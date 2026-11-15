@@ -1,6 +1,6 @@
 // lexdb_pg: PostgreSQL's view of a statement and a catalog: identifier
-// quoting, the deparser pg_get_expr/pg_get_indexdef show, and (as the
-// module grows) the rest of PostgreSQL's own names and text.
+// quoting, the deparser pg_get_expr/pg_get_indexdef show, the rows of
+// pg_catalog and information_schema, and PostgreSQL's own names and text.
 import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
@@ -8,10 +8,81 @@ import "./lexdb_pgcat"
 import "./lexdb_catalog"
 
 type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
 type Table = lexdb_catalog.Table
 type CatIdx = lexdb_catalog.CatIdx
 type CatTab = lexdb_catalog.CatTab
 type CatSnap = lexdb_catalog.CatSnap
+type CatCon = lexdb_catalog.CatCon
+type Role = lexdb_catalog.Role
+type CatView = lexdb_catalog.CatView
+type TabStat = lexdb_catalog.TabStat
+type Acl = lexdb_catalog.Acl
+type Grant = lexdb_catalog.Grant
+type DbErr = lexdb_base.DbErr
+const ROWID = lexdb_catalog.ROWID
+
+fn iv(n: int): Val { return Val.Int(n) }
+fn tv(s: &str): Val { return Val.Text(s.toStr()) }
+fn bv(b: bool): Val { return Val.Bool(b) }
+
+// An int array as PostgreSQL shows it ({1,2}).
+fn intsArr(ns: &[]int): Val {
+    var parts: []str = []
+    for x in ns { append(mut &parts, x.toStr()) }
+    return Val.Text("{" + strings.join(&parts, ",") + "}")
+}
+
+// An int2vector or oidvector: its numbers, spaced.
+fn vecOf(ns: &[]int): Val {
+    var parts: []str = []
+    for x in ns { append(mut &parts, x.toStr()) }
+    return Val.Text(strings.join(&parts, " "))
+}
+
+fn zeros(n: int): Val {
+    var ns: []int = []
+    for i in 0..n { append(mut &ns, 0) }
+    return vecOf(&ns)
+}
+
+// A role's OID: the trusted session's user (no role) and the unknown owner 10.
+fn roleOid(r: &str, roles: &[]Role): int {
+    for x in roles { if x.name == r { return catOid(&"a", r) } }
+    return OID_OWNER
+}
+
+fn aclOf(snap: &CatSnap, obj: &str): Acl {
+    var a = match snap.acls.get(obj) {
+        Some(v) { lexdb_catalog.decAcl(obj, &v) }
+        None { Acl{owner: "", grants: lexdb_catalog.defaultGrants(obj), set: false} }
+    }
+    // the schema public's own grants are shown, as PostgreSQL shows them
+    if obj == "n:public" { a.set = true }
+    return a
+}
+
+fn ownerName(snap: &CatSnap, a: &Acl): str { return if len(a.owner) > 0 { a.owner } else { snap.user } }
+
+// relacl, nspacl: PostgreSQL's aclitem[] text, NULL until a GRANT or REVOKE.
+fn aclText(snap: &CatSnap, a: &Acl, all: &str): Val {
+    if !a.set { return Val.Null }
+    let o = ownerName(snap, a)
+    var items: []str = [quoteIfNeeded(&o) + "=" + all + "/" + quoteIfNeeded(&o)]
+    for g in a.grants {
+        if g.to == o { continue }
+        append(mut &items, (if len(g.to) > 0 { quoteIfNeeded(&g.to) } else { "" }) + "=" + g.privs + "/" + quoteIfNeeded(&o))
+    }
+    return Val.Text("{" + strings.join(&items, ",") + "}")
+}
+
+fn predVal(p: &Option[Expr]): Val {
+    let none: Option[lexdb_sql.TypeName] = None
+    match p {
+        Some(x) { return tv(&exprText(&x, &none)) }
+        None { return Val.Null }
+    }
+}
 
 // quote_ident: the name as is when it needs no quotes. PostgreSQL's rule:
 // a lower-case letter or _ first, then lower-case letters, digits and _.
@@ -355,4 +426,429 @@ pub fn idxDefOn(ct: &CatTab, ix: &CatIdx, on: &str, pretty: bool): str {
         None {}
     }
     return d
+}
+
+// The rows of PostgreSQL's catalog relation rel (pg_catalog or
+// information_schema), from catView; stats is filled for
+// pg_stat_user_tables only (the executor keeps the analysis state).
+pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabStat], rel: &str): Result[[][]Val, DbErr] {
+    let snap = &cq.snap
+    let roles = &cq.roles
+    var rows: [][]Val = []
+    let db = "lexdb"
+    let owner = snap.user
+    match rel {
+        "pg_namespace" {
+            append(mut &rows, [iv(OID_PG_CATALOG), tv(&"pg_catalog"), iv(OID_OWNER), Val.Null])
+            append(mut &rows, [iv(OID_INFO_SCHEMA), tv(&"information_schema"), iv(OID_OWNER), Val.Null])
+            for s in snap.schemas {
+                let na = aclOf(&snap, &lexdb_catalog.nspObj(&s))
+                append(mut &rows, [iv(nspOid(&s)), tv(&s), iv(roleOid(&ownerName(&snap, &na), roles)), aclText(&snap, &na, &"UC")])
+            }
+        }
+        "pg_class" {
+            for ct in snap.tabs {
+                let hasIdx = len(ct.idxs) > 0
+                let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
+                let ta = aclOf(&snap, &lexdb_catalog.relObj(&ct.key))
+                append(mut &rows, [iv(ct.oid), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), roles)), iv(2), iv(ct.oid), iv(0),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&persistOf(&ct.schema)), tv(&"r"), iv(len(ct.t.cols) - (if lexdb_catalog.rowidKeyed(&ct.t) { 1 } else { 0 })),
+                                   iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
+                                   bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
+                for ix in ct.idxs {
+                    append(mut &rows, [iv(ix.oid), tv(&ix.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(403), iv(ix.oid),
+                                       iv(0), iv(0), Val.Real(0.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&ct.schema)), tv(&"i"), iv(len(ix.cols)),
+                                       iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
+                                       iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+                }
+            }
+            for v in snap.views {
+                let va = aclOf(&snap, &lexdb_catalog.relObj(&v.key))
+                append(mut &rows, [iv(v.oid), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), roles)), iv(0), iv(0), iv(0),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&v.schema)), tv(&"v"), iv(len(v.t.cols)),
+                                   iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
+                                   bv(false), iv(0), iv(0), iv(0), aclText(&snap, &va, &"arwdDxt"), Val.Null, Val.Null])
+            }
+            for d in snap.seqs {
+                let sc = lexdb_sql.schemaOf(&d.key)
+                let sa = aclOf(&snap, &lexdb_catalog.relObj(&d.key))
+                append(mut &rows, [iv(lexdb_catalog.seqOid(&d)), tv(&lexdb_sql.baseName(&d.key)), iv(nspOid(&sc)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &sa), roles)), iv(0),
+                                   iv(lexdb_catalog.seqOid(&d)), iv(0), iv(1), Val.Real(1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&sc)), tv(&"S"),
+                                   iv(3), iv(0), bv(false), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"), bv(false),
+                                   iv(0), iv(0), iv(0), aclText(&snap, &sa, &"rwU"), Val.Null, Val.Null])
+            }
+            for r in lexdb_pgcat.relNames() {
+                let dot = strings.indexOf(&r, ".", 0)
+                let sc = if dot < 0 { "pg_catalog" } else { r[0..dot] }
+                let nm = if dot < 0 { r } else { r[dot + 1..len(r)] }
+                let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(sc + "\x1f" + nm)) }
+                let view = dot >= 0 || strings.startsWith(&r, "pg_tables") || r == "pg_indexes" || r == "pg_views" || r == "pg_stat_user_tables" ||
+                           r == "pg_matviews" || r == "pg_sequences" || r == "pg_settings" || r == "pg_roles" || r == "pg_user"
+                append(mut &rows, [iv(o), tv(&nm), iv(nspOid(&sc)), iv(0), iv(0), iv(OID_OWNER), iv(if view { 0 } else { 2 }), iv(o),
+                                   iv(0), iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&"p"), tv(&if view { "v" } else { "r" }),
+                                   iv(len(lexdb_pgcat.relCols(&r))), iv(0), bv(view), bv(false), bv(false), bv(false), bv(false),
+                                   bv(true), tv(&if view { "n" } else { "d" }), bv(false), iv(0), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
+        }
+        "pg_attribute" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    if c.name == ROWID { continue }
+                    var nn = c.notNull
+                    for p in ct.t.pk { if p == i { nn = true } }
+                    append(mut &rows, attRow(ct.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), &(identOf(c))))
+                }
+                for ix in ct.idxs {
+                    for k in 0..len(ix.cols) {
+                        let cn = ix.cols[k]
+                        if cn < 1 || cn > len(ct.t.cols) { continue }
+                        let c = &ct.t.cols[cn - 1]
+                        append(mut &rows, attRow(ix.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
+                    }
+                }
+            }
+            for v in snap.views {
+                for i in 0..len(v.t.cols) {
+                    let c = &v.t.cols[i]
+                    append(mut &rows, attRow(v.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, false, false, ""))
+                }
+            }
+            for r in lexdb_pgcat.relNames() {
+                let dot = strings.indexOf(&r, ".", 0)
+                let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(r[0..dot] + "\x1f" + r[dot + 1..len(r)])) }
+                let cs = lexdb_pgcat.relCols(&r)
+                for k in 0..len(cs) { append(mut &rows, attRow(o, &cs[k].name, cs[k].oid, -1, k + 1, false, false, "")) }
+            }
+        }
+        "pg_attrdef" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    if ct.t.cols[i].name == ROWID { continue }
+                    match defaultText(&snap, &ct.t.cols[i]) {
+                        Some(d) { append(mut &rows, [iv(catOid(&"d", &(ct.key + "\x00" + ct.t.cols[i].name))), iv(ct.oid), iv(i + 1), tv(&d)]) }
+                        None {}
+                    }
+                }
+            }
+        }
+        "pg_type" {
+            for t in lexdb_pgcat.types() {
+                let arr = t.cat == "A"
+                append(mut &rows, [iv(t.oid), tv(&t.name), iv(OID_PG_CATALOG), iv(OID_OWNER), iv(t.len), bv(t.byval), tv(&"b"), tv(&t.cat),
+                                   bv(t.pref), bv(true), tv(&","), iv(0), tv(&if arr { "array_subscript_handler" } else { "-" }),
+                                   iv(t.elem), iv(t.array), tv(&if arr { "array_in" } else { t.name + "in" }),
+                                   tv(&if arr { "array_out" } else { t.name + "out" }), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"-"),
+                                   tv(&t.align), tv(&if t.byval { "p" } else { "x" }), bv(false), iv(0), iv(-1), iv(0), iv(t.coll),
+                                   Val.Null, Val.Null, Val.Null])
+            }
+            // enum types (9.90)
+            for en in snap.enums {
+                let nm = lexdb_sql.baseName(&en.key)
+                append(mut &rows, [iv(en.oid), tv(&nm), iv(nspOid(&lexdb_sql.schemaOf(&en.key))), iv(OID_OWNER), iv(4), bv(true), tv(&"e"), tv(&"E"),
+                                   bv(false), bv(true), tv(&","), iv(0), tv(&"-"), iv(0), iv(0), tv(&"enum_in"), tv(&"enum_out"),
+                                   tv(&"enum_recv"), tv(&"enum_send"), tv(&"-"), tv(&"-"), tv(&"-"), tv(&"i"), tv(&"p"), bv(false), iv(0),
+                                   iv(-1), iv(0), iv(0), Val.Null, Val.Null, Val.Null])
+            }
+        }
+        "pg_index" {
+            for ct in snap.tabs {
+                for ix in ct.idxs {
+                    var colls: []int = []
+                    for c in ix.cols { append(mut &colls, if c >= 1 && c <= len(ct.t.cols) { collOf(ct.t.cols[c - 1].typ.oid) } else { 0 }) }
+                    let pred = predVal(&ix.pred)
+                    append(mut &rows, [iv(ix.oid), iv(ct.oid), iv(len(ix.cols)), iv(len(ix.cols)), bv(ix.unique), bv(false), bv(ix.primary),
+                                       bv(false), bv(true), bv(false), bv(true), bv(false), bv(true), bv(true), bv(false),
+                                       vecOf(&ix.cols), vecOf(&colls), zeros(len(ix.cols)), indOptions(&ix),
+                                       if len(ix.exprs) > 0 { tv(&strings.join(&ix.exprs, " ")) } else { Val.Null }, pred])
+                }
+            }
+        }
+        "pg_constraint" {
+            for c in snap.cons {
+                let isF = c.typ == "f"
+                append(mut &rows, [iv(c.oid), tv(&c.name), iv(nspOid(&c.schema)), tv(&c.typ), bv(c.deferrable), bv(c.deferred), bv(c.valid), iv(c.rel),
+                                   iv(0), iv(c.idx), iv(0), iv(c.refRel), tv(&c.upd), tv(&c.del), tv(&if isF { "s" } else { " " }),
+                                   bv(true), iv(0), bv(false), if c.typ == "c" && len(c.cols) == 0 { Val.Null } else { intsArr(&c.cols) },
+                                   if isF { intsArr(&c.refCols) } else { Val.Null }, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   if c.typ == "c" { tv(&c.check) } else { Val.Null }, bv(false)])
+            }
+        }
+        "pg_enum" {
+            for en in snap.enums {
+                for i in 0..len(en.labels) {
+                    append(mut &rows, [iv(catOid(&"E", &(en.key + "\x00" + en.labels[i]))), iv(en.oid), Val.Real(float(i + 1)), tv(&en.labels[i])])
+                }
+            }
+        }
+        "pg_sequence" {
+            for d in snap.seqs {
+                append(mut &rows, [iv(lexdb_catalog.seqOid(&d)), iv(d.typ), iv(d.start), iv(d.inc), iv(d.max), iv(d.min), iv(d.cache), bv(d.cycle)])
+            }
+        }
+        "pg_depend" {
+            for ct in snap.tabs {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    if len(c.seq) == 0 || c.name == ROWID { continue }
+                    append(mut &rows, [iv(1259), iv(catOid(&"S", &c.seq)), iv(0), iv(1259), iv(ct.oid), iv(i + 1),
+                                       tv(&if c.identity == lexdb_sql.ID_SERIAL { "a" } else { "i" })])
+                }
+            }
+        }
+        "pg_collation" {
+            append(mut &rows, [iv(100), tv(&"default"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"d"), bv(true), iv(-1), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+            append(mut &rows, [iv(950), tv(&"C"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"c"), bv(true), iv(-1), tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null])
+            append(mut &rows, [iv(951), tv(&"POSIX"), iv(OID_PG_CATALOG), iv(OID_OWNER), tv(&"c"), bv(true), iv(-1), tv(&"POSIX"), tv(&"POSIX"), Val.Null, Val.Null, Val.Null])
+        }
+        "pg_am" {
+            append(mut &rows, [iv(2), tv(&"heap"), tv(&"heap_tableam_handler"), tv(&"t")])
+            append(mut &rows, [iv(403), tv(&"btree"), tv(&"bthandler"), tv(&"i")])
+            append(mut &rows, [iv(405), tv(&"hash"), tv(&"hashhandler"), tv(&"i")])
+        }
+        "pg_database" {
+            append(mut &rows, [iv(16384), tv(&db), iv(OID_OWNER), iv(6), tv(&"c"), bv(false), bv(true), iv(-1), iv(0), iv(1), iv(1663),
+                               tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+        }
+        "pg_language" {
+            // the languages PostgreSQL has before CREATE EXTENSION (lexdb runs none of them)
+            append(mut &rows, [iv(12), tv(&"internal"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_internal_validator"), Val.Null])
+            append(mut &rows, [iv(13), tv(&"c"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_c_validator"), Val.Null])
+            append(mut &rows, [iv(14), tv(&"sql"), iv(OID_OWNER), bv(false), bv(true), iv(0), iv(0), tv(&"fmgr_sql_validator"), Val.Null])
+        }
+        "pg_tablespace" {
+            append(mut &rows, [iv(1663), tv(&"pg_default"), iv(OID_OWNER), Val.Null, Val.Null])
+            append(mut &rows, [iv(1664), tv(&"pg_global"), iv(OID_OWNER), Val.Null, Val.Null])
+        }
+        "pg_roles", "pg_user" {
+            var rs: []Role = []
+            for i in 0..len(roles) { append(mut &rs, Role{name: roles[i].name.toStr(), login: roles[i].login, superuser: roles[i].superuser, verifier: roles[i].verifier.toStr(), oraVerifier: roles[i].oraVerifier.toStr()}) }
+            var seen = false
+            for r in rs { if r.name == owner { seen = true } }
+            if !seen { append(mut &rs, Role{name: owner, login: true, superuser: true, verifier: "", oraVerifier: ""}) }
+            for r in rs {
+                let o = roleOid(&r.name, roles)
+                let pw = if len(r.verifier) > 0 { tv(&"********") } else { Val.Null }
+                if rel == "pg_roles" {
+                    append(mut &rows, [tv(&r.name), bv(r.superuser), bv(true), bv(r.superuser), bv(r.superuser), bv(r.login), bv(false),
+                                       iv(-1), pw, Val.Null, bv(r.superuser), Val.Null, iv(o)])
+                } else if r.login {
+                    append(mut &rows, [tv(&r.name), iv(o), bv(r.superuser), bv(r.superuser), bv(false), bv(r.superuser), pw, Val.Null, Val.Null])
+                }
+            }
+        }
+        "pg_stat_user_tables" {
+            // what the automatic statistics keep (optimizer 44), since the store opened
+            for ct in snap.tabs {
+                let a = stats.get(&ct.t.tree).unwrap()
+                let c: []int = [a.c0, a.c1, a.c2, a.c3, a.c4]
+                let base = a.rows
+                let tz = fn(us: int): Val { return if us == 0 { Val.Null } else { Val.Tstz(us) } }
+                append(mut &rows, [iv(ct.oid), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), iv(0), Val.Null, iv(0),
+                                   iv(0), Val.Null, iv(0), iv(c[1]), iv(c[2]), iv(c[3]), iv(0), iv(0), iv(max(0, base + c[4])), iv(0), iv(c[0]),
+                                   iv(0), Val.Null, Val.Null, tz(a.last), tz(a.lastAuto), iv(0), iv(0), iv(a.n), iv(a.nAuto), Val.Float(0.0f),
+                                   Val.Float(0.0f), Val.Float(float(a.ns) / 1000000.0f), Val.Float(float(a.nsAuto) / 1000000.0f)])
+            }
+        }
+        "pg_tables" {
+            for ct in snap.tabs {
+                append(mut &rows, [tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&ownerName(&snap, &aclOf(&snap, &lexdb_catalog.relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
+                                   bv(len(ct.t.fks) > 0 || len(ct.t.refBy) > 0), bv(false)])
+            }
+        }
+        "pg_indexes" {
+            for ct in snap.tabs {
+                for ix in ct.idxs { append(mut &rows, [tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&ix.name), Val.Null, tv(&idxDef(&ct, &ix))]) }
+            }
+        }
+        "pg_sequences" {
+            for d in snap.seqs {
+                append(mut &rows, [tv(&lexdb_sql.schemaOf(&d.key)), tv(&lexdb_sql.baseName(&d.key)), tv(&owner),
+                                   Val.Reg(d.typ, lexdb_pgcat.formatType(d.typ, -1)), iv(d.start), iv(d.min), iv(d.max), iv(d.inc),
+                                   bv(d.cycle), iv(d.cache), Val.Null])
+            }
+        }
+        "information_schema.schemata" {
+            for s in ["pg_catalog", "information_schema"] {
+                append(mut &rows, [tv(&db), tv(&s), tv(&owner), Val.Null, Val.Null, Val.Null, Val.Null])
+            }
+            for s in snap.schemas { append(mut &rows, [tv(&db), tv(&s), tv(&owner), Val.Null, Val.Null, Val.Null, Val.Null]) }
+        }
+        "information_schema.tables" {
+            for ct in snap.tabs {
+                append(mut &rows, [tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&if persistOf(&ct.schema) == "t" { "LOCAL TEMPORARY" } else { "BASE TABLE" }), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   tv(&"YES"), tv(&"NO"), Val.Null])
+            }
+            for v in snap.views {
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&"VIEW"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                   tv(&"NO"), tv(&"NO"), Val.Null])
+            }
+        }
+        "pg_auth_members" {
+            for pr in cq.mems {
+                let z = strings.indexOf(&pr, "\x00", 0)
+                append(mut &rows, [iv(catOid(&"m", &pr)), iv(roleOid(&pr[0..z], roles)), iv(roleOid(&pr[z + 1..len(pr)], roles)), iv(OID_OWNER),
+                                   bv(false), bv(true), bv(true)])
+            }
+        }
+        "information_schema.table_privileges" {
+            // each grant, the owner's own included, as privilege names
+            for which in 0..2 {
+                for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
+                    let a = aclOf(&snap, &lexdb_catalog.relObj(&ct.key))
+                    let o = ownerName(&snap, &a)
+                    var gs: []Grant = [Grant{to: o, privs: "arwdDxt"}]
+                    if a.set { for g in a.grants { if g.to != o { append(mut &gs, Grant{to: g.to, privs: g.privs}) } } }
+                    for g in gs {
+                        for k in 0..len(g.privs) {
+                            let pn = lexdb_catalog.privName(&g.privs[k..k + 1])
+                            if len(pn) == 0 { continue }
+                            append(mut &rows, [tv(&o), tv(&(if len(g.to) > 0 { g.to } else { "PUBLIC" })), tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&pn),
+                                               tv(&(if g.to == o { "YES" } else { "NO" })), tv(&(if pn == "SELECT" { "YES" } else { "NO" }))])
+                        }
+                    }
+                }
+            }
+        }
+        "information_schema.views" {
+            for v in snap.views {
+                append(mut &rows, [tv(&db), tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&(lexdb_sql.viewShown(&v.t.view) + ";")), tv(&"NONE"), tv(&"NO"), tv(&"NO"),
+                                   tv(&"NO"), tv(&"NO"), tv(&"NO")])
+            }
+        }
+        "pg_views" {
+            for v in snap.views { append(mut &rows, [tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell } else { v.name })), tv(&ownerName(&snap, &aclOf(&snap, &lexdb_catalog.relObj(&v.key)))), tv(&(lexdb_sql.viewShown(&v.t.view) + ";"))]) }
+        }
+        "information_schema.columns" {
+            for which in 0..2 {
+            for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    if c.name == ROWID { continue }
+                    var nn = c.notNull
+                    for p in ct.t.pk { if p == i { nn = true } }
+                    let o = c.typ.oid
+                    let isInt = o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8
+                    let isFl = o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8
+                    let isNumT = o == lexdb_sql.OID_NUMERIC
+                    let isChar = o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_BPCHAR
+                    let sized = (o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_BPCHAR) && c.typ.len > 0
+                    let prec = if o == lexdb_sql.OID_INT2 { iv(16) } else if o == lexdb_sql.OID_INT4 { iv(32) } else if o == lexdb_sql.OID_INT8 { iv(64) }
+                               else if o == lexdb_sql.OID_FLOAT4 { iv(24) } else if o == lexdb_sql.OID_FLOAT8 { iv(53) }
+                               else if isNumT && c.typ.prec > 0 { iv(c.typ.prec) } else { Val.Null }
+                    let radix = if isInt || isFl { iv(2) } else if isNumT { iv(10) } else { Val.Null }
+                    let scale = if isInt { iv(0) } else if isNumT && c.typ.prec > 0 { iv(c.typ.scale) } else { Val.Null }
+                    let dtp = if o == lexdb_sql.OID_DATE { iv(0) } else if lexdb_sql.isTimeKind(c.typ.kind) { iv(if c.typ.prec > 0 { c.typ.scale } else { 6 }) } else { Val.Null }
+                    let maxLen = if sized { iv(c.typ.len) } else { Val.Null }
+                    let octLen = if sized { iv(c.typ.len * 4) } else if isChar { iv(1073741824) } else { Val.Null }
+                    var udt = match lexdb_pgcat.typeOf(o) {
+                        Some(t) { t.name }
+                        None { "text" }
+                    }
+                    var udtSchema = "pg_catalog"
+                    var dataType = infoType(&c.typ)
+                    if c.typ.kind == lexdb_sql.K_ENUM {
+                        for en in snap.enums {
+                            if en.oid == o {
+                                udt = lexdb_sql.baseName(&en.key)
+                                udtSchema = lexdb_sql.schemaOf(&en.key)
+                            }
+                        }
+                        dataType = "USER-DEFINED"
+                    }
+                    let ident = identOf(c)
+                    let isId = len(ident) > 0
+                    var sq = lexdb_catalog.noSeq()
+                    if isId { for d in snap.seqs { if d.key == c.seq { sq = lexdb_catalog.seqCopy(&d) } } }
+                    let dflt = match defaultText(&snap, c) {
+                        Some(d) { tv(&d) }
+                        None { Val.Null }
+                    }
+                    append(mut &rows, [tv(&db), tv(&ct.schema), tv(&(if len(ct.t.spell) > 0 { ct.t.spell } else { ct.name })), tv(&lexdb_sql.colShown(c)), iv(i + 1), dflt, tv(&if nn { "NO" } else { "YES" }),
+                                       tv(&dataType), maxLen, octLen, prec, radix, scale, dtp, Val.Null, Val.Null,
+                                       Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
+                                       tv(&db), tv(&udtSchema), tv(&udt), Val.Null, Val.Null, Val.Null, Val.Null, tv(&(i + 1).toStr()),
+                                       tv(&"NO"), tv(&if isId { "YES" } else { "NO" }),
+                                       if isId { tv(&if ident == "a" { "ALWAYS" } else { "BY DEFAULT" }) } else { Val.Null },
+                                       if isId { tv(&sq.start.toStr()) } else { Val.Null }, if isId { tv(&sq.inc.toStr()) } else { Val.Null },
+                                       if isId { tv(&sq.max.toStr()) } else { Val.Null }, if isId { tv(&sq.min.toStr()) } else { Val.Null },
+                                       if isId { tv(&if sq.cycle { "YES" } else { "NO" }) } else { tv(&"NO") },
+                                       tv(&"NEVER"), Val.Null, tv(&(if len(ct.t.view) > 0 { "NO" } else { "YES" }))])
+                }
+            }
+            }
+        }
+        "information_schema.table_constraints" {
+            for c in snap.cons {
+                let ct = lexdb_catalog.catTabOf(&snap, c.rel)
+                let ty = if c.typ == "p" { "PRIMARY KEY" } else if c.typ == "u" { "UNIQUE" } else if c.typ == "f" { "FOREIGN KEY" } else { "CHECK" }
+                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&ct), tv(&ty),
+                                   tv(&if c.deferrable { "YES" } else { "NO" }), tv(&if c.deferred { "YES" } else { "NO" }),
+                                   tv(&"YES"), if c.typ == "u" || c.typ == "p" { tv(&"YES") } else { Val.Null }])
+            }
+        }
+        "information_schema.key_column_usage" {
+            for c in snap.cons {
+                if c.typ == "c" { continue }
+                let ti = lexdb_catalog.catTabIdx(&snap, c.rel)
+                if ti < 0 { continue }
+                for k in 0..len(c.cols) {
+                    let cn = c.cols[k]
+                    if cn < 1 || cn > len(snap.tabs[ti].t.cols) { continue }
+                    var pos = Val.Null
+                    if c.typ == "f" { pos = iv(k + 1) }
+                    append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), tv(&c.schema), tv(&snap.tabs[ti].name),
+                                       tv(&snap.tabs[ti].t.cols[cn - 1].name), iv(k + 1), pos])
+                }
+            }
+        }
+        "information_schema.referential_constraints" {
+            for c in snap.cons {
+                if c.typ != "f" { continue }
+                var uname = Val.Null
+                var usch = Val.Null
+                for u in snap.cons {
+                    if (u.typ == "p" || u.typ == "u") && u.idx == c.idx && u.rel == c.refRel {
+                        uname = tv(&u.name)
+                        usch = tv(&u.schema)
+                    }
+                }
+                append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&db), usch, uname, tv(&"NONE"), tv(&fkActionText(&c.upd)),
+                                   tv(&fkActionText(&c.del))])
+            }
+        }
+        "information_schema.constraint_column_usage" {
+            for c in snap.cons {
+                let ti = lexdb_catalog.catTabIdx(&snap, if c.typ == "f" { c.refRel } else { c.rel })
+                if ti < 0 { continue }
+                let cols = if c.typ == "f" { lexdb_catalog.copyInts(&c.refCols) } else if c.typ == "c" { lexdb_catalog.checkCols(&snap.tabs[ti].t, &c) } else { lexdb_catalog.copyInts(&c.cols) }
+                for cn in cols {
+                    if cn < 1 || cn > len(snap.tabs[ti].t.cols) { continue }
+                    append(mut &rows, [tv(&db), tv(&snap.tabs[ti].schema), tv(&snap.tabs[ti].name), tv(&snap.tabs[ti].t.cols[cn - 1].name),
+                                       tv(&db), tv(&c.schema), tv(&c.name)])
+                }
+            }
+        }
+        "information_schema.check_constraints" {
+            for c in snap.cons {
+                if c.typ == "c" { append(mut &rows, [tv(&db), tv(&c.schema), tv(&c.name), tv(&c.check)]) }
+            }
+        }
+        "information_schema.sequences" {
+            // not an identity column's (PostgreSQL leaves those out)
+            var idSeqs: []str = []
+            for ct in snap.tabs { for c in ct.t.cols { if len(identOf(&c)) > 0 { append(mut &idSeqs, c.seq) } } }
+            for d in snap.seqs {
+                var skip = false
+                for k in idSeqs { if k == d.key { skip = true } }
+                if skip { continue }
+                let p = if d.typ == lexdb_sql.OID_INT2 { 16 } else if d.typ == lexdb_sql.OID_INT4 { 32 } else { 64 }
+                append(mut &rows, [tv(&db), tv(&lexdb_sql.schemaOf(&d.key)), tv(&lexdb_sql.baseName(&d.key)), tv(&lexdb_pgcat.formatType(d.typ, -1)),
+                                   iv(p), iv(2), iv(0), tv(&d.start.toStr()), tv(&d.min.toStr()), tv(&d.max.toStr()), tv(&d.inc.toStr()),
+                                   tv(&if d.cycle { "YES" } else { "NO" })])
+            }
+        }
+        else {}         // the rest have no rows: no comments, triggers, policies, views, ...
+    }
+    return Ok(rows)
 }

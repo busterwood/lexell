@@ -4,6 +4,7 @@
 // and table types. Behavior stays in the modules that own it; this module
 // is the vocabulary they pass.
 import "strings"
+import "./lexdb_base"
 import "./lexdb_rows"
 import "./lexdb_sql"
 
@@ -161,6 +162,7 @@ pub type CatView = record {
     pub snap: CatSnap
     pub roles: []Role
     pub sess: int
+    pub mems: []str              // role memberships, as pg_auth_members reads them
 }
 
 // A hex digit's value, -1 not one.
@@ -205,6 +207,80 @@ pub fn copyStrs(xs: &[]str): []str {
     var out: []str = []
     for x in xs { append(mut &out, x.toStr()) }
     return out
+}
+
+// A privilege letter's name, "" none.
+pub fn privName(l: &str): str {
+    return match l {
+        "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "D" { "TRUNCATE" } "x" { "REFERENCES" }
+        "t" { "TRIGGER" } "U" { "USAGE" } "C" { "CREATE" } else { "" }
+    }
+}
+
+// An owner's grants on an object (9.83): the ACL as the catalog stores it.
+pub type Grant = record { pub to: str; pub privs: str }
+
+pub type Acl = record {
+    pub owner: str              // "" unknown: made before privileges, or by no role
+    pub grants: []Grant         // "" PUBLIC
+    pub set: bool               // grants were given: relacl is not NULL
+}
+
+// The privileges an object has without a GRANT: the schema public's USAGE
+// for PUBLIC (PostgreSQL 15 on: not CREATE).
+pub fn defaultGrants(obj: &str): []Grant {
+    if obj == "n:public" { return [Grant{to: "", privs: "U"}] }
+    // a session's temporary schema (9.96): its own, to use and make in
+    if len(obj) > 2 && obj[0] == 'n' && lexdb_base.isTempSchema(&obj[2..len(obj)]) { return [Grant{to: "", privs: "UC"}] }
+    return []
+}
+
+pub fn decAcl(obj: &str, v: &str): Acl {
+    let ls = strings.split(&v, "\n")
+    var a = Acl{owner: ls[0].toStr(), grants: [], set: len(ls) > 1 && ls[1] == "1"}
+    for i in 2..len(ls) {
+        let tb = strings.indexOf(&ls[i], "\t", 0)
+        if tb >= 0 { append(mut &a.grants, Grant{to: ls[i][0..tb].toStr(), privs: ls[i][tb + 1..len(ls[i])].toStr()}) }
+    }
+    if !a.set { a.grants = defaultGrants(obj) }
+    return a
+}
+
+// The catalog key of an object a privilege is on: a relation's or a schema's.
+pub fn relObj(k: &str): str { return "r:" + k }
+pub fn nspObj(n: &str): str { return "n:" + n }
+
+// A table's name by OID, "" none.
+pub fn catTabOf(snap: &CatSnap, oid: int): str {
+    let i = catTabIdx(snap, oid)
+    return if i < 0 { "" } else { snap.tabs[i].name }
+}
+
+// The columns a CHECK names.
+pub fn checkCols(t: &Table, c: &CatCon): []int {
+    var out: []int = []
+    for i in 0..len(t.cols) {
+        if strings.contains(&c.check, &t.cols[i].name) { append(mut &out, i + 1) }
+    }
+    return out
+}
+
+// A table's statistics as pg_stat_user_tables shows them: the automatic
+// analysis state and the row count at the last ANALYZE.
+pub type TabStat = value record {
+    pub c0: int                 // changes since the last analysis: inserts, updates, deletes, ...
+    pub c1: int
+    pub c2: int
+    pub c3: int
+    pub c4: int
+    pub base: int
+    pub last: int
+    pub lastAuto: int
+    pub n: int
+    pub nAuto: int
+    pub ns: int
+    pub nsAuto: int
+    pub rows: int
 }
 
 // A text as one line: tabs and newlines as spaces (catalog definitions).
