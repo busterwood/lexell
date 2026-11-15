@@ -12,6 +12,9 @@ have the joins, correlated subqueries, `CASE`, date arithmetic and decimal
 aggregates that `bench/sock`'s five aggregates and the 35-query analytic
 suite in `~/Work/lexdb-bench/hp` do not.
 
+The plan comparison and the planner gaps it found are in
+[design/lexdb-tpch-plans.md](../../design/lexdb-tpch-plans.md).
+
 ## Files
 
 | file | what |

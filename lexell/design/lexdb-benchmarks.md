@@ -155,6 +155,7 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 | analytic queries | `~/Work/lexdb-bench/saved/vec/bench.py` over `~/Work/lexdb-bench/hp/q.txt` (`.../2026-11-15-refresh/query_run.sh`, `cmp.py`) | 35 queries over w (1M), d, t (1M), cr; the scratch PostgreSQL `saved/pg18` |
 | bulk loads | `.../2026-11-15-refresh/copy_run.sh` (`bench.py`, `bcp.sh`, `gen.py`) | `\copy` and `bcp` of generated files |
 | commits | pgbench `-M simple -f ins.sql -c N -T 10` | single-row autocommit inserts |
+| TPC-H derived | `lexell/bench/tpch/run.sh LEXDB WORKDIR [SF] [RUNS]` | 22 TPC-H queries over dbgen at SF1/10, conventional indexes, lexdb against PG one core and four processes; plan findings in `lexdb-tpch-plans.md` |
 
 The raw results of each run: `~/Work/lexdb-bench/saved/results/<date>-*/`.
 The TPC-H-like workload (`design/experiments/workload.lxl`) compares
