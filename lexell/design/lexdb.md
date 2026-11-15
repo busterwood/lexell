@@ -12155,3 +12155,53 @@ as the benchmark ran (the file grew 169 to 191 MB, and cold reads on it
 slowed by up to 4 times). Cold benchmarks need a settled copy.
 
 The suite passes (170).
+
+### 9.133 Bulk loads and commits against PostgreSQL and SQL Server, again (2026-11-15)
+
+9.118's comparison run again at 478d49f6 (after `exp/copy-fast`, 9.130 to
+9.132 and optimizer 45), with its scripts and data
+(`~/Work/lexdb-bench/saved/results/2026-11-15-refresh/`: `copy_run.sh`,
+`bench.py`, `bcp.sh`, `gen.py`; the data files regenerated, identical by
+md5 to 11-13's and to the copies in the SQL Server container). One run at a
+time, the median of 3, load under 1. psql's `\copy` for lexdb and
+PostgreSQL 18.6 (its own database, `bulkdb`), `bcp -c` for SQL Server 2022
+CU27 in its container (database in SIMPLE recovery: a reference, not a
+tuned figure). lexdb's wide load checked against PostgreSQL's: count, sums
+of every numeric column, distinct counts, min and max, the same.
+
+| 1M rows unless said | lexdb 11-13 | **lexdb now** (peak RSS) | PostgreSQL 18 | SQL Server bcp |
+|---|---:|---:|---:|---:|
+| narrow: int key, int, text | 1.23 s | **0.55 s** (268 MB) | 0.58 s | 1.17 s |
+| wide: 12 columns of mixed types, 174 MB | 5.15 s | **1.48 s** (583 MB) | 1.79 s | 3.34 s (2.84 s with TABLOCK) |
+| wide, with 2 secondary indexes | 9.49 s | **7.11 s** (1.18 GB) | 4.81 s | 7.40 s |
+| wide, no key | 6.63 s | **3.29 s** (652 MB) | 1.39 s | 2.28 s |
+| narrow, 10M rows | 14.3 s | **5.32 s** (2.57 GB) | 5.81 s | 10.86 s |
+
+- lexdb is now level with or ahead of PostgreSQL on keyed tables (narrow
+  0.95 ×, wide 0.83 ×, 10M narrow 0.92 ×) and about twice as fast as SQL
+  Server's bcp. The serial fast path (lexdb-copy-fast.md) is most of it.
+- **Behind:** with secondary indexes (1.48 × PostgreSQL; level with SQL
+  Server) and with no key (2.4 ×: a table without a primary key gets a
+  hidden key, and its rows go through the generic path).
+- Peak RSS at 10M rows is still 2.6 GB (the load is one statement's
+  transaction).
+
+**Commits** (new here): pgbench 18.6 `-M simple`, autocommit single-row
+`INSERT ... ON CONFLICT DO NOTHING` (`ins.sql`), 10 s, fresh table. Both
+servers' data on NOCOW btrfs on the same NVMe (WD SN570, under LUKS), each
+durable by its defaults.
+
+| clients | lexdb (O_DSYNC log, 9.131) | PostgreSQL, `fdatasync` (default) | PostgreSQL, `open_datasync` |
+|---:|---:|---:|---:|
+| 1 | 3,843/s, 0.260 ms | 1,577/s, 0.634 ms | 1,573/s, 0.636 ms |
+| 4 | 9,359/s, 0.427 ms | 3,354/s, 1.19 ms | 3,382/s, 1.18 ms |
+| 16 | 33,976/s, 0.471 ms | 13,073/s, 1.22 ms | 13,079/s, 1.22 ms |
+
+- lexdb's log before 9.131 (write, then fdatasync) gave 1,545, 3,265 and
+  12,600: PostgreSQL's figures. The difference is the one FUA write.
+- PostgreSQL's `open_datasync` changes nothing: its WAL writes are
+  buffered, so each O_DSYNC write is still a full file-system sync. Its
+  WAL is direct only with the developer setting `debug_io_direct = wal`
+  (a restart; not tried). The setting was reset after the run.
+- SQL Server's commit rate is not measured: there is no pgbench for TDS
+  here.
