@@ -97,7 +97,19 @@ and `lexdb_planner` are next.
 | 6 | `rs.batch` master switch, old row SELECT operators or test-only | `exec_batch*`, EXPLAIN counts |
 | 9 | `lexdb_planner` production mode if cost covers no-stats | `exec_joincost`, `exec_joinorder`, `exec_switch` |
 
-## 6. New-flag policy
+## 6. Known limits of the current format
+
+- Pre-9.115 time-tagged rows are unsupported. Such a row begins with
+  FIXED's byte (8); in a table whose first place is a time it can read as a
+  fixed row of the layout its next bytes name. New writers always take the
+  long form, and no fixture has this shape, but a mixed-version cluster or
+  a data directory written before 9.115 is not a supported input. A
+  fail-closed guard needs the layout's first kind at decode time (a
+  per-layout flag, not a per-row layout scan).
+- A data file from before the runs free list opens, but its flat free
+  list's pages are lost (not reused); `store_drop` covers that outcome.
+
+## 7. New-flag policy
 
 - A flag must name its seam and its deletion phase in this file.
 - A flag that selects an implementation must be read once at connection,
