@@ -3,11 +3,15 @@
 // catalog snapshot the catalog relations are made from, sequences, enums
 // and table types. Behavior stays in the modules that own it; this module
 // is the vocabulary they pass.
+import "strings"
 import "./lexdb_rows"
 import "./lexdb_sql"
 
 type Expr = lexdb_sql.Expr
 type FixedLay = lexdb_rows.FixedLay
+
+// The hidden rowid column a table without a primary key has.
+pub const ROWID: str = "\x00rowid"
 
 pub type Index = record {
     pub name: str
@@ -139,6 +143,73 @@ pub type CatSnap = record {
 // A stored procedure or function: its owner, kind (PROCEDURE or FUNCTION), name and source (lexdb_plsql keeps them in the
 // catalog under "\x02src\x00" and the three).
 pub type ProcSrc = record { pub owner: str; pub kind: str; pub name: str; pub src: str }
+// A role (9.81): a catalog row of its own, roleKey(name). Whether it may
+// log in, whether it is a superuser, and its password's SCRAM verifier (""
+// none). Roles matter to SCRAM authentication (lexdb_wire); a session that
+// came in by trust is not checked against them.
+pub type Role = record {
+    pub name: str
+    pub login: bool
+    pub superuser: bool
+    pub verifier: str
+    pub oraVerifier: str    // Oracle's 12c verifier (lexdb_auth.makeOraVerifier), "" none: TNS logins need it
+}
+
+// A catalog as one statement's dialect reads it: the metadata snapshot, the
+// roles, and the session (Oracle's V$SESSION shows its id).
+pub type CatView = record {
+    pub snap: CatSnap
+    pub roles: []Role
+    pub sess: int
+}
+
+// A hex digit's value, -1 not one.
+pub fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+// A hex text as bytes ("" when a digit is not one).
+pub fn fromHex(s: &str): str {
+    var b = newStrBuf()
+    var i = 0
+    while i + 1 < len(s) {
+        let hi = hexVal(s[i])
+        let lo = hexVal(s[i + 1])
+        if hi < 0 || lo < 0 { return "" }
+        b.addByte(byte(hi * 16 + lo))
+        i += 2
+    }
+    return b.toStr()
+}
+
+// A bytea's hex text ("0x..." or bare) as bytes.
+pub fn hexBytes(s: &str): str {
+    let h = if strings.startsWith(s, "0x") { s[2..len(s)] } else { s.toStr() }
+    return fromHex(&strings.toLowerAscii(&h))
+}
+
+// Whether a constraint's name is the one lexdb makes when none is given.
+pub fn sysNamed(c: &CatCon, tname: &str): bool {
+    if c.typ == "p" { return c.name != tname + "_pkey" }
+    if c.typ == "u" || c.typ == "f" || c.typ == "c" {
+        let suffix = if c.typ == "u" { "_key" } else if c.typ == "f" { "_fkey" } else { "_check" }
+        return !(strings.startsWith(&c.name, &(tname + "_")) && strings.endsWith(&c.name, &suffix))
+    }
+    return true
+}
+
+// A sequence's OID: its catalog key's, as nameOid makes it.
+pub fn seqOid(d: &Seq): int { return lexdb_sql.nameOid("S", &d.key) }
+
+// The index in snap.tabs of the table with OID oid, -1 none.
+pub fn catTabIdx(snap: &CatSnap, oid: int): int {
+    for i in 0..len(snap.tabs) { if snap.tabs[i].oid == oid { return i } }
+    return -1
+}
+
 
 pub type Seq = record {
     pub key: str            // its catalog key

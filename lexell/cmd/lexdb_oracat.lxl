@@ -4,20 +4,34 @@
 // sessions. Their shapes (columns, types, order), the rows lexdb takes from
 // Oracle as they are, and a template row for each kind of object are Oracle
 // Database Free's, recorded by tools/gen_oracle_catalog.py in lexdb_oradata;
-// the rows that describe lexdb's own tables lexdb_exec makes from its catalog
-// (oraRows), each from a template row with the columns that describe the
-// object set.
+// the rows that describe lexdb's own tables this module makes from the
+// catalog (viewRows), each from a template row with the columns that describe
+// the object set.
 //
 // A view is a catalog relation as pg_catalog's are (lexdb_pgcat): the Oracle
 // parser makes ALL_TABLES, SYS.ALL_TABLES, V$VERSION (V_$VERSION), a public
 // synonym such as TABS, ... the function "#ora.ALL_TABLES" in FROM, whose rows
-// lexdb_exec makes when the statement runs. PostgreSQL and T-SQL sessions never
+// this module makes when the statement runs. PostgreSQL and T-SQL sessions never
 // see them.
 
 import "strings"
-import "./lexdb_oradata"
+import "./lexdb_base"
+import "./lexdb_catalog"
 import "./lexdb_dialect"
+import "./lexdb_float"
+import "./lexdb_time"
+import "./lexdb_oradata"
 import "./lexdb_sql"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type Role = lexdb_catalog.Role
+type CatSnap = lexdb_catalog.CatSnap
+type CatTab = lexdb_catalog.CatTab
+type CatIdx = lexdb_catalog.CatIdx
+const ROWID = lexdb_catalog.ROWID
+
+fn iv(n: int): Val { return Val.Int(n) }
 
 // A view's column: as DBA_TAB_COLUMNS describes SYS's own view.
 pub type OraCol = record {
@@ -217,4 +231,636 @@ pub fn oraTypeOf(t: &lexdb_sql.TypeName): OraT {
         return OraT{dtype: "CLOB", len: 4000, prec: -1, scale: -1, chars: 0}
     }
     return OraT{dtype: "VARCHAR2", len: 4000, prec: -1, scale: -1, chars: 4000}
+}
+
+// The views' shapes, the rows lexdb takes as Oracle has them (V$VERSION,
+// NLS_DATABASE_PARAMETERS, ...) and a template row of each kind of object are
+// lexdb_oracat's (recorded from Oracle Database Free); a row that describes one
+// of lexdb's objects is its template with the columns that describe the object
+// set (a table's name and owner; a column's type, length, nullability; ...).
+// ALL_x and DBA_x list every schema (lexdb has no per-object visibility test
+// for them), USER_x the session's own. An object's owner is its schema's
+// upper-cased name; public's objects are the session user's. A name without a
+// spelling of its own is shown in upper case (Oracle's fold), a name that has
+// one as written.
+
+const ORA_DATE: str = "2000-01-01 00:00:00"      // CREATED, LAST_DDL_TIME ...: lexdb keeps no times
+
+// A row being made: the owner it is listed under, the kind of its template
+// row (the value of the view's discriminating column), the columns it sets.
+type OraNV = record {
+    name: str
+    v: Val
+}
+
+type OraPend = record {
+    owner: str
+    disc: str
+    sets: []OraNV
+}
+
+fn oraPend(owner: &str, disc: &str): OraPend { return OraPend{owner: owner.toStr(), disc: disc.toStr(), sets: []} }
+
+fn (p: mut &OraPend) set(name: &str, v: Val) { append(mut &p.sets, OraNV{name: name.toStr(), v: v}) }
+fn (p: mut &OraPend) s(name: &str, v: &str) { p.set(name, Val.Text(v.toStr())) }
+fn (p: mut &OraPend) i(name: &str, n: int) { p.set(name, Val.Int(n)) }
+fn (p: mut &OraPend) null(name: &str) { p.set(name, Val.Null) }
+
+// A name as Oracle shows it: one lexdb folded to lower case is its upper case.
+fn oraUp(n: &str): str { return if n == strings.toLowerAscii(n) { strings.toUpperAscii(n) } else { n.toStr() } }
+
+fn oraOwner(schema: &str, user: &str): str { return if schema == "public" { strings.toUpperAscii(user) } else { oraUp(schema) } }
+fn oraTabName(ct: &CatTab): str { return if len(ct.t.spell) > 0 { ct.t.spell } else { oraUp(&lexdb_sql.baseName(&ct.name)) } }
+fn oraColName(c: &lexdb_sql.ColDef): str { return if len(c.spell) > 0 { c.spell } else { oraUp(&c.name) } }
+
+// A column's Oracle type: DATA_TYPE, DATA_LENGTH, DATA_PRECISION, DATA_SCALE
+// (-1 none), and for a text type its length in characters (0 not text).
+fn oraOptInt(n: int): Val { return if n < 0 { Val.Null } else { Val.Int(n) } }
+
+// A template value as its column's type.
+fn oraVal(c: &OraCol, s: &str): Val {
+    if s == "\x00" { return Val.Null }
+    let o = lexOid(c)
+    if o == lexdb_sql.OID_INT8 { return Val.Int(strings.parseIntOpt(s).unwrapOr(0)) }
+    if o == lexdb_sql.OID_NUMERIC {
+        match Decimal.parse(s) {
+            Ok(d) { return Val.Num(d) }
+            Err(_) { return Val.Null }
+        }
+    }
+    if o == lexdb_sql.OID_FLOAT8 {
+        match lexdb_float.parse(s, false) {
+            Ok(x) { return Val.Float(x) }
+            Err(_) { return Val.Null }
+        }
+    }
+    if o == lexdb_sql.OID_TS {
+        match lexdb_time.parseTs(s, &lexdb_time.utc()) {
+            Ok(u) { return Val.Ts(u) }
+            Err(_) { return Val.Null }
+        }
+    }
+    if o == lexdb_sql.OID_BYTEA { return Val.Bytes(lexdb_catalog.hexBytes(s)) }
+    return Val.Text(s.toStr())
+}
+
+// A value made in code as its column's type (an int in a NUMBER column, a
+// text date in a DATE one).
+fn oraCoerce(c: &OraCol, v: Val): Val {
+    let o = lexOid(c)
+    match v {
+        Val.Int(n) {
+            if o == lexdb_sql.OID_NUMERIC {
+                match Decimal.parse(&(n.toStr())) {
+                    Ok(d) { return Val.Num(d) }
+                    Err(_) { return v }
+                }
+            }
+            return v
+        }
+        Val.Text(s) {
+            if o == lexdb_sql.OID_TS { return oraVal(c, &s) }
+            if o == lexdb_sql.OID_NUMERIC || o == lexdb_sql.OID_INT8 { return oraVal(c, &s) }
+            return v
+        }
+        else { return v }
+    }
+}
+
+fn oraTyped(view: &str, rows: &[][]str): [][]Val {
+    let cs = cols(view)
+    var out: [][]Val = []
+    for r in rows {
+        var vs: []Val = []
+        for k in 0..len(cs) { append(mut &vs, if k < len(r) { oraVal(&cs[k], &r[k]) } else { Val.Null }) }
+        append(mut &out, vs)
+    }
+    return out
+}
+
+// The column of a view that tells a template row's kind (the value a pending row's disc has).
+fn oraDiscCol(base: &str): str {
+    match base.toStr() {
+        "TAB_COLUMNS", "TAB_COLS" { return "DATA_TYPE" }
+        "INDEXES" { return "UNIQUENESS" }
+        "CONSTRAINTS" { return "CONSTRAINT_TYPE" }
+        "OBJECTS", "PROCEDURES" { return "OBJECT_TYPE" }
+        "SOURCE" { return "TYPE" }
+        "CATALOG", "TAB_COMMENTS" { return "TABLE_TYPE" }
+        else { return "" }
+    }
+}
+
+// The rows of a view of the ALL_/USER_/DBA_ family from the pending ones: each
+// view column from the row's own sets, else the template row (ALL_x's) of its
+// kind, else NULL.
+fn oraProject(view: &str, fam: &Family, pends: &[]OraPend, userOwner: &str): [][]Val {
+    let cs = cols(view)
+    let allView = "ALL_" + fam.base
+    let tcols = cols(&allView)
+    let dc = oraDiscCol(&fam.base)
+    var out: [][]Val = []
+    var tIdx: []int = []                // each view column's place in the template
+    for c in cs {
+        var ti = -1
+        for k in 0..len(tcols) { if tcols[k].name == c.name { ti = k } }
+        append(mut &tIdx, ti)
+    }
+    for p in pends {
+        if fam.scope == "USER" && p.owner != userOwner { continue }
+        let tr = template(&allView, &dc, &p.disc)
+        var vs: []Val = []
+        for k in 0..len(cs) {
+            var v = Val.Null
+            var found = false
+            for nv in p.sets {
+                if nv.name == cs[k].name {
+                    v = oraCoerce(&cs[k], nv.v)
+                    found = true
+                }
+            }
+            if !found && tIdx[k] >= 0 && tIdx[k] < len(tr) { v = oraVal(&cs[k], &tr[tIdx[k]]) }
+            // the template's owner is the account the templates were taken from: the object's own owner is this row's
+            let cn = cs[k].name
+            if !found && (cn == "OWNER" || cn == "TABLE_OWNER" || cn == "INDEX_OWNER" || cn == "SEQUENCE_OWNER") && len(p.owner) > 0 {
+                v = oraCoerce(&cs[k], Val.Text(p.owner))
+            }
+            append(mut &vs, v)
+        }
+        append(mut &out, vs)
+    }
+    return out
+}
+
+// A row of one of the views Oracle has one of for the instance or the session:
+// its template row (NULL where it has none) with sets.
+fn oraOneRow(view: &str, sets: []OraNV): []Val {
+    let cs = cols(view)
+    let ts = rows(view, "template")
+    var vs: []Val = []
+    for k in 0..len(cs) { append(mut &vs, if len(ts) > 0 && k < len(ts[0]) { oraVal(&cs[k], &ts[0][k]) } else { Val.Null }) }
+    for nv in sets {
+        for k in 0..len(cs) { if cs[k].name == nv.name { vs[k] = oraCoerce(&cs[k], nv.v) } }
+    }
+    return vs
+}
+
+fn oraNV(name: &str, v: Val): OraNV { return OraNV{name: name.toStr(), v: v} }
+fn oraNS(name: &str, v: &str): OraNV { return OraNV{name: name.toStr(), v: Val.Text(v.toStr())} }
+
+fn oraSeqLimit(n: int): Val {
+    // Oracle's default MAXVALUE is 28 nines; lexdb's is the type's
+    if n == 9223372036854775807 {
+        match Decimal.parse("9999999999999999999999999999") {
+            Ok(d) { return Val.Num(d) }
+            Err(_) { return Val.Int(n) }
+        }
+    }
+    return Val.Int(n)
+}
+
+fn oraUserId(roles: &[]Role, name: &str): int {
+    for i in 0..len(roles) { if roles[i].name == name { return 100 + i } }
+    return 100
+}
+
+fn oraObject(p: mut &OraPend, name: &str, id: int, typ: &str, generated: bool) {
+    p.s("OBJECT_NAME", name)
+    p.i("OBJECT_ID", id)
+    p.i("DATA_OBJECT_ID", id)
+    p.s("OBJECT_TYPE", typ)
+    p.s("CREATED", ORA_DATE)
+    p.s("LAST_DDL_TIME", ORA_DATE)
+    p.s("TIMESTAMP", "2000-01-01:00:00:00")
+    p.s("GENERATED", if generated { "Y" } else { "N" })
+}
+
+// The default of a column as Oracle shows it (DATA_DEFAULT), "" none.
+fn oraDefault(c: &lexdb_sql.ColDef): str {
+    if c.identity != lexdb_sql.ID_NONE { return "" }
+    match c.def {
+        Some(d) { return lexdb_sql.exprText(&d) }
+        None { return "" }
+    }
+}
+
+fn oraIdxName(ix: &CatIdx): str { return oraUp(&ix.name) }
+
+// Whether an index of a constraint has the name lexdb makes when none is given (Oracle's GENERATED = Y: SYS_Cnnn).
+fn oraGenIdx(ct: &CatTab, ix: &CatIdx): bool {
+    if !ix.con { return false }
+    let t = lexdb_sql.baseName(&ct.name)
+    return ix.name == t + "_pkey" || (strings.startsWith(&ix.name, &(t + "_")) && strings.endsWith(&ix.name, "_key"))
+}
+
+// ALL_TAB_COLUMNS' rows of one table or view.
+fn oraColRows(out: mut &[]OraPend, ct: &CatTab, user: &str, view: bool) {
+    if lexdb_base.isTempSchema(&ct.schema) { return }
+    let owner = oraOwner(&ct.schema, user)
+    var n = 0
+    for i in 0..len(ct.t.cols) {
+        let c = &ct.t.cols[i]
+        if c.name == ROWID { continue }
+        n += 1
+        var nn = c.notNull
+        for k in ct.t.pk { if k == i { nn = true } }
+        var ty = oraTypeOf(&c.typ)
+        // a view's text column has lost its length (lexdb keeps no typmod through a query): Oracle's VARCHAR2, not a CLOB
+        if view && ty.dtype == "CLOB" { ty = OraT{dtype: "VARCHAR2", len: 4000, prec: -1, scale: -1, chars: 4000} }
+        // an identity column is a plain NUMBER in Oracle (lexdb's is a bigint)
+        if (c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT) && ty.dtype == "NUMBER" { ty.scale = -1 }
+        var p = oraPend(&owner, &ty.dtype)
+        p.s("TABLE_NAME", &oraTabName(ct))
+        p.s("COLUMN_NAME", &oraColName(c))
+        p.s("DATA_TYPE", &ty.dtype)
+        p.i("DATA_LENGTH", ty.len)
+        p.set("DATA_PRECISION", oraOptInt(ty.prec))
+        p.set("DATA_SCALE", oraOptInt(ty.scale))
+        p.s("NULLABLE", if nn { "N" } else { "Y" })
+        p.i("COLUMN_ID", n)
+        p.i("INTERNAL_COLUMN_ID", n)
+        p.i("SEGMENT_COLUMN_ID", n)
+        p.s("QUALIFIED_COL_NAME", &oraColName(c))
+        let d = oraDefault(c)
+        p.set("DATA_DEFAULT", if len(d) > 0 { Val.Text(d) } else { Val.Null })
+        p.set("DATA_DEFAULT_VC", if len(d) > 0 { Val.Text(d) } else { Val.Null })
+        p.set("DEFAULT_LENGTH", if len(d) > 0 { Val.Int(len(d)) } else { Val.Null })
+        p.s("IDENTITY_COLUMN", if c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT { "YES" } else { "NO" })
+        if ty.chars > 0 {
+            p.i("CHAR_LENGTH", ty.chars)
+            p.i("CHAR_COL_DECL_LENGTH", ty.chars)
+        } else if ty.dtype != "VARCHAR2" && ty.dtype != "CHAR" {
+            p.i("CHAR_LENGTH", 0)
+        }
+        append(mut &out, p)
+    }
+}
+
+fn oraCommentRows(out: mut &[]OraPend, ct: &CatTab, user: &str, tableLevel: bool, isView: bool) {
+    if lexdb_base.isTempSchema(&ct.schema) { return }
+    let owner = oraOwner(&ct.schema, user)
+    if tableLevel {
+        var p = oraPend(&owner, if isView { "VIEW" } else { "TABLE" })
+        p.s("TABLE_NAME", &oraTabName(ct))
+        p.s("TABLE_TYPE", if isView { "VIEW" } else { "TABLE" })
+        p.null("COMMENTS")
+        append(mut &out, p)
+        return
+    }
+    for c in ct.t.cols {
+        if c.name == ROWID { continue }
+        var p = oraPend(&owner, &"")
+        p.s("TABLE_NAME", &oraTabName(ct))
+        p.s("COLUMN_NAME", &oraColName(&c))
+        p.null("COMMENTS")
+        append(mut &out, p)
+    }
+}
+
+fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
+    // objects of the public schema are the login's own only when it has no schema of its name; a user with one
+    // has them as the system's (USER_ views list a user's own schema alone)
+    var user = snap.user
+    for sc in snap.schemas { if sc == strings.toLowerAscii(&snap.user) && sc != "public" { user = "SYS" } }
+    var out: []OraPend = []
+    if base == "TABLES" {
+        for ct in snap.tabs {
+            if lexdb_base.isTempSchema(&ct.schema) { continue }
+            var p = oraPend(&oraOwner(&ct.schema, &user), &"")
+            p.s("TABLE_NAME", &oraTabName(&ct))
+            var ident = false
+            for c in ct.t.cols { if c.name != ROWID && (c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT) { ident = true } }
+            p.s("HAS_IDENTITY", if ident { "YES" } else { "NO" })
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "TAB_COLUMNS" || base == "TAB_COLS" {
+        for ct in snap.tabs { oraColRows(mut &out, &ct, &user, false) }
+        for v in snap.views { oraColRows(mut &out, &v, &user, true) }
+        return out
+    }
+    if base == "OBJECTS" {
+        for ct in snap.tabs {
+            if lexdb_base.isTempSchema(&ct.schema) { continue }
+            let owner = oraOwner(&ct.schema, &user)
+            var p = oraPend(&owner, &"TABLE")
+            oraObject(mut &p, &oraTabName(&ct), ct.oid, &"TABLE", false)
+            append(mut &out, p)
+            for ix in ct.idxs {
+                var q = oraPend(&owner, &"INDEX")
+                oraObject(mut &q, &oraIdxName(&ix), ix.oid, &"INDEX", oraGenIdx(&ct, &ix))
+                append(mut &out, q)
+            }
+        }
+        for v in snap.views {
+            if lexdb_base.isTempSchema(&v.schema) { continue }
+            var p = oraPend(&oraOwner(&v.schema, &user), &"VIEW")
+            oraObject(mut &p, &oraTabName(&v), v.oid, &"VIEW", false)
+            append(mut &out, p)
+        }
+        for d in snap.seqs {
+            if len(d.ownerT) > 0 { continue }
+            let sc = lexdb_sql.schemaOf(&d.key)
+            if lexdb_base.isTempSchema(&sc) { continue }
+            var p = oraPend(&oraOwner(&sc, &user), &"SEQUENCE")
+            oraObject(mut &p, &oraUp(&lexdb_sql.baseName(&d.key)), lexdb_catalog.seqOid(&d), &"SEQUENCE", false)
+            append(mut &out, p)
+        }
+        for pr in snap.procs {
+            var p = oraPend(&pr.owner, &pr.kind)
+            oraObject(mut &p, &pr.name, lexdb_sql.nameOid("p", &(pr.owner + "." + pr.name)), &pr.kind, false)
+            p.s("STATUS", "VALID")
+            p.s("TEMPORARY", "N")
+            p.s("SECONDARY", "N")
+            p.i("NAMESPACE", 1)
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "PROCEDURES" {
+        for pr in snap.procs {
+            var p = oraPend(&pr.owner, &pr.kind)
+            p.s("OBJECT_NAME", &pr.name)
+            p.i("OBJECT_ID", lexdb_sql.nameOid("p", &(pr.owner + "." + pr.name)))
+            p.i("SUBPROGRAM_ID", 1)
+            p.s("OBJECT_TYPE", &pr.kind)
+            p.s("AGGREGATE", "NO")
+            p.s("PIPELINED", "NO")
+            p.s("PARALLEL", "NO")
+            p.s("INTERFACE", "NO")
+            p.s("DETERMINISTIC", "NO")
+            p.s("AUTHID", "DEFINER")
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "SOURCE" {
+        // the text from the keyword PROCEDURE or FUNCTION on, a row per line
+        for pr in snap.procs {
+            let up = strings.toUpperAscii(&pr.src)
+            var at = strings.indexOf(&up, &pr.kind, 0)
+            if at < 0 { at = 0 }
+            let lines = strings.split(&pr.src[at..len(pr.src)], "\n")
+            for k in 0..len(lines) {
+                var p = oraPend(&pr.owner, &pr.kind)
+                p.s("NAME", &pr.name)
+                p.s("TYPE", &pr.kind)
+                p.i("LINE", k + 1)
+                p.s("TEXT", &(lines[k] + (if k + 1 < len(lines) { "\n" } else { "" })))
+                p.i("ORIGIN_CON_ID", 3)
+                append(mut &out, p)
+            }
+        }
+        return out
+    }
+    if base == "CATALOG" {
+        for ct in snap.tabs {
+            if lexdb_base.isTempSchema(&ct.schema) { continue }
+            var p = oraPend(&oraOwner(&ct.schema, &user), &"TABLE")
+            p.s("TABLE_NAME", &oraTabName(&ct))
+            p.s("TABLE_TYPE", "TABLE")
+            append(mut &out, p)
+        }
+        for v in snap.views {
+            if lexdb_base.isTempSchema(&v.schema) { continue }
+            var p = oraPend(&oraOwner(&v.schema, &user), &"VIEW")
+            p.s("TABLE_NAME", &oraTabName(&v))
+            p.s("TABLE_TYPE", "VIEW")
+            append(mut &out, p)
+        }
+        for d in snap.seqs {
+            if len(d.ownerT) > 0 { continue }
+            let sc = lexdb_sql.schemaOf(&d.key)
+            if lexdb_base.isTempSchema(&sc) { continue }
+            var p = oraPend(&oraOwner(&sc, &user), &"SEQUENCE")
+            p.s("TABLE_NAME", &oraUp(&lexdb_sql.baseName(&d.key)))
+            p.s("TABLE_TYPE", "SEQUENCE")
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "TAB_COMMENTS" || base == "COL_COMMENTS" {
+        // (COMMENT ON is accepted and ignored, O3: no comments)
+        for ct in snap.tabs { oraCommentRows(mut &out, &ct, &user, base == "TAB_COMMENTS", false) }
+        for v in snap.views { oraCommentRows(mut &out, &v, &user, base == "TAB_COMMENTS", true) }
+        return out
+    }
+    if base == "SEQUENCES" {
+        for d in snap.seqs {
+            if len(d.ownerT) > 0 { continue }
+            let sc = lexdb_sql.schemaOf(&d.key)
+            if lexdb_base.isTempSchema(&sc) { continue }
+            var p = oraPend(&oraOwner(&sc, &user), &"")
+            p.s("SEQUENCE_OWNER", &oraOwner(&sc, &user))
+            p.s("SEQUENCE_NAME", &oraUp(&lexdb_sql.baseName(&d.key)))
+            p.set("MIN_VALUE", Val.Int(d.min))
+            p.set("MAX_VALUE", oraSeqLimit(d.max))
+            p.i("INCREMENT_BY", d.inc)
+            p.s("CYCLE_FLAG", if d.cycle { "Y" } else { "N" })
+            p.i("CACHE_SIZE", if d.cache > 1 { d.cache } else { 0 })
+            p.i("LAST_NUMBER", d.start)
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "VIEWS" {
+        for v in snap.views {
+            if lexdb_base.isTempSchema(&v.schema) { continue }
+            var p = oraPend(&oraOwner(&v.schema, &user), &"")
+            p.s("VIEW_NAME", &oraTabName(&v))
+            let text = lexdb_sql.viewShown(&v.t.view)
+            p.i("TEXT_LENGTH", len(text))
+            p.s("TEXT", &text)
+            p.s("TEXT_VC", &text)
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "TAB_IDENTITY_COLS" {
+        for ct in snap.tabs {
+            if lexdb_base.isTempSchema(&ct.schema) { continue }
+            for c in ct.t.cols {
+                if c.name == ROWID || (c.identity != lexdb_sql.ID_ALWAYS && c.identity != lexdb_sql.ID_BY_DEFAULT) { continue }
+                var p = oraPend(&oraOwner(&ct.schema, &user), &"")
+                p.s("TABLE_NAME", &oraTabName(&ct))
+                p.s("COLUMN_NAME", &oraColName(&c))
+                p.s("GENERATION_TYPE", if c.identity == lexdb_sql.ID_ALWAYS { "ALWAYS" } else { "BY DEFAULT" })
+                p.s("SEQUENCE_NAME", &("ISEQ$$_" + ct.oid.toStr()))
+                append(mut &out, p)
+            }
+        }
+        return out
+    }
+    if base == "INDEXES" || base == "IND_COLUMNS" {
+        for ct in snap.tabs {
+            if lexdb_base.isTempSchema(&ct.schema) { continue }
+            let owner = oraOwner(&ct.schema, &user)
+            for ix in ct.idxs {
+                if base == "INDEXES" {
+                    var p = oraPend(&owner, if ix.unique { "UNIQUE" } else { "NONUNIQUE" })
+                    p.s("INDEX_NAME", &oraIdxName(&ix))
+                    p.s("TABLE_OWNER", &owner)
+                    p.s("TABLE_NAME", &oraTabName(&ct))
+                    p.s("UNIQUENESS", if ix.unique { "UNIQUE" } else { "NONUNIQUE" })
+                    var fn_ = false
+                    for c in ix.cols { if c == 0 { fn_ = true } }
+                    p.s("INDEX_TYPE", if fn_ { "FUNCTION-BASED NORMAL" } else { "NORMAL" })
+                    p.s("CONSTRAINT_INDEX", if ix.con { "YES" } else { "NO" })
+                    p.s("GENERATED", if oraGenIdx(&ct, &ix) { "Y" } else { "N" })
+                    append(mut &out, p)
+                } else {
+                    for j in 0..len(ix.cols) {
+                        var p = oraPend(&owner, &"")
+                        p.s("INDEX_OWNER", &owner)
+                        p.s("INDEX_NAME", &oraIdxName(&ix))
+                        p.s("TABLE_OWNER", &owner)
+                        p.s("TABLE_NAME", &oraTabName(&ct))
+                        let cn = ix.cols[j]
+                        var cname = ""
+                        var len_ = 22
+                        var chars = 0
+                        if cn >= 1 && cn <= len(ct.t.cols) {
+                            cname = oraColName(&ct.t.cols[cn - 1])
+                            let ty = oraTypeOf(&ct.t.cols[cn - 1].typ)
+                            len_ = ty.len
+                            chars = ty.chars
+                        } else if j < len(ix.exprs) && len(ix.exprs[j]) > 0 {
+                            cname = ix.exprs[j]
+                        }
+                        p.s("COLUMN_NAME", &cname)
+                        p.i("COLUMN_POSITION", j + 1)
+                        p.i("COLUMN_LENGTH", len_)
+                        p.i("CHAR_LENGTH", chars)
+                        p.s("DESCEND", if j < len(ix.opts) && strings.contains(&ix.opts[j], "DESC") { "DESC" } else { "ASC" })
+                        append(mut &out, p)
+                    }
+                }
+            }
+        }
+        return out
+    }
+    if base == "CONSTRAINTS" || base == "CONS_COLUMNS" {
+        for c in snap.cons {
+            if lexdb_base.isTempSchema(&c.schema) { continue }
+            let ti = lexdb_catalog.catTabIdx(snap, c.rel)
+            if ti < 0 { continue }
+            let ct = &snap.tabs[ti]
+            let owner = oraOwner(&c.schema, &user)
+            let ty = if c.typ == "p" { "P" } else if c.typ == "u" { "U" } else if c.typ == "f" { "R" } else { "C" }
+            if base == "CONSTRAINTS" {
+                var p = oraPend(&owner, &ty)
+                p.s("CONSTRAINT_NAME", &oraUp(&c.name))
+                p.s("CONSTRAINT_TYPE", &ty)
+                p.s("TABLE_NAME", &oraTabName(ct))
+                if c.typ == "c" {
+                    var b = c.check
+                    if strings.startsWith(&b, "(") && strings.endsWith(&b, ")") { b = b[1..len(b) - 1].toStr() }
+                    p.s("SEARCH_CONDITION", &b)
+                    p.s("SEARCH_CONDITION_VC", &b)
+                }
+                if c.typ == "f" {
+                    // the key it refers to: the primary or UNIQUE constraint on its index
+                    var rname = ""
+                    var rowner = owner
+                    for k in snap.cons {
+                        if (k.typ == "p" || k.typ == "u") && k.rel == c.refRel && k.idx == c.idx {
+                            rname = oraUp(&k.name)
+                            rowner = oraOwner(&k.schema, &user)
+                        }
+                    }
+                    p.s("R_OWNER", &rowner)
+                    p.s("R_CONSTRAINT_NAME", &rname)
+                    p.s("DELETE_RULE", if c.del == "c" { "CASCADE" } else if c.del == "n" { "SET NULL" } else { "NO ACTION" })
+                }
+                if c.typ == "p" || c.typ == "u" {
+                    var iname = ""
+                    for ix in ct.idxs { if ix.oid == c.idx { iname = oraIdxName(&ix) } }
+                    p.s("INDEX_OWNER", &owner)
+                    p.s("INDEX_NAME", &iname)
+                }
+                p.s("DEFERRABLE", if c.deferrable { "DEFERRABLE" } else { "NOT DEFERRABLE" })
+                p.s("DEFERRED", if c.deferred { "DEFERRED" } else { "IMMEDIATE" })
+                p.s("VALIDATED", if c.valid { "VALIDATED" } else { "NOT VALIDATED" })
+                p.s("GENERATED", if lexdb_catalog.sysNamed(&c, &ct.name) { "USER NAME" } else { "GENERATED NAME" })
+                append(mut &out, p)
+            } else {
+                if c.typ == "c" { continue }
+                for j in 0..len(c.cols) {
+                    let cn = c.cols[j]
+                    if cn < 1 || cn > len(ct.t.cols) { continue }
+                    var p = oraPend(&owner, &"")
+                    p.s("CONSTRAINT_NAME", &oraUp(&c.name))
+                    p.s("TABLE_NAME", &oraTabName(ct))
+                    p.s("COLUMN_NAME", &oraColName(&ct.t.cols[cn - 1]))
+                    p.i("POSITION", j + 1)
+                    append(mut &out, p)
+                }
+            }
+        }
+        return out
+    }
+    return out
+}
+
+pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] {
+    if !isView(view) { return Ok([]) }
+    let snap = &cq.snap
+    let roles = &cq.roles
+    let sess = cq.sess
+    let userOwner = strings.toUpperAscii(&snap.user)
+    let fam = family(view)
+    if view == "ALL_USERS" || view == "DBA_USERS" {
+        var rows = oraTyped(view, &rows(view, "full"))
+        // the roles that log in, and the session's user (a TNS login needs no role under trust)
+        var names: []str = []
+        for r in roles { if r.login { append(mut &names, r.name) } }
+        var known = false
+        for n in names { if n == snap.user { known = true } }
+        if !known { append(mut &names, snap.user) }
+        for i in 0..len(names) {
+            let uname = strings.toUpperAscii(&names[i])
+            append(mut &rows, oraOneRowOf(view, "template", [oraNS("USERNAME", &uname), oraNV("USER_ID", iv(oraUserId(&roles, &names[i]))),
+                                                              oraNS("CREATED", ORA_DATE), oraNS("PASSWORD_CHANGE_DATE", ORA_DATE)]))
+        }
+        return Ok(rows)
+    }
+    if view == "USER_USERS" {
+        return Ok([oraOneRow(view, [oraNS("USERNAME", &userOwner), oraNV("USER_ID", iv(oraUserId(&roles, &snap.user))),
+                                    oraNS("CREATED", ORA_DATE), oraNS("PASSWORD_CHANGE_DATE", ORA_DATE)])])
+    }
+    if view == "V_$SESSION" {
+        return Ok([oraOneRow(view, [oraNV("SID", iv(sess)), oraNV("SERIAL#", iv(1)), oraNS("USERNAME", &userOwner),
+                                    oraNS("SCHEMANAME", &userOwner), oraNV("USER#", iv(oraUserId(&roles, &snap.user))),
+                                    oraNS("STATUS", "ACTIVE"), oraNS("TYPE", "USER"), oraNS("SERVER", "DEDICATED"),
+                                    oraNS("MACHINE", &lexdb_dialect.hostName()), oraNS("OSUSER", &snap.user),
+                                    oraNS("PROGRAM", "lexdb"), oraNS("SERVICE_NAME", "FREEPDB1"), oraNV("CON_ID", iv(3)),
+                                    oraNS("LOGON_TIME", ORA_DATE), oraNS("SQL_ADDRESS", "00"), oraNS("COMMAND", "3")])])
+    }
+    if view == "V_$INSTANCE" {
+        return Ok([oraOneRow(view, [oraNS("INSTANCE_NAME", "lexdb"), oraNS("HOST_NAME", &lexdb_dialect.hostName()),
+                                    oraNS("STARTUP_TIME", ORA_DATE), oraNS("STATUS", "OPEN"), oraNS("DATABASE_STATUS", "ACTIVE"),
+                                    oraNS("ACTIVE_STATE", "NORMAL")])])
+    }
+    if view == "V_$DATABASE" {
+        return Ok([oraOneRow(view, [oraNS("NAME", "LEXDB"), oraNS("CREATED", ORA_DATE), oraNS("OPEN_MODE", "READ WRITE"),
+                                    oraNV("CON_ID", iv(0)), oraNS("DB_UNIQUE_NAME", "lexdb")])])
+    }
+    if len(fam.scope) > 0 && isBuilt(&fam.base) {
+        let pends = oraBuilt(&snap, &fam.base, &roles)
+        return Ok(oraProject(view, &fam, &pends, &userOwner))
+    }
+    return Ok(oraTyped(view, &rows(view, "full")))
+}
+
+// A row of kind (its template) with sets, for a view whose template row has a name to replace.
+fn oraOneRowOf(view: &str, kind: &str, sets: []OraNV): []Val {
+    let cs = cols(view)
+    let ts = rows(view, kind)
+    var vs: []Val = []
+    for k in 0..len(cs) { append(mut &vs, if len(ts) > 0 && k < len(ts[0]) { oraVal(&cs[k], &ts[0][k]) } else { Val.Null }) }
+    for nv in sets {
+        for k in 0..len(cs) { if cs[k].name == nv.name { vs[k] = oraCoerce(&cs[k], nv.v) } }
+    }
+    return vs
 }
