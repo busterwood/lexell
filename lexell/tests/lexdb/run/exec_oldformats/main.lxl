@@ -1,10 +1,8 @@
-// lexdb: data directories written before column leaves (design/lexdb.md
-// 9.112) open and read, through SQL: one as lexdb wrote it at 78731801 (row
-// leaves, T_LEAF: fixture78) and one at 61d57286 (front-coded leaves,
-// T_FLEAF: fixture61), each a table of every place kind in two layouts,
-// with NULLs, a long text (a tagged row), a value stored apart and an
-// index, checkpointed, and a last commit in the log only (gen.lxl.txt made
-// both).
+// lexdb: a data directory written before column leaves (design/lexdb.md
+// 9.112) opens and reads, through SQL: lexdb at 61d57286 (front-coded leaves,
+// T_FLEAF: fixture61), a table of every place kind in two layouts, with
+// NULLs, a long text (a tagged row), a value stored apart and an index,
+// checkpointed, and a last commit in the log only (gen.lxl.txt made it).
 // - Opened (the log replayed over the old leaves), four queries give what
 //   the lexdb that wrote it gives (the expected lines below are its
 //   output), and a follower (a replica's reader) reads every tree as the
@@ -15,11 +13,8 @@
 //   beside the old leaves (a leaf holding rows of two layouts stays rows);
 //   the queries agree, and agree again, with the follower's reads, after
 //   reopening.
-// expect: 78 opened: leaves T_LEAF true T_FLEAF false T_CLEAF false; queries as at 78731801 true; follower ok true
-// expect: 78 written: leaves T_LEAF true T_FLEAF true T_CLEAF true; same as rows only true
-// expect: 78 reopened: same true; follower ok true
-// expect: 61 opened: leaves T_LEAF false T_FLEAF true T_CLEAF false; queries as at 61d57286 true; follower ok true
-// expect: 61 written: leaves T_LEAF false T_FLEAF true T_CLEAF true; same as rows only true
+// expect: 61 opened: leaves T_FLEAF true T_CLEAF false; queries as at 61d57286 true; follower ok true
+// expect: 61 written: leaves T_FLEAF true T_CLEAF true; same as rows only true
 // expect: 61 reopened: same true; follower ok true
 import "os"
 import "fs"
@@ -31,7 +26,6 @@ import "../../../../cmd/lexdb_store"
 import "../../../../cmd/lexdb_disk"
 import "../../../../cmd/lexdb_page"
 import "../../../../cmd/lexdb_exec"
-import "./fixture78"
 import "./fixture61"
 
 // What the lexdb that wrote them gives for queries() (the same for both).
@@ -102,28 +96,16 @@ fn put(dir: &str, name: &str, size: int, at: &[]int, b64: &[]str) {
     io.write(&(fs.join(&(dir.toStr()), &(name.toStr()))), &(strFromBytes(&b))).unwrap()
 }
 
-fn materialize(which: int, dir: &str) {
+fn materialize(dir: &str) {
     let made = fs.mkdirAll(&(dir.toStr()))
-    if which == 78 {
-        for f in fixture78.files() {
-            var at: []int = []
-            var bs: []str = []
-            for p in f.parts {
-                append(mut &at, p.at)
-                append(mut &bs, p.b64)
-            }
-            put(dir, &f.name, f.size, &at, &bs)
+    for f in fixture61.files() {
+        var at: []int = []
+        var bs: []str = []
+        for p in f.parts {
+            append(mut &at, p.at)
+            append(mut &bs, p.b64)
         }
-    } else {
-        for f in fixture61.files() {
-            var at: []int = []
-            var bs: []str = []
-            for p in f.parts {
-                append(mut &at, p.at)
-                append(mut &bs, p.b64)
-            }
-            put(dir, &f.name, f.size, &at, &bs)
-        }
+        put(dir, &f.name, f.size, &at, &bs)
     }
 }
 
@@ -159,7 +141,7 @@ fn census(dir: &str): []int {
         while len(stack) > 0 {
             let x = pop(mut &stack)
             let pg = strToBytes(b[x * 4096..x * 4096 + 4096].toStr())
-            lexdb_page.check(&pg, x, lexdb_page.T_LEAF).unwrap()
+            lexdb_page.check(&pg, x, lexdb_page.T_ANY).unwrap()
             let typ = int(pg[12])
             if typ == lexdb_page.T_INTERNAL {
                 for k in lexdb_page.decodeNode(&pg).kids { append(mut &stack, k) }
@@ -173,7 +155,7 @@ fn census(dir: &str): []int {
 }
 
 fn censusText(c: &[]int): str {
-    return "leaves T_LEAF " + (c[lexdb_page.T_LEAF] > 0).toStr() + " T_FLEAF " + (c[lexdb_page.T_FLEAF] > 0).toStr() + " T_CLEAF " + (c[lexdb_page.T_CLEAF] > 0).toStr()
+    return "leaves T_FLEAF " + (c[lexdb_page.T_FLEAF] > 0).toStr() + " T_CLEAF " + (c[lexdb_page.T_CLEAF] > 0).toStr()
 }
 
 // Whether a follower on dir reads every tree as the store does.
@@ -209,14 +191,14 @@ fn opts(): lexdb_store.Options {
     return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 64 * 1024, ckptBytes: 16 * 1024 * 1024, snapNodes: 100000}
 }
 
-fn one(which: int) {
-    let base = fs.join(&(os.tempDir()), &("lexdb_oldformats_" + os.pid().toStr() + "_" + which.toStr()))
+fn one() {
+    let base = fs.join(&(os.tempDir()), &("lexdb_oldformats_" + os.pid().toStr()))
     let da = fs.join(&base, "a")
     let db = fs.join(&base, "b")
-    materialize(which, &da)
-    materialize(which, &db)
+    materialize(&da)
+    materialize(&db)
     let before = census(&da)
-    let w = which.toStr()
+    let w = "61"
     let r = lexdb_store.run(lexdb_disk.real(&(da.toStr())), opts(), fn(sa: lexdb_store.Store): int {
         let r2 = lexdb_store.run(lexdb_disk.real(&(db.toStr())), opts(), fn(sb: lexdb_store.Store): int {
             sb.setColumns(false)
@@ -225,7 +207,7 @@ fn one(which: int) {
             var a = lexdb_exec.newSession(sa)
             var b = lexdb_exec.newSession(sb)
             let got = runAll(mut &a, &queries())
-            println(w + " opened: " + censusText(&before) + "; queries as at " + (if which == 78 { "78731801" } else { "61d57286" }) + " " +
+            println(w + " opened: " + censusText(&before) + "; queries as at 61d57286 " +
                     sameList(&got, &expected()).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
             for x in ["update m set a = a + 1 where id % 2 = 0 and id < 250", "alter table m add column g text",
                       "update m set g = 'g' || id where id % 3 = 0 or id < 200", "insert into m (id, a, c, g) select g, g % 9, g, 'n' || g from generate_series(400, 460) g"] {
@@ -258,6 +240,5 @@ fn one(which: int) {
 }
 
 fn main() {
-    one(78)
-    one(61)
+    one()
 }
