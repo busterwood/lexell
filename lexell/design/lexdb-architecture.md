@@ -173,14 +173,15 @@ stay inside a module and the caller pays one dispatch, not one per value.
 ## 8. Phases
 
 0. **Architecture and inventory** (this branch). No code changes.
-1. **Dead compatibility cleanup and the `rs.batch` split.** `T_LEAF`, old
-   layout compatibility, dead test hooks, flat free list. Keep the tagged
-   writer as the overflow form until Rows replaces it. Split `rs.batch`:
-   compiled expressions and typed sort always on; the flag controls vector
-   scans only. Time-boxed.
+1. **Dead switches and the `rs.batch` split.** `LEXDB_ROWFMT`, dead test
+   hooks. Done on this branch. The format deletions wait for Rows, so the
+   old-format fixtures are retargeted once. Split `rs.batch`: compiled
+   expressions and typed sort always on; the flag controls vector scans only.
 2. **Rows / codec.** Start with `encodeLeafK`; then the universal column
    leaf, one layout per leaf, overflow for long/odd values, `C_ANY` /
-   `C_STUB`.
+   `C_STUB`. Delete `T_LEAF`, the old layout compatibility, the tagged-row
+   general form and mixed-layout leaves here, with the codec that replaces
+   them. Keep the tagged writer until the overflow codec lands.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
    follower base+delta; replica batch scans.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide
