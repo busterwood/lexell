@@ -3181,7 +3181,7 @@ fn encRowOf(t: &Table, row: &[]Val): str {
 
 fn placesOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
             need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
-    match lexdb_store.partOf(v) {
+    match lexdb_rows.partOf(v) {
         Some(p) {
             if lexdb_rows.fitsIn(&p, n, need) { return decRowNeed(&p, n, need, missing, &t.lays) }
             let w = try st.whole(txn, t.tree, key, v)
@@ -4152,7 +4152,7 @@ fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Resul
 // conflict, a snapshot gone too old beside heavy writes) is tried at a
 // later look. Nothing on a replica.
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
-    if st.isReplica() || !autoAnalyzeOn() { return Ok(0) }
+    if st.follower().isSome() || !autoAnalyzeOn() { return Ok(0) }
     st.memo.del(&AC_DUE)
     let r = autoLook(st)
     // (an error before a table's own: looked at again at the next look)
@@ -4283,7 +4283,7 @@ fn autoOne(st: &lexdb_store.Store, key: &str, raw: &str, t: &Table, mod: int): R
 // The task: a look every AUTO_NAP_MS when a commit counted changes, until
 // it is cancelled (lexdb's master starts it; a replica does not).
 pub fn autoAnalyzer(st: lexdb_store.Store): int {
-    if st.isReplica() || !autoAnalyzeOn() { return 0 }
+    if st.follower().isSome() || !autoAnalyzeOn() { return 0 }
     while true {
         // (sooner while a table waits for its writes to pause)
         let soon = st.memo.get(&AC_SOON).isSome()
@@ -4508,7 +4508,7 @@ fn setSpec(st: &lexdb_store.Store, t: &Table) {
 const VACUUM_STEP = 2048
 
 fn vacuumTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[Unit, DbErr] {
-    if st.isReplica() { return Ok(Unit{}) }
+    if st.follower().isSome() { return Ok(Unit{}) }
     var tabs: []Table = []
     if len(names) > 0 {
         for n in names {
@@ -4566,7 +4566,7 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
         try st.commit(r)
     }
     // temporary objects left by a crash (9.96); a replica's go with the master's
-    if !st.isReplica() { try dropLeftTemps(st) }
+    if !st.follower().isSome() { try dropLeftTemps(st) }
     return Ok(Unit{})
 }
 
@@ -18586,9 +18586,9 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
-    if st.isReplica() {
+    if st.follower().isSome() {
         match writesOn(s) {
-            Some(what) { return Err(lexdb_store.readOnly(&what)) }
+            Some(what) { return Err(lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))) }
             None {}
         }
     }
@@ -19213,7 +19213,7 @@ fn waitFits(cols: &[]int, eqs: &[]int, cur: int): bool {
 // the index does not hold is cheap only when most rows pass it: the rows
 // after the cursor that fail it are read again at every wake.
 fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql.Stmt): Result[Unit, DbErr] {
-    if st.isReplica() { return Err(waitRefused("is not supported on a replica")) }
+    if st.follower().isSome() { return Err(waitRefused("is not supported on a replica")) }
     if stmt.lockMode > 0 { return Err(waitRefused("cannot be used with FOR UPDATE, FOR SHARE and the like")) }
     if stmt.setop != 0 || len(stmt.from) != 1 || stmt.from[0].sub >= 0 {
         return Err(waitRefused("needs a SELECT from one ordinary table"))
@@ -23764,7 +23764,7 @@ fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
 // fixed layout, not stored apart, not one with long texts kept whole.
 fn plainTagged(s: &str): bool {
     if len(s) > 0 && (s[0] == FIXED || s[0] == 6 || s[0] == 0xFF) { return false }
-    return lexdb_store.partOf(s).isNone()
+    return lexdb_rows.partOf(s).isNone()
 }
 
 // bRunLazy for a run of tagged rows from vs[from] up to vs[to]: each decoded
