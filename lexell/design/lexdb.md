@@ -12259,3 +12259,31 @@ Every aggregate's results were the same on both, every round (checksums).
   PostgreSQL 1.3 to 1.7 times faster.
 
 The output: `~/Work/lexdb-bench/saved/results/2026-11-15-refresh/vspg.txt`.
+
+**With 3 replicas** (`--replicas 3`: lexdb's shape, 4 processes against
+PostgreSQL's 4 CPUs). `vspg.sh` runs one lexdb process, and replicas serve
+only the clients that connect to them (their shared port; nothing is
+forwarded from the master), so the table above is one core's. The same
+data, pgbench on the replicas' socket (`replicas.txt`):
+
+| point selects | lexdb, 3 replicas | lexdb, master only | PostgreSQL (4 CPUs) |
+|---|---:|---:|---:|
+| 1 client | 75,200/s | 83,000/s | 75,300/s |
+| 8 clients | 335,200/s, 8.9 µs | 138,500/s | 327,100/s |
+| 32 clients | 365,400/s, 8.2 µs | 127,000/s | 265,700/s |
+
+- **Mixed:** 8 clients updating on the master and 24 reading on the
+  replicas, 10 s: 16,500 to 17,200 updates/s and 306,000 to 320,000
+  selects/s together.
+- **Lag:** after updates alone, a replica had every commit at the first
+  look (0.4 s). After the mixed load, three times out of five every
+  replica sampled was current within a second; twice the replicas were
+  slow to answer and behind (about 20,000 updates behind for over 3 s
+  once; nine one-row queries took 12.6 and 17.5 s to answer after two
+  others). Not explained yet: a guess is the replicas reading a new
+  checkpoint while serving.
+- **A replica's scans are slow:** `select sum(abalance) from acct` (1M
+  rows) 180 ms on a replica against 14 ms on the master, `count(*)` 156
+  against 3.7. The replica reads through the follower's snapshot, which
+  does not take the batches' column-leaf scans. For reports on replicas
+  this is the gap to close.
