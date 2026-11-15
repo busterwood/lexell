@@ -194,6 +194,15 @@ the wide COPY parse/encode). `par_db_run.py` runs the matrix and writes its
 TSV; design/par-db-perf.md gives the results, the profiles and the
 projections.
 
+## TPC-H, derived
+
+`tpch/` runs the 22 TPC-H queries over dbgen data against lexdb and
+PostgreSQL on one machine. It is derived from TPC-H, not an audited TPC
+result, and it has no refresh functions: see
+[tpch/README.md](tpch/README.md) for the rules, modes and output. First
+`bench/tpch/fetch.sh WORKDIR/tpch-kit`; then
+`bench/tpch/run.sh LEXDB WORKDIR [SCALE] [RUNS]`.
+
 ## Notes
 
 - **Native and C.** The native backend is ahead on allocation and strings
