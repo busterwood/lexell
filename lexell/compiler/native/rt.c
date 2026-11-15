@@ -2596,6 +2596,28 @@ static void rt_spin_note(int64_t took) {
         if (in * 5 >= n * 4) { rt_spin_cur = w; return; }
     }
 }
+/* When the heap is idle: the retire queue is drained after this long with nothing to run
+   (LXL_TRIM_MS, default 300 ms); LXL_TRIM=0 turns it off. */
+static int rt_trim_on = -1;
+static int64_t rt_trim_delay;
+static int64_t rt_idle_from;
+static void rt_trim_cfg(void) {
+    const char* e = getenv("LXL_TRIM");
+    rt_trim_on = !(e && e[0] == '0');
+    int64_t ms = 300;
+    const char* d = getenv("LXL_TRIM_MS");
+    if (d) {
+        int64_t v = 0;
+        int any = 0;
+        for (; *d >= '0' && *d <= '9'; d++) {
+            v = v * 10 + (*d - '0');
+            any = 1;
+            if (v > 600000) { v = 600000; break; }
+        }
+        if (any) ms = v;
+    }
+    rt_trim_delay = ms * 1000000;
+}
 static void rt_poll(bool block, const char* w) {
     struct k_epoll_event ev[256];
     bool spun = false;
@@ -2622,6 +2644,25 @@ static void rt_poll(bool block, const char* w) {
             else if (rt_nheap && wait) wait = rt_heap[0]->wake_at - now;
         }
         if (wait < 0 && !rt_nio && !rt_njobs) rt_trap(14, "deadlock: every task is parked", w);
+        if (rt_trim_on < 0) rt_trim_cfg();
+        if (!block || rt_rq_head || !rt_trim_on || rt_mheap.queued < 4) {
+            rt_idle_from = 0;
+        } else if (rt_nio || rt_njobs) {
+            int64_t now = rt_mono();
+            if (!rt_idle_from) rt_idle_from = now;
+            int64_t idle = now - rt_idle_from;
+            if (idle >= rt_trim_delay) {
+                int64_t until = now + 250000;            /* at most 250 us of retiring */
+                while (rt_mheap.queue && lxllib_heaptrim() && rt_mono() < until) {}
+                if (rt_mheap.queue) {
+                    int64_t cap = 5 * 1000000;           /* drain the rest while idle */
+                    if (wait < 0 || wait > cap) wait = cap;
+                }
+            } else {
+                int64_t rem = rt_trim_delay - idle;
+                if (wait < 0 || wait > rem) wait = rem;   /* wake when the idle time is up */
+            }
+        }
         if (wait != 0 && rt_nio && rt_spin_ns && !spun) {
             spun = true;
             int64_t win = rt_spin_adapt ? rt_spin_cur : rt_spin_ns;
@@ -2668,7 +2709,7 @@ static void rt_poll(bool block, const char* w) {
             rt_spin_note(rt_mono() - idle_from);
             idle_from = 0;
         }
-        if (!block || rt_rq_head) return;
+        if (!block || rt_rq_head) { rt_idle_from = 0; return; }
     }
 }
 static rt_task* rt_next(const char* w) {

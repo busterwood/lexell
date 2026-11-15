@@ -295,16 +295,17 @@ header, and a new chunk is carved.
 **Retirement.** A chunk whose live count reaches zero goes on a per-heap
 retire queue. Nothing is unmapped on the free path. `lxllib_heaptrim()`
 retires one queued chunk: it detaches its class lists, `MADV_DONTNEED`s its
-2 MiB, and keeps the mapping for `heap_chunk` to reuse. With `LXL_TRIM=1` the
-event loop calls it when it is about to park with nothing runnable, with a
-queue floor of 4 chunks (8 MiB) and a budget of 250 µs per park; a chunk
-costs one `madvise`, not a scan. Retiring the 15 wholly free chunks of the
+2 MiB, and keeps the mapping for `heap_chunk` to reuse. With the trim on by
+default, the event loop calls it after 300 ms with nothing runnable
+(`LXL_TRIM_MS` sets the delay; `LXL_TRIM=0` turns it off), with a queue floor
+of 4 chunks (8 MiB) and a budget of 250 µs per park; a chunk costs one
+`madvise`, not a scan. Retiring the 15 wholly free chunks of the
 1M allocation probe added less than 0.1 ms to the run (median 11.9 ms with
 the trim against 11.8 without, inside the noise): a chunk is a list detach
 and one 2 MiB `MADV_DONTNEED`.
 
 **Measured on lexdb** (one CPU, `LXL_PAR=0`, cache 64 MB, one 1M-row table;
-`LXL_TRIM=1`, report at shutdown):
+trim on, report at shutdown):
 
 | State | Chunks before -> after | Heap before -> after | VmHWM | VmRSS before -> after |
 |---|---:|---:|---:|---:|
@@ -382,7 +383,7 @@ event loop's idle point, so no chunk is retired, and the per-chunk header is
 **lexdb, one server** (`LXL_PAR=0`, cache 64 MB, a 1M-row table with a primary
 key; query medians of three; RSS after 2.5 s idle):
 
-| | base | new | new + `LXL_TRIM=1` |
+| | base | new | new, trim on (default) |
 |---|---:|---:|---:|
 | insert 1M rows | 1.4 s | 1.4 s | 1.4 s |
 | `count(*)` | 8.7 ms | 8.9 ms | 9.3 ms |
@@ -394,8 +395,12 @@ key; query medians of three; RSS after 2.5 s idle):
 | RSS after queries | 200.6 MB | 200.7 MB | **128.7 MB** |
 | peak RSS | 341.0 MB | 341.1 MB | 341.0 MB |
 
-Query time is unchanged; the differences are noise (the sort is slightly
-faster on the new runtime). The trim returns **72 MB** of steady-state RSS
+The trim is now the default, after 300 ms with nothing to run (the table's
+trim column was measured with `LXL_TRIM=1`, which that delay makes the
+default; a fresh 1M run with no variable set settled at 139.1 MB after three
+seconds idle, against 214.9 MB with `LXL_TRIM=0`). `LXL_TRIM_MS=n` changes
+the delay. Query time is unchanged; the differences are noise (the sort is
+slightly faster on the new runtime). The trim returns **72 MB** of steady-state RSS
 after the insert and after the queries, and **not** the peak: the highest
 point is the same 341 MB, as section 7 said. The 250 µs idle pass is not
 visible in these latencies.

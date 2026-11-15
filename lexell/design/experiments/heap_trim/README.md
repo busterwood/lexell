@@ -29,9 +29,10 @@ around a trim and a refill.
 - `lxllib_heaptrim()` retires **one** queued chunk: detach its per-class
   lists, `MADV_DONTNEED` its 2 MiB, pool it for reuse. Returns 1 if it took a
   chunk off the queue, 0 when the queue is empty. It is O(NCLASS), no scan.
-- `LXL_TRIM=1` makes the event loop call `lxllib_heaptrim()` when it is about
-  to park with nothing to run, but only while the queue holds at least four
-  chunks, and with a 250 µs budget per park.
+- The trim is on by default: the event loop calls `lxllib_heaptrim()` after it
+  has been idle for 300 ms (`LXL_TRIM_MS=n` changes the delay; `LXL_TRIM=0`
+  turns it off), only while the queue holds at least four chunks, with a 250 µs
+  budget per park.
 
 ## Probes
 
@@ -54,12 +55,13 @@ extern `heapReport` and a loop of `heapTrim` at shutdown (before the store
 closes, so the cache is still live). A 1M-row measurement:
 
     rm -rf /tmp/lexdb-h && mkdir /tmp/lexdb-h
-    LXL_PAR=0 LEXDB_CACHE_MB=64 LXL_TRIM=1 LXL_HEAPSTAT=1 \
+    LXL_PAR=0 LEXDB_CACHE_MB=64 LXL_HEAPSTAT=1 \
         /tmp/lexdb-exp /tmp/lexdb-h 127.0.0.1:55432 &
     psql "host=127.0.0.1 port=55432 user=me dbname=lexdb" \
         -c "create table t (id int, code text)" \
         -c "insert into t select i, 'ABC' || i from generate_series(1, 1000000) i"
     # sample VmRSS here, then SIGTERM the server
 
-`LXL_TRIM=1` is what retires the chunks at idle; without it the heap stays at
-its peak. The 1M insert went from 210 MB RSS to 113 MB, 80 chunks to 40.
+The trim is on by default and is what retires the chunks at idle; `LXL_TRIM=0`
+leaves the heap at its peak. The 1M insert went from 210 MB RSS to 113 MB, 80
+chunks to 40.
