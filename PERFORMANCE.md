@@ -1083,6 +1083,26 @@ the comparison.
   CPU, server, network) and the slow-network runs are in
   design/db-streaming.md, section 7.
 
+## lexdb against PostgreSQL and SQL Server
+
+lexdb, the SQL server written in Lexell, measured against PostgreSQL 18.6
+and SQL Server 2022 on this machine's bare-metal Linux (2026-11-15). The
+full record, its host, rules and history, and how to run each suite:
+[design/lexdb-benchmarks.md](lexell/design/lexdb-benchmarks.md).
+PostgreSQL is capped at 4 processes, lexdb's shape (a master and 3 read
+replicas); all figures warm.
+
+| | lexdb | PostgreSQL |
+|---|---:|---:|
+| pgbench point selects, 32 clients (lexdb: 3 read replicas) | **367,800/s** | 270,800/s |
+| pgbench updates, 8 clients | **18,037/s** | 6,831/s |
+| single-row autocommit inserts, 1 client | **3,843/s** (0.26 ms) | 1,577/s (0.63 ms) |
+| a commit visible on the read replicas, p50 / p99 | 0.28 / 0.54-1.12 ms | |
+| `count(*)`, 1M rows | **3.8 ms** | 19.2 (one core), 11.7 (4 processes) |
+| 35 analytic queries, geometric mean of lexdb's time over PG's | 0.78 against one core, 1.30 against 4 processes | |
+| COPY of 1M wide rows (12 columns) | **1.48 s** | 1.79 s (SQL Server bcp 3.34 s) |
+| COPY of 10M narrow rows | **5.32 s** | 5.81 s (bcp 10.86 s) |
+
 ## Reproducing
 
 ```sh
