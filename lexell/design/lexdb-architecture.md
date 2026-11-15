@@ -11,8 +11,11 @@ Progress (2026-11-15): the test tooling builds natively by default; the
 owns the leaf, fixed, tagged/long and column body codecs, `Projection`,
 the batch decoders and `LeafView`. `page` imports `rows`, and the
 `rows → page → rows` cycle is gone; `cols` is now below both. Exec imports
-only `rows` and `store` for data. The universal column leaf, the old-format
-deletion, `ReadView` and the dialect port remain.
+only `rows` and `store` for data. A replica or a range the transaction has
+written now reaches the same batch decoder through synthetic leaves
+(`scanLeavesMerged`), so the follower's scan is no longer row-at-a-time.
+The universal column leaf, the old-format deletion, the rest of `ReadView`
+and the dialect port remain.
 
 ## 1. Why this exists
 
@@ -201,7 +204,11 @@ stay inside a module and the caller pays one dispatch, not one per value.
    the old layout compatibility, the tagged-row general form and
    mixed-layout leaves.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
-   follower base+delta; replica batch scans.
+   follower base+delta; replica batch scans. Progress: `scanLeaves` yields
+   `LeafView`; a replica or own-write range is gathered by `scanPart` into
+   synthetic leaves (`scanLeavesMerged`) and decoded by the same
+   `decodeRun`/`decodeRow` path. Next: one `ReadView` selection over the
+   remaining `st.fo` branches, and the follower's apply paths.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide
    `CUT_POOL`.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into

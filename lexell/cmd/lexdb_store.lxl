@@ -3352,6 +3352,45 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     return Ok(Unit{})
 }
 
+// scanLeaves for a replica or a range the transaction has written or cut:
+// scanPart (which merges base and delta, or the transaction's own writes)
+// gathers entries into leaves of MERGE_CHUNK, given as views. A caller's
+// false stops the scan; its cursor resumes at the key it stopped on.
+const MERGE_CHUNK = 1024
+
+fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: str,
+                                 f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[bool, lexdb_base.DbErr] {
+    var ks: []str = []
+    var vs: []str = []
+    var stopped = false
+    let noBody = ""
+    let noEnts: []int = []
+    let noCols = ""
+    let noDir: []int = []
+    try st.scanPart(t, tree, from, &to, fn(en: &Entry): bool {
+        append(mut &ks, en.key)
+        append(mut &vs, en.val)
+        if len(ks) < MERGE_CHUNK { return true }
+        let lv = lexdb_rows.LeafView{isCols: false, lazy: false, n: len(ks), body: &noBody, ents: &noEnts,
+                                     keys: &ks, vals: &vs, cols: &noCols, dir: &noDir}
+        let go = f(&lv, 0, len(ks))
+        if !go {
+            stopped = true
+            return false
+        }
+        ks = []
+        vs = []
+        return true
+    })
+    if !stopped && len(ks) > 0 {
+        let lv = lexdb_rows.LeafView{isCols: false, lazy: false, n: len(ks), body: &noBody, ents: &noEnts,
+                                     keys: &ks, vals: &vs, cols: &noCols, dir: &noDir}
+        let go = f(&lv, 0, len(ks))
+        if !go { stopped = true }
+    }
+    return Ok(true)
+}
+
 // The entries of tree with keys in [from, to) (to "": to the end), read in
 // place: f gets each leaf and the range [i, j) of its entries in the
 // range, inside the store's lock, in key order, while it gives true. f
@@ -3361,8 +3400,8 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 // read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[bool, lexdb_base.DbErr] {
-    if st.fo.isSome() { return Ok(false) }         // a replica's reads go through scan
-    if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return Ok(false) }
+    if st.fo.isSome() { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
+    if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor: str = from
     var more = true
