@@ -1,0 +1,46 @@
+// lexdb: the row and leaf codec (design/lexdb-architecture.md). This module
+// owns how a row is represented: the fixed layout, the tagged form, the
+// column leaf, the conversion between layouts, and the leaf body a
+// checkpoint writes. The store and the executor call it; they do not decode
+// pages or rows themselves.
+//
+// The interface is deliberately small: a Projection says which columns a
+// reader needs, Rows says how a table's rows are laid out, and encode/decode
+// move between rows and leaves. The format details stay here.
+import "./lexdb_page"
+import "./lexdb_cols"
+
+// A leaf to encode (encodeLeaf): its version at the cut, and the index of
+// its tree's layouts in the cut's (-1 none).
+pub type LeafJob = record { pub node: lexdb_page.Node; pub spec: int }
+
+// A leaf encoded: its page's body (lexdb_page.bodyPage), kind 0 its rows,
+// 1 a column leaf, 2 neither fits a page (refit cuts it); conv: its rows
+// were converted to the current layout (9.114).
+// packed: the leaf as repack would make it of body (lexdb_page.packedLeaf),
+// none when it is already a column leaf of that body.
+pub type LeafEnc = record { pub body: str; pub kind: int; pub conv: bool; pub packed: Option[lexdb_page.Node] }
+
+// What the checkpoint writes of a leaf (leafBody's choice, and refit's test
+// of a leaf that does not fit): a kernel, run on the par pool.
+pub fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_cols.Spec, colsOn: bool, check: bool): LeafEnc {
+    let n = &j.node
+    if j.spec >= 0 {
+        if colsOn {
+            if n.isCols() { return LeafEnc{body: n.body, kind: 1, conv: false, packed: None} }
+            var conv = false
+            match lexdb_page.colBodyRangeK(n, 0, n.count(), &specs[j.spec], check, mut &conv) {
+                Some(b) {
+                    let p = lexdb_page.packedLeaf(&b, n.count())
+                    return LeafEnc{body: b, kind: 1, conv: conv, packed: Some(p)}
+                }
+                None {}
+            }
+        }
+        if n.size > lexdb_page.NODE_ROOM && !n.isCols() && n.count() > 0 { return LeafEnc{body: "", kind: 2, conv: false, packed: None} }
+    }
+    let b = lexdb_page.leafNodeBody(n)
+    if n.lazy { return LeafEnc{body: b, kind: 0, conv: false, packed: None} }
+    let p = lexdb_page.packedLeaf(&b, n.count())
+    return LeafEnc{body: b, kind: 0, conv: false, packed: Some(p)}
+}
