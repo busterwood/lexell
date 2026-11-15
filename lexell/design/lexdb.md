@@ -12181,8 +12181,9 @@ of every numeric column, distinct counts, min and max, the same.
   0.95 ×, wide 0.83 ×, 10M narrow 0.92 ×) and about twice as fast as SQL
   Server's bcp. The serial fast path (lexdb-copy-fast.md) is most of it.
 - **Behind:** with secondary indexes (1.48 × PostgreSQL; level with SQL
-  Server) and with no key (2.4 ×: a table without a primary key gets a
-  hidden key, and its rows go through the generic path).
+  Server) and with no key (2.4 ×). Both take the generic path: the fast
+  path needs one integer primary key and no secondary index
+  (lexdb-copy-fast.md, "When it applies").
 - Peak RSS at 10M rows is still 2.6 GB (the load is one statement's
   transaction).
 
