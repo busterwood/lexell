@@ -64,7 +64,7 @@ def cli():
         r = subprocess.run([cbuild.LXLC, flag], capture_output=True, text=True)
         need = ['usage: lxlc', '--run', '--emit-c-json', '--borrow-report', '-L dir', 'LXL_LIB', 'TMPDIR', 'LXL_NOBORROW',
                 'LXL_RCSTAT', 'LXL_NATIVE_IR', 'LXL_NATIVE_MAP', 'LXL_INLINE', 'LXL_CSE', 'LXL_LOOPS', 'LXL_STRS',
-                'LXL_PAR', 'LXL_URING', 'LXL_HELPERS', 'LXL_CHECK', 'LXL_HASH_SEED', 'LXL_SPIN_US', 'LXL_NOCACHE']
+                'LXL_PAR', 'LXL_URING', 'LXL_HELPERS', 'LXL_CHECK', 'LXL_HASH_SEED', 'LXL_SPIN_US', 'LXL_THP', 'LXL_NOCACHE']
         miss = [w for w in need if w not in r.stdout]
         if r.returncode or r.stderr or miss:
             bad.append(f"{flag}: exit {r.returncode}, stderr {r.stderr[:80]!r}, missing {miss}")

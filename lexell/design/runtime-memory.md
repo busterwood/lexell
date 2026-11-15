@@ -10,7 +10,8 @@ never gives memory back.
 The allocator is `compiler/native/rt.c`, "the heap". lexdb uses it, not
 glibc's: lexdb is linked dynamically, but imports no `malloc`.
 - **Small blocks** (up to 64 kB) have 40 size classes. They are cut in turn
-  from 1 MB chunks that are mapped and never unmapped. Each class has a free
+  from 1 MB chunks that are mapped and never unmapped. (Since 2026-11-15
+  the chunks are 2 MB, on huge pages where the kernel allows them: section 6.) Each class has a free
   list threaded through its free blocks.
   - A free block goes back on its own class's list, and only that class
     reuses it.
@@ -144,3 +145,66 @@ the machine):
    unchanged.
 3. A repeated large sort with and without A, for the cost of the faults.
 4. lexdb's suite and the compiler's fixed point, with `LXL_CHECK=1`.
+
+## 6. Transparent huge pages (done, 2026-11-15)
+
+**Before:** the kernel's setting here is `always`, but lexdb's heap was
+almost all on 4 KB pages: 2 MB of 212 MB after a 1M-row load and sort. Each
+1 MB chunk was its own mapping, so every 2 MB range was first touched half
+at a time, in small pages, and the kernel could not fault a huge page in.
+Its background merger (`khugepaged`) had not merged any 12 s later.
+
+**Now** (`compiler/native/rt.c`, `heap_chunk`, `sys_mmap_thp`):
+- Chunks are 2 MB, aligned to 2 MB (an over-sized mapping with its ends
+  unmapped) and marked `MADV_HUGEPAGE`.
+- Large blocks of 2 MB or more are rounded up to whole 2 MB, aligned and
+  marked the same way.
+- The kernel's setting (`/sys/kernel/mm/transparent_hugepage/enabled`)
+  decides: under `always` or `madvise` the marked ranges get huge pages,
+  under `never` the mark does nothing. The runtime does not read the
+  setting (the first version did, and its open and read put a hello-world
+  program over its size budget in `tests/run_native.py`).
+- `LXL_THP=0` marks them `MADV_NOHUGEPAGE` instead: no huge pages for the
+  heap even under `always`. The native backend only: the C backend's
+  runtime (rt.h) is unchanged.
+- Mapping a chunk moved out of `malloc`'s inline path (`heap_chunk`).
+
+**Measured** (exp/hugepages, as an opt-in `LXL_THP=1` against off; lexdb on `bd_ob` (w, d, t, cr), the 35 queries
+of `bench.py`, 5 runs each, off, on, off, on; Ryzen 7 8745HS, Zen 4;
+data and scripts in `~/Work/lexdb-bench/hp`):
+
+| | off | on |
+|---|---|---|
+| RSS after the queries | 569-571 MB | 570 MB |
+| of it on huge pages | 0-2 MB | 538 MB |
+| peak RSS | 621 MB | 626 MB |
+| server CPU, geometric mean (34 queries) | | -1.4% |
+| wall time, geometric mean | | -0.9% |
+
+- 32 of 34 queries used less CPU; the largest gains were 3-4.5% (window,
+  correlated subquery, left join, filters). Scans and the 20k point lookups
+  moved less than 1%. The two off passes differed by up to 3% per query, so
+  only the set's direction is significant.
+- `perf stat` on five queries (points, hash join, window, scan, text
+  group-by): instructions equal (66.5 G), cycles -4.2%, L1 data-TLB misses
+  -60% (29.6 M to 11.9 M), page walks -71% (3.80 M to 1.09 M).
+- **Why it is small:** with 4 KB pages there were only 0.06 walks per
+  thousand instructions. lexdb reads columns mostly in order, and Zen 4's
+  L2 TLB (3072 entries) also coalesces neighbouring 4 KB pages. Larger
+  tables and more random access (big hash builds, lookups in a cache of
+  several GB) should gain more; not measured.
+- The lexdb suite passes with it on.
+
+**Costs:**
+- A thread heap's smallest mapping is 2 MB, not 1 MB (each par worker has
+  one), whatever the kernel's setting; with huge pages it is also 2 MB of
+  RSS at its first touch.
+- The first touch of a chunk zeroes 2 MB at once. Under `defrag=madvise`
+  (this machine's), a fault in a marked range may compact memory to find a
+  free 2 MB page.
+
+**For the scavenger (section 3, A):** `MADV_DONTNEED` on part of a huge
+page splits it. The pass should give back runs of whole, aligned 2 MB (or
+accept the split where only 4 KB pages are free), and the page pool should
+hand out whole 2 MB chunks first.
+
