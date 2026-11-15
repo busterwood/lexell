@@ -32,7 +32,7 @@ No new runtime flag without a named seam and a deletion phase.
 | `T_LEAF` reader/writer | pre-9.109 page format | delete | — | 2 |
 | tagged row (general) | pre-9.50 row format; long/odd values | seam | `Rows`: fixed + `C_ANY`/`C_STUB` overflow | 2 |
 | `LEXDB_ROWFMT` | tagged vs fixed A/B | deleted | `setFixedRows` remains as the test hook | done |
-| `LEXDB_COLUMNS` / `setColumns` | row vs column leaf A/B | seam | `LeafCodec` in Rows/Store; old binary for A/B | 2 |
+| `LEXDB_COLUMNS` | row vs column leaf A/B | deleted | old binary for A/B; `setColumns` remains the test hook | done |
 | `LEXDB_COLCHECK` | codec self-check | test-only | `Rows` test hook | test build |
 | `olderKinds`, `upgradeLayouts`, `setLegacyKinds` | pre-9.113 layouts | delete | — | 2 |
 | `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | delete | — | 2 |
@@ -65,7 +65,6 @@ The target is **one selection point and zero hot-loop branches**.
 | `st.fo` | ~22 read-path sites | `ReadView` |
 | `rs.batch` | 4 subsystems + 5 drivers | `ExecStrategy` |
 | `LEXDB_ROWFMT` | encoder, decoder, executor, tests | `Rows` |
-| `LEXDB_COLUMNS` | leaf writer, leaf reader, store options | `LeafCodec` |
 | `lexdb_planner` | ~22 planner branches, two cost models | `CostModel` |
 | `ckptLocked` | one fallback branch in the checkpoint | delete after cut is total |
 | `pushed` / `poll` | two follower apply paths | one `applyFrame` |
@@ -93,7 +92,7 @@ and `lexdb_planner` are next.
 | Phase | Delete | Gate |
 |---|---|---|
 | 1 | `LEXDB_ROWFMT` (done); move dead test hooks to the test build; keep the tagged writer as the overflow form for now | suite subset, targeted native tests |
-| 2 | `T_LEAF`, old layouts, tagged row as a general format (replaced by `C_ANY`/`C_STUB`), mixed-layout leaves, row-leaf table fallback, `LEXDB_COLUMNS` production switch, `setUpgradeBudget` / upgrade queue | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
+| 2 | `T_LEAF`, old layouts, tagged row as a general format (replaced by `C_ANY`/`C_STUB`), mixed-layout leaves, row-leaf table fallback, `setUpgradeBudget` / upgrade queue | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
 | 3 | `st.fo` branches, push/poll duplication (`scanLeaves`' follower path is done) | `follow_basic`, `follow_covers`, `exec_replica`, `replica.py` |
 | 4 | `ckptLocked` / `CUT_TRIES` fallback; decide `CUT_POOL`; flat free list | `store_ckptcut` (including cancelled snapshot, real disk, pool) |
 | 6 | `rs.batch` master switch, old row SELECT operators or test-only | `exec_batch*`, EXPLAIN counts |

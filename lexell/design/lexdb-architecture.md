@@ -115,7 +115,7 @@ granularity — never per row.
 | Seam | Implementations | Selected at | Removes |
 |---|---|---|---|
 | **ReadView** | live tree, snapshot, follower | session / statement | `st.fo` branches; the replica batch-scan gap |
-| **Rows / LeafCodec** | column table leaf, front-coded index/catalog leaf, overflow value | table / leaf | tagged/mixed-layout/row-leaf fallbacks; `LEXDB_COLUMNS`, `LEXDB_ROWFMT` |
+| **Rows / LeafCodec** | column table leaf, front-coded index/catalog leaf, overflow value | table / leaf | tagged/mixed-layout/row-leaf fallbacks; `setColumns` remains a test hook |
 | **ExecStrategy** | batch, chunk-of-one row, test-only old row | plan / session | `rs.batch` as a four-subsystem switch; five driver skeletons |
 | **CostModel** | cost, rules as no-statistics fallback / test oracle | plan | `lexdb_planner` branches; two disagreeing cost models |
 | **Dialect** | PG, MSSQL, Oracle | connection | dialect code in exec; core/dialect leakage |
