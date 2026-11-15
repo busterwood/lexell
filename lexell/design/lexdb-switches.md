@@ -91,7 +91,7 @@ and `lexdb_planner` are next.
 | Phase | Delete | Gate |
 |---|---|---|
 | 1 | `LEXDB_ROWFMT` (done); move dead test hooks to the test build; keep the tagged writer as the overflow form for now | suite subset, targeted native tests |
-| 2 | `T_LEAF`, old layouts, tagged row as a general format (replaced by `C_ANY`/`C_STUB`), mixed-layout leaves, row-leaf table fallback, `setUpgradeBudget` / upgrade queue | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
+| 2 | tagged row as a general format (table leaves are `C_ANY`; the tagged writer remains), the serving row-leaf fallback, `setUpgradeBudget` / upgrade queue (T_LEAF and old layouts are done) | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
 | 3 | `st.fo` branches, push/poll duplication (`scanLeaves`' follower path is done; it no longer returns false) | `follow_basic`, `follow_covers`, `exec_replica`, `replica.py` |
 | 4 | `ckptLocked` / `CUT_TRIES` fallback (the flat free list and CUT_POOL are done) | `store_ckptcut` (including cancelled snapshot, real disk) |
 | 6 | `rs.batch` master switch, old row SELECT operators or test-only | `exec_batch*`, EXPLAIN counts |

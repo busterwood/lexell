@@ -10,7 +10,8 @@ Progress (2026-11-15): the test tooling builds natively by default; the
 `rs.batch` split, the `LEXDB_ROWFMT` and `LEXDB_COLUMNS` removals are
 done; `lexdb_rows` owns the leaf, fixed, tagged/long and column body
 codecs, `Spec`, `Projection`, `Batch`, the batch decoders and `LeafView`.
-`lexdb_like` holds the shared simple-LIKE matcher. `page` imports `rows`, and the
+`lexdb_like` holds the shared simple-LIKE matcher; `lexdb_catalog` holds
+the metadata types; `lexdb_dialect` the parser-facing dialect facts. `page` imports `rows`, and the
 `rows → page → rows` cycle is gone; `cols` is now below both. Exec imports
 only `rows` and `store` for data. A replica or a range the transaction has
 written now reaches the same batch decoder through synthetic leaves
@@ -22,9 +23,14 @@ mapping, catalog row helpers and the expression deparser. The T_LEAF page
 format and the pre-9.113/9.115 layout and time-tagged row compatibility are
 deleted. Table leaves are now always column leaves: a leaf the typed
 encoder cannot take (tagged/odd values, a stored-apart stub, mixed layouts)
-is a `C_ANY` column of its rows' bytes. The rest of `ReadView`, the rest of
-the dialect port and the executor/planner phases remain. The flat free
-list is deleted; checkpoints use the runs lists only.
+is a `C_ANY` column of its rows' bytes. The flat free list and the
+parallel checkpoint encode are deleted. The 35-query benchmark (fresh data
+from the branch, main's binary as control, 3 runs each) gives a geometric
+mean of 1.004 and a median of 1.0: no regression beyond noise. The parser/dialect cycle is broken:
+`lexdb_sql` imports `lexdb_dialect` and `lexdb_catalog`, and the dialect
+modules own their type mappings and PG catalog text. The rest of
+`ReadView`, the catalog generators/wire/auth and the executor/planner
+phases remain.
 
 ## 1. Why this exists
 
@@ -250,16 +256,15 @@ stay inside a module and the caller pays one dispatch, not one per value.
 Phases 2 and 3 are designed together; implement Rows first. Phase 5 can run
 in parallel once the port is stable. Phases 6–8 are sequential.
 
-**Where this branch stands.** The T_LEAF page format and the pre-9.113/9.115
-compatibility are gone, and a table leaf is always a column leaf: `C_ANY`
-holds the whole rows when the typed columns cannot. The remaining format
-work (deleting the tagged general form and the serving row-leaf fallback,
-the flat free list) changes bytes and needs the old binary as the control. `ckptLocked` is still the fallback for
-a cancelled cut. The dialect port's root blocker is `lexdb_sql` importing
-`lexdb_pgcat`/`lexdb_syscat`/`lexdb_oracat` for parser tables; breaking
-that cycle comes before moving the catalog generators, wire/auth and the
-`Dialect` facade. The executor phases change hot loops and need the same
-measurement discipline.
+**Where this branch stands.** The T_LEAF page format, the pre-9.113/9.115
+compatibility, the flat free list and CUT_POOL are gone; a table leaf is
+always a column leaf (`C_ANY` holds whole rows when the typed columns
+cannot). `ckptLocked` is still the fallback for a cancelled cut. The
+parser/dialect cycle is broken and the dialect modules own their type
+mappings and PG catalog text; the catalog generators, wire/auth and the
+`Dialect` facade are next. The executor phases (ExecStrategy, one
+expression IR, the chunked pipeline, the planner) change hot loops and
+need the benchmark A/B at each step.
 
 ## 9. Gates
 
@@ -275,8 +280,9 @@ gates are targeted and interleaved:
 - performance: `bench.py`, `qL.txt`, point selects, updates, loads, replica
   scans. Stop on a regression beyond the phase's noise threshold (5%).
 
-A full suite, crash test or replica run is a milestone gate, not every
-commit, while background benchmarks are running.
+A full suite, crash test or replica run is a milestone gate, and the
+35-query benchmark A/B (`cmp/run.sh` with the main binary as control) is
+the performance gate at each phase boundary.
 
 ## 10. Change locality
 
