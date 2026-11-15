@@ -7,17 +7,20 @@ mechanism was measured and chosen; this note is the map we hold the code
 to.
 
 Progress (2026-11-15): the test tooling builds natively by default; the
-`rs.batch` split and the `LEXDB_ROWFMT` removal are done; `lexdb_rows`
-owns the leaf, fixed, tagged/long and column body codecs, `Projection`,
-the batch decoders and `LeafView`. `page` imports `rows`, and the
+`rs.batch` split, the `LEXDB_ROWFMT` and `LEXDB_COLUMNS` removals are
+done; `lexdb_rows` owns the leaf, fixed, tagged/long and column body
+codecs, `Spec`, `Projection`, `Batch`, the batch decoders and `LeafView`.
+`lexdb_like` holds the shared simple-LIKE matcher. `page` imports `rows`, and the
 `rows → page → rows` cycle is gone; `cols` is now below both. Exec imports
 only `rows` and `store` for data. A replica or a range the transaction has
 written now reaches the same batch decoder through synthetic leaves
 (`scanLeavesMerged`), so the follower's scan is no longer row-at-a-time.
 `scanLeaves` always yields `LeafView`s and has no false fallback; a key
 lookup or an empty range is the only separate batch path (`fillPoint`).
-The universal column leaf, the old-format deletion, the rest of `ReadView`
-and the dialect port remain.
+`lexdb_pg` has started the PG dialect: identifier and name rendering, OID
+mapping, catalog row helpers and the expression deparser. The universal
+column leaf, the old-format deletion, the rest of `ReadView`, the rest of
+the dialect port and the executor/planner phases remain.
 
 ## 1. Why this exists
 
@@ -71,7 +74,7 @@ small; behavior belongs in the deep modules.
 | **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | lives inside exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
-| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier and name rendering, OID mapping and `pg_get_expr` deparse moved; catalog rows, wire/auth and the facade remain in exec |
+| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier/name rendering, OID mapping, catalog row helpers and `pg_get_expr` deparse moved; catalog generators, wire/auth and the facade remain in exec |
 | **`lexdb_mssql`** | T-SQL grammar/quirks, TDS, `sys.*`, T-SQL functions, temp-table semantics | one `Dialect` facade | `lexdb_tsql*` / `lexdb_tds` / `lexdb_sys*` |
 | **`lexdb_oracle`** | PL/SQL, TNS, Oracle data dictionary, functions/types, error text | one `Dialect` facade | `lexdb_plsql` / `lexdb_tns` / `lexdb_ora*` |
 
@@ -197,7 +200,8 @@ stay inside a module and the caller pays one dispatch, not one per value.
    expressions and typed sort always on; the flag controls vector scans only.
 2. **Rows / codec.** Progress: `encodeLeaf`, the fixed row codec, the
    tagged/long row codec, `encodeRowOf`, the column body codec, `Projection`,
-   the batch decoders and `Spec` are moved; `LeafView` is the page-to-codec
+   the batch decoders and `Spec` are moved; the `LEXDB_COLUMNS` production
+   switch is deleted (setColumns remains the test hook); `LeafView` is the page-to-codec
    adapter. `page` imports `rows`, and `cols` is below both. Exec keeps thin
    adapters, `rowOf`/`placesOf` (large-value I/O), table metadata and the
    lazy two-step orchestration over `LeafView`; it imports only `rows` and
@@ -216,8 +220,9 @@ stay inside a module and the caller pays one dispatch, not one per value.
    `CUT_POOL`.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
    the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
-   PostgreSQL's identifier and name rendering, OID mapping and expression
-   deparser; the PG catalog rows, wire/auth and the `Dialect` facade remain.
+   PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
+   and expression deparser; the PG catalog generators, wire/auth and the
+   `Dialect` facade remain.
 6. **ExecStrategy / one batch driver.** Sink and fallback policies; one
    `BPlan` builder; compiled expressions and typed sort always on.
 7. **One expression IR.** Scalar and vector backends; delete `BNode` /
@@ -229,6 +234,16 @@ stay inside a module and the caller pays one dispatch, not one per value.
 
 Phases 2 and 3 are designed together; implement Rows first. Phase 5 can run
 in parallel once the port is stable. Phases 6–8 are sequential.
+
+**Where this branch stops.** The next steps are deliberately not taken
+while the background benchmarks run. The format deletions (T_LEAF, old
+layouts, the tagged general form, the flat free list) change bytes and
+need the old binary as the control. `ckptLocked` is still the fallback for
+a cancelled cut. The dialect port's root blocker is `lexdb_sql` importing
+`lexdb_pgcat`/`lexdb_syscat`/`lexdb_oracat` for parser tables; breaking
+that cycle comes before moving the catalog generators, wire/auth and the
+`Dialect` facade. The executor phases change hot loops and need the same
+measurement discipline.
 
 ## 9. Gates
 
