@@ -12076,3 +12076,46 @@ wall ms median; warm unchanged on all):
   by `getMany`); lookups whose input batches hold few keys after a filter
   (`join_t_w`: about one key per batch of t); per-row subqueries.
 - The suite passes (170).
+
+### 9.131 The log written O_DSYNC: a commit is one write
+
+The drive measurements of 2026-11-15 (`~/Work/lexdb-bench/fio/RESULTS.md`):
+a 4 KiB `O_DIRECT` write then `fdatasync` took 561-577 µs; the same write
+into an already-written file opened `O_DIRECT|O_DSYNC` took 198 µs (p99
+272). The kernel makes that one write with FUA when no metadata changes,
+with no journal or btrfs log-tree commit. The log writer wrote each batch's
+frame and then flushed it (`segF.flush()`, `fdatasync`).
+
+**Now:**
+- `openSeg` zero-fills a new segment through the plain `O_DIRECT` handle and
+  flushes it, as before (or takes the spare, already written), then reopens
+  it with `Fs.openDsync` (`O_RDWR|O_DIRECT|O_DSYNC`). The writer does not
+  flush that handle: a frame is durable when its write returns. A failed
+  write fails the store, as a failed flush did.
+- Only the real Fs: a simulated file is opened as before and still flushed,
+  so the crash simulation keeps its model of what a flush makes durable.
+- `--unsafe-no-sync` opens the segments without it (nothing synced).
+- `LEXDB_LOG_DSYNC=0` restores the write and `fdatasync`, for comparison.
+- **Durability** is O_DSYNC's guarantee: the data and the metadata needed to
+  read it back are on stable storage when the write returns, on any file
+  system. **The speed** needs the segment already written (it is) and a
+  file system that overwrites in place: ext4, XFS, btrfs NOCOW (9.61). On a
+  copy-on-write file each write is a full sync, about what the flush was.
+
+**Measured** (pgbench 18.6, `-M simple`, autocommit single-row
+`INSERT ... ON CONFLICT DO NOTHING` into a fresh table, 10 s per point, two
+passes alternating; `~/Work/lexdb-bench/ds/run.sh`; the passes agree within
+1%):
+
+| Clients | write + fdatasync | O_DSYNC |
+|---:|---:|---:|
+| 1 | 1,545/s, 0.647 ms | 3,890/s, 0.257 ms |
+| 4 | 3,265/s, 1.23 ms | 9,410/s, 0.425 ms |
+| 16 | 12,600/s, 1.27 ms | 34,240/s, 0.467 ms |
+
+- **Tests:** the suite (170), `logdir.py`, `nosync.py`, `replica.py`, and the
+  crash test (20 rounds, SIGKILL and SIGTERM on the real disk) pass. A power
+  cut is not tested here: that is the drive's FUA, which the kernel uses
+  only where the drive reports it (`queue/fua`: 1 on both drives here).
+- The checkpoint's page writes still end with `fdatasync` (one per
+  checkpoint, many pages).

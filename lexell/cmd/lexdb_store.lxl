@@ -4338,7 +4338,19 @@ fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.D
         }
         try f.flush()
     }
+    if fs.isReal() && lexdb_disk.logDsync() {
+        // the appends durable as they return: no fdatasync after each (9.131)
+        f.close()
+        return fs.openDsync(&name)
+    }
     return Ok(f)
+}
+
+// Whether the writer's segment writes are durable without a flush (openSeg).
+fn (st: &Store) segDsync(): bool {
+    var r = false
+    st.sh.with(fn(db: mut &Db) { r = db.logFs.isReal() && lexdb_disk.logDsync() })
+    return r
 }
 
 fn (st: &Store) fail(e: lexdb_base.DbErr) {
@@ -4371,6 +4383,7 @@ pub fn writer(st: Store): int {
         segBytes = db.opts.segBytes
     })
     var segF = lexdb_disk.File.Real(-1, false)
+    let dsync = st.segDsync()
     match st.openSeg(segNo, segBytes) {
         Ok(f) { segF = f }
         Err(e) {
@@ -4439,11 +4452,13 @@ pub fn writer(st: Store): int {
                 return 1
             }
         }
-        match segF.flush() {
-            Ok(_) {}
-            Err(e) {
-                st.fail(e)        // never retried: the store stops (fsyncgate, 4.1)
-                return 1
+        if !dsync {
+            match segF.flush() {
+                Ok(_) {}
+                Err(e) {
+                    st.fail(e)        // never retried: the store stops (fsyncgate, 4.1)
+                    return 1
+                }
             }
         }
         segOff += len(fr)
