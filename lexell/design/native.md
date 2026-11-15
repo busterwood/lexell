@@ -153,6 +153,9 @@ Observable behaviour is that of rt.h:
 - refcounted `str` blocks, the drop-action stack, `rt_ddefer`;
 - `LXL_CHECK=1`: live objects counted in `rt_alloc`/`rt_free` and the first
   `rt_arr_push`, `Lexell: leak: N live objects at exit at runtime`, exit 5;
+- the heap on transparent huge pages: 2 MiB chunks, and large blocks of
+  2 MiB or more, aligned and marked `MADV_HUGEPAGE` (the kernel's setting
+  decides; `LXL_THP=0` marks them `MADV_NOHUGEPAGE`; design/runtime-memory.md 6);
 - stack overflow: an alternate signal stack and a `SIGSEGV` handler
   installed with `rt_sigaction` (with `SA_RESTORER` and a restorer that calls
   `rt_sigreturn`); a fault within the stack limit (+1 MiB) of the stack top

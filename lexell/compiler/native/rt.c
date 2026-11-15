@@ -29,7 +29,7 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 #define SYS4(n, a, b, c, d) sys6(n, (i64)(a), (i64)(b), (i64)(c), (i64)(d), 0, 0)
 
 enum { S_READ = 0, S_WRITE = 1, S_OPEN = 2, S_CLOSE = 3, S_LSEEK = 8, S_MMAP = 9, S_MUNMAP = 11, S_RT_SIGACTION = 13,
-       S_MREMAP = 25,
+       S_MREMAP = 25, S_MADVISE = 28,
        S_NANOSLEEP = 35, S_GETPID = 39, S_FORK = 57, S_EXECVE = 59, S_WAIT4 = 61, S_KILL = 62, S_GETCWD = 79, S_READLINK = 89, S_IOCTL = 16,
        S_CHDIR = 80, S_RENAME = 82, S_MKDIR = 83, S_RMDIR = 84, S_UNLINK = 87, S_SYMLINK = 88,
        S_CHMOD = 90, S_GETRLIMIT = 97, S_SIGALTSTACK = 131, S_GETDENTS64 = 217,
@@ -168,7 +168,7 @@ static int str_eqn(const char* a, const char* b, size_t n) {
 #define NCLASS 40
 #define LARGE_MARK 0xff                 /* a large block's class byte */
 static size_t class_size[NCLASS];
-#define CHUNK (1 << 20)
+#define CHUNK ((size_t)2 << 20)          /* a huge page (HUGE) */
 #define LARGE (1 << 16)
 #define KEEP ((size_t)32 << 20)
 /* A thread's heap (design/parallel.md 2.2). The main thread's is rt_mheap; each par worker has
@@ -237,6 +237,33 @@ static void* sys_mmap(size_t n) {
     if (r < 0 && r > -4096) return 0;
     return (void*)r;
 }
+/* Transparent huge pages (design/runtime-memory.md 6): the heap's chunks are 2 MiB, aligned to
+   2 MiB and marked MADV_HUGEPAGE, and so are large blocks of 2 MiB or more (rounded up to whole
+   2 MiB): where the kernel has huge pages (its setting is "always" or "madvise"), their first
+   touch is one huge page, not 512 small ones; where it is "never", the mark does nothing.
+   LXL_THP=0 marks them MADV_NOHUGEPAGE instead: no huge pages, even under "always". */
+static int rt_thp_adv = 14;         /* MADV_HUGEPAGE, or MADV_NOHUGEPAGE (15) with LXL_THP=0 */
+#define HUGE ((size_t)2 << 20)
+/* n bytes (a multiple of HUGE) at a HUGE-aligned address, marked: over-map by HUGE and unmap
+   the ends. */
+__attribute__((noinline)) static void* sys_mmap_thp(size_t n) {
+    char* p = sys_mmap(n + HUGE);
+    if (!p) return 0;
+    size_t lead = (HUGE - ((size_t)p & (HUGE - 1))) & (HUGE - 1);
+    if (lead) SYS(S_MUNMAP, p, lead, 0);
+    if (HUGE - lead) SYS(S_MUNMAP, p + lead + n, HUGE - lead, 0);
+    p += lead;
+    SYS(S_MADVISE, p, n, rt_thp_adv);
+    return p;
+}
+/* A fresh chunk for the small classes, out of line. */
+__attribute__((noinline)) static bool heap_chunk(rt_hp* h) {
+    char* p = sys_mmap_thp(CHUNK);
+    if (!p) return false;
+    h->chunk_at = p + 8;
+    h->chunk_left = CHUNK - 8;
+    return true;
+}
 static void heap_init(void) {
     size_t s = 8;
     for (int i = 0; i < NCLASS; i++) {
@@ -261,7 +288,12 @@ __attribute__((noinline)) static void* malloc_large(rt_hp* h, size_t need) {
         k[1] = LARGE_MARK | h->tag << 8;
         return (char*)k + 16;       /* k[0] stays its mapping size */
     }
-    char* p = sys_mmap(m);
+    char* p;
+    if (m >= HUGE) {
+        m = (m + HUGE - 1) & ~(HUGE - 1);
+        p = sys_mmap_thp(m);
+    } else
+        p = sys_mmap(m);
     if (!p) return 0;
     ((size_t*)p)[0] = m;
     ((size_t*)p)[1] = LARGE_MARK | h->tag << 8;
@@ -290,12 +322,7 @@ static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, 
         return f;
     }
     size_t bs = class_size[c] + 8;
-    if (h->chunk_left < bs) {
-        char* p = sys_mmap(CHUNK);
-        if (!p) return 0;
-        h->chunk_at = p + 8;
-        h->chunk_left = CHUNK - 8;
-    }
+    if (h->chunk_left < bs && !heap_chunk(h)) return 0;
     char* b = h->chunk_at;
     h->chunk_at += bs;
     h->chunk_left -= bs;
@@ -840,6 +867,8 @@ void rt_init(int argc, char** argv) {
     struct k_sigaction sa = {0};
     const char* c = getenv("LXL_CHECK");
     rt_check = c && c[0] == '1';
+    const char* t = getenv("LXL_THP");
+    if (t && t[0] == '0') rt_thp_adv = 15;          /* MADV_NOHUGEPAGE */
     rt_argc = argc; rt_argv = argv;
     rt_at_random = (const unsigned char*)rt_auxval(argv + argc + 1, 25);     /* AT_RANDOM */
     rt_vdso_init(argv + argc + 1);
