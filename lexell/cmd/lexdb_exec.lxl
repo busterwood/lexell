@@ -5333,6 +5333,9 @@ pub type Level = record {
     readOnce: bool          // the join order read it once (a hash join), not per row of the tables before (optimizer 26)
     semi: bool              // a semi-join (9.104): subquery src's rows, hashed; a row of the tables before goes on once if any matches
     anti: bool              // a NOT EXISTS/IN's: the row goes on once if none matches
+    resNot: bool            // a semi/anti filter "inner <> outer": per key, mixed or one value (resCol)
+    resCol: int             // the filter's inner column in t.cols
+    resVal: Expr            // ... and its outer value
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -7960,7 +7963,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false}
+                 lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null)}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -8484,6 +8487,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
         var keys: Map[str, int] = newMap()
         var ikeys: Map[int, int] = newMap()
         let fast = semiIntKey(&q.levels[k])
+        var mixed: []bool = []
+        var single: []Val = []
         var buckets: [][]int = []
         {
             let lv = &q.levels[k]
@@ -8517,6 +8522,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                                     b = len(buckets)
                                     ikeys.put(x, b)
                                     append(mut &buckets, [])
+                                    append(mut &mixed, false)
+                                    append(mut &single, Val.Null)
                                 }
                             }
                         }
@@ -8546,6 +8553,21 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                             b = len(buckets)
                             keys.put(key, b)
                             append(mut &buckets, [])
+                            append(mut &mixed, false)
+                            append(mut &single, Val.Null)
+                        }
+                    }
+                }
+                if lv.resNot {
+                    let rv = r[lv.resCol]
+                    if !isNull(&rv) {
+                        if isNull(&single[b]) {
+                            single[b] = rv
+                        } else {
+                            match compare(&single[b], &rv) {
+                                Ok(c) { if c != 0 { mixed[b] = true } }
+                                Err(_) {}
+                            }
                         }
                     }
                 }
@@ -8559,6 +8581,8 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
         m.keys[k] = keys
         m.ikeys[k] = ikeys
         m.buckets[k] = buckets
+        m.resMixed[k] = mixed
+        m.resSingle[k] = single
     }
     return Ok(Unit{})
 }
@@ -8767,6 +8791,31 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             }
         } else if !nul {
             match m.keys[k].get(&kb.toStr()) { Some(x) { b = x } None {} }
+        }
+        if lv.resNot {
+            // "inner <> outer": the bucket's mixed/single value is enough
+            var hit = false
+            if b >= 0 {
+                let noAggs: []Val = []
+                let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+                let ov = try eval(&lv.resVal, &env)
+                if !isNull(&ov) {
+                    hit = m.resMixed[k][b]
+                    let sm = m.resSingle[k][b]
+                    if !hit && !isNull(&sm) {
+                        let c = try compare(&sm, &ov)
+                        if c != 0 { hit = true }
+                    }
+                }
+            }
+            rs.cnt[k].read += 1
+            if lv.anti {
+                if hit { return Ok(true) }
+            } else {
+                if !hit { return Ok(true) }
+            }
+            if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(false) }
+            return Ok(true)
         }
         if lv.anti {
             // a NOT EXISTS/IN: a matching candidate drops the row; none
@@ -10183,7 +10232,44 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
         for j in 0..len(resFrom) { rc = renameCol(&rc, &resFrom[j], &resTo[j]) }
         append(mut &lcond, rc)
     }
-    lv.cond = lcond
+    // one "inner <> outer" filter: a bucket needs only whether it holds
+    // more than one inner value, or the one it holds (q21's l_suppkey)
+    if len(lcond) == 1 {
+        match lcond[0] {
+            Expr.Bin(op, a, b) {
+                if op == "<>" {
+                    var ii = -1
+                    var oval = Expr.Lit(Val.Null)
+                    match a {
+                        Expr.Col(n) { for j in 0..len(resTo) { if resTo[j] == n { ii = j } } }
+                        else {}
+                    }
+                    if ii >= 0 {
+                        oval = clone(&b)
+                    } else {
+                        match b {
+                            Expr.Col(n) { for j in 0..len(resTo) { if resTo[j] == n { ii = j } } }
+                            else {}
+                        }
+                        if ii >= 0 { oval = clone(&a) }
+                    }
+                    var ovalOk = ii >= 0 && !hasSubCall(&oval)
+                    if ovalOk {
+                        var ns: []str = []
+                        colNames(&oval, mut &ns)
+                        for n in ns { for j in 0..len(resTo) { if resTo[j] == n { ovalOk = false } } }
+                    }
+                    if ovalOk {
+                        lv.resNot = true
+                        lv.resCol = w + ii
+                        lv.resVal = oval
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    lv.cond = if lv.resNot { [] } else { lcond }
     var hc: []int = []
     var hk: []int = []
     for j in 0..w {
@@ -10760,6 +10846,8 @@ type Mats = record {
     keys: []Map[str, int]       // hash key -> bucket
     ikeys: []Map[int, int]      // a semi-join's one integer key: value -> bucket
     buckets: [][][]int          // rows of mat
+    resMixed: [][]bool          // a semi/anti "inner <> outer": per bucket, more than one inner value
+    resSingle: [][]Val          // ... or its one inner value (NULL: only NULLs or no row)
     subs: []SubRes
     // per level, its conditions and the WHERE conjuncts after it compiled
     // (9.108: columns by place, functions bound once), with batches on;
@@ -10772,13 +10860,15 @@ type Mats = record {
 // Before a query runs: its subqueries without refs, then its hash tables.
 fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
            rs: mut &Run): Result[Mats, DbErr] {
-    var m = Mats{vrows: [], mat: [], keys: [], ikeys: [], buckets: [], subs: [], cc: [], cp: [], ce: cenvOf(seqEnv(st, txn))}
+    var m = Mats{vrows: [], mat: [], keys: [], ikeys: [], buckets: [], resMixed: [], resSingle: [], subs: [], cc: [], cp: [], ce: cenvOf(seqEnv(st, txn))}
     for k in 0..len(q.levels) {
         append(mut &m.vrows, [])
         append(mut &m.mat, [])
         append(mut &m.keys, newMap())
         append(mut &m.ikeys, newMap())
         append(mut &m.buckets, [])
+        append(mut &m.resMixed, [])
+        append(mut &m.resSingle, [])
         append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params))
         append(mut &m.cp, cxsOf(q, &q.levels[k].post, params))
     }
@@ -25426,6 +25516,9 @@ type JLevel = record {
     txts: Map[str, int]     // JK_TEXT
     conds: []BNode
     post: []BNode
+    resNot: bool            // a semi/anti "inner <> outer": res evaluates the outer value
+    res: BNode
+    resTyp: int             // BT_INT or BT_BOOL
     rows: Batch             // its rows (Mats.mat) as columns: by its table's column
     rkinds: []int
     // the query's columns gathered (jpFinish): into its candidates (those
@@ -25569,8 +25662,21 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             if !boolLike(cc.typ) { return Ok(None) }
             append(mut &conds, takeN(cc))
         }
+        var resNot = false
+        var res = BNode.Const(0, true)
+        var resTyp = BT_INT
+        if lv.resNot {
+            let rc = bCompile(&lv.resVal, q, &kinds, &env, 0)
+            if rc.isNone() { return Ok(None) }
+            let rcc = rc.unwrap()
+            if rcc.typ != BT_INT && rcc.typ != BT_BOOL { return Ok(None) }
+            resNot = true
+            resTyp = rcc.typ
+            res = takeN(rcc)
+        }
         append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, look: look, key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
-                                   ints: ints, txts: txts, conds: conds, post: post, rows: rows, rkinds: rkinds, cand: [], after: []})
+                                   ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
+                                   rows: rows, rkinds: rkinds, cand: [], after: []})
     }
     var all: []bool = []
     for x in need { append(mut &all, x) }
@@ -25707,6 +25813,13 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
     var pj: []int = withCapacity(n)
     var pi: []int = withCapacity(n)
     let buckets = &m.buckets[k]
+    var rv = bvec(0)
+    if jl.resNot {
+        match bEval(&jl.res, j, &all) {
+            Ok(v) { rv = v }
+            Err(_) { return Ok(None) }
+        }
+    }
     for r in 0..n {
         var bk = -1
         if jl.mode == JK_INT {
@@ -25765,6 +25878,24 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
                     None {}
                 }
             }
+        }
+        if jl.resNot {
+            if bk >= 0 {
+                var hit = m.resMixed[k][bk]
+                if !hit && !rv.nul[r] {
+                    let sm = m.resSingle[k][bk]
+                    if !isNull(&sm) {
+                        let ov = if jl.resTyp == BT_BOOL { Val.Bool(rv.v[r] != 0) } else { Val.Int(rv.v[r]) }
+                        let c = try compare(&sm, &ov)
+                        if c != 0 { hit = true }
+                    }
+                }
+                if hit {
+                    append(mut &pj, r)
+                    append(mut &pi, -1)
+                }
+            }
+            continue
         }
         if bk >= 0 {
             if lv.semi && len(lv.cond) == 0 {
