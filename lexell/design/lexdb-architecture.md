@@ -8,10 +8,11 @@ to.
 
 Progress (2026-11-15): the test tooling builds natively by default; the
 `rs.batch` split and the `LEXDB_ROWFMT` removal are done; `lexdb_rows`
-owns the leaf, fixed, tagged/long and column body codecs, `Projection`
-and the batch decoders. `page` imports `rows`, and the
-`rows → page → rows` cycle is gone; `cols` is now below both. `Spec`, the
-lazy two-step orchestration, `ReadView` and the dialect port remain.
+owns the leaf, fixed, tagged/long and column body codecs, `Projection`,
+the batch decoders and `LeafView`. `page` imports `rows`, and the
+`rows → page → rows` cycle is gone; `cols` is now below both. Exec imports
+only `rows` and `store` for data. The universal column leaf, the old-format
+deletion, `ReadView` and the dialect port remain.
 
 ## 1. Why this exists
 
@@ -61,7 +62,7 @@ small; behavior belongs in the deep modules.
 | Module | Secret it hides | Interface | Leak today |
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | 12 read operations; `Node` callbacks; `st.fo` at many sites |
-| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body and batch decoders moved; `Spec`, `LeafView` construction and the lazy two-step orchestration remain in page/exec |
+| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
 | **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | lives inside exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
@@ -85,6 +86,7 @@ main
  └── lexdb_oracle ───┤
                      ▼
                 lexdb_core
+                 ├── lexdb_like    (simple LIKE pieces)
                  ├── lexdb_store   (page, repl internal)
                  ├── lexdb_rows    (cols, page internal)
                  ├── lexdb_catalog
@@ -96,10 +98,10 @@ main
 - No dialect depends on another dialect.
 - `main` composes them; a test checks the imports.
 - The core's hot paths contain no dialect branch and no per-row flag.
-- Current storage layering: `cols` (byte codec) ← `rows` ← `page`/`store`;
-  `page` imports `rows` for column bodies. Exec still imports `page`/`cols`
-  for `LeafView`, the lazy two-step paths and `cLikeRaw`; those are the next
-  leaks to remove.
+- Current storage layering: `cols` (byte codec) ← `rows` ← `page`/`store`.
+  `page` imports `rows` for column bodies and makes `LeafView` from a
+  `Node`; exec imports `rows` and `store` only, never `page` or `cols`.
+  `lexdb_like` is a small shared matcher below exec and rows.
 
 ## 5. Seams
 
@@ -189,15 +191,15 @@ stay inside a module and the caller pays one dispatch, not one per value.
    old-format fixtures are retargeted once. Split `rs.batch`: compiled
    expressions and typed sort always on; the flag controls vector scans only.
 2. **Rows / codec.** Progress: `encodeLeaf`, the fixed row codec, the
-   tagged/long row codec, `encodeRowOf` and the column body codec are
-   moved, along with `Projection` and the batch decoders; `LeafView` is the
-   page-to-codec adapter. `page` imports `rows`, and `cols` is below both.
-   Exec keeps thin adapters, `rowOf`/`placesOf` (large-value I/O), table
-   metadata and the lazy two-step orchestration. Next: move `Spec` behind
-   Rows and remove exec's remaining page/cols imports, then the universal
-   column leaf, one layout per leaf, overflow for long/odd values (`C_ANY` /
-   `C_STUB`), and the deletion of `T_LEAF`, the old layout compatibility, the
-   tagged-row general form and mixed-layout leaves.
+   tagged/long row codec, `encodeRowOf`, the column body codec, `Projection`,
+   the batch decoders and `Spec` are moved; `LeafView` is the page-to-codec
+   adapter. `page` imports `rows`, and `cols` is below both. Exec keeps thin
+   adapters, `rowOf`/`placesOf` (large-value I/O), table metadata and the
+   lazy two-step orchestration over `LeafView`; it imports only `rows` and
+   `store`. Next: the universal column leaf, one layout per leaf, overflow
+   for long/odd values (`C_ANY` / `C_STUB`), and the deletion of `T_LEAF`,
+   the old layout compatibility, the tagged-row general form and
+   mixed-layout leaves.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
    follower base+delta; replica batch scans.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide

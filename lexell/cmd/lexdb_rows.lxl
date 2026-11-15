@@ -11,6 +11,7 @@ import "binary"
 import "math"
 import "./lexdb_base"
 import "./lexdb_cols"
+import "./lexdb_like"
 import "./lexdb_sql"
 import "./lexdb_time"
 
@@ -35,6 +36,10 @@ pub const PK_UUID: byte = 13    // variable: its 16 bytes
 pub const PK_BYTEA: byte = 14   // variable: its bytes
 
 pub const LONG: int = 256
+
+// A table's column-leaf schema (lexdb_cols): its layouts and the fill
+// value rows written before a column was added take.
+pub type Spec = lexdb_cols.Spec
 
 // A large value's stored form (lexdb_store): a stub begins with 0xFF, which
 // no row does (a key is at most MAX_KEY bytes), version 1 whole, version 2
@@ -486,7 +491,7 @@ pub fn placesNeeded(r: &Rows, need: &[]bool): []bool {
 // them (a u16 key length, a u16 0, the key), then its columns (lexdb_cols).
 
 pub const CB: int = 6
-const PAGE: int = 4096
+pub const PAGE: int = 4096
 
 // The bytes a leaf's keys from..to take front coded on a T_CLEAF page.
 fn colKeysSize(keys: &[]str, from: int, to: int): int {
@@ -512,12 +517,12 @@ fn colBodyOf(keys: &[]byte, kb: int, cols: &str): str {
 
 // Leaf keys and vals as a column leaf's body: None when the rows do not all
 // encode (lexdb_cols.encodeRows) or the page would not hold them.
-pub fn colBody(keys: &[]str, vals: &[]&str, spec: &lexdb_cols.Spec): Option[str] {
+pub fn colBody(keys: &[]str, vals: &[]&str, spec: &Spec): Option[str] {
     return colBodyRange(keys, vals, 0, len(keys), spec)
 }
 
 // colBody of the entries from..to.
-pub fn colBodyRange(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec): Option[str] {
+pub fn colBodyRange(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &Spec): Option[str] {
     var conv = false
     let got = colBodyRangeK(keys, vals, from, to, spec, lexdb_cols.checking(), mut &conv)
     if conv { lexdb_cols.noteConverted() }
@@ -527,7 +532,7 @@ pub fn colBodyRange(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexd
 // colBodyRange as a kernel (par.map): check is lexdb_cols.checking(); conv
 // set when the rows were converted (9.114), which the caller counts
 // (lexdb_cols.noteConverted).
-pub fn colBodyRangeK(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec,
+pub fn colBodyRangeK(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &Spec,
                      check: bool, conv: mut &bool): Option[str] {
     let cnt = to - from
     if cnt <= 0 { return None }
@@ -553,7 +558,7 @@ pub fn colBodyRangeK(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lex
 
 // The bytes a column leaf of the entries from..to would take on its page
 // (its header, keys and columns), -1 when the rows do not encode.
-pub fn colSize(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &lexdb_cols.Spec): int {
+pub fn colSize(keys: &[]str, vals: &[]&str, from: int, to: int, spec: &Spec): int {
     if to <= from { return -1 }
     var rows: []&str = withCapacity(to - from)
     for i in from..to { append(mut &rows, vals[i]) }
@@ -1148,22 +1153,18 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
     return Ok(0)
 }
 
-// Decodes the rows of a leaf in the fixed layout of its first, up to to,
-// into rows b.n on of b, a column at a time (9.53). The number of rows
-// decoded: 0 when the first is not in the fixed layout (decodeRow reads
-// it), -1 a value of a kind its column's batch does not hold (as
-// decodeRow's 1).
-pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
-    if leaf.isCols { return decodeCols(leaf, from, to, b, bp, rw) }
+// The run of rows from `from` (at most `to`) that are in the fixed layout
+// of the first, as views of the leaf's bytes ([] when the first is not in a
+// fixed layout).
+pub fn fixedRunRows(leaf: &LeafView, from: int, to: int, rw: &Rows): Result[[]&str, DbErr] {
     let s0 = leafValAt(leaf, from)
-    if len(s0) < 3 || !isFixedRow(s0, rw) { return Ok(0) }
+    if len(s0) < 3 || !isFixedRow(s0, rw) { return Ok([]) }
     let tf = lexdb_cols.timeFirst(rw.layouts)
     let id = try layOf(s0, rw.lays)
     let lay = &rw.lays[id]
     let id0 = s0[1]
     let id1 = s0[2]
     let v0 = lay.v0
-    // each row's bytes, found once (a lazy leaf's are in its page's body)
     var rows: []&str = withCapacity(to - from)
     append(mut &rows, s0)
     var end = from + 1
@@ -1174,7 +1175,28 @@ pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projec
         append(mut &rows, s)
         end += 1
     }
-    let n = end - from
+    return Ok(rows)
+}
+
+// The number of places a column leaf's rows have, and the kind of one:
+// cRunLazy's raw LIKE chooses a text place without seeing lexdb_cols.
+pub fn leafPlaces(leaf: &LeafView): int { return lexdb_cols.places(leaf.dir) }
+
+pub fn leafPlaceKind(leaf: &LeafView, pl: int): byte { return lexdb_cols.kindOf(leaf.cols, pl) }
+
+// Decodes the rows of a leaf in the fixed layout of its first, up to to,
+// into rows b.n on of b, a column at a time (9.53). The number of rows
+// decoded: 0 when the first is not in the fixed layout (decodeRow reads
+// it), -1 a value of a kind its column's batch does not hold (as
+// decodeRow's 1).
+pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    if leaf.isCols { return decodeCols(leaf, from, to, b, bp, rw) }
+    // each row's bytes, found once (a lazy leaf's are in its page's body)
+    let rows = try fixedRunRows(leaf, from, to, rw)
+    if len(rows) == 0 { return Ok(0) }
+    let id = try layOf(rows[0], rw.lays)
+    let lay = &rw.lays[id]
+    let n = len(rows)
     let r0 = b.n
     let np = len(lay.kinds)
     for pl in bp.usedP {
@@ -1435,6 +1457,43 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
         }
     }
     return Ok(true)
+}
+
+// Rows rs (batch rows, from row r0 = leaf row from) whose text at place pl
+// a simple LIKE of pieces ps holds for; a dictionary's entries matched once.
+pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str): []int {
+    let s = leaf.cols
+    let dir = leaf.dir
+    var out: []int = []
+    if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            let a = lexdb_cols.spanStart(sp)
+            let e = lexdb_cols.spanEnd(sp)
+            hit[j] = lexdb_like.likeRange(&s[a..e], 0, e - a, ps)
+        }
+        for r in rs {
+            let i = from + r - r0
+            if lexdb_cols.isNull(s, dir, pl, i) { continue }
+            if hit[lexdb_cols.codeAt(s, dir, pl, i)] { append(mut &out, r) }
+        }
+        return out
+    }
+    // (each text a view of its own bytes: a piece searched for is not
+    // looked for past its end, in the texts after it)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    let ends = lexdb_cols.endsAt(dir, pl)
+    let data = lexdb_cols.bytesAt(dir, pl)
+    for r in rs {
+        let i = from + r - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let a = if i == 0 { data } else { data + (int(s[ends + 2 * i - 2]) | (int(s[ends + 2 * i - 1]) << 8)) }
+        let e = data + (int(s[ends + 2 * i]) | (int(s[ends + 2 * i + 1]) << 8))
+        if lexdb_like.likeRange(&s[a..e], 0, e - a, ps) { append(mut &out, r) }
+    }
+    return out
 }
 
 // Column leaves batch scans skipped (excluded), for the tests.

@@ -213,7 +213,7 @@ pub type Db = record {
     // gave them (setColSpec), specs[colSpecs[tree]]; leaves checkpoints
     // wrote as columns and as rows (of trees with layouts)
     colSpecs: Map[int, int]
-    specs: []lexdb_cols.Spec
+    specs: []lexdb_rows.Spec
     pub colLeaves: int
     pub rowLeaves: int
     colsOff: bool               // no column leaves written (setColumns)
@@ -3360,7 +3360,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 // in the range (scan merges them). Each leaf's whole range is noted as
 // read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
-                               f: &fn(&lexdb_page.Node, int, int): bool): Result[bool, lexdb_base.DbErr] {
+                               f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[bool, lexdb_base.DbErr] {
     if st.fo.isSome() { return Ok(false) }         // a replica's reads go through scan
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return Ok(false) }
     let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
@@ -3410,7 +3410,8 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 if len(to) > 0 { j = n.lower(&to) }
                 if j > i {
                     seen = n.key(j - 1)
-                    go = f(n, i, j)
+                    let lv = lexdb_page.leafView(&n)
+                    go = f(&lv, i, j)
                 }
                 upper = d.fence
                 hasUpper = d.hasFence
@@ -3434,7 +3435,8 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
             if len(to) > 0 { j = n.lower(&to) }
             if j > i {
                 seen = n.key(j - 1)
-                go = f(n, i, j)
+                let lv = lexdb_page.leafView(n)
+                go = f(&lv, i, j)
             }
             upper = d.upper
             hasUpper = d.hasUpper
@@ -4817,14 +4819,14 @@ fn (db: mut &Db) leafBody(s: int, pages: &[]int, tree: int): str {
 // layouts must be committed ones: the executor gives none its own
 // transaction has written. A table's layouts are only ever added to, so
 // layouts that begin the ones already given (a snapshot's older catalog)
-// are not taken. fill, fillOk: lexdb_cols.Spec's.
+// are not taken. fill, fillOk: lexdb_rows.Spec's.
 pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte, fill: &str, fillOk: bool) {
     if st.fo.isSome() { return }
     st.sh.with(fn(db: mut &Db) {
         match db.colSpecs.get(&tree) {
             Some(i) {
                 if lexdb_cols.sameSpec(&db.specs[i], layouts, fill, fillOk) { return }
-                let given = lexdb_cols.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk}
+                let given = lexdb_rows.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk}
                 if len(layouts) < len(db.specs[i].layouts) && lexdb_cols.extends(&given, &db.specs[i].layouts) { return }
                 db.specs[i] = given
                 // leaves whose rows did not convert may now
@@ -4832,7 +4834,7 @@ pub fn (st: &Store) setColSpec(tree: int, layouts: &[][]byte, fill: &str, fillOk
             }
             None {
                 db.colSpecs.put(tree, len(db.specs))
-                append(mut &db.specs, lexdb_cols.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk})
+                append(mut &db.specs, lexdb_rows.Spec{layouts: copyLayouts(layouts), fill: fill.toStr(), fillOk: fillOk})
                 append(mut &db.specRatio, 0)
                 append(mut &db.specSplits, 0)
             }
@@ -5453,7 +5455,7 @@ type CkCut = record {
     freedLen: int; dropped: []int
     ids: []int; roots: []int; rootDisk: []int
     nodes: []CutNode; at: Map[int, int]
-    specs: []lexdb_cols.Spec; colsOn: bool; check: bool
+    specs: []lexdb_rows.Spec; colsOn: bool; check: bool
     chunk: int          // leaves encoded at a time (Db.cutChunk)
     pool: bool          // encoded on the par pool: on a real disk (on lexdb_disk.sim, in the task, so a seed's run is the same every time)
 }
@@ -5505,7 +5507,7 @@ fn (db: mut &Db) takeCut(): CkCut {
     c.chunk = max(if c.pool || !db.fs.isReal() { db.cutChunk } else { min(db.cutChunk, CUT_CHUNK_TASK) }, 1)
     for i in 0..len(db.specs) {
         let sp = &db.specs[i]
-        append(mut &c.specs, lexdb_cols.Spec{layouts: copyLayouts(&sp.layouts), fill: sp.fill.toStr(), fillOk: sp.fillOk})
+        append(mut &c.specs, lexdb_rows.Spec{layouts: copyLayouts(&sp.layouts), fill: sp.fill.toStr(), fillOk: sp.fillOk})
     }
     for i in 0..len(c.roots) { db.cutSlot(c.roots[i], c.ids[i], mut &c) }
     return c
@@ -5706,7 +5708,7 @@ type LeafEnc = record { body: str; kind: int; conv: bool; packed: Option[lexdb_p
 
 // What the checkpoint writes of a leaf (leafBody's choice, and refit's test
 // of a leaf that does not fit): a kernel, run on the par pool.
-fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_cols.Spec, colsOn: bool, check: bool): LeafEnc {
+fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_rows.Spec, colsOn: bool, check: bool): LeafEnc {
     let n = &j.node
     if j.spec >= 0 {
         if colsOn {

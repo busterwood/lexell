@@ -1,0 +1,66 @@
+// lexdb: simple LIKE matching (design/lexdb.md 9.52, 9.108).
+//
+// A pattern of literal text and % only is split into pieces and matched as
+// bytes: the first at the text's start, the last at its end, the others in
+// order between, each at its first place. The row codec uses the range form
+// on a text in a row's or a column leaf's bytes, without copying it out;
+// the evaluator uses it for the whole text.
+// Whether LIKE pattern pat is literal text and % only (no _, no escape
+// character): matched as bytes. UTF-8 text matches a literal piece only at
+// a character's start, so bytes give what characters do.
+pub fn likeSimple(pat: &str, esc: &str): bool {
+    for i in 0..len(pat) { if pat[i] == '_' { return false } }
+    if len(esc) == 0 { return true }
+    var i = 0
+    while i + len(esc) <= len(pat) {
+        if bytesAt(pat, i, esc) { return false }
+        i += 1
+    }
+    return true
+}
+
+// pat's pieces between its %s ("a%b%" gives "a", "b", "").
+pub fn likeSplit(pat: &str): []str {
+    var out: []str = []
+    var from = 0
+    for i in 0..len(pat) {
+        if pat[i] == '%' {
+            append(mut &out, pat[from..i])
+            from = i + 1
+        }
+    }
+    append(mut &out, pat[from..len(pat)])
+    return out
+}
+
+fn bytesAt(s: &str, at: int, p: &str): bool {
+    if at < 0 || at + len(p) > len(s) { return false }
+    for i in 0..len(p) { if s[at + i] != p[i] { return false } }
+    return true
+}
+
+// Whether s matches the pattern of these pieces (likeSplit).
+pub fn likePieces(s: &str, ps: &[]str): bool { return likeRange(s, 0, len(s), ps) }
+
+// likePieces of s[lo..hi] (9.108: a text in a row's bytes, not copied out).
+// A piece between is found by the runtime's search from where the last
+// ended: its first place in s, which is in s[lo..hi] if any is.
+pub fn likeRange(s: &str, lo: int, hi: int, ps: &[]str): bool {
+    let n = len(ps)
+    if n == 1 { return hi - lo == len(ps[0]) && bytesAt(s, lo, &ps[0]) }
+    let first = &ps[0]
+    let last = &ps[n - 1]
+    if hi - lo < len(first) + len(last) { return false }
+    if !bytesAt(s, lo, first) || !bytesAt(s, hi - len(last), last) { return false }
+    var at = lo + len(first)
+    let end = hi - len(last)
+    for k in 1..n - 1 {
+        let p = &ps[k]
+        if len(p) == 0 { continue }
+        if at + len(p) > end { return false }
+        let found = strFind(s, at, p)
+        if found < 0 || found + len(p) > end { return false }
+        at = found + len(p)
+    }
+    return true
+}

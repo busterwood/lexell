@@ -31,9 +31,8 @@ import "regex"
 import "unicode"
 import "math"
 import "base64"
-import "./lexdb_page"
-import "./lexdb_cols"
 import "./lexdb_rows"
+import "./lexdb_like"
 import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_func"
@@ -2552,75 +2551,13 @@ fn intArg(v: Val, fname: &str): Result[int, DbErr] {
     }
 }
 
-// Whether LIKE pattern pat is literal text and % only (no _, no escape
-// character): matched as bytes (likePieces). UTF-8 text matches a literal
-// piece only at a character's start, so bytes give what characters do.
-fn likeSimple(pat: &str, esc: &str): bool {
-    for i in 0..len(pat) { if pat[i] == '_' { return false } }
-    if len(esc) == 0 { return true }
-    var i = 0
-    while i + len(esc) <= len(pat) {
-        if bytesAt(pat, i, esc) { return false }
-        i += 1
-    }
-    return true
-}
-
-// pat's pieces between its %s ("a%b%" gives "a", "b", "").
-fn likeSplit(pat: &str): []str {
-    var out: []str = []
-    var from = 0
-    for i in 0..len(pat) {
-        if pat[i] == '%' {
-            append(mut &out, pat[from..i])
-            from = i + 1
-        }
-    }
-    append(mut &out, pat[from..len(pat)])
-    return out
-}
-
-fn bytesAt(s: &str, at: int, p: &str): bool {
-    if at < 0 || at + len(p) > len(s) { return false }
-    for i in 0..len(p) { if s[at + i] != p[i] { return false } }
-    return true
-}
-
-// Whether s matches the pattern of these pieces (likeSplit): the first at
-// its start, the last at its end, the others in order between, each at the
-// first place it is found.
-fn likePieces(s: &str, ps: &[]str): bool { return likeRange(s, 0, len(s), ps) }
-
-// likePieces of s[lo..hi] (9.108: a text in a row's bytes, not copied out).
-// A piece between is found by the runtime's search from where the last
-// ended: its first place in s, which is in s[lo..hi] if any is.
-fn likeRange(s: &str, lo: int, hi: int, ps: &[]str): bool {
-    let n = len(ps)
-    if n == 1 { return hi - lo == len(ps[0]) && bytesAt(s, lo, &ps[0]) }
-    let first = &ps[0]
-    let last = &ps[n - 1]
-    if hi - lo < len(first) + len(last) { return false }
-    if !bytesAt(s, lo, first) || !bytesAt(s, hi - len(last), last) { return false }
-    var at = lo + len(first)
-    let end = hi - len(last)
-    for k in 1..n - 1 {
-        let p = &ps[k]
-        if len(p) == 0 { continue }
-        if at + len(p) > end { return false }
-        let found = strFind(s, at, p)
-        if found < 0 || found + len(p) > end { return false }
-        at = found + len(p)
-    }
-    return true
-}
-
 // LIKE: % any run of characters, _ one character, the escape character
 // (backslash unless given; '' for none) before either for itself.
 fn likeMatch(s: &str, pat: &str, esc: &str, fold: bool): Result[bool, DbErr] {
     let er = strings.runes(&esc)
     if len(er) > 1 { return Err(e("22019", "invalid escape string")) }
     // literal text and % only: its pieces, found in order as bytes (9.52)
-    if !fold && likeSimple(&pat, &esc) { return Ok(likePieces(&s, &likeSplit(&pat))) }
+    if !fold && lexdb_like.likeSimple(&pat, &esc) { return Ok(lexdb_like.likePieces(&s, &lexdb_like.likeSplit(&pat))) }
     let sl: str = if fold { strings.toLowerAscii(&s) } else { s }
     let sr = strings.runes(&sl)
     let pl: str = if fold { strings.toLowerAscii(&pat) } else { pat }
@@ -5012,7 +4949,7 @@ fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 
 // Gives the store table t's layouts (lexdb_store.setColSpec), and the
 // values its rows written before a column was added have for it (as a row
-// in its current layout: lexdb_cols.Spec.fill).
+// in its current layout: lexdb_rows.Spec.fill).
 fn setSpec(st: &lexdb_store.Store, t: &Table) {
     if t.tree <= 0 || len(t.layouts) == 0 || len(t.view) > 0 { return }
     let miss = placesMissing(t)
@@ -8723,7 +8660,7 @@ fn switchMost(rules: bool, n: int): int {
 // The table's rows, counted until there are more than most.
 fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
     var n = 0
-    let done = try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+    let done = try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
         n += j - i
         return n <= most
     })
@@ -23762,11 +23699,6 @@ type BSpec = record {
     vcol: int
 }
 
-type RawRows = record {
-    keys: []str
-    vals: []str
-}
-
 fn colKind(c: &lexdb_sql.ColDef): int { return lexdb_rows.colKind(c) }
 
 // Whether x has no column (its value is the same for every row).
@@ -23897,8 +23829,8 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
             let pat = text(&cs[0])
             let esc = if len(cs) > 1 { text(&cs[1]) } else { "\\" }
             let fold = name == "ilike"
-            let simple = !fold && likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
-            let pieces = if simple { likeSplit(&pat) } else { [] }
+            let simple = !fold && lexdb_like.likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
+            let pieces = if simple { lexdb_like.likeSplit(&pat) } else { [] }
             return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces}), typ: BT_BOOL})
         }
         else { return None }
@@ -24095,8 +24027,8 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 }
                 let hit = if lp.simple {
                     match b.vals[c][r] {
-                        Val.Text(x) { likePieces(&x, &lp.pieces) }
-                        else { likePieces(&text(&b.vals[c][r]), &lp.pieces) }
+                        Val.Text(x) { lexdb_like.likePieces(&x, &lp.pieces) }
+                        else { lexdb_like.likePieces(&text(&b.vals[c][r]), &lp.pieces) }
                     }
                 } else {
                     try likeMatch(&(text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
@@ -24335,51 +24267,6 @@ fn bTrue(n: &BNode, b: &Batch, idx: &[]int): Result[[]int, DbErr] {
     return Ok(out)
 }
 
-// Up to BROWS stored rows of a scan, from the cursor on.
-fn fetchRaw(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool,
-            cur: mut &Cursor): Result[RawRows, DbErr] {
-    var ks: []str = []
-    var vs: []str = []
-    if sc.empty {
-        cur.done = true
-        return Ok(RawRows{keys: ks, vals: vs})
-    }
-    if sc.point {
-        cur.done = true
-        let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
-        match got {
-            Some(v) {
-                append(mut &ks, sc.lo)
-                append(mut &vs, v)
-            }
-            None {}
-        }
-        return Ok(RawRows{keys: ks, vals: vs})
-    }
-    let from = if cur.started { cur.at } else { sc.lo }
-    cur.started = true
-    var last = ""
-    if part {
-        try st.scanPart(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &ks, en.key)
-            append(mut &vs, en.val)
-            last = en.key
-            return len(vs) < BROWS
-        })
-    } else {
-        try st.scan(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &ks, en.key)
-            append(mut &vs, en.val)
-            last = en.key
-            return len(vs) < BROWS
-        })
-    }
-    if len(vs) < BROWS { cur.done = true } else { cur.at = after(&last) }
-    return Ok(RawRows{keys: ks, vals: vs})
-}
-
-
-
 // Where a batch reads the columns used (lexdb_rows.Projection).
 type BPlan = lexdb_rows.Projection
 
@@ -24394,14 +24281,6 @@ fn bRowInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, 
     return lexdb_rows.decodeRow(s, r, b, bp, &rw)
 }
 
-// Decodes a leaf's rows in one fixed layout into b, as
-// lexdb_rows.decodeRun.
-fn bRunInto(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table): Result[int, DbErr] {
-    let rw = rowsFor(t)
-    let v = lexdb_page.leafView(leaf)
-    return lexdb_rows.decodeRun(&v, from, to, b, bp, &rw)
-}
-
 // A row read whole by the row path (a value stored apart) into row r of b;
 // false: a value of a kind its column's batch does not hold.
 fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, r: int, b: mut &Batch,
@@ -24413,32 +24292,99 @@ fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &st
     return Ok(true)
 }
 
-// The columns used of a batch of stored rows (copied out by fetchRaw);
-// None: a value of a kind its column's batch does not hold.
-fn bDecode(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, raw: &RawRows, bp: &BPlan): Result[Option[Batch], DbErr] {
-    let n = len(raw.vals)
-    var b = lexdb_rows.newBatch(bp, n)
-    for r in 0..n {
-        let code = try bRowInto(&raw.vals[r], r, mut &b, bp, t)
-        if code == 1 { return Ok(None) }
-        if code == 2 && !(try bRowOf(st, txn, t, &raw.keys[r], &raw.vals[r], r, mut &b, bp)) { return Ok(None) }
+// Up to BROWS rows of a scan decoded as they are read: the transaction's
+// own writes merged (scan/scanPart), a replica's base and delta, or a stored
+// value read whole (a stub) decoded after the scan. None: a value of a
+// kind its column's batch does not hold.
+fn fillScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool,
+            cur: mut &Cursor, bp: &BPlan): Result[Option[Batch], DbErr] {
+    let rw = rowsFor(t)
+    if sc.empty {
+        cur.done = true
+        return Ok(Some(lexdb_rows.newBatch(bp, 0)))
     }
-    b.n = n
+    if sc.point {
+        cur.done = true
+        var b = lexdb_rows.newBatch(bp, 1)
+        let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
+        match got {
+            Some(v) {
+                let code = try lexdb_rows.decodeRow(&v, 0, mut &b, bp, &rw)
+                if code == 1 { return Ok(None) }
+                if code == 2 && !(try bRowOf(st, txn, t, &sc.lo, &v, 0, mut &b, bp)) { return Ok(None) }
+                b.n = 1
+            }
+            None {}
+        }
+        return Ok(Some(b))
+    }
+    var b = lexdb_rows.newBatch(bp, BROWS)
+    let from = if cur.started { cur.at } else { sc.lo }
+    cur.started = true
+    var last = ""
+    var full = false
+    var bail = false
+    var bad: []DbErr = []
+    var pend: []int = []                // rows stored apart: decoded after the scan
+    var pkeys: []str = []
+    var pvals: []str = []
+    let one = fn(en: &lexdb_store.Entry, bb: mut &Batch, bp2: &BPlan, rw2: &lexdb_rows.Rows, pend2: mut &[]int,
+                 pkeys2: mut &[]str, pvals2: mut &[]str, bail2: mut &bool, bad2: mut &[]DbErr, last2: mut &str,
+                 full2: mut &bool): bool {
+        match lexdb_rows.decodeRow(&en.val, bb.n, bb, bp2, rw2) {
+            Ok(code) {
+                if code == 0 {
+                    bb.n += 1
+                } else if code == 1 {
+                    bail2 = true
+                    return false
+                } else {
+                    append(pend2, bb.n)
+                    append(pkeys2, en.key)
+                    append(pvals2, en.val)
+                    bb.n += 1
+                }
+            }
+            Err(x) {
+                append(bad2, x)
+                return false
+            }
+        }
+        last2 = en.key
+        if bb.n >= BROWS {
+            full2 = true
+            return false
+        }
+        return true
+    }
+    if part {
+        try st.scanPart(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
+            return one(en, mut &b, bp, &rw, mut &pend, mut &pkeys, mut &pvals, mut &bail, mut &bad, mut &last, mut &full)
+        })
+    } else {
+        try st.scan(txn, t.tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
+            return one(en, mut &b, bp, &rw, mut &pend, mut &pkeys, mut &pvals, mut &bail, mut &bad, mut &last, mut &full)
+        })
+    }
+    if len(bad) > 0 { return Err(bad[0]) }
+    if bail { return Ok(None) }
+    for i in 0..len(pend) {
+        if !(try bRowOf(st, txn, t, &pkeys[i], &pvals[i], pend[i], mut &b, bp)) { return Ok(None) }
+    }
+    if full { cur.at = after(&last) } else { cur.done = true }
     return Ok(Some(b))
 }
 
 // The next batch of a scan, its rows decoded from the leaves in place
 // (lexdb_store.scanLeaves: no entry copied out); None: a value of a kind
 // its column's batch does not hold. A key lookup, and a scan whose range
-// the transaction has written, go through fetchRaw (it merges those
-// writes); a value stored apart is read by the row path.
+// the transaction has written or a replica's scan, go through fillScan
+// (scan merges those writes); a value stored apart is read by the row path.
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
              bp: &BPlan): Result[Option[Batch], DbErr] {
-    if sc.empty || sc.point {
-        let raw = try fetchRaw(st, txn, t, sc, part, cur)
-        return bDecode(st, txn, t, &raw, bp)
-    }
+    if sc.empty || sc.point { return fillScan(st, txn, t, sc, part, cur, bp) }
     var b = lexdb_rows.newBatch(bp, BROWS)
+    let rw = rowsFor(t)
     while b.n < BROWS && !cur.done {
         let from = if cur.started { cur.at } else { sc.lo }
         cur.started = true
@@ -24446,17 +24392,17 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols() && cExcluded(leaf, bp, t) { return true }
+        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
                 if b.n == BROWS {
                     stop = 1
-                    stopKey = leaf.key(k)
+                    stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
                 }
                 // a run of rows in one fixed layout: a column at a time
-                match bRunInto(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t) {
+                match lexdb_rows.decodeRun(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, &rw) {
                     Ok(got) {
                         if got < 0 {
                             bail = true
@@ -24473,7 +24419,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                         return false
                     }
                 }
-                match bRowInto(leaf.valView(k), b.n, mut &b, bp, t) {
+                match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, k), b.n, mut &b, bp, &rw) {
                     Ok(code) {
                         if code == 1 {
                             bail = true
@@ -24481,7 +24427,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                         }
                         if code == 2 {
                             stop = 2
-                            stopKey = leaf.key(k)
+                            stopKey = lexdb_rows.leafKey(leaf, k)
                             return false
                         }
                     }
@@ -24501,8 +24447,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
             // the transaction's own writes in the range: copied and merged
             cur.at = from
             if b.n > 0 { return Ok(Some(b)) }
-            let raw = try fetchRaw(st, txn, t, sc, part, cur)
-            return bDecode(st, txn, t, &raw, bp)
+            return fillScan(st, txn, t, sc, part, cur, bp)
         }
         if stop == 1 {
             cur.at = stopKey
@@ -24655,14 +24600,15 @@ fn plainTagged(s: &str): bool {
 // them choosing the rows). The rows decoded (0: vs[from] is not a tagged
 // row); -1 a value of a kind its column's batch does not hold; -2 a
 // condition's error on one of them.
-fn bTagLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+fn bTagLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
             bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
     let r0 = b.n
+    let rw = rowsFor(t)
     var end = from
     while end < to {
-        let s = leaf.valView(end)
+        let s = lexdb_rows.leafValAt(leaf, end)
         if !plainTagged(s) { break }
-        if try bRowInto(s, r0 + end - from, b, &lz.bf, t) != 0 { return Ok(-1) }
+        if try lexdb_rows.decodeRow(s, r0 + end - from, b, &lz.bf, &rw) != 0 { return Ok(-1) }
         end += 1
     }
     let n = end - from
@@ -24682,7 +24628,7 @@ fn bTagLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
         ch = ok
     }
     for r in ch {
-        if try bRowInto(leaf.valView(from + r - r0), r, b, &lz.br, t) != 0 { return Ok(-1) }
+        if try lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, from + r - r0), r, b, &lz.br, &rw) != 0 { return Ok(-1) }
         append(idx, r)
     }
     return Ok(n)
@@ -24722,7 +24668,7 @@ fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]s
         let e = binary.readU16LEStr(s, o)
         let st = if pv < 0 { 0 } else { binary.readU16LEStr(s, pv) }
         if st > e || v0 + e > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
-        if likeRange(s, v0 + st, v0 + e, ps) { append(mut &out, r) }
+        if lexdb_like.likeRange(s, v0 + st, v0 + e, ps) { append(mut &out, r) }
     }
     return Ok(out)
 }
@@ -24744,28 +24690,15 @@ fn barAfter(bar: &Bar, x: int, nul: bool): bool {
 // bar run over them, their other places decoded for the rows kept, which
 // are added to idx (kept: the conditions' count added to). The rows
 // decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
-fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
             bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
-    if leaf.isCols() { return cRunLazy(leaf, from, to, b, bp, t, lz, conds, bar, idx, kept) }
-    let s0 = leaf.valView(from)
-    if len(s0) < 3 || !isFixedRow(s0, t) { return Ok(0) }
-    let tf = lexdb_cols.timeFirst(&t.layouts)
-    let id = try layOf(s0, &t.lays)
-    let lay = &t.lays[id]
-    let id0 = s0[1]
-    let id1 = s0[2]
-    let v0 = lay.v0
-    var rows: []&str = withCapacity(to - from)
-    append(mut &rows, s0)
-    var end = from + 1
-    while end < to {
-        let s = leaf.valView(end)
-        if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
-        if tf && lexdb_cols.timeTagged(s, &t.layouts) { break }
-        append(mut &rows, s)
-        end += 1
-    }
-    let n = end - from
+    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, conds, bar, idx, kept) }
+    let rw = rowsFor(t)
+    let rows = try lexdb_rows.fixedRunRows(leaf, from, to, &rw)
+    if len(rows) == 0 { return Ok(0) }
+    let id = try layOf(rows[0], rw.lays)
+    let lay = &rw.lays[id]
+    let n = len(rows)
     let r0 = b.n
     let np = len(lay.kinds)
     var rs: []int = withCapacity(n)
@@ -24815,7 +24748,7 @@ fn bRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
 // ---- Column leaves (9.112)
 //
 // A table leaf a checkpoint wrote as columns (lexdb_page T_CLEAF,
-// lexdb_cols) is decoded into a batch a column at a time from its
+// lexdb_rows) is decoded into a batch a column at a time from its
 // columns, only the places used: an integer unpacked from its frame of
 // reference, a text a slice of the leaf, a dictionary's entries made once.
 // Two steps as for rows (9.108): the places the conditions read, then the
@@ -24926,28 +24859,20 @@ fn cRangeAdd(o: int, v: int, col: int, kind: int, t: &Table, out: mut &[]int) {
 // Column leaves batch scans skipped (lexdb_rows.excluded), for the tests.
 pub fn colLeavesSkipped(): int { return lexdb_rows.colLeavesSkipped() }
 
-// Whether a column leaf holds no row bp.ranges keep.
-fn cExcluded(leaf: &lexdb_page.Node, bp: &BPlan, t: &Table): bool {
-    let rw = rowsFor(t)
-    let v = lexdb_page.leafView(leaf)
-    return lexdb_rows.excluded(&v, bp, &rw)
-}
-
 // bRunLazy for a column leaf: rows from..to, the places the conditions
 // read first, the conditions, then the other places for the rows kept
 // (added to idx). A simple LIKE on a dictionary's text is matched once per
 // entry. The rows decoded (to - from), -1 and -2 as bRunLazy.
-fn cRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
+fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
             bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
     let n = to - from
     let r0 = b.n
-    let v = lexdb_page.leafView(leaf)
     let rw = rowsFor(t)
     var rs: []int = withCapacity(n)
     for q in 0..n { append(mut &rs, r0 + q) }
-    if !lexdb_rows.layoutOk(&v, &rw) {
+    if !lexdb_rows.layoutOk(leaf, &rw) {
         // row by row, the conditions over them all
-        if (try lexdb_rows.rowsInto(&v, from, to, b, bp, &rw)) < 0 { return Ok(-1) }
+        if (try lexdb_rows.rowsInto(leaf, from, to, b, bp, &rw)) < 0 { return Ok(-1) }
         let none: []bool = []
         let got0 = bNarrow(conds, &none, b, rs)
         if got0.isNone() { return Ok(-2) }
@@ -24956,24 +24881,22 @@ fn cRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
         for r in ch0 { append(idx, r) }
         return Ok(n)
     }
-    let s = &leaf.cols
-    let dir = &leaf.cdir
-    let np = lexdb_cols.places(dir)
+    let np = lexdb_rows.leafPlaces(leaf)
     // the simple LIKEs on the leaf's bytes
     for x in 0..len(lz.raw) {
         if len(rs) == 0 { break }
         let ci = lz.raw[x]
         let pl = lz.rawPl[x]
-        if pl < np && lexdb_cols.kindOf(s, pl) == PK_TEXT {
+        if pl < np && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT {
             match conds[ci] {
-                BNode.Like(_, lp) { rs = cLikeRaw(leaf, from, &rs, r0, pl, &lp.pieces) }
+                BNode.Like(_, lp) { rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lp.pieces) }
                 else {}
             }
             continue
         }
         var qs1: []int = withCapacity(len(rs))
         for r in rs { append(mut &qs1, r - r0) }
-        if !(try lexdb_rows.colsInto(&v, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
+        if !(try lexdb_rows.colsInto(leaf, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
         var only: []bool = array(len(conds), true)
         only[ci] = false
         let got1 = bNarrow(conds, &only, b, rs)
@@ -24982,7 +24905,7 @@ fn cRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
     }
     var qs0: []int = withCapacity(len(rs))
     for r in rs { append(mut &qs0, r - r0) }
-    if !(try lexdb_rows.colsInto(&v, from, &qs0, len(rs) == n, r0, &lz.first, b, bp)) { return Ok(-1) }
+    if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(rs) == n, r0, &lz.first, b, bp)) { return Ok(-1) }
     let got = bNarrow(conds, &lz.skip, b, rs)
     if got.isNone() { return Ok(-2) }
     var ch = got.unwrap()
@@ -24995,46 +24918,9 @@ fn cRunLazy(leaf: &lexdb_page.Node, from: int, to: int, b: mut &Batch, bp: &BPla
     }
     var qs: []int = withCapacity(len(ch))
     for r in ch { append(mut &qs, r - r0) }
-    if !(try lexdb_rows.colsInto(&v, from, &qs, len(ch) == n, r0, &lz.rest, b, bp)) { return Ok(-1) }
+    if !(try lexdb_rows.colsInto(leaf, from, &qs, len(ch) == n, r0, &lz.rest, b, bp)) { return Ok(-1) }
     for r in ch { append(idx, r) }
     return Ok(n)
-}
-
-// Rows rs (batch rows, from row r0 = leaf row from) whose text at place pl
-// a simple LIKE of pieces ps holds for; a dictionary's entries matched once.
-fn cLikeRaw(leaf: &lexdb_page.Node, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str): []int {
-    let s = &leaf.cols
-    let dir = &leaf.cdir
-    var out: []int = []
-    if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
-        let nd = lexdb_cols.dictSize(dir, pl)
-        var hit: []bool = array(nd, false)
-        for j in 0..nd {
-            let sp = lexdb_cols.entryAt(s, dir, pl, j)
-            let a = lexdb_cols.spanStart(sp)
-            let e = lexdb_cols.spanEnd(sp)
-            hit[j] = likeRange(&s[a..e], 0, e - a, ps)
-        }
-        for r in rs {
-            let i = from + r - r0
-            if lexdb_cols.isNull(s, dir, pl, i) { continue }
-            if hit[lexdb_cols.codeAt(s, dir, pl, i)] { append(mut &out, r) }
-        }
-        return out
-    }
-    // (each text a view of its own bytes: a piece searched for is not
-    // looked for past its end, in the texts after it)
-    let nulls = lexdb_cols.hasNulls(dir, pl)
-    let ends = lexdb_cols.endsAt(dir, pl)
-    let data = lexdb_cols.bytesAt(dir, pl)
-    for r in rs {
-        let i = from + r - r0
-        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
-        let a = if i == 0 { data } else { data + (int(s[ends + 2 * i - 2]) | (int(s[ends + 2 * i - 1]) << 8)) }
-        let e = data + (int(s[ends + 2 * i]) | (int(s[ends + 2 * i + 1]) << 8))
-        if likeRange(&s[a..e], 0, e - a, ps) { append(mut &out, r) }
-    }
-    return out
 }
 
 // The next batch of a level, decoded in two steps when lz is on and the
@@ -25064,6 +24950,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
         return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
     }
     var b = lexdb_rows.reuse(spare, bp)
+    let rw = rowsFor(t)
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
@@ -25074,13 +24961,13 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols() && cExcluded(leaf, bp, t) { return true }
+        let inPlace = try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
                 if b.n == BROWS {
                     stop = 1
-                    stopKey = leaf.key(k)
+                    stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
                 }
                 match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
@@ -25117,7 +25004,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
                         return false
                     }
                 }
-                match bRowInto(leaf.valView(k), b.n, mut &b, bp, t) {
+                match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, k), b.n, mut &b, bp, &rw) {
                     Ok(code) {
                         if code == 1 {
                             bail = true
@@ -25125,7 +25012,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
                         }
                         if code == 2 {
                             stop = 2
-                            stopKey = leaf.key(k)
+                            stopKey = lexdb_rows.leafKey(leaf, k)
                             return false
                         }
                     }
@@ -25146,8 +25033,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
             // the transaction's own writes in the range: copied and merged
             cur.at = from
             if b.n > 0 { break }
-            let raw = try fetchRaw(st, txn, t, sc, part, cur)
-            let got = try bDecode(st, txn, t, &raw, bp)
+            let got = try fillScan(st, txn, t, sc, part, cur, bp)
             if got.isNone() { return Ok(None) }
             let b2 = got.unwrap()
             let ch = bChoose(conds, &b2)
@@ -26361,15 +26247,15 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
         cur.started = true
         var stopKey = ""
         var full = false
-        let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+        let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             var k = i
             while k < j {
                 if b.n == BROWS {
                     full = true
-                    stopKey = leaf.key(k)
+                    stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
                 }
-                if !bIdxInto(&leaf.key(k), b.n, mut &b, bp, &rd.dec) {
+                if !bIdxInto(&lexdb_rows.leafKey(leaf, k), b.n, mut &b, bp, &rd.dec) {
                     bail = true
                     return false
                 }
@@ -26433,15 +26319,15 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd:
             cur.started = true
             var stopKey = ""
             var full = false
-            let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_page.Node, i: int, j: int): bool {
+            let inPlace = try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
                 var k = i
                 while k < j {
                     if len(pks) == BROWS {
                         full = true
-                        stopKey = leaf.key(k)
+                        stopKey = lexdb_rows.leafKey(leaf, k)
                         return false
                     }
-                    append(mut &pks, leaf.val(k))
+                    append(mut &pks, lexdb_rows.leafVal(leaf, k))
                     k += 1
                 }
                 return true
@@ -28653,7 +28539,7 @@ fn relSize(se: &SeqEnv, name: &str, oid: int): Result[Val, DbErr] {
             let take = if l[1] == "i" { name != "pg_indexes_size" } else if name == "pg_indexes_size" { !mine } else if name == "pg_total_relation_size" { true } else { mine }
             if take { pages += try se.st.treePages(tr) }
         }
-        return Ok(Val.Int(pages * lexdb_page.PAGE))
+        return Ok(Val.Int(pages * lexdb_rows.PAGE))
     }
     if relShown(se, oid).isSome() { return Ok(Val.Int(0)) }
     return Ok(Val.Null)
@@ -30187,7 +30073,7 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         // file may hold freed pages, and rows still only in the log)
         var pages = 0
         for tr in se.st.trees() { if tr < lexdb_store.OVF { pages += try se.st.treePages(tr) } }
-        return Ok(Some(Val.Int(pages * lexdb_page.PAGE)))
+        return Ok(Some(Val.Int(pages * lexdb_rows.PAGE)))
     }
     if n >= 1 && isNull(&vs[0]) { return Ok(Some(Val.Null)) }
     if name == "pg_table_is_visible" && n == 1 {

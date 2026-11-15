@@ -38,7 +38,7 @@ No new runtime flag without a named seam and a deletion phase.
 | `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | delete | — | 2 |
 | flat free list in the meta page | pre-runs free encoding | delete | runs only | 4 |
 | `st.fo` | live vs follower read view | seam | `ReadView` (batch-level) | 3 |
-| `scanLeaves` returning false on a follower | leaf representation leaking to exec | seam | `ReadView.nextBatch` | 3 |
+| `scanLeaves` returning false on a follower | leaf representation leaking to exec | seam | `ReadView.nextBatch`; `LeafView` already replaces `Node` in exec | 3 |
 | `rs.batch` / `Run.batch` | master switch for batches, compiled expressions, outputs, typed sort | seam | `ExecStrategy`; compiled/typed always on | split 1, seam 6 |
 | `lexdb_planner` / `Session.rules` | rules vs cost planner | seam | `CostModel`; rules as no-stats fallback/test | 9 |
 | `ckptLocked` / `CUT_TRIES` | checkpoint cut vs whole-under-`with` fallback | fallback | cut-only, with a retry; delete locked | 4 |
