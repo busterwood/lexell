@@ -382,3 +382,96 @@ and partial aggregates split by key range), not only a faster single
 thread.
 
 The tables in `~/Work/lexdb-bench/saved/results/2026-11-13-refresh/`.
+
+## 7. Results after the read-ahead, the O_DSYNC log and the costs measured again (2026-11-15)
+
+lexdb at 478d49f6 (main: lexdb.md 9.130 to 9.132, optimizer 45, the heap
+on huge pages). The 35 queries of `~/Work/lexdb-bench/hp/q.txt` (section
+6's four lists, 34 queries, and `join_text_group`), bench.py, 5 runs each,
+the median; one benchmark at a time on a quiet machine (load under 1).
+- **lexdb:** a fresh copy of a **settled** bd_ob (every table vacuumed:
+  column leaves, checkpointed; `~/Work/lexdb-bench/la/base2`). Server CPU.
+- **PostgreSQL 18.6** (`saved/pg18`, shared_buffers 1GB): one core
+  (`max_parallel_workers_per_gather = 0`), server CPU; and at 4 processes
+  (`= 3`, `max_parallel_workers = 3`), wall. Its table `t` had been dropped
+  and was loaded again from `saved/rows1m.tsv` (the same rows as lexdb's).
+- Every query returned the same number of rows on both. PostgreSQL's CPU
+  is counted in 10 ms ticks, so a query under 10 ms is compared by wall
+  time (marked).
+
+| query | lexdb 11-13 | lexdb now | PG 1 core | ratio | lexdb wall | PG 4 proc wall | ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `sort_all` | 74 | **74** | 410 | 0.18 | 132 | 476 | 0.28 |
+| `grp_int` | 37 | **37** | 100 | 0.37 | 41 | 37 | 1.11 |
+| `sort_lim` | 28 | **34** | 90 | 0.38 | 39 | 34 | 1.15 |
+| `count` | 9 | **12** | 30 | 0.40 | 16 | 19 | 0.84 |
+| `join_hash_agg` | 38 | **40** | 100 | 0.40 | 44 | 37 | 1.19 |
+| `filt1pct` | 21 | **19** | 40 | 0.47 | 24 | 24 | 1.00 |
+| `sub_exists` | 25 | **27** | 50 | 0.54 | 31 | 25 | 1.24 |
+| `sub_in` | 25 | **27** | 50 | 0.54 | 31 | 25 | 1.24 |
+| `filt10pct` | 32 | **30** | 50 | 0.60 | 44 | 61 | 0.72 |
+| `filt_agg` | 20 | **24** | 40 | 0.60 | 28 | 23 | 1.22 |
+| `join_hash_sort` | 68 | **66** | 110 | 0.60 | 80 | 58 | 1.38 |
+| `join_hash_rows` | 37 | **38** | 60 | 0.63 | 48 | 67 | 0.72 |
+| `filt_like` | 47 | **52** | 80 | 0.65 | 57 | 32 | 1.78 |
+| `pk_range100k` | 13 | **13** | 20 | 0.65 | 26 | 34 | 0.76 |
+| `idx_range1k` (wall) | 3 | **7** | 10 | 0.70 | 7 | 10 | 0.70 |
+| `expr_int` | 96 | **100** | 140 | 0.71 | 183 | 222 | 0.82 |
+| `join_left_rows` | 29 | **29** | 40 | 0.72 | 44 | 58 | 0.76 |
+| `expr_agg` | 46 | **45** | 60 | 0.75 | 50 | 26 | 1.92 |
+| `minmax_text` | 100 | **104** | 130 | 0.80 | 108 | 45 | 2.40 |
+| `scan3` | 110 | **114** | 130 | 0.88 | 204 | 221 | 0.92 |
+| `sub_corr_sel` | 145 | **132** | 150 | 0.88 | 147 | 155 | 0.95 |
+| `scan2` | 82 | **81** | 90 | 0.90 | 139 | 150 | 0.93 |
+| `distinct` | 85 | **89** | 90 | 0.99 | 93 | 36 | 2.58 |
+| `join_text_group` |  | **188** | 170 | 1.11 | 193 | 55 | 3.51 |
+| `join_text_agg` | 97 | **99** | 80 | 1.24 | 104 | 34 | 3.06 |
+| `join_lookup_agg` | 110 | **100** | 80 | 1.25 | 104 | 34 | 3.06 |
+| `join_text_rows` | 100 | **102** | 80 | 1.27 | 115 | 89 | 1.29 |
+| `expr_mix` | 400 | **408** | 310 | 1.32 | 535 | 438 | 1.22 |
+| `grp_text` | 169 | **174** | 130 | 1.34 | 179 | 44 | 4.07 |
+| `idx_range100k` | 45 | **56** | 40 | 1.40 | 69 | 48 | 1.44 |
+| `idx_range_agg` | 31 | **42** | 30 | 1.40 | 47 | 25 | 1.88 |
+| `pk_point20k` | 610 | **640** | 450 | 1.42 | 693 | 680 | 1.02 |
+| `window` | 214 | **201** | 140 | 1.44 | 222 | 95 | 2.34 |
+| `scan9` | 453 | **465** | 270 | 1.72 | 740 | 552 | 1.34 |
+| `distinct2` | 190 | **191** | 110 | 1.74 | 195 | 42 | 4.64 |
+
+| geometric mean, 34 queries | 11-13 (section 6) | now |
+|---|---:|---:|
+| lexdb CPU over PostgreSQL's, one core | 0.72 | **0.78** |
+| lexdb wall over PostgreSQL's, one core | 0.79 | 0.82 |
+| lexdb wall over PostgreSQL's, 4 processes | 1.28 | 1.30 |
+
+23 queries are ahead or level (to 1.12 ×) and 8 more than 1.3 × behind (22
+and 6 on 11-13). PostgreSQL's own figures are where they were (its CPU
+now over 11-13's: 1.00).
+
+**lexdb is 6.7% slower than on 11-13, and not from today's changes.** On
+the same settled data, main before today (4979c256, heap without huge
+pages) and main now differ by 0.2% (geometric mean of CPU over the 35;
+`warm-ab-*.tsv`): `window` -18 ms and `grp_int` -5 with huge pages and
+the new costs, `filt_agg`, `sort_lim` and `idx_range_agg` +3. The
+difference from 11-13 is the data: 11-13 ran on copies whose tables were
+partly row leaves, converted as the scans read them (lexdb.md 9.132's
+note); these copies are column leaves throughout. Point and index reads
+cost more from column leaves (optimizer 45): `pk_point20k` 610 to 640,
+`idx_range100k` 45 to 56, `idx_range_agg` 31 to 42.
+
+**Where lexdb is behind on one core** (unchanged in kind from section 6):
+returning every column of 1M rows (`scan9` 1.72, `expr_mix` 1.32), text
+keys hashed (`distinct2` 1.74, `grp_text` 1.34, the text joins 1.24 to
+1.27), windows (1.44), the 20k point lookups (1.42, one statement each;
+not profiled here), the 10% index ranges (1.40: they
+are scanned) and `w join t` (1.25).
+
+**Against 4 processes** PostgreSQL's parallel aggregates and hash joins
+are 2.3 to 4.6 times faster (`distinct2`, `grp_text`, `join_text_group`,
+`join_text_agg`, `join_lookup_agg`, `distinct`, `minmax_text`, `window`);
+lexdb, one thread, is ahead where PostgreSQL's plans stay serial (the
+sort 0.28, filters, key ranges, LEFT JOIN, the row-returning hash join).
+
+The tables and scripts: `~/Work/lexdb-bench/saved/results/2026-11-15-refresh/`
+(`query_run.sh`, `cmp.py`). Bulk loads and commits against PostgreSQL and
+SQL Server: lexdb.md 9.133.
+
