@@ -18,6 +18,7 @@
 import "strings"
 import "./lexdb_sysdata"
 import "./lexdb_dialect"
+import "./lexdb_sql"
 
 // A view's column: as sys.all_columns describes it.
 pub type SysCol = record {
@@ -295,4 +296,85 @@ pub fn schemaIdOf(n: &str): int {
     let l = strings.toLowerAscii(&(strings.trim(n)))
     for r in rows(&"schemas", &"full") { if strings.toLowerAscii(&r[0]) == l { return strings.parseIntOpt(&r[1]).unwrapOr(0) } }
     return 0
+}
+
+pub type SqlT = record {
+    pub name: str
+    pub sys: int
+    pub user: int
+    pub maxLen: int
+    pub prec: int
+    pub scale: int
+    pub coll: str
+}
+
+pub fn sqlT(name: &str, maxLen: int, prec: int, scale: int, coll: &str): SqlT {
+    let id = typeId(name)
+    return SqlT{name: name.toStr(), sys: id, user: if name == "sysname" { TS_SYSNAME } else { id }, maxLen: maxLen, prec: prec,
+                scale: scale, coll: coll.toStr()}
+}
+
+// SQL Server's precision and length of a time type of scale s.
+pub fn timeT(name: &str, s: int): SqlT {
+    let frac = if s > 0 { s + 1 } else { 0 }
+    let short = if s < 3 { 0 } else if s < 5 { 1 } else { 2 }
+    if name == "time" { return sqlT(name, 3 + short, 8 + frac, s, &"") }
+    if name == "datetimeoffset" { return sqlT(name, 8 + short, 26 + frac, s, &"") }
+    return sqlT(name, 6 + short, 19 + frac, s, &"")
+}
+
+// The SQL Server type of a column of lexdb type t: SQL Server's own where
+// the column was made with one (TypeName.prec's code: lexdb_sql.tsqlType),
+// else the nearest (text is nvarchar(max), a timestamp datetime2, ...).
+pub fn sqlTypeOf(t: &lexdb_sql.TypeName, collName: &str): SqlT {
+    let code = lexdb_sql.tsqlCode(t)
+    let coll = if len(collName) > 0 { collName.toStr() } else { "Latin1_General_BIN2" }
+    let k = t.kind
+    if k == lexdb_sql.K_INT {
+        if code == TS_TINYINT { return sqlT(&"tinyint", 1, 3, 0, &"") }
+        if t.oid == lexdb_sql.OID_INT2 { return sqlT(&"smallint", 2, 5, 0, &"") }
+        if t.oid == lexdb_sql.OID_INT8 { return sqlT(&"bigint", 8, 19, 0, &"") }
+        return sqlT(&"int", 4, 10, 0, &"")
+    }
+    if k == lexdb_sql.K_BOOL { return sqlT(&"bit", 1, 1, 0, &"") }
+    if k == lexdb_sql.K_NUM {
+        let p = if t.prec > 0 { t.prec } else { 38 }
+        let s = if t.prec > 0 { t.scale } else { 6 }
+        return sqlT(&"decimal", if p <= 9 { 5 } else if p <= 19 { 9 } else if p <= 28 { 13 } else { 17 }, p, s, &"")
+    }
+    if k == lexdb_sql.K_FLOAT {
+        if t.oid == lexdb_sql.OID_FLOAT4 { return sqlT(&"real", 4, 24, 0, &"") }
+        return sqlT(&"float", 8, 53, 0, &"")
+    }
+    if k == lexdb_sql.K_DATE { return sqlT(&"date", 3, 10, 0, &"") }
+    // an interval (SQL Server has none) is sent as its text: nvarchar(max), as arrays, json and enums
+    if t.oid == lexdb_sql.OID_IVAL { return sqlT(&"nvarchar", -1, 0, 0, &coll) }
+    if lexdb_sql.isTimeKind(k) {
+        if code == TS_DATETIME { return sqlT(&"datetime", 8, 23, 3, &"") }
+        if code == TS_SMALLDATETIME { return sqlT(&"smalldatetime", 4, 16, 0, &"") }
+        let s = if t.prec >= 1 { min(t.scale, 7) } else { 7 }
+        if t.oid == lexdb_sql.OID_TIME { return timeT(&"time", s) }
+        if t.oid == lexdb_sql.OID_TSTZ { return timeT(&"datetimeoffset", s) }
+        return timeT(&"datetime2", s)
+    }
+    if k == lexdb_sql.K_UUID { return sqlT(&"uniqueidentifier", 16, 0, 0, &"") }
+    if k == lexdb_sql.K_BYTEA {
+        if code == TS_BINARY { return sqlT(&"binary", if t.len > 0 { t.len } else { 1 }, 0, 0, &"") }
+        if code == TS_IMAGE { return sqlT(&"image", 16, 0, 0, &"") }
+        if code == TS_TIMESTAMP { return sqlT(&"timestamp", 8, 0, 0, &"") }
+        return sqlT(&"varbinary", if t.len > 0 { t.len } else { -1 }, 0, 0, &"")
+    }
+    if k == lexdb_sql.K_TEXT {
+        let n = t.len
+        if code == TS_VARCHAR { return sqlT(&"varchar", if n > 0 { n } else { -1 }, 0, 0, &coll) }
+        if code == TS_CHAR { return sqlT(&"char", if n > 0 { n } else { 1 }, 0, 0, &coll) }
+        if code == TS_NCHAR { return sqlT(&"nchar", if n > 0 { n * 2 } else { 2 }, 0, 0, &coll) }
+        if code == TS_TEXT { return sqlT(&"text", 16, 0, 0, &coll) }
+        if code == TS_NTEXT { return sqlT(&"ntext", 16, 0, 0, &coll) }
+        if code == TS_XML { return sqlT(&"xml", -1, 0, 0, &"") }
+        if t.oid == lexdb_sql.OID_BPCHAR { return sqlT(&"nchar", if n > 0 { n * 2 } else { 2 }, 0, 0, &coll) }
+        if n > 0 { return sqlT(&"nvarchar", n * 2, 0, 0, &coll) }
+        return sqlT(&"nvarchar", -1, 0, 0, &coll)
+    }
+    return sqlT(&"nvarchar", -1, 0, 0, &coll)
 }

@@ -44,6 +44,9 @@ import "./lexdb_syscat"
 import "./lexdb_oracat"
 import "./lexdb_match"
 
+type SqlT = lexdb_syscat.SqlT
+type OraT = lexdb_oracat.OraT
+
 pub const CATALOG = 1
 
 type Val = lexdb_sql.Val
@@ -30337,87 +30340,6 @@ fn sysSchemaName(s: &str): str { return if s == "public" { "dbo" } else { s.toSt
 
 // A column's SQL Server type: its name, system_type_id, user_type_id,
 // max_length, precision, scale, collation ("" none).
-type SqlT = record {
-    name: str
-    sys: int
-    user: int
-    maxLen: int
-    prec: int
-    scale: int
-    coll: str
-}
-
-fn sqlT(name: &str, maxLen: int, prec: int, scale: int, coll: &str): SqlT {
-    let id = lexdb_syscat.typeId(name)
-    return SqlT{name: name.toStr(), sys: id, user: if name == "sysname" { lexdb_syscat.TS_SYSNAME } else { id }, maxLen: maxLen, prec: prec,
-                scale: scale, coll: coll.toStr()}
-}
-
-// SQL Server's precision and length of a time type of scale s.
-fn timeT(name: &str, s: int): SqlT {
-    let frac = if s > 0 { s + 1 } else { 0 }
-    let short = if s < 3 { 0 } else if s < 5 { 1 } else { 2 }
-    if name == "time" { return sqlT(name, 3 + short, 8 + frac, s, &"") }
-    if name == "datetimeoffset" { return sqlT(name, 8 + short, 26 + frac, s, &"") }
-    return sqlT(name, 6 + short, 19 + frac, s, &"")
-}
-
-// The SQL Server type of a column of lexdb type t: SQL Server's own where
-// the column was made with one (TypeName.prec's code: lexdb_sql.tsqlType),
-// else the nearest (text is nvarchar(max), a timestamp datetime2, ...).
-fn sqlTypeOf(t: &lexdb_sql.TypeName, collName: &str): SqlT {
-    let code = lexdb_sql.tsqlCode(t)
-    let coll = if len(collName) > 0 { collName.toStr() } else { "Latin1_General_BIN2" }
-    let k = t.kind
-    if k == lexdb_sql.K_INT {
-        if code == lexdb_syscat.TS_TINYINT { return sqlT(&"tinyint", 1, 3, 0, &"") }
-        if t.oid == lexdb_sql.OID_INT2 { return sqlT(&"smallint", 2, 5, 0, &"") }
-        if t.oid == lexdb_sql.OID_INT8 { return sqlT(&"bigint", 8, 19, 0, &"") }
-        return sqlT(&"int", 4, 10, 0, &"")
-    }
-    if k == lexdb_sql.K_BOOL { return sqlT(&"bit", 1, 1, 0, &"") }
-    if k == lexdb_sql.K_NUM {
-        let p = if t.prec > 0 { t.prec } else { 38 }
-        let s = if t.prec > 0 { t.scale } else { 6 }
-        return sqlT(&"decimal", if p <= 9 { 5 } else if p <= 19 { 9 } else if p <= 28 { 13 } else { 17 }, p, s, &"")
-    }
-    if k == lexdb_sql.K_FLOAT {
-        if t.oid == lexdb_sql.OID_FLOAT4 { return sqlT(&"real", 4, 24, 0, &"") }
-        return sqlT(&"float", 8, 53, 0, &"")
-    }
-    if k == lexdb_sql.K_DATE { return sqlT(&"date", 3, 10, 0, &"") }
-    // an interval (SQL Server has none) is sent as its text: nvarchar(max), as arrays, json and enums
-    if t.oid == lexdb_sql.OID_IVAL { return sqlT(&"nvarchar", -1, 0, 0, &coll) }
-    if lexdb_sql.isTimeKind(k) {
-        if code == lexdb_syscat.TS_DATETIME { return sqlT(&"datetime", 8, 23, 3, &"") }
-        if code == lexdb_syscat.TS_SMALLDATETIME { return sqlT(&"smalldatetime", 4, 16, 0, &"") }
-        let s = if t.prec >= 1 { min(t.scale, 7) } else { 7 }
-        if t.oid == lexdb_sql.OID_TIME { return timeT(&"time", s) }
-        if t.oid == lexdb_sql.OID_TSTZ { return timeT(&"datetimeoffset", s) }
-        return timeT(&"datetime2", s)
-    }
-    if k == lexdb_sql.K_UUID { return sqlT(&"uniqueidentifier", 16, 0, 0, &"") }
-    if k == lexdb_sql.K_BYTEA {
-        if code == lexdb_syscat.TS_BINARY { return sqlT(&"binary", if t.len > 0 { t.len } else { 1 }, 0, 0, &"") }
-        if code == lexdb_syscat.TS_IMAGE { return sqlT(&"image", 16, 0, 0, &"") }
-        if code == lexdb_syscat.TS_TIMESTAMP { return sqlT(&"timestamp", 8, 0, 0, &"") }
-        return sqlT(&"varbinary", if t.len > 0 { t.len } else { -1 }, 0, 0, &"")
-    }
-    if k == lexdb_sql.K_TEXT {
-        let n = t.len
-        if code == lexdb_syscat.TS_VARCHAR { return sqlT(&"varchar", if n > 0 { n } else { -1 }, 0, 0, &coll) }
-        if code == lexdb_syscat.TS_CHAR { return sqlT(&"char", if n > 0 { n } else { 1 }, 0, 0, &coll) }
-        if code == lexdb_syscat.TS_NCHAR { return sqlT(&"nchar", if n > 0 { n * 2 } else { 2 }, 0, 0, &coll) }
-        if code == lexdb_syscat.TS_TEXT { return sqlT(&"text", 16, 0, 0, &coll) }
-        if code == lexdb_syscat.TS_NTEXT { return sqlT(&"ntext", 16, 0, 0, &coll) }
-        if code == lexdb_syscat.TS_XML { return sqlT(&"xml", -1, 0, 0, &"") }
-        if t.oid == lexdb_sql.OID_BPCHAR { return sqlT(&"nchar", if n > 0 { n * 2 } else { 2 }, 0, 0, &coll) }
-        if n > 0 { return sqlT(&"nvarchar", n * 2, 0, 0, &coll) }
-        return sqlT(&"nvarchar", -1, 0, 0, &coll)
-    }
-    return sqlT(&"nvarchar", -1, 0, 0, &coll)
-}
-
 // A column as SQL Server describes it (lexdb_tds: SET FMTONLY ON, sp_prepare's
 // metadata, sp_describe_first_result_set, sp_tablecollations_100 and INSERT
 // BULK; design/lexdb-tds.md section 14): its label, SQL Server's type for it
@@ -30439,7 +30361,7 @@ pub type DeclCol = record {
 }
 
 fn declOf(name: &str, t: &lexdb_sql.TypeName, coll: &str, nullable: bool, identity: bool, hasDefault: bool): DeclCol {
-    let q = sqlTypeOf(t, coll)
+    let q = lexdb_syscat.sqlTypeOf(t, coll)
     return DeclCol{name: name.toStr(), typ: q.name, sys: q.sys, maxLen: q.maxLen, prec: q.prec, scale: q.scale, coll: q.coll,
                    nullable: nullable, identity: identity, hasDefault: hasDefault, oid: t.oid}
 }
@@ -30735,7 +30657,7 @@ fn sysTabTypeColumns(snap: &CatSnap): [][]Val {
         let cols = tabTypeCols(&t)
         for i in 0..len(cols) {
             let c = &cols[i]
-            let ty = sqlTypeOf(&c.typ, &c.coll)
+            let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
             let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
             append(mut &rows, sysColumn(tabTypeObj(&t.key), &(if len(c.spell) > 0 { c.spell } else { c.name }), i + 1, &ty, !c.notNull, ident, 0))
         }
@@ -30783,7 +30705,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
             if ids[i] == 0 { continue }
             var nn = c.notNull
             for p in ct.t.pk { if p == i { nn = true } }
-            let ty = sqlTypeOf(&c.typ, &c.coll)
+            let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
             let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
             append(mut &rows, sysColumn(ct.oid, &colShown(c), ids[i], &ty, !nn, ident, if sysHasDefault(c) { sysDefOid(&ct, c) } else { 0 }))
         }
@@ -30794,7 +30716,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
             let c = &v.t.cols[i]
             // a column of the one table it reads that has its name and type:
             // that column's type and nullability (as SQL Server derives them)
-            var ty = sqlTypeOf(&c.typ, &c.coll)
+            var ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
             var nullable = true
             var found = 0
             for d in v.t.deps {
@@ -30804,7 +30726,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
                         let b = &ct.t.cols[k]
                         if b.name != c.name || b.typ.oid != c.typ.oid { continue }
                         found += 1
-                        ty = sqlTypeOf(&b.typ, &b.coll)
+                        ty = lexdb_syscat.sqlTypeOf(&b.typ, &b.coll)
                         var nn = b.notNull
                         for p in ct.t.pk { if p == k { nn = true } }
                         nullable = !nn
@@ -30812,7 +30734,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
                 }
             }
             if found != 1 {
-                ty = sqlTypeOf(&c.typ, &c.coll)
+                ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
                 nullable = true
             }
             append(mut &rows, sysColumn(v.oid, &colShown(c), i + 1, &ty, nullable, false, 0))
@@ -30828,7 +30750,7 @@ fn sysSysColumns(): [][]Val {
         let cs = lexdb_syscat.cols(&v)
         for k in 0..len(cs) {
             let c = &cs[k]
-            let ty = sqlT(&c.typ, c.maxLen, c.prec, c.scale, &c.coll)
+            let ty = lexdb_syscat.sqlT(&c.typ, c.maxLen, c.prec, c.scale, &c.coll)
             append(mut &rows, sysColumn(id, &c.name, k + 1, &ty, c.nullable, false, 0))
         }
     }
@@ -30845,7 +30767,7 @@ fn sysTableRow(ct: &CatTab, view: &str): []Val {
     r.set(&"is_ms_shipped", bv(false))
     var lob = false
     for c in ct.t.cols {
-        let ty = sqlTypeOf(&c.typ, &c.coll)
+        let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
         if ty.maxLen == -1 { lob = true }
     }
     r.set(&"lob_data_space_id", iv(if lob { 1 } else { 0 }))
@@ -31184,7 +31106,7 @@ fn sysRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, view: &str): Resul
                     if ids[i] == 0 || !(c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL) { continue }
                     var sq = noSeq()
                     for d in snap.seqs { if d.key == c.seq { sq = seqCopy(&d) } }
-                    let ty = sqlTypeOf(&c.typ, &c.coll)
+                    let ty = lexdb_syscat.sqlTypeOf(&c.typ, &c.coll)
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     var r = sysTemplate(&"identity_columns")
@@ -32736,51 +32658,6 @@ fn oraColName(c: &lexdb_sql.ColDef): str { return if len(c.spell) > 0 { c.spell 
 
 // A column's Oracle type: DATA_TYPE, DATA_LENGTH, DATA_PRECISION, DATA_SCALE
 // (-1 none), and for a text type its length in characters (0 not text).
-type OraT = record {
-    dtype: str
-    len: int
-    prec: int
-    scale: int
-    chars: int
-}
-
-fn oraTypeOf(t: &lexdb_sql.TypeName): OraT {
-    let k = t.kind
-    if k == lexdb_sql.K_INT {
-        if t.oid == lexdb_sql.OID_INT2 { return OraT{dtype: "NUMBER", len: 22, prec: 5, scale: 0, chars: 0} }
-        if t.oid == lexdb_sql.OID_INT4 { return OraT{dtype: "NUMBER", len: 22, prec: 10, scale: 0, chars: 0} }
-        return OraT{dtype: "NUMBER", len: 22, prec: -1, scale: 0, chars: 0}
-    }
-    if k == lexdb_sql.K_BOOL { return OraT{dtype: "BOOLEAN", len: 1, prec: -1, scale: -1, chars: 0} }
-    if k == lexdb_sql.K_NUM {
-        if t.prec > 0 { return OraT{dtype: "NUMBER", len: 22, prec: t.prec, scale: t.scale, chars: 0} }
-        return OraT{dtype: "NUMBER", len: 22, prec: -1, scale: -1, chars: 0}
-    }
-    if k == lexdb_sql.K_FLOAT {
-        if t.oid == lexdb_sql.OID_FLOAT4 { return OraT{dtype: "BINARY_FLOAT", len: 4, prec: -1, scale: -1, chars: 0} }
-        return OraT{dtype: "BINARY_DOUBLE", len: 8, prec: -1, scale: -1, chars: 0}
-    }
-    if k == lexdb_sql.K_DATE { return OraT{dtype: "DATE", len: 7, prec: -1, scale: -1, chars: 0} }
-    if k == lexdb_sql.K_UUID { return OraT{dtype: "RAW", len: 16, prec: -1, scale: -1, chars: 0} }
-    if k == lexdb_sql.K_BYTEA { return OraT{dtype: "BLOB", len: 4000, prec: -1, scale: -1, chars: 0} }
-    if k == lexdb_sql.K_IVAL { return OraT{dtype: "INTERVAL DAY(2) TO SECOND(6)", len: 11, prec: -1, scale: 6, chars: 0} }
-    if k == lexdb_sql.K_TS || k == lexdb_sql.K_TSTZ {
-        // DATE is lexdb's timestamp(0) (O3)
-        if k == lexdb_sql.K_TS && t.prec >= 1 && t.scale == 0 { return OraT{dtype: "DATE", len: 7, prec: -1, scale: -1, chars: 0} }
-        let s = if t.prec >= 1 { min(t.scale, 9) } else { 6 }
-        if k == lexdb_sql.K_TS { return OraT{dtype: "TIMESTAMP(" + s.toStr() + ")", len: 11, prec: -1, scale: s, chars: 0} }
-        return OraT{dtype: "TIMESTAMP(" + s.toStr() + ") WITH TIME ZONE", len: 13, prec: -1, scale: s, chars: 0}
-    }
-    if k == lexdb_sql.K_TIME { return OraT{dtype: "VARCHAR2", len: 15, prec: -1, scale: -1, chars: 15} }
-    if k == lexdb_sql.K_TEXT {
-        let n = t.len
-        if t.oid == lexdb_sql.OID_BPCHAR { return OraT{dtype: "CHAR", len: if n > 0 { n } else { 1 }, prec: -1, scale: -1, chars: if n > 0 { n } else { 1 }} }
-        if n > 0 { return OraT{dtype: "VARCHAR2", len: n, prec: -1, scale: -1, chars: n} }
-        return OraT{dtype: "CLOB", len: 4000, prec: -1, scale: -1, chars: 0}
-    }
-    return OraT{dtype: "VARCHAR2", len: 4000, prec: -1, scale: -1, chars: 4000}
-}
-
 fn oraOptInt(n: int): Val { return if n < 0 { Val.Null } else { Val.Int(n) } }
 
 // A template value as its column's type.
@@ -32970,7 +32847,7 @@ fn oraColRows(out: mut &[]OraPend, ct: &CatTab, user: &str, view: bool) {
         n += 1
         var nn = c.notNull
         for k in ct.t.pk { if k == i { nn = true } }
-        var ty = oraTypeOf(&c.typ)
+        var ty = lexdb_oracat.oraTypeOf(&c.typ)
         // a view's text column has lost its length (lexdb keeps no typmod through a query): Oracle's VARCHAR2, not a CLOB
         if view && ty.dtype == "CLOB" { ty = OraT{dtype: "VARCHAR2", len: 4000, prec: -1, scale: -1, chars: 4000} }
         // an identity column is a plain NUMBER in Oracle (lexdb's is a bigint)
@@ -33228,7 +33105,7 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
                         var chars = 0
                         if cn >= 1 && cn <= len(ct.t.cols) {
                             cname = oraColName(&ct.t.cols[cn - 1])
-                            let ty = oraTypeOf(&ct.t.cols[cn - 1].typ)
+                            let ty = lexdb_oracat.oraTypeOf(&ct.t.cols[cn - 1].typ)
                             len_ = ty.len
                             chars = ty.chars
                         } else if j < len(ix.exprs) && len(ix.exprs[j]) > 0 {
