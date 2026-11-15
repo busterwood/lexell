@@ -12038,12 +12038,20 @@ fn bumpKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ks: &[]str): Resu
     return Ok(Unit{})
 }
 
-// VACUUM, ANALYZE, CHECKPOINT, REINDEX and CLUSTER (9.94): lexdb has
-// nothing for them to do (its pages are reused as freed, its planner keeps
-// no statistics), so each is checked as PostgreSQL checks it and then does
-// nothing: the tables, columns, index or schema it names must exist, and
-// some cannot run in a block.
+// VACUUM, ANALYZE, CHECKPOINT, REINDEX and CLUSTER (9.94): each is
+// checked as PostgreSQL checks it: the tables, columns, index or schema it
+// names must exist, and some cannot run in a block. REINDEX and CLUSTER
+// then do nothing (lexdb's pages are reused as freed); VACUUM makes leaves
+// of rows column leaves (9.114), ANALYZE keeps statistics (optimizer 20),
+// and CHECKPOINT (a superuser's, as PostgreSQL's) takes a checkpoint and
+// waits until it is written (design/lexdb.md 9.136): on a replica, nothing.
 fn maint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.alias == "CHECKPOINT" {
+        let w = try whoNow(st, txn)
+        if !w.super { return Err(e("42501", "permission denied to execute CHECKPOINT command")) }
+        try st.checkpointAll()
+        return Ok(tagOnly(&s.alias))
+    }
     if len(s.table) > 0 && txn.inBlock() { return Err(e("25001", &(s.table + " cannot run inside a transaction block"))) }
     for i in 0..len(s.names) {
         let n = &s.names[i]

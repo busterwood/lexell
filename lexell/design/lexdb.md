@@ -12353,3 +12353,108 @@ step for both.
 and `exec_replica`); `replica.py` (20 rounds: replicas killed and started
 again 6 times, the master once, the supervised master with 2 replicas);
 the crash test (10 rounds).
+
+### 9.136 Checkpoints from a cut: the 70 ms stall gone; SQL CHECKPOINT
+
+**Before:** a checkpoint encoded every changed node inside one `st.sh.with`,
+which cannot yield, so nothing else ran on the master meanwhile: under
+pgbench updates (16,700/s on acct's 1M rows) 62 to 75 ms every 1.8 s, in
+the commits' latency (max 70 ms) and in what the replicas saw (9.135). A
+trace of the critical section: `refit` 62 to 75 ms, the rest of the encode
+0.5 ms, the lists 0.25 ms. Each update loosens a whole column leaf into
+rows (about 500 rows), so each checkpoint encoded the whole table again,
+2,170 leaves at about 35 µs each. Doing refit a step at a time does not
+help: at this rate each leaf changes about every 125 ms, so most would be
+loosened again before the cut.
+
+**Now: a cut, then the encode while commits run.**
+- **The cut** (`takeCut`, one `with`, 0.3 ms): a snapshot as of the last
+  applied commit, which keeps the old version of any node a commit
+  changes afterwards (as for a reader, `willChange`); the changed nodes,
+  children first, with their slots' generations and the pages of their
+  clean children; the trees' roots; the replay point, covers batch, next
+  tree id; how many of `freeAfterNext`'s pages were freed before it (the
+  later ones are the next checkpoint's: the image still names them) and
+  the dropped subtrees then; the trees' layouts.
+- **The leaves**, a step at a time: copy each leaf's cut version
+  (`copyNode`, in a `with`), encode it outside (`encodeLeafK`, a pure
+  function: leafBody's choice, and the packed node repack would make),
+  install in a `with` (counters; a leaf not changed since the cut takes
+  its packed form, as the encode did before), then yield. On a real disk a
+  step is 2 leaves (about 0.1 ms, a query's turn); on `lexdb_disk.sim`,
+  64, which keeps the tests' runs close to the atomic checkpoint they were
+  set with (`setCutChunk` sets fewer).
+- **The end** (`cutPages`, one `with`, 0.7 ms): pages given out, children
+  first (a tree's leaves in key order, as before); the inner nodes encoded
+  from their cut versions; a node made clean only when unchanged since the
+  cut (`since <= cut`) and, an inner one, with no changed child; a node
+  changed since stays changed, and the page it was given is freed after the
+  next checkpoint, as markDirty frees a clean node's page. Then the lists
+  and the meta page (`ckptLists`, shared with the old path), the snapshot
+  ended.
+- **A leaf that does not fit a page** (its rows, as columns or as rows, over
+  a page: what refit cut) ends the try. The pass goes on to find all of
+  them, refit cuts them (`refitAll`), and the cut is taken again. After
+  `CUT_TRIES` (3), or when the snapshot is cancelled (`snapNodes`), the
+  checkpoint is taken whole under one `with`, as before (`ckptLocked`).
+- The ratio leafBody sampled for leafRoom is not sampled: before 9.136
+  refit had made every leaf over a page a column leaf before leafBody saw
+  it, so the sample was never taken. Sampling 2,000 leaves a checkpoint
+  cost 15 ms and would have moved leafRoom's estimate.
+
+**The par pool (opt-in, `LEXDB_CKPT_POOL=1`).** The encode is a kernel, so
+it can run on `par.map`, with the main thread serving commits meanwhile;
+the compiler had to accept it (`encodeConvK`, `encodeCheckedK`,
+`colBodyRangeK`, `leafNodeBody`: no globals, no CRC reached). It is off
+by default, for two measured reasons:
+- once the pool has started, every `malloc`, and every string count change,
+  in the whole process goes through the runtime's pool hooks (rt.c:
+  `rt_heap_slow`, `RT_HOOK(dup/drop)`), not their inline paths: about 5 µs
+  more CPU an update (13% unpinned, 5% pinned), more than the encode the
+  pool takes away. Keeping the main thread's test inline in the runtime
+  would remove it.
+- pinned to the 4 cores a master and 3 replicas keep busy, the pool's
+  workers preempt them: replica lag up to 33 ms. On 6 cores (2 spare) it
+  was the better of the two (lag max 3.6 to 4.0 ms).
+On `lexdb_disk.sim` the pool is never used, so a seed's run stays the same
+(with it, `exec_hashagg`'s rows read varied between runs).
+
+**SQL `CHECKPOINT`** takes one and waits until it is written (it did
+nothing since 9.94): a superuser's, as PostgreSQL's (42501 otherwise); on a
+replica, nothing. Tests settle a table with it (`exec_switch`).
+
+**Measured** (the master alone on CPUs 0-3, pgbench updates from 4-7 and
+12-15, 8 clients, 20 s, every commit's latency logged; two runs each):
+
+| commit latency | p50 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|
+| before (518f8d9d) | 0.42 ms | 0.72-0.76 | 4.2-4.5 | **70** |
+| a cut, steps of 8 leaves | 0.42 ms | 1.42-1.44 | 3.9-4.0 | 7.5 |
+| a cut, steps of 2 leaves (now) | 0.42 ms | 0.88-0.91 | 3.9-4.0 | 8.0-11.9 |
+
+Steps of 8 (0.35 ms each) put the encode in more commits' way; 2 is a
+query's turn. CPU an update, the same: 36.2 to 36.4 µs against 36.4 (on 6
+cores). The checkpoint's work on the main thread is now about 64 ms a
+checkpoint, spread: copies 12 ms, encodes 48, installs 4. Its locked
+sections: the cut 0.3 ms, a step 0.1 ms, the end 0.7 ms.
+
+The replica lag probe times from the master's acknowledgement, so the old
+stall showed there only when it fell between an acknowledgement and the
+push; it shows in commit latency, and in the probe's commits (978 in 20 s
+against 997). With the master and 3 replicas pinned to 4 cores, lag p99 is
+about 1 ms with either build, idle too (0.25 ms unpinned): four busy
+processes and the kernel's I/O workers on four cores.
+
+**What is left.** Each update still loosens a whole column leaf, and the
+checkpoint encodes it whole again (35 µs for one changed row): encoding a
+column leaf's changed rows into its columns, or updating it in place, is
+what would shrink the 48 ms. The pool hooks in the runtime (above).
+
+**Tests:** `store_ckptcut` (new): 20,000 rows changed by up to 400 commits
+between a cut and its end, then a second checkpoint and a crash, every row
+read back from the second image alone (simulated disk; a real disk in the
+task and on the pool); the snapshot cancelled (the checkpoint taken whole);
+rows grown past their leaves' estimate (cut again). Made clean too soon
+(the `since` test or the inner nodes' test removed), it loses 6 to 56 rows.
+`exec_privsx` (CHECKPOINT refused to a role); `exec_switch` (settled
+by CHECKPOINT). The suite (171), `crash.py` 20 rounds, `replica.py` 12.

@@ -523,11 +523,23 @@ pub fn colBody(n: &Node, spec: &lexdb_cols.Spec): Option[str] {
 // colBody of the leaf of n's entries from..to (a changed leaf, not a
 // column leaf).
 pub fn colBodyRange(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec): Option[str] {
+    var conv = false
+    let got = colBodyRangeK(n, from, to, spec, lexdb_cols.checking(), mut &conv)
+    if conv { lexdb_cols.noteConverted() }
+    return got
+}
+
+// colBodyRange as a kernel (par.map): check is lexdb_cols.checking(); conv
+// set when the rows were converted (9.114), which the caller counts
+// (lexdb_cols.noteConverted).
+pub fn colBodyRangeK(n: &Node, from: int, to: int, spec: &lexdb_cols.Spec, check: bool, conv: mut &bool): Option[str] {
     let cnt = to - from
     if cnt <= 0 { return None }
     var rows: []&str = withCapacity(cnt)
     for i in from..to { append(mut &rows, n.valView(i)) }
-    let got = lexdb_cols.encodeChecked(&rows, spec)
+    var cv: []str = []
+    let got = lexdb_cols.encodeCheckedK(&rows, spec, check, mut &cv)
+    if len(cv) > 0 { conv = true }
     if got.isNone() { return None }
     let cols = got.unwrap()
     if 22 + colKeysSize(n, from, to) + len(cols) > PAGE { return None }
@@ -762,27 +774,30 @@ pub fn decodeNode(b: &[]byte): Node {
 // whole (the page is front coded as it is written); an internal node's
 // page from byte 18 (with its kids' pages, pages[i] for kid i).
 pub fn nodeBody(n: &Node, pages: &[]int): str {
-    if n.lazy { return n.body }
-    if n.leaf {
-        var total = 0
-        for i in 0..len(n.keys) { total += 4 + len(n.keys[i]) + (if isSuffix(&n.keys[i], &n.vals[i]) { 0 } else { len(n.vals[i]) }) }
-        var b = array(total, byte(0))
-        var at = 0
-        for i in 0..len(n.keys) {
-            let suf = isSuffix(&n.keys[i], &n.vals[i])
-            binary.setU16LE(mut &b, at, len(n.keys[i]))
-            binary.setU16LE(mut &b, at + 2, len(n.vals[i]) | (if suf { SUFFIX } else { 0 }))
-            putStr(mut &b, at + 4, &n.keys[i])
-            at += 4 + len(n.keys[i])
-            if !suf {
-                putStr(mut &b, at, &n.vals[i])
-                at += len(n.vals[i])
-            }
-        }
-        return strFromBytes(&b)
-    }
+    if n.leaf { return leafNodeBody(n) }
     let b = encodeNode(n, pages, 0)
     return getStr(&b, 18, n.size)
+}
+
+// nodeBody of a leaf (a kernel's: par.map).
+pub fn leafNodeBody(n: &Node): str {
+    if n.lazy { return n.body }
+    var total = 0
+    for i in 0..len(n.keys) { total += 4 + len(n.keys[i]) + (if isSuffix(&n.keys[i], &n.vals[i]) { 0 } else { len(n.vals[i]) }) }
+    var b = array(total, byte(0))
+    var at = 0
+    for i in 0..len(n.keys) {
+        let suf = isSuffix(&n.keys[i], &n.vals[i])
+        binary.setU16LE(mut &b, at, len(n.keys[i]))
+        binary.setU16LE(mut &b, at + 2, len(n.vals[i]) | (if suf { SUFFIX } else { 0 }))
+        putStr(mut &b, at + 4, &n.keys[i])
+        at += 4 + len(n.keys[i])
+        if !suf {
+            putStr(mut &b, at, &n.vals[i])
+            at += len(n.vals[i])
+        }
+    }
+    return strFromBytes(&b)
 }
 
 // Page pageNo holding a node's body (nodeBody) and count: a leaf's front
@@ -803,44 +818,37 @@ pub fn bodyPage(leaf: bool, n: int, body: &str, pageNo: int): []byte {
 // its own allocation in arrays with room to spare, takes less memory
 // after this.
 pub fn repack(n: mut &Node, body: &str) {
-    if n.leaf && n.isCols() && isColBody(body) && n.body == body { return }
-    if n.leaf && isColBody(body) {
-        let cnt = n.count()
-        var l = colNode(body, cnt)
-        n.keys = []
-        n.vals = []
-        n.ents = replace(mut &l.ents, [])
-        n.cdir = replace(mut &l.cdir, [])
-        n.cols = l.cols
-        n.body = l.body
-        n.lazy = true
-        n.packed = true
-        return
-    }
     if n.leaf {
-        let cnt = n.count()
-        n.keys = []
-        n.vals = []
-        n.cols = ""
-        n.cdir = []
-        var l = lazyLeaf(body, cnt)
-        n.ents = replace(mut &l.ents, [])
-        n.body = l.body
-        n.lazy = true
-        n.packed = true
+        if n.isCols() && isColBody(body) && n.body == body { return }
+        adopt(n, packedLeaf(body, n.count()))
         return
     }
     var keys: []str = array(len(n.keys), "")
     n.keys = keys
-    if n.leaf {
-        var vals: []str = array(len(n.keys), "")
-        n.vals = vals
-    } else {
-        var kids: []int = array(len(n.kids), 0)
-        for i in 0..len(n.kids) { kids[i] = n.kids[i] }
-        n.kids = kids
-    }
+    var kids: []int = array(len(n.kids), 0)
+    for i in 0..len(n.kids) { kids[i] = n.kids[i] }
+    n.kids = kids
     unpack(n, body, false)
+}
+
+// The lazy leaf of a leaf's page body (nodeBody's or colBody's) of cnt
+// entries: what repack makes a leaf; a kernel's (par.map), whose caller
+// then adopts it.
+pub fn packedLeaf(body: &str, cnt: int): Node {
+    if isColBody(body) { return colNode(body, cnt) }
+    return lazyLeaf(body, cnt)
+}
+
+// Leaf n made l (packedLeaf of its own entries' body), as repack makes it.
+pub fn adopt(n: mut &Node, var l: Node) {
+    n.keys = []
+    n.vals = []
+    n.ents = replace(mut &l.ents, [])
+    n.cdir = replace(mut &l.cdir, [])
+    n.cols = l.cols
+    n.body = l.body
+    n.lazy = true
+    n.packed = true
 }
 
 // Fills n's keys and values (arrays of the right length) with slices of

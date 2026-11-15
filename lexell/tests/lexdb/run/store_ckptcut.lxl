@@ -1,0 +1,169 @@
+// lexdb_store: a checkpoint taken from a cut (design/lexdb.md 9.136). Its
+// leaves are encoded on the par pool while commits go on, so a node a
+// commit changes after the cut must be written by the next checkpoint too.
+// - 20,000 rows over some 500 leaves, all changed; a checkpoint runs while
+//   up to 400 commits change rows one at a time, until its end; a second checkpoint, after
+//   which recovery replays nothing those commits made; a crash. Every row
+//   read back must be its last commit's, from the second image alone.
+// - The same on a real disk (closed and opened again, not crashed), the
+//   leaves encoded in the checkpointer's task, then on the par pool
+//   (setCutPool).
+// - The same with a snapshot budget of no old versions: the cut's snapshot
+//   is cancelled, and the checkpoint is taken whole under one with.
+// - A table's rows made longer and less alike by an update: its leaves
+//   split as column leaves of the short rows would hold (leafRoom's ratio),
+//   so the cut finds leaves whose rows no longer fit a page; refit cuts
+//   them, and the cut is taken again.
+// expect: cut: commits during the checkpoint true; taken whole 0; rows 20000 right 20000
+// expect: cancelled: commits during the checkpoint true; taken whole true; rows 20000 right 20000
+// expect: real disk: commits during the checkpoint true; taken whole 0; rows 20000 right 20000
+// expect: real disk, the par pool: commits during the checkpoint true; taken whole 0; rows 20000 right 20000
+// expect: refit: cut again true; taken whole 0; leaves cut true; 3000|4504500
+// expect: reopened: 3000|4504500
+import "task"
+import "os"
+import "fs"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const ROWS = 20000
+const COMMITS = 400     // at most; none after the cut's end (one would mark its path changed again, which would hide a node made clean too soon)
+
+fn key(i: int): str { return "k" + (100000 + i).toStr() }
+fn val(tag: str, i: int): str { return tag + i.toStr() + "-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad" }
+
+type Arg = value record { st: lexdb_store.Store; tree: int; during: task.Shared[int]; ckpt: task.Shared[int] }
+
+fn ckptTask(a: Arg): int {
+    a.ckpt.with(fn(x: mut &int) { x = 1 })
+    let r = a.st.checkpoint()
+    a.ckpt.with(fn(x: mut &int) { x = 2 })
+    return 0
+}
+
+fn opts(snap: int): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 1024 * 1024 * 1024, snapNodes: snap}
+}
+
+// fs: lexdb_disk.sim's (crashed after the second checkpoint), or a real
+// directory's (closed, then opened again), whose leaves the par pool encodes.
+fn rows(fs: lexdb_disk.Fs, snap: int, seed: int, label: str) {
+    var crashed = fs
+    var tree = 0
+    var want: []str = []
+    for i in 0..ROWS { append(mut &want, val("b", i)) }
+    var during = 0
+    var whole = 0
+    lexdb_store.run(fs, opts(snap), fn(st: lexdb_store.Store): int {
+        st.setCutChunk(1)           // a yield after each leaf: the commits land between the cut and its end
+        var t = lexdb_store.begin()
+        tree = st.createTree(mut &t)
+        st.commit(t).unwrap()
+        for tag in ["a", "b"] {
+            var i = 0
+            while i < ROWS {
+                var u = lexdb_store.begin()
+                for j in i..i + 1000 { u.put(tree, &key(j), &val(tag, j)).unwrap() }
+                st.commit(u).unwrap()
+                i += 1000
+            }
+            if tag == "a" { st.checkpointAll().unwrap() }
+        }
+        let a = Arg{st: st, tree: tree, during: task.shared(0), ckpt: task.shared(0)}
+        task.scope(fn(s: mut &task.Scope) {
+            let ends = st.cutCounts()[2]
+            s.spawn(ckptTask, a)
+            for n in 0..COMMITS {
+                var c0 = 0
+                a.ckpt.with(fn(x: mut &int) { c0 = x })
+                if c0 == 2 || st.cutCounts()[2] > ends { break }
+                let i = (n * 7919) % ROWS
+                let v = val("c", n)
+                var u = lexdb_store.begin()
+                u.put(a.tree, &key(i), &v).unwrap()
+                st.commit(u).unwrap()
+                want[i] = v
+                var c = 0
+                a.ckpt.with(fn(x: mut &int) { c = x })
+                if c == 1 { during += 1 }
+                let y = task.yield()
+            }
+        })
+        st.checkpointAll().unwrap()
+        whole = st.cutCounts()[0]
+        if !fs.isReal() { crashed = fs.crash(seed * 3 + 1) }
+        return 0
+    }).unwrap()
+    let tr = tree
+    var right = 0
+    var n = 0
+    lexdb_store.run(crashed, opts(snap), fn(st: lexdb_store.Store): int {
+        for i in 0..ROWS {
+            var t = lexdb_store.begin()
+            match st.get(mut &t, tr, &key(i)).unwrap() {
+                Some(v) {
+                    n += 1
+                    if v == want[i] { right += 1 } else if right + 5 > i { println("row " + i.toStr() + ": " + v + ", not " + want[i]) }
+                }
+                None {}
+            }
+        }
+        return 0
+    }).unwrap()
+    let w = if snap > 100 { whole.toStr() } else { (whole > 0).toStr() }
+    println(label + ": commits during the checkpoint " + (during > 0).toStr() + "; taken whole " + w + "; rows " + n.toStr() + " right " + right.toStr())
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out = ""
+            for r in rs {
+                for row in r.rows {
+                    for v in row {
+                        if len(out) > 0 { out = out + "|" }
+                        out = out + lexdb_exec.text(&v)
+                    }
+                }
+            }
+            return out
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    rows(lexdb_disk.sim(5), 50000, 5, "cut")
+    rows(lexdb_disk.sim(6), 0, 6, "cancelled")
+    let dir = fs.join(&(os.tempDir()), &("lexdb_ckptcut_" + os.pid().toStr()))
+    let made = fs.mkdirAll(&dir)
+    rows(lexdb_disk.real(&dir), 50000, 0, "real disk")
+    lexdb_store.setCutPool(true)
+    let gone0 = fs.removeAll(&dir)
+    let made2 = fs.mkdirAll(&dir)
+    rows(lexdb_disk.real(&dir), 50000, 0, "real disk, the par pool")
+    lexdb_store.setCutPool(false)
+    let gone = fs.removeAll(&dir)
+    let fs = lexdb_disk.sim(7)
+    lexdb_store.run(fs, opts(50000), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c = q(mut &s, &"create table w (id int primary key, a int, t text)")
+        let i = q(mut &s, &"insert into w select g, g, 'text ' || (g % 17) from generate_series(1, 3000) g")
+        st.checkpointAll().unwrap()
+        let cuts0 = st.colCounts()[2]
+        let u = q(mut &s, &"update w set a = a + 1, t = 'a longer text, one per row: ' || (id * 7919 % 100003) || ' ' || md5(id::text)")
+        st.checkpointAll().unwrap()
+        let cc = st.cutCounts()
+        println("refit: cut again " + (cc[1] > 0).toStr() + "; taken whole " + cc[0].toStr() + "; leaves cut " + (st.colCounts()[2] > cuts0).toStr() + "; " +
+                q(mut &s, &"select count(*), sum(a) from w"))
+        return 0
+    }).unwrap()
+    lexdb_store.run(fs, opts(50000), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, &"select count(*), sum(a) from w"))
+        return 0
+    }).unwrap()
+}

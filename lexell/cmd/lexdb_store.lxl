@@ -27,6 +27,7 @@ import "./lexdb_disk"
 import "./lexdb_page"
 import "./lexdb_cols"
 import "./lexdb_time"
+import "par"
 
 pub const DATA = "data.lxdb"
 const SPARE = "log.spare"
@@ -228,6 +229,10 @@ pub type Db = record {
     upgBudget: int
     pub upgLeaves: int          // clean leaves rewritten as column leaves (upgradeLeaf)
     pub upgFailed: int          // and those whose rows did not convert
+    pub ckptLocked: int         // checkpoints taken whole under one with (9.136: CUT_TRIES cuts failed, or a cut's snapshot was cancelled)
+    pub cutRetries: int         // cuts taken again after leaves that did not fit a page were cut (9.136)
+    cutChunk: int               // leaves a checkpoint encodes at a time (CUT_CHUNK; tests set fewer)
+    pub cutEnds: int            // cuts written (their end taken: cutPages)
 }
 
 // A handle to an open store; copies reach the same store. A replica's
@@ -721,6 +726,11 @@ fn (db: mut &Db) markDirty(s: int) {
 fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
     var c = lexdb_page.newNode(n.leaf)
     c.size = n.size
+    if !n.lazy {
+        c.keys = withCapacity(len(n.keys))
+        c.vals = withCapacity(len(n.vals))
+        c.kids = withCapacity(len(n.kids))
+    }
     if n.lazy {
         c.lazy = true
         c.packed = true
@@ -4847,6 +4857,14 @@ fn copyLayouts(ls: &[][]byte): [][]byte {
 // (tests compare the two).
 pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
 
+// Checkpoints taken whole under one with, cuts taken again, and cuts
+// written (9.136).
+pub fn (st: &Store) cutCounts(): []int {
+    var out: []int = []
+    st.sh.with(fn(db: mut &Db) { out = [db.ckptLocked, db.cutRetries, db.cutEnds] })
+    return out
+}
+
 // Leaves checkpoints wrote as column leaves, and as rows (of trees with
 // layouts: their rows did not all encode), and cut to fit (refit): 9.112.
 pub fn (st: &Store) colCounts(): []int {
@@ -5133,6 +5151,20 @@ pub fn (st: &Store) checkpointAll(): Result[Unit, lexdb_base.DbErr] {
 // Takes a checkpoint: writes the changed nodes to new pages, then a meta
 // page that names them, once the log holds every commit they include.
 // Commits go on meanwhile. Does nothing while another checkpoint runs.
+//
+// The nodes are taken as they were at one moment, the cut (design/lexdb.md
+// 9.136): a snapshot then (takeCut) keeps the version of every node a
+// commit changes afterwards, as it does for a reader, so the leaves are
+// encoded outside with, a few at a time in this task with a yield after
+// each step (or on the par pool: CUT_POOL, never on lexdb_disk.sim, so a
+// seed's run is the same every time), while commits run; only the cut,
+// each step's copy and install, and
+// the end (pages given out, inner nodes, lists: cutPages) hold the store.
+// A node changed after the cut stays changed, for the next checkpoint. A
+// leaf whose rows would not fit a page ends the try: refit cuts it, and the
+// cut is taken again; after CUT_TRIES, or when the snapshot is cancelled
+// (over snapNodes), the checkpoint is taken whole under one with, as
+// before 9.136.
 pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     var out: []PageOut = []
     var metaPage: []byte = []
@@ -5191,85 +5223,160 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         for x in db.dropped { append(mut &todo, x) }
         db.dropped = replace(mut &todo, [])
         for p in gone { db.freePage(p) }
-        db.ckpt += 1
-        n = db.ckpt
         f = db.data
         fs = db.logFs
-        db.refit()      // (it may split leaves, and roots: before the roots are taken)
-        var roots: []int = []
-        var ids: []int = []
-        var rs: []int = []
-        for i in 0..db.trees.size() {
-            let id: int = db.trees.keyAt(i)
-            let r: int = db.trees.valAt(i)
-            append(mut &ids, id)
-            append(mut &rs, r)
-        }
-        for i in 0..len(ids) {
-            append(mut &roots, ids[i])
-            append(mut &roots, db.encodeSlot(rs[i], n, mut &out, ids[i]))
-        }
-        var freed = replace(mut &db.freeAfterNext, [])
-        for p in db.listPages { append(mut &freed, p) }
-        // The list pages come from the free pages; the free list then holds
-        // what is left, and what this checkpoint frees.
-        var rootPages: []int = []
-        for i in 0..lexdb_page.listPages(len(roots)) { append(mut &rootPages, db.allocPage()) }
-        var dropVals: []int = []
-        var i = 0
-        while i + 1 < len(db.dropped) {
-            append(mut &dropVals, db.dropped[i])
-            append(mut &dropVals, db.dropped[i + 1] + 1)
-            i += 2
-        }
-        var dropPages: []int = []
-        for j in 0..lexdb_page.listPages(len(dropVals)) { append(mut &dropPages, db.allocPage()) }
-        // As many list pages as the runs if none join (taking the lowest
-        // free pages for them joins none and splits none).
-        let freedRuns = runsOf(&freed)
-        var freePages: []int = []
-        var heldRuns = 0
-        for h in db.heldFree { heldRuns += len(h.runs) }
-        for j in 0..lexdb_page.listPages(len(db.free) + len(freedRuns) + heldRuns) { append(mut &freePages, db.allocPage()) }
-        // pages held for a follower are free as far as recovery goes
-        var freeVals = mergeRuns(&db.free, &freedRuns)
-        for h in db.heldFree { freeVals = mergeRuns(&freeVals, &h.runs) }
-        var dl = lexdb_page.encodeList(&dropVals, &dropPages)
-        i = len(dl) - 1
-        while i >= 0 {
-            append(mut &out, PageOut{no: dropPages[i], leaf: false, n: 0, body: "", raw: pop(mut &dl)})
-            i -= 1
-        }
-        var rl = lexdb_page.encodeList(&roots, &rootPages)
-        i = len(rl) - 1
-        while i >= 0 {
-            append(mut &out, PageOut{no: rootPages[i], leaf: false, n: 0, body: "", raw: pop(mut &rl)})
-            i -= 1
-        }
-        var fl = lexdb_page.encodeList(&freeVals, &freePages)
-        i = len(fl) - 1
-        while i >= 0 {
-            append(mut &out, PageOut{no: freePages[i], leaf: false, n: 0, body: "", raw: pop(mut &fl)})
-            i -= 1
-        }
-        for p in rootPages { append(mut &newLists, p) }
-        for p in dropPages { append(mut &newLists, p) }
-        for p in freePages { append(mut &newLists, p) }
-        db.pendingFree = freedRuns
-        target = db.appliedBatch
-        let m = lexdb_page.Meta{ckpt: n, npages: db.npages,
-                                roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
-                                free: 0, runs: if len(freePages) > 0 { freePages[0] } else { 0 },
-                                replaySeg: db.seg, replayOff: db.segOff, replayBatch: db.durableBatch + 1,
-                                nextTree: db.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 },
-                                covers: target}
-        metaPage = lexdb_page.encodeMeta(&m, n % 2)
-        reserve = db.reserveAhead()
-        ckPages = db.npages
-        for s in 1..db.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
     })
     if len(bad) > 0 { return Err(bad[0]) }
-    if busy { return Ok(Unit{}) }
+    var tries = 0
+    var done = false
+    while !done && tries < CUT_TRIES {
+        tries += 1
+        // the cut
+        var c = emptyCut()
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            c = db.takeCut()
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+        // its leaves, encoded a chunk at a time
+        var leaves: []int = []
+        for i in 0..len(c.nodes) { if c.nodes[i].leaf { append(mut &leaves, i) } }
+        var lost = false
+        var offTree: []int = []
+        var offKey: []str = []
+        var at = 0
+        while at < len(leaves) && !lost {
+            let end = min(at + c.chunk, len(leaves))
+            var jobs: []LeafJob = []
+            st.sh.with(fn(db: mut &Db) {
+                if len(db.failed) > 0 || !db.snapLive(c.snap) {
+                    lost = true
+                    return
+                }
+                for x in at..end {
+                    let cn = &c.nodes[leaves[x]]
+                    let v = db.verOf(cn.slot, c.seq)
+                    if v <= -2 || db.meta[cn.slot].gen != cn.gen {      // (a version missing, or not in memory: the cut's are)
+                        lost = true
+                        return
+                    }
+                    append(mut &jobs, LeafJob{node: copyNode(db.snapNode(cn.slot, v)), spec: cn.spec})
+                }
+            })
+            if lost { break }
+            let colsOn = c.colsOn
+            let check = c.check
+            let specs = &c.specs
+            var encs: []LeafEnc = []
+            if c.pool { encs = par.map(&jobs, fn(j: &LeafJob): LeafEnc { return encodeLeafK(j, specs, colsOn, check) }) } else {
+                for j in &jobs { append(mut &encs, encodeLeafK(j, specs, colsOn, check)) }
+            }
+            st.sh.with(fn(db: mut &Db) {
+                for x in at..end {
+                    let j = x - at
+                    let ci = leaves[x]
+                    if encs[j].kind == 2 {
+                        append(mut &offTree, c.nodes[ci].tree)
+                        append(mut &offKey, lexdb_base.own(&jobs[j].node.key(0)))
+                        continue
+                    }
+                    let body = replace(mut &encs[j].body, "")
+                    let s = c.nodes[ci].slot
+                    let sp = c.nodes[ci].spec
+                    let cnt = jobs[j].node.count()
+                    c.nodes[ci].n = cnt
+                    c.nodes[ci].conv = encs[j].conv
+                    if encs[j].conv { lexdb_cols.noteConverted() }
+                    if sp >= 0 && c.colsOn {
+                        // (no ratio sampled, unlike leafBody: before 9.136 refit had made
+                        // every leaf over a page a column leaf by then, so leafBody's
+                        // sample was never taken; leafRoom samples its own)
+                        if encs[j].kind == 1 { db.colLeaves += 1 } else { db.rowLeaves += 1 }
+                    }
+                    // a leaf not changed since the cut takes its page's form now
+                    // (what the encode in with did before): it is the same rows
+                    let same = db.meta[s].used && db.meta[s].gen == c.nodes[ci].gen && db.meta[s].loaded && db.meta[s].since <= c.seq
+                    if same && !encs[j].conv {
+                        match replace(mut &encs[j].packed, None) {
+                            Some(p) {
+                                lexdb_page.adopt(mut &db.pool[db.meta[s].frame], p)
+                                db.recost(s)
+                            }
+                            None {}
+                        }
+                    }
+                    c.nodes[ci].body = body
+                }
+            })
+            at = end
+            // (a pass that found leaves that do not fit goes on, so that one
+            // refit cuts them all before the cut is taken again)
+            match task.yield() {
+                Ok(_) {}
+                Err(_) { lost = true }
+            }
+        }
+        if !lost && len(offTree) == 0 {
+            // the end: pages, inner nodes, which nodes are clean, the lists
+            st.sh.with(fn(db: mut &Db) {
+                if len(db.failed) > 0 {
+                    append(mut &bad, db.failed[0])
+                    return
+                }
+                if !db.snapLive(c.snap) || !db.innersAt(&c) {
+                    lost = true
+                    return
+                }
+                db.ckpt += 1
+                n = db.ckpt
+                var roots = db.cutPages(n, mut &c, mut &out)
+                metaPage = db.ckptLists(n, &c, &roots, mut &out, mut &newLists)
+                db.endSnapIn(c.snap)
+                db.cutEnds += 1
+                target = c.target
+                reserve = db.reserveAhead()
+                ckPages = db.npages
+                for s in 1..c.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
+                done = true
+            })
+            if len(bad) > 0 { return Err(bad[0]) }
+        }
+        if !done {
+            st.sh.with(fn(db: mut &Db) { db.endSnapIn(c.snap) })
+            if lost { break }
+            // the leaves that do not fit, cut (refit), and the cut taken again
+            refitAll(st, &offTree, &offKey)
+            st.sh.with(fn(db: mut &Db) { db.cutRetries += 1 })
+        }
+    }
+    if !done {
+        // whole, under one with
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0])
+                return
+            }
+            db.ckptLocked += 1
+            db.ckpt += 1
+            n = db.ckpt
+            db.refit()      // (it may split leaves, and roots: before the roots are taken)
+            var c = db.lockedCut()
+            var roots: []int = []
+            for i in 0..len(c.ids) {
+                append(mut &roots, c.ids[i])
+                append(mut &roots, db.encodeSlot(c.roots[i], n, mut &out, c.ids[i]))
+            }
+            metaPage = db.ckptLists(n, &c, &roots, mut &out, mut &newLists)
+            target = c.target
+            reserve = db.reserveAhead()
+            ckPages = db.npages
+            for s in 1..c.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
+        })
+        if len(bad) > 0 { return Err(bad[0]) }
+    }
     if len(reserve) == 2 {
         let ok = f.reserve(reserve[0], reserve[1] - reserve[0]).isOk()
         st.sh.with(fn(db: mut &Db) {
@@ -5277,7 +5384,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         })
     }
     let r = st.finishCheckpoint(&f, &out, &metaPage, n, target)
-    var done: []task.Promise[Unit] = []
+    var woken: []task.Promise[Unit] = []
     match r {
         Ok(_) {}
         Err(e) {
@@ -5288,7 +5395,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     st.sh.with(fn(db: mut &Db) {
         db.durableCkpt = n
         db.ckptCovers = target
-        while len(db.changeWake) > 0 { append(mut &done, pop(mut &db.changeWake)) }
+        while len(db.changeWake) > 0 { append(mut &woken, pop(mut &db.changeWake)) }
         let pf = replace(mut &db.pendingFree, [])
         if db.holdCkpt >= 0 && db.holdCkpt < n {
             append(mut &db.heldFree, HeldRuns{ckpt: n, runs: pf})        // base n - 1's: a follower may read them
@@ -5301,9 +5408,9 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         db.logSinceCkpt = 0
         db.checkpoints += 1
         db.maybeEvict()
-        while len(db.ckptDone) > 0 { append(mut &done, pop(mut &db.ckptDone)) }
+        while len(db.ckptDone) > 0 { append(mut &woken, pop(mut &db.ckptDone)) }
     })
-    while len(done) > 0 { pop(mut &done).complete(Unit{}) }
+    while len(woken) > 0 { pop(mut &woken).complete(Unit{}) }
     // Segments before the one recovery now starts from are not needed.
     for s in oldSegs {
         let name = segName(s)
@@ -5312,6 +5419,315 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         }
     }
     return Ok(Unit{})
+}
+
+// ---- the cut (9.136)
+
+const CUT_TRIES = 3         // cuts tried before a checkpoint is taken whole under one with
+const CUT_CHUNK = 64        // leaves encoded at a time on the par pool: about 2 ms of one core's (lexdb.md 9.136)
+const CUT_CHUNK_TASK = 2    // in the checkpointer's task: about 0.1 ms (a query's turn, TURN_NS), then a yield
+
+// Whether checkpoints encode on the par pool (setCutPool; LEXDB_CKPT_POOL=1).
+// Off by default (9.136): once the pool has started, every allocation and
+// string count of the process goes through the runtime's pool hooks (about
+// 5 us more CPU an update, measured), and on a server whose cores are all
+// busy (a master and its replicas, one core each) the pool's threads
+// preempt them: lag up to 33 ms. In the task, a step is 0.35 ms.
+var CUT_POOL: bool = false
+pub fn setCutPool(on: bool) { CUT_POOL = on }
+
+// A node a checkpoint writes, as it was at the cut: its slot (and the
+// slot's generation then), its tree and, a leaf of a table's, the index of
+// the tree's layouts (CkCut.specs; -1 none); an inner node's children's pages
+// then (-1: a child this checkpoint writes too, given its page by cutPages).
+// Its page, body and count once known; conv: its rows were converted (9.114).
+type CutNode = record { slot: int; gen: int; tree: int; spec: int; leaf: bool; kids: []int; page: int; body: str; n: int; conv: bool }
+
+// What a checkpoint writes, as of its cut: the snapshot that keeps it
+// (-1 none: lockedCut's), the commits it holds (seq; target, the last batch
+// applied), where recovery replays from (seg, off, batch), the next tree's
+// id; how many of freeAfterNext's pages were freed before it and the
+// dropped subtrees then; the trees (ids, roots: their root slots, rootDisk:
+// a clean root's page, -1 one written); the nodes to write, children before
+// parents (at: slot -> index), and the trees' layouts then.
+type CkCut = record {
+    snap: int; seq: int; target: int; seg: int; off: int; batch: int; nextTree: int
+    freedLen: int; dropped: []int
+    ids: []int; roots: []int; rootDisk: []int
+    nodes: []CutNode; at: Map[int, int]
+    specs: []lexdb_cols.Spec; colsOn: bool; check: bool
+    chunk: int          // leaves encoded at a time (Db.cutChunk)
+    pool: bool          // encoded on the par pool: on a real disk (on lexdb_disk.sim, in the task, so a seed's run is the same every time)
+}
+
+fn emptyCut(): CkCut {
+    return CkCut{snap: -1, seq: 0, target: 0, seg: 0, off: 0, batch: 0, nextTree: 0, freedLen: 0, dropped: [], ids: [], roots: [], rootDisk: [],
+               nodes: [], at: newMap(), specs: [], colsOn: false, check: false, chunk: CUT_CHUNK, pool: false}
+}
+
+// The cut's fields but its nodes: what lockedCut and takeCut share.
+fn (db: &Db) cutHead(snap: int): CkCut {
+    var c = emptyCut()
+    c.snap = snap
+    c.seq = db.seq
+    c.target = db.appliedBatch
+    c.seg = db.seg
+    c.off = db.segOff
+    c.batch = db.durableBatch + 1
+    c.nextTree = db.nextTree
+    c.freedLen = len(db.freeAfterNext)
+    for x in db.dropped { append(mut &c.dropped, x) }
+    for i in 0..db.trees.size() {
+        let id: int = db.trees.keyAt(i)
+        let r: int = db.trees.valAt(i)
+        append(mut &c.ids, id)
+        append(mut &c.roots, r)
+        append(mut &c.rootDisk, if db.meta[r].dirty { -1 } else { db.meta[r].disk })
+    }
+    return c
+}
+
+// The cut of a checkpoint taken whole (its nodes are encoded in the same with).
+fn (db: &Db) lockedCut(): CkCut { return db.cutHead(-1) }
+
+// The cut: a snapshot as of the last commit applied, and the nodes changed
+// since the last checkpoint, children first (as encodeSlot writes them, so a
+// tree's leaves get pages in key order).
+fn (db: mut &Db) takeCut(): CkCut {
+    let id = db.nextSnap
+    db.nextSnap += 1
+    append(mut &db.snaps, Snap{id: id, seq: db.seq, cancelled: false})
+    var c = db.cutHead(id)
+    c.colsOn = lexdb_cols.on() && !db.colsOff
+    c.check = lexdb_cols.checking()
+    c.pool = CUT_POOL && db.fs.isReal()
+    // (on lexdb_disk.sim, CUT_CHUNK in the task too: the tests' runs were set
+    // with checkpoints that took their encode at once, and a step that size
+    // is closer to it; setCutChunk sets fewer)
+    c.chunk = max(if c.pool || !db.fs.isReal() { db.cutChunk } else { min(db.cutChunk, CUT_CHUNK_TASK) }, 1)
+    for i in 0..len(db.specs) {
+        let sp = &db.specs[i]
+        append(mut &c.specs, lexdb_cols.Spec{layouts: copyLayouts(&sp.layouts), fill: sp.fill.toStr(), fillOk: sp.fillOk})
+    }
+    for i in 0..len(c.roots) { db.cutSlot(c.roots[i], c.ids[i], mut &c) }
+    return c
+}
+
+fn (db: &Db) cutSlot(s: int, tree: int, c: mut &CkCut) {
+    if !db.meta[s].dirty { return }
+    let f = db.meta[s].frame
+    let leaf = db.pool[f].leaf
+    var kids: []int = []
+    if !leaf {
+        for i in 0..len(db.pool[f].kids) {
+            let k = db.pool[f].kids[i]
+            if db.meta[k].dirty {
+                db.cutSlot(k, tree, mut &c)
+                append(mut &kids, -1)
+            } else { append(mut &kids, db.meta[k].disk) }
+        }
+    }
+    var spec = -1
+    if leaf {
+        match db.colSpecs.get(&tree) {
+            Some(x) { spec = x }
+            None {}
+        }
+    }
+    c.at.put(s, len(c.nodes))
+    append(mut &c.nodes, CutNode{slot: s, gen: db.meta[s].gen, tree: tree, spec: spec, leaf: leaf, kids: kids, page: -1, body: "", n: 0, conv: false})
+}
+
+// Whether the snapshot still has every inner node of the cut.
+fn (db: &Db) innersAt(c: &CkCut): bool {
+    for cn in c.nodes {
+        if cn.leaf { continue }
+        if db.meta[cn.slot].gen != cn.gen { return false }
+        let v = db.verOf(cn.slot, c.seq)
+        if v == -3 || v == -2 { return false }
+    }
+    return true
+}
+
+// The cut's nodes given pages (children first), its inner nodes encoded
+// as they were at the cut, and the nodes not changed since made clean
+// (written by checkpoint n: an inner node only when its children are too);
+// a node changed since stays changed, and the page it was given is freed
+// after the next checkpoint, as markDirty frees a clean node's. The
+// trees' roots: (id, page) pairs.
+fn (db: mut &Db) cutPages(n: int, c: mut &CkCut, out: mut &[]PageOut): []int {
+    for i in 0..len(c.nodes) { c.nodes[i].page = db.allocPage() }
+    for i in 0..len(c.nodes) {
+        let s = c.nodes[i].slot
+        if !c.nodes[i].leaf {
+            var pages: []int = []
+            let v = db.verOf(s, c.seq)
+            let node = db.snapNode(s, v)
+            for j in 0..len(c.nodes[i].kids) {
+                let p = c.nodes[i].kids[j]
+                if p >= 0 { append(mut &pages, p) } else {
+                    match c.at.get(&node.kids[j]) {
+                        Some(x) { append(mut &pages, c.nodes[x].page) }
+                        None { panic("lexdb: checkpoint: a changed child is not in the cut") }
+                    }
+                }
+            }
+            c.nodes[i].body = lexdb_page.nodeBody(node, &pages)
+            c.nodes[i].n = node.count()
+        }
+        var ok = db.meta[s].used && db.meta[s].gen == c.nodes[i].gen && db.meta[s].dirty && db.meta[s].loaded && db.meta[s].since <= c.seq
+        if ok && !c.nodes[i].leaf {
+            for k in db.pool[db.meta[s].frame].kids { if db.meta[k].dirty { ok = false } }
+        }
+        if ok {
+            if c.nodes[i].conv { db.willChange(s) }     // its rows rewritten (9.114): a snapshot keeps them as they were
+            if !c.nodes[i].leaf || c.nodes[i].conv {
+                lexdb_page.repack(mut &db.pool[db.meta[s].frame], &c.nodes[i].body)
+                db.recost(s)
+            }
+            db.meta[s].dirty = false
+            db.meta[s].disk = c.nodes[i].page
+            db.meta[s].ckpt = n
+        } else { db.freePage(c.nodes[i].page) }
+        append(mut &out, PageOut{no: c.nodes[i].page, leaf: c.nodes[i].leaf, n: c.nodes[i].n, body: replace(mut &c.nodes[i].body, ""), raw: []})
+    }
+    var roots: []int = []
+    for i in 0..len(c.ids) {
+        append(mut &roots, c.ids[i])
+        if c.rootDisk[i] >= 0 { append(mut &roots, c.rootDisk[i]) } else {
+            match c.at.get(&c.roots[i]) {
+                Some(x) { append(mut &roots, c.nodes[x].page) }
+                None { panic("lexdb: checkpoint: a changed root is not in the cut") }
+            }
+        }
+    }
+    return roots
+}
+
+// The rest of checkpoint n after its nodes' pages: the list pages of the
+// trees' roots (roots: (id, page) pairs), of the dropped subtrees and of the
+// free pages, added to out (and to lists), and its meta page.
+fn (db: mut &Db) ckptLists(n: int, c: &CkCut, roots: &[]int, out: mut &[]PageOut, lists: mut &[]int): []byte {
+    // the pages freed before the cut (those freed since are the next one's)
+    var freed: []int = []
+    var rest: []int = []
+    for i in 0..len(db.freeAfterNext) { if i < c.freedLen { append(mut &freed, db.freeAfterNext[i]) } else { append(mut &rest, db.freeAfterNext[i]) } }
+    db.freeAfterNext = rest
+    for p in db.listPages { append(mut &freed, p) }
+    // The list pages come from the free pages; the free list then holds
+    // what is left, and what this checkpoint frees.
+    var rootPages: []int = []
+    for i in 0..lexdb_page.listPages(len(roots)) { append(mut &rootPages, db.allocPage()) }
+    var dropVals: []int = []
+    var i = 0
+    while i + 1 < len(c.dropped) {
+        append(mut &dropVals, c.dropped[i])
+        append(mut &dropVals, c.dropped[i + 1] + 1)
+        i += 2
+    }
+    var dropPages: []int = []
+    for j in 0..lexdb_page.listPages(len(dropVals)) { append(mut &dropPages, db.allocPage()) }
+    // As many list pages as the runs if none join (taking the lowest
+    // free pages for them joins none and splits none).
+    let freedRuns = runsOf(&freed)
+    var freePages: []int = []
+    var heldRuns = 0
+    for h in db.heldFree { heldRuns += len(h.runs) }
+    for j in 0..lexdb_page.listPages(len(db.free) + len(freedRuns) + heldRuns) { append(mut &freePages, db.allocPage()) }
+    // pages held for a follower are free as far as recovery goes
+    var freeVals = mergeRuns(&db.free, &freedRuns)
+    for h in db.heldFree { freeVals = mergeRuns(&freeVals, &h.runs) }
+    var dl = lexdb_page.encodeList(&dropVals, &dropPages)
+    i = len(dl) - 1
+    while i >= 0 {
+        append(mut &out, PageOut{no: dropPages[i], leaf: false, n: 0, body: "", raw: pop(mut &dl)})
+        i -= 1
+    }
+    var rl = lexdb_page.encodeList(roots, &rootPages)
+    i = len(rl) - 1
+    while i >= 0 {
+        append(mut &out, PageOut{no: rootPages[i], leaf: false, n: 0, body: "", raw: pop(mut &rl)})
+        i -= 1
+    }
+    var fl = lexdb_page.encodeList(&freeVals, &freePages)
+    i = len(fl) - 1
+    while i >= 0 {
+        append(mut &out, PageOut{no: freePages[i], leaf: false, n: 0, body: "", raw: pop(mut &fl)})
+        i -= 1
+    }
+    for p in rootPages { append(mut &lists, p) }
+    for p in dropPages { append(mut &lists, p) }
+    for p in freePages { append(mut &lists, p) }
+    db.pendingFree = freedRuns
+    let m = lexdb_page.Meta{ckpt: n, npages: db.npages,
+                            roots: if len(rootPages) > 0 { rootPages[0] } else { 0 },
+                            free: 0, runs: if len(freePages) > 0 { freePages[0] } else { 0 },
+                            replaySeg: c.seg, replayOff: c.off, replayBatch: c.batch,
+                            nextTree: c.nextTree, dropped: if len(dropPages) > 0 { dropPages[0] } else { 0 },
+                            covers: c.target}
+    return lexdb_page.encodeMeta(&m, n % 2)
+}
+
+fn (db: &Db) snapLive(id: int): bool {
+    for sn in db.snaps { if sn.id == id { return !sn.cancelled } }
+    return false
+}
+
+// Ends snapshot id (endSnap, inside with).
+fn (db: mut &Db) endSnapIn(id: int) {
+    if id < 0 { return }
+    var keep: []Snap = []
+    for sn in db.snaps { if sn.id != id { append(mut &keep, sn) } }
+    db.snaps = keep
+    db.prune()
+}
+
+// The leaves of trees whose rows did not fit a page (the cut's leaf with
+// key(0) of each), cut to fit (refitLeaf), each in its own with.
+fn refitAll(st: &Store, trees: &[]int, keys: &[]str) {
+    for i in 0..len(trees) {
+        st.sh.with(fn(db: mut &Db) {
+            match db.colSpecs.get(&trees[i]) {
+                Some(x) { db.refitLeaf(trees[i], x, &keys[i]) }
+                None {}
+            }
+        })
+    }
+}
+
+// A leaf to encode (encodeLeafK): its version at the cut, and the index of
+// its tree's layouts in the cut's (-1 none).
+type LeafJob = record { node: lexdb_page.Node; spec: int }
+
+// A leaf encoded: its page's body (lexdb_page.bodyPage), kind 0 its rows,
+// 1 a column leaf, 2 neither fits a page (refit cuts it); conv: its rows
+// were converted to the current layout (9.114).
+// packed: the leaf as repack would make it of body (lexdb_page.packedLeaf),
+// none when it is already a column leaf of that body.
+type LeafEnc = record { body: str; kind: int; conv: bool; packed: Option[lexdb_page.Node] }
+
+// What the checkpoint writes of a leaf (leafBody's choice, and refit's test
+// of a leaf that does not fit): a kernel, run on the par pool.
+fn encodeLeafK(j: &LeafJob, specs: &[]lexdb_cols.Spec, colsOn: bool, check: bool): LeafEnc {
+    let n = &j.node
+    if j.spec >= 0 {
+        if colsOn {
+            if n.isCols() { return LeafEnc{body: n.body, kind: 1, conv: false, packed: None} }
+            var conv = false
+            match lexdb_page.colBodyRangeK(n, 0, n.count(), &specs[j.spec], check, mut &conv) {
+                Some(b) {
+                    let p = lexdb_page.packedLeaf(&b, n.count())
+                    return LeafEnc{body: b, kind: 1, conv: conv, packed: Some(p)}
+                }
+                None {}
+            }
+        }
+        if n.size > lexdb_page.NODE_ROOM && !n.isCols() && n.count() > 0 { return LeafEnc{body: "", kind: 2, conv: false, packed: None} }
+    }
+    let b = lexdb_page.leafNodeBody(n)
+    if n.lazy { return LeafEnc{body: b, kind: 0, conv: false, packed: None} }
+    let p = lexdb_page.packedLeaf(&b, n.count())
+    return LeafEnc{body: b, kind: 0, conv: false, packed: Some(p)}
 }
 
 // A run of consecutive pages, written with one call (writePages).
@@ -5587,7 +6003,7 @@ fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: O
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
               colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false,
-              specRatio: [], specSplits: [], refitCuts: 0, upgTree: [], upgKey: [], upgBudget: UPG_BUDGET, upgLeaves: 0, upgFailed: 0}
+              specRatio: [], specSplits: [], refitCuts: 0, upgTree: [], upgKey: [], upgBudget: UPG_BUDGET, upgLeaves: 0, upgFailed: 0, ckptLocked: 0, cutRetries: 0, cutChunk: CUT_CHUNK, cutEnds: 0}
 }
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
@@ -5878,6 +6294,7 @@ pub type Stats = value record {
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
 pub fn (st: &Store) setFrameMax(n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
+pub fn (st: &Store) setCutChunk(n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
 pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any

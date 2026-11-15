@@ -8,57 +8,78 @@ again, add its row to section 4 and update section 1.
 
 ## 1. Now (2026-11-15)
 
-lexdb at `518f8d9d` (`exp/replica-lag`: the log pushed to replicas, 9.135)
-for sections 1.1 and 1.2; at `478d49f6` (main) for 1.3 to 1.5. PostgreSQL
-18.6; SQL Server 2022 CU27. The host and the rules are in section 2.
+lexdb at `exp/ckpt-incremental` (checkpoints from a cut, lexdb.md 9.136)
+for sections 1.1 to 1.3, pinned (section 2: both servers on the same four
+physical cores, clients on the other four); at `478d49f6` (main, not
+pinned) for 1.4 and 1.5. PostgreSQL 18.6; SQL Server 2022 CU27. The host
+and the rules are in section 2.
 
 ### 1.1 OLTP: pgbench, 1M rows (`bench/sock/vspg.sh`, `bench/repl/vsrep.sh`)
 
-PostgreSQL limited to 4 CPUs; lexdb as one process, and as its master with
-3 read replicas (4 processes, lexdb's shape). The median of 3 rounds of
-10 s; server CPU an operation in µs.
+PostgreSQL on 4 cores; lexdb as one process, and as its master with 3 read
+replicas (4 processes, lexdb's shape), on the same 4 cores. The median of
+3 rounds of 10 s (replicas: two runs); server CPU an operation in µs.
 
-| | lexdb, 1 process | lexdb, 3 replicas | PostgreSQL (4 CPUs) | lexdb / PG |
+| | lexdb, 1 process | lexdb, 3 replicas | PostgreSQL (4 cores) | lexdb / PG |
 |---|---:|---:|---:|---:|
-| point selects, 1 client | 84,800/s, 11.7 µs | 79,700/s, 12.4 µs | 76,900/s, 8.9 µs | 1.10 × |
-| point selects, 8 clients | 143,400/s, 7.0 µs | **333,900/s**, 9.0 µs | 342,700/s, 11.7 µs | 0.97 × (replicas) |
-| point selects, 32 clients | 139,600/s, 7.1 µs | **367,800/s**, 8.1 µs | 270,800/s, 14.9 µs | **1.36 ×** (replicas) |
-| updates, 1 client | **3,802/s**, 66 µs | | 1,651/s, 90 µs | **2.30 ×** |
-| updates, 8 clients | **18,037/s**, 32 µs | | 6,831/s, 63 µs | **2.64 ×** |
-| updates, 32 clients | **45,765/s**, 22 µs | | 26,552/s, 52 µs | **1.72 ×** |
+| point selects, 1 client | 80,100/s, 12.4 µs | 79,400-79,900/s, 12.4 µs | 75,900/s, 9.0 µs | 1.05 × |
+| point selects, 8 clients | 133,900/s, 7.5 µs | 244,200-345,800/s, 8.2-8.7 µs | **426,000/s**, 9.3 µs | 0.57-0.81 × (replicas) |
+| point selects, 32 clients | 128,400/s, 7.8 µs | 376,000-377,700/s, 7.9 µs | 386,600/s, 10.3 µs | 0.97 × (replicas) |
+| updates, 1 client | **3,726/s**, 74 µs | | 1,650/s, 98 µs | **2.26 ×** |
+| updates, 8 clients | **17,846/s**, 34 µs | | 6,793/s, 61 µs | **2.63 ×** |
+| updates, 32 clients | **40,124/s**, 25 µs | | 26,040/s, 42 µs | **1.54 ×** |
 
 Updates are on the master: replicas serve only reads. With replicas,
 mixed: 8 clients updating on the master and 24 reading on the replicas give
-16,500 updates/s and 307,800 selects/s together.
+16,500-16,600 updates/s and 316,900-319,500 selects/s together.
 
-### 1.2 Read replicas: how soon a commit is visible (`bench/repl/probe2.py`)
+Pinned, PostgreSQL's point selects are much faster than under the earlier
+`CPUQuota=400%` over every CPU (426,000 against 342,700/s at 8 clients,
+386,600 against 270,800 at 32): with four whole cores it no longer shares
+them with its clients or SMT siblings. lexdb's replicas run 8 clients'
+selects at 244,000 to 346,000/s from run to run (not yet looked at).
 
-From the master's commit acknowledgement to the first read on a replica
-that shows it, to within one read (about 0.1 ms); replicas show only commits
-the master has made durable. The acceptance test is p99 under 1 ms at the
-mixed load above.
+### 1.2 Commit latency and read replicas
+
+The master's commit latency (`bench/sock/commitlat.sh`: the
+master alone, pgbench updates, 8 clients, 20 s, every commit logged; two
+runs, and one of the script). The checkpoint's 70 ms stall (lexdb.md 9.135) is gone (9.136):
+
+| commit latency | p50 | p99 | p99.9 | max |
+|---|---:|---:|---:|---:|
+| before 9.136 (518f8d9d) | 0.42 ms | 0.72-0.76 | 4.2-4.5 | 70 |
+| now | 0.42 ms | 0.88-0.91 | 3.9-4.4 | **8.0-11.1** |
+
+A commit visible on a replica (`bench/repl/probe2.py`): from the master's
+commit acknowledgement to the first read on a replica that shows it, to
+within one read (about 0.1 ms); replicas show only commits the master has
+made durable. The acceptance test is p99 under 1 ms at the mixed load
+above. Two runs, pinned:
 
 | | p50 | p90 | p99 | p99.9 | max |
 |---|---:|---:|---:|---:|---:|
-| idle | 0.12 ms | 0.18 | 0.25 | 0.74 | 1.05 |
-| mixed load, 5 runs | 0.26-0.32 ms | 0.37-0.44 | **0.54-1.12** | 3.5-72 | 4.3-72 |
+| idle | 0.08-0.12 ms | 0.14-0.21 | 0.55-1.46 | 2.2-2.3 | 2.2-2.4 |
+| mixed load | 0.23-0.26 ms | 0.31-0.36 | **0.80-1.27** | 3.8-4.3 | 4.4-5.2 |
 
-The tail is the master's checkpoint: its encode holds the master's event
-loop 65 to 70 ms every 2 s (lexdb.md 9.135), which also stalls its commits.
+Unpinned (before), p99 was 0.24 idle and 0.54-1.12 under load. Pinned to 4
+cores, four busy processes and the kernel's I/O workers share them, and
+p99 sits about 1 ms with or without 9.136, idle too. The probe times from
+the acknowledgement, so a master stall delays the acknowledgement and
+hides from it: the commit latency above is where the checkpoint showed.
 
 ### 1.3 Aggregates on t, 1M rows (`vspg.sh`; ms, best of 5, median of 3 rounds)
 
 | query | lexdb | PG one core | PG 4 processes |
 |---|---:|---:|---:|
-| `count(*)` | **3.8** | 19.2 | 11.7 |
-| 4 aggregates `WHERE n > 10` | **22.9** | 57.4 | 26.0 |
-| `sum(v)` with three conditions | 26.0 | 46.3 | **22.5** |
-| `GROUP BY g`, 3 aggregates | **31.1** | 84.1 | 36.4 |
-| `GROUP BY n WHERE v % 2 = 0` | 46.7 (32 to 47) | 60.0 | **35.5** |
+| `count(*)` | **3.9** | 19.4 | 12.1 |
+| 4 aggregates `WHERE n > 10` | **24.2** | 59.7 | 26.7 |
+| `sum(v)` with three conditions | 26.2 | 48.6 | **23.0** |
+| `GROUP BY g`, 3 aggregates | 67.5 (63 to 69) | 88.1 | **37.6** |
+| `GROUP BY n WHERE v % 2 = 0` | **23.8** | 62.3 | 35.8 |
 
-lexdb runs a query on one thread. The last two vary between rounds (q4 30
-to 66 ms over the day, q5 22 to 47), most likely the master's checkpoint
-landing in them. The results are checksummed and the same on both.
+lexdb runs a query on one thread. `GROUP BY g` took 30 to 66 ms unpinned
+over the day and 63 to 69 pinned (not yet looked at). The results are
+checksummed and the same on both.
 
 ### 1.4 Analytic queries: 35 queries over w, d, t, cr (`saved/vec/bench.py`; lexdb-engines.md 7)
 
@@ -109,9 +130,16 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 - **The user's rules:**
   - PostgreSQL in parallel is capped at 4 processes, lexdb's shape (a main
     process and 3 replicas): `max_parallel_workers_per_gather = 3`,
-    `max_parallel_workers = 3`, and 4 CPUs (`CPUQuota=400%`) for many
-    clients. Figures with all its CPUs are not comparable (before
-    2026-11-15).
+    `max_parallel_workers = 3`. Figures with all its CPUs are not
+    comparable (before 2026-11-15).
+  - **Pinned, no shared cores** (since 2026-11-15, the ckpt-incremental
+    rows): the server under test (lexdb and its replicas, or PostgreSQL) on
+    CPUs 0-3, their SMT siblings 8-11 idle; pgbench, psql and the probes on
+    4-7 and 12-15. On this CPU a core's siblings are N and N+8
+    (`/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`). The
+    scripts take `SERVER_CPUS` and `CLIENT_CPUS`. Before, nothing was
+    pinned and PostgreSQL had `CPUQuota=400%` over all 16: those rows are
+    not comparable with pinned ones.
   - One benchmark at a time, on a quiet machine (load under 1).
   - Results are checked: row counts, checksums, or column sums.
 - **Warm vs cold:** every figure here is warm (data in memory) unless it
@@ -123,6 +151,7 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 |---|---|---|
 | OLTP and aggregates | `lexell/bench/sock/vspg.sh LEXDB WORKDIR 3 10 1 8 32` | pgbench point selects and updates (prepared, Unix sockets), five aggregates, two loads; each server a systemd unit, its CPU from the cgroup |
 | read replicas | `lexell/bench/repl/vsrep.sh LEXDB WORKDIR OUT` (WORKDIR: vspg.sh's) | 3 replicas: point selects, the mixed load, the lag probe |
+| commit latency | `lexell/bench/sock/commitlat.sh LEXDB WORKDIR OUT` (WORKDIR: vspg.sh's) | the master alone, pgbench updates, every commit's latency (p50 to max) |
 | analytic queries | `~/Work/lexdb-bench/saved/vec/bench.py` over `~/Work/lexdb-bench/hp/q.txt` (`.../2026-11-15-refresh/query_run.sh`, `cmp.py`) | 35 queries over w (1M), d, t (1M), cr; the scratch PostgreSQL `saved/pg18` |
 | bulk loads | `.../2026-11-15-refresh/copy_run.sh` (`bench.py`, `bcp.sh`, `gen.py`) | `\copy` and `bcp` of generated files |
 | commits | pgbench `-M simple -f ins.sql -c N -T 10` | single-row autocommit inserts |
@@ -138,7 +167,9 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
-| 2026-11-15 | 518f8d9d | OLTP, replicas | 3 replicas: point selects 333,900 / 367,800/s at 8 / 32 clients (PG at 4 CPUs 342,700 / 270,800); updates 2.3 to 2.6 × PG; replica lag p50 0.28 ms, p99 1.12 | this page, 1.1, 1.2; lexdb.md 9.135 |
+| 2026-11-15 | exp/ckpt-incremental | commit latency | the checkpoint's stall gone: commit max 70 → 8-11 ms, p99.9 4.2-4.5 → 3.9-4.4, p99 0.72-0.76 → 0.88-0.91 (master alone, 8 clients, pinned) | this page, 1.2; lexdb.md 9.136 |
+| 2026-11-15 | exp/ckpt-incremental | OLTP, replicas, aggregates (**pinned**, first) | 3 replicas: point selects 376,000-377,700/s at 32 clients (PG on 4 cores 386,600; 426,000 at 8); updates 2.26 / 2.63 / 1.54 × PG; lag p99 0.80-1.27 ms under load | this page, 1.1-1.3; lexdb.md 9.136 |
+| 2026-11-15 | 518f8d9d | OLTP, replicas (not pinned) | 3 replicas: point selects 333,900 / 367,800/s at 8 / 32 clients (PG at 4 CPUs 342,700 / 270,800); updates 2.3 to 2.6 × PG; replica lag p50 0.28 ms, p99 1.12 | this page, 1.1, 1.2; lexdb.md 9.135 |
 | 2026-11-15 | 518f8d9d | replica lag | under the mixed load p50 0.26-0.32 ms, p99 0.54-1.10 (before: p50 4.6, p99 355, max 1.08 s) | lexdb.md 9.135 |
 | 2026-11-15 | 478d49f6 | OLTP, aggregates | one process: point selects 83,000 / 138,500 / 127,000/s (12 to 26% below 11-11); updates 3,713 / 17,630 / 41,100/s (2.3 / 2.6 / 1.6 × PG at 4 CPUs); aggregates ahead of PG one core on all five | lexdb.md 9.134 |
 | 2026-11-15 | 478d49f6 | analytic queries | lexdb / PG one core 0.78 (CPU), / PG 4 processes 1.30 (wall); on settled data, column leaves throughout | lexdb-engines.md 7 |

@@ -19,14 +19,20 @@
 # PostgreSQL: shared_buffers 4GB (both servers hold all the data in memory),
 # otherwise its defaults. lexdb: its defaults (io_uring and adaptive polling).
 # PostgreSQL is capped at 4 processes, lexdb's shape (a main process and 3
-# replicas; the user's rule of 2026-11-13): its service at 4 CPUs
-# (CPUQuota=400%) for pgbench's clients, and its parallel aggregates at a
-# leader and 3 workers ("pg 4 processes"). PG_UNCAPPED=1 lifts both (9.67's
+# replicas; the user's rule of 2026-11-13): its parallel aggregates at a
+# leader and 3 workers ("pg 4 processes"). PG_UNCAPPED=1 lifts that (9.67's
 # runs: every CPU, its default 2 workers).
+# CPUs (since 2026-11-15; before, nothing was pinned and PostgreSQL was held
+# to CPUQuota=400% over every CPU): both servers on SERVER_CPUS (0-3: four
+# cores whose SMT siblings, 8-11 on this machine, are left idle), pgbench and
+# psql on CLIENT_CPUS (4-7,12-15), so no client shares a core with a server.
+# Siblings: /sys/devices/system/cpu/cpu*/topology/thread_siblings_list.
 set -e
 BIN=$(realpath "$1"); W=$2; ROUNDS=${3:-2}; SECS=${4:-10}; shift 4 2>/dev/null || shift $#
 CLIENTS=${*:-1 8 32}
 LPORT=5497; PPORT=5496
+SERVER_CPUS=${SERVER_CPUS:-0-3}; CLIENT_CPUS=${CLIENT_CPUS:-4-7,12-15}
+pin() { taskset -c "$CLIENT_CPUS" "$@"; }
 mkdir -p "$W"; W=$(realpath "$W")
 LSOCK=$W/lsock; PSOCK=$W/psock
 mkdir -p "$LSOCK" "$PSOCK"
@@ -38,7 +44,7 @@ stop() { systemctl --user stop "$(unit "$1")" 2>/dev/null || true; }
 cpu_ns() { systemctl --user show -p CPUUsageNSec --value "$(unit "$1")"; }
 host() { [ "$1" = lexdb ] && echo "$LSOCK" || echo "$PSOCK"; }
 port() { [ "$1" = lexdb ] && echo $LPORT || echo $PPORT; }
-q() { local s=$1; shift; psql -h "$(host "$s")" -p "$(port "$s")" -U test -d test -X -q "$@"; }
+q() { local s=$1; shift; pin psql -h "$(host "$s")" -p "$(port "$s")" -U test -d test -X -q "$@"; }
 ready() {
     local db=test; [ "$1" = pg ] && db=postgres                    # test may not exist yet
     for _ in $(seq 100); do psql -h "$(host "$1")" -p "$(port "$1")" -U test -d $db -X -Atc 'select 1' >/dev/null 2>&1 && return; sleep 0.1; done
@@ -47,9 +53,9 @@ ready() {
 start() {
     stop "$1"
     if [ "$1" = lexdb ]; then
-        systemd-run --user --quiet --collect -u "$(unit lexdb)" "$BIN" "$W/lexdb" 127.0.0.1:$LPORT "$LSOCK"
+        systemd-run --user --quiet --collect -u "$(unit lexdb)" -p CPUAffinity="$SERVER_CPUS" "$BIN" "$W/lexdb" 127.0.0.1:$LPORT "$LSOCK"
     else
-        local cap=(-p CPUQuota=400%); [ -n "${PG_UNCAPPED:-}" ] && cap=()
+        local cap=(-p CPUAffinity="$SERVER_CPUS"); [ -n "${PG_UNCAPPED:-}" ] && cap=()
         systemd-run --user --quiet --collect -u "$(unit pg)" "${cap[@]}" /usr/bin/postgres -D "$W/pg" -k "$PSOCK" -p $PPORT \
             -c listen_addresses= -c shared_buffers=4GB
     fi
@@ -104,12 +110,12 @@ for r in $(seq "$ROUNDS"); do
         start $s
         q $s -Atc 'SELECT sum(abalance) FROM acct' >/dev/null       # warm
         q $s -Atc 'SELECT sum(v) FROM t' >/dev/null
-        pgbench -n -f "$W/sel.sql" -M prepared -c 32 -j 8 -T 5 -h "$(host $s)" -p "$(port $s)" -U test test >/dev/null 2>&1
+        pin pgbench -n -f "$W/sel.sql" -M prepared -c 32 -j 8 -T 5 -h "$(host $s)" -p "$(port $s)" -U test test >/dev/null 2>&1
         for kind in sel upd; do
             for c in $CLIENTS; do
                 j=$c; [ $j -gt 8 ] && j=8
                 c0=$(cpu_ns $s)
-                tps=$(pgbench -n -f "$W/$kind.sql" -M prepared -c $c -j $j -T "$SECS" -h "$(host $s)" -p "$(port $s)" -U test test 2>&1 |
+                tps=$(pin pgbench -n -f "$W/$kind.sql" -M prepared -c $c -j $j -T "$SECS" -h "$(host $s)" -p "$(port $s)" -U test test 2>&1 |
                       awk '/^tps/ { print int($3) }')
                 c1=$(cpu_ns $s)
                 awk -v r=$r -v s=$s -v k=$kind -v c=$c -v t=$tps -v d=$((c1 - c0)) -v n=$SECS \
