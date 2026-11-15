@@ -349,3 +349,59 @@ the 1M sort and keeps 20 chunks.
   measurement is a repeated-sort loop and a container memory limit, to see
   whether the floor causes refault thrash.
 
+## 9. The applications, before and after (2026-11-15)
+
+The microbenchmark above is the worst case for the allocator: one allocation
+and one free, nothing else. This measures the same programs a user runs.
+
+**Method.** Two compilers: the baseline is `main`'s seed (the old runtime);
+the new one is this branch's seed. Both build the same source with
+`-O --native`, on one core (`taskset -c 4`), output discarded, seven runs,
+median wall time and the child's `ru_maxrss`. Inputs: the 20 MB JSON from
+`bench/json/gen_data.py`, the 3 MB regex corpus, 10 MB of Markdown, and the
+source tree for `eza --tree -L 4`.
+
+**Command-line programs.**
+
+| Program | Base | New | Time | Base RSS | New RSS |
+|---|---:|---:|---:|---:|---:|
+| `jq -c .` (20 MB JSON) | 247.1 ms | 252.6 ms | +2.2% | 128.6 MB | 128.6 MB |
+| `json_bench` (20 MB, 5 reps) | 1793 ms | 1811 ms | +1.0% | 307.6 MB | 307.6 MB |
+| `regex_bench` (3 MB, 5 reps) | 170.1 ms | 171.8 ms | +1.0% | 30.4 MB | 30.4 MB |
+| `grep -c` (3 MB) | 1.48 ms | 1.48 ms | +0.3% | 8.2 MB | 8.2 MB |
+| `sort` (3 MB) | 10.01 ms | 9.99 ms | -0.2% | 9.0 MB | 9.0 MB |
+| `eza --tree -L 4` | 4.09 ms | 4.09 ms | 0.0% | 8.2 MB | 8.2 MB |
+| `cmark` (10 MB) | 75.4 ms | 76.0 ms | +0.8% | 108.3 MB | 108.3 MB |
+
+The +6.5% of `bench alloc` is not what applications see: they spend most of
+their time elsewhere, and the change is under 2.2% here. Peak RSS is
+unchanged, as expected: these are short-lived programs that never reach the
+event loop's idle point, so no chunk is retired, and the per-chunk header is
+1 KiB a chunk.
+
+**lexdb, one server** (`LXL_PAR=0`, cache 64 MB, a 1M-row table with a primary
+key; query medians of three; RSS after 2.5 s idle):
+
+| | base | new | new + `LXL_TRIM=1` |
+|---|---:|---:|---:|
+| insert 1M rows | 1.4 s | 1.4 s | 1.4 s |
+| `count(*)` | 8.7 ms | 8.9 ms | 9.3 ms |
+| `sum(id)` | 17.7 ms | 17.6 ms | 17.9 ms |
+| 100k point joins | 134.2 ms | 132.4 ms | 131.3 ms |
+| sort 100k rows | 312.5 ms | 298.9 ms | 299.5 ms |
+| filtered count | 48.7 ms | 48.3 ms | 50.4 ms |
+| RSS after insert | 210.0 MB | 210.1 MB | **138.1 MB** |
+| RSS after queries | 200.6 MB | 200.7 MB | **128.7 MB** |
+| peak RSS | 341.0 MB | 341.1 MB | 341.0 MB |
+
+Query time is unchanged; the differences are noise (the sort is slightly
+faster on the new runtime). The trim returns **72 MB** of steady-state RSS
+after the insert and after the queries, and **not** the peak: the highest
+point is the same 341 MB, as section 7 said. The 250 µs idle pass is not
+visible in these latencies.
+
+Two things this does not settle: a repeated large-sort loop (to see the
+refault cost and the 4-chunk floor), and a memory-limited container (where
+the peak, not the steady state, is the limit).
+
+
