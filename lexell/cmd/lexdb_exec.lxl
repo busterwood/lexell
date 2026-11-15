@@ -44,6 +44,7 @@ import "./lexdb_orafn"
 import "./lexdb_syscat"
 import "./lexdb_oracat"
 import "./lexdb_match"
+import "./lexdb_parse"
 
 type SqlT = lexdb_syscat.SqlT
 type OraT = lexdb_oracat.OraT
@@ -782,7 +783,7 @@ fn floatKey(x: float): int {
 // session's zone, and back), rounded to the type's fractional digits.
 fn coerceTime(v: Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let k = t.kind
-    let p = if t.prec >= 1 && lexdb_sql.tsqlCode(t) == 0 { t.scale } else if t.prec >= 1 { min(t.scale, 6) } else { 6 }
+    let p = if t.prec >= 1 && lexdb_parse.tsqlCode(t) == 0 { t.scale } else if t.prec >= 1 { min(t.scale, 6) } else { 6 }
     match v {
         Val.Text(s) {
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s, z))) }
@@ -3454,7 +3455,7 @@ fn decTable(name: &str, s: &str): Result[Table, DbErr] {
         }
         if flags & 2 != 0 {
             let pl = binary.readU32LEStr(s, at)
-            match lexdb_sql.parseExpr(&s[at + 4..at + 4 + pl]) {
+            match lexdb_parse.parseExpr(&s[at + 4..at + 4 + pl]) {
                 Ok(x) { ix.pred = Some(x) }
                 Err(_) { return Err(lexdb_base.corrupt(&("the predicate of index \"" + ix.name + "\""))) }
             }
@@ -3472,7 +3473,7 @@ fn decTable(name: &str, s: &str): Result[Table, DbErr] {
                     append(mut &ix.exprs, Expr.Lit(Val.Null))
                     continue
                 }
-                match lexdb_sql.parseExpr(&x) {
+                match lexdb_parse.parseExpr(&x) {
                     Ok(e1) { append(mut &ix.exprs, e1) }
                     Err(_) { return Err(lexdb_base.corrupt(&("an expression of index \"" + ix.name + "\""))) }
                 }
@@ -3495,7 +3496,7 @@ fn decTable(name: &str, s: &str): Result[Table, DbErr] {
             at += 1
             if flags & 1 != 0 {
                 let l = binary.readU32LEStr(s, at)
-                match lexdb_sql.parseExpr(&s[at + 4..at + 4 + l]) {
+                match lexdb_parse.parseExpr(&s[at + 4..at + 4 + l]) {
                     Ok(x) { t.cols[i].def = Some(x) }
                     Err(_) { return Err(lexdb_base.corrupt(&("the default of column \"" + t.cols[i].name + "\""))) }
                 }
@@ -3526,7 +3527,7 @@ fn decTable(name: &str, s: &str): Result[Table, DbErr] {
             let cn = s[at + 4..at + 4 + l]
             at += 4 + l
             let xl = binary.readU32LEStr(s, at)
-            match lexdb_sql.parseExpr(&s[at + 4..at + 4 + xl]) {
+            match lexdb_parse.parseExpr(&s[at + 4..at + 4 + xl]) {
                 Ok(x) { append(mut &t.checks, Check{name: cn, expr: x}) }
                 Err(_) { return Err(lexdb_base.corrupt(&("check constraint \"" + cn + "\""))) }
             }
@@ -9137,11 +9138,11 @@ fn typPS(t: &lexdb_sql.TypeName): PS {
 }
 
 // A time type's fractional seconds where it says them (prec 1), else -1.
-// Or SQL Server's type, where a T-SQL type name said it (lexdb_sql.tsqlCode),
+// Or SQL Server's type, where a T-SQL type name said it (lexdb_parse.tsqlCode),
 // as lexdb_syscat.hint: it and the length (lexdb_tds sends tinyint,
 // varchar, char, datetime, ... as SQL Server would).
 fn typScale(t: &lexdb_sql.TypeName): int {
-    let code = lexdb_sql.tsqlCode(t)
+    let code = lexdb_parse.tsqlCode(t)
     if code > 0 { return lexdb_syscat.hint(code, if code == lexdb_syscat.TS_DATETIME || code == lexdb_syscat.TS_SMALLDATETIME { 0 } else { t.len }) }
     if t.kind == lexdb_sql.K_NUM && t.len == lexdb_syscat.TS_NUMERIC { return lexdb_syscat.hint(lexdb_syscat.TS_NUMERIC, 0) }
     if lexdb_sql.isTimeKind(t.kind) && t.prec >= 1 { return t.scale }
@@ -10992,7 +10993,7 @@ fn createType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     if isTable {
         let spell = if len(s.spell) > 0 { s.spell } else { lexdb_sql.baseName(&key) }
-        try txn.put(CATALOG, &(tabTypeKey(&key)), &(encTabType(&TabType{key: key, spell: spell, body: s.index})))
+        try txn.put(CATALOG, &(tabTypeKey(&key)), &(encTabType(&TabType{key: key, spell: spell, body: s.index, cols: parseTabTypeCols(&s.index)})))
         try bumpCatalog(st, txn)
         return Ok(tagOnly("CREATE TYPE"))
     }
@@ -11090,6 +11091,32 @@ fn alterType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 fn tabTypeKey(key: &str): str { return "\x02ttype\x00" + key }
 
 
+
+// A table type's columns as its CREATE TABLE text gives them (sys.columns,
+// and a table-valued parameter's temporary table). Parsed here, where the
+// grammar lives; lexdb_catalog only carries the result.
+fn parseTabTypeCols(body: &str): []lexdb_sql.ColDef {
+    let none: []str = []
+    match lexdb_parse.tsqlParser(body, lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &none) {
+        Ok(q0) {
+            var q = q0
+            match q.tableDef(&"#t") {
+                Ok(s0) {
+                    var s = s0
+                    var all = replace(mut &s.cols, [])
+                    for i in 0..len(all) {
+                        for p in s.pk { if p == all[i].name { all[i].notNull = true } }
+                    }
+                    return all
+                }
+                Err(_) {}
+            }
+        }
+        Err(_) {}
+    }
+    return []
+}
+
 fn encTabType(t: &TabType): str {
     var b = newStrBuf()
     addStrs(mut &b, &[t.key, t.spell, t.body])
@@ -11098,8 +11125,8 @@ fn encTabType(t: &TabType): str {
 
 fn decTabType(v: &str): TabType {
     let all = strsAt(v, 0)
-    if len(all) < 3 { return TabType{key: "", spell: "", body: "()"} }
-    return TabType{key: all[0], spell: all[1], body: all[2]}
+    if len(all) < 3 { return TabType{key: "", spell: "", body: "()", cols: []} }
+    return TabType{key: all[0], spell: all[1], body: all[2], cols: parseTabTypeCols(&all[2])}
 }
 
 fn readTabType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[TabType], DbErr] {
@@ -18785,7 +18812,7 @@ fn (s: mut &Session) undoLocal() {
 fn (s: &Session) show(name: &str): Result[Res, DbErr] {
     var res = Res{cols: showCols(name), rows: [], tag: "SHOW", hasRows: true, copy: COPY_NONE}
     if name == "all" {
-        for n in lexdb_sql.SETTINGS { append(mut &res.rows, [Val.Text(n), Val.Text(s.setting(&n).unwrap())]) }
+        for n in lexdb_sql.settingsList() { append(mut &res.rows, [Val.Text(n), Val.Text(s.setting(&n).unwrap())]) }
         return Ok(res)
     }
     match s.setting(name) {
@@ -19919,7 +19946,7 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
 
 // Parses and runs SQL text with no parameters (for the tests and tools).
 pub fn (s: mut &Session) exec(sql: &str): Result[[]Res, DbErr] {
-    let stmts = try lexdb_sql.parse(sql)
+    let stmts = try lexdb_parse.parse(sql)
     var out: []Res = []
     let none: []Val = []
     let nt: []int = []
@@ -22133,7 +22160,7 @@ fn fastCopyUnescape(s: &str): str {
 }
 
 fn fastCopyPrec(t: &lexdb_sql.TypeName): int {
-    if t.prec >= 1 && lexdb_sql.tsqlCode(t) == 0 { return t.scale }
+    if t.prec >= 1 && lexdb_parse.tsqlCode(t) == 0 { return t.scale }
     if t.prec >= 1 { return min(t.scale, 6) }
     return 6
 }
@@ -29718,7 +29745,7 @@ fn sysSuper(se: &SeqEnv): bool {
 }
 
 // SQL Server's catalog functions: OBJECT_NAME, OBJECTPROPERTY,
-// COLUMNPROPERTY, SCHEMA_NAME, ... (lexdb_sql.tsqlCatCall).
+// COLUMNPROPERTY, SCHEMA_NAME, ... (lexdb_parse.tsqlCatCall).
 fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     let n = len(vs)
     let none: Option[Val] = None
@@ -30145,7 +30172,7 @@ fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
         q.use = lexdb_sql.SUB_FROM
         return Ok(q)
     }
-    var ss = try lexdb_sql.parseView(&t.view)
+    var ss = try lexdb_parse.parseView(&t.view)
     if len(ss) != 1 || ss[0].kind != lexdb_sql.S_SELECT { return Err(lexdb_base.corrupt(&("the query of view \"" + t.name + "\""))) }
     var q = pop(mut &ss)
     q.use = lexdb_sql.SUB_FROM
