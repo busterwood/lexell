@@ -34,7 +34,8 @@ encoder cannot take (tagged/odd values, a stored-apart stub, mixed layouts)
 is a `C_ANY` column of its rows' bytes. The flat free list and the
 parallel checkpoint encode are deleted. The 35-query benchmark (fresh data
 from the branch, main's binary as control, 3 runs each) gives a geometric
-mean of 1.004 and a median of 1.0: no regression beyond noise. The parser/dialect cycle is broken:
+mean of 1.004 before the dialect work and 0.999 after it, a median of 1.0
+both times: no regression beyond noise. The parser/dialect cycle is broken:
 `lexdb_sql` imports `lexdb_dialect` and the dialect modules own their type
 mappings, catalog rows and catalog text. Wire/auth and the small
 connection-time `Dialect` facade remain, then `ReadView` and the
