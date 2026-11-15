@@ -333,6 +333,16 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   scanning lineitem's 6M and probing 214k: **8.49 s -> 448 ms** warm,
   the PostgreSQL checksum. The same estimate picks q7's order: **11.74 ->
   4.48 s** warm. All 22 queries keep their checksums.
+- **An IN list is evaluated over a batch.** A scan condition with
+  `x IN (a, b, ...)` was not one the batches compiled, so the whole level
+  ran on the row path: q12 called the IN function once per lineitem row,
+  7.0 s for the list alone. The list is compiled once (a literal, a
+  parameter, or char(n)'s padding of one) and tested per row: up to eight
+  values as a chain of equalities, longer ones as a sorted set searched
+  by halves, both with SQL's NULL for a NULL column or a NULL in the
+  list. q12 7.10 -> **1.19 s** warm, q16 0.69 -> 0.59 s; a 200-value list
+  is 0.89 s and a 5,000-value list 1.22 s, where the equality chain cost
+  17.2 s and over two minutes.
 - The plan choice is in `choosePath`, the fallback in `indexOrScan`;
   `exec_scanchoice.lxl` covers the broad, selective, index-only and
   primary-key cases, and `exec_switch.lxl` the counted fallback. The
@@ -341,14 +351,15 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   alone.
 
 A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q1
-16.0 s, q21 14.6 s, q12 6.86 s, q13 5.49 s, q7 4.60 s, q4 4.09 s, q19
-0.44 s. The A/B figures above are the measurements; the run-level
+17.1 s, q21 15.5 s, q13 5.86 s, q7 4.91 s, q4 4.32 s, q12 1.33 s, q19
+0.46 s. The A/B figures above are the measurements; the run-level
 comparison to the pre-fix baseline is not, because that baseline run was
 the first after the load (queries it did not touch moved 0.84-1.01x from
 cache warmth alone).
 
 Still open: q4's semi-join is now 24x PostgreSQL and q21's 21x, down
-from 44x and 35x; q19 is 13x and q7 8.6x, down from 248x and 22x.
+from 44x and 35x; q19 is 13x, q7 8.6x and q12 1.7x, down from 248x, 22x
+and 8.7x.
 PostgreSQL's q21 plan scans lineitem once (433 ms),
 hashes supplier/nation to 156,739 rows, then probes lineitem's primary
 key 156k times for the anti join and 13.8k for the semi join
