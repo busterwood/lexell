@@ -5,6 +5,13 @@ import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_pgcat"
+import "./lexdb_catalog"
+
+type Val = lexdb_sql.Val
+type Table = lexdb_catalog.Table
+type CatIdx = lexdb_catalog.CatIdx
+type CatTab = lexdb_catalog.CatTab
+type CatSnap = lexdb_catalog.CatSnap
 
 // quote_ident: the name as is when it needs no quotes. PostgreSQL's rule:
 // a lower-case letter or _ first, then lower-case letters, digits and _.
@@ -276,3 +283,76 @@ pub fn seqOid(key: &str): int { return catOid(&"S", key) }
 pub fn clean(s: &str): str { return strings.replaceAll(&(strings.replaceAll(&s, "\t", " ")), "\n", " ") }
 
 pub fn persistOf(schema: &str): str { return if lexdb_base.isTempSchema(schema) { "t" } else { "p" } }
+
+// An index's columns with their options, as pg_get_indexdef shows them.
+pub fn colOpts(t: &Table, ix: &CatIdx): str {
+    var parts: []str = []
+    for k in 0..len(ix.cols) {
+        let n = ix.cols[k]
+        var p = ""
+        if n == 0 && k < len(ix.exprs) {
+            // an expression: a function's call as it is, any other in parentheses
+            let x = ix.exprs[k]
+            let call = len(x) > 0 && x[len(x) - 1] == ')' && x[0] != '('
+            p = if call { x } else { "(" + x + ")" }
+        } else {
+            if n < 1 || n > len(t.cols) { continue }
+            p = quoteIfNeeded(&lexdb_sql.colShown(&t.cols[n - 1]))
+        }
+        if k < len(ix.opts) && len(ix.opts[k]) > 0 { p = p + " " + ix.opts[k] }
+        append(mut &parts, p)
+    }
+    return strings.join(&parts, ", ")
+}
+
+// pg_index.indoption: per column, 1 DESC, 2 NULLS FIRST.
+pub fn indOptions(ix: &CatIdx): Val {
+    var ns: []int = []
+    for k in 0..len(ix.cols) {
+        let o = if k < len(ix.opts) { ix.opts[k] } else { "" }
+        let desc = strings.contains(&o, "DESC")
+        let first = if desc { !strings.contains(&o, "NULLS LAST") } else { strings.contains(&o, "NULLS FIRST") }
+        append(mut &ns, (if desc { 1 } else { 0 }) + (if first { 2 } else { 0 }))
+    }
+    var parts: []str = []
+    for x in ns { append(mut &parts, x.toStr()) }
+    return Val.Text(strings.join(&parts, " "))
+}
+
+pub fn colList(t: &Table, nums: &[]int): str {
+    var parts: []str = []
+    for n in nums { if n >= 1 && n <= len(t.cols) { append(mut &parts, quoteIfNeeded(&lexdb_sql.colShown(&t.cols[n - 1]))) } }
+    return strings.join(&parts, ", ")
+}
+
+// A column's DEFAULT as pg_attrdef shows it; None for none (an identity
+// column has none: its sequence is its own).
+pub fn defaultText(snap: &CatSnap, c: &lexdb_sql.ColDef): Option[str] {
+    if c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT { return None }
+    if c.identity == lexdb_sql.ID_SERIAL && len(c.seq) > 0 {
+        return Some("nextval('" + shownIn(&snap.path, &lexdb_sql.schemaOf(&c.seq), &lexdb_sql.baseName(&c.seq)) + "'::regclass)")
+    }
+    match c.def {
+        Some(d) { return Some(exprText(&d, &Some(c.typ))) }
+        None { return None }
+    }
+}
+
+pub fn idxDef(ct: &CatTab, ix: &CatIdx): str { return idxDefOn(ct, ix, &(quoteIfNeeded(&ct.schema) + "." + quoteIfNeeded(&ct.name)), false) }
+
+// The index's definition on table on as written; pretty, pg_get_indexdef's
+// pretty form (the table as the path shows it, its predicate's outer
+// parentheses dropped: 9.117).
+pub fn idxDefOn(ct: &CatTab, ix: &CatIdx, on: &str, pretty: bool): str {
+    var d = "CREATE " + (if ix.unique { "UNIQUE " } else { "" }) + "INDEX " + quoteIfNeeded(&ix.name) + " ON " +
+            on + " USING btree (" + colOpts(&ct.t, ix) + ")"
+    match ix.pred {
+        Some(p) {
+            let none: Option[lexdb_sql.TypeName] = None
+            let x = exprText(&p, &none)
+            d = d + " WHERE " + (if pretty { lexdb_sql.unwrapParens(&x) } else if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })
+        }
+        None {}
+    }
+    return d
+}
