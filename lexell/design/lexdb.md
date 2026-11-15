@@ -12496,3 +12496,14 @@ Deliberately not attempted: the connection-time `Dialect` composition
 and opaque table mutation, and the path/join-order search. The design
 for those, and the parked storage/executor/cleanup work, is in
 [lexdb-refactor-followups.md](lexdb-refactor-followups.md).
+
+**One read view** (2026-11-15, `arch/deep-modules-2`). `Store.viewOf`
+returns `View.Live`, `View.Snap` or `View.Repl`; every read operation asks
+it once instead of repeating the follower/snapshot tests. The chosen view
+drives `get`, `getMany`, `warm`, `scan`, `scanBack`, `scanLeaves`,
+`countRange`, `noteRange` and `liveStale`. Internal-only frame, chunk and
+CRC helpers became private; `Txn.isSnapshot` and `Follower.applied` were
+unused and are gone. Store exports 141 → 134, lines per export 55.9 →
+59.0. The 35-query A/B is 1.013 CPU geometric mean (median 1.011), inside
+the 5% gate. The scan family is still five methods; one reader over a
+`Sink` is the next cut.

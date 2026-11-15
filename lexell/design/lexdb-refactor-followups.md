@@ -135,13 +135,20 @@ not start it as part of the current branch.
 
 `st.fo` is now entirely inside `lexdb_store` (25 references, none in
 exec), so this is a store-internal consolidation rather than an
-exec-wide rewrite. Today the store branches live/snapshot/follower at
-each read operation (`getBaseIn`, `countRange`, `noteRange`, `scan`,
-`scanLeaves`, `snapGet`, follower paths). Target: one selection point at
-statement or scan construction; a `Scan`/`Reader` that holds the choice
-and yields `Entry` or `LeafView` batches; point reads select once, not
-per row; the follower merges base + delta into the same batch decoder as
-the master. No virtual dispatch per row and no `Node` above store.
+exec-wide rewrite. **Started on `arch/deep-modules-2`:** `Store.viewOf`
+returns `View.Live`, `View.Snap` or `View.Repl`, and `get`, `getMany`,
+`warm`, `scan`, `scanBack`, `scanLeaves`, `countRange`, `noteRange` and
+`liveStale` select once through it. Internal-only frame/CRC helpers are
+private; `isSnapshot` and `Follower.applied` are deleted. Store exports
+went 141 → 134 (lines/export 55.9 → 59.0).
+
+What remains: the live and snapshot loops still branch on
+`view == View.Snap` internally, and the scan family is five public
+methods (`scan`, `scanPart`, `scanBack`, `scanBackPart`, `scanLeaves`).
+The next cut is one reader over a `Sink` (entries or leaves) with
+`back`/`part` options, so exec's scan call sites choose a mode instead of
+a method. That is where the Store interface starts to shrink rather than
+just select better.
 
 ### 3b. `Txn`
 
