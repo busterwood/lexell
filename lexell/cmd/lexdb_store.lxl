@@ -2835,6 +2835,15 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
     return -1
 }
 
+// Read ahead for getMany (lexdb.md 9.130): at a node to load, the later
+// keys' paths are followed through the nodes in memory, and the first node
+// each needs that is not is read with it (loadMany: READS_IN_FLIGHT at a
+// time). At most LOOKUP_AHEAD nodes (and a 32nd of the cache's budget, as
+// runAt), and the probe stops LOOKUP_GAP keys after the last node it
+// found: keys whose paths are in memory cost it a descent each.
+const LOOKUP_AHEAD = 64
+const LOOKUP_GAP = 256
+
 // get (part: getPart) of each of keys in turn, their values (or None)
 // appended to out: what as many calls give, their reads noted as they note
 // them, in the same order. The store's lock is taken once for as many keys
@@ -2856,6 +2865,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
     var i = 0
     while i < n {
         var need = -1
+        var ahead: []int = []           // need, and the nodes the next keys need (read ahead)
         var bad: []lexdb_base.DbErr = []
         var apart = false               // out's last value is stored apart: unstore it first
         st.sh.with(fn(db: mut &Db) {
@@ -2888,7 +2898,10 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                 var d = -1
                 if root >= 0 {
                     d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
-                    if d == -1 { return }
+                    if d == -1 {
+                        ahead = db.lookupAhead(root, snap, q, keys, i, need)
+                        return
+                    }
                     if d == -2 {
                         append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
                         return
@@ -2933,7 +2946,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if need >= 0 {
-            try st.load(need)
+            if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
             continue
         }
         if apart {
@@ -2943,6 +2956,32 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
         }
     }
     return Ok(Unit{})
+}
+
+// The nodes to read for getMany at keys[i], which needs node need: need,
+// then the first node not in memory on each later key's path, each once
+// (getMany's read ahead, above).
+fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]str, i: int, need: int): []int {
+    var out: []int = [need]
+    let most = min(LOOKUP_AHEAD, db.opts.cacheBytes / (32 * PAGE))
+    var f = newFinger()
+    var last = i
+    var j = i + 1
+    while j < len(keys) && len(out) < most && j - last <= LOOKUP_GAP {
+        var nd = -1
+        let d = db.fingerTo(mut &f, root, snap, q, &keys[j], mut &nd)
+        if d == -2 { break }
+        if d == -1 {
+            var seen = false
+            for x in out { if x == nd { seen = true } }
+            if !seen {
+                append(mut &out, nd)
+                last = j
+            }
+        }
+        j += 1
+    }
+    return out
 }
 
 // The pages of tree and of its companion (large values), as the latest

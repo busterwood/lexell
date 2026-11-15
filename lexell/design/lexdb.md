@@ -12033,3 +12033,46 @@ did not grow when refilled.
   reference by foreign key) is parked: it takes the row path in batches.
 - The scripts and raw results are in `~/Work/lexdb-bench/bd9/` (`py/`,
   `res*.jsonl`); the data copies were removed.
+
+### 9.130 getMany reads ahead: a batch's missing pages read together
+
+The drive measurements of 2026-11-15 (`~/Work/lexdb-bench/fio/RESULTS.md`)
+showed this disk doing 9,900 random 4 KiB reads a second one at a time and
+118,000 with 16 in flight, at about the same latency (101 against 135 µs).
+`getMany` (9.107) read a batch's missing nodes one at a time: at a node to
+load it loaded it (`load`, one page, parked) and went on from the root.
+
+**Now** (`lookupAhead`): at a node to load, the later keys' paths are
+followed through the nodes in memory, and the first missing node on each is
+read with it by `loadMany` (32 reads in flight, pages in a row in one read),
+as commits load their leaves. At most `LOOKUP_AHEAD` (64) nodes, and a 32nd
+of the cache's budget as `runAt`; the probe stops `LOOKUP_GAP` (256) keys
+after the last node it found. The keys are probed through the same
+`fingerTo`, so the reads are what the lookups would have read, only sooner;
+what is noted for serializable reads is unchanged (noting stays in the main
+loop). A cold tree's first lookup still reads its root alone; the next
+round reads the next level's nodes together.
+
+**Measured** (`~/Work/lexdb-bench/la`: `cold.py`, bd_ob's w, d, t, a fresh
+server per cold run, the data file evicted from the kernel's cache, 5 runs,
+wall ms median; warm unchanged on all):
+
+| Query, cold | Before | After |
+|---|---:|---:|
+| `idx_range1k` (w_b, about 1,000 rows) | 117 | 23 |
+| `idx_range5k` | 263 | 71 |
+| `idx_range20k` | 308-454 | 159-181 |
+| `join_d_w` (1,000 lookups into w by key) | 105 | 21 |
+| `idx_range50k` | 152-193 | 161-210 (+9%) |
+| `in1000`, `join_t_w`, `corr_sub`, `pk_range100k`, `count(*)` | unchanged | |
+
+- **The 50k range** reads nearly every leaf of w (23,330 pages both ways):
+  each sorted batch's keys are about 23 leaves apart, and read one at a time
+  the kernel's read-ahead brought in the leaves later batches needed. Read
+  32 at a time they look random to it. Server CPU +7%, in the kernel (the
+  user-space profiles are the same). A full scan is cheaper than either
+  (`count(*)` cold 85 ms): the planner choosing it there is the better fix.
+- **Not reached:** `IN` lists (`in1000`: 1,000 keys, read one at a time, not
+  by `getMany`); lookups whose input batches hold few keys after a filter
+  (`join_t_w`: about one key per batch of t); per-row subqueries.
+- The suite passes (170).
