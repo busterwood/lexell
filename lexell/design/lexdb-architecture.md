@@ -6,6 +6,11 @@ chronological record. [lexdb.md](lexdb.md) remains the record of how each
 mechanism was measured and chosen; this note is the map we hold the code
 to.
 
+Progress (2026-11-15): the test tooling builds natively by default; the
+`rs.batch` split and the `LEXDB_ROWFMT` removal are done; `lexdb_rows`
+owns the leaf, fixed and tagged/long row codecs. The column body/Spec,
+`Projection`, the batch decoders, `ReadView` and the dialect port remain.
+
 ## 1. Why this exists
 
 The code is a successful performance research log. Each design section
@@ -54,7 +59,7 @@ small; behavior belongs in the deep modules.
 | Module | Secret it hides | Interface | Leak today |
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | 12 read operations; `Node` callbacks; `st.fo` at many sites |
-| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | split across exec/cols/page; ~45 public functions |
+| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed and tagged/long codecs moved; column body/Spec, batch decoders and Projection remain |
 | **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | lives inside exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
@@ -177,11 +182,14 @@ stay inside a module and the caller pays one dispatch, not one per value.
    hooks. Done on this branch. The format deletions wait for Rows, so the
    old-format fixtures are retargeted once. Split `rs.batch`: compiled
    expressions and typed sort always on; the flag controls vector scans only.
-2. **Rows / codec.** Start with `encodeLeafK`; then the universal column
-   leaf, one layout per leaf, overflow for long/odd values, `C_ANY` /
-   `C_STUB`. Delete `T_LEAF`, the old layout compatibility, the tagged-row
-   general form and mixed-layout leaves here, with the codec that replaces
-   them. Keep the tagged writer until the overflow codec lands.
+2. **Rows / codec.** Progress: `encodeLeaf`, the fixed row codec, the
+   tagged/long row codec and `encodeRowOf` are moved; exec keeps thin
+   adapters, `rowOf`/`placesOf` (large-value I/O) and table metadata. Next:
+   the column body/Spec and `Projection`, then the batch decoders. After
+   that, the universal column leaf, one layout per leaf, overflow for
+   long/odd values (`C_ANY` / `C_STUB`), and the deletion of `T_LEAF`, the
+   old layout compatibility, the tagged-row general form and mixed-layout
+   leaves.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
    follower base+delta; replica batch scans.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide
