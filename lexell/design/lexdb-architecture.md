@@ -20,8 +20,14 @@ written now reaches the same batch decoder through synthetic leaves
 lookup or an empty range is the only separate point path (`fillPoint`). A
 C_ANY leaf is decoded a row at a time (`layoutOk` false), as the tagged
 form was.
-`lexdb_pg` has started the PG dialect: identifier and name rendering, OID
-mapping, catalog row helpers and the expression deparser. The T_LEAF page
+The three dialect modules now make their own catalog rows: `lexdb_pg`
+(pg_catalog, information_schema), `lexdb_syscat` (sys.*, including TDS's
+metadata binder) and `lexdb_oracat` (the data dictionary). They take a
+`CatView` (snapshot, roles, session) and, for PostgreSQL's statistics
+view, a small per-table stats map; none calls the executor. The shared
+metadata (Table, Index, constraints, CatSnap, sequences, enums, table
+types, roles, ACLs, CatView, TabStat) and its pure helpers live in
+`lexdb_catalog`. The T_LEAF page
 format and the pre-9.113/9.115 layout and time-tagged row compatibility are
 deleted. Table leaves are now always column leaves: a leaf the typed
 encoder cannot take (tagged/odd values, a stored-apart stub, mixed layouts)
@@ -29,10 +35,10 @@ is a `C_ANY` column of its rows' bytes. The flat free list and the
 parallel checkpoint encode are deleted. The 35-query benchmark (fresh data
 from the branch, main's binary as control, 3 runs each) gives a geometric
 mean of 1.004 and a median of 1.0: no regression beyond noise. The parser/dialect cycle is broken:
-`lexdb_sql` imports `lexdb_dialect` and `lexdb_catalog`, and the dialect
-modules own their type mappings and PG catalog text. The rest of
-`ReadView`, the catalog generators/wire/auth and the executor/planner
-phases remain.
+`lexdb_sql` imports `lexdb_dialect` and the dialect modules own their type
+mappings, catalog rows and catalog text. Wire/auth and the small
+connection-time `Dialect` facade remain, then `ReadView` and the
+executor/planner phases.
 
 ## 1. Why this exists
 
@@ -85,12 +91,12 @@ the deep modules.
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | 12 read operations; `Node` callbacks; `st.fo` at many sites |
 | **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows` (exec's `rowsFor`), `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
-| **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | started: the shared metadata types (Table, Index, constraints, CatSnap, sequences, enums, table types) moved; the behavior lives in exec |
+| **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | started: the shared metadata types (Table, Index, constraints, CatSnap, sequences, enums, table types, roles, ACLs, CatView, TabStat) and their pure helpers moved; DDL behavior lives in exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
-| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier/name rendering, OID mapping, catalog row helpers and `pg_get_expr` deparse moved; catalog generators, wire/auth and the facade remain in exec |
-| **`lexdb_mssql`** | T-SQL grammar/quirks, TDS, `sys.*`, T-SQL functions, temp-table semantics | one `Dialect` facade | `lexdb_tsql*` / `lexdb_tds` / `lexdb_sys*` |
-| **`lexdb_oracle`** | PL/SQL, TNS, Oracle data dictionary, functions/types, error text | one `Dialect` facade | `lexdb_plsql` / `lexdb_tns` / `lexdb_ora*` |
+| **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one small `Dialect` facade; catalog rows stay separate | identifier/name rendering, OID mapping, the whole catalog generator, `pg_get_expr`/`pg_get_indexdef` and ACL text moved; wire/auth and the facade remain |
+| **`lexdb_mssql`** | T-SQL grammar/quirks, TDS, `sys.*`, T-SQL functions, temp-table semantics | one small `Dialect` facade; catalog rows stay separate | `lexdb_tsql*` / `lexdb_tds`; `sys.*` rows and the metadata binder moved into `lexdb_syscat` |
+| **`lexdb_oracle`** | PL/SQL, TNS, Oracle data dictionary, functions/types, error text | one small `Dialect` facade; catalog rows stay separate | `lexdb_plsql` / `lexdb_tns`; the data-dictionary rows moved into `lexdb_oracat` |
 
 `lexdb_page`, `lexdb_cols` and `lexdb_repl` are **internal** to Store,
 Rows and the dialects. They are not public modules.
@@ -241,13 +247,14 @@ stay inside a module and the caller pays one dispatch, not one per value.
    deleted (its measured overhead outweighed the encode). `ckptLocked` is
    still the cancelled-cut fallback.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
-   the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
-   PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
-   and expression deparser. `lexdb_dialect` now holds the parser-facing
-   facts (T-SQL type codes, SERVERPROPERTY, the view/relation names), so
-   `lexdb_sql` imports `lexdb_dialect` (not a behavior dialect) and a
-   dialect module may import `lexdb_sql`. `lexdb_catalog` imports both. The PG catalog generators, wire/auth and the
-   `Dialect` facade remain.
+   the common plan; no dialect branches in exec. Progress: `lexdb_pg`,
+   `lexdb_syscat` and `lexdb_oracat` own their type mappings, catalog rows
+   and catalog text; `lexdb_dialect` holds the parser-facing facts (T-SQL
+   type codes, SERVERPROPERTY, view/relation names), so `lexdb_sql` never
+   imports a behavior dialect. `lexdb_catalog` holds the shared CatView and
+   metadata. Wire/auth and the small connection-time `Dialect` facade
+   remain; exec's exact dialect imports are the import gate's shrinking
+   exception list.
 6. **ExecStrategy / one batch driver.** Sink and fallback policies; one
    `BPlan` builder; compiled expressions and typed sort always on.
 7. **One expression IR.** Scalar and vector backends; delete `BNode` /
@@ -265,7 +272,7 @@ compatibility, the flat free list and CUT_POOL are gone; a table leaf is
 always a column leaf (`C_ANY` holds whole rows when the typed columns
 cannot). `ckptLocked` is still the fallback for a cancelled cut. The
 parser/dialect cycle is broken and the dialect modules own their type
-mappings and PG catalog text; the catalog generators, wire/auth and the
+mappings, catalog rows and catalog text; wire/auth and the small
 `Dialect` facade are next. The executor phases (ExecStrategy, one
 expression IR, the chunked pipeline, the planner) change hot loops and
 need the benchmark A/B at each step.
