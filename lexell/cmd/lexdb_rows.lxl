@@ -81,12 +81,6 @@ pub type Rows = value record {
     pub lays: &[]FixedLay
 }
 
-// Rows written as before 9.113: their places of the kinds 9.113 added are
-// text places (a test's look at an old catalog row).
-var legacyKinds: bool = false
-
-pub fn setLegacyKinds(on: bool) { legacyKinds = on }
-
 // Each place's kind, from its column's type.
 pub fn placeKinds(r: &Rows): []byte {
     var out: []byte = array(r.width, PK_NONE)
@@ -111,7 +105,6 @@ pub fn placeKind(c: &lexdb_sql.ColDef): byte {
     else if o == lexdb_sql.OID_FLOAT4 { k = PK_F4 }
     else if o == lexdb_sql.OID_UUID { k = PK_UUID }
     else if o == lexdb_sql.OID_BYTEA { k = PK_BYTEA }
-    if legacyKinds && k >= PK_DATE { k = PK_TEXT }
     return k
 }
 
@@ -214,16 +207,6 @@ pub fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] {
     }
 }
 
-// Whether a table's stored current layout (old) is the layout the table
-// would have now (cur) but for places of a kind 9.113 added, which old
-// has as text places: rows are then written in old, as they were before
-// (a value of the new kinds then makes its row tagged).
-pub fn olderKinds(old: &[]byte, cur: &[]byte): bool {
-    if len(old) != len(cur) { return false }
-    for i in 0..len(old) { if old[i] != cur[i] && !(old[i] == PK_TEXT && cur[i] >= PK_DATE) { return false } }
-    return true
-}
-
 // Whether integer v fits a place of kind k.
 fn intFits(k: byte, v: int): bool {
     if k == PK_INT { return true }
@@ -250,8 +233,7 @@ pub fn encodeFixed(r: &Rows, places: &[]Val): Option[str] {
     let kinds = &r.layouts[nl - 1]
     let n = len(kinds)
     if n > 255 || len(places) != n { return None }
-    // the table as it stands must have this layout as its current one (or
-    // one stored before 9.113's kinds: olderKinds)
+    // the table as it stands must have this layout as its current one
     if !kindsFit(r, kinds) { return None }
     // first the values checked against their places, and the variable
     // part's size; a numeric's or a uuid's bytes made once (conv)
@@ -350,10 +332,9 @@ pub fn encodeFixed(r: &Rows, places: &[]Val): Option[str] {
     return Some(strFromBytes(&b))
 }
 
-// Whether kinds is the table's current layout (placeKinds), or one stored
-// before 9.113's kinds (olderKinds), without making placeKinds' array:
-// every column's place of its kind (or text for an older one), and every
-// other place none.
+// Whether kinds is the table's current layout (placeKinds), without making
+// placeKinds' array: every column's place of its kind, and every other
+// place none.
 pub fn kindsFit(r: &Rows, kinds: &[]byte): bool {
     if len(kinds) != r.width { return false }
     var none = 0
@@ -362,7 +343,7 @@ pub fn kindsFit(r: &Rows, kinds: &[]byte): bool {
     for i in 0..len(r.cols) {
         let k = placeKind(&r.cols[i])
         let have = kinds[if len(r.slots) == 0 { i } else { r.slots[i] }]
-        if have != k && !(have == PK_TEXT && k >= PK_DATE) { return false }
+        if have != k { return false }
     }
     return true
 }
@@ -406,27 +387,8 @@ pub fn decodeFixed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]Fix
     return Ok(out)
 }
 
-// Whether s, beginning with FIXED, is a tagged row whose first value is a
-// time, written before 9.115 (lexdb_cols.timeTagged), in a table of these
-// layouts.
-pub fn timeTaggedLays(s: &str, lays: &[]FixedLay): bool {
-    var tf = false
-    for l in lays { if len(l.kinds) > 0 && l.kinds[0] == PK_TIME { tf = true } }
-    if !tf { return false }
-    var ks: [][]byte = []
-    for l in lays {
-        var k: []byte = []
-        for x in l.kinds { append(mut &k, x) }
-        append(mut &ks, k)
-    }
-    return lexdb_cols.timeTagged(s, &ks)
-}
-
-// Whether s is a row in the fixed layout of table r (not tagged; 9.115).
-pub fn isFixedRow(s: &str, r: &Rows): bool {
-    if len(s) == 0 || s[0] != FIXED { return false }
-    return !(lexdb_cols.timeFirst(&r.layouts) && lexdb_cols.timeTagged(s, &r.layouts))
-}
+// Whether s is a row in a fixed layout (not tagged; 9.115).
+pub fn isFixedRow(s: &str): bool { return len(s) > 0 && s[0] == FIXED }
 
 // The layout of rows with these places' kinds.
 pub fn layOfKinds(kinds: &[]byte): FixedLay {
@@ -449,12 +411,6 @@ pub fn layOfKinds(kinds: &[]byte): FixedLay {
     }
     return FixedLay{kinds: ks, off: off, prev: prev, bm: bm, v0: at}
 }
-
-// Rows written as before 9.115: a tagged row whose first value is a time
-// beginning with its tag (a test's way to write what older builds wrote).
-var legacyTimeRows: bool = false
-
-pub fn setLegacyTimeRows(on: bool) { legacyTimeRows = on }
 
 // Rows written in the fixed layout when every value fits it (9.50); a test
 // turns this off to write the tagged form and compare the two.
@@ -616,7 +572,7 @@ pub fn encodeRow(row: &[]Val): str {
     }
     // a row whose first value is a time would begin with its tag, 8, which
     // is FIXED: in the long form instead, which begins with 6 (9.115)
-    if len(row) > 0 && !legacyTimeRows {
+    if len(row) > 0 {
         match row[0] {
             Val.Time(_) { long = true }
             else {}
@@ -795,7 +751,7 @@ pub fn rowHead(s: &str): int {
 // decoded (9.31).
 // lays: the row's table's layouts (Table.lays), for a row in the fixed form.
 pub fn decodeRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] {
-    if len(s) > 0 && s[0] == FIXED && !timeTaggedLays(s, lays) { return decodeFixed(s, n, need, missing, lays) }
+    if len(s) > 0 && s[0] == FIXED { return decodeFixed(s, n, need, missing, lays) }
     var out: []Val = []
     var at = 0
     let some = len(need) > 0
@@ -1074,7 +1030,7 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
     let kinds = &bp.kinds
     let placeCol = &bp.placeCol
     let missing = &bp.missing
-    if isFixedRow(s, rw) {
+    if isFixedRow(s) {
         // one load per column used, at its offset (9.50)
         let lay = &rw.lays[try layOf(s, rw.lays)]
         let np = len(lay.kinds)
@@ -1175,8 +1131,7 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
 // fixed layout).
 pub fn fixedRunRows(leaf: &LeafView, from: int, to: int, rw: &Rows): Result[[]&str, DbErr] {
     let s0 = leafValAt(leaf, from)
-    if len(s0) < 3 || !isFixedRow(s0, rw) { return Ok([]) }
-    let tf = lexdb_cols.timeFirst(rw.layouts)
+    if !isFixedRow(s0) { return Ok([]) }
     let id = try layOf(s0, rw.lays)
     let lay = &rw.lays[id]
     let id0 = s0[1]
@@ -1188,7 +1143,6 @@ pub fn fixedRunRows(leaf: &LeafView, from: int, to: int, rw: &Rows): Result[[]&s
     while end < to {
         let s = leafValAt(leaf, end)
         if len(s) < v0 || s[0] != FIXED || s[1] != id0 || s[2] != id1 { break }
-        if tf && lexdb_cols.timeTagged(s, rw.layouts) { break }
         append(mut &rows, s)
         end += 1
     }

@@ -9,11 +9,6 @@
 //   so does one from after a leaf's last change and before the layout its
 //   rows are converted to (it reads the leaf's version from before). An
 //   ALTER in a block that rolls back: no row is converted to its layout.
-// - A table made before 9.113 (setLegacyKinds): its rows with a date are
-//   tagged, and its leaves stay rows (a date does not go in its layout's
-//   text place). Opened again (bootstrap), its catalog gets the layout of
-//   its kinds now; new rows take it, and VACUUM rewrites its tagged rows'
-//   leaves in it (a snapshot from before reads the rows as they were).
 // - Rows that do not convert stay rows: a leaf with a long text, a table
 //   with an interval. Tried once: a second VACUUM, and scans, do not try
 //   them again.
@@ -25,14 +20,10 @@
 // expect: snapshot: same as before true
 // expect: snapshot of mixed leaves: same as before true; by layout: 2:600 of 3 layouts
 // expect: rolled back: 600|1800; by layout: 1:600 of 2 layouts; queries 6 of 6 the same
-// expect: old table: no column leaves true; by layout: tagged:1500 of 1 layouts
-// expect: upgraded: tables 1; new row fixed: 1:1 tagged:1500 of 2 layouts
-// expect: snapshot of the old table: same as before true
-// expect: vacuumed old: leaves 0 rows; by layout: 1:1501 of 2 layouts; queries 6 of 6 the same
 // expect: kept as rows: long text leaf rows true, interval table no column leaves true; failed true; tried again false; queued after scans 0
 // expect: vacuum: before 0 cols; after 0 rows; queries 6 of 6 the same; vacuum analyze VACUUM
 // expect: queue: queued true; after one checkpoint 10 cols; after two 20 cols; after all 0 rows
-// expect: reopened: queries 6 of 6 the same
+// expect: reopened: queries 5 of 5 the same
 // expect: different 0
 import "strings"
 import "../../../cmd/lexdb_store"
@@ -181,32 +172,6 @@ fn body(sa: lexdb_store.Store, sb: lexdb_store.Store) {
     let z4 = q(mut &z, &"rollback")
     println("rolled back: " + z3 + "; by layout: " + lexdb_exec.rowLayouts(&sa, &"m3") + "; queries " + compare(mut &a, mut &b, &"m3").toStr() + " of 6 the same")
 
-    // ---- a table made before 9.113
-    lexdb_exec.setLegacyKinds(true)
-    let c2 = both(mut &a, mut &b, &"create table old (id int primary key, a int, d date, f float8, t text)")
-    lexdb_exec.setLegacyKinds(false)
-    let i3 = both(mut &a, mut &b, &("insert into old select g, g % 100, date '2020-01-01' + g, g * 1.5, 'x' || g from generate_series(1, 1500) g"))
-    ck(&sa, &sb)
-    println("old table: no column leaves " + (colsOf(&lexdb_exec.leafKinds(&sa, &"old")) == 0).toStr() + "; by layout: " + lexdb_exec.rowLayouts(&sa, &"old"))
-    // opened again: its catalog row given the layout of its kinds now
-    var x6 = lexdb_exec.newSession(sa)
-    let x7 = q(mut &x6, &"begin")
-    let before3 = q(mut &x6, &"select count(*), sum(a), min(d), sum(f) from old")
-    let up = lexdb_exec.upgradeLayouts(&sa).unwrap()
-    let upb = lexdb_exec.upgradeLayouts(&sb).unwrap()
-    lexdb_exec.bootstrap(&sa).unwrap()
-    var a2s = lexdb_exec.newSession(sa)
-    let i4 = q(mut &a2s, &"insert into old values (1501, 1, '2024-02-02', 2.5, 'new')")
-    let i4b = q(mut &b, &"insert into old values (1501, 1, '2024-02-02', 2.5, 'new')")
-    let rl = lexdb_exec.rowLayouts(&sa, &"old")
-    println("upgraded: tables " + up.toStr() + "; new row fixed: " + rl)
-    let v1 = both(mut &a, mut &b, &"vacuum old")
-    let after3 = q(mut &x6, &"select count(*), sum(a), min(d), sum(f) from old")
-    let x8 = q(mut &x6, &"commit")
-    println("snapshot of the old table: same as before " + (before3 == after3 && !strings.startsWith(&before3, "ERROR")).toStr())
-    println("vacuumed old: leaves " + rowsOf(&lexdb_exec.leafKinds(&sa, &"old")).toStr() + " rows; by layout: " + lexdb_exec.rowLayouts(&sa, &"old") +
-            "; queries " + compare(mut &a, mut &b, &"old").toStr() + " of 6 the same")
-
     // ---- rows that do not convert
     let c3 = both(mut &a, mut &b, &"create table lt (id int primary key, a int, t text)")
     let i5 = both(mut &a, mut &b, &"insert into lt select g, g % 50, 'short ' || g from generate_series(1, 2000) g")
@@ -281,7 +246,7 @@ fn main() {
             var a = lexdb_exec.newSession(sa)
             var b = lexdb_exec.newSession(sb)
             var same = 0
-            for t in ["m", "old", "lt", "iv", "v", "w"] {
+            for t in ["m", "lt", "iv", "v", "w"] {
                 let ra = q(mut &a, &("select * from " + t + " order by id"))
                 let rb = q(mut &b, &("select * from " + t + " order by id"))
                 if ra == rb && !strings.startsWith(&ra, "ERROR") { same += 1 } else {
@@ -289,7 +254,7 @@ fn main() {
                     println("DIFFERENT after the crash: " + t)
                 }
             }
-            println("reopened: queries " + same.toStr() + " of 6 the same")
+            println("reopened: queries " + same.toStr() + " of 5 the same")
             return 0
         })
         return 0

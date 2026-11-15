@@ -18,9 +18,10 @@ written now reaches the same batch decoder through synthetic leaves
 `scanLeaves` always yields `LeafView`s and has no false fallback; a key
 lookup or an empty range is the only separate batch path (`fillPoint`).
 `lexdb_pg` has started the PG dialect: identifier and name rendering, OID
-mapping, catalog row helpers and the expression deparser. The universal
-column leaf, the old-format deletion, the rest of `ReadView`, the rest of
-the dialect port and the executor/planner phases remain.
+mapping, catalog row helpers and the expression deparser. The T_LEAF page
+format and the pre-9.113/9.115 layout and time-tagged row compatibility are
+deleted. The universal column leaf, the rest of `ReadView`, the rest of the
+dialect port and the executor/planner phases remain.
 
 ## 1. Why this exists
 
@@ -201,14 +202,14 @@ stay inside a module and the caller pays one dispatch, not one per value.
 2. **Rows / codec.** Progress: `encodeLeaf`, the fixed row codec, the
    tagged/long row codec, `encodeRowOf`, the column body codec, `Projection`,
    the batch decoders and `Spec` are moved; the `LEXDB_COLUMNS` production
-   switch is deleted (setColumns remains the test hook); `LeafView` is the page-to-codec
+   switch, T_LEAF, olderKinds and the legacy time-tagged rows are deleted
+   (setColumns and setFixedRows remain test hooks); `LeafView` is the page-to-codec
    adapter. `page` imports `rows`, and `cols` is below both. Exec keeps thin
    adapters, `rowOf`/`placesOf` (large-value I/O), table metadata and the
    lazy two-step orchestration over `LeafView`; it imports only `rows` and
    `store`. Next: the universal column leaf, one layout per leaf, overflow
-   for long/odd values (`C_ANY` / `C_STUB`), and the deletion of `T_LEAF`,
-   the old layout compatibility, the tagged-row general form and
-   mixed-layout leaves.
+   for long/odd values (`C_ANY` / `C_STUB`), and the deletion of the
+   tagged-row general form and mixed-layout leaves.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
    follower base+delta; replica batch scans. Progress: `scanLeaves` always
    yields `LeafView`; a replica or own-write range is gathered by
@@ -235,10 +236,10 @@ stay inside a module and the caller pays one dispatch, not one per value.
 Phases 2 and 3 are designed together; implement Rows first. Phase 5 can run
 in parallel once the port is stable. Phases 6–8 are sequential.
 
-**Where this branch stops.** The next steps are deliberately not taken
-while the background benchmarks run. The format deletions (T_LEAF, old
-layouts, the tagged general form, the flat free list) change bytes and
-need the old binary as the control. `ckptLocked` is still the fallback for
+**Where this branch stands.** The T_LEAF page format and the pre-9.113/9.115
+compatibility are gone. The remaining format work (the universal column
+leaf, `C_ANY`/`C_STUB`, the tagged general form and mixed-layout leaves,
+the flat free list) changes bytes and needs the old binary as the control. `ckptLocked` is still the fallback for
 a cancelled cut. The dialect port's root blocker is `lexdb_sql` importing
 `lexdb_pgcat`/`lexdb_syscat`/`lexdb_oracat` for parser tables; breaking
 that cycle comes before moving the catalog generators, wire/auth and the

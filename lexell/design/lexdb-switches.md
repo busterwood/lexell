@@ -29,13 +29,13 @@ No new runtime flag without a named seam and a deletion phase.
 
 | Item | What it is | Class | Target | Phase |
 |---|---|---|---|---|
-| `T_LEAF` reader/writer | pre-9.109 page format | delete | — | 2 |
+| `T_LEAF` reader/writer | pre-9.109 page format | deleted | — | done |
 | tagged row (general) | pre-9.50 row format; long/odd values | seam | `Rows`: fixed + `C_ANY`/`C_STUB` overflow | 2 |
 | `LEXDB_ROWFMT` | tagged vs fixed A/B | deleted | `setFixedRows` remains as the test hook | done |
 | `LEXDB_COLUMNS` | row vs column leaf A/B | deleted | old binary for A/B; `setColumns` remains the test hook | done |
 | `LEXDB_COLCHECK` | codec self-check | test-only | `Rows` test hook | test build |
-| `olderKinds`, `upgradeLayouts`, `setLegacyKinds` | pre-9.113 layouts | delete | — | 2 |
-| `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | delete | — | 2 |
+| `olderKinds`, `upgradeLayouts`, `setLegacyKinds` | pre-9.113 layouts | deleted | — | done |
+| `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | deleted | — | done |
 | flat free list in the meta page | pre-runs free encoding | delete | runs only | 4 |
 | `st.fo` | live vs follower read view | seam | `ReadView` (batch-level) | 3 |
 | `scanLeaves` returning false on a follower | leaf representation leaking to exec | deleted | `LeafView` + `scanLeavesMerged`; one `ReadView` selection remains | 3 |

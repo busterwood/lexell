@@ -3062,8 +3062,6 @@ fn succ(s: &str): str {
 // them stay at the row's start, which a large row keeps in its leaf.
 const LONG: int = lexdb_rows.LONG
 
-pub fn setLegacyTimeRows(on: bool) { lexdb_rows.setLegacyTimeRows(on) }
-
 // ---- uuid and bytea (9.78)
 
 extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
@@ -4982,34 +4980,6 @@ fn seenTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Table
     return Ok(tabs)
 }
 
-// Tables whose stored current layout is from before 9.113 (olderKinds:
-// text places where dates, times, floats, uuids and byteas are now) are
-// given the layout of their kinds now, as DDL gives it (encTable), in one
-// transaction (9.114): their new rows then take the new kinds, and their
-// leaves of older rows are converted to it as checkpoints write them.
-// At open, on a primary.
-pub fn upgradeLayouts(st: &lexdb_store.Store): Result[int, DbErr] {
-    if st.isReplica() { return Ok(0) }
-    var txn = lexdb_store.begin()
-    let tabs = try seenTables(st, mut &txn)
-    var n = 0
-    for t in tabs {
-        let nl = len(t.layouts)
-        if nl == 0 { continue }
-        let cur = placeKinds(&t)
-        if sameKinds(&t.layouts[nl - 1], &cur) || !olderKinds(&t.layouts[nl - 1], &cur) { continue }
-        try putTable(mut &txn, &t)
-        n += 1
-    }
-    if n == 0 {
-        st.abort(txn)
-        return Ok(0)
-    }
-    try bumpCatalog(st, mut &txn)
-    try st.commit(txn)
-    return Ok(n)
-}
-
 // VACUUM (9.114): the named tables' leaves, or every table's, made column
 // leaves where their rows allow (lexdb_store.upgradeTree), a checkpoint
 // after each VACUUM_STEP leaves converted.
@@ -5075,8 +5045,6 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
     }
     // temporary objects left by a crash (9.96); a replica's go with the master's
     if !st.isReplica() { try dropLeftTemps(st) }
-    // tables of layouts from before 9.113 (9.114)
-    let up = try upgradeLayouts(st)
     return Ok(Unit{})
 }
 
@@ -27614,7 +27582,7 @@ pub fn countFixedRows(st: &lexdb_store.Store, name: &str): int {
     match found {
         Some(t) {
             let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if isFixedRow(&en.val, &t) { n += 1 }
+                if isFixedRow(&en.val) { n += 1 }
                 return true
             })
         }
@@ -27638,7 +27606,7 @@ pub fn rowLayouts(st: &lexdb_store.Store, name: &str): str {
             nl = len(t.layouts)
             counts = array(nl, 0)
             let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if len(en.val) > 2 && isFixedRow(&en.val, &t) {
+                if len(en.val) > 2 && isFixedRow(&en.val) {
                     let id = binary.readU16LEStr(&en.val, 1)
                     if id < len(counts) { counts[id] += 1 }
                 } else {
@@ -27709,10 +27677,6 @@ pub fn treeDump(st: &lexdb_store.Store, name: &str): str {
     return strings.join(&out, "; ")
 }
 
-// Places of 9.113's kinds as text places, as before 9.113 (a test's look
-// at a table whose layout was stored then: olderKinds).
-pub fn setLegacyKinds(on: bool) { lexdb_rows.setLegacyKinds(on) }
-
 fn rowsFor(t: &Table): lexdb_rows.Rows {
     return lexdb_rows.Rows{layouts: &t.layouts, cols: &t.cols, slots: &t.slots, width: rowWidth(t), lays: &t.lays}
 }
@@ -27725,7 +27689,6 @@ fn isWordKind(k: byte): bool { return lexdb_rows.isWordKind(k) }
 fn isVarKind(k: byte): bool { return lexdb_rows.isVarKind(k) }
 fn wordVal(k: byte, w: int): Val { return lexdb_rows.wordVal(k, w) }
 fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] { return lexdb_rows.varVal(k, s, a, b) }
-fn olderKinds(old: &[]byte, cur: &[]byte): bool { return lexdb_rows.olderKinds(old, cur) }
 fn readIntK(s: &str, at: int, k: byte): int { return lexdb_rows.readIntK(s, at, k) }
 fn encFixed(t: &Table, places: &[]Val): Option[str] { let r = rowsFor(t); return lexdb_rows.encodeFixed(&r, places) }
 fn kindsFit(t: &Table, kinds: &[]byte): bool { let r = rowsFor(t); return lexdb_rows.kindsFit(&r, kinds) }
@@ -27733,8 +27696,7 @@ type FixedLay = lexdb_rows.FixedLay
 fn layOf(s: &str, lays: &[]FixedLay): Result[int, DbErr] { return lexdb_rows.layOf(s, lays) }
 fn fixedVal(s: &str, p: int, k: byte, lay: &FixedLay): Result[Val, DbErr] { return lexdb_rows.fixedVal(s, p, k, lay) }
 fn decFixed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] { return lexdb_rows.decodeFixed(s, n, need, missing, lays) }
-fn timeTaggedLays(s: &str, lays: &[]FixedLay): bool { return lexdb_rows.timeTaggedLays(s, lays) }
-fn isFixedRow(s: &str, t: &Table): bool { let r = rowsFor(t); return lexdb_rows.isFixedRow(s, &r) }
+fn isFixedRow(s: &str): bool { return lexdb_rows.isFixedRow(s) }
 fn layOfKinds(kinds: &[]byte): FixedLay { return lexdb_rows.layOfKinds(kinds) }
 
 // ---- pg_catalog and information_schema (9.80)
