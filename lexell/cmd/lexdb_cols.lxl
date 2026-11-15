@@ -4,11 +4,12 @@
 // The store keeps a changed leaf as rows (lexdb_page.Node's keys and vals)
 // and encodes it here when a checkpoint writes it; the page is then a
 // column leaf (lexdb_page T_CLEAF), and so is the node in memory until it
-// changes again. Every row of a column leaf is in the fixed layout of 9.50
-// (lexdb_exec encFixed), all of one layout; the encoder takes a leaf only
-// when every row parses in it to the byte (encodeRows), so the rows rebuilt
-// from the columns (rowOf, allRows) are the rows given, byte for byte, and
-// a reader that wants a row's bytes is given them.
+// changes again. A column leaf's rows are in the fixed layout of 9.50
+// (lexdb_exec encFixed), all of one layout, when the encoder can take them
+// to the byte (encodeRows); the rows rebuilt from the columns (rowOf,
+// allRows) are then the rows given. A leaf the typed columns cannot take
+// (a tagged or long row, a value stored apart, mixed layouts) is the
+// C_ANY form: one place holding each row's bytes as they were.
 //
 // The store knows nothing of types: the executor gives it, per table tree,
 // its layouts (each a kind per place), and the page keeps the kinds of the
@@ -417,7 +418,27 @@ pub fn encodeAny(rows: &[]&str): Option[str] {
         binary.appendU16LE(mut &cols, end)
     }
     for r in rows { appendStr(mut &cols, r) }
-    return Some(strFromBytes(&cols))
+    let out = strFromBytes(&cols)
+    if checking() { checkAny(&out, rows) }
+    return Some(out)
+}
+
+// The check's (checking()): a C_ANY leaf decoded again gives its rows back.
+fn checkAny(s: &str, rows: &[]&str) {
+    let dir = match parse(s, len(rows)) {
+        Some(d) { d }
+        None { panic("a C_ANY leaf does not parse") }
+    }
+    if !isAny(s, &dir) { panic("a C_ANY leaf does not read as one") }
+    var ends: []int = array(len(rows), 0)
+    let back = allRows(s, &dir, mut &ends)
+    var at = 0
+    for i in 0..len(rows) {
+        if ends[i] - at != len(rows[i]) || back[at..ends[i]] != rows[i] {
+            panic("a C_ANY leaf changed row " + i.toStr())
+        }
+        at = ends[i]
+    }
 }
 
 pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
@@ -639,7 +660,8 @@ fn encodeOne(rows: &[]&str, spec: &Spec): Option[str] {
 //   own kind (a tagged numeric's text as Decimal.toBin), a text, bytea or
 //   numeric only under LONG bytes.
 // A value that does not go (an interval, a long text, a date outside int32,
-// a text where a date is now, an integer too wide) leaves the leaf in rows.
+// a text where a date is now, an integer too wide) makes the leaf a C_ANY
+// column of its rows (encodeAny), not a leaf of rows.
 
 const LONG = 256        // lexdb_exec LONG: a text this long or longer makes its row tagged
 

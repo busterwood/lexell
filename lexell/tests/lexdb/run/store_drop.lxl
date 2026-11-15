@@ -16,7 +16,9 @@
 //   memory had their heights, it read the leaves under them: 41.)
 // - b's rows written again: the file does not grow.
 // - A file whose free pages are a flat list, as before runs (9.33): it
-//   opens with them as runs, and its next checkpoint writes runs.
+//   opens (the old field is ignored), its rows are intact, and the flat
+//   list's pages leak: they are not free and a checkpoint does not reuse
+//   them.
 // - Crashes at random points of a drop and its walk, with commits to tree
 //   a going on: each recovers with nothing lost or freed twice, and a's rows
 //   all there (some crashes come with the walk partway done).
@@ -25,13 +27,14 @@
 // expect: reopened: still to free yes, checkpoints to free it 8
 // expect: walked: pages 747: trees 1 1, dropped 0, free 744 in 2 runs, lists 2, lost 0, twice 0; internal 0
 // expect: refilled: file grew no
-// expect: a flat free list: pages 748: trees 3 737, dropped 0, free 9 in 0 runs, lists 2, lost 0, twice 0; internal 23
-// expect: opened: free 9 in 3 runs; written again: pages 748: trees 3 737, dropped 0, free 9 in 4 runs, lists 2, lost 0, twice 0; internal 23
+// expect: a flat free list: pages 748: trees 3 737, dropped 0, free 0 in 0 runs, lists 1, lost 10, twice 0; internal 23
+// expect: opened: free 0 in 0 runs; written again: pages 751: trees 3 737, dropped 0, free 2 in 2 runs, lists 2, lost 10, twice 0; internal 23
 // expect: crashes 12: ok 12, with the walk partway done some
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_page"
+import "binary"
 import "strings"
 
 fn opts(): lexdb_store.Options {
@@ -83,7 +86,7 @@ fn toFlat(fs: lexdb_disk.Fs) {
     let f = fs.open(lexdb_store.DATA, false).unwrap()
     var b = array(4096, byte(0))
     var at = -1
-    var m = lexdb_page.Meta{ckpt: -1, npages: 0, roots: 0, free: 0, replaySeg: 0, replayOff: 0, replayBatch: 0, nextTree: 0, dropped: 0, runs: 0, covers: -1}
+    var m = lexdb_page.Meta{ckpt: -1, npages: 0, roots: 0, replaySeg: 0, replayOff: 0, replayBatch: 0, nextTree: 0, dropped: 0, runs: 0, covers: -1}
     for i in 0..2 {
         f.read(i * 4096, mut &b[0..4096], 4096).unwrap()
         match lexdb_page.decodeMeta(&b, i) {
@@ -110,9 +113,15 @@ fn toFlat(fs: lexdb_disk.Fs) {
     let enc = lexdb_page.encodeList(&flat, &pages)
     for i in 0..len(pages) { f.write(pages[i] * 4096, &enc[i]).unwrap() }
     m.npages += len(pages)
-    m.free = pages[0]
     m.runs = 0
-    f.write(at * 4096, &lexdb_page.encodeMeta(&m, at)).unwrap()
+    // The old field is at offset 48, which encodeMeta reserves as 0; patch
+    // it and the checksum by hand. This is the old file's one writer.
+    var mb = lexdb_page.encodeMeta(&m, at)
+    let free = pages[0]
+    for k in 0..8 { mb[48 + k] = byte((free >> (8 * k)) & 0xff) }
+    let c = lexdb_base.crc32c(&mb, 4, 4096)
+    binary.setU32LE(mut &mb, 0, int(c))
+    f.write(at * 4096, &mb).unwrap()
     f.flush().unwrap()
     f.close()
 }

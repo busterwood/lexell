@@ -17,7 +17,9 @@ only `rows` and `store` for data. A replica or a range the transaction has
 written now reaches the same batch decoder through synthetic leaves
 (`scanLeavesMerged`), so the follower's scan is no longer row-at-a-time.
 `scanLeaves` always yields `LeafView`s and has no false fallback; a key
-lookup or an empty range is the only separate batch path (`fillPoint`).
+lookup or an empty range is the only separate point path (`fillPoint`). A
+C_ANY leaf is decoded a row at a time (`layoutOk` false), as the tagged
+form was.
 `lexdb_pg` has started the PG dialect: identifier and name rendering, OID
 mapping, catalog row helpers and the expression deparser. The T_LEAF page
 format and the pre-9.113/9.115 layout and time-tagged row compatibility are
@@ -73,14 +75,16 @@ One rule:
 
 ## 3. Modules
 
-`lexdb_core` is the shared vocabulary, not a behavior module: `Val`,
-`DbErr`, `TypeName`, `Stmt`, and the `Catalog` / `Plan` interfaces. Keep it
-small; behavior belongs in the deep modules.
+`lexdb_core` is the intended shared vocabulary, not a behavior module:
+`Val`, `DbErr`, `TypeName`, `Stmt`, and the `Catalog` / `Plan` interfaces.
+It is not extracted yet: today `lexdb_sql` holds the vocabulary, and `rows`
+and `catalog` import it. Keep the eventual module small; behavior belongs in
+the deep modules.
 
 | Module | Secret it hides | Interface | Leak today |
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | 12 read operations; `Node` callbacks; `st.fo` at many sites |
-| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
+| **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows` (exec's `rowsFor`), `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
 | **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | started: the shared metadata types (Table, Index, constraints, CatSnap, sequences, enums, table types) moved; the behavior lives in exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
@@ -241,8 +245,8 @@ stay inside a module and the caller pays one dispatch, not one per value.
    PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
    and expression deparser. `lexdb_dialect` now holds the parser-facing
    facts (T-SQL type codes, SERVERPROPERTY, the view/relation names), so
-   `lexdb_sql` no longer imports a dialect module and a dialect module may
-   import `lexdb_sql`. The PG catalog generators, wire/auth and the
+   `lexdb_sql` imports `lexdb_dialect` (not a behavior dialect) and a
+   dialect module may import `lexdb_sql`. `lexdb_catalog` imports both. The PG catalog generators, wire/auth and the
    `Dialect` facade remain.
 6. **ExecStrategy / one batch driver.** Sink and fallback policies; one
    `BPlan` builder; compiled expressions and typed sort always on.

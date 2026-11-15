@@ -10,12 +10,12 @@
 // - Then two copies get the same writes (rows changed, a column added,
 //   most rows written again in its layout), one writing column leaves and
 //   one rows only, and are checkpointed: the first then has column leaves
-//   beside the old leaves (a leaf holding rows of two layouts stays rows);
-//   the queries agree, and agree again, with the follower's reads, after
-//   reopening.
+//   beside the old leaves (a leaf whose rows of two layouts cannot convert
+//   is a C_ANY column); the queries agree, and agree again, with the
+//   follower's reads, after reopening.
 // expect: 61 opened: leaves T_FLEAF true T_CLEAF false; queries as at 61d57286 true; follower ok true
-// expect: 61 written: leaves T_FLEAF true T_CLEAF true; same as rows only true
-// expect: 61 reopened: same true; follower ok true
+// expect: 61 written: leaves T_FLEAF true T_CLEAF true; m whole leaves true; same as rows only true
+// expect: 61 reopened: m whole leaves true; same true; follower ok true
 import "os"
 import "fs"
 import "io"
@@ -111,6 +111,8 @@ fn materialize(dir: &str) {
 
 // The last checkpoint's leaves, by page type: read from the page file down
 // from its roots.
+fn wholeOf(k: &str): int { return strings.parseInt(strings.split(k, " ")[4]).unwrapOr(-1) }
+
 fn census(dir: &str): []int {
     let b = io.read(&(fs.join(&(dir.toStr()), lexdb_store.DATA))).unwrap()
     var best = -1
@@ -210,7 +212,9 @@ fn one() {
             println(w + " opened: " + censusText(&before) + "; queries as at 61d57286 " +
                     sameList(&got, &expected()).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
             for x in ["update m set a = a + 1 where id % 2 = 0 and id < 250", "alter table m add column g text",
-                      "update m set g = 'g' || id where id % 3 = 0 or id < 200", "insert into m (id, a, c, g) select g, g % 9, g, 'n' || g from generate_series(400, 460) g"] {
+                      "update m set g = 'g' || id where id % 3 = 0 or id < 200",
+                      "update m set t = repeat('z', 300) where id = 2",
+                      "insert into m (id, a, c, g) select g, g % 9, g, 'n' || g from generate_series(400, 460) g"] {
                 let ra = q(mut &a, &x)
                 let rb = q(mut &b, &x)
             }
@@ -218,7 +222,8 @@ fn one() {
             sb.checkpointAll().unwrap()
             let ga = runAll(mut &a, &more())
             let gb = runAll(mut &b, &more())
-            println(w + " written: " + censusText(&census(&da)) + "; same as rows only " + sameList(&ga, &gb).toStr())
+            println(w + " written: " + censusText(&census(&da)) + "; m whole leaves " +
+                    (wholeOf(&lexdb_exec.leafKinds(&sa, &"m")) > 0).toStr() + "; same as rows only " + sameList(&ga, &gb).toStr())
             return 0
         })
         return 0
@@ -231,7 +236,8 @@ fn one() {
             var b = lexdb_exec.newSession(sb)
             let ga = runAll(mut &a, &more())
             let gb = runAll(mut &b, &more())
-            println(w + " reopened: same " + sameList(&ga, &gb).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
+            println(w + " reopened: m whole leaves " + (wholeOf(&lexdb_exec.leafKinds(&sa, &"m")) > 0).toStr() +
+                    "; same " + sameList(&ga, &gb).toStr() + "; follower ok " + followerOk(&sa, &da).toStr())
             return 0
         })
         return 0

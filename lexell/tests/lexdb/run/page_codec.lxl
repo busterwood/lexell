@@ -7,7 +7,9 @@
 // through a checkpoint's body (nodeBody, bodyPage, repack) unchanged; and
 // no entry takes more bytes front coded than whole.
 // expect: leaf 3 a=1 bb=22 ccc=333 size 21
+// expect: old type 2 refused true
 // expect: lazy true lower 0 1 1 3 3; loosened 3 a=1 ccc=333 lazy false
+// expect: any column leaf true
 // expect: internal 2 kids 7 8 9 keys m t
 // expect: meta 5 120 9 6 10
 // expect: bad crc true wrong page true
@@ -21,6 +23,7 @@ import "binary"
 import "../../../cmd/lexdb_page"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_cols"
 
 // An index entry's key for value v and primary key k: 1, v as 8 bytes, k
 // as 8 bytes (lexdb_exec's encIdxPart and encKeyPart); its value is k's.
@@ -76,11 +79,36 @@ fn main() {
     lexdb_page.check(&b, 12, lexdb_page.T_ANY).unwrap()
     let d = lexdb_page.decodeNode(&b)
     println("leaf " + d.count().toStr() + " " + d.key(0) + "=" + d.val(0) + " " + d.key(1) + "=" + d.val(1) + " " + d.key(2) + "=" + d.val(2) + " size " + d.size.toStr())
+    // a page of the deleted T_LEAF format (type 2): refused, not read as an
+    // internal page
+    var old = array(len(b), byte(0))
+    for k in 0..len(b) { old[k] = b[k] }
+    old[12] = byte(2)
+    binary.setU64LE(mut &old, 4, 12)
+    let oc = lexdb_base.crc32c(&old, 4, 4096)
+    binary.setU32LE(mut &old, 0, int(oc))
+    println("old type 2 refused " + lexdb_page.check(&old, 12, lexdb_page.T_ANY).isErr().toStr())
     var l = lexdb_page.decodeNode(&b)
     let lw = l.lower(&"").toStr() + " " + l.lower(&"b").toStr() + " " + l.lower(&"bb").toStr() + " " + l.lower(&"ccc0").toStr() + " " + l.lower(&"d").toStr()
     let wasLazy = l.lazy
     l.loosen()
     println("lazy " + wasLazy.toStr() + " lower " + lw + "; loosened " + len(l.keys).toStr() + " " + l.keys[0] + "=" + l.vals[0] + " " + l.keys[2] + "=" + l.vals[2] + " lazy " + l.lazy.toStr())
+    // a whole-row column leaf (C_ANY): rows the typed columns cannot take
+    // keep their bytes, and the page decodes back to them
+    var an = lexdb_page.newLeaf()
+    append(mut &an.keys, "a"); append(mut &an.vals, "\x08\x00\x00\x01\x00\x00\x00\x00\x00\x05")
+    append(mut &an.keys, "b"); append(mut &an.vals, "\x01\x05xyz")
+    append(mut &an.keys, "c"); append(mut &an.vals, strings.repeat("q", 300))
+    match lexdb_page.colBody(&an, &lexdb_cols.specOf([[byte(1)]])) {
+        Some(cb) {
+            let cp = lexdb_page.bodyPage(true, 3, &cb, 31)
+            let cn = lexdb_page.decodeNode(&cp)
+            var anyOk = lexdb_page.isColBody(&cb) && cn.isCols() && lexdb_cols.isAny(&cn.cols, &cn.cdir)
+            for i in 0..3 { if lexdb_cols.rowOf(&cn.cols, &cn.cdir, i) != an.val(i) { anyOk = false } }
+            println("any column leaf " + anyOk.toStr())
+        }
+        None { println("any column leaf false") }
+    }
     var i = lexdb_page.newNode(false)
     i.keys = ["m", "t"]
     i.kids = [0, 1, 2]
@@ -88,7 +116,7 @@ fn main() {
     let ib = lexdb_page.encodeNode(&i, &pages, 13)
     let di = lexdb_page.decodeNode(&ib)
     println("internal " + len(di.keys).toStr() + " kids " + di.kids[0].toStr() + " " + di.kids[1].toStr() + " " + di.kids[2].toStr() + " keys " + di.keys[0] + " " + di.keys[1])
-    let m = lexdb_page.Meta{ckpt: 5, npages: 120, roots: 3, free: 4, replaySeg: 1, replayOff: 8192, replayBatch: 77, nextTree: 9, dropped: 6, runs: 10, covers: 76}
+    let m = lexdb_page.Meta{ckpt: 5, npages: 120, roots: 3, replaySeg: 1, replayOff: 8192, replayBatch: 77, nextTree: 9, dropped: 6, runs: 10, covers: 76}
     let mb = lexdb_page.encodeMeta(&m, 1)
     let back = lexdb_page.decodeMeta(&mb, 1).unwrap()
     println("meta " + back.ckpt.toStr() + " " + back.npages.toStr() + " " + back.nextTree.toStr() + " " + back.dropped.toStr() + " " + back.runs.toStr())
