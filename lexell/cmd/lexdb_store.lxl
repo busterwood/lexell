@@ -28,7 +28,6 @@ import "./lexdb_page"
 import "./lexdb_cols"
 import "./lexdb_rows"
 import "./lexdb_time"
-import "par"
 
 pub const DATA = "data.lxdb"
 const SPARE = "log.spare"
@@ -5199,8 +5198,8 @@ pub fn (st: &Store) checkpointAll(): Result[Unit, lexdb_base.DbErr] {
 // 9.136): a snapshot then (takeCut) keeps the version of every node a
 // commit changes afterwards, as it does for a reader, so the leaves are
 // encoded outside with, a few at a time in this task with a yield after
-// each step (or on the par pool: CUT_POOL, never on lexdb_disk.sim, so a
-// seed's run is the same every time), while commits run; only the cut,
+// each step (never on lexdb_disk.sim, so a seed's run is the same every
+// time), while commits run; only the cut,
 // each step's copy and install, and
 // the end (pages given out, inner nodes, lists: cutPages) hold the store.
 // A node changed after the cut stays changed, for the next checkpoint. A
@@ -5314,9 +5313,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             let check = c.check
             let specs = &c.specs
             var encs: []LeafEnc = []
-            if c.pool { encs = par.map(&jobs, fn(j: &LeafJob): LeafEnc { return encodeLeaf(j, specs, colsOn, check) }) } else {
-                for j in &jobs { append(mut &encs, encodeLeaf(j, specs, colsOn, check)) }
-            }
+            for j in &jobs { append(mut &encs, encodeLeaf(j, specs, colsOn, check)) }
             st.sh.with(fn(db: mut &Db) {
                 for x in at..end {
                     let j = x - at
@@ -5467,17 +5464,8 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
 // ---- the cut (9.136)
 
 const CUT_TRIES = 3         // cuts tried before a checkpoint is taken whole under one with
-const CUT_CHUNK = 64        // leaves encoded at a time on the par pool: about 2 ms of one core's (lexdb.md 9.136)
+const CUT_CHUNK = 64        // leaves encoded at a time (lexdb.md 9.136)
 const CUT_CHUNK_TASK = 2    // in the checkpointer's task: about 0.1 ms (a query's turn, TURN_NS), then a yield
-
-// Whether checkpoints encode on the par pool (setCutPool; LEXDB_CKPT_POOL=1).
-// Off by default (9.136): once the pool has started, every allocation and
-// string count of the process goes through the runtime's pool hooks (about
-// 5 us more CPU an update, measured), and on a server whose cores are all
-// busy (a master and its replicas, one core each) the pool's threads
-// preempt them: lag up to 33 ms. In the task, a step is 0.35 ms.
-var CUT_POOL: bool = false
-pub fn setCutPool(on: bool) { CUT_POOL = on }
 
 // A node a checkpoint writes, as it was at the cut: its slot (and the
 // slot's generation then), its tree and, a leaf of a table's, the index of
@@ -5500,12 +5488,11 @@ type CkCut = record {
     nodes: []CutNode; at: Map[int, int]
     specs: []lexdb_rows.Spec; colsOn: bool; check: bool
     chunk: int          // leaves encoded at a time (Db.cutChunk)
-    pool: bool          // encoded on the par pool: on a real disk (on lexdb_disk.sim, in the task, so a seed's run is the same every time)
 }
 
 fn emptyCut(): CkCut {
     return CkCut{snap: -1, seq: 0, target: 0, seg: 0, off: 0, batch: 0, nextTree: 0, freedLen: 0, dropped: [], ids: [], roots: [], rootDisk: [],
-               nodes: [], at: newMap(), specs: [], colsOn: false, check: false, chunk: CUT_CHUNK, pool: false}
+               nodes: [], at: newMap(), specs: [], colsOn: false, check: false, chunk: CUT_CHUNK}
 }
 
 // The cut's fields but its nodes: what lockedCut and takeCut share.
@@ -5543,11 +5530,10 @@ fn (db: mut &Db) takeCut(): CkCut {
     var c = db.cutHead(id)
     c.colsOn = db.colsOn()
     c.check = lexdb_cols.checking()
-    c.pool = CUT_POOL && db.fs.isReal()
     // (on lexdb_disk.sim, CUT_CHUNK in the task too: the tests' runs were set
     // with checkpoints that took their encode at once, and a step that size
     // is closer to it; setCutChunk sets fewer)
-    c.chunk = max(if c.pool || !db.fs.isReal() { db.cutChunk } else { min(db.cutChunk, CUT_CHUNK_TASK) }, 1)
+    c.chunk = max(if !db.fs.isReal() { db.cutChunk } else { min(db.cutChunk, CUT_CHUNK_TASK) }, 1)
     for i in 0..len(db.specs) {
         let sp = &db.specs[i]
         append(mut &c.specs, lexdb_rows.Spec{layouts: copyLayouts(&sp.layouts), fill: sp.fill.toStr(), fillOk: sp.fillOk})

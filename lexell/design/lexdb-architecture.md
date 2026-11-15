@@ -159,8 +159,9 @@ cheaper than after it ossifies.
 checkpoint under one `with` (`ckptLocked`) after `CUT_TRIES` or a cancelled
 snapshot. The target is one cut path with a retry; the locked path is a
 fallback to delete once `store_ckptcut` (including the cancelled-snapshot
-case) is proven. `CUT_POOL` is an opt-in encode experiment, not a module:
-keep it behind the encoder seam and delete it if it does not win.
+case) is proven. `CUT_POOL` was the parallel encode experiment; it was
+deleted after its measured overhead (the runtime's pool hooks and preempted
+replicas) outweighed the encode.
 
 ## 6. Performance kernels — do not cross
 
@@ -224,9 +225,9 @@ stay inside a module and the caller pays one dispatch, not one per value.
    remaining `st.fo` branches, and the follower's apply paths.
 4. **Checkpoint unification.** Cut-only; delete `ckptLocked`; decide
    `CUT_POOL`. Progress: the flat free list is gone (the meta page's runs
-   are the one encoding; the old slot is reserved); `CUT_POOL` still needs
-   its measurement decision, and `ckptLocked` is still the cancelled-cut
-   fallback.
+   are the one encoding; the old slot is reserved), and `CUT_POOL` is
+   deleted (its measured overhead outweighed the encode). `ckptLocked` is
+   still the cancelled-cut fallback.
 5. **Dialect port.** PG first, then MSSQL and Oracle. Normalise syntax into
    the common plan; no dialect branches in exec. Progress: `lexdb_pg` holds
    PostgreSQL's identifier/name rendering, OID mapping, catalog row helpers
@@ -289,7 +290,6 @@ commit, while background benchmarks are running.
 - Is `SET lexdb_batch=off` still user-facing, or test-only after the split?
 - Universal column leaves, or an explicit per-table row option for
   point-read-heavy tables?
-- Is `CUT_POOL` worth keeping after the encode is tunable?
 - Does `lexdb_catalog` earn its own module, or does it live inside Plan/Exec?
 - How much of the `Dialect` facade is needed before Oracle/Postgres
   differences stop being normalisable?
