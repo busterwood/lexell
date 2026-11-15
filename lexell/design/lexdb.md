@@ -12206,3 +12206,56 @@ durable by its defaults.
   (a restart; not tried). The setting was reset after the run.
 - SQL Server's commit rate is not measured: there is no pgbench for TDS
   here.
+
+### 9.134 Against PostgreSQL 18 again: pgbench, aggregates, loads (2026-11-15)
+
+9.67's comparison (`bench/sock/vspg.sh`) run again at 478d49f6, in a new
+work directory (`~/Work/lexdb-bench/vspg2`: both loaded afresh), 3 rounds of
+10 s, the median of the rounds. **PostgreSQL is capped at 4 processes**
+(the user's rule of 2026-11-13, now in the script): its service at 4 CPUs
+(`CPUQuota=400%`) for pgbench, its parallel aggregates at a leader and 3
+workers. 9.67 let it use all 16 CPUs and its default 2 workers, so its
+many-client figures are not comparable (`PG_UNCAPPED=1` runs them so).
+Every aggregate's results were the same on both, every round (checksums).
+
+| pgbench, 1M rows | lexdb 9.67 | **lexdb now** | PostgreSQL now (4 CPUs) | lexdb / PG |
+|---|---:|---:|---:|---:|
+| point selects, 1 client | 94,700/s | **83,000/s**, 12.0 µs | 75,300/s, 9.1 µs | 1.10 × |
+| point selects, 8 clients | 173,900/s | **138,500/s**, 7.2 µs | 327,100/s, 12.3 µs | 0.42 × |
+| point selects, 32 clients | 172,300/s | **127,000/s**, 7.9 µs | 265,700/s, 15.0 µs | 0.48 × |
+| updates, 1 client | 1,663/s | **3,713/s**, 70 µs | 1,641/s, 91 µs | 2.26 × |
+| updates, 8 clients | 6,690/s | **17,630/s**, 34 µs | 6,765/s, 65 µs | 2.61 × |
+| updates, 32 clients | 26,140/s | **41,100/s**, 24 µs | 26,360/s, 54 µs | 1.56 × |
+
+(µs: server CPU an operation.)
+
+| Query on t (1M rows), ms, best of 5 | lexdb 9.67 | **lexdb now** | PG one core | PG 4 processes |
+|---|---:|---:|---:|---:|
+| `count(*)` | 13.9 | **3.8** | 19.5 | 11.2 |
+| 4 aggregates `WHERE n > 10` | 36.8 | **24.1** | 56.9 | 25.6 |
+| `sum(v)` with three conditions | 42.2 | **25.6** | 46.3 | 21.7 |
+| `GROUP BY g`, 3 aggregates | 47.4 | **38.1** | 84.4 | 35.6 |
+| `GROUP BY n WHERE v % 2 = 0` | 35.1 | **28.7** | 59.6 | 35.5 |
+
+| Load, 1M rows (INSERT ... generate_series) | lexdb 9.67 | lexdb now | PostgreSQL |
+|---|---:|---:|---:|
+| acct (2 ints) | 1.49 s | 1.22 s | 0.91 s |
+| t (4 ints and a text) | 2.52 s | 2.55 s | 1.52 s |
+
+- **Updates:** 2.3 to 2.6 times PostgreSQL's rate to 8 clients, 1.6 at 32
+  (the O_DSYNC log, 9.131), at 44 to 77% of its CPU an update.
+- **Aggregates:** ahead of PostgreSQL on one core on all five (1.8 to 5.1
+  times); against 4 processes ahead on three, level on one (`GROUP BY g`
+  1.07), behind on one (three conditions, 1.18).
+- **Point selects are 12 to 26% slower than in 9.67,** and not from
+  today's changes: main before today (4979c256, heap without huge pages)
+  and now give the same on the same data (81,400 against 81,100/s with one
+  client, 132,100 against 130,100 with 8; two passes each). The change is
+  between 9.67 (2026-11-11) and 4979c256, most likely column leaves
+  (9.112: a point read decodes one row from a column leaf). Not bisected.
+  One client is still 10% ahead of PostgreSQL; with many clients
+  PostgreSQL's processes (4 CPUs) give 2.1 to 2.4 times lexdb's one loop.
+- **Loads:** generate_series inserts are not the COPY fast path (9.133):
+  PostgreSQL 1.3 to 1.7 times faster.
+
+The output: `~/Work/lexdb-bench/saved/results/2026-11-15-refresh/vspg.txt`.

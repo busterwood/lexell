@@ -18,6 +18,11 @@
 #          (max_parallel_workers_per_gather = 0); the results compared
 # PostgreSQL: shared_buffers 4GB (both servers hold all the data in memory),
 # otherwise its defaults. lexdb: its defaults (io_uring and adaptive polling).
+# PostgreSQL is capped at 4 processes, lexdb's shape (a main process and 3
+# replicas; the user's rule of 2026-11-13): its service at 4 CPUs
+# (CPUQuota=400%) for pgbench's clients, and its parallel aggregates at a
+# leader and 3 workers ("pg 4 processes"). PG_UNCAPPED=1 lifts both (9.67's
+# runs: every CPU, its default 2 workers).
 set -e
 BIN=$(realpath "$1"); W=$2; ROUNDS=${3:-2}; SECS=${4:-10}; shift 4 2>/dev/null || shift $#
 CLIENTS=${*:-1 8 32}
@@ -44,7 +49,8 @@ start() {
     if [ "$1" = lexdb ]; then
         systemd-run --user --quiet --collect -u "$(unit lexdb)" "$BIN" "$W/lexdb" 127.0.0.1:$LPORT "$LSOCK"
     else
-        systemd-run --user --quiet --collect -u "$(unit pg)" /usr/bin/postgres -D "$W/pg" -k "$PSOCK" -p $PPORT \
+        local cap=(-p CPUQuota=400%); [ -n "${PG_UNCAPPED:-}" ] && cap=()
+        systemd-run --user --quiet --collect -u "$(unit pg)" "${cap[@]}" /usr/bin/postgres -D "$W/pg" -k "$PSOCK" -p $PPORT \
             -c listen_addresses= -c shared_buffers=4GB
     fi
     ready "$1"
@@ -111,7 +117,8 @@ for r in $(seq "$ROUNDS"); do
             done
         done
         if [ $s = lexdb ]; then agg lexdb "lexdb"; else
-            agg pg "pg parallel" ""
+            if [ -n "${PG_UNCAPPED:-}" ]; then agg pg "pg parallel" ""
+            else agg pg "pg 4 processes" "SET max_parallel_workers_per_gather = 3; SET max_parallel_workers = 3;"; fi
             agg pg "pg one core" "SET max_parallel_workers_per_gather = 0;"
         fi
         stop $s

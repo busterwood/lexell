@@ -2863,3 +2863,41 @@ copy per run):
 - **The ordered lookup's own cost** (34 against 48): section 43's open
   item; lookups in key order are still costed as any lookup.
 - The suite passes (170).
+
+## 46. Section 34's workload again, on settled tables (2026-11-15)
+
+`design/experiments/workload.lxl` now settles its tables as the calibration
+programs do (section 45): loaded, `ANALYZE`d, vacuumed and checkpointed in
+a first store run, measured in a second. Run with the costs before section
+45 (e87c71e8) and after (main), the median of 5 runs a query
+(`~/Work/lexdb-bench/saved/results/2026-11-15-refresh/workload-*.txt`):
+
+| Query | 34 (cost, rows just inserted) | old costs | new costs | rules |
+|---|---:|---:|---:|---:|
+| Q1 | 53 | 60 | 59 | 39 |
+| Q2 | 24 | 39 | 38 | 30 |
+| Q3 | 139 | 152 | 152 | 129 |
+| Q4 | 42 | 65 | 65 | 39 |
+| Q5 | 38 | 41 | 41 | 110,424 |
+| Q6 | 105 | 148 | 155 | 383,894 |
+| Q7 | 36,099 | 50,960 | 50,632 | 168,713 |
+| Q8 | 41,436 | 34,116 | 33,892 | 318,474 |
+| Q9 | 63,135 | 12,370 | 10,038 | 19,988 |
+| Q10 | 67,159 | 28,011 | 29,214 | 64,774 |
+| Q11 | 111,052 | 27,186 | 25,445 | 111,909 |
+| Q12 | 70,385 | 15,974 | 17,111 | 449,820 |
+| Q13 | 11,395 | 14,867 | 12,849 | 11,870 |
+| Q14 | 641 | 1,037 | 884 | 860 |
+| **total** | **401,703** | **185,026** | **180,575** | **1,640,963** |
+
+(µs. Section 34's column is its own data and code, for scale.)
+
+- **The new costs changed one plan:** Q10 hashes the quarter's orders and
+  scans customer, where it hashed customer over the orders' index range
+  (28.0 to 29.2 ms). The others' plans are the same; their differences
+  (Q9 12.4 to 10.0, Q12 16.0 to 17.1) are between runs. Total 2.4% less.
+- Every query returned the same rows under both planners.
+- Since section 34 the cost plans' total fell from 402 ms to 181 (the
+  batches, column leaves and the work since), the rules' from 5.55 s to
+  1.64. The point queries Q1 to Q4 are slower on settled tables (60
+  against 53 µs for Q1): a row taken from a column leaf costs more.
