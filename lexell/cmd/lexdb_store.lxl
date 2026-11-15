@@ -239,6 +239,21 @@ pub type Db = record {
 // (openReplica) reads through its follower (fo), and takes no writes.
 pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower] }
 
+// Which tree a transaction's reads see: the live tree, its snapshot, or a
+// replica's follower. Read operations select once through viewOf, so every
+// path agrees on the choice and on what a snapshot's reads note.
+pub type View = closed {
+    Live
+    Snap
+    Repl
+}
+
+pub fn (st: &Store) viewOf(t: &Txn): View {
+    if st.fo.isSome() { return View.Repl }
+    if t.snap >= 0 && !t.live { return View.Snap }
+    return View.Live
+}
+
 // A read mark: a leaf seen at a version (4.4).
 // A leaf a transaction read: its slot as it was then, and its page if it
 // was clean (the slot may be dropped meanwhile, its parent evicted: the
@@ -348,8 +363,6 @@ pub fn begin(): Txn {
                pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
-
-pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
 
 // A transaction block's (BEGIN ... COMMIT), not a statement's own.
 pub fn (t: &Txn) inBlock(): bool { return t.track }
@@ -2025,10 +2038,10 @@ pub const STUB_LEN: int = lexdb_rows.STUB_LEN
 pub const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a key range's end
 
 fn isOvf(tree: int): bool { return tree >= OVF }
-pub fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
+fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
 // A stub: version 1 (9.29) has no row start; version 2 (9.31) is followed
 // by the value's first bytes, the chunks holding the rest.
-pub fn isStub(v: &str): bool { return lexdb_rows.isStub(v) }
+fn isStub(v: &str): bool { return lexdb_rows.isStub(v) }
 
 // How a scan gives large values: whole; RAW, as stored (a companion's
 // chunks); PART, as their stubs (partOf, whole).
@@ -2057,7 +2070,7 @@ pub fn chunkKey(key: &str, i: int): str {
 // The bytes of a value each chunk of key holds.
 fn chunkRoom(key: &str): int { return lexdb_page.MAX_ENTRY - lexdb_page.leafEntry(&chunkKey(key, 0), &"") }
 
-pub fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
+fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
 
 // The value at key in a tree whose leaf for it is in memory.
 fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
@@ -2301,14 +2314,15 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
 // getIn without the transaction's own writes and range deletes: the stored
 // row (as the transaction's reads see the store).
 fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    match st.viewOf(t) {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.get(&s, tree, &key)
         }
-        None {}
+        View.Snap { return st.snapGet(t, tree, key, mode) }
+        View.Live {}
     }
-    if t.snap >= 0 && !t.live { return st.snapGet(t, tree, key, mode) }
     while true {
         var need = -1
         var out: Option[str] = None
@@ -2588,8 +2602,9 @@ fn (c: mut &Cnt) countPage(it: &CItem, b: &[]byte): Result[Unit, lexdb_base.DbEr
 // Writes of other commits to the range are for noteRange to catch.
 pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Result[int, lexdb_base.DbErr] {
     if len(hi) > 0 && lo >= hi { return Ok(0) }
-    match st.fo {
-        Some(_) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
             // a replica: its follower's rows, counted by a scan (which skips the cut ranges: the base leaves of a purge are not read; rows outside it are)
             var n = 0
             try st.scan(t, tree, lo, hi, fn(e: &Entry): bool {
@@ -2598,9 +2613,9 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
             })
             return Ok(n)
         }
-        None {}
+        else {}
     }
-    let snap = t.snap >= 0 && !t.live
+    let snap = view == View.Snap
     for attempt in 0..COUNT_TRIES {
         var c = Cnt{q: if snap { t.snapSeq } else { -1 }, lo: lo.toStr(), hi: hi.toStr(), total: 0, items: [], tops: [], err: ""}
         var f = lexdb_disk.File.Real(-1, false)
@@ -2736,9 +2751,10 @@ pub fn (st: &Store) countView(t: mut &Txn, tree: int, lo: &str, hi: &str): Resul
 // statement runs again).
 pub fn (st: &Store) noteRange(t: mut &Txn, tree: int, lo: &str, hi: &str) {
     if len(hi) > 0 && lo >= hi { return }
-    if !t.noting() || st.fo.isSome() { return }
+    let view = st.viewOf(t)
+    if !t.noting() || view == View.Repl { return }
     var seq = 0
-    if t.snap >= 0 && !t.live { seq = t.snapSeq } else { st.sh.with(fn(db: mut &Db) { seq = db.seq }) }
+    if view == View.Snap { seq = t.snapSeq } else { st.sh.with(fn(db: mut &Db) { seq = db.seq }) }
     t.noteRead(tree, lo, hi, seq)
 }
 
@@ -2864,12 +2880,13 @@ const LOOKUP_GAP = 256
 pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, out: mut &[]Option[str]): Result[Unit, lexdb_base.DbErr] {
     let mode = if part { M_PART } else { M_FULL }
     let n = len(keys)
-    if st.fo.isSome() {
+    let view = st.viewOf(t)
+    if view == View.Repl {
         // a replica's reads: one by one
         for k in keys { append(out, try st.getIn(t, tree, k, mode)) }
         return Ok(Unit{})
     }
-    let snap = t.snap >= 0 && !t.live
+    let snap = view == View.Snap
     let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     let noting = t.noting()
     var i = 0
@@ -3002,8 +3019,9 @@ fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]str, i: int
 // quietly: the reads after it give the error.
 pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_base.DbErr] {
     let n = len(keys)
-    if st.fo.isSome() || n < 2 { return Ok(Unit{}) }
-    let snap = t.snap >= 0 && !t.live
+    let view = st.viewOf(t)
+    if view == View.Repl || n < 2 { return Ok(Unit{}) }
+    let snap = view == View.Snap
     let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var i = 0
     while i < n {
@@ -3217,17 +3235,20 @@ pub fn (st: &Store) scanPart(t: mut &Txn, tree: int, from: &str, to: &str, f: &f
 
 // scan; raw: the stored forms, no reads noted (a companion tree's chunks).
 fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.scan(&s, tree, &from, &to, f)
         }
-        None {}
+        else {}
     }
     let raw = mode == M_RAW
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let cut = !raw && t.hasCuts(tree)           // stored keys in a range delete of its own are skipped
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
     var more = true
@@ -3247,8 +3268,8 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3399,9 +3420,11 @@ fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: str,
 // range is noted as read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
+    let view = st.viewOf(t)
+    if view == View.Repl { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor: str = from
     var more = true
     let noting = t.noting()
@@ -3421,8 +3444,8 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3539,16 +3562,19 @@ pub fn (st: &Store) scanBackPart(t: mut &Txn, tree: int, from: &str, to: &str, f
 }
 
 fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.scanBack(&s, tree, &from, &to, f)
         }
-        None {}
+        else {}
     }
     let own = t.ownRange(tree, &from, &to)
     let cut = t.hasCuts(tree)
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
     var cursor = to
     var more = true
@@ -3565,8 +3591,8 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3759,7 +3785,7 @@ fn (db: mut &Db) logWrites(t: &Txn) {
 // so that its commit would fail (40001): the SQL layer's look at an error
 // that a state read in two moments may have caused (lexdb.md 9.120).
 pub fn (st: &Store) liveStale(t: &Txn): bool {
-    if st.fo.isSome() || (t.snap >= 0 && !t.live) { return false }
+    if st.viewOf(t) != View.Live { return false }
     var stale = false
     st.sh.with(fn(db: mut &Db) { stale = !db.validate(t) })
     return stale
@@ -6191,7 +6217,7 @@ fn (st: &Store) applyRecovered(w: &TxWrite): Result[Unit, lexdb_base.DbErr] {
 
 // Reads one frame at off: its records and length, or None when there is no
 // valid frame with that batch number there.
-pub fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
     if off + PAGE > size { return Ok(None) }
     var h = array(PAGE, byte(0))
     try f.read(off, mut &h[0..PAGE], PAGE)
@@ -6208,7 +6234,7 @@ pub fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int)
 
 // A whole frame's records (read from the log, or pushed to a replica), or
 // None when it is not batch's frame in segment seg or its CRC is wrong.
-pub fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
     if len(b) < FRAME_HDR || binary.readU32LE(b, 0) != LOG_MAGIC || int(binary.readU64LE(b, 8)) != batch || binary.readU32LE(b, 16) != seg {
         return Ok(None)
     }
@@ -6220,7 +6246,7 @@ pub fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], 
     return Ok(Some(recs))
 }
 
-pub fn frameLen(recs: &[]TxWrite): int {
+fn frameLen(recs: &[]TxWrite): int {
     var n = FRAME_HDR
     for w in recs { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
     return (n + PAGE - 1) / PAGE * PAGE
@@ -6496,7 +6522,7 @@ pub fn (st: &Store) waitChange(): bool {
 // Starts a hold at the last durable checkpoint, and every log segment,
 // in one step (a follower's first; it then holds the checkpoint it reads,
 // which is this one or a later one), and gives that checkpoint.
-pub fn (st: &Store) holdNow(): int { return st.holdNowFor(0) }
+fn (st: &Store) holdNow(): int { return st.holdNowFor(0) }
 
 // holdNow, for follower id.
 pub fn (st: &Store) holdNowFor(id: int): int {
@@ -6827,12 +6853,6 @@ pub fn (fo: &Follower) ready(): bool {
     var r = false
     fo.sh.with(fn(f: mut &Fol) { r = len(f.bases) > 0 })
     return r
-}
-
-pub fn (fo: &Follower) applied(): int {
-    var a = 0
-    fo.sh.with(fn(f: mut &Fol) { a = f.applied })
-    return a
 }
 
 pub fn (fo: &Follower) close() {
