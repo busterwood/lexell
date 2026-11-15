@@ -1514,14 +1514,14 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         let k = len(sel.outs)
         var i = 0
         // T-SQL: '' in a column of numbers is 0 (design/lexdb-tds.md, section 13)
-        let tsql = len(sessColl(st, txn.sess)) > 0
+        let tsql = len(sessColl(st, txn.sql.sess)) > 0
         while i + k <= len(args) {
             var row: []Val = []
             for c in 0..k {
                 let ty = oidType(sel.outs[c].oid)
                 let blank = tsql && (ty.kind == lexdb_sql.K_INT || ty.kind == lexdb_sql.K_FLOAT) && kindOf(&args[i + c]) == lexdb_sql.K_TEXT &&
                             len(strings.trim(&text(&args[i + c]))) == 0
-                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { args[i + c] } else if blank { try coerceZ(Val.Int(0), &ty, &txn.zone) } else { try coerceZ(args[i + c], &ty, &txn.zone) })
+                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { args[i + c] } else if blank { try coerceZ(Val.Int(0), &ty, &txn.sql.zone) } else { try coerceZ(args[i + c], &ty, &txn.sql.zone) })
             }
             append(mut &rows, row)
             i += k
@@ -1554,7 +1554,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         let ty = oidType(sel.outs[0].oid)
         if ty.kind == lexdb_sql.K_TS || ty.kind == lexdb_sql.K_TSTZ {
             // timestamps stepped by an interval; a timestamptz's days and months in the session's zone (9.95)
-            let zone = txn.zone
+            let zone = txn.sql.zone
             var v = try coerceZ(args[0], &ty, &zone)
             let stop = try coerceZ(args[1], &ty, &zone)
             let step = try coerceZ(args[2], &oidType(lexdb_sql.OID_IVAL), &zone)
@@ -1579,9 +1579,9 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
         }
-        let start = try coerceZ(args[0], &ty, &txn.zone)
-        let stop = try coerceZ(args[1], &ty, &txn.zone)
-        let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.zone) } else { try coerce(Val.Int(1), &ty) }
+        let start = try coerceZ(args[0], &ty, &txn.sql.zone)
+        let stop = try coerceZ(args[1], &ty, &txn.sql.zone)
+        let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.sql.zone) } else { try coerce(Val.Int(1), &ty) }
         let zero = try coerce(Val.Int(0), &ty)
         let dir = try compare(&step, &zero)
         if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
@@ -1599,7 +1599,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &rows, row)
             try rs.tick()
             // the next value; past the type's range: the end
-            match arithZ(&"+", &v, &step, &txn.zone) {
+            match arithZ(&"+", &v, &step, &txn.sql.zone) {
                 Ok(x) { v = x }
                 Err(_) { break }
             }
@@ -3313,7 +3313,7 @@ fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: b
     // the statistics choose between candidates: two indexes, or an index and
     // a primary key of several columns (optimizer 24); or a join's order
     let cands = len(t.indexes) + (if len(t.pk) >= 2 { 1 } else { 0 })
-    if txn.rules || t.tree < 0 || (cands < 2 && !join) { return Ok(noEst()) }
+    if txn.sql.rules || t.tree < 0 || (cands < 2 && !join) { return Ok(noEst()) }
     let got = try st.getUnnoted(txn, CATALOG, &(statKey(&t.name)))
     if got.isNone() { return Ok(noEst()) }
     let v = got.unwrap()
@@ -4020,10 +4020,10 @@ fn intsText(xs: &[]int): str {
 // A row of table t written by txn: kind 0 inserted, 1 updated, 2 deleted.
 fn noteChg(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, kind: int) {
     if AUTO_STATE == 2 { return }
-    if txn.sess != CHG_SESS || t.tree != CHG_TREE {
-        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sess <= 0 { return }
+    if txn.sql.sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sql.sess <= 0 { return }
         chgFlush(st)
-        CHG_SESS = txn.sess
+        CHG_SESS = txn.sql.sess
         CHG_TREE = t.tree
     }
     if kind == 0 { CHG_I += 1 } else if kind == 1 { CHG_U += 1 } else { CHG_D += 1 }
@@ -4315,9 +4315,9 @@ fn schemaExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Res
 // The schema new unqualified names go in: the first on the path that
 // exists ("" none), never the temporary one (9.96).
 fn createSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
-    if len(txn.path) == 0 { return Ok("public") }
-    for i in 0..len(txn.path) {
-        let sc = txn.path[i]
+    if len(txn.sql.path) == 0 { return Ok("public") }
+    for i in 0..len(txn.sql.path) {
+        let sc = txn.sql.path[i]
         if len(txn.tmp) > 0 && sc == txn.tmp { continue }
         if try schemaExists(st, txn, &sc) { return Ok(sc) }
     }
@@ -4340,19 +4340,19 @@ fn tempKey(sess: int, n: &str): str { return lexdb_sql.qual(&tempSchema(sess), n
 // pg_temp is the session's temporary schema; another session's is refused
 // (9.96).
 fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
-    if isTempName(n) { return Ok(tempKey(txn.sess, n)) }
+    if isTempName(n) { return Ok(tempKey(txn.sql.sess, n)) }
     let q = lexdb_sql.isQual(n)
     if q && n[0] == 'p' { return tmpQual(st, txn, n) }
-    if len(txn.path) == 0 || q { return Ok(n) }
-    for i in 0..len(txn.path) {
-        let sc = txn.path[i]
+    if len(txn.sql.path) == 0 || q { return Ok(n) }
+    for i in 0..len(txn.sql.path) {
+        let sc = txn.sql.path[i]
         let k = lexdb_sql.qual(&sc, n)
         let found = if idx { try st.get(txn, CATALOG, &(idxName(&k))) } else { try st.get(txn, CATALOG, &k) }
         if found.isSome() { return Ok(k) }
     }
     let sc = try createSchema(st, txn)
-    var first = txn.path[0]
-    if len(txn.tmp) > 0 && first == txn.tmp && len(txn.path) > 1 { first = txn.path[1] }
+    var first = txn.sql.path[0]
+    if len(txn.tmp) > 0 && first == txn.tmp && len(txn.sql.path) > 1 { first = txn.sql.path[1] }
     return Ok(lexdb_sql.qual(if len(sc) > 0 { &sc } else { &first }, n))
 }
 
@@ -4412,10 +4412,10 @@ pub fn withTmp(path: &[]str, tmp: &str): []str {
 // The transaction's session's temporary schema, made if it has none yet.
 fn useTmp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): str {
     if len(txn.tmp) > 0 { return txn.tmp }
-    let n = tmpName(txn.sess)
-    txn.path = withTmp(&txn.path, &n)
+    let n = tmpName(txn.sql.sess)
+    txn.sql.path = withTmp(&txn.sql.path, &n)
     txn.tmp = n
-    st.memo.put(&tmpMemo(txn.sess), &n)
+    st.memo.put(&tmpMemo(txn.sql.sess), &n)
     return n
 }
 
@@ -4424,7 +4424,7 @@ fn useTmp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): str {
 // Session.tmpUndo). Other sessions' are not touched.
 fn tmpBump(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn) {
     txn.tmpDdl = true
-    tmpChanged(st, txn.sess)
+    tmpChanged(st, txn.sql.sess)
 }
 
 fn tmpChanged(st: &lexdb_store.Store, sess: int) {
@@ -4449,7 +4449,7 @@ fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: b
     var tmp = temp || isTempName(n)       // T-SQL's #name (S4)
     if lexdb_sql.isQual(n) {
         let sn = lexdb_sql.schemaOf(n)
-        if sn == "pg_temp" || sn == tmpName(txn.sess) {
+        if sn == "pg_temp" || sn == tmpName(txn.sql.sess) {
             tmp = true
         } else {
             if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", &("schema \"" + sn + "\" does not exist"))) }
@@ -7691,7 +7691,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // them as keys, to be hashed if a hash costs less (semiJoins). Not
         // where reading may stop early, nor in a transaction whose reads are
         // noted: there the lookups' reads stand (as in the join order).
-        if semiCand[i] && !early && !txn.noting() && !txn.rules && (sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) &&
+        if semiCand[i] && !early && !txn.noting() && !txn.sql.rules && (sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) &&
            len(sp.sel.q.refs) > 0 && !sp.hashed && sp.cte < 0 {
             sc.noRefKeys = true
             let again = planSub(st, txn, &subs[i], params, sc)
@@ -7773,7 +7773,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         }
         None {}
     }
-    if reorder && nl >= 2 && !txn.rules {
+    if reorder && nl >= 2 && !txn.sql.rules {
         // the join order: by cost with statistics (optimizer 26), else bound
         // by keys (optimizer 25); the conjuncts go again to the latest table
         // they use, in the new order
@@ -7799,7 +7799,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // lookup (optimizer 26 review).
         // a hash holds at most half the statement's memory, 64 MB at most
         var cap = HASH_MAX_BYTES
-        if txn.memMax > 0 && float(txn.memMax) / 2.0f < cap { cap = float(txn.memMax) / 2.0f }
+        if txn.sql.memMax > 0 && float(txn.sql.memMax) / 2.0f < cap { cap = float(txn.sql.memMax) / 2.0f }
         var ordCols: []int = []
         let ordT = q.orderedLevel(&ordBy, mut &ordCols)
         // A join that starts from a row its key pins (optimizer 35): the
@@ -8054,7 +8054,7 @@ fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most:
 fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan,
                keys: mut &[]str): Result[int, DbErr] {
     let tree = t.indexes[p.index].tree
-    let start = if txn.rules { SWITCH_ENTRIES } else { SWITCH_ENTRIES_COST }
+    let start = if txn.sql.rules { SWITCH_ENTRIES } else { SWITCH_ENTRIES_COST }
     var lim = start
     var from = sc.lo
     var n = 0
@@ -8077,17 +8077,17 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
             if first {
                 // a short range: the index, unless (cost mode) the table is
                 // smaller than r times it
-                if !txn.rules && n > 0 && try countRows(st, txn, t, switchMost(false, n)) <= switchMost(false, n) { return Ok(1) }
+                if !txn.sql.rules && n > 0 && try countRows(st, txn, t, switchMost(false, n)) <= switchMost(false, n) { return Ok(1) }
                 for x in got { append(keys, x) }
                 return Ok(0)
             }
             // the range has n entries: a scan if the table has at most switchMost rows
-            let most = switchMost(txn.rules, n)
+            let most = switchMost(txn.sql.rules, n)
             if try countRows(st, txn, t, most) <= most { return Ok(1) }
             return Ok(2)
         }
         from = after(&last)
-        let most = switchMost(txn.rules, lim)
+        let most = switchMost(txn.sql.rules, lim)
         if try countRows(st, txn, t, most) <= most { return Ok(1) }
         lim = lim * 2
     }
@@ -8111,7 +8111,7 @@ fn firstSwitch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, sca
         rs.swLo = scans[0].lo
         rs.swHi = scans[0].hi
     }
-    if rs.sw == 1 { rs.cnt[0].switched = if txn.rules { 1 } else { 2 } }
+    if rs.sw == 1 { rs.cnt[0].switched = if txn.sql.rules { 1 } else { 2 } }
     if rs.sw == 0 { for x in rs.swKeys { append(keys, x) } }
     return Ok(rs.sw)
 }
@@ -8157,7 +8157,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 } else {
                     // of the column's type for its bounds: a value it cannot
                     // hold matches no row (optimizer 26 review)
-                    match try keyVal(try eval(&lv.hashVals[i], &env), &boundType(&lv.t.cols[lv.hashCols[i]].typ), &txn.zone) {
+                    match try keyVal(try eval(&lv.hashVals[i], &env), &boundType(&lv.t.cols[lv.hashCols[i]].typ), &txn.sql.zone) {
                         Some(v) {
                             if isNull(&v) { nul = true }
                             encIdxPart(mut &kb, &v)
@@ -8240,7 +8240,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 row[lv.first] = v
                 matched = true
                 if !(try emit(txn, row)) { return Ok(false) }
-                match arithZ(&"+", &v, &sr.vals[2], &txn.zone) {
+                match arithZ(&"+", &v, &sr.vals[2], &txn.sql.zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
                 }
@@ -8264,7 +8264,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 if got < 0 { return Ok(false) }
                 if got > 0 { matched = true }
                 // the next value; past the type's range: the end
-                match arithZ(&"+", &v, &sr.vals[2], &txn.zone) {
+                match arithZ(&"+", &v, &sr.vals[2], &txn.sql.zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
                 }
@@ -8468,9 +8468,9 @@ fn seriesRes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
     out.sOrdin = sel.ordin
     for a in args { if isNull(&a) { return Ok(out) } }
     let ty = oidType(out.sOid)
-    let start = try coerceZ(args[0], &ty, &txn.zone)
-    let stop = try coerceZ(args[1], &ty, &txn.zone)
-    let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.zone) } else { try coerce(Val.Int(1), &ty) }
+    let start = try coerceZ(args[0], &ty, &txn.sql.zone)
+    let stop = try coerceZ(args[1], &ty, &txn.sql.zone)
+    let step = if len(args) > 2 { try coerceZ(args[2], &ty, &txn.sql.zone) } else { try coerce(Val.Int(1), &ty) }
     if try compare(&step, &(try coerce(Val.Int(0), &ty))) == 0 { return Err(e("22023", "step size cannot equal zero")) }
     out.vals = [start, stop, step]
     return Ok(out)
@@ -8523,7 +8523,7 @@ type Work = record { id: int; cols: []lexdb_sql.ColDef }
 // SELECT on relation key, for a query being planned: as its view's owner,
 // or the session's role (9.83).
 fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, key: &str, kind: &str): Result[Unit, DbErr] {
-    let actAs = if len(sc.asRole) > 0 { sc.asRole[len(sc.asRole) - 1] } else { currentRole(st, txn.sess) }
+    let actAs = if len(sc.asRole) > 0 { sc.asRole[len(sc.asRole) - 1] } else { currentRole(st, txn.sql.sess) }
     var at = -1
     for i in 0..len(sc.whos) { if sc.whos[i].name == actAs { at = i } }
     if at < 0 {
@@ -8544,7 +8544,7 @@ fn newScope(params: &[]Val, ptypes: &[]int): Scope {
 // newScope for a statement of txn's session: its default collation (L2).
 fn newScopeIn(st: &lexdb_store.Store, txn: &lexdb_store.Txn, params: &[]Val, ptypes: &[]int): Scope {
     var sc = newScope(params, ptypes)
-    sc.coll = sessColl(st, txn.sess)
+    sc.coll = sessColl(st, txn.sql.sess)
     return sc
 }
 
@@ -11414,7 +11414,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             {
                 let env = Env{cols: &q.cols, row: &found[f], aggs: &noAggs, params: &noParams, subs: &m.subs, cur: &noAggs, seq: sqe}
                 for k in 0..len(changes) {
-                    append(mut &vals, try coerceZ(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ, &txn.zone))
+                    append(mut &vals, try coerceZ(try evalX(st, txn, &q, &xs[k], &env, mut &rs), &changes[k].typ, &txn.sql.zone))
                 }
             }
             for k in 0..len(changes) { found[f][changes[k].col] = vals[k] }
@@ -11493,7 +11493,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             try fetch(st, txn, &rd, &path, &sc, &all, mut &cur, mut &batch)
             for r in batch {
                 var row = copyRow(&r)
-                for ch in changes { row[ch.col] = try coerceZ(row[ch.col], &ch.typ, &txn.zone) }
+                for ch in changes { row[ch.col] = try coerceZ(row[ch.col], &ch.typ, &txn.sql.zone) }
                 try rwRow(st, txn, t, &defs, rw, n, mut &row, checked)
                 try rwAdd(t, &row, mut &out, room)
                 n += 1
@@ -12330,7 +12330,7 @@ fn seqOptsCopy(o: &lexdb_sql.SeqOpts): lexdb_sql.SeqOpts {
 fn ownColSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, i: int): Result[Unit, DbErr] {
     if len(t.cols[i].seq) == 0 { return Ok(Unit{}) }
     let a = try readAcl(st, txn, &relObj(&t.name))
-    let owner = if len(a.owner) > 0 { a.owner } else { currentRole(st, txn.sess) }
+    let owner = if len(a.owner) > 0 { a.owner } else { currentRole(st, txn.sql.sess) }
     return writeAcl(txn, &relObj(&t.cols[i].seq), &Acl{owner: owner, grants: [], set: false})
 }
 
@@ -12373,7 +12373,7 @@ fn createSchemaStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb
     // a superuser's (PostgreSQL: the database's CREATE, its owner's); owned by AUTHORIZATION's role, or its maker
     let w = try whoNow(st, txn)
     if !w.super { return Err(e("42501", "permission denied for database lexdb")) }
-    var owner = currentRole(st, txn.sess)
+    var owner = currentRole(st, txn.sql.sess)
     if len(s.names) > 0 {
         owner = roleName(st, txn, &s.names[0])
         if !(try roleExists(st, txn, &owner)) { return Err(e("42704", &("role \"" + owner + "\" does not exist"))) }
@@ -12843,7 +12843,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     let sqe = seqEnv(st, txn)
     let t = try needTable(st, txn, &s.table)
     // T-SQL's SET IDENTITY_INSERT t ON (design/lexdb-tds.md S3)
-    let ovr = if s.overriding == lexdb_sql.OVR_NONE && identityInsertOf(st, txn.sess) == lexdb_sql.baseName(&t.name) { lexdb_sql.OVR_TSQL } else { s.overriding }
+    let ovr = if s.overriding == lexdb_sql.OVR_NONE && identityInsertOf(st, txn.sql.sess) == lexdb_sql.baseName(&t.name) { lexdb_sql.OVR_TSQL } else { s.overriding }
     var targets: []int = []
     if len(s.names) == 0 {
         for i in 0..len(t.cols) { if t.cols[i].name != ROWID { append(mut &targets, i) } }
@@ -13118,7 +13118,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     for i in 0..len(t.cols) { append(mut &given, false) }
     for k in 0..len(vs) {
         let ci = targets[k]
-        row[ci] = try coerceZ(vs[k], &t.cols[ci].typ, &txn.zone)
+        row[ci] = try coerceZ(vs[k], &t.cols[ci].typ, &txn.sql.zone)
         given[ci] = true
     }
     // the others their defaults (a sequence's taken only for these)
@@ -13317,7 +13317,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     for k in 0..len(up.sets) {
         let ci = up.targets[k]
         if lexdb_sql.isDefault(&up.sets[k]) { next[ci] = try defAt(st, txn, defs, t, ci) }
-        else { next[ci] = try coerceZ(try eval(&up.sets[k], &uenv), &t.cols[ci].typ, &txn.zone) }
+        else { next[ci] = try coerceZ(try eval(&up.sets[k], &uenv), &t.cols[ci].typ, &txn.sql.zone) }
     }
     try updRow(st, txn, t, old, &next, fw, later)
     up.touched.put(keyOf(t, &next), 1)
@@ -13435,7 +13435,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         var all = copyRow(&joined)
         for k in 0..len(sets) {
             if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
-            else { all[targets[k]] = try coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.zone) }
+            else { all[targets[k]] = try coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.sql.zone) }
         }
         // (the table's alone, without FROM: the rows as they are, not copied)
         if len(joined) == nt {
@@ -13594,13 +13594,13 @@ fn winEnd(win: mut &Win, t: &Table, found: &[][]Val, read: int) {
 // A transaction like txn's for the next batch.
 fn freshTxn(txn: &lexdb_store.Txn): lexdb_store.Txn {
     var fresh = lexdb_store.begin()
-    for n in txn.path { append(mut &fresh.path, n) }
-    fresh.sess = txn.sess
+    for n in txn.sql.path { append(mut &fresh.sql.path, n) }
+    fresh.sql.sess = txn.sql.sess
     fresh.tmp = txn.tmp
     fresh.now = txn.now
-    fresh.zone = txn.zone
-    fresh.rules = txn.rules
-    fresh.memMax = txn.memMax
+    fresh.sql.zone = txn.sql.zone
+    fresh.sql.rules = txn.sql.rules
+    fresh.sql.memMax = txn.sql.memMax
     return fresh
 }
 
@@ -13923,9 +13923,9 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             return Ok(Some(p))
         }
         let typ = boundType(&col.typ)
-        match coerceZ(v, &typ, &txn.zone) {
+        match coerceZ(v, &typ, &txn.sql.zone) {
             Ok(c) {
-                match compareZ(&v, &c, &txn.zone) {
+                match compareZ(&v, &c, &txn.sql.zone) {
                     Ok(r) { if r != 0 { return Ok(None) } }
                     Err(_) { return Ok(None) }
                 }
@@ -13970,10 +13970,10 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 // Rows of table t deleted: n of them counted for the automatic statistics.
 fn noteChgN(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, n: int) {
     if AUTO_STATE == 2 { return }
-    if txn.sess != CHG_SESS || t.tree != CHG_TREE {
-        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sess <= 0 { return }
+    if txn.sql.sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sql.sess <= 0 { return }
         chgFlush(st)
-        CHG_SESS = txn.sess
+        CHG_SESS = txn.sql.sess
         CHG_TREE = t.tree
     }
     CHG_D += n
@@ -14212,7 +14212,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     let ns = q.levels[tl].first
     let alias = if len(s.alias) > 0 { s.alias } else { lexdb_sql.baseName(&t.name) }
     // T-SQL's SET IDENTITY_INSERT t ON
-    let ovr = if s.overriding == lexdb_sql.OVR_NONE && identityInsertOf(st, txn.sess) == lexdb_sql.baseName(&t.name) { lexdb_sql.OVR_TSQL } else { s.overriding }
+    let ovr = if s.overriding == lexdb_sql.OVR_NONE && identityInsertOf(st, txn.sql.sess) == lexdb_sql.baseName(&t.name) { lexdb_sql.OVR_TSQL } else { s.overriding }
     var cl: []MClause = []
     var bySource = false
     // the target's columns ON names (Oracle: they cannot be updated)
@@ -14409,7 +14409,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         for k in 0..len(c.targets) {
             let ti = c.targets[k]
             if lexdb_sql.isDefault(&c.exprs[k]) { all[ns + ti] = try defAt(st, txn, &defs, &t, ti) }
-            else { all[ns + ti] = try coerceZ(try evalX(st, txn, &q, &c.exprs[k], &env, mut &rs), &t.cols[ti].typ, &txn.zone) }
+            else { all[ns + ti] = try coerceZ(try evalX(st, txn, &q, &c.exprs[k], &env, mut &rs), &t.cols[ti].typ, &txn.sql.zone) }
         }
         touched.put(key, 1)
         let nw = rowSlice(&all, ns, nt)
@@ -15020,23 +15020,23 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     // outcome of the looks at its parameters' values (optimizer 22), the first whose
     // looks the parameters give again taken.
     var ver = try catVersion(st, txn)
-    if len(txn.path) > 0 { ver = ver + "|" + strings.join(&txn.path, ",") }      // its names resolved by the path
+    if len(txn.sql.path) > 0 { ver = ver + "|" + strings.join(&txn.sql.path, ",") }      // its names resolved by the path
     // the session's temporary objects (9.96): their DDL bumps this, not the catalog's version
-    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memo.get(&tmpVerKey(txn.sess)).unwrapOr("0") }
+    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memo.get(&tmpVerKey(txn.sql.sess)).unwrapOr("0") }
     // the time zone (9.95): nothing planned depends on it now (a value is
     // read in it when the plan runs), but a plan is not kept across it
-    if !txn.zone.isUtc() { ver = ver + "|z" + txn.zone.name }
+    if !txn.sql.zone.isUtc() { ver = ver + "|z" + txn.sql.zone.name }
     // its privileges checked as the role: SET ROLE plans it again (9.83)
-    match st.memo.get(&roleKeyOf(txn.sess)) {
+    match st.memo.get(&roleKeyOf(txn.sql.sess)) {
         Some(r) { if len(r) > 0 { ver = ver + "|r" + r } }
         None {}
     }
-    match st.memo.get(&sessAuthKey(txn.sess)) {
+    match st.memo.get(&sessAuthKey(txn.sql.sess)) {
         Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
         None {}
     }
     // the join order differs where reads are noted (optimizer 29, 33)
-    if txn.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
+    if txn.sql.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.sql.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
     if pc.ver != ver {
         pc.sels = []
         pc.looks = []
@@ -17776,7 +17776,7 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
         return
     }
     var txn = lexdb_store.begin()
-    for x in path { append(mut &txn.path, x) }
+    for x in path { append(mut &txn.sql.path, x) }
     txn.tmp = tmpOf(path)
     match findTable(st, mut &txn, &s.table) {
         Ok(found) {
@@ -17899,7 +17899,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     let dml = s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE
     if s.kind != lexdb_sql.S_SELECT && !(dml && len(s.items) > 0) { return Ok([]) }
     var txn = lexdb_store.begin()
-    for x in path { append(mut &txn.path, x) }
+    for x in path { append(mut &txn.sql.path, x) }
     txn.tmp = tmpOf(path)
     if dml {
         let none: Option[Expr] = None
@@ -17984,7 +17984,7 @@ pub fn (s: mut &Session) startupZone(v: &str): Result[Unit, DbErr] {
 // The session's zone made z, in its open block's transaction too.
 fn (s: mut &Session) setZone(z: lexdb_time.Zone) {
     s.zone = z
-    if len(s.txn) > 0 { s.txn[0].zone = z }
+    if len(s.txn) > 0 { s.txn[0].sql.zone = z }
 }
 
 // A savepoint: its name and the block's writes when it was made.
@@ -18027,12 +18027,12 @@ fn tmpOf(path: &[]str): str {
 // A transaction of the session's: its path, temporary schema, number and
 // time zone.
 fn (s: &Session) setUp(t: mut &lexdb_store.Txn) {
-    t.path = s.txnPath()
+    t.sql.path = s.txnPath()
     t.tmp = s.tmp
-    t.sess = s.id
-    t.zone = s.zone
-    t.rules = s.rules
-    t.memMax = s.maxMem
+    t.sql.sess = s.id
+    t.sql.zone = s.zone
+    t.sql.rules = s.rules
+    t.sql.memMax = s.maxMem
 }
 
 // A transaction ended without committing: if it changed temporary objects'
@@ -18048,7 +18048,7 @@ fn (s: mut &Session) setPath(names: &[]str) {
     if len(p) == 1 && p[0] == "public" { p = [] }
     s.path = p
     s.pathAt += 1
-    if len(s.txn) > 0 { s.txn[0].path = s.txnPath() }
+    if len(s.txn) > 0 { s.txn[0].sql.path = s.txnPath() }
 }
 
 // SHOW's columns: the setting's name, or SHOW ALL's name and setting.
@@ -18175,7 +18175,7 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         let v = strings.toLowerAscii(&(strings.trim(value)))
         if v != "rules" && v != "cost" { return Err(e("22023", "invalid value for parameter \"lexdb_planner\": use cost or rules")) }
         s.rules = v == "rules"
-        if len(s.txn) > 0 { s.txn[0].rules = s.rules }
+        if len(s.txn) > 0 { s.txn[0].sql.rules = s.rules }
         return Ok(Unit{})
     }
     if k == "lexdb_batch" {
@@ -18367,7 +18367,7 @@ fn noticeKey(sess: int): str { return "nt:" + sess.toStr() }
 // condition's own, as PostgreSQL's 42701 for ADD COLUMN IF NOT EXISTS),
 // msg, and a DETAIL ("" none).
 fn notice(st: &lexdb_store.Store, txn: &lexdb_store.Txn, state: &str, msg: &str, detail: &str) {
-    let k = noticeKey(txn.sess)
+    let k = noticeKey(txn.sql.sess)
     let was = st.memo.get(&k).unwrapOr("")
     st.memo.put(&k, &(was + state + "\x01" + msg + "\x01" + detail + "\x00"))
 }
@@ -18469,10 +18469,10 @@ fn (s: mut &Session) resetAll() {
     s.maxSteps = MAX_MATCH_STEPS
     s.timeoutMs = 0
     s.maxMem = MAX_STATEMENT_MEM
-    if len(s.txn) > 0 { s.txn[0].memMax = s.maxMem }
+    if len(s.txn) > 0 { s.txn[0].sql.memMax = s.maxMem }
     s.batch = true
     s.rules = false
-    if len(s.txn) > 0 { s.txn[0].rules = false }
+    if len(s.txn) > 0 { s.txn[0].sql.rules = false }
     s.auto = true
     s.rdel = true
 }
@@ -18816,7 +18816,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 s.rules = rules
-                if len(s.txn) > 0 { s.txn[0].rules = rules }
+                if len(s.txn) > 0 { s.txn[0].sql.rules = rules }
             } else if stmt.table == "lexdb_batch" {
                 var on = true                       // DEFAULT, RESET
                 match stmt.limit {
@@ -18888,7 +18888,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 if stmt.table == "statement_timeout" { s.timeoutMs = if v < 0 { 0 } else { v } }
                 if stmt.table == "max_statement_mem" {
                     s.maxMem = if v < 0 { MAX_STATEMENT_MEM } else { v }
-                    if len(s.txn) > 0 { s.txn[0].memMax = s.maxMem }
+                    if len(s.txn) > 0 { s.txn[0].sql.memMax = s.maxMem }
                 }
             }
             return Ok(tagOnly(if stmt.ifFlag { "RESET" } else { "SET" }))
@@ -18916,12 +18916,12 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.localUndo = []
                 s.savedZone = [s.zone]
                 let q = s.txnPath()
-                s.txn[0].path = q
+                s.txn[0].sql.path = q
                 s.txn[0].tmp = s.tmp
-                s.txn[0].sess = s.id
-                s.txn[0].zone = s.zone
-                s.txn[0].rules = s.rules
-                s.txn[0].memMax = s.maxMem
+                s.txn[0].sql.sess = s.id
+                s.txn[0].sql.zone = s.zone
+                s.txn[0].sql.rules = s.rules
+                s.txn[0].sql.memMax = s.maxMem
             }
             return Ok(tagOnly("BEGIN"))
         }
@@ -18929,7 +18929,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if len(s.txn) == 0 { return Ok(tagOnly("COMMIT")) }
             s.saves = []
             // the deferred foreign key checks (9.85): one failing rolls back
-            if !s.failed && len(s.txn[0].pending) > 0 {
+            if !s.failed && len(s.txn[0].sql.pending) > 0 {
                 let st = s.st
                 let all: Option[[]str] = None
                 match checkPending(&st, mut &s.txn[0], &all) {
@@ -19731,8 +19731,8 @@ fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: 
 fn deferredNow(txn: &lexdb_store.Txn, c: &Table, f: &ForeignKey): bool {
     if !f.deferrable { return false }
     var d = f.deferred
-    if txn.consAll == 1 { d = true } else if txn.consAll == 2 { d = false }
-    for i in 0..len(txn.consNames) { if consNamed(&txn.consNames[i], c, &f.name) { d = txn.consDeferred[i] } }
+    if txn.sql.consAll == 1 { d = true } else if txn.sql.consAll == 2 { d = false }
+    for i in 0..len(txn.sql.consNames) { if consNamed(&txn.sql.consNames[i], c, &f.name) { d = txn.sql.consDeferred[i] } }
     return d
 }
 
@@ -19757,7 +19757,7 @@ fn pendingCheck(kind: int, child: &str, fname: &str, vals: &[]Val): str {
 // Does the pending checks of txn (those of constraints which says, all
 // when which is None) and forgets them.
 fn checkPending(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[]str]): Result[Unit, DbErr] {
-    let all = replace(mut &txn.pending, [])
+    let all = replace(mut &txn.sql.pending, [])
     var keep: []str = []
     var err: Option[DbErr] = None
     let live = txn.live
@@ -19800,7 +19800,7 @@ fn checkPending(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Optio
         }
     }
     txn.live = live
-    txn.pending = keep
+    txn.sql.pending = keep
     match err {
         Some(x) { return Err(x) }
         None { return Ok(Unit{}) }
@@ -19812,9 +19812,9 @@ fn checkPending(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Optio
 fn setConstraints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql.Stmt): Result[Unit, DbErr] {
     let deferred = stmt.table == "constraints:deferred"
     if len(stmt.names) == 0 {
-        txn.consAll = if deferred { 1 } else { 2 }
-        txn.consNames = []
-        txn.consDeferred = []
+        txn.sql.consAll = if deferred { 1 } else { 2 }
+        txn.sql.consNames = []
+        txn.sql.consDeferred = []
         if !deferred {
             let all: Option[[]str] = None
             try checkPending(st, txn, &all)
@@ -19838,8 +19838,8 @@ fn setConstraints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexd
             if !other { return Err(e("42704", &("constraint \"" + lexdb_sql.baseName(&n) + "\" does not exist"))) }
         }
         if !found || !deferrable { return Err(e("42809", &("constraint \"" + lexdb_sql.baseName(&n) + "\" is not deferrable"))) }
-        append(mut &txn.consNames, n)
-        append(mut &txn.consDeferred, deferred)
+        append(mut &txn.sql.consNames, n)
+        append(mut &txn.sql.consDeferred, deferred)
     }
     if !deferred { try checkPending(st, txn, &Some(copyStrs(&stmt.names))) }
     return Ok(Unit{})
@@ -19864,7 +19864,7 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
         // a check a deferred constraint waits for the block's COMMIT with
         // (RESTRICT never waits: PostgreSQL's is not deferrable)
         if (kind == FK_MISSING || (kind == FK_GONE && act != lexdb_sql.FK_RESTRICT)) && txn.inBlock() && deferredNow(txn, c, f) {
-            append(mut &txn.pending, pendingCheck(kind, &child, &f.name, &vals))
+            append(mut &txn.sql.pending, pendingCheck(kind, &child, &f.name, &vals))
             continue
         }
         if kind == FK_MISSING {
@@ -20202,7 +20202,7 @@ const SEQ_TREE: str = "\x02seqs"
 pub type SeqEnv = value record { st: lexdb_store.Store; sess: int; now: int; zone: lexdb_time.Zone }
 
 fn seqEnv(st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[SeqEnv] {
-    return Some(SeqEnv{st: st.handle(), sess: txn.sess, now: txn.now, zone: txn.zone})
+    return Some(SeqEnv{st: st.handle(), sess: txn.sql.sess, now: txn.now, zone: txn.sql.zone})
 }
 
 
@@ -20268,10 +20268,10 @@ fn findSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[O
     var keys: []str = []
     if lexdb_sql.isQual(n) {
         append(mut &keys, if n[0] == 'p' { try tmpQual(st, txn, n) } else { n.toStr() })
-    } else if len(txn.path) == 0 {
+    } else if len(txn.sql.path) == 0 {
         append(mut &keys, n)
     } else {
-        for sc in txn.path { append(mut &keys, lexdb_sql.qual(&sc, n)) }
+        for sc in txn.sql.path { append(mut &keys, lexdb_sql.qual(&sc, n)) }
     }
     for k in keys {
         match try st.get(txn, CATALOG, &(seqRow(&k))) {
@@ -20329,7 +20329,7 @@ fn newSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, typ: int
     d.typ = typ
     // unique: the catalog's version (one per DDL statement) and the time
     // (a temporary one's not: its DDL reads nothing others write, 9.96)
-    d.id = (if tempRel(key) { "t" + txn.sess.toStr() } else { try catVersion(st, txn) }) + "." + time.unixMillis().toStr() + "." +
+    d.id = (if tempRel(key) { "t" + txn.sql.sess.toStr() } else { try catVersion(st, txn) }) + "." + time.unixMillis().toStr() + "." +
            time.monotonicNs().toStr()
     let r = try seqFrom(o, &d, true)
     try txn.put(CATALOG, &(seqRow(key)), &(encSeq(&r)))
@@ -20621,8 +20621,8 @@ fn nextFor(st: &lexdb_store.Store, sess: int, d: &Seq): Result[int, DbErr] {
 // evaluation, under a number of this statement's.
 fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[Unit, DbErr] {
     if len(names) == 0 { return Ok(Unit{}) }
-    let no = num(&st.memo.get(&stmtKey(txn.sess)).unwrapOr("0")) + 1
-    st.memo.put(&stmtKey(txn.sess), &no.toStr())
+    let no = num(&st.memo.get(&stmtKey(txn.sql.sess)).unwrapOr("0")) + 1
+    st.memo.put(&stmtKey(txn.sql.sess), &no.toStr())
     for n in names {
         if n == lexdb_sql.CAT_MARK {
             try bindCatalog(st, txn)
@@ -20639,7 +20639,7 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let ci = colIndex(&t.cols, &strings.toLowerAscii(&(tc[z + 1..len(tc)].toStr())))
             if ci < 0 || len(t.cols[ci].seq) == 0 { continue }
             match try st.get(txn, CATALOG, &(seqRow(&t.cols[ci].seq))) {
-                Some(v) { st.memo.put(&bindKey(txn.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
+                Some(v) { st.memo.put(&bindKey(txn.sql.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
                 None {}
             }
             continue
@@ -20660,7 +20660,7 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let a = try readAcl(st, txn, &relObj(&d.key))
             if !allows(&w, &a, &"U") && !allows(&w, &a, &"w") && !allows(&w, &a, &"r") { return Err(denied(&"sequence", &d.key)) }
         }
-        st.memo.put(&bindKey(txn.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
+        st.memo.put(&bindKey(txn.sql.sess, &n), &(no.toStr() + "\n" + encSeq(&d)))
     }
     return Ok(Unit{})
 }
@@ -20917,14 +20917,14 @@ fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Res
 // Column i's default for a row.
 fn defAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Defs, t: &Table, i: int): Result[Val, DbErr] {
     let sqe = seqEnv(st, txn)
-    if len(d.seqs[i].key) > 0 { return Ok(Val.Int(try nextFor(st, txn.sess, &d.seqs[i]))) }
+    if len(d.seqs[i].key) > 0 { return Ok(Val.Int(try nextFor(st, txn.sql.sess, &d.seqs[i]))) }
     match d.exprs[i] {
         Some(x) {
             let none: []Val = []
             let noCols: []lexdb_sql.ColDef = []
             let noSubs: []SubRes = []
             let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: sqe}
-            return coerceZ(try eval(&x, &env), &t.cols[i].typ, &txn.zone)
+            return coerceZ(try eval(&x, &env), &t.cols[i].typ, &txn.sql.zone)
         }
         None { return Ok(d.vals[i]) }
     }
@@ -21367,7 +21367,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 // a value not of its column's type (insertOne turns them
                 // first, in order): which column, said as PostgreSQL does
                 for k in 0..len(vs) {
-                    match coerceZ(vs[k], &t.cols[targets[k]].typ, &txn.zone) {
+                    match coerceZ(vs[k], &t.cols[targets[k]].typ, &txn.sql.zone) {
                         Ok(_) {}
                         Err(y) { return Err(within(y, &(where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&text(&vs[k]))))) }
                     }
@@ -21655,9 +21655,9 @@ fn fastCopyOne(t: &Table, txn: &lexdb_store.Txn, plan: &FastCopyPlan, p: int, ra
     }
     if anyEsc && strings.indexOfByte(raw, '\\', 0) >= 0 {
         let un = fastCopyUnescape(raw)
-        return fastCopyField(t, &txn.zone, plan, p, &un, mut &b)
+        return fastCopyField(t, &txn.sql.zone, plan, p, &un, mut &b)
     }
-    return fastCopyField(t, &txn.zone, plan, p, raw, mut &b)
+    return fastCopyField(t, &txn.sql.zone, plan, p, raw, mut &b)
 }
 
 // One record: fields to the stored row, the key, and putRowLoad.
@@ -22032,7 +22032,7 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         copyHeader(&res.cols, &s.copy, mut &b)
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
-    let zone = txn.zone
+    let zone = txn.sql.zone
     for r in res.rows {
         replace(mut &b, [])
         copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
@@ -22060,7 +22060,7 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         copyMsgEnd(mut &b, at)
     }
     var count = 0
-    let zone = txn.zone
+    let zone = txn.sql.zone
     try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         let at = copyMsgStart(mut &b)
         copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
@@ -25582,7 +25582,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     if len(lp.conds) == 0 && !direct { return Ok(-1) }
     if !lp.ranges { return Ok(-1) }
     let bp = &lp.bp
-    let zone = txn.zone
+    let zone = txn.sql.zone
     try warmPoints(st, txn, t, &lp.scans)
     for sc in lp.scans {
         var cur = newCursor()
@@ -26015,7 +26015,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     let bp = &lp.bp
     let lv = &q.levels[0]
     let t = &lv.t
-    let zone = txn.zone
+    let zone = txn.sql.zone
     let no = len(op.nodes)
     let nk = if sorting { len(op.knodes) } else { 0 }
     // ORDER BY with LIMIT: the first limit + offset rows (top-N)
@@ -26314,7 +26314,7 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     let lp = &op.lp
     let bp = &lp.bp
     let sqe = seqEnv(st, txn)
-    let zone = txn.zone
+    let zone = txn.sql.zone
     let no = len(op.nodes)
     var n = 0
     var vals: []Val = []
@@ -26614,7 +26614,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         for k in bp.kinds { append(mut &rowKinds, k) }
         for x in bp.needCol { append(mut &rowNeed, x) }
     }
-    let zone = txn.zone
+    let zone = txn.sql.zone
     // the groups: their first rows, and per aggregate its counts, sums and minima or maxima
     let ns = len(specs)
     var firsts: [][]Val = []
@@ -27055,8 +27055,8 @@ fn seqOid(d: &Seq): int { return lexdb_catalog.seqOid(d) }
 fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
     let snap = try catSnap(st, txn)
     var b = newStrBuf()
-    b.add(&("u\t" + currentRole(st, txn.sess) + "\n"))
-    b.add(&("U\t" + sessionUser(st, txn.sess) + "\n"))
+    b.add(&("u\t" + currentRole(st, txn.sql.sess) + "\n"))
+    b.add(&("U\t" + sessionUser(st, txn.sql.sess) + "\n"))
     // the roles: OID, name, superuser, the roles each acts as; and every owner and grant (9.83)
     for r in try rolesIn(st, txn) {
         let w = try whoIs(st, txn, &r.name)
@@ -27129,7 +27129,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     lexdb_syscat.bind(&snap, mut &b)
     for s in snap.schemas { b.add(&("n\t" + lexdb_pg.nspOid(&s).toStr() + "\t" + s + "\n")) }
     b.add("n\t11\tpg_catalog\nn\t13000\tinformation_schema\n")
-    st.memo.put(&catMemoKey(txn.sess), &b.toStr())
+    st.memo.put(&catMemoKey(txn.sql.sess), &b.toStr())
     return Ok(Unit{})
 }
 
@@ -28786,7 +28786,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             return true
         })
     }
-    var cq = CatView{snap: snap, roles: roles, sess: txn.sess, mems: mems}
+    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
@@ -29274,7 +29274,7 @@ fn applyRoleOpts(r: mut &Role, opts: &[]str): Result[Unit, DbErr] {
 // CREATE ROLE, ALTER ROLE, DROP ROLE. Who may: a superuser role, or a
 // session that is no role (trust); a role may change its own password.
 fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
-    let me = currentRole(st, txn.sess)
+    let me = currentRole(st, txn.sql.sess)
     let all = try rolesIn(st, txn)
     var mine = false
     var su = true
@@ -29625,7 +29625,7 @@ fn moveAcl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &str, to: &s
 
 // A new object's owner: the session's current role.
 fn ownNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, obj: &str): Result[Unit, DbErr] {
-    return writeAcl(txn, obj, &Acl{owner: currentRole(st, txn.sess), grants: [], set: false})
+    return writeAcl(txn, obj, &Acl{owner: currentRole(st, txn.sql.sess), grants: [], set: false})
 }
 
 fn roleKeyOf(sess: int): str { return "\x00role\x00" + sess.toStr() }
@@ -29689,7 +29689,7 @@ fn whoIs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[
     }
 }
 
-fn whoNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Who, DbErr] { return whoIs(st, txn, &currentRole(st, txn.sess)) }
+fn whoNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Who, DbErr] { return whoIs(st, txn, &currentRole(st, txn.sql.sess)) }
 
 fn allows(w: &Who, a: &Acl, letter: &str): bool {
     if w.super { return true }
@@ -29724,7 +29724,7 @@ fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &s
 // CREATE in a schema.
 fn needCreate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Unit, DbErr] {
     let sc = lexdb_sql.schemaOf(key)
-    if sc == tempSchema(txn.sess) { return Ok(Unit{}) }        // a session's temporary tables
+    if sc == tempSchema(txn.sql.sess) { return Ok(Unit{}) }        // a session's temporary tables
     let w = try whoNow(st, txn)
     if !(try may(st, txn, &w, &nspObj(&sc), &"C")) { return Err(denied(&"schema", &sc)) }
     return Ok(Unit{})
@@ -29776,8 +29776,8 @@ fn dropLetters(have: &str, gone: &str): str {
 
 // A role spec's name: CURRENT_USER and SESSION_USER resolved.
 fn roleName(st: &lexdb_store.Store, txn: &lexdb_store.Txn, r: &str): str {
-    if r == "#current_user" { return currentRole(st, txn.sess) }
-    if r == "#session_user" { return sessionUser(st, txn.sess) }
+    if r == "#current_user" { return currentRole(st, txn.sql.sess) }
+    if r == "#session_user" { return sessionUser(st, txn.sql.sess) }
     return r.toStr()
 }
 

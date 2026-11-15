@@ -24,7 +24,8 @@ CORE = {
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo",
-    "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows", "lexdb_sql", "lexdb_sqlcoll",
+    "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows",
+    "lexdb_session", "lexdb_sql", "lexdb_sqlcoll",
     "lexdb_store", "lexdb_time",
 }
 
@@ -81,6 +82,15 @@ def family(m):
 
 def check():
     mods = read_modules()
+    # The store carries a transaction's SQL state (Txn.sql) and must not
+    # read it: the boundary is what keeps storage and SQL session state
+    # separable.
+    store = os.path.join(CMD, "lexdb_store.lxl")
+    with open(store, encoding="utf-8") as f:
+        body = f.read()
+    sql_fields = re.findall(r"\.sql\.(?:path|sess|rules|memMax|now|zone|pending|consAll|consNames|consDeferred)\b", body)
+    if sql_fields:
+        bad.append("lexdb_store reads Txn.sql: " + ", ".join(sorted(set(sql_fields))))
     bad = []
     for m in sorted(set(mods) - CORE - DIALECT):
         bad.append(f"{m}: not in the core or dialect sets")
