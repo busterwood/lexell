@@ -75,7 +75,7 @@ small; behavior belongs in the deep modules.
 |---|---|---|---|
 | **`lexdb_store`** | How bytes become durable and visible: COW B+tree, slots, versions, snapshots, cache, log, checkpoint cut, free space, follower push/epochs | `open/begin/commit/abort`, `cursor/lookup/lookupMany/count`, `checkpoint/follow` | 12 read operations; `Node` callbacks; `st.fo` at many sites |
 | **`lexdb_rows`** (new) | How a row is represented: fixed/tagged/column, layouts, overflow, conversion, projection | `Rows.of`, `encodeRow`, `decodeRow`, `encodeLeaf`, `decodeLeaf`, `convert`, one `Projection` | leaf, fixed, tagged/long, column body, batch decoders, `Spec` and `LeafView` moved; the lazy two-step orchestration stays in exec over `LeafView`; universal column leaf and old-format deletion remain |
-| **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | lives inside exec |
+| **`lexdb_catalog`** | Metadata, DDL, dependencies, temp objects | `lookup/define/alter/drop/list` | started: the shared metadata types (Table, Index, constraints, CatSnap, sequences, enums, table types) moved; the behavior lives in exec |
 | **`lexdb_plan`** | Path search, join order, cost model, subquery strategy | `plan(catalog, stmt, params) -> Plan`, `explain` | `Sel`/`Query`/`Level`/`Path` leak into exec |
 | **`lexdb_exec`** | Execution: vectorization, operators, sinks, fallback | `execute(plan, params, sink)`, `collect` | 1,381 functions; 17 representations |
 | **`lexdb_pg`** | PG wire, `pg_catalog`/`information_schema`, auth, PG type/function names, error text, deparse | one `Dialect` facade | started: identifier/name rendering, OID mapping, catalog row helpers and `pg_get_expr` deparse moved; catalog generators, wire/auth and the facade remain in exec |
@@ -101,6 +101,7 @@ main
                  ├── lexdb_like    (simple LIKE pieces)
                  ├── lexdb_dialect (parser-facing dialect facts; data only)
                  ├── lexdb_store   (page, repl internal)
+                 ├── lexdb_catalog (metadata types; behavior still in exec)
                  ├── lexdb_rows    (cols, page internal)
                  ├── lexdb_catalog
                  ├── lexdb_plan

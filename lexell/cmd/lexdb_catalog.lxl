@@ -1,0 +1,158 @@
+// lexdb_catalog: the metadata types shared by the store, the planner, the
+// executor and the dialects: a table and its indexes and constraints, the
+// catalog snapshot the catalog relations are made from, sequences, enums
+// and table types. Behavior stays in the modules that own it; this module
+// is the vocabulary they pass.
+import "./lexdb_rows"
+import "./lexdb_sql"
+
+type Expr = lexdb_sql.Expr
+type FixedLay = lexdb_rows.FixedLay
+
+pub type Index = record {
+    pub name: str
+    pub tree: int
+    pub cols: []int
+    pub unique: bool
+    pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
+    pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
+    pub opts: []str             // per column, its options as shown (opclass, DESC, NULLS ...: 9.85); [] none
+    // per column, an expression's (9.89): where cols holds -1, its value is
+    // exprs' (column names bare); [] none
+    pub exprs: []Expr
+}
+
+pub type Table = record {
+    pub name: str
+    pub tree: int
+    pub cols: []lexdb_sql.ColDef
+    pub pk: []int
+    pub indexes: []Index
+    // Where each column is in a stored row, once a column has been dropped
+    // (9.35): a column keeps its place, and a dropped one's is skipped.
+    // [] when none has been: column i is at i.
+    pub slots: []int
+    pub width: int              // the places a row has (with slots)
+    pub checks: []Check         // CHECK constraints (9.40)
+    pub fks: []ForeignKey       // its foreign keys (9.41)
+    pub refBy: []str            // the tables with foreign keys to it (itself among them if so)
+    // The row layouts its rows may have (9.50): each place's kind (PK_*),
+    // the last one the current. A row names its own; one is added when a
+    // column is added, dropped or retyped, and rows are not rewritten.
+    pub layouts: [][]byte
+    pub lays: []FixedLay            // where each layout's places are (layOfKinds), not stored
+    // A view (9.82): its query's text ("" a table), and the catalog keys of
+    // the relations it reads; its cols are its output columns.
+    pub view: str
+    pub deps: []str
+    // A temporary table's ON COMMIT (lexdb_sql.ONC_*, 9.96): kept for
+    // DELETE ROWS and DROP
+    pub onCommit: int
+    // Its name as written, where that differs from its catalog key's base
+    // name (design/lexdb-tds.md L6: names are matched folded, shown as
+    // written); "" else. Its columns' are their ColDef.spell.
+    pub spell: str
+    // Its primary key constraint's name (and its index's, as the catalog
+    // shows it), "" the default: its name's and _pkey (pkConName). Kept
+    // once it differs: ADD CONSTRAINT name PRIMARY KEY, RENAME CONSTRAINT,
+    // RENAME TO (as PostgreSQL's index keeps its name). 9.117
+    pub pkName: str
+    // Its CHECK and foreign key constraints added NOT VALID and not
+    // validated since, by name (9.117)
+    pub invalid: []str
+}
+
+pub type ForeignKey = record {
+    pub name: str
+    pub cols: []str
+    pub ref: str                // the table's catalog key
+    pub refCols: []str
+    pub onDelete: int           // lexdb_sql.FK_*
+    pub onUpdate: int
+    pub deferrable: bool        // DEFERRABLE, INITIALLY DEFERRED (9.85)
+    pub deferred: bool
+}
+
+pub fn emptyTable(name: &str): Table {
+    return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+}
+
+// A CHECK constraint: a row may not make expr false (column names bare).
+pub type Check = record { pub name: str; pub expr: Expr }
+
+pub type CatIdx = record {
+    pub name: str
+    pub oid: int
+    pub cols: []int             // attnums
+    pub unique: bool
+    pub primary: bool
+    pub con: bool               // a constraint's (primary key, UNIQUE)
+    pub pred: Option[Expr]
+    pub opts: []str             // per column: opclass, DESC, NULLS ... as shown; [] none
+    pub exprs: []str            // per column: an expression's text as PostgreSQL shows it ("" a column's; cols 0); [] none
+}
+
+pub type CatTab = record {
+    pub key: str
+    pub t: Table
+    pub oid: int
+    pub schema: str
+    pub name: str
+    pub shown: str              // as regclass shows it: qualified unless on the path
+    pub idxs: []CatIdx
+}
+
+pub type CatCon = record {
+    pub oid: int
+    pub name: str
+    pub typ: str                // p u f c
+    pub rel: int                // its table's OID
+    pub schema: str
+    pub cols: []int
+    pub refRel: int
+    pub refCols: []int
+    pub idx: int                // conindid
+    pub def: str
+    pub upd: str
+    pub del: str
+    pub check: str              // a CHECK's expression, as PostgreSQL shows it
+    pub deferrable: bool
+    pub deferred: bool
+    pub valid: bool             // convalidated: false for a CHECK or foreign key added NOT VALID (9.117)
+}
+
+pub type CatSnap = record {
+    pub acls: Map[str, str]     // owners and grants, by object, encoded (9.83)
+    pub tabs: []CatTab
+    pub views: []CatTab         // views (9.82): t.view their text, t.cols their columns
+    pub cons: []CatCon
+    pub seqs: []Seq
+    pub schemas: []str          // public and those made
+    pub path: []str
+    pub user: str
+    pub enums: []EnumType       // enum types (9.90)
+    pub procs: []ProcSrc        // stored PL/SQL procedures and functions (O6)
+    pub ttypes: []TabType       // T-SQL table types
+}
+
+// A stored procedure or function: its owner, kind (PROCEDURE or FUNCTION), name and source (lexdb_plsql keeps them in the
+// catalog under "\x02src\x00" and the three).
+pub type ProcSrc = record { pub owner: str; pub kind: str; pub name: str; pub src: str }
+
+pub type Seq = record {
+    pub key: str            // its catalog key
+    pub id: str             // made when it was: its values' memo and durable row
+    pub typ: int            // OID_INT2, OID_INT4, OID_INT8
+    pub inc: int
+    pub min: int
+    pub max: int
+    pub start: int
+    pub cache: int
+    pub cycle: bool
+    pub ownerT: str         // OWNED BY: a table's catalog key and column; "" none
+    pub ownerC: str
+}
+
+pub type EnumType = record { pub key: str; pub oid: int; pub labels: []str }
+pub type TabType = record { pub key: str; pub spell: str; pub body: str }

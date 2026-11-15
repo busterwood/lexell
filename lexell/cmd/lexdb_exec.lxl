@@ -35,6 +35,7 @@ import "base64"
 import "./lexdb_rows"
 import "./lexdb_like"
 import "./lexdb_store"
+import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
@@ -53,82 +54,25 @@ type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
 type DbErr = lexdb_base.DbErr
 
+pub type Index = lexdb_catalog.Index
+pub type Table = lexdb_catalog.Table
+pub type ForeignKey = lexdb_catalog.ForeignKey
+pub type Check = lexdb_catalog.Check
+pub type Seq = lexdb_catalog.Seq
+type EnumType = lexdb_catalog.EnumType
+pub type TabType = lexdb_catalog.TabType
+type CatIdx = lexdb_catalog.CatIdx
+type CatTab = lexdb_catalog.CatTab
+type CatCon = lexdb_catalog.CatCon
+type CatSnap = lexdb_catalog.CatSnap
+type ProcSrc = lexdb_catalog.ProcSrc
+
+fn emptyTable(name: &str): Table { return lexdb_catalog.emptyTable(name) }
+
 fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
-
-pub type Index = record {
-    pub name: str
-    pub tree: int
-    pub cols: []int
-    pub unique: bool
-    pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
-    pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
-    pub opts: []str             // per column, its options as shown (opclass, DESC, NULLS ...: 9.85); [] none
-    // per column, an expression's (9.89): where cols holds -1, its value is
-    // exprs' (column names bare); [] none
-    pub exprs: []Expr
-}
-
-pub type Table = record {
-    pub name: str
-    pub tree: int
-    pub cols: []lexdb_sql.ColDef
-    pub pk: []int
-    pub indexes: []Index
-    // Where each column is in a stored row, once a column has been dropped
-    // (9.35): a column keeps its place, and a dropped one's is skipped.
-    // [] when none has been: column i is at i.
-    pub slots: []int
-    pub width: int              // the places a row has (with slots)
-    pub checks: []Check         // CHECK constraints (9.40)
-    pub fks: []ForeignKey       // its foreign keys (9.41)
-    pub refBy: []str            // the tables with foreign keys to it (itself among them if so)
-    // The row layouts its rows may have (9.50): each place's kind (PK_*),
-    // the last one the current. A row names its own; one is added when a
-    // column is added, dropped or retyped, and rows are not rewritten.
-    layouts: [][]byte
-    lays: []FixedLay            // where each layout's places are (layOfKinds), not stored
-    // A view (9.82): its query's text ("" a table), and the catalog keys of
-    // the relations it reads; its cols are its output columns.
-    pub view: str
-    pub deps: []str
-    // A temporary table's ON COMMIT (lexdb_sql.ONC_*, 9.96): kept for
-    // DELETE ROWS and DROP
-    pub onCommit: int
-    // Its name as written, where that differs from its catalog key's base
-    // name (design/lexdb-tds.md L6: names are matched folded, shown as
-    // written); "" else. Its columns' are their ColDef.spell.
-    pub spell: str
-    // Its primary key constraint's name (and its index's, as the catalog
-    // shows it), "" the default: its name's and _pkey (pkConName). Kept
-    // once it differs: ADD CONSTRAINT name PRIMARY KEY, RENAME CONSTRAINT,
-    // RENAME TO (as PostgreSQL's index keeps its name). 9.117
-    pub pkName: str
-    // Its CHECK and foreign key constraints added NOT VALID and not
-    // validated since, by name (9.117)
-    pub invalid: []str
-}
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
 // primary key or a unique index's columns, in any order). Columns by name.
-pub type ForeignKey = record {
-    pub name: str
-    pub cols: []str
-    pub ref: str                // the table's catalog key
-    pub refCols: []str
-    pub onDelete: int           // lexdb_sql.FK_*
-    pub onUpdate: int
-    pub deferrable: bool        // DEFERRABLE, INITIALLY DEFERRED (9.85)
-    pub deferred: bool
-}
-
-fn emptyTable(name: &str): Table {
-    return Table{name: name, tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
-}
-
-// A CHECK constraint: a row may not make expr false (column names bare).
-pub type Check = record { pub name: str; pub expr: Expr }
-
 // A result column: its name and type OID.
 // spell: its name as written where that differs (L6), "" else; a client is
 // shown label(), lexdb matches name.
@@ -11030,7 +10974,6 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 
 fn enumKey(oid: int): str { return "\x02enum\x00" + oid.toStr() }
 
-type EnumType = record { key: str; oid: int; labels: []str }
 
 fn encEnum(en: &EnumType): str {
     var all: []str = [en.key]
@@ -11179,7 +11122,6 @@ fn alterType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 
 fn tabTypeKey(key: &str): str { return "\x02ttype\x00" + key }
 
-pub type TabType = record { pub key: str; pub spell: str; pub body: str }
 
 fn encTabType(t: &TabType): str {
     var b = newStrBuf()
@@ -20855,20 +20797,6 @@ fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old:
 // block written, skipping what was left of it (as PostgreSQL skips what it
 // logged ahead).
 
-pub type Seq = record {
-    key: str            // its catalog key
-    id: str             // made when it was: its values' memo and durable row
-    typ: int            // OID_INT2, OID_INT4, OID_INT8
-    inc: int
-    min: int
-    max: int
-    start: int
-    cache: int
-    cycle: bool
-    ownerT: str         // OWNED BY: a table's catalog key and column; "" none
-    ownerC: str
-}
-
 fn seqCopy(d: &Seq): Seq {
     return Seq{key: d.key, id: d.id, typ: d.typ, inc: d.inc, min: d.min, max: d.max, start: d.start, cache: d.cache,
                cycle: d.cycle, ownerT: d.ownerT, ownerC: d.ownerC}
@@ -27737,65 +27665,6 @@ fn cloneOptE(x: &Option[Expr]): Option[Expr] {
 
 // quote_ident: the name as is when it needs no quotes.
 fn quoteIfNeeded(n: &str): str { return lexdb_pg.quoteIfNeeded(n) }
-
-type CatIdx = record {
-    name: str
-    oid: int
-    cols: []int             // attnums
-    unique: bool
-    primary: bool
-    con: bool               // a constraint's (primary key, UNIQUE)
-    pred: Option[Expr]
-    opts: []str             // per column: opclass, DESC, NULLS ... as shown; [] none
-    exprs: []str            // per column: an expression's text as PostgreSQL shows it ("" a column's; cols 0); [] none
-}
-
-type CatTab = record {
-    key: str
-    t: Table
-    oid: int
-    schema: str
-    name: str
-    shown: str              // as regclass shows it: qualified unless on the path
-    idxs: []CatIdx
-}
-
-type CatCon = record {
-    oid: int
-    name: str
-    typ: str                // p u f c
-    rel: int                // its table's OID
-    schema: str
-    cols: []int
-    refRel: int
-    refCols: []int
-    idx: int                // conindid
-    def: str
-    upd: str
-    del: str
-    check: str              // a CHECK's expression, as PostgreSQL shows it
-    deferrable: bool
-    deferred: bool
-    valid: bool             // convalidated: false for a CHECK or foreign key added NOT VALID (9.117)
-}
-
-type CatSnap = record {
-    acls: Map[str, str]     // owners and grants, by object, encoded (9.83)
-    tabs: []CatTab
-    views: []CatTab         // views (9.82): t.view their text, t.cols their columns
-    cons: []CatCon
-    seqs: []Seq
-    schemas: []str          // public and those made
-    path: []str
-    user: str
-    enums: []EnumType       // enum types (9.90)
-    procs: []ProcSrc        // stored PL/SQL procedures and functions (O6)
-    ttypes: []TabType       // T-SQL table types
-}
-
-// A stored procedure or function: its owner, kind (PROCEDURE or FUNCTION), name and source (lexdb_plsql keeps them in the
-// catalog under "\x02src\x00" and the three).
-type ProcSrc = record { owner: str; kind: str; name: str; src: str }
 
 fn userKey(sess: int): str { return "\x00user\x00" + sess.toStr() }
 fn catMemoKey(sess: int): str { return "\x00cat\x00" + sess.toStr() }
