@@ -30,7 +30,7 @@ No new runtime flag without a named seam and a deletion phase.
 | Item | What it is | Class | Target | Phase |
 |---|---|---|---|---|
 | `T_LEAF` reader/writer | pre-9.109 page format | deleted | — | done |
-| tagged row (general) | pre-9.50 row format; long/odd values | seam | `Rows`: fixed + `C_ANY`/`C_STUB` overflow | 2 |
+| tagged row (general) | pre-9.50 row format; long/odd values | seam | `Rows`: fixed + `C_ANY` overflow (done for table leaves; the tagged writer remains) | 2 |
 | `LEXDB_ROWFMT` | tagged vs fixed A/B | deleted | `setFixedRows` remains as the test hook | done |
 | `LEXDB_COLUMNS` | row vs column leaf A/B | deleted | old binary for A/B; `setColumns` remains the test hook | done |
 | `LEXDB_COLCHECK` | codec self-check | test-only | `Rows` test hook | test build |

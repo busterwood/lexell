@@ -59,6 +59,7 @@ pub const K_F8: byte = 11
 pub const K_F4: byte = 12
 pub const K_UUID: byte = 13
 pub const K_BYTEA: byte = 14
+pub const K_ANY: byte = 15      // a whole row's bytes (C_ANY)
 
 pub const C_NONE = 0
 pub const C_FOR = 1
@@ -68,6 +69,7 @@ pub const C_TEXT = 4
 pub const C_DICT = 5
 pub const C_UNITS = 6
 pub const C_BIN = 7
+pub const C_ANY = 8              // a whole row's bytes, any layout (K_ANY)
 pub const C_NULLS = 0x80
 
 const VERSION = 1
@@ -394,6 +396,30 @@ fn unitsBin(u: int, ds: int, out: mut &[]byte, at: int, write: bool): int {
 // of one of spec's layouts (all the same one) and parses in it to the byte,
 // or else when every row converts to the current layout (convertRows,
 // 9.114); None otherwise (the leaf stays in rows).
+// A leaf of whole rows, whatever their layouts or values (C_ANY): the
+// escape hatch that keeps a table leaf a column leaf when the typed
+// encoder cannot take it (a tagged row, a stub, mixed layouts). The rows
+// are returned by rowOf/allRows as they were.
+pub fn encodeAny(rows: &[]&str): Option[str] {
+    let n = len(rows)
+    if n == 0 || n > 65535 { return None }
+    var cols: []byte = withCapacity(4 + 2 + n * 2)
+    append(mut &cols, byte(VERSION))
+    append(mut &cols, byte(0xff))
+    append(mut &cols, byte(0xff))
+    append(mut &cols, byte(1))
+    append(mut &cols, K_ANY)
+    append(mut &cols, C_ANY)
+    var end = 0
+    for r in rows {
+        if end + len(r) > 65535 { return None }
+        end += len(r)
+        binary.appendU16LE(mut &cols, end)
+    }
+    for r in rows { appendStr(mut &cols, r) }
+    return Some(strFromBytes(&cols))
+}
+
 pub fn encodeRows(rows: &[]&str, spec: &Spec): Option[str] {
     var conv: []str = []
     return encodeConv(rows, spec, mut &conv)
@@ -1125,6 +1151,12 @@ pub fn parse(s: &str, n: int): Option[[]int] {
             let total = u16At(s, at + 2 * n - 2)
             dir[x + F_X] = at + 2 * n
             at += 2 * n + total
+        } else if c == C_ANY {
+            if k != K_ANY || n == 0 || at + 2 * n > len(s) { return None }
+            dir[x + F_DATA] = at
+            let total = u16At(s, at + 2 * n - 2)
+            dir[x + F_X] = at + 2 * n
+            at += 2 * n + total
         } else if c == C_DICT {
             if k != K_TEXT || at >= len(s) { return None }
             let nd = int(s[at]) + 1
@@ -1148,6 +1180,12 @@ pub fn parse(s: &str, n: int): Option[[]int] {
     }
     if at != len(s) { return None }
     return Some(dir)
+}
+
+// Whether the leaf is a whole-row column leaf (C_ANY): every row's bytes
+// as they were, whatever its layout or kind.
+pub fn isAny(s: &str, dir: &[]int): bool {
+    return dir[1] == 1 && s[4] == K_ANY && codecOf(dir, 0) == C_ANY
 }
 
 pub fn layoutOf(dir: &[]int): int { return dir[0] }
@@ -1380,6 +1418,10 @@ fn rowLen(s: &str, dir: &[]int, i: int, tmp: mut &[]byte): int {
 
 // Row i of the leaf, rebuilt.
 pub fn rowOf(s: &str, dir: &[]int, i: int): str {
+    if isAny(s, dir) {
+        let sp = varAt(s, dir, 0, i)
+        return s[spanStart(sp)..spanEnd(sp)]
+    }
     var tmp: []byte = array(32, byte(0))
     let l = rowLen(s, dir, i, mut &tmp)
     var out: []byte = array(l, byte(0))
@@ -1393,6 +1435,19 @@ pub fn rowOf(s: &str, dir: &[]int, i: int): str {
 // written one after another (their bytes appended).
 pub fn allRows(s: &str, dir: &[]int, ends: mut &[]int): str {
     let n = dir[2]
+    if isAny(s, dir) {
+        var out: []byte = withCapacity(n * 64)
+        var total = 0
+        for i in 0..n {
+            let sp = varAt(s, dir, 0, i)
+            let a = spanStart(sp)
+            let e = spanEnd(sp)
+            appendStr(mut &out, s[a..e])
+            total += e - a
+            ends[i] = total
+        }
+        return strFromBytes(&out)
+    }
     let np = dir[1]
     let nb = (np + 7) / 8
     var vals: [][]int = []          // per place: its integers, booleans (0, 1), units or spans; [] none

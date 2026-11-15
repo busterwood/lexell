@@ -20,8 +20,10 @@ lookup or an empty range is the only separate batch path (`fillPoint`).
 `lexdb_pg` has started the PG dialect: identifier and name rendering, OID
 mapping, catalog row helpers and the expression deparser. The T_LEAF page
 format and the pre-9.113/9.115 layout and time-tagged row compatibility are
-deleted. The universal column leaf, the rest of `ReadView`, the rest of the
-dialect port and the executor/planner phases remain.
+deleted. Table leaves are now always column leaves: a leaf the typed
+encoder cannot take (tagged/odd values, a stored-apart stub, mixed layouts)
+is a `C_ANY` column of its rows' bytes. The rest of `ReadView`, the rest of
+the dialect port and the executor/planner phases remain.
 
 ## 1. Why this exists
 
@@ -207,9 +209,11 @@ stay inside a module and the caller pays one dispatch, not one per value.
    adapter. `page` imports `rows`, and `cols` is below both. Exec keeps thin
    adapters, `rowOf`/`placesOf` (large-value I/O), table metadata and the
    lazy two-step orchestration over `LeafView`; it imports only `rows` and
-   `store`. Next: the universal column leaf, one layout per leaf, overflow
-   for long/odd values (`C_ANY` / `C_STUB`), and the deletion of the
-   tagged-row general form and mixed-layout leaves.
+   `store`. The universal column leaf is done for table leaves: `C_ANY`
+   keeps the rows' bytes when the typed columns cannot, so the row-leaf
+   fallback is only the `setColumns(false)` test hook and trees without a
+   spec (indexes, the catalog). Next: delete the row-leaf fallback from
+   the serving path, then the tagged-row general form.
 3. **ReadView, batch-level.** Live/snapshot/follower; master in-place and
    follower base+delta; replica batch scans. Progress: `scanLeaves` always
    yields `LeafView`; a replica or own-write range is gathered by
@@ -237,8 +241,9 @@ Phases 2 and 3 are designed together; implement Rows first. Phase 5 can run
 in parallel once the port is stable. Phases 6–8 are sequential.
 
 **Where this branch stands.** The T_LEAF page format and the pre-9.113/9.115
-compatibility are gone. The remaining format work (the universal column
-leaf, `C_ANY`/`C_STUB`, the tagged general form and mixed-layout leaves,
+compatibility are gone, and a table leaf is always a column leaf: `C_ANY`
+holds the whole rows when the typed columns cannot. The remaining format
+work (deleting the tagged general form and the serving row-leaf fallback,
 the flat free list) changes bytes and needs the old binary as the control. `ckptLocked` is still the fallback for
 a cancelled cut. The dialect port's root blocker is `lexdb_sql` importing
 `lexdb_pgcat`/`lexdb_syscat`/`lexdb_oracat` for parser tables; breaking
