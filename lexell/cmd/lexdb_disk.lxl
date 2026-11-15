@@ -39,6 +39,7 @@ const O_RDONLY: i32 = 0
 const O_RDWR: i32 = 2
 const O_CREAT: i32 = 64
 const O_DIRECT: i32 = 16384
+const O_DSYNC: i32 = 4096
 const O_DIRECTORY: i32 = 65536
 const O_CLOEXEC: i32 = 524288
 
@@ -80,6 +81,12 @@ var NO_SYNC: bool = false
 pub fn setNoSync(on: bool) { NO_SYNC = on }
 pub fn noSync(): bool { return NO_SYNC }
 
+// The log's writes durable as they return (O_DSYNC, design/lexdb.md 9.131):
+// the default; LEXDB_LOG_DSYNC=0 turns it off (a write, then fdatasync).
+var LOG_DSYNC: bool = true
+pub fn setLogDsync(on: bool) { LOG_DSYNC = on }
+pub fn logDsync(): bool { return LOG_DSYNC && !NO_SYNC }
+
 pub fn real(dir: &str): Fs { return Fs.Real(dir) }
 
 pub fn sim(seed: int): Fs {
@@ -111,6 +118,24 @@ pub fn (f: &Fs) open(name: &str, create: bool): Result[File, lexdb_base.DbErr] {
 // evicted. Offsets and lengths are still whole pages. A simulated file is
 // the same either way.
 pub fn (f: &Fs) openBuffered(name: &str, create: bool): Result[File, lexdb_base.DbErr] { return f.openWith(name, create, false) }
+
+// open of a file that exists, with O_DSYNC as well (the real Fs): each write
+// is durable when it returns, data and what reading it back needs. Into a
+// file already written (a log segment, zero-filled when made) that is one
+// write with FUA on a drive that has it, no journal commit: about a third of
+// a write and an fdatasync on this machine (9.131). A simulated file is
+// opened as open does: its writes still need flush.
+pub fn (f: &Fs) openDsync(name: &str): Result[File, lexdb_base.DbErr] {
+    match f {
+        Fs.Real(dir) {
+            let path = fs.join(dir, name)
+            let fd = openFile(path, O_RDWR | O_DIRECT | O_DSYNC | O_CLOEXEC, 420)
+            if fd < 0 { return Err(lexdb_base.ioErr(&("open " + path), errno())) }
+            return Ok(File.Real(fd, false))
+        }
+        Fs.Sim(_) { return f.openWith(name, false, true) }
+    }
+}
 
 fn (f: &Fs) openWith(name: str, create: bool, direct: bool): Result[File, lexdb_base.DbErr] {
     match f {

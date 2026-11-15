@@ -2785,3 +2785,81 @@ other agents' builds running beside):
 - Selinger, Astrahan, Chamberlin, Lorie, Price, "Access Path Selection in a Relational Database Management System", SIGMOD 1979. Scanned; read page by page (section 13). Copy: https://people.csail.mit.edu/tdanford/6830papers/selinger-access-path-selection.pdf
 - Engines (section 16), read from the official pages: DuckDB join operations, explain and tuning guides (2.0 docs): https://duckdb.org/docs/2.0/guides/performance/join_operations.html ; ClickHouse join execution, query-plan settings, use-statistics, join algorithms: https://clickhouse.com/docs/concepts/features/operations/select/join-execution.md ; MonetDB MAL optimizers and design overview: https://www.monetdb.org/documentation/dev-guide/monetdb-internals/mal-optimizers/ and https://www.monetdb.org/documentation/dev-guide/monetdb-internals/design-overview/ ; SQLite optimizer overview, query planner NG, ANALYZE: https://www.sqlite.org/optoverview.html , https://www.sqlite.org/queryplanner-ng.html , https://www.sqlite.org/lang_analyze.html
 - Graefe (1993, 1995), Moerkotte and Neumann (2006), Markl et al. (2004): from memory, not checked.
+
+## 45. The read costs measured again, on settled tables (2026-11-15)
+
+Sections 36, 41 and 43 measured the costs on tables just inserted: their
+leaves were rows held in memory, never checkpointed. A server's tables are
+column leaves (lexdb 9.112, 9.114) read from their pages. lexdb 9.130's
+cold measurements showed the switch keeping an index far past the point
+where a scan was faster: 50,000 entries of `w`'s 1M rows took 106 ms warm
+by the index and 63 by a scan (224 and 146 cold).
+
+**The programs now measure settled tables:** `calib`, `calib_batch` and
+`calib_index` load, `VACUUM` and `ANALYZE` their tables and checkpoint in a
+first store run, then measure in a second on the same (simulated) disk.
+The tables are read from their pages, warm after the first of each
+median's five runs. Settled, in ns (units of a scan's row):
+
+| | 43 (rows just inserted) | settled |
+|---|---:|---:|
+| a scan's row in batches (the unit) | 28 | 12 |
+| a scan's row read row by row (a hashed table's read) | 307 (12) | 527-568 (44) |
+| a primary key range's row | 42 (1.7) | 22 (1.8) |
+| an index range's entry and its row (2%, scattered) | 483 (17) | 584 (49) |
+| an index range's entry, read alone | 57 (2) | 29 (2.4) |
+| a lookup by primary key per outer row, no order | 709 (25) | 436-648 (36-54) |
+| the same, keys in order | 218 (8) | 404 (34) |
+| a row read once and hashed | 560 (20) | 757-883 (63-74) |
+| a probe, an integer key | 13-21 | 18 (1.5) |
+
+Column leaves made a batched scan 2.3 times cheaper; a row taken out of a
+column leaf alone (by key, or row by row) costs as much as before or more.
+
+**Changed** (`lexdb_exec.lxl`):
+- `COST_IX_ROW` 16 to 49: the switch's ratio (cost mode) is 49, so a range
+  is scanned when the table has at most 49 times its entries (it was 16).
+- `COST_SCAN_INNER` 12 to 44; `HASH_BUILD` 8 to 19 (63 a row hashed, read
+  included); `COST_KEY_ROW` 45 to 36 (a lookup 12 + 36 = 48, the middle of
+  the two measures); `COST_PK_RANGE` 1.7 to 1.8. `COST_DESCENT`,
+  `HASH_PROBE` and `ROW_COST` are as they were (not measured apart).
+
+**Measured with them** (`~/Work/lexdb-bench/la`: bd_ob settled, a fresh
+copy per run):
+- **The 35 benchmark queries, warm** (bench.py, 5 runs, two passes each):
+  geometric mean +0.7%, every query within its passes' spread except 2 ms
+  more on the two 10% ranges (`idx_range_agg`, `idx_range100k`, scanned
+  either way: the switch now counts further before it decides).
+- **Dense ranges of w** (`b between ...`, cold / warm, ms):
+
+| Entries of 1M | before | after |
+|---|---|---|
+| 10k (1%) | 138 / 24 | 128 / 29 |
+| 20k (2%) | 199 / 43 | 149 / 56 |
+| 50k (5%) | 228 / 106 | 157 / 62 |
+
+  The break-even measured on w was about 2.6% warm and 1% cold; 1/49 is
+  between them, so a range near it gains cold and loses warm.
+
+**Plans changed in the suite** (no result changed):
+- `exec_switch`: its cases moved to the new boundary (400 and 420 entries
+  of 20,000; 1 and 2 of 50).
+- `exec_batchindex`: of its random queries, 45 read an index with its rows
+  in batches (76 before): the others are switched to scans.
+- `exec_joinreview`: `big a join big b on b.id = a.sid` looks `b` up per
+  row, `a` read through `big_sid` (keys in order), where it hashed big
+  (the settled measure: 445 ns a row by lookups, 922 by a hash). Its
+  section 2 (the statement's memory) now uses a table the costs hash,
+  `mid5`. A range's table now comes first in section 3, as its title says;
+  the four-table case of the second review starts from `item`.
+- `exec_joincost`: the 20-table chain starts from `c11` again (section 36's
+  doubling estimate, not a cost: the count is the rules' 10).
+
+**Not done:**
+- **A cost for reading from disk.** The model is CPU only. Cold, a scan
+  reads in long runs and an index's rows are scattered reads, so the cold
+  break-even is about half the warm one. Whether the cache holds a table
+  is known to the store (its loaded nodes) but not the kernel's cache.
+- **The ordered lookup's own cost** (34 against 48): section 43's open
+  item; lookups in key order are still costed as any lookup.
+- The suite passes (170).

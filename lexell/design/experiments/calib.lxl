@@ -66,7 +66,22 @@ fn body(st: lexdb_store.Store): int {
         "insert into d select g, (g * 37) % 200000 + 1 from generate_series(1, 20000) g",
         "create table dk (id int primary key, x int)",
         "insert into dk select g, (g * 37) % 10000 from generate_series(1, 1000) g",
+        "create table d2 (id int primary key, x int)",
+        "insert into d2 select g, (g * 37) % 200000 + 1 from generate_series(1, 200000) g",
+        "analyze",
+        // settled as a server's tables are (lexdb 9.114): column leaves, checkpointed
+        "vacuum t", "vacuum d", "vacuum dk", "vacuum d2",
     ] { exec(mut &s, &x) }
+    st.checkpointAll().unwrap()
+    return 0
+}
+
+// The tables read from their pages (a store opened again), warm after the
+// first of each median's runs: as a server's, not as rows just inserted.
+fn measure(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    exec(mut &s, &"set max_statement_mem = 0")
     exec(mut &s, &"set lexdb_planner = rules")
     let scan = med(mut &s, &"select sum(v) from t")
     println("scan     " + (scan / 200000).toStr() + " ns a row")
@@ -90,10 +105,7 @@ fn body(st: lexdb_store.Store): int {
     println("scan1    " + (scan1 / 200000).toStr() + " ns a row (no batches)")
     exec(mut &s, &"set lexdb_batch = on")
     // a hash: d2's 200,000 rows probe t hashed on id (t read once)
-    exec(mut &s, &"create table d2 (id int primary key, x int)")
-    exec(mut &s, &"insert into d2 select g, (g * 37) % 200000 + 1 from generate_series(1, 200000) g")
     exec(mut &s, &"set lexdb_planner = cost")
-    exec(mut &s, &"analyze")
     let d2scan = med(mut &s, &"select sum(x) from d2")
     let hj = med(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
     show(mut &s, &"select sum(t.v) from d2 join t on t.id = d2.x")
@@ -106,5 +118,8 @@ fn body(st: lexdb_store.Store): int {
 }
 
 fn main() {
-    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 1024 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 256 * 1024 * 1024, snapNodes: 1000000, bufferedPages: false}, body).unwrap()
+    let fs = lexdb_disk.sim(5)
+    let o = lexdb_store.Options{cacheBytes: 1024 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 256 * 1024 * 1024, snapNodes: 1000000}
+    lexdb_store.run(fs, o, body).unwrap()
+    lexdb_store.run(fs, o, measure).unwrap()
 }

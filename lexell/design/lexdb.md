@@ -12033,3 +12033,125 @@ did not grow when refilled.
   reference by foreign key) is parked: it takes the row path in batches.
 - The scripts and raw results are in `~/Work/lexdb-bench/bd9/` (`py/`,
   `res*.jsonl`); the data copies were removed.
+
+### 9.130 getMany reads ahead: a batch's missing pages read together
+
+The drive measurements of 2026-11-15 (`~/Work/lexdb-bench/fio/RESULTS.md`)
+showed this disk doing 9,900 random 4 KiB reads a second one at a time and
+118,000 with 16 in flight, at about the same latency (101 against 135 µs).
+`getMany` (9.107) read a batch's missing nodes one at a time: at a node to
+load it loaded it (`load`, one page, parked) and went on from the root.
+
+**Now** (`lookupAhead`): at a node to load, the later keys' paths are
+followed through the nodes in memory, and the first missing node on each is
+read with it by `loadMany` (32 reads in flight, pages in a row in one read),
+as commits load their leaves. At most `LOOKUP_AHEAD` (64) nodes, and a 32nd
+of the cache's budget as `runAt`; the probe stops `LOOKUP_GAP` (256) keys
+after the last node it found. The keys are probed through the same
+`fingerTo`, so the reads are what the lookups would have read, only sooner;
+what is noted for serializable reads is unchanged (noting stays in the main
+loop). A cold tree's first lookup still reads its root alone; the next
+round reads the next level's nodes together.
+
+**Measured** (`~/Work/lexdb-bench/la`: `cold.py`, bd_ob's w, d, t, a fresh
+server per cold run, the data file evicted from the kernel's cache, 5 runs,
+wall ms median; warm unchanged on all):
+
+| Query, cold | Before | After |
+|---|---:|---:|
+| `idx_range1k` (w_b, about 1,000 rows) | 117 | 23 |
+| `idx_range5k` | 263 | 71 |
+| `idx_range20k` | 308-454 | 159-181 |
+| `join_d_w` (1,000 lookups into w by key) | 105 | 21 |
+| `idx_range50k` | 152-193 | 161-210 (+9%) |
+| `in1000`, `join_t_w`, `corr_sub`, `pk_range100k`, `count(*)` | unchanged | |
+
+- **The 50k range** reads nearly every leaf of w (23,330 pages both ways):
+  each sorted batch's keys are about 23 leaves apart, and read one at a time
+  the kernel's read-ahead brought in the leaves later batches needed. Read
+  32 at a time they look random to it. Server CPU +7%, in the kernel (the
+  user-space profiles are the same). A full scan is cheaper than either
+  (`count(*)` cold 85 ms): the planner choosing it there is the better fix.
+- **Not reached:** `IN` lists (`in1000`: 1,000 keys, read one at a time, not
+  by `getMany`); lookups whose input batches hold few keys after a filter
+  (`join_t_w`: about one key per batch of t); per-row subqueries.
+- The suite passes (170).
+
+### 9.131 The log written O_DSYNC: a commit is one write
+
+The drive measurements of 2026-11-15 (`~/Work/lexdb-bench/fio/RESULTS.md`):
+a 4 KiB `O_DIRECT` write then `fdatasync` took 561-577 µs; the same write
+into an already-written file opened `O_DIRECT|O_DSYNC` took 198 µs (p99
+272). The kernel makes that one write with FUA when no metadata changes,
+with no journal or btrfs log-tree commit. The log writer wrote each batch's
+frame and then flushed it (`segF.flush()`, `fdatasync`).
+
+**Now:**
+- `openSeg` zero-fills a new segment through the plain `O_DIRECT` handle and
+  flushes it, as before (or takes the spare, already written), then reopens
+  it with `Fs.openDsync` (`O_RDWR|O_DIRECT|O_DSYNC`). The writer does not
+  flush that handle: a frame is durable when its write returns. A failed
+  write fails the store, as a failed flush did.
+- Only the real Fs: a simulated file is opened as before and still flushed,
+  so the crash simulation keeps its model of what a flush makes durable.
+- `--unsafe-no-sync` opens the segments without it (nothing synced).
+- `LEXDB_LOG_DSYNC=0` restores the write and `fdatasync`, for comparison.
+- **Durability** is O_DSYNC's guarantee: the data and the metadata needed to
+  read it back are on stable storage when the write returns, on any file
+  system. **The speed** needs the segment already written (it is) and a
+  file system that overwrites in place: ext4, XFS, btrfs NOCOW (9.61). On a
+  copy-on-write file each write is a full sync, about what the flush was.
+
+**Measured** (pgbench 18.6, `-M simple`, autocommit single-row
+`INSERT ... ON CONFLICT DO NOTHING` into a fresh table, 10 s per point, two
+passes alternating; `~/Work/lexdb-bench/ds/run.sh`; the passes agree within
+1%):
+
+| Clients | write + fdatasync | O_DSYNC |
+|---:|---:|---:|
+| 1 | 1,545/s, 0.647 ms | 3,890/s, 0.257 ms |
+| 4 | 3,265/s, 1.23 ms | 9,410/s, 0.425 ms |
+| 16 | 12,600/s, 1.27 ms | 34,240/s, 0.467 ms |
+
+- **Tests:** the suite (170), `logdir.py`, `nosync.py`, `replica.py`, and the
+  crash test (20 rounds, SIGKILL and SIGTERM on the real disk) pass. A power
+  cut is not tested here: that is the drive's FUA, which the kernel uses
+  only where the drive reports it (`queue/fua`: 1 on both drives here).
+- The checkpoint's page writes still end with `fdatasync` (one per
+  checkpoint, many pages).
+
+### 9.132 IN lists' keys read ahead (Store.warm)
+
+9.130's read ahead reached only `getMany`'s callers. A list of primary keys
+(`id in (...)`, an IN subquery's or an array's values) is a list of point
+scans (`pathScans`), read key by key by `fetch`'s `get` in the row path and
+in the batch loops (`batchLevel`, `eachOut`, `sortBatches`, `winBatch`).
+
+**Now:** before such a list is read, `warmPoints` gives its keys to
+`Store.warm`: the keys' paths are followed through the nodes in memory and
+each round's missing nodes are read together (`lookupAhead`, `loadMany`),
+as `getMany` reads them. `warm` reads no value and notes nothing, so what
+the list's reads then give and note is as before, writes and locking reads
+included. A failed store, a cancelled snapshot or a missing version ends it
+quietly; the reads after it give the error.
+
+**Measured** (`~/Work/lexdb-bench/la`, `cold.py`, on a settled copy of bd_ob:
+every table vacuumed (column leaves) and checkpointed, a fresh copy per
+build; cold, 5 runs, ms):
+
+| Query | main | 9.130 | 9.132 |
+|---|---:|---:|---:|
+| `in1000` (1,000 keys scattered over w) | 132 | 132 | 57 |
+| `idx_range1k` | 99 | 35 | 30 |
+| `idx_range5k` | 354 | 80 | 80 |
+| `join_d_w` | 93 | 23 | 23 |
+| `idx_range20k` | 144 | 193 | 194 |
+| `idx_range50k` | 208 | 229 | 226 |
+
+The dense ranges (20k and 50k rows) are the cost model's (optimizer 45).
+A note on method: bd_ob's tables were written before column leaves, and
+scans convert leaves as they read them (9.114), so a copy's layout changed
+as the benchmark ran (the file grew 169 to 191 MB, and cold reads on it
+slowed by up to 4 times). Cold benchmarks need a settled copy.
+
+The suite passes (170).

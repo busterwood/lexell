@@ -2835,6 +2835,15 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
     return -1
 }
 
+// Read ahead for getMany (lexdb.md 9.130): at a node to load, the later
+// keys' paths are followed through the nodes in memory, and the first node
+// each needs that is not is read with it (loadMany: READS_IN_FLIGHT at a
+// time). At most LOOKUP_AHEAD nodes (and a 32nd of the cache's budget, as
+// runAt), and the probe stops LOOKUP_GAP keys after the last node it
+// found: keys whose paths are in memory cost it a descent each.
+const LOOKUP_AHEAD = 64
+const LOOKUP_GAP = 256
+
 // get (part: getPart) of each of keys in turn, their values (or None)
 // appended to out: what as many calls give, their reads noted as they note
 // them, in the same order. The store's lock is taken once for as many keys
@@ -2856,6 +2865,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
     var i = 0
     while i < n {
         var need = -1
+        var ahead: []int = []           // need, and the nodes the next keys need (read ahead)
         var bad: []lexdb_base.DbErr = []
         var apart = false               // out's last value is stored apart: unstore it first
         st.sh.with(fn(db: mut &Db) {
@@ -2888,7 +2898,10 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                 var d = -1
                 if root >= 0 {
                     d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
-                    if d == -1 { return }
+                    if d == -1 {
+                        ahead = db.lookupAhead(root, snap, q, keys, i, need)
+                        return
+                    }
                     if d == -2 {
                         append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
                         return
@@ -2933,7 +2946,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
         })
         if len(bad) > 0 { return Err(bad[0]) }
         if need >= 0 {
-            try st.load(need)
+            if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
             continue
         }
         if apart {
@@ -2941,6 +2954,77 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
             let v = out[at].unwrap()
             out[at] = Some(try st.unstore(t, tree, &keys[i - 1], &v))
         }
+    }
+    return Ok(Unit{})
+}
+
+// The nodes to read for getMany at keys[i], which needs node need: need,
+// then the first node not in memory on each later key's path, each once
+// (getMany's read ahead, above).
+fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]str, i: int, need: int): []int {
+    var out: []int = [need]
+    let most = min(LOOKUP_AHEAD, db.opts.cacheBytes / (32 * PAGE))
+    var f = newFinger()
+    var last = i
+    var j = i + 1
+    while j < len(keys) && len(out) < most && j - last <= LOOKUP_GAP {
+        var nd = -1
+        let d = db.fingerTo(mut &f, root, snap, q, &keys[j], mut &nd)
+        if d == -2 { break }
+        if d == -1 {
+            var seen = false
+            for x in out { if x == nd { seen = true } }
+            if !seen {
+                append(mut &out, nd)
+                last = j
+            }
+        }
+        j += 1
+    }
+    return out
+}
+
+// Brings into memory the nodes the lookups of keys will need (lexdb.md
+// 9.132), each round's missing nodes read together as getMany reads them
+// (lookupAhead, loadMany). It reads no value and notes nothing: what the
+// caller then reads key by key (get) is as before, and so is what it notes.
+// A failed store, a cancelled snapshot or a missing version ends it
+// quietly: the reads after it give the error.
+pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_base.DbErr] {
+    let n = len(keys)
+    if st.fo.isSome() || n < 2 { return Ok(Unit{}) }
+    let snap = t.snap >= 0 && !t.live
+    let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    var i = 0
+    while i < n {
+        var ahead: []int = []
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 || (snap && db.snapGone(t.snap)) {
+                i = n
+                return
+            }
+            let root = if snap { sroot } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            if root < 0 {
+                i = n
+                return
+            }
+            let q = if snap { t.snapSeq } else { db.seq }
+            var f = newFinger()
+            while i < n {
+                var need = -1
+                let d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
+                if d == -2 {
+                    i = n
+                    return
+                }
+                if d == -1 {
+                    ahead = db.lookupAhead(root, snap, q, keys, i, need)
+                    return
+                }
+                i += 1
+            }
+        })
+        if len(ahead) > 0 { try st.loadMany(&ahead) }
     }
     return Ok(Unit{})
 }
@@ -4299,7 +4383,19 @@ fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.D
         }
         try f.flush()
     }
+    if fs.isReal() && lexdb_disk.logDsync() {
+        // the appends durable as they return: no fdatasync after each (9.131)
+        f.close()
+        return fs.openDsync(&name)
+    }
     return Ok(f)
+}
+
+// Whether the writer's segment writes are durable without a flush (openSeg).
+fn (st: &Store) segDsync(): bool {
+    var r = false
+    st.sh.with(fn(db: mut &Db) { r = db.logFs.isReal() && lexdb_disk.logDsync() })
+    return r
 }
 
 fn (st: &Store) fail(e: lexdb_base.DbErr) {
@@ -4332,6 +4428,7 @@ pub fn writer(st: Store): int {
         segBytes = db.opts.segBytes
     })
     var segF = lexdb_disk.File.Real(-1, false)
+    let dsync = st.segDsync()
     match st.openSeg(segNo, segBytes) {
         Ok(f) { segF = f }
         Err(e) {
@@ -4400,11 +4497,13 @@ pub fn writer(st: Store): int {
                 return 1
             }
         }
-        match segF.flush() {
-            Ok(_) {}
-            Err(e) {
-                st.fail(e)        // never retried: the store stops (fsyncgate, 4.1)
-                return 1
+        if !dsync {
+            match segF.flush() {
+                Ok(_) {}
+                Err(e) {
+                    st.fail(e)        // never retried: the store stops (fsyncgate, 4.1)
+                    return 1
+                }
             }
         }
         segOff += len(fr)
