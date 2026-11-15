@@ -12458,3 +12458,41 @@ rows grown past their leaves' estimate (cut again). Made clean too soon
 (the `since` test or the inner nodes' test removed), it loses 6 to 56 rows.
 `exec_privsx` (CHECKPOINT refused to a role); `exec_switch` (settled
 by CHECKPOINT). The suite (171), `crash.py` 20 rounds, `replica.py` 12.
+
+**The module split** (2026-11-15, `arch/deep-modules-2`). Three cuts,
+each gated by the full suite (168) and `replica.py`:
+
+- **Grammar out of the language model.** `lexdb_sql` keeps the values,
+  types, expressions, columns, statements and their text;
+  `lexdb_parse` gets the tokens, lexer, recursive-descent parser, T-SQL
+  cursor and Oracle read mode. `lexdb_sql` no longer imports
+  `lexdb_dialect`; the storage stack (`rows`, `cols`, `page`, `store`,
+  `catalog`) imports the model only. A table type now carries the
+  columns of its CREATE TABLE text, so the catalog no longer calls the
+  parser.
+- **Catalog tree and snapshot out of exec.** `lexdb_catalog` owns the
+  table/view/sequence/enum/type codecs, the readers, the catalog-key
+  scan that hides other sessions' temporary objects, the snapshot
+  builder, and PostgreSQL's naming rules (`quoteIfNeeded`, `shownBy`,
+  `fkAction`, `colList`, OIDs). The decoders take the expression parser
+  as a function, so the catalog does not import the grammar. The
+  snapshot takes a one-field `Naming` record (`exprText`); all three
+  dialects share PostgreSQL's naming for now. Exec keeps forwarders.
+- **Planner vocabulary.** `lexdb_plan` owns `Path`, `Bound`, `Look`,
+  `Cmp`, `EqClass`, `BindCol`, `WayCand`, `Way`, `Est`, `Common`, `Fig`,
+  the statistics estimates and the cost constants. The executor still
+  builds and reads the representation; the path/join-order search and
+  `Query`/`Level`/`Sel` are the next cut (they need value coercion and
+  index-key encoding in a core home first).
+
+Measured: the 35-query A/B against a binary built from current `main`
+(same fresh data, 3 runs, CPU from schedstat) is a geometric mean of
+1.003, median 1.0, worst query 1.04. The write path (`dml.py`) is within
+noise. The earlier 1.19 reading was against a pre-heap-trim binary and
+is not comparable.
+
+Deliberately not attempted: the connection-time `Dialect` composition
+(exec still imports seven dialect modules), the catalog DDL interface
+and opaque table mutation, and the path/join-order search. The design
+for those, and the parked storage/executor/cleanup work, is in
+[lexdb-refactor-followups.md](lexdb-refactor-followups.md).

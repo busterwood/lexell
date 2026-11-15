@@ -39,6 +39,93 @@ Agreed, in this order:
 Explicitly out of scope: point 3 (storage seam), point 6 (executor),
 point 7 (continuous cleanup), and planner option B.
 
+## What landed on `arch/deep-modules-2`
+
+- **Parser split (point 2): done.** `lexdb_parse` has the tokens,
+  lexer, parser, T-SQL cursor and Oracle read mode; `lexdb_sql` is the
+  language model and imports no dialect. A table type stores its columns,
+  so the catalog never parses CREATE TABLE text.
+- **Catalog (4a): codec, readers, snapshot and naming moved.** What
+  remains from 4a is name resolution (`catKey`, temp keys, `createKey`)
+  and the writers (`findTable`'s `setSpec` is exec's), because both still
+  reach schema creation and store specs. `findTable` resolves the name in
+  exec and then calls the catalog reader.
+- **Planner (5): the data vocabulary moved.** `Path`, `Bound`, `Look`,
+  `Cmp`, `EqClass`, `BindCol`, `WayCand`, `Way`, `Est`, `Common`, `Fig`
+  and the cost constants are in `lexdb_plan`; `Query`/`Level`/`Sel`,
+  `choosePath`, `pathFig`, `costOrder` and EXPLAIN are still in exec.
+- **Dialect boundary (1): naming and the snapshot moved.** The seven
+  exec→dialect imports remain.
+
+## Remaining: 1. closing the dialect imports
+
+The remaining edges are auth (`applyRoleOpts`), function dispatch
+(`isDialectFn`/`callDialectFn`, `orafn.resultOid`), catalog rows
+(`catRows`), catalog binding (`bindCatalog`), type describe
+(`declOf`/`tableDecls`/`DescribeDecl`/`oraDecl`/`typPS`/`typScale`/
+`outType`) and the PG catalog-function helpers (`callCat`, `callMisc`,
+`sysCall`, `srfCols`, `regCast`, `enumOf`, `waitShape`, `createView`'s
+relation checks).
+
+The shape that closes them without moving thousands of lines:
+
+1. Define a `Dialect` record in exec (the hook signatures use exec types
+   such as `SeqEnv`, `Env` and `OutCol`), with one field per cluster:
+   `naming`, `catalogRows`, `bindCatalog`, `srfCols`, `isFn`, `callFn`,
+   `fnOid`, `authParse`, `authMake`, `authParseOra`, `authMakeOra`, and
+   `describe`.
+2. Build the union in a new **composition module** (`lexdb_server`) that
+   imports exec and every dialect family. The import gate treats it as a
+   protocol/composition module, not core. `lexdb_wire`, `lexdb_tds` and
+   `lexdb_tns` already import exec; they import the composition module
+   and pass the record to `newSession(st, dialect)`.
+3. Move the T-SQL describe (`DeclCol`, `declOf`, `tableDecls`,
+   `describeDecl`, tag helpers) into `lexdb_tds`, and the Oracle describe
+   into `lexdb_tns`; the protocols call their own.
+4. Keep `bindCatalog` in exec but split it: neutral lines
+   (`u/U/R/A/p/T/n`) stay, the PG relation/index/view lines move to
+   `lexdb_pg.bindCatalog`, `lexdb_syscat.bind` stays, and the hook calls
+   both.
+5. Delete `KNOWN_CORE_DIALECT` from `tests/lexdb/imports.py` and make the
+   gate exact.
+
+`Session` must carry the record; `newSession` grows a parameter and the
+four call sites (wire, TDS twice, TNS) plus the two LXL generators supply
+it. Function evaluation gets it through `Env`/`SeqEnv` for the paths that
+can call a dialect function; paths with `seq: None` are constant folding
+and do not.
+
+## Remaining: 4. catalog DDL (4b/4c)
+
+`encTable`/`decTable` and the readers are in catalog; the writers and
+name resolution are not. The next cut is the DDL translation:
+
+- Move `catKey`, `createKey`, `createSchema`, temp-key handling and
+  `bumpCatalog`/`tmpBump` into catalog, behind a `Catalog` handle.
+- Exec translates `CREATE/ALTER/DROP` statements into `TableDef` and
+  semantic `Alter` values; catalog applies them and enforces dependency
+  checks (FKs, views, owned sequences, indexes on dropped columns).
+- Then make `Table`/`Index` mutation opaque and map `CatErr` to dialect
+  errors in exec. `ANALYZE`/`VACUUM` data scans and leaf rewrites stay
+  out of catalog.
+
+## Remaining: 5. the planner's search and plan types
+
+Moving `Query`/`Level`/`Sel` needs two things first:
+
+- the value coercion (`coerce`/`coerceZ`/`coerceFloat`/`coerceTime`) and
+  the index-key encoding (`encIdxPart` and its value encoder) in a core
+  module that both plan and exec can use; today they are exec-local;
+- a `Fold` record for the constant evaluator: `constVal` and `litValue`
+  call `eval`, which cannot move. `Query` can carry `fold: Fold` so its
+  methods call `q.fold.constVal`/`litValue` without threading a parameter
+  through every signature.
+
+Then the types and all their methods move together (LXL methods live with
+their type), `choosePath`/`pathFig`/`costOrder`/`wayCands` follow, and
+EXPLAIN moves with the plan. Fields are public while exec reads them.
+
+
 ## Deferred: 3. storage seam
 
 Highest-risk phase and the one the owner was least comfortable with. Do
