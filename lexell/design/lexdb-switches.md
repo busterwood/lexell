@@ -31,13 +31,12 @@ No new runtime flag without a named seam and a deletion phase.
 |---|---|---|---|---|
 | `T_LEAF` reader/writer | pre-9.109 page format | delete | — | 1 |
 | tagged row (general) | pre-9.50 row format; long/odd values | seam | `Rows`: fixed + `C_ANY`/`C_STUB` overflow | 2 |
-| `LEXDB_ROWFMT` | tagged vs fixed A/B | old binary | fixed only; delete the flag | 1 |
+| `LEXDB_ROWFMT` | tagged vs fixed A/B | deleted | `setFixedRows` remains as the test hook | done |
 | `LEXDB_COLUMNS` / `setColumns` | row vs column leaf A/B | seam | `LeafCodec` in Rows/Store; old binary for A/B | 2 |
 | `LEXDB_COLCHECK` | codec self-check | test-only | `Rows` test hook | test build |
 | `olderKinds`, `upgradeLayouts`, `setLegacyKinds` | pre-9.113 layouts | delete | — | 1 |
 | `legacyTimeRows`, `timeTagged` | pre-9.115 tagged-time rows | delete | — | 1 |
 | flat free list in the meta page | pre-runs free encoding | delete | runs only | 1 |
-| `Db.owner` | dead bookkeeping | delete | — | 1 |
 | `st.fo` | live vs follower read view | seam | `ReadView` (batch-level) | 3 |
 | `scanLeaves` returning false on a follower | leaf representation leaking to exec | seam | `ReadView.nextBatch` | 3 |
 | `rs.batch` / `Run.batch` | master switch for batches, compiled expressions, outputs, typed sort | seam | `ExecStrategy`; compiled/typed always on | split 1, seam 6 |
@@ -93,7 +92,7 @@ and `lexdb_planner` are next.
 
 | Phase | Delete | Gate |
 |---|---|---|
-| 1 | `T_LEAF`, old layouts, dead hooks, flat free list, `Db.owner`, `LEXDB_ROWFMT`; keep the tagged writer as the overflow form for now | suite subset, targeted store/format tests |
+| 1 | `T_LEAF`, old layouts, dead hooks, flat free list, `LEXDB_ROWFMT`; keep the tagged writer as the overflow form for now | suite subset, targeted store/format tests |
 | 2 | tagged row as a general format (replaced by `C_ANY`/`C_STUB`), mixed-layout leaves, row-leaf table fallback, `LEXDB_COLUMNS` production switch, `setUpgradeBudget` / upgrade queue | `cols_codec`, `exec_cols`, `exec_upgrade`, `exec_rowfmt`, byte-exact checks |
 | 3 | `st.fo` branches, `scanLeaves` false-on-follower, push/poll duplication | `follow_basic`, `follow_covers`, `exec_replica`, `replica.py` |
 | 4 | `ckptLocked` / `CUT_TRIES` fallback; decide `CUT_POOL` | `store_ckptcut` (including cancelled snapshot, real disk, pool) |

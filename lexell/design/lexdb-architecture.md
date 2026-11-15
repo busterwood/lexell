@@ -174,10 +174,10 @@ stay inside a module and the caller pays one dispatch, not one per value.
 
 0. **Architecture and inventory** (this branch). No code changes.
 1. **Dead compatibility cleanup and the `rs.batch` split.** `T_LEAF`, old
-   layout compatibility, dead test hooks, flat free list, `Db.owner`. Keep
-   the tagged writer as the overflow form until Rows replaces it. Split
-   `rs.batch`: compiled expressions and typed sort always on; the flag
-   controls vector scans only. Time-boxed.
+   layout compatibility, dead test hooks, flat free list. Keep the tagged
+   writer as the overflow form until Rows replaces it. Split `rs.batch`:
+   compiled expressions and typed sort always on; the flag controls vector
+   scans only. Time-boxed.
 2. **Rows / codec.** Start with `encodeLeafK`; then the universal column
    leaf, one layout per leaf, overflow for long/odd values, `C_ANY` /
    `C_STUB`.
