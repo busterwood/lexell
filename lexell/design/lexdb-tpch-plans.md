@@ -310,8 +310,10 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   column has more than one value or the one it has: for `<>` that is the
   whole check, since a mixed key always holds a value that differs from
   whatever the outer row has, and a NULL never matches. The batch probe
-  filters the key's rows without making a candidate row. q21 21.16 ->
-  19.88 s warm.
+  filters the key's rows without making a candidate row, and the build
+  keeps no candidate rows at all (only the summary): anyway unreadable,
+  they were 6M and 3.79M two-column rows on q21. q21 21.16 -> 19.88 ->
+  14.14 s warm.
 - **A semi-join subquery's scan reads only its key columns.** The
   subquery is planned while its SELECT list is still `select *`, so its
   level has no `need` and the scan fetches every column; unnesting then
@@ -351,13 +353,13 @@ and q3's 8.30x against PostgreSQL are mostly that, not code).
   alone.
 
 A warm full run (one run, `out/lexdb.tsv`) completes all 22 queries: q1
-17.1 s, q21 15.5 s, q13 5.86 s, q7 4.91 s, q4 4.32 s, q12 1.33 s, q19
+15.9 s, q21 14.9 s, q13 5.92 s, q7 5.08 s, q4 4.39 s, q12 1.21 s, q19
 0.46 s. The A/B figures above are the measurements; the run-level
 comparison to the pre-fix baseline is not, because that baseline run was
 the first after the load (queries it did not touch moved 0.84-1.01x from
 cache warmth alone).
 
-Still open: q4's semi-join is now 24x PostgreSQL and q21's 21x, down
+Still open: q4's semi-join is now 25x PostgreSQL and q21's 22x, down
 from 44x and 35x; q19 is 13x, q7 8.6x and q12 1.7x, down from 248x, 22x
 and 8.7x.
 PostgreSQL's q21 plan scans lineitem once (433 ms),
