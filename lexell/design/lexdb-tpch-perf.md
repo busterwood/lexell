@@ -101,6 +101,24 @@ Split by cause, not by query, so each owns a part of the engine. Worktree
 | `joinorder` | the join order search and its estimates: selectivity, pushing a table's filters into its path before the search, equivalence classes, starting from the selective dimension | q5, q7, q8, q9, q10, q3's order | `optimizer/path/joinrels.c`, `allpaths.c`, `clausesel.c`, `equivclass.c`, `costsize.c`, `utils/adt/selfuncs.c` |
 | `outer` | join methods for large and outer joins (hash right join, hash vs a lookup per row), IN over a grouped subquery, top-N and group aggregation on the sort | q13, q18, q12, q3/q10's sort and LIMIT | `nodeHashjoin.c` (right/full), `optimizer/path/joinpath.c`, `utils/sort/tuplesort.c` (bounded heap), `nodeAgg.c` (sorted grouping) |
 
+**Decision, 2026-11-16: refactor the executor as the `exec` work, not
+before it.** The review of the TPC-H merge found three regressions where
+the batch path re-implemented row-path semantics and drifted (the "<>"
+summary's batch key map and its crash, batched IN lists ignoring the
+session's zone), and every speed-up has to be written twice while the two
+paths exist. `lexdb-architecture.md` section 8's phases 6-8 (one batch
+driver, one expression IR with scalar and vector backends, a chunked
+pipeline with one hash table and comparator) are close to the executor
+that closes q1's gap. So `exec` designs those phases from PostgreSQL's
+executor and the q1/q6/q14 profiles, and builds them in shippable steps,
+each gated by the suite, the checksums and an A/B. New executor code goes
+in new modules below exec where it can. The plan-side workstreams
+(`semi`, `joinorder`, `outer`) carry on: their changes are local. Once
+their first branches merge, the orchestrator splits `lexdb_exec.lxl`
+mechanically (the planner search into `lexdb_plan`, the batch engine into
+its own module) and catches `arch/exec-extract` up with main, so the split
+has nothing in flight to conflict with.
+
 Boundaries: `semi` owns semi/anti levels (`semiJoins`, `semiLevel`,
 `materialize` and `bProbe` for them); `joinorder` owns the order of the
 ordinary tables; `outer` owns the choice of join method for ordinary
