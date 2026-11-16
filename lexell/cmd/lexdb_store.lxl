@@ -177,6 +177,7 @@ pub type Db = record {
     histSlots: []int            // the slots with old versions
     deferred: []Deferred        // slots freed while a snapshot may reach them
     rootHist: []RootChange      // root changes a snapshot may still need
+    lateRoots: int              // root changes a live snapshot saw at its own commit (setRoot, snapRoot)
     durableSeq: int             // the last commit the log holds: snapshots read as of it
     holds: Map[int, HoldAt]     // each follower's hold (9.73); the fields below are the oldest's
     holdCkpt: int               // a follower reads checkpoints from this one on (9.71), -1 none:
@@ -342,7 +343,8 @@ pub type Txn = record {
     created: []int
     snap: int                   // its reads' snapshot's id, -1 for none (reads of the live tree)
     snapSeq: int
-    snapTrees: Map[int, int]    // the tree roots as the snapshot sees them
+    snapTrees: Map[int, int]    // the tree roots as the snapshot sees them when it began (snapRoot)
+    snapLate: int               // Db.lateRoots when it began
     track: bool                 // a snapshot's reads are noted (Mark) for its writes' commit: a transaction block
     pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
     pub sql: lexdb_session.SqlTxn // the SQL layer's state; store carries it, never reads it
@@ -375,7 +377,7 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
+    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
                raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
@@ -1692,7 +1694,30 @@ fn (db: mut &Db) setRoot(tree: int, slot: int) {
     db.shape += 1
     let prev = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
     if db.seq > db.durableSeq || db.maxSnap() >= 0 { append(mut &db.rootHist, RootChange{seq: db.seq, tree: tree, prev: prev}) }
+    // A change at a live snapshot's own commit: one made outside a commit,
+    // by a checkpoint's refit cutting leaves (a cut leaf's parent may
+    // split, and the root with it). The snapshot reads the nodes' current
+    // versions (their since is at most its seq), the old root's cut down
+    // to its left part, so the root it began with no longer reaches the
+    // rest: its reads take the root again (snapRoot).
+    if db.maxSnap() >= db.seq { db.lateRoots += 1 }
     if slot >= 0 { db.trees.put(tree, slot) } else { let gone = db.trees.remove(&tree) }
+}
+
+// The root of tree as snapshot t sees it: the one it began with, unless a
+// root changed at its own commit since (setRoot): then the current root,
+// taken back past the root changes of later commits (rootHist keeps them
+// while a snapshot before them is live), as snapshotTxn takes it.
+fn (db: &Db) snapRoot(t: &Txn, tree: int): int {
+    if db.lateRoots == t.snapLate { return match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } }
+    var r = match db.trees.get(&tree) { Some(x) { x } None { -1 } }
+    var k = len(db.rootHist) - 1
+    while k >= 0 {
+        let rc = db.rootHist[k]
+        if rc.tree == tree && rc.seq > t.snapSeq { r = rc.prev }
+        k -= 1
+    }
+    return r
 }
 
 fn (db: mut &Db) applyCreate(tree: int) {
@@ -2649,7 +2674,7 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
                     append(mut &bad, snapCancelled())
                     return
                 }
-                root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
+                root = db.snapRoot(t, tree)
             } else {
                 root = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
             }
@@ -2904,7 +2929,6 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
         return Ok(Unit{})
     }
     let snap = view == View.Snap
-    let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     let noting = t.noting()
     var i = 0
     while i < n {
@@ -2921,7 +2945,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                 append(mut &bad, snapCancelled())
                 return
             }
-            let root = if snap { sroot } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            let root = if snap { db.snapRoot(t, tree) } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
             let q = if snap { t.snapSeq } else { db.seq }
             var f = newFinger()
             while i < n {
@@ -3039,7 +3063,6 @@ pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_b
     let view = st.viewOf(t)
     if view == View.Repl || n < 2 { return Ok(Unit{}) }
     let snap = view == View.Snap
-    let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var i = 0
     while i < n {
         var ahead: []int = []
@@ -3048,7 +3071,7 @@ pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_b
                 i = n
                 return
             }
-            let root = if snap { sroot } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            let root = if snap { db.snapRoot(t, tree) } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
             if root < 0 {
                 i = n
                 return
@@ -3140,7 +3163,6 @@ pub fn (st: &Store) treePages(tree: int): Result[int, lexdb_base.DbErr] {
 // getIn for a snapshot's reads: the key's leaf as the snapshot sees it,
 // one descent (9.53; a one-key scan, as before, cost a point lookup 15%).
 fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
-    let root = match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } }
     let noting = t.noting()
     while true {
         var need = -1
@@ -3155,6 +3177,7 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Opt
                 append(mut &bad, snapCancelled())
                 return
             }
+            let root = db.snapRoot(t, tree)
             if root < 0 { return }
             let d = db.snapDescend(root, t.snapSeq, &key, false)
             if d.need >= 0 {
@@ -3265,7 +3288,6 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let cut = !raw && t.hasCuts(tree)           // stored keys in a range delete of its own are skipped
     let snap = view == View.Snap
-    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
     var more = true
@@ -3291,6 +3313,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     append(mut &bad, snapCancelled())
                     return
                 }
+                let root = db.snapRoot(t, tree)
                 if root < 0 { return }
                 let d = db.snapDescend(root, t.snapSeq, &cursor, false)
                 if d.need >= 0 {
@@ -3441,7 +3464,6 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
     if view == View.Repl { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
     let snap = view == View.Snap
-    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor: str = from
     var more = true
     let noting = t.noting()
@@ -3467,6 +3489,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                     append(mut &bad, snapCancelled())
                     return
                 }
+                let root = db.snapRoot(t, tree)
                 if root < 0 {
                     empty = true
                     return
@@ -3591,7 +3614,6 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
     let own = t.ownRange(tree, &from, &to)
     let cut = t.hasCuts(tree)
     let snap = view == View.Snap
-    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
     var cursor = to
     var more = true
@@ -3614,6 +3636,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                     append(mut &bad, snapCancelled())
                     return
                 }
+                let root = db.snapRoot(t, tree)
                 if root < 0 { return }
                 let d = db.snapDescend(root, t.snapSeq, &cursor, true)
                 if d.need >= 0 {
@@ -4086,6 +4109,7 @@ fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
         // it waits for nothing (9.16)
         let q = db.durableSeq
         t.snapSeq = q
+        t.snapLate = db.lateRoots
         append(mut &db.snaps, Snap{id: t.snap, seq: q, cancelled: false})
         db.snapshots += 1
         for i in 0..db.trees.size() {
@@ -4129,6 +4153,7 @@ pub fn (st: &Store) renewSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
     t.snap = fresh.snap
     t.snapSeq = fresh.snapSeq
     t.snapTrees = replace(mut &fresh.snapTrees, newMap())
+    t.snapLate = fresh.snapLate
     t.now = fresh.now
     t.reads = []                    // (an earlier run's, gone with its snapshot)
     return Ok(Unit{})
@@ -5885,7 +5910,7 @@ fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: O
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], lateRoots: 0, durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
               colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false,
               specRatio: [], specSplits: [], refitCuts: 0, upgTree: [], upgKey: [], upgBudget: UPG_BUDGET, upgLeaves: 0, upgFailed: 0, ckptLocked: 0, cutRetries: 0, cutChunk: CUT_CHUNK, cutEnds: 0}
