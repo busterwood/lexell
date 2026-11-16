@@ -1,0 +1,70 @@
+// lexdb_exec: the join order's estimates (lexdb-tpch-perf.md 4.joinorder).
+// A lookup per row whose index goes on with a range of constants after its
+// equalities (ord_ck_d: ck =, then d's range) reads only the range's share
+// of the key's rows: TPC-H q5's orders by customer and date. Costed so, the
+// order starts from the customers (their region hashed) and reads their
+// orders by ord_ck_d, not from the scan of ord hashed against all
+// customers (the plan before). A LIKE with a leading wildcard is still a
+// flat half (PostgreSQL's heuristic without a histogram was tried and made
+// TPC-H q9 slower): its plan scans ord. Each count is checked against an
+// IN formulation and with batches off.
+// expect: CREATE TABLE
+// expect: INSERT 0 5
+// expect: CREATE TABLE
+// expect: INSERT 0 5000
+// expect: CREATE INDEX
+// expect: CREATE TABLE
+// expect: INSERT 0 100000
+// expect: CREATE INDEX
+// expect: CREATE INDEX
+// expect: ANALYZE
+// expect: [QUERY PLAN] scan cust: full scan; join reg: hash on (rk) over full scan; join ord: index ord_ck_d range (at most 20 rows) per row; aggregate
+// expect: 143921
+// expect: 143921
+// expect: [QUERY PLAN] scan ord: full scan; cross join cust: hash on (ck) over full scan; aggregate
+// expect: 22500
+// expect: 22500
+// expect: SET
+// expect: 143921
+// expect: 22500
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const QUERIES = "create table reg (rk int primary key, rname text)\ninsert into reg select g, 'r' || g from generate_series(1, 5) g\ncreate table cust (ck int primary key, rk int, seg text)\ninsert into cust select g, g % 5 + 1, case when g % 4 = 0 then 'green ' || (g % 80) else 'plain ' || (g % 80) end from generate_series(1, 5000) g\ncreate index cust_rk on cust (rk)\ncreate table ord (ok int primary key, ck int, d int, amt int)\ninsert into ord select g, g % 5000 + 1, g / 100, g % 97 from generate_series(1, 100000) g\ncreate index ord_ck_d on ord (ck, d)\ncreate index ord_d on ord (d)\nanalyze\nexplain select sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord where d >= 100 and d < 250 and ck in (select ck from cust where rk = 3)\nexplain select count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord where d < 900 and ck in (select ck from cust where ck % 4 = 0)\nset lexdb_batch = off\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900"
+
+fn show(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, lexdb_exec.text(&v)) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            if len(r.cols) > 0 && r.cols[0].name == "QUERY PLAN" {
+                return "[QUERY PLAN] " + strings.join(&rows, "; ")
+            }
+            if r.tag != "" && !strings.startsWith(&r.tag, "SELECT") && r.tag != "SHOW" { append(mut &rows, r.tag) }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let text: str = QUERIES
+    for q in strings.lines(&text) { println(show(mut &s, &q)) }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                           snapNodes: 50000}, body).unwrap()
+}
