@@ -401,7 +401,10 @@ l_discount)`) and q18 (its grouped `sum(l_quantity)`) now run as units.
 q13 has no numeric and does not reach the changed code (its grouping is
 over a join and a derived table: `dec` is off, and `batchGroups` refuses a
 derived table before compiling anything); its 13% in this pair is past
-the 8% noise rule and is NOT explained here: see 4.1.6.
+the 8% noise rule and was not explained here; the orchestrator's
+interleaved A/B (base, exec, base, exec) found it noise (exec 3% slower in
+one pair, 1% faster in the other, the baseline itself moving 12% between
+pairs).
 
 Profile after step 1 (q1, 2.0 s): decoding 30% (`fillBatch`,
 `colsInto`, and a new batch allocated per fill: `newBatch` 9.4%); the
@@ -411,6 +414,81 @@ twice); grouping by the two char(1) keys about 17%; `Val` copies of the
 key texts 11% (`dup`). q6 after step 1: its date conditions compared as
 `Val`s (`compare`, `compareTime`, `memcmp`) are the largest item. These
 are steps 2 to 4.
+
+#### 4.1.6 Step 1's review: nothing slower than before units
+
+The review of step 1 found one plausible regression by reading: with a
+numeric(p, s) column typed as units in a grouped single-table query, a
+condition the units do not compile (`k IN (...)`, `k LIKE ...`, `k >
+1.5::float8`: the IN branch takes only integer, boolean and value
+columns, `bValCol` only value columns) sent the query to the row path,
+where before units it ran over batches with the numeric as a value.
+`batchGroups` now tries units first and, when the query read a numeric
+as units and that gave way (a condition not compiled, a value not of its
+scale, a result past its units), runs the batches again with numerics as
+values before the row path: nothing that ran over batches before step 1
+runs on the row path now (commit `58bac6c4`). `exec_batchdec` adds the
+review's gaps: data before its first checkpoint; GROUP BY a numeric column
+and expression; a product of exactly -2^63 units (kept) and its negation
+(past units: the row path); the IN list, LIKE and float constant (over
+batches as values); comparisons with a float column, a plain numeric
+column and another numeric(18,0); a scale changed by ALTER TYPE and a
+column added with a numeric default, before and after a checkpoint. A
+native units IN list was not built: the retry covers it, and no TPC-H
+query has one.
+
+#### 4.1.7 Step 2a: every join condition compiles (the generic node)
+
+The other workstreams' profiles put 75-90% of q3, q5, q7, q8 and q10 in
+`tryRow`/`runLevel`: `bJoinPlan` sends a whole multi-table query to the
+row path when one join condition does not compile for batches, or when a
+level after the first is neither a hash nor a whole-primary-key lookup.
+A debug build (each refusal's reason printed; q3, 4, 5, 7, 8, 9, 10, 12,
+13, 18, 20, 21, 22) finds the first cause in q7 only (its cross-table
+`(n1.n_name = .. and n2.n_name = ..) or (..)`) and in q21 (`o_orderstatus
+= 'F'`, a char(1) constant: `#bppad('F', 1)` is a call, so `bConst`
+refuses it); every other refusal is `bJoinPlan`'s first check, which
+holds the second cause (a `perRow` level that is not a whole-key lookup:
+by the plans, q3/q5/q10's lineitem by `l_orderkey`, a primary key prefix,
+and q8/q9's secondary index lookups) and the join types batches do not
+run (the debug build did not tell the two apart).
+
+The first cause is the IR's generic node, which exists already for the
+first level (`bLevelPlan`: `BNode.Gen`, a compiled `CX` run per row over
+the batch). `bJoinCond` gives a join level's conditions and post
+conditions the same fallback: compiled for batches, else compiled per
+row. Semantics are the row path's own (`cEval`), and a row on which a
+condition gives an error sends its batch to the row path, as before.
+Test: `exec_joingen` (an OR across tables against a UNION ALL of its
+branches; a char(n) constant on a lookup level against a semi join count;
+a substring IN a list; a CASE; a function of both tables; division by
+zero on some rows; grouped; in a transaction): with batches as without,
+and the joins ran over batches with a compiled condition.
+
+A/B, same session, nothing else running on 4-7 (medians of three, spread):
+
+| query | before ms | after ms | ratio | PG one core |
+|---|---:|---:|---:|---:|
+| q7 | 5,021 (4,861-5,033) | 1,621 (1,599-1,637) | 0.32 | 565 |
+| q8 | 432 (425-436) | 411 (408-415) | 0.95 | 236 |
+| q10 | 1,645 (1,608-1,664) | 1,543 (1,535-1,627) | 0.94 | 625 |
+| q21 | 14,391 (14,126-14,579) | 13,767 (13,625-13,773) | 0.96 | 687 |
+
+(An earlier pair, taken while the suite ran on 4-7, showed q8 +14% and
+q10 +8%: the debug build shows neither query reaches the change, and the
+clean pair puts both within noise.) q21 needs the second cause too: its
+orders lookup now compiles, and a later level is a per-row range.
+
+All 22 at `a2718e8b` (main with `perf/joinorder` merged, one run of
+three, `~/tpch-w/exec/out-jc2-all`): every checksum unchanged (q1, q8,
+q17 keep theirs). q7 1,575 ms; q3 2,048 and q5 937 owe their change to
+`joinorder`'s merge, not to this step (the debug build shows neither
+reaches it).
+
+Next (step 6 brought forward): batch a per-row level that reads a key
+range or an index per outer row, with `perf/semi`'s `bRange` (each
+batch's distinct keys in key order straight from the leaves) once it is
+on main, rather than a second reader.
 
 ### 4.2 `semi`: semi and anti joins
 
