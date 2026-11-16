@@ -15,6 +15,8 @@
 //   EXISTS, the select list) whose condition uses the outermost query's
 //   value: against the count form, batches off and on. The middle
 //   subquery must not be unnested through the inner level's condition.
+// - q21's joins over all of lineitem (hashed, the "<>" a summary per
+//   key), its outer value NULL in some rows: against the count form.
 // - How many ran as looked-up semi/anti joins, and over batches.
 // - EXPLAIN ANALYZE's counts with batches on and off (but "batches N",
 //   and the rows read: the batches read a key's whole range, the row
@@ -30,6 +32,7 @@
 // expect: in a transaction: 40 queries, 40 the same with and without batches
 // expect: looked up: 268 of 300, 268 over batches
 // expect: nested: 56 queries, 56 the same as with counts, batches off and on
+// expect: hashed: 4 queries, 4 hashed, 4 the same as with counts, batches off and on
 // expect: counts q21: same: true
 // expect: counts q22: same: true
 // expect: plan q4: scan o: full scan; semi join l: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join
@@ -324,6 +327,38 @@ fn nested(s: mut &lexdb_exec.Session) {
     println("nested: " + n.toStr() + " queries, " + same.toStr() + " the same as with counts, batches off and on")
 }
 
+// q21's semi and anti joins over all of lineitem: hashed (a lookup per
+// row costs more), the "<>" filter a summary per key; l1.sp is NULL in a
+// twelfth of the rows, which is "<>" no value: never a match.
+fn hashed(s: mut &lexdb_exec.Session) {
+    let xs = ["exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp)",
+              "not exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp)",
+              "exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp and l2.rd > l2.cd)",
+              "not exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp and l2.rd > l2.cd)"]
+    var n = 0
+    var same = 0
+    var hashes = 0
+    for x in xs {
+        let neg = strings.startsWith(&x, "not ")
+        let body = if neg { strings.substr(&x, 4, len(x)) } else { "" + x }
+        let cnt = strings.replaceAll(&body, &"exists (select * from", "(select count(*) from") + (if neg { " = 0" } else { " > 0" })
+        let a = "select count(*), sum(l1.ok), sum(l1.ln) from l l1 where " + x
+        let b = "select count(*), sum(l1.ok), sum(l1.ln) from l l1 where " + cnt
+        if strings.contains(&(ex(s, &("explain " + a))), "hash on") { hashes += 1 }
+        let o1 = q(s, &"set lexdb_batch = off")
+        let aOff = q(s, &a)
+        let bOff = q(s, &b)
+        let o2 = q(s, &"set lexdb_batch = on")
+        let aOn = q(s, &a)
+        n += 1
+        if aOff == bOff && aOn == bOff { same += 1 } else {
+            println("DIFFERENT: " + a)
+            println("  off: " + aOff + " on: " + aOn + " reference " + bOff)
+        }
+    }
+    println("hashed: " + n.toStr() + " queries, " + hashes.toStr() + " hashed, " + same.toStr() + " the same as with counts, batches off and on")
+}
+
 fn main() {
     lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
@@ -370,6 +405,7 @@ fn main() {
         println("in a transaction: 40 queries, " + same3.toStr() + " the same with and without batches")
         println("looked up: " + looks.toStr() + " of 300, " + batched.toStr() + " over batches")
         nested(mut &s)
+        hashed(mut &s)
         let q21 = "select s.name, count(*) from l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok " +
                   "where n.name = 'N2' and o.st = 'F' and l1.rd > l1.cd " +
                   "and exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp) " +
