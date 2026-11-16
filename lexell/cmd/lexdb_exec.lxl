@@ -24306,7 +24306,13 @@ fn bConst(x: &Expr): bool {
         Expr.Bin(_, a, b) { return bConst(&a) && bConst(&b) }
         Expr.IsNull(a, _) { return bConst(&a) }
         Expr.Cast(a, _) { return bConst(&a) }
-        Expr.Call(_, _, _) { return false }
+        // a char(n) constant's padding (#bppad, the parser's for 'F' compared
+        // with a char(1) column: q21's o_orderstatus = 'F'): of constants, a
+        // constant
+        Expr.Call(n, args, star) {
+            if n != "#bppad" || star || len(args) != 2 { return false }
+            return bConst(&args[0]) && bConst(&args[1])
+        }
     }
 }
 
@@ -26186,7 +26192,11 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // where reading may stop early (a LIMIT, EXISTS: optimizer 19's
         // stops): a batch's lookups would be made for rows never wanted.
         let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
-        let range = lv.perRow && !l0.stops && lv.semiSub >= 0 && rangePath(q, lv)
+        // a range per row: a semi/anti level's (semiLook), or (9.103's
+        // lookups for a key's range) a join's by its primary key's leading
+        // columns or an index's (q3, q5, q10's lineitem by l_orderkey; q8,
+        // q9's index lookups)
+        let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
         let keyed = look || range
         if (lv.perRow && !keyed) || lv.lateral || !(inner || rj || lv.join == lexdb_sql.J_LEFT) { return Ok(None) }
         if !keyed && (len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols)) { return Ok(None) }
@@ -26320,6 +26330,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                                    ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
                                    rows: rows, rkinds: rkinds, cand: [], after: []})
     }
+    joinPlansMade += 1
     for jl in levels {
         var gen = false
         for c in jl.conds { match c { BNode.Gen(_) { gen = true } else {} } }
@@ -26338,6 +26349,11 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
 var genJoinPlans: int = 0
 
 pub fn genJoins(): int { return genJoinPlans }
+
+// Batch join plans made (bJoinPlan's), for the tests.
+var joinPlansMade: int = 0
+
+pub fn joinPlans(): int { return joinPlansMade }
 
 // A join level's condition x over the joined batch (kinds, need: the
 // query's columns in it): compiled for batches, else compiled (9.108) and
@@ -26459,6 +26475,7 @@ fn bJoinAll(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         let c = l0.first + i
         if jp.first[c] { bGather(b0, i, jp.kinds[c], idx, mut &cur, c) }
     }
+    // (a batch that gives way: its callers restore the counts, 7f350792)
     for li in 0..len(jp.levels) {
         let got = if jp.levels[li].look { try bLookup(st, txn, q, jp, &jp.levels[li], &cur, z, rs) } else if jp.levels[li].range {
             try bRange(st, txn, q, jp, &jp.levels[li], &cur, z, rs)
@@ -26938,7 +26955,8 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     // leaf at a time), an index's entries decoded when they hold every
     // column used, else their primary keys kept for the rows' reads; per
     // key read its rows [lo[x], hi[x])
-    let one = len(jl.conds) == 0
+    // (a semi or anti join's: an inner or LEFT join's every row)
+    let one = (lv.semi || lv.anti) && len(jl.conds) == 0
     let tree = if ix { t.indexes[p.index].tree } else { t.tree }
     let rw = rowsFor(t)
     var rows = lexdb_rows.newBatch(&bp, 64)
@@ -27090,8 +27108,17 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     }
     let out = bJoinTail(q, jp, jl, j, &pj, &pi, &rows, rs)
     rs.held -= held
-    return out
+    let b = try out
+    // counted only when the batch joined, not when it gave way
+    if b.isSome() && !lv.semi && !lv.anti { rangeJoinBatches += 1 }
+    return Ok(b)
 }
+
+// Batches joined to an inner or LEFT join's level read by a range per row
+// (bRange, not a semi/anti level's), for the tests.
+var rangeJoinBatches: int = 0
+
+pub fn rangeJoins(): int { return rangeJoinBatches }
 
 // Where a batch reads table t's columns used (needCol; need: the level's,
 // [] all): as bLevelPlan's.
