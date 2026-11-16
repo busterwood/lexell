@@ -1,0 +1,467 @@
+// lexdb_lib: the function library (design/lexdb-layers.md 4.4.1, slice 2c,
+// item 3): the functions that read no table and no session, one entry per
+// signature. A call's entry is found from its name and number of
+// arguments once, when it is bound (lexdb_exec.fnRefOf: entryOf,
+// entry1Of, into lexdb_bind.FnRef), so a bound call matches no name per
+// row; eval finds it per call (call). A session's time zone and the
+// transaction's start come as arguments. It sits beside lexdb_ops (the
+// operators and conversions) and below the binder and the executor; the
+// functions that need the session (sequences, settings, advisory locks,
+// the catalog) stay in lexdb_exec.
+
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_ops"
+import "./lexdb_func"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// A function's entry: its name as called (its errors name it), its
+// arguments, the transaction's start (microseconds since 2000; 0: the
+// clock) and the session's time zone (9.95).
+pub type LibFn = fn(&str, &[]Val, int, &lexdb_time.Zone): Result[Val, DbErr]
+
+// A function of one argument, given a value not NULL (NULL in, NULL out:
+// the caller gives NULL itself), without an argument list: a bound call's
+// and a batch's fast path (lexdb_exec.bGenVals).
+pub type Lib1 = fn(&str, &Val): Result[Val, DbErr]
+
+// The error of a call no function takes: name with n arguments.
+pub fn noSuch(name: &str, n: int): DbErr { return e("42883", &("function " + name + " with " + n.toStr() + " arguments does not exist")) }
+
+// The entry of a name no Lib1 takes (lexdb_bind.FnRef.f1 when FnRef.way is
+// not FN_ONE): never called.
+pub fn no1(name: &str, v: &Val): Result[Val, DbErr] { return Err(noSuch(name, 1)) }
+
+// ---- functions of one argument (entry1Of)
+
+// name's function of one argument (not NULL), None: none. These names
+// take one argument nowhere else first.
+pub fn entry1Of(name: &str): Option[Lib1] {
+    match name {
+        "lower" { return Some(lower1) }
+        "upper" { return Some(upper1) }
+        "trim", "btrim" { return Some(trim1) }
+        "ltrim" { return Some(ltrim1) }
+        "rtrim" { return Some(rtrim1) }
+        "length", "char_length" { return Some(length1) }
+        "octet_length" { return Some(octets1) }
+        "abs" { return Some(abs1) }
+        "floor" { return Some(floor1) }
+        "ceil", "ceiling" { return Some(ceil1) }
+        "trunc" { return Some(trunc1) }
+        "sign" { return Some(sign1) }
+        "round" { return Some(round1) }
+        "sqrt" { return Some(sqrt1) }
+        "cbrt" { return Some(cbrt1) }
+        "exp" { return Some(exp1) }
+        "ln" { return Some(ln1) }
+        "log10" { return Some(log10_1) }
+        "log" { return Some(log1) }
+        else { return None }
+    }
+}
+
+fn lower1(name: &str, v: &Val): Result[Val, DbErr] { return Ok(Val.Text(strings.toLowerAscii(&(lexdb_sql.text(v))))) }
+fn upper1(name: &str, v: &Val): Result[Val, DbErr] { return Ok(Val.Text(strings.toUpperAscii(&(lexdb_sql.text(v))))) }
+fn trim1(name: &str, v: &Val): Result[Val, DbErr] { return Ok(Val.Text(strings.trim(&(lexdb_sql.text(v))))) }
+fn ltrim1(name: &str, v: &Val): Result[Val, DbErr] { return Ok(Val.Text(strings.trimLeft(&(lexdb_sql.text(v))))) }
+fn rtrim1(name: &str, v: &Val): Result[Val, DbErr] { return Ok(Val.Text(strings.trimRight(&(lexdb_sql.text(v))))) }
+
+fn length1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Bytes(x) { return Ok(Val.Int(len(x))) }
+        else { return Ok(Val.Int(strings.runeCount(&lexdb_sql.text(v)))) }
+    }
+}
+
+fn octets1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Bytes(x) { return Ok(Val.Int(len(x))) }
+        else { return Ok(Val.Int(len(lexdb_sql.text(v)))) }
+    }
+}
+
+fn abs1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Int(x) {
+            if x >= 0 { return Ok(Val.Int(x)) }
+            match (0).checkedSub(x) {
+                Some(r) { return Ok(Val.Int(r)) }
+                None { return Err(e("22003", "bigint out of range")) }
+            }
+        }
+        Val.Num(d) { return Ok(Val.Num(d.abs())) }
+        Val.Float(x) { return Ok(Val.Float(x.abs())) }
+        Val.Real(x) { return Ok(Val.Real(x.abs())) }
+        else { return Err(noSuch(name, 1)) }
+    }
+}
+
+fn round1(name: &str, v: &Val): Result[Val, DbErr] {
+    if lexdb_ops.isFloat(v) { return Ok(Val.Float(lexdb_ops.asFloat(v).unwrap().roundEven())) }
+    match lexdb_ops.asNum(v) {
+        Some(d) {
+            match d.roundAway(0) {
+                Ok(r) { return Ok(Val.Num(r)) }
+                Err(_) { return Err(lexdb_ops.decErr()) }
+            }
+        }
+        None { return Err(noSuch(name, 1)) }
+    }
+}
+
+// floor, ceil, trunc (9.79): a numeric stays one (to 0 places); an integer
+// or float is a double precision.
+const CUT_FLOOR = 0
+const CUT_CEIL = 1
+const CUT_TRUNC = 2
+
+fn cutOf(name: &str, v: &Val, how: int): Result[Val, DbErr] {
+    match lexdb_ops.asNum(v) {
+        Some(d) {
+            if !lexdb_ops.isFloat(v) && lexdb_ops.kindOf(v) != lexdb_sql.K_INT {
+                let r = if how == CUT_FLOOR { d.floor(0) } else if how == CUT_TRUNC { d.trunc(0) } else { d.ceil(0) }
+                match r {
+                    Ok(x) { return Ok(Val.Num(x)) }
+                    Err(_) { return Err(lexdb_ops.decErr()) }
+                }
+            }
+        }
+        None {}
+    }
+    let x = try lexdb_ops.floatArg(v, name)
+    return Ok(Val.Float(if how == CUT_FLOOR { x.floor() } else if how == CUT_TRUNC { x.trunc() } else { x.ceil() }))
+}
+
+fn floor1(name: &str, v: &Val): Result[Val, DbErr] { return cutOf(name, v, CUT_FLOOR) }
+fn ceil1(name: &str, v: &Val): Result[Val, DbErr] { return cutOf(name, v, CUT_CEIL) }
+fn trunc1(name: &str, v: &Val): Result[Val, DbErr] { return cutOf(name, v, CUT_TRUNC) }
+
+fn sign1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(Val.Num(Decimal.fromInt(if n > 0 { 1 } else if n < 0 { -1 } else { 0 }))) }
+        Val.Num(d) { return Ok(Val.Num(Decimal.fromInt(if d.isNeg() { -1 } else if d.isZero() { 0 } else { 1 }))) }
+        else {}
+    }
+    let x = try lexdb_ops.floatArg(v, name)
+    return Ok(Val.Float(if x > 0.0f { 1.0f } else if x < 0.0f { -1.0f } else { 0.0f }))
+}
+
+// sqrt, cbrt, exp, ln, log10 over double precision (9.79); name names an
+// argument that is not a number in the error.
+const M_SQRT = 0
+const M_CBRT = 1
+const M_EXP = 2
+const M_LN = 3
+const M_LOG10 = 4
+
+fn floatMath(name: &str, v: &Val, m: int): Result[Val, DbErr] {
+    let x = try lexdb_ops.floatArg(v, name)
+    if m == M_SQRT && x < 0.0f { return Err(e("2201F", "cannot take square root of a negative number")) }
+    if (m == M_LN || m == M_LOG10) && x == 0.0f { return Err(e("2201E", "cannot take logarithm of zero")) }
+    if (m == M_LN || m == M_LOG10) && x < 0.0f { return Err(e("2201E", "cannot take logarithm of a negative number")) }
+    let r = if m == M_SQRT { x.sqrt() } else if m == M_CBRT { x.cbrt() } else if m == M_EXP { x.exp() } else if m == M_LN { x.ln() } else { x.log10() }
+    if r.isInf() && !x.isInf() { return Err(e("22003", "value out of range: overflow")) }
+    if r == 0.0f && m == M_EXP && !x.isInf() { return Err(e("22003", "value out of range: underflow")) }
+    return Ok(Val.Float(r))
+}
+
+// A numeric's sqrt, exp, ln and log are numerics (9.79); cbrt a double.
+fn sqrt1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Num(d) { return Ok(Val.Num(try lexdb_func.numSqrt(&d))) }
+        else { return floatMath(name, v, M_SQRT) }
+    }
+}
+
+fn cbrt1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Num(d) { return Ok(Val.Float(d.toFloat().cbrt())) }
+        else { return floatMath(name, v, M_CBRT) }
+    }
+}
+
+fn exp1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Num(d) { return Ok(Val.Num(try lexdb_func.numExp(&d))) }
+        else { return floatMath(name, v, M_EXP) }
+    }
+}
+
+fn ln1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Num(d) { return Ok(Val.Num(try lexdb_func.numLn(&d))) }
+        else { return floatMath(name, v, M_LN) }
+    }
+}
+
+fn log10_1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Num(d) { return Ok(Val.Num(try lexdb_func.numLog(&Decimal.fromInt(10), &d))) }
+        else { return floatMath(name, v, M_LOG10) }
+    }
+}
+
+// log(x): log10's, its error naming log10
+fn log1(name: &str, v: &Val): Result[Val, DbErr] { return log10_1(&"log10", v) }
+
+// ---- the functions of several arguments (entryOf)
+
+// name's function of n arguments; None: none here.
+pub fn entryOf(name: &str, n: int): Option[LibFn] {
+    match name {
+        "now", "current_timestamp", "transaction_timestamp", "statement_timestamp" { return Some(nowFn) }
+        "clock_timestamp" { return Some(clockFn) }
+        "localtimestamp" { return Some(localTsFn) }
+        "current_date" { return Some(currentDateFn) }
+        "current_time", "localtime" { return Some(currentTimeFn) }
+        "date_part" { return Some(datePartFn) }
+        "date_trunc" { return Some(dateTruncFn) }
+        "age" { return Some(ageFn) }
+        "make_date" { return Some(makeDateFn) }
+        "to_timestamp" { if n != 2 { return Some(toTimestamp1Fn) } }
+        "isfinite" { return Some(isfiniteFn) }
+        "timezone" { return Some(timezoneFn) }
+        "make_timestamp" { return Some(makeTsFn) }
+        "make_timestamptz" { return Some(makeTstzFn) }
+        else {}
+    }
+    return None
+}
+
+// ---- dates, times, timestamps and intervals (9.76; lexdb_time)
+
+// now() and the rest of a precision: the transaction's start;
+// clock_timestamp() the clock.
+fn precOf(vs: &[]Val): int { return if len(vs) == 1 { lexdb_ops.intOf(&vs[0]).unwrapOr(6) } else { 6 } }
+
+fn startOf(now: int): int { return if now != 0 { now } else { lexdb_time.nowTstz() } }
+
+fn nowFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Tstz(lexdb_time.roundUs(startOf(now), precOf(vs))))
+}
+
+fn clockFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Tstz(lexdb_time.roundUs(lexdb_time.nowTstz(), precOf(vs))))
+}
+
+fn localTsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Ts(lexdb_time.roundUs(lexdb_time.tstzToTs(startOf(now), z), precOf(vs))))
+}
+
+fn currentDateFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Date(lexdb_time.tsToDate(lexdb_time.tstzToTs(startOf(now), z))))
+}
+
+fn currentTimeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Time(lexdb_time.roundUs(lexdb_ops.floorModInt(lexdb_time.tstzToTs(startOf(now), z), lexdb_time.DAY_US), precOf(vs))))
+}
+
+// Whether one of vs is NULL: the date and time functions below give NULL
+// then, of any number of arguments.
+fn anyNull(vs: &[]Val): bool {
+    for v in vs { if lexdb_ops.isNull(&v) { return true } }
+    return false
+}
+
+fn kindNameOf(v: &Val): str { return lexdb_ops.kindName(&lexdb_sql.oidType(lexdb_ops.kindOid(v))) }
+
+// x AT TIME ZONE zone, timezone(zone, x); AT LOCAL, timezone(x): the session's
+fn timezoneFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let n = len(vs)
+    if n != 1 && n != 2 { return Err(noSuch(name, n)) }
+    let x = &vs[n - 1]
+    if n == 1 { return atTimeZone(x, z, z) }
+    match vs[0] {
+        Val.Ival(iv) { return atTimeZone(x, &(try lexdb_time.ivalZone(&iv)), z) }
+        else { return atTimeZone(x, &(try lexdb_time.atZone(&lexdb_sql.text(&vs[0]))), z) }
+    }
+}
+
+// date_part's and date_trunc's second argument: a text read as a timestamptz.
+fn timeArg(v: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    match v {
+        Val.Text(s) { return Ok(Val.Tstz(try lexdb_time.parseTstz(&s, z))) }
+        else { return Ok(v) }
+    }
+}
+
+fn datePartFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 2 { return Err(noSuch(name, len(vs))) }
+    let field = lexdb_sql.text(&vs[0])
+    let x = try timeArg(&vs[1], z)
+    match x {
+        Val.Date(d) {
+            // a date's fields are whole numbers (its epoch and Julian day too)
+            try lexdb_time.dateField(&field)
+            let u = lexdb_time.dateToTs(d)
+            let xd = try lexdb_time.extractTs(&field, u, u, &"date", 0)
+            return Ok(Val.Num(xd.trunc(0).unwrapOr(xd)))
+        }
+        Val.Ts(u) { return Ok(Val.Num(try lexdb_time.extractTs(&field, u, u, &"timestamp without time zone", 0))) }
+        Val.Tstz(u) {
+            let off = if u == lexdb_time.INF || u == lexdb_time.NINF { 0 } else { z.offsetOf(u) }
+            return Ok(Val.Num(try lexdb_time.extractTs(&field, lexdb_time.tstzToTs(u, z), u, &"timestamp with time zone", off)))
+        }
+        Val.Time(u) { return Ok(Val.Num(try lexdb_time.extractIval(&field, &lexdb_time.Ival{months: 0, days: 0, us: u}))) }
+        Val.Ival(iv) { return Ok(Val.Num(try lexdb_time.extractIval(&field, &iv))) }
+        else { return Err(e("42883", &("function date_part(text, " + kindNameOf(&x) + ") does not exist"))) }
+    }
+}
+
+fn dateTruncFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let n = len(vs)
+    if n != 2 && n != 3 { return Err(noSuch(name, n)) }
+    let field = lexdb_sql.text(&vs[0])
+    let x = try timeArg(&vs[1], z)
+    if n == 3 {
+        // date_trunc(field, x, zone): a timestamptz cut in that zone
+        let tz3 = try lexdb_time.atZone(&lexdb_sql.text(&vs[2]))
+        match x {
+            Val.Tstz(u) { return Ok(Val.Tstz(try truncTstz(&field, u, &tz3))) }
+            Val.Date(d) { return Ok(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), &tz3))) }
+            Val.Ts(u) { return Ok(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(u, z), &tz3))) }
+            else { return Err(e("42883", &("function date_trunc(text, " + kindNameOf(&x) + ", text) does not exist"))) }
+        }
+    }
+    match x {
+        Val.Date(d) { return Ok(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.dateToTs(d)), z))) }
+        Val.Ts(u) { return Ok(Val.Ts(try lexdb_time.truncTs(&field, u))) }
+        Val.Tstz(u) { return Ok(Val.Tstz(try truncTstz(&field, u, z))) }
+        Val.Ival(iv) { return Ok(Val.Ival(try lexdb_time.truncIval(&field, &iv))) }
+        else { return Err(e("42883", &("function date_trunc(text, " + kindNameOf(&x) + ") does not exist"))) }
+    }
+}
+
+fn ageFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let n = len(vs)
+    if n != 1 && n != 2 { return Err(noSuch(name, n)) }
+    let a = if n == 2 { try tsOfVal(&vs[0], z) } else { lexdb_time.dateToTs(lexdb_time.tsToDate(lexdb_time.tstzToTs(startOf(now), z))) }
+    let b = try tsOfVal(&vs[n - 1], z)
+    return Ok(Val.Ival(try lexdb_time.age(a, b)))
+}
+
+fn makeDateFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 3 { return Err(noSuch(name, len(vs))) }
+    match lexdb_ops.intOf(&vs[0]) {
+        Some(y) {
+            match lexdb_ops.intOf(&vs[1]) {
+                Some(m) {
+                    match lexdb_ops.intOf(&vs[2]) {
+                        Some(d) { return Ok(Val.Date(try lexdb_time.makeDate(y, m, d))) }
+                        None {}
+                    }
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Err(e("42883", "function make_date needs three integers"))
+}
+
+// make_timestamp(year, month, day, hour, min, sec): its local time
+fn makeLocal(name: &str, vs: &[]Val): Result[int, DbErr] {
+    var ns: []int = []
+    for i in 0..5 {
+        match lexdb_ops.intOf(&vs[i]) {
+            Some(x) { append(mut &ns, x) }
+            None { return Err(e("42883", &("function " + name + " needs integers and a number of seconds"))) }
+        }
+    }
+    let sec = lexdb_ops.asNum(&vs[5])
+    if sec.isNone() { return Err(e("42883", &("function " + name + " needs integers and a number of seconds"))) }
+    return lexdb_time.makeTs(ns[0], ns[1], ns[2], ns[3], ns[4], &sec.unwrap())
+}
+
+fn makeTsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 6 { return Err(noSuch(name, len(vs))) }
+    return Ok(Val.Ts(try makeLocal(name, vs)))
+}
+
+// make_timestamptz: in the session's zone, or the seventh argument's
+fn makeTstzFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let n = len(vs)
+    if n != 6 && n != 7 { return Err(noSuch(name, n)) }
+    let local = try makeLocal(name, vs)
+    if n == 7 { return Ok(Val.Tstz(lexdb_time.tsToTstz(local, &(try lexdb_time.atZone(&lexdb_sql.text(&vs[6])))))) }
+    return Ok(Val.Tstz(lexdb_time.tsToTstz(local, z)))
+}
+
+// to_timestamp(seconds since 1970); to_timestamp(text, format) is to_char's kin
+fn toTimestamp1Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 1 { return Err(noSuch(name, len(vs))) }
+    match lexdb_ops.asNum(&vs[0]) {
+        Some(d) { return Ok(Val.Tstz(try lexdb_time.fromEpochSeconds(&d))) }
+        None { return Err(e("42883", "function to_timestamp(text) does not exist")) }
+    }
+}
+
+fn isfiniteFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) == 1 {
+        match vs[0] {
+            Val.Date(d) { return Ok(Val.Bool(d != lexdb_time.INF && d != lexdb_time.NINF)) }
+            Val.Ts(u) { return Ok(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF)) }
+            Val.Tstz(u) { return Ok(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF)) }
+            Val.Ival(_) { return Ok(Val.Bool(true)) }
+            else {}
+        }
+    }
+    return Err(noSuch(name, len(vs)))
+}
+
+// date_trunc of a timestamptz in zone z, as PostgreSQL's: the local time
+// cut; a day or more read back in the zone (by its rules for a time that
+// is not, or is twice), less with the offset it had.
+fn truncTstz(field: &str, u: int, z: &lexdb_time.Zone): Result[int, DbErr] {
+    if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(u) }
+    let off = z.offsetOf(u)
+    let local = u + off * 1000000
+    let cut = try lexdb_time.truncTs(field, local)
+    match strings.toLowerAscii(&field) {
+        "microseconds", "microsecond", "milliseconds", "millisecond", "second", "seconds", "minute", "minutes", "hour", "hours" {
+            return Ok(cut - off * 1000000)
+        }
+        else { return Ok(lexdb_time.tsToTstz(cut, z)) }
+    }
+}
+
+// x AT TIME ZONE at (9.95): a timestamptz made the local time there; a
+// timestamp (a date, a text: a timestamptz, as PostgreSQL reads them, in
+// the session's zone z) read there, made a timestamptz.
+fn atTimeZone(x: &Val, at: &lexdb_time.Zone, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    match x {
+        Val.Ts(u) { return Ok(Val.Tstz(lexdb_time.tsToTstz(u, at))) }
+        Val.Tstz(u) { return Ok(Val.Ts(lexdb_time.tstzToTs(u, at))) }
+        Val.Date(d) { return Ok(Val.Ts(lexdb_time.tstzToTs(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), at))) }
+        Val.Text(s) { return Ok(Val.Ts(lexdb_time.tstzToTs(try lexdb_time.parseTstz(&s, z), at))) }
+        else { return Err(e("42883", &("function timezone(text, " + kindNameOf(x) + ") does not exist"))) }
+    }
+}
+
+// A timestamp's local microseconds for age(): a date at midnight, a
+// timestamptz in the session's zone z.
+fn tsOfVal(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
+        Val.Ts(u) { return Ok(u) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Text(s) { return Ok(try lexdb_time.parseTs(&s, z)) }
+        else { return Err(e("42883", &("function age(" + kindNameOf(v) + ") does not exist"))) }
+    }
+}
