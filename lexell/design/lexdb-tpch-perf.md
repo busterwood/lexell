@@ -111,3 +111,138 @@ changed.
 ## 4. Findings
 
 (Each workstream's subsection.)
+
+### 4.outer: join methods for outer joins, grouped aggregation
+
+Branch `perf/outer`. Plans re-taken at `1744ef99` with EXPLAIN ANALYZE
+(lexdb) and EXPLAIN (ANALYZE, BUFFERS) (PostgreSQL, one core); timings are
+warm medians of three from `run.sh` unless marked as EXPLAIN ANALYZE runs.
+`perf` could not open any event on this machine during this work, so the
+profiles below are stack samples taken by gdb (the server run under gdb,
+stopped by SIGUSR2 every 50 ms, its frame-pointer chain resolved against
+the `LXL_NATIVE_MAP` map): 40-100 samples a query, enough for shape, not
+for small percentages.
+
+**What the plans show now (the brief's list re-verified).**
+
+- q13 was the brief's case: `left join orders: index orders_cust_date
+  range per row (lookups 150000, rows read 1500000)`, on the row path,
+  6.25 s. PostgreSQL: `Hash Right Join` (the filtered orders seq scan
+  probing a hash of customer's 150k keys), then two HashAggregates, 0.82 s.
+- q18's IN is no longer the problem: the subquery is run once and orders
+  is looked up for its 57 values (`rows read 57`). The cost is the
+  subquery itself: lineitem read whole and grouped into 1.5M groups,
+  2.2-2.5 s of q18's 2.45 s. PostgreSQL runs it as a `GroupAggregate`
+  over `lineitem_pkey` (input already in l_orderkey order), 1.68 s under
+  EXPLAIN ANALYZE, about 1.0 s in the timed run.
+- q12 is no longer a lookup problem: the batched IN list left 30,988
+  orders lookups (from 6M). Its 1.2 s is the 6M-row lineitem scan and
+  filter (PostgreSQL's seq scan alone is 0.49 s): `exec`'s area.
+- q3 and q10's aggregation, sort and LIMIT are small. Replacing the
+  aggregate with `count(*)` takes q3 from 2.54-2.59 s to 2.36-2.38 s and
+  q10 from 1.54 s to 1.17 s; the groups are 11,620 and 37,967 (the
+  plans' 314k and 55k were estimates), and sorting them is a few ms, so
+  a top-N heap would save nothing measurable (PostgreSQL's `top-N
+  heapsort` is on the same 11k/38k rows). Both run on the row path
+  because their lineitem level is a primary-key *prefix* range per row,
+  which `bJoinPlan` does not run (it gives up on the whole query when any
+  level is not a hash or a whole-key lookup; `exec`'s to fix). In q10's
+  profile `addToGroup` is 8% and the per-row join path most of the rest.
+
+**1. A LEFT JOIN as a hash right join (q13).** PostgreSQL considers both
+sides of a left join: `populate_joinrel_with_paths` (joinrels.c) adds
+`(rel1, rel2, JOIN_LEFT)` and `(rel2, rel1, JOIN_RIGHT)`, so the hash can
+be built on the preserved side; `nodeHashjoin.c` marks the hashed tuples
+that match and returns the unmatched ones after the outer side ends
+(`HJ_FILL_INNER_TUPLES`, `ExecScanHashTableForUnmatched`). lexdb kept
+FROM's order for outer joins and chose per level between a lookup and a
+hash of the nullable side (`outerReadOnce`); hashing orders was over the
+64 MB cap, so it looked up.
+
+lexdb now does the same for two tables: `rightCheaper` compares the left
+join as `outerReadOnce` chose it (a's scan plus b looked up or hashed)
+with b's scan by its own ON conditions, a hash of a, and a probe per b
+row, with a's hash counted at the columns the statement uses. When
+cheaper, `buildQuery` swaps the levels to `b RIGHT JOIN a`: b's own ON
+conjuncts filter its scan (its rows that join nothing are dropped either
+way), the rest of the ON stays the right join's, WHERE conjuncts on a
+alone filter a's rows as they are hashed, other WHERE conjuncts are
+checked after the join. Not with subqueries, USING, LATERAL, locking,
+volatile functions or an early stop. The batches now run a RIGHT JOIN
+level (one per query): the probe notes the rows that joined (`Run.seen`),
+`batchGroups` adds the rest after the scans (`bUnmatched`: NULLs for the
+tables before, the level's WHERE conjuncts, then the tables after it),
+and `batchLevel` leaves them to `runQuery`'s existing row-path loop.
+Written RIGHT JOINs take the batches too.
+
+Before the batch support, the swapped plan on the row path was 4.2 s
+against the lookups' 5.8 s; the batches are what made it pay. q13
+**6254 -> 1289 ms** (spreads 6196-6538 and 1212-1329), the same checksum.
+What is left (gdb samples): customer's hash build row by row in
+`materialize` (about 20%), the int maps of the probe and the grouping
+(15%). `exec_rightjoin` covers nine shapes with batches off, on, and an
+independent formulation.
+
+**2. Grouped aggregation over many groups (q18).** The subquery's samples
+before: per group a full-width first row (`bRow`: 16 `Val`s copied for
+lineitem, 12%; the dup glue of the copies 14%), its accumulators and
+their drops (15%), the group map (6.5%), and HAVING evaluated for 1.5M
+groups after all were kept (10%); the scan about 20%. Three changes in
+`batchGroups`:
+
+- the one table read in primary key order and grouped by the key's first
+  column takes each row into the group before it or starts one, with no
+  map (PostgreSQL's GroupAggregate over presorted input, `nodeAgg.c`);
+  alone it was within the noise;
+- a group's first row holds only the columns read after grouping (outputs,
+  HAVING, ORDER BY), kept compactly and made whole once;
+- a HAVING without volatile functions or subqueries is checked as the
+  groups are handed over, so a group it drops is never kept (57 of 1.5M
+  on q18); the select checks the kept ones again.
+
+q18's subquery 2.1-2.5 s -> 1.24-1.25 s, q18 2.45-2.53 s -> 1.48-1.55 s
+(single-session timings under gdb; the run.sh medians are below). The samples now are
+decimal arithmetic of `sum(l_quantity)` (`makeDec`, `arith`: about 30%,
+`exec`'s) and the scan.
+
+**3. GROUP BY keys a primary key makes redundant (q10).** PostgreSQL drops
+GROUP BY columns of a table whose primary key is grouped
+(`remove_useless_groupby_columns`, planmain.c). lexdb now does the same
+when it plans the select (the first row of the group still gives their
+values); q10 groups by c_custkey and six customer columns, three of them
+long texts. On q10 it is not measurable today (the row path's grouping is
+8% of the query); it matters once q10's joins run in batches.
+`exec_groupkeys` covers these and the sorted grouping with batches off,
+on, and an independent formulation.
+
+**Numbers** (`run.sh`, warm median of three, CPUs 0-3, ms). A/B in one
+session, the baseline binary then `f9334267`:
+
+| query | baseline | perf/outer | spread (outer) | PG one core |
+|---|---:|---:|---:|---:|
+| q13 | 5698 | 1119 | 1069-1128 | 818 |
+| q18 | 2791 | 1505 | 1493-1506 | 1050 |
+| q10 | 1635 | 1547 | 1541-1547 | 625 |
+| q12 | 1196 | 1232 | 1221-1237 | 832 |
+
+q10's 5% and q12's 3% are within the noise. A full 22-query run of
+`f9334267` (`out-r4all`): every check "ok", q1/q8/q17 at their lexdb
+checksums; total 59.7 s against the baseline's 66.0 s, geometric mean
+lexdb / PG one core **3.41** (3.77 at the baseline).
+
+**For other workstreams.** q3 and q10 (and any query with a lineitem
+primary-key prefix lookup per row) run their joins and grouping on the
+row path because `bJoinPlan` gives up on the whole query when one level
+is not a hash or a whole-key lookup (`exec`). q13's remaining time is
+the row-by-row hash build (`materialize`) and the int maps; q18's is the
+decimal `sum` and the scan (`exec`). q12 is its lineitem scan (`exec`).
+
+**Next steps proposed.** The right-join swap handles two tables; with more
+(a LEFT JOIN after inner joins, or several) the same choice belongs in the
+join order search as a join method, which needs `joinorder`'s search to
+accept outer levels. Sorted grouping could also take the order of an
+index read in batches, or a join whose first table is read in key order
+(q3 groups by l_orderkey but starts from orders, by o_orderkey). The
+early HAVING could skip making the whole first row for dropped groups
+entirely when HAVING reads only aggregates.
+
