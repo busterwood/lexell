@@ -86,15 +86,6 @@ fn predVal(p: &Option[Expr]): Val {
 
 // quote_ident: the name as is when it needs no quotes. PostgreSQL's rule:
 // a lower-case letter or _ first, then lower-case letters, digits and _.
-pub fn quoteIfNeeded(n: &str): str {
-    var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
-    for i in 0..len(n) {
-        let c = n[i]
-        if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
-    }
-    if plain && lexdb_sql.isReservedWord(n) { plain = false }
-    return if plain { n.toStr() } else { "\"" + strings.replaceAll(&n, "\"", "\"\"") + "\"" }
-}
 
 // An expression as PostgreSQL's deparser writes it (near enough): names
 // bare where they can be, constants typed, AND and OR in capitals.
@@ -198,45 +189,15 @@ pub fn exprText(x: &lexdb_sql.Expr, typ: &Option[lexdb_sql.TypeName]): str {
     }
 }
 
-pub fn visibleIn(path: &[]str, schema: &str): bool {
-    if schema == "pg_catalog" { return true }
-    if len(path) == 0 { return schema == "public" }
-    for p in path { if p == schema { return true } }
-    return false
-}
 
-pub fn shownIn(path: &[]str, schema: &str, name: &str): str {
-    if visibleIn(path, schema) { return quoteIfNeeded(name) }
-    return quoteIfNeeded(schema) + "." + quoteIfNeeded(name)
-}
 
 // shownIn, a name a temporary relation hides (tnames, 9.96) qualified;
 // spelt, the name as written (L6).
-pub fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str, spelt: &str): str {
-    if len(tnames) > 0 && !lexdb_base.isTempSchema(schema) && hasStr(tnames, name) { return quoteIfNeeded(schema) + "." + quoteIfNeeded(spelt) }
-    return shownIn(path, schema, spelt)
-}
 
-fn hasStr(xs: &[]str, x: &str): bool {
-    for y in xs { if y == x { return true } }
-    return false
-}
 
 // PostgreSQL's own OIDs for the schemas, the owner, and the relations
 // clients name (as classoid).
-pub const OID_PUBLIC: int = 2200
-pub const OID_PG_CATALOG: int = 11
-pub const OID_INFO_SCHEMA: int = 13000
-pub const OID_OWNER: int = 10
 
-pub fn catOid(kind: &str, key: &str): int { return lexdb_sql.nameOid(kind, key) }
-
-pub fn nspOid(n: &str): int {
-    if n == "public" { return OID_PUBLIC }
-    if n == "pg_catalog" { return OID_PG_CATALOG }
-    if n == "information_schema" { return OID_INFO_SCHEMA }
-    return catOid(&"n", n)
-}
 
 pub fn sysRelOid(rel: &str): int {
     match rel {
@@ -254,21 +215,7 @@ pub fn sysRelOid(rel: &str): int {
     }
 }
 
-pub fn fkAction(a: int): str {
-    if a == lexdb_sql.FK_RESTRICT { return "r" }
-    if a == lexdb_sql.FK_CASCADE { return "c" }
-    if a == lexdb_sql.FK_SET_NULL { return "n" }
-    if a == lexdb_sql.FK_SET_DEFAULT { return "d" }
-    return "a"
-}
 
-pub fn fkActionText(a: &str): str {
-    if a == "r" { return "RESTRICT" }
-    if a == "c" { return "CASCADE" }
-    if a == "n" { return "SET NULL" }
-    if a == "d" { return "SET DEFAULT" }
-    return "NO ACTION"
-}
 
 
 
@@ -281,12 +228,6 @@ pub fn typLenOf(oid: int): int {
 
 // A column's typmod: varchar's length + 4, numeric's precision << 16 |
 // scale + 4, a time type's precision; -1 none.
-pub fn typmodOf(t: &lexdb_sql.TypeName): int {
-    if (t.oid == lexdb_sql.OID_VARCHAR || t.oid == lexdb_sql.OID_BPCHAR) && t.len > 0 { return t.len + 4 }
-    if t.kind == lexdb_sql.K_NUM && t.prec > 0 { return ((t.prec << 16) | t.scale) + 4 }
-    if lexdb_sql.isTimeKind(t.kind) && t.prec > 0 { return t.scale }
-    return -1
-}
 
 pub fn collOf(oid: int): int {
     return if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_NAME || oid == 1009 || oid == 1015 ||
@@ -390,11 +331,6 @@ pub fn indOptions(ix: &CatIdx): Val {
     return Val.Text(strings.join(&parts, " "))
 }
 
-pub fn colList(t: &Table, nums: &[]int): str {
-    var parts: []str = []
-    for n in nums { if n >= 1 && n <= len(t.cols) { append(mut &parts, quoteIfNeeded(&lexdb_sql.colShown(&t.cols[n - 1]))) } }
-    return strings.join(&parts, ", ")
-}
 
 // A column's DEFAULT as pg_attrdef shows it; None for none (an identity
 // column has none: its sequence is its own).
@@ -852,3 +788,26 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
     }
     return Ok(rows)
 }
+
+// The naming rules live in lexdb_catalog; these keep the dialect's names.
+
+pub const OID_PUBLIC: int = lexdb_catalog.OID_PUBLIC
+pub const OID_PG_CATALOG: int = lexdb_catalog.OID_PG_CATALOG
+pub const OID_INFO_SCHEMA: int = lexdb_catalog.OID_INFO_SCHEMA
+pub const OID_OWNER: int = lexdb_catalog.OID_OWNER
+
+pub fn quoteIfNeeded(n: &str): str { return lexdb_catalog.quoteIfNeeded(n) }
+pub fn visibleIn(path: &[]str, schema: &str): bool { return lexdb_catalog.visibleIn(path, schema) }
+pub fn shownIn(path: &[]str, schema: &str, name: &str): str { return lexdb_catalog.shownIn(path, schema, name) }
+pub fn shownBy(path: &[]str, tnames: &[]str, schema: &str, name: &str, spelt: &str): str { return lexdb_catalog.shownBy(path, tnames, schema, name, spelt) }
+pub fn catOid(kind: &str, key: &str): int { return lexdb_catalog.catOid(kind, key) }
+pub fn nspOid(n: &str): int { return lexdb_catalog.nspOid(n) }
+pub fn fkAction(a: int): str { return lexdb_catalog.fkAction(a) }
+pub fn fkActionText(a: &str): str { return lexdb_catalog.fkActionText(a) }
+pub fn typmodOf(t: &lexdb_sql.TypeName): int { return lexdb_catalog.typmodOf(t) }
+pub fn colList(t: &Table, nums: &[]int): str { return lexdb_catalog.colList(t, nums) }
+
+// The naming the catalog snapshot uses. All three dialects share PostgreSQL's
+// stable OIDs and text for now; another naming can be supplied without
+// changing the snapshot builder.
+pub fn naming(): lexdb_catalog.Naming { return lexdb_catalog.Naming{exprText: exprText} }

@@ -2861,9 +2861,9 @@ a transaction that rolls back is not given again, and two sessions taking
 values never conflict. Kept as an ordinary row, every two concurrent
 inserts would conflict under serializable validation.
 
-They are handed out from the store's memo (`Store.memoGet` and
-`memoPut`: a map kept while the store is open, outside any transaction) a
-block at a time. Before a block's first value is given, its last is
+They are handed out from the session memo (`lexdb_memo`, reached as
+`Store.memo`: a map kept while the store is open, outside any transaction)
+a block at a time. Before a block's first value is given, its last is
 written (`seqWrite`) to the sequences' tree, in a transaction of its own.
 The tree is made by `bootstrap`, its id under the catalog key "\x02seqs".
 It is not the catalog, whose writes make the wire describe statements
@@ -12458,3 +12458,69 @@ rows grown past their leaves' estimate (cut again). Made clean too soon
 (the `since` test or the inner nodes' test removed), it loses 6 to 56 rows.
 `exec_privsx` (CHECKPOINT refused to a role); `exec_switch` (settled
 by CHECKPOINT). The suite (171), `crash.py` 20 rounds, `replica.py` 12.
+
+**The module split** (2026-11-15, `arch/deep-modules-2`). Three cuts,
+each gated by the full suite (168) and `replica.py`:
+
+- **Grammar out of the language model.** `lexdb_sql` keeps the values,
+  types, expressions, columns, statements and their text;
+  `lexdb_parse` gets the tokens, lexer, recursive-descent parser, T-SQL
+  cursor and Oracle read mode. `lexdb_sql` no longer imports
+  `lexdb_dialect`; the storage stack (`rows`, `cols`, `page`, `store`,
+  `catalog`) imports the model only. A table type now carries the
+  columns of its CREATE TABLE text, so the catalog no longer calls the
+  parser.
+- **Catalog tree and snapshot out of exec.** `lexdb_catalog` owns the
+  table/view/sequence/enum/type codecs, the readers, the catalog-key
+  scan that hides other sessions' temporary objects, the snapshot
+  builder, and PostgreSQL's naming rules (`quoteIfNeeded`, `shownBy`,
+  `fkAction`, `colList`, OIDs). The decoders take the expression parser
+  as a function, so the catalog does not import the grammar. The
+  snapshot takes a one-field `Naming` record (`exprText`); all three
+  dialects share PostgreSQL's naming for now. Exec keeps forwarders.
+- **Planner vocabulary.** `lexdb_plan` owns `Path`, `Bound`, `Look`,
+  `Cmp`, `EqClass`, `BindCol`, `WayCand`, `Way`, `Est`, `Common`, `Fig`,
+  the statistics estimates and the cost constants. The executor still
+  builds and reads the representation; the path/join-order search and
+  `Query`/`Level`/`Sel` are the next cut (they need value coercion and
+  index-key encoding in a core home first).
+
+Measured: the 35-query A/B against a binary built from current `main`
+(same fresh data, 3 runs, CPU from schedstat) is a geometric mean of
+1.003, median 1.0, worst query 1.04. The write path (`dml.py`) is within
+noise. The earlier 1.19 reading was against a pre-heap-trim binary and
+is not comparable.
+
+Deliberately not attempted: the connection-time `Dialect` composition
+(exec still imports seven dialect modules), the catalog DDL interface
+and opaque table mutation, and the path/join-order search. The design
+for those, and the parked storage/executor/cleanup work, is in
+[lexdb-refactor-followups.md](lexdb-refactor-followups.md).
+
+**One read view** (2026-11-15, `arch/deep-modules-2`). `Store.viewOf`
+returns `View.Live`, `View.Snap` or `View.Repl`; every read operation asks
+it once instead of repeating the follower/snapshot tests. The chosen view
+drives `get`, `getMany`, `warm`, `scan`, `scanBack`, `scanLeaves`,
+`countRange`, `noteRange` and `liveStale`. Internal-only frame, chunk and
+CRC helpers became private; `Txn.isSnapshot` and `Follower.applied` were
+unused and are gone. Store exports 141 → 134, lines per export 55.9 →
+59.0. The 35-query A/B is 1.013 CPU geometric mean (median 1.011), inside
+the 5% gate. The scan family is still five methods; one reader over a
+`Sink` is the next cut.
+
+**Session memo out of the store** (2026-11-15). The SQL layer's scratch map
+(session user and settings, a sequence's block, the catalog binding) moved
+to `lexdb_memo.Memo`, with its own lock; `Store` carries the handle and
+never reads a key. The 35-query A/B is 1.017 CPU geometric mean (median
+1.01), inside the gate.
+
+**Locks, SQL payload, test hooks.** `lexdb_locks.Locks` owns the lock
+table, waiters and deadlock walk; Store keeps `lockRow`, the wrapper that
+manages `Txn.lockId/held`. `lexdb_session.SqlTxn` collects the SQL state a
+transaction carries (path, session, planner mode, memory budget, zone,
+deferred constraints); `Txn.sql` is a payload the store never reads, and
+the import gate fails if it does. Test and diagnostic knobs (cache state,
+counters, column/cut counts, hooks, frame/cut/read-drop limits, upgrade
+budget, audit, segment and chunk names) are private functions behind
+`Store.testHooks()`. Store's public functions went 126 → 91, lines per
+export 55.9 → 72.1; suite 168, replica 12 rounds, A/B 1.010 CPU.

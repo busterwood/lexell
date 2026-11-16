@@ -108,6 +108,11 @@ and `lexdb_planner` are next.
   per-layout flag, not a per-row layout scan).
 - A data file from before the runs free list opens, but its flat free
   list's pages are lost (not reused); `store_drop` covers that outcome.
+- A catalog table-type value (`\x02ttype\0`) written before
+  `arch/deep-modules-2` holds three strings (key, spelling, column-list
+  text); the current decoder reads the columns that follow them and, with
+  none, leaves the type's columns empty (its `sys.columns` rows are
+  missing until the type is recreated). There is no dual-read.
 
 ## 7. New-flag policy
 

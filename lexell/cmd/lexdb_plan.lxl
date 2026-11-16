@@ -1,0 +1,153 @@
+// lexdb_plan: the planner's data vocabulary: a path into a table, a way
+// to join it, a level's statistics, and the estimates compared to choose
+// them. The path and join-order search moves here next; the executor
+// still builds and reads this representation, so its fields are public.
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+
+type Expr = lexdb_sql.Expr
+type Val = lexdb_sql.Val
+type TypeName = lexdb_sql.TypeName
+
+
+pub const IN_LOOKUP_MAX: int = 1000
+pub const COMMON_MAX: int = 16
+pub const JOIN_SEARCH_MAX: int = 24
+pub const JOIN_EXACT_MAX: int = 8
+pub const JOIN_BEST: int = 10
+pub const COST_SCAN: float = 1.0f
+pub const COST_SCAN_INNER: float = 44.0f
+pub const COST_PK_RANGE: float = 1.8f
+pub const COST_DESCENT: float = 12.0f
+pub const COST_KEY_ROW: float = 36.0f
+pub const COST_IX_ROW: float = 49.0f
+pub const HASH_PROBE: float = 2.0f
+pub const HASH_BUILD: float = 19.0f
+pub const ROW_COST: float = 2.0f
+pub const EQ_GUESS: float = 0.25f
+pub const HASH_MAX_BYTES: float = 67108864.0f
+// A range over at least this share of the table is read as a scan: the
+// index's entries and rows cost more than reading the table once. The
+// threshold is twice the measured crossover (SWITCH_TIMES), so a sampling
+// error does not put the plan on the wrong path; PostgreSQL would keep a
+// 3% index range and use a bitmap scan, which LexDB does not have yet.
+// The plan decides from ANALYZE's samples; the counted switch (optimizer
+// 38) is the fallback for a range they do not estimate.
+pub const SCAN_SHARE: int = 32
+// The switch is for tables where reading the index is real work; a small
+// table's index-only range is cheap and keeps its order.
+pub const SCAN_MIN_ROWS: int = 1024
+
+// A table's way in: its primary key (index -1) or one of its indexes, with
+// an equality for each of the first len(eqs) key columns, then perhaps
+// bounds on the next one. No equality and no bound is a full scan.
+pub type Path = record {
+    pub index: int
+    pub eqs: []Expr
+    pub rng: []Bound
+    pub desc: bool          // read backward (ORDER BY ... DESC, MAX)
+    pub noNulls: bool       // an index pub path: leave out its next column's NULLs (MIN, MAX)
+    pub ins: []Expr         // x IN (...) on the column after the pub equalities: a lookup per value
+    pub inSub: int          // or x IN (subquery), pub uncorrelated: a lookup per value it gives; -1 none
+    pub inArr: []Expr       // or x = ANY (array): its one expression, a lookup per element (9.28); [] none
+    pub stats: bool         // a pure range the planner chose from its samples: the executor need not recount (optimizer 19)
+}
+
+// A conjunct "col op value" (or "value op col", turned round).
+pub type Bound = record { pub op: str; pub val: Expr }
+
+// kind 0: an implication (c implies p; out 1 yes); 1: a LIMIT or OFFSET (c;
+// out its value); 2: an estimate (c a parameter equal to an index's leading
+// column of type typ, its common values cm; out the estimate's scale, optimizer 23).
+pub type Look = record { pub kind: int; pub c: Expr; pub p: Expr; pub out: int; pub typ: lexdb_sql.TypeName; pub cm: Common }
+
+// "column op value", from a comparison of a column with a constant.
+pub type Cmp = record { pub col: str; pub op: str; pub val: Val }
+
+pub type EqClass = record { pub names: []str; pub levels: []int; pub konst: []Expr }
+
+// A key column's values among the conjuncts: per value, the levels it uses
+// (a bit each; 0 constants and parameters) and its key when it is a literal
+// ("" else).
+pub type BindCol = record { pub deps: []int; pub keys: []str }
+
+// A way into a level: its primary key (index -1) or an unfiltered index.
+pub type WayCand = record { pub index: int; pub tree: int; pub unique: bool; pub cols: []BindCol; pub colIds: []int }
+
+// the levels placed. rows -1: none.
+// cost: as the first table (scanned in batches) or per lookup; inner: read
+// once as a hashed table (row by row, optimizer 36).
+pub type Way = record { pub rows: float; pub cost: float; pub outer: bool; pub inner: float }
+
+// columns (a NULL counted as a value), and its leading column's most common
+// values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
+// of the name, or SET lexdb_planner = rules).
+pub type Est = record { pub rows: int; pub trees: []int; pub entries: []int; pub dist: [][]int; pub cm: []Common; pub lo: []float; pub hi: []float; pub span: []bool; pub samp: []str;
+                    pub cols: []str; pub cnd: []int }
+
+// An index's leading column (optimizer 23): its entries, its distinct values, and its
+// most common values (their encoded index parts) with their exact counts:
+// those above the average, at most COMMON_MAX. d -1: unknown.
+pub type Common = record { pub entries: int; pub d: int; pub keys: []str; pub cnts: []int }
+
+// What the statistics say a path reads (optimizer 24): rows, and whether that is an
+// estimate or only a bound (at most rows). rows -1: no figure (no
+// statistics, or an index ANALYZE has not seen).
+pub type Fig = record { pub rows: int; pub bound: bool }
+
+// The rows an index path with eqs leading equalities is expected to read, the
+// first equal to key ("" unknown): with one equality, by the common values;
+// else its entries over the distinct values of that prefix. -1 unknown.
+pub fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
+    if es.rows < 0 || eqs <= 0 { return -1 }
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree && eqs <= len(es.dist[i]) {
+            if eqs == 1 { return rowsOf(&es.cm[i], key) }
+            let d = es.dist[i][eqs - 1]
+            if d > 0 { return (es.entries[i] + d - 1) / d }
+        }
+    }
+    return -1
+}
+
+// A copy of an index's common values, for a look (optimizer 23).
+pub fn (es: &Est) commonOf(tree: int): Common {
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree {
+            let c = &es.cm[i]
+            var n: []int = []
+            for x in c.cnts { append(mut &n, x) }
+            return Common{entries: c.entries, d: c.d, keys: lexdb_catalog.copyStrs(&c.keys), cnts: n}
+        }
+    }
+    return noCommon()
+}
+
+// An index's (or the primary key's, by the table's tree) entries; -1 none.
+pub fn (es: &Est) entriesOf(tree: int): int {
+    for i in 0..len(es.trees) { if es.trees[i] == tree { return es.entries[i] } }
+    return -1
+}
+
+pub fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []} }
+
+pub fn noCommon(): Common { return Common{entries: 0, d: -1, keys: [], cnts: []} }
+
+// The rows expected equal to key (an encoded index part; "" unknown): its
+// count when it is a common value, else the average of the other values.
+pub fn rowsOf(cm: &Common, key: &str): int {
+    if cm.d <= 0 { return -1 }
+    if len(key) > 0 && len(cm.keys) > 0 {
+        let k = key.toStr()
+        var inCommon = 0
+        for j in 0..len(cm.keys) {
+            if cm.keys[j] == k { return cm.cnts[j] }
+            inCommon += cm.cnts[j]
+        }
+        let rest = cm.d - len(cm.keys)
+        if rest <= 0 { return 0 }
+        return (cm.entries - inCommon + rest - 1) / rest
+    }
+    return (cm.entries + cm.d - 1) / cm.d
+}

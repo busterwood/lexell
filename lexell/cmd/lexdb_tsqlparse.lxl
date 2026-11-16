@@ -14,12 +14,13 @@
 import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
+import "./lexdb_parse"
 
 type DbErr = lexdb_base.DbErr
 type TypeName = lexdb_sql.TypeName
 type Stmt = lexdb_sql.Stmt
 type Expr = lexdb_sql.Expr
-type Parser = lexdb_sql.Parser
+type Parser = lexdb_parse.Parser
 
 pub const TS_SQL = 1        // a statement of lexdb's parser: stmt[0]
 pub const TS_DECLARE = 2    // DECLARE: names and types; stmt: the initialisers, as SELECT @v = expr
@@ -91,7 +92,7 @@ fn block(q: mut &Parser, types: mut &[]TypeName): Result[[]TStmt, DbErr] {
     while true {
         while q.acceptKw(";") {}
         if q.isKw("end") { break }
-        if q.peek().kind == lexdb_sql.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
+        if q.peek().kind == lexdb_parse.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
         append(mut &out, try tsqlStmt(q, types))
     }
     return Ok(out)
@@ -106,7 +107,7 @@ fn single(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
 // Whether the next token ends a statement with nothing after it (THROW, RETURN).
 fn atEnd(q: &Parser): bool {
     let t = q.peek()
-    return t.kind == lexdb_sql.T_EOF || (t.kind == lexdb_sql.T_OP && t.text == ";") || (t.kind == lexdb_sql.T_IDENT && (t.text == "end" || t.text == "else"))
+    return t.kind == lexdb_parse.T_EOF || (t.kind == lexdb_parse.T_OP && t.text == ";") || (t.kind == lexdb_parse.T_IDENT && (t.text == "end" || t.text == "else"))
 }
 
 // An optional transaction or savepoint name after BEGIN TRAN, COMMIT, ROLLBACK.
@@ -114,12 +115,12 @@ fn tranName(q: mut &Parser, names: mut &[]str) {
     let t = q.peek()
     // (a statement's keyword after BEGIN TRAN is the next statement, not the transaction's name: mssql-jdbc's
     // "BEGIN TRAN IF @@TRANCOUNT = 2 COMMIT TRAN")
-    if t.kind == lexdb_sql.T_IDENT && (t.text == "if" || t.text == "begin" || t.text == "end" || t.text == "commit" || t.text == "rollback" ||
+    if t.kind == lexdb_parse.T_IDENT && (t.text == "if" || t.text == "begin" || t.text == "end" || t.text == "commit" || t.text == "rollback" ||
        t.text == "save" || t.text == "set" || t.text == "declare" || t.text == "while" || t.text == "print" || t.text == "exec" || t.text == "execute" ||
        t.text == "return" || t.text == "merge" || t.text == "use" || t.text == "throw" || t.text == "raiserror" || t.text == "goto" || t.text == "else") {
         return
     }
-    if t.kind == lexdb_sql.T_IDENT && !lexdb_sql.isReservedWord(&t.text) || t.kind == lexdb_sql.T_QIDENT || t.kind == lexdb_sql.T_VAR {
+    if t.kind == lexdb_parse.T_IDENT && !lexdb_sql.isReservedWord(&t.text) || t.kind == lexdb_parse.T_QIDENT || t.kind == lexdb_parse.T_VAR {
         q.skip(1)
         append(names, t.text)
     }
@@ -130,7 +131,7 @@ fn declare(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     var ts = tstmt(TS_DECLARE)
     while true {
         let t = q.peek()
-        if t.kind != lexdb_sql.T_VAR || strings.startsWith(&t.text, "@@") { return Err(q.unexpected()) }
+        if t.kind != lexdb_parse.T_VAR || strings.startsWith(&t.text, "@@") { return Err(q.unexpected()) }
         q.skip(1)
         let a = q.acceptKw("as")
         if q.isKw("table") || q.isKw("cursor") { return Err(lexdb_base.err("0A000", "DECLARE of a table or cursor variable is not supported yet")) }
@@ -172,9 +173,9 @@ fn setOption(q: mut &Parser): Result[TStmt, DbErr] {
         if !q.acceptKw(",") { break }
     }
     let v = q.next()
-    if v.kind == lexdb_sql.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
-    ts.value = if v.kind == lexdb_sql.T_IDENT { v.text } else { strings.toLowerAscii(&v.text) }
-    if v.kind == lexdb_sql.T_OP && v.text == "-" { ts.value = "-" + q.next().text }
+    if v.kind == lexdb_parse.T_EOF { return Err(lexdb_base.err("42601", "syntax error at end of input")) }
+    ts.value = if v.kind == lexdb_parse.T_IDENT { v.text } else { strings.toLowerAscii(&v.text) }
+    if v.kind == lexdb_parse.T_OP && v.text == "-" { ts.value = "-" + q.next().text }
     return Ok(ts)
 }
 
@@ -183,7 +184,7 @@ fn multiName(q: mut &Parser): Result[[]str, DbErr] {
     var parts: []str = []
     while true {
         let t = q.peek()
-        if t.kind == lexdb_sql.T_IDENT || t.kind == lexdb_sql.T_QIDENT {
+        if t.kind == lexdb_parse.T_IDENT || t.kind == lexdb_parse.T_QIDENT {
             q.skip(1)
             append(mut &parts, if len(t.spell) > 0 { t.spell } else { t.text })
         } else if q.isKw(".") {
@@ -208,15 +209,15 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
     }
     var ts = tstmt(TS_EXEC)
     let r = q.peek()
-    if r.kind == lexdb_sql.T_VAR && q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" { q.skip(2) }
+    if r.kind == lexdb_parse.T_VAR && q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "=" { q.skip(2) }
     let parts = try multiName(q)
     append(mut &ts.names, strings.toLowerAscii(&parts[len(parts) - 1]))
     var args: []Expr = []
     var outs: []str = []
-    while !atEnd(q) && !(q.peek().kind == lexdb_sql.T_IDENT && lexdb_sql.isTsqlStart(&q.peek().text)) {
+    while !atEnd(q) && !(q.peek().kind == lexdb_parse.T_IDENT && lexdb_parse.isTsqlStart(&q.peek().text)) {
         let t = q.peek()
         var pname = ""
-        if t.kind == lexdb_sql.T_VAR && q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" {
+        if t.kind == lexdb_parse.T_VAR && q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "=" {
             pname = t.text
             q.skip(2)
         }
@@ -227,7 +228,7 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
         } else {
             append(mut &args, try q.expr())
             if q.acceptKw("output") || q.acceptKw("out") {
-                if v.kind != lexdb_sql.T_VAR { return Err(q.unexpected()) }
+                if v.kind != lexdb_parse.T_VAR { return Err(q.unexpected()) }
                 out = v.text
             }
         }
@@ -243,26 +244,26 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
 // Whether INSERT [INTO] name [(columns)] EXEC follows.
 fn insertExec(q: &Parser): bool {
     var k = 1
-    if q.peekAt(k).kind == lexdb_sql.T_IDENT && q.peekAt(k).text == "into" { k += 1 }
+    if q.peekAt(k).kind == lexdb_parse.T_IDENT && q.peekAt(k).text == "into" { k += 1 }
     while true {
         let t = q.peekAt(k)
-        if !(t.kind == lexdb_sql.T_IDENT || t.kind == lexdb_sql.T_QIDENT) { return false }
+        if !(t.kind == lexdb_parse.T_IDENT || t.kind == lexdb_parse.T_QIDENT) { return false }
         k += 1
         let d = q.peekAt(k)
-        if !(d.kind == lexdb_sql.T_OP && d.text == ".") { break }
+        if !(d.kind == lexdb_parse.T_OP && d.text == ".") { break }
         k += 1
     }
-    if q.peekAt(k).kind == lexdb_sql.T_OP && q.peekAt(k).text == "(" {
+    if q.peekAt(k).kind == lexdb_parse.T_OP && q.peekAt(k).text == "(" {
         while true {
             k += 1
             let t = q.peekAt(k)
-            if t.kind == lexdb_sql.T_EOF { return false }
-            if t.kind == lexdb_sql.T_OP && t.text == ")" { break }
+            if t.kind == lexdb_parse.T_EOF { return false }
+            if t.kind == lexdb_parse.T_OP && t.text == ")" { break }
         }
         k += 1
     }
     let w = q.peekAt(k)
-    return w.kind == lexdb_sql.T_IDENT && (w.text == "exec" || w.text == "execute")
+    return w.kind == lexdb_parse.T_IDENT && (w.text == "exec" || w.text == "execute")
 }
 
 // INSERT BULK, after it: the table, its columns as the client will send
@@ -276,7 +277,7 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
     try q.expectKw("(")
     while true {
         let c = q.next()
-        if c.kind != lexdb_sql.T_IDENT && c.kind != lexdb_sql.T_QIDENT { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + c.text + "\""))) }
+        if c.kind != lexdb_parse.T_IDENT && c.kind != lexdb_parse.T_QIDENT { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + c.text + "\""))) }
         for k in 1..len(ts.names) {
             if ts.names[k] == c.text {
                 return Err(lexdb_base.err("TS264", &("The column name '" + (if len(c.spell) > 0 { c.spell } else { c.text }) +
@@ -295,7 +296,7 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
         try q.expectKw("(")
         while true {
             let o = q.peek()
-            if o.kind != lexdb_sql.T_IDENT { return Err(q.unexpected()) }
+            if o.kind != lexdb_parse.T_IDENT { return Err(q.unexpected()) }
             if o.text == "check_constraints" || o.text == "fire_triggers" || o.text == "keep_nulls" || o.text == "tablock" {
                 q.skip(1)
                 append(mut &opts, o.text)
@@ -303,13 +304,13 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
                 q.skip(1)
                 try q.expectKw("=")
                 let n = q.next()
-                if n.kind != lexdb_sql.T_NUM { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + n.text + "\""))) }
+                if n.kind != lexdb_parse.T_NUM { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + n.text + "\""))) }
             } else if o.text == "order" {
                 q.skip(1)
                 try q.expectKw("(")
                 while true {
                     let c = q.next()
-                    if c.kind != lexdb_sql.T_IDENT && c.kind != lexdb_sql.T_QIDENT { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + c.text + "\""))) }
+                    if c.kind != lexdb_parse.T_IDENT && c.kind != lexdb_parse.T_QIDENT { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + c.text + "\""))) }
                     if !q.acceptKw("asc") { let d = q.acceptKw("desc") }
                     if !q.acceptKw(",") { break }
                 }
@@ -322,7 +323,7 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
         try q.expectKw(")")
     }
     ts.value = strings.join(&opts, " ")
-    if q.peek().kind != lexdb_sql.T_EOF && !q.isKw(";") { return Err(q.unexpected()) }
+    if q.peek().kind != lexdb_parse.T_EOF && !q.isKw(";") { return Err(q.unexpected()) }
     return Ok(ts)
 }
 
@@ -330,12 +331,12 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
 fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     q.fresh()
     let t = q.peek()
-    if t.kind == lexdb_sql.T_IDENT {
+    if t.kind == lexdb_parse.T_IDENT {
         let w1 = q.peekAt(1)
         if t.text == "use" {
             q.skip(1)
             let n = q.next()
-            if n.kind != lexdb_sql.T_IDENT && n.kind != lexdb_sql.T_QIDENT { return Err(q.unexpected()) }
+            if n.kind != lexdb_parse.T_IDENT && n.kind != lexdb_parse.T_QIDENT { return Err(q.unexpected()) }
             var ts = tstmt(TS_USE)
             append(mut &ts.names, if len(n.spell) > 0 { n.spell } else { n.text })
             return Ok(ts)
@@ -345,10 +346,10 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             return execStmt(q)
         }
         // a batch that begins with a system procedure's name executes it (mssql-jdbc's "sp_executesql N'SET FMTONLY ON ...'")
-        if (strings.startsWith(&t.text, "sp_") || strings.startsWith(&t.text, "xp_")) && !(w1.kind == lexdb_sql.T_OP && (w1.text == "=" || w1.text == ".")) {
+        if (strings.startsWith(&t.text, "sp_") || strings.startsWith(&t.text, "xp_")) && !(w1.kind == lexdb_parse.T_OP && (w1.text == "=" || w1.text == ".")) {
             return execStmt(q)
         }
-        if t.text == "insert" && w1.kind == lexdb_sql.T_IDENT && w1.text == "bulk" {
+        if t.text == "insert" && w1.kind == lexdb_parse.T_IDENT && w1.text == "bulk" {
             q.skip(2)
             return insertBulk(q)
         }
@@ -370,7 +371,7 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             append(mut &ts.body, try execStmt(q))
             return Ok(ts)
         }
-        if t.text == "declare" && w1.kind == lexdb_sql.T_VAR && q.peekAt(2).kind == lexdb_sql.T_IDENT && q.peekAt(2).text == "table" {
+        if t.text == "declare" && w1.kind == lexdb_parse.T_VAR && q.peekAt(2).kind == lexdb_parse.T_IDENT && q.peekAt(2).text == "table" {
             // DECLARE @t TABLE (...): a table for the batch, #@t
             q.skip(3)
             var ts = tstmt(TS_TABLEVAR)
@@ -382,14 +383,14 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             q.skip(1)
             return declare(q, types)
         }
-        if t.text == "set" && w1.kind == lexdb_sql.T_VAR {
+        if t.text == "set" && w1.kind == lexdb_parse.T_VAR {
             q.skip(2)
             let target = try q.variable(&w1)
             // SET @v = e, and SET @v += e and the like
             var op = ""
             let o = q.peek()
-            if o.kind == lexdb_sql.T_OP && (o.text == "+" || o.text == "-" || o.text == "*" || o.text == "/" || o.text == "%") &&
-               q.peekAt(1).kind == lexdb_sql.T_OP && q.peekAt(1).text == "=" {
+            if o.kind == lexdb_parse.T_OP && (o.text == "+" || o.text == "-" || o.text == "*" || o.text == "/" || o.text == "%") &&
+               q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "=" {
                 q.skip(1)
                 op = if o.text == "+" { "t+" } else { o.text }
             }
@@ -405,7 +406,7 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             var ts = tstmt(TS_IF)
             append(mut &ts.stmt, try q.condition())
             append(mut &ts.body, try single(q, types))
-            if q.isKw(";") && q.peekAt(1).kind == lexdb_sql.T_IDENT && q.peekAt(1).text == "else" { q.skip(1) }
+            if q.isKw(";") && q.peekAt(1).kind == lexdb_parse.T_IDENT && q.peekAt(1).text == "else" { q.skip(1) }
             if q.acceptKw("else") { append(mut &ts.els, try single(q, types)) }
             return Ok(ts)
         }
@@ -422,7 +423,7 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
         }
         if t.text == "return" {
             q.skip(1)
-            if !atEnd(q) && (q.peek().kind == lexdb_sql.T_NUM || q.peek().kind == lexdb_sql.T_VAR || q.isKw("(") || q.isKw("-")) {
+            if !atEnd(q) && (q.peek().kind == lexdb_parse.T_NUM || q.peek().kind == lexdb_parse.T_VAR || q.isKw("(") || q.isKw("-")) {
                 q.fresh()
                 let x = try q.expr()
             }
@@ -468,32 +469,32 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
             }
             return Ok(ts)
         }
-        if t.text == "set" && w1.kind == lexdb_sql.T_IDENT && w1.text == "identity_insert" {
+        if t.text == "set" && w1.kind == lexdb_parse.T_IDENT && w1.text == "identity_insert" {
             // SET IDENTITY_INSERT [schema.]table ON | OFF: names the option and the table
             q.skip(2)
             var ts = tstmt(TS_SETOPT)
             append(mut &ts.names, "identity_insert")
             var n = q.next()
             while q.acceptKw(".") { n = q.next() }
-            if n.kind != lexdb_sql.T_IDENT && n.kind != lexdb_sql.T_QIDENT { return Err(q.unexpected()) }
+            if n.kind != lexdb_parse.T_IDENT && n.kind != lexdb_parse.T_QIDENT { return Err(q.unexpected()) }
             append(mut &ts.names, n.text)
             let v = q.next()
             if v.text != "on" && v.text != "off" { return Err(q.unexpected()) }
             ts.value = v.text
             return Ok(ts)
         }
-        if t.text == "set" && w1.kind == lexdb_sql.T_IDENT && (isSetOption(&w1.text) || w1.text == "transaction") {
+        if t.text == "set" && w1.kind == lexdb_parse.T_IDENT && (isSetOption(&w1.text) || w1.text == "transaction") {
             q.skip(1)
             return setOption(q)
         }
         if t.text == "begin" {
-            if w1.kind == lexdb_sql.T_IDENT && (w1.text == "tran" || w1.text == "transaction") {
+            if w1.kind == lexdb_parse.T_IDENT && (w1.text == "tran" || w1.text == "transaction") {
                 q.skip(2)
                 var ts = tstmt(TS_BEGIN)
                 tranName(q, mut &ts.names)
                 return Ok(ts)
             }
-            if w1.kind == lexdb_sql.T_IDENT && w1.text == "try" {
+            if w1.kind == lexdb_parse.T_IDENT && w1.text == "try" {
                 q.skip(2)
                 var ts = tstmt(TS_TRY)
                 ts.body = try block(q, types)
@@ -771,14 +772,14 @@ fn replaceDeclare(text: &str, nm: &str): str {
 }
 
 // A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order).
-pub fn parseBatch(sql0: &str, d: lexdb_sql.Dialect, vars: &[]str): Result[TBatch, DbErr] {
+pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBatch, DbErr] {
     let sql = tableVariables(sql0)
-    var q = try lexdb_sql.tsqlParser(&sql, d, vars)
+    var q = try lexdb_parse.tsqlParser(&sql, d, vars)
     var out: []TStmt = []
     var types: []TypeName = []
     while true {
         while q.acceptKw(";") {}
-        if q.peek().kind == lexdb_sql.T_EOF { break }
+        if q.peek().kind == lexdb_parse.T_EOF { break }
         append(mut &out, try tsqlStmt(mut &q, mut &types))
     }
     return Ok(TBatch{stmts: out, vars: q.takeVars(), types: types})
@@ -792,11 +793,11 @@ pub type ParamDecl = record { pub name: str; pub typ: TypeName; pub output: bool
 
 pub fn parseParamDecls(text: &str): Result[[]ParamDecl, DbErr] {
     let none: []str = []
-    var q = try lexdb_sql.tsqlParser(text, lexdb_sql.Dialect{tsql: true, quotedIdent: true}, &none)
+    var q = try lexdb_parse.tsqlParser(text, lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &none)
     var out: []ParamDecl = []
-    while q.peek().kind != lexdb_sql.T_EOF {
+    while q.peek().kind != lexdb_parse.T_EOF {
         let t = q.next()
-        if t.kind != lexdb_sql.T_VAR { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + t.text + "\""))) }
+        if t.kind != lexdb_parse.T_VAR { return Err(lexdb_base.err("42601", &("syntax error at or near \"" + t.text + "\""))) }
         let a = q.acceptKw("as")
         let pt = try q.paramType()
         if q.acceptKw("=") { let dflt = try q.expr() }
@@ -805,6 +806,6 @@ pub fn parseParamDecls(text: &str): Result[[]ParamDecl, DbErr] {
         append(mut &out, ParamDecl{name: t.text, typ: pt.typ, output: output, tableType: pt.key, typeText: pt.written, readonly: ro})
         if !q.acceptKw(",") { break }
     }
-    if q.peek().kind != lexdb_sql.T_EOF { return Err(q.unexpected()) }
+    if q.peek().kind != lexdb_parse.T_EOF { return Err(q.unexpected()) }
     return Ok(out)
 }

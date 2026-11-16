@@ -26,6 +26,9 @@ import "./lexdb_base"
 import "./lexdb_disk"
 import "./lexdb_page"
 import "./lexdb_cols"
+import "./lexdb_locks"
+import "./lexdb_memo"
+import "./lexdb_session"
 import "./lexdb_rows"
 import "./lexdb_time"
 
@@ -47,7 +50,7 @@ const OP_PUT_HEAD = 5       // in the log only: a put with its head (TxWrite.hea
 // subtrees wholly inside are freed as a dropped tree's are (design/lexdb-bulkdelete.md).
 pub const OP_DELRANGE = 6
 
-pub fn segName(g: int): str { return "log." + g.toStr() }
+fn segName(g: int): str { return "log." + g.toStr() }
 
 pub type Options = value record {
     pub cacheBytes: int     // about the memory nodes take before clean ones are evicted (lexdb_page.nodeCost)
@@ -148,7 +151,6 @@ pub type Db = record {
     countArg: str
     countCalls: int
     dropReads: int              // the most of their pages a checkpoint reads (DROP_READS; tests set fewer)
-    memo: Map[str, str]         // what the SQL layer keeps while the store is open, outside transactions (its sequences' blocks: 9.43)
     listPages: []int            // the list pages of the last durable checkpoint
     ckpt: int
     durableCkpt: int
@@ -159,12 +161,6 @@ pub type Db = record {
     appliedBatch: int           // the highest batch with an applied commit
     durableBatch: int
     waiters: []Waiter
-    // Row locks (9.86): "tree:key" -> its holders, "id mode" each, joined
-    // by ";"; the transactions waiting for one, and what each waits for.
-    locks: Map[str, str]
-    lockWaits: []LockWait
-    waitFor: Map[int, str]
-    nextLock: int
     writerWake: []task.Promise[Unit]
     ckptWake: []task.Promise[Unit]
     ckptDone: []task.Promise[Unit]  // commits held while the cache is over twice its budget (see commit)
@@ -237,7 +233,54 @@ pub type Db = record {
 
 // A handle to an open store; copies reach the same store. A replica's
 // (openReplica) reads through its follower (fo), and takes no writes.
-pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower] }
+// The test and diagnostic surface: knobs and checks that no serving path
+// calls. They stay in the store because they inspect its internals; this
+// record names them so Store's serving methods do not carry them.
+pub type TestHooks = value record {
+    pub audit: fn(lexdb_disk.Fs): Result[str, lexdb_base.DbErr]
+    pub cacheState: fn(Store): str
+    pub clearCountHook: fn(Store)
+    pub colCounts: fn(Store): []int
+    pub countHookCalls: fn(Store): int
+    pub cutCounts: fn(Store): []int
+    pub durWaiting: fn(Store): int
+    pub readsText: fn(&Txn): str
+    pub segName: fn(int): str
+    pub setColumns: fn(Store, bool)
+    pub setCountHook: fn(Store, fn(Store, int, str, int), int, &str)
+    pub setCutChunk: fn(Store, int)
+    pub setDropReads: fn(Store, int)
+    pub setFrameMax: fn(Store, int)
+    pub setUpgradeBudget: fn(Store, int)
+    pub setWriteLogMax: fn(int)
+    pub chunkKey: fn(&str, int): str
+    pub upgradeCounts: fn(Store): []int
+}
+
+pub fn testHooks(): TestHooks {
+    return TestHooks{audit: audit, cacheState: cacheState, clearCountHook: clearCountHook, colCounts: colCounts,
+                     countHookCalls: countHookCalls, cutCounts: cutCounts, durWaiting: durWaiting, readsText: readsText,
+                     segName: segName, setColumns: setColumns, setCountHook: setCountHook, setCutChunk: setCutChunk,
+                     setDropReads: setDropReads, setFrameMax: setFrameMax, setUpgradeBudget: setUpgradeBudget,
+                     setWriteLogMax: setWriteLogMax, chunkKey: chunkKey, upgradeCounts: upgradeCounts}
+}
+
+pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks }
+
+// Which tree a transaction's reads see: the live tree, its snapshot, or a
+// replica's follower. Read operations select once through viewOf, so every
+// path agrees on the choice and on what a snapshot's reads note.
+type View = closed {
+    Live
+    Snap
+    Repl
+}
+
+fn (st: &Store) viewOf(t: &Txn): View {
+    if st.fo.isSome() { return View.Repl }
+    if t.snap >= 0 && !t.live { return View.Snap }
+    return View.Live
+}
 
 // A read mark: a leaf seen at a version (4.4).
 // A leaf a transaction read: its slot as it was then, and its page if it
@@ -267,7 +310,7 @@ const WLOG_RANGE = 1024
 var WLOG_MAX: int = 131072
 
 // For the tests: keeps fewer writes.
-pub fn setWriteLogMax(n: int) { WLOG_MAX = n }
+fn setWriteLogMax(n: int) { WLOG_MAX = n }
 
 // head: a large value's first bytes its writer wants kept in its leaf (9.31).
 pub type TxWrite = value record { pub op: int; pub tree: int; pub key: str; pub val: str; pub head: int }
@@ -302,25 +345,14 @@ pub type Txn = record {
     snapTrees: Map[int, int]    // the tree roots as the snapshot sees them
     track: bool                 // a snapshot's reads are noted (Mark) for its writes' commit: a transaction block
     pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
-    pub path: []str             // the SQL layer's search path for its names (lexdb_exec); [] the default
-    pub sess: int               // the SQL layer's session running it (its sequences' values, 9.43)
-    pub rules: bool             // the SQL layer's planner ignores statistics (SET lexdb_planner = rules: lexdb_exec optimizer 20)
-    pub memMax: int             // the SQL layer's statement memory (SET max_statement_mem, bytes; 0 none): its planner's hash joins fit in it (optimizer 26 review)
+    pub sql: lexdb_session.SqlTxn // the SQL layer's state; store carries it, never reads it
+    pub now: int                // when it began, Unix microseconds: SQL's now() (9.76) and a renewed snapshot's
     // Read-ahead's run size where the last scan left it, and its tree: a
     // scan the caller goes on with in parts (a batch at a time) keeps
     // growing its runs, not starting again at AHEAD_MIN.
     raTree: int
     ra: int
     fsnap: []RepPin             // on a replica: its follower snapshot, from its first read to its end (or its drop)
-    pub now: int                // when it began, Unix microseconds: SQL's now() (9.76)
-    pub zone: lexdb_time.Zone   // the SQL layer's session's time zone (9.95): it travels with the statement
-    // The SQL layer's deferred foreign key checks, encoded (lexdb_exec,
-    // 9.85), and SET CONSTRAINTS: consAll 0 none, 1 ALL DEFERRED, 2 ALL
-    // IMMEDIATE; then per name (later ones win).
-    pub pending: []str
-    pub consAll: int
-    pub consNames: []str
-    pub consDeferred: []bool
     lockId: int                 // its row locks' owner (9.86); 0 none yet
     held: []str                 // the rows it has locked ("tree:key")
     // Its reads not noted for the commit's check, for now: a SELECT that
@@ -343,16 +375,16 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, path: [], sess: 0, rules: false, memMax: 0,
-               raTree: -1, ra: AHEAD_MIN, fsnap: [], now: time.now().unixMicros(), zone: lexdb_time.utc(),
-               pending: [], consAll: 0, consNames: [], consDeferred: [], lockId: 0, held: [], quiet: false, openEnd: false,
+    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
+               raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
 
-pub fn (t: &Txn) isSnapshot(): bool { return t.snap >= 0 }
-
 // A transaction block's (BEGIN ... COMMIT), not a statement's own.
 pub fn (t: &Txn) inBlock(): bool { return t.track }
+
+// The owner id of its row locks (0 before its first lock).
+pub fn (t: &Txn) lockOwner(): int { return t.lockId }
 
 // Notes a read of [lo, hi) of tree as of commit seq; one adjacent to the
 // last (a scan's next leaf) extends it.
@@ -392,7 +424,7 @@ fn hexTo(b: mut &StrBuf, s: &str) {
 }
 
 // The reads noted, as text (for the tests: tree, range, seq of each).
-pub fn (t: &Txn) readsText(): str {
+fn readsText(t: &Txn): str {
     var b = newStrBuf()
     for r in t.reads {
         b.add(&(r.tree.toStr()))
@@ -2025,10 +2057,10 @@ pub const STUB_LEN: int = lexdb_rows.STUB_LEN
 pub const LAST_CHUNK = 0xFFFFFFFF                 // past every chunk's number: a key range's end
 
 fn isOvf(tree: int): bool { return tree >= OVF }
-pub fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
+fn marked(v: &str): bool { return len(v) > 0 && v[0] == BIG }
 // A stub: version 1 (9.29) has no row start; version 2 (9.31) is followed
 // by the value's first bytes, the chunks holding the rest.
-pub fn isStub(v: &str): bool { return lexdb_rows.isStub(v) }
+fn isStub(v: &str): bool { return lexdb_rows.isStub(v) }
 
 // How a scan gives large values: whole; RAW, as stored (a companion's
 // chunks); PART, as their stubs (partOf, whole).
@@ -2038,15 +2070,13 @@ const M_PART = 2
 
 // A large value's stored form as getPart and the Part scans give it: its
 // first bytes (as many as its leaf holds), or None for any other value.
-pub fn partOf(v: &str): Option[str] { return lexdb_rows.partOf(v) }
-
 // A value given in part (partOf), whole.
 pub fn (st: &Store) whole(t: mut &Txn, tree: int, key: &str, v: &str): Result[str, lexdb_base.DbErr] {
     if !isStub(v) { return Ok(lexdb_base.own(v)) }
     return st.unstore(t, tree, key, v)
 }
 
-pub fn chunkKey(key: &str, i: int): str {
+fn chunkKey(key: &str, i: int): str {
     var b = newStrBuf()
     binary.addU16BE(mut &b, len(key))
     b.add(key)
@@ -2057,7 +2087,7 @@ pub fn chunkKey(key: &str, i: int): str {
 // The bytes of a value each chunk of key holds.
 fn chunkRoom(key: &str): int { return lexdb_page.MAX_ENTRY - lexdb_page.leafEntry(&chunkKey(key, 0), &"") }
 
-pub fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
+fn crcOf(crc: u32, s: &str): u32 { return hash.crc32cMore(crc, &strToBytes(s)) }
 
 // The value at key in a tree whose leaf for it is in memory.
 fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
@@ -2301,14 +2331,15 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Optio
 // getIn without the transaction's own writes and range deletes: the stored
 // row (as the transaction's reads see the store).
 fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    match st.viewOf(t) {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.get(&s, tree, &key)
         }
-        None {}
+        View.Snap { return st.snapGet(t, tree, key, mode) }
+        View.Live {}
     }
-    if t.snap >= 0 && !t.live { return st.snapGet(t, tree, key, mode) }
     while true {
         var need = -1
         var out: Option[str] = None
@@ -2391,7 +2422,7 @@ const COUNT_DEPTH = 64
 // For the tests: f(store, mode, arg, try) is called after a count has found
 // what to read and before it reads (try 0 the first), outside the store's
 // lock. A closure cannot be kept here, so mode and arg carry what it needs.
-pub fn (st: &Store) setCountHook(f: fn(Store, int, str, int), mode: int, arg: &str) {
+fn setCountHook(st: Store, f: fn(Store, int, str, int), mode: int, arg: &str) {
     st.sh.with(fn(db: mut &Db) {
         db.countHook = [f]
         db.countMode = mode
@@ -2399,10 +2430,10 @@ pub fn (st: &Store) setCountHook(f: fn(Store, int, str, int), mode: int, arg: &s
         db.countCalls = 0
     })
 }
-pub fn (st: &Store) clearCountHook() { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
+fn clearCountHook(st: Store) { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
 
 // How many times the hook was called since it was set.
-pub fn (st: &Store) countHookCalls(): int {
+fn countHookCalls(st: Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = db.countCalls })
     return n
@@ -2588,8 +2619,9 @@ fn (c: mut &Cnt) countPage(it: &CItem, b: &[]byte): Result[Unit, lexdb_base.DbEr
 // Writes of other commits to the range are for noteRange to catch.
 pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Result[int, lexdb_base.DbErr] {
     if len(hi) > 0 && lo >= hi { return Ok(0) }
-    match st.fo {
-        Some(_) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
             // a replica: its follower's rows, counted by a scan (which skips the cut ranges: the base leaves of a purge are not read; rows outside it are)
             var n = 0
             try st.scan(t, tree, lo, hi, fn(e: &Entry): bool {
@@ -2598,9 +2630,9 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
             })
             return Ok(n)
         }
-        None {}
+        else {}
     }
-    let snap = t.snap >= 0 && !t.live
+    let snap = view == View.Snap
     for attempt in 0..COUNT_TRIES {
         var c = Cnt{q: if snap { t.snapSeq } else { -1 }, lo: lo.toStr(), hi: hi.toStr(), total: 0, items: [], tops: [], err: ""}
         var f = lexdb_disk.File.Real(-1, false)
@@ -2736,15 +2768,16 @@ pub fn (st: &Store) countView(t: mut &Txn, tree: int, lo: &str, hi: &str): Resul
 // statement runs again).
 pub fn (st: &Store) noteRange(t: mut &Txn, tree: int, lo: &str, hi: &str) {
     if len(hi) > 0 && lo >= hi { return }
-    if !t.noting() || st.fo.isSome() { return }
+    let view = st.viewOf(t)
+    if !t.noting() || view == View.Repl { return }
     var seq = 0
-    if t.snap >= 0 && !t.live { seq = t.snapSeq } else { st.sh.with(fn(db: mut &Db) { seq = db.seq }) }
+    if view == View.Snap { seq = t.snapSeq } else { st.sh.with(fn(db: mut &Db) { seq = db.seq }) }
     t.noteRead(tree, lo, hi, seq)
 }
 
 // The nodes in memory, as text (slot, whether referenced, whether dirty,
 // version): a test's check that a read leaves the cache as it was.
-pub fn (st: &Store) cacheState(): str {
+fn cacheState(st: Store): str {
     var b = newStrBuf()
     st.sh.with(fn(db: mut &Db) {
         for s in 0..len(db.meta) {
@@ -2864,12 +2897,13 @@ const LOOKUP_GAP = 256
 pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, out: mut &[]Option[str]): Result[Unit, lexdb_base.DbErr] {
     let mode = if part { M_PART } else { M_FULL }
     let n = len(keys)
-    if st.fo.isSome() {
+    let view = st.viewOf(t)
+    if view == View.Repl {
         // a replica's reads: one by one
         for k in keys { append(out, try st.getIn(t, tree, k, mode)) }
         return Ok(Unit{})
     }
-    let snap = t.snap >= 0 && !t.live
+    let snap = view == View.Snap
     let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     let noting = t.noting()
     var i = 0
@@ -3002,8 +3036,9 @@ fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]str, i: int
 // quietly: the reads after it give the error.
 pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]str): Result[Unit, lexdb_base.DbErr] {
     let n = len(keys)
-    if st.fo.isSome() || n < 2 { return Ok(Unit{}) }
-    let snap = t.snap >= 0 && !t.live
+    let view = st.viewOf(t)
+    if view == View.Repl || n < 2 { return Ok(Unit{}) }
+    let snap = view == View.Snap
     let sroot = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var i = 0
     while i < n {
@@ -3217,17 +3252,20 @@ pub fn (st: &Store) scanPart(t: mut &Txn, tree: int, from: &str, to: &str, f: &f
 
 // scan; raw: the stored forms, no reads noted (a companion tree's chunks).
 fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.scan(&s, tree, &from, &to, f)
         }
-        None {}
+        else {}
     }
     let raw = mode == M_RAW
     let own: []TxWrite = if raw { [] } else { t.ownRange(tree, &from, &to) }
     let cut = !raw && t.hasCuts(tree)           // stored keys in a range delete of its own are skipped
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = 0
     var cursor = from
     var more = true
@@ -3247,8 +3285,8 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3399,9 +3437,11 @@ fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: str,
 // range is noted as read, even when f stops in it (a wider read is safe).
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
+    let view = st.viewOf(t)
+    if view == View.Repl { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var cursor: str = from
     var more = true
     let noting = t.noting()
@@ -3421,8 +3461,8 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3539,16 +3579,19 @@ pub fn (st: &Store) scanBackPart(t: mut &Txn, tree: int, from: &str, to: &str, f
 }
 
 fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
-    match st.fo {
-        Some(fo) {
+    let view = st.viewOf(t)
+    match view {
+        View.Repl {
+            let fo = st.fo.unwrap()
             let s = try repSnap(&fo, t)
             return fo.scanBack(&s, tree, &from, &to, f)
         }
-        None {}
+        else {}
     }
     let own = t.ownRange(tree, &from, &to)
     let cut = t.hasCuts(tree)
-    let root = if t.snap >= 0 && !t.live { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
+    let snap = view == View.Snap
+    let root = if snap { match t.snapTrees.get(&tree) { Some(r) { r } None { -1 } } } else { -1 }
     var oi = len(own) - 1
     var cursor = to
     var more = true
@@ -3565,8 +3608,8 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                 append(mut &bad, db.failed[0])
                 return
             }
-            rseq = if t.snap >= 0 && !t.live { t.snapSeq } else { db.seq }
-            if t.snap >= 0 && !t.live {
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
@@ -3759,7 +3802,7 @@ fn (db: mut &Db) logWrites(t: &Txn) {
 // so that its commit would fail (40001): the SQL layer's look at an error
 // that a state read in two moments may have caused (lexdb.md 9.120).
 pub fn (st: &Store) liveStale(t: &Txn): bool {
-    if st.fo.isSome() || (t.snap >= 0 && !t.live) { return false }
+    if st.viewOf(t) != View.Live { return false }
     var stale = false
     st.sh.with(fn(db: mut &Db) { stale = !db.validate(t) })
     return stale
@@ -3776,12 +3819,12 @@ pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     let held = replace(mut &t.held, [])
     if id >= 0 && len(t.writes) == 0 {
         st.endSnap(id)
-        st.unlockAll(lid, &held)
+        st.locks.release(lid, &held)
         return Ok(Unit{})
     }
     let r = st.commitLive(t, true)
     st.endSnap(id)
-    st.unlockAll(lid, &held)            // after the commit: those woken read what it wrote
+    st.locks.release(lid, &held)            // after the commit: those woken read what it wrote
     return r
 }
 
@@ -3797,7 +3840,7 @@ pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     let held = replace(mut &t.held, [])
     let r = st.commitLive(t, false)
     st.endSnap(id)
-    st.unlockAll(lid, &held)
+    st.locks.release(lid, &held)
     return r
 }
 
@@ -4111,7 +4154,7 @@ fn (st: &Store) endSnap(id: int) {
 
 // Ends a transaction without committing it.
 pub fn (st: &Store) abort(t: Txn) {
-    st.unlockAll(t.lockId, &t.held)
+    st.locks.release(t.lockId, &t.held)
     st.endSnapshot(&t)
 }
 
@@ -4124,210 +4167,16 @@ pub fn (st: &Store) abort(t: Txn) {
 // transaction a lock keeps out waits for the holders to end, woken then to
 // try again; one whose wait would close a cycle fails (40P01).
 
-type LockWait = record { key: str; id: int; p: task.Promise[Unit] }
-
-// Whether lock modes a and b (LOCK_*: 1 key share, 2 share, 3 no key
-// update, 4 update) keep each other out.
-fn lockConflict(a: int, b: int): bool {
-    let hi = if a > b { a } else { b }
-    let lo = if a > b { b } else { a }
-    if hi == 4 { return true }
-    if hi == 3 { return lo >= 2 }
-    return false
-}
-
-// A row's holders: ids and their modes.
-fn holdersOf(s: &str, ids: mut &[]int, modes: mut &[]int) {
-    if len(s) == 0 { return }
-    for h in strings.split(s, ";") {
-        let sp = strings.indexOf(&h, " ", 0)
-        append(ids, strings.parseIntOpt(&(h[0..sp].toStr())).unwrapOr(0))
-        append(modes, strings.parseIntOpt(&(h[sp + 1..len(h)].toStr())).unwrapOr(0))
-    }
-}
-
-fn holdersText(ids: &[]int, modes: &[]int): str {
-    var parts: []str = []
-    for i in 0..len(ids) { append(mut &parts, ids[i].toStr() + " " + modes[i].toStr()) }
-    return strings.join(&parts, ";")
-}
-
-// Whether transaction me waiting for the holders hs would wait for itself:
-// a holder that is me, or waits (in turn) for a row me holds.
-fn (db: &Db) cycle(me: int, hs: &[]int): bool {
-    var todo: []int = []
-    for h in hs { append(mut &todo, h) }
-    var seen: []int = []
-    while len(todo) > 0 {
-        let h = pop(mut &todo)
-        if h == me { return true }
-        var was = false
-        for x in seen { if x == h { was = true } }
-        if was { continue }
-        append(mut &seen, h)
-        match db.waitFor.get(&h) {
-            Some(k) {
-                var ids: []int = []
-                var modes: []int = []
-                holdersOf(&db.locks.get(&k).unwrapOr(""), mut &ids, mut &modes)
-                for i in ids { append(mut &todo, i) }
-            }
-            None {}
-        }
-    }
-    return false
-}
-
-// What lockRow did.
-pub const LOCKED = 0
-pub const LOCKED_AFTER_WAIT = 1     // the row may have changed meanwhile
-pub const LOCK_SKIPPED = 2          // SKIP LOCKED: another holds it
-
-// Locks key of tree in mode (LOCK_*) for t, waiting while others hold it
-// in a mode that conflicts (wait 0), or failing (1: 55P03), or skipping
-// (2). keep false: only waits for others, takes no lock (an UPDATE outside
-// a block: its own commit ends it at once).
+// Locks row tree:key for t in mode, waiting while others hold it in a
+// conflicting mode (wait 0), failing (1), or skipping (2). keep false: only
+// waits, takes no lock. The lock state and policy are lexdb_locks.
 pub fn (st: &Store) lockRow(t: mut &Txn, tree: int, key: &str, mode: int, wait: int, keep: bool): Result[int, lexdb_base.DbErr] {
-    if t.lockId == 0 {
-        var id = 0
-        st.sh.with(fn(db: mut &Db) {
-            db.nextLock += 1
-            id = db.nextLock
-        })
-        t.lockId = id
-    }
+    if t.lockId == 0 { t.lockId = st.locks.newId() }
     let lk = tree.toStr() + ":" + key
     var added = false
-    let r = try st.lockAs(t.lockId, &lk, mode, wait, keep, mut &added)
+    let r = try st.locks.lockAs(t.lockId, &lk, mode, wait, keep, mut &added)
     if added { append(mut &t.held, lk) }
     return Ok(r)
-}
-
-// lockRow for lock owner me (a transaction's lockId, or a session's own
-// for advisory locks: negative) and lock key lk. added: me did not hold it.
-pub fn (st: &Store) lockAs(me: int, lk: &str, mode: int, wait: int, keep: bool, added: mut &bool): Result[int, lexdb_base.DbErr] {
-    var waited = false
-    while true {
-        var out = -1
-        var bad: []lexdb_base.DbErr = []
-        var fut: []task.Future[Unit] = []
-        st.sh.with(fn(db: mut &Db) {
-            let gone = db.waitFor.remove(&me)
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&db.locks.get(&lk).unwrapOr(""), mut &ids, mut &modes)
-            var others: []int = []
-            var mine = -1
-            for i in 0..len(ids) {
-                if ids[i] == me { mine = i } else if lockConflict(mode, modes[i]) { append(mut &others, ids[i]) }
-            }
-            if len(others) == 0 {
-                if keep {
-                    if mine < 0 {
-                        append(mut &ids, me)
-                        append(mut &modes, mode)
-                        added = true
-                    } else if modes[mine] < mode {
-                        modes[mine] = mode
-                    }
-                    db.locks.put(lk.toStr(), holdersText(&ids, &modes))
-                }
-                out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
-                return
-            }
-            if wait == 1 {
-                append(mut &bad, lexdb_base.err("55P03", "could not obtain lock on row"))
-                return
-            }
-            if wait == 2 {
-                out = LOCK_SKIPPED
-                return
-            }
-            if db.cycle(me, &others) {
-                append(mut &bad, lexdb_base.err("40P01", "deadlock detected"))
-                return
-            }
-            let task.Handoff{promise: p, future: f} = task.promise[Unit]()
-            append(mut &db.lockWaits, LockWait{key: lk.toStr(), id: me, p: p})
-            db.waitFor.put(me, lk.toStr())
-            append(mut &fut, f)
-        })
-        if len(bad) > 0 { return Err(bad[0]) }
-        if out >= 0 { return Ok(out) }
-        match pop(mut &fut).wait() {
-            Ok(_) {}
-            Err(_) { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "lock: the waker has gone")) }
-        }
-        waited = true
-    }
-    return Ok(LOCKED)
-}
-
-// Releases the row locks of lock owner id (held, its rows), waking those
-// waiting for them.
-pub fn (st: &Store) unlockAll(id: int, held: &[]str) {
-    if id == 0 { return }
-    var wake: []task.Promise[Unit] = []
-    st.sh.with(fn(db: mut &Db) {
-        let w = db.waitFor.remove(&id)
-        for lk in held {
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&db.locks.get(&lk).unwrapOr(""), mut &ids, mut &modes)
-            var ki: []int = []
-            var km: []int = []
-            for i in 0..len(ids) {
-                if ids[i] != id {
-                    append(mut &ki, ids[i])
-                    append(mut &km, modes[i])
-                }
-            }
-            if len(ki) == 0 { let r = db.locks.remove(&lk) } else { db.locks.put(lk.toStr(), holdersText(&ki, &km)) }
-        }
-        if len(held) == 0 { return }
-        var keep: []LockWait = []
-        while len(db.lockWaits) > 0 {
-            let lw = pop(mut &db.lockWaits)
-            var mine = false
-            for lk in held { if lk == lw.key { mine = true } }
-            if mine {
-                let LockWait{key: _, id: _, p: p} = move(lw)
-                append(mut &wake, p)
-            } else { append(mut &keep, lw) }
-        }
-        db.lockWaits = keep
-    })
-    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
-}
-
-// Whether any row of [lo, hi) of tree (hi "": to the end) is locked by a
-// transaction other than t (a range delete falls back to the row path when
-// one is, which waits for it, 9.86). Keys are "tree:key", so a scan of the
-// locks; none are held most of the time.
-pub fn (st: &Store) locksIn(t: &Txn, tree: int, lo: &str, hi: &str): bool {
-    var any = false
-    let pre = tree.toStr() + ":"
-    st.sh.with(fn(db: mut &Db) {
-        if db.locks.size() == 0 { return }
-        for i in 0..db.locks.size() {
-            let k: str = db.locks.keyAt(i)
-            if !strings.startsWith(&k, &pre) { continue }
-            let key = k[len(pre)..len(k)]
-            if key < lo || (len(hi) > 0 && key >= hi) { continue }
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&db.locks.get(&k).unwrapOr(""), mut &ids, mut &modes)
-            for h in ids { if h != t.lockId { any = true } }
-        }
-    })
-    return any
-}
-
-// The rows locked now (for tests and EXPLAIN-like checks): count.
-pub fn (st: &Store) lockCount(): int {
-    var n = 0
-    st.sh.with(fn(db: mut &Db) { n = db.locks.size() })
-    return n
 }
 
 // The version of slot s a snapshot at seq q sees: -1 the current one (in
@@ -4897,11 +4746,11 @@ fn (db: &Db) colsOn(): bool { return !db.colsOff }
 
 // Whether this store's checkpoints write column leaves: off, every leaf
 // is written as rows (tests compare the two).
-pub fn (st: &Store) setColumns(on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
+fn setColumns(st: Store, on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
 
 // Checkpoints taken whole under one with, cuts taken again, and cuts
 // written (9.136).
-pub fn (st: &Store) cutCounts(): []int {
+fn cutCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.ckptLocked, db.cutRetries, db.cutEnds] })
     return out
@@ -4909,7 +4758,7 @@ pub fn (st: &Store) cutCounts(): []int {
 
 // Leaves checkpoints wrote as column leaves, and as rows (of trees with
 // layouts: their rows did not all encode), and cut to fit (refit): 9.112.
-pub fn (st: &Store) colCounts(): []int {
+fn colCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves, db.refitCuts] })
     return out
@@ -4937,7 +4786,7 @@ const UPG_QUEUE = 4096          // leaves queued at most
 const UPG_BUDGET = 256          // leaves a checkpoint converts at most (lexdb.md 9.114: its cost)
 
 // The leaves a checkpoint converts at most (tests set fewer).
-pub fn (st: &Store) setUpgradeBudget(n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
+fn setUpgradeBudget(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
 
 // Leaf s of tree, just read by a scan: queued when it is a clean row leaf
 // of a table tree (one with layouts).
@@ -5147,7 +4996,7 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
 
 // Leaves converted while clean (upgradeLeaf), and those left as rows; the
 // leaves queued now.
-pub fn (st: &Store) upgradeCounts(): []int {
+fn upgradeCounts(st: Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.upgLeaves, db.upgFailed, len(db.upgTree)] })
     return out
@@ -6032,9 +5881,9 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
 fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
     return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], ovfLens: newMap(), loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
-              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, countHook: [], countMode: 0, countArg: "", countCalls: 0, memo: newMap(), listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
+              pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, countHook: [], countMode: 0, countArg: "", countCalls: 0, listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
-              durableBatch: m.replayBatch - 1, waiters: [], locks: newMap(), lockWaits: [], waitFor: newMap(), nextLock: 0, writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
+              durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
               hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
@@ -6098,7 +5947,7 @@ fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): 
         db.trees.put(roots[i], s)
         i += 2
     }
-    let st = Store{sh: task.shared(db), fo: None}
+    let st = Store{sh: task.shared(db), fo: None, memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks()}
     try st.replay(&m)
     return Ok(st)
 }
@@ -6106,7 +5955,7 @@ fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): 
 // Checks the data file's last checkpoint (a test's check, with the store
 // closed): every page below its high-water mark is in one tree, one dropped
 // subtree, the free list or a list page, and in no more than one of them.
-pub fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
+fn audit(fs: lexdb_disk.Fs): Result[str, lexdb_base.DbErr] {
     let data = try fs.openBuffered(DATA, false)
     var best: Option[lexdb_page.Meta] = None
     var b = array(PAGE, byte(0))
@@ -6191,7 +6040,7 @@ fn (st: &Store) applyRecovered(w: &TxWrite): Result[Unit, lexdb_base.DbErr] {
 
 // Reads one frame at off: its records and length, or None when there is no
 // valid frame with that batch number there.
-pub fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
     if off + PAGE > size { return Ok(None) }
     var h = array(PAGE, byte(0))
     try f.read(off, mut &h[0..PAGE], PAGE)
@@ -6208,7 +6057,7 @@ pub fn readFrame(f: &lexdb_disk.File, off: int, size: int, seg: int, batch: int)
 
 // A whole frame's records (read from the log, or pushed to a replica), or
 // None when it is not batch's frame in segment seg or its CRC is wrong.
-pub fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
+fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], lexdb_base.DbErr] {
     if len(b) < FRAME_HDR || binary.readU32LE(b, 0) != LOG_MAGIC || int(binary.readU64LE(b, 8)) != batch || binary.readU32LE(b, 16) != seg {
         return Ok(None)
     }
@@ -6220,7 +6069,7 @@ pub fn decodeFrame(b: &[]byte, seg: int, batch: int): Result[Option[[]TxWrite], 
     return Ok(Some(recs))
 }
 
-pub fn frameLen(recs: &[]TxWrite): int {
+fn frameLen(recs: &[]TxWrite): int {
     var n = FRAME_HDR
     for w in recs { n += 13 + len(w.key) + len(w.val) + (if w.op == OP_PUT && w.head > 0 { 4 } else { 0 }) }
     return (n + PAGE - 1) / PAGE * PAGE
@@ -6326,24 +6175,14 @@ pub type Stats = value record {
 }
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
-pub fn (st: &Store) setFrameMax(n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
-pub fn (st: &Store) setCutChunk(n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
-pub fn (st: &Store) setDropReads(n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
+fn setFrameMax(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
+fn setCutChunk(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
+fn setDropReads(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any
 // transaction (lost when it closes).
 // A copy of the store's handle (it is a reference to the one store).
-pub fn (st: &Store) handle(): Store { return Store{sh: st.sh, fo: st.fo} }
-
-pub fn (st: &Store) memoGet(k: &str): Option[str] {
-    var out: Option[str] = None
-    st.sh.with(fn(db: mut &Db) { out = db.memo.get(k) })
-    return out
-}
-
-pub fn (st: &Store) memoPut(k: &str, v: &str) { st.sh.with(fn(db: mut &Db) { db.memo.put(k, v) }) }
-
-pub fn (st: &Store) memoDel(k: &str) { st.sh.with(fn(db: mut &Db) { let gone = db.memo.remove(k) }) }
+pub fn (st: &Store) handle(): Store { return Store{sh: st.sh, fo: st.fo, memo: st.memo, locks: st.locks} }
 
 // ---- followers (9.71)
 
@@ -6406,7 +6245,7 @@ pub fn (st: &Store) durableCheckpoint(): int {
 }
 
 // The waitDurable calls waiting now (for the tests).
-pub fn (st: &Store) durWaiting(): int {
+fn durWaiting(st: Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = len(db.durWaits) })
     return n
@@ -6496,7 +6335,7 @@ pub fn (st: &Store) waitChange(): bool {
 // Starts a hold at the last durable checkpoint, and every log segment,
 // in one step (a follower's first; it then holds the checkpoint it reads,
 // which is this one or a later one), and gives that checkpoint.
-pub fn (st: &Store) holdNow(): int { return st.holdNowFor(0) }
+fn (st: &Store) holdNow(): int { return st.holdNowFor(0) }
 
 // holdNow, for follower id.
 pub fn (st: &Store) holdNowFor(id: int): int {
@@ -6827,12 +6666,6 @@ pub fn (fo: &Follower) ready(): bool {
     var r = false
     fo.sh.with(fn(f: mut &Fol) { r = len(f.bases) > 0 })
     return r
-}
-
-pub fn (fo: &Follower) applied(): int {
-    var a = 0
-    fo.sh.with(fn(f: mut &Fol) { a = f.applied })
-    return a
 }
 
 pub fn (fo: &Follower) close() {
@@ -7848,10 +7681,8 @@ fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Opt
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
                             dropped: 0, runs: 0, covers: -1}
     let db = newDb(fs, logFs, lexdb_disk.File.Real(-1, false), opts, &m)
-    return Ok(Store{sh: task.shared(db), fo: Some(fo)})
+    return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks()})
 }
-
-pub fn (st: &Store) isReplica(): bool { return st.fo.isSome() }
 
 // A replica's follower.
 pub fn (st: &Store) follower(): Option[Follower] { return st.fo }
@@ -7872,7 +7703,7 @@ fn repSnap(fo: &Follower, t: mut &Txn): Result[FSnap, lexdb_base.DbErr] {
     return Ok(t.fsnap[0].s)
 }
 
-pub fn readOnly(what: &str): lexdb_base.DbErr {
+fn readOnly(what: &str): lexdb_base.DbErr {
     return lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))
 }
 
