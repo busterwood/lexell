@@ -24039,8 +24039,9 @@ fn isSpill(x: &DbErr): bool { return x.state == "XXDEC" }
 // gave way to the row path (a result past its units), for the tests.
 var decRuns: int = 0
 var decSpills: int = 0
+var groupRuns: int = 0      // grouped queries run over batches, units or not
 
-pub fn decCounts(): []int { return [decRuns, decSpills] }
+pub fn decCounts(): []int { return [decRuns, decSpills, groupRuns] }
 
 const BA_STAR = 0       // count(*)
 const BA_COUNT = 1
@@ -26068,11 +26069,10 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         }
         var post: []BNode = []
         for x in lv.post {
-            let c = bCompile(&x, q, &kinds, &env, 0)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            if !boolLike(cc.typ) { return Ok(None) }
-            append(mut &post, takeN(cc))
+            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+                Some(n) { append(mut &post, n) }
+                None { return Ok(None) }
+            }
         }
         // its rows as columns (a lookup's: per batch, as found)
         let mat = &m.mat[k]
@@ -26147,11 +26147,10 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             // too: q21's shape nested in a subquery, "inner > $1")
             if !keyed && !rj && !lv.semi && q.minLevel(&x) >= k { continue }
             if mode != JK_GEN && isKeyEq(&x, q, lv) { continue }
-            let c = bCompile(&x, q, &kinds, &env, 0)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            if !boolLike(cc.typ) { return Ok(None) }
-            append(mut &conds, takeN(cc))
+            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+                Some(n) { append(mut &conds, n) }
+                None { return Ok(None) }
+            }
         }
         var resNot = false
         var res = BNode.Const(0, true)
@@ -26169,11 +26168,43 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                                    ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
                                    rows: rows, rkinds: rkinds, cand: [], after: []})
     }
+    for jl in levels {
+        var gen = false
+        for c in jl.conds { match c { BNode.Gen(_) { gen = true } else {} } }
+        for c in jl.post { match c { BNode.Gen(_) { gen = true } else {} } }
+        if gen { genJoinPlans += 1 }
+    }
     var all: []bool = []
     for x in need { append(mut &all, x) }
     var jp = JPlan{levels: levels, kinds: kinds, need: need, first: [], right: rightAt}
     jpFinish(mut &jp, q, &all)
     return Ok(Some(jp))
+}
+
+// Batch join plans with a condition compiled per row (bJoinCond's), for
+// the tests.
+var genJoinPlans: int = 0
+
+pub fn genJoins(): int { return genJoinPlans }
+
+// A join level's condition x over the joined batch (kinds, need: the
+// query's columns in it): compiled for batches, else compiled (9.108) and
+// run per row there, as the first level's are (bLevelPlan): any condition
+// cxOf takes, so one the batches do not type (q7's OR across tables, a
+// char(n) compared, q22's substring IN a list) no longer sends the whole
+// query to the row path. None: neither (a subquery, a column not read).
+// A row on which it gives an error sends its batch to the row path, as a
+// compiled one's does.
+fn bJoinCond(x: &Expr, q: &Query, kinds: &[]int, need: &[]bool, env: &Env, params: &[]Val, st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[BNode] {
+    let c = bCompile(x, q, kinds, env, 0)
+    if c.isSome() {
+        let cc = c.unwrap()
+        if boolLike(cc.typ) { return Some(takeN(cc)) }
+    }
+    match bGenOf(x, q, kinds, 0, need, params, seqEnv(st, txn)) {
+        Some(g) { return Some(BNode.Gen(g)) }
+        None { return None }
+    }
 }
 
 // Whether x is the equality of level lv's one hash column with its value
@@ -28321,22 +28352,29 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
 // the batches run (nothing done; the row path runs it).
 fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
                gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
-    // a numeric past its units gives way to the row path, from the start
-    // (the groups are made at the end: none yet)
+    // Numerics as units first. Where that gives way (a numeric past its
+    // units, a condition the units do not compile, as a numeric IN list,
+    // LIKE or a float), the batches run again with numerics as values, as
+    // before units, then the row path; from the start each time (the
+    // groups are made at the end: none yet).
     let h0: int = held + 0
-    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max) {
-        Ok(x) { return Ok(x) }
+    var usedDec = false
+    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, true, mut &usedDec) {
+        Ok(x) { if x || !usedDec { return Ok(x) } }
         Err(x) {
             if !isSpill(&x) { return Err(x) }
             held = h0
             decSpills += 1
-            return Ok(false)
         }
     }
+    var none = false
+    return batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, false, mut &none)
 }
 
+// allowDec: numeric(p, s) columns as units (one table's batches); usedDec
+// set when the query reads such a column so.
 fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
-                 gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
+                 gs: mut &Groups, held: mut &int, room: int, rs0max: int, allowDec: bool, usedDec: mut &bool): Result[bool, DbErr] {
     let q = &sel.q
     if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) == 0 || len(sel.gsets) > 0 { return Ok(false) }
     // subqueries: only semi-joins' (levels, run before: 9.104)
@@ -28368,11 +28406,12 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         return Ok(false)
     }
     // one table's batches hold a numeric(p, s) as its units (BK_DEC)
-    let dec = !jn
+    let dec = !jn && allowDec
     var kinds: []int = []
-    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, lexdb_rows.decColKind(&c)) } }
+    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, if dec { lexdb_rows.decColKind(&c) } else { colKind(&c) }) } }
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
+    if dec { for i in 0..len(kinds) { if needCol[i] && lexdb_rows.isDecKind(kinds[i]) { usedDec = true } } }
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
@@ -28842,6 +28881,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         for i in 0..len(bp.kinds) { if bp.needCol[i] && lexdb_rows.isDecKind(bp.kinds[i]) { anyDec = true } }
         if anyDec { decRuns += 1 }
     }
+    groupRuns += 1
     rs.cnt[0].starts += 1
     rs.cnt[0].read += nRead
     rs.cnt[0].joined += nJoined
