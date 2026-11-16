@@ -8353,6 +8353,9 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 }
             }
             rs.cnt[k].read += 1
+            // joined: the rows that found one (an anti join's are
+            // dropped), as bJoinTail counts them
+            if hit { rs.cnt[k].joined += 1 }
             if lv.anti {
                 if hit { return Ok(true) }
             } else {
@@ -8373,7 +8376,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     if try allTrueC(st, txn, q, m, &lv.cond, &m.cc[k], row, params, rs) { found = true; break }
                 }
             }
-            if found { return Ok(true) }
+            if found {
+                rs.cnt[k].joined += 1
+                return Ok(true)
+            }
             if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(false) }
             return Ok(true)
         }
@@ -26330,12 +26336,25 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     var hi: []int = withCapacity(len(ks))
     var bail = false
     var bad: []DbErr = []
+    // the rows read are held while the batch is joined (a key's range may
+    // be long): counted against max_statement_mem; past it the reading
+    // stops and the row path, which holds none of them (it reads a range
+    // as it goes), does the rest of the scan
+    var nNeed = 0
+    for c in 0..len(bp.needCol) { if bp.needCol[c] { nNeed += 1 } }
+    let perRow = 32 + 24 * nNeed
+    let room0 = rs.room()
+    var over = false
     for x in 0..len(ks) {
-        if bail || len(bad) > 0 { break }
+        if bail || over || len(bad) > 0 { break }
         append(mut &lo, if ix && !only { len(pks) } else { rows.n })
         try st.scanLeaves(txn, tree, &ks[x], succ(&ks[x]), fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
             var e = i0
             while e < j0 {
+                if room0 >= 0 && (rows.n + len(pks)) * perRow > room0 {
+                    over = true
+                    return false
+                }
                 if ix && !only {
                     append(mut &pks, lexdb_rows.leafVal(leaf, e))
                     e += 1
@@ -26397,7 +26416,7 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
         append(mut &hi, if ix && !only { len(pks) } else { rows.n })
     }
     if len(bad) > 0 { return Err(bad[0]) }
-    if bail { return Ok(None) }
+    if bail || over { return Ok(None) }
     for a in 0..len(apart) {
         let got = if part { try st.getPart(txn, t.tree, &apart[a]) } else { try st.get(txn, t.tree, &apart[a]) }
         match got {
@@ -26430,6 +26449,18 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
         }
         rows.n = ne
     }
+    var held = (rows.n + len(pks)) * perRow
+    for c in 0..len(bp.needCol) {
+        if !bp.needCol[c] || bp.kinds[c] != BK_VAL { continue }
+        for r in 0..rows.n {
+            match rows.vals[c][r] {
+                Val.Text(tx) { held += len(tx) }
+                else {}
+            }
+        }
+    }
+    if room0 >= 0 && held > room0 { return Ok(None) }
+    rs.held += held
     rs.cnt[k].starts += n
     try rs.tickN(rows.n)
     // the candidates, in the batch's order
@@ -26442,7 +26473,9 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
             append(mut &pi, e)
         }
     }
-    return bJoinTail(q, jp, jl, j, &pj, &pi, &rows, rs)
+    let out = bJoinTail(q, jp, jl, j, &pj, &pi, &rows, rs)
+    rs.held -= held
+    return out
 }
 
 // Where a batch reads table t's columns used (needCol; need: the level's,
