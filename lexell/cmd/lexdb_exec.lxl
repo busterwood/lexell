@@ -40,6 +40,8 @@ import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_plan"
+import "./lexdb_bind"
+import "./lexdb_dialect"
 import "./lexdb_locks"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
@@ -1206,28 +1208,8 @@ fn tsOfVal(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
     }
 }
 
-// The result type of a date or time operator (0: not one).
-fn timeOpOid(op: &str, l: int, r: int): int {
-    let tl = lexdb_sql.timeKind(l)
-    let tr = lexdb_sql.timeKind(r)
-    if tl == 0 && tr == 0 { return 0 }
-    let D = lexdb_sql.OID_DATE
-    let T = lexdb_sql.OID_TIME
-    let TS = lexdb_sql.OID_TS
-    let TZ = lexdb_sql.OID_TSTZ
-    let IV = lexdb_sql.OID_IVAL
-    if op == "*" || op == "/" { return IV }
-    if l == D && r == D { return if op == "-" { lexdb_sql.OID_INT4 } else { 0 } }
-    if l == D && r == IV || l == IV && r == D { return TS }
-    if l == D && r == T || l == T && r == D { return TS }
-    if l == D { return D }                              // a date and days
-    if r == D && op == "+" { return D }
-    if (l == TS && r == TS) || (l == TZ && r == TZ) || (l == T && r == T) { return if op == "-" { IV } else { 0 } }
-    if l == TS || r == TS { return TS }
-    if l == TZ || r == TZ { return TZ }
-    if l == T || r == T { return T }
-    return IV
-}
+// The result type of a date or time operator (0: not one): lexdb_bind's.
+fn timeOpOid(op: &str, l: int, r: int): int { return lexdb_bind.timeOpOid(op, l, r) }
 
 // ---- arrays (9.27): one dimension, held as PostgreSQL's text form
 
@@ -1397,16 +1379,25 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         return Ok(out)
     }
     if strings.startsWith(&name, "#values:") {
-        // VALUES (9.80): a column's type is its first typed value's
+        // VALUES (9.80): a column's type is the common type of its values
+        // (lexdb_bind.commonOid; an untyped literal's type 705 here); of
+        // different categories, its first typed value's
         let k = strings.parseIntOpt(&name[8..len(name)]).unwrapOr(1)
+        let ty = typing()
         for c in 0..k {
-            var oid = lexdb_sql.OID_TEXT
+            var os: []int = []
             var r = c
             while r < len(args) {
-                if args[r].oid != lexdb_sql.OID_TEXT && args[r].oid != lexdb_sql.OID_UNKNOWN { oid = args[r].oid }
-                if oid != lexdb_sql.OID_TEXT { break }
+                append(mut &os, args[r].oid)
                 r += k
             }
+            var oid = lexdb_bind.commonOid(&ty, &os)
+            r = c
+            while oid == 0 && r < len(args) {
+                if args[r].oid != lexdb_sql.OID_TEXT && args[r].oid != lexdb_sql.OID_UNKNOWN { oid = args[r].oid }
+                r += k
+            }
+            if oid == 0 { oid = lexdb_sql.OID_TEXT }
             append(mut &out, OutCol{name: "column" + (c + 1).toStr(), oid: oid, spell: "", coll: "", scale: -1})
         }
         return Ok(out)
@@ -1901,10 +1892,7 @@ fn truth(v: &Val): Option[bool] {
 }
 
 // An aggregate's name without its modifiers ("count distinct filter").
-fn aggBase(name: &str): str {
-    let i = strings.indexOf(&name, " ", 0)
-    return if i < 0 { name } else { name[0..i] }
-}
+fn aggBase(name: &str): str { return lexdb_sql.aggBase(name) }
 
 const AGGS: []str = ["count", "sum", "avg", "min", "max", "string_agg", "array_agg", "bool_and", "bool_or", "every", "stddev",
                      "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"]
@@ -5093,22 +5081,12 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             if nm == "in" || nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "distinct from" || nm == "charindex" || nm == "patindex" {
                 out = try collateCall(&nm, out, cols, sc)
             }
-            if nm == "coalesce" && len(out) > 1 {
-                // its arguments of no type of their own ('1900-01-01' after a
-                // timestamp) take the result's, as PostgreSQL's and SQL Server's
-                let pt = ptypesOf(sc)
-                let o = exprOid(&Expr.Call(nm.toStr(), cloneAll(&out), star), cols, &pt)
-                if o != 0 && o != 705 && !isTextOid(o) {
-                    var cast: []Expr = []
-                    for ca in out {
-                        let xo = exprOid(&ca, cols, &pt)
-                        let lit = match ca { Expr.Lit(v) { kindOf(&v) == lexdb_sql.K_TEXT } else { false } }
-                        // (T-SQL: '' as a number is 0)
-                        let blank = len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&ca) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL)
-                        append(mut &cast, if blank { Expr.Cast(Expr.Lit(Val.Int(0)), oidType(o)) } else if lit || xo == 705 { Expr.Cast(clone(&ca), oidType(o)) } else { clone(&ca) })
-                    }
-                    out = cast
-                }
+            if !star && (((nm == "coalesce" || nm == "greatest" || nm == "least") && len(out) > 1) || nm == "case" || nm == "case else") {
+                // its values made of one type (lexdb_bind.commonOid), as
+                // PostgreSQL's: an untyped one ('1900-01-01' after a
+                // timestamp) read as it, a number or a date of another type
+                // converted (1 as a numeric beside 2.5)
+                out = unifyVals(&nm, out, cols, sc)
             }
             if nm == "avg" && !star && len(out) == 1 && len(sc.coll) > 0 {
                 // T-SQL's AVG: of integers an integer, of decimal(p, s) scale max(s, 6)
@@ -5145,6 +5123,53 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
 }
 
 fn colNames(x: &Expr, out: mut &[]str) { lexdb_sql.colNames(x, out) }
+
+// A call's values (lexdb_bind.valueArgs) made of their common type: each
+// one of another type cast to it, a constant converted now (but for a
+// timestamptz, whose value is the session's zone's). Of different
+// categories, as they are.
+fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): []Expr {
+    let pt = ptypesOf(sc)
+    let ty = typing()
+    let idx = lexdb_bind.valueArgs(nm, len(out))
+    var os: []int = []
+    for i in idx { append(mut &os, lexdb_bind.argOid(&out[i], cols, &pt, &ty)) }
+    let o = lexdb_bind.commonOid(&ty, &os)
+    if o == 0 { return out }
+    var xs = out
+    for k in 0..len(idx) {
+        let i = idx[k]
+        // (T-SQL: '' as a number is 0)
+        if len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&xs[i]) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL) {
+            xs[i] = Expr.Cast(Expr.Lit(Val.Int(0)), oidType(o))
+            continue
+        }
+        if !lexdb_bind.converts(&ty, os[k], o) { continue }
+        let x = replace(mut &xs[i], Expr.Lit(Val.Null))
+        xs[i] = castConst(x, o)
+    }
+    return xs
+}
+
+// x cast to the type oid: a constant's value converted now (an error left
+// for the run), but a timestamptz's.
+fn castConst(x: Expr, oid: int): Expr {
+    let t = oidType(oid)
+    match x {
+        Expr.Lit(v) {
+            if isNull(&v) { return Expr.Lit(Val.Null) }
+            if oid != lexdb_sql.OID_TSTZ {
+                let none: Option[SeqEnv] = None
+                match castVal(v, &t, &none) {
+                    Ok(c) { return Expr.Lit(c) }
+                    Err(_) {}
+                }
+            }
+        }
+        else {}
+    }
+    return Expr.Cast(x, t)
+}
 
 fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !(q.corr && hasCorr(x)) && !(q.noRefKeys && usesRefs(x, q.base)) }
 
@@ -8853,11 +8878,7 @@ const COLL_EXPLICIT = 3
 
 fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
 
-fn isTextOid(o: int): bool {
-    // (char(n) too: its collation counts as a text's, L2)
-    return o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_NAME || o == lexdb_sql.OID_CHAR || o == 705 ||
-           o == lexdb_sql.OID_BPCHAR
-}
+fn isTextOid(o: int): bool { return lexdb_bind.isTextOid(o) }
 
 fn noColl(): Coll { return Coll{name: "", level: COLL_NONE} }
 
@@ -9107,7 +9128,16 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
     if len(sel.q.levels) > 0 && (s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !sel.aggQ)) { sel.q.levels[0].stops = true }
-    if len(s.srf) > 0 { sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs) }
+    if len(s.srf) > 0 {
+        if strings.startsWith(&s.srf, "#values:") && len(sel.exprs) == len(sel.outs) {
+            // an untyped literal or parameter takes its column's type (srfCols)
+            let pt = ptypesOf(sc)
+            let ty = typing()
+            let noCols: []lexdb_sql.ColDef = []
+            for i in 0..len(sel.outs) { if lexdb_bind.argOid(&sel.exprs[i], &noCols, &pt, &ty) == lexdb_sql.OID_UNKNOWN { sel.outs[i].oid = lexdb_sql.OID_UNKNOWN } }
+        }
+        sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
+    }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
@@ -10250,19 +10280,13 @@ fn cutRows(rows: [][]Val, n: int): [][]Val {
     return out
 }
 
-fn isSubCall(n: &str): bool { return n == "#sub" || n == "#exists" || n == "#in" }
+fn isSubCall(n: &str): bool { return lexdb_sql.isSubCall(n) }
 
 // A resolved subquery call's arguments before its refs: number, type, name
 // (and IN's value).
 fn subFixed(n: &str): int { return if n == "#in" { 4 } else { 3 } }
 
-fn litInt(x: &Expr): int {
-    match x {
-        Expr.Lit(v) { match v { Val.Int(n) { return n } else {} } }
-        else {}
-    }
-    return -1
-}
+fn litInt(x: &Expr): int { return lexdb_sql.litInt(x) }
 
 // Has a correlated subquery: one run per row.
 fn hasCorr(x: &Expr): bool {
@@ -15358,297 +15382,14 @@ fn exprName(x: &Expr): str {
     }
 }
 
-// The type OID of an expression, as far as it can be told before running.
-fn isFloatOid(o: int): bool { return o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8 }
+fn isFloatOid(o: int): bool { return lexdb_bind.isFloatOid(o) }
 
-// x ^ y's and power's type: numeric when either is and neither is a float.
-fn numOrFloat(a: int, b: int): int {
-    if isFloatOid(a) || isFloatOid(b) { return lexdb_sql.OID_FLOAT8 }
-    return if a == lexdb_sql.OID_NUMERIC || b == lexdb_sql.OID_NUMERIC { lexdb_sql.OID_NUMERIC } else { lexdb_sql.OID_FLOAT8 }
-}
+// The type OID of an expression, as far as it can be told before running
+// (lexdb_bind's, with the dialects' functions).
+pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int { return lexdb_bind.exprOid(x, cols, ptypes, &typing()) }
 
-pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int {
-    match x {
-        Expr.Lit(v) {
-            match v {
-                Val.Int(n) { return if n >= -2147483648 && n <= 2147483647 { lexdb_sql.OID_INT4 } else { lexdb_sql.OID_INT8 } }
-                Val.Bool(_) { return lexdb_sql.OID_BOOL }
-                Val.Num(_) { return lexdb_sql.OID_NUMERIC }
-                Val.Date(_) { return lexdb_sql.OID_DATE }
-                Val.Time(_) { return lexdb_sql.OID_TIME }
-                Val.Ts(_) { return lexdb_sql.OID_TS }
-                Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
-                Val.Ival(_) { return lexdb_sql.OID_IVAL }
-                Val.Uuid(_) { return lexdb_sql.OID_UUID }
-                Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
-        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
-        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
-        Val.Reg(_, _) { return lexdb_sql.OID_REGCLASS }
-                else { return lexdb_sql.OID_TEXT }
-            }
-        }
-        Expr.Param(n) {
-            if n <= len(ptypes) && ptypes[n - 1] != 0 { return ptypes[n - 1] }
-            return lexdb_sql.OID_TEXT
-        }
-        Expr.Col(n) {
-            let i = colIndex(cols, &n)
-            return if i >= 0 { cols[i].typ.oid } else { lexdb_sql.OID_TEXT }
-        }
-        Expr.Unary(op, a) { return if op == "not" { lexdb_sql.OID_BOOL } else { exprOid(&a, cols, ptypes) } }
-        Expr.Bin(op, a, b) {
-            if op == "||" {
-                let l = exprOid(&a, cols, ptypes)
-                let r = exprOid(&b, cols, ptypes)
-                let f = arrayConcat(&a, &b, cols, ptypes)
-                if len(f) > 0 { return concatOid(&f, l, r) }
-                return if l == lexdb_sql.OID_BYTEA || r == lexdb_sql.OID_BYTEA { lexdb_sql.OID_BYTEA } else { lexdb_sql.OID_TEXT }
-            }
-            if op == "^" { return numOrFloat(exprOid(&a, cols, ptypes), exprOid(&b, cols, ptypes)) }
-            if op == "t+" {
-                // T-SQL's +: text when both are, else the other's type
-                let l = exprOid(&a, cols, ptypes)
-                let r = exprOid(&b, cols, ptypes)
-                let lt = isTextOid(l) || l == 0
-                let rt = isTextOid(r) || r == 0
-                if lt && rt { return lexdb_sql.OID_TEXT }
-                if lt { return r }
-                if rt { return l }
-                return exprOid(&Expr.Bin("+", clone(&a), clone(&b)), cols, ptypes)
-            }
-            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "#" || op == "<<" || op == ">>" {
-                let l = exprOid(&a, cols, ptypes)
-                let r = exprOid(&b, cols, ptypes)
-                let to = timeOpOid(&op, l, r)
-                if to > 0 { return to }
-                if l == lexdb_sql.OID_FLOAT4 && r == lexdb_sql.OID_FLOAT4 { return lexdb_sql.OID_FLOAT4 }
-                if isFloatOid(l) || isFloatOid(r) { return lexdb_sql.OID_FLOAT8 }
-                if l == lexdb_sql.OID_NUMERIC || r == lexdb_sql.OID_NUMERIC { return lexdb_sql.OID_NUMERIC }
-                if l == lexdb_sql.OID_INT8 || r == lexdb_sql.OID_INT8 { return lexdb_sql.OID_INT8 }
-                return lexdb_sql.OID_INT4
-            }
-            return lexdb_sql.OID_BOOL
-        }
-        Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
-        Expr.Cast(_, t) { return t.oid }
-        Expr.Call(n, args, _) {
-            if n == "#bptrim" { return lexdb_sql.OID_TEXT }
-            if n == "#bppad" { return lexdb_sql.OID_BPCHAR }
-            if n == "grouping" { return lexdb_sql.OID_INT4 }
-            if n == "#mrnav" && len(args) == 2 { return exprOid(&args[1], cols, ptypes) }
-            if n == "#win" && len(args) == 2 {
-                // a window call: its function's type (9.46)
-                match args[1] {
-                    Expr.Call(f, fa, _) {
-                        let b = aggBase(&f)
-                        if b == "row_number" || b == "rank" || b == "dense_rank" || b == "ntile" { return lexdb_sql.OID_INT8 }
-                        if b == "percent_rank" || b == "cume_dist" { return lexdb_sql.OID_FLOAT8 }
-                        if b == "lag" || b == "lead" || b == "first_value" || b == "last_value" || b == "nth_value" {
-                            return if len(fa) > 0 { exprOid(&fa[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                        }
-                    }
-                    else {}
-                }
-                return exprOid(&args[1], cols, ptypes)
-            }
-            if isSubCall(&n) {
-                if n != "#sub" { return lexdb_sql.OID_BOOL }
-                let oid = if len(args) >= 2 { litInt(&args[1]) } else { -1 }
-                return if oid > 0 { oid } else { lexdb_sql.OID_TEXT }
-            }
-            match aggBase(&n) {
-                "count" { return lexdb_sql.OID_INT8 }
-                "bool_and", "bool_or", "every" { return lexdb_sql.OID_BOOL }
-                "string_agg" { return lexdb_sql.OID_TEXT }
-                "array_agg" {
-                    let el = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                    let ao = lexdb_sql.arrayOid(if el == lexdb_sql.OID_UNKNOWN { lexdb_sql.OID_TEXT } else { el })
-                    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                }
-                "like", "ilike", "similar", "in", "distinct", "any", "all" { return lexdb_sql.OID_BOOL }
-                "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
-                "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT } }
-                "strpos" { return lexdb_sql.OID_INT4 }
-                "regexp_split_to_table", "string_to_table" { return lexdb_sql.OID_TEXT }
-                "array" {
-                    var el = lexdb_sql.OID_TEXT
-                    for a in args { el = widerOid(el, exprOid(&a, cols, ptypes)) }
-                    let ao = lexdb_sql.arrayOid(el)
-                    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                }
-                "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop", "avg" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_INT8 }
-                    return if isFloatOid(a) { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
-                }
-                "sum" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_INT8 }
-                    return if a == lexdb_sql.OID_NUMERIC || isFloatOid(a) { a } else { lexdb_sql.OID_INT8 }
-                }
-                "floor", "ceil", "ceiling", "trunc" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_FLOAT8 }
-                    return if a == lexdb_sql.OID_NUMERIC { a } else { lexdb_sql.OID_FLOAT8 }
-                }
-                "sign" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_FLOAT8 }
-                    return if isFloatOid(a) { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
-                }
-                "cbrt", "random", "pi", "sin", "cos", "tan", "cot", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
-                "acosh", "atanh", "sind", "cosd", "tand", "cotd", "asind", "acosd", "atand", "atan2d", "degrees", "radians" {
-                    return lexdb_sql.OID_FLOAT8
-                }
-                "sqrt", "exp", "ln", "log10", "log" {
-                    // numeric's own, else double precision (9.92); log(b, x) numeric only
-                    if n == "log" && len(args) == 2 { return lexdb_sql.OID_NUMERIC }
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_FLOAT8 }
-                    return if a == lexdb_sql.OID_NUMERIC { a } else { lexdb_sql.OID_FLOAT8 }
-                }
-                "power", "pow" {
-                    if len(args) < 2 { return lexdb_sql.OID_FLOAT8 }
-                    return numOrFloat(exprOid(&args[0], cols, ptypes), exprOid(&args[1], cols, ptypes))
-                }
-                "mod", "gcd", "lcm" {
-                    if len(args) < 2 { return lexdb_sql.OID_NUMERIC }
-                    let a = exprOid(&args[0], cols, ptypes)
-                    let b = exprOid(&args[1], cols, ptypes)
-                    if a == lexdb_sql.OID_NUMERIC || b == lexdb_sql.OID_NUMERIC || isFloatOid(a) || isFloatOid(b) { return lexdb_sql.OID_NUMERIC }
-                    if a == lexdb_sql.OID_INT8 || b == lexdb_sql.OID_INT8 { return lexdb_sql.OID_INT8 }
-                    if a == lexdb_sql.OID_INT2 && b == lexdb_sql.OID_INT2 { return lexdb_sql.OID_INT2 }
-                    return lexdb_sql.OID_INT4
-                }
-                "div", "to_number" { return lexdb_sql.OID_NUMERIC }
-                "to_char" { return lexdb_sql.OID_TEXT }
-                "to_date" { return lexdb_sql.OID_DATE }
-                "width_bucket", "position", "ascii", "regexp_count", "regexp_instr", "array_position", "array_ndims" { return lexdb_sql.OID_INT4 }
-                "starts_with", "regexp_like", "@>", "<@", "&&" { return lexdb_sql.OID_BOOL }
-                "regexp_match", "regexp_matches", "regexp_split_to_array", "string_to_array" { return lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                "array_positions" { return lexdb_sql.arrayOid(lexdb_sql.OID_INT4) }
-                "#acat", "#aappend", "#aprepend" {
-                    if len(args) < 2 { return lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                    return concatOid(&n, exprOid(&args[0], cols, ptypes), exprOid(&args[1], cols, ptypes))
-                }
-                "array_append", "array_cat", "array_remove", "array_replace" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                    if n == "array_cat" && lexdb_sql.elemOid(a) == 0 && len(args) > 1 { return exprOid(&args[1], cols, ptypes) }
-                    if n == "array_append" && lexdb_sql.elemOid(a) == 0 && len(args) > 1 {
-                        let el = exprOid(&args[1], cols, ptypes)
-                        let ao = lexdb_sql.arrayOid(el)
-                        return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                    }
-                    return if lexdb_sql.elemOid(a) > 0 { a } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                }
-                "array_prepend" {
-                    let a = if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                    if lexdb_sql.elemOid(a) > 0 { return a }
-                    let el = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                    let ao = lexdb_sql.arrayOid(el)
-                    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-                }
-                "pg_backend_pid" { return lexdb_sql.OID_INT4 }
-                "pg_my_temp_schema" { return lexdb_sql.OID_OID }
-                "pg_is_other_temp_schema" { return lexdb_sql.OID_BOOL }
-                "txid_current", "pg_current_xact_id" { return lexdb_sql.OID_INT8 }
-                "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
-                "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
-                "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
-                "pg_get_function_result", "pg_get_function_arguments", "pg_size_pretty" {
-                    return lexdb_sql.OID_TEXT
-                }
-                "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
-                "has_sequence_privilege", "has_any_column_privilege", "pg_try_advisory_lock", "pg_try_advisory_lock_shared",
-                "pg_try_advisory_xact_lock", "pg_try_advisory_xact_lock_shared", "pg_advisory_unlock", "pg_advisory_unlock_shared" { return lexdb_sql.OID_BOOL }
-                "pg_table_is_visible", "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible", "~", "!~", "~*",
-                "!~*", "has_table_privilege", "has_schema_privilege", "has_database_privilege", "pg_relation_is_publishable" {
-                    return lexdb_sql.OID_BOOL
-                }
-                "array_length", "array_upper", "array_lower", "cardinality", "generate_subscripts" { return lexdb_sql.OID_INT4 }
-                "pg_relation_size", "pg_total_relation_size", "pg_table_size", "pg_indexes_size", "pg_database_size" { return lexdb_sql.OID_INT8 }
-                "to_regclass", "pg_partition_ancestors" { return lexdb_sql.OID_REGCLASS }
-                "to_regtype" { return lexdb_sql.OID_REGTYPE }
-                "to_regnamespace" { return lexdb_sql.OID_REGNAMESPACE }
-                "unnest", "#elem" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                    let el = lexdb_sql.elemOid(a)
-                    return if el > 0 { el } else { lexdb_sql.OID_TEXT }
-                }
-                "coalesce" {
-                    // the first argument's whose type is known (COALESCE(NULL, 5) is an integer)
-                    for a in args {
-                        match a { Expr.Lit(v) { if isNull(&v) { continue } } else {} }
-                        let o = exprOid(&a, cols, ptypes)
-                        if o != 0 && o != 705 { return o }
-                    }
-                    return lexdb_sql.OID_TEXT
-                }
-                "min", "max", "abs" {
-                    return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_TEXT }
-                }
-                "length", "char_length", "octet_length" { return lexdb_sql.OID_INT4 }
-                "gen_random_uuid" { return lexdb_sql.OID_UUID }
-                "encode" { return lexdb_sql.OID_TEXT }
-                "decode" { return lexdb_sql.OID_BYTEA }
-                "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp", "to_timestamp" {
-                    return lexdb_sql.OID_TSTZ
-                }
-                "localtimestamp", "make_timestamp" { return lexdb_sql.OID_TS }
-                "make_timestamptz" { return lexdb_sql.OID_TSTZ }
-                "timezone" {
-                    // AT TIME ZONE (9.95): a timestamp made a timestamptz, the rest a timestamp
-                    let a = if len(args) > 0 { exprOid(&args[len(args) - 1], cols, ptypes) } else { lexdb_sql.OID_TSTZ }
-                    return if a == lexdb_sql.OID_TS { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }
-                }
-                "current_date", "make_date" { return lexdb_sql.OID_DATE }
-                "current_time", "localtime" { return lexdb_sql.OID_TIME }
-                "date_part" { return lexdb_sql.OID_NUMERIC }
-                "age" { return lexdb_sql.OID_IVAL }
-                "isfinite" { return lexdb_sql.OID_BOOL }
-                "date_trunc" {
-                    let a = if len(args) > 1 { exprOid(&args[1], cols, ptypes) } else { lexdb_sql.OID_TSTZ }
-                    return if a == lexdb_sql.OID_TS || a == lexdb_sql.OID_IVAL { a } else { lexdb_sql.OID_TSTZ }
-                }
-                "nextval", "currval", "setval", "lastval" { return lexdb_sql.OID_INT8 }
-                "scope_identity" { return lexdb_sql.OID_NUMERIC }
-                // T-SQL's (lexdb_tsqlfn)
-                "#len", "#datalength", "charindex", "patindex", "#datediff", "#datepart" { return lexdb_sql.OID_INT4 }
-                // SQL Server's catalog functions (callCat)
-                "#object_id", "#schema_id", "#db_id", "#type_id", "#has_dbaccess", "#is_srvrolemember", "#is_member",
-                "#has_perms_by_name", "#objectproperty", "#columnproperty", "#indexproperty" { return lexdb_sql.OID_INT4 }
-                "#object_name", "#object_schema_name", "#schema_name", "#type_name", "#suser_sname", "#db_name" { return lexdb_sql.OID_TEXT }
-                "#suser_sid", "#sid_binary" { return lexdb_sql.OID_BYTEA }
-                "#replaceci", "#stuff", "#datename", "#datestyle", "#reverse", "#concat_ws" { return lexdb_sql.OID_TEXT }
-                "#tlike" { return lexdb_sql.OID_BOOL }
-                "#utcnow" { return lexdb_sql.OID_TS }
-                "#eomonth" { return lexdb_sql.OID_DATE }
-                "#tdiv" { return lexdb_sql.OID_NUMERIC }
-                "#tavg" {
-                    let m = if len(args) > 1 { litInt(&args[1]) } else { 0 }
-                    return if m == -1 { lexdb_sql.OID_INT8 } else { lexdb_sql.OID_NUMERIC }
-                }
-                "#old", "#round", "#power", "#try", "#tint", "#bitnot" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_NUMERIC } }
-                "#bitint" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_INT4 }
-                    return if a == lexdb_sql.OID_BOOL { lexdb_sql.OID_INT4 } else { a }
-                }
-                "#dateadd" {
-                    let o = if len(args) > 2 { exprOid(&args[2], cols, ptypes) } else { 0 }
-                    return if o == lexdb_sql.OID_DATE || o == lexdb_sql.OID_TS || o == lexdb_sql.OID_TSTZ { o } else { lexdb_sql.OID_TS }
-                }
-                "round" {
-                    let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes) } else { lexdb_sql.OID_NUMERIC }
-                    return if isFloatOid(a) && len(args) == 1 { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
-                }
-                else {
-                    // Oracle's (lexdb_orafn)
-                    if lexdb_orafn.isOraFn(&n) {
-                        var os: []int = []
-                        for a in args { append(mut &os, exprOid(&a, cols, ptypes)) }
-                        return lexdb_orafn.resultOid(&n, &os)
-                    }
-                    return lexdb_sql.OID_TEXT
-                }
-            }
-        }
-    }
-}
+// What the dialects supply the binder (lexdb_bind.Typing).
+fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.RULES_PG, fnOid: lexdb_orafn.resultOid} }
 
 // The output columns of a SELECT: (name, OID), and the expressions behind
 // them (* expanded).
@@ -16580,6 +16321,10 @@ type Sel = record {
     // the rows evaluated in their order, each seeing the last's values
     feedback: []int
     mr: []MrPlan            // MATCH_RECOGNIZE's wrapper (design/lexdb-match-recognize.md): its plan; outs stay the input's
+    // UNION, INTERSECT, EXCEPT: per output column, the parts whose values
+    // are converted to its type (lexdb_bind.converts): 1 the first, 2 the
+    // second; [] none
+    conv: []int
 }
 
 fn copySets(xs: &[][]int): [][]int {
@@ -17326,7 +17071,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
                   locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: copySets(&s.gsets), gx: gx, gord: gord, gh: gh,
                   groupKinds: groupKinds, ordKinds: ordKinds, outKinds: outKindsOf(&outs),
-                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: []})
+                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: []})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -17355,6 +17100,28 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var outs: []OutCol = []
     for o in l.outs { append(mut &outs, o) }
     for i in 0..len(outs) { if len(outs[i].coll) == 0 { outs[i].coll = r.outs[i].coll } }
+    // each column of the type of both sides' values (lexdb_bind.commonOid),
+    // the side of another type converted (runSet); of different categories,
+    // or in a recursive CTE, the first side's as before
+    var conv: []int = []
+    if !s.rec {
+        let ty = typing()
+        for i in 0..len(outs) {
+            let lo = branchOid(&s.inner[0], &l, i)
+            let ro = branchOid(&s.inner[1], &r, i)
+            let o = lexdb_bind.commonOid(&ty, &[lo, ro])
+            var bits = 0
+            if o != 0 {
+                if o != outs[i].oid {
+                    outs[i].scale = if r.outs[i].oid == o { r.outs[i].scale } else { -1 }
+                    outs[i].oid = o
+                }
+                if lexdb_bind.converts(&ty, lo, o) { bits = bits | 1 }
+                if lexdb_bind.converts(&ty, ro, o) { bits = bits | 2 }
+            }
+            append(mut &conv, bits)
+        }
+    }
     var order: []Expr = []
     var ordKinds: []int = []
     for o in s.order {
@@ -17385,7 +17152,35 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
                   groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs),
-                  topMode: 0, topN: -1, feedback: [], mr: []})
+                  topMode: 0, topN: -1, feedback: [], mr: [], conv: conv})
+}
+
+// The type of a set operation's side's i-th column for its common type:
+// 705 for an untyped literal ('x', NULL) in a plain select list, else its
+// planned type.
+fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
+    if s.setop == 0 && i < len(s.items) {
+        var star = false
+        for it in s.items { if it.star { star = true } }
+        if !star {
+            match s.items[i].expr {
+                Some(x) { if isUnknownLit(&x) { return lexdb_sql.OID_UNKNOWN } }
+                None {}
+            }
+        }
+    }
+    return sel.outs[i].oid
+}
+
+// A set operation's side's rows with the values of the columns whose
+// conv has bit converted to the operation's types.
+fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Result[Unit, DbErr] {
+    for c in 0..len(sel.conv) {
+        if (sel.conv[c] & bit) == 0 { continue }
+        let t = oidType(sel.outs[c].oid)
+        for i in 0..len(rows) { rows[i][c] = try coerceZ(replace(mut &rows[i][c], Val.Null), &t, z) }
+    }
+    return Ok(Unit{})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -17540,8 +17335,10 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     for j in base + sel.split..len(params) { append(mut &rp, params[j]) }
     if sel.rec >= 0 { return runRecursive(st, txn, sel, &lp, &rp, rs) }
     var lres = try runChild(st, txn, &sel.parts[0], &lp, -1, rs, 0)
+    try convRows(mut &lres.rows, sel, 1, &txn.sql.zone)
     try rs.hold(rowsBytes(&lres.rows))
     var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
+    try convRows(mut &rres.rows, sel, 2, &txn.sql.zone)
     try rs.hold(rowsBytes(&rres.rows))
     return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, []), &sel.outKinds))
 }
@@ -28173,59 +27970,14 @@ fn looksArray(v: &Val): bool {
     }
 }
 
-fn isUnknownLit(x: &Expr): bool {
-    match x {
-        Expr.Lit(v) {
-            match v {
-                Val.Text(_) { return true }
-                Val.Null { return true }
-                else { return false }
-            }
-        }
-        else { return false }
-    }
-}
+fn isUnknownLit(x: &Expr): bool { return lexdb_bind.isUnknownLit(x) }
 
-// a || b with an array on either side (9.92): the function it is (#acat,
-// #aappend or #aprepend), "" for text's ||. A literal text or NULL beside an
-// array is read as an array, as PostgreSQL reads an unknown literal.
-fn arrayConcat(a: &Expr, b: &Expr, cols: &[]lexdb_sql.ColDef, pt: &[]int): str {
-    let la = lexdb_sql.elemOid(exprOid(a, cols, pt)) > 0
-    let ra = lexdb_sql.elemOid(exprOid(b, cols, pt)) > 0
-    if !la && !ra { return "" }
-    if la && ra { return "#acat" }
-    if la { return if isUnknownLit(b) { "#acat" } else { "#aappend" } }
-    return if isUnknownLit(a) { "#acat" } else { "#aprepend" }
-}
+// a || b with an array on either side (9.92): lexdb_bind's.
+fn arrayConcat(a: &Expr, b: &Expr, cols: &[]lexdb_sql.ColDef, pt: &[]int): str { return lexdb_bind.arrayConcat(a, b, cols, pt, &typing()) }
 
-// The array type of a || (#acat, #aappend, #aprepend), from its sides' types.
-fn concatOid(f: &str, l: int, r: int): int {
-    let le = lexdb_sql.elemOid(l)
-    let re = lexdb_sql.elemOid(r)
-    var el = 0
-    if f == "#acat" { el = if le > 0 && re > 0 { widerOid(le, re) } else if le > 0 { le } else { re } }
-    else if f == "#aappend" { el = if le > 0 { widerOid(le, r) } else { r } }
-    else { el = if re > 0 { widerOid(l, re) } else { l } }
-    let ao = lexdb_sql.arrayOid(el)
-    return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
-}
+fn concatOid(f: &str, l: int, r: int): int { return lexdb_bind.concatOid(f, l, r) }
 
-// Of two element types, the one both become (numbers widen; else the first,
-// an unknown text giving way to the other).
-fn widerOid(a: int, b: int): int {
-    if a == b { return a }
-    if a == lexdb_sql.OID_TEXT || a == lexdb_sql.OID_UNKNOWN { return b }
-    if b == lexdb_sql.OID_TEXT || b == lexdb_sql.OID_UNKNOWN { return a }
-    let nums = [lexdb_sql.OID_INT2, lexdb_sql.OID_INT4, lexdb_sql.OID_INT8, lexdb_sql.OID_NUMERIC, lexdb_sql.OID_FLOAT4, lexdb_sql.OID_FLOAT8]
-    var ia = -1
-    var ib = -1
-    for i in 0..len(nums) {
-        if nums[i] == a { ia = i }
-        if nums[i] == b { ib = i }
-    }
-    if ia >= 0 && ib >= 0 { return if ia > ib { a } else { b } }
-    return a
-}
+fn widerOid(a: int, b: int): int { return lexdb_bind.widerOid(a, b) }
 
 fn isTypedFn(n: &str): bool {
     for f in TYPED_FNS { if f == n { return true } }

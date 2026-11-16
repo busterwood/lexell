@@ -1,0 +1,139 @@
+// lexdb_bind: a value made of several branches has their common type
+// (PostgreSQL's select_common_type, from pg_type's categories and
+// pg_cast's implicit casts: lexdb_bind.commonOid), and each branch's values
+// are converted to it. Before, a UNION's, a VALUES column's, CASE's,
+// COALESCE's, GREATEST's and LEAST's type was its first branch's and the
+// other branches' values were left as they were: 1 UNION 2.5 was an
+// integer column holding 2.5, VALUES (1), (3000000000) overflowed an
+// integer, VALUES (1), (2.5) gave 1 and 3, CASE ... THEN 1 ELSE 2.5 END / 2
+// divided integers, and a date UNION a timestamp was labelled date, so
+// EXISTS against a timestamp column missed the dates (36 rows of 72).
+// Each query runs with SET lexdb_batch = off and on; each line gives the
+// values and the column's type OID. The values are PostgreSQL 18.6's
+// (a division's rounded to two places, where PostgreSQL shows 20).
+// expect: U1 int union numeric: 1;2.5 oid 1700, same: true
+// expect: U2 int union bigint: 1;3000000000 oid 20, same: true
+// expect: U3 int union float8: 1;2.5 oid 701, same: true
+// expect: U4 date union timestamp: 2024-01-02 00:00:00;2024-01-03 04:05:00 oid 1114, same: true
+// expect: U5 timestamp union timestamptz: 2024-01-02 03:00:00+00;2024-01-03 04:05:00+00 oid 1184, same: true
+// expect: U6 null union int: 1; oid 23, same: true
+// expect: U7 three ways: 1;2.5;3 oid 1700, same: true
+// expect: U8 union distinct: 1 oid 1700, same: true
+// expect: U9 intersect: 1 oid 1700, same: true
+// expect: U10 divided: 0.50;1.25 oid 1700, same: true
+// expect: U11 smallint union int: 1;2 oid 23, same: true
+// expect: U12 text literal union int: 1;2 oid 23, same: true
+// expect: U13 int union text: 1;a oid 23, same: true
+// expect: V1 values int, bigint: 1;3000000000 oid 20, same: true
+// expect: V2 values int, numeric: 1;2.5 oid 1700, same: true
+// expect: V3 values null, int: 1; oid 23, same: true
+// expect: V4 values date, timestamp: 2024-01-02 00:00:00;2024-01-03 04:05:00 oid 1114, same: true
+// expect: C1 case int, numeric: 1 oid 1700, same: true
+// expect: C2 case divided: 0.50 oid 1700, same: true
+// expect: C3 case date, timestamp: 2024-01-02 00:00:00 oid 1114, same: true
+// expect: C4 case null, int: |0 oid 23, same: true
+// expect: C5 case texts: a oid 25, same: true
+// expect: C6 case over rows: 0.50;1.25 oid 1700, same: true
+// expect: G1 coalesce int, numeric: 0.50 oid 1700, same: true
+// expect: G2 coalesce date, timestamp: 2024-01-02 00:00:00 oid 1114, same: true
+// expect: G3 greatest, least: 2.5|0.50 oid 1700, same: true
+// expect: J1 join on date union timestamp: 216, same: true
+// expect: J2 exists on date union timestamp: 72, same: true
+// expect: J3 in on date union timestamp: 72, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const SETUP = "create table d (k date)\ninsert into d select date '2024-01-01' + (i % 12) from generate_series(1, 36) i\ncreate table ts (t timestamp)\ninsert into ts select timestamp '2024-01-01' + (i % 12) * interval '1 day' from generate_series(1, 36) i\ncreate table n (g int, x int)\ninsert into n values (1, 1), (2, 5)"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            var oid = 0
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                if len(r.cols) > 0 { oid = r.cols[0].oid }
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 })) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";") + " oid " + oid.toStr()
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let same = off == on && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on) }
+    println(label + ": " + on + ", same: " + same.toStr())
+}
+
+// The count alone (a count's column is bigint).
+fn cnt(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let same = off == on && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on) }
+    println(label + ": " + strings.replaceAll(&on, " oid 20", "") + ", same: " + same.toStr())
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for line in strings.lines(&setup) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    let u = "select x from ("
+    two(mut &s, &"U1 int union numeric", &(u + "select 1 as x union all select 2.5) s order by 1"))
+    two(mut &s, &"U2 int union bigint", &(u + "select 1 as x union all select 3000000000) s order by 1"))
+    two(mut &s, &"U3 int union float8", &(u + "select 1 as x union all select 2.5::float8) s order by 1"))
+    two(mut &s, &"U4 date union timestamp", &(u + "select date '2024-01-02' as x union all select timestamp '2024-01-03 04:05') s order by 1"))
+    two(mut &s, &"U5 timestamp union timestamptz", &(u + "select timestamp '2024-01-02 03:00' as x union all select timestamptz '2024-01-03 04:05+00') s order by 1"))
+    two(mut &s, &"U6 null union int", &(u + "select null as x union all select 1) s order by 1"))
+    two(mut &s, &"U7 three ways", &(u + "select 1 as x union all select 2.5 union all select 3::bigint) s order by 1"))
+    two(mut &s, &"U8 union distinct", &(u + "select 1 as x union select 1.0) s"))
+    two(mut &s, &"U9 intersect", &(u + "select 1 as x intersect select 1.0) s"))
+    two(mut &s, &"U10 divided", &"select (x / 2)::numeric(10,2) from (select 1 as x union all select 2.5) s order by 1")
+    two(mut &s, &"U11 smallint union int", &(u + "select 1::int2 as x union all select 2::int4) s order by 1"))
+    two(mut &s, &"U12 text literal union int", &(u + "select '1' as x union all select 2) s order by 1"))
+    // PostgreSQL refuses this one (42804); lexdb keeps the first side's type
+    two(mut &s, &"U13 int union text", &(u + "select 1 as x union all select 'a'::text) s"))
+    let v = "select column1 from (values "
+    two(mut &s, &"V1 values int, bigint", &(v + "(1), (3000000000)) v order by 1"))
+    two(mut &s, &"V2 values int, numeric", &(v + "(1), (2.5)) v order by 1"))
+    two(mut &s, &"V3 values null, int", &(v + "(null), (1)) v order by 1"))
+    two(mut &s, &"V4 values date, timestamp", &(v + "(date '2024-01-02'), (timestamp '2024-01-03 04:05')) v order by 1"))
+    two(mut &s, &"C1 case int, numeric", &"select case when true then 1 else 2.5 end")
+    two(mut &s, &"C2 case divided", &"select (case when true then 1 else 2.5 end / 2)::numeric(10,2)")
+    two(mut &s, &"C3 case date, timestamp", &"select case when true then date '2024-01-02' else timestamp '2024-01-03 04:05' end")
+    two(mut &s, &"C4 case null, int", &"select case when true then null else 1 end, 0 where false union all select case when true then null else 1 end, 0")
+    two(mut &s, &"C5 case texts", &"select case when true then 'a' else 'b' end")
+    two(mut &s, &"C6 case over rows", &"select (case when g = 1 then x else 2.5 end / 2)::numeric(10,2) from n order by g")
+    two(mut &s, &"G1 coalesce int, numeric", &"select (coalesce(1, 2.5) / 2)::numeric(10,2)")
+    two(mut &s, &"G2 coalesce date, timestamp", &"select coalesce(date '2024-01-02', timestamp '2024-01-03 04:05')")
+    two(mut &s, &"G3 greatest, least", &"select greatest(1, 2.5), (least(1, 2.5) / 2)::numeric(10,2)")
+    let du = "(select k as x from d union all select t from ts) u"
+    cnt(mut &s, &"J1 join on date union timestamp", &("select count(*) from " + du + " join ts on u.x = ts.t"))
+    cnt(mut &s, &"J2 exists on date union timestamp", &("select count(*) from " + du + " where exists (select 1 from ts where u.x = ts.t)"))
+    cnt(mut &s, &"J3 in on date union timestamp", &("select count(*) from " + du + " where u.x in (select t from ts)"))
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

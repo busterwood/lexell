@@ -403,6 +403,195 @@ never divides for rows that take the other branch.
 The dialect differences in typing are tables the dialect supplies. They are
 not branches in the binder's code.
 
+#### 4.4.1 Design: the bound plan, the expression IR and the transition (step 2)
+
+Written 2026-11-16 on `redesign/bind`. Slice 2a is built (below); the rest
+is the plan.
+
+**What is there today.** Types are worked out on demand: `exprOid` labels
+an expression by its OID only (no typmod, no collation), `resolve` rewrites
+names and inserts a few casts (COALESCE's literals, T-SQL's bit, char(n)'s
+trim and pad), and the run-time operators decide by the values' kinds
+(`binVal` matches the operator as a string and then `kindOf` both sides).
+A union's, CASE's and VALUES' column was labelled from its first branch,
+and its values were left in whatever type each branch gave. That is the
+week's binding bugs in one sentence.
+
+**Types.** One descriptor, used for every column and every expression node:
+
+```
+Ty = value record {
+    oid: int          // the type (lexdb_sql.OID_*, an enum's OID, an array's)
+    mod: int          // typmod: numeric p << 16 | s, varchar/char n, time precision; -1 none
+    coll: int         // collation id (0 none, 1 the session's default)
+    collLevel: int    // none, default, implicit, explicit (parse_collate.c's strengths)
+    notNull: bool     // nullability, for the optimizer (outer-join sides are nullable)
+}
+```
+
+`TypeName` (the parse tree's) converts to `Ty` once. OID 705 (unknown) is
+kept for an untyped literal or parameter until the binder decides it from
+context, as PostgreSQL does; it never reaches a plan's output (it becomes
+text there).
+
+**The bound plan.** A tree of logical operators, each with output columns
+`[]BCol{slot, name, spell, ty}`; an expression refers to its input's columns
+by slot. The operators match lexdb-constructs.md's B rows:
+
+| Logical operator | From | Notes |
+|---|---|---|
+| `Get(rel, cols)` | a table, a view (inlined), a catalog relation | `rel` is layer 2's handle; a view's text is bound once per statement |
+| `Values(rows)`, `Func(fn, args, ordinality)` | VALUES, SRFs in FROM | column types from all rows (common type) |
+| `CteRef(id)`, `Recursive(id, anchor, step)` | WITH | bound once, referenced by id (the inventory's re-parse per use goes) |
+| `Filter(pred)`, `Project(exprs)` | WHERE, select list | volatile exprs flagged (4.9 rule 1) |
+| `Join(kind, lateral, l, r, on)` | FROM | kind: inner, left, right, full, cross; semi, anti, mark after step 5 |
+| `Apply(kind, outer, sub, refs)` | correlated subqueries, LATERAL | what step 5 unnests; until then the executor runs it as today |
+| `Agg(keys, sets, aggs)`, `Window(part, order, frame, calls)` | GROUP BY, GROUPING SETS, windows | aggregates referenced by slot (`#agg` today) |
+| `Sort`, `Limit(count, offset, ties, percent)`, `Distinct(on)` | ORDER BY, LIMIT/FETCH/TOP, DISTINCT [ON] | |
+| `SetOp(op, all, l, r)` | UNION, INTERSECT, EXCEPT | each side projected to the common types first |
+| `Match(def)`, `Lock(mode, tables, wait)` | MATCH_RECOGNIZE, FOR UPDATE | |
+
+DML stays a layer-7 statement holding a bound source plan and bound
+SET/VALUES/RETURNING expressions over the target's columns.
+
+**The typed expression IR (`BX`).**
+
+```
+BX = closed {
+    Const(Val, Ty)                 // folded; already of its type (1 as numeric is Num(1))
+    Param(int, Ty)                 // $n, cast to its use's type when the client gave none
+    Col(int, Ty)                   // input slot
+    Outer(int, int, Ty)            // an enclosing query's slot (correlation), until unnested
+    Op(OpId, []BX, Ty)             // operator or function, chosen by signature
+    Cast(BX, CastId, Ty)
+    Case([]BX, []BX, BX, Ty)       // WHENs, THENs, ELSE: every THEN already of Ty
+    And([]BX), Or([]BX), Not(BX), IsNull(BX, bool)
+    Coalesce([]BX, Ty)
+    Sub(int, int, Ty)              // a subquery's result (scalar, EXISTS, IN) until unnested
+    Agg(int, Ty), Win(int, Ty)     // slots of the operator below
+}
+```
+
+`OpId` and `CastId` index tables of definitions, one entry per signature:
+
+```
+OpDef = value record {
+    name: str; args: []Ty; result: Ty
+    scalar: fn(&[]Val, &Ctx): Result[Val, DbErr]     // the one semantics
+    kernel: int                                      // a typed vector kernel (lexdb_vec), or 0
+    strict: bool        // NULL in, NULL out: the evaluators skip NULL rows
+    volatile: bool      // random, nextval, clock_timestamp, set_config
+    canFail: bool       // overflow, division by zero, bad input
+}
+```
+
+The scalar functions are today's `binVal`/`unaryVal`/`castVal`/`callAt`
+arms, split per signature so nothing matches a string or a kind per row.
+They move into a module below exec (`lexdb_ops`, as lexdb-tpch-perf.md
+4.1.4 planned) so that the binder can fold constants with them and the
+planner can coerce bounds with them: that is the `Fold` record and the
+"coercion in a core module" of followups 5, and the `keyVal`/`coerceZ`
+coercion the access layer now leaves to the binder.
+
+**Scalar and vector from one definition.** A bound expression is compiled
+once per plan into a flat program (PostgreSQL's `ExprState` steps): each
+step is an `OpId` with input and output registers. The scalar evaluator
+runs the steps on one row's values. The vector evaluator runs each step on
+a chunk: the op's kernel when it has one and the registers are typed
+vectors, else the op's `scalar` over the selected rows (the generic step,
+today's `Gen`). So a kernel is an optimisation of an op, never a second
+semantics; a test runs every op with a kernel both ways on the same
+inputs, as the "three ways" tests do for whole queries. A kernel that
+cannot represent a result (a units overflow) spills that step to the
+generic step for the chunk, which gives the exact value or the row's error.
+
+**Errors and short-circuits under a selection vector.** Every step runs on
+the selection it is given, never on rows outside it:
+
+- `And`/`Or`: the right side runs only on rows the left side left
+  undecided (true for AND, false for OR, or NULL).
+- `Case`: WHEN k runs on the rows no earlier WHEN took; THEN k on the rows
+  WHEN k made true; ELSE on the rest. `CASE WHEN x <> 0 THEN 1/x END`
+  never divides by zero.
+- `Coalesce`: argument k runs only on rows still NULL.
+- Strict ops skip NULL rows; a `canFail` op checks only selected rows.
+- An error is raised exactly when the scalar evaluation of some selected
+  row would raise it; the reported row is the lowest selected row of the
+  first failing step. (Which row PostgreSQL reports is not specified
+  either.)
+- A volatile op is evaluated once per selected row, in row order, at the
+  place 4.9's rule 1 puts it; the binder marks the expression volatile so
+  the optimizer never moves or duplicates it.
+
+**Dialect typing as data.** The binder has one algorithm; a dialect
+supplies tables (`Typing`, chosen at connection with the `Dialect` record):
+
+- per type, its category and whether it is its category's preferred type,
+  and the implicit casts. PostgreSQL's are pg_type's `typcategory` /
+  `typispreferred` and pg_cast's castcontext `i` (REL_18_6). The common type
+  of a union, CASE, COALESCE, GREATEST/LEAST or VALUES column is
+  `select_common_type` over them: a left fold where a type gives way to a
+  later one of its category when it is not preferred and casts to it
+  implicitly but not back. SQL Server's data type precedence fits the same
+  form (one category per family, implicit casts from lower to higher
+  precedence); Oracle's datatype families likewise;
+- how an untyped literal is read (PostgreSQL: unknown, decided by context;
+  T-SQL: `''` as 0 for numbers);
+- the collation rule for a comparison (PostgreSQL lets a non-default
+  implicit collation win over the default; SQL Server treats it as a
+  conflict: the open question of lexdb-tpch-perf.md 4.2);
+- function and operator signatures beyond the core's (Oracle's
+  `lexdb_orafn.resultOid` today), and decimal rules such as T-SQL's
+  division scale (`#tdiv` today).
+
+**The transition: the old executor consumes the bound form.** No big-bang;
+each slice merges with the suite, the 22 checksums and an A/B.
+
+| Slice | What | The old executor sees |
+|---|---|---|
+| 2a (built) | `lexdb_bind` owns expression typing (`exprOid` moved) and PostgreSQL's common-type rule as data; set operations, VALUES, CASE, COALESCE, GREATEST/LEAST typed from every branch | the same `Expr`, with the implicit casts made explicit (`Cast` nodes, constants folded) and the set operation's per-side conversions (`Sel.conv`) |
+| 2b | `BX`, `OpDef` and `lexdb_ops`; `cxOf` becomes the binder's `bindExpr`, `cEval` runs `BX`; delete `CX` and `FnB` | `BX` for compiled expressions; `eval` over `Expr` for the rest |
+| 2c | `bCompile` builds its batch nodes from `BX` (the generic node is a `BX` step); constants pre-scaled and common subexpressions once per chunk | `BX` in both evaluators; `BNode` shrinks to the kernels |
+| 2d | Scope and naming: `resolve`/`resolveName`/`Scope` frames, star, GROUP BY and ORDER BY resolution move to the binder; columns by slot | `Query.cols` as `BCol`s; `eval`'s name lookup (`colIndex`) gone |
+| 2e | The binder emits the logical plan for SELECT and DML sources; `planSelect`/`buildQuery` read it instead of the `Stmt` | step 3 then turns it into the operator tree |
+
+Each later slice deletes the code it replaces; nothing keeps two typings.
+
+**Slice 2a as built.** `lexdb_bind` holds `exprOid` (moved unchanged,
+with Oracle's result types passed in as `Typing.fnOid`), `commonOid`
+(select_common_type) and `converts` (whether a value must be converted
+to the common type: numbers and date/time types along an implicit cast,
+and untyped literals). The facts are `lexdb_dialect.TYPE_FACTS` and
+`IMPLICIT_CASTS`; only PostgreSQL's exist yet, and they serve all three
+dialects, as exec's one rule did before. Where two branches are of
+different categories (PostgreSQL's 42804, `1 UNION SELECT 'a'::text`),
+the old first-branch rule is kept rather than adding an error a T-SQL or
+Oracle session would not raise; with each dialect's tables that becomes
+the dialect's own answer.
+
+Fixed, each checked against PostgreSQL 18.6 and in `exec_bindtypes`
+(batches off and on):
+
+- a set operation's column takes both sides' common type, and the side of
+  another type is converted (`runSet`): `1 UNION ALL 2.5` is numeric (was
+  an integer column holding 2.5), a date UNION a timestamp a timestamp, so
+  EXISTS and IN against a timestamp column find the dates too (72 rows,
+  was 36; the join gave 216 before and after);
+- a VALUES column takes all its rows' common type: `VALUES (1),
+  (3000000000)` is bigint (was "integer out of range"), `VALUES (1), (2.5)`
+  gives 1 and 2.5 (was 1 and 3);
+- CASE, COALESCE, GREATEST and LEAST: values of the common type, constants
+  converted when bound: `CASE WHEN c THEN 1 ELSE 2.5 END / 2` divides
+  numerics (was integer division, 0), a date beside a timestamp shows as a
+  timestamp.
+
+Not changed, found on the way: NULLIF's type (PostgreSQL types
+`nullif(1, 2.5)` numeric, through its `=`); a numeric division's scale
+(lexdb gives 16 places where PostgreSQL gives 20); typmods of a common
+type (`numeric(10,2) UNION numeric(12,2)`), since exprOid has none; and
+an untyped literal in the first side of a set operation is typed only in a
+plain select list (`branchOid`).
+
 ### 4.5 Layer 5, optimizer (`lexdb_plan`)
 
 **In:** the bound logical plan. **Out:** a physical operator tree, which is
