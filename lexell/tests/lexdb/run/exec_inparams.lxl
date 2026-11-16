@@ -1,0 +1,54 @@
+// lexdb_exec: an IN list over a batch with parameters ($1, $2) in a cached
+// plan (runCached): each run compiles its batch with that run's values, so
+// a plan reused with others finds them, the chain and the sorted set, text
+// and integers, a NULL; batches on and off. From the TPC-H review
+// (2026-11-16), where this was an open question.
+// expect: batch on: 300, 150, 0, 1500, 1200, 300, 150 (plans 3)
+// expect: batch off: 300, 150, 0, 1500, 1200, 300, 150 (plans 3)
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+import "strings"
+type Val = lexdb_sql.Val
+fn run(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) { Ok(_) {} Err(e) { println(sql + " -> " + e.msg) } }
+}
+fn cnt(s: mut &lexdb_exec.Session, pc: mut &lexdb_exec.PlanCache, sql: &str, ps: []Val, pt: &[]int): str {
+    let st = lexdb_parse.parse(sql).unwrap()
+    match s.runCached(&st[0], &ps, pt, pc) {
+        Ok(r) { return lexdb_exec.text(&r.rows[0][0]) }
+        Err(e) { return e.msg }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        run(mut &s, "create table t (id int primary key, i int, s text)")
+        run(mut &s, "insert into t select g, g % 20, (g % 20)::text from generate_series(1, 3000) g")
+        run(mut &s, "analyze t")
+        for b in ["on", "off"] {
+            run(mut &s, "set lexdb_batch = " + b)
+            var pc = lexdb_exec.newPlanCache()
+            var pc2 = lexdb_exec.newPlanCache()
+            var pc3 = lexdb_exec.newPlanCache()
+            let pt: []int = [lexdb_sql.OID_INT8, lexdb_sql.OID_INT8]
+            let q1 = "select count(*) from t where i in ($1, $2)"
+            let q2 = "select count(*) from t where i in ($1, $2, 3, 4, 5, 6, 7, 8, 9, 10)"
+            let pts: []int = [lexdb_sql.OID_TEXT, lexdb_sql.OID_TEXT]
+            let q3 = "select count(*) from t where s in ($1, $2, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h')"
+            var out: []str = []
+            append(mut &out, cnt(mut &s, mut &pc, &q1, [Val.Int(1), Val.Int(2)], &pt))
+            append(mut &out, cnt(mut &s, mut &pc, &q1, [Val.Int(1), Val.Int(25)], &pt))
+            append(mut &out, cnt(mut &s, mut &pc, &q1, [Val.Null, Val.Int(25)], &pt))
+            append(mut &out, cnt(mut &s, mut &pc2, &q2, [Val.Int(1), Val.Int(2)], &pt))
+            append(mut &out, cnt(mut &s, mut &pc2, &q2, [Val.Int(30), Val.Int(31)], &pt))
+            append(mut &out, cnt(mut &s, mut &pc3, &q3, [Val.Text("1"), Val.Text("2")], &pts))
+            append(mut &out, cnt(mut &s, mut &pc3, &q3, [Val.Text("1"), Val.Text("zz")], &pts))
+            println("batch " + b + ": " + strings.join(&out, ", ") + " (plans " + (pc.plans + pc2.plans + pc3.plans).toStr() + ")")
+        }
+        return 0
+    })
+}
