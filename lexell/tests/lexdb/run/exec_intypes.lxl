@@ -10,6 +10,15 @@
 // each key's values for the same compare (runHashed, hashValue). Before,
 // main gave 0 or the whole table for every case marked below as floats or
 // timestamps.
+// Each value is keyed by what = would find it equal to (inValKeys): an
+// integer or numeric by value, a float by its float8 (a float against a
+// numeric compares as float8, not by a 15-digit numeric: 0.1 + 0.2 is not
+// 0.3), a date or time by its own kind and by its instant in the session's
+// zone (a timestamp and a timestamptz in New York); a probe looks up the
+// keys it could equal (inProbeKeys): one lookup or a few, never the set
+// one by one (20,000 float probes against 20,000 integers). A numeric key
+// looked up by float values would miss 0.10000000000000000001: a set of
+// another class than the column's reads the table whole (pathScans).
 // expect: numeric key, float values: 20, same: true
 // expect: numeric expression, float values: 20, same: true
 // expect: = any, float values: 20, same: true
@@ -27,12 +36,32 @@
 // expect: correlated by a key, float values: 20, same: true
 // expect: correlated by a key, timestamp values: 10, same: true
 // expect: scan ti: full scan;aggregate;subquery 1 (in): hashed on f.xi = ti.v;  scan f: full scan
+// expect: F1 float in numeric set: 2,3,5,6, same: true
+// expect: F2 float not in numeric set: 1,4, same: true
+// expect: F3 = any: 2,3,5,6, same: true
+// expect: F4 scalar: f|f|f, same: true
+// expect: F5 correlated: 2,3,5,6, same: true
+// expect: F6 hashed by key: 2,3,6, same: true
+// expect: N1 numeric in float set: 2,3,6, same: true
+// expect: N2 numeric key, float values: 0,0.1,0.10000000000000000001, same: true
+// expect: N3 float key, numeric values: 0.1, same: true
+// expect: U1 nulls: ||t||, same: true
+// expect: Z1 zero nan: t|t|t|t|f, same: true
+// expect: T1 date in tstz: 1, same: true
+// expect: T2 date not in tstz: 0, same: true
+// expect: T3 tstz in date: 1, same: true
+// expect: T4 hashed date in tstz: 1, same: true
+// expect: T5 timestamp in tstz: 1, same: true
+// expect: T6 hashed timestamp in tstz: 1, same: true
+// expect: T7 tstz in timestamp: 1, same: true
+// expect: T8 scalar: f|t, same: true
+// expect: P float probes, many: 0, same: true
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 
-const SETUP = "create table tn (k numeric(12,2) primary key, v int)\ninsert into tn select g / 4.0, g from generate_series(1, 2000) g\ncreate table ti (id int primary key, v int)\ninsert into ti select g, g from generate_series(1, 2000) g\ncreate table tf (k float8 primary key, v int)\ninsert into tf select g / 4.0, g from generate_series(1, 2000) g\ncreate table td (k date primary key, v int)\ninsert into td select date '2000-01-01' + g, g from generate_series(1, 2000) g\ncreate table tsx (k timestamp primary key, v int)\ninsert into tsx select timestamp '2000-01-01' + (g || ' hours')::interval * 12, g from generate_series(1, 2000) g\ncreate table tt (k text primary key, v int)\ninsert into tt select 'k' || g, g from generate_series(1, 2000) g\ncreate table f (xf float8, xn numeric(8,2), xi int, xd date, xs timestamp, xt text)\ninsert into f select g / 4.0, g / 4.0, g, date '2000-01-01' + g, timestamp '2000-01-01' + (g || ' days')::interval + case when g % 2 = 0 then interval '0' else interval '3 hours' end, 'k' || g from generate_series(1, 20) g\ninsert into f (xf) values (null)\ncreate table mix (m text)\ninsert into mix values ('1'), ('2.0'), ('x'), (null)\nanalyze"
+const SETUP = "create table tn (k numeric(12,2) primary key, v int)\ninsert into tn select g / 4.0, g from generate_series(1, 2000) g\ncreate table ti (id int primary key, v int)\ninsert into ti select g, g from generate_series(1, 2000) g\ncreate table tf (k float8 primary key, v int)\ninsert into tf select g / 4.0, g from generate_series(1, 2000) g\ncreate table td (k date primary key, v int)\ninsert into td select date '2000-01-01' + g, g from generate_series(1, 2000) g\ncreate table tsx (k timestamp primary key, v int)\ninsert into tsx select timestamp '2000-01-01' + (g || ' hours')::interval * 12, g from generate_series(1, 2000) g\ncreate table tt (k text primary key, v int)\ninsert into tt select 'k' || g, g from generate_series(1, 2000) g\ncreate table f (xf float8, xn numeric(8,2), xi int, xd date, xs timestamp, xt text)\ninsert into f select g / 4.0, g / 4.0, g, date '2000-01-01' + g, timestamp '2000-01-01' + (g || ' days')::interval + case when g % 2 = 0 then interval '0' else interval '3 hours' end, 'k' || g from generate_series(1, 20) g\ninsert into f (xf) values (null)\ncreate table mix (m text)\ninsert into mix values ('1'), ('2.0'), ('x'), (null)\ncreate table nn (g int, k numeric)\ninsert into nn values (1, 0.3), (2, 0.1), (3, 0.10000000000000000001), (4, 10000000000000000), (5, 1), (6, 0)\ncreate table n (k numeric primary key)\ninsert into n select k from nn\ncreate table fl (g int, x float8)\ninsert into fl values (1, 0.1::float8 + 0.2), (2, 0.1), (3, 0.1), (4, 10000000000000002::float8), (5, '-0'::float8), (6, '-0'::float8)\ncreate table fk (x float8 primary key)\ninsert into fk values (0.1), (0.30000000000000004), (10000000000000002)\ncreate table tz (id int, t timestamptz)\ncreate table dd (id int, d date primary key)\ncreate table nl (k numeric)\ninsert into nl values (1), (null)\ncreate table bi (k int primary key)\ninsert into bi select g from generate_series(1, 20000) g\ncreate table bf (x float8)\ninsert into bf select g + 0.5 from generate_series(1, 20000) g\nanalyze"
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
     match s.exec(sql) {
@@ -104,6 +133,44 @@ fn body(st: lexdb_store.Store): int {
     three(mut &s, &"correlated by a key, timestamp values", &"select count(*) from td where td.k in (select f.xs from f where f.xi = td.v)",
           &"select count(*) from td where exists (select 1 from f where f.xs = td.k and f.xi = td.v)")
     println(q(mut &s, &"explain select count(*) from ti where ti.id in (select f.xf * 4 from f where f.xi = ti.v)"))
+    // the review's cases: a float against numerics compares as a float8
+    // (not by a 15-digit numeric), an index lookup of floats in a numeric
+    // key, -0 and NaN, NULLs, timestamp against timestamptz in a zone
+    let ag = "select string_agg(g::text, ',' order by g) from "
+    three(mut &s, &"F1 float in numeric set", &(ag + "fl where x in (select k from nn)"), &(ag + "fl where exists (select 1 from nn where nn.k = fl.x)"))
+    three(mut &s, &"F2 float not in numeric set", &(ag + "fl where x not in (select k from nn)"), &(ag + "fl where not exists (select 1 from nn where nn.k = fl.x)"))
+    three(mut &s, &"F3 = any", &(ag + "fl where x = any (select k from nn)"), &(ag + "fl where exists (select 1 from nn where nn.k = fl.x)"))
+    three(mut &s, &"F4 scalar", &"select (0.1::float8 + 0.2) in (select 0.3::numeric), 10000000000000002::float8 in (select 10000000000000000::int8), 0.1::real in (select 0.1::numeric)",
+          &"select (0.1::float8 + 0.2) = 0.3::numeric, 10000000000000002::float8 = 10000000000000000::int8, 0.1::real = 0.1::numeric")
+    three(mut &s, &"F5 correlated", &(ag + "fl where x in (select k from nn where nn.g >= fl.g - 10 + 0 * fl.g)"),
+          &(ag + "fl where exists (select 1 from nn where nn.k = fl.x and nn.g >= fl.g - 10 + 0 * fl.g)"))
+    three(mut &s, &"F6 hashed by key", &(ag + "fl where x in (select k from nn where nn.g = fl.g)"), &(ag + "fl where exists (select 1 from nn where nn.k = fl.x and nn.g = fl.g)"))
+    three(mut &s, &"N1 numeric in float set", &(ag + "nn where k in (select x from fl)"), &(ag + "nn where exists (select 1 from fl where fl.x = nn.k)"))
+    three(mut &s, &"N2 numeric key, float values", &"select string_agg(k::text, ',' order by k) from n where k in (select x from fl)",
+          &"select string_agg(k::text, ',' order by k) from n where exists (select 1 from fl where fl.x = n.k)")
+    three(mut &s, &"N3 float key, numeric values", &"select string_agg(x::text, ',' order by x) from fk where x in (select k from nn)",
+          &"select string_agg(x::text, ',' order by x) from fk where exists (select 1 from nn where nn.k = fk.x)")
+    three(mut &s, &"U1 nulls", &"select 1.5::float8 in (select k from nl), 1.5::float8 not in (select k from nl), 1::float8 in (select k from nl), null::float8 in (select k from nl), 1 in (select x from (values (1.5::float8), (null)) v(x))",
+          &"select null::bool, null::bool, true, null::bool, null::bool")
+    three(mut &s, &"Z1 zero nan", &"select 0 in (select '-0'::float8), '-0'::float8 in (select 0::numeric), '-0'::float8 in (select 0::float8), 'NaN'::float8 in (select 'NaN'::float8), 1 in (select 'NaN'::float8)",
+          &"select 0 = '-0'::float8, '-0'::float8 = 0::numeric, '-0'::float8 = 0::float8, 'NaN'::float8 = 'NaN'::float8, 1 = 'NaN'::float8")
+    let tzs: str = "set time zone 'America/New_York'\ninsert into tz values (1, '2000-01-02 00:00:00-05'), (2, '2000-01-03 00:00:00+00'), (3, null)\ninsert into dd values (1, '2000-01-02'), (2, '2000-01-03')"
+    for line in strings.lines(&tzs) { let r = q(mut &s, &line) }
+    let ai = "select string_agg(id::text, ',') from "
+    three(mut &s, &"T1 date in tstz", &(ai + "dd where d in (select t from tz)"), &(ai + "dd where exists (select 1 from tz where tz.t = dd.d)"))
+    three(mut &s, &"T2 date not in tstz", &"select count(*) from dd where d not in (select t from tz)", &"select 0")
+    three(mut &s, &"T3 tstz in date", &(ai + "tz where t in (select d from dd)"), &(ai + "tz where exists (select 1 from dd where tz.t = dd.d)"))
+    three(mut &s, &"T4 hashed date in tstz", &(ai + "dd where d in (select t from tz where tz.id = dd.id)"), &(ai + "dd where exists (select 1 from tz where tz.t = dd.d and tz.id = dd.id)"))
+    three(mut &s, &"T5 timestamp in tstz", &(ai + "dd where d::timestamp in (select t from tz)"), &(ai + "dd where exists (select 1 from tz where tz.t = dd.d::timestamp)"))
+    three(mut &s, &"T6 hashed timestamp in tstz", &(ai + "dd where d::timestamp in (select t from tz where tz.id = dd.id)"),
+          &(ai + "dd where exists (select 1 from tz where tz.t = dd.d::timestamp and tz.id = dd.id)"))
+    three(mut &s, &"T7 tstz in timestamp", &(ai + "tz where t in (select d::timestamp from dd)"), &(ai + "tz where exists (select 1 from dd where tz.t = dd.d::timestamp)"))
+    three(mut &s, &"T8 scalar", &"select '2000-01-03 00:00'::timestamp in (select '2000-01-03 00:00+00'::timestamptz), '2000-01-03 00:00'::timestamp not in (select '2000-01-03 00:00+00'::timestamptz)",
+          &"select '2000-01-03 00:00'::timestamp = '2000-01-03 00:00+00'::timestamptz, '2000-01-03 00:00'::timestamp <> '2000-01-03 00:00+00'::timestamptz")
+    let z0 = q(mut &s, &"set time zone 'UTC'")
+    // 20,000 float probes against 20,000 integers: a lookup each (compared
+    // one by one, this was 8 s)
+    three(mut &s, &"P float probes, many", &"select count(*) from bf where x in (select k from bi)", &"select 0")
     s.close()
     return 0
 }
