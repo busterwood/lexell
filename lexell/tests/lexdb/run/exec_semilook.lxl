@@ -1,0 +1,335 @@
+// lexdb_exec: EXISTS and NOT EXISTS looked up per row as a join's level
+// (semiLook, bRange): a semi or anti join that reads the subquery's table
+// by its path's range for each outer row, its filters (a residual "<>"
+// on outer values too) checked on the rows found, in place of a subquery
+// run per row. Over a miniature of TPC-H's orders and lineitem: lineitem
+// keyed by (order, line), orders with an index by customer, suppliers by
+// nation; some orders without lines, NULLs in the keys and filters.
+// - Random queries against the same query with each EXISTS written as a
+//   count, (select count(*) ...) > 0 (= 0 for NOT EXISTS), which is no
+//   semi-join: the same rows.
+// - With SET lexdb_batch = off and on: the same results.
+// - In a transaction with writes of its own (no lookup level: its reads
+//   are noted; the same with and without batches).
+// - How many ran as looked-up semi/anti joins, and over batches.
+// - EXPLAIN ANALYZE's counts with batches on and off (but "batches N",
+//   and the rows read: the batches read a key's whole range, the row
+//   path stops at the first row that passes).
+// - The plans: q4's (a primary key range per order, its filter per row),
+//   q22's (an index read alone, no filter: the first entry decides), a
+//   lookup of an index's rows, and q21's: the semi and anti joins after
+//   the joins that cut lineitem's rows (supplier, nation, orders), not
+//   after lineitem.
+// expect: reference: 300 queries, 300 the same as with counts
+// expect: batches: 300 queries, 300 the same with and without batches
+// expect: in a transaction: 40 queries, 40 the same with and without batches
+// expect: looked up: 268 of 300, 268 over batches
+// expect: counts q21: same: true
+// expect: counts q22: same: true
+// expect: plan q4: scan o: full scan; semi join l: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join
+// expect: plan q22: scan c: full scan; anti join o: index o_cust lookup, index only (estimated 5 rows) per row; aggregate; order: sort; subquery 1 (exists): anti join, looked up per row by the join
+// expect: plan index rows: scan c: primary key range; semi join o2: index o_cust lookup (estimated 5 rows) per row, filter per row read; aggregate; subquery 1 (exists): semi join, looked up per row by the join
+// expect: plan q21: scan l l1: full scan; join s: hash on (id) over full scan; join n: hash on (id) over full scan; join o: primary key lookup per row; semi join l2: primary key range per row, filter per row read; anti join l3: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join; subquery 2 (exists): anti join, looked up per row by the join
+// expect: star: 4 columns
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// EXPLAIN's lines, joined by "; "
+fn ex(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs { for row in r.rows { append(mut &out, lexdb_exec.text(&row[0])) } }
+            return strings.join(&out, "; ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(12) == 0 { "null" } else { v } }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+// A filter of the subquery's table x (lineitem's alias) on its own rows.
+fn lineOwn(r: mut &lexdb_base.Rng, x: &str): str {
+    let c = r.below(5)
+    if c == 0 { return x + ".rd > " + x + ".cd" }
+    if c == 1 { return x + ".cd < " + x + ".rd" }
+    if c == 2 { return x + ".sp % 3 = 1" }
+    if c == 3 { return x + ".qty > " + r.below(40).toStr() }
+    return x + ".rd is not null"
+}
+
+// A correlated EXISTS over lineitem (alias x) by its order key, for outer
+// lineitem l1: with "<>" on the supplier (q21's), own filters.
+fn lineSub(r: mut &lexdb_base.Rng, x: &str, outerOk: &str, outerSp: &str): str {
+    var cs: []str = [x + ".ok = " + outerOk]
+    if outerSp != "" && r.below(3) != 0 { append(mut &cs, x + ".sp <> " + outerSp) }
+    let n = r.below(3)
+    for i in 0..n { append(mut &cs, lineOwn(r, x)) }
+    return "select * from l " + x + " where " + strings.join(&cs, " and ")
+}
+
+// A correlated EXISTS over orders by customer (the index o_cust).
+fn ordSub(r: mut &lexdb_base.Rng, outerC: &str): str {
+    var cs: []str = ["o2.cust = " + outerC]
+    let c = r.below(4)
+    if c == 0 { append(mut &cs, "o2.st = 'F'") }
+    if c == 1 { append(mut &cs, "o2.dt >= '2024-03-01'") }
+    return "select 1 from o o2 where " + strings.join(&cs, " and ")
+}
+
+// One EXISTS (or NOT EXISTS) and its count form, into ex and cnt.
+fn sub(r: mut &lexdb_base.Rng, body: &str, ex: mut &[]str, cnt: mut &[]str) {
+    let neg = r.below(2) == 0
+    append(ex, (if neg { "not exists (" } else { "exists (" }) + body + ")")
+    let star = strings.replaceAll(body, &"select * from", "select count(*) from")
+    let one = strings.replaceAll(&star, &"select 1 from", "select count(*) from")
+    append(cnt, "(" + one + ")" + (if neg { " = 0" } else { " > 0" }))
+}
+
+// A query and its reference (each EXISTS a count).
+fn query(r: mut &lexdb_base.Rng, out: mut &[]str) {
+    let shape = r.below(5)
+    var ex: []str = []
+    var cnt: []str = []
+    var head = ""
+    var frm = ""
+    var own: []str = []
+    var tail = ""
+    if shape == 0 {
+        // q4: orders by date, a semi join on lineitem
+        head = "select o.st, count(*) from "
+        frm = "o"
+        append(mut &own, "o.dt >= '2024-0" + (1 + r.below(4)).toStr() + "-01' and o.dt < '2024-0" + (5 + r.below(4)).toStr() + "-01'")
+        sub(r, &lineSub(r, &"x", &"o.id", &""), mut &ex, mut &cnt)
+        tail = " group by o.st order by 1"
+    } else if shape == 1 {
+        // q21: lineitem joined to supplier and nation, then the two
+        head = "select s.name, count(*) from "
+        frm = "l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok"
+        append(mut &own, "n.name = '" + pick(r, &["N1", "N2", "N3"]) + "'")
+        if r.below(2) == 0 { append(mut &own, "o.st = 'F'") }
+        if r.below(2) == 0 { append(mut &own, "l1.rd > l1.cd") }
+        sub(r, &lineSub(r, &"l2", &"l1.ok", &"l1.sp"), mut &ex, mut &cnt)
+        if r.below(2) == 0 { sub(r, &lineSub(r, &"l3", &"l1.ok", &"l1.sp"), mut &ex, mut &cnt) }
+        tail = " group by s.name order by 2 desc, 1 limit " + pick(r, &["3", "50"])
+    } else if shape == 2 {
+        // q22: customers without (with) orders
+        head = "select c.nat, count(*), sum(c.bal) from "
+        frm = "c"
+        if r.below(2) == 0 { append(mut &own, "c.bal > " + r.below(50).toStr()) }
+        sub(r, &ordSub(r, &"c.id"), mut &ex, mut &cnt)
+        tail = " group by c.nat order by 1"
+    } else if shape == 3 {
+        // rows out: orders of some customers and their lines
+        head = "select o.id, o.cust from "
+        frm = "o join c on c.id = o.cust"
+        append(mut &own, "c.nat = " + r.below(5).toStr())
+        sub(r, &lineSub(r, &"x", &"o.id", &""), mut &ex, mut &cnt)
+        if r.below(2) == 0 { sub(r, &ordSub(r, &"c.id"), mut &ex, mut &cnt) }
+        tail = " order by 1"
+    } else {
+        // lineitem by order range, a lookup of the order's other lines
+        head = "select l1.ok, l1.ln, l1.sp from "
+        frm = "l l1"
+        append(mut &own, "l1.ok < " + (50 + r.below(400)).toStr())
+        sub(r, &lineSub(r, &"l2", &"l1.ok", &"l1.sp"), mut &ex, mut &cnt)
+        tail = " order by 1, 2"
+    }
+    var a: []str = []
+    var b: []str = []
+    for x in own {
+        append(mut &a, x.toStr())
+        append(mut &b, x.toStr())
+    }
+    for x in ex { append(mut &a, x.toStr()) }
+    for x in cnt { append(mut &b, x.toStr()) }
+    append(out, head + frm + " where " + strings.join(&a, " and ") + tail)
+    append(out, head + frm + " where " + strings.join(&b, " and ") + tail)
+}
+
+fn both(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    return false
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table n (id int primary key, name text)")
+    let c2 = q(s, &"create table s (id int primary key, nat int, name text)")
+    let c3 = q(s, &"create table c (id int primary key, nat int, bal int)")
+    let c4 = q(s, &"create table o (id int primary key, cust int, st text, dt date)")
+    let c5 = q(s, &"create table l (ok int, ln int, sp int, cd int, rd int, qty int, primary key (ok, ln))")
+    let i1 = q(s, &"create index o_cust on o (cust)")
+    let i2 = q(s, &"create index o_dt on o (dt)")
+    var rows: []str = []
+    for i in 0..25 { append(mut &rows, "(" + i.toStr() + ", 'N" + i.toStr() + "')") }
+    let a1 = q(s, &("insert into n values " + strings.join(&rows, ", ")))
+    rows = []
+    for i in 1..101 { append(mut &rows, "(" + i.toStr() + ", " + maybe(r, r.below(25).toStr()) + ", 'S" + (i % 37).toStr() + "')") }
+    let a2 = q(s, &("insert into s values " + strings.join(&rows, ", ")))
+    rows = []
+    for i in 1..401 { append(mut &rows, "(" + i.toStr() + ", " + r.below(5).toStr() + ", " + maybe(r, r.below(100).toStr()) + ")") }
+    let a3 = q(s, &("insert into c values " + strings.join(&rows, ", ")))
+    var id = 1
+    for chunk in 0..13 {
+        rows = []
+        var lrows: []str = []
+        for i in 0..100 {
+            let m = 1 + r.below(8)
+            append(mut &rows, "(" + id.toStr() + ", " + maybe(r, (1 + r.below(300)).toStr()) + ", " + maybe(r, pick(r, &["'F'", "'O'", "'P'"])) +
+                   ", '2024-0" + (1 + r.below(9)).toStr() + "-1" + r.below(10).toStr() + "')")
+            // an eighth of the orders have no lines
+            let lines = if r.below(8) == 0 { 0 } else { 1 + r.below(6) }
+            for ln in 1..lines + 1 {
+                append(mut &lrows, "(" + id.toStr() + ", " + ln.toStr() + ", " + maybe(r, (1 + r.below(100)).toStr()) + ", " + r.below(30).toStr() + ", " +
+                       maybe(r, r.below(30).toStr()) + ", " + r.below(50).toStr() + ")")
+            }
+            id += 1
+            if m > 100 { id += 1 }
+        }
+        let a4 = q(s, &("insert into o values " + strings.join(&rows, ", ")))
+        if len(lrows) > 0 {
+            let a5 = q(s, &("insert into l values " + strings.join(&lrows, ", ")))
+            if !strings.contains(&a5, "INSERT") { println("insert: " + a5) }
+        }
+    }
+    let an = q(s, &"analyze")
+}
+
+// s without each pre and the digits after it.
+fn dropNum(s: &str, pre: &str): str {
+    let parts = strings.split(s, pre)
+    var out = "" + parts[0]
+    for i in 1..len(parts) {
+        let p = parts[i]
+        var j = 0
+        while j < len(p) && p[j] >= '0' && p[j] <= '9' { j += 1 }
+        out = out + strings.substr(&p, j, len(p))
+    }
+    return out
+}
+
+// An EXPLAIN ANALYZE's lines without the batches, the rows read and the
+// result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    return dropNum(&dropNum(parts[0], &", batches "), &"rows read ")
+}
+
+fn counts(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = ex(s, &("explain analyze " + sql))
+    let b = q(s, &"set lexdb_batch = on")
+    let on = ex(s, &("explain analyze " + sql))
+    let ok = plan(&on) == plan(&off) && strings.contains(&on, "batches") && strings.contains(&on, " per row")
+    println("counts " + label + ": same: " + ok.toStr())
+    if !ok {
+        println("  off: " + off)
+        println("  on:  " + on)
+    }
+}
+
+// Whether EXPLAIN shows a looked-up semi or anti join.
+fn looked(e: &str): bool {
+    for l in strings.split(e, &"; ") {
+        if (strings.startsWith(&l, "semi join ") || strings.startsWith(&l, "anti join ")) && strings.contains(&l, " per row") { return true }
+    }
+    return false
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(73)
+        load(mut &s, mut &r)
+        var same = 0
+        var looks = 0
+        var batched = 0
+        for i in 0..300 {
+            var two: []str = []
+            query(mut &r, mut &two)
+            let a = q(mut &s, &two[0])
+            let b = q(mut &s, &two[1])
+            if a == b { same += 1 } else {
+                println("DIFFERENT: " + two[0])
+                println("  semi:      " + a)
+                println("  reference: " + b)
+            }
+            let e = ex(mut &s, &("explain analyze " + two[0]))
+            if looked(&e) { looks += 1 }
+            if looked(&e) && strings.contains(strings.split(&e, &"; ")[0], "batches") { batched += 1 }
+        }
+        println("reference: 300 queries, " + same.toStr() + " the same as with counts")
+        var same2 = 0
+        for i in 0..300 {
+            var two: []str = []
+            query(mut &r, mut &two)
+            if both(mut &s, &two[0]) { same2 += 1 }
+        }
+        println("batches: 300 queries, " + same2.toStr() + " the same with and without batches")
+        let b1 = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into l select ok, ln + 10, sp, cd, rd, qty from l where ok % 7 = 1")
+        let w2 = q(mut &s, &"update l set sp = sp + 1 where ok % 5 = 2")
+        let w3 = q(mut &s, &"delete from l where ok % 11 = 3")
+        let w4 = q(mut &s, &"update o set cust = null where id % 13 = 5")
+        var same3 = 0
+        for i in 0..40 {
+            var two: []str = []
+            query(mut &r, mut &two)
+            if both(mut &s, &two[0]) { same3 += 1 }
+        }
+        let b2 = q(mut &s, &"rollback")
+        println("in a transaction: 40 queries, " + same3.toStr() + " the same with and without batches")
+        println("looked up: " + looks.toStr() + " of 300, " + batched.toStr() + " over batches")
+        let q21 = "select s.name, count(*) from l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok " +
+                  "where n.name = 'N2' and o.st = 'F' and l1.rd > l1.cd " +
+                  "and exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp) " +
+                  "and not exists (select * from l l3 where l3.ok = l1.ok and l3.sp <> l1.sp and l3.rd > l3.cd) group by s.name order by 2 desc, 1"
+        let q22 = "select c.nat, count(*), sum(c.bal) from c where c.bal > 20 and not exists (select 1 from o where o.cust = c.id) group by c.nat order by 1"
+        counts(mut &s, &"q21", &q21)
+        counts(mut &s, &"q22", &q22)
+        println("plan q4: " + ex(mut &s, &("explain select o.st, count(*) from o where o.dt >= '2024-03-01' and o.dt < '2024-04-01' " +
+                                         "and exists (select * from l where l.ok = o.id and l.cd < l.rd) group by o.st order by 1")))
+        println("plan q22: " + ex(mut &s, &("explain " + q22)))
+        println("plan index rows: " + ex(mut &s, &"explain select count(*) from c where c.id < 30 and exists (select 1 from o o2 where o2.cust = c.id and o2.st = 'F')"))
+        println("plan q21: " + ex(mut &s, &("explain " + q21)))
+        // the level's columns are no names
+        let st1 = q(mut &s, &"select * from o where o.id = 3 and exists (select * from l where l.ok = o.id)")
+        println("star: " + len(strings.split(&st1, &"|")).toStr() + " columns")
+        return 0
+    }).unwrap()
+}

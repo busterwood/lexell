@@ -111,3 +111,122 @@ changed.
 ## 4. Findings
 
 (Each workstream's subsection.)
+
+### 4.2 `semi`: semi and anti joins
+
+**What PostgreSQL does.** `pull_up_sublinks` (prep/prepjointree.c)
+turns a WHERE conjunct `EXISTS (...)` or `x IN (...)` into a join-tree
+node of type JOIN_SEMI, and `NOT EXISTS` into JOIN_ANTI
+(`convert_EXISTS_sublink_to_join`, `convert_ANY_sublink_to_join` in
+plan/subselect.c). The subquery's tables then take part in the ordinary
+join search, constrained only so that the semi join's inner side is
+joined as a unit after the tables its outer values come from: the join
+search places it wherever it is cheapest. For q21 it puts the anti join
+after the hash join of lineitem with (supplier, nation), on 156,739 rows,
+and the semi join after that, on 13,859. The join itself is a nested loop
+whose inner side is an index scan with the correlation as its index
+condition (nodeNestloop.c: `single_match` for JOIN_SEMI stops the inner
+scan at the first match, JOIN_ANTI emits the outer row only when the scan
+found none). Its cost (costsize.c, `final_cost_nestloop` with
+`semifactors`): a matched outer row pays a fraction 2/(match_count+1) of
+the inner scan, an unmatched one only the index descent when every join
+qual is an index qual (`has_indexed_join_quals`). q4 and q22 are the same
+shape: 57,218 and 19,000 index probes, 0.007 and 0.002 ms each.
+
+**What lexdb did.** A correlated EXISTS whose outer values are equality
+keys was either hashed (the whole inner side read once: q21's 6M and 3.8M
+lineitem rows, q4's 3.8M) or left a subquery run per outer row, at about
+140 us a run for a primary-key range and 26 us for a secondary index's
+(the run's setup, not its reads). And the semi level was placed directly
+after the first table its outer values come from, before the joins that
+cut the rows: q21's semi and anti joins ran on lineitem's 3.79M rows.
+
+**Changed (kept).**
+
+- *A semi or anti join looked up per row as a join's level*
+  (`semiLookable`, `semiLook`, `runLevel`'s `semiSub` branch, `bRange`).
+  An EXISTS / NOT EXISTS over one table whose path is its outer values'
+  leading equalities becomes a level of that table, perRow, its filters
+  the subquery's (the residual `l3.l_suppkey <> l1.l_suppkey` too) with
+  its columns renamed to hidden ones; the subquery is no longer run. The
+  row path reads the range until a row passes; the batches read each
+  batch's distinct key prefixes in key order, each range in place
+  (`scanLeaves`, column leaves decoded a run at a time), and hand the
+  rows to `bJoinTail` (first passing candidate per outer row for a semi
+  join, none for an anti join). An integer key's equality with its own
+  path value is dropped from the filters, so a range with no other filter
+  stops at its first entry (q22's NOT EXISTS reads one index entry per
+  customer, index only).
+- *Cost.* `semiLookRun`: a descent and the first row (COST_DESCENT +
+  COST_KEY_ROW), then 1.8 per further row of a primary key's or a covering
+  index's range, 49 an index entry and its row; compared with the hash's
+  `inner * (COST_SCAN + HASH_BUILD) + outer * HASH_PROBE` at the outer
+  rows of the semi level's place. PostgreSQL's 2/(match_count+1) fraction
+  is not modelled (the whole range is charged): it only matters near the
+  crossover.
+- *Placement.* `orderRows` estimates the rows after each level of the
+  chosen order (the join search's own estimates: each table's rows by its
+  own conditions, an equality class by its distinct values), and
+  `semiJoins` places each semi/anti level after the level, from the one
+  where its outer values are known, with the fewest rows (not past an
+  outer join). q21's two levels now run after supplier, nation and
+  orders.
+
+A/B, `run.sh` lexdb only, pinned, medians of three warm runs (min-max),
+the baseline binary `lexdb-1744ef99` and this change measured in the same
+session; all four checksums unchanged:
+
+| query | before ms | after ms | PG one core ms |
+|---|---:|---:|---:|
+| q4 | 4,272 (4,159-4,290) | **543** (543-557) | 180 |
+| q21 | 14,076 (13,995-14,140) | **10,962** (9,907-10,979) | 687 |
+| q22 | 1,239 (1,180-1,240) | **598** (592-607) | 76 |
+| q20 | 1,254 (1,252-1,260) | 1,220 (1,194-1,222) | 114 |
+
+A run of all 22 (`out-t3all`, one session): every result as before (19
+match PostgreSQL's, q1, q8 and q17 keep lexdb's checksums 0d3d0dc5,
+30016240, 3f7be248); q4 539 ms, q21 9,140 ms (9,092-9,215), q22 596 ms;
+the 22 sum to 56.3 s against the baseline's 66.0 s. q21 moves 9.1-11.0 s
+between sessions.
+
+The first version read each range with `Store.scan`, which copies every
+entry and rebuilds a column leaf's row value (`Node.val`, 25% of q4's
+time): q4 was 1,050-1,500 ms with it; reading the ranges in place
+(`scanLeaves`, decoding a run of a column leaf at a time as the first
+table's batches do) is the 543 ms.
+
+**Where the rest of the time is (profiled, `perf` on the server).**
+
+- q21 (10.9 s): the semi and anti joins are now small (75,871 and
+  73,089 lookups, 92,139 and 134,711 rows read). The time is the plan
+  before them, and it runs on the row path: `bJoinPlan` gives up on the
+  join because the orders level's condition `o_orderstatus = 'F'` (a
+  char(1) comparison) does not compile for batches (`bCompile` returns
+  None), so every one of lineitem's 3.79M kept rows goes through
+  `tryRow` and `runLevel` (63% of the samples) and two row-path hash
+  probes (supplier, nation). Without that conjunct (an experiment, not
+  the same query) the joins run over batches and the query takes 7.9 s,
+  the rest being lineitem's 6M-row scan and its filter. Both are the
+  `exec` workstream's (char(n) comparison in `bCompile`; the scan).
+  PostgreSQL's plan also hashes supplier joined to nation (411 rows) and
+  probes it once per lineitem row, where lexdb's left-deep order probes
+  supplier's 10,000 and then nation's 1 for each of the 3.79M rows: a
+  hash of a join (a bushy plan) is the `joinorder` workstream's.
+- q22 (598 ms): the anti join is 19,000 index-only lookups reading one
+  entry each. The time is `substring(c_phone from 1 for 2) in (...)` on
+  two scans of customer's 150,000 rows, evaluated by the row path's
+  function calls (`callFn`, `cEval`, `callMisc`: 30% self time): the
+  `exec` workstream's.
+- q4 (543 ms): orders' full scan of 1.5M rows (36% before the in-place
+  reads) and 57,218 range lookups (229,691 rows). PostgreSQL reads the
+  57,218 orders through a bitmap scan of `orders_date` (37 ms); lexdb's
+  `choosePath` takes the scan for a range over 1/32 of the table (this
+  one is 3.8%), as it has no bitmap scan.
+- q20 is not a semi join in the sense above: its `ps_suppkey IN (...)`
+  is a lookup per value, and the time is the correlated scalar `sum`
+  over lineitem run per partsupp row (8,508 runs, about 100 us each, the
+  run's setup: `runChild` builds a `Run`, `prepare` compiles every
+  level's conditions, the batch plan is made again) and partsupp's scan:
+  2,127 part keys are over `IN_LOOKUP_MAX` (1,000), so partsupp is read
+  whole (800,000 rows) instead of by 2,127 key ranges. PostgreSQL runs
+  the same subplan per row at 27 us. Unchanged here.
