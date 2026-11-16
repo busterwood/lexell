@@ -35,6 +35,7 @@ import "base64"
 import "./lexdb_rows"
 import "./lexdb_vec"
 import "./lexdb_like"
+import "./lexdb_access"
 import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
@@ -769,13 +770,6 @@ fn randomFloat(): Result[Val, DbErr] {
     for i in 0..7 { n = n * 256 + int(b[i]) }
     n = n >> 3                  // 53 bits
     return Ok(Val.Float(float(n) / 9007199254740992.0f))
-}
-
-// A float's key: its bits in an order that sorts as the values do, -0 as
-// 0, every NaN as one, after +Infinity.
-fn floatKey(x: float): int {
-    let bits = if x.isNaN() { 0x7ff8000000000000 } else if x == 0.0f { 0 } else { math.bitsOf(x) }
-    return if bits < 0 { ~bits } else { bits ^ (-9223372036854775807 - 1) }
 }
 
 // ---- dates, times, timestamps and intervals (9.76; lexdb_time)
@@ -2876,80 +2870,6 @@ fn arithInt(a: int, b: int): Result[int, DbErr] {
 
 // ---- keys and rows
 
-fn encKeyPart(b: mut &StrBuf, v: &Val) {
-    match v {
-        Val.Int(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
-        Val.Date(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
-        Val.Time(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
-        Val.Ts(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
-        Val.Tstz(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
-        Val.Ival(iv) {
-            // as PostgreSQL compares intervals: a month as 30 days, then the time of day left
-            let k = lexdb_time.ivalKey(&iv)
-            binary.addU64BE(b, k.days ^ (-9223372036854775807 - 1))
-            binary.addU64BE(b, k.us ^ (-9223372036854775807 - 1))
-        }
-        Val.Bool(x) { b.addByte(if x { 1 } else { 0 }) }
-        Val.Num(d) { encNum(b, &d) }
-        Val.Text(s) { encBytesKey(b, &s) }
-        Val.Uuid(u) { encBytesKey(b, &u) }       // its lowercase form sorts as its bytes do
-        Val.Float(x) { binary.addU64BE(b, floatKey(x)) }
-        Val.Real(x) { binary.addU64BE(b, floatKey(x)) }
-        Val.Reg(o, _) { binary.addU64BE(b, o ^ (-9223372036854775807 - 1)) }
-        Val.Bytes(x) { encBytesKey(b, &x) }
-        else {}
-    }
-}
-
-// Bytes in key order: a 0 byte as 0 FF, the end as 0 0.
-fn encBytesKey(b: mut &StrBuf, s: &str) {
-    for i in 0..len(s) {
-        b.addByte(s[i])
-        if s[i] == 0 { b.addByte(0xFF) }
-    }
-    b.addByte(0)
-    b.addByte(0)
-}
-
-// A numeric in key order: 0x80 zero; 0x81, the exponent of its leading
-// digit, its digits, 00 positive; 0x7F and all of that complemented
-// negative. Decimal is canonical (no trailing zero digits), so equal values
-// have equal keys whatever their scale.
-fn encNum(b: mut &StrBuf, d: &Decimal) {
-    if d.isZero() {
-        b.addByte(0x80)
-        return
-    }
-    // trailing zeros dropped: equal values (1.5, 1.50) have one key
-    var digs = d.coefficient().toStr()
-    var nd = len(digs)
-    while nd > 1 && digs[nd - 1] == '0' { nd -= 1 }
-    let ex = len(digs) + d.exponent() + 0x40000000
-    digs = digs[0..nd]
-    if d.isNeg() {
-        b.addByte(0x7F)
-        binary.addU32BE(b, 0x7FFFFFFF - ex)
-        for i in 0..len(digs) { b.addByte(0xFF - digs[i]) }
-        b.addByte(0xFF)
-    } else {
-        b.addByte(0x81)
-        binary.addU32BE(b, ex)
-        for i in 0..len(digs) { b.addByte(digs[i]) }
-        b.addByte(0)
-    }
-}
-
-// An index's key part: a marker first so that NULL has a place, last as
-// PostgreSQL sorts it: 1 a value, 2 NULL.
-fn encIdxPart(b: mut &StrBuf, v: &Val) {
-    if isNull(v) {
-        b.addByte(2)
-        return
-    }
-    b.addByte(1)
-    encKeyPart(b, v)
-}
-
 // A column, bare or under a collation's key (#ci(col), #pad(col)): its
 // name and the kind; name "" when x is neither.
 type KeyedCol = value record { name: str; kind: int }
@@ -2968,41 +2888,6 @@ fn keyedCol(x: &Expr): KeyedCol {
         else {}
     }
     return KeyedCol{name: "", kind: lexdb_sql.COLL_EXACT}
-}
-
-// The key of a row: its primary key's values, in byte order = SQL order.
-fn keyOf(t: &Table, row: &[]Val): str {
-    var b = newStrBuf()
-    for i in t.pk { encKeyPart(mut &b, &collKeyVal(&t.cols[i], &row[i])) }
-    return b.toStr()
-}
-
-// The collation kind of a column (L2): lexdb_sql.COLL_*, a text column's.
-fn colCollKind(c: &lexdb_sql.ColDef): int {
-    if c.typ.kind != lexdb_sql.K_TEXT || len(c.coll) == 0 { return lexdb_sql.COLL_EXACT }
-    return lexdb_sql.collKind(&c.coll)
-}
-
-// A column's value as its keys hold it (L2): under a case-insensitive
-// collation its ciKey, under SQL Server's others its trailing spaces
-// dropped; else itself. The row holds the value.
-fn collKeyVal(c: &lexdb_sql.ColDef, v: &Val): Val {
-    let k = colCollKind(c)
-    if k == lexdb_sql.COLL_EXACT { return v }
-    match v {
-        Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
-        else { return v }
-    }
-}
-
-// The smallest string after every string that starts with s ("" when there
-// is none: the end of the tree).
-fn succ(s: &str): str {
-    var bs = strToBytes(s)
-    while len(bs) > 0 && bs[len(bs) - 1] == 0xFF { let x = pop(mut &bs) }
-    if len(bs) == 0 { return "" }
-    bs[len(bs) - 1] = bs[len(bs) - 1] + 1
-    return strFromBytes(&bs)
 }
 
 // A row's stored form: per column a tag (0 NULL, 1 int, 2 bool, 3 numeric,
@@ -3790,7 +3675,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var pkNums = 0
     let all: []bool = []
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
+    let sc = lexdb_access.wholeScan()
     // the primary key (optimizer 24; of one column too, optimizer 29): rows
     // come in its order, so each prefix's distinct values are counted where
     // it changes, its leading column's values by their runs (of several
@@ -4810,14 +4695,6 @@ fn figCost(f: &Fig, index: int, first: bool): int {
     return 120 + f.rows * (if index >= 0 { 450 } else if first { 17 } else { 120 })
 }
 
-type Scan = record {
-    empty: bool         // a bound is NULL: no row can match
-    point: bool         // one primary key (lo)
-    lo: str             // the keys [lo, hi) of the primary key or the index; hi "" for the end
-    hi: str
-    whole: bool         // the whole table, in primary key order, whatever the path's index
-}
-
 // One table of a query, in FROM order. Its rows join the rows of the tables
 // before it: looked up per row through its path when the path's values come
 // from them (a nested loop over a key or an index), else read once and
@@ -5728,7 +5605,7 @@ fn likeBounds(c: &Expr, col: &str, q: &Query, out: mut &[]Bound) {
                             let p = pre.toStr()
                             if len(p) == 0 { return }
                             append(out, Bound{op: ">=", val: Expr.Lit(Val.Text(p))})
-                            let next = succ(&p)
+                            let next = lexdb_access.succ(&p)
                             if next != "" { append(out, Bound{op: "<", val: Expr.Lit(Val.Text(next))}) }
                         }
                         else {}
@@ -7398,10 +7275,6 @@ fn pathCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, p: &Pat
     return Ok(cur)
 }
 
-fn encPart(b: mut &StrBuf, v: &Val, index: bool) {
-    if index { encIdxPart(b, v) } else { encKeyPart(b, v) }
-}
-
 // The keys a path covers, its values evaluated now.
 // A column's type for its bounds: a value too long for varchar(n) is not
 // an error there, it only matches nothing.
@@ -7414,17 +7287,14 @@ fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     if len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 { return Ok([try pathScan(t, p, env)]) }
     if p.inSub >= 0 && len(env.subs[p.inSub].vals) > (if p.inMax > IN_LOOKUP_MAX { p.inMax } else { IN_LOOKUP_MAX }) {
-        return Ok([Scan{empty: false, point: false, lo: "", hi: "", whole: true}])
+        return Ok([lexdb_access.wholeScan()])
     }
-    let ix = p.index >= 0
-    let cols = keyCols(t, p.index)
-    var prefix = newStrBuf()
+    var eqs: []Val = []
     for k in 0..len(p.eqs) {
         let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok([]) } }
         if isNull(&v) { return Ok([]) }
-        encPart(mut &prefix, &v, ix)
+        append(mut &eqs, v)
     }
-    let pre = prefix.toStr()
     let typ = keyType(t, p.index, len(p.eqs))
     // values of another class than the column's (a float for a numeric, a
     // timestamp for a date): = does not compare them as the column's type,
@@ -7433,7 +7303,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     // condition decides
     if p.inSub >= 0 {
         let sc = env.subs[p.inSub].cls
-        if sc != -2 && sc != typeClass(&typ) { return Ok([Scan{empty: false, point: false, lo: "", hi: "", whole: true}]) }
+        if sc != -2 && sc != typeClass(&typ) { return Ok([lexdb_access.wholeScan()]) }
     }
     var vs: []Val = []
     if p.inSub >= 0 {
@@ -7472,29 +7342,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
             }
         }
     }
-    var keys: []str = []
-    for v in vs {
-        if isNull(&v) { continue }
-        var kb = newStrBuf()
-        kb.add(&pre)
-        encPart(mut &kb, &v, ix)
-        append(mut &keys, kb.toStr())
-    }
-    collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) })
-    let point = !ix && len(p.eqs) + 1 == len(cols)
-    var out: []Scan = []
-    for i in 0..len(keys) {
-        if i > 0 && keys[i] == keys[i - 1] { continue }
-        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: "", whole: false}) } else {
-            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i]), whole: false})
-        }
-    }
-    if p.desc {
-        var rev: []Scan = []
-        while len(out) > 0 { append(mut &rev, pop(mut &out)) }
-        return Ok(rev)
-    }
-    return Ok(out)
+    return Ok(lexdb_access.inScans(&relOf(t), p.index, &eqs, &vs, p.desc))
 }
 
 // A key's value v as the column's type (for its bounds: keyType, boundType):
@@ -7512,83 +7360,26 @@ fn keyVal(v: Val, typ: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Option[
 }
 
 fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
-    let none = Scan{empty: true, point: false, lo: "", hi: "", whole: false}
-    let ix = p.index >= 0
-    let cols = keyCols(t, p.index)
-    var prefix = newStrBuf()
+    var eqs: []Val = []
     for k in 0..len(p.eqs) {
-        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok(none) } }
-        if isNull(&v) { return Ok(none) }
-        encPart(mut &prefix, &v, ix)
+        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok(lexdb_access.noScan()) } }
+        if isNull(&v) { return Ok(lexdb_access.noScan()) }
+        append(mut &eqs, v)
     }
-    let pre = prefix.toStr()
-    if !ix && len(p.eqs) == len(cols) { return Ok(Scan{empty: false, point: true, lo: pre, hi: "", whole: false}) }
-    var lo = pre
-    var hi = if len(pre) > 0 { succ(&pre) } else { "" }
-    if len(p.rng) > 0 {
+    var los: []Val = []
+    var his: []Val = []
+    if len(p.rng) > 0 && (p.index >= 0 || len(p.eqs) < len(t.pk)) {
         let typ = keyType(t, p.index, len(p.eqs))
         for b in p.rng {
             let v = try coerceZ(try eval(&b.val, env), &typ, &envZone(env))
-            if isNull(&v) { return Ok(none) }
-            var kb = newStrBuf()
-            kb.add(&pre)
-            encPart(mut &kb, &v, ix)
-            let kv = kb.toStr()
-            if b.op == ">" || b.op == ">=" {
-                if kv > lo { lo = kv }
-            } else {
-                // Inclusive even for <: the value coerced to the column's type
-                // may have been rounded. Every row is checked against the WHERE.
-                let s = succ(&kv)
-                if s != "" && (hi == "" || s < hi) { hi = s }
-            }
+            if isNull(&v) { return Ok(lexdb_access.noScan()) }
+            if b.op == ">" || b.op == ">=" { append(mut &los, v) } else { append(mut &his, v) }
         }
     }
-    if ix && (len(p.rng) > 0 || p.noNulls) {
-        {
-            // An index's NULLs sort last (marker 2): no range includes them.
-            var nb = newStrBuf()
-            nb.add(&pre)
-            nb.addByte(2)
-            let nk = nb.toStr()
-            if hi == "" || nk < hi { hi = nk }
-        }
-    }
-    return Ok(Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
+    return Ok(lexdb_access.rangeScan(&relOf(t), p.index, &eqs, &los, &his, p.noNulls))
 }
 
 const BATCH = 256
-
-type Cursor = record { at: str; started: bool; done: bool }
-
-fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false} }
-
-// The scans of a primary key path from key from on (a batched statement's resume): a point before it is dropped, a range starts
-// at it at the latest, and the whole table is a range from it.
-fn afterScans(scans: &[]Scan, from: &str): []Scan {
-    var out: []Scan = []
-    for sc in scans {
-        if sc.empty { append(mut &out, Scan{empty: true, point: false, lo: "", hi: "", whole: false}); continue }
-        if sc.point {
-            if sc.lo >= from { append(mut &out, Scan{empty: false, point: true, lo: sc.lo, hi: "", whole: false}) }
-            continue
-        }
-        var lo = if sc.whole { "" } else { sc.lo }
-        let hi = if sc.whole { "" } else { sc.hi }
-        if lo < from { lo = from.toStr() }
-        if len(hi) > 0 && lo >= hi { continue }
-        append(mut &out, Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
-    }
-    return out
-}
-
-// The smallest key after k.
-fn after(k: &str): str {
-    var b = newStrBuf()
-    b.add(&k)
-    b.addByte(0)
-    return b.toStr()
-}
 
 // Appends up to BATCH rows of a scan to out, from the cursor on. Rows are
 // read in batches so that what is done with them (a join's lookups, an
@@ -7670,7 +7461,7 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
             return len(vals) < BATCH
         })
         }
-        if len(vals) < BATCH { cur.done = true } else { cur.at = after(&last) }
+        if len(vals) < BATCH { cur.done = true } else { cur.at = lexdb_access.after(&last) }
     }
     for k in 0..len(vals) {
         if !byIndex {
@@ -8494,7 +8285,7 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
             if try countRows(st, txn, t, most) <= most { return Ok(1) }
             return Ok(2)
         }
-        from = after(&last)
+        from = lexdb_access.after(&last)
         // the planner chose this range from its samples: no count
         if decided { return Ok(2) }
         let most = switchMost(txn.sql.rules, lim)
@@ -8821,11 +8612,11 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         var keys: []str = []
         var byKeys = false
         // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
-        if k == 0 && len(rs.after) > 0 && lv.path.index < 0 { scans = afterScans(&scans, &rs.after) }
+        if k == 0 && len(rs.after) > 0 && lv.path.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
         if k == 0 {
             let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
             if how == 1 {
-                scans = [Scan{empty: false, point: false, lo: "", hi: "", whole: true}]
+                scans = [lexdb_access.wholeScan()]
             } else if how == 0 {
                 byKeys = true
             }
@@ -11717,7 +11508,7 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
     if !ix.unique || (try hasNull(t, ix, row)) { return Ok(Unit{}) }
     let pre = try idxPrefix(t, ix, row)
     var clash = false
-    try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
+    try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
         if en.val != pk {
             clash = true
             return false
@@ -12534,7 +12325,7 @@ fn renameCol(x: &Expr, from: &str, to: &str): Expr {
 // Whether the table has a row (col < 0), or a row whose column col is NULL.
 fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    let sc = lexdb_access.allScan()
     var need: []bool = []
     if col >= 0 {
         for i in 0..len(t.cols) { append(mut &need, i == col) }
@@ -12930,7 +12721,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         }
     } else {
         let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-        let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+        let sc = lexdb_access.allScan()
         var cur = newCursor()
         while !cur.done {
             var batch: [][]Val = []
@@ -13718,7 +13509,7 @@ fn pruneInvalid(t: mut &Table) {
 // The rows of t against check c (23514).
 fn checkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &Check): Result[Unit, DbErr] {
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    let sc = lexdb_access.allScan()
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
@@ -13958,7 +13749,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 // columns, none NULL (the tree is new, so they are all there is to check).
 fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    let sc = lexdb_access.allScan()
     var cur = newCursor()
     var ents: []str = []
     var pks: []str = []
@@ -14723,7 +14514,7 @@ fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: 
             if (try hasNull(t, ix, row)) || !(try inIndex(t, ix, row)) { continue }
             let pre = try idxPrefix(t, ix, row)
             var hit: []str = []
-            try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
+            try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
                 append(mut &hit, en.val)
                 return false
             })
@@ -15090,7 +14881,7 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 total += win.count
                 tries = 0
                 if !win.full { break }
-                if win.keyed { win.after = after(&win.last) }
+                if win.keyed { win.after = lexdb_access.after(&win.last) }
             }
             Err(x) {
                 // a conflict: this batch again, from the same key
@@ -15245,21 +15036,21 @@ fn rdExactCol(c: &lexdb_sql.ColDef): bool {
 // and an upper bound on the next (in an index: each part under its marker).
 fn rdRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val], upIncl: bool, ix: bool): RdRange {
     var pb = newStrBuf()
-    for v in eqs { encPart(mut &pb, &v, ix) }
+    for v in eqs { lexdb_access.encPart(mut &pb, &v, ix) }
     let p = pb.toStr()
     var lo = p
-    var hi = if len(p) > 0 { succ(&p) } else { "" }
+    var hi = if len(p) > 0 { lexdb_access.succ(&p) } else { "" }
     match lower {
         Some(v) {
             var kb = newStrBuf()
             kb.add(&p)
-            encPart(mut &kb, &v, ix)
+            lexdb_access.encPart(mut &kb, &v, ix)
             let e = kb.toStr()
             if lowIncl {
                 lo = e
             } else {
                 // just after every key that starts with e; none: nothing is above it
-                let n = succ(&e)
+                let n = lexdb_access.succ(&e)
                 if n == "" { return RdRange{lo: "", hi: "", empty: true} }
                 lo = n
             }
@@ -15270,10 +15061,10 @@ fn rdRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val],
         Some(v) {
             var kb = newStrBuf()
             kb.add(&p)
-            encPart(mut &kb, &v, ix)
+            lexdb_access.encPart(mut &kb, &v, ix)
             let e = kb.toStr()
             // (inclusive with nothing after e: to the end, no tighter than hi)
-            let h = if upIncl { succ(&e) } else { e }
+            let h = if upIncl { lexdb_access.succ(&e) } else { e }
             if h != "" && (hi == "" || h < hi) { hi = h }
         }
         None {}
@@ -15463,7 +15254,7 @@ fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, lo: 
         }
         count += len(keys)
         if len(keys) < BATCH { break }
-        from = after(&keys[len(keys) - 1])
+        from = lexdb_access.after(&keys[len(keys) - 1])
     }
     return Ok(count)
 }
@@ -19129,7 +18920,7 @@ fn winBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         var cur = newCursor()
         var rowPath = false
         while !cur.done {
-            let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
+            let saved = cur.copy()
             let got = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar())
             if got.isNone() {
                 cur = saved
@@ -20975,7 +20766,7 @@ fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &
     let ix = &p.indexes[fc.via]
     let pre = try idxPrefix(p, ix, &prow)
     var found = false
-    try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
+    try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
         found = true
         return false
     })
@@ -20996,13 +20787,13 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     var crow = nullRow(len(c.cols))
     for j in 0..n { crow[cols[j]] = vals[j] }
     var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    var sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    var sc = lexdb_access.allScan()
     if prefixSame(&c.pk, n, cols) {
         var b = newStrBuf()
         for j in 0..n { encKeyPart(mut &b, &collKeyVal(&c.cols[c.pk[j]], &crow[c.pk[j]])) }
         let pre = b.toStr()
         sc.lo = pre
-        sc.hi = succ(&pre)
+        sc.hi = lexdb_access.succ(&pre)
     } else {
         for k in 0..len(c.indexes) {
             if path.index < 0 && c.indexes[k].pred.isNone() && prefixSame(&c.indexes[k].cols, n, cols) {
@@ -21011,7 +20802,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
                 let pre = b.toStr()
                 path.index = k
                 sc.lo = pre
-                sc.hi = succ(&pre)
+                sc.hi = lexdb_access.succ(&pre)
             }
         }
     }
@@ -21464,7 +21255,7 @@ fn fkName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &lexd
 fn fkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, f: &ForeignKey, p: &Table): Result[Unit, DbErr] {
     let fc = fkCols(t, f, p)
     let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
+    let sc = lexdb_access.allScan()
     var cur = newCursor()
     while !cur.done {
         var batch: [][]Val = []
@@ -25355,7 +25146,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
                 }
                 None {}
             }
-            cur.at = after(&stopKey)
+            cur.at = lexdb_access.after(&stopKey)
             continue
         }
         cur.done = true
@@ -25936,7 +25727,7 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
                 }
                 None {}
             }
-            cur.at = after(&stopKey)
+            cur.at = lexdb_access.after(&stopKey)
             continue
         }
         cur.done = true
@@ -26230,7 +26021,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     let all = len(conds) == len(lv.cond)
     var scans = try pathScans(t, p, &env)
     // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
-    if len(rs.after) > 0 && p.index < 0 { scans = afterScans(&scans, &rs.after) }
+    if len(rs.after) > 0 && p.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
     var rd = noIxRead()
     if p.index >= 0 {
         rd.ix = p.index
@@ -26244,7 +26035,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         } else {
             var keys: []str = []
             let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
-            if how == 1 { scans = [Scan{empty: false, point: false, lo: "", hi: "", whole: true}] }
+            if how == 1 { scans = [lexdb_access.wholeScan()] }
             // its range's keys, counted (at most a batch): read once
             if how == 0 && len(keys) <= BROWS && !p.desc {
                 rd.byKeys = true
@@ -26392,7 +26183,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                     continue
                 }
                 var kb = newStrBuf()
-                encPart(mut &kb, &v, lv.path.index >= 0)
+                lexdb_access.encPart(mut &kb, &v, lv.path.index >= 0)
                 if b.op == ">" || b.op == ">=" { append(mut &loSuf, kb.toStr()) } else { append(mut &hiSuf, kb.toStr()) }
             }
         }
@@ -26964,7 +26755,7 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
                 Ok(got) {
                     match got {
                         Some(x) {
-                            if isNull(&x) { none = true } else { encPart(mut &kb, &x, false) }
+                            if isNull(&x) { none = true } else { lexdb_access.encPart(mut &kb, &x, false) }
                         }
                         None { none = true }
                     }
@@ -27124,7 +26915,7 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
                 Ok(got) {
                     match got {
                         Some(x) {
-                            if isNull(&x) { none = true } else { encPart(mut &kb, &x, ix) }
+                            if isNull(&x) { none = true } else { lexdb_access.encPart(mut &kb, &x, ix) }
                         }
                         None { none = true }
                     }
@@ -27186,13 +26977,13 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
         append(mut &lo, if ix && !only { len(pks) } else { rows.n })
         // the key's range: its prefix's, narrowed by the bounds (pathScan's)
         var rlo = ks[x]
-        var rhi = succ(&ks[x])
+        var rhi = lexdb_access.succ(&ks[x])
         for sf in jl.loSuf {
             let lk = ks[x] + sf
             if lk > rlo { rlo = lk }
         }
         for sf in jl.hiSuf {
-            let sv = succ(&(ks[x] + sf))
+            let sv = lexdb_access.succ(&(ks[x] + sf))
             if sv != "" && (rhi == "" || sv < rhi) { rhi = sv }
         }
         if jl.capNulls {
@@ -27919,7 +27710,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         var rowPath = false
         var spare = noRows()            // the last batch, used again (bReuse)
         while !cur.done {
-            let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
+            let saved = cur.copy()
             // (decoded in two steps: 9.108)
             let got = try fillPickIn(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar(), mut &spare)
             if got.isNone() {
@@ -28662,7 +28453,7 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
         var rowPath = false
         var spare = noRows()            // the last batch, used again (bReuse)
         while !cur.done {
-            let saved = Cursor{at: cur.at, started: cur.started, done: cur.done}
+            let saved = cur.copy()
             let got = try fillPickIn(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &noBar(), mut &spare)
             if got.isNone() {
                 cur = saved
@@ -28971,7 +28762,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         } else {
             var swKeys: []str = []
             let how = try firstSwitch(st, txn, q, &scans, rs, mut &swKeys)
-            if how == 1 { scans = [Scan{empty: false, point: false, lo: "", hi: "", whole: true}] }
+            if how == 1 { scans = [lexdb_access.wholeScan()] }
             // its range's keys, counted (at most a batch): read once
             if how == 0 && len(swKeys) <= BROWS && !p.desc {
                 rd.byKeys = true
@@ -29467,6 +29258,28 @@ pub fn treeDump(st: &lexdb_store.Store, name: &str): str {
     return strings.join(&out, "; ")
 }
 
+// ---- lexdb_access: a relation's layout, keys and ranges
+
+type Scan = lexdb_access.Scan
+type Cursor = lexdb_access.Cursor
+
+fn relOf(t: &Table): lexdb_access.Rel { return lexdb_catalog.relOf(t) }
+fn newCursor(): Cursor { return lexdb_access.newCursor() }
+
+// A row's key: its identity in its table (locks, rows already changed).
+fn keyOf(t: &Table, row: &[]Val): str { return lexdb_access.keyOf(&relOf(t), row) }
+
+// The order-preserving value encoding (lexdb_access), for keys held in
+// memory: groups, hashes, partitions, statistics.
+fn encKeyPart(b: mut &StrBuf, v: &Val) { lexdb_access.encKeyPart(b, v) }
+fn encIdxPart(b: mut &StrBuf, v: &Val) { lexdb_access.encIdxPart(b, v) }
+fn encNum(b: mut &StrBuf, d: &Decimal) { lexdb_access.encNum(b, d) }
+fn floatKey(x: float): int { return lexdb_access.floatKey(x) }
+fn colCollKind(c: &lexdb_sql.ColDef): int { return lexdb_access.colCollKind(c) }
+fn collKeyVal(c: &lexdb_sql.ColDef, v: &Val): Val { return lexdb_access.collKeyVal(c, v) }
+pub fn ciKey(s: &str): str { return lexdb_access.ciKey(s) }
+pub fn padKey(s: &str): str { return lexdb_access.padKey(s) }
+
 fn rowsFor(t: &Table): lexdb_rows.Rows {
     return lexdb_rows.Rows{layouts: &t.layouts, cols: &t.cols, slots: &t.slots, width: rowWidth(t), lays: &t.lays}
 }
@@ -29897,134 +29710,6 @@ fn jsonText(v: &Val): str {
 }
 
 // ---- collations (design/lexdb-tds.md L2)
-
-// The key of a text under SQL Server's default collation (L2): equal for
-// texts it holds equal, in its order, byte by byte. From lexdb_sqlcoll's
-// table (generated from SQL Server): a combining mark after a letter
-// composed with it where there is one letter for both; trailing spaces and
-// ignored characters dropped; then each letter's primary weight (3 bytes;
-// an expansion, as ae for ae's ligature, two), 0 0 0, each letter's
-// secondary weight (its accent: 2 bytes; a combining mark left over adds
-// to its letter's), and each hyphen-like mark: how many letters before it
-// (2 bytes), its weight. Case is in none of them.
-pub fn ciKey(s: &str): str {
-    var cps: []int = []
-    var i = 0
-    while i < len(s) {
-        let d = strings.decodeAt(&s, i)
-        i += d.size
-        let r = d.rune
-        let n = len(cps)
-        if n > 0 && collClass(collAt(r)) == 2 {
-            let c = collCompose(cps[n - 1], r)
-            if c >= 0 && collClass(collAt(c)) == 1 {
-                cps[n - 1] = c
-                continue
-            }
-        }
-        append(mut &cps, r)
-    }
-    while len(cps) > 0 && (cps[len(cps) - 1] == 32 || collClass(collAt(cps[len(cps) - 1])) == 0) { let x = pop(mut &cps) }
-    var prim = newStrBuf()
-    var sec: []int = []
-    var spec = newStrBuf()
-    for cp in cps {
-        let v = collAt(cp)
-        let k = collClass(v)
-        if k == 0 { continue }
-        if k == 2 {
-            if len(sec) > 0 { sec[len(sec) - 1] += 1000 + (v & 0xFFFFFF) }
-            continue
-        }
-        if k == 3 {
-            binary.addU16BE(mut &spec, len(sec))
-            spec.addByte(byte(v & 0xFF))
-            continue
-        }
-        let e = collExpansion(cp)
-        if e >= 0 {
-            let at = int(lexdb_sqlcoll.EXP_AT[e])
-            for j in 0..int(lexdb_sqlcoll.EXP_N[e]) {
-                let el = int(lexdb_sqlcoll.EXP_EL[at + j])
-                addU24(mut &prim, el >> 8)
-                append(mut &sec, el & 0xFF)
-            }
-        } else if v < 0 {
-            addU24(mut &prim, (1 << 20) + cp)       // not in the table: after all of it
-            append(mut &sec, 0)
-        } else {
-            addU24(mut &prim, (v >> 8) & 0xFFFF)
-            append(mut &sec, v & 0xFF)
-        }
-    }
-    addU24(mut &prim, 0)
-    for x in sec { binary.addU16BE(mut &prim, x + 1) }
-    prim.add(&spec.toStr())
-    return prim.toStr()
-}
-
-fn addU24(b: mut &StrBuf, x: int) {
-    b.addByte(byte((x >> 16) & 0xFF))
-    b.addByte(byte((x >> 8) & 0xFF))
-    b.addByte(byte(x & 0xFF))
-}
-
-// A code point's value in lexdb_sqlcoll's table (kind << 24 | data), -1
-// if it is in none of its runs.
-fn collAt(cp: int): int {
-    if cp >= 0 && cp < 128 { return int(lexdb_sqlcoll.ASCII[cp]) }
-    var lo = 0
-    var hi = len(lexdb_sqlcoll.RUN_START)
-    while lo < hi {
-        let m = (lo + hi) / 2
-        if int(lexdb_sqlcoll.RUN_START[m]) <= cp { lo = m + 1 } else { hi = m }
-    }
-    let i = lo - 1
-    if i < 0 { return -1 }
-    let st = int(lexdb_sqlcoll.RUN_START[i])
-    if cp >= st + int(lexdb_sqlcoll.RUN_LEN[i]) { return -1 }
-    return int(lexdb_sqlcoll.RUN_VAL[i]) + (cp - st) * int(lexdb_sqlcoll.RUN_STEP[i])
-}
-
-// Its kind: 0 ignored, 1 a letter (one not in the table too), 2 a
-// combining mark, 3 hyphen-like.
-fn collClass(v: int): int { return if v < 0 { 1 } else { v >> 24 } }
-
-// The letter a letter and a combining mark make, -1 none.
-fn collCompose(base: int, mark: int): int {
-    var lo = 0
-    var hi = len(lexdb_sqlcoll.COMP_BASE)
-    while lo < hi {
-        let m = (lo + hi) / 2
-        let b = int(lexdb_sqlcoll.COMP_BASE[m])
-        let k = int(lexdb_sqlcoll.COMP_MARK[m])
-        if b < base || (b == base && k < mark) { lo = m + 1 } else { hi = m }
-    }
-    if lo < len(lexdb_sqlcoll.COMP_BASE) && int(lexdb_sqlcoll.COMP_BASE[lo]) == base && int(lexdb_sqlcoll.COMP_MARK[lo]) == mark {
-        return int(lexdb_sqlcoll.COMP_TO[lo])
-    }
-    return -1
-}
-
-// An expansion's number, -1 if cp is none.
-fn collExpansion(cp: int): int {
-    var lo = 0
-    var hi = len(lexdb_sqlcoll.EXP_CP)
-    while lo < hi {
-        let m = (lo + hi) / 2
-        if int(lexdb_sqlcoll.EXP_CP[m]) < cp { lo = m + 1 } else { hi = m }
-    }
-    if lo < len(lexdb_sqlcoll.EXP_CP) && int(lexdb_sqlcoll.EXP_CP[lo]) == cp { return lo }
-    return -1
-}
-
-// A text's key under SQL Server's case-sensitive collations: its trailing
-// spaces dropped.
-pub fn padKey(s: &str): str {
-    var end = len(s)
-    while end > 0 && s[end - 1] == ' ' { end -= 1 }
-    return s[0..end].toStr()
-}
 
 // A text with its case folded as ciKey folds it, its spaces kept.
 fn ciFold(s: &str): str {

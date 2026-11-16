@@ -7,6 +7,9 @@
 - A dialect's behavior module imports only its own family's modules (plus
   core). A protocol module (wire, TDS, TNS) composes the dialect it serves.
 - A dialect's data module imports nothing but core.
+- The storage stack is layered (design/lexdb-layers.md 4): lexdb_access
+  (layer 2, how a relation is laid out in trees) imports only the store, the
+  row codecs and the vocabulary below it; nothing below it imports it.
 - No cycle.
 
 Run by lexdb.py before the tests; also usable directly.
@@ -20,7 +23,7 @@ CMD = os.path.normpath(os.path.join(HERE, "..", "..", "cmd"))
 IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
-    "lexdb_base", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
+    "lexdb_access", "lexdb_base", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_vec",
@@ -54,6 +57,14 @@ KNOWN_CORE_DIALECT = {
     ("lexdb_exec", "lexdb_auth"),
 }
 
+# The access layer (design/lexdb-layers.md 4.2) sits above the store and the
+# row codecs and below the catalog, the planner and the executor: what it may
+# import, and the modules below it, which may not import it.
+ACCESS = "lexdb_access"
+ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like"}
+BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_disk", "lexdb_locks", "lexdb_memo",
+                "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect"}
+
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
 PARSER_DATA = "lexdb_dialect"
@@ -82,6 +93,7 @@ def family(m):
 
 def check():
     mods = read_modules()
+    bad = []
     # The store carries a transaction's SQL state (Txn.sql) and must not
     # read it: the boundary is what keeps storage and SQL session state
     # separable.
@@ -91,7 +103,12 @@ def check():
     sql_fields = re.findall(r"\.sql\.(?:path|sess|rules|memMax|now|zone|pending|consAll|consNames|consDeferred)\b", body)
     if sql_fields:
         bad.append("lexdb_store reads Txn.sql: " + ", ".join(sorted(set(sql_fields))))
-    bad = []
+    for d in mods.get(ACCESS, []):
+        if d not in ACCESS_MAY:
+            bad.append(f"{ACCESS} -> {d}: the access layer imports above the store and the row codecs")
+    for m in sorted(BELOW_ACCESS):
+        if ACCESS in mods.get(m, []):
+            bad.append(f"{m} -> {ACCESS}: a module below the access layer imports it")
     for m in sorted(set(mods) - CORE - DIALECT):
         bad.append(f"{m}: not in the core or dialect sets")
 

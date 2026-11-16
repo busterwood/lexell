@@ -1,0 +1,493 @@
+// lexdb_access: how a relation is laid out in the store's trees
+// (design/lexdb-layers.md 4.2). Its secret: a table's rows live in the
+// tree of its primary key (the hidden row id's when it has none), their
+// key its primary key's columns encoded so that byte order is SQL order,
+// their value the row (lexdb_rows' codecs: column leaves at rest, a row
+// with large values stored apart); a secondary index is a tree of its own
+// whose entries are its columns (each after a NULL marker) then the
+// primary key, the primary key the value.
+//
+// Above it, a relation is a Rel (a table's layout, lent by the catalog), a
+// range of it a Scan made from bound values, and its rows come out as
+// rows of values or as batches (lexdb_rows.Batch). Nothing above reads a
+// key's bytes or a leaf.
+import "binary"
+import "strings"
+import "math"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_rows"
+import "./lexdb_store"
+import "./lexdb_time"
+import "./lexdb_sqlcoll"
+import "./lexdb_like"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type DbErr = lexdb_base.DbErr
+type FixedLay = lexdb_rows.FixedLay
+type Batch = lexdb_rows.Batch
+type BPlan = lexdb_rows.Projection
+
+// A secondary index: its tree, and per part its table's column (-1: its
+// expression's in exprs). The catalog's metadata (its name, a constraint's,
+// how it is shown) travels with it.
+pub type Index = record {
+    pub name: str
+    pub tree: int
+    pub cols: []int
+    pub unique: bool
+    pub pred: Option[Expr]      // a filtered index: the rows it holds (column names bare)
+    pub con: bool               // a UNIQUE constraint's (9.39): dropped with the constraint, not by DROP INDEX
+    pub opts: []str             // per column, its options as shown (opclass, DESC, NULLS ...: 9.85); [] none
+    // per column, an expression's (9.89): where cols holds -1, its value is
+    // exprs' (column names bare); [] none
+    pub exprs: []Expr
+}
+
+// A relation as it is laid out: its table's trees, columns, primary key,
+// indexes and row layouts (lexdb_catalog.relOf lends them from its Table).
+pub type Rel = value record {
+    pub name: &str
+    pub tree: int
+    pub cols: &[]lexdb_sql.ColDef
+    pub pk: &[]int
+    pub indexes: &[]Index
+    pub slots: &[]int           // where each column is in a stored row ([] column i at i)
+    pub width: int              // the places a row has, with slots
+    pub layouts: &[][]byte
+    pub lays: &[]FixedLay
+}
+
+fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
+}
+
+// The places a stored row has: its table's columns, and dropped ones.
+pub fn rowWidth(t: &Rel): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
+
+pub fn rowsFor(t: &Rel): lexdb_rows.Rows {
+    return lexdb_rows.Rows{layouts: t.layouts, cols: t.cols, slots: t.slots, width: rowWidth(t), lays: t.lays}
+}
+
+// ---- keys: a value in byte order = SQL order
+
+pub fn encKeyPart(b: mut &StrBuf, v: &Val) {
+    match v {
+        Val.Int(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Date(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Time(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Ts(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Tstz(n) { binary.addU64BE(b, n ^ (-9223372036854775807 - 1)) }
+        Val.Ival(iv) {
+            // as PostgreSQL compares intervals: a month as 30 days, then the time of day left
+            let k = lexdb_time.ivalKey(&iv)
+            binary.addU64BE(b, k.days ^ (-9223372036854775807 - 1))
+            binary.addU64BE(b, k.us ^ (-9223372036854775807 - 1))
+        }
+        Val.Bool(x) { b.addByte(if x { 1 } else { 0 }) }
+        Val.Num(d) { encNum(b, &d) }
+        Val.Text(s) { encBytesKey(b, &s) }
+        Val.Uuid(u) { encBytesKey(b, &u) }       // its lowercase form sorts as its bytes do
+        Val.Float(x) { binary.addU64BE(b, floatKey(x)) }
+        Val.Real(x) { binary.addU64BE(b, floatKey(x)) }
+        Val.Reg(o, _) { binary.addU64BE(b, o ^ (-9223372036854775807 - 1)) }
+        Val.Bytes(x) { encBytesKey(b, &x) }
+        else {}
+    }
+}
+
+// Bytes in key order: a 0 byte as 0 FF, the end as 0 0.
+fn encBytesKey(b: mut &StrBuf, s: &str) {
+    for i in 0..len(s) {
+        b.addByte(s[i])
+        if s[i] == 0 { b.addByte(0xFF) }
+    }
+    b.addByte(0)
+    b.addByte(0)
+}
+
+// A numeric in key order: 0x80 zero; 0x81, the exponent of its leading
+// digit, its digits, 00 positive; 0x7F and all of that complemented
+// negative. Decimal is canonical (no trailing zero digits), so equal values
+// have equal keys whatever their scale.
+pub fn encNum(b: mut &StrBuf, d: &Decimal) {
+    if d.isZero() {
+        b.addByte(0x80)
+        return
+    }
+    // trailing zeros dropped: equal values (1.5, 1.50) have one key
+    var digs = d.coefficient().toStr()
+    var nd = len(digs)
+    while nd > 1 && digs[nd - 1] == '0' { nd -= 1 }
+    let ex = len(digs) + d.exponent() + 0x40000000
+    digs = digs[0..nd]
+    if d.isNeg() {
+        b.addByte(0x7F)
+        binary.addU32BE(b, 0x7FFFFFFF - ex)
+        for i in 0..len(digs) { b.addByte(0xFF - digs[i]) }
+        b.addByte(0xFF)
+    } else {
+        b.addByte(0x81)
+        binary.addU32BE(b, ex)
+        for i in 0..len(digs) { b.addByte(digs[i]) }
+        b.addByte(0)
+    }
+}
+
+// An index's key part: a marker first so that NULL has a place, last as
+// PostgreSQL sorts it: 1 a value, 2 NULL.
+pub fn encIdxPart(b: mut &StrBuf, v: &Val) {
+    if isNull(v) {
+        b.addByte(2)
+        return
+    }
+    b.addByte(1)
+    encKeyPart(b, v)
+}
+
+pub fn encPart(b: mut &StrBuf, v: &Val, index: bool) {
+    if index { encIdxPart(b, v) } else { encKeyPart(b, v) }
+}
+
+// A float's key: its bits in an order that sorts as the values do, -0 as
+// 0, every NaN as one, after +Infinity.
+pub fn floatKey(x: float): int {
+    let bits = if x.isNaN() { 0x7ff8000000000000 } else if x == 0.0f { 0 } else { math.bitsOf(x) }
+    return if bits < 0 { ~bits } else { bits ^ (-9223372036854775807 - 1) }
+}
+
+// The key of a row: its primary key's values, in byte order = SQL order.
+pub fn keyOf(t: &Rel, row: &[]Val): str {
+    var b = newStrBuf()
+    for i in t.pk { encKeyPart(mut &b, &collKeyVal(&t.cols[i], &row[i])) }
+    return b.toStr()
+}
+
+// The collation kind of a column (L2): lexdb_sql.COLL_*, a text column's.
+pub fn colCollKind(c: &lexdb_sql.ColDef): int {
+    if c.typ.kind != lexdb_sql.K_TEXT || len(c.coll) == 0 { return lexdb_sql.COLL_EXACT }
+    return lexdb_sql.collKind(&c.coll)
+}
+
+// A column's value as its keys hold it (L2): under a case-insensitive
+// collation its ciKey, under SQL Server's others its trailing spaces
+// dropped; else itself. The row holds the value.
+pub fn collKeyVal(c: &lexdb_sql.ColDef, v: &Val): Val {
+    let k = colCollKind(c)
+    if k == lexdb_sql.COLL_EXACT { return v }
+    match v {
+        Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
+        else { return v }
+    }
+}
+
+// The smallest string after every string that starts with s ("" when there
+// is none: the end of the tree).
+pub fn succ(s: &str): str {
+    var bs = strToBytes(s)
+    while len(bs) > 0 && bs[len(bs) - 1] == 0xFF { let x = pop(mut &bs) }
+    if len(bs) == 0 { return "" }
+    bs[len(bs) - 1] = bs[len(bs) - 1] + 1
+    return strFromBytes(&bs)
+}
+
+// The smallest key after k.
+pub fn after(k: &str): str {
+    var b = newStrBuf()
+    b.add(&k)
+    b.addByte(0)
+    return b.toStr()
+}
+
+// ---- collations' keys (design/lexdb-tds.md L2)
+
+// The key of a text under SQL Server's default collation (L2): equal for
+// texts it holds equal, in its order, byte by byte. From lexdb_sqlcoll's
+// table (generated from SQL Server): a combining mark after a letter
+// composed with it where there is one letter for both; trailing spaces and
+// ignored characters dropped; then each letter's primary weight (3 bytes;
+// an expansion, as ae for ae's ligature, two), 0 0 0, each letter's
+// secondary weight (its accent: 2 bytes; a combining mark left over adds
+// to its letter's), and each hyphen-like mark: how many letters before it
+// (2 bytes), its weight. Case is in none of them.
+pub fn ciKey(s: &str): str {
+    var cps: []int = []
+    var i = 0
+    while i < len(s) {
+        let d = strings.decodeAt(&s, i)
+        i += d.size
+        let r = d.rune
+        let n = len(cps)
+        if n > 0 && collClass(collAt(r)) == 2 {
+            let c = collCompose(cps[n - 1], r)
+            if c >= 0 && collClass(collAt(c)) == 1 {
+                cps[n - 1] = c
+                continue
+            }
+        }
+        append(mut &cps, r)
+    }
+    while len(cps) > 0 && (cps[len(cps) - 1] == 32 || collClass(collAt(cps[len(cps) - 1])) == 0) { let x = pop(mut &cps) }
+    var prim = newStrBuf()
+    var sec: []int = []
+    var spec = newStrBuf()
+    for cp in cps {
+        let v = collAt(cp)
+        let k = collClass(v)
+        if k == 0 { continue }
+        if k == 2 {
+            if len(sec) > 0 { sec[len(sec) - 1] += 1000 + (v & 0xFFFFFF) }
+            continue
+        }
+        if k == 3 {
+            binary.addU16BE(mut &spec, len(sec))
+            spec.addByte(byte(v & 0xFF))
+            continue
+        }
+        let e = collExpansion(cp)
+        if e >= 0 {
+            let at = int(lexdb_sqlcoll.EXP_AT[e])
+            for j in 0..int(lexdb_sqlcoll.EXP_N[e]) {
+                let el = int(lexdb_sqlcoll.EXP_EL[at + j])
+                addU24(mut &prim, el >> 8)
+                append(mut &sec, el & 0xFF)
+            }
+        } else if v < 0 {
+            addU24(mut &prim, (1 << 20) + cp)       // not in the table: after all of it
+            append(mut &sec, 0)
+        } else {
+            addU24(mut &prim, (v >> 8) & 0xFFFF)
+            append(mut &sec, v & 0xFF)
+        }
+    }
+    addU24(mut &prim, 0)
+    for x in sec { binary.addU16BE(mut &prim, x + 1) }
+    prim.add(&spec.toStr())
+    return prim.toStr()
+}
+
+fn addU24(b: mut &StrBuf, x: int) {
+    b.addByte(byte((x >> 16) & 0xFF))
+    b.addByte(byte((x >> 8) & 0xFF))
+    b.addByte(byte(x & 0xFF))
+}
+
+// A code point's value in lexdb_sqlcoll's table (kind << 24 | data), -1
+// if it is in none of its runs.
+fn collAt(cp: int): int {
+    if cp >= 0 && cp < 128 { return int(lexdb_sqlcoll.ASCII[cp]) }
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.RUN_START)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.RUN_START[m]) <= cp { lo = m + 1 } else { hi = m }
+    }
+    let i = lo - 1
+    if i < 0 { return -1 }
+    let st = int(lexdb_sqlcoll.RUN_START[i])
+    if cp >= st + int(lexdb_sqlcoll.RUN_LEN[i]) { return -1 }
+    return int(lexdb_sqlcoll.RUN_VAL[i]) + (cp - st) * int(lexdb_sqlcoll.RUN_STEP[i])
+}
+
+// Its kind: 0 ignored, 1 a letter (one not in the table too), 2 a
+// combining mark, 3 hyphen-like.
+fn collClass(v: int): int { return if v < 0 { 1 } else { v >> 24 } }
+
+// The letter a letter and a combining mark make, -1 none.
+fn collCompose(base: int, mark: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.COMP_BASE)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        let b = int(lexdb_sqlcoll.COMP_BASE[m])
+        let k = int(lexdb_sqlcoll.COMP_MARK[m])
+        if b < base || (b == base && k < mark) { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.COMP_BASE) && int(lexdb_sqlcoll.COMP_BASE[lo]) == base && int(lexdb_sqlcoll.COMP_MARK[lo]) == mark {
+        return int(lexdb_sqlcoll.COMP_TO[lo])
+    }
+    return -1
+}
+
+// An expansion's number, -1 if cp is none.
+fn collExpansion(cp: int): int {
+    var lo = 0
+    var hi = len(lexdb_sqlcoll.EXP_CP)
+    while lo < hi {
+        let m = (lo + hi) / 2
+        if int(lexdb_sqlcoll.EXP_CP[m]) < cp { lo = m + 1 } else { hi = m }
+    }
+    if lo < len(lexdb_sqlcoll.EXP_CP) && int(lexdb_sqlcoll.EXP_CP[lo]) == cp { return lo }
+    return -1
+}
+
+// A text's key under SQL Server's case-sensitive collations: its trailing
+// spaces dropped.
+pub fn padKey(s: &str): str {
+    var end = len(s)
+    while end > 0 && s[end - 1] == ' ' { end -= 1 }
+    return s[0..end].toStr()
+}
+
+// ---- ranges
+
+// A range of a relation's tree: the keys [lo, hi) of its primary key or
+// an index ("" hi the end), one primary key, none, or the whole table.
+pub type Scan = record {
+    pub empty: bool     // a bound is NULL: no row can match
+    pub point: bool     // one primary key (lo)
+    pub lo: str
+    pub hi: str
+    pub whole: bool     // the whole table, in primary key order, whatever the path's index
+}
+
+// No row: a bound is NULL, or one its column cannot hold.
+pub fn noScan(): Scan { return Scan{empty: true, point: false, lo: "", hi: "", whole: false} }
+
+// The whole table in primary key order, whatever the path's index.
+pub fn wholeScan(): Scan { return Scan{empty: false, point: false, lo: "", hi: "", whole: true} }
+
+// Every entry of the path's tree: its index's, or the primary key's.
+pub fn allScan(): Scan { return Scan{empty: false, point: false, lo: "", hi: "", whole: false} }
+
+// Whether a and b read the same keys.
+pub fn sameScan(a: &Scan, b: &Scan): bool {
+    return a.empty == b.empty && a.point == b.point && a.whole == b.whole && a.lo == b.lo && a.hi == b.hi
+}
+
+// The number of a primary key's columns (ix -1) or index ix's parts.
+fn partCount(t: &Rel, ix: int): int { return if ix < 0 { len(t.pk) } else { len(t.indexes[ix].cols) } }
+
+// The keys of index ix (-1 the primary key) whose leading parts equal eqs
+// (bound to their columns' types, none NULL) and whose next part is at
+// least each of los and at most each of his. Both are inclusive: a bound
+// made its column's type may have been rounded, and every row is checked
+// against the WHERE. Through an index, its NULLs of the next part are left
+// out when it has bounds or noNulls. The whole primary key: one key.
+pub fn rangeScan(t: &Rel, ix: int, eqs: &[]Val, los: &[]Val, his: &[]Val, noNulls: bool): Scan {
+    let index = ix >= 0
+    var prefix = newStrBuf()
+    for v in eqs { encPart(mut &prefix, &v, index) }
+    let pre = prefix.toStr()
+    if !index && len(eqs) == partCount(t, ix) { return Scan{empty: false, point: true, lo: pre, hi: "", whole: false} }
+    var lo = pre
+    var hi = if len(pre) > 0 { succ(&pre) } else { "" }
+    for v in los {
+        var kb = newStrBuf()
+        kb.add(&pre)
+        encPart(mut &kb, &v, index)
+        let kv = kb.toStr()
+        if kv > lo { lo = kv }
+    }
+    for v in his {
+        var kb = newStrBuf()
+        kb.add(&pre)
+        encPart(mut &kb, &v, index)
+        let s = succ(&(kb.toStr()))
+        if s != "" && (hi == "" || s < hi) { hi = s }
+    }
+    if index && (len(los) + len(his) > 0 || noNulls) {
+        // an index's NULLs sort last (marker 2): no range includes them
+        var nb = newStrBuf()
+        nb.add(&pre)
+        nb.addByte(2)
+        let nk = nb.toStr()
+        if hi == "" || nk < hi { hi = nk }
+    }
+    return Scan{empty: false, point: false, lo: lo, hi: hi, whole: false}
+}
+
+// The keys of index ix (-1 the primary key) whose leading parts equal eqs
+// and whose next part is one of vals (bound to its column's type; a NULL
+// matches none), each once, in key order (backward when desc): a point
+// each where that makes the whole primary key, else a range.
+pub fn inScans(t: &Rel, ix: int, eqs: &[]Val, vals: &[]Val, desc: bool): []Scan {
+    let index = ix >= 0
+    var prefix = newStrBuf()
+    for v in eqs { encPart(mut &prefix, &v, index) }
+    let pre = prefix.toStr()
+    var keys: []str = []
+    for v in vals {
+        if isNull(&v) { continue }
+        var kb = newStrBuf()
+        kb.add(&pre)
+        encPart(mut &kb, &v, index)
+        append(mut &keys, kb.toStr())
+    }
+    collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    let point = !index && len(eqs) + 1 == partCount(t, ix)
+    var out: []Scan = []
+    for i in 0..len(keys) {
+        if i > 0 && keys[i] == keys[i - 1] { continue }
+        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: "", whole: false}) } else {
+            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i]), whole: false})
+        }
+    }
+    if desc {
+        var rev: []Scan = []
+        while len(out) > 0 { append(mut &rev, pop(mut &out)) }
+        return rev
+    }
+    return out
+}
+
+// A range's bounds after its leading equal parts, for many prefixes (a
+// join's lookups per row: rangeOf): the next part's bounds encoded once.
+pub type Tail = record {
+    lo: []str
+    hi: []str
+    capNulls: bool
+}
+
+pub fn noTail(): Tail { return Tail{lo: [], hi: [], capNulls: false} }
+
+// The bounds rangeScan puts on index ix's (-1 the primary key's) next part:
+// at least each of los, at most each of his; capNulls: an index's NULLs
+// left out.
+pub fn tailOf(ix: int, los: &[]Val, his: &[]Val, capNulls: bool): Tail {
+    var t = noTail()
+    t.capNulls = capNulls
+    for v in los {
+        var kb = newStrBuf()
+        encPart(mut &kb, &v, ix >= 0)
+        append(mut &t.lo, kb.toStr())
+    }
+    for v in his {
+        var kb = newStrBuf()
+        encPart(mut &kb, &v, ix >= 0)
+        append(mut &t.hi, kb.toStr())
+    }
+    return t
+}
+
+// Where a scan read in parts is: forward, the key to go on from; backward,
+// the end (exclusive).
+pub type Cursor = record { pub at: str; pub started: bool; pub done: bool }
+
+pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false} }
+
+pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at, started: c.started, done: c.done} }
+
+// The scans of a primary key path from key from on (a batched statement's resume): a point before it is dropped, a range starts
+// at it at the latest, and the whole table is a range from it.
+pub fn afterScans(scans: &[]Scan, from: &str): []Scan {
+    var out: []Scan = []
+    for sc in scans {
+        if sc.empty { append(mut &out, Scan{empty: true, point: false, lo: "", hi: "", whole: false}); continue }
+        if sc.point {
+            if sc.lo >= from { append(mut &out, Scan{empty: false, point: true, lo: sc.lo, hi: "", whole: false}) }
+            continue
+        }
+        var lo = if sc.whole { "" } else { sc.lo }
+        let hi = if sc.whole { "" } else { sc.hi }
+        if lo < from { lo = from.toStr() }
+        if len(hi) > 0 && lo >= hi { continue }
+        append(mut &out, Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
+    }
+    return out
+}
