@@ -184,6 +184,112 @@ Two properties make this the right seam for the mixed workload:
   ON CONFLICT and range delete all reach indexes through `insert`, `update`
   and `delete`. Today each of these does its own index upkeep.
 
+#### 4.2.1 As built: the read side (step 1a, 1b)
+
+Status: 2026-11-16, branch `redesign/access`. The read side is in
+`lexdb_access`; the write side (index upkeep) and `ExecTxn` are not yet.
+
+**Where it sits.** `lexdb_access` imports `lexdb_store`, `lexdb_rows`,
+`lexdb_sql`, `lexdb_base`, `lexdb_time`, `lexdb_sqlcoll`, `lexdb_like` and
+`lexdb_vec`; `lexdb_catalog`, `lexdb_plan` and `lexdb_exec` import it. The
+import gate (tests/lexdb/imports.py) checks both directions.
+
+Because access is below the catalog it cannot see `Table`. So:
+
+- `Index` (tree, parts, expressions, predicate, and the catalog's
+  presentation fields) moved to `lexdb_access`; `lexdb_catalog.Index` is an
+  alias.
+- `Rel` is a value record of borrows of a `Table`'s layout fields (name,
+  tree, columns, primary key, indexes, slots, width, layouts), made by
+  `lexdb_catalog.relOf(t)` per call. It copies nothing, like
+  `lexdb_rows.Rows`.
+
+**Interface.**
+
+```
+type Rel; type Index; type Scan; type Cursor; type Tail
+type IdxDec; type IxRead; type Lazy; type Bar; type Picked
+type RowRead; type Probes; type Fetched; type Ranged
+
+// ranges, from bound values (exec evaluates and coerces; keyVal stays there)
+noScan() / wholeScan() / allScan(): Scan
+rangeScan(rel, ix, eqs: &[]Val, los: &[]Val, his: &[]Val, noNulls): Scan
+inScans(rel, ix, eqs, vals, desc): []Scan
+prefixScan(rel, ix, row, n): Scan                    // a foreign key's lookup
+tailOf(ix, los, his, capNulls): Tail                 // a join's bounds, made once
+afterScans(scans, from): []Scan; sameRange(a, b); newCursor()
+
+// rows
+rowRead(rel, need): RowRead; getRow(st, txn, rel, rr, key): Option[[]Val]
+fetch(st, txn, rel, ix, desc, sc, need, cur, out: mut &[][]Val)
+rowOf(st, txn, rel, key, v, n, need, missing)        // a stored value decoded (large values read whole)
+
+// batches
+idxDecOf(rel, ix, needCol): Option[IdxDec]           // index-only reads
+fillLevel(st, txn, rel, rd: &IxRead, sc, part, cur, bp): Option[Batch]
+fillPickIn(st, txn, rel, sc, part, cur, bp, rd, lz: &Lazy,
+           narrow: &fn(skip, &Batch, idx): Option[[]int], bar, spare): Option[Picked]
+probes(ix, n): Probes; p.part(v) / p.intKey(x) / p.again() / p.end() / p.clear()
+fetchMany(st, txn, rel, pr, part, bp): Option[Fetched]            // bLookup's reads
+rangeMany(st, txn, rel, ix, pr, tail, noRange, one, bp, part,
+          room, perRow): Option[Ranged]                           // bRange's reads
+
+// counts and the rest
+countRows(st, txn, rel, most); countEntries(st, txn, rel, ix, sc, cur, n, lim, keep, keys)
+pages(st, rel); rowCount(st, txn, rel); warmPoints(st, txn, rel, scans)
+keyOf(rel, row): str                                 // a row's identity (locks, rows changed)
+encKeyPart / encIdxPart / encNum / floatKey / collKeyVal / ciKey / padKey
+fixedRows / layoutRows / leafKinds / treeDump        // test hooks
+```
+
+**What differs from the sketch above.**
+
+- *Bounds are values, not expressions.* Exec still evaluates a path's
+  values and makes them the column's type (`keyVal`, `coerceZ`); that is
+  the binder's work (layer 4). Access only turns bound values into key
+  ranges.
+- *Filters are a closure, not a `Want`.* The two-step decode (9.108)
+  needs the level's conditions between its two steps. They reach access as
+  `narrow`, a closure over exec's `bNarrow`, called once per run of rows.
+  A raw LIKE's pattern pieces travel in `Lazy`. After step 2 the closure
+  is over the expression IR's vector evaluator; nothing in access changes.
+- *Lookups are made a part at a time.* `Probes` keeps a batch's keys
+  opaque without a `[]Val` per row; `fetchMany` and `rangeMany` sort,
+  deduplicate, read and decode them. `rangeMany` takes the statement's
+  memory room as two numbers, so the budget stays the executor's.
+- *Exec keeps the value encoding for in-memory keys.* Groups, hash joins,
+  partitions, DISTINCT and ANALYZE's sketches use `encIdxPart` as an
+  order-preserving codec. Exec reaches it through thin wrappers. It could
+  become a codec of its own (in `lexdb_rows` or `lexdb_vec`) if keys held
+  in memory and keys on disk ever need to differ.
+- *Collation keys moved too.* `ciKey`/`padKey` make the bytes a
+  collated text's key holds, so they are in access. Exec keeps wrappers
+  for its comparisons.
+- `radixPerm` moved to `lexdb_vec`: both the sort and `sortKeysPerm` use
+  it.
+
+**Gate (step 1b against main `ae3e370a`, both built the same session).**
+Suite 184 passed. TPC-H SF1, 3 runs each: all 22 checksums equal the
+`1744ef99` baseline's; median wall time per query within 0.980–1.020 of
+main's, geometric mean 1.004, total 31.36 s against 31.29 s. OLTP (vspg,
+lexdb only, 3 rounds of 10 s, medians): point selects 82.2k/135.8k/131.0k
+tps at 1/8/32 clients against 83.1k/137.5k/132.5k (about 1% lower,
+server CPU per select 1% higher); updates 3,822/18,198/41,131 against
+3,830/18,192/40,602; the five aggregates equal. Loads: 1M-row INSERT ...
+SELECT 1.21 s and 2.43 s against 1.17 s and 2.38 s (one run each); COPY
+narrow 0.51 s both, wide with two indexes 7.07 s both.
+
+**Still in exec after step 1b:**
+
+- index upkeep and the writes (`insertRows`, `storeRow`, `updRow`,
+  `delRow`, `conflictOf`, `checkUnique`, `changeIndexes`, `fillIndex`,
+  `rewrite`, `rangeDelete`/`delEntries`, `fastCopyRow`, `idxPrefix`/
+  `idxVal`, `parentHas`), with their `txn.put`/`txn.del`/`putRow` calls;
+- `Txn.sql` (`ExecTxn` not made yet);
+- catalog trees, read and written directly (`CATALOG`, sequences, roles,
+  ACLs), and `relSize`, which counts pages by tree number from the catalog
+  lines.
+
 ### 4.3 Layer 3, catalog (`lexdb_catalog`)
 
 Already half done (architecture 5, followups 4).
