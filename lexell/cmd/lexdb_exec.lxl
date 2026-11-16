@@ -10198,11 +10198,41 @@ fn orOf(xs: &[]Expr): Expr {
     return out
 }
 
+// Whether x can raise no error on a row's values: columns, constants and
+// comparisons of them, AND, OR, NOT, IS NULL, IN and LIKE. A part with no
+// column is a constant, the same value (or error) on every row. Arithmetic
+// (division by zero, overflow), a cast or another call can fail on some
+// row's values, so a copy of it must not be evaluated on rows the query
+// as written would not evaluate it on (pullCommonOr, orLevels).
+fn cannotFail(x: &Expr): bool {
+    var ns: []str = []
+    colNames(x, mut &ns)
+    if len(ns) == 0 { return !hasSubCall(x) && immutable(x) }
+    match x {
+        Expr.Col(_) { return true }
+        Expr.Unary(op, a) { return op == "not" && cannotFail(&a) }
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" || op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+                return cannotFail(&a) && cannotFail(&b)
+            }
+            return false
+        }
+        Expr.IsNull(a, _) { return cannotFail(&a) }
+        Expr.Call(n, args, star) {
+            if star || (n != "in" && n != "like" && n != "ilike") { return false }
+            for a in args { if !cannotFail(&a) { return false } }
+            return true
+        }
+        else { return false }
+    }
+}
+
 // (A and X) or (A and Y) -> A and (X or Y), when A is the same conjunct in
 // every branch. q19's OR of three joins shares p_partkey = l_partkey, and
 // pulling it out is what lets the planner join the tables instead of
-// crossing them. Only immutable, subquery-free conjuncts are pulled, so
-// evaluation is not moved.
+// crossing them. Only immutable, subquery-free conjuncts are pulled, and
+// only those that cannot fail: A then runs before the branches' guards
+// ("id > 100 and 1/(id - 5) > 0").
 fn pullCommonOr(x: &Expr): Expr {
     if !matchesOr(x) { return clone(x) }
     var branches: []Expr = []
@@ -10216,7 +10246,7 @@ fn pullCommonOr(x: &Expr): Expr {
     }
     var common: []Expr = []
     for c in parts[0] {
-        if !immutable(&c) || hasSubCall(&c) { continue }
+        if !immutable(&c) || hasSubCall(&c) || !cannotFail(&c) { continue }
         var all = true
         for j in 1..len(parts) {
             var found = false
@@ -10244,6 +10274,10 @@ fn pullCommonOr(x: &Expr): Expr {
 // conditions on it, or'd. Branch 1's part may pair with branch 2's
 // lineitem, so the full OR stays at the join; this only cuts the table's
 // rows first, as PostgreSQL's BitmapOr does with an index per branch.
+// Only conditions that cannot fail are copied: the table's rows are tested
+// before the join, some of them rows the OR itself never sees (a.id = 5
+// with no b row: "1/(a.id - 5) > 0" would divide by zero). Leaving one out
+// keeps the filter necessary, only weaker.
 fn orLevels(x: &Expr, k: int, q: &Query): Option[Expr] {
     var branches: []Expr = []
     orParts(x, mut &branches)
@@ -10253,7 +10287,7 @@ fn orLevels(x: &Expr, k: int, q: &Query): Option[Expr] {
         andParts(&b, mut &ps)
         var local: []Expr = []
         for d in ps {
-            if q.levelMask(&d) == (1 << k) && !hasCorr(&d) && !hasSubCall(&d) { append(mut &local, clone(&d)) }
+            if q.levelMask(&d) == (1 << k) && !hasCorr(&d) && !hasSubCall(&d) && cannotFail(&d) { append(mut &local, clone(&d)) }
         }
         if len(local) == 0 { return None }
         append(mut &outs, andOf(&local))
