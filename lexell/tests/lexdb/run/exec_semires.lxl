@@ -1,0 +1,136 @@
+// lexdb_exec: a semi/anti join's residual filters (q21's "l_suppkey <>
+// outer"), regressions from the TPC-H review (2026-11-16). A correlated
+// filter that is not a key is a residual only in a semi join's plan; any
+// other hashed subquery (scalar, select list, under OR, IN's value) keeps
+// it. Unanalyzed tables still hash a correlated EXISTS/NOT EXISTS on no
+// index. The "<>" summary over batches: its key's map (integer and text),
+// the outer value's column gathered, an anti join's hidden columns. Batches
+// on and off give the same counts, which the joins at the end confirm.
+// expect: create table h (id int primary key, g int, v int) -> CREATE TABLE
+// expect: insert into h values (1, 1, 10), (2, 1, null), (3, 2, 20), (4, 3, 30) -> INSERT 0 4
+// expect: create table k (id int primary key, g int, x int) -> CREATE TABLE
+// expect: insert into k values (1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, null), (5, 4, 1), (6, null, 5) -> INSERT 0 6
+// expect: select k.id, (select count(*) from h where h.g = k.g and h.v > k.x) from k order by k.id -> 1|0; 2|0; 3|0; 4|0; 5|0; 6|0
+// expect: select k.id, (select count(*) from h where h.g = k.g and h.v > k.x - 15) from k order by k.id -> 1|1; 2|1; 3|1; 4|0; 5|0; 6|0
+// expect: select k.id, exists (select 1 from h where h.g = k.g and h.v > k.x) from k order by k.id -> 1|f; 2|f; 3|f; 4|f; 5|f; 6|f
+// expect: select k.id from k where k.id = 99 or exists (select 1 from h where h.g = k.g and h.v > k.x) order by k.id -> SELECT 0
+// expect: select k.id, k.x in (select v from h where h.g = k.g and h.id <> k.id) from k order by k.id -> 1|NULL; 2|f; 3|f; 4|NULL; 5|f; 6|f
+// expect: select k.id from k where not exists (select 1 from h where h.g = k.g and h.v > k.x) order by k.id -> 1; 2; 3; 4; 5; 6
+// expect: select k.id from k where exists (select 1 from h where h.g = k.g and h.v > k.x - 15) order by k.id -> 1; 2; 3
+// expect: create table o (id int primary key, ok int, s int, t text) -> CREATE TABLE
+// expect: insert into o select g, case when g % 10 = 0 then null else g end, g % 7, 'k' || (g % 50) from generate_series(1, 3000) g -> INSERT 0 3000
+// expect: create table l (id int primary key, ok int, sk int, t text) -> CREATE TABLE
+// expect: insert into l select g, g % 1500 + 1, case when g % 2 = 0 then g % 3 else 1 end, 'k' || (g % 40) from generate_series(1, 6000) g -> INSERT 0 6000
+// expect: explain select count(*) from o where exists (select 1 from l where l.ok = o.id) -> scan o: full scan; semi join l: hash on (ok) over rows of subquery 1; aggregate; subquery 1 (exists): semi join on l.ok = o.id, run once;   scan l: full scan
+// expect: explain select count(*) from o where not exists (select 1 from l where l.ok = o.id) -> scan o: full scan; semi join l: hash on (ok) over rows of subquery 1; aggregate; subquery 1 (exists): semi join on l.ok = o.id, run once;   scan l: full scan
+// expect: analyze -> ANALYZE
+// expect: create table e (id int primary key, ok int) -> CREATE TABLE
+// expect: analyze e -> ANALYZE
+// expect: set lexdb_batch = on -> SET
+// expect: select count(*) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1285
+// expect: select count(*) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1715
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1285|4282
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1715|4716
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 2229|7036
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 771|1962
+// expect: select count(*), count(o.t) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 2229|2229
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.ok and l.sk > o.s) -> 193|36
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok and l.sk > o.s) -> 2807|8962
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok) -> 1650|4953
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from e where e.ok = o.ok) -> 3000|8998
+// expect: select count(*), sum(o.s) from o where exists (select 1 from e where e.ok = o.ok) -> 0|NULL
+// expect: set lexdb_batch = off -> SET
+// expect: select count(*) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1285
+// expect: select count(*) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1715
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1285|4282
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> 1715|4716
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 2229|7036
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 771|1962
+// expect: select count(*), count(o.t) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s) -> 2229|2229
+// expect: select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.ok and l.sk > o.s) -> 193|36
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok and l.sk > o.s) -> 2807|8962
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok) -> 1650|4953
+// expect: select count(*), sum(o.s) from o where not exists (select 1 from e where e.ok = o.ok) -> 3000|8998
+// expect: select count(*), sum(o.s) from o where exists (select 1 from e where e.ok = o.ok) -> 0|NULL
+// expect: explain select count(*) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s) -> scan o: full scan; semi join l: hash on (ok) over rows of subquery 1; aggregate; subquery 1 (exists): semi join on l.ok = o.id, run once;   scan l: full scan
+// expect: select count(distinct o.id) from o join l on l.ok = o.id and l.sk <> o.s -> 1285
+// expect: select count(distinct o.id) from o join l on l.t = o.t and l.sk <> o.s -> 2229
+// expect: select count(distinct o.id) from o join l on l.ok = o.ok and l.sk > o.s -> 193
+// expect: select count(*) from o where o.ok is null or o.ok not in (select ok from l) -> 1650
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            let out = sql + " -> " + (if len(lines) == 0 { r.tag } else { strings.join(&lines, "; ") })
+            let k = strings.indexOf(&out, " rows in ", 0)      // EXPLAIN ANALYZE's time varies
+            println(if k >= 0 { out[0..k] + " rows" } else { out })
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // 1. a correlated filter that is not a key stays in a subquery that
+        // is not a semi join (scalar, select list, under OR, IN's value)
+        show(mut &s, "create table h (id int primary key, g int, v int)")
+        show(mut &s, "insert into h values (1, 1, 10), (2, 1, null), (3, 2, 20), (4, 3, 30)")
+        show(mut &s, "create table k (id int primary key, g int, x int)")
+        show(mut &s, "insert into k values (1, 1, 10), (2, 1, 11), (3, 2, 20), (4, 2, null), (5, 4, 1), (6, null, 5)")
+        show(mut &s, "select k.id, (select count(*) from h where h.g = k.g and h.v > k.x) from k order by k.id")
+        show(mut &s, "select k.id, (select count(*) from h where h.g = k.g and h.v > k.x - 15) from k order by k.id")
+        show(mut &s, "select k.id, exists (select 1 from h where h.g = k.g and h.v > k.x) from k order by k.id")
+        show(mut &s, "select k.id from k where k.id = 99 or exists (select 1 from h where h.g = k.g and h.v > k.x) order by k.id")
+        show(mut &s, "select k.id, k.x in (select v from h where h.g = k.g and h.id <> k.id) from k order by k.id")
+        show(mut &s, "select k.id from k where not exists (select 1 from h where h.g = k.g and h.v > k.x) order by k.id")
+        show(mut &s, "select k.id from k where exists (select 1 from h where h.g = k.g and h.v > k.x - 15) order by k.id")
+        // 2. without ANALYZE a correlated EXISTS/NOT EXISTS on no index is
+        // still hashed once, not a scan of the inner table per outer row
+        show(mut &s, "create table o (id int primary key, ok int, s int, t text)")
+        show(mut &s, "insert into o select g, case when g % 10 = 0 then null else g end, g % 7, 'k' || (g % 50) from generate_series(1, 3000) g")
+        show(mut &s, "create table l (id int primary key, ok int, sk int, t text)")
+        show(mut &s, "insert into l select g, g % 1500 + 1, case when g % 2 = 0 then g % 3 else 1 end, 'k' || (g % 40) from generate_series(1, 6000) g")
+        show(mut &s, "explain select count(*) from o where exists (select 1 from l where l.ok = o.id)")
+        show(mut &s, "explain select count(*) from o where not exists (select 1 from l where l.ok = o.id)")
+        show(mut &s, "analyze")
+        // 3. a semi/anti join with a "<>" filter (summarized per key) and
+        // other residuals, integer and text keys, NULL keys, an empty inner
+        // table: batches on and off agree, with the outer columns the filter
+        // names used elsewhere or not
+        show(mut &s, "create table e (id int primary key, ok int)")
+        show(mut &s, "analyze e")
+        for b in ["on", "off"] {
+            show(mut &s, "set lexdb_batch = " + b)
+            show(mut &s, "select count(*) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s)")
+            show(mut &s, "select count(*) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.id and l.sk <> o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where not exists (select 1 from l where l.t = o.t and l.sk <> o.s)")
+            show(mut &s, "select count(*), count(o.t) from o where exists (select 1 from l where l.t = o.t and l.sk <> o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where exists (select 1 from l where l.ok = o.ok and l.sk > o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok and l.sk > o.s)")
+            show(mut &s, "select count(*), sum(o.s) from o where not exists (select 1 from l where l.ok = o.ok)")
+            show(mut &s, "select count(*), sum(o.s) from o where not exists (select 1 from e where e.ok = o.ok)")
+            show(mut &s, "select count(*), sum(o.s) from o where exists (select 1 from e where e.ok = o.ok)")
+        }
+        show(mut &s, "explain select count(*) from o where exists (select 1 from l where l.ok = o.id and l.sk <> o.s)")
+        // the same counts by joins
+        show(mut &s, "select count(distinct o.id) from o join l on l.ok = o.id and l.sk <> o.s")
+        show(mut &s, "select count(distinct o.id) from o join l on l.t = o.t and l.sk <> o.s")
+        show(mut &s, "select count(distinct o.id) from o join l on l.ok = o.ok and l.sk > o.s")
+        show(mut &s, "select count(*) from o where o.ok is null or o.ok not in (select ok from l)")
+        return 0
+    })
+}

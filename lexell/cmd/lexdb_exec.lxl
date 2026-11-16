@@ -7552,7 +7552,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var lateral = false
         if f.sub >= 0 {
             sc.frames[me].hidden = !f.lateral
-            let planning = planSub(st, txn, &subs[f.sub], params, sc, true)
+            let planning = planSub(st, txn, &subs[f.sub], params, sc, false)
             sc.frames[me].hidden = false
             let sp = try planning
             // outer values: run per row of the tables before it (and cached by them)
@@ -7611,7 +7611,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 let vowner = (try readAcl(st, txn, &relObj(&t.name))).owner
                 if len(vowner) > 0 { append(mut &sc.asRole, vowner) }
                 sc.frames[me].hidden = true
-                let planning = planSub(st, txn, &vs, params, sc, true)
+                let planning = planSub(st, txn, &vs, params, sc, false)
                 sc.frames[me].hidden = false
                 if len(vowner) > 0 { let x = pop(mut &sc.asRole) }
                 let sp = try planning
@@ -7738,7 +7738,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     }
     if anyUsing { for j in 0..len(order) { q.cols[order[j]].pos = j } }
     for i in 0..len(subs) {
-        if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc, !semiCand[i])) }
+        if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc, false)) }
         let sp = pop(mut &planned[i])
         // a correlated EXISTS or IN of a semi-join's that 9.9 could not
         // hash, its outer values a lookup's keys: planned again without
@@ -9135,7 +9135,7 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
-           sc: mut &Scope, allowHash: bool): Result[SubPlan, DbErr] {
+           sc: mut &Scope, res: bool): Result[SubPlan, DbErr] {
     // EXISTS stops at its first row; a scalar subquery at its second, unless
     // it aggregates, groups or is DISTINCT (then it reads everything:
     // optimizer 33)
@@ -9152,7 +9152,10 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
     var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: []}
-    if len(sp.sel.q.refs) > 0 && s.use != lexdb_sql.SUB_FROM && allowHash { hashSub(mut &sp, sc.base) }
+    // res: a semi-join's alternative (buildQuery), which may keep correlated
+    // filters that are not keys as residuals (SubPlan.res) for its level to
+    // check. Any other hashed subquery must not: nothing else reads them.
+    if len(sp.sel.q.refs) > 0 && s.use != lexdb_sql.SUB_FROM { hashSub(mut &sp, sc.base, res) }
     return Ok(sp)
 }
 
@@ -9241,11 +9244,12 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
     }
 }
 
-fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool): bool {
+fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool): bool {
     for c in cs {
         if !usesRefs(&c, base) { continue }
         if !movable { return false }
         if !keyConj(&c, base, hk) {
+            if !res { return false }
             // not inner = outer: a filter the once-run subquery cannot keep
             // (the outer value is a parameter now), checked per candidate
             // row of the key's bucket instead
@@ -9275,7 +9279,7 @@ fn dropTexts(cs: []Expr, texts: &[]str): []Expr {
     return out
 }
 
-fn hashSub(sp: mut &SubPlan, base: int) {
+fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
     var hk = HashKeys{inner: [], outer: [], texts: [], res: []}
     // a scalar subquery: one aggregate row, no GROUP BY, its key's groups
     // then its value per group (9.26)
@@ -9292,11 +9296,11 @@ fn hashSub(sp: mut &SubPlan, base: int) {
             if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return }
             for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
             // an outer join's ON conjuncts are not WHERE filters: they stay
-            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join)) { return }
-            if !keyConjs(&lv.post, base, mut &hk, true) { return }
-            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join)) { return }
+            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res) { return }
+            if !keyConjs(&lv.post, base, mut &hk, true, res) { return }
+            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res) { return }
         }
-        if !keyConjs(&q.top, base, mut &hk, true) { return }
+        if !keyConjs(&q.top, base, mut &hk, true, res) { return }
         if len(hk.inner) == 0 { return }
     }
     for k in 0..len(sp.sel.q.levels) {
@@ -9551,6 +9555,8 @@ fn semiAltOk(alt: &SubPlan, sp: &SubPlan): bool {
     for i in 0..len(a.refs) { if lexdb_sql.exprText(&a.refs[i]) != lexdb_sql.exprText(&b.refs[i]) { return false } }
     for x in alt.sel.exprs { if !immutable(&x) { return false } }
     for x in alt.keyOuter { if !immutable(&x) { return false } }
+    // a residual is checked per outer row (or once per key's summary)
+    for x in alt.res { if !immutable(&x) { return false } }
     for x in a.top { if !immutable(&x) { return false } }
     for lv in a.levels {
         if lv.virt() { return false }
@@ -25164,6 +25170,7 @@ fn bChoose(conds: &[]BNode, b: &Batch): Option[[]int] {
 const JK_GEN = 0        // a join's key looked up as the row path does (keyVal, encIdxPart or keyPart, Mats.keys)
 const JK_INT = 1        // one integer key: in a map of its own
 const JK_TEXT = 2       // one text key (text or varchar, no collation): in a map of its own, by its text
+const JK_IKEYS = 3      // a semi-join's one integer key (semiIntKey): materialize's map, Mats.ikeys
 
 type JLevel = record {
     k: int
@@ -25277,9 +25284,18 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         let hc = if look { 0 } else { lv.hashCols[0] }
         let exact = !look && (len(lv.hashKinds) == 0 || lv.hashKinds[0] == lexdb_sql.COLL_EXACT)
         var ints: Map[int, int] = newMap()
+        // a semi-join's one integer key: materialize keyed it in Mats.ikeys
+        // only (Mats.keys is empty), and a "<>" summary's buckets hold no
+        // rows to rebuild a map from
+        let ik = !look && semiIntKey(lv)
+        if ik {
+            if len(key) != 1 || keyTyp[0] != BT_INT { return Ok(None) }
+            mode = JK_IKEYS
+        }
         // (a semi-join's rows are keyed by value, keyPart: an integer's key
-        // is its value's, a text's its text, as these maps take them)
-        if len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == BT_INT && rkinds[hc] == BK_INT {
+        // is its value's, a text's its text, as these maps take them; a
+        // "<>" summary keeps no rows, so its key is looked up in Mats.keys)
+        if !ik && !lv.resNot && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == BT_INT && rkinds[hc] == BK_INT {
             mode = JK_INT
             let bs = &m.buckets[k]
             for bi in 0..len(bs) {
@@ -25295,7 +25311,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // the value a text or varchar column's: by its text
         var txts: Map[str, int] = newMap()
         let ho = lv.t.cols[hc].typ.oid
-        if mode == JK_GEN && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == BT_OTHER && (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) {
+        if mode == JK_GEN && !lv.resNot && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == BT_OTHER && (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) {
             let ko = q.cols[keyCol[0]].typ.oid
             if ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR {
                 mode = JK_TEXT
@@ -25388,6 +25404,8 @@ fn jpFinish(jp: mut &JPlan, q: &Query, out: &[]bool) {
         for x in cand { append(mut &inp, x) }
         for i in 0..len(lv.t.cols) { inp[lv.first + i] = false }
         for ki in 0..len(jp.levels[li].key) { bColsOf(&jp.levels[li].key[ki], mut &inp) }
+        // a "<>" summary's outer value: bProbe evaluates it on the input
+        if jp.levels[li].resNot { bColsOf(&jp.levels[li].res, mut &inp) }
         jp.levels[li].cand = cand
         jp.levels[li].after = after
         after = inp
@@ -25486,6 +25504,13 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
         if jl.mode == JK_INT {
             if !kv[0].nul[r] {
                 match jl.ints.get(&kv[0].v[r]) {
+                    Some(x) { bk = x }
+                    None {}
+                }
+            }
+        } else if jl.mode == JK_IKEYS {
+            if !kv[0].nul[r] {
+                match m.ikeys[k].get(&kv[0].v[r]) {
                     Some(x) { bk = x }
                     None {}
                 }
@@ -25785,18 +25810,12 @@ fn bJoinTail(q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, pj: &[]int, pi: &[]i
             if mask[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], &aj, mut &out, c) }
         }
         // the level's own columns are hidden: no expression reads them, but
-        // the batch's columns must hold what jp.need says (a length at least)
-        if rows.n > 0 {
-            var zero: []int = array(len(aj), 0)
-            for i in 0..len(jl.rkinds) {
-                let c = lv.first + i
-                if jp.need[c] { bGather(rows, i, jl.rkinds[i], &zero, mut &out, c) }
-            }
-        } else {
-            for i in 0..len(jl.rkinds) {
-                let c = lv.first + i
-                if jp.need[c] { out.cols[c] = bvec(len(aj)) }
-            }
+        // the batch's columns must hold what jp.need says, a column of values
+        // its values too (a "<>" summary's level has no rows: NULLs)
+        var none: []int = array(len(aj), -1)
+        for i in 0..len(jl.rkinds) {
+            let c = lv.first + i
+            if jp.need[c] { bGather(rows, i, jl.rkinds[i], &none, mut &out, c) }
         }
         return Ok(Some(out))
     }
