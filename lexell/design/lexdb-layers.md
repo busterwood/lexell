@@ -423,14 +423,16 @@ Main stays green after every step.
 - **Performance kernels.** Moving code must not regress the tuned loops. Each
   operator port is an A/B against main's binary.
 
-## 8. Open decisions
+## 8. Decisions
 
-1. **The row strategy.** Is the row executor kept as a supported strategy for
-   small queries, or is a chunk of one enough, with the row path deleted?
-   The recommendation is a chunk of one, decided after step 4's OLTP
-   numbers.
-2. **The on-disk format.** Agree to keep it through steps 1–7 (section 5)?
-3. **Covering indexes (`INCLUDE`)** as the answer to the per-row fetch cost,
-   in place of a heap layout?
+Agreed with the owner on 2026-11-16:
+
+1. **The row strategy:** a chunk of one. The row executor is deleted once
+   step 4's OLTP numbers confirm it is no slower.
+2. **The on-disk format:** kept through steps 1–7 (section 5).
+3. **The per-row fetch cost:** answered with covering indexes (`INCLUDE`),
+   not a heap layout.
 4. **Module names:** `lexdb_access` and `lexdb_bind`.
-5. **`SET lexdb_batch = off`** becomes test-only (architecture 11).
+5. **`SET lexdb_batch = off`:** test-only (architecture 11).
+
+Steps 0–1 and 0–2 start at once, one agent each.
