@@ -268,10 +268,18 @@ main has too:
 - A NULL outer value matched a mixed key of a "<>" summary over batches
   (`bProbe`; `06c8b1c7`). Main has it; TPC-H has no such NULLs.
 - An outer char(n) value was compared as an untyped text, blanks
-  included (`faea665f`). An outer column of the default collation was
-  the weakest collation instead of an implicit one, so EXISTS accepted
-  a comparison that a join rejects with 42P21 (`d665f217`). Main has
-  both.
+  included (`faea665f`). Main has it.
+- Reverted: `d665f217` gave an outer column of the default collation an
+  implicit collation, so that EXISTS raised the join's 42P21 against a
+  case-insensitive column. A second review judged it wrong for
+  PostgreSQL, where the non-default implicit collation wins over the
+  default (parse_collate.c), and harmful: it failed at plan time,
+  CREATE VIEW too, and for outer columns made of literals. **Open
+  question:** how an outer reference's collation is derived, per
+  dialect. PostgreSQL lets the non-default implicit collation win;
+  lexdb's join, like SQL Server, treats it as a conflict; EXISTS on main
+  follows PostgreSQL. In a T-SQL session `exists (select 1 where o.t =
+  'K1')` therefore does not compare as the outer query does.
 - `bRange` now counts the rows it holds against max_statement_mem.
   Past the limit it hands the scan to the row path. "joined" counts
   the same on every semi/anti path (`6eb8597b`).
