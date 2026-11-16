@@ -27,6 +27,9 @@
 //   a scalar count as the join compares them.
 // - A filter on an outer char(3) column alone inside the subquery (per
 //   row, hashed): as the same filter written outside it.
+// - A derived table's outer column wider than its label (a UNION's int
+//   over a numeric, a date over a timestamp), run per row: as the filter
+//   without the subquery; a same-type char or float key stays hashed.
 // - How many ran as looked-up semi/anti joins, and over batches.
 // - EXPLAIN ANALYZE's counts with batches on and off (but "batches N",
 //   and the rows read: the batches read a key's whole range, the row
@@ -47,6 +50,7 @@
 // expect: chars: 6 comparisons, 6 as the join compares
 // expect: reftypes: 13 comparisons, 13 as the join compares
 // expect: char filter: 6 queries, 6 as the filter outside, per row: true
+// expect: derived refs: 6 queries, 6 as without the subquery; hashed on char: true, on float: true
 // expect: counts q21: same: true
 // expect: counts q22: same: true
 // expect: plan q4: scan o: full scan; semi join l: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join
@@ -518,6 +522,46 @@ fn charFilter(s: mut &lexdb_exec.Session) {
     println("char filter: " + len(pairs).toStr() + " queries, " + same.toStr() + " as the filter outside, per row: " + strings.contains(&pl, "per row, on").toStr())
 }
 
+// An outer column of a derived table whose rows are of wider types than
+// its label (a UNION's int over a numeric, a date over a timestamp, CASE
+// and GREATEST): run per row, against the same filter without the
+// subquery. (Typed as its label, 2.5 became 3.) And a hashed scalar
+// subquery keyed on one type on both sides (char(4), float8) stays hashed.
+fn derivedRefs(s: mut &lexdb_exec.Session) {
+    let pairs = [["select count(*) from (select 1 as x union all select 2.5) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select 1 as x union all select 2.5) o where o.x = 2.5"],
+                 ["select count(*) from (select 1 as x union all select 2.5) o where (select o.x) = 2.5",
+                  "select count(*) from (select 1 as x union all select 2.5) o where o.x = 2.5"],
+                 ["select x, (select x) from (select 1 as x union all select 2.5) o order by 1",
+                  "select x, x from (select 1 as x union all select 2.5) o order by 1"],
+                 ["select count(*) from (select date '2024-01-01' as x union all select timestamp '2024-01-01 05:00') o where exists (select 1 where o.x > date '2024-01-01')",
+                  "select count(*) from (select date '2024-01-01' as x union all select timestamp '2024-01-01 05:00') o where o.x > date '2024-01-01'"],
+                 ["select count(*) from (select case when g = 1 then 1 else 2.5 end as x from generate_series(1, 2) g) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select case when g = 1 then 1 else 2.5 end as x from generate_series(1, 2) g) o where o.x = 2.5"],
+                 ["select count(*) from (select greatest(g, 2.5) as x from generate_series(1, 2) g) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select greatest(g, 2.5) as x from generate_series(1, 2) g) o where o.x = 2.5"]]
+    var same = 0
+    for pr in pairs {
+        var ok = true
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            let a1 = q(s, &pr[0])
+            let a2 = q(s, &pr[1])
+            if a1 != a2 {
+                ok = false
+                println("DIFFERENT (" + b + "): " + pr[0] + ": " + a1 + " against " + a2)
+            }
+        }
+        if ok { same += 1 }
+    }
+    let c1 = q(s, &"create table hk (id int primary key, c char(4), f float8)")
+    let c2 = q(s, &"insert into hk select g, 'k' || (g % 9), (g % 9) + 0.5 from generate_series(1, 200) g")
+    let pc = ex(s, &"explain select sum((select max(h2.id) from hk h2 where h2.c = hk.c and h2.id % 2 = 0)) from hk")
+    let pf = ex(s, &"explain select sum((select max(h2.id) from hk h2 where h2.f = hk.f and h2.id % 2 = 0)) from hk")
+    println("derived refs: " + len(pairs).toStr() + " queries, " + same.toStr() + " as without the subquery; hashed on char: " +
+            strings.contains(&pc, "hashed on").toStr() + ", on float: " + strings.contains(&pf, "hashed on").toStr())
+}
+
 fn main() {
     lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
@@ -569,6 +613,7 @@ fn main() {
         chars(mut &s)
         reftypes(mut &s)
         charFilter(mut &s)
+        derivedRefs(mut &s)
         let q21 = "select s.name, count(*) from l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok " +
                   "where n.name = 'N2' and o.st = 'F' and l1.rd > l1.cd " +
                   "and exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp) " +

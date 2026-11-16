@@ -7720,7 +7720,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for i in 0..len(subs) { append(mut &planned, []) }
     // its scope comes first, its columns added as its tables are read: a
     // LATERAL subquery sees the tables before it, another none of them
-    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
+    append(mut &sc.frames, Frame{cols: [], exact: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
     let me = len(sc.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
     var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
@@ -7853,6 +7853,9 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 fc.spell = q.cols[i].spell
                 fc.coll = q.cols[i].coll
                 append(mut &sc.frames[me].cols, fc)
+                // a subquery's, a view's, a working table's column is typed
+                // by its first branch (a UNION's int over a numeric): not exact
+                append(mut &sc.frames[me].exact, f.sub < 0 && f.work < 0 && viewSrc < 0)
             }
         }
         // JOIN ... USING and NATURAL JOIN (9.93): an ON made of the names'
@@ -8950,6 +8953,7 @@ fn seriesRes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
 // The queries being planned, outermost first.
 type Frame = record {
     cols: []lexdb_sql.ColDef
+    exact: []bool               // per column: a table's, its values of exactly its type (outerRef types its parameter)
     refs: []Expr                // the outer values it uses, in the terms of the query around it
     refOids: []int
     subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
@@ -9376,9 +9380,11 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
             Ok(n) {
-                let fc = &sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)]
+                let ci = colIndex(&sc.frames[f].cols, &n)
+                let fc = &sc.frames[f].cols[ci]
                 oid = fc.typ.oid
-                if refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
+                let exact = ci < len(sc.frames[f].exact) && sc.frames[f].exact[ci] && (len(fc.using) == 0 || fc.using == lexdb_sql.USING_HIDDEN)
+                if exact && refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
                 if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
                 found = n
             }
@@ -9535,6 +9541,26 @@ fn hasSubCall(x: &Expr): bool {
     }
 }
 
+// Whether a hashed subquery's key inner = outer compares as = does:
+// semiTypes's kinds; one type on both sides, a float's or a char(n)'s
+// of one n (padded alike); or an outer value of no known type (a derived
+// table's column: an untyped parameter, keyed as before).
+fn hashKeyTypes(inner: &Expr, outer: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match outer {
+        Expr.Param(_) { return true }
+        else {}
+    }
+    let io = exprOid(inner, cols, &[])
+    let oo = exprOid(outer, cols, &[])
+    if semiTypes(io, oo) { return true }
+    if io == oo && (io == lexdb_sql.OID_FLOAT4 || io == lexdb_sql.OID_FLOAT8) { return true }
+    if io == oo && io == lexdb_sql.OID_BPCHAR {
+        let n = bpLen(inner, cols)
+        return n > 0 && n == bpLen(outer, cols)
+    }
+    return false
+}
+
 // A conjunct "inner = outer" (either way round), into hk; false: it uses an
 // outer value otherwise.
 fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): bool {
@@ -9555,7 +9581,7 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): b
             // date, a text with an integer, a float with a numeric compare
             // equal as = converts them, and not as keys. The outer value's
             // type: its column's (outerRef types it)
-            if !semiTypes(exprOid(&inner, cols, &[]), exprOid(&outer, cols, &[])) { return false }
+            if !hashKeyTypes(&inner, &outer, cols) { return false }
             append(mut &hk.inner, inner)
             append(mut &hk.outer, outer)
             append(mut &hk.texts, t)

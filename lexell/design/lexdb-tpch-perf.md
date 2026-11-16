@@ -683,6 +683,15 @@ main has too:
   twice (`7f350792`). `bRange`'s memory room also did not include rows a
   grouping or a sort held in its own count; `Run.aside` now carries
   them. A row-path consumer's count is still not seen.
+- A third review found that typing every outer column truncated values.
+  lexdb labels some derived columns narrower than their values: int
+  UNION ALL numeric is labelled int, date UNION ALL timestamp is
+  labelled date. So `(select o.x)` turned 2.5 into 3. Now only a base
+  table's column is typed; a derived table's column stays an untyped
+  parameter, as on main. Same-type char(n) and float keys of a hashed
+  subquery are hash keys again, as on main. **Open:** the union column
+  labels themselves are wrong. On both builds, a join on a
+  date-UNION-timestamp column gives 216 rows where EXISTS gives 432.
 
 ### 4.3 `joinorder`: the join order and its estimates
 
