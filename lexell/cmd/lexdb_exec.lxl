@@ -3848,6 +3848,22 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             if nm == "in" || nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "distinct from" || nm == "charindex" || nm == "patindex" {
                 out = try collateCall(&nm, out, cols, sc)
             }
+            if lexdb_sql.isQuant(&nm) && len(out) == 2 && !star {
+                // x op ANY (ARRAY[a, b]) under a collation's keys (L2), each element's as IN's
+                match out[1] {
+                    Expr.Call(an, elems, s2) {
+                        if an == "array" && !s2 && len(elems) > 0 {
+                            var xs: []Expr = [clone(&out[0])]
+                            for el in elems { append(mut &xs, clone(&el)) }
+                            var ks = try collateCall(&"in", xs, cols, sc)
+                            var rest: []Expr = []
+                            for k in 1..len(ks) { append(mut &rest, replace(mut &ks[k], Expr.Lit(Val.Null))) }
+                            out = [replace(mut &ks[0], Expr.Lit(Val.Null)), Expr.Call("array", rest, false)]
+                        }
+                    }
+                    else {}
+                }
+            }
             if !star && (((nm == "coalesce" || nm == "greatest" || nm == "least") && len(out) > 1) || nm == "case" || nm == "case else") {
                 // its values made of one type (lexdb_bind.commonOid), as
                 // PostgreSQL's: an untyped one ('1900-01-01' after a
@@ -23574,22 +23590,35 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     var conds: []BNode = []
+    var vol: []bool = []
     for x in lv.cond {
         let c = bCompile(&x, q, &qkinds, &env, lv.first)
         if c.isSome() {
             let cc = c.unwrap()
             if boolLike(cc.typ) {
                 append(mut &conds, takeN(cc))
+                append(mut &vol, isVolatile(&x))
                 continue
             }
         }
         // else compiled (9.108): a condition of any type, per row
         match bGenOf(&x, q, &qkinds, lv.first, &needCol, params, seqEnv(st, txn)) {
-            Some(g) { append(mut &conds, BNode.Gen(g)) }
+            Some(g) {
+                append(mut &conds, BNode.Gen(g))
+                append(mut &vol, isVolatile(&x))
+            }
             None {}
         }
     }
     let all = len(conds) == len(lv.cond)
+    if !all {
+        // the row path checks every condition again (tryRow): a volatile one
+        // (random()) is left to it alone, evaluated once per row
+        // (design/lexdb-layers.md 4.9, rule 1)
+        var kept: []BNode = []
+        for i in 0..len(conds) { if !vol[i] { append(mut &kept, replace(mut &conds[i], BNode.Const(0, false))) } }
+        conds = kept
+    }
     var scans = try pathScans(t, p, &env)
     // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
     if len(rs.after) > 0 && p.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
