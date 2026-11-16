@@ -230,3 +230,23 @@ table's batches do) is the 543 ms.
   2,127 part keys are over `IN_LOOKUP_MAX` (1,000), so partsupp is read
   whole (800,000 rows) instead of by 2,127 key ranges. PostgreSQL runs
   the same subplan per row at 27 us. Unchanged here.
+
+**Not done, and next.**
+
+- Not modelled: PostgreSQL's early-stop fraction 2/(match_count+1) for
+  a matched outer row; lexdb charges the key's whole range. The batches
+  also read the whole range when the level has a filter (the row path
+  stops at the first row that passes); a semi join with a filter could
+  stop a key's range once one row passes, at the cost of evaluating the
+  filter during the read.
+- Only EXISTS / NOT EXISTS over one table with an equality-keyed path
+  becomes a lookup level. A two-table EXISTS, an IN whose value is the
+  inner table's key, and a range-keyed path stay hashed or per row.
+- q20: an IN over a subquery whose values exceed `IN_LOOKUP_MAX` could
+  choose its key lookups by cost against the table's rows (2,127 ranges
+  against 800,000 rows); and the per-run cost of a correlated subquery
+  (about 100 us) is setup, not reading: caching the run's prepared state
+  across runs is the larger part of q20.
+- For the other workstreams: char(n) comparisons in `bCompile` (q21's
+  joins run on the row path for `o_orderstatus = 'F'`), `substring` over
+  batches (q22), and a hash of a join for q21's (supplier, nation).
