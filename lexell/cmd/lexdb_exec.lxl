@@ -9683,13 +9683,25 @@ fn semiInner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sq: mut &Query, 
 const SEMI_RUN_PK: float = 5000.0f
 const SEMI_RUN_INDEX: float = 100.0f
 
-fn semiCheaper(outer: float, inner: float, pk: bool): bool {
+fn semiCheaper(outer: float, inner: float, run: float): bool {
     // The inner side is read once and hashed (COST_SCAN), not once per outer
-    // row; the per-row side pays its setup and the first row's lookup. One
-    // pinned row is one lookup: no build.
+    // row; the per-row side pays a run each (semiRun). One pinned row is
+    // one run: no build.
     if outer <= 1.0f { return false }
-    let run = if pk { SEMI_RUN_PK } else { SEMI_RUN_INDEX }
-    return inner * (COST_SCAN + HASH_BUILD) + outer * HASH_PROBE < outer * (run + COST_DESCENT + COST_KEY_ROW)
+    return inner * (COST_SCAN + HASH_BUILD) + outer * HASH_PROBE < outer * run
+}
+
+// One per-row run's cost, by its first table's path: its setup and the
+// first row's lookup for a key's (a primary key's range, a secondary
+// index's), its setup and every row for a path with no key: a full scan
+// reads the inner side (about inner rows) again on each run. Charging it as
+// a lookup chose 40 runs of a 100k-row scan, 2.76M rows, over one hash.
+fn semiRun(lv: &Level, inner: float): float {
+    let p = &lv.path
+    let keyed = len(p.eqs) > 0 || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0
+    if !keyed || lv.virt() { return SEMI_RUN_PK + inner * COST_SCAN }
+    let setup = if p.index < 0 { SEMI_RUN_PK } else { SEMI_RUN_INDEX }
+    return setup + COST_DESCENT + COST_KEY_ROW
 }
 
 // Reads a subquery's tables only the columns its output and its conditions
@@ -9732,11 +9744,10 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     if alts[i].isSome() && !q.subs[i].hashed {
         var alt = replace(mut &alts[i], None).unwrap()
         let inner = try semiInner(st, txn, mut &alt.sel.q, params)
-        var pk = true
-        if len(q.subs[i].sel.q.levels) > 0 {
-            pk = q.subs[i].sel.q.levels[0].path.index < 0
-        }
-        if outer >= 0.0f && inner >= 0.0f && semiCheaper(outer, inner, pk) {
+        // the per-row plan's run (the subquery as planned, not alt)
+        var run = SEMI_RUN_PK + COST_DESCENT + COST_KEY_ROW
+        if len(q.subs[i].sel.q.levels) > 0 { run = semiRun(&q.subs[i].sel.q.levels[0], inner) }
+        if outer >= 0.0f && inner >= 0.0f && semiCheaper(outer, inner, run) {
             let got = semiKeys(q, &alt, c, pt)
             if got.isSome() {
                 keys = got.unwrap()
