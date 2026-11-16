@@ -5835,6 +5835,94 @@ fn ufRoot(parent: &[]int, i: int): int {
     return x
 }
 
+// One equality per class into each table (ms: the conjuncts per level, the
+// implied ones added): of a class's equalities between a column of level k
+// and a column of an earlier level, the first is kept and one whose earlier
+// column is another level's is left out, since the two earlier columns
+// were made equal at the later of their levels (implied adds every pair of
+// levels a class joins). PostgreSQL makes one clause per equivalence class
+// for each join (equivclass.c, generate_join_implied_equalities). TPC-H
+// q5 hashed supplier on (s_suppkey, s_nationkey, s_nationkey): c_nationkey
+// = s_nationkey and n_nationkey = s_nationkey; one key of each is enough,
+// and a hash of one integer key has its own map. Two columns of the same
+// earlier level both stay: nothing need have made them equal. Only an
+// equality whose two columns are in the class, and of one integer type or
+// both dates (plainEqCols), is left out or stands for another: the classes
+// leave out equalities across types (int = numeric), which no other
+// equality implies.
+fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
+    var all: []Expr = []
+    for m in ms { for c in m { append(mut &all, clone(&c)) } }
+    let cls = q.eqClasses(&all)
+    for k in 1..len(ms) {
+        var keep: []Expr = []
+        var kc: []int = []          // per equality kept: its class, its earlier level
+        var kl: []int = []
+        let xs = replace(mut &ms[k], [])
+        for c in xs {
+            var drop = false
+            match c {
+                Expr.Bin(op, l, r) {
+                    if op == "=" {
+                        match l {
+                            Expr.Col(a) {
+                                match r {
+                                    Expr.Col(b) {
+                                        let la = q.levelOf(&a)
+                                        let lb = q.levelOf(&b)
+                                        if la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k && q.plainEqCols(&a, &b) {
+                                            let mine = if la == k { &a } else { &b }
+                                            let lo = if la == k { lb } else { la }
+                                            var ci = -1
+                                            for x in 0..len(cls) {
+                                                var hasA = false
+                                                var hasB = false
+                                                for n in cls[x].names {
+                                                    if n == &a { hasA = true }
+                                                    if n == &b { hasB = true }
+                                                }
+                                                if hasA && hasB { ci = x }
+                                            }
+                                            if ci >= 0 {
+                                                for i in 0..len(kc) { if kc[i] == ci && kl[i] != lo { drop = true } }
+                                                if !drop {
+                                                    append(mut &kc, ci)
+                                                    append(mut &kl, lo)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else {}
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                }
+                else {}
+            }
+            if !drop { append(mut &keep, clone(&c)) }
+        }
+        ms[k] = keep
+    }
+}
+
+// Whether a = b is an equality oneEqPerClass may stand for by another of
+// its class: both columns of one integer type, or both dates. Their
+// equality is the values' own, so it is transitive. Not across types (an
+// int and a numeric, a date and a timestamp: the classes leave those out,
+// and the equality is a conversion's), and not texts (a char(n)'s padding,
+// a collation), floats (NaN, -0) or others, where a written equality is
+// kept as written.
+fn (q: &Query) plainEqCols(a: &str, b: &str): bool {
+    let i = colIndex(&q.cols, a)
+    let j = colIndex(&q.cols, b)
+    if i < 0 || j < 0 { return false }
+    let o = q.cols[i].typ.oid
+    if o != q.cols[j].typ.oid { return false }
+    return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_DATE
+}
+
 // The equalities cs holds, as text, each way round (a set, so that the
 // implied ones are checked against it at once: a star of 24 tables implies
 // hundreds).
@@ -6061,8 +6149,9 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[
             let r = lv.est.rowsFor(wc.tree, n, &key)
             m = if r >= 0 { float(r) } else { fmax(t / 10.0f, 1.0f) }
         }
-        if !outer && n < len(wc.colIds) && wc.colIds[n] >= 0 {
-            // a range of the next column (optimizer 29)
+        if n < len(wc.colIds) && wc.colIds[n] >= 0 {
+            // a range of the next column (optimizer 29), by constants:
+            // a lookup's too, after its equalities
             let sh = q.rangeShare(k, wc.colIds[n], cs)
             if n == 0 && sh >= 1.0f { continue }        // a whole index: no better than the full scan
             m = m * sh
@@ -6418,7 +6507,7 @@ fn (q: &Query) setRows(mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &
 // SQLite's N-best search from the levels init (each a one-table start):
 // the order (order, flags: read once) and its cost (optimizer 28; from a
 // given start, optimizer 32).
-fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, base: &[]Way, adj: &[]int, cmask: &[]int, cdist: &[]float,
+fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, owns: &[][]Expr, base: &[]Way, adj: &[]int, cmask: &[]int, cdist: &[]float,
                      memo: mut &Map[int, float], lookups: bool, cap: float, order: mut &[]int, flags: mut &[]bool): float {
     // SQLite's N-best search: at each step the JOIN_BEST cheapest
     // partial orders are kept (one per set of tables), each extended by
@@ -6455,7 +6544,7 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, base: &[]Way, a
                 let next = mask | (1 << k)
                 var o = false
                 let rnext = q.setRows(next, nl, base, cmask, cdist, memo)
-                let total = pc[p] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                let total = pc[p] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
                 let j = at.getOr(&next, -1)
                 if j >= 0 {
                     if nc[j] <= total { continue }
@@ -6509,13 +6598,12 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, base: &[]Way, a
 // Where a lookup is possible, it is taken when lookups is set, or when the
 // hash would hold more than cap bytes (statement memory, optimizer 26
 // review).
-fn (q: &Query) joinStep(k: int, cands: &[]WayCand, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
+fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
                         cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
     var add = base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
     hashed = true
-    let none: []Expr = []
-    let w = q.wayInto(k, cands, mask, true, &none)
+    let w = q.wayInto(k, cands, mask, true, own)
     if w.rows >= 0.0f {
         let big = base.rows * float(estRowBytes(&q.levels[k].t)) > cap
         if lookups || big || rin * w.cost + out < add {
@@ -6636,6 +6724,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     var cands: [][]WayCand = []
     var base: []Way = []                // each level by its constants alone
     var guessed: []bool = []            // per level: its rows by a guessed share
+    var owns: [][]Expr = []             // per level: its own conditions
     for k in 0..nl {
         append(mut &cands, q.wayCands(k, &cs))
         // its own conditions (no other table's columns)
@@ -6654,6 +6743,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         var g = false
         append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: w.cost, outer: false, inner: w.inner})
         append(mut &guessed, g)
+        append(mut &owns, own)
     }
     // the levels each level shares a conjunct with
     var adj: []int = array(nl, 0)
@@ -6711,7 +6801,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
                 let next = mask | (1 << k)
                 var o = false
                 let rnext = q.setRows(next, nl, &base, &cmask, &cdist, mut &memo)
-                let total = cost[mask] + q.joinStep(k, &cands[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                let total = cost[mask] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
                 if cost[next] < 0.0f || total < cost[next] {
                     cost[next] = total
                     last[next] = k
@@ -6736,7 +6826,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     } else {
         var starts: []int = []
         for k in 0..nl { append(mut &starts, k) }
-        bestCost = q.nBest(&starts, nl, &cands, &base, &adj, &cmask, &cdist, mut &memo, lookups, cap, mut &order, mut &flags)
+        bestCost = q.nBest(&starts, nl, &cands, &owns, &base, &adj, &cmask, &cdist, mut &memo, lookups, cap, mut &order, mut &flags)
     }
     // ORDER BY ... LIMIT (optimizer 32): the ordered table first, read in its
     // order (a full scan the planner turns into its index), each other table
@@ -6759,7 +6849,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     if ordT >= 0 && sure && !q.constWay(ordT, &cands[ordT], &cs, ordCols) {
         var o2: []int = []
         var f2: []bool = []
-        let c2 = q.nBest(&[ordT], nl, &cands, &base, &adj, &cmask, &cdist, mut &memo, true, cap, mut &o2, mut &f2)
+        let c2 = q.nBest(&[ordT], nl, &cands, &owns, &base, &adj, &cmask, &cdist, mut &memo, true, cap, mut &o2, mut &f2)
         var builds = 0.0f
         for i in 1..nl { if f2[i] { builds += base[o2[i]].cost + base[o2[i]].rows * HASH_BUILD } }
         let rall = q.setRows((1 << nl) - 1, nl, &base, &cmask, &cdist, mut &memo)
@@ -7936,6 +8026,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         for i in 0..len(ro) { q.levels[i].readOnce = ro[i] }
+        if q.innerOnly() { q.oneEqPerClass(mut &ms) }
     }
     if q.corr {
         // a correlated subquery runs per row: its conjuncts go last
