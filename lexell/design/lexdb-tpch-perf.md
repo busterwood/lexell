@@ -1011,6 +1011,29 @@ on main's `cmd/`). Not ours, found by the same review: FOR UPDATE inside a
 FROM subquery with a LEFT JOIN crashes on main (index out of range in
 `tryRow`'s `rs.cnt[k]`).
 
+**Round 2: q20 (main 5917302b, fixed clock).** q20 was 1,418 ms against
+PostgreSQL's ~120 ms. Re-verified both of semi's leads:
+- *(a) IN past 1,000 values.* partsupp was read whole (800,000 rows) for
+  2,127 part keys. choosePath now sets `Path.inMax`, the most values
+  whose lookups (a descent and the key's rows by ANALYZE) cost less than
+  one read of the table; pathScans reads whole only past it (never below
+  the old 1,000, and the old limit without statistics). partsupp now
+  reads 8,508 rows. **q20 1,418 -> 385 ms** (A/B against a main build,
+  run.sh at the fixed clock; 1,414-1,418 and 384-385), q16 and q18
+  unchanged; all 22 checks "ok" (`out-q20all`). `exec_inlookup` covers
+  it (duplicates and NULLs in the values, NOT IN with and without a NULL,
+  past the limit, inside a correlated subquery; batches off, on, and a
+  join/NOT EXISTS formulation).
+- *(b) the correlated subquery's setup* was measured before building it:
+  the same 8,508 runs with a key that matches no row take 72-75 ms
+  against 21 ms without the subquery, so the setup is about 6 us a run
+  (about 50 ms of q20's 300 ms). The rest, about 225 ms, is reading
+  63,832 lineitem rows through `lineitem_part_supp` (3.5 us a row in
+  `fillIdxRows`/`getMany` and the row decode): `exec`'s read path, not
+  setup. Caching the prepared run would save at most about 15% of q20,
+  so it was not built; the 100 us a run semi measured included
+  partsupp's whole read.
+
 **For other workstreams.** q3 and q10 (and any query with a lineitem
 primary-key prefix lookup per row) run their joins and grouping on the
 row path because `bJoinPlan` gives up on the whole query when one level
