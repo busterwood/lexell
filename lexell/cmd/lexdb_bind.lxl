@@ -702,3 +702,54 @@ pub fn hasParam(x: &BX): bool {
         }
     }
 }
+
+// x, bound over a row of cols by place (direct), re-slotted for a row of
+// the columns slots lists, as bindExpr binds with direct false: Col(i)
+// becomes Col(s), slots[s] == i (i added to slots when first read). par:
+// set when x reads a parameter slot (BX.Param). A plan's bound tree run
+// over a batch's row (lexdb_exec's bGenOf), not bound again per run.
+pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
+    match x {
+        BX.Const(v) { return BX.Const(v) }
+        BX.Param(i) {
+            par = true
+            return BX.Param(i)
+        }
+        BX.Col(i) {
+            for s in 0..len(slots) { if slots[s] == i { return BX.Col(s) } }
+            append(slots, i)
+            return BX.Col(len(slots) - 1)
+        }
+        BX.Agg(i) { return BX.Agg(i) }
+        BX.Un(u, a) { return BX.Un(u, reslot(&a, slots, par)) }
+        BX.And(a, b) {
+            let ra = reslot(&a, slots, par)
+            return BX.And(ra, reslot(&b, slots, par))
+        }
+        BX.Or(a, b) {
+            let ra = reslot(&a, slots, par)
+            return BX.Or(ra, reslot(&b, slots, par))
+        }
+        BX.Op(op, a, b) {
+            let ra = reslot(&a, slots, par)
+            return BX.Op(op, ra, reslot(&b, slots, par))
+        }
+        BX.Cat(a, b, f) {
+            let ra = reslot(&a, slots, par)
+            return BX.Cat(ra, reslot(&b, slots, par), f)
+        }
+        BX.IsNull(a, neg) { return BX.IsNull(reslot(&a, slots, par), neg) }
+        BX.Cast(a, t) { return BX.Cast(reslot(&a, slots, par), t) }
+        BX.Case(cs, hasElse) {
+            var bs: []BX = withCapacity(len(cs))
+            for c in cs { append(mut &bs, reslot(&c, slots, par)) }
+            return BX.Case(bs, hasElse)
+        }
+        BX.Try(a) { return BX.Try(reslot(&a, slots, par)) }
+        BX.Call(fr, cs) {
+            var bs: []BX = withCapacity(len(cs))
+            for c in cs { append(mut &bs, reslot(&c, slots, par)) }
+            return BX.Call(FnRef{name: fr.name, way: fr.way, id: fr.id, dialect: fr.dialect}, bs)
+        }
+    }
+}
