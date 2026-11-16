@@ -9862,19 +9862,21 @@ fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val, z: &lexdb_time.Zone)
     // by the key when x is of the values' class (a number against floats
     // as a float8), else each of the key's values compared (inProbe)
     let cx = inClass(x)
-    if r.cls >= 0 && (cx == r.cls || (cx == 1 && r.cls == 2)) {
-        var mk = newStrBuf()
-        mk.add(&gk.toStr())
-        if r.cls == 2 {
-            match asFloat(x) {
-                Some(fx) { keyPart(mut &mk, &Val.Float(fx)) }
-                None { keyPart(mut &mk, x) }
+    var mk = newStrBuf()
+    mk.add(&gk.toStr())
+    var keyed = false
+    if r.cls == 2 && (cx == 1 || cx == 2) {
+        match asFloat(x) {
+            Some(fx) {
+                keyPart(mut &mk, &Val.Float(fx))
+                keyed = true
             }
-        } else {
-            keyPart(mut &mk, x)
+            None {}
         }
-        if r.set.get(&mk.toStr()).isSome() { return Val.Bool(true) }
-    } else if r.cls != -2 {
+    }
+    if !keyed { keyPart(mut &mk, x) }
+    if r.set.get(&mk.toStr()).isSome() { return Val.Bool(true) }
+    if inCompares(r.cls, cx) {
         match r.gidx.get(&gk.toStr()) {
             Some(gi) {
                 for v in r.gvals[gi] {
@@ -10763,6 +10765,16 @@ fn inFamily(a: int, b: int): bool {
     return a == b || ((a == 1 || a == 2) && (b == 1 || b == 2)) || (a >= 10 && b >= 10)
 }
 
+// Whether an IN set of class cls (-1 mixed) is searched value by value for
+// an x of class cx its keys did not find: x a number or a date or time,
+// and the set not all of x's own class (keyed alike: the key decided) nor
+// floats with x a number.
+fn inCompares(cls: int, cx: int): bool {
+    if !(cx == 1 || cx == 2 || cx >= 10) { return false }
+    if cls == -2 || cls == cx || (cls == 2 && cx == 1) { return false }
+    return true
+}
+
 // A float set's value as keyed: its float8 (a float4 widened, as = compares).
 fn inFloat(v: Val): Val {
     match asFloat(&v) {
@@ -10780,19 +10792,22 @@ fn inProbe(r: &SubRes, x: &Val, z: &lexdb_time.Zone): Val {
     if r.rows == 0 { return Val.Bool(false) }
     if isNull(x) { return Val.Null }
     let cx = inClass(x)
-    if r.cls >= 0 && (cx == r.cls || (cx == 1 && r.cls == 2)) {
-        var xf = Val.Null
-        if r.cls == 2 {
-            match asFloat(x) {
-                Some(f) { xf = Val.Float(f) }
-                None {}
-            }
-        }
-        match (if r.cls == 2 { setKey(&xf, r.numeric) } else { setKey(x, r.numeric) }) {
-            Some(k) { if r.set.get(&k).isSome() { return Val.Bool(true) } }
+    // by the set's key (a number against floats as a float8)
+    let asF = r.cls == 2 && (cx == 1 || cx == 2)
+    var xf = Val.Null
+    if asF {
+        match asFloat(x) {
+            Some(f) { xf = Val.Float(f) }
             None {}
         }
-    } else if r.cls != -2 {
+    }
+    match (if asF { setKey(&xf, r.numeric) } else { setKey(x, r.numeric) }) {
+        Some(k) { if r.set.get(&k).isSome() { return Val.Bool(true) } }
+        None {}
+    }
+    // a number or a date or time x against values its key does not reach
+    if !inCompares(r.cls, cx) { return if r.hasNull { Val.Null } else { Val.Bool(false) } }
+    if r.cls != -2 {
         for v in r.vals {
             if !inFamily(cx, inClass(&v)) { continue }
             match compareZ(x, &v, z) {
@@ -11084,7 +11099,16 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
             let c = inClass(&r[0])
             if out.cls == -2 { out.cls = c } else if out.cls != c { out.cls = -1 }
         }
-        out.numeric = out.cls == 1
+        // (numbers by value when any is an integer or numeric, as before,
+        // unless all are floats)
+        for r in res.rows {
+            match r[0] {
+                Val.Int(_) { out.numeric = true }
+                Val.Num(_) { out.numeric = true }
+                else {}
+            }
+        }
+        if out.cls == 2 { out.numeric = false }
         for r in res.rows {
             if isNull(&r[0]) {
                 out.hasNull = true
