@@ -2114,18 +2114,23 @@ fn addEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, row: &
 pub fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rows: &[]&[]Val,
               pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
               wrote: &fn(&lexdb_store.Txn)): Result[Conflict, DbErr] {
-    let rowid = rowidKeyed(t)
     for at in 0..len(rows) {
-        let row = rows[at]
-        let key = keyOf(t, row)
-        if !rowid && (try st.get(txn, t.tree, &key)).isSome() { return Ok(Conflict{at: at, ix: PK_CONFLICT}) }
-        let enc = encRow(t, row)
-        try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
-        wrote(txn)
-        let c = try addEntries(st, txn, t, row, &key, pred, expr)
+        let c = try insertRow(st, txn, t, rows[at], pred, expr, wrote)
         if c != NO_CONFLICT { return Ok(Conflict{at: at, ix: c}) }
     }
     return Ok(noConflict())
+}
+
+// insert for one row: NO_CONFLICT, PK_CONFLICT or the index's number.
+pub fn insertRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, row: &[]Val,
+                 pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
+                 wrote: &fn(&lexdb_store.Txn)): Result[int, DbErr] {
+    let key = keyOf(t, row)
+    if !rowidKeyed(t) && (try st.get(txn, t.tree, &key)).isSome() { return Ok(PK_CONFLICT) }
+    let enc = encRow(t, row)
+    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
+    wrote(txn)
+    return addEntries(st, txn, t, row, &key, pred, expr)
 }
 
 // Rows olds[i] of t changed to news[i], their index entries with them: a
@@ -2135,52 +2140,65 @@ pub fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, olds: 
               pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
               wrote: &fn(&lexdb_store.Txn)): Result[Conflict, DbErr] {
     for at in 0..len(olds) {
-        let old = olds[at]
-        let row = news[at]
-        let oldKey = keyOf(t, old)
-        let key = keyOf(t, row)
-        if key != oldKey {
-            if (try st.get(txn, t.tree, &key)).isSome() { return Ok(Conflict{at: at, ix: PK_CONFLICT}) }
-            txn.del(t.tree, &oldKey)
-        }
-        let enc = encRow(t, row)
-        try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
-        wrote(txn)
-        for i in 0..len(t.indexes) {
-            let ix = &t.indexes[i]
-            let was = try ixHolds(ix, old, pred)
-            let now = try ixHolds(ix, row, pred)
-            // (an entry made only for a row the index holds: an expression
-            // need not have a value outside a filtered index's rows)
-            let a = if was { (try ixKey(t, ix, old, expr)).pre + oldKey } else { "" }
-            var b = ""
-            var nul = false
-            if now {
-                let k = try ixKey(t, ix, row, expr)
-                b = k.pre + key
-                nul = k.nul
-            }
-            if a == b && was == now { continue }
-            if was { txn.del(ix.tree, &a) }
-            if now {
-                if ix.unique && !nul && (try ixClash(st, txn, ix, &b[0..len(b) - len(key)], &key)) { return Ok(Conflict{at: at, ix: i}) }
-                try txn.put(ix.tree, &b, &key)
-            }
-        }
+        let c = try updateRow(st, txn, t, olds[at], news[at], pred, expr, wrote)
+        if c != NO_CONFLICT { return Ok(Conflict{at: at, ix: c}) }
     }
     return Ok(noConflict())
+}
+
+// update for one row: NO_CONFLICT, PK_CONFLICT or the index's number.
+pub fn updateRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, old: &[]Val, row: &[]Val,
+                 pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
+                 wrote: &fn(&lexdb_store.Txn)): Result[int, DbErr] {
+    let oldKey = keyOf(t, old)
+    let key = keyOf(t, row)
+    if key != oldKey {
+        if (try st.get(txn, t.tree, &key)).isSome() { return Ok(PK_CONFLICT) }
+        txn.del(t.tree, &oldKey)
+    }
+    let enc = encRow(t, row)
+    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
+    wrote(txn)
+    for i in 0..len(t.indexes) {
+        let ix = &t.indexes[i]
+        let was = try ixHolds(ix, old, pred)
+        let now = try ixHolds(ix, row, pred)
+        // (an entry made only for a row the index holds: an expression
+        // need not have a value outside a filtered index's rows)
+        let a = if was { (try ixKey(t, ix, old, expr)).pre + oldKey } else { "" }
+        var b = ""
+        var nul = false
+        if now {
+            let k = try ixKey(t, ix, row, expr)
+            b = k.pre + key
+            nul = k.nul
+        }
+        if a == b && was == now { continue }
+        if was { txn.del(ix.tree, &a) }
+        if now {
+            if ix.unique && !nul && (try ixClash(st, txn, ix, &b[0..len(b) - len(key)], &key)) { return Ok(i) }
+            try txn.put(ix.tree, &b, &key)
+        }
+    }
+    return Ok(NO_CONFLICT)
 }
 
 // Rows of t deleted, with their index entries.
 pub fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rows: &[]&[]Val,
               pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
               wrote: &fn(&lexdb_store.Txn)): Result[Unit, DbErr] {
-    for row in rows {
-        let key = keyOf(t, row)
-        txn.del(t.tree, &key)
-        wrote(txn)
-        for ix in t.indexes { if try ixHolds(&ix, row, pred) { txn.del(ix.tree, &((try ixKey(t, &ix, row, expr)).pre + key)) } }
-    }
+    for row in rows { try deleteRow(st, txn, t, row, pred, expr, wrote) }
+    return Ok(Unit{})
+}
+
+// delete for one row.
+pub fn deleteRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, row: &[]Val,
+                 pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr],
+                 wrote: &fn(&lexdb_store.Txn)): Result[Unit, DbErr] {
+    let key = keyOf(t, row)
+    txn.del(t.tree, &key)
+    wrote(txn)
+    for ix in t.indexes { if try ixHolds(&ix, row, pred) { txn.del(ix.tree, &((try ixKey(t, &ix, row, expr)).pre + key)) } }
     return Ok(Unit{})
 }
 
@@ -2191,39 +2209,41 @@ pub fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rows: 
 pub fn conflicts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, arb: &[]int, rows: &[]&[]Val,
                  pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[[]Option[[]Val], DbErr] {
     var out: []Option[[]Val] = withCapacity(len(rows))
-    for row in rows {
-        var found: Option[[]Val] = None
-        for a in arb {
-            var pk = ""
-            if a < 0 {
-                pk = keyOf(t, row)
-            } else {
-                let ix = &t.indexes[a]
-                // (its parts first, then its predicate, as the check reads them)
-                var nul = false
-                for k in 0..len(ix.cols) { if isNull(&(try ixPart(t, ix, k, row, expr))) { nul = true; break } }
-                if nul || !(try ixHolds(ix, row, pred)) { continue }
-                let pre = (try ixKey(t, ix, row, expr)).pre
-                var hit: []str = []
-                try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-                    append(mut &hit, en.val)
-                    return false
-                })
-                if len(hit) == 0 { continue }
-                pk = hit[0]
-            }
-            match try st.get(txn, t.tree, &pk) {
-                Some(v) {
-                    let all: []bool = []
-                    found = Some(try rowOf(st, txn, t, &pk, &v, rowWidth(t), &all, &placesMissing(t)))
-                    break
-                }
-                None {}
-            }
-        }
-        append(mut &out, found)
-    }
+    for row in rows { append(mut &out, try conflictRow(st, txn, t, arb, row, pred, expr)) }
     return Ok(out)
+}
+
+// conflicts for one row.
+pub fn conflictRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, arb: &[]int, row: &[]Val,
+                   pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[Option[[]Val], DbErr] {
+    for a in arb {
+        var pk = ""
+        if a < 0 {
+            pk = keyOf(t, row)
+        } else {
+            let ix = &t.indexes[a]
+            // (its parts first, then its predicate, as the check reads them)
+            var nul = false
+            for k in 0..len(ix.cols) { if isNull(&(try ixPart(t, ix, k, row, expr))) { nul = true; break } }
+            if nul || !(try ixHolds(ix, row, pred)) { continue }
+            let pre = (try ixKey(t, ix, row, expr)).pre
+            var hit: []str = []
+            try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
+                append(mut &hit, en.val)
+                return false
+            })
+            if len(hit) == 0 { continue }
+            pk = hit[0]
+        }
+        match try st.get(txn, t.tree, &pk) {
+            Some(v) {
+                let all: []bool = []
+                return Ok(Some(try rowOf(st, txn, t, &pk, &v, rowWidth(t), &all, &placesMissing(t))))
+            }
+            None {}
+        }
+    }
+    return Ok(None)
 }
 
 // Per row, whether t has a row with its values: through its primary key
@@ -2231,21 +2251,22 @@ pub fn conflicts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, arb
 pub fn hasKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, via: int, rows: &[]&[]Val,
                expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[[]bool, DbErr] {
     var out: []bool = withCapacity(len(rows))
-    for row in rows {
-        if via < 0 {
-            append(mut &out, (try st.get(txn, t.tree, &(keyOf(t, row)))).isSome())
-            continue
-        }
-        let ix = &t.indexes[via]
-        let pre = (try ixKey(t, ix, row, expr)).pre
-        var found = false
-        try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-            found = true
-            return false
-        })
-        append(mut &out, found)
-    }
+    for row in rows { append(mut &out, try hasKey(st, txn, t, via, row, expr)) }
     return Ok(out)
+}
+
+// hasKeys for one row.
+pub fn hasKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, via: int, row: &[]Val,
+              expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[bool, DbErr] {
+    if via < 0 { return Ok((try st.get(txn, t.tree, &(keyOf(t, row)))).isSome()) }
+    let ix = &t.indexes[via]
+    let pre = (try ixKey(t, ix, row, expr)).pre
+    var found = false
+    try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
+        found = true
+        return false
+    })
+    return Ok(found)
 }
 
 // The keys of [lo, hi) for equalities eqs on the first columns and a lower

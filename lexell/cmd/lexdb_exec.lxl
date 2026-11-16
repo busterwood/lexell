@@ -14184,10 +14184,9 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
 // The row already in t that row conflicts with on one of up's unique keys,
 // if any.
 fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: &Upsert, row: &[]Val): Result[Option[[]Val], DbErr] {
-    var got = try lexdb_access.conflicts(st, txn, &relOf(t), &up.arb, &[row],
-                                         fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
-                                         fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
-    return Ok(pop(mut &got))
+    return lexdb_access.conflictRow(st, txn, &relOf(t), &up.arb, row,
+                                    fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                    fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
 }
 
 // The row there (old), the row proposed (row): DO NOTHING leaves it; DO
@@ -14224,12 +14223,12 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     try checkEnums(st, txn, t, &row)
     // its key free (the hidden key is its sequence's next value, never
     // given: not looked for, 9.119), its index entries added
-    let c = try lexdb_access.insert(st, txn, &relOf(t), &[&row],
-                                    fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
-                                    fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                                    fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })
-    if c.ix == lexdb_access.PK_CONFLICT { return Err(dupKey(t, &row)) }
-    if c.ix >= 0 { return Err(try uniqueErr(t, &t.indexes[c.ix], &row)) }
+    let c = try lexdb_access.insertRow(st, txn, &relOf(t), &row,
+                                       fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                       fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })
+    if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, &row)) }
+    if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], &row)) }
     if len(t.fks) > 0 {
         let none: []Val = []
         try childSide(st, txn, t, fw, &row, &none, later)
@@ -20303,9 +20302,8 @@ fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &
     var prow = nullRow(len(p.cols))
     for k in 0..len(vals) { prow[fc.refCols[k]] = vals[k] }
     if fc.via < -1 { return Ok(false) }
-    var got = try lexdb_access.hasKeys(st, txn, &relOf(p), fc.via, &[&prow],
-                                       fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(p, xi, k, r) })
-    return Ok(pop(mut &got))
+    return lexdb_access.hasKey(st, txn, &relOf(p), fc.via, &prow,
+                               fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(p, xi, k, r) })
 }
 
 // Whether a row of table c has vals in its columns cols.
@@ -20437,12 +20435,12 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
     try checkRow(t, row)
     try checkChecks(t, row)
     try checkEnums(st, txn, t, row)
-    let c = try lexdb_access.update(st, txn, &relOf(t), &[old], &[row],
-                                    fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
-                                    fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                                    fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 1) })
-    if c.ix == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
-    if c.ix >= 0 { return Err(try uniqueErr(t, &t.indexes[c.ix], row)) }
+    let c = try lexdb_access.updateRow(st, txn, &relOf(t), old, row,
+                                       fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                       fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 1) })
+    if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
+    if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
     if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
     if len(t.refBy) > 0 { try parentSide(st, txn, t, fw, old, row, true, later) }
     return Ok(Unit{})
@@ -20451,10 +20449,10 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
 // Row of table t deleted, its index entries, and what references it.
 fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]Val, fw: &[]Table,
           later: mut &[]FkLater): Result[Unit, DbErr] {
-    try lexdb_access.delete(st, txn, &relOf(t), &[row],
-                            fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
-                            fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                            fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 2) })
+    try lexdb_access.deleteRow(st, txn, &relOf(t), row,
+                               fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                               fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                               fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 2) })
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
