@@ -4886,6 +4886,7 @@ type Run = record {
     maxRounds: int              // a recursive CTE's rounds at most (the session's max_recursion); 0 no limit
     maxSteps: int               // MATCH_RECOGNIZE: steps per start row at most (the session's max_match_steps); 0 no limit
     held: int                   // about the bytes of rows the statement holds (its runs inside: their own and this)
+    aside: int                  // ... and those a batch consumer (groups, a sort) holds in its own count while a batch is joined (bRange)
     maxHeld: int                // max_statement_mem; 0 no limit
     deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
     ticks: int
@@ -5030,7 +5031,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
+               held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -26820,7 +26821,8 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     var nNeed = 0
     for c in 0..len(bp.needCol) { if bp.needCol[c] { nNeed += 1 } }
     let perRow = 32 + 24 * nNeed
-    let room0 = rs.room()
+    // (less what a grouping or a sort holds and has not yet given to rs)
+    let room0 = if rs.maxHeld > 0 { rs.maxHeld - rs.held - rs.aside } else { -1 }
     var over = false
     for x in 0..len(ks) {
         if bail || over || len(bad) > 0 { break }
@@ -27549,8 +27551,12 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 continue
             }
             if joined {
+                // (the batch's counts so far, for the row path to count it again)
+                var cntB: []Counts = []
+                for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
                 if got3.isNone() {
+                    rs.cnt = cntB
                     cur = saved
                     rowPath = true
                     break
@@ -28021,7 +28027,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             if nr == 0 { continue }
             let nChosen = pk.kept
             if op.joined {
+                rs.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
+                rs.aside = 0
                 if got3.isNone() {
                     rs.cnt = cnt0
                     return Ok(false)
@@ -28285,8 +28293,12 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             let nChosen = len(idx)
             if op.joined {
                 // the joined rows (9.102): the batch's rows from here on
+                // (the batch's counts so far, for the row path to count it again)
+                var cntB: []Counts = []
+                for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
                 if got3.isNone() {
+                    rs.cnt = cntB
                     cur = saved
                     rowPath = true
                     break
@@ -28370,11 +28382,18 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // a numeric past its units gives way to the row path, from the start
     // (the groups are made at the end: none yet)
     let h0: int = held + 0
+    // the counts so far: the row path counts from the start again
+    var cnt0: []Counts = []
+    for c in rs.cnt { append(mut &cnt0, c) }
     match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max) {
-        Ok(x) { return Ok(x) }
+        Ok(x) {
+            if !x { rs.cnt = cnt0 }
+            return Ok(x)
+        }
         Err(x) {
             if !isSpill(&x) { return Err(x) }
             held = h0
+            rs.cnt = cnt0
             decSpills += 1
             return Ok(false)
         }
@@ -28696,7 +28715,9 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             }
             nJoined += len(idx)
             if jn {
+                rs.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &jp, &b, &idx, &zone, rs)
+                rs.aside = 0
                 if got3.isNone() {
                     held -= added
                     return Ok(false)

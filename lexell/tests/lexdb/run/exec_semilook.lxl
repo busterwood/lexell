@@ -43,7 +43,7 @@
 // expect: looked up: 268 of 300, 268 over batches
 // expect: nested: 56 queries, 56 the same as with counts, batches off and on
 // expect: hashed: 4 queries, 4 hashed, 4 the same as with counts, batches off and on
-// expect: skewed: same: true, looked up: true
+// expect: skewed: same: true, looked up: true, counts as the row path's: true
 // expect: chars: 6 comparisons, 6 as the join compares
 // expect: reftypes: 13 comparisons, 13 as the join compares
 // expect: char filter: 6 queries, 6 as the filter outside, per row: true
@@ -390,10 +390,25 @@ fn skewed(s: mut &lexdb_exec.Session) {
     }
     append(mut &outs, q(s, &"select count(*), sum(c.id) from c where c.id < 60 and (select count(*) from sk where sk.k = c.nat and sk.v > 990 + c.id % 20) > 0"))
     append(mut &outs, q(s, &"select count(*), sum(c.id) from c where c.id < 60 and (select count(*) from sk where sk.k = c.nat and sk.v > 990 + c.id % 20) = 0"))
+    // EXPLAIN ANALYZE's counts: the batch given up is not counted twice
+    // (the row path counts all of it), with grouping and with rows out
+    var cnts: []str = []
+    for sql in ["select count(*), sum(c.id) from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)",
+                "select c.id from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)",
+                "select count(*), sum(c.id) from c join n on n.id = c.nat where c.id < 60 and exists (select * from sk where sk.k = n.id and sk.v > 990 + c.id % 20)",
+                "select c.id, n.name from c join n on n.id = c.nat where c.id < 60 and exists (select * from sk where sk.k = n.id and sk.v > 990 + c.id % 20)"] {
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            append(mut &cnts, plan(&ex(s, &("explain analyze " + sql))))
+        }
+    }
     let m2 = q(s, &"set max_statement_mem = 0")
+    let counted = cnts[0] == cnts[1] && cnts[2] == cnts[3] && cnts[4] == cnts[5] && cnts[6] == cnts[7]
+    if !counted { for c in cnts { println("  " + c) } }
     let pl = ex(s, &"explain select count(*), sum(c.id) from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)")
     let same = outs[0] == outs[2] && outs[2] == outs[4] && outs[1] == outs[3] && outs[3] == outs[5]
-    println("skewed: same: " + same.toStr() + ", looked up: " + strings.contains(&pl, "semi join sk: primary key range per row").toStr())
+    println("skewed: same: " + same.toStr() + ", looked up: " + strings.contains(&pl, "semi join sk: primary key range per row").toStr() +
+            ", counts as the row path's: " + counted.toStr())
     if !same { for o in outs { println("  " + o) } }
 }
 
