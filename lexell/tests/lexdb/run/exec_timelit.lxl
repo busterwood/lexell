@@ -1,0 +1,71 @@
+// lexdb_exec: an untyped value beside a date or time column is of the
+// column's type (design/lexdb-layers.md 4.4.1, 2-iii). resolve casts a
+// text literal, or a parameter of no type or a text's, to the column's
+// type (timeLitOid), as PostgreSQL types it; a batch then compares the
+// column with a value of its own kind, and another date or time kind
+// only in UTC (bCmpKinds), where its comparison is the row path's. Each
+// count is PostgreSQL 18.6's, in Asia/Kolkata (and UTC at the end),
+// batches on and off.
+// - A literal the column's type refuses is refused even where the
+//   column is NULL (PostgreSQL types it when parsing): lexdb gave 0
+//   rows, comparing only the rows not NULL.
+// expect: on: 514, 514, 256, 643, 257, 1157, 1287, 643, 643, 22007 invalid input syntax for type timestamp with time zone: "bad", 643, 256, utc 1414, 1414
+// expect: off: 514, 514, 256, 643, 257, 1157, 1287, 643, 643, 22007 invalid input syntax for type timestamp with time zone: "bad", 643, 256, utc 1414, 1414
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+type Val = lexdb_sql.Val
+fn run(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) { Ok(_) {} Err(e) { println(sql + " -> " + e.msg) } }
+}
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) { return lexdb_exec.text(&rs[len(rs) - 1].rows[0][0]) }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+// a prepared statement's run: its parameters texts of no type, as a client's
+fn p(s: mut &lexdb_exec.Session, pc: mut &lexdb_exec.PlanCache, sql: str, ps: []Val): str {
+    let st = lexdb_parse.parse(&sql).unwrap()
+    let pt: []int = array(len(ps), 0)
+    match s.runCached(&st[0], &ps, &pt, pc) {
+        Ok(r) { return lexdb_exec.text(&r.rows[0][0]) }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        run(mut &s, "create table w (id int primary key, d date, tz timestamptz, tm time)")
+        run(mut &s, "insert into w select g, date '2020-01-01' + (g % 20), timestamptz '2020-01-01 00:00:00+00' + (g % 20) * interval '1 hour', time '10:00' + (g % 10) * interval '1 minute' from generate_series(1, 3000) g")
+        run(mut &s, "update w set d = null, tz = null, tm = null where id % 7 = 0")
+        for b in ["on", "off"] {
+            run(mut &s, "set lexdb_batch = " + b)
+            run(mut &s, "set time zone 'Asia/Kolkata'")
+            var out: []str = []
+            append(mut &out, q(mut &s, "select count(*) from w where d < '2020-01-05'"))
+            append(mut &out, q(mut &s, "select count(*) from w where '2020-01-05' > d"))
+            append(mut &out, q(mut &s, "select count(*) from w where d in ('2020-01-02', '2020-01-03', null)"))
+            append(mut &out, q(mut &s, "select count(*) from w where tz < '2020-01-01 10:30'"))
+            append(mut &out, q(mut &s, "select count(*) from w where tz in ('2020-01-01 05:30', '2020-01-01 06:30')"))
+            append(mut &out, q(mut &s, "select count(*) from w where tz in ('2020-01-01 05:30', '2020-01-01 06:30', '2020-01-01 07:30', '2020-01-01 08:30', '2020-01-01 09:30', '2020-01-01 10:30', '2020-01-01 11:30', '2020-01-01 12:30', '2020-01-01 13:30')"))
+            append(mut &out, q(mut &s, "select count(*) from w where tm < '10:05'"))
+            append(mut &out, q(mut &s, "select count(*) from w where d < timestamp '2020-01-05 12:00'"))
+            append(mut &out, q(mut &s, "select count(*) from w where d <= timestamptz '2020-01-05 00:00+05:30'"))
+            append(mut &out, q(mut &s, "select count(*) from w where tz is null and tz = 'bad'"))
+            var pc = lexdb_exec.newPlanCache()
+            var pc2 = lexdb_exec.newPlanCache()
+            append(mut &out, p(mut &s, mut &pc, "select count(*) from w where tz < $1", [Val.Text("2020-01-01 10:30")]))
+            append(mut &out, p(mut &s, mut &pc2, "select count(*) from w where d in ($1, $2)", [Val.Text("2020-01-02"), Val.Text("2020-01-03")]))
+            run(mut &s, "set time zone 'UTC'")
+            append(mut &out, "utc " + q(mut &s, "select count(*) from w where tz < '2020-01-01 10:30'"))
+            append(mut &out, p(mut &s, mut &pc, "select count(*) from w where tz < $1", [Val.Text("2020-01-01 10:30")]))
+            println(b + ": " + strings.join(&out, ", "))
+        }
+        return 0
+    })
+}
