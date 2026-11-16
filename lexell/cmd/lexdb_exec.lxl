@@ -5766,8 +5766,7 @@ fn (q: &Query) colKind(name: &str): int {
 fn eqConst(x: &Expr): bool {
     match x {
         Expr.Lit(v) { return !isNull(&v) }
-        Expr.Param(_) { return true }
-        else { return false }
+        else { return refParam(x) }
     }
 }
 
@@ -7273,7 +7272,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
-            let byParam = match p.eqs[0] { Expr.Param(_) { true } else { false } }
+            let byParam = refParam(&p.eqs[0])
             if byParam && len(p.eqs) == 1 {
                 let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
                 let typ = keyType(&lv.t, c, 0)
@@ -9371,7 +9370,7 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
             Ok(n) {
                 let fc = &sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)]
                 oid = fc.typ.oid
-                if oid == lexdb_sql.OID_BPCHAR { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
+                if refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
                 if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
                 found = n
             }
@@ -9395,10 +9394,12 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         x = Expr.Param(sc.base + at + 1)
     }
-    // a char(n) column stays one (9.94): its parameter is untyped, which a
-    // comparison would read as the other side's type (ls.s = o.tc compared
-    // 'k1' with 'k1   ' as texts); as a cast to its type it is compared
-    // as the column is in the query it comes from
+    // the column keeps its type: a parameter is untyped, which a
+    // comparison reads as the other side's type (a char(n) column's 'k1'
+    // with 'k1   ' as texts; a text 'x ' padded as the inner char(3)'s
+    // 'x'; a date as the inner timestamp's text), where the join compares
+    // the column as it is. As a cast to its type (refParam) it is compared
+    // as in the query it comes from; the cast keeps the value as it is.
     match bp {
         Some(t) { x = Expr.Cast(x, t) }
         None {}
@@ -9406,6 +9407,29 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
     // a collated column keeps its collation (L2): #coll(x, name), implicit
     if len(coll) > 0 { x = Expr.Call("#coll", [x, Expr.Lit(Val.Text(coll))], false) }
     return Ok(Some(x))
+}
+
+// Whether an outer column of type oid is given as a cast to its type
+// (outerRef): the scalar types a cast keeps as they are.
+fn refTyped(oid: int): bool {
+    return isIntOid(oid) || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 ||
+           oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_BOOL ||
+           oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ ||
+           oid == lexdb_sql.OID_UUID
+}
+
+// A parameter, bare or as outerRef types an outer column: a cast of one.
+fn refParam(x: &Expr): bool {
+    match x {
+        Expr.Param(_) { return true }
+        Expr.Cast(a, _) {
+            match a {
+                Expr.Param(_) { return true }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
 }
 
 // The query being planned is done: its refs are what the query around it
@@ -9453,6 +9477,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 fn refOf(x: &Expr, base: int): int {
     match x {
         Expr.Param(n) { if n > base { return n - base - 1 } }
+        Expr.Cast(a, _) { return refOf(&a, base) }
         else {}
     }
     return -1
@@ -9504,7 +9529,7 @@ fn hasSubCall(x: &Expr): bool {
 
 // A conjunct "inner = outer" (either way round), into hk; false: it uses an
 // outer value otherwise.
-fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
+fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): bool {
     let t = lexdb_sql.exprText(c)
     for x in hk.texts { if x == t { return true } }
     match c {
@@ -9517,6 +9542,12 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
                 outer = clone(&a)
             }
             if !outerOnly(&outer, base) || usesRefs(&inner, base) || hasCorr(&inner) { return false }
+            // a hash compares keys by value (keyPart), which = does only
+            // for the same kinds of value (semiTypes): a timestamp with a
+            // date, a text with an integer, a float with a numeric compare
+            // equal as = converts them, and not as keys. The outer value's
+            // type: its column's (outerRef types it)
+            if !semiTypes(exprOid(&inner, cols, &[]), exprOid(&outer, cols, &[])) { return false }
             append(mut &hk.inner, inner)
             append(mut &hk.outer, outer)
             append(mut &hk.texts, t)
@@ -9526,11 +9557,11 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
     }
 }
 
-fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool): bool {
+fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool, cols: &[]lexdb_sql.ColDef): bool {
     for c in cs {
         if !usesRefs(&c, base) { continue }
         if !movable { return false }
-        if !keyConj(&c, base, hk) {
+        if !keyConj(&c, base, hk, cols) {
             if !res { return false }
             // not inner = outer: a filter the once-run subquery cannot keep
             // (the outer value is a parameter now), checked per candidate
@@ -9583,11 +9614,11 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
             if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return }
             for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
             // an outer join's ON conjuncts are not WHERE filters: they stay
-            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res) { return }
-            if !keyConjs(&lv.post, base, mut &hk, true, res) { return }
-            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res) { return }
+            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
+            if !keyConjs(&lv.post, base, mut &hk, true, res, &q.cols) { return }
+            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
         }
-        if !keyConjs(&q.top, base, mut &hk, true, res) { return }
+        if !keyConjs(&q.top, base, mut &hk, true, res, &q.cols) { return }
         if len(hk.inner) == 0 { return }
     }
     for k in 0..len(sp.sel.q.levels) {
@@ -9823,7 +9854,15 @@ fn substRefs(x: &Expr, base: int, refs: &[]Expr): Expr {
         Expr.Unary(op, a) { return Expr.Unary(op, substRefs(&a, base, refs)) }
         Expr.Bin(op, a, b) { return Expr.Bin(op, substRefs(&a, base, refs), substRefs(&b, base, refs)) }
         Expr.IsNull(a, neg) { return Expr.IsNull(substRefs(&a, base, refs), neg) }
-        Expr.Cast(a, t) { return Expr.Cast(substRefs(&a, base, refs), t) }
+        Expr.Cast(a, t) {
+            // an outer column typed as itself (outerRef): the column
+            // (a bare parameter's: a cast written over it stays)
+            match a {
+                Expr.Param(n) { if n > base && n - base - 1 < len(refs) && refTyped(t.oid) { return clone(&refs[n - base - 1]) } }
+                else {}
+            }
+            return Expr.Cast(substRefs(&a, base, refs), t)
+        }
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args { append(mut &out, substRefs(&a, base, refs)) }
