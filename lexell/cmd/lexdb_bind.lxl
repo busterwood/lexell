@@ -8,15 +8,121 @@
 // the typed expression IR come next (lexdb-layers.md 4.4.1).
 
 import "./lexdb_sql"
+import "./lexdb_dialect"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
 
-// What a dialect supplies the binder for typing: its functions' result
-// types (Oracle's lexdb_orafn.resultOid; a text when it does not know the
-// name).
+// What a dialect supplies the binder for typing: which typing facts
+// (lexdb_dialect.TYPE_FACTS and IMPLICIT_CASTS: RULES_PG), and its
+// functions' result types (Oracle's lexdb_orafn.resultOid; a text when it
+// does not know the name).
 pub type Typing = value record {
+    pub rules: int
     pub fnOid: fn(&str, &[]int): int
+}
+
+// ---- common types (PostgreSQL's parse_coerce.c select_common_type)
+
+// No type yet: an untyped literal or parameter (705), or none (0).
+pub fn isUnknownOid(o: int): bool { return o == 0 || o == lexdb_sql.OID_UNKNOWN }
+
+// A type's facts: its category ('A' an array; a type the facts do not
+// name, as an enum, its own category 'U') and whether it is preferred.
+fn factOf(ty: &Typing, oid: int): lexdb_dialect.TypeFact {
+    for f in lexdb_dialect.TYPE_FACTS { if f.rules == ty.rules && f.oid == oid { return f } }
+    let cat: byte = if lexdb_sql.elemOid(oid) > 0 { 'A' } else { 'U' }
+    return lexdb_dialect.TypeFact{rules: ty.rules, oid: oid, cat: cat, pref: false}
+}
+
+// Whether a value of type from becomes a to without being asked (an
+// implicit cast; a type is its own).
+pub fn implicitCast(ty: &Typing, from: int, to: int): bool {
+    if from == to { return true }
+    for c in lexdb_dialect.IMPLICIT_CASTS { if c.rules == ty.rules && c.from == from && c.to == to { return true } }
+    return false
+}
+
+// The type values of these types are made together (a UNION's column,
+// CASE's and COALESCE's values, a VALUES column): the first known type,
+// giving way to a later one of its category when it is not preferred and
+// casts to the later one implicitly but not back. Unknowns take the
+// others' type, a text when all are. 0 when two are of different
+// categories (PostgreSQL's 42804): the caller keeps its own rule.
+pub fn commonOid(ty: &Typing, oids: &[]int): int {
+    var p = 0
+    for o in oids {
+        if isUnknownOid(o) || o == p { continue }
+        if p == 0 {
+            p = o
+            continue
+        }
+        let pf = factOf(ty, p)
+        let nf = factOf(ty, o)
+        if pf.cat != nf.cat { return 0 }
+        if !pf.pref && implicitCast(ty, p, o) && !implicitCast(ty, o, p) { p = o }
+    }
+    return if p == 0 { lexdb_sql.OID_TEXT } else { p }
+}
+
+fn plainNum(o: int): bool {
+    return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_NUMERIC ||
+           o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8
+}
+
+fn plainTime(o: int): bool {
+    return o == lexdb_sql.OID_DATE || o == lexdb_sql.OID_TIME || o == lexdb_sql.OID_TS || o == lexdb_sql.OID_TSTZ ||
+           o == lexdb_sql.OID_IVAL
+}
+
+// Whether a value of type from must be converted to be one of the common
+// type to: a number or a date or time along an implicit cast (1 as a
+// numeric, a date as a timestamp), or an untyped literal read as a type
+// other than a text's. Texts of other text types are the same values.
+pub fn converts(ty: &Typing, from: int, to: int): bool {
+    if from == to || isUnknownOid(to) || isTextOid(to) { return false }
+    if isUnknownOid(from) { return true }
+    if !implicitCast(ty, from, to) { return false }
+    return (plainNum(from) && plainNum(to)) || (plainTime(from) && plainTime(to))
+}
+
+// An expression's type for a common type: 705 for an untyped literal
+// ('x', NULL) or parameter, else exprOid's.
+pub fn argOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing): int {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(_) { return lexdb_sql.OID_UNKNOWN }
+                Val.Null { return lexdb_sql.OID_UNKNOWN }
+                else {}
+            }
+        }
+        Expr.Param(n) { if n > len(ptypes) || ptypes[n - 1] == 0 { return lexdb_sql.OID_UNKNOWN } }
+        else {}
+    }
+    return exprOid(x, cols, ptypes, ty)
+}
+
+// The places of a call's arguments that are its values, made of one type:
+// CASE's THENs and ELSE ("case else": the last), COALESCE's, GREATEST's and
+// LEAST's arguments; [] another call.
+pub fn valueArgs(name: &str, n: int): []int {
+    var out: []int = []
+    if name == "case" || name == "case else" {
+        let pairs = if name == "case else" { (n - 1) / 2 } else { n / 2 }
+        for k in 0..pairs { append(mut &out, 2 * k + 1) }
+        if name == "case else" && n > 0 { append(mut &out, n - 1) }
+    } else if name == "coalesce" || name == "greatest" || name == "least" {
+        for i in 0..n { append(mut &out, i) }
+    }
+    return out
+}
+
+// The common type of a call's values (valueArgs); 0 as commonOid.
+pub fn valuesOid(name: &str, args: &[]Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing): int {
+    var os: []int = []
+    for i in valueArgs(name, len(args)) { append(mut &os, argOid(&args[i], cols, ptypes, ty)) }
+    return commonOid(ty, &os)
 }
 
 // A text type: its collation counts as a text's (L2); char(n) too.
@@ -169,8 +275,14 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                     return if ao > 0 { ao } else { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
                 }
                 "like", "ilike", "similar", "in", "distinct", "any", "all" { return lexdb_sql.OID_BOOL }
-                "case" { return if len(args) > 1 { exprOid(&args[1], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT } }
-                "nullif", "greatest", "least" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT } }
+                "case", "greatest", "least" {
+                    // the common type of its values; of different categories, its first value's
+                    let c = valuesOid(&n, &args, cols, ptypes, ty)
+                    if c != 0 { return c }
+                    let first = if lexdb_sql.aggBase(&n) == "case" { 1 } else { 0 }
+                    return if len(args) > first { exprOid(&args[first], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT }
+                }
+                "nullif" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT } }
                 "strpos" { return lexdb_sql.OID_INT4 }
                 "regexp_split_to_table", "string_to_table" { return lexdb_sql.OID_TEXT }
                 "array" {
@@ -274,7 +386,10 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                     return if el > 0 { el } else { lexdb_sql.OID_TEXT }
                 }
                 "coalesce" {
-                    // the first argument's whose type is known (COALESCE(NULL, 5) is an integer)
+                    // the common type of its arguments; of different
+                    // categories, the first argument's whose type is known
+                    let c = valuesOid(&n, &args, cols, ptypes, ty)
+                    if c != 0 { return c }
                     for a in args {
                         match a { Expr.Lit(v) { if nullLit(&v) { continue } } else {} }
                         let o = exprOid(&a, cols, ptypes, ty)

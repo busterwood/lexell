@@ -41,6 +41,7 @@ import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_bind"
+import "./lexdb_dialect"
 import "./lexdb_locks"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
@@ -1378,16 +1379,25 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         return Ok(out)
     }
     if strings.startsWith(&name, "#values:") {
-        // VALUES (9.80): a column's type is its first typed value's
+        // VALUES (9.80): a column's type is the common type of its values
+        // (lexdb_bind.commonOid; an untyped literal's type 705 here); of
+        // different categories, its first typed value's
         let k = strings.parseIntOpt(&name[8..len(name)]).unwrapOr(1)
+        let ty = typing()
         for c in 0..k {
-            var oid = lexdb_sql.OID_TEXT
+            var os: []int = []
             var r = c
             while r < len(args) {
-                if args[r].oid != lexdb_sql.OID_TEXT && args[r].oid != lexdb_sql.OID_UNKNOWN { oid = args[r].oid }
-                if oid != lexdb_sql.OID_TEXT { break }
+                append(mut &os, args[r].oid)
                 r += k
             }
+            var oid = lexdb_bind.commonOid(&ty, &os)
+            r = c
+            while oid == 0 && r < len(args) {
+                if args[r].oid != lexdb_sql.OID_TEXT && args[r].oid != lexdb_sql.OID_UNKNOWN { oid = args[r].oid }
+                r += k
+            }
+            if oid == 0 { oid = lexdb_sql.OID_TEXT }
             append(mut &out, OutCol{name: "column" + (c + 1).toStr(), oid: oid, spell: "", coll: "", scale: -1})
         }
         return Ok(out)
@@ -5071,22 +5081,12 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             if nm == "in" || nm == "like" || nm == "ilike" || nm == "#tlike" || nm == "distinct from" || nm == "charindex" || nm == "patindex" {
                 out = try collateCall(&nm, out, cols, sc)
             }
-            if nm == "coalesce" && len(out) > 1 {
-                // its arguments of no type of their own ('1900-01-01' after a
-                // timestamp) take the result's, as PostgreSQL's and SQL Server's
-                let pt = ptypesOf(sc)
-                let o = exprOid(&Expr.Call(nm.toStr(), cloneAll(&out), star), cols, &pt)
-                if o != 0 && o != 705 && !isTextOid(o) {
-                    var cast: []Expr = []
-                    for ca in out {
-                        let xo = exprOid(&ca, cols, &pt)
-                        let lit = match ca { Expr.Lit(v) { kindOf(&v) == lexdb_sql.K_TEXT } else { false } }
-                        // (T-SQL: '' as a number is 0)
-                        let blank = len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&ca) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL)
-                        append(mut &cast, if blank { Expr.Cast(Expr.Lit(Val.Int(0)), oidType(o)) } else if lit || xo == 705 { Expr.Cast(clone(&ca), oidType(o)) } else { clone(&ca) })
-                    }
-                    out = cast
-                }
+            if !star && (((nm == "coalesce" || nm == "greatest" || nm == "least") && len(out) > 1) || nm == "case" || nm == "case else") {
+                // its values made of one type (lexdb_bind.commonOid), as
+                // PostgreSQL's: an untyped one ('1900-01-01' after a
+                // timestamp) read as it, a number or a date of another type
+                // converted (1 as a numeric beside 2.5)
+                out = unifyVals(&nm, out, cols, sc)
             }
             if nm == "avg" && !star && len(out) == 1 && len(sc.coll) > 0 {
                 // T-SQL's AVG: of integers an integer, of decimal(p, s) scale max(s, 6)
@@ -5123,6 +5123,53 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
 }
 
 fn colNames(x: &Expr, out: mut &[]str) { lexdb_sql.colNames(x, out) }
+
+// A call's values (lexdb_bind.valueArgs) made of their common type: each
+// one of another type cast to it, a constant converted now (but for a
+// timestamptz, whose value is the session's zone's). Of different
+// categories, as they are.
+fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): []Expr {
+    let pt = ptypesOf(sc)
+    let ty = typing()
+    let idx = lexdb_bind.valueArgs(nm, len(out))
+    var os: []int = []
+    for i in idx { append(mut &os, lexdb_bind.argOid(&out[i], cols, &pt, &ty)) }
+    let o = lexdb_bind.commonOid(&ty, &os)
+    if o == 0 { return out }
+    var xs = out
+    for k in 0..len(idx) {
+        let i = idx[k]
+        // (T-SQL: '' as a number is 0)
+        if len(sc.coll) > 0 && lexdb_syscat.tsqlBlank(&xs[i]) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL) {
+            xs[i] = Expr.Cast(Expr.Lit(Val.Int(0)), oidType(o))
+            continue
+        }
+        if !lexdb_bind.converts(&ty, os[k], o) { continue }
+        let x = replace(mut &xs[i], Expr.Lit(Val.Null))
+        xs[i] = castConst(x, o)
+    }
+    return xs
+}
+
+// x cast to the type oid: a constant's value converted now (an error left
+// for the run), but a timestamptz's.
+fn castConst(x: Expr, oid: int): Expr {
+    let t = oidType(oid)
+    match x {
+        Expr.Lit(v) {
+            if isNull(&v) { return Expr.Lit(Val.Null) }
+            if oid != lexdb_sql.OID_TSTZ {
+                let none: Option[SeqEnv] = None
+                match castVal(v, &t, &none) {
+                    Ok(c) { return Expr.Lit(c) }
+                    Err(_) {}
+                }
+            }
+        }
+        else {}
+    }
+    return Expr.Cast(x, t)
+}
 
 fn (q: &Query) valBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !(q.corr && hasCorr(x)) && !(q.noRefKeys && usesRefs(x, q.base)) }
 
@@ -9081,7 +9128,16 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
     if len(sel.q.levels) > 0 && (s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !sel.aggQ)) { sel.q.levels[0].stops = true }
-    if len(s.srf) > 0 { sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs) }
+    if len(s.srf) > 0 {
+        if strings.startsWith(&s.srf, "#values:") && len(sel.exprs) == len(sel.outs) {
+            // an untyped literal or parameter takes its column's type (srfCols)
+            let pt = ptypesOf(sc)
+            let ty = typing()
+            let noCols: []lexdb_sql.ColDef = []
+            for i in 0..len(sel.outs) { if lexdb_bind.argOid(&sel.exprs[i], &noCols, &pt, &ty) == lexdb_sql.OID_UNKNOWN { sel.outs[i].oid = lexdb_sql.OID_UNKNOWN } }
+        }
+        sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
+    }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
@@ -15333,7 +15389,7 @@ fn isFloatOid(o: int): bool { return lexdb_bind.isFloatOid(o) }
 pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int { return lexdb_bind.exprOid(x, cols, ptypes, &typing()) }
 
 // What the dialects supply the binder (lexdb_bind.Typing).
-fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{fnOid: lexdb_orafn.resultOid} }
+fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.RULES_PG, fnOid: lexdb_orafn.resultOid} }
 
 // The output columns of a SELECT: (name, OID), and the expressions behind
 // them (* expanded).
@@ -16265,6 +16321,10 @@ type Sel = record {
     // the rows evaluated in their order, each seeing the last's values
     feedback: []int
     mr: []MrPlan            // MATCH_RECOGNIZE's wrapper (design/lexdb-match-recognize.md): its plan; outs stay the input's
+    // UNION, INTERSECT, EXCEPT: per output column, the parts whose values
+    // are converted to its type (lexdb_bind.converts): 1 the first, 2 the
+    // second; [] none
+    conv: []int
 }
 
 fn copySets(xs: &[][]int): [][]int {
@@ -17011,7 +17071,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
                   locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: copySets(&s.gsets), gx: gx, gord: gord, gh: gh,
                   groupKinds: groupKinds, ordKinds: ordKinds, outKinds: outKindsOf(&outs),
-                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: []})
+                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: []})
 }
 
 // UNION, INTERSECT, EXCEPT: its two queries, planned on their own; the
@@ -17040,6 +17100,28 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var outs: []OutCol = []
     for o in l.outs { append(mut &outs, o) }
     for i in 0..len(outs) { if len(outs[i].coll) == 0 { outs[i].coll = r.outs[i].coll } }
+    // each column of the type of both sides' values (lexdb_bind.commonOid),
+    // the side of another type converted (runSet); of different categories,
+    // or in a recursive CTE, the first side's as before
+    var conv: []int = []
+    if !s.rec {
+        let ty = typing()
+        for i in 0..len(outs) {
+            let lo = branchOid(&s.inner[0], &l, i)
+            let ro = branchOid(&s.inner[1], &r, i)
+            let o = lexdb_bind.commonOid(&ty, &[lo, ro])
+            var bits = 0
+            if o != 0 {
+                if o != outs[i].oid {
+                    outs[i].scale = if r.outs[i].oid == o { r.outs[i].scale } else { -1 }
+                    outs[i].oid = o
+                }
+                if lexdb_bind.converts(&ty, lo, o) { bits = bits | 1 }
+                if lexdb_bind.converts(&ty, ro, o) { bits = bits | 2 }
+            }
+            append(mut &conv, bits)
+        }
+    }
     var order: []Expr = []
     var ordKinds: []int = []
     for o in s.order {
@@ -17070,7 +17152,35 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
                   groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs),
-                  topMode: 0, topN: -1, feedback: [], mr: []})
+                  topMode: 0, topN: -1, feedback: [], mr: [], conv: conv})
+}
+
+// The type of a set operation's side's i-th column for its common type:
+// 705 for an untyped literal ('x', NULL) in a plain select list, else its
+// planned type.
+fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
+    if s.setop == 0 && i < len(s.items) {
+        var star = false
+        for it in s.items { if it.star { star = true } }
+        if !star {
+            match s.items[i].expr {
+                Some(x) { if isUnknownLit(&x) { return lexdb_sql.OID_UNKNOWN } }
+                None {}
+            }
+        }
+    }
+    return sel.outs[i].oid
+}
+
+// A set operation's side's rows with the values of the columns whose
+// conv has bit converted to the operation's types.
+fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Result[Unit, DbErr] {
+    for c in 0..len(sel.conv) {
+        if (sel.conv[c] & bit) == 0 { continue }
+        let t = oidType(sel.outs[c].oid)
+        for i in 0..len(rows) { rows[i][c] = try coerceZ(replace(mut &rows[i][c], Val.Null), &t, z) }
+    }
+    return Ok(Unit{})
 }
 
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
@@ -17225,8 +17335,10 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     for j in base + sel.split..len(params) { append(mut &rp, params[j]) }
     if sel.rec >= 0 { return runRecursive(st, txn, sel, &lp, &rp, rs) }
     var lres = try runChild(st, txn, &sel.parts[0], &lp, -1, rs, 0)
+    try convRows(mut &lres.rows, sel, 1, &txn.sql.zone)
     try rs.hold(rowsBytes(&lres.rows))
     var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
+    try convRows(mut &rres.rows, sel, 2, &txn.sql.zone)
     try rs.hold(rowsBytes(&rres.rows))
     return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, []), &sel.outKinds))
 }
