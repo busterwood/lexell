@@ -176,6 +176,45 @@ fn untyped(x: &Expr): bool {
     }
 }
 
+// x compared with other, a column of a date or time type, when x
+// has no type of its own: a text literal, or a parameter of no type or a
+// text's (its value a text). The column's type then (its OID), as
+// PostgreSQL types an untyped literal from the other side; else 0. resolve
+// casts x to it (lexdb_sql.timeType: no precision, as compareTime reads a
+// text), so it is read once, in the session's zone where it is evaluated,
+// and a batch compares the column with a value of its own kind
+// (bCmpKinds). design/lexdb-layers.md 4.4.1, 2-iii.
+fn timeLitOid(x: &Expr, other: &Expr, cols: &[]lexdb_sql.ColDef, sc: &Scope): int {
+    var pn = 0
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(_) {}
+                else { return 0 }
+            }
+        }
+        Expr.Param(n) {
+            if n < 1 { return 0 }
+            pn = n
+        }
+        else { return 0 }
+    }
+    var o = 0
+    match other {
+        Expr.Col(n) {
+            let i = colIndex(cols, &n)
+            if i < 0 || lexdb_sql.timeKind(cols[i].typ.oid) == 0 { return 0 }
+            o = cols[i].typ.oid
+        }
+        else { return 0 }
+    }
+    if pn == 0 { return o }
+    let pt = ptypesOf(sc)
+    if pn > len(pt) { return 0 }
+    let p = pt[pn - 1]
+    return if p == 0 || p == lexdb_sql.OID_UNKNOWN || p == lexdb_sql.OID_TEXT || p == lexdb_sql.OID_VARCHAR { o } else { 0 }
+}
+
 fn trimmed(x: Expr): Expr { return Expr.Call("#bptrim", [x], false) }
 
 // Whether a side compared with a char is read as a char too: a char, a
@@ -3766,6 +3805,11 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
             if isCmp(&op) {
                 var lx = l
                 var rx = r
+                // an untyped value beside a date or time column: of its type (timeLitOid)
+                let tl = timeLitOid(&lx, &rx, cols, sc)
+                let tr = timeLitOid(&rx, &lx, cols, sc)
+                if tl > 0 { lx = Expr.Cast(replace(mut &lx, Expr.Lit(Val.Null)), lexdb_sql.timeType(tl)) }
+                if tr > 0 { rx = Expr.Cast(replace(mut &rx, Expr.Lit(Val.Null)), lexdb_sql.timeType(tr)) }
                 if len(sc.coll) > 0 {
                     // T-SQL has no booleans: a bit compared with a number (active = 1)
                     let pt = ptypesOf(sc)
@@ -3849,6 +3893,13 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 return Ok(Expr.Call(nm, out, star))
             }
             for a in args { append(mut &out, try resolve(&a, cols, n, sc)) }
+            if nm == "in" && !star {
+                // x IN (a, b) beside a date or time column x: as x = a OR x = b
+                for i in 1..len(out) {
+                    let o = timeLitOid(&out[i], &out[0], cols, sc)
+                    if o > 0 { out[i] = Expr.Cast(replace(mut &out[i], Expr.Lit(Val.Null)), lexdb_sql.timeType(o)) }
+                }
+            }
             if isTypedFn(&nm) && (len(out) == 0 || !isHint(&out[len(out) - 1])) {
                 // the arguments' types, for the call to see (9.92)
                 var os: []str = []
@@ -22400,8 +22451,8 @@ type BNode = closed {
     // sorted, and whether the list had a NULL (a no-match row is NULL)
     InVals(int, []Val, bool)
     InInts(int, []int, bool)
-    // two columns compared, one at least of values (bColPair): op, the
-    // columns, their kinds (BK_*)
+    // two columns compared, one at least of values, as eval compares them
+    // (bCmpKinds): op, the columns, their kinds (BK_*)
     VCmp(int, int, int, int, int)
     // a compiled expression (9.108): a condition, true where its value is
     // true (eval's truth), as the row path checks one; or an output's or a
@@ -22626,8 +22677,35 @@ fn bCompileD(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool):
         BX.And(a, b) { return bAndOr(true, &a, &b, q, kinds, ce, base, dec) }
         BX.Or(a, b) { return bAndOr(false, &a, &b, q, kinds, ce, base, dec) }
         BX.Op(code, a, b) {
-            let vc = bValCmp(code, &a, &b, q, kinds, ce, base)
-            if vc.isSome() { return vc }
+            let cc = cmpOf(code)
+            if cc >= 0 {
+                // a column of values (BK_VAL) compared with a column or a
+                // constant: as values (VCmp, ValCmp), when the batch's
+                // comparison is the row path's for their types (bCmpKinds)
+                let ia = colOf(&a, kinds)
+                let ib = colOf(&b, kinds)
+                if ia >= 0 && ib >= 0 && (kinds[ia] == BK_VAL || kinds[ib] == BK_VAL) {
+                    let ka = q.cols[ia].typ.kind
+                    let kb = q.cols[ib].typ.kind
+                    if !bCmpKinds(ka, kb, ce) || !bCmpKinds(kb, ka, ce) { return None }
+                    return Some(BComp{n: BNode.VCmp(cc, ia - base, ib - base, kinds[ia], kinds[ib]), typ: BT_BOOL})
+                }
+                let va = bValCol(&a, kinds, base)
+                let vb = if va >= 0 { -1 } else { bValCol(&b, kinds, base) }
+                if va >= 0 || vb >= 0 {
+                    let k = if va >= 0 { &b } else { &a }
+                    if !bxConst(k) { return None }
+                    let none: []Val = []
+                    match bxEval(k, &none, &none, ce) {
+                        Ok(v) {
+                            let c = if va >= 0 { va } else { vb }
+                            if !lexdb_ops.isNull(&v) && !bCmpKinds(q.cols[c + base].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
+                            return Some(BComp{n: BNode.ValCmp(cc, c, v, vb >= 0), typ: BT_BOOL})
+                        }
+                        Err(_) { return None }
+                    }
+                }
+            }
             let ca = bCompileD(&a, q, kinds, ce, base, dec)
             if ca.isNone() { return None }
             let cb = bCompileD(&b, q, kinds, ce, base, dec)
@@ -22638,7 +22716,6 @@ fn bCompileD(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool):
             let rt = rc.typ
             let l = takeN(lc)
             let r = takeN(rc)
-            let cc = cmpOf(code)
             let ac = arithOf(code)
             if (isDecT(lt) || isDecT(rt)) && (isDecT(lt) || intLike(lt)) && (isDecT(rt) || intLike(rt)) {
                 // a numeric with a numeric or an integer (read as a
@@ -22695,16 +22772,10 @@ fn bCompileD(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool):
                             var keep: []Val = []
                             for v in vs {
                                 if lexdb_ops.isNull(&v) { hasNull = true; continue }
-                                // a time column's value in the session's zone,
-                                // as the row path compares it (bValCmpOf)
-                                if k == BK_VAL {
-                                    match bTimeVal(v, col, q, &ce.zone) {
-                                        Some(tv) { append(mut &keep, tv) }
-                                        None { return None }
-                                    }
-                                } else {
-                                    append(mut &keep, v)
-                                }
+                                // compared as the row path compares them, one
+                                // order for the sorted set (bCmpKinds)
+                                if k == BK_VAL && !bCmpKinds(q.cols[col].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
+                                append(mut &keep, v)
                             }
                             // A short list is a chain of equality tests; a
                             // long one a sorted set searched by halves (a
@@ -22829,34 +22900,6 @@ fn bValCol(x: &BX, kinds: &[]int, base: int): int {
     }
 }
 
-// a op b (op an operator's code), one a column of values and the other a
-// constant (its value made once): ValCmp. None otherwise, or when the
-// constant gives an error (the row path gives it).
-fn bValCmp(code: int, a: &BX, b: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] {
-    let cc = cmpOf(code)
-    if cc < 0 { return None }
-    let two = bColPair(cc, a, b, q, kinds, base)
-    if two.isSome() { return two }
-    let ca = bValCol(a, kinds, base)
-    if ca >= 0 { return bValCmpOf(cc, ca, ca + base, b, false, q, ce) }
-    let cb = bValCol(b, kinds, base)
-    if cb >= 0 { return bValCmpOf(cc, cb, cb + base, a, true, q, ce) }
-    return None
-}
-
-// a op b, both columns, one at least of values (BK_VAL): VCmp, compared
-// as eval compares them. Not when either is a date or time and they are
-// not of one kind (eval compares those in the session's zone).
-fn bColPair(cc: int, a: &BX, b: &BX, q: &Query, kinds: &[]int, base: int): Option[BComp] {
-    let ia = colOf(a, kinds)
-    let ib = colOf(b, kinds)
-    if ia < 0 || ib < 0 || (kinds[ia] != BK_VAL && kinds[ib] != BK_VAL) { return None }
-    let ka = q.cols[ia].typ.kind
-    let kb = q.cols[ib].typ.kind
-    if (lexdb_sql.isTimeKind(ka) || lexdb_sql.isTimeKind(kb)) && ka != kb { return None }
-    return Some(BComp{n: BNode.VCmp(cc, ia - base, ib - base, kinds[ia], kinds[ib]), typ: BT_BOOL})
-}
-
 // The query's column x is, if the batch holds it, else -1.
 fn colOf(x: &BX, kinds: &[]int): int {
     match x {
@@ -22868,41 +22911,19 @@ fn colOf(x: &BX, kinds: &[]int): int {
     }
 }
 
-// c: the batch's column; qc: the query's.
-fn bValCmpOf(cc: int, c: int, qc: int, k: &BX, left: bool, q: &Query, ce: &CEnv): Option[BComp] {
-    if !bxConst(k) { return None }
-    let none: []Val = []
-    match bxEval(k, &none, &none, ce) {
-        Ok(v0) {
-            match bTimeVal(v0, qc, q, &ce.zone) {
-                Some(v) { return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL}) }
-                None { return None }
-            }
-        }
-        Err(_) { return None }
-    }
-}
-
-// A constant compared with query column qc in a batch: for a date,
-// timestamp or timestamptz column, the value made its type here, in the
-// session's zone z (9.95), as compareTime would (a text read as it; the
-// others compared as instants, which compare does only in UTC). None: the
-// batch cannot compare it as the row path does.
-fn bTimeVal(v0: Val, qc: int, q: &Query, z: &lexdb_time.Zone): Option[Val] {
-    var v = v0
-    let ck = q.cols[qc].typ.kind
-    let vk = lexdb_ops.kindOf(&v)
-    if (ck == lexdb_sql.K_DATE || ck == lexdb_sql.K_TS || ck == lexdb_sql.K_TSTZ) && vk != ck && !lexdb_ops.isNull(&v) {
-        if vk == lexdb_sql.K_TEXT {
-            match lexdb_ops.coerceTime(v, &lexdb_sql.timeType(q.cols[qc].typ.oid), z) {
-                Ok(x) { v = x }
-                Err(_) { return None }
-            }
-        } else if !z.isUtc() {
-            return None
-        }
-    }
-    return Some(v)
+// Whether a batch compares a value of kind vk (lexdb_sql.K_*) with a
+// column of type kind ck as the row path compares them. ValCmp, VCmp and
+// InVals compare in UTC (lexdb_ops.compare), the row path in the session's
+// zone (compareZ): they differ only where a date or time kind meets
+// another kind outside UTC. A text beside a date or time column is
+// declined in any zone: resolve casts an untyped one to the column's type
+// (timeLitOid), and InVals' sorted set must be of the column's order.
+fn bCmpKinds(ck: int, vk: int, ce: &CEnv): bool {
+    if ck == vk { return true }
+    let tc = lexdb_sql.isTimeKind(ck)
+    if !tc && !lexdb_sql.isTimeKind(vk) { return true }
+    if tc && vk == lexdb_sql.K_TEXT { return false }
+    return ce.zone.isUtc()
 }
 
 fn bvec(m: int): BVec { return lexdb_rows.bvec(m) }

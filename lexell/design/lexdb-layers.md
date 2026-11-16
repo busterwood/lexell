@@ -707,6 +707,7 @@ Steps, each with q1, q6 and the scan queries as its gate:
 - 2-iii: node types bottom-up in `bindExpr` (once per plan). `bCompile`
   chooses a kernel from the node's type and the batch's kind. `bValCmp`,
   `bColPair` and `bTimeVal` are deleted once the binder casts constants.
+  (As built, without a type on every node: see "2-iii as built".)
 - 2-iv: `bGenOf` from the plan's bound expression. Its slots are the
   batch row's places, so it re-slots a bound tree instead of binding
   again.
@@ -804,6 +805,111 @@ unless named; search for the names, since line numbers move.
   (a path 2-ii does not touch), updates level. With the follow-up: TPC-H
   1.001 (q1 1.015 again), point selects 0.999/0.994/0.999, updates
   level. So the follow-up's saving was not visible against 540106ec.
+
+**2-iii as built: a constant beside a time column typed by the binder.**
+
+- `resolve` casts an untyped value beside a column of a date or time type
+  to the column's type (`timeLitOid`), as PostgreSQL types an untyped
+  literal from the other side: a text literal, or a parameter of no type
+  or a text's (`ptypesOf`: its value is a text), in a comparison and in
+  an IN list. The cast is to the bare type (`lexdb_sql.timeType`, no
+  precision), which is what `compareTime` read a text as, and it is
+  evaluated where the plan runs, in the run's zone (`bxEval` with
+  `Mats.ce`, `eval` with the session). So the batches see the column's
+  own kind, and nothing in a plan depends on the zone. The plan cache
+  already keys on the zone (9.95), so no key was added.
+- `bCompileD` chooses the kernel for a comparison from the types of its
+  two sides and the batch's kinds, in the `BX.Op` arm: a column of values
+  (`BK_VAL`) beside a column is `VCmp`, beside a constant `ValCmp`, when
+  `bCmpKinds` allows the pair. The same rule guards the IN list's chain
+  and sorted set (`InVals`). `bCmpKinds`: the batches compare in UTC
+  (`lexdb_ops.compare`) and the row path in the session's zone
+  (`compareZ`), so a pair is allowed when it is of one kind, when neither
+  is a date or time kind, or in UTC; a text beside a date or time column
+  never (resolve casts the untyped ones, and a sorted set must be in the
+  column's order).
+- Deleted: `bValCmp`, `bColPair`, `bValCmpOf` and `bTimeVal`. `BT_*`
+  stays: it is the batch's physical kind of a result (`BK_*`, `BK_DEC`'s
+  scale), which `bKeyVal`, `JLevel.keyTyp`, `outNode` and
+  `batchGroupsIn` read; none of it became dead.
+- Decisions:
+  - **No type stored on every `BX` node.** No kernel reads an inner
+    node's SQL type: the comparisons that need one read their leaves, a
+    column's type (`q.cols`, fixed when the plan is made) and a
+    constant's kind (its value, evaluated once per run; a parameter's
+    kind is only certain then). Typing every node in `bindExpr` would run
+    per run on the `bxOf` paths (join, group and ORDER BY keys, aggregate
+    arguments), which is what cost q20 5% in 2b. Node types come with
+    the first consumer (2-iv's `bGenOf` or the function library, 3).
+  - **"Another time kind" is not cast.** A constant of a lower date or
+    time kind (a date beside a timestamp column) could be cast up exactly,
+    but one of a higher kind cannot be cast down: `d < timestamp
+    '2020-01-05 12:00'` keeps 2020-01-05, `d < '2020-01-05'::date` does
+    not, and q6's `l_shipdate < date '1994-01-01' + interval '1 year'` is
+    a date column beside a timestamp. Casting the column up instead takes
+    the condition off the batches. So the batch compares a pair of
+    different time kinds only in UTC, as before, as a kernel choice made
+    per run from the run's zone (`bCmpKinds`), not a cast in the plan.
+  - Pairs that reached a batch before and now do not, or the other way
+    round, with the same results: two columns of different time kinds in
+    UTC now batch (`VCmp`; `bColPair` declined them in every zone); a
+    text column beside a date or time constant outside UTC, and a text
+    constant beside a date or time column that resolve did not cast (a
+    parameter with no type given at all, `run` with fewer types than
+    values), now go to the row path (`bTimeVal` read the text once; the
+    former compared in UTC where the row path compared in the zone).
+- One difference in results, PostgreSQL's (`exec_timelit`): a literal the
+  column's type refuses (`tz = 'bad'`) is refused even where the column
+  is NULL. lexdb compared only the rows not NULL, so `tz is null and tz =
+  'bad'` gave 0 rows; PostgreSQL 18.6 types the literal when parsing and
+  refuses the statement. As before, a statement that reads no row
+  (`where 1 = 0 and tz = 'bad'`) still gives 0 where PostgreSQL refuses
+  it.
+- A/B against main 445bc9cf (built from `git archive`), medians of 3
+  rounds, binaries alternating: TPC-H total 1.002, all 22 checksums the
+  baseline's; q1 0.988 (2-ii's 1.1% back), q6 1.005, q20 1.013 (1.012 to
+  1.027 per round in `run.sh`, but 0.986 in a direct A/B of q20 alone, 15
+  runs per server, three rounds; its per-run path runs the same work, so
+  probably layout). 35 queries 1.004 (filt_agg 1.037 on 27 ms, the rest
+  within 2%). Point selects 0.989/0.996/0.993 at 1/8/32 clients (prepared:
+  none of 2-iii's code runs per execution; 2-ii saw the same against
+  540106ec), updates 1.000/1.002/0.989. `timeLitOid` first asked for the
+  parameters' types (`ptypesOf`, a copy) for every parameter compared;
+  reading them last took q20 from 309.0 to 302.8 ms (main 306.2).
+
+**Where 2-iii left off, and how to start 2-iv.** All in `lexdb_exec`
+unless named; search for the names.
+
+- The batch compiler is as 2-ii left it (`bCompile`/`bCompileD` over
+  `BX`, `bCompileCond`, `bCompileOut`, `bCompileX`/`bxOf`, `bxConst`,
+  `bxFixed`, `cmpOf`, `arithOf`, `bAndOr`), with the comparisons'
+  kernel choice inline in `bCompileD`'s `BX.Op` arm and the IN list's,
+  both through `bCmpKinds`; `colOf` and `bValCol` find the columns.
+- 2-iv is `bGenOf`: it binds the expression again per run
+  (`lexdb_bind.bindExpr` with `direct` false, the batch row's places as
+  `slots`, parameters as constants for `bGenVals`' constant shape). The
+  plan already holds the expression bound by query column (`Query.cc`/
+  `cp`, `Sel.ox`); 2-iv re-slots that tree (a `BX.Col(i)` to the place
+  of query column `i` in the batch row) instead of binding again, and
+  reads a `Param` slot from `Mats.ce` where `bGenVals` wants a constant.
+  Measure q20 (8,508 subquery runs) and q18's HAVING as well as q1, q6.
+- Types: `BX` nodes still carry none (see the decision above). If 2-iv
+  or the function library needs a node's type, compute it once in
+  `bindSel` (where plans are bound), not in `bindExpr`, which `bxOf`
+  runs per run.
+- The resolve cast is `timeLitOid`, called from `resolve`'s comparison
+  arm and its `in` call. Its parameters' types come from `ptypesOf`
+  (the statement's, then the refs' `refOids`); a statement run with
+  fewer types than values is not cast and goes to the row path.
+- Traps, build, suite and A/B are as 2-ii's paragraph says. The suite is
+  188 tests now (`exec_timelit`). A differential check that helped:
+  the same queries (date, timestamp, timestamptz, time and interval
+  columns against literals, parameters, other kinds, IN lists, EXPLAIN)
+  in UTC, Asia/Kolkata and America/New_York, batches on and off,
+  compiled against main's sources and the branch's, outputs diffed.
+  For one query, a server per binary on the TPC-H data with the query
+  run 15 times through psql (median), three rounds alternating, gave a
+  steadier number than `run.sh` did for q20.
 
 **The rest of 2c, planned:**
 
