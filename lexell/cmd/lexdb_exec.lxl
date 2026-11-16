@@ -4886,6 +4886,7 @@ type Run = record {
     maxRounds: int              // a recursive CTE's rounds at most (the session's max_recursion); 0 no limit
     maxSteps: int               // MATCH_RECOGNIZE: steps per start row at most (the session's max_match_steps); 0 no limit
     held: int                   // about the bytes of rows the statement holds (its runs inside: their own and this)
+    aside: int                  // ... and those a batch consumer (groups, a sort) holds in its own count while a batch is joined (bRange)
     maxHeld: int                // max_statement_mem; 0 no limit
     deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
     ticks: int
@@ -5030,7 +5031,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               held: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
+               held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -5195,7 +5196,12 @@ fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, sc: mut &Scope): Result[
                 // under a collation's keys (L2), else as PostgreSQL compares a char
                 let k = try cmpKind(&op, &lx, &rx, cols, sc)
                 if k == lexdb_sql.COLL_EXACT { return Ok(bpCmp(&op, lx, rx, cols)) }
-                return Ok(Expr.Bin(op, collKeyOf(k, lx), collKeyOf(k, rx)))
+                // a char(n) side without its blanks (or both padded alike) first,
+                // as bpCmp makes it, then its key: 'AB   ' is 'ab' case-insensitively
+                match bpCmp(&op, lx, rx, cols) {
+                    Expr.Bin(o2, l2, r2) { return Ok(Expr.Bin(o2, collKeyOf(k, l2), collKeyOf(k, r2))) }
+                    else { return Err(e("XX000", "a comparison resolved to no comparison")) }
+                }
             }
             return Ok(Expr.Bin(op, l, r))
         }
@@ -5766,8 +5772,7 @@ fn (q: &Query) colKind(name: &str): int {
 fn eqConst(x: &Expr): bool {
     match x {
         Expr.Lit(v) { return !isNull(&v) }
-        Expr.Param(_) { return true }
-        else { return false }
+        else { return refParam(x) }
     }
 }
 
@@ -7273,7 +7278,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
-            let byParam = match p.eqs[0] { Expr.Param(_) { true } else { false } }
+            let byParam = refParam(&p.eqs[0])
             if byParam && len(p.eqs) == 1 {
                 let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
                 let typ = keyType(&lv.t, c, 0)
@@ -7715,7 +7720,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for i in 0..len(subs) { append(mut &planned, []) }
     // its scope comes first, its columns added as its tables are read: a
     // LATERAL subquery sees the tables before it, another none of them
-    append(mut &sc.frames, Frame{cols: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
+    append(mut &sc.frames, Frame{cols: [], exact: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], hidden: false})
     let me = len(sc.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
     var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
@@ -7848,6 +7853,9 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 fc.spell = q.cols[i].spell
                 fc.coll = q.cols[i].coll
                 append(mut &sc.frames[me].cols, fc)
+                // a subquery's, a view's, a working table's column is typed
+                // by its first branch (a UNION's int over a numeric): not exact
+                append(mut &sc.frames[me].exact, f.sub < 0 && f.work < 0 && viewSrc < 0)
             }
         }
         // JOIN ... USING and NATURAL JOIN (9.93): an ON made of the names'
@@ -8945,6 +8953,7 @@ fn seriesRes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
 // The queries being planned, outermost first.
 type Frame = record {
     cols: []lexdb_sql.ColDef
+    exact: []bool               // per column: a table's, its values of exactly its type (outerRef types its parameter)
     refs: []Expr                // the outer values it uses, in the terms of the query around it
     refOids: []int
     subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
@@ -9203,7 +9212,9 @@ const COLL_EXPLICIT = 3
 fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
 
 fn isTextOid(o: int): bool {
-    return o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_NAME || o == lexdb_sql.OID_CHAR || o == 705
+    // (char(n) too: its collation counts as a text's, L2)
+    return o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_NAME || o == lexdb_sql.OID_CHAR || o == 705 ||
+           o == lexdb_sql.OID_BPCHAR
 }
 
 fn noColl(): Coll { return Coll{name: "", level: COLL_NONE} }
@@ -9369,9 +9380,11 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         match resolveName(&sc.frames[f].cols, len(sc.frames[f].cols), name) {
             Ok(n) {
-                let fc = &sc.frames[f].cols[colIndex(&sc.frames[f].cols, &n)]
+                let ci = colIndex(&sc.frames[f].cols, &n)
+                let fc = &sc.frames[f].cols[ci]
                 oid = fc.typ.oid
-                if oid == lexdb_sql.OID_BPCHAR { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
+                let exact = ci < len(sc.frames[f].exact) && sc.frames[f].exact[ci] && (len(fc.using) == 0 || fc.using == lexdb_sql.USING_HIDDEN)
+                if exact && refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
                 if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
                 found = n
             }
@@ -9395,10 +9408,12 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
         }
         x = Expr.Param(sc.base + at + 1)
     }
-    // a char(n) column stays one (9.94): its parameter is untyped, which a
-    // comparison would read as the other side's type (ls.s = o.tc compared
-    // 'k1' with 'k1   ' as texts); as a cast to its type it is compared
-    // as the column is in the query it comes from
+    // the column keeps its type: a parameter is untyped, which a
+    // comparison reads as the other side's type (a char(n) column's 'k1'
+    // with 'k1   ' as texts; a text 'x ' padded as the inner char(3)'s
+    // 'x'; a date as the inner timestamp's text), where the join compares
+    // the column as it is. As a cast to its type (refParam) it is compared
+    // as in the query it comes from; the cast keeps the value as it is.
     match bp {
         Some(t) { x = Expr.Cast(x, t) }
         None {}
@@ -9406,6 +9421,29 @@ fn outerRef(sc: mut &Scope, name: &str): Result[Option[Expr], DbErr] {
     // a collated column keeps its collation (L2): #coll(x, name), implicit
     if len(coll) > 0 { x = Expr.Call("#coll", [x, Expr.Lit(Val.Text(coll))], false) }
     return Ok(Some(x))
+}
+
+// Whether an outer column of type oid is given as a cast to its type
+// (outerRef): the scalar types a cast keeps as they are.
+fn refTyped(oid: int): bool {
+    return isIntOid(oid) || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 ||
+           oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_BOOL ||
+           oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ ||
+           oid == lexdb_sql.OID_UUID
+}
+
+// A parameter, bare or as outerRef types an outer column: a cast of one.
+fn refParam(x: &Expr): bool {
+    match x {
+        Expr.Param(_) { return true }
+        Expr.Cast(a, _) {
+            match a {
+                Expr.Param(_) { return true }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
 }
 
 // The query being planned is done: its refs are what the query around it
@@ -9453,6 +9491,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 fn refOf(x: &Expr, base: int): int {
     match x {
         Expr.Param(n) { if n > base { return n - base - 1 } }
+        Expr.Cast(a, _) { return refOf(&a, base) }
         else {}
     }
     return -1
@@ -9502,9 +9541,29 @@ fn hasSubCall(x: &Expr): bool {
     }
 }
 
+// Whether a hashed subquery's key inner = outer compares as = does:
+// semiTypes's kinds; one type on both sides, a float's or a char(n)'s
+// of one n (padded alike); or an outer value of no known type (a derived
+// table's column: an untyped parameter, keyed as before).
+fn hashKeyTypes(inner: &Expr, outer: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match outer {
+        Expr.Param(_) { return true }
+        else {}
+    }
+    let io = exprOid(inner, cols, &[])
+    let oo = exprOid(outer, cols, &[])
+    if semiTypes(io, oo) { return true }
+    if io == oo && (io == lexdb_sql.OID_FLOAT4 || io == lexdb_sql.OID_FLOAT8) { return true }
+    if io == oo && io == lexdb_sql.OID_BPCHAR {
+        let n = bpLen(inner, cols)
+        return n > 0 && n == bpLen(outer, cols)
+    }
+    return false
+}
+
 // A conjunct "inner = outer" (either way round), into hk; false: it uses an
 // outer value otherwise.
-fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
+fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): bool {
     let t = lexdb_sql.exprText(c)
     for x in hk.texts { if x == t { return true } }
     match c {
@@ -9517,6 +9576,12 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
                 outer = clone(&a)
             }
             if !outerOnly(&outer, base) || usesRefs(&inner, base) || hasCorr(&inner) { return false }
+            // a hash compares keys by value (keyPart), which = does only
+            // for the same kinds of value (semiTypes): a timestamp with a
+            // date, a text with an integer, a float with a numeric compare
+            // equal as = converts them, and not as keys. The outer value's
+            // type: its column's (outerRef types it)
+            if !hashKeyTypes(&inner, &outer, cols) { return false }
             append(mut &hk.inner, inner)
             append(mut &hk.outer, outer)
             append(mut &hk.texts, t)
@@ -9526,11 +9591,11 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys): bool {
     }
 }
 
-fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool): bool {
+fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool, cols: &[]lexdb_sql.ColDef): bool {
     for c in cs {
         if !usesRefs(&c, base) { continue }
         if !movable { return false }
-        if !keyConj(&c, base, hk) {
+        if !keyConj(&c, base, hk, cols) {
             if !res { return false }
             // not inner = outer: a filter the once-run subquery cannot keep
             // (the outer value is a parameter now), checked per candidate
@@ -9583,11 +9648,11 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
             if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return }
             for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
             // an outer join's ON conjuncts are not WHERE filters: they stay
-            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res) { return }
-            if !keyConjs(&lv.post, base, mut &hk, true, res) { return }
-            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res) { return }
+            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
+            if !keyConjs(&lv.post, base, mut &hk, true, res, &q.cols) { return }
+            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
         }
-        if !keyConjs(&q.top, base, mut &hk, true, res) { return }
+        if !keyConjs(&q.top, base, mut &hk, true, res, &q.cols) { return }
         if len(hk.inner) == 0 { return }
     }
     for k in 0..len(sp.sel.q.levels) {
@@ -9823,7 +9888,15 @@ fn substRefs(x: &Expr, base: int, refs: &[]Expr): Expr {
         Expr.Unary(op, a) { return Expr.Unary(op, substRefs(&a, base, refs)) }
         Expr.Bin(op, a, b) { return Expr.Bin(op, substRefs(&a, base, refs), substRefs(&b, base, refs)) }
         Expr.IsNull(a, neg) { return Expr.IsNull(substRefs(&a, base, refs), neg) }
-        Expr.Cast(a, t) { return Expr.Cast(substRefs(&a, base, refs), t) }
+        Expr.Cast(a, t) {
+            // an outer column typed as itself (outerRef): the column
+            // (a bare parameter's: a cast written over it stays)
+            match a {
+                Expr.Param(n) { if n > base && n - base - 1 < len(refs) && refTyped(t.oid) { return clone(&refs[n - base - 1]) } }
+                else {}
+            }
+            return Expr.Cast(substRefs(&a, base, refs), t)
+        }
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args { append(mut &out, substRefs(&a, base, refs)) }
@@ -26805,7 +26878,8 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     var nNeed = 0
     for c in 0..len(bp.needCol) { if bp.needCol[c] { nNeed += 1 } }
     let perRow = 32 + 24 * nNeed
-    let room0 = rs.room()
+    // (less what a grouping or a sort holds and has not yet given to rs)
+    let room0 = if rs.maxHeld > 0 { rs.maxHeld - rs.held - rs.aside } else { -1 }
     var over = false
     for x in 0..len(ks) {
         if bail || over || len(bad) > 0 { break }
@@ -27534,8 +27608,12 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 continue
             }
             if joined {
+                // (the batch's counts so far, for the row path to count it again)
+                var cntB: []Counts = []
+                for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
                 if got3.isNone() {
+                    rs.cnt = cntB
                     cur = saved
                     rowPath = true
                     break
@@ -28006,7 +28084,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             if nr == 0 { continue }
             let nChosen = pk.kept
             if op.joined {
+                rs.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
+                rs.aside = 0
                 if got3.isNone() {
                     rs.cnt = cnt0
                     return Ok(false)
@@ -28270,8 +28350,12 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             let nChosen = len(idx)
             if op.joined {
                 // the joined rows (9.102): the batch's rows from here on
+                // (the batch's counts so far, for the row path to count it again)
+                var cntB: []Counts = []
+                for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
                 if got3.isNone() {
+                    rs.cnt = cntB
                     cur = saved
                     rowPath = true
                     break
@@ -28358,17 +28442,34 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // before units, then the row path; from the start each time (the
     // groups are made at the end: none yet).
     let h0: int = held + 0
+    // the counts so far: each try counts from the start again (a try that
+    // gave way would have them twice)
+    var cnt0: []Counts = []
+    for c in rs.cnt { append(mut &cnt0, c) }
     var usedDec = false
     match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, true, mut &usedDec) {
-        Ok(x) { if x || !usedDec { return Ok(x) } }
+        Ok(x) {
+            if x { return Ok(x) }
+            rs.cnt = copyCounts(&cnt0)
+            if !usedDec { return Ok(x) }
+        }
         Err(x) {
             if !isSpill(&x) { return Err(x) }
             held = h0
+            rs.cnt = copyCounts(&cnt0)
             decSpills += 1
         }
     }
     var none = false
-    return batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, false, mut &none)
+    let again = try batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, false, mut &none)
+    if !again { rs.cnt = cnt0 }
+    return Ok(again)
+}
+
+fn copyCounts(cs: &[]Counts): []Counts {
+    var out: []Counts = []
+    for c in cs { append(mut &out, c) }
+    return out
 }
 
 // allowDec: numeric(p, s) columns as units (one table's batches); usedDec
@@ -28689,7 +28790,9 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             }
             nJoined += len(idx)
             if jn {
+                rs.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &jp, &b, &idx, &zone, rs)
+                rs.aside = 0
                 if got3.isNone() {
                     held -= added
                     return Ok(false)
