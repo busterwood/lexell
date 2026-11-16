@@ -14,12 +14,37 @@
 //   path (the same result, exactly); a sum past 2^63 is kept in 128 bits.
 // - A column whose values are not all of its scale (a typmod-less numeric)
 //   and a numeric(20,2) (past 18 digits) stay values.
-// - Again in a transaction with its own writes not committed.
+// - Again in a transaction with its own writes not committed, and before
+//   the first checkpoint.
+// - Shapes the units do not compile (a numeric IN list, LIKE, a float)
+//   run over batches as values, as before units (step 1's review); GROUP
+//   BY a numeric column and expression; a product of exactly -2^63 units;
+//   comparisons with a float column, a plain numeric column and another
+//   numeric(p, s); a column's scale changed by ALTER TYPE and a numeric
+//   column added with a default, before and after a checkpoint: with
+//   batches as without (the row path, the reference), whether they ran
+//   over batches (b) and as units (u).
+// expect: not checkpointed: 100 queries, 100 the same three ways, as units 100
 // expect: committed: 400 queries, 400 the same three ways, as units 400
 // expect: fixed: 6 queries, 6 the same three ways, as units 6
 // expect: past units: 3 queries, 3 the same three ways, gave way 2
 // expect: not units: 2 queries, 2 the same three ways, as units 0
 // expect: in a transaction: 100 queries, 100 the same three ways, as units 100
+// expect: group by k: same b u
+// expect: group by k * 2: same b u
+// expect: -2^63: same b u
+// expect: group by m * n: same b u
+// expect: negated past units: same
+// expect: in list: same b
+// expect: like: same b
+// expect: float constant: same b
+// expect: float column: same b u
+// expect: plain numeric column: same b u
+// expect: two of numeric(18,0): same b u
+// expect: scale altered: same b u
+// expect: added with a default: same b u
+// expect: checkpointed, scale altered: same b u
+// expect: checkpointed, added with a default: same b u
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -139,6 +164,57 @@ fn fixed(s: mut &lexdb_exec.Session, label: &str, qs: &[]str) {
             (if label == "past units" { "gave way " + gave.toStr() } else { "as units " + units.toStr() }))
 }
 
+// sql with batches and without: the same, and whether it ran over
+// batches (b) and as units (u).
+fn both(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let c0 = lexdb_exec.decCounts()
+    let on = q(s, sql)
+    let c1 = lexdb_exec.decCounts()
+    var out = label + ": " + (if off == on { "same" } else { "DIFFERENT" })
+    if c1[2] > c0[2] { out = out + " b" }
+    if c1[0] > c0[0] { out = out + " u" }
+    println(out)
+    if off != on { println("  rows: " + off + "\n  batches: " + on) }
+}
+
+fn gaps(s: mut &lexdb_exec.Session) {
+    let c1 = q(s, &"create table g (id int primary key, k numeric(10,2), m numeric(18,0), n numeric(18,0), f float8, p numeric, j int)")
+    var rows: []str = []
+    for i in 0..2500 {
+        let k = ["1.50", "2.00", "3.25", "-0.75", "null"][i % 5]
+        // m * n is -2^63 (-2147483648 * 4294967296) in some rows
+        let m = if i % 7 == 0 { "-2147483648" } else { (i * 13 - 9000).toStr() }
+        let n = if i % 7 == 0 { "4294967296" } else if i % 11 == 0 { "null" } else { (i % 97 - 40).toStr() }
+        let f = if i % 9 == 0 { "null" } else { (i % 50).toStr() + ".25" }
+        let p = if i % 6 == 0 { "null" } else { (i % 40).toStr() + "." + (i % 1000).toStr() }
+        append(mut &rows, "(" + i.toStr() + ", " + k + ", " + m + ", " + n + ", " + f + ", " + p + ", " + (i % 17).toStr() + ")")
+    }
+    let c2 = q(s, &("insert into g values " + strings.join(&rows, ", ")))
+    if c2 != "INSERT 0 2500" { println("insert: " + c2) }
+    both(s, &"group by k", &"select k, count(*), sum(j), avg(m) from g group by k order by k")
+    both(s, &"group by k * 2", &"select k * 2, sum(m), min(n) from g group by k * 2 order by 1")
+    both(s, &"-2^63", &"select sum(m * n), min(m * n), max(m * n), count(m * n) from g")
+    both(s, &"group by m * n", &"select m * n, count(*) from g where m < 0 group by m * n order by 1 limit 5")
+    both(s, &"negated past units", &"select sum(-(m * n)), j from g group by j order by j")
+    both(s, &"in list", &"select count(*), sum(j) from g where k in (1.50, 2, 3.251, null)")
+    both(s, &"like", &"select count(*), sum(j) from g where k like '1%'")
+    both(s, &"float constant", &"select sum(k), count(*) from g where k > 1.5::float8")
+    both(s, &"float column", &"select sum(k), count(*) from g where k < f")
+    both(s, &"plain numeric column", &"select sum(k), count(*) from g where k < p")
+    both(s, &"two of numeric(18,0)", &"select sum(k), count(*), sum(m - n) from g where m > n")
+    let a1 = q(s, &"alter table g alter column k type numeric(10,3)")
+    let a2 = q(s, &"alter table g add column z numeric(9,2) default 1.5")
+    let a3 = q(s, &"update g set z = j * 0.5 where id % 4 = 0")
+    both(s, &"scale altered", &"select k, sum(k), avg(k * 2), min(k) from g group by k order by k")
+    both(s, &"added with a default", &"select z, sum(z), avg(z * j), count(*) from g group by z order by z")
+    let ck = q(s, &"checkpoint")
+    both(s, &"checkpointed, scale altered", &"select k, sum(k), avg(k * 2), min(k) from g group by k order by k")
+    both(s, &"checkpointed, added with a default", &"select z, sum(z), avg(z * j), count(*) from g group by z order by z")
+}
+
 fn main() {
     lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
@@ -159,6 +235,7 @@ fn main() {
         // u: t's values, each at its own display scale (no typmod)
         let c3 = q(mut &s, &"insert into u select * from t")
         if c3 != "INSERT 0 3000" { println("copy: " + c3) }
+        run(mut &s, mut &r, &"not checkpointed", 100)
         let ck = q(mut &s, &"checkpoint")
         run(mut &s, mut &r, &"committed", 400)
         fixed(mut &s, &"fixed", &["select f, s, sum(d), sum(a), sum(a * (1 - b)), sum(a * (1 - b) * (1 + b)), avg(d), avg(a), avg(b), count(*) from t where e <= date '1998-06-04' group by f, s order by f, s",
@@ -190,6 +267,7 @@ fn main() {
         let b7 = q(mut &s, &"insert into u values (5001, 'A', 'F', 12.34, 0.05, 1.0001, 3, 1, '1998-01-01'), (5002, 'N', 'O', null, null, null, null, null, '1998-02-02')")
         run(mut &s, mut &r, &"in a transaction", 100)
         let b8 = q(mut &s, &"rollback")
+        gaps(mut &s)
         return 0
     }).unwrap()
 }

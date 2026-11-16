@@ -23524,8 +23524,9 @@ fn isSpill(x: &DbErr): bool { return x.state == "XXDEC" }
 // gave way to the row path (a result past its units), for the tests.
 var decRuns: int = 0
 var decSpills: int = 0
+var groupRuns: int = 0      // grouped queries run over batches, units or not
 
-pub fn decCounts(): []int { return [decRuns, decSpills] }
+pub fn decCounts(): []int { return [decRuns, decSpills, groupRuns] }
 
 const BA_STAR = 0       // count(*)
 const BA_COUNT = 1
@@ -27423,22 +27424,29 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
 // the batches run (nothing done; the row path runs it).
 fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
                gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
-    // a numeric past its units gives way to the row path, from the start
-    // (the groups are made at the end: none yet)
+    // Numerics as units first. Where that gives way (a numeric past its
+    // units, a condition the units do not compile, as a numeric IN list,
+    // LIKE or a float), the batches run again with numerics as values, as
+    // before units, then the row path; from the start each time (the
+    // groups are made at the end: none yet).
     let h0: int = held + 0
-    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max) {
-        Ok(x) { return Ok(x) }
+    var usedDec = false
+    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, true, mut &usedDec) {
+        Ok(x) { if x || !usedDec { return Ok(x) } }
         Err(x) {
             if !isSpill(&x) { return Err(x) }
             held = h0
             decSpills += 1
-            return Ok(false)
         }
     }
+    var none = false
+    return batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, false, mut &none)
 }
 
+// allowDec: numeric(p, s) columns as units (one table's batches); usedDec
+// set when the query reads such a column so.
 fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
-                 gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
+                 gs: mut &Groups, held: mut &int, room: int, rs0max: int, allowDec: bool, usedDec: mut &bool): Result[bool, DbErr] {
     let q = &sel.q
     if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) == 0 || len(sel.gsets) > 0 { return Ok(false) }
     // subqueries: only semi-joins' (levels, run before: 9.104)
@@ -27470,11 +27478,12 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         return Ok(false)
     }
     // one table's batches hold a numeric(p, s) as its units (BK_DEC)
-    let dec = !jn
+    let dec = !jn && allowDec
     var kinds: []int = []
-    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, lexdb_rows.decColKind(&c)) } }
+    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, if dec { lexdb_rows.decColKind(&c) } else { colKind(&c) }) } }
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
+    if dec { for i in 0..len(kinds) { if needCol[i] && lexdb_rows.isDecKind(kinds[i]) { usedDec = true } } }
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
@@ -27855,6 +27864,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         for i in 0..len(bp.kinds) { if bp.needCol[i] && lexdb_rows.isDecKind(bp.kinds[i]) { anyDec = true } }
         if anyDec { decRuns += 1 }
     }
+    groupRuns += 1
     rs.cnt[0].starts += 1
     rs.cnt[0].read += nRead
     rs.cnt[0].joined += nJoined
