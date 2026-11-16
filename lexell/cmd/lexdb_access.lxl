@@ -352,8 +352,8 @@ pub fn padKey(s: &str): str {
 pub type Scan = record {
     pub empty: bool     // a bound is NULL: no row can match
     pub point: bool     // one primary key (lo)
-    pub lo: str
-    pub hi: str
+    lo: str
+    hi: str
     pub whole: bool     // the whole table, in primary key order, whatever the path's index
 }
 
@@ -1591,6 +1591,16 @@ pub fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, mos
 // The pages t's table tree holds (its rows, long values included).
 pub fn pages(st: &lexdb_store.Store, t: &Rel): Result[int, DbErr] { return st.treePages(t.tree) }
 
+// Whether t has a row (its first one read).
+pub fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel): Result[bool, DbErr] {
+    var any = false
+    try st.scan(txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
+        any = true
+        return false
+    })
+    return Ok(any)
+}
+
 // How many rows t has (exact, from the leaf headers).
 pub fn rowCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel): Result[int, DbErr] { return st.countRange(txn, t.tree, &"", &"") }
 
@@ -2236,4 +2246,325 @@ pub fn hasKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, via: 
         append(mut &out, found)
     }
     return Ok(out)
+}
+
+// The keys of [lo, hi) for equalities eqs on the first columns and a lower
+// and an upper bound on the next, each inclusive or not (in an index: each
+// part under its marker): exact, for a range delete. noScan: none.
+pub fn exactRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val], upIncl: bool, ix: bool): Scan {
+    var pb = newStrBuf()
+    for v in eqs { encPart(mut &pb, &v, ix) }
+    let p = pb.toStr()
+    var lo = p
+    var hi = if len(p) > 0 { succ(&p) } else { "" }
+    match lower {
+        Some(v) {
+            var kb = newStrBuf()
+            kb.add(&p)
+            encPart(mut &kb, &v, ix)
+            let e = kb.toStr()
+            if lowIncl {
+                lo = e
+            } else {
+                // just after every key that starts with e; none: nothing is above it
+                let n = succ(&e)
+                if n == "" { return noScan() }
+                lo = n
+            }
+        }
+        None {}
+    }
+    match upper {
+        Some(v) {
+            var kb = newStrBuf()
+            kb.add(&p)
+            encPart(mut &kb, &v, ix)
+            let e = kb.toStr()
+            // (inclusive with nothing after e: to the end, no tighter than hi)
+            let h = if upIncl { succ(&e) } else { e }
+            if h != "" && (hi == "" || h < hi) { hi = h }
+        }
+        None {}
+    }
+    if len(hi) > 0 && lo >= hi { return noScan() }
+    return Scan{empty: false, point: false, lo: lo, hi: hi, whole: false}
+}
+
+// Whether a transaction other than txn holds a row lock in t's range sc.
+pub fn rangeLocked(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Rel, sc: &Scan): bool {
+    return st.locks.locksIn(txn.lockOwner(), t.tree, &sc.lo, &sc.hi)
+}
+
+// A range delete of t: its rows of main dropped as subtrees, and the
+// entries of indexes ixs (their ranges ixr) too; the entries of indexes
+// slow, which do not lead with the key, deleted one by one (delEntries,
+// their columns need). The range is noted as read before it is counted,
+// so a commit into it meanwhile fails this one (40001). The rows deleted;
+// -1 the count gave up (nothing deleted).
+pub fn deleteRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, main: &Scan, ixs: &[]int, ixr: &[]Scan, slow: &[]int,
+                   need: &[]bool, pred: &fn(&Index, &[]Val): Result[bool, DbErr],
+                   expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[int, DbErr] {
+    st.noteRange(txn, t.tree, &main.lo, &main.hi)
+    // with indexes to delete entry by entry, the rows are read (through the
+    // transaction's own view) and counted: the rows read are the rows
+    // deleted, whatever the transaction wrote or cut before
+    let n = if len(slow) > 0 { try delEntries(st, txn, t, &main.lo, &main.hi, slow, need, pred, expr) }
+            else { try st.countView(txn, t.tree, &main.lo, &main.hi) }
+    if n <= 0 { return Ok(n) }
+    txn.delRange(t.tree, &main.lo, &main.hi)
+    for i in 0..len(ixs) { txn.delRange(t.indexes[ixs[i]].tree, &ixr[i].lo, &ixr[i].hi) }
+    return Ok(n)
+}
+
+// The entries of the indexes slow (places in t.indexes) of the rows of [lo, hi) of table t, deleted one by one
+// as the row path's delRow does (an expression's value, a filtered index's predicate, the key from the row's
+// key): the number of rows read. Only the columns those indexes use (need) are read, in batches (the rows are not
+// held), and through the transaction's own view, so a row it wrote is read as written and one it deleted or
+// cut is not.
+fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, lo: &str, hi: &str, slow: &[]int, need: &[]bool,
+              pred: &fn(&Index, &[]Val): Result[bool, DbErr], expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[int, DbErr] {
+    let n = rowWidth(t)
+    let places = placesNeeded(t, need)
+    let missing = placesMissing(t)
+    var from = lo.toStr()
+    var count = 0
+    while true {
+        var keys: []str = []
+        var vals: []str = []
+        try st.scanPart(txn, t.tree, &from, hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val)
+            append(mut &keys, en.key)
+            return len(vals) < BATCH
+        })
+        for k in 0..len(keys) {
+            let row = try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing)
+            for x in slow {
+                let ix = &t.indexes[x]
+                if try ixHolds(ix, &row, pred) { txn.del(ix.tree, &((try ixKey(t, ix, &row, expr)).pre + keys[k])) }
+            }
+        }
+        count += len(keys)
+        if len(keys) < BATCH { break }
+        from = after(&keys[len(keys) - 1])
+    }
+    return Ok(count)
+}
+
+// ---- bulk builds: a table's rows, or an index's entries, made again into
+// new trees and written in key order, as a sorted index build writes them:
+// each goes past the tree's last, so its leaves are left full (lexdb_store
+// applyPut; design/lexdb.md 9.109).
+
+// A duplicate a build found: on what (NO_CONFLICT none, PK_CONFLICT the
+// primary key, else the index) and one of its rows ([] not known).
+pub type Dup = record {
+    pub ix: int
+    pub row: []Val
+}
+
+fn noDup(): Dup { return Dup{ix: NO_CONFLICT, row: []} }
+
+// A table's rows made again (ALTER TABLE's rewrite): their keys and bytes,
+// and the entries of the indexes made again (redo, places in its indexes;
+// per one, each entry's row and, for a unique index, the length of its
+// parts, -1 one NULL). held: the bytes held so far.
+pub type Build = record {
+    keys: []str
+    encs: []str
+    redo: []int
+    ents: [][]str
+    rows: [][]int
+    pres: [][]int
+    pub held: int
+}
+
+pub fn newBuild(redo: &[]int): Build {
+    var b = Build{keys: [], encs: [], redo: [], ents: [], rows: [], pres: [], held: 0}
+    for x in redo {
+        append(mut &b.redo, x)
+        append(mut &b.ents, [])
+        append(mut &b.rows, [])
+        append(mut &b.pres, [])
+    }
+    return b
+}
+
+pub fn (b: &Build) count(): int { return len(b.keys) }
+
+// A row of the build: its key, its bytes, its entries in the indexes made
+// again (held counts them).
+pub fn buildAdd(t: &Rel, b: mut &Build, row: &[]Val, pred: &fn(&Index, &[]Val): Result[bool, DbErr],
+                expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[Unit, DbErr] {
+    let key = keyOf(t, row)
+    let enc = encRow(t, row)
+    b.held += len(key) + len(enc) + 48
+    let r = len(b.keys)
+    for j in 0..len(b.redo) {
+        let ix = &t.indexes[b.redo[j]]
+        if !(try ixHolds(ix, row, pred)) { continue }
+        let k = try ixKey(t, ix, row, expr)
+        let en = k.pre + key
+        b.held += len(en) + 32
+        append(mut &b.ents[j], en)
+        append(mut &b.rows[j], r)
+        if ix.unique { append(mut &b.pres[j], if k.nul { -1 } else { len(k.pre) }) }
+    }
+    append(mut &b.keys, key)
+    append(mut &b.encs, enc)
+    return Ok(Unit{})
+}
+
+// Whether xs are in order already (a key that follows the rows' order, as
+// an id filled as rows came: no sort needed).
+fn inOrder(xs: &[]str): bool {
+    for i in 1..len(xs) { if xs[i - 1].cmp(&xs[i]) > 0 { return false } }
+    return true
+}
+
+// The build written to t's (new) trees: the rows in key order (sorted
+// unless sorted says they come so, or they do), then each index's entries.
+// Two rows of one key, or two entries of a unique index with equal parts
+// (none NULL), are a duplicate: nothing more is written.
+pub fn buildWrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, b: &Build, sorted: bool,
+                  wrote: &fn(&lexdb_store.Txn)): Result[Dup, DbErr] {
+    var order: []int = array(len(b.keys), 0)
+    for i in 0..len(order) { order[i] = i }
+    if !sorted && !inOrder(&b.keys) { collections.sortBy(mut &order, fn(x: &int, y: &int): int { return b.keys[x].cmp(&b.keys[y]) }) }
+    for j in 0..len(order) {
+        let i = order[j]
+        if j > 0 && b.keys[i] == b.keys[order[j - 1]] {
+            let row = try rowOf(st, txn, t, &b.keys[i], &b.encs[i], rowWidth(t), &[], &[])
+            return Ok(Dup{ix: PK_CONFLICT, row: row})
+        }
+        try txn.putRow(t.tree, &b.keys[i], &b.encs[i], lexdb_rows.rowHead(&b.encs[i]))
+        wrote(txn)
+    }
+    for j in 0..len(b.redo) {
+        var pks: []str = []
+        for r in b.rows[j] { append(mut &pks, b.keys[r]) }
+        match try fillIndex(st, txn, t, &t.indexes[b.redo[j]], &b.ents[j], &pks, &b.pres[j]) {
+            Some(row) { return Ok(Dup{ix: b.redo[j], row: row}) }
+            None {}
+        }
+    }
+    return Ok(noDup())
+}
+
+// Index ix (not yet one of t's: CREATE INDEX) filled from t's rows, a
+// unique one checked: the entries sorted, so a unique index's duplicates
+// are neighbours (the tree is new, so they are all there is to check).
+// Some: a duplicate, one of its rows ([] not known).
+pub fn buildIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index, pred: &fn(&Index, &[]Val): Result[bool, DbErr],
+                  expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[Option[[]Val], DbErr] {
+    let sc = allScan()
+    var cur = newCursor()
+    var ents: []str = []
+    var pks: []str = []
+    var pres: []int = []                // a unique index's: the length of each entry's parts, -1 one NULL
+    while !cur.done {
+        var batch: [][]Val = []
+        let all: []bool = []
+        try fetch(st, txn, t, -1, false, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            if !(try ixHolds(ix, &r, pred)) { continue }
+            let pk = keyOf(t, &r)
+            let k = try ixKey(t, ix, &r, expr)
+            if ix.unique { append(mut &pres, if k.nul { -1 } else { len(k.pre) }) }
+            append(mut &ents, k.pre + pk)
+            append(mut &pks, pk)
+        }
+    }
+    return fillIndex(st, txn, t, ix, &ents, &pks, &pres)
+}
+
+// Fills index ix's (new) tree with its entries ents, each ending with its
+// row's key pks[i], in their order; a unique one's (pres: each entry's
+// parts' length, -1 one NULL) two of equal parts are then neighbours: a
+// duplicate, its row read back from t's tree (Some).
+fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index, ents: &[]str, pks: &[]str,
+             pres: &[]int): Result[Option[[]Val], DbErr] {
+    var order: []int = array(len(ents), 0)
+    for i in 0..len(ents) { order[i] = i }
+    if !inOrder(ents) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) }) }
+    for j in 0..len(order) {
+        let i = order[j]
+        if ix.unique && j > 0 {
+            let h = order[j - 1]
+            if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
+                var row: []Val = []
+                match try st.get(txn, t.tree, &pks[i]) {
+                    Some(v) { row = try rowOf(st, txn, t, &pks[i], &v, rowWidth(t), &[], &placesMissing(t)) }
+                    None {}
+                }
+                return Ok(Some(row))
+            }
+        }
+        try txn.put(ix.tree, &ents[i], &pks[i])
+    }
+    return Ok(None)
+}
+
+// ---- a load in key order (COPY's fast path)
+
+// Where a load is: the last key loaded, and whether its rows have entered
+// the own-writes map (a key came out of order).
+pub type Load = record {
+    lastId: int
+    haveLast: bool
+    indexed: bool
+}
+
+pub fn newLoad(): Load { return Load{lastId: 0, haveLast: false, indexed: false} }
+
+// Row bytes row (t's stored form) of the primary key id (one integer
+// column) loaded into t: in key order straight to the tree's end
+// (putRowLoad: no own-writes entry); once a key comes out of order, the
+// rows so far enter the own-writes map and from there each key is looked
+// for before it is written. False: that key is there already.
+pub fn loadRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, id: int, row: &str, ld: mut &Load): Result[bool, DbErr] {
+    let outOfOrder = ld.haveLast && id <= ld.lastId
+    ld.lastId = id
+    ld.haveLast = true
+    var kb = newStrBuf()
+    binary.addU64BE(mut &kb, id ^ (-9223372036854775807 - 1))
+    let key = kb.toStr()
+    if outOfOrder && !ld.indexed {
+        txn.indexWrites()
+        ld.indexed = true
+    }
+    if ld.indexed {
+        match try st.get(txn, t.tree, &key) {
+            Some(_) { return Ok(false) }
+            None {}
+        }
+        try txn.putRow(t.tree, &key, row, 0)
+    } else {
+        try txn.putRowLoad(t.tree, &key, row, 0)
+    }
+    return Ok(true)
+}
+
+// ---- column leaves
+
+// Gives the store t's layouts for its column leaves (lexdb_store.setColSpec),
+// and the values its rows written before a column was added have for it
+// (as a row in its current layout: lexdb_rows.Spec.fill).
+pub fn setSpec(st: &lexdb_store.Store, t: &Rel) {
+    let miss = placesMissing(t)
+    var fill = ""
+    var ok = true
+    if len(miss) > 0 {
+        let r = rowsFor(t)
+        match lexdb_rows.encodeFixed(&r, &miss) {
+            Some(f) { fill = f }
+            None { ok = false }
+        }
+    }
+    st.setColSpec(t.tree, t.layouts, &fill, ok)
+}
+
+// Up to most of t's leaves from from on made column leaves where their rows
+// allow (VACUUM).
+pub fn upgrade(st: &lexdb_store.Store, t: &Rel, from: &str, most: int): Result[lexdb_store.Upgrade, DbErr] {
+    return st.upgradeTree(t.tree, from, most)
 }
