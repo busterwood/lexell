@@ -542,8 +542,7 @@ pub fn inReadOid(side: int, other: int): int {
 // places in the row (not found by their names per row, as eval finds
 // them), its parameters as their values, each operator decoded to its
 // code (lexdb_ops.OPS) and each function bound once (FnRef: which of the executor's
-// ways gives it, not a check of its name on every call), each operator's,
-// CASE's and call's type as exprOid labels it. lexdb_exec evaluates it
+// ways gives it, not a check of its name on every call). lexdb_exec evaluates it
 // (bxEval, and per batch bGenVals) with eval's own operations, so it gives
 // exactly what eval gives. What only eval evaluates (a subquery, an
 // aggregate, a window call, a sequence, session, lock or catalog function,
@@ -557,13 +556,13 @@ pub type BX = closed {
     Un(int, BX)                 // lexdb_ops.UN_*
     And(BX, BX)
     Or(BX, BX)
-    Op(int, int, BX, BX)        // a binary operator (lexdb_ops.OP_*), its type
+    Op(int, BX, BX)             // a binary operator (lexdb_ops.OP_*)
     Cat(BX, BX, str)            // ||, with its function for arrays (arrayConcat; "" none)
     IsNull(BX, bool)
     Cast(BX, lexdb_sql.TypeName)
-    Case([]BX, bool, int)       // CASE's conditions and values in turn; true: an ELSE last; its type
+    Case([]BX, bool)            // CASE's conditions and values in turn; true: an ELSE last
     Try(BX)                     // T-SQL's TRY_CAST: NULL for an error
-    Call(FnRef, []BX, int)      // a bound function, its arguments, its type
+    Call(FnRef, []BX)           // a bound function and its arguments
 }
 
 // How a bound function is evaluated (FnRef.way): FN_NONE, it does not
@@ -590,12 +589,10 @@ pub type FnRef = record {
 // to slots when first used). aggs: #agg's slots are given.
 pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int,
                 ty: &Typing): Option[BX] {
-    var pt: []int = []
-    for p in params { append(mut &pt, exprOid(&Expr.Lit(p), cols, &[], ty)) }
-    return bindIn(x, cols, params, &pt, direct, aggs, slots, ty)
+    return bindIn(x, cols, params, direct, aggs, slots, ty)
 }
 
-fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direct: bool, aggs: bool, slots: mut &[]int,
+fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int,
           ty: &Typing): Option[BX] {
     match x {
         Expr.Lit(v) { return Some(BX.Const(v)) }
@@ -612,15 +609,15 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direc
             return Some(BX.Col(len(slots) - 1))
         }
         Expr.Unary(op, a) {
-            let ba = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
+            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
             if ba.isNone() { return None }
             let u = lexdb_ops.unCode(&op)
             return Some(BX.Un(u, ba.unwrap()))
         }
         Expr.Bin(op, a, b) {
-            let ba = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
+            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
             if ba.isNone() { return None }
-            let bb = bindIn(&b, cols, params, pt, direct, aggs, slots, ty)
+            let bb = bindIn(&b, cols, params, direct, aggs, slots, ty)
             if bb.isNone() { return None }
             if op == "and" { return Some(BX.And(ba.unwrap(), bb.unwrap())) }
             if op == "or" { return Some(BX.Or(ba.unwrap(), bb.unwrap())) }
@@ -631,16 +628,16 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direc
             }
             let code = lexdb_ops.opCode(&op)
             if code < 0 { return None }
-            return Some(BX.Op(code, exprOid(x, cols, pt, ty), ba.unwrap(), bb.unwrap()))
+            return Some(BX.Op(code, ba.unwrap(), bb.unwrap()))
         }
         Expr.IsNull(a, neg) {
-            let ba = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
+            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
             if ba.isNone() { return None }
             return Some(BX.IsNull(ba.unwrap(), neg))
         }
         Expr.Cast(a, t) {
             if t.kind == lexdb_sql.K_REG { return None }
-            let ba = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
+            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
             if ba.isNone() { return None }
             return Some(BX.Cast(ba.unwrap(), t))
         }
@@ -657,18 +654,18 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direc
             if !special && fr.way == FN_NONE { return None }
             var bs: []BX = []
             for a in args {
-                let c = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
+                let c = bindIn(&a, cols, params, direct, aggs, slots, ty)
                 if c.isNone() { return None }
                 append(mut &bs, c.unwrap())
             }
-            if name == "case" || name == "case else" { return Some(BX.Case(bs, name == "case else", exprOid(x, cols, pt, ty))) }
+            if name == "case" || name == "case else" { return Some(BX.Case(bs, name == "case else")) }
             if name == "#try" {
                 if len(bs) == 1 { return Some(BX.Try(pop(mut &bs))) }
                 let tr = ty.fnBind(&name, len(bs))
                 if tr.way == FN_NONE { return None }
-                return Some(BX.Call(tr, bs, exprOid(x, cols, pt, ty)))
+                return Some(BX.Call(tr, bs))
             }
-            return Some(BX.Call(fr, bs, exprOid(x, cols, pt, ty)))
+            return Some(BX.Call(fr, bs))
         }
     }
 }

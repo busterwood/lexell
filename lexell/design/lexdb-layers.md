@@ -599,7 +599,11 @@ plain select list (`branchOid`).
   `CX`, `FnB` and `cxOf` are gone.
   - Its binary operators carry a code (`lexdb_ops.OPS`), its unary ones
     `UN_*`, so nothing matches an operator's text per row.
-  - Each operator, CASE and call carries its type as `exprOid` labels it.
+  - Its nodes carry no type yet. A first version labelled each operator,
+    CASE and call with `exprOid` while binding, and q20 lost 5%.
+    `bindExpr` runs once per run of a correlated subquery (8,508 times in
+    q20), because parameters are bound as constants. Types come with 2c,
+    once per plan and bottom-up, with parameters as slots.
   - A function binds through the executor's hook (`Typing.fnBind`:
     exec's `fnRefOf`, which also lists what only `eval` evaluates) into
     a `FnRef`.
@@ -626,6 +630,11 @@ plain select list (`branchOid`).
   - the function library (`callAt`, `callFn`, `callMisc`, `callTime`)
     is not split per signature: it moves with 2c's generic node;
   - `arith` still takes the operator's text inside;
+  - exec calls `lexdb_ops` directly (496 call sites renamed); it keeps
+    `pub` forwarders only for the names other modules and tests use. A
+    forwarder per call to `isNull` or `compare` measurably slowed q20;
+    `opCode` reads bytes, not a match of texts, because q18's HAVING
+    reaches `binVal` 1.5M times;
   - `bxEval` walks the tree rather than running flat steps.
 
 ### 4.5 Layer 5, optimizer (`lexdb_plan`)
