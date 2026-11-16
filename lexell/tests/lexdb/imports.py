@@ -61,9 +61,10 @@ KNOWN_CORE_DIALECT = {
 # row codecs and below the catalog, the planner and the executor: what it may
 # import, and the modules below it, which may not import it.
 ACCESS = "lexdb_access"
-ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like"}
+ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_vec"}
 BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_disk", "lexdb_locks", "lexdb_memo",
-                "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect"}
+                "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect",
+                "lexdb_vec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).

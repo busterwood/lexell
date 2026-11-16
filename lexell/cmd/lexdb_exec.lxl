@@ -3036,45 +3036,14 @@ fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
     return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
 }
 
-// A row from a stored value as a Part read gives it: a large row from its
-// first bytes when the columns used are all there, else read whole (9.31).
-// n and need are of the row's places (rowWidth, placesNeeded); the values
-// are the table's columns'.
-fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
-         need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
-    let places = try placesOf(st, txn, t, key, v, n, need, missing)
-    if len(t.slots) == 0 { return Ok(places) }
-    var out: []Val = []
-    for k in t.slots { append(mut &out, places[k]) }
-    return Ok(out)
-}
-
 // The places a stored row has: its table's columns, and dropped ones.
 fn rowWidth(t: &Table): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
-
-// The values rows written before a column was added have for it, by
-// place ([] when all are NULL).
-fn placesMissing(t: &Table): []Val { let r = rowsFor(t); return lexdb_rows.placesMissing(&r) }
-
-fn placesNeeded(t: &Table, need: &[]bool): []bool { let r = rowsFor(t); return lexdb_rows.placesNeeded(&r, need) }
 
 // A table's row as stored: its values at their places, NULL at a dropped
 // column's.
 fn encRowOf(t: &Table, row: &[]Val): str {
     let r = rowsFor(t)
     return lexdb_rows.encodeRowOf(&r, row)
-}
-
-fn placesOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
-            need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
-    match lexdb_rows.partOf(v) {
-        Some(p) {
-            if lexdb_rows.fitsIn(&p, n, need) { return decRowNeed(&p, n, need, missing, &t.lays) }
-            let w = try st.whole(txn, t.tree, key, v)
-            return decRowNeed(&w, n, need, missing, &t.lays)
-        }
-        None { return decRowNeed(v, n, need, missing, &t.lays) }
-    }
 }
 
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
@@ -4771,12 +4740,11 @@ type Run = record {
     batch: bool                 // vector scans and batch operators (SET lexdb_batch: 9.47); compiled expressions and typed sorts are always on
     writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (optimizer 19)
     // The first level's switch (firstSwitch, 9.107), decided once for its
-    // range [swLo, swHi), for the batches and the row path: -1 not yet;
+    // range swScan, for the batches and the row path: -1 not yet;
     // indexOrScan's answer, swKeys its keys
     sw: int
     swKeys: []str
-    swLo: str
-    swHi: str
+    swScan: Scan
     after: str                  // a batched DELETE or UPDATE (stage 8): the first level's primary key scan starts at this key; "" none
 }
 
@@ -4909,7 +4877,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swLo: "", swHi: "", after: ""}
+               held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: ""}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -6606,7 +6574,7 @@ fn (q: &Query) outerReadOnce(ms: &[][]Expr, early: bool, cap: float, ro: mut &[]
 fn (q: &Query) rightFits(st: &lexdb_store.Store, cap: float): Result[bool, DbErr] {
     let a = &q.levels[0]
     if a.est.rows <= 0 || a.t.tree < 0 { return Ok(a.est.rows == 0) }
-    let pages = try st.treePages(a.t.tree)
+    let pages = try lexdb_access.pages(st, &relOf(&a.t))
     let stored = float(pages * lexdb_rows.PAGE) / float(a.est.rows)
     let held = float(a.est.rows) * (32.0f + 24.0f * float(len(a.t.cols)) + stored)
     return Ok(held <= cap)
@@ -7379,106 +7347,6 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     return Ok(lexdb_access.rangeScan(&relOf(t), p.index, &eqs, &los, &his, p.noNulls))
 }
 
-const BATCH = 256
-
-// Appends up to BATCH rows of a scan to out, from the cursor on. Rows are
-// read in batches so that what is done with them (a join's lookups, an
-// index's entries) can use the transaction between.
-fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan, need: &[]bool, cur: mut &Cursor,
-         out: mut &[][]Val): Result[Unit, DbErr] {
-    let n = rowWidth(t)
-    let places = placesNeeded(t, need)
-    let missing = placesMissing(t)
-    // only some columns used: large rows are read in part (rowOf)
-    let part = len(need) > 0
-    if sc.empty {
-        cur.done = true
-        return Ok(Unit{})
-    }
-    if sc.point {
-        cur.done = true
-        let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
-        match got {
-            Some(v) { append(out, try rowOf(st, txn, t, &sc.lo, &v, n, &places, &missing)) }
-            None {}
-        }
-        return Ok(Unit{})
-    }
-    let byIndex = p.index >= 0 && !sc.whole
-    let tree = if byIndex { t.indexes[p.index].tree } else { t.tree }
-    // an index whose entries hold every column used (a SELECT's: need
-    // narrowed, 9.31): read alone, no row read (9.107)
-    var alone = false
-    var dec = IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}
-    if byIndex && len(need) > 0 {
-        match idxDecOf(t, p.index, need) {
-            Some(d) {
-                dec = d
-                alone = true
-            }
-            None {}
-        }
-    }
-    var vals: []str = []
-    var keys: []str = []
-    var last = ""
-    let inPart = part && !byIndex
-    if p.desc {
-        // backward: the cursor is the exclusive end
-        let to = if cur.started { cur.at } else { sc.hi }
-        cur.started = true
-        if inPart {
-            try st.scanBackPart(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
-            return len(vals) < BATCH
-        })
-        } else {
-            try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
-            return len(vals) < BATCH
-        })
-        }
-        if len(vals) < BATCH { cur.done = true } else { cur.at = last }
-    } else {
-        let from = if cur.started { cur.at } else { sc.lo }
-        cur.started = true
-        if inPart {
-            try st.scanPart(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
-            return len(vals) < BATCH
-        })
-        } else {
-            try st.scan(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
-            return len(vals) < BATCH
-        })
-        }
-        if len(vals) < BATCH { cur.done = true } else { cur.at = lexdb_access.after(&last) }
-    }
-    for k in 0..len(vals) {
-        if !byIndex {
-            append(out, try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing))
-        } else if alone {
-            append(out, try idxRow(t, &dec, &keys[k]))
-        } else {
-            let got = if part { try st.getPart(txn, t.tree, &vals[k]) } else { try st.get(txn, t.tree, &vals[k]) }
-            match got {
-                Some(rv) { append(out, try rowOf(st, txn, t, &vals[k], &rv, n, &places, &missing)) }
-                None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
-            }
-        }
-    }
-    return Ok(Unit{})
-}
-
 fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val): Result[bool, DbErr] {
     if len(cs) == 0 { return Ok(true) }
     let noAggs: []Val = []
@@ -8233,41 +8101,19 @@ fn switchMost(rules: bool, n: int): int {
     return SWITCH_TIMES * n
 }
 
-// The table's rows, counted until there are more than most.
-fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
-    var n = 0
-    try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-        n += j - i
-        return n <= most
-    })
-    return Ok(n)
-}
-
 // 0: the index, keys holding its range's primary keys (the range ended within
 // SWITCH_ENTRIES, so it is read once); 2: the index, its range read again;
 // 1: a scan.
 fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan,
                keys: mut &[]str, decided: bool): Result[int, DbErr] {
-    let tree = t.indexes[p.index].tree
     let start = if txn.sql.rules { SWITCH_ENTRIES } else { SWITCH_ENTRIES_COST }
     var lim = start
-    var from = sc.lo
+    var cur = newCursor()
     var n = 0
     var got: []str = []
     while true {
-        var more = false
-        var last = ""
         let first = lim == start
-        try st.scan(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            if n == lim {
-                more = true
-                return false
-            }
-            n += 1
-            last = en.key
-            if first { append(mut &got, en.val) }
-            return true
-        })
+        let more = try lexdb_access.countEntries(st, txn, &relOf(t), p.index, sc, mut &cur, mut &n, lim, first, mut &got)
         if !more {
             if first {
                 // a short range: the index, unless (cost mode) the table is
@@ -8285,7 +8131,6 @@ fn indexOrScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: 
             if try countRows(st, txn, t, most) <= most { return Ok(1) }
             return Ok(2)
         }
-        from = lexdb_access.after(&last)
         // the planner chose this range from its samples: no count
         if decided { return Ok(2) }
         let most = switchMost(txn.sql.rules, lim)
@@ -8305,29 +8150,15 @@ fn firstSwitch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, sca
     if lv.keeps || lv.stops || rs.writes || txn.noting() || len(q.refs) > 0 || (q.corr && pathCorr(&lv.path)) || len(scans) != 1 ||
        lv.path.index < 0 || len(lv.path.ins) > 0 || lv.path.inSub >= 0 || len(lv.path.inArr) > 0 || scans[0].point || scans[0].empty ||
        scans[0].whole || ixCovers(lv, lv.path.index) { return Ok(-1) }
-    if rs.sw < 0 || rs.swLo != scans[0].lo || rs.swHi != scans[0].hi {
+    if rs.sw < 0 || !lexdb_access.sameRange(&rs.swScan, &scans[0]) {
         var got: []str = []
         rs.sw = try indexOrScan(st, txn, &lv.t, &lv.path, &scans[0], mut &got, lv.path.stats)
         rs.swKeys = got
-        rs.swLo = scans[0].lo
-        rs.swHi = scans[0].hi
+        rs.swScan = scans[0].copy()
     }
     if rs.sw == 1 { rs.cnt[0].switched = if txn.sql.rules { 1 } else { 2 } }
     if rs.sw == 0 { for x in rs.swKeys { append(keys, x) } }
     return Ok(rs.sw)
-}
-
-// Before a list of primary keys (an IN list's lookups: two or more point
-// scans) is read key by key, their nodes not in memory are read together
-// (Store.warm, lexdb.md 9.132): what is read and noted is unchanged.
-fn warmPoints(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, scans: &[]Scan): Result[Unit, DbErr] {
-    if len(scans) < 2 { return Ok(Unit{}) }
-    var ks: []str = []
-    for sc in scans {
-        if !sc.point { return Ok(Unit{}) }
-        append(mut &ks, sc.lo)
-    }
-    return st.warm(txn, t.tree, &ks)
 }
 
 // Joins the rows of level k on to the joined row (levels before k filled),
@@ -8624,15 +8455,10 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         if byKeys {
             // the range's primary keys, already read: its rows, one by one
             let t = &lv.t
-            let n = rowWidth(t)
-            let places = placesNeeded(t, &lv.need)
-            let missing = placesMissing(t)
-            let part = len(lv.need) > 0
+            let rr = lexdb_access.rowRead(&relOf(t), &lv.need)
             for i in 0..len(keys) {
-                let got = if part { try st.getPart(txn, t.tree, &keys[i]) } else { try st.get(txn, t.tree, &keys[i]) }
-                match got {
-                    Some(rv) {
-                        let r = try rowOf(st, txn, t, &keys[i], &rv, n, &places, &missing)
+                match try lexdb_access.getRow(st, txn, &relOf(t), &rr, &keys[i]) {
+                    Some(r) {
                         let g = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
                         if g < 0 { return Ok(false) }
                         if g > 0 { matched = true }
@@ -18398,51 +18224,6 @@ fn skPack(keys: &[]SKey, n: int, out: mut &[]int, bits: mut &int): int {
     return taken
 }
 
-// The permutation sorting the rows by their packed keys (stable): a radix
-// sort, 11 bits or fewer a pass; none when they are in order already.
-fn radixPerm(keys0: &[]int, bits: int): []int {
-    let n = len(keys0)
-    var idx: []int = withCapacity(n)
-    for i in 0..n { append(mut &idx, i) }
-    var sorted = true
-    for i in 1..n {
-        if keys0[i] < keys0[i - 1] {
-            sorted = false
-            break
-        }
-    }
-    if sorted || bits == 0 { return idx }
-    let passes = (bits + 10) / 11
-    let digit = (bits + passes - 1) / passes
-    let mask = (1 << digit) - 1
-    var ka: []int = withCapacity(n)
-    for x in keys0 { append(mut &ka, x) }
-    var kb: []int = array(n, 0)
-    var ib: []int = array(n, 0)
-    var cnt: []int = array((1 << digit) + 1, 0)
-    var shift = 0
-    for p in 0..passes {
-        for d in 0..len(cnt) { cnt[d] = 0 }
-        for i in 0..n { cnt[((ka[i] >> shift) & mask) + 1] += 1 }
-        var one = false
-        for d in 1..len(cnt) { if cnt[d] == n { one = true } }
-        if !one {
-            for d in 1..len(cnt) { cnt[d] += cnt[d - 1] }
-            for i in 0..n {
-                let d = (ka[i] >> shift) & mask
-                let at = cnt[d]
-                cnt[d] = at + 1
-                kb[at] = ka[i]
-                ib[at] = idx[i]
-            }
-            ka = replace(mut &kb, ka)
-            idx = replace(mut &ib, idx)
-        }
-        shift += digit
-    }
-    return idx
-}
-
 // Sorts idx[lo..hi] stably by keys[from..to] (skCmp): insertion sort in
 // runs of 16, then merges; a merge whose halves are in order already is
 // skipped, so rows in order cost n - 1 comparisons.
@@ -18513,7 +18294,7 @@ fn skSort(keys: mut &[]SKey, n: int): []int {
     if taken == 0 {
         for i in 0..n { append(mut &idx, i) }
     } else {
-        idx = radixPerm(&packed, bits)
+        idx = lexdb_vec.radixPerm(&packed, bits)
     }
     let nk = len(keys)
     if taken == nk { return idx }
@@ -20789,20 +20570,12 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     var sc = lexdb_access.allScan()
     if prefixSame(&c.pk, n, cols) {
-        var b = newStrBuf()
-        for j in 0..n { encKeyPart(mut &b, &collKeyVal(&c.cols[c.pk[j]], &crow[c.pk[j]])) }
-        let pre = b.toStr()
-        sc.lo = pre
-        sc.hi = lexdb_access.succ(&pre)
+        sc = lexdb_access.prefixScan(&relOf(c), -1, &crow, n)
     } else {
         for k in 0..len(c.indexes) {
             if path.index < 0 && c.indexes[k].pred.isNone() && prefixSame(&c.indexes[k].cols, n, cols) {
-                var b = newStrBuf()
-                for j in 0..n { encIdxPart(mut &b, &collKeyVal(&c.cols[c.indexes[k].cols[j]], &crow[c.indexes[k].cols[j]])) }
-                let pre = b.toStr()
                 path.index = k
-                sc.lo = pre
-                sc.hi = lexdb_access.succ(&pre)
+                sc = lexdb_access.prefixScan(&relOf(c), k, &crow, n)
             }
         }
     }
@@ -22559,7 +22332,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             // (a fresh load), and no later statement of the same transaction
             // may read the load; otherwise the generic path checks every key
             // and serves reads.
-            if !txn.inBlock() && (try st.countRange(txn, t.tree, &"", &"")) == 0 {
+            if !txn.inBlock() && (try lexdb_access.rowCount(st, txn, &relOf(&t))) == 0 {
                 return fastCopyRun(st, txn, &t, s, &plan, &input, pull)
             }
         }
@@ -25032,128 +24805,6 @@ fn emptyBPlan(): BPlan { return lexdb_rows.emptyProjection() }
 
 fn newBatch(bp: &BPlan, cap: int): Batch { return lexdb_rows.newBatch(bp, cap) }
 
-// A row read whole by the row path (a value stored apart) into row r of b;
-// false: a value of a kind its column's batch does not hold.
-fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, r: int, b: mut &Batch,
-          bp: &BPlan): Result[bool, DbErr] {
-    let row = try rowOf(st, txn, t, key, v, bp.width, &bp.needP, &bp.missing)
-    for i in 0..len(bp.kinds) {
-        if bp.needCol[i] && !lexdb_rows.put(b, i, r, row[i], bp.kinds[i]) { return Ok(false) }
-    }
-    return Ok(true)
-}
-
-// An empty range or a key lookup as a batch: a stored value read whole
-// (a stub) is decoded by the row path. None: a value of a kind its
-// column's batch does not hold.
-fn fillPoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool,
-             cur: mut &Cursor, bp: &BPlan): Result[Option[Batch], DbErr] {
-    let rw = rowsFor(t)
-    cur.done = true
-    if sc.empty { return Ok(Some(lexdb_rows.newBatch(bp, 0))) }
-    var b = lexdb_rows.newBatch(bp, 1)
-    let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
-    match got {
-        Some(v) {
-            let code = try lexdb_rows.decodeRow(&v, 0, mut &b, bp, &rw)
-            if code == 1 { return Ok(None) }
-            if code == 2 && !(try bRowOf(st, txn, t, &sc.lo, &v, 0, mut &b, bp)) { return Ok(None) }
-            b.n = 1
-        }
-        None {}
-    }
-    return Ok(Some(b))
-}
-
-// The next batch of a scan, its rows decoded from the leaves in place
-// (lexdb_store.scanLeaves: no entry copied out); None: a value of a kind
-// its column's batch does not hold. A key lookup or an empty range goes
-// through fillPoint; scanLeaves gives a replica's rows and the
-// transaction's own writes and cuts as one path too.
-fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
-             bp: &BPlan): Result[Option[Batch], DbErr] {
-    if sc.empty || sc.point { return fillPoint(st, txn, t, sc, part, cur, bp) }
-    var b = lexdb_rows.newBatch(bp, BROWS)
-    let rw = rowsFor(t)
-    while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
-        cur.started = true
-        var stopKey = ""
-        var stop = 0                // 1 the batch is full, 2 a value stored apart
-        var bail = false
-        var bad: []DbErr = []
-        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
-            var k = i
-            while k < j {
-                if b.n == BROWS {
-                    stop = 1
-                    stopKey = lexdb_rows.leafKey(leaf, k)
-                    return false
-                }
-                // a run of rows in one fixed layout: a column at a time
-                match lexdb_rows.decodeRun(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, &rw) {
-                    Ok(got) {
-                        if got < 0 {
-                            bail = true
-                            return false
-                        }
-                        if got > 0 {
-                            b.n += got
-                            k += got
-                            continue
-                        }
-                    }
-                    Err(x) {
-                        append(mut &bad, x)
-                        return false
-                    }
-                }
-                match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, k), b.n, mut &b, bp, &rw) {
-                    Ok(code) {
-                        if code == 1 {
-                            bail = true
-                            return false
-                        }
-                        if code == 2 {
-                            stop = 2
-                            stopKey = lexdb_rows.leafKey(leaf, k)
-                            return false
-                        }
-                    }
-                    Err(x) {
-                        append(mut &bad, x)
-                        return false
-                    }
-                }
-                b.n += 1
-                k += 1
-            }
-            return true
-        })
-        if len(bad) > 0 { return Err(bad[0]) }
-        if bail { return Ok(None) }
-                if stop == 1 {
-            cur.at = stopKey
-            return Ok(Some(b))
-        }
-        if stop == 2 {
-            let got = if part { try st.getPart(txn, t.tree, &stopKey) } else { try st.get(txn, t.tree, &stopKey) }
-            match got {
-                Some(v) {
-                    if !(try bRowOf(st, txn, t, &stopKey, &v, b.n, mut &b, bp)) { return Ok(None) }
-                    b.n += 1
-                }
-                None {}
-            }
-            cur.at = lexdb_access.after(&stopKey)
-            continue
-        }
-        cur.done = true
-    }
-    return Ok(Some(b))
-}
-
 // ---- Decoding in two steps (9.108)
 //
 // A batch of the first level is decoded as PostgreSQL decodes a row for
@@ -25165,47 +24816,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &
 // decoded. Rows not in the fixed layout (tagged, stored apart, read
 // merged with the transaction's writes) are decoded whole, as before.
 
-type Lazy = record {
-    on: bool
-    first: []int            // the places read first, in order
-    rest: []int             // the other places used
-    // conditions run on the rows' bytes, before anything is decoded: a
-    // simple LIKE (literal text and %) on a text column no other
-    // condition reads; per one, its condition and its column's place
-    raw: []int
-    rawPl: []int
-    skip: []bool            // per condition: one of raw
-    // A tagged row's (9.76: a row with a date or a timestamp mostly is)
-    // two steps (bTagLazy): first the places of first and raw (bf's
-    // placeCol, stopAt), then those of rest for the rows kept (br's)
-    bf: BPlan
-    br: BPlan
-}
-
-// A top-N's bar (sortBatches): a row whose first key (an integer column,
-// col of the batch) sorts after the heap's last row's (v, nul) cannot
-// enter the heap.
-type Bar = record {
-    on: bool
-    col: int
-    v: int
-    nul: bool
-    desc: bool
-    nf: bool
-}
-
-fn noBar(): Bar { return Bar{on: false, col: -1, v: 0, nul: false, desc: false, nf: false} }
-
 fn noRows(): Batch { return lexdb_rows.noRows() }
-
-// A batch decoded and its rows chosen: the rows the conditions chose and
-// the bar did not drop (their columns all decoded), in order; kept: the
-// rows the conditions chose.
-type Picked = record {
-    b: Batch
-    idx: []int
-    kept: int
-}
 
 // The two steps for a batch plan with these conditions: a simple LIKE on
 // a column no other condition reads on the rows' bytes; then the places
@@ -25224,6 +24835,7 @@ fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
     }
     var raw: []int = []
     var rawPl: []int = []
+    var pieces: [][]str = []
     var skip: []bool = array(len(conds), false)
     for ci in 0..len(conds) {
         let c = likeOn[ci]
@@ -25231,6 +24843,14 @@ fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
         if used[c] { continue }
         append(mut &raw, ci)
         append(mut &rawPl, if len(t.slots) == 0 { c } else { t.slots[c] })
+        match conds[ci] {
+            BNode.Like(_, lp) {
+                var ps: []str = []
+                for x in lp.pieces { append(mut &ps, x) }
+                append(mut &pieces, ps)
+            }
+            else { append(mut &pieces, []) }
+        }
         skip[ci] = true
     }
     // (a column two raw conditions read: both raw)
@@ -25247,7 +24867,7 @@ fn lazyOf(bp: &BPlan, t: &Table, conds: &[]BNode, extra: int): Lazy {
     bf.stopAt = 0
     for pl in 0..len(bf.placeCol) { if bf.placeCol[pl] >= 0 { bf.stopAt = pl + 1 } }
     let br = placesOnly(bp, &rest)
-    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, skip: skip,
+    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, pieces: pieces, skip: skip,
                 bf: bf, br: br}
 }
 
@@ -25268,56 +24888,6 @@ fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
                  missing: copyRow(&bp.missing), needP: np, width: bp.width, ranges: []}
 }
 
-// Whether stored row s is a tagged one (decodeRow's last way): not in the
-// fixed layout, not stored apart, not one with long texts kept whole.
-fn plainTagged(s: &str): bool {
-    if len(s) > 0 && (s[0] == FIXED || s[0] == 6 || s[0] == 0xFF) { return false }
-    return lexdb_rows.partOf(s).isNone()
-}
-
-// bRunLazy for a run of tagged rows from vs[from] up to vs[to]: each decoded
-// into b's rows b.n on at the places of the conditions (lz.bf), the
-// conditions and the bar run over the run, the rest decoded for the rows
-// kept (lz.br), which are added to idx (kept: the conditions' count added
-// to). Before, every place a tagged row's level used was decoded for every
-// row (an UPDATE of 1% of a million rows with a timestamp: 296 ms, 80 of
-// them choosing the rows). The rows decoded (0: vs[from] is not a tagged
-// row); -1 a value of a kind its column's batch does not hold; -2 a
-// condition's error on one of them.
-fn bTagLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
-            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
-    let r0 = b.n
-    let rw = rowsFor(t)
-    var end = from
-    while end < to {
-        let s = lexdb_rows.leafValAt(leaf, end)
-        if !plainTagged(s) { break }
-        if try lexdb_rows.decodeRow(s, r0 + end - from, b, &lz.bf, &rw) != 0 { return Ok(-1) }
-        end += 1
-    }
-    let n = end - from
-    if n == 0 { return Ok(0) }
-    var rs: []int = withCapacity(n)
-    for q in 0..n { append(mut &rs, r0 + q) }
-    // (raw LIKEs too: their places were decoded)
-    let none: []bool = []
-    let got = bNarrow(conds, &none, b, rs)
-    if got.isNone() { return Ok(-2) }
-    var ch = got.unwrap()
-    kept += len(ch)
-    if bar.on && len(ch) > 0 {
-        var ok: []int = withCapacity(len(ch))
-        let kc = &b.cols[bar.col]
-        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
-        ch = ok
-    }
-    for r in ch {
-        if try lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, from + r - r0), r, b, &lz.br, &rw) != 0 { return Ok(-1) }
-        append(idx, r)
-    }
-    return Ok(n)
-}
-
 // idx0 narrowed to the rows of b every one of conds (not marked in skip)
 // holds for, in order; None: one gives an error on one of them.
 fn bNarrow(conds: &[]BNode, skip: &[]bool, b: &Batch, idx0: []int): Option[[]int] {
@@ -25335,98 +24905,6 @@ fn bNarrow(conds: &[]BNode, skip: &[]bool, b: &Batch, idx0: []int): Option[[]int
         }
     }
     return Some(idx)
-}
-
-// Rows rs of a run (their bytes rows[r - r0], of layout lay) a simple LIKE
-// on place pl holds for, read in place: as Like over the decoded text.
-fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]str): Result[[]int, DbErr] {
-    let at = lay.bm + pl / 8
-    let bit = pl % 8
-    let o = lay.off[pl]
-    let pv = lay.prev[pl]
-    let v0 = lay.v0
-    var out: []int = []
-    for r in rs {
-        let s = rows[r - r0]
-        if (int(s[at]) >> bit) & 1 == 1 { continue }
-        let e = binary.readU16LEStr(s, o)
-        let st = if pv < 0 { 0 } else { binary.readU16LEStr(s, pv) }
-        if st > e || v0 + e > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
-        if lexdb_like.likeRange(s, v0 + st, v0 + e, ps) { append(mut &out, r) }
-    }
-    return Ok(out)
-}
-
-// Whether integer key x (nul) sorts after the bar's (bar.v, bar.nul), as
-// skCmp orders an integer key.
-fn barAfter(bar: &Bar, x: int, nul: bool): bool {
-    if nul || bar.nul {
-        if nul && bar.nul { return false }
-        if nul { return !bar.nf }
-        return bar.nf
-    }
-    if x == bar.v { return false }
-    return (x > bar.v) != bar.desc
-}
-
-// bRunInto in two steps (Lazy): the rows vs[from..to) in the fixed layout
-// of vs[from] decoded at lz.first into rows b.n on, the conditions and the
-// bar run over them, their other places decoded for the rows kept, which
-// are added to idx (kept: the conditions' count added to). The rows
-// decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
-fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
-            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
-    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, conds, bar, idx, kept) }
-    let rw = rowsFor(t)
-    let rows = try lexdb_rows.fixedRunRows(leaf, from, to, &rw)
-    if len(rows) == 0 { return Ok(0) }
-    let id = try layOf(rows[0], rw.lays)
-    let lay = &rw.lays[id]
-    let n = len(rows)
-    let r0 = b.n
-    let np = len(lay.kinds)
-    var rs: []int = withCapacity(n)
-    for q in 0..n { append(mut &rs, r0 + q) }
-    // the simple LIKEs on the rows' bytes
-    for x in 0..len(lz.raw) {
-        if len(rs) == 0 { break }
-        let ci = lz.raw[x]
-        let pl = lz.rawPl[x]
-        if pl < np && lay.kinds[pl] == PK_TEXT {
-            match conds[ci] {
-                BNode.Like(_, lp) { rs = try likeRaw(&rows, &rs, r0, pl, lay, &lp.pieces) }
-                else {}
-            }
-            continue
-        }
-        // (a layout whose place is not a text: decoded, then the condition)
-        var qs1: []int = withCapacity(len(rs))
-        for r in rs { append(mut &qs1, r - r0) }
-        if !(try lexdb_rows.runCols(&rows, &qs1, r0, &[pl], b, bp, lay)) { return Ok(-1) }
-        var only: []bool = array(len(conds), true)
-        only[ci] = false
-        let got1 = bNarrow(conds, &only, b, rs)
-        if got1.isNone() { return Ok(-2) }
-        rs = got1.unwrap()
-    }
-    var qs0: []int = withCapacity(len(rs))
-    for r in rs { append(mut &qs0, r - r0) }
-    if !(try lexdb_rows.runCols(&rows, &qs0, r0, &lz.first, b, bp, lay)) { return Ok(-1) }
-    let got = bNarrow(conds, &lz.skip, b, rs)
-    if got.isNone() { return Ok(-2) }
-    var ch = got.unwrap()
-    kept += len(ch)
-    if bar.on && len(ch) > 0 {
-        var ok: []int = withCapacity(len(ch))
-        let kc = &b.cols[bar.col]
-        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
-        ch = ok
-    }
-    var qs: []int = withCapacity(len(ch))
-    for r in ch { append(mut &qs, r - r0) }
-    if !(try lexdb_rows.runCols(&rows, &qs, r0, &lz.rest, b, bp, lay)) { return Ok(-1) }
-    for r in ch { append(idx, r) }
-    return Ok(n)
 }
 
 // ---- Column leaves (9.112)
@@ -25542,219 +25020,6 @@ fn cRangeAdd(o: int, v: int, col: int, kind: int, t: &Table, out: mut &[]int) {
 // (or whose rows are all NULL).
 // Column leaves batch scans skipped (lexdb_rows.excluded), for the tests.
 pub fn colLeavesSkipped(): int { return lexdb_rows.colLeavesSkipped() }
-
-// bRunLazy for a column leaf: rows from..to, the places the conditions
-// read first, the conditions, then the other places for the rows kept
-// (added to idx). A simple LIKE on a dictionary's text is matched once per
-// entry. The rows decoded (to - from), -1 and -2 as bRunLazy.
-fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Table, lz: &Lazy, conds: &[]BNode,
-            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
-    let n = to - from
-    let r0 = b.n
-    let rw = rowsFor(t)
-    var rs: []int = withCapacity(n)
-    for q in 0..n { append(mut &rs, r0 + q) }
-    if !lexdb_rows.layoutOk(leaf, &rw) {
-        // row by row, the conditions over them all
-        if (try lexdb_rows.rowsInto(leaf, from, to, b, bp, &rw)) < 0 { return Ok(-1) }
-        let none: []bool = []
-        let got0 = bNarrow(conds, &none, b, rs)
-        if got0.isNone() { return Ok(-2) }
-        let ch0 = got0.unwrap()
-        kept += len(ch0)
-        for r in ch0 { append(idx, r) }
-        return Ok(n)
-    }
-    let np = lexdb_rows.leafPlaces(leaf)
-    // the simple LIKEs on the leaf's bytes
-    for x in 0..len(lz.raw) {
-        if len(rs) == 0 { break }
-        let ci = lz.raw[x]
-        let pl = lz.rawPl[x]
-        if pl < np && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT {
-            match conds[ci] {
-                BNode.Like(_, lp) { rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lp.pieces) }
-                else {}
-            }
-            continue
-        }
-        var qs1: []int = withCapacity(len(rs))
-        for r in rs { append(mut &qs1, r - r0) }
-        if !(try lexdb_rows.colsInto(leaf, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
-        var only: []bool = array(len(conds), true)
-        only[ci] = false
-        let got1 = bNarrow(conds, &only, b, rs)
-        if got1.isNone() { return Ok(-2) }
-        rs = got1.unwrap()
-    }
-    var qs0: []int = withCapacity(len(rs))
-    for r in rs { append(mut &qs0, r - r0) }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(rs) == n, r0, &lz.first, b, bp)) { return Ok(-1) }
-    let got = bNarrow(conds, &lz.skip, b, rs)
-    if got.isNone() { return Ok(-2) }
-    var ch = got.unwrap()
-    kept += len(ch)
-    if bar.on && len(ch) > 0 {
-        var ok: []int = withCapacity(len(ch))
-        let kc = &b.cols[bar.col]
-        for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
-        ch = ok
-    }
-    var qs: []int = withCapacity(len(ch))
-    for r in ch { append(mut &qs, r - r0) }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs, len(ch) == n, r0, &lz.rest, b, bp)) { return Ok(-1) }
-    for r in ch { append(idx, r) }
-    return Ok(n)
-}
-
-// The next batch of a level, decoded in two steps when lz is on and the
-// level is a scan of its table (else as fillLevel reads it, whole), its
-// rows chosen by conds (and the bar). None: a
-// value of a kind its column's batch does not hold, or a condition's
-// error on one of its rows (the caller reads the batch by the row path).
-fn fillPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
-            bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar): Result[Option[Picked], DbErr] {
-    var none = noRows()
-    return fillPickIn(st, txn, t, sc, part, cur, bp, rd, lz, conds, bar, mut &none)
-}
-
-// fillPick, its batch spare's when that is of the plan (bReuse): a caller
-// that is done with a batch gives it back there for the next.
-fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
-              bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar, spare: mut &Batch): Result[Option[Picked], DbErr] {
-    // (an index's read, 9.107, whole: an index-only entry's columns come
-    // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
-    if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
-        let got = try fillLevel(st, txn, t, rd, sc, part, cur, bp)
-        if got.isNone() { return Ok(None) }
-        let b = got.unwrap()
-        let ch = bChoose(conds, &b)
-        if ch.isNone() { return Ok(None) }
-        let idx = ch.unwrap()
-        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
-    }
-    var b = lexdb_rows.reuse(spare, bp)
-    let rw = rowsFor(t)
-    var idx: []int = []
-    var pend: []int = []                // rows decoded whole: chosen at the end
-    var kept = 0
-    while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
-        cur.started = true
-        var stopKey = ""
-        var stop = 0                // 1 the batch is full, 2 a value stored apart
-        var bail = false
-        var bad: []DbErr = []
-        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
-            var k = i
-            while k < j {
-                if b.n == BROWS {
-                    stop = 1
-                    stopKey = lexdb_rows.leafKey(leaf, k)
-                    return false
-                }
-                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
-                    Ok(got) {
-                        if got < 0 {
-                            bail = true
-                            return false
-                        }
-                        if got > 0 {
-                            b.n += got
-                            k += got
-                            continue
-                        }
-                    }
-                    Err(x) {
-                        append(mut &bad, x)
-                        return false
-                    }
-                }
-                match bTagLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, conds, bar, mut &idx, mut &kept) {
-                    Ok(got) {
-                        if got < 0 {
-                            bail = true
-                            return false
-                        }
-                        if got > 0 {
-                            b.n += got
-                            k += got
-                            continue
-                        }
-                    }
-                    Err(x) {
-                        append(mut &bad, x)
-                        return false
-                    }
-                }
-                match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, k), b.n, mut &b, bp, &rw) {
-                    Ok(code) {
-                        if code == 1 {
-                            bail = true
-                            return false
-                        }
-                        if code == 2 {
-                            stop = 2
-                            stopKey = lexdb_rows.leafKey(leaf, k)
-                            return false
-                        }
-                    }
-                    Err(x) {
-                        append(mut &bad, x)
-                        return false
-                    }
-                }
-                append(mut &pend, b.n)
-                b.n += 1
-                k += 1
-            }
-            return true
-        })
-        if len(bad) > 0 { return Err(bad[0]) }
-        if bail { return Ok(None) }
-                if stop == 1 {
-            cur.at = stopKey
-            break
-        }
-        if stop == 2 {
-            let got = if part { try st.getPart(txn, t.tree, &stopKey) } else { try st.get(txn, t.tree, &stopKey) }
-            match got {
-                Some(v) {
-                    if !(try bRowOf(st, txn, t, &stopKey, &v, b.n, mut &b, bp)) { return Ok(None) }
-                    append(mut &pend, b.n)
-                    b.n += 1
-                }
-                None {}
-            }
-            cur.at = lexdb_access.after(&stopKey)
-            continue
-        }
-        cur.done = true
-    }
-    if len(pend) > 0 {
-        // the rows decoded whole: chosen now, then in order among the others
-        let none: []bool = []
-        let got = bNarrow(conds, &none, &b, pend)
-        if got.isNone() { return Ok(None) }
-        let pk = got.unwrap()
-        kept += len(pk)
-        var merged: []int = withCapacity(len(idx) + len(pk))
-        var x = 0
-        var y = 0
-        while x < len(idx) || y < len(pk) {
-            if y >= len(pk) || (x < len(idx) && idx[x] < pk[y]) {
-                append(mut &merged, idx[x])
-                x += 1
-            } else {
-                append(mut &merged, pk[y])
-                y += 1
-            }
-        }
-        idx = merged
-    }
-    return Ok(Some(Picked{kept: kept, idx: idx, b: b}))
-}
 
 // The columns cols of row r of a batch, appended to out; the bytes a group
 // holds for its first row (as rowBytes counts a row of len(kinds) values).
@@ -26089,11 +25354,9 @@ type JLevel = record {
     look: bool              // a lookup by the whole primary key per row (its key: the path's equalities), not a hash
     range: bool             // a semi/anti join's range per row (semiLook; its key: the path's equalities): bRange
     // a range's bounds on the column after its equalities (the path's rng,
-    // constants): each one's encoded value, after a row's prefix; and
-    // whether one is NULL (no row in any range)
-    loSuf: []str
-    hiSuf: []str
-    capNulls: bool          // an index's NULLs left out (pathScan's marker 2)
+    // constants; an index's NULLs left out as pathScan leaves them), after
+    // a row's prefix; and whether one is NULL (no row in any range)
+    tail: lexdb_access.Tail
     noRange: bool
     key: []BNode            // per hash column: the value it equals, over the joined batch
     keyTyp: []int           // their BT_*
@@ -26160,8 +25423,8 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // q9's index lookups)
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
         let keyed = look || range
-        var loSuf: []str = []
-        var hiSuf: []str = []
+        var los: []Val = []
+        var his: []Val = []
         var noRange = false
         if range && len(lv.path.rng) > 0 {
             // its bounds on the column after the equalities (q3, q5's
@@ -26182,12 +25445,11 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                     noRange = true
                     continue
                 }
-                var kb = newStrBuf()
-                lexdb_access.encPart(mut &kb, &v, lv.path.index >= 0)
-                if b.op == ">" || b.op == ">=" { append(mut &loSuf, kb.toStr()) } else { append(mut &hiSuf, kb.toStr()) }
+                if b.op == ">" || b.op == ">=" { append(mut &los, v) } else { append(mut &his, v) }
             }
         }
         let capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
+        let tail = lexdb_access.tailOf(lv.path.index, &los, &his, capNulls)
         if (lv.perRow && !keyed) || lv.lateral || !(inner || rj || lv.join == lexdb_sql.J_LEFT) { return Ok(None) }
         if !keyed && (len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols)) { return Ok(None) }
         if inner && len(lv.post) > 0 { return Ok(None) }
@@ -26317,7 +25579,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             res = takeN(rcc)
         }
         append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, right: rj, look: look, range: range,
-                                   loSuf: loSuf, hiSuf: hiSuf, capNulls: capNulls, noRange: noRange,
+                                   tail: tail, noRange: noRange,
                                    key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
                                    ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
                                    rows: rows, rkinds: rkinds, cand: [], after: []})
@@ -26712,11 +25974,11 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
     var types: []lexdb_sql.TypeName = []
     for i in 0..len(jl.key) { append(mut &types, keyType(t, -1, i)) }
     // each row's key (rows without one: none)
-    var keys: []str = withCapacity(n)
+    var pr = lexdb_access.probes(-1, n)
     var of: []int = withCapacity(n)            // the batch's row of each key
-    // one integer key of an integer column: encoded here, as keyVal and
-    // encKeyPart would (a value out of the column's range: no row), the
-    // key before used again for a value repeated
+    // one integer key of an integer column: made as keyVal would (a value
+    // out of the column's range: no row), the key before used again for a
+    // value repeated
     let o0 = if len(types) == 1 { types[0].oid } else { 0 }
     let intKey = len(jl.key) == 1 && jl.keyTyp[0] == BT_INT && types[0].kind == lexdb_sql.K_INT &&
                  (o0 == lexdb_sql.OID_INT2 || o0 == lexdb_sql.OID_INT4 || o0 == lexdb_sql.OID_INT8)
@@ -26728,19 +25990,15 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
             if kv[0].nul[r] { continue }
             let x = kv[0].v[r]
             if x < kmin || x > kmax { continue }
-            if len(keys) > 0 && x == prev {
-                let same = keys[len(keys) - 1]
-                append(mut &keys, same)
+            if pr.count() > 0 && x == prev {
+                pr.again()
             } else {
-                var ib = newStrBuf()
-                binary.addU64BE(mut &ib, x ^ (-9223372036854775807 - 1))
-                append(mut &keys, ib.toStr())
+                pr.intKey(x)
                 prev = x
             }
             append(mut &of, r)
             continue
         }
-        var kb = newStrBuf()
         var none = false
         for i in 0..len(jl.key) {
             var v = Val.Null
@@ -26755,7 +26013,7 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
                 Ok(got) {
                     match got {
                         Some(x) {
-                            if isNull(&x) { none = true } else { lexdb_access.encPart(mut &kb, &x, false) }
+                            if isNull(&x) { none = true } else { pr.part(&x) }
                         }
                         None { none = true }
                     }
@@ -26764,75 +26022,31 @@ fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JP
             }
             if none { break }
         }
-        if none { continue }
-        append(mut &keys, kb.toStr())
-        append(mut &of, r)
-    }
-    // the keys read: in key order, each once; or (reads noted) as they come
-    let nk = len(keys)
-    var order: []int = withCapacity(nk)
-    for i in 0..nk { append(mut &order, i) }
-    let noted = txn.noting()
-    if !noted { sortKeysPerm(&keys, mut &order) }
-    var ks: []str = withCapacity(nk)
-    var first: []int = array(nk, -1)          // per key: the place in ks it is read at
-    for i in order {
-        if !noted && len(ks) > 0 && keys[i] == ks[len(ks) - 1] {
-            first[i] = len(ks) - 1
+        if none {
+            pr.clear()
             continue
         }
-        first[i] = len(ks)
-        append(mut &ks, keys[i])
+        pr.end()
+        append(mut &of, r)
     }
-    var got: []Option[str] = withCapacity(len(ks))
-    try st.getMany(txn, t.tree, &ks, part, mut &got)
-    // each row read decoded once, in the order read
-    let rw = rowsFor(t)
-    var rows = lexdb_rows.newBatch(&bp, len(ks))
-    var at: []int = array(len(ks), -1)        // per key read: its row in rows
-    for x in 0..len(ks) {
-        match got[x] {
-            Some(v) {
-                let code = try lexdb_rows.decodeRow(&v, rows.n, mut &rows, &bp, &rw)
-                if code == 1 { return Ok(None) }
-                if code == 2 && !(try bRowOf(st, txn, t, &ks[x], &v, rows.n, mut &rows, &bp)) { return Ok(None) }
-                at[x] = rows.n
-                rows.n += 1
-            }
-            None {}
-        }
+    // the keys' rows, read at once (lexdb_access.fetchMany)
+    let nk = pr.count()
+    let fetched = match try lexdb_access.fetchMany(st, txn, &relOf(t), &pr, part, &bp) {
+        Some(f) { f }
+        None { return Ok(None) }
     }
+    let rows = &fetched.rows
     // the candidates, in the batch's order
     var pj: []int = withCapacity(nk)
     var pi: []int = withCapacity(nk)
     for i in 0..nk {
-        let ri = at[first[i]]
+        let ri = fetched.at[i]
         if ri < 0 { continue }
         append(mut &pj, of[i])
         append(mut &pi, ri)
     }
     rs.cnt[k].starts += n
-    return bJoinTail(q, jp, jl, j, &pj, &pi, &rows, rs)
-}
-
-// b with room for m rows at least (room: its rows now; its n kept): its
-// columns copied into a batch twice as large, or m.
-fn bRoom(b: mut &Batch, bp: &BPlan, room: mut &int, m: int) {
-    if m <= room { return }
-    var cap = room * 2
-    if cap < m { cap = m }
-    var nb = lexdb_rows.newBatch(bp, cap)
-    for c in 0..len(bp.kinds) {
-        if !bp.needCol[c] { continue }
-        for r in 0..b.n {
-            nb.cols[c].v[r] = b.cols[c].v[r]
-            nb.cols[c].nul[r] = b.cols[c].nul[r]
-        }
-        if bp.kinds[c] == BK_VAL { for r in 0..b.n { nb.vals[c][r] = b.vals[c][r] } }
-    }
-    nb.n = b.n
-    b = nb
-    room = cap
+    return bJoinTail(q, jp, jl, j, &pj, &pi, rows, rs)
 }
 
 // Whether a semi/anti level looked up per row (semiLook) reads a range
@@ -26863,7 +26077,6 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     let lv = &q.levels[k]
     let t = &lv.t
     let p = &lv.path
-    let ix = p.index >= 0
     let n = j.n
     var all: []int = withCapacity(n)
     for r in 0..n { append(mut &all, r) }
@@ -26881,26 +26094,14 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     // the columns read: those its candidates use
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, jl.cand[lv.first + i]) }
-    var dec = IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}
-    var only = false
-    if ix {
-        match idxDecOf(t, p.index, &needCol) {
-            Some(d) {
-                dec = d
-                only = true
-            }
-            None {}
-        }
-    }
     let bp = bPlanOf(t, needCol, &lv.need)
     let part = len(lv.need) > 0
     var types: []lexdb_sql.TypeName = []
     for i in 0..len(jl.key) { append(mut &types, keyType(t, p.index, i)) }
     // each row's key prefix (rows without one: none)
-    var keys: []str = withCapacity(n)
+    var pr = lexdb_access.probes(p.index, n)
     var of: []int = withCapacity(n)
     for r in 0..n {
-        var kb = newStrBuf()
         var none = false
         for i in 0..len(jl.key) {
             var v = Val.Null
@@ -26915,7 +26116,7 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
                 Ok(got) {
                     match got {
                         Some(x) {
-                            if isNull(&x) { none = true } else { lexdb_access.encPart(mut &kb, &x, ix) }
+                            if isNull(&x) { none = true } else { pr.part(&x) }
                         }
                         None { none = true }
                     }
@@ -26924,44 +26125,17 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
             }
             if none { break }
         }
-        if none { continue }
-        append(mut &keys, kb.toStr())
-        append(mut &of, r)
-    }
-    // the keys read: in key order, each once; or (reads noted) as they come
-    let nk = len(keys)
-    var order: []int = withCapacity(nk)
-    for i in 0..nk { append(mut &order, i) }
-    let noted = txn.noting()
-    if !noted { sortKeysPerm(&keys, mut &order) }
-    var ks: []str = withCapacity(nk)
-    var first: []int = array(nk, -1)          // per key: the place in ks it is read at
-    for i in order {
-        if !noted && len(ks) > 0 && keys[i] == ks[len(ks) - 1] {
-            first[i] = len(ks) - 1
+        if none {
+            pr.clear()
             continue
         }
-        first[i] = len(ks)
-        append(mut &ks, keys[i])
+        pr.end()
+        append(mut &of, r)
     }
-    // each key's range read in place (scanLeaves), its rows decoded into
-    // rows as the first table's batches are (fillBatch: a run of a column
-    // leaf at a time), an index's entries decoded when they hold every
-    // column used, else their primary keys kept for the rows' reads; per
-    // key read its rows [lo[x], hi[x])
-    // (a semi or anti join's: an inner or LEFT join's every row)
+    // each key's range read (lexdb_access.rangeMany); a semi or anti
+    // join's with no filter: its first row only (an inner or LEFT join's:
+    // every row)
     let one = (lv.semi || lv.anti) && len(jl.conds) == 0
-    let tree = if ix { t.indexes[p.index].tree } else { t.tree }
-    let rw = rowsFor(t)
-    var rows = lexdb_rows.newBatch(&bp, 64)
-    var room = 64
-    var pks: []str = []                       // an index's entries' primary keys (not only)
-    var apart: []str = []                     // rows stored apart: their keys ...
-    var apartAt: []int = []                   // ... and places
-    var lo: []int = withCapacity(len(ks))
-    var hi: []int = withCapacity(len(ks))
-    var bail = false
-    var bad: []DbErr = []
     // the rows read are held while the batch is joined (a key's range may
     // be long): counted against max_statement_mem; past it the reading
     // stops and the row path, which holds none of them (it reads a range
@@ -26971,134 +26145,14 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     let perRow = 32 + 24 * nNeed
     // (less what a grouping or a sort holds and has not yet given to rs)
     let room0 = if rs.maxHeld > 0 { rs.maxHeld - rs.held - rs.aside } else { -1 }
-    var over = false
-    for x in 0..len(ks) {
-        if bail || over || len(bad) > 0 { break }
-        append(mut &lo, if ix && !only { len(pks) } else { rows.n })
-        // the key's range: its prefix's, narrowed by the bounds (pathScan's)
-        var rlo = ks[x]
-        var rhi = lexdb_access.succ(&ks[x])
-        for sf in jl.loSuf {
-            let lk = ks[x] + sf
-            if lk > rlo { rlo = lk }
-        }
-        for sf in jl.hiSuf {
-            let sv = lexdb_access.succ(&(ks[x] + sf))
-            if sv != "" && (rhi == "" || sv < rhi) { rhi = sv }
-        }
-        if jl.capNulls {
-            var nb = newStrBuf()
-            nb.add(&ks[x])
-            nb.addByte(2)
-            let nulAt = nb.toStr()
-            if rhi == "" || nulAt < rhi { rhi = nulAt }
-        }
-        if jl.noRange || (rhi != "" && rlo >= rhi) {
-            append(mut &hi, if ix && !only { len(pks) } else { rows.n })
-            continue
-        }
-        try st.scanLeaves(txn, tree, &rlo, rhi, fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
-            var e = i0
-            while e < j0 {
-                if room0 >= 0 && (rows.n + len(pks)) * perRow > room0 {
-                    over = true
-                    return false
-                }
-                if ix && !only {
-                    append(mut &pks, lexdb_rows.leafVal(leaf, e))
-                    e += 1
-                    if one { return false }
-                    continue
-                }
-                let want = if one { 1 } else { j0 - e }
-                bRoom(mut &rows, &bp, mut &room, rows.n + want)
-                if ix {
-                    if !bIdxInto(&lexdb_rows.leafKey(leaf, e), rows.n, mut &rows, &bp, &dec) {
-                        bail = true
-                        return false
-                    }
-                    rows.n += 1
-                    e += 1
-                    if one { return false }
-                    continue
-                }
-                match lexdb_rows.decodeRun(leaf, e, e + want, mut &rows, &bp, &rw) {
-                    Ok(got) {
-                        if got < 0 {
-                            bail = true
-                            return false
-                        }
-                        if got > 0 {
-                            rows.n += got
-                            e += got
-                            if one { return false }
-                            continue
-                        }
-                    }
-                    Err(er) {
-                        append(mut &bad, er)
-                        return false
-                    }
-                }
-                match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, e), rows.n, mut &rows, &bp, &rw) {
-                    Ok(code) {
-                        if code == 1 {
-                            bail = true
-                            return false
-                        }
-                        if code == 2 {
-                            append(mut &apart, lexdb_rows.leafKey(leaf, e))
-                            append(mut &apartAt, rows.n)
-                        }
-                    }
-                    Err(er) {
-                        append(mut &bad, er)
-                        return false
-                    }
-                }
-                rows.n += 1
-                e += 1
-                if one { return false }
-            }
-            return true
-        })
-        append(mut &hi, if ix && !only { len(pks) } else { rows.n })
+    let nk = pr.count()
+    let ranged = match try lexdb_access.rangeMany(st, txn, &relOf(t), p.index, &pr, &jl.tail, jl.noRange, one, &bp, part,
+                                                  room0, perRow) {
+        Some(x) { x }
+        None { return Ok(None) }
     }
-    if len(bad) > 0 { return Err(bad[0]) }
-    if bail || over { return Ok(None) }
-    for a in 0..len(apart) {
-        let got = if part { try st.getPart(txn, t.tree, &apart[a]) } else { try st.get(txn, t.tree, &apart[a]) }
-        match got {
-            Some(v) { if !(try bRowOf(st, txn, t, &apart[a], &v, apartAt[a], mut &rows, &bp)) { return Ok(None) } }
-            None { return Err(lexdb_base.corrupt(&("a row of \"" + t.name + "\" read and gone"))) }
-        }
-    }
-    if ix && !only {
-        // an index's entries: their rows by primary key, in key order
-        // unless the reads are noted
-        let ne = len(pks)
-        var po: []int = withCapacity(ne)
-        for e in 0..ne { append(mut &po, e) }
-        if !noted { sortKeysPerm(&pks, mut &po) }
-        var sk: []str = withCapacity(ne)
-        for e in po { append(mut &sk, pks[e]) }
-        var got: []Option[str] = withCapacity(ne)
-        try st.getMany(txn, t.tree, &sk, part, mut &got)
-        rows = lexdb_rows.newBatch(&bp, ne)
-        for y in 0..ne {
-            let e = po[y]
-            match got[y] {
-                Some(v) {
-                    let code = try lexdb_rows.decodeRow(&v, e, mut &rows, &bp, &rw)
-                    if code == 1 { return Ok(None) }
-                    if code == 2 && !(try bRowOf(st, txn, t, &sk[y], &v, e, mut &rows, &bp)) { return Ok(None) }
-                }
-                None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
-            }
-        }
-        rows.n = ne
-    }
-    var held = (rows.n + len(pks)) * perRow
+    let rows = &ranged.rows
+    var held = (rows.n + ranged.pks) * perRow
     for c in 0..len(bp.needCol) {
         if !bp.needCol[c] || bp.kinds[c] != BK_VAL { continue }
         for r in 0..rows.n {
@@ -27116,13 +26170,12 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     var pj: []int = withCapacity(rows.n)
     var pi: []int = withCapacity(rows.n)
     for i in 0..nk {
-        let x = first[i]
-        for e in lo[x]..hi[x] {
+        for e in ranged.lo[i]..ranged.hi[i] {
             append(mut &pj, of[i])
             append(mut &pi, e)
         }
     }
-    let out = bJoinTail(q, jp, jl, j, &pj, &pi, &rows, rs)
+    let out = bJoinTail(q, jp, jl, j, &pj, &pi, rows, rs)
     rs.held -= held
     let b = try out
     // counted only when the batch joined, not when it gave way
@@ -27273,81 +26326,6 @@ fn bJoinTail(q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, pj: &[]int, pi: &[]i
 //   transaction whose reads are noted the rows are read in the index's
 //   order, as the row path reads them, so the reads are noted the same.
 
-const ID_INT = 1        // integers of each width: 8 bytes in key order (encKeyPart)
-const ID_BOOL = 2
-const ID_TEXT = 3       // text and varchar under no collation: its bytes, 0 as 0 FF, ended by 0 0
-const ID_DATE = 4
-const ID_TIME = 5
-const ID_TS = 6
-const ID_TSTZ = 7
-const ID_UUID = 8
-const ID_BYTES = 9
-
-// How column c's values are kept in an index's key, when they can be read
-// back as the row holds them: ID_*; 0 not. (A text under a collation is
-// kept as its collation's key, a numeric without its scale, a float with
-// -0 as 0, an interval as its days: not read back.)
-fn idCode(c: &lexdb_sql.ColDef): int {
-    let o = c.typ.oid
-    let k = c.typ.kind
-    if (o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8) && k == lexdb_sql.K_INT { return ID_INT }
-    if o == lexdb_sql.OID_BOOL && k == lexdb_sql.K_BOOL { return ID_BOOL }
-    if (o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR) && k == lexdb_sql.K_TEXT && colCollKind(c) == lexdb_sql.COLL_EXACT { return ID_TEXT }
-    if o == lexdb_sql.OID_DATE && k == lexdb_sql.K_DATE { return ID_DATE }
-    if o == lexdb_sql.OID_TIME && k == lexdb_sql.K_TIME { return ID_TIME }
-    if o == lexdb_sql.OID_TS && k == lexdb_sql.K_TS { return ID_TS }
-    if o == lexdb_sql.OID_TSTZ && k == lexdb_sql.K_TSTZ { return ID_TSTZ }
-    if o == lexdb_sql.OID_UUID && k == lexdb_sql.K_UUID { return ID_UUID }
-    if o == lexdb_sql.OID_BYTEA && k == lexdb_sql.K_BYTEA { return ID_BYTES }
-    return 0
-}
-
-// An index's entries decoded: per part of their keys (the index's columns,
-// each after its marker, 1 a value and 2 NULL; then the primary key's,
-// unmarked) the table's column, its code (idCode), and whether it is
-// decoded (a column used, at its first part). Parts from last on are not
-// read.
-type IdxDec = record {
-    cols: []int
-    codes: []int
-    marked: []bool
-    want: []bool
-    last: int
-}
-
-// How index ix of t's entries give the columns needCol; None: one of them
-// is not in its entries, an index column is an expression's, or a part
-// up to the last one used is not read back (idCode).
-fn idxDecOf(t: &Table, ix: int, needCol: &[]bool): Option[IdxDec] {
-    let x = &t.indexes[ix]
-    if len(t.pk) == 0 || len(needCol) != len(t.cols) { return None }
-    var d = IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}
-    for c in x.cols {
-        if c < 0 { return None }
-        append(mut &d.cols, c)
-        append(mut &d.codes, idCode(&t.cols[c]))
-        append(mut &d.marked, true)
-    }
-    for c in t.pk {
-        append(mut &d.cols, c)
-        append(mut &d.codes, idCode(&t.cols[c]))
-        append(mut &d.marked, false)
-    }
-    var have: []bool = array(len(t.cols), false)
-    for p in 0..len(d.cols) {
-        let c = d.cols[p]
-        let w = needCol[c] && !have[c]
-        append(mut &d.want, w)
-        if w {
-            have[c] = true
-            d.last = p + 1
-        }
-    }
-    for c in 0..len(t.cols) { if needCol[c] && !have[c] { return None } }
-    for p in 0..d.last { if d.codes[p] == 0 { return None } }
-    return Some(d)
-}
-
 // Whether level lv's index (its path's) holds every column it uses: a
 // SELECT's (its columns narrowed, 9.31), not locking its rows.
 fn ixCovers(lv: &Level, ix: int): bool {
@@ -27355,315 +26333,6 @@ fn ixCovers(lv: &Level, ix: int): bool {
     return idxDecOf(&lv.t, ix, &lv.need).isSome()
 }
 
-// A value of an index key's part at at (after its marker), code's kind;
-// at goes past it.
-fn idVal(s: &str, at: mut &int, code: int): Val {
-    if code == ID_BOOL {
-        let x = s[at] == 1
-        at += 1
-        return Val.Bool(x)
-    }
-    if code == ID_TEXT || code == ID_UUID || code == ID_BYTES {
-        let tx = idBytes(s, at)
-        return if code == ID_TEXT { Val.Text(tx) } else if code == ID_UUID { Val.Uuid(tx) } else { Val.Bytes(tx) }
-    }
-    let n = binary.readI64BEStr(s, at) ^ (-9223372036854775807 - 1)
-    at += 8
-    if code == ID_DATE { return Val.Date(n) }
-    if code == ID_TIME { return Val.Time(n) }
-    if code == ID_TS { return Val.Ts(n) }
-    if code == ID_TSTZ { return Val.Tstz(n) }
-    return Val.Int(n)
-}
-
-// Bytes kept in key order (encBytesKey) at at: the value; at goes past
-// their end.
-fn idBytes(s: &str, at: mut &int): str {
-    var i = at + 0
-    while i + 1 < len(s) && !(s[i] == 0 && s[i + 1] != 0xFF) { i += if s[i] == 0 { 2 } else { 1 } }
-    let raw = s[at..i]
-    at = i + 2
-    var esc = false
-    for j in 0..len(raw) { if raw[j] == 0 { esc = true } }
-    if !esc { return raw }
-    var b = newStrBuf()
-    var j = 0
-    while j < len(raw) {
-        b.addByte(raw[j])
-        j += if raw[j] == 0 { 2 } else { 1 }
-    }
-    return b.toStr()
-}
-
-
-// Index entry key s decoded into row r of b (its parts dec.want); false: a
-// value its column's batch does not hold, or not such an entry.
-fn bIdxInto(s: &str, r: int, b: mut &Batch, bp: &BPlan, dec: &IdxDec): bool {
-    var at = 0
-    for p in 0..dec.last {
-        if at >= len(s) { return false }
-        let w = dec.want[p]
-        let c = dec.cols[p]
-        if dec.marked[p] {
-            let m = s[at]
-            at += 1
-            if m == 2 {
-                if w { b.cols[c].nul[r] = true }
-                continue
-            }
-        }
-        let code = dec.codes[p]
-        if !w {
-            let skip = idVal(s, mut &at, code)
-            continue
-        }
-        let k = bp.kinds[c]
-        if code == ID_INT && k == BK_INT {
-            if at + 8 > len(s) { return false }
-            b.cols[c].v[r] = ((int(s[at]) << 56) | (int(s[at + 1]) << 48) | (int(s[at + 2]) << 40) | (int(s[at + 3]) << 32) |
-                              (int(s[at + 4]) << 24) | (int(s[at + 5]) << 16) | (int(s[at + 6]) << 8) | int(s[at + 7])) ^ (-9223372036854775807 - 1)
-            at += 8
-        } else if code == ID_BOOL && k == BK_BOOL {
-            b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
-            at += 1
-        } else if k == BK_VAL {
-            b.vals[c][r] = idVal(s, mut &at, code)
-        } else {
-            return false
-        }
-    }
-    return true
-}
-
-// Index entry key s as a row of t's columns: those dec decodes, NULL the
-// others (as a narrowed row reads them).
-fn idxRow(t: &Table, dec: &IdxDec, s: &str): Result[[]Val, DbErr] {
-    var out: []Val = array(len(t.cols), Val.Null)
-    var at = 0
-    for p in 0..dec.last {
-        if at >= len(s) { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\""))) }
-        if dec.marked[p] {
-            let m = s[at]
-            at += 1
-            if m == 2 { continue }
-        }
-        let v = idVal(s, mut &at, dec.codes[p])
-        if dec.want[p] { out[dec.cols[p]] = v }
-    }
-    return Ok(out)
-}
-
-// How the first level's batches read its table (bLevelPlan): ix -1 by
-// its primary key (fillBatch); else through index ix, alone (only: its
-// entries decoded by dec) or each entry's row read, backward when desc;
-// byKeys: the rows of keys, its range's primary keys (the switch's count
-// read them: firstSwitch), not the range read again.
-type IxRead = record {
-    ix: int
-    only: bool
-    dec: IdxDec
-    desc: bool
-    byKeys: bool
-    keys: []str
-}
-
-fn noIxRead(): IxRead { return IxRead{ix: -1, only: false, dec: IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}, desc: false, byKeys: false, keys: []} }
-
-// The next batch of the first level, as rd reads it (fillBatch for the
-// primary key, and for a scan of the whole table in an index's place).
-fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
-             bp: &BPlan): Result[Option[Batch], DbErr] {
-    if rd.ix < 0 || sc.whole { return fillBatch(st, txn, t, sc, part, cur, bp) }
-    if sc.empty {
-        cur.done = true
-        return Ok(Some(lexdb_rows.newBatch(bp, 0)))
-    }
-    if rd.only { return fillIdxOnly(st, txn, t, rd, sc, cur, bp) }
-    return fillIdxRows(st, txn, t, rd, sc, part, cur, bp)
-}
-
-// The next batch of an index read alone: up to BROWS entries from the
-// cursor on (the cursor as fetch keeps it: forward, the key to go on
-// from; backward, the end), their keys decoded. Forward from the leaves
-// in place; a range the transaction has written, or a backward read,
-// copied (scan and scanBack merge its writes). None: a value its column's
-// batch does not hold.
-fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd: &IxRead, sc: &Scan, cur: mut &Cursor,
-               bp: &BPlan): Result[Option[Batch], DbErr] {
-    let tree = t.indexes[rd.ix].tree
-    var b = lexdb_rows.newBatch(bp, BROWS)
-    var bail = false
-    if rd.desc {
-        let to = if cur.started { cur.at } else { sc.hi }
-        cur.started = true
-        var last = ""
-        try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            if !bIdxInto(&en.key, b.n, mut &b, bp, &rd.dec) {
-                bail = true
-                return false
-            }
-            b.n += 1
-            last = en.key
-            return b.n < BROWS
-        })
-        if bail { return Ok(None) }
-        if b.n < BROWS { cur.done = true } else { cur.at = last }
-        return Ok(Some(b))
-    }
-    while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
-        cur.started = true
-        var stopKey = ""
-        var full = false
-        try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-            var k = i
-            while k < j {
-                if b.n == BROWS {
-                    full = true
-                    stopKey = lexdb_rows.leafKey(leaf, k)
-                    return false
-                }
-                if !bIdxInto(&lexdb_rows.leafKey(leaf, k), b.n, mut &b, bp, &rd.dec) {
-                    bail = true
-                    return false
-                }
-                b.n += 1
-                k += 1
-            }
-            return true
-        })
-        if bail { return Ok(None) }
-                if full {
-            cur.at = stopKey
-            return Ok(Some(b))
-        }
-        cur.done = true
-    }
-    return Ok(Some(b))
-}
-
-// The next batch of an index's entries' rows: up to BROWS entries from the
-// cursor on (as fillIdxOnly), then their rows by primary key, read in key
-// order (getMany), each decoded at its entry's place. None: a value its
-// column's batch does not hold.
-fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
-               bp: &BPlan): Result[Option[Batch], DbErr] {
-    let tree = t.indexes[rd.ix].tree
-    var pks: []str = []
-    if rd.byKeys {
-        cur.done = true
-        for k in rd.keys { append(mut &pks, k) }
-    } else if rd.desc {
-        let to = if cur.started { cur.at } else { sc.hi }
-        cur.started = true
-        var last = ""
-        try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &pks, en.val)
-            last = en.key
-            return len(pks) < BROWS
-        })
-        if len(pks) < BROWS { cur.done = true } else { cur.at = last }
-    } else {
-        while len(pks) < BROWS && !cur.done {
-            let from = if cur.started { cur.at } else { sc.lo }
-            cur.started = true
-            var stopKey = ""
-            var full = false
-            try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-                var k = i
-                while k < j {
-                    if len(pks) == BROWS {
-                        full = true
-                        stopKey = lexdb_rows.leafKey(leaf, k)
-                        return false
-                    }
-                    append(mut &pks, lexdb_rows.leafVal(leaf, k))
-                    k += 1
-                }
-                return true
-            })
-                        if full {
-                cur.at = stopKey
-                break
-            }
-            cur.done = true
-        }
-    }
-    let n = len(pks)
-    var b = lexdb_rows.newBatch(bp, n)
-    // the rows in key order, unless the reads are noted (then in the
-    // index's, as the row path reads them)
-    var order: []int = withCapacity(n)
-    for i in 0..n { append(mut &order, i) }
-    if !txn.noting() { sortKeysPerm(&pks, mut &order) }
-    var ks: []str = withCapacity(n)
-    for i in order { append(mut &ks, pks[i]) }
-    var got: []Option[str] = withCapacity(n)
-    try st.getMany(txn, t.tree, &ks, part, mut &got)
-    let rw = rowsFor(t)
-    for j in 0..n {
-        let r = order[j]
-        match got[j] {
-            Some(v) {
-                let code = try lexdb_rows.decodeRow(&v, r, mut &b, bp, &rw)
-                if code == 1 { return Ok(None) }
-                if code == 2 && !(try bRowOf(st, txn, t, &ks[j], &v, r, mut &b, bp)) { return Ok(None) }
-            }
-            None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
-        }
-    }
-    b.n = n
-    return Ok(Some(b))
-}
-
-// order (places in ks) sorted by their keys, stably (equal keys keep
-// their order); nothing done when they are in order already. Keys of 8
-// bytes each spanning less than 2^62 as integers (an integer primary
-// key's) are sorted by radixPerm; others by comparison.
-fn sortKeysPerm(ks: &[]str, order: mut &[]int) {
-    let n = len(order)
-    var sorted = true
-    for i in 1..n {
-        if ks[order[i]] < ks[order[i - 1]] {
-            sorted = false
-            break
-        }
-    }
-    if sorted { return }
-    var pre: []int = withCapacity(n)
-    var lo = 0
-    var hi = 0
-    var ok = true
-    for i in 0..n {
-        let k = &ks[order[i]]
-        if len(k) != 8 {
-            ok = false
-            break
-        }
-        let x = binary.readI64BEStr(k, 0) ^ (-9223372036854775807 - 1)
-        if i == 0 || x < lo { lo = x }
-        if i == 0 || x > hi { hi = x }
-        append(mut &pre, x)
-    }
-    var span = -1
-    if ok {
-        match hi.checkedSub(lo) {
-            Some(d) { if d < (1 << 62) { span = d } }
-            None {}
-        }
-    }
-    if span < 0 {
-        collections.sortBy(order, fn(a: &int, b: &int): int { return ks[a].cmp(&ks[b]) })
-        return
-    }
-    var bits = 0
-    while bits < 62 && (span >> bits) > 0 { bits += 1 }
-    for i in 0..n { pre[i] = pre[i] - lo }
-    let perm = radixPerm(&pre, bits)
-    var out: []int = withCapacity(n)
-    for j in perm { append(mut &out, order[j]) }
-    order = out
-}
 
 // Scans the first level's table in batches (9.52): the level's
 // conditions that batches can evaluate pick the rows, and only those are
@@ -29162,10 +27831,7 @@ pub fn countFixedRows(st: &lexdb_store.Store, name: &str): int {
     let found = findTable(st, mut &txn, name).unwrapOr(None)
     match found {
         Some(t) {
-            let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if isFixedRow(&en.val) { n += 1 }
-                return true
-            })
+            n = lexdb_access.fixedRows(st, mut &txn, &relOf(&t))
         }
         None {}
     }
@@ -29185,16 +27851,8 @@ pub fn rowLayouts(st: &lexdb_store.Store, name: &str): str {
     match found {
         Some(t) {
             nl = len(t.layouts)
-            counts = array(nl, 0)
-            let r = st.scan(mut &txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                if len(en.val) > 2 && isFixedRow(&en.val) {
-                    let id = binary.readU16LEStr(&en.val, 1)
-                    if id < len(counts) { counts[id] += 1 }
-                } else {
-                    tagged += 1
-                }
-                return true
-            })
+            counts = lexdb_access.layoutRows(st, mut &txn, &relOf(&t))
+            tagged = pop(mut &counts)
         }
         None {}
     }
@@ -29214,7 +27872,7 @@ pub fn leafKinds(st: &lexdb_store.Store, name: &str): str {
     st.abort(txn)
     match found {
         Some(t) {
-            match st.leafKinds(t.tree) {
+            match lexdb_access.leafKinds(st, &relOf(&t)) {
                 Ok(k) { out = k[0].toStr() + " cols " + k[1].toStr() + " rows " + k[2].toStr() + " whole" }
                 Err(x) { out = x.toStr() }
             }
@@ -29233,24 +27891,7 @@ pub fn treeDump(st: &lexdb_store.Store, name: &str): str {
     let found = findTable(st, mut &txn, name).unwrapOr(None)
     match found {
         Some(t) {
-            var trees: []int = [t.tree]
-            var names: []str = ["table"]
-            for ix in t.indexes {
-                append(mut &trees, ix.tree)
-                append(mut &names, ix.name)
-            }
-            for k in 0..len(trees) {
-                var n = 0
-                var h = 0
-                let r = st.scan(mut &txn, trees[k], "", "", fn(en: &lexdb_store.Entry): bool {
-                    n += 1
-                    for i in 0..len(en.key) { h = (h * 131 + int(en.key[i]) + 1) & 0xffffffffffff }
-                    h = (h * 131 + 7) & 0xffffffffffff
-                    for i in 0..len(en.val) { h = (h * 131 + int(en.val[i]) + 1) & 0xffffffffffff }
-                    return true
-                })
-                append(mut &out, names[k] + " " + n.toStr() + " " + h.toStr())
-            }
+            out = lexdb_access.treeDump(st, mut &txn, &relOf(&t))
         }
         None { append(mut &out, "no table") }
     }
@@ -29268,6 +27909,58 @@ fn newCursor(): Cursor { return lexdb_access.newCursor() }
 
 // A row's key: its identity in its table (locks, rows already changed).
 fn keyOf(t: &Table, row: &[]Val): str { return lexdb_access.keyOf(&relOf(t), row) }
+
+// Rows and index entries read (lexdb_access), for a Table and a Path.
+const BATCH: int = lexdb_access.BATCH
+type IdxDec = lexdb_access.IdxDec
+type IxRead = lexdb_access.IxRead
+type Lazy = lexdb_access.Lazy
+type Bar = lexdb_access.Bar
+type Picked = lexdb_access.Picked
+
+fn noIxRead(): IxRead { return lexdb_access.noIxRead() }
+fn noBar(): Bar { return lexdb_access.noBar() }
+
+fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, key: &str, v: &str, n: int,
+         need: &[]bool, missing: &[]Val): Result[[]Val, DbErr] {
+    return lexdb_access.rowOf(st, txn, &relOf(t), key, v, n, need, missing)
+}
+
+fn placesMissing(t: &Table): []Val { return lexdb_access.placesMissing(&relOf(t)) }
+fn placesNeeded(t: &Table, need: &[]bool): []bool { return lexdb_access.placesNeeded(&relOf(t), need) }
+
+fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path, sc: &Scan, need: &[]bool, cur: mut &Cursor,
+         out: mut &[][]Val): Result[Unit, DbErr] {
+    return lexdb_access.fetch(st, txn, &relOf(t), p.index, p.desc, sc, need, cur, out)
+}
+
+fn idxDecOf(t: &Table, ix: int, needCol: &[]bool): Option[IdxDec] { return lexdb_access.idxDecOf(&relOf(t), ix, needCol) }
+
+fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
+             bp: &BPlan): Result[Option[Batch], DbErr] {
+    return lexdb_access.fillLevel(st, txn, &relOf(t), rd, sc, part, cur, bp)
+}
+
+// A level's next batch with its rows chosen by conds (lexdb_access.fillPickIn).
+fn fillPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
+            bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar): Result[Option[Picked], DbErr] {
+    var none = noRows()
+    return fillPickIn(st, txn, t, sc, part, cur, bp, rd, lz, conds, bar, mut &none)
+}
+
+fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: &Scan, part: bool, cur: mut &Cursor,
+              bp: &BPlan, rd: &IxRead, lz: &Lazy, conds: &[]BNode, bar: &Bar, spare: mut &Batch): Result[Option[Picked], DbErr] {
+    return lexdb_access.fillPickIn(st, txn, &relOf(t), sc, part, cur, bp, rd, lz,
+                                   fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(conds, skip, b, idx) }, bar, spare)
+}
+
+fn countRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, most: int): Result[int, DbErr] {
+    return lexdb_access.countRows(st, txn, &relOf(t), most)
+}
+
+fn warmPoints(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, scans: &[]Scan): Result[Unit, DbErr] {
+    return lexdb_access.warmPoints(st, txn, &relOf(t), scans)
+}
 
 // The order-preserving value encoding (lexdb_access), for keys held in
 // memory: groups, hashes, partitions, statistics.
@@ -29296,10 +27989,8 @@ fn readIntK(s: &str, at: int, k: byte): int { return lexdb_rows.readIntK(s, at, 
 fn encFixed(t: &Table, places: &[]Val): Option[str] { let r = rowsFor(t); return lexdb_rows.encodeFixed(&r, places) }
 fn kindsFit(t: &Table, kinds: &[]byte): bool { let r = rowsFor(t); return lexdb_rows.kindsFit(&r, kinds) }
 type FixedLay = lexdb_rows.FixedLay
-fn layOf(s: &str, lays: &[]FixedLay): Result[int, DbErr] { return lexdb_rows.layOf(s, lays) }
 fn fixedVal(s: &str, p: int, k: byte, lay: &FixedLay): Result[Val, DbErr] { return lexdb_rows.fixedVal(s, p, k, lay) }
 fn decFixed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] { return lexdb_rows.decodeFixed(s, n, need, missing, lays) }
-fn isFixedRow(s: &str): bool { return lexdb_rows.isFixedRow(s) }
 fn layOfKinds(kinds: &[]byte): FixedLay { return lexdb_rows.layOfKinds(kinds) }
 
 // ---- pg_catalog and information_schema (9.80)
