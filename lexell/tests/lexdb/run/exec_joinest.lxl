@@ -8,6 +8,12 @@
 // flat half (PostgreSQL's heuristic without a histogram was tried and made
 // TPC-H q9 slower): its plan scans ord. Each count is checked against an
 // IN formulation and with batches off.
+// An equality between columns of different types (int = numeric, int =
+// float8, date = timestamp) is in no class: it is not implied by the
+// class's others and is kept as written (a review found it dropped, which
+// gave 120 rows for 4 and 5,000 for 0). Each such count, in a lookup and a
+// hash join, batches on and off, is checked against the same join written
+// with an expression (n2.c - n1.n = 0), which no class takes in.
 // expect: CREATE TABLE
 // expect: INSERT 0 5
 // expect: CREATE TABLE
@@ -27,12 +33,62 @@
 // expect: SET
 // expect: 143921
 // expect: 22500
+// expect: SET
+// expect: CREATE TABLE
+// expect: CREATE TABLE
+// expect: CREATE TABLE
+// expect: CREATE INDEX
+// expect: INSERT 0 30
+// expect: INSERT 0 30
+// expect: INSERT 0 20000
+// expect: CREATE TABLE
+// expect: CREATE TABLE
+// expect: CREATE INDEX
+// expect: INSERT 0 30
+// expect: INSERT 0 20000
+// expect: CREATE TABLE
+// expect: CREATE TABLE
+// expect: CREATE TABLE
+// expect: INSERT 0 5000
+// expect: INSERT 0 5000
+// expect: INSERT 0 50
+// expect: ANALYZE
+// expect: 30
+// expect: 30
+// expect: 20000
+// expect: 30
+// expect: 20000
+// expect: 5000
+// expect: 5000
+// expect: 50
+// expect: SET
+// expect: 4
+// expect: 4
+// expect: 0
+// expect: 0
+// expect: 4
+// expect: 4
+// expect: 200
+// expect: 200
+// expect: 0
+// expect: 0
+// expect: SET
+// expect: 4
+// expect: 4
+// expect: 0
+// expect: 0
+// expect: 4
+// expect: 4
+// expect: 200
+// expect: 200
+// expect: 0
+// expect: 0
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 
-const QUERIES = "create table reg (rk int primary key, rname text)\ninsert into reg select g, 'r' || g from generate_series(1, 5) g\ncreate table cust (ck int primary key, rk int, seg text)\ninsert into cust select g, g % 5 + 1, case when g % 4 = 0 then 'green ' || (g % 80) else 'plain ' || (g % 80) end from generate_series(1, 5000) g\ncreate index cust_rk on cust (rk)\ncreate table ord (ok int primary key, ck int, d int, amt int)\ninsert into ord select g, g % 5000 + 1, g / 100, g % 97 from generate_series(1, 100000) g\ncreate index ord_ck_d on ord (ck, d)\ncreate index ord_d on ord (d)\nanalyze\nexplain select sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord where d >= 100 and d < 250 and ck in (select ck from cust where rk = 3)\nexplain select count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord where d < 900 and ck in (select ck from cust where ck % 4 = 0)\nset lexdb_batch = off\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900"
+const QUERIES = "create table reg (rk int primary key, rname text)\ninsert into reg select g, 'r' || g from generate_series(1, 5) g\ncreate table cust (ck int primary key, rk int, seg text)\ninsert into cust select g, g % 5 + 1, case when g % 4 = 0 then 'green ' || (g % 80) else 'plain ' || (g % 80) end from generate_series(1, 5000) g\ncreate index cust_rk on cust (rk)\ncreate table ord (ok int primary key, ck int, d int, amt int)\ninsert into ord select g, g % 5000 + 1, g / 100, g % 97 from generate_series(1, 100000) g\ncreate index ord_ck_d on ord (ck, d)\ncreate index ord_d on ord (d)\nanalyze\nexplain select sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect sum(amt) from ord where d >= 100 and d < 250 and ck in (select ck from cust where rk = 3)\nexplain select count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nselect count(*) from ord where d < 900 and ck in (select ck from cust where ck % 4 = 0)\nset lexdb_batch = off\nselect sum(amt) from ord, cust, reg where reg.rk = cust.rk and cust.ck = ord.ck and rname = 'r3' and d >= 100 and d < 250\nselect count(*) from ord, cust where cust.ck = ord.ck and seg like '%green%' and d < 900\nset lexdb_batch = on\ncreate table n0 (id int primary key, a int)\ncreate table n1 (id int primary key, n numeric, f float8, t timestamp)\ncreate table n2 (id int primary key, c int)\ncreate index n2_c on n2 (c)\ninsert into n0 select g, g % 50 from generate_series(1, 30) g\ninsert into n1 select g, ((g * 7) % 50)::numeric, ((g * 7) % 50)::float8 + 0.5, date '2020-01-01' + (g * 7) % 50 from generate_series(1, 30) g\ninsert into n2 select g, g % 5000 from generate_series(1, 20000) g\ncreate table d0 (id int primary key, a date)\ncreate table d2 (id int primary key, c date)\ncreate index d2_c on d2 (c)\ninsert into d0 select g, date '2020-01-01' + g % 50 from generate_series(1, 30) g\ninsert into d2 select g, date '2020-01-01' + g % 5000 from generate_series(1, 20000) g\ncreate table h0 (id int primary key, a int)\ncreate table h1 (id int primary key, n numeric, f float8)\ncreate table h2 (id int primary key, c int)\ninsert into h0 select g, g % 50 from generate_series(1, 5000) g\ninsert into h1 select g, ((g * 7) % 50)::numeric, ((g * 7) % 50)::float8 + 0.5 from generate_series(1, 5000) g\ninsert into h2 select g, g % 50 from generate_series(1, 50) g\nanalyze\nselect count(*) from n0\nselect count(*) from n1\nselect count(*) from n2\nselect count(*) from d0\nselect count(*) from d2\nselect count(*) from h0\nselect count(*) from h1\nselect count(*) from h2\nset lexdb_batch = on\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and n2.c = n1.n\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and (n2.c - n1.n) = 0\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and n2.c = n1.f\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and (n2.c - n1.f) = 0\nselect count(*) from d0, n1, d2 where d0.id = n1.id and d2.c = d0.a and d2.c = n1.t\nselect count(*) from d0, n1, d2 where d0.id = n1.id and d2.c = d0.a and cast(d2.c as timestamp) = n1.t\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and h2.c = h1.n\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and (h2.c - h1.n) = 0\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and h2.c = h1.f\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and (h2.c - h1.f) = 0\nset lexdb_batch = off\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and n2.c = n1.n\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and (n2.c - n1.n) = 0\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and n2.c = n1.f\nselect count(*) from n0, n1, n2 where n0.id = n1.id and n2.c = n0.a and (n2.c - n1.f) = 0\nselect count(*) from d0, n1, d2 where d0.id = n1.id and d2.c = d0.a and d2.c = n1.t\nselect count(*) from d0, n1, d2 where d0.id = n1.id and d2.c = d0.a and cast(d2.c as timestamp) = n1.t\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and h2.c = h1.n\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and (h2.c - h1.n) = 0\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and h2.c = h1.f\nselect count(*) from h0, h1, h2 where h0.id = h1.id and h2.c = h0.a and (h2.c - h1.f) = 0"
 
 fn show(s: mut &lexdb_exec.Session, q: &str): str {
     match s.exec(q) {

@@ -5844,7 +5844,11 @@ fn ufRoot(parent: &[]int, i: int): int {
 // q5 hashed supplier on (s_suppkey, s_nationkey, s_nationkey): c_nationkey
 // = s_nationkey and n_nationkey = s_nationkey; one key of each is enough,
 // and a hash of one integer key has its own map. Two columns of the same
-// earlier level both stay: nothing need have made them equal.
+// earlier level both stay: nothing need have made them equal. Only an
+// equality whose two columns are in the class, and of one integer type or
+// both dates (plainEqCols), is left out or stands for another: the classes
+// leave out equalities across types (int = numeric), which no other
+// equality implies.
 fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
     var all: []Expr = []
     for m in ms { for c in m { append(mut &all, clone(&c)) } }
@@ -5865,12 +5869,18 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
                                     Expr.Col(b) {
                                         let la = q.levelOf(&a)
                                         let lb = q.levelOf(&b)
-                                        if la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k {
+                                        if la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k && q.plainEqCols(&a, &b) {
                                             let mine = if la == k { &a } else { &b }
                                             let lo = if la == k { lb } else { la }
                                             var ci = -1
                                             for x in 0..len(cls) {
-                                                for n in cls[x].names { if n == mine { ci = x } }
+                                                var hasA = false
+                                                var hasB = false
+                                                for n in cls[x].names {
+                                                    if n == &a { hasA = true }
+                                                    if n == &b { hasB = true }
+                                                }
+                                                if hasA && hasB { ci = x }
                                             }
                                             if ci >= 0 {
                                                 for i in 0..len(kc) { if kc[i] == ci && kl[i] != lo { drop = true } }
@@ -5894,6 +5904,22 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
         }
         ms[k] = keep
     }
+}
+
+// Whether a = b is an equality oneEqPerClass may stand for by another of
+// its class: both columns of one integer type, or both dates. Their
+// equality is the values' own, so it is transitive. Not across types (an
+// int and a numeric, a date and a timestamp: the classes leave those out,
+// and the equality is a conversion's), and not texts (a char(n)'s padding,
+// a collation), floats (NaN, -0) or others, where a written equality is
+// kept as written.
+fn (q: &Query) plainEqCols(a: &str, b: &str): bool {
+    let i = colIndex(&q.cols, a)
+    let j = colIndex(&q.cols, b)
+    if i < 0 || j < 0 { return false }
+    let o = q.cols[i].typ.oid
+    if o != q.cols[j].typ.oid { return false }
+    return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_DATE
 }
 
 // The equalities cs holds, as text, each way round (a set, so that the

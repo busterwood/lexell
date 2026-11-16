@@ -197,7 +197,20 @@ q5's at 30.8M against 25.3M: both wrong in direction.
    `n_nationkey = s_nationkey` is dropped where `c_nationkey =
    s_nationkey` already joins the class and `c_nationkey = n_nationkey`
    was applied at an earlier table. Two columns of the same earlier table
-   both stay.
+   both stay. Only an equality whose two columns are both in the class and
+   of one integer type, or both dates, is left out or stands for another
+   (`plainEqCols`). The first version checked only the later table's
+   column: the classes leave out equalities across types (int = numeric,
+   int = float8, date = timestamp), so such an equality was dropped though
+   nothing implied it, and gave wrong counts (120 for 4; 5,000 for 0 as a
+   hash). A review found this before the merge; `exec_joinest` now checks
+   those shapes. Texts (char(n) padding, collations) and floats (NaN, -0)
+   are kept as written, so the rewrite never relies on an equality that
+   might not be transitive.
+   With the fix the 22 plans are unchanged from the first version, every
+   checksum matches, and q3/q5 measured again (baseline, branch, baseline
+   in one session, a busier machine: load 4-6) were 2,910 / 2,422 / 2,956
+   and 1,899 / 1,071 / 1,976 ms.
 
 `tests/lexdb/run/exec_joinest.lxl` covers 1 (plan and counts, batches
 on and off, against IN formulations); `exec_joincost`'s three-table case
