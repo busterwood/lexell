@@ -5834,6 +5834,68 @@ fn ufRoot(parent: &[]int, i: int): int {
     return x
 }
 
+// One equality per class into each table (ms: the conjuncts per level, the
+// implied ones added): of a class's equalities between a column of level k
+// and a column of an earlier level, the first is kept and one whose earlier
+// column is another level's is left out, since the two earlier columns
+// were made equal at the later of their levels (implied adds every pair of
+// levels a class joins). PostgreSQL makes one clause per equivalence class
+// for each join (equivclass.c, generate_join_implied_equalities). TPC-H
+// q5 hashed supplier on (s_suppkey, s_nationkey, s_nationkey): c_nationkey
+// = s_nationkey and n_nationkey = s_nationkey; one key of each is enough,
+// and a hash of one integer key has its own map. Two columns of the same
+// earlier level both stay: nothing need have made them equal.
+fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
+    var all: []Expr = []
+    for m in ms { for c in m { append(mut &all, clone(&c)) } }
+    let cls = q.eqClasses(&all)
+    for k in 1..len(ms) {
+        var keep: []Expr = []
+        var kc: []int = []          // per equality kept: its class, its earlier level
+        var kl: []int = []
+        let xs = replace(mut &ms[k], [])
+        for c in xs {
+            var drop = false
+            match c {
+                Expr.Bin(op, l, r) {
+                    if op == "=" {
+                        match l {
+                            Expr.Col(a) {
+                                match r {
+                                    Expr.Col(b) {
+                                        let la = q.levelOf(&a)
+                                        let lb = q.levelOf(&b)
+                                        if la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k {
+                                            let mine = if la == k { &a } else { &b }
+                                            let lo = if la == k { lb } else { la }
+                                            var ci = -1
+                                            for x in 0..len(cls) {
+                                                for n in cls[x].names { if n == mine { ci = x } }
+                                            }
+                                            if ci >= 0 {
+                                                for i in 0..len(kc) { if kc[i] == ci && kl[i] != lo { drop = true } }
+                                                if !drop {
+                                                    append(mut &kc, ci)
+                                                    append(mut &kl, lo)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else {}
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                }
+                else {}
+            }
+            if !drop { append(mut &keep, clone(&c)) }
+        }
+        ms[k] = keep
+    }
+}
+
 // The equalities cs holds, as text, each way round (a set, so that the
 // implied ones are checked against it at once: a star of 24 tables implies
 // hundreds).
@@ -7937,6 +7999,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         for i in 0..len(ro) { q.levels[i].readOnce = ro[i] }
+        if q.innerOnly() { q.oneEqPerClass(mut &ms) }
     }
     if q.corr {
         // a correlated subquery runs per row: its conjuncts go last
