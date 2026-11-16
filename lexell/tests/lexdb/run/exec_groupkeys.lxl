@@ -1,0 +1,120 @@
+// lexdb_exec: GROUP BY keys a table's primary key makes redundant. A table
+// whose whole primary key is grouped by has one row per group, so its other
+// columns grouped by are left out of the group's key (tpch-perf 4.outer,
+// PostgreSQL's remove_useless_groupby_columns: TPC-H q10). Each query runs
+// with SET lexdb_batch = off and on, and against a formulation grouping by
+// the key alone (a join to an aggregate): all three must give the same
+// rows.
+// - a join grouped by the customer's key and four of its other columns,
+//   names shared by several customers;
+// - a LEFT JOIN, the table whose key is grouped on its NULL side;
+// - a key of two columns, all of it grouped and only part of it (no
+//   reduction: the names then split groups);
+// - HAVING and ORDER BY on a column left out of the key.
+// Grouping by the first column of the primary key of the one table read in
+// key order takes each group's rows as they come, with no map of the
+// groups (q18's subquery): groups of 1-7 rows across batch boundaries,
+// with HAVING, a key range, a filter on another column, and a group key
+// that is not the key's first column (a map then). A HAVING is checked as
+// the groups are made (a group it drops is not kept): on a grouped column
+// and an aggregate, and one that divides by zero (the same error, batches
+// on and off).
+// expect: one-column key: 300 groups, same: true
+// expect: left join: 2400 groups, same: true
+// expect: two-column key: 120 groups, same: true
+// expect: part of the key: 60 groups, same: true
+// expect: having, order: 95 groups, same: true
+// expect: in key order: 1715 groups, same: true
+// expect: in key order, having: 471 groups, same: true
+// expect: in key order, a range and a filter: 1 groups, same: true
+// expect: not the key's first column: 7 groups, same: true
+// expect: having on a column: 244 groups, same: true
+// expect: having error: ERROR 22012 division by zero, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const SETUP = "create table cust (id int primary key, name text, addr varchar(20), seg char(4), bal numeric(10,2))\ncreate table ord (id int primary key, cid int, amt int)\ncreate table pr (a int, b int, name text, primary key (a, b))\ninsert into cust select g, 'name' || (g % 40), case when g % 9 = 0 then null else 'addr' || g end, case g % 3 when 0 then 'x' else 'yy' end, g * 1.25 from generate_series(1, 300) g\ninsert into ord select g, case when g % 23 = 0 then null else (g * 7) % 330 + 1 end, g % 50 from generate_series(1, 2400) g\ninsert into pr select g % 12, g / 12, 'p' || (g % 5) from generate_series(0, 119) g\ncreate table li (ok int, ln int, qty numeric(8,2), primary key (ok, ln))\ninsert into li select g / 7 * 3 + 1, g % 7 + 1, (g % 13) * 1.5 from generate_series(0, 11999) g where g % 7 < (g / 7) % 7 + 1\nanalyze"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn three(s: mut &lexdb_exec.Session, sql: &str, other: &str, same: mut &bool): int {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let alt = q(s, other)
+    same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    return len(strings.split(&on, ";"))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for line in strings.lines(&setup) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    var same = false
+    var n = three(mut &s, &"select c.id, c.name, c.addr, c.seg, c.bal, count(o.id), sum(o.amt) from cust c join ord o on o.cid = c.id group by c.id, c.name, c.addr, c.seg, c.bal order by 1",
+                  &"select c.id, c.name, c.addr, c.seg, c.bal, x.n, x.s from cust c join (select cid, count(id) n, sum(amt) s from ord group by cid) x on x.cid = c.id order by 1", mut &same)
+    println("one-column key: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select o.id, c.id, c.name, c.addr, count(*) from ord o left join cust c on c.id = o.cid group by o.id, c.id, c.name, c.addr order by 1",
+              &"select o.id, c.id, c.name, c.addr, 1 from ord o left join cust c on c.id = o.cid order by 1", mut &same)
+    println("left join: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select a, b, name, count(*) from pr group by name, a, b order by 1, 2",
+              &"select a, b, name, 1 from pr order by 1, 2", mut &same)
+    println("two-column key: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select a, name, count(*) from pr group by a, name order by 1, 2",
+              &"select a, name, count(*) from (select a, name from pr) t group by a, name order by 1, 2", mut &same)
+    println("part of the key: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select c.name, c.id, sum(o.amt) from cust c join ord o on o.cid = c.id group by c.id, c.name having c.name < 'name2' and sum(o.amt) > 100 order by c.name desc, c.id",
+              &"select c.name, c.id, x.s from cust c join (select cid, sum(amt) s from ord group by cid) x on x.cid = c.id where c.name < 'name2' and x.s > 100 order by c.name desc, c.id", mut &same)
+    println("having, order: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select ok, sum(qty), count(*), min(ln) from li group by ok order by ok",
+              &"select ok, (select sum(qty) from li b where b.ok = a.ok), (select count(*) from li b where b.ok = a.ok), 1 from (select distinct ok from li) a order by ok", mut &same)
+    println("in key order: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select ok from li group by ok having sum(qty) > 50 order by ok",
+              &"select ok from (select distinct ok from li) a where (select sum(qty) from li b where b.ok = a.ok) > 50 order by ok", mut &same)
+    println("in key order, having: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select count(*), sum(c), sum(s) from (select ok, count(*) c, sum(qty) s from li where ok between 100 and 3000 and ln > 2 group by ok) t",
+              &"select count(*), sum(c), sum(s) from (select ok, count(*) c, sum(qty) s from li where ok + 0 between 100 and 3000 and ln > 2 group by ok + 0, ok) t", mut &same)
+    println("in key order, a range and a filter: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select ln, count(*), sum(qty) from li group by ln order by ln",
+              &"select ln, count(*), sum(qty) from (select ln, qty from li order by ok desc) t group by ln order by ln", mut &same)
+    println("not the key's first column: " + n.toStr() + " groups, same: " + same.toStr())
+    n = three(mut &s, &"select ok, count(*) from li group by ok having ok % 3 = 1 and count(*) > 5 and max(ln) = 7 order by ok",
+              &"select ok, count(*) from li where ok % 3 = 1 group by ok having count(*) = 7 order by ok", mut &same)
+    println("having on a column: " + n.toStr() + " groups, same: " + same.toStr())
+    let z1 = q(mut &s, &"set lexdb_batch = off")
+    let e1 = q(mut &s, &"select ok from li group by ok having sum(qty) / (ok % 5 - 1) > 1")
+    let z2 = q(mut &s, &"set lexdb_batch = on")
+    let e2 = q(mut &s, &"select ok from li group by ok having sum(qty) / (ok % 5 - 1) > 1")
+    println("having error: " + e2 + ", same: " + (e1 == e2).toStr())
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

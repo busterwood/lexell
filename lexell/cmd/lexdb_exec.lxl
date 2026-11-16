@@ -17096,6 +17096,34 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             gx = []
             gord = []
             gh = []
+            // A table whose primary key is grouped has one row per group of
+            // it: its other columns grouped by are the same in every row of
+            // a group, and need not be in the group's key (PostgreSQL's
+            // remove_useless_groupby_columns). The group's first row still
+            // gives their values. (q10 groups by c_custkey and six other
+            // customer columns, three of them long texts.)
+            var gb: []Expr = []
+            var gk: []int = []
+            for gi in 0..len(groupBy) {
+                var redundant = false
+                match groupBy[gi] {
+                    Expr.Col(n) {
+                        let ci = colIndex(&q.cols, &n)
+                        for li in 0..len(q.levels) {
+                            let lv = &q.levels[li]
+                            if !okLevels[li] || ci < lv.first || ci >= lv.first + len(lv.t.cols) { continue }
+                            redundant = !hasIdx(&lv.t.pk, ci - lv.first)
+                        }
+                    }
+                    else {}
+                }
+                if !redundant {
+                    append(mut &gb, clone(&groupBy[gi]))
+                    append(mut &gk, groupKinds[gi])
+                }
+            }
+            groupBy = gb
+            groupKinds = gk
         }
     } else {
         for x in exprs { if hasGrouping(&x) { return Err(e("42803", "arguments to GROUPING must be grouping expressions of the associated query level")) } }
@@ -25079,6 +25107,22 @@ fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, sc: 
     return Ok(Some(Picked{kept: kept, idx: idx, b: b}))
 }
 
+// The columns cols of row r of a batch, appended to out; the bytes a group
+// holds for its first row (as rowBytes counts a row of len(kinds) values).
+fn bFirstVals(b: &Batch, r: int, kinds: &[]int, cols: &[]int, out: mut &[]Val): int {
+    var n = 32 + 24 * len(kinds)
+    for i in cols {
+        var v = Val.Null
+        if len(b.cols[i].nul) > 0 && !b.cols[i].nul[r] {
+            let k = kinds[i]
+            v = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) } else { b.vals[i][r] }
+        }
+        n += valExtra(&v)
+        append(out, v)
+    }
+    return n
+}
+
 // Row r of a batch as the row path gives it: its columns used, NULL for
 // the others.
 fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
@@ -27605,10 +27649,37 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         for k in bp.kinds { append(mut &rowKinds, k) }
         for x in bp.needCol { append(mut &rowNeed, x) }
     }
+    // A group's first row keeps only the columns read after grouping (its
+    // outputs, HAVING, ORDER BY): the others, an aggregate's argument
+    // among them, are not copied for each group (q18's 1.5M groups).
+    {
+        var names: []str = []
+        for x in sel.exprs { colNames(&x, mut &names) }
+        match sel.having {
+            Some(h) { colNames(&h, mut &names) }
+            None {}
+        }
+        for x in sel.order { colNames(&x, mut &names) }
+        var after: []bool = array(len(q.cols), false)
+        for n in names {
+            let ci = colIndex(&q.cols, &n)
+            if ci >= 0 { after[ci] = true }
+        }
+        for i in 0..len(rowNeed) {
+            let qc = if jn { i } else { lv.first + i }
+            if qc < len(after) && !after[qc] { rowNeed[i] = false }
+        }
+    }
     let zone = txn.sql.zone
     // the groups: their first rows, and per aggregate its counts, sums and minima or maxima
     let ns = len(specs)
-    var firsts: [][]Val = []
+    // each group's first row: only its columns read after grouping (fcols),
+    // nf values a group in fv; made whole once the groups are done
+    var fcols: []int = []
+    for i in 0..len(rowNeed) { if rowNeed[i] { append(mut &fcols, i) } }
+    let nf = len(fcols)
+    var fv: []Val = []
+    var ngroups = 0
     var an: [][]int = []
     var asum: [][]int = []
     var amm: [][]int = []
@@ -27623,6 +27694,20 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     var byKey: Map[str, int] = newMap()
     var nullGroup = -1
     let oneKey = len(keys) == 1 && keys[0].typ != BT_OTHER
+    // The one table read in primary key order, grouped by the key's first
+    // column: each group's rows come together (PostgreSQL's GroupAggregate
+    // over presorted input, nodeAgg.c), so a row is in the group before it
+    // or starts one; no map of the groups. (q18's subquery: lineitem by
+    // l_orderkey.)
+    var sorted = false
+    if !jn && oneKey && p.index < 0 && !p.desc && len(scans) == 1 && len(t.pk) > 0 {
+        match keys[0].n {
+            BNode.Col(c) { sorted = c == lv.first + t.pk[0] }
+            else {}
+        }
+    }
+    var lastKey = 0
+    var lastG = -1
     // one key a text or varchar column (under no collation: groupKinds):
     // its groups by its text, not by its encoded key
     var textCol = -1
@@ -27698,13 +27783,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             // each row's group, new groups made in the rows' order
             var gid: []int = array(nc, 0)
             if len(keys) == 0 {
-                if len(firsts) == 0 {
-                    let row = bRow(&b, idx[0], &rowKinds, &rowNeed)
-                    let cost = rowBytes(&row) + 64 * (len(sel.specs) + 1)
+                if ngroups == 0 {
+                    let cost = bFirstVals(&b, idx[0], &rowKinds, &fcols, mut &fv) + 64 * (len(sel.specs) + 1)
+                    ngroups += 1
                     held += cost
                     added += cost
                     if room >= 0 && held > room { return Err(memErr(rs0max)) }
-                    append(mut &firsts, row)
                     for i in 0..ns {
                         append(mut &an[i], 0)
                         append(mut &asum[i], 0)
@@ -27721,6 +27805,8 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     if oneKey {
                         if kvs[0].nul[j] {
                             g = nullGroup
+                        } else if sorted {
+                            if lastG >= 0 && kvs[0].v[j] == lastKey { g = lastG }
                         } else {
                             match byInt.get(&kvs[0].v[j]) {
                                 Some(x) { g = x }
@@ -27759,13 +27845,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         }
                     }
                     if g < 0 {
-                        g = len(firsts)
-                        let row = bRow(&b, idx[j], &rowKinds, &rowNeed)
-                        let cost = rowBytes(&row) + 64 * (len(sel.specs) + 1) + klen
+                        g = ngroups
+                        ngroups += 1
+                        let cost = bFirstVals(&b, idx[j], &rowKinds, &fcols, mut &fv) + 64 * (len(sel.specs) + 1) + klen
                         held += cost
                         added += cost
                         if room >= 0 && held > room { return Err(memErr(rs0max)) }
-                        append(mut &firsts, row)
                         for i in 0..ns {
                             append(mut &an[i], 0)
                             append(mut &asum[i], 0)
@@ -27775,7 +27860,14 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         if textCol >= 0 {
                             if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
                         } else if oneKey {
-                            if kvs[0].nul[j] { nullGroup = g } else { byInt.put(kvs[0].v[j], g) }
+                            if kvs[0].nul[j] {
+                                nullGroup = g
+                            } else if sorted {
+                                lastKey = kvs[0].v[j]
+                                lastG = g
+                            } else {
+                                byInt.put(kvs[0].v[j], g)
+                            }
                         } else {
                             byKey.put(kstr, g)
                         }
@@ -27806,8 +27898,20 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             }
         }
     }
-    // the groups as the row path leaves them
-    for g in 0..len(firsts) {
+    // the groups as the row path leaves them. A HAVING of no volatile
+    // function or subquery is checked here first: a group it drops is not
+    // kept (q18's subquery keeps 57 of 1.5M), and the select checks the
+    // others again.
+    var fuse = false
+    match sel.having {
+        Some(h) { fuse = immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
+        None {}
+    }
+    var firsts: [][]Val = []
+    var scratch: []Val = array(len(rowKinds), Val.Null)
+    let sqe = seqEnv(st, txn)
+    for g in 0..ngroups {
+        for fi in 0..nf { scratch[fcols[fi]] = fv[g * nf + fi] }
         var accs = newAccs(len(sel.specs))
         for si in 0..ns {
             let kd = specs[si].kind
@@ -27820,6 +27924,16 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                 if kd == BA_MIN || kd == BA_MAX { accs[si].val = Val.Int(amm[si][g]) }
             }
         }
+        if fuse {
+            var vals: []Val = []
+            for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[i])) }
+            let henv = Env{cols: &q.cols, row: &scratch, aggs: &vals, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+            match sel.having {
+                Some(h) { if truth(&(try evalX(st, txn, q, &h, &henv, rs))) != Some(true) { continue } }
+                None {}
+            }
+        }
+        append(mut &firsts, copyRow(&scratch))
         append(mut &gs.accs, accs)
     }
     gs.firsts = firsts
