@@ -23,7 +23,7 @@ CORE = {
     "lexdb_base", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
     "lexdb_locks", "lexdb_match",
-    "lexdb_memo",
+    "lexdb_memo", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows",
     "lexdb_session", "lexdb_sql", "lexdb_sqlcoll",
     "lexdb_store", "lexdb_time",

@@ -864,6 +864,51 @@ pub const BK_INT: int = 0    // a column's kind in a batch: an integer ...
 pub const BK_BOOL: int = 1   // ... a boolean (0, 1) ...
 pub const BK_VAL: int = 2    // ... or any other, as values
 pub const BK_NONE: int = -1  // a query's column not in the batch (of another table)
+// ... or a numeric(p, s) of p at most DEC_MAX_P as its units, the value
+// times 10^s, in an integer: BK_DEC + s (decKind). Only where the
+// operator asks for it (decColKind); every value read must have display
+// scale s and fit, or the batch gives way to the row path (put's false).
+pub const BK_DEC: int = 16
+pub const DEC_MAX_P: int = 18
+
+pub fn decKind(s: int): int { return BK_DEC + s }
+pub fn isDecKind(k: int): bool { return k >= BK_DEC }
+pub fn decScale(k: int): int { return k - BK_DEC }
+
+// A column's batch kind when the operator takes numerics as units: a
+// numeric(p, s) of 0 < p <= DEC_MAX_P is BK_DEC + s (its values all have
+// display scale s: coerce quantizes them), any other as colKind.
+pub fn decColKind(c: &lexdb_sql.ColDef): int {
+    let t = c.typ
+    if t.oid == lexdb_sql.OID_NUMERIC && t.prec > 0 && t.prec <= DEC_MAX_P && t.scale >= 0 && t.scale <= t.prec {
+        return decKind(t.scale)
+    }
+    return colKind(c)
+}
+
+// 10^k for 0 <= k <= 18.
+pub fn pow10i(k: int): int {
+    var r = 1
+    for i in 0..k { r *= 10 }
+    return r
+}
+
+// d's units at scale s (d times 10^s) when d's display scale is s and they
+// fit an integer; None otherwise.
+pub fn decUnits(d: &Decimal, s: int): Option[int] {
+    if d.scale() != s || s > DEC_MAX_P { return None }
+    let c = d.coefficient()
+    if c == 0 { return Some(0) }
+    let sh = d.exponent() + s
+    if sh < 0 || sh > DEC_MAX_P { return None }
+    let lim = u128(0x7fffffffffffffff) / u128(pow10i(sh))
+    if c > lim { return None }
+    let u = int(c) * pow10i(sh)
+    return Some(if d.isNeg() { -u } else { u })
+}
+
+// The value of units u at scale s (display scale s).
+pub fn decVal(u: int, s: int): Val { return Val.Num(Decimal.fromUnits(u, s)) }
 
 // A column of a batch: its integers or booleans, and its NULLs.
 pub type BVec = record {
@@ -982,6 +1027,17 @@ pub fn put(b: mut &Batch, c: int, r: int, v: Val, kind: int): bool {
                 return true
             }
         }
+        Val.Num(d) {
+            if isDecKind(kind) {
+                match decUnits(&d, decScale(kind)) {
+                    Some(u) {
+                        b.cols[c].v[r] = u
+                        return true
+                    }
+                    None { return false }
+                }
+            }
+        }
         else {}
     }
     if kind != BK_VAL { return false }
@@ -1062,6 +1118,8 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
                 b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
             } else if pk == PK_BOOL && k == BK_BOOL {
                 b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
+            } else if isDecKind(k) {
+                if !put(b, c, r, try fixedVal(s, pl, pk, lay), k) { return Ok(1) }
             } else if k != BK_VAL {
                 return Ok(1)
             } else {
@@ -1109,6 +1167,16 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
         } else if tag == 2 && k == BK_BOOL {
             b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
             at += 1
+        } else if isDecKind(k) {
+            // a numeric's text, as units (anything else gives way)
+            if tag != 3 { return Ok(1) }
+            let l = binary.readU32LEStr(s, at)
+            let tx = s[at + 4..at + 4 + l]
+            at += 4 + l
+            match Decimal.parse(&tx) {
+                Ok(d) { if !put(b, c, r, Val.Num(d), k) { return Ok(1) } }
+                Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+            }
         } else if k != BK_VAL {
             return Ok(1)
         } else if tag == 1 {
@@ -1247,6 +1315,11 @@ pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projec
                 let s = rows[q]
                 if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else { b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay) }
             }
+        } else if isDecKind(k) && pk == PK_NUM {
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else if !put(b, c, r0 + q, try fixedVal(s, pl, pk, lay), k) { return Ok(-1) }
+            }
         } else {
             return Ok(-1)
         }
@@ -1328,6 +1401,11 @@ pub fn runCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp
                     b.vals[c][r0 + q] = try fixedVal(s, pl, pk, lay)
                 }
             }
+        } else if isDecKind(k) && pk == PK_NUM {
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else if !put(b, c, r0 + q, try fixedVal(s, pl, pk, lay), k) { return Ok(false) }
+            }
         } else {
             return Ok(false)
         }
@@ -1381,6 +1459,30 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
                 for q in qs { col.v[r0 + q] = if lexdb_cols.boolAt(s, dir, pl, from + q) { 1 } else { 0 } }
             }
             b.cols[c] = col
+        } else if isDecKind(k) {
+            // a numeric as its units: a leaf of units at the column's scale
+            // read as integers; any other numeric leaf value by value
+            if pk != PK_NUM { return Ok(false) }
+            let ds = decScale(k)
+            if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_UNITS {
+                if lexdb_cols.scaleOf(dir, pl) != ds { return Ok(false) }
+                var col = replace(mut &b.cols[c], bvec(0))
+                if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                    for q in qs { col.v[r0 + q] = lexdb_cols.intAt(s, dir, pl, from + q) }
+                }
+                b.cols[c] = col
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let q = qs[x]
+                    if b.cols[c].nul[r0 + q] { continue }
+                    let v = try varVal(pk, s, lexdb_cols.spanStart(sp[x]), lexdb_cols.spanEnd(sp[x]))
+                    if !put(b, c, r0 + q, v, k) { return Ok(false) }
+                }
+            }
         } else if k == BK_VAL {
             var vals = replace(mut &b.vals[c], [])
             // a NULL row's value written too: a batch's value columns are

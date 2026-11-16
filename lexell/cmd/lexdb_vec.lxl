@@ -1,0 +1,142 @@
+// lexdb_vec: kernels over a batch's typed vectors (design/lexdb-tpch-perf.md
+// 4.1, the expression IR's vector backend). A vector is a BVec: its words
+// and NULL flags. A numeric(p, s) column read as units (lexdb_rows.BK_DEC)
+// is a vector of integers at scale s: the value times 10^s. The kernels give
+// exactly what the row path's Decimal arithmetic gives for such values (the
+// value, and the display scale the caller tracks: + and - the larger of the
+// two, * their sum), or false where a result does not fit an integer: the
+// caller then gives way to the row path, which computes it in Decimal.
+// Nothing here errs: SQL's errors stay the row path's.
+import "./lexdb_rows"
+import "./lexdb_sql"
+import "decimal"
+
+type BVec = lexdb_rows.BVec
+type Val = lexdb_sql.Val
+
+// The largest scale a units vector has (10^18 fits an integer).
+pub const MAX_SCALE: int = 18
+
+// x times 10^k (0 <= k <= MAX_SCALE) of every row not NULL; false: one
+// does not fit.
+fn scaleUp(a: mut &BVec, k: int): bool {
+    if k == 0 { return true }
+    let m = lexdb_rows.pow10i(k)
+    for j in 0..len(a.v) {
+        if a.nul[j] { continue }
+        match a.v[j].checkedMul(m) {
+            Some(w) { a.v[j] = w }
+            None { return false }
+        }
+    }
+    return true
+}
+
+// a op c for numerics as units, row by row: op 0 +, 1 -, 2 *; a at scale
+// sa, c at sc. The result is left in a: + and - at max(sa, sc), * at
+// sa + sc (at most MAX_SCALE: the caller's check). A row NULL in either is
+// NULL. False: a result (or an operand brought to the larger scale) does
+// not fit an integer.
+pub fn arith(op: int, a: mut &BVec, sa: int, c: &BVec, sc: int): bool {
+    let m = len(a.v)
+    for j in 0..m { if c.nul[j] { a.nul[j] = true } }
+    if op == 2 {
+        for j in 0..m {
+            if a.nul[j] { continue }
+            match a.v[j].checkedMul(c.v[j]) {
+                Some(w) { a.v[j] = w }
+                None { return false }
+            }
+        }
+        return true
+    }
+    if sa < sc { if !scaleUp(a, sc - sa) { return false } }
+    // c's rows brought to a's scale as they are read
+    let k = if sc < sa { lexdb_rows.pow10i(sa - sc) } else { 1 }
+    for j in 0..m {
+        if a.nul[j] { continue }
+        var y = c.v[j]
+        if k != 1 {
+            match y.checkedMul(k) {
+                Some(w) { y = w }
+                None { return false }
+            }
+        }
+        let r = if op == 0 { a.v[j].checkedAdd(y) } else { a.v[j].checkedSub(y) }
+        match r {
+            Some(w) { a.v[j] = w }
+            None { return false }
+        }
+    }
+    return true
+}
+
+// The comparison x op y (0 =, 1 <>, 2 <, 3 <=, 4 >, 5 >=) of two signs.
+fn holds(op: int, x: int): bool {
+    if op == 0 { return x == 0 }
+    if op == 1 { return x != 0 }
+    if op == 2 { return x < 0 }
+    if op == 3 { return x <= 0 }
+    if op == 4 { return x > 0 }
+    return x >= 0
+}
+
+// a op c for numerics as units (a at scale sa, c at sc), compared by
+// value, as Decimal compares them: 1 or 0 in a, NULL where either is.
+pub fn cmp(op: int, a: mut &BVec, sa: int, c: &BVec, sc: int) {
+    let m = len(a.v)
+    for j in 0..m { if c.nul[j] { a.nul[j] = true } }
+    if sa == sc {
+        for j in 0..m {
+            let x = a.v[j]
+            let y = c.v[j]
+            a.v[j] = if holds(op, if x < y { -1 } else if x > y { 1 } else { 0 }) { 1 } else { 0 }
+        }
+        return
+    }
+    // at the larger scale, in 128 bits (no overflow)
+    let ka = i128(lexdb_rows.pow10i(if sc > sa { sc - sa } else { 0 }))
+    let kc = i128(lexdb_rows.pow10i(if sa > sc { sa - sc } else { 0 }))
+    for j in 0..m {
+        let x = i128(a.v[j]) * ka
+        let y = i128(c.v[j]) * kc
+        a.v[j] = if holds(op, if x < y { -1 } else if x > y { 1 } else { 0 }) { 1 } else { 0 }
+    }
+}
+
+// Adds the rows of a (units) not NULL to their groups' sums (gids: each
+// row's group; one: all in group 0) and counts, in 128 bits: 2^64 values
+// of 2^63 at most cannot pass it.
+pub fn sum(a: &BVec, gids: &[]int, one: bool, cn: mut &[]int, su: mut &[]i128) {
+    let k = len(a.v)
+    if one {
+        var s = su[0]
+        var c = cn[0]
+        for j in 0..k {
+            if a.nul[j] { continue }
+            s += i128(a.v[j])
+            c += 1
+        }
+        su[0] = s
+        cn[0] = c
+        return
+    }
+    for j in 0..k {
+        if a.nul[j] { continue }
+        let g = gids[j]
+        su[g] += i128(a.v[j])
+        cn[g] += 1
+    }
+}
+
+// 10^38: a numeric sum at or past it in magnitude is out of range, as
+// Decimal's exact sum is (38 digits).
+const TEN38: i128 = 100000000000000000000000000000000000000
+
+// The numeric of units u (128 bits) at scale s, as the row path's sum of
+// such values gives it (display scale s); None: out of numeric's range
+// (the row path's 22003).
+pub fn sumVal(u: i128, s: int): Option[Val] {
+    if u >= TEN38 || u <= -TEN38 { return None }
+    return Some(Val.Num(decimal.fromFraction(u, s)))
+}
