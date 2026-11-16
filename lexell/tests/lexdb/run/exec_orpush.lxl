@@ -1,0 +1,66 @@
+// lexdb_exec: an OR across tables gives each table its own filter
+// (17336832, q19), but not a LEFT JOIN's nullable side (there it would be
+// an ON condition: a branch true for the NULL-extended row kept a row
+// whose match it had cut), and not a volatile OR (its copy drew random()
+// again). Regressions from the TPC-H review (2026-11-16).
+// expect: create table a (id int primary key, x int) -> CREATE TABLE
+// expect: create table b (id int primary key, aid int, y int) -> CREATE TABLE
+// expect: insert into a values (1, 1), (2, 2), (3, 2) -> INSERT 0 3
+// expect: insert into b values (10, 1, 1), (11, 2, 5), (12, 3, 1) -> INSERT 0 3
+// expect: select a.id, b.id, b.y from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y is null) order by a.id -> 1|10|1
+// expect: explain select a.id, b.id, b.y from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y is null) -> scan a: full scan; left join b: hash on (aid) over full scan
+// expect: select a.id, b.id from a left join b on b.aid = a.id where (a.x = 1 and coalesce(b.y, 0) = 1) or (a.x = 2 and coalesce(b.y, 0) = 0) order by a.id -> 1|10
+// expect: select a.id, b.id from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y = 7) order by a.id -> 1|10
+// expect: select a.id, b.id from a join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y = 5) order by a.id -> 1|10; 2|11
+// expect: create table r (id int primary key, x int) -> CREATE TABLE
+// expect: create table q (id int primary key, y int) -> CREATE TABLE
+// expect: insert into r select g, g % 2 from generate_series(1, 2000) g -> INSERT 0 2000
+// expect: insert into q values (1, 1), (2, 2) -> INSERT 0 2
+// expect: select count(*) between 1350 and 1650 from r, q where (r.x * random() < 0.5 and q.y = 1) or (r.x = 7 and q.y = 2) -> t
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            let out = sql + " -> " + (if len(lines) == 0 { r.tag } else { strings.join(&lines, "; ") })
+            let k = strings.indexOf(&out, " rows in ", 0)      // EXPLAIN ANALYZE's time varies
+            println(if k >= 0 { out[0..k] + " rows" } else { out })
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        show(mut &s, "create table a (id int primary key, x int)")
+        show(mut &s, "create table b (id int primary key, aid int, y int)")
+        show(mut &s, "insert into a values (1, 1), (2, 2), (3, 2)")
+        show(mut &s, "insert into b values (10, 1, 1), (11, 2, 5), (12, 3, 1)")
+        // a LEFT JOIN's nullable side gets no part of a WHERE OR: a branch
+        // true for its NULL-extended row would keep a row whose match it cut
+        show(mut &s, "select a.id, b.id, b.y from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y is null) order by a.id")
+        show(mut &s, "explain select a.id, b.id, b.y from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y is null)")
+        show(mut &s, "select a.id, b.id from a left join b on b.aid = a.id where (a.x = 1 and coalesce(b.y, 0) = 1) or (a.x = 2 and coalesce(b.y, 0) = 0) order by a.id")
+        show(mut &s, "select a.id, b.id from a left join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y = 7) order by a.id")
+        // an inner join's sides still get theirs (q19)
+        show(mut &s, "select a.id, b.id from a join b on b.aid = a.id where (a.x = 1 and b.y = 1) or (a.x = 2 and b.y = 5) order by a.id")
+        // a volatile OR is not copied: its copy would draw random() again
+        // (about 1500 rows of 2000 x 2; the copy made it about 1125)
+        show(mut &s, "create table r (id int primary key, x int)")
+        show(mut &s, "create table q (id int primary key, y int)")
+        show(mut &s, "insert into r select g, g % 2 from generate_series(1, 2000) g")
+        show(mut &s, "insert into q values (1, 1), (2, 2)")
+        show(mut &s, "select count(*) between 1350 and 1650 from r, q where (r.x * random() < 0.5 and q.y = 1) or (r.x = 7 and q.y = 2)")
+        return 0
+    })
+}
