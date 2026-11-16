@@ -673,6 +673,44 @@ plain select list (`branchOid`).
 - Node types are not added yet: nothing reads them until item 2 chooses
   kernels from them.
 
+**Slice 2c, item 2, first step as built: outputs bound once.** A
+plan's output expressions are bound with its conditions (`bindSel`,
+`Sel.ox`, parameters as slots). `outC` reads them, and binds per run only
+for a plan not bound once (DML, EXPLAIN). The window path's outputs and
+`bGenOf` still bind per run.
+
+**Why the rest of item 2 is split.** `bCompile`'s `BT_*` types are not
+only SQL types:
+
+- `BT_DEC + s` is a column leaf's units scale (`BK_DEC`), known per batch,
+  not per plan.
+- `BT_INT`, `BT_BOOL` and `BT_OTHER` follow the batch's column kinds
+  (`BK_*`).
+
+So the kernels need both the binder's type and the batch's physical kind,
+and "BNode's separate typing" cannot simply be deleted. What can move:
+
+- the SQL-level decisions (which operator, integer or numeric
+  arithmetic, comparisons by value) to the bound node;
+- `bTimeVal`'s two jobs to the binder:
+  - a text constant beside a date column read as a date: an untyped
+    literal cast to the column's type in `resolve`, as PostgreSQL types
+    it;
+  - another time kind compared in the session's zone: a cast made when
+    bound, which ties the plan to the zone, so the plan cache must key
+    on it.
+
+Steps, each with q1, q6 and the scan queries as its gate:
+
+- 2-ii: `bCompile` reads `BX` instead of `Expr`. Constants come from
+  `bxEval`; IN and LIKE are read from the bound call. No new types.
+- 2-iii: node types bottom-up in `bindExpr` (once per plan). `bCompile`
+  chooses a kernel from the node's type and the batch's kind. `bValCmp`,
+  `bColPair` and `bTimeVal` are deleted once the binder casts constants.
+- 2-iv: `bGenOf` from the plan's bound expression. Its slots are the
+  batch row's places, so it re-slots a bound tree instead of binding
+  again.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
