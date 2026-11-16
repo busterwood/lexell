@@ -1,0 +1,1387 @@
+// lexdb_ops: the value operations below the executor (design/lexdb-layers.md
+// 4.4.1, slice 2b): converting a value to a type (coerce, coerceZ and
+// their parts), comparing values (compare, compareZ, compareTime), the
+// arithmetic operators (arith, arithZ, arithTime, arithFloat, powOp) and
+// the unary ones (unaryVal), and the kinds and texts of values they need.
+// They read no table and no session: a session's time zone comes as an
+// argument. The binder folds constants with them and the executor
+// evaluates with them (eval, bxEval, the batches' generic node);
+// lexdb_exec keeps its names for them as forwarders, and its function
+// library (callAt) for now.
+
+import "strings"
+import "math"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_float"
+import "./lexdb_func"
+import "./lexdb_dialect"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// Each byte's value as a hex digit, 255 for none: HEX_LOW lower case only
+// (a canonical uuid).
+const HEX_LOW: str = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x0a\x0b\x0c\x0d\x0e\x0f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+
+// text, a timestamptz in zone z (the session's: 9.95). text itself gives
+// UTC: the form kept (arrays, keys) and where no session is.
+pub fn textZ(v: &Val, z: &lexdb_time.Zone): str {
+    match v {
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        else { return lexdb_sql.text(v) }
+    }
+}
+
+// The text a client sees for a value of a column of type oid in zone z: a
+// timestamptz's in the zone, and an array of them (kept as text in UTC:
+// 9.27) with each element so; an element of one (x[i], unnest: its text
+// as kept) too. (What is kept has its offset; a text without one, as
+// coalesce(x, '...') gives, is read in the zone, as PostgreSQL would.)
+pub fn textOut(v: &Val, oid: int, z: &lexdb_time.Zone): str {
+    if z.isUtc() { return lexdb_sql.text(v) }
+    match v {
+        Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        Val.Text(t) {
+            if oid == lexdb_sql.OID_TSTZ {
+                match lexdb_time.parseTstz(&t, z) {
+                    Ok(u) { return lexdb_time.fmtTstz(u, z) }
+                    Err(_) { return t }
+                }
+            }
+            if oid > 0 && lexdb_sql.elemOid(oid) == lexdb_sql.OID_TSTZ {
+                match arrayParts(&t) {
+                    Ok(ps) {
+                        var vals: []Val = []
+                        for p in ps {
+                            match p {
+                                Some(x) {
+                                    match lexdb_time.parseTstz(&x, z) {
+                                        Ok(u) { append(mut &vals, Val.Text(lexdb_time.fmtTstz(u, z))) }
+                                        Err(_) { return t }
+                                    }
+                                }
+                                None { append(mut &vals, Val.Null) }
+                            }
+                        }
+                        return arrayText(&vals)
+                    }
+                    Err(_) { return t }
+                }
+            }
+        }
+        else {}
+    }
+    return lexdb_sql.text(v)
+}
+
+pub fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
+}
+
+pub fn kindName(t: &lexdb_sql.TypeName): str {
+    if t.kind == lexdb_sql.K_INT {
+        return if t.oid == lexdb_sql.OID_INT8 { "bigint" } else if t.oid == lexdb_sql.OID_INT2 { "smallint" } else { "integer" }
+    }
+    if t.kind == lexdb_sql.K_BOOL { return "boolean" }
+    if t.kind == lexdb_sql.K_NUM { return "numeric" }
+    if lexdb_sql.isTimeKind(t.kind) { return lexdb_sql.typeText(&lexdb_sql.timeType(t.oid)) }
+    if t.kind == lexdb_sql.K_UUID { return "uuid" }
+    if t.kind == lexdb_sql.K_BYTEA { return "bytea" }
+    if t.kind == lexdb_sql.K_FLOAT { return if t.oid == lexdb_sql.OID_FLOAT4 { "real" } else { "double precision" } }
+    if t.kind == lexdb_sql.K_REG || t.oid == lexdb_sql.OID_OID || t.oid == lexdb_sql.OID_NAME || t.oid == lexdb_sql.OID_CHAR { return lexdb_sql.typeText(t) }
+    if t.oid == lexdb_sql.OID_BPCHAR { return "character" }
+    return if t.oid == lexdb_sql.OID_VARCHAR { "character varying" } else { "text" }
+}
+
+pub fn badInput(t: &lexdb_sql.TypeName, s: &str): DbErr {
+    return e("22P02", &("invalid input syntax for type " + kindName(t) + ": \"" + s + "\""))
+}
+
+pub fn parseBool(s: &str): Option[bool] {
+    let l = strings.toLowerAscii(&(strings.trim(&s)))
+    if l == "t" || l == "true" || l == "yes" || l == "on" || l == "1" || l == "y" { return Some(true) }
+    if l == "f" || l == "false" || l == "no" || l == "off" || l == "0" || l == "n" { return Some(false) }
+    return None
+}
+
+// The digits before d's point (0 for |d| < 1): the coefficient's digits
+// and the exponent (9.119; it was d's text, made and searched).
+pub fn intDigits(d: &Decimal): int {
+    var c = d.coefficient()
+    var n = 0
+    while c > 0 {
+        c = c / 10
+        n += 1
+    }
+    let k = n + d.exponent()
+    return if n == 0 || k < 0 { 0 } else { k }
+}
+
+pub fn intRange(t: &lexdb_sql.TypeName, n: int): Result[int, DbErr] {
+    if t.oid == lexdb_sql.OID_INT4 && (n < -2147483648 || n > 2147483647) { return Err(e("22003", "integer out of range")) }
+    if t.oid == lexdb_sql.OID_INT2 && (n < -32768 || n > 32767) { return Err(e("22003", "smallint out of range")) }
+    return Ok(n)
+}
+
+// coerce in zone z (the session's, 9.95): a text read as a timestamptz,
+// a timestamptz made a timestamp, date, time or text, a date or timestamp
+// made a timestamptz, in the zone.
+pub fn coerceZ(v: Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if z.isUtc() { return coerce(v, t) }
+    match v {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    if lexdb_sql.isTimeKind(t.kind) { return coerceTime(v, t, z) }
+    if t.kind == lexdb_sql.K_ARRAY && lexdb_sql.elemOid(t.oid) == lexdb_sql.OID_TSTZ {
+        match v {
+            Val.Text(x) {
+                let et = lexdb_sql.oidType(lexdb_sql.OID_TSTZ)
+                var vals: []Val = []
+                for part in try arrayParts(&x) {
+                    match part {
+                        Some(p) { append(mut &vals, try coerceTime(Val.Text(p), &et, z)) }
+                        None { append(mut &vals, Val.Null) }
+                    }
+                }
+                return Ok(Val.Text(arrayText(&vals)))
+            }
+            else {}
+        }
+    }
+    match v {
+        Val.Tstz(u) {
+            if t.kind == lexdb_sql.K_TEXT { return coerce(Val.Text(lexdb_time.fmtTstz(u, z)), t) }
+        }
+        else {}
+    }
+    return coerce(v, t)
+}
+
+// A value made fit for a column of type t (an assignment's conversion).
+// A timestamptz's zone is UTC here: coerceZ for a session's.
+pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    match v {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    if t.kind == lexdb_sql.K_INT {
+        match v {
+            Val.Int(n) { return Ok(Val.Int(try intRange(t, n))) }
+            Val.Num(d) {
+                match d.toInt(Rounding.HALF_AWAY) {
+                    Ok(n) { return Ok(Val.Int(try intRange(t, n))) }
+                    Err(_) { return Err(e("22003", &(kindName(t) + " out of range"))) }
+                }
+            }
+            Val.Float(x) { return Ok(Val.Int(try floatToInt(x, t))) }
+            Val.Real(x) { return Ok(Val.Int(try floatToInt(x, t))) }
+            Val.Reg(o, _) { return Ok(Val.Int(o)) }
+            Val.Text(s) {
+                match strings.parseIntOpt(&(strings.trim(&s))) {
+                    Some(n) { return Ok(Val.Int(try intRange(t, n))) }
+                    None { return Err(badInput(t, &s)) }
+                }
+            }
+            else {}
+        }
+    } else if t.kind == lexdb_sql.K_BOOL {
+        match v {
+            Val.Bool(b) { return Ok(Val.Bool(b)) }
+            // T-SQL's bit (len 1): a number, 0 false, else true
+            Val.Int(n) { if t.len == 1 { return Ok(Val.Bool(n != 0)) } }
+            Val.Num(d) { if t.len == 1 { return Ok(Val.Bool(!d.isZero())) } }
+            Val.Text(s) {
+                match parseBool(&s) {
+                    Some(b) { return Ok(Val.Bool(b)) }
+                    None { return Err(badInput(t, &s)) }
+                }
+            }
+            else {}
+        }
+    } else if t.kind == lexdb_sql.K_NUM {
+        var d = Decimal.zero()
+        match v {
+            Val.Int(n) { d = Decimal.fromInt(n) }
+            Val.Num(x) { d = x }
+            Val.Text(s) {
+                match Decimal.parse(&(strings.trim(&s))) {
+                    Ok(x) { d = x }
+                    Err(_) { return Err(badInput(t, &s)) }
+                }
+            }
+            Val.Float(x) { d = try floatNum(x, false) }
+            Val.Real(x) { d = try floatNum(x, true) }
+            else { return Err(e("42804", "column is of type numeric but expression is of type boolean")) }
+        }
+        if t.prec > 0 {
+            match d.quantize(t.scale, Rounding.HALF_AWAY) {
+                Ok(q) { d = q }
+                Err(_) { return Err(e("22003", "numeric field overflow")) }
+            }
+            if intDigits(&d) > t.prec - t.scale {
+                return Err(e("22003", &("numeric field overflow: a field with precision " + t.prec.toStr() + ", scale " +
+                             t.scale.toStr() + " must round to an absolute value less than 10^" + (t.prec - t.scale).toStr())))
+            }
+        }
+        return Ok(Val.Num(d))
+    } else if lexdb_sql.isTimeKind(t.kind) {
+        return coerceTime(v, t, &lexdb_time.utc())
+    } else if t.kind == lexdb_sql.K_FLOAT {
+        return coerceFloat(v, t)
+    } else if t.kind == lexdb_sql.K_REG {
+        // without the catalog (eval's casts look names up: regCast)
+        match v {
+            Val.Reg(o, n) { return Ok(Val.Reg(o, n)) }
+            else {
+                match oidArg(&v) {
+                    Some(o) { return Ok(Val.Reg(o, o.toStr())) }
+                    None { return Err(e("0A000", &("lexdb: a name cast to " + kindName(t) + " is not supported here"))) }
+                }
+            }
+        }
+    } else if t.kind == lexdb_sql.K_UUID {
+        match v {
+            Val.Uuid(u) { return Ok(Val.Uuid(u)) }
+            Val.Text(x) { return Ok(Val.Uuid(try parseUuid(&x))) }
+            else { return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to uuid"))) }
+        }
+    } else if t.kind == lexdb_sql.K_BYTEA {
+        match v {
+            Val.Bytes(x) { return Ok(Val.Bytes(x)) }
+            Val.Text(x) { return Ok(Val.Bytes(try parseBytea(&x))) }
+            else { return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to bytea"))) }
+        }
+    } else if t.kind == lexdb_sql.K_ARRAY {
+        match v {
+            Val.Text(x) {
+                let et = lexdb_sql.oidType(lexdb_sql.elemOid(t.oid))
+                var vals: []Val = []
+                for part in try arrayParts(&x) {
+                    match part {
+                        Some(p) { append(mut &vals, try coerce(Val.Text(p), &et)) }
+                        None { append(mut &vals, Val.Null) }
+                    }
+                }
+                return Ok(Val.Text(arrayText(&vals)))
+            }
+            else { return Err(e("42804", &("cannot cast a " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to " + lexdb_sql.typeText(t)))) }
+        }
+    } else {
+        var s = ""
+        match v {
+            Val.Text(x) { s = x }
+            Val.Int(n) { s = n.toStr() }
+            Val.Num(d) { s = d.toStr() }
+            Val.Bool(b) { s = if b { "true" } else { "false" } }
+            else { s = lexdb_sql.text(&v) }
+        }
+        if t.oid == lexdb_sql.OID_BPCHAR { return bpcharOf(&s, t.len, false) }
+        // (characters are counted only when the bytes could be too many)
+        if t.len > 0 && len(s) > t.len && strings.runeCount(&s) > t.len {
+            return Err(e("22001", &("value too long for type character varying(" + t.len.toStr() + ")")))
+        }
+        return Ok(Val.Text(s))
+    }
+    return Err(e("42804", &("column is of type " + kindName(t) + " but the expression is of another type")))
+}
+
+// s made a char(n): too long is 22001 unless only blanks are cut (an
+// explicit cast cuts anything).
+pub fn bpcharOf(s: &str, n: int, cut: bool): Result[Val, DbErr] {
+    if n <= 0 { return Ok(Val.Text(s)) }
+    let k = strings.runeCount(&s)
+    if k == n { return Ok(Val.Text(s)) }
+    if k < n {
+        var b = newStrBuf()
+        b.add(&s)
+        for i in k..n { b.addByte(' ') }
+        return Ok(Val.Text(b.toStr()))
+    }
+    var at = 0
+    for i in 0..n { at += strings.decodeAt(s, at).size }
+    if !cut {
+        for j in at..len(s) {
+            if s[j] != ' ' { return Err(e("22001", &("value too long for type character(" + n.toStr() + ")"))) }
+        }
+    }
+    return Ok(Val.Text(s[0..at].toStr()))
+}
+
+// Its trailing blanks taken off.
+pub fn bpTrim(s: &str): str {
+    var k = len(s)
+    while k > 0 && s[k - 1] == ' ' { k -= 1 }
+    return s[0..k].toStr()
+}
+
+pub fn isFloat(v: &Val): bool { return kindOf(v) == lexdb_sql.K_FLOAT }
+
+pub fn isReal(v: &Val): bool {
+    match v {
+        Val.Real(_) { return true }
+        else { return false }
+    }
+}
+
+// A number as a double: an integer, numeric or float, or a text (a
+// parameter) read as a double precision.
+pub fn asFloat(v: &Val): Option[float] {
+    match v {
+        Val.Int(n) { return Some(float(n)) }
+        Val.Num(d) { return math.parse(&(d.toStr())) }
+        Val.Float(x) { return Some(x) }
+        Val.Real(x) { return Some(x) }
+        Val.Text(s) {
+            match lexdb_float.parse(&s, false) {
+                Ok(x) { return Some(x) }
+                Err(_) { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+// A value made a real or double precision.
+pub fn coerceFloat(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    let real = t.oid == lexdb_sql.OID_FLOAT4
+    var x = 0.0f
+    match v {
+        Val.Float(f) { x = f }
+        Val.Real(f) { x = f }
+        Val.Int(n) { x = float(n) }
+        Val.Num(d) {
+            x = math.parse(&(d.toStr())).unwrapOr(0.0f)
+            if x.isInf() { return Err(e("22003", "value out of range: overflow")) }
+        }
+        Val.Text(s) { x = try lexdb_float.parse(&s, real) }
+        else { return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to " + kindName(t)))) }
+    }
+    if !real { return Ok(Val.Float(x)) }
+    let r = lexdb_float.round4(x)
+    if r.isInf() && !x.isInf() { return Err(e("22003", "value out of range: overflow")) }
+    if r == 0.0f && x != 0.0f { return Err(e("22003", "value out of range: underflow")) }
+    return Ok(Val.Real(r))
+}
+
+// A float as an integer type: rounded half to even, as PostgreSQL's rint.
+pub fn floatToInt(x: float, t: &lexdb_sql.TypeName): Result[int, DbErr] {
+    let r = x.roundEven()
+    if x.isNaN() || r < -9223372036854775808.0f || r >= 9223372036854775808.0f {
+        return Err(e("22003", &(kindName(t) + " out of range")))
+    }
+    return intRange(t, int(r))
+}
+
+// A float as a numeric: 15 significant digits (a real's 6).
+pub fn floatNum(x: float, real: bool): Result[Decimal, DbErr] {
+    match lexdb_float.numericText(x, real) {
+        Some(s) {
+            match Decimal.parse(&s) {
+                Ok(d) { return Ok(d) }
+                Err(_) {}
+            }
+        }
+        None {}
+    }
+    return Err(e("0A000", &("lexdb: cannot convert " + lexdb_float.fmt8(x) + " to numeric")))
+}
+
+// Floats in order: NaN equal to itself and after every other value.
+pub fn floatCmp(x: float, y: float): int {
+    if x.isNaN() || y.isNaN() { return if x.isNaN() && y.isNaN() { 0 } else if x.isNaN() { 1 } else { -1 } }
+    return if x < y { -1 } else if x > y { 1 } else { 0 }
+}
+
+// + - * / with a float: a real's with two reals (rounded to single
+// precision), else a double's; overflow and underflow from finite operands
+// are 22003, as in PostgreSQL.
+pub fn arithFloat(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
+    let real = isReal(a) && isReal(b)
+    let xo = asFloat(a)
+    let yo = asFloat(b)
+    if xo.isNone() || yo.isNone() || !(op == "+" || op == "-" || op == "*" || op == "/") {
+        return Err(e("42883", &("operator does not exist: " + kindName(&lexdb_sql.oidType(kindOid(a))) + " " + op + " " +
+                     kindName(&lexdb_sql.oidType(kindOid(b))))))
+    }
+    let x = xo.unwrap()
+    let y = yo.unwrap()
+    var r = 0.0f
+    if op == "+" { r = x + y }
+    else if op == "-" { r = x - y }
+    else if op == "*" { r = x * y }
+    else {
+        if y == 0.0f { return Err(e("22012", "division by zero")) }
+        r = x / y
+    }
+    if real { r = lexdb_float.round4(r) }
+    if r.isInf() && !x.isInf() && !y.isInf() { return Err(e("22003", "value out of range: overflow")) }
+    if r == 0.0f && x != 0.0f && ((op == "*" && y != 0.0f) || (op == "/" && !y.isInf())) {
+        return Err(e("22003", "value out of range: underflow"))
+    }
+    return Ok(if real { Val.Real(r) } else { Val.Float(r) })
+}
+
+// A float function's argument as a double: an integer or float (a numeric is
+// not: PostgreSQL's numeric versions answer in numeric digits).
+pub fn floatArg(v: &Val, name: &str): Result[float, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(float(n)) }
+        Val.Float(x) { return Ok(x) }
+        Val.Real(x) { return Ok(x) }
+        else { return Err(e("0A000", &("lexdb: " + name + " of a " + kindName(&lexdb_sql.oidType(kindOid(v))) + " is not supported (cast it to double precision)"))) }
+    }
+}
+
+// power(x, y) over double precision.
+pub fn powerOf(a: &Val, b: &Val): Result[Val, DbErr] {
+    let x = try floatArg(a, &"power")
+    let y = try floatArg(b, &"power")
+    if x == 0.0f && y < 0.0f { return Err(e("2201F", "zero raised to a negative power is undefined")) }
+    if x < 0.0f && y.floor() != y { return Err(e("2201F", "a negative number raised to a non-integer power yields a complex result")) }
+    let r = x.pow(y)
+    if r.isInf() && !x.isInf() && !y.isInf() { return Err(e("22003", "value out of range: overflow")) }
+    if r == 0.0f && x != 0.0f && !y.isInf() { return Err(e("22003", "value out of range: underflow")) }
+    return Ok(Val.Float(r))
+}
+
+// A value made a date or time type: text read in PostgreSQL's forms, the
+// date and time kinds converted (a timestamp to a timestamptz in the
+// session's zone, and back), rounded to the type's fractional digits.
+pub fn coerceTime(v: Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let k = t.kind
+    let p = if t.prec >= 1 && !tsqlDatetime(t) { t.scale } else if t.prec >= 1 { min(t.scale, 6) } else { 6 }
+    match v {
+        Val.Text(s) {
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s, z))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(try lexdb_time.parseTime(&s), p))) }
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(try lexdb_time.parseTs(&s, z), p))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(try lexdb_time.parseTstz(&s, z), p))) }
+            let iv = try lexdb_time.parseIval(&s)
+            return Ok(Val.Ival(lexdb_time.Ival{months: iv.months, days: iv.days, us: lexdb_time.roundUs(iv.us, p)}))
+        }
+        Val.Date(d) {
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(d)) }
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.dateToTs(d))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z))) }
+        }
+        Val.Ts(u) {
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(u, p))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(u))) }
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(lexdb_time.tsToTstz(u, z), p))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(u, lexdb_time.DAY_US), p))) }
+        }
+        Val.Tstz(u) {
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(u, p))) }
+            let local = lexdb_time.tstzToTs(u, z)
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(local, p))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(local))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), p))) }
+        }
+        Val.Time(u) {
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(u, p))) }
+            if k == lexdb_sql.K_IVAL { return Ok(Val.Ival(lexdb_time.Ival{months: 0, days: 0, us: u})) }
+        }
+        Val.Ival(iv) {
+            if k == lexdb_sql.K_IVAL { return Ok(Val.Ival(lexdb_time.Ival{months: iv.months, days: iv.days, us: lexdb_time.roundUs(iv.us, p)})) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(floorModInt(iv.us, lexdb_time.DAY_US))) }
+        }
+        else {}
+    }
+    return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to " + lexdb_sql.typeText(t))))
+}
+
+pub fn floorModInt(a: int, b: int): int {
+    let r = a % b
+    return if r < 0 { r + b } else { r }
+}
+
+// The type of a date or time value (a text's: the other side's type).
+pub fn timeTypeOf(v: &Val): lexdb_sql.TypeName { return lexdb_sql.timeType(kindOid(v)) }
+
+// A timestamp-like value as a timestamptz's microseconds (a date at
+// midnight, a timestamp in the session's zone z), for comparing across them.
+pub fn asTstz(v: &Val, z: &lexdb_time.Zone): Option[int] {
+    match v {
+        Val.Date(d) { return Some(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)) }
+        Val.Ts(u) { return Some(lexdb_time.tsToTstz(u, z)) }
+        Val.Tstz(u) { return Some(u) }
+        else { return None }
+    }
+}
+
+// Compares two values of which one is a date or time kind: the same kind
+// directly, a date, timestamp and timestamptz with each other, a text read
+// as the other's type.
+pub fn compareTime(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match a {
+        Val.Text(s) {
+            let x = try coerceTime(Val.Text(s), &timeTypeOf(b), z)
+            return compareTime(&x, b, z)
+        }
+        else {}
+    }
+    match b {
+        Val.Text(s) {
+            let y = try coerceTime(Val.Text(s), &timeTypeOf(a), z)
+            return compareTime(a, &y, z)
+        }
+        else {}
+    }
+    match a {
+        Val.Date(x) { match b { Val.Date(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Ts(x) { match b { Val.Ts(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Tstz(x) { match b { Val.Tstz(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Time(x) { match b { Val.Time(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Ival(x) { match b { Val.Ival(y) { return Ok(lexdb_time.ivalCmp(&x, &y)) } else {} } }
+        else {}
+    }
+    match asTstz(a, z) {
+        Some(x) {
+            match asTstz(b, z) {
+                Some(y) { return Ok(x.cmp(&y)) }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Err(e("42883", &("operator does not exist: " + kindName(&lexdb_sql.oidType(kindOid(a))) + " compared with " +
+                 kindName(&lexdb_sql.oidType(kindOid(b))))))
+}
+
+pub fn opErr(op: &str, a: &Val, b: &Val): DbErr {
+    return e("42883", &("operator does not exist: " + kindName(&lexdb_sql.oidType(kindOid(a))) + " " + op + " " + kindName(&lexdb_sql.oidType(kindOid(b)))))
+}
+
+pub fn intOf(v: &Val): Option[int] {
+    match v {
+        Val.Int(n) { return Some(n) }
+        Val.Text(s) { return strings.parseIntOpt(&(strings.trim(&s))) }
+        else { return None }
+    }
+}
+
+pub fn ivalOfVal(v: &Val): Result[Option[lexdb_time.Ival], DbErr] {
+    match v {
+        Val.Ival(iv) { return Ok(Some(iv)) }
+        Val.Text(s) { return Ok(Some(try lexdb_time.parseIval(&s))) }
+        else { return Ok(None) }
+    }
+}
+
+// Arithmetic with a date or time kind, as PostgreSQL's operators: a date
+// and days, dates' difference in days, a date-time and an interval, the
+// difference of two date-times, intervals with each other and times a
+// number. A text on one side is read as the type the operator needs.
+pub fn arithTime(op: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let plus = op == "+"
+    let minus = op == "-"
+    match a {
+        Val.Date(d) {
+            if plus || minus {
+                match b {
+                    Val.Date(d2) { if minus { return Ok(Val.Int(d - d2)) } }
+                    Val.Time(t) { if plus { return Ok(Val.Ts(lexdb_time.dateToTs(d) + t)) } }
+                    Val.Ival(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Ts(try lexdb_time.tsPlus(lexdb_time.dateToTs(d), &x)))
+                    }
+                    Val.Int(n) { return Ok(Val.Date(if plus { d + n } else { d - n })) }
+                    Val.Text(s) {
+                        match strings.parseIntOpt(&(strings.trim(&s))) {
+                            Some(n) { return Ok(Val.Date(if plus { d + n } else { d - n })) }
+                            None {}
+                        }
+                        if minus {
+                            match lexdb_time.parseDate(&s, z) {
+                                Ok(d2) { return Ok(Val.Int(d - d2)) }
+                                Err(_) {}
+                            }
+                        }
+                        return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)), z)
+                    }
+                    else {}
+                }
+            }
+        }
+        Val.Ts(u) {
+            if plus || minus {
+                match b {
+                    Val.Ts(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Text(s) {
+                        // timestamp - '...': a timestamp, as PostgreSQL reads it
+                        if minus { return arithTime(op, a, &Val.Ts(try lexdb_time.parseTs(&s, z)), z) }
+                    }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Ts(try lexdb_time.tsPlus(u, &x)))
+                    }
+                    None {}
+                }
+            }
+        }
+        Val.Tstz(u) {
+            if plus || minus {
+                match b {
+                    Val.Tstz(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Text(s) {
+                        if minus { return arithTime(op, a, &Val.Tstz(try lexdb_time.parseTstz(&s, z)), z) }
+                    }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        return Ok(Val.Tstz(try lexdb_time.tstzPlus(u, &x, z)))
+                    }
+                    None {}
+                }
+            }
+        }
+        Val.Time(t) {
+            if plus || minus {
+                match b {
+                    Val.Time(t2) { if minus { return Ok(Val.Ival(lexdb_time.Ival{months: 0, days: 0, us: t - t2})) } }
+                    Val.Date(d) { if plus { return Ok(Val.Ts(lexdb_time.dateToTs(d) + t)) } }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) { return Ok(Val.Time(floorModInt(if plus { t + iv.us } else { t - iv.us }, lexdb_time.DAY_US))) }
+                    None {}
+                }
+            }
+        }
+        Val.Ival(iv) {
+            if plus || minus {
+                match b {
+                    Val.Ival(iv2) { return Ok(Val.Ival(lexdb_time.ivalPlus(&iv, &(if minus { lexdb_time.ivalNeg(&iv2) } else { iv2 })))) }
+                    Val.Text(s) { return arithTime(op, a, &Val.Ival(try lexdb_time.parseIval(&s)), z) }
+                    else {}
+                }
+                if plus { return arithTime(op, b, a, z) }      // interval + a date-time
+            }
+            if op == "*" || op == "/" {
+                match asNum(b) {
+                    Some(f) {
+                        return Ok(Val.Ival(if op == "*" { try lexdb_time.ivalTimes(&iv, &f) } else { try lexdb_time.ivalDiv(&iv, &f) }))
+                    }
+                    None {}
+                }
+            }
+        }
+        else {
+            // a number times an interval; a text before a date-time
+            if op == "*" {
+                match b { Val.Ival(_) { return arithTime(op, b, a, z) } else {} }
+            }
+            if plus {
+                match b {
+                    Val.Date(_) { return arithTime(op, b, a, z) }
+                    Val.Ts(_) { return arithTime(op, b, a, z) }
+                    Val.Tstz(_) { return arithTime(op, b, a, z) }
+                    Val.Time(_) { return arithTime(op, b, a, z) }
+                    else {}
+                }
+            }
+            match a {
+                Val.Text(s) {
+                    // '2026-01-02' - date '2026-01-01', '...' - interval: the text as the other's type
+                    match b {
+                        Val.Ival(_) {}
+                        else {
+                            if lexdb_sql.isTimeKind(kindOf(b)) { return arithTime(op, &(try coerceTime(Val.Text(s), &timeTypeOf(b), z)), b, z) }
+                        }
+                    }
+                }
+                else {}
+            }
+        }
+    }
+    return Err(opErr(op, a, b))
+}
+
+// The elements of an array's text form, {a,"b c",NULL}: None for NULL.
+pub fn arrayParts(s: &str): Result[[]Option[str], DbErr] {
+    let bad = e("22P02", &("malformed array literal: \"" + s + "\""))
+    var out: []Option[str] = []
+    var i = 0
+    let n = len(s)
+    while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
+    if i < n && s[i] != '{' {
+        // an int2vector's or oidvector's form: numbers and spaces (9.80)
+        for c in 0..n { if !((s[c] >= '0' && s[c] <= '9') || s[c] == ' ' || s[c] == '-') { return Err(bad) } }
+        for f in strings.split(&s, " ") { if len(f) > 0 { append(mut &out, Some(f.toStr())) } }
+        return Ok(out)
+    }
+    if i >= n { return Err(bad) }
+    i += 1
+    while i < n && s[i] == ' ' { i += 1 }
+    if i < n && s[i] == '}' { return Ok(out) }
+    while true {
+        while i < n && s[i] == ' ' { i += 1 }
+        if i >= n { return Err(bad) }
+        if s[i] == '{' { return Err(e("0A000", "lexdb: arrays of more than one dimension are not supported")) }
+        if s[i] == '"' {
+            var b = newStrBuf()
+            i += 1
+            while i < n && s[i] != '"' {
+                if s[i] == '\\' { i += 1 }
+                if i >= n { return Err(bad) }
+                b.addByte(s[i])
+                i += 1
+            }
+            if i >= n { return Err(bad) }
+            i += 1
+            append(mut &out, Some(b.toStr()))
+        } else {
+            var b = newStrBuf()
+            while i < n && s[i] != ',' && s[i] != '}' {
+                if s[i] == '\\' { i += 1 }
+                if i >= n { return Err(bad) }
+                b.addByte(s[i])
+                i += 1
+            }
+            let w = strings.trim(&(b.toStr()))
+            if len(w) == 0 { return Err(bad) }
+            if strings.toLowerAscii(&w) == "null" { append(mut &out, None) } else { append(mut &out, Some(w)) }
+        }
+        while i < n && s[i] == ' ' { i += 1 }
+        if i >= n { return Err(bad) }
+        if s[i] == '}' {
+            i += 1
+            break
+        }
+        if s[i] != ',' { return Err(bad) }
+        i += 1
+    }
+    while i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n') { i += 1 }
+    if i != n { return Err(bad) }
+    return Ok(out)
+}
+
+// An array's text form: elements quoted when they must be.
+pub fn arrayText(vals: &[]Val): str {
+    var b = newStrBuf()
+    b.addByte('{')
+    for i in 0..len(vals) {
+        if i > 0 { b.addByte(',') }
+        match vals[i] {
+            Val.Null { b.add("NULL") }
+            Val.Bool(x) { b.add(if x { "t" } else { "f" }) }
+            Val.Text(x) {
+                var plain = len(x) > 0 && strings.toLowerAscii(&x) != "null"
+                for k in 0..len(x) {
+                    let c = x[k]
+                    if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' { plain = false }
+                }
+                if plain { b.add(&x) } else {
+                    b.addByte('"')
+                    for k in 0..len(x) {
+                        if x[k] == '"' || x[k] == '\\' { b.addByte('\\') }
+                        b.addByte(x[k])
+                    }
+                    b.addByte('"')
+                }
+            }
+            else { b.add(&(lexdb_sql.text(&vals[i]))) }
+        }
+    }
+    b.addByte('}')
+    return b.toStr()
+}
+
+// A value's type OID by its kind (for messages).
+pub fn kindOid(v: &Val): int {
+    match v {
+        Val.Int(_) { return lexdb_sql.OID_INT8 }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Ival(_) { return lexdb_sql.OID_IVAL }
+        Val.Uuid(_) { return lexdb_sql.OID_UUID }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
+        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
+        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Reg(_, _) { return lexdb_sql.OID_REGCLASS }
+        else { return lexdb_sql.OID_TEXT }
+    }
+}
+
+pub fn kindOf(v: &Val): int {
+    match v {
+        Val.Null { return 0 }
+        Val.Int(_) { return lexdb_sql.K_INT }
+        Val.Bool(_) { return lexdb_sql.K_BOOL }
+        Val.Num(_) { return lexdb_sql.K_NUM }
+        Val.Text(_) { return lexdb_sql.K_TEXT }
+        Val.Date(_) { return lexdb_sql.K_DATE }
+        Val.Time(_) { return lexdb_sql.K_TIME }
+        Val.Ts(_) { return lexdb_sql.K_TS }
+        Val.Tstz(_) { return lexdb_sql.K_TSTZ }
+        Val.Ival(_) { return lexdb_sql.K_IVAL }
+        Val.Uuid(_) { return lexdb_sql.K_UUID }
+        Val.Bytes(_) { return lexdb_sql.K_BYTEA }
+        Val.Float(_) { return lexdb_sql.K_FLOAT }
+        Val.Real(_) { return lexdb_sql.K_FLOAT }
+        Val.Reg(_, _) { return lexdb_sql.K_REG }
+    }
+}
+
+pub fn asNum(v: &Val): Option[Decimal] {
+    match v {
+        Val.Int(n) { return Some(Decimal.fromInt(n)) }
+        Val.Num(d) { return Some(d) }
+        Val.Float(x) { return floatNum(x, false).ok() }
+        Val.Real(x) { return floatNum(x, true).ok() }
+        Val.Text(s) {
+            match Decimal.parse(&(strings.trim(&s))) {
+                Ok(d) { return Some(d) }
+                Err(_) { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+// compare in zone z (the session's, 9.95): a date or timestamp with a
+// timestamptz, a text with a date or time kind.
+pub fn compareZ(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    if lexdb_sql.isTimeKind(kindOf(a)) || lexdb_sql.isTimeKind(kindOf(b)) { return compareTime(a, b, z) }
+    return compare(a, b)
+}
+
+// arith in zone z (the session's, 9.95): a timestamptz and an interval's
+// days and months.
+pub fn arithZ(op: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) || op == "^" || !(lexdb_sql.isTimeKind(kindOf(a)) || lexdb_sql.isTimeKind(kindOf(b))) { return arith(op, a, b) }
+    return arithTime(op, a, b, z)
+}
+
+// Compares two values that are not NULL; a text compared with a number or a
+// boolean is read as one (a parameter sent as text). In UTC: compareZ for
+// a session's zone.
+pub fn compare(a: &Val, b: &Val): Result[int, DbErr] {
+    let ka = kindOf(a)
+    let kb = kindOf(b)
+    if lexdb_sql.isTimeKind(ka) || lexdb_sql.isTimeKind(kb) { return compareTime(a, b, &lexdb_time.utc()) }
+    if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID || ka == lexdb_sql.K_BYTEA || kb == lexdb_sql.K_BYTEA {
+        // a text with either is read as its type; then as bytes, which is their order
+        let k = if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID { lexdb_sql.K_UUID } else { lexdb_sql.K_BYTEA }
+        let ty = lexdb_sql.oidType(if k == lexdb_sql.K_UUID { lexdb_sql.OID_UUID } else { lexdb_sql.OID_BYTEA })
+        let x = try coerce(a, &ty)
+        let y = try coerce(b, &ty)
+        return Ok(lexdb_sql.text(&x).cmp(&lexdb_sql.text(&y)))
+    }
+    if ka == lexdb_sql.K_REG || kb == lexdb_sql.K_REG {
+        // a reg type compares as its OID
+        match oidArg(a) {
+            Some(x) {
+                match oidArg(b) {
+                    Some(y) { return Ok(x.cmp(&y)) }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    if ka == lexdb_sql.K_FLOAT || kb == lexdb_sql.K_FLOAT {
+        match asFloat(a) {
+            Some(x) {
+                match asFloat(b) {
+                    Some(y) { return Ok(floatCmp(x, y)) }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    match a {
+        Val.Int(x) {
+            match b {
+                Val.Int(y) { return Ok(x.cmp(&y)) }
+                Val.Text(s) {
+                    match strings.parseIntOpt(&(strings.trim(&s))) {
+                        Some(y) { return Ok(x.cmp(&y)) }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        Val.Text(x) {
+            match b {
+                Val.Text(y) { return Ok(x.cmp(&y)) }
+                Val.Int(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                Val.Bool(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                Val.Num(_) {
+                    let r = try compare(b, a)
+                    return Ok(-r)
+                }
+                else {}
+            }
+        }
+        Val.Bool(x) {
+            let y = match b {
+                Val.Bool(v) { Some(v) }
+                Val.Text(s) { parseBool(&s) }
+                else { None }
+            }
+            match y {
+                Some(v) { return Ok(if x == v { 0 } else if !x { -1 } else { 1 }) }
+                None {}
+            }
+        }
+        else {}
+    }
+    if ka == lexdb_sql.K_NUM || kb == lexdb_sql.K_NUM {
+        match asNum(a) {
+            Some(x) {
+                match asNum(b) {
+                    Some(y) { return Ok(x.cmp(&y)) }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    return Err(e("42883", &("operator does not exist: " + lexdb_sql.text(a) + " compared with " + lexdb_sql.text(b))))
+}
+
+pub fn decErr(): DbErr { return e("22003", "numeric value out of range") }
+
+pub fn arith(op: &str, a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    if op == "^" { return powOp(a, b) }
+    if lexdb_sql.isTimeKind(kindOf(a)) || lexdb_sql.isTimeKind(kindOf(b)) { return arithTime(op, a, b, &lexdb_time.utc()) }
+    if isFloat(a) || isFloat(b) { return arithFloat(op, a, b) }
+    var x = 0
+    var y = 0
+    var ints = false
+    match a {
+        Val.Int(n) {
+            match b {
+                Val.Int(m) {
+                    x = n
+                    y = m
+                    ints = true
+                }
+                Val.Text(s) {
+                    match strings.parseIntOpt(&(strings.trim(&s))) {
+                        Some(m) {
+                            x = n
+                            y = m
+                            ints = true
+                        }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        Val.Text(s) {
+            match b {
+                Val.Int(m) {
+                    match strings.parseIntOpt(&(strings.trim(&s))) {
+                        Some(n) {
+                            x = n
+                            y = m
+                            ints = true
+                        }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    if ints {
+        var r: Option[int] = None
+        match op {
+            "+" { r = x.checkedAdd(y) }
+            "-" { r = x.checkedSub(y) }
+            "*" { r = x.checkedMul(y) }
+            "/" {
+                if y == 0 { return Err(e("22012", "division by zero")) }
+                r = x.checkedDiv(y)
+            }
+            "%" {
+                if y == 0 { return Err(e("22012", "division by zero")) }
+                r = x.checkedRem(y)
+            }
+            "&" { r = Some(x & y) }
+            "|" { r = Some(x | y) }
+            "#" { r = Some(x ^ y) }
+            // PostgreSQL shifts by the count modulo 64
+            "<<" { r = Some(x << (y & 63)) }
+            ">>" { r = Some(x >> (y & 63)) }
+            else {}
+        }
+        match r {
+            Some(v) { return Ok(Val.Int(v)) }
+            None { return Err(e("22003", "bigint out of range")) }
+        }
+    }
+    let da = asNum(a)
+    let db = asNum(b)
+    if da.isNone() || db.isNone() {
+        return Err(e("42883", &("operator does not exist: " + lexdb_sql.text(a) + " " + op + " " + lexdb_sql.text(b))))
+    }
+    let p = da.unwrap()
+    let q = db.unwrap()
+    var r: Result[Decimal, DecError] = Ok(Decimal.zero())
+    match op {
+        "+" { r = p.addExact(q) }
+        "-" { r = p.subExact(q) }
+        "*" { r = p.mulExact(q) }
+        "/" {
+            if q.isZero() { return Err(e("22012", "division by zero")) }
+            var sc = 16
+            if p.scale() > sc { sc = p.scale() }
+            if q.scale() > sc { sc = q.scale() }
+            r = p.div(q, sc, Rounding.HALF_EVEN)
+        }
+        "%" {
+            if q.isZero() { return Err(e("22012", "division by zero")) }
+            r = p.remExact(q)
+        }
+        else {}
+    }
+    match r {
+        Ok(v) { return Ok(Val.Num(v)) }
+        Err(_) { return Err(decErr()) }
+    }
+}
+
+pub fn truth(v: &Val): Option[bool] {
+    match v {
+        Val.Bool(b) { return Some(b) }
+        Val.Text(s) { return parseBool(&s) }
+        else { return None }
+    }
+}
+
+pub fn isTstz(v: &Val): bool {
+    match v {
+        Val.Tstz(_) { return true }
+        else { return false }
+    }
+}
+
+// op on v: eval's Expr.Unary, shared with compiled expressions (cEval).
+pub fn unaryVal(op: &str, v: Val): Result[Val, DbErr] {
+    if op == "~" {
+        match v {
+            Val.Null { return Ok(Val.Null) }
+            Val.Int(n) { return Ok(Val.Int(~n)) }
+            else { return Err(e("42883", &("operator does not exist: ~ " + kindName(&lexdb_sql.oidType(kindOid(&v)))))) }
+        }
+    }
+    if op == "-" {
+        match v {
+            Val.Null { return Ok(Val.Null) }
+            Val.Int(n) {
+                match (0).checkedSub(n) {
+                    Some(m) { return Ok(Val.Int(m)) }
+                    None { return Err(e("22003", "bigint out of range")) }
+                }
+            }
+            Val.Num(d) { return Ok(Val.Num(d.neg())) }
+            Val.Ival(iv) { return Ok(Val.Ival(lexdb_time.ivalNeg(&iv))) }
+            Val.Float(fx) { return Ok(Val.Float(-fx)) }
+            Val.Real(fx) { return Ok(Val.Real(-fx)) }
+            else { return arith(&"-", &Val.Int(0), &v) }
+        }
+    }
+    if isNull(&v) { return Ok(Val.Null) }
+    match truth(&v) {
+        Some(b) { return Ok(Val.Bool(!b)) }
+        None { return Err(e("42804", "argument of NOT must be type boolean")) }
+    }
+}
+
+// A uuid in any of PostgreSQL's forms (upper or lower case, in braces, a
+// hyphen after any group of four digits or none), as its canonical form.
+pub fn parseUuid(s: &str): Result[str, DbErr] {
+    // the canonical form, lower case: taken as it is (9.119)
+    if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+        var bad = 0
+        for i in 0..36 { if i != 8 && i != 13 && i != 18 && i != 23 { bad = bad | int(HEX_LOW[int(s[i])]) } }
+        if bad < 16 { return Ok(s.toStr()) }
+    }
+    let bad = e("22P02", &("invalid input syntax for type uuid: \"" + s + "\""))
+    var t = strings.trim(&s)
+    if len(t) > 0 && t[0] == '{' {
+        if len(t) < 2 || t[len(t) - 1] != '}' { return Err(bad) }
+        t = t[1..len(t) - 1]
+    }
+    var hex = newStrBuf()
+    var n = 0
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == '-' {
+            if n == 0 || n % 4 != 0 || n >= 32 || t[i - 1] == '-' { return Err(bad) }
+            continue
+        }
+        let v = lexdb_sql.hexVal(c)
+        if v < 0 || n >= 32 { return Err(bad) }
+        hex.addByte(if c >= 'A' && c <= 'F' { c + 32 } else { c })
+        n += 1
+    }
+    if n != 32 || t[len(t) - 1] == '-' { return Err(bad) }
+    let h = hex.toStr()
+    return Ok(h[0..8] + "-" + h[8..12] + "-" + h[12..16] + "-" + h[16..20] + "-" + h[20..32])
+}
+
+// A bytea from its text: hex (\x0001ff, pairs perhaps spaced) or the
+// escape form (\\ a backslash, \nnn an octal byte, the rest as is).
+pub fn parseBytea(s: &str): Result[str, DbErr] {
+    let bad = e("22P02", "invalid input syntax for type bytea")
+    var b = newStrBuf()
+    if len(s) >= 2 && s[0] == '\\' && (s[1] == 'x' || s[1] == 'X') {
+        var i = 2
+        while i < len(s) {
+            if s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' {
+                i += 1
+                continue
+            }
+            if i + 1 >= len(s) { return Err(e("22023", "invalid hexadecimal data: odd number of digits")) }
+            let hi = lexdb_sql.hexVal(s[i])
+            let lo = lexdb_sql.hexVal(s[i + 1])
+            if hi < 0 || lo < 0 { return Err(e("22023", &("invalid hexadecimal digit: \"" + s[if hi < 0 { i } else { i + 1 }..if hi < 0 { i + 1 } else { i + 2 }] + "\""))) }
+            b.addByte(byte(hi * 16 + lo))
+            i += 2
+        }
+        return Ok(b.toStr())
+    }
+    var i = 0
+    while i < len(s) {
+        if s[i] != '\\' {
+            b.addByte(s[i])
+            i += 1
+        } else if i + 1 < len(s) && s[i + 1] == '\\' {
+            b.addByte('\\')
+            i += 2
+        } else if i + 3 < len(s) && s[i + 1] >= '0' && s[i + 1] <= '3' && s[i + 2] >= '0' && s[i + 2] <= '7' && s[i + 3] >= '0' && s[i + 3] <= '7' {
+            b.addByte(byte((int(s[i + 1] - '0') * 8 + int(s[i + 2] - '0')) * 8 + int(s[i + 3] - '0')))
+            i += 4
+        } else {
+            return Err(bad)
+        }
+    }
+    return Ok(b.toStr())
+}
+
+pub fn oidArg(v: &Val): Option[int] {
+    match v {
+        Val.Int(n) { return Some(n) }
+        Val.Reg(o, _) { return Some(o) }
+        Val.Text(s) { return strings.parseIntOpt(&(strings.trim(&s))) }
+        else { return None }
+    }
+}
+
+// x ^ y and power(x, y): over numeric when either is one and neither a
+// float, else over double precision.
+pub fn powOp(a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    let numeric = (kindOf(a) == lexdb_sql.K_NUM || kindOf(b) == lexdb_sql.K_NUM) && !isFloat(a) && !isFloat(b)
+    if numeric {
+        match asNum(a) {
+            Some(x) {
+                match asNum(b) {
+                    Some(y) { return Ok(Val.Num(try lexdb_func.numPower(&x, &y))) }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    return powerOf(a, b)
+}
+
+// A time type of T-SQL's datetime or smalldatetime (lexdb_parse.tsqlCode's
+// code for one): its precision is not its fractional digits.
+fn tsqlDatetime(t: &lexdb_sql.TypeName): bool {
+    return lexdb_sql.timeKind(t.oid) > 0 && (t.prec == lexdb_dialect.TS_DATETIME || t.prec == lexdb_dialect.TS_SMALLDATETIME)
+}
+
+// ---- operators, by code (design/lexdb-layers.md 4.4.1)
+//
+// The binder decodes an operator's text once (lexdb_bind.BX.Op: its code,
+// its place in OPS); the operations below take the code, so a bound
+// expression matches no text per row. eval's texts reach the same code
+// (binVal: opCode).
+
+pub type OpDef = value record {
+    pub name: str               // its text, as the parse tree and the operations name it
+    pub cmp: bool               // a comparison: NULL with a NULL, else a boolean
+}
+
+pub const OPS: []OpDef = [
+    OpDef{name: "+", cmp: false},
+    OpDef{name: "-", cmp: false},
+    OpDef{name: "*", cmp: false},
+    OpDef{name: "/", cmp: false},
+    OpDef{name: "%", cmp: false},
+    OpDef{name: "^", cmp: false},
+    OpDef{name: "t+", cmp: false},
+    OpDef{name: "&", cmp: false},
+    OpDef{name: "|", cmp: false},
+    OpDef{name: "#", cmp: false},
+    OpDef{name: "<<", cmp: false},
+    OpDef{name: ">>", cmp: false},
+    OpDef{name: "=", cmp: true},
+    OpDef{name: "<>", cmp: true},
+    OpDef{name: "<", cmp: true},
+    OpDef{name: "<=", cmp: true},
+    OpDef{name: ">", cmp: true},
+    OpDef{name: ">=", cmp: true},
+    OpDef{name: "||", cmp: false}
+]
+
+pub const OP_ADD = 0
+pub const OP_TPLUS = 6          // T-SQL's +
+pub const OP_EQ = 12
+pub const OP_GE = 17
+pub const OP_CAT = 18           // ||
+
+// An operator's code (its place in OPS); -1 none.
+pub fn opCode(name: &str): int {
+    match name {
+        "+" { return 0 }
+        "-" { return 1 }
+        "*" { return 2 }
+        "/" { return 3 }
+        "%" { return 4 }
+        "^" { return 5 }
+        "t+" { return 6 }
+        "&" { return 7 }
+        "|" { return 8 }
+        "#" { return 9 }
+        "<<" { return 10 }
+        ">>" { return 11 }
+        "=" { return 12 }
+        "<>" { return 13 }
+        "<" { return 14 }
+        "<=" { return 15 }
+        ">" { return 16 }
+        ">=" { return 17 }
+        "||" { return 18 }
+        else { return -1 }
+    }
+}
+
+// The text of an operator's code: OPS's name at that place, as literals (a
+// static text, no count taken per row).
+pub fn opName(code: int): &str {
+    match code {
+        0 { return "+" }
+        1 { return "-" }
+        2 { return "*" }
+        3 { return "/" }
+        4 { return "%" }
+        5 { return "^" }
+        6 { return "t+" }
+        7 { return "&" }
+        8 { return "|" }
+        9 { return "#" }
+        10 { return "<<" }
+        11 { return ">>" }
+        12 { return "=" }
+        13 { return "<>" }
+        14 { return "<" }
+        15 { return "<=" }
+        16 { return ">" }
+        17 { return ">=" }
+        18 { return "||" }
+        else { return "" }
+    }
+}
+
+// The unary operators.
+pub const UN_NEG = 0            // -
+pub const UN_NOT = 1            // NOT
+pub const UN_BITNOT = 2         // ~
+
+pub fn unCode(op: &str): int { return if op == "-" { UN_NEG } else if op == "~" { UN_BITNOT } else { UN_NOT } }
+
+// l op r for an operator's code, not AND or OR (eval's Expr.Bin after its
+// operands; || without arrays); zone: the evaluation's time zone, asked
+// for only where a value needs it.
+pub fn binOp(code: int, l: Val, r: Val, zone: &fn(): lexdb_time.Zone): Result[Val, DbErr] {
+    if code == OP_TPLUS {
+        // T-SQL's + (design/lexdb-tds.md S3): NULL with a NULL; two
+        // strings joined; a string with a number read as that number
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        let lt = kindOf(&l) == lexdb_sql.K_TEXT
+        let rt = kindOf(&r) == lexdb_sql.K_TEXT
+        if lt && rt { return Ok(Val.Text(lexdb_sql.text(&l) + lexdb_sql.text(&r))) }
+        if lt { return arith(&"+", &(try coerce(l, &lexdb_sql.oidType(kindOid(&r)))), &r) }
+        if rt { return arith(&"+", &l, &(try coerce(r, &lexdb_sql.oidType(kindOid(&l))))) }
+        return arith(&"+", &l, &r)
+    }
+    if code == OP_CAT {
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        if kindOf(&l) == lexdb_sql.K_BYTEA || kindOf(&r) == lexdb_sql.K_BYTEA {
+            let ty = lexdb_sql.oidType(lexdb_sql.OID_BYTEA)
+            let lb = try coerce(l, &ty)
+            let rb = try coerce(r, &ty)
+            match lb { Val.Bytes(p) { match rb { Val.Bytes(q) { return Ok(Val.Bytes(p + q)) } else {} } } else {} }
+        }
+        if isTstz(&l) || isTstz(&r) {
+            let z = zone()
+            return Ok(Val.Text(textZ(&l, &z) + textZ(&r, &z)))
+        }
+        return Ok(Val.Text(lexdb_sql.text(&l) + lexdb_sql.text(&r)))
+    }
+    if code >= OP_EQ && code <= OP_GE {
+        if isNull(&l) || isNull(&r) { return Ok(Val.Null) }
+        let c = if lexdb_sql.isTimeKind(kindOf(&l)) || lexdb_sql.isTimeKind(kindOf(&r)) { try compareTime(&l, &r, &zone()) } else { try compare(&l, &r) }
+        let t = match code - OP_EQ {
+            0 { c == 0 }
+            1 { c != 0 }
+            2 { c < 0 }
+            3 { c <= 0 }
+            4 { c > 0 }
+            else { c >= 0 }
+        }
+        return Ok(Val.Bool(t))
+    }
+    if lexdb_sql.isTimeKind(kindOf(&l)) || lexdb_sql.isTimeKind(kindOf(&r)) { return arithZ(opName(code), &l, &r, &zone()) }
+    return arith(opName(code), &l, &r)
+}
+
+// v cast to t, t not a reg type (the executor's: a session's catalog);
+// zone: the evaluation's, asked for only where a value needs it.
+pub fn castTo(v: Val, t: &lexdb_sql.TypeName, zone: &fn(): lexdb_time.Zone): Result[Val, DbErr] {
+    if t.oid == lexdb_sql.OID_BPCHAR && !isNull(&v) && kindOf(&v) == lexdb_sql.K_TEXT { return bpcharOf(&(lexdb_sql.text(&v)), t.len, true) }
+    if lexdb_sql.isTimeKind(t.kind) || t.kind == lexdb_sql.K_ARRAY || isTstz(&v) { return coerceZ(v, t, &zone()) }
+    // an explicit cast of a boolean to an integer type (PostgreSQL's true::int; T-SQL's CONVERT(int, bit)): 1 or 0
+    if t.kind == lexdb_sql.K_INT {
+        match v {
+            Val.Bool(b) { return Ok(Val.Int(if b { 1 } else { 0 })) }
+            else {}
+        }
+    }
+    return coerce(v, t)
+}

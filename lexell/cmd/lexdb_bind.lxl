@@ -9,6 +9,7 @@
 
 import "./lexdb_sql"
 import "./lexdb_dialect"
+import "./lexdb_ops"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -540,7 +541,7 @@ pub fn inReadOid(side: int, other: int): int {
 // An expression bound once for a statement's run: its columns by their
 // places in the row (not found by their names per row, as eval finds
 // them), its parameters as their values, each operator decoded to its
-// code (OPS) and each function bound once (FnRef: which of the executor's
+// code (lexdb_ops.OPS) and each function bound once (FnRef: which of the executor's
 // ways gives it, not a check of its name on every call), each operator's,
 // CASE's and call's type as exprOid labels it. lexdb_exec evaluates it
 // (bxEval, and per batch bGenVals) with eval's own operations, so it gives
@@ -553,69 +554,16 @@ pub type BX = closed {
     Const(Val)
     Col(int)                    // the row's value at this place
     Agg(int)                    // an aggregate's or window's value (#agg's slot)
-    Un(int, BX)                 // UN_*
+    Un(int, BX)                 // lexdb_ops.UN_*
     And(BX, BX)
     Or(BX, BX)
-    Op(int, int, BX, BX)        // a binary operator (OPS's place), its type
+    Op(int, int, BX, BX)        // a binary operator (lexdb_ops.OP_*), its type
     Cat(BX, BX, str)            // ||, with its function for arrays (arrayConcat; "" none)
     IsNull(BX, bool)
     Cast(BX, lexdb_sql.TypeName)
     Case([]BX, bool, int)       // CASE's conditions and values in turn; true: an ELSE last; its type
     Try(BX)                     // T-SQL's TRY_CAST: NULL for an error
     Call(FnRef, []BX, int)      // a bound function, its arguments, its type
-}
-
-// The unary operators.
-pub const UN_NEG = 0            // -
-pub const UN_NOT = 1            // NOT
-pub const UN_BITNOT = 2         // ~
-
-// The binary operators (not AND, OR, ||): each one's text, as the parse
-// tree and the executor's operations (binVal) name it. An operator's code
-// is its place here.
-pub type OpDef = value record {
-    pub name: str
-    pub cmp: bool               // a comparison: NULL with a NULL, a boolean
-}
-
-pub const OPS: []OpDef = [
-    OpDef{name: "+", cmp: false}, OpDef{name: "-", cmp: false}, OpDef{name: "*", cmp: false}, OpDef{name: "/", cmp: false},
-    OpDef{name: "%", cmp: false}, OpDef{name: "^", cmp: false}, OpDef{name: "t+", cmp: false}, OpDef{name: "&", cmp: false},
-    OpDef{name: "|", cmp: false}, OpDef{name: "#", cmp: false}, OpDef{name: "<<", cmp: false}, OpDef{name: ">>", cmp: false},
-    OpDef{name: "=", cmp: true}, OpDef{name: "<>", cmp: true}, OpDef{name: "<", cmp: true}, OpDef{name: "<=", cmp: true},
-    OpDef{name: ">", cmp: true}, OpDef{name: ">=", cmp: true}
-]
-
-// An operator's code (its place in OPS); -1 none.
-pub fn opCode(name: &str): int {
-    for i in 0..len(OPS) { if OPS[i].name == name { return i } }
-    return -1
-}
-
-// The text of an operator's code: OPS's name at that place, as literals (a static
-// text, no count taken per row).
-pub fn opName(code: int): &str {
-    match code {
-        0 { return "+" }
-        1 { return "-" }
-        2 { return "*" }
-        3 { return "/" }
-        4 { return "%" }
-        5 { return "^" }
-        6 { return "t+" }
-        7 { return "&" }
-        8 { return "|" }
-        9 { return "#" }
-        10 { return "<<" }
-        11 { return ">>" }
-        12 { return "=" }
-        13 { return "<>" }
-        14 { return "<" }
-        15 { return "<=" }
-        16 { return ">" }
-        17 { return ">=" }
-        else { return "" }
-    }
 }
 
 // How a bound function is evaluated (FnRef.way): FN_NONE, it does not
@@ -666,7 +614,7 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direc
         Expr.Unary(op, a) {
             let ba = bindIn(&a, cols, params, pt, direct, aggs, slots, ty)
             if ba.isNone() { return None }
-            let u = if op == "-" { UN_NEG } else if op == "~" { UN_BITNOT } else { UN_NOT }
+            let u = lexdb_ops.unCode(&op)
             return Some(BX.Un(u, ba.unwrap()))
         }
         Expr.Bin(op, a, b) {
@@ -681,7 +629,7 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, pt: &[]int, direc
                 let noTypes: []int = []
                 return Some(BX.Cat(ba.unwrap(), bb.unwrap(), arrayConcat(&a, &b, &noCols, &noTypes, ty)))
             }
-            let code = opCode(&op)
+            let code = lexdb_ops.opCode(&op)
             if code < 0 { return None }
             return Some(BX.Op(code, exprOid(x, cols, pt, ty), ba.unwrap(), bb.unwrap()))
         }

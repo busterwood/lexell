@@ -550,7 +550,7 @@ each slice merges with the suite, the 22 checksums and an A/B.
 | Slice | What | The old executor sees |
 |---|---|---|
 | 2a (built) | `lexdb_bind` owns expression typing (`exprOid` moved) and PostgreSQL's common-type rule as data; set operations, VALUES, CASE, COALESCE, GREATEST/LEAST typed from every branch | the same `Expr`, with the implicit casts made explicit (`Cast` nodes, constants folded) and the set operation's per-side conversions (`Sel.conv`) |
-| 2b | `BX`, `OpDef` and `lexdb_ops`; `cxOf` becomes the binder's `bindExpr`, `cEval` runs `BX`; delete `CX` and `FnB` | `BX` for compiled expressions; `eval` over `Expr` for the rest |
+| 2b (built) | `BX`, `OpDef` and `lexdb_ops`; `cxOf` becomes the binder's `bindExpr`, `cEval` runs `BX`; delete `CX` and `FnB` | `BX` for compiled expressions; `eval` over `Expr` for the rest |
 | 2c | `bCompile` builds its batch nodes from `BX` (the generic node is a `BX` step); constants pre-scaled and common subexpressions once per chunk | `BX` in both evaluators; `BNode` shrinks to the kernels |
 | 2d | Scope and naming: `resolve`/`resolveName`/`Scope` frames, star, GROUP BY and ORDER BY resolution move to the binder; columns by slot | `Query.cols` as `BCol`s; `eval`'s name lookup (`colIndex`) gone |
 | 2e | The binder emits the logical plan for SELECT and DML sources; `planSelect`/`buildQuery` read it instead of the `Stmt` | step 3 then turns it into the operator tree |
@@ -591,6 +591,42 @@ Not changed, found on the way: NULLIF's type (PostgreSQL types
 type (`numeric(10,2) UNION numeric(12,2)`), since exprOid has none; and
 an untyped literal in the first side of a set operation is typed only in a
 plain select list (`branchOid`).
+
+**Slice 2b as built.**
+
+- `lexdb_bind.BX` is the compiled scalar expression: `bindExpr` binds it
+  with `cxOf`'s rules (columns by slot, parameters as constants), and
+  `CX`, `FnB` and `cxOf` are gone.
+  - Its binary operators carry a code (`lexdb_ops.OPS`), its unary ones
+    `UN_*`, so nothing matches an operator's text per row.
+  - Each operator, CASE and call carries its type as `exprOid` labels it.
+  - A function binds through the executor's hook (`Typing.fnBind`:
+    exec's `fnRefOf`, which also lists what only `eval` evaluates) into
+    a `FnRef`.
+  - exec's `bxEval` and `callRef` evaluate it, as `cEval` and `callB`
+    did.
+- `lexdb_ops` (new, below the binder and the executor) holds the value
+  operations:
+  - conversion (`coerce`, `coerceZ` and their parts);
+  - comparison (`compare`, `compareZ`, `compareTime`);
+  - arithmetic (`arith`, `arithZ`, `arithTime`, `arithFloat`, `powOp`)
+    and `unaryVal`;
+  - the operator table, `binOp` (an operator by its code) and `castTo`
+    (a cast other than a reg type's).
+  - A session's zone reaches them as a closure, asked for only where a
+    value needs it, so no per-row copy is made.
+  - exec keeps its names as one-line forwarders. `binVal` and `castVal`
+    stay in exec as eval's entry points over the session (a reg cast
+    reads the catalog).
+- IN and = ANY over a subquery compare as `=` does
+  (`lexdb_bind.inReadOid`): an untyped or text side is read as the other
+  side's type. This fixes an untyped date parameter IN a date set and
+  `true IN (SELECT 't'::text)`.
+- Not yet:
+  - the function library (`callAt`, `callFn`, `callMisc`, `callTime`)
+    is not split per signature: it moves with 2c's generic node;
+  - `arith` still takes the operator's text inside;
+  - `bxEval` walks the tree rather than running flat steps.
 
 ### 4.5 Layer 5, optimizer (`lexdb_plan`)
 
