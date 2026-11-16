@@ -22,6 +22,14 @@
 //   results.
 // - A char(5) outer value compared in EXISTS with a text, a varchar and
 //   a char(8) column: as the join compares them.
+// - An outer value of each type (text, date, char, varchar, numeric,
+//   integer) against an inner column of another: EXISTS, NOT EXISTS and
+//   a scalar count as the join compares them.
+// - A filter on an outer char(3) column alone inside the subquery (per
+//   row, hashed): as the same filter written outside it.
+// - A derived table's outer column wider than its label (a UNION's int
+//   over a numeric, a date over a timestamp), run per row: as the filter
+//   without the subquery; a same-type char or float key stays hashed.
 // - How many ran as looked-up semi/anti joins, and over batches.
 // - EXPLAIN ANALYZE's counts with batches on and off (but "batches N",
 //   and the rows read: the batches read a key's whole range, the row
@@ -38,8 +46,11 @@
 // expect: looked up: 268 of 300, 268 over batches
 // expect: nested: 56 queries, 56 the same as with counts, batches off and on
 // expect: hashed: 4 queries, 4 hashed, 4 the same as with counts, batches off and on
-// expect: skewed: same: true, looked up: true
+// expect: skewed: same: true, looked up: true, counts as the row path's: true
 // expect: chars: 6 comparisons, 6 as the join compares
+// expect: reftypes: 13 comparisons, 13 as the join compares
+// expect: char filter: 6 queries, 6 as the filter outside, per row: true
+// expect: derived refs: 6 queries, 6 as without the subquery; hashed on char: true, on float: true
 // expect: counts q21: same: true
 // expect: counts q22: same: true
 // expect: plan q4: scan o: full scan; semi join l: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join
@@ -383,10 +394,25 @@ fn skewed(s: mut &lexdb_exec.Session) {
     }
     append(mut &outs, q(s, &"select count(*), sum(c.id) from c where c.id < 60 and (select count(*) from sk where sk.k = c.nat and sk.v > 990 + c.id % 20) > 0"))
     append(mut &outs, q(s, &"select count(*), sum(c.id) from c where c.id < 60 and (select count(*) from sk where sk.k = c.nat and sk.v > 990 + c.id % 20) = 0"))
+    // EXPLAIN ANALYZE's counts: the batch given up is not counted twice
+    // (the row path counts all of it), with grouping and with rows out
+    var cnts: []str = []
+    for sql in ["select count(*), sum(c.id) from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)",
+                "select c.id from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)",
+                "select count(*), sum(c.id) from c join n on n.id = c.nat where c.id < 60 and exists (select * from sk where sk.k = n.id and sk.v > 990 + c.id % 20)",
+                "select c.id, n.name from c join n on n.id = c.nat where c.id < 60 and exists (select * from sk where sk.k = n.id and sk.v > 990 + c.id % 20)"] {
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            append(mut &cnts, plan(&ex(s, &("explain analyze " + sql))))
+        }
+    }
     let m2 = q(s, &"set max_statement_mem = 0")
+    let counted = cnts[0] == cnts[1] && cnts[2] == cnts[3] && cnts[4] == cnts[5] && cnts[6] == cnts[7]
+    if !counted { for c in cnts { println("  " + c) } }
     let pl = ex(s, &"explain select count(*), sum(c.id) from c where c.id < 60 and exists (select * from sk where sk.k = c.nat and sk.v > 990 + c.id % 20)")
     let same = outs[0] == outs[2] && outs[2] == outs[4] && outs[1] == outs[3] && outs[3] == outs[5]
-    println("skewed: same: " + same.toStr() + ", looked up: " + strings.contains(&pl, "semi join sk: primary key range per row").toStr())
+    println("skewed: same: " + same.toStr() + ", looked up: " + strings.contains(&pl, "semi join sk: primary key range per row").toStr() +
+            ", counts as the row path's: " + counted.toStr())
     if !same { for o in outs { println("  " + o) } }
 }
 
@@ -419,6 +445,121 @@ fn chars(s: mut &lexdb_exec.Session) {
         }
     }
     println("chars: " + len(pairs).toStr() + " comparisons, " + same.toStr() + " as the join compares")
+}
+
+// An outer value of each type compared in a correlated subquery with an
+// inner column of another: as the join compares the two columns (the
+// outer value is its column's type, not an untyped parameter the inner
+// side's type reads), in EXISTS, NOT EXISTS and a scalar count, batches
+// off and on; and the hashed subquery (9.9) keys only types it compares
+// as = does (a timestamp with a date: by =, per row).
+fn reftypes(s: mut &lexdb_exec.Session) {
+    let c1 = q(s, &"create table ra (id int primary key, t text, d date, n int, c3 char(3), vc varchar(5), nu numeric(6,2))")
+    let c2 = q(s, &"insert into ra select i, case when i % 3 = 0 then 'x ' else 'x' || (i % 4) end, date '2024-01-01' + i % 9, i % 7, 'x' || (i % 4), 'x' || (i % 5), (i % 7) + case when i % 2 = 0 then 0.5 else 0 end from generate_series(1, 120) i")
+    let c3 = q(s, &"create table rb (id int primary key, c char(3), ts timestamp, i int, t text, nu numeric(8,3), f float8)")
+    let c4 = q(s, &"insert into rb select i, case when i % 5 = 0 then 'x' else 'x' || (i % 6) end, timestamp '2024-01-03 00:00:00' + (i % 4) * interval '12 hours', i % 5, '' || (i % 6), (i % 6) + 0.5, (i % 6) + 0.5 from generate_series(1, 40) i")
+    let pairs = ["rb.c = ra.t", "rb.c < ra.t", "rb.ts = ra.d", "rb.ts >= ra.d", "rb.t = ra.c3", "rb.c = ra.c3", "rb.c = ra.vc",
+                 "rb.nu = ra.nu", "rb.f = ra.nu", "rb.i = ra.n", "rb.i + 1 = ra.n + 1", "ra.t = rb.t", "rb.t = ra.n"]
+    var same = 0
+    for pr in pairs {
+        let j = q(s, &("select count(*), sum(id) from ra where ra.id in (select ra.id from ra join rb on " + pr + ")"))
+        let nj = q(s, &("select count(*), sum(id) from ra where ra.id not in (select ra.id from ra join rb on " + pr + ")"))
+        let cj = q(s, &("select ra.id, count(rb.id) from ra left join rb on " + pr + " group by ra.id order by 1"))
+        var ok = true
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            let e = q(s, &("select count(*), sum(id) from ra where exists (select 1 from rb where " + pr + ")"))
+            let ne = q(s, &("select count(*), sum(id) from ra where not exists (select 1 from rb where " + pr + ")"))
+            let cs = q(s, &("select ra.id, (select count(*) from rb where " + pr + ") from ra order by 1"))
+            if e != j || ne != nj || cs != cj {
+                ok = false
+                println("DIFFERENT (" + b + "): " + pr + ": " + e + " / " + ne + " join " + j + " / " + nj)
+            }
+        }
+        if ok { same += 1 }
+    }
+    println("reftypes: " + len(pairs).toStr() + " comparisons, " + same.toStr() + " as the join compares")
+}
+
+// A correlated subquery's filter on an outer char(3) column only (a.c =
+// 'x', padded 'x  '), run per row (an OR keeps it so), hashed, or in the
+// select list: against the filter written outside it, batches off and on.
+// (An untyped parameter compared 'x  ' with 'x' as texts: none matched.)
+fn charFilter(s: mut &lexdb_exec.Session) {
+    let c1 = q(s, &"create table fa (id int primary key, k int, x int, c char(3))")
+    let c2 = q(s, &"insert into fa select g, g % 50, g % 7 - 3, case when g % 5 = 0 then null else 'x' end from generate_series(1, 600) g")
+    let c3 = q(s, &"create table fb (id int primary key, k int, y int)")
+    let c4 = q(s, &"insert into fb select g, case when g % 11 = 0 then null else g % 60 end, case when g % 9 = 0 then null else g % 5 end from generate_series(1, 400) g")
+    let c5 = q(s, &"analyze fa")
+    let c6 = q(s, &"analyze fb")
+    let pairs = [["exists (select 1 from fb where fb.k = fa.k and fb.y <> fa.x and fa.c = 'x') or fa.id < 0",
+                  "fa.c = 'x' and exists (select 1 from fb where fb.k = fa.k and fb.y <> fa.x)"],
+                 ["exists (select 1 from fb where fb.k = fa.k and fa.c = 'x') or fa.id < 0",
+                  "fa.c = 'x' and exists (select 1 from fb where fb.k = fa.k)"],
+                 ["fa.k in (select fb.k from fb where fa.c = 'x') or fa.id < 0",
+                  "fa.c = 'x' and fa.k in (select fb.k from fb)"],
+                 ["exists (select 1 from fb where fb.k = fa.k and fb.y <> fa.x and fa.c = 'x')",
+                  "fa.c = 'x' and exists (select 1 from fb where fb.k = fa.k and fb.y <> fa.x)"],
+                 ["fa.k in (select fb.k from fb where fa.c = 'x')",
+                  "fa.c = 'x' and fa.k in (select fb.k from fb)"],
+                 ["(select count(*) from fb where fb.k = fa.k and fa.c < 'y') > 0",
+                  "fa.c < 'y' and (select count(*) from fb where fb.k = fa.k) > 0"]]
+    var same = 0
+    for pr in pairs {
+        var ok = true
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            let a1 = q(s, &("select count(*), sum(fa.id) from fa where " + pr[0]))
+            let a2 = q(s, &("select count(*), sum(fa.id) from fa where " + pr[1]))
+            if a1 != a2 {
+                ok = false
+                println("DIFFERENT (" + b + "): " + pr[0] + ": " + a1 + " against " + a2)
+            }
+        }
+        if ok { same += 1 }
+    }
+    let pl = q(s, &("explain select count(*) from fa where " + pairs[0][0]))
+    println("char filter: " + len(pairs).toStr() + " queries, " + same.toStr() + " as the filter outside, per row: " + strings.contains(&pl, "per row, on").toStr())
+}
+
+// An outer column of a derived table whose rows are of wider types than
+// its label (a UNION's int over a numeric, a date over a timestamp, CASE
+// and GREATEST): run per row, against the same filter without the
+// subquery. (Typed as its label, 2.5 became 3.) And a hashed scalar
+// subquery keyed on one type on both sides (char(4), float8) stays hashed.
+fn derivedRefs(s: mut &lexdb_exec.Session) {
+    let pairs = [["select count(*) from (select 1 as x union all select 2.5) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select 1 as x union all select 2.5) o where o.x = 2.5"],
+                 ["select count(*) from (select 1 as x union all select 2.5) o where (select o.x) = 2.5",
+                  "select count(*) from (select 1 as x union all select 2.5) o where o.x = 2.5"],
+                 ["select x, (select x) from (select 1 as x union all select 2.5) o order by 1",
+                  "select x, x from (select 1 as x union all select 2.5) o order by 1"],
+                 ["select count(*) from (select date '2024-01-01' as x union all select timestamp '2024-01-01 05:00') o where exists (select 1 where o.x > date '2024-01-01')",
+                  "select count(*) from (select date '2024-01-01' as x union all select timestamp '2024-01-01 05:00') o where o.x > date '2024-01-01'"],
+                 ["select count(*) from (select case when g = 1 then 1 else 2.5 end as x from generate_series(1, 2) g) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select case when g = 1 then 1 else 2.5 end as x from generate_series(1, 2) g) o where o.x = 2.5"],
+                 ["select count(*) from (select greatest(g, 2.5) as x from generate_series(1, 2) g) o where exists (select 1 where o.x = 2.5)",
+                  "select count(*) from (select greatest(g, 2.5) as x from generate_series(1, 2) g) o where o.x = 2.5"]]
+    var same = 0
+    for pr in pairs {
+        var ok = true
+        for b in ["off", "on"] {
+            let o = q(s, &("set lexdb_batch = " + b))
+            let a1 = q(s, &pr[0])
+            let a2 = q(s, &pr[1])
+            if a1 != a2 {
+                ok = false
+                println("DIFFERENT (" + b + "): " + pr[0] + ": " + a1 + " against " + a2)
+            }
+        }
+        if ok { same += 1 }
+    }
+    let c1 = q(s, &"create table hk (id int primary key, c char(4), f float8)")
+    let c2 = q(s, &"insert into hk select g, 'k' || (g % 9), (g % 9) + 0.5 from generate_series(1, 200) g")
+    let pc = ex(s, &"explain select sum((select max(h2.id) from hk h2 where h2.c = hk.c and h2.id % 2 = 0)) from hk")
+    let pf = ex(s, &"explain select sum((select max(h2.id) from hk h2 where h2.f = hk.f and h2.id % 2 = 0)) from hk")
+    println("derived refs: " + len(pairs).toStr() + " queries, " + same.toStr() + " as without the subquery; hashed on char: " +
+            strings.contains(&pc, "hashed on").toStr() + ", on float: " + strings.contains(&pf, "hashed on").toStr())
 }
 
 fn main() {
@@ -470,6 +611,9 @@ fn main() {
         hashed(mut &s)
         skewed(mut &s)
         chars(mut &s)
+        reftypes(mut &s)
+        charFilter(mut &s)
+        derivedRefs(mut &s)
         let q21 = "select s.name, count(*) from l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok " +
                   "where n.name = 'N2' and o.st = 'F' and l1.rd > l1.cd " +
                   "and exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp) " +

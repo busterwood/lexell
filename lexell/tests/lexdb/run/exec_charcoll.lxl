@@ -1,0 +1,82 @@
+// lexdb_exec: a char(n) column's collation (L2) counts as a text's. A
+// case-insensitive char(5) column against a case-insensitive text column
+// holding the same values (no trailing blanks): every comparison, LIKE,
+// IN, BETWEEN, a join, grouping, DISTINCT and ORDER BY give the same
+// rows, batches off and on. (A char column ignored its collation: 'AB'
+// was not = 'ab', and grouped apart from it.)
+// expect: 13 queries, 13 the same as the text column's, batches off and on
+// expect: c = 'ab', id <= 30: 7, as text: 7
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(7), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(7)
+        let c1 = q(mut &s, &"create table w (id int primary key, c char(5) collate \"SQL_Latin1_General_CP1_CI_AS\", t text collate \"SQL_Latin1_General_CP1_CI_AS\")")
+        let words = ["ab", "AB", "Ab", "aB", "abc", "ABC", "a", "A", "b", "B", "zz", "Zz", "ab c"]
+        var rows: []str = []
+        for i in 1..401 {
+            let x = words[r.below(len(words))]
+            append(mut &rows, "(" + i.toStr() + ", '" + x + "', '" + x + "')")
+        }
+        let i1 = q(mut &s, &("insert into w values " + strings.join(&rows, ", ")))
+        // X: the column compared (c, then t)
+        let qs = ["select count(*) from w where X = 'ab'",
+                  "select count(*) from w where X <> 'AB'",
+                  "select count(*) from w where X < 'ab'",
+                  "select count(*) from w where X >= 'B'",
+                  "select count(*) from w where X like 'ab%'",
+                  "select count(*) from w where X in ('ab', 'zz')",
+                  "select count(*) from w where X between 'aa' and 'ab'",
+                  "select count(*) from w a join w b on a.X = b.t where a.id < 50",
+                  "select upper(X), count(*) from w group by X order by 1",
+                  "select count(distinct X) from w",
+                  "select upper(X), min(id) from w group by X having count(*) > 30 order by 1",
+                  "select count(*) from w where exists (select 1 from w v where v.X = w.t and v.id = w.id + 1)",
+                  "select id from w where X = 'ZZ' order by id limit 5"]
+        var same = 0
+        for x in qs {
+            var outs: []str = []
+            for b in ["off", "on"] {
+                let o = q(mut &s, &("set lexdb_batch = " + b))
+                append(mut &outs, q(mut &s, &strings.replaceAll(&x, &"X", "c")))
+                append(mut &outs, q(mut &s, &strings.replaceAll(&x, &"X", "t")))
+            }
+            if outs[0] == outs[1] && outs[1] == outs[2] && outs[2] == outs[3] { same += 1 } else {
+                println("DIFFERENT: " + x)
+                for o in outs { println("  " + o) }
+            }
+        }
+        println(len(qs).toStr() + " queries, " + same.toStr() + " the same as the text column's, batches off and on")
+        println("c = 'ab', id <= 30: " + q(mut &s, &"select count(*) from w where c = 'ab' and id <= 30") + ", as text: " +
+                q(mut &s, &"select count(*) from w where t = 'ab' and id <= 30"))
+        return 0
+    }).unwrap()
+}
