@@ -33,6 +33,7 @@ import "unicode"
 import "math"
 import "base64"
 import "./lexdb_rows"
+import "./lexdb_vec"
 import "./lexdb_like"
 import "./lexdb_store"
 import "./lexdb_catalog"
@@ -23414,6 +23415,26 @@ const BT_INT = 0        // an expression's type in a batch
 const BT_BOOL = 1
 const BT_NULL = 2       // a NULL constant: any type
 const BT_OTHER = 3      // a column of another type: IS NULL and count only
+// a numeric as its units at a scale (lexdb_rows.BK_DEC): BT_DEC + the
+// scale; only where the operator asked for them (bCompileD's dec)
+const BT_DEC = 16
+
+fn isDecT(t: int): bool { return t >= BT_DEC }
+// an operand of a numeric operation: its scale (an integer's 0)
+fn decSc(t: int): int { return if t >= BT_DEC { t - BT_DEC } else { 0 } }
+
+// A batch's numeric result past its units (lexdb_vec's false): the
+// operator gives way to the row path, which computes it in Decimal. Never
+// a client's error.
+fn decSpill(): DbErr { return e("XXDEC", "a numeric past a batch's units") }
+fn isSpill(x: &DbErr): bool { return x.state == "XXDEC" }
+
+// Grouped queries run over batches with numerics as units, and those that
+// gave way to the row path (a result past its units), for the tests.
+var decRuns: int = 0
+var decSpills: int = 0
+
+pub fn decCounts(): []int { return [decRuns, decSpills] }
 
 const BA_STAR = 0       // count(*)
 const BA_COUNT = 1
@@ -23472,6 +23493,10 @@ type BNode = closed {
     // true (eval's truth), as the row path checks one; or an output's or a
     // key's values (OutPlan's src -2: bGenVals)
     Gen(BGen)
+    // numerics as units (lexdb_vec): + - * as 0 to 2 of a at scale sa and
+    // b at sb (DArith(op, a, sa, b, sb)); = <> < <= > >= as 0 to 5
+    DArith(int, BNode, int, BNode, int)
+    DCmp(int, BNode, int, BNode, int)
 }
 
 // A compiled expression over a batch (9.108): per row, the columns it
@@ -23505,6 +23530,9 @@ type BSpec = record {
     // this is (9.52): its values kept per group as the row path keeps
     // them (bAccVal); -1 an integer aggregate
     vcol: int
+    // the scale of a numeric argument as units (BT_DEC): its sums in 128
+    // bits (lexdb_vec.sum), its minima and maxima as units; -1 none
+    dsc: int
 }
 
 fn colKind(c: &lexdb_sql.ColDef): int { return lexdb_rows.colKind(c) }
@@ -23552,7 +23580,11 @@ fn intLike(t: int): bool { return t == BT_INT || t == BT_NULL }
 fn boolLike(t: int): bool { return t == BT_BOOL || t == BT_NULL }
 
 // x over a batch; None: not one the batches evaluate (the row path does).
-fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BComp] {
+fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BComp] { return bCompileD(x, q, kinds, env, base, false) }
+
+// bCompile; dec: numerics as units (kinds may hold BK_DEC columns, and a
+// numeric constant is one), else a numeric is a value as any other.
+fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool): Option[BComp] {
     if bConst(x) {
         // its value once; an error is left for the row path to give
         match eval(x, env) {
@@ -23561,6 +23593,13 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
                     Val.Int(i) { return Some(BComp{n: BNode.Const(i, false), typ: BT_INT}) }
                     Val.Bool(b) { return Some(BComp{n: BNode.Const(if b { 1 } else { 0 }, false), typ: BT_BOOL}) }
                     Val.Null { return Some(BComp{n: BNode.Const(0, true), typ: BT_NULL}) }
+                    Val.Num(d) {
+                        if !dec || d.scale() > lexdb_vec.MAX_SCALE { return None }
+                        match lexdb_rows.decUnits(&d, d.scale()) {
+                            Some(u) { return Some(BComp{n: BNode.Const(u, false), typ: BT_DEC + d.scale()}) }
+                            None { return None }
+                        }
+                    }
                     else { return None }
                 }
             }
@@ -23577,23 +23616,26 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
             // batch's first (the first table's own columns: optimizer 33,
             // it may not be FROM's first; a joined batch's: all, 0)
             let at = i - base
+            if lexdb_rows.isDecKind(k) { return Some(BComp{n: BNode.Col(at), typ: BT_DEC + lexdb_rows.decScale(k)}) }
             return Some(BComp{n: BNode.Col(at), typ: if k == BK_INT { BT_INT } else if k == BK_BOOL { BT_BOOL } else { BT_OTHER }})
         }
         Expr.Unary(op, a) {
-            let ca = bCompile(&a, q, kinds, env, base)
+            let ca = bCompileD(&a, q, kinds, env, base, dec)
             if ca.isNone() { return None }
             let c = ca.unwrap()
             let ty = c.typ
             if op == "not" && boolLike(ty) { return Some(BComp{n: BNode.Not(takeN(c)), typ: BT_BOOL}) }
             if op == "-" && intLike(ty) { return Some(BComp{n: BNode.Neg(takeN(c)), typ: BT_INT}) }
+            // a numeric's negation keeps its scale: 0 - x
+            if op == "-" && isDecT(ty) { return Some(BComp{n: BNode.DArith(1, BNode.Const(0, false), 0, takeN(c), decSc(ty)), typ: ty}) }
             return None
         }
         Expr.Bin(op, a, b) {
             let vc = bValCmp(&op, &a, &b, q, kinds, env, base)
             if vc.isSome() { return vc }
-            let ca = bCompile(&a, q, kinds, env, base)
+            let ca = bCompileD(&a, q, kinds, env, base, dec)
             if ca.isNone() { return None }
-            let cb = bCompile(&b, q, kinds, env, base)
+            let cb = bCompileD(&b, q, kinds, env, base, dec)
             if cb.isNone() { return None }
             let lc = ca.unwrap()
             let rc = cb.unwrap()
@@ -23601,6 +23643,20 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
             let rt = rc.typ
             let l = takeN(lc)
             let r = takeN(rc)
+            if (isDecT(lt) || isDecT(rt)) && (isDecT(lt) || intLike(lt)) && (isDecT(rt) || intLike(rt)) {
+                // a numeric with a numeric or an integer (read as a
+                // numeric of scale 0, as arith reads it): by value; + and
+                // - at the larger scale, * at the sum of the two (Decimal's
+                // display scales)
+                let sa = decSc(lt)
+                let sb = decSc(rt)
+                let dc = cmpCode(&op)
+                if dc >= 0 { return Some(BComp{n: BNode.DCmp(dc, l, sa, r, sb), typ: BT_BOOL}) }
+                let da = arithCode(&op)
+                if da == 0 || da == 1 { return Some(BComp{n: BNode.DArith(da, l, sa, r, sb), typ: BT_DEC + max(sa, sb)}) }
+                if da == 2 && sa + sb <= lexdb_vec.MAX_SCALE { return Some(BComp{n: BNode.DArith(2, l, sa, r, sb), typ: BT_DEC + sa + sb}) }
+                return None
+            }
             if op == "and" || op == "or" {
                 if !boolLike(lt) || !boolLike(rt) { return None }
                 if op == "and" { return Some(BComp{n: BNode.And(l, r), typ: BT_BOOL}) }
@@ -23617,7 +23673,7 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
             return None
         }
         Expr.IsNull(a, neg) {
-            let ca = bCompile(&a, q, kinds, env, base)
+            let ca = bCompileD(&a, q, kinds, env, base, dec)
             if ca.isNone() { return None }
             return Some(BComp{n: BNode.IsNull(takeN(ca.unwrap()), neg), typ: BT_BOOL})
         }
@@ -24093,6 +24149,18 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             var out = bvec(m)
             for j in 0..m { if truth(&vs[j]) == Some(true) { out.v[j] = 1 } }
             return Ok(out)
+        }
+        BNode.DArith(op, x, sa, y, sb) {
+            var a = try bEval(&x, b, idx)
+            let c = try bEval(&y, b, idx)
+            if !lexdb_vec.arith(op, mut &a, sa, &c, sb) { return Err(decSpill()) }
+            return Ok(a)
+        }
+        BNode.DCmp(op, x, sa, y, sb) {
+            var a = try bEval(&x, b, idx)
+            let c = try bEval(&y, b, idx)
+            lexdb_vec.cmp(op, mut &a, sa, &c, sb)
+            return Ok(a)
         }
     }
 }
@@ -24975,7 +25043,8 @@ fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
     for i in 0..len(kinds) {
         if !needCol[i] || len(b.cols[i].nul) == 0 || b.cols[i].nul[r] { continue }
         let k = kinds[i]
-        out[i] = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) } else { b.vals[i][r] }
+        out[i] = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) }
+                 else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r] }
     }
     return out
 }
@@ -24991,6 +25060,7 @@ fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     }
     if kv.nul[j] { return Val.Null }
     if c.typ == BT_BOOL { return Val.Bool(kv.v[j] == 1) }
+    if isDecT(c.typ) { return lexdb_rows.decVal(kv.v[j], decSc(c.typ)) }
     return Val.Int(kv.v[j])
 }
 
@@ -25027,6 +25097,14 @@ fn bColsOf(n: &BNode, used: mut &[]bool) {
             used[b] = true
         }
         BNode.Gen(g) { for c in g.cols { used[c] = true } }
+        BNode.DArith(_, a, _, b, _) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
+        BNode.DCmp(_, a, _, b, _) {
+            bColsOf(&a, used)
+            bColsOf(&b, used)
+        }
     }
 }
 
@@ -25034,6 +25112,7 @@ fn bColsOf(n: &BNode, used: mut &[]bool) {
 fn bValAt(b: &Batch, c: int, k: int, r: int): Val {
     if k == BK_INT { return Val.Int(b.cols[c].v[r]) }
     if k == BK_BOOL { return Val.Bool(b.cols[c].v[r] == 1) }
+    if lexdb_rows.isDecKind(k) { return lexdb_rows.decVal(b.cols[c].v[r], lexdb_rows.decScale(k)) }
     return b.vals[c][r]
 }
 
@@ -25058,6 +25137,17 @@ fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int, av
         }
         cn[g] += 1
     }
+    return Ok(Unit{})
+}
+
+// Adds the rows (gids: their groups) of a batch to a numeric aggregate's
+// counts and sums as units (sp.dsc), in 128 bits.
+fn bAccDec(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: mut &[]int, su: mut &[]i128): Result[Unit, DbErr] {
+    let a = match sp.arg {
+        Some(x) { try bEval(&x, b, rows) }
+        None { bvec(0) }
+    }
+    lexdb_vec.sum(&a, gids, one, cn, su)
     return Ok(Unit{})
 }
 
@@ -27242,6 +27332,22 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
 // the batches run (nothing done; the row path runs it).
 fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
                gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
+    // a numeric past its units gives way to the row path, from the start
+    // (the groups are made at the end: none yet)
+    let h0: int = held + 0
+    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max) {
+        Ok(x) { return Ok(x) }
+        Err(x) {
+            if !isSpill(&x) { return Err(x) }
+            held = h0
+            decSpills += 1
+            return Ok(false)
+        }
+    }
+}
+
+fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
+                 gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
     let q = &sel.q
     if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) == 0 || len(sel.gsets) > 0 { return Ok(false) }
     // subqueries: only semi-joins' (levels, run before: 9.104)
@@ -27272,8 +27378,10 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     } else if lv.first != 0 || len(q.cols) != len(lv.t.cols) {
         return Ok(false)
     }
+    // one table's batches hold a numeric(p, s) as its units (BK_DEC)
+    let dec = !jn
     var kinds: []int = []
-    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, colKind(&c)) } }
+    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, lexdb_rows.decColKind(&c)) } }
     var needCol: []bool = []
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     let noAggs: []Val = []
@@ -27285,7 +27393,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         conds = replace(mut &lp0[0].conds, [])
     } else {
         for x in lv.cond {
-            let c = bCompile(&x, q, &kinds, &env, 0)
+            let c = bCompileD(&x, q, &kinds, &env, 0, dec)
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
             if !boolLike(cc.typ) { return Ok(false) }
@@ -27297,7 +27405,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     for sp in sel.specs { if sp.kind != lexdb_sql.COLL_EXACT { return Ok(false) } }
     var keys: []BComp = []
     for x in sel.groupBy {
-        let c = bCompile(&x, q, &kinds, &env, 0)
+        let c = bCompileD(&x, q, &kinds, &env, 0, dec)
         if c.isNone() { return Ok(false) }
         let cc = c.unwrap()
         if cc.typ == BT_OTHER {
@@ -27318,12 +27426,16 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         if kind < 0 { return Ok(false) }
         var arg: Option[BNode] = None
         var vcol = -1
+        var dsc = -1
         if kind != BA_STAR {
             if len(sp.args) != 1 { return Ok(false) }
-            let c = bCompile(&sp.args[0], q, &kinds, &env, 0)
+            let c = bCompileD(&sp.args[0], q, &kinds, &env, 0, dec)
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
-            if kind != BA_COUNT && cc.typ != BT_INT {
+            if kind != BA_COUNT && isDecT(cc.typ) {
+                // a numeric as units: its sum in 128 bits, its min or max as units
+                dsc = decSc(cc.typ)
+            } else if kind != BA_COUNT && cc.typ != BT_INT {
                 // min or max of a column of values, sum or avg of a numeric one
                 let vc = bValCol(&sp.args[0], q, &kinds, 0)
                 if vc < 0 { return Ok(false) }
@@ -27336,7 +27448,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         var filt: Option[BNode] = None
         match sp.filter {
             Some(fx) {
-                let c = bCompile(&fx, q, &kinds, &env, 0)
+                let c = bCompileD(&fx, q, &kinds, &env, 0, dec)
                 if c.isNone() { return Ok(false) }
                 let cc = c.unwrap()
                 if !boolLike(cc.typ) { return Ok(false) }
@@ -27344,7 +27456,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             }
             None {}
         }
-        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol})
+        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol, dsc: dsc})
     }
     // With no GROUP BY no column is used outside an aggregate (42803): the
     // columns read are those of the conditions and the aggregates only
@@ -27409,7 +27521,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     }
     // where each column used is in a stored row
     var tkinds: []int = []
-    for c in t.cols { append(mut &tkinds, colKind(&c)) }
+    for c in t.cols { append(mut &tkinds, if dec { lexdb_rows.decColKind(&c) } else { colKind(&c) }) }
     var bp = emptyBPlan()
     if jn {
         bp = replace(mut &lp0[0].bp, emptyBPlan())
@@ -27437,11 +27549,13 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     var asum: [][]int = []
     var amm: [][]int = []
     var aval: [][]Val = []              // per value aggregate (vcol) and group: its sum, min or max
+    var adec: [][]i128 = []             // per numeric aggregate as units (dsc) and group: its sum
     for i in 0..ns {
         append(mut &an, [])
         append(mut &asum, [])
         append(mut &amm, [])
         append(mut &aval, [])
+        append(mut &adec, [])
     }
     var byInt: Map[int, int] = newMap()
     var byKey: Map[str, int] = newMap()
@@ -27517,6 +27631,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                         append(mut &asum[i], 0)
                         append(mut &amm[i], 0)
                         append(mut &aval[i], Val.Null)
+                        append(mut &adec[i], i128(0))
                     }
                 }
             } else {
@@ -27578,6 +27693,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             append(mut &asum[i], 0)
                             append(mut &amm[i], 0)
                             append(mut &aval[i], Val.Null)
+                            append(mut &adec[i], i128(0))
                         }
                         if textCol >= 0 {
                             if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
@@ -27603,10 +27719,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                             append(mut &g2, gid[j])
                         }
                         if sp.vcol >= 0 { try bAccVal(sp, &b, &r2, &g2, mut &an[si], mut &aval[si]) }
+                        else if sp.dsc >= 0 && (sp.kind == BA_SUM || sp.kind == BA_AVG) { try bAccDec(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &adec[si]) }
                         else { try bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
                     }
                     None {
                         if sp.vcol >= 0 { try bAccVal(sp, &b, &idx, &gid, mut &an[si], mut &aval[si]) }
+                        else if sp.dsc >= 0 && (sp.kind == BA_SUM || sp.kind == BA_AVG) { try bAccDec(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &adec[si]) }
                         else { try bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
                     }
                 }
@@ -27622,6 +27740,16 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             if an[si][g] > 0 && specs[si].vcol >= 0 {
                 if kd == BA_SUM || kd == BA_AVG { accs[si].sum = aval[si][g] }
                 if kd == BA_MIN || kd == BA_MAX { accs[si].val = aval[si][g] }
+            } else if an[si][g] > 0 && specs[si].dsc >= 0 {
+                // as the row path's Decimal sum of the same values (display scale dsc)
+                let ds = specs[si].dsc
+                if kd == BA_SUM || kd == BA_AVG {
+                    match lexdb_vec.sumVal(adec[si][g], ds) {
+                        Some(v) { accs[si].sum = v }
+                        None { return Err(decErr()) }
+                    }
+                }
+                if kd == BA_MIN || kd == BA_MAX { accs[si].val = lexdb_rows.decVal(amm[si][g], ds) }
             } else if an[si][g] > 0 {
                 if kd == BA_SUM || kd == BA_AVG { accs[si].sum = Val.Int(asum[si][g]) }
                 if kd == BA_MIN || kd == BA_MAX { accs[si].val = Val.Int(amm[si][g]) }
@@ -27630,6 +27758,12 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
         append(mut &gs.accs, accs)
     }
     gs.firsts = firsts
+    if dec {
+        var anyDec = false
+        for sp in specs { if sp.dsc >= 0 { anyDec = true } }
+        for i in 0..len(bp.kinds) { if bp.needCol[i] && lexdb_rows.isDecKind(bp.kinds[i]) { anyDec = true } }
+        if anyDec { decRuns += 1 }
+    }
     rs.cnt[0].starts += 1
     rs.cnt[0].read += nRead
     rs.cnt[0].joined += nJoined

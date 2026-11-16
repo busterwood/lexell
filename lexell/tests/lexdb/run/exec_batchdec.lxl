@@ -1,0 +1,195 @@
+// lexdb_exec: grouped queries over one table's batches with numeric(p, s)
+// columns read as units (lexdb_rows.BK_DEC, lexdb_vec; design/
+// lexdb-tpch-perf.md 4.1): sums and averages in 128 bits, products and
+// sums of scales, numeric constants of other scales, integers mixed in,
+// comparisons by value, min and max, FILTER, NULLs. Each query is run three
+// ways: SET lexdb_batch = off (the row path's Decimal arithmetic, the
+// reference), on, and on over a copy of the table whose columns are plain
+// numeric (no typmod: never units, the batches' values path), and the
+// three must agree, display scale included.
+// - Random queries over 3,000 rows (three batches), some NULL, of
+//   numeric(15,2), numeric(12,4), numeric(5,0), int and char(1) keys.
+// - TPC-H's q1 and q6 shapes.
+// - A numeric past its units: a product past 2^63 gives way to the row
+//   path (the same result, exactly); a sum past 2^63 is kept in 128 bits.
+// - A column whose values are not all of its scale (a typmod-less numeric)
+//   and a numeric(20,2) (past 18 digits) stay values.
+// - Again in a transaction with its own writes not committed.
+// expect: committed: 400 queries, 400 the same three ways, as units 400
+// expect: fixed: 6 queries, 6 the same three ways, as units 6
+// expect: past units: 3 queries, 3 the same three ways, gave way 2
+// expect: not units: 2 queries, 2 the same three ways, as units 0
+// expect: in a transaction: 100 queries, 100 the same three ways, as units 100
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn two(n: int): str { return if n < 10 { "0" + n.toStr() } else { n.toStr() } }
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(12) == 0 { "null" } else { v } }
+
+// units u at scale sc as a literal
+fn lit(u: int, sc: int): str {
+    let neg = u < 0
+    let a = if neg { -u } else { u }
+    var p = 1
+    for i in 0..sc { p *= 10 }
+    var frac = (a % p).toStr()
+    while len(frac) < sc { frac = "0" + frac }
+    let s = if sc == 0 { (a / p).toStr() } else { (a / p).toStr() + "." + frac }
+    return if neg { "-" + s } else { s }
+}
+
+fn row(r: mut &lexdb_base.Rng, id: int): str {
+    let vs: []str = [id.toStr(), "'" + pick(r, &["A", "N", "R"]) + "'", "'" + pick(r, &["F", "O"]) + "'",
+                     maybe(r, lit(r.below(10000000) - 1000000, 2)),         // a: numeric(15,2)
+                     maybe(r, lit(r.below(11), 2)),                         // b: numeric(15,2), a discount
+                     maybe(r, lit(r.below(2000000) - 1000000, 4)),          // c: numeric(12,4)
+                     maybe(r, (r.below(99999) - 50000).toStr()),            // d: numeric(5,0)
+                     maybe(r, (r.below(200) - 100).toStr()),                // i: int
+                     "'1998-0" + (1 + r.below(9)).toStr() + "-" + two(1 + r.below(28)) + "'"]
+    return "(" + strings.join(&vs, ", ") + ")"
+}
+
+fn numX(): []str { return ["a", "b", "c", "d", "a * (1 - b)", "a * (1 - b) * (1 + b)", "a + c", "c - a", "-a", "a * 2.5", "a - 0.005",
+                           "a * i", "i * c", "d * b", "c * c", "a + d", "1 - b", "b * 100", "a * 0", "-(c * 3)", "a - a", "d - 0.1",
+                           "i + 0.25", "c * b * b"] }
+fn condX(): []str { return ["a > 0", "b between 0.05 and 0.07", "a < 24", "c >= -12.5", "d <> 7", "a * (1 - b) > 1000", "i < 0.5",
+                            "a = c", "b <= 0.03 and i > 10", "a is null", "c is not null", "a > 5000 or b = 0.1", "not (a < c)",
+                            "d * b < 100", "e <= '1998-06-02'", "i * 2 >= a", "a + 0.001 > 0"] }
+
+fn aggX(r: mut &lexdb_base.Rng): str {
+    let f = pick(r, &["sum", "sum", "avg", "min", "max", "count"])
+    let x = pick(r, &numX())
+    if r.below(6) == 0 { return f + "(" + x + ") filter (where " + pick(r, &condX()) + ")" }
+    return f + "(" + x + ")"
+}
+
+fn query(r: mut &lexdb_base.Rng, t: &str): str {
+    var aggs: []str = []
+    let n = 1 + r.below(4)
+    for i in 0..n { append(mut &aggs, aggX(r)) }
+    let w = if r.below(3) == 0 { "" } else { " where " + pick(r, &condX()) }
+    let g = r.below(4)
+    if g == 0 { return "select " + strings.join(&aggs, ", ") + " from " + t + w }
+    if g == 1 { return "select f, " + strings.join(&aggs, ", ") + " from " + t + w + " group by f order by f" }
+    if g == 2 { return "select f, s, " + strings.join(&aggs, ", ") + " from " + t + w + " group by f, s order by f, s" }
+    return "select i % 3, " + strings.join(&aggs, ", ") + " from " + t + w + " group by i % 3 order by 1"
+}
+
+// sql on t, without batches, with them, and on u (plain numeric): 0 the
+// three the same (printed if not); units: whether the batches read t's
+// numerics as units (decCounts' first went up).
+fn three(s: mut &lexdb_exec.Session, sql: &str, units: mut &int): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let d0 = lexdb_exec.decCounts()[0]
+    let on = q(s, sql)
+    if lexdb_exec.decCounts()[0] > d0 { units += 1 }
+    let vals = q(s, &(strings.replaceAll(sql, " from t", " from u")))
+    if off == on && on == vals { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  values:  " + vals)
+    return false
+}
+
+fn run(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng, label: &str, n: int) {
+    var same = 0
+    var units = 0
+    for i in 0..n { if three(s, &query(r, &"t"), mut &units) { same += 1 } }
+    println(label + ": " + n.toStr() + " queries, " + same.toStr() + " the same three ways, as units " + units.toStr())
+}
+
+fn fixed(s: mut &lexdb_exec.Session, label: &str, qs: &[]str) {
+    var same = 0
+    var units = 0
+    let sp0 = lexdb_exec.decCounts()[1]
+    for x in qs {
+        let u0 = units
+        if three(s, &x, mut &units) { same += 1 }
+        if units == u0 && label == "fixed" { println("  not as units: " + x) }
+    }
+    let gave = lexdb_exec.decCounts()[1] - sp0
+    println(label + ": " + len(qs).toStr() + " queries, " + same.toStr() + " the same three ways, " +
+            (if label == "past units" { "gave way " + gave.toStr() } else { "as units " + units.toStr() }))
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(53)
+        let c1 = q(mut &s, &"create table t (id int primary key, f char(1), s char(1), a numeric(15,2), b numeric(15,2), c numeric(12,4), d numeric(5,0), i int, e date)")
+        let c2 = q(mut &s, &"create table u (id int primary key, f char(1), s char(1), a numeric, b numeric, c numeric, d numeric, i int, e date)")
+        var id = 1
+        for chunk in 0..30 {
+            var rows: []str = []
+            for i in 0..100 {
+                append(mut &rows, row(mut &r, id))
+                id += 1
+            }
+            let ins = q(mut &s, &("insert into t values " + strings.join(&rows, ", ")))
+            if ins != "INSERT 0 100" { println("insert: " + ins) }
+        }
+        // u: t's values, each at its own display scale (no typmod)
+        let c3 = q(mut &s, &"insert into u select * from t")
+        if c3 != "INSERT 0 3000" { println("copy: " + c3) }
+        let ck = q(mut &s, &"checkpoint")
+        run(mut &s, mut &r, &"committed", 400)
+        fixed(mut &s, &"fixed", &["select f, s, sum(d), sum(a), sum(a * (1 - b)), sum(a * (1 - b) * (1 + b)), avg(d), avg(a), avg(b), count(*) from t where e <= date '1998-06-04' group by f, s order by f, s",
+                                  "select sum(a * b) from t where e >= '1998-03-01' and e < date '1998-03-01' + interval '1 year' and b between 0.06 - 0.01 and 0.06 + 0.01 and d < 24",
+                                  "select avg(a), avg(c), avg(d), avg(b * 3) from t",
+                                  "select f, min(a), max(a), min(c * b), max(-c) from t group by f order by f",
+                                  "select count(a), count(*), sum(b) filter (where a > 0) from t where i is not null",
+                                  "select sum(a) from t where a > 99999999"])
+        // values near 10^13 (numeric(15,2)'s greatest): a product of two
+        // past 2^63 as units; a sum of 3,000 past 2^63
+        let big = q(mut &s, &"update t set a = 9999999999999.99 - id, c = 99999999.9999 where id % 2 = 0")
+        if big != "UPDATE 1500" { println("update: " + big) }
+        let bu = q(mut &s, &"update u set a = 9999999999999.99 - id, c = 99999999.9999 where id % 2 = 0")
+        fixed(mut &s, &"past units", &["select f, sum(a * a) from t group by f order by f", "select sum(a), avg(a), sum(c * 10000) from t",
+                                       "select sum(a * b * c) from t where i > 0"])
+        // a typmod-less numeric and a numeric(20,2): values, as before
+        let w1 = q(mut &s, &"create table v (id int primary key, a numeric, b numeric(20,2))")
+        let w2 = q(mut &s, &"insert into v select id, a, b from t")
+        fixed(mut &s, &"not units", &["select sum(a * (1 - b)), avg(b) from v", "select sum(b * 2), max(a) from v where b < 0.05"])
+        // in a transaction, with its own writes (a back in range first)
+        let sm1 = q(mut &s, &"update t set a = id * 1.50, c = id * 0.0001 where id % 2 = 0")
+        let sm2 = q(mut &s, &"update u set a = id * 1.50, c = id * 0.0001 where id % 2 = 0")
+        let b1 = q(mut &s, &"begin")
+        let b2 = q(mut &s, &"update t set a = a * 3, b = 0.04 where id % 5 = 0")
+        let b3 = q(mut &s, &"update u set a = a * 3, b = 0.04 where id % 5 = 0")
+        let b4 = q(mut &s, &"delete from t where id % 11 = 0")
+        let b5 = q(mut &s, &"delete from u where id % 11 = 0")
+        let b6 = q(mut &s, &"insert into t values (5001, 'A', 'F', 12.34, 0.05, 1.0001, 3, 1, '1998-01-01'), (5002, 'N', 'O', null, null, null, null, null, '1998-02-02')")
+        let b7 = q(mut &s, &"insert into u values (5001, 'A', 'F', 12.34, 0.05, 1.0001, 3, 1, '1998-01-01'), (5002, 'N', 'O', null, null, null, null, null, '1998-02-02')")
+        run(mut &s, mut &r, &"in a transaction", 100)
+        let b8 = q(mut &s, &"rollback")
+        return 0
+    }).unwrap()
+}
