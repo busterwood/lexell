@@ -315,6 +315,52 @@ These are estimates from section sizes, not measurements.
   implementation of each thing, files that each fit one task, and
   workstreams that don't conflict.
 
+### 4.9 Everything runs in chunks
+
+The inventory (lexdb-constructs.md) lists 13 "row-only" features. They mix
+two different things:
+
+- **Constraints on where and in what order an expression is evaluated:**
+  - exactly once per qualifying row;
+  - in input order;
+  - not on rows past a LIMIT.
+- **A true dependency of one row on the one before it.**
+
+Neither needs a row-at-a-time interface. Batching is about the size of the
+interface: one call per chunk, not per row. An operator with a sequential
+dependency keeps the chunk interface and runs a plain loop inside it.
+
+| Feature | In chunks |
+|---|---|
+| Sequences, identity defaults | Reserve a block of n values per chunk (one sequence update), assign them in selection order |
+| Volatile functions, `set_config`, advisory locks | One call per selected row, in order, in a Project placed where the row set is final: after every filter and after Limit |
+| Correlated subqueries | Unnested to joins (step 5). What remains runs as a batched dependent join: dedupe the chunk's correlation values, run the inner plan once per distinct value or with a chunk of parameters, join back. bRange already does this for index lookups. |
+| FOR UPDATE / NOWAIT / SKIP LOCKED | A LockRows operator locks a chunk's keys in key order. SKIP LOCKED clears locked rows from the selection before Limit counts them. The rerun after a wait stays in layer 7. |
+| RETURNING, OUTPUT | The DML operator writes a chunk and emits a chunk of the written rows |
+| MERGE clauses | First matching clause: evaluate each clause's condition on the rows no earlier clause took (selection vectors), then one write per clause per chunk |
+| ON CONFLICT | Look up the chunk's keys at once (getMany) and find duplicates within the chunk with a hash. DO NOTHING: the first occurrence wins. DO UPDATE: a second hit on a row is PostgreSQL's cardinality error, so there is no row-to-row dependency to honour. |
+| CHECK | A vector predicate |
+| UNIQUE, FK | Batched probes plus a hash of the chunk's own keys. Deferred checks collect keys and check them at commit in one batch. |
+| UPDATE/DELETE TOP (n), `batch_rows` | A Limit in the DML pipeline (truncates the selection) |
+| T-SQL `SELECT @v = f(@v)` | A fold operator. Common forms become aggregates: `@v = @v + x` is a sum, `@s = @s + col` an ordered string_agg, `@v = col` the last value. The general form is a loop inside the operator. |
+| MATCH_RECOGNIZE | Partitions are independent. DEFINE predicates that don't use PREV/NEXT or running aggregates are computed per chunk as a bitmask per variable, and the pattern automaton then runs over the bitmasks |
+| DISTINCT ON, WITH TIES, ROWNUM, MIN/MAX by index | Properties of order the optimizer preserves. ROWNUM is a running counter. WITH TIES compares with the boundary row. TOP PERCENT counts first (two phases). |
+| WAIT n SECONDS | Statement-level rerun. The query inside runs in chunks |
+
+Two rules for the planner and executor follow:
+
+1. **A volatile or side-effecting expression is evaluated exactly once per
+   row, where its row set is final.** It is never evaluated speculatively on
+   a chunk that a later filter or Limit will cut. This also fixes the
+   double-evaluation bug the inventory found, where the batch filter calls
+   `random()` and then the row path calls it again.
+2. **Order is a plan property.** An operator that needs order states it, and
+   the optimizer keeps it or adds a Sort. Nothing relies on the row path
+   happening to run in order.
+
+So the target is that every operator takes and gives chunks. "Row-only"
+survives only as a loop inside an operator, never as a separate path.
+
 ## 5. The on-disk format
 
 **Is it a constraint? No, but nothing in this plan needs it changed.**
