@@ -113,6 +113,27 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 `INSERT ... SELECT generate_series` loads (`vspg.sh`): acct (2 ints) lexdb
 1.26 s, PostgreSQL 0.90; t (4 ints, a text) 2.54 s and 1.07.
 
+### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
+
+lexdb at `1744ef99` (main, 2026-11-16) against PostgreSQL 18.6 with
+parallel query off, both pinned to CPUs 0-3, conventional secondary
+indexes (`bench/tpch/indexes.sql`). **Geometric mean of lexdb / PG one
+core: 3.77** (wall; 3.52 server CPU); level or ahead on 2 of 22 (q2, q17).
+19 queries give PostgreSQL's checksum; q1, q8 and q17 differ in decimal
+scale only. Results: `~/tpch/out-baseline-1744ef99`. The plan comparison
+is `lexdb-tpch-plans.md`; the work to close the gap is `lexdb-tpch-perf.md`.
+
+| | lexdb | PG one core | ratio |
+|---|---:|---:|---:|
+| q1 | 15,925 | 2,833 | 5.6 |
+| q4 | 4,004 | 180 | 22.2 |
+| q7 | 5,113 | 565 | 9.1 |
+| q13 | 5,938 | 818 | 7.3 |
+| q21 | 13,525 | 687 | 19.7 |
+| q22 | 1,200 | 76 | 15.9 |
+| q17 | **37** | 515 | 0.1 |
+| all 22, summed | 66.0 s | 12.5 s | |
+
 ## 2. Host and rules
 
 - **Host:** AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB, bare-metal
@@ -168,6 +189,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-16 | 1744ef99 | TPC-H derived, SF1 | lexdb / PG one core 3.77 (geometric mean, wall), 2 of 22 level or ahead; q4 22×, q21 20×, q1 5.6×; pinned 0-3 | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-15 | exp/ckpt-incremental | commit latency | the checkpoint's stall gone: commit max 70 → 8-11 ms, p99.9 4.2-4.5 → 3.9-4.4, p99 0.72-0.76 → 0.88-0.91 (master alone, 8 clients, pinned) | this page, 1.2; lexdb.md 9.136 |
 | 2026-11-15 | exp/ckpt-incremental | OLTP, replicas, aggregates (**pinned**, first) | 3 replicas: point selects 376,000-377,700/s at 32 clients (PG on 4 cores 386,600; 426,000 at 8); updates 2.26 / 2.63 / 1.54 × PG; lag p99 0.80-1.27 ms under load | this page, 1.1-1.3; lexdb.md 9.136 |
 | 2026-11-15 | 518f8d9d | OLTP, replicas (not pinned) | 3 replicas: point selects 333,900 / 367,800/s at 8 / 32 clients (PG at 4 CPUs 342,700 / 270,800); updates 2.3 to 2.6 × PG; replica lag p50 0.28 ms, p99 1.12 | this page, 1.1, 1.2; lexdb.md 9.135 |

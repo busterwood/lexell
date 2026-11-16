@@ -14,8 +14,9 @@
 # restarted between modes, never run together.
 #
 # The servers run as transient systemd user units, so a server's CPU is its
-# cgroup's. Both are confined to TPCH_CPUS (default 0-7, half of this
-# machine), and they run one at a time. lexdb is deliberately not CPU-capped
+# cgroup's. Both are confined to TPCH_CPUS (default 0-3: four physical
+# cores, their SMT siblings 8-11 left idle, as the other suites pin servers;
+# design/lexdb-benchmarks.md 2), and they run one at a time. lexdb is deliberately not CPU-capped
 # to one core: its SQL execution is one thread, but checkpoints encode leaves
 # on the par pool (LEXDB_CKPT_POOL=1) and its I/O helpers use other cores. A
 # 100% quota would throttle all of them; par.map would still start its pool
@@ -27,7 +28,7 @@
 #   TPCH_DBGEN=PATH           dbgen binary or kit directory;
 #                             default WORKDIR/tpch-kit/dbgen/dbgen
 #   PG_SHARED_BUFFERS=12GB
-#   TPCH_CPUS=0-7             CPUs both servers are confined to
+#   TPCH_CPUS=0-3             CPUs both servers are confined to
 #   TPCH_INDEXES=conventional secondary index set, or none for PKs only
 #   QUERY_TIMEOUT=900         seconds per query; lexdb cancels on the server
 #                             (statement_timeout), psql gets 30 s more
@@ -69,7 +70,7 @@ UNIT_L=tpch-lexdb
 UNIT_P=tpch-pg
 PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-12GB}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-900}
-TPCH_CPUS=${TPCH_CPUS:-0-7}
+TPCH_CPUS=${TPCH_CPUS:-0-3}
 TPCH_INDEXES=${TPCH_INDEXES:-conventional}
 LEXDB_CPU_QUOTA=${LEXDB_CPU_QUOTA:-}
 PG_CPU_QUOTA=${PG_CPU_QUOTA:-}
