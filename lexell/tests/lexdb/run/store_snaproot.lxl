@@ -1,0 +1,74 @@
+// lexdb_store: a snapshot's root when a checkpoint's refit splits it. A bulk
+// INSERT ... SELECT leaves a table's leaves over a page of rows (leafRoom);
+// a checkpoint's cut finds they do not fit, and refit cuts them, outside any
+// commit, at the last commit's seq. The cut leaves' parent overflows and,
+// in a tree of two levels, the root splits: a new root above the old one,
+// which keeps only the left part. A snapshot as of that commit (a READ ONLY
+// block begun before the checkpoint, or a statement's own while the
+// checkpointer runs) reads the nodes' current versions, so it must take the
+// new root too: with the root it began with, it saw only the left part
+// (about 28,000 of 60,000 rows), until a snapshot after the checkpoint.
+// Each read is checked: a filtered scan (scanLeaves, and scanIn with
+// batches off), count(*) (countRange), a backward scan, point lookups
+// (snapGet) and a lookup of many keys (getMany, a join).
+// expect: leaves cut by refit: true
+// expect: scanLeaves 1260 / 60000 1800030000
+// expect: scanIn 1260 / 60000 1800030000
+// expect: count 60000; desc 60000; point t59999 t30001
+// expect: join 60000
+// expect: commit COMMIT; after 1260 60000
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag }
+            var out = ""
+            for row in r.rows {
+                for v in row {
+                    if len(out) > 0 { out = out + " " }
+                    out = out + (if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) })
+                }
+            }
+            return out
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    // no checkpoint but the test's own (ckptBytes)
+    let opts = lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 1024 * 1024 * 1024, snapNodes: 50000}
+    lexdb_store.run(lexdb_disk.sim(1), opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var w = lexdb_exec.newSession(st)
+        let c = q(mut &w, &"create table od (id int primary key, cust int, amt int, tx text)")
+        let k = q(mut &w, &"create table ks (k int primary key)")
+        let i = q(mut &w, &"insert into ks select g from generate_series(1, 60000) g")
+        st.checkpointAll().unwrap()
+        let j = q(mut &w, &"insert into od select g, (g * 13) % 3000 + 1, g % 1000, 't' || g from generate_series(1, 60000) g")
+        // the snapshot, as of that commit, and a read of it before the checkpoint
+        let b = q(mut &s, &"begin read only")
+        let r0 = q(mut &s, &"select count(*) from od where amt between 10 and 30")
+        let cuts = lexdb_store.testHooks().colCounts(st)[2]
+        st.checkpointAll().unwrap()
+        let cut = lexdb_store.testHooks().colCounts(st)[2] > cuts
+        println("leaves cut by refit: " + cut.toStr())
+        println("scanLeaves " + q(mut &s, &"select count(*) from od where amt between 10 and 30") + " / " +
+                q(mut &s, &"select count(*), sum(id) from od where amt >= 0"))
+        let off = q(mut &s, &"set lexdb_batch = off")
+        println("scanIn " + q(mut &s, &"select count(*) from od where amt between 10 and 30") + " / " +
+                q(mut &s, &"select count(*), sum(id) from od where amt >= 0"))
+        let on = q(mut &s, &"set lexdb_batch = on")
+        println("count " + q(mut &s, &"select count(*) from od") + "; desc " + q(mut &s, &"select id from od order by id desc limit 1") +
+                "; point " + q(mut &s, &"select tx from od where id = 59999") + " " + q(mut &s, &"select tx from od where id = 30001"))
+        println("join " + q(mut &s, &"select count(*) from ks join od on od.id = ks.k"))
+        let e = q(mut &s, &"commit")
+        println("commit " + e + "; after " + q(mut &s, &"select count(*) from od where amt between 10 and 30") + " " + q(mut &s, &"select count(*) from od"))
+        return 0
+    }).unwrap()
+}
