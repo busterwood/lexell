@@ -3789,7 +3789,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     var pkMax = 0.0f
     var pkNums = 0
     let all: []bool = []
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: true}
     // the primary key (optimizer 24; of one column too, optimizer 29): rows
     // come in its order, so each prefix's distinct values are counted where
@@ -6107,7 +6107,7 @@ fn (q: &Query) constWay(k: int, cands: &[]WayCand, cs: &[]Expr, cols: &[]int): b
             if !konst { break }
             append(mut &eqs, Expr.Lit(Val.Null))
         }
-        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
         if !servesOrder(&lv.t, &p, cols) { return true }
     }
     return false
@@ -7011,7 +7011,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
     for c0 in 0..len(t.indexes) + 1 {
         let c = c0 - 1
         if c >= 0 && t.indexes[c].pred.isSome() { continue }
-        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
         if servesOrder(t, &p, &cols) {
             for x in cols { append(out, x) }
             return lv
@@ -7251,7 +7251,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score == 0 { continue }
-        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr, stats: false}
+        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr, stats: false, inMax: 0}
         if lv.readOnce && q.pathOuter(&p) { continue }          // read once (optimizer 26)
         let po = q.pathOuter(&p)
         var saved: []Expr = []
@@ -7281,6 +7281,20 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             }
         }
         if fdiff { p.eqs = saved }
+        // x IN (subquery) on the first table: a lookup per value costs a
+        // descent and the value's rows; past the values where those cost
+        // more than reading the table once, the table is read whole
+        // (pathScans). q20's 2,127 part keys into partsupp's 800,000 rows
+        // were over the old fixed IN_LOOKUP_MAX.
+        if inSub >= 0 && k == 0 && lv.est.rows > 0 {
+            let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
+            let r = lv.est.rowsFor(tree, len(eqs) + 1, &"")
+            if r >= 0 {
+                let one = COST_DESCENT + float(r) * (if c < 0 { COST_PK_RANGE } else { COST_IX_ROW })
+                let most = float(lv.est.rows) * COST_SCAN / one
+                p.inMax = if most > 1000000000.0f { 1000000000 } else { int(most) }
+            }
+        }
         append(mut &outer, po)
         append(mut &paths, p)
         append(mut &scores, score)
@@ -7288,7 +7302,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         append(mut &looks, lo)
         if best < 0 || score > scores[best] { best = len(scores) - 1 }
     }
-    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false} }
+    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} }
     var pick = best
     if scores[best] < 999 && figs[best].rows >= 0 {
         var pc = figCost(&figs[best], paths[best].index, k == 0)
@@ -7314,7 +7328,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             }
         }
     }
-    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false})
+    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0})
 }
 
 // A level read once (a hash join, optimizer 26) takes only the bounds whose
@@ -7382,7 +7396,7 @@ fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 // in key order (backward for a backward path).
 fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     if len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 { return Ok([try pathScan(t, p, env)]) }
-    if p.inSub >= 0 && len(env.subs[p.inSub].vals) > IN_LOOKUP_MAX {
+    if p.inSub >= 0 && len(env.subs[p.inSub].vals) > (if p.inMax > IN_LOOKUP_MAX { p.inMax } else { IN_LOOKUP_MAX }) {
         return Ok([Scan{empty: false, point: false, lo: "", hi: "", whole: true}])
     }
     let ix = p.index >= 0
@@ -7658,7 +7672,7 @@ fn allTrue(cs: &[]Expr, cols: &[]lexdb_sql.ColDef, row: &[]Val, params: &[]Val):
 }
 
 fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
-    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}, cond: [],
+    return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, need: [],
                  lock: 0, lockWait: 0, keeps: false, est: noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
 }
@@ -8167,14 +8181,14 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for k in 0..nl {
         let m = replace(mut &ms[k], [])
         // a subquery's rows have no key: read them all
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} } else {
             choosePath(&q, k, &m, params, mut &sc.looks)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
             perRow = false
         }
         var local: []Expr = []
@@ -8891,7 +8905,7 @@ type SubRes = record {
     hasNull: bool
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
     data: [][]Val               // in FROM: its rows
-    vals: []Val                 // IN: its distinct values not NULL, IN_LOOKUP_MAX + 1 at most (Path.inSub); a series: start, stop, step ([] none)
+    vals: []Val                 // IN: its distinct values not NULL, all of them (Path.inSub, inMax); a series: start, stop, step ([] none)
     // In FROM, an integer generate_series the first level reads: its rows
     // made as they are read (runLevel), not held (lazySeries). Its type
     // and WITH ORDINALITY.
@@ -10062,7 +10076,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
     let alias = "\x00sj" + (i + 1).toStr()
     let first = len(q.cols)
     var names: []str = []
-    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     var conds: []Expr = []
     var estRows = -1
     var estMax = false
@@ -10890,7 +10904,7 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
             let v = collVal(sp.kind, &inVal(sp, r[0]))
             match setKey(&v, out.numeric) {
                 Some(k) {
-                    if out.set.get(&k).isNone() && len(out.vals) <= IN_LOOKUP_MAX { append(mut &out.vals, v) }
+                    if out.set.get(&k).isNone() { append(mut &out.vals, v) }
                     out.set.put(k, 1)
                 }
                 None {}
@@ -12217,7 +12231,7 @@ fn renameCol(x: &Expr, from: &str, to: &str): Expr {
 
 // Whether the table has a row (col < 0), or a row whose column col is NULL.
 fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var need: []bool = []
     if col >= 0 {
@@ -12613,7 +12627,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             n += 1
         }
     } else {
-        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
         let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
         var cur = newCursor()
         while !cur.done {
@@ -13401,7 +13415,7 @@ fn pruneInvalid(t: mut &Table) {
 
 // The rows of t against check c (23514).
 fn checkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &Check): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
@@ -13641,7 +13655,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 // unique index's duplicates are then neighbours: two entries with the same
 // columns, none NULL (the tree is new, so they are all there is to check).
 fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     var ents: []str = []
@@ -14503,7 +14517,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         // always reads by the key, so that a row it changed is not found again (the Halloween problem across
         // batches), and may not change the key, which would move a row past the cursor
         if q.levels[0].path.index >= 0 || q.levels[0].path.desc {
-            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
         }
         win.keyed = true
         for k in targets { for p in q.levels[0].t.pk { if p == k {
@@ -17058,7 +17072,7 @@ fn orderedScan(q: &Query, cols: &[]int, params: &[]Val, lk: mut &[]Look): Option
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params, lk) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -20679,7 +20693,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     let n = len(cols)
     var crow = nullRow(len(c.cols))
     for j in 0..n { crow[cols[j]] = vals[j] }
-    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     var sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     if prefixSame(&c.pk, n, cols) {
         var b = newStrBuf()
@@ -21147,7 +21161,7 @@ fn fkName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &lexd
 // The rows of t against its foreign key f to table p (23503).
 fn fkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, f: &ForeignKey, p: &Table): Result[Unit, DbErr] {
     let fc = fkCols(t, f, p)
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
     let sc = Scan{empty: false, point: false, lo: "", hi: "", whole: false}
     var cur = newCursor()
     while !cur.done {
