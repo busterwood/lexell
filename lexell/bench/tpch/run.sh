@@ -37,6 +37,8 @@
 #                             quota throttles its parallel checkpoint pool)
 #   PG_CPU_QUOTA=400%         PostgreSQL cgroup quota (default: 400%)
 #   TPCH_CHECK_ONLY=1         check prerequisites and the plan; run nothing
+#   TPCH_REF=DIR              an earlier run's directory whose pg1.tsv checks
+#                             lexdb's results when this run has no pg1
 #
 # First time:
 #   lexell/bench/tpch/fetch.sh WORKDIR/tpch-kit
@@ -360,7 +362,7 @@ if want pg1 || want pg4; then
 fi
 
 if [ -f "$OUT/lexdb.tsv" ] || [ -f "$OUT/pg1.tsv" ] || [ -f "$OUT/pg4.tsv" ]; then
-    python3 "$HERE/compare.py" "$OUT" | tee "$OUT/summary.txt"
+    python3 "$HERE/compare.py" "$OUT" ${TPCH_REF:+"$TPCH_REF"} | tee "$OUT/summary.txt"
     echo "tpch: results in $OUT/summary.md"
 else
     echo "tpch: no results to compare" >&2
