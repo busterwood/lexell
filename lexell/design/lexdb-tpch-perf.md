@@ -1126,16 +1126,22 @@ PostgreSQL's ~120 ms. Re-verified both of semi's leads:
 
 **IN (subquery) across types (review, after 9f6dd830).** The IN set was
 keyed by value only for integers and numerics: a float8 value never matched
-a numeric or integer column, and a date never matched a timestamp, either
-way, uncorrelated or hashed correlated (main too). The set now records its
-values' class; a probe tries the key first as before (a number against
-floats as a float8), and a number or date/time it does not find is
-compared with the values of its family by `compareZ` in the session's
-zone. A text against numbers keeps the old by-value key (`'3' in (select
-int)`). A table with an uncorrelated IN condition now loads its
-statistics for `Path.inMax`. `exec_intypes` covers 16 cases against
-EXISTS, batches off and on; the reviewer's 44 probes give IN = EXISTS.
-q16/q18/q20 unchanged (A/B against main 9f6dd830).
+a numeric or integer column, a date never matched a timestamp, and a float
+probe matched numerics through a 15-digit numeric ((0.1 + 0.2) IN (select
+0.3::numeric) was true), uncorrelated or hashed correlated (main too). A
+first fix compared the other classes value by value; its review found it
+quadratic (20,000 float probes against 20,000 integers: 8.3 s), a
+timestamp/timestamptz key collision in a non-UTC zone, and the index path
+missing rows (a float made the column's numeric). Now each value gets keys
+tagged by what = finds it equal to (`inValKeys`): its old key, a float8
+for numbers and floats (= compares as float8 when either side is one),
+its own date/time kind, and its instant in the session's zone (= compares
+date, timestamp and timestamptz so); a probe looks up the few keys it could
+equal (`inProbeKeys`), O(1) whatever the types. `pathScans` reads the
+table whole when the set's class differs from the column's. A table with
+an uncorrelated IN condition loads its statistics for `Path.inMax`.
+`exec_intypes` has the review's cases against EXISTS or =, batches off and
+on. Not fixed (as on main): an untyped text parameter against a date set.
 
 **For other workstreams.** q3 and q10 (and any query with a lineitem
 primary-key prefix lookup per row) run their joins and grouping on the
