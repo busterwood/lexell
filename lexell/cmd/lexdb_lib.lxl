@@ -10,11 +10,17 @@
 // the catalog) stay in lexdb_exec.
 
 import "strings"
+import "unicode"
+import "base64"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_time"
 import "./lexdb_ops"
 import "./lexdb_func"
+import "./lexdb_like"
+import "./lexdb_rows"
+import "./lexdb_access"
+import "./lexdb_catalog"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -85,6 +91,9 @@ pub fn entry1Of(name: &str): Option[Lib1] {
         "atand" { return Some(atand1) }
         "degrees" { return Some(degrees1) }
         "radians" { return Some(radians1) }
+        "#ci" { return Some(ci1) }
+        "#pad" { return Some(pad1) }
+        "#cifold" { return Some(cifold1) }
         else { return None }
     }
 }
@@ -235,77 +244,133 @@ fn log1(name: &str, v: &Val): Result[Val, DbErr] { return log10_1(&"log10", v) }
 
 // ---- the functions of several arguments (entryOf)
 
-// name's function of n arguments; None: none here.
-pub fn entryOf(name: &str, n: int): Option[LibFn] {
+// name's function of n arguments: the first of lexdb_exec's old callAt
+// chain that took the name and number (its order is kept where names met:
+// to_timestamp of two is to_char's kin, else seconds since 1970), restFn
+// when none does. For n == 1, a name entry1Of takes is not looked up here:
+// its caller asks entry1Of first (lexdb_exec.callAt, fnRefOf).
+pub fn entryOf(name: &str, n: int): LibFn {
     match name {
-        "now", "current_timestamp", "transaction_timestamp", "statement_timestamp" { return Some(nowFn) }
-        "clock_timestamp" { return Some(clockFn) }
-        "localtimestamp" { return Some(localTsFn) }
-        "current_date" { return Some(currentDateFn) }
-        "current_time", "localtime" { return Some(currentTimeFn) }
-        "date_part" { return Some(datePartFn) }
-        "date_trunc" { return Some(dateTruncFn) }
-        "age" { return Some(ageFn) }
-        "make_date" { return Some(makeDateFn) }
-        "to_timestamp" { return Some(if n == 2 { toTimestamp2Fn } else { toTimestamp1Fn }) }
-        "isfinite" { return Some(isfiniteFn) }
-        "timezone" { return Some(timezoneFn) }
-        "make_timestamp" { return Some(makeTsFn) }
-        "make_timestamptz" { return Some(makeTstzFn) }
-        "lpad" { if n == 2 || n == 3 { return Some(lpadFn) } }
-        "rpad" { if n == 2 || n == 3 { return Some(rpadFn) } }
-        "split_part" { if n == 3 { return Some(splitPartFn) } }
-        "concat_ws" { return Some(concatWsFn) }
-        "md5" { if n == 1 { return Some(md5Fn) } }
-        "format" { if n >= 1 { return Some(formatFn) } }
-        "chr" { if n == 1 { return Some(chrFn) } }
-        "ascii" { if n == 1 { return Some(asciiFn) } }
-        "initcap" { if n == 1 { return Some(initcapFn) } }
-        "reverse" { if n == 1 { return Some(reverseFn) } }
-        "quote_literal" { if n == 1 { return Some(quoteLiteralFn) } }
-        "quote_nullable" { if n == 1 { return Some(quoteNullableFn) } }
-        "starts_with" { if n == 2 { return Some(startsWithFn) } }
-        "to_hex" { return Some(toHexFn) }                 // (typed: a hint after the arguments)
-        "translate" { if n == 3 { return Some(translateFn) } }
-        "overlay" { if n == 3 || n == 4 { return Some(overlayFn) } }
-        "regexp_replace" { if n >= 3 && n <= 6 { return Some(reReplaceFn) } }
-        "regexp_match" { if n == 2 || n == 3 { return Some(reMatchFn) } }
-        "regexp_matches" { if n == 2 || n == 3 { return Some(reMatchesFn) } }
-        "regexp_like" { if n == 2 || n == 3 { return Some(reLikeFn) } }
-        "regexp_split_to_table" { if n == 2 || n == 3 { return Some(reSplitTableFn) } }
-        "regexp_split_to_array" { if n == 2 || n == 3 { return Some(reSplitArrayFn) } }
-        "regexp_count" { if n >= 2 && n <= 4 { return Some(reCountFn) } }
-        "regexp_instr" { if n >= 2 && n <= 7 { return Some(reInstrFn) } }
-        "regexp_substr" { if n >= 2 && n <= 6 { return Some(reSubstrFn) } }
-        "array_append", "#aappend" { if n == 2 { return Some(arrAppendFn) } }
-        "array_prepend", "#aprepend" { if n == 2 { return Some(arrPrependFn) } }
-        "array_cat", "#acat" { if n == 2 { return Some(arrCatFn) } }
-        "array_remove" { return Some(arrRemoveFn) }       // (typed)
-        "array_replace" { return Some(arrReplaceFn) }     // (typed)
-        "array_position" { return Some(arrPositionFn) }   // (typed)
-        "array_positions" { return Some(arrPositionsFn) } // (typed)
-        "string_to_array" { if n == 2 || n == 3 { return Some(strToArrayFn) } }
-        "string_to_table" { if n == 2 || n == 3 { return Some(strToTableFn) } }
-        "array_ndims" { if n == 1 { return Some(arrNdimsFn) } }
-        "array_dims" { if n == 1 { return Some(arrDimsFn) } }
-        "@>" { return Some(arrContainsFn) }               // (typed)
-        "<@" { return Some(arrWithinFn) }                 // (typed)
-        "&&" { return Some(arrOverlapsFn) }               // (typed)
-        "mod" { if n == 2 { return Some(modFn) } }
-        "div" { if n == 2 { return Some(divFn) } }
-        "gcd" { if n == 2 { return Some(gcdFn) } }
-        "lcm" { if n == 2 { return Some(lcmFn) } }
-        "width_bucket" { if n == 4 { return Some(widthBucketFn) } }
-        "to_char" { if n == 2 { return Some(toCharFn) } }
-        "to_number" { if n == 2 { return Some(toNumberFn) } }
-        "to_date" { if n == 2 { return Some(toDateFn) } }
-        "pi" { if n == 0 { return Some(piFn) } }
-        "atan2" { if n == 2 { return Some(atan2Fn) } }
-        "atan2d" { if n == 2 { return Some(atan2dFn) } }
-        "log" { if n == 2 { return Some(log2Fn) } }
+        "now", "current_timestamp", "transaction_timestamp", "statement_timestamp" { return nowFn }
+        "clock_timestamp" { return clockFn }
+        "localtimestamp" { return localTsFn }
+        "current_date" { return currentDateFn }
+        "current_time", "localtime" { return currentTimeFn }
+        "date_part" { return datePartFn }
+        "date_trunc" { return dateTruncFn }
+        "age" { return ageFn }
+        "make_date" { return makeDateFn }
+        "to_timestamp" { return if n == 2 { toTimestamp2Fn } else { toTimestamp1Fn } }
+        "isfinite" { return isfiniteFn }
+        "timezone" { return timezoneFn }
+        "make_timestamp" { return makeTsFn }
+        "make_timestamptz" { return makeTstzFn }
+        "lpad" { if n == 2 || n == 3 { return lpadFn } }
+        "rpad" { if n == 2 || n == 3 { return rpadFn } }
+        "split_part" { if n == 3 { return splitPartFn } }
+        "concat_ws" { return concatWsFn }
+        "md5" { if n == 1 { return md5Fn } }
+        "format" { if n >= 1 { return formatFn } }
+        "chr" { if n == 1 { return chrFn } }
+        "ascii" { if n == 1 { return asciiFn } }
+        "initcap" { if n == 1 { return initcapFn } }
+        "reverse" { if n == 1 { return reverseFn } }
+        "quote_literal" { if n == 1 { return quoteLiteralFn } }
+        "quote_nullable" { if n == 1 { return quoteNullableFn } }
+        "starts_with" { if n == 2 { return startsWithFn } }
+        "to_hex" { return toHexFn }                 // (typed: a hint after the arguments)
+        "translate" { if n == 3 { return translateFn } }
+        "overlay" { if n == 3 || n == 4 { return overlayFn } }
+        "regexp_replace" { if n >= 3 && n <= 6 { return reReplaceFn } }
+        "regexp_match" { if n == 2 || n == 3 { return reMatchFn } }
+        "regexp_matches" { if n == 2 || n == 3 { return reMatchesFn } }
+        "regexp_like" { if n == 2 || n == 3 { return reLikeFn } }
+        "regexp_split_to_table" { if n == 2 || n == 3 { return reSplitTableFn } }
+        "regexp_split_to_array" { if n == 2 || n == 3 { return reSplitArrayFn } }
+        "regexp_count" { if n >= 2 && n <= 4 { return reCountFn } }
+        "regexp_instr" { if n >= 2 && n <= 7 { return reInstrFn } }
+        "regexp_substr" { if n >= 2 && n <= 6 { return reSubstrFn } }
+        "array_append", "#aappend" { if n == 2 { return arrAppendFn } }
+        "array_prepend", "#aprepend" { if n == 2 { return arrPrependFn } }
+        "array_cat", "#acat" { if n == 2 { return arrCatFn } }
+        "array_remove" { return arrRemoveFn }       // (typed)
+        "array_replace" { return arrReplaceFn }     // (typed)
+        "array_position" { return arrPositionFn }   // (typed)
+        "array_positions" { return arrPositionsFn } // (typed)
+        "string_to_array" { if n == 2 || n == 3 { return strToArrayFn } }
+        "string_to_table" { if n == 2 || n == 3 { return strToTableFn } }
+        "array_ndims" { if n == 1 { return arrNdimsFn } }
+        "array_dims" { if n == 1 { return arrDimsFn } }
+        "@>" { return arrContainsFn }               // (typed)
+        "<@" { return arrWithinFn }                 // (typed)
+        "&&" { return arrOverlapsFn }               // (typed)
+        "mod" { if n == 2 { return modFn } }
+        "div" { if n == 2 { return divFn } }
+        "gcd" { if n == 2 { return gcdFn } }
+        "lcm" { if n == 2 { return lcmFn } }
+        "width_bucket" { if n == 4 { return widthBucketFn } }
+        "to_char" { if n == 2 { return toCharFn } }
+        "to_number" { if n == 2 { return toNumberFn } }
+        "to_date" { if n == 2 { return toDateFn } }
+        "pi" { if n == 0 { return piFn } }
+        "atan2" { if n == 2 { return atan2Fn } }
+        "atan2d" { if n == 2 { return atan2dFn } }
+        "log" { if n == 2 { return log2Fn } }
+        "#collate", "#coll" { if n == 2 { return collateFn } }
+        "~" { if n == 2 { return reOpFn } }
+        "!~" { if n == 2 { return reOpNotFn } }
+        "~*" { if n == 2 { return reOpFoldFn } }
+        "!~*" { if n == 2 { return reOpNotFoldFn } }
+        "#enumpos" { if n == 2 { return enumPosFn } }
+        "#elem" { if n == 2 { return elemFn } }
+        "unnest" { if n == 1 { return unnestFn } }
+        "generate_subscripts" { if n == 2 || n == 3 { return subscriptsFn } }
+        "btrim" { if n == 2 { return btrim2Fn } }
+        "ltrim" { if n == 2 { return ltrim2Fn } }
+        "rtrim" { if n == 2 { return rtrim2Fn } }
+        "repeat" { if n == 2 { return repeatFn } }
+        "quote_ident" { if n == 1 { return quoteIdentFn } }
+        "array_to_string" { if n == 2 || n == 3 { return arrayToStringFn } }
+        "array_length", "array_upper" { if n == 2 { return arrLengthFn } }
+        "array_lower" { if n == 2 { return arrLowerFn } }
+        "cardinality" { if n == 1 || n == 2 { return cardinalityFn } }
+        "pg_encoding_to_char" { if n == 1 { return encodingFn } }
+        "json_build_object", "jsonb_build_object" { return jsonObjectFn }
+        "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible" { if n == 1 { return visibleFn } }
+        "obj_description", "col_description", "shobj_description", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
+        "pg_get_function_result", "pg_get_function_arguments" { return nullFn }
+        "pg_get_expr" { if n == 2 || n == 3 { return getExprFn } }
+        "gen_random_uuid" { if n == 0 { return uuidFn } }
+        "random" { if n == 0 { return randomFn } }
+        "encode" { if n == 2 { return encodeFn } }
+        "decode" { if n == 2 { return decodeFn } }
+        "array" { return arrayFn }
+        "in" { return inFn }
+        "distinct from" { return distinctFn }
+        "like" { return likeFn }
+        "ilike" { return ilikeFn }
+        "#bptrim" { return bpTrimFn }
+        "#bppad" { return bpPadFn }
+        "similar" { return similarFn }
+        "nullif" { if n == 2 { return nullifFn } }
+        "greatest" { if n >= 1 { return greatestFn } }
+        "least" { if n >= 1 { return leastFn } }
+        "concat" { return concatFn }
+        "substr" { if n >= 2 { return substrFn } }
+        "substring" { if n >= 2 { return substringFn } }
+        "strpos", "position" { if n >= 2 { return strposFn } }
+        "replace" { if n >= 2 { return replaceFn } }
+        "left" { if n >= 2 { return leftFn } }
+        "right" { if n >= 2 { return rightFn } }
+        "coalesce" { return coalesceFn }
+        "version" { if n == 0 { return versionFn } }
+        "current_database" { if n == 0 { return databaseFn } }
+        "power", "pow" { if n == 2 { return powFn } }
+        "round" { if n == 2 { return round2Fn } }
         else {}
     }
-    return None
+    if lexdb_sql.isQuant(name) { return quantEntry(name) }
+    return restFn
 }
 
 // ---- dates, times, timestamps and intervals (9.76; lexdb_time)
@@ -1425,3 +1490,700 @@ fn atan2Of(name: &str, vs: &[]Val, t: int): Result[Val, DbErr] {
 
 fn atan2Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return atan2Of(name, vs, T_ATAN2) }
 fn atan2dFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return atan2Of(name, vs, T_ATAN2D) }
+
+// ---- operators that are calls: IN, IS DISTINCT FROM, LIKE, SIMILAR TO,
+// x op ANY | ALL (array), char(n)'s trim and pad
+
+// x IN (a, b): true if one equals x; else NULL if x or one of them is NULL
+fn inFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    var sawNull = false
+    for i in 1..len(vs) {
+        if lexdb_ops.isNull(&vs[i]) {
+            sawNull = true
+            continue
+        }
+        if (try lexdb_ops.compareZ(&vs[0], &vs[i], z)) == 0 { return Ok(Val.Bool(true)) }
+    }
+    return Ok(if sawNull { Val.Null } else { Val.Bool(false) })
+}
+
+fn distinctFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let na = lexdb_ops.isNull(&vs[0])
+    let nb = lexdb_ops.isNull(&vs[1])
+    if na || nb { return Ok(Val.Bool(na != nb)) }
+    return Ok(Val.Bool((try lexdb_ops.compareZ(&vs[0], &vs[1], z)) != 0))
+}
+
+fn likeOf(vs: &[]Val, fold: bool): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let esc = if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "\\" }
+    return Ok(Val.Bool(try likeMatch(&(lexdb_sql.text(&vs[0])), &(lexdb_sql.text(&vs[1])), &esc, fold)))
+}
+
+fn likeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return likeOf(vs, false) }
+fn ilikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return likeOf(vs, true) }
+
+fn similarFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let esc = if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "\\" }
+    return Ok(Val.Bool(try lexdb_func.similarTo(&lexdb_sql.text(&vs[0]), &lexdb_sql.text(&vs[1]), &esc)))
+}
+
+fn bpTrimFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    return Ok(Val.Text(lexdb_ops.bpTrim(&lexdb_sql.text(&vs[0]))))
+}
+
+fn bpPadFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let pad = lexdb_ops.intOf(&vs[1]).unwrapOr(0)
+    // a value too long for n stays so: equal to no value of the column
+    let s = lexdb_ops.bpTrim(&lexdb_sql.text(&vs[0]))
+    return if strings.runeCount(&s) > pad { Ok(Val.Text(s)) } else { lexdb_ops.bpcharOf(&s, pad, false) }
+}
+
+// LIKE: % any run of characters, _ one character, the escape character
+// (backslash unless given; '' for none) before either for itself.
+pub fn likeMatch(s: &str, pat: &str, esc: &str, fold: bool): Result[bool, DbErr] {
+    let er = strings.runes(&esc)
+    if len(er) > 1 { return Err(e("22019", "invalid escape string")) }
+    // literal text and % only: its pieces, found in order as bytes (9.52)
+    if !fold && lexdb_like.likeSimple(&pat, &esc) { return Ok(lexdb_like.likePieces(&s, &lexdb_like.likeSplit(&pat))) }
+    let sl: str = if fold { strings.toLowerAscii(&s) } else { s }
+    let sr = strings.runes(&sl)
+    let pl: str = if fold { strings.toLowerAscii(&pat) } else { pat }
+    let pr = strings.runes(&pl)
+    let ec = if len(er) == 1 { er[0] } else { -1 }
+    var kind: []int = []            // 0 a character, 1 _, 2 %
+    var lit: []int = []
+    var i = 0
+    while i < len(pr) {
+        let c = pr[i]
+        if c == ec {
+            if i + 1 >= len(pr) { return Err(e("22025", "LIKE pattern must not end with escape character")) }
+            append(mut &kind, 0)
+            append(mut &lit, pr[i + 1])
+            i += 2
+            continue
+        }
+        if c == 37 {
+            if len(kind) == 0 || kind[len(kind) - 1] != 2 {
+                append(mut &kind, 2)
+                append(mut &lit, 0)
+            }
+        } else if c == 95 {
+            append(mut &kind, 1)
+            append(mut &lit, 0)
+        } else {
+            append(mut &kind, 0)
+            append(mut &lit, c)
+        }
+        i += 1
+    }
+    var si = 0
+    var pi = 0
+    var star = -1
+    var mark = 0
+    while si < len(sr) {
+        if pi < len(kind) && (kind[pi] == 1 || (kind[pi] == 0 && lit[pi] == sr[si])) {
+            si += 1
+            pi += 1
+        } else if pi < len(kind) && kind[pi] == 2 {
+            star = pi
+            mark = si
+            pi += 1
+        } else if star >= 0 {
+            pi = star + 1
+            mark += 1
+            si = mark
+        } else {
+            return Ok(false)
+        }
+    }
+    while pi < len(kind) && kind[pi] == 2 { pi += 1 }
+    return Ok(pi == len(kind))
+}
+
+// x op ANY (array), x op ALL (array), as PostgreSQL: ANY is true if one
+// comparison is, else NULL if one is NULL, else false (an empty array:
+// false); ALL is false if one is false, else NULL if one is NULL, else true.
+// The elements are read as x's type. The operator (Q_*) is decoded from the
+// call's name ("any =", "all not ilike") when bound.
+const Q_EQ = 0
+const Q_NE = 1
+const Q_LT = 2
+const Q_LE = 3
+const Q_GT = 4
+const Q_GE = 5
+const Q_LIKE = 6
+const Q_NLIKE = 7
+const Q_ILIKE = 8
+const Q_NILIKE = 9
+
+fn quantOf(all: bool, op: int, x: &Val, arr: &Val): Result[Val, DbErr] {
+    let a = match arr {
+        Val.Text(t) { t }
+        Val.Null { return Ok(Val.Null) }
+        else { return Err(e("42809", "op ANY/ALL (array) requires an array on the right")) }
+    }
+    let parts = try lexdb_ops.arrayParts(&a)
+    if len(parts) == 0 { return Ok(Val.Bool(all)) }
+    if lexdb_ops.isNull(x) { return Ok(Val.Null) }
+    // x [NOT] LIKE | ILIKE ANY | ALL (array) (9.94)
+    let like = op >= Q_LIKE
+    let ty = lexdb_sql.oidType(if lexdb_ops.kindOf(x) == lexdb_sql.K_INT { lexdb_sql.OID_INT8 } else { lexdb_ops.kindOid(x) })
+    var sawNull = false
+    for part in parts {
+        match part {
+            None { sawNull = true }
+            Some(p) {
+                var ok = false
+                if like {
+                    ok = (try likeMatch(&(lexdb_sql.text(x)), &p, "\\", op == Q_ILIKE || op == Q_NILIKE)) != (op == Q_NLIKE || op == Q_NILIKE)
+                } else {
+                    let v = try lexdb_ops.coerce(Val.Text(p), &ty)
+                    let c = try lexdb_ops.compare(x, &v)
+                    ok = if op == Q_EQ { c == 0 } else if op == Q_NE { c != 0 } else if op == Q_LT { c < 0 } else if op == Q_LE { c <= 0 } else if op == Q_GT { c > 0 } else { c >= 0 }
+                }
+                if ok && !all { return Ok(Val.Bool(true)) }
+                if !ok && all { return Ok(Val.Bool(false)) }
+            }
+        }
+    }
+    if sawNull { return Ok(Val.Null) }
+    return Ok(Val.Bool(all))
+}
+
+// A quantified comparison's entry (lexdb_sql.isQuant(name)): its operator
+// read from the name once.
+fn quantEntry(name: &str): LibFn {
+    let all = strings.startsWith(&name, "all ")
+    let op = name[4..len(name)]
+    if strings.endsWith(&op, "like") {
+        let i = strings.endsWith(&op, "ilike")
+        let not = strings.startsWith(&op, "not ")
+        if all { return if i { if not { allNIlikeFn } else { allIlikeFn } } else { if not { allNLikeFn } else { allLikeFn } } }
+        return if i { if not { anyNIlikeFn } else { anyIlikeFn } } else { if not { anyNLikeFn } else { anyLikeFn } }
+    }
+    if all { return if op == "=" { allEqFn } else if op == "<>" { allNeFn } else if op == "<" { allLtFn } else if op == "<=" { allLeFn } else if op == ">" { allGtFn } else { allGeFn } }
+    return if op == "=" { anyEqFn } else if op == "<>" { anyNeFn } else if op == "<" { anyLtFn } else if op == "<=" { anyLeFn } else if op == ">" { anyGtFn } else { anyGeFn }
+}
+
+fn anyEqFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_EQ, &vs[0], &vs[1]) }
+fn anyNeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_NE, &vs[0], &vs[1]) }
+fn anyLtFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_LT, &vs[0], &vs[1]) }
+fn anyLeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_LE, &vs[0], &vs[1]) }
+fn anyGtFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_GT, &vs[0], &vs[1]) }
+fn anyGeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_GE, &vs[0], &vs[1]) }
+fn anyLikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_LIKE, &vs[0], &vs[1]) }
+fn anyNLikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_NLIKE, &vs[0], &vs[1]) }
+fn anyIlikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_ILIKE, &vs[0], &vs[1]) }
+fn anyNIlikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(false, Q_NILIKE, &vs[0], &vs[1]) }
+fn allEqFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_EQ, &vs[0], &vs[1]) }
+fn allNeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_NE, &vs[0], &vs[1]) }
+fn allLtFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_LT, &vs[0], &vs[1]) }
+fn allLeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_LE, &vs[0], &vs[1]) }
+fn allGtFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_GT, &vs[0], &vs[1]) }
+fn allGeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_GE, &vs[0], &vs[1]) }
+fn allLikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_LIKE, &vs[0], &vs[1]) }
+fn allNLikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_NLIKE, &vs[0], &vs[1]) }
+fn allIlikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_ILIKE, &vs[0], &vs[1]) }
+fn allNIlikeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return quantOf(true, Q_NILIKE, &vs[0], &vs[1]) }
+
+// ---- conditional expressions (9.18)
+
+fn coalesceFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    for v in vs { if !lexdb_ops.isNull(&v) { return Ok(v) } }
+    return Ok(Val.Null)
+}
+
+fn nullifFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(vs[0]) }
+    if (try lexdb_ops.compareZ(&vs[0], &vs[1], z)) == 0 { return Ok(Val.Null) }
+    return Ok(vs[0])
+}
+
+fn bestOf(vs: &[]Val, z: &lexdb_time.Zone, greatest: bool): Result[Val, DbErr] {
+    var best = Val.Null
+    var widest = 0                  // a date, timestamp, timestamptz among them: the result's type
+    for v in vs {
+        if lexdb_ops.isNull(&v) { continue }
+        let k = lexdb_ops.kindOf(&v)
+        if (k == lexdb_sql.K_DATE || k == lexdb_sql.K_TS || k == lexdb_sql.K_TSTZ) && k > widest { widest = k }
+        if lexdb_ops.isNull(&best) { best = v } else {
+            let c = try lexdb_ops.compareZ(&v, &best, z)
+            if (greatest && c > 0) || (!greatest && c < 0) { best = v }
+        }
+    }
+    if widest > 0 && lexdb_ops.kindOf(&best) != widest && lexdb_sql.isTimeKind(lexdb_ops.kindOf(&best)) {
+        return lexdb_ops.coerceTime(best, &lexdb_sql.oidType(if widest == lexdb_sql.K_TSTZ { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }), z)
+    }
+    return Ok(best)
+}
+
+fn greatestFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return bestOf(vs, z, true) }
+fn leastFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return bestOf(vs, z, false) }
+
+// ---- strings (9.4)
+
+fn concatFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var out = ""
+    for v in vs { if !lexdb_ops.isNull(&v) { out = out + lexdb_ops.textZ(&v, z) } }
+    return Ok(Val.Text(out))
+}
+
+// substr(s, from [, count]), by characters, from 1, as PostgreSQL clips it.
+fn substr(s: &str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
+    let rs = strings.runes(&s)
+    if hasCount && count < 0 { return Err(e("22011", "negative substring length not allowed")) }
+    var lo = from
+    var hi = if hasCount { from + count } else { len(rs) + 1 }
+    if lo < 1 { lo = 1 }
+    if hi > len(rs) + 1 { hi = len(rs) + 1 }
+    if hi <= lo { return Ok("") }
+    var out: []int = []
+    for i in lo - 1..hi - 1 { append(mut &out, rs[i]) }
+    return Ok(strings.fromRunes(&out))
+}
+
+// substr(a, from [, count]) of vs (none NULL), a vs[0]'s text.
+fn substrOf(a: &str, vs: &[]Val, name: &str): Result[Val, DbErr] {
+    let n = len(vs)
+    let from = try intArg(vs[1], name)
+    let count = if n == 3 { try intArg(vs[2], name) } else { 0 }
+    return Ok(Val.Text(try substr(a, from, count, n == 3)))
+}
+
+// substr, substring, strpos, position, replace, left, right: of two or
+// more arguments (entryOf), NULL for a NULL one whatever their number.
+fn substrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) > 3 { return rest(name, vs) }
+    return substrOf(&lexdb_sql.text(&vs[0]), vs, name)
+}
+
+// substring(x FROM pattern) (9.92): the first group's match, or the whole
+// match; FROM pattern FOR escape is SIMILAR TO's (9.94); substring(x FROM
+// n FOR m) substr's.
+fn substringFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let n = len(vs)
+    let a = lexdb_sql.text(&vs[0])
+    if lexdb_ops.kindOf(&vs[1]) == lexdb_sql.K_TEXT {
+        if n == 3 {
+            match try lexdb_func.similarSubstring(&a, &lexdb_sql.text(&vs[1]), &lexdb_sql.text(&vs[2])) {
+                Some(r) { return Ok(Val.Text(r)) }
+                None { return Ok(Val.Null) }
+            }
+        }
+        let fl = try lexdb_func.reFlags(&"")
+        let re = try lexdb_func.reCompile(&lexdb_sql.text(&vs[1]), &fl)
+        let ms = lexdb_func.reMatches(&re, &a, 0, false, false)
+        if len(ms) == 0 { return Ok(Val.Null) }
+        let m = &ms[0]
+        if len(m) > 2 {
+            if m[2] < 0 { return Ok(Val.Null) }
+            return Ok(Val.Text(a[m[2]..m[3]].toStr()))
+        }
+        return Ok(Val.Text(a[m[0]..m[1]].toStr()))
+    }
+    if n > 3 { return rest(name, vs) }
+    return substrOf(&a, vs, name)
+}
+
+fn strposFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 2 { return rest(name, vs) }
+    let a = lexdb_sql.text(&vs[0])
+    let i = strings.indexOf(&a, &(lexdb_sql.text(&vs[1])), 0)
+    return Ok(Val.Int(if i < 0 { 0 } else { strings.runeCount(&a[0..i]) + 1 }))
+}
+
+fn replaceFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 3 { return rest(name, vs) }
+    let a = lexdb_sql.text(&vs[0])
+    let from = lexdb_sql.text(&vs[1])
+    if len(from) == 0 { return Ok(Val.Text(a)) }
+    return Ok(Val.Text(strings.replaceAll(&a, &from, &(lexdb_sql.text(&vs[2])))))
+}
+
+fn sideOf(name: &str, vs: &[]Val, left: bool): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    if len(vs) != 2 { return rest(name, vs) }
+    let a = lexdb_sql.text(&vs[0])
+    let k = try intArg(vs[1], name)
+    let total = strings.runeCount(&a)
+    var take = if k >= 0 { k } else { total + k }
+    if take < 0 { take = 0 }
+    if take > total { take = total }
+    if left { return Ok(Val.Text(try substr(&a, 1, take, true))) }
+    return Ok(Val.Text(try substr(&a, total - take + 1, take, true)))
+}
+
+fn leftFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return sideOf(name, vs, true) }
+fn rightFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return sideOf(name, vs, false) }
+
+// btrim, ltrim, rtrim (s, chars): the characters of chars off the start,
+// the end, or both
+fn trimOf(vs: &[]Val, lo: bool, hi: bool): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let x = lexdb_sql.text(&vs[0])
+    let cs = lexdb_sql.text(&vs[1])
+    var a = 0
+    var b = len(x)
+    if lo { while a < b && strings.contains(&cs, &x[a..a + 1]) { a += 1 } }
+    if hi { while b > a && strings.contains(&cs, &x[b - 1..b]) { b -= 1 } }
+    return Ok(Val.Text(x[a..b].toStr()))
+}
+
+fn btrim2Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return trimOf(vs, true, true) }
+fn ltrim2Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return trimOf(vs, true, false) }
+fn rtrim2Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return trimOf(vs, false, true) }
+
+fn repeatFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let k = lexdb_ops.oidArg(&vs[1]).unwrapOr(0)
+    let t = lexdb_sql.text(&vs[0])
+    if k > 0 && len(t) * k > 1073741823 { return Err(e("54000", "requested length too large")) }
+    return Ok(Val.Text(if k <= 0 { "" } else { strings.repeat(&t, k) }))
+}
+
+fn quoteIdentFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    return Ok(Val.Text(lexdb_catalog.quoteIfNeeded(&lexdb_sql.text(&vs[0]))))
+}
+
+// x ~ p, !~, ~*, !~* (9.7.3)
+fn reOpOf(vs: &[]Val, fold: bool, neg: bool): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let fl = try lexdb_func.reFlags(&(if fold { "i" } else { "" }))
+    let re = try lexdb_func.reCompileTest(&lexdb_sql.text(&vs[1]), &fl)
+    let m = re.isMatch(&(lexdb_sql.text(&vs[0])))
+    return Ok(Val.Bool(if neg { !m } else { m }))
+}
+
+fn reOpFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reOpOf(vs, false, false) }
+fn reOpNotFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reOpOf(vs, false, true) }
+fn reOpFoldFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reOpOf(vs, true, false) }
+fn reOpNotFoldFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reOpOf(vs, true, true) }
+
+// ---- collations (design/lexdb-tds.md L2)
+
+// x COLLATE name: x (its collation used when planned)
+fn collateFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return Ok(vs[0]) }
+
+// #ci(x): a text's key under a case-insensitive collation (ciKey)
+fn ci1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Text(s) { return Ok(Val.Text(lexdb_access.ciKey(&s))) }
+        else { return Ok(v) }
+    }
+}
+
+// #pad(x): a text's key under a collation that pads with spaces
+fn pad1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Text(t) { return Ok(Val.Text(lexdb_access.padKey(&t))) }
+        else { return Ok(v) }
+    }
+}
+
+// #cifold(x): LIKE's operands under a case-insensitive collation: case
+// folded as ciKey folds it, spaces kept
+fn cifold1(name: &str, v: &Val): Result[Val, DbErr] {
+    match v {
+        Val.Text(t) { return Ok(Val.Text(ciFold(&t))) }
+        else { return Ok(v) }
+    }
+}
+
+fn ciFold(s: &str): str {
+    var ascii = true
+    for i in 0..len(s) { if s[i] >= 128 { ascii = false } }
+    if ascii { return strings.toLowerAscii(&s) }
+    var b = newStrBuf()
+    var i = 0
+    while i < len(s) {
+        let d = strings.decodeAt(&s, i)
+        strings.addRune(mut &b, unicode.lower(unicode.upper(d.rune)))
+        i += d.size
+    }
+    return b.toStr()
+}
+
+// ---- enums and arrays (9.27, 9.90)
+
+// an enum value's place among its type's labels (9.90): vs[1] is the
+// type's name and labels, joined by \x1f
+fn enumPosFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let v = lexdb_sql.text(&vs[0])
+    let enc = lexdb_sql.text(&vs[1])
+    let parts = strings.split(&enc, "\x1f")
+    for i in 1..len(parts) { if parts[i] == v { return Ok(Val.Int(i)) } }
+    return Err(e("22P02", &("invalid input value for enum " + parts[0] + ": \"" + v + "\"")))
+}
+
+// #elem(a, i): a[i]
+fn elemFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let i = lexdb_ops.oidArg(&vs[1]).unwrapOr(0)
+    let ps = try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0]))
+    if i < 1 || i > len(ps) { return Ok(Val.Null) }
+    match ps[i - 1] {
+        Some(p) { return Ok(Val.Text(p)) }
+        None { return Ok(Val.Null) }
+    }
+}
+
+fn unnestFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(srfMark(&[])) }
+    var vals: []Val = []
+    for p in try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0])) {
+        match p {
+            Some(x) { append(mut &vals, Val.Text(x)) }
+            None { append(mut &vals, Val.Null) }
+        }
+    }
+    return Ok(srfMark(&vals))
+}
+
+fn subscriptsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(srfMark(&[])) }
+    let k = len(try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0])))
+    var vals: []Val = []
+    for i in 1..k + 1 { append(mut &vals, Val.Int(i)) }
+    if len(vs) == 3 && lexdb_ops.truth(&vs[2]) == Some(true) {
+        var rev: []Val = []
+        var j = len(vals) - 1
+        while j >= 0 {
+            append(mut &rev, vals[j])
+            j -= 1
+        }
+        return Ok(srfMark(&rev))
+    }
+    return Ok(srfMark(&vals))
+}
+
+fn arrayToStringFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    var parts: []str = []
+    for p in try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0])) {
+        match p {
+            Some(x) { append(mut &parts, x) }
+            None { if len(vs) == 3 && !lexdb_ops.isNull(&vs[2]) { append(mut &parts, lexdb_sql.text(&vs[2])) } }
+        }
+    }
+    return Ok(Val.Text(strings.join(&parts, &lexdb_sql.text(&vs[1]))))
+}
+
+// array_length, array_upper (a, dim), array_lower; cardinality(a)
+fn arrLenOf(vs: &[]Val, lower: bool, card: bool): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let k = len(try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0])))
+    if k == 0 { return Ok(if card { Val.Int(0) } else { Val.Null }) }
+    if len(vs) == 2 && lexdb_ops.oidArg(&vs[1]).unwrapOr(0) != 1 { return Ok(Val.Null) }
+    return Ok(Val.Int(if lower { 1 } else { k }))
+}
+
+fn arrLengthFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return arrLenOf(vs, false, false) }
+fn arrLowerFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return arrLenOf(vs, true, false) }
+fn cardinalityFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return arrLenOf(vs, false, true) }
+
+// array[a, b, ...]
+fn arrayFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return Ok(Val.Text(lexdb_ops.arrayText(vs))) }
+
+// ---- the system information functions that read nothing (9.27)
+
+fn encodingFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Text(if lexdb_ops.oidArg(&vs[0]) == Some(6) { "UTF8" } else { "SQL_ASCII" }))
+}
+
+fn visibleFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(if lexdb_ops.isNull(&vs[0]) { Val.Null } else { Val.Bool(true) })
+}
+
+fn nullFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return Ok(Val.Null) }
+
+// pg_get_expr(text, rel [, pretty]): pretty without the parentheses around the whole
+fn getExprFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) == 3 && lexdb_ops.truth(&vs[2]) == Some(true) && !lexdb_ops.isNull(&vs[0]) { return Ok(Val.Text(lexdb_sql.unwrapParens(&lexdb_sql.text(&vs[0])))) }
+    return Ok(vs[0])
+}
+
+fn versionFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return Ok(Val.Text("PostgreSQL 16.0 (lexdb 0.1)")) }
+fn databaseFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return Ok(Val.Text("lexdb")) }
+
+// ---- JSON (9.16)
+
+fn jsonText(v: &Val): str {
+    match v {
+        Val.Null { return "null" }
+        Val.Int(n) { return n.toStr() }
+        Val.Num(d) { return d.toStr() }
+        Val.Bool(b) { return if b { "true" } else { "false" } }
+        Val.Float(_) { return lexdb_sql.text(v) }
+        else {
+            var b = newStrBuf()
+            b.addByte('"')
+            let s = lexdb_sql.text(v)
+            for i in 0..len(s) {
+                let c = s[i]
+                if c == '"' { b.add("\\\"") }
+                else if c == '\\' { b.add("\\\\") }
+                else if c == '\n' { b.add("\\n") }
+                else if c == '\t' { b.add("\\t") }
+                else if c == '\r' { b.add("\\r") }
+                else { b.addByte(c) }
+            }
+            b.addByte('"')
+            return b.toStr()
+        }
+    }
+}
+
+fn jsonObjectFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let n = len(vs)
+    if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
+    var parts: []str = []
+    var k = 0
+    while k < n {
+        if lexdb_ops.isNull(&vs[k]) { return Err(e("22004", "null value not allowed for object key")) }
+        append(mut &parts, jsonText(&Val.Text(lexdb_sql.text(&vs[k]))) + " : " + jsonText(&vs[k + 1]))
+        k += 2
+    }
+    return Ok(Val.Text("{" + strings.join(&parts, ", ") + "}"))
+}
+
+// ---- math (9.79)
+
+fn powFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return lexdb_ops.powOp(&vs[0], &vs[1]) }
+
+// round(x, s): a numeric's, to s places (negative: left of the point)
+fn round2Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    match lexdb_ops.asNum(&vs[0]) {
+        Some(d) {
+            match vs[1] {
+                Val.Int(s) {
+                    if s < 0 {
+                        // a negative scale rounds the digits left of the point
+                        // (past the 38 digits a numeric holds the answer is 0; the product is checked)
+                        if s < -200 { return Ok(Val.Num(Decimal.fromInt(0))) }
+                        var pw = Decimal.fromInt(1)
+                        for _ in 0..(-s) {
+                            match pw.mulExact(Decimal.fromInt(10)) {
+                                Ok(r) { pw = r }
+                                Err(_) { return Ok(Val.Num(Decimal.fromInt(0))) }
+                            }
+                        }
+                        match d.div(pw, 0, Rounding.HALF_AWAY) {
+                            Ok(q) {
+                                match q.mulExact(pw) {
+                                    Ok(r) { return Ok(Val.Num(r)) }
+                                    Err(_) { return Err(lexdb_ops.decErr()) }
+                                }
+                            }
+                            Err(_) { return Err(lexdb_ops.decErr()) }
+                        }
+                    }
+                    if s > 200 { return Ok(Val.Num(d)) }
+                    match d.roundAway(s) {
+                        Ok(r) { return Ok(Val.Num(r)) }
+                        Err(_) { return Err(lexdb_ops.decErr()) }
+                    }
+                }
+                else {}
+            }
+        }
+        None {}
+    }
+    return Err(noSuch(name, 2))
+}
+
+// random(): a double in [0, 1), from the kernel's random bytes.
+fn randomFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var b = array(8, byte(0))
+    if getrandom(mut &b, 8, u32(0)) != 8 { return Err(e("58000", "could not generate random values")) }
+    var n = 0
+    for i in 0..7 { n = n * 256 + int(b[i]) }
+    n = n >> 3                  // 53 bits
+    return Ok(Val.Float(float(n) / 9007199254740992.0f))
+}
+
+// ---- uuid and bytea (9.78)
+
+extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
+
+// gen_random_uuid(): version 4, from the kernel's random bytes.
+fn uuidFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var b = array(16, byte(0))
+    if getrandom(mut &b, 16, u32(0)) != 16 { return Err(e("58000", "could not generate random values")) }
+    b[6] = byte((int(b[6]) & 0x0f) | 0x40)
+    b[8] = byte((int(b[8]) & 0x3f) | 0x80)
+    return Ok(Val.Uuid(lexdb_rows.uuidText(&strFromBytes(&b))))
+}
+
+// encode(bytes, format), decode(text, format): hex, base64 or escape
+fn encodeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let b = try lexdb_ops.coerce(vs[0], &lexdb_sql.oidType(lexdb_sql.OID_BYTEA))
+    match b { Val.Bytes(x) { return Ok(Val.Text(try encodeBytes(&x, &lexdb_sql.text(&vs[1])))) } else {} }
+    return Ok(Val.Bytes(try decodeBytes(&lexdb_sql.text(&vs[0]), &lexdb_sql.text(&vs[1]))))
+}
+
+fn decodeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    return Ok(Val.Bytes(try decodeBytes(&lexdb_sql.text(&vs[0]), &lexdb_sql.text(&vs[1]))))
+}
+
+// encode(bytes, format): hex, base64 or escape.
+fn encodeBytes(b: &str, f: &str): Result[str, DbErr] {
+    let fmt = strings.toLowerAscii(&f)
+    if fmt == "hex" { return Ok(lexdb_sql.bytesHex(b)[2..]) }
+    if fmt == "base64" {
+        // 76 characters a line, as PostgreSQL writes it
+        let x = base64.encode(b)
+        var out = newStrBuf()
+        var i = 0
+        while i < len(x) {
+            if i > 0 { out.addByte('\n') }
+            let end = if i + 76 < len(x) { i + 76 } else { len(x) }
+            out.add(&x[i..end])
+            i = end
+        }
+        return Ok(out.toStr())
+    }
+    if fmt == "escape" {
+        var out = newStrBuf()
+        for i in 0..len(b) {
+            let c = b[i]
+            if c == '\\' { out.add("\\\\") }
+            else if c < 32 || c > 126 {
+                out.addByte('\\')
+                out.addByte('0' + (c >> 6))
+                out.addByte('0' + ((c >> 3) & 7))
+                out.addByte('0' + (c & 7))
+            } else { out.addByte(c) }
+        }
+        return Ok(out.toStr())
+    }
+    return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
+}
+
+// decode(text, format): hex, base64 or escape.
+fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
+    let fmt = strings.toLowerAscii(&f)
+    if fmt == "hex" { return lexdb_ops.parseBytea(&("\\x" + t)) }
+    if fmt == "base64" {
+        var clean = newStrBuf()
+        for i in 0..len(t) { if t[i] != '\n' && t[i] != '\r' && t[i] != ' ' && t[i] != '\t' { clean.addByte(t[i]) } }
+        match base64.decodeStrict(&(clean.toStr())) {
+            Some(x) { return Ok(x) }
+            None { return Err(e("22023", "invalid base64 input")) }
+        }
+    }
+    if fmt == "escape" { return lexdb_ops.parseBytea(t) }
+    return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
+}
