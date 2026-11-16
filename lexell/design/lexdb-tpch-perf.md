@@ -68,10 +68,28 @@ and q19, q20 and q7 are furthest off.
   5598/5599) or times anything runs under `flock ~/tpch/.bench.lock ...`.
 - Servers run on CPUs 0-3 (`TPCH_CPUS=0-3`); 8-11, their SMT siblings, stay
   idle. Builds and tests run on 4-7,12-15 (`taskset -c 4-7,12-15`, `-j 2`).
+- Tests, probe builds and probe runs hold the same lock *shared*
+  (`flock -s ~/tpch/.bench.lock ...`): they run alongside each other but
+  never during a benchmark. All-core load lowers this CPU's boost clock and
+  shares its L3 and memory bandwidth; a full run came out 10-25% slower
+  under it. Never run tests inside an exclusive section (it deadlocks).
+- `run.sh` turns CPU boost off for a run and restores it after
+  (`bench/tpch/cpu-boost`; README "CPU boost"), so every recorded run is at
+  the base clock; `config.txt` records the clock a run had. Runs with boost
+  on and off are not comparable.
+- Leave no background process running: kill what you start.
 - A/B against the baseline binary `~/tpch/bin/lexdb-1744ef99`, both
   measured in the same session; report medians of three warm runs and the
   run-to-run spread. Separate runs of an unchanged query move up to about
   8%, so a smaller difference is not a result.
+
+**PostgreSQL's settings (a follow-up).** PostgreSQL runs natively (the
+Arch package, a transient systemd unit pinned to the same CPUs, no
+container), with only `shared_buffers=12GB` and the parallel settings
+set: `work_mem` 4 MB, `random_page_cost` 4, `effective_cache_size` 4 GB
+and JIT are its defaults. A tuned column (`work_mem`, `random_page_cost`
+for NVMe, JIT on and off, chosen by measurement) should sit beside the
+default one before the comparison is called final.
 
 **Where to work.**
 

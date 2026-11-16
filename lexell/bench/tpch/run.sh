@@ -40,6 +40,8 @@
 #   TPCH_CHECK_ONLY=1         check prerequisites and the plan; run nothing
 #   TPCH_REF=DIR              an earlier run's directory whose pg1.tsv checks
 #                             lexdb's results when this run has no pg1
+#   TPCH_BOOST=off            CPU frequency boost for the run: off (default:
+#                             a fixed clock, restored after), or keep
 #
 # First time:
 #   lexell/bench/tpch/fetch.sh WORKDIR/tpch-kit
@@ -152,7 +154,24 @@ psql_admin() {
 }
 
 stop() { systemctl --user stop "tpch-$1" 2>/dev/null || true; }
-trap 'stop lexdb; stop pg' EXIT
+
+# CPU frequency boost. With it on, a core's clock follows how many other
+# cores are busy and how warm the machine is, and the same query moved
+# 10-25% between runs; with it off every run is at the base clock. It is
+# turned off for the run and restored on exit (also on an interrupt), by
+# bench/tpch/cpu-boost, installed root-owned in /usr/local/sbin with a
+# sudoers rule for exactly its "on" and "off" (README.md).
+BOOST_FILE=/sys/devices/system/cpu/cpufreq/boost
+BOOST_WAS=$(cat "$BOOST_FILE" 2>/dev/null || echo unknown)
+BOOST_SET=
+restore_boost() {
+    if [ -n "$BOOST_SET" ]; then
+        sudo -n /usr/local/sbin/cpu-boost on || echo "run.sh: could not turn CPU boost back on" >&2
+        BOOST_SET=
+    fi
+}
+trap 'stop lexdb; stop pg; restore_boost' EXIT
+trap 'exit 130' INT TERM
 
 start_lexdb() {
     stop lexdb
@@ -300,6 +319,20 @@ if [ -n "${TPCH_CHECK_ONLY:-}" ]; then
     exit 0
 fi
 
+case "${TPCH_BOOST:-off}" in
+    keep) ;;
+    off)
+        if [ "$BOOST_WAS" = 1 ]; then
+            if sudo -n /usr/local/sbin/cpu-boost off; then
+                BOOST_SET=1
+            else
+                echo "run.sh: cannot turn CPU boost off; install bench/tpch/cpu-boost (README.md) or set TPCH_BOOST=keep" >&2
+                exit 1
+            fi
+        fi ;;
+    *) echo "run.sh: TPCH_BOOST is off or keep" >&2; exit 2 ;;
+esac
+
 rm -f "$OUT"/lexdb.tsv "$OUT"/pg1.tsv "$OUT"/pg4.tsv \
       "$OUT"/load-*.tsv "$OUT"/analyze-*.ms "$OUT"/*.log "$OUT"/summary.md \
       "$OUT"/summary.txt
@@ -317,6 +350,13 @@ rm -f "$OUT"/lexdb.tsv "$OUT"/pg1.tsv "$OUT"/pg4.tsv \
     printf 'pg_cpu_quota\t%s\n' "${PG_CPU_QUOTA:-none}"
     printf 'pg_shared_buffers\t%s\n' "$PG_SHARED_BUFFERS"
     printf 'pg_binary\t%s\n' "$POSTGRES"
+    # the clock the run had: boost, governor, the servers' first CPU's limits
+    c0=${TPCH_CPUS%%[-,]*}; c0=${c0:-0}
+    fq=/sys/devices/system/cpu/cpu$c0/cpufreq
+    printf 'cpu_boost\t%s\n' "$(cat "$BOOST_FILE" 2>/dev/null || echo unknown)"
+    printf 'cpu_governor\t%s\n' "$(cat "$fq/scaling_governor" 2>/dev/null || echo unknown)"
+    printf 'cpu_epp\t%s\n' "$(cat "$fq/energy_performance_preference" 2>/dev/null || echo unknown)"
+    printf 'cpu_max_khz\t%s\n' "$(cat "$fq/scaling_max_freq" 2>/dev/null || echo unknown)"
 } > "$OUT/config.txt"
 gen_data
 

@@ -111,7 +111,9 @@ name, rows, median/min/max wall ms, median/min/max CPU ms, MD5, status),
 | `TPCH_QUERIES` | all | query numbers, e.g. `3,5,15` |
 | `PG_SHARED_BUFFERS` | `12GB` | PostgreSQL `shared_buffers` |
 | `QUERY_TIMEOUT` | `900` | seconds per query; lexdb cancels on the server, psql gets 30 s more |
-| `TPCH_CPUS` | `0-7` | CPUs both servers are confined to; empty for none |
+| `TPCH_CPUS` | `0-3` | CPUs both servers are confined to; empty for none |
+| `TPCH_REF` | unset | an earlier run's directory whose `pg1.tsv` checks lexdb's results when this run has none |
+| `TPCH_BOOST` | `off` | CPU frequency boost for the run: `off` (a fixed clock, restored after) or `keep` |
 | `TPCH_INDEXES` | `conventional` | secondary indexes after the load; `none` for PKs only |
 | `LEXDB_CACHE_MB` | lexdb's default | passed to lexdb |
 | `LEXDB_CPU_QUOTA` | unset | lexdb's cgroup quota; `400%` budget-matches PG |
@@ -120,6 +122,22 @@ name, rows, median/min/max wall ms, median/min/max CPU ms, MD5, status),
 | `LXL_PAR` | lexdb's default | par.map threads (`0` runs the caller's thread only) |
 | `POSTGRES` | `command -v postgres` | PostgreSQL server binary |
 | `LEXDB_PORT`, `PG_PORT` | `5598`, `5599` | ports |
+
+**CPU boost.** With boost on, a core's clock follows the machine's load
+and temperature, and the same query moved 10-25% between runs. `run.sh`
+turns boost off for a run and restores it on exit, through
+[`cpu-boost`](cpu-boost), which needs root. Install it once, root-owned,
+with a sudoers rule for exactly its two arguments (validate the rule
+before installing it):
+
+```sh
+sudo install -o root -g root -m 0755 cpu-boost /usr/local/sbin/cpu-boost
+echo 'chris ALL=(root) NOPASSWD: /usr/local/sbin/cpu-boost on, /usr/local/sbin/cpu-boost off' > /tmp/cpu-boost.sudoers
+sudo visudo -cf /tmp/cpu-boost.sudoers && sudo install -o root -g root -m 0440 /tmp/cpu-boost.sudoers /etc/sudoers.d/cpu-boost
+```
+
+Without it, `run.sh` refuses to run unless `TPCH_BOOST=keep`. Each run's
+`config.txt` records the boost, governor, EPP and maximum clock it had.
 
 Use one `WORKDIR` per scale factor; `run.sh` refuses a workdir that already
 has a different `sf*`. To reload a database, remove its directory and
