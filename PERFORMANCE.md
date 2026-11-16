@@ -1102,7 +1102,7 @@ on the same four physical cores, the clients on the other four.
 | single-row autocommit inserts, 1 client | **3,843/s** (0.26 ms) | 1,577/s (0.63 ms) |
 | `count(*)`, 1M rows | **3.9 ms** | 19.4 (one core), 12.1 (4 processes) |
 | 35 analytic queries, geometric mean of lexdb's time over PG's | 0.78 against one core, 1.30 against 4 processes | |
-| TPC-H derived, SF1, 22 queries: geometric mean of lexdb's time over PG's (pinned, 2026-11-16) | 3.77 against one core | |
+| TPC-H derived, SF1, 22 queries: geometric mean of lexdb's time over PG's (pinned, boost off, 2026-11-16, `94536d12`) | 2.48 against one core (3.77 at `1744ef99`), 4.51 against 4 processes | |
 | COPY of 1M wide rows (12 columns) | **1.48 s** | 1.79 s (SQL Server bcp 3.34 s) |
 | COPY of 10M narrow rows | **5.32 s** | 5.81 s (bcp 10.86 s) |
 

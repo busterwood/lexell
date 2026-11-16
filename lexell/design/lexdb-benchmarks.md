@@ -134,6 +134,42 @@ is `lexdb-tpch-plans.md`; the work to close the gap is `lexdb-tpch-perf.md`.
 | q17 | **37** | 515 | 0.1 |
 | all 22, summed | 66.0 s | 12.5 s | |
 
+**At a fixed clock, main `94536d12` (2026-11-16):** the same setup with the
+CPU boost off for both engines (3.8 GHz; `run.sh` turns it off and records
+it in `config.txt`), after the first merges of the perf work (exec steps 1
+and 2a, semi, joinorder, outer). **Geometric mean of lexdb / PG one core:
+2.48** (wall; 2.31 server CPU; 4.51 against four processes); level or
+ahead on 4 of 22 (q1, q2, q17, q18). Checksums as at the baseline.
+Results: `~/tpch-w/int/out-main-94536d12-full`. The baseline column ran
+with boost on, so it is up to ~20% faster than it would be at this clock:
+PostgreSQL's own sum moved from 12.5 s to 14.0 s between the two.
+
+| | lexdb `1744ef99` (boost on) | lexdb `94536d12` | PG one core | ratio |
+|---|---:|---:|---:|---:|
+| q1 | 15,924 | 2,527 | 3,300 | 0.8 |
+| q2 | 61 | 70 | 160 | 0.4 |
+| q3 | 2,642 | 2,499 | 516 | 4.8 |
+| q4 | 4,004 | 666 | 201 | 3.3 |
+| q5 | 1,703 | 1,166 | 280 | 4.2 |
+| q6 | 1,061 | 666 | 512 | 1.3 |
+| q7 | 5,113 | 1,939 | 585 | 3.3 |
+| q8 | 425 | 474 | 240 | 2.0 |
+| q9 | 4,296 | 5,370 | 1,732 | 3.1 |
+| q10 | 1,612 | 1,826 | 681 | 2.7 |
+| q11 | 197 | 231 | 61 | 3.8 |
+| q12 | 1,231 | 1,508 | 944 | 1.6 |
+| q13 | 5,938 | 1,226 | 789 | 1.6 |
+| q14 | 696 | 807 | 161 | 5.0 |
+| q15 | 1,413 | 1,239 | 620 | 2.0 |
+| q16 | 580 | 703 | 260 | 2.7 |
+| q17 | 37 | 45 | 579 | 0.1 |
+| q18 | 2,731 | 1,268 | 1,261 | 1.0 |
+| q19 | 463 | 572 | 40 | 14.3 |
+| q20 | 1,140 | 1,431 | 123 | 11.6 |
+| q21 | 13,525 | 8,634 | 820 | 10.5 |
+| q22 | 1,200 | 745 | 88 | 8.5 |
+| all 22, summed | 66.0 s | 35.6 s | 14.0 s | |
+
 ## 2. Host and rules
 
 - **Host:** AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB, bare-metal
@@ -189,6 +225,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-16 | 94536d12 | TPC-H derived, SF1, boost off | lexdb / PG one core 2.48 (geometric mean, wall; was 3.77), 4 of 22 level or ahead; worst q19 14×, q20 12×, q21 10.5×, q22 8.5×; pinned 0-3, 3.8 GHz | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-16 | 1744ef99 | TPC-H derived, SF1 | lexdb / PG one core 3.77 (geometric mean, wall), 2 of 22 level or ahead; q4 22×, q21 20×, q1 5.6×; pinned 0-3 | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-15 | exp/ckpt-incremental | commit latency | the checkpoint's stall gone: commit max 70 → 8-11 ms, p99.9 4.2-4.5 → 3.9-4.4, p99 0.72-0.76 → 0.88-0.91 (master alone, 8 clients, pinned) | this page, 1.2; lexdb.md 9.136 |
 | 2026-11-15 | exp/ckpt-incremental | OLTP, replicas, aggregates (**pinned**, first) | 3 replicas: point selects 376,000-377,700/s at 32 clients (PG on 4 cores 386,600; 426,000 at 8); updates 2.26 / 2.63 / 1.54 × PG; lag p99 0.80-1.27 ms under load | this page, 1.1-1.3; lexdb.md 9.136 |
