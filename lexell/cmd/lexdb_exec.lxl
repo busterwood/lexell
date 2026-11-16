@@ -807,7 +807,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
                 append(mut &rows, row)
                 try rs.tick()
-                match lexdb_ops.arithZ(&"+", &v, &step, &zone) {
+                match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
                 }
@@ -834,7 +834,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             append(mut &rows, row)
             try rs.tick()
             // the next value; past the type's range: the end
-            match lexdb_ops.arithZ(&"+", &v, &step, &txn.sql.zone) {
+            match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &txn.sql.zone) {
                 Ok(x) { v = x }
                 Err(_) { break }
             }
@@ -1057,7 +1057,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                     }
                     else {}
                 }
-                return lexdb_ops.arith(&"/", &vs[0], &vs[1])
+                return lexdb_ops.arith(lexdb_ops.OP_DIV, &vs[0], &vs[1])
             }
             if name == "#tavg" && len(vs) == 2 {
                 // T-SQL's AVG: an integer's cut to an integer, a decimal's to its scale
@@ -1126,8 +1126,9 @@ fn seqZone(seq: &Option[SeqEnv]): lexdb_time.Zone {
 fn binVal(op: &str, l: Val, r: Val, seq: &Option[SeqEnv]): Result[Val, DbErr] {
     let code = lexdb_ops.opCode(op)
     if code < 0 {
-        if lexdb_sql.isTimeKind(lexdb_ops.kindOf(&l)) || lexdb_sql.isTimeKind(lexdb_ops.kindOf(&r)) { return lexdb_ops.arithZ(op, &l, &r, &seqZone(seq)) }
-        return lexdb_ops.arith(op, &l, &r)
+        if lexdb_ops.isNull(&l) || lexdb_ops.isNull(&r) { return Ok(Val.Null) }
+        return Err(e("42883", &("operator does not exist: " + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&l))) + " " + op + " " +
+                                lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&r))))))
     }
     return lexdb_ops.binOp(code, l, r, fn(): lexdb_time.Zone { return seqZone(seq) })
 }
@@ -7168,7 +7169,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 row[lv.first] = v
                 matched = true
                 if !(try emit(txn, row)) { return Ok(false) }
-                match lexdb_ops.arithZ(&"+", &v, &sr.vals[2], &txn.sql.zone) {
+                match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &sr.vals[2], &txn.sql.zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
                 }
@@ -7192,7 +7193,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 if got < 0 { return Ok(false) }
                 if got > 0 { matched = true }
                 // the next value; past the type's range: the end
-                match lexdb_ops.arithZ(&"+", &v, &sr.vals[2], &txn.sql.zone) {
+                match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &sr.vals[2], &txn.sql.zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
                 }
@@ -14859,8 +14860,8 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
         // avg of reals adds in double precision, as PostgreSQL's float4_accum
         let w = if f == "avg" && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
         // and squares them, so overflows where PostgreSQL's float8_accum does
-        if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(&"*", &w, &w) }
-        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(&"+", &acc.sum, &w) }
+        if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
+        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &w) }
     } else if f == "min" {
         // of equal values the last, as PostgreSQL's numeric_smaller gives
         // (0.5 and 0.500: 0.500 if it comes after)
@@ -14903,9 +14904,9 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     } else if f != "count" {
         // the variances and standard deviations
         let x = try numOf(&v, &f)
-        let sq = try lexdb_ops.arith(&"*", &x, &x)
-        acc.sum = if lexdb_ops.isNull(&acc.sum) { x } else { try lexdb_ops.arith(&"+", &acc.sum, &x) }
-        acc.sumsq = if lexdb_ops.isNull(&acc.sumsq) { sq } else { try lexdb_ops.arith(&"+", &acc.sumsq, &sq) }
+        let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &x, &x)
+        acc.sum = if lexdb_ops.isNull(&acc.sum) { x } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &x) }
+        acc.sumsq = if lexdb_ops.isNull(&acc.sumsq) { sq } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sumsq, &sq) }
     }
     acc.n += 1
     return Ok(Unit{})
@@ -14981,7 +14982,7 @@ fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     if f == "count" { return Ok(Val.Int(acc.n)) }
     if acc.n == 0 { return Ok(Val.Null) }
     if f == "sum" { return Ok(acc.sum) }
-    if f == "avg" { return lexdb_ops.arith(&"/", &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
+    if f == "avg" { return lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
     if f == "string_agg" && len(sp.order) > 0 { return Ok(Val.Text(try orderedParts(sp, acc))) }
     if f == "string_agg" { return Ok(Val.Text(strings.join(&acc.parts, ""))) }
     if f == "array_agg" {
@@ -14996,9 +14997,9 @@ fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let pop = f == "var_pop" || f == "stddev_pop"
     if !pop && acc.n < 2 { return Ok(Val.Null) }
     let n = Val.Int(acc.n)
-    let num = try lexdb_ops.arith(&"-", &(try lexdb_ops.arith(&"*", &n, &acc.sumsq)), &(try lexdb_ops.arith(&"*", &acc.sum, &acc.sum)))
+    let num = try lexdb_ops.arith(lexdb_ops.OP_SUB, &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &n, &acc.sumsq)), &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &acc.sum)))
     let den = Val.Int(if pop { acc.n * acc.n } else { acc.n * (acc.n - 1) })
-    let vr = try lexdb_ops.arith(&"/", &(try numOf(&num, &f)), &(try numOf(&den, &f)))
+    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&num, &f)), &(try numOf(&den, &f)))
     if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
     return sqrtNum(&vr)
 }
@@ -22012,7 +22013,7 @@ fn frameBounds(w: &WinPlan, k: int, n: int, grp: &[]int, gStart: &[]int, gEnd: &
 // v - off or v + off: the value a RANGE bound stands at (preceding rows
 // have smaller values going up, larger going down).
 fn rangeTarget(v: &Val, off: &Val, preceding: bool, desc: bool): Result[Val, DbErr] {
-    return lexdb_ops.arith(&(if preceding != desc { "-" } else { "+" }), v, off)
+    return lexdb_ops.arith(if preceding != desc { lexdb_ops.OP_SUB } else { lexdb_ops.OP_ADD }, v, off)
 }
 
 // The first position whose value is not before t (after: not after t is
@@ -23455,7 +23456,7 @@ fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int, av
         if lexdb_ops.isNull(&av[g]) {
             av[g] = b.vals[c][r]
         } else if summing {
-            av[g] = try lexdb_ops.arith(&"+", &av[g], &b.vals[c][r])
+            av[g] = try lexdb_ops.arith(lexdb_ops.OP_ADD, &av[g], &b.vals[c][r])
         } else {
             let x = try lexdb_ops.compare(&b.vals[c][r], &av[g])
             if (mx && x >= 0) || (!mx && x <= 0) { av[g] = b.vals[c][r] }
