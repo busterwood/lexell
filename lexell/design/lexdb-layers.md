@@ -711,6 +711,7 @@ Steps, each with q1, q6 and the scan queries as its gate:
 - 2-iv: `bGenOf` from the plan's bound expression. Its slots are the
   batch row's places, so it re-slots a bound tree instead of binding
   again.
+  (As built: see "2-iv as built".)
 
 **2-ii as built: `bCompile` reads `BX`.** The batch nodes it makes are
 the same as before, node for node; only what it reads changed.
@@ -910,6 +911,135 @@ unless named; search for the names.
   For one query, a server per binary on the TPC-H data with the query
   run 15 times through psql (median), three rounds alternating, gave a
   steadier number than `run.sh` did for q20.
+
+**2-iv as built: `bGenOf` re-slots the plan's bound tree.**
+
+- `bGenOf(x: &BX, kinds, base, need, ce)` takes the tree the plan bound
+  over the query's columns by place and re-slots it
+  (`lexdb_bind.reslot`): a `BX.Col(i)` becomes `Col(s)`, where `s` is the
+  place of query column `i` in the `BGen`'s own row (`BGen.cols[s]` is the
+  batch's column `i - base`), in first-read order, as `bindExpr` with
+  `direct` false numbered them. No name is looked up and no function is
+  bound again (`typing()`, `fnBind`); the walk only copies.
+- Parameters stay slots. The `BGen` gets the run's `CEnv` (`Mats.ce`: its
+  session, transaction start and zone), with its parameters copied only
+  when the tree reads one (`reslot`'s `par`), as `outC` does for
+  `Sel.oxParam`. `bGenVals`' "column op constant" shape takes a
+  `BX.Param` given in that `CEnv` as its constant (`cxLit`), so `col ||
+  $1` keeps the shape it had when parameters were bound as constants.
+- Where the tree comes from:
+  - a level's conditions: `bCondNode(q, m, k, i, post, kinds, base,
+    need)`, which reads `Mats.cc`/`cp` or `Query.cc`/`cp` as
+    `bCompileCond` does (else `bxOf`), then `bCondOf`: the batch kernel
+    when `bCompile` gives a boolean, else `bGenOf` of the same tree. It
+    serves the first level (`bLevelPlan`) and the joins (`bJoinPlan`'s
+    conditions and post).
+  - outputs: `outNodeOut` (`Sel.ox`; else `bxOf`, which is a plain column
+    the plan does not bind) and ORDER BY keys `outNodeX` (`bxOf`: the
+    plan holds no binding for them), both into `outNode(x: &BX, ...)`,
+    which tries `bCompile` and then `bGenOf` of the same tree.
+- Deleted: `bJoinCond` (now `bCondNode`), `bLevelPlan`'s inline copy of
+  it, `bCompileOut` (now `outNodeOut`), `bGenOf`'s `Expr`, `params` and
+  `seq` arguments, and the `cenvOf(seqEnv(st, txn))` it made per
+  `BGen`. Per run, a condition or output that falls back to `Gen` is
+  bound once (or not at all, when the plan holds it) where it was bound
+  twice before (`bCompileX`, then `bGenOf`).
+- No change in results. A tree the plan could not bind (`None`: a
+  subquery, a correlated reference, a function only `eval` evaluates)
+  gave `None` from `bGenOf`'s own `bindExpr` too: the same functions
+  decide both (`bindIn`, `hasCorr` implies a subquery call). A parameter
+  past the ones given is the same error from `bxEval` as before.
+- No types added: no consumer needed one. `bGenVals` reads a constant's
+  value and the batch's kinds, as before.
+- Lines: `lexdb_exec` 30522 to 30549 (+27, mostly the new entry
+  points' comments), `lexdb_bind` 704 to 755 (`reslot`).
+- A/B against main 3457f377 (built from `git archive`), medians of 3
+  rounds, binaries alternating: TPC-H total 0.999, all 22 checksums the
+  baseline's; q1 0.986, q6 0.994, q18 0.984, q20 0.995 (`run.sh`).
+  Direct A/B (`qab.sh`, 15 runs per server, 7 for q1): q20 1.011
+  (368.4 to 372.6 ms, all three rounds), q18 1.008 (109.9 to 110.8),
+  q1 1.002, q6 0.998, q22 1.000. 35 queries 1.006 (window 1.036 on
+  279 ms, pk_point20k 1.021, the rest within 1.3%). Point selects
+  0.998/0.987/0.997 at 1/8/32 clients, updates 0.997/1.000/1.023.
+- None of the changed code runs per run in q20, q18, q1 or q6: a build
+  printing in `bGenOf` showed no call in q20, q18, q1, q6, q7, q8 and q13,
+  and 2 per run in q22 (its `substring` IN a list), which is level. So
+  q20's and q18's 1% in the direct A/B is not `bGenOf`; layout, most
+  likely, as 2-iii's q20 was (not verified with a profile).
+
+**Where 2-iv left off, and how to start item 3 (the function library).**
+All in `lexdb_exec` unless named; search for the names, since line
+numbers move.
+
+- What evaluates a bound call today: `bxEval`'s `BX.Call` arm evaluates
+  the arguments and calls `callRef(fb, vs, ce)`. `callRef` switches on
+  `FnRef.way` (`lexdb_bind.FN_ONE`: `call1(id, ...)`; `FN_COALESCE`:
+  `coalesceOf`; `FN_SUBSTR`: `substrOf`; `FN_CONCAT`: `concatOf`), then a
+  dialect function (`FnRef.dialect`: `callDialectFn`, `lexdb_tsqlfn`,
+  `lexdb_orafn`), then `callAt(name, vs, now, zone)`. `bGenVals` has its
+  own fast shape for `FN_ONE` over one column (`call1`, else `callAt`).
+  `eval`'s `Expr.Call` path reaches `callAt` by name too (search
+  `callAt(`; `call(` is `callAt` in UTC with no clock).
+- `callAt` is a chain of name tests: `callMisc(name, vs)`, then
+  `callFn(name, vs, z)`, then a few inline (`gen_random_uuid`, `random`,
+  `encode`/`decode`), then `callTime(name, vs, now, z)`, then `array`,
+  the quantified comparisons (`lexdb_sql.isQuant`), `in`, and more down
+  to its end. Each returns `Option` (None: not mine), so a call that
+  reaches the end has matched dozens of strings. Sizes on 3457f377+2-iv:
+  `callFn` ~490 lines, `callAt` ~190, `callMisc` ~160, `callTime` ~125,
+  `call1` ~40 (with `fn1Of` and the `F1_*` ids).
+- The binding side: `fnRefOf(name, n)` (exec, given to the binder as
+  `Typing.fnBind` by `typing()`) decides `FN_NONE` (what only `eval`
+  evaluates: aggregates, window calls, `isSeqFn`, `isSessFn`,
+  `isAdvFn`, `lexdb_sql.isCatFn`, `current_schema`, `#tdiv`, `#tavg`)
+  and otherwise the way. `FnRef` (`lexdb_bind`) is `name`, `way`, `id`,
+  `dialect`. Item 3's "`FnRef` gains the signature's entry point" is
+  where a function value (or an id into a table in `lexdb_ops`) goes;
+  `reslot` copies `FnRef` field by field (it is not a copy type), so a
+  new field must be added there too.
+- What moves and what stays: the pure functions (text, numeric, time,
+  `encode`/`decode`, arrays, `call1`'s) move to `lexdb_ops` (or a module
+  beside it, below the binder), split per signature so nothing matches
+  a name per row. The session-bound calls stay in exec (sequences,
+  catalog, settings, advisory locks: `isSeqFn`, `isSessFn`, `isAdvFn`,
+  `isCatFn`; these are already `FN_NONE`). A time function gets the zone
+  and transaction start as arguments, as `lexdb_ops` takes them today
+  (a closure for the zone in `binOp`, `CEnv.now`/`zone` in `callRef`).
+- Before moving, list each function's helpers: `callFn` and `callMisc`
+  call many exec helpers (`text`, `intArg`, `substrOf`, `concatOf`,
+  formatting and regex helpers); each moves with its callers or is
+  already in `lexdb_ops`. 2b's rule holds: exec calls `lexdb_ops`
+  directly and keeps a `pub` forwarder only for names other modules and
+  tests use. A forwarder on a per-row path measurably slowed q20, and a
+  string match on a per-row path cost q18's HAVING (1.5M `binVal`s).
+- Traps:
+  - `BX` and `FnRef` are owned and not copy types: match a borrowed
+    `BX` and build a new one inside the arm (`reslot`), and copy a
+    `FnRef` by its fields.
+  - The suite compiles each test as it runs it: do not edit the sources
+    while it runs.
+  - `bxOf` binds per run (join, group and ORDER BY keys, aggregate
+    arguments): nothing costly may be added to `bindExpr`. A per-call
+    entry point found by name belongs in `fnRefOf` only if it is a cheap
+    lookup; else bind once in `bindSel`.
+  - Errors must keep their text and SQLSTATE: the row path (`eval`)
+    and the batches (`bxEval`, `bGenVals`) both reach the library, and a
+    batch whose row gives an error goes to the row path, which must give
+    the same one.
+- Gates: the suite (188), TPC-H all 22 (checksums against
+  `~/tpch/out-baseline-1744ef99`, fields [0] and [8]; q1, q8 and q17 show
+  "different result" in `run.sh`'s text check on every binary: formatting,
+  not checksums), q1, q6, q20 (8,508 subquery runs), q18's HAVING, the
+  35 queries (five fail on both binaries with la/base2's data: known) and
+  OLTP point selects and updates. Methods, scripts and build as 2-ii's
+  paragraph says; for one query, `qab.sh QFILE N LABEL...` (a server per
+  binary on `~/tpch-w/bind/lexdb`, the query N times through psql, the
+  median, three rounds alternating; take `flock ~/tpch/.bench.lock` and
+  turn boost off with `sudo /usr/local/sbin/cpu-boost off` first, as
+  `run.sh` does, and on after). A copy of `qab.sh` is in
+  `~/tpch-w/bind/bench`. Function-heavy queries to add: q22
+  (`substring` IN a list), q7's and q8's `extract`, q13's `like`, and the
+  35 queries' text ones.
 
 **The rest of 2c, planned:**
 

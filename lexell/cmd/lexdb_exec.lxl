@@ -22533,13 +22533,14 @@ fn boolLike(t: int): bool { return t == BT_BOOL || t == BT_NULL }
 
 // x over a batch; None: not one the batches evaluate (the row path does).
 // x is bound over q's columns by place (lexdb_bind.BX: bxOf, or as the
-// plan or prepare bound it: bCompileCond, bCompileOut); its constants
-// are evaluated once, in ce (the run's parameters and session: the zone
-// they are read in, 9.95).
+// plan or prepare bound it: bCompileCond, bCondNode, outNodeOut); its
+// constants are evaluated once, in ce (the run's parameters and session:
+// the zone they are read in, 9.95).
 fn bCompile(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] { return bCompileD(x, q, kinds, ce, base, false) }
 
-// x bound for bCompile and bGenOf: over q's columns by place, its
-// parameters as slots (BX.Param: the run's, in Mats.ce). None: only eval
+// x bound for bCompile and bGenOf where the plan holds no binding (join,
+// group and ORDER BY keys, aggregate arguments): over q's columns by
+// place, its parameters as slots (BX.Param: the run's, in Mats.ce). None: only eval
 // evaluates it.
 fn bxOf(x: &Expr, q: &Query): Option[BX] {
     let none: []Val = []
@@ -23215,10 +23216,10 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
                 }
             }
             lexdb_bind.BX.Op(code, x, y) {
-                                let lc = cxCol0(&x)
+                let lc = cxCol0(&x)
                 let rc = cxCol0(&y)
                 var kv = Val.Null
-                let lit = if lc { cxLit(&y, mut &kv) } else { cxLit(&x, mut &kv) }
+                let lit = if lc { cxLit(&y, &g.ce, mut &kv) } else { cxLit(&x, &g.ce, mut &kv) }
                 if (lc || rc) && !(lc && rc) && lit {
                     var out: []Val = withCapacity(m)
                     for j in 0..m {
@@ -23246,11 +23247,17 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
     return Ok(out)
 }
 
-// Whether x is a constant (its value in v).
-fn cxLit(x: &lexdb_bind.BX, v: mut &Val): bool {
+// Whether x is a constant: a literal, or a parameter slot given in ce
+// (its value in v).
+fn cxLit(x: &lexdb_bind.BX, ce: &CEnv, v: mut &Val): bool {
     match x {
         lexdb_bind.BX.Const(k) {
             v = k
+            return true
+        }
+        lexdb_bind.BX.Param(i) {
+            if i >= len(ce.params) { return false }
+            v = ce.params[i]
             return true
         }
         else { return false }
@@ -23265,14 +23272,17 @@ fn cxCol0(x: &lexdb_bind.BX): bool {
     }
 }
 
-// x compiled to run over a batch (BGen): the query's column i is the
-// batch's i - base, kinds per column of the query (BK_NONE: not in the
-// batch), need per column of the batch (decoded). None: x reads a column
-// the batch does not hold, or only eval evaluates it.
-fn bGenOf(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, params: &[]Val, seq: Option[SeqEnv]): Option[BGen] {
+// x, bound over the query's columns by place (the plan's binding, or
+// bxOf), compiled to run over a batch (BGen): re-slotted (lexdb_bind.reslot)
+// to a row of the columns it reads, the query's column i the batch's
+// i - base; kinds per column of the query (BK_NONE: not in the batch),
+// need per column of the batch (decoded); evaluated in ce (the run's:
+// Mats.ce), its parameters with it when x reads one. None: x reads a
+// column the batch does not hold.
+fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &CEnv): Option[BGen] {
     var slots: []int = []
-    let c = lexdb_bind.bindExpr(x, &q.cols, params, false, false, mut &slots, &typing())
-    if c.isNone() { return None }
+    var par = false
+    let c = lexdb_bind.reslot(x, mut &slots, mut &par)
     var cols: []int = []
     var ks: []int = []
     for i in slots {
@@ -23280,7 +23290,8 @@ fn bGenOf(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, params: 
         append(mut &cols, i - base)
         append(mut &ks, kinds[i])
     }
-    return Some(BGen{cx: c.unwrap(), cols: cols, kinds: ks, ce: cenvOf(seq)})
+    let gce = CEnv{seq: ce.seq, now: ce.now, zone: ce.zone, params: if par { copyRow(&ce.params) } else { [] }}
+    return Some(BGen{cx: c, cols: cols, kinds: ks, ce: gce})
 }
 
 // vals, of b's rows idx, added to b as a column of values (BK_VAL): its place.
@@ -23796,21 +23807,10 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     var conds: []BNode = []
     var vol: []bool = []
     for ci in 0..len(lv.cond) {
-        let x = &lv.cond[ci]
-        let c = bCompileCond(q, m, 0, ci, false, &qkinds, lv.first, false)
-        if c.isSome() {
-            let cc = c.unwrap()
-            if boolLike(cc.typ) {
-                append(mut &conds, takeN(cc))
-                append(mut &vol, isVolatile(x))
-                continue
-            }
-        }
-        // else compiled (9.108): a condition of any type, per row
-        match bGenOf(x, q, &qkinds, lv.first, &needCol, params, seqEnv(st, txn)) {
-            Some(g) {
-                append(mut &conds, BNode.Gen(g))
-                append(mut &vol, isVolatile(x))
+        match bCondNode(q, m, 0, ci, false, &qkinds, lv.first, &needCol) {
+            Some(n) {
+                append(mut &conds, n)
+                append(mut &vol, isVolatile(&lv.cond[ci]))
             }
             None {}
         }
@@ -24023,7 +24023,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         }
         var post: []BNode = []
         for pi in 0..len(lv.post) {
-            match bJoinCond(&lv.post[pi], bCompileCond(q, m, k, pi, true, &kinds, 0, false), q, &kinds, &need, params, st, txn) {
+            match bCondNode(q, m, k, pi, true, &kinds, 0, &need) {
                 Some(n) { append(mut &post, n) }
                 None { return Ok(None) }
             }
@@ -24102,7 +24102,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             // too: q21's shape nested in a subquery, "inner > $1")
             if !keyed && !rj && !lv.semi && q.minLevel(x) >= k { continue }
             if mode != JK_GEN && isKeyEq(x, q, lv) { continue }
-            match bJoinCond(x, bCompileCond(q, m, k, ci, false, &kinds, 0, false), q, &kinds, &need, params, st, txn) {
+            match bCondNode(q, m, k, ci, false, &kinds, 0, &need) {
                 Some(n) { append(mut &conds, n) }
                 None { return Ok(None) }
             }
@@ -24139,7 +24139,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
     return Ok(Some(jp))
 }
 
-// Batch join plans with a condition compiled per row (bJoinCond's), for
+// Batch join plans with a condition compiled per row (bCondNode's), for
 // the tests.
 var genJoinPlans: int = 0
 
@@ -24150,20 +24150,38 @@ var joinPlansMade: int = 0
 
 pub fn joinPlans(): int { return joinPlansMade }
 
-// A join level's condition x over the joined batch (kinds, need: the
-// query's columns in it): compiled for batches, else compiled (9.108) and
-// run per row there, as the first level's are (bLevelPlan): any condition
-// cxOf takes, so one the batches do not type (q7's OR across tables, a
-// char(n) compared, q22's substring IN a list) no longer sends the whole
-// query to the row path. None: neither (a subquery, a column not read).
-// A row on which it gives an error sends its batch to the row path, as a
-// compiled one's does. c: x compiled for batches (bCompileCond).
-fn bJoinCond(x: &Expr, c: Option[BComp], q: &Query, kinds: &[]int, need: &[]bool, params: &[]Val, st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[BNode] {
+// Level k's condition i (post: of its WHERE conjuncts after it) over a
+// batch (kinds: per column of the query, base: the batch's first, need:
+// per column of the batch), bound as bCompileCond reads it: compiled for
+// batches, else compiled (9.108) and run per row there (bGenOf: the same
+// bound tree re-slotted), so one the batches do not type (q7's OR across
+// tables, a char(n) compared, q22's substring IN a list) does not send
+// the whole query to the row path. None: neither (a subquery, a column
+// not read). A row on which it gives an error sends its batch to the row
+// path, as a compiled one's does.
+fn bCondNode(q: &Query, m: &Mats, k: int, i: int, post: bool, kinds: &[]int, base: int, need: &[]bool): Option[BNode] {
+    let xs = if post { &q.levels[k].post } else { &q.levels[k].cond }
+    let cs = if post { if len(m.cp) > 0 { &m.cp } else { &q.cp } } else { if len(m.cc) > 0 { &m.cc } else { &q.cc } }
+    if k < len(cs) && len(cs[k]) == len(xs) {
+        match cs[k][i] {
+            Some(b) { return bCondOf(&b, q, kinds, &m.ce, base, need) }
+            None { return None }
+        }
+    }
+    match bxOf(&xs[i], q) {
+        Some(b) { return bCondOf(&b, q, kinds, &m.ce, base, need) }
+        None { return None }
+    }
+}
+
+// bCondNode of the bound condition x.
+fn bCondOf(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, need: &[]bool): Option[BNode] {
+    let c = bCompile(x, q, kinds, ce, base)
     if c.isSome() {
         let cc = c.unwrap()
         if boolLike(cc.typ) { return Some(takeN(cc)) }
     }
-    match bGenOf(x, q, kinds, 0, need, params, seqEnv(st, txn)) {
+    match bGenOf(x, kinds, base, need, ce) {
         Some(g) { return Some(BNode.Gen(g)) }
         None { return None }
     }
@@ -25053,13 +25071,14 @@ fn takeON(c: ONode): BNode {
     return replace(mut &x.n, BNode.Const(0, false))
 }
 
-// x as an output or key over the batch: a column of it (src its column), an
-// integer or boolean expression (src -1), or a compiled expression of any
-// type (9.108: src -2, its values BK_VAL). kinds: per column of the query
-// (base: the batch's first), need: per column of the batch, decoded. None:
-// not one the batches evaluate. c: x compiled for batches (bCompileOut,
-// bCompileX).
-fn outNode(x: &Expr, c: Option[BComp], q: &Query, kinds: &[]int, base: int, need: &[]bool, params: &[]Val, seq: Option[SeqEnv]): Option[ONode] {
+// x, bound (as bCompile takes it), as an output or key over the batch: a
+// column of it (src its column), an integer or boolean expression (src
+// -1), or a compiled expression of any type (9.108: src -2, its values
+// BK_VAL; bGenOf). kinds: per column of the query (base: the batch's
+// first), need: per column of the batch, decoded. None: not one the
+// batches evaluate.
+fn outNode(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, need: &[]bool): Option[ONode] {
+    let c = bCompile(x, q, kinds, ce, base)
     if c.isSome() {
         let cc = c.unwrap()
         var col = -1
@@ -25073,8 +25092,16 @@ fn outNode(x: &Expr, c: Option[BComp], q: &Query, kinds: &[]int, base: int, need
         }
         if cc.typ != BT_OTHER { return Some(ONode{kind: if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT }, src: -1, n: takeN(cc)}) }
     }
-    match bGenOf(x, q, kinds, base, need, params, seq) {
+    match bGenOf(x, kinds, base, need, ce) {
         Some(g) { return Some(ONode{n: BNode.Gen(g), kind: BK_VAL, src: -2}) }
+        None { return None }
+    }
+}
+
+// outNode of x, bound now (bxOf).
+fn outNodeX(x: &Expr, q: &Query, kinds: &[]int, ce: &CEnv, base: int, need: &[]bool): Option[ONode] {
+    match bxOf(x, q) {
+        Some(b) { return outNode(&b, q, kinds, ce, base, need) }
         None { return None }
     }
 }
@@ -25104,16 +25131,16 @@ fn bOutVal(n: &BNode, src: int, b: mut &Batch, idx: &[]int, ex: mut &[]BVec, src
     return Ok(Unit{})
 }
 
-// bCompile of output i of sel, bound as the plan bound it (Sel.ox), else
-// now (bxOf); its constants in ce.
-fn bCompileOut(sel: &Sel, i: int, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] {
+// outNode of output i of sel, bound as the plan bound it (Sel.ox), else
+// now (bxOf: a column, which the plan does not bind); its constants in ce.
+fn outNodeOut(sel: &Sel, i: int, kinds: &[]int, ce: &CEnv, base: int, need: &[]bool): Option[ONode] {
     if len(sel.ox) == len(sel.exprs) {
         match sel.ox[i] {
-            Some(b) { return bCompile(&b, &sel.q, kinds, ce, base) }
+            Some(b) { return outNode(&b, &sel.q, kinds, ce, base, need) }
             None {}
         }
     }
-    return bCompileX(&sel.exprs[i], &sel.q, kinds, ce, base, false)
+    return outNodeX(&sel.exprs[i], &sel.q, kinds, ce, base, need)
 }
 
 // sel's OutPlan; None: its rows are made by the row path (runQuery).
@@ -25140,7 +25167,7 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     var kinds: []int = []
     var src: []int = []
     for xi in 0..len(sel.exprs) {
-        let c = outNode(&sel.exprs[xi], bCompileOut(sel, xi, qk, &m.ce, base), q, qk, base, need, params, seqEnv(st, txn))
+        let c = outNodeOut(sel, xi, qk, &m.ce, base, need)
         if c.isNone() { return Ok(None) }
         let on = c.unwrap()
         append(mut &kinds, on.kind)
@@ -25162,7 +25189,7 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 append(mut &ksrc, -1)
                 continue
             }
-            let c = outNode(&sel.order[oi], bCompileX(&sel.order[oi], q, qk, &m.ce, base, false), q, qk, base, need, params, seqEnv(st, txn))
+            let c = outNodeX(&sel.order[oi], q, qk, &m.ce, base, need)
             if c.isNone() { return Ok(None) }
             let on = c.unwrap()
             append(mut &kkinds, on.kind)
