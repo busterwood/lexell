@@ -490,6 +490,64 @@ range or an index per outer row, with `perf/semi`'s `bRange` (each
 batch's distinct keys in key order straight from the leaves) once it is
 on main, rather than a second reader.
 
+#### 4.1.8 Step 2b: inner and LEFT levels read by a range per row (bRange)
+
+`bJoinPlan` now takes a per-row level that is not a whole-key lookup but
+reads a range by its path's leading equalities only (`rangePath`: a
+primary key's leading columns or an index's equalities, no range bound,
+not backward) and joins it over batches with `perf/semi`'s `bRange`, as
+semi and anti levels are: each batch's distinct keys read in key order
+straight from the leaves, an index's entries decoded or their rows read
+by primary key. For an inner or LEFT level the whole range is read (a
+semi or anti level still stops at its first row when it has no filter).
+Also: `bConst` takes `#bppad` of constants as a constant, so a char(n)
+column compared with a literal (q21's `o_orderstatus = 'F'`, q7's nation
+names) is a batch comparison (`ValCmp`), not a per-row compiled one. The
+EXPLAIN ANALYZE double count when a batch gives way is `semi`'s fix
+(7f350792, the callers of `bJoinAll` restore the counts); this branch's
+own restore in `bJoinAll` was dropped in the merge so it is done once.
+
+Test: `exec_joinrange` (orders, lineitem keyed by order and line with an
+index by part, parts; orders without lines, NULL keys and filters):
+fixed and random INNER and LEFT queries over two and three tables, rows,
+sorted and grouped, residual conditions on the looked-up table, against
+batches off and against a hash form of the same join (`l.lk + 0 =
+o.ok`); EXPLAIN ANALYZE's counts the same with batches on and off,
+including where a batch gives way (division by zero on some row); in a
+transaction with its own writes. `exec_join`'s index lookup now runs over
+batches (its EXPLAIN shows `batches 1`); `exec_joingen` counts batch join
+plans (`joinPlans`), since the char(n) and OR conditions now compile
+outright. Suite: 179 passed in the full run; the three it failed (these two
+expectations, and `exec_joinrange` past its time under load, now smaller
+with a 90 s timeout) pass when rerun.
+
+A/B, same session, boost off (run.sh's fixed clock: about 20-25% slower
+than the boosted figures above), medians of three; main `5917302b`
+against this step:
+
+| query | main ms | step 2b ms | ratio |
+|---|---:|---:|---:|
+| q3 | 2,450 (2,447-2,451) | 2,408 (2,404-2,414) | 0.98 |
+| q5 | 1,150 (1,150-1,151) | 1,165 (1,163-1,166) | 1.01 |
+| q8 | 480 (479-481) | 362 (361-363) | 0.75 |
+| q9 | 5,373 (5,242-5,411) | 5,327 (5,224-5,345) | 0.99 |
+| q10 | 1,816 (1,797-1,817) | 1,192 (1,174-1,195) | 0.66 |
+| q21 | 8,568 (8,566-8,594) | 8,450 (8,403-8,479) | 0.99 |
+
+All 22 (`~/tpch-w/exec/out-rg3-all`): every checksum unchanged (q1, q8,
+q17 keep theirs). EXPLAIN ANALYZE says why four did not move:
+
+- q3 and q5: their orders level is `index orders_cust_date range` per
+  row, the customer's equality *and a range on o_orderdate* (`p.rng`),
+  which `rangePath` leaves out, so the query stays on the row path (q5's
+  first scan shows no batches). Next: let `bRange` read an equality
+  prefix with a bound on the next column, as `pathScan` builds it.
+- q9: over batches already (its levels are hashes and whole-key lookups);
+  its 5.3 s is elsewhere (319k rows through three lookups and the
+  derived table).
+- q21: over batches already (`semi`'s work); `o_orderstatus = 'F'` now
+  compiles for batches outright.
+
 ### 4.2 `semi`: semi and anti joins
 
 **What PostgreSQL does.** `pull_up_sublinks` (prep/prepjointree.c)

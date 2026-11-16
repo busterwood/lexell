@@ -1,0 +1,185 @@
+// lexdb_exec: an inner or LEFT join's level read per row of the tables
+// before it by a range (its primary key's leading columns, or an index's
+// equalities: TPC-H q3, q5 and q10's lineitem by l_orderkey, q8 and q9's
+// index lookups), joined over batches (bRange, as semi and anti levels
+// are: each batch's distinct keys read in key order from the leaves)
+// instead of sending the whole query to the row path (design/
+// lexdb-tpch-perf.md 4.1). Over a miniature of orders (o) and lineitem
+// (l, keyed by order and line, an index by part), parts (p); orders
+// without lines, lines without a part (NULL), NULLs in the filters.
+// - Fixed and random queries, row out, sorted and grouped, INNER and
+//   LEFT, two and three tables, a char(1) constant on the looked-up table
+//   (#bppad folded: a batch comparison), residual conditions on it:
+//   with SET lexdb_batch = off and on, and against the same query with
+//   the join's key written l.lk + 0 (no range per row: a hash join),
+//   which must give the same rows.
+// - EXPLAIN ANALYZE's counts with batches on and off (but "batches N"),
+//   also where a batch gives way to the row path: counted once.
+// - In a transaction with writes of its own (reads noted: the batch's
+//   keys read as they come).
+// - Whether the ranges were joined over batches (rangeJoins went up).
+// timeout: 90
+// expect: plan: join l: primary key range (estimated 4 rows) per row
+// expect: fixed: 11 queries, 11 the same three ways, 8 over batches, counts same 11
+// expect: random: 120 queries, 120 the same three ways
+// expect: in a transaction: 30 queries, 30 the same three ways
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+// An EXPLAIN ANALYZE without its "batches N" and the result's time.
+fn counts(s: mut &lexdb_exec.Session, sql: &str): str {
+    var t = q(s, &("explain analyze " + sql))
+    while true {
+        let at = strings.indexOf(&t, ", batches ", 0)
+        if at < 0 { break }
+        var e = at + 10
+        while e < len(t) && t[e] >= '0' && t[e] <= '9' { e += 1 }
+        t = t[0..at] + t[e..len(t)]
+    }
+    let at = strings.indexOf(&t, " rows in ", 0)
+    return if at < 0 { t } else { t[0..at] }
+}
+
+// sql with batches off and on, and its hash form (alt); the same three,
+// whether a batch read ranges (over), whether EXPLAIN ANALYZE's counts
+// agree (cnt, when asked).
+fn three(s: mut &lexdb_exec.Session, sql: &str, alt: &str, over: mut &int, cnt: mut &int, withCounts: bool): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let co = if withCounts { counts(s, sql) } else { "" }
+    let b = q(s, &"set lexdb_batch = on")
+    let r0 = lexdb_exec.rangeJoins()
+    let on = q(s, sql)
+    if lexdb_exec.rangeJoins() > r0 { over += 1 }
+    if withCounts {
+        let cn = counts(s, sql)
+        if cn == co { cnt += 1 } else { println("COUNTS: " + sql + "\n  off: " + co + "\n  on:  " + cn) }
+    }
+    let h = q(s, alt)
+    if off == on && on == h { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  hash:    " + h)
+    return false
+}
+
+fn hashForm(sql: &str): str { return strings.replaceAll(&strings.replaceAll(sql, "l.lk = o.ok", "l.lk + 0 = o.ok"), "l.pk2 = p.pk", "l.pk2 + 0 = p.pk") }
+
+fn randomQuery(r: mut &lexdb_base.Rng): str {
+    let ow = pick(r, &["o.c = 3", "o.c < 2", "o.c = 7 and o.st = 'F'", "o.c in (1, 9)", "o.d < '2024-02-01' and o.c = 4", "o.st is null and o.c = 5"])
+    let lw = pick(r, &["", " and l.q > 20", " and l.f = 'R'", " and l.f <> 'N'", " and l.q * 2 < o.ok % 50", " and upper(l.f) = 'A' or o.c = 3 and l.ln = 1"])
+    let shape = r.below(4)
+    let join = if r.below(3) == 0 { "left join" } else { "join" }
+    if shape == 0 { return "select o.ok, l.ln, l.q, l.f from o " + join + " l on l.lk = o.ok where " + ow + lw + " order by 1, 2" }
+    if shape == 1 { return "select o.st, count(*), count(l.ln), sum(l.q), max(l.f) from o " + join + " l on l.lk = o.ok where " + ow + lw + " group by o.st order by 1" }
+    if shape == 2 { return "select o.ok, l.ln, p.nm from o join l on l.lk = o.ok " + join + " p on p.pk = l.pk2 where " + ow + lw + " order by 1, 2" }
+    return "select count(*), sum(l.q) from o " + join + " l on l.lk = o.ok where " + ow + lw
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(67), lexdb_store.Options{cacheBytes: 8 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(67)
+        let c1 = q(mut &s, &"create table o (ok int primary key, c int, d date, st char(1))")
+        let c2 = q(mut &s, &"create table l (lk int, ln int, pk2 int, q numeric(15,2), f char(1), primary key (lk, ln))")
+        let c3 = q(mut &s, &"create table p (pk int primary key, nm text)")
+        let c4 = q(mut &s, &"create index l_pk2 on l (pk2)")
+        var os: []str = []
+        for i in 0..4000 {
+            let stv = ["'F'", "'O'", "'P'", "null"][i % 4]
+            let c = if i % 23 == 0 { "null" } else { (i % 40).toStr() }
+            append(mut &os, "(" + i.toStr() + ", " + c + ", '2024-0" + (1 + i % 3).toStr() + "-1" + (i % 9).toStr() + "', " + stv + ")")
+        }
+        let c5 = q(mut &s, &("insert into o values " + strings.join(&os, ", ")))
+        var ls: []str = []
+        for i in 0..4000 {
+            if i % 6 == 0 { continue }          // an order without lines
+            for ln in 1..(1 + i % 7) {
+                let pk2 = if (i + ln) % 13 == 0 { "null" } else { ((i * 7 + ln) % 600).toStr() }
+                let f = ["'A'", "'N'", "'R'", "null"][(i + ln) % 4]
+                append(mut &ls, "(" + i.toStr() + ", " + ln.toStr() + ", " + pk2 + ", " + ((i * ln) % 5000).toStr() + "." + (ln % 10).toStr() + "5, " + f + ")")
+            }
+        }
+        for b in 0..(len(ls) / 1000 + 1) {
+            let hi = if (b + 1) * 1000 > len(ls) { len(ls) } else { (b + 1) * 1000 }
+            if b * 1000 >= hi { break }
+            let ins = q(mut &s, &("insert into l values " + strings.join(&ls[b * 1000..hi], ", ")))
+            if !strings.startsWith(&ins, "INSERT") { println("insert: " + ins) }
+        }
+        var ps: []str = []
+        for i in 0..600 { append(mut &ps, "(" + i.toStr() + ", 'x" + (i % 37).toStr() + "')") }
+        let c6 = q(mut &s, &("insert into p values " + strings.join(&ps, ", ")))
+        let a1 = q(mut &s, &"analyze o")
+        let a2 = q(mut &s, &"analyze l")
+        let a3 = q(mut &s, &"analyze p")
+        let ck = q(mut &s, &"checkpoint")
+        // the plan: lineitem's lines read per order by the key's range
+        let ex = q(mut &s, &"explain select o.ok, l.ln from o join l on l.lk = o.ok where o.c = 3")
+        var planLine = "none"
+        for part in strings.split(&ex, "join l: ") { if strings.startsWith(&part, "primary key") || strings.contains(&part, "per row") { planLine = "join l: " + strings.trim(&part) } }
+        println("plan: " + planLine)
+        let fixedQs: []str = [
+            "select o.ok, l.ln, l.q from o join l on l.lk = o.ok where o.c = 3 order by 1, 2",
+            "select o.st, count(*), sum(l.q), min(l.ln) from o join l on l.lk = o.ok where o.c < 3 group by o.st order by 1",
+            "select o.ok, l.ln, l.f from o left join l on l.lk = o.ok and l.f = 'R' where o.c = 5 order by 1, 2",
+            "select count(*), sum(l.q) from o join l on l.lk = o.ok where o.c = 4 and l.q > 10 and l.f = 'A'",
+            "select p.pk, l.lk, l.ln from p join l on l.pk2 = p.pk where p.nm = 'x1' order by 1, 2, 3",
+            "select o.ok, l.ln, p.nm from o join l on l.lk = o.ok join p on p.pk = l.pk2 where o.c = 2 order by 1, 2",
+            "select o.ok, count(l.ln) from o left join l on l.lk = o.ok where o.c = 6 group by o.ok order by 1",
+            "select o.ok, l.ln from o join l on l.lk = o.ok where o.c = 8 and (l.f = 'N' or o.st = 'P') order by 1, 2 limit 7",
+            "select l.f, count(*) from o join l on l.lk = o.ok where o.c is null group by l.f order by 1",
+            // a batch that gives way to the row path (division by zero on
+            // some row): counted once, as the row path reads it; one of them gives
+            // way, so it is not counted as joined over batches
+            "select o.ok, l.ln from o join l on l.lk = o.ok where o.c = 3 and (l.f = 'R' or 1 / (l.ln - 2) > 0) order by 1, 2 limit 5",
+            "select o.ok from o join l on l.lk = o.ok where o.c = 9 and (upper(l.f) = 'A' or 1 / (l.ln - 2) > 0) limit 5"]
+        var same = 0
+        var over = 0
+        var cnt = 0
+        for x in fixedQs { if three(mut &s, &x, &hashForm(&x), mut &over, mut &cnt, true) { same += 1 } }
+        println("fixed: " + len(fixedQs).toStr() + " queries, " + same.toStr() + " the same three ways, " + over.toStr() + " over batches, counts same " + cnt.toStr())
+        same = 0
+        for i in 0..120 {
+            let x = randomQuery(mut &r)
+            if three(mut &s, &x, &hashForm(&x), mut &over, mut &cnt, false) { same += 1 }
+        }
+        println("random: 120 queries, " + same.toStr() + " the same three ways")
+        let b1 = q(mut &s, &"begin")
+        let b2 = q(mut &s, &"update l set q = q + 1, f = 'R' where lk % 9 = 0")
+        let b3 = q(mut &s, &"delete from l where lk % 11 = 0 and ln = 2")
+        let b4 = q(mut &s, &"insert into l values (6, 1, 5, 1.00, 'A'), (12, 1, null, 2.00, null)")
+        same = 0
+        for i in 0..30 {
+            let x = randomQuery(mut &r)
+            if three(mut &s, &x, &hashForm(&x), mut &over, mut &cnt, false) { same += 1 }
+        }
+        println("in a transaction: 30 queries, " + same.toStr() + " the same three ways")
+        let b5 = q(mut &s, &"rollback")
+        return 0
+    }).unwrap()
+}
