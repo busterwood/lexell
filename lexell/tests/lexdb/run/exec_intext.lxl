@@ -1,0 +1,114 @@
+// lexdb_bind: x IN (subquery) and x = ANY (subquery) compare as = does
+// when one side is a text or untyped (lexdb_bind.inReadOid): an untyped
+// parameter or text value is read as the set's type, and a set of texts
+// is read as the value's type (numbers as numerics, booleans, dates and
+// times as their types), as = reads a text beside a typed value. Before,
+// the set was keyed by the values as they were: an untyped parameter
+// '2024-01-02' never matched a set of dates (the TPC-H review's open
+// case), true IN (SELECT 't'::text) was false while true = 't'::text is
+// true, and 1 IN (SELECT '1'::text) was false. Each runs with batches off
+// and on, against the same predicate written with = (or EXISTS).
+// expect: P1 untyped parameter in dates: 2, same: true
+// expect: P2 untyped parameter not in dates: 0, same: true
+// expect: P3 text parameter in dates: 2, same: true
+// expect: B1 true in texts: t, same: true
+// expect: B2 true = any texts: t, same: true
+// expect: N1 int in texts: t, same: true
+// expect: N2 int column in text column: 1, same: true
+// expect: N3 correlated, int column in text column: 1, same: true
+// expect: N4 numeric in texts: t, same: true
+// expect: D1 date in texts: t, same: true
+// expect: D2 text column in dates: 1, same: true
+// expect: T1 texts in texts: 1, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn run(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) { Ok(_) {} Err(e) { println(sql + " -> " + e.msg) } }
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs { for row in r.rows { for v in row { append(mut &out, lexdb_exec.text(&v)) } } }
+            return strings.join(&out, "|")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn qp(s: mut &lexdb_exec.Session, sql: &str, ps: []Val, pt: &[]int): str {
+    let st = lexdb_parse.parse(sql).unwrap()
+    var pc = lexdb_exec.newPlanCache()
+    match s.runCached(&st[0], &ps, pt, mut &pc) {
+        Ok(r) { return lexdb_exec.text(&r.rows[0][0]) }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn three(s: mut &lexdb_exec.Session, label: &str, sql: &str, other: &str) {
+    run(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    run(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let alt = q(s, other)
+    let same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    println(label + ": " + on + ", same: " + same.toStr())
+}
+
+fn threeP(s: mut &lexdb_exec.Session, label: &str, sql: &str, other: &str, ps: &[]Val, pt: &[]int) {
+    run(s, &"set lexdb_batch = off")
+    let off = qp(s, sql, copyVals(ps), pt)
+    run(s, &"set lexdb_batch = on")
+    let on = qp(s, sql, copyVals(ps), pt)
+    let alt = qp(s, other, copyVals(ps), pt)
+    let same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    println(label + ": " + on + ", same: " + same.toStr())
+}
+
+fn copyVals(vs: &[]Val): []Val {
+    var out: []Val = []
+    for v in vs { append(mut &out, v) }
+    return out
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        run(mut &s, &"create table dd (d date, n int, t text, x numeric(6,2))")
+        run(mut &s, &"insert into dd values ('2024-01-02', 1, '1', 1.5), ('2024-01-03', 2, '2024-01-03', 2)")
+        let untyped: []int = [0]
+        let texty: []int = [lexdb_sql.OID_TEXT]
+        threeP(mut &s, &"P1 untyped parameter in dates", &"select count(*) from dd where $1 in (select d from dd)",
+               &"select count(*) from dd where exists (select 1 from dd b where b.d = $1::date)", &[Val.Text("2024-01-02")], &untyped)
+        threeP(mut &s, &"P2 untyped parameter not in dates", &"select count(*) from dd where $1 in (select d from dd)",
+               &"select count(*) from dd where exists (select 1 from dd b where b.d = $1::date)", &[Val.Text("2024-01-05")], &untyped)
+        threeP(mut &s, &"P3 text parameter in dates", &"select count(*) from dd where $1 in (select d from dd)",
+               &"select count(*) from dd where exists (select 1 from dd b where b.d = $1)", &[Val.Text("2024-01-03")], &texty)
+        three(mut &s, &"B1 true in texts", &"select true in (select 't'::text)", &"select true = 't'::text")
+        three(mut &s, &"B2 true = any texts", &"select true = any (select 't'::text)", &"select true = 't'::text")
+        three(mut &s, &"N1 int in texts", &"select 1 in (select '1'::text)", &"select 1 = '1'::text")
+        three(mut &s, &"N2 int column in text column", &"select count(*) from dd a where a.n in (select t from dd where t <> '2024-01-03')",
+              &"select count(*) from dd a where exists (select 1 from dd b where b.t <> '2024-01-03' and a.n = b.t)")
+        three(mut &s, &"N3 correlated, int column in text column", &"select count(*) from dd a where a.n in (select t from dd b where b.n = a.n and b.t <> '2024-01-03')",
+              &"select count(*) from dd a where exists (select 1 from dd b where b.n = a.n and b.t <> '2024-01-03' and a.n = b.t)")
+        three(mut &s, &"N4 numeric in texts", &"select 1.50 in (select '1.5'::text)", &"select 1.50 = '1.5'::text")
+        three(mut &s, &"D1 date in texts", &"select date '2024-01-02' in (select '2024-01-02'::text)", &"select date '2024-01-02' = '2024-01-02'::text")
+        three(mut &s, &"D2 text column in dates", &"select count(*) from (select t from dd where n = 2) a where a.t in (select d from dd where n = 2)",
+              &"select count(*) from (select t from dd where n = 2) a join dd b on b.n = 2 and a.t = b.d")
+        three(mut &s, &"T1 texts in texts", &"select count(*) from dd a where a.t in (select t from dd where n = 1)",
+              &"select count(*) from dd a where exists (select 1 from dd b where b.n = 1 and a.t = b.t)")
+        s.close()
+        return 0
+    })
+}
