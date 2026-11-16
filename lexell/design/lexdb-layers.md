@@ -740,6 +740,12 @@ the same as before, node for node; only what it reads changed.
   conditions are mostly on catalog relations, which batches do not scan
   (`lv.virt()`).
 
+**Follow-up: the outputs' parameters.** `outC` copied the run's
+parameters into its `CEnv` on every execution of a plan bound once, which
+cost point selects 0.5–0.9%. `bindSel` now notes whether any bound output
+reads a parameter slot (`Sel.oxParam`, `lexdb_bind.hasParam`), and `outC`
+copies them only then.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
