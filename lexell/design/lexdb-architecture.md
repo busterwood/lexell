@@ -6,6 +6,11 @@ chronological record. [lexdb.md](lexdb.md) remains the record of how each
 mechanism was measured and chosen; this note is the map we hold the code
 to.
 
+Superseded in part (2026-11-16): the executor and planner phases (6–9)
+are replaced by [lexdb-layers.md](lexdb-layers.md), which adds an access
+layer and a binder and takes the operator tree. The principles, kernels,
+invariants and gates here still hold.
+
 Progress (2026-11-15): the test tooling builds natively by default; the
 `rs.batch` split, the `LEXDB_ROWFMT` and `LEXDB_COLUMNS` removals are
 done; `lexdb_rows` owns the leaf, fixed, tagged/long and column body

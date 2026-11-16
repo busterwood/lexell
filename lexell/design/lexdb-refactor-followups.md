@@ -5,6 +5,10 @@ This note records the refactor work we deliberately did **not** take on
 now. It is the design we had reached, kept so it does not have to be
 re-derived. Nothing here is a promise to implement it.
 
+The executor (6) and planner option B sections are superseded by
+[lexdb-layers.md](lexdb-layers.md) (2026-11-16); the storage seam (3) is
+its workstream S.
+
 ## Scope of this branch
 
 Agreed, in this order:
