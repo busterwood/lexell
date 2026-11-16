@@ -230,6 +230,41 @@ q10's 5% and q12's 3% are within the noise. A full 22-query run of
 checksums; total 59.7 s against the baseline's 66.0 s, geometric mean
 lexdb / PG one core **3.41** (3.77 at the baseline).
 
+**Review fixes.** An independent review found:
+- *Early HAVING without GROUP BY gave a row* (f9334267): dropping the one
+  implicit group made the select add its empty group and check HAVING on
+  no rows (`select count(*) from li having count(*) = 0` gave `0`; also
+  correlated scalar, EXISTS and NOT EXISTS subqueries). The early check now
+  runs only with grouping keys.
+- *The swap could raise 53200 where the lookups succeed* (16e64ad2): the
+  hash of a was sized at 32 bytes a text. `rightFits` now sizes it by a's
+  stored bytes per row (its tree's pages, long values included, over
+  ANALYZE's rows) plus the held row's overhead; an overestimate when the
+  statement reads few columns, so a hash that might not fit keeps the
+  lookups. It is still an estimate: with stale statistics a chosen hash
+  can exceed max_statement_mem at run time and give 53200, as any hash
+  join can; there is no run-time fallback to the lookups.
+- *An equality with no column of a to hash on was taken as hashable*
+  (`c.id + 0 = o.cid` became a loop, 4.2 s against 10 ms): the swap now
+  needs a column of a (bare or under its collation's key) equal to a value
+  of b's alone.
+- *b's ON conjuncts that can fail filtered b's whole scan* (`1 / (o.cid -
+  3017)` divided by zero on a row no customer joins): only `cannotFail`
+  conjuncts go to b's scan now, as for the OR pushdown; the others stay
+  the join's and are evaluated on the joined pairs, as the lookups did.
+- *The swap's lock check never fired* (locks are applied after planning):
+  the select tells `buildQuery` it will lock (`Scope.locking`), and a
+  locking query keeps FROM's join.
+After the fixes (A/B in one session, baseline then fixed branch): q13
+6324 -> 1088 ms (1032-1090), q18 2891 -> 1550 ms (1508-1557); a full
+22-query run (`out-r5all`) has every check "ok" (that run was 10-25%
+slower across untouched queries too, q7 and q9 included: the machine's
+load, not the change). `exec_rightjoin` and `exec_groupkeys` cover each
+case with batches off and on; their results were checked against main's engine (the same test built
+on main's `cmd/`). Not ours, found by the same review: FOR UPDATE inside a
+FROM subquery with a LEFT JOIN crashes on main (index out of range in
+`tryRow`'s `rs.cnt[k]`).
+
 **For other workstreams.** q3 and q10 (and any query with a lineitem
 primary-key prefix lookup per row) run their joins and grouping on the
 row path because `bJoinPlan` gives up on the whole query when one level

@@ -6613,16 +6613,19 @@ fn (q: &Query) outerReadOnce(ms: &[][]Expr, early: bool, cap: float, ro: mut &[]
     return true
 }
 
-// A row's size in a hash counting only the columns the statement uses (the
-// others are read as NULL and held as one): 32 bytes, 24 a value, and a
-// text's bytes (32 taken as its length).
-fn estNeedBytes(lv: &Level): int {
-    var n = 32
-    for i in 0..len(lv.t.cols) {
-        n += 24
-        if (len(lv.need) == 0 || lv.need[i]) && lv.t.cols[i].typ.kind == lexdb_sql.K_TEXT { n += 32 }
-    }
-    return n
+// Whether the right join's hash of level 0 (a, rightCheaper) fits in cap
+// bytes: its rows (by ANALYZE) at what a row is held as (32 bytes, 24 a
+// value) plus its stored size on average (its table's pages, long values'
+// included, over its rows). The stored size counts every column, not only
+// those the statement uses: an overestimate, so a hash that might not fit
+// keeps the lookups (which hold nothing).
+fn (q: &Query) rightFits(st: &lexdb_store.Store, cap: float): Result[bool, DbErr] {
+    let a = &q.levels[0]
+    if a.est.rows <= 0 || a.t.tree < 0 { return Ok(a.est.rows == 0) }
+    let pages = try st.treePages(a.t.tree)
+    let stored = float(pages * lexdb_rows.PAGE) / float(a.est.rows)
+    let held = float(a.est.rows) * (32.0f + 24.0f * float(len(a.t.cols)) + stored)
+    return Ok(held <= cap)
 }
 
 // Whether "a LEFT JOIN b" (two tables, FROM's order) costs less as a hash
@@ -6651,12 +6654,21 @@ fn (q: &Query) rightCheaper(ms: &[][]Expr, ps: &[][]Expr, cap: float, ro: &[]boo
             if k == 0 && mk == 1 {
                 append(mut &ownA, clone(&c))
                 append(mut &maskA, mk)
-            } else if k == 1 && mk == 2 {
+            } else if k == 1 && mk == 2 && cannotFail(&c) {
                 append(mut &ownB, clone(&c))
                 append(mut &maskB, mk)
             } else if k == 1 && mk == 3 {
+                // an equality a hash of a keys on: a column of a (bare or
+                // under its collation's key) equal to a value of b's alone
                 match c {
-                    Expr.Bin(op, _, _) { if op == "=" { eq = true } }
+                    Expr.Bin(op, x, y) {
+                        if op == "=" {
+                            let kx = keyedCol(&x)
+                            let ky = keyedCol(&y)
+                            if len(kx.name) > 0 && q.levelOf(&kx.name) == 0 && q.levelMask(&y) == 2 { eq = true }
+                            if len(ky.name) > 0 && q.levelOf(&ky.name) == 0 && q.levelMask(&x) == 2 { eq = true }
+                        }
+                    }
                     else {}
                 }
             }
@@ -6667,7 +6679,6 @@ fn (q: &Query) rightCheaper(ms: &[][]Expr, ps: &[][]Expr, cap: float, ro: &[]boo
     var g = false
     let rowsA = fmax(float(a.est.rows) * q.localShare(0, &ownA, &maskA, mut &g), 1.0f)
     let rowsB = fmax(float(b.est.rows) * q.localShare(1, &ownB, &maskB, mut &g), 1.0f)
-    if rowsA * float(estNeedBytes(a)) > cap { return false }
     let candsA = q.wayCands(0, &ms[0])
     let firstA = q.wayInto(0, &candsA, 0, false, &ownA)
     let candsB = q.wayCands(1, &ms[1])
@@ -7572,6 +7583,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
+    let locking = sc.locking
+    sc.locking = false
     q.noRefKeys = sc.noRefKeys
     sc.noRefKeys = false
     // the subqueries a semi-join may run (9.104): WHERE's top-level
@@ -7996,14 +8009,15 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 // rows as they are hashed (a row they drop neither joins
                 // nor is kept), the others are checked after the join, on
                 // the joined rows and a's rows kept with NULLs
-                if !early && !anyUsing && len(q.subs) == 0 && q.rightCheaper(&ms, &ps, cap, &ro) {
+                if !early && !locking && !anyUsing && len(q.subs) == 0 && q.rightCheaper(&ms, &ps, cap, &ro) &&
+                   (try q.rightFits(st, cap)) {
                     var onB: []Expr = []
                     var onAB: []Expr = []
                     var post: []Expr = []
                     var xs = replace(mut &ms[1], [])
                     for i in 0..len(xs) {
                         let c = replace(mut &xs[i], Expr.Lit(Val.Null))
-                        if q.levelMask(&c) == 2 { append(mut &onB, c) } else { append(mut &onAB, c) }
+                        if q.levelMask(&c) == 2 && cannotFail(&c) { append(mut &onB, c) } else { append(mut &onAB, c) }
                     }
                     xs = replace(mut &ms[0], [])
                     for i in 0..len(xs) {
@@ -8819,6 +8833,10 @@ pub type Scope = record {
     // EXISTS, a scalar subquery): its join order keeps lookups (optimizer 26
     // review). Set by planSub and planSelect, taken by buildQuery.
     early: bool
+    // the next query planned locks rows (FOR UPDATE and the like, applied
+    // after it is planned): its tables keep FROM's order and join methods
+    // that keep it. Set by planSelect, taken by buildQuery.
+    locking: bool
     // the next query's ORDER BY when it has a LIMIT (and no grouping or
     // window), and its LIMIT plus OFFSET (a parameter's taken as 100);
     // -1: none. The join order may read the table ordered by them first
@@ -8852,7 +8870,7 @@ fn scCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: mut &Scope, ke
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false, ordBy: [], ordLim: -1, coll: "", noRefKeys: false}
+    return Scope{frames: [], base: len(params), ptypes: pt, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, coll: "", noRefKeys: false}
 }
 
 // newScope for a statement of txn's session: its default collation (L2).
@@ -16772,6 +16790,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var needNames: Map[str, int] = newMap()
     var needStar = false
     stmtNames(s, mut &needNames, mut &needStar)
+    sc.locking = s.lockMode > 0
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, &needNames, needStar, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
@@ -27904,7 +27923,9 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // others again.
     var fuse = false
     match sel.having {
-        Some(h) { fuse = immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
+        // (not without GROUP BY: there the one group stays even when
+        // HAVING drops it, as the select's empty group)
+        Some(h) { fuse = len(keys) > 0 && immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
         None {}
     }
     var firsts: [][]Val = []

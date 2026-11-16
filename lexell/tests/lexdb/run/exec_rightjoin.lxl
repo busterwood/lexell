@@ -14,6 +14,13 @@
 // - rows out sorted, not grouped;
 // - RIGHT JOINs as written, with a table joined after the right join, and a
 //   WHERE conjunct on the right join's rows.
+// Where the swap must not be taken (the results are main's, which looks up):
+// an equality with no column of a to hash on (c.id + 0 = o.cid: a hash
+// could not key on it, the right join would be a loop); an ON conjunct of
+// b that can fail stays the join's, not b's scan filter (1 / (o.cid - 3017)
+// would divide by zero on a row no customer joins); FOR UPDATE; and an a
+// whose rows are wide (3,000-byte texts) under a small max_statement_mem,
+// whose hash would not fit (the lookups hold nothing).
 // expect: [QUERY PLAN] scan ord o: full scan;right join cust c: hash on (id) over full scan;aggregate
 // expect: [QUERY PLAN] scan cust c: primary key lookup;left join ord o: index ord_cid lookup, index only (estimated 7 rows) per row
 // expect: q13: 4 groups, same: true
@@ -26,6 +33,12 @@
 // expect: right join, then a join: same: true
 // expect: right join, where: same: true
 // expect: unmatched counted: 300
+// expect: no column of a to hash on: [QUERY PLAN] scan cust c: full scan;left join ord o: index ord_cid lookup, index only (estimated 7 rows) per row;aggregate
+// expect: no column of a to hash on: 10726|10426, same: true
+// expect: an ON conjunct that can fail: 10726|10426, same: true
+// expect: locked: [QUERY PLAN] scan cust c: full scan;left join ord o: index ord_cid lookup, index only per row
+// expect: a wide a: [QUERY PLAN] scan big b: full scan;left join bo o: index bo_bid lookup, index only (estimated 8 rows) per row;aggregate
+// expect: a wide a: 11257|33771000, same: true
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -123,6 +136,23 @@ fn body(st: lexdb_store.Store): int {
         }
         println("unmatched counted: " + n)
     }
+    let ne = "select count(*), count(o.id) from cust c left join ord o on c.id + 0 = o.cid"
+    println("no column of a to hash on: " + plan(mut &s, &ne))
+    let r10 = three(mut &s, &ne, &"select count(*), count(o.id) from cust c left join ord o on c.id = o.cid", mut &same)
+    println("no column of a to hash on: " + r10 + ", same: " + same.toStr())
+    let r11 = three(mut &s, &"select count(*), count(o.id) from cust c left join ord o on c.id = o.cid and 1 / (o.cid - 3017) >= 0",
+                    &"select count(*), count(o.id) from cust c left join ord o on c.id = o.cid and o.cid <> 3017", mut &same)
+    println("an ON conjunct that can fail: " + r11 + ", same: " + same.toStr())
+    println("locked: " + plan(mut &s, &"select c.id from cust c left join ord o on c.id = o.cid for update of c"))
+    let big: str = "create table big (id int primary key, pad text)\ninsert into big select g, repeat('x', 3000) from generate_series(1, 1500) g\ncreate table bo (id int primary key, bid int)\ninsert into bo select g, (g * 7) % 1600 + 1 from generate_series(1, 12000) g\ncreate index bo_bid on bo (bid)\nanalyze\nset max_statement_mem = 2048"
+    for line in strings.lines(&big) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    let wide = "select count(*), sum(length(b.pad)) from big b left join bo o on b.id = o.bid"
+    println("a wide a: " + plan(mut &s, &("select b.id, b.pad, count(o.id) from big b left join bo o on b.id = o.bid group by b.id, b.pad")))
+    let r12 = three(mut &s, &wide, &"select (select count(*) from big b join bo o on b.id = o.bid) + (select count(*) from big b where not exists (select 1 from bo o where o.bid = b.id)), 3000 * 1500 + 3000 * (select count(*) from big b join bo o on b.id = o.bid) - 3000 * (select count(*) from big b where exists (select 1 from bo o where o.bid = b.id))", mut &same)
+    println("a wide a: " + r12 + ", same: " + same.toStr())
     s.close()
     return 0
 }

@@ -18,7 +18,11 @@
 // that is not the key's first column (a map then). A HAVING is checked as
 // the groups are made (a group it drops is not kept): on a grouped column
 // and an aggregate, and one that divides by zero (the same error, batches
-// on and off).
+// on and off). Not without GROUP BY: there the one group stays even when
+// HAVING drops it (it is the select's empty group), so a HAVING true of no
+// rows must not give a row (the results are main's, which has no early
+// HAVING): alone, through a join, in a correlated scalar subquery, EXISTS
+// and NOT EXISTS.
 // expect: one-column key: 300 groups, same: true
 // expect: left join: 2400 groups, same: true
 // expect: two-column key: 120 groups, same: true
@@ -30,6 +34,8 @@
 // expect: not the key's first column: 7 groups, same: true
 // expect: having on a column: 244 groups, same: true
 // expect: having error: ERROR 22012 division by zero, same: true
+// expect: no group by: |||6|, same: true
+// expect: no group by, a subquery: 49|4|3;2|1;10|;200;296, same: true
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -110,6 +116,24 @@ fn body(st: lexdb_store.Store): int {
     let z2 = q(mut &s, &"set lexdb_batch = on")
     let e2 = q(mut &s, &"select ok from li group by ok having sum(qty) / (ok % 5 - 1) > 1")
     println("having error: " + e2 + ", same: " + (e1 == e2).toStr())
+    let ng = ["select count(*) from li having count(*) = 0", "select count(*) from li where ok < 10 having count(*) <> 6",
+              "select count(*) from cust c join ord o on o.cid = c.id having count(*) = 0", "select count(*) from li where ok < 10 having count(*) = 6",
+              "select max(ln) from li having max(ln) is null"]
+    let ns = ["select count(*), count(x), sum(x) from (select c.id, (select count(*) from li where li.ok < c.id having count(*) < 3) x from cust c where c.id < 50) t",
+              "select c.id, (select count(*) from li where li.ok < c.id having count(*) < 3) x from cust c where c.id in (2, 10) order by 1",
+              "select count(*) from cust c where exists (select count(*) from li where li.ok = c.id having count(*) = 0) and c.id <= 1000",
+              "select count(*) from cust c where not exists (select count(*) from li where li.ok < c.id having count(*) < 2) and c.id >= 0"]
+    for set in [ng, ns] {
+        var offs: []str = []
+        var ons: []str = []
+        let x1 = q(mut &s, &"set lexdb_batch = off")
+        for x in set { append(mut &offs, q(mut &s, &x)) }
+        let x2 = q(mut &s, &"set lexdb_batch = on")
+        for x in set { append(mut &ons, q(mut &s, &x)) }
+        let a = strings.join(&ons, "|")
+        let label = if len(set) == 5 { "no group by: " } else { "no group by, a subquery: " }
+        println(label + (if len(set) == 5 { a } else { strings.join(&ons, ";") }) + ", same: " + (strings.join(&offs, "|") == a).toStr())
+    }
     s.close()
     return 0
 }
