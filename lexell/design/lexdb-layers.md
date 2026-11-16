@@ -711,6 +711,100 @@ Steps, each with q1, q6 and the scan queries as its gate:
   batch row's places, so it re-slots a bound tree instead of binding
   again.
 
+**2-ii as built: `bCompile` reads `BX`.** The batch nodes it makes are
+the same as before, node for node; only what it reads changed.
+
+- `bCompile`/`bCompileD` take a `BX` bound over the query's columns by
+  place (`BX.Col(i)` is query column `i`, the batch's `i - base`) and a
+  `CEnv`, the run's (`Mats.ce`: its parameters, session and zone).
+- Where the plan bound the expression, that binding is read, not bound
+  again: a level's conditions from `Mats.cc`/`cp` or `Query.cc`/`cp`
+  (`bCompileCond`), the outputs from `Sel.ox` (`bCompileOut`). The rest
+  (join keys, a semi/anti join's value, ORDER BY keys, group keys,
+  aggregate arguments and FILTERs) are bound when compiled (`bxOf`:
+  parameters as slots).
+- A constant subtree (`bxConst`: literals and parameters under
+  operators, casts and `#bppad`, as `bConst` was for `Expr`) is
+  evaluated once by `bxEval`. An IN list's values are those `bxFixed`
+  allows (no column, no clock, session or volatile function:
+  `immutableName`, shared with `immutable`). IN and LIKE are read from the
+  bound call (`FnRef.name`).
+- Operators by code: `cmpOf` and `arithOf` map `lexdb_ops.OP_*` to
+  `BNode`'s codes; `cmpCode` and `arithCode` (by text) are gone.
+- Not changed: `BT_*` and `bTimeVal` (2-iii), `bGenOf` (2-iv), and
+  `bConst` over `Expr`, which `rangePath` still reads.
+- One difference in what reaches the batches, not in results: an
+  expression with a part that does not bind (a reg cast, a session or
+  catalog function in an IN list) was compiled before when that part was
+  a constant; now it goes to the row path, with the same result. Such
+  conditions are mostly on catalog relations, which batches do not scan
+  (`lv.virt()`).
+
+**Follow-up: the outputs' parameters.** `outC` copied the run's
+parameters into its `CEnv` on every execution of a plan bound once, which
+cost point selects 0.5–0.9%. `bindSel` now notes whether any bound output
+reads a parameter slot (`Sel.oxParam`, `lexdb_bind.hasParam`), and `outC`
+copies them only then.
+
+**Where 2-ii left off, and how to start 2-iii.** All in `lexdb_exec`
+unless named; search for the names, since line numbers move.
+
+- The batch compiler: `bCompile`/`bCompileD` (over `BX`), with its entry
+  points `bCompileCond` (a level's conditions, from `Mats.cc`/`cp` or
+  `Query.cc`/`cp`), `bCompileOut` (`Sel.ox`), `bCompileX` (bind now:
+  `bxOf`). Its helpers are `bxConst`, `bxFixed`, `cmpOf`, `arithOf` and
+  `bAndOr`. Its typing, which 2-iii replaces, is the `BT_*` constants
+  (`BT_INT`, `BT_BOOL`, `BT_NULL`, `BT_OTHER`, `BT_DEC + scale`),
+  `intLike`/`boolLike`/`isDecT`/`decSc`, and `bValCmp`, `bColPair`,
+  `bValCmpOf` and `bTimeVal`.
+- `BT_*` reaches past `bCompile`: `BComp.typ` is read by
+  `bKeyVal`, `JLevel.keyTyp` (`JK_INT`/`JK_TEXT` choice), `outNode`, and
+  `batchGroupsIn` (`dsc`, `vcol`, group keys). Kernels: `BNode`,
+  `bEval`, `lexdb_vec` (`arith`, `cmp`, `sum`).
+- `bTimeVal` matters only for a `BK_VAL` column of date, timestamp or
+  timestamptz: `ValCmp` and the IN list (`InVals`). `BK_DEC` occurs only
+  in `batchGroupsIn` over one table (`dec`).
+- The binder: `lexdb_bind.bindExpr`/`bindIn`, `BX`, `exprOid`; exec's
+  `typing()` and `fnRefOf`. Plans are bound once in `bindSel`/
+  `bindQuery` (`cxsOf`, `boundOnce`); `prepare` binds per run when the
+  plan's bindings no longer match (DML, EXPLAIN), and `bxOf` binds join
+  keys, ORDER BY and group keys and aggregate arguments per run. So node
+  types computed inside `bindExpr` run per run on those paths: 2b found
+  that typing per bind cost q20 5%. Compute types once per plan (in
+  `bindSel`) or keep them cheap. The plan cache is `PlanCache` (`ver`);
+  a zone key for bind-time time casts goes there.
+- Traps:
+  - `BX` is boxed and owned. `return cs[k][i]` out of a borrow does not
+    compile; match on it and compile inside the arm (as
+    `bCompileCond` does).
+  - The suite compiles each test as it runs it: do not edit the sources
+    while it runs.
+  - `bConst` (over `Expr`) is still read by `rangePath`; `immutable`
+    and `immutableName` are shared.
+- Build, test and measure:
+  - Build: `flock -s ~/tpch/.bench.lock env LXL_NOCACHE=1 taskset -c
+    4-7,12-15 lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o OUT`
+    (the native backend; never the gcc path).
+  - Suite: `flock -s ~/tpch/.bench.lock python3 lexell/tests/lexdb.py
+    --compiler .../lxlc -j 2` (187 tests; a test's name as an argument
+    runs it alone).
+  - The A/B scripts are in `~/tpch-w/bind/bench`: `tpch_ab.sh TAG
+    LABEL...` (run.sh per binary `~/tpch-w/bind/lexdb-LABEL`, out to
+    `out-LABEL-TAG`) with `tpcmp.py A B TAG...` (medians, checks, checksums
+    against `~/tpch/out-baseline-1744ef99`); `ab35.sh` with `cmp35.py`
+    (the 35 queries); `oltp.sh` (vspg, lexdb only, `vspg-lex.sh`).
+  - The main baseline is built from `git archive <main> lexell/cmd` into
+    `~/tpch-w/bind/src-main`.
+  - Five of the 35 queries fail on both binaries with la/base2's data
+    ("page N: type 2"): known.
+- 2-ii's A/B against main 540106ec: TPC-H total 1.000, all checksums the
+  baseline's. q1 was 1.1% slower in all three rounds and q6 0.8% faster,
+  with the same batch nodes; probably code layout, not verified. 35
+  queries 1.001. Point selects 0.988/0.994/0.993 at 1/8/32 clients
+  (a path 2-ii does not touch), updates level. With the follow-up: TPC-H
+  1.001 (q1 1.015 again), point selects 0.999/0.994/0.999, updates
+  level. So the follow-up's saving was not visible against 540106ec.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
