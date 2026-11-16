@@ -1,0 +1,110 @@
+// lexdb_exec: x IN (subquery) on the first table looked up per value by
+// cost, past the old fixed 1,000 values (IN_LOOKUP_MAX). choosePath sets
+// the most values whose lookups (a descent and a key's rows each) cost less
+// than reading the table once (Path.inMax); more and the table is read
+// whole (TPC-H q20: 2,127 part keys into partsupp's 800,000 rows). The
+// table needs its statistics (loadEst: a second index here). Each
+// query runs with SET lexdb_batch = off and on, and against an independent
+// formulation (a join to the distinct values, NOT EXISTS): all three must
+// give the same rows.
+// - 3,000 distinct values (with duplicates and NULLs) into 200,000 rows:
+//   looked up (EXPLAIN ANALYZE's rows read are the values' rows);
+// - 30,000 values: past the cost's limit, the table read whole;
+// - NOT IN, with and without a NULL among the values;
+// - an IN with another condition, and one inside a correlated subquery's
+//   table (not the first table of the statement).
+// expect: lookups: rows read 6000
+// expect: 3,000 values: 6000|296901000, same: true
+// expect: whole: rows read 200000
+// expect: 30,000 values: 60000|2699910000, same: true
+// expect: not in: 194000, same: true
+// expect: not in with a null: 0, same: true
+// expect: another condition: 3000, same: true
+// expect: correlated: 300, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const SETUP = "create table big2 (k int, j int, v int, primary key (k, j))\ninsert into big2 select g / 2, g % 2, g / 2 from generate_series(0, 199999) g\ncreate index big2_v on big2 (v)\ncreate table pick (x int)\ninsert into pick select (g * 37) % 3000 * 33 from generate_series(1, 4500) g\ninsert into pick values (null), (null)\ncreate table pick2 (x int)\ninsert into pick2 select g * 3 from generate_series(0, 29999) g\ncreate table outer3 (id int primary key)\ninsert into outer3 select g from generate_series(1, 300) g\nanalyze"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn three(s: mut &lexdb_exec.Session, sql: &str, other: &str, same: mut &bool): str {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let alt = q(s, other)
+    same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    return on
+}
+
+// EXPLAIN ANALYZE's first "rows read N" of the statement's first table.
+fn rowsRead(s: mut &lexdb_exec.Session, sql: &str): str {
+    let ea = q(s, &("explain analyze " + sql))
+    let at = strings.indexOf(&ea, "rows read ", 0)
+    if at < 0 { return ea }
+    var i = at + 10
+    var n = ""
+    while i < len(ea) && ea[i] >= '0' && ea[i] <= '9' {
+        n = n + strings.substr(&ea, i, i + 1)
+        i += 1
+    }
+    return "rows read " + n
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for line in strings.lines(&setup) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    var same = false
+    let q1 = "select count(*), sum(v) from big2 where k in (select x from pick)"
+    println("lookups: " + rowsRead(mut &s, &q1))
+    let r1 = three(mut &s, &q1, &"select count(*), sum(v) from big2 join (select distinct x from pick where x is not null) p on p.x = big2.k", mut &same)
+    println("3,000 values: " + r1 + ", same: " + same.toStr())
+    let q2 = "select count(*), sum(v) from big2 where k in (select x from pick2)"
+    println("whole: " + rowsRead(mut &s, &q2))
+    let r2 = three(mut &s, &q2, &"select count(*), sum(v) from big2 join pick2 p on p.x = big2.k", mut &same)
+    println("30,000 values: " + r2 + ", same: " + same.toStr())
+    let r3 = three(mut &s, &"select count(*) from big2 where k not in (select x from pick where x is not null)",
+                   &"select count(*) from big2 where not exists (select 1 from pick p where p.x = big2.k)", mut &same)
+    println("not in: " + r3 + ", same: " + same.toStr())
+    let r4 = three(mut &s, &"select count(*) from big2 where k not in (select x from pick)",
+                   &"select count(*) from big2 where false", mut &same)
+    println("not in with a null: " + r4 + ", same: " + same.toStr())
+    let r5 = three(mut &s, &"select count(*) from big2 where k in (select x from pick) and j = 1",
+                   &"select count(*) from big2 join (select distinct x from pick) p on p.x = big2.k where j = 1", mut &same)
+    println("another condition: " + r5 + ", same: " + same.toStr())
+    let r6 = three(mut &s, &"select count(*) from outer3 o where (select count(*) from big2 where k in (select x from pick) and big2.v = o.id * 33) > 0",
+                   &"select count(*) from outer3 o where exists (select 1 from pick p where p.x = o.id * 33)", mut &same)
+    println("correlated: " + r6 + ", same: " + same.toStr())
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}
