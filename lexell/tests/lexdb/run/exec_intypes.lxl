@@ -1,0 +1,114 @@
+// lexdb_exec: x IN (subquery) compares x with the subquery's values as =
+// does, whatever their types. The IN set is keyed by value only within one
+// class (integers and numerics by value, floats as float8, each date and
+// time type); a float8 value against a numeric or integer column, or a date
+// against timestamps, is compared value by value (inProbe). Before, a float8
+// value never matched a numeric or integer column, and a date never matched
+// a timestamp. Each query runs with SET lexdb_batch = off and on, and
+// against the same predicate as EXISTS (correlated, compared by =): all
+// three must give the same rows. A correlated IN hashed on its key keeps
+// each key's values for the same compare (runHashed, hashValue). Before,
+// main gave 0 or the whole table for every case marked below as floats or
+// timestamps.
+// expect: numeric key, float values: 20, same: true
+// expect: numeric expression, float values: 20, same: true
+// expect: = any, float values: 20, same: true
+// expect: int key, float values: 20, same: true
+// expect: int key, float values, not in: 1980, same: true
+// expect: float key, numeric values: 20, same: true
+// expect: float key, int values: 20, same: true
+// expect: date key, timestamp values: 10, same: true
+// expect: timestamp, date values: 10, same: true
+// expect: timestamp key, date values: 20, same: true
+// expect: mixed values: 2, same: true
+// expect: int key, int values: 20, same: true
+// expect: text key, text values: 10, same: true
+// expect: correlated, float values: 14, same: true
+// expect: correlated by a key, float values: 20, same: true
+// expect: correlated by a key, timestamp values: 10, same: true
+// expect: scan ti: full scan;aggregate;subquery 1 (in): hashed on f.xi = ti.v;  scan f: full scan
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const SETUP = "create table tn (k numeric(12,2) primary key, v int)\ninsert into tn select g / 4.0, g from generate_series(1, 2000) g\ncreate table ti (id int primary key, v int)\ninsert into ti select g, g from generate_series(1, 2000) g\ncreate table tf (k float8 primary key, v int)\ninsert into tf select g / 4.0, g from generate_series(1, 2000) g\ncreate table td (k date primary key, v int)\ninsert into td select date '2000-01-01' + g, g from generate_series(1, 2000) g\ncreate table tsx (k timestamp primary key, v int)\ninsert into tsx select timestamp '2000-01-01' + (g || ' hours')::interval * 12, g from generate_series(1, 2000) g\ncreate table tt (k text primary key, v int)\ninsert into tt select 'k' || g, g from generate_series(1, 2000) g\ncreate table f (xf float8, xn numeric(8,2), xi int, xd date, xs timestamp, xt text)\ninsert into f select g / 4.0, g / 4.0, g, date '2000-01-01' + g, timestamp '2000-01-01' + (g || ' days')::interval + case when g % 2 = 0 then interval '0' else interval '3 hours' end, 'k' || g from generate_series(1, 20) g\ninsert into f (xf) values (null)\ncreate table mix (m text)\ninsert into mix values ('1'), ('2.0'), ('x'), (null)\nanalyze"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn three(s: mut &lexdb_exec.Session, label: &str, sql: &str, other: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let alt = q(s, other)
+    let same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    println(label + ": " + on + ", same: " + same.toStr())
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for line in strings.lines(&setup) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    three(mut &s, &"numeric key, float values", &"select count(*) from tn where k in (select xf from f)",
+          &"select count(*) from tn where exists (select 1 from f where f.xf = tn.k)")
+    three(mut &s, &"numeric expression, float values", &"select count(*) from tn where k + 0 in (select xf from f)",
+          &"select count(*) from tn where exists (select 1 from f where f.xf = tn.k + 0)")
+    three(mut &s, &"= any, float values", &"select count(*) from tn where k = any (select xf from f)",
+          &"select count(*) from tn where exists (select 1 from f where f.xf = tn.k)")
+    three(mut &s, &"int key, float values", &"select count(*) from ti where id in (select xf * 4 from f)",
+          &"select count(*) from ti where exists (select 1 from f where f.xf * 4 = ti.id)")
+    three(mut &s, &"int key, float values, not in", &"select count(*) from ti where id not in (select xf * 4 from f where xf is not null)",
+          &"select count(*) from ti where not exists (select 1 from f where f.xf * 4 = ti.id)")
+    three(mut &s, &"float key, numeric values", &"select count(*) from tf where k in (select xn from f)",
+          &"select count(*) from tf where exists (select 1 from f where f.xn = tf.k)")
+    three(mut &s, &"float key, int values", &"select count(*) from tf where k in (select xi from f)",
+          &"select count(*) from tf where exists (select 1 from f where f.xi = tf.k)")
+    three(mut &s, &"date key, timestamp values", &"select count(*) from td where k in (select xs from f)",
+          &"select count(*) from td where exists (select 1 from f where f.xs = td.k)")
+    three(mut &s, &"timestamp, date values", &"select count(*) from f where xs in (select k from td)",
+          &"select count(*) from f where exists (select 1 from td where td.k = f.xs)")
+    three(mut &s, &"timestamp key, date values", &"select count(*) from tsx where k in (select xd from f)",
+          &"select count(*) from tsx where exists (select 1 from f where f.xd = tsx.k)")
+    three(mut &s, &"mixed values", &"select count(*) from ti where id::text in (select m from mix) or id in (select xi from f where xi = 2)",
+          &"select count(*) from ti where id in (1, 2) or id::text = 'x'")
+    three(mut &s, &"int key, int values", &"select count(*) from ti where id in (select xi from f)",
+          &"select count(*) from ti where exists (select 1 from f where f.xi = ti.id)")
+    three(mut &s, &"text key, text values", &"select count(*) from tt where k in (select xt from f where xi <= 10)",
+          &"select count(*) from tt where exists (select 1 from f where f.xt = tt.k and f.xi <= 10)")
+    three(mut &s, &"correlated, float values", &"select count(*) from ti where ti.id <= 20 and ti.id in (select f.xf * 4 from f where f.xi >= ti.v - 3 and f.xi <= ti.v + 3 and f.xi % 3 <> 0)",
+          &"select count(*) from ti where ti.id <= 20 and exists (select 1 from f where f.xf * 4 = ti.id and f.xi >= ti.v - 3 and f.xi <= ti.v + 3 and f.xi % 3 <> 0)")
+    three(mut &s, &"correlated by a key, float values", &"select count(*) from ti where ti.id in (select f.xf * 4 from f where f.xi = ti.v)",
+          &"select count(*) from ti where exists (select 1 from f where f.xf * 4 = ti.id and f.xi = ti.v)")
+    three(mut &s, &"correlated by a key, timestamp values", &"select count(*) from td where td.k in (select f.xs from f where f.xi = td.v)",
+          &"select count(*) from td where exists (select 1 from f where f.xs = td.k and f.xi = td.v)")
+    println(q(mut &s, &"explain select count(*) from ti where ti.id in (select f.xf * 4 from f where f.xi = ti.v)"))
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

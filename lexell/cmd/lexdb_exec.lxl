@@ -8927,6 +8927,8 @@ type SubRes = record {
     set: Map[str, int]
     numeric: bool               // the values are numbers: keyed as numbers
     cls: int                    // IN: the values' class (inClass), all the same; -1 mixed, -2 none
+    gidx: Map[str, int]         // hashed IN: per key, its values in gvals (compared when classes differ, as inProbe)
+    gvals: [][]Val
     hasNull: bool
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
     data: [][]Val               // in FROM: its rows
@@ -8940,7 +8942,7 @@ type SubRes = record {
 }
 
 fn emptyRes(): SubRes {
-    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, cls: -2, hasNull: false, groups: newMap(), data: [], vals: [],
+    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, cls: -2, gidx: newMap(), gvals: [], hasNull: false, groups: newMap(), data: [], vals: [],
                   series: false, sOid: 0, sOrdin: false}
 }
 
@@ -9786,6 +9788,14 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
         out.val = try eval(&sp.sel.exprs[nk], &env)
         return Ok(out)
     }
+    // IN's values' class (inClass, as runSub's): floats keyed as float8
+    if sp.use == lexdb_sql.SUB_IN {
+        for r in res.rows {
+            if nk >= len(r) || isNull(&r[nk]) { continue }
+            let c = inClass(&r[nk])
+            if out.cls == -2 { out.cls = c } else if out.cls != c { out.cls = -1 }
+        }
+    }
     for r in res.rows {
         var gk = newStrBuf()
         var nul = false
@@ -9800,10 +9810,19 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
             if isNull(&r[nk]) {
                 f = 3
             } else {
+                let v0 = collVal(sp.kind, &inVal(sp, r[nk]))
+                let v = if out.cls == 2 { inFloat(v0) } else { v0 }
                 var mk = newStrBuf()
                 mk.add(&g)
-                keyPart(mut &mk, &collVal(sp.kind, &inVal(sp, r[nk])))
+                keyPart(mut &mk, &v)
                 out.set.put(mk.toStr(), 1)
+                match out.gidx.get(&g) {
+                    Some(gi) { append(mut &out.gvals[gi], v) }
+                    None {
+                        out.gidx.put(g.toStr(), len(out.gvals))
+                        append(mut &out.gvals, [v])
+                    }
+                }
             }
         }
         match out.groups.get(&g) {
@@ -9815,7 +9834,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
 }
 
 // A hashed subquery's value for an outer row: its key's values, IN's x.
-fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val): Val {
+fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val, z: &lexdb_time.Zone): Val {
     var gk = newStrBuf()
     var miss = false
     for v in keyVals {
@@ -9840,10 +9859,35 @@ fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val): Val {
     if f == 0 { return Val.Bool(false) }            // no rows for it
     if n == "#exists" { return Val.Bool(true) }
     if isNull(x) { return Val.Null }
-    var mk = newStrBuf()
-    mk.add(&gk.toStr())
-    keyPart(mut &mk, x)
-    if r.set.get(&mk.toStr()).isSome() { return Val.Bool(true) }
+    // by the key when x is of the values' class (a number against floats
+    // as a float8), else each of the key's values compared (inProbe)
+    let cx = inClass(x)
+    if r.cls >= 0 && (cx == r.cls || (cx == 1 && r.cls == 2)) {
+        var mk = newStrBuf()
+        mk.add(&gk.toStr())
+        if r.cls == 2 {
+            match asFloat(x) {
+                Some(fx) { keyPart(mut &mk, &Val.Float(fx)) }
+                None { keyPart(mut &mk, x) }
+            }
+        } else {
+            keyPart(mut &mk, x)
+        }
+        if r.set.get(&mk.toStr()).isSome() { return Val.Bool(true) }
+    } else if r.cls != -2 {
+        match r.gidx.get(&gk.toStr()) {
+            Some(gi) {
+                for v in r.gvals[gi] {
+                    if !inFamily(cx, inClass(&v)) { continue }
+                    match compareZ(x, &v, z) {
+                        Ok(c) { if c == 0 { return Val.Bool(true) } }
+                        Err(_) {}
+                    }
+                }
+            }
+            None {}
+        }
+    }
     return if f == 3 { Val.Null } else { Val.Bool(false) }
 }
 
@@ -10712,6 +10756,13 @@ fn inClass(v: &Val): int {
     return 0
 }
 
+// Whether values of classes a and b are compared value by value: the same
+// class, both numbers, or both dates and times. (A text against a number stays
+// unequal, as the set's keys made it.)
+fn inFamily(a: int, b: int): bool {
+    return a == b || ((a == 1 || a == 2) && (b == 1 || b == 2)) || (a >= 10 && b >= 10)
+}
+
 // A float set's value as keyed: its float8 (a float4 widened, as = compares).
 fn inFloat(v: Val): Val {
     match asFloat(&v) {
@@ -10743,6 +10794,7 @@ fn inProbe(r: &SubRes, x: &Val, z: &lexdb_time.Zone): Val {
         }
     } else if r.cls != -2 {
         for v in r.vals {
+            if !inFamily(cx, inClass(&v)) { continue }
             match compareZ(x, &v, z) {
                 Ok(c) { if c == 0 { return Val.Bool(true) } }
                 Err(_) {}
@@ -11090,7 +11142,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
                 var kv: []Val = []
                 for ko in q.subs[i].keyOuter { append(mut &kv, try eval(&ko, &kenv)) }
                 rs.stats[i].hits += 1
-                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv)
+                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv, &envZone(env))
                 return Ok(Unit{})
             }
             let key = valsKey(&refVals)
