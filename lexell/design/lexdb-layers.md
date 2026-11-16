@@ -184,6 +184,188 @@ Two properties make this the right seam for the mixed workload:
   ON CONFLICT and range delete all reach indexes through `insert`, `update`
   and `delete`. Today each of these does its own index upkeep.
 
+#### 4.2.1 As built: the read side (step 1a, 1b)
+
+Status: 2026-11-16, branch `redesign/access`. The read side is in
+`lexdb_access`; the write side (index upkeep) and `ExecTxn` are not yet.
+
+**Where it sits.** `lexdb_access` imports `lexdb_store`, `lexdb_rows`,
+`lexdb_sql`, `lexdb_base`, `lexdb_time`, `lexdb_sqlcoll`, `lexdb_like` and
+`lexdb_vec`; `lexdb_catalog`, `lexdb_plan` and `lexdb_exec` import it. The
+import gate (tests/lexdb/imports.py) checks both directions.
+
+Because access is below the catalog it cannot see `Table`. So:
+
+- `Index` (tree, parts, expressions, predicate, and the catalog's
+  presentation fields) moved to `lexdb_access`; `lexdb_catalog.Index` is an
+  alias.
+- `Rel` is a value record of borrows of a `Table`'s layout fields (name,
+  tree, columns, primary key, indexes, slots, width, layouts), made by
+  `lexdb_catalog.relOf(t)` per call. It copies nothing, like
+  `lexdb_rows.Rows`.
+
+**Interface.**
+
+```
+type Rel; type Index; type Scan; type Cursor; type Tail
+type IdxDec; type IxRead; type Lazy; type Bar; type Picked
+type RowRead; type Probes; type Fetched; type Ranged
+
+// ranges, from bound values (exec evaluates and coerces; keyVal stays there)
+noScan() / wholeScan() / allScan(): Scan
+rangeScan(rel, ix, eqs: &[]Val, los: &[]Val, his: &[]Val, noNulls): Scan
+inScans(rel, ix, eqs, vals, desc): []Scan
+prefixScan(rel, ix, row, n): Scan                    // a foreign key's lookup
+tailOf(ix, los, his, capNulls): Tail                 // a join's bounds, made once
+afterScans(scans, from): []Scan; sameRange(a, b); newCursor()
+
+// rows
+rowRead(rel, need): RowRead; getRow(st, txn, rel, rr, key): Option[[]Val]
+fetch(st, txn, rel, ix, desc, sc, need, cur, out: mut &[][]Val)
+rowOf(st, txn, rel, key, v, n, need, missing)        // a stored value decoded (large values read whole)
+
+// batches
+idxDecOf(rel, ix, needCol): Option[IdxDec]           // index-only reads
+fillLevel(st, txn, rel, rd: &IxRead, sc, part, cur, bp): Option[Batch]
+fillPickIn(st, txn, rel, sc, part, cur, bp, rd, lz: &Lazy,
+           narrow: &fn(skip, &Batch, idx): Option[[]int], bar, spare): Option[Picked]
+probes(ix, n): Probes; p.part(v) / p.intKey(x) / p.again() / p.end() / p.clear()
+fetchMany(st, txn, rel, pr, part, bp): Option[Fetched]            // bLookup's reads
+rangeMany(st, txn, rel, ix, pr, tail, noRange, one, bp, part,
+          room, perRow): Option[Ranged]                           // bRange's reads
+
+// counts and the rest
+countRows(st, txn, rel, most); countEntries(st, txn, rel, ix, sc, cur, n, lim, keep, keys)
+pages(st, rel); rowCount(st, txn, rel); warmPoints(st, txn, rel, scans)
+keyOf(rel, row): str                                 // a row's identity (locks, rows changed)
+encKeyPart / encIdxPart / encNum / floatKey / collKeyVal / ciKey / padKey
+fixedRows / layoutRows / leafKinds / treeDump        // test hooks
+```
+
+**What differs from the sketch above.**
+
+- *Bounds are values, not expressions.* Exec still evaluates a path's
+  values and makes them the column's type (`keyVal`, `coerceZ`); that is
+  the binder's work (layer 4). Access only turns bound values into key
+  ranges.
+- *Filters are a closure, not a `Want`.* The two-step decode (9.108)
+  needs the level's conditions between its two steps. They reach access as
+  `narrow`, a closure over exec's `bNarrow`, called once per run of rows.
+  A raw LIKE's pattern pieces travel in `Lazy`. After step 2 the closure
+  is over the expression IR's vector evaluator; nothing in access changes.
+- *Lookups are made a part at a time.* `Probes` keeps a batch's keys
+  opaque without a `[]Val` per row; `fetchMany` and `rangeMany` sort,
+  deduplicate, read and decode them. `rangeMany` takes the statement's
+  memory room as two numbers, so the budget stays the executor's.
+- *Exec keeps the value encoding for in-memory keys.* Groups, hash joins,
+  partitions, DISTINCT and ANALYZE's sketches use `encIdxPart` as an
+  order-preserving codec. Exec reaches it through thin wrappers. It could
+  become a codec of its own (in `lexdb_rows` or `lexdb_vec`) if keys held
+  in memory and keys on disk ever need to differ.
+- *Collation keys moved too.* `ciKey`/`padKey` make the bytes a
+  collated text's key holds, so they are in access. Exec keeps wrappers
+  for its comparisons.
+- `radixPerm` moved to `lexdb_vec`: both the sort and `sortKeysPerm` use
+  it.
+
+**Gate (step 1b against main `ae3e370a`, both built the same session).**
+Suite 184 passed. TPC-H SF1, 3 runs each: all 22 checksums equal the
+`1744ef99` baseline's; median wall time per query within 0.980–1.020 of
+main's, geometric mean 1.004, total 31.36 s against 31.29 s. OLTP (vspg,
+lexdb only, 3 rounds of 10 s, medians): point selects 82.2k/135.8k/131.0k
+tps at 1/8/32 clients against 83.1k/137.5k/132.5k (about 1% lower,
+server CPU per select 1% higher); updates 3,822/18,198/41,131 against
+3,830/18,192/40,602; the five aggregates equal. Loads: 1M-row INSERT ...
+SELECT 1.21 s and 2.43 s against 1.17 s and 2.38 s (one run each); COPY
+narrow 0.51 s both, wide with two indexes 7.07 s both.
+
+**Still in exec after step 1b:**
+
+- index upkeep and the writes (done in 1c and 1d, 4.2.2);
+- `Txn.sql` (`ExecTxn` not made yet);
+- catalog trees, read and written directly (`CATALOG`, sequences, roles,
+  ACLs), and `relSize`, which counts pages by tree number from the catalog
+  lines.
+
+#### 4.2.2 As built: the write side (step 1c, 1d)
+
+Status: 2026-11-16, branch `redesign/access`. Exec's table and index
+writes go through `lexdb_access`; `Scan.lo`/`hi` are private.
+
+**What an index needs from above** comes as closures, so evaluation stays
+where it is and its order is unchanged:
+
+- `pred: &fn(&Index, &[]Val): Result[bool, DbErr]`, a filtered index's
+  predicate (exec's `inIndex`);
+- `expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]`, an expression
+  part's value of its type (exec's `idxVal`);
+- `wrote: &fn(&Txn)`, called once a row's own tree is written and before
+  its entries, where exec counted the row for the automatic statistics.
+
+Access calls `pred` and `expr` only for an index that has a predicate or
+an expression part. A part's value is now made once per row and index,
+where exec made it up to three times. Index expressions must be immutable,
+so the values and the first error are the same.
+
+**Interface.**
+
+```
+const NO_CONFLICT = -2; const PK_CONFLICT = -1        // else an index's number
+type Conflict { at, ix }                              // a chunk's first conflict
+insert(st, txn, rel, rows: &[]&[]Val, pred, expr, wrote): Conflict
+update(st, txn, rel, olds, news, pred, expr, wrote): Conflict
+delete(st, txn, rel, rows, pred, expr, wrote)
+conflicts(st, txn, rel, arb, rows, pred, expr): []Option[[]Val]   // ON CONFLICT's arbiters
+hasKeys(st, txn, rel, via, rows, expr): []bool                    // a foreign key's parent
+insertRow / updateRow / deleteRow / conflictRow / hasKey          // the same for one row
+encRow(rel, row); rowidKeyed(rel); ixPart(rel, ix, k, row, expr); ROWID
+
+newBuild(redo) / buildAdd(rel, b, row, pred, expr) / buildWrite(st, txn, rel, b, sorted, wrote): Dup
+buildIndex(st, txn, rel, ix, pred, expr): Option[[]Val]           // CREATE INDEX
+exactRange(eqs, lower, lowIncl, upper, upIncl, ix): Scan          // a range delete's bounds
+rangeLocked(st, txn, rel, sc); deleteRange(st, txn, rel, main, ixs, ixr, slow, need, pred, expr): int
+newLoad() / loadRow(st, txn, rel, id, row, ld): bool              // COPY's fast path
+setSpec(st, rel); upgrade(st, rel, from, most); anyRow(st, txn, rel)
+```
+
+**Conflicts are reported, not raised.** A key taken, or a unique index's
+value that another row holds, comes back as `PK_CONFLICT` or the index's
+number, with the rows before it written. Exec makes the error (`dupKey`,
+`uniqueErr`, `dupMade`) as before: UNIQUE, ON CONFLICT, foreign keys,
+CHECK and deferred checks stay in layer 7.
+
+**Chunks of one, for now.** The chunk calls loop over the one-row calls.
+Exec calls the one-row calls, because building a one-element array of
+row borrows per row cost about 2.5% on the 1M-row INSERT ... SELECT load
+(one allocation a row). When DML runs in chunks (4.9), exec calls the
+chunk forms. Their per-row loop is where the batched probes and the
+chunk's own-key hash go.
+
+**Gate (steps 1c–1e against main `b222bca3`, built the same session;
+medians of three).** Suite 184 passed. TPC-H: all 22 checksums equal the
+`1744ef99` baseline's, per-query ratios 0.968–1.038, geometric mean 0.997.
+OLTP point selects 83.3k/136.9k/131.2k tps at 1/8/32 clients against
+82.9k/136.3k/131.3k; updates 3,831/18,131/39,936 against
+3,831/18,151/39,830. INSERT ... SELECT of 1M rows (three fresh runs):
+acct 1.18 s against 1.17 s, t 2.37 s against 2.36 s; 30k rows into a
+table with an index and a unique text index 2.92 s both; UPDATE of an
+indexed column (8 clients) 21,422 against 21,510 tps. COPY: narrow
+0.51 s against 0.50 s (after `relOf` was hoisted out of the fast path's
+row loop; 0.52–0.53 s before), wide 1.54 s against 1.53 s, wide with two
+indexes 7.14 s against 7.08 s.
+
+**Still in exec after step 1d:**
+
+- the fast COPY's text-to-row encoder (`fastCopyField` and friends). It
+  builds a row's stored bytes, so it belongs with `lexdb_rows`. Its key
+  and write moved (`loadRow`).
+- creating and dropping a table's or index's trees (`st.createTree`,
+  `txn.dropTree`) in DDL. These go with the catalog's define/alter/drop
+  (4.3), since the catalog row names the trees.
+- `rs.after`/`win.after`, a batched statement's resume key, is made with
+  `lexdb_access.after` and kept opaque.
+- `Txn.sql` (`ExecTxn`): after step 2.
+
 ### 4.3 Layer 3, catalog (`lexdb_catalog`)
 
 Already half done (architecture 5, followups 4).
@@ -314,6 +496,52 @@ These are estimates from section sizes, not measurements.
 - **Where the real gain lies.** Not mainly in the line count: in one
   implementation of each thing, files that each fit one task, and
   workstreams that don't conflict.
+
+### 4.9 Everything runs in chunks
+
+The inventory (lexdb-constructs.md) lists 13 "row-only" features. They mix
+two different things:
+
+- **Constraints on where and in what order an expression is evaluated:**
+  - exactly once per qualifying row;
+  - in input order;
+  - not on rows past a LIMIT.
+- **A true dependency of one row on the one before it.**
+
+Neither needs a row-at-a-time interface. Batching is about the size of the
+interface: one call per chunk, not per row. An operator with a sequential
+dependency keeps the chunk interface and runs a plain loop inside it.
+
+| Feature | In chunks |
+|---|---|
+| Sequences, identity defaults | Reserve a block of n values per chunk (one sequence update), assign them in selection order |
+| Volatile functions, `set_config`, advisory locks | One call per selected row, in order, in a Project placed where the row set is final: after every filter and after Limit |
+| Correlated subqueries | Unnested to joins (step 5). What remains runs as a batched dependent join: dedupe the chunk's correlation values, run the inner plan once per distinct value or with a chunk of parameters, join back. bRange already does this for index lookups. |
+| FOR UPDATE / NOWAIT / SKIP LOCKED | A LockRows operator locks a chunk's keys in key order. SKIP LOCKED clears locked rows from the selection before Limit counts them. The rerun after a wait stays in layer 7. |
+| RETURNING, OUTPUT | The DML operator writes a chunk and emits a chunk of the written rows |
+| MERGE clauses | First matching clause: evaluate each clause's condition on the rows no earlier clause took (selection vectors), then one write per clause per chunk |
+| ON CONFLICT | Look up the chunk's keys at once (getMany) and find duplicates within the chunk with a hash. DO NOTHING: the first occurrence wins. DO UPDATE: a second hit on a row is PostgreSQL's cardinality error, so there is no row-to-row dependency to honour. |
+| CHECK | A vector predicate |
+| UNIQUE, FK | Batched probes plus a hash of the chunk's own keys. Deferred checks collect keys and check them at commit in one batch. |
+| UPDATE/DELETE TOP (n), `batch_rows` | A Limit in the DML pipeline (truncates the selection) |
+| T-SQL `SELECT @v = f(@v)` | A fold operator. Common forms become aggregates: `@v = @v + x` is a sum, `@s = @s + col` an ordered string_agg, `@v = col` the last value. The general form is a loop inside the operator. |
+| MATCH_RECOGNIZE | Partitions are independent. DEFINE predicates that don't use PREV/NEXT or running aggregates are computed per chunk as a bitmask per variable, and the pattern automaton then runs over the bitmasks |
+| DISTINCT ON, WITH TIES, ROWNUM, MIN/MAX by index | Properties of order the optimizer preserves. ROWNUM is a running counter. WITH TIES compares with the boundary row. TOP PERCENT counts first (two phases). |
+| WAIT n SECONDS | Statement-level rerun. The query inside runs in chunks |
+
+Two rules for the planner and executor follow:
+
+1. **A volatile or side-effecting expression is evaluated exactly once per
+   row, where its row set is final.** It is never evaluated speculatively on
+   a chunk that a later filter or Limit will cut. This also fixes the
+   double-evaluation bug the inventory found, where the batch filter calls
+   `random()` and then the row path calls it again.
+2. **Order is a plan property.** An operator that needs order states it, and
+   the optimizer keeps it or adds a Sort. Nothing relies on the row path
+   happening to run in order.
+
+So the target is that every operator takes and gives chunks. "Row-only"
+survives only as a loop inside an operator, never as a separate path.
 
 ## 5. The on-disk format
 
