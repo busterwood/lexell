@@ -1,0 +1,133 @@
+// lexdb_exec: a LEFT JOIN run as a hash right join, and RIGHT JOINs over
+// batches. "a LEFT JOIN b" whose lookups into b per row of a cost more than
+// reading b once and probing a hash of a is planned as "b RIGHT JOIN a"
+// (rightCheaper, tpch-perf 4.outer: TPC-H q13's shape); the batches note the
+// rows of a that join and add the others after the scan (bUnmatched).
+// Each query runs with SET lexdb_batch = off and on, and against an
+// independent formulation (a correlated count, NOT EXISTS, UNION ALL): all
+// three must give the same rows.
+// - q13's shape: a count per customer of its orders by an ON condition on
+//   the orders alone, grouped again by that count;
+// - WHERE conjuncts on a alone (a's rows dropped before the hash), on b
+//   (checked after the join, on the NULL rows too), ON conditions on a alone
+//   (a's rows kept, joined to none);
+// - rows out sorted, not grouped;
+// - RIGHT JOINs as written, with a table joined after the right join, and a
+//   WHERE conjunct on the right join's rows.
+// expect: [QUERY PLAN] scan ord o: full scan;right join cust c: hash on (id) over full scan;aggregate
+// expect: [QUERY PLAN] scan cust c: primary key lookup;left join ord o: index ord_cid lookup, index only (estimated 7 rows) per row
+// expect: q13: 4 groups, same: true
+// expect: counts: 10726|6662770|62559942|515742, same: true
+// expect: where on a: same: true
+// expect: where on b: 300|405150, same: true
+// expect: on a alone: same: true
+// expect: rows out: 9804 rows, same: true
+// expect: right join written: same: true
+// expect: right join, then a join: same: true
+// expect: right join, where: same: true
+// expect: unmatched counted: 300
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+const SETUP = "create table cust (id int primary key, seg text, k int)\ncreate table ord (id int primary key, cid int, note text, amt int)\ncreate table nat (k int primary key, name text)\ninsert into cust select g, case g % 3 when 0 then 'a' when 1 then 'b' else 'c' end, case when g % 11 = 0 then null else g % 7 end from generate_series(1, 1500) g\ninsert into ord select g, case when g % 13 = 0 then null when g % 17 = 0 then 3000 + g else (g * 7) % 1200 + 1 end, case when g % 5 = 0 then 'special requests' else 'plain' end, g % 100 from generate_series(1, 12000) g\ninsert into nat select g, 'n' || g from generate_series(0, 5) g\ncreate index ord_cid on ord (cid)\nanalyze"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str {
+    return "[QUERY PLAN] " + q(s, &("explain " + sql))
+}
+
+// The query with batches off and on, and the other formulation: their
+// rows, and whether all three are the same.
+fn three(s: mut &lexdb_exec.Session, sql: &str, other: &str, same: mut &bool): str {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let alt = q(s, other)
+    same = off == on && on == alt && !strings.startsWith(&on, "ERROR")
+    if !same { println("off: " + off + "\non: " + on + "\nalt: " + alt) }
+    return on
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for line in strings.lines(&setup) {
+        let r = q(mut &s, &line)
+        if strings.startsWith(&r, "ERROR") { println(line + ": " + r) }
+    }
+    let inner = "select c.id, count(o.id) from cust c left join ord o on c.id = o.cid and o.note not like '%special%' group by c.id"
+    println(plan(mut &s, &inner))
+    // a lookup per row stays where a's rows are few
+    println(plan(mut &s, &"select c.id, o.id from cust c left join ord o on c.id = o.cid where c.id = 5"))
+    var same = false
+    let q13 = "select c_count, count(*) as custdist from (" + inner + ") as t (cid, c_count) group by c_count order by custdist desc, c_count desc"
+    let q13b = "select c_count, count(*) as custdist from (select c.id, (select count(*) from ord o where o.cid = c.id and o.note not like '%special%') from cust c) as t (cid, c_count) group by c_count order by custdist desc, c_count desc"
+    let r1 = three(mut &s, &q13, &q13b, mut &same)
+    println("q13: " + len(strings.split(&r1, ";")).toStr() + " groups, same: " + same.toStr())
+    let both = "select c.id as cid, o.id as oid, o.amt as amt from cust c join ord o on c.id = o.cid"
+    let none = "select c.id, null::int, null::int from cust c where not exists (select 1 from ord o where o.cid = c.id)"
+    let r2 = three(mut &s, &"select count(*), sum(c.id), sum(coalesce(o.id, 0)), sum(coalesce(o.amt, -1)) from cust c left join ord o on c.id = o.cid",
+                   &("select count(*), sum(cid), sum(coalesce(oid, 0)), sum(coalesce(amt, -1)) from (" + both + " union all " + none + ") u"), mut &same)
+    println("counts: " + r2 + ", same: " + same.toStr())
+    let r3 = three(mut &s, &"select c.seg, count(*), sum(coalesce(o.amt, 7)) from cust c left join ord o on c.id = o.cid and o.amt > 40 where c.seg <> 'b' and c.k is not null group by c.seg order by 1",
+                   &"select c.seg, count(*), sum(coalesce(o.amt, 7)) from cust c left join lateral (select * from ord o where o.cid = c.id and o.amt > 40) o on true where c.seg <> 'b' and c.k is not null group by c.seg order by 1", mut &same)
+    println("where on a: same: " + same.toStr())
+    let r4 = three(mut &s, &"select count(*), sum(c.id) from cust c left join ord o on c.id = o.cid where o.id is null",
+                   &"select count(*), sum(c.id) from cust c where not exists (select 1 from ord o where o.cid = c.id)", mut &same)
+    println("where on b: " + r4 + ", same: " + same.toStr())
+    let r5 = three(mut &s, &"select count(*), sum(c.id), sum(coalesce(o.id, 0)), count(o.id) from cust c left join ord o on c.id = o.cid and c.k = 3",
+                   &"select count(*), sum(cid), sum(coalesce(oid, 0)), count(oid) from (select c.id as cid, o.id as oid from cust c join ord o on c.id = o.cid where c.k = 3 union all select c.id, null::int from cust c where not (coalesce(c.k = 3, false) and exists (select 1 from ord o where o.cid = c.id))) u", mut &same)
+    println("on a alone: same: " + same.toStr())
+    let r6 = three(mut &s, &"select c.id, o.id from cust c left join ord o on c.id = o.cid and o.amt < 90 order by 1, 2",
+                   &"select cid, oid from (select c.id as cid, o.id as oid from cust c join ord o on c.id = o.cid and o.amt < 90 union all select c.id, null::int from cust c where not exists (select 1 from ord o where o.cid = c.id and o.amt < 90)) u order by 1, 2", mut &same)
+    println("rows out: " + len(strings.split(&r6, ";")).toStr() + " rows, same: " + same.toStr())
+    let r7 = three(mut &s, &"select count(*), sum(c.id), sum(coalesce(o.id, 0)) from ord o right join cust c on c.id = o.cid and o.note = 'plain'",
+                   &"select count(*), sum(c.id), sum(coalesce(o.id, 0)) from cust c left join ord o on c.id = o.cid and o.note = 'plain'", mut &same)
+    println("right join written: same: " + same.toStr())
+    let r8 = three(mut &s, &"select n.name, count(*), sum(coalesce(o.amt, 1000)) from ord o right join cust c on c.id = o.cid join nat n on n.k = c.k group by n.name order by 1",
+                   &"select n.name, count(*), sum(coalesce(o.amt, 1000)) from cust c join nat n on n.k = c.k left join ord o on c.id = o.cid group by n.name order by 1", mut &same)
+    println("right join, then a join: same: " + same.toStr())
+    let r9 = three(mut &s, &"select c.id, o.id from ord o right join cust c on c.id = o.cid where o.amt is null or o.amt > 97 order by 1, 2",
+                   &"select c.id, o.id from cust c left join ord o on c.id = o.cid where o.amt is null or o.amt > 97 order by 1, 2", mut &same)
+    println("right join, where: same: " + same.toStr())
+    // EXPLAIN ANALYZE's count of a's rows kept with NULLs, batches on
+    let ea = q(mut &s, &"explain analyze select count(o.id) from cust c left join ord o on c.id = o.cid")
+    let at = strings.indexOf(&ea, "unmatched rows ", 0)
+    if at < 0 { println("unmatched counted: " + ea) } else {
+        var n = ""
+        var i = at + 15
+        while i < len(ea) && ea[i] >= '0' && ea[i] <= '9' {
+            n = n + strings.substr(&ea, i, i + 1)
+            i += 1
+        }
+        println("unmatched counted: " + n)
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}
