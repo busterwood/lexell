@@ -250,3 +250,28 @@ table's batches do) is the 543 ms.
 - For the other workstreams: char(n) comparisons in `bCompile` (q21's
   joins run on the row path for `o_orderstatus = 'F'`), `substring` over
   batches (q22), and a hash of a join for q21's (supplier, nation).
+
+**Review fixes (after eec0db53).** An independent review found a wrong
+result in the lookup level, and the new tests found three faults that
+main has too:
+
+- An EXISTS nested in another subquery, its filter on the outermost
+  query's value, became a lookup level whose condition the middle
+  subquery's unnesting (`hashSub`) took for its own key and dropped:
+  wrong rows, and a crash over batches. `semiLookable` now refuses
+  conditions on the query's own outer values. `hashSub` now refuses a
+  subquery whose semi or anti level has a condition on an outer value
+  (`80d960e0`).
+- Over batches, a hash semi level's residual on its own columns and an
+  outer value only was skipped (`bJoinPlan` took it for one that
+  `materialize` applies). Fixed in the same commit; main has it.
+- A NULL outer value matched a mixed key of a "<>" summary over batches
+  (`bProbe`; `06c8b1c7`). Main has it; TPC-H has no such NULLs.
+- An outer char(n) value was compared as an untyped text, blanks
+  included (`faea665f`). An outer column of the default collation was
+  the weakest collation instead of an implicit one, so EXISTS accepted
+  a comparison that a join rejects with 42P21 (`d665f217`). Main has
+  both.
+- `bRange` now counts the rows it holds against max_statement_mem.
+  Past the limit it hands the scan to the row path. "joined" counts
+  the same on every semi/anti path (`6eb8597b`).
