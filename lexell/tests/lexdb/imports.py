@@ -20,7 +20,7 @@ CMD = os.path.normpath(os.path.join(HERE, "..", "..", "cmd"))
 IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
-    "lexdb_base", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
+    "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_vec",
@@ -53,6 +53,12 @@ KNOWN_CORE_DIALECT = {
     ("lexdb_exec", "lexdb_tsqlfn"),
     ("lexdb_exec", "lexdb_auth"),
 }
+
+# The binder (design/lexdb-layers.md 4.4, layer 4) sits above the language
+# model, the catalog and the dialect facts, and below the planner and the
+# executor: it imports only these (and lexell's own libraries).
+BIND = "lexdb_bind"
+BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -113,6 +119,10 @@ def check():
                 continue
             if d in DIALECT and family(m) != family(d):
                 bad.append(f"{m} -> {d}: dialect family {family(m)} imports {family(d)}")
+
+    for d in mods.get(BIND, []):
+        if d not in BIND_MAY_IMPORT:
+            bad.append(f"{BIND} -> {d}: the binder imports above or beside its layer")
 
     # The list of known core->dialect edges is exact in both directions.
     present = {(m, d) for m, ds in mods.items() for d in ds if m in CORE and d in DIALECT}
