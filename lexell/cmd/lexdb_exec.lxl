@@ -23594,7 +23594,19 @@ fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BC
                         if all {
                             var hasNull = false
                             var keep: []Val = []
-                            for v in vs { if isNull(&v) { hasNull = true } else { append(mut &keep, v) } }
+                            for v in vs {
+                                if isNull(&v) { hasNull = true; continue }
+                                // a time column's value in the session's zone,
+                                // as the row path compares it (bValCmpOf)
+                                if k == BK_VAL {
+                                    match bTimeVal(v, col, q, env) {
+                                        Some(tv) { append(mut &keep, tv) }
+                                        None { return None }
+                                    }
+                                } else {
+                                    append(mut &keep, v)
+                                }
+                            }
                             // A short list is a chain of equality tests; a
                             // long one a sorted set searched by halves (a
                             // 200-value chain read 1.2B values on q12's 6M
@@ -23749,27 +23761,36 @@ fn bValCmpOf(cc: int, c: int, qc: int, k: &Expr, left: bool, q: &Query, env: &En
     if !bConst(k) { return None }
     match eval(k, env) {
         Ok(v0) {
-            var v = v0
-            // a date, timestamp or timestamptz column: the value made its
-            // type here, in the session's zone (9.95), as compareTime
-            // would (a text read as it; the others compared as instants)
-            let ck = q.cols[qc].typ.kind
-            let vk = kindOf(&v)
-            if (ck == lexdb_sql.K_DATE || ck == lexdb_sql.K_TS || ck == lexdb_sql.K_TSTZ) && vk != ck && !isNull(&v) {
-                let z = envZone(env)
-                if vk == lexdb_sql.K_TEXT {
-                    match coerceTime(v, &lexdb_sql.timeType(q.cols[qc].typ.oid), &z) {
-                        Ok(x) { v = x }
-                        Err(_) { return None }
-                    }
-                } else if !z.isUtc() {
-                    return None
-                }
+            match bTimeVal(v0, qc, q, env) {
+                Some(v) { return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL}) }
+                None { return None }
             }
-            return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL})
         }
         Err(_) { return None }
     }
+}
+
+// A constant compared with query column qc in a batch: for a date,
+// timestamp or timestamptz column, the value made its type here, in the
+// session's zone (9.95), as compareTime would (a text read as it; the
+// others compared as instants, which compare does only in UTC). None: the
+// batch cannot compare it as the row path does.
+fn bTimeVal(v0: Val, qc: int, q: &Query, env: &Env): Option[Val] {
+    var v = v0
+    let ck = q.cols[qc].typ.kind
+    let vk = kindOf(&v)
+    if (ck == lexdb_sql.K_DATE || ck == lexdb_sql.K_TS || ck == lexdb_sql.K_TSTZ) && vk != ck && !isNull(&v) {
+        let z = envZone(env)
+        if vk == lexdb_sql.K_TEXT {
+            match coerceTime(v, &lexdb_sql.timeType(q.cols[qc].typ.oid), &z) {
+                Ok(x) { v = x }
+                Err(_) { return None }
+            }
+        } else if !z.isUtc() {
+            return None
+        }
+    }
+    return Some(v)
 }
 
 fn bvec(m: int): BVec { return lexdb_rows.bvec(m) }

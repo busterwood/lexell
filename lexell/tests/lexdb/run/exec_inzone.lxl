@@ -1,0 +1,70 @@
+// lexdb_exec: an IN list over a batch (c33b60d5) compares a date,
+// timestamp or timestamptz column with its values as the row path does,
+// in the session's zone: a text read in it, another time type declined to
+// the row path outside UTC. The chain (up to 8 values) and the sorted set,
+// batches on and off. Regressions from the TPC-H review (2026-11-16).
+// expect: create table t (id int primary key, ts timestamptz, d date) -> CREATE TABLE
+// expect: insert into t select g, timestamptz '2020-01-01 00:00:00+00' + (g % 20) * interval '1 hour', date '2020-01-01' + (g % 20) from generate_series(1, 3000) g -> INSERT 0 3000
+// expect: update t set ts = null, d = null where id % 7 = 0 -> UPDATE 428
+// expect: set time zone 'Asia/Kolkata' -> SET
+// expect: set lexdb_batch = on -> SET
+// expect: select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30') -> 257
+// expect: select count(*) from t where ts = '2020-01-01 05:30' or ts = '2020-01-01 06:30' -> 257
+// expect: select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30') -> 257
+// expect: select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30', timestamp '2020-01-01 07:30', timestamp '2020-01-01 08:30', timestamp '2020-01-01 09:30', timestamp '2020-01-01 10:30', timestamp '2020-01-01 11:30', timestamp '2020-01-01 12:30', timestamp '2020-01-01 13:30') -> 1157
+// expect: select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30', '2020-01-01 07:30', '2020-01-01 08:30', '2020-01-01 09:30', '2020-01-01 10:30', '2020-01-01 11:30', '2020-01-01 12:30', '2020-01-01 13:30', null) -> 1157
+// expect: select count(*) from t where ts in (date '2020-01-01', date '2020-01-02') -> 0
+// expect: select count(*) from t where d in (timestamptz '2020-01-02 00:00+05:30', timestamptz '2020-01-03 00:00+05:30') -> 256
+// expect: select count(*) from t where d in ('2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-01-06', '2020-01-07', '2020-01-08', '2020-01-09', '2020-01-10') -> 1156
+// expect: set lexdb_batch = off -> SET
+// expect: select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30') -> 257
+// expect: select count(*) from t where ts = '2020-01-01 05:30' or ts = '2020-01-01 06:30' -> 257
+// expect: select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30') -> 257
+// expect: select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30', timestamp '2020-01-01 07:30', timestamp '2020-01-01 08:30', timestamp '2020-01-01 09:30', timestamp '2020-01-01 10:30', timestamp '2020-01-01 11:30', timestamp '2020-01-01 12:30', timestamp '2020-01-01 13:30') -> 1157
+// expect: select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30', '2020-01-01 07:30', '2020-01-01 08:30', '2020-01-01 09:30', '2020-01-01 10:30', '2020-01-01 11:30', '2020-01-01 12:30', '2020-01-01 13:30', null) -> 1157
+// expect: select count(*) from t where ts in (date '2020-01-01', date '2020-01-02') -> 0
+// expect: select count(*) from t where d in (timestamptz '2020-01-02 00:00+05:30', timestamptz '2020-01-03 00:00+05:30') -> 256
+// expect: select count(*) from t where d in ('2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-01-06', '2020-01-07', '2020-01-08', '2020-01-09', '2020-01-10') -> 1156
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "strings"
+fn show(s: mut &lexdb_exec.Session, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_exec.isNull(&v) { "NULL" } else { lexdb_exec.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            let out = sql + " -> " + (if len(lines) == 0 { r.tag } else { strings.join(&lines, "; ") })
+            let k = strings.indexOf(&out, " rows in ", 0)      // EXPLAIN ANALYZE's time varies
+            println(if k >= 0 { out[0..k] + " rows" } else { out })
+        }
+        Err(e) { println(sql + " -> " + e.state + " " + e.msg) }
+    }
+}
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(1), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        show(mut &s, "create table t (id int primary key, ts timestamptz, d date)")
+        show(mut &s, "insert into t select g, timestamptz '2020-01-01 00:00:00+00' + (g % 20) * interval '1 hour', date '2020-01-01' + (g % 20) from generate_series(1, 3000) g")
+        show(mut &s, "update t set ts = null, d = null where id % 7 = 0")
+        show(mut &s, "set time zone 'Asia/Kolkata'")
+        for b in ["on", "off"] {
+            show(mut &s, "set lexdb_batch = " + b)
+            show(mut &s, "select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30')")
+            show(mut &s, "select count(*) from t where ts = '2020-01-01 05:30' or ts = '2020-01-01 06:30'")
+            show(mut &s, "select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30')")
+            show(mut &s, "select count(*) from t where ts in (timestamp '2020-01-01 05:30', timestamp '2020-01-01 06:30', timestamp '2020-01-01 07:30', timestamp '2020-01-01 08:30', timestamp '2020-01-01 09:30', timestamp '2020-01-01 10:30', timestamp '2020-01-01 11:30', timestamp '2020-01-01 12:30', timestamp '2020-01-01 13:30')")
+            show(mut &s, "select count(*) from t where ts in ('2020-01-01 05:30', '2020-01-01 06:30', '2020-01-01 07:30', '2020-01-01 08:30', '2020-01-01 09:30', '2020-01-01 10:30', '2020-01-01 11:30', '2020-01-01 12:30', '2020-01-01 13:30', null)")
+            show(mut &s, "select count(*) from t where ts in (date '2020-01-01', date '2020-01-02')")
+            show(mut &s, "select count(*) from t where d in (timestamptz '2020-01-02 00:00+05:30', timestamptz '2020-01-03 00:00+05:30')")
+            show(mut &s, "select count(*) from t where d in ('2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-01-06', '2020-01-07', '2020-01-08', '2020-01-09', '2020-01-10')")
+        }
+        return 0
+    })
+}
