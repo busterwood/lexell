@@ -13,6 +13,9 @@
 //   with SET lexdb_batch = off and on, and against the same query with
 //   the join's key written l.lk + 0 (no range per row: a hash join),
 //   which must give the same rows.
+// - Ranges narrowed by a constant bound on the column after the
+//   equalities (a primary key's next column, an index's), lower, upper and
+//   both, inner and LEFT, and in a semi and an anti join.
 // - EXPLAIN ANALYZE's counts with batches on and off (but "batches N"),
 //   also where a batch gives way to the row path: counted once.
 // - In a transaction with writes of its own (reads noted: the batch's
@@ -20,7 +23,7 @@
 // - Whether the ranges were joined over batches (rangeJoins went up).
 // timeout: 90
 // expect: plan: join l: primary key range (estimated 4 rows) per row
-// expect: fixed: 11 queries, 11 the same three ways, 8 over batches, counts same 11
+// expect: fixed: 19 queries, 19 the same three ways, 14 over batches, counts same 19
 // expect: random: 120 queries, 120 the same three ways
 // expect: in a transaction: 30 queries, 30 the same three ways
 import "strings"
@@ -109,6 +112,7 @@ fn main() {
         let c2 = q(mut &s, &"create table l (lk int, ln int, pk2 int, q numeric(15,2), f char(1), primary key (lk, ln))")
         let c3 = q(mut &s, &"create table p (pk int primary key, nm text)")
         let c4 = q(mut &s, &"create index l_pk2 on l (pk2)")
+        let c4b = q(mut &s, &"create index l_pk2_q on l (pk2, q)")
         var os: []str = []
         for i in 0..4000 {
             let stv = ["'F'", "'O'", "'P'", "null"][i % 4]
@@ -157,7 +161,19 @@ fn main() {
             // some row): counted once, as the row path reads it; one of them gives
             // way, so it is not counted as joined over batches
             "select o.ok, l.ln from o join l on l.lk = o.ok where o.c = 3 and (l.f = 'R' or 1 / (l.ln - 2) > 0) order by 1, 2 limit 5",
-            "select o.ok from o join l on l.lk = o.ok where o.c = 9 and (upper(l.f) = 'A' or 1 / (l.ln - 2) > 0) limit 5"]
+            "select o.ok from o join l on l.lk = o.ok where o.c = 9 and (upper(l.f) = 'A' or 1 / (l.ln - 2) > 0) limit 5",
+            // a bound on the next key column too (q3, q5's orders by
+            // customer and date): the prefix's range narrowed
+            "select o.ok, l.ln, l.q from o join l on l.lk = o.ok and l.ln <= 2 where o.c = 3 order by 1, 2",
+            "select o.ok, count(*), sum(l.q) from o join l on l.lk = o.ok and l.ln > 1 and l.ln < 4 where o.c < 3 group by o.ok order by 1",
+            "select o.ok, l.ln from o left join l on l.lk = o.ok and l.ln >= 5 where o.c = 5 order by 1, 2",
+            "select o.ok, l.ln from o join l on l.lk = o.ok and l.ln > 9 where o.c = 7 order by 1, 2",
+            // ... in a semi and an anti join: a strict bound is inclusive in the
+            // range (pathScan's), so its first row is checked, not taken
+            "select o.ok from o where o.c < 4 and exists (select 1 from l where l.lk = o.ok and l.ln > 1) order by 1",
+            "select o.ok from o where o.c < 4 and not exists (select 1 from l where l.lk = o.ok and l.ln < 2) order by 1",
+            "select p.pk, l.lk, l.ln, l.q from p join l on l.pk2 = p.pk and l.q < 900 where p.nm = 'x2' order by 1, 2, 3",
+            "select p.pk, count(*) from p join l on l.pk2 = p.pk and l.q >= 2000.5 and l.q <= 4000 where p.nm in ('x3', 'x4') group by p.pk order by 1"]
         var same = 0
         var over = 0
         var cnt = 0

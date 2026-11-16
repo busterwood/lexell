@@ -26209,6 +26209,13 @@ type JLevel = record {
     right: bool             // a RIGHT JOIN's: its rows that join are noted (Run.seen), the others added after the scan (bUnmatched)
     look: bool              // a lookup by the whole primary key per row (its key: the path's equalities), not a hash
     range: bool             // a semi/anti join's range per row (semiLook; its key: the path's equalities): bRange
+    // a range's bounds on the column after its equalities (the path's rng,
+    // constants): each one's encoded value, after a row's prefix; and
+    // whether one is NULL (no row in any range)
+    loSuf: []str
+    hiSuf: []str
+    capNulls: bool          // an index's NULLs left out (pathScan's marker 2)
+    noRange: bool
     key: []BNode            // per hash column: the value it equals, over the joined batch
     keyTyp: []int           // their BT_*
     keyCol: []int           // ... the batch's column for a BT_OTHER (a column of values)
@@ -26274,6 +26281,34 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // q9's index lookups)
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
         let keyed = look || range
+        var loSuf: []str = []
+        var hiSuf: []str = []
+        var noRange = false
+        if range && len(lv.path.rng) > 0 {
+            // its bounds on the column after the equalities (q3, q5's
+            // orders by customer and o_orderdate < ...): as pathScan makes
+            // them, once
+            let typ = keyType(&lv.t, lv.path.index, len(lv.path.eqs))
+            for b in lv.path.rng {
+                let v = match eval(&b.val, &env) {
+                    Ok(x) {
+                        match coerceZ(x, &typ, &envZone(&env)) {
+                            Ok(y) { y }
+                            Err(_) { return Ok(None) }
+                        }
+                    }
+                    Err(_) { return Ok(None) }
+                }
+                if isNull(&v) {
+                    noRange = true
+                    continue
+                }
+                var kb = newStrBuf()
+                encPart(mut &kb, &v, lv.path.index >= 0)
+                if b.op == ">" || b.op == ">=" { append(mut &loSuf, kb.toStr()) } else { append(mut &hiSuf, kb.toStr()) }
+            }
+        }
+        let capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
         if (lv.perRow && !keyed) || lv.lateral || !(inner || rj || lv.join == lexdb_sql.J_LEFT) { return Ok(None) }
         if !keyed && (len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols)) { return Ok(None) }
         if inner && len(lv.post) > 0 { return Ok(None) }
@@ -26402,7 +26437,9 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             resTyp = rcc.typ
             res = takeN(rcc)
         }
-        append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, right: rj, look: look, range: range, key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
+        append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, right: rj, look: look, range: range,
+                                   loSuf: loSuf, hiSuf: hiSuf, capNulls: capNulls, noRange: noRange,
+                                   key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
                                    ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
                                    rows: rows, rkinds: rkinds, cand: [], after: []})
     }
@@ -26923,7 +26960,9 @@ fn bRoom(b: mut &Batch, bp: &BPlan, room: mut &int, m: int) {
 // the batches read (bRange): its path's leading equalities only.
 fn rangePath(q: &Query, lv: &Level): bool {
     let p = &lv.path
-    if lv.virt() || lv.lateral || p.desc || len(p.eqs) == 0 || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return false }
+    if lv.virt() || lv.lateral || p.desc || len(p.eqs) == 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return false }
+    // bounds on the next column: constants only (made once: rangeBounds)
+    for b in p.rng { if !bConst(&b.val) { return false } }
     if q.corr && pathCorr(p) { return false }
     return true
 }
@@ -27057,7 +27096,29 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     for x in 0..len(ks) {
         if bail || over || len(bad) > 0 { break }
         append(mut &lo, if ix && !only { len(pks) } else { rows.n })
-        try st.scanLeaves(txn, tree, &ks[x], succ(&ks[x]), fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
+        // the key's range: its prefix's, narrowed by the bounds (pathScan's)
+        var rlo = ks[x]
+        var rhi = succ(&ks[x])
+        for sf in jl.loSuf {
+            let lk = ks[x] + sf
+            if lk > rlo { rlo = lk }
+        }
+        for sf in jl.hiSuf {
+            let sv = succ(&(ks[x] + sf))
+            if sv != "" && (rhi == "" || sv < rhi) { rhi = sv }
+        }
+        if jl.capNulls {
+            var nb = newStrBuf()
+            nb.add(&ks[x])
+            nb.addByte(2)
+            let nulAt = nb.toStr()
+            if rhi == "" || nulAt < rhi { rhi = nulAt }
+        }
+        if jl.noRange || (rhi != "" && rlo >= rhi) {
+            append(mut &hi, if ix && !only { len(pks) } else { rows.n })
+            continue
+        }
+        try st.scanLeaves(txn, tree, &rlo, rhi, fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
             var e = i0
             while e < j0 {
                 if room0 >= 0 && (rows.n + len(pks)) * perRow > room0 {

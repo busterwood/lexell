@@ -548,6 +548,38 @@ q17 keep theirs). EXPLAIN ANALYZE says why four did not move:
 - q21: over batches already (`semi`'s work); `o_orderstatus = 'F'` now
   compiles for batches outright.
 
+#### 4.1.9 Step 2c: a range per row narrowed by a bound
+
+q3 and q5's orders level is read per customer by `orders_cust_date`: the
+customer's equality and a constant bound on `o_orderdate` (the path's
+`rng`), which `rangePath` left out, so the queries stayed on the row
+path. `rangePath` now takes bounds whose values are constants;
+`bJoinPlan` coerces and encodes them once (as `pathScan` does, in the
+session's zone; a NULL bound: no row), and `bRange` narrows each key's
+prefix range by them: the larger of the prefix and prefix + each lower
+bound, the smaller of the prefix's end and the end of prefix + each upper
+bound (inclusive, as `pathScan`: the WHERE still checks every row), and an
+index's NULLs left out (marker 2). A bound that depends on an earlier
+table's row still sends the level to the row path.
+
+Test: `exec_joinrange` adds six queries with a bound on the next key
+column (a primary key's, and an index's `(pk2, q)`): lower, upper and
+both, INNER and LEFT, one with no row in range; all over batches, the
+same with batches off and as a hash join, EXPLAIN ANALYZE's counts the
+same. Suite: 183 passed.
+
+A/B, boost off, same session, medians of three, main `9f6dd830` against
+this step: q3 2,372 (2,359-2,380) -> 1,359 (1,358-1,365) ms; q5 1,157
+(1,149-1,161) -> 402 (399-403) ms; q7, q10 and q21 (controls) unchanged.
+All 22 checksums unchanged (`~/tpch-w/exec/out-rb1-all`).
+
+Not done (open): a bound that depends on an earlier table's row; the
+per-row fetch cost of a range or index level whose entries are not
+covering (q19: 57% fetching 14,301 lineitem rows for 485 index lookups;
+q20's remainder about 3.5 us a row in `fillIdxRows`/`getMany`); the scan's
+"rows read" with batches on and off (4,000 against 3,971 for `select
+count(*) from o where o.c = 3`, on main too).
+
 ### 4.2 `semi`: semi and anti joins
 
 **What PostgreSQL does.** `pull_up_sublinks` (prep/prepjointree.c)
