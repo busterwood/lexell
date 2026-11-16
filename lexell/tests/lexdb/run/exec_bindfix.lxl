@@ -1,0 +1,83 @@
+// lexdb_bind and lexdb_ops: four binding bugs of the TPC-H week and the
+// inventory's double evaluation of random(), each against PostgreSQL
+// 18.6's result, batches off and on.
+// - x COLLATE "C" on a char(n) column was typed a text, so 'ab' did not
+//   equal the column's 'ab ' (0 rows); it keeps x's type (exprOid).
+// - '2024-1-2'::date was refused: a month and a day of one digit are read.
+// - 'abcdef'::varchar(2) failed with 22001: an explicit cast cuts the text
+//   to n characters (castTo); an assignment's conversion still refuses it.
+// - x = ANY (ARRAY[...]) ignored a case-insensitive column's collation:
+//   each element is keyed as IN's values are.
+// - A batch filter evaluated random() and then the row path evaluated it
+//   again on the rows it kept (about a quarter of the rows kept, not half):
+//   where the row path rechecks a level's conditions, a volatile one is
+//   left to it alone (design/lexdb-layers.md 4.9, rule 1).
+// expect: K1 collate C on char(3): 1, same: true
+// expect: K2 collate C on the literal: 1, same: true
+// expect: D1 one-digit month and day: 2024-01-02|2024-01-02|2024-01-02 00:00:00, same: true
+// expect: V1 explicit varchar(n): ab|abc|ab, same: true
+// expect: V2 varchar(4) keeps a blank: 4, same: true
+// expect: V3 insert too long: ERROR 22001, same: true
+// expect: A1 = any under CI: 2, same: true
+// expect: A2 <> all under CI: 1, same: true
+// expect: R1 random alone: t, same: true
+// expect: R2 random beside a row-only condition: t, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 })) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let y = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup = ["create table c (x char(3), v varchar(2))", "insert into c (x) values ('ab'), ('xy')",
+                 "create table ci (t text collate \"SQL_Latin1_General_CP1_CI_AS\")", "insert into ci values ('ABC'), ('abc'), ('x')",
+                 "create table r (id int)", "insert into r select g from generate_series(1, 4000) g"]
+    for l in setup {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    two(mut &s, &"K1 collate C on char(3)", &"select count(*) from c where x collate \"C\" = 'ab'")
+    two(mut &s, &"K2 collate C on the literal", &"select count(*) from c where x = 'ab' collate \"C\"")
+    two(mut &s, &"D1 one-digit month and day", &"select '2024-1-2'::date, date '2024-1-2', '2024-01-2'::timestamp")
+    two(mut &s, &"V1 explicit varchar(n)", &"select 'abcdef'::varchar(2), cast('abcdef' as varchar(3)), 'abcdef'::char(2)")
+    two(mut &s, &"V2 varchar(4) keeps a blank", &"select length('abc  '::varchar(4))")
+    two(mut &s, &"V3 insert too long", &"insert into c (v) values ('abc')")
+    two(mut &s, &"A1 = any under CI", &"select count(*) from ci where t = any (array['abc'])")
+    two(mut &s, &"A2 <> all under CI", &"select count(*) from ci where t <> all (array['abc'])")
+    two(mut &s, &"R1 random alone", &"select count(*) between 1600 and 2400 from r where random() < 0.5")
+    two(mut &s, &"R2 random beside a row-only condition",
+        &"select count(*) between 1600 and 2400 from r where random() < 0.5 and id::text <> current_setting('server_version')")
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(95), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

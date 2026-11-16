@@ -637,6 +637,46 @@ plain select list (`branchOid`).
     reaches `binVal` 1.5M times;
   - `bxEval` walks the tree rather than running flat steps.
 
+**Slice 2c, first part, as built.**
+
+- Binding bugs fixed, each against PostgreSQL 18.6 (`exec_bindfix`):
+  - `COLLATE "C"` on char(n);
+  - `'2024-1-2'::date`;
+  - an explicit `::varchar(n)` now truncates;
+  - `= ANY (ARRAY[...])` and `<> ALL (...)` under a case-insensitive
+    collation.
+- **Rule 1 of 4.9:** where the row path rechecks a level's conditions, a
+  volatile one (`random()`) is no longer also evaluated by the batch
+  filter.
+- `arith`, `arithZ`, `arithTime` and `arithFloat` take operator codes.
+- **Not fixed: EXISTS with a derived table's text column compared to a
+  date** (0 rows where 1 is right). The subquery is hashed on `b.d = a.t`
+  (`keyConj`/`hashKeyTypes` let an untyped outer parameter key a hash).
+  Its date keys and the outer text value never meet. It needs the outer
+  reference typed from the derived column's label, which 2a made
+  trustworthy for unions, VALUES and CASE but not yet everywhere.
+
+**The rest of 2c, planned:**
+
+1. **Bind once per plan.**
+   - `BX.Param(i)` reads the run's parameters (`CEnv` gets an owned copy
+     per run), and the binding moves from `cxsOf`, the output plan and
+     `bGenOf` (per run) into the plan (`Query`, `Sel`), done when it is
+     built.
+   - Node types are then computed once, bottom-up.
+   - `bGenVals`' constant shape reads a `Param` slot as a constant.
+2. **`bCompile` builds from `BX`.**
+   - `BNode`'s typed kernels (Arith, Cmp, DArith/DCmp, Like, InVals) are
+     chosen from the node's bound type instead of `bCompile`'s own
+     typing.
+   - `Gen` becomes a `BX` step.
+   - `BNode`'s duplicate typing and `bTimeVal` are deleted.
+   - Gate: the scan-heavy queries (q1, q6, the 35-query suite's scans).
+3. **The function library moves into `lexdb_ops` per signature.**
+   - `callAt`, `callFn`, `callMisc`, `callTime`, `call1` move; the
+     session-bound calls (sequences, catalog, settings) stay in exec.
+   - `FnRef` gains the signature's entry point.
+
 ### 4.5 Layer 5, optimizer (`lexdb_plan`)
 
 **In:** the bound logical plan. **Out:** a physical operator tree, which is
