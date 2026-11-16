@@ -1154,6 +1154,7 @@ type CEnv = record {
     seq: Option[SeqEnv]
     now: int
     zone: lexdb_time.Zone
+    params: []Val           // the run's parameters, for a plan's bound slots (BX.Param); [] where they are bound as constants
 }
 
 fn cenvOf(seq: Option[SeqEnv]): CEnv {
@@ -1166,7 +1167,7 @@ fn cenvOf(seq: Option[SeqEnv]): CEnv {
         }
         None {}
     }
-    return CEnv{seq: seq, now: now, zone: z}
+    return CEnv{seq: seq, now: now, zone: z, params: []}
 }
 
 // Whether name is a T-SQL or Oracle function that lexdb's own functions do
@@ -1220,6 +1221,10 @@ fn unName(u: int): &str {
 fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     match x {
         lexdb_bind.BX.Const(v) { return Ok(v) }
+        lexdb_bind.BX.Param(i) {
+            if i >= len(ce.params) { return Err(e("08P01", &("there is no parameter $" + (i + 1).toStr()))) }
+            return Ok(ce.params[i])
+        }
         lexdb_bind.BX.Col(i) {
             if len(row) == 0 { return Ok(Val.Null) }
             return Ok(row[i])
@@ -3628,6 +3633,10 @@ pub type Query = record {
     colAt: Map[str, int]        // cols by name, once its tables are read (levelOf's; a name missing: colIndex)
     pinned: bool                // its join starts from a pinned row (optimizer 35): an outer value's equality is taken first
     noRefKeys: bool             // its outer values (refs) are not a path's or a hash's keys (Scope.noRefKeys, 9.104)
+    // per level, its conditions and the WHERE conjuncts after it bound once
+    // for the plan (bindSel; parameters as slots); [] bound per run (prepare)
+    cc: [][]Option[lexdb_bind.BX]
+    cp: [][]Option[lexdb_bind.BX]
 }
 
 fn dotAt(s: &str): int {
@@ -6163,7 +6172,7 @@ fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool,
               sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: []}
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
@@ -6858,10 +6867,10 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
     rs.cnt[k].read += 1
-    if !(try allTrueC(st, txn, q, m, &lv.cond, &m.cc[k], row, params, rs)) { return Ok(0) }
+    if !(try allTrueC(st, txn, q, m, &lv.cond, (if len(m.cc) > 0 { &m.cc[k] } else { &q.cc[k] }), row, params, rs)) { return Ok(0) }
     rs.cnt[k].joined += 1
     if ri >= 0 && len(rs.seen[k]) > 0 { rs.seen[k][ri] = true }
-    if !(try allTrueC(st, txn, q, m, &lv.post, &m.cp[k], row, params, rs)) { return Ok(1) }
+    if !(try allTrueC(st, txn, q, m, &lv.post, (if len(m.cp) > 0 { &m.cp[k] } else { &q.cp[k] }), row, params, rs)) { return Ok(1) }
     if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(-1) }
     return Ok(1)
 }
@@ -7055,7 +7064,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     let r = &m.mat[k][ri]
                     for i in 0..len(r) { row[lv.first + i] = r[i] }
                     rs.cnt[k].read += 1
-                    if try allTrueC(st, txn, q, m, &lv.cond, &m.cc[k], row, params, rs) { found = true; break }
+                    if try allTrueC(st, txn, q, m, &lv.cond, (if len(m.cc) > 0 { &m.cc[k] } else { &q.cc[k] }), row, params, rs) { found = true; break }
                 }
             }
             if found {
@@ -7095,7 +7104,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     try rs.tick()
                     for i in 0..len(r) { row[lv.first + i] = r[i] }
                     rs.cnt[k].read += 1
-                    if try allTrueC(st, txn, q, m, &lv.cond, &m.cc[k], row, params, rs) {
+                    if try allTrueC(st, txn, q, m, &lv.cond, (if len(m.cc) > 0 { &m.cc[k] } else { &q.cc[k] }), row, params, rs) {
                         found = true
                         break
                     }
@@ -9727,6 +9736,36 @@ fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val): []Option[lexdb_bind.BX] {
     return out
 }
 
+// Whether q's levels' conditions were bound for the plan (bindSel) and
+// are still its conditions, one each.
+fn boundOnce(q: &Query): bool {
+    if len(q.cc) != len(q.levels) || len(q.cp) != len(q.levels) { return false }
+    for k in 0..len(q.levels) { if len(q.cc[k]) != len(q.levels[k].cond) || len(q.cp[k]) != len(q.levels[k].post) { return false } }
+    return true
+}
+
+// The levels' conditions of sel's queries (its own, its parts', its
+// subqueries', recursively) bound once (lexdb_bind.bindExpr, parameters as
+// slots), for every run of the plan: prepare reads them, not binding them
+// again per run (a correlated subquery's 8,508 runs in q20).
+fn bindSel(sel: mut &Sel) {
+    bindQuery(mut &sel.q)
+    for i in 0..len(sel.parts) { bindSel(mut &sel.parts[i]) }
+}
+
+fn bindQuery(q: mut &Query) {
+    let none: []Val = []
+    var cc: [][]Option[lexdb_bind.BX] = []
+    var cp: [][]Option[lexdb_bind.BX] = []
+    for k in 0..len(q.levels) {
+        append(mut &cc, cxsOf(q, &q.levels[k].cond, &none))
+        append(mut &cp, cxsOf(q, &q.levels[k].post, &none))
+    }
+    q.cc = cc
+    q.cp = cp
+    for i in 0..len(q.subs) { bindSel(mut &q.subs[i].sel) }
+}
+
 // allTrueX, the conditions compiled in ccs (cxsOf) run by cEval.
 fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, ccs: &[]Option[lexdb_bind.BX],
             row: &[]Val, params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
@@ -9798,8 +9837,13 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         append(mut &m.buckets, [])
         append(mut &m.resMixed, [])
         append(mut &m.resSingle, [])
-        append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params))
-        append(mut &m.cp, cxsOf(q, &q.levels[k].post, params))
+    }
+    m.ce.params = copyRow(params)
+    if !boundOnce(q) {
+        for k in 0..len(q.levels) {
+            append(mut &m.cc, cxsOf(q, &q.levels[k].cond, params))
+            append(mut &m.cp, cxsOf(q, &q.levels[k].post, params))
+        }
     }
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
@@ -14404,7 +14448,8 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         if looksHold(&pc.looks[i], params) { return runSelTo(st, txn, &pc.sels[i], params, lim, sink) }
     }
     var sc = newScopeIn(st, txn, params, ptypes)
-    let sel = try planSelect(st, txn, s, params, mut &sc)
+    var sel = try planSelect(st, txn, s, params, mut &sc)
+    bindSel(mut &sel)
     let looks = replace(mut &sc.looks, [])
     if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSelTo(st, txn, &sel, params, lim, sink) }
     append(mut &pc.sels, sel)
@@ -15942,7 +15987,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: []}
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
@@ -16217,7 +16262,8 @@ fn setLines(sel: &Sel, stats: &[]SubStat): []str {
 fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
               lim: Limits, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
     var sc = newScopeIn(st, txn, params, ptypes)
-    let sel = try planSelect(st, txn, s, params, mut &sc)
+    var sel = try planSelect(st, txn, s, params, mut &sc)
+    bindSel(mut &sel)
     var rs = newRun(&sel.q)
     rs.limit(&lim)
     let res = try execSel(st, txn, &sel, params, -1, mut &rs)
