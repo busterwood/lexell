@@ -26,7 +26,7 @@ CORE = {
     "lexdb_access", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
     "lexdb_locks", "lexdb_match",
-    "lexdb_memo", "lexdb_vec",
+    "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows",
     "lexdb_session", "lexdb_sql", "lexdb_sqlcoll",
     "lexdb_store", "lexdb_time",
@@ -61,7 +61,7 @@ KNOWN_CORE_DIALECT = {
 # model, the catalog and the dialect facts, and below the planner and the
 # executor: it imports only these (and lexell's own libraries).
 BIND = "lexdb_bind"
-BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float"}
+BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops"}
 
 # The access layer (design/lexdb-layers.md 4.2) sits above the store and the
 # row codecs and below the catalog, the planner and the executor: what it may
@@ -71,6 +71,12 @@ ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_tim
 BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_disk", "lexdb_locks", "lexdb_memo",
                 "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect",
                 "lexdb_vec"}
+
+# The value operations (lexdb_ops, design/lexdb-layers.md 4.4.1) sit below
+# the binder and the executor: values, types and the time and number
+# libraries only.
+OPS = "lexdb_ops"
+OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -138,6 +144,9 @@ def check():
             if d in DIALECT and family(m) != family(d):
                 bad.append(f"{m} -> {d}: dialect family {family(m)} imports {family(d)}")
 
+    for d in mods.get(OPS, []):
+        if d not in OPS_MAY_IMPORT:
+            bad.append(f"{OPS} -> {d}: the value operations import above their layer")
     for d in mods.get(BIND, []):
         if d not in BIND_MAY_IMPORT:
             bad.append(f"{BIND} -> {d}: the binder imports above or beside its layer")
