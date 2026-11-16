@@ -1092,6 +1092,19 @@ PostgreSQL's ~120 ms. Re-verified both of semi's leads:
   so it was not built; the 100 us a run semi measured included
   partsupp's whole read.
 
+**IN (subquery) across types (review, after 9f6dd830).** The IN set was
+keyed by value only for integers and numerics: a float8 value never matched
+a numeric or integer column, and a date never matched a timestamp, either
+way, uncorrelated or hashed correlated (main too). The set now records its
+values' class; a probe tries the key first as before (a number against
+floats as a float8), and a number or date/time it does not find is
+compared with the values of its family by `compareZ` in the session's
+zone. A text against numbers keeps the old by-value key (`'3' in (select
+int)`). A table with an uncorrelated IN condition now loads its
+statistics for `Path.inMax`. `exec_intypes` covers 16 cases against
+EXISTS, batches off and on; the reviewer's 44 probes give IN = EXISTS.
+q16/q18/q20 unchanged (A/B against main 9f6dd830).
+
 **For other workstreams.** q3 and q10 (and any query with a lineitem
 primary-key prefix lookup per row) run their joins and grouping on the
 row path because `bJoinPlan` gives up on the whole query when one level
