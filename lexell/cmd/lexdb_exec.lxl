@@ -25522,11 +25522,10 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         }
         var post: []BNode = []
         for x in lv.post {
-            let c = bCompile(&x, q, &kinds, &env, 0)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            if !boolLike(cc.typ) { return Ok(None) }
-            append(mut &post, takeN(cc))
+            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+                Some(n) { append(mut &post, n) }
+                None { return Ok(None) }
+            }
         }
         // its rows as columns (a lookup's: per batch, as found)
         let mat = &m.mat[k]
@@ -25597,11 +25596,10 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         for x in lv.cond {
             if !look && q.minLevel(&x) >= k { continue }
             if mode != JK_GEN && isKeyEq(&x, q, lv) { continue }
-            let c = bCompile(&x, q, &kinds, &env, 0)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            if !boolLike(cc.typ) { return Ok(None) }
-            append(mut &conds, takeN(cc))
+            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+                Some(n) { append(mut &conds, n) }
+                None { return Ok(None) }
+            }
         }
         var resNot = false
         var res = BNode.Const(0, true)
@@ -25619,11 +25617,43 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
                                    ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
                                    rows: rows, rkinds: rkinds, cand: [], after: []})
     }
+    for jl in levels {
+        var gen = false
+        for c in jl.conds { match c { BNode.Gen(_) { gen = true } else {} } }
+        for c in jl.post { match c { BNode.Gen(_) { gen = true } else {} } }
+        if gen { genJoinPlans += 1 }
+    }
     var all: []bool = []
     for x in need { append(mut &all, x) }
     var jp = JPlan{levels: levels, kinds: kinds, need: need, first: []}
     jpFinish(mut &jp, q, &all)
     return Ok(Some(jp))
+}
+
+// Batch join plans with a condition compiled per row (bJoinCond's), for
+// the tests.
+var genJoinPlans: int = 0
+
+pub fn genJoins(): int { return genJoinPlans }
+
+// A join level's condition x over the joined batch (kinds, need: the
+// query's columns in it): compiled for batches, else compiled (9.108) and
+// run per row there, as the first level's are (bLevelPlan): any condition
+// cxOf takes, so one the batches do not type (q7's OR across tables, a
+// char(n) compared, q22's substring IN a list) no longer sends the whole
+// query to the row path. None: neither (a subquery, a column not read).
+// A row on which it gives an error sends its batch to the row path, as a
+// compiled one's does.
+fn bJoinCond(x: &Expr, q: &Query, kinds: &[]int, need: &[]bool, env: &Env, params: &[]Val, st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[BNode] {
+    let c = bCompile(x, q, kinds, env, 0)
+    if c.isSome() {
+        let cc = c.unwrap()
+        if boolLike(cc.typ) { return Some(takeN(cc)) }
+    }
+    match bGenOf(x, q, kinds, 0, need, params, seqEnv(st, txn)) {
+        Some(g) { return Some(BNode.Gen(g)) }
+        None { return None }
+    }
 }
 
 // Whether x is the equality of level lv's one hash column with its value

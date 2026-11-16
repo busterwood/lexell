@@ -1,0 +1,106 @@
+// lexdb_exec: a join level's conditions the batches do not type, compiled
+// (9.108) and run per row over the joined batch (bJoinCond), so the query's
+// joins stay over batches (design/lexdb-tpch-perf.md 4.1): an OR across
+// two tables (TPC-H q7's nations), a char(n) column compared with a
+// constant (q21's o_orderstatus = 'F'), a substring IN a list (q22), a
+// CASE, a function of both tables, and one that gives an error on some
+// rows (division by zero): with batches as without (the row path, the
+// reference), errors included, and against an independent formulation (the
+// OR as a UNION ALL of its two branches; the char(n) test as a semi join
+// count). Whether the joins ran over batches with a compiled condition
+// (genJoins went up).
+// expect: or across tables: same, union same, batched
+// expect: char(n) constant: same, count same, batched
+// expect: substring in a list: same, batched
+// expect: case: same, batched
+// expect: function of both: same, batched
+// expect: error on some rows: same
+// expect: grouped: same, batched
+// expect: in a transaction: same, batched
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_exec.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// sql with batches off and on; the same, an independent formulation's
+// rows (alt, "" none) the same, and whether the joins ran over batches
+// with a compiled condition.
+fn check(s: mut &lexdb_exec.Session, label: &str, sql: &str, alt: &str, altLabel: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let g0 = lexdb_exec.genJoins()
+    let on = q(s, sql)
+    let g1 = lexdb_exec.genJoins()
+    var out = label + ": " + (if off == on { "same" } else { "DIFFERENT" })
+    if len(alt) > 0 {
+        let x = q(s, alt)
+        out = out + ", " + altLabel + (if x == on { " same" } else { " DIFFERENT: " + x })
+    }
+    if g1 > g0 { out = out + ", batched" }
+    println(out)
+    if off != on { println("  rows: " + off + "\n  batches: " + on) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table nat (nk int primary key, name char(25))")
+        let c2 = q(mut &s, &"create table cust (ck int primary key, nk int, phone char(15), bal int)")
+        let c3 = q(mut &s, &"create table ord (ok int primary key, ck int, status char(1), sk int, amt int)")
+        let c4 = q(mut &s, &"insert into nat values (0, 'FRANCE'), (1, 'GERMANY'), (2, 'PERU'), (3, 'CHINA'), (4, null)")
+        var cs: []str = []
+        for i in 0..400 {
+            let nk = if i % 31 == 0 { "null" } else { (i % 5).toStr() }
+            let ph = if i % 17 == 0 { "null" } else { "'" + (10 + i % 25).toStr() + "-555-" + (1000 + i).toStr() + "'" }
+            append(mut &cs, "(" + i.toStr() + ", " + nk + ", " + ph + ", " + (i % 9 - 3).toStr() + ")")
+        }
+        let c5 = q(mut &s, &("insert into cust values " + strings.join(&cs, ", ")))
+        var os: []str = []
+        for i in 0..3000 {
+            let sv = ["'F'", "'O'", "'P'", "null"][i % 4]
+            append(mut &os, "(" + i.toStr() + ", " + ((i * 7) % 420).toStr() + ", " + sv + ", " + (i % 5).toStr() + ", " + (i % 97).toStr() + ")")
+        }
+        let c6 = q(mut &s, &("insert into ord values " + strings.join(&os, ", ")))
+        let ck = q(mut &s, &"checkpoint")
+        // q7's shape: two nations, the pair in either order
+        let orSql = "select n1.name, n2.name, count(*), sum(o.amt) from ord o join cust c on o.ck = c.ck join nat n1 on c.nk = n1.nk join nat n2 on o.sk = n2.nk " +
+                    "where (n1.name = 'FRANCE' and n2.name = 'GERMANY') or (n1.name = 'GERMANY' and n2.name = 'FRANCE') group by n1.name, n2.name order by 1, 2"
+        let orAlt = "select a, b, count(*), sum(amt) from (select n1.name as a, n2.name as b, o.amt from ord o join cust c on o.ck = c.ck join nat n1 on c.nk = n1.nk join nat n2 on o.sk = n2.nk where n1.name = 'FRANCE' and n2.name = 'GERMANY' " +
+                    "union all select n1.name, n2.name, o.amt from ord o join cust c on o.ck = c.ck join nat n1 on c.nk = n1.nk join nat n2 on o.sk = n2.nk where n1.name = 'GERMANY' and n2.name = 'FRANCE') x group by a, b order by 1, 2"
+        check(mut &s, &"or across tables", &orSql, &orAlt, &"union")
+        // (o2 looked up per row by its primary key: its condition is the join's)
+        check(mut &s, &"char(n) constant", &"select count(*), sum(o2.amt) from ord o join ord o2 on o2.ok = o.ok + 1 where o2.status = 'F' and o.amt > 10",
+              &"select count(*), sum(o.amt + 1 - o.amt + (select amt from ord x where x.ok = o.ok + 1) - 1) from ord o where o.ok + 1 in (select ok from ord where status = 'F') and o.amt > 10", &"count")
+        check(mut &s, &"substring in a list", &"select substring(c.phone from 1 for 2), count(*), sum(o.amt) from ord o join cust c on o.ck = c.ck where substring(c.phone from 1 for 2) in ('13', '17', '31', '22') group by 1 order by 1", &"", &"")
+        check(mut &s, &"case", &"select count(*), sum(o.amt) from ord o join cust c on o.ck = c.ck where case when c.bal > 2 then o.amt > 50 else o.status = 'O' end", &"", &"")
+        check(mut &s, &"function of both", &"select o.ok, c.ck from ord o join cust c on o.ck = c.ck where length(trim(c.phone) || o.status) = 13 and o.amt > 90 order by 1", &"", &"")
+        check(mut &s, &"error on some rows", &"select count(*) from ord o join cust c on o.ck = c.ck where o.amt / (c.bal + 3) > 10 and o.status = 'F'", &"", &"")
+        check(mut &s, &"grouped", &"select o.status, count(*), min(o.amt) from ord o join cust c on o.ck = c.ck where coalesce(c.phone, 'none') like '1%' or o.status = 'P' group by o.status order by 1", &"", &"")
+        let b1 = q(mut &s, &"begin")
+        let b2 = q(mut &s, &"update ord set status = 'F' where ok % 9 = 0")
+        let b3 = q(mut &s, &"delete from cust where ck % 13 = 0")
+        check(mut &s, &"in a transaction", &orSql, &"", &"")
+        let b4 = q(mut &s, &"rollback")
+        return 0
+    }).unwrap()
+}
