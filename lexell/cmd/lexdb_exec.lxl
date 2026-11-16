@@ -8616,6 +8616,7 @@ type SubPlan = record {
     kind: int                   // IN: the collation kind its values are compared under (L2)
     semi: bool                  // a semi-join's (9.104): run once, its rows a level's (Level.semi)
     res: []Expr                 // correlated filters that are not keys (q21's l_suppkey <> outer), run once
+    resText: []str              // ... their text, the outer values by name (EXPLAIN)
 }
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
@@ -9155,7 +9156,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: []}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: []}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -9349,6 +9350,9 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
     sp.hashed = true
     sp.keyOuter = replace(mut &hk.outer, [])
     sp.keyText = texts
+    var rt: []str = []
+    for x in hk.res { append(mut &rt, lexdb_sql.exprText(&substRefs(&x, base, &sp.sel.q.refs))) }
+    sp.resText = rt
     sp.res = replace(mut &hk.res, [])
 }
 
@@ -10502,7 +10506,12 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
         let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else if sp.use == lexdb_sql.SUB_FROM { "from" } else { "scalar" }
         var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
         if sp.semi {
-            head = head + "semi join" + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" }) + ", run once"
+            // NOT EXISTS's level is an anti join (Level.anti)
+            var anti = false
+            for lv in q.levels { if lv.semi && lv.src == i && lv.anti { anti = true } }
+            head = head + (if anti { "anti join" } else { "semi join" }) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
+            if len(sp.resText) > 0 { head = head + ", filter " + strings.join(&sp.resText, " and ") }
+            head = head + ", run once"
         } else if sp.hashed {
             head = head + "hashed on " + strings.join(&sp.keyText, ", ")
         } else if len(sp.sel.q.refs) == 0 {
@@ -10595,7 +10604,10 @@ fn explainLines(q: &Query, cnt: &[]Counts): []str {
             let sn = if len(sq.levels) == 1 { sq.levels[0].alias.toStr() } else { "subquery " + (lv.src + 1).toStr() }
             var cs: []str = []
             for c in lv.hashCols { append(mut &cs, lv.t.cols[c].name) }
-            append(mut &out, "semi join " + sn + ": hash on (" + strings.join(&cs, ", ") + ") over " + pathText(lv) + tail)
+            // a residual filter: the subquery's line names it
+            var filt = ""
+            if lv.resNot { filt = ", filter by a summary per key" } else if len(lv.cond) > 0 { filt = ", filter per candidate" }
+            append(mut &out, (if lv.anti { "anti join " } else { "semi join " }) + sn + ": hash on (" + strings.join(&cs, ", ") + ") over " + pathText(lv) + filt + tail)
             continue
         }
         let tn = lexdb_sql.baseName(&lv.t.name)
