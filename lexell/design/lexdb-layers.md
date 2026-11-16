@@ -711,6 +711,35 @@ Steps, each with q1, q6 and the scan queries as its gate:
   batch row's places, so it re-slots a bound tree instead of binding
   again.
 
+**2-ii as built: `bCompile` reads `BX`.** The batch nodes it makes are
+the same as before, node for node; only what it reads changed.
+
+- `bCompile`/`bCompileD` take a `BX` bound over the query's columns by
+  place (`BX.Col(i)` is query column `i`, the batch's `i - base`) and a
+  `CEnv`, the run's (`Mats.ce`: its parameters, session and zone).
+- Where the plan bound the expression, that binding is read, not bound
+  again: a level's conditions from `Mats.cc`/`cp` or `Query.cc`/`cp`
+  (`bCompileCond`), the outputs from `Sel.ox` (`bCompileOut`). The rest
+  (join keys, a semi/anti join's value, ORDER BY keys, group keys,
+  aggregate arguments and FILTERs) are bound when compiled (`bxOf`:
+  parameters as slots).
+- A constant subtree (`bxConst`: literals and parameters under
+  operators, casts and `#bppad`, as `bConst` was for `Expr`) is
+  evaluated once by `bxEval`. An IN list's values are those `bxFixed`
+  allows (no column, no clock, session or volatile function:
+  `immutableName`, shared with `immutable`). IN and LIKE are read from the
+  bound call (`FnRef.name`).
+- Operators by code: `cmpOf` and `arithOf` map `lexdb_ops.OP_*` to
+  `BNode`'s codes; `cmpCode` and `arithCode` (by text) are gone.
+- Not changed: `BT_*` and `bTimeVal` (2-iii), `bGenOf` (2-iv), and
+  `bConst` over `Expr`, which `rangePath` still reads.
+- One difference in what reaches the batches, not in results: an
+  expression with a part that does not bind (a reg cast, a session or
+  catalog function in an IN list) was compiled before when that part was
+  a constant; now it goes to the row path, with the same result. Such
+  conditions are mostly on catalog relations, which batches do not scan
+  (`lv.virt()`).
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**

@@ -10158,10 +10158,7 @@ fn keyType(t: &Table, index: int, k: int): lexdb_sql.TypeName {
 fn immutable(x: &Expr): bool {
     match x {
         Expr.Call(n, args, _) {
-            if isVolatile(x) || n == "now" || n == "random" || n == "clock_timestamp" || n == "statement_timestamp" ||
-               n == "transaction_timestamp" || n == "timeofday" || n == "current_timestamp" || n == "current_date" ||
-               n == "current_time" || n == "localtimestamp" || n == "localtime" || n == "gen_random_uuid" || n == "current_user" ||
-               n == "session_user" || n == "current_schema" || n == "version" { return false }
+            if !immutableName(&n) { return false }
             for a in args { if !immutable(&a) { return false } }
             return true
         }
@@ -10171,6 +10168,15 @@ fn immutable(x: &Expr): bool {
         Expr.Cast(a, _) { return immutable(&a) }
         else { return true }
     }
+}
+
+// Whether a call of the function n gives the same value for the same
+// arguments within a statement (not volatile, nor of the clock or session).
+fn immutableName(n: &str): bool {
+    if isSeqFn(n) || isAdvFn(n) || n == "gen_random_uuid" || n == "random" || n == "clock_timestamp" { return false }
+    return !(n == "now" || n == "statement_timestamp" || n == "transaction_timestamp" || n == "timeofday" || n == "current_timestamp" ||
+             n == "current_date" || n == "current_time" || n == "localtimestamp" || n == "localtime" || n == "current_user" ||
+             n == "session_user" || n == "current_schema" || n == "version")
 }
 
 // The error for row's value in unique index ix that another row holds
@@ -22363,6 +22369,7 @@ pub type OutBatch = record {
 pub fn noBatch(): OutBatch { return OutBatch{n: 0, kinds: [], src: [], idx: [], cols: [], vals: [], ex: []} }
 
 type Batch = lexdb_rows.Batch
+type BX = lexdb_bind.BX
 
 // An expression over a batch. Operators: + - * / % as 0 to 4; = <> < <=
 // > >= as 0 to 5.
@@ -22455,25 +22462,6 @@ fn bConst(x: &Expr): bool {
     }
 }
 
-fn arithCode(op: &str): int {
-    if op == "+" { return 0 }
-    if op == "-" { return 1 }
-    if op == "*" { return 2 }
-    if op == "/" { return 3 }
-    if op == "%" { return 4 }
-    return -1
-}
-
-fn cmpCode(op: &str): int {
-    if op == "=" { return 0 }
-    if op == "<>" { return 1 }
-    if op == "<" { return 2 }
-    if op == "<=" { return 3 }
-    if op == ">" { return 4 }
-    if op == ">=" { return 5 }
-    return -1
-}
-
 // c's node (c given up).
 fn takeN(c: BComp): BNode {
     var x = c
@@ -22484,14 +22472,107 @@ fn intLike(t: int): bool { return t == BT_INT || t == BT_NULL }
 fn boolLike(t: int): bool { return t == BT_BOOL || t == BT_NULL }
 
 // x over a batch; None: not one the batches evaluate (the row path does).
-fn bCompile(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BComp] { return bCompileD(x, q, kinds, env, base, false) }
+// x is bound over q's columns by place (lexdb_bind.BX: bxOf, or as the
+// plan or prepare bound it: bCompileCond, bCompileOut); its constants
+// are evaluated once, in ce (the run's parameters and session: the zone
+// they are read in, 9.95).
+fn bCompile(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] { return bCompileD(x, q, kinds, ce, base, false) }
+
+// x bound for bCompile and bGenOf: over q's columns by place, its
+// parameters as slots (BX.Param: the run's, in Mats.ce). None: only eval
+// evaluates it.
+fn bxOf(x: &Expr, q: &Query): Option[BX] {
+    let none: []Val = []
+    var sl: []int = []
+    return lexdb_bind.bindExpr(x, &q.cols, &none, true, false, mut &sl, &typing())
+}
+
+// bCompileD of level k's condition i (post: of its WHERE conjuncts after
+// it), bound as prepare bound it (Mats.cc, cp) or the plan (Query.cc, cp),
+// else bound now; its constants in m.ce.
+fn bCompileCond(q: &Query, m: &Mats, k: int, i: int, post: bool, kinds: &[]int, base: int, dec: bool): Option[BComp] {
+    let xs = if post { &q.levels[k].post } else { &q.levels[k].cond }
+    let cs = if post { if len(m.cp) > 0 { &m.cp } else { &q.cp } } else { if len(m.cc) > 0 { &m.cc } else { &q.cc } }
+    if k < len(cs) && len(cs[k]) == len(xs) {
+        match cs[k][i] {
+            Some(b) { return bCompileD(&b, q, kinds, &m.ce, base, dec) }
+            None { return None }
+        }
+    }
+    return bCompileX(&xs[i], q, kinds, &m.ce, base, dec)
+}
+
+// bCompile of x bound (bxOf); None when it does not bind.
+fn bCompileX(x: &Expr, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool): Option[BComp] {
+    match bxOf(x, q) {
+        Some(b) { return bCompileD(&b, q, kinds, ce, base, dec) }
+        None { return None }
+    }
+}
+
+// Whether x has no column (its value is the same for every row): of
+// literals and parameters, by operators, casts and char(n)'s padding (#bppad,
+// the parser's for 'F' compared with a char(1) column: q21's o_orderstatus
+// = 'F'), not by other functions.
+fn bxConst(x: &BX): bool {
+    match x {
+        BX.Const(_) { return true }
+        BX.Param(_) { return true }
+        BX.Un(_, a) { return bxConst(&a) }
+        BX.And(a, b) { return bxConst(&a) && bxConst(&b) }
+        BX.Or(a, b) { return bxConst(&a) && bxConst(&b) }
+        BX.Op(_, a, b) { return bxConst(&a) && bxConst(&b) }
+        BX.Cat(a, b, _) { return bxConst(&a) && bxConst(&b) }
+        BX.IsNull(a, _) { return bxConst(&a) }
+        BX.Cast(a, _) { return bxConst(&a) }
+        BX.Call(fr, cs) { return fr.name == "#bppad" && len(cs) == 2 && bxConst(&cs[0]) && bxConst(&cs[1]) }
+        else { return false }
+    }
+}
+
+// Whether x reads no column and calls no function whose value may change
+// within a statement (immutable's, for a bound expression).
+fn bxFixed(x: &BX): bool {
+    match x {
+        BX.Const(_) { return true }
+        BX.Param(_) { return true }
+        BX.Col(_) { return false }
+        BX.Agg(_) { return false }
+        BX.Un(_, a) { return bxFixed(&a) }
+        BX.And(a, b) { return bxFixed(&a) && bxFixed(&b) }
+        BX.Or(a, b) { return bxFixed(&a) && bxFixed(&b) }
+        BX.Op(_, a, b) { return bxFixed(&a) && bxFixed(&b) }
+        BX.Cat(a, b, _) { return bxFixed(&a) && bxFixed(&b) }
+        BX.IsNull(a, _) { return bxFixed(&a) }
+        BX.Cast(a, _) { return bxFixed(&a) }
+        BX.Case(cs, _) {
+            for c in cs { if !bxFixed(&c) { return false } }
+            return true
+        }
+        BX.Try(a) { return bxFixed(&a) }
+        BX.Call(fr, cs) {
+            if !immutableName(&fr.name) { return false }
+            for c in cs { if !bxFixed(&c) { return false } }
+            return true
+        }
+    }
+}
+
+// A comparison's code as BNode's (= <> < <= > >= as 0 to 5), -1 another
+// operator.
+fn cmpOf(code: int): int { return if code >= lexdb_ops.OP_EQ && code <= lexdb_ops.OP_GE { code - lexdb_ops.OP_EQ } else { -1 } }
+
+// An arithmetic operator's code as BNode's (+ - * / % as 0 to 4), -1
+// another.
+fn arithOf(code: int): int { return if code >= lexdb_ops.OP_ADD && code <= lexdb_ops.OP_MOD { code } else { -1 } }
 
 // bCompile; dec: numerics as units (kinds may hold BK_DEC columns, and a
 // numeric constant is one), else a numeric is a value as any other.
-fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool): Option[BComp] {
-    if bConst(x) {
+fn bCompileD(x: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool): Option[BComp] {
+    if bxConst(x) {
         // its value once; an error is left for the row path to give
-        match eval(x, env) {
+        let none: []Val = []
+        match bxEval(x, &none, &none, ce) {
             Ok(v) {
                 match v {
                     Val.Int(i) { return Some(BComp{n: BNode.Const(i, false), typ: BT_INT}) }
@@ -22511,10 +22592,9 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
         }
     }
     match x {
-        Expr.Col(name) {
-            let i = colIndex(&q.cols, &name)
+        BX.Col(i) {
             // (a column of another table than the one batched: BK_NONE)
-            if i < 0 || i >= len(kinds) || kinds[i] == BK_NONE { return None }
+            if i >= len(kinds) || kinds[i] == BK_NONE { return None }
             let k = kinds[i]
             // its place in the batch: base the query's column of the
             // batch's first (the first table's own columns: optimizer 33,
@@ -22523,23 +22603,25 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
             if lexdb_rows.isDecKind(k) { return Some(BComp{n: BNode.Col(at), typ: BT_DEC + lexdb_rows.decScale(k)}) }
             return Some(BComp{n: BNode.Col(at), typ: if k == BK_INT { BT_INT } else if k == BK_BOOL { BT_BOOL } else { BT_OTHER }})
         }
-        Expr.Unary(op, a) {
-            let ca = bCompileD(&a, q, kinds, env, base, dec)
+        BX.Un(u, a) {
+            let ca = bCompileD(&a, q, kinds, ce, base, dec)
             if ca.isNone() { return None }
             let c = ca.unwrap()
             let ty = c.typ
-            if op == "not" && boolLike(ty) { return Some(BComp{n: BNode.Not(takeN(c)), typ: BT_BOOL}) }
-            if op == "-" && intLike(ty) { return Some(BComp{n: BNode.Neg(takeN(c)), typ: BT_INT}) }
+            if u == lexdb_ops.UN_NOT && boolLike(ty) { return Some(BComp{n: BNode.Not(takeN(c)), typ: BT_BOOL}) }
+            if u == lexdb_ops.UN_NEG && intLike(ty) { return Some(BComp{n: BNode.Neg(takeN(c)), typ: BT_INT}) }
             // a numeric's negation keeps its scale: 0 - x
-            if op == "-" && isDecT(ty) { return Some(BComp{n: BNode.DArith(1, BNode.Const(0, false), 0, takeN(c), decSc(ty)), typ: ty}) }
+            if u == lexdb_ops.UN_NEG && isDecT(ty) { return Some(BComp{n: BNode.DArith(1, BNode.Const(0, false), 0, takeN(c), decSc(ty)), typ: ty}) }
             return None
         }
-        Expr.Bin(op, a, b) {
-            let vc = bValCmp(&op, &a, &b, q, kinds, env, base)
+        BX.And(a, b) { return bAndOr(true, &a, &b, q, kinds, ce, base, dec) }
+        BX.Or(a, b) { return bAndOr(false, &a, &b, q, kinds, ce, base, dec) }
+        BX.Op(code, a, b) {
+            let vc = bValCmp(code, &a, &b, q, kinds, ce, base)
             if vc.isSome() { return vc }
-            let ca = bCompileD(&a, q, kinds, env, base, dec)
+            let ca = bCompileD(&a, q, kinds, ce, base, dec)
             if ca.isNone() { return None }
-            let cb = bCompileD(&b, q, kinds, env, base, dec)
+            let cb = bCompileD(&b, q, kinds, ce, base, dec)
             if cb.isNone() { return None }
             let lc = ca.unwrap()
             let rc = cb.unwrap()
@@ -22547,6 +22629,8 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
             let rt = rc.typ
             let l = takeN(lc)
             let r = takeN(rc)
+            let cc = cmpOf(code)
+            let ac = arithOf(code)
             if (isDecT(lt) || isDecT(rt)) && (isDecT(lt) || intLike(lt)) && (isDecT(rt) || intLike(rt)) {
                 // a numeric with a numeric or an integer (read as a
                 // numeric of scale 0, as arith reads it): by value; + and
@@ -22554,41 +22638,32 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
                 // display scales)
                 let sa = decSc(lt)
                 let sb = decSc(rt)
-                let dc = cmpCode(&op)
-                if dc >= 0 { return Some(BComp{n: BNode.DCmp(dc, l, sa, r, sb), typ: BT_BOOL}) }
-                let da = arithCode(&op)
-                if da == 0 || da == 1 { return Some(BComp{n: BNode.DArith(da, l, sa, r, sb), typ: BT_DEC + max(sa, sb)}) }
-                if da == 2 && sa + sb <= lexdb_vec.MAX_SCALE { return Some(BComp{n: BNode.DArith(2, l, sa, r, sb), typ: BT_DEC + sa + sb}) }
+                if cc >= 0 { return Some(BComp{n: BNode.DCmp(cc, l, sa, r, sb), typ: BT_BOOL}) }
+                if ac == 0 || ac == 1 { return Some(BComp{n: BNode.DArith(ac, l, sa, r, sb), typ: BT_DEC + max(sa, sb)}) }
+                if ac == 2 && sa + sb <= lexdb_vec.MAX_SCALE { return Some(BComp{n: BNode.DArith(2, l, sa, r, sb), typ: BT_DEC + sa + sb}) }
                 return None
             }
-            if op == "and" || op == "or" {
-                if !boolLike(lt) || !boolLike(rt) { return None }
-                if op == "and" { return Some(BComp{n: BNode.And(l, r), typ: BT_BOOL}) }
-                return Some(BComp{n: BNode.Or(l, r), typ: BT_BOOL})
-            }
-            let cc = cmpCode(&op)
             if cc >= 0 {
                 let ok = (intLike(lt) && intLike(rt)) || (boolLike(lt) && boolLike(rt))
                 if !ok { return None }
                 return Some(BComp{n: BNode.Cmp(cc, l, r), typ: BT_BOOL})
             }
-            let ac = arithCode(&op)
             if ac >= 0 && intLike(lt) && intLike(rt) { return Some(BComp{n: BNode.Arith(ac, l, r), typ: BT_INT}) }
             return None
         }
-        Expr.IsNull(a, neg) {
-            let ca = bCompileD(&a, q, kinds, env, base, dec)
+        BX.IsNull(a, neg) {
+            let ca = bCompileD(&a, q, kinds, ce, base, dec)
             if ca.isNone() { return None }
             return Some(BComp{n: BNode.IsNull(takeN(ca.unwrap()), neg), typ: BT_BOOL})
         }
-        Expr.Call(name, args, star) {
+        BX.Call(fr, args) {
             // x IN (a, b, ...): x = a OR x = b ..., or'd with SQL's NULL
             // for a NULL (or NULL x): one batch test per value, not a
             // function call per row (q12's l_shipmode).
-            if name == "in" && !star && len(args) >= 2 {
+            if fr.name == "in" && len(args) >= 2 {
                 var col = -1
                 match args[0] {
-                    Expr.Col(n) { col = colIndex(&q.cols, &n) }
+                    BX.Col(i) { col = i }
                     else {}
                 }
                 if col >= 0 && col < len(kinds) {
@@ -22598,12 +22673,10 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
                         // like char(n)'s padding of one
                         var vs: []Val = []
                         var all = true
+                        let none: []Val = []
                         for i in 1..len(args) {
-                            if hasSubCall(&args[i]) || !immutable(&args[i]) { all = false; break }
-                            var ns: []str = []
-                            colNames(&args[i], mut &ns)
-                            if len(ns) > 0 { all = false; break }
-                            match eval(&args[i], env) {
+                            if !bxFixed(&args[i]) { all = false; break }
+                            match bxEval(&args[i], &none, &none, ce) {
                                 Ok(v) { append(mut &vs, v) }
                                 Err(_) { all = false }
                             }
@@ -22616,7 +22689,7 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
                                 // a time column's value in the session's zone,
                                 // as the row path compares it (bValCmpOf)
                                 if k == BK_VAL {
-                                    match bTimeVal(v, col, q, env) {
+                                    match bTimeVal(v, col, q, &ce.zone) {
                                         Some(tv) { append(mut &keep, tv) }
                                         None { return None }
                                     }
@@ -22694,13 +22767,14 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
                 }
                 return None
             }
-            if star || (name != "like" && name != "ilike") || len(args) < 2 || len(args) > 3 { return None }
-            let c = bValCol(&args[0], q, kinds, base)
+            if (fr.name != "like" && fr.name != "ilike") || len(args) < 2 || len(args) > 3 { return None }
+            let c = bValCol(&args[0], kinds, base)
             if c < 0 { return None }
             var cs: []Val = []
+            let none: []Val = []
             for i in 1..len(args) {
-                if !bConst(&args[i]) { return None }
-                match eval(&args[i], env) {
+                if !bxConst(&args[i]) { return None }
+                match bxEval(&args[i], &none, &none, ce) {
                     Ok(v) { append(mut &cs, v) }
                     Err(_) { return None }
                 }
@@ -22708,7 +22782,7 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
             for v in cs { if lexdb_ops.isNull(&v) { return Some(BComp{n: BNode.Const(0, true), typ: BT_NULL}) } }
             let pat = text(&cs[0])
             let esc = if len(cs) > 1 { text(&cs[1]) } else { "\\" }
-            let fold = name == "ilike"
+            let fold = fr.name == "ilike"
             let simple = !fold && lexdb_like.likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
             let pieces = if simple { lexdb_like.likeSplit(&pat) } else { [] }
             return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces}), typ: BT_BOOL})
@@ -22717,43 +22791,56 @@ fn bCompileD(x: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int, dec: bool
     }
 }
 
+// a AND b (and), a OR b over a batch: both booleans.
+fn bAndOr(and: bool, a: &BX, b: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int, dec: bool): Option[BComp] {
+    let ca = bCompileD(a, q, kinds, ce, base, dec)
+    if ca.isNone() { return None }
+    let cb = bCompileD(b, q, kinds, ce, base, dec)
+    if cb.isNone() { return None }
+    let lc = ca.unwrap()
+    let rc = cb.unwrap()
+    if !boolLike(lc.typ) || !boolLike(rc.typ) { return None }
+    let l = takeN(lc)
+    let r = takeN(rc)
+    return Some(BComp{n: if and { BNode.And(l, r) } else { BNode.Or(l, r) }, typ: BT_BOOL})
+}
+
 // An IN list up to this many values is an OR chain in a batch; longer
 // lists are a sorted set (search by halves).
 const IN_CHAIN_MAX = 8
 
 // The batch column of x when it is a column of values (BK_VAL), else -1.
-fn bValCol(x: &Expr, q: &Query, kinds: &[]int, base: int): int {
+fn bValCol(x: &BX, kinds: &[]int, base: int): int {
     match x {
-        Expr.Col(name) {
-            let i = colIndex(&q.cols, &name)
-            if i < 0 || i >= len(kinds) || kinds[i] != BK_VAL { return -1 }
+        BX.Col(i) {
+            if i >= len(kinds) || kinds[i] != BK_VAL { return -1 }
             return i - base
         }
         else { return -1 }
     }
 }
 
-// a op b, one a column of values and the other a constant (its value made
-// once): ValCmp. None otherwise, or when the constant gives an error (the
-// row path gives it).
-fn bValCmp(op: &str, a: &Expr, b: &Expr, q: &Query, kinds: &[]int, env: &Env, base: int): Option[BComp] {
-    let cc = cmpCode(op)
+// a op b (op an operator's code), one a column of values and the other a
+// constant (its value made once): ValCmp. None otherwise, or when the
+// constant gives an error (the row path gives it).
+fn bValCmp(code: int, a: &BX, b: &BX, q: &Query, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] {
+    let cc = cmpOf(code)
     if cc < 0 { return None }
     let two = bColPair(cc, a, b, q, kinds, base)
     if two.isSome() { return two }
-    let ca = bValCol(a, q, kinds, base)
-    if ca >= 0 { return bValCmpOf(cc, ca, ca + base, b, false, q, env) }
-    let cb = bValCol(b, q, kinds, base)
-    if cb >= 0 { return bValCmpOf(cc, cb, cb + base, a, true, q, env) }
+    let ca = bValCol(a, kinds, base)
+    if ca >= 0 { return bValCmpOf(cc, ca, ca + base, b, false, q, ce) }
+    let cb = bValCol(b, kinds, base)
+    if cb >= 0 { return bValCmpOf(cc, cb, cb + base, a, true, q, ce) }
     return None
 }
 
 // a op b, both columns, one at least of values (BK_VAL): VCmp, compared
 // as eval compares them. Not when either is a date or time and they are
 // not of one kind (eval compares those in the session's zone).
-fn bColPair(cc: int, a: &Expr, b: &Expr, q: &Query, kinds: &[]int, base: int): Option[BComp] {
-    let ia = colOf(a, q, kinds)
-    let ib = colOf(b, q, kinds)
+fn bColPair(cc: int, a: &BX, b: &BX, q: &Query, kinds: &[]int, base: int): Option[BComp] {
+    let ia = colOf(a, kinds)
+    let ib = colOf(b, kinds)
     if ia < 0 || ib < 0 || (kinds[ia] != BK_VAL && kinds[ib] != BK_VAL) { return None }
     let ka = q.cols[ia].typ.kind
     let kb = q.cols[ib].typ.kind
@@ -22762,11 +22849,10 @@ fn bColPair(cc: int, a: &Expr, b: &Expr, q: &Query, kinds: &[]int, base: int): O
 }
 
 // The query's column x is, if the batch holds it, else -1.
-fn colOf(x: &Expr, q: &Query, kinds: &[]int): int {
+fn colOf(x: &BX, kinds: &[]int): int {
     match x {
-        Expr.Col(name) {
-            let i = colIndex(&q.cols, &name)
-            if i < 0 || i >= len(kinds) || kinds[i] == BK_NONE { return -1 }
+        BX.Col(i) {
+            if i >= len(kinds) || kinds[i] == BK_NONE { return -1 }
             return i
         }
         else { return -1 }
@@ -22774,11 +22860,12 @@ fn colOf(x: &Expr, q: &Query, kinds: &[]int): int {
 }
 
 // c: the batch's column; qc: the query's.
-fn bValCmpOf(cc: int, c: int, qc: int, k: &Expr, left: bool, q: &Query, env: &Env): Option[BComp] {
-    if !bConst(k) { return None }
-    match eval(k, env) {
+fn bValCmpOf(cc: int, c: int, qc: int, k: &BX, left: bool, q: &Query, ce: &CEnv): Option[BComp] {
+    if !bxConst(k) { return None }
+    let none: []Val = []
+    match bxEval(k, &none, &none, ce) {
         Ok(v0) {
-            match bTimeVal(v0, qc, q, env) {
+            match bTimeVal(v0, qc, q, &ce.zone) {
                 Some(v) { return Some(BComp{n: BNode.ValCmp(cc, c, v, left), typ: BT_BOOL}) }
                 None { return None }
             }
@@ -22789,17 +22876,16 @@ fn bValCmpOf(cc: int, c: int, qc: int, k: &Expr, left: bool, q: &Query, env: &En
 
 // A constant compared with query column qc in a batch: for a date,
 // timestamp or timestamptz column, the value made its type here, in the
-// session's zone (9.95), as compareTime would (a text read as it; the
+// session's zone z (9.95), as compareTime would (a text read as it; the
 // others compared as instants, which compare does only in UTC). None: the
 // batch cannot compare it as the row path does.
-fn bTimeVal(v0: Val, qc: int, q: &Query, env: &Env): Option[Val] {
+fn bTimeVal(v0: Val, qc: int, q: &Query, z: &lexdb_time.Zone): Option[Val] {
     var v = v0
     let ck = q.cols[qc].typ.kind
     let vk = lexdb_ops.kindOf(&v)
     if (ck == lexdb_sql.K_DATE || ck == lexdb_sql.K_TS || ck == lexdb_sql.K_TSTZ) && vk != ck && !lexdb_ops.isNull(&v) {
-        let z = envZone(env)
         if vk == lexdb_sql.K_TEXT {
-            match lexdb_ops.coerceTime(v, &lexdb_sql.timeType(q.cols[qc].typ.oid), &z) {
+            match lexdb_ops.coerceTime(v, &lexdb_sql.timeType(q.cols[qc].typ.oid), z) {
                 Ok(x) { v = x }
                 Err(_) { return None }
             }
@@ -23669,8 +23755,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     for i in 0..len(t.cols) { qkinds[lv.first + i] = kinds[i] }
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
-    // (its session: the time zone its constants are read in, 9.95; no
-    // function is evaluated here, bConst)
+    // (its session: the time zone its scans' bounds are read in, 9.95)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     // the conditions batches evaluate. Any of them, in any order: tryRow
     // checks every condition on the rows they keep, and a batch on one of
@@ -23680,21 +23765,22 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
     var conds: []BNode = []
     var vol: []bool = []
-    for x in lv.cond {
-        let c = bCompile(&x, q, &qkinds, &env, lv.first)
+    for ci in 0..len(lv.cond) {
+        let x = &lv.cond[ci]
+        let c = bCompileCond(q, m, 0, ci, false, &qkinds, lv.first, false)
         if c.isSome() {
             let cc = c.unwrap()
             if boolLike(cc.typ) {
                 append(mut &conds, takeN(cc))
-                append(mut &vol, isVolatile(&x))
+                append(mut &vol, isVolatile(x))
                 continue
             }
         }
         // else compiled (9.108): a condition of any type, per row
-        match bGenOf(&x, q, &qkinds, lv.first, &needCol, params, seqEnv(st, txn)) {
+        match bGenOf(x, q, &qkinds, lv.first, &needCol, params, seqEnv(st, txn)) {
             Some(g) {
                 append(mut &conds, BNode.Gen(g))
-                append(mut &vol, isVolatile(&x))
+                append(mut &vol, isVolatile(x))
             }
             None {}
         }
@@ -23883,7 +23969,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         var keyCol: []int = []
         let keyXs = if keyed { &lv.path.eqs } else { &lv.hashVals }
         for x in keyXs {
-            let c = bCompile(&x, q, &kinds, &env, 0)
+            let c = bCompileX(&x, q, &kinds, &m.ce, 0, false)
             if c.isNone() { return Ok(None) }
             let cc = c.unwrap()
             var col = -1
@@ -23906,8 +23992,8 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             need[lv.first + i] = len(lv.need) == 0 || lv.need[i]
         }
         var post: []BNode = []
-        for x in lv.post {
-            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+        for pi in 0..len(lv.post) {
+            match bJoinCond(&lv.post[pi], bCompileCond(q, m, k, pi, true, &kinds, 0, false), q, &kinds, &need, params, st, txn) {
                 Some(n) { append(mut &post, n) }
                 None { return Ok(None) }
             }
@@ -23979,13 +24065,14 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // for; not a RIGHT JOIN's, which keeps every row), and with a key of
         // its own map, the key's equality
         var conds: []BNode = []
-        for x in lv.cond {
+        for ci in 0..len(lv.cond) {
+            let x = &lv.cond[ci]
             // (a semi join's conditions are its residuals, none applied by
             // materialize, those on its own columns and outer values only
             // too: q21's shape nested in a subquery, "inner > $1")
-            if !keyed && !rj && !lv.semi && q.minLevel(&x) >= k { continue }
-            if mode != JK_GEN && isKeyEq(&x, q, lv) { continue }
-            match bJoinCond(&x, q, &kinds, &need, &env, params, st, txn) {
+            if !keyed && !rj && !lv.semi && q.minLevel(x) >= k { continue }
+            if mode != JK_GEN && isKeyEq(x, q, lv) { continue }
+            match bJoinCond(x, bCompileCond(q, m, k, ci, false, &kinds, 0, false), q, &kinds, &need, params, st, txn) {
                 Some(n) { append(mut &conds, n) }
                 None { return Ok(None) }
             }
@@ -23994,7 +24081,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         var res = BNode.Const(0, true)
         var resTyp = BT_INT
         if lv.resNot {
-            let rc = bCompile(&lv.resVal, q, &kinds, &env, 0)
+            let rc = bCompileX(&lv.resVal, q, &kinds, &m.ce, 0, false)
             if rc.isNone() { return Ok(None) }
             let rcc = rc.unwrap()
             if rcc.typ != BT_INT && rcc.typ != BT_BOOL { return Ok(None) }
@@ -24040,9 +24127,8 @@ pub fn joinPlans(): int { return joinPlansMade }
 // char(n) compared, q22's substring IN a list) no longer sends the whole
 // query to the row path. None: neither (a subquery, a column not read).
 // A row on which it gives an error sends its batch to the row path, as a
-// compiled one's does.
-fn bJoinCond(x: &Expr, q: &Query, kinds: &[]int, need: &[]bool, env: &Env, params: &[]Val, st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[BNode] {
-    let c = bCompile(x, q, kinds, env, 0)
+// compiled one's does. c: x compiled for batches (bCompileCond).
+fn bJoinCond(x: &Expr, c: Option[BComp], q: &Query, kinds: &[]int, need: &[]bool, params: &[]Val, st: &lexdb_store.Store, txn: &lexdb_store.Txn): Option[BNode] {
     if c.isSome() {
         let cc = c.unwrap()
         if boolLike(cc.typ) { return Some(takeN(cc)) }
@@ -24941,9 +25027,9 @@ fn takeON(c: ONode): BNode {
 // integer or boolean expression (src -1), or a compiled expression of any
 // type (9.108: src -2, its values BK_VAL). kinds: per column of the query
 // (base: the batch's first), need: per column of the batch, decoded. None:
-// not one the batches evaluate.
-fn outNode(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, env: &Env, params: &[]Val, seq: Option[SeqEnv]): Option[ONode] {
-    let c = bCompile(x, q, kinds, env, base)
+// not one the batches evaluate. c: x compiled for batches (bCompileOut,
+// bCompileX).
+fn outNode(x: &Expr, c: Option[BComp], q: &Query, kinds: &[]int, base: int, need: &[]bool, params: &[]Val, seq: Option[SeqEnv]): Option[ONode] {
     if c.isSome() {
         let cc = c.unwrap()
         var col = -1
@@ -24988,6 +25074,18 @@ fn bOutVal(n: &BNode, src: int, b: mut &Batch, idx: &[]int, ex: mut &[]BVec, src
     return Ok(Unit{})
 }
 
+// bCompile of output i of sel, bound as the plan bound it (Sel.ox), else
+// now (bxOf); its constants in ce.
+fn bCompileOut(sel: &Sel, i: int, kinds: &[]int, ce: &CEnv, base: int): Option[BComp] {
+    if len(sel.ox) == len(sel.exprs) {
+        match sel.ox[i] {
+            Some(b) { return bCompile(&b, &sel.q, kinds, ce, base) }
+            None {}
+        }
+    }
+    return bCompileX(&sel.exprs[i], &sel.q, kinds, ce, base, false)
+}
+
 // sel's OutPlan; None: its rows are made by the row path (runQuery).
 fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run, keyed: bool): Result[Option[OutPlan], DbErr] {
     let q = &sel.q
@@ -25006,16 +25104,13 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
         }
     }
     let base = if joined { 0 } else { q.levels[0].first }
-    let noAggs: []Val = []
-    let nullRow: []Val = array(len(q.cols), Val.Null)
-    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
     let qk = if joined { &jp.kinds } else { &lp.qkinds }
     let need = if joined { &jp.need } else { &lp.bp.needCol }
     var nodes: []BNode = []
     var kinds: []int = []
     var src: []int = []
     for xi in 0..len(sel.exprs) {
-        let c = outNode(&sel.exprs[xi], q, qk, base, need, &env, params, seqEnv(st, txn))
+        let c = outNode(&sel.exprs[xi], bCompileOut(sel, xi, qk, &m.ce, base), q, qk, base, need, params, seqEnv(st, txn))
         if c.isNone() { return Ok(None) }
         let on = c.unwrap()
         append(mut &kinds, on.kind)
@@ -25037,7 +25132,7 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 append(mut &ksrc, -1)
                 continue
             }
-            let c = outNode(&sel.order[oi], q, qk, base, need, &env, params, seqEnv(st, txn))
+            let c = outNode(&sel.order[oi], bCompileX(&sel.order[oi], q, qk, &m.ce, base, false), q, qk, base, need, params, seqEnv(st, txn))
             if c.isNone() { return Ok(None) }
             let on = c.unwrap()
             append(mut &kkinds, on.kind)
@@ -25736,8 +25831,8 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     if jn {
         conds = replace(mut &lp0[0].conds, [])
     } else {
-        for x in lv.cond {
-            let c = bCompileD(&x, q, &kinds, &env, 0, dec)
+        for ci in 0..len(lv.cond) {
+            let c = bCompileCond(q, m, 0, ci, false, &kinds, 0, dec)
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
             if !boolLike(cc.typ) { return Ok(false) }
@@ -25749,7 +25844,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     for sp in sel.specs { if sp.kind != lexdb_sql.COLL_EXACT { return Ok(false) } }
     var keys: []BComp = []
     for x in sel.groupBy {
-        let c = bCompileD(&x, q, &kinds, &env, 0, dec)
+        let c = bCompileX(&x, q, &kinds, &m.ce, 0, dec)
         if c.isNone() { return Ok(false) }
         let cc = c.unwrap()
         if cc.typ == BT_OTHER {
@@ -25773,7 +25868,11 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         var dsc = -1
         if kind != BA_STAR {
             if len(sp.args) != 1 { return Ok(false) }
-            let c = bCompileD(&sp.args[0], q, &kinds, &env, 0, dec)
+            let ax = bxOf(&sp.args[0], q)
+            let c = match ax {
+                Some(bx) { bCompileD(&bx, q, &kinds, &m.ce, 0, dec) }
+                None { None }
+            }
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
             if kind != BA_COUNT && isDecT(cc.typ) {
@@ -25781,7 +25880,10 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                 dsc = decSc(cc.typ)
             } else if kind != BA_COUNT && cc.typ != BT_INT {
                 // min or max of a column of values, sum or avg of a numeric one
-                let vc = bValCol(&sp.args[0], q, &kinds, 0)
+                let vc = match ax {
+                    Some(bx) { bValCol(&bx, &kinds, 0) }
+                    None { -1 }
+                }
                 if vc < 0 { return Ok(false) }
                 let numeric = q.cols[vc].typ.oid == lexdb_sql.OID_NUMERIC
                 if !(kind == BA_MIN || kind == BA_MAX || ((kind == BA_SUM || kind == BA_AVG) && numeric)) { return Ok(false) }
@@ -25792,7 +25894,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         var filt: Option[BNode] = None
         match sp.filter {
             Some(fx) {
-                let c = bCompileD(&fx, q, &kinds, &env, 0, dec)
+                let c = bCompileX(&fx, q, &kinds, &m.ce, 0, dec)
                 if c.isNone() { return Ok(false) }
                 let cc = c.unwrap()
                 if !boolLike(cc.typ) { return Ok(false) }
