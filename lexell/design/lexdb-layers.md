@@ -656,6 +656,23 @@ plain select list (`branchOid`).
   reference typed from the derived column's label, which 2a made
   trustworthy for unions, VALUES and CASE but not yet everywhere.
 
+**Slice 2c, item 1, as built: bound once per plan.**
+
+- `BX.Param(i)` is a parameter slot. `bindExpr` with no parameter values
+  binds each `$n` as a slot; the run's values are in `CEnv.params`.
+- `bindSel` binds every level's conditions once per plan: its own, its
+  set operation's parts' and its subqueries', recursively. They are held
+  in `Query.cc`/`cp`, after all planning rewrites. `runCached` (plans
+  kept for prepared and repeated statements) and `selectWith` call it.
+- `prepare` uses them when they still match the levels one for one
+  (`boundOnce`). Otherwise, as in DML's queries and EXPLAIN, it binds per
+  run as before.
+- The output plan, the aggregates' outputs and the batches' generic node
+  still bind per run, with values as constants: `bGenVals`' constant
+  shape needs them. They follow with item 2.
+- Node types are not added yet: nothing reads them until item 2 chooses
+  kernels from them.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
