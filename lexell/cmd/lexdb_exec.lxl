@@ -2218,48 +2218,14 @@ fn castVal(v: Val, t: &lexdb_sql.TypeName, seq: &Option[SeqEnv]): Result[Val, Db
     return coerce(v, t)
 }
 
-// ---- Compiled expressions (design/lexdb.md 9.108)
+// ---- Bound expressions (design/lexdb.md 9.108; lexdb_bind.BX, design/lexdb-layers.md 4.4.1)
 //
-// An expression compiled once for a statement's run: its columns by their
-// places in the row (not found by their names per row, as eval finds
-// them), its parameters as their values, each function bound once (FnB:
-// which of callAt's ways gives it, not eval's checks of its name on every
-// call). cEval gives exactly what eval gives: it runs eval's own
-// operations (unaryVal, binVal, castVal, callAt and its parts). What eval
-// alone evaluates (a subquery, an aggregate, a window call, a sequence,
+// lexdb_bind binds an expression once for a statement's run (bindExpr);
+// bxEval gives exactly what eval gives: it runs eval's own operations
+// (unaryVal, binVal, castVal, callAt and its parts). What eval alone
+// evaluates (a subquery, an aggregate, a window call, a sequence,
 // session, lock or catalog function, a reg cast, T-SQL's typed division
-// and AVG) does not compile: eval runs it.
-
-const FN_GEN = 0        // callAt by the name (after T-SQL's, tsql)
-const FN_ONE = 1        // one argument: call1's (id)
-const FN_COALESCE = 2
-const FN_SUBSTR = 3     // substr of 2 or 3 arguments
-const FN_CONCAT = 4
-
-// A function call bound once: the way callAt gives it, found from its name
-// and number of arguments when compiled.
-type FnB = record {
-    name: str
-    way: int
-    id: int                 // FN_ONE: call1's
-    dialect: bool           // a T-SQL or Oracle function's name: callDialectFn first, as eval
-}
-
-type CX = closed {
-    Lit(Val)
-    Col(int)                    // the row's value at this place
-    Agg(int)                    // an aggregate's or window's value (#agg's slot)
-    Unary(str, CX)
-    And(CX, CX)
-    Or(CX, CX)
-    Bin(str, CX, CX)            // binVal
-    Cat(CX, CX, str)            // ||, with its function for arrays (arrayConcat; "" none)
-    IsNull(CX, bool)
-    Cast(CX, lexdb_sql.TypeName)
-    Case([]CX, bool)            // CASE's conditions and values in turn; true: an ELSE last
-    Try(CX)                     // T-SQL's TRY_CAST: NULL for an error
-    Call(FnB, []CX)
-}
+// and AVG) does not bind (fnRefOf's FN_NONE): eval runs it.
 
 // What a compiled expression is evaluated in: the session (seq, as Env
 // has it), and the transaction's start and time zone eval gives callAt.
@@ -2292,9 +2258,14 @@ fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val
     return lexdb_tsqlfn.call(name, vs, z)
 }
 
-// name's call of n arguments, bound: callAt's way for it, when none of
+// name's call of n arguments, bound (lexdb_bind's Typing.fnBind): FN_NONE
+// for one eval alone evaluates; else callAt's way for it, when none of
 // callAt's earlier ways (callMisc, callFn, callTime, ...) can take it.
-fn fnBind(name: &str, n: int): FnB {
+fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
+    if isAgg(name) || name == "#win" || name == "#wmark" || name == "row" || isWinFn(name) || name == "#tdiv" || name == "#tavg" ||
+       isSeqFn(name) || isSessFn(name) || isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
+        return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, id: 0, dialect: false}
+    }
     var way = FN_GEN
     var id = 0
     let special = isDialectFn(name)
@@ -2308,147 +2279,87 @@ fn fnBind(name: &str, n: int): FnB {
         if name == "substr" && (n == 2 || n == 3) { way = FN_SUBSTR }
         if name == "concat" { way = FN_CONCAT }
     }
-    return FnB{name: name.toStr(), way: way, id: id, dialect: special}
+    return lexdb_bind.FnRef{name: name.toStr(), way: way, id: id, dialect: special}
 }
 
-// x compiled; None: eval evaluates it. cols: the row's columns; params:
-// the statement's. direct: the row is of cols (Col(i): its place i); else
-// a row of the columns slots lists (Col(s): slots[s] of cols, a column
-// added to slots when first used). aggs: #agg's slots are given.
-fn cxOf(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int): Option[CX] {
-    match x {
-        Expr.Lit(v) { return Some(CX.Lit(v)) }
-        Expr.Param(n) {
-            if n < 1 || n > len(params) { return None }
-            return Some(CX.Lit(params[n - 1]))
-        }
-        Expr.Col(name) {
-            let i = colIndex(cols, &name)
-            if i < 0 { return None }
-            if direct { return Some(CX.Col(i)) }
-            for s in 0..len(slots) { if slots[s] == i { return Some(CX.Col(s)) } }
-            append(slots, i)
-            return Some(CX.Col(len(slots) - 1))
-        }
-        Expr.Unary(op, a) {
-            let ca = cxOf(&a, cols, params, direct, aggs, slots)
-            if ca.isNone() { return None }
-            return Some(CX.Unary(op, ca.unwrap()))
-        }
-        Expr.Bin(op, a, b) {
-            let ca = cxOf(&a, cols, params, direct, aggs, slots)
-            if ca.isNone() { return None }
-            let cb = cxOf(&b, cols, params, direct, aggs, slots)
-            if cb.isNone() { return None }
-            if op == "and" { return Some(CX.And(ca.unwrap(), cb.unwrap())) }
-            if op == "or" { return Some(CX.Or(ca.unwrap(), cb.unwrap())) }
-            if op == "||" {
-                let noCols: []lexdb_sql.ColDef = []
-                let noTypes: []int = []
-                return Some(CX.Cat(ca.unwrap(), cb.unwrap(), arrayConcat(&a, &b, &noCols, &noTypes)))
-            }
-            return Some(CX.Bin(op, ca.unwrap(), cb.unwrap()))
-        }
-        Expr.IsNull(a, neg) {
-            let ca = cxOf(&a, cols, params, direct, aggs, slots)
-            if ca.isNone() { return None }
-            return Some(CX.IsNull(ca.unwrap(), neg))
-        }
-        Expr.Cast(a, t) {
-            if t.kind == lexdb_sql.K_REG { return None }
-            let ca = cxOf(&a, cols, params, direct, aggs, slots)
-            if ca.isNone() { return None }
-            return Some(CX.Cast(ca.unwrap(), t))
-        }
-        Expr.Call(name, args, star) {
-            if isSubCall(&name) { return None }
-            if name == "#agg" {
-                if !aggs || len(args) != 1 { return None }
-                let i = litInt(&args[0])
-                if i < 0 { return None }
-                return Some(CX.Agg(i))
-            }
-            if isAgg(&name) || name == "#win" || name == "#wmark" || name == "row" || isWinFn(&name) { return None }
-            if name == "#tdiv" || name == "#tavg" || isSeqFn(&name) || isSessFn(&name) || isAdvFn(&name) ||
-               lexdb_sql.isCatFn(&name) || name == "current_schema" { return None }
-            var cs: []CX = []
-            for a in args {
-                let c = cxOf(&a, cols, params, direct, aggs, slots)
-                if c.isNone() { return None }
-                append(mut &cs, c.unwrap())
-            }
-            if name == "case" || name == "case else" { return Some(CX.Case(cs, name == "case else")) }
-            if name == "#try" && len(cs) == 1 { return Some(CX.Try(pop(mut &cs))) }
-            return Some(CX.Call(fnBind(&name, len(cs)), cs))
-        }
-    }
+const FN_GEN = lexdb_bind.FN_GEN
+const FN_ONE = lexdb_bind.FN_ONE
+const FN_COALESCE = lexdb_bind.FN_COALESCE
+const FN_SUBSTR = lexdb_bind.FN_SUBSTR
+const FN_CONCAT = lexdb_bind.FN_CONCAT
+
+// A unary operator's text (lexdb_bind.UN_*), as unaryVal takes it.
+fn unName(u: int): &str {
+    if u == lexdb_bind.UN_NEG { return "-" }
+    if u == lexdb_bind.UN_BITNOT { return "~" }
+    return "not"
 }
 
 // x's value for row (aggs: #agg's slots), as eval gives it.
-fn cEval(x: &CX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
+fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     match x {
-        CX.Lit(v) { return Ok(v) }
-        CX.Col(i) {
+        lexdb_bind.BX.Const(v) { return Ok(v) }
+        lexdb_bind.BX.Col(i) {
             if len(row) == 0 { return Ok(Val.Null) }
             return Ok(row[i])
         }
-        CX.Agg(i) { return Ok(aggs[i]) }
-        CX.Unary(op, a) { return unaryVal(&op, try cEval(&a, row, aggs, ce)) }
-        CX.And(a, b) {
-            let l = truth(&(try cEval(&a, row, aggs, ce)))
+        lexdb_bind.BX.Agg(i) { return Ok(aggs[i]) }
+        lexdb_bind.BX.Un(u, a) { return unaryVal(unName(u), try bxEval(&a, row, aggs, ce)) }
+        lexdb_bind.BX.And(a, b) {
+            let l = truth(&(try bxEval(&a, row, aggs, ce)))
             if l == Some(false) { return Ok(Val.Bool(false)) }
-            let r = truth(&(try cEval(&b, row, aggs, ce)))
+            let r = truth(&(try bxEval(&b, row, aggs, ce)))
             if r == Some(false) { return Ok(Val.Bool(false)) }
             if l.isNone() || r.isNone() { return Ok(Val.Null) }
             return Ok(Val.Bool(true))
         }
-        CX.Or(a, b) {
-            let l = truth(&(try cEval(&a, row, aggs, ce)))
+        lexdb_bind.BX.Or(a, b) {
+            let l = truth(&(try bxEval(&a, row, aggs, ce)))
             if l == Some(true) { return Ok(Val.Bool(true)) }
-            let r = truth(&(try cEval(&b, row, aggs, ce)))
+            let r = truth(&(try bxEval(&b, row, aggs, ce)))
             if r == Some(true) { return Ok(Val.Bool(true)) }
             if l.isNone() || r.isNone() { return Ok(Val.Null) }
             return Ok(Val.Bool(false))
         }
-        CX.Bin(op, a, b) {
-            let l = try cEval(&a, row, aggs, ce)
-            let r = try cEval(&b, row, aggs, ce)
-            return binVal(&op, l, r, &ce.seq)
+        lexdb_bind.BX.Op(op, _, a, b) {
+            let l = try bxEval(&a, row, aggs, ce)
+            let r = try bxEval(&b, row, aggs, ce)
+            return binVal(lexdb_bind.opName(op), l, r, &ce.seq)
         }
-        CX.Cat(a, b, f) {
-            let l = try cEval(&a, row, aggs, ce)
-            let r = try cEval(&b, row, aggs, ce)
+        lexdb_bind.BX.Cat(a, b, f) {
+            let l = try bxEval(&a, row, aggs, ce)
+            let r = try bxEval(&b, row, aggs, ce)
             if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return call(&f, &[l, r]) }
             return binVal(&"||", l, r, &ce.seq)
         }
-        CX.IsNull(a, neg) {
-            let v = try cEval(&a, row, aggs, ce)
+        lexdb_bind.BX.IsNull(a, neg) {
+            let v = try bxEval(&a, row, aggs, ce)
             return Ok(Val.Bool(isNull(&v) != neg))
         }
-        CX.Cast(a, t) { return castVal(try cEval(&a, row, aggs, ce), &t, &ce.seq) }
-        CX.Case(cs, hasElse) {
+        lexdb_bind.BX.Cast(a, t) { return castVal(try bxEval(&a, row, aggs, ce), &t, &ce.seq) }
+        lexdb_bind.BX.Case(cs, hasElse, _) {
             // only the branch taken is evaluated
             let pairs = if hasElse { (len(cs) - 1) / 2 } else { len(cs) / 2 }
-            for k in 0..pairs { if truth(&(try cEval(&cs[2 * k], row, aggs, ce))) == Some(true) { return cEval(&cs[2 * k + 1], row, aggs, ce) } }
-            if hasElse { return cEval(&cs[len(cs) - 1], row, aggs, ce) }
+            for k in 0..pairs { if truth(&(try bxEval(&cs[2 * k], row, aggs, ce))) == Some(true) { return bxEval(&cs[2 * k + 1], row, aggs, ce) } }
+            if hasElse { return bxEval(&cs[len(cs) - 1], row, aggs, ce) }
             return Ok(Val.Null)
         }
-        CX.Try(a) {
-            match cEval(&a, row, aggs, ce) {
+        lexdb_bind.BX.Try(a) {
+            match bxEval(&a, row, aggs, ce) {
                 Ok(v) { return Ok(v) }
                 Err(_) { return Ok(Val.Null) }
             }
         }
-        CX.Call(fb, cs) {
+        lexdb_bind.BX.Call(fb, cs, _) {
             var vs: []Val = withCapacity(len(cs))
-            for c in cs { append(mut &vs, try cEval(&c, row, aggs, ce)) }
-            return callB(&fb, &vs, ce)
+            for c in cs { append(mut &vs, try bxEval(&c, row, aggs, ce)) }
+            return callRef(&fb, &vs, ce)
         }
     }
 }
 
 // A bound call's value for its arguments vs, as eval's call gives it.
-fn callB(fb: &FnB, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
+fn callRef(fb: &lexdb_bind.FnRef, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     if fb.way == FN_ONE {
         if isNull(&vs[0]) { return Ok(Val.Null) }
         match try call1(fb.id, &fb.name, &vs[0]) {
@@ -2776,7 +2687,7 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
 
 // The functions of one argument callAt gives itself, after every other
 // it knows (none of these names is taken before): an id, found once by a
-// compiled expression (FnB), else per call. 0: none of them.
+// bound expression (lexdb_bind.FnRef), else per call. 0: none of them.
 const F1_LOWER = 1
 const F1_UPPER = 2
 const F1_TRIM = 3
@@ -10944,17 +10855,17 @@ fn evalX(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Expr,
 
 // The conditions xs of q compiled (9.108); None those eval evaluates (a
 // correlated subquery's among them).
-fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val): []Option[CX] {
-    var out: []Option[CX] = []
+fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val): []Option[lexdb_bind.BX] {
+    var out: []Option[lexdb_bind.BX] = []
     for x in xs {
         var sl: []int = []
-        append(mut &out, if !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, false, mut &sl) } else { None })
+        append(mut &out, if !(q.corr && hasCorr(&x)) { lexdb_bind.bindExpr(&x, &q.cols, params, true, false, mut &sl, &typing()) } else { None })
     }
     return out
 }
 
 // allTrueX, the conditions compiled in ccs (cxsOf) run by cEval.
-fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, ccs: &[]Option[CX],
+fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, cs: &[]Expr, ccs: &[]Option[lexdb_bind.BX],
             row: &[]Val, params: &[]Val, rs: mut &Run): Result[bool, DbErr] {
     if len(cs) == 0 { return Ok(true) }
     if len(ccs) != len(cs) { return allTrueX(st, txn, q, m, cs, row, params, rs) }
@@ -10964,7 +10875,7 @@ fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     if all {
         for i in 0..len(cs) {
             match ccs[i] {
-                Some(cx) { if truth(&(try cEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
+                Some(cx) { if truth(&(try bxEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
                 None {}
             }
         }
@@ -10976,7 +10887,7 @@ fn allTrueC(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
     for i in 0..len(cs) {
         match ccs[i] {
-            Some(cx) { if truth(&(try cEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
+            Some(cx) { if truth(&(try bxEval(&cx, row, &noAggs, &m.ce))) != Some(true) { return Ok(false) } }
             None { if truth(&(try evalX(st, txn, q, &cs[i], &env, rs))) != Some(true) { return Ok(false) } }
         }
     }
@@ -11007,8 +10918,8 @@ type Mats = record {
     // per level, its conditions and the WHERE conjuncts after it compiled
     // (9.108: columns by place, functions bound once), with batches on;
     // None: evaluated by eval
-    cc: [][]Option[CX]
-    cp: [][]Option[CX]
+    cc: [][]Option[lexdb_bind.BX]
+    cp: [][]Option[lexdb_bind.BX]
     ce: CEnv
 }
 
@@ -15411,7 +15322,7 @@ fn isFloatOid(o: int): bool { return lexdb_bind.isFloatOid(o) }
 pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int { return lexdb_bind.exprOid(x, cols, ptypes, &typing()) }
 
 // What the dialects supply the binder (lexdb_bind.Typing).
-fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.RULES_PG, fnOid: lexdb_orafn.resultOid} }
+fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.RULES_PG, fnOid: lexdb_orafn.resultOid, fnBind: fnRefOf} }
 
 // The output columns of a SELECT: (name, OID), and the expressions behind
 // them (* expanded).
@@ -15804,7 +15715,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 // needs eval.
 type OutC = record {
     at: []int
-    cxs: []Option[CX]
+    cxs: []Option[lexdb_bind.BX]
     plain: bool
     none: bool
     ce: CEnv
@@ -15820,12 +15731,12 @@ fn outC(sel: &Sel, params: &[]Val, seq: Option[SeqEnv]): OutC {
             else {}
         }
         append(mut &oc.at, c)
-        var cx: Option[CX] = None
+        var cx: Option[lexdb_bind.BX] = None
         if c < 0 {
             oc.plain = false
             if !(q.corr && hasCorr(&x)) {
                 var sl: []int = []
-                cx = cxOf(&x, &q.cols, params, true, false, mut &sl)
+                cx = lexdb_bind.bindExpr(&x, &q.cols, params, true, false, mut &sl, &typing())
             }
             if cx.isNone() { oc.none = false }
         }
@@ -15861,7 +15772,7 @@ fn outRow(sel: &Sel, m: &Mats, params: &[]Val, sqe: Option[SeqEnv], oc: &OutC, r
             continue
         }
         match oc.cxs[i] {
-            Some(cx) { append(vals, try cEval(&cx, r, &noAggs, &oc.ce)) }
+            Some(cx) { append(vals, try bxEval(&cx, r, &noAggs, &oc.ce)) }
             None {}
         }
     }
@@ -18105,7 +18016,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             var vals: []Val = []
             for xi in 0..len(sel.exprs) {
                 match oc.cxs[xi] {
-                    Some(cx) { append(mut &vals, try cEval(&cx, &r, &noAggs, &oc.ce)) }
+                    Some(cx) { append(mut &vals, try bxEval(&cx, &r, &noAggs, &oc.ce)) }
                     None { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
                 }
             }
@@ -18141,7 +18052,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     continue
                 }
                 match oc.cxs[xi] {
-                    Some(cx) { append(mut &vals, try cEval(&cx, r, &noAggs, &oc.ce)) }
+                    Some(cx) { append(mut &vals, try bxEval(&cx, r, &noAggs, &oc.ce)) }
                     None { append(mut &vals, try eval(&sel.exprs[xi], &env)) }
                 }
             }
@@ -18174,14 +18085,14 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         // an output that is a column read at its place, found once (9.105);
         // the others compiled (9.108)
         var at: []int = []
-        var cxs: []Option[CX] = []
+        var cxs: []Option[lexdb_bind.BX] = []
         for x in sel.exprs {
             match x {
                 Expr.Col(name) { append(mut &at, colIndex(&q.cols, &name)) }
                 else { append(mut &at, -1) }
             }
             var sl: []int = []
-            append(mut &cxs, if !(q.corr && hasCorr(&x)) { cxOf(&x, &q.cols, params, true, true, mut &sl) } else { None })
+            append(mut &cxs, if !(q.corr && hasCorr(&x)) { lexdb_bind.bindExpr(&x, &q.cols, params, true, true, mut &sl, &typing()) } else { None })
         }
         let ce = cenvOf(seqEnv(st, txn))
         for bi in 0..len(bases) {
@@ -18195,7 +18106,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 if c >= 0 && c < len(bases[bi].row) { append(mut &vals, bases[bi].row[c]) }
                 else {
                     match cxs[xi] {
-                        Some(cx) { append(mut &vals, try cEval(&cx, &bases[bi].row, &aggs, &ce)) }
+                        Some(cx) { append(mut &vals, try bxEval(&cx, &bases[bi].row, &aggs, &ce)) }
                         None { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
                     }
                 }
@@ -23539,7 +23450,7 @@ type BNode = closed {
 // reads put in a row of its own (its places), then cEval, in the
 // statement's session (ce).
 type BGen = record {
-    cx: CX
+    cx: lexdb_bind.BX
     cols: []int             // per place of its row: the batch's column
     kinds: []int            // ... and its kind (BK_*)
     ce: CEnv
@@ -24218,7 +24129,7 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
         let c = g.cols[0]
         let k = g.kinds[0]
         match g.cx {
-            CX.Call(fb, cs) {
+            lexdb_bind.BX.Call(fb, cs, _) {
                 if fb.way == FN_ONE && len(cs) == 1 && cxCol0(&cs[0]) {
                     var out: []Val = withCapacity(m)
                     for j in 0..m {
@@ -24236,7 +24147,8 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
                     return Ok(out)
                 }
             }
-            CX.Bin(op, x, y) {
+            lexdb_bind.BX.Op(code, _, x, y) {
+                let op = lexdb_bind.opName(code)
                 let lc = cxCol0(&x)
                 let rc = cxCol0(&y)
                 var kv = Val.Null
@@ -24246,7 +24158,7 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
                     for j in 0..m {
                         let r = idx[j]
                         let v = if b.cols[c].nul[r] { Val.Null } else { bValAt(b, c, k, r) }
-                        append(mut &out, if lc { try binVal(&op, v, kv, &g.ce.seq) } else { try binVal(&op, kv, v, &g.ce.seq) })
+                        append(mut &out, if lc { try binVal(op, v, kv, &g.ce.seq) } else { try binVal(op, kv, v, &g.ce.seq) })
                     }
                     return Ok(out)
                 }
@@ -24263,15 +24175,15 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
             let c = g.cols[p]
             row[p] = if b.cols[c].nul[r] { Val.Null } else { bValAt(b, c, g.kinds[p], r) }
         }
-        append(mut &out, try cEval(&g.cx, &row, &none, &g.ce))
+        append(mut &out, try bxEval(&g.cx, &row, &none, &g.ce))
     }
     return Ok(out)
 }
 
 // Whether x is a constant (its value in v).
-fn cxLit(x: &CX, v: mut &Val): bool {
+fn cxLit(x: &lexdb_bind.BX, v: mut &Val): bool {
     match x {
-        CX.Lit(k) {
+        lexdb_bind.BX.Const(k) {
             v = k
             return true
         }
@@ -24280,9 +24192,9 @@ fn cxLit(x: &CX, v: mut &Val): bool {
 }
 
 // Whether x is the column of a one-column row (cEval: its place 0).
-fn cxCol0(x: &CX): bool {
+fn cxCol0(x: &lexdb_bind.BX): bool {
     match x {
-        CX.Col(i) { return i == 0 }
+        lexdb_bind.BX.Col(i) { return i == 0 }
         else { return false }
     }
 }
@@ -24293,7 +24205,7 @@ fn cxCol0(x: &CX): bool {
 // the batch does not hold, or only eval evaluates it.
 fn bGenOf(x: &Expr, q: &Query, kinds: &[]int, base: int, need: &[]bool, params: &[]Val, seq: Option[SeqEnv]): Option[BGen] {
     var slots: []int = []
-    let c = cxOf(x, &q.cols, params, false, false, mut &slots)
+    let c = lexdb_bind.bindExpr(x, &q.cols, params, false, false, mut &slots, &typing())
     if c.isNone() { return None }
     var cols: []int = []
     var ks: []int = []
