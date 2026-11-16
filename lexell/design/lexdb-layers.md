@@ -281,14 +281,90 @@ narrow 0.51 s both, wide with two indexes 7.07 s both.
 
 **Still in exec after step 1b:**
 
-- index upkeep and the writes (`insertRows`, `storeRow`, `updRow`,
-  `delRow`, `conflictOf`, `checkUnique`, `changeIndexes`, `fillIndex`,
-  `rewrite`, `rangeDelete`/`delEntries`, `fastCopyRow`, `idxPrefix`/
-  `idxVal`, `parentHas`), with their `txn.put`/`txn.del`/`putRow` calls;
+- index upkeep and the writes (done in 1c and 1d, 4.2.2);
 - `Txn.sql` (`ExecTxn` not made yet);
 - catalog trees, read and written directly (`CATALOG`, sequences, roles,
   ACLs), and `relSize`, which counts pages by tree number from the catalog
   lines.
+
+#### 4.2.2 As built: the write side (step 1c, 1d)
+
+Status: 2026-11-16, branch `redesign/access`. Exec's table and index
+writes go through `lexdb_access`; `Scan.lo`/`hi` are private.
+
+**What an index needs from above** comes as closures, so evaluation stays
+where it is and its order is unchanged:
+
+- `pred: &fn(&Index, &[]Val): Result[bool, DbErr]`, a filtered index's
+  predicate (exec's `inIndex`);
+- `expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]`, an expression
+  part's value of its type (exec's `idxVal`);
+- `wrote: &fn(&Txn)`, called once a row's own tree is written and before
+  its entries, where exec counted the row for the automatic statistics.
+
+Access calls `pred` and `expr` only for an index that has a predicate or
+an expression part. A part's value is now made once per row and index,
+where exec made it up to three times. Index expressions must be immutable,
+so the values and the first error are the same.
+
+**Interface.**
+
+```
+const NO_CONFLICT = -2; const PK_CONFLICT = -1        // else an index's number
+type Conflict { at, ix }                              // a chunk's first conflict
+insert(st, txn, rel, rows: &[]&[]Val, pred, expr, wrote): Conflict
+update(st, txn, rel, olds, news, pred, expr, wrote): Conflict
+delete(st, txn, rel, rows, pred, expr, wrote)
+conflicts(st, txn, rel, arb, rows, pred, expr): []Option[[]Val]   // ON CONFLICT's arbiters
+hasKeys(st, txn, rel, via, rows, expr): []bool                    // a foreign key's parent
+insertRow / updateRow / deleteRow / conflictRow / hasKey          // the same for one row
+encRow(rel, row); rowidKeyed(rel); ixPart(rel, ix, k, row, expr); ROWID
+
+newBuild(redo) / buildAdd(rel, b, row, pred, expr) / buildWrite(st, txn, rel, b, sorted, wrote): Dup
+buildIndex(st, txn, rel, ix, pred, expr): Option[[]Val]           // CREATE INDEX
+exactRange(eqs, lower, lowIncl, upper, upIncl, ix): Scan          // a range delete's bounds
+rangeLocked(st, txn, rel, sc); deleteRange(st, txn, rel, main, ixs, ixr, slow, need, pred, expr): int
+newLoad() / loadRow(st, txn, rel, id, row, ld): bool              // COPY's fast path
+setSpec(st, rel); upgrade(st, rel, from, most); anyRow(st, txn, rel)
+```
+
+**Conflicts are reported, not raised.** A key taken, or a unique index's
+value that another row holds, comes back as `PK_CONFLICT` or the index's
+number, with the rows before it written. Exec makes the error (`dupKey`,
+`uniqueErr`, `dupMade`) as before: UNIQUE, ON CONFLICT, foreign keys,
+CHECK and deferred checks stay in layer 7.
+
+**Chunks of one, for now.** The chunk calls loop over the one-row calls.
+Exec calls the one-row calls, because building a one-element array of
+row borrows per row cost about 2.5% on the 1M-row INSERT ... SELECT load
+(one allocation a row). When DML runs in chunks (4.9), exec calls the
+chunk forms. Their per-row loop is where the batched probes and the
+chunk's own-key hash go.
+
+**Gate (steps 1c–1e against main `b222bca3`, built the same session;
+medians of three).** Suite 184 passed. TPC-H: all 22 checksums equal the
+`1744ef99` baseline's, per-query ratios 0.968–1.038, geometric mean 0.997.
+OLTP point selects 83.3k/136.9k/131.2k tps at 1/8/32 clients against
+82.9k/136.3k/131.3k; updates 3,831/18,131/39,936 against
+3,831/18,151/39,830. INSERT ... SELECT of 1M rows (three fresh runs):
+acct 1.18 s against 1.17 s, t 2.37 s against 2.36 s; 30k rows into a
+table with an index and a unique text index 2.92 s both; UPDATE of an
+indexed column (8 clients) 21,422 against 21,510 tps. COPY: narrow
+0.51 s against 0.50 s (after `relOf` was hoisted out of the fast path's
+row loop; 0.52–0.53 s before), wide 1.54 s against 1.53 s, wide with two
+indexes 7.14 s against 7.08 s.
+
+**Still in exec after step 1d:**
+
+- the fast COPY's text-to-row encoder (`fastCopyField` and friends). It
+  builds a row's stored bytes, so it belongs with `lexdb_rows`. Its key
+  and write moved (`loadRow`).
+- creating and dropping a table's or index's trees (`st.createTree`,
+  `txn.dropTree`) in DDL. These go with the catalog's define/alter/drop
+  (4.3), since the catalog row names the trees.
+- `rs.after`/`win.after`, a batched statement's resume key, is made with
+  `lexdb_access.after` and kept opaque.
+- `Txn.sql` (`ExecTxn`): after step 2.
 
 ### 4.3 Layer 3, catalog (`lexdb_catalog`)
 

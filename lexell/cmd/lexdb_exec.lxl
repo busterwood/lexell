@@ -3039,13 +3039,6 @@ fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
 // The places a stored row has: its table's columns, and dropped ones.
 fn rowWidth(t: &Table): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
 
-// A table's row as stored: its values at their places, NULL at a dropped
-// column's.
-fn encRowOf(t: &Table, row: &[]Val): str {
-    let r = rowsFor(t)
-    return lexdb_rows.encodeRowOf(&r, row)
-}
-
 fn decRow(s: &str, n: int): Result[[]Val, DbErr] {
     let all: []bool = []
     let none: []Val = []
@@ -4343,16 +4336,7 @@ fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 // in its current layout: lexdb_rows.Spec.fill).
 fn setSpec(st: &lexdb_store.Store, t: &Table) {
     if t.tree <= 0 || len(t.layouts) == 0 || len(t.view) > 0 { return }
-    let miss = placesMissing(t)
-    var fill = ""
-    var ok = true
-    if len(miss) > 0 {
-        match encFixed(t, &miss) {
-            Some(f) { fill = f }
-            None { ok = false }
-        }
-    }
-    st.setColSpec(t.tree, &t.layouts, &fill, ok)
+    lexdb_access.setSpec(st, &relOf(t))
 }
 
 // Every table (not a view, nor another session's temporary table).
@@ -4380,7 +4364,7 @@ fn vacuumTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str
         if t.tree <= 0 || len(t.layouts) == 0 { continue }
         var from = ""
         while true {
-            let u = try st.upgradeTree(t.tree, &from, VACUUM_STEP)
+            let u = try lexdb_access.upgrade(st, &relOf(&t), &from, VACUUM_STEP)
             if u.converted > 0 { try st.checkpointAll() }
             if u.done { break }
             from = u.next
@@ -11293,19 +11277,6 @@ fn keyType(t: &Table, index: int, k: int): lexdb_sql.TypeName {
     return boundType(&t.cols[cols[k]].typ)
 }
 
-fn idxPrefix(t: &Table, ix: &Index, row: &[]Val): Result[str, DbErr] {
-    var b = newStrBuf()
-    for k in 0..len(ix.cols) { encIdxPart(mut &b, &(try idxVal(t, ix, k, row))) }
-    return Ok(b.toStr())
-}
-
-fn idxEntry(t: &Table, ix: &Index, row: &[]Val, pk: &str): Result[str, DbErr] { return Ok((try idxPrefix(t, ix, row)) + pk) }
-
-fn hasNull(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
-    for k in 0..len(ix.cols) { if isNull(&(try idxVal(t, ix, k, row))) { return Ok(true) } }
-    return Ok(false)
-}
-
 // Whether an index expression's value depends on the row alone: no
 // function whose value changes (time, random, sequences).
 fn immutable(x: &Expr): bool {
@@ -11326,22 +11297,9 @@ fn immutable(x: &Expr): bool {
     }
 }
 
-// A unique index may hold a value once, NULLs aside (they are all distinct).
-// The scan reads the index's leaf, so a commit that adds the same value
-// meanwhile fails one of the two with 40001.
-fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix: &Index, row: &[]Val,
-               pk: &str): Result[Unit, DbErr] {
-    if !ix.unique || (try hasNull(t, ix, row)) { return Ok(Unit{}) }
-    let pre = try idxPrefix(t, ix, row)
-    var clash = false
-    try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-        if en.val != pk {
-            clash = true
-            return false
-        }
-        return true
-    })
-    if !clash { return Ok(Unit{}) }
+// The error for row's value in unique index ix that another row holds
+// already (lexdb_access reports the conflict).
+fn uniqueErr(t: &Table, ix: &Index, row: &[]Val): Result[DbErr, DbErr] {
     var names: []str = []
     var vals: []str = []
     for k in 0..len(ix.cols) {
@@ -11353,7 +11311,7 @@ fn checkUnique(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix:
         // the value as written, not its key (L2)
         append(mut &vals, text(&(if c >= 0 { row[c] } else { try idxVal(t, ix, k, row) })))
     }
-    return Err(lexdb_base.errDetail("23505", &("duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\""),
+    return Ok(lexdb_base.errDetail("23505", &("duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\""),
                                     &("Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."), ""))
 }
 
@@ -11369,34 +11327,6 @@ fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
         }
         None { return Ok(true) }
     }
-}
-
-fn addIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]Val, pk: &str): Result[Unit, DbErr] {
-    for ix in t.indexes {
-        if !(try inIndex(t, &ix, row)) { continue }
-        try checkUnique(st, txn, t, &ix, row, pk)
-        try txn.put(ix.tree, &(try idxEntry(t, &ix, row, pk)), pk)
-    }
-    return Ok(Unit{})
-}
-
-fn changeIndexes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]Val, oldPk: &str, row: &[]Val,
-                 pk: &str): Result[Unit, DbErr] {
-    for ix in t.indexes {
-        let was = try inIndex(t, &ix, old)
-        let now = try inIndex(t, &ix, row)
-        // (an entry made only for a row the index holds: an expression
-        // need not have a value outside a filtered index's rows)
-        let a = if was { try idxEntry(t, &ix, old, oldPk) } else { "" }
-        let b = if now { try idxEntry(t, &ix, row, pk) } else { "" }
-        if a == b && was == now { continue }
-        if was { txn.del(ix.tree, &a) }
-        if now {
-            try checkUnique(st, txn, t, &ix, row, pk)
-            try txn.put(ix.tree, &b, pk)
-        }
-    }
-    return Ok(Unit{})
 }
 
 // ---- statements
@@ -11957,12 +11887,7 @@ fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str): 
                     tmpBump(st, txn)
                 } else if t.onCommit == lexdb_sql.ONC_DELETE {
                     append(mut &kept, k)
-                    var any = false
-                    try st.scan(txn, t.tree, "", "", fn(en: &lexdb_store.Entry): bool {
-                        any = true
-                        return false
-                    })
-                    if any { append(mut &full, k) }
+                    if try lexdb_access.anyRow(st, txn, &relOf(&t)) { append(mut &full, k) }
                 }
             }
             None {}
@@ -12419,7 +12344,6 @@ fn noRewrite(): Rewrite { return Rewrite{rekey: false, fills: [], rowid: -1, nn:
 // A rewrite's rows as made: each row's key and stored bytes; per index made
 // again, its entries, each one's row and (a unique one's) the length of its
 // columns' part (-1 one NULL); the bytes held.
-type RwRows = record { keys: []str; encs: []str; redo: []int; ents: [][]str; rows: [][]int; pres: [][]int; held: int }
 
 // Rewrites table t, as PostgreSQL does: each row, with its columns' new
 // types (changes, USING's values converted to them) and what rw says,
@@ -12499,7 +12423,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
     t.tree = st.createTree(txn)
     txn.dropTree(old)
     // the indexes whose entries change
-    var out = RwRows{keys: [], encs: [], redo: [], ents: [], rows: [], pres: [], held: 0}
+    var redo: []int = []
     for k in 0..len(t.indexes) {
         var uses = keyChanged
         for c in t.indexes[k].cols { if c >= 0 && changed[c] { uses = true } }
@@ -12525,12 +12449,10 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         if uses {
             txn.dropTree(t.indexes[k].tree)
             t.indexes[k].tree = st.createTree(txn)
-            append(mut &out.redo, k)
-            append(mut &out.ents, [])
-            append(mut &out.rows, [])
-            append(mut &out.pres, [])
+            append(mut &redo, k)
         }
     }
+    var out = lexdb_access.newBuild(&redo)
     // the defaults of the columns filled (only theirs: making them binds
     // the sequences they name)
     let defs = if len(rw.fills) > 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: []} }
@@ -12563,23 +12485,14 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         }
     }
     // the rows, in key order: two of one key are 23505, as the key's index
-    // made again would find them (PostgreSQL's "could not create unique index")
-    var order: []int = array(len(out.keys), 0)
-    for i in 0..len(order) { order[i] = i }
-    if (keyChanged || !rw.sorted) && !inOrder(&out.keys) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return out.keys[a].cmp(&out.keys[b]) }) }
-    for j in 0..len(order) {
-        let i = order[j]
-        if j > 0 && out.keys[i] == out.keys[order[j - 1]] {
-            let row = try rowOf(st, txn, t, &out.keys[i], &out.encs[i], rowWidth(t), &[], &[])
-            return Err(dupMade(t, &pkConName(t), &t.pk, &[], &row))
-        }
-        try txn.putRow(t.tree, &out.keys[i], &out.encs[i], lexdb_rows.rowHead(&out.encs[i]))
-        noteChg(st, txn, t, 0)          // the new tree's rows, for its statistics (optimizer 44)
-    }
-    for j in 0..len(out.redo) {
-        var pks: []str = []
-        for r in out.rows[j] { append(mut &pks, out.keys[r]) }
-        try fillIndex(st, txn, t, &t.indexes[out.redo[j]], &out.ents[j], &pks, &out.pres[j])
+    // made again would find them (PostgreSQL's "could not create unique
+    // index"); then the indexes made again, each in its key order
+    let d = try lexdb_access.buildWrite(st, txn, &relOf(t), &out, !keyChanged && rw.sorted,
+                                        fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })   // the new tree's rows, for its statistics (optimizer 44)
+    if d.ix == lexdb_access.PK_CONFLICT { return Err(dupMade(t, &pkConName(t), &t.pk, &[], &d.row)) }
+    if d.ix >= 0 {
+        let ix = &t.indexes[d.ix]
+        return Err(dupMade(t, &lexdb_sql.baseName(&ix.name), &ix.cols, &ix.exprs, &d.row))
     }
     // the old trees' statistics are of no use (the new tree's are made as
     // its rows are counted)
@@ -12589,14 +12502,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
     // rollback drops the tree (9.114 keeps an uncommitted layout from trees
     // whose rows were there before)
     setSpec(st, t)
-    return Ok(len(out.keys))
-}
-
-// Whether xs are in order already (a key that follows the rows' order, as
-// an id filled as rows came: no sort needed).
-fn inOrder(xs: &[]str): bool {
-    for i in 1..len(xs) { if xs[i - 1].cmp(&xs[i]) > 0 { return false } }
-    return true
+    return Ok(out.count())
 }
 
 // Row n of a rewrite (its new types' values in): rw's columns given, then
@@ -12624,50 +12530,11 @@ fn rwRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &De
 
 // A rewrite's row made: its key, its bytes, its entries in the indexes made
 // again.
-fn rwAdd(t: &Table, row: &[]Val, out: mut &RwRows, room: int): Result[Unit, DbErr] {
-    let key = keyOf(t, row)
-    let enc = encRowOf(t, row)
-    out.held += len(key) + len(enc) + 48
-    let r = len(out.keys)
-    for j in 0..len(out.redo) {
-        let ix = &t.indexes[out.redo[j]]
-        if !(try inIndex(t, ix, row)) { continue }
-        let en = try idxEntry(t, ix, row, &key)
-        out.held += len(en) + 32
-        append(mut &out.ents[j], en)
-        append(mut &out.rows[j], r)
-        if ix.unique { append(mut &out.pres[j], if try hasNull(t, ix, row) { -1 } else { len(en) - len(key) }) }
-    }
+fn rwAdd(t: &Table, row: &[]Val, out: mut &lexdb_access.Build, room: int): Result[Unit, DbErr] {
+    try lexdb_access.buildAdd(&relOf(t), out, row,
+                              fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                              fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
     if room >= 0 && out.held > room { return Err(memErr(room)) }
-    append(mut &out.keys, key)
-    append(mut &out.encs, enc)
-    return Ok(Unit{})
-}
-
-// Fills index ix's (new) tree with its entries ents, each ending with its
-// row's key pks[i], in their order; a unique one's (pres: each entry's
-// columns' length, -1 one NULL) two of equal columns are then neighbours:
-// 23505, the row read back from t's tree for the DETAIL.
-fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, ix: &Index, ents: &[]str, pks: &[]str,
-             pres: &[]int): Result[Unit, DbErr] {
-    var order: []int = array(len(ents), 0)
-    for i in 0..len(ents) { order[i] = i }
-    if !inOrder(ents) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) }) }
-    for j in 0..len(order) {
-        let i = order[j]
-        if ix.unique && j > 0 {
-            let h = order[j - 1]
-            if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
-                var row: []Val = []
-                match try st.get(txn, t.tree, &pks[i]) {
-                    Some(v) { row = try rowOf(st, txn, t, &pks[i], &v, rowWidth(t), &[], &placesMissing(t)) }
-                    None {}
-                }
-                return Err(dupMade(t, &lexdb_sql.baseName(&ix.name), &ix.cols, &ix.exprs, &row))
-            }
-        }
-        try txn.put(ix.tree, &ents[i], &pks[i])
-    }
     return Ok(Unit{})
 }
 
@@ -13574,26 +13441,12 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
 // unique index's duplicates are then neighbours: two entries with the same
 // columns, none NULL (the tree is new, so they are all there is to check).
 fn addIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ix: Index): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = lexdb_access.allScan()
-    var cur = newCursor()
-    var ents: []str = []
-    var pks: []str = []
-    var pres: []int = []                // a unique index's: the length of each entry's columns, -1 one NULL
-    while !cur.done {
-        var batch: [][]Val = []
-        let all: []bool = []
-        try fetch(st, txn, t, &path, &sc, &all, mut &cur, mut &batch)
-        for r in batch {
-            if !(try inIndex(t, &ix, &r)) { continue }
-            let pk = keyOf(t, &r)
-            let en = try idxEntry(t, &ix, &r, &pk)
-            if ix.unique { append(mut &pres, if try hasNull(t, &ix, &r) { -1 } else { len(en) - len(pk) }) }
-            append(mut &ents, en)
-            append(mut &pks, pk)
-        }
+    match try lexdb_access.buildIndex(st, txn, &relOf(t), &ix,
+                                      fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                      fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) }) {
+        Some(row) { return Err(dupMade(t, &lexdb_sql.baseName(&ix.name), &ix.cols, &ix.exprs, &row)) }
+        None {}
     }
-    try fillIndex(st, txn, t, &ix, &ents, &pks, &pres)
     try txn.put(CATALOG, &(idxName(&ix.name)), &t.name)
     append(mut &t.indexes, ix)
     return Ok(Unit{})
@@ -14331,31 +14184,9 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
 // The row already in t that row conflicts with on one of up's unique keys,
 // if any.
 fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: &Upsert, row: &[]Val): Result[Option[[]Val], DbErr] {
-    for a in up.arb {
-        var pk = ""
-        if a < 0 {
-            pk = keyOf(t, row)
-        } else {
-            let ix = &t.indexes[a]
-            if (try hasNull(t, ix, row)) || !(try inIndex(t, ix, row)) { continue }
-            let pre = try idxPrefix(t, ix, row)
-            var hit: []str = []
-            try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-                append(mut &hit, en.val)
-                return false
-            })
-            if len(hit) == 0 { continue }
-            pk = hit[0]
-        }
-        match try st.get(txn, t.tree, &pk) {
-            Some(v) {
-                let all: []bool = []
-                return Ok(Some(try rowOf(st, txn, t, &pk, &v, rowWidth(t), &all, &placesMissing(t))))
-            }
-            None {}
-        }
-    }
-    return Ok(None)
+    return lexdb_access.conflictRow(st, txn, &relOf(t), &up.arb, row,
+                                    fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                    fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
 }
 
 // The row there (old), the row proposed (row): DO NOTHING leaves it; DO
@@ -14390,15 +14221,14 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
 fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: []Val, fw: &[]Table,
             later: mut &[]FkLater): Result[[]Val, DbErr] {
     try checkEnums(st, txn, t, &row)
-    let key = keyOf(t, &row)
-    // the hidden key is its sequence's next value, never given (no name in
-    // SQL can reach it): no row can have it already, so it is not looked
-    // for, nor read (9.119)
-    if !rowidKeyed(t) && (try st.get(txn, t.tree, &key)).isSome() { return Err(dupKey(t, &row)) }
-    let enc = encRowOf(t, &row)
-    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
-    noteChg(st, txn, t, 0)
-    try addIndexes(st, txn, t, &row, &key)
+    // its key free (the hidden key is its sequence's next value, never
+    // given: not looked for, 9.119), its index entries added
+    let c = try lexdb_access.insertRow(st, txn, &relOf(t), &row,
+                                       fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                       fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })
+    if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, &row)) }
+    if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], &row)) }
     if len(t.fks) > 0 {
         let none: []Val = []
         try childSide(st, txn, t, fw, &row, &none, later)
@@ -14765,13 +14595,12 @@ pub fn rangeDeletes(): int { return RDEL_TAKEN }
 type RdBound = record { pos: int; op: str; x: Expr }
 
 // [lo, hi) of a tree (hi "": to the end), or nothing.
-type RdRange = value record { lo: str; hi: str; empty: bool }
 
 type RPlan = record {
     empty: bool                 // no row can match (a NULL bound): DELETE 0
-    main: RdRange
+    main: Scan
     ixs: []int                  // the indexes (places in t.indexes) that take the same op, with their ranges
-    ixr: []RdRange
+    ixr: []Scan
     slow: []int                 // the others: their entries are deleted one by one, from the rows read (stage 6)
     text: str                   // EXPLAIN's line
 }
@@ -14858,48 +14687,7 @@ fn rdExactCol(c: &lexdb_sql.ColDef): bool {
            k == lexdb_sql.K_TSTZ || k == lexdb_sql.K_UUID
 }
 
-// The keys of [lo, hi) for equalities eqs on the first columns and a lower
-// and an upper bound on the next (in an index: each part under its marker).
-fn rdRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Option[Val], upIncl: bool, ix: bool): RdRange {
-    var pb = newStrBuf()
-    for v in eqs { lexdb_access.encPart(mut &pb, &v, ix) }
-    let p = pb.toStr()
-    var lo = p
-    var hi = if len(p) > 0 { lexdb_access.succ(&p) } else { "" }
-    match lower {
-        Some(v) {
-            var kb = newStrBuf()
-            kb.add(&p)
-            lexdb_access.encPart(mut &kb, &v, ix)
-            let e = kb.toStr()
-            if lowIncl {
-                lo = e
-            } else {
-                // just after every key that starts with e; none: nothing is above it
-                let n = lexdb_access.succ(&e)
-                if n == "" { return RdRange{lo: "", hi: "", empty: true} }
-                lo = n
-            }
-        }
-        None {}
-    }
-    match upper {
-        Some(v) {
-            var kb = newStrBuf()
-            kb.add(&p)
-            lexdb_access.encPart(mut &kb, &v, ix)
-            let e = kb.toStr()
-            // (inclusive with nothing after e: to the end, no tighter than hi)
-            let h = if upIncl { lexdb_access.succ(&e) } else { e }
-            if h != "" && (hi == "" || h < hi) { hi = h }
-        }
-        None {}
-    }
-    if len(hi) > 0 && lo >= hi { return RdRange{lo: "", hi: "", empty: true} }
-    return RdRange{lo: lo, hi: hi, empty: false}
-}
-
-fn rdNone(): RPlan { return RPlan{empty: false, main: RdRange{lo: "", hi: "", empty: false}, ixs: [], ixr: [], slow: [], text: ""} }
+fn rdNone(): RPlan { return RPlan{empty: false, main: lexdb_access.allScan(), ixs: [], ixr: [], slow: [], text: ""} }
 
 // The range delete s makes of q's one table, or None for the row path.
 fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, params: &[]Val,
@@ -15011,16 +14799,16 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         upIncl = bs[hiAt[k]].op == "<="
     }
     var p = rdNone()
-    p.main = rdRange(&eqs, &lower, lowIncl, &upper, upIncl, false)
+    p.main = lexdb_access.exactRange(&eqs, &lower, lowIncl, &upper, upIncl, false)
     if p.main.empty {
         p.empty = true
         p.text = "range delete: no row can match"
         return Ok(Some(p))
     }
-    if st.locks.locksIn(txn.lockOwner(), t.tree, &p.main.lo, &p.main.hi) { return Ok(None) }
+    if lexdb_access.rangeLocked(st, txn, &relOf(t), &p.main) { return Ok(None) }
     for x in ixs {
         append(mut &p.ixs, x)
-        append(mut &p.ixr, rdRange(&eqs, &lower, lowIncl, &upper, upIncl, true))
+        append(mut &p.ixr, lexdb_access.exactRange(&eqs, &lower, lowIncl, &upper, upIncl, true))
     }
     p.slow = slow
     p.text = "range delete: primary key " + (if used == 0 { "whole table" } else { "range" }) + ", subtrees dropped" +
@@ -15041,12 +14829,9 @@ fn noteChgN(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, n: int) {
     CHG_D += n
 }
 
-// The entries of the indexes slow (places in t.indexes) of the rows of [lo, hi) of table t, deleted one by one
-// as the row path's delRow does (an expression's value, a filtered index's predicate, the key from the row's
-// key): the number of rows read. Only the columns those indexes use are read, in batches (the rows are not
-// held), and through the transaction's own view, so a row it wrote is read as written and one it deleted or
-// cut is not.
-fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, lo: &str, hi: &str, slow: &[]int): Result[int, DbErr] {
+// The columns of t indexes slow (places in t.indexes) use: their columns,
+// expressions and predicates'.
+fn slowNeed(t: &Table, slow: &[]int): []bool {
     var names: []str = []
     for x in slow {
         let ix = &t.indexes[x]
@@ -15058,31 +14843,7 @@ fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, lo: 
     for x in names { used.put(colPart(&x), 1) }
     var need: []bool = []
     for c in t.cols { append(mut &need, used.has(&c.name)) }
-    let n = rowWidth(t)
-    let places = placesNeeded(t, &need)
-    let missing = placesMissing(t)
-    var from = lo.toStr()
-    var count = 0
-    while true {
-        var keys: []str = []
-        var vals: []str = []
-        try st.scanPart(txn, t.tree, &from, hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            return len(vals) < BATCH
-        })
-        for k in 0..len(keys) {
-            let row = try rowOf(st, txn, t, &keys[k], &vals[k], n, &places, &missing)
-            for x in slow {
-                let ix = &t.indexes[x]
-                if try inIndex(t, ix, &row) { txn.del(ix.tree, &(try idxEntry(t, ix, &row, &keys[k]))) }
-            }
-        }
-        count += len(keys)
-        if len(keys) < BATCH { break }
-        from = lexdb_access.after(&keys[len(keys) - 1])
-    }
-    return Ok(count)
+    return need
 }
 
 // DELETE as a range delete when it can be one: its result, or None for the
@@ -15096,17 +14857,15 @@ fn rangeDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         return Ok(Some(tagOnly(&"DELETE 0")))
     }
     let t = &q.levels[0].t
-    // noted before the count: a commit into the range meanwhile fails this one (40001), not unseen
-    st.noteRange(txn, t.tree, &pl.main.lo, &pl.main.hi)
-    // with indexes to delete entry by entry, the rows are read (through the transaction's own view) and
-    // counted: the rows read are the rows deleted, whatever the transaction wrote or cut before
-    let n = if len(pl.slow) > 0 { try delEntries(st, txn, t, &pl.main.lo, &pl.main.hi, &pl.slow) }
-            else { try st.countView(txn, t.tree, &pl.main.lo, &pl.main.hi) }
+    // noted before the count: a commit into the range meanwhile fails this one (40001), not unseen; the
+    // indexes not cut by range have their entries deleted one by one, reading the columns they use
+    let need = slowNeed(t, &pl.slow)
+    let n = try lexdb_access.deleteRange(st, txn, &relOf(t), &pl.main, &pl.ixs, &pl.ixr, &pl.slow, &need,
+                                         fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                         fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
     if n < 0 { return Ok(None) }
     RDEL_TAKEN += 1
     if n == 0 { return Ok(Some(tagOnly(&"DELETE 0"))) }
-    txn.delRange(t.tree, &pl.main.lo, &pl.main.hi)
-    for i in 0..len(pl.ixs) { txn.delRange(t.indexes[pl.ixs[i]].tree, &pl.ixr[i].lo, &pl.ixr[i].hi) }
     noteChgN(st, txn, t, n)
     return Ok(Some(tagOnly(&("DELETE " + n.toStr()))))
 }
@@ -20542,16 +20301,9 @@ fn nullRow(n: int): []Val {
 fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &FkCols, vals: &[]Val): Result[bool, DbErr] {
     var prow = nullRow(len(p.cols))
     for k in 0..len(vals) { prow[fc.refCols[k]] = vals[k] }
-    if fc.via == -1 { return Ok((try st.get(txn, p.tree, &(keyOf(p, &prow)))).isSome()) }
-    if fc.via < 0 { return Ok(false) }
-    let ix = &p.indexes[fc.via]
-    let pre = try idxPrefix(p, ix, &prow)
-    var found = false
-    try st.scan(txn, ix.tree, &pre, &(lexdb_access.succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-        found = true
-        return false
-    })
-    return Ok(found)
+    if fc.via < -1 { return Ok(false) }
+    return lexdb_access.hasKey(st, txn, &relOf(p), fc.via, &prow,
+                               fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(p, xi, k, r) })
 }
 
 // Whether a row of table c has vals in its columns cols.
@@ -20683,16 +20435,12 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
     try checkRow(t, row)
     try checkChecks(t, row)
     try checkEnums(st, txn, t, row)
-    let oldKey = keyOf(t, old)
-    let key = keyOf(t, row)
-    if key != oldKey {
-        if (try st.get(txn, t.tree, &key)).isSome() { return Err(dupKey(t, row)) }
-        txn.del(t.tree, &oldKey)
-    }
-    let enc = encRowOf(t, row)
-    try txn.putRow(t.tree, &key, &enc, lexdb_rows.rowHead(&enc))
-    noteChg(st, txn, t, 1)
-    try changeIndexes(st, txn, t, old, &oldKey, row, &key)
+    let c = try lexdb_access.updateRow(st, txn, &relOf(t), old, row,
+                                       fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                       fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 1) })
+    if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
+    if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
     if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
     if len(t.refBy) > 0 { try parentSide(st, txn, t, fw, old, row, true, later) }
     return Ok(Unit{})
@@ -20701,10 +20449,10 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
 // Row of table t deleted, its index entries, and what references it.
 fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]Val, fw: &[]Table,
           later: mut &[]FkLater): Result[Unit, DbErr] {
-    let key = keyOf(t, row)
-    txn.del(t.tree, &key)
-    noteChg(st, txn, t, 2)
-    for ix in t.indexes { if try inIndex(t, &ix, row) { txn.del(ix.tree, &(try idxEntry(t, &ix, row, &key))) } }
+    try lexdb_access.deleteRow(st, txn, &relOf(t), row,
+                               fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                               fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
+                               fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 2) })
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
@@ -22453,7 +22201,6 @@ type FastCopyPlan = record {
     pk: int
 }
 
-type FastCopyState = record { lastId: int; haveLast: bool; indexed: bool }
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
     if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 { return None }
@@ -22702,8 +22449,8 @@ fn fastCopyOne(t: &Table, txn: &lexdb_store.Txn, plan: &FastCopyPlan, p: int, ra
 }
 
 // One record: fields to the stored row, the key, and putRowLoad.
-fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, plan: &FastCopyPlan, line: &str,
-               state: mut &FastCopyState): Result[Unit, DbErr] {
+fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel: &lexdb_access.Rel, plan: &FastCopyPlan, line: &str,
+               state: mut &lexdb_access.Load): Result[Unit, DbErr] {
     var b: []byte = withCapacity(plan.v0 + len(line))
     for i in 0..plan.v0 { append(mut &b, 0) }
     b[0] = FIXED
@@ -22728,27 +22475,9 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, pla
         return Err(e("22P04", &("missing data for column \"" + t.cols[p].name + "\"")))
     }
     if !haveId { return Err(e("XX000", "lexdb: COPY fast path: no primary key value")) }
-    let outOfOrder = state.haveLast && id <= state.lastId
-    state.lastId = id
-    state.haveLast = true
-    var kb = newStrBuf()
-    binary.addU64BE(mut &kb, id ^ (-9223372036854775807 - 1))
-    let key = kb.toStr()
     let row = strFromBytes(&b)
-    if outOfOrder && !state.indexed {
-        // an unsorted load: the earlier rows enter the own-writes map, and
-        // from here each key is looked up before it is written
-        txn.indexWrites()
-        state.indexed = true
-    }
-    if state.indexed {
-        match try st.get(txn, t.tree, &key) {
-            Some(_) { return Err(e("23505", "duplicate key value violates unique constraint")) }
-            None {}
-        }
-        try txn.putRow(t.tree, &key, &row, 0)
-    } else {
-        try txn.putRowLoad(t.tree, &key, &row, 0)
+    if !(try lexdb_access.loadRow(st, txn, rel, id, &row, state)) {
+        return Err(e("23505", "duplicate key value violates unique constraint"))
     }
     noteChg(st, txn, t, 0)
     return Ok(Unit{})
@@ -22761,7 +22490,8 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
     var ended = false
     var count = 0
     var lineNo = 0
-    var state = FastCopyState{lastId: 0, haveLast: false, indexed: false}
+    var state = lexdb_access.newLoad()
+    let rel = relOf(t)
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
     let next = fn(): CopyPart {
         if input.pull { return pull() }
@@ -22784,7 +22514,7 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
             if len(line) > 0 && line[len(line) - 1] == '\r' { line = line[0..len(line) - 1] }
             if line == "\\." { ended = true; start = nl + 1; break }
             lineNo += 1
-            match fastCopyRow(st, txn, t, plan, &line, mut &state) {
+            match fastCopyRow(st, txn, t, &rel, plan, &line, mut &state) {
                 Ok(_) {}
                 Err(x) { return Err(fastCopyAt(x, &where, lineNo)) }
             }
@@ -22800,7 +22530,7 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
         if len(line) > 0 && line[len(line) - 1] == '\r' { line = line[0..len(line) - 1] }
         if line != "\\." {
             lineNo += 1
-            match fastCopyRow(st, txn, t, plan, &line, mut &state) {
+            match fastCopyRow(st, txn, t, &rel, plan, &line, mut &state) {
                 Ok(_) {}
                 Err(x) { return Err(fastCopyAt(x, &where, lineNo)) }
             }
@@ -27986,7 +27716,6 @@ fn isVarKind(k: byte): bool { return lexdb_rows.isVarKind(k) }
 fn wordVal(k: byte, w: int): Val { return lexdb_rows.wordVal(k, w) }
 fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] { return lexdb_rows.varVal(k, s, a, b) }
 fn readIntK(s: &str, at: int, k: byte): int { return lexdb_rows.readIntK(s, at, k) }
-fn encFixed(t: &Table, places: &[]Val): Option[str] { let r = rowsFor(t); return lexdb_rows.encodeFixed(&r, places) }
 fn kindsFit(t: &Table, kinds: &[]byte): bool { let r = rowsFor(t); return lexdb_rows.kindsFit(&r, kinds) }
 type FixedLay = lexdb_rows.FixedLay
 fn fixedVal(s: &str, p: int, k: byte, lay: &FixedLay): Result[Val, DbErr] { return lexdb_rows.fixedVal(s, p, k, lay) }
