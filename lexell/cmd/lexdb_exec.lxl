@@ -9339,6 +9339,11 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
         let q = &sel.q
         for lv in q.levels {
             if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return }
+            // a semi or anti join's conditions (a residual on its hidden
+            // columns, a lookup level's filters) are its own: a condition
+            // on an outer value there is no WHERE conjunct of this query,
+            // to be a key or a residual of it
+            if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return }
             for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
             // an outer join's ON conjuncts are not WHERE filters: they stay
             if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res) { return }
@@ -9786,6 +9791,14 @@ fn semiLookable(q: &Query, i: int): bool {
     for x in sl.cond { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
     for x in sl.local { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
     for x in sq.top { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
+    // Nothing of it may use q's own outer values (q a subquery, the
+    // EXISTS's outer value one of the query around q): q's level would
+    // carry a condition on them, which q's own unnesting (hashSub) could
+    // take for a key "inner = outer" of q and drop from the level.
+    for x in p.eqs { if usesRefs(&substRefs(&x, q.base, &sq.refs), q.base) { return false } }
+    for x in sl.cond { if usesRefs(&substRefs(&x, q.base, &sq.refs), q.base) { return false } }
+    for x in sl.local { if usesRefs(&substRefs(&x, q.base, &sq.refs), q.base) { return false } }
+    for x in sq.top { if usesRefs(&substRefs(&x, q.base, &sq.refs), q.base) { return false } }
     return true
 }
 
@@ -25744,7 +25757,10 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
         // for), and with a key of its own map, the key's equality
         var conds: []BNode = []
         for x in lv.cond {
-            if !keyed && q.minLevel(&x) >= k { continue }
+            // (a semi join's conditions are its residuals, none applied by
+            // materialize, those on its own columns and outer values only
+            // too: q21's shape nested in a subquery, "inner > $1")
+            if !keyed && !lv.semi && q.minLevel(&x) >= k { continue }
             if mode != JK_GEN && isKeyEq(&x, q, lv) { continue }
             let c = bCompile(&x, q, &kinds, &env, 0)
             if c.isNone() { return Ok(None) }

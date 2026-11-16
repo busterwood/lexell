@@ -11,6 +11,10 @@
 // - With SET lexdb_batch = off and on: the same results.
 // - In a transaction with writes of its own (no lookup level: its reads
 //   are noted; the same with and without batches).
+// - An EXISTS nested in another subquery (IN, NOT IN, = ANY, a scalar,
+//   EXISTS, the select list) whose condition uses the outermost query's
+//   value: against the count form, batches off and on. The middle
+//   subquery must not be unnested through the inner level's condition.
 // - How many ran as looked-up semi/anti joins, and over batches.
 // - EXPLAIN ANALYZE's counts with batches on and off (but "batches N",
 //   and the rows read: the batches read a key's whole range, the row
@@ -20,10 +24,12 @@
 //   lookup of an index's rows, and q21's: the semi and anti joins after
 //   the joins that cut lineitem's rows (supplier, nation, orders), not
 //   after lineitem.
+// timeout: 60
 // expect: reference: 300 queries, 300 the same as with counts
 // expect: batches: 300 queries, 300 the same with and without batches
 // expect: in a transaction: 40 queries, 40 the same with and without batches
 // expect: looked up: 268 of 300, 268 over batches
+// expect: nested: 56 queries, 56 the same as with counts, batches off and on
 // expect: counts q21: same: true
 // expect: counts q22: same: true
 // expect: plan q4: scan o: full scan; semi join l: primary key range per row, filter per row read; aggregate; order: sort; subquery 1 (exists): semi join, looked up per row by the join
@@ -270,6 +276,54 @@ fn looked(e: &str): bool {
     return false
 }
 
+// An EXISTS inside another subquery whose filter or key uses the outer
+// query's value (c's, two levels up): the middle subquery is run per row
+// (its unnesting must not take the inner semi join's condition on c for a
+// key of its own), in IN, NOT IN, = ANY, a scalar, EXISTS in EXISTS, the
+// select list; each against its count form, batches off and on.
+fn nested(s: mut &lexdb_exec.Session) {
+    let inners = ["exists (select 1 from l where l.ok = o.id and l.sp = c.id % 100)",
+                  "not exists (select 1 from l where l.ok = o.id and l.sp = c.id % 100)",
+                  "exists (select 1 from l where l.ok = o.id and l.qty > c.bal % 40)",
+                  "not exists (select 1 from l where l.ok = o.id and l.qty > c.bal % 40)",
+                  "exists (select 1 from l where l.ok = o.id and l.sp <> c.nat)",
+                  "not exists (select 1 from l where l.ok = o.id and l.sp <> c.nat and l.rd > l.cd)",
+                  "exists (select 1 from l where l.ok = o.id + c.nat)",
+                  "exists (select 1 from o o3 where o3.cust = o.cust and o3.st = 'F' and o3.id > c.id)"]
+    let shapes = ["select count(*), sum(c.id) from c where c.id < 150 and c.id in (select o.cust from o where o.id < 300 and X)",
+                  "select count(*), sum(c.id) from c where c.id < 150 and c.id not in (select o.cust from o where o.id < 300 and o.cust is not null and X)",
+                  "select count(*), sum(c.id) from c where c.id < 150 and c.id = any (select o.cust from o where o.id < 300 and X)",
+                  "select c.id, (select count(*) from o where o.cust = c.id and X) from c order by c.id limit 40",
+                  "select count(*), sum(c.id) from c where c.id < 150 and exists (select 1 from o where o.cust = c.id and X)",
+                  "select count(*), sum(c.id) from c where c.id < 150 and not exists (select 1 from o where o.cust = c.id and X)",
+                  "select c.id, c.id in (select o.cust from o where o.id < 300 and X) from c order by c.id limit 40"]
+    var n = 0
+    var same = 0
+    for sh in shapes {
+        for x in inners {
+            // the count form: no semi join anywhere
+            let neg = strings.startsWith(&x, "not ")
+            let body = if neg { strings.substr(&x, 4, len(x)) } else { "" + x }
+            let cnt = strings.replaceAll(&body, &"exists (select 1 from", "(select count(*) from") + (if neg { " = 0" } else { " > 0" })
+            let a = strings.replaceAll(&sh, &"X", &x)
+            let b = strings.replaceAll(&sh, &"X", &cnt)
+            let o1 = q(s, &"set lexdb_batch = off")
+            let aOff = q(s, &a)
+            let bOff = q(s, &b)
+            let o2 = q(s, &"set lexdb_batch = on")
+            let aOn = q(s, &a)
+            let bOn = q(s, &b)
+            n += 1
+            if aOff == bOff && aOn == bOn && aOff == aOn { same += 1 } else {
+                println("DIFFERENT: " + a)
+                println("  off: " + aOff + " reference " + bOff)
+                println("  on:  " + aOn + " reference " + bOn)
+            }
+        }
+    }
+    println("nested: " + n.toStr() + " queries, " + same.toStr() + " the same as with counts, batches off and on")
+}
+
 fn main() {
     lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
@@ -315,6 +369,7 @@ fn main() {
         let b2 = q(mut &s, &"rollback")
         println("in a transaction: 40 queries, " + same3.toStr() + " the same with and without batches")
         println("looked up: " + looks.toStr() + " of 300, " + batched.toStr() + " over batches")
+        nested(mut &s)
         let q21 = "select s.name, count(*) from l l1 join s on s.id = l1.sp join n on n.id = s.nat join o on o.id = l1.ok " +
                   "where n.name = 'N2' and o.st = 'F' and l1.rd > l1.cd " +
                   "and exists (select * from l l2 where l2.ok = l1.ok and l2.sp <> l1.sp) " +
