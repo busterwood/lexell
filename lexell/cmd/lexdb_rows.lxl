@@ -11,6 +11,7 @@
 // here.
 import "binary"
 import "math"
+import "task"
 import "./lexdb_base"
 import "./lexdb_cols"
 import "./lexdb_like"
@@ -1446,6 +1447,50 @@ pub fn layoutOk(leaf: &LeafView, rw: &Rows): bool {
     return lid < len(rw.lays) && lexdb_cols.kindsAre(leaf.cols, leaf.dir, &rw.lays[lid].kinds)
 }
 
+// The text of dictionary coded columns, kept for the program (strStatic):
+// a batch's value is then a copy of a static string, which costs nothing,
+// where a heap string's clone copies its bytes for every row. A dictionary
+// column has few distinct values; the pool stops taking new ones at
+// DICT_MAX entries or DICT_BYTES bytes, and a value past that is a heap
+// copy as before.
+type DictPool = record { m: Map[str, str]; bytes: int }
+
+const DICT_MAX = 65536
+const DICT_BYTES = 8 << 20
+
+var DICTS: once task.Shared[DictPool]
+
+fn dictPool(): task.Shared[DictPool] {
+    if !DICTS.isSet() { DICTS.set(task.shared(DictPool{m: newMap(), bytes: 0})) }
+    return DICTS.get().share()
+}
+
+// The values of a column leaf's dictionary (place pl), pooled.
+fn dictVals(s: &str, dir: &[]int, pl: int): []Val {
+    let nd = lexdb_cols.dictSize(dir, pl)
+    var dv: []Val = withCapacity(nd)
+    dictPool().with(fn(p: mut &DictPool) {
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            let t = &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]
+            match p.m.get(t) {
+                Some(x) { append(mut &dv, Val.Text(x)) }
+                None {
+                    if p.m.size() < DICT_MAX && p.bytes + len(t) <= DICT_BYTES {
+                        let x = strStatic(t)
+                        p.m.put(t.toStr(), x.clone())
+                        p.bytes += len(t)
+                        append(mut &dv, Val.Text(x))
+                    } else {
+                        append(mut &dv, Val.Text(t.toStr()))
+                    }
+                }
+            }
+        }
+    })
+    return dv
+}
+
 // Places ps of column leaf rows from + qs[x] into b's rows r0 + qs[x]
 // (all: qs is 0, 1, 2 ... in order, read as a run); false: a value of a
 // kind its column's batch does not hold.
@@ -1522,13 +1567,8 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
             } else if pk == PK_BOOL {
                 for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + q)) } }
             } else if codec == lexdb_cols.C_DICT {
-                // each entry made once
-                let nd = lexdb_cols.dictSize(dir, pl)
-                var dv: []Val = withCapacity(nd)
-                for j in 0..nd {
-                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
-                    append(mut &dv, Val.Text(s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]))
-                }
+                // each entry made once, pooled (dictVals)
+                let dv = dictVals(s, dir, pl)
                 var codes: []int = array(n, 0)
                 if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
                     for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
