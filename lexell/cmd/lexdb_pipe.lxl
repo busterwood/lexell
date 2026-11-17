@@ -1,13 +1,16 @@
 // lexdb_pipe: how a physical plan runs (design/lexdb-layers.md 6.2.3).
 // Its secret, when step 4 is done: push pipelines of operators over
 // chunks. For now it holds what they will stand on: the scalar evaluator
-// of bound expressions (lexdb_bind.BX).
+// of bound expressions (lexdb_bind.BX), and a run's budget (Budget: the
+// rows it holds, its deadline and its turns) and counts.
 //
 // A run reads its session only through its context (Ctx): the
 // transaction's start and time zone, the parameters, and the hooks (Up)
 // for the functions it does not own, which its caller supplies. It never
 // imports lexdb_exec; from the store it takes the Store and Txn handles
 // only, never a transaction's SQL state.
+import "time"
+import "task"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_time"
@@ -177,3 +180,112 @@ pub fn looksArray(v: &Val): bool {
         else { return false }
     }
 }
+
+// ---- the budget: what a run holds, its deadline and its turns
+
+// A statement that does not wait (its pages in the cache) lets the other
+// sessions run after this much time: lexdb runs SQL on one thread
+// (design/lexdb.md 9.15).
+pub const TURN_NS = 100000
+
+// A statement's budget, kept by its run (and passed on to the runs inside
+// it): about the bytes of rows it holds against max_statement_mem, and
+// its clock against statement_timeout and its turn.
+pub type Budget = value record {
+    pub held: int               // about the bytes of rows the statement holds (its runs inside: their own and this)
+    pub aside: int              // ... and those a batch consumer (groups, a sort) holds in its own count while a batch is joined (bRange)
+    pub maxHeld: int            // max_statement_mem; 0 no limit
+    pub deadline: int           // statement_timeout: the monotonic clock's ns to stop at; 0 none
+    pub ticks: int
+    pub turnEnd: int            // the monotonic clock's ns after which the statement lets other sessions run
+}
+
+// A budget with no limits, nothing held, its turn not begun.
+pub fn newBudget(): Budget { return Budget{held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0} }
+
+// Rows of about n bytes now held until the statement ends (or its run
+// inside another does).
+pub fn (b: mut &Budget) hold(n: int): Result[Unit, DbErr] {
+    b.held += n
+    if b.maxHeld > 0 && b.held > b.maxHeld { return Err(memErr(b.maxHeld)) }
+    return Ok(Unit{})
+}
+
+// The bytes a run may still hold (-1: no limit), for code that cannot reach
+// the run (a row callback): it counts and checks itself, then holds.
+pub fn (b: &Budget) room(): int { return if b.maxHeld > 0 { b.maxHeld - b.held } else { -1 } }
+
+// The error of a statement past max_statement_mem (max bytes).
+pub fn memErr(max: int): DbErr {
+    return e("53200", &("statement holds more than max_statement_mem (" + (max / 1024).toStr() +
+             " kB) of rows; SET max_statement_mem to allow more, 0 for no limit"))
+}
+
+// Per row looked at: every 256th, the clock. Past statement_timeout: an
+// error. After a turn of TURN_NS: the other sessions run, then this again.
+pub fn (b: mut &Budget) tick(): Result[Unit, DbErr] {
+    b.ticks += 1
+    if b.ticks % 256 != 0 { return Ok(Unit{}) }
+    return b.checkTime()
+}
+
+// tick for n rows at once (a batch: 9.47).
+pub fn (b: mut &Budget) tickN(n: int): Result[Unit, DbErr] {
+    b.ticks += n
+    return b.checkTime()
+}
+
+fn (b: mut &Budget) checkTime(): Result[Unit, DbErr] {
+    let now = time.monotonicNs()
+    if b.deadline != 0 && now > b.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+    if b.turnEnd == 0 {
+        b.turnEnd = now + TURN_NS
+    } else if now > b.turnEnd {
+        // a yield looks at the sockets: a session whose query has arrived runs
+        match task.yield() {
+            Ok(_) {}
+            Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+        }
+        b.turnEnd = time.monotonicNs() + TURN_NS
+    }
+    return Ok(Unit{})
+}
+
+// About the memory a row takes: its array, and per value its tag and
+// payload (text and numbers their bytes).
+pub fn rowBytes(r: &[]Val): int {
+    var n = 32
+    for v in r {
+        n += 24
+        match v {
+            Val.Text(t) { n += len(t) }
+            Val.Num(_) { n += 32 }
+            Val.Ival(_) { n += 24 }
+            else {}
+        }
+    }
+    return n
+}
+
+pub fn rowsBytes(rows: &[][]Val): int {
+    var n = 24
+    for r in rows { n += rowBytes(&r) }
+    return n
+}
+
+// ---- counts (EXPLAIN ANALYZE)
+
+// What one table of a query did.
+pub type Counts = value record {
+    pub starts: int         // scans or lookups begun (per row: one per row of the tables before); hash: probes
+    pub read: int           // candidate rows tried
+    pub joined: int         // rows that met the join's conditions
+    pub nulls: int          // LEFT JOIN rows made with NULLs
+    pub built: int          // hash: rows read to build it, and kept
+    pub kept: int
+    pub unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
+    pub batches: int        // the batches its rows were read and aggregated in (9.47)
+    pub switched: int       // when an index range was run as a scan (optimizer 19): 1 by the rules mode's rule, 2 by the measured costs (optimizer 38)
+}
+
+pub fn noCounts(): Counts { return Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0} }

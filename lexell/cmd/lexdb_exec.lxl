@@ -266,7 +266,7 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     var args: []Val = []
     for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
     var rows: [][]Val = []
-    let room = rs.room()
+    let room = rs.bud.room()
     var bytes = 0
     if sel.srf == "pg_available_extensions" {
         // none
@@ -310,8 +310,8 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                     if cap >= 0 && len(rows) >= cap { break }
                     var row: []Val = [match ps[i] { Some(t) { Val.Text(t) } None { Val.Null } }]
                     if sel.ordin { append(mut &row, Val.Int(i + 1)) }
-                    bytes += rowBytes(&row)
-                    if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+                    bytes += lexdb_pipe.rowBytes(&row)
+                    if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
                     append(mut &rows, row)
                 }
             }
@@ -336,10 +336,10 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 n += 1
                 var row: []Val = [v]
                 if sel.ordin { append(mut &row, Val.Int(n)) }
-                bytes += rowBytes(&row)
-                if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+                bytes += lexdb_pipe.rowBytes(&row)
+                if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
                 append(mut &rows, row)
-                try rs.tick()
+                try rs.bud.tick()
                 match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &zone) {
                     Ok(x) { v = x }
                     Err(_) { break }
@@ -362,10 +362,10 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             n += 1
             var row: []Val = [v]
             if sel.ordin { append(mut &row, Val.Int(n)) }
-            bytes += rowBytes(&row)
-            if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+            bytes += lexdb_pipe.rowBytes(&row)
+            if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
             append(mut &rows, row)
-            try rs.tick()
+            try rs.bud.tick()
             // the next value; past the type's range: the end
             match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &txn.sql.zone) {
                 Ok(x) { v = x }
@@ -404,10 +404,10 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var row: []Val = []
             for k in 0..len(cols) { append(mut &row, if i < len(cols[k]) { cols[k][i] } else { Val.Null }) }
             if sel.ordin { append(mut &row, Val.Int(i + 1)) }
-            bytes += rowBytes(&row)
-            if room >= 0 && bytes > room { return Err(memErr(rs.maxHeld)) }
+            bytes += lexdb_pipe.rowBytes(&row)
+            if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
             append(mut &rows, row)
-            try rs.tick()
+            try rs.bud.tick()
         }
     }
     return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
@@ -1319,14 +1319,14 @@ fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
 }
 
 // Table t's statistics counted from its rows on snap, written in txn; its
-// rows. It takes turns (9.15) as a statement does: after TURN_NS of
+// rows. It takes turns (9.15) as a statement does: after lexdb_pipe.TURN_NS of
 // reading, the other sessions run (an ANALYZE of a million rows held every
 // session for over a second; the automatic one runs beside them: optimizer
 // 44).
 fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
                 lim: &Limits): Result[int, DbErr] {
     var rows = 0
-    var turnEnd = time.monotonicNs() + TURN_NS
+    var turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
     var entries: []int = []
     var seen: [][]Map[str, int] = []
     // the leading column's least and greatest values as numbers, when they
@@ -1385,7 +1385,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                 Ok(_) {}
                 Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
             }
-            turnEnd = time.monotonicNs() + TURN_NS
+            turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
         }
         var batch: [][]Val = []
         try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
@@ -1397,7 +1397,7 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                     Ok(_) {}
                     Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
                 }
-                turnEnd = time.monotonicNs() + TURN_NS
+                turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
             }
             for x in 0..len(others) {
                 if lexdb_ops.isNull(&r[others[x]]) { continue }
@@ -2410,24 +2410,11 @@ pub type Level = record {
 // A level of rows held by the run (a subquery's, a working table), not a table's.
 fn (lv: &Level) virt(): bool { return lv.src >= 0 || lv.work >= 0 }
 
-// What one table of a query did (EXPLAIN ANALYZE).
-type Counts = value record {
-    starts: int         // scans or lookups begun (per row: one per row of the tables before); hash: probes
-    read: int           // candidate rows tried
-    joined: int         // rows that met the join's conditions
-    nulls: int          // LEFT JOIN rows made with NULLs
-    built: int          // hash: rows read to build it, and kept
-    kept: int
-    unmatched: int      // RIGHT and FULL JOIN: its rows that joined nothing
-    batches: int        // the batches its rows were read and aggregated in (9.47)
-    switched: int       // when an index range was run as a scan (optimizer 19): 1 by the rules mode's rule, 2 by the measured costs (optimizer 38)
-}
-
 // A query's run: the counts, and per RIGHT or FULL JOIN table which of its
 // rows have joined.
 type Run = record {
     noLimit: bool               // the SELECT's LIMIT and OFFSET not applied (a locking one applies them as it locks, 9.86)
-    cnt: []Counts
+    cnt: []lexdb_pipe.Counts
     seen: [][]bool
     memo: []Map[str, int]       // per subquery (correlated): its outer values -> its result in memoRes
     memoRes: [][]SubRes
@@ -2435,12 +2422,7 @@ type Run = record {
     cache: CteCache
     maxRounds: int              // a recursive CTE's rounds at most (the session's max_recursion); 0 no limit
     maxSteps: int               // MATCH_RECOGNIZE: steps per start row at most (the session's max_match_steps); 0 no limit
-    held: int                   // about the bytes of rows the statement holds (its runs inside: their own and this)
-    aside: int                  // ... and those a batch consumer (groups, a sort) holds in its own count while a batch is joined (bRange)
-    maxHeld: int                // max_statement_mem; 0 no limit
-    deadline: int               // statement_timeout: the monotonic clock's ns to stop at; 0 none
-    ticks: int
-    turnEnd: int                // the monotonic clock's ns after which the statement lets other sessions run
+    bud: lexdb_pipe.Budget      // the rows it holds, its deadline and turns
     batch: bool                 // vector scans and batch operators (SET lexdb_batch: 9.47); compiled expressions and typed sorts are always on
     writes: bool                // an INSERT, UPDATE or DELETE's run: no index-to-scan switch (optimizer 19)
     // The first level's switch (firstSwitch, 9.107), decided once for its
@@ -2451,11 +2433,6 @@ type Run = record {
     swScan: Scan
     after: str                  // a batched DELETE or UPDATE (stage 8): the first level's primary key scan starts at this key; "" none
 }
-
-// A statement that does not wait (its pages in the cache) lets the other
-// sessions run after this much time: lexdb runs SQL on one thread
-// (design/lexdb.md 9.15).
-pub const TURN_NS = 100000
 
 // A session's limits on one statement (SET max_recursion,
 // max_statement_mem, statement_timeout).
@@ -2475,86 +2452,17 @@ pub fn noLimits(): Limits { return Limits{rounds: 0, steps: 0, mem: 0, deadline:
 fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxRounds = l.rounds
     rs.maxSteps = l.steps
-    rs.maxHeld = l.mem
-    rs.deadline = l.deadline
+    rs.bud.maxHeld = l.mem
+    rs.bud.deadline = l.deadline
     rs.batch = l.batch
-}
-
-// Rows of about n bytes now held until the statement ends (or its run
-// inside another does).
-fn (rs: mut &Run) hold(n: int): Result[Unit, DbErr] {
-    rs.held += n
-    if rs.maxHeld > 0 && rs.held > rs.maxHeld { return Err(memErr(rs.maxHeld)) }
-    return Ok(Unit{})
-}
-
-// The bytes a run may still hold (-1: no limit), for code that cannot reach
-// the run (a row callback): it counts and checks itself, then holds.
-fn (rs: &Run) room(): int { return if rs.maxHeld > 0 { rs.maxHeld - rs.held } else { -1 } }
-
-fn memErr(max: int): DbErr {
-    return e("53200", &("statement holds more than max_statement_mem (" + (max / 1024).toStr() +
-             " kB) of rows; SET max_statement_mem to allow more, 0 for no limit"))
-}
-
-// Per row looked at: every 256th, the clock. Past statement_timeout: an
-// error. After a turn of TURN_NS: the other sessions run, then this again.
-fn (rs: mut &Run) tick(): Result[Unit, DbErr] {
-    rs.ticks += 1
-    if rs.ticks % 256 != 0 { return Ok(Unit{}) }
-    return rs.checkTime()
-}
-
-// tick for n rows at once (a batch: 9.47).
-fn (rs: mut &Run) tickN(n: int): Result[Unit, DbErr] {
-    rs.ticks += n
-    return rs.checkTime()
-}
-
-fn (rs: mut &Run) checkTime(): Result[Unit, DbErr] {
-    let now = time.monotonicNs()
-    if rs.deadline != 0 && now > rs.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
-    if rs.turnEnd == 0 {
-        rs.turnEnd = now + TURN_NS
-    } else if now > rs.turnEnd {
-        // a yield looks at the sockets: a session whose query has arrived runs
-        match task.yield() {
-            Ok(_) {}
-            Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
-        }
-        rs.turnEnd = time.monotonicNs() + TURN_NS
-    }
-    return Ok(Unit{})
-}
-
-// About the memory a row takes: its array, and per value its tag and
-// payload (text and numbers their bytes).
-fn rowBytes(r: &[]Val): int {
-    var n = 32
-    for v in r {
-        n += 24
-        match v {
-            Val.Text(t) { n += len(t) }
-            Val.Num(_) { n += 32 }
-            Val.Ival(_) { n += 24 }
-            else {}
-        }
-    }
-    return n
-}
-
-fn rowsBytes(rows: &[][]Val): int {
-    var n = 24
-    for r in rows { n += rowBytes(&r) }
-    return n
 }
 
 // A subquery's kept result: its rows, its set's and groups' keys.
 fn resBytes(r: &SubRes): int {
-    var n = 96 + rowsBytes(&r.data)
+    var n = 96 + lexdb_pipe.rowsBytes(&r.data)
     for i in 0..r.set.size() { n += 48 + len(r.set.keyAt(i)) }
     for i in 0..r.groups.size() { n += 48 + len(r.groups.keyAt(i)) }
-    n += rowBytes(&r.vals)
+    n += lexdb_pipe.rowBytes(&r.vals)
     return n
 }
 
@@ -2566,7 +2474,7 @@ pub const MAX_MATCH_STEPS = 10000000
 
 // What a subquery did: runs, results taken from the cache, and its own
 // counts and subqueries' over all its runs.
-type SubStat = record { runs: int; hits: int; cnt: []Counts; inner: []SubStat }
+type SubStat = record { runs: int; hits: int; cnt: []lexdb_pipe.Counts; inner: []SubStat }
 
 fn newRun(q: &Query): Run {
     var seen: [][]bool = []
@@ -2579,9 +2487,9 @@ fn newRun(q: &Query): Run {
         append(mut &memoRes, [])
         append(mut &stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []})
     }
-    return Run{noLimit: false, cnt: array(len(q.levels), Counts{starts: 0, read: 0, joined: 0, nulls: 0, built: 0, kept: 0, unmatched: 0, batches: 0, switched: 0}),
+    return Run{noLimit: false, cnt: array(len(q.levels), lexdb_pipe.noCounts()),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               held: 0, aside: 0, maxHeld: 0, deadline: 0, ticks: 0, turnEnd: 0, batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: ""}
+               bud: lexdb_pipe.newBudget(), batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: ""}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -5565,7 +5473,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 }
             }
             rs.cnt[k].built += len(rows)
-            try rs.hold(rowsBytes(&rows))
+            try rs.bud.hold(lexdb_pipe.rowsBytes(&rows))
             let keepAll = keepsRight(lv.join)
             for i in 0..len(rows) {
                 let r = replace(mut &rows[i], [])
@@ -5655,7 +5563,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
 // next level if it joins: -1 stop, 0 it does not join, 1 it joined.
 fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, r: &[]Val, ri: int,
           row: mut &[]Val, params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
-    try rs.tick()
+    try rs.bud.tick()
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i] }
     rs.cnt[k].read += 1
@@ -5893,7 +5801,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 var batch: [][]Val = []
                 try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
                 for r in batch {
-                    try rs.tick()
+                    try rs.bud.tick()
                     for i in 0..len(r) { row[lv.first + i] = r[i] }
                     rs.cnt[k].read += 1
                     if try allTrueC(st, txn, q, m, &lv.cond, (if len(m.cc) > 0 { &m.cc[k] } else { &q.cc[k] }), row, params, rs) {
@@ -5939,7 +5847,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             var res = try runChild(st, txn, &q.subs[i].sel, &ps, -1, rs, i)
             rows = replace(mut &res.rows, [])
             if len(rs.memoRes[i]) < MEMO_MAX {
-                try rs.hold(rowsBytes(&rows) + len(key) + 48)
+                try rs.bud.hold(lexdb_pipe.rowsBytes(&rows) + len(key) + 48)
                 at = len(rs.memoRes[i])
                 rs.memo[i].put(key, at)
                 append(mut &rs.memoRes[i], emptyRes())
@@ -5964,7 +5872,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             while true {
                 let c = try lexdb_ops.compare(&v, &sr.vals[1])
                 if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
-                try rs.tick()
+                try rs.bud.tick()
                 rs.cnt[k].read += 1
                 rs.cnt[k].joined += 1
                 row[lv.first] = v
@@ -7824,7 +7732,7 @@ fn subValue(n: &str, r: &SubRes, x: &Val, z: &lexdb_time.Zone): Val {
     return r.val
 }
 
-fn addCounts(a: mut &[]Counts, b: &[]Counts) {
+fn addCounts(a: mut &[]lexdb_pipe.Counts, b: &[]lexdb_pipe.Counts) {
     if len(a) == 0 {
         for c in b { append(a, c) }
         return
@@ -7870,7 +7778,7 @@ fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
     out.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
     if sp.cte >= 0 {
-        try parent.hold(rowsBytes(&out.data))
+        try parent.bud.hold(lexdb_pipe.rowsBytes(&out.data))
         cachePut(mut &parent.cache, key, copyRows(&out.data))
     }
     return Ok(out)
@@ -7913,18 +7821,18 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     var rs = newRun(&sel.q)
     rs.maxRounds = parent.maxRounds
     rs.maxSteps = parent.maxSteps
-    rs.maxHeld = parent.maxHeld
-    rs.deadline = parent.deadline
+    rs.bud.maxHeld = parent.bud.maxHeld
+    rs.bud.deadline = parent.bud.deadline
     rs.batch = parent.batch
     rs.writes = parent.writes
-    rs.held = parent.held
-    rs.ticks = parent.ticks
-    rs.turnEnd = parent.turnEnd
+    rs.bud.held = parent.bud.held
+    rs.bud.ticks = parent.bud.ticks
+    rs.bud.turnEnd = parent.bud.turnEnd
     rs.cache = replace(mut &parent.cache, newCache())
     let r = execSel(st, txn, sel, params, cap, mut &rs)
     parent.cache = replace(mut &rs.cache, newCache())
-    parent.ticks = rs.ticks
-    parent.turnEnd = rs.turnEnd
+    parent.bud.ticks = rs.bud.ticks
+    parent.bud.turnEnd = rs.bud.turnEnd
     while len(parent.stats) <= i { append(mut &parent.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
     parent.stats[i].runs += 1
     addCounts(mut &parent.stats[i].cnt, &rs.cnt)
@@ -8185,7 +8093,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
             cur[i] = subValue(&n, &r, &xv, &envZone(env))
             if len(rs.memoRes[i]) < MEMO_MAX {
-                try rs.hold(resBytes(&r) + len(key) + 48)
+                try rs.bud.hold(resBytes(&r) + len(key) + 48)
                 rs.memo[i].put(key, len(rs.memoRes[i]))
                 append(mut &rs.memoRes[i], r)
             }
@@ -8363,7 +8271,7 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         } else {
             append(mut &m.subs, try runSub(st, txn, sp, &ps, rs, i))
         }
-        try rs.hold(resBytes(&m.subs[len(m.subs) - 1]))
+        try rs.bud.hold(resBytes(&m.subs[len(m.subs) - 1]))
     }
     // the levels' rows: a subquery's (each is read by one level), a working table's
     for k in 0..len(q.levels) {
@@ -8443,7 +8351,7 @@ fn physOf(sel: &Sel): lexdb_plan.PPlan {
 
 // EXPLAIN's lines for q's subqueries (subs: their plans, subsOf).
 fn subLines(q: &Query, subs: &[]lexdb_plan.PSub, stats: &[]SubStat, out: mut &[]str) {
-    let none: []Counts = []
+    let none: []lexdb_pipe.Counts = []
     let noStats: []SubStat = []
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
@@ -8521,7 +8429,7 @@ fn pathText(lv: &Level): str {
 }
 
 // EXPLAIN: a line per table; with counts (EXPLAIN ANALYZE), what each did.
-fn explainLines(q: &Query, cnt: &[]Counts): []str {
+fn explainLines(q: &Query, cnt: &[]lexdb_pipe.Counts): []str {
     var out: []str = []
     for k in 0..len(q.levels) {
         var tail = ""
@@ -9779,12 +9687,12 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         rs.limit(&lim)
         rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
         let m = try prepare(st, txn, &q, &noParams, mut &rs)
-        let room = rs.room()
-        let max = rs.maxHeld
+        let room = rs.bud.room()
+        let max = rs.bud.maxHeld
         var held = 0
         try runQuery(st, txn, &q, &m, &noParams, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-            held += 2 * rowBytes(r)             // the row found, and its new one
-            if room >= 0 && held > room { return Err(memErr(max)) }
+            held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its new one
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(max)) }
             append(mut &found, collections.copyOf(r))
             return Ok(true)
         }, mut &rs)
@@ -9928,7 +9836,7 @@ fn rwAdd(t: &Table, row: &[]Val, out: mut &lexdb_access.Build, room: int): Resul
     try lexdb_access.buildAdd(&lexdb_catalog.relOf(t), out, row,
                               fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
                               fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) })
-    if room >= 0 && out.held > room { return Err(memErr(room)) }
+    if room >= 0 && out.held > room { return Err(lexdb_pipe.memErr(room)) }
     return Ok(Unit{})
 }
 
@@ -11687,8 +11595,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     rs.after = win.after
     var m = try prepare(st, txn, &q, params, mut &rs)
-    let room = rs.room()
-    let max = rs.maxHeld
+    let room = rs.bud.room()
+    let max = rs.bud.maxHeld
     var held = 0
     let wn = win.n
     // a key changed: FOR UPDATE's lock, else FOR NO KEY UPDATE's (9.86)
@@ -11697,8 +11605,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let reads0 = txn.readCount()
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-            held += 2 * rowBytes(r)             // the row found, and its write
-            if room >= 0 && held > room { return Err(memErr(max)) }
+            held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(max)) }
             append(mut &found, collections.copyOf(r))
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
@@ -11786,15 +11694,15 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     if win.keyed { rs.after = win.after }
     var m = try prepare(st, txn, &q, params, mut &rs)
-    let room = rs.room()
-    let max = rs.maxHeld
+    let room = rs.bud.room()
+    let max = rs.bud.maxHeld
     var held = 0
     let wn = win.n
     let reads0 = txn.readCount()
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-            held += 2 * rowBytes(r)             // the row found, and its write
-            if room >= 0 && held > room { return Err(memErr(max)) }
+            held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(max)) }
             append(mut &found, collections.copyOf(r))
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
@@ -12530,16 +12438,16 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     var m = try prepare(st, txn, &q, params, mut &rs)
-    let room = rs.room()
-    let max = rs.maxHeld
+    let room = rs.bud.room()
+    let max = rs.bud.maxHeld
     var held = 0
     var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
     for c in cl { for k in c.targets { for p in t.pk { if p == k && c.act == lexdb_sql.MA_UPDATE { lmode = lexdb_sql.LOCK_UPDATE } } } }
     let reads0 = txn.readCount()
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-            held += 2 * rowBytes(r)             // the row found, and its write
-            if room >= 0 && held > room { return Err(memErr(max)) }
+            held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(max)) }
             append(mut &found, collections.copyOf(r))
             return Ok(true)
         }, mut &rs)
@@ -12712,7 +12620,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
     let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}], rows: [], tag: "EXPLAIN", hasRows: true, copy: COPY_NONE}
     var lines: []str = []
-    let none: []Counts = []
+    let none: []lexdb_pipe.Counts = []
     if x.ifFlag {
         // ANALYZE: run it, counting what each table does
         let t0 = time.monotonicNs()
@@ -13281,8 +13189,8 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
                 Some(i) { g = i }
                 None {
                     g = len(gs.firsts)
-                    held += rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
-                    if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                    held += lexdb_pipe.rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                    if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     gs.index.put(k, g)
                     append(mut &gs.firsts, collections.copyOf(r))
                     append(mut &gs.accs, newAccs(len(sel.specs)))
@@ -13305,8 +13213,8 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
             Some(i) { g = i }
             None {
                 g = len(gs.firsts)
-                held += rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
-                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                held += lexdb_pipe.rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 gs.index.put(k, g)
                 append(mut &gs.firsts, collections.copyOf(r))
                 append(mut &gs.accs, newAccs(len(sel.specs)))
@@ -14730,10 +14638,10 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     if sel.rec >= 0 { return runRecursive(st, txn, sel, &lp, &rp, rs) }
     var lres = try runChild(st, txn, &sel.parts[0], &lp, -1, rs, 0)
     try convRows(mut &lres.rows, sel, 1, &txn.sql.zone)
-    try rs.hold(rowsBytes(&lres.rows))
+    try rs.bud.hold(lexdb_pipe.rowsBytes(&lres.rows))
     var rres = try runChild(st, txn, &sel.parts[1], &rp, -1, rs, 1)
     try convRows(mut &rres.rows, sel, 2, &txn.sql.zone)
-    try rs.hold(rowsBytes(&rres.rows))
+    try rs.bud.hold(lexdb_pipe.rowsBytes(&rres.rows))
     return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, []), &sel.outKinds))
 }
 
@@ -14751,8 +14659,8 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
     // max_recursion: rounds that add rows (the last round, adding none, is free)
     var rounds = 0
     while len(work) > 0 {
-        try rs.tick()
-        try rs.hold(rowsBytes(&work) * 2)       // kept in the result and as the working table
+        try rs.bud.tick()
+        try rs.bud.hold(lexdb_pipe.rowsBytes(&work) * 2)       // kept in the result and as the working table
         for r in work { append(mut &out, collections.copyOf(&r)) }
         cachePut(mut &rs.cache, key, work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
@@ -14770,13 +14678,13 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
 // EXPLAIN's lines for a planned SELECT.
 // EXPLAIN's lines for a planned Sel: its operators (physOf), then its
 // subqueries'; with counts (EXPLAIN ANALYZE), what each table did.
-fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
+fn selLines(sel: &Sel, cnt: &[]lexdb_pipe.Counts, stats: &[]SubStat): []str {
     let p = physOf(sel)
     return planLines(sel, &p, cnt, stats)
 }
 
 // selLines over sel's operators p.
-fn planLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]Counts, stats: &[]SubStat): []str {
+fn planLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, stats: &[]SubStat): []str {
     if sel.setop != 0 { return setLines(sel, p, stats) }
     var lines: []str = []
     opLines(sel, p, cnt, mut &lines)
@@ -14787,7 +14695,7 @@ fn planLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]Counts, stats: &[]SubStat)
 // An operator's line after its input's (a table's each: explainLines),
 // MATCH_RECOGNIZE's before them; those that print none: the window calls,
 // the select list, a lock, a LIMIT the scan does not stop for.
-fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]Counts, out: mut &[]str) {
+fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut &[]str) {
     match p {
         lexdb_plan.PPlan.Levels(_, _) { for l in explainLines(&sel.q, cnt) { append(out, l) } }
         lexdb_plan.PPlan.Result(_) {
@@ -14837,7 +14745,7 @@ fn setLines(sel: &Sel, p: &lexdb_plan.PPlan, stats: &[]SubStat): []str {
     var lines: []str = []
     let op = if sel.setop == lexdb_sql.SET_UNION { "union" } else if sel.setop == lexdb_sql.SET_INTERSECT { "intersect" } else { "except" }
     append(mut &lines, (if sel.rec >= 0 { "recursive " } else { "" }) + op + (if sel.setAll { " all" } else { "" }))
-    let none: []Counts = []
+    let none: []lexdb_pipe.Counts = []
     let noStats: []SubStat = []
     match lexdb_plan.pLeaf(p) {
         lexdb_plan.PPlan.SetOp(_, _, _, parts, _) {
@@ -15350,7 +15258,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     var bases: []WinRow = []
     var outRows: []OutRow = []
     // the rows kept here, counted in the row callbacks (they cannot reach rs)
-    let room = rs.room()
+    let room = rs.bud.room()
     var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
@@ -15363,11 +15271,11 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 let env = Env{cols: &noCols, row: &vals, aggs: &none, params: params, subs: &m.subs, cur: &none, seq: sqe}
                 for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderValue(&sel.order[oi], &sel.outs, &vals, &env))) }
             }
-            held += rowBytes(&ord)
+            held += lexdb_pipe.rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     }
-    let rs0max = rs.maxHeld
+    let rs0max = rs.bud.maxHeld
     let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct) && !windowed
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
@@ -15389,8 +15297,8 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && lexdb_ops.isNull(&r[sel.first]) { return Ok(true) }
             if later {
-                held += rowBytes(r)
-                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                held += lexdb_pipe.rowBytes(r)
+                if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 append(mut &kept, collections.copyOf(r))
                 return Ok(sel.first < 0)
             }
@@ -15450,7 +15358,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 }
                 var ord: []Val = []
                 if sorting { for o in sel.gord[si] { append(mut &ord, try orderX(st, txn, q, &o, &sel.outs, &out, &env, rs)) } }
-                held += rowBytes(&out) + rowBytes(&ord)
+                held += lexdb_pipe.rowBytes(&out) + lexdb_pipe.rowBytes(&ord)
                 append(mut &outRows, OutRow{vals: out, ord: ord})
                 continue
             }
@@ -15471,7 +15379,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             var ord: []Val = []
             if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &out, &env, rs))) } }
-            held += rowBytes(&out) + rowBytes(&ord)
+            held += lexdb_pipe.rowBytes(&out) + lexdb_pipe.rowBytes(&ord)
             append(mut &outRows, OutRow{vals: out, ord: ord})
         }
     } else if late {
@@ -15481,8 +15389,8 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         if windowed && len(sel.feedback) == 0 { fromBatches = try winBatch(st, txn, q, &m, params, rs, mut &raws, mut &held, room, rs0max) }
         if !fromBatches {
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-            held += rowBytes(r)
-            if room >= 0 && held > room { return Err(memErr(rs0max)) }
+            held += lexdb_pipe.rowBytes(r)
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
             append(mut &raws, collections.copyOf(r))
             return Ok(!early || len(raws) < stopAt)
         }, rs)
@@ -15516,7 +15424,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     let k = sel.feedback[i]
                     if k > 0 && k <= len(pv) && i < len(vals) { pv[k - 1] = vals[i] }
                 }
-                held += rowBytes(&vals)
+                held += lexdb_pipe.rowBytes(&vals)
                 append(mut &outRows, OutRow{vals: vals, ord: []})
             }
             raws = []
@@ -15539,7 +15447,7 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             var ord: []Val = []
             if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &vals, &env, rs))) } }
-            held += rowBytes(&vals) + rowBytes(&ord)
+            held += lexdb_pipe.rowBytes(&vals) + lexdb_pipe.rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
@@ -15580,14 +15488,14 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 // after the last kept, or tied with it: the full sort puts it after
                 if barSet && ordCmp(sel, &ord, &bar) >= 0 { return Ok(true) }
             }
-            held += rowBytes(&vals) + rowBytes(&ord)
-            if room >= 0 && held > room { return Err(memErr(rs0max)) }
+            held += lexdb_pipe.rowBytes(&vals) + lexdb_pipe.rowBytes(&ord)
+            if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
             append(mut &outRows, OutRow{vals: vals, ord: ord})
             if topK > 0 && len(outRows) >= 2 * topK + 16 {
                 bar = keepFirst(sel, mut &outRows, topK)
                 barSet = true
                 held = 0
-                for o in outRows { held += rowBytes(&o.vals) + rowBytes(&o.ord) }
+                for o in outRows { held += lexdb_pipe.rowBytes(&o.vals) + lexdb_pipe.rowBytes(&o.ord) }
             }
             return Ok(!early || len(outRows) < stopAt)
         }, rs)
@@ -15629,11 +15537,11 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             var ord: []Val = []
             if sorting { for oi in 0..len(sel.order) { append(mut &ord, ordVal(sel, oi, try orderX(st, txn, q, &sel.order[oi], &sel.outs, &vals, &env, rs))) } }
-            held += rowBytes(&vals) + rowBytes(&ord)
+            held += lexdb_pipe.rowBytes(&vals) + lexdb_pipe.rowBytes(&ord)
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     }
-    try rs.hold(held)
+    try rs.bud.hold(held)
     if hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
     // (rows assigned in their order are in it already)
     if sorting && len(sel.feedback) == 0 { sortOutRows(sel, mut &outRows) }
@@ -15725,12 +15633,12 @@ fn winBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     r[lv.first + i] = v
                 }
                 held += n
-                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 append(raws, r)
             }
             rs.cnt[0].read += nr
             rs.cnt[0].joined += len(pk.idx)
-            try rs.tickN(nr)
+            try rs.bud.tickN(nr)
         }
         while rowPath && !cur.done {
             var batch: [][]Val = []
@@ -15738,8 +15646,8 @@ fn winBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             var row: []Val = array(nq, Val.Null)
             for r in batch {
                 let got2 = try tryRow(st, txn, q, m, 0, &r, -1, mut &row, params, fn(tx: mut &lexdb_store.Txn, x: &[]Val): Result[bool, DbErr] {
-                    held += rowBytes(x)
-                    if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                    held += lexdb_pipe.rowBytes(x)
+                    if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     append(raws, collections.copyOf(x))
                     return Ok(true)
                 }, rs)
@@ -22765,7 +22673,7 @@ fn bUnmatched(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     }
     let n = len(idx)
     rs.cnt[k].unmatched += n
-    try rs.tickN(n)
+    try rs.bud.tickN(n)
     let nq = len(q.cols)
     let mask = if len(jl.post) > 0 { &jl.cand } else { &jl.after }
     var cur = bJoined(nq, n)
@@ -23149,7 +23057,7 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
     for c in 0..len(bp.needCol) { if bp.needCol[c] { nNeed += 1 } }
     let perRow = 32 + 24 * nNeed
     // (less what a grouping or a sort holds and has not yet given to rs)
-    let room0 = if rs.maxHeld > 0 { rs.maxHeld - rs.held - rs.aside } else { -1 }
+    let room0 = if rs.bud.maxHeld > 0 { rs.bud.maxHeld - rs.bud.held - rs.bud.aside } else { -1 }
     let nk = pr.count()
     let ranged = match try lexdb_access.rangeMany(st, txn, &lexdb_catalog.relOf(t), p.index, &pr, &jl.tail, jl.noRange, one, &bp, part,
                                                   room0, perRow) {
@@ -23168,9 +23076,9 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
         }
     }
     if room0 >= 0 && held > room0 { return Ok(None) }
-    rs.held += held
+    rs.bud.held += held
     rs.cnt[k].starts += n
-    try rs.tickN(rows.n)
+    try rs.bud.tickN(rows.n)
     // the candidates, in the batch's order
     var pj: []int = withCapacity(rows.n)
     var pi: []int = withCapacity(rows.n)
@@ -23181,7 +23089,7 @@ fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPl
         }
     }
     let out = bJoinTail(q, jp, jl, j, &pj, &pi, rows, rs)
-    rs.held -= held
+    rs.bud.held -= held
     let b = try out
     // counted only when the batch joined, not when it gave way
     if b.isSome() && !lv.semi && !lv.anti { rangeJoinBatches += 1 }
@@ -23212,7 +23120,7 @@ fn bJoinTail(q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, pj: &[]int, pi: &[]i
     let lv = &q.levels[k]
     let n = j.n
     rs.cnt[k].read += len(pj)
-    try rs.tickN(len(pj))
+    try rs.bud.tickN(len(pj))
     // the candidates joined: the batch's columns and the table's
     let nq = len(q.cols)
     var cand = bJoined(nq, len(pj))
@@ -23404,7 +23312,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
             }
             if joined {
                 // (the batch's counts so far, for the row path to count it again)
-                var cntB: []Counts = []
+                var cntB: []lexdb_pipe.Counts = []
                 for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
                 if got3.isNone() {
@@ -23417,7 +23325,7 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 rs.cnt[0].batches += 1
                 rs.cnt[0].read += nr
                 rs.cnt[0].joined += len(idx)
-                try rs.tickN(nr)
+                try rs.bud.tickN(nr)
                 for r in 0..jb.n {
                     for c in 0..len(row) {
                         row[c] = if jpl.need[c] && !jb.cols[c].nul[r] { bValAt(&jb, c, jpl.kinds[c], r) } else { Val.Null }
@@ -23453,13 +23361,13 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 }
                 rs.cnt[0].read += nr - len(idx) + went
                 rs.cnt[0].joined += went
-                try rs.tickN(nr - len(idx) + went)
+                try rs.bud.tickN(nr - len(idx) + went)
                 if stopped { return Ok(1) }
                 spare = b
                 continue
             }
             // the rows dropped count as read, as the row path counts them
-            try rs.tickN(nr - len(idx))
+            try rs.bud.tickN(nr - len(idx))
             rs.cnt[0].read += nr - len(idx)
             for j in idx {
                 let r = bRow(&b, j, &bp.kinds, &bp.needCol)
@@ -23839,7 +23747,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // DISTINCT with LIMIT and no ORDER BY: the scan stops at the rows wanted
     let early = !sorting && limit >= 0
     let stopAt = if offset > 0 { limit + offset } else { limit }
-    var cnt0: []Counts = []
+    var cnt0: []lexdb_pipe.Counts = []
     for c in rs.cnt { append(mut &cnt0, c) }
     var set = SortSet{outs: [], ovals: [], keys: [], vk: array(nk, 0), seq: [], bytes: [], n: 0}
     for o in 0..no {
@@ -23862,8 +23770,8 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     var scr = -1                        // top-N: the slot a row is tried in
     var held = 0
     var seq = 0
-    let room = rs.room()
-    let rs0max = rs.maxHeld
+    let room = rs.bud.room()
+    let rs0max = rs.bud.maxHeld
     var stopped = false
     // top-N whose first key is an integer column of the first table: that
     // column decoded first, with the conditions', and a row it puts after
@@ -23897,9 +23805,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             if nr == 0 { continue }
             let nChosen = pk.kept
             if op.joined {
-                rs.aside = held + 0
+                rs.bud.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
-                rs.aside = 0
+                rs.bud.aside = 0
                 if got3.isNone() {
                     rs.cnt = cnt0
                     return Ok(false)
@@ -24034,7 +23942,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                     set.n += 1
                     held += kb2 + ob
                 }
-                if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 if early && set.n >= stopAt {
                     went = j + 1
                     stopped = true
@@ -24045,11 +23953,11 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             if op.joined {
                 rs.cnt[0].read += nr
                 rs.cnt[0].joined += nChosen
-                try rs.tickN(nr)
+                try rs.bud.tickN(nr)
             } else {
                 rs.cnt[0].read += nr - nChosen + went
                 rs.cnt[0].joined += went
-                try rs.tickN(nr - nChosen + went)
+                try rs.bud.tickN(nr - nChosen + went)
             }
             if stopped { break }
         }
@@ -24079,7 +23987,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     } else {
         for i in 0..set.n { append(mut &perm, i) }
     }
-    try rs.hold(held)
+    try rs.bud.hold(held)
     let from = min(if offset > 0 { offset } else { 0 }, len(perm))
     var to = len(perm)
     if limit >= 0 && from + limit < to { to = from + limit }
@@ -24164,7 +24072,7 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             if op.joined {
                 // the joined rows (9.102): the batch's rows from here on
                 // (the batch's counts so far, for the row path to count it again)
-                var cntB: []Counts = []
+                var cntB: []lexdb_pipe.Counts = []
                 for c in rs.cnt { append(mut &cntB, c) }
                 let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
                 if got3.isNone() {
@@ -24203,11 +24111,11 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 // (the first table's rows all counted: a LIMIT ends the scan with the batch)
                 rs.cnt[0].read += nRead
                 rs.cnt[0].joined += nChosen
-                try rs.tickN(nRead)
+                try rs.bud.tickN(nRead)
             } else {
                 rs.cnt[0].read += nr - len(idx) + take
                 rs.cnt[0].joined += take
-                try rs.tickN(nr - len(idx) + take)
+                try rs.bud.tickN(nr - len(idx) + take)
             }
             if take > 0 {
                 var ob = OutBatch{n: take, kinds: collections.copyOf(&op.kinds), src: srcs, idx: move(idx),
@@ -24257,7 +24165,7 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     let h0: int = held + 0
     // the counts so far: each try counts from the start again (a try that
     // gave way would have them twice)
-    var cnt0: []Counts = []
+    var cnt0: []lexdb_pipe.Counts = []
     for c in rs.cnt { append(mut &cnt0, c) }
     var usedDec = false
     match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, true, mut &usedDec) {
@@ -24279,8 +24187,8 @@ fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     return Ok(again)
 }
 
-fn copyCounts(cs: &[]Counts): []Counts {
-    var out: []Counts = []
+fn copyCounts(cs: &[]lexdb_pipe.Counts): []lexdb_pipe.Counts {
+    var out: []lexdb_pipe.Counts = []
     for c in cs { append(mut &out, c) }
     return out
 }
@@ -24611,7 +24519,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             read = true
             let nr = b.n
             if nr == 0 { continue }
-            try rs.tickN(nr)
+            try rs.bud.tickN(nr)
             nRead += nr
             nBatches += 1
             // WHERE: the rows chosen, narrowed condition by condition
@@ -24625,9 +24533,9 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             }
             nJoined += len(idx)
             if jn {
-                rs.aside = held + 0
+                rs.bud.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &jp, &b, &idx, &zone, rs)
-                rs.aside = 0
+                rs.bud.aside = 0
                 if got3.isNone() {
                     held -= added
                     return Ok(false)
@@ -24652,7 +24560,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                     ngroups += 1
                     held += cost
                     added += cost
-                    if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                    if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     for i in 0..ns {
                         append(mut &an[i], 0)
                         append(mut &asum[i], 0)
@@ -24715,7 +24623,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                         let cost = bFirstVals(&b, idx[j], &rowKinds, &fcols, mut &fv) + 64 * (len(sel.specs) + 1) + klen
                         held += cost
                         added += cost
-                        if room >= 0 && held > room { return Err(memErr(rs0max)) }
+                        if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                         for i in 0..ns {
                             append(mut &an[i], 0)
                             append(mut &asum[i], 0)
@@ -27666,16 +27574,16 @@ fn mrHolds(mi: &MrIn, v: int, pos: int, lab: &[]int, s: int, mno: int, slots: mu
 fn mrAttempt(mi: &MrIn, m: mut &lexdb_match.Matcher, s: int, mno: int, rs: mut &Run, slots: mut &[]Val): Result[lexdb_match.Found, DbErr] {
     let maxSteps = rs.maxSteps
     let holds = fn(v: int, pos: int, lab: &[]int): Result[bool, DbErr] { return mrHolds(mi, v, pos, lab, s, mno, mut &slots) }
-    let tick = fn(): Result[Unit, DbErr] { return rs.tick() }
+    let tick = fn(): Result[Unit, DbErr] { return rs.bud.tick() }
     return m.attempt(&mi.pl.prog, mi.lo, mi.hi, s, mi.pl.local, maxSteps, holds, tick)
 }
 
 // One output row: the input row's columns and the measures' values.
 fn mrPush(mi: &MrIn, row: &[]Val, mv: &[]Val, out: mut &[][]Val, rs: mut &Run): Result[Unit, DbErr] {
-    try rs.tick()
+    try rs.bud.tick()
     var o: []Val = withCapacity(len(mi.pl.outFrom))
     for f in mi.pl.outFrom { append(mut &o, if f >= 0 { row[f] } else if len(mv) > 0 { mv[-1 - f] } else { Val.Null }) }
-    try rs.hold(rowBytes(&o))
+    try rs.bud.hold(lexdb_pipe.rowBytes(&o))
     append(out, o)
     return Ok(Unit{})
 }
@@ -27711,7 +27619,7 @@ fn mrPartition(mi: &MrIn, rs: mut &Run, out: mut &[][]Val, heldM: mut &int): Res
         let f = try mrAttempt(mi, mut &m, s, mno, rs, mut &slots)
         let b = m.bytes()
         if b > heldM {
-            try rs.hold(b - heldM)
+            try rs.bud.hold(b - heldM)
             heldM = b
         }
         if f.over { return Err(mrSteps(pl, rs)) }
@@ -27777,7 +27685,7 @@ fn execMatch(pl: &MrPlan, r: Res, params: &[]Val, rs: mut &Run): Result[Res, DbE
     for j in 0..nk {
         var col: []Val = withCapacity(n)
         for i in 0..n {
-            try rs.tick()
+            try rs.bud.tick()
             if pl.keyAt[j] >= 0 {
                 append(mut &col, rows[i][pl.keyAt[j]])
             } else {
