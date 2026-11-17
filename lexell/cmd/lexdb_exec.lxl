@@ -6566,8 +6566,6 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var sel = try planSelect(st, txn, s, params, sc)
     if len(s.mr) > 0 {
         try planMatch(st, txn, &s.mr[0], mut &sel, params, sc)
-        let mcols = outBCols(&sel.mr[0].outs)
-        sel.lp = lexdb_bind.LPlan.Match(replace(mut &sel.lp, lexdb_bind.noPlan()), mcols)
     }
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
@@ -11323,7 +11321,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         // rows it inserts.
         let noTypes: []int = []
         var ssc = newScopeIn(st, txn, params, &noTypes)
-        let sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        // the logical plan (read by nothing yet): the query's plan its source
+        let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), copyInts(&targets), takeLp(mut &sel), retBCols(&ret))
         let defs = try defaultsOf(st, txn, &t)
         let fw = try fkTables(st, txn, &t, true, parents)
         var later: []FkLater = []
@@ -11343,6 +11343,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
         try fkFinish(st, txn, &fw, mut &later)
     } else {
+        // the logical plan (read by nothing yet): VALUES its source, its rows the statement's
+        let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), copyInts(&targets),
+                                         lexdb_bind.LPlan.Values(if len(s.rows) > 0 { len(s.rows[0]) } else { 0 }, [], []), retBCols(&ret))
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
@@ -11444,6 +11447,12 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
         if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
     }
     return Ok(r)
+}
+
+// RETURNING's columns as a DML operator's (LPlan.Insert and the like): [] none.
+fn retBCols(r: &Ret): []lexdb_bind.BCol {
+    if !r.on { return [] }
+    return outBCols(&r.outs)
 }
 
 fn retAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
@@ -11781,6 +11790,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         append(mut &sets, lexdb_bind.bpAssign(try lexdb_bind.resolve(&set.expr, &q.cols, len(q.cols), mut &sc.names), &q.levels[0].t.cols[i].typ, &q.cols, &typing()))
     }
     var ret = try retOf(s, &q, mut &sc)
+    // the logical plan (read by nothing yet): the FROM and WHERE part its source
+    let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), copyInts(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
     if win.n > 0 {
         // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
@@ -11875,6 +11886,8 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
+    // the logical plan (read by nothing yet): the FROM and WHERE part its source
+    let lp = lexdb_bind.LPlan.Delete(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
     delNarrow(mut &q, s)
     // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
@@ -12634,6 +12647,8 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         ret.outs = try lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &ret.exprs)
         for x in ret.exprs { if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) } }
     }
+    // the logical plan (read by nothing yet): the source joined to the target its source
+    let lp = lexdb_bind.LPlan.Merge(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
     var found: [][]Val = []
     var rs = newRun(&q)
@@ -14485,7 +14500,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &desc, false)
         append(mut &nullsFirst, false)
     }
-    let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
+    // FOR UPDATE and the like: a Lock over the FROM and WHERE part, with
+    // the levels applyLocks locks
+    var base = replace(mut &q.lp, lexdb_bind.noPlan())
+    if s.lockMode > 0 {
+        var lv: []int = []
+        for k in 0..len(q.levels) { if q.levels[k].lock != 0 { append(mut &lv, k) } }
+        base = lexdb_bind.LPlan.Lock(base, s.lockMode, s.lockWait, lv, [])
+    }
+    let lp = selPlan(base, s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
                      len(specs), bh, bw, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
                      copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
@@ -14639,7 +14662,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let lpr = takeLp(mut &r)
     let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, outBCols(&outs)) }
               else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, outBCols(&outs)) }
-    let lp = topPlan(set, s, cloneAll(&order), copyBools(&desc), copyBools(&nullsFirst))
+    // the Sort lends its keys (Sel.order, lexdb_bind.lpLentOrder)
+    let lp = topPlan(set, s, [], copyBools(&desc), copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
@@ -27445,7 +27469,9 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
     let unknown = fn(c: &str): DbErr {
         return mrErr(d, 904, &("\"" + strings.toUpperAscii(&(c.toStr())) + "\": invalid identifier"), "42703", 207, &("column \"" + c + "\" does not exist"))
     }
-    // keys: PARTITION BY, then ORDER BY
+    // keys: PARTITION BY, then ORDER BY (the plan's, lpOrder: as resolved;
+    // the planner's, keyX: collation keys)
+    var lpOrder: []Expr = []
     var keyX: []Expr = []
     var keyAt: []int = []
     var desc: []bool = []
@@ -27465,7 +27491,8 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         let r = try lexdb_bind.resolve(&o.expr, &rw.inCols, nIn, mut &sc.names)
         let k = lexdb_bind.exprKind(&r, &rw.inCols, &sc.names)
         append(mut &keyAt, if k == lexdb_sql.COLL_EXACT { colAtOf(&r, &rw.inCols) } else { -1 })
-        append(mut &keyX, lexdb_bind.collKeyOf(k, r))
+        append(mut &keyX, lexdb_bind.collKeyOf(k, clone(&r)))
+        append(mut &lpOrder, r)
         append(mut &desc, o.desc)
         append(mut &nullsFirst, o.nullsFirst)
         match o.expr {
@@ -27486,7 +27513,9 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         return Err(mrErr(d, 62518, "MATCH_RECOGNIZE pattern is too large.", "54001", 0, "MATCH_RECOGNIZE pattern is too large"))
     }
     let prog = cr.unwrap()
-    // DEFINE
+    // DEFINE (the plan's, lpDefs: as resolved, navigations marked; the
+    // planner's, defs: the marks as slots)
+    var lpDefs: []Option[Expr] = []
     var defs: []Option[Expr] = []
     var defNavs: [][]int = []
     var local = true
@@ -27495,6 +27524,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         for i in 0..len(m.defines) { if m.defines[i].v == v { found = i } }
         if found < 0 {
             append(mut &defs, None)
+            append(mut &lpDefs, None)
             append(mut &defNavs, [])
             continue
         }
@@ -27508,10 +27538,12 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         for k in n0..len(rw.navs) { append(mut &ids, k) }
         if !mrLocal(&rw.navs, &ids, v) { local = false }
         append(mut &defs, Some(e3))
+        append(mut &lpDefs, Some(e2))
         append(mut &defNavs, ids)
     }
     rw.inDefine = false
-    // MEASURES
+    // MEASURES (lpMeas and meas as DEFINE's)
+    var lpMeas: []Expr = []
     var meas: []Expr = []
     var measNavs: [][]int = []
     var measOuts: []OutCol = []
@@ -27544,6 +27576,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         if isCls { oid = lexdb_sql.OID_TEXT }
         if isMno { oid = lexdb_sql.OID_INT8 }
         append(mut &meas, e3)
+        append(mut &lpMeas, e2)
         append(mut &measNavs, ids)
         append(mut &measOuts, OutCol{name: it.alias, oid: oid, spell: it.spell, coll: if isCls || isMno { "" } else { cname }, scale: sc2})
     }
@@ -27592,6 +27625,10 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
             for s in m.subsets { if s.name == m.skipTo { for v in s.vars { skipSet[v] = true } } }
         }
     }
+    // the logical plan: Match over the Sel's, with the clauses as resolved
+    let mdef = lexdb_bind.MatchDef{part: copyInts(&partCols), order: lpOrder, desc: copyBools(&desc), nullsFirst: copyBools(&nullsFirst),
+                                   defs: lpDefs, meas: lpMeas}
+    sel.lp = lexdb_bind.LPlan.Match(replace(mut &sel.lp, lexdb_bind.noPlan()), mdef, outBCols(&outs))
     let pl = MrPlan{inCols: replace(mut &rw.inCols, []), keyX: keyX, keyAt: keyAt, np: len(m.part), desc: desc, nullsFirst: nullsFirst,
                     prog: prog, shown: copyStrs(&m.shown), navs: replace(mut &rw.navs, []), defs: defs, defNavs: defNavs, meas: meas,
                     measNavs: measNavs, local: local, rows: m.rows, skip: m.skip, skipSet: skipSet, outs: outs, outFrom: outFrom,
