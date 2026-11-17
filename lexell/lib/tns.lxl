@@ -275,9 +275,12 @@ fn putBytes2(b: mut &[]byte, s: &str) {
 
 // A cursor over received bytes. Every read checks the bytes there are; when
 // they run out, short is set (the message may continue in the next packet).
-pub type Cur = value record { s: str; pub pos: int; pub short: bool }
+pub type Cur = value record { s: rc str; pub pos: int; pub short: bool }     // s: the data, shared by the cursors over it
 
-pub fn cursor(s: &str): Cur { return Cur{s: s.clone(), pos: 0, short: false} }
+pub fn cursor(s: &str): Cur { return Cur{s: rc(s.clone()), pos: 0, short: false} }
+
+// A cursor at at over data already held in an rc: no copy of the bytes.
+fn cursorOf(s: &rc str, at: int): Cur { return Cur{s: s.share(), pos: at, short: false} }
 
 fn (c: &Cur) left(): int { return len(c.s) - c.pos }
 
@@ -1338,7 +1341,7 @@ fn plainRaw(col: &Column): bool {
 // which is then decoded again with the next packet joined on. Plain values
 // (a length byte below 254, then the bytes) are read straight from d, the
 // rest (chunked values over 252 bytes, the other types) with columnRaw.
-fn scanRaw(d: &str, at: int, r: mut &Reply): Result[int, Error] {
+fn scanRaw(d: &rc str, at: int, r: mut &Reply): Result[int, Error] {
     let nc = len(r.columns)
     let n = len(d)
     let mark = len(r.rawData)
@@ -1380,7 +1383,7 @@ fn scanRaw(d: &str, at: int, r: mut &Reply): Result[int, Error] {
                 continue
             }
         }
-        var c = Cur{s: d.clone(), pos: p, short: false}
+        var c = cursorOf(d, p)
         match columnRaw(mut &c, &r.columns[i]) {
             Ok(v) {
                 append(mut &r.rawStarts, len(r.rawData))
@@ -2572,12 +2575,12 @@ fn (s: mut &Session) exchange(msg: &[]byte, r: mut &Reply, w: Where): Result[Uni
 
 // Reads one reply into r.
 fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
-    var data = ""
+    var data: rc str = rc("")          // shared by the cursors over it
     var total = 0
     while !r.done {
         if len(data) == 0 {
             let d = try s.nextData(w)
-            data = d.data.clone()
+            data = rc(d.data.clone())
             total += len(data)
         }
         if r.raw && int(data[0]) == MT_ROW_DATA && !(r.outMode && !r.described) {
@@ -2592,20 +2595,20 @@ fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
                 }
                 p = q
             }
-            data = data[p..]
+            data = rc(data[p..])
             if short {
                 let d = try s.nextData(w)
                 total += len(d.data)
                 if total > s.maxReply {
                     return Err(sqldialect.dbError(sqldialect.E_LIMIT, &("tns: a reply larger than " + s.maxReply.toStr() + " bytes")))
                 }
-                data = if d.reset { d.data.clone() } else { data + d.data }
+                data = rc(if d.reset { d.data.clone() } else { data + d.data })
             }
             continue
         }
-        var c = cursor(&data)
+        var c = cursorOf(&data, 0)
         match decodeMessage(mut &c, r, s.fieldVersion) {
-            Ok(_) { data = data[c.pos..] }
+            Ok(_) { data = rc(data[c.pos..]) }
             Err(e) {
                 if !c.short { return Err(e) }
                 let d = try s.nextData(w)
@@ -2613,7 +2616,7 @@ fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
                 if total > s.maxReply {
                     return Err(sqldialect.dbError(sqldialect.E_LIMIT, &("tns: a reply larger than " + s.maxReply.toStr() + " bytes")))
                 }
-                data = if d.reset { d.data.clone() } else { data + d.data }
+                data = rc(if d.reset { d.data.clone() } else { data + d.data })
             }
         }
     }

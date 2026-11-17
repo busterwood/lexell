@@ -394,9 +394,16 @@ expected, so a variable may still be named `rc`.
   `r.clone()` does the same: the value cannot change, so a deep copy could
   not be told apart from it. The value is dropped, and the box freed, with
   the last handle.
-- **Reading is transparent.** `r.f` reads a field of the value, `r.m()` calls
-  a method of the value (one not declared on `Rc` itself), `for x in r`
-  walks it, and a handle passed where a `&T` is expected lends the value.
+- **Reading is transparent.** All of these read the value:
+  - `r.f`, a field of it;
+  - `r.m()`, a method of it (one not declared on `Rc` itself);
+  - `r[i]`, `r[a..b]` and `len(r)`;
+  - operators, so `r == "x"` and `r + "!"` work when `r` is an `rc str`;
+  - `for x in r`;
+  - a handle passed, returned or bound where a `&T` is expected, which lends
+    the value;
+  - a handle passed to a value parameter of the value's type (an intrinsic
+    such as `strByte(r, 0)`, or a copy type), which reads the value.
   These reads are places rooted at the handle, so a borrow of the value
   keeps the handle alive (section 10).
 - **The value is immutable through a handle.** Assigning to it, mutably
@@ -408,6 +415,10 @@ expected, so a variable may still be named `rc`.
   handles keep the old value.
 - **Forwarded interfaces.** `==`, `cmp`, `hash` and `toStr` on handles forward
   to the value when `T` has them.
+
+A buffer that several readers walk is a natural `rc`: the TDS and TNS clients
+keep a reply in an `rc str` and their cursors share it (`Cur{s: r.share(),
+pos: p}`), so making a cursor costs a count, not a copy.
 
 Because no handle can change a shared value, handles cannot form cycles.
 Every box is freed with its last handle, without a collector. Counts are not

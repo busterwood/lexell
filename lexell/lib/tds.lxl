@@ -1818,9 +1818,9 @@ pub fn parseRpc(d: &str): Result[[]RpcCall, Error] {
 // ---------------------------------------------------------------- reading
 
 // A position in a byte string, with an end.
-type Cur = value record { s: str; pos: int; end: int }
+type Cur = value record { s: rc str; pos: int; end: int }     // s: the reply, shared by the cursors over it
 
-fn cursor(s: &str): Cur { return Cur{s: s.clone(), pos: 0, end: len(s)} }
+fn cursor(s: &str): Cur { return Cur{s: rc(s.clone()), pos: 0, end: len(s)} }
 
 fn (c: &Cur) left(): int { return c.end - c.pos }
 
@@ -1887,7 +1887,7 @@ fn (c: mut &Cur) skip(n: int, what: &str): Result[Unit, Error] {
 // A cursor over the next n bytes; c moves past them.
 fn (c: mut &Cur) sub(n: int, what: &str): Result[Cur, Error] {
     try c.need(n, what)
-    let r = Cur{s: c.s.clone(), pos: c.pos, end: c.pos + n}
+    let r = Cur{s: c.s.share(), pos: c.pos, end: c.pos + n}
     c.pos += n
     return Ok(r)
 }
@@ -2700,7 +2700,7 @@ fn returnValue(c: mut &Cur): Result[ReturnValue, Error] {
 pub type Metadata = record { pub cols: []Column; pub end: int }
 
 pub fn parseColMetadata(d: &str, at: int): Result[Metadata, Error] {
-    var c = Cur{s: d.toStr(), pos: at, end: len(d)}
+    var c = Cur{s: rc(d.toStr()), pos: at, end: len(d)}
     let cols = try colMetadata(mut &c)
     return Ok(Metadata{cols: cols, end: c.pos})
 }
@@ -3484,7 +3484,7 @@ fn (s: mut &Session) abandon(e: Error, w: Where): Error {
     }
     s.rr = noReader()
     s.rr.active = true
-    s.rr.data = part.data.clone()
+    s.rr.data = rc(part.data.clone())
     match s.settle(w) {
         Ok(_) {}
         Err(_) {}                         // broken by settle
@@ -3500,7 +3500,7 @@ fn (s: mut &Session) abandon(e: Error, w: Where): Error {
 // next one); eom: the reply's last packet is in.
 type RowReader = record {
     active: bool            // a reply is being read: settle ends it before another request
-    data: str
+    data: rc str            // the reply read so far, shared with the cursors over it
     pos: int
     eom: bool
     cols: []Column          // the columns of the result set being read
@@ -3511,7 +3511,7 @@ type RowReader = record {
 }
 
 fn noReader(): RowReader {
-    return RowReader{active: false, data: "", pos: 0, eom: false, cols: [], inRows: false, starts: [], lens: [], attnDone: false}
+    return RowReader{active: false, data: rc(""), pos: 0, eom: false, cols: [], inRows: false, starts: [], lens: [], attnDone: false}
 }
 
 const EV_ROW = 1        // a ROW or NBCROW: its values are in starts and lens
@@ -3629,7 +3629,7 @@ fn (s: mut &Session) more(dl: int, w: Where): Result[Unit, Error] {
     if rest + len(p.data) > s.maxReply {
         return Err(sqldialect.dbError(sqldialect.E_LIMIT, &("tds: a token larger than " + s.maxReply.toStr() + " bytes")))
     }
-    s.rr.data = if rest == 0 { p.data.clone() } else { s.rr.data[s.rr.pos..] + p.data }
+    s.rr.data = rc(if rest == 0 { p.data.clone() } else { s.rr.data[s.rr.pos..] + p.data })
 
     s.rr.pos = 0
     s.rr.eom = p.eom
@@ -3674,7 +3674,7 @@ fn (s: mut &Session) token(): Result[int, Error] {
         s.rr.pos = end
         return Ok(EV_ROW)
     }
-    var c = Cur{s: s.rr.data.clone(), pos: s.rr.pos + 1, end: len(s.rr.data)}
+    var c = Cur{s: s.rr.data.share(), pos: s.rr.pos + 1, end: len(s.rr.data)}
     match s.other(tok, mut &c) {
         Ok(ev) {
             s.rr.pos = c.pos
@@ -3833,7 +3833,7 @@ pub fn (s: mut &Session) nextRow(w: Where): Result[bool, Error] {
                 if e2 == EV_END { break }
             }
             s.rr.active = false
-            s.rr.data = ""
+            s.rr.data = rc("")
             s.rr.pos = 0
             return Ok(false)
         }

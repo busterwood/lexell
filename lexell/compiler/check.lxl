@@ -1823,8 +1823,15 @@ fn (c: mut &Checker) stmt(s: int) {
     }
 }
 
-fn (c: mut &Checker) coerce(v: Val, t: int, line: int, what: &str): Val {
+fn (c: mut &Checker) coerce(v0: Val, t: int, line: int, what: &str): Val {
+    var v = v0
     if v.t == t { return v }
+    if c.pg.tk(t) == sema.TK_REF && !c.pg.tm(t) && c.pg.tk(v.t) == sema.TK_REF && !c.pg.tm(v.t) &&
+            c.pg.isRc(c.pg.ta(v.t)) && !c.pg.isRc(c.pg.ta(t)) {
+        // SPEC 4.9: a &rc T where a &T is expected lends the value the handle holds
+        var p = c.rcRead(v)
+        if p.t == c.pg.ta(t) { return c.borrow(p, false, line, false) }
+    }
     let vk = c.pg.tk(v.t)
     let k = c.pg.tk(t)
     if k == sema.TK_CLO && vk == sema.TK_FN && c.sameSig(v.t, t) {     // through a trampoline (emit)
@@ -3613,6 +3620,13 @@ fn (c: mut &Checker) rcUnshare(recv: Val, t: int, line: int): Val {
     return c.borrow(p, true, line, false)
 }
 
+// The value v reads: a borrow dereferenced, and an rc handle's value (SPEC 4.9), any number of times.
+fn (c: mut &Checker) rcRead(v0: Val): Val {
+    var v = c.deref(v0)
+    while c.pg.isRc(v.t) { v = c.rcValue(v) }
+    return v
+}
+
 // Whether name on an rc handle reaches the value (outside std, every field name does).
 fn (c: &Checker) rcReaches(name: &str): bool {
     return c.cx.mod != c.pg.types[c.pg.rc].mod || (name != "n" && name != "v")
@@ -3668,7 +3682,7 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
     }
     if c.count(n.b) != 1 { c.err(n.line, "an index takes one expression") }
     let ix = c.item(n.b, 0)
-    var v = c.deref(c.expr(n.a, -1))
+    var v = c.rcRead(c.expr(n.a, -1))
     if v.t == sema.T_STR {
         v = c.before1(v, ix)
         let i = c.intIndex(ix)
@@ -3706,7 +3720,7 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
 // xs[a..b], xs[a..], xs[..b] of an array or slice (a slice, SPEC 4.2a) or of a str.
 fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
     let n = c.nd(e)
-    var v = c.deref(c.expr(n.a, -1))
+    var v = c.rcRead(c.expr(n.a, -1))
     let W = c.W(n.line)
     if v.t == sema.T_STR && view {
         // a view (design/borrow-types.md): a shared &str of the bytes, rooted where s is, uncounted
@@ -3989,7 +4003,7 @@ fn (c: mut &Checker) logic(e: int): Val {
 
 // lv: the evaluated left operand; r: the right operand (a node, or a value).
 fn (c: mut &Checker) binop(op: str, lv0: Val, r: Arg, line: int, exp: int, hasHeld: bool, held: Val): Val {
-    let lv = c.rd(lv0)
+    let lv = c.rcRead(lv0)          // SPEC 4.9: an operator reads an rc handle's value
     let lt = lv.t
     var rv0 = r.v
     if !r.isVal {
@@ -4000,7 +4014,7 @@ fn (c: mut &Checker) binop(op: str, lv0: Val, r: Arg, line: int, exp: int, hasHe
         rv0 = c.expr(r.n, rexp)
         c.cutPending(mark)
     }
-    let rv1 = c.rd(rv0)
+    let rv1 = c.rcRead(rv0)
     let rt = rv1.t
     let W = c.W(line)
     let cmp = isCmpOp(&op)
@@ -5130,6 +5144,13 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             // a borrow passed where a type argument is a borrow (Some(&x) as an Option[&T]) stays one
             let keepRef = c.pg.tk(c.pg.subst(pt, &bind)) == sema.TK_REF
             if c.pg.tk(v.t) == sema.TK_REF && !keepRef { v = c.deref(v) }
+            while c.pg.isRc(v.t) {
+                // SPEC 4.9: where the handle itself does not fit, the value it holds is read (a copy type
+                // is copied; an owned value cannot be moved out, as for a borrow)
+                var trial = copyInts(&bind)
+                if c.pg.unify(pt, v.t, mut &trial, &tps) { break }
+                v = c.rcValue(v)
+            }
             if v.t == sema.T_VOID { c.err(line, what + " has no value") }
             if !c.pg.unify(pt, v.t, mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t))
@@ -5842,7 +5863,7 @@ fn (c: mut &Checker) builtinBorrow(v0: Val, m: bool, line: int, ast: int): Val {
 
 fn (c: mut &Checker) bLen(e: int): Val {
     c.nargs(e, 1)
-    let v = c.deref(c.expr(c.arg(e, 0), -1))
+    let v = c.rcRead(c.expr(c.arg(e, 0), -1))
     if v.t == sema.T_STR { return rv(c.x.pcast(c.ct("int64_t"), c.x.dot(c.x.par(v.c), "len")), sema.T_INT) }
     let k = c.pg.tk(v.t)
     if k != sema.TK_SLICE && k != sema.TK_ARR {

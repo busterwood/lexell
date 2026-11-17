@@ -38,8 +38,12 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | N | `rc T`, SPEC 4.9: counted handles to immutable values. `rc(v)` makes one; `share()`/`clone()` add a handle; transparent reads (fields, methods, `&T` arguments, `for`); `unshare()` gives `mut &T` (copy-on-write). `rc` is a keyword only in type position. | 48716697 | yes. New std names `Rc` and `rc`: a local variable named `rc` still works, but calling `rc(...)` inside its scope does not. | none |
 
-Still to come: `rc str` slices that share the bytes, `task.Shared`/`Frozen`
-on `rc`, and the switch itself.
+| O | `rc` reads, SPEC 4.9: `len`, indexing, slicing, operators, value parameters, returns and `let`s of `&T` all reach an `rc` handle's value. The TDS and TNS clients keep replies in an `rc str`; their cursors share them. | (this commit) | yes (lexdb's TDS and TNS programs compile; the offline suites pass) | none |
+
+`rc str` needs no slicing of its own: a reader of a shared buffer is
+`rc str` plus positions (the cursor pattern), and a substring is a borrowed
+view or an owned copy. Still to come: `task.Shared`/`Frozen` on `rc`, the
+generalised borrow report, and the switch itself.
 
 **At the switch, for string globals:** a string global passed to a function,
 returned or stored needs `g.clone()` (the sweep's `global` kind lists them;
@@ -67,6 +71,9 @@ forms from the start:
 - **H:** `make().field` moves the field out; don't clone it.
 - **I:** in `for x in f() { append(mut &out, x) }`, `x` is owned; drop the
   `.clone()`. To consume a variable's array, write `for x in move(xs)`.
+- **O:** wire-protocol readers (lexdb's pgwire, TDS and TNS servers)
+  should follow the client pattern: the received message in an `rc str`,
+  cursors holding `r.share()` and a position.
 - **N:** a large buffer or structure that several owners read (cursors over
   a reply, a parsed catalog, a plan) is an `rc T`: `share()` instead of
   `clone()`.
