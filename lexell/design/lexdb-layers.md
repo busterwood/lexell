@@ -5344,6 +5344,255 @@ query within 1.8%).
 **Line counts:** `lexdb_exec` 26,481 to 26,503, `lexdb_pipe` 3,055 to
 3,056.
 
+#### 6.2.10 P2 as built: joins in the pipeline
+
+Built 2026-11-17 on `redesign/bind` from main 9835e4c0. Scripts and
+outputs are in `~/tpch-w/bind/p2` (`qt.sh`, `rep.sh`, `rep2.sh`,
+`dbg.sh`, `icount.sh`; profiles `pq*-m`, `pq*-c`; TPC-H runs `out-a2`,
+`out-c1`, `out-c3`). The sub-slices were reordered: the lookups and
+ranges per row (planned for P2c) came with the hash joins in P2a,
+because the batch driver's probe, lookup and range share one tail and
+almost every TPC-H join mixes them; P2c became the row engine's joins
+and the deletions.
+
+**Commits:**
+
+- 373e1963 (P2a 1/n): inner and LEFT joins over chunks: hashes built in
+  batches, lookups and ranges per row, late gathering, the
+  required-columns pass, aggregates over joins.
+- 0f4f9db4 (P2a 2/n): a FROM subquery's rows by its pipeline plan (q7,
+  q8, q9's joins).
+- 956041c5 (P2b): semi and anti joins (a RUN_SEMI subquery's rows as a
+  hash, RUN_LOOKED as a range per row, the "inner <> outer" summary), a
+  FROM subquery's rows as a hash, one RIGHT JOIN; a single row's range past
+  `max_statement_mem` read in pieces; generic-step aggregate arguments.
+- fdcda546 (P2c 1/n): the row engine's joins run by the pipeline (levels
+  programs); the batch join driver deleted.
+- aa841ad6 (P2c 2/n): the scan's batch used again under a join; a levels
+  program's hashes not built twice.
+
+**The plan** (`lexdb_plan`):
+
+- `PPlan.Join(PPlan, PJoin)`: the rows below joined with one more table.
+  `PJoin` holds how its table is read (`JH_HASH` once by its path,
+  `JH_ROWS` a subquery's or working table's rows, `JH_LOOK` per row by its
+  whole primary key, `JH_RANGE` per row by its path's leading equalities
+  and constant bounds), the kind (inner, LEFT, RIGHT), the mark (join,
+  semi, anti), its table's arm (`PScan`), the hash's own conditions
+  (`build`, Level.local), key columns and keys (`hcols`, `keys`, `ktypes`),
+  the conditions per candidate (`conds`, the key's equality `keq` left out
+  where the hash compares by value), a LEFT JOIN's WHERE conjuncts
+  (`post`), a range's bounds, and a summary's column and outer value.
+- `lexdb_plan.needs` is the required-columns pass (6.2.2), next to
+  `callsNeed`: each table decodes the columns some operator of the plan
+  reads, by slot, so per table instance (a `*` elsewhere widens nothing).
+  `compile` runs it for every plan with joins. Above a join only row
+  numbers are carried, so "per operator" is what each operator gathers.
+- exec's `joinsOver` makes the arms from the levels as the planner chose
+  them (the batch driver's choices: a lookup or range per row only where
+  the first table's reading does not stop early). The joins' expressions
+  are bound for the plan (`planX`); the first table's conditions moved as
+  in P1.
+
+**What the pipe does** (`lexdb_pipe`, the joins section):
+
+- **Late materialisation.** A chunk carries per level its rows' places
+  (the scan's batch, the hash's rows, a lookup's rows read for the chunk;
+  -1 a LEFT JOIN's NULL row). Each operator gathers only what it reads
+  (`gatherAt`): a join's keys, then its conditions over the candidates,
+  then the consumer's columns once. Nothing is copied from level to level
+  but row numbers (`compose`).
+- **Late decoding.** With a first hash join of one integer key read from
+  the scanned table, the scan's narrowing drops the rows the hash does not
+  hold, inside the two-step decode (`lazyOf`'s extra column): their other
+  columns are never decoded (q9: 95% of lineitem's decimals).
+- **Hashes** are built in batches by the pipe (`Builder`): the table read
+  by its path with its own conditions compiled once, buckets as first/next
+  chains in read order, NULL keys out (a RIGHT JOIN's kept), integer and
+  text keys by value, others by their encoding (`encIdxPart` after
+  `keyVal`'s coercion; a subquery's rows by `keyPart`). No `materialize`.
+- **Lookups and ranges** are bLookup's and bRange's (`fetchMany`,
+  `rangeMany`), keyed from the gathered keys; a chunk whose ranges are
+  past `max_statement_mem` is joined in halves, a single row's range is
+  read in pieces (`rangeOne`, as the row engine reads it).
+- **Semi, anti, RIGHT:** a semi join gives each outer row once (its first
+  passing candidate), an anti join the rows with none; both count
+  candidates read as the row engine does (up to the first passing one);
+  a RIGHT JOIN's rows that joined nothing go on after the scan with NULLs
+  before them.
+- **Errors** (exactness): an expression's error in a chunk joins the
+  chunk again row by row (`one` mode: each row's candidates in order, as
+  `runLevel` tries them), skipping the rows already given, so an error past
+  a LIMIT is not reached and the rows before an error are the row
+  engine's. A condition's error in the scan's batch gives the batch whole
+  to the same row-by-row join. Aggregates raise from the chunk (4.4.1).
+- **XXBAT** ("a value or key a join's batch cannot hold": a key the
+  kernels do not compile, a value of the wrong kind) is raised before any
+  row is given where the caller holds them; exec then runs the row engine
+  (execSelTo, eachRowB when nothing was streamed, pipeGroups, runQuery).
+- **Consumers:** `runJ` (Project over joins: OutBatches, a LIMIT),
+  `runAggJ` (P1b's aggregate, its state now `AggSt` shared with one
+  table's: units, then values, then the joined rows grouped by the scalar
+  evaluator), `runLevels` (each joined row to the row engine's emit).
+- **Generic aggregate arguments:** a sum, min or max whose argument the
+  kernels do not evaluate takes its values by the generic step (a values
+  column per batch, `bAccVal`) instead of the row pass (q14's CASE of a
+  LIKE; `exec_batchdec`'s "negated past units" now over batches).
+
+**What compile accepts:**
+
+- Project (streamed or held rows, a LIMIT) and Agg over a join tree whose
+  first table is read in batches (`PScan.batch`; its points row by row),
+  its subqueries run once, RUN_SEMI or RUN_LOOKED;
+- levels: inner, CROSS and LEFT joins by a hash of a table or of rows, a
+  lookup or a range per row; semi and anti joins by a hash of a
+  subquery's rows (with a summary) or a range per row; one RIGHT JOIN by a
+  hash; a FROM subquery's or a recursive CTE's working table's rows as a
+  hash; keys of no collation;
+- for the row engine (levels programs, `Query.jp`): the same joins under
+  any query the pipeline does not run whole (sorted, DISTINCT, windows,
+  set parts, statements' queries, aggregates it does not accumulate).
+
+**It rejects** (the row engine runs them): FULL joins; LATERAL; locked
+tables; a correlated query (`q.corr`, or a correlated path); a per-row
+level that is neither a whole-key lookup nor a range (a nested loop, an
+IN list per row); a lookup or range under a LIMIT that stops the scan; a
+collation's key; a first table that is a subquery's rows or not read in
+batches; generate_series in FROM.
+
+**Deleted from exec** (fdcda546): `eachOut`; `outPlan`'s and
+`batchLevel`'s joined branches; `sortBatches`' joins; `bJoinPlan`,
+`jpFinish`, `bJoinAll`, `bProbe`, `bJoinTail`, `bLookup`, `bRange`,
+`bUnmatched`, `bGather`, `bJoined`, `JLevel`, `JPlan`, `noJoins`;
+`batchGroups`, `batchGroupsIn` (`pipeAgg`'s Agg over a join arm replaces
+it); `bCompileCond`, `bCompileX`, `bChoose`, `copyCounts`. A query's
+joins have one implementation now, the pipe's. Kept in exec: the path
+tests the planner's choice needs (`lookupPath`, `rangePath`, `isKeyEq`,
+`bCondNode` for the first level's one-table batches).
+
+**Line counts:**
+
+| | main 9835e4c0 | 373e1963 | 0f4f9db4 | 956041c5 | fdcda546 | aa841ad6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `lexdb_exec` | 26,503 | 26,705 | 26,706 | 26,757 | 25,304 | 25,312 |
+| `lexdb_pipe` | 3,056 | 4,565 | 4,565 | 4,954 | 5,039 | 5,055 |
+| `lexdb_plan` | 320 | 446 | 446 | 461 | 461 | 461 |
+
+Exec is 1,191 lines shorter: the secret that left it is how a join runs
+(the batch join driver, 1,450 lines, and its aggregate driver); exec
+gained the glue (`joinsOver` 120, `joinSrcs`, `levelCounts`,
+`levelsProg`, `runLevelsProg`, the fallbacks: ~260). The pipe gained
+2,000 (the joins ~1,500, the shared aggregate state, the levels program);
+the plan 141 (`PJoin`, `needs`). No new import edge (214).
+
+**Gates:**
+
+- Suite from a snapshot of each commit (`e7/suite-p2a1`, `p2b`, `p2c1`,
+  `p2c2`; 2/n's in the working tree): 190 passed, imports ok. Counters
+  that moved, with the same rows: `exec_batchexpr` OutBatches 286 to 290
+  and `exec_batchjoin` batched joins 206 to 208 (joins past an error now
+  batched), `exec_semijoin` 167 to 189 over batches, `exec_joinrange` 14
+  to 15, `exec_batchdec` "negated past units" over batches; and two that
+  went down because sorted joins are no longer sorted as OutBatches
+  (`sortBatches` is one table's until P3): `exec_batchsort` 198 to 155,
+  `exec_batchindex` 164 to 134.
+- `exec_pipe` gained joins, two ways (row engine and pipeline): 400
+  random joins committed and 100 in a transaction with its own writes
+  (inner, LEFT, hash, lookup, range, three tables, two keys, expression
+  keys, text keys, duplicate and NULL keys, an empty table, rows and
+  aggregates, errors), 26 fixed shapes (errors before and past a LIMIT
+  in a join's condition, an output, a call; empty build and probe; a LEFT
+  JOIN's WHERE), 12 runs of a prepared join, `max_statement_mem` (the
+  same 53200, the same rows under it), 10 EXPLAIN ANALYZE shapes; then
+  300 random semi and anti joins (EXISTS, NOT EXISTS, IN, NOT IN with
+  NULLs in the set and an empty set, a range per row with a filter, the
+  summary), 12 fixed semi, anti and RIGHT shapes, 6 EXPLAIN ANALYZE
+  shapes: all the same. (Its run takes 12 s: `timeout: 120`.)
+- Naming battery (`nam-a1.out`, `nam-c1.out`) and EXPLAIN of the 22 TPC-H
+  queries (`exp-a1.txt`, `exp-c1.txt`): identical to main's.
+- Point selects (`icount.sh`, `perf stat` over 3 runs of `points.sql`,
+  two rounds): main 197,338 and 197,404 instructions a statement,
+  aa841ad6 197,857 and 197,890 (+0.26%; cycles 105,561 to 103,852).
+- TPC-H, SF1, one run of each build; all 22 checksums are the baseline's
+  (1744ef99). Against `out-main-9835e4c0` (ms):
+
+  | query | main | 0f4f9db4 (P2a) | fdcda546 | aa841ad6 | change |
+  |---|---:|---:|---:|---:|---:|
+  | q3 | 1,338 | 968 | 957 | 966 | -27.8% |
+  | q5 | 401 | 246 | 249 | 254 | -36.7% |
+  | q7 | 1,907 | 1,758 | 1,776 | 1,533 | -19.6% |
+  | q9 | 5,026 | 3,106 | 3,041 | 2,888 | -42.5% |
+  | q10 | 1,163 | 590 | 587 | 597 | -48.7% |
+  | q11 | 215 | 167 | 168 | 172 | -19.8% |
+  | q12 | 1,502 | 1,635 | 1,605 | 1,358 | -9.6% |
+  | q13 | 1,120 | 1,108 | 771 | 777 | -30.6% |
+  | q14 | 788 | 380 | 339 | 338 | -57.0% |
+  | q16 | 581 | 569 | 354 | 358 | -38.3% |
+  | q21 | 1,940 | 1,956 | 1,925 | 1,796 | -7.4% |
+  | q22 | 445 | 442 | 334 | 334 | -25.1% |
+  | q2, q4, q8 | 64, 354, 363 | | | 59, 339, 355 | -8%, -4%, -2% |
+  | total | 22,924 | 19,593 | 18,663 | 18,000 | -21.5% |
+
+  Worse in the last run: q1 +3.7%, q17 +15.8% (44 to 51 ms), q18 +3.0%,
+  q6 +2.1%. Repeated on copies through the harness (`rep2.sh`, 3 runs a
+  pass, two passes): q17 44.7 and 44.5 against 44.7 and 45.9 (level), q18
+  1,220 and 1,225 against 1,210 and 1,215 (+0.9%), q1 2,492 and 2,418
+  against 2,363 and 2,402 (+3.0%); q1 again at `LXL_PADB 32 / LXL_FALIGN
+  128` (`rep2p.txt`): 2,451 and 2,456 against 2,414 and 2,420 (+1.5%).
+  q1 runs no join; its code changed only by the aggregate state's move
+  into `AggSt` (its grouping loop reads the state through a borrow). Within
+  the 4% placement spread of 6.2.7, but consistently 1.5-3% slower: not
+  resolved.
+  - q12 was +6.8% at fdcda546: the join's scan moved each batch into its
+    consumer, so `lexdb_rows.reuse` allocated a new one per batch
+    (`newBatch` 15% of the profile, `pq12-c`); aa841ad6 lends it and takes
+    it back. q20 was +3.3%: its sorted outer query's supplier lookups were
+    read twice (prepare's `materialize` and the levels program's hash);
+    aa841ad6 skips materialize for a levels program (`rep-q20b.txt`: level).
+
+**Where the remaining join time goes** (profiles at P2a): q9 is now 30%
+`fetchMany` (325k lookups each of partsupp, supplier, orders: the plan's
+choice; PostgreSQL hashes them), q3 77% `rangeMany` (orders by customer,
+lineitem by order, per row), q14 60% the build's index range read row by
+row by primary key (`getMany`; PostgreSQL's bitmap scan), q7 the lookups
+and dates compared as values (`lexdb_ops.compare` 8%). The next gains are
+the planner's (hash instead of lookups where the probe side is large) and
+the chunk's (dates as integers), not the join operators'.
+
+**Hand-over:**
+
+- **P3 (Sort, TopN, Distinct over chunks)** now also owns sorted joins:
+  `sortBatches` is one table's, so ORDER BY over a join sorts the levels
+  program's rows in exec's row sort (`exec_batchsort`'s OutBatches went
+  down). A Sort operator over `runJ`'s chunks would take them back.
+- **Levels programs** (`Query.jp`) are the row engine's joins now; they
+  disappear when the row engine's consumers (sort, DISTINCT, windows, set
+  parts, statements' queries) are pipeline operators. Their glue
+  (`runLevelsProg`) copies the subqueries' values and rows per run.
+- **XXBAT** is the only give-way left. A key the kernels do not compile
+  could take the generic step (`bGenOf`'s values, keyed by encoding)
+  instead; a value of the wrong kind for its column could make that
+  chunk's column BK_VAL (6.2.3's table). The fallbacks (execSelTo,
+  eachRowB, pipeGroups, runQuery) go with them.
+- **Not taken:** FULL joins; a per-row level other than a whole-key lookup
+  or a range (nested loops, IN lists per row: the planner's
+  `loop over primary key lookup` lines); LATERAL; correlated queries
+  (RUN_HASHED as a build side was not built: its per-key values feed
+  expressions, not a level); the first table read from a subquery's rows
+  (q7, q8, q9's outer aggregates over their FROM subquery still run in the
+  row engine: a Scan of rows would take them).
+- **Costs to watch:** the memory a hash holds is now its kept rows'
+  (`Builder.held`), not every row read (`materialize` counted those): a
+  statement near `max_statement_mem` may now pass where it failed. A
+  levels program holds its hashes in its run, prepare none.
+- **Traps:** `readRows` lends its batch to the consumer (`mut &Batch`) and
+  takes it back for `reuse`: a consumer must leave the table's columns as
+  they were. `joinFrom`'s `one` mode and `Skip` must stay in step (the
+  rows given before an error are skipped by count). `opLines` prints a
+  Join arm as nothing: the Scan's `explainLines` prints every level.
+  `pipeGroups` must read its path's values before lending the subqueries'
+  values (`pipeCtx`), or a path bound by a subquery is empty.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
