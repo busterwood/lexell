@@ -3645,29 +3645,39 @@ Steps 1 and 2 are independent and can run at the same time, one agent each
 (the two-agent limit). Step 3 needs step 2. Steps 4–7 are sequential.
 Main stays green after every step.
 
-**Revised order (agreed with the owner, 2026-11-17, after 2e slice 3c):**
-2 (through 2e slice 3c) → **3** → **5** → 4 → 6 → 7.
+**Revised order (agreed with the owner, 2026-11-17, second revision,
+after step 3a; supersedes the first, which put unnesting before step 4):**
+2 (through 2e slice 3c) → 3a → **4** → 5 → 6 → 7, with the sorted row-id
+scan and bushy joins slotted in when convenient.
 
-- Steps 1–4 change no behaviour, and TPC-H's worst gaps (q19 14×, q20 12×,
-  q21 10.5×, q22 8.5× PostgreSQL on one core at `94536d12`) are plan
-  shape, not executor speed. So unnesting moves ahead of the pipeline
-  executor, and the first deliberate TPC-H gains no longer wait for all
-  of step 4.
-- Step 5 is a rewrite of the logical plan (layer 5's rewrites), and
-  today's executor already runs hash semi-joins and anti-joins (lexdb.md
-  9.104). It runs on today's executor through step 3's `Levels` operator;
-  a mark join, if needed, is added there and ported in step 4 with the
-  rest. Step 4 then ports operators for plans that already have the right
-  shape.
-- Deferred until something needs them: 2e slice 3d (`bindFrom` into
-  `lexdb_bind`) and 2e slice 4 (each expression bound against its
-  operator's own input; eval's name check dropped). Their notes stay in
-  4.4.1.
-- Optional, beside step 5: the OR-across-tables filters for q19
-  (joinorder's `orHull`, parked on `perf/joinorder` 6e514a3f).
-- Gates for these refactor steps are light: the suite, the 22 checksums,
-  and one TPC-H run of the branch against main's stored result; point
-  selects only where per-statement planning or the row path changes.
+- The first revision rested on TPC-H gaps measured at `94536d12` (q19
+  14×, q20 12×). At `2b605b2b` the geometric mean is 1.86× PostgreSQL on
+  one core (3.39× against four processes), q19 3.0×, q20 3.3×, and 6.1
+  shows every TPC-H subquery query already has PostgreSQL's plan shape.
+  Unnesting would make none of q4, q20, q21, q22 faster.
+- So step 4 comes next. Its first slices take the measured items: q21's
+  semi and anti levels under grouped batches (about 5 s of 7.2), then
+  scan, filter and project (q1, q6, q22's `substring`). Step 5 follows
+  for generality (6.1's 5a-5f). The sorted row-id scan (q4, q14, q19) and
+  step 6's bushy joins (q21) need neither step 3 nor step 5.
+- **Modules are a goal equal to speed.** `lexdb_exec` (28,224 lines at
+  step 3a) still holds the planner and cost model, the plan structures
+  mixed with run-time state, statements and sessions, and two
+  evaluators. So:
+  - step 4's operators and chunk machinery live in their own module, and
+    each operator ported deletes the code it replaces from exec;
+  - step 4 starts with a map of exec by target module (lines per secret,
+    and what each depends on);
+  - every slice reports exec's line count and which secret left it;
+  - extraction slices with no behaviour change (the planner into
+    `lexdb_plan`, with 2e slice 3d; statements into layer 7) alternate
+    with the speed slices.
+- Deferred until needed: 2e slice 4 (expressions bound against their
+  operator's input; eval's name check dropped).
+- Gates for refactor steps are light: the suite, the 22 checksums, and
+  one TPC-H run of the branch against main's stored result
+  (`~/tpch-w/int/out-main-<commit>`); point selects only where
+  per-statement planning or the row path changes.
 
 ### 6.1 Step 3 and step 5: the plan, slice by slice
 
