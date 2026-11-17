@@ -192,24 +192,24 @@ pub type Error = value record {
 }
 
 // "tls: verify: certificate has expired (localhost)"
-pub fn (e: Error) toStr(): str {
+pub fn (e: &Error) toStr(): str {
     if len(e.peer) == 0 { return "tls: " + e.kind.toStr() + ": " + e.msg }
     return "tls: " + e.kind.toStr() + ": " + e.msg + " (" + e.peer + ")"
 }
 
-pub fn (e: Error) isTimeout(): bool { return e.kind == Kind.Timeout }
-pub fn (e: Error) isCancelled(): bool { return e.kind == Kind.Cancelled }
+pub fn (e: &Error) isTimeout(): bool { return e.kind == Kind.Timeout }
+pub fn (e: &Error) isCancelled(): bool { return e.kind == Kind.Cancelled }
 
 fn noCause(): io.IoError { return io.ioError(0, "", "") }
 
 fn fail(k: Kind, msg: &str, code: int, peer: &str): Error {
-    return Error{kind: k, msg: msg, code: code, peer: peer, cause: noCause()}
+    return Error{kind: k, msg: msg.clone(), code: code, peer: peer.clone(), cause: noCause()}
 }
 
 // The error of a socket call.
 fn ioFail(e: io.IoError, peer: &str): Error {
     let k = if e.isTimeout() { Kind.Timeout } else if e.isCancelled() { Kind.Cancelled } else { Kind.Io }
-    return Error{kind: k, msg: e.toStr(), code: e.errno, peer: peer, cause: e}
+    return Error{kind: k, msg: e.toStr(), code: e.errno, peer: peer.clone(), cause: e}
 }
 
 // OpenSSL's error queue as text (the reasons, oldest first, without
@@ -236,7 +236,7 @@ fn drainQueue(what: &str): Queue {
         }
         if !strings.contains(&text, &r) { text = if len(text) == 0 { r } else { text + "; " + r } }
     }
-    if len(text) == 0 { text = what }
+    if len(text) == 0 { text = what.clone() }
     return Queue{text: text, code: first}
 }
 
@@ -441,7 +441,7 @@ fn newContext(o: &Options, server: bool): Result[Context, Error] {
         if SSL_CTX_use_certificate_chain_file(h, o.certFile) != 1 {
             return Err(fileFail("the certificate file", &o.certFile))
         }
-        let key = if len(o.keyFile) > 0 { o.keyFile } else { o.certFile }
+        let key: &str = if len(o.keyFile) > 0 { &o.keyFile } else { &o.certFile }
         if SSL_CTX_use_PrivateKey_file(h, key, i32(SSL_FILETYPE_PEM)) != 1 {
             return Err(fileFail("the key file", &key))
         }
@@ -482,14 +482,14 @@ fn loadCas(h: ptr, file: &str, dir: &str): Result[Unit, Error] {
 pub fn (c: &Context) share(): Context {
     let r = SSL_CTX_up_ref(c.ctx)
     OPEN += 1
-    return Context{ctx: c.ctx, server: c.server, verify: c.verify, pins: c.pins, names: c.names, sni: c.sni,
-                   alpn: c.alpn}
+    return Context{ctx: c.ctx, server: c.server, verify: c.verify, pins: c.pins.clone(), names: c.names, sni: c.sni,
+                   alpn: c.alpn.clone()}
 }
 
 pub fn (c: &Context) isServer(): bool { return c.server }
 
 // The ALPN protocols from Options.alpn, trimmed and joined by "," ("": none).
-pub fn (c: &Context) alpn(): str { return c.alpn }
+pub fn (c: &Context) alpn(): str { return c.alpn.clone() }
 
 // Whether h is an IPv4 or IPv6 address literal (no SNI is sent for one).
 fn isIpLiteral(h: &str): bool {
@@ -507,7 +507,7 @@ fn isIpLiteral(h: &str): bool {
 // (an IP address is checked as one, and sends no SNI); "" only with
 // insecureSkipVerify. A server's serverName is only used in errors.
 pub fn (c: &Context) engine(serverName: &str): Result[Engine, Error] {
-    var host: str = serverName
+    var host: str = serverName.clone()
     if len(host) > 1 && host[0] == '[' && host[len(host) - 1] == ']' { host = host[1..len(host) - 1] }
     if !c.server && c.verify && c.names && len(host) == 0 {
         return Err(fail(Kind.Config, "a server name is needed to verify the server's certificate", 0, ""))
@@ -520,7 +520,7 @@ pub fn (c: &Context) engine(serverName: &str): Result[Engine, Error] {
     if isNull(rb) || isNull(wb) { panic("tls: out of memory (BIO_new)") }
     SSL_set_bio(ssl, rb, wb)        // the SSL owns them now
     OPEN += 1
-    var e = Engine{ssl: ssl, rbio: rb, wbio: wb, host: host, pins: c.pins, state: ST_HANDSHAKE, server: c.server,
+    var e = Engine{ssl: ssl, rbio: rb, wbio: wb, host: host.clone(), pins: c.pins.clone(), state: ST_HANDSHAKE, server: c.server,
                    verify: c.verify, alpn: None}
     if c.server {
         SSL_set_accept_state(ssl)
@@ -673,7 +673,7 @@ pub fn (e: mut &Engine) handshake(): Result[bool, Error] {
 fn (e: mut &Engine) checkPins(): Result[Unit, Error] {
     if len(e.pins) == 0 { return Ok(Unit{}) }
     let got = match e.peer() {
-        Some(c) { c.sha256 }
+        Some(c) { c.sha256.clone() }
         None { "" }
     }
     for p in strings.splitByte(&e.pins, ',') {
@@ -765,7 +765,7 @@ pub fn (e: &Engine) verifyText(): str { return X509_verify_cert_error_string(SSL
 pub fn (e: &Engine) resumed(): bool { return SSL_session_reused(e.ssl) == 1 }
 
 // The name the engine was made for.
-pub fn (e: &Engine) serverName(): str { return e.host }
+pub fn (e: &Engine) serverName(): str { return e.host.clone() }
 
 // A certificate, for diagnostics.
 pub type Cert = value record {
@@ -925,7 +925,7 @@ fn (c: mut &Conn) flushStall(w: Where, dl: int, stallMs: int): Result[Unit, Erro
         }
         match sent {
             Ok(_) {}
-            Err(x) { return Err(ioFail(x, &c.e.host)) }
+            Err(x) { return Err(ioFail(x.clone(), &c.e.host)) }
         }
     }
     return Ok(Unit{})
@@ -938,7 +938,7 @@ fn (c: mut &Conn) fill(w: Where, dl: int): Result[bool, Error] {
     let got = if dl < 0 { c.sock.read(mut &c.buf, w) } else { c.sock.readFor(mut &c.buf, leftMs(dl), w) }
     let n = match got {
         Ok(k) { k }
-        Err(x) { return Err(ioFail(x, &c.e.host)) }
+        Err(x) { return Err(ioFail(x.clone(), &c.e.host)) }
     }
     if n == 0 {
         c.eof = true
@@ -961,7 +961,7 @@ fn (c: mut &Conn) handshakeD(w: Where, dl: int): Result[Unit, Error] {
                 if sent.isErr() { return Err(sent.unwrapErr()) }
                 if done { return Ok(Unit{}) }
             }
-            Err(x) { return Err(x) }
+            Err(x) { return Err(x.clone()) }
         }
         let more = try c.fill(w, dl)
         if !more {
