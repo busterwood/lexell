@@ -4267,6 +4267,124 @@ After P3 the batch engine (3,717 lines) is out of exec, and exec is about
 RUN_PER_ROW (q2, q17, q20, before step 5's 5f), `Fetch` for point
 selects (the OLTP gate), and the row engine's deletion.
 
+#### 6.2.4 4.1 and E0 as built
+
+Built 2026-11-17 on `redesign/bind` from main 5f4ce91e. Scripts and
+outputs are in `~/tpch-w/bind/s41`.
+
+**Slice 4.1** (172df168), from the scratch fix of 6.2.2, reviewed:
+
+- `stmtNames`: the `*` of an EXISTS subquery reads nothing, unless the
+  rows it counts depend on their values. Those keep `*` reading every
+  column:
+  - a set operation (its members' `use` is not EXISTS anyway);
+  - GROUP BY or grouping sets: `group by 1, 2 having count(*) > 1` names
+    `*`'s columns by position, which no name list sees;
+  - DISTINCT and DISTINCT ON: `select distinct * ... offset 1` counts
+    distinct rows.
+
+  The other `*`s are unchanged: the outer select list's, an IN
+  subquery's, a view's or FROM subquery's (`SUB_FROM`), NATURAL's.
+  `count(*)` was never a `*` item.
+- `stmtNames` also reads DISTINCT ON's keys. They were missing: `select
+  distinct on (b) k from t` read no `b` and gave one row, with batches
+  and without (a bug on main, found in the review).
+- `batchGroupsIn`: a grouped join gathers the keys', the aggregates' and
+  `afterCols` (the names a group's first row keeps: outputs, HAVING, ORDER
+  BY, which holds DISTINCT ON's keys). `afterCols` is the list the first
+  row already used, so the first row cannot read a column the join did
+  not gather. Windows and grouping sets do not take this path.
+- Where a dropped column would have shown: in batches a key or output on
+  a column not decoded is an index out of range (`bEval`), not a NULL. A
+  build without the GROUP BY and DISTINCT exceptions crashed on the GROUP
+  BY shape; one without `afterCols` in the gather gave no rows for the
+  HAVING shape. The test catches both.
+- Test `exec_narrow.lxl`: 24 shapes (q21's and q4's, NOT EXISTS, IN
+  (select *), the outer `*`, a view, LATERAL, `count(*)` in EXISTS, the
+  three exceptions, grouped joins whose outputs, HAVING and ORDER BY read
+  non-key columns, an outer join's ON filter, a window, DISTINCT ON,
+  EXISTS with a join, ORDER BY with OFFSET, a window, uncorrelated, nested
+  under IN). Each runs with batches off and on, and both must give
+  PostgreSQL 18's rows. 13 of them run grouped over batches, the five
+  grouped joins (1, 13, 14, 17, 19) among them.
+
+**E0** (38a9568d, 74c6ff09):
+
+- 147 one-line forwards deleted (functions and constants that only call
+  or name another module's): exec, the protocol and dialect modules, 112
+  tests and the two generators now call the owner. 12 of them were used
+  outside exec (`text` by about 110 tests, `isNull`, `coerce`, the catalog
+  and syscat constants).
+- Exec's type aliases are all private now (`OutCol` and `TabType` were
+  re-exported: the protocol modules name `lexdb_bind.OutCol` and
+  `lexdb_catalog.TabType`). A private alias stays: it is every module's
+  import idiom, as `e()` is: 48 remain.
+- Adapters that add exec's context stay: `typing()` (`exprOid`,
+  `arrayConcat`), `parseExpr` (`decTable`, `allTables`), a `Table`'s `Rel`
+  (`keyOf`, `rowOf`, `fetch`, `fillLevel`, `placesMissing`,
+  `placesNeeded`, `idxDecOf`), and `tempKey`, `sameExpr`, `isDialectFn`,
+  `tabTypeId`.
+- Helpers: `copyRow`, `copyStrs`, `copyInts`, `copyBools` became
+  `collections.copyOf`; `nullRow(n)` became `array(n, Val.Null)`; `bv`,
+  `tv`, `iv` were unused; `num` and `hasStr` went to `lexdb_base`, with
+  `lexdb_catalog`'s copies. Staying with their users: `toHex`, `intsOf`,
+  `intsText` (statistics, E2), `fmax`, `fmin` (the planner, E5; not std's
+  `max`, which differs on NaN), `span` (sequences), `quoted`, `append1`,
+  `copyRows`.
+- Import edges 185 to 198, all allowed by `imports.py` (unchanged): the
+  protocol and dialect modules (`lexdb_wire`, `lexdb_tds`, `lexdb_tns`,
+  `lexdb_tsql`, `lexdb_plsql`) import `lexdb_ops` and `lexdb_bind`, and
+  three of them `lexdb_catalog`, where they went through exec before.
+- No secret left exec in E0: what went were other modules' secrets that
+  exec re-exported (the row format's place kinds, the cost constants, the
+  catalog's encodings, value display and coercion). Exec stops being the
+  door to them, which is what the later moves need: code that leaves
+  exec names the owner already.
+
+**Line counts:**
+
+| | main 5f4ce91e | 4.1 | E0 |
+|---|---:|---:|---:|
+| `lexdb_exec` | 28,224 | 28,245 | 27,989 |
+| `lexdb_base` | 108 | 108 | 119 |
+| `lexdb_catalog` | 1,358 | 1,358 | 1,351 |
+| `lexdb_rows` | 1,642 | 1,642 | 1,647 (LONG's comment) |
+
+The protocol and dialect modules gained 2 or 3 import lines each.
+
+**Gates:**
+
+- Suite, from a snapshot of each commit: 189 passed (188 and
+  `exec_narrow`), imports ok (185 edges, then 198).
+- Naming battery (`bench/naming`): identical to main's build for both.
+- TPC-H, SF1, one run each, the 22 checksums as the baseline's (1744ef99),
+  against main's stored result (`out-main-d32f5fb8`, the same code):
+
+  | query | main | 4.1 | E0 |
+  |---|---:|---:|---:|
+  | q21 | 8,266 | 1,964 | 1,957 |
+  | q4 | 581 | 359 | 358 |
+  | q13 | 1,328 | 1,118 | 1,125 |
+  | total | 30,389 | 23,026 | 23,110 |
+
+  - q21 is 76% down and q4 38%, as 6.2.2 expected. q13 (a grouped left
+    join whose ON reads `o_comment`) is 16% down, probably from the
+    gather (not profiled). No query was more than 3% slower.
+  - main's stored run is slower than 6.2.2's second runs (q21 8,266
+    against 5,910 ms, q4 581 against 442): one pass per query (RUNS 1),
+    as the 4.1 and E0 runs are, against 6.2.2's second of two.
+  - E0 against 4.1's run: the total +0.4%. q1 (+3.6%) and q20 (+4.0%)
+    were repeated on copies of the binaries (`s41/rep`, 3 runs, medians):
+    q20 383 ms main, 386 E0, level. q1 2,330 and 2,363 main, 2,311 4.1,
+    2,405 and 2,398 E0: 2 to 4% slower, reproduced.
+  - q1's perf profiles (`rep/self-p1.txt`, `rep/self-e0.txt`) have the
+    same functions in the same shares, and E0's has 1.4% fewer samples.
+    E0 changes nothing on q1's path but who is called by name (the same
+    functions, directly). Not explained; code placement is the likely
+    cause. Not resolved.
+- `simple.sh` and `pts.sh` were not run: E0 does not touch the
+  per-statement path, beyond names.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
