@@ -3,11 +3,10 @@
 // slice P1a), against the engines it replaces. Random queries over a
 // table of 2,600 rows (three batches, the last part full) with integers,
 // booleans, numerics, texts, dates and NULLs, an index and its covering
-// read, run four ways: SET lexdb_batch = off (the row engine, the
-// reference), on with the pipeline switched off (the batch drivers, as
-// before P1), and with it on, the rows held and given to a sink (an
-// OutBatch where a chunk made them). The four must agree, errors
-// included:
+// read, run by the row engine (SET lexdb_batch = off, the reference) and
+// by the pipeline, each with the rows held and given to a sink (an
+// OutBatch where a chunk made them). They must agree, errors included,
+// and the rows a sink was given before an error:
 // - every path: a scan, a primary key range, its point, IN lists, read
 //   backward, an index range, the index read alone, a LIMIT on each;
 // - outputs and conditions of every type, with NULLs, and errors under
@@ -18,11 +17,11 @@
 //   LIMIT 0, as the sinks and PostgreSQL do not);
 // - parameters, the plan kept and run again with others;
 // - max_statement_mem: the rows held past it, the same error;
-// - EXPLAIN ANALYZE's counts the same with the pipeline on and off; its
-//   EXPLAIN the same.
-// Aggregates over the table (slice P1b), the same four ways (the pipeline
-// switched off: the row engine with batches on, since the one-table batch
-// driver is deleted): the plain
+// - EXPLAIN ANALYZE's counts the same in the pipeline and the row engine
+//   (but for the batches); its EXPLAIN the same.
+// (Slices P1a and P1b compared the batch drivers too, with the pipeline
+// switched off; slice P1c deleted the one-table drivers and the switch.)
+// Aggregates over the table (slice P1b), the same ways: the plain
 // aggregate and GROUP BY one or more keys (integers, booleans, texts,
 // numerics, dates, expressions, NULL keys), count, sum, avg, min and max
 // of every type, FILTER, numerics' scales, HAVING, DISTINCT over the
@@ -31,20 +30,33 @@
 // sum, a text function's key: the pipeline's rows) and shapes the
 // pipeline does not take (DISTINCT and ORDER BY in a call, string_agg,
 // grouping sets: the row engine); parameters; max_statement_mem.
-// expect: committed: 500 queries, 500 the same four ways
-// expect: in a transaction: 120 queries, 120 the same four ways
-// expect: fixed: 30 queries, 30 the same four ways
+// Subqueries run once (slice P1c), their values given to the pipeline's
+// run: scalar, EXISTS and IN subqueries in WHERE, in the select list and
+// in an aggregate's conditions, keys and calls; a scalar's NULL and an
+// empty set, a set with a NULL, IN of numbers, texts and dates; a scalar
+// of more than one row (21000); a subquery in the path (a primary key's
+// point, a lookup per value of an IN); parameters in the subqueries, the
+// plan kept and run again; EXPLAIN ANALYZE's lines (the subqueries' runs
+// included) the same.
+// expect: committed: 500 queries, 500 the same both ways
+// expect: in a transaction: 120 queries, 120 the same both ways
+// expect: fixed: 30 queries, 30 the same both ways
 // expect: the pipeline ran: true, read batches: true, errors: true
 // expect: parameters: 12 of 12 the same
-// expect: memory: ERROR 53200 | ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
+// expect: memory: ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
 // expect: counts: 24 of 24 the same
-// expect: aggregates: 400 queries, 400 the same four ways
-// expect: aggregates in a transaction: 80 queries, 80 the same four ways
-// expect: aggregates fixed: 26 queries, 26 the same four ways
+// expect: aggregates: 400 queries, 400 the same both ways
+// expect: aggregates in a transaction: 80 queries, 80 the same both ways
+// expect: aggregates fixed: 26 queries, 26 the same both ways
 // expect: aggregates ran in the pipeline: true, over batches: true, row by row: true
 // expect: aggregate parameters: 12 of 12 the same
-// expect: aggregate memory: ERROR 53200 | ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
+// expect: aggregate memory: ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
 // expect: aggregate counts: 12 of 12 the same
+// expect: subqueries: 300 queries, 300 the same both ways
+// expect: subqueries fixed: 34 queries, 34 the same both ways
+// expect: subqueries ran in the pipeline: true
+// expect: subquery parameters: 12 of 12 the same
+// expect: subquery counts: 10 of 10 the same
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -54,6 +66,7 @@ import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_rows"
 import "../../../cmd/lexdb_bind"
 import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_pipe"
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
     match s.exec(sql) {
@@ -133,21 +146,18 @@ fn viaSink(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, pc: 
     }
 }
 
-// sql's held rows (q) and its sink's (viaSink) with the pipeline on, then
-// the batch drivers' (pipeline off) and the row engine's: the same.
+// sql's held rows (q) and its sink's (viaSink) in the row engine, then in
+// the pipeline: the same.
 var sunkErrors: int = 0
 
-fn four(s: mut &lexdb_exec.Session, sql: &str): bool {
+fn both(s: mut &lexdb_exec.Session, sql: &str): bool {
     let a = q(s, &"set lexdb_batch = off")
     let off = q(s, sql)
-    let b = q(s, &"set lexdb_batch = on")
-    lexdb_exec.setPipe(false)
-    let drivers = q(s, sql)
     var pc0 = lexdb_exec.oneShot()
     let none: []lexdb_sql.Val = []
     var ob0 = false
     let sunk0 = viaSink(s, sql, &none, mut &pc0, mut &ob0)
-    lexdb_exec.setPipe(true)
+    let b = q(s, &"set lexdb_batch = on")
     let held = q(s, sql)
     var pc = lexdb_exec.oneShot()
     var ob = false
@@ -157,15 +167,14 @@ fn four(s: mut &lexdb_exec.Session, sql: &str): bool {
     // PostgreSQL's Limit; the held rows' path read a first row, and gave
     // its error (design/lexdb-layers.md 6.2.6)
     if strings.endsWith(sql, &" limit 0") {
-        if held == "" && sunk == "" && sunk0 == "" && (off == drivers) { return true }
+        if held == "" && sunk == "" && sunk0 == "" { return true }
     }
-    // a sink's rows before an error are the batch drivers' sink's
-    if off == drivers && drivers == held && sunk == sunk0 && (strings.contains(&sunk, "ERROR") || sunk == held) { return true }
+    // a sink's rows before an error are the row engine's sink's
+    if off == held && sunk == sunk0 && (strings.contains(&sunk, "ERROR") || sunk == held) { return true }
     println("DIFFERENT: " + sql)
     println("  rows:     " + off)
-    println("  drivers:  " + drivers)
     println("  pipeline: " + held)
-    println("  sink (drivers):  " + sunk0)
+    println("  sink (rows):     " + sunk0)
     println("  sink (pipeline): " + sunk)
     return false
 }
@@ -306,16 +315,37 @@ fn plan(x: &str): str {
     return "" + parts[0]
 }
 
+
+// x without its tables' batches (", batches n").
+fn noBatches(x: &str): str {
+    var out = ""
+    var i = 0
+    while i < len(x) {
+        if strings.startsWith(&x[i..len(x)], &", batches ") {
+            i += 10
+            while i < len(x) && x[i] >= '0' && x[i] <= '9' { i += 1 }
+            continue
+        }
+        out = out + x[i..i + 1]
+        i += 1
+    }
+    return out
+}
+
+// EXPLAIN ANALYZE's lines of sql in the row engine and in the pipeline
+// the same, but for the tables' batches; and its EXPLAIN. (A scan that
+// stops within a batch, at a LIMIT or an EXISTS's first row, reads the
+// batch's rows: not among the shapes.)
 fn sameCounts(s: mut &lexdb_exec.Session, sql: &str): bool {
-    lexdb_exec.setPipe(false)
-    let off = q(s, &("explain analyze " + sql))
+    let a = q(s, &"set lexdb_batch = off")
+    let off = noBatches(&q(s, &("explain analyze " + sql)))
     let offPlan = q(s, &("explain " + sql))
-    lexdb_exec.setPipe(true)
-    let on = q(s, &("explain analyze " + sql))
+    let b = q(s, &"set lexdb_batch = on")
+    let on = noBatches(&q(s, &("explain analyze " + sql)))
     let onPlan = q(s, &("explain " + sql))
     if plan(&on) == plan(&off) && onPlan == offPlan { return true }
     println("COUNTS: " + sql)
-    println("  drivers:  " + off)
+    println("  rows:     " + off)
     println("  pipeline: " + on)
     println("  plans: " + offPlan + " / " + onPlan)
     return false
@@ -328,13 +358,13 @@ fn main() {
         var r = lexdb_base.rng(61)
         load(mut &s, mut &r)
         let an = q(mut &s, &"analyze f")
-        let runs0 = lexdb_exec.pipeRuns()
+        let runs0 = lexdb_pipe.runCounts()
         var same = 0
         for i in 0..500 {
             let sql = query(mut &r, i % 3 == 0)
-            if four(mut &s, &sql) { same += 1 }
+            if both(mut &s, &sql) { same += 1 }
         }
-        println("committed: 500 queries, " + same.toStr() + " the same four ways")
+        println("committed: 500 queries, " + same.toStr() + " the same both ways")
         // a transaction's own writes, not committed, read merged
         let b = q(mut &s, &"begin")
         let w1 = q(mut &s, &"insert into f values (5001, 7, 7, 1, true, 'L1', 1.5, '2024-01-02', 'w1'), (5002, null, 1, 3, false, 'x', 2.0, null, null)")
@@ -344,10 +374,10 @@ fn main() {
         for i in 0..120 {
             // (no errors: one would end the transaction)
             let sql = query(mut &r, true)
-            if four(mut &s, &sql) { sameT += 1 }
+            if both(mut &s, &sql) { sameT += 1 }
         }
         let rb = q(mut &s, &"rollback")
-        println("in a transaction: 120 queries, " + sameT.toStr() + " the same four ways")
+        println("in a transaction: 120 queries, " + sameT.toStr() + " the same both ways")
         // the shapes one by one: errors on one row of a batch, before and
         // past a LIMIT; short-circuits; every path
         let fixed = ["select id, x / (z - 3) from f", "select id, x / (z - 3) from f limit 2", "select id from f where x / (z - 3) > 0",
@@ -364,9 +394,9 @@ fn main() {
                      "select id from f limit 0", "select * from f where id < 3", "select x + z, x > 100 from f limit 1100",
                      "select abs(x - 100), round(nu) from f where id between 2000 and 2100", "select id from f where x is null"]
         var sameF = 0
-        for sql in fixed { if four(mut &s, &sql) { sameF += 1 } }
-        println("fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same four ways")
-        let runs1 = lexdb_exec.pipeRuns()
+        for sql in fixed { if both(mut &s, &sql) { sameF += 1 } }
+        println("fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same both ways")
+        let runs1 = lexdb_pipe.runCounts()
         println("the pipeline ran: " + (runs1[0] - runs0[0] > 500).toStr() + ", read batches: " + (runs1[1] - runs0[1] > 100).toStr() +
                 ", errors: " + (sunkErrors > 20).toStr())
         // parameters: the plan kept (one cache) and run with each value,
@@ -393,9 +423,6 @@ fn main() {
         let a1 = q(mut &s, &"set lexdb_batch = off")
         append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
         let a2 = q(mut &s, &"set lexdb_batch = on")
-        lexdb_exec.setPipe(false)
-        append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
-        lexdb_exec.setPipe(true)
         append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
         let lim = "select id, tx, w, nu from f where x > 100 limit 2000"
         append(mut &errs, strings.split(&q(mut &s, &lim), &" ")[0] + " " + strings.split(&q(mut &s, &lim), &" ")[1])
@@ -409,7 +436,7 @@ fn main() {
         // EXPLAIN ANALYZE's counts, and EXPLAIN, with the pipeline on and off
         let shapes = ["select id from f", "select id, x + z from f where x > 100", "select x from f where x between 10 and 30",
                       "select id from f where id = 17", "select id from f where id between 100 and 1500 and bo",
-                      "select id, tx from f where tx like 'L1%' limit 5", "select id from f where id in (1, 2, 3)",
+                      "select id, tx from f where tx like 'L1%'", "select id from f where id in (1, 2, 3)",
                       "select id from f order by id desc limit 4", "select id, x from f where x = 42", "select id from f limit 1100",
                       "select id from f where id > 2000 order by id", "select nu * 2 from f where nu > 10.5 and z = 1",
                       "select id from f where x > 50 limit 3", "select upper(tx) from f where dt >= '2024-01-10'",
@@ -421,20 +448,21 @@ fn main() {
         for sql in shapes { if sameCounts(mut &s, &sql) { sameC += 1 } }
         println("counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
         aggregates(mut &s, mut &r)
+        subqueries(mut &s, mut &r)
         return 0
     })
 }
 
-// The aggregates (slice P1b), four ways.
+// The aggregates (slice P1b), both ways.
 fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     let g0 = lexdb_exec.decCounts()[2]
-    let runs0 = lexdb_exec.pipeRuns()
+    let runs0 = lexdb_pipe.runCounts()
     var same = 0
     for i in 0..400 {
         let sql = aggQuery(r, i % 3 != 0)
-        if four(s, &sql) { same += 1 }
+        if both(s, &sql) { same += 1 }
     }
-    println("aggregates: 400 queries, " + same.toStr() + " the same four ways")
+    println("aggregates: 400 queries, " + same.toStr() + " the same both ways")
     let b = q(s, &"begin")
     let w1 = q(s, &"insert into f values (6001, 7, 7, 1, true, 'L1', 1.5, '2024-01-02', 'w1'), (6002, null, 1, 3, false, 'x', 2.0, null, null)")
     let w2 = q(s, &"update f set x = x + 1, nu = nu * 3, tx = 'L1' || tx where id % 7 = 0")
@@ -442,10 +470,10 @@ fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     var sameT = 0
     for i in 0..80 {
         let sql = aggQuery(r, true)
-        if four(s, &sql) { sameT += 1 }
+        if both(s, &sql) { sameT += 1 }
     }
     let rb = q(s, &"rollback")
-    println("aggregates in a transaction: 80 queries, " + sameT.toStr() + " the same four ways")
+    println("aggregates in a transaction: 80 queries, " + sameT.toStr() + " the same both ways")
     let fixed = ["select count(*) from f", "select count(*), sum(x), avg(nu) from f where id < 0", "select z, count(*) from f where id < 0 group by z",
                  "select sum(y * 1000000000) from f", "select z, sum(y * 1000000000) from f group by z order by 1",
                  "select sum(x / (z - 3)) from f", "select z, max(x / (z - 3)) from f group by z order by 1",
@@ -460,9 +488,9 @@ fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
                  "select count(*), max(x) from f where id in (5, 7, 2600)", "select count(*) from f where id = 17",
                  "select z, count(*) from f group by rollup (z) order by 1", "select dt, min(nu) from f where dt >= '2024-01-25' group by dt having min(nu) > 1 order by 1"]
     var sameF = 0
-    for sql in fixed { if four(s, &sql) { sameF += 1 } }
-    println("aggregates fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same four ways")
-    let runs1 = lexdb_exec.pipeRuns()
+    for sql in fixed { if both(s, &sql) { sameF += 1 } }
+    println("aggregates fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same both ways")
+    let runs1 = lexdb_pipe.runCounts()
     let batches = lexdb_exec.decCounts()[2] - g0
     println("aggregates ran in the pipeline: " + (runs1[0] - runs0[0] > 400).toStr() + ", over batches: " + (runs1[1] - runs0[1] > 200 && batches > 200).toStr() +
             ", row by row: " + (runs1[0] - runs0[0] > runs1[1] - runs0[1]).toStr())
@@ -489,9 +517,6 @@ fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     let a1 = q(s, &"set lexdb_batch = off")
     append(mut &errs, firstTwo(&q(s, &big)))
     let a2 = q(s, &"set lexdb_batch = on")
-    lexdb_exec.setPipe(false)
-    append(mut &errs, firstTwo(&q(s, &big)))
-    lexdb_exec.setPipe(true)
     append(mut &errs, firstTwo(&q(s, &big)))
     // (row by row: a float's sum does not run over batches)
     append(mut &errs, firstTwo(&q(s, &"select id, sum(cast(x as float8)) from f group by id")))
@@ -516,4 +541,116 @@ fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
 fn firstTwo(x: &str): str {
     let p = strings.split(x, &" ")
     return if len(p) > 1 { p[0] + " " + p[1] } else { x.toStr() }
+}
+
+// A condition with a subquery run once (safe: no error).
+fn subCond(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(14)
+    if c == 0 { return "x > (select avg(k) from g)" }
+    if c == 1 { return "z in (select k from g)" }
+    if c == 2 { return "z not in (select k from g where k is not null)" }
+    if c == 3 { return "z in (select k from g)" }       // (g has a NULL: NULL where none is equal)
+    if c == 4 { return "exists (select 1 from g where k > " + r.below(8).toStr() + ")" }
+    if c == 5 { return "nu in (select n from g)" }
+    if c == 6 { return "tx in (select t from g)" }
+    if c == 7 { return "dt in (select d from g)" }
+    if c == 8 { return "x < (select max(k) * 30 from g where k < " + r.below(8).toStr() + ")" }
+    if c == 9 { return "(select min(k) from e) is null" }
+    if c == 10 { return "z not in (select k from e)" }
+    if c == 11 { return "bo = (select count(*) > 3 from g)" }
+    if c == 12 { return if safe { "x <> (select k from g where k = 3)" } else { "x = (select k from g)" } }
+    return "x in (select k * 20 from g) or z = 0"
+}
+
+// An output with a subquery run once.
+fn subOut(r: mut &lexdb_base.Rng): str {
+    return pick(r, &["(select max(k) from g)", "x - (select min(k) from g)", "z in (select k from g)", "exists (select 1 from e)",
+                     "(select t from g where k = 2)", "case when z = 1 then (select sum(k) from g) else z end", "(select k from e)",
+                     "tx in (select t from g)", "coalesce((select max(n) from g where k > 50), nu)"])
+}
+
+// A random query over f with subqueries run once: in WHERE, in the select
+// list, or in an aggregate's.
+fn subQ(r: mut &lexdb_base.Rng, safe: bool): str {
+    var conds: []str = []
+    let p = path(r)
+    if p != "" { append(mut &conds, p) }
+    for i in 0..(1 + r.below(2)) { append(mut &conds, subCond(r, safe)) }
+    if r.below(3) == 0 { append(mut &conds, cond(r, safe)) }
+    let w = " where " + strings.join(&conds, " and ")
+    if r.below(4) == 0 {
+        let k = pick(r, &["z", "bo", "tx", "z in (select k from g)"])
+        let c = pick(r, &["count(*)", "sum(x)", "max(nu)", "sum(x - (select min(k) from g))", "count(*) filter (where z in (select k from g))"])
+        return "select " + k + ", " + c + " from f" + w + " group by 1 order by 1"
+    }
+    var items: []str = []
+    for i in 0..(1 + r.below(2)) { append(mut &items, pick(r, &["id", "x", "z", "tx", "nu", "x + z"])) }
+    if r.below(2) == 0 { append(mut &items, subOut(r)) }
+    var sql = "select " + strings.join(&items, ", ") + " from f" + w
+    if r.below(4) == 0 { sql = sql + " limit " + pick(r, &["1", "5", "300"]) }
+    return sql
+}
+
+// Subqueries run once (slice P1c), both ways.
+fn subqueries(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table g (k int, t text, n numeric(10,2), d date)")
+    let c2 = q(s, &"insert into g values (1, 'L1', 1.5, '2024-01-03'), (2, 'L2', 2.0, '2024-01-07'), (3, '7', 10.50, null), (4, null, null, '2024-01-12'), (null, 'L40', 3.0, '2024-01-20'), (6, 'L60', 21.5, '2024-01-28'), (2, 'L2', 2.0, null)")
+    let c3 = q(s, &"create table e (k int)")
+    let runs0 = lexdb_pipe.runCounts()
+    var same = 0
+    for i in 0..300 {
+        let sql = subQ(r, i % 3 != 0)
+        if both(s, &sql) { same += 1 }
+    }
+    println("subqueries: 300 queries, " + same.toStr() + " the same both ways")
+    let fixed = ["select id, x from f where x > (select avg(k) * 40 from g)", "select id, (select max(k) from g) from f where id < 20",
+                 "select id from f where z in (select k from g)", "select id, z in (select k from g) from f where id < 60",
+                 "select id from f where z not in (select k from g)", "select id from f where z not in (select k from g where k is not null)",
+                 "select id from f where exists (select 1 from g where k = 6)", "select id from f where not exists (select 1 from e)",
+                 "select id, exists (select 1 from g where k = 99) from f where id < 5", "select id, (select k from e) from f where id < 5",
+                 "select id from f where x in (select k from e)", "select id from f where x = (select k from g)",
+                 "select id, (select k from g) from f", "select id, (select k from g) from f where id < 0",
+                 "select id from f where id = (select max(k) from g)", "select id, x from f where id in (select k from g)",
+                 "select id from f where id in (select k from g where k > 100)", "select x from f where x = (select min(k) * 50 from g)",
+                 "select id from f where nu in (select n from g)", "select id from f where tx in (select t from g)",
+                 "select id from f where dt in (select d from g)", "select id from f where x / ((select min(k) from g) - 1) > 0",
+                 "select id, x / ((select min(k) from g) - 1) from f", "select id from f where z = 3 or x / ((select min(k) from g) - 1) > 0 limit 3",
+                 "select case when z = 1 then (select sum(k) from g) else z end from f where id < 40",
+                 "select z, count(*) from f where x > (select avg(k) * 40 from g) group by z order by 1",
+                 "select sum(x), count(*) from f where z in (select k from g)", "select z in (select k from g), count(*) from f group by 1 order by 1",
+                 "select z, sum(x - (select min(k) from g)) from f group by z order by 1", "select count(*) filter (where tx in (select t from g)) from f",
+                 "select z, count(*) from f where z = (select k from g) group by z", "select max(x) from f where id in (select k from g)",
+                 "select id from f where x > (select avg(x) from f where z in (select k from g)) limit 10",
+                 "select id from f where x > (select avg(k) from g where g.k = f.z)"]
+    var sameF = 0
+    for sql in fixed { if both(s, &sql) { sameF += 1 } }
+    println("subqueries fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same both ways")
+    let runs1 = lexdb_pipe.runCounts()
+    println("subqueries ran in the pipeline: " + (runs1[0] - runs0[0] > 300).toStr())
+    // parameters in the subqueries: the plan kept and run with each value,
+    // against the row engine's
+    let psql = "select id, x + $1, (select max(k) from g where k < $2) from f where x > (select avg(k) * $1 from g) and z in (select k from g where k <> $2) limit 30"
+    var pc = lexdb_exec.newPlanCache()
+    var sameP = 0
+    for i in 0..12 {
+        let ps = [lexdb_sql.Val.Int(r.below(60)), lexdb_sql.Val.Int(r.below(7))]
+        var ob = false
+        let viaPipe = viaSink(s, &psql, &ps, mut &pc, mut &ob)
+        let a = q(s, &"set lexdb_batch = off")
+        var pc2 = lexdb_exec.oneShot()
+        var ob2 = false
+        let viaRows = viaSink(s, &psql, &ps, mut &pc2, mut &ob2)
+        let b2 = q(s, &"set lexdb_batch = on")
+        if viaPipe == viaRows && !strings.contains(&viaPipe, "ERROR") { sameP += 1 } else { println("SUB PARAMS: " + viaPipe + " / " + viaRows) }
+    }
+    println("subquery parameters: " + sameP.toStr() + " of 12 the same")
+    let shapes = ["select id from f where x > (select avg(k) * 40 from g)", "select id, (select max(k) from g) from f where id < 20",
+                  "select id from f where z in (select k from g) and id < 1000", "select id from f where not exists (select 1 from g where k > 100) limit 5",
+                  "select id from f where id = (select max(k) from g)", "select id from f where id in (select k from g)",
+                  "select z, count(*) from f where x > (select avg(k) * 40 from g) group by z", "select sum(x) from f where z in (select k from g)",
+                  "select id from f where x > (select avg(x) from f where z in (select k from g)) limit 10",
+                  "select id from f where tx in (select t from g) and x > 10"]
+    var sameC = 0
+    for sql in shapes { if sameCounts(s, &sql) { sameC += 1 } }
+    println("subquery counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
 }
