@@ -6131,6 +6131,10 @@ pub type Scope = record {
     // (a semi-join's subquery planned to be hashed, 9.104). Set by
     // buildQuery for a subquery, taken by the subquery's buildQuery.
     noRefKeys: bool
+    // the next SELECT planned is a statement's own, whose logical plan
+    // nothing reads (select runs the Sel): its Sel.lp is not built (a point
+    // select's planning cost). Set by select, taken by planSelect.
+    noLp: bool
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -6160,7 +6164,7 @@ fn constLit(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false}
+    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false, noLp: false}
 }
 
 // newScope for a statement of txn's session: its default collation (L2).
@@ -12514,10 +12518,41 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
           lim: Limits, pc: mut &PlanCache, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
-    // A prepared statement's plans, kept while the schema the transaction
-    // sees is the same (and the statistics and the planner's mode): one per
-    // outcome of the looks at its parameters' values (optimizer 22), the first whose
-    // looks the parameters give again taken.
+    if pc.keep {
+        let ver = try planVersion(st, txn)
+        if pc.ver != ver {
+            pc.sels = []
+            pc.looks = []
+            pc.ver = ver
+        }
+        for i in 0..len(pc.sels) {
+            if looksHold(&pc.looks[i], params) { return runSelTo(st, txn, &pc.sels[i], params, lim, sink) }
+        }
+    } else {
+        // a plan for this run only (oneShot: the simple protocol's) keeps
+        // nothing and needs no version; the catalog's is read as for a
+        // kept plan (a read the transaction notes)
+        let noted = try catVersion(st, txn)
+    }
+    var sc = newScopeIn(st, txn, params, ptypes)
+    sc.noLp = true
+    var sel = try planSelect(st, txn, s, params, mut &sc)
+    bindSel(mut &sel)
+    pipeSel(mut &sel)
+    let looks = replace(mut &sc.looks, [])
+    if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSelTo(st, txn, &sel, params, lim, sink) }
+    append(mut &pc.sels, sel)
+    append(mut &pc.looks, looks)
+    pc.plans += 1
+    return runSelTo(st, txn, &pc.sels[len(pc.sels) - 1], params, lim, sink)
+}
+
+// The version a prepared statement's plans (select's PlanCache) are kept
+// for: while the schema the transaction sees is the same (and the
+// statistics and the planner's mode). Its plans are one per outcome of the
+// looks at its parameters' values (optimizer 22), the first whose looks
+// the parameters give again taken.
+fn planVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
     var ver = try catVersion(st, txn)
     if len(txn.sql.path) > 0 { ver = ver + "|" + strings.join(&txn.sql.path, ",") }      // its names resolved by the path
     // the session's temporary objects (9.96): their DDL bumps this, not the catalog's version
@@ -12536,24 +12571,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     // the join order differs where reads are noted (optimizer 29, 33)
     if txn.sql.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.sql.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
-    if pc.ver != ver {
-        pc.sels = []
-        pc.looks = []
-        pc.ver = ver
-    }
-    for i in 0..len(pc.sels) {
-        if looksHold(&pc.looks[i], params) { return runSelTo(st, txn, &pc.sels[i], params, lim, sink) }
-    }
-    var sc = newScopeIn(st, txn, params, ptypes)
-    var sel = try planSelect(st, txn, s, params, mut &sc)
-    bindSel(mut &sel)
-    pipeSel(mut &sel)
-    let looks = replace(mut &sc.looks, [])
-    if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSelTo(st, txn, &sel, params, lim, sink) }
-    append(mut &pc.sels, sel)
-    append(mut &pc.looks, looks)
-    pc.plans += 1
-    return runSelTo(st, txn, &pc.sels[len(pc.sels) - 1], params, lim, sink)
+    return Ok(ver)
 }
 
 // runSel, or its rows given to sink as they are made (a client's: the
@@ -14059,6 +14077,9 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if s.withTies { return Err(e("0A000", &("lexdb: " + lexdb_sql.lockName(s.lockMode) + " is not supported with WITH TIES"))) }
         if len(s.wins) > 0 { return Err(e("0A000", &(what + "window functions"))) }
     }
+    // (a set's parts and the subqueries build theirs: their callers take them)
+    let noLp = sc.noLp
+    sc.noLp = false
     if s.setop != 0 { return planSet(st, txn, s, params, sc) }
     sc.early = sc.early || (s.limit.isSome() && len(s.order) == 0 && !stmtGathers(s))
     sc.ordLim = -1
@@ -14504,14 +14525,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // FOR UPDATE and the like: a Lock over the FROM and WHERE part, with
     // the levels applyLocks locks
     var base = replace(mut &q.lp, lexdb_bind.noPlan())
-    if s.lockMode > 0 {
+    if s.lockMode > 0 && !noLp {
         var lv: []int = []
         for k in 0..len(q.levels) { if q.levels[k].lock != 0 { append(mut &lv, k) } }
         base = lexdb_bind.LPlan.Lock(base, s.lockMode, s.lockWait, lv, [])
     }
-    let lp = selPlan(base, s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
-                     len(specs), bh, bw, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, collections.copyOf(&desc),
-                     collections.copyOf(&nullsFirst))
+    let lp = if noLp { lexdb_bind.noPlan() }
+             else { selPlan(base, s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
+                            len(specs), bh, bw, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, collections.copyOf(&desc),
+                            collections.copyOf(&nullsFirst)) }
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
