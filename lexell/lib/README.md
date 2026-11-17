@@ -58,7 +58,7 @@ for leaks.
 | `crypto.lxl` | 161 | digests (SHA-1, SHA-512, MD5), PBKDF2-HMAC-SHA512, AES-CBC and random bytes from libcrypto, for Oracle's password authentication |
 | `tns.lxl` | 3,308 | Oracle's TNS and TTC protocol, ported from python-oracledb's thin mode: packets, connect (TLS renegotiation over tcps), fast auth and the classic login with the 12c and 11g verifiers, execute, fetch, binds, the value codecs (NUMBER, DATE, TIMESTAMP[ TZ], BINARY_FLOAT/DOUBLE, BOOLEAN), OUT and IN OUT binds, REF CURSORs and implicit results, the bind placeholder parser |
 | `oracle.lxl` | 1,696 | Oracle Database natively over `tns`, for tasks: connection strings, Conn, Value and typed Param binds, buffered Rows, Stream, errors with ORA- codes, transaction[T], call with OUT binds and REF CURSORs, Pool/Lease on `pool` (stages O1 to O3, O5) |
-| `task.lxl` | 702 | concurrent tasks on one thread: Scope, Future, Promise, Shared, Frozen, all/any, yield, cancellation, sleep, deadlines; signals; worker processes |
+| `task.lxl` | 702 | concurrent tasks on one thread: Scope, Future, Promise, Shared, all/any, yield, cancellation, sleep, deadlines; signals; worker processes |
 | `par.lxl` | 50 | par.map: a map over a slice on a pool of threads, of a closure the compiler proves pure (design/parallel.md) |
 | `net.lxl` | 1,077 | TCP over IPv4 and IPv6 for tasks: listen (also with SO_REUSEPORT), accept, connect, read, write; name lookup and dial |
 | `tls.lxl` | 1,113 | TLS 1.2 and 1.3 through OpenSSL 3: an engine over memory buffers, and connections over net sockets for tasks; client and server contexts, verification, pins, client certificates, ALPN (a client offers, a server selects) |
@@ -586,7 +586,7 @@ task.Future[int], w: Where)` calls `f.wait(w)`).
   with no result cannot give `R`); `within` itself never parks.
 - `Cancelled` is `value closed { Cancelled; Abandoned; Timeout }` (`eq`,
   `toStr`).
-- `shared[T](v: T): Shared[T]`: a counted copy handle (a lang item, SPEC 15);
+- `shared[T](v: T): Shared[T]`: a counted handle (a lang item, SPEC 15); `sh.share()` makes another (a copy type until the switch, then owned);
   `sh.with(f: &fn(mut &T))` is the only access. Parking inside `with`, or a
   `with` on a value whose `with` is open, is exit 13. If every task is
   parked the program stops with exit 14 (deadlock). The messages name the
@@ -594,51 +594,11 @@ task.Future[int], w: Where)` calls `f.wait(w)`).
   at a.lxl:37) at a.lxl:41`, `Lexell: Shared.with on a value whose with is
   already open (the with at a.lxl:30) at a.lxl:35`, `Lexell: deadlock: every
   task is parked at a.lxl:41`.
-- `freeze[T](v: T): Frozen[T]`: a counted copy handle, like `Shared`, to a
-  value that never changes again. `fr.read(f: &fn(&T): R): R` lends it as
-  `&T`, and `f` **may park**: no writer exists, and the handle that `read`
-  borrows keeps a count, so the value cannot go away meanwhile (the reason
-  set-once globals are sound). Any number of tasks may be inside `read` at
-  once. `fr.get(): T` copies a copy value. The value is dropped with the last
-  handle. For what every connection's task reads and none writes: a router,
-  configuration, templates. A forked worker gets its own copy with its own
-  count. It is a closure, not `get(): &T`, because a result may only borrow
-  a place rooted at the receiver (SPEC 10 rule 5) and the value lives in the
-  runtime's box.
-
-The scheduler waits in `epoll_wait` only when no task is runnable, and checks
-sockets and timers every 64 switches otherwise. A task parked in `sleep`, on
-a socket or in a blocking C call is never a deadlock; a program whose tasks
-all wait on futures nobody will complete still is (exit 14).
-
-**Blocking C calls** (SPEC 12, stage C1c). A module marks an extern that may
-take long `blocking`; while another task could run, a call parks its task
-and runs on a helper thread. The pool starts with the first such call:
-`LXL_HELPERS` threads (default 4, at most 64; `LXL_HELPERS=0` runs every
-call on the program's thread, as when nothing else could run). A round trip
-through the pool costs about 0.4 us (C backend) to 0.8 us (native) while the
-helpers and the event loop spin for each other (50 us each, not when the
-process may use only one CPU: then about 6 us). The library's blocking
-calls: sqlite's `sqlite3_step` and `sqlite3_exec`; postgres's
-`PQconnectStart`, `PQconnectPoll` and `PQcancel` (the libpq oracle only: `postgres` has none); the ODBC oracle's calls.
-
-A blocking call is not cut short by itself when its task is cancelled or
-its deadline passes: the task sees that at its next call that can park.
-`onCancelCall(f: fn(ptr), arg: ptr): CancelCall` registers a C function
-that makes the call return early; while the guard lives, if the task is
-cancelled or a `within` deadline passes while it is parked in a blocking
-call, the runtime calls `f(arg)` once, on the program's thread, while the
-call goes on running on its helper. `f` must be safe to call at the same
-time as the call: `sqlite` registers `sqlite3_interrupt` around its steps
-(the step returns `SQLITE_INTERRUPT`, error 9) and the ODBC oracle's `SQLCancel` around
-statement calls. With a registration and a deadline a blocking call always
-runs on a helper, so that the deadline is seen. Registrations nest; the
-innermost counts.
-
-**Signals** (SPEC 16, stage C2). A watched signal is an event of the loop
-instead of its default action (for `SIGTERM` and `SIGINT`, the end of the
-process); watching cannot be undone.
-
+- A value that every task reads and none writes (a router, configuration,
+  templates) is an `rc T` (SPEC 4.9): `rc(v)` makes it, `r.share()` gives a
+  task its own handle, and reading it may park, because no handle can change
+  it. `task.Frozen` did this before `rc` existed. It is deprecated and stays
+  only until lexdb moves to `rc`.
 - `watchSignals(sigs: &[]int)` starts watching without waiting, so that an
   arrival before the first wait is kept, not lost. Constants: `SIGHUP`,
   `SIGINT`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM` (any signal 1 to 31
@@ -1035,7 +995,7 @@ let r = try c.send(&rq)
   trusts that CA instead of the system's store (not as well as it: see
   tls above); `o.tls.insecureSkipVerify = true` turns verification
   off; pins and a client certificate are `tls` options too.
-- `Client` (`newClient(o)`) is a copy handle over a `task.Shared` pool:
+- `Client` (`newClient(o)`) is a handle over a `task.Shared` pool (`clone()` gives another):
   copies share it. `send(&rq)`, `get(u)`, `head(u)`,
   `post(u, contentType, body)`, `put(...)`, `delete(u)`; `options()`,
   `stats()` (`Stats {open, idle, waiting, dials, reuses, retries}`),
@@ -1306,7 +1266,7 @@ Values from input are escaped (controls, quotes, backslashes and bytes past
 0x7e as `\xHH`) and cut at 256 bytes. The query, `Authorization` and
 `Cookie` are not logged; `rq.note` adds fields.
 
-The router and middleware are held in a `task.Frozen`, which every
+The router and middleware are held in an `rc`, which every
 connection's task reads at once. Not there yet (parts of S2 and S4): SNI
 certificate selection, session tickets across workers, a handshake cap,
 HTTP/2, `w.hint` (103), full duplex, a `Cookie` type, `traceparent`, a JSON
@@ -2037,7 +1997,7 @@ prefilters), `appendStr(mut &bytes, s)` (the bytes of `s` at the end of a
 `[]byte` in one copy: `StrBuf.add`), and the built-ins `isNull`, `exit`,
 `panic`. `task` also uses the library-only intrinsics `intoPtr` and
 `fromPtr` (SPEC 15), to keep a task's argument and result and a `Shared`
-or `Frozen` value in the runtime's structures.
+value in the runtime's structures.
 
 C functions through `extern "c"`: the math functions std declares (`sqrt cbrt
 pow exp exp2 expm1 log log1p log2 log10 sin cos tan asin acos atan atan2 sinh
@@ -2083,7 +2043,7 @@ errno, a static buffer):
 | `lxllib_fd_wait(fd, dir, ms, cancellable, w)` | park until a descriptor a C library reads itself (libpq's socket) is readable (0), writable (1) or either (2): armed one-shot in the epoll set each time; ends at cancellation and the deadline when `cancellable`, after `ms` when `ms >= 0`; 0, 1 cancelled, 3 deadline or `ms`, -errno |
 | `lxllib_net_addr(fd, peer, out)`, `lxllib_net_nodelay(fd, on)`, `lxllib_net_soerror(fd)`, `lxllib_net_shutdown(fd, how)`, `lxllib_net_close(fd)` | the local or peer address (family, port, 16 address bytes); `TCP_NODELAY`; `SO_ERROR`; `shutdown`; close (and forget the fd's waiters) |
 | `lxllib_task_promise(resdrop)`, `lxllib_task_complete(t, r)`, `lxllib_task_abandon(t)` | promises |
-| `lxllib_sh_new(box, drop)`, `lxllib_sh_enter(s, w)`, `lxllib_sh_leave(s, box)` | a `Shared` block; lend its box to `with` (exit 13 when already lent; `w` is kept for the messages while the `with` is open) and take it back. A `Frozen` is such a block that is never entered: `read` lends the box directly |
+| `lxllib_sh_new(box, drop)`, `lxllib_sh_enter(s, w)`, `lxllib_sh_leave(s, box)` | a `Shared` block; lend its box to `with` (exit 13 when already lent; `w` is kept for the messages while the `with` is open) and take it back. |
 
 The `lxllib_` helpers are not `lxl_` names because the compiler lets
 externs name only the `lxl_` helpers it knows (sema's `cHelper`); any other

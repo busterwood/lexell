@@ -210,7 +210,7 @@ implicit copy was. They need doing before or at the switch to owned `str`.
 
 ## 6. Language issues the migration exposed
 
-**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). **Next:** `rc str` slices, `Shared`/`Frozen` on `rc`, the generalised borrow report, then the compiler migration and the switch.
+**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). Then the `rc` reads and the TDS/TNS cursors on `rc str`, the parameter report, and `Shared`/`Frozen`: `share()` everywhere a `Shared` is copied (outside lexdb), `Frozen` deprecated for `rc`. **Order from here (2026-11-17):** compiler migration, then lexdb's migration, then the switch (owned `str` and owned `Shared` handles together). The switch must come last, because it breaks code that has not been migrated: making `Shared` owned stopped 188 lexdb programs compiling when tried.
 
 **Decided 2026-11-17:** implement 1 (freeze only the borrowed path), 10
 (implicit shared borrow of arguments), 9 (a match moves a local at its last

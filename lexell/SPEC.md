@@ -1324,8 +1324,8 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   ordinary rules: a closure is not a `fn` value (section 4.6), and a borrow
   type, or a type that holds borrows, is not a type argument of `start`
   (section 10, rule 1). So a task reaches nothing of its starter's
-  but what was moved into it, and `Shared` values (and `Frozen` values,
-  library handles built on `Shared` that lend only `&T`; lib/README.md).
+  but what was moved into it: its own `Shared` handles, and `rc` handles
+  (section 4.9) to values that never change.
 - A task runs until it parks: it waits for an unfinished future (`wait`,
   `task.all`, `task.any`), calls `task.yield()` or `task.sleep(ms)`, makes a
   socket call that would block (`net`: it parks on `EAGAIN` until the socket
@@ -1399,9 +1399,11 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   again, and the work in `f` ends through its `Result`s. `within` itself
   does not park. The clock is `CLOCK_MONOTONIC`; timers fire in the order of
   their time, and those with the same time in the order they were set.
-- `Shared[T]` is a copy handle to one value, which is dropped with the last
-  handle. `sh.with(f)` lends the value to `f` as `mut &T`, and is the only
-  access. No other task runs during `with`: an operation that can park,
+- `Shared[T]` is a counted handle to one value, which is dropped with the
+  last handle. `sh.share()` (or `sh.clone()`) makes another handle. Today a
+  handle is still a copy type; at the switch to owned `str` it becomes owned,
+  so every copy must then be a `share()` (design/owned-str.md). `sh.with(f)`
+  lends the value to `f` as `mut &T`, and is the only access. No other task runs during `with`: an operation that can park,
   called while any `with` is open, stops the program with exit 13 (the check
   is made whether or not the call would have parked), and so does a `with`
   on a value whose `with` is already open. `with` on different values may

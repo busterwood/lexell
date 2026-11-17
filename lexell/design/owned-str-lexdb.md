@@ -40,6 +40,20 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | O | `rc` reads, SPEC 4.9: `len`, indexing, slicing, operators, value parameters, returns and `let`s of `&T` all reach an `rc` handle's value. The TDS and TNS clients keep replies in an `rc str`; their cursors share them. | 64bf43d0 | yes (lexdb's TDS and TNS programs compile; the offline suites pass) | none |
 
+| P | par.map's kernel check refuses `rc` count changes (reading through a handle is fine). httpserver keeps its router in an `rc`; `Next[A]` (handed to middleware) holds a handle and `run` consumes it. | 8b69affc | yes | none for lexdb (it has its own servers) |
+| Q | `Shared` gets `share()`; `LXL_OWNED_SHARED=1` measures the owned-handle version (as `LXL_OWNED_STR` does for strings); a `copy` type parameter satisfies `Clone`; httpserver's app type is `A: Clone` and each connection gets `app.clone()`. 76 implicit `Shared` copies outside lexdb now say `share()`/`clone()`. | 6d3a55cc, e7244cff | yes: `Shared` is still a copy type, so `share()` is optional today | none |
+| R | `task.Frozen` is deprecated in favour of `rc T`: pool keeps its config in an `rc`, so `pool.Pool` is owned (copies are `clone()`). `Frozen` stays only for lexdb. | (this commit) | yes | none |
+
+**What the switch does to lexdb, beyond strings:** `Shared` handles become
+owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
+need `share()`, and `task.Frozen` goes, so lexdb_time.lxl's three
+`task.freeze` sites become `rc(...)` and `Frozen[tz.Zone]` becomes
+`rc tz.Zone`. Find the `Shared` sites with
+`LXL_OWNED_STR= LXL_OWNED_SHARED=1 tools/owned_str_sweep.sh` after adding
+lexdb's programs to the sweep (section 3, step 2). Because these changes
+break code that has not been migrated, **lexdb's migration must come before
+the switch**.
+
 `rc str` needs no slicing of its own: a reader of a shared buffer is
 `rc str` plus positions (the cursor pattern), and a substring is a borrowed
 view or an owned copy. Still to come: `task.Shared`/`Frozen` on `rc`, the
