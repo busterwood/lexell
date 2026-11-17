@@ -85,18 +85,9 @@ fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 
 // A foreign key: cols of its table hold a key of table ref, refCols (a
 // primary key or a unique index's columns, in any order). Columns by name.
-// A result column: its name and type OID.
-// spell: its name as written where that differs (L6), "" else; a client is
-// shown label(), lexdb matches name.
-// coll: a text column's collation (L2), "" exact.
-// scale: a time type's fractional seconds where its type says (datetime's
-// 3), -1 else (design/lexdb-tds.md S3: TDS sends datetime2(scale)).
-pub type OutCol = value record { pub name: str; pub oid: int; pub spell: str; pub coll: str; pub scale: int }
 
-pub fn (o: &OutCol) label(): str {
-    if o.spell == lexdb_sql.ANON { return "" }         // T-SQL's unnamed column
-    return if len(o.spell) > 0 { o.spell } else { o.name }
-}
+// A result column (lexdb_bind's).
+pub type OutCol = lexdb_bind.OutCol
 
 pub type Res = record {
     pub cols: []OutCol
@@ -6290,7 +6281,7 @@ fn constLit(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false}
+    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false}
 }
 
 // newScope for a statement of txn's session: its default collation (L2).
@@ -11297,7 +11288,7 @@ type Ret = record {
 fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
     var r = Ret{on: len(s.items) > 0, outs: [], exprs: [], rows: []}
     if !r.on { return Ok(r) }
-    r.outs = try itemCols(&s.items, true, &q.cols, sc, mut &r.exprs)
+    r.outs = try lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &r.exprs)
     for x in r.exprs {
         if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
     }
@@ -12489,7 +12480,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     var ret = Ret{on: len(s.items) > 0, outs: [], exprs: [], rows: []}
     if ret.on {
         let items = mergeItems(s, &t, &alias)
-        ret.outs = try itemCols(&items, true, &q.cols, mut &sc, mut &ret.exprs)
+        ret.outs = try lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &ret.exprs)
         for x in ret.exprs { if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) } }
     }
     endScope(mut &sc, mut &q)
@@ -12716,27 +12707,6 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
 
 // ---- SELECT
 
-fn exprName(x: &Expr): str {
-    match x {
-        Expr.Col(n, _) { return lexdb_bind.colPart(&n) }
-        Expr.Call(n, args, _) {
-            if isSubCall(&n) && len(args) >= 3 {
-                match args[2] { Expr.Lit(v) { return text(&v) } else {} }
-            }
-            if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
-            if n == "#old" && len(args) == 1 { return exprName(&args[0]) }
-            if n == "#acat" || n == "#aappend" || n == "#aprepend" || n == "@>" || n == "<@" || n == "&&" || n == "~" ||
-               n == "!~" || n == "~*" || n == "!~*" { return "?column?" }
-            return aggBase(&n)
-        }
-        Expr.Cast(a, t) {
-            let inner = exprName(&a)
-            return if inner == "?column?" { lexdb_ops.kindName(&t) } else { inner }
-        }
-        else { return "?column?" }
-    }
-}
-
 fn isFloatOid(o: int): bool { return lexdb_bind.isFloatOid(o) }
 
 // The type OID of an expression, as far as it can be told before running
@@ -12745,82 +12715,6 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int): int { retur
 
 // What the dialects supply the binder (lexdb_bind.Typing).
 fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.RULES_PG, fnOid: lexdb_orafn.resultOid, fnBind: fnRefOf} }
-
-// The output columns of a SELECT: (name, OID), and the expressions behind
-// them (* expanded).
-fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, sc: mut &Scope, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
-    return itemCols(&s.items, len(s.from) > 0, cols, sc, exprs)
-}
-
-// An item list's output columns (a SELECT's or RETURNING's), over cols.
-fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, sc: mut &Scope,
-            exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
-    var out: []OutCol = []
-    for it in items {
-        if it.star {
-            if !from { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
-            var any = false
-            var placed = false
-            for c in cols { if c.pos >= 0 { placed = true } }
-            if placed && it.qual == "" {
-                // after JOIN ... USING: the merged columns, then the rest (9.93)
-                for p in 0..len(cols) {
-                    for i in 0..len(cols) {
-                        let c = &cols[i]
-                        if c.pos != p || hiddenName(&c.name) { continue }
-                        any = true
-                        append(mut &out, OutCol{name: lexdb_bind.colPart(&c.name), oid: c.typ.oid, spell: "", coll: "", scale: -1})
-                        append(exprs, lexdb_bind.colExpr(cols, i))
-                    }
-                }
-                if !any { return Err(e("42601", "SELECT * with no columns")) }
-                continue
-            }
-            for i in 0..len(cols) {
-                let c = &cols[i]
-                if it.qual != "" && c.name[0..lexdb_bind.dotAt(&c.name)] != it.qual { continue }
-                any = true
-                if hiddenName(&c.name) { continue }
-                append(mut &out, OutCol{name: lexdb_bind.colPart(&c.name), oid: c.typ.oid, spell: c.spell, coll: c.coll, scale: typScale(&c.typ)})
-                append(exprs, Expr.Col(c.name, i))
-            }
-            if !any { return Err(e("42P01", &("missing FROM-clause entry for table \"" + it.qual + "\""))) }
-            continue
-        }
-        match it.expr {
-            Some(x) {
-                let r = try lexdb_bind.resolve(&x, cols, len(cols), mut &sc.names)
-                let name = if it.alias != "" { it.alias } else { exprName(&r) }
-                let pt = lexdb_bind.ptypesOf(&sc.names)
-                // (its scale or SQL Server type as written, where resolving folded a cast away)
-                let rs = exprScale(&r, cols)
-                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, &pt), spell: it.spell, coll: lexdb_bind.exprColl(&r, cols, &sc.names).name,
-                                        scale: if rs != -1 { rs } else { exprScale(&x, cols) }})
-                append(exprs, r)
-            }
-            None {}
-        }
-    }
-    return Ok(out)
-}
-
-// ORDER BY: an output column's name, if no input column has it, else an
-// expression over the input.
-fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, sc: mut &Scope): Result[Expr, DbErr] {
-    match o {
-        Expr.Col(n, _) {
-            match lexdb_bind.resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(if lexdb_bind.dotAt(&n) < 0 { lexdb_bind.colExpr(cols, r) } else { Expr.Col(cols[r].name, r) }) }
-                Err(x) {
-                    for oc in outs { if oc.name == n { return Ok(Expr.Col(n, -1)) } }
-                    return Err(x)
-                }
-            }
-        }
-        else {}
-    }
-    return lexdb_bind.resolve(o, cols, len(cols), mut &sc.names)
-}
 
 type OutRow = record { vals: []Val; ord: []Val }
 
@@ -12887,27 +12781,6 @@ fn outText(o: &Expr, exprs: &[]Expr, outs: &[]OutCol, cols: &[]lexdb_sql.ColDef)
         else {}
     }
     return lexdb_sql.exprText(o)
-}
-
-// The output an ORDER BY item names (orderValue's): by position or by its
-// alias; -1 none (an expression over the row); -2 a position not in the
-// list (orderValue's error).
-fn orderOut(o: &Expr, q: &Query, outs: &[]OutCol, n: int): int {
-    match o {
-        Expr.Lit(v) {
-            match v {
-                Val.Int(i) { return if i < 1 || i > n { -2 } else { i - 1 } }
-                else {}
-            }
-        }
-        Expr.Col(name, _) {
-            if colIndex(&q.cols, &name) < 0 {
-                for i in 0..len(outs) { if outs[i].name == name { return i } }
-            }
-        }
-        else {}
-    }
-    return -1
 }
 
 // An ORDER BY item may name an output column by position or by its alias.
@@ -13621,33 +13494,6 @@ fn checkGrouped(x: &Expr, gtexts: &[]str, okLevels: &[]bool, q: &Query): Result[
     return Ok(Unit{})
 }
 
-// GROUP BY: an input column or expression; else an output column's
-// position or name, meaning its expression.
-fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr, sc: mut &Scope): Result[Expr, DbErr] {
-    match g {
-        Expr.Lit(v) {
-            match v {
-                Val.Int(n) {
-                    if n < 1 || n > len(exprs) { return Err(e("42P10", &("GROUP BY position " + n.toStr() + " is not in select list"))) }
-                    return Ok(clone(&exprs[n - 1]))
-                }
-                else {}
-            }
-        }
-        Expr.Col(n, _) {
-            match lexdb_bind.resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(if lexdb_bind.dotAt(&n) < 0 { lexdb_bind.colExpr(cols, r) } else { Expr.Col(cols[r].name, r) }) }
-                Err(x) {
-                    for i in 0..len(outs) { if outs[i].name == n { return Ok(clone(&exprs[i])) } }
-                    return Err(x)
-                }
-            }
-        }
-        else {}
-    }
-    return lexdb_bind.resolve(g, cols, len(cols), mut &sc.names)
-}
-
 fn valsKey(vs: &[]Val): str {
     var kb = newStrBuf()
     for v in vs { encIdxPart(mut &kb, &v) }
@@ -14069,11 +13915,11 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
     var exprs: []Expr = []
-    let outs = try selectCols(s, &q.cols, sc, mut &exprs)
+    let outs = try lexdb_bind.selectCols(s, &q.cols, mut &sc.names, mut &exprs)
     var groupBy: []Expr = []
     var groupKinds: []int = []
     for g in s.group {
-        let r = try resolveGroup(&g, &q.cols, &outs, &exprs, sc)
+        let r = try lexdb_bind.resolveGroup(&g, &q.cols, &outs, &exprs, mut &sc.names)
         if hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
         append(mut &groupKinds, lexdb_bind.exprKind(&r, &q.cols, &sc.names))
         append(mut &groupBy, r)
@@ -14082,7 +13928,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var ordKinds: []int = []
     for o in s.order {
         // an enum's order is its labels' (9.90)
-        let r = try resolveOrder(&o.expr, &q.cols, &outs, sc)
+        let r = try lexdb_bind.resolveOrder(&o.expr, &q.cols, &outs, mut &sc.names)
         // its collation's (L2): an output column's, or the expression's
         var ok = outRefKind(&r, &outs)
         match r {
@@ -14105,7 +13951,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if len(s.distinctOn) > 0 {
         var dt: []str = []
         for d in s.distinctOn {
-            var r = try resolveOrder(&d, &q.cols, &outs, sc)
+            var r = try lexdb_bind.resolveOrder(&d, &q.cols, &outs, mut &sc.names)
             match try enumOf(st, txn, &r, &q.cols) {
                 Some(en) { r = enumPos(&r, &en) }
                 None {}
@@ -14135,7 +13981,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if used[j] { continue }
             if skipped { return Err(bad) }
             for k in j..len(dt) { if dt[k] == dt[j] { used[k] = true } }
-            var r = try resolveOrder(&s.distinctOn[j], &q.cols, &outs, sc)
+            var r = try lexdb_bind.resolveOrder(&s.distinctOn[j], &q.cols, &outs, mut &sc.names)
             match try enumOf(st, txn, &r, &q.cols) {
                 Some(en) { r = enumPos(&r, &en) }
                 None {}
@@ -15896,9 +15742,9 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
         var exprs: []Expr = []
         if s.kind == lexdb_sql.S_MERGE {
             let items = mergeItems(s, &q.levels[len(q.levels) - 1].t, &(if len(s.alias) > 0 { s.alias } else { lexdb_sql.baseName(&s.table) }))
-            return itemCols(&items, true, &q.cols, mut &sc, mut &exprs)
+            return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
         }
-        return itemCols(&s.items, true, &q.cols, mut &sc, mut &exprs)
+        return lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &exprs)
     }
     if s.setop != 0 {
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
@@ -15913,7 +15759,7 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     var sc = newScopeIn(st, &txn, &np, ptypes)
     let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
     var exprs: []Expr = []
-    return selectCols(s, &q.cols, mut &sc, mut &exprs)
+    return lexdb_bind.selectCols(s, &q.cols, mut &sc.names, mut &exprs)
 }
 
 // ---- sessions
@@ -23593,7 +23439,7 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     var ksrc: []int = []
     if keyed {
         for oi in 0..len(sel.order) {
-            let o = orderOut(&sel.order[oi], q, &sel.outs, len(sel.exprs))
+            let o = lexdb_bind.orderOut(&sel.order[oi], &q.cols, &sel.outs, len(sel.exprs))
             if o == -2 { return Ok(None) }      // a position not in the list: the row path's error
             append(mut &kout, o)
             if o >= 0 {

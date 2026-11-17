@@ -912,6 +912,8 @@ pub type Names = record {
     pub ty: Typing                  // the dialects' typing
     pub blank: fn(&Expr): bool      // T-SQL's '' read as 0 (lexdb_syscat.tsqlBlank), under a session collation
     pub constCast: fn(Val, &lexdb_sql.TypeName): Result[Val, DbErr]  // a constant cast when resolved (castConst)
+    pub colScale: fn(&lexdb_sql.TypeName): int  // a column's OutCol.scale (lexdb_exec.typScale: the dialects' wire types)
+    pub outScale: fn(&Expr, &[]lexdb_sql.ColDef): int  // an expression's (lexdb_exec.exprScale)
 }
 
 pub fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
@@ -1685,4 +1687,164 @@ pub fn exprKind(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): int {
     let c = exprColl(x, cols, ns)
     if c.level == CL_NONE || !isTextExpr(x, cols, ns) { return lexdb_sql.COLL_EXACT }
     return lexdb_sql.collKind(&c.name)
+}
+
+// ---- the select list, ORDER BY and GROUP BY
+
+// A result column: its name and type OID.
+// spell: its name as written where that differs (L6), "" else; a client is
+// shown label(), lexdb matches name.
+// coll: a text column's collation (L2), "" exact.
+// scale: a time type's fractional seconds where its type says (datetime's
+// 3), -1 else (design/lexdb-tds.md S3: TDS sends datetime2(scale)).
+pub type OutCol = value record { pub name: str; pub oid: int; pub spell: str; pub coll: str; pub scale: int }
+
+pub fn (o: &OutCol) label(): str {
+    if o.spell == lexdb_sql.ANON { return "" }         // T-SQL's unnamed column
+    return if len(o.spell) > 0 { o.spell } else { o.name }
+}
+
+fn exprName(x: &Expr): str {
+    match x {
+        Expr.Col(n, _) { return colPart(&n) }
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) && len(args) >= 3 {
+                match args[2] { Expr.Lit(v) { return lexdb_sql.text(&v) } else {} }
+            }
+            if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
+            if n == "#old" && len(args) == 1 { return exprName(&args[0]) }
+            if n == "#acat" || n == "#aappend" || n == "#aprepend" || n == "@>" || n == "<@" || n == "&&" || n == "~" ||
+               n == "!~" || n == "~*" || n == "!~*" { return "?column?" }
+            return lexdb_sql.aggBase(&n)
+        }
+        Expr.Cast(a, t) {
+            let inner = exprName(&a)
+            return if inner == "?column?" { lexdb_ops.kindName(&t) } else { inner }
+        }
+        else { return "?column?" }
+    }
+}
+
+// The output columns of a SELECT: (name, OID), and the expressions behind
+// them (* expanded).
+pub fn selectCols(s: &lexdb_sql.Stmt, cols: &[]lexdb_sql.ColDef, ns: mut &Names, exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
+    return itemCols(&s.items, len(s.from) > 0, cols, ns, exprs)
+}
+
+// An item list's output columns (a SELECT's or RETURNING's), over cols.
+pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColDef, ns: mut &Names,
+            exprs: mut &[]Expr): Result[[]OutCol, DbErr] {
+    var out: []OutCol = []
+    for it in items {
+        if it.star {
+            if !from { return Err(e("42601", "SELECT * with no tables specified is not valid")) }
+            var any = false
+            var placed = false
+            for c in cols { if c.pos >= 0 { placed = true } }
+            if placed && it.qual == "" {
+                // after JOIN ... USING: the merged columns, then the rest (9.93)
+                for p in 0..len(cols) {
+                    for i in 0..len(cols) {
+                        let c = &cols[i]
+                        if c.pos != p || lexdb_catalog.hiddenName(&c.name) { continue }
+                        any = true
+                        append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid, spell: "", coll: "", scale: -1})
+                        append(exprs, colExpr(cols, i))
+                    }
+                }
+                if !any { return Err(e("42601", "SELECT * with no columns")) }
+                continue
+            }
+            for i in 0..len(cols) {
+                let c = &cols[i]
+                if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
+                any = true
+                if lexdb_catalog.hiddenName(&c.name) { continue }
+                append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid, spell: c.spell, coll: c.coll, scale: ns.colScale(&c.typ)})
+                append(exprs, Expr.Col(c.name, i))
+            }
+            if !any { return Err(e("42P01", &("missing FROM-clause entry for table \"" + it.qual + "\""))) }
+            continue
+        }
+        match it.expr {
+            Some(x) {
+                let r = try resolve(&x, cols, len(cols), ns)
+                let name = if it.alias != "" { it.alias } else { exprName(&r) }
+                let pt = ptypesOf(ns)
+                // (its scale or SQL Server type as written, where resolving folded a cast away)
+                let rs = ns.outScale(&r, cols)
+                append(mut &out, OutCol{name: name, oid: exprOid(&r, cols, &pt, &ns.ty), spell: it.spell, coll: exprColl(&r, cols, ns).name,
+                                        scale: if rs != -1 { rs } else { ns.outScale(&x, cols) }})
+                append(exprs, r)
+            }
+            None {}
+        }
+    }
+    return Ok(out)
+}
+
+// ORDER BY: an output column's name, if no input column has it, else an
+// expression over the input.
+pub fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, ns: mut &Names): Result[Expr, DbErr] {
+    match o {
+        Expr.Col(n, _) {
+            match resolveName(cols, len(cols), &n) {
+                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { Expr.Col(cols[r].name, r) }) }
+                Err(x) {
+                    for oc in outs { if oc.name == n { return Ok(Expr.Col(n, -1)) } }
+                    return Err(x)
+                }
+            }
+        }
+        else {}
+    }
+    return resolve(o, cols, len(cols), ns)
+}
+
+// The output an ORDER BY item names (orderValue's): by position or by its
+// alias; -1 none (an expression over the row); -2 a position not in the
+// list (orderValue's error).
+pub fn orderOut(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, n: int): int {
+    match o {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(i) { return if i < 1 || i > n { -2 } else { i - 1 } }
+                else {}
+            }
+        }
+        Expr.Col(name, _) {
+            if colIndex(cols, &name) < 0 {
+                for i in 0..len(outs) { if outs[i].name == name { return i } }
+            }
+        }
+        else {}
+    }
+    return -1
+}
+
+// GROUP BY: an input column or expression; else an output column's
+// position or name, meaning its expression.
+pub fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr, ns: mut &Names): Result[Expr, DbErr] {
+    match g {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) {
+                    if n < 1 || n > len(exprs) { return Err(e("42P10", &("GROUP BY position " + n.toStr() + " is not in select list"))) }
+                    return Ok(clone(&exprs[n - 1]))
+                }
+                else {}
+            }
+        }
+        Expr.Col(n, _) {
+            match resolveName(cols, len(cols), &n) {
+                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { Expr.Col(cols[r].name, r) }) }
+                Err(x) {
+                    for i in 0..len(outs) { if outs[i].name == n { return Ok(clone(&exprs[i])) } }
+                    return Err(x)
+                }
+            }
+        }
+        else {}
+    }
+    return resolve(g, cols, len(cols), ns)
 }
