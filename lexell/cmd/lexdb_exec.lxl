@@ -12858,32 +12858,35 @@ fn pipeSelIn(sel: mut &Sel, rows: bool) {
         return
     }
     if !rows || !pipeShape(sel) { return }
-    // the outputs: a column by its slot, the others as bindSel bound them
-    // (moved), else bound for the plan; none if one does not bind
-    var xs: []BX = []
+    // the outputs: as bindSel bound them (moved), a column by its slot,
+    // else bound for the plan; none if one does not bind (those moved
+    // given back)
+    var xs: []BX = withCapacity(len(sel.exprs))
     for i in 0..len(sel.exprs) {
-        if sel.ox[i].isSome() {
-            append(mut &xs, BX.Const(Val.Null))
-            continue
+        match replace(mut &sel.ox[i], None) {
+            Some(b) {
+                append(mut &xs, b)
+                continue
+            }
+            None {}
         }
         let c = match sel.exprs[i] {
             Expr.Col(name, sl) { lexdb_bind.colSlot(&sel.q.cols, &name, sl) }
             else { -1 }
         }
         let b = if c >= 0 { Some(BX.Col(c)) } else { planX(&sel.exprs[i], &sel.q) }
-        if b.isNone() { return }
+        if b.isNone() {
+            oxBack(sel, xs)
+            return
+        }
         append(mut &xs, b.unwrap())
     }
-    let cs = match planConds(sel) {
-        Some(x) { x }
-        None { return }
+    let got = planConds(sel)
+    if got.isNone() {
+        oxBack(sel, xs)
+        return
     }
-    for i in 0..len(xs) {
-        match replace(mut &sel.ox[i], None) {
-            Some(b) { xs[i] = b }
-            None {}
-        }
-    }
+    let cs = got.unwrap()
     let proj = lexdb_plan.PPlan.Project(filterOver(scanArm(sel, false), cs, subsOf(&sel.q)), xs)
     // ORDER BY in the scan's order (sel.sort false: streams' rule)
     let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(proj, false) } else { proj }
@@ -12910,7 +12913,7 @@ fn planConds(sel: mut &Sel): Option[[]BX] {
         None { return None }
     }
     var cc = replace(mut &sel.q.cc[0], [])
-    var cs: []BX = []
+    var cs: []BX = withCapacity(len(cc))
     for i in 0..len(cc) {
         match replace(mut &cc[i], None) {
             Some(b) { append(mut &cs, b) }
@@ -12921,16 +12924,15 @@ fn planConds(sel: mut &Sel): Option[[]BX] {
 }
 
 // Per condition of q's table the plan did not bind, its binding for the
-// plan (planX); None if one does not bind.
+// plan (planX); [] when the plan bound every one; None if one does not
+// bind.
 fn condsMore(q: &Query): Option[[]Option[BX]] {
     var more: []Option[BX] = []
     for i in 0..len(q.cc[0]) {
-        if q.cc[0][i].isSome() {
-            append(mut &more, None)
-            continue
-        }
+        if q.cc[0][i].isSome() { continue }
         let b = planX(&q.levels[0].cond[i], q)
         if b.isNone() { return None }
+        while len(more) < i { append(mut &more, None) }
         append(mut &more, b)
     }
     return Some(more)
@@ -12944,7 +12946,7 @@ fn scanArm(sel: &Sel, aggs: bool): lexdb_plan.PScan {
     let t = &lv.t
     var kinds: []int = array(len(sel.q.cols), lexdb_rows.BK_NONE)
     for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.colKind(&t.cols[i]) }
-    var need: []bool = []
+    var need: []bool = withCapacity(len(t.cols))
     for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
     let batch = lexdb_plan.scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
     return lexdb_plan.PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch}
@@ -13159,16 +13161,7 @@ fn unplan(sel: mut &Sel, p: lexdb_plan.PPlan) {
                 unplan(sel, i)
                 return
             }
-            var v = xs
-            var ox: []Option[BX] = []
-            for k in 0..len(v) {
-                let col = match sel.exprs[k] {
-                    Expr.Col(name, sl) { lexdb_bind.colSlot(&sel.q.cols, &name, sl) >= 0 }
-                    else { false }
-                }
-                append(mut &ox, unbound(replace(mut &v[k], BX.Const(Val.Null)), col))
-            }
-            sel.ox = ox
+            oxBack(sel, xs)
             unplan(sel, i)
         }
         lexdb_plan.PPlan.Filter(i, cs) {
@@ -13178,6 +13171,19 @@ fn unplan(sel: mut &Sel, p: lexdb_plan.PPlan) {
             sel.q.cc[0] = cc
         }
         else {}
+    }
+}
+
+// The outputs xs (the first len(xs)) back to sel.ox, as unbound those
+// bound for the plan alone.
+fn oxBack(sel: mut &Sel, xs: []BX) {
+    var v = xs
+    for k in 0..len(v) {
+        let col = match sel.exprs[k] {
+            Expr.Col(name, sl) { lexdb_bind.colSlot(&sel.q.cols, &name, sl) >= 0 }
+            else { false }
+        }
+        sel.ox[k] = unbound(replace(mut &v[k], BX.Const(Val.Null)), col)
     }
 }
 
