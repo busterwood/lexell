@@ -54,7 +54,7 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | W | `task.Frozen` is deleted: use `rc T` (step 7). | f92dcdb1 | no: lexdb_time.lxl uses it | none |
 
-| X | `strStatic(s)` (SPEC 11): a copy never freed, whose clones are free. Clone glue leaves static `str` fields as copied. `LXL_RCSTAT=sites` and tools/strsites.py count heap string copies by site. | (this commit) | no | none |
+| X | `strStatic(s)` (SPEC 11): a copy never freed, whose clones are free. Clone glue leaves static `str` fields as copied. `LXL_RCSTAT=sites` and tools/strsites.py count heap string copies by site. | 57a5dd5c | no | none |
 
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
