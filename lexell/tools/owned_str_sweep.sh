@@ -5,7 +5,8 @@
 # Prints "kind file:line name what-took-it", sorted and unique. With file names (base names, such
 # as fs.lxl), only the sites in those files. Free moves (kind "move") are left out unless -a.
 # LXLC is the compiler to use (default compiler/out/lxlc); P the parallel compiles (default 4). Programs the mode cannot finish are
-# listed on stderr as "STOPPED file: error". LXL_OWNED_STR= (empty) measures something else alone, such as
+# listed on stderr as "STOPPED file: error"; a program that does not compile even without the flag
+# (other than an error test) as "BROKEN file: error", so a broken build never looks like a clean one. LXL_OWNED_STR= (empty) measures something else alone, such as
 # LXL_OWNED_SHARED=1.
 set -e
 D=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +30,9 @@ while read -r f; do n=$((n + 1)); echo "$n $f"; done < "$T/progs" |
         if ! timeout 60 "$LXLC" "$1" --emit-c > /dev/null 2> "$T/$0.err"; then
             if LXL_OWNED_STR= LXL_OWNED_SHARED= timeout 60 "$LXLC" "$1" --emit-c > /dev/null 2>&1; then
                 echo "STOPPED $1: $(grep -v "^OWNED_STR" "$T/$0.err" | head -1)" >&2
+            else
+                # fails without the flag too: an error test, or a program the edits broke
+                case "$1" in */error/*) ;; *) echo "BROKEN $1: $(grep -v "^OWNED_STR" "$T/$0.err" | head -1)" >&2 ;; esac
             fi
         fi
         grep "^OWNED_STR" "$T/$0.err" > "$T/$0.log" || true'
