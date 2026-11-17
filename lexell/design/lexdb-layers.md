@@ -1285,6 +1285,268 @@ numbers move.
   outputs (`probe.sh`-style: a fresh data directory per binary, psql with
   `ON_ERROR_STOP=0`, so errors are compared too).
 
+**2d slices 1–2 as built: a `BCol` per column, and each resolved column
+carries its slot.** One commit on `redesign/bind` (65cf9972), from main
+285a089f.
+
+- Slice 1, `lexdb_bind`:
+  - `Ty` (`oid`, `mod`, `coll`, `collLevel`, `notNull`) and `BCol`
+    (`slot`, `name`, `spell`, `ty`), with `tyOf(TypeName, coll, notNull)`
+    and `bcolOf(slot, ColDef)`. `mod` is the design's: numeric
+    `p << 16 | s`, varchar/char `n`, a time type's precision; -1 none.
+  - One departure from the design: `Ty.coll` is the collation's name as
+    written (`ColDef.coll`'s), not an id, because there is no collation
+    catalog to number them yet. `collLevel` is `CL_NONE`/`CL_DEFAULT`/
+    `CL_IMPLICIT`/`CL_EXPLICIT`, and exec's `COLL_*` constants are now
+    those. A column's level is `CL_IMPLICIT` for a text, else `CL_NONE`,
+    as `exprColl` gives it.
+- Slice 1, `lexdb_exec`:
+  - `Query.bcols` sits beside `Query.cols`: `bcols[i]` is `cols[i]` at
+    slot `i`.
+  - Every column added to a query's row goes through `addCol`, which
+    appends to both. That covers `buildQuery`'s FROM items and the
+    semi-joins' hidden columns (`semiLookAdd` and `semiJoins`' `\x00sjN`
+    keys and residual columns). Nothing else appends to a `Query.cols`.
+  - `cols` is kept rather than derived from `bcols`. It still carries
+    what the binder's column does not: `using`, `pos`, `def`, `identity`.
+    Nothing reads `bcols` yet.
+- Slice 2, a resolved column carries its slot:
+  - `Expr.Col(str)` is `Expr.Col(str, int)`: the name (`alias.column`, as
+    before) and its slot in the row it was resolved over, -1 when not
+    known.
+  - The parser and every construction outside resolution give -1 (134
+    sites changed mechanically, in `lexdb_sql`, `lexdb_parse`,
+    `lexdb_pg`, `lexdb_syscat`, `lexdb_bind` and `lexdb_exec`). The clones
+    (`cloneExpr`, parse's `cloneE`, `clone`) keep the slot. A rename
+    keeps it for the names it leaves alone.
+  - `resolveName` returns the column's place instead of its name
+    (`cols[i].name` is the name). Its callers changed with it:
+    `orderedLevel`, `outerRef`, MERGE's `onCols`.
+  - These give a slot:
+    - `resolve`, `resolveOrder` and `resolveGroup` (their `Expr.Col`
+      arms);
+    - `colExpr`, which now takes the place, with FULL JOIN USING's
+      COALESCE arguments found once by name;
+    - star in `itemCols`, both the plain order and USING's order;
+    - USING's ON;
+    - `outerRef`'s ref: the outer frame's place, since a frame's `cols`
+      are its query's in order;
+    - the implied equalities (`q.slotOf`, the `colAt` map, else by name);
+    - the semi-joins' renamed columns. `renameCol` takes the new name's
+      slot: `semiLook`'s `first + j`, `semiJoins`' `first + w + j`, and
+      ALTER TABLE -1.
+  - An output column named in ORDER BY or GROUP BY (`resolveOrder`'s
+    `Expr.Col(n, -1)`) has no slot, as it is not an input column.
+- Slice 2, reading the slot: `lexdb_bind.colSlot(cols, name, slot)`
+  replaces bind's `colAt`. It gives `slot` when `cols[slot].name ==
+  name`, else the first column of that name, else -1. Its readers:
+  - `bindExpr`'s `Expr.Col` arm (so `bxOf`, `cxsOf`, `bindSel`, `outC`
+    and the window outputs);
+  - `exprOid`'s `Expr.Col` arm;
+  - the plain-column places of the outputs (`outC`, `bindSel`'s `col`,
+    the windowed outputs' `at`, `winValues`' partition and order `at`).
+  - Why the name is checked: expressions are typed and bound over other
+    column lists than the one they were resolved over, so a slot alone
+    can name the wrong column there. Examples are DML's target columns,
+    index and CHECK expressions, and the `g.g` of the suite's `exec_*`
+    tests. A check with a build that panicked on any mismatch found 40
+    of the suite's tests doing this. In every one the name was absent
+    from the list (slot set, no column of that name), so the old search
+    found nothing too.
+  - With the panic narrowed to a slot that names a different column
+    than the first of its name, the whole suite passed. So where the
+    name is in the list, the slot is the column the search finds.
+  - TPC-H's 22 queries, counted with a build that logged each lookup,
+    made 12,872 lookups. All of them took the slot, except 7 lookups of
+    output names (`revenue`, `numwait`, and so on: ORDER BY by alias),
+    which have no slot and miss as before.
+- Deleted:
+  - bind's `colAt`;
+  - `bindExpr`'s `direct`/`slots` mode and `bindIn` (every caller passed
+    `direct` true; `reslot` is the re-slotting way, as `bGenOf` uses it);
+  - the callers' `var sl` lists;
+  - `resolveName`'s second search in `outerRef` and `orderedLevel`.
+- Found, not changed (both binaries): `ORDER BY s`, where `s` is an
+  output alias and also an input column, takes the input column, so
+  `select x, sum(id) s from a group by x order by s` fails with 42803.
+  PostgreSQL takes the output column (findTargetlistEntrySQL92).
+  `resolveOrder` tries input columns first. Slice 3 moves that rule; it
+  should keep it unless the fix is its own commit with a test.
+- The planner still matches columns by name (`keyedCol`, `levelOf`,
+  `colAt`, `rangePath`, `bpFix`), and `eval` still finds a column by name
+  per row (`colIndex`). Both are later slices' work. 74 `colIndex(` sites
+  remain in exec.
+- Lines:
+
+  | Module | Before | After |
+  |---|---|---|
+  | `lexdb_exec` | 28901 | 28912 |
+  | `lexdb_bind` | 754 | 798 |
+
+- No change in results:
+  - the suite (188);
+  - TPC-H's 22 checksums;
+  - a differential battery, compiled from main 285a089f and from the
+    branch, outputs diffed: the same, 623 lines. It ran 83 statements, 14 of
+    them errors, with errors in verbose form: joins, USING (inner, LEFT, RIGHT, FULL),
+    NATURAL, repeated names in a FROM subquery, LATERAL, correlated
+    EXISTS, NOT EXISTS, IN and scalar subqueries (one nested two deep),
+    a view, CTEs (one recursive over a join), GROUP BY and ORDER BY by
+    position, by output name and by expression, HAVING with a subquery,
+    windows, DISTINCT ON, INTERSECT, row IN, UPDATE ... FROM, DELETE ...
+    USING, ON CONFLICT, parameters through the extended protocol (psql's
+    `\bind`) for a join and a semi-join, star over USING and over a view
+    of a view, and the naming errors (42703, 42P01, 42702, 42712, 42803,
+    42P10). The files are
+    `~/tpch-w/bind/bench/naming/` (`naming.sql`, `run.sh BIN OUT`).
+- A/B against main 285a089f (built from `git archive`), binaries
+  alternating, medians of 3 rounds:
+  - TPC-H (`run.sh`): total 1.001; all 22 checksums are the baseline's.
+    - q1 1.022 and q18 1.028, the same in all three rounds.
+    - q20 0.989, q2 0.994, q17 1.007, q21 0.998, q22 0.998; the rest
+      within 1%.
+  - Direct A/B (`qab.sh`, 15 runs per server, 7 for q1):
+    - q18 1.000 (110.3 against 110.3 ms; q18's file in `qab.sh` runs
+      110 ms against `run.sh`'s 1246).
+    - q1 1.019 (2526 to 2573 ms, in all three rounds).
+    - q20 0.997 (366.6 to 365.6 ms), q2 0.993, q17 1.003.
+  - q1 under perf (`LXL_NATIVE_MAP`, 4 runs each): the same functions in
+    the same shares on both binaries (dup, colsInto, vec_sum, bEval,
+    checkedMul, vec_arith, batchGroupsIn). The hot functions are byte
+    for byte the same size, at other addresses. None of the changed code
+    shows, and q1 binds per run, not per row. So most likely layout, as
+    2-ii's q1 (1.1% and 1.5%); not resolved further.
+  - The 35 queries (`ab35.sh`, boost off): total 0.996.
+    - grp_text 1.043 (115 to 120 ms, all three rounds). A direct run, a
+      server per binary, 15 runs each, three rounds alternating: 111.9
+      against 112.4 ms (1.004). Under perf the shares are the same.
+    - pk_range100k 1.032 (31 to 32 ms); the rest within 2%.
+  - OLTP, tps ratios, medians of 3:
+
+    | Clients | Point selects | Updates |
+    |---|---|---|
+    | 1 | 1.002 | 0.999 |
+    | 8 | 1.010 | 1.003 |
+    | 32 | 1.009 | 0.980 |
+
+    Main's updates at 32 clients ranged from 39.6k to 41.0k tps across
+    its rounds, and the branch's from 39.4k to 39.8k. Point selects are
+    level, so the plan cache hits; the cache itself was not inspected.
+
+**Where 2d slice 2 left off, and how to start slice 3.** Slice 3 moves
+name resolution into `lexdb_bind`: `resolve`, `resolveName`, `outerRef`
+and the select-list, ORDER BY and GROUP BY resolution, with the naming
+part of `Scope`. The planner's hints stay in exec. Results and speed must
+not change; this is a move, not a rewrite. Everything named is in
+`lexdb_exec` unless the note says otherwise. Search for the names, since
+line numbers move.
+
+- What is there after slice 2:
+  - `Expr.Col(name, slot)` (`lexdb_sql`). `resolve` and its kin give the
+    slot, -1 elsewhere.
+  - `lexdb_bind.colSlot` reads the slot, after checking the name.
+  - `Query.bcols` (`lexdb_bind.BCol`) is kept with `Query.cols` by
+    `addCol`. Nothing reads it yet; slice 3 may make it the frames'
+    column list.
+- What moves (exec's names):
+  - Names and scope: `resolveName`, `colPart`, `dotAt`, `DUPSEP`,
+    `hiddenName`, `colExpr`, `usingSide`, `outerRef`, `refTyped`,
+    `refParam`, `ptypesOf`, `endScope`.
+  - The resolver itself: `resolve` (about 210 lines), `resolveOrder`,
+    `resolveGroup`, `selectCols`/`itemCols`, `orderOut` and
+    `checkGrouped` (GROUP BY's checks).
+  - The typing helpers resolve calls: `timeLitOid`, `isBp`, `trimmed`,
+    `bpCmp`, `bpCall`, `bpAssign`, `numPS`, `exprColl`, `cmpColl`,
+    `Coll`, `collKeyOf`, `collateCall`, `cmpKind`, `textOrUnknown`,
+    `isTextExpr`, `exprKind`, `unifyVals`, `isTypedFn`/`TYPED_FNS`,
+    `isHint`, `oidType`, `isIntOid`, `isCmp`, and exec's wrappers of
+    bind's (`exprOid`, `arrayConcat`, `isTextOid`, `typing()`).
+  - Get the full list of what resolve calls first. Its body, cut out and
+    run through `grep -o '\b[a-zA-Z_][a-zA-Z0-9_.]*('`, gives what must
+    move with it or be passed in.
+- The `Scope` split:
+  - `Frame` is all naming: `cols`, `exact`, `refs`, `refOids`,
+    `subRefs`, `subOids`, `subNames`, `subColls`, `subKinds`,
+    `subReads`, `hidden`. It moves.
+  - In `Scope`, `frames`, `base`, `ptypes` and `coll` are naming.
+  - The rest are the planner's hints and stay in exec: `works`,
+    `asRole`, `whos`, `target`, `looks`, `early`, `locking`, `ordBy`,
+    `ordLim`, `noRefKeys`.
+  - A way to split it: a `lexdb_bind.Names` record (frames, base,
+    ptypes, coll) held by exec's `Scope` as one field, with
+    `resolve(x, cols, n, nm: mut &Names)`. Then every `sc.frames`,
+    `sc.base`, `sc.ptypes` and `sc.coll` in exec becomes `sc.names.…`.
+    Count those sites first (`grep -c 'sc\.frames'`): they are many, in
+    `buildQuery`, `planSub`, `planSelect` and the DML planners.
+- Blockers to check before moving:
+  - Import rules: `lexdb_bind` may import only `lexdb_base`,
+    `lexdb_sql`, `lexdb_catalog`, `lexdb_dialect`, `lexdb_time`,
+    `lexdb_float`, `lexdb_ops` and `lexdb_lib` (`tests/lexdb/imports.py`,
+    `BIND_MAY_IMPORT`). resolve calls `lexdb_syscat.tsqlBlank` (T-SQL's
+    `''` as 0), so move that function down or pass it in, as
+    `Typing.fnOid`/`fnBind` pass the dialect's functions. Errors are
+    `lexdb_base.DbErr`; exec's `e()` is `lexdb_base.err`.
+  - `enumOrder` reads the store (an enum's order). It is called on
+    resolve's result in `buildQuery`, not inside resolve, so it stays in
+    exec, as do `planSub` (resolve does not plan subqueries: they come in
+    as `#sub`/`#in`/`#exists` calls numbered by the frame's `sub*`
+    lists, which `buildQuery` fills).
+  - `outerRef`'s numbering (refs past `Scope.base`) and `endScope`
+    (`q.refs`, `Query.base`) are what `SubPlan`, `subFixed`, `isSubCall`,
+    `subValue`, `keyConj` and `noRefKeys` (9.104) depend on. Move them
+    unchanged.
+- Traps:
+  - The slot is relative to the column list resolve was given. A
+    frame's `cols` are its query's `q.cols` in order, but only when that
+    query has subqueries (`buildQuery` fills `sc.frames[me].cols` only
+    then). Keep `colSlot`'s name check until `eval` and every binder
+    read one column list per query level (slice 4). Expressions are
+    still typed and bound over other lists: DML's targets, index and
+    CHECK expressions.
+  - `resolveName` returns a place now. `cols[i].name` is the resolved
+    name, and the first column of a name wins, as before.
+  - A name repeated in one FROM item is `name DUPSEP k`. USING and
+    NATURAL mark columns `USING_HIDDEN` and list FULL JOIN's other sides
+    in `using`. `pos` is star's order after USING. A view resolves under
+    its owner (`asRole`, the planner's: keep the view's planning in exec
+    and only its naming in the binder).
+  - `Expr.Col`'s name is still load-bearing (`keyedCol`, `levelOf`,
+    `colAt`, `rangePath`, `bpFix`, `exprText`, `sameExpr`, `colNames`).
+    Keep both fields.
+  - `bindExpr` runs per run on the `bxOf` paths. Slice 2 made its column
+    arm one compare; keep it so.
+  - `BX` and `FnRef` are owned, not copy types. Copy a `FnRef` by its
+    fields (`reslot`).
+  - The suite compiles each test as it runs it: do not edit the sources
+    while it runs (about 4 minutes at `-j 2`). That includes a source
+    copy that the suite run reads. An instrumented copy elsewhere (a
+    scratch tree with `cmd`, `tests`, `lib` and `tools`) is fine.
+  - When waiting for a process, do not `pgrep -f` a pattern that also
+    appears in your own waiting command line: it matches itself and
+    never ends. Wait on the PID.
+- Gates, as for slices 1–2:
+  - the suite (188);
+  - TPC-H all 22, checksums against `~/tpch/out-baseline-1744ef99`
+    (fields [0] and [8]), with q20, q18's HAVING, q2, q17, q21 and q22
+    watched;
+  - the 35 queries;
+  - OLTP point selects and updates.
+  - q1 sits 1.5–2% from main on some layouts with no change on its path
+    (2-ii, this slice). Confirm with `qab.sh` and a perf profile before
+    chasing it.
+- Methods:
+  - `tpch_ab.sh`/`tpcmp.py`, `ab35.sh`/`cmp35.py`, `oltp.sh` and
+    `qab.sh` are in `~/tpch-w/bind/bench`. The baseline is built from
+    `git archive <main> lexell/cmd` into `~/tpch-w/bind/src-main`, run
+    from there.
+  - The differential naming battery is `~/tpch-w/bind/bench/naming/`
+    (`run.sh BIN OUT [SQL]`: a fresh data directory, psql with
+    `ON_ERROR_STOP=0` and verbose errors). Diff main's output against the
+    branch's; add cases for whatever moves.
+  - For a slot check, build a scratch copy whose `colSlot` panics when
+    `slot >= 0` and the first column of the name is another one, and run
+    the suite from that copy.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
