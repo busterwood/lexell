@@ -1392,6 +1392,25 @@ fn (c: mut &Checker) frozen(root: int, kind: int, line: int) {
     }
 }
 
+// Under LXL_OWNED_STR: would frozen(root, FR_MOVE) stop (a captured variable, or a borrow in scope)?
+fn (c: mut &Checker) moveBlocked(root: int): bool {
+    if root < 0 { return false }
+    if c.vars[root].jn >= 0 {
+        for x in c.members(root) {
+            if c.moveBlocked(x) { return true }
+        }
+        return false
+    }
+    if c.vars[root].cap >= 0 { return true }
+    for s in 0..len(c.cx.scopes) {
+        for f in c.cx.scopes[s].freezes {
+            let hit = f.root == root || (f.root >= 0 && c.vars[f.root].jn >= 0 && hasInt(&c.joins[c.vars[f.root].jn], root))
+            if hit && c.inForce(&f, 0) { return true }
+        }
+    }
+    return false
+}
+
 // A move or assignment may not touch a place held by a call (or operator) in progress.
 fn (c: mut &Checker) checkPending(root: int, path: &str, line: int, move: bool) {
     if root == -1 { return }
@@ -1480,6 +1499,10 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
         if c.vars[vx].moved { c.movedErr(vx, line) }
         if soft && len(c.cx.nomove) > 0 {
             c.note("loop", line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft && c.moveBlocked(vx) {
+            c.note(if c.vars[vx].cap >= 0 { "captured" } else { "frozen" }, line, &c.vars[vx].name)
             return c.dup(v.c, v.t)
         }
         if soft && c.pendingHit(vx, "") {
@@ -5325,6 +5348,13 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         if st.k == ST_NONE {
             let recv = c.expr(fn1.a, -1)
             let base = if c.pg.tk(recv.t) == sema.TK_REF { c.pg.ta(recv.t) } else { recv.t }
+            if fn1.s == "clone" && len(args) == 0 && c.pg.tk(base) != sema.TK_TP && c.pg.methodOf(base, "clone") < 0 &&
+                    c.pg.isCopyLegacy(base) {
+                // design/owned-str.md: the built-in clone of a type that is copied while str is counted
+                let v = c.rd(recv)
+                if v.cat == CAT_PLACE { return rv(c.dup(v.c, base), base) }
+                return rv(c.consume(v, n.line), base)
+            }
             let sig = c.methodSig(base, &fn1.s, n.line, c.pg.tk(base) == sema.TK_INST)
             if sig.kind < 0 {
                 let fv = c.fieldOf(recv, &fn1.s, n.line)
