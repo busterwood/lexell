@@ -1,0 +1,370 @@
+// lexdb_exec and lexdb_pipe: a SELECT of one table, its rows filtered and
+// its outputs made, run by the pipeline (design/lexdb-layers.md 6.2.3,
+// slice P1a), against the engines it replaces. Random queries over a
+// table of 2,600 rows (three batches, the last part full) with integers,
+// booleans, numerics, texts, dates and NULLs, an index and its covering
+// read, run four ways: SET lexdb_batch = off (the row engine, the
+// reference), on with the pipeline switched off (the batch drivers, as
+// before P1), and with it on, the rows held and given to a sink (an
+// OutBatch where a chunk made them). The four must agree, errors
+// included:
+// - every path: a scan, a primary key range, its point, IN lists, read
+//   backward, an index range, the index read alone, a LIMIT on each;
+// - outputs and conditions of every type, with NULLs, and errors under
+//   vector evaluation: a division by zero on one row of a batch, past a
+//   LIMIT or before it, under AND and CASE (short-circuits: never
+//   evaluated where the row engine does not), a text not a number, an
+//   integer's overflow (the held rows' path no longer reads a row under
+//   LIMIT 0, as the sinks and PostgreSQL do not);
+// - parameters, the plan kept and run again with others;
+// - max_statement_mem: the rows held past it, the same error;
+// - EXPLAIN ANALYZE's counts the same with the pipeline on and off; its
+//   EXPLAIN the same.
+// expect: committed: 500 queries, 500 the same four ways
+// expect: in a transaction: 120 queries, 120 the same four ways
+// expect: fixed: 30 queries, 30 the same four ways
+// expect: the pipeline ran: true, read batches: true, errors: true
+// expect: parameters: 12 of 12 the same
+// expect: memory: ERROR 53200 | ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
+// expect: counts: 24 of 24 the same
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+import "../../../cmd/lexdb_parse"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// An OutBatch's row j as text.
+fn obText(ob: &lexdb_rows.OutBatch, j: int): str {
+    var vs: []str = []
+    for o in 0..len(ob.kinds) {
+        let c = ob.src[o]
+        let k = ob.kinds[o]
+        var v = lexdb_sql.Val.Null
+        if c < 0 {
+            if !ob.ex[o].nul[j] { v = if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.ex[o].v[j] == 1) } else { lexdb_sql.Val.Int(ob.ex[o].v[j]) } }
+        } else {
+            let at = ob.idx[j]
+            if !ob.cols[c].nul[at] {
+                v = if k == lexdb_exec.BK_INT { lexdb_sql.Val.Int(ob.cols[c].v[at]) } else if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.cols[c].v[at] == 1) } else { ob.vals[c][at] }
+            }
+        }
+        append(mut &vs, lexdb_sql.text(&v))
+    }
+    return strings.join(&vs, "|")
+}
+
+// sql's rows through runRows' sink (with params, the plan cache pc), as q
+// gives them, the rows given before an error too; batched: whether some
+// came as an OutBatch.
+fn viaSink(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache, batched: mut &bool): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    let nt: []int = []
+    var lines: []str = []
+    var nb = 0
+    let r = s.runRows(&stmts[0], params, &nt, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
+        if start { return true }
+        if ob.n > 0 {
+            nb += 1
+            for j in 0..ob.n { append(mut &lines, obText(ob, j)) }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    batched = nb > 0
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) {
+            // the rows given before it: those the row engine gives too
+            return strings.join(&lines, " ") + " ERROR " + e.state + " " + e.msg
+        }
+    }
+}
+
+// sql's held rows (q) and its sink's (viaSink) with the pipeline on, then
+// the batch drivers' (pipeline off) and the row engine's: the same.
+var sunkErrors: int = 0
+
+fn four(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    lexdb_exec.setPipe(false)
+    let drivers = q(s, sql)
+    var pc0 = lexdb_exec.oneShot()
+    let none: []lexdb_sql.Val = []
+    var ob0 = false
+    let sunk0 = viaSink(s, sql, &none, mut &pc0, mut &ob0)
+    lexdb_exec.setPipe(true)
+    let held = q(s, sql)
+    var pc = lexdb_exec.oneShot()
+    var ob = false
+    let sunk = viaSink(s, sql, &none, mut &pc, mut &ob)
+    if strings.contains(&sunk, "ERROR") { sunkErrors += 1 }
+    // LIMIT 0: the pipeline reads nothing, as the sinks did before and as
+    // PostgreSQL's Limit; the held rows' path read a first row, and gave
+    // its error (design/lexdb-layers.md 6.2.6)
+    if strings.endsWith(sql, &" limit 0") {
+        if held == "" && sunk == "" && sunk0 == "" && (off == drivers) { return true }
+    }
+    // a sink's rows before an error are the batch drivers' sink's
+    if off == drivers && drivers == held && sunk == sunk0 && (strings.contains(&sunk, "ERROR") || sunk == held) { return true }
+    println("DIFFERENT: " + sql)
+    println("  rows:     " + off)
+    println("  drivers:  " + drivers)
+    println("  pipeline: " + held)
+    println("  sink (drivers):  " + sunk0)
+    println("  sink (pipeline): " + sunk)
+    return false
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))] }
+
+fn maybe(r: mut &lexdb_base.Rng, v: str): str { return if r.below(10) == 0 { "null" } else { v } }
+
+fn day(r: mut &lexdb_base.Rng): str {
+    let d = 1 + r.below(28)
+    return if d < 10 { "0" + d.toStr() } else { d.toStr() }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn cond(r: mut &lexdb_base.Rng, safe: bool): str {
+    let c = r.below(16)
+    if c == 0 { return "x > " + (r.below(240) - 20).toStr() }
+    if c == 1 { return "z <> " + r.below(5).toStr() }
+    if c == 2 { return "tx like 'L1%'" }
+    if c == 3 { return "bo" }
+    if c == 4 { return if safe { "y is not null" } else { "x / (z - 3) > 0" } }
+    if c == 5 { return "nu > " + r.below(30).toStr() + ".5" }
+    if c == 6 { return "dt >= '2024-01-" + day(r) + "'" }
+    if c == 7 { return "x between " + r.below(100).toStr() + " and " + (100 + r.below(100)).toStr() }
+    if c == 8 { return "z in (1, 3)" }
+    if c == 9 { return "tx is null" }
+    if c == 10 { return "upper(tx) = 'L" + r.below(80).toStr() + "'" }
+    // short-circuits: the division only where the row engine reaches it
+    if c == 11 { return "z <> 3 and x / (z - 3) >= 0" }
+    if c == 12 { return "case when z = 2 then false else x / (z - 2) > 1 end" }
+    if c == 13 { return if safe { "coalesce(x, 0) > 5" } else { "x + y > 0" } }
+    if c == 14 { return "not (bo and x > 50)" }
+    return if safe { "w like 'w1%'" } else { "cast(tx as int) > 0" }
+}
+
+// The path a condition gives: a primary key range or point, IN lists, the
+// index on x (with x alone in the output: read alone), or none.
+fn path(r: mut &lexdb_base.Rng): str {
+    let c = r.below(9)
+    if c == 0 { return "id between " + r.below(2600).toStr() + " and " + r.below(2600).toStr() }
+    if c == 1 { return "id = " + r.below(2700).toStr() }
+    if c == 2 { return "id in (" + r.below(2600).toStr() + ", " + r.below(2600).toStr() + ", 7)" }
+    if c == 3 { return "x = " + r.below(200).toStr() }
+    if c == 4 { return "x between " + r.below(200).toStr() + " and " + r.below(200).toStr() }
+    if c == 5 { return "id > " + r.below(2700).toStr() }
+    return ""
+}
+
+fn query(r: mut &lexdb_base.Rng, safe: bool): str {
+    let cols = ["id", "x", "y", "z", "bo", "tx", "nu", "dt", "w", "x + z", "x > 100", "x * 2 - z", "-y", "nu * 2", "nu + x",
+                "upper(tx)", "tx || '!'", "length(w)", "dt + 1", "case when z = 0 then 'zero' else tx end", "coalesce(x, -1)",
+                "x is null", "abs(x - 100)", "round(nu)", "cast(x as text)", "substr(tx, 2)", "z = 1 or bo"]
+    let unsafe = ["x / (z - 3)", "y * 1000000000", "cast(tx as int)", "100 / x", "case when z <> 1 then x / (z - 1) end"]
+    var items: []str = []
+    if r.below(6) == 0 {
+        // the index read alone
+        append(mut &items, "x")
+    } else {
+        for i in 0..(1 + r.below(4)) { append(mut &items, pick(r, &cols)) }
+        if !safe && r.below(3) == 0 { append(mut &items, pick(r, &unsafe)) }
+    }
+    var conds: []str = []
+    let p = path(r)
+    if p != "" { append(mut &conds, p) }
+    for i in 0..r.below(3) { append(mut &conds, cond(r, safe)) }
+    var sql = "select " + strings.join(&items, ", ") + " from f"
+    if len(conds) > 0 { sql = sql + " where " + strings.join(&conds, " and ") }
+    let o = r.below(8)
+    if o == 0 { sql = sql + " order by id" }
+    if o == 1 { sql = sql + " order by id desc" }
+    let l = r.below(4)
+    if l == 0 { sql = sql + " limit " + pick(r, &["0", "1", "5", "300", "1100"]) }
+    return sql
+}
+
+fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table f (id int primary key, x int, y bigint, z int, bo boolean, tx text, nu numeric(10,2), dt date, w varchar(20))")
+    let c2 = q(s, &"create index f_x on f (x)")
+    var id = 1
+    for chunk in 0..26 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, "(" + id.toStr() + ", " + maybe(r, (r.below(220) - 10).toStr()) + ", " + maybe(r, ((r.below(11) - 5) * 1000000007).toStr()) + ", " +
+                   maybe(r, r.below(5).toStr()) + ", " + maybe(r, pick(r, &["true", "false"])) + ", " +
+                   maybe(r, pick(r, &["'L" + r.below(80).toStr() + "'", "'" + r.below(30).toStr() + "'"])) + ", " +
+                   maybe(r, r.below(30).toStr() + "." + pick(r, &["0", "5", "50"])) + ", " + maybe(r, "'2024-01-" + day(r) + "'") + ", " +
+                   maybe(r, "'w" + r.below(40).toStr() + "'") + ")")
+            id += 1
+        }
+        let ins = q(s, &("insert into f values " + strings.join(&rows, ", ")))
+        if ins != "INSERT 0 100" { println("insert: " + ins) }
+    }
+}
+
+// An EXPLAIN ANALYZE's lines without the result's time.
+fn plan(x: &str): str {
+    let parts = strings.split(x, &"result:")
+    return "" + parts[0]
+}
+
+fn sameCounts(s: mut &lexdb_exec.Session, sql: &str): bool {
+    lexdb_exec.setPipe(false)
+    let off = q(s, &("explain analyze " + sql))
+    let offPlan = q(s, &("explain " + sql))
+    lexdb_exec.setPipe(true)
+    let on = q(s, &("explain analyze " + sql))
+    let onPlan = q(s, &("explain " + sql))
+    if plan(&on) == plan(&off) && onPlan == offPlan { return true }
+    println("COUNTS: " + sql)
+    println("  drivers:  " + off)
+    println("  pipeline: " + on)
+    println("  plans: " + offPlan + " / " + onPlan)
+    return false
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var r = lexdb_base.rng(61)
+        load(mut &s, mut &r)
+        let an = q(mut &s, &"analyze f")
+        let runs0 = lexdb_exec.pipeRuns()
+        var same = 0
+        for i in 0..500 {
+            let sql = query(mut &r, i % 3 == 0)
+            if four(mut &s, &sql) { same += 1 }
+        }
+        println("committed: 500 queries, " + same.toStr() + " the same four ways")
+        // a transaction's own writes, not committed, read merged
+        let b = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into f values (5001, 7, 7, 1, true, 'L1', 1.5, '2024-01-02', 'w1'), (5002, null, 1, 3, false, 'x', 2.0, null, null)")
+        let w2 = q(mut &s, &"update f set x = x + 1, tx = 'L1' || tx where id % 7 = 0")
+        let w3 = q(mut &s, &"delete from f where id % 11 = 0")
+        var sameT = 0
+        for i in 0..120 {
+            // (no errors: one would end the transaction)
+            let sql = query(mut &r, true)
+            if four(mut &s, &sql) { sameT += 1 }
+        }
+        let rb = q(mut &s, &"rollback")
+        println("in a transaction: 120 queries, " + sameT.toStr() + " the same four ways")
+        // the shapes one by one: errors on one row of a batch, before and
+        // past a LIMIT; short-circuits; every path
+        let fixed = ["select id, x / (z - 3) from f", "select id, x / (z - 3) from f limit 2", "select id from f where x / (z - 3) > 0",
+                     "select id from f where x / (z - 3) > 0 limit 1", "select id, 100 / x from f where x <> 0",
+                     "select id, case when z <> 1 then x / (z - 1) end from f", "select id from f where z <> 3 and x / (z - 3) >= 0",
+                     "select id from f where z = 3 or x / (z - 3) >= 0", "select id, cast(tx as int) from f where tx not like 'L%'",
+                     "select id, cast(tx as int) from f", "select y * 1000000000 from f", "select id from f where id = 17",
+                     "select id, tx from f where id = 999999", "select id, x from f where id in (5, 2500, 1300)",
+                     "select id from f order by id desc limit 3", "select x from f where x between 10 and 20",
+                     "select id, x from f where x = 42", "select x from f where x > 200 limit 5", "select id, nu * 2, nu + x from f where nu > 20.5",
+                     "select dt + 1, dt from f where dt >= '2024-01-20' and id < 300", "select tx || '!', upper(tx) from f where tx like 'L2%'",
+                     "select id from f where id > 2590", "select id, w from f where id between 1000 and 1030 and w is null",
+                     "select bo, not bo, bo and x > 5 from f where id < 50", "select coalesce(x, -1), x is null from f where id < 1030",
+                     "select id from f limit 0", "select * from f where id < 3", "select x + z, x > 100 from f limit 1100",
+                     "select abs(x - 100), round(nu) from f where id between 2000 and 2100", "select id from f where x is null"]
+        var sameF = 0
+        for sql in fixed { if four(mut &s, &sql) { sameF += 1 } }
+        println("fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same four ways")
+        let runs1 = lexdb_exec.pipeRuns()
+        println("the pipeline ran: " + (runs1[0] - runs0[0] > 500).toStr() + ", read batches: " + (runs1[1] - runs0[1] > 100).toStr() +
+                ", errors: " + (sunkErrors > 20).toStr())
+        // parameters: the plan kept (one cache) and run with each value,
+        // against the row engine's
+        let psql = "select id, x + $1, tx from f where x > $1 and id < $2 limit 40"
+        var pc = lexdb_exec.newPlanCache()
+        var sameP = 0
+        for i in 0..12 {
+            let ps = [lexdb_sql.Val.Int(r.below(200)), lexdb_sql.Val.Int(r.below(2700))]
+            var ob = false
+            let viaPipe = viaSink(mut &s, &psql, &ps, mut &pc, mut &ob)
+            let a = q(mut &s, &"set lexdb_batch = off")
+            var pc2 = lexdb_exec.oneShot()
+            var ob2 = false
+            let viaRows = viaSink(mut &s, &psql, &ps, mut &pc2, mut &ob2)
+            let b2 = q(mut &s, &"set lexdb_batch = on")
+            if viaPipe == viaRows { sameP += 1 } else { println("PARAMS: " + viaPipe + " / " + viaRows) }
+        }
+        println("parameters: " + sameP.toStr() + " of 12 the same")
+        // max_statement_mem: the rows held past it
+        let m1 = q(mut &s, &"set max_statement_mem = '64kB'")
+        let big = "select id, tx, w, nu from f"
+        var errs: []str = []
+        let a1 = q(mut &s, &"set lexdb_batch = off")
+        append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
+        let a2 = q(mut &s, &"set lexdb_batch = on")
+        lexdb_exec.setPipe(false)
+        append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
+        lexdb_exec.setPipe(true)
+        append(mut &errs, strings.split(&q(mut &s, &big), &" ")[0] + " " + strings.split(&q(mut &s, &big), &" ")[1])
+        let lim = "select id, tx, w, nu from f where x > 100 limit 2000"
+        append(mut &errs, strings.split(&q(mut &s, &lim), &" ")[0] + " " + strings.split(&q(mut &s, &lim), &" ")[1])
+        let small = "select id, tx from f where id < 40"
+        let under = q(mut &s, &small)
+        let a3 = q(mut &s, &"set lexdb_batch = off")
+        let underOff = q(mut &s, &small)
+        let a4 = q(mut &s, &"set lexdb_batch = on")
+        let m2 = q(mut &s, &"set max_statement_mem = 0")
+        println("memory: " + strings.join(&errs, " | ") + "; under it: " + (under == underOff && !strings.contains(&under, "ERROR")).toStr())
+        // EXPLAIN ANALYZE's counts, and EXPLAIN, with the pipeline on and off
+        let shapes = ["select id from f", "select id, x + z from f where x > 100", "select x from f where x between 10 and 30",
+                      "select id from f where id = 17", "select id from f where id between 100 and 1500 and bo",
+                      "select id, tx from f where tx like 'L1%' limit 5", "select id from f where id in (1, 2, 3)",
+                      "select id from f order by id desc limit 4", "select id, x from f where x = 42", "select id from f limit 1100",
+                      "select id from f where id > 2000 order by id", "select nu * 2 from f where nu > 10.5 and z = 1",
+                      "select id from f where x > 50 limit 3", "select upper(tx) from f where dt >= '2024-01-10'",
+                      "select id from f where x is null", "select bo from f where not bo", "select id from f where z in (1, 4)",
+                      "select id from f where id < 0", "select x from f where x > 200 limit 1", "select id, w from f where w like 'w2%'",
+                      "select id from f where id between 1020 and 1030", "select id, x from f where x between 0 and 5 limit 2",
+                      "select id from f where coalesce(x, 0) > 150", "select dt from f where id >= 2599"]
+        var sameC = 0
+        for sql in shapes { if sameCounts(mut &s, &sql) { sameC += 1 } }
+        println("counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
+        return 0
+    })
+}
