@@ -29,9 +29,7 @@ import "./lexdb_pgcat"
 import "./lexdb_pg"
 import "./lexdb_auth"
 import "regex"
-import "unicode"
 import "math"
-import "base64"
 import "./lexdb_rows"
 import "./lexdb_vec"
 import "./lexdb_like"
@@ -42,6 +40,7 @@ import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_bind"
 import "./lexdb_ops"
+import "./lexdb_lib"
 import "./lexdb_dialect"
 import "./lexdb_locks"
 import "./lexdb_func"
@@ -351,255 +350,7 @@ fn bpFix(x: &Expr, cols: &[]lexdb_sql.ColDef): Expr {
     }
 }
 
-// ---- real and double precision (9.79; lexdb_float)
-
-
-
-
-
-
-
-
-
-
-// The math functions over double precision (9.79): one argument's, None if
-// name is none of them.
-fn callFloat(name: &str, v: &Val): Result[Option[Val], DbErr] {
-    if name == "floor" || name == "ceil" || name == "ceiling" || name == "trunc" || name == "round" {
-        // a numeric stays one (to 0 places); an integer or float is a double precision
-        match lexdb_ops.asNum(v) {
-            Some(d) {
-                if !lexdb_ops.isFloat(v) && lexdb_ops.kindOf(v) != lexdb_sql.K_INT {
-                    let r = if name == "floor" { d.floor(0) } else if name == "trunc" { d.trunc(0) } else if name == "round" { d.roundAway(0) } else { d.ceil(0) }
-                    match r {
-                        Ok(x) { return Ok(Some(Val.Num(x))) }
-                        Err(_) { return Err(lexdb_ops.decErr()) }
-                    }
-                }
-            }
-            None {}
-        }
-        let x = try lexdb_ops.floatArg(v, name)
-        let r = if name == "floor" { x.floor() } else if name == "trunc" { x.trunc() } else if name == "round" { x.roundEven() } else { x.ceil() }
-        return Ok(Some(Val.Float(r)))
-    }
-    if name == "sqrt" || name == "cbrt" || name == "exp" || name == "ln" || name == "log10" {
-        let x = try lexdb_ops.floatArg(v, name)
-        if name == "sqrt" && x < 0.0f { return Err(e("2201F", "cannot take square root of a negative number")) }
-        if (name == "ln" || name == "log10") && x == 0.0f { return Err(e("2201E", "cannot take logarithm of zero")) }
-        if (name == "ln" || name == "log10") && x < 0.0f { return Err(e("2201E", "cannot take logarithm of a negative number")) }
-        let r = if name == "sqrt" { x.sqrt() } else if name == "cbrt" { x.cbrt() } else if name == "exp" { x.exp() } else if name == "ln" { x.ln() } else { x.log10() }
-        if r.isInf() && !x.isInf() { return Err(e("22003", "value out of range: overflow")) }
-        if r == 0.0f && name == "exp" && !x.isInf() { return Err(e("22003", "value out of range: underflow")) }
-        return Ok(Some(Val.Float(r)))
-    }
-    if name == "sign" {
-        match v {
-            Val.Int(n) { return Ok(Some(Val.Num(Decimal.fromInt(if n > 0 { 1 } else if n < 0 { -1 } else { 0 })))) }
-            Val.Num(d) { return Ok(Some(Val.Num(Decimal.fromInt(if d.isNeg() { -1 } else if d.isZero() { 0 } else { 1 })))) }
-            else {}
-        }
-        let x = try lexdb_ops.floatArg(v, name)
-        return Ok(Some(Val.Float(if x > 0.0f { 1.0f } else if x < 0.0f { -1.0f } else { 0.0f })))
-    }
-    return Ok(None)
-}
-
-
-// random(): a double in [0, 1), from the kernel's random bytes.
-fn randomFloat(): Result[Val, DbErr] {
-    var b = array(8, byte(0))
-    if getrandom(mut &b, 8, u32(0)) != 8 { return Err(e("58000", "could not generate random values")) }
-    var n = 0
-    for i in 0..7 { n = n * 256 + int(b[i]) }
-    n = n >> 3                  // 53 bits
-    return Ok(Val.Float(float(n) / 9007199254740992.0f))
-}
-
 // ---- dates, times, timestamps and intervals (9.76; lexdb_time)
-
-
-
-
-
-
-
-
-
-
-// The date and time functions (9.76): None when name is not one.
-// now: the transaction's start (microseconds since 2000), 0 for the clock;
-// z: the session's time zone (9.95).
-fn callTime(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
-    let n = len(vs)
-    let prec = if n == 1 { lexdb_ops.intOf(&vs[0]).unwrapOr(6) } else { 6 }
-    // the transaction's start, as PostgreSQL's now(); clock_timestamp() the clock
-    let at = if now != 0 && name != "clock_timestamp" { now } else { lexdb_time.nowTstz() }
-    match name {
-        "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp" {
-            return Ok(Some(Val.Tstz(lexdb_time.roundUs(at, prec))))
-        }
-        "localtimestamp" { return Ok(Some(Val.Ts(lexdb_time.roundUs(lexdb_time.tstzToTs(at, z), prec)))) }
-        "current_date" { return Ok(Some(Val.Date(lexdb_time.tsToDate(lexdb_time.tstzToTs(at, z))))) }
-        "current_time", "localtime" {
-            return Ok(Some(Val.Time(lexdb_time.roundUs(lexdb_ops.floorModInt(lexdb_time.tstzToTs(at, z), lexdb_time.DAY_US), prec))))
-        }
-        "date_part", "date_trunc", "age", "make_date", "to_timestamp", "isfinite", "timezone", "make_timestamp", "make_timestamptz" {}
-        else { return Ok(None) }                // not a date or time function
-    }
-    for v in vs { if lexdb_ops.isNull(&v) { return Ok(Some(Val.Null)) } }
-    if name == "timezone" && (n == 1 || n == 2) {
-        // x AT TIME ZONE zone, timezone(zone, x); AT LOCAL, timezone(x): the session's
-        let x = &vs[n - 1]
-        if n == 1 { return Ok(Some(try atTimeZone(x, z, z))) }
-        match vs[0] {
-            Val.Ival(iv) { return Ok(Some(try atTimeZone(x, &(try lexdb_time.ivalZone(&iv)), z))) }
-            else { return Ok(Some(try atTimeZone(x, &(try lexdb_time.atZone(&text(&vs[0]))), z))) }
-        }
-    }
-    if (name == "date_part" || name == "date_trunc") && (n == 2 || (n == 3 && name == "date_trunc")) {
-        let field = text(&vs[0])
-        var x = vs[1]
-        match x {
-            Val.Text(s) { x = Val.Tstz(try lexdb_time.parseTstz(&s, z)) }
-            else {}
-        }
-        if name == "date_part" {
-            match x {
-                Val.Date(d) {
-                    // a date's fields are whole numbers (its epoch and Julian day too)
-                    try lexdb_time.dateField(&field)
-                    let u = lexdb_time.dateToTs(d)
-                    let xd = try lexdb_time.extractTs(&field, u, u, &"date", 0)
-                    return Ok(Some(Val.Num(xd.trunc(0).unwrapOr(xd))))
-                }
-                Val.Ts(u) { return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, u, u, &"timestamp without time zone", 0)))) }
-                Val.Tstz(u) {
-                    let off = if u == lexdb_time.INF || u == lexdb_time.NINF { 0 } else { z.offsetOf(u) }
-                    return Ok(Some(Val.Num(try lexdb_time.extractTs(&field, lexdb_time.tstzToTs(u, z), u, &"timestamp with time zone", off))))
-                }
-                Val.Time(u) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &lexdb_time.Ival{months: 0, days: 0, us: u})))) }
-                Val.Ival(iv) { return Ok(Some(Val.Num(try lexdb_time.extractIval(&field, &iv)))) }
-                else { return Err(e("42883", &("function date_part(text, " + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&x))) + ") does not exist"))) }
-            }
-        }
-        if n == 3 {
-            // date_trunc(field, x, zone): a timestamptz cut in that zone
-            let tz3 = try lexdb_time.atZone(&text(&vs[2]))
-            match x {
-                Val.Tstz(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, u, &tz3)))) }
-                Val.Date(d) { return Ok(Some(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), &tz3)))) }
-                Val.Ts(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, lexdb_time.tsToTstz(u, z), &tz3)))) }
-                else { return Err(e("42883", &("function date_trunc(text, " + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&x))) + ", text) does not exist"))) }
-            }
-        }
-        match x {
-            Val.Date(d) { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(try lexdb_time.truncTs(&field, lexdb_time.dateToTs(d)), z)))) }
-            Val.Ts(u) { return Ok(Some(Val.Ts(try lexdb_time.truncTs(&field, u)))) }
-            Val.Tstz(u) { return Ok(Some(Val.Tstz(try truncTstz(&field, u, z)))) }
-            Val.Ival(iv) { return Ok(Some(Val.Ival(try lexdb_time.truncIval(&field, &iv)))) }
-            else { return Err(e("42883", &("function date_trunc(text, " + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&x))) + ") does not exist"))) }
-        }
-    }
-    if name == "age" && (n == 1 || n == 2) {
-        let a = if n == 2 { try tsOfVal(&vs[0], z) } else { lexdb_time.dateToTs(lexdb_time.tsToDate(lexdb_time.tstzToTs(at, z))) }
-        let b = try tsOfVal(&vs[n - 1], z)
-        return Ok(Some(Val.Ival(try lexdb_time.age(a, b))))
-    }
-    if name == "make_date" && n == 3 {
-        match lexdb_ops.intOf(&vs[0]) {
-            Some(y) {
-                match lexdb_ops.intOf(&vs[1]) {
-                    Some(m) {
-                        match lexdb_ops.intOf(&vs[2]) {
-                            Some(d) { return Ok(Some(Val.Date(try lexdb_time.makeDate(y, m, d)))) }
-                            None {}
-                        }
-                    }
-                    None {}
-                }
-            }
-            None {}
-        }
-        return Err(e("42883", "function make_date needs three integers"))
-    }
-    if (name == "make_timestamp" && n == 6) || (name == "make_timestamptz" && (n == 6 || n == 7)) {
-        // make_timestamp(year, month, day, hour, min, sec); make_timestamptz's
-        // in the session's zone, or the seventh argument's
-        var ns: []int = []
-        for i in 0..5 {
-            match lexdb_ops.intOf(&vs[i]) {
-                Some(x) { append(mut &ns, x) }
-                None { return Err(e("42883", &("function " + name + " needs integers and a number of seconds"))) }
-            }
-        }
-        let sec = lexdb_ops.asNum(&vs[5])
-        if sec.isNone() { return Err(e("42883", &("function " + name + " needs integers and a number of seconds"))) }
-        let local = try lexdb_time.makeTs(ns[0], ns[1], ns[2], ns[3], ns[4], &sec.unwrap())
-        if name == "make_timestamp" { return Ok(Some(Val.Ts(local))) }
-        if n == 7 { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, &(try lexdb_time.atZone(&text(&vs[6]))))))) }
-        return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, z))))
-    }
-    if name == "to_timestamp" && n == 1 {
-        match lexdb_ops.asNum(&vs[0]) {
-            Some(d) { return Ok(Some(Val.Tstz(try lexdb_time.fromEpochSeconds(&d)))) }
-            None { return Err(e("42883", "function to_timestamp(text) does not exist")) }
-        }
-    }
-    if name == "isfinite" && n == 1 {
-        match vs[0] {
-            Val.Date(d) { return Ok(Some(Val.Bool(d != lexdb_time.INF && d != lexdb_time.NINF))) }
-            Val.Ts(u) { return Ok(Some(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF))) }
-            Val.Tstz(u) { return Ok(Some(Val.Bool(u != lexdb_time.INF && u != lexdb_time.NINF))) }
-            Val.Ival(_) { return Ok(Some(Val.Bool(true))) }
-            else {}
-        }
-    }
-    return Ok(None)
-}
-
-// date_trunc of a timestamptz in zone z, as PostgreSQL's: the local time
-// cut; a day or more read back in the zone (by its rules for a time that
-// is not, or is twice), less with the offset it had.
-fn truncTstz(field: &str, u: int, z: &lexdb_time.Zone): Result[int, DbErr] {
-    if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(u) }
-    let off = z.offsetOf(u)
-    let local = u + off * 1000000
-    let cut = try lexdb_time.truncTs(field, local)
-    match strings.toLowerAscii(&field) {
-        "microseconds", "microsecond", "milliseconds", "millisecond", "second", "seconds", "minute", "minutes", "hour", "hours" {
-            return Ok(cut - off * 1000000)
-        }
-        else { return Ok(lexdb_time.tsToTstz(cut, z)) }
-    }
-}
-
-// x AT TIME ZONE at (9.95): a timestamptz made the local time there; a
-// timestamp (a date, a text: a timestamptz, as PostgreSQL reads them, in
-// the session's zone z) read there, made a timestamptz.
-fn atTimeZone(x: &Val, at: &lexdb_time.Zone, z: &lexdb_time.Zone): Result[Val, DbErr] {
-    match x {
-        Val.Ts(u) { return Ok(Val.Tstz(tsAt(u, at))) }
-        Val.Tstz(u) { return Ok(Val.Ts(lexdb_time.tstzToTs(u, at))) }
-        Val.Date(d) { return Ok(Val.Ts(lexdb_time.tstzToTs(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z), at))) }
-        Val.Text(s) { return Ok(Val.Ts(lexdb_time.tstzToTs(try lexdb_time.parseTstz(&s, z), at))) }
-        else { return Err(e("42883", &("function timezone(text, " + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(x))) + ") does not exist"))) }
-    }
-}
-
-fn tsAt(u: int, at: &lexdb_time.Zone): int { return lexdb_time.tsToTstz(u, at) }
-
-// A timestamp's local microseconds for age(): a date at midnight, a
-// timestamptz in the session's zone z.
-fn tsOfVal(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
-    match v {
-        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
-        Val.Ts(u) { return Ok(u) }
-        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
-        Val.Text(s) { return Ok(try lexdb_time.parseTs(&s, z)) }
-        else { return Err(e("42883", &("function age(" + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(v))) + ") does not exist"))) }
-    }
-}
 
 // The result type of a date or time operator (0: not one): lexdb_bind's.
 fn timeOpOid(op: &str, l: int, r: int): int { return lexdb_bind.timeOpOid(op, l, r) }
@@ -608,46 +359,6 @@ fn timeOpOid(op: &str, l: int, r: int): int { return lexdb_bind.timeOpOid(op, l,
 
 
 pub fn arrayText(vals: &[]Val): str { return lexdb_ops.arrayText(vals) }
-
-// x op ANY (array), x op ALL (array), as PostgreSQL: ANY is true if one
-// comparison is, else NULL if one is NULL, else false (an empty array:
-// false); ALL is false if one is false, else NULL if one is NULL, else true.
-// The elements are read as x's type.
-fn quantified(name: &str, x: &Val, arr: &Val): Result[Val, DbErr] {
-    let all = strings.startsWith(&name, "all ")
-    let op = name[4..len(name)]
-    let a = match arr {
-        Val.Text(t) { t }
-        Val.Null { return Ok(Val.Null) }
-        else { return Err(e("42809", "op ANY/ALL (array) requires an array on the right")) }
-    }
-    let parts = try lexdb_ops.arrayParts(&a)
-    if len(parts) == 0 { return Ok(Val.Bool(all)) }
-    if lexdb_ops.isNull(x) { return Ok(Val.Null) }
-    // x [NOT] LIKE | ILIKE ANY | ALL (array) (9.94)
-    let like = strings.endsWith(&op, "like")
-    let ty = oidType(if lexdb_ops.kindOf(x) == lexdb_sql.K_INT { lexdb_sql.OID_INT8 } else { lexdb_ops.kindOid(x) })
-    var sawNull = false
-    for part in parts {
-        match part {
-            None { sawNull = true }
-            Some(p) {
-                var ok = false
-                if like {
-                    ok = (try likeMatch(&(text(x)), &p, "\\", strings.endsWith(&op, "ilike"))) != strings.startsWith(&op, "not ")
-                } else {
-                    let v = try lexdb_ops.coerce(Val.Text(p), &ty)
-                    let c = try lexdb_ops.compare(x, &v)
-                    ok = if op == "=" { c == 0 } else if op == "<>" { c != 0 } else if op == "<" { c < 0 } else if op == "<=" { c <= 0 } else if op == ">" { c > 0 } else { c >= 0 }
-                }
-                if ok && !all { return Ok(Val.Bool(true)) }
-                if !ok && all { return Ok(Val.Bool(false)) }
-            }
-        }
-    }
-    if sawNull { return Ok(Val.Null) }
-    return Ok(Val.Bool(all))
-}
 
 pub fn kindOid(v: &Val): int { return lexdb_ops.kindOid(v) }
 
@@ -1182,7 +893,7 @@ fn castVal(v: Val, t: &lexdb_sql.TypeName, seq: &Option[SeqEnv]): Result[Val, Db
 //
 // lexdb_bind binds an expression once for a statement's run (bindExpr);
 // bxEval gives exactly what eval gives: it runs eval's own operations
-// (unaryVal, binVal, castVal, callAt and its parts). What eval alone
+// (unaryVal, binVal, castVal, callAt: lexdb_ops, lexdb_lib). What eval alone
 // evaluates (a subquery, an aggregate, a window call, a sequence,
 // session, lock or catalog function, a reg cast, T-SQL's typed division
 // and AVG) does not bind (fnRefOf's FN_NONE): eval runs it.
@@ -1220,34 +931,30 @@ fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val
 }
 
 // name's call of n arguments, bound (lexdb_bind's Typing.fnBind): FN_NONE
-// for one eval alone evaluates; else callAt's way for it, when none of
-// callAt's earlier ways (callMisc, callFn, callTime, ...) can take it.
+// for one eval alone evaluates; else its entries, found once here
+// (entryAt; lexdb_lib.entry1Of for one argument: FN_ONE), after its
+// dialect's call for a T-SQL or Oracle name, as eval.
 fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
     if isAgg(name) || name == "#win" || name == "#wmark" || name == "row" || isWinFn(name) || name == "#tdiv" || name == "#tavg" ||
        isSeqFn(name) || isSessFn(name) || isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
-        return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, id: 0, dialect: false}
+        return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}
     }
     var way = FN_GEN
-    var id = 0
-    let special = isDialectFn(name)
-    if !special {
-        // (callFn takes sqrt, cbrt, exp, ln and log10 first)
-        if n == 1 && name != "sqrt" && name != "cbrt" && name != "exp" && name != "ln" && name != "log10" {
-            id = fn1Of(name)
-            if id > 0 { way = FN_ONE }
+    var f1: lexdb_lib.Lib1 = lexdb_lib.no1
+    if n == 1 {
+        match lexdb_lib.entry1Of(name) {
+            Some(f) {
+                f1 = f
+                way = FN_ONE
+            }
+            None {}
         }
-        if name == "coalesce" { way = FN_COALESCE }
-        if name == "substr" && (n == 2 || n == 3) { way = FN_SUBSTR }
-        if name == "concat" { way = FN_CONCAT }
     }
-    return lexdb_bind.FnRef{name: name.toStr(), way: way, id: id, dialect: special}
+    return lexdb_bind.FnRef{name: name.toStr(), way: way, f: entryAt(name, n), f1: f1, dialect: isDialectFn(name)}
 }
 
 const FN_GEN = lexdb_bind.FN_GEN
 const FN_ONE = lexdb_bind.FN_ONE
-const FN_COALESCE = lexdb_bind.FN_COALESCE
-const FN_SUBSTR = lexdb_bind.FN_SUBSTR
-const FN_CONCAT = lexdb_bind.FN_CONCAT
 
 // A unary operator's text (lexdb_ops.UN_*), as unaryVal takes it.
 fn unName(u: int): &str {
@@ -1325,410 +1032,67 @@ fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, 
 
 // A bound call's value for its arguments vs, as eval's call gives it.
 fn callRef(fb: &lexdb_bind.FnRef, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
-    if fb.way == FN_ONE {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-        match try call1(fb.id, &fb.name, &vs[0]) {
-            Some(r) { return Ok(r) }
-            None {}
-        }
-    } else if fb.way == FN_COALESCE {
-        return Ok(coalesceOf(vs))
-    } else if fb.way == FN_SUBSTR {
-        for v in vs { if lexdb_ops.isNull(&v) { return Ok(Val.Null) } }
-        return substrOf(&(text(&vs[0])), vs, &fb.name)
-    } else if fb.way == FN_CONCAT {
-        return Ok(concatOf(vs, &ce.zone))
-    }
     if fb.dialect {
         match try callDialectFn(&fb.name, vs, &ce.zone) {
             Some(v) { return Ok(v) }
             None {}
         }
     }
-    return callAt(&fb.name, vs, ce.now, &ce.zone)
-}
-
-fn intArg(v: Val, fname: &str): Result[int, DbErr] {
-    match v {
-        Val.Int(n) { return Ok(n) }
-        else {
-            match try lexdb_ops.coerce(v, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
-                Val.Int(n) { return Ok(n) }
-                else { return Err(e("42883", &("function " + fname + " needs an integer"))) }
-            }
-        }
+    if fb.way == FN_ONE {
+        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+        return fb.f1(&fb.name, &vs[0])
     }
-}
-
-// LIKE: % any run of characters, _ one character, the escape character
-// (backslash unless given; '' for none) before either for itself.
-fn likeMatch(s: &str, pat: &str, esc: &str, fold: bool): Result[bool, DbErr] {
-    let er = strings.runes(&esc)
-    if len(er) > 1 { return Err(e("22019", "invalid escape string")) }
-    // literal text and % only: its pieces, found in order as bytes (9.52)
-    if !fold && lexdb_like.likeSimple(&pat, &esc) { return Ok(lexdb_like.likePieces(&s, &lexdb_like.likeSplit(&pat))) }
-    let sl: str = if fold { strings.toLowerAscii(&s) } else { s }
-    let sr = strings.runes(&sl)
-    let pl: str = if fold { strings.toLowerAscii(&pat) } else { pat }
-    let pr = strings.runes(&pl)
-    let ec = if len(er) == 1 { er[0] } else { -1 }
-    var kind: []int = []            // 0 a character, 1 _, 2 %
-    var lit: []int = []
-    var i = 0
-    while i < len(pr) {
-        let c = pr[i]
-        if c == ec {
-            if i + 1 >= len(pr) { return Err(e("22025", "LIKE pattern must not end with escape character")) }
-            append(mut &kind, 0)
-            append(mut &lit, pr[i + 1])
-            i += 2
-            continue
-        }
-        if c == 37 {
-            if len(kind) == 0 || kind[len(kind) - 1] != 2 {
-                append(mut &kind, 2)
-                append(mut &lit, 0)
-            }
-        } else if c == 95 {
-            append(mut &kind, 1)
-            append(mut &lit, 0)
-        } else {
-            append(mut &kind, 0)
-            append(mut &lit, c)
-        }
-        i += 1
-    }
-    var si = 0
-    var pi = 0
-    var star = -1
-    var mark = 0
-    while si < len(sr) {
-        if pi < len(kind) && (kind[pi] == 1 || (kind[pi] == 0 && lit[pi] == sr[si])) {
-            si += 1
-            pi += 1
-        } else if pi < len(kind) && kind[pi] == 2 {
-            star = pi
-            mark = si
-            pi += 1
-        } else if star >= 0 {
-            pi = star + 1
-            mark += 1
-            si = mark
-        } else {
-            return Ok(false)
-        }
-    }
-    while pi < len(kind) && kind[pi] == 2 { pi += 1 }
-    return Ok(pi == len(kind))
-}
-
-// substr(s, from [, count]), by characters, from 1, as PostgreSQL clips it.
-fn substr(s: &str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
-    let rs = strings.runes(&s)
-    if hasCount && count < 0 { return Err(e("22011", "negative substring length not allowed")) }
-    var lo = from
-    var hi = if hasCount { from + count } else { len(rs) + 1 }
-    if lo < 1 { lo = 1 }
-    if hi > len(rs) + 1 { hi = len(rs) + 1 }
-    if hi <= lo { return Ok("") }
-    var out: []int = []
-    for i in lo - 1..hi - 1 { append(mut &out, rs[i]) }
-    return Ok(strings.fromRunes(&out))
-}
-
-// callAt's substr(a, from [, count]) of vs (none NULL), a vs[0]'s text.
-fn substrOf(a: &str, vs: &[]Val, name: &str): Result[Val, DbErr] {
-    let n = len(vs)
-    let from = try intArg(vs[1], name)
-    let count = if n == 3 { try intArg(vs[2], name) } else { 0 }
-    return Ok(Val.Text(try substr(a, from, count, n == 3)))
-}
-
-// callAt's concat.
-fn concatOf(vs: &[]Val, z: &lexdb_time.Zone): Val {
-    var out = ""
-    for v in vs { if !lexdb_ops.isNull(&v) { out = out + lexdb_ops.textZ(&v, z) } }
-    return Val.Text(out)
-}
-
-// callAt's coalesce.
-fn coalesceOf(vs: &[]Val): Val {
-    for v in vs { if !lexdb_ops.isNull(&v) { return v } }
-    return Val.Null
+    return fb.f(&fb.name, vs, ce.now, &ce.zone)
 }
 
 fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0, &lexdb_time.utc()) }
 
 // call, with now the transaction's start (microseconds since 2000; 0: the clock).
-// z: the session's time zone (9.95).
+// z: the session's time zone (9.95). The entry is found per call (a
+// bound call finds it once: fnRefOf).
 fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
-    match try callMisc(name, vs) {
-        Some(r) { return Ok(r) }
-        None {}
-    }
-    match try callFn(name, vs, z) {
-        Some(r) { return Ok(r) }
-        None {}
-    }
-    if name == "gen_random_uuid" && len(vs) == 0 { return randomUuid() }
-    if name == "random" && len(vs) == 0 { return randomFloat() }
-    if (name == "encode" || name == "decode") && len(vs) == 2 {
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
-        if name == "encode" {
-            let b = try lexdb_ops.coerce(vs[0], &oidType(lexdb_sql.OID_BYTEA))
-            match b { Val.Bytes(x) { return Ok(Val.Text(try encodeBytes(&x, &text(&vs[1])))) } else {} }
-        }
-        return Ok(Val.Bytes(try decodeBytes(&text(&vs[0]), &text(&vs[1]))))
-    }
-    match try callTime(name, vs, now, z) {
-        Some(v) { return Ok(v) }
-        None {}
-    }
-    if name == "array" { return Ok(Val.Text(lexdb_ops.arrayText(vs))) }
-    if lexdb_sql.isQuant(name) { return quantified(name, &vs[0], &vs[1]) }
-    let n = len(vs)
-    if name == "in" {
-        // x IN (a, b): true if one equals x; else NULL if x or one of them is NULL
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-        var sawNull = false
-        for i in 1..n {
-            if lexdb_ops.isNull(&vs[i]) {
-                sawNull = true
-                continue
-            }
-            if (try lexdb_ops.compareZ(&vs[0], &vs[i], z)) == 0 { return Ok(Val.Bool(true)) }
-        }
-        return Ok(if sawNull { Val.Null } else { Val.Bool(false) })
-    }
-    if name == "distinct from" {
-        let na = lexdb_ops.isNull(&vs[0])
-        let nb = lexdb_ops.isNull(&vs[1])
-        if na || nb { return Ok(Val.Bool(na != nb)) }
-        return Ok(Val.Bool((try lexdb_ops.compareZ(&vs[0], &vs[1], z)) != 0))
-    }
-    if name == "like" || name == "ilike" {
-        for v in vs { if lexdb_ops.isNull(&v) { return Ok(Val.Null) } }
-        let esc = if n > 2 { text(&vs[2]) } else { "\\" }
-        return Ok(Val.Bool(try likeMatch(&(text(&vs[0])), &(text(&vs[1])), &esc, name == "ilike")))
-    }
-    if name == "#bptrim" {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-        return Ok(Val.Text(lexdb_ops.bpTrim(&text(&vs[0]))))
-    }
-    if name == "#bppad" {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-        let pad = lexdb_ops.intOf(&vs[1]).unwrapOr(0)
-        // a value too long for n stays so: equal to no value of the column
-        let s = lexdb_ops.bpTrim(&text(&vs[0]))
-        return if strings.runeCount(&s) > pad { Ok(Val.Text(s)) } else { lexdb_ops.bpcharOf(&s, pad, false) }
-    }
-    if name == "similar" {
-        for v in vs { if lexdb_ops.isNull(&v) { return Ok(Val.Null) } }
-        let esc = if n > 2 { text(&vs[2]) } else { "\\" }
-        return Ok(Val.Bool(try lexdb_func.similarTo(&text(&vs[0]), &text(&vs[1]), &esc)))
-    }
-    if name == "nullif" && n == 2 {
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(vs[0]) }
-        if (try lexdb_ops.compareZ(&vs[0], &vs[1], z)) == 0 { return Ok(Val.Null) }
-        return Ok(vs[0])
-    }
-    if (name == "greatest" || name == "least") && n >= 1 {
-        var best = Val.Null
-        var widest = 0                  // a date, timestamp, timestamptz among them: the result's type
-        for v in vs {
-            if lexdb_ops.isNull(&v) { continue }
-            let k = lexdb_ops.kindOf(&v)
-            if (k == lexdb_sql.K_DATE || k == lexdb_sql.K_TS || k == lexdb_sql.K_TSTZ) && k > widest { widest = k }
-            if lexdb_ops.isNull(&best) { best = v } else {
-                let c = try lexdb_ops.compareZ(&v, &best, z)
-                if (name == "greatest" && c > 0) || (name == "least" && c < 0) { best = v }
-            }
-        }
-        if widest > 0 && lexdb_ops.kindOf(&best) != widest && lexdb_sql.isTimeKind(lexdb_ops.kindOf(&best)) {
-            return lexdb_ops.coerceTime(best, &oidType(if widest == lexdb_sql.K_TSTZ { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }), z)
-        }
-        return Ok(best)
-    }
-    if name == "concat" { return Ok(concatOf(vs, z)) }
-    let strFn = name == "substr" || name == "substring" || name == "strpos" || name == "replace" || name == "left" ||
-                name == "right" || name == "position"
-    if n >= 2 && strFn {
-        for v in vs { if lexdb_ops.isNull(&v) { return Ok(Val.Null) } }
-        let a = text(&vs[0])
-        if name == "substring" && lexdb_ops.kindOf(&vs[1]) == lexdb_sql.K_TEXT {
-            // substring(x FROM pattern) (9.92): the first group's match, or the whole
-            // match; FROM pattern FOR escape is SIMILAR TO's (9.94)
-            if n == 3 {
-                match try lexdb_func.similarSubstring(&a, &text(&vs[1]), &text(&vs[2])) {
-                    Some(r) { return Ok(Val.Text(r)) }
-                    None { return Ok(Val.Null) }
-                }
-            }
-            let fl = try lexdb_func.reFlags(&"")
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            let ms = lexdb_func.reMatches(&re, &a, 0, false, false)
-            if len(ms) == 0 { return Ok(Val.Null) }
-            let m = &ms[0]
-            if len(m) > 2 {
-                if m[2] < 0 { return Ok(Val.Null) }
-                return Ok(Val.Text(a[m[2]..m[3]].toStr()))
-            }
-            return Ok(Val.Text(a[m[0]..m[1]].toStr()))
-        }
-        if (name == "substr" || name == "substring") && n <= 3 { return substrOf(&a, vs, name) }
-        if (name == "strpos" || name == "position") && n == 2 {
-            let i = strings.indexOf(&a, &(text(&vs[1])), 0)
-            return Ok(Val.Int(if i < 0 { 0 } else { strings.runeCount(&a[0..i]) + 1 }))
-        }
-        if name == "replace" && n == 3 {
-            let from = text(&vs[1])
-            if len(from) == 0 { return Ok(Val.Text(a)) }
-            return Ok(Val.Text(strings.replaceAll(&a, &from, &(text(&vs[2])))))
-        }
-        if (name == "left" || name == "right") && n == 2 {
-            let k = try intArg(vs[1], name)
-            let total = strings.runeCount(&a)
-            var take = if k >= 0 { k } else { total + k }
-            if take < 0 { take = 0 }
-            if take > total { take = total }
-            if name == "left" { return Ok(Val.Text(try substr(&a, 1, take, true))) }
-            return Ok(Val.Text(try substr(&a, total - take + 1, take, true)))
-        }
-    }
-    if name == "coalesce" { return Ok(coalesceOf(vs)) }
-    if name == "version" && n == 0 { return Ok(Val.Text("PostgreSQL 16.0 (lexdb 0.1)")) }
-    if name == "current_database" && n == 0 { return Ok(Val.Text("lexdb")) }
-    if n == 1 {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-        let id = fn1Of(name)
-        if id > 0 {
-            match try call1(id, name, &vs[0]) {
-                Some(r) { return Ok(r) }
-                None {}
-            }
-        }
-    }
-    if n == 2 && (name == "power" || name == "pow") { return lexdb_ops.powOp(&vs[0], &vs[1]) }
-    if n == 2 && name == "round" {
-        match lexdb_ops.asNum(&vs[0]) {
-            Some(d) {
-                match vs[1] {
-                    Val.Int(s) {
-                        if s < 0 {
-                            // a negative scale rounds the digits left of the point
-                            // (past the 38 digits a numeric holds the answer is 0; the product is checked)
-                            if s < -200 { return Ok(Val.Num(Decimal.fromInt(0))) }
-                            var pw = Decimal.fromInt(1)
-                            for _ in 0..(-s) {
-                                match pw.mulExact(Decimal.fromInt(10)) {
-                                    Ok(r) { pw = r }
-                                    Err(_) { return Ok(Val.Num(Decimal.fromInt(0))) }
-                                }
-                            }
-                            match d.div(pw, 0, Rounding.HALF_AWAY) {
-                                Ok(q) {
-                                    match q.mulExact(pw) {
-                                        Ok(r) { return Ok(Val.Num(r)) }
-                                        Err(_) { return Err(lexdb_ops.decErr()) }
-                                    }
-                                }
-                                Err(_) { return Err(lexdb_ops.decErr()) }
-                            }
-                        }
-                        if s > 200 { return Ok(Val.Num(d)) }
-                        match d.roundAway(s) {
-                            Ok(r) { return Ok(Val.Num(r)) }
-                            Err(_) { return Err(lexdb_ops.decErr()) }
-                        }
-                    }
-                    else {}
-                }
+    if len(vs) == 1 {
+        match lexdb_lib.entry1Of(name) {
+            Some(f) {
+                if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+                return f(name, &vs[0])
             }
             None {}
         }
     }
-    return Err(e("42883", &("function " + name + " with " + n.toStr() + " arguments does not exist")))
+    let f = entryAt(name, len(vs))
+    return f(name, vs, now, z)
 }
 
-// The functions of one argument callAt gives itself, after every other
-// it knows (none of these names is taken before): an id, found once by a
-// bound expression (lexdb_bind.FnRef), else per call. 0: none of them.
-const F1_LOWER = 1
-const F1_UPPER = 2
-const F1_TRIM = 3
-const F1_LTRIM = 4
-const F1_RTRIM = 5
-const F1_LENGTH = 6
-const F1_OCTETS = 7
-const F1_ABS = 8
-const F1_FLOAT = 9          // floor, ceil, ceiling, trunc, sqrt, cbrt, exp, ln, log10, sign (callFloat)
-const F1_ROUND = 10
-
-fn fn1Of(name: &str): int {
-    match name {
-        "lower" { return F1_LOWER }
-        "upper" { return F1_UPPER }
-        "trim", "btrim" { return F1_TRIM }
-        "ltrim" { return F1_LTRIM }
-        "rtrim" { return F1_RTRIM }
-        "length", "char_length" { return F1_LENGTH }
-        "octet_length" { return F1_OCTETS }
-        "abs" { return F1_ABS }
-        "floor", "ceil", "ceiling", "trunc", "sqrt", "cbrt", "exp", "ln", "log10", "sign" { return F1_FLOAT }
-        "round" { return F1_ROUND }
-        else { return 0 }
-    }
+// name's entry of n arguments: lexdb_lib's, or one of the two catalog
+// functions that read PostgreSQL's dialect (lexdb_pgcat, lexdb_pg).
+fn entryAt(name: &str, n: int): lexdb_lib.LibFn {
+    if name == "format_type" && n == 2 { return formatTypeFn }
+    if name == "pg_size_pretty" && n == 1 { return sizePrettyFn }
+    return lexdb_lib.entryOf(name, n)
 }
 
-// Function id (fn1Of: name's) of v, not NULL; None: not one it gives for
-// v (callAt goes on to its error).
-fn call1(id: int, name: &str, v: &Val): Result[Option[Val], DbErr] {
-    if id == F1_LOWER { return Ok(Some(Val.Text(strings.toLowerAscii(&(text(v)))))) }
-    if id == F1_UPPER { return Ok(Some(Val.Text(strings.toUpperAscii(&(text(v)))))) }
-    if id == F1_TRIM { return Ok(Some(Val.Text(strings.trim(&(text(v)))))) }
-    if id == F1_LTRIM { return Ok(Some(Val.Text(strings.trimLeft(&(text(v)))))) }
-    if id == F1_RTRIM { return Ok(Some(Val.Text(strings.trimRight(&(text(v)))))) }
-    if id == F1_LENGTH {
-        match v {
-            Val.Bytes(x) { return Ok(Some(Val.Int(len(x)))) }
-            else { return Ok(Some(Val.Int(strings.runeCount(&text(v))))) }
-        }
-    }
-    if id == F1_OCTETS {
-        match v {
-            Val.Bytes(x) { return Ok(Some(Val.Int(len(x)))) }
-            else { return Ok(Some(Val.Int(len(text(v))))) }
-        }
-    }
-    if id == F1_ABS {
-        match v {
-            Val.Int(x) { return Ok(Some(Val.Int(if x < 0 { try arithInt(0, x) } else { x }))) }
-            Val.Num(d) { return Ok(Some(Val.Num(d.abs()))) }
-            Val.Float(x) { return Ok(Some(Val.Float(x.abs()))) }
-            Val.Real(x) { return Ok(Some(Val.Real(x.abs()))) }
-            else { return Ok(None) }
-        }
-    }
-    if id == F1_FLOAT { return callFloat(name, v) }
-    if id == F1_ROUND {
-        if lexdb_ops.isFloat(v) { return Ok(Some(Val.Float(lexdb_ops.asFloat(v).unwrap().roundEven()))) }
-        match lexdb_ops.asNum(v) {
-            Some(d) {
-                match d.roundAway(0) {
-                    Ok(r) { return Ok(Some(Val.Num(r))) }
-                    Err(_) { return Err(lexdb_ops.decErr()) }
+fn formatTypeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let m = if lexdb_ops.isNull(&vs[1]) { -1 } else { lexdb_ops.oidArg(&vs[1]).unwrapOr(-1) }
+    return Ok(Val.Text(lexdb_pgcat.formatType(lexdb_ops.oidArg(&vs[0]).unwrapOr(0), m)))
+}
+
+fn sizePrettyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    match vs[0] {
+        Val.Null { return Ok(Val.Null) }
+        Val.Int(x) { return Ok(Val.Text(lexdb_pg.sizePretty(x))) }
+        else {
+            match lexdb_ops.coerce(vs[0], &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
+                Ok(iv) {
+                    match iv {
+                        Val.Int(x) { return Ok(Val.Text(lexdb_pg.sizePretty(x))) }
+                        else { return Ok(Val.Null) }
+                    }
                 }
+                Err(x) { return Err(x) }
             }
-            None { return Ok(None) }
         }
-    }
-    return Ok(None)
-}
-
-fn arithInt(a: int, b: int): Result[int, DbErr] {
-    match a.checkedSub(b) {
-        Some(v) { return Ok(v) }
-        None { return Err(e("22003", "bigint out of range")) }
     }
 }
 
@@ -1761,70 +1125,8 @@ fn keyedCol(x: &Expr): KeyedCol {
 // them stay at the row's start, which a large row keeps in its leaf.
 const LONG: int = lexdb_rows.LONG
 
-// ---- uuid and bytea (9.78)
-
-extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
 
 
-// gen_random_uuid(): version 4, from the kernel's random bytes.
-fn randomUuid(): Result[Val, DbErr] {
-    var b = array(16, byte(0))
-    if getrandom(mut &b, 16, u32(0)) != 16 { return Err(e("58000", "could not generate random values")) }
-    b[6] = byte((int(b[6]) & 0x0f) | 0x40)
-    b[8] = byte((int(b[8]) & 0x3f) | 0x80)
-    return Ok(Val.Uuid(lexdb_rows.uuidText(&strFromBytes(&b))))
-}
-
-
-// encode(bytes, format): hex, base64 or escape.
-fn encodeBytes(b: &str, f: &str): Result[str, DbErr] {
-    let fmt = strings.toLowerAscii(&f)
-    if fmt == "hex" { return Ok(lexdb_sql.bytesHex(b)[2..]) }
-    if fmt == "base64" {
-        // 76 characters a line, as PostgreSQL writes it
-        let x = base64.encode(b)
-        var out = newStrBuf()
-        var i = 0
-        while i < len(x) {
-            if i > 0 { out.addByte('\n') }
-            let end = if i + 76 < len(x) { i + 76 } else { len(x) }
-            out.add(&x[i..end])
-            i = end
-        }
-        return Ok(out.toStr())
-    }
-    if fmt == "escape" {
-        var out = newStrBuf()
-        for i in 0..len(b) {
-            let c = b[i]
-            if c == '\\' { out.add("\\\\") }
-            else if c < 32 || c > 126 {
-                out.addByte('\\')
-                out.addByte('0' + (c >> 6))
-                out.addByte('0' + ((c >> 3) & 7))
-                out.addByte('0' + (c & 7))
-            } else { out.addByte(c) }
-        }
-        return Ok(out.toStr())
-    }
-    return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
-}
-
-// decode(text, format): hex, base64 or escape.
-fn decodeBytes(t: &str, f: &str): Result[str, DbErr] {
-    let fmt = strings.toLowerAscii(&f)
-    if fmt == "hex" { return lexdb_ops.parseBytea(&("\\x" + t)) }
-    if fmt == "base64" {
-        var clean = newStrBuf()
-        for i in 0..len(t) { if t[i] != '\n' && t[i] != '\r' && t[i] != ' ' && t[i] != '\t' { clean.addByte(t[i]) } }
-        match base64.decodeStrict(&(clean.toStr())) {
-            Some(x) { return Ok(x) }
-            None { return Err(e("22023", "invalid base64 input")) }
-        }
-    }
-    if fmt == "escape" { return lexdb_ops.parseBytea(t) }
-    return Err(e("22023", &("unrecognized encoding: \"" + f + "\"")))
-}
 
 // The places a stored row has: its table's columns, and dropped ones.
 fn rowWidth(t: &Table): int { return if len(t.slots) == 0 { len(t.cols) } else { t.width } }
@@ -23078,7 +22380,7 @@ fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                         else { lexdb_like.likePieces(&text(&b.vals[c][r]), &lp.pieces) }
                     }
                 } else {
-                    try likeMatch(&(text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
+                    try lexdb_lib.likeMatch(&(text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
                 }
                 out.v[j] = if hit { 1 } else { 0 }
             }
@@ -23191,14 +22493,14 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
     let m = len(idx)
     let ns = len(g.cols)
     // two shapes run without a row or a walk, as cEval would run them: a
-    // function of one argument bound to call1, of a column; an operator
+    // function of one argument bound to its entry (FnRef.f1), of a column; an operator
     // of a column and a constant
     if ns == 1 {
         let c = g.cols[0]
         let k = g.kinds[0]
         match g.cx {
             lexdb_bind.BX.Call(fb, cs) {
-                if fb.way == FN_ONE && len(cs) == 1 && cxCol0(&cs[0]) {
+                if fb.way == FN_ONE && !fb.dialect && len(cs) == 1 && cxCol0(&cs[0]) {
                     var out: []Val = withCapacity(m)
                     for j in 0..m {
                         let r = idx[j]
@@ -23206,11 +22508,7 @@ fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
                             append(mut &out, Val.Null)
                             continue
                         }
-                        let got = if k == BK_VAL { try call1(fb.id, &fb.name, &b.vals[c][r]) } else { try call1(fb.id, &fb.name, &bValAt(b, c, k, r)) }
-                        match got {
-                            Some(v) { append(mut &out, v) }
-                            None { append(mut &out, try callAt(&fb.name, &[bValAt(b, c, k, r)], g.ce.now, &g.ce.zone)) }
-                        }
+                        append(mut &out, if k == BK_VAL { try fb.f1(&fb.name, &b.vals[c][r]) } else { try fb.f1(&fb.name, &bValAt(b, c, k, r)) })
                     }
                     return Ok(out)
                 }
@@ -26852,7 +26150,7 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
 // A set-returning function in a select list (unnest, generate_subscripts,
 // pg_partition_ancestors): its values, marked, expanded into rows when the
 // query's rows are made (expandSrfs).
-const SRF_MARK: str = "\x00srf"
+const SRF_MARK: str = lexdb_lib.SRF_MARK
 
 // Whether a select list calls a set-returning function: only then are its
 // rows looked through for marked values.
@@ -26876,8 +26174,6 @@ fn srfIn(x: &Expr): bool {
         else { return false }
     }
 }
-
-fn srfMark(vals: &[]Val): Val { return Val.Text(SRF_MARK + lexdb_ops.arrayText(vals)) }
 
 fn srfParts(v: &Val): Option[[]Option[str]] {
     match v {
@@ -26945,69 +26241,13 @@ fn expandSrfs(rows: mut &[]OutRow, outs: &[]OutCol): Result[Unit, DbErr] {
     return Ok(Unit{})
 }
 
-// s without the parentheses around the whole of it, if it has them.
-
-
-fn jsonText(v: &Val): str {
-    match v {
-        Val.Null { return "null" }
-        Val.Int(n) { return n.toStr() }
-        Val.Num(d) { return d.toStr() }
-        Val.Bool(b) { return if b { "true" } else { "false" } }
-        Val.Float(_) { return text(v) }
-        else {
-            var b = newStrBuf()
-            b.addByte('"')
-            let s = text(v)
-            for i in 0..len(s) {
-                let c = s[i]
-                if c == '"' { b.add("\\\"") }
-                else if c == '\\' { b.add("\\\\") }
-                else if c == '\n' { b.add("\\n") }
-                else if c == '\t' { b.add("\\t") }
-                else if c == '\r' { b.add("\\r") }
-                else { b.addByte(c) }
-            }
-            b.addByte('"')
-            return b.toStr()
-        }
-    }
-}
-
-// ---- collations (design/lexdb-tds.md L2)
-
-// A text with its case folded as ciKey folds it, its spaces kept.
-fn ciFold(s: &str): str {
-    var ascii = true
-    for i in 0..len(s) { if s[i] >= 128 { ascii = false } }
-    if ascii { return strings.toLowerAscii(&s) }
-    var b = newStrBuf()
-    var i = 0
-    while i < len(s) {
-        let d = strings.decodeAt(&s, i)
-        strings.addRune(mut &b, unicode.lower(unicode.upper(d.rune)))
-        i += d.size
-    }
-    return b.toStr()
-}
-
-// A value's key under a case-insensitive collation: a text's ciKey; any
-// other value as it is.
-fn ciVal(v: &Val): Val {
-    match v {
-        Val.Text(s) { return Val.Text(ciKey(&s)) }
-        else { return v }
-    }
-}
-
-// The functions that need no catalog: None if name is none of them.
 // ---- the functions of 9.92 (lexdb_func): strings, regular expressions,
 // math and arrays
 
 // A call's hint of its arguments' types, put there by resolve for the
 // functions whose answer depends on them (TYPED_FNS): a last argument of
 // text no SQL text can hold, "\x00types:" and the OIDs.
-const HINT: str = "\x00types:"
+const HINT: str = lexdb_lib.HINT
 const TYPED_FNS: []str = ["to_hex", "array_remove", "array_replace", "array_position", "array_positions", "@>", "<@", "&&"]
 
 // Whether a value may be an array's text (a {...} text).
@@ -27044,731 +26284,6 @@ fn isHint(x: &Expr): bool {
     }
 }
 
-// The hint's OIDs, None if the call has none.
-fn hintOids(vs: &[]Val): Option[[]int] {
-    if len(vs) == 0 { return None }
-    match vs[len(vs) - 1] {
-        Val.Text(s) {
-            if strings.startsWith(&s, HINT) {
-                var out: []int = []
-                for p in strings.split(&s[len(HINT)..len(s)], ",") { append(mut &out, strings.parseIntOpt(&(p.toStr())).unwrapOr(0)) }
-                return Some(out)
-            }
-        }
-        else {}
-    }
-    return None
-}
-
-// An array value's elements (None: the array is NULL).
-fn arrOf(v: &Val): Result[Option[[]Option[str]], DbErr] {
-    match v {
-        Val.Null { return Ok(None) }
-        else { return Ok(Some(try lexdb_ops.arrayParts(&text(v)))) }
-    }
-}
-
-fn partsVal(ps: &[]Option[str]): Val {
-    var vals: []Val = []
-    for p in ps {
-        match p {
-            Some(t) { append(mut &vals, Val.Text(t)) }
-            None { append(mut &vals, Val.Null) }
-        }
-    }
-    return Val.Text(lexdb_ops.arrayText(&vals))
-}
-
-// An element as a value of the array's element type (elem 0: unknown, as
-// like's kind).
-fn elemVal(t: &str, like: &Val, elem: int): Result[Val, DbErr] {
-    let ty = if elem > 0 { oidType(elem) } else { oidType(lexdb_ops.kindOid(like)) }
-    if ty.kind == lexdb_sql.K_TEXT || ty.kind == lexdb_sql.K_ENUM { return Ok(Val.Text(t.toStr())) }
-    return lexdb_ops.coerce(Val.Text(t.toStr()), &ty)
-}
-
-// Whether element p is v, as IS NOT DISTINCT FROM.
-fn elemIs(p: &Option[str], v: &Val, elem: int): Result[bool, DbErr] {
-    match p {
-        None { return Ok(lexdb_ops.isNull(v)) }
-        Some(t) {
-            if lexdb_ops.isNull(v) { return Ok(false) }
-            let x = try elemVal(&t, v, elem)
-            let y = if lexdb_ops.kindOf(v) == lexdb_sql.K_TEXT && lexdb_ops.kindOf(&x) != lexdb_sql.K_TEXT { try lexdb_ops.coerce(v, &oidType(lexdb_ops.kindOid(&x))) } else { v }
-            return Ok((try lexdb_ops.compare(&x, &y)) == 0)
-        }
-    }
-}
-
-// The element type a call's hint gives for its argument k (0: none).
-fn hintElem(h: &Option[[]int], k: int): int {
-    match h {
-        Some(os) {
-            if k < len(os) {
-                let el = lexdb_sql.elemOid(os[k])
-                return if el > 0 { el } else { os[k] }
-            }
-        }
-        None {}
-    }
-    return 0
-}
-
-// @>: every element of b (not NULL) is in a.
-fn arrContains(a: &[]Option[str], b: &[]Option[str], elem: int): Result[bool, DbErr] {
-    for q in b {
-        match q {
-            None { return Ok(false) }
-            Some(t) {
-                let v = if elem > 0 { try elemVal(&t, &Val.Text(""), elem) } else { Val.Text(t) }
-                var found = false
-                for p in a {
-                    if p.isSome() && try elemIs(&p, &v, elem) {
-                        found = true
-                        break
-                    }
-                }
-                if !found { return Ok(false) }
-            }
-        }
-    }
-    return Ok(true)
-}
-
-// A float argument of a function PostgreSQL has over double precision only
-// (a numeric is cast to it).
-fn fArg(v: &Val, name: &str): Result[float, DbErr] {
-    match v {
-        Val.Num(d) { return Ok(d.toFloat()) }
-        else { return lexdb_ops.floatArg(v, name) }
-    }
-}
-
-const RADIANS_PER_DEGREE: float = 0.0174532925199432957692f
-
-fn sind030(x: float): float { return (x * RADIANS_PER_DEGREE).sin() / (30.0f * RADIANS_PER_DEGREE).sin() / 2.0f }
-fn cosd060(x: float): float { return 1.0f - ((1.0f - (x * RADIANS_PER_DEGREE).cos()) / (1.0f - (60.0f * RADIANS_PER_DEGREE).cos())) / 2.0f }
-fn sindQ1(x: float): float { return if x <= 30.0f { sind030(x) } else { cosd060(90.0f - x) } }
-fn cosdQ1(x: float): float { return if x <= 60.0f { cosd060(x) } else { sind030(90.0f - x) } }
-fn asindQ1(x: float): float { return if x <= 0.5f { x.asin() / 0.5f.asin() * 30.0f } else { 90.0f - x.acos() / 0.5f.acos() * 60.0f } }
-fn acosdQ1(x: float): float { return if x <= 0.5f { 90.0f - x.asin() / 0.5f.asin() * 30.0f } else { x.acos() / 0.5f.acos() * 60.0f } }
-
-// The trigonometric functions, with PostgreSQL's degree variants (exact at
-// 30, 45, 60 and 90 degrees as there).
-fn trig(name: &str, x: float, y: float): Result[float, DbErr] {
-    let out = e("22003", "input is out of range")
-    if x.isNaN() || y.isNaN() { return Ok(x + y) }
-    match name {
-        "sin", "cos", "tan", "cot" {
-            if x.isInf() { return Err(out) }
-            if name == "sin" { return Ok(x.sin()) }
-            if name == "cos" { return Ok(x.cos()) }
-            if name == "tan" { return Ok(x.tan()) }
-            return Ok(1.0f / x.tan())
-        }
-        "asin", "acos" {
-            if x < -1.0f || x > 1.0f { return Err(out) }
-            return Ok(if name == "asin" { x.asin() } else { x.acos() })
-        }
-        "atan" { return Ok(x.atan()) }
-        "atan2" { return Ok(x.atan2(y)) }
-        "sinh" { return Ok(x.sinh()) }
-        "cosh" { return Ok(x.cosh()) }
-        "tanh" { return Ok(x.tanh()) }
-        "asinh" { return Ok((x + (x * x + 1.0f).sqrt()).ln()) }
-        "acosh" {
-            if x < 1.0f { return Err(out) }
-            return Ok((x + (x * x - 1.0f).sqrt()).ln())
-        }
-        "atanh" {
-            if x < -1.0f || x > 1.0f { return Err(out) }
-            return Ok(0.5f * ((1.0f + x) / (1.0f - x)).ln())
-        }
-        "sind", "cosd", "tand", "cotd" {
-            if x.isInf() { return Err(out) }
-            var a = x.mod(360.0f)
-            var sign = 1.0f
-            if name == "cosd" {
-                if a < 0.0f { a = -a }
-                if a > 180.0f { a = 360.0f - a }
-                if a > 90.0f {
-                    a = 180.0f - a
-                    sign = -sign
-                }
-                let r = sign * cosdQ1(a)
-                return Ok(if r == 0.0f { 0.0f } else { r })
-            }
-            if a < 0.0f {
-                a = -a
-                sign = -sign
-            }
-            if a > 180.0f {
-                a = 360.0f - a
-                sign = -sign
-            }
-            if a > 90.0f {
-                a = 180.0f - a
-                if name != "sind" { sign = -sign }
-            }
-            var r = 0.0f
-            if name == "sind" { r = sign * sindQ1(a) }
-            else if name == "tand" { r = sign * (sindQ1(a) / cosdQ1(a)) / (sindQ1(45.0f) / cosdQ1(45.0f)) }
-            else { r = sign * (cosdQ1(a) / sindQ1(a)) / (cosdQ1(45.0f) / sindQ1(45.0f)) }
-            return Ok(if r == 0.0f { 0.0f } else { r })
-        }
-        "asind", "acosd" {
-            if x < -1.0f || x > 1.0f { return Err(out) }
-            if name == "asind" { return Ok(if x >= 0.0f { asindQ1(x) } else { -asindQ1(-x) }) }
-            return Ok(if x >= 0.0f { acosdQ1(x) } else { 90.0f + asindQ1(-x) })
-        }
-        "atand" { return Ok(x.atan() / 1.0f.atan() * 45.0f) }
-        "atan2d" { return Ok(x.atan2(y) / 1.0f.atan() * 45.0f) }
-        "degrees" { return Ok(x / RADIANS_PER_DEGREE) }
-        "radians" { return Ok(x * RADIANS_PER_DEGREE) }
-        else { return Err(e("42883", &("function " + name + " does not exist"))) }
-    }
-}
-
-fn isTrig(n: &str): bool {
-    match n {
-        "sin", "cos", "tan", "cot", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "sind", "cosd",
-        "tand", "cotd", "asind", "acosd", "atand", "degrees", "radians" { return true }
-        else { return false }
-    }
-}
-
-
-// A regular expression function's flags (vs[k], if there).
-fn reFlagsAt(vs: &[]Val, k: int, n: int): Result[lexdb_func.ReFlags, DbErr] {
-    return lexdb_func.reFlags(&(if k < n { text(&vs[k]) } else { "" }))
-}
-
-fn noGlobal(fl: &lexdb_func.ReFlags, f: &str): Result[Unit, DbErr] {
-    if fl.glob { return Err(e("22023", &(f + "() does not support the \"global\" option"))) }
-    return Ok(Unit{})
-}
-
-fn posArg(v: &Val, what: &str, min: int): Result[int, DbErr] {
-    let k = try intArg(v, &"regexp")
-    if k < min { return Err(e("22023", &("invalid value for parameter \"" + what + "\": " + k.toStr()))) }
-    return Ok(k)
-}
-
-// The functions of 9.92; None if name is none of them.
-fn callFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
-    let hint = hintOids(vs)
-    let n = if hint.isSome() { len(vs) - 1 } else { len(vs) }
-    var anyNull = false
-    for i in 0..n { if lexdb_ops.isNull(&vs[i]) { anyNull = true } }
-    match name {
-        "lpad", "rpad" {
-            if n != 2 && n != 3 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let fill = if n == 3 { text(&vs[2]) } else { " " }
-            return Ok(Some(Val.Text(try lexdb_func.pad(&text(&vs[0]), try intArg(vs[1], name), &fill, name == "lpad"))))
-        }
-        "split_part" {
-            if n != 3 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Text(try lexdb_func.splitPart(&text(&vs[0]), &text(&vs[1]), try intArg(vs[2], name)))))
-        }
-        "concat_ws" {
-            if n < 2 { return Err(e("42883", &("function concat_ws with " + n.toStr() + " arguments does not exist"))) }
-            if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-            var parts: []str = []
-            for i in 1..n { if !lexdb_ops.isNull(&vs[i]) { append(mut &parts, lexdb_ops.textZ(&vs[i], z)) } }
-            return Ok(Some(Val.Text(strings.join(&parts, &(text(&vs[0]))))))
-        }
-        "md5" {
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            match vs[0] {
-                Val.Bytes(b) { return Ok(Some(Val.Text(try lexdb_func.md5Hex(&b)))) }
-                else { return Ok(Some(Val.Text(try lexdb_func.md5Hex(&text(&vs[0]))))) }
-            }
-        }
-        "format" {
-            if n < 1 { return Ok(None) }
-            if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-            var args: []Option[str] = []
-            for i in 1..n { append(mut &args, if lexdb_ops.isNull(&vs[i]) { None } else { Some(lexdb_ops.textZ(&vs[i], z)) }) }
-            return Ok(Some(Val.Text(try lexdb_func.format(&text(&vs[0]), &args))))
-        }
-        "chr" {
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Text(try lexdb_func.chr(try intArg(vs[0], name)))))
-        }
-        "ascii", "initcap", "reverse", "quote_literal" {
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let t = text(&vs[0])
-            if name == "ascii" { return Ok(Some(Val.Int(lexdb_func.ascii(&t)))) }
-            if name == "initcap" { return Ok(Some(Val.Text(lexdb_func.initcap(&t)))) }
-            if name == "reverse" { return Ok(Some(Val.Text(lexdb_func.reverse(&t)))) }
-            return Ok(Some(Val.Text(lexdb_func.quoteLiteral(&t))))
-        }
-        "quote_nullable" {
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Text("NULL"))) }
-            return Ok(Some(Val.Text(lexdb_func.quoteLiteral(&text(&vs[0])))))
-        }
-        "starts_with" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Bool(strings.startsWith(&(text(&vs[0])), &(text(&vs[1]))))))
-        }
-        "to_hex" {
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let x = try intArg(vs[0], name)
-            var bits = if x >= -2147483648 && x <= 2147483647 { 32 } else { 64 }
-            match hint {
-                Some(os) { if len(os) > 0 { bits = if os[0] == lexdb_sql.OID_INT8 { 64 } else { 32 } } }
-                None {}
-            }
-            return Ok(Some(Val.Text(lexdb_func.toHex(x, bits))))
-        }
-        "translate" {
-            if n != 3 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Text(lexdb_func.translate(&text(&vs[0]), &text(&vs[1]), &text(&vs[2])))))
-        }
-        "overlay" {
-            if n != 3 && n != 4 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let cnt = if n == 4 { try intArg(vs[3], name) } else { 0 }
-            return Ok(Some(Val.Text(try lexdb_func.overlay(&text(&vs[0]), &text(&vs[1]), try intArg(vs[2], name), cnt, n == 4))))
-        }
-        "regexp_replace" {
-            if n < 3 || n > 6 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            // (s, p, r [, flags]) or (s, p, r, start [, N [, flags]])
-            var start = 1
-            var nth = -1
-            var fk = 3
-            if n >= 4 && lexdb_ops.kindOf(&vs[3]) != lexdb_sql.K_TEXT {
-                start = try posArg(&vs[3], &"start", 1)
-                fk = 4
-                if n >= 5 {
-                    nth = try posArg(&vs[4], &"n", 0)
-                    fk = 5
-                }
-            } else if n > 4 {
-                return Ok(None)
-            }
-            let fl = try reFlagsAt(vs, fk, n)
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            let all = fl.glob || nth == 0
-            return Ok(Some(Val.Text(lexdb_func.reReplace(&re, &text(&vs[0]), &text(&vs[2]), start - 1, if nth > 0 { nth } else { 0 }, all))))
-        }
-        "regexp_match", "regexp_matches", "regexp_like" {
-            if n != 2 && n != 3 { return Ok(None) }
-            let fl = try reFlagsAt(vs, 2, n)
-            if name != "regexp_matches" { try noGlobal(&fl, name) }
-            if anyNull { return Ok(Some(if name == "regexp_matches" { srfMark(&[]) } else { Val.Null })) }
-            let s = text(&vs[0])
-            if name == "regexp_like" { return Ok(Some(Val.Bool((try lexdb_func.reCompileTest(&text(&vs[1]), &fl)).isMatch(&s)))) }
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            let ms = lexdb_func.reMatches(&re, &s, 0, fl.glob, false)
-            if name == "regexp_match" {
-                if len(ms) == 0 { return Ok(Some(Val.Null)) }
-                return Ok(Some(partsVal(&lexdb_func.reGroups(&s, &ms[0]))))
-            }
-            var rows: []Val = []
-            for m in ms { append(mut &rows, partsVal(&lexdb_func.reGroups(&s, &m))) }
-            return Ok(Some(srfMark(&rows)))
-        }
-        "regexp_split_to_table", "regexp_split_to_array" {
-            if n != 2 && n != 3 { return Ok(None) }
-            let fl = try reFlagsAt(vs, 2, n)
-            try noGlobal(&fl, name)
-            let tbl = name == "regexp_split_to_table"
-            if anyNull { return Ok(Some(if tbl { srfMark(&[]) } else { Val.Null })) }
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            var vals: []Val = []
-            for p in lexdb_func.reSplit(&re, &text(&vs[0])) { append(mut &vals, Val.Text(p)) }
-            return Ok(Some(if tbl { srfMark(&vals) } else { Val.Text(lexdb_ops.arrayText(&vals)) }))
-        }
-        "regexp_count" {
-            if n < 2 || n > 4 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let start = if n >= 3 { try posArg(&vs[2], &"start", 1) } else { 1 }
-            let fl = try reFlagsAt(vs, 3, n)
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            let s = text(&vs[0])
-            return Ok(Some(Val.Int(len(lexdb_func.reMatches(&re, &s, start - 1, true, false)))))
-        }
-        "regexp_instr", "regexp_substr" {
-            // instr: (s, p [, start [, N [, endoption [, flags [, subexpr]]]]]);
-            // substr: (s, p [, start [, N [, flags [, subexpr]]]])
-            let inst = name == "regexp_instr"
-            if n < 2 || n > (if inst { 7 } else { 6 }) { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let start = if n >= 3 { try posArg(&vs[2], &"start", 1) } else { 1 }
-            let nth = if n >= 4 { try posArg(&vs[3], &"n", 1) } else { 1 }
-            var endOpt = 0
-            var fk = 4
-            if inst {
-                if n >= 5 { endOpt = try posArg(&vs[4], &"endoption", 0) }
-                if endOpt > 1 { return Err(e("22023", &("invalid value for parameter \"endoption\": " + endOpt.toStr()))) }
-                fk = 5
-            }
-            let fl = try reFlagsAt(vs, fk, n)
-            let sub = if n > fk + 1 { try posArg(&vs[fk + 1], &"subexpr", 0) } else { 0 }
-            let re = try lexdb_func.reCompile(&text(&vs[1]), &fl)
-            let s = text(&vs[0])
-            let ms = lexdb_func.reMatches(&re, &s, start - 1, true, false)
-            let none = if inst { Val.Int(0) } else { Val.Null }
-            if nth > len(ms) { return Ok(Some(none)) }
-            let m = &ms[nth - 1]
-            if 2 * sub + 1 >= len(m) || m[2 * sub] < 0 { return Ok(Some(none)) }
-            let a = m[2 * sub]
-            let b = m[2 * sub + 1]
-            if inst { return Ok(Some(Val.Int(lexdb_func.charPos(&s, if endOpt == 1 { b } else { a })))) }
-            return Ok(Some(Val.Text(s[a..b].toStr())))
-        }
-        "array_append", "array_prepend", "array_cat", "#aappend", "#aprepend", "#acat" {
-            if n != 2 { return Ok(None) }
-            let cat = name == "array_cat" || name == "#acat"
-            let pre = name == "array_prepend" || name == "#aprepend"
-            let ai = if pre { 1 } else { 0 }
-            let other = if pre { 0 } else { 1 }
-            let a = try arrOf(&vs[ai])
-            if cat {
-                let b = try arrOf(&vs[1])
-                if a.isNone() && b.isNone() { return Ok(Some(Val.Null)) }
-                var out: []Option[str] = []
-                match a {
-                    Some(ps) { for p in ps { append(mut &out, p) } }
-                    None {}
-                }
-                match b {
-                    Some(ps) { for p in ps { append(mut &out, p) } }
-                    None {}
-                }
-                return Ok(Some(partsVal(&out)))
-            }
-            var out: []Option[str] = []
-            let x: Option[str] = if lexdb_ops.isNull(&vs[other]) { None } else { Some(text(&vs[other])) }
-            if pre { append(mut &out, x) }
-            match a {
-                Some(ps) { for p in ps { append(mut &out, p) } }
-                None {}
-            }
-            if !pre { append(mut &out, x) }
-            return Ok(Some(partsVal(&out)))
-        }
-        "array_remove", "array_replace" {
-            if (name == "array_remove" && n != 2) || (name == "array_replace" && n != 3) { return Ok(None) }
-            match try arrOf(&vs[0]) {
-                Some(ps) {
-                    let el = hintElem(&hint, 0)
-                    var out: []Option[str] = []
-                    for p in ps {
-                        if try elemIs(&p, &vs[1], el) {
-                            if name == "array_replace" { append(mut &out, if lexdb_ops.isNull(&vs[2]) { None } else { Some(text(&vs[2])) }) }
-                        } else {
-                            append(mut &out, p)
-                        }
-                    }
-                    return Ok(Some(partsVal(&out)))
-                }
-                None { return Ok(Some(Val.Null)) }
-            }
-        }
-        "array_position", "array_positions" {
-            if n != 2 && !(n == 3 && name == "array_position") { return Ok(None) }
-            match try arrOf(&vs[0]) {
-                Some(ps) {
-                    let el = hintElem(&hint, 0)
-                    var from = 1
-                    if n == 3 {
-                        if lexdb_ops.isNull(&vs[2]) { return Err(e("22004", "initial position must not be null")) }
-                        from = try intArg(vs[2], name)
-                    }
-                    var found: []Val = []
-                    for i in 0..len(ps) {
-                        if i + 1 < from { continue }
-                        if try elemIs(&ps[i], &vs[1], el) {
-                            if name == "array_position" { return Ok(Some(Val.Int(i + 1))) }
-                            append(mut &found, Val.Int(i + 1))
-                        }
-                    }
-                    return Ok(Some(if name == "array_position" { Val.Null } else { Val.Text(lexdb_ops.arrayText(&found)) }))
-                }
-                None { return Ok(Some(Val.Null)) }
-            }
-        }
-        "string_to_array", "string_to_table" {
-            if n != 2 && n != 3 { return Ok(None) }
-            let tbl = name == "string_to_table"
-            if lexdb_ops.isNull(&vs[0]) { return Ok(Some(if tbl { srfMark(&[]) } else { Val.Null })) }
-            let d: Option[str] = if lexdb_ops.isNull(&vs[1]) { None } else { Some(text(&vs[1])) }
-            let ns: Option[str] = if n == 3 && !lexdb_ops.isNull(&vs[2]) { Some(text(&vs[2])) } else { None }
-            let ps = lexdb_func.stringToArray(&text(&vs[0]), d, ns)
-            if tbl {
-                var vals: []Val = []
-                for p in ps {
-                    match p {
-                        Some(t) { append(mut &vals, Val.Text(t)) }
-                        None { append(mut &vals, Val.Null) }
-                    }
-                }
-                return Ok(Some(srfMark(&vals)))
-            }
-            return Ok(Some(partsVal(&ps)))
-        }
-        "array_ndims", "array_dims" {
-            if n != 1 { return Ok(None) }
-            match try arrOf(&vs[0]) {
-                Some(ps) {
-                    if len(ps) == 0 { return Ok(Some(Val.Null)) }
-                    if name == "array_ndims" { return Ok(Some(Val.Int(1))) }
-                    return Ok(Some(Val.Text("[1:" + len(ps).toStr() + "]")))
-                }
-                None { return Ok(Some(Val.Null)) }
-            }
-        }
-        "@>", "<@", "&&" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let a = (try arrOf(&vs[0])).unwrap()
-            let b = (try arrOf(&vs[1])).unwrap()
-            var el = hintElem(&hint, 0)
-            if el == 0 { el = hintElem(&hint, 1) }
-            if name == "@>" { return Ok(Some(Val.Bool(try arrContains(&a, &b, el)))) }
-            if name == "<@" { return Ok(Some(Val.Bool(try arrContains(&b, &a, el)))) }
-            for q in b {
-                if q.isNone() { continue }
-                var one: []Option[str] = [q]
-                if try arrContains(&a, &one, el) { return Ok(Some(Val.Bool(true))) }
-            }
-            return Ok(Some(Val.Bool(false)))
-        }
-        "mod", "div", "gcd", "lcm" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            if lexdb_ops.isFloat(&vs[0]) || lexdb_ops.isFloat(&vs[1]) {
-                return Err(e("42883", &("function " + name + "(double precision, double precision) does not exist")))
-            }
-            let ints = lexdb_ops.kindOf(&vs[0]) != lexdb_sql.K_NUM && lexdb_ops.kindOf(&vs[1]) != lexdb_sql.K_NUM && name != "div"
-            if ints {
-                let a = try intArg(vs[0], name)
-                let b = try intArg(vs[1], name)
-                if name == "mod" {
-                    if b == 0 { return Err(e("22012", "division by zero")) }
-                    return Ok(Some(Val.Int(if b == -1 { 0 } else { a % b })))
-                }
-                let g = gcdInt(a, b)
-                if g < 0 { return Err(e("22003", "bigint out of range")) }
-                if name == "gcd" { return Ok(Some(Val.Int(g))) }
-                if a == 0 || b == 0 { return Ok(Some(Val.Int(0))) }
-                match (a / g).checkedMul(b) {
-                    Some(l) {
-                        if l == -9223372036854775807 - 1 { return Err(e("22003", "bigint out of range")) }
-                        return Ok(Some(Val.Int(if l < 0 { -l } else { l })))
-                    }
-                    None { return Err(e("22003", "bigint out of range")) }
-                }
-            }
-            let a = lexdb_ops.asNum(&vs[0]).unwrapOr(Decimal.zero())
-            let b = lexdb_ops.asNum(&vs[1]).unwrapOr(Decimal.zero())
-            if (name == "mod" || name == "div") && b.isZero() { return Err(e("22012", "division by zero")) }
-            if name == "mod" { return Ok(Some(Val.Num(a.rem(b)))) }
-            if name == "div" {
-                match a.sub(a.rem(b)).div(b, 0, Rounding.HALF_EVEN) {
-                    Ok(q) { return Ok(Some(Val.Num(q))) }
-                    Err(_) { return Err(lexdb_ops.decErr()) }
-                }
-            }
-            var x = a.abs()
-            var y = b.abs()
-            let ds = if a.scale() > b.scale() { a.scale() } else { b.scale() }
-            while !y.isZero() {
-                let r = x.rem(y)
-                x = y
-                y = r
-            }
-            if name == "gcd" { return Ok(Some(Val.Num(try decScale(x, ds)))) }
-            if a.isZero() || b.isZero() { return Ok(Some(Val.Num(try decScale(Decimal.zero(), ds)))) }
-            match a.abs().div(x, 0, Rounding.HALF_EVEN) {
-                Ok(q) {
-                    match q.mulExact(b.abs()) {
-                        Ok(l) { return Ok(Some(Val.Num(try decScale(l, ds)))) }
-                        Err(_) { return Err(lexdb_ops.decErr()) }
-                    }
-                }
-                Err(_) { return Err(lexdb_ops.decErr()) }
-            }
-        }
-        "width_bucket" {
-            if n != 4 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let count = try intArg(vs[3], name)
-            if count <= 0 { return Err(e("2201G", "count must be greater than zero")) }
-            if lexdb_ops.isFloat(&vs[0]) || lexdb_ops.isFloat(&vs[1]) || lexdb_ops.isFloat(&vs[2]) {
-                let op = try fArg(&vs[0], name)
-                let b1 = try fArg(&vs[1], name)
-                let b2 = try fArg(&vs[2], name)
-                if op.isNaN() || b1.isNaN() || b2.isNaN() { return Err(e("2201G", "operand, lower bound, and upper bound cannot be NaN")) }
-                if b1.isInf() || b2.isInf() { return Err(e("2201G", "lower and upper bounds must be finite")) }
-                if b1 == b2 { return Err(e("2201G", "lower bound cannot equal upper bound")) }
-                var r = 0
-                if b1 < b2 {
-                    if op < b1 { r = 0 } else if op >= b2 { r = count + 1 } else {
-                        r = int(float(count) * ((op - b1) / (b2 - b1)))
-                        if r >= count { r = count - 1 }
-                        r += 1
-                    }
-                } else {
-                    if op > b1 { r = 0 } else if op <= b2 { r = count + 1 } else {
-                        r = int(float(count) * ((b1 - op) / (b1 - b2)))
-                        if r >= count { r = count - 1 }
-                        r += 1
-                    }
-                }
-                if r > 2147483647 { return Err(e("22003", "integer out of range")) }
-                return Ok(Some(Val.Int(r)))
-            }
-            let op = lexdb_ops.asNum(&vs[0]).unwrapOr(Decimal.zero())
-            let b1 = lexdb_ops.asNum(&vs[1]).unwrapOr(Decimal.zero())
-            let b2 = lexdb_ops.asNum(&vs[2]).unwrapOr(Decimal.zero())
-            let c = b1.cmp(&b2)
-            if c == 0 { return Err(e("2201G", "lower bound cannot equal upper bound")) }
-            var r = 0
-            let below = if c < 0 { op.cmp(&b1) < 0 } else { op.cmp(&b1) > 0 }
-            let above = if c < 0 { op.cmp(&b2) >= 0 } else { op.cmp(&b2) <= 0 }
-            if below { r = 0 } else if above { r = count + 1 } else {
-                let num = if c < 0 { op.sub(b1) } else { b1.sub(op) }
-                let den = if c < 0 { b2.sub(b1) } else { b1.sub(b2) }
-                match num.mulExact(Decimal.fromInt(count)) {
-                    Ok(p) {
-                        match p.div(den, 0, Rounding.FLOOR) {
-                            Ok(q) { r = q.toInt(Rounding.FLOOR).unwrapOr(0) + 1 }
-                            Err(_) { return Err(lexdb_ops.decErr()) }
-                        }
-                    }
-                    Err(_) { return Err(lexdb_ops.decErr()) }
-                }
-            }
-            if r > 2147483647 { return Err(e("22003", "integer out of range")) }
-            return Ok(Some(Val.Int(r)))
-        }
-        "to_char" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let f = text(&vs[1])
-            match vs[0] {
-                Val.Int(x) { return Ok(Some(Val.Text(try lexdb_func.toCharNum(&lexdb_func.NumIn{text: x.toStr(), isFloat: false, isReal: false, fl: 0.0f}, &f)))) }
-                Val.Num(d) { return Ok(Some(Val.Text(try lexdb_func.toCharNum(&lexdb_func.NumIn{text: d.toStr(), isFloat: false, isReal: false, fl: 0.0f}, &f)))) }
-                Val.Float(x) { return Ok(Some(Val.Text(try lexdb_func.toCharNum(&lexdb_func.NumIn{text: "", isFloat: true, isReal: false, fl: x}, &f)))) }
-                Val.Real(x) { return Ok(Some(Val.Text(try lexdb_func.toCharNum(&lexdb_func.NumIn{text: "", isFloat: true, isReal: true, fl: x}, &f)))) }
-                Val.Date(d) {
-                    if d == lexdb_time.INF || d == lexdb_time.NINF { return Ok(Some(Val.Null)) }
-                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfTs(lexdb_time.dateToTs(d), false), &f))))
-                }
-                Val.Ts(u) {
-                    if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(Some(Val.Null)) }
-                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfTs(u, false), &f))))
-                }
-                Val.Tstz(u) {
-                    if u == lexdb_time.INF || u == lexdb_time.NINF { return Ok(Some(Val.Null)) }
-                    // in the session's zone: its offset and abbreviation for TZ, OF, TZH, TZM
-                    let inf = z.info(lexdb_time.unixSecOf(u))
-                    var tm = lexdb_func.tmOfTs(u + inf.offset * 1000000, true)
-                    tm.off = inf.offset
-                    tm.abbr = inf.abbr
-                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&tm, &f))))
-                }
-                Val.Ival(iv) { return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfIval(&iv), &f)))) }
-                Val.Time(u) {
-                    // as an interval, as PostgreSQL casts it
-                    return Ok(Some(Val.Text(lexdb_func.toCharTm(&lexdb_func.tmOfIval(&lexdb_time.Ival{months: 0, days: 0, us: u}), &f))))
-                }
-                else { return Err(e("42725", &("function to_char(" + lexdb_ops.kindName(&oidType(lexdb_ops.kindOid(&vs[0]))) + ", unknown) is not unique"))) }
-            }
-        }
-        "to_number" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Num(try lexdb_func.toNumber(&text(&vs[0]), &text(&vs[1])))))
-        }
-        "to_date", "to_timestamp" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            let pd = try lexdb_func.parseDate(&text(&vs[0]), &text(&vs[1]))
-            let days = try lexdb_func.parsedDate(&pd)
-            if name == "to_date" { return Ok(Some(Val.Date(days))) }
-            let local = lexdb_time.dateToTs(days) + try lexdb_func.parsedTime(&pd)
-            // with TZH (and TZM) at that offset, else in the session's zone
-            if !pd.hasTz { return Ok(Some(Val.Tstz(lexdb_time.tsToTstz(local, z)))) }
-            let off = if pd.tzoff == -1 { 0 } else { pd.tzoff }
-            return Ok(Some(Val.Tstz(local - off * 1000000)))
-        }
-        "pi" {
-            if n != 0 { return Ok(None) }
-            return Ok(Some(Val.Float(3.141592653589793f)))
-        }
-        "atan2", "atan2d" {
-            if n != 2 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            return Ok(Some(Val.Float(try trig(name, try fArg(&vs[0], name), try fArg(&vs[1], name)))))
-        }
-        "sqrt", "exp", "ln", "log10", "log", "cbrt" {
-            if n == 2 && name == "log" {
-                if anyNull { return Ok(Some(Val.Null)) }
-                let b = lexdb_ops.asNum(&vs[0])
-                let x = lexdb_ops.asNum(&vs[1])
-                if b.isNone() || x.isNone() { return Err(e("42883", "function log needs numbers")) }
-                return Ok(Some(Val.Num(try lexdb_func.numLog(&b.unwrap(), &x.unwrap()))))
-            }
-            if n != 1 { return Ok(None) }
-            if anyNull { return Ok(Some(Val.Null)) }
-            match vs[0] {
-                Val.Num(d) {
-                    if name == "sqrt" { return Ok(Some(Val.Num(try lexdb_func.numSqrt(&d)))) }
-                    if name == "exp" { return Ok(Some(Val.Num(try lexdb_func.numExp(&d)))) }
-                    if name == "ln" { return Ok(Some(Val.Num(try lexdb_func.numLn(&d)))) }
-                    if name == "cbrt" { return Ok(Some(Val.Float(d.toFloat().cbrt()))) }
-                    return Ok(Some(Val.Num(try lexdb_func.numLog(&Decimal.fromInt(10), &d))))
-                }
-                else {}
-            }
-            return callFloat(&(if name == "log" { "log10" } else { name }), &vs[0])
-        }
-        else {}
-    }
-    if isTrig(name) {
-        if n != 1 { return Ok(None) }
-        if anyNull { return Ok(Some(Val.Null)) }
-        return Ok(Some(Val.Float(try trig(name, try fArg(&vs[0], name), 0.0f))))
-    }
-    return Ok(None)
-}
-
-fn decScale(d: Decimal, s: int): Result[Decimal, DbErr] {
-    match d.roundAway(s) {
-        Ok(r) { return Ok(r) }
-        Err(_) { return Err(lexdb_ops.decErr()) }
-    }
-}
-
-// gcd of two bigints; -1 when it is 2^63, out of range.
-fn gcdInt(a0: int, b0: int): int {
-    var a = a0
-    var b = b0
-    // with negatives: -2^63 has no positive
-    if a > 0 { a = -a }
-    if b > 0 { b = -b }
-    while b != 0 {
-        let r = a % b
-        a = b
-        b = r
-    }
-    if a == -9223372036854775807 - 1 { return -1 }
-    return -a
-}
 
 // The functions that need the session (9.92).
 fn isSessFn(n: &str): bool {
@@ -27841,169 +26356,6 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
         return Ok(Val.Text(v))
     }
     return Err(e("42883", &("function " + name + " with " + n.toStr() + " arguments does not exist")))
-}
-
-fn callMisc(name: &str, vs: &[]Val): Result[Option[Val], DbErr] {
-    let n = len(vs)
-    // x COLLATE name: x (its collation used when planned); #ci(x): its key
-    if (name == "#collate" || name == "#coll") && n == 2 { return Ok(Some(vs[0])) }
-    if name == "#ci" && n == 1 { return Ok(Some(ciVal(&vs[0]))) }
-    if name == "#pad" && n == 1 {
-        match vs[0] {
-            Val.Text(t) { return Ok(Some(Val.Text(padKey(&t)))) }
-            else { return Ok(Some(vs[0])) }
-        }
-    }
-    if name == "#cifold" && n == 1 {
-        // LIKE's operands under a case-insensitive collation: case folded, spaces kept
-        match vs[0] {
-            Val.Text(t) { return Ok(Some(Val.Text(ciFold(&t)))) }
-            else { return Ok(Some(vs[0])) }
-        }
-    }
-    if name == "~" || name == "!~" || name == "~*" || name == "!~*" {
-        if n != 2 { return Ok(None) }
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Some(Val.Null)) }
-        let fl = try lexdb_func.reFlags(&(if strings.contains(&name, "*") { "i" } else { "" }))
-        let re = try lexdb_func.reCompileTest(&text(&vs[1]), &fl)
-        let m = re.isMatch(&(text(&vs[0])))
-        return Ok(Some(Val.Bool(if strings.startsWith(&name, "!") { !m } else { m })))
-    }
-    if name == "#enumpos" && n == 2 {
-        // an enum value's place among its type's labels (9.90): vs[1] is
-        // the type's name and labels, joined by \x1f
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-        let v = text(&vs[0])
-        let enc = text(&vs[1])
-        let parts = strings.split(&enc, "\x1f")
-        for i in 1..len(parts) { if parts[i] == v { return Ok(Some(Val.Int(i))) } }
-        return Err(e("22P02", &("invalid input value for enum " + parts[0] + ": \"" + v + "\"")))
-    }
-    if name == "#elem" && n == 2 {
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Some(Val.Null)) }
-        let i = lexdb_ops.oidArg(&vs[1]).unwrapOr(0)
-        let ps = try lexdb_ops.arrayParts(&text(&vs[0]))
-        if i < 1 || i > len(ps) { return Ok(Some(Val.Null)) }
-        match ps[i - 1] {
-            Some(p) { return Ok(Some(Val.Text(p))) }
-            None { return Ok(Some(Val.Null)) }
-        }
-    }
-    if name == "unnest" && n == 1 {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(srfMark(&[]))) }
-        var vals: []Val = []
-        for p in try lexdb_ops.arrayParts(&text(&vs[0])) {
-            match p {
-                Some(x) { append(mut &vals, Val.Text(x)) }
-                None { append(mut &vals, Val.Null) }
-            }
-        }
-        return Ok(Some(srfMark(&vals)))
-    }
-    if name == "generate_subscripts" && (n == 2 || n == 3) {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(srfMark(&[]))) }
-        let k = len(try lexdb_ops.arrayParts(&text(&vs[0])))
-        var vals: []Val = []
-        for i in 1..k + 1 { append(mut &vals, Val.Int(i)) }
-        if n == 3 && lexdb_ops.truth(&vs[2]) == Some(true) {
-            var rev: []Val = []
-            var j = len(vals) - 1
-            while j >= 0 {
-                append(mut &rev, vals[j])
-                j -= 1
-            }
-            return Ok(Some(srfMark(&rev)))
-        }
-        return Ok(Some(srfMark(&vals)))
-    }
-    if name == "format_type" && n == 2 {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-        let m = if lexdb_ops.isNull(&vs[1]) { -1 } else { lexdb_ops.oidArg(&vs[1]).unwrapOr(-1) }
-        return Ok(Some(Val.Text(lexdb_pgcat.formatType(lexdb_ops.oidArg(&vs[0]).unwrapOr(0), m))))
-    }
-    if (name == "btrim" || name == "ltrim" || name == "rtrim") && n == 2 {
-        // the characters of vs[1] off the start, the end, or both
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Some(Val.Null)) }
-        let x = text(&vs[0])
-        let cs = text(&vs[1])
-        var a = 0
-        var b = len(x)
-        if name != "rtrim" { while a < b && strings.contains(&cs, &x[a..a + 1]) { a += 1 } }
-        if name != "ltrim" { while b > a && strings.contains(&cs, &x[b - 1..b]) { b -= 1 } }
-        return Ok(Some(Val.Text(x[a..b].toStr())))
-    }
-    if name == "repeat" && n == 2 {
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Some(Val.Null)) }
-        let k = lexdb_ops.oidArg(&vs[1]).unwrapOr(0)
-        let t = text(&vs[0])
-        if k > 0 && len(t) * k > 1073741823 { return Err(e("54000", "requested length too large")) }
-        return Ok(Some(Val.Text(if k <= 0 { "" } else { strings.repeat(&t, k) })))
-    }
-    if name == "quote_ident" && n == 1 {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-        return Ok(Some(Val.Text(quoteIfNeeded(&text(&vs[0])))))
-    }
-    if (name == "array_to_string" && (n == 2 || n == 3)) {
-        if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Some(Val.Null)) }
-        var parts: []str = []
-        for p in try lexdb_ops.arrayParts(&text(&vs[0])) {
-            match p {
-                Some(x) { append(mut &parts, x) }
-                None { if n == 3 && !lexdb_ops.isNull(&vs[2]) { append(mut &parts, text(&vs[2])) } }
-            }
-        }
-        return Ok(Some(Val.Text(strings.join(&parts, &text(&vs[1])))))
-    }
-    if (name == "array_length" || name == "array_upper" || name == "array_lower" || name == "cardinality") && (n == 2 || (n == 1 && name == "cardinality")) {
-        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
-        let k = len(try lexdb_ops.arrayParts(&text(&vs[0])))
-        if k == 0 { return Ok(Some(if name == "cardinality" { Val.Int(0) } else { Val.Null })) }
-        if n == 2 && lexdb_ops.oidArg(&vs[1]).unwrapOr(0) != 1 { return Ok(Some(Val.Null)) }
-        return Ok(Some(Val.Int(if name == "array_lower" { 1 } else { k })))
-    }
-    if name == "pg_size_pretty" && n == 1 {
-        match vs[0] {
-            Val.Null { return Ok(Some(Val.Null)) }
-            Val.Int(x) { return Ok(Some(Val.Text(lexdb_pg.sizePretty(x)))) }
-            else {
-                match lexdb_ops.coerce(vs[0], &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) {
-                    Ok(iv) {
-                        match iv {
-                            Val.Int(x) { return Ok(Some(Val.Text(lexdb_pg.sizePretty(x)))) }
-                            else { return Ok(Some(Val.Null)) }
-                        }
-                    }
-                    Err(x) { return Err(x) }
-                }
-            }
-        }
-    }
-    if name == "pg_encoding_to_char" && n == 1 { return Ok(Some(Val.Text(if lexdb_ops.oidArg(&vs[0]) == Some(6) { "UTF8" } else { "SQL_ASCII" }))) }
-    if (name == "json_build_object" || name == "jsonb_build_object") {
-        if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
-        var parts: []str = []
-        var k = 0
-        while k < n {
-            if lexdb_ops.isNull(&vs[k]) { return Err(e("22004", "null value not allowed for object key")) }
-            append(mut &parts, jsonText(&Val.Text(text(&vs[k]))) + " : " + jsonText(&vs[k + 1]))
-            k += 2
-        }
-        return Ok(Some(Val.Text("{" + strings.join(&parts, ", ") + "}")))
-    }
-    if (name == "pg_type_is_visible" || name == "pg_function_is_visible" || name == "pg_collation_is_visible") && n == 1 {
-        return Ok(Some(if lexdb_ops.isNull(&vs[0]) { Val.Null } else { Val.Bool(true) }))
-    }
-    if (name == "obj_description" || name == "col_description" || name == "shobj_description" ||
-        name == "pg_get_triggerdef" || name == "pg_get_ruledef" || name == "pg_get_statisticsobjdef_columns" || name == "pg_get_function_result" ||
-        name == "pg_get_function_arguments") {
-        return Ok(Some(Val.Null))
-    }
-    if name == "pg_get_expr" && (n == 2 || n == 3) {
-        // pretty: without the parentheses around the whole
-        if n == 3 && lexdb_ops.truth(&vs[2]) == Some(true) && !lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Text(lexdb_sql.unwrapParens(&text(&vs[0]))))) }
-        return Ok(Some(vs[0]))
-    }
-    return Ok(None)
 }
 
 // The functions that read the bound catalog: None if name is none of them.
@@ -28152,7 +26504,7 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     }
     if name == "pg_partition_ancestors" && n == 1 {
         let o = lexdb_ops.oidArg(&vs[0]).unwrapOr(0)
-        return Ok(Some(srfMark(&[Val.Int(o)])))
+        return Ok(Some(lexdb_lib.srfMark(&[Val.Int(o)])))
     }
     return Ok(None)
 }

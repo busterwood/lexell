@@ -1041,6 +1041,250 @@ numbers move.
   (`substring` IN a list), q7's and q8's `extract`, q13's `like`, and the
   35 queries' text ones.
 
+**Item 3 as built: the function library is `lexdb_lib`, one entry per
+signature.** Three commits on `redesign/bind` (6df59bd7: call1's and
+callTime's functions; 03e2c288: callFn's; 714fa6d0: callMisc's and the rest
+of callAt's, and `FnRef.f`).
+
+- `lexdb_lib` (new, 2189 lines) sits beside `lexdb_ops`, below the binder
+  and the executor. `imports.py` has its rule (`LIB_MAY_IMPORT`: ops' list
+  plus `lexdb_ops`, `lexdb_like`, `lexdb_rows`, `lexdb_access`,
+  `lexdb_catalog`), and the binder may import it.
+- An entry is a function value of one of two types:
+  - `LibFn = fn(name, args, now, zone)`: `name` as called, for its errors;
+    `now` the transaction's start (0: the clock); `zone` the session's.
+  - `Lib1 = fn(name, value)`, a function of one argument given a value not
+    NULL (the caller gives NULL for NULL). It needs no argument list, so
+    a bound call and the batches' one-column shape (`bGenVals`) call it per
+    row without allocating.
+- Finding an entry:
+  - `entry1Of(name)` gives the `Lib1` of a one-argument name: call1's
+    (lower, upper, the trims, length, octet_length, abs, round, floor,
+    ceil, trunc, sign), sqrt, cbrt, exp, ln, log10 and log (with callFn's
+    numeric semantics), the 22 trigonometric functions, and `#ci`, `#pad`
+    and `#cifold`.
+  - `entryOf(name, n)` gives a `LibFn` for every name and count. It is the
+    first of the old chain (callMisc, callFn, the inline ones, callTime,
+    the rest of callAt) that took that name and count, so where names met,
+    the old order holds (`to_timestamp` of two arguments is to_char's kin,
+    else seconds since 1970). It gives `restFn` when none does.
+  - `rest` is what callAt gave at its end: NULL for one NULL argument, else
+    42883 "function X with n arguments does not exist" (`noSuch`).
+- Split per signature: no entry tests its name per call.
+  - Names that branched inside one arm are an entry each: lpad/rpad,
+    regexp_match/matches/like, the regexp splits, array append/prepend/cat,
+    remove/replace, position(s), `@>`/`<@`/`&&`, mod/div/gcd/lcm, to_date
+    and to_timestamp, the `~` operators, the trims of two, greatest/least,
+    left/right, like/ilike, encode/decode.
+  - Shared bodies take a code instead of the name: `trig` (`T_*`),
+    `intMathOf` (`IM_*`), `cutOf` (`CUT_*`), `floatMath` (`M_*`),
+    `arrCmpOf` (`AR_*`).
+  - A quantified comparison ("any =", "all not ilike") gets its operator
+    from the name once (`quantEntry`, twenty entries over `quantOf`).
+    Before, `quantified` matched the operator's text for every element.
+- What a value a function does not take gives: where the old chain
+  answered "not mine" from a value (abs or round of a text, isfinite of a
+  number, `regexp_replace` with a text fourth argument and more than four
+  arguments, round of two with a non-integer scale), the entry returns
+  `rest`/`noSuch`. That is what the chain reached, since nothing later in
+  it took those names. The typed functions (`to_hex`, array_remove,
+  array_replace, array_position(s), `@>`, `<@`, `&&`) count their
+  arguments without resolve's hint (`argsOf`), as callFn did. Other
+  functions no longer look for a hint: resolve adds one only to
+  `TYPED_FNS`.
+- `lexdb_bind.FnRef` is `name`, `way` (`FN_NONE`, `FN_GEN`, `FN_ONE`),
+  `f` (the `LibFn`), `f1` (the `Lib1`; `lexdb_lib.no1` when not
+  `FN_ONE`), and `dialect`.
+  - `fnRefOf` finds both entries once per bind: two string matches,
+    `entry1Of` and exec's `entryAt`. `bindExpr` is unchanged.
+  - `FN_COALESCE`, `FN_SUBSTR`, `FN_CONCAT` and the call1 `id` are gone.
+  - `reslot` copies `f` and `f1` with the other fields.
+- Evaluating:
+  - `callRef` calls the dialect's function first when `dialect`
+    (`callDialectFn`: `lexdb_tsqlfn`, `lexdb_orafn`), then `f1` for
+    `FN_ONE` (NULL for NULL), else `f`.
+  - A one-argument call of a T-SQL or Oracle name the library also takes
+    is `FN_ONE` now. `bGenVals`' one-column shape skips it
+    (`!fb.dialect`), since its dialect call comes first.
+  - `eval`'s way in is `callAt` (and `call`, in UTC with no clock). It
+    finds the entry per call: `entry1Of` for one argument, else
+    `entryAt`. That is two matches where the chain matched dozens of
+    texts.
+- Stays in exec:
+  - The session-bound calls, which `fnRefOf` makes `FN_NONE` and `eval`
+    runs: `seqCall` (`isSeqFn`), `sessCall` (`isSessFn`), `advCall`
+    (`isAdvFn`), `callCat` (`lexdb_sql.isCatFn`, `current_schema`), `#tdiv`
+    and `#tavg`.
+  - The dialect functions (`callDialectFn`).
+  - `format_type` and `pg_size_pretty` (`entryAt`, `formatTypeFn`,
+    `sizePrettyFn`), because they read `lexdb_pgcat` and `lexdb_pg`, which a
+    core module below the binder may not import.
+- Deleted from exec: call1, fn1Of, `F1_*`, arithInt, callFloat, callTime,
+  truncTstz, atTimeZone, tsAt, tsOfVal, callFn, reFlagsAt, noGlobal,
+  posArg, decScale, gcdInt, hintOids, arrOf, partsVal, elemVal, elemIs,
+  hintElem, arrContains, fArg, the sind/cosd helpers, trig, isTrig, intArg,
+  srfMark, callMisc, callAt's chain, substr, substrOf, concatOf,
+  coalesceOf, likeMatch, quantified, randomFloat, randomUuid, getrandom,
+  encodeBytes, decodeBytes, ciVal, ciFold, jsonText, and the `unicode` and
+  `base64` imports.
+  - exec calls `lexdb_lib.intArg`, `srfMark` and `likeMatch` (the batches'
+    LIKE) directly; `HINT` and `SRF_MARK` are `lexdb_lib`'s.
+  - No `pub` forwarder was needed: no other module or test used these
+    names.
+- Lines:
+
+  | Module | Before | After |
+  |---|---|---|
+  | `lexdb_exec` | 30549 | 28901 |
+  | `lexdb_lib` | (new) | 2189 |
+  | `lexdb_ops` | 1424 | 1424 (comment) |
+  | `lexdb_bind` | 755 | 754 |
+
+  The library is larger than what left exec because of the per-signature
+  wrappers and their comments.
+- No change in results:
+  - the suite (188);
+  - a differential battery, compiled once from main 71b196b9 and once from
+    the branch, outputs diffed: about 150 calls and their errors, over
+    NULLs, numbers, texts, dates, timestamps, arrays and bytea, through
+    the batch shapes (5,000 and 20,000 rows), two zones, and errors
+    raised on the batch path. Messages and
+    SQLSTATEs were both compared (`VERBOSITY verbose`, 41 errors);
+  - TPC-H's 22 checksums.
+- Not done (later slices):
+  - no node types and no `OpDef` metadata (strict, volatile, canFail);
+  - `immutableName` and `bxFixed` still decide by name;
+  - the binder does not yet fold constants with the library;
+  - the dialect functions (`lexdb_tsqlfn.call`, `lexdb_orafn.call`) still
+    match names per call.
+- A/B against main 71b196b9 (built from `git archive`), binaries
+  alternating, medians of 3 rounds:
+  - TPC-H (`run.sh`, 3 runs a round): total 0.981; all 22 checksums are
+    the baseline's.
+    - q22 0.612 (754 to 461 ms) and q16 0.801 (724 to 580 ms), the same
+      in all three rounds. q22's `substring(c_phone from 1 for 2) IN
+      (...)` and q16's `NOT LIKE`, `IN` and `NOT IN` reach the library
+      per row: before through callAt's chain of name tests, now through
+      one entry. That this is the cause was not checked with a profile.
+    - q9 0.975, q7 0.984, q5 1.014; the rest within 1.2%.
+  - Direct A/B (`qab.sh`, 15 runs per server, 7 for q1, three rounds):
+    q20 1.002, q18 0.994, q1 1.009, q6 1.001, q22 0.608, q7 0.991, q8
+    0.987, q13 0.993.
+  - The 35 queries: total 1.000, expr_mix 0.958.
+    - distinct2 (`select distinct a, city from w`) is 1.107 in all three
+      rounds of `ab35.sh` (253 to 280 ms), and window 1.032 (2-iv saw
+      1.036 there). distinct2 calls no function. A direct run, a server
+      per binary with 5 runs each, gave 252 against 257 ms (1.02). perf
+      (`LXL_NATIVE_MAP`) shows the same functions in the same shares on
+      both (sortBatches, encBytesKey, malloc, dup, colsInto); none of
+      them is changed code. So layout and allocation, most likely; not
+      resolved further.
+  - OLTP, medians of 3:
+
+    | Clients | Point selects | Updates |
+    |---|---|---|
+    | 1 | 0.995 | 0.994 |
+    | 8 | 1.001 | 0.999 |
+    | 32 | 0.997 | 0.989 |
+
+**Where item 3 left off, and how to start 2d (scope and naming).** 2d
+moves name resolution out of the executor into the binder, so that
+expressions refer to columns by slot and `eval` stops finding columns by
+name (4.4.1's table: "`resolve`/`resolveName`/`Scope` frames, star, GROUP
+BY and ORDER BY resolution move to the binder; columns by slot;
+`Query.cols` as `BCol`s; `eval`'s name lookup (`colIndex`) gone"). All of
+it is in `lexdb_exec` unless named. Search for the names, since line
+numbers move.
+
+- What resolves names today:
+  - `resolve(x, cols, n, sc: mut &Scope)` rewrites an `Expr` over a
+    query's columns. It turns a bare or qualified name into the
+    `alias.column` name `cols` holds (`resolveName`, `colPart`, `DUPSEP`
+    for a name repeated in one FROM item), finds outer references
+    (`outerRef`: a correlated name becomes a parameter past `Scope.base`,
+    recorded in the frame's `refs`/`refOids`), and inserts the binder's
+    casts (2a's common types, `timeLitOid`, char(n)'s `#bptrim`/`#bppad`,
+    the collation calls `collateCall`/`#ci`/`#pad`). It is called about
+    30 times (`resolve(`).
+  - `Scope` (with `Frame` per query level: `cols`, `exact`, `refs`,
+    `subRefs`, `hidden` for a non-LATERAL FROM subquery) also carries
+    planning state that is not naming: privileges (`asRole`, `whos`,
+    `scCheck`), `looks`, `early`, `locking`, `ordBy`/`ordLim`,
+    `noRefKeys`, `works` (recursive CTEs). 2d should split the naming part
+    (frames, base, ptypes, coll) from the planner's hints rather than move
+    `Scope` whole.
+  - Star and the select list: `selectCols`/`itemCols` (select items to
+    `OutCol`s and expressions). ORDER BY: `resolveOrder` (output names and
+    positions first, then input columns). GROUP BY: `resolveGroup`
+    (output names, positions, expressions). `endScope` closes a frame
+    into its `Query`.
+  - The typing helpers that read a `Scope` (`numPS`, `exprColl`,
+    `textOrUnknown`, `isTextExpr`, `cmpKind`, `exprKind`, `ptypesOf`,
+    `unifyVals`) are the binder's work too. They use `lexdb_bind.exprOid`
+    with the frame's columns.
+- What reads names at run time: `eval`'s `Expr.Col(name)` arm
+  (`colIndex(&env.cols, &name)`, a linear search per row; 80 `colIndex(`
+  sites in all), `Query.colAt` (`levelOf`'s map), `keyedCol`, and every
+  pass that matches `Expr.Col` by name (`bpFix`, the planner's key
+  finders). The bound path (`BX.Col(i)`) is by slot already: `bindExpr`
+  maps names to places through `cols` once per plan (`bindSel`/
+  `bindQuery`) or per run (`bxOf`).
+- A way in, in slices that each keep results and speed:
+  1. A `BCol` (slot, name, spell, `Ty`) list per query level, built where
+     `Query.cols` is built (`buildQuery`), with `cols` derived from it.
+     Nothing reads it yet.
+  2. `resolve` emits slots as well as names (a resolved `Expr.Col` that
+     carries its slot, or a side table), so that `bindExpr` stops
+     searching `cols` by name.
+  3. Move `resolve`, `resolveName`, `outerRef` and the select, ORDER BY
+     and GROUP BY resolution into `lexdb_bind`, with the naming part of
+     `Scope`. exec keeps the planner's hints.
+  4. `eval` reads slots; `colIndex` goes. `eval` still runs what does not
+     bind (subqueries, aggregates, DML's expressions), so every `Env`
+     must carry rows in its query's slot order. Check `Env.cols` users
+     first.
+- Traps:
+  - `Expr.Col`'s name is load-bearing beyond lookup: the planner matches
+    columns by name for keys, implied equalities and index paths
+    (`keyedCol`, `colAt`, `rangePath`). Keep the name alongside the slot
+    until those read slots.
+  - Correlation: an outer reference becomes a parameter numbered past
+    `Scope.base` (`refs`, `Query.base`, `subFixed`, `isSubCall`). The
+    subquery machinery (`SubPlan`, the `#in` and other sub calls, `subValue`) and
+    hashing on `refs` (9.104 `noRefKeys`, `keyConj`) depend on that
+    numbering.
+  - A repeated column name in one FROM item is `name DUPSEP position`.
+    USING and NATURAL merge columns (`usingSide`, and the join handling in
+    `buildQuery`). A view's text is resolved under its owner (`asRole`).
+  - `bindExpr` runs per run on the `bxOf` paths (join, group and ORDER BY
+    keys, aggregate arguments): keep it cheap (2b lost 5% on q20 typing
+    there). `fnRefOf` now finds the library entries there (two string
+    matches per call node).
+  - `BX` and `FnRef` are owned and not copy types. `FnRef` holds function
+    values (`f`, `f1`); copy it by its fields (`reslot`).
+  - The suite compiles each test as it runs it: do not edit the sources
+    while it runs (about 3.5 minutes at `-j 2`).
+- Gates, as for item 3:
+  - the suite (188);
+  - TPC-H all 22, checksums against `~/tpch/out-baseline-1744ef99`
+    (fields [0] and [8]; q1, q8 and q17 show "different result" in
+    `run.sh`'s text check on every binary: formatting, not checksums),
+    with q20 (8,508 subquery runs), q18's HAVING, q2, q17, q21 and q22
+    (correlation) watched;
+  - the 35 queries (five fail on both binaries with la/base2's data:
+    known);
+  - OLTP point selects and updates (prepared: the plan cache must still
+    hit; `PlanCache`).
+- Methods: as 2-ii's and 2-iv's paragraphs say (`tpch_ab.sh`/`tpcmp.py`,
+  `ab35.sh`/`cmp35.py`, `oltp.sh`, `qab.sh`, all in
+  `~/tpch-w/bind/bench`). The baseline is built from `git archive <main>
+  lexell/cmd`. For a differential check of naming, compile the same SQL
+  over joins, USING/NATURAL, LATERAL, correlated subqueries, views, CTEs,
+  ORDER BY/GROUP BY by position and by output name, and star with
+  repeated names, against main's sources and the branch's, and diff the
+  outputs (`probe.sh`-style: a fresh data directory per binary, psql with
+  `ON_ERROR_STOP=0`, so errors are compared too).
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
@@ -1061,6 +1305,7 @@ numbers move.
    - `callAt`, `callFn`, `callMisc`, `callTime`, `call1` move; the
      session-bound calls (sequences, catalog, settings) stay in exec.
    - `FnRef` gains the signature's entry point.
+   - (Built, in `lexdb_lib` beside `lexdb_ops`: see "Item 3 as built".)
 
 ### 4.5 Layer 5, optimizer (`lexdb_plan`)
 

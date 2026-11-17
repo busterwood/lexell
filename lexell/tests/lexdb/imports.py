@@ -24,7 +24,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
     "lexdb_access", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
-    "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_like",
+    "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows",
@@ -61,7 +61,7 @@ KNOWN_CORE_DIALECT = {
 # model, the catalog and the dialect facts, and below the planner and the
 # executor: it imports only these (and lexell's own libraries).
 BIND = "lexdb_bind"
-BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops"}
+BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_lib"}
 
 # The access layer (design/lexdb-layers.md 4.2) sits above the store and the
 # row codecs and below the catalog, the planner and the executor: what it may
@@ -77,6 +77,12 @@ BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_
 # libraries only.
 OPS = "lexdb_ops"
 OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect"}
+
+# The function library (lexdb_lib, design/lexdb-layers.md 4.4.1, slice 2c
+# item 3) sits beside the value operations, below the binder and the
+# executor: what it may import.
+LIB = "lexdb_lib"
+LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -147,6 +153,9 @@ def check():
     for d in mods.get(OPS, []):
         if d not in OPS_MAY_IMPORT:
             bad.append(f"{OPS} -> {d}: the value operations import above their layer")
+    for d in mods.get(LIB, []):
+        if d not in LIB_MAY_IMPORT:
+            bad.append(f"{LIB} -> {d}: the function library imports above its layer")
     for d in mods.get(BIND, []):
         if d not in BIND_MAY_IMPORT:
             bad.append(f"{BIND} -> {d}: the binder imports above or beside its layer")
