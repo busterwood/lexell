@@ -3835,6 +3835,96 @@ are the plan-side gains, and neither needs step 3 or step 5. If the owner
 keeps 3 then 5, 5a to 5c are the most useful (correctness and
 generality), but the TPC-H totals will not move.
 
+**Step 3a as built.** There are two commits on `redesign/bind` from main
+413100d1: af5da38f (this note) and 3d48e049 (the code). The suite passed
+on the code commit's snapshot.
+
+- `lexdb_plan` gained the following, with no new imports:
+  - `PPlan`, the arms as in 1 above;
+  - `PSub{use, run, anti, plan}`;
+  - `RUN_ONCE`, `RUN_PER_ROW`, `RUN_HASHED`, `RUN_SEMI`, `RUN_LOOKED`;
+  - `pSubs(&PPlan)`, which returns the leaf's subqueries;
+  - `pLeaf(&PPlan)`.
+- `lexdb_exec`:
+  - `physOf(&Sel)` and `subsOf(&Query)` build the tree. `subsOf` uses
+    the classification `subLines` made inline before: looked up, then
+    semi, hashed, once, per row.
+  - `selLines` is `physOf` followed by `planLines`. `planLines` walks the
+    operators (`opLines`), then the subqueries (`subLines`, which now
+    takes the `PSub`s and recurses with each one's plan).
+  - `setLines` takes the parts' plans from the `SetOp` leaf.
+  - DML's EXPLAIN calls `subLines(&q, &subsOf(&q), ...)`.
+  - Only EXPLAIN builds the tree. Planning, the plan cache and
+    `execSel` are unchanged.
+- The order is kept for EXPLAIN:
+  - `Match` prints its line before its input's;
+  - `Func` and `Result` print the level lines first, as before;
+  - `Window`, `Project` and `Lock` print nothing;
+  - `Limit` prints only when it stops the scan;
+  - a set is still printed by `setLines`: its `Sort` always as "order:
+    sort", its `Limit` never.
+- Lines:
+
+  | Module | main 413100d1 | after |
+  |---|---|---|
+  | `lexdb_exec` | 28124 | 28224 |
+  | `lexdb_bind` | 2025 | 2025 |
+  | `lexdb_plan` | 154 | 229 |
+
+- Gates:
+  - the suite from a snapshot of 3d48e049
+    (`~/tpch-w/bind/e7/suitec.sh s3a`): 188 passed, imports ok;
+  - the naming battery: 1,505 lines, identical to main's
+    (`~/tpch-w/bind/s3/nam-*.out`);
+  - EXPLAIN of the 22 TPC-H queries (`s3/explain.sh`, 188 lines) is
+    byte-identical to main's binary;
+  - `s3/exx.sql`, 45 EXPLAINs over this slice's shapes, identical to
+    main once the times are masked (309 lines). It covers every `RUN_*`
+    mode, sets, a recursive CTE, functions, VALUES, MIN/MAX, DISTINCT
+    ON, windows, grouping sets, LIMIT and OFFSET, FOR UPDATE and FOR
+    SHARE, LATERAL, MATCH_RECOGNIZE, DML, and EXPLAIN ANALYZE;
+  - TPC-H: all 22 checksums match the baseline's (fields [0] and [8]) on
+    every run.
+    - The first run against main's stored result
+      (`~/tpch-w/int/out-main-2b605b2b`) was 30,756 against 29,744 ms
+      (1.034), with q21 at 1.077.
+    - The repeat used byte-identical copies, the branch first
+      (`s3/lexdb-ac`) and then main's binary (`s3/lexdb-mc`, a copy of
+      `e8/lexdb-bc`): 30,389 against 30,489 ms (0.997). q21 was 0.987,
+      and nothing moved past 4% (q20 1.039, q3 1.023).
+    - So the first run's gap was the machine, not the change. That fits:
+      the code runs only under EXPLAIN. The outputs are in `s3/out-a`,
+      `out-ac` and `out-mc`.
+  - Not run, as planning per statement does not change: `simple.sh`
+    and `pts.sh`.
+
+**Where 3a left off, and how to start step 4 (or step 5).**
+
+- The tree is a view, and nothing runs from it. Step 4's first slice
+  does three things:
+  - stores the tree in the `Sel`: built at the end of `planSelect` and
+    `planSet`, cached with the `Sel`. `pts.sh` and `simple.sh` measure
+    this, because it is per statement on the simple protocol;
+  - adds the check that the pipeline supports a plan (a walk of
+    `PPlan`, its subqueries included);
+  - moves the first ported operator's details into its arm, out of the
+    `Sel`. The `Sel` field goes when its last reader does.
+
+  Splitting `Levels` into scan and join arms is part of porting the
+  hash join.
+- For step 5 slices, in today's structures:
+  - a new way to run a subquery gets a `RUN_*` value, its line in
+    `subLines`, and its case in `subsOf`;
+  - a new kind of level (a mark join) gets its line in `explainLines`.
+- Traps:
+  - `pSubs` is exhaustive over the arms, and `pLeaf` ends in `else`. A
+    new unary arm needs a case in both.
+  - `Agg` and `MinMax` can both be present (EXPLAIN printed both lines
+    whenever both conditions held). `Limit` is also present for TOP
+    PERCENT and WITH TIES (`topMode`, `limit` -1).
+  - Lexell: the tree is built with `let` chains (`p1` ... `p9`). Each
+    arm moves its input in, and nothing is reassigned.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
