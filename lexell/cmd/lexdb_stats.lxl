@@ -1,0 +1,1164 @@
+// lexdb_stats: a table's statistics (design/lexdb-layers.md 4.5 and 6.2,
+// slice E2; optimizer 20 to 44): what ANALYZE counts from a table's rows
+// (its rows; per key and index the distinct values of each prefix, the
+// leading column's common values, least and greatest and samples; the
+// other columns' distinct values), the row they are kept in, the
+// estimates the planner reads from them (Est), and the automatic
+// statistics (the rows each commit changed, and the task that analyzes a
+// table again when enough have).
+//
+// What needs the executor's evaluator comes in Up (lexdb_exec: statsUp):
+// an index expression's value, a partial index's predicate, a catalog
+// row's expressions. The session's settings come as arguments.
+import "strings"
+import "collections"
+import "time"
+import "task"
+import "os"
+import "hash"
+import "math"
+import "./lexdb_base"
+import "./lexdb_time"
+import "./lexdb_float"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_store"
+import "./lexdb_catalog"
+import "./lexdb_access"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type Table = lexdb_catalog.Table
+type Index = lexdb_catalog.Index
+type TabStat = lexdb_catalog.TabStat
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// ---- what the executor supplies (lexdb_exec: statsUp)
+
+// An index's k-th value for a row of its table: its column's, or its
+// expression's, evaluated (lexdb_exec.idxVal).
+pub type IdxValFn = fn(&Table, &Index, int, &[]Val): Result[Val, DbErr]
+
+// Whether a row belongs in an index: always, or its predicate is true
+// (lexdb_exec.inIndex).
+pub type InIndexFn = fn(&Table, &Index, &[]Val): Result[bool, DbErr]
+
+// A catalog row decoded as a table, its expressions parsed
+// (lexdb_exec.decTable).
+pub type DecTableFn = fn(&str, &str): Result[Table, DbErr]
+
+pub type Up = value record {
+    pub idxVal: IdxValFn
+    pub inIndex: InIndexFn
+    pub decTable: DecTableFn
+}
+
+// ---- estimates: what the planner reads (optimizer 20, 23, 24)
+
+// ANALYZE's statistics for a table (optimizer 20): its rows, and per index (by its
+// tree) its entries, the distinct values of each leading prefix of its
+// columns (a NULL counted as a value), and its leading column's most common
+// values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
+// of the name, or SET lexdb_planner = rules).
+pub type Est = record { pub rows: int; pub trees: []int; pub entries: []int; pub dist: [][]int; pub cm: []Common; pub lo: []float; pub hi: []float; pub span: []bool; pub samp: []str;
+                    pub cols: []str; pub cnd: []int }
+
+// An index's leading column (optimizer 23): its entries, its distinct values, and its
+// most common values (their encoded index parts) with their exact counts:
+// those above the average, at most COMMON_MAX. d -1: unknown.
+pub type Common = record { pub entries: int; pub d: int; pub keys: []str; pub cnts: []int }
+
+// The common values kept per index at most (optimizer 23).
+pub const COMMON_MAX: int = 16
+
+// The rows an index path with eqs leading equalities is expected to read, the
+// first equal to key ("" unknown): with one equality, by the common values;
+// else its entries over the distinct values of that prefix. -1 unknown.
+pub fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
+    if es.rows < 0 || eqs <= 0 { return -1 }
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree && eqs <= len(es.dist[i]) {
+            if eqs == 1 { return rowsOf(&es.cm[i], key) }
+            let d = es.dist[i][eqs - 1]
+            if d > 0 { return (es.entries[i] + d - 1) / d }
+        }
+    }
+    return -1
+}
+
+// A copy of an index's common values, for a look (optimizer 23).
+pub fn (es: &Est) commonOf(tree: int): Common {
+    for i in 0..len(es.trees) {
+        if es.trees[i] == tree {
+            let c = &es.cm[i]
+            var n: []int = []
+            for x in c.cnts { append(mut &n, x) }
+            return Common{entries: c.entries, d: c.d, keys: lexdb_catalog.copyStrs(&c.keys), cnts: n}
+        }
+    }
+    return noCommon()
+}
+
+// An index's (or the primary key's, by the table's tree) entries; -1 none.
+pub fn (es: &Est) entriesOf(tree: int): int {
+    for i in 0..len(es.trees) { if es.trees[i] == tree { return es.entries[i] } }
+    return -1
+}
+
+pub fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []} }
+
+pub fn noCommon(): Common { return Common{entries: 0, d: -1, keys: [], cnts: []} }
+
+// The rows expected equal to key (an encoded index part; "" unknown): its
+// count when it is a common value, else the average of the other values.
+pub fn rowsOf(cm: &Common, key: &str): int {
+    if cm.d <= 0 { return -1 }
+    if len(key) > 0 && len(cm.keys) > 0 {
+        let k = key.toStr()
+        var inCommon = 0
+        for j in 0..len(cm.keys) {
+            if cm.keys[j] == k { return cm.cnts[j] }
+            inCommon += cm.cnts[j]
+        }
+        let rest = cm.d - len(cm.keys)
+        if rest <= 0 { return 0 }
+        return (cm.entries - inCommon + rest - 1) / rest
+    }
+    return (cm.entries + cm.d - 1) / cm.d
+}
+
+// ---- statistics (optimizer 20): ANALYZE's row per table, keyed "\x02stat\x00"
+// then the table's catalog key (with the other \x02 rows; it was \x05, the
+// roles' prefix since 9.81: optimizer 40), its text "tree;rows" then
+// ";indextree:entries:d1,d2,..." per index. The table's tree is in it, so
+// an older table of the same name's statistics are not used.
+fn statKey(name: &str): str { return "\x02stat\x00" + name }
+
+// A key's bytes as hex, and back (the statistics' text row).
+fn toHex(s: &str): str {
+    let digits = "0123456789abcdef"
+    var b = newStrBuf()
+    for i in 0..len(s) {
+        b.addByte(digits[int(s[i]) / 16])
+        b.addByte(digits[int(s[i]) % 16])
+    }
+    return b.toStr()
+}
+
+// The statistics' version: a row ANALYZE bumps, apart from the catalog's, so
+// that statements that read the catalog's version do not conflict with an
+// ANALYZE. It is read unnoted (getUnnoted), as the statistics are: they
+// change plans, never results. A prepared statement's plan is kept under it.
+const STAT_VERSION: str = "\x02stats"
+
+pub fn statVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
+    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, STAT_VERSION) {
+        Some(v) { return Ok(v) }
+        None { return Ok("0") }
+    }
+}
+
+// The statistics' version bumped: prepared statements are planned again.
+pub fn bumpVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
+    let v = try statVersion(st, txn)
+    try txn.put(lexdb_catalog.CATALOG, STAT_VERSION, &(lexdb_catalog.nextVersion(&v)))
+    return Ok(Unit{})
+}
+
+// The statistics of a table moved to a new catalog key (RENAME, SET SCHEMA).
+pub fn moveStats(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str, new: &str): Result[Unit, DbErr] {
+    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(old))) {
+        Some(v) {
+            txn.del(lexdb_catalog.CATALOG, &(statKey(old)))
+            try txn.put(lexdb_catalog.CATALOG, &(statKey(new)), &v)
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// The statistics of the table with catalog key name dropped (DROP, a
+// rewrite to a new tree).
+pub fn dropStats(txn: mut &lexdb_store.Txn, name: &str) { txn.del(lexdb_catalog.CATALOG, &(statKey(name))) }
+
+// A table's statistics as the transaction sees them (none when rules: SET
+// lexdb_planner = rules).
+// join: a table of a SELECT's join, whose order its rows decide (optimizer 26).
+pub fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: bool, rules: bool): Result[Est, DbErr] {
+    // the statistics choose between candidates: two indexes, or an index and
+    // a primary key of several columns (optimizer 24); or a join's order
+    let cands = len(t.indexes) + (if len(t.pk) >= 2 { 1 } else { 0 })
+    if rules || t.tree < 0 || (cands < 2 && !join) { return Ok(noEst()) }
+    let got = try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(&t.name)))
+    if got.isNone() { return Ok(noEst()) }
+    let v = got.unwrap()
+    let parts = strings.split(&v, ";")
+    if len(parts) < 2 || strings.parseIntOpt(&(parts[0].toStr())).unwrapOr(-1) != t.tree { return Ok(noEst()) }
+    var es = Est{rows: strings.parseIntOpt(&(parts[1].toStr())).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []}
+    for i in 2..len(parts) {
+        let f = strings.split(&parts[i], ":")
+        if len(f) == 2 && f[0] == "d" {
+            // the other columns' distinct values (optimizer 39)
+            for kv in strings.split(&f[1], ",") {
+                let eq = strings.indexOf(&kv, "=", 0)
+                if eq < 0 { continue }
+                append(mut &es.cols, lexdb_catalog.fromHex(&kv[0..eq]))
+                append(mut &es.cnd, strings.parseIntOpt(&(kv[eq + 1..len(kv)].toStr())).unwrapOr(-1))
+            }
+            continue
+        }
+        if len(f) < 3 { continue }
+        var ds: []int = []
+        for x in strings.split(&f[2], ",") { append(mut &ds, strings.parseIntOpt(&(x.toStr())).unwrapOr(0)) }
+        let ents = strings.parseIntOpt(&(f[1].toStr())).unwrapOr(0)
+        var cm = Common{entries: ents, d: if len(ds) > 0 { ds[0] } else { -1 }, keys: [], cnts: []}
+        if len(f) >= 4 && len(f[3]) > 0 {
+            for kv in strings.split(&f[3], ",") {
+                let eq = strings.indexOf(&kv, "=", 0)
+                if eq < 0 { continue }
+                append(mut &cm.keys, lexdb_catalog.fromHex(&kv[0..eq]))
+                append(mut &cm.cnts, strings.parseIntOpt(&(kv[eq + 1..len(kv)].toStr())).unwrapOr(0))
+            }
+        }
+        append(mut &es.trees, strings.parseIntOpt(&(f[0].toStr())).unwrapOr(-1))
+        append(mut &es.entries, ents)
+        append(mut &es.dist, ds)
+        append(mut &es.cm, cm)
+        // its leading column's least and greatest, as numbers (optimizer 29)
+        var lo = 0.0f
+        var hi = 0.0f
+        var span = false
+        if len(f) >= 6 {
+            match math.parse(&(f[4].toStr())) {
+                Some(a) {
+                    match math.parse(&(f[5].toStr())) {
+                        Some(b) {
+                            lo = a
+                            hi = b
+                            span = true
+                        }
+                        None {}
+                    }
+                }
+                None {}
+            }
+        }
+        append(mut &es.lo, lo)
+        append(mut &es.hi, hi)
+        append(mut &es.span, span)
+        // the samples as text, parsed only when a range needs them (most
+        // plannings do not: optimizer 37)
+        append(mut &es.samp, if len(f) >= 7 { f[6].toStr() } else { "" })
+    }
+    return Ok(es)
+}
+
+// ANALYZE's work (lexdb_exec.analyzeStmt names the tables): the statistics
+// of tabs counted from a full read and written in txn; deadline the
+// statement's timeout (monotonic ns, 0 none). The rows are read on a
+// snapshot of their own, so the statement's reads are only the catalog's
+// and it does not conflict with the writes it does not see (optimizer 20).
+pub fn analyze(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tabs: &[]Table, deadline: int, up: &Up): Result[Unit, DbErr] {
+    var snap = try st.beginSnapshot()
+    var failed: []DbErr = []
+    var counted: []int = []             // per table: its rows, its time
+    var c0s: [][]int = []               // its counts when it began
+    for t in tabs {
+        append(mut &c0s, acCounts(st, t.tree))
+        let t0 = time.monotonicNs()
+        match analyzeTable(st, txn, mut &snap, &t, deadline, up) {
+            Ok(n) {
+                append(mut &counted, n)
+                append(mut &counted, time.monotonicNs() - t0)
+            }
+            Err(x) {
+                append(mut &failed, x)
+                break
+            }
+        }
+    }
+    st.endSnapshot(&snap)
+    if len(failed) > 0 { return Err(failed[0]) }
+    // the automatic statistics' counts start again (optimizer 44); not in a
+    // block, which may roll back (the automatic one may then come early)
+    if !txn.inBlock() {
+        for i in 0..len(tabs) { acDone(st, &tabs[i], counted[2 * i], &c0s[i], false, counted[2 * i + 1]) }
+    }
+    return Ok(Unit{})
+}
+
+// A value as a number for range estimates (optimizer 29): numbers, dates,
+// times and timestamps (their counts of days or microseconds); None else.
+pub fn spanNum(v: &Val): Option[float] {
+    match v {
+        Val.Int(n) { return Some(float(n)) }
+        Val.Num(d) { return Some(d.toFloat()) }
+        Val.Float(x) { return Some(x) }
+        Val.Real(x) { return Some(x) }
+        Val.Date(n) { return Some(float(n)) }
+        Val.Time(n) { return Some(float(n)) }
+        Val.Ts(n) { return Some(float(n)) }
+        Val.Tstz(n) { return Some(float(n)) }
+        else { return None }
+    }
+}
+
+// An entry's least and greatest leading values, ":min:max" when they were
+// all numbers (n > 0), else "::" (the fields kept, so the samples' follow).
+fn spanText(n: int, lo: float, hi: float): str {
+    if n <= 0 { return "::" }
+    return ":" + lexdb_float.fmt8(lo) + ":" + lexdb_float.fmt8(hi)
+}
+
+// ---- samples (optimizer 37), the rest of SQLite's stat4: per index and
+// primary key, up to SAMPLES keys of the leading column spread evenly over
+// its rows, each with the rows below it and equal to it, and the rows not
+// NULL. A range's rows are counted from them: the samples it covers whole,
+// and half of each gap it ends in (SQLite's); so a range of skewed or
+// clustered values is estimated as it is, any type (keys compare as their
+// encoded index parts, in the index's order).
+
+const SAMPLES: int = 24
+
+// nums: the keys as numbers when the column's are (numeric), for
+// interpolating within a gap.
+type Samp = record { nn: int; keys: []str; lt: []int; eq: []int; nums: []float; numeric: bool }
+
+fn noSamp(): Samp { return Samp{nn: 0, keys: [], lt: [], eq: [], nums: [], numeric: false} }
+
+// The primary key's sampler: its leading values come in order, a run each;
+// every stride-th run is kept, the stride doubling (every other one
+// dropped) when 2 x SAMPLES are kept.
+type Sampler = record { keys: []str; lt: []int; eq: []int; nums: []float; stride: int; runs: int }
+
+fn newSampler(): Sampler { return Sampler{keys: [], lt: [], eq: [], nums: [], stride: 1, runs: 0} }
+
+fn (sp: mut &Sampler) add(key: &str, lt: int, eq: int, num: float) {
+    if sp.runs % sp.stride == 0 {
+        append(mut &sp.keys, key.toStr())
+        append(mut &sp.lt, lt)
+        append(mut &sp.eq, eq)
+        append(mut &sp.nums, num)
+        if len(sp.keys) > 2 * SAMPLES {
+            var k: []str = []
+            var l: []int = []
+            var q: []int = []
+            var u: []float = []
+            for i in 0..len(sp.keys) {
+                if i % 2 == 0 {
+                    append(mut &k, replace(mut &sp.keys[i], ""))
+                    append(mut &l, sp.lt[i])
+                    append(mut &q, sp.eq[i])
+                    append(mut &u, sp.nums[i])
+                }
+            }
+            sp.keys = k
+            sp.lt = l
+            sp.eq = q
+            sp.nums = u
+            sp.stride = sp.stride * 2
+        }
+    }
+    sp.runs += 1
+}
+
+fn (sp: mut &Sampler) done(rows: int, numeric: bool): Samp {
+    return Samp{nn: rows, keys: replace(mut &sp.keys, []), lt: replace(mut &sp.lt, []), eq: replace(mut &sp.eq, []),
+                nums: replace(mut &sp.nums, []), numeric: numeric}
+}
+
+// An index's samples from ANALYZE's count of its leading values (none when
+// the count stopped at ANALYZE_DISTINCT_MAX): the key holding each
+// (k + 1/2) / SAMPLES of its rows not NULL.
+fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Result[Samp, DbErr] {
+    if m.size() >= ANALYZE_DISTINCT_MAX { return Ok(noSamp()) }
+    var nb = newStrBuf()
+    lexdb_access.encIdxPart(mut &nb, &Val.Null)
+    let nullKey = nb.toStr()
+    var keys: []str = []
+    for x in 0..m.size() {
+        let k = m.keyAt(x).toStr()
+        if k != nullKey { append(mut &keys, k) }
+    }
+    try sortTakingTurns(mut &keys)
+    var nn = 0
+    for k in keys { nn += m.getOr(&k, 0) }
+    var out = Samp{nn: nn, keys: [], lt: [], eq: [], nums: [], numeric: numeric}
+    if nn == 0 { return Ok(out) }
+    var lt = 0
+    var next = 0
+    for k in keys {
+        let c = m.getOr(&k, 0)
+        var took = false
+        while next < SAMPLES && float(lt + c) > (float(next) + 0.5f) * float(nn) / float(SAMPLES) {
+            if !took {
+                append(mut &out.keys, k.toStr())
+                append(mut &out.lt, lt)
+                append(mut &out.eq, c)
+                append(mut &out.nums, vm.getOr(&k, 0.0f))
+                took = true
+            }
+            next += 1
+        }
+        lt += c
+    }
+    return Ok(out)
+}
+
+// Keys sorted, taking turns (9.15): sorted in runs of SORT_RUN, a yield
+// after each, then merged, a yield every SORT_RUN keys. An index of 100,000
+// distinct leading values took 42 ms to sort at the end of its analysis,
+// holding every session (optimizer 44).
+const SORT_RUN: int = 4096
+
+fn sortTakingTurns(keys: mut &[]str): Result[Unit, DbErr] {
+    let n = len(keys)
+    if n <= SORT_RUN {
+        collections.sortBy(keys, fn(a: &str, b: &str): int { return a.cmp(b) })
+        return Ok(Unit{})
+    }
+    var runs: [][]str = []
+    var at = 0
+    while at < n {
+        var run: []str = []
+        for k in at..min(n, at + SORT_RUN) { append(mut &run, replace(mut &keys[k], "")) }
+        collections.sortBy(mut &run, fn(a: &str, b: &str): int { return a.cmp(b) })
+        append(mut &runs, run)
+        at += SORT_RUN
+        if task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
+    }
+    var heads: []int = array(len(runs), 0)
+    var out: []str = withCapacity(n)
+    while len(out) < n {
+        var best = -1
+        for r in 0..len(runs) {
+            if heads[r] < len(runs[r]) && (best < 0 || runs[r][heads[r]] < runs[best][heads[best]]) { best = r }
+        }
+        append(mut &out, replace(mut &runs[best][heads[best]], ""))
+        heads[best] += 1
+        if len(out) % SORT_RUN == 0 && task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
+    }
+    keys = out
+    return Ok(Unit{})
+}
+
+// "nn/hex~lt~eq[~number],..." ("" none; the numbers when numeric).
+fn sampText(sp: &Samp): str {
+    if len(sp.keys) == 0 { return "" }
+    var parts: []str = []
+    for i in 0..len(sp.keys) {
+        append(mut &parts, toHex(&sp.keys[i]) + "~" + sp.lt[i].toStr() + "~" + sp.eq[i].toStr() +
+                          (if sp.numeric { "~" + lexdb_float.fmt8(sp.nums[i]) } else { "" }))
+    }
+    return sp.nn.toStr() + "/" + strings.join(&parts, ",")
+}
+
+fn parseSamp(t: &str): Samp {
+    let sl = strings.indexOf(&t, "/", 0)
+    if sl < 0 { return noSamp() }
+    var out = Samp{nn: strings.parseIntOpt(&(t[0..sl].toStr())).unwrapOr(0), keys: [], lt: [], eq: [], nums: [], numeric: true}
+    for part in strings.split(&t[sl + 1..len(t)], ",") {
+        let f = strings.split(&part, "~")
+        if len(f) < 3 { continue }
+        append(mut &out.keys, lexdb_catalog.fromHex(&f[0]))
+        append(mut &out.lt, strings.parseIntOpt(&(f[1].toStr())).unwrapOr(0))
+        append(mut &out.eq, strings.parseIntOpt(&(f[2].toStr())).unwrapOr(0))
+        var x = 0.0f
+        if len(f) >= 4 {
+            match math.parse(&(f[3].toStr())) {
+                Some(v) { x = v }
+                None { out.numeric = false }
+            }
+        } else {
+            out.numeric = false
+        }
+        append(mut &out.nums, x)
+    }
+    return out
+}
+
+// The rows below key (an encoded leading part, num its number when has),
+// and equal to it when incl: a sample's own counts when key is one; else the
+// rows to the gap it falls in and a part of the gap: by the numbers when the
+// samples have them (the gap's ends the samples', or the column's least and
+// greatest, span), else 1/3 for a lower bound and 2/3 for an upper one
+// (SQLite's).
+fn (sp: &Samp) below(key: &str, num: float, has: bool, incl: bool, upper: bool, span: bool, mn: float, mx: float): float {
+    var at = -1
+    for i in 0..len(sp.keys) { if sp.keys[i] <= key { at = i } }
+    if at >= 0 && sp.keys[at] == key { return float(sp.lt[at] + (if incl { sp.eq[at] } else { 0 })) }
+    let from = if at >= 0 { sp.lt[at] + sp.eq[at] } else { 0 }
+    let to = if at + 1 < len(sp.keys) { sp.lt[at + 1] } else { sp.nn }
+    var frac = if upper { 2.0f / 3.0f } else { 1.0f / 3.0f }
+    // NaN sorts above every number, infinity above every finite one: the
+    // whole gap; an infinite end is no number to interpolate by (optimizer 39)
+    if sp.numeric && has && (num.isNaN() || (!num.isFinite() && num > 0.0f)) {
+        frac = 1.0f
+    } else if sp.numeric && has && !num.isFinite() {
+        frac = 0.0f
+    } else if sp.numeric && has && num.isFinite() {
+        let a = if at >= 0 { sp.nums[at] } else if span { mn } else { num }
+        let b = if at + 1 < len(sp.keys) { sp.nums[at + 1] } else if span { mx } else { num }
+        if b > a && a.isFinite() && b.isFinite() {
+            frac = (num - a) / (b - a)
+            if frac < 0.0f { frac = 0.0f }
+            if frac > 1.0f { frac = 1.0f }
+        }
+    }
+    return float(from) + float(to - from) * frac
+}
+
+// The share of the entries (entries) between a range's bounds (lower ">"
+// or ">=", upper "<" or "<=", keys their encoded parts) by the samples; -1
+// when there are none.
+fn (sp: &Samp) rangeShare(hasLo: bool, loKey: &str, loNum: float, loIncl: bool, hasHi: bool, hiKey: &str, hiNum: float, hiIncl: bool,
+                          nums: bool, span: bool, mn: float, mx: float, entries: int): float {
+    if len(sp.keys) == 0 || entries <= 0 { return -1.0f }
+    let a = if hasLo { sp.below(loKey, loNum, nums, !loIncl, false, span, mn, mx) } else { 0.0f }
+    let b = if hasHi { sp.below(hiKey, hiNum, nums, hiIncl, true, span, mn, mx) } else { float(sp.nn) }
+    let r = if b > a { b - a } else { 0.0f }
+    return (if r > 1.0f { r } else { 1.0f }) / float(entries)
+}
+
+// The share of the entries of a statistics' index or key (e, its place in
+// es) between a range's bounds by its samples (Samp.rangeShare); -1 when
+// it has none.
+pub fn (es: &Est) sampShare(e: int, hasLo: bool, loKey: &str, loNum: float, loIncl: bool, hasHi: bool, hiKey: &str, hiNum: float,
+                            hiIncl: bool, nums: bool): float {
+    if len(es.samp[e]) == 0 { return -1.0f }
+    return parseSamp(&es.samp[e]).rangeShare(hasLo, loKey, loNum, loIncl, hasHi, hiKey, hiNum, hiIncl, nums,
+                                             es.span[e], es.lo[e], es.hi[e], es.entries[e])
+}
+
+// The distinct values of a column no key or index leads with (optimizer
+// 39), estimated in bounded memory: the KMV_K least hashes of its values
+// (Bar-Yossef et al. 2002, "k minimum values"): when there are fewer, their
+// number is the count; else (KMV_K - 1) / the KMV_K-th least as a share of
+// the hashes' range, within about 1 / sqrt(KMV_K - 2) (6%). The hash is
+// SipHash under a fixed key, so the same rows give the same count.
+const KMV_K: int = 256
+
+type Kmv = record { hs: []u64 }
+
+fn (k: mut &Kmv) add(v: &str) {
+    let h = hash.sipHash13(u64(0x6c657864), u64(0x62737461), v)
+    let n = len(k.hs)
+    if n >= KMV_K && h >= k.hs[n - 1] { return }
+    var lo = 0
+    var hi = n
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if k.hs[mid] < h { lo = mid + 1 } else { hi = mid }
+    }
+    if lo < n && k.hs[lo] == h { return }
+    append(mut &k.hs, h)
+    var j = n
+    while j > lo {
+        k.hs[j] = k.hs[j - 1]
+        j -= 1
+    }
+    k.hs[lo] = h
+    if len(k.hs) > KMV_K { let dropped = pop(mut &k.hs) }
+}
+
+fn (k: &Kmv) count(): int {
+    if len(k.hs) < KMV_K { return len(k.hs) }
+    let top = int(k.hs[KMV_K - 1] >> 11)      // 53 bits
+    return int(float(KMV_K - 1) * 9007199254740992.0f / float(top + 1))
+}
+
+// Distinct values counted per prefix at most: past it the count stays here, a
+// lower bound, which keeps ANALYZE's memory bounded (the estimate it gives is
+// then an upper bound).
+const ANALYZE_DISTINCT_MAX: int = 100000
+
+// Keeps key with count c among the COMMON_MAX largest counts (keys and
+// cnts in count order, the largest first).
+fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
+    var at = len(cnts)
+    while at > 0 && cnts[at - 1] < c { at -= 1 }
+    if at >= COMMON_MAX { return }
+    append(keys, key.toStr())
+    append(cnts, c)
+    var j = len(cnts) - 1
+    while j > at {
+        let kk = replace(mut &keys[j - 1], "")
+        keys[j - 1] = replace(mut &keys[j], kk)
+        let cc = cnts[j - 1]
+        cnts[j - 1] = cnts[j]
+        cnts[j] = cc
+        j -= 1
+    }
+    if len(cnts) > COMMON_MAX {
+        let dk = pop(keys)
+        let dc = pop(cnts)
+    }
+}
+
+// Table t's statistics counted from its rows on snap, written in txn; its
+// rows. deadline: the statement's timeout (0 none). It takes turns (9.15)
+// as a statement does: after lexdb_base.TURN_NS of reading, the other
+// sessions run (an ANALYZE of a million rows held every session for over a
+// second; the automatic one runs beside them: optimizer 44).
+fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
+                deadline: int, up: &Up): Result[int, DbErr] {
+    var rows = 0
+    var turnEnd = time.monotonicNs() + lexdb_base.TURN_NS
+    var entries: []int = []
+    var seen: [][]Map[str, int] = []
+    // the leading column's least and greatest values as numbers, when they
+    // are numbers (dates and times too), for range estimates (optimizer 29)
+    var mins: []float = []
+    var maxs: []float = []
+    var nums: []int = []                // per index: values counted as numbers; -1 one was not a number
+    var keyNums: []Map[str, float] = [] // per index: its leading keys' numbers, for the samples (optimizer 37)
+    for ix in t.indexes {
+        var ms: []Map[str, int] = []
+        for j in 0..len(ix.cols) { append(mut &ms, newMap()) }
+        append(mut &seen, ms)
+        append(mut &entries, 0)
+        append(mut &mins, 0.0f)
+        append(mut &maxs, 0.0f)
+        append(mut &nums, 0)
+        append(mut &keyNums, newMap())
+    }
+    // the columns no key or index leads with: their distinct values
+    // (optimizer 39)
+    var others: []int = []
+    var sketches: []Kmv = []
+    for ci in 0..len(t.cols) {
+        var leads = len(t.pk) > 0 && t.pk[0] == ci
+        for ix in t.indexes { if len(ix.cols) > 0 && ix.cols[0] == ci && ix.pred.isNone() { leads = true } }
+        if leads { continue }
+        append(mut &others, ci)
+        append(mut &sketches, Kmv{hs: []})
+    }
+    var pkMin = 0.0f
+    var pkMax = 0.0f
+    var pkNums = 0
+    let all: []bool = []
+    let sc = lexdb_access.wholeScan()
+    // the primary key (optimizer 24; of one column too, optimizer 29): rows
+    // come in its order, so each prefix's distinct values are counted where
+    // it changes, its leading column's values by their runs (of several
+    // columns), and its least and greatest are the first row's and the last's
+    let pkn = len(t.pk)
+    var pkPrev: []str = array(pkn, "")
+    var pkDist: []int = array(pkn, 0)
+    var run = 0
+    var runKey = ""
+    var runLt = 0                       // the rows before the run (optimizer 37)
+    var runNum = 0.0f                   // its leading value as a number
+    var pkSamp = newSampler()
+    var pkKeys: []str = []
+    var pkCnts: []int = []
+    var cur = lexdb_access.newCursor()
+    while !cur.done {
+        let now = time.monotonicNs()
+        if deadline != 0 && now > deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        if now > turnEnd {
+            match task.yield() {
+                Ok(_) {}
+                Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+            }
+            turnEnd = time.monotonicNs() + lexdb_base.TURN_NS
+        }
+        var batch: [][]Val = []
+        try lexdb_access.fetch(st, snap, &lexdb_catalog.relOf(t), -1, false, &sc, &all, mut &cur, mut &batch)
+        for r in batch {
+            rows += 1
+            // (a batch's rows counted take milliseconds with several indexes)
+            if rows % 128 == 0 && time.monotonicNs() > turnEnd {
+                match task.yield() {
+                    Ok(_) {}
+                    Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
+                }
+                turnEnd = time.monotonicNs() + lexdb_base.TURN_NS
+            }
+            for x in 0..len(others) {
+                if lexdb_ops.isNull(&r[others[x]]) { continue }
+                var ob = newStrBuf()
+                lexdb_access.encIdxPart(mut &ob, &r[others[x]])
+                sketches[x].add(&ob.toStr())
+            }
+            if pkn > 0 {
+                var b = newStrBuf()
+                var changed = rows == 1
+                for j in 0..pkn {
+                    lexdb_access.encIdxPart(mut &b, &r[t.pk[j]])
+                    let k = b.toStr()
+                    if changed || k != pkPrev[j] {
+                        if j == 0 && rows > 1 {
+                            if pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
+                            pkSamp.add(&runKey, runLt, run, runNum)
+                            runLt = rows - 1
+                            run = 0
+                        }
+                        if j == 0 { runNum = spanNum(&r[t.pk[0]]).unwrapOr(0.0f) }
+                        if j == 0 { runKey = k.toStr() }
+                        changed = true
+                        pkDist[j] += 1
+                        pkPrev[j] = k
+                    }
+                }
+                run += 1
+                if pkNums >= 0 {
+                    match spanNum(&r[t.pk[0]]) {
+                        Some(x) {
+                            if pkNums == 0 { pkMin = x }
+                            pkMax = x
+                            pkNums += 1
+                        }
+                        None { if !lexdb_ops.isNull(&r[t.pk[0]]) { pkNums = -1 } }
+                    }
+                }
+            }
+            for i in 0..len(t.indexes) {
+                if !(try up.inIndex(t, &t.indexes[i], &r)) { continue }
+                entries[i] += 1
+                var lnum = 0.0f
+                var lhas = false
+                if nums[i] >= 0 && len(t.indexes[i].cols) > 0 {
+                    let lv0 = try up.idxVal(t, &t.indexes[i], 0, &r)
+                    match spanNum(&lv0) {
+                        Some(x) {
+                            if nums[i] == 0 || x < mins[i] { mins[i] = x }
+                            if nums[i] == 0 || x > maxs[i] { maxs[i] = x }
+                            nums[i] += 1
+                            lnum = x
+                            lhas = true
+                        }
+                        None { if !lexdb_ops.isNull(&lv0) { nums[i] = -1 } }
+                    }
+                }
+                var b = newStrBuf()
+                for j in 0..len(t.indexes[i].cols) {
+                    lexdb_access.encIdxPart(mut &b, &(try up.idxVal(t, &t.indexes[i], j, &r)))
+                    let k = b.toStr()
+                    // the leading column's values are counted (its common values, optimizer 23)
+                    let n = if j == 0 { seen[i][j].getOr(&k, 0) } else { 0 }
+                    if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX {
+                        if j == 0 && n == 0 && lhas { keyNums[i].put(k.toStr(), lnum) }
+                        seen[i][j].put(k, n + 1)
+                    }
+                }
+            }
+        }
+    }
+    var out = newStrBuf()
+    out.add(&(t.tree.toStr() + ";" + rows.toStr()))
+    if pkn > 0 {
+        // the primary key's, under the table's tree
+        if rows > 0 && pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
+        if rows > 0 { pkSamp.add(&runKey, runLt, run, runNum) }
+        var ds: []str = []
+        for d in pkDist { append(mut &ds, d.toStr()) }
+        out.add(&(";" + t.tree.toStr() + ":" + rows.toStr() + ":" + strings.join(&ds, ",")))
+        let avg = if pkDist[0] > 0 { rows / pkDist[0] } else { 0 }
+        var parts: []str = []
+        for x in 0..len(pkKeys) { if pkCnts[x] > avg { append(mut &parts, toHex(&pkKeys[x]) + "=" + pkCnts[x].toStr()) } }
+        out.add(&(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax) + ":" + sampText(&pkSamp.done(rows, pkNums > 0))))
+    }
+    for i in 0..len(t.indexes) {
+        var ds: []str = []
+        for m in seen[i] { append(mut &ds, m.size().toStr()) }
+        out.add(&(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ",")))
+        // the most common values of its leading column: above the average,
+        // at most COMMON_MAX, as hex=count (optimizer 23)
+        if len(seen[i]) > 0 && seen[i][0].size() > 0 {
+            let m = &seen[i][0]
+            let avg = entries[i] / m.size()
+            var keys: []str = []
+            var cnts: []int = []
+            for x in 0..m.size() {
+                let c = m.getOr(m.keyAt(x), 0)
+                if c <= avg { continue }
+                keepCommon(mut &keys, mut &cnts, m.keyAt(x), c)
+            }
+            var parts: []str = []
+            for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
+            out.add(&(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&(try mapSamples(m, &keyNums[i], nums[i] > 0)))))
+        } else {
+            out.add(&(":" + spanText(0, 0.0f, 0.0f) + ":"))
+        }
+    }
+    if len(others) > 0 {
+        // the other columns' distinct values, hexname=count
+        var parts: []str = []
+        for x in 0..len(others) { append(mut &parts, toHex(&t.cols[others[x]].name) + "=" + sketches[x].count().toStr()) }
+        out.add(&(";d:" + strings.join(&parts, ",")))
+    }
+    try txn.put(lexdb_catalog.CATALOG, &(statKey(&t.name)), &(out.toStr()))
+    return Ok(rows)
+}
+
+// ---- automatic statistics (optimizer 44), as PostgreSQL's autovacuum
+// analyzes: a table whose rows changed since its last ANALYZE pass
+// AUTO_THRESHOLD + AUTO_SCALE_PCT% of its rows then (autovacuum_analyze_
+// threshold 50, autovacuum_analyze_scale_factor 0.1) is analyzed again, by
+// a task of its own (autoAnalyzer) that takes turns with the sessions.
+// - Counted: each row an INSERT, UPDATE or DELETE writes (COPY, a
+//   cascade, ON CONFLICT's too: storeRow, updRow, delRow), per session
+//   while its transaction runs; added to the table's count when it
+//   commits, dropped when it does not (as PostgreSQL's changed tuples).
+//   Temporary tables are not counted, as autovacuum does not see them.
+// - Kept in the store's memo, not the catalog: counts and times are lost
+//   at a restart (PostgreSQL's after a crash). The rows at the last
+//   analysis are then read from the statistics' row.
+// - Off: LEXDB_AUTOANALYZE=off for the process (nothing counted, no task);
+//   SET lexdb_autoanalyze = off for a session (its changes not counted).
+//   A replica never analyzes: its statistics are the master's.
+// Statistics change plans only, never results.
+
+const AUTO_THRESHOLD: int = 50
+const AUTO_SCALE_PCT: int = 10
+const AUTO_NAP_MS: int = 1000              // between looks (autovacuum_naptime is 60 s)
+const AUTO_COOL: int = 9                   // after an analysis of d ms, the table waits AUTO_COOL x d: at most a tenth of the time
+const AUTO_QUIET_NS: int = 300000000       // a table is analyzed once no commit has changed it for this long ...
+const AUTO_WAIT_NS: int = 30000000000      // ... or once it has waited this long for that
+const AUTO_SOON_MS: int = 200              // the next look's nap while one waits
+
+// The rows counted for one session and table, before they go to the memo
+// (chgFlush): a row's count is a few integer operations. Globals must be of
+// copy types (and the SQL runs on one thread).
+var CHG_SESS: int = -1
+var CHG_TREE: int = -1
+var CHG_I: int = 0
+var CHG_U: int = 0
+var CHG_D: int = 0
+var AUTO_STATE: int = 0                    // 0 not yet read, 1 on, 2 off
+
+// Automatic statistics on or off for the process (lexdb's LEXDB_AUTOANALYZE).
+pub fn setAutoAnalyze(on: bool) { AUTO_STATE = if on { 1 } else { 2 } }
+
+fn autoAnalyzeOn(): bool {
+    if AUTO_STATE == 0 {
+        AUTO_STATE = 1
+        match os.env("LEXDB_AUTOANALYZE") {
+            Some(v) {
+                let x = strings.toLowerAscii(&v)
+                if x == "off" || x == "0" || x == "false" || x == "no" { AUTO_STATE = 2 }
+            }
+            None {}
+        }
+    }
+    return AUTO_STATE == 1
+}
+
+const AC_DUE: str = "\x00acdue"
+const AC_SOON: str = "\x00acsoon"
+fn acPendKey(sess: int): str { return "\x00acp\x00" + sess.toStr() }
+fn acKey(tree: int): str { return "\x00ac\x00" + tree.toStr() }
+fn acStateKey(tree: int): str { return "\x00acs\x00" + tree.toStr() }
+
+// Space-separated integers, n of them (0 those missing).
+fn intsOf(v: &str, n: int): []int {
+    var out: []int = array(n, 0)
+    let f = strings.split(&v, " ")
+    for i in 0..min(n, len(f)) { out[i] = strings.parseIntOpt(&(f[i].toStr())).unwrapOr(0) }
+    return out
+}
+
+fn intsText(xs: &[]int): str {
+    var parts: []str = []
+    for x in xs { append(mut &parts, x.toStr()) }
+    return strings.join(&parts, " ")
+}
+
+// A row of table t written by session sess's transaction: kind 0 inserted,
+// 1 updated, 2 deleted.
+pub fn noteChg(st: &lexdb_store.Store, sess: int, t: &Table, kind: int) {
+    if AUTO_STATE == 2 { return }
+    if sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || lexdb_catalog.tempRel(&t.name) || sess <= 0 { return }
+        chgFlush(st)
+        CHG_SESS = sess
+        CHG_TREE = t.tree
+    }
+    if kind == 0 { CHG_I += 1 } else if kind == 1 { CHG_U += 1 } else { CHG_D += 1 }
+}
+
+// Rows of table t deleted: n of them counted for the automatic statistics.
+pub fn noteChgN(st: &lexdb_store.Store, sess: int, t: &Table, n: int) {
+    if AUTO_STATE == 2 { return }
+    if sess != CHG_SESS || t.tree != CHG_TREE {
+        if !autoAnalyzeOn() || lexdb_catalog.tempRel(&t.name) || sess <= 0 { return }
+        chgFlush(st)
+        CHG_SESS = sess
+        CHG_TREE = t.tree
+    }
+    CHG_D += n
+}
+
+// A table's counts (acKey): its rows changed since its last analysis;
+// inserted, updated, deleted since the store opened; inserted less deleted
+// since its last analysis; when a commit last changed it (monotonic ns).
+fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memo.get(&acKey(tree)).unwrapOr(""), 6) }
+
+// The rows counted so far into their session's pending counts:
+// "tree ins upd del" per table, ";" between.
+fn chgFlush(st: &lexdb_store.Store) {
+    if CHG_SESS < 0 { return }
+    let k = acPendKey(CHG_SESS)
+    let add: []int = [CHG_TREE, CHG_I, CHG_U, CHG_D]
+    var parts: []str = []
+    var found = false
+    match st.memo.get(&k) {
+        Some(v) {
+            for p in strings.split(&v, ";") {
+                var xs = intsOf(&p.toStr(), 4)
+                if xs[0] == CHG_TREE {
+                    for i in 1..4 { xs[i] += add[i] }
+                    found = true
+                }
+                append(mut &parts, intsText(&xs))
+            }
+        }
+        None {}
+    }
+    if !found { append(mut &parts, intsText(&add)) }
+    st.memo.put(&k, &strings.join(&parts, ";"))
+    CHG_SESS = -1
+    CHG_TREE = -1
+    CHG_I = 0
+    CHG_U = 0
+    CHG_D = 0
+}
+
+// A session's transaction ended: its counts added to its tables' (keep:
+// it committed, and the session counts its changes), or dropped.
+pub fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
+    if AUTO_STATE == 2 { return }
+    if CHG_SESS == sess { chgFlush(st) }
+    let k = acPendKey(sess)
+    let got = st.memo.get(&k)
+    if got.isNone() { return }
+    st.memo.del(&k)
+    if !keep { return }
+    for p in strings.split(&got.unwrap(), ";") {
+        let xs = intsOf(&p.toStr(), 4)
+        // the table's: changed since its last analysis, then inserted, updated, deleted
+        var c = intsOf(&st.memo.get(&acKey(xs[0])).unwrapOr(""), 6)
+        c[0] += xs[1] + xs[2] + xs[3]
+        for i in 1..4 { c[i] += xs[i] }
+        c[4] += xs[1] - xs[3]
+        c[5] = time.monotonicNs()
+        st.memo.put(&acKey(xs[0]), &intsText(&c))
+    }
+    st.memo.put(&AC_DUE, &"1")
+}
+
+// A table's analysis state: the rows at its last analysis (-1 not known),
+// when (lexdb_time.nowTstz(); 0 never) by ANALYZE and automatically, how
+// many of each, the time it took (ns, the automatic ones' in all), until
+// when (monotonic ns) it waits before the next automatic one, and since
+// when it has waited for its writes to pause (0 not waiting).
+type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int; since: int }
+
+fn acState(st: &lexdb_store.Store, tree: int): AcState {
+    match st.memo.get(&acStateKey(tree)) {
+        Some(v) {
+            let xs = intsOf(&v, 9)
+            return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7], since: xs[8]}
+        }
+        None { return AcState{base: -1, last: 0, lastAuto: 0, n: 0, nAuto: 0, ns: 0, nsAuto: 0, cool: 0, since: 0} }
+    }
+}
+
+fn acPut(st: &lexdb_store.Store, tree: int, a: &AcState) {
+    st.memo.put(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool, a.since]))
+}
+
+// Table t analyzed (auto: by the task), its rows counted; c0 its counts
+// when the analysis began (acKey's: changes since then stay counted); ns
+// its time.
+fn acDone(st: &lexdb_store.Store, t: &Table, rows: int, c0: &[]int, auto: bool, ns: int) {
+    var c = intsOf(&st.memo.get(&acKey(t.tree)).unwrapOr(""), 6)
+    c[0] = max(0, c[0] - c0[0])
+    c[4] = c[4] - c0[4]
+    st.memo.put(&acKey(t.tree), &intsText(&c))
+    var a = acState(st, t.tree)
+    a.base = rows
+    a.since = 0
+    if auto {
+        a.lastAuto = lexdb_time.nowTstz()
+        a.nAuto += 1
+        a.nsAuto += ns
+    } else {
+        a.last = lexdb_time.nowTstz()
+        a.n += 1
+        a.ns += ns
+    }
+    acPut(st, t.tree, &a)
+}
+
+// The rows table t had at its last ANALYZE, from its statistics' row (0
+// none: PostgreSQL's reltuples of a table never analyzed counts as 0).
+fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[int, DbErr] {
+    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(&t.name))) {
+        Some(v) {
+            let parts = strings.split(&v, ";")
+            if len(parts) >= 2 && strings.parseIntOpt(&(parts[0].toStr())).unwrapOr(-1) == t.tree {
+                return Ok(max(0, strings.parseIntOpt(&(parts[1].toStr())).unwrapOr(0)))
+            }
+        }
+        None {}
+    }
+    return Ok(0)
+}
+
+// pg_stat_user_tables' figures for table t (optimizer 44): its counts of
+// changed rows, its analyses, and its rows at the last one.
+pub fn tabStat(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[TabStat, DbErr] {
+    let c = intsOf(&st.memo.get(&acKey(t.tree)).unwrapOr(""), 5)
+    let a = acState(st, t.tree)
+    let base = if a.base >= 0 { a.base } else { try statRows(st, txn, t) }
+    return Ok(TabStat{c0: c[0], c1: c[1], c2: c[2], c3: c[3], c4: c[4], base: a.base, last: a.last, lastAuto: a.lastAuto, n: a.n,
+                      nAuto: a.nAuto, ns: a.ns, nsAuto: a.nsAuto, rows: base})
+}
+
+// One look of the automatic statistics: each table whose changes passed
+// its threshold analyzed, in a transaction of its own; the number analyzed.
+// A table analyzed lately waits (AUTO_COOL); one whose analysis failed (a
+// conflict, a snapshot gone too old beside heavy writes) is tried at a
+// later look. Nothing on a replica.
+pub fn autoAnalyzeStep(st: &lexdb_store.Store, up: &Up): Result[int, DbErr] {
+    if st.follower().isSome() || !autoAnalyzeOn() { return Ok(0) }
+    st.memo.del(&AC_DUE)
+    let r = autoLook(st, up)
+    // (an error before a table's own: looked at again at the next look)
+    if r.isErr() { st.memo.put(&AC_DUE, &"1") }
+    return r
+}
+
+fn autoLook(st: &lexdb_store.Store, up: &Up): Result[int, DbErr] {
+    var keys: []str = []
+    var raw: []str = []
+    var lt = lexdb_store.begin()
+    // (other sessions' temporary tables are not listed: catScan)
+    let listed = lexdb_catalog.catScan(st, mut &lt, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key)
+        append(mut &raw, en.val)
+        return true
+    })
+    st.abort(lt)
+    try listed
+    var done = 0
+    for i in 0..len(keys) {
+        let t = try up.decTable(&keys[i], &raw[i])
+        if len(t.view) > 0 || lexdb_catalog.tempRel(&t.name) || t.tree < 0 { continue }
+        let c0 = acCounts(st, t.tree)
+        let mod = c0[0]
+        if mod <= 0 { continue }
+        var a = acState(st, t.tree)
+        if a.base < 0 {
+            var rt = lexdb_store.begin()
+            let got = statRows(st, mut &rt, &t)
+            st.abort(rt)
+            a.base = try got
+            acPut(st, t.tree, &a)
+        }
+        if mod <= AUTO_THRESHOLD + a.base * AUTO_SCALE_PCT / 100 { continue }
+        // not while it is being written (a load committed in pieces): once
+        // its commits pause, or it has waited AUTO_WAIT_NS; not again soon
+        // after its last analysis
+        let now = time.monotonicNs()
+        if a.since == 0 {
+            a.since = now
+            acPut(st, t.tree, &a)
+        }
+        if now < a.cool || (now - c0[5] < AUTO_QUIET_NS && now - a.since < AUTO_WAIT_NS) {
+            st.memo.put(&AC_DUE, &"1")
+            st.memo.put(&AC_SOON, &"1")
+            continue
+        }
+        let t0 = time.monotonicNs()
+        let r = autoOne(st, &keys[i], &raw[i], &t, mod, up)
+        let t1 = time.monotonicNs()
+        var b = acState(st, t.tree)
+        b.cool = t1 + AUTO_COOL * (t1 - t0)
+        b.since = 0
+        acPut(st, t.tree, &b)
+        match r {
+            Ok(rows) {
+                if rows >= 0 {
+                    acDone(st, &t, rows, &c0, true, t1 - t0)
+                    done += 1
+                }
+            }
+            Err(x) {
+                // tried again at a later look; a cancelled task ends
+                st.memo.put(&AC_DUE, &"1")
+                if x.state == "57014" { return Err(x) }
+            }
+        }
+    }
+    return Ok(done)
+}
+
+// Table t (catalog key key, row raw when listed) analyzed and committed:
+// its rows; -1 it changed or went since it was listed.
+fn autoOne(st: &lexdb_store.Store, key: &str, raw: &str, t: &Table, mod: int, up: &Up): Result[int, DbErr] {
+    var tx = lexdb_store.begin()
+    // its catalog row read (noted): a DROP or ALTER meanwhile fails the commit
+    match st.get(mut &tx, lexdb_catalog.CATALOG, key) {
+        Ok(got) {
+            if got.isNone() || got.unwrap() != raw {
+                st.abort(tx)
+                return Ok(-1)
+            }
+        }
+        Err(x) {
+            st.abort(tx)
+            return Err(x)
+        }
+    }
+    match st.beginSnapshot() {
+        Ok(snap0) {
+            var snap = snap0
+            let r = analyzeTable(st, mut &tx, mut &snap, t, 0, up)
+            st.endSnapshot(&snap)
+            match r {
+                Ok(rows) {
+                    match bumpVersion(st, mut &tx) {
+                        Ok(_) {}
+                        Err(x) {
+                            st.abort(tx)
+                            return Err(x)
+                        }
+                    }
+                    try st.commit(tx)
+                    return Ok(rows)
+                }
+                Err(x) {
+                    st.abort(tx)
+                    return Err(x)
+                }
+            }
+        }
+        Err(x) {
+            st.abort(tx)
+            return Err(x)
+        }
+    }
+}
+
+// The task: a look every AUTO_NAP_MS when a commit counted changes, until
+// it is cancelled (lexdb's master starts it, through lexdb_exec.autoAnalyzer;
+// a replica does not).
+pub fn autoAnalyzer(st: lexdb_store.Store, up: &Up): int {
+    if st.follower().isSome() || !autoAnalyzeOn() { return 0 }
+    while true {
+        // (sooner while a table waits for its writes to pause)
+        let soon = st.memo.get(&AC_SOON).isSome()
+        st.memo.del(&AC_SOON)
+        if task.sleep(if soon { AUTO_SOON_MS } else { AUTO_NAP_MS }).isErr() { return 0 }
+        if st.memo.get(&AC_DUE).isNone() { continue }
+        match autoAnalyzeStep(&st, up) {
+            Ok(_) {}
+            Err(x) { if x.state == "57014" { return 0 } }
+        }
+    }
+    return 0
+}
