@@ -3660,6 +3660,9 @@ scan and bushy joins slotted in when convenient.
   scan, filter and project (q1, q6, q22's `substring`). Step 5 follows
   for generality (6.1's 5a-5f). The sorted row-id scan (q4, q14, q19) and
   step 6's bushy joins (q21) need neither step 3 nor step 5.
+  (6.2 found q21's 5 s to be column narrowing, a small fix in today's
+  code, slice 4.1; the pipeline's first slice is then scan, filter,
+  project and aggregate.)
 - **Modules are a goal equal to speed.** `lexdb_exec` (28,224 lines at
   step 3a) still holds the planner and cost model, the plan structures
   mixed with run-time state, statements and sessions, and two
@@ -3709,7 +3712,9 @@ written (grouped by `s_name`) 6.65 s, against 1.60 s for the same grouping
 without them. So about 5 s of q21's 7.2 s is the semi and anti levels
 under the grouped batches. With `lexdb_batch = off` the counted query
 takes 14.3 s. Why the grouped run is so much slower than the counted one
-was not diagnosed.
+was not diagnosed. (6.2 diagnoses it: the cause is not the semi and anti
+levels but the `*` in their subqueries, which turns column narrowing off
+for every table.)
 
 So unnesting, done as step 5 now, would make none of q4, q20, q21 or q22
 faster. Their gaps are the executor (q21's grouped semi and anti path,
@@ -3934,6 +3939,333 @@ on the code commit's snapshot.
     PERCENT and WITH TIES (`topMode`, `limit` -1).
   - Lexell: the tree is built with `let` chains (`p1` ... `p9`). Each
     arm moves its input in, and nothing is reassigned.
+
+### 6.2 Step 4: the map, q21, and the pipeline module
+
+Written 2026-11-17 on `redesign/bind` at main 386438df (slice 4.0:
+analysis and design, no code change). Scripts and outputs are in
+`~/tpch-w/bind/s4`:
+
+- `execmap.py` (with `decls.py`) makes the map; `run.sh` writes `map.txt`,
+  `slices.txt` and `groups.tsv`;
+- `probe.sh`, `prof.sh` and `callers.py` are the q21 probes and profiles.
+
+Measurements are the native build of 386438df (`s4/lexdb-m`, with
+`LXL_NATIVE_MAP`), SF1, boost on, the server on CPUs 0-3, run twice. The
+second run is quoted.
+
+#### 6.2.1 The map of `lexdb_exec`
+
+**How it is made.**
+
+- Each top-level declaration runs from its comments to the next one's.
+- It is put in a group by line ranges (the file is mostly in sections),
+  then by name overrides. Both tables are in `execmap.py`.
+- A reference is an identifier in a declaration that names another
+  declaration of exec. A method counts only as `.name(`, and only when its
+  receiver's type is named in the declaration.
+- So the line counts are good to a few percent per group, and the
+  references are a crude call graph: they count edges, not calls.
+
+**Summary.** 28,224 lines: 54 of imports, and 28,170 in 1,409
+declarations.
+
+| group | lines | main declarations | goes to |
+|---|---:|---|---|
+| access (layer 2) | 561 | `pathScans`, column-leaf ranges (`cRangesOf`, `bNarrow`), `lazyOf`, the row-layout constants, `idxVal`, `inIndex` | `lexdb_access` (step 1 left these) |
+| binder | 1,653 | `bindFrom` 312, MATCH_RECOGNIZE's rewrite 335, `srfCols` 111, `collectAggs`, `setSubst`, `exprScale`, `Scope`, `bindSel` | `lexdb_bind` |
+| planner, cost, statistics | 5,799 | `planSelect` 475, `planFrom` 290, `choosePath` 176, `semiLevel` 171, `Query.costOrder` 168, `planMatch` 187; statistics 1,003 (`analyzeTable` 216, samples, `loadEst`, autoanalyze 327) | `lexdb_plan`; statistics `lexdb_stats` |
+| plan structures and EXPLAIN | 705 | `Query`, `Level`, `Sel`, `SubPlan`, `JPlan`/`JLevel`/`OutPlan`, `physOf`, `subsOf`, `explainLines`, `opLines` | `lexdb_plan` |
+| batch engine | 3,717 | `batchGroupsIn` 556, `sortBatches` 302, `bEval` 257, `bCompileD` 245, `bJoinPlan` 214, `batchLevel` 144, `bProbe`, `bJoinTail`, `bRange`, `bLookup`, `eachOut` | `lexdb_pipe` |
+| row evaluator | 1,205 | `eval` 169, `bxEval` 67, `callAt`, `entryAt`, `Env`, `CEnv` (485 in all); the catalog and session functions `sysCall` 219, `callCat` 153, `sessCall`, `seqCall`, `advCall`, `hasPrivFn` (720) | the BX evaluator to `lexdb_pipe`; the functions to layer 7, behind a hook |
+| executor proper | 4,308 | `execSelTo` 352, `runLevel` 331, windows 533, MATCH_RECOGNIZE 395, `execSrf` 157, `materialize`, `runSub`/`fillCur`, row aggregates 282, row sort and `sk*` 463, `Run` 188 | `lexdb_pipe` as operators; the row engine is deleted (decision 1) |
+| statements and sessions (layer 7) | 9,020 | DDL 2,272 (`alterTable` 362, `rewrite` 160), DML 1,767 (`merge` 254, `rangePlan`, `updateB`, `deleteB`, `insert`), COPY 935, sequences 772, foreign keys 771, privileges and views 841, `Session.runStmt` 405, SET 196, WAITFOR 210 | layer-7 modules |
+| catalog relations and lookups | 537 | `bindCatalog`, `relOidOf`, `catRows`, `findTable`, `createKey`, `bootstrap`, catalog versions | `lexdb_catalog` (lookups), layer 7 (catalog relations) |
+| protocol glue | 359 | `describe`, `guessParams`, `paramTypes`, `Session.runRows`/`runIn`/`copyIn`, `Session.exec` | layer 7/8 |
+| small helpers | 104 | `copyRow`, `copyStrs`, `iv`, `num`, `span`, `toHex` | `lexdb_base` or their users |
+| one-line forwards | 202 | 136 aliases and forwards to `lexdb_catalog`, `lexdb_plan`, `lexdb_access`, `lexdb_ops` | deleted: callers call the module |
+
+**Edges that block a move.** The full matrix is in `map.txt`. The ones
+that decide the order:
+
+- **`Query` carries 1,402 lines of methods, and 1,354 of them are the
+  planner's** (`costOrder`, `nBest`, `wayCands`, `implied`, the shares).
+  Lexell declares methods only in the type's module (SPEC 5.3). So the
+  plan structures cannot leave exec without the planner, unless those
+  methods first become functions. `Session` likewise carries 1,145 lines
+  of methods.
+- **The evaluator is named everywhere, and it reaches up:**
+  - it is named from statements 68 times, from the executor 67, from the
+    batch engine 26 and from the planner 15 (`Env`, `eval`, `seqEnv`,
+    `CEnv`, `bxEval`);
+  - through `callAt` and `entryAt` it calls the catalog and session
+    functions (`sysCall`, `callCat`, `sessCall`, `seqCall`, `advCall`),
+    which read the `Session`, the catalog relations and sequences.
+  - So the scalar evaluator can sit below exec only once those calls go
+    through a hook in its context.
+- **The batch engine names:**
+  - the plan structures 76 times (`Query` 23, `JPlan`, `Sel`, `Level`);
+  - the run state 60 (`Mats` 13, `Run` 13, `Run.tickN`);
+  - access 38 (forwards only);
+  - the evaluator 26.
+
+  It reads plans through `Query`, so its drivers are ported, not moved.
+  Its kernels (`bEval`, `bAccum`, the probe and gather loops, `skSort`)
+  move.
+- **The planner names the binder's functions 80 times** (`Scope`,
+  `hasAgg`, `immutable`, `boundType`, `exprOid`, `keyType`). They are
+  still in exec: the binder leftovers go to `lexdb_bind` before the
+  planner can leave.
+- **Statements name the executor 84 times** (`Limits` 21, `prepare`,
+  `runQuery`, `SubRes`), because DML runs queries. They name the access
+  helpers 71 times and the catalog lookups 54. Layer 7 sits above exec,
+  so these edges are allowed. What blocks it is the reverse: 116
+  references from what stays into layer 7 (catalog and session functions
+  22, catalog relations 19, `execSelTo` 13 for `Res` and the COPY
+  constants).
+
+**Extraction order, smallest risk first.** Each is a refactor slice with
+the light gates of the revised order: the suite, the 22 checksums, and
+one TPC-H run against main's stored result. `pts.sh` and `simple.sh` are
+added where per-statement planning moves.
+
+| # | slice | lines leaving exec | to | blockers | risk |
+|---|---|---:|---|---|---|
+| E0 | forwards and helpers | ~300 | callers call `lexdb_catalog`/`access`/`plan`/`ops`; helpers to `lexdb_base` | none | none |
+| E1 | **the BX evaluator and the run state** (`bxEval`, `callRef`, `callAt`, `entryAt`, `CEnv` 176; `Run`, `Limits`, `Counts`, budget and ticks 195) | ~370 | `lexdb_pipe` (slice P1) | the catalog and session functions (720 lines) stay in exec behind a hook in the pipe's context; `SubRes` of a `#sub` arrives as a value | medium |
+| E2 | statistics: ANALYZE, samples, estimates, autoanalyze | ~1,000 | `lexdb_stats` (layer 5) | 16 references out: temporary tables' names, `findTable`, three index helpers, the `Limits` of autoanalyze's statement, `nextVersion`. In: DML's change counts (`noteChg`, `chgEnd`), the planner's `loadEst` | low |
+| E3 | binder leftovers (`bindFrom`, MATCH's rewrite, `srfCols`, types, scope, aggregates' slots) | ~1,650 | `lexdb_bind` (with 2e slice 3d) | 73 references out: `bindSel`/`bindQuery` take a `Query` (they stay with the planner); `scCheck` and sequence names need the catalog snapshot; `colIndex` | medium |
+| E4 | layer 7 top down. First the dispatcher, sessions, SET, notices and protocol glue (~1,750); then COPY (935); then DML (1,767); then DDL with foreign keys, sequences, privileges and views (~4,900, which name each other 76, 65 and 108 times) | ~9,400 | layer-7 modules above exec | `Session`'s methods move with it. What stays below must stop reading the session first: catalog and session functions, catalog relations, DDL's `notice`. Their reads go through the evaluation context (4.7's `ExecTxn`). | medium to high |
+| E5 | planner and plan structures | ~6,500 | `lexdb_plan` | after E3: `Query`'s methods (move together, or become functions first, a mechanical slice); constant evaluation (`eval`, `evalInt`: `lexdb_ops` folding); `Limits`/`SubRes`; batch-ability checks (`ixCovers`, `colKind`: to `lexdb_rows`/`access`); temporary and catalog lookups | high (per-statement planning, the OLTP gate) |
+
+- **Step 4's operators need only E1 first.** E0 is free and can ride
+  along.
+- Step 4 does not need the planner moved:
+  - the pipe reads `PPlan` arms, and the planner fills them in exec
+    (6.1's handover);
+  - E5 stays deferred with 2e slice 3d;
+  - E2 to E4 alternate with the speed slices, as the revised order says.
+- The `sk*` sort keys (361 lines) move with slice P1's Sort, and exec's
+  row sort then calls them.
+
+#### 6.2.2 q21: the cause is column narrowing
+
+**Measured** (`s4/ea-m.txt`, `star-m2.txt`, `star-f.txt`; ms, second
+run):
+
+| query | main 386438df | `select 1` for `select *` | scratch fix (both changes below) |
+|---|---:|---:|---:|
+| q21 as written (grouped) | 5,910 | 1,986 | 1,491 |
+| q21's joins + EXISTS + NOT EXISTS, counted | 2,772 | | 1,312 |
+| q21's joins, grouped by `s_name`, no subqueries | 1,530 | | 1,169 |
+| q21's joins, counted | 1,032 | | 1,023 |
+| q4 | 442 | 293 | 282 |
+| q22 | 355 | 345 | 346 |
+
+- All results were identical across the three builds and the rewrites.
+- PostgreSQL at one core (`~/tpch/out-baseline-1744ef99`) takes 687 ms
+  for q21 and 180 ms for q4. So q21 goes from 8.6× to 2.2×, and q4 from
+  2.5× to 1.6×.
+
+**The questions 6.1 left:**
+
+- **Do batches fall back to rows?** No. `runLevel` and `tryRow` are not in
+  the profile. EXPLAIN ANALYZE shows one pass of 5,861 batches. The
+  units retry in `batchGroups` is for one table only (`dec = !jn`).
+- **Do the semi and anti lookups repeat per group?** No. The counted and
+  grouped runs show the same counts: semi 75,871 lookups and 378,274 rows
+  read; anti 73,089 and 375,492.
+- **What does the memo do?** Nothing here. The levels run in `bRange`,
+  whose `rangeMany` reads a repeated key once. `runSub`'s per-row memo is
+  not involved. The batch path reads whole ranges (378k rows, against the
+  row path's 92k, which stops at the first passing row). That costs
+  about 0.27 s after the fix.
+
+**The cause, with evidence.** Two things compound:
+
+1. **Every table is read whole.**
+   - TPC-H writes `exists (select * from lineitem ...)`.
+   - `stmtNames` (exec:13975) sets `star` for a `*` anywhere in the
+     statement, subqueries included. `narrow` (exec:14006) then returns
+     without narrowing any level.
+   - So lineitem l1 decodes all 16 columns for 6M rows, its four numerics
+     as `Val`s. The counted profile is 58% `decodeCols` and 20%
+     `Decimal.fromUnits` (`s4/pcnt`).
+   - That is all of the counted query's extra time:
+     - with `select 1` it drops to the joins' cost plus the levels;
+     - the same `*` costs q4 a third of its time (orders read whole).
+2. **With GROUP BY, the joins carry every column read.**
+   - `bJoinPlan` finishes the plan with every column the statement reads
+     (`jpFinish(.., &all)`). `batchGroupsIn` narrows it to the
+     aggregates' columns only when there is no GROUP BY (`if jn &&
+     len(keys) == 0`, exec:24609).
+   - So the grouped query gathers every needed column through every join
+     level, and with (1) that is every column: 3.79M rows at the first
+     level and at the supplier probe, dates, text and numerics as `Val`s.
+   - The grouped profile (`s4/pgrp`) is 45% `bGather`, half of it `dup`
+     (copying `Val`s). The counted one (`s4/pcnt`) is 2.6%.
+   - By caller: `bGather < bJoinTail < bProbe` is 25% of samples, and the
+     first level's gather in `bJoinAll` 12%.
+   - Without the subqueries there is no `*`, so the same gather moves only
+     the needed columns: that is the 1.53 s against 1.03 s.
+
+**The fix.**
+
+- **Slice 4.1, in today's code, worth doing first (about 25 lines, both
+  measured above in a scratch build that was not committed):**
+  - `stmtNames` ignores the `*` of an EXISTS subquery that is not a set
+    operation. PostgreSQL ignores EXISTS's select list.
+  - `batchGroupsIn` calls `jpFinish` with GROUP BY too: the keys', the
+    aggregates' and filters' columns, and the names its outputs, HAVING
+    and ORDER BY read (the set it already keeps for a group's first row).
+  - Gates: the suite (not yet run on the fix), the 22 checksums, one TPC-H
+    run.
+  - Expected: q21 about 5.9 to 1.5 s and q4 440 to 280 ms, the TPC-H
+    total about 4.5 s lower.
+- **In the pipeline, the structure takes it:**
+  - Required columns are a plan property. A top-down pass over `PPlan`
+    gives each operator the columns its consumer reads, per table
+    instance (alias and slot), not per bare name, so `l2.*` cannot widen
+    `l1`. The binder never binds an EXISTS's select list.
+  - Each operator's output chunk holds only those columns. A filter
+    narrows the selection vector and copies nothing. A join gathers only
+    its output columns, once.
+  - This belongs to slice P2's join operators. The pass itself is in
+    `lexdb_plan`.
+- **What is left of q21 after the fix** (1.49 s, `s4/pq21f`):
+  - the scan and decode of l1, 28%;
+  - `l_receiptdate > l_commitdate` compared as `Val`s, 19%: dates are
+    `BK_VAL` in batches, through `lexdb_ops.compare`;
+  - the semi and anti ranges, 18%;
+  - the orders lookups, 14%;
+  - gathers, 13%.
+
+  The pipe's Chunk takes dates as integer vectors (the compare becomes a
+  kernel). Step 6's bushy join (supplier with nation hashed first) cuts
+  the 3.79M-row probe to 157k.
+
+#### 6.2.3 The pipeline module
+
+**Name: `lexdb_pipe`.**
+
+- Its secret is how a physical plan runs: push pipelines of operators
+  over chunks.
+- The alternatives say less: `lexdb_run` is not specific, and `lexdb_vexec`
+  names an implementation choice.
+- At step 4's end the row engine is deleted (decision 1), so `lexdb_pipe`
+  is layer 6. What is left of `lexdb_exec` is layer 7, and is renamed
+  then (for example to `lexdb_stmt`).
+
+**Place and interface.**
+
+- It sits below `lexdb_exec` and above `lexdb_plan`, `lexdb_bind`,
+  `lexdb_access` and `lexdb_rows`. Exec calls it; it never calls exec.
+
+  ```
+  compile(p: &PPlan, cols: &[]ColDef): Option[Prog]
+      // None: an arm or an expression it does not run. Called once at
+      // plan time (end of planSelect/planSet); the Prog is kept in the
+      // Sel with the PPlan, so the plan cache keeps it.
+  run(st, txn, prog: &Prog, cx: &Ctx, bud: mut &Budget, sink: fn(&Chunk): Result[bool, DbErr]): Result[Unit, DbErr]
+      // the sink returns false to stop (LIMIT, a client's cancel)
+  Ctx    { params; subs (RUN_ONCE results, as values); zone; now;
+           callOut: fn(name, args, ...) for catalog and session functions;
+           nextval hook }     // 4.7's ExecTxn, the part a run reads
+  Budget { maxHeld; held; deadline tick; counts per operator }
+           // from Run; EXPLAIN ANALYZE prints the counts
+  ```
+
+- **To the plan:**
+  - the pipe reads `lexdb_plan.PPlan` arms only, never `Query`, `Level`
+    or `Sel`;
+  - an arm takes its operator's details when ported (6.1's handover): a
+    `Scan` arm holds the table (`lexdb_catalog.Table`), the `Path`, the
+    columns needed and its conditions as `BX`;
+  - `Agg` holds keys and calls;
+  - `Sort` holds keys;
+  - `Limit` holds its count and offset.
+- **To access:** today's batched calls, unchanged: `fillLevel`/`fillBatch`
+  (scan), `fetchMany` (by primary key), `rangeMany` (a range per key),
+  `Probes`, `idxDecOf` (index-only reads). Nothing in the pipe sees a key
+  byte.
+- **Expressions:**
+  - `BX` is compiled to today's `BNode` kernels. The generic step is the
+    scalar BX evaluator, which moves into the pipe (E1), so there is one
+    evaluator, scalar and vector, as 4.4.1 says;
+  - exec's row path calls the pipe's scalar evaluator;
+  - columns stay addressed by the query's slots (the `q.cols` positions,
+    as `Batch` is today, an absent column holding no vector), so 2e
+    slice 4 is not needed first.
+
+**Chunk.**
+
+- `Chunk { b: lexdb_rows.Batch; sel: []int; all: bool }`: today's `Batch`
+  plus a selection vector (`all`: every row 0..n).
+- Filters narrow `sel`, and Project and the sinks read through it.
+- A join emits pairs of rows (outer, inner) and gathers only the columns
+  above it needs.
+- Kinds:
+  - `BK_INT`, `BK_BOOL` and `BK_DEC`, as now;
+  - dates and timestamps join `BK_INT` (days and microseconds; q21's
+    compare above);
+  - `BK_VAL` for the rest.
+- A chunk keeps its capacity across uses (`lexdb_rows.reuse`).
+
+**Choosing it, and deleting the old code.**
+
+- `compile` is the support check: it walks the `PPlan` with its `PSub`s
+  and every expression.
+- `execSel` runs the `Prog` when there is one and `lexdb_batch` is on,
+  else today's path. Nothing gives way mid-query, so each of today's
+  give-way reasons gets an answer inside the operator:
+
+  | today's give-way | in the pipe |
+  |---|---|
+  | numeric units overflow (`batchGroups` runs again with values) | the kernel's chunk falls back to the generic step (4.4.1) |
+  | a value its column's batch cannot hold | that chunk's column as `BK_VAL` |
+  | a range's rows past the room (`bRange`'s `room0`) | ranges read in bounded pieces per chunk of keys |
+  | an expression error (the row path raises it) | the evaluator raises it, at the lowest selected row of the first failing step (4.4.1) |
+  | memory | `max_statement_mem`'s error, as the row path; spilling later |
+
+- A driver of today's batch engine is deleted in the slice whose
+  `compile` accepts every plan the driver accepted. Its accept conditions
+  are the guards at its top, for example the first 30 lines of
+  `batchGroupsIn`.
+- The proof is the "three ways" tests (`lexdb_batch` on and off), the
+  checksums, and the drivers' test counters (`groupRuns`,
+  `rangeJoinBatches`), which move to the pipe's counters.
+- The row engine stays as the path for plans the pipe does not compile,
+  until it compiles all of them.
+
+**Import rules** (`tests/lexdb/imports.py`, next to `BIND` and `ACCESS`):
+
+- `lexdb_pipe` joins `CORE`.
+- It may import `lexdb_base`, `lexdb_sql`, `lexdb_time`, `lexdb_float`,
+  `lexdb_rows`, `lexdb_vec`, `lexdb_like`, `lexdb_sqlcoll`, `lexdb_ops`,
+  `lexdb_lib`, `lexdb_catalog`, `lexdb_bind`, `lexdb_plan`,
+  `lexdb_access` and `lexdb_store`, plus lexell's own libraries.
+- From `lexdb_store` it may use the `Store` and `Txn` handles only (a
+  check like the `Txn.sql` one), and it never reads `txn.sql.`: session
+  state arrives in `Ctx`.
+- No module it may import, and none below access, imports it. Only
+  `lexdb_exec` (and later layer 7) do.
+- No dialect and no protocol module is imported.
+
+**The first three code slices** (after 4.1). The lines are estimates
+from the map. Each slice's gate is step 4's: the suite, the checksums,
+an A/B against main's binary per operator, and `pts.sh` and `simple.sh`,
+because the `Prog` is made per statement.
+
+| slice | operators | queries it runs (expected, not verified) | lines leaving exec |
+|---|---|---|---:|
+| P1 | the module, `Chunk`, the BX evaluator and `BNode` compile and eval (E1, `batch.core` 1,064, `bAccum` 97); `Scan` (full, primary key or index range, index-only), `Filter`, `Project`, `Agg` and `HashAgg` over one table (numerics as units), `Sort` of the output rows (`sk*` keys, 361), `Limit`; RUN_ONCE subqueries as values | q1, q6, q22's scalar subquery; the 35-query suite's one-table scans and aggregates | ~2,000: ~1,700 moved, ~300 deleted (`batchGroupsIn`'s one-table branch and the units retry, `eachOut`'s and `outPlan`'s one-table output) |
+| P2 | `HashBuild`; `HashProbe` (inner, left, semi, anti); `IndexLookup` (by whole primary key: `bLookup`; a range per key: `bRange`); `Levels` splits into scan and join arms; required columns per operator (6.2.2) | q3, q4, q5, q7, q8, q9, q10, q12, q14, q19, q21, and q22's inner query; q11, q15, q18 if their RUN_ONCE parts compile | ~1,700: `batch.join`, `batch.lookup`, `batch.plan`, `batch.level` (1,227) and the join branches of `batchGroupsIn`, `eachOut` and `outPlan` |
+| P3 | `Sort`, `TopN` and `Distinct` over chunks with the memory budget (`sortBatches`, `SortSet`, the heap) | the suite's ORDER BY and DISTINCT over many rows; nothing new in TPC-H (its sorts are over grouped output, P1's) | ~550: `batch.sort` 440, what is left of `batch.out` |
+
+After P3 the batch engine (3,717 lines) is out of exec, and exec is about
+24,000 lines. Next come windows (`winBatch`, `winPartition`), Apply for
+RUN_PER_ROW (q2, q17, q20, before step 5's 5f), `Fetch` for point
+selects (the OLTP gate), and the row engine's deletion.
 
 ## 7. Trade-offs and risks
 
