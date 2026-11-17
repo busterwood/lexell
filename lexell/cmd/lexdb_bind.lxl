@@ -796,6 +796,11 @@ pub type BX = closed {
     Case([]BX, bool)            // CASE's conditions and values in turn; true: an ELSE last
     Try(BX)                     // T-SQL's TRY_CAST: NULL for an error
     Call(FnRef, []BX)           // a bound function and its arguments
+    // a subquery run once (lexdb_plan.RUN_ONCE), its value the run's
+    // (lexdb_pipe.Ctx.subs): its use (lexdb_sql.SUB_SCALAR, SUB_EXISTS,
+    // SUB_IN), its number, and IN's value ([] the others). Bound only for a
+    // plan the pipeline runs (bindSubs).
+    Sub(int, int, []BX)
 }
 
 // How a bound function is evaluated (FnRef.way): FN_NONE, it does not
@@ -819,7 +824,14 @@ pub type FnRef = record {
 // statement's, bound as constants ([]: each $n a slot, BX.Param, for a plan
 // bound once and run with other values). aggs: #agg's slots are given.
 // (lexdb_exec's bGenOf re-slots a bound tree for a batch's row: reslot.)
-pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, ty: &Typing): Option[BX] {
+pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, ty: &Typing): Option[BX] { return bindIn(x, cols, params, aggs, false, ty) }
+
+// bindExpr, a subquery that has no outer values (its call has none) bound
+// too, as BX.Sub: for a plan whose run is given the values of its
+// subqueries run once (lexdb_pipe.Ctx.subs).
+pub fn bindSubs(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, ty: &Typing): Option[BX] { return bindIn(x, cols, params, false, true, ty) }
+
+fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, subs: bool, ty: &Typing): Option[BX] {
     match x {
         Expr.Lit(v) { return Some(BX.Const(v)) }
         Expr.Param(n) {
@@ -834,15 +846,15 @@ pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool,
             return Some(BX.Col(i))
         }
         Expr.Unary(op, a) {
-            let ba = bindExpr(&a, cols, params, aggs, ty)
+            let ba = bindIn(&a, cols, params, aggs, subs, ty)
             if ba.isNone() { return None }
             let u = lexdb_ops.unCode(&op)
             return Some(BX.Un(u, ba.unwrap()))
         }
         Expr.Bin(op, a, b) {
-            let ba = bindExpr(&a, cols, params, aggs, ty)
+            let ba = bindIn(&a, cols, params, aggs, subs, ty)
             if ba.isNone() { return None }
-            let bb = bindExpr(&b, cols, params, aggs, ty)
+            let bb = bindIn(&b, cols, params, aggs, subs, ty)
             if bb.isNone() { return None }
             if op == "and" { return Some(BX.And(ba.unwrap(), bb.unwrap())) }
             if op == "or" { return Some(BX.Or(ba.unwrap(), bb.unwrap())) }
@@ -856,18 +868,28 @@ pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool,
             return Some(BX.Op(code, ba.unwrap(), bb.unwrap()))
         }
         Expr.IsNull(a, neg) {
-            let ba = bindExpr(&a, cols, params, aggs, ty)
+            let ba = bindIn(&a, cols, params, aggs, subs, ty)
             if ba.isNone() { return None }
             return Some(BX.IsNull(ba.unwrap(), neg))
         }
         Expr.Cast(a, t) {
             if t.kind == lexdb_sql.K_REG { return None }
-            let ba = bindExpr(&a, cols, params, aggs, ty)
+            let ba = bindIn(&a, cols, params, aggs, subs, ty)
             if ba.isNone() { return None }
             return Some(BX.Cast(ba.unwrap(), t))
         }
         Expr.Call(name, args, star) {
-            if lexdb_sql.isSubCall(&name) { return None }
+            if lexdb_sql.isSubCall(&name) {
+                // (with its outer values: run per row or hashed, not bound)
+                if !subs || len(args) != subFixed(&name) { return None }
+                let i = lexdb_sql.litInt(&args[0])
+                if i < 0 { return None }
+                if name == "#exists" { return Some(BX.Sub(lexdb_sql.SUB_EXISTS, i, [])) }
+                if name == "#sub" { return Some(BX.Sub(lexdb_sql.SUB_SCALAR, i, [])) }
+                let v = bindIn(&args[3], cols, params, aggs, subs, ty)
+                if v.isNone() { return None }
+                return Some(BX.Sub(lexdb_sql.SUB_IN, i, [v.unwrap()]))
+            }
             if name == "#agg" {
                 if !aggs || len(args) != 1 { return None }
                 let i = lexdb_sql.litInt(&args[0])
@@ -879,7 +901,7 @@ pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool,
             if !special && fr.way == FN_NONE { return None }
             var bs: []BX = []
             for a in args {
-                let c = bindExpr(&a, cols, params, aggs, ty)
+                let c = bindIn(&a, cols, params, aggs, subs, ty)
                 if c.isNone() { return None }
                 append(mut &bs, c.unwrap())
             }
@@ -919,12 +941,42 @@ pub fn hasParam(x: &BX): bool {
             for c in cs { if hasParam(&c) { return true } }
             return false
         }
+        BX.Sub(_, _, xs) {
+            for c in xs { if hasParam(&c) { return true } }
+            return false
+        }
+    }
+}
+
+// Whether x reads a subquery's value (BX.Sub): a run of its plan must
+// give it the values (lexdb_pipe.Ctx.subs).
+pub fn hasSub(x: &BX): bool {
+    match x {
+        BX.Sub(_, _, _) { return true }
+        BX.Un(_, a) { return hasSub(&a) }
+        BX.And(a, b) { return hasSub(&a) || hasSub(&b) }
+        BX.Or(a, b) { return hasSub(&a) || hasSub(&b) }
+        BX.Op(_, a, b) { return hasSub(&a) || hasSub(&b) }
+        BX.Cat(a, b, _) { return hasSub(&a) || hasSub(&b) }
+        BX.IsNull(a, _) { return hasSub(&a) }
+        BX.Cast(a, _) { return hasSub(&a) }
+        BX.Case(cs, _) {
+            for c in cs { if hasSub(&c) { return true } }
+            return false
+        }
+        BX.Try(a) { return hasSub(&a) }
+        BX.Call(_, cs) {
+            for c in cs { if hasSub(&c) { return true } }
+            return false
+        }
+        else { return false }
     }
 }
 
 // x, bound over a row of cols by place, re-slotted for a row of the
 // columns slots lists: Col(i) becomes Col(s), slots[s] == i (i added to slots when first read). par:
-// set when x reads a parameter slot (BX.Param). A plan's bound tree run
+// set when x reads a parameter slot (BX.Param) or a subquery's value
+// (BX.Sub): a run's context. A plan's bound tree run
 // over a batch's row (lexdb_exec's bGenOf), not bound again per run.
 pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
     match x {
@@ -968,6 +1020,12 @@ pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
             var bs: []BX = withCapacity(len(cs))
             for c in cs { append(mut &bs, reslot(&c, slots, par)) }
             return BX.Call(FnRef{name: fr.name, way: fr.way, f: fr.f, f1: fr.f1, dialect: fr.dialect}, bs)
+        }
+        BX.Sub(u, i, xs) {
+            par = true
+            var bs: []BX = []
+            for c in xs { append(mut &bs, reslot(&c, slots, par)) }
+            return BX.Sub(u, i, bs)
         }
     }
 }

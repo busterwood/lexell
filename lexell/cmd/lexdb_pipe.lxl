@@ -45,13 +45,15 @@ fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 // ---- the context
 
 // What a bound expression is evaluated in: the transaction's start and
-// time zone (as the row evaluator gives callAt), the run's parameters,
-// and the calls up into the functions its owner supplies.
+// time zone (as the row evaluator gives callAt), the run's parameters, the
+// values of the subqueries run once before it, and the calls up into the
+// functions its owner supplies.
 pub type Ctx = record {
     pub now: int
     pub zone: lexdb_time.Zone
     pub params: []Val           // the run's parameters, for a plan's bound slots (BX.Param); [] where they are bound as constants
     pub up: Up
+    pub subs: []SubVal          // per subquery of the query, by number: the value BX.Sub reads (one run once; [] none)
 }
 
 // name's entry of n arguments where it is not lexdb_lib's; None: lexdb_lib's.
@@ -145,6 +147,12 @@ pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Va
             var vs: []Val = withCapacity(len(cs))
             for c in cs { append(mut &vs, try bxEval(&c, row, aggs, ce)) }
             return callRef(&fb, &vs, ce)
+        }
+        lexdb_bind.BX.Sub(u, i, xs) {
+            if i >= len(ce.subs) { return Err(e("0A000", "a subquery is not supported here")) }
+            if u == lexdb_sql.SUB_IN { return Ok(inProbe(&ce.subs[i], &(try bxEval(&xs[0], row, aggs, ce)), &ce.zone)) }
+            if u == lexdb_sql.SUB_EXISTS { return Ok(Val.Bool(ce.subs[i].rows > 0)) }
+            return Ok(ce.subs[i].val)
         }
     }
 }
@@ -465,6 +473,10 @@ pub fn bxConst(x: &BX): bool {
         BX.IsNull(a, _) { return bxConst(&a) }
         BX.Cast(a, _) { return bxConst(&a) }
         BX.Call(fr, cs) { return fr.name == "#bppad" && len(cs) == 2 && bxConst(&cs[0]) && bxConst(&cs[1]) }
+        BX.Sub(_, _, xs) {
+            for c in xs { if !bxConst(&c) { return false } }
+            return true
+        }
         else { return false }
     }
 }
@@ -492,6 +504,10 @@ pub fn bxFixed(x: &BX): bool {
         BX.Call(fr, cs) {
             if !lexdb_bind.immutableName(&fr.name) { return false }
             for c in cs { if !bxFixed(&c) { return false } }
+            return true
+        }
+        BX.Sub(_, _, xs) {
+            for c in xs { if !bxFixed(&c) { return false } }
             return true
         }
     }
@@ -1162,7 +1178,8 @@ pub fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &Ctx): Option
         append(mut &cols, i - base)
         append(mut &ks, kinds[i])
     }
-    let gce = Ctx{now: ce.now, zone: ce.zone, params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up}
+    let gce = Ctx{now: ce.now, zone: ce.zone, params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up,
+                  subs: if par && lexdb_bind.hasSub(x) { copySubs(&ce.subs) } else { [] }}
     return Some(BGen{cx: c, cols: cols, kinds: ks, ce: gce})
 }
 
@@ -1843,10 +1860,11 @@ fn aggRead(a: &lexdb_plan.PAgg, sc: &lexdb_plan.PScan): bool {
 }
 
 // Whether a scan's arm is one run runs: a table's (its query's columns'
-// kinds and the table's need agree), no subqueries (RUN_ONCE's values in
-// the context come with P1b).
+// kinds and the table's need agree), its subqueries each run once before
+// it, their values in the run's context (Ctx.subs; not in FROM).
 fn scanRuns(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
-    return len(subs) == 0 && len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
+    for s in subs { if s.run != lexdb_plan.RUN_ONCE || s.use == lexdb_sql.SUB_FROM { return false } }
+    return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
 }
 
 // Whether every expression of xs reads only the scan's columns it decodes.
@@ -1878,6 +1896,10 @@ fn reads(x: &BX, sc: &lexdb_plan.PScan): bool {
         BX.Try(a) { return reads(&a, sc) }
         BX.Call(_, cs) {
             for c in cs { if !reads(&c, sc) { return false } }
+            return true
+        }
+        BX.Sub(_, _, xs) {
+            for c in xs { if !reads(&c, sc) { return false } }
             return true
         }
     }
@@ -2728,6 +2750,17 @@ pub type SubVal = record {
 }
 
 pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(), numeric: false, hasNull: false} }
+
+// A copy of subs (a compiled expression's own: BGen's context).
+fn copySubs(subs: &[]SubVal): []SubVal {
+    var out: []SubVal = []
+    for s in subs {
+        var set: Map[str, int] = newMap()
+        for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
+        append(mut &out, SubVal{rows: s.rows, val: s.val, set: set, numeric: s.numeric, hasNull: s.hasNull})
+    }
+    return out
+}
 
 // A hash key's part: numbers by value (2 = 2.0), else as the value.
 pub fn keyPart(b: mut &StrBuf, v: &Val) {
