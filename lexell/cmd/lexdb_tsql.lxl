@@ -28,6 +28,9 @@ import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_tsqlparse"
 import "./lexdb_exec"
+import "./lexdb_bind"
+import "./lexdb_catalog"
+import "./lexdb_ops"
 import "./lexdb_syscat"
 import "./lexdb_parse"
 
@@ -48,7 +51,7 @@ pub const EV_DB = 6         // USE: the session's database is err.msg (ENVCHANGE
 
 pub type Event = record {
     pub kind: int
-    pub cols: []lexdb_exec.OutCol
+    pub cols: []lexdb_bind.OutCol
     pub rows: [][]Val
     pub count: int
     pub cmd: int
@@ -469,7 +472,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
             for i in 0..len(s.assign) {
                 let k = f.find(&s.assign[i])
                 if k < 0 || i >= len(res.rows[n - 1]) { continue }
-                match lexdb_exec.coerce(res.rows[n - 1][i], &f.types[k]) {
+                match lexdb_ops.coerce(res.rows[n - 1][i], &f.types[k]) {
                     Ok(v) { f.vals[k] = v }
                     Err(e) {
                         st.failErr(ev, &e, cmd)
@@ -758,7 +761,7 @@ const TVP_SAVE = "\"lexdb tsql tvp\""
 // 245, 8114, 8115, 241, 8169, 206, 2628), 515 and 2627 for the type's own
 // constraints. In a transaction, under a savepoint: an error leaves it as
 // it was.
-pub fn bindTable(sess: mut &lexdb_exec.Session, st: mut &State, param: &str, tt: &lexdb_exec.TabType, ncols: int, sent: &[]int,
+pub fn bindTable(sess: mut &lexdb_exec.Session, st: mut &State, param: &str, tt: &lexdb_catalog.TabType, ncols: int, sent: &[]int,
                  srcTypes: &[]str, rows: mut &[][]Val): Result[Unit, DbErr] {
     let tmp = tvpTable(param)
     let inTx = sess.status() != 'I'
@@ -773,7 +776,7 @@ pub fn bindTable(sess: mut &lexdb_exec.Session, st: mut &State, param: &str, tt:
     return r
 }
 
-fn fillTable(sess: mut &lexdb_exec.Session, tmp: &str, param: &str, tt: &lexdb_exec.TabType, ncols: int, sent: &[]int,
+fn fillTable(sess: mut &lexdb_exec.Session, tmp: &str, param: &str, tt: &lexdb_catalog.TabType, ncols: int, sent: &[]int,
              srcTypes: &[]str, rows: mut &[][]Val): Result[Unit, DbErr] {
     let none: []Val = []
     let nt: []int = []
@@ -814,7 +817,7 @@ fn fillTable(sess: mut &lexdb_exec.Session, tmp: &str, param: &str, tt: &lexdb_e
                 Val.Bool(b) { if c.typ.kind != lexdb_sql.K_BOOL { v = Val.Int(if b { 1 } else { 0 }) } }
                 else {}
             }
-            match lexdb_exec.coerce(v, &c.typ) {
+            match lexdb_ops.coerce(v, &c.typ) {
                 Ok(x) { rows[r][j] = x }
                 Err(e) { return Err(convErr(e, &(if j < len(srcTypes) { srcTypes[j].toStr() } else { "nvarchar" }), &decl[sent[j]], &rows[r][j], param)) }
             }
@@ -864,7 +867,7 @@ fn convErr(e: DbErr, src: &str, d: &lexdb_exec.DeclCol, v: &Val, param: &str): D
     let isTime = to == "date" || to == "time" || to == "datetime" || to == "datetime2" || to == "smalldatetime" || to == "datetimeoffset"
     if e.state == "22001" {
         return tsErr(2628, &("String or binary data would be truncated in table '" + param + "', column '" + d.name + "'. Truncated value: '" +
-                           truncText(&lexdb_exec.text(v), d.maxLen, to == "nvarchar" || to == "nchar") + "'."))
+                           truncText(&lexdb_sql.text(v), d.maxLen, to == "nvarchar" || to == "nchar") + "'."))
     }
     if e.state == "22003" {
         if isNum { return tsErr(8115, &("Arithmetic overflow error converting " + from + " to data type numeric.")) }
@@ -876,7 +879,7 @@ fn convErr(e: DbErr, src: &str, d: &lexdb_exec.DeclCol, v: &Val, param: &str): D
     if isNum { return tsErr(8114, &("Error converting data type " + from + " to numeric.")) }
     if to == "float" || to == "real" { return tsErr(8114, &("Error converting data type " + from + " to " + to + ".")) }
     if to == "bigint" { return tsErr(8114, &("Error converting data type " + from + " to bigint.")) }
-    if isInt { return tsErr(245, &("Conversion failed when converting the " + from + " value '" + lexdb_exec.text(v) + "' to data type " + to + ".")) }
+    if isInt { return tsErr(245, &("Conversion failed when converting the " + from + " value '" + lexdb_sql.text(v) + "' to data type " + to + ".")) }
     return e
 }
 
@@ -1071,7 +1074,7 @@ fn raiseText(fmt: &str, args: &[]Val): str {
             } else if t == 'd' || t == 'i' || t == 'u' {
                 out.add(&(intVal(&v).toStr()))
             } else {
-                let tv: str = if lexdb_exec.isNull(&v) { "(null)" } else { lexdb_exec.text(&v) }
+                let tv: str = if lexdb_ops.isNull(&v) { "(null)" } else { lexdb_sql.text(&v) }
                 out.add(&tv)
             }
         } else {
@@ -1123,7 +1126,7 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
     if k == lexdb_tsqlparse.TS_PRINT {
         match st.args(sess, &t.stmt[0], f, ev) {
             Some(vs) {
-                let msg = if len(vs) == 0 || lexdb_exec.isNull(&vs[0]) { "" } else { lexdb_exec.text(&vs[0]) }
+                let msg = if len(vs) == 0 || lexdb_ops.isNull(&vs[0]) { "" } else { lexdb_sql.text(&vs[0]) }
                 caughtEv(ev, &Caught{number: 0, message: msg, severity: 0, state: 1}, EV_INFO)
                 return F_NEXT
             }
@@ -1135,7 +1138,7 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
             Some(vs) {
                 var rest: []Val = []
                 for i in 3..len(vs) { append(mut &rest, vs[i]) }
-                let msg = raiseText(&(if lexdb_exec.isNull(&vs[0]) { "" } else { lexdb_exec.text(&vs[0]) }), &rest)
+                let msg = raiseText(&(if lexdb_ops.isNull(&vs[0]) { "" } else { lexdb_sql.text(&vs[0]) }), &rest)
                 let sev = intVal(&vs[1])
                 let c = Caught{number: 50000, message: msg, severity: sev, state: intVal(&vs[2])}
                 if sev <= 10 {
@@ -1162,7 +1165,7 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
             match st.args(sess, &t.stmt[0], f, ev) {
                 Some(vs) {
                     c.number = intVal(&vs[0])
-                    c.message = if lexdb_exec.isNull(&vs[1]) { "" } else { lexdb_exec.text(&vs[1]) }
+                    c.message = if lexdb_ops.isNull(&vs[1]) { "" } else { lexdb_sql.text(&vs[1]) }
                     c.state = intVal(&vs[2])
                 }
                 None { return st.flowAfterError() }
@@ -1215,10 +1218,10 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         // lexdb's database (and master, taken as it, as at login); SQL
         // Server's other system databases are listed, not opened
         let n = t.names[0]
-        let id = lexdb_syscat.dbId(&n, &lexdb_exec.SYS_DB_NAME)
-        if id == lexdb_exec.SYS_DB_ID || id == 1 {
+        let id = lexdb_syscat.dbId(&n, &lexdb_syscat.SYS_DB_NAME)
+        if id == lexdb_syscat.SYS_DB_ID || id == 1 {
             var x = ev0(EV_DB)
-            x.err = lexdb_base.err("", lexdb_exec.SYS_DB_NAME)
+            x.err = lexdb_base.err("", lexdb_syscat.SYS_DB_NAME)
             append(ev, x)
             doneEv(ev, -1, 0, false)
             return F_NEXT
@@ -1277,21 +1280,21 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     }
     if k == lexdb_tsqlparse.TS_EXECSTR {
         // dynamic SQL: a batch of its own, without the caller's variables
-        let sql = if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) { lexdb_exec.text(&vals[0]) } else { "" }
+        let sql = if len(vals) > 0 && !lexdb_ops.isNull(&vals[0]) { lexdb_sql.text(&vals[0]) } else { "" }
         var fr = newFrame()
         return st.nested(sess, &sql, mut &fr, ev)
     }
     let proc = t.names[0]
     let outs = strings.split(&t.value, "\x1f")
     if proc == "sp_executesql" {
-        if len(vals) == 0 || lexdb_exec.isNull(&vals[0]) {
+        if len(vals) == 0 || lexdb_ops.isNull(&vals[0]) {
             st.fail(ev, Caught{number: 201, message: "Procedure or function 'sp_executesql' expects parameter '@statement', which was not supplied.",
                                severity: 16, state: 4}, 0)
             return F_NEXT
         }
         var decls: []lexdb_tsqlparse.ParamDecl = []
-        if len(vals) > 1 && !lexdb_exec.isNull(&vals[1]) {
-            match lexdb_tsqlparse.parseParamDecls(&lexdb_exec.text(&vals[1])) {
+        if len(vals) > 1 && !lexdb_ops.isNull(&vals[1]) {
+            match lexdb_tsqlparse.parseParamDecls(&lexdb_sql.text(&vals[1])) {
                 Ok(ds) { decls = ds }
                 Err(e) {
                     st.failErr(ev, &e, 0)
@@ -1307,7 +1310,7 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
                 let pn = if 1 + j < len(t.names) { t.names[1 + j] } else { "" }
                 if pn == decls[i].name || (pn == "" && j - 2 == i) { v = vals[j] }
             }
-            match lexdb_exec.coerce(v, &decls[i].typ) {
+            match lexdb_ops.coerce(v, &decls[i].typ) {
                 Ok(cv) { let x = fr.add(&decls[i].name, decls[i].typ, cv) }
                 Err(e) {
                     st.failErr(ev, &e, 0)
@@ -1315,7 +1318,7 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
                 }
             }
         }
-        let r = st.nested(sess, &lexdb_exec.text(&vals[0]), mut &fr, ev)
+        let r = st.nested(sess, &lexdb_sql.text(&vals[0]), mut &fr, ev)
         // OUTPUT parameters back to the caller's variables
         for j in 2..len(vals) {
             if j >= len(outs) || len(outs[j]) == 0 { continue }
@@ -1323,7 +1326,7 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
             let kf = fr.find(&pn)
             let ko = f.find(&outs[j])
             if kf < 0 || ko < 0 { continue }
-            match lexdb_exec.coerce(fr.vals[kf], &f.types[ko]) {
+            match lexdb_ops.coerce(fr.vals[kf], &f.types[ko]) {
                 Ok(cv) { f.vals[ko] = cv }
                 Err(_) {}
             }
@@ -1343,8 +1346,8 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     if proc == "sp_tablecollations_100" || proc == "sp_tablecollations_90" || proc == "sp_tablecollations" {
         // a table's columns' collations (SqlBulkCopy's): none for no such table
         var x = tableCollations(&[])
-        if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) {
-            match tableArg(&lexdb_exec.text(&vals[0])) {
+        if len(vals) > 0 && !lexdb_ops.isNull(&vals[0]) {
+            match tableArg(&lexdb_sql.text(&vals[0])) {
                 Ok(name) {
                     match sess.tableDecl(&name) {
                         Ok(cols) { x = tableCollations(&cols) }
@@ -1360,7 +1363,7 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         return F_NEXT
     }
     if proc == "sp_describe_first_result_set" {
-        let sql = if len(vals) > 0 && !lexdb_exec.isNull(&vals[0]) { lexdb_exec.text(&vals[0]) } else { "" }
+        let sql = if len(vals) > 0 && !lexdb_ops.isNull(&vals[0]) { lexdb_sql.text(&vals[0]) } else { "" }
         let none: []lexdb_tsqlparse.ParamDecl = []
         match describeFirst(sess, st, &sql, &none) {
             Ok(cols) {
@@ -1406,7 +1409,7 @@ fn argLit(vals: &[]Val, names: &[]str, name: &str, pos: int): str {
     for j in 0..len(vals) {
         let pn = if 1 + j < len(names) { names[1 + j] } else { "" }
         if (len(pn) > 0 && strings.toLowerAscii(&pn) == name) || (len(pn) == 0 && j == pos) {
-            if lexdb_exec.isNull(&vals[j]) { return "NULL" }
+            if lexdb_ops.isNull(&vals[j]) { return "NULL" }
             return litOf(&vals[j])
         }
     }
@@ -1603,18 +1606,18 @@ const MSVER: []str = ["ProductName||Microsoft SQL Server", "ProductVersion|10485
                       "ProcessorCount|16|16", "ProcessorActiveMask||            ffff", "ProcessorType|8664|",
                       "PhysicalMemory|38361|38361 (40224423936)", "Product ID||"]
 
-fn outCol(name: &str, oid: int): lexdb_exec.OutCol {
-    return lexdb_exec.OutCol{name: strings.toLowerAscii(&name), oid: oid, spell: name.toStr(), coll: "", scale: -1}
+fn outCol(name: &str, oid: int): lexdb_bind.OutCol {
+    return lexdb_bind.OutCol{name: strings.toLowerAscii(&name), oid: oid, spell: name.toStr(), coll: "", scale: -1}
 }
 
 // A value as a T-SQL literal.
 fn litOf(v: &Val): str {
-    if lexdb_exec.isNull(v) { return "NULL" }
+    if lexdb_ops.isNull(v) { return "NULL" }
     match v {
         Val.Int(n) { return n.toStr() }
         Val.Num(d) { return d.toStr() }
         Val.Bool(b) { return if b { "1" } else { "0" } }
-        else { return "N'" + strings.replaceAll(&lexdb_exec.text(v), "'", "''") + "'" }
+        else { return "N'" + strings.replaceAll(&lexdb_sql.text(v), "'", "''") + "'" }
     }
 }
 
@@ -1791,7 +1794,7 @@ pub fn describeRows(cols: &[]lexdb_exec.DeclCol): Event {
         let p = strings.split(&c, ":")
         let k = p[1]
         let oid = if k == "b" { lexdb_sql.OID_BOOL } else if k == "s" { lexdb_sql.OID_TEXT } else if k == "i" { lexdb_sql.OID_INT4 } else { lexdb_sql.OID_INT2 }
-        append(mut &x.cols, lexdb_exec.OutCol{name: p[0].toStr(), oid: oid, spell: p[0].toStr(), coll: "",
+        append(mut &x.cols, lexdb_bind.OutCol{name: p[0].toStr(), oid: oid, spell: p[0].toStr(), coll: "",
                                               scale: if k == "t" { lexdb_syscat.hint(lexdb_syscat.TS_TINYINT, 0) } else { -1 }})
     }
     for i in 0..len(cols) {

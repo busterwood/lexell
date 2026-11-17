@@ -57,6 +57,9 @@ import "./lexdb_sql"
 import "./lexdb_syscat"
 import "codepage"
 import "./lexdb_exec"
+import "./lexdb_bind"
+import "./lexdb_catalog"
+import "./lexdb_ops"
 import "./lexdb_auth"
 import "./lexdb_wire"
 import "./lexdb_tsql"
@@ -276,7 +279,7 @@ fn units16(s: &str): int {
 // The columns' types for these rows: the lexdb type's, unless a value does
 // not fit it (then text); the largest decimal scale; (max) where a value is
 // longer than nvarchar(4000) or varbinary(8000) holds.
-fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
+fn colTypes(cols: &[]lexdb_bind.OutCol, rows: &[][]Val): []ColT {
     var ts: []ColT = []
     for i in 0..len(cols) {
         var t = kindOf(cols[i].oid)
@@ -288,8 +291,8 @@ fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
             var own = -1
             var same = true
             for r in rows {
-                if i >= len(r) || lexdb_exec.isNull(&r[i]) { continue }
-                let o = lexdb_exec.kindOid(&r[i])
+                if i >= len(r) || lexdb_ops.isNull(&r[i]) { continue }
+                let o = lexdb_ops.kindOid(&r[i])
                 if own < 0 { own = o } else if o != own { same = false }
             }
             if same && own > 0 {
@@ -309,7 +312,7 @@ fn colTypes(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): []ColT {
                 }
                 Val.Bytes(b) { if t.kind == C_BIN && len(b) > 8000 { t.max = true } }
                 else {
-                    if t.kind == C_TEXT && !t.max && units16(&lexdb_exec.text(&r[i])) > 4000 { t.max = true }
+                    if t.kind == C_TEXT && !t.max && units16(&lexdb_sql.text(&r[i])) > 4000 { t.max = true }
                 }
             }
         }
@@ -331,7 +334,7 @@ fn hinted(t: ColT, h: int, rows: &[][]Val, i: int): ColT {
     if code == lexdb_syscat.TS_NUMERIC && t.kind == C_DEC { return ColT{kind: C_DEC, n: t.n, max: true} }
     if code == lexdb_syscat.TS_INT && t.kind == C_TEXT {
         // a bare NULL
-        for r in rows { if !lexdb_exec.isNull(&r[i]) { return t } }
+        for r in rows { if !lexdb_ops.isNull(&r[i]) { return t } }
         return ColT{kind: C_INT, n: 4, max: false}
     }
     if code == lexdb_syscat.TS_TINYINT && t.kind == C_INT {
@@ -350,8 +353,8 @@ fn hinted(t: ColT, h: int, rows: &[][]Val, i: int): ColT {
         // every value in the code page and within the length (8000 bytes, or n)
         let lim = if n > 0 { n } else if code == lexdb_syscat.TS_VARCHAR { 1073741823 } else { 1 }
         for r in rows {
-            if lexdb_exec.isNull(&r[i]) { continue }
-            let x = lexdb_exec.text(&r[i])
+            if lexdb_ops.isNull(&r[i]) { continue }
+            let x = lexdb_sql.text(&r[i])
             if code == lexdb_syscat.TS_NCHAR {
                 if units16(&x) > lim { return t }
             } else {
@@ -367,7 +370,7 @@ fn hinted(t: ColT, h: int, rows: &[][]Val, i: int): ColT {
     return t
 }
 
-fn (o: mut &Out) colmetadata(cols: &[]lexdb_exec.OutCol, ts: &[]ColT) {
+fn (o: mut &Out) colmetadata(cols: &[]lexdb_bind.OutCol, ts: &[]ColT) {
     o.u8(tds.TK_COLMETADATA)
     o.u16(len(cols))
     for i in 0..len(cols) {
@@ -557,7 +560,7 @@ fn (o: mut &Out) datetime(us: int, n: int): Result[Unit, DbErr] {
 fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
     let k = t.kind
     if k == C_VARIANT {
-        if lexdb_exec.isNull(v) {
+        if lexdb_ops.isNull(v) {
             o.u32(0)
             return Ok(Unit{})
         }
@@ -588,7 +591,7 @@ fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
                 try o.datetime(us, 8)
             }
             else {
-                let u = units(&lexdb_exec.text(v), 4000)
+                let u = units(&lexdb_sql.text(v), 4000)
                 o.u32(2 + 7 + len(u))
                 o.u8(tds.T_NVARCHAR)
                 o.u8(7)
@@ -599,7 +602,7 @@ fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
         }
         return Ok(Unit{})
     }
-    if lexdb_exec.isNull(v) {
+    if lexdb_ops.isNull(v) {
         if t.max { for _ in 0..8 { o.u8(0xFF) } } else if k == C_DATETIME { o.u8(0) } else { o.u16(0xFFFF) }
         return Ok(Unit{})
     }
@@ -613,7 +616,7 @@ fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
         }
         return Ok(Unit{})
     }
-    var x = lexdb_exec.text(v)
+    var x = lexdb_sql.text(v)
     if k == C_NCHAR {
         while units16(&x) < t.n { x = x + " " }
         let u = units(&x, t.n)
@@ -634,7 +637,7 @@ fn (o: mut &Out) hintedValue(t: &ColT, v: &Val): Result[Unit, DbErr] {
 
 fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
     if t.kind >= C_VARCHAR { return o.hintedValue(t, v) }
-    if lexdb_exec.isNull(v) {
+    if lexdb_ops.isNull(v) {
         if (t.kind == C_TEXT || t.kind == C_BIN) && t.max {
             for k in 0..8 { o.u8(0xFF) }
         } else if t.kind == C_TEXT || t.kind == C_BIN {
@@ -645,7 +648,7 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
         return Ok(Unit{})
     }
     // a value that does not fit its column (whose type is text then): its text
-    let vv: Val = if fits(t.kind, v) { v } else { Val.Text(lexdb_exec.text(v)) }
+    let vv: Val = if fits(t.kind, v) { v } else { Val.Text(lexdb_sql.text(v)) }
     if t.kind == C_BIT {
         match vv {
             Val.Int(b) {
@@ -732,7 +735,7 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
             o.u16(0)                // the offset: +00:00
         }
         else {
-            let u = units(&lexdb_exec.text(v), 1073741823)
+            let u = units(&lexdb_sql.text(v), 1073741823)
             if t.max {
                 o.plp(&u)
             } else {
@@ -746,7 +749,7 @@ fn (o: mut &Out) value(t: &ColT, v: &Val): Result[Unit, DbErr] {
 
 // A result set: COLMETADATA and its ROWs. Err, with nothing written, when a
 // value has no SQL Server form (a date before year 1, NaN, ...).
-fn (o: mut &Out) rowSet(cols: &[]lexdb_exec.OutCol, rows: &[][]Val): Result[Unit, DbErr] {
+fn (o: mut &Out) rowSet(cols: &[]lexdb_bind.OutCol, rows: &[][]Val): Result[Unit, DbErr] {
     let ts = colTypes(cols, rows)
     let mark = len(o.b)
     o.colmetadata(cols, &ts)
@@ -935,7 +938,7 @@ fn intOf(p: &tds.RpcParam): int {
 
 // RETURNVALUE: an output parameter's value.
 fn (o: mut &Out) returnValue(ordinal: int, name: &str, t: &lexdb_sql.TypeName, v: &Val) {
-    let cols = [lexdb_exec.OutCol{name: name.toStr(), oid: t.oid, spell: "", coll: "", scale: -1}]
+    let cols = [lexdb_bind.OutCol{name: name.toStr(), oid: t.oid, spell: "", coll: "", scale: -1}]
     let rows = [[v]]
     let ts = colTypes(&cols, &rows)
     let mark = len(o.b)
@@ -1004,7 +1007,7 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
     } else {
         let list = ds.unwrap()
         var given: []bool = []
-        var types: []lexdb_exec.TabType = []         // per declaration: its table type (key "": none)
+        var types: []lexdb_catalog.TabType = []         // per declaration: its table type (key "": none)
         var bound: []int = []                        // per declaration: the parameter given for it, -1 none
         var isTable: []bool = []                     // per declaration: a table-valued parameter's
         for j in 0..len(list) {
@@ -1013,7 +1016,7 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
             append(mut &given, false)
             append(mut &bound, -1)
             append(mut &isTable, false)
-            append(mut &types, lexdb_exec.TabType{key: "", spell: "", body: "", cols: []})
+            append(mut &types, lexdb_catalog.TabType{key: "", spell: "", body: "", cols: []})
             if d.output {
                 append(mut &outs, k)
                 append(mut &outNames, d.name)
@@ -1079,7 +1082,7 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
             }
             match valOf(&p) {
                 Ok(v) {
-                    match lexdb_exec.coerce(v, &list[k].typ) {
+                    match lexdb_ops.coerce(v, &list[k].typ) {
                         Ok(x) { f.vals[base + k] = x }
                         Err(e) { bad = Some(e) }
                     }

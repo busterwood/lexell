@@ -255,6 +255,7 @@ import "oracle"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
 import "../../../cmd/lexdb_tns"
 ''' + CMP + r'''
 fn values(rows: &oracle.Rows, row: int): str {
@@ -330,12 +331,13 @@ import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_sql"
 import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
 ''' + CMP + r'''
 fn cell(v: &lexdb_sql.Val): str {
-    if lexdb_exec.isNull(v) { return "NULL" }
+    if lexdb_ops.isNull(v) { return "NULL" }
     match v {
         lexdb_sql.Val.Text(t) { return "'" + strings.replaceAll(t, "'", "''") + "'" }
-        else { return lexdb_exec.text(v) }
+        else { return lexdb_sql.text(v) }
     }
 }
 
@@ -392,6 +394,7 @@ import "sqlserver"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
 import "../../../cmd/lexdb_wire"
 import "../../../cmd/lexdb_tds"
 ''' + CMP + r'''
