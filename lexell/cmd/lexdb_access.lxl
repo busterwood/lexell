@@ -903,11 +903,12 @@ fn fillPoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
 // (lexdb_store.scanLeaves: no entry copied out); None: a value of a kind
 // its column's batch does not hold. A key lookup or an empty range goes
 // through fillPoint; scanLeaves gives a replica's rows and the
-// transaction's own writes and cuts as one path too.
+// transaction's own writes and cuts as one path too. Its batch is spare's
+// when that is of the plan (lexdb_rows.reuse), as fillPickIn's.
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
-             bp: &BPlan): Result[Option[Batch], DbErr] {
+             bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
     if sc.empty || sc.point { return fillPoint(st, txn, t, sc, part, cur, bp) }
-    var b = lexdb_rows.newBatch(bp, BROWS)
+    var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
     while b.n < BROWS && !cur.done {
         let from = if cur.started { cur.at } else { sc.lo }
@@ -989,10 +990,11 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
 }
 
 // The next batch of the first level, as rd reads it (fillBatch for the
-// primary key, and for a scan of the whole table in an index's place).
+// primary key, and for a scan of the whole table in an index's place;
+// spare as fillBatch's).
 pub fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
-             bp: &BPlan): Result[Option[Batch], DbErr] {
-    if rd.ix < 0 || sc.whole { return fillBatch(st, txn, t, sc, part, cur, bp) }
+             bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
+    if rd.ix < 0 || sc.whole { return fillBatch(st, txn, t, sc, part, cur, bp, spare) }
     if sc.empty {
         cur.done = true
         return Ok(Some(lexdb_rows.newBatch(bp, 0)))
@@ -1444,7 +1446,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
     if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
-        let got = try fillLevel(st, txn, t, rd, sc, part, cur, bp)
+        let got = try fillLevel(st, txn, t, rd, sc, part, cur, bp, spare)
         if got.isNone() { return Ok(None) }
         let b = got.unwrap()
         var all: []int = withCapacity(b.n)
