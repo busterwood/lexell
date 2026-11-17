@@ -426,11 +426,24 @@ owned or copy, that starts empty and is set at most once:
   `get()` or `set(v)` from then on (in a drop method, including its own) stops
   the program (exit 12).
 
-**Globals of owned types** are otherwise not allowed. Mutable state that owns
-heap data belongs to `main` (or a context record it creates) and is passed down
-by borrow. Borrowing mutable owned globals soundly would need the effect rules
-of section 13; they will be considered only if real programs need more than
-copy globals, constant tables and set-once globals.
+**Globals of owned types** (design/owned-str.md, issue 8) are allowed with
+**value-only access**, when their type has a constant initializer: a `str`,
+or a value record or value closed type built from such types
+(`var LOG: str = ""`, `var CACHE: Option[[]int] = None`).
+- A built-in operation that runs no code of the program may read the global
+  in place: `len(g)`, `g[i]`, `g + x` and comparisons on strings.
+- `g.clone()` reads a copy.
+- `g = v` stores, dropping the old value.
+- No borrow of the global may outlive such an operation. Passing it to a
+  function or method (`f(g)`, `g.m()`), moving it out (`return g`), `&g`,
+  and `for x in g` are errors; write `g.clone()`.
+
+Because no borrow of the global ever outlives a built-in operation, no code
+that might assign it runs while one is held, which is why borrowing mutable
+globals in general would need the effect rules of section 13. A global of a
+boxed type, or of an array type (an array global is a constant table), must
+be set-once. Larger mutable state that owns heap data belongs to `main`, or a
+context record it creates, and is passed down by borrow.
 
 ### 5.3 Functions and methods
 

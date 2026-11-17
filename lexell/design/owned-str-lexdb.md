@@ -32,8 +32,14 @@ the reasons are in [owned-str.md](owned-str.md).
 | J | Issues 5 and 11: `toStr`/`eq` on string-holding library error and value types take `&Self` (cli, crypto, json, httpserver, redis, sqldialect `Value`/`DbError`, url, uuid, mssql `Diag`); `Option.is(&x)` | b4bbea4a | yes | none |
 | K | Issue 7, SPEC 7.4: `s += f(mut &s)` on an owned type is a borrow conflict. No compiler change: it follows from the existing rules once `str` is owned. | (spec only) | yes until the switch | At the switch, such code needs `let t = f(mut &s); s += t`. |
 
-Not yet decided (design/owned-str.md section 6): issues 2 and 8. Add them
-here as they land.
+| L | Issue 8, SPEC 5.2: global `var`s of owned types (str, and value records or value closed types built from them) with value-only access: built-in reads in place, `g.clone()`, `g = v`. A borrow (`f(g)`, `g.m()`), a move (`return g`) or `for x in g` is an error. Boxed and array globals must be `once`. | (this commit) | yes. Changed error texts: a global moved out now says "read a copy with g.clone()"; an owned non-array global that used to be rejected as "has the owned type" now compiles, or gets the boxed-type error. | none |
+
+Not yet decided (design/owned-str.md section 6): issue 2. Add it here when it
+lands.
+
+**At the switch, for string globals:** a string global passed to a function,
+returned or stored needs `g.clone()` (the sweep's `global` kind lists them;
+reads by built-in operators need nothing).
 
 **The switch itself**, when `str` becomes an owned, uncounted type, is the
 change that breaks code. Everything above is groundwork that lets code be
@@ -57,6 +63,8 @@ forms from the start:
 - **H:** `make().field` moves the field out; don't clone it.
 - **I:** in `for x in f() { append(mut &out, x) }`, `x` is owned; drop the
   `.clone()`. To consume a variable's array, write `for x in move(xs)`.
+- **L:** a string global read by a function call or a return becomes
+  `g.clone()`; `len(g)`, `g + x` and comparisons stay as they are.
 - **J:** `x.clone().toStr()` on those types becomes `x.toStr()`; `Some(y.clone())
   == opt` becomes `opt.is(&y)`.
 - **G:** a record or array that is really duplicated gets `x.clone()`; no
