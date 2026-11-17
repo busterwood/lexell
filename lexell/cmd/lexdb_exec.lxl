@@ -4979,6 +4979,9 @@ fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
 // where all its columns are known.
 // reorder: the tables of inner joins may run in another order than FROM's
 // (a SELECT's; UPDATE ... FROM and DELETE ... USING keep their target first).
+// The binder's pass (bindFrom: FROM, its columns, ON and WHERE resolved,
+// the subqueries numbered; Query.lp) and then the planner's (planFrom,
+// which reads the ON and WHERE conjuncts from Query.lp).
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool,
               sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
@@ -4992,14 +4995,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     sc.noRefKeys = false
     // the subqueries a semi-join may run (9.104): WHERE's top-level
     // conjuncts x IN (subquery) and EXISTS (subquery), of a SELECT
-    var semiCand: []bool = []
-    var semiAlts: []Option[SubPlan] = []
-    var semiLooks: []bool = []             // ... may be a lookup per row as a join's level (semiLook)
-    for i in 0..len(subs) {
-        append(mut &semiCand, false)
-        append(mut &semiAlts, None)
-        append(mut &semiLooks, false)
-    }
+    var semiCand: []bool = array(len(subs), false)
     var anySemi = false
     if reorder {
         match where {
@@ -5017,9 +5013,40 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             None {}
         }
     }
-    let ordBy = replace(mut &sc.ordBy, [])
-    let ordLim = sc.ordLim
+    let hs = FromHints{early: early, locking: locking, ordBy: replace(mut &sc.ordBy, []), ordLim: sc.ordLim, semiCand: semiCand, anySemi: anySemi}
     sc.ordLim = -1
+    let bf = try bindFrom(st, txn, from, where, params, subs, sc, mut &q)
+    try planFrom(st, txn, mut &q, &hs, &bf, params, subs, selNames, star, sc, reorder)
+    return Ok(q)
+}
+
+// The hints planSelect left on the Scope for this query, taken by
+// buildQuery before anything is planned (its subqueries set their own).
+type FromHints = record {
+    early: bool                 // Scope.early
+    locking: bool               // Scope.locking
+    ordBy: []lexdb_sql.OrderItem  // Scope.ordBy
+    ordLim: int                 // Scope.ordLim
+    semiCand: []bool            // per subquery: a semi-join's (WHERE's top-level x IN (subquery), EXISTS (subquery), 9.104)
+    anySemi: bool
+}
+
+// What bindFrom found beside the Query.
+type FromBound = record {
+    anyUsing: bool              // a JOIN ... USING or NATURAL JOIN (*'s order in ColDef.pos)
+    where: bool                 // Query.lp's top is WHERE's Filter
+}
+
+// The binder's pass over FROM (2e slice 2): each FROM item read (a table,
+// a view planned under its owner, a FROM subquery planned first, a working
+// table) and its columns added, USING's and NATURAL's ON made, the
+// expression subqueries planned and numbered (the views' after them), ON
+// and WHERE resolved. Its result is q's levels, columns and subqueries and
+// q.lp: the items left-deep in FROM's order, each Join with its ON, and
+// WHERE's Filter over them. The frame it pushes stays for the planner and
+// the select list (endScope pops it).
+fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem, where: &Option[Expr],
+            params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope, q: mut &Query): Result[FromBound, DbErr] {
     // a subquery in FROM is planned first: it sees the queries around this
     // one, not this one's tables
     var planned: [][]SubPlan = []
@@ -5156,7 +5183,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             qc.spell = t.cols[k].spell
             qc.coll = t.cols[k].coll
             append(mut &icols, lexdb_bind.bcolOf(len(q.cols), &qc))
-            addCol(mut &q, qc)
+            addCol(q, qc)
         }
         if f.sub < 0 && f.work < 0 && viewSrc < 0 {
             append(mut &items, lexdb_bind.LPlan.Get(t.name.toStr(), f.alias.toStr(), icols))
@@ -5277,24 +5304,13 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         append(mut &q.subs, vp)
     }
     let nl = len(q.levels)
-    // the columns by name, for levelOf (the planner asks it often: optimizer 30)
-    if nl >= 2 { for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } } }
-    // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
-    // conjunct goes below the last one.
-    var lastRight = -1
-    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
-    var ms: [][]Expr = []
-    var ps: [][]Expr = []
-    var lp = if nl == 0 { lexdb_bind.LPlan.One([]) } else { replace(mut &items[0], lexdb_bind.noPlan()) }
+    var lp = if nl == 0{ lexdb_bind.LPlan.One([]) } else { replace(mut &items[0], lexdb_bind.noPlan()) }
     for k in 0..nl {
-        append(mut &ms, [])
-        append(mut &ps, [])
         var jon: []Expr = []               // the logical plan's Join's ON
         match from[k].on {
             Some(on) {
                 // ON sees this table and those before it
                 let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
-                conjuncts(&r, mut &ms[k])
                 append(mut &jon, r)
             }
             None {}
@@ -5304,7 +5320,6 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 // its names qualified already; resolved as an ON is, for the
                 // types' casts (char(n)'s, 9.94) and enums' order
                 let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&u, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
-                conjuncts(&r, mut &ms[k])
                 append(mut &jon, r)
             }
             None {}
@@ -5314,55 +5329,85 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             let rc = lexdb_bind.lpCols(&items[k])
             for c in rc { append(mut &jcols, lexdb_bind.BCol{slot: c.slot, name: c.name, spell: c.spell, ty: c.ty}) }
             lp = lexdb_bind.LPlan.Join(from[k].join, q.levels[k].lateral, lp, replace(mut &items[k], lexdb_bind.noPlan()), jon, jcols)
+        } else if len(jon) > 0 {
+            // (a first item's ON, which SQL's grammar does not make: a
+            // Filter over it, level 0's condition)
+            let c0 = lexdb_bind.lpCols(&lp)
+            lp = lexdb_bind.LPlan.Filter(lp, jon, c0)
         }
     }
+    var hasWhere = false
     match where {
         Some(w0) {
             let w = pullCommonOr(w0)
             let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
-            var cs: []Expr = []
-            conjuncts(&r, mut &cs)
             let fcols = lexdb_bind.lpCols(&lp)
             lp = lexdb_bind.LPlan.Filter(lp, [r], fcols)
-            for i in 0..len(cs) {
-                let c = replace(mut &cs[i], Expr.Lit(Val.Null))
-                if nl == 0 {
-                    append(mut &q.top, c)
-                } else {
-                    var k = q.maxLevel(&c)
-                    if k < 0 { k = 0 }
-                    if lastRight > k { k = lastRight }
-                    // An OR across tables: each table's own part of it is a
-                    // necessary filter, so a scan of that table can cut its
-                    // rows before the join (q19's part brand/container).
-                    // Not a LEFT JOIN's nullable side: its conditions are its
-                    // ON's, and a branch that holds for its NULL-extended row
-                    // ("b.y is null") would lose that row's match. Not a
-                    // volatile OR: its copy would draw again (random()).
-                    let om = q.levelMask(&c)
-                    if lastRight < 0 && matchesOr(&c) && (om & (om - 1)) != 0 && !hasSubCall(&c) && immutable(&c) {
-                        for lev in 0..nl {
-                            if (om & (1 << lev)) == 0 || isOuter(q.levels[lev].join) { continue }
-                            let got = orLevels(&c, lev, &q)
-                            if got.isSome() { append(mut &ms[lev], got.unwrap()) }
-                        }
-                    }
-                    if isOuter(q.levels[k].join) { append(mut &ps[k], c) } else { append(mut &ms[k], c) }
-                }
-            }
+            hasWhere = true
         }
         None {}
     }
     q.lp = lp
+    return Ok(FromBound{anyUsing: anyUsing, where: hasWhere})
+}
+
+// The ON conjuncts of q.lp's FROM part, per level (ms[k]: the k-th
+// left-deep Join's), and WHERE's (where: q.lp's top is its Filter), as
+// bindFrom left them; conjuncts copies them.
+fn fromConds(p: &lexdb_bind.LPlan, where: bool, ms: mut &[][]Expr, cs: mut &[]Expr) {
+    if where {
+        match p {
+            lexdb_bind.LPlan.Filter(i, w, _) {
+                let n = onConds(&i, ms)
+                for x in w { conjuncts(&x, cs) }
+                return
+            }
+            else {}
+        }
+    }
+    let n = onConds(p, ms)
+}
+
+// The levels in p, its Joins' ON conjuncts into ms by level.
+fn onConds(p: &lexdb_bind.LPlan, ms: mut &[][]Expr): int {
+    match p {
+        lexdb_bind.LPlan.Join(_, _, l, _, on, _) {
+            let k = onConds(&l, ms)
+            if k < len(ms) { for x in on { conjuncts(&x, mut &ms[k]) } }
+            return k + 1
+        }
+        lexdb_bind.LPlan.Filter(_, on, _) {
+            // a first item's ON (bindFrom)
+            if len(ms) > 0 { for x in on { conjuncts(&x, mut &ms[0]) } }
+            return 1
+        }
+        else {}
+    }
+    return 1
+}
+
+// The planner's pass over FROM (2e slice 2), after bindFrom: the semi-join
+// alternatives, the ON and WHERE conjuncts placed per level (read from
+// q.lp), the implied equalities, the join order, the paths, hashing, the
+// semi-joins.
+fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs: &FromHints, bf: &FromBound,
+            params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool, sc: mut &Scope,
+            reorder: bool): Result[Unit, DbErr] {
+    let early = hs.early
+    let locking = hs.locking
+    let anyUsing = bf.anyUsing
+    var semiAlts: []Option[SubPlan] = []
+    for i in 0..len(subs) { append(mut &semiAlts, None) }
+    var semiLooks: []bool = array(len(subs), false)    // ... may be a lookup per row as a join's level (semiLook)
     // A correlated EXISTS or IN of a semi-join's that 9.9 could not hash,
     // its outer values a lookup's keys: planned again without them as
     // keys, to be hashed if a hash costs less (semiJoins). Not where
     // reading may stop early, nor in a transaction whose reads are noted:
     // there the lookups' reads stand (as in the join order). Planner work:
     // after every subquery is numbered and typed.
-    if anySemi && !early && !txn.noting() && !txn.sql.rules {
+    if hs.anySemi && !early && !txn.noting() && !txn.sql.rules {
         for i in 0..len(subs) {
-            if !semiCand[i] { continue }
+            if !hs.semiCand[i] { continue }
             let sp = &q.subs[i]
             if !((sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 && !sp.hashed && sp.cte < 0) { continue }
             semiLooks[i] = true
@@ -5377,6 +5422,47 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 let alt = got.unwrap()
                 if alt.hashed && semiAltOk(&alt, &q.subs[i]) { semiAlts[i] = Some(alt) }
             }
+        }
+    }
+    let nl = len(q.levels)
+    // the columns by name, for levelOf (the planner asks it often: optimizer 30)
+    if nl >= 2 { for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } } }
+    // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
+    // conjunct goes below the last one.
+    var lastRight = -1
+    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
+    var ms: [][]Expr = []
+    var ps: [][]Expr = []
+    for k in 0..nl {
+        append(mut &ms, [])
+        append(mut &ps, [])
+    }
+    var cs: []Expr = []                    // WHERE's conjuncts
+    fromConds(&q.lp, bf.where, mut &ms, mut &cs)
+    for i in 0..len(cs) {
+        let c = replace(mut &cs[i], Expr.Lit(Val.Null))
+        if nl == 0 {
+            append(mut &q.top, c)
+        } else {
+            var k = q.maxLevel(&c)
+            if k < 0 { k = 0 }
+            if lastRight > k { k = lastRight }
+            // An OR across tables: each table's own part of it is a
+            // necessary filter, so a scan of that table can cut its
+            // rows before the join (q19's part brand/container).
+            // Not a LEFT JOIN's nullable side: its conditions are its
+            // ON's, and a branch that holds for its NULL-extended row
+            // ("b.y is null") would lose that row's match. Not a
+            // volatile OR: its copy would draw again (random()).
+            let om = q.levelMask(&c)
+            if lastRight < 0 && matchesOr(&c) && (om & (om - 1)) != 0 && !hasSubCall(&c) && immutable(&c) {
+                for lev in 0..nl {
+                    if (om & (1 << lev)) == 0 || isOuter(q.levels[lev].join) { continue }
+                    let got = orLevels(&c, lev, q)
+                    if got.isSome() { append(mut &ms[lev], got.unwrap()) }
+                }
+            }
+            if isOuter(q.levels[k].join) { append(mut &ps[k], c) } else { append(mut &ms[k], c) }
         }
     }
     // the columns the SELECT names, for the index-only choice (9.31):
@@ -5418,7 +5504,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         var cap = HASH_MAX_BYTES
         if txn.sql.memMax > 0 && float(txn.sql.memMax) / 2.0f < cap { cap = float(txn.sql.memMax) / 2.0f }
         var ordCols: []int = []
-        let ordT = q.orderedLevel(&ordBy, mut &ordCols)
+        let ordT = q.orderedLevel(&hs.ordBy, mut &ordCols)
         // A join that starts from a row its key pins (optimizer 35): the
         // order bound by keys, at once; no statistics read for it and no
         // search (most OLTP joins, planned on every run unless prepared).
@@ -5426,7 +5512,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         // order and stopping early (optimizer 32) may beat starting from the
         // pinned row (optimizer 39).
         var po: []int = []
-        if ordT < 0 || ordLim < 0 { po = q.pinnedOrder(&ms) }
+        if ordT < 0 || hs.ordLim < 0 { po = q.pinnedOrder(&ms) }
         let pinned = len(po) > 0
         // from one row, a lookup per row is one lookup: cheaper than a hash
         // of what a constant reaches (the "constant first" rule, optimizer 27)
@@ -5446,7 +5532,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             var ident = true
             for i in 0..nl { if po[i] != i { ident = false } }
             if !ident { perm = po }
-        } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(ordLim), mut &perm, mut &ro) {
+        } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(hs.ordLim), mut &perm, mut &ro) {
             perm = q.joinOrder(&ms)
             // outer joins, in FROM's order: each table hashed or looked up
             // by cost (optimizer 41)
@@ -5528,7 +5614,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             q.levels[k].est = try loadEst(st, txn, &q.levels[k].t, true)
         }
         var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} } else {
-            choosePath(&q, k, &m, params, mut &sc.looks)
+            choosePath(q, k, &m, params, mut &sc.looks)
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
@@ -5581,8 +5667,8 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         q.levels[k].hashKinds = hkinds
     }
     for i in 0..len(rightLocal) { append(mut &q.levels[1].local, replace(mut &rightLocal[i], Expr.Lit(Val.Null))) }
-    if anySemi && nl > 0 { try semiJoins(st, txn, mut &q, mut &semiAlts, &semiCand, &semiLooks, params, sc) }
-    return Ok(q)
+    if hs.anySemi && nl > 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc) }
+    return Ok(Unit{})
 }
 
 // Reads the tables that are joined by hash, once.
