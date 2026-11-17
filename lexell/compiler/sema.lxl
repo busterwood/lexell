@@ -294,6 +294,7 @@ pub type Program = record {
     pub main: int
     bcMemo: []int            // isBorrowClass per type: -1 unknown, 0, 1
     bcDecl: []int            // declBC per declaration: -1 unknown, 0, 1, 2 (being computed)
+    pub ownedStr: bool       // LXL_OWNED_STR=1: str is an owned type (design/owned-str.md, a measurement)
 }
 
 // ---------------------------------------------------------------- errors
@@ -402,7 +403,8 @@ pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
     var pg = Program{libroots: libroots, mainFile: mainFile, mods: [], modIndex: newMapWith[str, int](fxHashStr), types: [],
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
-        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, main: -1, bcMemo: [], bcDecl: []}
+        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, main: -1, bcMemo: [], bcDecl: [],
+        ownedStr: os.envOr("LXL_OWNED_STR", "") == "1"}
     let none: []int = []
     for p in 0..len(PRIM_NAMES) { pg.intern(TK_PRIM, p, 0, false, &none) }
     pg.intern(TK_SELF, 0, 0, false, &none)
@@ -654,10 +656,28 @@ pub fn (pg: mut &Program) fieldTypes(t: int): []int {
 
 pub fn (pg: mut &Program) isCopy(t: int): bool { return pg.isCopyAt(t, 0) }
 
+// LXL_OWNED_STR: a type copied today that would be owned with str owned.
+pub fn (pg: mut &Program) soft(t: int): bool { return pg.ownedStr && pg.isCopyLegacy(t) }
+
+// A measurement line on stderr: OWNED_STR kind file:line name.
+pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
+    eprintln("OWNED_STR " + kind + " " + pg.mods[m].fname + ":" + intToStr(line) + " " + what)
+}
+
+// isCopy as if str were counted (LXL_OWNED_STR off): the measurement's "copied today".
+pub fn (pg: mut &Program) isCopyLegacy(t: int): bool {
+    let o = pg.ownedStr
+    pg.ownedStr = false
+    let r = pg.isCopyAt(t, 0)
+    pg.ownedStr = o
+    return r
+}
+
 fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     if depth > 5000 { pg.tooDeep() }
     match pg.tk(t) {
-        TK_PRIM, TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
+        TK_PRIM { return !(pg.ownedStr && pg.ta(t) == T_STR) }
+        TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
         TK_ARR, TK_SELF { return false }
         TK_TP { return pg.tparams[pg.ta(t)].copy }
         else {}
@@ -1342,7 +1362,9 @@ pub fn (pg: mut &Program) checkTargs(targs: &[]int, tparams: &[]int, m: int, lin
                 "types, so they cannot be type arguments")
         }
         pg.checkBorrowTarg(t, p, m, line)
-        if pg.tparams[p].copy && !pg.isCopy(t) {
+        if pg.tparams[p].copy && !pg.isCopy(t) && pg.soft(t) {
+            pg.note("tcopy", m, line, &pn)
+        } else if pg.tparams[p].copy && !pg.isCopy(t) {
             pg.err(m, line, pg.tstr(t) + " is not a copy type (type parameter " + pn + " needs copy)")
         }
         let cons = copyInts(&pg.tparams[p].cons)
@@ -1676,7 +1698,10 @@ fn (pg: mut &Program) resolveGlobal(g: int) {
         pg.err(m, a.line, "global " + pg.globals[g].name + " cannot have the type " + pg.tstr(t) +
             ": it holds borrows, which are second class")
     }
-    if !pg.isCopy(t) && !pg.globals[g].isOnce {
+    if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.soft(t) {
+        let gname = pg.globals[g].name
+        pg.note("gvar", m, a.line, &gname)
+    } else if !pg.isCopy(t) && !pg.globals[g].isOnce {
         let ts = pg.tstr(t)
         let gn = pg.globals[g].name
         pg.err(m, a.line, "global " + gn + " has the owned type " + ts + "; globals must have " +
@@ -1727,7 +1752,7 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
         }
         if t >= 0 && (pg.tk(t) == TK_ARR || pg.tk(t) == TK_INST) {     // a constant table, or a record/variant constant
             let et = if pg.tk(t) == TK_ARR { pg.ta(t) } else { t }
-            if !pg.isCopy(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
+            if !pg.isCopy(et) && !pg.soft(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
             pg.consts[c].table = t
             pg.consts[c].value = cv(t, CK_TABLE)
             pg.consts[c].busy = false
@@ -2078,7 +2103,7 @@ pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
                         for c0 in cons {
                             if len(pg.satisfies(bt, pg.subst(c0, &bind), m)) > 0 { replace(mut &cands, []) }
                         }
-                        if pg.tparams[tp].copy && !pg.isCopy(bt) { replace(mut &cands, []) }
+                        if pg.tparams[tp].copy && !pg.isCopy(bt) && !pg.soft(bt) { replace(mut &cands, []) }
                     }
                 }
             }

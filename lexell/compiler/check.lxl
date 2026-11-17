@@ -165,6 +165,8 @@ type Var = value record {
     kind: int
     line: int
     moved: bool
+    mline: int      // LXL_OWNED_STR: the line of its last move
+    mctx: str       // and what took it
     broot: int      // the root of a borrow variable, or -1
     cap: int        // a closure's capture: the captured variable, or -1
     capmut: bool
@@ -343,6 +345,7 @@ type MatchX = record {
 }
 
 pub type Checker = record {
+    octx: str       // LXL_OWNED_STR: what is consuming (let, arg, return, ...)
     pub pg: sema.Program
     pub x: tm.Arena            // the templates' nodes
     pub tmpls: []Tmpl          // per FnDecl
@@ -371,7 +374,7 @@ pub type Checker = record {
 pub fn newChecker(pg: sema.Program): Checker {
     var c = Checker{pg: pg, x: tm.newArena(), tmpls: [], ginits: [], cinits: [], vars: [], tmps: [], capl: [], statics: newMapWith[str, int](fxHashStr),
         podMemo: [], copyMemo: [], cids: 0, holes: [], lifted: [], cx: newCtx(-1, "", sema.T_VOID, [], 0, false),
-        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0}
+        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0, octx: ""}
     for f in 0..len(c.pg.fns) { append(mut &c.tmpls, Tmpl{done: false, lines: [], holes: [], lifted: []}) }
     for g in 0..len(c.pg.globals) { append(mut &c.ginits, noInit()) }
     for k in 0..len(c.pg.consts) { append(mut &c.cinits, noInit()) }
@@ -1155,7 +1158,7 @@ fn (c: mut &Checker) lookupAt(lvl: int, name: &str, capture: bool): int {
 
 fn (c: mut &Checker) newVar(name: &str, cn: &str, t: int, mutable: bool, kind: int, line: int): int {
     let cx = c.nm(cn)
-    append(mut &c.vars, Var{name: name, c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false,
+    append(mut &c.vars, Var{name: name, c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false, mline: 0, mctx: "",
         broot: -1, cap: -1, capmut: false, pjoin: 0, croot: -1, depth: len(c.cx.scopes) - 1, loops: len(c.cx.loops),
         jn: -1, tv: false, blk: len(c.cx.blks) - 1, bi: if len(c.cx.blks) > 0 { c.cx.blks[len(c.cx.blks) - 1].i } else { -1 }})
     return len(c.vars) - 1
@@ -1317,7 +1320,9 @@ fn (c: mut &Checker) join(snaps: &[][]int, line: int) {
         while i < len(snaps[k]) {
             let v = snaps[k][i]
             let s0 = snapGet(&snaps[0], v)
-            if s0 >= 0 && s0 != snaps[k][i + 1] { c.err(line, "'" + c.vars[v].name + "' is moved on one path but not another") }
+            if s0 >= 0 && s0 != snaps[k][i + 1] && c.soft(c.vars[v].t) {
+                c.noteClone(v)
+            } else if s0 >= 0 && s0 != snaps[k][i + 1] { c.err(line, "'" + c.vars[v].name + "' is moved on one path but not another") }
             i += 2
         }
     }
@@ -1399,6 +1404,14 @@ fn (c: mut &Checker) checkPending(root: int, path: &str, line: int, move: bool) 
     }
 }
 
+// Under LXL_OWNED_STR: would moving root's path conflict with a borrow held by a call in progress?
+fn (c: &Checker) pendingHit(root: int, path: &str): bool {
+    for p in c.cx.pending {
+        if p.root == root && overlap(&p.path, path) { return true }
+    }
+    return false
+}
+
 fn (c: mut &Checker) newCid(): int {
     c.cids += 1
     return c.cids
@@ -1439,6 +1452,15 @@ fn (c: mut &Checker) hold(v: Val, m: int, cid: int, line: int) {
 
 fn hm(m: bool): int { return if m { HM_MUT } else { HM_SHARED } }
 
+// consume, recording what takes the value for LXL_OWNED_STR's notes.
+fn (c: mut &Checker) consumeAs(what: &str, v: Val, line: int): int {
+    let o = c.octx
+    c.octx = what
+    let r = c.consume(v, line)
+    c.octx = o
+    return r
+}
+
 // Take ownership of the value of v: copy (dup) a copy type, move otherwise.
 fn (c: mut &Checker) consume(v: Val, line: int): int {
     if c.pg.tk(v.t) == sema.TK_CLO {
@@ -1452,9 +1474,23 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
     }
     if v.cat == CAT_RV { return v.c }
     if c.isCopy(v.t) { return c.dup(v.c, v.t) }
+    let soft = c.soft(v.t)
     if v.vvar >= 0 && !v.viaref && len(v.path) == 0 && c.pg.tk(c.vars[v.vvar].t) != sema.TK_REF {
         let vx = v.vvar
         if c.vars[vx].moved { c.movedErr(vx, line) }
+        if soft && len(c.cx.nomove) > 0 {
+            c.note("loop", line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft && c.pendingHit(vx, "") {
+            c.note("held", line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft {
+            c.note("move", line, &c.vars[vx].name)
+            c.vars[vx].mline = line
+            c.vars[vx].mctx = c.octx
+        }
         if len(c.cx.nomove) > 0 {
             c.err(line, "cannot move '" + c.vars[vx].name + "' " + c.cx.nomove[len(c.cx.nomove) - 1])
         }
@@ -1465,6 +1501,11 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
     }
     let hasName = v.root >= 0 || v.root <= -2
     let name = c.rootName(v.root, "")
+    if soft {
+        let what = if v.viaref { "borrow" } else if v.gk >= 0 { "global" } else { "place" }
+        c.note(&what, line, &name)
+        return c.dup(v.c, v.t)
+    }
     if v.viaref {
         let s = if hasName { " (" + name + ")" } else { "" }
         c.err(line, "cannot move a " + c.tstr(v.t) + " out of a borrow" + s + ": it is not a copy type")
@@ -1825,7 +1866,7 @@ fn (c: mut &Checker) sLet(s: int) {
     if exp >= 0 { v = c.coerce(v, exp, n.line, &what) }
     let bc = c.pg.isBorrowClass(v.t)
     let cr = if bc { c.crOf(v) } else { -1 }
-    let cc = c.consume(v, n.line)
+    let cc = c.consumeAs("let", v, n.line)
     let ct = c.T(v.t)
     c.emit(c.x.decl(ct, &cn, cc))
     let x = c.newVar(&name, &cn, v.t, mutable, VK_LOCAL, n.line)
@@ -1872,7 +1913,9 @@ fn (c: mut &Checker) sDestructure(s: int) {
     var v = c.expr(n.c, exp)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
     if c.pg.tk(v.t) != sema.TK_INST || c.pg.ta(v.t) != di { c.err(n.line, "the value is " + c.tstr(v.t) + ", not a " + dname) }
-    if v.cat == CAT_PLACE && !c.isCopy(v.t) {
+    if v.cat == CAT_PLACE && !c.isCopy(v.t) && c.soft(v.t) {
+        c.note("apart", n.line, "")
+    } else if v.cat == CAT_PLACE && !c.isCopy(v.t) {
         c.err(n.line, "cannot take apart a place of the owned type " + c.tstr(v.t) + ": the value must not be a " +
             "variable, field or element (use move(x) for a local)")
     }
@@ -1893,7 +1936,7 @@ fn (c: mut &Checker) sDestructure(s: int) {
     let acc = c.fresh("ds")
     let ct = c.T(v.t)
     let dcr = if c.pg.isBorrowClass(v.t) { c.crOf(v) } else { -1 }
-    let cv = c.consume(v, n.line)
+    let cv = c.consumeAs("destructure", v, n.line)
     c.emit(c.x.decl(ct, &acc, cv))
     let accn = c.nm(&acc)
     let sep = if c.pg.types[di].value { "." } else { "->" }
@@ -1994,7 +2037,7 @@ fn (c: mut &Checker) sAssign(s: int) {
                 c.frozen(vx, FR_ASSIGN, n.line)
                 c.cx.rhsAt = -1
                 if c.pg.isBorrowClass(vt) { c.storeRoot(vx, c.crOf(v), vt, n.line) }
-                let cc = c.consume(v, n.line)
+                let cc = c.consumeAs("assign", v, n.line)
                 var p = val(c.vars[vx].c, vt, CAT_PLACE)
                 p.vvar = vx
                 c.store(p, cc, !c.vars[vx].moved)
@@ -2012,14 +2055,14 @@ fn (c: mut &Checker) sAssign(s: int) {
         let mark = len(c.cx.pending)
         if c.effects(tg, false) { v = c.snapVal(v) }
         if c.placeActs(tg) || (c.acts(tg) && c.pod(v.t)) { v = c.seq(v) }
-        if v.cat == CAT_PLACE && !c.isCopy(v.t) { c.hold(v, HM_MOVE, c.newCid(), n.line) }
+        if v.cat == CAT_PLACE && !c.isCopy(v.t) && !c.soft(v.t) { c.hold(v, HM_MOVE, c.newCid(), n.line) }
         c.cx.rhsAt = s
         let p = c.place(tg)
         c.cx.rhsAt = -1
         c.cutPending(mark)
         v = c.coerce(v, p.t, n.line, "the assigned value")
         if c.pg.isBorrowClass(p.t) { c.storeRoot(p.root, c.crOf(v), p.t, n.line) }
-        let cc = c.consume(v, n.line)
+        let cc = c.consumeAs("assign", v, n.line)
         c.store(p, cc, true)
         return
     }
@@ -2033,7 +2076,7 @@ fn (c: mut &Checker) sAssign(s: int) {
     // (`x.v += take(x)`, or an if expression moving it on one path and dropping it on the others)
     if p.root >= 0 && p.vvar < 0 && c.vars[p.root].moved { c.movedErr(p.root, n.line) }
     if c.effects(n.b, false) && c.checks(p.c) && c.pod(p.t) { r = c.seq(r) }
-    let cc = c.consume(c.coerce(r, p.t, n.line, "the result"), n.line)
+    let cc = c.consumeAs("assign", c.coerce(r, p.t, n.line, "the result"), n.line)
     let live = !(p.vvar >= 0 && c.vars[p.vvar].moved)
     c.store(p, cc, live)
     if p.vvar >= 0 {
@@ -2095,7 +2138,34 @@ fn (c: mut &Checker) cond(e: int): int {
     return c.nm(&cn)
 }
 
-fn (c: &Checker) movedErr(vx: int, line: int): never {
+// LXL_OWNED_STR (design/owned-str.md): a type copied today that would be owned with str owned.
+fn (c: mut &Checker) soft(t: int): bool { return c.pg.ownedStr && !c.isCopy(t) && c.pg.isCopyLegacy(t) }
+
+// A measurement line on stderr: OWNED_STR kind file:line name.
+fn (c: &Checker) note(kind: &str, line: int, what: &str) {
+    let into = if c.octx == "" { "other" } else { c.octx }
+    eprintln("OWNED_STR " + kind + " " + c.pg.mods[c.cx.mod].fname + ":" + intToStr(line) + " " + what + " " + into)
+}
+
+// A move that a later use shows needed a clone: noted where it was, with what took it.
+fn (c: &Checker) noteClone(vx: int) {
+    let into = if c.vars[vx].mctx == "" { "other" } else { c.vars[vx].mctx }
+    eprintln("OWNED_STR clone " + c.pg.mods[c.cx.mod].fname + ":" + intToStr(c.vars[vx].mline) + " " +
+        c.vars[vx].name + " " + into)
+}
+
+// Under LXL_OWNED_STR, a use after a move of a soft variable: its last move needed a clone. The
+// variable is given its value back and checking goes on.
+fn (c: mut &Checker) movedErr(vx: int, line: int) {
+    if c.soft(c.vars[vx].t) {
+        c.noteClone(vx)
+        c.vars[vx].moved = false
+        return
+    }
+    c.movedErr0(vx, line)
+}
+
+fn (c: &Checker) movedErr0(vx: int, line: int): never {
     var m = "'" + c.vars[vx].name + "' was moved and has no value here"
     if c.vars[vx].pjoin > 0 {
         m = m + " (it is moved on some paths of the if or match at line " + intToStr(c.vars[vx].pjoin) +
@@ -2243,7 +2313,10 @@ fn (c: mut &Checker) loopEnd(body: int, line: int) {
         for b in lp.breaks {
             var i = 0
             while i < len(lp.entry) {
-                if snapGet(&b, lp.entry[i]) != lp.entry[i + 1] {
+                let lv = lp.entry[i]
+                if snapGet(&b, lv) != lp.entry[i + 1] && c.soft(c.vars[lv].t) {
+                    c.noteClone(lv)
+                } else if snapGet(&b, lv) != lp.entry[i + 1] {
                     c.err(line, "'" + c.vars[lp.entry[i]].name + "' is moved inside the loop")
                 }
                 i += 2
@@ -2253,12 +2326,16 @@ fn (c: mut &Checker) loopEnd(body: int, line: int) {
     }
 }
 
-fn (c: &Checker) loopState(line: int) {
+fn (c: mut &Checker) loopState(line: int) {
     let lp = len(c.cx.loops) - 1
     var i = 0
     while i < len(c.cx.loops[lp].entry) {
         let v = c.cx.loops[lp].entry[i]
-        if (if c.vars[v].moved { 1 } else { 0 }) != c.cx.loops[lp].entry[i + 1] {
+        let ch = (if c.vars[v].moved { 1 } else { 0 }) != c.cx.loops[lp].entry[i + 1]
+        if ch && c.soft(c.vars[v].t) {
+            c.noteClone(v)
+            c.vars[v].moved = false
+        } else if ch {
             c.err(line, "'" + c.vars[v].name + "' is moved inside the loop and not assigned again before the next " +
                 "iteration")
         }
@@ -2433,7 +2510,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     let cr = if c.pg.isBorrowClass(v0.t) {
         c.stmtRoot(c.crOf(v0), mut &h, &("the temporary in the header of the for loop at line " + intToStr(line)), line)
     } else { -1 }
-    let cc = c.consume(v0, line)
+    let cc = c.consumeAs("for", v0, line)
     c.emit(c.x.sblock())
     c.cx.ind += 1
     c.pushScope()
@@ -2465,7 +2542,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     if some < 0 { c.err(line, "an iterator's next must return an Option, not " + c.tstr(ot)) }
     let rcr = if c.pg.isBorrowClass(ot) { c.crOf(r) } else { -1 }
     let on = c.fresh("nx")
-    c.emit(c.x.decl(c.T(ot), &on, c.consume(r, line)))
+    c.emit(c.x.decl(c.T(ot), &on, c.consumeAs("for", r, line)))
     let fr = c.popFrame()
     c.dropFrame(&fr)
     let sep = if c.pg.types[c.pg.ta(ot)].value { "." } else { "->" }
@@ -2520,7 +2597,7 @@ fn (c: mut &Checker) sReturn(s: int) {
         } else {
             v = c.coerce(v, ret, n.line, "the returned value")
             if c.cx.fd >= 0 && c.pg.isBorrowClass(ret) { c.checkResult(c.crOf(v), -1, n.line, false) }
-            cc = c.consume(v, n.line)
+            cc = c.consumeAs("return", v, n.line)
         }
         let rn = c.fresh("r")
         let ct = c.T(ret)
@@ -2580,7 +2657,7 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
         }
         let an = c.fresh("s")
         let ct = c.T(base)
-        let cv = c.consume(v, n.line)
+        let cv = c.consumeAs("match", v, n.line)
         c.emit(c.x.decl(ct, &an, cv))
         acc = c.nm(&an)
     }
@@ -3912,7 +3989,7 @@ fn (c: mut &Checker) ifBranch(x: int, want: int, snap: &[]int, r: int, bm: bool)
     }
     let fr = c.popFrame()
     if !v.noreturn {
-        v = rv(c.consume(v, c.line(x)), v.t)
+        v = rv(c.consumeAs("if", v, c.line(x)), v.t)
         var live = false
         for t in fr {
             if c.tmps[t].live { live = true }
@@ -4052,7 +4129,7 @@ fn (c: mut &Checker) mxBody(x: int) {
             c.err(c.line(x), "the arms of a match expression have different types, " + c.tstr(c.mxs[top].t) + " and " +
                 c.tstr(v.t))
         }
-        let cc = c.consume(v, c.line(x))
+        let cc = c.consumeAs("match", v, c.line(x))
         c.emitx(c.x.asg(c.mxs[top].r, cc))
     }
     c.dropFrame(&fr)
@@ -4185,7 +4262,7 @@ fn (c: mut &Checker) xTry(e: int, exp: int): Val {
     // Err value returned, which must be rooted at the function's sources
     let tcr = if c.pg.isBorrowClass(t) { c.crOf(v) } else { R_FREE }
     if c.pg.isBorrowClass(a.erT) && len(c.cx.rsrc) > 0 { c.checkResult(tcr, -1, n.line, false) }
-    let cv = c.consume(v, n.line)
+    let cv = c.consumeAs("try", v, n.line)
     c.emit(c.x.decl(ct, &sn, cv))
     let snn = c.nm(&sn)
     c.emit(c.x.sif(c.x.bin("==", c.x.member(snn, &sep, "tag"), c.lit(c.pg.variants[a.er].index))))
@@ -4451,7 +4528,7 @@ fn (c: mut &Checker) xArrlit(e: int, exp: int): Val {
         for v in vals { acr = c.joinRoots(acr, c.crOf(v)) }
     }
     var cs: []int = []
-    for v in vals { append(mut &cs, c.consume(v, n.line)) }
+    for v in vals { append(mut &cs, c.consumeAs("arrlit", v, n.line)) }
     let an = c.fresh("a")
     let ct = c.T(et)
     c.emit(c.x.decl(c.ct("lxl_arr"), &an, c.x.call("rt_arr_new", [c.lit(len(cs)), c.x.szof(ct)])))
@@ -4597,6 +4674,10 @@ fn (c: mut &Checker) late(a0: int): bool {
 
 // Take a late borrow: its place must still be there; rule 3 then holds it.
 fn (c: mut &Checker) take(v: Val, m: int, cid: int, line: int) {
+    if v.root >= 0 && c.vars[v.root].moved && c.soft(c.vars[v.root].t) {
+        c.noteClone(v.root)
+        c.vars[v.root].moved = false
+    }
     if v.root >= 0 && c.vars[v.root].moved {
         c.err(line, "'" + c.vars[v.root].name + "' was moved and has no value here: a later argument moved it, and the " +
             "borrow of it is taken when the call is made")
@@ -4819,7 +4900,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                 if effs[p] { later = true }
             }
             if later { v = c.snapVal(v) }
-            if v.cat == CAT_PLACE && !c.isCopy(v.t) { c.hold(v, HM_MOVE, cid, line) }
+            if v.cat == CAT_PLACE && !c.isCopy(v.t) && !c.soft(v.t) { c.hold(v, HM_MOVE, cid, line) }
             vals[i] = CArg{b: false, v: v}
         }
         if mayBC && ptk != sema.TK_CLO {
@@ -4892,7 +4973,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
     }
     var cs: []int = []
     for x in vals {
-        if x.b || sig.kind == SK_INTR || sig.kind == SK_EXTERN { append(mut &cs, x.v.c) } else { append(mut &cs, c.consume(x.v, line)) }
+        if x.b || sig.kind == SK_INTR || sig.kind == SK_EXTERN { append(mut &cs, x.v.c) } else { append(mut &cs, c.consumeAs("arg", x.v, line)) }
     }
     c.cutPending(mark)
     let ret = c.pg.subst(sig.ret, &bind)
@@ -5295,7 +5376,7 @@ fn (c: mut &Checker) rawPtr(name: &str, e: int, exp: int): Val {
         if c.pg.tk(v.t) != sema.TK_INST || c.pg.types[c.pg.ta(v.t)].value {
             c.err(line, "intoPtr needs a boxed record or closed type, not " + c.tstr(v.t))
         }
-        let cc = c.consume(v, line)
+        let cc = c.consumeAs("rawptr", v, line)
         return rv(c.x.pcast(c.ct("void*"), cc), sema.T_PTR)
     }
     if exp < 0 || c.pg.tk(exp) != sema.TK_INST || c.pg.types[c.pg.ta(exp)].value {
@@ -5389,7 +5470,7 @@ fn (c: mut &Checker) onceCall(g: int, name: &str, e: int): Val {
         return rvAt(c.addrOf(gt, c.nm(&cn)), c.pg.mkRef(gt, false), c.staticVar(sema.D_GLOBAL, g), "")
     }
     let v = c.seq(c.coerce(c.expr(c.item(n.b, 0), gt), gt, n.line, &("the value of " + gname)))
-    let cc = c.consume(v, n.line)
+    let cc = c.consumeAs("once", v, n.line)
     let m = c.x.cond(c.x.bin("==", setn, c.lit(2)), c.x.str(&(msg + " is dropped")), c.x.str(&(msg + " is set twice")))
     c.emit(c.x.if1(setn, c.x.sx(c.x.call("rt_trap", [c.lit(12), m, W]))))
     c.emit(c.x.seq([c.x.sx(c.x.asg(c.nm(&cn), cc)), c.x.sx(c.x.asg(setn, c.lit(1)))]))
@@ -5516,7 +5597,7 @@ fn (c: mut &Checker) bAppend(e: int): Val {
     v = c.coerce(v, et, line, "the appended value")
     if c.pg.isBorrowClass(et) { c.storeRoot(a.root, c.crOf(v), et, line) }
     if a.late { c.take(a, HM_MUT, c.newCid(), line) }
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("append", v, line)
     let n = c.fresh("ap")
     let ct = c.T(et)
     c.emit(c.x.decl(ct, &n, cc))
@@ -5567,7 +5648,7 @@ fn (c: mut &Checker) bReplace(e: int): Val {
     if bcT { c.storeRoot(p.root, c.crOf(v), t, line) }
     if c.checks(p.c) { v = c.seq(v) }         // the value's checks, then the place's again
     if p.late { c.take(p, HM_MUT, c.newCid(), line) }
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("replace", v, line)
     let n = c.fresh("old")
     let ct = c.T(t)
     c.emit(c.x.decl(ct, &n, c.x.pre("*", p.c)))
@@ -5591,7 +5672,7 @@ fn (c: mut &Checker) bMove(e: int): Val {
     let v = c.expr(a, -1)
     if c.pg.tk(v.t) == sema.TK_REF { c.err(line, "cannot move the borrow '" + c.nd(a).s + "'") }
     let mcr = c.crOf(v)
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("move", v, line)
     var r = c.holdtmp(cc, v.t)
     r.cr = mcr
     return r
@@ -5606,12 +5687,13 @@ fn (c: mut &Checker) bArray(e: int, exp: int): Val {
     let et = if c.ek(exp) == sema.TK_ARR { c.pg.ta(exp) } else { -1 }
     let v = c.rd(c.expr(c.arg(e, 1), et))
     c.elemType(v.t, c.line(c.arg(e, 1)))
-    if !c.isCopy(v.t) { c.err(line, "array needs a copy value, and " + c.tstr(v.t) + " is not a copy type") }
+    if !c.isCopy(v.t) && c.soft(v.t) { c.note("fill", line, "array") }
+    else if !c.isCopy(v.t) { c.err(line, "array needs a copy value, and " + c.tstr(v.t) + " is not a copy type") }
     let vn = c.fresh("fill")
     let an = c.fresh("a")
     let i = c.fresh("i")
     let ct = c.T(v.t)
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("array", v, line)
     c.emit(c.x.decl(ct, &vn, cc))
     let ct2 = c.T(v.t)
     c.emit(c.x.decl(c.ct("lxl_arr"), &an, c.x.call("rt_arr_fill", [n.c, c.x.szof(ct2), c.W(line)])))
