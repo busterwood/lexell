@@ -4512,8 +4512,8 @@ planted import.
 Built 2026-11-17 on `redesign/bind` from main 9aa2c0b2. Scripts and
 outputs are in `~/tpch-w/bind/p1`. P1 was split in three (P1a scan,
 filter and project; P1b aggregates over one table; P1c sort and limit
-over them, and the deletions). This section is P1a; P1b and P1c are not
-built.
+over them, and the deletions). This section is P1a; P1b is 6.2.7, P1c
+is not built.
 
 **Commits:**
 
@@ -4747,6 +4747,275 @@ Import edges 205 to 214, all within `imports.py`'s rules.
   must take the arms' (`runPipe`), or bind per run as the row engine
   does. Two closures capturing the same state mutably are rejected:
   give the pipe one sink.
+
+#### 6.2.7 P1b as built: aggregates over one table, and two checks
+
+Built 2026-11-17 on `redesign/bind` from main 51aa78b7. Scripts and
+outputs are in `~/tpch-w/bind/p1b`.
+
+**Check 1: q1's 2-4% after E0 and P1a is code placement.**
+
+- main 51aa78b7's source built six times with the native backend's
+  placement knobs (`bplace.sh`: `LXL_PADB` 0, 16, 32, 48 with
+  `LXL_FALIGN` 64; `LXL_PADB` 0 and 32 with `LXL_FALIGN` 128), q1 alone,
+  3 runs each, two passes in opposite orders (`q1place.sh`,
+  `q1place.log`). Medians, ms:
+
+  | PADB / FALIGN | pass 1 | pass 2 |
+  |---|---:|---:|
+  | 0 / 64 (the default: main's binary, byte-identical) | 2,353 | 2,344 |
+  | 16 / 64 | 2,398 | 2,383 |
+  | 32 / 64 | 2,400 | 2,385 |
+  | 48 / 64 | 2,356 | 2,365 |
+  | 0 / 128 | 2,390 | 2,412 |
+  | 32 / 128 | 2,304 | 2,332 |
+
+- The same code moves q1 by 3.6% (pass means 2,318 to 2,401), up to
+  4.7% between single passes. Placement explains the 2-4% of E0 and
+  P1a; it is not chased further. Read a q1 difference under about 4% as
+  noise until a build pins placement.
+
+**Check 2: point selects.**
+
+- Profiles (`profpts.sh`: perf at 20 kHz with frame-pointer call graphs,
+  10 runs of `points.sql`, about 158,000 samples each; `ppts-e1.data`
+  for main's pre-P1a build `e1/lexdb-e1`, `ppts-a.data` for main
+  51aa78b7; resolved with `p1/m.map` and `p1/a.map` by
+  `e7/tools/selfdiff.py` and `under.py`). Inclusive shares:
+  - the statement's run (`runSelTo`) fell from 28.83% to 26.42%;
+  - `pipeSel`, the pipeline's plan made per simple-protocol statement,
+    is 2.23% (`pipeShape` 0.83%, its own loops 0.74%, `compile` 0.48%);
+  - so the executor's part is level (-0.18 points);
+  - the rest of the +1.2% samples is in code P1a did not change:
+    parsing (`parseIn` 12.85% to 13.80%), `planSelect` (28.78% to
+    29.80%), `choosePath`. That is placement again.
+- pts.sh, 3 rounds of 5 runs alternating (`pts-place.txt`), server CPU
+  means: e1 666.1 ms; main 51aa78b7 672.7 (+0.99%); the same source with
+  `PADB 32 / FALIGN 128` 662.1 (-0.59%) and `PADB 16 / FALIGN 64` 663.1
+  (-0.45%). Main's own code, placed otherwise, is faster than e1. So the
+  +0.8-1.2% is placement, within a 1.6% spread; the executor's path
+  costs no more than the old one. Nothing was changed for it: trimming
+  `pipeSel` (0.9 µs a statement) is cheap later, but would not show
+  under this noise.
+
+**Commits:**
+
+- c1d6e547 (1/n): the Agg arm with its details; `lexdb_pipe.runAgg`;
+  exec's glue; `exec_pipe` extended.
+- db22f0bd (2/n): the aggregates of subqueries, set parts and statements'
+  queries; the one-table branch of the batch driver deleted.
+- 93fcf5bd (3/n): a group's states given in one array used again, and
+  exec's accumulators made only for a group it keeps (q18).
+
+**The plan.**
+
+- `PPlan.Agg(PPlan, bool, Option[PAgg])`: `PAgg { keys: []BX; calls:
+  []PCall; keep: []bool }`, `PCall { fname; star; arg: Option[BX];
+  filter: Option[BX] }`. None in a view (physOf).
+- `pipeAgg` (exec), from `pipeSelIn`: binds the GROUP BY keys and the
+  calls' arguments and FILTERs (`bxOf`), moves the table's bound
+  conditions (`Query.cc[0]`) into the Filter, and makes
+  `physAbove(sel, Agg (Filter? (Scan)))`: physOf's operators over the
+  groups (Having, Project([]), Distinct, Sort, Limit, Match) as views.
+  physOf was split for it (`physAbove`), so EXPLAIN prints the kept plan
+  as before: the 22 TPC-H EXPLAINs are byte-identical.
+- With no GROUP BY, the scan's `need` is the conditions' and calls'
+  columns (a column outside a call is 42803), as the driver narrowed it.
+- `keep` is `afterCols` (the outputs', HAVING's and ORDER BY's columns):
+  a group's first row holds only those.
+- What stays in the Sel: `groupBy` and `specs` as `Expr`s, which the row
+  engine (`lexdb_batch` off) and the output's `finish` read. As in P1a,
+  the bound forms moved, the expressions stay until the row engine goes.
+
+**What compile accepts** (`aggOps`, and `aggShape` and `pipeAgg` in
+exec):
+
+- an aggregate over one table read per row whose columns are the
+  query's (`first` 0), no grouping sets, no window, no MIN/MAX by the
+  scan's order, no lock, no subquery of its own, not a correlated
+  query's (`q.corr`; a correlated subquery's own Sel is accepted: its
+  outer values are its parameters);
+- keys of any type with no collation's keys; calls count(*), count,
+  sum, avg, min, max, not DISTINCT, no ORDER BY, no collation; FILTER;
+  each key, argument, FILTER and condition bound and reading the
+  table's decoded columns;
+- any HAVING, outputs, DISTINCT, ORDER BY, LIMIT, OFFSET, TOP and
+  MATCH_RECOGNIZE over the groups (exec's views).
+
+It rejects (the row engine runs them, as before): DISTINCT or ORDER BY
+in a call, string_agg, array_agg, bool_and, the variances, collations'
+keys, grouping sets, joins (the batch driver's, `batchGroupsIn`), and an
+aggregate with a subquery (RUN_ONCE values, below).
+
+**Where plans are made.** `pipeSelIn(sel, rows)`: the SELECT's own plan
+(rows: P1a's scan too), then for its subqueries and set parts, and for
+CREATE TABLE AS, INSERT ... SELECT and COPY (query) TO, aggregates only
+(those statements now call `bindSel`; their scans stay the row
+engine's, as P1a left them). So a correlated subquery's aggregate (q17,
+q20) and q18's IN subquery run in the pipe.
+
+**What runAgg does** (`aggRun`):
+
+- Over batches, numerics as units (BK_DEC, sums in 128 bits); if the
+  units give way (a numeric past them, `XXDEC`, or an expression they
+  do not compile) again with numerics as values; if batches give way (a
+  value a batch cannot hold, an expression the kernels do not compile, a
+  text key that is not a text) row by row. Each from the start, the
+  counts reset: the groups are given at the end, none yet. This is
+  `batchGroups`' retry and its give-way, now the operator's.
+- The batch passes are `batchGroupsIn`'s one-table code, moved: the
+  grouping by one integer key (a map, or by the primary key's order with
+  no map: q18), by a text key's text, or by the keys' encoding; the
+  first rows' columns kept; `bAccum`, `bAccDec`, `bAccVal`; the memory
+  counted per group as before.
+- The row pass (`aggRows`) reads the scan as `runScan` does (in batches
+  where it can, its conditions over the batch with the generic step, as
+  the row engine's first level reads them in `batchLevel`; else row by
+  row) and groups each row it keeps by the scalar evaluator
+  (`groupRow`, `accOne`: `addToGroup` and `accumulate` for the five
+  calls). Its memory is counted as the row engine counts it.
+- The groups go to exec's `give(first, states)` (`PAcc { n; sum; val }`,
+  an `Acc`'s fields). exec checks a fused HAVING first (no volatile
+  function, no subquery: `fuse`, as before), keeping only the groups it
+  passes, then makes the outputs over `Groups` as before.
+- An aggregate's primary-key points are read as a batch, as the driver
+  read them (`pipeSrc`), so EXPLAIN ANALYZE prints what it printed.
+- Counts: the scan's go to the run's table counts; `decCounts` adds the
+  pipe's (`aggCounts`: units runs, spills, grouped runs over batches),
+  which `exec_batchdec` and `exec_narrow` read unchanged.
+
+**Deleted** (db22f0bd): the one-table branch of `batchGroupsIn`
+(numerics as units, the narrowing of a key-less aggregate's columns,
+its scans and index reads, the sorted grouping), `batchGroups`' units
+retry, exec's `decRuns` and `decSpills`. `batchGroupsIn` is the joins'
+driver now (`len(q.levels) >= 2`). `obRow` moved to the pipe.
+
+**Line counts:**
+
+| | main 51aa78b7 | c1d6e547 | db22f0bd | 93fcf5bd |
+|---|---:|---:|---:|---:|
+| `lexdb_exec` | 26,691 | 26,901 | 26,762 | 26,770 |
+| `lexdb_pipe` | 2,049 | 2,708 | 2,709 | 2,710 |
+| `lexdb_plan` | 259 | 281 | 281 | 281 |
+
+Exec is 79 lines longer. The first commit added the glue (`pipeAgg`,
+`aggShape`, `pipeGroups`, `pipeRows`/`pipeAggs`, `bxUses`,
+`physAbove`, `prepareIn`: 249 lines in, 39 out); the deletion removed
+202 lines and added 63 (`pipeSelIn`, the statements' bindings, the
+joins-only driver's head). Less left than 6.2.3 hoped because the
+driver's one-table and join code were one function: what was only the
+one table's is gone, the rest is the joins'. The pipe gained 661: the
+aggregate (the driver's one-table passes and its retry, ~430), the row
+pass and the scalar accumulate (~120, new), `compile`'s checks. The
+big deletions (`eachOut`'s, `outPlan`'s and `batchLevel`'s single-table
+branches, ~300 lines) wait for RUN_ONCE values.
+
+**Gates:**
+
+- Suite from a snapshot of each commit (`e7/suite-p1b1`, `p1b2`,
+  `p1b3`): 190 passed, imports ok (214 edges: no new import).
+- `exec_pipe` gained the aggregates, four ways (rows; the pipeline off;
+  pipeline held; pipeline sunk): 400 random queries committed and 80 in
+  a transaction with its own writes, 26 fixed ones. Keys of each type
+  with NULL keys, expressions and several keys; count, sum, avg, min,
+  max of each type; FILTER; numerics' scales (`sum(nu * 2)`,
+  `avg(nu * x)`); HAVING fused and not; DISTINCT over the groups; ORDER
+  BY and LIMIT; empty input with and without GROUP BY; an integer's
+  overflow (`sum(y * 1000000000)`) and a division by zero in a call;
+  shapes the batches do not run (a float's sum, a text function's key:
+  the row pass) and shapes compile rejects (DISTINCT and ORDER BY in a
+  call, string_agg, ROLLUP); 12 runs of a prepared aggregate from one
+  plan cache against the row engine; `max_statement_mem` (53200 four
+  ways, the row pass's too, and the same rows under it); EXPLAIN ANALYZE
+  and EXPLAIN of 12 aggregate shapes the same with the pipeline on and
+  off. The first commit ran it against the batch driver (all the same);
+  after the deletion the "off" way is the row engine.
+  `exec_batchdec` (units, spills, values) and `exec_narrow` pass
+  unchanged through the pipe's counters.
+- Naming battery (`nam-p1b2.out`, `nam-p1b3.out`): identical to main's.
+- EXPLAIN of the 22 TPC-H queries (`exp-*.txt`): byte-identical to
+  main's.
+- TPC-H, SF1, one run each of db22f0bd's (`out-p1b2`) and 93fcf5bd's
+  (`out-p1b3`) builds: the 22 checksums are the baseline's (1744ef99).
+  Against `out-main-51aa78b7` (ms):
+
+  | | main | db22f0bd | 93fcf5bd |
+  |---|---:|---:|---:|
+  | total | 23,176 | 23,146 (-0.13%) | 23,161 (-0.06%) |
+  | q1 | 2,360 | 2,396 (+1.5%) | 2,383 (+0.9%) |
+  | q6 | 611 | 602 (-1.5%) | 617 (+1.1%) |
+  | q18 | 1,274 | 1,342 (+5.4%) | 1,207 (-5.2%) |
+  | q20 | 396 | 380 (-3.8%) | 380 (-3.9%) |
+
+  Every other query within 3.3% (q13 -3.3%, q21 +1.7%, q8 +1.5%).
+- Repeated on copies (`rep.sh`, `rep18.sh`, 3 runs a pass, alternating,
+  two passes, medians):
+  - db22f0bd against main: q1 2,303 and 2,347 against 2,378 and 2,395
+    (-2.5%), q6 601 and 605 against 604 and 616 (-1.1%); q18 1,355 and
+    1,361 against 1,243 and 1,265 (+8%, reproduced). The cause was a
+    new accumulator (with its DISTINCT map) and a states array made for
+    each of q18's 1.5M groups, which HAVING drops; 93fcf5bd fixed it.
+  - 93fcf5bd: q18 1,211 and 1,209 against 1,272 and 1,274 (-5%).
+  - q1 and q6 are in the pipe now; within check 1's placement spread
+    they are level with main.
+- Point selects, one pass each against main (copies):
+  - `pts.sh` (2 rounds of 5 runs, `pts-c3.txt`), server CPU means: e1
+    665.2 ms, main 670.3 (+0.77%), 93fcf5bd 671.0 (+0.87%; +0.1%
+    against main). Against e1 that is the placement of check 2 (main's
+    own code placed otherwise ran -0.5% against e1), not under the 0.5%
+    gate by measurement. Nothing P1b did shows on this path.
+  - `simple.sh` (`simple-c3.txt`): point select 49,271 and 50,003 tps
+    (+1.5%), update 9,488 and 9,474 (-0.1%), 3-table join 20,228 and
+    20,394 (+0.8%).
+
+**Hand-over (P1b's rest, then P1c):**
+
+- **RUN_ONCE subqueries as values: not built.** It is the next item and
+  gates every remaining deletion. What it takes, from reading the code:
+  - `lexdb_bind`: a `BX.Sub(kind, i, probe)` arm (scalar, EXISTS, IN with
+    its probe), bound only where the subquery is RUN_ONCE (`#sub`,
+    `#exists`, `#in` with no correlated arguments). Six exhaustive BX
+    matches gain a case (`bxEval`, `reads`, `reslot`, `hasParam`,
+    `bxConst`/`bxFixed`, `bCompileD`).
+  - `Ctx` gains `subs: []SubVal { rows; val; set; hasNull; numeric }`,
+    exec's `SubRes` result as a value. Every `Ctx` a bound expression
+    with a Sub is evaluated in needs them, including `BGen.ce` (bGenOf
+    copies only now, zone, params) and `outC`'s: bind the Sub only for
+    plans the pipe keeps, or fill `subs` wherever `cenvOf` makes a Ctx
+    for a query with subqueries.
+  - IN's keys move to the pipe as a section (`setKey`, `inClass`,
+    `fKey`, `wholeF`, `exactInt`, `isInstantClass`, `inValKeys`,
+    `inProbeKeys`, `inProbe`, `keyPart`; ~200 lines, used by exec's
+    semi-joins and hashed subqueries too: exec calls them there).
+  - `bCompileD` takes a Sub as a constant of the run (as a Param), IN
+    as the generic step.
+  - exec runs the RUN_ONCE subqueries before `run`/`runAgg` (prepare's
+    loop; `pipeHeld` does not call prepare today) and passes the values.
+  - `scanRuns` and `aggShape` accept subs whose `PSub.run` is RUN_ONCE
+    and not FROM.
+- **Then the deletions** P1a listed: `outPlan`'s and `eachOut`'s
+  single-table branches and `batchLevel`'s `direct` branch, and
+  `setPipe`. Note for the tests: with the one-table driver gone,
+  `setPipe(false)` runs one-table aggregates in the row engine (with
+  batches on), so `exec_pipe`'s "drivers" way for aggregates is the row
+  engine now.
+- `pipeSrc` (exec) still makes the pipe's `Src`; it should move to
+  `lexdb_access` with `pathScans`.
+- The batch passes compile conditions without the generic step (as the
+  driver did, so `exec_narrow`'s "grouped over batches" is unchanged): a
+  condition like `upper(tx) = 'L1'` sends the aggregate to the row
+  pass, which reads it in batches anyway. Taking `condNode` in the
+  batch passes, and a generic key and argument step (values through
+  `bGenVals`, grouped by their encoding, accumulated as `accOne`), would
+  keep such aggregates in batches; `exec_narrow`'s expectations would
+  change.
+- P1c: Project, Having, Distinct, Sort and Limit over the Agg arm as
+  operators (they are exec's views over `Groups` today), Sort and TopN
+  over chunks, Limit with OFFSET.
+- Traps: `underViews` (pipe) and `unplan` (exec) must learn each new
+  view arm; `Prog.groups` says whether `run` or `runAgg` runs a plan;
+  `pipeRows`/`pipeAggs` are exec's two tests of it. `pipeSelIn`
+  recurses into subqueries and set parts before the Sel itself.
 
 ## 7. Trade-offs and risks
 
