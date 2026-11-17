@@ -1689,6 +1689,97 @@ commit with two dead wrappers deleted and this note.
   another column than the first of its name): resolve's slots were moved,
   not recomputed, and the naming battery is identical.
 
+**After 2d slice 3: q1's drift, looked into.** q1 had moved +1.1% (2-ii),
++2% (slices 1-2) and +4% (slice 3) on merges that did not touch its path.
+One commit on `redesign/bind` after main 4ca6a0d9: a scan's batch is used
+again (`lexdb_rows.reuse`) in the grouped aggregate's scan.
+
+- Not page faults. The guess was a first touch per batch (each value
+  column's array from mmap or fresh top of heap). Over 5 q1 runs the
+  server's `minflt` (`/proc/PID/stat`, all threads) did not move on main
+  8f482ee7 or on slice 3 (3030 and 3028 before and after); `perf stat`
+  gives 1 page fault on both. An array is 1,024 slots of a 64-byte `Val`,
+  64 KB, under glibc's 128 KB mmap threshold, and the last batch's freed
+  arrays serve the next.
+- What moved: the same instructions (177.7G per 5 runs on both), 4.4% more
+  cycles, the same L2, L3 and DRAM fills. `ls_bad_status2.stli_other`
+  (a load that cannot take its data from an older store and waits for it)
+  in `newBatch`: 1.85M per q1 on main, 23.9M on slice 3, nearly all at one
+  load of the `array(cap, Val.Null)` loop. Each slot is a call of the
+  `Val` glue `dup`: the caller stores the 64-byte argument as eight 8-byte
+  moves and `dup` reads it as four 16-byte `movdqu` (a load over two
+  stores is never forwarded), then the result goes back through a stack
+  slot. About 600M such interlocks per q1 in all, `dup` the most.
+- Why the binary decides it: the stack. Queries run on a task's stack,
+  so a frame's offset in its page is fixed per binary, not per run.
+  `newBatch`'s `rbp` is at page offset 0x100 on every earlier main
+  (2iii, 2iv, i3, 2d12, 8f482ee7) and at 0x110 on slice 3 (parts D and
+  last): exec's `select` frame went from 0x278 to 0x268 bytes (`Scope`'s
+  layout, part A), and every frame under it moved 16 bytes. Same code
+  bytes, the copies land 16 bytes over. The samples move between the
+  loop and `dup` with it: with callers counted, the fill was about 7% of
+  q1 on main and on slice 3 alike (one run each), and slice 3 padded back
+  to 0x278 (two locals in `select`) put `rbp` back at 0x100 and moved the
+  cost into `dup` (q1 2561 against 2576 ms; the padding also moved the
+  code after `select`). So read "69 against 734 samples in newBatch" as
+  where the stall is charged, not as the whole difference.
+- The "dead code" commit: 7a0aecfe and b99601e0 build to the same code
+  bytes at the same addresses; the binaries differ only in panic-location
+  strings (line numbers, same lengths). Byte-identical copies of one
+  binary in different files differ by up to 1.3-1.7% in `qab.sh` medians
+  (a copy's pages are new physical pages). The 2.9% above is that floor,
+  not layout: in this run 7a0a 2570 and b996 2552 to 2574 ms.
+- The change (smallest that keeps results): `fillBatch` takes a `spare`
+  as `fillPickIn` does and gets its batch from `lexdb_rows.reuse`
+  (`fillLevel` passes it; `fillPickIn`'s whole-read path passes its own);
+  `batchGroupsIn` (the grouped aggregate's scan, q1's) gives the batch
+  back after each one, the pre-join batch when it joins, and not
+  `bUnmatched`'s. `decodeRun`'s NULL paths (a `PK_NONE` place, a
+  NULL in a value column) now write `Val.Null` to the slot (`setNull`),
+  as `runCols` and `colsInto` already did for `reuse` (9.111), so a batch
+  used again holds no value of its last use at a NULL row. The fill runs
+  once per scan instead of once per batch.
+- A/B (`qab.sh`, boost off, 5 runs per server, medians of 3 rounds; `f`
+  is the change on that commit; `c2` a copy of the same file):
+
+  | Build | q1 ms | Copy |
+  |---|---|---|
+  | main 8f482ee7 | 2475, 2476 | 2479 |
+  | slice 3 (b99601e0) | 2552, 2573, 2574 | 2581 |
+  | slice 3 part D (7a0aecfe) | 2570, 2570 | |
+  | f 8f482ee7 | 2400, 2377 | 2399 |
+  | f b99601e0 | 2410, 2384, 2379, 2384 | 2420, 2392 |
+  | f 7a0aecfe | 2323, 2336, 2343 | 2373, 2372 |
+
+  Without the change slice 3 is 3.9% over main, on copies too; with it
+  main and slice 3 are within the copy-to-copy floor (2377-2399 against
+  2379-2420), and the dead-code pair (identical code) within 1.4% on
+  average, inside the same floor. q1 is 4-7% faster.
+- Gates (the change against main 4ca6a0d9's code, `lexdb-b996`):
+  - the suite: 188 passed, imports ok;
+  - TPC-H (`tpch_ab.sh`, 3 rounds alternating): all 22 checksums the
+    baseline's; total 0.950; q1 0.928, q4 0.856, q6 0.912, q9 0.960,
+    q13 0.983, q15 0.898, q21 0.903; the rest within 1% but q19 1.018
+    (111 to 113 ms) and q2 1.011;
+  - the 35 queries (`ab35.sh`, boost off): total 0.985, again on fresh
+    copies 0.978; scan2-9 0.93-0.96, grp_text 0.89-0.92, minmax_text
+    0.84-0.86; distinct2 1.027-1.028 and pk_point20k 1.024-1.032 on
+    both. Neither reads through the changed path: distinct2 runs the same
+    instructions on both binaries (32.13G per 10 runs) and 1.6% more
+    cycles, a layout shift;
+  - OLTP (`oltp.sh`, boost off), tps ratios: point selects 1.008, 0.995,
+    0.993 and updates 0.999, 1.001, 0.997 at 1, 8, 32 clients; the
+    `INSERT ... generate_series` loads acct 1.51 s on both (medians), t
+    2.96 against 2.93 s.
+- Left as it is: every `Val` passed by value still goes through the
+  stack as above (`dup`'s 16-byte reads of 8-byte stores), so other
+  per-row paths keep a smaller sensitivity to frame offsets and code
+  placement (`bKeyVal`'s key copy per row and key in q1's two-key GROUP
+  BY, `colsInto`'s per-slot writes). The cure for that is in the native
+  backend (copy an aggregate with the same move widths on both sides),
+  not in lexdb. A query's A/B under about 1.5% needs copies of each
+  binary to tell from the floor.
+
 **Where 2d slice 3 left off, and how to start slice 4.** Slice 4 makes
 `eval` read a column by its slot, so that `colIndex` (a linear search by
 name, per row) goes from the executor. Everything named is in

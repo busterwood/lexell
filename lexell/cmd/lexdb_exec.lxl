@@ -24385,8 +24385,10 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     var tailAt = 0
     for sj in 0..nsc + tails {
         var cur = newCursor()
+        var spare = noRows()            // the last batch read, used again (lexdb_rows.reuse)
         while !cur.done {
             var b = noRows()
+            var read = false                // b is the read's (fillLevel): given back to spare when done
             var idx: []int = []
             if sj == nsc {
                 let got4 = try bUnmatched(st, txn, q, m, &jp, &zone, rs, mut &tailAt)
@@ -24399,12 +24401,13 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                 idx = withCapacity(b.n)
                 for r in 0..b.n { append(mut &idx, r) }
             } else {
-            let got = try fillLevel(st, txn, t, &rd, &scans[sj], part, mut &cur, &bp)
+            let got = try fillLevel(st, txn, t, &rd, &scans[sj], part, mut &cur, &bp, mut &spare)
             if got.isNone() {
                 held -= added
                 return Ok(false)
             }
             b = got.unwrap()
+            read = true
             let nr = b.n
             if nr == 0 { continue }
             try rs.tickN(nr)
@@ -24428,14 +24431,18 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                     held -= added
                     return Ok(false)
                 }
-                b = got3.unwrap()
+                spare = replace(mut &b, got3.unwrap())
+                read = false
                 var all: []int = withCapacity(b.n)
                 for r in 0..b.n { append(mut &all, r) }
                 idx = all
             }
             }
             let nc = len(idx)
-            if nc == 0 { continue }
+            if nc == 0 {
+                if read { spare = b }
+                continue
+            }
             // each row's group, new groups made in the rows' order
             var gid: []int = array(nc, 0)
             if len(keys) == 0 {
@@ -24556,6 +24563,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                     }
                 }
             }
+            if read { spare = b }
         }
     }
     // the groups as the row path leaves them. A HAVING of no volatile
@@ -24777,8 +24785,8 @@ fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Path,
 fn idxDecOf(t: &Table, ix: int, needCol: &[]bool): Option[IdxDec] { return lexdb_access.idxDecOf(&relOf(t), ix, needCol) }
 
 fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
-             bp: &BPlan): Result[Option[Batch], DbErr] {
-    return lexdb_access.fillLevel(st, txn, &relOf(t), rd, sc, part, cur, bp)
+             bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
+    return lexdb_access.fillLevel(st, txn, &relOf(t), rd, sc, part, cur, bp, spare)
 }
 
 // A level's next batch with its rows chosen by conds (lexdb_access.fillPickIn).
