@@ -20,6 +20,17 @@
 // - max_statement_mem: the rows held past it, the same error;
 // - EXPLAIN ANALYZE's counts the same with the pipeline on and off; its
 //   EXPLAIN the same.
+// Aggregates over the table (slice P1b), the same four ways (the pipeline
+// switched off: the row engine with batches on, since the one-table batch
+// driver is deleted): the plain
+// aggregate and GROUP BY one or more keys (integers, booleans, texts,
+// numerics, dates, expressions, NULL keys), count, sum, avg, min and max
+// of every type, FILTER, numerics' scales, HAVING, DISTINCT over the
+// groups, ORDER BY and LIMIT; empty input; an integer's overflow and a
+// division by zero in a call; shapes the batches do not run (a float's
+// sum, a text function's key: the pipeline's rows) and shapes the
+// pipeline does not take (DISTINCT and ORDER BY in a call, string_agg,
+// grouping sets: the row engine); parameters; max_statement_mem.
 // expect: committed: 500 queries, 500 the same four ways
 // expect: in a transaction: 120 queries, 120 the same four ways
 // expect: fixed: 30 queries, 30 the same four ways
@@ -27,6 +38,13 @@
 // expect: parameters: 12 of 12 the same
 // expect: memory: ERROR 53200 | ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
 // expect: counts: 24 of 24 the same
+// expect: aggregates: 400 queries, 400 the same four ways
+// expect: aggregates in a transaction: 80 queries, 80 the same four ways
+// expect: aggregates fixed: 26 queries, 26 the same four ways
+// expect: aggregates ran in the pipeline: true, over batches: true, row by row: true
+// expect: aggregate parameters: 12 of 12 the same
+// expect: aggregate memory: ERROR 53200 | ERROR 53200 | ERROR 53200 | ERROR 53200; under it: true
+// expect: aggregate counts: 12 of 12 the same
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -226,6 +244,43 @@ fn query(r: mut &lexdb_base.Rng, safe: bool): str {
     return sql
 }
 
+// A random aggregate over f: keys, calls (with FILTERs), conditions,
+// HAVING, DISTINCT, ORDER BY by the keys, a LIMIT.
+fn aggQuery(r: mut &lexdb_base.Rng, safe: bool): str {
+    let keys = ["z", "bo", "tx", "w", "x % 7", "dt", "nu", "x > 100", "z + 1", "upper(tx)", "length(w)", "coalesce(z, -1)"]
+    let calls = ["count(*)", "count(x)", "sum(x)", "avg(x)", "min(x)", "max(x)", "sum(nu)", "avg(nu)", "min(nu)", "max(nu)",
+                 "min(tx)", "max(w)", "min(dt)", "max(dt)", "sum(y)", "count(tx)", "sum(nu * 2)", "sum(nu + x)", "avg(nu * x)",
+                 "sum(x) filter (where z > 1)", "min(nu) filter (where bo)", "count(*) filter (where tx like 'L%')",
+                 "max(x * 2 - z)", "sum(z)", "min(bo::int)", "sum(cast(x as float8))", "max(upper(tx))", "avg(y)"]
+    let unsafe = ["sum(x / (z - 3))", "sum(y * 1000000000)", "count(distinct z)", "string_agg(tx, ',' order by tx)", "max(cast(tx as int))"]
+    var ks: []str = []
+    let nk = r.below(3)
+    for i in 0..nk { append(mut &ks, pick(r, &keys)) }
+    var items: []str = []
+    for k in ks { append(mut &items, k) }
+    for i in 0..(1 + r.below(3)) { append(mut &items, pick(r, &calls)) }
+    if !safe && r.below(4) == 0 { append(mut &items, pick(r, &unsafe)) }
+    var conds: []str = []
+    let p = path(r)
+    if p != "" { append(mut &conds, p) }
+    for i in 0..r.below(2) { append(mut &conds, cond(r, true)) }
+    var sql = "select " + strings.join(&items, ", ") + " from f"
+    if len(conds) > 0 { sql = sql + " where " + strings.join(&conds, " and ") }
+    if nk > 0 {
+        sql = sql + " group by " + strings.join(&ks, ", ")
+        let h = r.below(5)
+        if h == 0 { sql = sql + " having count(*) > " + r.below(40).toStr() }
+        if h == 1 { sql = sql + " having sum(x) > " + r.below(3000).toStr() }
+        var ords: []str = []
+        for i in 0..nk { append(mut &ords, (i + 1).toStr()) }
+        sql = sql + " order by " + strings.join(&ords, ", ")
+        if r.below(4) == 0 { sql = sql + " limit " + pick(r, &["0", "1", "3", "10"]) }
+    } else if r.below(6) == 0 {
+        sql = sql + " having count(*) > " + r.below(2000).toStr()
+    }
+    return sql
+}
+
 fn load(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     let c1 = q(s, &"create table f (id int primary key, x int, y bigint, z int, bo boolean, tx text, nu numeric(10,2), dt date, w varchar(20))")
     let c2 = q(s, &"create index f_x on f (x)")
@@ -365,6 +420,100 @@ fn main() {
         var sameC = 0
         for sql in shapes { if sameCounts(mut &s, &sql) { sameC += 1 } }
         println("counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
+        aggregates(mut &s, mut &r)
         return 0
     })
+}
+
+// The aggregates (slice P1b), four ways.
+fn aggregates(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let g0 = lexdb_exec.decCounts()[2]
+    let runs0 = lexdb_exec.pipeRuns()
+    var same = 0
+    for i in 0..400 {
+        let sql = aggQuery(r, i % 3 != 0)
+        if four(s, &sql) { same += 1 }
+    }
+    println("aggregates: 400 queries, " + same.toStr() + " the same four ways")
+    let b = q(s, &"begin")
+    let w1 = q(s, &"insert into f values (6001, 7, 7, 1, true, 'L1', 1.5, '2024-01-02', 'w1'), (6002, null, 1, 3, false, 'x', 2.0, null, null)")
+    let w2 = q(s, &"update f set x = x + 1, nu = nu * 3, tx = 'L1' || tx where id % 7 = 0")
+    let w3 = q(s, &"delete from f where id % 11 = 0")
+    var sameT = 0
+    for i in 0..80 {
+        let sql = aggQuery(r, true)
+        if four(s, &sql) { sameT += 1 }
+    }
+    let rb = q(s, &"rollback")
+    println("aggregates in a transaction: 80 queries, " + sameT.toStr() + " the same four ways")
+    let fixed = ["select count(*) from f", "select count(*), sum(x), avg(nu) from f where id < 0", "select z, count(*) from f where id < 0 group by z",
+                 "select sum(y * 1000000000) from f", "select z, sum(y * 1000000000) from f group by z order by 1",
+                 "select sum(x / (z - 3)) from f", "select z, max(x / (z - 3)) from f group by z order by 1",
+                 "select z, bo, count(*), sum(nu), min(tx), max(dt) from f group by z, bo order by 1, 2",
+                 "select tx, count(*) from f group by tx order by 1", "select w, sum(x) from f where id between 100 and 2000 group by w order by 1",
+                 "select id, count(*) from f group by id having count(*) > 1 order by 1", "select nu, count(*) from f group by nu order by 1",
+                 "select sum(nu), avg(nu), min(nu), max(nu) from f", "select avg(nu * x), sum(nu * 2 + 1) from f where bo",
+                 "select count(distinct z), count(z) from f", "select string_agg(tx, ',' order by id) from f where id < 30",
+                 "select z, sum(cast(x as float8)) from f group by z order by 1", "select upper(tx), count(*) from f group by upper(tx) order by 1",
+                 "select distinct z % 2, count(*) from f group by z order by 1, 2", "select z, count(*) from f group by z order by 2 desc, 1 limit 2",
+                 "select sum(x) filter (where z > 1), count(*) filter (where nu > 10.5) from f", "select x, count(*) from f where x between 10 and 20 group by x order by 1",
+                 "select count(*), max(x) from f where id in (5, 7, 2600)", "select count(*) from f where id = 17",
+                 "select z, count(*) from f group by rollup (z) order by 1", "select dt, min(nu) from f where dt >= '2024-01-25' group by dt having min(nu) > 1 order by 1"]
+    var sameF = 0
+    for sql in fixed { if four(s, &sql) { sameF += 1 } }
+    println("aggregates fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same four ways")
+    let runs1 = lexdb_exec.pipeRuns()
+    let batches = lexdb_exec.decCounts()[2] - g0
+    println("aggregates ran in the pipeline: " + (runs1[0] - runs0[0] > 400).toStr() + ", over batches: " + (runs1[1] - runs0[1] > 200 && batches > 200).toStr() +
+            ", row by row: " + (runs1[0] - runs0[0] > runs1[1] - runs0[1]).toStr())
+    // parameters: the plan kept and run with each value, against the row engine's
+    let psql = "select z, sum(x + $1), count(*) filter (where x > $1) from f where id < $2 group by z order by 1"
+    var pc = lexdb_exec.newPlanCache()
+    var sameP = 0
+    for i in 0..12 {
+        let ps = [lexdb_sql.Val.Int(r.below(200)), lexdb_sql.Val.Int(r.below(2700))]
+        var ob = false
+        let viaPipe = viaSink(s, &psql, &ps, mut &pc, mut &ob)
+        let a = q(s, &"set lexdb_batch = off")
+        var pc2 = lexdb_exec.oneShot()
+        var ob2 = false
+        let viaRows = viaSink(s, &psql, &ps, mut &pc2, mut &ob2)
+        let b2 = q(s, &"set lexdb_batch = on")
+        if viaPipe == viaRows { sameP += 1 } else { println("AGG PARAMS: " + viaPipe + " / " + viaRows) }
+    }
+    println("aggregate parameters: " + sameP.toStr() + " of 12 the same")
+    // max_statement_mem: the groups held past it
+    let m1 = q(s, &"set max_statement_mem = '64kB'")
+    let big = "select id, tx, count(*) from f group by id, tx"
+    var errs: []str = []
+    let a1 = q(s, &"set lexdb_batch = off")
+    append(mut &errs, firstTwo(&q(s, &big)))
+    let a2 = q(s, &"set lexdb_batch = on")
+    lexdb_exec.setPipe(false)
+    append(mut &errs, firstTwo(&q(s, &big)))
+    lexdb_exec.setPipe(true)
+    append(mut &errs, firstTwo(&q(s, &big)))
+    // (row by row: a float's sum does not run over batches)
+    append(mut &errs, firstTwo(&q(s, &"select id, sum(cast(x as float8)) from f group by id")))
+    let small = "select z, count(*), sum(nu) from f group by z order by 1"
+    let under = q(s, &small)
+    let a3 = q(s, &"set lexdb_batch = off")
+    let underOff = q(s, &small)
+    let a4 = q(s, &"set lexdb_batch = on")
+    let m2 = q(s, &"set max_statement_mem = 0")
+    println("aggregate memory: " + strings.join(&errs, " | ") + "; under it: " + (under == underOff && !strings.contains(&under, "ERROR")).toStr())
+    let shapes = ["select count(*) from f", "select z, count(*) from f group by z", "select sum(nu) from f where x > 100",
+                  "select tx, max(x) from f where id between 100 and 1500 group by tx", "select count(*) from f where id between 17 and 30",
+                  "select count(*) from f where id in (1, 2, 3)", "select x, count(*) from f where x between 10 and 30 group by x",
+                  "select z, sum(cast(x as float8)) from f group by z", "select z, count(*) from f group by z having count(*) > 500 order by 1",
+                  "select count(*) from f where id < 0", "select bo, avg(nu) from f where upper(tx) = 'L1' group by bo",
+                  "select max(x) from f where id > 2500"]
+    var sameC = 0
+    for sql in shapes { if sameCounts(s, &sql) { sameC += 1 } }
+    println("aggregate counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
+}
+
+fn firstTwo(x: &str): str {
+    let p = strings.split(x, &" ")
+    return if len(p) > 1 { p[0] + " " + p[1] } else { x.toStr() }
 }
