@@ -44,6 +44,8 @@ the reasons are in [owned-str.md](owned-str.md).
 | Q | `Shared` gets `share()`; `LXL_OWNED_SHARED=1` measures the owned-handle version (as `LXL_OWNED_STR` does for strings); a `copy` type parameter satisfies `Clone`; httpserver's app type is `A: Clone` and each connection gets `app.clone()`. 76 implicit `Shared` copies outside lexdb now say `share()`/`clone()`. | 6d3a55cc, e7244cff | yes: `Shared` is still a copy type, so `share()` is optional today | none |
 | R | `task.Frozen` is deprecated in favour of `rc T`: pool keeps its config in an `rc`, so `pool.Pool` is owned (copies are `clone()`). `Frozen` stays only for lexdb. | b33aa25b | yes | none |
 
+| S | The compiler is migrated; library parameters it reads now borrow (`fs.mkdir`, `io.openAppend`, `Option.expect`/`Result.expect`'s message, `StrBuf.addLine` and others: `str` became `&str`). Issue 12: `f([])` infers the element type through a `&[]T` parameter. | ad66f390 to the compiler-migration merges | yes: call sites are unchanged (implicit borrow); verified, every lexdb program compiles. A lexdb function passed where a `fn(str)` value of one of these is expected would not, but none is. | none |
+
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
 need `share()`, and `task.Frozen` goes, so lexdb_time.lxl's three
