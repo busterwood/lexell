@@ -351,6 +351,22 @@ A type is a **copy type** if it has no `drop` method and it is a primitive, a fu
 `value record` or `value closed` whose fields are all copy types, or a type
 parameter constrained by `copy`. Every other type is **owned**.
 
+`x.clone()` makes a second owner of `x` (std's `Clone` interface). A type
+that declares a `clone` method uses it. Otherwise the compiler provides a deep
+copy for a type that is **cloneable**:
+- a copy type;
+- an array whose elements are cloneable;
+- `task.Shared[T]`, where the copy is another handle;
+- a record or closed type without a `drop` method, holding no borrows, whose
+  fields are each cloneable.
+
+A type that contains itself is cloneable when the rest of it is
+(`type Node = record { name: str; kids: []Node }`). Such a type satisfies
+`Clone` without a method of its own. A type with a `drop` method holds a
+resource, and is cloneable only through a `clone` method it declares.
+`x.clone()` on a type that is not cloneable is an error that names the part
+that blocks it.
+
 ### 4.8 Type identity and aliases
 
 Types are nominal: two declarations make two types even with the same fields.

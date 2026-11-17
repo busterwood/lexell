@@ -1,5 +1,8 @@
 # Owned strings and declared reference counting
 
+lexdb was left out of the migration; what it will need is logged in
+[owned-str-lexdb.md](owned-str-lexdb.md).
+
 Status: proposal and first measurement, 2026-11-17. Branch `lang/owned-str`.
 
 ## 1. The problem

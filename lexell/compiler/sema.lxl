@@ -664,12 +664,59 @@ pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
     eprintln("OWNED_STR " + kind + " " + pg.mods[m].fname + ":" + intToStr(line) + " " + what)
 }
 
-// design/owned-str.md: a type copied while str is counted (a copy type, or one holding strings)
-// satisfies std's Clone without a clone method of its own; x.clone() then copies it.
+// design/owned-str.md (issue 4): a type with no clone method of its own satisfies std's Clone when
+// it is cloneable; x.clone() then makes a deep copy (copy glue for a type copied while str is
+// counted, clone glue for the rest).
 pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
     if pg.types[iface].mod != pg.std || pg.types[iface].name != "Clone" { return false }
     if pg.tk(t) == TK_TP || pg.methodOf(t, "clone") >= 0 { return false }
-    return pg.isCopyLegacy(t)
+    return pg.cloneable(t)
+}
+
+// Whether t has a built-in deep copy: a type copied while str is counted; an array of cloneable
+// elements; task.Shared (another handle); a record or closed type with no drop method, holding no
+// borrows, whose fields are each cloneable or have a clone method. A type that contains itself is
+// cloneable when the rest of it is.
+pub fn (pg: mut &Program) cloneable(t: int): bool {
+    var seen: []int = []
+    return pg.cloneableAt(t, mut &seen)
+}
+
+// Why t is not cloneable: the first part found that blocks it (for the error), or "".
+pub fn (pg: mut &Program) cloneBlocker(t: int): str {
+    if pg.cloneable(t) { return "" }
+    let k = pg.tk(t)
+    if k == TK_ARR { return pg.cloneBlocker(pg.ta(t)) }
+    if k == TK_CLO || k == TK_REF || k == TK_SLICE { return pg.tstr(t) + " holds borrows" }
+    if k != TK_INST { return pg.tstr(t) + " cannot be copied" }
+    let d = pg.ta(t)
+    if pg.types[d].drop >= 0 { return pg.tstr(t) + " has a drop method" }
+    if pg.isBorrowClass(t) { return pg.tstr(t) + " holds borrows" }
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if !pg.cloneable(ft) { return pg.cloneBlocker(ft) }
+    }
+    return pg.tstr(t) + " cannot be cloned"
+}
+
+fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
+    if pg.isCopyLegacy(t) { return true }
+    let k = pg.tk(t)
+    if k == TK_ARR { return pg.cloneableAt(pg.ta(t), seen) }
+    if k != TK_INST { return false }
+    if pg.methodOf(t, "clone") >= 0 { return true }
+    let d = pg.ta(t)
+    if d == pg.shared { return true }
+    if pg.types[d].drop >= 0 || pg.isBorrowClass(t) { return false }
+    for x in seen {
+        if x == t { return true }
+    }
+    append(seen, t)
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if !pg.cloneableAt(ft, seen) { return false }
+    }
+    return true
 }
 
 // isCopy as if str were counted (LXL_OWNED_STR off): the measurement's "copied today".

@@ -82,6 +82,7 @@ pub const H_IASSOC = 10
 pub const H_ADDR = 11
 pub const H_DEREF = 12
 pub const H_SHARE = 13
+pub const H_CLONE = 14     // a deep copy (design/owned-str.md, issue 4): the type t and the value x
 
 pub type Hole = value record {
     pub k: int
@@ -5396,11 +5397,26 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
             let recv = c.expr(fn1.a, -1)
             let base = if c.pg.tk(recv.t) == sema.TK_REF { c.pg.ta(recv.t) } else { recv.t }
             if fn1.s == "clone" && len(args) == 0 && c.pg.tk(base) != sema.TK_TP && c.pg.methodOf(base, "clone") < 0 &&
-                    c.pg.isCopyLegacy(base) {
-                // design/owned-str.md: the built-in clone of a type that is copied while str is counted
+                    c.pg.cloneable(base) {
+                // design/owned-str.md: the built-in clone, a copy (counts) of a type copied while str is
+                // counted, a deep copy (clone glue) of any other cloneable type
                 let v = c.rd(recv)
-                if v.cat == CAT_PLACE { return rv(c.dup(v.c, base), base) }
-                return rv(c.consume(v, n.line), base)
+                var cc = -1
+                if v.cat != CAT_PLACE {
+                    cc = c.consume(v, n.line)
+                } else if c.pg.isCopyLegacy(base) {
+                    cc = c.dup(v.c, base)
+                } else {
+                    cc = c.hole(mkHoleX(H_CLONE, base, v.c))
+                }
+                // like a call's result: a temporary dropped at the end of the statement unless moved
+                return if c.pod(base) { rv(cc, base) } else { c.holdtmp(cc, base) }
+            }
+            if fn1.s == "clone" && len(args) == 0 && (c.pg.tk(base) == sema.TK_INST || c.pg.tk(base) == sema.TK_ARR) &&
+                    c.pg.methodOf(base, "clone") < 0 &&
+                    (c.pg.tk(base) == sema.TK_ARR || c.fieldIndex(c.pg.ta(base), "clone") < 0) {
+                c.err(n.line, c.tstr(base) + " cannot be cloned: " + c.pg.cloneBlocker(base) +
+                    " (give it a clone method to clone it)")
             }
             let sig = c.methodSig(base, &fn1.s, n.line, c.pg.tk(base) == sema.TK_INST)
             if sig.kind < 0 {

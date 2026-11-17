@@ -25,7 +25,8 @@ const G_ACT = 1
 const G_REST = 2
 const G_DUP = 3
 const G_TRAMP = 4
-const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp"]
+const G_CLONE = 5
+const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone"]
 
 type Inst = value record {
     f: int
@@ -282,6 +283,87 @@ fn (e: mut &Emitter) dropC(t: int, cc: int): int {
     if t == sema.T_STR { return e.call("rt_str_drop", [cc]) }
     let g = e.glueFn(G_DROP, t)
     return e.call(&g, [cc])
+}
+
+// A deep copy of the value cc of type t (design/owned-str.md, issue 4): itself for plain data, a copy
+// for a type copied while str is counted, a call of t's clone method if it has one, else clone glue.
+fn (e: mut &Emitter) cloneC(t: int, cc: int): int {
+    if e.pod(t) { return cc }
+    let f = e.c.pg.methodOf(t, "clone")
+    if f >= 0 && e.tk(t) == sema.TK_INST {
+        var bind: []int = []
+        if e.c.pg.unify(e.c.pg.fns[f].recvType, t, mut &bind, &e.c.pg.fns[f].tps) {
+            var ta: []int = []
+            for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
+            let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
+            let arg = if e.c.pg.fns[f].recvMode == sema.RM_VAL { e.dupC(t, cc) } else { e.c.x.pre("&", cc) }
+            return e.call(&fname, [arg])
+        }
+    }
+    if e.c.pg.isCopyLegacy(t) { return e.dupC(t, cc) }
+    let g = e.glueFn(G_CLONE, t)
+    return e.call(&g, [cc])
+}
+
+// The body of clone glue: a new buffer or box for v, each part cloned into it.
+fn (e: mut &Emitter) cloneBody(t: int, ct: &str): []int {
+    let r = e.nm("r")
+    if e.tk(t) == sema.TK_ARR {
+        let et = e.c.pg.ta(t)
+        let ec = e.ctype(et)
+        let size = e.c.x.szof(e.ct(&ec))
+        let src = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&ec)), e.c.x.dot(e.nm("v"), "data")), e.nm("i"))
+        let dst = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&ec)), e.c.x.dot(r, "data")), e.nm("i"))
+        let h = e.loopHead(e.c.x.lit(0), "<", e.c.x.dot(e.nm("v"), "len"), "++")
+        return [e.c.x.decl(e.ct(ct), "r", e.call("rt_arr_new", [e.c.x.dot(e.nm("v"), "len"), size])),
+            e.c.x.for1(h[0], h[1], h[2], e.c.x.sx(e.c.x.asg(dst, e.cloneC(et, src)))), e.c.x.sret(r)]
+    }
+    let d = e.c.pg.ta(t)
+    let env = e.c.pg.declEnv(t)
+    if d == e.c.pg.shared {
+        return [e.callS("rt_sh_dup", [e.c.x.dot(e.nm("v"), "f_p")]), e.c.x.sret(e.nm("v"))]
+    }
+    let boxed = !e.c.pg.types[d].value
+    var body: []int = []
+    if boxed {
+        append(mut &body, e.c.x.decl(e.ct(ct), "r", e.call("rt_alloc", [e.c.x.szof(e.c.x.pre("*", r))])))
+        append(mut &body, e.c.x.sx(e.c.x.asg(e.c.x.pre("*", r), e.c.x.pre("*", e.nm("v")))))
+    } else {
+        append(mut &body, e.c.x.decl(e.ct(ct), "r", e.nm("v")))
+    }
+    let sep = if boxed { "->" } else { "." }
+    if e.c.pg.types[d].form == sx.F_RECORD {
+        for i in 0..len(e.c.pg.types[d].fields) {
+            let f = e.c.pg.types[d].fields[i]
+            let ft = e.c.pg.subst(f.ty, &env)
+            if e.pod(ft) { continue }
+            let src = if boxed { e.c.x.arrow(e.nm("v"), &("f_" + f.name)) } else { e.c.x.dot(e.nm("v"), &("f_" + f.name)) }
+            let dst = if boxed { e.c.x.arrow(r, &("f_" + f.name)) } else { e.c.x.dot(r, &("f_" + f.name)) }
+            append(mut &body, e.c.x.sx(e.c.x.asg(dst, e.cloneC(ft, src))))
+        }
+    } else {
+        let tagOf = if boxed { e.c.x.arrow(e.nm("v"), "tag") } else { e.c.x.dot(e.nm("v"), "tag") }
+        append(mut &body, e.c.x.sswitch(tagOf))
+        let vs = copyInts(&e.c.pg.types[d].variants)
+        for v in vs {
+            append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+            let vn = "V_" + e.c.pg.variants[v].name
+            for i in 0..len(e.c.pg.variants[v].fields) {
+                let fd = e.c.pg.variants[v].fields[i]
+                let ft = e.c.pg.subst(fd.ty, &env)
+                if e.pod(ft) { continue }
+                let su = if boxed { e.c.x.arrow(e.nm("v"), "u") } else { e.c.x.dot(e.nm("v"), "u") }
+                let du = if boxed { e.c.x.arrow(r, "u") } else { e.c.x.dot(r, "u") }
+                let src = e.c.x.dot(e.c.x.dot(su, &vn), &("f_" + fd.name))
+                let dst = e.c.x.dot(e.c.x.dot(du, &vn), &("f_" + fd.name))
+                append(mut &body, e.c.x.sx(e.c.x.asg(dst, e.cloneC(ft, src))))
+            }
+            append(mut &body, e.c.x.sbreak())
+        }
+        append(mut &body, e.c.x.send())
+    }
+    append(mut &body, e.c.x.sret(r))
+    return body
 }
 
 fn (e: mut &Emitter) dupC(t: int, cc: int): int {
@@ -556,7 +638,7 @@ fn (e: mut &Emitter) define(name: &str, ret: &str, ptys: []str, pnames: []str, l
 fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
     let key = t * 8 + kind
     let n = e.glue.getOr(&key, "")
-    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of"]
+    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of", "the clone of"]
     e.fsrc.put(n, gk[kind] + " " + e.c.pg.tstr(t))
     let ct = e.ctype(t)
     if kind == G_TRAMP {        // a plain function seen as a closure: the environment is the function
@@ -607,6 +689,11 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         } else {
             e.define(&n, "void", ["void*"], ["p"], body, -1)
         }
+        return
+    }
+    if kind == G_CLONE {
+        let body = e.cloneBody(t, &ct)
+        e.define(&n, &ct, [ct], ["v"], body, -1)
         return
     }
     let d = e.c.pg.ta(t)
@@ -705,6 +792,11 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         e.fill(h.x, holes, env, name, res)
         return e.dupC(t, h.x)
     }
+    if k == ck.H_CLONE {
+        let t = e.c.pg.subst(h.t, env)
+        e.fill(h.x, holes, env, name, res)
+        return e.cloneC(t, h.x)
+    }
     if k == ck.H_STR || k == ck.H_GSTR { return e.strlit(h.s, k == ck.H_GSTR) }
     if k == ck.H_ADDR || k == ck.H_DEREF || k == ck.H_SHARE {
         let t = e.c.pg.subst(h.t, env)
@@ -724,11 +816,11 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         return e.nm(&g)
     }
     let t = e.c.pg.subst(h.t, env)
-    if k == ck.H_IMETH && h.s == "clone" && e.c.pg.methodOf(t, "clone") < 0 && e.c.pg.isCopyLegacy(t) {
-        // design/owned-str.md: the built-in clone of a type copied while str is counted (sema.builtinClone)
+    if k == ck.H_IMETH && h.s == "clone" && e.c.pg.methodOf(t, "clone") < 0 && e.c.pg.cloneable(t) {
+        // design/owned-str.md: the built-in clone (sema.builtinClone)
         e.fill(h.r, holes, env, name, res)
         if h.f == sema.RM_VAL { return h.r }
-        return e.dupC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
+        return e.cloneC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
     }
     let f = e.c.pg.methodOf(t, h.s)
     var bind: []int = []
