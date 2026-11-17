@@ -28483,7 +28483,7 @@ static lxl_str f892_kernel_externWhy(lxl_str);
 static bool f891_kernel_externAllowed(lxl_str);
 static lxl_str f890_kernel_rtRefused(lxl_str);
 static void f881_kernel_refuse(struct S8_ir_Ir**, struct S88_kernel_Kern**, int64_t, lxl_str);
-static void f894_kernel_fail(lxl_str, lxl_str, lxl_str, lxl_arr);
+static void f894_kernel_fail(lxl_str, lxl_str, lxl_str, lxl_arr*);
 static lxl_str f893_kernel_display(struct S8_ir_Ir**, int64_t);
 static void f880_kernel_findRoots(struct S8_ir_Ir**, struct S88_kernel_Kern**, int64_t, int64_t);
 static lxl_str f896_kernel_whereIn(struct S8_ir_Ir**, int64_t);
@@ -28496,7 +28496,7 @@ static struct S8_ir_Ir*f876_emit_Emitter_program(struct S87_emit_Emitter**, int6
 static struct S8_ir_Ir*f925_emit_Emitter_lower(struct S87_emit_Emitter**, lxl_str, lxl_arr*, lxl_arr*, lxl_arr*);
 static int64_t f949_tmpl_Arena_sret(struct S99_tmpl_Arena**, int64_t);
 static int64_t f950_tmpl_Arena_mk(struct S99_tmpl_Arena**, int64_t, int64_t, int64_t, int64_t, lxl_str);
-static int64_t f948_tmpl_Arena_call(struct S99_tmpl_Arena**, lxl_str, lxl_arr);
+static int64_t f948_tmpl_Arena_call(struct S99_tmpl_Arena**, lxl_str, lxl_arr*);
 static int64_t f951_tmpl_Arena_list(struct S99_tmpl_Arena**, lxl_arr*);
 static int64_t f947_tmpl_Arena_at(struct S99_tmpl_Arena**, int64_t, int64_t);
 static int64_t f946_emit_Emitter_thunkSlot(struct S87_emit_Emitter**, struct S97_lower_Lower**, int64_t);
@@ -96239,16 +96239,16 @@ static void f881_kernel_refuse(struct S8_ir_Ir**p_p, struct S88_kernel_Kern**p_k
   int64_t ix17 = v_root_4;
   (void)*((lxl_str*)(*p_k)->f_rootAt.data + rt_idx(ix17, (*p_k)->f_rootAt.len, "kernel.lxl:251"));
   lxl_str t18 = rt_str_concat(sl8957, p_what);
-  f894_kernel_fail(*((lxl_str*)(*p_k)->f_rootAt.data + rt_idx(ix17, (*p_k)->f_rootAt.len, "kernel.lxl:251")), t18, sl0, v_rev_10);
+  f894_kernel_fail(*((lxl_str*)(*p_k)->f_rootAt.data + rt_idx(ix17, (*p_k)->f_rootAt.len, "kernel.lxl:251")), t18, sl0, &v_rev_10);
 }
-static void f894_kernel_fail(lxl_str p_at, lxl_str p_why, lxl_str p_root, lxl_arr p_chain) {
+static void f894_kernel_fail(lxl_str p_at, lxl_str p_why, lxl_str p_root, lxl_arr*p_chain) {
   lxl_str t1 = rt_str_concat(p_at, sl8958);
   lxl_str t2 = rt_str_concat(t1, p_why);
   lxl_str t3 = rt_str_concat(t2, sl8652);
   lxl_str v_msg_4 = t3;
   rt_str_drop(t2);
   rt_str_drop(t1);
-  lxl_slice ap5 = rt_as_slice(&p_chain);
+  lxl_slice ap5 = rt_as_slice(p_chain);
   for (int64_t i6 = 0LL; i6 < ap5.len; i6++) {
     lxl_str v_c_7 = rt_str_dup(*((lxl_str*)ap5.data + i6));
     lxl_str t8 = rt_str_concat(v_msg_4, sl8959);
@@ -96315,7 +96315,7 @@ static void f880_kernel_findRoots(struct S8_ir_Ir**p_p, struct S88_kernel_Kern**
       bool c20 = (bool)(v_rs_12.len == 0LL);
       if (c20) {
         lxl_arr a21 = rt_arr_new(0LL, 16ULL);
-        f894_kernel_fail(v_at_19, sl8960, sl0, a21);
+        f894_kernel_fail(v_at_19, sl8960, sl0, &a21);
       }
       lxl_slice ap22 = rt_as_slice(&v_rs_12);
       for (int64_t i23 = 0LL; i23 < ap22.len; i23++) {
@@ -97387,7 +97387,7 @@ static struct S8_ir_Ir*f925_emit_Emitter_lower(struct S87_emit_Emitter**p_e, lxl
       *(int64_t*)rt_arr_push(&v_args_172, 8ULL) = ap179;
     }
     lxl_str t180 = rt_str_concat(sl8974, (*v_x_169)->f_name);
-    int64_t t181 = f948_tmpl_Arena_call(&v_u_2->f_x, t180, v_args_172);
+    int64_t t181 = f948_tmpl_Arena_call(&v_u_2->f_x, t180, &v_args_172);
     int64_t v_call_182 = t181;
     rt_str_drop(t180);
     int64_t ifx183;
@@ -97421,6 +97421,7 @@ static struct S8_ir_Ir*f925_emit_Emitter_lower(struct S87_emit_Emitter**p_e, lxl
     gl11_drop(a197);
     gl0_drop(a195);
     gl11_drop(a193);
+    gl11_drop(v_args_172);
   }
   lxl_arr a198 = rt_arr_new(0LL, 8ULL);
   {
@@ -97443,36 +97444,41 @@ static struct S8_ir_Ir*f925_emit_Emitter_lower(struct S87_emit_Emitter**p_e, lxl
   lxl_arr a207 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a207.data + 0LL) = t205;
   *((int64_t*)a207.data + 1LL) = t206;
-  int64_t t208 = f948_tmpl_Arena_call(&v_u_2->f_x, sl298, a207);
+  int64_t t208 = f948_tmpl_Arena_call(&v_u_2->f_x, sl298, &a207);
   int64_t t209 = f909_tmpl_Arena_sx(&v_u_2->f_x, t208);
   int64_t t210 = f941_tmpl_Arena_nm(&v_u_2->f_x, sl8976);
   lxl_arr a211 = rt_arr_new(1LL, 8ULL);
   *((int64_t*)a211.data + 0LL) = t210;
-  int64_t t212 = f948_tmpl_Arena_call(&v_u_2->f_x, sl300, a211);
+  int64_t t212 = f948_tmpl_Arena_call(&v_u_2->f_x, sl300, &a211);
   int64_t t213 = f909_tmpl_Arena_sx(&v_u_2->f_x, t212);
   lxl_arr a214 = rt_arr_new(0LL, 8ULL);
-  int64_t t215 = f948_tmpl_Arena_call(&v_u_2->f_x, p_entry, a214);
+  int64_t t215 = f948_tmpl_Arena_call(&v_u_2->f_x, p_entry, &a214);
   int64_t t216 = f909_tmpl_Arena_sx(&v_u_2->f_x, t215);
   lxl_arr a217 = rt_arr_new(3LL, 8ULL);
   *((int64_t*)a217.data + 0LL) = t209;
   *((int64_t*)a217.data + 1LL) = t213;
   *((int64_t*)a217.data + 2LL) = t216;
   lxl_arr v_ml_218 = a217;
+  gl11_drop(a214);
+  gl11_drop(a211);
+  gl11_drop(a207);
   int64_t t219 = f939_tmpl_Arena_ct(&v_u_2->f_x, sl141);
   int64_t t220 = f940_tmpl_Arena_ptr(&v_u_2->f_x, t219);
   int64_t t221 = f907_tmpl_Arena_lit(&v_u_2->f_x, 0LL);
   int64_t t222 = f921_tmpl_Arena_cast(&v_u_2->f_x, t220, t221);
   lxl_arr a223 = rt_arr_new(1LL, 8ULL);
   *((int64_t*)a223.data + 0LL) = t222;
-  int64_t t224 = f948_tmpl_Arena_call(&v_u_2->f_x, sl8976, a223);
+  int64_t t224 = f948_tmpl_Arena_call(&v_u_2->f_x, sl8976, &a223);
   int64_t t225 = f909_tmpl_Arena_sx(&v_u_2->f_x, t224);
   int64_t ap226 = t225;
   *(int64_t*)rt_arr_push(&v_ml_218, 8ULL) = ap226;
+  gl11_drop(a223);
   lxl_arr a227 = rt_arr_new(0LL, 8ULL);
-  int64_t t228 = f948_tmpl_Arena_call(&v_u_2->f_x, sl301, a227);
+  int64_t t228 = f948_tmpl_Arena_call(&v_u_2->f_x, sl301, &a227);
   int64_t t229 = f909_tmpl_Arena_sx(&v_u_2->f_x, t228);
   int64_t ap230 = t229;
   *(int64_t*)rt_arr_push(&v_ml_218, 8ULL) = ap230;
+  gl11_drop(a227);
   int64_t t231 = f907_tmpl_Arena_lit(&v_u_2->f_x, 0LL);
   int64_t t232 = f949_tmpl_Arena_sret(&v_u_2->f_x, t231);
   int64_t ap233 = t232;
@@ -97520,15 +97526,14 @@ static int64_t f950_tmpl_Arena_mk(struct S99_tmpl_Arena**p_x, int64_t p_k, int64
   int64_t r3 = rt_sub_int((*p_x)->f_nodes.len, 1LL, "tmpl.lxl:77");
   return r3;
 }
-static int64_t f948_tmpl_Arena_call(struct S99_tmpl_Arena**p_x, lxl_str p_f, lxl_arr p_args) {
+static int64_t f948_tmpl_Arena_call(struct S99_tmpl_Arena**p_x, lxl_str p_f, lxl_arr*p_args) {
   int64_t t1 = f941_tmpl_Arena_nm(p_x, p_f);
   int64_t t2 = f950_tmpl_Arena_mk(p_x, 4LL, t1, -1LL, -1LL, sl0);
   int64_t v_n_3 = t2;
-  int64_t t4 = f951_tmpl_Arena_list(p_x, &p_args);
+  int64_t t4 = f951_tmpl_Arena_list(p_x, p_args);
   int64_t ix5 = v_n_3;
   ((struct S101_tmpl_Node*)(*p_x)->f_nodes.data + rt_idx(ix5, (*p_x)->f_nodes.len, "tmpl.lxl:113"))->f_l = t4;
   int64_t r6 = v_n_3;
-  gl11_drop(p_args);
   return r6;
 }
 static int64_t f951_tmpl_Arena_list(struct S99_tmpl_Arena**p_x, lxl_arr*p_xs) {
@@ -101659,8 +101664,9 @@ static int64_t f1041_emit_Emitter_dupC(struct S87_emit_Emitter**p_e, int64_t p_t
   return r12;
 }
 static int64_t f1045_emit_Emitter_call(struct S87_emit_Emitter**p_e, lxl_str p_f, lxl_arr p_args) {
-  int64_t t1 = f948_tmpl_Arena_call(&(*p_e)->f_c->f_x, p_f, p_args);
+  int64_t t1 = f948_tmpl_Arena_call(&(*p_e)->f_c->f_x, p_f, &p_args);
   int64_t r2 = t1;
+  gl11_drop(p_args);
   return r2;
 }
 static int64_t f1040_tmpl_Arena_dot(struct S99_tmpl_Arena**p_x, int64_t p_a, lxl_str p_f) {
@@ -103187,9 +103193,10 @@ static bool f1034_emit_Emitter_listed(struct S87_emit_Emitter**p_e, int64_t p_t)
   return r4;
 }
 static int64_t f1033_emit_Emitter_callS(struct S87_emit_Emitter**p_e, lxl_str p_f, lxl_arr p_args) {
-  int64_t t1 = f948_tmpl_Arena_call(&(*p_e)->f_c->f_x, p_f, p_args);
+  int64_t t1 = f948_tmpl_Arena_call(&(*p_e)->f_c->f_x, p_f, &p_args);
   int64_t t2 = f909_tmpl_Arena_sx(&(*p_e)->f_c->f_x, t1);
   int64_t r3 = t2;
+  gl11_drop(p_args);
   return r3;
 }
 static int64_t f1032_tmpl_Arena_arrow(struct S99_tmpl_Arena**p_x, int64_t p_a, lxl_str p_f) {
@@ -111245,8 +111252,9 @@ static void f1255_check_Checker_sMatch(struct S84_check_Checker**p_c, int64_t p_
       if (c248) {
         lxl_arr a249 = rt_arr_new(1LL, 8ULL);
         *((int64_t*)a249.data + 0LL) = v_acc_45;
-        int64_t t250 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, a249);
+        int64_t t250 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, &a249);
         f1230_check_Checker_emitx(p_c, t250);
+        gl11_drop(a249);
       }
       rt_str_drop(v_vname_163);
     }
@@ -112421,13 +112429,14 @@ static struct S125_check_Val f1311_check_Checker_asSlice(struct S84_check_Checke
   if (c8) {
     lxl_arr a9 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a9.data + 0LL) = p_v.f_c;
-    int64_t t10 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, a9);
+    int64_t t10 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, &a9);
     int64_t t11 = f918_sema_Program_ta(&(*p_c)->f_pg, p_v.f_t);
     int64_t t12 = f918_sema_Program_ta(&(*p_c)->f_pg, t11);
     bool t13 = f1014_sema_Program_tm(&(*p_c)->f_pg, p_v.f_t);
     int64_t t14 = f1162_sema_Program_mkSlice(&(*p_c)->f_pg, t12, t13);
     struct S125_check_Val t15 = f1312_check_rvAt(t10, t14, p_v.f_root, p_v.f_path);
     struct S125_check_Val r16 = t15;
+    gl11_drop(a9);
     gl84_drop(p_v);
     return r16;
   }
@@ -114082,8 +114091,9 @@ static void f1261_check_Checker_matchLits(struct S84_check_Checker**p_c, int64_t
           lxl_arr a90 = rt_arr_new(2LL, 8ULL);
           *((int64_t*)a90.data + 0LL) = t87;
           *((int64_t*)a90.data + 1LL) = t89;
-          int64_t t91 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl310, a90);
+          int64_t t91 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl310, &a90);
           v_cmp_84 = t91;
+          gl11_drop(a90);
         } else {
           bool c92 = (bool)(v_k_51 == 2LL);
           if (c92) {
@@ -114944,8 +114954,9 @@ static int64_t f1347_check_Checker_moveOutOfTmp(struct S84_check_Checker**p_c, s
   if (c68) {
     lxl_arr a69 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a69.data + 0LL) = v_base_48;
-    int64_t t70 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, a69);
+    int64_t t70 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, &a69);
     f1230_check_Checker_emitx(p_c, t70);
+    gl11_drop(a69);
   }
   int64_t ix71 = v_ti_1;
   ((struct S132_check_Tmp*)(*p_c)->f_tmps.data + rt_idx(ix71, (*p_c)->f_tmps.len, "check.lxl:1517"))->f_live = (bool)0LL;
@@ -115982,8 +115993,9 @@ static void f1251_check_Checker_sFor(struct S84_check_Checker**p_c, int64_t p_s)
     int64_t t83 = f942_tmpl_Arena_pre(&(*p_c)->f_x, sl58, v_v_43.f_c);
     lxl_arr a84 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a84.data + 0LL) = t83;
-    int64_t t85 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, a84);
+    int64_t t85 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, &a84);
     ifx82 = t85;
+    gl11_drop(a84);
   }
   int64_t v_sl_86 = ifx82;
   int64_t t87 = f1313_check_Checker_ct(p_c, sl8883);
@@ -117701,9 +117713,10 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                     lxl_arr a666 = rt_arr_new(2LL, 8ULL);
                     *((int64_t*)a666.data + 0LL) = t664;
                     *((int64_t*)a666.data + 1LL) = t665;
-                    int64_t t667 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl315, a666);
+                    int64_t t667 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl315, &a666);
                     int64_t ap668 = t667;
                     *(int64_t*)rt_arr_push(&v_cs2_655, 8ULL) = ap668;
+                    gl11_drop(a666);
                   } else {
                     bool c669 = (bool)(v_pk_660 == 3LL);
                     if (c669) {
@@ -117712,9 +117725,10 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                       int64_t t672 = f1040_tmpl_Arena_dot(&(*p_c)->f_x, t671, sl8970);
                       lxl_arr a673 = rt_arr_new(1LL, 8ULL);
                       *((int64_t*)a673.data + 0LL) = t672;
-                      int64_t t674 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl317, a673);
+                      int64_t t674 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl317, &a673);
                       int64_t ap675 = t674;
                       *(int64_t*)rt_arr_push(&v_cs2_655, 8ULL) = ap675;
+                      gl11_drop(a673);
                     } else {
                       bool b676 = (bool)(v_pk_660 == 2LL);
                       if (b676) {
@@ -117730,9 +117744,10 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                         int64_t t683 = f1032_tmpl_Arena_arrow(&(*p_c)->f_x, t682, sl8970);
                         lxl_arr a684 = rt_arr_new(1LL, 8ULL);
                         *((int64_t*)a684.data + 0LL) = t683;
-                        int64_t t685 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl317, a684);
+                        int64_t t685 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl317, &a684);
                         int64_t ap686 = t685;
                         *(int64_t*)rt_arr_push(&v_cs2_655, 8ULL) = ap686;
+                        gl11_drop(a684);
                       } else {
                         int64_t ix687 = v_k_657;
                         int64_t ap688 = *((int64_t*)v_cs_549.data + rt_idx(ix687, v_cs_549.len, "check.lxl:5308"));
@@ -117765,7 +117780,7 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                 }
                 int64_t ix693 = (*p_sig)->f_fd;
                 lxl_str t694 = rt_str_concat(sl8974, ((struct S86_sema_FnDecl*)(*p_c)->f_pg->f_fns.data + rt_idx(ix693, (*p_c)->f_pg->f_fns.len, "check.lxl:5312"))->f_cname);
-                int64_t t695 = f948_tmpl_Arena_call(&(*p_c)->f_x, t694, v_cs2_655);
+                int64_t t695 = f948_tmpl_Arena_call(&(*p_c)->f_x, t694, &v_cs2_655);
                 v_text_589 = t695;
                 rt_str_drop(t694);
                 bool c696 = (bool)(v_ret_560 == 9LL);
@@ -117774,8 +117789,9 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                   int64_t t698 = f921_tmpl_Arena_cast(&(*p_c)->f_x, t697, v_text_589);
                   lxl_arr a699 = rt_arr_new(1LL, 8ULL);
                   *((int64_t*)a699.data + 0LL) = t698;
-                  int64_t t700 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl192, a699);
+                  int64_t t700 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl192, &a699);
                   v_text_589 = t700;
+                  gl11_drop(a699);
                 }
                 bool c701 = v_hasStr_525;
                 if (c701) {
@@ -117783,14 +117799,16 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                   lxl_str v_mk_703 = t702;
                   int64_t t704 = f1313_check_Checker_ct(p_c, sl147);
                   lxl_arr a705 = rt_arr_new(0LL, 8ULL);
-                  int64_t t706 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl316, a705);
+                  int64_t t706 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl316, &a705);
                   int64_t t707 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t704, v_mk_703, t706);
                   f1231_check_Checker_emit(p_c, t707);
+                  gl11_drop(a705);
                   int64_t t708 = f1187_check_Checker_nm(p_c, v_mk_703);
                   lxl_arr a709 = rt_arr_new(1LL, 8ULL);
                   *((int64_t*)a709.data + 0LL) = t708;
-                  int64_t t710 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl318, a709);
+                  int64_t t710 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl318, &a709);
                   int64_t v_free_711 = t710;
+                  gl11_drop(a709);
                   bool b712 = (bool)(v_ret_560 != 11LL);
                   if (b712) {
                     b712 = (bool)(v_ret_560 != 12LL);
@@ -117803,6 +117821,7 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                     struct S125_check_Val r716 = gl83_dup(v_v_715);
                     gl84_drop(v_v_715);
                     rt_str_drop(v_mk_703);
+                    gl11_drop(v_cs2_655);
                     gl11_drop(v_cs_549);
                     gl1_drop(v_missing_488);
                     gl106_drop(v_rechecks_125);
@@ -117824,6 +117843,7 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                   struct S125_check_Val t717 = f1215_check_voidVal((bool)(v_ret_560 == 12LL));
                   struct S125_check_Val r718 = t717;
                   rt_str_drop(v_mk_703);
+                  gl11_drop(v_cs2_655);
                   gl11_drop(v_cs_549);
                   gl1_drop(v_missing_488);
                   gl106_drop(v_rechecks_125);
@@ -117840,6 +117860,7 @@ static struct S125_check_Val f1372_check_Checker_call(struct S84_check_Checker**
                   gl84_drop(p_recv);
                   return r718;
                 }
+                gl11_drop(v_cs2_655);
               }
             }
           }
@@ -118023,9 +118044,10 @@ static struct S125_check_Val f1396_check_Checker_blockingCall(struct S84_check_C
     }
     int64_t t6 = f1313_check_Checker_ct(p_c, sl147);
     lxl_arr a7 = rt_arr_new(0LL, 8ULL);
-    int64_t t8 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl316, a7);
+    int64_t t8 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl316, &a7);
     int64_t t9 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t6, v_mk_2, t8);
     f1231_check_Checker_emit(p_c, t9);
+    gl11_drop(a7);
   }
   lxl_str t10 = f1264_check_Checker_fresh(p_c, sl9389);
   lxl_str v_bk_11 = t10;
@@ -118056,16 +118078,18 @@ static struct S125_check_Val f1396_check_Checker_blockingCall(struct S84_check_C
   *((int64_t*)a32.data + 0LL) = t29;
   *((int64_t*)a32.data + 1LL) = t30;
   *((int64_t*)a32.data + 2LL) = t31;
-  int64_t t33 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl543, a32);
+  int64_t t33 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl543, &a32);
   f1230_check_Checker_emitx(p_c, t33);
+  gl11_drop(a32);
   rt_str_drop(t28);
   bool c34 = p_hasStr;
   if (c34) {
     int64_t t35 = f1187_check_Checker_nm(p_c, v_mk_2);
     lxl_arr a36 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a36.data + 0LL) = t35;
-    int64_t t37 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl318, a36);
+    int64_t t37 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl318, &a36);
     f1230_check_Checker_emitx(p_c, t37);
+    gl11_drop(a36);
   }
   bool b38 = (bool)(p_ret == 11LL);
   if (!b38) {
@@ -118091,9 +118115,10 @@ static struct S125_check_Val f1396_check_Checker_blockingCall(struct S84_check_C
     int64_t t50 = f921_tmpl_Arena_cast(&(*p_c)->f_x, t49, v_res_47);
     lxl_arr a51 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a51.data + 0LL) = t50;
-    int64_t t52 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl192, a51);
+    int64_t t52 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl192, &a51);
     struct S125_check_Val t53 = f1259_check_Checker_holdtmp(p_c, t52, p_ret);
     struct S125_check_Val r54 = t53;
+    gl11_drop(a51);
     rt_str_drop(v_bk_11);
     rt_str_drop(v_mk_2);
     return r54;
@@ -118293,9 +118318,10 @@ static int64_t f1393_check_Checker_build(struct S84_check_Checker**p_c, int64_t 
   int64_t t65 = f1046_tmpl_Arena_szof(&(*p_c)->f_x, t64);
   lxl_arr a66 = rt_arr_new(1LL, 8ULL);
   *((int64_t*)a66.data + 0LL) = t65;
-  int64_t t67 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl278, a66);
+  int64_t t67 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl278, &a66);
   int64_t t68 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t63, v_n_58, t67);
   f1231_check_Checker_emit(p_c, t68);
+  gl11_drop(a66);
   bool c69 = (bool)(p_vr >= 0LL);
   if (c69) {
     int64_t t70 = f1032_tmpl_Arena_arrow(&(*p_c)->f_x, v_nn_62, sl9032);
@@ -120924,9 +120950,10 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
       *((int64_t*)a63.data + 0LL) = v_lv_2.f_c;
       *((int64_t*)a63.data + 1LL) = v_rv1_18.f_c;
       *((int64_t*)a63.data + 2LL) = v_W_21;
-      int64_t t64 = f948_tmpl_Arena_call(&(*p_c)->f_x, t62, a63);
+      int64_t t64 = f948_tmpl_Arena_call(&(*p_c)->f_x, t62, &a63);
       struct S125_check_Val t65 = f1216_check_rv(t64, v_lt_3);
       struct S125_check_Val r66 = t65;
+      gl11_drop(a63);
       rt_str_drop(t62);
       rt_str_drop(t61);
       rt_str_drop(t60);
@@ -120992,9 +121019,10 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
         *((int64_t*)a89.data + 0LL) = v_lv_2.f_c;
         *((int64_t*)a89.data + 1LL) = v_rv1_18.f_c;
         *((int64_t*)a89.data + 2LL) = v_W_21;
-        int64_t t90 = f948_tmpl_Arena_call(&(*p_c)->f_x, t88, a89);
+        int64_t t90 = f948_tmpl_Arena_call(&(*p_c)->f_x, t88, &a89);
         struct S125_check_Val t91 = f1216_check_rv(t90, v_lt_3);
         struct S125_check_Val r92 = t91;
+        gl11_drop(a89);
         rt_str_drop(t88);
         rt_str_drop(t87);
         rt_str_drop(t86);
@@ -121027,9 +121055,10 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
         lxl_arr a100 = rt_arr_new(2LL, 8ULL);
         *((int64_t*)a100.data + 0LL) = v_lv_2.f_c;
         *((int64_t*)a100.data + 1LL) = v_rv1_18.f_c;
-        int64_t t101 = f948_tmpl_Arena_call(&(*p_c)->f_x, t99, a100);
+        int64_t t101 = f948_tmpl_Arena_call(&(*p_c)->f_x, t99, &a100);
         struct S125_check_Val t102 = f1216_check_rv(t101, v_lt_3);
         struct S125_check_Val r103 = t102;
+        gl11_drop(a100);
         rt_str_drop(t99);
         rt_str_drop(t98);
         rt_str_drop(t97);
@@ -121150,9 +121179,10 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
               lxl_arr a139 = rt_arr_new(2LL, 8ULL);
               *((int64_t*)a139.data + 0LL) = v_lv_2.f_c;
               *((int64_t*)a139.data + 1LL) = v_rv1_18.f_c;
-              int64_t t140 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl312, a139);
+              int64_t t140 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl312, &a139);
               struct S125_check_Val t141 = f1259_check_Checker_holdtmp(p_c, t140, 9LL);
               struct S125_check_Val r142 = t141;
+              gl11_drop(a139);
               rt_str_drop(v_nm_30);
               gl84_drop(v_rv1_18);
               gl84_drop(v_rv0_4);
@@ -121170,8 +121200,9 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
               lxl_arr a145 = rt_arr_new(2LL, 8ULL);
               *((int64_t*)a145.data + 0LL) = v_lv_2.f_c;
               *((int64_t*)a145.data + 1LL) = v_rv1_18.f_c;
-              int64_t t146 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl310, a145);
+              int64_t t146 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl310, &a145);
               int64_t v_eq_147 = t146;
+              gl11_drop(a145);
               int64_t ifx148;
               if (rt_str_eq(p_op, sl42)) {
                 ifx148 = v_eq_147;
@@ -121195,12 +121226,13 @@ static struct S125_check_Val f1428_check_Checker_binop(struct S84_check_Checker*
               lxl_arr a154 = rt_arr_new(2LL, 8ULL);
               *((int64_t*)a154.data + 0LL) = v_lv_2.f_c;
               *((int64_t*)a154.data + 1LL) = v_rv1_18.f_c;
-              int64_t t155 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl311, a154);
+              int64_t t155 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl311, &a154);
               int64_t t156 = f1192_check_Checker_lit(p_c, 0LL);
               int64_t t157 = f911_tmpl_Arena_bin(&(*p_c)->f_x, p_op, t155, t156);
               int64_t t158 = f952_tmpl_Arena_par(&(*p_c)->f_x, t157);
               struct S125_check_Val t159 = f1216_check_rv(t158, 8LL);
               struct S125_check_Val r160 = t159;
+              gl11_drop(a154);
               rt_str_drop(v_nm_30);
               gl84_drop(v_rv1_18);
               gl84_drop(v_rv0_4);
@@ -122225,8 +122257,9 @@ static void f1247_check_Checker_sDestructure(struct S84_check_Checker**p_c, int6
   if (c195) {
     lxl_arr a196 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a196.data + 0LL) = v_accn_140;
-    int64_t t197 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, a196);
+    int64_t t197 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, &a196);
     f1230_check_Checker_emitx(p_c, t197);
+    gl11_drop(a196);
   }
   rt_str_drop(v_sep_144);
   rt_str_drop(v_acc_129);
@@ -123571,9 +123604,10 @@ static struct S125_check_Val f1473_check_Checker_convert(struct S84_check_Checke
     lxl_arr a44 = rt_arr_new(2LL, 8ULL);
     *((int64_t*)a44.data + 0LL) = v_v_20.f_c;
     *((int64_t*)a44.data + 1LL) = v_W_26;
-    int64_t t45 = f948_tmpl_Arena_call(&(*p_c)->f_x, t43, a44);
+    int64_t t45 = f948_tmpl_Arena_call(&(*p_c)->f_x, t43, &a44);
     struct S125_check_Val t46 = f1216_check_rv(t45, p_t);
     struct S125_check_Val r47 = t46;
+    gl11_drop(a44);
     rt_str_drop(t43);
     rt_str_drop(v_d_24);
     gl84_drop(v_v_20);
@@ -123586,9 +123620,10 @@ static struct S125_check_Val f1473_check_Checker_convert(struct S84_check_Checke
     lxl_arr a50 = rt_arr_new(2LL, 8ULL);
     *((int64_t*)a50.data + 0LL) = v_v_20.f_c;
     *((int64_t*)a50.data + 1LL) = v_W_26;
-    int64_t t51 = f948_tmpl_Arena_call(&(*p_c)->f_x, t49, a50);
+    int64_t t51 = f948_tmpl_Arena_call(&(*p_c)->f_x, t49, &a50);
     struct S125_check_Val t52 = f1216_check_rv(t51, p_t);
     struct S125_check_Val r53 = t52;
+    gl11_drop(a50);
     rt_str_drop(t49);
     rt_str_drop(v_d_24);
     gl84_drop(v_v_20);
@@ -123601,9 +123636,10 @@ static struct S125_check_Val f1473_check_Checker_convert(struct S84_check_Checke
   lxl_arr a57 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a57.data + 0LL) = t56;
   *((int64_t*)a57.data + 1LL) = v_W_26;
-  int64_t t58 = f948_tmpl_Arena_call(&(*p_c)->f_x, t54, a57);
+  int64_t t58 = f948_tmpl_Arena_call(&(*p_c)->f_x, t54, &a57);
   struct S125_check_Val t59 = f1216_check_rv(t58, p_t);
   struct S125_check_Val r60 = t59;
+  gl11_drop(a57);
   rt_str_drop(t54);
   rt_str_drop(v_d_24);
   gl84_drop(v_v_20);
@@ -124021,9 +124057,10 @@ static struct S125_check_Val f1468_check_Checker_rcUnshare(struct S84_check_Chec
   int64_t t35 = f1046_tmpl_Arena_szof(&(*p_c)->f_x, t34);
   lxl_arr a36 = rt_arr_new(1LL, 8ULL);
   *((int64_t*)a36.data + 0LL) = t35;
-  int64_t t37 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl278, a36);
+  int64_t t37 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl278, &a36);
   int64_t t38 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t33, v_q_30, t37);
   f1231_check_Checker_emit(p_c, t38);
+  gl11_drop(a36);
   int64_t t39 = f1032_tmpl_Arena_arrow(&(*p_c)->f_x, v_qn_32, sl9056);
   int64_t t40 = f1192_check_Checker_lit(p_c, 1LL);
   int64_t t41 = f908_tmpl_Arena_asg(&(*p_c)->f_x, t39, t40);
@@ -124574,10 +124611,11 @@ static struct S125_check_Val f1463_check_Checker_onceCall(struct S84_check_Check
     *((int64_t*)a48.data + 0LL) = t47;
     *((int64_t*)a48.data + 1LL) = v_m_43;
     *((int64_t*)a48.data + 2LL) = v_W_4;
-    int64_t t49 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl265, a48);
+    int64_t t49 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl265, &a48);
     int64_t t50 = f909_tmpl_Arena_sx(&(*p_c)->f_x, t49);
     int64_t t51 = f1064_tmpl_Arena_if1(&(*p_c)->f_x, t46, t50);
     f1231_check_Checker_emit(p_c, t51);
+    gl11_drop(a48);
     int64_t t52 = v_gt_10;
     int64_t t53 = f1187_check_Checker_nm(p_c, v_cn_8);
     int64_t t54 = f1276_check_Checker_addrOf(p_c, t52, t53);
@@ -124617,10 +124655,11 @@ static struct S125_check_Val f1463_check_Checker_onceCall(struct S84_check_Check
   *((int64_t*)a78.data + 0LL) = t77;
   *((int64_t*)a78.data + 1LL) = v_m_75;
   *((int64_t*)a78.data + 2LL) = v_W_4;
-  int64_t t79 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl265, a78);
+  int64_t t79 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl265, &a78);
   int64_t t80 = f909_tmpl_Arena_sx(&(*p_c)->f_x, t79);
   int64_t t81 = f1064_tmpl_Arena_if1(&(*p_c)->f_x, t76, t80);
   f1231_check_Checker_emit(p_c, t81);
+  gl11_drop(a78);
   int64_t t82 = f1187_check_Checker_nm(p_c, v_cn_8);
   int64_t t83 = f908_tmpl_Arena_asg(&(*p_c)->f_x, t82, v_cc_66);
   int64_t t84 = f909_tmpl_Arena_sx(&(*p_c)->f_x, t83);
@@ -125217,8 +125256,9 @@ static struct S125_check_Val f1495_check_Checker_bExit(struct S84_check_Checker*
   }
   lxl_arr a10 = rt_arr_new(1LL, 8ULL);
   *((int64_t*)a10.data + 0LL) = v_v_4.f_c;
-  int64_t t11 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl302, a10);
+  int64_t t11 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl302, &a10);
   f1230_check_Checker_emitx(p_c, t11);
+  gl11_drop(a10);
   struct S125_check_Val t12 = f1215_check_voidVal((bool)1LL);
   struct S125_check_Val r13 = t12;
   gl84_drop(v_v_4);
@@ -125249,10 +125289,11 @@ static struct S125_check_Val f1494_check_Checker_bAssert(struct S84_check_Checke
   lxl_arr a18 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a18.data + 0LL) = t15;
   *((int64_t*)a18.data + 1LL) = t17;
-  int64_t t19 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl319, a18);
+  int64_t t19 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl319, &a18);
   int64_t t20 = f909_tmpl_Arena_sx(&(*p_c)->f_x, t19);
   int64_t t21 = f1064_tmpl_Arena_if1(&(*p_c)->f_x, t14, t20);
   f1231_check_Checker_emit(p_c, t21);
+  gl11_drop(a18);
   struct S125_check_Val t22 = f1215_check_voidVal((bool)0LL);
   struct S125_check_Val r23 = t22;
   gl84_drop(v_v_4);
@@ -125278,8 +125319,9 @@ static struct S125_check_Val f1493_check_Checker_bPanic(struct S84_check_Checker
   lxl_arr a13 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a13.data + 0LL) = t10;
   *((int64_t*)a13.data + 1LL) = t12;
-  int64_t t14 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl319, a13);
+  int64_t t14 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl319, &a13);
   f1230_check_Checker_emitx(p_c, t14);
+  gl11_drop(a13);
   struct S125_check_Val t15 = f1215_check_voidVal((bool)1LL);
   struct S125_check_Val r16 = t15;
   gl84_drop(v_v_4);
@@ -125322,9 +125364,10 @@ static struct S125_check_Val f1492_check_Checker_bWithCapacity(struct S84_check_
   *((int64_t*)a21.data + 0LL) = t18;
   *((int64_t*)a21.data + 1LL) = t19;
   *((int64_t*)a21.data + 2LL) = t20;
-  int64_t t22 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl327, a21);
+  int64_t t22 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl327, &a21);
   int64_t t23 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t17, v_an_14, t22);
   f1231_check_Checker_emit(p_c, t23);
+  gl11_drop(a21);
   int64_t t24 = f1013_sema_Program_mkArr(&(*p_c)->f_pg, v_et_11);
   int64_t v_at_25 = t24;
   int64_t t26 = f1187_check_Checker_nm(p_c, v_an_14);
@@ -125424,9 +125467,10 @@ static struct S125_check_Val f1491_check_Checker_bArray(struct S84_check_Checker
   *((int64_t*)a52.data + 0LL) = t49;
   *((int64_t*)a52.data + 1LL) = t50;
   *((int64_t*)a52.data + 2LL) = t51;
-  int64_t t53 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl325, a52);
+  int64_t t53 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl325, &a52);
   int64_t t54 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t48, v_an_38, t53);
   f1231_check_Checker_emit(p_c, t54);
+  gl11_drop(a52);
   int64_t t55 = f1214_check_Checker_T(p_c, v_v_19.f_t);
   int64_t v_ct3_56 = t55;
   int64_t t57 = f1187_check_Checker_nm(p_c, v_vn_36);
@@ -125738,8 +125782,9 @@ static struct S125_check_Val f1488_check_Checker_bSwap(struct S84_check_Checker*
   *((int64_t*)a34.data + 2LL) = t31;
   *((int64_t*)a34.data + 3LL) = t32;
   *((int64_t*)a34.data + 4LL) = t33;
-  int64_t t35 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl332, a34);
+  int64_t t35 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl332, &a34);
   f1230_check_Checker_emitx(p_c, t35);
+  gl11_drop(a34);
   struct S125_check_Val t36 = f1215_check_voidVal((bool)0LL);
   struct S125_check_Val r37 = t36;
   gl84_drop(v_j_22);
@@ -125898,10 +125943,11 @@ static struct S125_check_Val f1487_check_Checker_bPop(struct S84_check_Checker**
   *((int64_t*)a15.data + 0LL) = t11;
   *((int64_t*)a15.data + 1LL) = t12;
   *((int64_t*)a15.data + 2LL) = t14;
-  int64_t t16 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl331, a15);
+  int64_t t16 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl331, &a15);
   int64_t t17 = f947_tmpl_Arena_at(&(*p_c)->f_x, t10, t16);
   struct S125_check_Val t18 = f1259_check_Checker_holdtmp(p_c, t17, v_et_5);
   struct S125_check_Val v_r_19 = t18;
+  gl11_drop(a15);
   bool t20 = f1082_sema_Program_isBorrowClass(&(*p_c)->f_pg, v_et_5);
   struct S125_check_Val ifx21;
   if (t20) {
@@ -125974,11 +126020,12 @@ static struct S125_check_Val f1486_check_Checker_bAppend(struct S84_check_Checke
   lxl_arr a38 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a38.data + 0LL) = t36;
   *((int64_t*)a38.data + 1LL) = t37;
-  int64_t t39 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl330, a38);
+  int64_t t39 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl330, &a38);
   int64_t t40 = f947_tmpl_Arena_at(&(*p_c)->f_x, t35, t39);
   int64_t t41 = f1187_check_Checker_nm(p_c, v_n_27);
   int64_t t42 = f908_tmpl_Arena_asg(&(*p_c)->f_x, t40, t41);
   f1230_check_Checker_emitx(p_c, t42);
+  gl11_drop(a38);
   struct S125_check_Val t43 = f1215_check_voidVal((bool)0LL);
   struct S125_check_Val r44 = t43;
   rt_str_drop(v_n_27);
@@ -126328,9 +126375,10 @@ static struct S125_check_Val f1452_check_Checker_xArrlit(struct S84_check_Checke
   lxl_arr a98 = rt_arr_new(2LL, 8ULL);
   *((int64_t*)a98.data + 0LL) = t96;
   *((int64_t*)a98.data + 1LL) = t97;
-  int64_t t99 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl323, a98);
+  int64_t t99 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl323, &a98);
   int64_t t100 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t95, v_an_92, t99);
   f1231_check_Checker_emit(p_c, t100);
+  gl11_drop(a98);
   int64_t t101 = f1187_check_Checker_nm(p_c, v_an_92);
   int64_t v_ann_102 = t101;
   int64_t end103 = v_cs_85.len;
@@ -126752,8 +126800,9 @@ static struct S125_check_Val f1449_check_Checker_xTry(struct S84_check_Checker**
   if (c78) {
     lxl_arr a79 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a79.data + 0LL) = v_snn_61;
-    int64_t t80 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, a79);
+    int64_t t80 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, &a79);
     f1230_check_Checker_emitx(p_c, t80);
+    gl11_drop(a79);
   }
   int64_t t81 = v_ret_15;
   int64_t t82 = v_r_17.f_er;
@@ -126793,8 +126842,9 @@ static struct S125_check_Val f1449_check_Checker_xTry(struct S84_check_Checker**
     f1231_check_Checker_emit(p_c, t106);
     lxl_arr a107 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a107.data + 0LL) = v_snn_61;
-    int64_t t108 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, a107);
+    int64_t t108 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl280, &a107);
     f1230_check_Checker_emitx(p_c, t108);
+    gl11_drop(a107);
     int64_t t109 = f1187_check_Checker_nm(p_c, v_on_103);
     v_oc_100 = t109;
     rt_str_drop(v_on_103);
@@ -127887,9 +127937,10 @@ static struct S125_check_Val f1445_check_Checker_xUn(struct S84_check_Checker**p
       lxl_arr a38 = rt_arr_new(2LL, 8ULL);
       *((int64_t*)a38.data + 0LL) = t36;
       *((int64_t*)a38.data + 1LL) = t37;
-      int64_t t39 = f948_tmpl_Arena_call(&(*p_c)->f_x, t35, a38);
+      int64_t t39 = f948_tmpl_Arena_call(&(*p_c)->f_x, t35, &a38);
       struct S125_check_Val t40 = f1216_check_rv(t39, v_t_6);
       struct S125_check_Val r41 = t40;
+      gl11_drop(a38);
       rt_str_drop(t35);
       gl84_drop(v_v_5);
       gl70_drop(v_n_2);
@@ -128035,9 +128086,10 @@ static struct S125_check_Val f1443_check_Checker_xIndex(struct S84_check_Checker
     *((int64_t*)a28.data + 0LL) = t25;
     *((int64_t*)a28.data + 1LL) = t26;
     *((int64_t*)a28.data + 2LL) = t27;
-    int64_t t29 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl178, a28);
+    int64_t t29 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl178, &a28);
     struct S125_check_Val t30 = f1216_check_rv(t29, 4LL);
     struct S125_check_Val r31 = t30;
+    gl11_drop(a28);
     gl84_drop(v_v_19);
     gl70_drop(v_n_2);
     return r31;
@@ -128098,9 +128150,10 @@ static struct S125_check_Val f1443_check_Checker_xIndex(struct S84_check_Checker
   *((int64_t*)a64.data + 0LL) = t61;
   *((int64_t*)a64.data + 1LL) = t62;
   *((int64_t*)a64.data + 2LL) = t63;
-  int64_t t65 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl320, a64);
+  int64_t t65 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl320, &a64);
   int64_t t66 = f1047_tmpl_Arena_idx(&(*p_c)->f_x, t60, t65);
   int64_t v_cc_67 = t66;
+  gl11_drop(a64);
   struct S125_check_Val t68 = f1217_check_val(v_cc_67, v_et_52, 2LL);
   struct S125_check_Val v_r_69 = t68;
   v_r_69.f_root = v_v_19.f_root;
@@ -128862,9 +128915,10 @@ static struct S125_check_Val f1437_check_Checker_xSub(struct S84_check_Checker**
     *((int64_t*)a31.data + 1LL) = v_lo_20;
     *((int64_t*)a31.data + 2LL) = v_hi_25;
     *((int64_t*)a31.data + 3LL) = v_W_7;
-    int64_t t32 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl313, a31);
+    int64_t t32 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl313, &a31);
     int64_t t33 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t30, v_vn_27, t32);
     f1231_check_Checker_emit(p_c, t33);
+    gl11_drop(a31);
     int64_t t34 = f1187_check_Checker_nm(p_c, v_vn_27);
     int64_t t35 = v_rt_29;
     int64_t t36 = v_b_14.f_root;
@@ -128910,9 +128964,10 @@ static struct S125_check_Val f1437_check_Checker_xSub(struct S84_check_Checker**
     *((int64_t*)a52.data + 1LL) = v_lo_46;
     *((int64_t*)a52.data + 2LL) = v_hi_51;
     *((int64_t*)a52.data + 3LL) = v_W_7;
-    int64_t t53 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl179, a52);
+    int64_t t53 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl179, &a52);
     struct S125_check_Val t54 = f1259_check_Checker_holdtmp(p_c, t53, 9LL);
     struct S125_check_Val r55 = t54;
+    gl11_drop(a52);
     gl84_drop(v_v_5);
     gl70_drop(v_n_2);
     return r55;
@@ -128963,8 +129018,9 @@ static struct S125_check_Val f1437_check_Checker_xSub(struct S84_check_Checker**
     int64_t t77 = f942_tmpl_Arena_pre(&(*p_c)->f_x, sl58, v_v_5.f_c);
     lxl_arr a78 = rt_arr_new(1LL, 8ULL);
     *((int64_t*)a78.data + 0LL) = t77;
-    int64_t t79 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, a78);
+    int64_t t79 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl333, &a78);
     v_base_64 = t79;
+    gl11_drop(a78);
   } else {
     bool b80 = p_mut1;
     if (b80) {
@@ -129035,9 +129091,10 @@ static struct S125_check_Val f1437_check_Checker_xSub(struct S84_check_Checker**
   *((int64_t*)a111.data + 2LL) = t109;
   *((int64_t*)a111.data + 3LL) = t110;
   *((int64_t*)a111.data + 4LL) = v_W_7;
-  int64_t t112 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl334, a111);
+  int64_t t112 = f948_tmpl_Arena_call(&(*p_c)->f_x, sl334, &a111);
   int64_t t113 = f1031_tmpl_Arena_decl(&(*p_c)->f_x, t106, v_sv_102, t112);
   f1231_check_Checker_emit(p_c, t113);
+  gl11_drop(a111);
   int64_t t114 = f1187_check_Checker_nm(p_c, v_sv_102);
   int64_t t115 = f918_sema_Program_ta(&(*p_c)->f_pg, v_v_5.f_t);
   int64_t t116 = f1162_sema_Program_mkSlice(&(*p_c)->f_pg, t115, p_mut1);
