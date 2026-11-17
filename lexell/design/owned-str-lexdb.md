@@ -175,3 +175,69 @@ until this is done. Do it on the lexdb branch.
    `Option[task.Frozen[tz.Zone]]` becomes `Option[rc tz.Zone]`. Reads that
    used `fr.read(fn(z: &tz.Zone) { ... })` read the value directly
    (`z.field`, or pass the handle where a `&tz.Zone` is expected).
+
+## 4. As done (2026-11-17, on redesign/bind)
+
+lexdb is migrated: it compiles, its suite passes (190), the quick gate
+passes, and TPC-H's 22 result checksums are those of main before the
+switch (f42569c2).
+
+| commit | what |
+|---|---|
+| c3ca7ab4 | part 1: `Frozen` to `rc tz.Zone`; a loaded zone's name `strStatic` (a Zone clone is an rc share); `Env.seq` a borrow (`&Option[SeqEnv]`) so an Env built per row does not copy the store handle and zone; the parameter report's read-only parameters made `&T` (task entry points kept by value) |
+| 78567aa8 | part 2: the 1,673 worklist sites, in 18 batches (Haiku agents, one worktree each): borrows, moves (`for x in move(xs)`, `replace`/`pop` where an element is read once), `.clone()` elsewhere |
+| fe104130 | part 3: the 182 test programs under tests/lexdb (802 sites, clones); `colNode` takes a column page's body by value |
+| dcde74e3, 1337842b, 16de690f | the costly copies found after it (below) |
+
+**Where the switch cost time, and what was done.** The mechanical pass left
+TPC-H 12% slower than main (18,000 -> 20,178 ms, q13 +69%, q10 +40%). Found
+with `LXL_RCSTAT=sites` and perf over the native symbol map:
+
+- decoding a column page copied its body into the node (160 MB in one run
+  of q13): `colNode(body: str)` moves it;
+- every row of a dictionary-coded text column cloned (copied) its entry:
+  the entries are `strStatic` strings in one pool for the program
+  (`lexdb_rows.dictVals`, capped at 65,536 entries and 8 MB, heap copies
+  past that), so a row's value is a free copy;
+- `compare()` made and dropped a UTC `Zone` per comparison of a date or
+  time (now an owned record, its rules an `rc`): two dates or timestamps,
+  or a time kind with its own, are compared with no zone (`timeCmpLocal`);
+- the parser cloned a token at every `peek` (once per grammar level):
+  `peek`/`peekAt` return `&Tok`;
+- `Finger.push` copied a descent's bounds twice.
+
+After these, TPC-H is 16,898 ms, 6.1% under main's 18,000 (one run; the
+slower queries repeated alternately with main's binary). Point selects take
+3.8% more instructions per statement but 2% fewer cycles (198k -> 205k
+instructions, 109k -> 107k cycles): no reference counts to update, more
+small copies of catalog and plan strings per statement.
+
+**Still slower than main, and why.** q10 +14.5% and q13 +6.8%. Both are
+text values copied per row where a counted string was shared:
+`lexdb_pipe.bGather` (a join's gathered text columns; a build row gathered
+many times), the row engine's output (`execSelTo`: each output column of
+each row, from a borrowed row), group keys. These are not moves: rows are
+gathered more than once and handed on by reference. The fix is a batch's
+text held once and shared (an `rc str` buffer and spans per column, or
+rows handed on owned), which is executor design work, not migration.
+
+The per-row clones the batches reported are kept in the scratch list the
+migration used; the ones above are those that show in TPC-H. Others are on
+paths TPC-H does not take (MATCH_RECOGNIZE, PL/SQL, the TNS and TDS
+servers' binds, the follower's reads, the store's own-write paths).
+
+**Language points met** (for owned-str.md section 6):
+
+- A global cannot be borrowed (`return &G` in a function without borrowed
+  parameters is refused), and a `const` must be a copy type, so there is no
+  way to keep one shared record (a UTC `Zone`) for the program and lend it
+  out; callers make and drop one, or avoid needing it.
+- A `var` cannot hold a `&str` (borrows are second class), so a borrow
+  chosen in a loop is a clone.
+- A field borrowed through a `mut &` parameter (`let to = &cur.at` with
+  `cur: mut &Cursor`) still blocked writes to the record's other fields
+  (`cur.started = true`); the code was reordered.
+- `match` on a field of a place (`match b.v`) cannot move the bound value,
+  so each arm that keeps it clones.
+- `Map.at`/`Map.get` take the key by value: lookups with a borrowed key
+  clone it (per wire message in pgwire).
