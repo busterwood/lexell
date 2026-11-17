@@ -2938,6 +2938,216 @@ move.
   every `Project`'s and `Sort`'s; extend `xTree` to print `Agg`'s keys,
   `Filter`'s predicate and `Window`'s definitions as their clauses move.
 
+**2e slice 3b as built: GROUP BY, HAVING and windows go into the plan,
+and pass-through operators hold no column list.** Four commits on
+`redesign/bind` from main 3bad2694: e219bc3c (GROUP BY), 4ed2d3e4 (HAVING),
+da7a587b (windows), bd99ed3d (pass-through operators), and a fifth with this
+note. The suite passed (188, imports ok) on snapshots of 4ed2d3e4 (GROUP BY
+and HAVING), da7a587b and bd99ed3d; e219bc3c alone was not run. No plan and
+no result changes. DISTINCT, LIMIT, locking, `planSet`, `planMatch` and DML
+are as slice 3a left them (slice 3c).
+
+- GROUP BY (e219bc3c). `lpGroup` (a clone) is gone. `groupBy` is the list
+  `resolveGroup` gives; the planner reads it in place (the window and
+  aggregate checks, `gtexts`, `okLevels`, the redundant-key loop). With one
+  grouping set (plain GROUP BY) the redundant-key loop builds the
+  planner's list by clones of the kept keys (`gb`, as before) and the
+  resolved list moves into the `Agg` (`bg = replace(mut &groupBy, gb)`).
+  With grouping sets the `Sel` keeps the resolved list (`Sel.groupBy` is
+  the sets' key list) and the `Agg` gets a copy (`cloneAll`, as `lpGroup`
+  was). No lending: `hashSub` replaces `Sel.groupBy` only where it is
+  empty.
+- HAVING (4ed2d3e4). `lpHaving` is gone. HAVING is present only with
+  aggregates, and `collectAggs` always rewrites it there, so the rewrite
+  replaces it and the resolved tree goes to the `Filter` (`bh =
+  replace(mut &having, rh)`).
+- Windows (da7a587b). `lpWins` is gone. With aggregates, the `collectAggs`
+  pass over the definitions builds new ones (it rewrote them in place
+  after a clone of each call) and the resolved ones go aside (`bw =
+  replace(mut &wdefs, cw)`); the aggregates' slots come in the same order
+  (each call's arguments, then its partitions, then its order). Without,
+  nothing rewrites them, and they move into the `Window` after `winPlan`
+  has read them (`winPlan(&d)` copies what it keeps). `wdefs` is read by
+  nothing after `winPlan`.
+- Pass-through operators (bd99ed3d), the coordinator's choice of the two
+  ways "Where 2e slice 3a left off" gave. `Filter`, `Agg`, `Window`,
+  `Distinct`, `Sort` and `Limit` keep their `[]BCol` field and hold []:
+  their columns are their input's. `lexdb_bind.lpColumns(p): &[]BCol`
+  gives any operator's columns as a borrow (a pass-through's from its
+  input, recursively; one that holds a list gives its own, so a later
+  `Agg` with its own outputs needs no type change); `lpCols` is
+  `copyBCols(lpColumns(p))`. `bindFrom`'s WHERE and first-item `Filter`s,
+  `selPlan`'s and `topPlan`'s operators are built with []. A `Join`'s
+  list is its sides' copied once (it copied the right side's twice:
+  `lpCols` then a second loop). The plan stays self-describing: nothing
+  needs the `Sel` to read a column list (the lent `Project` list and
+  `Sort` keys are expressions, not columns). The other way, the `Get`'s
+  columns made once per table version and shared, is not simple: the
+  catalog decodes a `Table` per statement (`findTable`, `decTable`) and has
+  no per-version cache to keep them in.
+- Tried and not kept: `BCol` as a `value record` (inline in its arrays, no
+  allocation per column), on top of bd99ed3d's change: `pk_point20k`
+  CPU 665 against 660 ms, no gain in one round.
+- The scratch checks, on builds of main 3bad2694 (`lexdb-ck-m`) and
+  bd99ed3d (`lexdb-ck-b`) with both patches applied
+  (`~/tpch-w/bind/e7/tools/xpatch.py` and `patch.py`, anchors asserted;
+  the suite from snapshots with slice 1's patched `run.py`, `LPCHK_OUT`):
+  - `xpatch.py` (the `exprText` check), extended: `xTree` prints each
+    `Agg`'s keys, sets and aggregate count, each `Filter`'s predicate
+    (WHERE's and HAVING's) and each `Window`'s definitions (call,
+    partitions, order with directions, frame); the `XSEL` line adds the
+    `Sel`'s `groupBy`, `having`, the aggregates' specs (name, arguments,
+    filter, order, text) and the window plans (`WinPlan`: function,
+    arguments, partitions, order, directions, the aggregate's spec). The
+    naming battery's 284 `XSEL` lines and TPC-H's 105 identical line for
+    line (also at da7a587b against main, xpatch alone); the suite's,
+    sorted, identical but for `exec_autostats` (2,387 more point selects
+    of one shape, different keys) and `exec_turns` (one), whose counts vary
+    by run.
+  - `patch.py` (slice 1's plan check), updated: its anchors are in
+    `bindFrom` (the FROM part's columns against `q.cols` where `q.lp` is
+    set) and at `planFrom`'s end; `lpValid` accepts a lending plan (a
+    `Project` of [] expressions with columns, or a `Sort` of [] keys with
+    `desc`, only on the `Sel`'s own chain of Match, Limit, Sort, Distinct
+    and Project, and only as many as the `Sel` has: `Sel.exprs` at least
+    the `Project`'s columns, `Sel.order` as many as `desc`) and a
+    pass-through operator with [] (one with a list is compared with its
+    input's, as before); a `Filter` with no predicate or a `Window` with
+    no definition is flagged. The top's columns (`lpCols`, through the
+    pass-through operators) against `fromCols(sel)` at `select`,
+    `selectWith` and `planSub`, as before, with an `LPCHK OK` line per
+    `Sel` checked. Results identical on main and the branch: the battery
+    233 `Sel`s checked, TPC-H's and the suite's lines identical (sorted,
+    but for `exec_autostats` and `exec_turns` as above). Nothing flagged
+    but slice 1's three by-design differences (the semi-joins' hidden
+    columns at `planFrom`'s end, `from-cols-end`; oid, name and the like
+    as text in a FROM subquery's or view's row, `subty`; a view's column
+    list renaming its plan's outputs, `sub-name`). No lent list was found
+    off the `Sel`'s chain or longer than the `Sel`'s.
+- Gates: the suite on the snapshots above (188, imports ok); the naming
+  battery (1,505 lines) identical from main, da7a587b, bd99ed3d and both
+  check builds; TPC-H all 22 checksums the baseline's (fields [0] and [8]
+  against `~/tpch/out-baseline-1744ef99`) on every run (main, the branch,
+  the check builds).
+- Speed, one pass, against main 3bad2694 (`~/tpch-w/bind/e7/lexdb-m3ba`,
+  from `git archive`; byte-identical to slice 3a's `lexdb-b`) and
+  76118b8a from before slice 1 (`~/tpch-w/bind/e6/lexdb-m761`); the
+  branch at bd99ed3d (`lexdb-b`). CPU boost on (left on as asked; slice
+  3a's simple-protocol numbers were with it off, so only the ratios
+  compare):
+  - TPC-H (`~/tpch-w/bind/e7/tpch1.sh`, SF1, 1 run): total 29,214 against
+    29,284 ms (0.998). Past 1.5%: q2 1.022 (63.6 to 65.0 ms), and q18 0.984
+    the other way. One repeat on byte-identical copies (`lexdb-m3bac`,
+    `lexdb-bc`): total 29,241 against 29,285 (0.999), q2 1.011 (63.7 to
+    64.4 ms); past 1.5% only faster ones (q9 0.985, q18 0.978). q2 plans
+    once; read as noise.
+  - `~/tpch-w/bind/e2/simple.sh` (pgbench `-M simple`, 4 clients, 10 s,
+    one round, binaries alternating), tps:
+
+    | | m761 | main 3bad2694 | branch | branch / main | branch / m761 |
+    |---|---|---|---|---|---|
+    | point selects | 50,646 | 48,855 | 49,106 | 1.005 | 0.970 |
+    | updates | 9,487 | 9,481 | 9,478 | 1.000 | 0.999 |
+    | 3-table join, ORDER BY, LIMIT | 21,405 | 20,226 | 20,643 | 1.021 | 0.964 |
+
+  - `pk_point20k` (`~/tpch-w/bind/e6/pts.sh`, 5 runs per server, one
+    round), server CPU ms, medians (range): m761 643 (641-645), main 669
+    (667-670), branch 657 (656-659); wall 691, 717, 705. Main is +4.0%
+    over m761, the branch +2.2%: 12 of the 26 ms come back, short of the
+    ~1.5% asked. An exploratory round before the commit (the profile
+    step): m761 646, main 669, bd99ed3d's change 660, with `BCol` a value
+    record as well 665.
+  - The profile (`~/tpch-w/bind/e2/profg.sh`, `incl.py`; maps in
+    `~/tpch-w/bind/e7/*.map`), inclusive, at da7a587b: `selPlan` 1.05%
+    (`outBCols` 0.82%), `lpCols` 0.51% (the WHERE `Filter`'s copy),
+    `copyBCols` 0.34%, `bcolOf` 0.29% (m761 0.46%: its `Query.bcols`);
+    after the pass-through change `lpCols` is gone from the path and
+    `outBCols` is 0.63%. What remains over m761 is the `Project`'s
+    columns, the plan's three nodes and their drop, and layout: slice 1's
+    scratch build with no plan lists at all (`x2`) was still +1.4% over
+    m761.
+  - Not run (as asked): more rounds, the 35 queries, OLTP and the loads,
+    the plan cache count, `qmulti.sh`, `pstat.sh`.
+- Lines:
+
+  | Module | main 3bad2694 | after |
+  |---|---|---|
+  | `lexdb_exec` | 28089 | 28087 |
+  | `lexdb_bind` | 1982 | 1990 |
+
+**Where 2e slice 3b left off, and how to start slice 3c.** Slice 3c makes
+`planSet`, `planMatch` and DML read from the plan, as slices 3a-3b did
+`planSelect`'s clauses; then `bindFrom` can move into `lexdb_bind` (slice
+2's way in, step 3). Everything named is in `lexdb_exec` unless the note
+says otherwise; search for the names, since line numbers move.
+
+- What is there after slice 3b:
+  - `planSelect` keeps no clone of a resolved clause but LIMIT's
+    (`topPlan`'s `optClone` of the parsed `s.limit`/`s.offset`, cheap: a
+    literal) and DISTINCT ON's (`lpOn`, moved since slice 1). The select
+    list and ORDER BY lend where no rewrite runs (`lpLentExprs`,
+    `lpLentOrder`, `lpRestore`, `takeLp`); GROUP BY, HAVING and windows
+    never lend (the `Agg`, `Filter` and `Window` always hold theirs).
+  - Pass-through operators hold [] columns; read any operator's columns
+    with `lexdb_bind.lpColumns` (a borrow) or `lpCols` (a copy), never by
+    matching the arm's last field.
+  - `planSet` builds `SetOp`/`Recursive` over `takeLp` of each side and
+    clones its own ORDER BY for `topPlan` (slice 3a left it); `planMatch`
+    wraps in `Match`; DML (`insert`, `update`, `delete`, `merge`) builds
+    the FROM/WHERE part (`q.lp`) and nothing over it.
+- The pattern for 3c, as before: find where the planner first rewrites a
+  list and whether a rewrite always runs; move the resolved list into the
+  plan where one does, lend it where none does (and teach `lpRestore`,
+  `takeLp`, `lpLent*` and `patch.py`'s `lpValid` any new lending).
+  - `planSet`'s ORDER BY: the parsed keys (an output's name or number,
+    checked against `outs`, not resolved) cloned into `Sel.order`, then
+    cloned again for the `Sort` (`topPlan(set, s, cloneAll(&order), ...)`).
+    The `Sort` can lend them as `planSelect`'s does, but `lpRestore`
+    panics where a lending `Sort` has no `Project` under it (a `SetOp`):
+    teach it that first, since `takeLp` runs on a set that is a side of
+    another set.
+  - DML: UPDATE and DELETE are planned per run (no plan cache), so what
+    they build is per-statement cost; they read `q.lp`'s `Filter` only
+    through `planFrom`. A `Lock` operator (FOR UPDATE, `applyLocks`,
+    `Level.lock`) and DML operators (`Insert`, `Update`, `Delete`,
+    `Merge`) are new arms: add them to `lpColumns`, `lpValid`, `xTree`.
+  - LIMIT: moving `s.limit`/`s.offset` needs an owned `Stmt` (the plan
+    cache's statements are borrowed); not worth it alone.
+- Where the remaining planning cost is: `pk_point20k` (9 columns: `Get`,
+  `Filter`, `Project`) builds the `Get`'s columns (`bcolOf` per table
+  column, as m761's `Query.bcols` did) and the `Project`'s (`outBCols`,
+  0.6% of the server's cycles in the profile), allocates three plan nodes
+  and drops them. Profiles of byte-different builds move single functions
+  by 2-4% (the parser, unchanged since m761, at 13.9%, 13.3% and 17.3% of
+  three profiles), so below about 1% they do not tell layout from cost:
+  use `~/tpch-w/bind/e7/tools/selfdiff.py` (self or inclusive counts of
+  two profiles side by side) and `under.py` (callees and leaves under a
+  function) for direction, and `pts.sh` for the number. Ways left, none
+  simple: the `Project`'s columns made from the `Get`'s where the select
+  list is `*` (the same names and types but the alias); a per-table-version
+  `BCol` list kept by a catalog cache, which does not exist (`findTable`
+  decodes per statement).
+- Traps (slice 3a's still hold; and):
+  - `bw` holds the resolved window definitions only where the
+    `collectAggs` pass ran; otherwise `wdefs` moves after `winPlan`. A
+    reader of `wdefs` added after `winPlan` would find it empty.
+  - With grouping sets `Sel.groupBy` is the resolved list (the sets' key
+    list) and the `Agg` a copy; with plain GROUP BY `Sel.groupBy` is the
+    planner's (redundant keys dropped) and the `Agg` the resolved list.
+    `exprText` of both appear in the check's `XSEL` line.
+  - `lpColumns` returns a borrow into the plan: copy (`lpCols`,
+    `copyBCols`) before moving or replacing the plan it came from.
+  - `patch.py`'s `lpValid` and `xpatch.py`'s `xTree` name every arm
+    with its arity; new arms or fields need both updated.
+- Gates (as slice 3b's): the suite (188, imports ok) from a snapshot of
+  the commit (`~/tpch-w/bind/e7/suitec.sh TAG REV`, a `git archive`);
+  the naming battery (1,505 lines) identical; TPC-H all 22 against
+  `~/tpch/out-baseline-1744ef99`; `xpatch.py` and `patch.py` together
+  on builds of main and the branch (`~/tpch-w/bind/e7/ckchain.sh`: TPC-H
+  and the suite on both; the battery by `run.sh`), identical but for
+  `exec_autostats`/`exec_turns`; `simple.sh` and `pts.sh` against m761
+  and main, with the updates (DML is planned per run) watched.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**

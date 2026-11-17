@@ -5335,15 +5335,16 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             None {}
         }
         if k > 0 {
-            var jcols = lexdb_bind.lpCols(&lp)
-            let rc = lexdb_bind.lpCols(&items[k])
+            let lc = lexdb_bind.lpColumns(&lp)
+            let rc = lexdb_bind.lpColumns(&items[k])
+            var jcols: []lexdb_bind.BCol = withCapacity(len(lc) + len(rc))
+            for c in lc { append(mut &jcols, lexdb_bind.BCol{slot: c.slot, name: c.name, spell: c.spell, ty: c.ty}) }
             for c in rc { append(mut &jcols, lexdb_bind.BCol{slot: c.slot, name: c.name, spell: c.spell, ty: c.ty}) }
             lp = lexdb_bind.LPlan.Join(from[k].join, q.levels[k].lateral, lp, replace(mut &items[k], lexdb_bind.noPlan()), jon, jcols)
         } else if len(jon) > 0 {
             // (a first item's ON, which SQL's grammar does not make: a
             // Filter over it, level 0's condition)
-            let c0 = lexdb_bind.lpCols(&lp)
-            lp = lexdb_bind.LPlan.Filter(lp, jon, c0)
+            lp = lexdb_bind.LPlan.Filter(lp, jon, [])
         }
     }
     var hasWhere = false
@@ -5351,8 +5352,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         Some(w0) {
             let w = pullCommonOr(w0)
             let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
-            let fcols = lexdb_bind.lpCols(&lp)
-            lp = lexdb_bind.LPlan.Filter(lp, [r], fcols)
+            lp = lexdb_bind.LPlan.Filter(lp, [r], [])
             hasWhere = true
         }
         None {}
@@ -14082,7 +14082,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &groupKinds, lexdb_bind.exprKind(&r, &q.cols, &sc.names))
         append(mut &groupBy, r)
     }
-    let lpGroup = cloneAll(&groupBy)
+    // GROUP BY as resolved: the plan's Agg's keys (bg), moved there when the
+    // planner has built its own list from it (the redundant keys dropped:
+    // gb), copied where the Sel keeps it as resolved (grouping sets)
+    var bg: []Expr = []
     var order: []Expr = []
     var ordKinds: []int = []
     for o in s.order {
@@ -14163,11 +14166,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         Some(h) { having = Some(try lexdb_bind.resolve(&h, &q.cols, len(q.cols), mut &sc.names)) }
         None {}
     }
-    let lpHaving = optClone(&having)
+    // HAVING as resolved: the plan's Filter's (bh), moved there by the
+    // planner's rewrite (collectAggs), which always runs where it is
+    var bh: Option[Expr] = None
     // window calls (9.46): not where rows are chosen or grouped; their
     // definitions merged with the named windows and resolved
+    // (the plan's Window's as resolved: bw, set aside where the planner's
+    // collectAggs pass builds its own, else moved after winPlan has read them)
     var wdefs: []lexdb_sql.WinDef = []
-    var lpWins: []lexdb_sql.WinDef = []
+    var bw: []lexdb_sql.WinDef = []
     if len(s.wins) > 0 {
         if hasWinOpt(&s.where) { return Err(e("42P20", "window functions are not allowed in WHERE")) }
         if hasWinOpt(&s.having) { return Err(e("42P20", "window functions are not allowed in HAVING")) }
@@ -14193,7 +14200,6 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if hasWin(&r.call) { return Err(e("42P20", "window function calls cannot be nested")) }
             append(mut &wdefs, r)
         }
-        for d in wdefs { append(mut &lpWins, cloneWin(&d)) }
         var mx: []Expr = []
         for x in exprs { append(mut &mx, winMarks(&x)) }
         rewriteList(mut &exprs, mx, mut &bx, mut &xRewritten)
@@ -14321,23 +14327,28 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             Some(h) { rh = Some(try collectAggs(&h, mut &specs)) }
             None {}
         }
-        having = rh
-        // a window's arguments, partitions and order: over the groups, their aggregates in slots
-        for k in 0..len(wdefs) {
-            var call = clone(&wdefs[k].call)
-            match wdefs[k].call {
-                Expr.Call(f, args, star) {
-                    var ca: []Expr = []
-                    for a in args { append(mut &ca, try collectAggs(&a, mut &specs)) }
-                    call = Expr.Call(f, ca, star)
+        bh = replace(mut &having, rh)
+        // a window's arguments, partitions and order: over the groups, their
+        // aggregates in slots (new definitions; the resolved ones go to bw)
+        if len(wdefs) > 0 {
+            var cw: []lexdb_sql.WinDef = withCapacity(len(wdefs))
+            for d in wdefs {
+                var call: Expr = Expr.Lit(Val.Null)
+                match d.call {
+                    Expr.Call(f, args, star) {
+                        var ca: []Expr = []
+                        for a in args { append(mut &ca, try collectAggs(&a, mut &specs)) }
+                        call = Expr.Call(f, ca, star)
+                    }
+                    else { call = clone(&d.call) }
                 }
-                else {}
+                var wp: []Expr = []
+                for x in d.part { append(mut &wp, try collectAggs(&x, mut &specs)) }
+                var wo: []lexdb_sql.WinOrder = []
+                for o in d.order { append(mut &wo, lexdb_sql.WinOrder{expr: try collectAggs(&o.expr, mut &specs), desc: o.desc, nullsFirst: o.nullsFirst}) }
+                append(mut &cw, lexdb_sql.WinDef{call: call, ref: d.ref, bare: d.bare, part: wp, order: wo, frame: cloneFrame(&d.frame)})
             }
-            wdefs[k].call = call
-            var wp: []Expr = []
-            for x in wdefs[k].part { append(mut &wp, try collectAggs(&x, mut &specs)) }
-            wdefs[k].part = wp
-            for j in 0..len(wdefs[k].order) { wdefs[k].order[j].expr = try collectAggs(&wdefs[k].order[j].expr, mut &specs) }
+            bw = replace(mut &wdefs, cw)
         }
         var gtexts: []str = []
         for g in groupBy { append(mut &gtexts, lexdb_sql.exprText(&g)) }
@@ -14431,8 +14442,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     append(mut &gk, groupKinds[gi])
                 }
             }
-            groupBy = gb
+            bg = replace(mut &groupBy, gb)
             groupKinds = gk
+        } else {
+            bg = cloneAll(&groupBy)
         }
     } else {
         for x in exprs { if hasGrouping(&x) { return Err(e("42803", "arguments to GROUPING must be grouping expressions of the associated query level")) } }
@@ -14449,6 +14462,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for x in order { append(mut &wo, winSlots(&x, nAggs)) }
         rewriteList(mut &order, wo, mut &bo, mut &oRewritten)
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
+        if len(bw) == 0 { bw = replace(mut &wdefs, []) }
     }
     // FOR UPDATE and the like (9.86): each locked table's key read with
     // the output, after it (where no rewrite ran, after the resolved list:
@@ -14471,8 +14485,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &desc, false)
         append(mut &nullsFirst, false)
     }
-    let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, lpGroup,
-                     len(specs), lpHaving, lpWins, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
+    let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
+                     len(specs), bh, bw, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
                      copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
@@ -14529,23 +14543,11 @@ fn takeLp(sel: mut &Sel): lexdb_bind.LPlan {
 fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]OutCol, aggQ: bool, group: []Expr, nAggs: int,
            having: Option[Expr], wins: []lexdb_sql.WinDef, on: []Expr, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
-    if aggQ {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Agg(lp, group, copySets(&s.gsets), nAggs, c)
-    }
-    if having.isSome() {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Filter(lp, [having.unwrap()], c)
-    }
-    if len(wins) > 0 {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Window(lp, wins, c)
-    }
+    if aggQ { lp = lexdb_bind.LPlan.Agg(lp, group, copySets(&s.gsets), nAggs, []) }
+    if having.isSome() { lp = lexdb_bind.LPlan.Filter(lp, [having.unwrap()], []) }
+    if len(wins) > 0 { lp = lexdb_bind.LPlan.Window(lp, wins, []) }
     lp = lexdb_bind.LPlan.Project(lp, exprs, outBCols(outs))
-    if s.distinct || len(on) > 0 {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Distinct(lp, on, c)
-    }
+    if s.distinct || len(on) > 0 { lp = lexdb_bind.LPlan.Distinct(lp, on, []) }
     return topPlan(lp, s, order, desc, nullsFirst)
 }
 
@@ -14553,13 +14555,9 @@ fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]O
 // [] where they are the Sel's, lexdb_bind.lpLentOrder).
 fn topPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
-    if len(desc) > 0 {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, c)
-    }
+    if len(desc) > 0 { lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, []) }
     if s.limit.isSome() || s.offset.isSome() || s.withTies {
-        let c = lexdb_bind.lpCols(&lp)
-        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, c)
+        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, [])
     }
     return lp
 }
