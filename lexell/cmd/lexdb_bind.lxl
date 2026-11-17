@@ -7,7 +7,10 @@
 // with and casts by (exprOid, moved from lexdb_exec). The bound plan and
 // the typed expression IR come next (lexdb-layers.md 4.4.1).
 
+import "strings"
+import "./lexdb_base"
 import "./lexdb_sql"
+import "./lexdb_catalog"
 import "./lexdb_dialect"
 import "./lexdb_ops"
 import "./lexdb_lib"
@@ -794,5 +797,210 @@ pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
             for c in cs { append(mut &bs, reslot(&c, slots, par)) }
             return BX.Call(FnRef{name: fr.name, way: fr.way, f: fr.f, f1: fr.f1, dialect: fr.dialect}, bs)
         }
+    }
+}
+
+// ---- names (design/lexdb-layers.md 4.4.1, step 2d): what a name in a
+// query means, as resolve finds it
+
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+fn clone(x: &Expr): Expr { return lexdb_sql.cloneExpr(x) }
+
+// The first column named name, -1 none (lexdb_exec's colIndex).
+fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
+    for i in 0..len(cols) { if cols[i].name == name { return i } }
+    return -1
+}
+
+pub fn dotAt(s: &str): int {
+    for i in 0..len(s) { if s[i] == '.' { return i } }
+    return -1
+}
+
+// The column part of alias.column (a repeated name's mark taken off).
+pub fn colPart(q: &str): str {
+    let i = dotAt(q)
+    let c = if i < 0 { q } else { q[i + 1..len(q)] }
+    let d = strings.indexOf(&c, DUPSEP, 0)
+    return if d < 0 { c } else { c[0..d] }
+}
+
+// Marks a column name repeated in one FROM item: name DUPSEP position.
+pub const DUPSEP: str = "\x1e"
+
+// The column a name refers to among the first n columns: alias.column, or a
+// column name only one table has. Its place (its slot); cols[i].name is its
+// name as resolved (alias.column).
+pub fn resolveName(cols: &[]lexdb_sql.ColDef, n: int, name: &str): Result[int, DbErr] {
+    let d = dotAt(name)
+    if d >= 0 {
+        for i in 0..n {
+            if cols[i].name == name {
+                let again = name + DUPSEP
+                for j in 0..n { if strings.startsWith(&cols[j].name, &again) { return Err(e("42702", &("column reference \"" + name + "\" is ambiguous"))) } }
+                return Ok(i)
+            }
+        }
+        let alias = name[0..d]
+        var known = false
+        for i in 0..n {
+            let cd = dotAt(&cols[i].name)
+            if cols[i].name[0..cd] == alias { known = true }
+        }
+        if !known { return Err(e("42P01", &("missing FROM-clause entry for table \"" + alias + "\""))) }
+        return Err(e("42703", &("column " + name + " does not exist")))
+    }
+    var found = -1
+    for i in 0..n {
+        if colPart(&cols[i].name) == name && cols[i].using != lexdb_sql.USING_HIDDEN {
+            if found >= 0 { return Err(e("42702", &("column reference \"" + name + "\" is ambiguous"))) }
+            found = i
+        }
+    }
+    if found < 0 { return Err(e("42703", &("column \"" + name + "\" does not exist"))) }
+    return Ok(found)
+}
+
+// Column i (as resolveName gives it) as an expression: the column, or
+// after a FULL JOIN ... USING the COALESCE of the pair's sides (9.93).
+pub fn colExpr(cols: &[]lexdb_sql.ColDef, i: int): Expr {
+    if len(cols[i].using) == 0 || cols[i].using == lexdb_sql.USING_HIDDEN { return Expr.Col(cols[i].name, i) }
+    var args: []Expr = [Expr.Col(cols[i].name, i)]
+    for o in strings.split(&cols[i].using, "\x1f") { append(mut &args, Expr.Col(o, colIndex(cols, &o))) }
+    return Expr.Call("coalesce", args, false)
+}
+
+// JOIN ... USING's column name among cols[lo..hi] (one side of the join):
+// the one a bare name there means, or 42703 / 42702 (9.93).
+pub fn usingSide(cols: &[]lexdb_sql.ColDef, lo: int, hi: int, name: &str, side: &str): Result[int, DbErr] {
+    var found = -1
+    for i in lo..hi {
+        if colPart(&cols[i].name) != name || lexdb_catalog.hiddenName(&cols[i].name) || cols[i].using == lexdb_sql.USING_HIDDEN { continue }
+        if found >= 0 { return Err(e("42702", &("common column name \"" + name + "\" appears more than once in " + side + " table"))) }
+        found = i
+    }
+    if found < 0 { return Err(e("42703", &("column \"" + name + "\" specified in USING clause does not exist in " + side + " table"))) }
+    return Ok(found)
+}
+
+// The queries being planned, outermost first.
+pub type Frame = record {
+    pub cols: []lexdb_sql.ColDef
+    pub exact: []bool               // per column: a table's, its values of exactly its type (outerRef types its parameter)
+    pub refs: []Expr                // the outer values it uses, in the terms of the query around it
+    pub refOids: []int
+    pub subRefs: [][]Expr           // per subquery of it: the subquery's refs, in its terms
+    pub subOids: []int
+    pub subNames: []str
+    pub subColls: []str             // per subquery of it: its column's collation (L2)
+    pub subKinds: []int             // ... IN's: the kind its values are compared under, as resolve finds it
+    pub subReads: []int             // ... IN's: the type its values are read as (lexdb_bind.inReadOid), 0 as they are
+    pub hidden: bool                // its columns are not in scope (a FROM subquery that is not LATERAL)
+}
+
+// What names mean in the query being planned (the binder's part of a
+// Scope, design/lexdb-layers.md 4.4.1, 2d): the query levels' frames, the
+// statement's parameters and their types, the session's collation.
+pub type Names = record {
+    pub frames: []Frame
+    pub base: int                   // the statement's parameters
+    pub ptypes: []int
+    pub coll: str                   // the session's default collation (L2): a literal's, a parameter's; "" exact
+}
+
+pub fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
+
+// The parameter types of the query being planned: the statement's, then
+// its refs'.
+pub fn ptypesOf(nm: &Names): []int {
+    var out: []int = []
+    for t in nm.ptypes { append(mut &out, t) }
+    if len(nm.frames) > 0 { for t in nm.frames[len(nm.frames) - 1].refOids { append(mut &out, t) } }
+    return out
+}
+
+// A name of a query around the one being planned, as a parameter of it.
+pub fn outerRef(nm: mut &Names, name: &str): Result[Option[Expr], DbErr] {
+    let top = len(nm.frames) - 1
+    var f = top - 1
+    var found = ""
+    var slot = -1
+    var oid = 0
+    var coll = ""
+    var bp: Option[lexdb_sql.TypeName] = None
+    while f >= 0 && found == "" {
+        if nm.frames[f].hidden {
+            f -= 1
+            continue
+        }
+        match resolveName(&nm.frames[f].cols, len(nm.frames[f].cols), name) {
+            Ok(ci) {
+                let fc = &nm.frames[f].cols[ci]
+                oid = fc.typ.oid
+                let exact = ci < len(nm.frames[f].exact) && nm.frames[f].exact[ci] && (len(fc.using) == 0 || fc.using == lexdb_sql.USING_HIDDEN)
+                if exact && refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
+                if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll }
+                found = fc.name
+                slot = ci
+            }
+            Err(x) {
+                // ambiguous there, or its table is there and the column is not
+                if x.state == "42702" || (x.state == "42703" && dotAt(name) >= 0) { return Err(x) }
+            }
+        }
+        if found == "" { f -= 1 }
+    }
+    if found == "" { return Ok(None) }
+    // (in the terms of frame f's query: its frame's columns are its own, in order)
+    var x = Expr.Col(found, slot)
+    for g in f + 1..top + 1 {
+        let t = lexdb_sql.exprText(&x)
+        var at = -1
+        for i in 0..len(nm.frames[g].refs) { if lexdb_sql.exprText(&nm.frames[g].refs[i]) == t { at = i } }
+        if at < 0 {
+            at = len(nm.frames[g].refs)
+            append(mut &nm.frames[g].refs, clone(&x))
+            append(mut &nm.frames[g].refOids, oid)
+        }
+        x = Expr.Param(nm.base + at + 1)
+    }
+    // the column keeps its type: a parameter is untyped, which a
+    // comparison reads as the other side's type (a char(n) column's 'k1'
+    // with 'k1   ' as texts; a text 'x ' padded as the inner char(3)'s
+    // 'x'; a date as the inner timestamp's text), where the join compares
+    // the column as it is. As a cast to its type (refParam) it is compared
+    // as in the query it comes from; the cast keeps the value as it is.
+    match bp {
+        Some(t) { x = Expr.Cast(x, t) }
+        None {}
+    }
+    // a collated column keeps its collation (L2): #coll(x, name), implicit
+    if len(coll) > 0 { x = Expr.Call("#coll", [x, Expr.Lit(Val.Text(coll))], false) }
+    return Ok(Some(x))
+}
+
+// Whether an outer column of type oid is given as a cast to its type
+// (outerRef): the scalar types a cast keeps as they are.
+pub fn refTyped(oid: int): bool {
+    return isIntOid(oid) || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 ||
+           oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_BOOL ||
+           oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ ||
+           oid == lexdb_sql.OID_UUID
+}
+
+// A parameter, bare or as outerRef types an outer column: a cast of one.
+pub fn refParam(x: &Expr): bool {
+    match x {
+        Expr.Param(_) { return true }
+        Expr.Cast(a, _) {
+            match a {
+                Expr.Param(_) { return true }
+                else { return false }
+            }
+        }
+        else { return false }
     }
 }
