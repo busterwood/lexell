@@ -208,6 +208,21 @@ implicit copy was. They need doing before or at the switch to owned `str`.
   check could make every literal a free view of static bytes (copied before
   any write) if literal allocations prove costly. Measure that at the switch.
 
+- **The compiler's node accessors copy at the switch.** `pg.nd(m, n)` and
+  `c.nd(n)` (156 calls) return a `sx.Node` value, now `.clone()`, a count
+  change per string field today but a copy of its three strings (`s`, `t`,
+  `u`) per call once `str` is owned, on the compiler's hottest path. A
+  borrowing accessor (`nd(): &Node`) freezes the whole `Program`/`Checker`,
+  which resolution writes to. The options, to decide with a measurement
+  before the switch:
+  - make `Node`'s string fields `rc str` (a clone is three count changes);
+  - intern the AST's names as ids;
+  - restructure the callers around a borrowing accessor.
+- **Clones whose result is only read** (`let nm = p.funcs[g].name.clone()`
+  where `&p.funcs[g].name` would do). The agents chose clones in places a
+  borrow would work. A report like `LXL_PARAM_REPORT` for local clones
+  whose result is never consumed would find them.
+
 ## 6. Language issues the migration exposed
 
 **Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). Then the `rc` reads and the TDS/TNS cursors on `rc str`, the parameter report, and `Shared`/`Frozen`: `share()` everywhere a `Shared` is copied (outside lexdb), `Frozen` deprecated for `rc`. **Order from here (2026-11-17):** compiler migration, then lexdb's migration, then the switch (owned `str` and owned `Shared` handles together). The switch must come last, because it breaks code that has not been migrated: making `Shared` owned stopped 188 lexdb programs compiling when tried.
