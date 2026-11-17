@@ -38,6 +38,16 @@
 // point, a lookup per value of an IN); parameters in the subqueries, the
 // plan kept and run again; EXPLAIN ANALYZE's lines (the subqueries' runs
 // included) the same.
+// Joins (slice P2), the same ways: inner and LEFT joins of f with d (a
+// hash, or a lookup per row by its primary key), g (duplicate and NULL
+// keys, a text key), h (a range per row of its key's first column, or a
+// lookup by both), e (empty), three tables, expression keys and two
+// keys; rows and aggregates over them; NULL keys, empty build and probe
+// sides, a LEFT JOIN's WHERE after it; errors in a join's condition, an
+// output or a call, before and past a LIMIT (a chunk with an error is
+// joined again row by row, as the row engine); in a transaction with
+// its own writes; parameters; max_statement_mem; EXPLAIN ANALYZE's
+// counts.
 // expect: committed: 500 queries, 500 the same both ways
 // expect: in a transaction: 120 queries, 120 the same both ways
 // expect: fixed: 30 queries, 30 the same both ways
@@ -57,6 +67,13 @@
 // expect: subqueries ran in the pipeline: true
 // expect: subquery parameters: 12 of 12 the same
 // expect: subquery counts: 10 of 10 the same
+// expect: joins: 400 queries, 400 the same both ways
+// expect: joins in a transaction: 100 queries, 100 the same both ways
+// expect: joins fixed: 26 queries, 26 the same both ways
+// expect: joins ran in the pipeline: true, hashes built: true, rows dropped by the first hash's keys: true, ranges per row: true
+// expect: join parameters: 12 of 12 the same
+// expect: join memory: ERROR 53200 | ERROR 53200; under it: true
+// expect: join counts: 10 of 10 the same
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -449,6 +466,7 @@ fn main() {
         println("counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
         aggregates(mut &s, mut &r)
         subqueries(mut &s, mut &r)
+        joins(mut &s, mut &r)
         return 0
     })
 }
@@ -653,4 +671,149 @@ fn subqueries(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     var sameC = 0
     for sql in shapes { if sameCounts(s, &sql) { sameC += 1 } }
     println("subquery counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
+}
+
+// A random join over f (slice P2): its tables d (by f.x: a hash or a
+// lookup per row by its primary key), g (by f.z or f.tx: duplicate and
+// NULL keys), h (by f.x: a range per row of its key's first column, or a
+// lookup by both), e (empty); inner and LEFT; rows or an aggregate.
+fn joinQ(r: mut &lexdb_base.Rng, safe: bool): str {
+    let froms = ["f join d on d.dk = f.x", "f left join d on d.dk = f.x and d.dz <> 1", "f join g on g.k = f.z", "f left join g on g.k = f.z",
+                 "f join g on g.t = f.tx", "f join h on h.hk = f.x", "f left join h on h.hk = f.x and h.ht <> 'H3'", "f join h on h.hk = f.x and h.hz = f.id",
+                 "f join d on d.dk = f.x join g on g.k = d.dz", "f join d on d.dk = f.x left join h on h.hk = d.dk", "d join f on f.x = d.dk",
+                 "f join e on e.k = f.z", "f left join e on e.k = f.z", "g join f on f.z = g.k", "f join d on d.dk = f.x + 1 and d.dz = f.z"]
+    let f = pick(r, &froms)
+    let gs = strings.contains(&f, "g on") || strings.contains(&f, "g join")
+    let ds = strings.contains(&f, "d on") || strings.contains(&f, "d join")
+    let hs = strings.contains(&f, "h on")
+    var items: []str = []
+    var cols = ["f.id", "f.x", "f.z", "f.tx", "f.nu", "f.dt", "f.bo"]
+    if gs { for c in ["g.k", "g.t", "g.n", "g.d"] { append(mut &cols, c) } }
+    if ds { for c in ["d.dk", "d.dz", "d.dtx", "d.dn", "d.dn * f.z", "f.x + d.dz"] { append(mut &cols, c) } }
+    if hs { for c in ["h.hk", "h.hz", "h.ht"] { append(mut &cols, c) } }
+    var conds: []str = []
+    for i in 0..r.below(3) { append(mut &conds, cond(r, safe)) }
+    if ds && r.below(3) == 0 { append(mut &conds, pick(r, &["d.dz <> 2", "d.dtx like 'D1%'", "d.dn > 10.5", "d.dz is null", "d.dk is null"])) }
+    if gs && r.below(3) == 0 { append(mut &conds, pick(r, &["g.n > 2", "g.t is not null", "g.k <> 2"])) }
+    if hs && r.below(3) == 0 { append(mut &conds, pick(r, &["h.hz > 300", "h.ht = 'H1'", "h.hk is null"])) }
+    if !safe && ds && r.below(3) == 0 { append(mut &conds, "f.x / (d.dz - 2) > 0") }
+    var sql = ""
+    if r.below(3) == 0 {
+        // an aggregate
+        let keys = ["f.z", "f.tx", "f.bo"]
+        var ks: []str = []
+        if r.below(3) > 0 {
+            append(mut &ks, pick(r, &keys))
+            if ds { append(mut &ks, "d.dz") }
+        }
+        for k in ks { append(mut &items, k) }
+        append(mut &items, pick(r, &["count(*)", "sum(f.x)", "avg(f.nu)", "min(f.tx)", "max(f.dt)"]))
+        if ds { append(mut &items, pick(r, &["sum(d.dn)", "count(d.dk)", "max(d.dtx)", "sum(d.dn * f.z)"])) }
+        if gs { append(mut &items, pick(r, &["sum(g.n)", "min(g.t)", "count(g.k)"])) }
+        if hs { append(mut &items, pick(r, &["sum(h.hz)", "max(h.ht)"])) }
+        if !safe && r.below(3) == 0 { append(mut &items, "sum(f.x / (f.z - 3))") }
+        sql = "select " + strings.join(&items, ", ") + " from " + f
+        if len(conds) > 0 { sql = sql + " where " + strings.join(&conds, " and ") }
+        if len(ks) > 0 {
+            sql = sql + " group by " + strings.join(&ks, ", ")
+            var ords: []str = []
+            for i in 0..len(ks) { append(mut &ords, (i + 1).toStr()) }
+            sql = sql + " order by " + strings.join(&ords, ", ")
+        }
+        return sql
+    }
+    for i in 0..(1 + r.below(4)) { append(mut &items, pick(r, &cols)) }
+    if !safe && r.below(3) == 0 { append(mut &items, pick(r, &["f.x / (f.z - 3)", "100 / f.x", "cast(f.tx as int)"])) }
+    sql = "select " + strings.join(&items, ", ") + " from " + f
+    if len(conds) > 0 { sql = sql + " where " + strings.join(&conds, " and ") }
+    if r.below(4) == 0 { sql = sql + " limit " + pick(r, &["1", "5", "300", "2000"]) }
+    return sql
+}
+
+// Joins (slice P2), both ways.
+fn joins(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
+    let c1 = q(s, &"create table d (dk int primary key, dz int, dtx text, dn numeric(10,2))")
+    let c2 = q(s, &"insert into d select i, case when i % 13 = 0 then null else i % 5 end, 'D' || (i % 20), i * 0.75 from generate_series(-5, 300) i")
+    let c3 = q(s, &"create table h (hk int, hz int, ht text, primary key (hk, hz))")
+    let c4 = q(s, &"insert into h select i % 230 - 5, i, 'H' || (i % 7) from generate_series(1, 1600) i")
+    let c5 = q(s, &"analyze")
+    let j0 = lexdb_pipe.joinCounts()
+    let rj0 = lexdb_exec.rangeJoins()
+    var same = 0
+    for i in 0..400 {
+        let sql = joinQ(r, i % 3 != 0)
+        if both(s, &sql) { same += 1 }
+    }
+    println("joins: 400 queries, " + same.toStr() + " the same both ways")
+    let b = q(s, &"begin")
+    let w1 = q(s, &"insert into d values (301, 2, 'D9', 1.5), (302, null, null, null)")
+    let w2 = q(s, &"update d set dz = dz + 1 where dk % 9 = 0")
+    let w3 = q(s, &"delete from h where hz % 5 = 0")
+    var sameT = 0
+    for i in 0..100 {
+        let sql = joinQ(r, true)
+        if both(s, &sql) { sameT += 1 }
+    }
+    let rb = q(s, &"rollback")
+    println("joins in a transaction: 100 queries, " + sameT.toStr() + " the same both ways")
+    let fixed = ["select f.id, d.dz from f join d on d.dk = f.x where f.id < 100", "select f.id, f.x / (d.dz - 2) from f join d on d.dk = f.x",
+                 "select f.id, f.x / (d.dz - 2) from f join d on d.dk = f.x limit 3", "select f.id from f join d on d.dk = f.x where f.x / (d.dz - 2) > 0 limit 2",
+                 "select f.id from f join d on d.dk = f.x where f.x / (f.z - 3) > 0 limit 2", "select f.id, g.k from f join g on g.k = f.z where f.id < 30",
+                 "select f.id, g.k from f left join g on g.k = f.z where f.id < 30", "select f.id, e.k from f join e on e.k = f.z",
+                 "select f.id, e.k from f left join e on e.k = f.z where f.id < 10", "select f.id, d.dk from f join d on d.dk = f.x where f.id < 0",
+                 "select f.id, d.dk from f left join d on d.dk = f.x and d.dz = 2 where d.dk is null and f.id < 200",
+                 "select f.id, h.hz from f join h on h.hk = f.x and h.hz = f.id", "select f.id, h.hz from f join h on h.hk = f.x where f.id < 50",
+                 "select f.id, h.hz from f left join h on h.hk = f.x and h.hz > 1500 where f.id < 50",
+                 "select f.id, d.dk, g.t from f join d on d.dk = f.x join g on g.k = d.dz where f.id < 400",
+                 "select f.id, d.dk from f join d on d.dk = f.x + 1 and d.dz = f.z", "select f.id, g.t from f join g on g.t = f.tx",
+                 "select z, count(*), sum(d.dn) from f join d on d.dk = f.x group by z order by 1",
+                 "select count(*), sum(d.dn * f.nu), min(d.dtx) from f join d on d.dk = f.x where f.z <> 1",
+                 "select d.dz, count(*), avg(f.nu), max(g.t) from f join d on d.dk = f.x join g on g.k = d.dz group by d.dz order by 1",
+                 "select f.tx, count(h.hz) from f left join h on h.hk = f.x group by f.tx order by 1 limit 5",
+                 "select count(*) from f join e on e.k = f.z", "select sum(f.x / (d.dz - 2)) from f join d on d.dk = f.x",
+                 "select sum(d.dn) from f join d on d.dk = f.x where d.dtx like 'D1%'", "select g.k, count(*) from f join g on g.k = f.z group by g.k order by 1",
+                 "select count(*), sum(h.hz) from f join h on h.hk = f.x and h.hz = f.id"]
+    var sameF = 0
+    for sql in fixed { if both(s, &sql) { sameF += 1 } }
+    println("joins fixed: " + len(fixed).toStr() + " queries, " + sameF.toStr() + " the same both ways")
+    let j1 = lexdb_pipe.joinCounts()
+    println("joins ran in the pipeline: " + (j1[0] - j0[0] > 300).toStr() + ", hashes built: " + (j1[2] - j0[2] > 50).toStr() +
+            ", rows dropped by the first hash's keys: " + (j1[3] - j0[3] > 0).toStr() + ", ranges per row: " + (lexdb_exec.rangeJoins() - rj0 > 20).toStr())
+    // parameters: the plan kept and run with each value
+    let psql = "select f.id, d.dtx, d.dn + $1 from f join d on d.dk = f.x where f.z <> $2 and d.dz <> $2 limit 50"
+    var pc = lexdb_exec.newPlanCache()
+    var sameP = 0
+    for i in 0..12 {
+        let ps = [lexdb_sql.Val.Int(r.below(60)), lexdb_sql.Val.Int(r.below(5))]
+        var ob = false
+        let viaPipe = viaSink(s, &psql, &ps, mut &pc, mut &ob)
+        let a = q(s, &"set lexdb_batch = off")
+        var pc2 = lexdb_exec.oneShot()
+        var ob2 = false
+        let viaRows = viaSink(s, &psql, &ps, mut &pc2, mut &ob2)
+        let b2 = q(s, &"set lexdb_batch = on")
+        if viaPipe == viaRows && !strings.contains(&viaPipe, "ERROR") { sameP += 1 } else { println("JOIN PARAMS: " + viaPipe + " / " + viaRows) }
+    }
+    println("join parameters: " + sameP.toStr() + " of 12 the same")
+    // max_statement_mem: a hash's rows held past it, both ways; and under it
+    let m1 = q(s, &"set max_statement_mem = '64kB'")
+    let a1 = q(s, &"set lexdb_batch = off")
+    let mOff = q(s, &"select f.id, f.tx, d.dtx from f join d on d.dk = f.x")
+    let a2 = q(s, &"set lexdb_batch = on")
+    let mOn = q(s, &"select f.id, f.tx, d.dtx from f join d on d.dk = f.x")
+    let m2 = q(s, &"set max_statement_mem = '4MB'")
+    let a3 = q(s, &"set lexdb_batch = off")
+    let uOff = q(s, &"select count(*), sum(b.nu) from f a join f b on b.y = a.y where a.id < 100")
+    let a4 = q(s, &"set lexdb_batch = on")
+    let uOn = q(s, &"select count(*), sum(b.nu) from f a join f b on b.y = a.y where a.id < 100")
+    let m3 = q(s, &"reset max_statement_mem")
+    println("join memory: " + mOff[0..11] + " | " + mOn[0..11] + "; under it: " + (uOff == uOn).toStr())
+    let shapes = ["select f.id, d.dz from f join d on d.dk = f.x", "select f.id, g.k from f left join g on g.k = f.z",
+                  "select f.id, h.hz from f join h on h.hk = f.x", "select f.id, d.dk, g.t from f join d on d.dk = f.x join g on g.k = d.dz",
+                  "select z, count(*), sum(d.dn) from f join d on d.dk = f.x group by z", "select count(*) from f join e on e.k = f.z",
+                  "select f.id from f left join d on d.dk = f.x and d.dz = 2 where d.dk is null", "select count(*) from f join h on h.hk = f.x and h.hz = f.id",
+                  "select f.id, g.t from f join g on g.t = f.tx", "select count(*) from f join d on d.dk = f.x where f.z <> 1 and d.dz <> 2"]
+    var sameC = 0
+    for sql in shapes { if sameCounts(s, &sql) { sameC += 1 } }
+    println("join counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
 }
