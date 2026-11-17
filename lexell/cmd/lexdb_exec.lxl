@@ -5069,7 +5069,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
                 col.coll = fcols[i].coll
                 append(mut &t.cols, col)
             }
-            item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, lexdb_bind.outBCols(fcols)) } else { spLp }
+            item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, outBCols(fcols)) } else { spLp }
             append(mut &planned[f.sub], sp)
         } else if f.work >= 0 {
             var w = -1
@@ -6459,7 +6459,7 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var sel = try planSelect(st, txn, s, params, sc)
     if len(s.mr) > 0 {
         try planMatch(st, txn, &s.mr[0], mut &sel, params, sc)
-        let mcols = lexdb_bind.outBCols(&sel.mr[0].outs)
+        let mcols = outBCols(&sel.mr[0].outs)
         sel.lp = lexdb_bind.LPlan.Match(replace(mut &sel.lp, lexdb_bind.noPlan()), mcols)
     }
     // EXISTS stops at its first row, a scalar at its second (runSub): its
@@ -6476,8 +6476,8 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
         // the logical plan: the function or VALUES, its arguments the select list's
         let args = cloneAll(&sel.exprs)
-        sel.lp = if strings.startsWith(&s.srf, "#values:") { lexdb_bind.LPlan.Values(strings.parseIntOpt(&s.srf[8..len(s.srf)]).unwrapOr(1), args, lexdb_bind.outBCols(&sel.outs)) }
-                 else { lexdb_bind.LPlan.Func(s.srf.toStr(), s.ordin, args, lexdb_bind.outBCols(&sel.outs)) }
+        sel.lp = if strings.startsWith(&s.srf, "#values:") { lexdb_bind.LPlan.Values(strings.parseIntOpt(&s.srf[8..len(s.srf)]).unwrapOr(1), args, outBCols(&sel.outs)) }
+                 else { lexdb_bind.LPlan.Func(s.srf.toStr(), s.ordin, args, outBCols(&sel.outs)) }
     }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
     if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
@@ -14362,6 +14362,14 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: [], ox: [], oxParam: false, lp: lp})
 }
 
+// The outputs of a SELECT as a logical operator's columns (lexdb_bind.outBCol),
+// each with the typmod a query reading it gives its column (outType's).
+fn outBCols(outs: &[]OutCol): []lexdb_bind.BCol {
+    var out: []lexdb_bind.BCol = []
+    for i in 0..len(outs) { append(mut &out, lexdb_bind.outBCol(i, &outs[i], lexdb_bind.tyOf(&outType(&outs[i]), &outs[i].coll, false).mod)) }
+    return out
+}
+
 // A SELECT's logical plan (Sel.lp) over its FROM and WHERE's (base): its
 // clauses as resolved (before the planner's rewrites).
 fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]OutCol, aggQ: bool, group: []Expr, nAggs: int,
@@ -14379,17 +14387,17 @@ fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]O
         let c = lexdb_bind.lpCols(&lp)
         lp = lexdb_bind.LPlan.Window(lp, wins, c)
     }
-    lp = lexdb_bind.LPlan.Project(lp, exprs, lexdb_bind.outBCols(outs))
-    if s.distinct || len(on) > 0 { lp = lexdb_bind.LPlan.Distinct(lp, on, lexdb_bind.outBCols(outs)) }
+    lp = lexdb_bind.LPlan.Project(lp, exprs, outBCols(outs))
+    if s.distinct || len(on) > 0 { lp = lexdb_bind.LPlan.Distinct(lp, on, outBCols(outs)) }
     return topPlan(lp, s, order, desc, nullsFirst, outs)
 }
 
 // ORDER BY and LIMIT over lp, whose outputs are outs.
 fn topPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, order: []Expr, desc: []bool, nullsFirst: []bool, outs: &[]OutCol): lexdb_bind.LPlan {
     var lp = base
-    if len(order) > 0 { lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, lexdb_bind.outBCols(outs)) }
+    if len(order) > 0 { lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, outBCols(outs)) }
     if s.limit.isSome() || s.offset.isSome() || s.withTies {
-        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, lexdb_bind.outBCols(outs))
+        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, outBCols(outs))
     }
     return lp
 }
@@ -14469,8 +14477,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let q = Query{levels: [], cols: [], bcols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
     let lpl = replace(mut &l.lp, lexdb_bind.noPlan())
     let lpr = replace(mut &r.lp, lexdb_bind.noPlan())
-    let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, lexdb_bind.outBCols(&outs)) }
-              else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, lexdb_bind.outBCols(&outs)) }
+    let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, outBCols(&outs)) }
+              else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, outBCols(&outs)) }
     let lp = topPlan(set, s, cloneAll(&order), copyBools(&desc), copyBools(&nullsFirst), &outs)
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
