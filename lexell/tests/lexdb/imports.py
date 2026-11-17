@@ -15,6 +15,12 @@
   imports exec, a dialect or a protocol module; from the store it uses the
   Store and Txn handles only, and it never reads a transaction's SQL state
   (Txn.sql). Only lexdb_exec imports it.
+- The statistics module lexdb_stats (layer 5, design/lexdb-layers.md 6.2,
+  slice E2) sits above the catalog, access and the store and below the
+  planner's vocabulary and the executor: it never imports the binder, the
+  plan, the pipeline or exec (what needs the evaluator comes in its Up
+  hooks), nor reads a transaction's SQL state (Txn.sql). Only lexdb_plan
+  and lexdb_exec import it.
 - No cycle.
 
 Run by lexdb.py before the tests; also usable directly.
@@ -33,7 +39,7 @@ CORE = {
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
-    "lexdb_session", "lexdb_sql", "lexdb_sqlcoll",
+    "lexdb_session", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time",
 }
 
@@ -99,6 +105,14 @@ PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexd
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec"}
 
+# The statistics (design/lexdb-layers.md 6.2, E2): what they may import (and
+# lexell's own libraries), and who may import them. The session's settings
+# come as arguments, the evaluator through lexdb_stats.Up.
+STATS = "lexdb_stats"
+STATS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_store", "lexdb_catalog",
+                    "lexdb_access"}
+STATS_USERS = {"lexdb_plan", "lexdb_exec"}
+
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
 PARSER_DATA = "lexdb_dialect"
@@ -158,6 +172,17 @@ def check():
             bad.append(f"{PIPE} uses lexdb_store beyond Store and Txn: " + ", ".join(sorted(names)))
         if re.search(r"\.sql\.", body):
             bad.append(f"{PIPE} reads a transaction's SQL state (Txn.sql)")
+    for d in mods.get(STATS, []):
+        if d not in STATS_MAY_IMPORT:
+            bad.append(f"{STATS} -> {d}: the statistics import above or beside their layer")
+    for m in sorted(mods):
+        if STATS in mods[m] and m not in STATS_USERS:
+            bad.append(f"{m} -> {STATS}: only {', '.join(sorted(STATS_USERS))} import the statistics")
+    stats = os.path.join(CMD, STATS + ".lxl")
+    if os.path.exists(stats):
+        with open(stats, encoding="utf-8") as f:
+            if re.search(r"\.sql\.", f.read()):
+                bad.append(f"{STATS} reads a transaction's SQL state (Txn.sql)")
     for m in sorted(set(mods) - CORE - DIALECT):
         bad.append(f"{m}: not in the core or dialect sets")
 

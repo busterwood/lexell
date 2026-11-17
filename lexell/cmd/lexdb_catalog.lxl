@@ -5,6 +5,7 @@
 // is the vocabulary they pass.
 import "binary"
 import "strings"
+import "time"
 import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_rows"
@@ -366,6 +367,28 @@ pub type TabType = record {
 pub const CATALOG: int = 1
 pub const ACL_PRE: str = "\x02acl\x00"
 pub const VIEW_MARK: str = "\xff\xff\xff\xffview"
+
+// Whether relation key k is a temporary one (9.96).
+pub fn tempRel(k: &str): bool {
+    if len(k) == 0 || k[0] != 'p' { return false }
+    return lexdb_base.isTempSchema(&lexdb_sql.schemaOf(k))
+}
+
+// Bumps made in this process: with the number, a version a bump gives is
+// unique, so a bump in a block that rolls back cannot give the version a
+// later bump commits (a plan kept under the first would be taken for the
+// second: optimizer 20).
+var VERSION_BUMPS: int = 0
+
+// The version after v (the catalog's, the statistics'): its count plus
+// one, and a token unique in this process.
+pub fn nextVersion(v: &str): str {
+    let dot = strings.indexOf(&v, ".", 0)
+    let nv: str = if dot < 0 { v.toStr() } else { v[0..dot] }
+    let n = strings.parseIntOpt(&nv).unwrapOr(0)
+    VERSION_BUMPS += 1
+    return (n + 1).toStr() + "." + VERSION_BUMPS.toStr() + "." + time.monotonicNs().toStr()
+}
 
 // What a snapshot builder needs from the dialect that names its objects.
 pub type Naming = value record {
@@ -1097,7 +1120,7 @@ pub fn dependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str
     // a temporary relation's: its schema's views only (a view reading it is
     // temporary, and no other session's can), 9.96
     let sc = lexdb_sql.schemaOf(k)
-    let tmp = len(k) > 0 && k[0] == 'p' && lexdb_base.isTempSchema(&lexdb_sql.schemaOf(k))
+    let tmp = tempRel(k)
     let vs = if tmp { try viewsIn(st, txn, &(sc + "\x1f"), &(sc + "\x20")) } else { try allViews(st, txn) }
     var out: []str = []
     var todo: []str = [k.toStr()]

@@ -5593,6 +5593,128 @@ the chunk's (dates as integers), not the join operators'.
   `pipeGroups` must read its path's values before lending the subqueries'
   values (`pipeCtx`), or a path bound by a subquery is empty.
 
+#### 6.2.11 E2 as built: the statistics in `lexdb_stats`
+
+Built 2026-11-17 on `redesign/bind` from main f42569c2 (1eb8a6e3). Scripts
+and outputs are in `~/tpch-w/bind/st2`.
+
+**What moved** (unchanged but for the interface) into `lexdb_stats`
+(layer 5; 1,164 lines):
+
+- the estimates the planner reads: `Est`, `Common`, `COMMON_MAX`,
+  `rowsFor`, `commonOf`, `entriesOf`, `rowsOf`, `noEst`, `noCommon` (from
+  `lexdb_plan`), and the samples' share of a range, now
+  `Est.sampShare(e, ...)` (exec's `parseSamp(...).rangeShare(...)`);
+- the statistics' row and version: `statKey`, `toHex`, `STAT_VERSION`,
+  `statVersion`, `moveStats`, `loadEst`;
+- ANALYZE's counting: `analyzeTable`, the samples (`Samp`, `Sampler`,
+  `mapSamples`, `sortTakingTurns`, `sampText`, `parseSamp`), the KMV
+  sketch, `keepCommon`, `spanNum`, `spanText`;
+- the automatic statistics and their state: the `CHG_*` and
+  `AUTO_STATE` globals, `noteChg`, `noteChgN`, `chgFlush`, `chgEnd`, the
+  memo's counts and states (`acCounts`, `acState`, `acDone`, ...),
+  `statRows`, `autoLook`, `autoOne`, `autoAnalyzeStep`, `autoAnalyzer`,
+  `setAutoAnalyze`.
+
+**The interface** (28 public names):
+
+- `Up { idxVal, inIndex, decTable }`, a value record of functions as
+  `lexdb_pipe.Up`: what needs exec's evaluator (an index expression's
+  value, a partial index's predicate) and the parser (a catalog row's
+  expressions). Exec's is `statsUp()`.
+- The session's settings come as arguments, so the module reads no
+  `Txn.sql`: `loadEst(st, txn, t, join, rules)`, `noteChg(st, sess, t,
+  kind)`, `noteChgN(st, sess, t, n)`, `analyze(st, txn, tabs, deadline,
+  up)` (the statement's `Limits` were read for the deadline only).
+- The planner reads estimates through `loadEst` and `Est`'s methods
+  (`rowsFor`, `commonOf`, `entriesOf`, `sampShare`) and `spanNum` for a
+  literal; DML reports through `noteChg`, `noteChgN`, `chgEnd`; DDL
+  through `moveStats`, `dropStats`; the plan cache reads `statVersion`;
+  `pg_stat_user_tables` takes `tabStat(st, txn, t)` (a
+  `lexdb_catalog.TabStat`).
+- ANALYZE the statement stays in exec (layer 7, E4): `maint`, the
+  tables by name (`findTable`, `catScan`), then `lexdb_stats.analyze`,
+  `tmpBump` for a temporary table, `lexdb_stats.bumpVersion` for a
+  permanent one, in the old order.
+- `autoAnalyzer` and `autoAnalyzeStep` stay in exec as one-line adapters
+  that add `statsUp()`: `lexdb.lxl` starts the task and the test calls the
+  step by those names.
+
+**Moved down instead of hooked:** `tempRel` and `nextVersion` (with
+`VERSION_BUMPS`) to `lexdb_catalog` (a relation key's kind; the catalog's
+and the statistics' versions; `dependentViews`' inline copy of `tempRel`
+now calls it); `TURN_NS` to `lexdb_base` (the pipe's budget and ANALYZE
+take turns by it). Exec's `fetch` adapter is not needed: `analyzeTable`
+calls `lexdb_access.fetch` on `relOf(t)`, as the adapter did. The one
+`fmax` became its expression (`r` is never NaN there).
+
+**Deleted:** exec's stale comments of the estimates (left by an earlier
+move), `lexdb_plan`'s `lexdb_catalog` import (unused once `Est` left),
+exec's `hash` and `os` imports.
+
+**Imports:** `lexdb_stats` imports `lexdb_base`, `lexdb_sql`,
+`lexdb_time`, `lexdb_float`, `lexdb_ops`, `lexdb_store`,
+`lexdb_catalog`, `lexdb_access`; `lexdb_plan` and `lexdb_exec` import it.
+`imports.py` checks that list, the two users and no `.sql.`: 214 edges
+to 223. `lexdb_plan` above `lexdb_stats` keeps E5 open: the planner can
+move into `lexdb_plan` and call `loadEst` without a cycle.
+
+**Line counts:**
+
+| | main f42569c2 | E2 |
+|---|---:|---:|
+| `lexdb_exec` | 25,312 | 24,271 |
+| `lexdb_stats` | | 1,164 |
+| `lexdb_plan` | 461 | 394 |
+| `lexdb_catalog` | 1,351 | 1,374 |
+| `lexdb_base` | 119 | 124 |
+| `lexdb_pipe` | 5,055 | 5,050 |
+
+So 1,041 lines left exec (6.2 estimated ~1,000).
+
+**Gates:**
+
+- Suite: 190 passed, imports ok (47 modules, 223 edges).
+- Naming battery and the 22 TPC-H EXPLAINs: identical to main's build
+  (`p2/lexdb-c3`) (`nam-*.out`, `exp-*.txt`).
+- TPC-H, SF1: the 22 checksums are main's (and the baseline's, 1744ef99;
+  q1, q8 and q17 differ in text as on main). The one run (`out-e2`)
+  against `out-main-f42569c2`: total 17,999.6 to 18,458.9 ms (+2.6%), q13
+  +29%, q20 +11%, q14 +7%, q19 +6%, q3 +3%. Another session's compiler
+  gates ran without the bench lock during these runs (up to 12 `lxlc`
+  processes), so they were repeated on copies of both binaries:
+  - `rep2.sh` (those five, 3 runs, two passes) twice: level within each
+    pass, but passes moved 20-60% with the other load (`rep2-first`,
+    `rep2-second`);
+  - `full2.sh` (the 22, one run each, main E2 E2 main), the least of two
+    per query (`full-min.txt`): total 17,946 main, 17,653 E2 (-1.6%); no
+    query more than 3% slower (q19 +1.7%); q13 775 and 747.
+  - Nothing E2 changed runs in a query: planning calls `loadEst` across
+    a module, and DML `noteChg`.
+- Point selects (`icount.sh`, 3 runs of `points.sql`, two rounds): main
+  200,151 and 199,256 instructions a statement, E2 200,169 and 198,156
+  (-0.3%).
+
+**Hand-over:**
+
+- E3 (the binder leftovers into `lexdb_bind`) was not started: it is not
+  low risk. `bindFrom` fills `Query`'s levels and plans FROM's subqueries
+  and views (`planSub`, `SubPlan`), and `Scope` carries the planner's
+  state (`looks`, `early`, `locking`, `ordBy`, `noRefKeys`, `noLp`) and
+  the privilege checks (`scCheck` reads the session's role, `whoIs`).
+  Before it moves: split `Scope` into the binder's names (`Names`, already
+  `lexdb_bind`'s) and the planner's flags; pass the catalog snapshot and
+  the role in; keep `bindFrom`'s planning of subqueries as a callback.
+  The small leaves (`srfCols`, `colIndex`, `exprScale`, `collectAggs`,
+  `setSubst`, `hasAgg`, `boundType`, `immutable`) can go first, one commit.
+- ANALYZE the statement and the two autoanalyze adapters leave with E4
+  (statements). `lexdb_stats.Up.decTable` is exec's `decTable`
+  (`lexdb_catalog.decTable` with `lexdb_parse.parseExpr`); if the catalog
+  takes the parser as its own hook later, it can drop out of `Up`.
+- `Est`'s fields are public: the planner reads `rows`, `trees`, `cm`,
+  `cols`, `cnd`, `lo`, `hi`, `span` directly. Narrowing that is E5's,
+  with the planner's move.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
