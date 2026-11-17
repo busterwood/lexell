@@ -1885,6 +1885,316 @@ line numbers move.
   and back on itself; `ab35.sh` and `oltp.sh` do not (slice 3 ran them
   with `sudo /usr/local/sbin/cpu-boost off`, then on).
 
+**2d slice 4 as built: `eval` reads a column at its slot.** Three commits
+on `redesign/bind` from main 21f9386c, each built and through the suite
+(188, imports ok), and a fourth with this note: caaae74c (stage 1),
+7a0633ac (stage 2), 42d40c6a (stage 3).
+
+- First, counted. A scratch build whose `eval` column arm logged every
+  read where the slot was not the column the name search finds (kinds:
+  NONE, slot -1; MISS, the slot names another column or is past the
+  list; DUP, the slot names a later column of the same name), deduplicated
+  per process, with the suite's test name passed in (`SLOT_TEST`, set by a
+  scratch `run.py`). Run over the suite, TPC-H's 22, the 35 queries, OLTP
+  (vspg: loads, point selects, updates) and the naming battery:
+  - no MISS and no DUP anywhere: every `Expr.Col` that carries a slot is
+    evaluated over the list it was resolved over, at that slot;
+  - NONE only in the suite (80 distinct sites, 0 in the rest): a table's
+    stored expressions (CHECK constraints, index expressions and
+    predicates, parsed from the catalog with slot -1) evaluated over
+    `t.cols` (`passes`, `idxVal`, `inIndex`, `dupMade`, `bpEval`).
+  - So slice 3's "every `Env` must carry its query's slot order" holds
+    wherever these runs reach: the `&q.cols` Envs read rows of `q.cols`'s
+    order, and nothing read through the other lists (`&t.cols` aside:
+    `&noCols`, `&pl.inCols`, `&up.cols`, `&sel.q.cols`) missed. Which of
+    the 75 `Env{` sites the runs reach was not counted.
+- Stage 1, `eval`: its `Expr.Col(name, slot)` arm takes `slot` when `slot
+  >= 0 && slot < len(env.cols) && env.cols[slot].name == name`
+  (`colSlot`'s rule, inline), else `colIndex` as before (42703 when
+  absent, NULL for an empty row, unchanged). `orderValue`'s "not an input
+  column" test (an ORDER BY output alias, per row) uses `colSlot`.
+- Stage 2, a table's stored expressions carry slots:
+  `lexdb_sql.slotted(x, cols)` gives each column its place in `cols` (the
+  first of its name; -1 none). `lexdb_catalog.decTable` calls
+  `slotExprs(t)` at its end (CHECKs, index expressions, index predicates
+  over `t.cols`), and CREATE INDEX and ADD CHECK slot the ones they make
+  (they evaluate them over the table's rows at once). A slot made stale by
+  ALTER TABLE in the same statement (a dropped or renamed column) fails
+  the name check and is searched; the next decode slots it again.
+- Stage 3, plan-time lookups that have an `Expr.Col` in hand use
+  `lexdb_bind.colSlot` instead of `colIndex`: `checkGrouped`, `firstCol`,
+  `orderLookups`, `planSelect` (ORDER BY's collation kind, the
+  output-alias check, GROUP BY's redundant keys), `compared` (three),
+  `isKeyEq` (two), `outText`, `oldRefs`, `colAtOf`, `mrSlots`. Same answer
+  as the search, since a query row's names are unique (`DUPSEP` for a
+  repeat in one FROM item, 42712 for a repeated alias, `\x00sjN` for the
+  semi-joins' columns) and resolve's slot is the first of its name.
+- Decision: the name check stays in `eval`. Without it (`slot <
+  len(env.cols)` alone, a scratch build) the row-path queries below moved
+  0.1-1.5% more in one round, inside the copy floor; with it, a slot that
+  is stale or from another list (none seen, but ALTER TABLE, DML target
+  lists and the expressions built after resolve are many paths) still
+  gives the right column instead of a wrong value. It can go when every
+  expression reaching `eval` is bound against its operator's own column
+  list (2e and step 3: see the note below).
+- `colIndex(` sites in exec: 70 before (with the definition), 54 after:
+  - 1 the definition, 1 `eval`'s fallback;
+  - 38 a table's columns by a name the user wrote (`t.cols` 32, `tb.cols`
+    4, `p.cols`, `q.levels[0].t.cols`): DDL, DML target lists, COPY,
+    foreign keys, ON CONFLICT targets. Binding of names that never were
+    `Expr.Col`s; they belong to the binder (2e's DML), not to `eval`;
+  - 10 `q.cols` by a name string, no `Expr` in hand: `slotOf` (behind the
+    `colAt` map), `likeBounds`, `colKind`, `plainEqCols`,
+    `distinctKnown`, `buildQuery` (the frames' USING marks, the hash
+    keys' `KeyedCol` names), `batchGroupsIn` (`colNames` of ORDER BY).
+    The planner's name matching (kept, as the brief says);
+  - 3 `rw.inCols` (MATCH_RECOGNIZE's PARTITION BY names and ORDER BY's
+    unresolved items), 1 `sq.cols` (`semiLevel`, by output name).
+- Not changed: `Expr.Col` keeps its name (the planner's keys, `levelOf`,
+  `colAt`, `rangePath`, `bpFix`, `exprText`, `sameExpr`); `Query.bcols`
+  is still read by nothing; `lexdb_bind` is untouched.
+- Lines:
+
+  | Module | main 21f9386c | after |
+  |---|---|---|
+  | `lexdb_exec` | 27826 | 27828 |
+  | `lexdb_bind` | 1856 | 1856 |
+  | `lexdb_sql` | 1188 | 1210 |
+  | `lexdb_catalog` | 1336 | 1358 |
+
+- No change in results:
+  - the suite (188) at every stage; imports ok;
+  - the naming battery: identical output from main and stages 1, 2 and 3.
+    Extended by 51 statements (now 1000 lines, 28 errors; the old file is
+    `naming.sql.s3`): CHECKs over several columns and a char(n) one,
+    passing and failing on INSERT and UPDATE; ADD CHECK validating
+    existing rows (failing and passing); DROP COLUMN before a checked
+    column, RENAME COLUMN of one, ADD COLUMN with a CHECK on it; an
+    expression index used by a lookup, a unique expression index and a
+    unique partial index violated by INSERT, by a multi-row INSERT and by
+    UPDATE, then DROP COLUMN before them and the same again; UPDATE and
+    DELETE with RETURNING expressions; ON CONFLICT DO UPDATE with
+    `excluded` (twice); MERGE with expressions in both arms; UPDATE ...
+    FROM, DELETE ... USING with RETURNING; INSERT ... SELECT RETURNING;
+    GROUP BY with an ORDER BY over an aggregate alias and an expression;
+  - TPC-H's 22 checksums (fields [0] and [8]) on every round.
+- A/B against main 21f9386c (built from `git archive` into
+  `~/tpch-w/bind/src-m21f`, binary `lexdb-m21f`; the branch at stage 3,
+  `lexdb-s4c`), boost off, binaries alternating, medians of 3 rounds:
+  - TPC-H (`tpch_ab.sh`, tags g1-g3): total 0.998; all 22 checksums the
+    baseline's on every round. q2 0.983, q17 0.980, q20 1.010, q21 0.998,
+    q22 1.002, q18 1.005; q10 0.967, q14 0.978, q16 0.968 (the same in all
+    three rounds); q1 1.016; the rest within 1%.
+  - The watched ones and the row path on copies (`qmulti.sh q4b 5 3`,
+    `m21f`, `s4c` and byte-identical copies `m21fc`, `s4cc`; ratio of the
+    pairs' means; the floor is copy against copy):
+
+    | Query | main | main copy | slice 4 | slice 4 copy | ratio | floor main, s4 |
+    |---|---|---|---|---|---|---|
+    | `case` (CASE over lineitem, row path) | 6393 | 6533 | 6188 | 6166 | 0.956 | 1.022, 0.997 |
+    | `cat` (max of `l_comment \|\| l_shipinstruct`) | 9403 | 9561 | 9109 | 8953 | 0.952 | 1.017, 0.983 |
+    | `md5` (`md5(l_comment) < '1'`) | 4572 | 4612 | 4497 | 4451 | 0.974 | 1.009, 0.990 |
+    | q1 | 2449 | 2462 | 2495 | 2457 | 1.008 | 1.005, 0.985 |
+    | q2 | 64.4 | 64.2 | 63.6 | 63.8 | 0.991 | |
+    | q17 | 43.7 | 43.4 | 43.6 | 43.2 | 0.996 | |
+    | q20 | 384.6 | 380.6 | 384.5 | 381.9 | 1.002 | 0.990, 0.993 |
+    | q22 | 457.5 | 459.4 | 459.9 | 454.9 | 0.998 | |
+
+    The row path gains 2.6-4.8%, over the floor. q1 and q20 are level,
+    inside the floor (`run.sh`'s q1 1.016 and q20 1.010 are that floor).
+  - User-space instructions (`pstat.sh`, `perf stat -p` on the server over
+    3 runs after a warm-up, one server each): `case`
+    189.86G against 185.53G (-2.3%; cycles -3.3%), q1 101.96G against
+    101.69G, q20 8.755G against 8.751G, q2 1.832G against 1.825G. So
+    q20's 8,508 subquery runs do not read columns through `eval`'s column
+    arm in an amount that shows (not looked into further: the bound `BX`
+    paths read by slot already); slice 3's note took q20 for an `eval`
+    path, and it is not where this slice's gain is.
+  - The 35 queries (`ab35.sh`, 3 rounds): total 0.999; every query within
+    1.5% (scan2 1.012, grp_text 1.010, join_left_rows 0.982, join_hash_agg
+    0.983, expr_agg 0.985). None of them reads columns through `eval` per
+    row in an amount that shows (their row paths are bound or batched).
+  - OLTP (`oltp.sh`, 3 rounds), tps ratios:
+
+    | Clients | Point selects | Updates |
+    |---|---|---|
+    | 1 | 1.006 | 0.997 |
+    | 8 | 1.013 | 1.004 |
+    | 32 | 1.015 | 1.008 |
+
+    The batch-insert loads (`INSERT ... generate_series`, 1M rows):
+    acct 1.52 against 1.50 s, t 2.94 against 2.92 s (medians).
+  - The plan cache, counted (`~/tpch-w/bind/bench/pc.sh BIN LOG` on
+    scratch builds of main and the branch that print `PC PLAN` at `pc.plans
+    += 1` and `PC HIT` in `select`'s loop over `pc.sels`; `pgbench -M
+    prepared`, 4 clients, 3 s of point selects, then 3 s of updates): 8
+    plans on both, every other select a hit (194,490 of 194,498 on main,
+    196,183 of 196,191 on the branch); the updates add no plan and no hit
+    (planned per run, no DML cache), on both.
+- Not verified: T-SQL's and Oracle's paths beyond the suite's `tds_*` and
+  `tns_*` tests (the counting build saw no slot misses there either); the
+  unguarded `eval` (no name check) beyond one round of the row-path probes.
+
+**Where 2d left off, and how to start 2e (the logical plan).** 2d is done
+as far as the old executor allows: names are resolved by `lexdb_bind`,
+each resolved `Expr.Col` carries its slot, `bindExpr` and `eval` read the
+slot (with the name check), and a table's stored expressions are slotted
+when the table is decoded. 2e makes the binder emit the logical plan (the
+table of operators in "The bound plan" above: `Get`, `Values`, `Func`,
+`CteRef`/`Recursive`, `Filter`, `Project`, `Join`, `Apply`, `Agg`,
+`Window`, `Sort`, `Limit`, `Distinct`, `SetOp`, `Match`, `Lock`) for SELECT
+and for DML's sources, and `planSelect`/`buildQuery` read it instead of the
+`Stmt`. Step 3 (section 6) then turns it into the operator tree, and 4.5's
+optimizer takes it over; 2e itself changes no plan and no result.
+Everything named is in `lexdb_exec` unless the note says otherwise; search
+for the names, since line numbers move.
+
+- What is there after 2d:
+  - `lexdb_bind`: `Names` (`frames`, `base`, `ptypes`, `coll`, the hooks
+    `ty`, `blank`, `constCast`, `colScale`, `outScale`), `Frame`,
+    `resolve(x, cols, n, ns: mut &Names)`, `resolveName`, `outerRef`,
+    `selectCols`/`itemCols`, `resolveOrder`, `resolveGroup`, `orderOut`,
+    `OutCol`, the typing helpers, `colSlot(cols, name, slot)`, `Ty`,
+    `BCol`, `bcolOf`, `BX`, `bindExpr`, `reslot`.
+  - exec's `Scope` holds `names: Names` and the planner's hints (`works`,
+    `asRole`, `whos`, `target`, `looks`, `early`, `locking`, `ordBy`,
+    `ordLim`, `noRefKeys`); `newScope`/`newScopeIn` make it, `endScope`
+    closes a frame into its `Query` (`Query.refs`, the subqueries' `kind`
+    and `readAs`).
+  - `Query` (`levels`, `cols`, `bcols`, `top`, `subs`, `base`, `refs`,
+    `colAt`, `cc`/`cp`) and `Sel` (`q`, `exprs`, `outs`, `groupBy`,
+    `order`, `having`, `specs`, `wins`, `parts`, `setop`, `gsets`, `mr`,
+    `locks`, `ox`, …) are both the bound form and the physical plan today.
+    `Query.bcols` is written by `addCol` (every column of a query's row
+    goes through it) and read by nothing: it is the natural output
+    column list of the `Get`/`Join` part.
+  - `buildQuery(st, txn, from, where, params, subs, selNames, star, sc,
+    reorder)` (about 1,150 lines) does both jobs in one pass: it walks the
+    FROM items (tables, views under their owner, FROM subqueries planned
+    first, LATERAL, SRFs, `#values:`), adds their columns (`addCol`),
+    builds USING/NATURAL's ON (`usingSide`, `colExpr`), resolves ON and
+    WHERE, plans the subqueries (`planSub`, numbered by the frame's
+    `sub*` lists), finds semi-joins (`semiLook`, `semiJoins`, hidden
+    `\x00sjN` columns), adds implied equalities, then orders the joins
+    and chooses paths (`choosePath`, `costOrder`). Its callers: 13 sites
+    (`planSelect`, `planSub` through `planSelect`, `insert`, `update`,
+    `delete`, `merge`, the batched DML at `dmlFrom`/`mergeFrom`, EXPLAIN's
+    and ALTER's uses).
+  - `planSelect(st, txn, s: &Stmt, params, sc)` reads the `Stmt`'s
+    clauses directly (`s.order`, `s.group`/`s.gsets`, `s.having`,
+    `s.distinct`/`s.distinctOn`, `s.wins`/`s.windows`, `s.limit`/`s.offset`,
+    `s.withTies`, `s.topMode`, `s.lockMode`, `s.setop` → `planSet`,
+    `s.srf`/`s.ordin`, `s.mr` → `planMatch`, `s.items`). The 20
+    `lexdb_bind.resolve(` sites are spread over `buildQuery`,
+    `planSelect`, `planSet`, `planMatch` and the DML planners.
+  - DML: `insert`, `update`, `delete`, `merge` (and `upsertOld`, `Ret` for
+    RETURNING, `MClause`) resolve their SET/VALUES/RETURNING over the
+    query's `cols`; target column names are found by `colIndex(&t.cols,
+    …)` (32 sites): binding work 2e's DML part should take.
+- A way in, in slices that each keep results and speed:
+  1. Types only: `lexdb_bind.LPlan` (a closed type, one arm per operator,
+     each with its output `[]BCol`), built beside today's structures where
+     they are built (`buildQuery`'s FROM walk for `Get`/`Join`/`Func`/
+     `Values` and FROM subqueries; `planSelect` for `Filter`, `Agg`,
+     `Window`, `Sort`, `Limit`, `Distinct`, `Project`; `planSet` for
+     `SetOp`), read by nothing, and checked against `Query.cols`/`bcols`
+     and `Sel.outs` in a scratch build over the suite and the battery.
+     As 2d slice 1 did with `bcols`.
+  2. Split `buildQuery` into the binder's FROM pass (FROM items, columns,
+     USING/NATURAL, ON and WHERE resolved, subqueries numbered: an
+     `LPlan`) and the planner's pass (semi-joins, implied equalities, join
+     order, paths), which reads the `LPlan`. Move the FROM pass into
+     `lexdb_bind`; it needs the catalog (tables, views) through the hooks
+     on `Names` or a catalog snapshot passed in (`lexdb_bind` may import
+     only `lexdb_base`, `lexdb_sql`, `lexdb_catalog`, `lexdb_dialect`,
+     `lexdb_time`, `lexdb_float`, `lexdb_ops`, `lexdb_lib`:
+     `tests/lexdb/imports.py`, `BIND_MAY_IMPORT`).
+  3. `planSelect` reads its clauses from the `LPlan` instead of the
+     `Stmt`, one clause per commit (ORDER BY, GROUP BY and HAVING,
+     windows, DISTINCT, LIMIT, locking), then `planSet`, `planMatch`,
+     then DML's sources and target lists.
+  4. With every operator's input list known to the binder, bind each
+     expression against its operator's own input (`BX.Col(slot)`), and
+     drop `eval`'s name check (see "2d slice 4 as built": it costs 0-1.5%
+     on the row path and guards against a slot from another list).
+- Traps:
+  - `Expr.Col`'s name is load-bearing for the planner (`keyedCol`,
+    `levelOf`, `colAt`, `slotOf`, `rangePath`, `bpFix`, `exprText`,
+    `sameExpr`, `colNames`, `checkGrouped`'s `exprText` match, the hash
+    keys' `KeyedCol`). Keep it until those read slots.
+  - The slot is relative to the list resolve was given. `Frame.cols` is
+    `q.cols` only where `buildQuery` fills it (queries with subqueries);
+    ON and USING are resolved over a prefix of the row, their slots are
+    the full row's. Semi-joins add hidden columns (`semiLookAdd`,
+    `semiJoins`) and rename columns (`renameCol` with the new slot): the
+    planner's rewrites change the row after binding, so the `LPlan`'s
+    column list and `Query.cols` differ from then on.
+  - Correlation: outer references are parameters past `Names.base`
+    (`outerRef`, `Frame.refs`, `endScope`, `Query.base`, `Query.refs`);
+    `SubPlan`, `subFixed`, `isSubCall`, `subValue`, `keyConj`,
+    `noRefKeys` (9.104) and the per-row subquery machinery depend on the
+    numbering. `Apply` should carry today's numbering until step 5.
+  - Views are planned under their owner (`asRole`, `whos`); CTEs are
+    re-parsed per use today (the design's `CteRef` binds once); a
+    recursive CTE's working table is `Scope.works`.
+  - The plan cache (`PlanCache`: `sels`, `looks`, `ver`, `plans`; the hit
+    is `select`'s loop over `pc.sels` with `looksHold`) keeps `Sel`s per
+    prepared statement; whatever 2e adds to a `Sel` is cached with it and
+    must not hold run-time state. Updates are planned per run (no DML
+    cache).
+  - `orderOut`, `outText`, `orderValue` and `checkGrouped` read "not an
+    input column" (`colSlot`/`colIndex` < 0) as an output alias. The known
+    difference from PostgreSQL (an input column before an output alias of
+    the same name in ORDER BY: 42803 where PostgreSQL takes the alias) rests
+    on it; fix it only as its own commit with a test.
+  - `bindExpr` runs per run on the `bxOf` paths (join, group and ORDER BY
+    keys, aggregate arguments); keep its column arm one compare. `BX` and
+    `FnRef` are owned, not copy types; copy a `FnRef` by its fields.
+  - A table's stored expressions are slotted in `decTable`
+    (`lexdb_catalog.slotExprs`); a Table changed in memory by ALTER keeps
+    stale slots until it is decoded again, which the name check absorbs.
+    If the check goes (way in, 4), call `slotExprs` after every in-memory
+    change of `t.cols` first (`alterTable`'s arms, `dropColumn`, RENAME COLUMN).
+  - The suite compiles each test as it runs: do not edit the sources it
+    reads (about 4 minutes at `-j 2`). Run it from a snapshot copy
+    (`cp -r lexell/{cmd,tests,lib,tools}` to a scratch tree) so editing can
+    go on; commit what the snapshot passed.
+  - When waiting for a process, wait on its PID or a file, not `pgrep -f`
+    of a pattern in your own command line (it matches itself).
+  - Run timings under `flock ~/tpch/.bench.lock` (exclusive); builds and
+    the suite take it shared, so they wait while a timing run holds it.
+- Gates:
+  - the suite (188), imports ok;
+  - the naming battery (`~/tpch-w/bind/bench/naming/run.sh BIN OUT`,
+    1000 lines on main 21f9386c and on slice 4): identical output from
+    main and the branch; extend it for whatever moves (2e: FROM shapes,
+    views, CTEs, recursive CTEs, LATERAL, set operations, DML sources);
+  - TPC-H all 22, checksums against `~/tpch/out-baseline-1744ef99`
+    (fields [0] and [8]), watching q2, q17, q18, q20, q21, q22;
+  - the 35 queries; OLTP point selects and updates, and the batch-insert
+    loads (`oltp.sh`'s `load` lines);
+  - the plan cache, counted: a scratch build that prints a line where
+    `select`'s loop over `pc.sels` hits and where it plans (`pc.plans +=
+    1`), under `pgbench -M prepared`, 4 clients, 3 s of point selects then
+    3 s of updates (`pc.sh` below). On main 21f9386c and slice 4: 8 plans,
+    every other select a hit; updates add none (planned per run).
+- Methods (`~/tpch-w/bind/bench`):
+  - baseline: `git archive <main> lexell/cmd` into a scratch tree, built
+    there with the native compiler (`LXL_NOCACHE=1`, `taskset -c
+    4-7,12-15`, shared lock);
+  - `tpch_ab.sh TAG LABEL…` (binaries `~/tpch-w/bind/lexdb-LABEL`, 3 runs,
+    `run.sh` turns boost off and restores it), `tpcmp.py A B TAG…`;
+  - `ab35.sh OUT A BINA B BINB [ROUNDS]`, `cmp35.py`; `oltp.sh OUT A BINA B
+    BINB [ROUNDS]`; neither sets boost: `sudo /usr/local/sbin/cpu-boost
+    off` first and `on` after;
+  - `qab.sh QFILE N LABEL…` (one query) and `qmulti.sh QDIR N ROUNDS
+    LABEL…` (every `QDIR/*.sql`, N timed runs after a warm-up, per server
+    start; added in slice 4). The row-path probes `~/tpch-w/bind/q4b`
+    (`case`, `cat`, `md5` over lineitem: eval per row, 4-9 s) with
+    q1, q2, q17, q20, q22. Under ~1.5% use byte-identical copies of each
+    binary (`cp lexdb-X lexdb-Xc`) as their own labels: a copy's pages
+    differ, and copies of one binary differ by that much (the q1 note).
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
