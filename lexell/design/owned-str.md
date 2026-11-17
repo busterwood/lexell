@@ -186,6 +186,11 @@ implicit copy was. They need doing before or at the switch to owned `str`.
 
 ## 6. Language issues the migration exposed
 
+**Decided 2026-11-17:** implement 1 (freeze only the borrowed path), 10
+(implicit shared borrow of arguments), 9 (a match moves a local at its last
+use) and 4 (generated `clone`) first, before the compiler migration. The
+others come back for discussion after that.
+
 The user asked (2026-11-17) for deeper language issues found during this
 work to be collected and presented at the end, since this redesign is the
 time to change the language. Each entry says what was seen, where, and

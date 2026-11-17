@@ -894,6 +894,10 @@ borrows, or a type parameter declared `borrow` (section 6.1).
    `mut &`, freezes its roots against any other use as well, except through
    it. A `for x in xs` loop freezes `xs` the same way for the loop body, and
    an iterating `for` freezes the iterator's roots.
+   A `let` borrow of a place, and a `for` loop over one, freeze only that
+   place: while `let s = &d.f` is live, `d.g` may be assigned or mutably
+   borrowed, but `d.f`, anything under it, and `d` itself may not (places
+   overlap as in rule 3). Other freezes cover the whole root.
    A local variable is live from its declaration to its last use: while its
    name occurs later in its block (in a statement after the current one, or
    in the rest of the current statement; the right side of a plain

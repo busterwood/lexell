@@ -211,6 +211,7 @@ type Cap = value record {
 
 type Freeze = value record {
     root: int
+    path: str       // the part of root that is borrowed ("" all of it): writes elsewhere in root go on
     m: bool
     by: str
     bv: int         // the variable it is made for: in force while that is live (-1: until its scope ends)
@@ -887,7 +888,7 @@ fn (c: mut &Checker) storeRoot(x0: int, r: int, t: int, line: int) {
     c.vars[x].croot = r
     let d = c.vars[x].depth
     if d >= 0 && d < len(c.cx.scopes) {
-        append(mut &c.cx.scopes[d].freezes, Freeze{root: r, m: c.pg.holdsMut(c.vars[x].t), by: name, bv: c.nllVar(x)})
+        append(mut &c.cx.scopes[d].freezes, Freeze{root: r, path: "", m: c.pg.holdsMut(c.vars[x].t), by: name, bv: c.nllVar(x)})
     }
 }
 
@@ -1177,9 +1178,13 @@ fn (c: mut &Checker) declare(v: int) {
 
 fn (c: mut &Checker) pushScope() { append(mut &c.cx.scopes, Scope{vars: [], freezes: []}) }
 
-fn (c: mut &Checker) freeze(root: int, m: bool, by: &str, bv: int) {
+fn (c: mut &Checker) freeze(root: int, m: bool, by: &str, bv: int) { c.freezeAt(root, "", m, by, bv) }
+
+// Freeze the place path of root (design/owned-str.md, issue 1): moves, writes and mutable borrows of
+// root conflict with it only where their paths overlap.
+fn (c: mut &Checker) freezeAt(root: int, path: &str, m: bool, by: &str, bv: int) {
     let s = len(c.cx.scopes) - 1
-    append(mut &c.cx.scopes[s].freezes, Freeze{root: root, m: m, by: by, bv: bv})
+    append(mut &c.cx.scopes[s].freezes, Freeze{root: root, path: path.clone(), m: m, by: by.clone(), bv: bv})
 }
 
 // Variable x, if its freezes may end at its last use (design/borrow-types.md 12.3): a local the
@@ -1370,10 +1375,14 @@ fn (c: mut &Checker) block(b: int, scope: bool, top: bool) {
 
 // ---------------------------------------------------------------- ownership checks
 
-fn (c: mut &Checker) frozen(root: int, kind: int, line: int) {
+fn (c: mut &Checker) frozen(root: int, kind: int, line: int) { c.frozenAt(root, "", kind, line) }
+
+// Whether path of root may be read, written, moved or mutably borrowed (kind): a freeze whose path
+// overlaps it stops the program being compiled.
+fn (c: mut &Checker) frozenAt(root: int, path: &str, kind: int, line: int) {
     if root < 0 { return }
     if c.vars[root].jn >= 0 {
-        for x in c.members(root) { c.frozen(x, kind, line) }
+        for x in c.members(root) { c.frozenAt(x, path, kind, line) }
         return
     }
     if c.vars[root].cap >= 0 && kind != FR_READ {
@@ -1383,7 +1392,7 @@ fn (c: mut &Checker) frozen(root: int, kind: int, line: int) {
     for s in 0..len(c.cx.scopes) {
         for f in c.cx.scopes[s].freezes {
             let hit = f.root == root || (f.root >= 0 && c.vars[f.root].jn >= 0 && hasInt(&c.joins[c.vars[f.root].jn], root))
-            if hit && (kind != FR_READ || f.m) && c.inForce(&f, 0) {
+            if hit && (kind != FR_READ || f.m) && overlap(&f.path, path) && c.inForce(&f, 0) {
                 let verb = match kind { FR_ASSIGN { "assigned" } FR_MOVE { "moved" } FR_MUT { "mutably borrowed" } else { "used" } }
                 c.err(line, "'" + c.vars[root].name + "' is borrowed by " + f.by + " and cannot be " + verb +
                     " while that borrow is in scope")
@@ -1559,14 +1568,14 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
     let k = c.pg.tk(v.t)
     if k == sema.TK_SLICE {
         if m && !c.pg.tm(v.t) { c.err(line, "cannot make a mut slice from a shared slice") }
-        if m { c.frozen(v.root, FR_MUT, line) }
+        if m { c.frozenAt(v.root, &v.path, FR_MUT, line) }
         return rvAt(v.c, c.pg.mkSlice(c.pg.ta(v.t), m), v.root, &v.path)
     }
     if k == sema.TK_REF {
         if m && !c.pg.tm(v.t) {
             c.err(line, "cannot mutably borrow through the shared borrow '" + c.rootName(v.root, "?") + "'")
         }
-        if m { c.frozen(v.root, FR_MUT, line) }
+        if m { c.frozenAt(v.root, &v.path, FR_MUT, line) }
         let rc = if !m && c.pg.tm(v.t) { c.shareOf(c.pg.ta(v.t), v.c) } else { v.c }
         return rvAt(rc, c.pg.mkRef(c.pg.ta(v.t), m), v.root, &v.path)
     }
@@ -1584,7 +1593,7 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
         }
         if m {
             if !v.mutable { c.immutable(v, line, "mutably borrow") }
-            c.frozen(v.root, FR_MUT, line)
+            c.frozenAt(v.root, &v.path, FR_MUT, line)
         }
         cc = if m { c.x.par(c.x.pre("&", v.c)) } else { c.addrOf(v.t, v.c) }
     } else if v.cat == CAT_TMP {
@@ -1880,7 +1889,7 @@ fn (c: mut &Checker) sLet(s: int) {
             c.err(n.line, "cannot borrow a temporary into let '" + name + "': the temporary does not outlive " +
                 "the statement")
         }
-        if c.pg.tm(v.t) { c.frozen(root, FR_MUT, n.line) }
+        if c.pg.tm(v.t) { c.frozenAt(root, &v.path, FR_MUT, n.line) }
         let vx = c.newVar(&name, &cn, v.t, false, VK_LOCAL, n.line)
         c.vars[vx].broot = if root == R_FREE { -1 } else { root }
         if c.pg.tk(v.t) == sema.TK_REF {
@@ -1889,7 +1898,7 @@ fn (c: mut &Checker) sLet(s: int) {
             c.emit(c.x.decl(c.ct("lxl_slice"), &cn, v.c))
         }
         c.declare(vx)
-        if root != R_FREE { c.freeze(root, c.pg.tm(v.t), &("'" + name + "'"), c.nllVar(vx)) }
+        if root != R_FREE { c.freezeAt(root, &v.path, c.pg.tm(v.t), &("'" + name + "'"), c.nllVar(vx)) }
         return
     }
     if exp >= 0 { v = c.coerce(v, exp, n.line, &what) }
@@ -2135,7 +2144,7 @@ fn (c: mut &Checker) place(e: int): Val {
     if v.gk == sema.D_CONST { c.err(line, "cannot assign to constant " + c.pg.consts[v.gi].name) }
     if v.gk < 0 {
         if !v.mutable { c.immutable(v, line, "assign to") }
-        c.frozen(v.root, FR_ASSIGN, line)
+        c.frozenAt(v.root, &v.path, FR_ASSIGN, line)
         c.checkPending(v.root, &v.path, line, false)
     }
     return v
@@ -2503,7 +2512,7 @@ fn (c: mut &Checker) sFor(s: int) {
     let ecr = if c.isCopy(et) && c.pg.isBorrowClass(et) { c.stmtRoot(c.innerCr(v.root, v.cr, et), mut &h, &hd, n.line) } else { -1 }
     let eroot = if !c.isCopy(et) && isTmpRoot(v.root) { c.stmtRoot(v.root, mut &h, &hd, n.line) } else { v.root }
     c.loopStart(c.snapshot(), false)
-    if v.root >= 0 { c.freeze(v.root, false, "the for loop", -1) }
+    if v.root >= 0 { c.freezeAt(v.root, &v.path, false, "the for loop", -1) }
     if c.isCopy(et) {
         let ct = c.T(et)
         c.emit(c.x.decl(ct, &xn, c.dup(elem, et)))
@@ -3543,7 +3552,7 @@ fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
         if mut1 && !c.pg.tm(v.t) { c.err(n.line, "cannot make a mut slice from a shared slice") }
         base = v.c
     }
-    if mut1 { c.frozen(v.root, FR_MUT, n.line) }
+    if mut1 { c.frozenAt(v.root, &v.path, FR_MUT, n.line) }
     if c.actsOpt(n.b) || c.actsOpt(n.c) { v = c.seq(v) }
     let mark = len(c.cx.pending)
     c.hold(v, HM_SHARED, c.newCid(), n.line)
@@ -4862,7 +4871,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                     ": pass a slice or a borrow (" + (if pm { "mut &" } else { "&" }) + "x)")
             }
             if pm && !c.pg.tm(sv.t) { c.err(line, what + " needs a mut slice, not " + c.tstr(sv.t)) }
-            if pm { c.frozen(sv.root, FR_MUT, line) }
+            if pm { c.frozenAt(sv.root, &sv.path, FR_MUT, line) }
             v = rvAt(sv.c, c.pg.mkSlice(c.pg.ta(sv.t), pm), sv.root, &sv.path)
             if !pm && c.strAsView(c.pg.ta(v.t), c.pg.ta(pt)) { v.t = c.pg.mkSlice(c.pg.ta(pt), false) }
             if !c.pg.unify(c.pg.ta(pt), c.pg.ta(v.t), mut &bind, &tps) {
