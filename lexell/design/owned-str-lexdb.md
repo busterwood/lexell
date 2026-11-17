@@ -52,7 +52,7 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | V | Issue 13: a local string indexed, sliced or used as a left operand is held while the later operands run (`s[f(mut &s)]` is an error); a string global read as an operand that a later operand may change is snapshotted with a clone. Early exits drop innermost first. `design/experiments/q1_split.lxl` imports lexdb and is migrated with it. | 5c4dd44f | lexdb code with `s[f(mut &s)]`-style expressions stops compiling; write `let i = f(mut &s); s[i]` | drop order on early exits from inside a statement with temporaries |
 
-| W | `task.Frozen` is deleted: use `rc T` (step 7). | (this commit) | no: lexdb_time.lxl uses it | none |
+| W | `task.Frozen` is deleted: use `rc T` (step 7). | f92dcdb1 | no: lexdb_time.lxl uses it | none |
 
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
