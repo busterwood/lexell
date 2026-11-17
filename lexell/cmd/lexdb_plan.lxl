@@ -5,6 +5,7 @@
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_catalog"
+import "./lexdb_bind"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -160,10 +161,15 @@ pub fn rowsOf(cm: &Common, key: &str): int {
 // applies them. Slice 3a's cut is a view: lexdb_exec makes it from a
 // planned Sel when asked (physOf), holding no expressions and no run-time
 // state; the Sel, which the plan cache keeps, holds each operator's details.
-// An arm takes its operator's details when step 4 ports it.
+// An arm takes its operator's details when step 4 ports it: a plan the
+// pipeline runs (lexdb_pipe.compile; slice P1, 6.2.3) has a Scan leaf,
+// a Filter and a Project with outputs, their details moved out of the Sel
+// and kept with it (Sel.pipe).
 pub type PPlan = closed {
     Levels(int, []PSub)             // today's level chain (Query.levels: the tables in join order, each by its path and
                                     // join method; semi and anti levels), its number of levels; its subqueries by number
+    Scan(PScan, []PSub)             // one table read by the pipeline; its subqueries
+    Filter(PPlan, []lexdb_bind.BX)  // the conditions a row must meet, bound over the query's columns (moved from Query.cc)
     Result([]PSub)                  // no FROM: one row if the WHERE holds; its subqueries
     Func(str, bool, []PSub)         // a function or VALUES in FROM: its name (Sel.srf), WITH ORDINALITY; its arguments' subqueries
     SetOp(int, bool, int, []PPlan, []PSub)  // lexdb_sql.SET_*, ALL, a recursive CTE's number (-1 none), its parts; the
@@ -172,12 +178,33 @@ pub type PPlan = closed {
     Agg(PPlan, bool)                // GROUP BY and the aggregates; true: grouping sets
     Having(PPlan)
     Window(PPlan)                   // the window calls (over the groups when it aggregates)
-    Project(PPlan)                  // the select list
+    Project(PPlan, []lexdb_bind.BX) // the select list: per output its expression bound over the query's columns (moved
+                                    // from Sel.ox; a column as its slot); [] in a view, where the Sel holds them
     Distinct(PPlan, bool)           // true: DISTINCT ON
     Sort(PPlan, bool)               // ORDER BY: true sorted (a top-N under a LIMIT), false the scan's order
     Lock(PPlan)                     // FOR UPDATE and the like
-    Limit(PPlan, bool)              // LIMIT, OFFSET, FETCH, TOP; true: it stops the scan (no aggregate or sort under it)
+    // LIMIT, OFFSET, FETCH, TOP; true: it stops the scan (no aggregate or
+    // sort under it); the count (-1 none: TOP PERCENT, WITH TIES, or an
+    // OFFSET alone) and the offset (0 none) when the plan was made (a
+    // parameter's: its value then)
+    Limit(PPlan, bool, int, int)
     Match(PPlan)                    // MATCH_RECOGNIZE over the query's rows
+}
+
+// A table the pipeline reads (lexdb_pipe's scan). Its table and path stay
+// in the query's level (Query.levels: EXPLAIN and the row engine read
+// them) until Levels splits into scan and join arms (slice P2).
+pub type PScan = record {
+    pub level: int          // its level in the query
+    pub first: int          // its first column's slot in the query's row
+    pub kinds: []int        // per column of the query: its kind in a batch (lexdb_rows.BK_*; BK_NONE another table's)
+    pub need: []bool        // per column of the table: decoded (all where the statement's names are not known)
+    pub part: bool          // the statement's names known: the columns not needed are not decoded
+    // read in batches when its scans are ranges; false: row by row (a
+    // primary key's point, a primary key read backward, IN lists, an
+    // index's entries' rows where the reading may stop early, an index
+    // read alone that its entries cannot give)
+    pub batch: bool
 }
 
 // A subquery of a query: what it is (lexdb_sql.SUB_*), how the executor
@@ -195,6 +222,8 @@ pub const RUN_LOOKED: int = 4       // not run: its table is a semi or anti leve
 pub fn pSubs(p: &PPlan): &[]PSub {
     match p {
         PPlan.Levels(_, s) { return &s }
+        PPlan.Scan(_, s) { return &s }
+        PPlan.Filter(i, _) { return pSubs(&i) }
         PPlan.Result(s) { return &s }
         PPlan.Func(_, _, s) { return &s }
         PPlan.SetOp(_, _, _, _, s) { return &s }
@@ -202,27 +231,28 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.Agg(i, _) { return pSubs(&i) }
         PPlan.Having(i) { return pSubs(&i) }
         PPlan.Window(i) { return pSubs(&i) }
-        PPlan.Project(i) { return pSubs(&i) }
+        PPlan.Project(i, _) { return pSubs(&i) }
         PPlan.Distinct(i, _) { return pSubs(&i) }
         PPlan.Sort(i, _) { return pSubs(&i) }
         PPlan.Lock(i) { return pSubs(&i) }
-        PPlan.Limit(i, _) { return pSubs(&i) }
+        PPlan.Limit(i, _, _, _) { return pSubs(&i) }
         PPlan.Match(i) { return pSubs(&i) }
     }
 }
 
-// p's leaf: its Levels, Result, Func or SetOp.
+// p's leaf: its Levels, Scan, Result, Func or SetOp.
 pub fn pLeaf(p: &PPlan): &PPlan {
     match p {
+        PPlan.Filter(i, _) { return pLeaf(&i) }
         PPlan.MinMax(i) { return pLeaf(&i) }
         PPlan.Agg(i, _) { return pLeaf(&i) }
         PPlan.Having(i) { return pLeaf(&i) }
         PPlan.Window(i) { return pLeaf(&i) }
-        PPlan.Project(i) { return pLeaf(&i) }
+        PPlan.Project(i, _) { return pLeaf(&i) }
         PPlan.Distinct(i, _) { return pLeaf(&i) }
         PPlan.Sort(i, _) { return pLeaf(&i) }
         PPlan.Lock(i) { return pLeaf(&i) }
-        PPlan.Limit(i, _) { return pLeaf(&i) }
+        PPlan.Limit(i, _, _, _) { return pLeaf(&i) }
         PPlan.Match(i) { return pLeaf(&i) }
         else { return p }
     }

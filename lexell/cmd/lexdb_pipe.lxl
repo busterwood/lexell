@@ -24,7 +24,9 @@ import "./lexdb_rows"
 import "./lexdb_vec"
 import "./lexdb_catalog"
 import "./lexdb_bind"
+import "./lexdb_plan"
 import "./lexdb_access"
+import "./lexdb_store"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -1595,4 +1597,453 @@ pub fn valExtra(v: &Val): int {
         Val.Ival(_) { return 24 }
         else { return 0 }
     }
+}
+
+// An output or ORDER BY key over a batch (outPlan): its node, its kind
+// (BK_*) and source as OutPlan has them.
+pub type ONode = record {
+    pub n: BNode
+    pub kind: int
+    pub src: int
+}
+
+pub fn takeON(c: ONode): BNode {
+    var x = c
+    return replace(mut &x.n, BNode.Const(0, false))
+}
+
+// x, bound (as bCompile takes it), as an output or key over the batch: a
+// column of it (src its column), an integer or boolean expression (src
+// -1), or a compiled expression of any type (9.108: src -2, its values
+// BK_VAL; bGenOf). kinds: per column of the query (base: the batch's
+// first), need: per column of the batch, decoded. None: not one the
+// batches evaluate.
+pub fn outNode(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[ONode] {
+    let c = bCompile(x, cols, kinds, ce, base)
+    if c.isSome() {
+        let cc = c.unwrap()
+        var col = -1
+        match cc.n {
+            BNode.Col(i) { col = i }
+            else {}
+        }
+        if col >= 0 {
+            if col >= len(need) || !need[col] { return None }
+            return Some(ONode{n: BNode.Col(col), kind: kinds[col + base], src: col})
+        }
+        if cc.typ != BT_OTHER { return Some(ONode{kind: if cc.typ == BT_BOOL { BK_BOOL } else { BK_INT }, src: -1, n: takeN(cc)}) }
+    }
+    match bGenOf(x, kinds, base, need, ce) {
+        Some(g) { return Some(ONode{n: BNode.Gen(g), kind: BK_VAL, src: -2}) }
+        None { return None }
+    }
+}
+
+// An output's or key's values (node, src as OutPlan has them) for b's rows
+// idx: an integer or boolean expression's into ex (src -1); a compiled
+// one's (-2) added to b as a column of values, its place in srcs (as a
+// column's own: src >= 0). Err: an expression's error on one of the rows.
+pub fn bOutVal(n: &BNode, src: int, b: mut &Batch, idx: &[]int, ex: mut &[]BVec, srcs: mut &[]int): Result[Unit, DbErr] {
+    if src >= 0 {
+        append(ex, lexdb_rows.bvec(0))
+        append(srcs, src)
+        return Ok(Unit{})
+    }
+    if src == -1 {
+        append(ex, try bEval(n, b, idx))
+        append(srcs, -1)
+        return Ok(Unit{})
+    }
+    var vs: []Val = []
+    match n {
+        BNode.Gen(g) { vs = try bGenVals(&g, b, idx) }
+        else { return Err(e("XX000", "an output's node")) }
+    }
+    append(srcs, bAddVals(b, idx, vs))
+    append(ex, lexdb_rows.bvec(0))
+    return Ok(Unit{})
+}
+
+// x, bound, as a condition over the batch: an integer or boolean kernel,
+// else a compiled expression (Gen: true where its value is true). None: x
+// reads a column the batch does not hold.
+pub fn condNode(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[BNode] {
+    let c = bCompile(x, cols, kinds, ce, base)
+    if c.isSome() {
+        let cc = c.unwrap()
+        if boolLike(cc.typ) { return Some(takeN(cc)) }
+    }
+    match bGenOf(x, kinds, base, need, ce) {
+        Some(g) { return Some(BNode.Gen(g)) }
+        None { return None }
+    }
+}
+
+// ---- programs: the plans the pipeline runs (design/lexdb-layers.md 6.2.3)
+//
+// compile is the support check: it takes a plan whose arms hold their
+// details (lexdb_plan.PPlan: Scan, Filter, Project, Limit) and keeps it
+// when the pipeline runs every operator and expression in it. run runs
+// it. Slice P1a: one table scanned, its rows filtered by its conditions,
+// the outputs made, at most a limit of them given:
+//
+//   Limit? (Sort? (Project (Filter? (Scan))))
+//
+// where the Sort is the scan's order (an ORDER BY its path gives).
+// A scan whose ranges are read in batches gives chunks (a batch and the
+// rows its conditions chose); the outputs are made over the chunk and go
+// to the caller as an OutBatch. A scan of key lookups, or one the plan
+// reads row by row, gives chunks of one row, evaluated by the scalar
+// evaluator (bxEval). A chunk the kernels cannot evaluate (a value its
+// batch cannot hold, an expression's error on one of its rows) is read
+// again row by row from its start, with the rest of its scan, so an
+// error is the one the first failing row gives, its conditions in order
+// before its outputs, as the row engine gives it.
+
+// Runs of a program, and of those the ones whose scan read batches (the
+// tests' look).
+var runs: int = 0
+var batchRuns: int = 0
+
+pub fn runCounts(): []int { return [runs, batchRuns] }
+
+// A plan the pipeline runs.
+pub type Prog = record {
+    pub plan: lexdb_plan.PPlan      // its operators, their details in their arms
+    pub ops: int                    // its operators (run's counts: one each, bottom up)
+}
+
+// p's program; Err(p): an operator or an expression the pipeline does
+// not run (the caller keeps its details: the plan is given back).
+pub fn compile(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+    let n = opsOf(&p, cols)
+    if n < 0 { return Err(p) }
+    return Ok(Prog{plan: p, ops: n})
+}
+
+// The operators of p if the pipeline runs it, else -1.
+fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
+    match p {
+        lexdb_plan.PPlan.Limit(i, stops, n, off) {
+            // a count, no offset (an OFFSET is not streamed: the row engine's)
+            if !stops || n < 0 || off > 0 { return -1 }
+            let k = opsOf(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Sort(i, sorted) {
+            // the scan's order: nothing to do
+            if sorted { return -1 }
+            let k = opsOf(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Project(i, xs) {
+            if len(xs) == 0 { return -1 }
+            match i {
+                lexdb_plan.PPlan.Filter(j, cs) {
+                    match j {
+                        lexdb_plan.PPlan.Scan(sc, subs) {
+                            if !scanRuns(&sc, &subs, cols) || !allRead(&cs, &sc) || !allRead(&xs, &sc) { return -1 }
+                            return 3
+                        }
+                        else { return -1 }
+                    }
+                }
+                lexdb_plan.PPlan.Scan(sc, subs) {
+                    if !scanRuns(&sc, &subs, cols) || !allRead(&xs, &sc) { return -1 }
+                    return 2
+                }
+                else { return -1 }
+            }
+        }
+        else { return -1 }
+    }
+}
+
+// Whether a scan's arm is one run runs: a table's (its query's columns'
+// kinds and the table's need agree), no subqueries (RUN_ONCE's values in
+// the context come with P1b).
+fn scanRuns(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
+    return len(subs) == 0 && len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
+}
+
+// Whether every expression of xs reads only the scan's columns it decodes.
+fn allRead(xs: &[]BX, sc: &lexdb_plan.PScan): bool {
+    for x in xs { if !reads(&x, sc) { return false } }
+    return true
+}
+
+fn reads(x: &BX, sc: &lexdb_plan.PScan): bool {
+    match x {
+        BX.Const(_) { return true }
+        BX.Param(_) { return true }
+        BX.Col(i) {
+            let c = i - sc.first
+            return i < len(sc.kinds) && sc.kinds[i] != BK_NONE && c >= 0 && c < len(sc.need) && sc.need[c]
+        }
+        BX.Agg(_) { return false }
+        BX.Un(_, a) { return reads(&a, sc) }
+        BX.And(a, b) { return reads(&a, sc) && reads(&b, sc) }
+        BX.Or(a, b) { return reads(&a, sc) && reads(&b, sc) }
+        BX.Op(_, a, b) { return reads(&a, sc) && reads(&b, sc) }
+        BX.Cat(a, b, _) { return reads(&a, sc) && reads(&b, sc) }
+        BX.IsNull(a, _) { return reads(&a, sc) }
+        BX.Cast(a, _) { return reads(&a, sc) }
+        BX.Case(cs, _) {
+            for c in cs { if !reads(&c, sc) { return false } }
+            return true
+        }
+        BX.Try(a) { return reads(&a, sc) }
+        BX.Call(_, cs) {
+            for c in cs { if !reads(&c, sc) { return false } }
+            return true
+        }
+    }
+}
+
+// Where a run's scan reads, as its caller found it for the run's
+// parameters: the scans (lexdb_access's: the pipeline passes their keys
+// on, never reads them) and how its index is read.
+pub type Src = record {
+    pub batch: bool                 // in batches: the plan's scan reads batches, and a scan is a range
+    pub scans: []lexdb_access.Scan
+    pub rd: lexdb_access.IxRead     // in batches: how an index is read (9.107)
+    pub index: int                  // the path's index (-1 the primary key) and direction (row by row)
+    pub desc: bool
+    pub keys: []str                 // row by row: a range's primary keys, already read (optimizer 19); [] none
+}
+
+// Runs pg over table t (the plan's Scan's), read as src says, in the
+// context cx, at most cap rows (-1 no cap) and the plan's limit; the
+// rows' bytes and the clock in bud. The rows go to give: a chunk as an
+// OutBatch (its n > 0), or a row read one by one (the OutBatch empty; the
+// row's array used again for the next); it gives false to stop. cnt: per
+// operator, bottom up,
+// its counts (the scan's as EXPLAIN ANALYZE prints a table's). The rows
+// given.
+pub fn run(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+           src: &Src, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+           give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    runs += 1
+    if src.batch { batchRuns += 1 }
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    return runOp(st, txn, &pg.plan, cols, t, src, cx, cap, bud, cnt, give)
+}
+
+// Runs p (Limit, the scan's Sort, Project): at most lim rows (-1 no limit).
+fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+         src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+         give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    let none: []BX = []
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give) }
+        lexdb_plan.PPlan.Sort(i, _) { return runOp(st, txn, &i, cols, t, src, cx, lim, bud, cnt, give) }
+        lexdb_plan.PPlan.Project(j, xs) {
+            match j {
+                lexdb_plan.PPlan.Filter(k, cs) {
+                    match k {
+                        lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &cs, &xs, cols, t, src, cx, lim, bud, cnt, give) }
+                        else {}
+                    }
+                }
+                lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &none, &xs, cols, t, src, cx, lim, bud, cnt, give) }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Err(e("XX000", "the pipeline was given a plan it does not run"))
+}
+
+// The scan, its filter (conds) and the outputs xs, at most lim rows (-1
+// no limit). cnt[0]: the scan's counts (its filter's rows as joined);
+// the last: the rows given.
+fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX,
+           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+           give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    let rel = lexdb_catalog.relOf(t)
+    let last = len(cnt) - 1
+    cnt[0].starts += 1
+    if lim == 0 { return Ok(0) }
+    // the table's columns read (fetch's, getRow's): [] all
+    var need: []bool = []
+    if sc.part { for x in sc.need { append(mut &need, x) } }
+    var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
+    if !src.batch {
+        if len(src.keys) > 0 {
+            // the range's primary keys, already read: its rows, one by one
+            let rr = lexdb_access.rowRead(&rel, &need)
+            for i in 0..len(src.keys) {
+                match try lexdb_access.getRow(st, txn, &rel, &rr, &src.keys[i]) {
+                    Some(r) {
+                        try oneRow(txn, &r, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+                        if sr.stop { return Ok(sr.n) }
+                    }
+                    None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
+                }
+            }
+            return Ok(sr.n)
+        }
+        try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
+        for s in src.scans {
+            var cur = lexdb_access.newCursor()
+            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+            if sr.stop { return Ok(sr.n) }
+        }
+        return Ok(sr.n)
+    }
+    // in batches: the table's columns' kinds, the conditions and outputs
+    // compiled over them (constants in cx: the run's parameters)
+    let base = sc.first
+    var kinds: []int = []
+    for c in t.cols { append(mut &kinds, lexdb_rows.colKind(&c)) }
+    var cn: []BNode = []
+    for c in conds {
+        match condNode(&c, cols, &sc.kinds, cx, base, &sc.need) {
+            Some(n) { append(mut &cn, n) }
+            None { return Err(e("XX000", "a filter the pipeline does not compile")) }
+        }
+    }
+    var nodes: []BNode = []
+    var okinds: []int = []
+    var osrc: []int = []
+    for x in xs {
+        match outNode(&x, cols, &sc.kinds, cx, base, &sc.need) {
+            Some(on) {
+                append(mut &okinds, on.kind)
+                append(mut &osrc, on.src)
+                append(mut &nodes, takeON(on))
+            }
+            None { return Err(e("XX000", "an output the pipeline does not compile")) }
+        }
+    }
+    let needP = lexdb_access.placesNeeded(&rel, &need)
+    var bp = lexdb_rows.projectionOf(kinds, collections.copyOf(&sc.need), &t.slots, lexdb_catalog.rowWidth(t), lexdb_access.placesMissing(&rel), needP)
+    bp.ranges = cRanges(&cn, &bp.kinds, t)
+    let lazy = lazyOf(&bp, t, &cn, -1)
+    let no = len(nodes)
+    try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
+    for s in src.scans {
+        var cur = lexdb_access.newCursor()
+        var rowPath = false
+        var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
+        while !cur.done {
+            let saved = cur.copy()
+            let got = try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, &bp, &src.rd, &lazy,
+                                                  fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(&cn, skip, b, idx) },
+                                                  &lexdb_access.noBar(), mut &spare)
+            if got.isNone() {
+                // a value a batch cannot hold, or a condition's error on one
+                // of its rows: row by row from its start
+                cur = saved
+                rowPath = true
+                break
+            }
+            var pk = got.unwrap()
+            var b = replace(mut &pk.b, lexdb_rows.noRows())
+            let idx = replace(mut &pk.idx, [])
+            let nr = b.n
+            if nr == 0 {
+                spare = b
+                continue
+            }
+            // the outputs' values, before any row of the chunk is given
+            var ex: []BVec = []
+            var srcs: []int = []
+            var failed = false
+            for o in 0..no {
+                match bOutVal(&nodes[o], osrc[o], mut &b, &idx, mut &ex, mut &srcs) {
+                    Ok(_) {}
+                    Err(_) {
+                        failed = true
+                        break
+                    }
+                }
+            }
+            if failed {
+                cur = saved
+                rowPath = true
+                break
+            }
+            cnt[0].batches += 1
+            var take = len(idx)
+            if lim >= 0 && sr.n + take > lim { take = lim - sr.n }
+            // counted as row by row: the rows dropped as read, each kept row as it goes on
+            cnt[0].read += nr - len(idx) + take
+            cnt[0].joined += take
+            try bud.tickN(nr - len(idx) + take)
+            if take > 0 {
+                var ob = lexdb_rows.OutBatch{n: take, kinds: collections.copyOf(&okinds), src: srcs, idx: idx,
+                                            cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
+                sr.n += take
+                cnt[last].joined += take
+                let noRow: []Val = []
+                if !(try give(txn, &ob, &noRow)) { return Ok(sr.n) }
+                // the table's columns back, the outputs' added ones dropped
+                b.cols = replace(mut &ob.cols, [])
+                b.vals = replace(mut &ob.vals, [])
+                while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
+                while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
+            }
+            spare = b
+            if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
+        }
+        if rowPath {
+            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+            if sr.stop { return Ok(sr.n) }
+        }
+    }
+    return Ok(sr.n)
+}
+
+// A scan's rows read one by one: the row it is building (the query's
+// columns), the outputs' array given, the rows given, whether to stop.
+type Scalar = record {
+    row: []Val
+    vals: []Val
+    none: lexdb_rows.OutBatch
+    n: int
+    stop: bool
+}
+
+// The rest of scan s from cur, row by row.
+fn rowsFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, src: &Src, s: &lexdb_access.Scan, need: &[]bool,
+            cur: mut &lexdb_access.Cursor, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget,
+            cnt: mut &[]Counts, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+    while !cur.done {
+        var rows: [][]Val = []
+        try lexdb_access.fetch(st, txn, rel, src.index, src.desc, s, need, cur, mut &rows)
+        for r in rows {
+            try oneRow(txn, &r, sc, conds, xs, cx, lim, bud, cnt, give, sr)
+            if sr.stop { return Ok(Unit{}) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// A row of the table (r) through the filter and the outputs, by the
+// scalar evaluator, as the row engine runs it: counted read, its
+// conditions in order, counted joined, its outputs, given.
+fn oneRow(txn: mut &lexdb_store.Txn, r: &[]Val, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget,
+          cnt: mut &[]Counts, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+    try bud.tick()
+    for i in 0..len(r) { sr.row[sc.first + i] = r[i] }
+    cnt[0].read += 1
+    let noAggs: []Val = []
+    for c in conds { if lexdb_ops.truth(&(try bxEval(&c, &sr.row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
+    cnt[0].joined += 1
+    while len(sr.vals) > 0 { let x = pop(mut &sr.vals) }
+    for x in xs {
+        match x {
+            BX.Col(i) { append(mut &sr.vals, sr.row[i]) }
+            else { append(mut &sr.vals, try bxEval(&x, &sr.row, &noAggs, cx)) }
+        }
+    }
+    cnt[len(cnt) - 1].joined += 1
+    if !(try give(txn, &sr.none, &sr.vals)) {
+        sr.stop = true
+        return Ok(Unit{})
+    }
+    sr.n += 1
+    if lim >= 0 && sr.n >= lim { sr.stop = true }
+    return Ok(Unit{})
 }
