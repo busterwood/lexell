@@ -4385,6 +4385,128 @@ The protocol and dialect modules gained 2 or 3 import lines each.
 - `simple.sh` and `pts.sh` were not run: E0 does not touch the
   per-statement path, beyond names.
 
+#### 6.2.5 E1 as built
+
+Built 2026-11-17 on `redesign/bind` from main fde5d3aa. Scripts and
+outputs are in `~/tpch-w/bind/e1`.
+
+**The hook** (fc35f5ea, in exec first, then moved as it was):
+
+- The pipe's context is `lexdb_pipe.Ctx { now; zone; params; up: Up }`,
+  exec's `CEnv` renamed. Its `seq` went: nothing read it.
+- `Up` is a value record of two functions, exec's to supply (`execUp`):
+  - `entry: EntryFn`, `fn(&str, int): Option[lexdb_lib.LibFn]`: a
+    function's entry where it is not lexdb_lib's. Exec's is `catEntry`:
+    `format_type` and `pg_size_pretty`, which read PostgreSQL's dialect
+    (`lexdb_pgcat`, `lexdb_pg`).
+  - `dialect: DialectFn`: a T-SQL or Oracle function's call
+    (`FnRef.dialect`). Exec's is `callDialectFn` (`lexdb_tsqlfn`,
+    `lexdb_orafn`).
+- `callAt` and `entryAt` take the entry hook as an argument
+  (`entryAt(name, n, up)`: `up`'s entry, else `lexdb_lib.entryOf`). The
+  row evaluator (`eval`), `call` and `fnRefOf` stay in exec and pass
+  `catEntry`; `bxEval` passes `ctx.up.entry`.
+- 6.2.3's sketch had a `callOut` for the catalog and session functions
+  and a nextval hook. They are not needed yet: those functions (and
+  sequences, `sysCall`, `callCat`, `sessCall`, `advCall`) do not bind
+  (`fnRefOf`'s `FN_NONE`), so only `eval` calls them, in exec. The hook
+  grows when the pipe compiles one of them.
+
+**What moved** (a03b7de1, 96abac48), unchanged but for names:
+
+- The evaluator: `Ctx`, `Up`, `EntryFn`, `DialectFn`, `bxEval`,
+  `callRef`, `callAt`, `entryAt`, `unName`, `looksArray`.
+- The budget: `Budget` (a value record: `held`, `aside`, `maxHeld`,
+  `deadline`, `ticks`, `turnEnd`, out of `Run`) with `hold`, `room`,
+  `tick`, `tickN`, `checkTime`; `newBudget`, `memErr`, `TURN_NS`,
+  `rowBytes`, `rowsBytes`.
+- `Counts` (EXPLAIN ANALYZE's per table), with `noCounts`.
+- Exec reaches them as `lexdb_pipe.*`; `Run` holds `bud: Budget`, so
+  `rs.tick()` is `rs.bud.tick()`. `runChild` passes the budget's fields
+  to a child run one by one, as before (the child's `held` is not
+  copied back, as before).
+- Exec keeps `type Ctx = lexdb_pipe.Ctx` (the private alias idiom) and
+  the context's maker `cenvOf(seq)`.
+
+**What was left, and why:**
+
+- `Run` (the rest: 21 lines). It is the row engine's run state: the
+  correlated subqueries' memo (`[]SubRes`), `SubStat`, the CTE cache
+  (`CteCache`), the RIGHT and FULL join `seen` flags, the first level's
+  switch. Moving it would take `SubRes` and the subquery machinery with
+  it, which 6.2's table keeps in exec (`SubRes` reaches the pipe as a
+  value). The pipe's operators take `mut &Budget`, which exec lends as
+  `mut &rs.bud`.
+- `Limits` and `noLimits`. They are the session's SET values for a
+  statement (recursion, MATCH steps, memory, timeout, `lexdb_batch`, the
+  planner mode, autoanalyze, range delete), read by statements and
+  sessions (layer 7). `Run.limit` copies the memory and deadline into the
+  budget.
+- `resBytes` (it reads `SubRes`), `seqEnv` and `SeqEnv` (the session),
+  `fnRefOf` (binding policy: which names are `FN_NONE` reads
+  `isSeqFn`, `isSessFn`, `isAdvFn`), `call`.
+
+**Line counts:**
+
+| | main fde5d3aa | hook | evaluator | budget |
+|---|---:|---:|---:|---:|
+| `lexdb_exec` | 27,989 | 28,016 | 27,874 | 27,782 |
+| `lexdb_pipe` | | | 179 | 291 |
+
+So 207 lines left exec (6.2 estimated ~370; the rest is `Run` and
+`Limits`, above). `lexdb_bind` and `lexdb_lib` changed a comment each.
+`imports.py` gained 6.2.3's rules for `lexdb_pipe`: what it may import,
+`Store` and `Txn` only from the store, no `.sql.`, and only `lexdb_exec`
+imports it (198 edges, then 205). Each rule was checked to fail on a
+planted import.
+
+**Gates:**
+
+- Suite, from a snapshot of each commit (`e7/suite-e1a`, `e1b`, `e1c`):
+  189 passed, imports ok (198 edges, then 205 from the second commit on).
+- Naming battery (`bench/naming`): identical to main's build for each of
+  the three builds (`e1/nam-*.out`).
+- TPC-H, SF1, one run of the last commit's build (`e1/out-e1`): the 22
+  checksums are the baseline's (1744ef99). Against main's stored run
+  (`out-main-fde5d3aa`, the same code as main): total 23,110 to 22,937
+  ms (-0.75%). Every query was within 3%: q1 -3.0%, q3 -2.1%, q20
+  -1.9%; the most slower q22 +2.9% (441 to 454 ms) and q18 +0.8%. No
+  repeat: the total is better, not 1.5% worse.
+- Row path, one pass each, main's build (fde5d3aa) against E1's:
+  - `simple.sh` (pgbench, 4 clients, 10 s): point select 47,493 and
+    48,535 tps (+2.2%), update 9,503 and 9,522 (+0.2%), 3-table join
+    20,195 and 20,525 (+1.6%).
+  - `pts.sh` (20,000 planned point selects, 5 runs, means): wall 727 and
+    716 ms, server CPU 679 and 668 ms (-1.6%).
+  - One pass is within noise; nothing is slower. The entry hook adds an
+    indirect call per `eval` function call (`callAt`), which these do
+    not show.
+
+**Hand-over to P1** (the first pipe operators, 6.2.3):
+
+- The evaluator is in place: the batch kernels that move with P1 call
+  `lexdb_pipe.bxEval` already (`bCompileD`'s constant folding,
+  `bGenVals`), so they lose a prefix. `bCompile*`, `bCondOf`, `outNode*`
+  and `bGenOf` take `&Ctx`; `Mats.ce`, `OutC.ce` and `BGen.ce` hold one.
+- The budget is in place: the batch engine reaches it only as `rs.bud`
+  (`tickN` 11 times, `aside`, `held`, `hold`, `tick`, `maxHeld`, `room`). P1's `run` takes `bud: mut &Budget`; exec
+  passes `mut &rs.bud`.
+- What still ties the batch core to exec (map `pipe1`, at 386438df):
+  `Query` (for the columns' kinds and slots: `bCompile`'s `q`), `Mats`,
+  `BSpec`, `Sel`, `OutPlan` and `ONode`. P1 takes them from the `PPlan`
+  arm instead (6.2.3, "To the plan"). `execmap.py` groups by line
+  ranges, which E0 and E1 shifted: re-base its tables before using the
+  map again.
+- `Ctx` has no subquery results yet. A RUN_ONCE subquery's value must
+  reach it as a value (a scalar's `Val`, IN's set), not as `SubRes`,
+  whose memo and data are the row engine's. This is P1's "RUN_ONCE
+  subqueries as values".
+- `Counts` is per table today (`Run.cnt`, per level). P1's operators
+  need counts per operator for EXPLAIN ANALYZE; `Budget` has room for
+  them (6.2.3's "counts per operator").
+- The q1 placement effect of E0 (6.2.4) is still there; read q1 against
+  main's stored run with that in mind.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
