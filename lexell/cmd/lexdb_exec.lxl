@@ -12721,7 +12721,8 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     var n = 0
     var vals: []Val = []                // one row's values, the array used again for each (9.99)
     let oc = outC(sel, params, seqEnv(st, txn))
-    if batched {
+    // (one table's: the pipeline's, runPipe above)
+    if batched && len(q.levels) > 1 {
         let op = try outPlan(st, txn, sel, &m, params, mut &rs, false)
         if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &oc, each, eachB, mut &rs) }
     }
@@ -12852,12 +12853,6 @@ fn streams(sel: &Sel): bool {
 // (execSelTo) alike, the subqueries run once first and their values given.
 // With it off the row engine runs it, binding per run.
 
-// The pipeline makes the plans it runs (a test's switch: off, the batch
-// drivers and the row engine run them as before slice P1).
-var pipeOn: bool = true
-
-pub fn setPipe(on: bool) { pipeOn = on }
-
 // The pipeline's runs, and those whose scan read batches (the tests' look).
 pub fn pipeRuns(): []int { return lexdb_pipe.runCounts() }
 
@@ -12868,7 +12863,6 @@ fn pipeSel(sel: mut &Sel) { pipeSelIn(sel, true) }
 // pipeSel; rows: a plan of rows too (a SELECT's own; false: a subquery's,
 // a set's part, or a statement's query: only its aggregates, slice P1b).
 fn pipeSelIn(sel: mut &Sel, rows: bool) {
-    if !pipeOn { return }
     for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, false) }
     for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], false) }
     if sel.aggQ {
@@ -13008,8 +13002,8 @@ fn pipeAgg(sel: mut &Sel) {
     var calls: []lexdb_plan.PCall = []
     for sp in sel.specs {
         let f = sp.fname
+        // (the calls it accumulates: lexdb_pipe.compile's)
         if sp.distinct || len(sp.order) > 0 || sp.kind != lexdb_sql.COLL_EXACT { return }
-        if !(f == "count" || f == "sum" || f == "avg" || f == "min" || f == "max") || (sp.star && f != "count") { return }
         var arg: Option[BX] = None
         if !sp.star {
             if len(sp.args) != 1 { return }
@@ -13032,21 +13026,7 @@ fn pipeAgg(sel: mut &Sel) {
     }
     var ps = scanArm(sel, true)
     if len(keys) == 0 {
-        // no GROUP BY: no column is read outside a call (42803), so only
-        // the conditions' and the calls' columns are decoded
-        var used: []bool = array(len(ps.need), false)
-        for c in cs { bxUses(&c, mut &used) }
-        for c in calls {
-            match c.arg {
-                Some(x) { bxUses(&x, mut &used) }
-                None {}
-            }
-            match c.filter {
-                Some(x) { bxUses(&x, mut &used) }
-                None {}
-            }
-        }
-        ps.need = used
+        ps.need = lexdb_plan.callsNeed(len(ps.need), &cs, &calls)
         ps.part = true
     }
     var keep: []bool = array(len(sel.q.cols), false)
@@ -13056,14 +13036,6 @@ fn pipeAgg(sel: mut &Sel) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { unplan(sel, back) }
     }
-}
-
-// The query's columns x reads, set in used.
-fn bxUses(x: &BX, used: mut &[]bool) {
-    var slots: []int = []
-    var par = false
-    let r = lexdb_bind.reslot(x, mut &slots, mut &par)
-    for i in slots { if i >= 0 && i < len(used) { used[i] = true } }
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
@@ -13246,66 +13218,23 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 }
 
 // Where a run of sel's pipeline plan pg reads its table, for the run's
-// parameters and subqueries' results (its path's values): its scans; in
-// batches (the plan's scan reads batches) when a scan is a range, with
-// the index read as bLevelPlan reads it, else row by row as runLevel
-// reads the first level (optimizer 19's switch, decided once a run,
-// alike).
+// parameters and subqueries' results (its path's values): its scans, and
+// optimizer 19's switch, decided once a run as runLevel decides it; the
+// pipeline reads them (lexdb_pipe.srcOf: in batches or row by row).
 fn pipeSrc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
            rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
-    match lexdb_plan.pLeaf(&pg.plan) {
-        lexdb_plan.PPlan.Scan(ps, _) { return srcOf(st, txn, sel, &ps, pg.groups, params, subs, rs) }
-        else { return Err(e("XX000", "a pipeline plan without its scan")) }
-    }
-}
-
-fn srcOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, ps: &lexdb_plan.PScan, groups: bool, params: &[]Val, subs: &[]SubRes,
-         rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
-    let batch = ps.batch
     let q = &sel.q
     let lv = &q.levels[0]
-    let t = &lv.t
     let p = &lv.path
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     // (its session: the time zone its scans' bounds are read in, 9.95)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: subs, cur: &noAggs, seq: seqEnv(st, txn)}
-    var scans = try pathScans(t, p, &env)
+    var scans = try pathScans(&lv.t, p, &env)
     if len(rs.after) > 0 && p.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
-    var src = lexdb_pipe.Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: p.index, desc: p.desc, keys: []}
-    var ranges = false
-    for sc in scans { if !sc.point && !sc.empty { ranges = true } }
-    // (an aggregate's points too, as the batch driver read them)
-    if batch && (ranges || groups) {
-        src.batch = true
-        if p.index >= 0 {
-            src.rd.ix = p.index
-            src.rd.desc = p.desc
-            if ixCovers(lv, p.index) {
-                src.rd.only = true
-                match idxDecOf(t, p.index, &ps.need) {
-                    Some(d) { src.rd.dec = d }
-                    None { return Err(e("XX000", "an index read alone without its decoding")) }
-                }
-            } else {
-                var keys: []str = []
-                let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
-                if how == 1 { scans = [lexdb_access.wholeScan()] }
-                // its range's keys, counted (at most a batch): read once
-                if how == 0 && len(keys) <= lexdb_rows.BROWS && !p.desc {
-                    src.rd.byKeys = true
-                    src.rd.keys = keys
-                }
-            }
-        }
-        src.scans = scans
-        return Ok(src)
-    }
     var keys: []str = []
     let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
-    if how == 1 { scans = [lexdb_access.wholeScan()] } else if how == 0 { src.keys = keys }
-    src.scans = scans
-    return Ok(src)
+    return lexdb_pipe.srcOf(pg, &lv.t, scans, p.index, p.desc, ixCovers(lv, p.index), how, keys)
 }
 
 // sel's rows held (execSel), by its pipeline plan: counted against
@@ -22972,14 +22901,15 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     return Ok(true)
 }
 
-// eachRowB's rows made in batches (outPlan), as runQuery's first level
-// would make them (batchLevel, direct): each batch's rows chosen by the
-// conditions and its expressions' values given to eachB, LIMIT applied in
-// the batch; counted as the row path counts them. A batch with a value its
-// column's batch cannot hold, or on one of whose rows a condition or an
-// output gives an error, ends the batches: the row path reads the rest of
-// that scan from the batch's start, its rows to each (it gives the error
-// only if it gets to that row). The number of rows given.
+// eachRowB's rows of a join made in batches (outPlan), as runQuery's
+// first level would make them (batchLevel, direct): each batch of the
+// first table's rows chosen by its conditions, joined (9.102), and the
+// expressions' values over the joined batch given to eachB, LIMIT applied
+// in the batch. A batch with a value its column's batch cannot hold, or on
+// one of whose rows a condition or an output gives an error, ends the
+// batches: the row path reads the rest of that scan from the batch's
+// start, its rows to each (it gives the error only if it gets to that
+// row). The number of rows given. (One table's: the pipeline's, slice P1.)
 fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, op: &OutPlan,
            oc: &OutC, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
            eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
@@ -23016,25 +22946,22 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
                 spare = b
                 continue
             }
-            let nRead = nr
             let nChosen = len(idx)
-            if op.joined {
-                // the joined rows (9.102): the batch's rows from here on
-                // (the batch's counts so far, for the row path to count it again)
-                var cntB: []lexdb_pipe.Counts = []
-                for c in rs.cnt { append(mut &cntB, c) }
-                let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
-                if got3.isNone() {
-                    rs.cnt = cntB
-                    cur = saved
-                    rowPath = true
-                    break
-                }
-                b = got3.unwrap()
-                var all: []int = withCapacity(b.n)
-                for r in 0..b.n { append(mut &all, r) }
-                idx = all
+            // the joined rows (9.102): the batch's rows from here on
+            // (the batch's counts so far, for the row path to count it again)
+            var cntB: []lexdb_pipe.Counts = []
+            for c in rs.cnt { append(mut &cntB, c) }
+            let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
+            if got3.isNone() {
+                rs.cnt = cntB
+                cur = saved
+                rowPath = true
+                break
             }
+            b = got3.unwrap()
+            var all: []int = withCapacity(b.n)
+            for r in 0..b.n { append(mut &all, r) }
+            idx = all
             // the expressions' values, before any row of the batch is given
             var ex: []BVec = []
             var srcs: []int = []
@@ -23056,29 +22983,17 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             rs.cnt[0].batches += 1
             var take = len(idx)
             if sel.limit >= 0 && n + take > sel.limit { take = sel.limit - n }
-            if op.joined {
-                // (the first table's rows all counted: a LIMIT ends the scan with the batch)
-                rs.cnt[0].read += nRead
-                rs.cnt[0].joined += nChosen
-                try rs.bud.tickN(nRead)
-            } else {
-                rs.cnt[0].read += nr - len(idx) + take
-                rs.cnt[0].joined += take
-                try rs.bud.tickN(nr - len(idx) + take)
-            }
+            // (the first table's rows all counted: a LIMIT ends the scan with the batch)
+            rs.cnt[0].read += nr
+            rs.cnt[0].joined += nChosen
+            try rs.bud.tickN(nr)
             if take > 0 {
-                var ob = OutBatch{n: take, kinds: collections.copyOf(&op.kinds), src: srcs, idx: move(idx),
+                let ob = OutBatch{n: take, kinds: collections.copyOf(&op.kinds), src: srcs, idx: move(idx),
                                   cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
                 n += take
                 if !(try eachB(txn, &ob)) { return Ok(n) }
-                // the table's columns back, the outputs' added ones dropped
-                b.cols = replace(mut &ob.cols, [])
-                b.vals = replace(mut &ob.vals, [])
-                while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
-                while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
             }
             // (a joined batch is the query's columns: not one to use again)
-            if !op.joined { spare = b }
             if sel.limit >= 0 && n >= sel.limit { return Ok(n) }
         }
         while rowPath && !cur.done {

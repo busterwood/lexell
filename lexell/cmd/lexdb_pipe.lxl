@@ -1917,6 +1917,48 @@ pub type Src = record {
     pub keys: []str                 // row by row: a range's primary keys, already read (optimizer 19); [] none
 }
 
+// Where a run of pg reads its table t, from what its caller found for the
+// run's parameters: the path's scans, its index (-1 the primary key) and
+// direction, whether the index holds every column used (covers: read
+// alone), optimizer 19's switch (how: 1 the whole table, 0 the range's
+// primary keys, read, in keys; -1 none). In batches when the plan's scan
+// reads batches and a scan is a range (an aggregate's points too), the
+// index read as the batch engine read it (9.107); else row by row.
+pub fn srcOf(pg: &Prog, t: &lexdb_catalog.Table, scans: []lexdb_access.Scan, index: int, desc: bool, covers: bool, how: int,
+             keys: []str): Result[Src, DbErr] {
+    match lexdb_plan.pLeaf(&pg.plan) {
+        lexdb_plan.PPlan.Scan(ps, _) {
+            var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: []}
+            var ranges = false
+            for s in scans { if !s.point && !s.empty { ranges = true } }
+            src.scans = if how == 1 { [lexdb_access.wholeScan()] } else { scans }
+            if !ps.batch || !(ranges || pg.groups) {
+                if how == 0 { src.keys = keys }
+                return Ok(src)
+            }
+            src.batch = true
+            if index < 0 { return Ok(src) }
+            src.rd.ix = index
+            src.rd.desc = desc
+            if covers {
+                match lexdb_access.idxDecOf(&lexdb_catalog.relOf(t), index, &ps.need) {
+                    Some(d) {
+                        src.rd.only = true
+                        src.rd.dec = d
+                    }
+                    None { return Err(e("XX000", "an index read alone without its decoding")) }
+                }
+            } else if how == 0 && len(keys) <= lexdb_rows.BROWS && !desc {
+                // its range's keys, counted (at most a batch): read once
+                src.rd.byKeys = true
+                src.rd.keys = keys
+            }
+            return Ok(src)
+        }
+        else { return Err(e("XX000", "a pipeline plan without its scan")) }
+    }
+}
+
 // Runs pg over table t (the plan's Scan's), read as src says, in the
 // context cx, at most cap rows (-1 no cap) and the plan's limit; the
 // rows' bytes and the clock in bud. The rows go to give: a chunk as an
