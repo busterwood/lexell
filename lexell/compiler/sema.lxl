@@ -297,6 +297,7 @@ pub type Program = record {
     bcDecl: []int            // declBC per declaration: -1 unknown, 0, 1, 2 (being computed)
     pub ownedStr: bool       // LXL_OWNED_STR=1: str is an owned type (design/owned-str.md, a measurement)
     pub paramReport: bool    // LXL_PARAM_REPORT=1: list the by-value owned parameters only read (check)
+    pub ownedShared: bool    // LXL_OWNED_SHARED=1: task.Shared handles are owned (a measurement, as ownedStr)
 }
 
 // ---------------------------------------------------------------- errors
@@ -406,7 +407,8 @@ pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
         externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
-        ownedStr: os.envOr("LXL_OWNED_STR", "") == "1", paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1"}
+        ownedStr: os.envOr("LXL_OWNED_STR", "") == "1", paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1",
+        ownedShared: os.envOr("LXL_OWNED_SHARED", "") == "1"}
     let none: []int = []
     for p in 0..len(PRIM_NAMES) { pg.intern(TK_PRIM, p, 0, false, &none) }
     pg.intern(TK_SELF, 0, 0, false, &none)
@@ -660,7 +662,7 @@ pub fn (pg: mut &Program) fieldTypes(t: int): []int {
 pub fn (pg: mut &Program) isCopy(t: int): bool { return pg.isCopyAt(t, 0) }
 
 // LXL_OWNED_STR: a type copied today that would be owned with str owned.
-pub fn (pg: mut &Program) soft(t: int): bool { return pg.ownedStr && pg.isCopyLegacy(t) }
+pub fn (pg: mut &Program) soft(t: int): bool { return (pg.ownedStr || pg.ownedShared) && pg.isCopyLegacy(t) }
 
 // A measurement line on stderr: OWNED_STR kind file:line name.
 pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
@@ -672,7 +674,8 @@ pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
 // counted, clone glue for the rest).
 pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
     if pg.types[iface].mod != pg.std || pg.types[iface].name != "Clone" { return false }
-    if pg.tk(t) == TK_TP || pg.methodOf(t, "clone") >= 0 { return false }
+    if pg.tk(t) == TK_TP { return pg.tparams[pg.ta(t)].copy }     // a copy type parameter: cloned by copying
+    if pg.methodOf(t, "clone") >= 0 { return false }
     return pg.cloneable(t)
 }
 
@@ -728,9 +731,12 @@ fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
 // isCopy as if str were counted (LXL_OWNED_STR off): the measurement's "copied today".
 pub fn (pg: mut &Program) isCopyLegacy(t: int): bool {
     let o = pg.ownedStr
+    let sh = pg.ownedShared
     pg.ownedStr = false
+    pg.ownedShared = false
     let r = pg.isCopyAt(t, 0)
     pg.ownedStr = o
+    pg.ownedShared = sh
     return r
 }
 
@@ -745,6 +751,7 @@ fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     }
     let d = pg.ta(t)
     if !pg.types[d].value || pg.types[d].drop >= 0 { return false }
+    if d == pg.shared && pg.ownedShared { return false }
     let fts = pg.fieldTypes(t)
     for ft in fts {
         if !pg.isCopyAt(ft, depth + 1) { return false }
