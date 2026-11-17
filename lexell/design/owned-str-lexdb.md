@@ -98,6 +98,10 @@ forms from the start:
    `cmd/lexdb.lxl` and `tests/lexdb/run/*.lxl`, or a flag to include them.
    Then run it with the lexdb module names
    (`tools/owned_str_sweep.sh lexdb_exec.lxl ...`).
+2b. **Parameters.** `LXL_PARAM_REPORT=1 LXL_OWNED_STR=1 lxlc cmd/lexdb.lxl
+   --emit-c` lists lexdb's by-value parameters that are only read. Declare
+   each one `&T` first: call sites stay as they are, and many worklist sites
+   disappear with them.
 3. **Rules.** The migration rules are in the agent brief, which is in this
    session's scratchpad. They are summarised here because the scratchpad does
    not last:

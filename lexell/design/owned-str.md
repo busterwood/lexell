@@ -70,6 +70,16 @@ implicit borrow makes free at every call site, and callers' `x.clone()` or
 `r.share()` for it can then go. It is the clean-up tool for the compiler
 migration and for lexdb.
 
+Implemented as `LXL_PARAM_REPORT=1` in the checker (2026-11-17): a by-value
+parameter of an owned type (with `LXL_OWNED_STR=1`, also `str` and the types
+holding it) that its function never consumes is listed as
+`file:line: parameter 'p' of f takes T by value but only reads it`. It may
+also list a parameter of a function used as a function value, or one that
+satisfies an interface; the compile shows those. First counts (owned-str
+mode, lexdb excluded): 48 in the compiler, 95 in the library, 490 in tests
+and commands. The IR-based `--borrow-report` and tools/borrow_check.py stay
+until the switch, because the gate's borrow check uses them.
+
 1. Measure (this note, section 4).
 2. Add the new pieces without changing existing behaviour: `rc T`, `share`,
    and the `Clone` interface. Under counted `str`, `clone` on a `str` takes a

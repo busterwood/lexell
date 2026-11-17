@@ -167,6 +167,7 @@ type Var = value record {
     line: int
     moved: bool
     mline: int      // LXL_OWNED_STR: the line of its last move
+    taken: bool     // LXL_PARAM_REPORT: consumed somewhere (moved, or an attempt the owned-str mode logs)
     mctx: str       // and what took it
     broot: int      // the root of a borrow variable, or -1
     cap: int        // a closure's capture: the captured variable, or -1
@@ -1161,7 +1162,7 @@ fn (c: mut &Checker) lookupAt(lvl: int, name: &str, capture: bool): int {
 
 fn (c: mut &Checker) newVar(name: &str, cn: &str, t: int, mutable: bool, kind: int, line: int): int {
     let cx = c.nm(cn)
-    append(mut &c.vars, Var{name: name, c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false, mline: 0, mctx: "",
+    append(mut &c.vars, Var{name: name, c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false, mline: 0, mctx: "", taken: false,
         broot: -1, cap: -1, capmut: false, pjoin: 0, croot: -1, depth: len(c.cx.scopes) - 1, loops: len(c.cx.loops),
         jn: -1, tv: false, blk: len(c.cx.blks) - 1, bi: if len(c.cx.blks) > 0 { c.cx.blks[len(c.cx.blks) - 1].i } else { -1 }})
     return len(c.vars) - 1
@@ -1542,6 +1543,7 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
     let soft = c.soft(v.t)
     if v.vvar >= 0 && !v.viaref && len(v.path) == 0 && c.pg.tk(c.vars[v.vvar].t) != sema.TK_REF {
         let vx = v.vvar
+        c.vars[vx].taken = true
         if c.vars[vx].moved { c.movedErr(vx, line) }
         if soft && len(c.cx.nomove) > 0 {
             c.note("loop", line, &c.vars[vx].name)
@@ -6069,6 +6071,24 @@ fn (c: mut &Checker) startFn(f: int, label: &str, ret: int, env: []int, mod: int
     c.mxs = []
 }
 
+// LXL_PARAM_REPORT (design/owned-str.md, section 3): a by-value parameter of an owned type (with
+// LXL_OWNED_STR, also one that would be owned with str owned) that the function never consumes only
+// reads its argument: it can be &T, and the implicit shared borrow keeps every call site as it is.
+fn (c: mut &Checker) reportParams(f: int, vs: &[]int) {
+    if c.pg.fns[f].isExtern || c.pg.fns[f].name == "drop" { return }
+    for i in 0..len(c.pg.fns[f].params) {
+        let p = c.pg.fns[f].params[i]
+        let v = vs[i]
+        let t = c.vars[v].t
+        let k = c.pg.tk(t)
+        if p.isVar || c.vars[v].taken || k == sema.TK_REF || k == sema.TK_SLICE || k == sema.TK_CLO || k == sema.TK_TP { continue }
+        if c.isCopy(t) && !c.soft(t) { continue }
+        let m = c.pg.fns[f].mod
+        eprintln(c.pg.mods[m].fname + ":" + intToStr(p.line) + ": parameter '" + p.name + "' of " + c.pg.label(f) +
+            " takes " + c.tstr(t) + " by value but only reads it: it can be &" + c.tstr(t))
+    }
+}
+
 pub fn (c: mut &Checker) checkFn(f: int) {
     let m = c.pg.fns[f].mod
     c.startFn(f, &(c.pg.label(f)), c.pg.fns[f].ret, copyInts(&c.pg.fns[f].tps), m)
@@ -6088,6 +6108,7 @@ pub fn (c: mut &Checker) checkFn(f: int) {
             append(mut &c.cx.rsrc, if c.vars[pv].croot >= 0 { c.vars[pv].croot } else { pv })
         }
     }
+    let pvs = copyInts(&vs)
     append(mut &c.cx.scopes, Scope{vars: vs, freezes: []})
     let line = c.pg.fns[f].line
     if c.pg.fns[f].name == "main" && c.pg.fns[f].ownerKind == sema.O_NONE && m == c.pg.main {
@@ -6096,6 +6117,7 @@ pub fn (c: mut &Checker) checkFn(f: int) {
         }
     }
     c.block(c.pg.nd(m, c.pg.fns[f].node).e, false, true)
+    if c.pg.paramReport { c.reportParams(f, &pvs) }
     if !c.cx.dead {
         let ret = c.pg.fns[f].ret
         if ret == sema.T_NEVER {
