@@ -5089,7 +5089,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             sc.names.frames[me].hidden = false
             var sp = try planning
             // (a CTE's use: its body's plan stays in its SubPlan, bound per use today)
-            let spLp = if subs[f.sub].cte >= 0 { lexdb_bind.noPlan() } else { replace(mut &sp.sel.lp, lexdb_bind.noPlan()) }
+            let spLp = if subs[f.sub].cte >= 0 { lexdb_bind.noPlan() } else { takeLp(mut &sp.sel) }
             // outer values: run per row of the tables before it (and cached by them)
             lateral = len(sp.sel.q.refs) > 0
             if lateral && keepsRight(f.join) {
@@ -5154,7 +5154,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 sc.names.frames[me].hidden = false
                 if len(vowner) > 0 { let x = pop(mut &sc.asRole) }
                 var sp = try planning
-                item = replace(mut &sp.sel.lp, lexdb_bind.noPlan())
+                item = takeLp(mut &sp.sel)
                 viewName = t.name.toStr()
                 if len(f.cols) > len(t.cols) {
                     return Err(e("42P10", &("table \"" + f.alias + "\" has " + len(t.cols).toStr() + " columns available but " +
@@ -6805,6 +6805,7 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
         }
         append(mut &texts, inner + " = " + outer)
     }
+    sp.sel.lp = takeLp(mut &sp.sel)
     sp.sel.exprs = outs
     sp.sel.order = []
     sp.sel.sort = false
@@ -14060,11 +14061,16 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, &needNames, needStar, sc, true)
     if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
+    // The select list as resolved: the plan's Project's. The planner reads it
+    // in place; its first rewrite (winMarks, collectAggs, winSlots: rewriteList)
+    // builds the planner's own list from it, and the resolved one goes to
+    // the plan (bx). Where none runs, Sel.exprs is the resolved list and the
+    // Project's is [] (lexdb_bind.lpLent; takeLp fills it when the plan
+    // leaves the Sel).
     var exprs: []Expr = []
     let outs = try lexdb_bind.selectCols(s, &q.cols, mut &sc.names, mut &exprs)
-    // the logical plan's clauses, as resolved (Sel.lp); a function's or
-    // VALUES' arguments are taken by planSub
-    let lpExprs: []Expr = if len(s.srf) > 0 { [] } else { cloneAll(&exprs) }
+    var bx: []Expr = []
+    var xRewritten = false
     var groupBy: []Expr = []
     var groupKinds: []int = []
     for g in s.group {
@@ -14182,7 +14188,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for d in wdefs { append(mut &lpWins, cloneWin(&d)) }
         var mx: []Expr = []
         for x in exprs { append(mut &mx, winMarks(&x)) }
-        exprs = mx
+        rewriteList(mut &exprs, mx, mut &bx, mut &xRewritten)
         var mo: []Expr = []
         for x in order { append(mut &mo, winMarks(&x)) }
         order = mo
@@ -14296,7 +14302,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if aggQ {
         var rx: []Expr = []
         for x in exprs { append(mut &rx, try collectAggs(&x, mut &specs)) }
-        exprs = rx
+        rewriteList(mut &exprs, rx, mut &bx, mut &xRewritten)
         // min, max and DISTINCT compare under their argument's collation (L2)
         for i in 0..len(specs) { if len(specs[i].args) > 0 { specs[i].kind = lexdb_bind.exprKind(&specs[i].args[0], &q.cols, &sc.names) } }
         var ro: []Expr = []
@@ -14430,14 +14436,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if len(wdefs) > 0 {
         var wx: []Expr = []
         for x in exprs { append(mut &wx, winSlots(&x, nAggs)) }
-        exprs = wx
+        rewriteList(mut &exprs, wx, mut &bx, mut &xRewritten)
         var wo: []Expr = []
         for x in order { append(mut &wo, winSlots(&x, nAggs)) }
         order = wo
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
     }
     // FOR UPDATE and the like (9.86): each locked table's key read with
-    // the output, after it
+    // the output, after it (where no rewrite ran, after the resolved list:
+    // the Project's are the first nOut)
     let nOut = len(exprs)
     var locks: []SelLock = []
     for k in 0..len(q.levels) {
@@ -14456,8 +14463,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &desc, false)
         append(mut &nullsFirst, false)
     }
-    let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, lpExprs, &outs, aggQ, lpGroup, len(specs), lpHaving, lpWins, lpOn, lpOrder,
-                     copyBools(&desc), copyBools(&nullsFirst))
+    let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, lpGroup,
+                     len(specs), lpHaving, lpWins, lpOn, lpOrder, copyBools(&desc), copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
@@ -14469,7 +14476,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // The outputs of a SELECT as a logical operator's columns (lexdb_bind.outBCol),
 // each with the typmod a query reading it gives its column (outType's).
 fn outBCols(outs: &[]OutCol): []lexdb_bind.BCol {
-    var out: []lexdb_bind.BCol = []
+    var out: []lexdb_bind.BCol = withCapacity(len(outs))
     for i in 0..len(outs) {
         // (a typmod only from a dialect's wire hint: outType's, as buildQuery's row column has it)
         let mod = if lexdb_syscat.hintCode(outs[i].scale) > 0 { lexdb_bind.tyOf(&outType(&outs[i]), &outs[i].coll, false).mod } else { -1 }
@@ -14478,8 +14485,33 @@ fn outBCols(outs: &[]OutCol): []lexdb_bind.BCol {
     return out
 }
 
+// A planner's rewrite of a list the binder resolved (planSelect's select
+// list): nx, built from xs, becomes xs; the first time, the resolved list
+// goes to keep (for the plan) and done is set.
+fn rewriteList(xs: mut &[]Expr, nx: []Expr, keep: mut &[]Expr, done: mut &bool) {
+    if done {
+        xs = nx
+        return
+    }
+    keep = replace(xs, nx)
+    done = true
+}
+
+// sel's plan, taken out of it (a FROM subquery's, a view's, a set
+// operation's side) or before its lists change (hashSub): whole, the
+// Project's list a copy of the select list where it lends it (lpLent).
+fn takeLp(sel: mut &Sel): lexdb_bind.LPlan {
+    let lp = replace(mut &sel.lp, lexdb_bind.noPlan())
+    let n = lexdb_bind.lpLent(&lp)
+    if n < 0 { return lp }
+    var xs: []Expr = withCapacity(n)
+    for i in 0..n { append(mut &xs, clone(&sel.exprs[i])) }
+    return lexdb_bind.lpRestore(lp, xs)
+}
+
 // A SELECT's logical plan (Sel.lp) over its FROM and WHERE's (base): its
-// clauses as resolved (before the planner's rewrites).
+// clauses as resolved (before the planner's rewrites); exprs [] where the
+// select list is the Sel's (lexdb_bind.lpLent).
 fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]OutCol, aggQ: bool, group: []Expr, nAggs: int,
            having: Option[Expr], wins: []lexdb_sql.WinDef, on: []Expr, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
@@ -14590,8 +14622,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
     let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
-    let lpl = replace(mut &l.lp, lexdb_bind.noPlan())
-    let lpr = replace(mut &r.lp, lexdb_bind.noPlan())
+    let lpl = takeLp(mut &l)
+    let lpr = takeLp(mut &r)
     let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, outBCols(&outs)) }
               else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, outBCols(&outs)) }
     let lp = topPlan(set, s, cloneAll(&order), copyBools(&desc), copyBools(&nullsFirst))
