@@ -14171,8 +14171,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var bh: Option[Expr] = None
     // window calls (9.46): not where rows are chosen or grouped; their
     // definitions merged with the named windows and resolved
+    // (the plan's Window's as resolved: bw, set aside where the planner's
+    // collectAggs pass builds its own, else moved after winPlan has read them)
     var wdefs: []lexdb_sql.WinDef = []
-    var lpWins: []lexdb_sql.WinDef = []
+    var bw: []lexdb_sql.WinDef = []
     if len(s.wins) > 0 {
         if hasWinOpt(&s.where) { return Err(e("42P20", "window functions are not allowed in WHERE")) }
         if hasWinOpt(&s.having) { return Err(e("42P20", "window functions are not allowed in HAVING")) }
@@ -14198,7 +14200,6 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if hasWin(&r.call) { return Err(e("42P20", "window function calls cannot be nested")) }
             append(mut &wdefs, r)
         }
-        for d in wdefs { append(mut &lpWins, cloneWin(&d)) }
         var mx: []Expr = []
         for x in exprs { append(mut &mx, winMarks(&x)) }
         rewriteList(mut &exprs, mx, mut &bx, mut &xRewritten)
@@ -14327,22 +14328,27 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             None {}
         }
         bh = replace(mut &having, rh)
-        // a window's arguments, partitions and order: over the groups, their aggregates in slots
-        for k in 0..len(wdefs) {
-            var call = clone(&wdefs[k].call)
-            match wdefs[k].call {
-                Expr.Call(f, args, star) {
-                    var ca: []Expr = []
-                    for a in args { append(mut &ca, try collectAggs(&a, mut &specs)) }
-                    call = Expr.Call(f, ca, star)
+        // a window's arguments, partitions and order: over the groups, their
+        // aggregates in slots (new definitions; the resolved ones go to bw)
+        if len(wdefs) > 0 {
+            var cw: []lexdb_sql.WinDef = withCapacity(len(wdefs))
+            for d in wdefs {
+                var call: Expr = Expr.Lit(Val.Null)
+                match d.call {
+                    Expr.Call(f, args, star) {
+                        var ca: []Expr = []
+                        for a in args { append(mut &ca, try collectAggs(&a, mut &specs)) }
+                        call = Expr.Call(f, ca, star)
+                    }
+                    else { call = clone(&d.call) }
                 }
-                else {}
+                var wp: []Expr = []
+                for x in d.part { append(mut &wp, try collectAggs(&x, mut &specs)) }
+                var wo: []lexdb_sql.WinOrder = []
+                for o in d.order { append(mut &wo, lexdb_sql.WinOrder{expr: try collectAggs(&o.expr, mut &specs), desc: o.desc, nullsFirst: o.nullsFirst}) }
+                append(mut &cw, lexdb_sql.WinDef{call: call, ref: d.ref, bare: d.bare, part: wp, order: wo, frame: cloneFrame(&d.frame)})
             }
-            wdefs[k].call = call
-            var wp: []Expr = []
-            for x in wdefs[k].part { append(mut &wp, try collectAggs(&x, mut &specs)) }
-            wdefs[k].part = wp
-            for j in 0..len(wdefs[k].order) { wdefs[k].order[j].expr = try collectAggs(&wdefs[k].order[j].expr, mut &specs) }
+            bw = replace(mut &wdefs, cw)
         }
         var gtexts: []str = []
         for g in groupBy { append(mut &gtexts, lexdb_sql.exprText(&g)) }
@@ -14456,6 +14462,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for x in order { append(mut &wo, winSlots(&x, nAggs)) }
         rewriteList(mut &order, wo, mut &bo, mut &oRewritten)
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
+        if len(bw) == 0 { bw = replace(mut &wdefs, []) }
     }
     // FOR UPDATE and the like (9.86): each locked table's key read with
     // the output, after it (where no rewrite ran, after the resolved list:
@@ -14479,7 +14486,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &nullsFirst, false)
     }
     let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, bg,
-                     len(specs), bh, lpWins, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
+                     len(specs), bh, bw, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
                      copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
