@@ -1689,7 +1689,13 @@ pub fn condNode(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base
 //
 //   Limit? (Sort? (Project (Filter? (Scan))))
 //
-// where the Sort is the scan's order (an ORDER BY its path gives).
+// where the Sort is the scan's order (an ORDER BY its path gives); and,
+// slice P1b, an aggregate over the same scan and filter (runAgg, below):
+//
+//   [views] (Agg (Filter? (Scan)))
+//
+// the views (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) the
+// caller's, over the groups.
 // A scan whose ranges are read in batches gives chunks (a batch and the
 // rows its conditions chose); the outputs are made over the chunk and go
 // to the caller as an OutBatch. A scan of key lookups, or one the plan
@@ -1711,6 +1717,10 @@ pub fn runCounts(): []int { return [runs, batchRuns] }
 pub type Prog = record {
     pub plan: lexdb_plan.PPlan      // its operators, their details in their arms
     pub ops: int                    // its operators (run's counts: one each, bottom up)
+    // its top is an aggregate (under the caller's views): its groups go to
+    // the caller (runAgg), which makes HAVING, the outputs, DISTINCT,
+    // ORDER BY and LIMIT of them; else its rows (run)
+    pub groups: bool
 }
 
 // p's program; Err(p): an operator or an expression the pipeline does
@@ -1718,11 +1728,42 @@ pub type Prog = record {
 pub fn compile(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
     let n = opsOf(&p, cols)
     if n < 0 { return Err(p) }
-    return Ok(Prog{plan: p, ops: n})
+    let g = match underViews(&p) {
+        lexdb_plan.PPlan.Agg(_, _, _) { true }
+        else { false }
+    }
+    return Ok(Prog{plan: p, ops: n, groups: g})
+}
+
+// p under the operators its caller runs over an aggregate's groups (the
+// views: HAVING, the select list's, DISTINCT, ORDER BY, a LIMIT that does
+// not stop the scan); p if none.
+fn underViews(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+    match p {
+        lexdb_plan.PPlan.Limit(i, stops, _, _) { if !stops { return underViews(&i) } }
+        lexdb_plan.PPlan.Sort(i, _) { return underViews(&i) }
+        lexdb_plan.PPlan.Distinct(i, _) { return underViews(&i) }
+        lexdb_plan.PPlan.Project(i, xs) { if len(xs) == 0 { return underViews(&i) } }
+        lexdb_plan.PPlan.Having(i) { return underViews(&i) }
+        else {}
+    }
+    return p
 }
 
 // The operators of p if the pipeline runs it, else -1.
 fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
+    match underViews(p) {
+        lexdb_plan.PPlan.Agg(i, sets, pa) {
+            // the plain or hash aggregate over one table's rows (its views
+            // the caller's)
+            if sets { return -1 }
+            match pa {
+                Some(a) { return aggOps(&i, &a, cols) }
+                None { return -1 }
+            }
+        }
+        else {}
+    }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
             // a count, no offset (an OFFSET is not streamed: the row engine's)
@@ -1757,6 +1798,47 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
         }
         else { return -1 }
     }
+}
+
+// The operators of an aggregate a over i if the pipeline runs it (its
+// calls ones it accumulates, every key, argument and FILTER reading the
+// table's decoded columns; the table the query's only columns), else -1.
+fn aggOps(i: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef): int {
+    for c in a.calls {
+        let f = c.fname
+        if !(f == "count" || f == "sum" || f == "avg" || f == "min" || f == "max") || (c.star != c.arg.isNone()) || (c.star && f != "count") { return -1 }
+    }
+    match i {
+        lexdb_plan.PPlan.Filter(j, cs) {
+            match j {
+                lexdb_plan.PPlan.Scan(sc, subs) {
+                    if !scanRuns(&sc, &subs, cols) || !allRead(&cs, &sc) || !aggRead(a, &sc) || sc.first != 0 || len(sc.need) != len(cols) { return -1 }
+                    return 3
+                }
+                else { return -1 }
+            }
+        }
+        lexdb_plan.PPlan.Scan(sc, subs) {
+            if !scanRuns(&sc, &subs, cols) || !aggRead(a, &sc) || sc.first != 0 || len(sc.need) != len(cols) { return -1 }
+            return 2
+        }
+        else { return -1 }
+    }
+}
+
+fn aggRead(a: &lexdb_plan.PAgg, sc: &lexdb_plan.PScan): bool {
+    if !allRead(&a.keys, sc) { return false }
+    for c in a.calls {
+        match c.arg {
+            Some(x) { if !reads(&x, sc) { return false } }
+            None {}
+        }
+        match c.filter {
+            Some(x) { if !reads(&x, sc) { return false } }
+            None {}
+        }
+    }
+    return true
 }
 
 // Whether a scan's arm is one run runs: a table's (its query's columns'
@@ -1868,7 +1950,10 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     var need: []bool = []
     if sc.part { for x in sc.need { append(mut &need, x) } }
     var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
-    if !src.batch {
+    // (an aggregate's scan of points only, given way: row by row)
+    var ranges = false
+    for s in src.scans { if !s.point && !s.empty { ranges = true } }
+    if !src.batch || !ranges {
         if len(src.keys) > 0 {
             // the range's primary keys, already read: its rows, one by one
             let rr = lexdb_access.rowRead(&rel, &need)
@@ -2046,4 +2131,578 @@ fn oneRow(txn: mut &lexdb_store.Txn, r: &[]Val, sc: &lexdb_plan.PScan, conds: &[
     sr.n += 1
     if lim >= 0 && sr.n >= lim { sr.stop = true }
     return Ok(Unit{})
+}
+
+// ---- the aggregate (slice P1b): one table's rows grouped, its calls accumulated
+//
+// Agg (Filter? (Scan)): the plain aggregate (no keys: one group) and the
+// hash aggregate. Its groups go to the caller (runAgg's give), which makes
+// HAVING, the outputs, DISTINCT, ORDER BY and LIMIT of them. Over batches
+// first, numerics as units (BK_DEC, sums in 128 bits); where that gives
+// way (a numeric past its units, an expression the units do not compile)
+// again with numerics as values; where batches give way (a value a batch
+// cannot hold, an expression the kernels do not compile, a text key not
+// a text), row by row with the scalar evaluator, as the row engine
+// groups. Each from the start: the groups are given at the end, none yet.
+// An expression's error in a batch is raised from the batch (its lowest
+// row of the first failing step, design/lexdb-layers.md 4.4.1).
+
+// Grouped runs over batches, those that read numerics as units, and the
+// unit runs that gave way to values (the tests' look).
+var groupRuns: int = 0
+var decRuns: int = 0
+var decSpills: int = 0
+
+pub fn aggCounts(): []int { return [decRuns, decSpills, groupRuns] }
+
+// A call's state in a group, as the row engine's accumulator holds it:
+// the values counted, their sum (sum, avg), their minimum or maximum.
+pub type PAcc = record {
+    pub n: int
+    pub sum: Val
+    pub val: Val
+}
+
+fn noAcc(): PAcc { return PAcc{n: 0, sum: Val.Null, val: Val.Null} }
+
+// Runs an aggregate program (pg.groups) over table t, read as src says,
+// in the context cx. Each group goes to give after the last row is read:
+// its first row (the query's columns; those not read after grouping
+// NULL, in batches) and its calls' states. room: the bytes the groups may
+// hold (-1 no limit), counted as the row engine and the batch driver
+// counted them; past it max_statement_mem's error. The bytes counted.
+pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+              src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+              give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
+    runs += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    let none: []BX = []
+    match underViews(&pg.plan) {
+        lexdb_plan.PPlan.Agg(i, _, pa) {
+            match pa {
+                Some(a) {
+                    match i {
+                        lexdb_plan.PPlan.Filter(j, cs) {
+                            match j {
+                                lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &cs, &a, cols, t, src, cx, room, bud, cnt, give) }
+                                else {}
+                            }
+                        }
+                        lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, cx, room, bud, cnt, give) }
+                        else {}
+                    }
+                }
+                None {}
+            }
+        }
+        else {}
+    }
+    return Err(e("XX000", "the pipeline was given a plan it does not run"))
+}
+
+// The aggregate a over scan sc filtered by conds: units, values, rows.
+fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
+          cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+          give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
+    // the counts so far: each try counts from the start again
+    let c0 = cnt[0]
+    if src.batch {
+        batchRuns += 1
+        var usedDec = false
+        var values = false
+        match aggBatches(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give, true, mut &usedDec) {
+            Ok(x) {
+                match x {
+                    Some(n) { return Ok(n) }
+                    None {}
+                }
+                cnt[0] = c0
+                // (no numeric read as units: the values' try is the same)
+                values = usedDec
+            }
+            Err(x) {
+                if !isSpill(&x) { return Err(x) }
+                cnt[0] = c0
+                decSpills += 1
+                values = true
+            }
+        }
+        if values {
+            var none = false
+            match try aggBatches(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give, false, mut &none) {
+                Some(n) { return Ok(n) }
+                None { cnt[0] = c0 }
+            }
+        }
+    }
+    return aggRows(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give)
+}
+
+// The aggregate over the scan's batches; dec: numeric(p, s) columns as
+// units (usedDec set when one is read so). None: the batches give way
+// (nothing given).
+fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
+              cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+              give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr], dec: bool, usedDec: mut &bool): Result[Option[int], DbErr] {
+    let rel = lexdb_catalog.relOf(t)
+    // the table's columns' kinds (the query's: they are its only ones)
+    var kinds: []int = []
+    for c in t.cols { append(mut &kinds, if dec { lexdb_rows.decColKind(&c) } else { lexdb_rows.colKind(&c) }) }
+    let needCol = collections.copyOf(&sc.need)
+    if dec { for i in 0..len(kinds) { if needCol[i] && lexdb_rows.isDecKind(kinds[i]) { usedDec = true } } }
+    // the conditions, the group keys and the calls over batches
+    var bconds: []BNode = []
+    for c in conds {
+        let got = bCompileD(&c, cols, &kinds, cx, 0, dec)
+        if got.isNone() { return Ok(None) }
+        let cc = got.unwrap()
+        if !boolLike(cc.typ) { return Ok(None) }
+        append(mut &bconds, takeN(cc))
+    }
+    var keys: []BComp = []
+    for x in a.keys {
+        let got = bCompileD(&x, cols, &kinds, cx, 0, dec)
+        if got.isNone() { return Ok(None) }
+        let cc = got.unwrap()
+        if cc.typ == BT_OTHER {
+            match cc.n {
+                BNode.Col(_) {}
+                else { return Ok(None) }
+            }
+        }
+        append(mut &keys, cc)
+    }
+    var specs: []BSpec = []
+    for c in a.calls {
+        let f = c.fname
+        let kind = if c.star { BA_STAR } else if f == "count" { BA_COUNT } else if f == "sum" { BA_SUM } else if f == "avg" { BA_AVG }
+                   else if f == "min" { BA_MIN } else { BA_MAX }
+        var arg: Option[BNode] = None
+        var vcol = -1
+        var dsc = -1
+        match c.arg {
+            Some(bx) {
+                let got = bCompileD(&bx, cols, &kinds, cx, 0, dec)
+                if got.isNone() { return Ok(None) }
+                let cc = got.unwrap()
+                if kind != BA_COUNT && isDecT(cc.typ) {
+                    // a numeric as units: its sum in 128 bits, its min or max as units
+                    dsc = decSc(cc.typ)
+                } else if kind != BA_COUNT && cc.typ != BT_INT {
+                    // min or max of a column of values, sum or avg of a numeric one
+                    let vc = bValCol(&bx, &kinds, 0)
+                    if vc < 0 { return Ok(None) }
+                    let numeric = cols[vc].typ.oid == lexdb_sql.OID_NUMERIC
+                    if !(kind == BA_MIN || kind == BA_MAX || ((kind == BA_SUM || kind == BA_AVG) && numeric)) { return Ok(None) }
+                    vcol = vc
+                }
+                arg = Some(takeN(cc))
+            }
+            None {}
+        }
+        var filt: Option[BNode] = None
+        match c.filter {
+            Some(fx) {
+                let got = bCompileD(&fx, cols, &kinds, cx, 0, dec)
+                if got.isNone() { return Ok(None) }
+                let cc = got.unwrap()
+                if !boolLike(cc.typ) { return Ok(None) }
+                filt = Some(takeN(cc))
+            }
+            None {}
+        }
+        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol, dsc: dsc})
+    }
+    // where each column used is in a stored row
+    let needP = lexdb_access.placesNeeded(&rel, &needCol)
+    var bp = lexdb_rows.projectionOf(collections.copyOf(&kinds), collections.copyOf(&needCol), &t.slots, lexdb_catalog.rowWidth(t),
+                                     lexdb_access.placesMissing(&rel), needP)
+    bp.ranges = cRanges(&bconds, &bp.kinds, t)
+    // A group's first row keeps only the columns read after grouping (its
+    // outputs, HAVING, ORDER BY): the others, an aggregate's argument among
+    // them, are not copied for each group (q18's 1.5M groups). nf values a
+    // group in fv.
+    var fcols: []int = []
+    for i in 0..len(bp.needCol) { if bp.needCol[i] && i < len(a.keep) && a.keep[i] { append(mut &fcols, i) } }
+    let nf = len(fcols)
+    let ns = len(specs)
+    var fv: []Val = []
+    var ngroups = 0
+    // per call and group: its count, sum and minimum or maximum (integers
+    // or units), its value (vcol), its sum as units in 128 bits (dsc)
+    var an: [][]int = []
+    var asum: [][]int = []
+    var amm: [][]int = []
+    var aval: [][]Val = []
+    var adec: [][]i128 = []
+    for i in 0..ns {
+        append(mut &an, [])
+        append(mut &asum, [])
+        append(mut &amm, [])
+        append(mut &aval, [])
+        append(mut &adec, [])
+    }
+    var byInt: Map[int, int] = newMap()
+    var byKey: Map[str, int] = newMap()
+    var nullGroup = -1
+    let oneKey = len(keys) == 1 && keys[0].typ != BT_OTHER
+    // The table read in primary key order, grouped by the key's first
+    // column: each group's rows come together (PostgreSQL's GroupAggregate
+    // over presorted input, nodeAgg.c), so a row is in the group before it
+    // or starts one; no map of the groups. (q18's subquery: lineitem by
+    // l_orderkey.)
+    var sorted = false
+    if oneKey && src.index < 0 && !src.desc && len(src.scans) == 1 && len(t.pk) > 0 {
+        match keys[0].n {
+            BNode.Col(c) { sorted = c == t.pk[0] }
+            else {}
+        }
+    }
+    var lastKey = 0
+    var lastG = -1
+    // one key a text or varchar column: its groups by its text, not by its
+    // encoded key
+    var textCol = -1
+    if len(keys) == 1 && keys[0].typ == BT_OTHER {
+        match keys[0].n {
+            BNode.Col(c) {
+                let o = cols[c].typ.oid
+                if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { textCol = c }
+            }
+            else {}
+        }
+    }
+    var byText: Map[str, int] = newMap()
+    var added = 0
+    var nRead = 0
+    var nJoined = 0
+    var nBatches = 0
+    for sj in 0..len(src.scans) {
+        var cur = lexdb_access.newCursor()
+        var spare = lexdb_rows.noRows()            // the last batch read, used again (lexdb_rows.reuse)
+        while !cur.done {
+            let got = try lexdb_access.fillLevel(st, txn, &rel, &src.rd, &src.scans[sj], sc.part, mut &cur, &bp, mut &spare)
+            if got.isNone() { return Ok(None) }
+            var b = got.unwrap()
+            let nr = b.n
+            if nr == 0 { continue }
+            try bud.tickN(nr)
+            nRead += nr
+            nBatches += 1
+            // WHERE: the rows chosen, narrowed condition by condition
+            var idx: []int = withCapacity(nr)
+            for r in 0..nr { append(mut &idx, r) }
+            for c in bconds {
+                if len(idx) == 0 { break }
+                let pos = try bTrue(&c, &b, &idx)
+                var next: []int = []
+                for j in pos { append(mut &next, idx[j]) }
+                idx = next
+            }
+            nJoined += len(idx)
+            let nc = len(idx)
+            if nc == 0 {
+                spare = b
+                continue
+            }
+            // each row's group, new groups made in the rows' order
+            var gid: []int = array(nc, 0)
+            if len(keys) == 0 {
+                if ngroups == 0 {
+                    let cost = bFirstVals(&b, idx[0], &bp.kinds, &fcols, mut &fv) + 64 * (ns + 1)
+                    ngroups += 1
+                    added += cost
+                    if room >= 0 && added > room { return Err(memErr(bud.maxHeld)) }
+                    for i in 0..ns {
+                        append(mut &an[i], 0)
+                        append(mut &asum[i], 0)
+                        append(mut &amm[i], 0)
+                        append(mut &aval[i], Val.Null)
+                        append(mut &adec[i], i128(0))
+                    }
+                }
+            } else {
+                var kvs: []BVec = []
+                for k in keys { append(mut &kvs, try bEval(&k.n, &b, &idx)) }
+                for j in 0..nc {
+                    var g = -1
+                    var klen = 9
+                    if oneKey {
+                        if kvs[0].nul[j] {
+                            g = nullGroup
+                        } else if sorted {
+                            if lastG >= 0 && kvs[0].v[j] == lastKey { g = lastG }
+                        } else {
+                            match byInt.get(&kvs[0].v[j]) {
+                                Some(x) { g = x }
+                                None {}
+                            }
+                        }
+                    }
+                    var kstr = ""
+                    var ktext = ""
+                    if textCol >= 0 {
+                        let r = idx[j]
+                        if b.cols[textCol].nul[r] {
+                            g = nullGroup
+                        } else {
+                            match b.vals[textCol][r] {
+                                Val.Text(x) { ktext = x }
+                                else { return Ok(None) }
+                            }
+                            klen = len(ktext)
+                            match byText.get(&ktext) {
+                                Some(x) { g = x }
+                                None {}
+                            }
+                        }
+                    } else if !oneKey {
+                        var kb = newStrBuf()
+                        for ki in 0..len(keys) { lexdb_access.encIdxPart(mut &kb, &bKeyVal(&keys[ki], &kvs[ki], j, &b, idx[j])) }
+                        kstr = kb.toStr()
+                        klen = len(kstr)
+                        match byKey.get(&kstr) {
+                            Some(x) { g = x }
+                            None {}
+                        }
+                    }
+                    if g < 0 {
+                        g = ngroups
+                        ngroups += 1
+                        let cost = bFirstVals(&b, idx[j], &bp.kinds, &fcols, mut &fv) + 64 * (ns + 1) + klen
+                        added += cost
+                        if room >= 0 && added > room { return Err(memErr(bud.maxHeld)) }
+                        for i in 0..ns {
+                            append(mut &an[i], 0)
+                            append(mut &asum[i], 0)
+                            append(mut &amm[i], 0)
+                            append(mut &aval[i], Val.Null)
+                            append(mut &adec[i], i128(0))
+                        }
+                        if textCol >= 0 {
+                            if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
+                        } else if oneKey {
+                            if kvs[0].nul[j] {
+                                nullGroup = g
+                            } else if sorted {
+                                lastKey = kvs[0].v[j]
+                                lastG = g
+                            } else {
+                                byInt.put(kvs[0].v[j], g)
+                            }
+                        } else {
+                            byKey.put(kstr, g)
+                        }
+                    }
+                    gid[j] = g
+                }
+            }
+            // the calls: per call its rows (FILTER), its argument's values, one loop
+            for si in 0..ns {
+                let sp = &specs[si]
+                match sp.filter {
+                    Some(fx) {
+                        let pos = try bTrue(&fx, &b, &idx)
+                        var r2: []int = []
+                        var g2: []int = []
+                        for j in pos {
+                            append(mut &r2, idx[j])
+                            append(mut &g2, gid[j])
+                        }
+                        if sp.vcol >= 0 { try bAccVal(sp, &b, &r2, &g2, mut &an[si], mut &aval[si]) }
+                        else if sp.dsc >= 0 && (sp.kind == BA_SUM || sp.kind == BA_AVG) { try bAccDec(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &adec[si]) }
+                        else { try bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
+                    }
+                    None {
+                        if sp.vcol >= 0 { try bAccVal(sp, &b, &idx, &gid, mut &an[si], mut &aval[si]) }
+                        else if sp.dsc >= 0 && (sp.kind == BA_SUM || sp.kind == BA_AVG) { try bAccDec(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &adec[si]) }
+                        else { try bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
+                    }
+                }
+            }
+            spare = b
+        }
+    }
+    if dec {
+        var anyDec = false
+        for sp in specs { if sp.dsc >= 0 { anyDec = true } }
+        for i in 0..len(bp.kinds) { if bp.needCol[i] && lexdb_rows.isDecKind(bp.kinds[i]) { anyDec = true } }
+        if anyDec { decRuns += 1 }
+    }
+    groupRuns += 1
+    cnt[0].starts += 1
+    cnt[0].read += nRead
+    cnt[0].joined += nJoined
+    cnt[0].batches += nBatches
+    cnt[len(cnt) - 1].joined += ngroups
+    // the groups, their states as the row engine's accumulators hold them
+    var first: []Val = array(len(cols), Val.Null)
+    var accs: []PAcc = []
+    for g in 0..ngroups {
+        for fi in 0..nf { first[fcols[fi]] = fv[g * nf + fi] }
+        while len(accs) > 0 { let gone = pop(mut &accs) }
+        for si in 0..ns {
+            let kd = specs[si].kind
+            var acc = noAcc()
+            acc.n = an[si][g]
+            if an[si][g] > 0 && specs[si].vcol >= 0 {
+                if kd == BA_SUM || kd == BA_AVG { acc.sum = aval[si][g] }
+                if kd == BA_MIN || kd == BA_MAX { acc.val = aval[si][g] }
+            } else if an[si][g] > 0 && specs[si].dsc >= 0 {
+                // as the row engine's Decimal sum of the same values (display scale dsc)
+                let ds = specs[si].dsc
+                if kd == BA_SUM || kd == BA_AVG {
+                    match lexdb_vec.sumVal(adec[si][g], ds) {
+                        Some(v) { acc.sum = v }
+                        None { return Err(lexdb_ops.decErr()) }
+                    }
+                }
+                if kd == BA_MIN || kd == BA_MAX { acc.val = lexdb_rows.decVal(amm[si][g], ds) }
+            } else if an[si][g] > 0 {
+                if kd == BA_SUM || kd == BA_AVG { acc.sum = Val.Int(asum[si][g]) }
+                if kd == BA_MIN || kd == BA_MAX { acc.val = Val.Int(amm[si][g]) }
+            }
+            append(mut &accs, acc)
+        }
+        try give(&first, &accs)
+    }
+    return Ok(Some(added))
+}
+
+// A row-by-row aggregate's state: the query's row, the groups by their
+// keys' encoding, each one's first row, and its calls' states (ns a
+// group); the bytes counted.
+type RowGroups = record {
+    row: []Val
+    index: Map[str, int]
+    firsts: [][]Val
+    accs: []PAcc
+    added: int
+}
+
+// The aggregate over the scan's rows evaluated one by one, as the row
+// engine groups them (addToGroup, accumulate): the scan and its filter
+// read as runScan reads them (in batches where it can, its conditions
+// over the batch, as the row engine's first level reads them:
+// batchLevel), each row it keeps grouped and accumulated by the scalar
+// evaluator.
+fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
+           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+           give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
+    // the scan's outputs: its columns decoded, at their slots
+    var xs: []BX = []
+    var slots: []int = []
+    for i in 0..len(sc.need) {
+        if sc.need[i] {
+            append(mut &xs, BX.Col(sc.first + i))
+            append(mut &slots, sc.first + i)
+        }
+    }
+    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], added: 0}
+    let maxHeld = bud.maxHeld
+    var vals: []Val = []
+    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+        if ob.n == 0 {
+            for k in 0..len(slots) { rg.row[slots[k]] = r[k] }
+            try groupRow(mut &rg, a, cx, room, maxHeld)
+            return Ok(true)
+        }
+        for j in 0..ob.n {
+            obRow(ob, j, mut &vals)
+            for k in 0..len(slots) { rg.row[slots[k]] = vals[k] }
+            try groupRow(mut &rg, a, cx, room, maxHeld)
+        }
+        return Ok(true)
+    })
+    let ns = len(a.calls)
+    let ng = len(rg.firsts)
+    var accs: []PAcc = []
+    for g in 0..ng {
+        while len(accs) > 0 { let gone = pop(mut &accs) }
+        for i in 0..ns { append(mut &accs, replace(mut &rg.accs[g * ns + i], noAcc())) }
+        try give(&rg.firsts[g], &accs)
+    }
+    return Ok(rg.added)
+}
+
+// The row (rg.row) into its group, by its keys' values (a new group's
+// bytes counted as the row engine counts them; past room
+// max_statement_mem's error), then each call's state.
+fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHeld: int): Result[Unit, DbErr] {
+    let noAggs: []Val = []
+    let ns = len(a.calls)
+    var g = 0
+    if len(a.keys) > 0 {
+        var kb = newStrBuf()
+        for k in a.keys { lexdb_access.encIdxPart(mut &kb, &(try bxEval(&k, &rg.row, &noAggs, cx))) }
+        let key = kb.toStr()
+        match rg.index.get(&key) {
+            Some(x) { g = x }
+            None {
+                g = len(rg.firsts)
+                rg.added += rowBytes(&rg.row) + 64 * (ns + 1) + len(key)
+                if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
+                rg.index.put(key, g)
+                append(mut &rg.firsts, collections.copyOf(&rg.row))
+                for i in 0..ns { append(mut &rg.accs, noAcc()) }
+            }
+        }
+    } else if len(rg.firsts) == 0 {
+        append(mut &rg.firsts, collections.copyOf(&rg.row))
+        for i in 0..ns { append(mut &rg.accs, noAcc()) }
+    }
+    for i in 0..ns { try accOne(&a.calls[i], mut &rg.accs[g * ns + i], &rg.row, cx) }
+    return Ok(Unit{})
+}
+
+// Adds a row to a call's state, as the row engine's accumulate: its
+// FILTER, then its argument's value (a NULL not counted); a sum by its
+// type's addition (avg of reals in double precision, squared to overflow
+// where PostgreSQL's float8_accum does); of equal values the last kept as
+// the minimum or maximum (PostgreSQL's numeric_smaller).
+fn accOne(c: &lexdb_plan.PCall, acc: mut &PAcc, row: &[]Val, cx: &Ctx): Result[Unit, DbErr] {
+    let noAggs: []Val = []
+    match c.filter {
+        Some(f) { if lexdb_ops.truth(&(try bxEval(&f, row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
+        None {}
+    }
+    if c.star {
+        acc.n += 1
+        return Ok(Unit{})
+    }
+    let v = match c.arg {
+        Some(x) { try bxEval(&x, row, &noAggs, cx) }
+        None { Val.Null }
+    }
+    if lexdb_ops.isNull(&v) { return Ok(Unit{}) }
+    let f = c.fname
+    if f == "sum" || f == "avg" {
+        let w = if f == "avg" && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
+        if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
+        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &w) }
+    } else if f == "min" {
+        if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) <= 0 { acc.val = v }
+    } else if f == "max" {
+        if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) >= 0 { acc.val = v }
+    }
+    acc.n += 1
+    return Ok(Unit{})
+}
+
+// Row j of an OutBatch, into out.
+pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
+    while len(out) > 0 { let x = pop(out) }
+    let r = ob.idx[j]
+    for o in 0..len(ob.kinds) {
+        let k = ob.kinds[o]
+        let c = ob.src[o]
+        if c < 0 {
+            let x = &ob.ex[o]
+            append(out, if x.nul[j] { Val.Null } else if k == BK_BOOL { Val.Bool(x.v[j] == 1) } else { Val.Int(x.v[j]) })
+        } else if ob.cols[c].nul[r] {
+            append(out, Val.Null)
+        } else {
+            append(out, if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) } else { ob.vals[c][r] })
+        }
+    }
 }
