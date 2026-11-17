@@ -622,7 +622,12 @@ parameter is a `std.Where` may leave that argument out: the compiler passes
 the call's location (section 15).
 
 An argument that already has a borrow type is passed to a parameter of a
-borrow type as it is: `f(r)` and `f(&r)` both pass the borrow `r`. A `mut &T`
+borrow type as it is: `f(r)` and `f(&r)` both pass the borrow `r`. An argument
+that is not a borrow, passed to a shared borrow parameter `&T`, is borrowed
+as if written `&x`: `show(name)` borrows `name`, and `show(make())` borrows a
+temporary that lives to the end of the statement. A `mut &T` parameter still
+needs `mut &x` written, because a mutable borrow changes what the caller may
+do with `x`. `print`, `println`, `eprint` and `eprintln` take `&T`. A `mut &T`
 may be passed where `&T` is expected. A copy-type argument is copied when it is
 evaluated, so `f(mut &n, n.v)` does not conflict (rule 10.3 concerns borrows
 and moves only).
