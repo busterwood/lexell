@@ -1482,6 +1482,41 @@ fn (c: mut &Checker) hold(v: Val, m: int, cid: int, line: int) {
 
 fn hm(m: bool): int { return if m { HM_MUT } else { HM_SHARED } }
 
+// SPEC 9.1 (design/owned-str.md, issue 3): a field moved out of a temporary record (f().x). The
+// temporary is taken apart as a destructuring let would: the field is moved out, the other fields
+// are dropped, a box is freed, and the temporary is no longer dropped at the end of the statement.
+// The C of the field, or -1 if v is not a direct field of such a temporary.
+fn (c: mut &Checker) moveOutOfTmp(v: Val): int {
+    let ti = -2 - v.root
+    if ti < 0 || ti >= len(c.tmps) || !c.tmps[ti].live { return -1 }
+    let tt = c.tmps[ti].t
+    if c.pg.tk(tt) != sema.TK_INST || c.pg.isBorrowClass(tt) { return -1 }
+    let d = c.pg.ta(tt)
+    if c.pg.types[d].form != sx.F_RECORD || c.pg.types[d].drop >= 0 { return -1 }
+    // the path names one field (a boxed record field's path ends in a separator)
+    var fname = v.path.clone()
+    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1] }
+    for k in 0..len(fname) {
+        if strByte(fname, k) == 0 { return -1 }
+    }
+    let fi = c.fieldIndex(d, &fname)
+    if fi < 0 { return -1 }
+    let env = c.pg.declEnv(tt)
+    let sep = if c.pg.types[d].value { "." } else { "->" }
+    let base = c.tmps[ti].c
+    let n = c.fresh("mv")
+    c.emit(c.x.decl(c.T(v.t), &n, c.x.member(base, &sep, &("f_" + c.pg.types[d].fields[fi].name))))
+    var i = len(c.pg.types[d].fields) - 1
+    while i >= 0 {
+        let f = c.pg.types[d].fields[i]
+        if i != fi { c.dropc(c.x.member(base, &sep, &("f_" + f.name)), c.pg.subst(f.ty, &env)) }
+        i -= 1
+    }
+    if !c.pg.types[d].value { c.emitx(c.x.call("rt_free", [base])) }
+    c.tmps[ti].live = false
+    return c.nm(&n)
+}
+
 // consume, recording what takes the value for LXL_OWNED_STR's notes.
 fn (c: mut &Checker) consumeAs(what: &str, v: Val, line: int): int {
     let o = c.octx
@@ -1532,6 +1567,10 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
         c.checkPending(vx, "", line, true)
         c.vars[vx].moved = true
         return v.c
+    }
+    if !v.viaref && v.gk < 0 && isTmpRoot(v.root) {
+        let mv = c.moveOutOfTmp(v)
+        if mv >= 0 { return mv }
     }
     let hasName = v.root >= 0 || v.root <= -2
     let name = c.rootName(v.root, "")

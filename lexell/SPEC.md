@@ -797,9 +797,12 @@ it. The source then has no value until it is assigned again.
   only in the record's module. `var P{...} = e` makes the variables
   assignable. Unbound fields are dropped at once, in reverse declaration
   order; the bound ones are bound in the order of the pattern.
-- Only a whole local variable or by-value parameter can be moved out of.
-  Moving out of a field, an element, a borrow or a global is an error; use
-  `replace`, `swap` or `pop`.
+- Only a whole local variable or by-value parameter can be moved out of,
+  with one exception: a field of a temporary record (`make().name`). That
+  temporary is taken apart as by `let P{name} = make()`: the field is moved
+  out, the other fields are dropped at once, and the temporary is not dropped
+  again at the end of the statement. Moving out of a field of a variable, an
+  element, a borrow or a global is an error; use `replace`, `swap` or `pop`.
 - Where the paths of an `if` (with or without `else`), a `match`, or an `if` or
   `match` expression join, a variable moved on some of the paths that reach the
   join but not on others is dropped at the end of each path that did not move
