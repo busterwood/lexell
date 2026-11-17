@@ -14065,8 +14065,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // in place; its first rewrite (winMarks, collectAggs, winSlots: rewriteList)
     // builds the planner's own list from it, and the resolved one goes to
     // the plan (bx). Where none runs, Sel.exprs is the resolved list and the
-    // Project's is [] (lexdb_bind.lpLent; takeLp fills it when the plan
-    // leaves the Sel).
+    // Project's is [] (lexdb_bind.lpLentExprs; takeLp fills it when the
+    // plan leaves the Sel).
     var exprs: []Expr = []
     let outs = try lexdb_bind.selectCols(s, &q.cols, mut &sc.names, mut &exprs)
     var bx: []Expr = []
@@ -14149,7 +14149,12 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             added += 1
         }
     }
-    let lpOrder = cloneAll(&order)
+    // ORDER BY as resolved (DISTINCT ON's keys added): the plan's Sort's
+    // keys, read in place and set aside by the planner's first rewrite as
+    // the select list is (bo); where none runs, the Sort's are [] and
+    // Sel.order is the list (lexdb_bind.lpLentOrder)
+    var bo: []Expr = []
+    var oRewritten = false
     var having: Option[Expr] = None
     match s.having {
         Some(h) { having = Some(try lexdb_bind.resolve(&h, &q.cols, len(q.cols), mut &sc.names)) }
@@ -14191,7 +14196,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         rewriteList(mut &exprs, mx, mut &bx, mut &xRewritten)
         var mo: []Expr = []
         for x in order { append(mut &mo, winMarks(&x)) }
-        order = mo
+        rewriteList(mut &order, mo, mut &bo, mut &oRewritten)
     }
     endScope(sc, mut &q)
     var aggQ = len(groupBy) > 0 || having.isSome() || len(s.gsets) > 0
@@ -14307,7 +14312,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for i in 0..len(specs) { if len(specs[i].args) > 0 { specs[i].kind = lexdb_bind.exprKind(&specs[i].args[0], &q.cols, &sc.names) } }
         var ro: []Expr = []
         for x in order { append(mut &ro, try collectAggs(&x, mut &specs)) }
-        order = ro
+        rewriteList(mut &order, ro, mut &bo, mut &oRewritten)
         var rh: Option[Expr] = None
         match having {
             Some(h) { rh = Some(try collectAggs(&h, mut &specs)) }
@@ -14439,7 +14444,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         rewriteList(mut &exprs, wx, mut &bx, mut &xRewritten)
         var wo: []Expr = []
         for x in order { append(mut &wo, winSlots(&x, nAggs)) }
-        order = wo
+        rewriteList(mut &order, wo, mut &bo, mut &oRewritten)
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
     }
     // FOR UPDATE and the like (9.86): each locked table's key read with
@@ -14464,7 +14469,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         append(mut &nullsFirst, false)
     }
     let lp = selPlan(replace(mut &q.lp, lexdb_bind.noPlan()), s, if xRewritten { replace(mut &bx, []) } else { [] }, &outs, aggQ, lpGroup,
-                     len(specs), lpHaving, lpWins, lpOn, lpOrder, copyBools(&desc), copyBools(&nullsFirst))
+                     len(specs), lpHaving, lpWins, lpOn, if oRewritten { replace(mut &bo, []) } else { [] }, copyBools(&desc),
+                     copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: exprs, outs: outs, groupBy: groupBy, order: order, aggQ: aggQ, sort: sort,
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf, ordin: s.ordin, wins: wins, nAggs: nAggs,
@@ -14499,19 +14505,24 @@ fn rewriteList(xs: mut &[]Expr, nx: []Expr, keep: mut &[]Expr, done: mut &bool) 
 
 // sel's plan, taken out of it (a FROM subquery's, a view's, a set
 // operation's side) or before its lists change (hashSub): whole, the
-// Project's list a copy of the select list where it lends it (lpLent).
+// Project's list and the Sort's keys copies of the Sel's where the plan
+// lends them (lpLentExprs, lpLentOrder).
 fn takeLp(sel: mut &Sel): lexdb_bind.LPlan {
     let lp = replace(mut &sel.lp, lexdb_bind.noPlan())
-    let n = lexdb_bind.lpLent(&lp)
-    if n < 0 { return lp }
-    var xs: []Expr = withCapacity(n)
-    for i in 0..n { append(mut &xs, clone(&sel.exprs[i])) }
-    return lexdb_bind.lpRestore(lp, xs)
+    let n = lexdb_bind.lpLentExprs(&lp)
+    let lentOrder = lexdb_bind.lpLentOrder(&lp)
+    if n < 0 && !lentOrder { return lp }
+    var xs: []Expr = []
+    if n > 0 {
+        xs = withCapacity(n)
+        for i in 0..n { append(mut &xs, clone(&sel.exprs[i])) }
+    }
+    return lexdb_bind.lpRestore(lp, xs, if lentOrder { cloneAll(&sel.order) } else { [] })
 }
 
 // A SELECT's logical plan (Sel.lp) over its FROM and WHERE's (base): its
-// clauses as resolved (before the planner's rewrites); exprs [] where the
-// select list is the Sel's (lexdb_bind.lpLent).
+// clauses as resolved (before the planner's rewrites); exprs and order []
+// where they are the Sel's (lexdb_bind.lpLentExprs, lpLentOrder).
 fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]OutCol, aggQ: bool, group: []Expr, nAggs: int,
            having: Option[Expr], wins: []lexdb_sql.WinDef, on: []Expr, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
@@ -14535,10 +14546,11 @@ fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]O
     return topPlan(lp, s, order, desc, nullsFirst)
 }
 
-// ORDER BY and LIMIT over lp.
+// ORDER BY and LIMIT over lp: a Sort where there are keys (desc's; order
+// [] where they are the Sel's, lexdb_bind.lpLentOrder).
 fn topPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
-    if len(order) > 0 {
+    if len(desc) > 0 {
         let c = lexdb_bind.lpCols(&lp)
         lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, c)
     }
