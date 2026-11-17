@@ -11321,7 +11321,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         // rows it inserts.
         let noTypes: []int = []
         var ssc = newScopeIn(st, txn, params, &noTypes)
-        let sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        // the logical plan (read by nothing yet): the query's plan its source
+        let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), copyInts(&targets), takeLp(mut &sel), retBCols(&ret))
         let defs = try defaultsOf(st, txn, &t)
         let fw = try fkTables(st, txn, &t, true, parents)
         var later: []FkLater = []
@@ -11341,6 +11343,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
         try fkFinish(st, txn, &fw, mut &later)
     } else {
+        // the logical plan (read by nothing yet): VALUES its source, its rows the statement's
+        let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), copyInts(&targets),
+                                         lexdb_bind.LPlan.Values(if len(s.rows) > 0 { len(s.rows[0]) } else { 0 }, [], []), retBCols(&ret))
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
         count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
@@ -11442,6 +11447,12 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
         if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
     }
     return Ok(r)
+}
+
+// RETURNING's columns as a DML operator's (LPlan.Insert and the like): [] none.
+fn retBCols(r: &Ret): []lexdb_bind.BCol {
+    if !r.on { return [] }
+    return outBCols(&r.outs)
 }
 
 fn retAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, r: mut &Ret,
@@ -11779,6 +11790,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         append(mut &sets, lexdb_bind.bpAssign(try lexdb_bind.resolve(&set.expr, &q.cols, len(q.cols), mut &sc.names), &q.levels[0].t.cols[i].typ, &q.cols, &typing()))
     }
     var ret = try retOf(s, &q, mut &sc)
+    // the logical plan (read by nothing yet): the FROM and WHERE part its source
+    let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), copyInts(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
     if win.n > 0 {
         // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
@@ -11873,6 +11886,8 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
+    // the logical plan (read by nothing yet): the FROM and WHERE part its source
+    let lp = lexdb_bind.LPlan.Delete(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
     delNarrow(mut &q, s)
     // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
@@ -12632,6 +12647,8 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         ret.outs = try lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &ret.exprs)
         for x in ret.exprs { if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) } }
     }
+    // the logical plan (read by nothing yet): the source joined to the target its source
+    let lp = lexdb_bind.LPlan.Merge(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
     var found: [][]Val = []
     var rs = newRun(&q)
