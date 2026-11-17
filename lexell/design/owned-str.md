@@ -57,6 +57,34 @@ special cases with it:
    constant behaves the same way. Neither needs a source edit, so the sweep
    does not count the `global` kind as an edit.
 
+## 2a. Stage 2: the runtime representation (2026-11-17)
+
+A `str` is `{ char* p; uint32_t cap; uint32_t len; }`, 16 bytes as before, so
+it is still passed in two registers, and `len` stays at offset 12, where the
+native backend's inline checks read it.
+- `cap == 0`: `p` is static bytes (a literal, a constant, the empty string).
+  They are never freed, and a copy (`rt_str_dup`, which `clone()` is) shares
+  them, so literals cost nothing even where an owned `str` is wanted.
+- `cap > 0`: `p` is a heap buffer of the owner. Drop frees it, and a copy
+  copies the bytes.
+- A view (`&str`) is the header by value. It is never dropped; a view of a
+  heap string keeps a nonzero cap, so copying it copies.
+- Every buffer and static string ends with a NUL, so `p[len]` can be read and
+  a string whose bytes are followed by a NUL goes to C as it is.
+- An owned substring `s[a..b]` copies (a substring of static bytes stays a
+  free view of them); a borrowed slice is free.
+- No counts are left. A `par.map` worker copies and frees strings like any
+  thread, so the worker log of count changes (native `rt_clog`) and the
+  `RT_HOOK(dup/drop)` hooks are gone.
+- The native backend no longer inlines `rt_str_dup`/`rt_str_drop` (they were
+  count arithmetic). It reads bytes at `p + i` instead of `block + 8 + off + i`.
+  `loops.lxl` hoists `p`.
+
+Older design notes (native.md, parallel.md, mid-ir.md, borrow-inference.md,
+lexell-vs-rust.md, http-server.md, tls.md, perf-ideas.md) describe the
+counted representation as it was. They are history, not a description of the
+current runtime.
+
 ## 3. Migration plan
 
 **Borrow inference after the switch (decided 2026-11-17).** compiler/borrow.lxl
@@ -225,7 +253,7 @@ implicit copy was. They need doing before or at the switch to owned `str`.
 
 ## 6. Language issues the migration exposed
 
-**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). Then the `rc` reads and the TDS/TNS cursors on `rc str`, the parameter report, and `Shared`/`Frozen`: `share()` everywhere a `Shared` is copied (outside lexdb), `Frozen` deprecated for `rc`. **Stage 1 of the switch done (2026-11-17):** `str` and `Shared` handles are owned in the language; the runtime still counts string blocks (clone is a count change). `LXL_OWNED_STR=1` (or `LXL_OWNED_SHARED=1`) is now the migration mode: sites that relied on implicit copies are logged and checking goes on. Conformance tests whose subject was copying were rewritten for owned semantics (two renamed: s04_value_record_with_str_is_owned, s04_str_clone_independent; rt2_g09's str half is the error test rt2_g09b). **Next: stage 2**, owned buffers in the runtime.
+**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). Then the `rc` reads and the TDS/TNS cursors on `rc str`, the parameter report, and `Shared`/`Frozen`: `share()` everywhere a `Shared` is copied (outside lexdb), `Frozen` deprecated for `rc`. **Stage 1 of the switch done (2026-11-17):** `str` and `Shared` handles are owned in the language; the runtime still counts string blocks (clone is a count change). `LXL_OWNED_STR=1` (or `LXL_OWNED_SHARED=1`) is now the migration mode: sites that relied on implicit copies are logged and checking goes on. Conformance tests whose subject was copying were rewritten for owned semantics (two renamed: s04_value_record_with_str_is_owned, s04_str_clone_independent; rt2_g09's str half is the error test rt2_g09b). **Stage 2 done (2026-11-17)**: owned buffers in the runtime (section 2a).
 **Compiler migrated (2026-11-17):** phase 1 made 57 read-only parameters borrow (then 2 more after issue 12); phase 2 fixed the remaining 446 sweep sites in 5 parallel batches. The compiler's sweep is clean, it compiles every program to the same C as before (tools/same_output.sh), and the quick gate passes. **Order from here (2026-11-17):** compiler migration, then lexdb's migration, then the switch (owned `str` and owned `Shared` handles together). The switch must come last, because it breaks code that has not been migrated: making `Shared` owned stopped 188 lexdb programs compiling when tried.
 
 **Decided 2026-11-17:** implement 1 (freeze only the borrowed path), 10
@@ -313,6 +341,20 @@ whether it was confirmed with a test.
       ownership, so making it implicit hides nothing that matters. `mut &`
       stays explicit, because it does matter.
     This is probably the biggest ergonomic question the switch raises.
+13. **An operand changed by a later operand in the same expression** (found
+    by the red-team rounds after stage 2). In `g + f()` where `f` assigns the
+    string global `g`, or `x.name[take(x)]`, the left operand was read in place
+    and its bytes freed by the right one: a use after free. With copied
+    strings, such an operand was copied first. Decided rule:
+    - a **local** being indexed, sliced or used as an operator's left operand
+      is held (SPEC 10 rule 3) while the later operands run, so moving or
+      mutably borrowing it there is a compile error (`s[f(mut &s)]`, like
+      `s += f(mut &s)`, issue 7);
+    - a **global**, which cannot be held, is snapshotted with a clone when a
+      later operand may change it. This is the one copy the compiler makes
+      without a `clone()` in the source; it happens only in that case.
+    Also fixed with it: on an early exit, values are now dropped strictly
+    innermost first (a loop variable before the statement's temporaries).
 12. **An empty `[]` passed to a `&[]T` parameter could not infer `T`**
     (found in compiler migration phase 1: `fail(..., [])`, `x.call("f", [])`).
     Fixed: the literal takes its element type from the expected `&[]T`.

@@ -267,6 +267,7 @@ type Ctx = record {
     loops: []Loop
     pending: []Pend
     pmarks: []int
+    fscopes: []int  // per frame: how many scopes were open when it was pushed (cleanup's nesting)
     dead: bool
     nomove: []str
     n: int
@@ -282,7 +283,7 @@ type Ctx = record {
 
 fn newCtx(f: int, label: &str, ret: int, env: []int, mod: int, closure: bool): Ctx {
     return Ctx{fd: f, label: label.clone(), ret: ret, env: env, mod: mod, closure: closure, bvar: -1, lines: [], ind: 1,
-        scopes: [], frames: [], loops: [], pending: [], pmarks: [], dead: false, nomove: [], n: 0, tailOn: false,
+        scopes: [], frames: [], loops: [], pending: [], pmarks: [], fscopes: [], dead: false, nomove: [], n: 0, tailOn: false,
         tail: [], capNames: [], capVars: [], wconds: [], rsrc: [], blks: [], rhsAt: -1}
 }
 
@@ -1030,17 +1031,20 @@ fn (c: mut &Checker) dropVars(vs: &[]int) {
     }
 }
 
+// Drops what leaving to nscopes scopes and nframes frames ends, innermost first: a scope opened
+// inside a statement (a block of a for over a temporary) goes before that statement's temporaries.
 fn (c: mut &Checker) cleanup(nscopes: int, nframes: int) {
     var i = len(c.cx.frames) - 1
-    while i >= nframes {
-        let fr = copyInts(&c.cx.frames[i])
-        c.dropFrame(&fr)
-        i -= 1
-    }
-    i = len(c.cx.scopes) - 1
-    while i >= nscopes {
-        c.dropScope(i)
-        i -= 1
+    var j = len(c.cx.scopes) - 1
+    while i >= nframes || j >= nscopes {
+        if j >= nscopes && (i < nframes || j >= c.cx.fscopes[i]) {
+            c.dropScope(j)
+            j -= 1
+        } else {
+            let fr = copyInts(&c.cx.frames[i])
+            c.dropFrame(&fr)
+            i -= 1
+        }
     }
 }
 
@@ -1053,9 +1057,11 @@ fn copyInts(xs: &[]int): []int {
 fn (c: mut &Checker) pushFrame() {
     append(mut &c.cx.frames, [])
     append(mut &c.cx.pmarks, len(c.cx.pending))
+    append(mut &c.cx.fscopes, len(c.cx.scopes))
 }
 
 fn (c: mut &Checker) popFrame(): []int {
+    let fs = pop(mut &c.cx.fscopes)
     let m = pop(mut &c.cx.pmarks)
     c.cutPending(m)
     return pop(mut &c.cx.frames)
@@ -1435,6 +1441,15 @@ fn (c: mut &Checker) checkPending(root: int, path: &str, line: int, move: bool) 
     }
 }
 
+// A str indexed or sliced in place is held (SPEC 10 rule 3) while its index expressions run, so
+// one that moves or mutably borrows it is an error, as for s += f(mut &s) (design/owned-str.md,
+// issues 7 and 13). A global is snapshotted by before/snapVal instead. The pending mark to cut.
+fn (c: mut &Checker) holdBase(v: &Val, line: int): int {
+    let mark = len(c.cx.pending)
+    if v.cat == CAT_PLACE && v.gk < 0 && v.root >= 0 { c.hold(v.clone(), HM_SHARED, c.newCid(), line) }
+    return mark
+}
+
 // Under LXL_OWNED_STR: would moving root's path conflict with a borrow held by a call in progress?
 fn (c: &Checker) pendingHit(root: int, path: &str): bool {
     for p in c.cx.pending {
@@ -1768,7 +1783,18 @@ fn (c: mut &Checker) snapVal(v: Val): Val {
     if v.cat == CAT_RV && v.t != sema.T_VOID && k != sema.TK_REF && !c.isWord(v.c) {
         return c.holdtmpSrc(v.c, v.t, true, v)
     }
-    if v.cat != CAT_PLACE || k == sema.TK_REF || !c.isCopy(v.t) { return v }
+    if v.cat != CAT_PLACE || k == sema.TK_REF { return v }
+    if !c.isCopy(v.t) {
+        // design/owned-str.md, issue 13: a value of a type that was copied before the switch (a str,
+        // a value holding one) read as an operand, with a later operand that may change or move its
+        // place (a global, or x in x.name[take(x)]), is snapshotted as a clone, as it was copied
+        // before. Other owned values keep the holds of rule 3.
+        if !c.pg.isCopyLegacy(v.t) || v.gk < 0 { return v }       // a local is held instead (rule 3)
+        let cr = c.crOf(v)
+        var r = c.holdtmp(c.hole(mkHoleX(H_CLONE, v.t, v.c)), v.t)
+        r.cr = cr
+        return r
+    }
     let cr = c.crOf(v)
     var r = c.holdtmp(c.dup(v.c, v.t), v.t)
     r.cr = cr
@@ -3688,8 +3714,10 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
     let ix = c.item(n.b, 0)
     var v = c.rcRead(c.expr(n.a, -1))
     if v.t == sema.T_STR {
+        let mark = c.holdBase(v, n.line)
         v = c.before1(v, ix)
         let i = c.intIndex(ix)
+        c.cutPending(mark)
         return rv(c.x.call("rt_str_byte", [v.c, i, c.W(n.line)]), sema.T_BYTE)
     }
     let k = c.pg.tk(v.t)
@@ -3729,19 +3757,23 @@ fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
     if v.t == sema.T_STR && view {
         // a view (design/borrow-types.md): a shared &str of the bytes, rooted where s is, uncounted
         if v.cat == CAT_RV { v = c.holdtmp(v.c, sema.T_STR) }
+        let mark = c.holdBase(v, n.line)
         var b = c.borrow(v, false, n.line, false)
         b = c.beforeOpt(b, n.b, n.c)
         let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
         let hi = if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(b.c), "len") }
+        c.cutPending(mark)
         let vn = c.fresh("vw")
         let rt = c.pg.mkRef(sema.T_STR, false)
         c.emit(c.x.decl(c.T(rt), &vn, c.x.call("rt_str_view", [b.c, lo, hi, W])))
         return rvAt(c.nm(&vn), rt, b.root, &(pathAdd(&b.path, "*")))
     }
     if v.t == sema.T_STR {
+        let mark = c.holdBase(v, n.line)
         v = c.beforeOpt(v, n.b, n.c)
         let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
         let hi = if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(v.c), "len") }
+        c.cutPending(mark)
         return c.holdtmp(c.x.call("rt_str_sub", [v.c, lo, hi, W]), sema.T_STR)
     }
     let k = c.pg.tk(v.t)

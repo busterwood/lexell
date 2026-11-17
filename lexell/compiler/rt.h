@@ -47,9 +47,8 @@
 #include <sanitizer/lsan_interface.h>
 #endif
 
-typedef struct { int64_t rc; char data[]; } lxl_sblk;
-typedef struct { lxl_sblk* b; uint32_t off, len; } lxl_str;
-#define RT_SP(s) ((const char*)(s).b->data + (s).off)
+typedef struct { char* p; uint32_t cap, len; } lxl_str;
+#define RT_SP(s) ((const char*)(s).p)
 typedef struct { void* data; int64_t len, cap; } lxl_arr;
 typedef struct { void* data; int64_t len; } lxl_slice;
 typedef struct { void* fn; void* env; } lxl_clo;     // a closure: code and environment
@@ -278,31 +277,38 @@ static void rt_finish(void) {
 __attribute__((noreturn)) static void rt_exit(int64_t code) { rt_flush(); rt_ended = true; exit((int)code); }
 
 /* ---- strings
-   A str is {block, offset, len} (16 bytes, so it is passed in registers): the block is a
-   reference-counted allocation, or a static one (rc < 0) for literals. A substring shares the
-   block, so its bytes are not in general NUL-terminated; but every block ends with a NUL, so
-   RT_SP(s)[s.len] can always be read. Offsets and lengths are 32 bits: a str holds < 4 GiB. */
+   A str is {p, cap, len} (16 bytes, so it is passed in registers; design/owned-str.md). It is
+   owned: one owner, no count.
+   - cap == 0: p is static bytes (a literal or constant, or the empty string). They are never
+     freed, so a copy of the str can share them.
+   - cap > 0: p is a buffer of the heap. The owner frees it when the str is dropped, and a
+     copy (rt_str_dup, which clone() is) copies the bytes.
+   A &str view is the header by value ({p + a, cap, len}): it is never dropped. A view of a
+   static str keeps cap 0, so copying it shares; a view of a heap str keeps a nonzero cap, so
+   copying it copies. Every buffer and every static string ends with a NUL, and a view lies
+   inside one, so RT_SP(s)[s.len] can always be read. Lengths are 32 bits: a str holds < 4 GiB. */
 
 #ifndef RT_STR_MAX
 #define RT_STR_MAX UINT32_MAX       /* the longest str; a test lowers it with -DRT_STR_MAX=n */
 #endif
-static struct { int64_t rc; char data[1]; } rt_empty = {-1, ""};
-/* Every str with new bytes is made here; lengths are computed in 64 bits by the callers. */
+static char rt_empty[1] = "";
+/* Every str with new bytes is made here; lengths are computed in 64 bits by the callers. The
+   empty string needs no buffer. */
 static lxl_str rt_str_new(int64_t len) {
-    if (len == 0) return (lxl_str){(lxl_sblk*)&rt_empty, 0, 0};
+    if (len == 0) return (lxl_str){rt_empty, 0, 0};
     if (len < 0 || len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
-    lxl_sblk* b = rt_alloc(sizeof(lxl_sblk) + (size_t)len + 1);
-    b->rc = 1;
-    b->data[len] = 0;
-    return (lxl_str){b, 0, (uint32_t)len};
+    char* p = rt_alloc((size_t)len + 1);
+    p[len] = 0;
+    return (lxl_str){p, (uint32_t)len, (uint32_t)len};
 }
 static lxl_str rt_str_of(const char* p, int64_t len) {
     lxl_str s = rt_str_new(len);
-    if (len) memcpy(s.b->data, p, (size_t)len);
+    if (len) memcpy(s.p, p, (size_t)len);
     return s;
 }
-static lxl_str rt_str_dup(lxl_str s) { if (s.b && s.b->rc >= 0) s.b->rc++; return s; }
-static void rt_str_drop(lxl_str s) { if (s.b && s.b->rc > 0 && --s.b->rc == 0) rt_free(s.b); }
+/* A second owner: static bytes are shared, a heap buffer is copied. */
+static lxl_str rt_str_dup(lxl_str s) { return s.cap == 0 ? s : rt_str_of(RT_SP(s), s.len); }
+static void rt_str_drop(lxl_str s) { if (s.cap) rt_free(s.p); }
 static bool rt_str_eq(lxl_str a, lxl_str b) {
     return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
 }
@@ -316,23 +322,24 @@ static lxl_str rt_str_concat(lxl_str a, lxl_str b) {
     if (b.len == 0) return rt_str_dup(a);
     if (a.len == 0) return rt_str_dup(b);
     lxl_str s = rt_str_new((int64_t)a.len + b.len);
-    memcpy(s.b->data, RT_SP(a), (size_t)a.len);
-    memcpy(s.b->data + a.len, RT_SP(b), (size_t)b.len);
+    memcpy(s.p, RT_SP(a), (size_t)a.len);
+    memcpy(s.p + a.len, RT_SP(b), (size_t)b.len);
     return s;
 }
 static uint8_t rt_str_byte(lxl_str s, int64_t i, const char* w) {
     if (i < 0 || i >= s.len) rt_trap(3, "string index out of range", w);
     return (uint8_t)RT_SP(s)[i];
 }
-/* s[a..b]: shares the bytes of s (a new reference to its block) */
+/* s[a..b] as an owned str: a copy of the bytes (static bytes are shared) */
 static lxl_str rt_str_sub(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){rt_str_dup(s).b, s.off + (uint32_t)a, (uint32_t)(b - a)};
+    if (s.cap == 0) return (lxl_str){s.p + a, 0, (uint32_t)(b - a)};
+    return rt_str_of(RT_SP(s) + a, b - a);
 }
-/* &s[a..b]: a view of the bytes of s, uncounted (a shared &str; design/borrow-types.md) */
+/* &s[a..b]: a view of the bytes of s (a shared &str; design/borrow-types.md), never dropped */
 static lxl_str rt_str_view(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){s.b, s.off + (uint32_t)a, (uint32_t)(b - a)};
+    return (lxl_str){s.p + a, s.cap, (uint32_t)(b - a)};
 }
 /* Searching (the regex prefilters): the first index >= from in s of the byte c, of any byte of
    set, or of the string n; -1 when there is none (from < 0 counts as 0). With SSE2 the loops

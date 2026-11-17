@@ -1041,37 +1041,25 @@ __attribute__((noreturn)) void exit(int code) { sys_exit(code); }
 
 /* ---- strings (see rt.h) */
 
-#define RT_SP(s) ((const char*)(s).b->data + (s).off)
+#define RT_SP(s) ((const char*)(s).p)
 #define RT_STR_MAX UINT32_MAX
-static struct { int64_t rc; char data[1]; } rt_empty = {-1, ""};
+static char rt_empty[1] = "";
 lxl_str rt_str_new(int64_t len) {
-    if (len == 0) return (lxl_str){(lxl_sblk*)&rt_empty, 0, 0};
+    if (len == 0) return (lxl_str){rt_empty, 0, 0};
     if (len < 0 || len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
-    lxl_sblk* b = rt_alloc(sizeof(lxl_sblk) + (size_t)len + 1);
-    b->rc = 1;
-    b->data[len] = 0;
-    return (lxl_str){b, 0, (uint32_t)len};
+    char* p = rt_alloc((size_t)len + 1);
+    p[len] = 0;
+    return (lxl_str){p, (uint32_t)len, (uint32_t)len};
 }
 lxl_str rt_str_of(const char* p, int64_t len) {
     lxl_str s = rt_str_new(len);
-    if (len) memcpy(s.b->data, p, (size_t)len);
+    if (len) memcpy(s.p, p, (size_t)len);
     return s;
 }
-/* On a par worker, a block it does not own is not counted: the change goes to its log, and the
-   main thread makes it when the map ends (design/parallel.md 2.3). */
-lxl_str rt_str_dup(lxl_str s) {
-    if (s.b && s.b->rc >= 0) {
-        if (__builtin_expect(rt_par_span != 0, 0)) return RT_HOOK(dup)(s);
-        s.b->rc++;
-    }
-    return s;
-}
-void rt_str_drop(lxl_str s) {
-    if (s.b && s.b->rc > 0) {
-        if (__builtin_expect(rt_par_span != 0, 0)) { RT_HOOK(drop)(s); return; }
-        if (--s.b->rc == 0) rt_free(s.b);
-    }
-}
+/* A second owner: static bytes (cap 0) are shared, a heap buffer is copied. Strings have no
+   counts (design/owned-str.md), so a par worker copies and frees as any thread does. */
+lxl_str rt_str_dup(lxl_str s) { return s.cap == 0 ? s : rt_str_of(RT_SP(s), s.len); }
+void rt_str_drop(lxl_str s) { if (s.cap) rt_free(s.p); }
 bool rt_str_eq(lxl_str a, lxl_str b) {
     return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
 }
@@ -1085,8 +1073,8 @@ lxl_str rt_str_concat(lxl_str a, lxl_str b) {
     if (b.len == 0) return rt_str_dup(a);
     if (a.len == 0) return rt_str_dup(b);
     lxl_str s = rt_str_new((int64_t)a.len + b.len);
-    memcpy(s.b->data, RT_SP(a), (size_t)a.len);
-    memcpy(s.b->data + a.len, RT_SP(b), (size_t)b.len);
+    memcpy(s.p, RT_SP(a), (size_t)a.len);
+    memcpy(s.p + a.len, RT_SP(b), (size_t)b.len);
     return s;
 }
 uint8_t rt_str_byte(lxl_str s, int64_t i, const char* w) {
@@ -1099,11 +1087,12 @@ uint64_t rt_str_word(lxl_str s, int64_t i, const char* w) {
 }
 lxl_str rt_str_sub(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){rt_str_dup(s).b, s.off + (uint32_t)a, (uint32_t)(b - a)};
+    if (s.cap == 0) return (lxl_str){s.p + a, 0, (uint32_t)(b - a)};
+    return rt_str_of(RT_SP(s) + a, b - a);
 }
 lxl_str rt_str_view(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){s.b, s.off + (uint32_t)a, (uint32_t)(b - a)};
+    return (lxl_str){s.p + a, s.cap, (uint32_t)(b - a)};
 }
 /* Searching (the regex prefilters): the first index >= from in s of the byte c, of any byte of
    set, or of the string n; -1 when there is none (from < 0 counts as 0). With SSE2 the loops
@@ -3947,8 +3936,9 @@ int64_t lxllib_net_wait_for(int64_t fd, int64_t dir, int64_t ms, bool cancellabl
    and wakes the loop as a helper does.
 
    A worker runs each job under a fresh tag: the blocks it allocates are its own while the job
-   runs and pass to the main thread with the results. It never changes the count of a str block
-   it does not own; it logs the change (rt_clog), and the main thread makes it when the job ends.
+   runs and pass to the main thread with the results. Strings have no counts (design/owned-str.md):
+   a worker copies and frees them as any thread does. (rt_clog, its log of count changes to
+   strings it did not own, is no longer written.)
    A trap on a worker (or an exit, or stack overflow) is recorded in the job, which finishes at
    once; the main thread then stops the program with that message and code. */
 
@@ -3994,18 +3984,6 @@ static void rt_pfree(void* p, size_t h) {          /* a large block, or one with
     if (w && h >> 8 != w->heap.tag) rt_wstop(w, 2, m, sizeof m - 1);
     free_h(hp, p);
 }
-static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d);
-__attribute__((noinline)) static lxl_str rt_str_dup_p(lxl_str s) {
-    rt_wctx* w = rt_wme();
-    if (!w || !rt_str_wcount(w, s.b, 1)) s.b->rc++;
-    return s;
-}
-__attribute__((noinline)) static void rt_str_drop_p(lxl_str s) {
-    rt_wctx* w = rt_wme();
-    if (w && rt_str_wcount(w, s.b, -1)) return;
-    if (--s.b->rc == 0) rt_free(s.b);
-}
-
 /* "Lexell: <a><b> at <where>\n" for a par worker's stop, in its own buffer. */
 __attribute__((noreturn, noinline)) static void rt_wtrap(rt_wctx* w, int code, const char* a, const char* b, size_t bn,
                                                           const char* where) {
@@ -4031,35 +4009,6 @@ static void rt_wsegv(char* a) {
         rt_wstop(w, 4, m, sizeof m - 1);
     }
 }
-static bool rt_str_wcount(rt_wctx* w, void* b, int64_t d) {
-    if (((size_t*)b)[-1] >> 8 == w->heap.tag) return false;
-    rt_clog* l = w->log;
-    if (!l || l->n * 2 >= l->cap) {
-        size_t cap = l ? l->cap * 2 : 64;
-        rt_clog* m = malloc(sizeof *m);
-        void** k = malloc(cap * sizeof *k);
-        int64_t* dd = malloc(cap * sizeof *dd);
-        if (!m || !k || !dd) rt_trap(2, "out of memory", "runtime");
-        memset(k, 0, cap * sizeof *k);
-        m->k = k; m->d = dd; m->cap = cap; m->n = 0; m->next = 0;
-        if (l) {
-            for (size_t i = 0; i < l->cap; i++) {
-                if (!l->k[i]) continue;
-                size_t h = ((size_t)l->k[i] >> 4) * 0x9E3779B97F4A7C15ULL >> 32 & (cap - 1);
-                while (m->k[h]) h = (h + 1) & (cap - 1);
-                m->k[h] = l->k[i]; m->d[h] = l->d[i]; m->n++;
-            }
-            free(l->k); free(l->d); free(l);
-        }
-        w->log = l = m;
-    }
-    size_t h = ((size_t)b >> 4) * 0x9E3779B97F4A7C15ULL >> 32 & (l->cap - 1);
-    while (l->k[h] && l->k[h] != b) h = (h + 1) & (l->cap - 1);
-    if (!l->k[h]) { l->k[h] = b; l->d[h] = 0; l->n++; }
-    l->d[h] += d;
-    return true;
-}
-
 /* Under the lock: j out of the queue, once every index is handed out. */
 static void rt_par_unqueue(rt_pjob* j) {
     if (j->removed || __atomic_load_n(&j->next, __ATOMIC_RELAXED) < j->n) return;
@@ -4195,8 +4144,6 @@ static void rt_par_start(void) {
     if (!class_size[0]) heap_init();
     rt_par_hooks.malloc = rt_pmalloc;
     rt_par_hooks.free = rt_pfree;
-    rt_par_hooks.dup = rt_str_dup_p;
-    rt_par_hooks.drop = rt_str_drop_p;
     rt_par_hooks.stop = rt_wstop;
     rt_par_hooks.trap = rt_wtrap;
     rt_par_hooks.write = rt_wwrite;
@@ -4268,17 +4215,6 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
         write_all(2, j.msg, j.msgn);
         rt_quit(j.fail);
     }
-    for (rt_clog* l = j.logs; l;) {                         /* the workers' count changes */
-        for (size_t i = 0; i < l->cap; i++) {
-            lxl_sblk* b = (lxl_sblk*)l->k[i];
-            if (!b || !l->d[i]) continue;
-            b->rc += l->d[i];
-            if (b->rc <= 0) rt_trap(2, "internal error: a par worker dropped a string it did not own", w);
-        }
-        rt_clog* nx = l->next;
-        free(l->k); free(l->d); free(l);
-        l = nx;
-    }
     if (rt_check) rt_live += j.live;
     return r;
 }
@@ -4311,11 +4247,11 @@ static void rt_rcs_print(void) {
 }
 lxl_str rt_str_dup_k(lxl_str s, int64_t k) {
     rt_rc_report = rt_rcs_print;
-    rt_rcs[k][0][s.b && s.b->rc >= 0]++;
+    rt_rcs[k][0][s.cap != 0]++;
     return rt_str_dup(s);
 }
 void rt_str_drop_k(lxl_str s, int64_t k) {
     rt_rc_report = rt_rcs_print;
-    rt_rcs[k][1][s.b && s.b->rc > 0]++;
+    rt_rcs[k][1][s.cap != 0]++;
     rt_str_drop(s);
 }

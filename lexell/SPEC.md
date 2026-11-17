@@ -190,10 +190,13 @@ borrowed `mut` (a string is immutable). Out-of-range indices and bounds stop
 the program (exit 3). A string is at most
 4 GiB − 1 bytes long; making a longer one stops the program (exit 2).
 
-A shared `&str` is a **view**: the string's header (its block, offset and
-length) by value, with no count taken. `&s[a..b]` borrows the bytes `a` to
-`b - 1` of `s` without copying or counting them, and so does `s[a..b]` where a
-`&str` is expected; elsewhere `s[a..b]` is an owned `str` (it counts). A view
+A shared `&str` is a **view**: the string's header (a pointer to its bytes and
+its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`
+without copying them, and so does `s[a..b]` where a `&str` is expected;
+elsewhere `s[a..b]` is a new owned `str` holding a copy of those bytes. In the
+runtime a string owns a buffer of the heap, except the static bytes of
+literals and constants, which are never freed and which copies may share
+(design/owned-str.md, "Stage 2"). A view
 is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str` does
 not convert to `str` by itself: where an owned string is needed, write
 `s.clone()`. `mut &str` borrows a `str` variable or
@@ -831,7 +834,8 @@ let name = match e { Expr.Num(n) { n.toStr() } Expr.Call(f, _) { f } else { "?" 
   each element in turn, and may move it (`for x in split(s, ",") {
   append(mut &out, x) }` needs no copy). Each element is dropped at the end of
   its turn unless the body moved it. On `break`, `return` or `try`, the
-  elements not yet taken are dropped with the array, last to first.
+  current element is dropped first (innermost first), then the elements not
+  yet taken, with the array, last to first.
 - `for x in e`, when `e` is not a range, an array or a slice, **iterates**:
   `e` is moved (or copied) into a hidden variable `it`, and the loop runs as
   `{ var it = e; while true { match it.next() { Some(x) { body } None { break } } } }`.

@@ -69,7 +69,7 @@ fn run(name: str, steps: &[]ht.Step, method: str, want: &[]str, mode: int, size:
         let ln = net.listen("127.0.0.1:0").unwrap()
         let u = "http://" + ln.localAddr() + "/"
         var mine: []ht.Step = []
-        for x in steps { append(mut &mine, x) }
+        for x in steps { append(mut &mine, x.clone()) }
         let srv = s.start(ht.scripted, ht.Script{ln: ln, steps: mine})
         let c = http.newClient(http.defaults())
         var bad = ""
