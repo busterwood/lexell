@@ -190,10 +190,10 @@ pub fn colCollKind(c: &lexdb_sql.ColDef): int {
 // dropped; else itself. The row holds the value.
 pub fn collKeyVal(c: &lexdb_sql.ColDef, v: &Val): Val {
     let k = colCollKind(c)
-    if k == lexdb_sql.COLL_EXACT { return v }
+    if k == lexdb_sql.COLL_EXACT { return v.clone() }
     match v {
         Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { ciKey(&s) } else { padKey(&s) }) }
-        else { return v }
+        else { return v.clone() }
     }
 }
 
@@ -369,7 +369,7 @@ pub fn allScan(): Scan { return Scan{empty: false, point: false, lo: "", hi: "",
 // Whether a and b cover the same keys [lo, hi).
 pub fn sameRange(a: &Scan, b: &Scan): bool { return a.lo == b.lo && a.hi == b.hi }
 
-pub fn (sc: &Scan) copy(): Scan { return Scan{empty: sc.empty, point: sc.point, lo: sc.lo, hi: sc.hi, whole: sc.whole} }
+pub fn (sc: &Scan) copy(): Scan { return Scan{empty: sc.empty, point: sc.point, lo: sc.lo.clone(), hi: sc.hi.clone(), whole: sc.whole} }
 
 // The number of a primary key's columns (ix -1) or index ix's parts.
 fn partCount(t: &Rel, ix: int): int { return if ix < 0 { len(t.pk) } else { len(t.indexes[ix].cols) } }
@@ -386,7 +386,7 @@ pub fn rangeScan(t: &Rel, ix: int, eqs: &[]Val, los: &[]Val, his: &[]Val, noNull
     for v in eqs { encPart(mut &prefix, &v, index) }
     let pre = prefix.toStr()
     if !index && len(eqs) == partCount(t, ix) { return Scan{empty: false, point: true, lo: pre, hi: "", whole: false} }
-    var lo = pre
+    var lo = pre.clone()
     var hi = if len(pre) > 0 { succ(&pre) } else { "" }
     for v in los {
         var kb = newStrBuf()
@@ -435,8 +435,8 @@ pub fn inScans(t: &Rel, ix: int, eqs: &[]Val, vals: &[]Val, desc: bool): []Scan 
     var out: []Scan = []
     for i in 0..len(keys) {
         if i > 0 && keys[i] == keys[i - 1] { continue }
-        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i], hi: "", whole: false}) } else {
-            append(mut &out, Scan{empty: false, point: false, lo: keys[i], hi: succ(&keys[i]), whole: false})
+        if point { append(mut &out, Scan{empty: false, point: true, lo: keys[i].clone(), hi: "", whole: false}) } else {
+            append(mut &out, Scan{empty: false, point: false, lo: keys[i].clone(), hi: succ(&keys[i]), whole: false})
         }
     }
     if desc {
@@ -497,7 +497,7 @@ pub type Cursor = record { at: str; started: bool; pub done: bool }
 
 pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false} }
 
-pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at, started: c.started, done: c.done} }
+pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done} }
 
 // The scans of a primary key path from key from on (a batched statement's resume): a point before it is dropped, a range starts
 // at it at the latest, and the whole table is a range from it.
@@ -506,14 +506,14 @@ pub fn afterScans(scans: &[]Scan, from: &str): []Scan {
     for sc in scans {
         if sc.empty { append(mut &out, Scan{empty: true, point: false, lo: "", hi: "", whole: false}); continue }
         if sc.point {
-            if sc.lo >= from { append(mut &out, Scan{empty: false, point: true, lo: sc.lo, hi: "", whole: false}) }
+            if sc.lo >= from { append(mut &out, Scan{empty: false, point: true, lo: sc.lo.clone(), hi: "", whole: false}) }
             continue
         }
-        var lo = if sc.whole { "" } else { sc.lo }
-        let hi = if sc.whole { "" } else { sc.hi }
+        var lo: str = if sc.whole { "" } else { sc.lo.clone() }
+        let hi: &str = if sc.whole { "" } else { &sc.hi }
         if lo < from { lo = from.toStr() }
         if len(hi) > 0 && lo >= hi { continue }
-        append(mut &out, Scan{empty: false, point: false, lo: lo, hi: hi, whole: false})
+        append(mut &out, Scan{empty: false, point: false, lo: lo, hi: hi.toStr(), whole: false})
     }
     return out
 }
@@ -529,7 +529,7 @@ pub fn rowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, key: &s
     let places = try placesOf(st, txn, t, key, v, n, need, missing)
     if len(t.slots) == 0 { return Ok(places) }
     var out: []Val = []
-    for k in t.slots { append(mut &out, places[k]) }
+    for k in t.slots { append(mut &out, places[k].clone()) }
     return Ok(out)
 }
 
@@ -620,39 +620,41 @@ pub fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int
     let inPart = part && !byIndex
     if desc {
         // backward: the cursor is the exclusive end
-        let to = if cur.started { cur.at } else { sc.hi }
+        let wasStarted = cur.started
         cur.started = true
+        let to: &str = if wasStarted { &cur.at } else { &sc.hi }
         if inPart {
-            try st.scanBackPart(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
+            try st.scanBackPart(txn, tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val.clone())
+            append(mut &keys, en.key.clone())
+            last = en.key.clone()
             return len(vals) < BATCH
         })
         } else {
-            try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
+            try st.scanBack(txn, tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val.clone())
+            append(mut &keys, en.key.clone())
+            last = en.key.clone()
             return len(vals) < BATCH
         })
         }
         if len(vals) < BATCH { cur.done = true } else { cur.at = last }
     } else {
-        let from = if cur.started { cur.at } else { sc.lo }
+        let wasStarted = cur.started
         cur.started = true
+        let from: &str = if wasStarted { &cur.at } else { &sc.lo }
         if inPart {
-            try st.scanPart(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
+            try st.scanPart(txn, tree, from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val.clone())
+            append(mut &keys, en.key.clone())
+            last = en.key.clone()
             return len(vals) < BATCH
         })
         } else {
-            try st.scan(txn, tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
-            last = en.key
+            try st.scan(txn, tree, from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &vals, en.val.clone())
+            append(mut &keys, en.key.clone())
+            last = en.key.clone()
             return len(vals) < BATCH
         })
         }
@@ -872,7 +874,7 @@ fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, key: &str,
           bp: &BPlan): Result[bool, DbErr] {
     let row = try rowOf(st, txn, t, key, v, bp.width, &bp.needP, &bp.missing)
     for i in 0..len(bp.kinds) {
-        if bp.needCol[i] && !lexdb_rows.put(b, i, r, row[i], bp.kinds[i]) { return Ok(false) }
+        if bp.needCol[i] && !lexdb_rows.put(b, i, r, row[i].clone(), bp.kinds[i]) { return Ok(false) }
     }
     return Ok(true)
 }
@@ -911,13 +913,14 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
     while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
+        let wasStarted = cur.started
         cur.started = true
+        let from: &str = if wasStarted { &cur.at } else { &sc.lo }
         var stopKey = ""
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, t.tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -966,7 +969,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
             }
             return true
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if bail { return Ok(None) }
                 if stop == 1 {
             cur.at = stopKey
@@ -1015,16 +1018,17 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
     var b = lexdb_rows.newBatch(bp, BROWS)
     var bail = false
     if rd.desc {
-        let to = if cur.started { cur.at } else { sc.hi }
+        let wasStarted = cur.started
         cur.started = true
+        let to: &str = if wasStarted { &cur.at } else { &sc.hi }
         var last = ""
-        try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
+        try st.scanBack(txn, tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
             if !bIdxInto(&en.key, b.n, mut &b, bp, &rd.dec) {
                 bail = true
                 return false
             }
             b.n += 1
-            last = en.key
+            last = en.key.clone()
             return b.n < BROWS
         })
         if bail { return Ok(None) }
@@ -1032,11 +1036,12 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
         return Ok(Some(b))
     }
     while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
+        let wasStarted = cur.started
         cur.started = true
+        let from: &str = if wasStarted { &cur.at } else { &sc.lo }
         var stopKey = ""
         var full = false
-        try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -1073,24 +1078,26 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
     var pks: []str = []
     if rd.byKeys {
         cur.done = true
-        for k in rd.keys { append(mut &pks, k) }
+        for k in rd.keys { append(mut &pks, k.clone()) }
     } else if rd.desc {
-        let to = if cur.started { cur.at } else { sc.hi }
+        let wasStarted = cur.started
         cur.started = true
+        let to: &str = if wasStarted { &cur.at } else { &sc.hi }
         var last = ""
-        try st.scanBack(txn, tree, &sc.lo, &to, fn(en: &lexdb_store.Entry): bool {
-            append(mut &pks, en.val)
-            last = en.key
+        try st.scanBack(txn, tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &pks, en.val.clone())
+            last = en.key.clone()
             return len(pks) < BROWS
         })
         if len(pks) < BROWS { cur.done = true } else { cur.at = last }
     } else {
         while len(pks) < BROWS && !cur.done {
-            let from = if cur.started { cur.at } else { sc.lo }
+            let wasStarted = cur.started
             cur.started = true
+            let from: &str = if wasStarted { &cur.at } else { &sc.lo }
             var stopKey = ""
             var full = false
-            try st.scanLeaves(txn, tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            try st.scanLeaves(txn, tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
                 var k = i
                 while k < j {
                     if len(pks) == BROWS {
@@ -1118,7 +1125,7 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
     for i in 0..n { append(mut &order, i) }
     if !txn.noting() { sortKeysPerm(&pks, mut &order) }
     var ks: []str = withCapacity(n)
-    for i in order { append(mut &ks, pks[i]) }
+    for i in order { append(mut &ks, replace(mut &pks[i], "")) }
     var got: []Option[str] = withCapacity(n)
     try st.getMany(txn, t.tree, &ks, part, mut &got)
     let rw = rowsFor(t)
@@ -1463,13 +1470,14 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
     while b.n < BROWS && !cur.done {
-        let from = if cur.started { cur.at } else { sc.lo }
+        let wasStarted = cur.started
         cur.started = true
+        let from: &str = if wasStarted { &cur.at } else { &sc.lo }
         var stopKey = ""
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        try st.scanLeaves(txn, t.tree, &from, sc.hi, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try st.scanLeaves(txn, t.tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -1535,7 +1543,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
             }
             return true
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if bail { return Ok(None) }
                 if stop == 1 {
             cur.at = stopKey
@@ -1612,18 +1620,19 @@ pub fn rowCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel): Res
 // the entry that reached it); false: the range ended first.
 pub fn countEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, sc: &Scan, cur: mut &Cursor, n: mut &int,
                     lim: int, keep: bool, keys: mut &[]str): Result[bool, DbErr] {
-    let from = if cur.started { cur.at } else { sc.lo }
+    let wasStarted = cur.started
     cur.started = true
+    let from: &str = if wasStarted { &cur.at } else { &sc.lo }
     var more = false
     var last = ""
-    try st.scan(txn, t.indexes[ix].tree, &from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
+    try st.scan(txn, t.indexes[ix].tree, from, &sc.hi, fn(en: &lexdb_store.Entry): bool {
         if n == lim {
             more = true
             return false
         }
         n += 1
-        last = en.key
-        if keep { append(keys, en.val) }
+        last = en.key.clone()
+        if keep { append(keys, en.val.clone()) }
         return true
     })
     if more { cur.at = after(&last) } else { cur.done = true }
@@ -1638,7 +1647,7 @@ pub fn warmPoints(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Rel, scans:
     var ks: []str = []
     for sc in scans {
         if !sc.point { return Ok(Unit{}) }
-        append(mut &ks, sc.lo)
+        append(mut &ks, sc.lo.clone())
     }
     return st.warm(txn, t.tree, &ks)
 }
@@ -1677,7 +1686,7 @@ pub fn (p: mut &Probes) intKey(x: int) {
 
 // The last key once more.
 pub fn (p: mut &Probes) again() {
-    let same = p.keys[len(p.keys) - 1]
+    let same = p.keys[len(p.keys) - 1].clone()
     append(mut &p.keys, same)
 }
 
@@ -1713,7 +1722,7 @@ pub fn fetchMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, pr:
             continue
         }
         first[i] = len(ks)
-        append(mut &ks, keys[i])
+        append(mut &ks, keys[i].clone())
     }
     var got: []Option[str] = withCapacity(len(ks))
     try st.getMany(txn, t.tree, &ks, part, mut &got)
@@ -1787,7 +1796,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
             continue
         }
         first[i] = len(ks)
-        append(mut &ks, keys[i])
+        append(mut &ks, keys[i].clone())
     }
     let tree = if index { t.indexes[ix].tree } else { t.tree }
     let rw = rowsFor(t)
@@ -1805,7 +1814,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         if bail || over || len(bad) > 0 { break }
         append(mut &lo, if index && !only { len(pks) } else { rows.n })
         // the key's range: its prefix's, narrowed by the bounds (rangeScan's)
-        var rlo = ks[x]
+        var rlo = ks[x].clone()
         var rhi = succ(&ks[x])
         for sf in tail.lo {
             let lk = ks[x] + sf
@@ -1893,7 +1902,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         })
         append(mut &hi, if index && !only { len(pks) } else { rows.n })
     }
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     if bail || over { return Ok(None) }
     for a in 0..len(apart) {
         let got = if part { try st.getPart(txn, t.tree, &apart[a]) } else { try st.get(txn, t.tree, &apart[a]) }
@@ -1910,7 +1919,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         for e in 0..ne { append(mut &po, e) }
         if !noted { sortKeysPerm(&pks, mut &po) }
         var sk: []str = withCapacity(ne)
-        for e in po { append(mut &sk, pks[e]) }
+        for e in po { append(mut &sk, replace(mut &pks[e], "")) }
         var got: []Option[str] = withCapacity(ne)
         try st.getMany(txn, t.tree, &sk, part, mut &got)
         rows = lexdb_rows.newBatch(bp, ne)
@@ -1949,7 +1958,7 @@ fn bRoom(b: mut &Batch, bp: &BPlan, room: mut &int, m: int) {
             nb.cols[c].v[r] = b.cols[c].v[r]
             nb.cols[c].nul[r] = b.cols[c].nul[r]
         }
-        if bp.kinds[c] == BK_VAL { for r in 0..b.n { nb.vals[c][r] = b.vals[c][r] } }
+        if bp.kinds[c] == BK_VAL { for r in 0..b.n { nb.vals[c][r] = b.vals[c][r].clone() } }
     }
     nb.n = b.n
     b = nb
@@ -1997,7 +2006,7 @@ pub fn treeDump(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel): []s
     var names: []str = ["table"]
     for ix in t.indexes {
         append(mut &trees, ix.tree)
-        append(mut &names, ix.name)
+        append(mut &names, ix.name.clone())
     }
     for k in 0..len(trees) {
         var n = 0
@@ -2231,11 +2240,11 @@ pub fn conflictRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, a
             let pre = (try ixKey(t, ix, row, expr)).pre
             var hit: []str = []
             try st.scan(txn, ix.tree, &pre, &(succ(&pre)), fn(en: &lexdb_store.Entry): bool {
-                append(mut &hit, en.val)
+                append(mut &hit, en.val.clone())
                 return false
             })
             if len(hit) == 0 { continue }
-            pk = hit[0]
+            pk = pop(mut &hit)
         }
         match try st.get(txn, t.tree, &pk) {
             Some(v) {
@@ -2278,7 +2287,7 @@ pub fn exactRange(eqs: &[]Val, lower: &Option[Val], lowIncl: bool, upper: &Optio
     var pb = newStrBuf()
     for v in eqs { encPart(mut &pb, &v, ix) }
     let p = pb.toStr()
-    var lo = p
+    var lo = p.clone()
     var hi = if len(p) > 0 { succ(&p) } else { "" }
     match lower {
         Some(v) {
@@ -2355,8 +2364,8 @@ fn delEntries(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, lo: &s
         var keys: []str = []
         var vals: []str = []
         try st.scanPart(txn, t.tree, &from, hi, fn(en: &lexdb_store.Entry): bool {
-            append(mut &vals, en.val)
-            append(mut &keys, en.key)
+            append(mut &vals, en.val.clone())
+            append(mut &keys, en.key.clone())
             return len(vals) < BATCH
         })
         for k in 0..len(keys) {
@@ -2464,7 +2473,7 @@ pub fn buildWrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, b:
     }
     for j in 0..len(b.redo) {
         var pks: []str = []
-        for r in b.rows[j] { append(mut &pks, b.keys[r]) }
+        for r in b.rows[j] { append(mut &pks, b.keys[r].clone()) }
         match try fillIndex(st, txn, t, &t.indexes[b.redo[j]], &b.ents[j], &pks, &b.pres[j]) {
             Some(row) { return Ok(Dup{ix: b.redo[j], row: row}) }
             None {}

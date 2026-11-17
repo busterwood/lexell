@@ -581,7 +581,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
                               desc: bool, check: &Option[[]lexdb_bind.OutCol]): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     let zone = w.sess.zone()
     w.streamed = false
-    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.clone()))
     let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
         if start {
             match check {
@@ -640,7 +640,7 @@ fn isCopyTo(s: &lexdb_sql.Stmt): bool { return s.kind == lexdb_sql.S_COPY && !s.
 // is out of w while it runs, so that the closure sending the lines can use
 // w's connection.
 fn (w: mut &Wire) copyTo(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, lexdb_base.DbErr] {
-    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.clone()))
     var started = false
     let r = sess.runOut(s, params, ptypes, pc, fn(n: int, b: &[]byte): bool {
         if !started {
@@ -665,7 +665,7 @@ fn (w: mut &Wire) copyTo(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc:
 fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_bind.OutCol): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     w.copyResponse('G', len(cols))
     if w.flush().isErr() { return Err(protoErr("the connection was lost during COPY")) }
-    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.clone()))
     let r = sess.copyInFrom(s, fn(): lexdb_exec.CopyPart {
         var b = newStrBuf()
         while true {
@@ -682,7 +682,7 @@ fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_bind.OutCol): Resu
                     } else if m.typ == 'c' {
                         return lexdb_exec.CopyPart{rows: [], data: b.toStr(), end: true, fail: "", proto: false}
                     } else if m.typ == 'f' {
-                        var rd = Rd{s: m.body, at: 0, bad: false}
+                        var rd = Rd{s: m.body.clone(), at: 0, bad: false}
                         let msg = rd.cstr()
                         return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: if msg == "" { "canceled by the client" } else { msg }, proto: false}
                     } else if m.typ != 'H' && m.typ != 'S' {
@@ -728,7 +728,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                         Ok(x) {
                             if x.copy == lexdb_exec.COPY_IN {
                                 copyIn = true
-                                for c in x.cols { append(mut &cols, c) }
+                                for c in x.cols { append(mut &cols, c.clone()) }
                             }
                         }
                         Err(_) {}
@@ -760,7 +760,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
 // ---- the extended query protocol
 
 fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body, at: 0, bad: false}
+    var r = Rd{s: body.clone(), at: 0, bad: false}
     let name = r.cstr()
     let sql = r.cstr()
     let n = r.i16()
@@ -821,13 +821,13 @@ fn binParam(data: &str, oid: int): Result[str, lexdb_base.DbErr] {
     if oid == lexdb_sql.OID_BOOL && len(data) == 1 { return Ok(if data[0] != 0 { "t" } else { "f" }) }
     if oid == lexdb_sql.OID_FLOAT8 && len(data) == 8 { return Ok(lexdb_float.fmt8(math.fromBits(binary.readI64BEStr(data, 0)))) }
     if oid == lexdb_sql.OID_FLOAT4 && len(data) == 4 { return Ok(lexdb_float.fmt4(math.fromBits32Int(binary.readU32BEStr(data, 0)))) }
-    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR { return Ok(data) }
+    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR { return Ok(data.clone()) }
     if lexdb_sql.elemOid(oid) > 0 { return binArray(data, lexdb_sql.elemOid(oid)) }
     return Err(lexdb_base.err("0A000", &("lexdb: a binary parameter of type " + oid.toStr() + " is not supported")))
 }
 
 fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body, at: 0, bad: false}
+    var r = Rd{s: body.clone(), at: 0, bad: false}
     let portal = r.cstr()
     let name = r.cstr()
     let nf = r.i16()
@@ -856,7 +856,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
     }
     var vals: []Val = []
     {
-    let p = ps.stmts.at(name)
+    let p = ps.stmts.at(name.clone())
     var texts: []Option[str] = []
     for i in 0..np {
         match raw[i] {
@@ -865,7 +865,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
                     let oid = if i < len(p.ptypes) { p.ptypes[i] } else { lexdb_sql.OID_TEXT }
                     append(mut &texts, Some(try binParam(&d, oid)))
                 } else {
-                    append(mut &texts, Some(d))
+                    append(mut &texts, Some(d.clone()))
                 }
             }
             None { append(mut &texts, None) }
@@ -884,19 +884,19 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
 }
 
 fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body, at: 0, bad: false}
+    var r = Rd{s: body.clone(), at: 0, bad: false}
     let kind = r.bytes(1)
     let name = r.cstr()
     if r.bad { return Err(protoErr("invalid Describe message")) }
-    var stmtName = name
+    var stmtName = name.clone()
     if kind == "P" {
         if !ps.portals.has(&name) { return Err(lexdb_base.err("34000", &("portal \"" + name + "\" does not exist"))) }
-        stmtName = ps.portals.at(name).stmt
+        stmtName = ps.portals.at(name.clone()).stmt.clone()
     }
     if !ps.stmts.has(&stmtName) {
         return Err(lexdb_base.err("26000", &("prepared statement \"" + stmtName + "\" does not exist")))
     }
-    let p = ps.stmts.at(stmtName)
+    let p = ps.stmts.at(stmtName.clone())
     if kind == "S" {
         var b = newStrBuf()
         binary.addU16BE(mut &b, len(p.ptypes))
@@ -924,24 +924,24 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
 }
 
 fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body, at: 0, bad: false}
+    var r = Rd{s: body.clone(), at: 0, bad: false}
     let portal = r.cstr()
     let maxRows = r.i32()
     if r.bad { return Err(protoErr("invalid Execute message")) }
     if !ps.portals.has(&portal) { return Err(lexdb_base.err("34000", &("portal \"" + portal + "\" does not exist"))) }
-    let name = ps.portals.at(portal).stmt
-    if len(ps.stmts.at(name).stmts) == 0 {
+    let name = ps.portals.at(portal.clone()).stmt.clone()
+    if len(ps.stmts.at(name.clone()).stmts) == 0 {
         w.empty('I')
         return Ok(Unit{})
     }
     // the statement's plan, out for the run and back after it
-    var plan = replace(mut &ps.stmts.atMut(name).plan, lexdb_exec.oneShot())
+    var plan = replace(mut &ps.stmts.atMut(name.clone()).plan, lexdb_exec.oneShot())
     let ran = w.runPortal(ps, &portal, &name, mut &plan)
-    ps.stmts.atMut(name).plan = plan
+    ps.stmts.atMut(name.clone()).plan = plan
     var res = try ran
     if res.copy == lexdb_exec.COPY_IN {
         let cols = replace(mut &res.cols, [])
-        res = try w.copyFrom(&ps.stmts.at(name).stmts[0], &cols)
+        res = try w.copyFrom(&ps.stmts.at(name.clone()).stmts[0], &cols)
     }
     if res.copy == lexdb_exec.COPY_OUT {
         w.copyOut(&res)
@@ -966,14 +966,14 @@ fn sameCols(a: &[]lexdb_bind.OutCol, b: &[]lexdb_bind.OutCol): bool {
 }
 
 fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, lexdb_base.DbErr] {
-    let po = ps.portals.at(portal)
-    let p = ps.stmts.at(name)
+    let po = ps.portals.at(portal.clone())
+    let p = ps.stmts.at(name.clone())
     if isCopyTo(&p.stmts[0]) { return w.copyTo(&p.stmts[0], &po.params, &p.ptypes, plan) }
     if p.stmts[0].kind == lexdb_sql.S_SELECT {
         var check: Option[[]lexdb_bind.OutCol] = None
         if p.colsAt >= 0 {
             var cs: []lexdb_bind.OutCol = []
-            for c in p.cols { append(mut &cs, c) }
+            for c in p.cols { append(mut &cs, c.clone()) }
             check = Some(cs)
         }
         return w.runStreamed(&p.stmts[0], &po.params, &p.ptypes, plan, false, &check)
@@ -982,7 +982,7 @@ fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_
 }
 
 fn (w: mut &Wire) closeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body, at: 0, bad: false}
+    var r = Rd{s: body.clone(), at: 0, bad: false}
     let kind = r.bytes(1)
     let name = r.cstr()
     if kind == "S" {
@@ -1052,7 +1052,7 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 w.paramStatus("integer_datetimes", "on")
                 w.paramStatus("standard_conforming_strings", "on")
                 w.tzShown = w.sess.zone().name
-                let tzs = w.tzShown
+                let tzs = w.tzShown.clone()
                 w.paramStatus("TimeZone", &tzs)
                 w.paramStatus("application_name", "")
                 var k = newStrBuf()
@@ -1120,8 +1120,8 @@ pub fn confOf(st: &lexdb_store.Store): AuthConf {
 
 fn tlsContext(a: &AuthConf): Result[tls.Context, tls.Error] {
     var o = tls.defaults()
-    o.certFile = a.cert
-    o.keyFile = if len(a.key) > 0 { a.key } else { a.cert }
+    o.certFile = a.cert.clone()
+    o.keyFile = if len(a.key) > 0 { a.key.clone() } else { a.cert.clone() }
     return tls.server(o)
 }
 
@@ -1131,7 +1131,7 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
     if !local && conf.requireTls && len(w.eng) == 0 {
         return w.fatal(&"28000", &"lexdb: a TCP connection must use TLS (sslmode=require)")
     }
-    if (if local { conf.local } else { conf.tcp }) != "scram-sha-256" { return Ok(true) }
+    if (if local { &conf.local } else { &conf.tcp }) != "scram-sha-256" { return Ok(true) }
     let rs = match lexdb_exec.roles(&w.st) {
         Ok(x) { x }
         Err(x) { return w.fatal(&x.state, &x.msg) }
@@ -1164,7 +1164,7 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
         None { return Ok(false) }
     }
     if m1.typ != 'p' { return w.fatal(&"08P01", &"expected SASL response") }
-    var r1 = Rd{s: m1.body, at: 0, bad: false}
+    var r1 = Rd{s: m1.body.clone(), at: 0, bad: false}
     let mech = r1.cstr()
     let n1 = r1.i32()
     if r1.bad || n1 < 0 || r1.at + n1 > len(m1.body) { return w.fatal(&"08P01", &"malformed SASL message") }
@@ -1184,7 +1184,7 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
     if m2.typ != 'p' { return w.fatal(&"08P01", &"expected SASL response") }
     let fin = match lexdb_auth.serverFinal(mut &sc, &m2.body, &w.bind) {
         Ok(x) { x }
-        Err(x) { return w.fatal(&x.state, &(if x.state == "28P01" { fail } else { x.msg })) }
+        Err(x) { return w.fatal(&x.state, &(if x.state == "28P01" { fail } else { x.msg.clone() })) }
     }
     if !login { return w.fatal(&"28000", &("role \"" + user + "\" is not permitted to log in")) }
     var f = newStrBuf()
@@ -1209,7 +1209,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
     }
     if t == 'Q' {
         w.skipping = false
-        var r = Rd{s: m.body, at: 0, bad: false}
+        var r = Rd{s: m.body.clone(), at: 0, bad: false}
         let sql = r.cstr()
         try w.query(&sql)
         return Ok(true)
@@ -1240,7 +1240,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
 pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
-    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st), st: st,
+    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st.clone()), st: st,
                  skipping: false, tzShown: "", streamed: false, texts: []}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w, &ctx).unwrapOr(false) {
@@ -1284,7 +1284,7 @@ pub fn listenAll(addrs: &[]str, files: mut &[]str): Result[[]net.Listener, str] 
     for a in addrs {
         if !strings.contains(&a, "/") { continue }
         let isDir = match fs.stat(&a) { Ok(x) { x.isDir() } Err(_) { false } }
-        let path = if !isDir { a } else if strings.endsWith(&a, "/") { a + ".s.PGSQL." + port } else { a + "/.s.PGSQL." + port }
+        let path = if !isDir { a.clone() } else if strings.endsWith(&a, "/") { a + ".s.PGSQL." + port } else { a + "/.s.PGSQL." + port }
         try clearStale(&path)
         match net.listenUnix(&path) {
             Ok(ln) {
@@ -1328,7 +1328,7 @@ pub fn acceptAll(a: ListenArg): int {
     task.scope(fn(s: mut &task.Scope) {
         while len(lns) > 0 {
             let ln = pop(mut &lns)
-            s.spawn(acceptLoop, AcceptArg{ln: ln, st: st})
+            s.spawn(acceptLoop, AcceptArg{ln: ln, st: st.clone()})
         }
     })
     return 0
@@ -1355,7 +1355,7 @@ pub fn acceptLoop(a: AcceptArg): int {
                     id += 1
                     var mine: []tls.Context = []
                     if len(ctxs) > 0 { append(mut &mine, ctxs[0].share()) }
-                    s.spawn(serve, ConnArg{conn: c, st: st, id: id, ctx: mine})
+                    s.spawn(serve, ConnArg{conn: c, st: st.clone(), id: id, ctx: mine})
                 }
                 Err(e) {
                     if e.isCancelled() || e.isTimeout() { return }
