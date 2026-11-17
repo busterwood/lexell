@@ -27,8 +27,13 @@ the reasons are in [owned-str.md](owned-str.md).
 | F | Issue 9, SPEC 9.3: `match x` on a local of an owned closed type (no `drop` method) that is not used again consumes `x`, as `match move(x)` does | 76fe0863 | yes in the tested code (the compiler, the library, every test). In principle an arm that relied on its binding being a borrow could stop compiling; none did. | **Drop timing:** fields that the arm does not bind, or a value that the arm binds and then drops, are dropped at the end of the arm instead of at the end of the enclosing scope. Only visible through `drop` methods that print or do I/O. Check lexdb tests that assert on drop order or close resources in `drop`. |
 | G | Issue 4, SPEC 4.7: built-in deep `clone` for arrays, records and closed types whose parts are cloneable, generated like drop code; a type's own `clone` method wins; types with a `drop` method are not cloneable. `Map.get` and the others now work with record values. | 1480a126 | yes (only accepts more programs). An error test that expected `Map.get` to reject a plain record was changed: it now uses a record with a `drop` method. | none |
 
-Not yet decided (design/owned-str.md section 6): issues 2, 3, 5, 6, 7, 8 and
-11. Add them here as they land.
+| H | Issue 3, SPEC 9.1: a field of a temporary record can be moved out (`make().name`); the other fields drop at once | 15ef7d47 | yes (only accepts more programs) | none |
+| I | Issue 6, SPEC 8: `for x in` a temporary array of owned elements (a call result, a literal, `move(xs)`) consumes it: `x` is an owned element, not a `&T` | aef5031a | yes: verified, every program compiled before and after. A body that relied on `x` being a borrow still works, through the implicit borrow (E). | **Drop timing:** each element drops at the end of its turn instead of with the array after the loop. On early exit the untaken elements drop last to first. Only visible through `drop` methods with side effects. |
+| J | Issues 5 and 11: `toStr`/`eq` on string-holding library error and value types take `&Self` (cli, crypto, json, httpserver, redis, sqldialect `Value`/`DbError`, url, uuid, mssql `Diag`); `Option.is(&x)` | b4bbea4a | yes | none |
+| K | Issue 7, SPEC 7.4: `s += f(mut &s)` on an owned type is a borrow conflict. No compiler change: it follows from the existing rules once `str` is owned. | (spec only) | yes until the switch | At the switch, such code needs `let t = f(mut &s); s += t`. |
+
+Not yet decided (design/owned-str.md section 6): issues 2 and 8. Add them
+here as they land.
 
 **The switch itself**, when `str` becomes an owned, uncounted type, is the
 change that breaks code. Everything above is groundwork that lets code be
@@ -49,6 +54,11 @@ forms from the start:
 - **F:** in `let r = f(); match r { Err(e) { wrap(e) } }`, `wrap(e)` needs no
   `e.clone()` and no `match move(r)`, as long as `r` is not used after the
   match.
+- **H:** `make().field` moves the field out; don't clone it.
+- **I:** in `for x in f() { append(mut &out, x) }`, `x` is owned; drop the
+  `.clone()`. To consume a variable's array, write `for x in move(xs)`.
+- **J:** `x.clone().toStr()` on those types becomes `x.toStr()`; `Some(y.clone())
+  == opt` becomes `opt.is(&y)`.
 - **G:** a record or array that is really duplicated gets `x.clone()`; no
   hand-written clone methods (lexdb has `copyInts`-style helpers that become
   `xs.clone()`).

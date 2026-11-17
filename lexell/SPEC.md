@@ -624,7 +624,11 @@ declaring `eq`, and `<` and the other comparisons still need `cmp`. A compound a
 with `a` evaluated once: the index expressions in `a` run once, before `b`, and,
 as in `a = a + b`, the value is stored to the place they name after `b` has run
 (so `xs[i] += f(mut &xs)` is allowed, and `i` is checked again when it is
-stored to).
+stored to). The left operand of the operator is read like any operand: a value
+of a copy type is copied before `b` runs (`n += f(mut &n)` is allowed), and a
+value of an owned type is borrowed until the operator has run, so
+`s += f(mut &s)` is a borrow conflict (rule 3 of section 10) once `str` is an
+owned type (design/owned-str.md, issue 7). Write `let t = f(mut &s); s += t`.
 
 ### 7.5 Calls and method calls
 
