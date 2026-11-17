@@ -2734,6 +2734,210 @@ for the names, since line numbers move.
   expressions read from the plan have the same `exprText`s as from the
   `Stmt`.
 
+**2e slice 3a as built: the select list and ORDER BY go into the plan,
+not copies.** Three commits on `redesign/bind` from main f8cc121e, each
+built and through the suite (188, imports ok): 4806e9dd (the select list),
+0f61fd0d (ORDER BY), 8cd7279d (`loadEst` at `planFrom`'s start), and a
+fourth with this note. The first part of "planSelect reads its clauses
+from the LPlan" (way in of "Where 2e slice 2 left off"); GROUP BY, HAVING,
+windows, DISTINCT, LIMIT, locking, `planSet`, `planMatch` and DML are
+slice 3b. No plan and no result changes.
+
+- The select list (4806e9dd). `planSelect` no longer clones the resolved
+  list (`lpExprs` is gone). `exprs` is the list `selectCols` resolves; the
+  planner reads it in place (GROUP BY's and DISTINCT ON's matching, the
+  aggregate and DISTINCT tests, `orderCols`, `minMax`, `feedbackOf`), and
+  its first rewrite builds the planner's own list from it with
+  `rewriteList(xs, nx, keep, done)`: the new list becomes `exprs`, the
+  resolved one goes to `bx` for the plan (no clone; a second rewrite just
+  replaces `exprs`). The rewrites are `winMarks`, `collectAggs` and
+  `winSlots`; `setSubst`'s lists (`gx`) are built from `collectAggs`'
+  output, so they come after the first rewrite.
+  - Where no rewrite runs (no aggregate, grouping or window: every point
+    select), `Sel.exprs` is the resolved list and the `Project`'s is []:
+    the plan lends it. `lexdb_bind.lpLentExprs(p)` gives the `Project`'s
+    column count n where it lends (`Sel.exprs`' first n: FOR UPDATE's key
+    columns are appended after them, `semiJoins` appends a subquery's
+    key columns after them), else -1; it looks under the `Sel`'s own
+    operators (Match, Limit, Sort, Distinct). A list of no expressions
+    has no columns either, so [] with columns is unambiguous; no flag.
+  - `takeLp(sel)` takes a `Sel`'s plan whole: where the plan lends, the
+    `Project` gets a copy of `Sel.exprs`' first n (`lpRestore`). It is used
+    where a plan leaves its `Sel` (`bindFrom`'s FROM subquery and view,
+    the two sides of `planSet`) and where the `Sel`'s lists change after
+    planning (`hashSub` replaces `exprs` and empties `order`: its
+    `sp.sel.lp = takeLp(...)` comes first). So the copy is paid where the
+    plan is moved into another plan (as slice 1 paid it, once), and a
+    plan in a `Sub`, `SetOp` or `Recursive` never lends.
+  - A function's or VALUES' `Sel` lent as slice 1 left it ([]): `planSub`
+    replaces its plan by `Func`/`Values` (arguments cloned from
+    `Sel.exprs`, as before).
+  - `outBCols` and `copyBCols` make their lists with `withCapacity(n)`
+    (one allocation, no growth). Read as "make outBCols' list once".
+- ORDER BY (0f61fd0d), the same way: the keys as resolved (enum positions,
+  DISTINCT ON's added keys) are `order`; the first rewrite (`winMarks`,
+  `collectAggs`, `winSlots`) sets them aside in `bo` for the `Sort`; where
+  none runs `Sel.order` is the list and the `Sort`'s keys are []
+  (`lexdb_bind.lpLentOrder`: [] keys with `desc` non-empty). `topPlan`
+  makes a `Sort` where `desc` has entries (it was `len(order) > 0`; equal
+  lengths). `lpRestore(p, xs, order)` fills either; `takeLp` copies
+  `Sel.order` for a lending `Sort`. `desc`, `nullsFirst` and `ordKinds` stay
+  as they were (copies of bools; not moved). `planSet`'s own ORDER BY
+  keeps its clone (slice 3b).
+- `loadEst` (8cd7279d): `bindFrom` no longer calls it. `planFrom` starts
+  by loading each table level's statistics (`src < 0 && work < 0`, which
+  is `bindFrom`'s old `f.sub < 0 && f.work < 0`: a view's level has its
+  `work` set, a FROM subquery's its `src`) before anything reads `est`.
+  `bindFrom` now calls the planner only through `planSub`.
+- The scratch check (`~/tpch-w/bind/e6/tools/xpatch.py` on a copy of
+  `lexell/cmd`, main's or the branch's; anchors asserted): one `LPCHK
+  XSEL` line at the end of `planSelect` and `planSet` and of `hashSub`,
+  with `Sel.exprs`, `Sel.order`, `desc`/`nullsFirst`, `gx`/`gord` (the
+  planner's lists) and every `Project`'s list and `Sort`'s keys in the
+  `Sel`'s plan by `exprText` (a list the top lends read from the `Sel`;
+  one lent anywhere else printed `LENT`). Builds of main f8cc121e
+  (`lexdb-chk-m`) and 0f61fd0d (`lexdb-chk-b2`):
+  - the suite (snapshots with slice 1's patched `run.py`): 99,967 lines
+    on main, 98,694 on the branch; sorted, identical but for 1,273
+    lines of `exec_autostats` (one point select repeated "until it is
+    done", whose count varies by run). No `LENT` in either;
+  - the naming battery: 284 lines, identical line for line (also at
+    4806e9dd); TPC-H's 22: 105 lines, identical line for line;
+  - a throwaway build counting what lends, over the battery: of 260
+    `planSelect`s, 214 lend the select list (46 have the planner's own:
+    aggregates, windows) and 87 lend their ORDER BY keys.
+  - `loadEst`'s move, slice 2's check (`~/tpch-w/bind/e5/tools/mspatch.py`:
+    `ms`/`ps` per level, and each level's path, join and semi-join at
+    the end) on main and 8cd7279d: the battery's 656 lines and TPC-H's
+    194 identical line for line.
+- Gates: the suite on each commit's snapshot (188, imports ok); the naming
+  battery (1,505 lines) identical from main, each commit and the check
+  builds; TPC-H all 22 checksums the baseline's (fields [0] and [8]
+  against `~/tpch/out-baseline-1744ef99`) on every run (main, the branch,
+  their copies, the four check builds).
+- Speed, one pass, against main f8cc121e (`lexdb-mf8`) and 76118b8a from
+  before slice 1 (`lexdb-m761`), both built from `git archive` into
+  `~/tpch-w/bind/e6/src-*`; the branch at 8cd7279d (`lexdb-b`):
+  - TPC-H (`~/tpch-w/bind/e6/tpch1.sh`, SF1, 1 run, boost off by
+    `run.sh`): total 29,332 against 29,396 ms (0.998). Past 1.5%: q1 1.037
+    (2,259 to 2,342 ms), and q2 0.983, q18 0.981, q22 0.985 the other
+    way. One repeat on byte-identical copies (`lexdb-mf8c`, `lexdb-bc`):
+    total 29,322 against 29,335 (1.000), q1 0.997 (main's copy took
+    2,370 ms: its first run was the outlier); past 1.5% only faster ones
+    (q5 0.974, q18 0.984, q20 0.981).
+  - `~/tpch-w/bind/e2/simple.sh` (pgbench `-M simple`, 4 clients, 10 s,
+    boost off, one round, binaries alternating), tps:
+
+    | | m761 | main f8cc121e | branch | branch / main | branch / m761 |
+    |---|---|---|---|---|---|
+    | point selects | 38,832 | 37,398 | 37,303 | 0.997 | 0.961 |
+    | updates | 9,077 | 9,110 | 9,077 | 0.996 | 1.000 |
+    | 3-table join, ORDER BY, LIMIT | 16,527 | 15,365 | 15,798 | 1.028 | 0.956 |
+
+  - `pk_point20k` (`~/tpch-w/bind/e2/pts.sh`, 20,000 `select * from w
+    where id = n` by the simple protocol; 5 runs per server, one round,
+    boost off), server CPU ms, medians (range): m761 832 (828-835), main
+    884 (883-885), branch 866 (865-874); wall 894, 947, 931.
+  - How much of slice 1's cost came back: on `pk_point20k`, main is +6.3%
+    over m761 and the branch +4.1%: 18 of the 52 ms, about a third. On the
+    join, 433 of the 1,162 tps lost (37%). On pgbench's point select
+    (`SELECT abalance`, one output column, no ORDER BY) nothing measurable:
+    there the clone saved is one `Expr.Col`, within the round's noise.
+    The rest is the per-operator column lists the FROM part builds (the
+    `Get`'s `bcolOf` per table column, the `Filter`'s copy of them), the
+    `Project`'s `outBCols` and the plan's drop: slice 1's scratch variant
+    without the `Get`, `Join` and `Filter` columns (`x2`) measured +1.4%
+    where the branch then was +5.3%. Not in this slice's scope.
+  - Not run (as asked): more rounds, the 35 queries, OLTP and the loads,
+    the plan cache count (`pc.sh`), `qmulti.sh`, `pstat.sh`, a profile.
+    No simple-protocol result regressed against main.
+- Lines:
+
+  | Module | main f8cc121e | after |
+  |---|---|---|
+  | `lexdb_exec` | 28042 | 28089 |
+  | `lexdb_bind` | 1936 | 1982 |
+
+**Where 2e slice 3a left off, and how to start slice 3b.** Slice 3b moves
+the rest of `planSelect`'s clauses the same way, then `planSet`,
+`planMatch` and DML, and should take back what is left of slice 1's cost
+on simple-protocol SELECT planning. Everything named is in `lexdb_exec`
+unless the note says otherwise; search for the names, since line numbers
+move.
+
+- What is there after slice 3a:
+  - `planSelect`'s select list and ORDER BY are the binder's lists, read
+    in place and moved into the plan (`bx`, `bo` by `rewriteList`), or
+    lent to the `Sel` where no rewrite runs (`lexdb_bind.lpLentExprs`,
+    `lpLentOrder`, `lpRestore`; `takeLp`). `lpGroup`, `lpHaving`, `lpWins`
+    are still clones; `lpOn` (DISTINCT ON) was already moved; LIMIT's
+    `Limit` clones `s.limit`/`s.offset` (`optClone`).
+  - `bindFrom` calls the planner only through `planSub` (FROM subqueries,
+    views, expression subqueries); statistics load in `planFrom`.
+- The pattern, for each remaining clause: find where the planner first
+  rewrites it and whether a rewrite always runs.
+  - GROUP BY (`lpGroup`): resolved by `resolveGroup` (binder); the planner
+    then drops redundant keys (`gb`, by the primary keys: a rebuild with
+    `clone`), so where `aggQ` and one set, `groupBy` is rebuilt by clones
+    anyway. Move the resolved list into the `Agg` and build `gb` from it
+    (the redundant-key loop reads `groupBy[gi]`; clone only the kept
+    ones, as today). `Sel.groupBy` is also replaced by `hashSub` (a
+    scalar subquery's keys): `takeLp` already runs first there, so a lent
+    group list would need `lpRestore` to fill the `Agg` too.
+  - HAVING (`lpHaving`): `collectAggs` always rewrites it where present
+    (it is only present with `aggQ`), so the resolved tree can move into
+    the `Filter` and `collectAggs` read it there; no lending needed.
+  - Windows (`lpWins`): `winPlan` and the `collectAggs` pass over
+    `wdefs` rewrite them only with aggregates; `wins` (`WinPlan`) is the
+    planner's form, so `wdefs` can move into the `Window` after `winPlan`
+    has read it (`winPlan(&d)` borrows), with the `collectAggs` pass
+    building its own copies first.
+  - DISTINCT and LIMIT: `Distinct` takes `lpOn` already; `Limit` holds
+    the parsed `s.limit`/`s.offset` (not resolved: `evalInt` reads the
+    `Stmt`'s per plan): a clone of a literal, cheap; moving it needs the
+    `Stmt` owned, which it is not (the plan cache's statements are
+    borrowed).
+  - Locking: no `Lock` operator yet; `applyLocks` sets `Level.lock`.
+- Where the remaining cost is: not in `planSelect`'s clauses. For a point
+  select every list is now built once, except the column lists: the
+  `Get`'s (`bcolOf` of each table column, in `bindFrom`), the `Filter`'s
+  copy of them (`lpCols`), the `Project`'s (`outBCols`), each with its
+  strings counted, and dropping the plan. Slice 1's `x2` measured those
+  FROM-part lists at about 2% of `pk_point20k`'s CPU. Ways to take them
+  back, for a coordinator to choose (each changes slice 1's "every
+  operator with its list" shape, which the user asked for): the
+  pass-through operators' columns read from their input (`x3`, measured
+  small); or the `Get`'s columns made once per table version (kept with
+  the catalog's `Table`) and shared. Profile first (`~/tpch-w/bind/e2/
+  profg.sh`, `incl.py`; symbols from `LXL_NATIVE_MAP`).
+- Traps (slice 2's still hold; and):
+  - A plan that lends (`Project` [] with columns, `Sort` [] keys with
+    `desc`) is only whole beside its `Sel`. Anything that moves a `Sel`'s
+    plan out of it, or changes `Sel.exprs`' first n or `Sel.order` after
+    `planSelect`, must call `takeLp` first (today: `bindFrom` twice,
+    `planSet`, `hashSub`). Appending after the first n is fine
+    (`semiJoins`, FOR UPDATE). A reader of `Sel.lp` reads the lent lists
+    from the `Sel` (or takes the plan with `takeLp`). Slice 1's check
+    (`patch.py`'s `lpValid`: a `Project`'s expressions one per column, a
+    `Sort`'s keys as many as `desc`) would flag every lending plan; it
+    was not run or updated in 3a.
+  - `rewriteList` moves the resolved list aside only on the first
+    rewrite; a later plain assignment (`exprs = replace(mut &gx[0], [])`)
+    is right only because `collectAggs` has already run. A new rewrite
+    placed before the first must go through `rewriteList`.
+  - `topPlan` makes a `Sort` where `desc` has entries, not `order`: a
+    caller must pass `desc` as long as the keys.
+  - `rewrite` is taken (a table rewrite for ALTER); the helper is
+    `rewriteList`.
+- Gates (as slice 3a's): the suite (188, imports ok); the naming battery
+  (1,505 lines) identical; TPC-H all 22 against
+  `~/tpch/out-baseline-1744ef99` (fields [0] and [8]), q1 and q18
+  layout-sensitive; the simple-protocol A/B (`simple.sh`) and
+  `pk_point20k` (`pts.sh`) against m761 and main; and for each clause
+  moved the `exprText` check: `xpatch.py` prints the `Sel`'s lists and
+  every `Project`'s and `Sort`'s; extend `xTree` to print `Agg`'s keys,
+  `Filter`'s predicate and `Window`'s definitions as their clauses move.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**

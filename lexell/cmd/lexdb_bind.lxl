@@ -90,7 +90,7 @@ pub fn outBCol(slot: int, o: &OutCol, mod: int): BCol {
 }
 
 pub fn copyBCols(cs: &[]BCol): []BCol {
-    var out: []BCol = []
+    var out: []BCol = withCapacity(len(cs))
     for c in cs { append(mut &out, BCol{slot: c.slot, name: c.name, spell: c.spell, ty: c.ty}) }
     return out
 }
@@ -124,10 +124,12 @@ pub type LPlan = closed {
                                                     // aggregates are read by #agg slot, as BX.Agg)
     Window(LPlan, []lexdb_sql.WinDef, []BCol)       // the window calls (named windows merged); its input's columns (the values at
                                                     // #agg slots after the aggregates')
-    Project(LPlan, []Expr, []BCol)                  // the select list, * expanded; the outputs at 0..
+    Project(LPlan, []Expr, []BCol)                  // the select list, * expanded ([] where the Sel has it: lpLentExprs); the
+                                                    // outputs at 0..
     Distinct(LPlan, []Expr, []BCol)                 // DISTINCT ON's expressions, [] plain DISTINCT; its input's columns
-    Sort(LPlan, []Expr, []bool, []bool, []BCol)     // ORDER BY's keys (DISTINCT ON's added), descending, NULLs first; read over
-                                                    // the Project's input and outputs (orderValue); its input's columns
+    Sort(LPlan, []Expr, []bool, []bool, []BCol)     // ORDER BY's keys (DISTINCT ON's added; [] where the Sel has them:
+                                                    // lpLentOrder), descending, NULLs first; read over the Project's
+                                                    // input and outputs (orderValue); its input's columns
     Limit(LPlan, Option[Expr], Option[Expr], bool, int, []BCol)  // LIMIT/FETCH/TOP's count, OFFSET, WITH TIES, lexdb_sql.TOP_*
     SetOp(int, bool, LPlan, LPlan, []BCol)          // lexdb_sql.SET_*, ALL, left, right; the common types
     Recursive(int, LPlan, LPlan, []BCol)            // a recursive CTE: its number, the anchor, the recursive term
@@ -159,6 +161,50 @@ pub fn lpCols(p: &LPlan): []BCol {
     }
 }
 
+// The lists a SELECT's plan lends its Sel (lexdb_exec's planSelect): where
+// the planner rewrote no part of the select list, the list is the Sel's
+// (Sel.exprs, its first n: the Project's columns') and the Project's is [];
+// where it rewrote no ORDER BY key, the keys are the Sel's (Sel.order) and
+// the Sort's are [] (its desc says how many). Both under the Sel's own
+// operators (Match, Limit, Sort, Distinct, Project).
+
+// The Project's n where it lends its list, -1 where it has its own or there
+// is no Project.
+pub fn lpLentExprs(p: &LPlan): int {
+    match p {
+        LPlan.Match(i, _) { return lpLentExprs(&i) }
+        LPlan.Limit(i, _, _, _, _, _) { return lpLentExprs(&i) }
+        LPlan.Sort(i, _, _, _, _) { return lpLentExprs(&i) }
+        LPlan.Distinct(i, _, _) { return lpLentExprs(&i) }
+        LPlan.Project(_, xs, c) { return if len(xs) == 0 && len(c) > 0 { len(c) } else { -1 } }
+        else { return -1 }
+    }
+}
+
+// Whether the Sort lends its keys.
+pub fn lpLentOrder(p: &LPlan): bool {
+    match p {
+        LPlan.Match(i, _) { return lpLentOrder(&i) }
+        LPlan.Limit(i, _, _, _, _, _) { return lpLentOrder(&i) }
+        LPlan.Sort(_, k, d, _, _) { return len(k) == 0 && len(d) > 0 }
+        else { return false }
+    }
+}
+
+// p with the lists it lends: the Project's xs, the Sort's order.
+pub fn lpRestore(p: LPlan, xs: []Expr, order: []Expr): LPlan {
+    match move(p) {
+        LPlan.Match(i, c) { return LPlan.Match(lpRestore(i, xs, order), c) }
+        LPlan.Limit(i, n, o, t, m, c) { return LPlan.Limit(lpRestore(i, xs, order), n, o, t, m, c) }
+        LPlan.Sort(i, k, d, nf, c) {
+            let lent = len(k) == 0 && len(d) > 0
+            return LPlan.Sort(lpRestore(i, xs, []), if lent { order } else { k }, d, nf, c)
+        }
+        LPlan.Distinct(i, on, c) { return LPlan.Distinct(lpRestore(i, xs, order), on, c) }
+        LPlan.Project(i, px, c) { return LPlan.Project(i, if len(px) == 0 && len(c) > 0 { xs } else { px }, c) }
+        else { panic("lpRestore: no Project") }
+    }
+}
 
 // ---- common types (PostgreSQL's parse_coerce.c select_common_type)
 
