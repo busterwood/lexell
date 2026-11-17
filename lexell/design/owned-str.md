@@ -198,7 +198,11 @@ whether it was confirmed with a test.
    make borrowing a field the normal way to read one, so this will come up
    everywhere. Freezes should record the borrowed path, as rule 3 already
    does for borrows taken at a call. Seen in json, regex_syntax and http
-   (batches 2 and 5).
+   (batches 2 and 5), markdown and pgwire (batch 8). Worst case:
+   `jq_parse.next()` clones the whole jq source for every token, because
+   `let s = &p.src` blocks the assignment to `p.tok`. That is a count
+   today, but after the switch it copies about 10 KB per token, so this
+   issue must be fixed before the switch.
 2. **Temporaries inside an array-literal argument cannot be views.**
    `f(&["GET", key, n.toStr()])` with `f(args: &[&str])` is rejected for the
    temporary `n.toStr()`. A temporary argument already lives to the end of
