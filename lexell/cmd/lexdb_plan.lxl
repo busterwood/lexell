@@ -1,11 +1,12 @@
 // lexdb_plan: the planner's data vocabulary: a path into a table, a way
-// to join it, a level's statistics, and the estimates compared to choose
-// them. The path and join-order search moves here next; the executor
-// still builds and reads this representation, so its fields are public.
+// to join it, and the estimates compared to choose them (a table's
+// statistics are lexdb_stats'). The path and join-order search moves here
+// next; the executor still builds and reads this representation, so its
+// fields are public.
 import "./lexdb_base"
 import "./lexdb_sql"
-import "./lexdb_catalog"
 import "./lexdb_bind"
+import "./lexdb_stats"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -13,7 +14,6 @@ type TypeName = lexdb_sql.TypeName
 
 
 pub const IN_LOOKUP_MAX: int = 1000
-pub const COMMON_MAX: int = 16
 pub const JOIN_SEARCH_MAX: int = 24
 pub const JOIN_EXACT_MAX: int = 8
 pub const JOIN_BEST: int = 10
@@ -74,7 +74,7 @@ pub type Bound = record { pub op: str; pub val: Expr }
 // kind 0: an implication (c implies p; out 1 yes); 1: a LIMIT or OFFSET (c;
 // out its value); 2: an estimate (c a parameter equal to an index's leading
 // column of type typ, its common values cm; out the estimate's scale, optimizer 23).
-pub type Look = record { pub kind: int; pub c: Expr; pub p: Expr; pub out: int; pub typ: lexdb_sql.TypeName; pub cm: Common }
+pub type Look = record { pub kind: int; pub c: Expr; pub p: Expr; pub out: int; pub typ: lexdb_sql.TypeName; pub cm: lexdb_stats.Common }
 
 // "column op value", from a comparison of a column with a constant.
 pub type Cmp = record { pub col: str; pub op: str; pub val: Val }
@@ -94,77 +94,10 @@ pub type WayCand = record { pub index: int; pub tree: int; pub unique: bool; pub
 // once as a hashed table (row by row, optimizer 36).
 pub type Way = record { pub rows: float; pub cost: float; pub outer: bool; pub inner: float }
 
-// columns (a NULL counted as a value), and its leading column's most common
-// values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
-// of the name, or SET lexdb_planner = rules).
-pub type Est = record { pub rows: int; pub trees: []int; pub entries: []int; pub dist: [][]int; pub cm: []Common; pub lo: []float; pub hi: []float; pub span: []bool; pub samp: []str;
-                    pub cols: []str; pub cnd: []int }
-
-// An index's leading column (optimizer 23): its entries, its distinct values, and its
-// most common values (their encoded index parts) with their exact counts:
-// those above the average, at most COMMON_MAX. d -1: unknown.
-pub type Common = record { pub entries: int; pub d: int; pub keys: []str; pub cnts: []int }
-
 // What the statistics say a path reads (optimizer 24): rows, and whether that is an
 // estimate or only a bound (at most rows). rows -1: no figure (no
 // statistics, or an index ANALYZE has not seen).
 pub type Fig = record { pub rows: int; pub bound: bool }
-
-// The rows an index path with eqs leading equalities is expected to read, the
-// first equal to key ("" unknown): with one equality, by the common values;
-// else its entries over the distinct values of that prefix. -1 unknown.
-pub fn (es: &Est) rowsFor(tree: int, eqs: int, key: &str): int {
-    if es.rows < 0 || eqs <= 0 { return -1 }
-    for i in 0..len(es.trees) {
-        if es.trees[i] == tree && eqs <= len(es.dist[i]) {
-            if eqs == 1 { return rowsOf(&es.cm[i], key) }
-            let d = es.dist[i][eqs - 1]
-            if d > 0 { return (es.entries[i] + d - 1) / d }
-        }
-    }
-    return -1
-}
-
-// A copy of an index's common values, for a look (optimizer 23).
-pub fn (es: &Est) commonOf(tree: int): Common {
-    for i in 0..len(es.trees) {
-        if es.trees[i] == tree {
-            let c = &es.cm[i]
-            var n: []int = []
-            for x in c.cnts { append(mut &n, x) }
-            return Common{entries: c.entries, d: c.d, keys: lexdb_catalog.copyStrs(&c.keys), cnts: n}
-        }
-    }
-    return noCommon()
-}
-
-// An index's (or the primary key's, by the table's tree) entries; -1 none.
-pub fn (es: &Est) entriesOf(tree: int): int {
-    for i in 0..len(es.trees) { if es.trees[i] == tree { return es.entries[i] } }
-    return -1
-}
-
-pub fn noEst(): Est { return Est{rows: -1, trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []} }
-
-pub fn noCommon(): Common { return Common{entries: 0, d: -1, keys: [], cnts: []} }
-
-// The rows expected equal to key (an encoded index part; "" unknown): its
-// count when it is a common value, else the average of the other values.
-pub fn rowsOf(cm: &Common, key: &str): int {
-    if cm.d <= 0 { return -1 }
-    if len(key) > 0 && len(cm.keys) > 0 {
-        let k = key.toStr()
-        var inCommon = 0
-        for j in 0..len(cm.keys) {
-            if cm.keys[j] == k { return cm.cnts[j] }
-            inCommon += cm.cnts[j]
-        }
-        let rest = cm.d - len(cm.keys)
-        if rest <= 0 { return 0 }
-        return (cm.entries - inCommon + rest - 1) / rest
-    }
-    return (cm.entries + cm.d - 1) / cm.d
-}
 
 // ---- the physical plan (design/lexdb-layers.md 6.1, step 3)
 //
@@ -182,6 +115,7 @@ pub type PPlan = closed {
     Levels(int, []PSub)             // today's level chain (Query.levels: the tables in join order, each by its path and
                                     // join method; semi and anti levels), its number of levels; its subqueries by number
     Scan(PScan, []PSub)             // one table read by the pipeline; its subqueries
+    Join(PPlan, PJoin)              // the rows below joined with one more table (slice P2): its outer input, the join
     Filter(PPlan, []lexdb_bind.BX)  // the conditions a row must meet, bound over the query's columns (moved from Query.cc)
     Result([]PSub)                  // no FROM: one row if the WHERE holds; its subqueries
     Func(str, bool, []PSub)         // a function or VALUES in FROM: its name (Sel.srf), WITH ORDINALITY; its arguments' subqueries
@@ -222,6 +156,50 @@ pub type PScan = record {
     pub batch: bool
 }
 
+// How a join's table is read (PJoin.how).
+pub const JH_HASH: int = 0      // once, its rows hashed by its key columns, probed by the outer rows' keys
+pub const JH_LOOK: int = 1      // per outer row, by its whole primary key (the keys: its columns' values)
+pub const JH_RANGE: int = 2     // per outer row, the range of its path's leading equalities (the keys), then its bounds
+pub const JH_ROWS: int = 3      // once, the rows of a subquery (its run's) hashed by its key columns (slice P2b)
+
+// What a join gives (PJoin.mark): the joined rows, or the outer rows
+// once each that have a match (semi) or none (anti).
+pub const MK_JOIN: int = 0
+pub const MK_SEMI: int = 1
+pub const MK_ANTI: int = 2
+
+// A table joined to the rows below it (slice P2; design/lexdb-layers.md
+// 6.2.3), an inner, LEFT or RIGHT join, or a semi or anti join. Its expressions are bound over the
+// query's columns; its keys read only the tables before it.
+pub type PJoin = record {
+    pub how: int
+    pub kind: int               // lexdb_sql.J_INNER (a CROSS JOIN's too), J_LEFT or J_RIGHT (a hash's: its rows that join nothing after the rest)
+    pub mark: int               // MK_*
+    // a semi or anti join's "inner <> outer" kept as a summary per key (no
+    // rows): its column (the table's; -1 none) and the outer value
+    pub resCol: int
+    pub res: []lexdb_bind.BX
+    pub scan: PScan             // its table: level, first slot, kinds, the columns decoded (needs)
+    pub build: []lexdb_bind.BX  // JH_HASH: the conditions on its own columns, applied as its rows are read
+    pub hcols: []int            // JH_HASH: its key columns (the table's)
+    pub keys: []lexdb_bind.BX   // per key column: the value it equals, of the rows below
+    // per key column its type (lookups and ranges: the key's; a hash: the
+    // column's), the keys made as the row engine makes them (keyVal); a
+    // range's bounds' column's type after them
+    pub ktypes: []lexdb_sql.TypeName
+    pub exact: bool             // JH_HASH: its key columns compared under no collation
+    pub conds: []lexdb_bind.BX  // per candidate row: the join's conditions but those its hash applied
+    pub keq: int                // JH_HASH: the one key's equality among conds (-1 none): left out where the hash compares by value
+    pub post: []lexdb_bind.BX   // a LEFT JOIN's WHERE conjuncts, after its NULL rows are made
+    pub index: int              // JH_RANGE: the path's index (-1 the primary key)
+    pub rng: []PBound           // JH_RANGE: its bounds on the column after the equalities (constants of the run)
+    pub capNulls: bool          // JH_RANGE: an index's range leaves out its next column's NULLs
+    pub noNulls: bool           // JH_RANGE: the path's (Path.noNulls), for a range read in pieces
+}
+
+// A range's bound: ">", ">=", "<" or "<=" its value.
+pub type PBound = record { pub op: str; pub val: lexdb_bind.BX }
+
 // An aggregate the pipeline runs (lexdb_pipe's; slice P1b): per group of
 // the keys' values, each call's value. Without keys, one group (the plain
 // aggregate); with them, a hash aggregate. The keys, arguments and
@@ -260,6 +238,100 @@ pub fn callsNeed(n: int, conds: &[]lexdb_bind.BX, calls: &[]PCall): []bool {
     return used
 }
 
+// The required columns (design/lexdb-layers.md 6.2.2): each table read
+// by plan p decodes only the columns its operators read (its own
+// conditions, the joins' keys, conditions and WHERE conjuncts, a hash's
+// key columns, the outputs, an aggregate's keys, calls and the columns a
+// group keeps), per table instance by its slots (two instances of a
+// table, or a "*" elsewhere in the statement, widen nothing). n: the
+// query's columns. A table's need is set in its arm (PScan.need, part).
+// Above a join only row numbers are carried, so a column is gathered
+// once, by the operator that reads it (lexdb_pipe).
+pub fn needs(p: PPlan, n: int): PPlan {
+    var used: []bool = array(n, false)
+    planUses(&p, mut &used)
+    return withNeeds(p, &used)
+}
+
+fn planUses(p: &PPlan, used: mut &[]bool) {
+    match p {
+        PPlan.Scan(_, _) {}
+        PPlan.Join(i, j) {
+            planUses(&i, used)
+            for x in j.build { uses(&x, used) }
+            for x in j.keys { uses(&x, used) }
+            for x in j.conds { uses(&x, used) }
+            for x in j.post { uses(&x, used) }
+            for c in j.hcols { if j.scan.first + c < len(used) { used[j.scan.first + c] = true } }
+            for x in j.res { uses(&x, used) }
+            if j.resCol >= 0 && j.scan.first + j.resCol < len(used) { used[j.scan.first + j.resCol] = true }
+        }
+        PPlan.Filter(i, cs) {
+            planUses(&i, used)
+            for x in cs { uses(&x, used) }
+        }
+        PPlan.Agg(i, _, pa) {
+            planUses(&i, used)
+            match pa {
+                Some(a) {
+                    for x in a.keys { uses(&x, used) }
+                    let none: []lexdb_bind.BX = []
+                    let calls = callsNeed(len(used), &none, &a.calls)
+                    for c in 0..len(calls) { if calls[c] { used[c] = true } }
+                    for c in 0..len(a.keep) { if a.keep[c] && c < len(used) { used[c] = true } }
+                }
+                None {}
+            }
+        }
+        PPlan.Project(i, xs) {
+            planUses(&i, used)
+            for x in xs { uses(&x, used) }
+        }
+        PPlan.Limit(i, _, _, _) { planUses(&i, used) }
+        PPlan.Sort(i, _) { planUses(&i, used) }
+        PPlan.Having(i) { planUses(&i, used) }
+        PPlan.Distinct(i, _) { planUses(&i, used) }
+        PPlan.Match(i) { planUses(&i, used) }
+        else {}
+    }
+}
+
+// p with each of its tables' need set from used (the query's columns read).
+fn withNeeds(p: PPlan, used: &[]bool): PPlan {
+    match move(p) {
+        PPlan.Scan(sc, subs) { return PPlan.Scan(scanNeed(sc, used), subs) }
+        PPlan.Join(i, j) {
+            var jj = j
+            jj.scan = scanNeed(replace(mut &jj.scan, noScan()), used)
+            return PPlan.Join(withNeeds(i, used), jj)
+        }
+        PPlan.Filter(i, cs) { return PPlan.Filter(withNeeds(i, used), cs) }
+        PPlan.Agg(i, sets, pa) { return PPlan.Agg(withNeeds(i, used), sets, pa) }
+        PPlan.Project(i, xs) { return PPlan.Project(withNeeds(i, used), xs) }
+        PPlan.Limit(i, stops, n, off) { return PPlan.Limit(withNeeds(i, used), stops, n, off) }
+        PPlan.Sort(i, sorted) { return PPlan.Sort(withNeeds(i, used), sorted) }
+        PPlan.Having(i) { return PPlan.Having(withNeeds(i, used)) }
+        PPlan.Distinct(i, on) { return PPlan.Distinct(withNeeds(i, used), on) }
+        PPlan.Match(i) { return PPlan.Match(withNeeds(i, used)) }
+        PPlan.Levels(n, subs) { return PPlan.Levels(n, subs) }
+        PPlan.Result(subs) { return PPlan.Result(subs) }
+        PPlan.Func(n, o, subs) { return PPlan.Func(n, o, subs) }
+        PPlan.SetOp(k, all, r, parts, subs) { return PPlan.SetOp(k, all, r, parts, subs) }
+        PPlan.MinMax(i) { return PPlan.MinMax(i) }
+        PPlan.Window(i) { return PPlan.Window(i) }
+        PPlan.Lock(i) { return PPlan.Lock(i) }
+    }
+}
+
+fn scanNeed(sc: PScan, used: &[]bool): PScan {
+    var s = sc
+    for i in 0..len(s.need) { s.need[i] = s.first + i < len(used) && used[s.first + i] }
+    s.part = true
+    return s
+}
+
+pub fn noScan(): PScan { return PScan{level: -1, first: 0, kinds: [], need: [], part: false, batch: false} }
+
 // The query's columns x reads, set in used.
 fn uses(x: &lexdb_bind.BX, used: mut &[]bool) {
     var slots: []int = []
@@ -284,6 +356,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
     match p {
         PPlan.Levels(_, s) { return &s }
         PPlan.Scan(_, s) { return &s }
+        PPlan.Join(i, _) { return pSubs(&i) }
         PPlan.Filter(i, _) { return pSubs(&i) }
         PPlan.Result(s) { return &s }
         PPlan.Func(_, _, s) { return &s }
@@ -305,6 +378,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
 pub fn pLeaf(p: &PPlan): &PPlan {
     match p {
         PPlan.Filter(i, _) { return pLeaf(&i) }
+        PPlan.Join(i, _) { return pLeaf(&i) }
         PPlan.MinMax(i) { return pLeaf(&i) }
         PPlan.Agg(i, _, _) { return pLeaf(&i) }
         PPlan.Having(i) { return pLeaf(&i) }

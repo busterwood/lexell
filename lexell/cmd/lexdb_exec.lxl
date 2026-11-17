@@ -20,8 +20,6 @@ import "strings"
 import "collections"
 import "time"
 import "task"
-import "os"
-import "hash"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
@@ -38,6 +36,7 @@ import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_plan"
+import "./lexdb_stats"
 import "./lexdb_bind"
 import "./lexdb_ops"
 import "./lexdb_pipe"
@@ -816,145 +815,16 @@ fn catVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, Db
 
 fn bumpCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, DbErr] {
     let v = try catVersion(st, txn)
-    try txn.put(lexdb_catalog.CATALOG, CAT_VERSION, &(nextVersion(&v)))
+    try txn.put(lexdb_catalog.CATALOG, CAT_VERSION, &(lexdb_catalog.nextVersion(&v)))
     return Ok(Unit{})
 }
 
-// Bumps made in this process: with the number, a version a bump gives is
-// unique, so a bump in a block that rolls back cannot give the version a
-// later bump commits (a plan kept under the first would be taken for the
-// second: optimizer 20).
-var VERSION_BUMPS: int = 0
-
-// The version after v: its count plus one, and a token unique in this process.
-fn nextVersion(v: &str): str {
-    let dot = strings.indexOf(&v, ".", 0)
-    let nv: str = if dot < 0 { v.toStr() } else { v[0..dot] }
-    let n = strings.parseIntOpt(&nv).unwrapOr(0)
-    VERSION_BUMPS += 1
-    return (n + 1).toStr() + "." + VERSION_BUMPS.toStr() + "." + time.monotonicNs().toStr()
-}
-
-// ---- statistics (optimizer 20): ANALYZE's row per table, keyed "\x02stat\x00"
-// then the table's catalog key (with the other \x02 rows; it was \x05, the
-// roles' prefix since 9.81: optimizer 40), its text "tree;rows" then
-// ";indextree:entries:d1,d2,..." per index. The table's tree is in it, so
-// an older table of the same name's statistics are not used.
-fn statKey(name: &str): str { return "\x02stat\x00" + name }
-
-// A key's bytes as hex, and back (the statistics' text row).
-fn toHex(s: &str): str {
-    let digits = "0123456789abcdef"
-    var b = newStrBuf()
-    for i in 0..len(s) {
-        b.addByte(digits[int(s[i]) / 16])
-        b.addByte(digits[int(s[i]) % 16])
-    }
-    return b.toStr()
-}
-
-// The statistics' version: a row ANALYZE bumps, apart from the catalog's, so
-// that statements that read the catalog's version do not conflict with an
-// ANALYZE. It is read unnoted (getUnnoted), as the statistics are: they
-// change plans, never results. A prepared statement's plan is kept under it.
-const STAT_VERSION: str = "\x02stats"
-
-fn statVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
-    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, STAT_VERSION) {
-        Some(v) { return Ok(v) }
-        None { return Ok("0") }
-    }
-}
-
-// The statistics of a table moved to a new catalog key (RENAME, SET SCHEMA).
-fn moveStats(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str, new: &str): Result[Unit, DbErr] {
-    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(old))) {
-        Some(v) {
-            txn.del(lexdb_catalog.CATALOG, &(statKey(old)))
-            try txn.put(lexdb_catalog.CATALOG, &(statKey(new)), &v)
-        }
-        None {}
-    }
-    return Ok(Unit{})
-}
-
-// A table's statistics as the transaction sees them (none with SET
-// lexdb_planner = rules).
-// join: a table of a SELECT's join, whose order its rows decide (optimizer 26).
-fn loadEst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, join: bool): Result[Est, DbErr] {
-    // the statistics choose between candidates: two indexes, or an index and
-    // a primary key of several columns (optimizer 24); or a join's order
-    let cands = len(t.indexes) + (if len(t.pk) >= 2 { 1 } else { 0 })
-    if txn.sql.rules || t.tree < 0 || (cands < 2 && !join) { return Ok(lexdb_plan.noEst()) }
-    let got = try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(&t.name)))
-    if got.isNone() { return Ok(lexdb_plan.noEst()) }
-    let v = got.unwrap()
-    let parts = strings.split(&v, ";")
-    if len(parts) < 2 || strings.parseIntOpt(&(parts[0].toStr())).unwrapOr(-1) != t.tree { return Ok(lexdb_plan.noEst()) }
-    var es = Est{rows: strings.parseIntOpt(&(parts[1].toStr())).unwrapOr(-1), trees: [], entries: [], dist: [], cm: [], lo: [], hi: [], span: [], samp: [], cols: [], cnd: []}
-    for i in 2..len(parts) {
-        let f = strings.split(&parts[i], ":")
-        if len(f) == 2 && f[0] == "d" {
-            // the other columns' distinct values (optimizer 39)
-            for kv in strings.split(&f[1], ",") {
-                let eq = strings.indexOf(&kv, "=", 0)
-                if eq < 0 { continue }
-                append(mut &es.cols, lexdb_catalog.fromHex(&kv[0..eq]))
-                append(mut &es.cnd, strings.parseIntOpt(&(kv[eq + 1..len(kv)].toStr())).unwrapOr(-1))
-            }
-            continue
-        }
-        if len(f) < 3 { continue }
-        var ds: []int = []
-        for x in strings.split(&f[2], ",") { append(mut &ds, strings.parseIntOpt(&(x.toStr())).unwrapOr(0)) }
-        let ents = strings.parseIntOpt(&(f[1].toStr())).unwrapOr(0)
-        var cm = Common{entries: ents, d: if len(ds) > 0 { ds[0] } else { -1 }, keys: [], cnts: []}
-        if len(f) >= 4 && len(f[3]) > 0 {
-            for kv in strings.split(&f[3], ",") {
-                let eq = strings.indexOf(&kv, "=", 0)
-                if eq < 0 { continue }
-                append(mut &cm.keys, lexdb_catalog.fromHex(&kv[0..eq]))
-                append(mut &cm.cnts, strings.parseIntOpt(&(kv[eq + 1..len(kv)].toStr())).unwrapOr(0))
-            }
-        }
-        append(mut &es.trees, strings.parseIntOpt(&(f[0].toStr())).unwrapOr(-1))
-        append(mut &es.entries, ents)
-        append(mut &es.dist, ds)
-        append(mut &es.cm, cm)
-        // its leading column's least and greatest, as numbers (optimizer 29)
-        var lo = 0.0f
-        var hi = 0.0f
-        var span = false
-        if len(f) >= 6 {
-            match math.parse(&(f[4].toStr())) {
-                Some(a) {
-                    match math.parse(&(f[5].toStr())) {
-                        Some(b) {
-                            lo = a
-                            hi = b
-                            span = true
-                        }
-                        None {}
-                    }
-                }
-                None {}
-            }
-        }
-        append(mut &es.lo, lo)
-        append(mut &es.hi, hi)
-        append(mut &es.span, span)
-        // the samples as text, parsed only when a range needs them (most
-        // plannings do not: optimizer 37)
-        append(mut &es.samp, if len(f) >= 7 { f[6].toStr() } else { "" })
-    }
-    return Ok(es)
-}
+// ---- ANALYZE (optimizer 20): the statement; the statistics, their row,
+// the estimates and the automatic statistics are lexdb_stats'.
 
 // ANALYZE [table]: the statistics of the table, or of every table, counted
-// from a full read. The rows are read on a snapshot of their own, so the
-// statement's reads are only the catalog's and it does not conflict with the
-// writes it does not see; only the statistics' rows and version are written,
-// so prepared statements are planned again with them (optimizer 20).
+// from a full read (lexdb_stats.analyze); only the statistics' rows and
+// version are written, so prepared statements are planned again with them.
 fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
     // lexdb's checks of the maintenance statement first (9.94): the
     // tables and columns exist, VACUUM not in a block (optimizer 31)
@@ -982,893 +852,26 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             if len(t.view) == 0 { append(mut &tabs, t) }
         }
     }
-    var snap = try st.beginSnapshot()
-    var failed: []DbErr = []
-    var counted: []int = []             // per table: its rows, its time
-    var c0s: [][]int = []               // its counts when it began
-    for t in tabs {
-        append(mut &c0s, acCounts(st, t.tree))
-        let t0 = time.monotonicNs()
-        match analyzeTable(st, txn, mut &snap, &t, &lim) {
-            Ok(n) {
-                append(mut &counted, n)
-                append(mut &counted, time.monotonicNs() - t0)
-            }
-            Err(x) {
-                append(mut &failed, x)
-                break
-            }
-        }
-    }
-    st.endSnapshot(&snap)
-    if len(failed) > 0 { return Err(failed[0]) }
-    // the automatic statistics' counts start again (optimizer 44); not in a
-    // block, which may roll back (the automatic one may then come early)
-    if !txn.inBlock() {
-        for i in 0..len(tabs) { acDone(st, &tabs[i], counted[2 * i], &c0s[i], false, counted[2 * i + 1]) }
-    }
+    try lexdb_stats.analyze(st, txn, &tabs, lim.deadline, &statsUp())
     // a temporary table's statistics are its session's alone: its kept
     // plans are made again (tmpBump), no other session's (optimizer 40)
     var perm = false
     var temp = false
-    for t in tabs { if tempRel(&t.name) { temp = true } else { perm = true } }
+    for t in tabs { if lexdb_catalog.tempRel(&t.name) { temp = true } else { perm = true } }
     if temp { tmpBump(st, txn) }
-    if perm || len(tabs) == 0 {
-        let v = try statVersion(st, txn)
-        try txn.put(lexdb_catalog.CATALOG, STAT_VERSION, &(nextVersion(&v)))
-    }
+    if perm || len(tabs) == 0 { try lexdb_stats.bumpVersion(st, txn) }
     return Ok(checked)
 }
 
-// A value as a number for range estimates (optimizer 29): numbers, dates,
-// times and timestamps (their counts of days or microseconds); None else.
-fn spanNum(v: &Val): Option[float] {
-    match v {
-        Val.Int(n) { return Some(float(n)) }
-        Val.Num(d) { return Some(d.toFloat()) }
-        Val.Float(x) { return Some(x) }
-        Val.Real(x) { return Some(x) }
-        Val.Date(n) { return Some(float(n)) }
-        Val.Time(n) { return Some(float(n)) }
-        Val.Ts(n) { return Some(float(n)) }
-        Val.Tstz(n) { return Some(float(n)) }
-        else { return None }
-    }
-}
+// What the statistics need of the executor: index values and predicates
+// evaluated, catalog rows decoded with their expressions.
+fn statsUp(): lexdb_stats.Up { return lexdb_stats.Up{idxVal: idxVal, inIndex: inIndex, decTable: decTable} }
 
-// An entry's least and greatest leading values, ":min:max" when they were
-// all numbers (n > 0), else "::" (the fields kept, so the samples' follow).
-fn spanText(n: int, lo: float, hi: float): str {
-    if n <= 0 { return "::" }
-    return ":" + lexdb_float.fmt8(lo) + ":" + lexdb_float.fmt8(hi)
-}
+// The automatic statistics' task (lexdb's master starts it) and one look
+// (lexdb_stats.autoAnalyzer, autoAnalyzeStep), with the executor's hooks.
+pub fn autoAnalyzer(st: lexdb_store.Store): int { return lexdb_stats.autoAnalyzer(st, &statsUp()) }
+pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] { return lexdb_stats.autoAnalyzeStep(st, &statsUp()) }
 
-// ---- samples (optimizer 37), the rest of SQLite's stat4: per index and
-// primary key, up to SAMPLES keys of the leading column spread evenly over
-// its rows, each with the rows below it and equal to it, and the rows not
-// NULL. A range's rows are counted from them: the samples it covers whole,
-// and half of each gap it ends in (SQLite's); so a range of skewed or
-// clustered values is estimated as it is, any type (keys compare as their
-// encoded index parts, in the index's order).
-
-const SAMPLES: int = 24
-
-// nums: the keys as numbers when the column's are (numeric), for
-// interpolating within a gap.
-type Samp = record { nn: int; keys: []str; lt: []int; eq: []int; nums: []float; numeric: bool }
-
-fn noSamp(): Samp { return Samp{nn: 0, keys: [], lt: [], eq: [], nums: [], numeric: false} }
-
-// The primary key's sampler: its leading values come in order, a run each;
-// every stride-th run is kept, the stride doubling (every other one
-// dropped) when 2 x SAMPLES are kept.
-type Sampler = record { keys: []str; lt: []int; eq: []int; nums: []float; stride: int; runs: int }
-
-fn newSampler(): Sampler { return Sampler{keys: [], lt: [], eq: [], nums: [], stride: 1, runs: 0} }
-
-fn (sp: mut &Sampler) add(key: &str, lt: int, eq: int, num: float) {
-    if sp.runs % sp.stride == 0 {
-        append(mut &sp.keys, key.toStr())
-        append(mut &sp.lt, lt)
-        append(mut &sp.eq, eq)
-        append(mut &sp.nums, num)
-        if len(sp.keys) > 2 * SAMPLES {
-            var k: []str = []
-            var l: []int = []
-            var q: []int = []
-            var u: []float = []
-            for i in 0..len(sp.keys) {
-                if i % 2 == 0 {
-                    append(mut &k, replace(mut &sp.keys[i], ""))
-                    append(mut &l, sp.lt[i])
-                    append(mut &q, sp.eq[i])
-                    append(mut &u, sp.nums[i])
-                }
-            }
-            sp.keys = k
-            sp.lt = l
-            sp.eq = q
-            sp.nums = u
-            sp.stride = sp.stride * 2
-        }
-    }
-    sp.runs += 1
-}
-
-fn (sp: mut &Sampler) done(rows: int, numeric: bool): Samp {
-    return Samp{nn: rows, keys: replace(mut &sp.keys, []), lt: replace(mut &sp.lt, []), eq: replace(mut &sp.eq, []),
-                nums: replace(mut &sp.nums, []), numeric: numeric}
-}
-
-// An index's samples from ANALYZE's count of its leading values (none when
-// the count stopped at ANALYZE_DISTINCT_MAX): the key holding each
-// (k + 1/2) / SAMPLES of its rows not NULL.
-fn mapSamples(m: &Map[str, int], vm: &Map[str, float], numeric: bool): Result[Samp, DbErr] {
-    if m.size() >= ANALYZE_DISTINCT_MAX { return Ok(noSamp()) }
-    var nb = newStrBuf()
-    lexdb_access.encIdxPart(mut &nb, &Val.Null)
-    let nullKey = nb.toStr()
-    var keys: []str = []
-    for x in 0..m.size() {
-        let k = m.keyAt(x).toStr()
-        if k != nullKey { append(mut &keys, k) }
-    }
-    try sortTakingTurns(mut &keys)
-    var nn = 0
-    for k in keys { nn += m.getOr(&k, 0) }
-    var out = Samp{nn: nn, keys: [], lt: [], eq: [], nums: [], numeric: numeric}
-    if nn == 0 { return Ok(out) }
-    var lt = 0
-    var next = 0
-    for k in keys {
-        let c = m.getOr(&k, 0)
-        var took = false
-        while next < SAMPLES && float(lt + c) > (float(next) + 0.5f) * float(nn) / float(SAMPLES) {
-            if !took {
-                append(mut &out.keys, k.toStr())
-                append(mut &out.lt, lt)
-                append(mut &out.eq, c)
-                append(mut &out.nums, vm.getOr(&k, 0.0f))
-                took = true
-            }
-            next += 1
-        }
-        lt += c
-    }
-    return Ok(out)
-}
-
-// Keys sorted, taking turns (9.15): sorted in runs of SORT_RUN, a yield
-// after each, then merged, a yield every SORT_RUN keys. An index of 100,000
-// distinct leading values took 42 ms to sort at the end of its analysis,
-// holding every session (optimizer 44).
-const SORT_RUN: int = 4096
-
-fn sortTakingTurns(keys: mut &[]str): Result[Unit, DbErr] {
-    let n = len(keys)
-    if n <= SORT_RUN {
-        collections.sortBy(keys, fn(a: &str, b: &str): int { return a.cmp(b) })
-        return Ok(Unit{})
-    }
-    var runs: [][]str = []
-    var at = 0
-    while at < n {
-        var run: []str = []
-        for k in at..min(n, at + SORT_RUN) { append(mut &run, replace(mut &keys[k], "")) }
-        collections.sortBy(mut &run, fn(a: &str, b: &str): int { return a.cmp(b) })
-        append(mut &runs, run)
-        at += SORT_RUN
-        if task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
-    }
-    var heads: []int = array(len(runs), 0)
-    var out: []str = withCapacity(n)
-    while len(out) < n {
-        var best = -1
-        for r in 0..len(runs) {
-            if heads[r] < len(runs[r]) && (best < 0 || runs[r][heads[r]] < runs[best][heads[best]]) { best = r }
-        }
-        append(mut &out, replace(mut &runs[best][heads[best]], ""))
-        heads[best] += 1
-        if len(out) % SORT_RUN == 0 && task.yield().isErr() { return Err(e("57014", "canceling statement: its session has ended")) }
-    }
-    keys = out
-    return Ok(Unit{})
-}
-
-// "nn/hex~lt~eq[~number],..." ("" none; the numbers when numeric).
-fn sampText(sp: &Samp): str {
-    if len(sp.keys) == 0 { return "" }
-    var parts: []str = []
-    for i in 0..len(sp.keys) {
-        append(mut &parts, toHex(&sp.keys[i]) + "~" + sp.lt[i].toStr() + "~" + sp.eq[i].toStr() +
-                          (if sp.numeric { "~" + lexdb_float.fmt8(sp.nums[i]) } else { "" }))
-    }
-    return sp.nn.toStr() + "/" + strings.join(&parts, ",")
-}
-
-fn parseSamp(t: &str): Samp {
-    let sl = strings.indexOf(&t, "/", 0)
-    if sl < 0 { return noSamp() }
-    var out = Samp{nn: strings.parseIntOpt(&(t[0..sl].toStr())).unwrapOr(0), keys: [], lt: [], eq: [], nums: [], numeric: true}
-    for part in strings.split(&t[sl + 1..len(t)], ",") {
-        let f = strings.split(&part, "~")
-        if len(f) < 3 { continue }
-        append(mut &out.keys, lexdb_catalog.fromHex(&f[0]))
-        append(mut &out.lt, strings.parseIntOpt(&(f[1].toStr())).unwrapOr(0))
-        append(mut &out.eq, strings.parseIntOpt(&(f[2].toStr())).unwrapOr(0))
-        var x = 0.0f
-        if len(f) >= 4 {
-            match math.parse(&(f[3].toStr())) {
-                Some(v) { x = v }
-                None { out.numeric = false }
-            }
-        } else {
-            out.numeric = false
-        }
-        append(mut &out.nums, x)
-    }
-    return out
-}
-
-// The rows below key (an encoded leading part, num its number when has),
-// and equal to it when incl: a sample's own counts when key is one; else the
-// rows to the gap it falls in and a part of the gap: by the numbers when the
-// samples have them (the gap's ends the samples', or the column's least and
-// greatest, span), else 1/3 for a lower bound and 2/3 for an upper one
-// (SQLite's).
-fn (sp: &Samp) below(key: &str, num: float, has: bool, incl: bool, upper: bool, span: bool, mn: float, mx: float): float {
-    var at = -1
-    for i in 0..len(sp.keys) { if sp.keys[i] <= key { at = i } }
-    if at >= 0 && sp.keys[at] == key { return float(sp.lt[at] + (if incl { sp.eq[at] } else { 0 })) }
-    let from = if at >= 0 { sp.lt[at] + sp.eq[at] } else { 0 }
-    let to = if at + 1 < len(sp.keys) { sp.lt[at + 1] } else { sp.nn }
-    var frac = if upper { 2.0f / 3.0f } else { 1.0f / 3.0f }
-    // NaN sorts above every number, infinity above every finite one: the
-    // whole gap; an infinite end is no number to interpolate by (optimizer 39)
-    if sp.numeric && has && (num.isNaN() || (!num.isFinite() && num > 0.0f)) {
-        frac = 1.0f
-    } else if sp.numeric && has && !num.isFinite() {
-        frac = 0.0f
-    } else if sp.numeric && has && num.isFinite() {
-        let a = if at >= 0 { sp.nums[at] } else if span { mn } else { num }
-        let b = if at + 1 < len(sp.keys) { sp.nums[at + 1] } else if span { mx } else { num }
-        if b > a && a.isFinite() && b.isFinite() {
-            frac = (num - a) / (b - a)
-            if frac < 0.0f { frac = 0.0f }
-            if frac > 1.0f { frac = 1.0f }
-        }
-    }
-    return float(from) + float(to - from) * frac
-}
-
-// The share of the entries (entries) between a range's bounds (lower ">"
-// or ">=", upper "<" or "<=", keys their encoded parts) by the samples; -1
-// when there are none.
-fn (sp: &Samp) rangeShare(hasLo: bool, loKey: &str, loNum: float, loIncl: bool, hasHi: bool, hiKey: &str, hiNum: float, hiIncl: bool,
-                          nums: bool, span: bool, mn: float, mx: float, entries: int): float {
-    if len(sp.keys) == 0 || entries <= 0 { return -1.0f }
-    let a = if hasLo { sp.below(loKey, loNum, nums, !loIncl, false, span, mn, mx) } else { 0.0f }
-    let b = if hasHi { sp.below(hiKey, hiNum, nums, hiIncl, true, span, mn, mx) } else { float(sp.nn) }
-    let r = if b > a { b - a } else { 0.0f }
-    return fmax(r, 1.0f) / float(entries)
-}
-
-// The distinct values of a column no key or index leads with (optimizer
-// 39), estimated in bounded memory: the KMV_K least hashes of its values
-// (Bar-Yossef et al. 2002, "k minimum values"): when there are fewer, their
-// number is the count; else (KMV_K - 1) / the KMV_K-th least as a share of
-// the hashes' range, within about 1 / sqrt(KMV_K - 2) (6%). The hash is
-// SipHash under a fixed key, so the same rows give the same count.
-const KMV_K: int = 256
-
-type Kmv = record { hs: []u64 }
-
-fn (k: mut &Kmv) add(v: &str) {
-    let h = hash.sipHash13(u64(0x6c657864), u64(0x62737461), v)
-    let n = len(k.hs)
-    if n >= KMV_K && h >= k.hs[n - 1] { return }
-    var lo = 0
-    var hi = n
-    while lo < hi {
-        let mid = (lo + hi) / 2
-        if k.hs[mid] < h { lo = mid + 1 } else { hi = mid }
-    }
-    if lo < n && k.hs[lo] == h { return }
-    append(mut &k.hs, h)
-    var j = n
-    while j > lo {
-        k.hs[j] = k.hs[j - 1]
-        j -= 1
-    }
-    k.hs[lo] = h
-    if len(k.hs) > KMV_K { let dropped = pop(mut &k.hs) }
-}
-
-fn (k: &Kmv) count(): int {
-    if len(k.hs) < KMV_K { return len(k.hs) }
-    let top = int(k.hs[KMV_K - 1] >> 11)      // 53 bits
-    return int(float(KMV_K - 1) * 9007199254740992.0f / float(top + 1))
-}
-
-// Distinct values counted per prefix at most: past it the count stays here, a
-// lower bound, which keeps ANALYZE's memory bounded (the estimate it gives is
-// then an upper bound).
-const ANALYZE_DISTINCT_MAX: int = 100000
-
-// Keeps key with count c among the COMMON_MAX largest counts (keys and
-// cnts in count order, the largest first).
-fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
-    var at = len(cnts)
-    while at > 0 && cnts[at - 1] < c { at -= 1 }
-    if at >= lexdb_plan.COMMON_MAX { return }
-    append(keys, key.toStr())
-    append(cnts, c)
-    var j = len(cnts) - 1
-    while j > at {
-        let kk = replace(mut &keys[j - 1], "")
-        keys[j - 1] = replace(mut &keys[j], kk)
-        let cc = cnts[j - 1]
-        cnts[j - 1] = cnts[j]
-        cnts[j] = cc
-        j -= 1
-    }
-    if len(cnts) > lexdb_plan.COMMON_MAX {
-        let dk = pop(keys)
-        let dc = pop(cnts)
-    }
-}
-
-// Table t's statistics counted from its rows on snap, written in txn; its
-// rows. It takes turns (9.15) as a statement does: after lexdb_pipe.TURN_NS of
-// reading, the other sessions run (an ANALYZE of a million rows held every
-// session for over a second; the automatic one runs beside them: optimizer
-// 44).
-fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
-                lim: &Limits): Result[int, DbErr] {
-    var rows = 0
-    var turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
-    var entries: []int = []
-    var seen: [][]Map[str, int] = []
-    // the leading column's least and greatest values as numbers, when they
-    // are numbers (dates and times too), for range estimates (optimizer 29)
-    var mins: []float = []
-    var maxs: []float = []
-    var nums: []int = []                // per index: values counted as numbers; -1 one was not a number
-    var keyNums: []Map[str, float] = [] // per index: its leading keys' numbers, for the samples (optimizer 37)
-    for ix in t.indexes {
-        var ms: []Map[str, int] = []
-        for j in 0..len(ix.cols) { append(mut &ms, newMap()) }
-        append(mut &seen, ms)
-        append(mut &entries, 0)
-        append(mut &mins, 0.0f)
-        append(mut &maxs, 0.0f)
-        append(mut &nums, 0)
-        append(mut &keyNums, newMap())
-    }
-    // the columns no key or index leads with: their distinct values
-    // (optimizer 39)
-    var others: []int = []
-    var sketches: []Kmv = []
-    for ci in 0..len(t.cols) {
-        var leads = len(t.pk) > 0 && t.pk[0] == ci
-        for ix in t.indexes { if len(ix.cols) > 0 && ix.cols[0] == ci && ix.pred.isNone() { leads = true } }
-        if leads { continue }
-        append(mut &others, ci)
-        append(mut &sketches, Kmv{hs: []})
-    }
-    var pkMin = 0.0f
-    var pkMax = 0.0f
-    var pkNums = 0
-    let all: []bool = []
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
-    let sc = lexdb_access.wholeScan()
-    // the primary key (optimizer 24; of one column too, optimizer 29): rows
-    // come in its order, so each prefix's distinct values are counted where
-    // it changes, its leading column's values by their runs (of several
-    // columns), and its least and greatest are the first row's and the last's
-    let pkn = len(t.pk)
-    var pkPrev: []str = array(pkn, "")
-    var pkDist: []int = array(pkn, 0)
-    var run = 0
-    var runKey = ""
-    var runLt = 0                       // the rows before the run (optimizer 37)
-    var runNum = 0.0f                   // its leading value as a number
-    var pkSamp = newSampler()
-    var pkKeys: []str = []
-    var pkCnts: []int = []
-    var cur = lexdb_access.newCursor()
-    while !cur.done {
-        let now = time.monotonicNs()
-        if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
-        if now > turnEnd {
-            match task.yield() {
-                Ok(_) {}
-                Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
-            }
-            turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
-        }
-        var batch: [][]Val = []
-        try fetch(st, snap, t, &path, &sc, &all, mut &cur, mut &batch)
-        for r in batch {
-            rows += 1
-            // (a batch's rows counted take milliseconds with several indexes)
-            if rows % 128 == 0 && time.monotonicNs() > turnEnd {
-                match task.yield() {
-                    Ok(_) {}
-                    Err(_) { return Err(e("57014", "canceling statement: its session has ended")) }
-                }
-                turnEnd = time.monotonicNs() + lexdb_pipe.TURN_NS
-            }
-            for x in 0..len(others) {
-                if lexdb_ops.isNull(&r[others[x]]) { continue }
-                var ob = newStrBuf()
-                lexdb_access.encIdxPart(mut &ob, &r[others[x]])
-                sketches[x].add(&ob.toStr())
-            }
-            if pkn > 0 {
-                var b = newStrBuf()
-                var changed = rows == 1
-                for j in 0..pkn {
-                    lexdb_access.encIdxPart(mut &b, &r[t.pk[j]])
-                    let k = b.toStr()
-                    if changed || k != pkPrev[j] {
-                        if j == 0 && rows > 1 {
-                            if pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
-                            pkSamp.add(&runKey, runLt, run, runNum)
-                            runLt = rows - 1
-                            run = 0
-                        }
-                        if j == 0 { runNum = spanNum(&r[t.pk[0]]).unwrapOr(0.0f) }
-                        if j == 0 { runKey = k.toStr() }
-                        changed = true
-                        pkDist[j] += 1
-                        pkPrev[j] = k
-                    }
-                }
-                run += 1
-                if pkNums >= 0 {
-                    match spanNum(&r[t.pk[0]]) {
-                        Some(x) {
-                            if pkNums == 0 { pkMin = x }
-                            pkMax = x
-                            pkNums += 1
-                        }
-                        None { if !lexdb_ops.isNull(&r[t.pk[0]]) { pkNums = -1 } }
-                    }
-                }
-            }
-            for i in 0..len(t.indexes) {
-                if !(try inIndex(t, &t.indexes[i], &r)) { continue }
-                entries[i] += 1
-                var lnum = 0.0f
-                var lhas = false
-                if nums[i] >= 0 && len(t.indexes[i].cols) > 0 {
-                    let lv0 = try idxVal(t, &t.indexes[i], 0, &r)
-                    match spanNum(&lv0) {
-                        Some(x) {
-                            if nums[i] == 0 || x < mins[i] { mins[i] = x }
-                            if nums[i] == 0 || x > maxs[i] { maxs[i] = x }
-                            nums[i] += 1
-                            lnum = x
-                            lhas = true
-                        }
-                        None { if !lexdb_ops.isNull(&lv0) { nums[i] = -1 } }
-                    }
-                }
-                var b = newStrBuf()
-                for j in 0..len(t.indexes[i].cols) {
-                    lexdb_access.encIdxPart(mut &b, &(try idxVal(t, &t.indexes[i], j, &r)))
-                    let k = b.toStr()
-                    // the leading column's values are counted (its common values, optimizer 23)
-                    let n = if j == 0 { seen[i][j].getOr(&k, 0) } else { 0 }
-                    if n > 0 || seen[i][j].size() < ANALYZE_DISTINCT_MAX {
-                        if j == 0 && n == 0 && lhas { keyNums[i].put(k.toStr(), lnum) }
-                        seen[i][j].put(k, n + 1)
-                    }
-                }
-            }
-        }
-    }
-    var out = newStrBuf()
-    out.add(&(t.tree.toStr() + ";" + rows.toStr()))
-    if pkn > 0 {
-        // the primary key's, under the table's tree
-        if rows > 0 && pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
-        if rows > 0 { pkSamp.add(&runKey, runLt, run, runNum) }
-        var ds: []str = []
-        for d in pkDist { append(mut &ds, d.toStr()) }
-        out.add(&(";" + t.tree.toStr() + ":" + rows.toStr() + ":" + strings.join(&ds, ",")))
-        let avg = if pkDist[0] > 0 { rows / pkDist[0] } else { 0 }
-        var parts: []str = []
-        for x in 0..len(pkKeys) { if pkCnts[x] > avg { append(mut &parts, toHex(&pkKeys[x]) + "=" + pkCnts[x].toStr()) } }
-        out.add(&(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax) + ":" + sampText(&pkSamp.done(rows, pkNums > 0))))
-    }
-    for i in 0..len(t.indexes) {
-        var ds: []str = []
-        for m in seen[i] { append(mut &ds, m.size().toStr()) }
-        out.add(&(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ",")))
-        // the most common values of its leading column: above the average,
-        // at most COMMON_MAX, as hex=count (optimizer 23)
-        if len(seen[i]) > 0 && seen[i][0].size() > 0 {
-            let m = &seen[i][0]
-            let avg = entries[i] / m.size()
-            var keys: []str = []
-            var cnts: []int = []
-            for x in 0..m.size() {
-                let c = m.getOr(m.keyAt(x), 0)
-                if c <= avg { continue }
-                keepCommon(mut &keys, mut &cnts, m.keyAt(x), c)
-            }
-            var parts: []str = []
-            for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
-            out.add(&(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&(try mapSamples(m, &keyNums[i], nums[i] > 0)))))
-        } else {
-            out.add(&(":" + spanText(0, 0.0f, 0.0f) + ":"))
-        }
-    }
-    if len(others) > 0 {
-        // the other columns' distinct values, hexname=count
-        var parts: []str = []
-        for x in 0..len(others) { append(mut &parts, toHex(&t.cols[others[x]].name) + "=" + sketches[x].count().toStr()) }
-        out.add(&(";d:" + strings.join(&parts, ",")))
-    }
-    try txn.put(lexdb_catalog.CATALOG, &(statKey(&t.name)), &(out.toStr()))
-    return Ok(rows)
-}
-
-// ---- automatic statistics (optimizer 44), as PostgreSQL's autovacuum
-// analyzes: a table whose rows changed since its last ANALYZE pass
-// AUTO_THRESHOLD + AUTO_SCALE_PCT% of its rows then (autovacuum_analyze_
-// threshold 50, autovacuum_analyze_scale_factor 0.1) is analyzed again, by
-// a task of its own (autoAnalyzer) that takes turns with the sessions.
-// - Counted: each row an INSERT, UPDATE or DELETE writes (COPY, a
-//   cascade, ON CONFLICT's too: storeRow, updRow, delRow), per session
-//   while its transaction runs; added to the table's count when it
-//   commits, dropped when it does not (as PostgreSQL's changed tuples).
-//   Temporary tables are not counted, as autovacuum does not see them.
-// - Kept in the store's memo, not the catalog: counts and times are lost
-//   at a restart (PostgreSQL's after a crash). The rows at the last
-//   analysis are then read from the statistics' row.
-// - Off: LEXDB_AUTOANALYZE=off for the process (nothing counted, no task);
-//   SET lexdb_autoanalyze = off for a session (its changes not counted).
-//   A replica never analyzes: its statistics are the master's.
-// Statistics change plans only, never results.
-
-const AUTO_THRESHOLD: int = 50
-const AUTO_SCALE_PCT: int = 10
-const AUTO_NAP_MS: int = 1000              // between looks (autovacuum_naptime is 60 s)
-const AUTO_COOL: int = 9                   // after an analysis of d ms, the table waits AUTO_COOL x d: at most a tenth of the time
-const AUTO_QUIET_NS: int = 300000000       // a table is analyzed once no commit has changed it for this long ...
-const AUTO_WAIT_NS: int = 30000000000      // ... or once it has waited this long for that
-const AUTO_SOON_MS: int = 200              // the next look's nap while one waits
-
-// The rows counted for one session and table, before they go to the memo
-// (chgFlush): a row's count is a few integer operations. Globals must be of
-// copy types (and the SQL runs on one thread).
-var CHG_SESS: int = -1
-var CHG_TREE: int = -1
-var CHG_I: int = 0
-var CHG_U: int = 0
-var CHG_D: int = 0
-var AUTO_STATE: int = 0                    // 0 not yet read, 1 on, 2 off
-
-// Automatic statistics on or off for the process (lexdb's LEXDB_AUTOANALYZE).
-pub fn setAutoAnalyze(on: bool) { AUTO_STATE = if on { 1 } else { 2 } }
-
-pub fn autoAnalyzeOn(): bool {
-    if AUTO_STATE == 0 {
-        AUTO_STATE = 1
-        match os.env("LEXDB_AUTOANALYZE") {
-            Some(v) {
-                let x = strings.toLowerAscii(&v)
-                if x == "off" || x == "0" || x == "false" || x == "no" { AUTO_STATE = 2 }
-            }
-            None {}
-        }
-    }
-    return AUTO_STATE == 1
-}
-
-const AC_DUE: str = "\x00acdue"
-const AC_SOON: str = "\x00acsoon"
-fn acPendKey(sess: int): str { return "\x00acp\x00" + sess.toStr() }
-fn acKey(tree: int): str { return "\x00ac\x00" + tree.toStr() }
-fn acStateKey(tree: int): str { return "\x00acs\x00" + tree.toStr() }
-
-// Space-separated integers, n of them (0 those missing).
-fn intsOf(v: &str, n: int): []int {
-    var out: []int = array(n, 0)
-    let f = strings.split(&v, " ")
-    for i in 0..min(n, len(f)) { out[i] = strings.parseIntOpt(&(f[i].toStr())).unwrapOr(0) }
-    return out
-}
-
-fn intsText(xs: &[]int): str {
-    var parts: []str = []
-    for x in xs { append(mut &parts, x.toStr()) }
-    return strings.join(&parts, " ")
-}
-
-// A row of table t written by txn: kind 0 inserted, 1 updated, 2 deleted.
-fn noteChg(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, kind: int) {
-    if AUTO_STATE == 2 { return }
-    if txn.sql.sess != CHG_SESS || t.tree != CHG_TREE {
-        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sql.sess <= 0 { return }
-        chgFlush(st)
-        CHG_SESS = txn.sql.sess
-        CHG_TREE = t.tree
-    }
-    if kind == 0 { CHG_I += 1 } else if kind == 1 { CHG_U += 1 } else { CHG_D += 1 }
-}
-
-// A table's counts (acKey): its rows changed since its last analysis;
-// inserted, updated, deleted since the store opened; inserted less deleted
-// since its last analysis; when a commit last changed it (monotonic ns).
-fn acCounts(st: &lexdb_store.Store, tree: int): []int { return intsOf(&st.memo.get(&acKey(tree)).unwrapOr(""), 6) }
-
-// The rows counted so far into their session's pending counts:
-// "tree ins upd del" per table, ";" between.
-fn chgFlush(st: &lexdb_store.Store) {
-    if CHG_SESS < 0 { return }
-    let k = acPendKey(CHG_SESS)
-    let add: []int = [CHG_TREE, CHG_I, CHG_U, CHG_D]
-    var parts: []str = []
-    var found = false
-    match st.memo.get(&k) {
-        Some(v) {
-            for p in strings.split(&v, ";") {
-                var xs = intsOf(&p.toStr(), 4)
-                if xs[0] == CHG_TREE {
-                    for i in 1..4 { xs[i] += add[i] }
-                    found = true
-                }
-                append(mut &parts, intsText(&xs))
-            }
-        }
-        None {}
-    }
-    if !found { append(mut &parts, intsText(&add)) }
-    st.memo.put(&k, &strings.join(&parts, ";"))
-    CHG_SESS = -1
-    CHG_TREE = -1
-    CHG_I = 0
-    CHG_U = 0
-    CHG_D = 0
-}
-
-// A session's transaction ended: its counts added to its tables' (keep:
-// it committed, and the session counts its changes), or dropped.
-fn chgEnd(st: &lexdb_store.Store, sess: int, keep: bool) {
-    if AUTO_STATE == 2 { return }
-    if CHG_SESS == sess { chgFlush(st) }
-    let k = acPendKey(sess)
-    let got = st.memo.get(&k)
-    if got.isNone() { return }
-    st.memo.del(&k)
-    if !keep { return }
-    for p in strings.split(&got.unwrap(), ";") {
-        let xs = intsOf(&p.toStr(), 4)
-        // the table's: changed since its last analysis, then inserted, updated, deleted
-        var c = intsOf(&st.memo.get(&acKey(xs[0])).unwrapOr(""), 6)
-        c[0] += xs[1] + xs[2] + xs[3]
-        for i in 1..4 { c[i] += xs[i] }
-        c[4] += xs[1] - xs[3]
-        c[5] = time.monotonicNs()
-        st.memo.put(&acKey(xs[0]), &intsText(&c))
-    }
-    st.memo.put(&AC_DUE, &"1")
-}
-
-// A table's analysis state: the rows at its last analysis (-1 not known),
-// when (lexdb_time.nowTstz(); 0 never) by ANALYZE and automatically, how
-// many of each, the time it took (ns, the automatic ones' in all), until
-// when (monotonic ns) it waits before the next automatic one, and since
-// when it has waited for its writes to pause (0 not waiting).
-type AcState = record { base: int; last: int; lastAuto: int; n: int; nAuto: int; ns: int; nsAuto: int; cool: int; since: int }
-
-fn acState(st: &lexdb_store.Store, tree: int): AcState {
-    match st.memo.get(&acStateKey(tree)) {
-        Some(v) {
-            let xs = intsOf(&v, 9)
-            return AcState{base: xs[0], last: xs[1], lastAuto: xs[2], n: xs[3], nAuto: xs[4], ns: xs[5], nsAuto: xs[6], cool: xs[7], since: xs[8]}
-        }
-        None { return AcState{base: -1, last: 0, lastAuto: 0, n: 0, nAuto: 0, ns: 0, nsAuto: 0, cool: 0, since: 0} }
-    }
-}
-
-fn acPut(st: &lexdb_store.Store, tree: int, a: &AcState) {
-    st.memo.put(&acStateKey(tree), &intsText(&[a.base, a.last, a.lastAuto, a.n, a.nAuto, a.ns, a.nsAuto, a.cool, a.since]))
-}
-
-// Table t analyzed (auto: by the task), its rows counted; c0 its counts
-// when the analysis began (acKey's: changes since then stay counted); ns
-// its time.
-fn acDone(st: &lexdb_store.Store, t: &Table, rows: int, c0: &[]int, auto: bool, ns: int) {
-    var c = intsOf(&st.memo.get(&acKey(t.tree)).unwrapOr(""), 6)
-    c[0] = max(0, c[0] - c0[0])
-    c[4] = c[4] - c0[4]
-    st.memo.put(&acKey(t.tree), &intsText(&c))
-    var a = acState(st, t.tree)
-    a.base = rows
-    a.since = 0
-    if auto {
-        a.lastAuto = lexdb_time.nowTstz()
-        a.nAuto += 1
-        a.nsAuto += ns
-    } else {
-        a.last = lexdb_time.nowTstz()
-        a.n += 1
-        a.ns += ns
-    }
-    acPut(st, t.tree, &a)
-}
-
-// The rows table t had at its last ANALYZE, from its statistics' row (0
-// none: PostgreSQL's reltuples of a table never analyzed counts as 0).
-fn statRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[int, DbErr] {
-    match try st.getUnnoted(txn, lexdb_catalog.CATALOG, &(statKey(&t.name))) {
-        Some(v) {
-            let parts = strings.split(&v, ";")
-            if len(parts) >= 2 && strings.parseIntOpt(&(parts[0].toStr())).unwrapOr(-1) == t.tree {
-                return Ok(max(0, strings.parseIntOpt(&(parts[1].toStr())).unwrapOr(0)))
-            }
-        }
-        None {}
-    }
-    return Ok(0)
-}
-
-// One look of the automatic statistics: each table whose changes passed
-// its threshold analyzed, in a transaction of its own; the number analyzed.
-// A table analyzed lately waits (AUTO_COOL); one whose analysis failed (a
-// conflict, a snapshot gone too old beside heavy writes) is tried at a
-// later look. Nothing on a replica.
-pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] {
-    if st.follower().isSome() || !autoAnalyzeOn() { return Ok(0) }
-    st.memo.del(&AC_DUE)
-    let r = autoLook(st)
-    // (an error before a table's own: looked at again at the next look)
-    if r.isErr() { st.memo.put(&AC_DUE, &"1") }
-    return r
-}
-
-fn autoLook(st: &lexdb_store.Store): Result[int, DbErr] {
-    var keys: []str = []
-    var raw: []str = []
-    var lt = lexdb_store.begin()
-    // (other sessions' temporary tables are not listed: catScan)
-    let listed = catScan(st, mut &lt, &"\x06", &"", &"", fn(en: &lexdb_store.Entry): bool {
-        append(mut &keys, en.key)
-        append(mut &raw, en.val)
-        return true
-    })
-    st.abort(lt)
-    try listed
-    var done = 0
-    for i in 0..len(keys) {
-        let t = try decTable(&keys[i], &raw[i])
-        if len(t.view) > 0 || tempRel(&t.name) || t.tree < 0 { continue }
-        let c0 = acCounts(st, t.tree)
-        let mod = c0[0]
-        if mod <= 0 { continue }
-        var a = acState(st, t.tree)
-        if a.base < 0 {
-            var rt = lexdb_store.begin()
-            let got = statRows(st, mut &rt, &t)
-            st.abort(rt)
-            a.base = try got
-            acPut(st, t.tree, &a)
-        }
-        if mod <= AUTO_THRESHOLD + a.base * AUTO_SCALE_PCT / 100 { continue }
-        // not while it is being written (a load committed in pieces): once
-        // its commits pause, or it has waited AUTO_WAIT_NS; not again soon
-        // after its last analysis
-        let now = time.monotonicNs()
-        if a.since == 0 {
-            a.since = now
-            acPut(st, t.tree, &a)
-        }
-        if now < a.cool || (now - c0[5] < AUTO_QUIET_NS && now - a.since < AUTO_WAIT_NS) {
-            st.memo.put(&AC_DUE, &"1")
-            st.memo.put(&AC_SOON, &"1")
-            continue
-        }
-        let t0 = time.monotonicNs()
-        let r = autoOne(st, &keys[i], &raw[i], &t, mod)
-        let t1 = time.monotonicNs()
-        var b = acState(st, t.tree)
-        b.cool = t1 + AUTO_COOL * (t1 - t0)
-        b.since = 0
-        acPut(st, t.tree, &b)
-        match r {
-            Ok(rows) {
-                if rows >= 0 {
-                    acDone(st, &t, rows, &c0, true, t1 - t0)
-                    done += 1
-                }
-            }
-            Err(x) {
-                // tried again at a later look; a cancelled task ends
-                st.memo.put(&AC_DUE, &"1")
-                if x.state == "57014" { return Err(x) }
-            }
-        }
-    }
-    return Ok(done)
-}
-
-// Table t (catalog key key, row raw when listed) analyzed and committed:
-// its rows; -1 it changed or went since it was listed.
-fn autoOne(st: &lexdb_store.Store, key: &str, raw: &str, t: &Table, mod: int): Result[int, DbErr] {
-    var tx = lexdb_store.begin()
-    // its catalog row read (noted): a DROP or ALTER meanwhile fails the commit
-    match st.get(mut &tx, lexdb_catalog.CATALOG, key) {
-        Ok(got) {
-            if got.isNone() || got.unwrap() != raw {
-                st.abort(tx)
-                return Ok(-1)
-            }
-        }
-        Err(x) {
-            st.abort(tx)
-            return Err(x)
-        }
-    }
-    match st.beginSnapshot() {
-        Ok(snap0) {
-            var snap = snap0
-            let r = analyzeTable(st, mut &tx, mut &snap, t, &noLimits())
-            st.endSnapshot(&snap)
-            match r {
-                Ok(rows) {
-                    match statVersion(st, mut &tx) {
-                        Ok(v) {
-                            match tx.put(lexdb_catalog.CATALOG, STAT_VERSION, &(nextVersion(&v))) {
-                                Ok(_) {}
-                                Err(x) {
-                                    st.abort(tx)
-                                    return Err(x)
-                                }
-                            }
-                        }
-                        Err(x) {
-                            st.abort(tx)
-                            return Err(x)
-                        }
-                    }
-                    try st.commit(tx)
-                    return Ok(rows)
-                }
-                Err(x) {
-                    st.abort(tx)
-                    return Err(x)
-                }
-            }
-        }
-        Err(x) {
-            st.abort(tx)
-            return Err(x)
-        }
-    }
-}
-
-// The task: a look every AUTO_NAP_MS when a commit counted changes, until
-// it is cancelled (lexdb's master starts it; a replica does not).
-pub fn autoAnalyzer(st: lexdb_store.Store): int {
-    if st.follower().isSome() || !autoAnalyzeOn() { return 0 }
-    while true {
-        // (sooner while a table waits for its writes to pause)
-        let soon = st.memo.get(&AC_SOON).isSome()
-        st.memo.del(&AC_SOON)
-        if task.sleep(if soon { AUTO_SOON_MS } else { AUTO_NAP_MS }).isErr() { return 0 }
-        if st.memo.get(&AC_DUE).isNone() { continue }
-        match autoAnalyzeStep(&st) {
-            Ok(_) {}
-            Err(x) { if x.state == "57014" { return 0 } }
-        }
-    }
-    return 0
-}
 
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
 // schema (lexdb_sql.qual: schema QSEP name), public's unqualified. A schema
@@ -1948,12 +951,6 @@ fn tmpName(sess: int): str { return "pg_temp_" + sess.toStr() }
 fn tmpMemo(sess: int): str { return "\x00tmp\x00" + sess.toStr() }
 fn tmpVerKey(sess: int): str { return "\x00tmpver\x00" + sess.toStr() }
 
-// Whether relation key k is a temporary one.
-fn tempRel(k: &str): bool {
-    if len(k) == 0 || k[0] != 'p' { return false }
-    return lexdb_base.isTempSchema(&lexdb_sql.schemaOf(k))
-}
-
 fn otherTemp(): DbErr { return e("0A000", "cannot access temporary tables of other sessions") }
 
 // A qualified name starting with p: pg_temp's names the session's
@@ -2007,7 +1004,7 @@ fn tmpChanged(st: &lexdb_store.Store, sess: int) {
 // The catalog's version bumped for DDL on relation key k: a temporary
 // one's bumps its session's only.
 fn bumpFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Unit, DbErr] {
-    if tempRel(k) {
+    if lexdb_catalog.tempRel(k) {
         tmpBump(st, txn)
         return Ok(Unit{})
     }
@@ -2158,25 +1155,6 @@ fn conjuncts(x: &Expr, out: mut &[]Expr) {
 
 // An IN subquery's values looked up one by one at most; past this many its
 // path reads the whole table instead (no row counts to choose by yet).
-
-// ANALYZE's statistics for a table (optimizer 20): its rows, and per index (by its
-// tree) its entries, the distinct values of each leading prefix of its
-// columns (a NULL counted as a value), and its leading column's most common
-// values (cm, optimizer 23). rows -1: none (no ANALYZE, an ANALYZE of an older table
-// of the name, or SET lexdb_planner = rules).
-
-// An index's leading column (optimizer 23): its entries, its distinct values, and its
-// most common values (their encoded index parts) with their exact counts:
-// those above the average, at most COMMON_MAX. d -1: unknown.
-
-// The rows expected equal to key (an encoded index part; "" unknown): its
-// count when it is a common value, else the average of the other values.
-
-// The rows an index path with eqs leading equalities is expected to read, the
-// first equal to key ("" unknown): with one equality, by the common values;
-// else its entries over the distinct values of that prefix. -1 unknown.
-
-// A copy of an index's common values, for a look (optimizer 23).
 
 // The encoded index part of a constant equality value: a literal, or one of
 // the statement's parameters, coerced to the column's type. "" when it is
@@ -2343,9 +1321,7 @@ fn sampOnly(lv: &Level, e: int, col: int, ops: &[]str, vals: &[]Expr): float {
             hasHi = true
         }
     }
-    if len(lv.est.samp[e]) == 0 { return -1.0f }
-    return parseSamp(&lv.est.samp[e]).rangeShare(hasLo, &loKey, loNum, loIncl, hasHi, &hiKey, hiNum, hiIncl, nums,
-                                     lv.est.span[e], lv.est.lo[e], lv.est.hi[e], lv.est.entries[e])
+    return lv.est.sampShare(e, hasLo, &loKey, loNum, loIncl, hasHi, &hiKey, hiNum, hiIncl, nums)
 }
 
 // A path's figure for EXPLAIN: none for a whole-key lookup (one row, by the
@@ -2515,6 +1491,10 @@ pub type Query = record {
     cc: [][]Option[lexdb_bind.BX]
     cp: [][]Option[lexdb_bind.BX]
     lp: lexdb_bind.LPlan        // FROM and WHERE as the binder gives them (buildQuery; planSelect moves it into Sel.lp)
+    // its joins as the pipeline runs them for the row engine (slice P2c:
+    // lexdb_pipe.compileLevels), where its Sel's own plan is not the
+    // pipeline's; None: the row engine joins
+    jp: Option[lexdb_pipe.Prog]
 }
 
 // Column c added to q's joined row, at the next slot. (Its binder's
@@ -2746,7 +1726,7 @@ fn noType(): lexdb_sql.TypeName { return lexdb_sql.TypeName{kind: 0, oid: 0, pre
 
 fn impliesOne(c: &Expr, p: &Expr, params: &[]Val, lk: mut &[]Look): bool {
     let r = impliesRaw(c, p, params)
-    if len(params) > 0 { append(lk, Look{kind: 0, c: lexdb_sql.cloneExpr(c), p: lexdb_sql.cloneExpr(p), out: if r { 1 } else { 0 }, typ: noType(), cm: lexdb_plan.noCommon()}) }
+    if len(params) > 0 { append(lk, Look{kind: 0, c: lexdb_sql.cloneExpr(c), p: lexdb_sql.cloneExpr(p), out: if r { 1 } else { 0 }, typ: noType(), cm: lexdb_stats.noCommon()}) }
     return r
 }
 
@@ -2756,7 +1736,7 @@ fn looksHold(ls: &[]Look, params: &[]Val): bool {
         if l.kind == 0 {
             if impliesRaw(&l.c, &l.p, params) != (l.out == 1) { return false }
         } else if l.kind == 2 {
-            if scaleOf(lexdb_plan.rowsOf(&l.cm, &constKey(&l.c, &l.typ, params))) != l.out { return false }
+            if scaleOf(lexdb_stats.rowsOf(&l.cm, &constKey(&l.c, &l.typ, params))) != l.out { return false }
         } else {
             let x = Some(lexdb_sql.cloneExpr(&l.c))
             var none: []Look = []
@@ -3435,7 +2415,7 @@ fn litNumOf(lv: &Level, col: int, x: &Expr): Option[float] {
         Some(v) {
             if lexdb_ops.isNull(&v) { return None }
             match lexdb_ops.coerce(v, &boundType(&lv.t.cols[col].typ)) {
-                Ok(cv) { return spanNum(&cv) }
+                Ok(cv) { return lexdb_stats.spanNum(&cv) }
                 Err(_) { return None }
             }
         }
@@ -3660,7 +2640,7 @@ fn (q: &Query) eqShare(k: int, col: int, v: &Expr, guessed: mut &bool): float {
     if e >= 0 && lv.est.entries[e] > 0 {
         let noParams: []Val = []
         let key = constKey(v, &boundType(&lv.t.cols[col].typ), &noParams)
-        let r = lexdb_plan.rowsOf(&lv.est.cm[e], &key)
+        let r = lexdb_stats.rowsOf(&lv.est.cm[e], &key)
         if r >= 0 { return fmax(float(r), 1.0f) / float(lv.est.entries[e]) }
     }
     let d = q.distinctKnown(&(lv.alias + "." + lv.t.cols[col].name), k)
@@ -4495,7 +3475,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             p.stats = true
         }
         // the first equality's value set the figure: a look (optimizer 23)
-        var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_plan.noCommon()}
+        var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_stats.noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
             let byParam = lexdb_bind.refParam(&p.eqs[0])
             if byParam && len(p.eqs) == 1 {
@@ -4547,7 +3527,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         if group >= 2 {
             for i in 0..len(paths) {
                 if (outer[i] == outer[best] || q.pinned) && figs[i].rows >= 0 && looks[i].kind == 2 {
-                    append(lk, replace(mut &looks[i], Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_plan.noCommon()}))
+                    append(lk, replace(mut &looks[i], Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_stats.noCommon()}))
                 }
             }
         }
@@ -4712,7 +3692,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
 fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias, join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: lexdb_plan.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
+                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
 }
 
 // Plans a query over the tables of FROM (4.8): the tables are joined in the
@@ -4726,7 +3706,7 @@ fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool,
               sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan(), jp: None}
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
@@ -5150,7 +4130,7 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
     // each table's statistics where they choose its path (a join's other
     // tables': when its order is costed, optimizer 35)
     for k in 0..len(q.levels) {
-        if q.levels[k].src < 0 && q.levels[k].work < 0 { q.levels[k].est = try loadEst(st, txn, &q.levels[k].t, false) }
+        if q.levels[k].src < 0 && q.levels[k].work < 0 { q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, false, txn.sql.rules) }
     }
     var semiAlts: []Option[SubPlan] = []
     for i in 0..len(subs) { append(mut &semiAlts, None) }
@@ -5279,7 +4259,7 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
         if !pinned && !txn.noting() {
             for k in 0..nl {
                 if q.levels[k].est.rows < 0 && !q.levels[k].virt() {
-                    let es = try loadEst(st, txn, &q.levels[k].t, true)
+                    let es = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, true, txn.sql.rules)
                     q.levels[k].est = es
                 }
             }
@@ -5367,7 +4347,7 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
         // an IN (subquery) on it: its statistics, for the lookups' limit by
         // cost (Path.inMax), as a join's are loaded
         if !q.levels[k].virt() && q.levels[k].est.rows < 0 && !txn.sql.rules && !txn.noting() && hasInSub(&m) {
-            q.levels[k].est = try loadEst(st, txn, &q.levels[k].t, true)
+            q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, true, txn.sql.rules)
         }
         var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} } else {
             choosePath(q, k, &m, params, mut &sc.looks)
@@ -5995,8 +4975,39 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
         if try allTrueX(st, txn, q, m, &q.top, &none, params, rs) { let more = try emit(txn, &none) }
         return Ok(Unit{})
     }
+    // (its joins the pipeline's, slice P2c; a value or key a batch cannot
+    // hold: the row engine, when no row was given yet)
+    if rs.batch {
+        match q.jp {
+            Some(pg) {
+                var emitted = 0
+                let got = runLevelsProg(st, txn, q, m, params, &pg, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+                    emitted += 1
+                    return emit(tx, r)
+                }, rs)
+                match got {
+                    Ok(_) { return Ok(Unit{}) }
+                    Err(x) { if !lexdb_pipe.isBat(&x) || emitted > 0 { return Err(x) } }
+                }
+                // (prepare built no hash for it: the row engine's, with them)
+                rs.batch = false
+                let m2 = try prepareIn(st, txn, q, params, rs, true, true)
+                rs.batch = true
+                var row2: []Val = array(len(q.cols), Val.Null)
+                return runRows(st, txn, q, &m2, params, mut &row2, emit, rs)
+            }
+            None {}
+        }
+    }
     var row: []Val = array(len(q.cols), Val.Null)
-    if !(try runLevel(st, txn, q, m, 0, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+    return runRows(st, txn, q, m, params, mut &row, emit, rs)
+}
+
+// runQuery's row engine: the levels from the first, then a RIGHT or FULL
+// JOIN's rows that joined nothing.
+fn runRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, row: mut &[]Val,
+           emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
+    if !(try runLevel(st, txn, q, m, 0, row, params, emit, rs)) { return Ok(Unit{}) }
     // A RIGHT or FULL JOIN's rows that joined nothing, with NULLs for the
     // tables before it, go on through the tables after it.
     for k in 1..len(q.levels) {
@@ -6008,7 +5019,7 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             for i in 0..len(m.mat[k][ri]) { row[lv.first + i] = m.mat[k][ri][i] }
             rs.cnt[k].unmatched += 1
             if try allTrueX(st, txn, q, m, &lv.post, &row, params, rs) {
-                if !(try runLevel(st, txn, q, m, k + 1, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+                if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(Unit{}) }
             }
         }
     }
@@ -6846,14 +5857,14 @@ fn semiRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, lv: mut &Level, p
     if len(lv.path.eqs) > 0 && len(lv.path.eqs) == len(cols) && unique { return Ok(1.0f) }
     if lv.estRows >= 0 { return Ok(float(lv.estRows)) }
     let loaded = lv.est.rows < 0
-    if loaded { lv.est = try loadEst(st, txn, &lv.t, true) }
+    if loaded { lv.est = try lexdb_stats.loadEst(st, txn, &lv.t, true, txn.sql.rules) }
     var n = -1.0f
     if lv.est.rows >= 0 {
         n = float(lv.est.rows)
         let f = pathFig(lv, &lv.path, params)
         if f.rows >= 0 { n = float(f.rows) }
     }
-    if loaded { lv.est = lexdb_plan.noEst() }
+    if loaded { lv.est = lexdb_stats.noEst() }
     return Ok(n)
 }
 
@@ -7978,13 +6989,13 @@ type Mats = record {
 // Before a query runs: its subqueries without refs, then its hash tables.
 fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
            rs: mut &Run): Result[Mats, DbErr] {
-    return prepareIn(st, txn, q, params, rs, true)
+    return prepareIn(st, txn, q, params, rs, true, true)
 }
 
 // prepare; bind: the levels' conditions bound for the run where the plan
 // did not bind them (false: the pipeline's plan holds them).
 fn prepareIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val,
-             rs: mut &Run, bind: bool): Result[Mats, DbErr] {
+             rs: mut &Run, bind: bool, mat: bool): Result[Mats, DbErr] {
     var m = Mats{vrows: [], mat: [], keys: [], ikeys: [], buckets: [], resMixed: [], resSingle: [], subs: [], cc: [], cp: [], ce: cenvOf(seqEnv(st, txn))}
     for k in 0..len(q.levels) {
         append(mut &m.vrows, [])
@@ -8013,7 +7024,9 @@ fn prepareIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, param
             m.vrows[k] = copyRows(&rs.cache.rows[at])
         }
     }
-    try materialize(st, txn, q, mut &m, params, rs)
+    // (the pipeline builds a join's hashes itself: slice P2; a levels
+    // program's too, Query.jp)
+    if mat && !(rs.batch && q.jp.isSome()) { try materialize(st, txn, q, mut &m, params, rs) }
     return Ok(m)
 }
 
@@ -8423,7 +7436,7 @@ fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
 
 fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let key = try createKey(st, txn, &s.table, s.temp)
-    if s.onCommit != lexdb_sql.ONC_NONE && !tempRel(&key) { return Err(e("42P16", "ON COMMIT can only be used on temporary tables")) }
+    if s.onCommit != lexdb_sql.ONC_NONE && !lexdb_catalog.tempRel(&key) { return Err(e("42P16", "ON COMMIT can only be used on temporary tables")) }
     let base = lexdb_sql.baseName(&key)
     let exists = try relExists(st, txn, &key)
     if exists {
@@ -8998,7 +8011,7 @@ fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str): 
 fn bumpKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ks: &[]str): Result[Unit, DbErr] {
     var perm = false
     var temp = false
-    for k in ks { if tempRel(&k) { temp = true } else { perm = true } }
+    for k in ks { if lexdb_catalog.tempRel(&k) { temp = true } else { perm = true } }
     if temp { tmpBump(st, txn) }
     if perm { try bumpCatalog(st, txn) }
     return Ok(Unit{})
@@ -9091,7 +8104,7 @@ fn dropOne(txn: mut &lexdb_store.Txn, t: &Table) {
     }
     txn.dropTree(t.tree)
     txn.del(lexdb_catalog.CATALOG, &t.name)
-    txn.del(lexdb_catalog.CATALOG, &(statKey(&t.name)))         // its statistics (optimizer 20)
+    lexdb_stats.dropStats(txn, &t.name)         // its statistics (optimizer 20)
 }
 
 // ---- column defaults (9.38)
@@ -9234,7 +8247,7 @@ fn moveTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, s
     t.name = lexdb_sql.qual(sc, &lexdb_sql.baseName(&t.name))
     try moveAcl(st, txn, &lexdb_catalog.relObj(&old), &lexdb_catalog.relObj(&t.name))
     try relink(st, txn, t, &old)
-    try moveStats(st, txn, &old, &t.name)
+    try lexdb_stats.moveStats(st, txn, &old, &t.name)
     try ownerMoved(st, txn, t, &old, &"", &"", sc)
     for k in 0..len(t.indexes) {
         txn.del(lexdb_catalog.CATALOG, &(idxName(&t.indexes[k].name)))
@@ -9267,7 +8280,7 @@ fn relExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result
 // ALTER TABLE ... SET SCHEMA: the table and its indexes, unless a name is
 // taken there.
 fn setSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, sc: &str): Result[Unit, DbErr] {
-    if tempRel(&t.name) || sc == "pg_temp" || lexdb_base.isTempSchema(sc) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
+    if lexdb_catalog.tempRel(&t.name) || sc == "pg_temp" || lexdb_base.isTempSchema(sc) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
     if !(try schemaExists(st, txn, sc)) { return Err(e("3F000", &("schema \"" + sc + "\" does not exist"))) }
     if lexdb_sql.schemaOf(&t.name) == sc { return Ok(Unit{}) }
     var names = [lexdb_sql.baseName(&t.name)]
@@ -9561,7 +8574,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
     // made again would find them (PostgreSQL's "could not create unique
     // index"); then the indexes made again, each in its key order
     let d = try lexdb_access.buildWrite(st, txn, &lexdb_catalog.relOf(t), &out, !keyChanged && rw.sorted,
-                                        fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })   // the new tree's rows, for its statistics (optimizer 44)
+                                        fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 0) })   // the new tree's rows, for its statistics (optimizer 44)
     if d.ix == lexdb_access.PK_CONFLICT { return Err(dupMade(t, &lexdb_catalog.pkConName(t), &t.pk, &[], &d.row)) }
     if d.ix >= 0 {
         let ix = &t.indexes[d.ix]
@@ -9569,7 +8582,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
     }
     // the old trees' statistics are of no use (the new tree's are made as
     // its rows are counted)
-    txn.del(lexdb_catalog.CATALOG, &(statKey(&t.name)))
+    lexdb_stats.dropStats(txn, &t.name)
     // the store's column leaves for the new tree from the first checkpoint
     // on: its rows are all in the layout the catalog row will have, and a
     // rollback drops the tree (9.114 keeps an uncommitted layout from trees
@@ -9672,7 +8685,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try needRelOwner(st, txn, &ft.name, &"table")
             // a view keeps its query's text: names it reads may not change under it
             for a in s.alters {
-                if a.kind == lexdb_sql.A_SET_SCHEMA && (tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
+                if a.kind == lexdb_sql.A_SET_SCHEMA && (lexdb_catalog.tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
                     return Err(e("0A000", "cannot move objects into or out of temporary schemas"))
                 }
                 if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
@@ -9801,7 +8814,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             t.name = key
             try moveAcl(st, txn, &lexdb_catalog.relObj(&old), &lexdb_catalog.relObj(&key))
             try relink(st, txn, mut &t, &old)
-            try moveStats(st, txn, &old, &t.name)
+            try lexdb_stats.moveStats(st, txn, &old, &t.name)
             try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(lexdb_catalog.CATALOG, &(idxName(&ix.name)), &key) }
         } else {
@@ -11313,7 +10326,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     let c = try lexdb_access.insertRow(st, txn, &lexdb_catalog.relOf(t), &row,
                                        fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
                                        fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 0) })
+                                       fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 0) })
     if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, &row)) }
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], &row)) }
     if len(t.fks) > 0 {
@@ -11908,18 +10921,6 @@ fn rangePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     return Ok(Some(p))
 }
 
-// Rows of table t deleted: n of them counted for the automatic statistics.
-fn noteChgN(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, n: int) {
-    if AUTO_STATE == 2 { return }
-    if txn.sql.sess != CHG_SESS || t.tree != CHG_TREE {
-        if !autoAnalyzeOn() || tempRel(&t.name) || txn.sql.sess <= 0 { return }
-        chgFlush(st)
-        CHG_SESS = txn.sql.sess
-        CHG_TREE = t.tree
-    }
-    CHG_D += n
-}
-
 // The columns of t indexes slow (places in t.indexes) use: their columns,
 // expressions and predicates'.
 fn slowNeed(t: &Table, slow: &[]int): []bool {
@@ -11957,7 +10958,7 @@ fn rangeDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if n < 0 { return Ok(None) }
     RDEL_TAKEN += 1
     if n == 0 { return Ok(Some(tagOnly(&"DELETE 0"))) }
-    noteChgN(st, txn, t, n)
+    lexdb_stats.noteChgN(st, txn.sql.sess, t, n)
     return Ok(Some(tagOnly(&("DELETE " + n.toStr()))))
 }
 
@@ -12467,7 +11468,7 @@ fn evalInt(x: &Option[Expr], params: &[]Val, what: &str, lk: mut &[]Look): Resul
                 else {}
             }
             // a look (optimizer 22): the plan keeps the value
-            if !lit { append(lk, Look{kind: 1, c: lexdb_sql.cloneExpr(&v), p: Expr.Lit(Val.Null), out: n, typ: noType(), cm: lexdb_plan.noCommon()}) }
+            if !lit { append(lk, Look{kind: 1, c: lexdb_sql.cloneExpr(&v), p: Expr.Lit(Val.Null), out: n, typ: noType(), cm: lexdb_stats.noCommon()}) }
             return Ok(n)
         }
         None { return Ok(-1) }
@@ -12570,7 +11571,7 @@ fn planVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, D
         None {}
     }
     // the join order differs where reads are noted (optimizer 29, 33)
-    if txn.sql.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try statVersion(st, txn)) + "|m" + txn.sql.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
+    if txn.sql.rules { ver = ver + "|rules" } else { ver = ver + "|" + (try lexdb_stats.statVersion(st, txn)) + "|m" + txn.sql.memMax.toStr() + (if txn.noting() { "|n" } else { "" }) }   // optimizer 20
     return Ok(ver)
 }
 
@@ -12714,7 +11715,9 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     if sel.limit == 0 { return Ok(0) }
     if rs.batch && pipeRows(sel) {
         var row: []Val = []
-        return runPipe(st, txn, sel, params, -1, mut &rs, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
+        var given = 0
+        let got = runPipe(st, txn, sel, params, -1, mut &rs, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
+            given += 1
             if ob.n == 0 { return each(tx, r) }
             if batched { return eachB(tx, ob) }
             for j in 0..ob.n {
@@ -12723,6 +11726,16 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             }
             return Ok(true)
         })
+        match got {
+            Ok(n) { return Ok(n) }
+            Err(x) {
+                // (a value a join's batch cannot hold, an expression it does
+                // not compile: the row engine, when nothing was given yet)
+                if !lexdb_pipe.isBat(&x) || given > 0 { return Err(x) }
+                rs = newRun(&sel.q)
+                rs.limit(&lim)
+            }
+        }
     }
     let sqe = seqEnv(st, txn)
     let m = try prepare(st, txn, &sel.q, params, mut &rs)
@@ -12730,11 +11743,6 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     var n = 0
     var vals: []Val = []                // one row's values, the array used again for each (9.99)
     let oc = outC(sel, params, seqEnv(st, txn))
-    // (one table's: the pipeline's, runPipe above)
-    if batched && len(q.levels) > 1 {
-        let op = try outPlan(st, txn, sel, &m, params, mut &rs, false)
-        if op.isSome() { return eachOut(st, txn, sel, &m, params, &op.unwrap(), &oc, each, eachB, mut &rs) }
-    }
     try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         try outRow(sel, &m, params, sqe, &oc, r, mut &vals)
         if !(try each(tx, &vals)) { return Ok(false) }
@@ -12868,8 +11876,42 @@ fn pipeSel(sel: mut &Sel) { pipeSelIn(sel, true) }
 
 // pipeSel; rows: a plan of rows too (a SELECT's own; false: a subquery's,
 // a set's part, or a statement's query: only its aggregates, slice P1b).
+// A query with joins whose plan is not then the pipeline's has its joins
+// run by it for the row engine (Query.jp, slice P2c).
 fn pipeSelIn(sel: mut &Sel, rows: bool) {
-    for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, false) }
+    pipeSelMain(sel, rows)
+    if len(sel.q.levels) > 1 && !pipeJoins(sel) { levelsProg(sel) }
+}
+
+// The joins of sel's query as a program for the row engine (Query.jp):
+// its first table's conditions and the joins' expressions bound for it
+// (copies: the row engine keeps its own).
+fn levelsProg(sel: mut &Sel) {
+    let q = &sel.q
+    if q.corr || len(q.refs) > 0 || len(q.top) > 0 || !tableRead(&q.levels[0]) { return }
+    var cs: []BX = []
+    for x in q.levels[0].cond {
+        match planX(&x, q) {
+            Some(b) { append(mut &cs, b) }
+            None { return }
+        }
+    }
+    let base = filterOver(scanArm(sel, false), cs, subsOf(q))
+    let joined = joinsOver(sel, base)
+    match move(joined) {
+        Ok(p) {
+            match lexdb_pipe.compileLevels(p, &sel.q.cols) {
+                Ok(pg) { sel.q.jp = Some(pg) }
+                Err(_) {}
+            }
+        }
+        Err(_) {}
+    }
+}
+
+fn pipeSelMain(sel: mut &Sel, rows: bool) {
+    // (a subquery in FROM: its rows too, held for its level, slice P2)
+    for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, sel.q.subs[i].use == lexdb_sql.SUB_FROM) }
     for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], false) }
     if sel.aggQ {
         if aggShape(sel) { pipeAgg(sel) }
@@ -12905,7 +11947,18 @@ fn pipeSelIn(sel: mut &Sel, rows: bool) {
         return
     }
     let cs = got.unwrap()
-    let proj = lexdb_plan.PPlan.Project(filterOver(scanArm(sel, false), cs, subsOf(&sel.q)), xs)
+    let base = filterOver(scanArm(sel, false), cs, subsOf(&sel.q))
+    let joined = if len(sel.q.levels) > 1 { joinsOver(sel, base) } else { Ok(base) }
+    var jp = lexdb_plan.PPlan.Result([])
+    match move(joined) {
+        Ok(x) { jp = x }
+        Err(b) {
+            unplan(sel, b)
+            oxBack(sel, xs)
+            return
+        }
+    }
+    let proj = lexdb_plan.PPlan.Project(jp, xs)
     // ORDER BY in the scan's order (sel.sort false: streams' rule)
     let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(proj, false) } else { proj }
     let plan = if sel.limit >= 0 { lexdb_plan.PPlan.Limit(ordered, true, sel.limit, 0) } else { ordered }
@@ -12976,6 +12029,122 @@ fn filterOver(ps: lexdb_plan.PScan, cs: []BX, subs: []lexdb_plan.PSub): lexdb_pl
     return if len(cs) > 0 { lexdb_plan.PPlan.Filter(leaf, cs) } else { leaf }
 }
 
+// The tables after sel's first joined over base (its Filter? (Scan)):
+// a Join arm per level (slice P2), its keys, conditions and WHERE
+// conjuncts bound for the plan, its table's arm (lexdb_plan.PJoin): a
+// hash (read once) of a table, a lookup per row by its whole primary key,
+// or a range per row (as the batch driver chose them, bJoinPlan: not
+// where the first table's reading may stop early). Err(base): a level the
+// pipeline does not join (a subquery's or CTE's rows, LATERAL, a semi or
+// anti join, RIGHT or FULL, a locked table, a per-row path of another
+// kind, a collation's key, an expression that does not bind).
+fn joinsOver(sel: &Sel, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_plan.PPlan] {
+    let q = &sel.q
+    let l0 = &q.levels[0]
+    var p = base
+    var rights = 0
+    for k in 1..len(q.levels) {
+        let lv = &q.levels[k]
+        let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
+        let rj = lv.join == lexdb_sql.J_RIGHT
+        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 { return Err(p) }
+        if lv.src >= 0 && lazySeries(q, lv.src) { return Err(p) }
+        if inner && len(lv.post) > 0 { return Err(p) }
+        if q.corr && pathCorr(&lv.path) { return Err(p) }
+        // (a RIGHT JOIN: hashed, one at most)
+        if rj {
+            rights += 1
+            if lv.perRow || rights > 1 { return Err(p) }
+        }
+        let mark = if lv.anti { lexdb_plan.MK_ANTI } else if lv.semi || lv.semiSub >= 0 { lexdb_plan.MK_SEMI } else { lexdb_plan.MK_JOIN }
+        let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
+        let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
+        if lv.perRow && !look && !range { return Err(p) }
+        let t = &lv.t
+        var kinds: []int = array(len(q.cols), lexdb_rows.BK_NONE)
+        for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.colKind(&t.cols[i]) }
+        var need: []bool = withCapacity(len(t.cols))
+        for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
+        let batch = lexdb_plan.scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
+        var j = lexdb_plan.PJoin{how: lexdb_plan.JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: lexdb_plan.MK_JOIN, resCol: -1, res: [],
+                                 scan: lexdb_plan.PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch},
+                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
+                                 rng: [], capNulls: false, noNulls: lv.path.noNulls}
+        j.mark = mark
+        if !lv.perRow {
+            if lv.virt() { j.how = lexdb_plan.JH_ROWS }
+            if lv.resNot {
+                j.resCol = lv.resCol
+                match planX(&lv.resVal, q) {
+                    Some(b) { append(mut &j.res, b) }
+                    None { return Err(p) }
+                }
+            }
+            if len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols) { return Err(p) }
+            for hk in lv.hashKinds { if hk != lexdb_sql.COLL_EXACT { return Err(p) } }
+            for i in 0..len(lv.hashCols) {
+                append(mut &j.hcols, lv.hashCols[i])
+                append(mut &j.ktypes, boundType(&t.cols[lv.hashCols[i]].typ))
+                match planX(&lv.hashVals[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None { return Err(p) }
+                }
+            }
+            for x in lv.local {
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.build, b) }
+                    None { return Err(p) }
+                }
+            }
+            // its conditions but those on its own columns (applied as its
+            // rows are read: Level.local)
+            for x in lv.cond {
+                // (a semi join's and a RIGHT JOIN's: every one, none applied as read)
+                if !rj && !lv.semi && q.minLevel(&x) >= k { continue }
+                if len(lv.hashCols) == 1 && isKeyEq(&x, q, lv) { j.keq = len(j.conds) }
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.conds, b) }
+                    None { return Err(p) }
+                }
+            }
+        } else {
+            j.how = if look { lexdb_plan.JH_LOOK } else { lexdb_plan.JH_RANGE }
+            let ix = if look { -1 } else { lv.path.index }
+            for i in 0..len(lv.path.eqs) {
+                append(mut &j.ktypes, keyType(t, ix, i))
+                match planX(&lv.path.eqs[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None { return Err(p) }
+                }
+            }
+            if range && len(lv.path.rng) > 0 {
+                append(mut &j.ktypes, keyType(t, ix, len(lv.path.eqs)))
+                for b in lv.path.rng {
+                    match planX(&b.val, q) {
+                        Some(v) { append(mut &j.rng, lexdb_plan.PBound{op: b.op.toStr(), val: v}) }
+                        None { return Err(p) }
+                    }
+                }
+            }
+            j.capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
+            for x in lv.cond {
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.conds, b) }
+                    None { return Err(p) }
+                }
+            }
+        }
+        for x in lv.post {
+            match planX(&x, q) {
+                Some(b) { append(mut &j.post, b) }
+                None { return Err(p) }
+            }
+        }
+        p = lexdb_plan.PPlan.Join(p, j)
+    }
+    return Ok(p)
+}
+
 // Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
 // takes, and what this Sel must give it): streamed (no sort, grouping,
 // DISTINCT, window, set or OFFSET), one table read per row, no correlated
@@ -12983,7 +12152,7 @@ fn filterOver(ps: lexdb_plan.PScan, cs: []BX, subs: []lexdb_plan.PSub): lexdb_pl
 fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
     if !streams(sel) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
-    if len(q.levels) != 1 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
+    if len(q.levels) == 0 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
     if !tableRead(&q.levels[0]) { return false }
     return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs) && boundOnce(q)
 }
@@ -13033,13 +12202,25 @@ fn pipeAgg(sel: mut &Sel) {
         None { return }
     }
     var ps = scanArm(sel, true)
-    if len(keys) == 0 {
+    // (over joins every table's columns are the plan's: lexdb_plan.needs)
+    if len(keys) == 0 && len(sel.q.levels) == 1 {
         ps.need = lexdb_plan.callsNeed(len(ps.need), &cs, &calls)
         ps.part = true
     }
     var keep: []bool = array(len(sel.q.cols), false)
     for ci in afterCols(sel, &sel.q) { keep[ci] = true }
-    let agg = lexdb_plan.PPlan.Agg(filterOver(ps, cs, subsOf(&sel.q)), false, Some(lexdb_plan.PAgg{keys: keys, calls: calls, keep: keep}))
+    let base = filterOver(ps, cs, subsOf(&sel.q))
+    // (over joins: slice P2)
+    let joined = if len(sel.q.levels) > 1 { joinsOver(sel, base) } else { Ok(base) }
+    var input = lexdb_plan.PPlan.Result([])
+    match move(joined) {
+        Ok(x) { input = x }
+        Err(b) {
+            unplan(sel, b)
+            return
+        }
+    }
+    let agg = lexdb_plan.PPlan.Agg(input, false, Some(lexdb_plan.PAgg{keys: keys, calls: calls, keep: keep}))
     match lexdb_pipe.compile(physAbove(sel, agg), &sel.q.cols) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { unplan(sel, back) }
@@ -13054,8 +12235,9 @@ fn aggShape(sel: &Sel): bool {
     let q = &sel.q
     if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters)
-    if len(q.levels) != 1 || q.corr || len(q.top) > 0 || !tableRead(&q.levels[0]) { return false }
-    if q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols) || !boundOnce(q) { return false }
+    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !tableRead(&q.levels[0]) || !boundOnce(q) { return false }
+    // (one table: the query's only columns; joins: each level's, joinsOver)
+    if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
     for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } }
     return true
 }
@@ -13065,6 +12247,13 @@ fn aggShape(sel: &Sel): bool {
 fn pipeRows(sel: &Sel): bool {
     match sel.pipe {
         Some(pg) { return !pg.groups }
+        None { return false }
+    }
+}
+
+fn pipeJoins(sel: &Sel): bool {
+    match sel.pipe {
+        Some(pg) { return pg.joins }
         None { return false }
     }
 }
@@ -13088,7 +12277,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
     let q = &sel.q
     match sel.pipe {
         Some(pg) {
-            let src = try pipeSrc(st, txn, sel, &pg, params, &m.subs, rs)
+            let src = if pg.joins { lexdb_pipe.noSrc() } else { try pipeSrc(st, txn, sel, &pg, params, &m.subs, rs) }
             // (not without GROUP BY: there the one group stays even when
             // HAVING drops it, as the select's empty group)
             var fuse = false
@@ -13105,8 +12294,16 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             // a group HAVING drops is checked in these, not kept
             var look = newAccs(len(sel.specs))
             var vals: []Val = []
+            var srcs: []lexdb_pipe.Src = []
+            var tabs: []&Table = []
+            if pg.joins {
+                // (slice P2) every table's arm: its table and where it is read
+                // (its path's values read before the subqueries' are lent)
+                srcs = try joinSrcs(st, txn, sel, &pg, params, &m.subs, rs)
+                for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
+            }
             var cx = pipeCtx(st, txn, params, mut &m.subs)
-            let got = lexdb_pipe.runAgg(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &cx, room, mut &rs.bud, mut &cnt,
+            let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, mut &rs.bud, mut &cnt,
                                         fn(first: &[]Val, ps: &[]lexdb_pipe.PAcc): Result[Unit, DbErr] {
                 if fuse {
                     while len(vals) > 0 { let gone = pop(mut &vals) }
@@ -13136,7 +12333,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             let n = try got
             gs.firsts = firsts
             gs.accs = accss
-            scanCounts(rs, &cnt)
+            if pg.joins { levelCounts(rs, &cnt) } else { scanCounts(rs, &cnt) }
             return Ok(n)
         }
         None { return Err(e("XX000", "a plan the pipeline does not run")) }
@@ -13173,6 +12370,8 @@ fn unplan(sel: mut &Sel, p: lexdb_plan.PPlan) {
         lexdb_plan.PPlan.Having(i) { unplan(sel, i) }
         // (its keys and calls were bound for the plan only)
         lexdb_plan.PPlan.Agg(i, _, _) { unplan(sel, i) }
+        // (a join's expressions were bound for the plan only)
+        lexdb_plan.PPlan.Join(i, _) { unplan(sel, i) }
         lexdb_plan.PPlan.Project(i, xs) {
             if len(xs) == 0 {
                 // a view: the Sel holds its outputs
@@ -13218,6 +12417,35 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     match sel.pipe {
         Some(pg) {
             var subs = try runSubs(st, txn, &sel.q, params, rs)
+            if pg.joins {
+                // (slice P2) every table's arm: its table and where it is read
+                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, rs)
+                let cx = pipeCtx(st, txn, params, mut &subs)
+                var tabs: []&Table = []
+                for k in 0..len(sel.q.levels) { append(mut &tabs, &sel.q.levels[k].t) }
+                // a subquery's rows a level's (in FROM, a semi join's: cut to its columns)
+                var vrows: [][][]Val = []
+                for k in 0..len(sel.q.levels) {
+                    let lv = &sel.q.levels[k]
+                    if lv.work >= 0 {
+                        // a recursive CTE's working table (as prepare reads it)
+                        let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+                        if at < 0 { return Err(e("XX000", "a working table is missing")) }
+                        append(mut &vrows, copyRows(&rs.cache.rows[at]))
+                        continue
+                    }
+                    if lv.src < 0 {
+                        append(mut &vrows, [])
+                        continue
+                    }
+                    let rows = replace(mut &subs[lv.src].data, [])
+                    append(mut &vrows, if lv.semi { cutRows(rows, len(lv.t.cols)) } else { rows })
+                }
+                var cnt: []lexdb_pipe.Counts = []
+                let n = try lexdb_pipe.runJ(st, txn, &pg, &sel.q.cols, &tabs, &srcs, &vrows, &cx, cap, mut &rs.bud, mut &cnt, give)
+                levelCounts(rs, &cnt)
+                return Ok(n)
+            }
             let src = try pipeSrc(st, txn, sel, &pg, params, &subs, rs)
             let cx = pipeCtx(st, txn, params, mut &subs)
             var cnt: []lexdb_pipe.Counts = []
@@ -13235,7 +12463,11 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 // pipeline reads them (lexdb_pipe.srcOf: in batches or row by row).
 fn pipeSrc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
            rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
-    let q = &sel.q
+    return pipeSrcQ(st, txn, &sel.q, pg, params, subs, rs)
+}
+
+fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
+            rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
     let lv = &q.levels[0]
     let p = &lv.path
     let noAggs: []Val = []
@@ -13247,6 +12479,68 @@ fn pipeSrc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &le
     var keys: []str = []
     let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
     return lexdb_pipe.srcOf(pg, &lv.t, scans, p.index, p.desc, ixCovers(lv, p.index), how, keys)
+}
+
+// Where each table of a join plan is read, by level: the first as
+// pipeSrc reads it; a hash's by its path, read once (as materialize reads
+// it); a table looked up per row: nothing.
+fn joinSrcs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
+            rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
+    return joinSrcsQ(st, txn, &sel.q, pg, params, subs, rs)
+}
+
+fn joinSrcsQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
+             rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
+    var out: []lexdb_pipe.Src = []
+    append(mut &out, try pipeSrcQ(st, txn, q, pg, params, subs, rs))
+    let noAggs: []Val = []
+    let nullRow: []Val = array(len(q.cols), Val.Null)
+    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: subs, cur: &noAggs, seq: seqEnv(st, txn)}
+    for k in 1..len(q.levels) {
+        let lv = &q.levels[k]
+        if lv.perRow {
+            append(mut &out, lexdb_pipe.noSrc())
+            continue
+        }
+        let scans = try pathScans(&lv.t, &lv.path, &env)
+        append(mut &out, try lexdb_pipe.srcAt(pg, k, &lv.t, scans, lv.path.index, lv.path.desc, ixCovers(lv, lv.path.index)))
+    }
+    return Ok(out)
+}
+
+// Runs q's levels program (Query.jp) for the row engine: its joined rows
+// to emit; m: the run's (its subqueries' values copied into the run's
+// context, a subquery's rows a level's).
+fn runLevelsProg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, pg: &lexdb_pipe.Prog,
+                 emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
+    let srcs = try joinSrcsQ(st, txn, q, pg, params, &m.subs, rs)
+    var cx = cenvOf(seqEnv(st, txn))
+    cx.params = collections.copyOf(params)
+    for i in 0..len(m.subs) { append(mut &cx.subs, lexdb_pipe.copySub(&m.subs[i].v)) }
+    var tabs: []&Table = []
+    for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
+    var vrows: [][][]Val = []
+    for k in 0..len(q.levels) { append(mut &vrows, if q.levels[k].virt() { copyRows(&m.vrows[k]) } else { [] }) }
+    var cnt: []lexdb_pipe.Counts = []
+    try lexdb_pipe.runLevels(st, txn, pg, &q.cols, &tabs, &srcs, &vrows, &cx, mut &rs.bud, mut &cnt, emit)
+    levelCounts(rs, &cnt)
+    return Ok(Unit{})
+}
+
+// A join run's counts, per level (the pipeline's first ones), added to
+// the run's (EXPLAIN ANALYZE).
+fn levelCounts(rs: mut &Run, cnt: &[]lexdb_pipe.Counts) {
+    for k in 0..len(rs.cnt) {
+        if k >= len(cnt) - 1 { break }
+        rs.cnt[k].starts += cnt[k].starts
+        rs.cnt[k].read += cnt[k].read
+        rs.cnt[k].joined += cnt[k].joined
+        rs.cnt[k].nulls += cnt[k].nulls
+        rs.cnt[k].built += cnt[k].built
+        rs.cnt[k].kept += cnt[k].kept
+        rs.cnt[k].unmatched += cnt[k].unmatched
+        rs.cnt[k].batches += cnt[k].batches
+    }
 }
 
 // sel's rows held (execSel), by its pipeline plan: counted against
@@ -14680,7 +13974,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan(), jp: None}
     let lpl = takeLp(mut &l)
     let lpr = takeLp(mut &r)
     let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, outBCols(&outs)) }
@@ -14936,6 +14230,8 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         lexdb_plan.PPlan.Levels(_, _) { for l in explainLines(&sel.q, cnt) { append(out, l) } }
         // (the pipeline's: its table's line as a level's, its conditions there)
         lexdb_plan.PPlan.Scan(_, _) { for l in explainLines(&sel.q, cnt) { append(out, l) } }
+        // (the joins' tables: lines of the Scan's, as levels)
+        lexdb_plan.PPlan.Join(i, _) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Filter(i, _) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Result(_) {
             for l in explainLines(&sel.q, cnt) { append(out, l) }
@@ -15480,9 +14776,17 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
              rs: mut &Run, toSink: bool, eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr]): Result[Res, DbErr] {
     let sqe = seqEnv(st, txn)
     if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
-    if rs.batch && pipeRows(sel) && !rs.noLimit { return pipeHeld(st, txn, sel, params, cap, rs) }
+    if rs.batch && pipeRows(sel) && !rs.noLimit {
+        // (a value a join's batch cannot hold, an expression it does not
+        // compile: the row engine, nothing given yet)
+        match pipeHeld(st, txn, sel, params, cap, rs) {
+            Ok(r) { return Ok(r) }
+            Err(x) { if !lexdb_pipe.isBat(&x) { return Err(x) } }
+        }
+    }
     // (an aggregate the pipeline runs: its conditions are its plan's, not bound per run)
-    var m = try prepareIn(st, txn, &sel.q, params, rs, !(rs.batch && pipeAggs(sel)))
+    let pa = rs.batch && pipeAggs(sel)
+    var m = try prepareIn(st, txn, &sel.q, params, rs, !pa, !(pa && pipeJoins(sel)))
     let q = &sel.q
     let limit = if rs.noLimit { -1 } else if cap >= 0 && (sel.limit < 0 || cap < sel.limit) { cap } else { sel.limit }
     let offset = if rs.noLimit { -1 } else { sel.offset }
@@ -15535,11 +14839,21 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         // over batches of rows when the query allows (9.47), else row by row
         var batched = false
         if !later && rs.batch && pipeAggs(sel) {
-            held += try pipeGroups(st, txn, sel, mut &m, params, rs, mut &gs, if room >= 0 { room - held } else { -1 })
-            batched = true
-        } else if !later {
-            batched = try batchGroups(st, txn, sel, &m, params, rs, mut &gs, mut &held, room, rs0max)
+            match pipeGroups(st, txn, sel, mut &m, params, rs, mut &gs, if room >= 0 { room - held } else { -1 }) {
+                Ok(h) {
+                    held += h
+                    batched = true
+                }
+                Err(x) {
+                    // a value a join's batch cannot hold: the row engine
+                    // (its hashes built now), nothing given yet
+                    if !lexdb_pipe.isBat(&x) { return Err(x) }
+                    gs = Groups{index: newMap(), firsts: [], accs: [], sets: []}
+                    try materialize(st, txn, q, mut &m, params, rs)
+                }
+            }
         }
+
         if !batched {
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && lexdb_ops.isNull(&r[sel.first]) { return Ok(true) }
@@ -16548,7 +15862,7 @@ pub fn (s: mut &Session) close() {
         s.tmpUndo(&t)
         s.st.abort(t)
     }
-    chgEnd(&s.st, s.id, false)
+    lexdb_stats.chgEnd(&s.st, s.id, false)
     s.failed = false
     // its temporary objects (9.96); should this fail, the next start drops them
     if len(s.tmp) > 0 { let r = s.dropTemps() }
@@ -16690,7 +16004,7 @@ fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
          stmt.kind == lexdb_sql.S_MERGE || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) { return false }
     let st = s.st
     match catKey(&st, mut &s.txn[0], &stmt.table, false) {
-        Ok(k) { return tempRel(&k) }
+        Ok(k) { return lexdb_catalog.tempRel(&k) }
         Err(_) { return false }
     }
 }
@@ -17099,7 +16413,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         lexdb_sql.S_BEGIN {
             if len(s.txn) == 0 {
-                chgEnd(&s.st, s.id, false)          // (counts an earlier failed statement left: optimizer 44)
+                lexdb_stats.chgEnd(&s.st, s.id, false)          // (counts an earlier failed statement left: optimizer 44)
                 if stmt.ifFlag {
                     append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
                 } else {
@@ -17171,7 +16485,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
                 s.restore()
-                chgEnd(&s.st, s.id, false)
+                lexdb_stats.chgEnd(&s.st, s.id, false)
                 return Ok(tagOnly("ROLLBACK"))
             }
             s.saved = []
@@ -17184,10 +16498,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             match s.st.commit(t) {
                 Ok(_) {
                     s.onCommit = kept
-                    chgEnd(&s.st, s.id, s.auto)
+                    lexdb_stats.chgEnd(&s.st, s.id, s.auto)
                 }
                 Err(x) {
-                    chgEnd(&s.st, s.id, false)
+                    lexdb_stats.chgEnd(&s.st, s.id, false)
                     if ddl { tmpChanged(&s.st, s.id) }
                     return Err(x)
                 }
@@ -17200,7 +16514,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.tmpUndo(&t)
                 s.st.abort(t)
             }
-            chgEnd(&s.st, s.id, false)
+            lexdb_stats.chgEnd(&s.st, s.id, false)
             s.failed = false
             s.saves = []
             s.restore()
@@ -17288,7 +16602,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
-        chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
+        lexdb_stats.chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
         // (and its notices: those of the statements before kept)
         if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
         var sent = false
@@ -17316,7 +16630,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 match s.st.commit(t) {
                     Ok(_) {
                         s.onCommit = kept
-                        chgEnd(&s.st, s.id, s.auto)
+                        lexdb_stats.chgEnd(&s.st, s.id, s.auto)
                         return Ok(r)
                     }
                     Err(x) {
@@ -17447,7 +16761,7 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
     let t = found.unwrap()
     let tn = lexdb_sql.shown(&t.name)
     if len(t.view) > 0 { return Err(waitRefused(&("reads an ordinary table: \"" + tn + "\" is a view"))) }
-    if tempRel(&t.name) { return Err(waitRefused("cannot read a temporary table: no other session can add to it")) }
+    if lexdb_catalog.tempRel(&t.name) { return Err(waitRefused("cannot read a temporary table: no other session can add to it")) }
     let alias = if len(f.alias) > 0 { f.alias.toStr() } else { lexdb_sql.baseName(&t.name) }
     let shape = "needs ORDER BY c, WHERE c > v and an index on (k ..., c), its k from WHERE's k = v"
     // the cursor: ORDER BY's column, ascending
@@ -17828,7 +17142,7 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
     let c = try lexdb_access.updateRow(st, txn, &lexdb_catalog.relOf(t), old, row,
                                        fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
                                        fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                                       fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 1) })
+                                       fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 1) })
     if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
     if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
@@ -17842,7 +17156,7 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
     try lexdb_access.deleteRow(st, txn, &lexdb_catalog.relOf(t), row,
                                fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
                                fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
-                               fn(tx: &lexdb_store.Txn) { noteChg(st, tx, t, 2) })
+                               fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 2) })
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
@@ -18093,9 +17407,9 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
     match try byKeyOpt(st, txn, &refKey) {
         Some(p) {
             // temporary to temporary only, permanent to permanent (9.96)
-            if tempRel(&t.name) != tempRel(&p.name) {
-                return Err(e("42P16", &("constraints on " + (if tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables may reference only " +
-                             (if tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables")))
+            if lexdb_catalog.tempRel(&t.name) != lexdb_catalog.tempRel(&p.name) {
+                return Err(e("42P16", &("constraints on " + (if lexdb_catalog.tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables may reference only " +
+                             (if lexdb_catalog.tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables")))
             }
             let f = try makeFk(st, txn, t, &p, c, &refKey)
             append(mut &t.fks, f)
@@ -18499,7 +17813,7 @@ fn newSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, typ: int
     d.typ = typ
     // unique: the catalog's version (one per DDL statement) and the time
     // (a temporary one's not: its DDL reads nothing others write, 9.96)
-    d.id = (if tempRel(key) { "t" + txn.sql.sess.toStr() } else { try catVersion(st, txn) }) + "." + time.unixMillis().toStr() + "." +
+    d.id = (if lexdb_catalog.tempRel(key) { "t" + txn.sql.sess.toStr() } else { try catVersion(st, txn) }) + "." + time.unixMillis().toStr() + "." +
            time.monotonicNs().toStr()
     let r = try seqFrom(o, &d, true)
     try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.seqRow(key)), &(lexdb_catalog.encSeq(&r)))
@@ -19166,7 +18480,7 @@ fn moveSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &Seq, a: &lex
     let base = lexdb_sql.baseName(&old.key)
     var key = lexdb_sql.qual(&lexdb_sql.schemaOf(&old.key), &a.name)
     if a.kind == lexdb_sql.A_SET_SCHEMA {
-        if tempRel(&old.key) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
+        if lexdb_catalog.tempRel(&old.key) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name) { return Err(e("0A000", "cannot move objects into or out of temporary schemas")) }
         if !(try schemaExists(st, txn, &a.name)) { return Err(e("3F000", &("schema \"" + a.name + "\" does not exist"))) }
         key = lexdb_sql.qual(&a.name, &base)
         if key != old.key && len(old.ownerT) > 0 {
@@ -19351,7 +18665,7 @@ fn makeColSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
 // The sequences owned by table t (its column col; "" any) dropped.
 fn dropOwnedSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: &str): Result[Unit, DbErr] {
     // (a temporary table's are in its schema: 9.96)
-    for d in try lexdb_catalog.allSeqs(st, txn, &(if tempRel(&t.name) { lexdb_sql.schemaOf(&t.name) } else { "" })) {
+    for d in try lexdb_catalog.allSeqs(st, txn, &(if lexdb_catalog.tempRel(&t.name) { lexdb_sql.schemaOf(&t.name) } else { "" })) {
         if d.ownerT == t.name && (len(col) == 0 || d.ownerC == col) { try dropSeqRows(st, txn, &d) }
     }
     return Ok(Unit{})
@@ -19853,7 +19167,7 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
     if !(try lexdb_access.loadRow(st, txn, rel, id, &row, state)) {
         return Err(e("23505", "duplicate key value violates unique constraint"))
     }
-    noteChg(st, txn, t, 0)
+    lexdb_stats.noteChg(st, txn.sql.sess, t, 0)
     return Ok(Unit{})
 }
 
@@ -20993,11 +20307,10 @@ pub const BK_BOOL: int = lexdb_rows.BK_BOOL  // ... a boolean (0, 1) ...
 pub const BK_VAL: int = lexdb_rows.BK_VAL    // ... or any other, as values
 // Grouped queries run over batches with numerics as units, and those that
 // gave way to the row path (a result past its units), for the tests.
-var groupRuns: int = 0      // joins' grouped queries run over batches (one table's: the pipeline's, lexdb_pipe.aggCounts)
 
 pub fn decCounts(): []int {
     let pc = lexdb_pipe.aggCounts()
-    return [pc[0], pc[1], groupRuns + pc[2]]
+    return [pc[0], pc[1], pc[2]]
 }
 
 // A column of a batch, or an expression's values for the rows chosen.
@@ -21046,28 +20359,7 @@ fn bxOf(x: &Expr, q: &Query): Option[BX] {
     return lexdb_bind.bindExpr(x, &q.cols, &none, false, &typing())
 }
 
-// bCompileD (lexdb_pipe) of level k's condition i (post: of its WHERE conjuncts after
-// it), bound as prepare bound it (Mats.cc, cp) or the plan (Query.cc, cp),
-// else bound now; its constants in m.ce.
-fn bCompileCond(q: &Query, m: &Mats, k: int, i: int, post: bool, kinds: &[]int, base: int, dec: bool): Option[BComp] {
-    let xs = if post { &q.levels[k].post } else { &q.levels[k].cond }
-    let cs = if post { if len(m.cp) > 0 { &m.cp } else { &q.cp } } else { if len(m.cc) > 0 { &m.cc } else { &q.cc } }
-    if k < len(cs) && len(cs[k]) == len(xs) {
-        match cs[k][i] {
-            Some(b) { return lexdb_pipe.bCompileD(&b, &q.cols, kinds, &m.ce, base, dec) }
-            None { return None }
-        }
-    }
-    return bCompileX(&xs[i], q, kinds, &m.ce, base, dec)
-}
 
-// bCompile (lexdb_pipe) of x bound (bxOf); None when it does not bind.
-fn bCompileX(x: &Expr, q: &Query, kinds: &[]int, ce: &Ctx, base: int, dec: bool): Option[BComp] {
-    match bxOf(x, q) {
-        Some(b) { return lexdb_pipe.bCompileD(&b, &q.cols, kinds, ce, base, dec) }
-        None { return None }
-    }
-}
 
 // Where a batch reads the columns used (lexdb_rows.Projection).
 type BPlan = lexdb_rows.Projection
@@ -21094,7 +20386,7 @@ type BPlan = lexdb_rows.Projection
 // table's (lexdb_store.setColSpec was given others) is read row by row,
 // its rows rebuilt.
 
-// The first level of q scanned in batches (batchLevel, eachOut): its
+// The first level of q scanned in batches (batchLevel, outPlan): its
 // conditions the batches evaluate (all: every one), its scans, where its
 // batches read the columns used, the query's columns' kinds (BK_NONE those
 // of the other tables), whether a scan is of a range (not key lookups).
@@ -21197,295 +20489,14 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     return Ok(Some(LPlan{conds: conds, all: all, scans: scans, bp: bp, part: part, qkinds: qkinds, ranges: ranges, rd: rd, lazy: lazy}))
 }
 
-// The rows of b every one of conds holds for (true, not NULL), in order;
-// None: one gives an error on some row of b.
-fn bChoose(conds: &[]BNode, b: &Batch): Option[[]int] {
-    var idx: []int = withCapacity(b.n)
-    for r in 0..b.n { append(mut &idx, r) }
-    let none: []bool = []
-    return lexdb_pipe.bNarrow(conds, &none, b, idx)
-}
 
-// ---- Joins over batches (9.102)
-//
-// The tables after the first, each a hash join (INNER, or LEFT) whose key
-// and conditions the batches evaluate, join a batch of the first table's
-// chosen rows at a time: the batch's keys looked up in the table's hash
-// (the row path's own, Mats: so any type of key, several columns, equal
-// keys), each match's columns gathered from the table's rows (held as
-// columns, once) into a joined batch, of the query's columns, the join's
-// conditions run over it. The joined rows are in the row path's order (by
-// the first table's row, then each table's matches in its hash's order),
-// counted as it counts them. A batch on one of whose rows a key or a
-// condition gives an error: the row path reads it.
+// ---- Join paths the pipeline's joins read (slice P2; the batch join driver was deleted with it)
 
-const JK_GEN = 0        // a join's key looked up as the row path does (keyVal, encIdxPart or lexdb_pipe.keyPart, Mats.keys)
-const JK_INT = 1        // one integer key: in a map of its own
-const JK_TEXT = 2       // one text key (text or varchar, no collation): in a map of its own, by its text
-const JK_IKEYS = 3      // a semi-join's one integer key (semiIntKey): materialize's map, Mats.ikeys
+// Joins run in batches (the pipeline's: lexdb_pipe.joinCounts), and those
+// with a range per row, for the tests.
+pub fn joinPlans(): int { return lexdb_pipe.joinCounts()[0] }
 
-type JLevel = record {
-    k: int
-    left: bool
-    right: bool             // a RIGHT JOIN's: its rows that join are noted (Run.seen), the others added after the scan (bUnmatched)
-    look: bool              // a lookup by the whole primary key per row (its key: the path's equalities), not a hash
-    range: bool             // a semi/anti join's range per row (semiLook; its key: the path's equalities): bRange
-    // a range's bounds on the column after its equalities (the path's rng,
-    // constants; an index's NULLs left out as pathScan leaves them), after
-    // a row's prefix; and whether one is NULL (no row in any range)
-    tail: lexdb_access.Tail
-    noRange: bool
-    key: []BNode            // per hash column: the value it equals, over the joined batch
-    keyTyp: []int           // their BT_*
-    keyCol: []int           // ... the batch's column for a lexdb_pipe.BT_OTHER (a column of values)
-    mode: int
-    ints: Map[int, int]     // JK_INT: key -> bucket
-    txts: Map[str, int]     // JK_TEXT
-    conds: []BNode
-    post: []BNode
-    resNot: bool            // a semi/anti "inner <> outer": res evaluates the outer value
-    res: BNode
-    resTyp: int             // lexdb_pipe.BT_INT or lexdb_pipe.BT_BOOL
-    rows: Batch             // its rows (Mats.mat) as columns: by its table's column
-    rkinds: []int
-    // the query's columns gathered (jpFinish): into its candidates (those
-    // its conditions and the rest of the query use), and after it
-    cand: []bool
-    after: []bool
-}
-
-type JPlan = record {
-    levels: []JLevel
-    kinds: []int            // per column of the query: BK_*
-    need: []bool            // per column of the query: read (else NULL)
-    first: []bool           // the first table's columns gathered (jpFinish)
-    right: int              // the RIGHT JOIN's level in levels (one at most); -1 none
-}
-
-// The joins after q's first level over batches (its plan: lp); None: one
-// is not a join the batches run (FULL, per row, LATERAL, a key or a
-// condition they do not evaluate, a row they cannot hold), or a RIGHT JOIN
-// where the caller does not add its unmatched rows (right false; one RIGHT
-// JOIN at most).
-fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, lp: &LPlan, right: bool): Result[Option[JPlan], DbErr] {
-    let nq = len(q.cols)
-    let l0 = &q.levels[0]
-    var kinds: []int = array(nq, lexdb_pipe.BK_NONE)
-    var need: []bool = array(nq, false)
-    for i in 0..len(lp.bp.kinds) {
-        kinds[l0.first + i] = lp.bp.kinds[i]
-        need[l0.first + i] = lp.bp.needCol[i]
-    }
-    let noAggs: []Val = []
-    let nullRow: []Val = array(nq, Val.Null)
-    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
-    var levels: []JLevel = []
-    var rightAt = -1
-    for k in 1..len(q.levels) {
-        let lv = &q.levels[k]
-        let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
-        // a RIGHT JOIN: hashed (read once), its rows noted as they join
-        let rj = lv.join == lexdb_sql.J_RIGHT
-        if rj {
-            if !right || rightAt >= 0 { return Ok(None) }
-            rightAt = len(levels)
-        }
-        // a lookup per row by its whole primary key (9.103), or a hash. Not
-        // where reading may stop early (a LIMIT, EXISTS: optimizer 19's
-        // stops): a batch's lookups would be made for rows never wanted.
-        let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
-        // a range per row: a semi/anti level's (semiLook), or (9.103's
-        // lookups for a key's range) a join's by its primary key's leading
-        // columns or an index's (q3, q5, q10's lineitem by l_orderkey; q8,
-        // q9's index lookups)
-        let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
-        let keyed = look || range
-        var los: []Val = []
-        var his: []Val = []
-        var noRange = false
-        if range && len(lv.path.rng) > 0 {
-            // its bounds on the column after the equalities (q3, q5's
-            // orders by customer and o_orderdate < ...): as pathScan makes
-            // them, once
-            let typ = keyType(&lv.t, lv.path.index, len(lv.path.eqs))
-            for b in lv.path.rng {
-                let v = match eval(&b.val, &env) {
-                    Ok(x) {
-                        match lexdb_ops.coerceZ(x, &typ, &envZone(&env)) {
-                            Ok(y) { y }
-                            Err(_) { return Ok(None) }
-                        }
-                    }
-                    Err(_) { return Ok(None) }
-                }
-                if lexdb_ops.isNull(&v) {
-                    noRange = true
-                    continue
-                }
-                if b.op == ">" || b.op == ">=" { append(mut &los, v) } else { append(mut &his, v) }
-            }
-        }
-        let capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
-        let tail = lexdb_access.tailOf(lv.path.index, &los, &his, capNulls)
-        if (lv.perRow && !keyed) || lv.lateral || !(inner || rj || lv.join == lexdb_sql.J_LEFT) { return Ok(None) }
-        if !keyed && (len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols)) { return Ok(None) }
-        if inner && len(lv.post) > 0 { return Ok(None) }
-        // its key's values: of the tables before it
-        var key: []BNode = []
-        var keyTyp: []int = []
-        var keyCol: []int = []
-        let keyXs = if keyed { &lv.path.eqs } else { &lv.hashVals }
-        for x in keyXs {
-            let c = bCompileX(&x, q, &kinds, &m.ce, 0, false)
-            if c.isNone() { return Ok(None) }
-            let cc = c.unwrap()
-            var col = -1
-            match cc.n {
-                BNode.Col(i) { col = i }
-                else {}
-            }
-            if cc.typ == lexdb_pipe.BT_OTHER && col < 0 { return Ok(None) }
-            append(mut &keyTyp, cc.typ)
-            append(mut &keyCol, col)
-            append(mut &key, lexdb_pipe.takeN(cc))
-        }
-        // its columns
-        let ncol = len(m.mat[k])            // (its rows)
-        var rkinds: []int = []
-        for i in 0..len(lv.t.cols) {
-            let kd = lexdb_rows.colKind(&lv.t.cols[i])
-            append(mut &rkinds, kd)
-            kinds[lv.first + i] = kd
-            need[lv.first + i] = len(lv.need) == 0 || lv.need[i]
-        }
-        var post: []BNode = []
-        for pi in 0..len(lv.post) {
-            match bCondNode(q, m, k, pi, true, &kinds, 0, &need) {
-                Some(n) { append(mut &post, n) }
-                None { return Ok(None) }
-            }
-        }
-        // its rows as columns (a lookup's: per batch, as found)
-        let mat = &m.mat[k]
-        var rows = Batch{cols: [], vals: [], n: ncol}
-        for i in 0..len(rkinds) {
-            let used = need[lv.first + i]
-            append(mut &rows.cols, if used { lexdb_rows.bvec(ncol) } else { lexdb_rows.bvec(0) })
-            append(mut &rows.vals, if used && rkinds[i] == BK_VAL { array(ncol, Val.Null) } else { [] })
-        }
-        for ri in 0..ncol {
-            for i in 0..len(rkinds) {
-                if !need[lv.first + i] { continue }
-                if i >= len(mat[ri]) { return Ok(None) }
-                if !lexdb_rows.put(mut &rows, i, ri, mat[ri][i], rkinds[i]) { return Ok(None) }
-            }
-        }
-        // one integer key, its column an integer's under no collation: its own map
-        var mode = JK_GEN
-        let hc = if keyed { 0 } else { lv.hashCols[0] }
-        let exact = !keyed && (len(lv.hashKinds) == 0 || lv.hashKinds[0] == lexdb_sql.COLL_EXACT)
-        var ints: Map[int, int] = newMap()
-        // a semi-join's one integer key: materialize keyed it in Mats.ikeys
-        // only (Mats.keys is empty), and a "<>" summary's buckets hold no
-        // rows to rebuild a map from
-        let ik = !keyed && semiIntKey(lv)
-        if ik {
-            if len(key) != 1 || keyTyp[0] != lexdb_pipe.BT_INT { return Ok(None) }
-            mode = JK_IKEYS
-        }
-        // (a semi-join's rows are keyed by value, lexdb_pipe.keyPart: an integer's key
-        // is its value's, a text's its text, as these maps take them; a
-        // "<>" summary keeps no rows, so its key is looked up in Mats.keys)
-        if !ik && !lv.resNot && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == lexdb_pipe.BT_INT && rkinds[hc] == BK_INT {
-            mode = JK_INT
-            let bs = &m.buckets[k]
-            for bi in 0..len(bs) {
-                if len(bs[bi]) == 0 { continue }
-                match mat[bs[bi][0]][hc] {
-                    Val.Int(x) { ints.put(x, bi) }
-                    else { mode = JK_GEN }
-                }
-                if mode == JK_GEN { break }
-            }
-        }
-        // one text key, of a text or varchar column under no collation,
-        // the value a text or varchar column's: by its text
-        var txts: Map[str, int] = newMap()
-        let ho = lv.t.cols[hc].typ.oid
-        if mode == JK_GEN && !lv.resNot && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == lexdb_pipe.BT_OTHER && (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) {
-            let ko = q.cols[keyCol[0]].typ.oid
-            if ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR {
-                mode = JK_TEXT
-                let bs = &m.buckets[k]
-                for bi in 0..len(bs) {
-                    if len(bs[bi]) == 0 { continue }
-                    match mat[bs[bi][0]][hc] {
-                        Val.Text(x) { txts.put(x, bi) }
-                        else { mode = JK_GEN }
-                    }
-                    if mode == JK_GEN { break }
-                }
-            }
-        }
-        // its conditions, but those its hash has already applied: those on
-        // its own columns only (materialize kept only the rows they hold
-        // for; not a RIGHT JOIN's, which keeps every row), and with a key of
-        // its own map, the key's equality
-        var conds: []BNode = []
-        for ci in 0..len(lv.cond) {
-            let x = &lv.cond[ci]
-            // (a semi join's conditions are its residuals, none applied by
-            // materialize, those on its own columns and outer values only
-            // too: q21's shape nested in a subquery, "inner > $1")
-            if !keyed && !rj && !lv.semi && q.minLevel(x) >= k { continue }
-            if mode != JK_GEN && isKeyEq(x, q, lv) { continue }
-            match bCondNode(q, m, k, ci, false, &kinds, 0, &need) {
-                Some(n) { append(mut &conds, n) }
-                None { return Ok(None) }
-            }
-        }
-        var resNot = false
-        var res = BNode.Const(0, true)
-        var resTyp = lexdb_pipe.BT_INT
-        if lv.resNot {
-            let rc = bCompileX(&lv.resVal, q, &kinds, &m.ce, 0, false)
-            if rc.isNone() { return Ok(None) }
-            let rcc = rc.unwrap()
-            if rcc.typ != lexdb_pipe.BT_INT && rcc.typ != lexdb_pipe.BT_BOOL { return Ok(None) }
-            resNot = true
-            resTyp = rcc.typ
-            res = lexdb_pipe.takeN(rcc)
-        }
-        append(mut &levels, JLevel{k: k, left: lv.join == lexdb_sql.J_LEFT, right: rj, look: look, range: range,
-                                   tail: tail, noRange: noRange,
-                                   key: key, keyTyp: keyTyp, keyCol: keyCol, mode: mode,
-                                   ints: ints, txts: txts, conds: conds, post: post, resNot: resNot, res: res, resTyp: resTyp,
-                                   rows: rows, rkinds: rkinds, cand: [], after: []})
-    }
-    joinPlansMade += 1
-    for jl in levels {
-        var gen = false
-        for c in jl.conds { match c { BNode.Gen(_) { gen = true } else {} } }
-        for c in jl.post { match c { BNode.Gen(_) { gen = true } else {} } }
-        if gen { genJoinPlans += 1 }
-    }
-    var all: []bool = []
-    for x in need { append(mut &all, x) }
-    var jp = JPlan{levels: levels, kinds: kinds, need: need, first: [], right: rightAt}
-    jpFinish(mut &jp, q, &all)
-    return Ok(Some(jp))
-}
-
-// Batch join plans with a condition compiled per row (bCondNode's), for
-// the tests.
-var genJoinPlans: int = 0
-
-pub fn genJoins(): int { return genJoinPlans }
-
-// Batch join plans made (bJoinPlan's), for the tests.
-var joinPlansMade: int = 0
-
-pub fn joinPlans(): int { return joinPlansMade }
+pub fn rangeJoins(): int { return lexdb_pipe.rangeJoins() }
 
 // Level k's condition i (post: of its WHERE conjuncts after it) over a
 // batch (kinds: per column of the query, base: the batch's first, need:
@@ -21532,280 +20543,6 @@ fn isKeyEq(x: &Expr, q: &Query, lv: &Level): bool {
     }
 }
 
-fn noJoins(): JPlan { return JPlan{levels: [], kinds: [], need: [], first: [], right: -1} }
-
-// Which columns each join gathers, given those its consumer uses (out):
-// each table's candidates, those its conditions use and those used after
-// it; before it, those and its keys'. A column nothing after uses is not
-// copied from batch to batch.
-fn jpFinish(jp: mut &JPlan, q: &Query, out: &[]bool) {
-    let nq = len(q.cols)
-    var after: []bool = array(nq, false)
-    for c in 0..nq { after[c] = c < len(out) && out[c] && jp.need[c] }
-    var li = len(jp.levels) - 1
-    while li >= 0 {
-        let lv = &q.levels[jp.levels[li].k]
-        var cand: []bool = []
-        for x in after { append(mut &cand, x) }
-        for ci in 0..len(jp.levels[li].conds) { lexdb_pipe.bColsOf(&jp.levels[li].conds[ci], mut &cand) }
-        for ci in 0..len(jp.levels[li].post) { lexdb_pipe.bColsOf(&jp.levels[li].post[ci], mut &cand) }
-        var inp: []bool = []
-        for x in cand { append(mut &inp, x) }
-        for i in 0..len(lv.t.cols) { inp[lv.first + i] = false }
-        for ki in 0..len(jp.levels[li].key) { lexdb_pipe.bColsOf(&jp.levels[li].key[ki], mut &inp) }
-        // a "<>" summary's outer value: bProbe evaluates it on the input
-        if jp.levels[li].resNot { lexdb_pipe.bColsOf(&jp.levels[li].res, mut &inp) }
-        jp.levels[li].cand = cand
-        jp.levels[li].after = after
-        after = inp
-        li -= 1
-    }
-    for c in 0..nq { after[c] = after[c] && jp.need[c] }
-    jp.first = after
-}
-
-// Column c's rows at (its rows' places in src) into a new column: out of
-// cols (and vals, when it is a column of values); -1: NULL.
-fn bGather(src: &Batch, c: int, kind: int, at: &[]int, out: mut &Batch, oc: int) {
-    let n = len(at)
-    var col = lexdb_rows.bvec(n)
-    let s = &src.cols[c]
-    for p in 0..n {
-        let r = at[p]
-        if r < 0 { col.nul[p] = true } else {
-            col.v[p] = s.v[r]
-            col.nul[p] = s.nul[r]
-        }
-    }
-    out.cols[oc] = col
-    if kind == BK_VAL {
-        var vs: []Val = array(n, Val.Null)
-        let sv = &src.vals[c]
-        for p in 0..n {
-            let r = at[p]
-            if r >= 0 { vs[p] = sv[r] }
-        }
-        out.vals[oc] = vs
-    }
-}
-
-// An empty joined batch of nq columns.
-fn bJoined(nq: int, n: int): Batch {
-    var b = Batch{cols: [], vals: [], n: n}
-    for i in 0..nq {
-        append(mut &b.cols, lexdb_rows.bvec(0))
-        append(mut &b.vals, [])
-    }
-    return b
-}
-
-// The rows idx of the first table's batch b0 joined with the tables after
-// it (jp): a joined batch of the query's columns, its rows all chosen;
-// None: a key or a condition gives an error on one of them.
-fn bJoinAll(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, jp: &JPlan, b0: &Batch, idx: &[]int,
-            z: &lexdb_time.Zone, rs: mut &Run): Result[Option[Batch], DbErr] {
-    let nq = len(q.cols)
-    let l0 = &q.levels[0]
-    var cur = bJoined(nq, len(idx))
-    for i in 0..len(b0.cols) {
-        let c = l0.first + i
-        if jp.first[c] { bGather(b0, i, jp.kinds[c], idx, mut &cur, c) }
-    }
-    // (a batch that gives way: its callers restore the counts, 7f350792)
-    for li in 0..len(jp.levels) {
-        let got = if jp.levels[li].look { try bLookup(st, txn, q, jp, &jp.levels[li], &cur, z, rs) } else if jp.levels[li].range {
-            try bRange(st, txn, q, jp, &jp.levels[li], &cur, z, rs)
-        } else { try bProbe(q, m, jp, &jp.levels[li], &cur, z, rs) }
-        if got.isNone() { return Ok(None) }
-        cur = got.unwrap()
-    }
-    return Ok(Some(cur))
-}
-
-// The rows of jp's RIGHT JOIN level that joined nothing (Run.seen), from
-// its row at on, at most BROWS of them, as runQuery adds them on the row
-// path: NULLs for the tables before it, its WHERE conjuncts checked, then
-// joined with the tables after it. at: its next row (its rows' count when
-// they are all done). None: a key or a condition gives an error on one of
-// them (the row path then gives it, or not).
-fn bUnmatched(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, jp: &JPlan, z: &lexdb_time.Zone, rs: mut &Run,
-              at: mut &int): Result[Option[Batch], DbErr] {
-    let li = jp.right
-    let jl = &jp.levels[li]
-    let k = jl.k
-    let lv = &q.levels[k]
-    let total = len(rs.seen[k])
-    var idx: []int = []
-    while at < total && len(idx) < lexdb_rows.BROWS {
-        if !rs.seen[k][at] { append(mut &idx, at) }
-        at += 1
-    }
-    let n = len(idx)
-    rs.cnt[k].unmatched += n
-    try rs.bud.tickN(n)
-    let nq = len(q.cols)
-    let mask = if len(jl.post) > 0 { &jl.cand } else { &jl.after }
-    var cur = bJoined(nq, n)
-    for c in 0..nq {
-        if !mask[c] || (c >= lv.first && c < lv.first + len(jl.rkinds)) { continue }
-        var col = lexdb_rows.bvec(n)
-        for p in 0..n { col.nul[p] = true }
-        cur.cols[c] = col
-        if jp.kinds[c] == BK_VAL { cur.vals[c] = array(n, Val.Null) }
-    }
-    for i in 0..len(jl.rkinds) {
-        if mask[lv.first + i] { bGather(&jl.rows, i, jl.rkinds[i], &idx, mut &cur, lv.first + i) }
-    }
-    if len(jl.post) > 0 {
-        let pc = bChoose(&jl.post, &cur)
-        if pc.isNone() { return Ok(None) }
-        let pk = pc.unwrap()
-        var fin = bJoined(nq, len(pk))
-        for c in 0..nq {
-            if jl.after[c] { bGather(&cur, c, jp.kinds[c], &pk, mut &fin, c) }
-        }
-        cur = fin
-    }
-    for l2 in li + 1..len(jp.levels) {
-        let got = if jp.levels[l2].look { try bLookup(st, txn, q, jp, &jp.levels[l2], &cur, z, rs) } else { try bProbe(q, m, jp, &jp.levels[l2], &cur, z, rs) }
-        if got.isNone() { return Ok(None) }
-        cur = got.unwrap()
-    }
-    return Ok(Some(cur))
-}
-
-// The joined batch j joined with one more table (jl).
-fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_time.Zone, rs: mut &Run): Result[Option[Batch], DbErr] {
-    let k = jl.k
-    let lv = &q.levels[k]
-    let n = j.n
-    var all: []int = withCapacity(n)
-    for r in 0..n { append(mut &all, r) }
-    var kv: []BVec = []
-    for i in 0..len(jl.key) {
-        if jl.keyTyp[i] == lexdb_pipe.BT_OTHER {
-            append(mut &kv, lexdb_rows.bvec(0))
-            continue
-        }
-        match lexdb_pipe.bEval(&jl.key[i], j, &all) {
-            Ok(v) { append(mut &kv, v) }
-            Err(_) { return Ok(None) }
-        }
-    }
-    // the matches: per joined row, its bucket's rows in order
-    var pj: []int = withCapacity(n)
-    var pi: []int = withCapacity(n)
-    let buckets = &m.buckets[k]
-    var rv = lexdb_rows.bvec(0)
-    if jl.resNot {
-        match lexdb_pipe.bEval(&jl.res, j, &all) {
-            Ok(v) { rv = v }
-            Err(_) { return Ok(None) }
-        }
-    }
-    for r in 0..n {
-        var bk = -1
-        if jl.mode == JK_INT {
-            if !kv[0].nul[r] {
-                match jl.ints.get(&kv[0].v[r]) {
-                    Some(x) { bk = x }
-                    None {}
-                }
-            }
-        } else if jl.mode == JK_IKEYS {
-            if !kv[0].nul[r] {
-                match m.ikeys[k].get(&kv[0].v[r]) {
-                    Some(x) { bk = x }
-                    None {}
-                }
-            }
-        } else if jl.mode == JK_TEXT {
-            let c = jl.keyCol[0]
-            if !j.cols[c].nul[r] {
-                match j.vals[c][r] {
-                    Val.Text(x) {
-                        match jl.txts.get(&x) {
-                            Some(y) { bk = y }
-                            None {}
-                        }
-                    }
-                    else { return Ok(None) }
-                }
-            }
-        } else {
-            var kb = newStrBuf()
-            var nul = false
-            for i in 0..len(jl.key) {
-                var v = Val.Null
-                let t = jl.keyTyp[i]
-                if t == lexdb_pipe.BT_OTHER {
-                    let c = jl.keyCol[i]
-                    if !j.cols[c].nul[r] { v = j.vals[c][r] }
-                } else if !kv[i].nul[r] {
-                    v = if t == lexdb_pipe.BT_BOOL { Val.Bool(kv[i].v[r] == 1) } else { Val.Int(kv[i].v[r]) }
-                }
-                if lv.virt() {
-                    if lexdb_ops.isNull(&v) { nul = true }
-                    lexdb_pipe.keyPart(mut &kb, &v)
-                } else {
-                    match keyVal(v, &boundType(&lv.t.cols[lv.hashCols[i]].typ), z) {
-                        Ok(got) {
-                            match got {
-                                Some(x) {
-                                    if lexdb_ops.isNull(&x) { nul = true }
-                                    lexdb_access.encIdxPart(mut &kb, &x)
-                                }
-                                None { nul = true }
-                            }
-                        }
-                        Err(_) { return Ok(None) }
-                    }
-                }
-            }
-            if !nul {
-                match m.keys[k].get(&kb.toStr()) {
-                    Some(x) { bk = x }
-                    None {}
-                }
-            }
-        }
-        if jl.resNot {
-            // a NULL outer value is "<>" no value: never a match (as the
-            // row path: runLevel)
-            if bk >= 0 && !rv.nul[r] {
-                var hit = m.resMixed[k][bk]
-                if !hit {
-                    let sm = m.resSingle[k][bk]
-                    if !lexdb_ops.isNull(&sm) {
-                        let ov = if jl.resTyp == lexdb_pipe.BT_BOOL { Val.Bool(rv.v[r] != 0) } else { Val.Int(rv.v[r]) }
-                        let c = try lexdb_ops.compare(&sm, &ov)
-                        if c != 0 { hit = true }
-                    }
-                }
-                if hit {
-                    append(mut &pj, r)
-                    append(mut &pi, -1)
-                }
-            }
-            continue
-        }
-        if bk >= 0 {
-            if lv.semi && len(lv.cond) == 0 {
-                // a semi-join with no filter to check: its first match only
-                append(mut &pj, r)
-                append(mut &pi, buckets[bk][0])
-            } else {
-                for ri in buckets[bk] {
-                    append(mut &pj, r)
-                    append(mut &pi, ri)
-                }
-            }
-        }
-    }
-    rs.cnt[k].starts += n
-    return bJoinTail(q, jp, jl, j, &pj, &pi, &jl.rows, rs)
-}
-
 // Whether level lv is looked up per row by its whole primary key, its
 // values from the tables before it (a point: pathScan), as the batches
 // look it up (bLookup): not an index's, a range's, an IN list's, a
@@ -21817,120 +20554,6 @@ fn lookupPath(q: &Query, lv: &Level): bool {
     return len(p.eqs) > 0 && len(p.eqs) == len(keyCols(&lv.t, -1))
 }
 
-// The joined batch j joined with a table looked up by its primary key per
-// row (9.103): each row's key made as the row path makes it (pathScan:
-// keyVal, encPart), its row read as fetch reads it (get, or getPart when
-// only some columns are used: noted as read the same way), decoded into
-// columns (decodeRow); then as a hash's candidates (bJoinTail). None: a key
-// gives an error, or a value its column's batch cannot hold.
-// The batch's keys are read at once (getMany, 9.107): each from the leaf
-// of the one before, not from the root. Unless the transaction's reads
-// are noted, they are read in key order (sorted, if they do not come so:
-// an index read alone gives them so), and a key repeated is read once.
-// With reads noted they are read in the batch's order, each as the row
-// path reads it, so that they are noted as its are.
-fn bLookup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_time.Zone,
-           rs: mut &Run): Result[Option[Batch], DbErr] {
-    let k = jl.k
-    let lv = &q.levels[k]
-    let t = &lv.t
-    let n = j.n
-    var all: []int = withCapacity(n)
-    for r in 0..n { append(mut &all, r) }
-    var kv: []BVec = []
-    for i in 0..len(jl.key) {
-        if jl.keyTyp[i] == lexdb_pipe.BT_OTHER {
-            append(mut &kv, lexdb_rows.bvec(0))
-            continue
-        }
-        match lexdb_pipe.bEval(&jl.key[i], j, &all) {
-            Ok(v) { append(mut &kv, v) }
-            Err(_) { return Ok(None) }
-        }
-    }
-    // the columns read: those its candidates use
-    var needCol: []bool = []
-    for i in 0..len(t.cols) { append(mut &needCol, jl.cand[lv.first + i]) }
-    let bp = bPlanOf(t, needCol, &lv.need)
-    let part = len(lv.need) > 0
-    var types: []lexdb_sql.TypeName = []
-    for i in 0..len(jl.key) { append(mut &types, keyType(t, -1, i)) }
-    // each row's key (rows without one: none)
-    var pr = lexdb_access.probes(-1, n)
-    var of: []int = withCapacity(n)            // the batch's row of each key
-    // one integer key of an integer column: made as keyVal would (a value
-    // out of the column's range: no row), the key before used again for a
-    // value repeated
-    let o0 = if len(types) == 1 { types[0].oid } else { 0 }
-    let intKey = len(jl.key) == 1 && jl.keyTyp[0] == lexdb_pipe.BT_INT && types[0].kind == lexdb_sql.K_INT &&
-                 (o0 == lexdb_sql.OID_INT2 || o0 == lexdb_sql.OID_INT4 || o0 == lexdb_sql.OID_INT8)
-    let kmin = if o0 == lexdb_sql.OID_INT2 { -32768 } else if o0 == lexdb_sql.OID_INT4 { -2147483648 } else { -9223372036854775807 - 1 }
-    let kmax = if o0 == lexdb_sql.OID_INT2 { 32767 } else if o0 == lexdb_sql.OID_INT4 { 2147483647 } else { 9223372036854775807 }
-    var prev = 0
-    for r in 0..n {
-        if intKey {
-            if kv[0].nul[r] { continue }
-            let x = kv[0].v[r]
-            if x < kmin || x > kmax { continue }
-            if pr.count() > 0 && x == prev {
-                pr.again()
-            } else {
-                pr.intKey(x)
-                prev = x
-            }
-            append(mut &of, r)
-            continue
-        }
-        var none = false
-        for i in 0..len(jl.key) {
-            var v = Val.Null
-            let ty = jl.keyTyp[i]
-            if ty == lexdb_pipe.BT_OTHER {
-                let c = jl.keyCol[i]
-                if !j.cols[c].nul[r] { v = j.vals[c][r] }
-            } else if !kv[i].nul[r] {
-                v = if ty == lexdb_pipe.BT_BOOL { Val.Bool(kv[i].v[r] == 1) } else { Val.Int(kv[i].v[r]) }
-            }
-            match keyVal(v, &types[i], z) {
-                Ok(got) {
-                    match got {
-                        Some(x) {
-                            if lexdb_ops.isNull(&x) { none = true } else { pr.part(&x) }
-                        }
-                        None { none = true }
-                    }
-                }
-                Err(_) { return Ok(None) }
-            }
-            if none { break }
-        }
-        if none {
-            pr.clear()
-            continue
-        }
-        pr.end()
-        append(mut &of, r)
-    }
-    // the keys' rows, read at once (lexdb_access.fetchMany)
-    let nk = pr.count()
-    let fetched = match try lexdb_access.fetchMany(st, txn, &lexdb_catalog.relOf(t), &pr, part, &bp) {
-        Some(f) { f }
-        None { return Ok(None) }
-    }
-    let rows = &fetched.rows
-    // the candidates, in the batch's order
-    var pj: []int = withCapacity(nk)
-    var pi: []int = withCapacity(nk)
-    for i in 0..nk {
-        let ri = fetched.at[i]
-        if ri < 0 { continue }
-        append(mut &pj, of[i])
-        append(mut &pi, ri)
-    }
-    rs.cnt[k].starts += n
-    return bJoinTail(q, jp, jl, j, &pj, &pi, rows, rs)
-}
-
 // Whether a semi/anti level looked up per row (semiLook) reads a range
 // the batches read (bRange): its path's leading equalities only.
 fn rangePath(q: &Query, lv: &Level): bool {
@@ -21940,255 +20563,6 @@ fn rangePath(q: &Query, lv: &Level): bool {
     for b in p.rng { if !bConst(&b.val) { return false } }
     if q.corr && pathCorr(p) { return false }
     return true
-}
-
-// The joined batch j semi- or anti-joined with a table read per row by
-// its path's range (semiLook, 9.103's lookups for a key's range): each
-// row's key prefix made as the row path makes it (pathScan: keyVal,
-// encPart), its range's rows read (an index's entries decoded when they
-// hold every column used, else their rows read by primary key), then as a
-// hash's candidates (bJoinTail: the first passing one per row for a semi
-// join, none for an anti join). Unless the transaction's reads are
-// noted, the batch's keys are read in key order and a key repeated (q21's
-// lineitem rows of one order) is read once. With no filter, a range stops
-// at its first row. None: a key gives an error, or a value its column's
-// batch cannot hold.
-fn bRange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_time.Zone,
-          rs: mut &Run): Result[Option[Batch], DbErr] {
-    let k = jl.k
-    let lv = &q.levels[k]
-    let t = &lv.t
-    let p = &lv.path
-    let n = j.n
-    var all: []int = withCapacity(n)
-    for r in 0..n { append(mut &all, r) }
-    var kv: []BVec = []
-    for i in 0..len(jl.key) {
-        if jl.keyTyp[i] == lexdb_pipe.BT_OTHER {
-            append(mut &kv, lexdb_rows.bvec(0))
-            continue
-        }
-        match lexdb_pipe.bEval(&jl.key[i], j, &all) {
-            Ok(v) { append(mut &kv, v) }
-            Err(_) { return Ok(None) }
-        }
-    }
-    // the columns read: those its candidates use
-    var needCol: []bool = []
-    for i in 0..len(t.cols) { append(mut &needCol, jl.cand[lv.first + i]) }
-    let bp = bPlanOf(t, needCol, &lv.need)
-    let part = len(lv.need) > 0
-    var types: []lexdb_sql.TypeName = []
-    for i in 0..len(jl.key) { append(mut &types, keyType(t, p.index, i)) }
-    // each row's key prefix (rows without one: none)
-    var pr = lexdb_access.probes(p.index, n)
-    var of: []int = withCapacity(n)
-    for r in 0..n {
-        var none = false
-        for i in 0..len(jl.key) {
-            var v = Val.Null
-            let ty = jl.keyTyp[i]
-            if ty == lexdb_pipe.BT_OTHER {
-                let c = jl.keyCol[i]
-                if !j.cols[c].nul[r] { v = j.vals[c][r] }
-            } else if !kv[i].nul[r] {
-                v = if ty == lexdb_pipe.BT_BOOL { Val.Bool(kv[i].v[r] == 1) } else { Val.Int(kv[i].v[r]) }
-            }
-            match keyVal(v, &types[i], z) {
-                Ok(got) {
-                    match got {
-                        Some(x) {
-                            if lexdb_ops.isNull(&x) { none = true } else { pr.part(&x) }
-                        }
-                        None { none = true }
-                    }
-                }
-                Err(_) { return Ok(None) }
-            }
-            if none { break }
-        }
-        if none {
-            pr.clear()
-            continue
-        }
-        pr.end()
-        append(mut &of, r)
-    }
-    // each key's range read (lexdb_access.rangeMany); a semi or anti
-    // join's with no filter: its first row only (an inner or LEFT join's:
-    // every row)
-    let one = (lv.semi || lv.anti) && len(jl.conds) == 0
-    // the rows read are held while the batch is joined (a key's range may
-    // be long): counted against max_statement_mem; past it the reading
-    // stops and the row path, which holds none of them (it reads a range
-    // as it goes), does the rest of the scan
-    var nNeed = 0
-    for c in 0..len(bp.needCol) { if bp.needCol[c] { nNeed += 1 } }
-    let perRow = 32 + 24 * nNeed
-    // (less what a grouping or a sort holds and has not yet given to rs)
-    let room0 = if rs.bud.maxHeld > 0 { rs.bud.maxHeld - rs.bud.held - rs.bud.aside } else { -1 }
-    let nk = pr.count()
-    let ranged = match try lexdb_access.rangeMany(st, txn, &lexdb_catalog.relOf(t), p.index, &pr, &jl.tail, jl.noRange, one, &bp, part,
-                                                  room0, perRow) {
-        Some(x) { x }
-        None { return Ok(None) }
-    }
-    let rows = &ranged.rows
-    var held = (rows.n + ranged.pks) * perRow
-    for c in 0..len(bp.needCol) {
-        if !bp.needCol[c] || bp.kinds[c] != BK_VAL { continue }
-        for r in 0..rows.n {
-            match rows.vals[c][r] {
-                Val.Text(tx) { held += len(tx) }
-                else {}
-            }
-        }
-    }
-    if room0 >= 0 && held > room0 { return Ok(None) }
-    rs.bud.held += held
-    rs.cnt[k].starts += n
-    try rs.bud.tickN(rows.n)
-    // the candidates, in the batch's order
-    var pj: []int = withCapacity(rows.n)
-    var pi: []int = withCapacity(rows.n)
-    for i in 0..nk {
-        for e in ranged.lo[i]..ranged.hi[i] {
-            append(mut &pj, of[i])
-            append(mut &pi, e)
-        }
-    }
-    let out = bJoinTail(q, jp, jl, j, &pj, &pi, rows, rs)
-    rs.bud.held -= held
-    let b = try out
-    // counted only when the batch joined, not when it gave way
-    if b.isSome() && !lv.semi && !lv.anti { rangeJoinBatches += 1 }
-    return Ok(b)
-}
-
-// Batches joined to an inner or LEFT join's level read by a range per row
-// (bRange, not a semi/anti level's), for the tests.
-var rangeJoinBatches: int = 0
-
-pub fn rangeJoins(): int { return rangeJoinBatches }
-
-// Where a batch reads table t's columns used (needCol; need: the level's,
-// [] all): as bLevelPlan's.
-fn bPlanOf(t: &Table, needCol: []bool, need: &[]bool): BPlan {
-    var kinds: []int = []
-    for c in t.cols { append(mut &kinds, lexdb_rows.colKind(&c)) }
-    var needList: []bool = []
-    for x in need { append(mut &needList, x) }
-    return lexdb_rows.projectionOf(kinds, needCol, &t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needList))
-}
-
-// A join's candidates (per candidate, the joined batch j's row pj and the
-// table's row pi of rows) as the rows it gives: its conditions over them,
-// a LEFT JOIN's NULL rows, its WHERE conjuncts.
-fn bJoinTail(q: &Query, jp: &JPlan, jl: &JLevel, j: &Batch, pj: &[]int, pi: &[]int, rows: &Batch, rs: mut &Run): Result[Option[Batch], DbErr] {
-    let k = jl.k
-    let lv = &q.levels[k]
-    let n = j.n
-    rs.cnt[k].read += len(pj)
-    try rs.bud.tickN(len(pj))
-    // the candidates joined: the batch's columns and the table's
-    let nq = len(q.cols)
-    var cand = bJoined(nq, len(pj))
-    for c in 0..nq {
-        if jl.cand[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], pj, mut &cand, c) }
-    }
-    for i in 0..len(jl.rkinds) {
-        if jl.cand[lv.first + i] { bGather(rows, i, jl.rkinds[i], pi, mut &cand, lv.first + i) }
-    }
-    let chosen = bChoose(&jl.conds, &cand)
-    if chosen.isNone() { return Ok(None) }
-    var keep = chosen.unwrap()
-    if lv.semi {
-        // its first passing candidate per outer row, as the row path stops
-        var first: []int = []
-        var prev = -1
-        for x in keep {
-            if pj[x] != prev {
-                append(mut &first, x)
-                prev = pj[x]
-            }
-        }
-        keep = first
-    }
-    // (joined is counted below: an anti join's are the rows it drops)
-    if jl.right { for x in keep { rs.seen[k][pi[x]] = true } }
-    if lv.anti {
-        // the outer rows with no passing candidate, once, without the
-        // level's (hidden) columns; joined: those with one (dropped)
-        var have: []bool = array(n, false)
-        for x in keep {
-            if !have[pj[x]] { rs.cnt[k].joined += 1 }
-            have[pj[x]] = true
-        }
-        var aj: []int = []
-        for r in 0..n { if !have[r] { append(mut &aj, r) } }
-        let mask = if len(jl.post) > 0 { &jl.cand } else { &jl.after }
-        var out = bJoined(nq, len(aj))
-        for c in 0..nq {
-            if mask[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], &aj, mut &out, c) }
-        }
-        // the level's own columns are hidden: no expression reads them, but
-        // the batch's columns must hold what jp.need says, a column of values
-        // its values too (a "<>" summary's level has no rows: NULLs)
-        var none: []int = array(len(aj), -1)
-        for i in 0..len(jl.rkinds) {
-            let c = lv.first + i
-            if jp.need[c] { bGather(rows, i, jl.rkinds[i], &none, mut &out, c) }
-        }
-        return Ok(Some(out))
-    }
-    rs.cnt[k].joined += len(keep)
-    // every candidate joined (an equality's usual case): the candidates are the rows
-    if !jl.left && !lv.semi && len(jl.post) == 0 && len(keep) == cand.n { return Ok(Some(cand)) }
-    // a LEFT JOIN: a row that joined nothing, with NULLs for the table
-    var outJ: []int = []
-    var outI: []int = []
-    if jl.left {
-        var at = 0
-        for r in 0..n {
-            var any = false
-            while at < len(keep) && pj[keep[at]] == r {
-                append(mut &outJ, r)
-                append(mut &outI, pi[keep[at]])
-                any = true
-                at += 1
-            }
-            if !any {
-                append(mut &outJ, r)
-                append(mut &outI, -1)
-                rs.cnt[k].nulls += 1
-            }
-        }
-    } else {
-        for x in keep {
-            append(mut &outJ, pj[x])
-            append(mut &outI, pi[x])
-        }
-    }
-    // (with WHERE conjuncts after it, the columns they use too)
-    let mask = if len(jl.post) > 0 { &jl.cand } else { &jl.after }
-    var out = bJoined(nq, len(outJ))
-    for c in 0..nq {
-        if mask[c] && (c < lv.first || c >= lv.first + len(jl.rkinds)) { bGather(j, c, jp.kinds[c], &outJ, mut &out, c) }
-    }
-    for i in 0..len(jl.rkinds) {
-        if mask[lv.first + i] { bGather(rows, i, jl.rkinds[i], &outI, mut &out, lv.first + i) }
-    }
-    if len(jl.post) == 0 { return Ok(Some(out)) }
-    // a LEFT JOIN's WHERE conjuncts, on its rows joined and its NULL rows
-    let pc = bChoose(&jl.post, &out)
-    if pc.isNone() { return Ok(None) }
-    let pk = pc.unwrap()
-    if len(pk) == out.n { return Ok(Some(out)) }
-    var fin = bJoined(nq, len(pk))
-    for c in 0..nq {
-        if jl.after[c] { bGather(&out, c, jp.kinds[c], &pk, mut &fin, c) }
-    }
-    return Ok(Some(fin))
 }
 
 // ---- Indexes read in batches (9.107)
@@ -22236,20 +20610,8 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     // The query's only level, every condition evaluated by the batches
     // (none at all too): its rows go to emit straight from the batch, not
     // through tryRow, which would check them again, and runLevel (9.100).
-    // The tables after it each a join the batches run (9.102): the joined
-    // rows go to emit straight from the joined batch.
-    var jpl = noJoins()
-    var joined = false
-    if len(q.levels) > 1 && len(lv.post) == 0 && lp.all && lp.ranges {
-        match try bJoinPlan(st, txn, q, m, params, &lp, true) {
-            Some(x) {
-                jpl = x
-                joined = true
-            }
-            None {}
-        }
-    }
-    let direct = (len(q.levels) == 1 || joined) && len(lv.post) == 0 && lp.all
+    // (A query's joins in batches are the pipeline's: Query.jp, runQuery.)
+    let direct = len(q.levels) == 1 && len(lv.post) == 0 && lp.all
     if len(lp.conds) == 0 && !direct { return Ok(-1) }
     if !lp.ranges { return Ok(-1) }
     let bp = &lp.bp
@@ -22276,32 +20638,6 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
             let idx = replace(mut &pk.idx, [])
             let nr = b.n
             if nr == 0 {
-                spare = b
-                continue
-            }
-            if joined {
-                // (the batch's counts so far, for the row path to count it again)
-                var cntB: []lexdb_pipe.Counts = []
-                for c in rs.cnt { append(mut &cntB, c) }
-                let got3 = try bJoinAll(st, txn, q, m, &jpl, &b, &idx, &zone, rs)
-                if got3.isNone() {
-                    rs.cnt = cntB
-                    cur = saved
-                    rowPath = true
-                    break
-                }
-                let jb = got3.unwrap()
-                rs.cnt[0].batches += 1
-                rs.cnt[0].read += nr
-                rs.cnt[0].joined += len(idx)
-                try rs.bud.tickN(nr)
-                for r in 0..jb.n {
-                    for c in 0..len(row) {
-                        row[c] = if jpl.need[c] && !jb.cols[c].nul[r] { lexdb_pipe.bValAt(&jb, c, jpl.kinds[c], r) } else { Val.Null }
-                    }
-                    matched = true
-                    if !(try emit(txn, row)) { return Ok(1) }
-                }
                 spare = b
                 continue
             }
@@ -22360,15 +20696,13 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
 }
 
 // How a streamed SELECT's rows are made in batches, outputs and all
-// (eachOut): its first table scanned in batches, every condition evaluated
+// (sortBatches): its first table scanned in batches, every condition evaluated
 // by them, the tables after it joined over them (jp, joined: 9.102); per
 // output its node over the batch (a column of any type, or an integer or
 // boolean expression), its kind and batch column as OutBatch has them (a
 // joined batch's columns are the query's).
 type OutPlan = record {
     lp: LPlan
-    jp: JPlan
-    joined: bool
     nodes: []BNode
     kinds: []int
     src: []int
@@ -22410,17 +20744,11 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     if got.isNone() { return Ok(None) }
     let lp = got.unwrap()
     if !lp.all || !lp.ranges { return Ok(None) }
-    var jp = noJoins()
-    let joined = len(q.levels) > 1
-    if joined {
-        match try bJoinPlan(st, txn, q, m, params, &lp, false) {
-            Some(x) { jp = x }
-            None { return Ok(None) }
-        }
-    }
-    let base = if joined { 0 } else { q.levels[0].first }
-    let qk = if joined { &jp.kinds } else { &lp.qkinds }
-    let need = if joined { &jp.need } else { &lp.bp.needCol }
+    // (joins: the pipeline's, slice P2)
+    if len(q.levels) > 1 { return Ok(None) }
+    let base = q.levels[0].first
+    let qk = &lp.qkinds
+    let need = &lp.bp.needCol
     var nodes: []BNode = []
     var kinds: []int = []
     var src: []int = []
@@ -22455,14 +20783,7 @@ fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
             append(mut &knodes, lexdb_pipe.takeON(on))
         }
     }
-    if joined {
-        // the joins gather only the columns the outputs (and keys) use
-        var used: []bool = array(len(q.cols), false)
-        for ni in 0..len(nodes) { lexdb_pipe.bColsOf(&nodes[ni], mut &used) }
-        for ni in 0..len(knodes) { lexdb_pipe.bColsOf(&knodes[ni], mut &used) }
-        jpFinish(mut &jp, q, &used)
-    }
-    return Ok(Some(OutPlan{lp: lp, jp: jp, joined: joined, nodes: nodes, kinds: kinds, src: src,
+    return Ok(Some(OutPlan{lp: lp, nodes: nodes, kinds: kinds, src: src,
                            kout: kout, knodes: knodes, kkinds: kkinds, ksrc: ksrc}))
 }
 
@@ -22671,7 +20992,7 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     // column decoded first, with the conditions', and a row it puts after
     // the heap's last dropped before its outputs are decoded (9.108)
     var barCol = -1
-    if topK > 0 && !op.joined && nk > 0 && op.kkinds[0] != BK_VAL {
+    if topK > 0 && nk > 0 && op.kkinds[0] != BK_VAL {
         barCol = if op.kout[0] >= 0 { op.src[op.kout[0]] } else { op.ksrc[0] }
     }
     let lz = lexdb_pipe.lazyOf(bp, t, &lp.conds, barCol)
@@ -22698,19 +21019,6 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
             let nr = b.n
             if nr == 0 { continue }
             let nChosen = pk.kept
-            if op.joined {
-                rs.bud.aside = held + 0
-                let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
-                rs.bud.aside = 0
-                if got3.isNone() {
-                    rs.cnt = cnt0
-                    return Ok(false)
-                }
-                b = got3.unwrap()
-                var all: []int = withCapacity(b.n)
-                for r in 0..b.n { append(mut &all, r) }
-                idx = all
-            }
             var ex: []BVec = []
             var kex: []BVec = []
             var srcs: []int = []
@@ -22844,15 +21152,9 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
                 }
             }
             // counted as the row path counts them (batchLevel)
-            if op.joined {
-                rs.cnt[0].read += nr
-                rs.cnt[0].joined += nChosen
-                try rs.bud.tickN(nr)
-            } else {
-                rs.cnt[0].read += nr - nChosen + went
-                rs.cnt[0].joined += went
-                try rs.bud.tickN(nr - nChosen + went)
-            }
+            rs.cnt[0].read += nr - nChosen + went
+            rs.cnt[0].joined += went
+            try rs.bud.tickN(nr - nChosen + went)
             if stopped { break }
         }
     }
@@ -22917,139 +21219,8 @@ fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: 
     return Ok(true)
 }
 
-// eachRowB's rows of a join made in batches (outPlan), as runQuery's
-// first level would make them (batchLevel, direct): each batch of the
-// first table's rows chosen by its conditions, joined (9.102), and the
-// expressions' values over the joined batch given to eachB, LIMIT applied
-// in the batch. A batch with a value its column's batch cannot hold, or on
-// one of whose rows a condition or an output gives an error, ends the
-// batches: the row path reads the rest of that scan from the batch's
-// start, its rows to each (it gives the error only if it gets to that
-// row). The number of rows given. (One table's: the pipeline's, slice P1.)
-fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, op: &OutPlan,
-           oc: &OutC, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
-           eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], rs: mut &Run): Result[int, DbErr] {
-    let q = &sel.q
-    let lv = &q.levels[0]
-    let t = &lv.t
-    let lp = &op.lp
-    let bp = &lp.bp
-    let sqe = seqEnv(st, txn)
-    let zone = txn.sql.zone
-    let no = len(op.nodes)
-    var n = 0
-    var vals: []Val = []
-    var row: []Val = array(len(q.cols), Val.Null)
-    rs.cnt[0].starts += 1
-    try warmPoints(st, txn, t, &lp.scans)
-    for sc in lp.scans {
-        var cur = lexdb_access.newCursor()
-        var rowPath = false
-        var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
-        while !cur.done {
-            let saved = cur.copy()
-            let got = try fillPickIn(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lp.lazy, &lp.conds, &lexdb_access.noBar(), mut &spare)
-            if got.isNone() {
-                cur = saved
-                rowPath = true
-                break
-            }
-            var pk = got.unwrap()
-            var b = replace(mut &pk.b, lexdb_rows.noRows())
-            var idx = replace(mut &pk.idx, [])
-            let nr = b.n
-            if nr == 0 {
-                spare = b
-                continue
-            }
-            let nChosen = len(idx)
-            // the joined rows (9.102): the batch's rows from here on
-            // (the batch's counts so far, for the row path to count it again)
-            var cntB: []lexdb_pipe.Counts = []
-            for c in rs.cnt { append(mut &cntB, c) }
-            let got3 = try bJoinAll(st, txn, q, m, &op.jp, &b, &idx, &zone, rs)
-            if got3.isNone() {
-                rs.cnt = cntB
-                cur = saved
-                rowPath = true
-                break
-            }
-            b = got3.unwrap()
-            var all: []int = withCapacity(b.n)
-            for r in 0..b.n { append(mut &all, r) }
-            idx = all
-            // the expressions' values, before any row of the batch is given
-            var ex: []BVec = []
-            var srcs: []int = []
-            var failed = false
-            for o in 0..no {
-                match lexdb_pipe.bOutVal(&op.nodes[o], op.src[o], mut &b, &idx, mut &ex, mut &srcs) {
-                    Ok(_) {}
-                    Err(_) {
-                        failed = true
-                        break
-                    }
-                }
-            }
-            if failed {
-                cur = saved
-                rowPath = true
-                break
-            }
-            rs.cnt[0].batches += 1
-            var take = len(idx)
-            if sel.limit >= 0 && n + take > sel.limit { take = sel.limit - n }
-            // (the first table's rows all counted: a LIMIT ends the scan with the batch)
-            rs.cnt[0].read += nr
-            rs.cnt[0].joined += nChosen
-            try rs.bud.tickN(nr)
-            if take > 0 {
-                let ob = OutBatch{n: take, kinds: collections.copyOf(&op.kinds), src: srcs, idx: move(idx),
-                                  cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
-                n += take
-                if !(try eachB(txn, &ob)) { return Ok(n) }
-            }
-            // (a joined batch is the query's columns: not one to use again)
-            if sel.limit >= 0 && n >= sel.limit { return Ok(n) }
-        }
-        while rowPath && !cur.done {
-            var batch: [][]Val = []
-            try fetch(st, txn, t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
-            for r in batch {
-                var stop = false
-                let got2 = try tryRow(st, txn, q, m, 0, &r, -1, mut &row, params, fn(tx: mut &lexdb_store.Txn, x: &[]Val): Result[bool, DbErr] {
-                    try outRow(sel, m, params, sqe, oc, x, mut &vals)
-                    if !(try each(tx, &vals)) {
-                        stop = true
-                        return Ok(false)
-                    }
-                    n += 1
-                    return Ok(sel.limit < 0 || n < sel.limit)
-                }, rs)
-                if got2 < 0 || stop { return Ok(n) }
-            }
-        }
-    }
-    return Ok(n)
-}
 
-// Runs a join's grouping over batches into gs; false: the query is not one
-// the batches run (nothing done; the row engine runs it). One table's
-// aggregates are the pipeline's (lexdb_pipe.runAgg, slice P1b).
-fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
-               gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
-    // the counts so far: given back if the batches give way
-    let cnt0 = copyCounts(&rs.cnt)
-    let done = try batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max)
-    if !done { rs.cnt = cnt0 }
-    return Ok(done)
-}
 
-fn copyCounts(cs: &[]lexdb_pipe.Counts): []lexdb_pipe.Counts {
-    var out: []lexdb_pipe.Counts = []
-    for c in cs { append(mut &out, c) }
-    return out
-}
 
 // The query's columns a grouped select reads after grouping: those its
 // outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.
@@ -23069,404 +21240,6 @@ fn afterCols(sel: &Sel, q: &Query): []int {
     return out
 }
 
-// The first table's batches joined with the tables after it (bJoinAll,
-// 9.102), the groups made of the joined batches, whose columns are the
-// query's.
-fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
-                 gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
-    let q = &sel.q
-    if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) < 2 || len(sel.gsets) > 0 { return Ok(false) }
-    // subqueries: only semi-joins' (levels, run before: 9.104)
-    for sp in q.subs { if !sp.semi { return Ok(false) } }
-    let lv = &q.levels[0]
-    if lv.src >= 0 || lv.work >= 0 || lv.lateral || !lv.perRow || len(lv.post) > 0 { return Ok(false) }
-    // an index read alone, or its entries' rows (9.107: as bLevelPlan)
-    if !lexdb_plan.scanBatches(&lv.path, len(lv.t.pk), ixCovers(lv, lv.path.index), lv.stops, true) { return Ok(false) }
-    let got0 = try bLevelPlan(st, txn, q, m, params, rs)
-    if got0.isNone() { return Ok(false) }
-    var lp = got0.unwrap()
-    if !lp.all || !lp.ranges { return Ok(false) }
-    var jp = noJoins()
-    match try bJoinPlan(st, txn, q, m, params, &lp, true) {
-        Some(x) { jp = x }
-        None { return Ok(false) }
-    }
-    let t = &lv.t
-    var kinds: []int = []
-    for k in jp.kinds { append(mut &kinds, k) }
-    // the conditions, the group keys and the aggregates over batches
-    var conds = replace(mut &lp.conds, [])
-    // keys and aggregates under a collation's keys (L2): the row path's
-    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return Ok(false) } }
-    for sp in sel.specs { if sp.kind != lexdb_sql.COLL_EXACT { return Ok(false) } }
-    var keys: []BComp = []
-    for x in sel.groupBy {
-        let c = bCompileX(&x, q, &kinds, &m.ce, 0, false)
-        if c.isNone() { return Ok(false) }
-        let cc = c.unwrap()
-        if cc.typ == lexdb_pipe.BT_OTHER {
-            match cc.n {
-                BNode.Col(_) {}
-                else { return Ok(false) }
-            }
-        }
-        append(mut &keys, cc)
-    }
-    var specs: []BSpec = []
-    for sp in sel.specs {
-        if sp.distinct || len(sp.order) > 0 { return Ok(false) }
-        let f = sp.fname
-        var kind = -1
-        if sp.star { kind = lexdb_pipe.BA_STAR } else if f == "count" { kind = lexdb_pipe.BA_COUNT } else if f == "sum" { kind = lexdb_pipe.BA_SUM }
-        else if f == "avg" { kind = lexdb_pipe.BA_AVG } else if f == "min" { kind = lexdb_pipe.BA_MIN } else if f == "max" { kind = lexdb_pipe.BA_MAX }
-        if kind < 0 { return Ok(false) }
-        var arg: Option[BNode] = None
-        var vcol = -1
-        var dsc = -1
-        if kind != lexdb_pipe.BA_STAR {
-            if len(sp.args) != 1 { return Ok(false) }
-            let ax = bxOf(&sp.args[0], q)
-            let c = match ax {
-                Some(bx) { lexdb_pipe.bCompileD(&bx, &q.cols, &kinds, &m.ce, 0, false) }
-                None { None }
-            }
-            if c.isNone() { return Ok(false) }
-            let cc = c.unwrap()
-            if kind != lexdb_pipe.BA_COUNT && cc.typ != lexdb_pipe.BT_INT {
-                // min or max of a column of values, sum or avg of a numeric one
-                let vc = match ax {
-                    Some(bx) { lexdb_pipe.bValCol(&bx, &kinds, 0) }
-                    None { -1 }
-                }
-                if vc < 0 { return Ok(false) }
-                let numeric = q.cols[vc].typ.oid == lexdb_sql.OID_NUMERIC
-                if !(kind == lexdb_pipe.BA_MIN || kind == lexdb_pipe.BA_MAX || ((kind == lexdb_pipe.BA_SUM || kind == lexdb_pipe.BA_AVG) && numeric)) { return Ok(false) }
-                vcol = vc
-            }
-            arg = Some(lexdb_pipe.takeN(cc))
-        }
-        var filt: Option[BNode] = None
-        match sp.filter {
-            Some(fx) {
-                let c = bCompileX(&fx, q, &kinds, &m.ce, 0, false)
-                if c.isNone() { return Ok(false) }
-                let cc = c.unwrap()
-                if !lexdb_pipe.boolLike(cc.typ) { return Ok(false) }
-                filt = Some(lexdb_pipe.takeN(cc))
-            }
-            None {}
-        }
-        append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol, dsc: dsc})
-    }
-    // The joins gather only the columns read after them: the group keys',
-    // the aggregates' (arguments and FILTERs), and those a group's first row
-    // keeps (its outputs, HAVING, ORDER BY: below). With no GROUP BY no
-    // column is used outside an aggregate (42803), so none for count(*).
-    // Gathering every column read made q21's joins copy each one through
-    // each level (design/lexdb-layers.md 6.2.2).
-    {
-        var used: []bool = array(len(q.cols), false)
-        for kc in keys { lexdb_pipe.bColsOf(&kc.n, mut &used) }
-        for ci in afterCols(sel, q) { used[ci] = true }
-        for sp in specs {
-            match sp.arg {
-                Some(x) { lexdb_pipe.bColsOf(&x, mut &used) }
-                None {}
-            }
-            match sp.filter {
-                Some(x) { lexdb_pipe.bColsOf(&x, mut &used) }
-                None {}
-            }
-        }
-        jpFinish(mut &jp, q, &used)
-    }
-    let scans = replace(mut &lp.scans, [])
-    let rd = replace(mut &lp.rd, lexdb_access.noIxRead())
-    let bp = replace(mut &lp.bp, lexdb_rows.emptyProjection())
-    let part = lp.part
-    // a group's first row: the joined batch's columns
-    var rowKinds: []int = []
-    var rowNeed: []bool = []
-    for k in jp.kinds { append(mut &rowKinds, k) }
-    for x in jp.need { append(mut &rowNeed, x) }
-    // A group's first row keeps only the columns read after grouping (its
-    // outputs, HAVING, ORDER BY): the others, an aggregate's argument
-    // among them, are not copied for each group (q18's 1.5M groups).
-    {
-        var after: []bool = array(len(q.cols), false)
-        for ci in afterCols(sel, q) { after[ci] = true }
-        for i in 0..len(rowNeed) {
-            if i < len(after) && !after[i] { rowNeed[i] = false }
-        }
-    }
-    let zone = txn.sql.zone
-    // the groups: their first rows, and per aggregate its counts, sums and minima or maxima
-    let ns = len(specs)
-    // each group's first row: only its columns read after grouping (fcols),
-    // nf values a group in fv; made whole once the groups are done
-    var fcols: []int = []
-    for i in 0..len(rowNeed) { if rowNeed[i] { append(mut &fcols, i) } }
-    let nf = len(fcols)
-    var fv: []Val = []
-    var ngroups = 0
-    var an: [][]int = []
-    var asum: [][]int = []
-    var amm: [][]int = []
-    var aval: [][]Val = []              // per value aggregate (vcol) and group: its sum, min or max
-    for i in 0..ns {
-        append(mut &an, [])
-        append(mut &asum, [])
-        append(mut &amm, [])
-        append(mut &aval, [])
-    }
-    var byInt: Map[int, int] = newMap()
-    var byKey: Map[str, int] = newMap()
-    var nullGroup = -1
-    let oneKey = len(keys) == 1 && keys[0].typ != lexdb_pipe.BT_OTHER
-    // one key a text or varchar column (under no collation: groupKinds):
-    // its groups by its text, not by its encoded key
-    var textCol = -1
-    if len(keys) == 1 && keys[0].typ == lexdb_pipe.BT_OTHER {
-        match keys[0].n {
-            BNode.Col(c) {
-                let o = q.cols[c].typ.oid
-                if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { textCol = c }
-            }
-            else {}
-        }
-    }
-    var byText: Map[str, int] = newMap()
-    var added = 0                       // the bytes counted in held (given back if the row path runs after all)
-    var nRead = 0
-    var nJoined = 0
-    var nBatches = 0
-    // after the scans, a RIGHT JOIN's rows that joined nothing (bUnmatched)
-    let nsc = len(scans)
-    let tails = if jp.right >= 0 { 1 } else { 0 }
-    var tailAt = 0
-    for sj in 0..nsc + tails {
-        var cur = lexdb_access.newCursor()
-        var spare = lexdb_rows.noRows()            // the last batch read, used again (lexdb_rows.reuse)
-        while !cur.done {
-            var b = lexdb_rows.noRows()
-            var read = false                // b is the read's (fillLevel): given back to spare when done
-            var idx: []int = []
-            if sj == nsc {
-                let got4 = try bUnmatched(st, txn, q, m, &jp, &zone, rs, mut &tailAt)
-                if got4.isNone() {
-                    held -= added
-                    return Ok(false)
-                }
-                b = got4.unwrap()
-                if tailAt >= len(rs.seen[jp.levels[jp.right].k]) { cur.done = true }
-                idx = withCapacity(b.n)
-                for r in 0..b.n { append(mut &idx, r) }
-            } else {
-            let got = try fillLevel(st, txn, t, &rd, &scans[sj], part, mut &cur, &bp, mut &spare)
-            if got.isNone() {
-                held -= added
-                return Ok(false)
-            }
-            b = got.unwrap()
-            read = true
-            let nr = b.n
-            if nr == 0 { continue }
-            try rs.bud.tickN(nr)
-            nRead += nr
-            nBatches += 1
-            // WHERE: the rows chosen, narrowed condition by condition
-            for r in 0..nr { append(mut &idx, r) }
-            for c in conds {
-                if len(idx) == 0 { break }
-                let pos = try lexdb_pipe.bTrue(&c, &b, &idx)
-                var next: []int = []
-                for j in pos { append(mut &next, idx[j]) }
-                idx = next
-            }
-            nJoined += len(idx)
-            {
-                rs.bud.aside = held + 0
-                let got3 = try bJoinAll(st, txn, q, m, &jp, &b, &idx, &zone, rs)
-                rs.bud.aside = 0
-                if got3.isNone() {
-                    held -= added
-                    return Ok(false)
-                }
-                spare = replace(mut &b, got3.unwrap())
-                read = false
-                var all: []int = withCapacity(b.n)
-                for r in 0..b.n { append(mut &all, r) }
-                idx = all
-            }
-            }
-            let nc = len(idx)
-            if nc == 0 {
-                if read { spare = b }
-                continue
-            }
-            // each row's group, new groups made in the rows' order
-            var gid: []int = array(nc, 0)
-            if len(keys) == 0 {
-                if ngroups == 0 {
-                    let cost = lexdb_pipe.bFirstVals(&b, idx[0], &rowKinds, &fcols, mut &fv) + 64 * (len(sel.specs) + 1)
-                    ngroups += 1
-                    held += cost
-                    added += cost
-                    if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
-                    for i in 0..ns {
-                        append(mut &an[i], 0)
-                        append(mut &asum[i], 0)
-                        append(mut &amm[i], 0)
-                        append(mut &aval[i], Val.Null)
-                    }
-                }
-            } else {
-                var kvs: []BVec = []
-                for k in keys { append(mut &kvs, try lexdb_pipe.bEval(&k.n, &b, &idx)) }
-                for j in 0..nc {
-                    var g = -1
-                    var klen = 9
-                    if oneKey {
-                        if kvs[0].nul[j] {
-                            g = nullGroup
-                        } else {
-                            match byInt.get(&kvs[0].v[j]) {
-                                Some(x) { g = x }
-                                None {}
-                            }
-                        }
-                    }
-                    var kstr = ""
-                    var ktext = ""
-                    if textCol >= 0 {
-                        let r = idx[j]
-                        if b.cols[textCol].nul[r] {
-                            g = nullGroup
-                        } else {
-                            match b.vals[textCol][r] {
-                                Val.Text(x) { ktext = x }
-                                else {
-                                    held -= added
-                                    return Ok(false)
-                                }
-                            }
-                            klen = len(ktext)
-                            match byText.get(&ktext) {
-                                Some(x) { g = x }
-                                None {}
-                            }
-                        }
-                    } else if !oneKey {
-                        var kb = newStrBuf()
-                        for ki in 0..len(keys) { lexdb_access.encIdxPart(mut &kb, &lexdb_pipe.bKeyVal(&keys[ki], &kvs[ki], j, &b, idx[j])) }
-                        kstr = kb.toStr()
-                        klen = len(kstr)
-                        match byKey.get(&kstr) {
-                            Some(x) { g = x }
-                            None {}
-                        }
-                    }
-                    if g < 0 {
-                        g = ngroups
-                        ngroups += 1
-                        let cost = lexdb_pipe.bFirstVals(&b, idx[j], &rowKinds, &fcols, mut &fv) + 64 * (len(sel.specs) + 1) + klen
-                        held += cost
-                        added += cost
-                        if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
-                        for i in 0..ns {
-                            append(mut &an[i], 0)
-                            append(mut &asum[i], 0)
-                            append(mut &amm[i], 0)
-                            append(mut &aval[i], Val.Null)
-                            }
-                        if textCol >= 0 {
-                            if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
-                        } else if oneKey {
-                            if kvs[0].nul[j] {
-                                nullGroup = g
-                            } else {
-                                byInt.put(kvs[0].v[j], g)
-                            }
-                        } else {
-                            byKey.put(kstr, g)
-                        }
-                    }
-                    gid[j] = g
-                }
-            }
-            // the aggregates: per aggregate its rows (FILTER), its argument's values, one loop
-            for si in 0..ns {
-                let sp = &specs[si]
-                match sp.filter {
-                    Some(fx) {
-                        let pos = try lexdb_pipe.bTrue(&fx, &b, &idx)
-                        var r2: []int = []
-                        var g2: []int = []
-                        for j in pos {
-                            append(mut &r2, idx[j])
-                            append(mut &g2, gid[j])
-                        }
-                        if sp.vcol >= 0 { try lexdb_pipe.bAccVal(sp, &b, &r2, &g2, mut &an[si], mut &aval[si]) }
-                        else { try lexdb_pipe.bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
-                    }
-                    None {
-                        if sp.vcol >= 0 { try lexdb_pipe.bAccVal(sp, &b, &idx, &gid, mut &an[si], mut &aval[si]) }
-                        else { try lexdb_pipe.bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
-                    }
-                }
-            }
-            if read { spare = b }
-        }
-    }
-    // the groups as the row path leaves them. A HAVING of no volatile
-    // function or subquery is checked here first: a group it drops is not
-    // kept (q18's subquery keeps 57 of 1.5M), and the select checks the
-    // others again.
-    var fuse = false
-    match sel.having {
-        // (not without GROUP BY: there the one group stays even when
-        // HAVING drops it, as the select's empty group)
-        Some(h) { fuse = len(keys) > 0 && immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
-        None {}
-    }
-    var firsts: [][]Val = []
-    var scratch: []Val = array(len(rowKinds), Val.Null)
-    let sqe = seqEnv(st, txn)
-    for g in 0..ngroups {
-        for fi in 0..nf { scratch[fcols[fi]] = fv[g * nf + fi] }
-        var accs = newAccs(len(sel.specs))
-        for si in 0..ns {
-            let kd = specs[si].kind
-            accs[si].n = an[si][g]
-            if an[si][g] > 0 && specs[si].vcol >= 0 {
-                if kd == lexdb_pipe.BA_SUM || kd == lexdb_pipe.BA_AVG { accs[si].sum = aval[si][g] }
-                if kd == lexdb_pipe.BA_MIN || kd == lexdb_pipe.BA_MAX { accs[si].val = aval[si][g] }
-            } else if an[si][g] > 0 {
-                if kd == lexdb_pipe.BA_SUM || kd == lexdb_pipe.BA_AVG { accs[si].sum = Val.Int(asum[si][g]) }
-                if kd == lexdb_pipe.BA_MIN || kd == lexdb_pipe.BA_MAX { accs[si].val = Val.Int(amm[si][g]) }
-            }
-        }
-        if fuse {
-            let noAggs: []Val = []
-            var vals: []Val = []
-            for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[i])) }
-            let henv = Env{cols: &q.cols, row: &scratch, aggs: &vals, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
-            match sel.having {
-                Some(h) { if lexdb_ops.truth(&(try evalX(st, txn, q, &h, &henv, rs))) != Some(true) { continue } }
-                None {}
-            }
-        }
-        append(mut &firsts, collections.copyOf(&scratch))
-        append(mut &gs.accs, accs)
-    }
-    gs.firsts = firsts
-    groupRuns += 1
-    rs.cnt[0].starts += 1
-    rs.cnt[0].read += nRead
-    rs.cnt[0].joined += nJoined
-    rs.cnt[0].batches += nBatches
-    return Ok(true)
-}
 
 // ---- The row layout (design/lexdb.md 9.48, 9.50)
 //
@@ -24210,11 +21983,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     var stats: Map[int, TabStat] = newMap()
     if rel == "pg_stat_user_tables" {
         for ct in cq.snap.tabs {
-            let c = intsOf(&st.memo.get(&acKey(ct.t.tree)).unwrapOr(""), 5)
-            let a = acState(st, ct.t.tree)
-            let base = if a.base >= 0 { a.base } else { try statRows(st, txn, &ct.t) }
-            stats.put(ct.t.tree, TabStat{c0: c[0], c1: c[1], c2: c[2], c3: c[3], c4: c[4], base: a.base, last: a.last, lastAuto: a.lastAuto, n: a.n,
-                                         nAuto: a.nAuto, ns: a.ns, nsAuto: a.nsAuto, rows: base})
+            stats.put(ct.t.tree, try lexdb_stats.tabStat(st, txn, &ct.t))
         }
     }
     return lexdb_pg.viewRows(&cq, &stats, rel)
@@ -24842,7 +22611,7 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         let sn = try createSchema(st, txn)
         if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
         key = try catKey(st, txn, &s.table, false)
-        if !(try relExists(st, txn, &key)) || tempRel(&key) { key = lexdb_sql.qual(&sn, &s.table) }
+        if !(try relExists(st, txn, &key)) || lexdb_catalog.tempRel(&key) { key = lexdb_sql.qual(&sn, &s.table) }
     }
     let base = lexdb_sql.baseName(&key)
     var old = try viewOld(st, txn, &key, s)
@@ -24865,9 +22634,9 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     try readsOf(st, txn, &q, mut &deps)
     // a view reading a temporary relation is temporary (PostgreSQL says so
     // in a NOTICE; lexdb has none), and may not be made elsewhere (9.96)
-    if !tempRel(&key) {
+    if !lexdb_catalog.tempRel(&key) {
         var reads = false
-        for d in deps { if tempRel(&d) { reads = true } }
+        for d in deps { if lexdb_catalog.tempRel(&d) { reads = true } }
         if reads {
             if lexdb_sql.isQual(&s.table) { return Err(e("42P16", "cannot create temporary relation in non-temporary schema")) }
             key = try createKey(st, txn, &s.table, true)
@@ -26497,7 +24266,6 @@ type EqClass = lexdb_plan.EqClass
 type BindCol = lexdb_plan.BindCol
 type WayCand = lexdb_plan.WayCand
 type Way = lexdb_plan.Way
-type Est = lexdb_plan.Est
-type Common = lexdb_plan.Common
+type Est = lexdb_stats.Est
 type Fig = lexdb_plan.Fig
 
