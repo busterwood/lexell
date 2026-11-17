@@ -1,0 +1,172 @@
+// lexdb_exec: column narrowing with a * that reads nothing (design/lexdb-layers.md
+// 6.2.2, slice 4.1). The * of an EXISTS subquery no longer makes a query
+// read every column of every table, and a grouped join gathers through its
+// levels only the columns read after it (keys, aggregates, outputs, HAVING,
+// ORDER BY). Each query runs with SET lexdb_batch = off and on, the two
+// must agree, and both must give PostgreSQL 18's rows (the expect lines).
+// Tables of 3,000, 200 and 1,500 rows (several batches), an index on f.x,
+// a view, NULLs in f.x. The shapes:
+// - 1-3: q21's (grouped join, EXISTS and NOT EXISTS) and q4's, NOT EXISTS
+//   counted;
+// - 4: IN (select * ...) of a one-column table: its * is read;
+// - 5, 7: * in the outer select list, and a view's *;
+// - 6: EXISTS over a view; 8: LATERAL with an EXISTS inside;
+// - 9: count(*) in an EXISTS, with HAVING;
+// - 10-12: an EXISTS whose rows depend on the * (DISTINCT and OFFSET,
+//   GROUP BY positions and HAVING, EXCEPT): its * is read;
+// - 13, 19: a grouped join whose outputs, HAVING and ORDER BY read columns
+//   that are neither keys nor aggregates' (f's primary key decides them);
+// - 14: an outer join's ON filter on its own columns, grouped;
+// - 15: a window over a grouped join; 17: ORDER BY a key not output;
+// - 16: DISTINCT ON a column named nowhere else (it was not read: one row);
+// - 18, 20-24: EXISTS with a join, ORDER BY and OFFSET, a window, uncorrelated,
+//   and nested under IN.
+// expect: queries: 24, the same with and without batches: 24
+// expect: 1: 0|217|435.00; 4|67|135.00; 5|216|430.00; 6|220|434.75
+// expect: 2: 0|142; 4|43; 5|143; 6|143
+// expect: 3: 1587
+// expect: 4: 857|102201
+// expect: 5: 3|3|L3|w3; 5|5|L5|w0; 10|10|L1|w0; 12|12|L3|w2; 17|17|L8|w2; 19|19|L1|w4
+// expect: 6: 310
+// expect: 7: 0|0|L0|w0; 1|1|L1|w1; 2|2|L2|w2; 3|3|L3|w3; 4|4|L4|w4
+// expect: 8: 0|5; 1|5; 2|5; 3|5; 4|5; 5|5; 6|7; 7|6; 8|6; 9|5
+// expect: 9: 0
+// expect: 10: 1
+// expect: 11: 2
+// expect: 12: 0
+// expect: 13: 28|t2|1|28; 56|t4|1|56; 29|t3|1|29; 57|t5|1|57; 30|t4|1|30; 58|t6|1|58; 31|t5|1|31; 59|t7|1|59
+// expect: 14: 0|261|L8; 1|265|L8; 2|261|L8; 3|262|L8; 4|262|L8; 5|263|L8; 6|262|L8
+// expect: 15: 0|9030|2; 1|9026|3; 2|9040|1; 3|9007|5; 4|8964|7; 5|9016|4; 6|8994|6
+// expect: 16: 7
+// expect: 17: 64; 66; 65; 65; 68; 65; 67; 67
+// expect: 18: 200
+// expect: 19: 0|w4|65; 4|w4|19; 5|w4|66; 6|w4|65; 0|w3|66; 4|w3|22
+// expect: 20: 100
+// expect: 21: 200
+// expect: 22: 95
+// expect: 23: 200
+// expect: 24: 1297|1912730
+// expect: grouped over batches: 1 2 3 4 6 8 9 11 13 14 17 18 19
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, "; ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn two(n: int): str { return if n < 10 { "0" + n.toStr() } else { n.toStr() } }
+
+fn run(s: mut &lexdb_exec.Session, sql: &str) {
+    let got = q(s, sql)
+    if strings.startsWith(&got, "ERROR") { println(sql + ": " + got) }
+}
+
+fn load(s: mut &lexdb_exec.Session) {
+    run(s, &"create table f (id int primary key, g int, x int, tx text, nu numeric(10,2), dt date)")
+    run(s, &"create table d (k int primary key, v int, lab text, w text)")
+    run(s, &"create table e (id int primary key, fk int, flag boolean, note text)")
+    run(s, &"create table one (c int)")
+    run(s, &"create table dup (a int, b int)")
+    var rows: []str = []
+    for i in 1..3001 {
+        let x = if i % 23 == 0 { "null" } else { (i % 250).toStr() }
+        let nu = (i % 17) * 25
+        append(mut &rows, "(" + i.toStr() + ", " + (i % 7).toStr() + ", " + x + ", 't" + (i % 13).toStr() + "', " +
+               (nu / 100).toStr() + "." + two(nu % 100) + ", '2024-01-" + two(1 + i % 28) + "')")
+        if len(rows) == 500 {
+            run(s, &("insert into f values " + strings.join(&rows, ", ")))
+            rows = []
+        }
+    }
+    for k in 0..200 { append(mut &rows, "(" + k.toStr() + ", " + (k % 60).toStr() + ", 'L" + (k % 9).toStr() + "', 'w" + (k % 5).toStr() + "')") }
+    run(s, &("insert into d values " + strings.join(&rows, ", ")))
+    rows = []
+    for i in 1..1501 {
+        append(mut &rows, "(" + i.toStr() + ", " + ((i * 7) % 3200).toStr() + ", " + (if i % 3 == 0 { "true" } else { "false" }) + ", 'n" + i.toStr() + "')")
+        if len(rows) == 500 {
+            run(s, &("insert into e values " + strings.join(&rows, ", ")))
+            rows = []
+        }
+    }
+    run(s, &"insert into one values (2), (5)")
+    run(s, &"insert into dup values (1, 1), (1, 2), (2, 5), (2, 5)")
+    run(s, &"create view vd as select * from d")
+    run(s, &"create index fx on f (x)")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        load(mut &s)
+        let qs = [
+        "select f.g, count(*), sum(f.nu) from f join d on f.x = d.k where exists (select * from e where e.fk = f.id) and not exists (select * from e e2 where e2.fk = f.id and e2.flag) group by f.g order by f.g",
+        "select f.g, count(*) from f where exists (select * from e where e.fk = f.id and e.flag) group by f.g order by f.g",
+        "select count(*) from f where not exists (select * from e where e.fk = f.id)",
+        "select count(*), sum(f.x) from f where f.g in (select * from one)",
+        "select * from d where exists (select * from f where f.x = d.k and f.g = 3 and f.id < 300) order by k limit 6",
+        "select count(*) from f where exists (select * from vd where vd.k = f.x and vd.v > 50)",
+        "select vd.* from vd where exists (select * from f where f.x = vd.k and f.tx = 't4') order by k limit 5",
+        "select d.k, z.c from d, lateral (select count(*) c from f where f.x = d.k and exists (select * from e where e.fk = f.id)) z where d.k < 10 order by d.k",
+        "select count(*) from d where exists (select count(*) from f where f.x = d.k having count(*) > 12)",
+        "select k from d where exists (select distinct * from dup where dup.a = d.k offset 1) order by k",
+        "select k from d where exists (select * from dup where dup.a = d.k group by 1, 2 having count(*) > 1) order by k",
+        "select count(*) from d where exists (select * from dup where a = 2 except select 2, 5)",
+        "select f.id, f.tx, count(*), sum(d.v) from f join d on f.x = d.k where f.id < 60 group by f.id having f.nu > 1 order by f.dt, f.id limit 8",
+        "select f.g, count(d.k), max(d.lab) from f left join d on f.x = d.k and d.w <> 'w3' group by f.g order by f.g",
+        "select f.g, sum(d.v), rank() over (order by sum(d.v) desc, f.g) from f join d on f.x = d.k group by f.g order by f.g",
+        "select count(*) from (select distinct on (f.g) f.id from f) z",
+        "select count(*) from f join d on f.x = d.k group by f.g, d.w order by d.w, f.g limit 8",
+        "select count(*) from d where exists (select * from f where f.x = d.k)",
+        "select f.g, d.w, count(*) from f join d on f.x = d.k where exists (select * from e where e.fk = f.id) group by f.g, d.w having max(f.tx) > 't5' order by d.w desc, f.g limit 6",
+        "select count(*) from d where exists (select * from f where f.g = 3 and f.tx = 't5' and d.k < 100)",
+        "select count(*) from d where exists (select * from f join e on e.fk = f.id where f.x = d.k)",
+        "select count(*) from d where exists (select * from f where f.x = d.k order by f.nu desc limit 1 offset 11)",
+        "select count(*) from d where exists (select *, row_number() over (order by f.id) from f where f.x = d.k)",
+        "select count(*), sum(f.id) from f where f.x in (select k from d where exists (select * from e where e.fk = d.k * 3))"
+        ]
+        var same = 0
+        var grouped: []str = []
+        var outs: []str = []
+        for i in 0..len(qs) {
+            let a = q(mut &s, &"set lexdb_batch = off")
+            let off = q(mut &s, &qs[i])
+            let b = q(mut &s, &"set lexdb_batch = on")
+            let g0 = lexdb_exec.decCounts()[2]
+            let on = q(mut &s, &qs[i])
+            if lexdb_exec.decCounts()[2] > g0 { append(mut &grouped, (i + 1).toStr()) }
+            if off == on { same += 1 } else {
+                println("DIFFERENT: " + qs[i])
+                println("  rows:    " + off)
+                println("  batches: " + on)
+            }
+            append(mut &outs, (i + 1).toStr() + ": " + off)
+        }
+        println("queries: " + len(qs).toStr() + ", the same with and without batches: " + same.toStr())
+        for o in outs { println(o) }
+        println("grouped over batches: " + strings.join(&grouped, " "))
+        return 0
+    }).unwrap()
+}

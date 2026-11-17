@@ -16,6 +16,9 @@ import "task"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_exec"
+import "./lexdb_bind"
+import "./lexdb_catalog"
+import "./lexdb_ops"
 import "./lexdb_store"
 import "./lexdb_oratext"
 import "./lexdb_time"
@@ -244,7 +247,7 @@ fn oidOf(t: &PT): int {
 }
 
 // The type a value of a column's result as PL/SQL's %TYPE sees it.
-fn ptOfOut(o: &lexdb_exec.OutCol): PT {
+fn ptOfOut(o: &lexdb_bind.OutCol): PT {
     let tag = lexdb_exec.declTag(o.scale)
     var t = pt(PK_TEXT)
     if tag == lexdb_exec.ORA_VARCHAR {
@@ -506,10 +509,10 @@ fn (cx: mut &Cx) newSid(): int {
 type Stored = record { owner: str; name: str; kind: str; src: str }
 
 // An open cursor: the rows its query gave, read as it is fetched.
-type Cur = record { cols: []lexdb_exec.OutCol; rows: [][]Val; pos: int; open: bool }
+type Cur = record { cols: []lexdb_bind.OutCol; rows: [][]Val; pos: int; open: bool }
 
 // A cursor a call hands to the client (a REF CURSOR OUT, an implicit result): its columns and all its rows.
-pub type CurOut = record { pub cols: []lexdb_exec.OutCol; pub rows: [][]Val }
+pub type CurOut = record { pub cols: []lexdb_bind.OutCol; pub rows: [][]Val }
 
 // A package's variables in a session: all the slots of its frame, those of its own variables the ones that count.
 type PkgInst = record { owner: str; name: str; vals: []Val; oids: []int; ready: bool; stamp: str }
@@ -575,7 +578,7 @@ fn bumpVer(st: &lexdb_store.Store) { let nv = (memoVer(st) + 1).toStr()
 pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str): Result[Unit, DbErr] {
     var t = lexdb_store.begin()
     if len(src) > 0 {
-        match t.put(lexdb_exec.CATALOG, &(srcKey(owner, kind, name)), src) {
+        match t.put(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)), src) {
             Ok(_) {}
             Err(e) {
                 st.abort(t)
@@ -583,7 +586,7 @@ pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, sr
             }
         }
     } else {
-        t.del(lexdb_exec.CATALOG, &(srcKey(owner, kind, name)))
+        t.del(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)))
     }
     try st.commit(t)
     bumpVer(st)
@@ -595,7 +598,7 @@ fn loadStored(ip: mut &Ip): Result[Unit, DbErr] {
     if ip.storedOk && ip.storedVer == v { return Ok(Unit{}) }
     var out: []Stored = []
     var t = try ip.st.beginSnapshot()
-    let r = ip.st.scan(mut &t, lexdb_exec.CATALOG, SRC_PRE, &(SRC_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
+    let r = ip.st.scan(mut &t, lexdb_catalog.CATALOG, SRC_PRE, &(SRC_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
         let k = en.key[len(SRC_PRE)..len(en.key)]
         let f = strings.split(&k, "\x00")
         if len(f) == 3 { append(mut &out, Stored{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val}) }
@@ -1128,7 +1131,7 @@ fn predefined(w: &str): int {
 fn sqlOid(t: &PT): int { return oidOf(t) }
 
 // The result columns of a SELECT of SQL text (variables as $n).
-fn (cx: &Cx) describeText(sess: mut &lexdb_exec.Session, sql: &str): Result[[]lexdb_exec.OutCol, DbErr] {
+fn (cx: &Cx) describeText(sess: mut &lexdb_exec.Session, sql: &str): Result[[]lexdb_bind.OutCol, DbErr] {
     let text = lexdb_oratext.oracleSql(sql)
     let stmts = try lexdb_parse.oraParseNls(&text, cloneStrs(&cx.nls))
     if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
@@ -1145,7 +1148,7 @@ fn (cx: &Cx) sqlErr(line: int, e: &DbErr): DbErr {
 }
 
 // A record's fields from the columns a query gives.
-fn (cx: mut &Cx) recOf(name: &str, cols: &[]lexdb_exec.OutCol): int {
+fn (cx: mut &Cx) recOf(name: &str, cols: &[]lexdb_bind.OutCol): int {
     var r = RecDef{name: name.toStr(), fields: []}
     for c in cols {
         append(mut &r.fields, RecField{name: strings.toUpperAscii(&c.name), pt: ptOfOut(&c)})
@@ -1775,7 +1778,7 @@ fn (cx: mut &Cx) forStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str
         var n = node(K_FORCUR, line)
         if len(label) > 0 { append(mut &n.names, label) }
         cx.push()
-        var cols: []lexdb_exec.OutCol = []
+        var cols: []lexdb_bind.OutCol = []
         if isQuery {
             let close = cx.matchParen(j)
             if close < 0 { return Err(cx.bad(j, "")) }
@@ -2295,7 +2298,7 @@ fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, 
             try cx.needK(k, "IS")
             let e = cx.stmtEnd(k + 1)
             let q = try cx.sqlNode(ip, sess, k + 1, e, -1, -1, SQ_QUERY)
-            var cols: []lexdb_exec.OutCol = []
+            var cols: []lexdb_bind.OutCol = []
             match cx.describeText(sess, &q.sql) {
                 Ok(c) { cols = c }
                 Err(er) { return Err(cx.sqlErr(t.line, &er)) }
@@ -2637,9 +2640,9 @@ fn conv(t: &PT, v: Val): Result[Val, DbErr] {
         var s = ""
         match v {
             Val.Text(x) { s = x }
-            Val.Bytes(b) { s = lexdb_exec.text(&Val.Bytes(b)) }
+            Val.Bytes(b) { s = lexdb_sql.text(&Val.Bytes(b)) }
             else {
-                match lexdb_exec.coerce(v, &tnOf(t)) {
+                match lexdb_ops.coerce(v, &tnOf(t)) {
                     Ok(c) {
                         match c {
                             Val.Text(x) { s = x }
@@ -2658,7 +2661,7 @@ fn conv(t: &PT, v: Val): Result[Val, DbErr] {
         Val.Text(s) {
             if len(s) == 0 { return Ok(Val.Null) }
             if t.k == PK_INT || t.k == PK_NUM || t.k == PK_FLOAT {
-                match lexdb_exec.coerce(Val.Text(strings.trim(&s)), &tnOf(t)) {
+                match lexdb_ops.coerce(Val.Text(strings.trim(&s)), &tnOf(t)) {
                     Ok(c) { return Ok(c) }
                     Err(_) { return Err(ora(6502, "PL/SQL: value or conversion error: character to number conversion error")) }
                 }
@@ -2674,7 +2677,7 @@ fn conv(t: &PT, v: Val): Result[Val, DbErr] {
             else {}
         }
     }
-    match lexdb_exec.coerce(v, &tn) {
+    match lexdb_ops.coerce(v, &tn) {
         Ok(c) {
             if t.k == PK_DATE {
                 match c {
@@ -2701,7 +2704,7 @@ fn assign(u: &PUnit, fr: mut &Fr, slot: int, v: Val): Result[Unit, DbErr] {
 fn putv(u: &PUnit, fr: mut &Fr, slot: int, v: Val) {
     match v {
         Val.Null { fr.oids[slot] = oidOf(&u.slotPt[slot]) }
-        else { fr.oids[slot] = lexdb_exec.kindOid(&v) }
+        else { fr.oids[slot] = lexdb_ops.kindOid(&v) }
     }
     fr.vals[slot] = v
 }
@@ -3244,7 +3247,7 @@ fn exec_rapp(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p
         match mv {
             Val.Text(s) { m = s }
             Val.Null {}
-            else { m = lexdb_exec.text(&mv) }
+            else { m = lexdb_sql.text(&mv) }
         }
         return Err(ora(-c, &m))
 }
@@ -3395,7 +3398,7 @@ fn usingOids(vals: &[]Val): []int {
     for v in vals {
         match v {
             Val.Null { append(mut &o, lexdb_sql.OID_UNKNOWN) }
-            else { append(mut &o, lexdb_exec.kindOid(&v)) }
+            else { append(mut &o, lexdb_ops.kindOid(&v)) }
         }
     }
     return o
@@ -3478,7 +3481,7 @@ fn plainText(v: &Val): str {
     match v {
         Val.Null { return "" }
         Val.Text(s) { return s }
-        else { return lexdb_exec.text(v) }
+        else { return lexdb_sql.text(v) }
     }
 }
 
@@ -4134,7 +4137,7 @@ fn sqlLiteral(v: &Val): str {
         Val.Int(n) { return n.toStr() }
         Val.Num(d) { return d.toStr() }
         Val.Bool(b) { return if b { "TRUE" } else { "FALSE" } }
-        Val.Ts(_) { return "TO_TIMESTAMP('" + lexdb_exec.textOut(v, lexdb_sql.OID_TS, &lexdb_time.utc()) + "', 'YYYY-MM-DD HH24:MI:SS.FF6')" }
+        Val.Ts(_) { return "TO_TIMESTAMP('" + lexdb_ops.textOut(v, lexdb_sql.OID_TS, &lexdb_time.utc()) + "', 'YYYY-MM-DD HH24:MI:SS.FF6')" }
         else { return "'" + strings.replaceAll(&(plainText(v)), "'", "''") + "'" }
     }
 }

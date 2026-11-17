@@ -20,6 +20,8 @@ import "./lexdb_base"
 import "./lexdb_store"
 import "./lexdb_sql"
 import "./lexdb_exec"
+import "./lexdb_bind"
+import "./lexdb_ops"
 import "./lexdb_float"
 import "./lexdb_time"
 import "./lexdb_auth"
@@ -39,7 +41,7 @@ pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub i
 type Prepared = record {
     stmts: []lexdb_sql.Stmt     // none (an empty query) or one
     ptypes: []int
-    cols: []lexdb_exec.OutCol   // its result's columns, as Describe found them
+    cols: []lexdb_bind.OutCol   // its result's columns, as Describe found them
     colsAt: int                 // the catalog's changes then (Store.changes), -1 not yet
     pathAt: int                 // the session's search path then (Session.pathVersion)
     plan: lexdb_exec.PlanCache  // its SELECT's plan, kept between executions
@@ -363,7 +365,7 @@ fn typLen(oid: int): int {
     return -1
 }
 
-fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
+fn (w: mut &Wire) rowDesc(cols: &[]lexdb_bind.OutCol) {
     var b = newStrBuf()
     binary.addU16BE(mut &b, len(cols))
     for c in cols {
@@ -380,12 +382,12 @@ fn (w: mut &Wire) rowDesc(cols: &[]lexdb_exec.OutCol) {
 
 // DataRows, written straight into the output (each value's text made once;
 // a timestamptz's in the session's zone: 9.95).
-fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_exec.OutCol) {
+fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_bind.OutCol) {
     let zone = w.sess.zone()
     for r in rows { w.dataRow(r, cols, &zone) }
 }
 
-fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_time.Zone) {
+fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_bind.OutCol, zone: &lexdb_time.Zone) {
     // Written straight into the output (9.99): a text's bytes need no
     // string of their own; any other value's text is made once (an
     // integer's by the runtime's conversion: faster than its digits a byte
@@ -405,13 +407,13 @@ fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_ti
             }
             Val.Text(t) {
                 if plainText(oid, utc) { size += 4 + len(t) } else {
-                    let x = lexdb_exec.textOut(&r[k], oid, zone)
+                    let x = lexdb_ops.textOut(&r[k], oid, zone)
                     size += 4 + len(x)
                     append(mut &w.texts, x)
                 }
             }
             else {
-                let x = lexdb_exec.textOut(&r[k], oid, zone)
+                let x = lexdb_ops.textOut(&r[k], oid, zone)
                 size += 4 + len(x)
                 append(mut &w.texts, x)
             }
@@ -453,7 +455,7 @@ fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_exec.OutCol, zone: &lexdb_ti
 // no row, and no value per integer or boolean, made. Into a buffer of
 // bytes, added to the output once: a message's length is written when it
 // is done, at its start.
-fn (w: mut &Wire) dataBatch(ob: &lexdb_exec.OutBatch, cols: &[]lexdb_exec.OutCol, zone: &lexdb_time.Zone) {
+fn (w: mut &Wire) dataBatch(ob: &lexdb_exec.OutBatch, cols: &[]lexdb_bind.OutCol, zone: &lexdb_time.Zone) {
     let utc = zone.isUtc()
     let nc = len(ob.kinds)
     var buf: []byte = withCapacity(ob.n * (7 + 12 * nc))
@@ -488,7 +490,7 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_exec.OutBatch, cols: &[]lexdb_exec.OutCol
                             putU32(mut &buf, len(t))
                             appendStr(mut &buf, t)
                         } else {
-                            let x = lexdb_exec.textOut(&ob.vals[c][r], oid, zone)
+                            let x = lexdb_ops.textOut(&ob.vals[c][r], oid, zone)
                             putU32(mut &buf, len(x))
                             appendStr(mut &buf, x)
                         }
@@ -496,7 +498,7 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_exec.OutBatch, cols: &[]lexdb_exec.OutCol
                     Val.Int(n) { putInt(mut &buf, n) }
                     Val.Null { putU32(mut &buf, 0xFFFFFFFF) }
                     else {
-                        let x = lexdb_exec.textOut(&ob.vals[c][r], oid, zone)
+                        let x = lexdb_ops.textOut(&ob.vals[c][r], oid, zone)
                         putU32(mut &buf, len(x))
                         appendStr(mut &buf, x)
                     }
@@ -575,11 +577,11 @@ fn plainText(oid: int, utc: bool): bool {
 // (else its rows are held, and executeMsg refuses them). The session is out
 // of w while it runs, so that the closure can use w's connection.
 fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache,
-                              desc: bool, check: &Option[[]lexdb_exec.OutCol]): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+                              desc: bool, check: &Option[[]lexdb_bind.OutCol]): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     let zone = w.sess.zone()
     w.streamed = false
     var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
-    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_exec.OutCol, row: &[]Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
+    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]Val, ob: &lexdb_exec.OutBatch, start: bool): bool {
         if start {
             match check {
                 Some(want) { if !sameCols(cols, want) { return false } }
@@ -621,7 +623,7 @@ fn (w: mut &Wire) copyResponse(typ: byte, n: int) {
 fn (w: mut &Wire) copyOut(r: &lexdb_exec.Res) {
     w.copyResponse('H', len(r.cols))
     for row in r.rows {
-        let l = lexdb_exec.text(&row[0])
+        let l = lexdb_sql.text(&row[0])
         w.out.addByte('d')
         binary.addU32BE(mut &w.out, len(l) + 4)
         w.out.add(&l)
@@ -659,7 +661,7 @@ fn (w: mut &Wire) copyTo(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc:
 // an error. The session is out of w while it runs, so that the closure can
 // read w's connection. CopyData after the statement ends (an error part
 // way) is dropped by step.
-fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_exec.OutCol): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_bind.OutCol): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     w.copyResponse('G', len(cols))
     if w.flush().isErr() { return Err(protoErr("the connection was lost during COPY")) }
     var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st))
@@ -715,11 +717,11 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
             } else {
                 for s in stmts {
                     var pc1 = lexdb_exec.oneShot()
-                    let noCheck: Option[[]lexdb_exec.OutCol] = None
+                    let noCheck: Option[[]lexdb_bind.OutCol] = None
                     var r = if isCopyTo(&s) { w.copyTo(&s, &none, &nt, mut &pc1) }
                             else if s.kind == lexdb_sql.S_SELECT { w.runStreamed(&s, &none, &nt, mut &pc1, true, &noCheck) }
                             else { w.sess.run(&s, &none, &nt) }
-                    var cols: []lexdb_exec.OutCol = []
+                    var cols: []lexdb_bind.OutCol = []
                     var copyIn = false
                     match r {
                         Ok(x) {
@@ -808,7 +810,7 @@ fn binArray(data: &str, elem: int): Result[str, lexdb_base.DbErr] {
             append(mut &vals, lexdb_sql.Val.Int(strings.parseIntOpt(&t).unwrapOr(0)))
         }
     }
-    return Ok(lexdb_exec.arrayText(&vals))
+    return Ok(lexdb_ops.arrayText(&vals))
 }
 
 fn binParam(data: &str, oid: int): Result[str, lexdb_base.DbErr] {
@@ -956,7 +958,7 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     return Ok(Unit{})
 }
 
-fn sameCols(a: &[]lexdb_exec.OutCol, b: &[]lexdb_exec.OutCol): bool {
+fn sameCols(a: &[]lexdb_bind.OutCol, b: &[]lexdb_bind.OutCol): bool {
     if len(a) != len(b) { return false }
     for i in 0..len(a) { if a[i].name != b[i].name || a[i].oid != b[i].oid { return false } }
     return true
@@ -967,9 +969,9 @@ fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_
     let p = ps.stmts.at(name)
     if isCopyTo(&p.stmts[0]) { return w.copyTo(&p.stmts[0], &po.params, &p.ptypes, plan) }
     if p.stmts[0].kind == lexdb_sql.S_SELECT {
-        var check: Option[[]lexdb_exec.OutCol] = None
+        var check: Option[[]lexdb_bind.OutCol] = None
         if p.colsAt >= 0 {
-            var cs: []lexdb_exec.OutCol = []
+            var cs: []lexdb_bind.OutCol = []
             for c in p.cols { append(mut &cs, c) }
             check = Some(cs)
         }
