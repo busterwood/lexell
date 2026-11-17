@@ -5249,6 +5249,101 @@ context 33, `srcOf` 42); bind 58 (the arm, `bindSubs`, `hasSub`); plan
   EXISTS's first row) reads more rows in batches, so EXPLAIN ANALYZE shapes
   must not stop mid-batch.
 
+#### 6.2.9 Point-select planning cost
+
+Measured and cut 2026-11-17 on `redesign/bind` from main fa606bd2.
+Scripts and outputs are in `~/tpch-w/bind/pt`. A simple-protocol
+statement is planned on every run, and 2e, P1a and P1c each added a
+little planning work, each judged against placement noise. This note
+measures the total source against source and takes it back.
+
+**Method.** Each source built three times: the default placement,
+`LXL_PADB 32 / LXL_FALIGN 128` and `LXL_PADB 16 / LXL_FALIGN 64`
+(`bld.sh`). `pts.sh` (2 rounds of 5 runs) and `simple.sh` (2 rounds)
+over all the binaries, alternating (`meas.sh`); a source's figure is the
+mean of its three placements' means. Beside them, the server's user
+instructions per statement over 3 runs of `points.sql` (`icount.sh`,
+`perf stat`), which placement does not move (the three placements of one
+source agree within 0.15%).
+
+**Source against source** (the second session, `pts-s2.txt`,
+`simple-s2.txt`, all four in one run; tps of 4 clients):
+
+| source | pts CPU ms | vs e1 | point select tps | vs e1 | update tps | join tps | instructions | cycles |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| m761 (76118b8a, before 2e) | 643.4 | -3.96% | 51,543 | +5.59% | 9,472 | 21,421 | 199,015 | 103,583 |
+| e1 (9aa2c0b2, before the pipeline) | 669.9 | 0 | 48,815 | 0 | 9,485 | 20,356 | 203,091 | 109,234 |
+| main fa606bd2 | 675.1 | +0.77% | 49,382 | +1.16% | 9,484 | 20,434 | 206,287 | 110,461 |
+| final fd0b6662 | 652.9 | -2.55% | 50,864 | +4.20% | 9,480 | 20,934 | 197,398 | 105,034 |
+
+The first session (`pts-s1.txt`, `simple-s1.txt`, the first three only)
+agrees: m761 642.7 ms and 51,438 tps, e1 671.9 and 48,917, main 677.5
+(+0.83%) and 49,616 (+1.43%). So 2e cost about 4% of a point select's
+server CPU (4,100 instructions, +2.0%; user cycles +5.5%), and P1's glue
+another 3,200 instructions (+1.6%), less in time (+0.8%: its run reads a
+row more cheaply than the row engine did). The placements of one source still
+spread by up to 5% (e1: 651 to 687 ms): that is why a single build
+pair could not see this.
+
+**The profile.** `perf record -e instructions:u -c 20000` with frame
+pointers (`profpts.sh`, `pi-*.data`; maps `*.map`, `incl.py`,
+`subdiff.py`, `callers.py`). Instruction samples skid, so a function's
+own count is only good to a few percent (`parseIn`, unchanged, reads 6%
+apart between builds); the cuts were judged by `perf stat`'s totals.
+What the profile showed per statement, in instructions: the Sel's
+logical plan (`selPlan`, `outBCols`) about 1,900, built for a statement's
+own SELECT and read by nothing; `pipeSelIn` about 5,300 and `pipeSrc`
+4,700 (its `pathScans` 3,000 as before), against a run 5,000 cheaper
+than the row engine's (`runQuery`, `prepare`, `outC`); and, older than
+both, `select`'s plan-cache version (the catalog's and the statistics'
+versions, the role and session user from the memo, the strings joined)
+made for a one-shot plan that keeps nothing.
+
+**What was cut** (each commit built and passed the suite):
+
+- dab6d0ad (1/n): a statement's own SELECT builds no logical plan
+  (`Scope.noLp`, set by `select`, taken by `planSelect`: `selPlan` is not
+  called; FROM and WHERE's plan, which `planFrom` reads, is built as
+  before; a subquery's, a view's, a set part's and a statement's query's
+  are built, `takeLp` reads them). 206,221 to 203,293 instructions (the
+  profile put 1,900 in `selPlan`; the rest is the plan's drop).
+- 3e05cad0 (2/n): the plan-cache version (`planVersion`) is made only for
+  a kept plan; a one-shot plan reads the catalog's version as before (a
+  read the transaction notes). 203,293 to 197,513.
+- fd0b6662 (3/n): `oneRow` moves the read row's values into the run's
+  row instead of copying them. 197,513 to 197,360.
+
+Not done: a Fetch→Project fast path in `pipeSelIn` (the plan's arrays
+and checks are what it makes; `compile` is about 1,200 instructions, and
+a second plan shape would be code to keep for under 1%); skipping the
+Prog for a plan not kept (the pipeline's run is the cheaper path now).
+
+**Result.** The final build is 2.6% under e1's server CPU and 4.2% over
+its point-select tps, 0.8% under m761 in instructions but 1.5% over it
+in pts CPU (1.3% under in tps): the same work runs at a lower IPC than
+m761's. Update tps is level (DML is not `select`); the 3-table join gains
+2.8% (it is planned by `select` too).
+
+**What is left, for later.** `findTable` reads and decodes the table's
+catalog entry on every statement (about 17,000 instructions, 8.7% of a
+point select); `decTable`'s instructions are the same in every build but its
+cycles are not (2.5% of samples in m761's default build, 4.3% in
+main's): much of the placement spread is there. A cache of the decoded
+table keyed by its stored bytes would take the decoding, not the read.
+The pipeline glue left is `pipeSelIn` (about 5,500) and `pipeSrc`'s own
+part (about 1,700).
+
+**Gates:** the suite from a snapshot of each commit (`e7/suite-pt1`,
+`pt2`, `pt3`): 190 passed, imports ok (214 edges). Naming battery
+(`nam-f1.out`) and EXPLAIN of the 22 TPC-H queries (`exp-f1.txt`):
+identical to main's. TPC-H SF1, one run of fd0b6662 (`out-f1`): the 22
+checksums are the baseline's; total 23,003 to 22,924 ms against
+`out-main-fa606bd2` (-0.35%; q1 -5.2%, q16 -3.6%, q20 +3.2%, every other
+query within 1.8%).
+
+**Line counts:** `lexdb_exec` 26,481 to 26,503, `lexdb_pipe` 3,055 to
+3,056.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
