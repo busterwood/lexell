@@ -4513,7 +4513,8 @@ Built 2026-11-17 on `redesign/bind` from main 9aa2c0b2. Scripts and
 outputs are in `~/tpch-w/bind/p1`. P1 was split in three (P1a scan,
 filter and project; P1b aggregates over one table; P1c sort and limit
 over them, and the deletions). This section is P1a; P1b is 6.2.7, P1c
-is not built.
+6.2.8 (built as RUN_ONCE subqueries and the deletions; sort and limit
+went to P3).
 
 **Commits:**
 
@@ -5016,6 +5017,237 @@ branches, ~300 lines) wait for RUN_ONCE values.
   view arm; `Prog.groups` says whether `run` or `runAgg` runs a plan;
   `pipeRows`/`pipeAggs` are exec's two tests of it. `pipeSelIn`
   recurses into subqueries and set parts before the Sel itself.
+
+#### 6.2.8 P1c as built: subqueries run once, and the deletions
+
+Built 2026-11-17 on `redesign/bind` from main 5ab955fd. Scripts and
+outputs are in `~/tpch-w/bind/p1c`. P1c was scoped to RUN_ONCE
+subqueries as values, the deletions they unblock and the glue; Sort,
+TopN and Limit over chunks stay with P3.
+
+**Commits:**
+
+- 75f33509 (1/n): a subquery's value (`SubVal`: rows, a scalar's value,
+  IN's set, numeric, NULL seen) is the pipe's type; exec's `SubRes` holds
+  one (`SubRes.v`). IN's keys (`setKey`, `inClass`, `typeClass`, `fKey`,
+  `FLOAT_EXACT`, `wholeF`, `exactInt`, `isInstantClass`, `inValKeys`,
+  `inProbeKeys`, `inProbe`), `subValue` and the hash key part `keyPart`
+  move unchanged to `lexdb_pipe`; exec calls them (semi-joins, hashed
+  subqueries, hash joins' keys, `eval`).
+- 29faf843 (2/n): RUN_ONCE subqueries as values in the pipeline; the
+  glue reworked (below); `exec_pipe` extended.
+- cca0b1dd (3/n): `eachOut`'s one-table branch and `setPipe` deleted;
+  where a run reads its table moves to the pipe (`srcOf`); a key-less
+  aggregate's columns to `lexdb_plan` (`callsNeed`).
+- 4f620bf1 (4/n): dead code (`allTrue`, `sysIntVal`: no caller, older
+  than P1) and the `pipeRuns` forward deleted.
+- 3a4512a2 (5/n): the plan's glue allocates less per statement (the
+  point selects' profile, below).
+
+**The plan and the run.**
+
+- `lexdb_bind.BX.Sub(use, i, probe)`: a scalar, EXISTS or IN subquery
+  (`lexdb_sql.SUB_*`), its number, IN's value as `[x]` ([] the others).
+  It is bound only by `bindSubs`, only for a call with no outer values
+  (exactly `subFixed` arguments), and only for a plan's arms (exec's
+  `planX`). So the row engine never meets one: `bindExpr`, `bindSel`,
+  `prepare` and `outC` bind as before. `unplan` gives back an arm that
+  reads a Sub as unbound (`unbound`), so a rejected plan leaves the Sel
+  as the row engine needs it. `hasParam`, `reslot` (a Sub sets `par`:
+  the run's context), `bxEval`, `bxConst`, `bxFixed`, `reads` learn the
+  arm; `hasSub` is new.
+- `Ctx.subs: []SubVal`, by subquery number. `bxEval` reads a scalar's
+  value, EXISTS's rows > 0, IN through `inProbe` (its value evaluated
+  first, as `eval`). `bCompileD` takes a scalar's and EXISTS's value as
+  the run's constant (`bxConst`), as a parameter; IN goes to the generic
+  step (`Gen`), whose context copies the subqueries' values
+  (`copySubs`, only when its expression reads one).
+- `compile` (`scanRuns`) accepts a scan or aggregate whose subqueries
+  are all RUN_ONCE and not in FROM; the PSubs are the Scan arm's now
+  (`subsOf`), so EXPLAIN prints them from the kept plan.
+- exec: `runSubs` (prepare's loop, extracted) runs them before the plan,
+  with the run's `Run` (EXPLAIN ANALYZE's runs per subquery are counted
+  as before, the bytes held too). `runPipe` runs them itself; the path
+  reads their results (`pathScans`: `id = (select ...)`, `id in (select
+  ...)`'s lookups), then their values are moved into the run's context
+  (`pipeCtx`, `subVals`). `pipeGroups` lends `prepare`'s results the same
+  way and puts them back (`subsBack`): HAVING and the outputs over the
+  groups still read them through `Env`.
+
+**What compile accepts now:** P1a's scans and P1b's aggregates as
+before, plus any whose conditions, outputs, keys, arguments and FILTERs
+read uncorrelated scalar, EXISTS and IN subqueries (in WHERE, in the
+select list, under OR, NOT, CASE; NOT IN; in the path's bounds and
+lookups). **It rejects** a correlated subquery of any kind (per row or
+hashed: `q.corr`, or a call with outer values), a subquery in FROM, and
+a semi or anti join. Note that an uncorrelated `x IN (select ...)` or
+EXISTS conjunct of WHERE is planned as a semi join (9.104: two levels),
+so most of those are P2's; P1c's IN is the one in the select list, under
+OR or NOT, and NOT IN.
+
+**Deleted, and what blocks the rest:**
+
+- `eachOut`'s one-table branch: no one-table query reaches it with the
+  pipeline on. Checked by a build that fails any query reaching it, over
+  the whole suite (`inst.log`): none did. The cases the pipeline still
+  rejects (a correlated subquery; MATCH_RECOGNIZE, TOP, WITH TIES, a
+  `SELECT @v =` feedback) were rejected by `outPlan` too, or now go to
+  `runQuery`, which gives the same rows. `eachRowB` asks the batch engine
+  for joins only.
+- `setPipe`/`pipeOn`: deleted; `exec_pipe` compares the pipeline with
+  the row engine.
+- **`outPlan`'s one-table branch is not deleted:** `sortBatches` (ORDER
+  BY, top-N and DISTINCT over batches, 9.105) builds its OutPlan for one
+  table through it. It goes with P3's Sort and TopN.
+- **`batchLevel`'s `direct` one-table branch is not deleted:** it is the
+  row engine's first level, and the row engine still runs every one-table
+  query the pipeline does not: sorts and DISTINCT that `sortBatches`
+  gives up, windows, set operations' parts, subqueries' own rows
+  (`pipeSelIn` makes only aggregates for them), CREATE TABLE AS, INSERT
+  ... SELECT and COPY (query) TO, a query with a correlated subquery. A
+  build that fails any query reaching it failed 105 of the suite's
+  190 tests (`inst2.log`). It goes when those are the pipeline's (P3 and
+  the row engine's deletion).
+- `prepare`'s per-run binding and `outC` stay for `lexdb_batch = off`.
+
+**The glue** (exec's part of handing over a plan: 433 lines with
+`pipeHeld` and the comments, from 455, though it now binds and runs the
+subqueries too):
+
+- moved out: where a run reads its table, in batches or row by row, the
+  index read alone (its decoding) or by its range's keys, is the pipe's
+  (`lexdb_pipe.srcOf`); exec gives it the path's scans and optimizer
+  19's switch (`pipeSrc`, 19 lines with its comment, from 61). The path test the batch
+  engine and the pipeline share is `lexdb_plan.scanBatches` (`bLevelPlan`,
+  `batchGroupsIn` and the pipeline's scan had three copies of it). A key-less
+  aggregate's decoded columns are `lexdb_plan.callsNeed` (required
+  columns are the plan's, 6.2.2).
+- shared, not duplicated: `scanArm` (the PScan), `planConds` (the
+  table's conditions moved, or bound for the plan), `filterOver`,
+  `pipeCtx`, `scanCounts`, `tableRead`.
+- stays exec's: what reads `Sel`, `Query` and `Level` (`pipeShape`,
+  `aggShape`, `pipeSelIn`, `pipeAgg`, `scanArm`, `unplan`), the runs'
+  hand-over (`runPipe`, `pipeGroups`, whose groups are exec's `Groups`),
+  and the held rows' sink (`pipeHeld`, exec's `Res`). They move with the
+  planner (E5).
+
+**Line counts:**
+
+| | main 5ab955fd | 75f33509 | 29faf843 | cca0b1dd | 4f620bf1 | 3a4512a2 |
+|---|---:|---:|---:|---:|---:|---:|
+| `lexdb_exec` | 26,770 | 26,518 | 26,579 | 26,494 | 26,475 | 26,481 |
+| `lexdb_pipe` | 2,710 | 2,980 | 3,013 | 3,055 | 3,055 | 3,055 |
+| `lexdb_plan` | 281 | 281 | 293 | 320 | 320 | 320 |
+| `lexdb_bind` | 2,043 | 2,043 | 2,101 | 2,101 | 2,101 | 2,101 |
+
+Exec is 289 lines shorter. The secrets that left it: subqueries' values
+and IN's keying (how a value is found in a set as = compares, 252
+lines), how a run reads its table (`srcOf`), and a key-less aggregate's
+columns. The pipe gained 345 lines (the moved keys 270, Sub and the
+context 33, `srcOf` 42); bind 58 (the arm, `bindSubs`, `hasSub`); plan
+39 (`scanBatches`, `callsNeed`). No new import edge.
+
+**Gates:**
+
+- Suite from a snapshot of each commit (`e7/suite-p1c1`, `p1c2b`,
+  `p1c3`, `p1c4`, `p1c5`): 190 passed, imports ok (214 edges). The first
+  run of 2/n failed two expectations that the slice changes on purpose,
+  amended into it: `exec_batchexpr` gives 286 of 600 queries as
+  OutBatches (267: its queries with `(select max(id) from g)` in WHERE
+  are the pipeline's now), and `exec_narrow`'s query 12 (`count(*)` with
+  an uncorrelated EXISTS over EXCEPT) is grouped over batches.
+- `exec_pipe` gained the subqueries: 300 random queries (scalar, EXISTS,
+  IN and NOT IN in WHERE, in the select list, in an aggregate's
+  conditions, keys and calls; IN of integers, numerics, texts, dates;
+  sets with a NULL, empty ones; a primary key or index path through
+  them) and 34 fixed ones: a scalar of more than one row (21000) in WHERE
+  and in the select list, empty results and NULLs, a division by zero
+  through a subquery's value, a path's point and lookups per value, a
+  correlated one (rejected: the row engine), an aggregate over a
+  subquery that has its own. Then 12 runs of a prepared statement with
+  parameters in its subqueries from one plan cache against the row
+  engine, and EXPLAIN ANALYZE of 10 shapes. Run four ways at 2/n (all the
+  same; EXPLAIN ANALYZE the same but for batches: the drivers read rows
+  the pipeline reads in batches); from 3/n two ways (the drivers and
+  `setPipe` deleted), the earlier shapes too: all the same.
+- Naming battery (`nam-c2.out`, `nam-c4.out`) and EXPLAIN of the 22
+  TPC-H queries (`exp-c2.txt`, `exp-c4.txt`): identical to main's.
+- TPC-H, SF1, one run of 4f620bf1's build (`out-c4`; 2/n's too,
+  `out-c2`): the 22 checksums are the baseline's (1744ef99). Against
+  `out-main-5ab955fd`: total 23,161 to 23,003 ms (-0.68%; 2/n -0.72%);
+  q1 +0.2%, q6 -2.9%, q21 -3.1%; every query within 3% but q16, +6.9%
+  (2/n: +6.0%).
+  - q16 repeated on copies (`rep.sh`, 3 runs a pass, alternating, two
+    passes, medians): 2/n's build 570.7 and 565.2 against main's 556.6
+    and 560.9 (+1.6%); 4f620bf1's, after q14 and q15 as in the full run,
+    557.1 and 556.2 against 557.1 and 555.0 (level). Not reproduced.
+    q16's NOT IN probes go through the moved `inProbe`; that is the only
+    code it runs that changed.
+  - 3a4512a2 (5/n) changes only plan-making; it was not run through
+    TPC-H.
+- Point selects (copies of main's and the branch's builds):
+  - 4f620bf1: `pts.sh` (2 rounds of 5) server CPU 680.4 against 674.0 ms
+    (+0.95%); `simple.sh` point select 48,550, 49,247, 49,018 tps
+    against 50,047, 49,693, 50,765 (three passes, -2.4%), update and join
+    level.
+  - Profile (`ppts-m`, `ppts-b`; 10 runs of `points.sql`, the same work):
+    the run (`runSelTo`) level, `pipeSelIn` (the plan made per
+    statement) 3.34% against 2.54%, its mallocs 0.14% against 0.02%. 5/n
+    trimmed it: 2.86% (`ppts-c`), +0.34% of the samples over main's.
+    Samples in all: 157,225 (main), 158,566 (5/n): +0.85%, of which
+    `planSelect`, unchanged, +1.1%.
+  - 3a4512a2: `pts.sh` 678.9 against 667.9 ms (+1.65%); `simple.sh`
+    point select 48,593 and 48,677 against 50,351 and 50,735 (-3.6%).
+  - Placement (`place.sh`, as 6.2.7's check 2): 3a4512a2's source
+    built with `LXL_PADB 32 / LXL_FALIGN 128` gives 49,877 and 49,950
+    tps (-1.0% against main's 50,066 and 50,702 in the same rounds) and
+    `pts.sh` CPU 669.8 against 668.8 ms (+0.15%); with `PADB 16 / FALIGN
+    64`, 48,593 and 48,905 tps. So most of the -3.5% is placement; what
+    the code adds is the plan glue's +0.34% (profile) to about 1%. Not
+    chased further: placement is not pinned.
+
+**Hand-over to P2 (hash joins, semi and anti, index lookups):**
+
+- **What P2 starts from.** The pipe holds the hash key part
+  (`keyPart`) and IN's keys, so a HashBuild and HashProbe key rows the
+  way today's hash levels, semi-joins and hashed subqueries do (exec calls
+  the same functions). `scanBatches` (lexdb_plan) and `srcOf` (lexdb_pipe)
+  are per table: a join's inner tables each get a Scan arm with its own
+  Src, or an IndexLookup arm whose keys come from the outer chunk
+  (`fetchMany`, `rangeMany`: today's `bLookup`, `bRange`). `callsNeed`
+  is the start of 6.2.2's required-columns pass: put the per-operator
+  pass next to it.
+- **Semi and anti joins.** An uncorrelated IN or EXISTS conjunct of WHERE
+  is a semi level (9.104: RUN_SEMI, its rows a level's hash), not a
+  `BX.Sub`: it is P2's HashJoin(semi/anti) with the subquery's plan as the
+  build side, not a value in `Ctx`. A correlated one decorrelated by 9.9
+  is RUN_HASHED (its keys and IN's per-key set, `runHashed`); a
+  `SubVal` per key does not fit `Ctx.subs`, so it should become a build
+  side too. `semiLook` (RUN_LOOKED) is an IndexLookup(semi/anti).
+- **What then goes from exec.** `eachOut` is joins-only now; with joins in
+  the pipe it goes, with `outPlan`'s joined branch (`bJoinPlan`,
+  `jpFinish`), `batchLevel`'s joined branch, `bJoinAll`, `bProbe`,
+  `bJoinTail`, `bLookup`, `bRange` and `batchGroupsIn` (the joins'
+  aggregate driver: `pipeAgg`'s Agg over a join arm replaces it).
+- **Still blocked after P2:** `outPlan`'s one-table branch (`sortBatches`:
+  P3) and `batchLevel`'s `direct` branch (the row engine's first level for
+  every query the pipeline does not run: 105 of the suite's tests reach
+  it). Making subqueries' own rows, set parts and the statements' queries
+  (`pipeSelIn`'s `rows` false) the pipeline's would shrink that list
+  without new operators.
+- **Costs to watch.** A Gen node that reads an IN subquery copies the
+  subqueries' values into its context per run (`copySubs`): free for the
+  sets seen so far, linear in a big set. The plan-making glue is ~3% of a
+  point select's server time (`pipeSelIn`); it is made per
+  simple-protocol statement.
+- **Traps.** `BX.Sub` exists only in plan arms: code that binds with
+  `bindExpr` never sees one, and `unplan`/`oxBack` must keep turning one
+  back into "unbound". `pipeGroups` lends `prepare`'s results to the run
+  and puts them back (`subsBack`) after it, also on error. `Scan` carries
+  its query's PSubs now (EXPLAIN reads them there). `exec_pipe` compares
+  against the row engine: a scan that stops inside a batch (a LIMIT, an
+  EXISTS's first row) reads more rows in batches, so EXPLAIN ANALYZE shapes
+  must not stop mid-batch.
 
 ## 7. Trade-offs and risks
 
