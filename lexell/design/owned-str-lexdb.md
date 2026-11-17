@@ -109,41 +109,59 @@ forms from the start:
   hand-written clone methods (lexdb has `copyInts`-style helpers that become
   `xs.clone()`).
 
-## 3. Procedure for lexdb
+## 3. Procedure for lexdb (on the lexdb refactoring branch)
 
-1. **Merge.** Merge `lang/owned-str` into `main`, or `main` into the branch,
-   once the lexdb work there is at a stable point. Changes A to G need no
-   lexdb edits. Run the lexdb suite (with `LXL_NOCACHE=1`, native lxlc) and
-   check the drop-timing note for F.
-2. **Worklist.** `tools/owned_str_sweep.sh` leaves lexdb out (it filters
-   `lexdb` from the program list). Add the lexdb programs, for example
-   `cmd/lexdb.lxl` and `tests/lexdb/run/*.lxl`, or a flag to include them.
-   Then run it with the lexdb module names
-   (`tools/owned_str_sweep.sh lexdb_exec.lxl ...`).
-2b. **Parameters.** `LXL_PARAM_REPORT=1 LXL_OWNED_STR=1 lxlc cmd/lexdb.lxl
-   --emit-c` lists lexdb's by-value parameters that are only read. Declare
-   each one `&T` first: call sites stay as they are, and many worklist sites
-   disappear with them.
-3. **Rules.** The migration rules are in the agent brief, which is in this
-   session's scratchpad. They are summarised here because the scratchpad does
-   not last:
-   - A value that is only read afterwards becomes a borrow (`let n = &p.name`,
-     a typed `let x: &str = if ...`, or pass `x` to a `&T` parameter).
-   - A private function that only reads a `str` parameter takes `&str`.
-   - A by-value receiver on a type that holds strings becomes `&Self`, even
-     on `pub` methods: callers are unaffected.
-   - Anything stored, appended, returned, assigned or put in a literal gets
-     `.clone()`.
+After `lang/owned-str` is merged into `main`, lexdb on `main` does not compile
+until this is done. Do it on the lexdb branch.
+
+1. **Merge `main` into the lexdb branch.** Build the compiler from the seed
+   (`lexell/compiler/build.sh`). lexdb stops at its first error.
+2. **Worklist.** `tools/owned_str_sweep.sh -l BASENAMES` runs the migration
+   mode (`LXL_OWNED_STR=1`) over the lexdb programs too, and lists every site
+   in the named files, for example `-l lexdb_exec.lxl lexdb_store.lxl`. With
+   no names, it lists every site. When this was written there were about
+   1,970 edit sites in cmd/lexdb.lxl's modules (largest: lexdb_exec 669,
+   lexdb_store 226, lexdb_parse 138). `design/experiments/q1_split.lxl`
+   imports lexdb and is migrated with it.
+3. **Parameters first.** `LXL_PARAM_REPORT=1 LXL_OWNED_STR=1 compiler/out/lxlc
+   cmd/lexdb.lxl --emit-c 2>&1 >/dev/null | grep 'only reads it' | sort -u`
+   lists the by-value parameters that are only read. Make each one `&T`; call
+   sites stay as they are (implicit borrow), and many worklist sites go with
+   them. Keep a parameter by value if its function is used as a function
+   value. Re-run the worklist afterwards.
+4. **The sites.** Split the worklist into batches of about 100 sites by file,
+   one Haiku agent per batch in its own worktree. The rules that worked for
+   the library, tests and compiler, in order of preference:
+   - Borrow a field that is only read afterwards: `let n = &p.f`. Writes to
+     other fields of `p` stay allowed (change D). A typed borrow:
+     `let s: &str = if c { &a.name } else { "x" }`.
+   - Pass a value to a `&T` parameter as it is: `f(x)` borrows (change E).
+   - A private function that only reads a by-value `str` (or record)
+     parameter takes `&str` (`&T`).
+   - A `match` on a local that is not used afterwards moves it (F);
+     `for x in f()` gives owned elements (I); `make().field` moves (H): no
+     clone in those.
+   - A by-value receiver on a type holding strings becomes `&Self`, even on
+     `pub` methods.
+   - Otherwise `.clone()` (`.share()` for a `task.Shared`), at the logged
+     line: values stored, appended, returned, assigned, put in a literal, or
+     passed by value. A string global read by value is `g.clone()`.
    - Shift array elements with `swap`, not by copying.
-   - Never change a `pub` signature or field during the mechanical pass.
-   - Never edit a test's `// expect:` lines.
-   - Skip the kinds `tcopy`, `gvar`, `recv`, `fill`, `apart` and `global`
-     and list them: they need a language decision or a person.
-4. **Parallel batches.** Haiku agents in separate worktrees, one batch of
-   about 100 sites each, worked well for the library and tests: about 1,600
-   sites with no wrong edit found in review. Review every diff, merge, then
-   run the gate.
-5. **Shared buffers.** Clones of large buffers on hot paths (the cursor
-   pattern in tds and tns) become `rc str` shares at the switch. Expect the
-   same in lexdb's storage and wire layers: list them, don't optimise them in
-   the mechanical pass.
+   - Never edit a test's `// expect:` lines. A test whose point was implicit
+     copying is rewritten for owned semantics, keeping its subject.
+   - Kinds `tcopy` (a `T: copy` generic used with a str: change it to
+     `T: Clone` and clone in its body), `gvar` and `recv` need a person, not a
+     mechanical edit.
+5. **Shared buffers.** A large string that several readers walk (a page, a
+   message, a row buffer) and that the migration clones per reader becomes an
+   `rc str`, with readers holding `r.share()` and a position, as in the TDS
+   and TNS clients (change O). Look for these in the storage, wire and
+   executor layers after the mechanical pass: a clone there is now a copy of
+   the bytes (change U).
+6. **Verify.** lexdb compiles. Its suite passes (`LXL_NOCACHE=1`, the native
+   compiler; see the project's lexdb test notes). The quick gate passes. Run
+   the lexdb benchmarks against `main` before the merge, and log them as the
+   project's benchmark record requires.
+7. **Deprecated `task.Frozen`.** lexdb_time.lxl's three `task.freeze` sites
+   become `rc(...)`, and `Frozen[tz.Zone]` becomes `rc tz.Zone`. Then
+   `task.Frozen` can be deleted from lib/task.lxl (change R).

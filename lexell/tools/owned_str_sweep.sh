@@ -2,7 +2,7 @@
 # The LXL_OWNED_STR worklist (design/owned-str.md): every site that would need an edit if str
 # were owned, over the compiler and every program in tests/, cmd/, lib/tests/, lib/examples/, bench/,
 # redteam/ and design/experiments/ (not lexdb).
-#     lexell/tools/owned_str_sweep.sh [-a] [file.lxl ...]
+#     lexell/tools/owned_str_sweep.sh [-a] [-l] [file.lxl ...]
 # Prints "kind file:line name what-took-it", sorted and unique. With file names (base names, such
 # as fs.lxl), only the sites in those files. Free moves (kind "move") are left out unless -a.
 # LXLC is the compiler to use (default compiler/out/lxlc); P the parallel compiles (default 4). Programs the mode cannot finish are
@@ -13,14 +13,22 @@ set -e
 D=$(cd "$(dirname "$0")/.." && pwd)
 LXLC=${LXLC:-$D/compiler/out/lxlc}
 ALL=0
-if [ "$1" = "-a" ]; then ALL=1; shift; fi
+LEXDB=0
+while true; do
+    case "$1" in
+        -a) ALL=1; shift ;;
+        -l) LEXDB=1; shift ;;       # lexdb's programs too (cmd/lexdb.lxl, tests/lexdb), for its migration
+        *) break ;;
+    esac
+done
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 LXL_OWNED_STR=${LXL_OWNED_STR-1}
 export LXL_LIB="$D/lib" LXL_OWNED_STR LXLC T
 cd "$D"
 { echo compiler/main.lxl
-  find tests cmd lib/tests lib/examples bench redteam design/experiments -name '*.lxl' | grep -v -i lexdb |
+  find tests cmd lib/tests lib/examples bench redteam design/experiments -name '*.lxl' |
+      { if [ $LEXDB = 1 ]; then cat; else grep -v -i lexdb; fi; } |
       grep -v -e '^tests/error' -e '^lib/tests/error' |
       xargs grep -l '^fn main'
 } > "$T/progs"

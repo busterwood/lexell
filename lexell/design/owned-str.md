@@ -80,6 +80,28 @@ native backend's inline checks read it.
   count arithmetic). It reads bytes at `p + i` instead of `block + 8 + off + i`.
   `loops.lxl` hoists `p`.
 
+**Measured (2026-11-17)**, stage 1 (owned semantics, counted runtime) against
+stage 2 (owned buffers): bench/bench.py, 5 runs each, the same sources, run
+one after the other on an otherwise idle machine. Native times:
+
+| benchmark | stage 1 | stage 2 | change |
+|---|---:|---:|---:|
+| fib, loop, array, alloc, lists, trees, sieve | | | within 1% |
+| strings | 207 ms | 201 ms | -3% |
+| tokens | 221 ms | 211 ms | -4.5% |
+| maps | 334 ms | 362 ms | +8% (via C: 331 to 397 ms, +20%) |
+| compiler self-build | 0.463 s | 0.489 s | +5.6% |
+
+Strings that are only moved and borrowed got a little faster (no count
+traffic). The two slowdowns are clones that now copy:
+- `maps` puts `keys[i].clone()` into a map: one allocation and copy per put.
+  Moving the keys in, or `rc str` keys, gets it back.
+- The self-build pays for the compiler migration's clones, above all `nd()`
+  (section 5).
+
+The user's direction: performance does not block the switch; the knobs
+(borrows, `rc str`, moves) are the remedy.
+
 Older design notes (native.md, parallel.md, mid-ir.md, borrow-inference.md,
 lexell-vs-rust.md, http-server.md, tls.md, perf-ideas.md) describe the
 counted representation as it was. They are history, not a description of the
