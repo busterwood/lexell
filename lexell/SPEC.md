@@ -814,6 +814,10 @@ view, `&str`, rooted where the scrutinee is: uncounted, and returnable through
 a borrowed parameter (`fn name(e: &E): &str { match e { E.S(s) { return s }
 ... } }`). Matching a variable directly binds a `str` field as a copy, so the
 arm may still assign that variable.
+A `match` directly on a local variable of an owned closed type without a
+`drop` method, where the variable is not used again (not in the arms, the
+rest of the statement, a later statement, or a loop around the match that it
+is declared outside of), consumes it as `match move(x)` would.
 `match` on any other expression (a call result, `move(x)`) consumes it: the
 bindings own the fields, and fields not bound (or bound to `_`) are dropped at
 the start of the arm, before its body runs; an arm naming several variants, like

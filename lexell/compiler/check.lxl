@@ -346,6 +346,7 @@ type MatchX = record {
 }
 
 pub type Checker = record {
+    liveSkip: int   // a node usesIn ignores (the scrutinee of a match deciding whether it moves), or -1
     octx: str       // LXL_OWNED_STR: what is consuming (let, arg, return, ...)
     pub pg: sema.Program
     pub x: tm.Arena            // the templates' nodes
@@ -375,7 +376,7 @@ pub type Checker = record {
 pub fn newChecker(pg: sema.Program): Checker {
     var c = Checker{pg: pg, x: tm.newArena(), tmpls: [], ginits: [], cinits: [], vars: [], tmps: [], capl: [], statics: newMapWith[str, int](fxHashStr),
         podMemo: [], copyMemo: [], cids: 0, holes: [], lifted: [], cx: newCtx(-1, "", sema.T_VOID, [], 0, false),
-        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0, octx: ""}
+        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0, octx: "", liveSkip: -1}
     for f in 0..len(c.pg.fns) { append(mut &c.tmpls, Tmpl{done: false, lines: [], holes: [], lifted: []}) }
     for g in 0..len(c.pg.globals) { append(mut &c.ginits, noInit()) }
     for k in 0..len(c.pg.consts) { append(mut &c.cinits, noInit()) }
@@ -1258,7 +1259,7 @@ fn (c: &Checker) usesIn(a: int, b: int, name: &str): bool {
     let hi = ast.shi[b]
     if lo < 0 || hi < 0 { return true }
     for i in lo..hi + 1 {
-        if ast.nodes[i].kind == sx.N_NAME && ast.nodes[i].s == name { return true }
+        if i != c.liveSkip && ast.nodes[i].kind == sx.N_NAME && ast.nodes[i].s == name { return true }
     }
     return false
 }
@@ -2653,9 +2654,35 @@ fn (c: mut &Checker) armBody(body: int, mx: bool) {
 }
 
 // A match statement (mx: a match expression's arms, each one expression).
+// SPEC 9.3 (design/owned-str.md, issue 9): a match on a local of an owned closed type that is not
+// used again (not in the arms, the rest of the statement, later statements or a loop around it)
+// consumes it, as match move(x) does.
+fn (c: mut &Checker) matchMoves(a: int): bool {
+    if c.kind(a) != sx.N_NAME { return false }
+    let vx = c.lookupVar(&(c.nd(a).s), true)
+    if vx < 0 || c.vars[vx].moved || c.vars[vx].cap >= 0 || len(c.cx.nomove) > 0 { return false }
+    if c.vars[vx].loops < len(c.cx.loops) { return false }     // declared outside a loop around the match
+    let t = c.vars[vx].t
+    if c.pg.tk(t) != sema.TK_INST || c.isCopy(t) { return false }
+    let d = c.pg.ta(t)
+    if c.pg.types[d].form != sx.F_CLOSED || c.pg.types[d].drop >= 0 { return false }
+    c.liveSkip = a
+    let live = c.isLive(vx, 0)
+    c.liveSkip = -1
+    return !live
+}
+
 fn (c: mut &Checker) sMatch(s: int, mx: bool) {
     let n = c.nd(s)
-    let v = c.expr(n.a, -1)
+    var v = voidVal(false)
+    if c.matchMoves(n.a) {
+        let mv = c.expr(n.a, -1)
+        let mcr = c.crOf(mv)
+        v = c.holdtmp(c.consumeAs("match", mv, n.line), mv.t)
+        v.cr = mcr
+    } else {
+        v = c.expr(n.a, -1)
+    }
     let base = if c.pg.tk(v.t) == sema.TK_REF { c.pg.ta(v.t) } else { v.t }
     if base == sema.T_VOID { c.err(n.line, "match needs a value") }
     if base < sema.NINTS || base == sema.T_STR {
