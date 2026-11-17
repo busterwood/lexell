@@ -586,7 +586,7 @@ task.Future[int], w: Where)` calls `f.wait(w)`).
   with no result cannot give `R`); `within` itself never parks.
 - `Cancelled` is `value closed { Cancelled; Abandoned; Timeout }` (`eq`,
   `toStr`).
-- `shared[T](v: T): Shared[T]`: a counted handle (a lang item, SPEC 15); `sh.share()` makes another (a copy type until the switch, then owned);
+- `shared[T](v: T): Shared[T]`: a counted handle (a lang item, SPEC 15), owned: `sh.share()` makes another;
   `sh.with(f: &fn(mut &T))` is the only access. Parking inside `with`, or a
   `with` on a value whose `with` is open, is exit 13. If every task is
   parked the program stops with exit 14 (deadlock). The messages name the

@@ -178,11 +178,12 @@ block or one expression.
 | `str` | immutable byte string |
 | `ptr` | an opaque C pointer; only for `extern` declarations and their wrappers |
 
-`str` is reference counted inside the runtime, so for the language it is a
-copy type: copying a string never copies its bytes, and it is freed with its
-last copy. Its bytes are not required to be UTF-8. `s[a..b]` is the substring
-of bytes `a` to `b - 1`; it shares the bytes of `s` (no copy, no allocation)
-and is itself an ordinary `str`. `s[a..]` and `s[..b]` run to the end and from
+`str` is an **owned** type (design/owned-str.md): a string has one owner,
+`let t = s` moves it, and it is freed when its owner is dropped. `s.clone()`
+makes a second, independent string. A string that several owners read is an
+`rc str` (section 4.9). Its bytes are not required to be UTF-8. `s[a..b]` is
+the substring of bytes `a` to `b - 1`: where a `&str` is expected it is a view
+of the bytes of `s` (no copy), and elsewhere it is a new owned `str`. `s[a..]` and `s[..b]` run to the end and from
 the start. `s[i]` is the byte at index `i` (a `byte`), on an owned or
 borrowed `str`; it is a value, not a place, so it cannot be assigned or
 borrowed `mut` (a string is immutable). Out-of-range indices and bounds stop
@@ -193,9 +194,9 @@ A shared `&str` is a **view**: the string's header (its block, offset and
 length) by value, with no count taken. `&s[a..b]` borrows the bytes `a` to
 `b - 1` of `s` without copying or counting them, and so does `s[a..b]` where a
 `&str` is expected; elsewhere `s[a..b]` is an owned `str` (it counts). A view
-is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str`
-converts to `str` where a `str` is expected (an argument, a stored value),
-which takes a count of the same bytes. `mut &str` borrows a `str` variable or
+is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str` does
+not convert to `str` by itself: where an owned string is needed, write
+`s.clone()`. `mut &str` borrows a `str` variable or
 field for writing, as for any `T`. A shared borrow or slice of an array of
 `str` may be used as one of views (`&[]str` as `&[]&str`, `&[str]` as
 `&[&str]`): the elements are read as views rooted where the array is
@@ -206,9 +207,10 @@ expected (an argument, a typed `let`, a field of a record literal, an
 `Option` or `Result` payload, an array element, a `return`) is a view of
 static bytes. It has **no root**: it may be passed, kept in a value that holds
 borrows, joined with any root, and returned from any function
-(`fn kind(k: int): &str { return "word" }`). Elsewhere it is a `str`.
+(`fn kind(k: int): &str { return "word" }`). Elsewhere it is a new owned `str`,
+as is a `str` constant read where an owned value is wanted.
 
-All primitive types are copy types.
+All primitive types except `str` are copy types.
 
 ### 4.2 Arrays
 
@@ -354,14 +356,17 @@ let adults = count(&people, fn(p: &Person): bool { return p.age >= minAge })
 
 ### 4.7 Copy types and owned types
 
-A type is a **copy type** if it has no `drop` method and it is a primitive, a function type, a
-`value record` or `value closed` whose fields are all copy types, or a type
-parameter constrained by `copy`. Every other type is **owned**.
+A type is a **copy type** if it has no `drop` method and it is a primitive
+other than `str`, a function type, a `value record` or `value closed` whose
+fields are all copy types, or a type parameter constrained by `copy`. Every
+other type is **owned**, `str` and `task.Shared` handles included (before
+design/owned-str.md both were copy types, counted in the runtime).
 
 `x.clone()` makes a second owner of `x` (std's `Clone` interface). A type
 that declares a `clone` method uses it. Otherwise the compiler provides a deep
 copy for a type that is **cloneable**:
 - a copy type;
+- `str`, where the clone is an independent string;
 - an array whose elements are cloneable;
 - `task.Shared[T]`, where the copy is another handle;
 - a record or closed type without a `drop` method, holding no borrows, whose
@@ -445,8 +450,9 @@ name is visible throughout its module; `pub` makes it visible to importers.
 
 `const` names a compile-time value: an integer, float, bool, string or
 fractional literal, or an operator expression over constants. A global `var`
-has a copy type and a constant initializer (constants, and value record or
-variant literals of constants). A constant expression that overflows is a
+has a copy type, or an owned type with value-only access (below), and a
+constant initializer (constants, and value record or variant literals of
+constants). A constant expression that overflows is a
 compile error. A constant is folded in the arithmetic of its type: a typed
 constant that does not fit its type is an error, and `const C: u32 = ~0` is
 `0xffffffff`. A global may not be borrowed
@@ -454,7 +460,9 @@ constant that does not fit its type is an error, and `const C: u32 = ~0` is
 temporary copy; a `mut &Self` method on a global is an error).
 
 **Constant tables.** A `const` may also be an array literal of constants, or a
-value record or variant literal of constants, of a copy type:
+value record or variant literal of constants, of a copy type or of strings
+and values built from them (static data, read as views or as new owned
+values):
 `const POW10: []u128 = [1, 10, 100]`. A constant table lives in read-only
 static data; it is never freed and never changes. Using its name gives a
 `&[T]` slice (section 4.2a), so `POW10[i]`, `len(POW10)` and `for p in POW10`
@@ -906,8 +914,8 @@ or named fields of owned types are bound as `&T`, and of copy types as copies.
 Through a shared borrow (the scrutinee is a `&T`), a `str` field is bound as a
 view, `&str`, rooted where the scrutinee is: uncounted, and returnable through
 a borrowed parameter (`fn name(e: &E): &str { match e { E.S(s) { return s }
-... } }`). Matching a variable directly binds a `str` field as a copy, so the
-arm may still assign that variable.
+... } }`). Matching a variable directly binds a `str` field as a borrow too
+(it is owned, section 4.1); the arm writes `s.clone()` to keep a copy.
 A `match` directly on a local variable of an owned closed type without a
 `drop` method, where the variable is not used again (not in the arms, the
 rest of the statement, a later statement, or a loop around the match that it
@@ -1271,9 +1279,10 @@ The compiler knows these names from the library: `fromFraction` (section
 variants that may be written bare (`Some`, `None`, `Ok`, `Err`, section 4.4).
 It knows two types from the library. `Shared` in the library module `task`
 (section 16), declared there as `value record { p: ptr }`: a value of an
-instance of it is not plain data: copying it calls the runtime's `rt_sh_dup`
-on `p`, and dropping it `rt_sh_drop`, so that the handle is counted like a
-`str`. Everything else about tasks is library code.
+instance of it is an owned handle: `share()` or `clone()` calls the
+runtime's `rt_sh_dup` on `p`, and dropping it `rt_sh_drop`, so that the value
+is dropped with the last handle. It also knows `Rc` in `std`, what `rc T`
+names (section 4.9). Everything else about tasks is library code.
 
 `Where` in `std`, declared there as `value record { p: ptr }`, is a call
 site: `p` points to the text `"file:line"` (the file's name and the line of
@@ -1401,9 +1410,8 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   does not park. The clock is `CLOCK_MONOTONIC`; timers fire in the order of
   their time, and those with the same time in the order they were set.
 - `Shared[T]` is a counted handle to one value, which is dropped with the
-  last handle. `sh.share()` (or `sh.clone()`) makes another handle. Today a
-  handle is still a copy type; at the switch to owned `str` it becomes owned,
-  so every copy must then be a `share()` (design/owned-str.md). `sh.with(f)`
+  last handle. A handle is owned: `sh.share()` (or `sh.clone()`) makes
+  another, and passing one to a task moves it (design/owned-str.md). `sh.with(f)`
   lends the value to `f` as `mut &T`, and is the only access. No other task runs during `with`: an operation that can park,
   called while any `with` is open, stops the program with exit 13 (the check
   is made whether or not the call would have parked), and so does a `with`

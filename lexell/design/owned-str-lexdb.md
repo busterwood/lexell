@@ -46,6 +46,8 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | S | The compiler is migrated; library parameters it reads now borrow (`fs.mkdir`, `io.openAppend`, `Option.expect`/`Result.expect`'s message, `StrBuf.addLine` and others: `str` became `&str`). Issue 12: `f([])` infers the element type through a `&[]T` parameter. | ad66f390 to the compiler-migration merges | yes: call sites are unchanged (implicit borrow); verified, every lexdb program compiles. A lexdb function passed where a `fn(str)` value of one of these is expected would not, but none is. | none |
 
+| T | **The switch, stage 1.** `str` and `task.Shared` handles are owned types: `let t = s` moves, a copy is `s.clone()` / `sh.share()`, a `&str` does not turn into a `str` by itself, a string global is read with `g.clone()`, a `str` constant or literal read as an owned value is a new value. `array(n, v)` clones an owned `v`. `std`'s `str.clone()` is the built-in one. In the runtime a string is still a counted block (clone is a count), so performance is as before. | (this commit) | **no**: lexdb stops at its first error (`lexdb.lxl:113: cannot move out of global LOG_DIR`). `LXL_OWNED_STR=1` (migration mode) compiles all of it and logs every site: 3,459 for cmd/lexdb.lxl, 1,491 of them free moves, so about 1,970 edits (1,188 borrow, 368 place, 157 clone, 38 captured, 2 loop, 2 global). | as for the library: drops happen where an owner ends, not where its last copy ends |
+
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
 need `share()`, and `task.Frozen` goes, so lexdb_time.lxl's three

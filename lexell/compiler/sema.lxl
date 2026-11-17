@@ -295,9 +295,10 @@ pub type Program = record {
     pub main: int
     bcMemo: []int            // isBorrowClass per type: -1 unknown, 0, 1
     bcDecl: []int            // declBC per declaration: -1 unknown, 0, 1, 2 (being computed)
-    pub ownedStr: bool       // LXL_OWNED_STR=1: str is an owned type (design/owned-str.md, a measurement)
+    pub migrate: bool        // LXL_OWNED_STR=1 (or LXL_OWNED_SHARED=1): migration mode (design/owned-str.md):
+                             // a site that relied on str or Shared being copied is logged, not an error
+    pub legacy: bool         // inside isCopyLegacy: str and Shared count as copy types, as before the switch
     pub paramReport: bool    // LXL_PARAM_REPORT=1: list the by-value owned parameters only read (check)
-    pub ownedShared: bool    // LXL_OWNED_SHARED=1: task.Shared handles are owned (a measurement, as ownedStr)
 }
 
 // ---------------------------------------------------------------- errors
@@ -407,8 +408,8 @@ pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
         externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
-        ownedStr: os.envOr("LXL_OWNED_STR", "") == "1", paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1",
-        ownedShared: os.envOr("LXL_OWNED_SHARED", "") == "1"}
+        migrate: os.envOr("LXL_OWNED_STR", "") == "1" || os.envOr("LXL_OWNED_SHARED", "") == "1", legacy: false,
+        paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1"}
     let none: []int = []
     for p in 0..len(PRIM_NAMES) { pg.intern(TK_PRIM, p, 0, false, &none) }
     pg.intern(TK_SELF, 0, 0, false, &none)
@@ -662,7 +663,7 @@ pub fn (pg: mut &Program) fieldTypes(t: int): []int {
 pub fn (pg: mut &Program) isCopy(t: int): bool { return pg.isCopyAt(t, 0) }
 
 // LXL_OWNED_STR: a type copied today that would be owned with str owned.
-pub fn (pg: mut &Program) soft(t: int): bool { return (pg.ownedStr || pg.ownedShared) && pg.isCopyLegacy(t) }
+pub fn (pg: mut &Program) soft(t: int): bool { return pg.migrate && pg.isCopyLegacy(t) }
 
 // A measurement line on stderr: OWNED_STR kind file:line name.
 pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
@@ -730,20 +731,17 @@ fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
 
 // isCopy as if str were counted (LXL_OWNED_STR off): the measurement's "copied today".
 pub fn (pg: mut &Program) isCopyLegacy(t: int): bool {
-    let o = pg.ownedStr
-    let sh = pg.ownedShared
-    pg.ownedStr = false
-    pg.ownedShared = false
+    let o = pg.legacy
+    pg.legacy = true
     let r = pg.isCopyAt(t, 0)
-    pg.ownedStr = o
-    pg.ownedShared = sh
+    pg.legacy = o
     return r
 }
 
 fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     if depth > 5000 { pg.tooDeep() }
     match pg.tk(t) {
-        TK_PRIM { return !(pg.ownedStr && pg.ta(t) == T_STR) }
+        TK_PRIM { return pg.ta(t) != T_STR || pg.legacy }       // str is owned (design/owned-str.md)
         TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
         TK_ARR, TK_SELF { return false }
         TK_TP { return pg.tparams[pg.ta(t)].copy }
@@ -751,7 +749,7 @@ fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     }
     let d = pg.ta(t)
     if !pg.types[d].value || pg.types[d].drop >= 0 { return false }
-    if d == pg.shared && pg.ownedShared { return false }
+    if d == pg.shared && !pg.legacy { return false }      // a Shared handle is owned: share() makes another
     let fts = pg.fieldTypes(t)
     for ft in fts {
         if !pg.isCopyAt(ft, depth + 1) { return false }
@@ -1836,7 +1834,9 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
         }
         if t >= 0 && (pg.tk(t) == TK_ARR || pg.tk(t) == TK_INST) {     // a constant table, or a record/variant constant
             let et = if pg.tk(t) == TK_ARR { pg.ta(t) } else { t }
-            if !pg.isCopy(et) && !pg.soft(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
+            // a constant is static data: a str (or a value built of strings) reads as a view, or as
+            // a new owned value where one is expected, as a literal does (design/owned-str.md)
+            if !pg.isCopyLegacy(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
             pg.consts[c].table = t
             pg.consts[c].value = cv(t, CK_TABLE)
             pg.consts[c].busy = false
