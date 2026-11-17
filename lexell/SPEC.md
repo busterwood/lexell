@@ -1057,7 +1057,7 @@ including `print`, `println`, string formatting and parsing, is in `std`.
 | `swap(mut &a, i, j)` | swap two elements of an array |
 | `replace(mut &p, v)` | store `v` at place `p` and return the old value |
 | `move(x)` | the value of local `x`, which is then moved |
-| `array(n, v)` | `n` copies of the copy value `v` |
+| `array(n, v)` | `n` copies of `v`: copies of a copy value, clones of an owned one (section 4.7) |
 | `withCapacity(n)` | an empty array with room for `n` elements before it grows (`n` rounded up to a power of two; negative stops the program, exit 2); its type is the array type expected where it is used (`var rows: []&str = withCapacity(n)`), so its elements may be views or of any type |
 | `panic(msg)` | print `Lexell: panic: msg` and stop with exit code 12 |
 | `assert(c)` | `panic("assertion failed")` with the line, when `c` is false |
