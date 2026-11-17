@@ -597,8 +597,7 @@ task.Future[int], w: Where)` calls `f.wait(w)`).
 - A value that every task reads and none writes (a router, configuration,
   templates) is an `rc T` (SPEC 4.9): `rc(v)` makes it, `r.share()` gives a
   task its own handle, and reading it may park, because no handle can change
-  it. `task.Frozen` did this before `rc` existed. It is deprecated and stays
-  only until lexdb moves to `rc`.
+  it. (`task.Frozen` did this before `rc` existed; it is gone.)
 - `watchSignals(sigs: &[]int)` starts watching without waiting, so that an
   arrival before the first wait is kept, not lost. Constants: `SIGHUP`,
   `SIGINT`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM` (any signal 1 to 31

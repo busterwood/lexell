@@ -52,6 +52,8 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | V | Issue 13: a local string indexed, sliced or used as a left operand is held while the later operands run (`s[f(mut &s)]` is an error); a string global read as an operand that a later operand may change is snapshotted with a clone. Early exits drop innermost first. `design/experiments/q1_split.lxl` imports lexdb and is migrated with it. | 5c4dd44f | lexdb code with `s[f(mut &s)]`-style expressions stops compiling; write `let i = f(mut &s); s[i]` | drop order on early exits from inside a statement with temporaries |
 
+| W | `task.Frozen` is deleted: use `rc T` (step 7). | (this commit) | no: lexdb_time.lxl uses it | none |
+
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
 need `share()`, and `task.Frozen` goes, so lexdb_time.lxl's three
@@ -162,6 +164,8 @@ until this is done. Do it on the lexdb branch.
    compiler; see the project's lexdb test notes). The quick gate passes. Run
    the lexdb benchmarks against `main` before the merge, and log them as the
    project's benchmark record requires.
-7. **Deprecated `task.Frozen`.** lexdb_time.lxl's three `task.freeze` sites
-   become `rc(...)`, and `Frozen[tz.Zone]` becomes `rc tz.Zone`. Then
-   `task.Frozen` can be deleted from lib/task.lxl (change R).
+7. **`task.Frozen` is gone** (deleted after the merge, change W).
+   lexdb_time.lxl's three `task.freeze(z)` sites become `rc(z)`, and
+   `Option[task.Frozen[tz.Zone]]` becomes `Option[rc tz.Zone]`. Reads that
+   used `fr.read(fn(z: &tz.Zone) { ... })` read the value directly
+   (`z.field`, or pass the handle where a `&tz.Zone` is expected).
