@@ -98,11 +98,13 @@ pub fn copyBCols(cs: &[]BCol): []BCol {
 // ---- the logical plan (design/lexdb-layers.md 4.4.1, step 2e)
 
 // A query as the binder gives it: a tree of logical operators, each with
-// its output columns last. Expressions are as resolve gives them (names
-// resolved, Expr.Col carrying its slot in its operator's input row); the
-// planner's rewrites (aggregates to #agg slots, semi-joins, pushed-down
-// conjuncts, the join order) are not in it. It holds nothing of a run: a
-// Sel keeps it, and the plan cache keeps the Sel.
+// its output columns last ([] in a pass-through operator, whose columns
+// are its input's: lpColumns gives every operator's). Expressions are as
+// resolve gives them (names resolved, Expr.Col carrying its slot in its
+// operator's input row); the planner's rewrites (aggregates to #agg
+// slots, semi-joins, pushed-down conjuncts, the join order) are not in
+// it. It holds nothing of a run: a Sel keeps it, and the plan cache keeps
+// the Sel.
 //
 // Built beside the executor's structures (slice 1: read by nothing):
 // lexdb_exec's buildQuery makes the FROM and WHERE part (Query.lp),
@@ -118,19 +120,20 @@ pub type LPlan = closed {
                                                     // its plan; its columns renamed (alias.column) at their row slots
     Join(int, bool, LPlan, LPlan, []Expr, []BCol)   // lexdb_sql.J_*, LATERAL, left, right, ON (USING's and NATURAL's made); the left's
                                                     // columns then the right's
-    Filter(LPlan, []Expr, []BCol)                   // WHERE (after pullCommonOr) or HAVING; its input's columns
+    Filter(LPlan, []Expr, []BCol)                   // WHERE (after pullCommonOr) or HAVING; [] (its input's columns: lpColumns)
     Agg(LPlan, []Expr, [][]int, int, []BCol)        // GROUP BY's keys (before the planner drops redundant ones), the grouping sets
-                                                    // ([] plain), the aggregates' number; its input's columns (a group's row; the
-                                                    // aggregates are read by #agg slot, as BX.Agg)
-    Window(LPlan, []lexdb_sql.WinDef, []BCol)       // the window calls (named windows merged); its input's columns (the values at
-                                                    // #agg slots after the aggregates')
+                                                    // ([] plain), the aggregates' number; [] (its input's columns: a group's row;
+                                                    // the aggregates are read by #agg slot, as BX.Agg)
+    Window(LPlan, []lexdb_sql.WinDef, []BCol)       // the window calls (named windows merged); [] (its input's columns: the values
+                                                    // at #agg slots after the aggregates')
     Project(LPlan, []Expr, []BCol)                  // the select list, * expanded ([] where the Sel has it: lpLentExprs); the
                                                     // outputs at 0..
-    Distinct(LPlan, []Expr, []BCol)                 // DISTINCT ON's expressions, [] plain DISTINCT; its input's columns
+    Distinct(LPlan, []Expr, []BCol)                 // DISTINCT ON's expressions, [] plain DISTINCT; [] (its input's columns)
     Sort(LPlan, []Expr, []bool, []bool, []BCol)     // ORDER BY's keys (DISTINCT ON's added; [] where the Sel has them:
                                                     // lpLentOrder), descending, NULLs first; read over the Project's
-                                                    // input and outputs (orderValue); its input's columns
-    Limit(LPlan, Option[Expr], Option[Expr], bool, int, []BCol)  // LIMIT/FETCH/TOP's count, OFFSET, WITH TIES, lexdb_sql.TOP_*
+                                                    // input and outputs (orderValue); [] (its input's columns)
+    Limit(LPlan, Option[Expr], Option[Expr], bool, int, []BCol)  // LIMIT/FETCH/TOP's count, OFFSET, WITH TIES, lexdb_sql.TOP_*;
+                                                                 // [] (its input's columns)
     SetOp(int, bool, LPlan, LPlan, []BCol)          // lexdb_sql.SET_*, ALL, left, right; the common types
     Recursive(int, LPlan, LPlan, []BCol)            // a recursive CTE: its number, the anchor, the recursive term
     Match(LPlan, []BCol)                            // MATCH_RECOGNIZE over its input (the plan's MrPlan has the rest)
@@ -138,28 +141,33 @@ pub type LPlan = closed {
 
 pub fn noPlan(): LPlan { return LPlan.One([]) }
 
-// p's output columns, copied.
-pub fn lpCols(p: &LPlan): []BCol {
+// p's output columns. A pass-through operator (Filter, Agg, Window,
+// Distinct, Sort, Limit), whose columns are its input's, holds no list of
+// its own ([]): its input's are its. (One that holds a list gives it.)
+pub fn lpColumns(p: &LPlan): &[]BCol {
     match p {
-        LPlan.One(c) { return copyBCols(&c) }
-        LPlan.Get(_, _, c) { return copyBCols(&c) }
-        LPlan.Values(_, _, c) { return copyBCols(&c) }
-        LPlan.Func(_, _, _, c) { return copyBCols(&c) }
-        LPlan.CteRef(_, _, c) { return copyBCols(&c) }
-        LPlan.Sub(_, _, _, c) { return copyBCols(&c) }
-        LPlan.Join(_, _, _, _, _, c) { return copyBCols(&c) }
-        LPlan.Filter(_, _, c) { return copyBCols(&c) }
-        LPlan.Agg(_, _, _, _, c) { return copyBCols(&c) }
-        LPlan.Window(_, _, c) { return copyBCols(&c) }
-        LPlan.Project(_, _, c) { return copyBCols(&c) }
-        LPlan.Distinct(_, _, c) { return copyBCols(&c) }
-        LPlan.Sort(_, _, _, _, c) { return copyBCols(&c) }
-        LPlan.Limit(_, _, _, _, _, c) { return copyBCols(&c) }
-        LPlan.SetOp(_, _, _, _, c) { return copyBCols(&c) }
-        LPlan.Recursive(_, _, _, c) { return copyBCols(&c) }
-        LPlan.Match(_, c) { return copyBCols(&c) }
+        LPlan.One(c) { return &c }
+        LPlan.Get(_, _, c) { return &c }
+        LPlan.Values(_, _, c) { return &c }
+        LPlan.Func(_, _, _, c) { return &c }
+        LPlan.CteRef(_, _, c) { return &c }
+        LPlan.Sub(_, _, _, c) { return &c }
+        LPlan.Join(_, _, _, _, _, c) { return &c }
+        LPlan.Filter(i, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.Agg(i, _, _, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.Window(i, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.Project(_, _, c) { return &c }
+        LPlan.Distinct(i, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.Sort(i, _, _, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.Limit(i, _, _, _, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
+        LPlan.SetOp(_, _, _, _, c) { return &c }
+        LPlan.Recursive(_, _, _, c) { return &c }
+        LPlan.Match(_, c) { return &c }
     }
 }
+
+// p's output columns, copied.
+pub fn lpCols(p: &LPlan): []BCol { return copyBCols(lpColumns(p)) }
 
 // The lists a SELECT's plan lends its Sel (lexdb_exec's planSelect): where
 // the planner rewrote no part of the select list, the list is the Sel's
