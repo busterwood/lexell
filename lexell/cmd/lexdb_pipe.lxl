@@ -2708,3 +2708,273 @@ pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
         }
     }
 }
+// ---- subqueries' values, IN's sets and hash keys
+//
+// A subquery run once (lexdb_plan.RUN_ONCE) is a value to the plans that
+// read it: a scalar's value, EXISTS's rows, IN's set of its values' keys,
+// keyed (inValKeys) so that a probe (inProbe) finds a value exactly when =
+// would give true. A hash's key parts (keyPart) are made the same way for
+// joins and the hashed subqueries.
+
+// A subquery's value (its caller runs it): its rows, a scalar's value,
+// IN's set (inValKeys' keys; hashed: each after its key's, keyPart), and
+// whether its values are numbers (keyed as numbers) and any is NULL.
+pub type SubVal = record {
+    pub rows: int
+    pub val: Val
+    pub set: Map[str, int]
+    pub numeric: bool
+    pub hasNull: bool
+}
+
+pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(), numeric: false, hasNull: false} }
+
+// A hash key's part: numbers by value (2 = 2.0), else as the value.
+pub fn keyPart(b: mut &StrBuf, v: &Val) {
+    match v {
+        Val.Int(_) {}
+        Val.Num(_) {}
+        else {
+            lexdb_access.encIdxPart(b, v)
+            return
+        }
+    }
+    match lexdb_ops.asNum(v) {
+        Some(d) {
+            b.addByte(3)
+            lexdb_access.encNum(b, &d)
+        }
+        None { lexdb_access.encIdxPart(b, v) }
+    }
+}
+
+// An IN set's key: numbers by value (1 = 1.0), else as the value.
+pub fn setKey(v: &Val, numeric: bool): Option[str] {
+    var kb = newStrBuf()
+    if numeric {
+        match lexdb_ops.asNum(v) {
+            Some(d) {
+                lexdb_access.encNum(mut &kb, &d)
+                return Some(kb.toStr())
+            }
+            None { return None }
+        }
+    }
+    lexdb_access.encIdxPart(mut &kb, v)
+    return Some(kb.toStr())
+}
+
+// A value's class for an IN set's keys: 1 an integer or numeric, 2 a
+// float8 or float4, 10 + its kind a date or time value, 0 the others.
+pub fn inClass(v: &Val): int {
+    match v {
+        Val.Int(_) { return 1 }
+        Val.Num(_) { return 1 }
+        Val.Float(_) { return 2 }
+        Val.Real(_) { return 2 }
+        else {}
+    }
+    let k = lexdb_ops.kindOf(v)
+    if lexdb_sql.isTimeKind(k) { return 10 + k }
+    return 0
+}
+
+// A column type's class (inClass) for its values.
+pub fn typeClass(t: &lexdb_sql.TypeName): int {
+    if t.kind == lexdb_sql.K_INT || t.kind == lexdb_sql.K_NUM { return 1 }
+    if t.kind == lexdb_sql.K_FLOAT { return 2 }
+    if lexdb_sql.isTimeKind(t.kind) { return 10 + t.kind }
+    return 0
+}
+
+// A float compared as = compares one (a float8: -0 as 0, NaN equal to NaN): its key.
+pub fn fKey(f: float): str {
+    if f != f { return "n" }
+    let g = if f == 0.0f { 0.0f } else { f }
+    var b = newStrBuf()
+    lexdb_access.encIdxPart(mut &b, &Val.Float(g))
+    return b.toStr()
+}
+
+// 2^53: every integer up to it is a float8 exactly, and no other float8
+// equals it
+pub const FLOAT_EXACT: float = 9007199254740992.0f
+
+// A float8 that is a whole number within FLOAT_EXACT.
+pub fn wholeF(f: float): bool { return f >= -FLOAT_EXACT && f <= FLOAT_EXACT && float(int(f)) == f }
+
+// An integer, or a numeric of a whole value, within FLOAT_EXACT: a float8
+// equals it exactly when it is that whole number.
+pub fn exactInt(v: &Val): bool {
+    match v {
+        Val.Int(n) { return n >= -9007199254740992 && n <= 9007199254740992 }
+        Val.Num(d) {
+            match lexdb_ops.asFloat(v) {
+                Some(f) {
+                    if !wholeF(f) { return false }
+                    match lexdb_ops.asNum(&Val.Int(int(f))) {
+                        Some(e) { return e.cmp(&d) == 0 }
+                        None { return false }
+                    }
+                }
+                None { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
+pub fn isInstantClass(c: int): bool { return c == 10 + lexdb_sql.K_DATE || c == 10 + lexdb_sql.K_TS || c == 10 + lexdb_sql.K_TSTZ }
+
+// An IN set's keys for its value v, each tagged by what it is equal to,
+// so that a probe (inProbeKeys) finds v exactly when = would give true
+// (compare, compareTime in zone z):
+// - X: the key a value always had (old: an integer or numeric by value
+//   when the set has any, numeric; else as the value; hashed: keyPart),
+//   for integers, numerics and the other values;
+// - a / F / t: a float8, an integer or numeric's (compared with a float),
+//   a float's, a text's that reads as one: = compares as float8 when
+//   either side is a float;
+// - K: a date or time value of its own kind; I: a date, timestamp or
+//   timestamptz's instant in zone z, which = compares across those kinds.
+pub fn inValKeys(v: &Val, numeric: bool, hashed: bool, z: &lexdb_time.Zone, out: mut &[]str) {
+    let c = inClass(v)
+    if c == 2 {
+        match lexdb_ops.asFloat(v) {
+            Some(f) { append(out, "F" + fKey(f)) }
+            None {}
+        }
+        return
+    }
+    if c >= 10 {
+        var b = newStrBuf()
+        lexdb_access.encIdxPart(mut &b, v)
+        append(out, "K" + c.toStr() + ":" + b.toStr())
+        if isInstantClass(c) {
+            match lexdb_ops.asTstz(v, z) {
+                Some(u) { append(out, "I" + c.toStr() + ":" + u.toStr()) }
+                None {}
+            }
+        }
+        return
+    }
+    if hashed {
+        var b = newStrBuf()
+        keyPart(mut &b, v)
+        append(out, "X" + b.toStr())
+    } else {
+        match setKey(v, numeric) {
+            Some(k) { append(out, "X" + k) }
+            None {}
+        }
+    }
+    if c == 1 {
+        // (an integer a float8 holds exactly has none: a float probe
+        // finds it by its own X key, intProbe)
+        if !exactInt(v) {
+            match lexdb_ops.asFloat(v) {
+                Some(f) { append(out, "a" + fKey(f)) }
+                None {}
+            }
+        }
+    } else {
+        match v {
+            Val.Text(_) {
+                match lexdb_ops.asFloat(v) {
+                    Some(f) { append(out, "t" + fKey(f)) }
+                    None {}
+                }
+            }
+            else {}
+        }
+    }
+}
+
+// The keys an IN probe x looks for (inValKeys).
+pub fn inProbeKeys(x: &Val, numeric: bool, hashed: bool, z: &lexdb_time.Zone, out: mut &[]str) {
+    let c = inClass(x)
+    if c == 2 {
+        match lexdb_ops.asFloat(x) {
+            Some(f) {
+                let k = fKey(f)
+                append(out, "F" + k)
+                append(out, "a" + k)
+                append(out, "t" + k)
+                // the integers it equals as a float8: itself, when it is
+                // a whole number a float8 holds exactly (exactInt)
+                if wholeF(f) {
+                    let iv = Val.Int(int(f))
+                    if hashed {
+                        var b = newStrBuf()
+                        keyPart(mut &b, &iv)
+                        append(out, "X" + b.toStr())
+                    } else {
+                        match setKey(&iv, numeric) {
+                            Some(kk) { append(out, "X" + kk) }
+                            None {}
+                        }
+                    }
+                }
+            }
+            None {}
+        }
+        return
+    }
+    if c >= 10 {
+        var b = newStrBuf()
+        lexdb_access.encIdxPart(mut &b, x)
+        append(out, "K" + c.toStr() + ":" + b.toStr())
+        if isInstantClass(c) {
+            match lexdb_ops.asTstz(x, z) {
+                Some(u) {
+                    for k in [lexdb_sql.K_DATE, lexdb_sql.K_TS, lexdb_sql.K_TSTZ] {
+                        if 10 + k != c { append(out, "I" + (10 + k).toStr() + ":" + u.toStr()) }
+                    }
+                }
+                None {}
+            }
+        }
+        return
+    }
+    if hashed {
+        var b = newStrBuf()
+        keyPart(mut &b, x)
+        append(out, "X" + b.toStr())
+    } else {
+        match setKey(x, numeric) {
+            Some(k) { append(out, "X" + k) }
+            None {}
+        }
+    }
+    // an integer or numeric, or a text read as a float8, against floats
+    match x {
+        Val.Int(_) {}
+        Val.Num(_) {}
+        Val.Text(_) {}
+        else { return }
+    }
+    match lexdb_ops.asFloat(x) {
+        Some(f) { append(out, "F" + fKey(f)) }
+        None {}
+    }
+}
+
+// x IN (subquery): true if one equals x, as = compares them; else NULL if
+// x or one is NULL. Each of x's keys (inProbeKeys) looked up: one lookup or
+// a few, whatever the types.
+pub fn inProbe(r: &SubVal, x: &Val, z: &lexdb_time.Zone): Val {
+    if r.rows == 0 { return Val.Bool(false) }
+    if lexdb_ops.isNull(x) { return Val.Null }
+    var ks: []str = []
+    inProbeKeys(x, r.numeric, false, z, mut &ks)
+    for k in ks { if r.set.get(&k).isSome() { return Val.Bool(true) } }
+    return if r.hasNull { Val.Null } else { Val.Bool(false) }
+}
+
+// A subquery's value where call n ("#sub", "#exists", "#in", lexdb_sql's
+// names) reads it; x: IN's value.
+pub fn subValue(n: &str, r: &SubVal, x: &Val, z: &lexdb_time.Zone): Val {
+    if n == "#exists" { return Val.Bool(r.rows > 0) }
+    if n == "#in" { return inProbe(r, x, z) }
+    return r.val
+}

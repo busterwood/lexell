@@ -518,7 +518,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
                 if len(args) < lexdb_bind.subFixed(&name) || i >= len(env.subs) { return Err(e("0A000", "a subquery is not supported here")) }
                 let xv = if name == "#in" { try eval(&args[3], env) } else { Val.Null }
-                return Ok(subValue(&name, &env.subs[i], &xv, &envZone(env)))
+                return Ok(lexdb_pipe.subValue(&name, &env.subs[i].v, &xv, &envZone(env)))
             }
             if name == "#agg" {
                 match args[0] {
@@ -2460,7 +2460,7 @@ fn (rs: mut &Run) limit(l: &Limits) {
 // A subquery's kept result: its rows, its set's and groups' keys.
 fn resBytes(r: &SubRes): int {
     var n = 96 + lexdb_pipe.rowsBytes(&r.data)
-    for i in 0..r.set.size() { n += 48 + len(r.set.keyAt(i)) }
+    for i in 0..r.v.set.size() { n += 48 + len(r.v.set.keyAt(i)) }
     for i in 0..r.groups.size() { n += 48 + len(r.groups.keyAt(i)) }
     n += lexdb_pipe.rowBytes(&r.vals)
     return n
@@ -4633,7 +4633,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     // condition decides
     if p.inSub >= 0 {
         let sc = env.subs[p.inSub].cls
-        if sc != -2 && sc != typeClass(&typ) { return Ok([lexdb_access.wholeScan()]) }
+        if sc != -2 && sc != lexdb_pipe.typeClass(&typ) { return Ok([lexdb_access.wholeScan()]) }
     }
     var vs: []Val = []
     if p.inSub >= 0 {
@@ -5504,7 +5504,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                         let c = lv.hashCols[j]
                         if lexdb_ops.isNull(&r[c]) { nul = true }
                         let hv = if j < len(lv.hashKinds) { collVal(lv.hashKinds[j], &r[c]) } else { r[c] }
-                        if lv.virt() { keyPart(mut &kb, &hv) } else { lexdb_access.encIdxPart(mut &kb, &hv) }
+                        if lv.virt() { lexdb_pipe.keyPart(mut &kb, &hv) } else { lexdb_access.encIdxPart(mut &kb, &hv) }
                     }
                     if nul {
                         // NULL equals nothing; a RIGHT or FULL JOIN still keeps the row
@@ -5704,7 +5704,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     if lv.virt() {
                         let v = try eval(&lv.hashVals[i], &env)
                         if lexdb_ops.isNull(&v) { nul = true }
-                        keyPart(mut &kb, &v)
+                        lexdb_pipe.keyPart(mut &kb, &v)
                     } else {
                         // of the column's type for its bounds: a value it cannot
                         // hold matches no row (optimizer 26 review)
@@ -6054,12 +6054,8 @@ type SubPlan = record {
 
 // A subquery's result: a scalar's value, how many rows, IN's values.
 type SubRes = record {
-    val: Val
-    rows: int
-    set: Map[str, int]
-    numeric: bool               // the values are numbers: keyed as numbers
-    cls: int                    // IN: the values' class (inClass), all the same; -1 mixed, -2 none
-    hasNull: bool
+    v: lexdb_pipe.SubVal        // its rows, a scalar's value, IN's set: what a plan reads of it
+    cls: int                    // IN: the values' class (lexdb_pipe.inClass), all the same; -1 mixed, -2 none
     groups: Map[str, int]       // hashed: key -> 1 rows, 3 rows and a NULL value (IN)
     data: [][]Val               // in FROM: its rows
     vals: []Val                 // IN: its distinct values not NULL, all of them (Path.inSub, inMax); a series: start, stop, step ([] none)
@@ -6072,7 +6068,7 @@ type SubRes = record {
 }
 
 fn emptyRes(): SubRes {
-    return SubRes{val: Val.Null, rows: 0, set: newMap(), numeric: false, cls: -2, hasNull: false, groups: newMap(), data: [], vals: [],
+    return SubRes{v: lexdb_pipe.noSubVal(), cls: -2, groups: newMap(), data: [], vals: [],
                   series: false, sOid: 0, sOrdin: false}
 }
 
@@ -6442,7 +6438,7 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): b
                 outer = lexdb_sql.cloneExpr(&a)
             }
             if !outerOnly(&outer, base) || usesRefs(&inner, base) || hasCorr(&inner) { return false }
-            // a hash compares keys by value (keyPart), which = does only
+            // a hash compares keys by value (lexdb_pipe.keyPart), which = does only
             // for the same kinds of value (semiTypes): a timestamp with a
             // date, a text with an integer, a float with a numeric compare
             // equal as = converts them, and not as keys. The outer value's
@@ -6570,25 +6566,6 @@ fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
     sp.res = replace(mut &hk.res, [])
 }
 
-// A hash key's part: numbers by value (2 = 2.0), else as the value.
-fn keyPart(b: mut &StrBuf, v: &Val) {
-    match v {
-        Val.Int(_) {}
-        Val.Num(_) {}
-        else {
-            lexdb_access.encIdxPart(b, v)
-            return
-        }
-    }
-    match lexdb_ops.asNum(v) {
-        Some(d) {
-            b.addByte(3)
-            lexdb_access.encNum(b, &d)
-        }
-        None { lexdb_access.encIdxPart(b, v) }
-    }
-}
-
 // Runs a hashed subquery once: its keys (a NULL key matches nothing), and
 // for IN its values per key.
 fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
@@ -6596,7 +6573,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
     let sqe = seqEnv(st, txn)
     let res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     var out = emptyRes()
-    out.rows = len(res.rows)
+    out.v.rows = len(res.rows)
     let nk = len(sp.keyOuter)
     if sp.use == lexdb_sql.SUB_SCALAR {
         for r in res.rows {
@@ -6604,7 +6581,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
             var nul = false
             for j in 0..nk {
                 if lexdb_ops.isNull(&r[j]) { nul = true }
-                keyPart(mut &gk, &r[j])
+                lexdb_pipe.keyPart(mut &gk, &r[j])
             }
             if nul { continue }
             out.groups.put(gk.toStr(), len(out.data))
@@ -6619,7 +6596,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
         let noRow: []Val = array(len(sp.sel.q.cols), Val.Null)
         let noSubs: []SubRes = []
         let env = Env{cols: &sp.sel.q.cols, row: &noRow, aggs: &vals, params: params, subs: &noSubs, cur: &noRow, seq: sqe}
-        out.val = try eval(&sp.sel.exprs[nk], &env)
+        out.v.val = try eval(&sp.sel.exprs[nk], &env)
         return Ok(out)
     }
     let z = txn.sql.zone
@@ -6628,7 +6605,7 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
         var nul = false
         for j in 0..nk {
             if lexdb_ops.isNull(&r[j]) { nul = true }
-            keyPart(mut &gk, &r[j])
+            lexdb_pipe.keyPart(mut &gk, &r[j])
         }
         if nul { continue }
         let g = gk.toStr()
@@ -6639,8 +6616,8 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
             } else {
                 let v = collVal(sp.kind, &(try inVal(sp, r[nk], &z)))
                 var ks: []str = []
-                inValKeys(&v, true, true, &z, mut &ks)
-                for k in ks { out.set.put(g + k, 1) }
+                lexdb_pipe.inValKeys(&v, true, true, &z, mut &ks)
+                for k in ks { out.v.set.put(g + k, 1) }
             }
         }
         match out.groups.get(&g) {
@@ -6657,14 +6634,14 @@ fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val, z: &lexdb_time.Zone)
     var miss = false
     for v in keyVals {
         if lexdb_ops.isNull(&v) { miss = true }               // inner = NULL: no row
-        keyPart(mut &gk, &v)
+        lexdb_pipe.keyPart(mut &gk, &v)
     }
     if n == "#sub" {
         // a scalar: its group's value, or the aggregate over no rows
-        if miss { return r.val }
+        if miss { return r.v.val }
         match r.groups.get(&gk.toStr()) {
             Some(i) { return r.data[i][0] }
-            None { return r.val }
+            None { return r.v.val }
         }
     }
     var f = 0
@@ -6677,11 +6654,11 @@ fn hashValue(n: &str, r: &SubRes, keyVals: &[]Val, x: &Val, z: &lexdb_time.Zone)
     if f == 0 { return Val.Bool(false) }            // no rows for it
     if n == "#exists" { return Val.Bool(true) }
     if lexdb_ops.isNull(x) { return Val.Null }
-    // x's keys (inProbeKeys) after the key's
+    // x's keys (lexdb_pipe.inProbeKeys) after the key's
     var ks: []str = []
-    inProbeKeys(x, true, true, z, mut &ks)
+    lexdb_pipe.inProbeKeys(x, true, true, z, mut &ks)
     let g = gk.toStr()
-    for k in ks { if r.set.get(&(g + k)).isSome() { return Val.Bool(true) } }
+    for k in ks { if r.v.set.get(&(g + k)).isSome() { return Val.Bool(true) } }
     return if f == 3 { Val.Null } else { Val.Bool(false) }
 }
 
@@ -6799,8 +6776,8 @@ fn semiAltOk(alt: &SubPlan, sp: &SubPlan): bool {
     return true
 }
 
-// Whether keys of types a and b (OIDs) in a hash (keyPart) match exactly
-// when = says they are equal, and IN's set (setKey): integers and numerics
+// Whether keys of types a and b (OIDs) in a hash (lexdb_pipe.keyPart) match exactly
+// when = says they are equal, and IN's set (lexdb_pipe.setKey): integers and numerics
 // by value, texts and varchars by their text, a few types each with
 // itself. (Not floats: -0 and 0; not intervals: '1 day' and '24 hours'; not
 // char(n): its blanks.)
@@ -7455,7 +7432,7 @@ fn runSemi(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
            i: int): Result[SubRes, DbErr] {
     var res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
     var out = emptyRes()
-    out.rows = len(res.rows)
+    out.v.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
     return Ok(out)
 }
@@ -7503,235 +7480,6 @@ fn subsLast(cs: []Expr): []Expr {
     return first
 }
 
-// An IN set's key: numbers by value (1 = 1.0), else as the value.
-fn setKey(v: &Val, numeric: bool): Option[str] {
-    var kb = newStrBuf()
-    if numeric {
-        match lexdb_ops.asNum(v) {
-            Some(d) {
-                lexdb_access.encNum(mut &kb, &d)
-                return Some(kb.toStr())
-            }
-            None { return None }
-        }
-    }
-    lexdb_access.encIdxPart(mut &kb, v)
-    return Some(kb.toStr())
-}
-
-// A value's class for an IN set's keys: 1 an integer or numeric, 2 a
-// float8 or float4, 10 + its kind a date or time value, 0 the others.
-fn inClass(v: &Val): int {
-    match v {
-        Val.Int(_) { return 1 }
-        Val.Num(_) { return 1 }
-        Val.Float(_) { return 2 }
-        Val.Real(_) { return 2 }
-        else {}
-    }
-    let k = lexdb_ops.kindOf(v)
-    if lexdb_sql.isTimeKind(k) { return 10 + k }
-    return 0
-}
-
-// A column type's class (inClass) for its values.
-fn typeClass(t: &lexdb_sql.TypeName): int {
-    if t.kind == lexdb_sql.K_INT || t.kind == lexdb_sql.K_NUM { return 1 }
-    if t.kind == lexdb_sql.K_FLOAT { return 2 }
-    if lexdb_sql.isTimeKind(t.kind) { return 10 + t.kind }
-    return 0
-}
-
-// A float compared as = compares one (a float8: -0 as 0, NaN equal to NaN): its key.
-fn fKey(f: float): str {
-    if f != f { return "n" }
-    let g = if f == 0.0f { 0.0f } else { f }
-    var b = newStrBuf()
-    lexdb_access.encIdxPart(mut &b, &Val.Float(g))
-    return b.toStr()
-}
-
-// 2^53: every integer up to it is a float8 exactly, and no other float8
-// equals it
-const FLOAT_EXACT: float = 9007199254740992.0f
-
-// A float8 that is a whole number within FLOAT_EXACT.
-fn wholeF(f: float): bool { return f >= -FLOAT_EXACT && f <= FLOAT_EXACT && float(int(f)) == f }
-
-// An integer, or a numeric of a whole value, within FLOAT_EXACT: a float8
-// equals it exactly when it is that whole number.
-fn exactInt(v: &Val): bool {
-    match v {
-        Val.Int(n) { return n >= -9007199254740992 && n <= 9007199254740992 }
-        Val.Num(d) {
-            match lexdb_ops.asFloat(v) {
-                Some(f) {
-                    if !wholeF(f) { return false }
-                    match lexdb_ops.asNum(&Val.Int(int(f))) {
-                        Some(e) { return e.cmp(&d) == 0 }
-                        None { return false }
-                    }
-                }
-                None { return false }
-            }
-        }
-        else { return false }
-    }
-}
-
-fn isInstantClass(c: int): bool { return c == 10 + lexdb_sql.K_DATE || c == 10 + lexdb_sql.K_TS || c == 10 + lexdb_sql.K_TSTZ }
-
-// An IN set's keys for its value v, each tagged by what it is equal to,
-// so that a probe (inProbeKeys) finds v exactly when = would give true
-// (compare, compareTime in zone z):
-// - X: the key a value always had (old: an integer or numeric by value
-//   when the set has any, numeric; else as the value; hashed: keyPart),
-//   for integers, numerics and the other values;
-// - a / F / t: a float8, an integer or numeric's (compared with a float),
-//   a float's, a text's that reads as one: = compares as float8 when
-//   either side is a float;
-// - K: a date or time value of its own kind; I: a date, timestamp or
-//   timestamptz's instant in zone z, which = compares across those kinds.
-fn inValKeys(v: &Val, numeric: bool, hashed: bool, z: &lexdb_time.Zone, out: mut &[]str) {
-    let c = inClass(v)
-    if c == 2 {
-        match lexdb_ops.asFloat(v) {
-            Some(f) { append(out, "F" + fKey(f)) }
-            None {}
-        }
-        return
-    }
-    if c >= 10 {
-        var b = newStrBuf()
-        lexdb_access.encIdxPart(mut &b, v)
-        append(out, "K" + c.toStr() + ":" + b.toStr())
-        if isInstantClass(c) {
-            match lexdb_ops.asTstz(v, z) {
-                Some(u) { append(out, "I" + c.toStr() + ":" + u.toStr()) }
-                None {}
-            }
-        }
-        return
-    }
-    if hashed {
-        var b = newStrBuf()
-        keyPart(mut &b, v)
-        append(out, "X" + b.toStr())
-    } else {
-        match setKey(v, numeric) {
-            Some(k) { append(out, "X" + k) }
-            None {}
-        }
-    }
-    if c == 1 {
-        // (an integer a float8 holds exactly has none: a float probe
-        // finds it by its own X key, intProbe)
-        if !exactInt(v) {
-            match lexdb_ops.asFloat(v) {
-                Some(f) { append(out, "a" + fKey(f)) }
-                None {}
-            }
-        }
-    } else {
-        match v {
-            Val.Text(_) {
-                match lexdb_ops.asFloat(v) {
-                    Some(f) { append(out, "t" + fKey(f)) }
-                    None {}
-                }
-            }
-            else {}
-        }
-    }
-}
-
-// The keys an IN probe x looks for (inValKeys).
-fn inProbeKeys(x: &Val, numeric: bool, hashed: bool, z: &lexdb_time.Zone, out: mut &[]str) {
-    let c = inClass(x)
-    if c == 2 {
-        match lexdb_ops.asFloat(x) {
-            Some(f) {
-                let k = fKey(f)
-                append(out, "F" + k)
-                append(out, "a" + k)
-                append(out, "t" + k)
-                // the integers it equals as a float8: itself, when it is
-                // a whole number a float8 holds exactly (exactInt)
-                if wholeF(f) {
-                    let iv = Val.Int(int(f))
-                    if hashed {
-                        var b = newStrBuf()
-                        keyPart(mut &b, &iv)
-                        append(out, "X" + b.toStr())
-                    } else {
-                        match setKey(&iv, numeric) {
-                            Some(kk) { append(out, "X" + kk) }
-                            None {}
-                        }
-                    }
-                }
-            }
-            None {}
-        }
-        return
-    }
-    if c >= 10 {
-        var b = newStrBuf()
-        lexdb_access.encIdxPart(mut &b, x)
-        append(out, "K" + c.toStr() + ":" + b.toStr())
-        if isInstantClass(c) {
-            match lexdb_ops.asTstz(x, z) {
-                Some(u) {
-                    for k in [lexdb_sql.K_DATE, lexdb_sql.K_TS, lexdb_sql.K_TSTZ] {
-                        if 10 + k != c { append(out, "I" + (10 + k).toStr() + ":" + u.toStr()) }
-                    }
-                }
-                None {}
-            }
-        }
-        return
-    }
-    if hashed {
-        var b = newStrBuf()
-        keyPart(mut &b, x)
-        append(out, "X" + b.toStr())
-    } else {
-        match setKey(x, numeric) {
-            Some(k) { append(out, "X" + k) }
-            None {}
-        }
-    }
-    // an integer or numeric, or a text read as a float8, against floats
-    match x {
-        Val.Int(_) {}
-        Val.Num(_) {}
-        Val.Text(_) {}
-        else { return }
-    }
-    match lexdb_ops.asFloat(x) {
-        Some(f) { append(out, "F" + fKey(f)) }
-        None {}
-    }
-}
-
-// x IN (subquery): true if one equals x, as = compares them; else NULL if
-// x or one is NULL. Each of x's keys (inProbeKeys) looked up: one lookup or
-// a few, whatever the types.
-fn inProbe(r: &SubRes, x: &Val, z: &lexdb_time.Zone): Val {
-    if r.rows == 0 { return Val.Bool(false) }
-    if lexdb_ops.isNull(x) { return Val.Null }
-    var ks: []str = []
-    inProbeKeys(x, r.numeric, false, z, mut &ks)
-    for k in ks { if r.set.get(&k).isSome() { return Val.Bool(true) } }
-    return if r.hasNull { Val.Null } else { Val.Bool(false) }
-}
-
-fn subValue(n: &str, r: &SubRes, x: &Val, z: &lexdb_time.Zone): Val {
-    if n == "#exists" { return Val.Bool(r.rows > 0) }
-    if n == "#in" { return inProbe(r, x, z) }
-    return r.val
-}
-
 fn addCounts(a: mut &[]lexdb_pipe.Counts, b: &[]lexdb_pipe.Counts) {
     if len(a) == 0 {
         for c in b { append(a, c) }
@@ -7769,13 +7517,13 @@ fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
         let at = cacheAt(&parent.cache, &key)
         if at >= 0 {
             out.data = copyRows(&parent.cache.rows[at])
-            out.rows = len(out.data)
+            out.v.rows = len(out.data)
             parent.stats[i].hits += 1
             return Ok(out)
         }
     }
     var res = try runChild(st, txn, &sp.sel, params, -1, parent, i)
-    out.rows = len(res.rows)
+    out.v.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
     if sp.cte >= 0 {
         try parent.bud.hold(lexdb_pipe.rowsBytes(&out.data))
@@ -8001,35 +7749,35 @@ fn runSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, param
         for k in 0..len(res.rows) { res.rows[k][0] = try inVal(sp, replace(mut &res.rows[k][0], Val.Null), &rz) }
     }
     var out = emptyRes()
-    out.rows = len(res.rows)
+    out.v.rows = len(res.rows)
     if sp.use == lexdb_sql.SUB_SCALAR {
         if len(res.rows) > 1 { return Err(e("21000", "more than one row returned by a subquery used as an expression")) }
-        if len(res.rows) == 1 { out.val = res.rows[0][0] }
+        if len(res.rows) == 1 { out.v.val = res.rows[0][0] }
     } else if sp.use == lexdb_sql.SUB_IN {
-        // the values' class (inClass), all the same or -1 (pathScans);
-        // numbers by value when any is an integer or numeric (setKey)
+        // the values' class (lexdb_pipe.inClass), all the same or -1 (pathScans);
+        // numbers by value when any is an integer or numeric (lexdb_pipe.setKey)
         for r in res.rows {
             if lexdb_ops.isNull(&r[0]) { continue }
-            let c = inClass(&r[0])
+            let c = lexdb_pipe.inClass(&r[0])
             if out.cls == -2 { out.cls = c } else if out.cls != c { out.cls = -1 }
             match r[0] {
-                Val.Int(_) { out.numeric = true }
-                Val.Num(_) { out.numeric = true }
+                Val.Int(_) { out.v.numeric = true }
+                Val.Num(_) { out.v.numeric = true }
                 else {}
             }
         }
         let z = txn.sql.zone
         for r in res.rows {
             if lexdb_ops.isNull(&r[0]) {
-                out.hasNull = true
+                out.v.hasNull = true
                 continue
             }
             let v = collVal(sp.kind, &r[0])
             var ks: []str = []
-            inValKeys(&v, out.numeric, false, &z, mut &ks)
+            lexdb_pipe.inValKeys(&v, out.v.numeric, false, &z, mut &ks)
             if len(ks) == 0 { continue }
-            if out.set.get(&ks[0]).isNone() { append(mut &out.vals, v) }
-            for k in ks { out.set.put(k, 1) }
+            if out.v.set.get(&ks[0]).isNone() { append(mut &out.vals, v) }
+            for k in ks { out.v.set.put(k, 1) }
         }
     }
     return Ok(out)
@@ -8084,14 +7832,14 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             }
             if at >= 0 {
                 rs.stats[i].hits += 1
-                cur[i] = subValue(&n, &rs.memoRes[i][at], &xv, &envZone(env))
+                cur[i] = lexdb_pipe.subValue(&n, &rs.memoRes[i][at].v, &xv, &envZone(env))
                 return Ok(Unit{})
             }
             var ps: []Val = []
             for j in 0..q.base { append(mut &ps, env.params[j]) }
             for v in refVals { append(mut &ps, v) }
             let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
-            cur[i] = subValue(&n, &r, &xv, &envZone(env))
+            cur[i] = lexdb_pipe.subValue(&n, &r.v, &xv, &envZone(env))
             if len(rs.memoRes[i]) < MEMO_MAX {
                 try rs.bud.hold(resBytes(&r) + len(key) + 48)
                 rs.memo[i].put(key, len(rs.memoRes[i]))
@@ -14967,7 +14715,7 @@ fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Resul
 // A row's key for UNION and the like (NULLs alike; 2 = 2.0).
 fn rowKey(vs: &[]Val): str {
     var kb = newStrBuf()
-    for v in vs { keyPart(mut &kb, &v) }
+    for v in vs { lexdb_pipe.keyPart(mut &kb, &v) }
     return kb.toStr()
 }
 
@@ -15037,7 +14785,7 @@ fn outRefKind(x: &Expr, outs: &[]OutCol): int {
 // rowKey with its columns' collations (L2).
 fn rowKeyIn(vs: &[]Val, kinds: &[]int): str {
     var kb = newStrBuf()
-    for i in 0..len(vs) { keyPart(mut &kb, &(if i < len(kinds) { collVal(kinds[i], &vs[i]) } else { vs[i] })) }
+    for i in 0..len(vs) { lexdb_pipe.keyPart(mut &kb, &(if i < len(kinds) { collVal(kinds[i], &vs[i]) } else { vs[i] })) }
     return kb.toStr()
 }
 
@@ -21463,7 +21211,7 @@ fn bChoose(conds: &[]BNode, b: &Batch): Option[[]int] {
 // counted as it counts them. A batch on one of whose rows a key or a
 // condition gives an error: the row path reads it.
 
-const JK_GEN = 0        // a join's key looked up as the row path does (keyVal, encIdxPart or keyPart, Mats.keys)
+const JK_GEN = 0        // a join's key looked up as the row path does (keyVal, encIdxPart or lexdb_pipe.keyPart, Mats.keys)
 const JK_INT = 1        // one integer key: in a map of its own
 const JK_TEXT = 2       // one text key (text or varchar, no collation): in a map of its own, by its text
 const JK_IKEYS = 3      // a semi-join's one integer key (semiIntKey): materialize's map, Mats.ikeys
@@ -21637,7 +21385,7 @@ fn bJoinPlan(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, m: &Mats,
             if len(key) != 1 || keyTyp[0] != lexdb_pipe.BT_INT { return Ok(None) }
             mode = JK_IKEYS
         }
-        // (a semi-join's rows are keyed by value, keyPart: an integer's key
+        // (a semi-join's rows are keyed by value, lexdb_pipe.keyPart: an integer's key
         // is its value's, a text's its text, as these maps take them; a
         // "<>" summary keeps no rows, so its key is looked up in Mats.keys)
         if !ik && !lv.resNot && len(key) == 1 && (!lv.virt() || lv.semi) && exact && keyTyp[0] == lexdb_pipe.BT_INT && rkinds[hc] == BK_INT {
@@ -21990,7 +21738,7 @@ fn bProbe(q: &Query, m: &Mats, jp: &JPlan, jl: &JLevel, j: &Batch, z: &lexdb_tim
                 }
                 if lv.virt() {
                     if lexdb_ops.isNull(&v) { nul = true }
-                    keyPart(mut &kb, &v)
+                    lexdb_pipe.keyPart(mut &kb, &v)
                 } else {
                     match keyVal(v, &boundType(&lv.t.cols[lv.hashCols[i]].typ), z) {
                         Ok(got) {
