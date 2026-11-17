@@ -227,13 +227,25 @@ pub type PScan = record {
 pub const JH_HASH: int = 0      // once, its rows hashed by its key columns, probed by the outer rows' keys
 pub const JH_LOOK: int = 1      // per outer row, by its whole primary key (the keys: its columns' values)
 pub const JH_RANGE: int = 2     // per outer row, the range of its path's leading equalities (the keys), then its bounds
+pub const JH_ROWS: int = 3      // once, the rows of a subquery (its run's) hashed by its key columns (slice P2b)
+
+// What a join gives (PJoin.mark): the joined rows, or the outer rows
+// once each that have a match (semi) or none (anti).
+pub const MK_JOIN: int = 0
+pub const MK_SEMI: int = 1
+pub const MK_ANTI: int = 2
 
 // A table joined to the rows below it (slice P2; design/lexdb-layers.md
-// 6.2.3), an inner or LEFT join. Its expressions are bound over the
+// 6.2.3), an inner, LEFT or RIGHT join, or a semi or anti join. Its expressions are bound over the
 // query's columns; its keys read only the tables before it.
 pub type PJoin = record {
     pub how: int
-    pub kind: int               // lexdb_sql.J_INNER (a CROSS JOIN's too) or J_LEFT
+    pub kind: int               // lexdb_sql.J_INNER (a CROSS JOIN's too), J_LEFT or J_RIGHT (a hash's: its rows that join nothing after the rest)
+    pub mark: int               // MK_*
+    // a semi or anti join's "inner <> outer" kept as a summary per key (no
+    // rows): its column (the table's; -1 none) and the outer value
+    pub resCol: int
+    pub res: []lexdb_bind.BX
     pub scan: PScan             // its table: level, first slot, kinds, the columns decoded (needs)
     pub build: []lexdb_bind.BX  // JH_HASH: the conditions on its own columns, applied as its rows are read
     pub hcols: []int            // JH_HASH: its key columns (the table's)
@@ -249,6 +261,7 @@ pub type PJoin = record {
     pub index: int              // JH_RANGE: the path's index (-1 the primary key)
     pub rng: []PBound           // JH_RANGE: its bounds on the column after the equalities (constants of the run)
     pub capNulls: bool          // JH_RANGE: an index's range leaves out its next column's NULLs
+    pub noNulls: bool           // JH_RANGE: the path's (Path.noNulls), for a range read in pieces
 }
 
 // A range's bound: ">", ">=", "<" or "<=" its value.
@@ -317,6 +330,8 @@ fn planUses(p: &PPlan, used: mut &[]bool) {
             for x in j.conds { uses(&x, used) }
             for x in j.post { uses(&x, used) }
             for c in j.hcols { if j.scan.first + c < len(used) { used[j.scan.first + c] = true } }
+            for x in j.res { uses(&x, used) }
+            if j.resCol >= 0 && j.scan.first + j.resCol < len(used) { used[j.scan.first + j.resCol] = true }
         }
         PPlan.Filter(i, cs) {
             planUses(&i, used)

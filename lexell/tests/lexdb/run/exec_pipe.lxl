@@ -47,7 +47,11 @@
 // output or a call, before and past a LIMIT (a chunk with an error is
 // joined again row by row, as the row engine); in a transaction with
 // its own writes; parameters; max_statement_mem; EXPLAIN ANALYZE's
-// counts.
+// counts. Semi and anti joins (slice P2b): EXISTS, NOT EXISTS, IN and NOT
+// IN (NULLs in the set, an empty set) by a hash of the subquery's rows, a
+// range per row with a filter, a summary of "inner <> outer"; RIGHT
+// joins (the rows that joined nothing after the scan).
+// timeout: 120
 // expect: committed: 500 queries, 500 the same both ways
 // expect: in a transaction: 120 queries, 120 the same both ways
 // expect: fixed: 30 queries, 30 the same both ways
@@ -74,6 +78,9 @@
 // expect: join parameters: 12 of 12 the same
 // expect: join memory: ERROR 53200 | ERROR 53200; under it: true
 // expect: join counts: 10 of 10 the same
+// expect: semi and anti joins: 300 queries, 300 the same both ways
+// expect: semi, anti and right fixed: 12 queries, 12 the same both ways
+// expect: semi, anti and right counts: 6 of 6 the same
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -730,6 +737,31 @@ fn joinQ(r: mut &lexdb_base.Rng, safe: bool): str {
     return sql
 }
 
+// A random semi or anti join over f (slice P2b): EXISTS, NOT EXISTS, IN
+// and NOT IN conjuncts of WHERE (a hash of the subquery's rows, a range
+// looked up per row, a summary of "inner <> outer"), rows or an aggregate.
+fn semiQ(r: mut &lexdb_base.Rng, safe: bool): str {
+    let semis = ["exists (select 1 from d where d.dk = f.x)", "not exists (select 1 from d where d.dk = f.x and d.dz = 2)",
+                 "f.z in (select k from g)", "f.z not in (select k from g)", "f.z not in (select k from g where k is not null)",
+                 "f.tx in (select t from g)", "exists (select 1 from h where h.hk = f.x and h.hz > f.id)", "not exists (select 1 from h where h.hk = f.x)",
+                 "exists (select 1 from d where d.dk = f.x and d.dz <> f.z)", "not exists (select 1 from d where d.dk = f.x and d.dz <> f.z)",
+                 "f.x in (select dk from d where dn > 100)", "exists (select * from e where e.k = f.z)", "not exists (select 1 from e where e.k = f.z)",
+                 "f.dt in (select d from g)", "exists (select 1 from h where h.hk = f.x and h.ht = 'H2')"]
+    var conds: []str = []
+    append(mut &conds, pick(r, &semis))
+    if r.below(3) == 0 { append(mut &conds, pick(r, &semis)) }
+    for i in 0..r.below(2) { append(mut &conds, cond(r, safe)) }
+    if r.below(3) == 0 {
+        let k = pick(r, &["z", "tx", "bo"])
+        return "select " + k + ", count(*), sum(x) from f where " + strings.join(&conds, " and ") + " group by 1 order by 1"
+    }
+    var items: []str = []
+    for i in 0..(1 + r.below(3)) { append(mut &items, pick(r, &["id", "x", "z", "tx", "nu", "dt"])) }
+    var sql = "select " + strings.join(&items, ", ") + " from f where " + strings.join(&conds, " and ")
+    if r.below(4) == 0 { sql = sql + " limit " + pick(r, &["1", "5", "300"]) }
+    return sql
+}
+
 // Joins (slice P2), both ways.
 fn joins(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     let c1 = q(s, &"create table d (dk int primary key, dz int, dtx text, dn numeric(10,2))")
@@ -816,4 +848,29 @@ fn joins(s: mut &lexdb_exec.Session, r: mut &lexdb_base.Rng) {
     var sameC = 0
     for sql in shapes { if sameCounts(s, &sql) { sameC += 1 } }
     println("join counts: " + sameC.toStr() + " of " + len(shapes).toStr() + " the same")
+    // semi and anti joins, RIGHT joins (slice P2b)
+    var sameS = 0
+    for i in 0..300 {
+        let sql = semiQ(r, i % 3 != 0)
+        if both(s, &sql) { sameS += 1 }
+    }
+    println("semi and anti joins: 300 queries, " + sameS.toStr() + " the same both ways")
+    let fixed2 = ["select id from f where exists (select 1 from d where d.dk = f.x) and f.x / (f.z - 3) > 0 limit 2",
+                  "select id, x / (z - 3) from f where f.z in (select k from g) limit 3", "select id from f where f.z not in (select k from g)",
+                  "select count(*) from f where f.x not in (select dk from d)", "select count(*) from f where f.x not in (select dz from d)",
+                  "select id from f where exists (select 1 from h where h.hk = f.x and h.hz > f.id) and id < 300",
+                  "select z, count(*) from f where not exists (select 1 from d where d.dk = f.x and d.dz <> f.z) group by z order by 1",
+                  "select f.id, d.dk from d right join f on f.x = d.dk where f.id < 300", "select d.dz, count(f.id) from f right join d on d.dk = f.x group by d.dz order by 1",
+                  "select d.dk, f.id from f right join d on d.dk = f.x and f.z = 1 where d.dk < 40", "select count(*) from e right join f on f.z = e.k",
+                  "select g.k, f.id from f right join g on g.k = f.x where f.id is null"]
+    var sameF2 = 0
+    for sql in fixed2 { if both(s, &sql) { sameF2 += 1 } }
+    println("semi, anti and right fixed: " + len(fixed2).toStr() + " queries, " + sameF2.toStr() + " the same both ways")
+    let shapes2 = ["select id from f where exists (select 1 from d where d.dk = f.x)", "select id from f where f.z not in (select k from g where k is not null)",
+                   "select count(*) from f where exists (select 1 from h where h.hk = f.x and h.hz > f.id)",
+                   "select z, count(*) from f where not exists (select 1 from d where d.dk = f.x and d.dz <> f.z) group by z",
+                   "select f.id, d.dk from d right join f on f.x = d.dk", "select d.dz, count(f.id) from f right join d on d.dk = f.x group by d.dz"]
+    var sameC2 = 0
+    for sql in shapes2 { if sameCounts(s, &sql) { sameC2 += 1 } }
+    println("semi, anti and right counts: " + sameC2.toStr() + " of " + len(shapes2).toStr() + " the same")
 }

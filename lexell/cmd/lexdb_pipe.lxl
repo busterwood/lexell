@@ -2433,7 +2433,10 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
                 spare = b
                 continue
             }
-            if !(try ag.eat(&b, &idx)) { return Ok(None) }
+            if !(try ag.eat(mut &b, &idx)) { return Ok(None) }
+            // (the columns the calls' generic steps added dropped)
+            while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
+            while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
             spare = b
         }
     }
@@ -2455,6 +2458,7 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
 type AggSt = record {
     keys: []BComp
     specs: []BSpec
+    gens: []Option[BGen]    // per call: its argument by the generic step (its values a column added per batch: vcol)
     kinds: []int            // per column of the batches eaten
     fcols: []int            // a group's first row's columns kept
     fv: []Val
@@ -2496,6 +2500,7 @@ fn aggState(a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef, kinds: &[]int, need:
         append(mut &keys, cc)
     }
     var specs: []BSpec = []
+    var gens: []Option[BGen] = []
     for c in a.calls {
         let f = c.fname
         let kind = if c.star { BA_STAR } else if f == "count" { BA_COUNT } else if f == "sum" { BA_SUM } else if f == "avg" { BA_AVG }
@@ -2503,6 +2508,43 @@ fn aggState(a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef, kinds: &[]int, need:
         var arg: Option[BNode] = None
         var vcol = -1
         var dsc = -1
+        var gen: Option[BGen] = None
+        match c.arg {
+            Some(bx) {
+                let got = bCompileD(&bx, cols, kinds, cx, 0, dec)
+                let other = match got {
+                    Some(cc) { kind != BA_COUNT && !isDecT(cc.typ) && cc.typ != BT_INT && bValCol(&bx, kinds, 0) < 0 }
+                    None { true }
+                }
+                if other && (kind == BA_SUM || kind == BA_MIN || kind == BA_MAX) {
+                    // an argument the kernels do not evaluate (q14's CASE of a
+                    // LIKE): its values by the generic step, added as the
+                    // row engine's accumulate adds them
+                    match bGenOf(&bx, kinds, 0, need, cx) {
+                        Some(g) { gen = Some(g) }
+                        None { return None }
+                    }
+                }
+            }
+            None {}
+        }
+        if gen.isSome() {
+            var filt: Option[BNode] = None
+            match c.filter {
+                Some(fx) {
+                    let got = bCompileD(&fx, cols, kinds, cx, 0, dec)
+                    if got.isNone() { return None }
+                    let cc = got.unwrap()
+                    if !boolLike(cc.typ) { return None }
+                    filt = Some(takeN(cc))
+                }
+                None {}
+            }
+            append(mut &specs, BSpec{kind: kind, arg: None, filter: filt, vcol: -2, dsc: -1})
+            append(mut &gens, gen)
+            continue
+        }
+        append(mut &gens, None)
         match c.arg {
             Some(bx) {
                 let got = bCompileD(&bx, cols, kinds, cx, 0, dec)
@@ -2542,7 +2584,7 @@ fn aggState(a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef, kinds: &[]int, need:
     var fcols: []int = []
     for i in 0..len(need) { if need[i] && i < len(a.keep) && a.keep[i] { append(mut &fcols, i) } }
     let ns = len(specs)
-    var ag = AggSt{keys: keys, specs: specs, kinds: collections.copyOf(kinds), fcols: fcols, fv: [], ngroups: 0,
+    var ag = AggSt{keys: keys, specs: specs, gens: gens, kinds: collections.copyOf(kinds), fcols: fcols, fv: [], ngroups: 0,
                    an: [], asum: [], amm: [], aval: [], adec: [], byInt: newMap(), byKey: newMap(), byText: newMap(), nullGroup: -1,
                    oneKey: false, sorted: false, lastKey: 0, lastG: -1, textCol: -1, added: 0, room: room, maxHeld: maxHeld}
     for i in 0..ns {
@@ -2586,7 +2628,7 @@ fn (ag: mut &AggSt) newGroup() {
 // b's rows idx into their groups (new groups made in the rows' order),
 // each call's state added to. false: the batches give way (a text key not
 // a text).
-fn (ag: mut &AggSt) eat(b: &Batch, idx: &[]int): Result[bool, DbErr] {
+fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
     let nc = len(idx)
     let ns = len(ag.specs)
     var gid: []int = array(nc, 0)
@@ -2670,7 +2712,21 @@ fn (ag: mut &AggSt) eat(b: &Batch, idx: &[]int): Result[bool, DbErr] {
     }
     // the calls: per call its rows (FILTER), its argument's values, one loop
     let one = len(ag.keys) == 0
-    let specs = replace(mut &ag.specs, [])
+    var specs = replace(mut &ag.specs, [])
+    for si in 0..len(specs) {
+        match ag.gens[si] {
+            Some(g) {
+                match bGenVals(&g, b, idx) {
+                    Ok(vs) { specs[si].vcol = bAddVals(b, idx, vs) }
+                    Err(x) {
+                        ag.specs = specs
+                        return Err(x)
+                    }
+                }
+            }
+            None {}
+        }
+    }
     let got = ag.accum(&specs, b, idx, &gid, one)
     ag.specs = specs
     try got
@@ -3233,6 +3289,17 @@ type JL = record {
     index: int
     bp: BPlan               // a lookup's or range's columns read
     perRow: int             // a range's rows' bytes each, held while joined
+    mark: int               // lexdb_plan.MK_*
+    los: []Val              // a range's bounds after its equalities, as values (rangeOne)
+    his: []Val
+    noNulls: bool
+    right: bool             // a RIGHT JOIN's: its rows that joined are noted (JState.seen)
+    raw: bool               // a subquery's rows: keys by their values' own encoding (keyPart), not coerced
+    resCol: int             // a "<>" summary's column (-1 none): mixed, single per bucket; res its outer value
+    mixed: []bool
+    single: []Val
+    res: BNode
+    resTyp: int
 }
 
 fn newJL(how: int, level: int, first: int, ncol: int): JL {
@@ -3240,7 +3307,7 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               mode: JK_GEN, ints: newMap(), txts: newMap(), gens: newMap(), head: [], next: [], rows: lexdb_rows.noRows(),
               conds: [], creads: [], post: [], preads: [], ktypes: [], tail: lexdb_access.noTail(), noRange: false, index: -1,
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
-              perRow: 0}
+              perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -3319,8 +3386,12 @@ fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool):
             if k < 0 { return -1 }
             let sc = &j.scan
             if len(sc.kinds) != len(cols) || sc.first < 0 || sc.first + len(sc.need) > len(cols) { return -1 }
-            if j.kind != lexdb_sql.J_INNER && j.kind != lexdb_sql.J_LEFT { return -1 }
-            if j.how == lexdb_plan.JH_HASH {
+            if j.kind != lexdb_sql.J_INNER && j.kind != lexdb_sql.J_LEFT && j.kind != lexdb_sql.J_RIGHT { return -1 }
+            let hash = j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS
+            if j.kind == lexdb_sql.J_RIGHT && (!hash || j.mark != lexdb_plan.MK_JOIN) { return -1 }
+            if j.mark != lexdb_plan.MK_JOIN && j.kind != lexdb_sql.J_INNER { return -1 }
+            if j.resCol >= 0 && (!hash || len(j.res) != 1 || !allIn(&j.res, avail)) { return -1 }
+            if hash {
                 if len(j.hcols) == 0 || len(j.hcols) != len(j.keys) || len(j.ktypes) != len(j.keys) || !j.exact { return -1 }
                 for c in j.hcols { if c < 0 || c >= len(sc.need) || !sc.need[c] { return -1 } }
                 // its own conditions read its own columns only
@@ -3342,7 +3413,7 @@ fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool):
         lexdb_plan.PPlan.Filter(i, cs) {
             match i {
                 lexdb_plan.PPlan.Scan(sc, subs) {
-                    if !scanRuns(&sc, &subs, cols) || !sc.batch { return -1 }
+                    if !joinRuns1(&sc, &subs, cols) || !sc.batch { return -1 }
                     for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
                     if !allIn(&cs, avail) { return -1 }
                     return 1
@@ -3351,7 +3422,7 @@ fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool):
             }
         }
         lexdb_plan.PPlan.Scan(sc, subs) {
-            if !scanRuns(&sc, &subs, cols) || !sc.batch { return -1 }
+            if !joinRuns1(&sc, &subs, cols) || !sc.batch { return -1 }
             for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
             return 1
         }
@@ -3364,6 +3435,18 @@ fn allIn1(x: &BX, avail: &[]bool): bool {
     readsOf1(x, mut &rs)
     for c in rs { if c < 0 || c >= len(avail) || !avail[c] { return false } }
     return true
+}
+
+// scanRuns for a join plan's first table: its subqueries run once (their
+// values in the run's context), or a semi or anti join's (run once, its
+// rows a level's: RUN_SEMI; or not run: RUN_LOOKED), or in FROM (its
+// rows a level's).
+fn joinRuns1(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
+    for s in subs {
+        let ok = s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_LOOKED || (s.run == lexdb_plan.RUN_ONCE)
+        if !ok { return false }
+    }
+    return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
 }
 
 // Whether every expression of xs reads only columns avail holds.
@@ -3630,11 +3713,22 @@ fn gatherAt(jr: &JRun, cur: &[]Batch, at: &[][]int, n: int, reads: &[]int): Batc
         let o = jr.owner[c]
         if o < 0 || o >= len(at) { continue }
         let jl = &jr.jls[o]
-        if jl.how == lexdb_plan.JH_HASH { bGather(&jl.rows, c - jl.first, jr.kinds[c], &at[o], mut &w, c) }
-        else { bGather(&cur[o], c - jl.first, jr.kinds[c], &at[o], mut &w, c) }
+        let src = if hashed(jl) { &jl.rows } else { &cur[o] }
+        if c - jl.first >= len(src.cols) {
+            // (no rows of it: a RIGHT JOIN's unmatched rows' tables before it)
+            var col = lexdb_rows.bvec(n)
+            for p in 0..n { col.nul[p] = true }
+            w.cols[c] = col
+            if jr.kinds[c] == BK_VAL { w.vals[c] = array(n, Val.Null) }
+            continue
+        }
+        bGather(src, c - jl.first, jr.kinds[c], &at[o], mut &w, c)
     }
     return w
 }
+
+// Whether a level's rows are its hash's (read once), not the chunk's.
+fn hashed(jl: &JL): bool { return jl.how == lexdb_plan.JH_HASH || jl.how == lexdb_plan.JH_ROWS }
 
 // at's rows sel (per level, its rows at sel's places).
 fn compose(at: &[][]int, sel: &[]int): [][]int {
@@ -3675,6 +3769,19 @@ fn keyAt(jl: &JL, kv: &[]BVec, w: &Batch, i: int, r: int): Val {
     return Val.Int(kv[i].v[r])
 }
 
+// Row 0's keys as values (its range's equalities; it has them: rows
+// without are not read).
+fn rowKeys(jl: &JL, kv: &[]BVec, w: &Batch, z: &lexdb_time.Zone): Result[[]Val, DbErr] {
+    var out: []Val = []
+    for i in 0..len(jl.key) {
+        match try keyOf(keyAt(jl, kv, w, i, 0), &jl.ktypes[i], z) {
+            Some(x) { append(mut &out, x) }
+            None { return Ok(out) }
+        }
+    }
+    return Ok(out)
+}
+
 // v made a key of type typ as the row engine makes it (keyVal): None, out
 // of the type's range (no row has it).
 fn keyOf(v: Val, typ: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Option[Val], DbErr] {
@@ -3692,15 +3799,19 @@ fn keyOf(v: Val, typ: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Option[V
 // read in batches, its own conditions applied), a lookup's or range's
 // columns and bounds.
 fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
-             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, cx: &Ctx, jr: mut &JRun, dec: bool, bud: mut &Budget,
+             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, jr: mut &JRun, dec: bool, bud: mut &Budget,
              cnt: mut &[]Counts): Result[Unit, DbErr] {
     match p {
         lexdb_plan.PPlan.Join(i, j) {
-            try joinSetup(st, txn, &i, cols, tabs, srcs, cx, jr, dec, bud, cnt)
+            try joinSetup(st, txn, &i, cols, tabs, srcs, vrows, cx, jr, dec, bud, cnt)
             let sc = &j.scan
             let t = tabs[sc.level]
             var jl = newJL(j.how, sc.level, sc.first, len(t.cols))
             jl.left = j.kind == lexdb_sql.J_LEFT
+            jl.right = j.kind == lexdb_sql.J_RIGHT
+            jl.mark = j.mark
+            jl.raw = j.how == lexdb_plan.JH_ROWS
+            jl.resCol = j.resCol
             for k in 0..len(t.cols) { append(mut &jl.rkinds, jr.kinds[sc.first + k]) }
             var avail: []bool = array(jr.nq, false)
             for c in 0..jr.nq { avail[c] = jr.owner[c] >= 0 && jr.owner[c] < len(jr.jls) }
@@ -3722,7 +3833,17 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
             for x in j.ktypes { append(mut &jl.ktypes, x) }
             let lvl = len(jr.jls)
-            if j.how == lexdb_plan.JH_HASH {
+            if len(j.res) > 0 {
+                // a "<>" summary's outer value
+                let got = bCompileD(&j.res[0], cols, &jr.kinds, cx, 0, dec)
+                if got.isNone() { return Err(batErr()) }
+                let cc = got.unwrap()
+                if cc.typ != BT_INT && cc.typ != BT_BOOL { return Err(batErr()) }
+                jl.resTyp = cc.typ
+                jl.res = takeN(cc)
+                readsOf(&j.res, mut &jl.kreads)
+            }
+            if j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS {
                 // one integer key of an integer column, no collation: by value; one text key of texts: by its text
                 let hc = j.hcols[0]
                 if len(j.keys) == 1 && jl.keyTyp[0] == BT_INT && jl.rkinds[hc] == BK_INT {
@@ -3732,13 +3853,14 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
                     let ko = cols[jl.keyCol[0]].typ.oid
                     if (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) && (ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR) { jl.mode = JK_TEXT }
                 }
-                try hashBuild(st, txn, t, &j, &srcs[sc.level], cols, cx, mut &jl, jr, dec, bud, mut &cnt[sc.level])
+                try hashBuild(st, txn, t, &j, &srcs[sc.level], &vrows[sc.level], cols, cx, mut &jl, jr, dec, bud, mut &cnt[sc.level])
             } else {
                 jl.bp = projOf(t, sc, &jr.kinds)
                 var nNeed = 0
                 for c in 0..len(sc.need) { if sc.need[c] { nNeed += 1 } }
                 jl.perRow = 32 + 24 * nNeed
                 jl.index = j.index
+                jl.noNulls = j.noNulls
                 if j.how == lexdb_plan.JH_RANGE {
                     var los: []Val = []
                     var his: []Val = []
@@ -3754,6 +3876,8 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
                         if b.op == ">" || b.op == ">=" { append(mut &los, v) } else { append(mut &his, v) }
                     }
                     jl.tail = lexdb_access.tailOf(j.index, &los, &his, j.capNulls)
+                    jl.los = los
+                    jl.his = his
                 }
             }
             for k in 0..len(j.conds) {
@@ -3778,7 +3902,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             append(mut &jr.jls, jl)
             return Ok(Unit{})
         }
-        lexdb_plan.PPlan.Filter(i, _) { return joinSetup(st, txn, &i, cols, tabs, srcs, cx, jr, dec, bud, cnt) }
+        lexdb_plan.PPlan.Filter(i, _) { return joinSetup(st, txn, &i, cols, tabs, srcs, vrows, cx, jr, dec, bud, cnt) }
         lexdb_plan.PPlan.Scan(sc, _) {
             let t = tabs[sc.level]
             var jl = newJL(-1, sc.level, sc.first, len(t.cols))
@@ -3790,11 +3914,134 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
     }
 }
 
-// Builds a hash join's table (j over table t, read as src says): its rows
-// its own conditions keep, by their key, NULL keys left out, as
-// materialize keeps them (built: rows read; kept: rows hashed).
+// A hash being built: its rows (by its table's columns), its buckets
+// (per bucket its first and last row, per row the next of its bucket),
+// and a "<>" summary's per bucket (more than one value, or its one value).
+type Builder = record {
+    rows: Batch
+    head: []int
+    tail: []int
+    next: []int
+    ints: Map[int, int]
+    txts: Map[str, int]
+    gens: Map[str, int]
+    mixed: []bool
+    single: []Val
+    held: int
+    kept: int
+}
+
+// Adds b's rows idx to a hash (its columns read by bp; its key columns
+// hc, looked up as mode says, raw: by their values' own encoding, a
+// subquery's rows); a NULL key's row joins nothing (kept, out of every
+// bucket, for a RIGHT JOIN: keepAll). resCol >= 0: a "<>" summary,
+// no row kept. room: past it max_statement_mem's error.
+fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: int, raw: bool, keepAll: bool, resCol: int,
+                          room: int, maxHeld: int): Result[Unit, DbErr] {
+    let ncol = len(bp.kinds)
+    for r in idx {
+        var bk = -1
+        var nul = false
+        if mode == JK_INT {
+            let kc = &b.cols[hc[0]]
+            if kc.nul[r] { nul = true } else {
+                match bd.ints.get(&kc.v[r]) {
+                    Some(x) { bk = x }
+                    None {
+                        bk = len(bd.head)
+                        bd.ints.put(kc.v[r], bk)
+                    }
+                }
+            }
+        } else if mode == JK_TEXT {
+            if b.cols[hc[0]].nul[r] { nul = true } else {
+                match b.vals[hc[0]][r] {
+                    Val.Text(x) {
+                        match bd.txts.get(&x) {
+                            Some(y) { bk = y }
+                            None {
+                                bk = len(bd.head)
+                                bd.txts.put(x, bk)
+                            }
+                        }
+                    }
+                    else { return Err(batErr()) }
+                }
+            }
+        } else {
+            var kb = newStrBuf()
+            for k in 0..len(hc) {
+                let v = if b.cols[hc[k]].nul[r] { Val.Null } else { bValAt(b, hc[k], bp.kinds[hc[k]], r) }
+                if lexdb_ops.isNull(&v) { nul = true }
+                if raw { keyPart(mut &kb, &v) } else { lexdb_access.encIdxPart(mut &kb, &v) }
+            }
+            if !nul {
+                let key = kb.toStr()
+                match bd.gens.get(&key) {
+                    Some(x) { bk = x }
+                    None {
+                        bk = len(bd.head)
+                        bd.gens.put(key, bk)
+                    }
+                }
+            }
+        }
+        if nul && !keepAll { continue }
+        if bk == len(bd.head) {
+            append(mut &bd.head, -1)
+            append(mut &bd.tail, -1)
+            append(mut &bd.mixed, false)
+            append(mut &bd.single, Val.Null)
+        }
+        bd.kept += 1
+        if resCol >= 0 {
+            // a summary is all a probe reads: no row kept (q21's shape)
+            if bk >= 0 && !b.cols[resCol].nul[r] {
+                let rv = bValAt(b, resCol, bp.kinds[resCol], r)
+                if lexdb_ops.isNull(&bd.single[bk]) {
+                    bd.single[bk] = rv
+                } else {
+                    match lexdb_ops.compare(&bd.single[bk], &rv) {
+                        Ok(c) { if c != 0 { bd.mixed[bk] = true } }
+                        Err(_) {}
+                    }
+                }
+            }
+            continue
+        }
+        // the row, at the end of its bucket
+        let at = bd.rows.n
+        for ci in 0..ncol {
+            if !bp.needCol[ci] { continue }
+            append(mut &bd.rows.cols[ci].v, b.cols[ci].v[r])
+            append(mut &bd.rows.cols[ci].nul, b.cols[ci].nul[r])
+            if bp.kinds[ci] == BK_VAL {
+                append(mut &bd.rows.vals[ci], b.vals[ci][r])
+                match b.vals[ci][r] {
+                    Val.Text(x) { bd.held += len(x) }
+                    else {}
+                }
+            }
+        }
+        bd.held += 32 + 24 * ncol
+        if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
+        bd.rows.n += 1
+        append(mut &bd.next, -1)
+        if bk >= 0 {
+            if bd.tail[bk] >= 0 { bd.next[bd.tail[bk]] = at } else { bd.head[bk] = at }
+            bd.tail[bk] = at
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Builds a hash join's table (j over table t, read as src says; JH_ROWS:
+// the rows vrows of its subquery): its rows its own conditions keep, by
+// their key, NULL keys left out (a RIGHT JOIN's kept), as materialize
+// keeps them (built: rows read; kept: rows hashed).
 fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, j: &lexdb_plan.PJoin, src: &Src,
-             cols: &[]lexdb_sql.ColDef, cx: &Ctx, jl: mut &JL, jr: &JRun, dec: bool, bud: mut &Budget, c: mut &Counts): Result[Unit, DbErr] {
+             vrows: &[][]Val, cols: &[]lexdb_sql.ColDef, cx: &Ctx, jl: mut &JL, jr: &JRun, dec: bool, bud: mut &Budget,
+             c: mut &Counts): Result[Unit, DbErr] {
     hashBuilds += 1
     let sc = &j.scan
     let bp = projOf(t, sc, &jr.kinds)
@@ -3805,144 +4052,105 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
             None { return Err(batErr()) }
         }
     }
-    var rows = lexdb_rows.newBatch(&bp, 0)
-    rows.n = 0
-    let ncol = len(bp.kinds)
-    let hc = &j.hcols
-    var head: []int = []
-    var tail: []int = []
-    var next: []int = []
-    var ints: Map[int, int] = newMap()
-    var txts: Map[str, int] = newMap()
-    var gens: Map[str, int] = newMap()
+    var rows0 = lexdb_rows.newBatch(&bp, 0)
+    rows0.n = 0
+    var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: newMap(), gens: newMap(), mixed: [], single: [],
+                     held: 0, kept: 0}
     let mode = jl.mode
-    let none: Map[int, int] = newMap()
-    var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
-    var held = 0
+    let raw = j.how == lexdb_plan.JH_ROWS
+    let keepAll = jl.right
     let room = bud.room()
     let maxHeld = bud.maxHeld
-    var kept = 0
-    let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &none, false, mut &rc, fn(tx: mut &lexdb_store.Txn, b: Batch, idx: []int, raw: bool): Result[bool, DbErr] {
-        for r in idx {
-            // its key: a bucket; a NULL key joins nothing
-            var bk = -1
-            if mode == JK_INT {
-                let kc = &b.cols[hc[0]]
-                if kc.nul[r] { continue }
-                match ints.get(&kc.v[r]) {
-                    Some(x) { bk = x }
-                    None {
-                        bk = len(head)
-                        ints.put(kc.v[r], bk)
-                    }
+    var nread = 0
+    if raw {
+        // a subquery's rows (Val), a batch of them at a time
+        var at = 0
+        while at < len(vrows) {
+            var b = lexdb_rows.newBatch(&bp, lexdb_rows.BROWS)
+            b.n = 0
+            while at < len(vrows) && b.n < lexdb_rows.BROWS {
+                for ci in 0..len(bp.kinds) {
+                    if !bp.needCol[ci] { continue }
+                    let v = if ci < len(vrows[at]) { vrows[at][ci] } else { Val.Null }
+                    if !lexdb_rows.put(mut &b, ci, b.n, v, bp.kinds[ci]) { return Err(batErr()) }
                 }
-            } else if mode == JK_TEXT {
-                if b.cols[hc[0]].nul[r] { continue }
-                match b.vals[hc[0]][r] {
-                    Val.Text(x) {
-                        match txts.get(&x) {
-                            Some(y) { bk = y }
-                            None {
-                                bk = len(head)
-                                txts.put(x, bk)
-                            }
-                        }
-                    }
-                    else { return Err(batErr()) }
-                }
-            } else {
-                var kb = newStrBuf()
-                var nul = false
-                for k in 0..len(hc) {
-                    let v = if b.cols[hc[k]].nul[r] { Val.Null } else { bValAt(&b, hc[k], bp.kinds[hc[k]], r) }
-                    if lexdb_ops.isNull(&v) { nul = true }
-                    lexdb_access.encIdxPart(mut &kb, &v)
-                }
-                if nul { continue }
-                let key = kb.toStr()
-                match gens.get(&key) {
-                    Some(x) { bk = x }
-                    None {
-                        bk = len(head)
-                        gens.put(key, bk)
-                    }
-                }
+                b.n += 1
+                at += 1
             }
-            if bk == len(head) {
-                append(mut &head, -1)
-                append(mut &tail, -1)
-            }
-            // the row, at the end of its bucket
-            let at = rows.n
-            for ci in 0..ncol {
-                if !bp.needCol[ci] { continue }
-                append(mut &rows.cols[ci].v, b.cols[ci].v[r])
-                append(mut &rows.cols[ci].nul, b.cols[ci].nul[r])
-                if bp.kinds[ci] == BK_VAL {
-                    append(mut &rows.vals[ci], b.vals[ci][r])
-                    match b.vals[ci][r] {
-                        Val.Text(x) { held += len(x) }
-                        else {}
-                    }
-                }
-            }
-            held += 32 + 24 * ncol
-            if room >= 0 && held > room { return Err(memErr(maxHeld)) }
-            rows.n += 1
-            append(mut &next, -1)
-            if tail[bk] >= 0 { next[tail[bk]] = at } else { head[bk] = at }
-            tail[bk] = at
-            kept += 1
+            var idx: []int = withCapacity(b.n)
+            for r in 0..b.n { append(mut &idx, r) }
+            nread += b.n
+            let kept = try pick(&conds, &b, idx)
+            try bd.add(&b, &kept, &bp, &j.hcols, mode, true, keepAll, j.resCol, room, maxHeld)
         }
-        return Ok(true)
-    })
-    try bud.tickN(rc.read)
-    try bud.hold(held)
-    c.built += rc.read
-    c.kept += kept
-    jl.rows = rows
-    jl.head = head
-    jl.next = next
-    jl.ints = ints
-    jl.txts = txts
-    jl.gens = gens
+    } else {
+        let none: Map[int, int] = newMap()
+        var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
+        let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &none, false, mut &rc,
+                                fn(tx: mut &lexdb_store.Txn, b: Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
+            try bd.add(&b, &idx, &bp, &j.hcols, mode, false, keepAll, j.resCol, room, maxHeld)
+            return Ok(true)
+        })
+        nread = rc.read
+    }
+    try bud.tickN(nread)
+    try bud.hold(bd.held)
+    c.built += nread
+    c.kept += bd.kept
+    jl.rows = replace(mut &bd.rows, lexdb_rows.noRows())
+    jl.head = replace(mut &bd.head, [])
+    jl.next = replace(mut &bd.next, [])
+    jl.ints = replace(mut &bd.ints, newMap())
+    jl.txts = replace(mut &bd.txts, newMap())
+    jl.gens = replace(mut &bd.gens, newMap())
+    jl.mixed = replace(mut &bd.mixed, [])
+    jl.single = replace(mut &bd.single, [])
     return Ok(Unit{})
 }
 
 // The rest of a chunk's join from level j: at, per level before it, its
 // rows' places (n rows). At the end the consumer's columns are gathered
 // and the joined rows given to out. false: stop.
-fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: mut &[]Batch, tabs: &[]&lexdb_catalog.Table, j: int,
-            at: [][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool, sk: mut &Skip,
+fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+            at: [][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
     if n == 0 { return Ok(true) }
     if j == len(jr.jls) {
         // (a chunk joined again row by row: the rows already given skipped)
-        if sk.skip >= n {
-            sk.skip -= n
+        if js.sk.skip >= n {
+            js.sk.skip -= n
             return Ok(true)
         }
-        var f = gatherAt(jr, cur, &at, n, &jr.wantList)
+        var f = gatherAt(jr, &js.cur, &at, n, &jr.wantList)
         let go = try out(txn, mut &f)
-        sk.given += n
+        js.sk.given += n
         return Ok(go)
     }
     if one && n > 1 {
         // row by row: each row's joins and its consumer's before the next row's
         for r in 0..n {
             let one1: []int = [r]
-            if !(try joinFrom(st, txn, jr, cur, tabs, j, compose(&at, &one1), 1, cx, bud, cnt, one, sk, out)) { return Ok(false) }
+            if !(try joinFrom(st, txn, jr, js, tabs, j, compose(&at, &one1), 1, cx, bud, cnt, one, out)) { return Ok(false) }
         }
         return Ok(true)
     }
     let jl = &jr.jls[j]
     let lv = jl.level
-    let w = gatherAt(jr, cur, &at, n, &jl.kreads)
+    let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
     let kv = try keyVecs(jl, &w)
     var pj: []int = withCapacity(n)
     var pi: []int = withCapacity(n)
     var held = 0
-    if jl.how == lexdb_plan.JH_HASH {
+    if hashed(jl) {
+        // a "<>" summary's outer value
+        var rv = lexdb_rows.bvec(0)
+        if jl.resCol >= 0 {
+            var all: []int = withCapacity(n)
+            for r in 0..n { append(mut &all, r) }
+            rv = try bEval(&jl.res, &w, &all)
+        }
+        // a semi join with no condition: its first match only
+        let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
         for r in 0..n {
             var bk = -1
             if jl.mode == JK_INT {
@@ -3969,6 +4177,13 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
                 var kb = newStrBuf()
                 var nul = false
                 for i in 0..len(jl.key) {
+                    if jl.raw {
+                        // a subquery's rows: by the value's own encoding (keyPart)
+                        let v = keyAt(jl, &kv, &w, i, r)
+                        if lexdb_ops.isNull(&v) { nul = true }
+                        keyPart(mut &kb, &v)
+                        continue
+                    }
                     match try keyOf(keyAt(jl, &kv, &w, i, r), &jl.ktypes[i], &jr.zone) {
                         Some(x) {
                             if lexdb_ops.isNull(&x) { nul = true }
@@ -3984,12 +4199,33 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
                     }
                 }
             }
+            if jl.resCol >= 0 {
+                // a NULL outer value is "<>" no value: never a match (as the
+                // row engine); a hit is a candidate without a row
+                if bk >= 0 && !rv.nul[r] {
+                    var hit = jl.mixed[bk]
+                    if !hit {
+                        let sm = &jl.single[bk]
+                        if !lexdb_ops.isNull(sm) {
+                            let ov = if jl.resTyp == BT_BOOL { Val.Bool(rv.v[r] != 0) } else { Val.Int(rv.v[r]) }
+                            if (try lexdb_ops.compare(sm, &ov)) != 0 { hit = true }
+                        }
+                    }
+                    if hit {
+                        append(mut &pj, r)
+                        append(mut &pi, -1)
+                    }
+                }
+                // (each row probed is read once, as the row engine reads a summary)
+                if !(bk >= 0 && !rv.nul[r] && len(pj) > 0 && pj[len(pj) - 1] == r) { cnt[lv].read += 1 }
+                continue
+            }
             if bk >= 0 {
                 var x = jl.head[bk]
                 while x >= 0 {
                     append(mut &pj, r)
                     append(mut &pi, x)
-                    x = jl.next[x]
+                    x = if first { -1 } else { jl.next[x] }
                 }
             }
         }
@@ -4042,7 +4278,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
                 None { return Err(batErr()) }
             }
             var f2 = fetched
-            cur[j] = replace(mut &f2.rows, lexdb_rows.noRows())
+            js.cur[j] = replace(mut &f2.rows, lexdb_rows.noRows())
             for i in 0..nk {
                 let ri = f2.at[i]
                 if ri < 0 { continue }
@@ -4053,17 +4289,20 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
             // the rows read are held while the chunk is joined, against
             // max_statement_mem: past it the chunk is joined in halves
             let room0 = if bud.maxHeld > 0 { bud.maxHeld - bud.held - bud.aside } else { -1 }
-            let got = try lexdb_access.rangeMany(st, txn, &rel, jl.index, &pr, &jl.tail, jl.noRange, false, &jl.bp, true, room0, jl.perRow)
+            // (a semi or anti join with no condition: a range's first row only)
+            let one1 = jl.mark != lexdb_plan.MK_JOIN && len(jl.conds) == 0
+            let got = try lexdb_access.rangeMany(st, txn, &rel, jl.index, &pr, &jl.tail, jl.noRange, one1, &jl.bp, true, room0, jl.perRow)
             if got.isNone() {
                 if n == 1 {
-                    if room0 >= 0 { return Err(memErr(bud.maxHeld)) }
-                    return Err(batErr())
+                    if room0 < 0 { return Err(batErr()) }
+                    // its one range read in pieces, as the row engine reads it
+                    return rangeOne(st, txn, jr, js, tabs, j, &at, &(try rowKeys(jl, &kv, &w, &jr.zone)), cx, bud, cnt, out)
                 }
                 var lo: []int = []
                 var hi: []int = []
                 for r in 0..n { if r < n / 2 { append(mut &lo, r) } else { append(mut &hi, r) } }
-                if !(try joinFrom(st, txn, jr, cur, tabs, j, compose(&at, &lo), len(lo), cx, bud, cnt, one, sk, out)) { return Ok(false) }
-                return joinFrom(st, txn, jr, cur, tabs, j, compose(&at, &hi), len(hi), cx, bud, cnt, one, sk, out)
+                if !(try joinFrom(st, txn, jr, js, tabs, j, compose(&at, &lo), len(lo), cx, bud, cnt, one, out)) { return Ok(false) }
+                return joinFrom(st, txn, jr, js, tabs, j, compose(&at, &hi), len(hi), cx, bud, cnt, one, out)
             }
             var rg = got.unwrap()
             let rows = replace(mut &rg.rows, lexdb_rows.noRows())
@@ -4078,12 +4317,12 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
                 }
             }
             if room0 >= 0 && held > room0 {
-                if n == 1 { return Err(memErr(bud.maxHeld)) }
+                if n == 1 { return rangeOne(st, txn, jr, js, tabs, j, &at, &(try rowKeys(jl, &kv, &w, &jr.zone)), cx, bud, cnt, out) }
                 var lo: []int = []
                 var hi: []int = []
                 for r in 0..n { if r < n / 2 { append(mut &lo, r) } else { append(mut &hi, r) } }
-                if !(try joinFrom(st, txn, jr, cur, tabs, j, compose(&at, &lo), len(lo), cx, bud, cnt, one, sk, out)) { return Ok(false) }
-                return joinFrom(st, txn, jr, cur, tabs, j, compose(&at, &hi), len(hi), cx, bud, cnt, one, sk, out)
+                if !(try joinFrom(st, txn, jr, js, tabs, j, compose(&at, &lo), len(lo), cx, bud, cnt, one, out)) { return Ok(false) }
+                return joinFrom(st, txn, jr, js, tabs, j, compose(&at, &hi), len(hi), cx, bud, cnt, one, out)
             }
             try bud.tickN(rows.n)
             for i in 0..nk {
@@ -4092,8 +4331,8 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
                     append(mut &pi, x)
                 }
             }
-            cur[j] = rows
-            rangeJoinChunks += 1
+            js.cur[j] = rows
+            if jl.mark == lexdb_plan.MK_JOIN { rangeJoinChunks += 1 }
         }
         cnt[lv].starts += n
     }
@@ -4101,15 +4340,15 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
     if one {
         // n is 1: its candidates in order, each joined on before the next
         // (its conditions evaluated only for the candidates reached)
-        let go = tailOne(st, txn, jr, cur, tabs, j, &at, &pj, &pi, cx, bud, cnt, sk, out)
+        let go = tailOne(st, txn, jr, js, tabs, j, &at, &pj, &pi, cx, bud, cnt, out)
         bud.held -= held
         return go
     }
-    let next = joinTail(jr, cur, j, &at, n, &pj, pi, bud, cnt)
+    let next = joinTail(jr, js, j, &at, n, &pj, pi, bud, cnt)
     if next.isErr() { bud.held -= held }
     let at2 = try next
     let n2 = len(at2[0])
-    let go = joinFrom(st, txn, jr, cur, tabs, j + 1, at2, n2, cx, bud, cnt, false, sk, out)
+    let go = joinFrom(st, txn, jr, js, tabs, j + 1, at2, n2, cx, bud, cnt, false, out)
     bud.held -= held
     return go
 }
@@ -4118,49 +4357,119 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: m
 // them a second, row-by-row join of the chunk skips (skip).
 type Skip = record { skip: int; given: int }
 
+// A join run's state: per level its rows for the chunk (the scan's batch,
+// a lookup's or range's rows), a RIGHT JOIN's rows that joined, the skip.
+type JState = record { cur: []Batch; seen: []bool; sk: Skip }
+
 // One row's candidates at level j (pj all 0, pi their rows), as the row
 // engine tries them: each one's conditions, then the levels after it for
 // it, before the next; a LEFT JOIN's NULL row after them if none joined;
 // the WHERE conjuncts after it on each row it gives.
-fn tailOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: mut &[]Batch, tabs: &[]&lexdb_catalog.Table, j: int,
-           at: &[][]int, pj: &[]int, pi: &[]int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, sk: mut &Skip,
+fn tailOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+           at: &[][]int, pj: &[]int, pi: &[]int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
            out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    var any = false
+    var done = false
+    if !(try tailCands(st, txn, jr, js, tabs, j, at, pi, cx, bud, cnt, mut &any, mut &done, out)) { return Ok(false) }
+    if done { return Ok(true) }
+    return tailEnd(st, txn, jr, js, tabs, j, at, any, cx, bud, cnt, out)
+}
+
+// The candidates pi of one row (at) in order, each joined on before the
+// next; any: one joined; done: a semi or anti join decided.
+fn tailCands(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+             at: &[][]int, pi: &[]int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, any: mut &bool, done: mut &bool,
+             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
     let jl = &jr.jls[j]
     let lv = jl.level
     let zero: []int = [0]
-    var any = false
-    for c in 0..len(pj) {
+    for c in 0..len(pi) {
         cnt[lv].read += 1
         try bud.tick()
         var atc = compose(at, &zero)
         append(mut &atc, [pi[c]])
         if len(jl.conds) > 0 {
-            let w = gatherAt(jr, cur, &atc, 1, &jl.creads)
+            let w = gatherAt(jr, &js.cur, &atc, 1, &jl.creads)
             if len(try pick(&jl.conds, &w, [0])) == 0 { continue }
         }
+        if jl.right && pi[c] >= 0 { js.seen[pi[c]] = true }
         cnt[lv].joined += 1
         any = true
-        if !(try postOne(st, txn, jr, cur, tabs, j, atc, cx, bud, cnt, sk, out)) { return Ok(false) }
-    }
-    if jl.left && !any {
-        cnt[lv].nulls += 1
-        var atn = compose(at, &zero)
-        append(mut &atn, [-1])
-        return postOne(st, txn, jr, cur, tabs, j, atn, cx, bud, cnt, sk, out)
+        // an anti join drops the row; a semi join gives it once
+        if jl.mark == lexdb_plan.MK_ANTI {
+            done = true
+            return Ok(true)
+        }
+        if !(try postOne(st, txn, jr, js, tabs, j, atc, cx, bud, cnt, out)) { return Ok(false) }
+        if jl.mark == lexdb_plan.MK_SEMI {
+            done = true
+            return Ok(true)
+        }
     }
     return Ok(true)
 }
 
+// After one row's candidates: an anti join's row if none joined, a LEFT
+// JOIN's NULL row.
+fn tailEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+           at: &[][]int, any: bool, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+           out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    let jl = &jr.jls[j]
+    let zero: []int = [0]
+    if any { return Ok(true) }
+    if jl.mark == lexdb_plan.MK_ANTI || jl.left {
+        if jl.left { cnt[jl.level].nulls += 1 }
+        var atn = compose(at, &zero)
+        append(mut &atn, [-1])
+        return postOne(st, txn, jr, js, tabs, j, atn, cx, bud, cnt, out)
+    }
+    return Ok(true)
+}
+
+// One row's range (eqs, then the level's bounds) read in pieces (fetch)
+// where its rows are past the statement's memory as one batch: each
+// piece's rows its candidates in order, as the row engine reads a range.
+fn rangeOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+            at: &[][]int, eqs: &[]Val, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+            out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    let jl = &jr.jls[j]
+    let rel = lexdb_catalog.relOf(tabs[jl.level])
+    cnt[jl.level].starts += 1
+    let sc = lexdb_access.rangeScan(&rel, jl.index, eqs, &jl.los, &jl.his, jl.noNulls)
+    var cur = lexdb_access.newCursor()
+    var any = false
+    var done = false
+    while !cur.done && !done {
+        var rows: [][]Val = []
+        try lexdb_access.fetch(st, txn, &rel, jl.index, false, &sc, &jl.bp.needCol, mut &cur, mut &rows)
+        var b = lexdb_rows.newBatch(&jl.bp, len(rows))
+        b.n = len(rows)
+        for r in 0..len(rows) {
+            for c in 0..len(jl.bp.kinds) {
+                if !jl.bp.needCol[c] { continue }
+                let v = if c < len(rows[r]) { replace(mut &rows[r][c], Val.Null) } else { Val.Null }
+                if !lexdb_rows.put(mut &b, c, r, v, jl.bp.kinds[c]) { return Err(batErr()) }
+            }
+        }
+        var pi: []int = withCapacity(b.n)
+        for r in 0..b.n { append(mut &pi, r) }
+        js.cur[j] = b
+        if !(try tailCands(st, txn, jr, js, tabs, j, at, &pi, cx, bud, cnt, mut &any, mut &done, out)) { return Ok(false) }
+    }
+    if done { return Ok(true) }
+    return tailEnd(st, txn, jr, js, tabs, j, at, any, cx, bud, cnt, out)
+}
+
 // One joined row of level j: its WHERE conjuncts after it, then on.
-fn postOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, cur: mut &[]Batch, tabs: &[]&lexdb_catalog.Table, j: int,
-           at: [][]int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, sk: mut &Skip,
+fn postOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+           at: [][]int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
            out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
     let jl = &jr.jls[j]
     if len(jl.post) > 0 {
-        let w = gatherAt(jr, cur, &at, 1, &jl.preads)
+        let w = gatherAt(jr, &js.cur, &at, 1, &jl.preads)
         if len(try pick(&jl.post, &w, [0])) == 0 { return Ok(true) }
     }
-    return joinFrom(st, txn, jr, cur, tabs, j + 1, at, 1, cx, bud, cnt, true, sk, out)
+    return joinFrom(st, txn, jr, js, tabs, j + 1, at, 1, cx, bud, cnt, true, out)
 }
 
 // Chunks joined to a range per row (the tests' look).
@@ -4171,24 +4480,63 @@ pub fn rangeJoins(): int { return rangeJoinChunks }
 // A level's candidates (per candidate, its row before pj and its row of
 // the level's pi) as the rows it gives: its conditions over them, a LEFT
 // JOIN's NULL rows, its WHERE conjuncts. The rows' places per level.
-fn joinTail(jr: &JRun, cur: &[]Batch, j: int, at: &[][]int, n: int, pj: &[]int, pi: []int, bud: mut &Budget,
+fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int, pi: []int, bud: mut &Budget,
             cnt: mut &[]Counts): Result[[][]int, DbErr] {
     let jl = &jr.jls[j]
     let lv = jl.level
     let nc = len(pj)
-    cnt[lv].read += nc
     try bud.tickN(nc)
     var cat = compose(at, pj)
     append(mut &cat, pi)
     var keep: []int = withCapacity(nc)
     for x in 0..nc { append(mut &keep, x) }
     if len(jl.conds) > 0 {
-        let w = gatherAt(jr, cur, &cat, nc, &jl.creads)
+        let w = gatherAt(jr, &js.cur, &cat, nc, &jl.creads)
         keep = try pick(&jl.conds, &w, keep)
     }
-    cnt[lv].joined += len(keep)
+    if jl.mark == lexdb_plan.MK_JOIN {
+        cnt[lv].read += nc
+    } else {
+        // a semi or anti join's: as the row engine reads them, up to each
+        // row's first passing candidate
+        var ki = 0
+        var doneRow = -1
+        for x in 0..nc {
+            if pj[x] == doneRow { continue }
+            cnt[lv].read += 1
+            while ki < len(keep) && keep[ki] < x { ki += 1 }
+            if ki < len(keep) && keep[ki] == x { doneRow = pj[x] }
+        }
+    }
+    // a RIGHT JOIN's rows that joined
+    if jl.right { for x in keep { if cat[j][x] >= 0 { js.seen[cat[j][x]] = true } } }
     var outAt: [][]int = []
-    if jl.left {
+    if jl.mark == lexdb_plan.MK_ANTI {
+        // the outer rows with no passing candidate, once; joined: those
+        // with one (dropped)
+        var have: []bool = array(n, false)
+        for x in keep {
+            if !have[pj[x]] { cnt[lv].joined += 1 }
+            have[pj[x]] = true
+        }
+        var aj: []int = []
+        for r in 0..n { if !have[r] { append(mut &aj, r) } }
+        outAt = compose(at, &aj)
+        append(mut &outAt, array(len(aj), -1))
+    } else if jl.mark == lexdb_plan.MK_SEMI {
+        // its first passing candidate per outer row, as the row engine stops
+        var fst: []int = []
+        var prev = -1
+        for x in keep {
+            if pj[x] != prev {
+                append(mut &fst, x)
+                prev = pj[x]
+            }
+        }
+        cnt[lv].joined += len(fst)
+        outAt = compose(&cat, &fst)
+    } else if jl.left {
+        cnt[lv].joined += len(keep)
         var outJ: []int = withCapacity(n)
         var outI: []int = withCapacity(n)
         var k = 0
@@ -4209,13 +4557,15 @@ fn joinTail(jr: &JRun, cur: &[]Batch, j: int, at: &[][]int, n: int, pj: &[]int, 
         outAt = compose(at, &outJ)
         append(mut &outAt, outI)
     } else if len(keep) == nc {
+        cnt[lv].joined += len(keep)
         outAt = cat
     } else {
+        cnt[lv].joined += len(keep)
         outAt = compose(&cat, &keep)
     }
     if len(jl.post) > 0 {
         let m = len(outAt[0])
-        let w = gatherAt(jr, cur, &outAt, m, &jl.preads)
+        let w = gatherAt(jr, &js.cur, &outAt, m, &jl.preads)
         var all: []int = withCapacity(m)
         for x in 0..m { append(mut &all, x) }
         let k2 = try pick(&jl.post, &w, all)
@@ -4229,13 +4579,13 @@ fn joinTail(jr: &JRun, cur: &[]Batch, j: int, at: &[][]int, n: int, pj: &[]int, 
 // (kinds; owner: per column the level holding it), want's columns
 // gathered. dec: numerics as units.
 fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
-            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, cx: &Ctx, dec: bool, kinds: []int, owner: []int, want: []bool, exact: bool,
+            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, dec: bool, kinds: []int, owner: []int, want: []bool, exact: bool,
             bud: mut &Budget, cnt: mut &[]Counts, out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[Unit, DbErr] {
     let nq = len(cols)
     var wl: []int = []
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
     var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone}
-    try joinSetup(st, txn, top, cols, tabs, srcs, cx, mut &jr, dec, bud, cnt)
+    try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, dec, bud, cnt)
     let bottom = joinBottom(top)
     let none: []BX = []
     let conds = match bottom {
@@ -4271,38 +4621,45 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         }
     }
     cnt[sc.level].starts += 1
-    var cur: []Batch = []
-    for i in 0..len(jr.jls) { append(mut &cur, lexdb_rows.noRows()) }
+    var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}}
+    for i in 0..len(jr.jls) { append(mut &js.cur, lexdb_rows.noRows()) }
+    // a RIGHT JOIN's rows that joined (at most one)
+    var rightAt = -1
+    for i in 0..len(jr.jls) {
+        if jr.jls[i].right {
+            rightAt = i
+            js.seen = array(jr.jls[i].rows.n, false)
+        }
+    }
     var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
     let pm = &jr.jls[if pushCol >= 0 { 1 } else { 0 }].ints
-    var sk = Skip{skip: 0, given: 0}
     var rawKept = 0
     let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &bp, &cn, pushCol, pm, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
-        cur[0] = b
-        sk.skip = 0
-        sk.given = 0
+        js.cur[0] = b
+        js.sk.skip = 0
+        js.sk.given = 0
         if raw {
             // its conditions gave an error on one of its rows: row by row
-            for r in 0..cur[0].n {
-                let k = try pick(&cn, &cur[0], [r])
+            for r in 0..js.cur[0].n {
+                let k = try pick(&cn, &js.cur[0], [r])
                 if len(k) == 0 { continue }
                 rawKept += 1
                 var at1: [][]int = []
                 append(mut &at1, [r])
-                if !(try joinFrom(st, tx, &jr, mut &cur, tabs, 1, at1, 1, cx, bud, cnt, true, mut &sk, out)) { return Ok(false) }
+                if !(try joinFrom(st, tx, &jr, mut &js, tabs, 1, at1, 1, cx, bud, cnt, true, out)) { return Ok(false) }
             }
             return Ok(true)
         }
         let n = len(idx)
         var at: [][]int = []
         append(mut &at, collections.copyOf(&idx))
-        if !exact { return joinFrom(st, tx, &jr, mut &cur, tabs, 1, at, n, cx, bud, cnt, false, mut &sk, out) }
+        if !exact { return joinFrom(st, tx, &jr, mut &js, tabs, 1, at, n, cx, bud, cnt, false, out) }
         let c0 = collections.copyOf(cnt)
         let h0 = bud.held
-        match joinFrom(st, tx, &jr, mut &cur, tabs, 1, at, n, cx, bud, cnt, false, mut &sk, out) {
+        match joinFrom(st, tx, &jr, mut &js, tabs, 1, at, n, cx, bud, cnt, false, out) {
             Ok(go) { return Ok(go) }
             Err(x) {
                 if isBat(&x) || x.state == "53200" || x.state == "57014" || isSpill(&x) { return Err(x) }
@@ -4311,15 +4668,47 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
                 // not reached)
                 for i in 0..len(c0) { cnt[i] = c0[i] }
                 bud.held = h0
-                sk.skip = sk.given
-                sk.given = 0
+                js.sk.skip = js.sk.given
+                js.sk.given = 0
                 var at2: [][]int = []
                 append(mut &at2, idx)
-                return joinFrom(st, tx, &jr, mut &cur, tabs, 1, at2, n, cx, bud, cnt, true, mut &sk, out)
+                return joinFrom(st, tx, &jr, mut &js, tabs, 1, at2, n, cx, bud, cnt, true, out)
             }
         }
     })
     cnt[sc.level].joined += rawKept
+    if rightAt >= 0 && !stopped {
+        // a RIGHT JOIN's rows that joined nothing, with NULLs for the
+        // tables before it, its WHERE conjuncts after it, then joined with
+        // the tables after it (as runQuery adds them)
+        let jl = &jr.jls[rightAt]
+        let total = len(js.seen)
+        var x = 0
+        while x < total {
+            var idx: []int = []
+            while x < total && len(idx) < lexdb_rows.BROWS {
+                if !js.seen[x] { append(mut &idx, x) }
+                x += 1
+            }
+            let n = len(idx)
+            if n == 0 { continue }
+            cnt[jl.level].unmatched += n
+            try bud.tickN(n)
+            var at: [][]int = []
+            for l in 0..rightAt { append(mut &at, array(n, -1)) }
+            append(mut &at, idx)
+            if len(jl.post) > 0 {
+                let w = gatherAt(&jr, &js.cur, &at, n, &jl.preads)
+                var all: []int = withCapacity(n)
+                for r in 0..n { append(mut &all, r) }
+                let k2 = try pick(&jl.post, &w, all)
+                if len(k2) < n { at = compose(&at, &k2) }
+            }
+            let m = len(at[0])
+            js.sk.skip = 0
+            if !(try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false, out)) { break }
+        }
+    }
     cnt[sc.level].read += rc.read
     cnt[sc.level].joined += rc.kept
     cnt[sc.level].batches += rc.batches
@@ -4342,7 +4731,7 @@ fn kindsFor(top: &lexdb_plan.PPlan, tabs: &[]&lexdb_catalog.Table, nq: int, dec:
 // its tables tabs and where each is read srcs, by level. cnt: per level
 // its counts (EXPLAIN ANALYZE's), then the rows given.
 pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
-            srcs: &[]Src, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+            srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     runs += 1
     joinRuns += 1
@@ -4377,7 +4766,7 @@ pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: 
             if lim == 0 { return Ok(0) }
             var given = 0
             let no = len(nodes)
-            try joinRows(st, txn, &top, cols, tabs, srcs, cx, false, kinds, owner, want, true, bud, cnt,
+            try joinRows(st, txn, &top, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt,
                          fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
                 var all: []int = withCapacity(f.n)
                 for r in 0..f.n { append(mut &all, r) }
@@ -4425,9 +4814,9 @@ fn limitOf(p: &lexdb_plan.PPlan, lim: mut &int) {
 // runAgg, or runAggJ for a plan with joins (its tables tabs, where each
 // is read srcs; t and src the first's).
 pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                  give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
-    if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, cx, room, bud, cnt, give) }
+    if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give) }
     return runAgg(st, txn, pg, cols, t, src, cx, room, bud, cnt, give)
 }
 
@@ -4438,7 +4827,7 @@ pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
 // the scalar evaluator; each from the start (the groups are given at the
 // end). A value a batch cannot hold: batErr (nothing given).
 pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
-               srcs: &[]Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+               srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     runs += 1
     joinRuns += 1
@@ -4447,7 +4836,7 @@ pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, col
     match underViews(&pg.plan) {
         lexdb_plan.PPlan.Agg(i, _, pa) {
             match pa {
-                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, cx, room, bud, cnt, give) }
+                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, give) }
                 None {}
             }
         }
@@ -4478,7 +4867,7 @@ fn aggWant(a: &lexdb_plan.PAgg, nq: int): []bool {
 }
 
 fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef,
-           tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+           tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
            give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     let nq = len(cols)
     let c0 = collections.copyOf(cnt)
@@ -4504,7 +4893,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
         let usedDec = dec && ag.anyDec(&kinds, &avail)
         if dec && !usedDec { continue }
         var gaveWay = false
-        let r = joinRows(st, txn, top, cols, tabs, srcs, cx, dec, kinds, owner, want, false, bud, cnt,
+        let r = joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt,
                          fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
             var all: []int = withCapacity(f.n)
             for x in 0..f.n { append(mut &all, x) }
@@ -4544,7 +4933,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     for c in 0..nq { if want[c] { append(mut &wl, c) } }
     var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], added: 0}
     let ks = collections.copyOf(&kinds)
-    try joinRows(st, txn, top, cols, tabs, srcs, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt,
+    try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
         for r in 0..f.n {
             for c in wl { rg.row[c] = if f.cols[c].nul[r] { Val.Null } else { bValAt(f, c, ks[c], r) } }
