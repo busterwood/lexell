@@ -8986,7 +8986,9 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
         }
     }
     var sc = newScopeIn(st, txn, params, ptypes)
-    let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    var sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    bindSel(mut &sel)
+    pipeSelIn(mut &sel, false)
     if len(s.names) > len(sel.outs) { return Err(e("42601", "too many column names were specified")) }
     var mk = lexdb_sql.newStmt(lexdb_sql.S_CREATE)
     mk.table = s.table
@@ -11110,6 +11112,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let noTypes: []int = []
         var ssc = newScopeIn(st, txn, params, &noTypes)
         var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        // (its aggregates the pipeline's)
+        bindSel(mut &sel)
+        pipeSelIn(mut &sel, false)
         // the logical plan (read by nothing yet): the query's plan its source
         let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), collections.copyOf(&targets), takeLp(mut &sel), retBCols(&ret))
         let defs = try defaultsOf(st, txn, &t)
@@ -13085,14 +13090,20 @@ pub fn setPipe(on: bool) { pipeOn = on }
 pub fn pipeRuns(): []int { return lexdb_pipe.runCounts() }
 
 // Makes sel's plan the pipeline's when it runs it (Sel.pipe); else
-// leaves sel as it was.
-fn pipeSel(sel: mut &Sel) {
+// leaves sel as it was. Its subqueries' and set parts' aggregates too.
+fn pipeSel(sel: mut &Sel) { pipeSelIn(sel, true) }
+
+// pipeSel; rows: a plan of rows too (a SELECT's own; false: a subquery's,
+// a set's part, or a statement's query: only its aggregates, slice P1b).
+fn pipeSelIn(sel: mut &Sel, rows: bool) {
     if !pipeOn { return }
+    for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, false) }
+    for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], false) }
     if sel.aggQ {
         pipeAgg(sel)
         return
     }
-    if !pipeShape(sel) { return }
+    if !rows || !pipeShape(sel) { return }
     let lv = &sel.q.levels[0]
     let t = &lv.t
     var kinds: []int = array(len(sel.q.cols), lexdb_rows.BK_NONE)
@@ -13267,9 +13278,9 @@ fn bxUses(x: &BX, used: mut &[]bool) {
 // order, its conditions bound for the plan.
 fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.gsets) > 0 || len(sel.mr) > 0 ||
-       len(sel.feedback) > 0 || len(sel.locks) > 0 { return false }
-    if len(q.levels) != 1 || len(q.subs) > 0 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
+    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 { return false }
+    // (a correlated subquery's own: its outer values are its parameters)
+    if len(q.levels) != 1 || len(q.subs) > 0 || q.corr || len(q.top) > 0 { return false }
     let lv = &q.levels[0]
     if !lv.perRow || lv.lateral || lv.virt() || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
     if lv.first != 0 || len(q.cols) != len(lv.t.cols) || !boundOnce(q) { return false }
@@ -20414,7 +20425,9 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
               lim: Limits, out: &fn(int, &[]byte): bool): Result[Res, DbErr] {
     var sc = newScopeIn(st, txn, params, ptypes)
-    let sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    var sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+    bindSel(mut &sel)
+    pipeSelIn(mut &sel, false)
     let n = len(sel.outs)
     var names: []str = []
     for c in sel.outs { append(mut &names, c.name) }
@@ -21213,13 +21226,11 @@ pub const BK_BOOL: int = lexdb_rows.BK_BOOL  // ... a boolean (0, 1) ...
 pub const BK_VAL: int = lexdb_rows.BK_VAL    // ... or any other, as values
 // Grouped queries run over batches with numerics as units, and those that
 // gave way to the row path (a result past its units), for the tests.
-var decRuns: int = 0
-var decSpills: int = 0
-var groupRuns: int = 0      // grouped queries run over batches, units or not
+var groupRuns: int = 0      // joins' grouped queries run over batches (one table's: the pipeline's, lexdb_pipe.aggCounts)
 
 pub fn decCounts(): []int {
     let pc = lexdb_pipe.aggCounts()
-    return [decRuns + pc[0], decSpills + pc[1], groupRuns + pc[2]]
+    return [pc[0], pc[1], groupRuns + pc[2]]
 }
 
 // A column of a batch, or an expression's values for the rows chosen.
@@ -23272,38 +23283,16 @@ fn eachOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mat
     return Ok(n)
 }
 
-// Runs sel's grouping over batches into gs; false: the query is not one
-// the batches run (nothing done; the row path runs it).
+// Runs a join's grouping over batches into gs; false: the query is not one
+// the batches run (nothing done; the row engine runs it). One table's
+// aggregates are the pipeline's (lexdb_pipe.runAgg, slice P1b).
 fn batchGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
                gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
-    // Numerics as units first. Where that gives way (a numeric past its
-    // units, a condition the units do not compile, as a numeric IN list,
-    // LIKE or a float), the batches run again with numerics as values, as
-    // before units, then the row path; from the start each time (the
-    // groups are made at the end: none yet).
-    let h0: int = held + 0
-    // the counts so far: each try counts from the start again (a try that
-    // gave way would have them twice)
-    var cnt0: []lexdb_pipe.Counts = []
-    for c in rs.cnt { append(mut &cnt0, c) }
-    var usedDec = false
-    match batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, true, mut &usedDec) {
-        Ok(x) {
-            if x { return Ok(x) }
-            rs.cnt = copyCounts(&cnt0)
-            if !usedDec { return Ok(x) }
-        }
-        Err(x) {
-            if !lexdb_pipe.isSpill(&x) { return Err(x) }
-            held = h0
-            rs.cnt = copyCounts(&cnt0)
-            decSpills += 1
-        }
-    }
-    var none = false
-    let again = try batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max, false, mut &none)
-    if !again { rs.cnt = cnt0 }
-    return Ok(again)
+    // the counts so far: given back if the batches give way
+    let cnt0 = copyCounts(&rs.cnt)
+    let done = try batchGroupsIn(st, txn, sel, m, params, rs, gs, held, room, rs0max)
+    if !done { rs.cnt = cnt0 }
+    return Ok(done)
 }
 
 fn copyCounts(cs: &[]lexdb_pipe.Counts): []lexdb_pipe.Counts {
@@ -23330,12 +23319,13 @@ fn afterCols(sel: &Sel, q: &Query): []int {
     return out
 }
 
-// allowDec: numeric(p, s) columns as units (one table's batches); usedDec
-// set when the query reads such a column so.
+// The first table's batches joined with the tables after it (bJoinAll,
+// 9.102), the groups made of the joined batches, whose columns are the
+// query's.
 fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
-                 gs: mut &Groups, held: mut &int, room: int, rs0max: int, allowDec: bool, usedDec: mut &bool): Result[bool, DbErr] {
+                 gs: mut &Groups, held: mut &int, room: int, rs0max: int): Result[bool, DbErr] {
     let q = &sel.q
-    if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) == 0 || len(sel.gsets) > 0 { return Ok(false) }
+    if !rs.batch || sel.setop != 0 || len(sel.wins) > 0 || sel.first >= 0 || q.corr || len(q.levels) < 2 || len(sel.gsets) > 0 { return Ok(false) }
     // subqueries: only semi-joins' (levels, run before: 9.104)
     for sp in q.subs { if !sp.semi { return Ok(false) } }
     let lv = &q.levels[0]
@@ -23344,55 +23334,26 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     if (p.index < 0 && p.desc) || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return Ok(false) }
     // an index read alone, or its entries' rows (9.107: as bLevelPlan)
     if p.index >= 0 && lv.stops && !ixCovers(lv, p.index) { return Ok(false) }
-    let t = &lv.t
-    // A join (9.102): the first table's batches joined with the tables
-    // after it (bJoinAll), the groups made of the joined batches, whose
-    // columns are the query's.
-    let jn = len(q.levels) > 1
-    var lp0: []LPlan = []
+    let got0 = try bLevelPlan(st, txn, q, m, params, rs)
+    if got0.isNone() { return Ok(false) }
+    var lp = got0.unwrap()
+    if !lp.all || !lp.ranges { return Ok(false) }
     var jp = noJoins()
-    if jn {
-        let got = try bLevelPlan(st, txn, q, m, params, rs)
-        if got.isNone() { return Ok(false) }
-        let lp = got.unwrap()
-        if !lp.all || !lp.ranges { return Ok(false) }
-        match try bJoinPlan(st, txn, q, m, params, &lp, true) {
-            Some(x) { jp = x }
-            None { return Ok(false) }
-        }
-        append(mut &lp0, lp)
-    } else if lv.first != 0 || len(q.cols) != len(lv.t.cols) {
-        return Ok(false)
+    match try bJoinPlan(st, txn, q, m, params, &lp, true) {
+        Some(x) { jp = x }
+        None { return Ok(false) }
     }
-    // one table's batches hold a numeric(p, s) as its units (BK_DEC)
-    let dec = !jn && allowDec
+    let t = &lv.t
     var kinds: []int = []
-    if jn { for k in jp.kinds { append(mut &kinds, k) } } else { for c in t.cols { append(mut &kinds, if dec { lexdb_rows.decColKind(&c) } else { lexdb_rows.colKind(&c) }) } }
-    var needCol: []bool = []
-    for i in 0..len(t.cols) { append(mut &needCol, len(lv.need) == 0 || lv.need[i]) }
-    if dec { for i in 0..len(kinds) { if needCol[i] && lexdb_rows.isDecKind(kinds[i]) { usedDec = true } } }
-    let noAggs: []Val = []
-    let nullRow: []Val = array(len(q.cols), Val.Null)
-    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: seqEnv(st, txn)}
+    for k in jp.kinds { append(mut &kinds, k) }
     // the conditions, the group keys and the aggregates over batches
-    var conds: []BNode = []
-    if jn {
-        conds = replace(mut &lp0[0].conds, [])
-    } else {
-        for ci in 0..len(lv.cond) {
-            let c = bCompileCond(q, m, 0, ci, false, &kinds, 0, dec)
-            if c.isNone() { return Ok(false) }
-            let cc = c.unwrap()
-            if !lexdb_pipe.boolLike(cc.typ) { return Ok(false) }
-            append(mut &conds, lexdb_pipe.takeN(cc))
-        }
-    }
+    var conds = replace(mut &lp.conds, [])
     // keys and aggregates under a collation's keys (L2): the row path's
     for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return Ok(false) } }
     for sp in sel.specs { if sp.kind != lexdb_sql.COLL_EXACT { return Ok(false) } }
     var keys: []BComp = []
     for x in sel.groupBy {
-        let c = bCompileX(&x, q, &kinds, &m.ce, 0, dec)
+        let c = bCompileX(&x, q, &kinds, &m.ce, 0, false)
         if c.isNone() { return Ok(false) }
         let cc = c.unwrap()
         if cc.typ == lexdb_pipe.BT_OTHER {
@@ -23418,15 +23379,12 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             if len(sp.args) != 1 { return Ok(false) }
             let ax = bxOf(&sp.args[0], q)
             let c = match ax {
-                Some(bx) { lexdb_pipe.bCompileD(&bx, &q.cols, &kinds, &m.ce, 0, dec) }
+                Some(bx) { lexdb_pipe.bCompileD(&bx, &q.cols, &kinds, &m.ce, 0, false) }
                 None { None }
             }
             if c.isNone() { return Ok(false) }
             let cc = c.unwrap()
-            if kind != lexdb_pipe.BA_COUNT && lexdb_pipe.isDecT(cc.typ) {
-                // a numeric as units: its sum in 128 bits, its min or max as units
-                dsc = lexdb_pipe.decSc(cc.typ)
-            } else if kind != lexdb_pipe.BA_COUNT && cc.typ != lexdb_pipe.BT_INT {
+            if kind != lexdb_pipe.BA_COUNT && cc.typ != lexdb_pipe.BT_INT {
                 // min or max of a column of values, sum or avg of a numeric one
                 let vc = match ax {
                     Some(bx) { lexdb_pipe.bValCol(&bx, &kinds, 0) }
@@ -23442,7 +23400,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         var filt: Option[BNode] = None
         match sp.filter {
             Some(fx) {
-                let c = bCompileX(&fx, q, &kinds, &m.ce, 0, dec)
+                let c = bCompileX(&fx, q, &kinds, &m.ce, 0, false)
                 if c.isNone() { return Ok(false) }
                 let cc = c.unwrap()
                 if !lexdb_pipe.boolLike(cc.typ) { return Ok(false) }
@@ -23458,7 +23416,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     // column is used outside an aggregate (42803), so none for count(*).
     // Gathering every column read made q21's joins copy each one through
     // each level (design/lexdb-layers.md 6.2.2).
-    if jn {
+    {
         var used: []bool = array(len(q.cols), false)
         for kc in keys { lexdb_pipe.bColsOf(&kc.n, mut &used) }
         for ci in afterCols(sel, q) { used[ci] = true }
@@ -23474,71 +23432,15 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         }
         jpFinish(mut &jp, q, &used)
     }
-    var part = len(lv.need) > 0
-    if len(keys) == 0 && !jn {
-        var used: []bool = array(len(t.cols), false)
-        for c in conds { lexdb_pipe.bColsOf(&c, mut &used) }
-        for sp in specs {
-            match sp.arg {
-                Some(x) { lexdb_pipe.bColsOf(&x, mut &used) }
-                None {}
-            }
-            match sp.filter {
-                Some(x) { lexdb_pipe.bColsOf(&x, mut &used) }
-                None {}
-            }
-        }
-        needCol = used
-        part = true
-    }
-    var needList: []bool = []
-    for x in needCol { append(mut &needList, x) }
-    var scans = if jn { replace(mut &lp0[0].scans, []) } else { try pathScans(t, p, &env) }
-    var rd = lexdb_access.noIxRead()
-    if jn {
-        rd = replace(mut &lp0[0].rd, lexdb_access.noIxRead())
-    } else if p.index >= 0 {
-        rd.ix = p.index
-        rd.desc = p.desc
-        if ixCovers(lv, p.index) {
-            rd.only = true
-            match idxDecOf(t, p.index, &needCol) {
-                Some(d) { rd.dec = d }
-                None { return Ok(false) }
-            }
-        } else {
-            var swKeys: []str = []
-            let how = try firstSwitch(st, txn, q, &scans, rs, mut &swKeys)
-            if how == 1 { scans = [lexdb_access.wholeScan()] }
-            // its range's keys, counted (at most a batch): read once
-            if how == 0 && len(swKeys) <= lexdb_rows.BROWS && !p.desc {
-                rd.byKeys = true
-                rd.keys = swKeys
-            }
-        }
-    }
-    // where each column used is in a stored row
-    var tkinds: []int = []
-    for c in t.cols { append(mut &tkinds, if dec { lexdb_rows.decColKind(&c) } else { lexdb_rows.colKind(&c) }) }
-    var bp = lexdb_rows.emptyProjection()
-    if jn {
-        bp = replace(mut &lp0[0].bp, lexdb_rows.emptyProjection())
-    } else {
-        var proj = lexdb_rows.projectionOf(tkinds, needCol, &t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needList))
-        proj.ranges = lexdb_pipe.cRanges(&conds, &proj.kinds, t)
-        bp = proj
-    }
-    if jn { part = lp0[0].part }
-    // a group's first row: the joined batch's columns, or the table's
+    let scans = replace(mut &lp.scans, [])
+    let rd = replace(mut &lp.rd, lexdb_access.noIxRead())
+    let bp = replace(mut &lp.bp, lexdb_rows.emptyProjection())
+    let part = lp.part
+    // a group's first row: the joined batch's columns
     var rowKinds: []int = []
     var rowNeed: []bool = []
-    if jn {
-        for k in jp.kinds { append(mut &rowKinds, k) }
-        for x in jp.need { append(mut &rowNeed, x) }
-    } else {
-        for k in bp.kinds { append(mut &rowKinds, k) }
-        for x in bp.needCol { append(mut &rowNeed, x) }
-    }
+    for k in jp.kinds { append(mut &rowKinds, k) }
+    for x in jp.need { append(mut &rowNeed, x) }
     // A group's first row keeps only the columns read after grouping (its
     // outputs, HAVING, ORDER BY): the others, an aggregate's argument
     // among them, are not copied for each group (q18's 1.5M groups).
@@ -23546,8 +23448,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         var after: []bool = array(len(q.cols), false)
         for ci in afterCols(sel, q) { after[ci] = true }
         for i in 0..len(rowNeed) {
-            let qc = if jn { i } else { lv.first + i }
-            if qc < len(after) && !after[qc] { rowNeed[i] = false }
+            if i < len(after) && !after[i] { rowNeed[i] = false }
         }
     }
     let zone = txn.sql.zone
@@ -23564,32 +23465,16 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     var asum: [][]int = []
     var amm: [][]int = []
     var aval: [][]Val = []              // per value aggregate (vcol) and group: its sum, min or max
-    var adec: [][]i128 = []             // per numeric aggregate as units (dsc) and group: its sum
     for i in 0..ns {
         append(mut &an, [])
         append(mut &asum, [])
         append(mut &amm, [])
         append(mut &aval, [])
-        append(mut &adec, [])
     }
     var byInt: Map[int, int] = newMap()
     var byKey: Map[str, int] = newMap()
     var nullGroup = -1
     let oneKey = len(keys) == 1 && keys[0].typ != lexdb_pipe.BT_OTHER
-    // The one table read in primary key order, grouped by the key's first
-    // column: each group's rows come together (PostgreSQL's GroupAggregate
-    // over presorted input, nodeAgg.c), so a row is in the group before it
-    // or starts one; no map of the groups. (q18's subquery: lineitem by
-    // l_orderkey.)
-    var sorted = false
-    if !jn && oneKey && p.index < 0 && !p.desc && len(scans) == 1 && len(t.pk) > 0 {
-        match keys[0].n {
-            BNode.Col(c) { sorted = c == lv.first + t.pk[0] }
-            else {}
-        }
-    }
-    var lastKey = 0
-    var lastG = -1
     // one key a text or varchar column (under no collation: groupKinds):
     // its groups by its text, not by its encoded key
     var textCol = -1
@@ -23609,7 +23494,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     var nBatches = 0
     // after the scans, a RIGHT JOIN's rows that joined nothing (bUnmatched)
     let nsc = len(scans)
-    let tails = if jn && jp.right >= 0 { 1 } else { 0 }
+    let tails = if jp.right >= 0 { 1 } else { 0 }
     var tailAt = 0
     for sj in 0..nsc + tails {
         var cur = lexdb_access.newCursor()
@@ -23651,7 +23536,7 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                 idx = next
             }
             nJoined += len(idx)
-            if jn {
+            {
                 rs.bud.aside = held + 0
                 let got3 = try bJoinAll(st, txn, q, m, &jp, &b, &idx, &zone, rs)
                 rs.bud.aside = 0
@@ -23685,7 +23570,6 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                         append(mut &asum[i], 0)
                         append(mut &amm[i], 0)
                         append(mut &aval[i], Val.Null)
-                        append(mut &adec[i], i128(0))
                     }
                 }
             } else {
@@ -23697,8 +23581,6 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                     if oneKey {
                         if kvs[0].nul[j] {
                             g = nullGroup
-                        } else if sorted {
-                            if lastG >= 0 && kvs[0].v[j] == lastKey { g = lastG }
                         } else {
                             match byInt.get(&kvs[0].v[j]) {
                                 Some(x) { g = x }
@@ -23748,16 +23630,12 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                             append(mut &asum[i], 0)
                             append(mut &amm[i], 0)
                             append(mut &aval[i], Val.Null)
-                            append(mut &adec[i], i128(0))
-                        }
+                            }
                         if textCol >= 0 {
                             if b.cols[textCol].nul[idx[j]] { nullGroup = g } else { byText.put(ktext, g) }
                         } else if oneKey {
                             if kvs[0].nul[j] {
                                 nullGroup = g
-                            } else if sorted {
-                                lastKey = kvs[0].v[j]
-                                lastG = g
                             } else {
                                 byInt.put(kvs[0].v[j], g)
                             }
@@ -23781,12 +23659,10 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
                             append(mut &g2, gid[j])
                         }
                         if sp.vcol >= 0 { try lexdb_pipe.bAccVal(sp, &b, &r2, &g2, mut &an[si], mut &aval[si]) }
-                        else if sp.dsc >= 0 && (sp.kind == lexdb_pipe.BA_SUM || sp.kind == lexdb_pipe.BA_AVG) { try lexdb_pipe.bAccDec(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &adec[si]) }
                         else { try lexdb_pipe.bAccum(sp, &b, &r2, &g2, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
                     }
                     None {
                         if sp.vcol >= 0 { try lexdb_pipe.bAccVal(sp, &b, &idx, &gid, mut &an[si], mut &aval[si]) }
-                        else if sp.dsc >= 0 && (sp.kind == lexdb_pipe.BA_SUM || sp.kind == lexdb_pipe.BA_AVG) { try lexdb_pipe.bAccDec(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &adec[si]) }
                         else { try lexdb_pipe.bAccum(sp, &b, &idx, &gid, len(keys) == 0, mut &an[si], mut &asum[si], mut &amm[si]) }
                     }
                 }
@@ -23817,22 +23693,13 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
             if an[si][g] > 0 && specs[si].vcol >= 0 {
                 if kd == lexdb_pipe.BA_SUM || kd == lexdb_pipe.BA_AVG { accs[si].sum = aval[si][g] }
                 if kd == lexdb_pipe.BA_MIN || kd == lexdb_pipe.BA_MAX { accs[si].val = aval[si][g] }
-            } else if an[si][g] > 0 && specs[si].dsc >= 0 {
-                // as the row path's Decimal sum of the same values (display scale dsc)
-                let ds = specs[si].dsc
-                if kd == lexdb_pipe.BA_SUM || kd == lexdb_pipe.BA_AVG {
-                    match lexdb_vec.sumVal(adec[si][g], ds) {
-                        Some(v) { accs[si].sum = v }
-                        None { return Err(lexdb_ops.decErr()) }
-                    }
-                }
-                if kd == lexdb_pipe.BA_MIN || kd == lexdb_pipe.BA_MAX { accs[si].val = lexdb_rows.decVal(amm[si][g], ds) }
             } else if an[si][g] > 0 {
                 if kd == lexdb_pipe.BA_SUM || kd == lexdb_pipe.BA_AVG { accs[si].sum = Val.Int(asum[si][g]) }
                 if kd == lexdb_pipe.BA_MIN || kd == lexdb_pipe.BA_MAX { accs[si].val = Val.Int(amm[si][g]) }
             }
         }
         if fuse {
+            let noAggs: []Val = []
             var vals: []Val = []
             for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[i])) }
             let henv = Env{cols: &q.cols, row: &scratch, aggs: &vals, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
@@ -23845,12 +23712,6 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         append(mut &gs.accs, accs)
     }
     gs.firsts = firsts
-    if dec {
-        var anyDec = false
-        for sp in specs { if sp.dsc >= 0 { anyDec = true } }
-        for i in 0..len(bp.kinds) { if bp.needCol[i] && lexdb_rows.isDecKind(bp.kinds[i]) { anyDec = true } }
-        if anyDec { decRuns += 1 }
-    }
     groupRuns += 1
     rs.cnt[0].starts += 1
     rs.cnt[0].read += nRead
