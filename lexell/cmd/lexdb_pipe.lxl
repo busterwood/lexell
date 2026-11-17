@@ -1,0 +1,179 @@
+// lexdb_pipe: how a physical plan runs (design/lexdb-layers.md 6.2.3).
+// Its secret, when step 4 is done: push pipelines of operators over
+// chunks. For now it holds what they will stand on: the scalar evaluator
+// of bound expressions (lexdb_bind.BX).
+//
+// A run reads its session only through its context (Ctx): the
+// transaction's start and time zone, the parameters, and the hooks (Up)
+// for the functions it does not own, which its caller supplies. It never
+// imports lexdb_exec; from the store it takes the Store and Txn handles
+// only, never a transaction's SQL state.
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_ops"
+import "./lexdb_lib"
+import "./lexdb_bind"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// ---- the context
+
+// What a bound expression is evaluated in: the transaction's start and
+// time zone (as the row evaluator gives callAt), the run's parameters,
+// and the calls up into the functions its owner supplies.
+pub type Ctx = record {
+    pub now: int
+    pub zone: lexdb_time.Zone
+    pub params: []Val           // the run's parameters, for a plan's bound slots (BX.Param); [] where they are bound as constants
+    pub up: Up
+}
+
+// name's entry of n arguments where it is not lexdb_lib's; None: lexdb_lib's.
+pub type EntryFn = fn(&str, int): Option[lexdb_lib.LibFn]
+
+// A T-SQL or Oracle function's call in a time zone; None: lexdb's own.
+pub type DialectFn = fn(&str, &[]Val, &lexdb_time.Zone): Result[Option[Val], DbErr]
+
+// The functions an evaluation calls that are not lexdb_lib's: they read a
+// dialect or the catalog, so the evaluation's owner supplies them
+// (lexdb_exec: execUp).
+pub type Up = value record {
+    pub entry: EntryFn          // the catalog functions that read a dialect (format_type, pg_size_pretty)
+    pub dialect: DialectFn      // FnRef.dialect's call
+}
+
+// ---- the scalar evaluator (design/lexdb.md 9.108; design/lexdb-layers.md 4.4.1)
+//
+// bxEval gives exactly what lexdb_exec's eval gives for an expression the
+// binder bound (lexdb_bind.bindExpr): it runs eval's own operations
+// (lexdb_ops' unaryVal, binOp, castTo; callAt and the bound entries of
+// lexdb_lib). What eval alone evaluates does not bind.
+
+// A unary operator's text (lexdb_ops.UN_*), as unaryVal takes it.
+fn unName(u: int): &str {
+    if u == lexdb_ops.UN_NEG { return "-" }
+    if u == lexdb_ops.UN_BITNOT { return "~" }
+    return "not"
+}
+
+// x's value for row (aggs: #agg's slots), as eval gives it.
+pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Val, DbErr] {
+    match x {
+        lexdb_bind.BX.Const(v) { return Ok(v) }
+        lexdb_bind.BX.Param(i) {
+            if i >= len(ce.params) { return Err(e("08P01", &("there is no parameter $" + (i + 1).toStr()))) }
+            return Ok(ce.params[i])
+        }
+        lexdb_bind.BX.Col(i) {
+            if len(row) == 0 { return Ok(Val.Null) }
+            return Ok(row[i])
+        }
+        lexdb_bind.BX.Agg(i) { return Ok(aggs[i]) }
+        lexdb_bind.BX.Un(u, a) { return lexdb_ops.unaryVal(unName(u), try bxEval(&a, row, aggs, ce)) }
+        lexdb_bind.BX.And(a, b) {
+            let l = lexdb_ops.truth(&(try bxEval(&a, row, aggs, ce)))
+            if l == Some(false) { return Ok(Val.Bool(false)) }
+            let r = lexdb_ops.truth(&(try bxEval(&b, row, aggs, ce)))
+            if r == Some(false) { return Ok(Val.Bool(false)) }
+            if l.isNone() || r.isNone() { return Ok(Val.Null) }
+            return Ok(Val.Bool(true))
+        }
+        lexdb_bind.BX.Or(a, b) {
+            let l = lexdb_ops.truth(&(try bxEval(&a, row, aggs, ce)))
+            if l == Some(true) { return Ok(Val.Bool(true)) }
+            let r = lexdb_ops.truth(&(try bxEval(&b, row, aggs, ce)))
+            if r == Some(true) { return Ok(Val.Bool(true)) }
+            if l.isNone() || r.isNone() { return Ok(Val.Null) }
+            return Ok(Val.Bool(false))
+        }
+        lexdb_bind.BX.Op(op, a, b) {
+            let l = try bxEval(&a, row, aggs, ce)
+            let r = try bxEval(&b, row, aggs, ce)
+            return lexdb_ops.binOp(op, l, r, fn(): lexdb_time.Zone { return ce.zone })
+        }
+        lexdb_bind.BX.Cat(a, b, f) {
+            let l = try bxEval(&a, row, aggs, ce)
+            let r = try bxEval(&b, row, aggs, ce)
+            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return callAt(&f, &[l, r], 0, &lexdb_time.utc(), ce.up.entry) }
+            return lexdb_ops.binOp(lexdb_ops.OP_CAT, l, r, fn(): lexdb_time.Zone { return ce.zone })
+        }
+        lexdb_bind.BX.IsNull(a, neg) {
+            let v = try bxEval(&a, row, aggs, ce)
+            return Ok(Val.Bool(lexdb_ops.isNull(&v) != neg))
+        }
+        lexdb_bind.BX.Cast(a, t) { return lexdb_ops.castTo(try bxEval(&a, row, aggs, ce), &t, fn(): lexdb_time.Zone { return ce.zone }) }
+        lexdb_bind.BX.Case(cs, hasElse) {
+            // only the branch taken is evaluated
+            let pairs = if hasElse { (len(cs) - 1) / 2 } else { len(cs) / 2 }
+            for k in 0..pairs { if lexdb_ops.truth(&(try bxEval(&cs[2 * k], row, aggs, ce))) == Some(true) { return bxEval(&cs[2 * k + 1], row, aggs, ce) } }
+            if hasElse { return bxEval(&cs[len(cs) - 1], row, aggs, ce) }
+            return Ok(Val.Null)
+        }
+        lexdb_bind.BX.Try(a) {
+            match bxEval(&a, row, aggs, ce) {
+                Ok(v) { return Ok(v) }
+                Err(_) { return Ok(Val.Null) }
+            }
+        }
+        lexdb_bind.BX.Call(fb, cs) {
+            var vs: []Val = withCapacity(len(cs))
+            for c in cs { append(mut &vs, try bxEval(&c, row, aggs, ce)) }
+            return callRef(&fb, &vs, ce)
+        }
+    }
+}
+
+// A bound call's value for its arguments vs, as eval's call gives it.
+fn callRef(fb: &lexdb_bind.FnRef, vs: &[]Val, ce: &Ctx): Result[Val, DbErr] {
+    if fb.dialect {
+        match try ce.up.dialect(&fb.name, vs, &ce.zone) {
+            Some(v) { return Ok(v) }
+            None {}
+        }
+    }
+    if fb.way == lexdb_bind.FN_ONE {
+        if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+        return fb.f1(&fb.name, &vs[0])
+    }
+    return fb.f(&fb.name, vs, ce.now, &ce.zone)
+}
+
+// name's call, with now the transaction's start (microseconds since 2000;
+// 0: the clock). z: the session's time zone (9.95); up: the entries that
+// are not lexdb_lib's. The entry is found per call (a bound call finds it
+// once: lexdb_exec.fnRefOf).
+pub fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone, up: EntryFn): Result[Val, DbErr] {
+    if len(vs) == 1 {
+        match lexdb_lib.entry1Of(name) {
+            Some(f) {
+                if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+                return f(name, &vs[0])
+            }
+            None {}
+        }
+    }
+    let f = entryAt(name, len(vs), up)
+    return f(name, vs, now, z)
+}
+
+// name's entry of n arguments: up's, else lexdb_lib's.
+pub fn entryAt(name: &str, n: int, up: EntryFn): lexdb_lib.LibFn {
+    match up(name, n) {
+        Some(f) { return f }
+        None {}
+    }
+    return lexdb_lib.entryOf(name, n)
+}
+
+// Whether a value may be an array's text (a {...} text): || then takes
+// it as an array (design/lexdb.md 9.92).
+pub fn looksArray(v: &Val): bool {
+    match v {
+        Val.Text(t) { return len(t) >= 2 && t[0] == '{' }
+        else { return false }
+    }
+}
