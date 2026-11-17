@@ -10,6 +10,11 @@
 - The storage stack is layered (design/lexdb-layers.md 4): lexdb_access
   (layer 2, how a relation is laid out in trees) imports only the store, the
   row codecs and the vocabulary below it; nothing below it imports it.
+- The pipeline module lexdb_pipe (layer 6, design/lexdb-layers.md 6.2.3)
+  sits below lexdb_exec and above the plan, the binder and access: it never
+  imports exec, a dialect or a protocol module; from the store it uses the
+  Store and Txn handles only, and it never reads a transaction's SQL state
+  (Txn.sql). Only lexdb_exec imports it.
 - No cycle.
 
 Run by lexdb.py before the tests; also usable directly.
@@ -27,7 +32,7 @@ CORE = {
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
-    "lexdb_page", "lexdb_parse", "lexdb_plan", "lexdb_repl", "lexdb_rows",
+    "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
     "lexdb_session", "lexdb_sql", "lexdb_sqlcoll",
     "lexdb_store", "lexdb_time",
 }
@@ -84,6 +89,16 @@ OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb
 LIB = "lexdb_lib"
 LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access"}
 
+# The pipeline module (design/lexdb-layers.md 6.2.3): what it may import
+# (and lexell's own libraries), the store names it may use, and who may
+# import it. Session state reaches it in its context (lexdb_pipe.Ctx).
+PIPE = "lexdb_pipe"
+PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
+                   "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
+                   "lexdb_access", "lexdb_store"}
+PIPE_STORE_NAMES = {"Store", "Txn"}
+PIPE_USERS = {"lexdb_exec"}
+
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
 PARSER_DATA = "lexdb_dialect"
@@ -128,6 +143,21 @@ def check():
     for m in sorted(BELOW_ACCESS):
         if ACCESS in mods.get(m, []):
             bad.append(f"{m} -> {ACCESS}: a module below the access layer imports it")
+    for d in mods.get(PIPE, []):
+        if d not in PIPE_MAY_IMPORT:
+            bad.append(f"{PIPE} -> {d}: the pipeline imports above or beside its layer")
+    for m in sorted(mods):
+        if PIPE in mods[m] and m not in PIPE_USERS:
+            bad.append(f"{m} -> {PIPE}: only {', '.join(sorted(PIPE_USERS))} imports the pipeline")
+    pipe = os.path.join(CMD, PIPE + ".lxl")
+    if os.path.exists(pipe):
+        with open(pipe, encoding="utf-8") as f:
+            body = f.read()
+        names = set(re.findall(r"\blexdb_store\.([A-Za-z_][A-Za-z0-9_]*)", body)) - PIPE_STORE_NAMES
+        if names:
+            bad.append(f"{PIPE} uses lexdb_store beyond Store and Txn: " + ", ".join(sorted(names)))
+        if re.search(r"\.sql\.", body):
+            bad.append(f"{PIPE} reads a transaction's SQL state (Txn.sql)")
     for m in sorted(set(mods) - CORE - DIALECT):
         bad.append(f"{m}: not in the core or dialect sets")
 
