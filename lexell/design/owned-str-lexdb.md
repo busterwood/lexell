@@ -42,7 +42,7 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | P | par.map's kernel check refuses `rc` count changes (reading through a handle is fine). httpserver keeps its router in an `rc`; `Next[A]` (handed to middleware) holds a handle and `run` consumes it. | 8b69affc | yes | none for lexdb (it has its own servers) |
 | Q | `Shared` gets `share()`; `LXL_OWNED_SHARED=1` measures the owned-handle version (as `LXL_OWNED_STR` does for strings); a `copy` type parameter satisfies `Clone`; httpserver's app type is `A: Clone` and each connection gets `app.clone()`. 76 implicit `Shared` copies outside lexdb now say `share()`/`clone()`. | 6d3a55cc, e7244cff | yes: `Shared` is still a copy type, so `share()` is optional today | none |
-| R | `task.Frozen` is deprecated in favour of `rc T`: pool keeps its config in an `rc`, so `pool.Pool` is owned (copies are `clone()`). `Frozen` stays only for lexdb. | (this commit) | yes | none |
+| R | `task.Frozen` is deprecated in favour of `rc T`: pool keeps its config in an `rc`, so `pool.Pool` is owned (copies are `clone()`). `Frozen` stays only for lexdb. | b33aa25b | yes | none |
 
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
