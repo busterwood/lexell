@@ -2958,7 +2958,13 @@ pub type SubVal = record {
 pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(), numeric: false, hasNull: false} }
 
 // A copy of subs (a compiled expression's own: BGen's context).
-fn copySubs(subs: &[]SubVal): []SubVal {
+pub fn copySub(s: &SubVal): SubVal {
+    var set: Map[str, int] = newMap()
+    for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
+    return SubVal{rows: s.rows, val: s.val, set: set, numeric: s.numeric, hasNull: s.hasNull}
+}
+
+pub fn copySubs(subs: &[]SubVal): []SubVal {
     var out: []SubVal = []
     for s in subs {
         var set: Map[str, int] = newMap()
@@ -4951,4 +4957,83 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
         try give(&rg.firsts[g], &accs)
     }
     return Ok(rg.added)
+}
+
+// ---- the row engine's joined rows (slice P2c)
+//
+// A query the pipeline does not run whole (its rows sorted, DISTINCT,
+// windowed, a set's part, a statement's query, an aggregate it does not
+// accumulate) has its joins run by it: a program of its join arms only
+// (compileLevels), whose joined rows, every column its tables decode, go
+// one by one to the row engine's emit (runLevels), as the batch driver's
+// first level gave them.
+
+// The program of a join tree p (Join arms over Filter? (Scan)) run for
+// the row engine; Err(p): not one the pipeline joins. Its tables decode
+// the columns their arms say (the statement's names: the row engine reads
+// the rows whole).
+pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+    match p {
+        lexdb_plan.PPlan.Join(_, _) {}
+        else { return Err(p) }
+    }
+    var avail: []bool = array(len(cols), false)
+    let n = joinOps(&p, cols, mut &avail)
+    if n < 0 { return Err(p) }
+    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true})
+}
+
+// Runs a levels program (compileLevels): each joined row (the query's
+// columns its tables decode, the others NULL) to each, in the row
+// engine's order; false from each stops. An error of each is given as is
+// (the rows before it given); one of the joins' is the row engine's
+// (the chunk joined again row by row).
+pub fn runLevels(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
+                 srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+                 each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    runs += 1
+    joinRuns += 1
+    batchRuns += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    let nq = len(cols)
+    var kinds: []int = []
+    var owner: []int = []
+    kindsFor(&pg.plan, tabs, nq, false, mut &kinds, mut &owner)
+    var want: []bool = array(nq, false)
+    decoded(&pg.plan, mut &want)
+    var wl: []int = []
+    for c in 0..nq { if want[c] { append(mut &wl, c) } }
+    let ks = collections.copyOf(&kinds)
+    var row: []Val = array(nq, Val.Null)
+    var bad: []DbErr = []
+    try joinRows(st, txn, &pg.plan, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt,
+                 fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+        for r in 0..f.n {
+            for c in wl { row[c] = if f.cols[c].nul[r] { Val.Null } else { bValAt(f, c, ks[c], r) } }
+            match each(tx, &row) {
+                Ok(go) { if !go { return Ok(false) } }
+                Err(x) {
+                    // (the consumer's: not a join's to read again)
+                    append(mut &bad, x)
+                    return Ok(false)
+                }
+            }
+        }
+        return Ok(true)
+    })
+    if len(bad) > 0 { return Err(replace(mut &bad[0], e("XX000", ""))) }
+    return Ok(Unit{})
+}
+
+// The query's columns a join plan's tables decode, set in want.
+fn decoded(p: &lexdb_plan.PPlan, want: mut &[]bool) {
+    match p {
+        lexdb_plan.PPlan.Join(i, j) {
+            decoded(&i, want)
+            for c in 0..len(j.scan.need) { if j.scan.need[c] && j.mark == lexdb_plan.MK_JOIN { want[j.scan.first + c] = true } }
+        }
+        lexdb_plan.PPlan.Filter(i, _) { decoded(&i, want) }
+        lexdb_plan.PPlan.Scan(sc, _) { for c in 0..len(sc.need) { if sc.need[c] { want[sc.first + c] = true } } }
+        else {}
+    }
 }
