@@ -3521,7 +3521,7 @@ type RC = record { read: int; kept: int; batches: int; pushed: int }
 // stopped it.
 fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, bp: &BPlan,
             conds: &[]BNode, pushCol: int, push: &Map[int, int], rawOnErr: bool, rc: mut &RC,
-            each: &fn(mut &lexdb_store.Txn, Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
+            each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     var ranges = false
     for s in src.scans { if !s.point && !s.empty { ranges = true } }
@@ -3566,12 +3566,12 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
                 Ok(kept) {
                     rc.kept += len(kept)
                     let fin = pushed(&b, kept, pushCol, push, rc)
-                    if !(try each(txn, b, fin, false)) { return Ok(true) }
+                    if !(try each(txn, mut &b, fin, false)) { return Ok(true) }
                 }
                 Err(x) {
                     // the caller's, row by row (an error past a LIMIT is not reached)
                     if !rawOnErr { return Err(x) }
-                    if !(try each(txn, b, idx, true)) { return Ok(true) }
+                    if !(try each(txn, mut &b, idx, true)) { return Ok(true) }
                 }
             }
         }
@@ -3625,16 +3625,17 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
                 cur = saved
                 let g2 = try lexdb_access.fillLevel(st, txn, &rel, &src.rd, &s, sc.part, mut &cur, bp, mut &spare)
                 if g2.isNone() { return Err(batErr()) }
-                let b2 = g2.unwrap()
+                var b2 = g2.unwrap()
                 var all: []int = withCapacity(b2.n)
                 for r in 0..b2.n { append(mut &all, r) }
                 rc.read += b2.n
                 rc.batches += 1
-                if !(try each(txn, b2, all, true)) { return Ok(true) }
+                if !(try each(txn, mut &b2, all, true)) { return Ok(true) }
+                spare = b2
                 continue
             }
             var pk = got.unwrap()
-            let b = replace(mut &pk.b, lexdb_rows.noRows())
+            var b = replace(mut &pk.b, lexdb_rows.noRows())
             let idx = replace(mut &pk.idx, [])
             let nr = b.n
             if nr == 0 {
@@ -3645,7 +3646,9 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
             rc.kept += keptN
             rc.pushed += dropped
             rc.batches += 1
-            if !(try each(txn, b, idx, false)) { return Ok(true) }
+            if !(try each(txn, mut &b, idx, false)) { return Ok(true) }
+            // (the batch back from its consumer, used again: lexdb_rows.reuse)
+            spare = b
         }
     }
     return Ok(false)
@@ -4093,8 +4096,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
         let none: Map[int, int] = newMap()
         var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
         let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &none, false, mut &rc,
-                                fn(tx: mut &lexdb_store.Txn, b: Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
-            try bd.add(&b, &idx, &bp, &j.hcols, mode, false, keepAll, j.resCol, room, maxHeld)
+                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
+            try bd.add(b, &idx, &bp, &j.hcols, mode, false, keepAll, j.resCol, room, maxHeld)
             return Ok(true)
         })
         nread = rc.read
@@ -4641,46 +4644,14 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     let pm = &jr.jls[if pushCol >= 0 { 1 } else { 0 }].ints
     var rawKept = 0
     let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &bp, &cn, pushCol, pm, exact, mut &rc,
-                               fn(tx: mut &lexdb_store.Txn, b: Batch, idx: []int, raw: bool): Result[bool, DbErr] {
+                               fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
-        js.cur[0] = b
-        js.sk.skip = 0
-        js.sk.given = 0
-        if raw {
-            // its conditions gave an error on one of its rows: row by row
-            for r in 0..js.cur[0].n {
-                let k = try pick(&cn, &js.cur[0], [r])
-                if len(k) == 0 { continue }
-                rawKept += 1
-                var at1: [][]int = []
-                append(mut &at1, [r])
-                if !(try joinFrom(st, tx, &jr, mut &js, tabs, 1, at1, 1, cx, bud, cnt, true, out)) { return Ok(false) }
-            }
-            return Ok(true)
-        }
-        let n = len(idx)
-        var at: [][]int = []
-        append(mut &at, collections.copyOf(&idx))
-        if !exact { return joinFrom(st, tx, &jr, mut &js, tabs, 1, at, n, cx, bud, cnt, false, out) }
-        let c0 = collections.copyOf(cnt)
-        let h0 = bud.held
-        match joinFrom(st, tx, &jr, mut &js, tabs, 1, at, n, cx, bud, cnt, false, out) {
-            Ok(go) { return Ok(go) }
-            Err(x) {
-                if isBat(&x) || x.state == "53200" || x.state == "57014" || isSpill(&x) { return Err(x) }
-                // an expression's error: the chunk again row by row, as the
-                // row engine joins (the rows given skipped; one past a LIMIT
-                // not reached)
-                for i in 0..len(c0) { cnt[i] = c0[i] }
-                bud.held = h0
-                js.sk.skip = js.sk.given
-                js.sk.given = 0
-                var at2: [][]int = []
-                append(mut &at2, idx)
-                return joinFrom(st, tx, &jr, mut &js, tabs, 1, at2, n, cx, bud, cnt, true, out)
-            }
-        }
+        js.cur[0] = replace(b, lexdb_rows.noRows())
+        let got = joinChunk(st, tx, &jr, mut &js, tabs, &cn, idx, raw, exact, cx, bud, cnt, mut &rawKept, out)
+        // (the batch back to the scan, used again)
+        b = replace(mut &js.cur[0], lexdb_rows.noRows())
+        return got
     })
     cnt[sc.level].joined += rawKept
     if rightAt >= 0 && !stopped {
@@ -4723,6 +4694,51 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         pushDrops += rc.pushed
     }
     return Ok(Unit{})
+}
+
+// One chunk of the first table (its rows idx in js.cur[0]; raw: its
+// conditions not yet applied, an error among them) joined on: an
+// expression's error joins it again row by row where exact.
+fn joinChunk(st: &lexdb_store.Store, tx: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, cn: &[]BNode,
+             idx: []int, raw: bool, exact: bool, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, rawKept: mut &int,
+             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+
+        js.sk.skip = 0
+        js.sk.given = 0
+        if raw {
+            // its conditions gave an error on one of its rows: row by row
+            for r in 0..js.cur[0].n {
+                let k = try pick(cn, &js.cur[0], [r])
+                if len(k) == 0 { continue }
+                rawKept += 1
+                var at1: [][]int = []
+                append(mut &at1, [r])
+                if !(try joinFrom(st, tx, jr, js, tabs, 1, at1, 1, cx, bud, cnt, true, out)) { return Ok(false) }
+            }
+            return Ok(true)
+        }
+        let n = len(idx)
+        var at: [][]int = []
+        append(mut &at, collections.copyOf(&idx))
+        if !exact { return joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, false, out) }
+        let c0 = collections.copyOf(cnt)
+        let h0 = bud.held
+        match joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, false, out) {
+            Ok(go) { return Ok(go) }
+            Err(x) {
+                if isBat(&x) || x.state == "53200" || x.state == "57014" || isSpill(&x) { return Err(x) }
+                // an expression's error: the chunk again row by row, as the
+                // row engine joins (the rows given skipped; one past a LIMIT
+                // not reached)
+                for i in 0..len(c0) { cnt[i] = c0[i] }
+                bud.held = h0
+                js.sk.skip = js.sk.given
+                js.sk.given = 0
+                var at2: [][]int = []
+                append(mut &at2, idx)
+                return joinFrom(st, tx, jr, js, tabs, 1, at2, n, cx, bud, cnt, true, out)
+            }
+        }
 }
 
 // The query's kinds and owners for a join plan (joinKinds), fresh.

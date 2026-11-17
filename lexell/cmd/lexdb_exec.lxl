@@ -6013,12 +6013,25 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     Ok(_) { return Ok(Unit{}) }
                     Err(x) { if !lexdb_pipe.isBat(&x) || emitted > 0 { return Err(x) } }
                 }
+                // (prepare built no hash for it: the row engine's, with them)
+                rs.batch = false
+                let m2 = try prepareIn(st, txn, q, params, rs, true, true)
+                rs.batch = true
+                var row2: []Val = array(len(q.cols), Val.Null)
+                return runRows(st, txn, q, &m2, params, mut &row2, emit, rs)
             }
             None {}
         }
     }
     var row: []Val = array(len(q.cols), Val.Null)
-    if !(try runLevel(st, txn, q, m, 0, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+    return runRows(st, txn, q, m, params, mut &row, emit, rs)
+}
+
+// runQuery's row engine: the levels from the first, then a RIGHT or FULL
+// JOIN's rows that joined nothing.
+fn runRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, row: mut &[]Val,
+           emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
+    if !(try runLevel(st, txn, q, m, 0, row, params, emit, rs)) { return Ok(Unit{}) }
     // A RIGHT or FULL JOIN's rows that joined nothing, with NULLs for the
     // tables before it, go on through the tables after it.
     for k in 1..len(q.levels) {
@@ -6030,7 +6043,7 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             for i in 0..len(m.mat[k][ri]) { row[lv.first + i] = m.mat[k][ri][i] }
             rs.cnt[k].unmatched += 1
             if try allTrueX(st, txn, q, m, &lv.post, &row, params, rs) {
-                if !(try runLevel(st, txn, q, m, k + 1, mut &row, params, emit, rs)) { return Ok(Unit{}) }
+                if !(try runLevel(st, txn, q, m, k + 1, row, params, emit, rs)) { return Ok(Unit{}) }
             }
         }
     }
@@ -8035,8 +8048,9 @@ fn prepareIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, param
             m.vrows[k] = copyRows(&rs.cache.rows[at])
         }
     }
-    // (the pipeline builds a join's hashes itself: slice P2)
-    if mat { try materialize(st, txn, q, mut &m, params, rs) }
+    // (the pipeline builds a join's hashes itself: slice P2; a levels
+    // program's too, Query.jp)
+    if mat && !(rs.batch && q.jp.isSome()) { try materialize(st, txn, q, mut &m, params, rs) }
     return Ok(m)
 }
 
@@ -13545,12 +13559,6 @@ fn runLevelsProg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m
     for k in 0..len(q.levels) { append(mut &vrows, if q.levels[k].virt() { copyRows(&m.vrows[k]) } else { [] }) }
     var cnt: []lexdb_pipe.Counts = []
     try lexdb_pipe.runLevels(st, txn, pg, &q.cols, &tabs, &srcs, &vrows, &cx, mut &rs.bud, mut &cnt, emit)
-    // (its hashes' rows read are prepare's to count: materialize built them
-    // too, for the row engine where the pipeline gives way)
-    for k in 0..len(cnt) {
-        cnt[k].built = 0
-        cnt[k].kept = 0
-    }
     levelCounts(rs, &cnt)
     return Ok(Unit{})
 }
