@@ -615,7 +615,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             // now() and the rest: the transaction's start (9.76)
             match env.seq {
-                Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now), &se.zone) }
+                Some(se) { return callAt(&name, &vs, lexdb_time.fromUnixUs(se.now), &se.zone, catEntry) }
                 None {}
             }
             return call(&name, &vs)
@@ -659,14 +659,31 @@ fn castVal(v: Val, t: &lexdb_sql.TypeName, seq: &Option[SeqEnv]): Result[Val, Db
 // session, lock or catalog function, a reg cast, T-SQL's typed division
 // and AVG) does not bind (fnRefOf's FN_NONE): eval runs it.
 
-// What a compiled expression is evaluated in: the session (seq, as Env
-// has it), and the transaction's start and time zone eval gives callAt.
+// What a compiled expression is evaluated in: the transaction's start and
+// time zone eval gives callAt, the run's parameters, and the calls up into
+// the functions its owner supplies (Up: design/lexdb-layers.md 6.2.3).
 type CEnv = record {
-    seq: Option[SeqEnv]
     now: int
     zone: lexdb_time.Zone
     params: []Val           // the run's parameters, for a plan's bound slots (BX.Param); [] where they are bound as constants
+    up: Up
 }
+
+// name's entry of n arguments where it is not lexdb_lib's; None: lexdb_lib's.
+type EntryFn = fn(&str, int): Option[lexdb_lib.LibFn]
+
+// A T-SQL or Oracle function's call in a time zone; None: lexdb's own.
+type DialectFn = fn(&str, &[]Val, &lexdb_time.Zone): Result[Option[Val], DbErr]
+
+// The functions an evaluation calls that are not lexdb_lib's: they read a
+// dialect or the catalog, so the evaluation's owner supplies them.
+type Up = value record {
+    entry: EntryFn          // the catalog functions that read a dialect (catEntry)
+    dialect: DialectFn      // FnRef.dialect's call (callDialectFn)
+}
+
+// The evaluator's hooks as exec supplies them.
+fn execUp(): Up { return Up{entry: catEntry, dialect: callDialectFn} }
 
 fn cenvOf(seq: Option[SeqEnv]): CEnv {
     var now = 0
@@ -678,7 +695,7 @@ fn cenvOf(seq: Option[SeqEnv]): CEnv {
         }
         None {}
     }
-    return CEnv{seq: seq, now: now, zone: z, params: []}
+    return CEnv{now: now, zone: z, params: [], up: execUp()}
 }
 
 // Whether name is a T-SQL or Oracle function that lexdb's own functions do
@@ -711,7 +728,7 @@ fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
             None {}
         }
     }
-    return lexdb_bind.FnRef{name: name.toStr(), way: way, f: entryAt(name, n), f1: f1, dialect: isDialectFn(name)}
+    return lexdb_bind.FnRef{name: name.toStr(), way: way, f: entryAt(name, n, catEntry), f1: f1, dialect: isDialectFn(name)}
 }
 
 // A unary operator's text (lexdb_ops.UN_*), as unaryVal takes it.
@@ -759,7 +776,7 @@ fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, 
         lexdb_bind.BX.Cat(a, b, f) {
             let l = try bxEval(&a, row, aggs, ce)
             let r = try bxEval(&b, row, aggs, ce)
-            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return call(&f, &[l, r]) }
+            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return callAt(&f, &[l, r], 0, &lexdb_time.utc(), ce.up.entry) }
             return lexdb_ops.binOp(lexdb_ops.OP_CAT, l, r, fn(): lexdb_time.Zone { return ce.zone })
         }
         lexdb_bind.BX.IsNull(a, neg) {
@@ -791,7 +808,7 @@ fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &CEnv): Result[Val, 
 // A bound call's value for its arguments vs, as eval's call gives it.
 fn callRef(fb: &lexdb_bind.FnRef, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     if fb.dialect {
-        match try callDialectFn(&fb.name, vs, &ce.zone) {
+        match try ce.up.dialect(&fb.name, vs, &ce.zone) {
             Some(v) { return Ok(v) }
             None {}
         }
@@ -803,12 +820,13 @@ fn callRef(fb: &lexdb_bind.FnRef, vs: &[]Val, ce: &CEnv): Result[Val, DbErr] {
     return fb.f(&fb.name, vs, ce.now, &ce.zone)
 }
 
-fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0, &lexdb_time.utc()) }
+fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return callAt(name, vs, 0, &lexdb_time.utc(), catEntry) }
 
-// call, with now the transaction's start (microseconds since 2000; 0: the clock).
-// z: the session's time zone (9.95). The entry is found per call (a
-// bound call finds it once: fnRefOf).
-fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+// name's call, with now the transaction's start (microseconds since 2000;
+// 0: the clock). z: the session's time zone (9.95); up: the entries that
+// are not lexdb_lib's. The entry is found per call (a bound call finds it
+// once: fnRefOf).
+fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone, up: EntryFn): Result[Val, DbErr] {
     if len(vs) == 1 {
         match lexdb_lib.entry1Of(name) {
             Some(f) {
@@ -818,16 +836,25 @@ fn callAt(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, Db
             None {}
         }
     }
-    let f = entryAt(name, len(vs))
+    let f = entryAt(name, len(vs), up)
     return f(name, vs, now, z)
 }
 
-// name's entry of n arguments: lexdb_lib's, or one of the two catalog
-// functions that read PostgreSQL's dialect (lexdb_pgcat, lexdb_pg).
-fn entryAt(name: &str, n: int): lexdb_lib.LibFn {
-    if name == "format_type" && n == 2 { return formatTypeFn }
-    if name == "pg_size_pretty" && n == 1 { return sizePrettyFn }
+// name's entry of n arguments: up's, else lexdb_lib's.
+fn entryAt(name: &str, n: int, up: EntryFn): lexdb_lib.LibFn {
+    match up(name, n) {
+        Some(f) { return f }
+        None {}
+    }
     return lexdb_lib.entryOf(name, n)
+}
+
+// The two catalog functions that read PostgreSQL's dialect (lexdb_pgcat,
+// lexdb_pg): the evaluator's entry hook (Up.entry).
+fn catEntry(name: &str, n: int): Option[lexdb_lib.LibFn] {
+    if name == "format_type" && n == 2 { return Some(formatTypeFn) }
+    if name == "pg_size_pretty" && n == 1 { return Some(sizePrettyFn) }
+    return None
 }
 
 fn formatTypeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
@@ -21856,7 +21883,7 @@ fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &CEnv): Option[BG
         append(mut &cols, i - base)
         append(mut &ks, kinds[i])
     }
-    let gce = CEnv{seq: ce.seq, now: ce.now, zone: ce.zone, params: if par { collections.copyOf(&ce.params) } else { [] }}
+    let gce = CEnv{now: ce.now, zone: ce.zone, params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up}
     return Some(BGen{cx: c, cols: cols, kinds: ks, ce: gce})
 }
 
