@@ -2541,6 +2541,199 @@ the note says otherwise; search for the names, since line numbers move.
   after the split, `planFrom` reading `q.lp` must give the same `ms`/`ps`
   per level as today (compare their `exprText`s in the check build).
 
+**2e slice 2 as built: `buildQuery` is `bindFrom` then `planFrom`.**
+Three commits on `redesign/bind` from main caaa5cfc, each built and
+through the suite (188, imports ok): 22566849 (the semi-join alternatives
+planned after the FROM pass), 81f83bfd (the split), dc60df84 (WHERE's
+semi-join candidates found in place), and a fourth with this note. Way in
+steps 1 and 2 of "Where 2e slice 1 left off"; `bindFrom` stays in
+`lexdb_exec` (step 3, the move, waits for slice 3). No plan and no result
+changes.
+
+- `buildQuery` keeps its signature (its 13 callers do not change) and is
+  now three parts:
+  - the prologue (phase 1): the `Scope`'s hints taken as before (`early`,
+    `locking`, `noRefKeys` onto `q`, `ordBy`, `ordLim`) with WHERE's
+    semi-join candidates into a `FromHints` record. The candidates come
+    from the parsed WHERE (`semiCands`: the AND tree walked in place,
+    `semiParsed` on each conjunct; it used to copy every conjunct first,
+    dc60df84), not from the resolved one: `pullCommonOr` can make a new
+    top-level conjunct, so `semiResolved` on `q.lp`'s `Filter` would not
+    give the same set.
+  - `bindFrom(st, txn, from, where, params, subs, sc, q: mut &Query):
+    FromBound` (phases 2-4, 6-7's resolve): pushes the frame, walks FROM
+    (items, `addCol`, `Frame.cols`, USING/NATURAL, `pos`), plans and
+    numbers the expression subqueries with the frame's `sub*` lists (the
+    views' after them), resolves ON and USING's ON into each `Join`'s `on`
+    and WHERE (after `pullCommonOr`, kept here for q19) into the `Filter`,
+    and sets `q.lp`. `FromBound` is `anyUsing` (the right-join switch reads
+    it) and `where`: whether `q.lp`'s top is WHERE's `Filter`. It still
+    calls the planner in three places: `planSub` of a FROM subquery or a
+    view and of each expression subquery (binds and plans), and `loadEst`
+    of each table (phase 2).
+  - `planFrom(st, txn, q: mut &Query, hs: &FromHints, bf: &FromBound,
+    params, subs, selNames, star, sc, reorder)` (phases 3's alternatives,
+    5, 6-7's placement, 8): the semi-join alternatives, `colAt`,
+    `lastRight`, then `fromConds(&q.lp, bf.where, ms, cs)`, then the
+    placement, `need`, implied equalities, join order, paths, hashing and
+    semi-joins as before.
+- `fromConds`/`onConds`: the k-th left-deep `Join`'s `on` conjuncts go to
+  `ms[k]` (the leaf is level 0), WHERE's `Filter`'s to the list the
+  placement walks. `conjuncts` copies, so the cost is today's: one copy of
+  each ON and of WHERE (before, `bindFrom`'s part copied them out of the
+  resolved trees and moved the trees into the plan; now it moves them in
+  and `planFrom` copies them out). Level ranges come from `q.levels`, not
+  the plan. A first FROM item's ON (SQL's grammar makes none; nor do
+  `dmlFrom`, `mergeFrom`, `tsqlDml`, `oneTable`) would be a `Filter` over
+  that item, read as level 0's, as `ms[0]` had it.
+- The semi-join alternatives (a candidate's correlated EXISTS/IN planned
+  again with `sc.noRefKeys`) moved from inside the subquery loop (between
+  subquery i's plan and i+1's) to `planFrom`'s start, after ON and WHERE
+  are resolved; the test reads `q.subs[i]` (`use`, `sel.q.refs`, `hashed`,
+  `cte`) and the plan `subs[i]`. Why the move changes nothing: the frame's
+  columns and USING marks are complete at both points; `outerRef` finds the
+  refs the first plan of the subquery already added to the frames between
+  (by text, so the same numbers); the `sub*` lists are read for the top
+  frame only (the subquery's own); `sc.looks` gets the alternatives' looks
+  later, and `looksHold` reads them as a set. A plan that fails is
+  dropped as before, and the frame it may leave is now popped (before,
+  it would have been the "top" the next subquery's lists went to).
+- The scratch check (`~/tpch-w/bind/e5/tools/mspatch.py` on a copy of
+  `lexell/cmd`; it finds main's `buildQuery` or the branch's `planFrom` by
+  anchors, asserted): one `LPCHK MSPS` line per FROM pass after the
+  placement (each level's `ms` and `ps`, and `q.top`, by `exprText`) and
+  one `LPCHK MSEND` at its end (each level's alias, join, semi/anti,
+  perRow, path index, `semiSub`, `src`, `cond`, `post`, `local`,
+  `hashVals`; `q.top`). Builds of main caaa5cfc (`lexdb-chk-m`) and
+  dc60df84 (`lexdb-chk-b`):
+  - the suite (snapshots with slice 1's patched `run.py`, `LPCHK_OUT`):
+    215,780 lines on main, 215,722 on the branch; sorted, identical but for
+    58 lines (29 FROM passes) of `exec_autostats` and `exec_turns`, point
+    selects that their concurrent tasks run "until it is done", whose
+    count varies by run (balanced MSPS/MSEND in both);
+  - the naming battery: 328 FROM passes, identical line for line;
+  - TPC-H's 22: 194 lines, identical sorted; in order, q21's alternative
+    for `l2` (the EXISTS planned without its outer keys) comes after the
+    next subquery's plan instead of before, the move above.
+- Gates: the suite on each commit's snapshot (188, imports ok); the naming
+  battery (1,505 lines) identical from main, 81f83bfd, dc60df84 and both
+  check builds; TPC-H all 22 checksums the baseline's (fields [0] and [8]
+  against `~/tpch/out-baseline-1744ef99`) on every run below (main, the
+  branch, their copies, both check builds).
+- Speed, one pass against main caaa5cfc (`lexdb-mca`, built from `git
+  archive` into `~/tpch-w/bind/e5/src-mca`; the branch at dc60df84,
+  `lexdb-c`), as asked for an intermediate refactor slice:
+  - TPC-H (`~/tpch-w/bind/e5/tpch1.sh`: `run.sh` SF1, 1 run, boost off by
+    `run.sh`): total 29,433 against 29,445 ms (1.000). Past 1.5%: q1 1.027
+    and q18 1.019; q20 0.976. One repeat on byte-identical copies
+    (`lexdb-mcac`, `lexdb-cc`): total 29,378 against 29,364; q1 0.992 (the
+    known copy noise), q18 1.029 (1,277 to 1,314 ms). q18 is +2.4% on both
+    pairs. Its plan is planned once and is the same (the check's MSPS and
+    MSEND lines for it are main's; `planSelect` is unchanged); the
+    executor's code is unchanged but moved in the binary. Read as layout,
+    not verified further (no more rounds, as asked).
+  - `~/tpch-w/bind/e2/simple.sh` (pgbench `-M simple`, 4 clients, 10 s,
+    boost off, one round, binaries alternating): point selects 37,505
+    against 37,286 tps (0.994), updates 9,047 against 9,028 (0.998), the
+    3-table join 15,671 against 15,480 (0.988). Within the floor: the
+    split adds two calls and two small records per FROM pass and saves a
+    copy of WHERE; it does not take back slice 1's cost (below).
+  - Not run: the 35 queries, OLTP and the loads (`oltp.sh`), the plan
+    cache count (`pc.sh`), `qmulti.sh`, `pstat.sh`, `pts.sh`: not asked
+    for this slice, and the simple-protocol pass did not regress.
+- Lines:
+
+  | Module | main caaa5cfc | after |
+  |---|---|---|
+  | `lexdb_exec` | 27936 | 28042 |
+  | `lexdb_bind` | 1936 | 1936 |
+
+**Where 2e slice 2 left off, and how to start slice 3.** Slice 3 makes
+`planSelect` (then `planSet`, `planMatch`, DML) read its clauses from the
+`LPlan` instead of the `Stmt` (way in, 3, in "Where 2d left off"), and
+should take back slice 1's +5% CPU on simple-protocol SELECT planning.
+Everything named is in `lexdb_exec` unless the note says otherwise; search
+for the names, since line numbers move.
+
+- What is there after slice 2:
+  - `buildQuery` = prologue (`FromHints`, `semiCands`) + `bindFrom` +
+    `planFrom` (above). `planFrom` reads the FROM part's conditions from
+    `q.lp` (`fromConds`, `onConds`); everything else it reads from `q`
+    (`levels`, `cols`, `subs`) and from `subs` (the `Stmt`s, for the
+    alternatives' re-plan).
+  - `planSelect` is as slice 1 left it: it resolves each clause into the
+    planner's variables and clones them into the plan (`lpExprs` the select
+    list, `lpGroup`, `lpOrder` after DISTINCT ON's keys are added,
+    `lpHaving`, `lpWins`; `lpOn` moved), then `selPlan` and `topPlan` wrap
+    `q.lp` (Agg, Filter, Window, Project, Distinct, Sort, Limit), each with
+    a copy of its input's columns (`lpCols`) or `outBCols(outs)`.
+- Where slice 1's cost is (its profile: `selPlan` 1.8% inclusive,
+  `outBCols` 0.8%, `lpCols` 0.6%, `copyBCols` 0.6%, plus the select list's
+  clone and the plan's drop), and how slice 2's pattern takes it back: the
+  binder moves the resolved expression into the plan, and the planner
+  copies out only what it rewrites. The planner's rewrites already build
+  new trees from a borrow (`collectAggs(&x, ...)`, `winMarks(&x)`,
+  `winSlots(&x, n)`, `setSubst(&x, ...)` return an `Expr`), so where one
+  runs the slice-1 clone is redundant: build the rewrite from the plan's
+  expression. Where none runs (a point select: no aggregate, window or
+  grouping set), `Sel.exprs` is the resolved list itself and the plan's
+  copy is the extra cost; the saving needs the executor to read the
+  `Project`'s expressions out of `Sel.lp` (or `Sel.exprs` to be the
+  plan's, taken by `replace` when the plan is no longer needed: it is read
+  by nothing yet), and `outBCols`' list to be made once. One clause per
+  commit, as the way in says: the select list first (it is the one a point
+  select pays), then ORDER BY (`lpOrder`: `enumPos` and DISTINCT ON's
+  added keys are binder work; `ordKinds`, `desc`/`nullsFirst` from
+  `s.order`), GROUP BY and HAVING (`resolveGroup`; the redundant keys
+  dropped later are planner work), windows (`mergeWin`, `collKeyOf`),
+  DISTINCT, LIMIT (`Limit` keeps expressions; `evalInt` and `sc.looks`
+  stay planner), locking (`applyLocks`, `Level.lock`: no `Lock` operator
+  yet).
+- Then the move of `bindFrom` into `lexdb_bind` (slice 2's way in, step 3):
+  it needs, from exec, the catalog (`findTable`, `findSeq`, `viewQuery`,
+  `readAcl` for a view's owner, `scCheck` with `sc.asRole`/`sc.whos`,
+  `enumOrder`'s enum types), and it calls the planner: `planSub` for FROM
+  subqueries, views and expression subqueries (the binder half of
+  `planSub`/`planSelect` must be separable first: that is slice 3's
+  ground), and `loadEst`. `loadEst(.., false)` (statistics where a table
+  has two candidate paths) reads only the level's `Table`, so it can move
+  to `planFrom`'s start (every level with `t.tree >= 0`; a view's level has
+  `tree` -1 and gets `noEst` either way) as a first, separate commit.
+- Traps (slice 1's still hold; and):
+  - `FromBound.where` tells WHERE's `Filter` from a first item's ON
+    `Filter` (one level, no WHERE): do not drop it in favour of "the top
+    `Filter` is WHERE".
+  - `pullCommonOr` runs in `bindFrom` on the parsed WHERE; the semi-join
+    candidates are found on the parsed WHERE (`semiCands`), not on
+    `q.lp`'s resolved one (`pullCommonOr` changes the top-level set).
+    Moving either is its own commit with q19's (and q4's, q21's, q22's)
+    plan and checksum as the gate.
+  - The alternatives in `planFrom` re-plan from `subs[i]`: when
+    subqueries are bound once into an `Apply` (step 5), they need the bound
+    form planned twice, or the planner's own copy with `noRefKeys`.
+  - `exec_autostats` and `exec_turns` run a variable number of point
+    selects: a check that counts or diffs per-statement lines must allow
+    for them (sort, and look at what differs).
+  - The suite compiles each test against the sources: run it from a
+    snapshot (`cp -r lexell/{cmd,tests,lib,tools}`;
+    `~/tpch-w/bind/e5/suite.sh TAG` does it). To commit one step while the
+    tree holds the next, commit the snapshot's file and copy the next back.
+- Gates (as slice 2's): the suite (188, imports ok); the naming battery
+  (`~/tpch-w/bind/bench/naming/run.sh BIN OUT`, 1,505 lines) identical; TPC-H
+  all 22 against `~/tpch/out-baseline-1744ef99` (fields [0] and [8]),
+  watching q1 and q18 (layout-sensitive here) and q2, q4, q17, q19, q20,
+  q21, q22; the simple-protocol A/B (`~/tpch-w/bind/e2/simple.sh OUT ROUNDS
+  LABEL BIN ...`) and `pk_point20k` (`~/tpch-w/bind/e2/pts.sh`), which is
+  where slice 3 must show slice 1's +5% coming back; the plan cache
+  (`pc.sh`, `~/tpch-w/bind/e2/chk/pcpatch.py`): whatever moves into
+  `Sel.lp` is cached with the `Sel`, so nothing of a run in it; the
+  scratch checks: slice 1's (`~/tpch-w/bind/e2/chk/patch.py`, the plan's
+  columns against the `Sel`'s; its anchors are asserted and need updating
+  for `bindFrom`) and slice 2's (`mspatch.py`, while `planFrom`'s
+  placement stays), plus for each clause moved a check that the planner's
+  expressions read from the plan have the same `exprText`s as from the
+  `Stmt`.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
