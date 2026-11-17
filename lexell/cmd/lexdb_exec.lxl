@@ -8544,37 +8544,87 @@ fn prepare(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
 }
 
 // EXPLAIN's lines for a query's subqueries (with their runs, ANALYZE).
-fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
-    let none: []Counts = []
-    let noStats: []SubStat = []
+// q's subqueries as the physical plan has them (lexdb_plan.PSub): each
+// one's plan, and how it runs, as the planner left it.
+fn subsOf(q: &Query): []lexdb_plan.PSub {
+    var out: []lexdb_plan.PSub = []
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
-        let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else if sp.use == lexdb_sql.SUB_FROM { "from" } else { "scalar" }
-        var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
+        var run = lexdb_plan.RUN_PER_ROW
+        var anti = false
         var looked = false
-        var lookAnti = false
         for lv in q.levels {
             if lv.semiSub == i {
                 looked = true
-                lookAnti = lv.anti
+                anti = lv.anti
             }
         }
         if looked {
             // a join's level looked up per row (semiLook): not run; its
             // table is the level's now
-            append(out, head + (if lookAnti { "anti join" } else { "semi join" }) + ", looked up per row by the join")
+            run = lexdb_plan.RUN_LOOKED
+        } else if sp.semi {
+            // NOT EXISTS's level is an anti join (Level.anti)
+            run = lexdb_plan.RUN_SEMI
+            for lv in q.levels { if lv.semi && lv.src == i && lv.anti { anti = true } }
+        } else if sp.hashed {
+            run = lexdb_plan.RUN_HASHED
+        } else if len(sp.sel.q.refs) == 0 {
+            run = lexdb_plan.RUN_ONCE
+        }
+        append(mut &out, lexdb_plan.PSub{use: sp.use, run: run, anti: anti, plan: physOf(&sp.sel)})
+    }
+    return out
+}
+
+// A planned Sel's operators (lexdb_plan.PPlan; design/lexdb-layers.md 6.1,
+// step 3), made when asked, in the order execSel applies them. The Sel holds
+// their details.
+fn physOf(sel: &Sel): lexdb_plan.PPlan {
+    let subs = subsOf(&sel.q)
+    if sel.setop != 0 {
+        var parts: []lexdb_plan.PPlan = []
+        for i in 0..len(sel.parts) { append(mut &parts, physOf(&sel.parts[i])) }
+        let set = lexdb_plan.PPlan.SetOp(sel.setop, sel.setAll, sel.rec, parts, subs)
+        let sorted = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(set, sel.sort) } else { set }
+        return if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(sorted, false) } else { sorted }
+    }
+    let leaf = if len(sel.srf) > 0 { lexdb_plan.PPlan.Func(sel.srf.toStr(), sel.ordin, subs) }
+               else if len(sel.q.levels) == 0 { lexdb_plan.PPlan.Result(subs) }
+               else { lexdb_plan.PPlan.Levels(len(sel.q.levels), subs) }
+    let p1 = if sel.first >= 0 { lexdb_plan.PPlan.MinMax(leaf) } else { leaf }
+    let p2 = if len(sel.groupBy) > 0 || (sel.aggQ && sel.first < 0) { lexdb_plan.PPlan.Agg(p1, len(sel.gsets) > 0) } else { p1 }
+    let p3 = if sel.having.isSome() { lexdb_plan.PPlan.Having(p2) } else { p2 }
+    let p4 = if len(sel.wins) > 0 { lexdb_plan.PPlan.Window(p3) } else { p3 }
+    // a function's select list is its arguments
+    let p5 = if len(sel.srf) == 0 { lexdb_plan.PPlan.Project(p4) } else { p4 }
+    let p6 = if sel.distinct { lexdb_plan.PPlan.Distinct(p5, sel.donKey > 0) } else { p5 }
+    let p7 = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(p6, sel.sort) } else { p6 }
+    let p8 = if len(sel.locks) > 0 { lexdb_plan.PPlan.Lock(p7) } else { p7 }
+    let p9 = if sel.limit >= 0 || sel.offset > 0 || sel.topMode != 0 { lexdb_plan.PPlan.Limit(p8, sel.limit >= 0 && !sel.aggQ && !sel.sort) } else { p8 }
+    return if len(sel.mr) > 0 { lexdb_plan.PPlan.Match(p9) } else { p9 }
+}
+
+// EXPLAIN's lines for q's subqueries (subs: their plans, subsOf).
+fn subLines(q: &Query, subs: &[]lexdb_plan.PSub, stats: &[]SubStat, out: mut &[]str) {
+    let none: []Counts = []
+    let noStats: []SubStat = []
+    for i in 0..len(q.subs) {
+        let sp = &q.subs[i]
+        let ps = &subs[i]
+        let what = if sp.use == lexdb_sql.SUB_EXISTS { "exists" } else if sp.use == lexdb_sql.SUB_IN { "in" } else if sp.use == lexdb_sql.SUB_FROM { "from" } else { "scalar" }
+        var head = "subquery " + (i + 1).toStr() + " (" + what + "): "
+        if ps.run == lexdb_plan.RUN_LOOKED {
+            append(out, head + (if ps.anti { "anti join" } else { "semi join" }) + ", looked up per row by the join")
             continue
         }
-        if sp.semi {
-            // NOT EXISTS's level is an anti join (Level.anti)
-            var anti = false
-            for lv in q.levels { if lv.semi && lv.src == i && lv.anti { anti = true } }
-            head = head + (if anti { "anti join" } else { "semi join" }) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
+        if ps.run == lexdb_plan.RUN_SEMI {
+            head = head + (if ps.anti { "anti join" } else { "semi join" }) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
             if len(sp.resText) > 0 { head = head + ", filter " + strings.join(&sp.resText, " and ") }
             head = head + ", run once"
-        } else if sp.hashed {
+        } else if ps.run == lexdb_plan.RUN_HASHED {
             head = head + "hashed on " + strings.join(&sp.keyText, ", ")
-        } else if len(sp.sel.q.refs) == 0 {
+        } else if ps.run == lexdb_plan.RUN_ONCE {
             head = head + "run once"
         } else {
             var rs: []str = []
@@ -8587,17 +8637,17 @@ fn subLines(q: &Query, stats: &[]SubStat, out: mut &[]str) {
             head = head + "per row, on " + strings.join(&rs, ", ")
         }
         var inner: []str = []
-        if i < len(stats) && sp.semi {
+        if i < len(stats) && ps.run == lexdb_plan.RUN_SEMI {
             head = head + " (runs " + stats[i].runs.toStr() + ")"
-            inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
-        } else if i < len(stats) && sp.hashed {
+            inner = planLines(&sp.sel, &ps.plan, &stats[i].cnt, &stats[i].inner)
+        } else if i < len(stats) && ps.run == lexdb_plan.RUN_HASHED {
             head = head + " (runs " + stats[i].runs.toStr() + ", probes " + stats[i].hits.toStr() + ")"
-            inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
+            inner = planLines(&sp.sel, &ps.plan, &stats[i].cnt, &stats[i].inner)
         } else if i < len(stats) {
             head = head + " (runs " + stats[i].runs.toStr() + ", from cache " + stats[i].hits.toStr() + ")"
-            inner = selLines(&sp.sel, &stats[i].cnt, &stats[i].inner)
+            inner = planLines(&sp.sel, &ps.plan, &stats[i].cnt, &stats[i].inner)
         } else {
-            inner = selLines(&sp.sel, &none, &noStats)
+            inner = planLines(&sp.sel, &ps.plan, &none, &noStats)
         }
         append(out, head)
         for l in inner { append(out, "  " + l) }
@@ -12858,7 +12908,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         endScope(mut &sc, mut &q)
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
-        subLines(&q, &noStats, mut &lines)
+        subLines(&q, &subsOf(&q), &noStats, mut &lines)
         if s.kind == lexdb_sql.S_DELETE {
             // (what delete would take, its bounds evaluated now)
             match try rangePlan(st, txn, s, &q, params, &lim, true) {
@@ -14884,43 +14934,93 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
 }
 
 // EXPLAIN's lines for a planned SELECT.
+// EXPLAIN's lines for a planned Sel: its operators (physOf), then its
+// subqueries'; with counts (EXPLAIN ANALYZE), what each table did.
 fn selLines(sel: &Sel, cnt: &[]Counts, stats: &[]SubStat): []str {
-    if sel.setop != 0 { return setLines(sel, stats) }
-    var lines = explainLines(&sel.q, cnt)
-    if len(sel.mr) > 0 {
-        var first: []str = ["match_recognize: " + sel.mr[0].text + "; " + (if sel.mr[0].local { "memo" } else { "steps" })]
-        for l in lines { append(mut &first, l) }
-        lines = first
-    }
-    if len(sel.srf) > 0 { append(mut &lines, "function " + sel.srf + (if sel.ordin { " with ordinality" } else { "" })) }
-    else if len(sel.q.levels) == 0 { append(mut &lines, "result") }
-    if sel.first >= 0 { append(mut &lines, "min/max: the first value in the scan's order") }
-    if len(sel.groupBy) > 0 || (sel.aggQ && sel.first < 0) { append(mut &lines, "aggregate") }
-    if sel.having.isSome() { append(mut &lines, "having") }
-    if sel.distinct { append(mut &lines, "distinct") }
-    if len(sel.order) > 0 { append(mut &lines, if sel.sort { "order: sort" } else { "order: the scan's" }) }
-    if sel.limit >= 0 && !sel.aggQ && !sel.sort { append(mut &lines, "limit: stops the scan") }
-    subLines(&sel.q, stats, mut &lines)
+    let p = physOf(sel)
+    return planLines(sel, &p, cnt, stats)
+}
+
+// selLines over sel's operators p.
+fn planLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]Counts, stats: &[]SubStat): []str {
+    if sel.setop != 0 { return setLines(sel, p, stats) }
+    var lines: []str = []
+    opLines(sel, p, cnt, mut &lines)
+    subLines(&sel.q, lexdb_plan.pSubs(p), stats, mut &lines)
     return lines
 }
 
-fn setLines(sel: &Sel, stats: &[]SubStat): []str {
+// An operator's line after its input's (a table's each: explainLines),
+// MATCH_RECOGNIZE's before them; those that print none: the window calls,
+// the select list, a lock, a LIMIT the scan does not stop for.
+fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]Counts, out: mut &[]str) {
+    match p {
+        lexdb_plan.PPlan.Levels(_, _) { for l in explainLines(&sel.q, cnt) { append(out, l) } }
+        lexdb_plan.PPlan.Result(_) {
+            for l in explainLines(&sel.q, cnt) { append(out, l) }
+            append(out, "result")
+        }
+        lexdb_plan.PPlan.Func(n, ordin, _) {
+            for l in explainLines(&sel.q, cnt) { append(out, l) }
+            append(out, "function " + n + (if ordin { " with ordinality" } else { "" }))
+        }
+        lexdb_plan.PPlan.SetOp(_, _, _, _, _) {}           // setLines'
+        lexdb_plan.PPlan.MinMax(i) {
+            opLines(sel, &i, cnt, out)
+            append(out, "min/max: the first value in the scan's order")
+        }
+        lexdb_plan.PPlan.Agg(i, _) {
+            opLines(sel, &i, cnt, out)
+            append(out, "aggregate")
+        }
+        lexdb_plan.PPlan.Having(i) {
+            opLines(sel, &i, cnt, out)
+            append(out, "having")
+        }
+        lexdb_plan.PPlan.Window(i) { opLines(sel, &i, cnt, out) }
+        lexdb_plan.PPlan.Project(i) { opLines(sel, &i, cnt, out) }
+        lexdb_plan.PPlan.Distinct(i, _) {
+            opLines(sel, &i, cnt, out)
+            append(out, "distinct")
+        }
+        lexdb_plan.PPlan.Sort(i, sorted) {
+            opLines(sel, &i, cnt, out)
+            append(out, if sorted { "order: sort" } else { "order: the scan's" })
+        }
+        lexdb_plan.PPlan.Lock(i) { opLines(sel, &i, cnt, out) }
+        lexdb_plan.PPlan.Limit(i, stops) {
+            opLines(sel, &i, cnt, out)
+            if stops { append(out, "limit: stops the scan") }
+        }
+        lexdb_plan.PPlan.Match(i) {
+            append(out, "match_recognize: " + sel.mr[0].text + "; " + (if sel.mr[0].local { "memo" } else { "steps" }))
+            opLines(sel, &i, cnt, out)
+        }
+    }
+}
+
+fn setLines(sel: &Sel, p: &lexdb_plan.PPlan, stats: &[]SubStat): []str {
     var lines: []str = []
     let op = if sel.setop == lexdb_sql.SET_UNION { "union" } else if sel.setop == lexdb_sql.SET_INTERSECT { "intersect" } else { "except" }
     append(mut &lines, (if sel.rec >= 0 { "recursive " } else { "" }) + op + (if sel.setAll { " all" } else { "" }))
     let none: []Counts = []
     let noStats: []SubStat = []
-    for i in 0..len(sel.parts) {
-        var head = if sel.rec >= 0 { if i == 0 { "first" } else { "then, per round, over the working table" } } else { "query " + (i + 1).toStr() }
-        var inner: []str = []
-        if i < len(stats) {
-            head = head + " (runs " + stats[i].runs.toStr() + ")"
-            inner = selLines(&sel.parts[i], &stats[i].cnt, &stats[i].inner)
-        } else {
-            inner = selLines(&sel.parts[i], &none, &noStats)
+    match lexdb_plan.pLeaf(p) {
+        lexdb_plan.PPlan.SetOp(_, _, _, parts, _) {
+            for i in 0..len(sel.parts) {
+                var head = if sel.rec >= 0 { if i == 0 { "first" } else { "then, per round, over the working table" } } else { "query " + (i + 1).toStr() }
+                var inner: []str = []
+                if i < len(stats) {
+                    head = head + " (runs " + stats[i].runs.toStr() + ")"
+                    inner = planLines(&sel.parts[i], &parts[i], &stats[i].cnt, &stats[i].inner)
+                } else {
+                    inner = planLines(&sel.parts[i], &parts[i], &none, &noStats)
+                }
+                append(mut &lines, "  " + head + ":")
+                for l in inner { append(mut &lines, "    " + l) }
+            }
         }
-        append(mut &lines, "  " + head + ":")
-        for l in inner { append(mut &lines, "    " + l) }
+        else {}
     }
     if len(sel.order) > 0 { append(mut &lines, "order: sort") }
     return lines
