@@ -422,7 +422,8 @@ pos: p}`), so making a cursor costs a count, not a copy.
 
 Because no handle can change a shared value, handles cannot form cycles.
 Every box is freed with its last handle, without a collector. Counts are not
-atomic: a handle must not cross to another OS thread (`par.map` workers).
+atomic, so a `par.map` closure may read through a handle but not share or
+drop one: the kernel check refuses it (design/parallel.md).
 
 ## 5. Declarations and modules
 
