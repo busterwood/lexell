@@ -87,9 +87,9 @@ fn one(s: mut &lexdb_exec.Session, sql: str): str {
         Ok(rs) {
             let r = &rs[len(rs) - 1]
             if r.hasRows { return rowsText(&r.rows) }
-            return r.tag
+            return r.tag.clone()
         }
-        Err(e) { return e.state }
+        Err(e) { return e.state.clone() }
     }
 }
 
@@ -118,7 +118,7 @@ fn job(st: lexdb_store.Store, sqls: []str): Job { return Job{s: lexdb_exec.newSe
 fn outOf(f: task.Future[Done]): str {
     var d = f.wait().unwrap()
     d.s.close()
-    return d.out
+    return d.out.clone()
 }
 
 fn pause(ms: int) { let z = task.sleep(ms) }
@@ -128,7 +128,7 @@ type Prod = record { st: lexdb_store.Store; n: int }
 // n events, each numbered from the counter row in its own block: the
 // failures.
 fn producer(a: Prod): int {
-    var s = lexdb_exec.newSession(a.st)
+    var s = lexdb_exec.newSession(a.st.clone())
     var bad = 0
     for i in 0..a.n {
         let b = one(mut &s, "begin")
@@ -150,7 +150,7 @@ type Cons = record { st: lexdb_store.Store; want: int }
 // began just after the last and was in order (no event seen before one
 // numbered below it).
 fn consumer(a: Cons): str {
-    var s = lexdb_exec.newSession(a.st)
+    var s = lexdb_exec.newSession(a.st.clone())
     var last = 0
     var ordered = true
     var got = 0
@@ -173,7 +173,7 @@ fn consumer(a: Cons): str {
 fn main() {
     lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
-        var a = lexdb_exec.newSession(st)
+        var a = lexdb_exec.newSession(st.clone())
         let m1 = one(mut &a, "create table ev (seq bigint primary key, subject text not null, payload text)")
         let m2 = one(mut &a, "insert into ev values (1, 'x', 'one'), (2, 'x', 'two')")
         let m3 = one(mut &a, "create table offs (id text primary key, last bigint)")
@@ -193,7 +193,7 @@ fn main() {
 
         task.scope(fn(sc: mut &task.Scope) {
             // woken by a commit
-            let fw = sc.start(runJob, job(st, ["select seq from ev where seq > 2 order by seq limit 10 wait 5000 milliseconds"]))
+            let fw = sc.start(runJob, job(st.clone(), ["select seq from ev where seq > 2 order by seq limit 10 wait 5000 milliseconds"]))
             pause(30)
             let t1 = time.monotonicNs()
             let i3 = one(mut &a, "insert into ev values (3, 'x', 'three')")
@@ -202,7 +202,7 @@ fn main() {
             println("woken: " + w + ", soon " + (if soon { "t" } else { "f" }))
 
             // a rollback wakes nobody with rows
-            let fr = sc.start(runJob, job(st, ["select seq from ev where seq > 3 order by seq limit 10 wait 300 milliseconds"]))
+            let fr = sc.start(runJob, job(st.clone(), ["select seq from ev where seq > 3 order by seq limit 10 wait 300 milliseconds"]))
             pause(30)
             let rb = one(mut &a, "begin")
             let ri = one(mut &a, "insert into ev values (4, 'x', 'gone')")
@@ -212,7 +212,7 @@ fn main() {
 
             // three waiters, one commit
             var fs: []task.Future[Done] = []
-            for k in 0..3 { append(mut &fs, sc.start(runJob, job(st, ["select seq from ev where seq > 3 order by seq limit 10 wait 5000 milliseconds"]))) }
+            for k in 0..3 { append(mut &fs, sc.start(runJob, job(st.clone(), ["select seq from ev where seq > 3 order by seq limit 10 wait 5000 milliseconds"]))) }
             pause(30)
             let i4 = one(mut &a, "insert into ev values (4, 'x', 'four')")
             var outs: []str = []
@@ -220,7 +220,7 @@ fn main() {
             println("three waiters: " + strings.join(&outs, " / "))
 
             // a consumer's block: a producer commits between its WAITFOR and its COMMIT
-            let fc = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 4 order by seq limit 1 wait 5000 milliseconds", "pause",
+            let fc = sc.start(runJob, job(st.clone(), ["begin", "select seq from ev where seq > 4 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 5 where id = 'a' and last = 0", "commit"]))
             pause(30)
             let i5 = one(mut &a, "insert into ev values (5, 'x', 'five')")
@@ -229,16 +229,16 @@ fn main() {
             println("consumer: " + outOf(fc))
 
             // the same with a plain SELECT: its read of the stream's end is checked
-            let fp = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 6 order by seq limit 1", "pause",
+            let fp = sc.start(runJob, job(st.clone(), ["begin", "select seq from ev where seq > 6 order by seq limit 1", "pause",
                                                "update offs set last = 6 where id = 'c' and last = 0", "commit"]))
             pause(20)
             let i7 = one(mut &a, "insert into ev values (7, 'x', 'seven')")
             println("plain select: " + outOf(fp))
 
             // two workers on one offset: compare-and-set
-            let w1 = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
+            let w1 = sc.start(runJob, job(st.clone(), ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
-            let w2 = sc.start(runJob, job(st, ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
+            let w2 = sc.start(runJob, job(st.clone(), ["begin", "select seq from ev where seq > 5 order by seq limit 1 wait 5000 milliseconds", "pause",
                                                "update offs set last = 6 where id = 'b' and last = 5", "commit"]))
             let o1 = outOf(w1)
             let o2 = outOf(w2)
@@ -251,7 +251,7 @@ fn main() {
             println("compare-and-set: updated " + upd.toStr() + ", none " + none.toStr())
         })
 
-        var b = lexdb_exec.newSession(st)
+        var b = lexdb_exec.newSession(st.clone())
         let nf = [one(mut &b, "begin"), one(mut &b, "select 1"),
                   one(mut &b, "select seq from ev where seq > 0 order by seq limit 1 wait 60 seconds"), one(mut &b, "rollback")]
         println("not first: " + strings.join(&nf, " / "))
@@ -280,13 +280,13 @@ fn main() {
 
         task.scope(fn(sc: mut &task.Scope) {
             // READ ONLY: the block's snapshot is the one WAITFOR found rows in
-            let fo = sc.start(runJob, job(st, ["begin read only", "select seq from ev where seq > 6 order by seq limit 1 wait 5000 milliseconds",
+            let fo = sc.start(runJob, job(st.clone(), ["begin read only", "select seq from ev where seq > 6 order by seq limit 1 wait 5000 milliseconds",
                                                "select max(seq) from ev", "commit"]))
             pause(30)
             println("read only: " + outOf(fo))
 
             // a partition's cursor: part 1's event wakes it, part 2's is returned
-            let fq = sc.start(runJob, job(st, ["select part, seq from pev where part = 2 and seq > 1 order by seq limit 5 wait 5000 milliseconds"]))
+            let fq = sc.start(runJob, job(st.clone(), ["select part, seq from pev where part = 2 and seq > 1 order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let p1 = one(mut &a, "insert into pev values (1, 2)")
             pause(30)
@@ -294,19 +294,19 @@ fn main() {
             println("partition: " + outOf(fq))
 
             // filters: rows that fail them wake the waiter, which waits on
-            let ff = sc.start(runJob, job(st, ["select seq, subject from ev where seq > 7 and subject = 'y' order by seq limit 5 wait 5000 milliseconds"]))
+            let ff = sc.start(runJob, job(st.clone(), ["select seq, subject from ev where seq > 7 and subject = 'y' order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let f8 = one(mut &a, "insert into ev values (8, 'x', 'no')")
             pause(30)
             let f9 = one(mut &a, "insert into ev values (9, 'y', 'yes')")
             println("filter: " + outOf(ff))
-            let fo2 = sc.start(runJob, job(st, ["select seq, subject from ev where seq > 9 and (lower(subject) = 'z' or payload like 'hot%') order by seq limit 5 wait 5 seconds"]))
+            let fo2 = sc.start(runJob, job(st.clone(), ["select seq, subject from ev where seq > 9 and (lower(subject) = 'z' or payload like 'hot%') order by seq limit 5 wait 5 seconds"]))
             pause(30)
             let f10 = one(mut &a, "insert into ev values (10, 'q', 'cold')")
             pause(30)
             let f11 = one(mut &a, "insert into ev values (11, 'Z', 'x')")
             println("or and a function: " + outOf(fo2))
-            let fp2 = sc.start(runJob, job(st, ["select part, seq, kind from pev2 where part = 1 and seq > 0 and kind = 'b' order by seq limit 5 wait 5000 milliseconds"]))
+            let fp2 = sc.start(runJob, job(st.clone(), ["select part, seq, kind from pev2 where part = 1 and seq > 0 and kind = 'b' order by seq limit 5 wait 5000 milliseconds"]))
             pause(30)
             let q1 = one(mut &a, "insert into pev2 values (1, 1, 'a'), (2, 1, 'b')")
             pause(30)
@@ -324,9 +324,9 @@ fn main() {
         // four producers numbering from a counter row; a consumer as they commit
         var ordered = ""
         task.scope(fn(sc: mut &task.Scope) {
-            let fcon = sc.start(consumer, Cons{st: st, want: 40})
+            let fcon = sc.start(consumer, Cons{st: st.clone(), want: 40})
             var ps2: []task.Future[int] = []
-            for k in 0..4 { append(mut &ps2, sc.start(producer, Prod{st: st, n: 10})) }
+            for k in 0..4 { append(mut &ps2, sc.start(producer, Prod{st: st.clone(), n: 10})) }
             var bad = 0
             while len(ps2) > 0 { bad += pop(mut &ps2).wait().unwrap() }
             ordered = fcon.wait().unwrap()
@@ -360,9 +360,9 @@ fn main() {
         let mq2 = one(mut &a, "insert into q values (1, 'pending'), (2, 'other')")
         task.scope(fn(sc: mut &task.Scope) {
             // two workers take the same row: the second's read of it is checked
-            let w1 = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
+            let w1 = sc.start(runJob, job(st.clone(), ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
                                                "update q set status = 'done' where seq = 1", "commit"]))
-            let w2 = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
+            let w2 = sc.start(runJob, job(st.clone(), ["begin", "select seq from q where seq > 0 and status = 'pending' order by seq limit 1 wait 60 seconds", "pause",
                                                "update q set status = 'done' where seq = 1", "commit"]))
             let o1 = outOf(w1)
             let o2 = outOf(w2)
@@ -375,7 +375,7 @@ fn main() {
             println("same row: " + ok.toStr() + " committed, " + conflict.toStr() + " 40001")
 
             // a row its filter skipped, changed meanwhile
-            let fk = sc.start(runJob, job(st, ["begin", "select seq from q where seq > 0 and status = 'other' order by seq limit 5 wait 60 seconds", "pause",
+            let fk = sc.start(runJob, job(st.clone(), ["begin", "select seq from q where seq > 0 and status = 'other' order by seq limit 5 wait 60 seconds", "pause",
                                                "update offs set last = 99 where id = 'c'", "commit"]))
             pause(20)
             let ch = one(mut &a, "update q set status = 'x' where seq = 1")
@@ -384,7 +384,7 @@ fn main() {
         })
 
         // an error after the wait: the block keeps its snapshot, and may WAITFOR again
-        var c = lexdb_exec.newSession(st)
+        var c = lexdb_exec.newSession(st.clone())
         let c0 = one(mut &c, "set statement_timeout = 50")
         var sp: []str = [one(mut &c, "begin"), one(mut &c, "savepoint a"),
                          one(mut &c, "select seq from ev where seq > 100 order by seq limit 1 wait 5000 milliseconds"),
@@ -392,7 +392,7 @@ fn main() {
         let n1 = one(mut &c, "select count(*) from ev")
         let ins = one(mut &a, "insert into ev values (12, 'x', 'twelve')")
         let n2 = one(mut &c, "select count(*) from ev")
-        append(mut &sp, if n1 == n2 { "n" } else { n1 })
+        append(mut &sp, if n1 == n2 { "n" } else { n1.clone() })
         append(mut &sp, if n1 == n2 { "n" } else { n2 })
         let c1 = one(mut &c, "set statement_timeout = 0")
         let rb = one(mut &c, "rollback")

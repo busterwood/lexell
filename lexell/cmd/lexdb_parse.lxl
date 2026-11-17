@@ -252,7 +252,7 @@ pub type Tok = value record { pub kind: int; pub text: str; pub at: int; pub spe
 // A name's token: its text folded, its spelling kept if that differs.
 fn nameTok(kind: int, raw: &str, at: int): Tok {
     let f = strings.toLowerAscii(&raw)
-    return Tok{kind: kind, text: f, at: at, spell: if f == raw { "" } else { raw }}
+    return Tok{kind: kind, text: f, at: at, spell: if f == raw { "" } else { raw.clone() }}
 }
 
 fn syntax(msg: &str): lexdb_base.DbErr { return lexdb_base.err("42601", msg) }
@@ -503,7 +503,7 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
         if i + 1 < n {
             let two = s[i..i + 2]
             if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" ||
-               two == "<<" || two == ">>" || two == "@>" || two == "<@" || two == "&&" { op = two }
+               two == "<<" || two == ">>" || two == "@>" || two == "<@" || two == "&&" { op = two.clone() }
             if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
         }
         if !strings.contains(&"(),;.*+-/%=<>|:![]~&#^@{}?$", &op[0..1]) {
@@ -546,13 +546,13 @@ type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool }
 
 type InCte = record { id: int; depth: int; refs: int }
 
-fn (p: &P) peek(): Tok { return p.toks[p.pos] }
-fn (p: &P) peekAt(k: int): Tok {
+fn (p: &P) peek(): &Tok { return &p.toks[p.pos] }
+fn (p: &P) peekAt(k: int): &Tok {
     let i = if p.pos + k < len(p.toks) { p.pos + k } else { len(p.toks) - 1 }
-    return p.toks[i]
+    return &p.toks[i]
 }
 fn (p: mut &P) next(): Tok {
-    let t = p.toks[p.pos]
+    let t = p.toks[p.pos].clone()
     if t.kind != T_EOF { p.pos += 1 }
     return t
 }
@@ -599,11 +599,11 @@ fn tsqlStarts(w: &str): bool {
 }
 
 fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text)) {
         p.pos += 1
-        p.spelled = t.spell
-        return Ok(t.text)
+        p.spelled = t.spell.clone()
+        return Ok(t.text.clone())
     }
     return Err(near(&t))
 }
@@ -620,21 +620,21 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
     if p.tsql {
         // T-SQL: [db.][schema.]name, db..name; dbo is public (design/lexdb-tds.md L3)
         var parts: []str = [first]
-        var spell = p.spelled
+        var spell = p.spelled.clone()
         while p.acceptKw(".") {
             if p.isKw(".") {
                 append(mut &parts, "")
                 continue
             }
             append(mut &parts, try p.name())
-            spell = p.spelled
+            spell = p.spelled.clone()
         }
         p.spelled = spell
         let n = len(parts)
         // msdb's objects lexdb_syscat has (msdb.dbo.x: msdb.x)
         if n >= 3 && parts[n - 3] == "msdb" && lexdb_dialect.isMsdb(&parts[n - 1]) { return Ok(lexdb_sql.qual(&"msdb", &parts[n - 1])) }
-        let sc = if n >= 2 { parts[n - 2] } else { "" }
-        if n == 1 || sc == "" || sc == "dbo" { return Ok(parts[n - 1]) }
+        let sc: &str = if n >= 2 { &parts[n - 2] } else { "" }
+        if n == 1 || sc == "" || sc == "dbo" { return Ok(parts[n - 1].clone()) }
         return Ok(lexdb_sql.qual(&sc, &parts[n - 1]))
     }
     if p.acceptKw(".") { return Ok(lexdb_sql.qual(&first, &(try p.name()))) }
@@ -758,7 +758,7 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
         }
         else {
             // a type of the user's (9.90): an enum, found when the statement runs
-            var key = w
+            var key = w.clone()
             if p.isKw(".") && (p.peekAt(1).kind == T_IDENT || p.peekAt(1).kind == T_QIDENT) {
                 p.pos += 1
                 key = lexdb_sql.qual(&w, &(try p.name()))
@@ -851,12 +851,12 @@ fn (p: mut &P) cmpExpr(): Result[Expr, lexdb_base.DbErr] {
 
 fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.catExpr()
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_OP && (t.text == "=" || t.text == "<>" || t.text == "!=" || t.text == "<" || t.text == "<=" ||
                           t.text == ">" || t.text == ">=") {
         p.pos += 1
-        let op = if t.text == "!=" { "<>" } else { t.text }
-        let q = p.peek()
+        let op = if t.text == "!=" { "<>" } else { t.text.clone() }
+        let q = p.peek().clone()
         if q.kind == T_IDENT && (q.text == "any" || q.text == "some" || q.text == "all") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
             // x op ANY (array), x op ALL (array): the call "any op" or "all op"
             // (9.28); with a subquery, = ANY is IN and <> ALL is NOT IN
@@ -895,14 +895,14 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
     var rop = ""
     if t.kind == T_OP && (t.text == "~" || t.text == "!~" || t.text == "~*" || t.text == "!~*") {
         p.pos += 1
-        rop = t.text
+        rop = t.text.clone()
     } else if t.kind == T_IDENT && t.text == "operator" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
         p.pos += 2
         if p.peek().kind == T_IDENT && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." { p.pos += 2 }
         let o = p.next()
         if o.kind != T_OP { return Err(near(&o)) }
         try p.expectKw(")")
-        rop = if o.text == "!=" { "<>" } else { o.text }
+        rop = if o.text == "!=" { "<>" } else { o.text.clone() }
         if rop == "=" || rop == "<>" || rop == "<" || rop == "<=" || rop == ">" || rop == ">=" {
             let r = try p.catExpr()
             return Ok(Expr.Bin(rop, e, r))
@@ -915,7 +915,7 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
     }
     // [NOT] LIKE, ILIKE, SIMILAR TO, IN, BETWEEN
     var neg = false
-    let nt = p.peekAt(1)
+    let nt = p.peekAt(1).clone()
     if p.isKw("not") && nt.kind == T_IDENT && (nt.text == "like" || nt.text == "ilike" || nt.text == "in" || nt.text == "between" ||
                                                nt.text == "similar") {
         p.pos += 1
@@ -923,7 +923,7 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
     }
     if p.isKw("like") || p.isKw("ilike") {
         var kw = p.next().text
-        let q = p.peek()
+        let q = p.peek().clone()
         if q.kind == T_IDENT && (q.text == "any" || q.text == "some" || q.text == "all") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
             // x [NOT] LIKE ANY | ALL (array or subquery) (9.94): the call "any like",
             // "all not like" and the like; NOT is the element's, as PostgreSQL's
@@ -1178,7 +1178,7 @@ fn (p: &P) sqlForm(): bool {
     var depth = 0
     var i = p.pos
     while i < len(p.toks) {
-        let t = p.toks[i]
+        let t = &p.toks[i]
         if t.kind == T_EOF { return false }
         if t.kind == T_OP && (t.text == "(" || t.text == "[") { depth += 1 }
         if t.kind == T_OP && (t.text == ")" || t.text == "]") {
@@ -1196,17 +1196,17 @@ fn negate(neg: bool, x: Expr): Expr { return if neg { Expr.Unary("not", x) } els
 
 fn cloneE(x: &Expr): Expr {
     match x {
-        Expr.Lit(v) { return Expr.Lit(v) }
+        Expr.Lit(v) { return Expr.Lit(v.clone()) }
         Expr.Param(n) { return Expr.Param(n) }
-        Expr.Col(n, s) { return Expr.Col(n, s) }
-        Expr.Unary(op, a) { return Expr.Unary(op, cloneE(&a)) }
-        Expr.Bin(op, a, b) { return Expr.Bin(op, cloneE(&a), cloneE(&b)) }
+        Expr.Col(n, s) { return Expr.Col(n.clone(), s) }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), cloneE(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), cloneE(&a), cloneE(&b)) }
         Expr.IsNull(a, neg) { return Expr.IsNull(cloneE(&a), neg) }
         Expr.Cast(a, t) { return Expr.Cast(cloneE(&a), t) }
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args { append(mut &out, cloneE(&a)) }
-            return Expr.Call(n, out, star)
+            return Expr.Call(n.clone(), out, star)
         }
     }
 }
@@ -1301,8 +1301,8 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         // a recursive one is in scope in its own body
         if rec {
             var cs: []str = []
-            for c in cols { append(mut &cs, c) }
-            append(mut &p.ctes, Cte{name: name, cols: cs, start: start, id: id, rec: true})
+            for c in cols { append(mut &cs, c.clone()) }
+            append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: true})
         }
         let keep = len(p.subs)
         if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0}) }
@@ -1327,8 +1327,8 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
     let upto = if rec { ci + 1 } else { ci }
     for i in 0..upto {
         var cols: []str = []
-        for c in saved[i].cols { append(mut &cols, c) }
-        append(mut &p.ctes, Cte{name: saved[i].name, cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec})
+        for c in saved[i].cols { append(mut &cols, c.clone()) }
+        append(mut &p.ctes, Cte{name: saved[i].name.clone(), cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec})
     }
     let pos = p.pos
     p.pos = saved[ci].start
@@ -1344,7 +1344,7 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
     return Ok(i)
 }
 
-fn subRef(name: &str, i: int): Expr { return Expr.Call(name, [Expr.Lit(Val.Int(i))], false) }
+fn subRef(name: &str, i: int): Expr { return Expr.Call(name.clone(), [Expr.Lit(Val.Int(i))], false) }
 
 // A row constructor, (a, b) or ROW(a, b) (9.94): the call "row". Rows are
 // compared, field by field, and nothing else.
@@ -1406,7 +1406,7 @@ fn rowCmp(op: &str, l: &Expr, r: &Expr): Result[Expr, lexdb_base.DbErr] {
     var x = Expr.Bin(op.toStr(), cloneE(&ls[n - 1]), cloneE(&rs[n - 1]))
     var i = n - 2
     while i >= 0 {
-        x = Expr.Bin("or", Expr.Bin(strict, cloneE(&ls[i]), cloneE(&rs[i])), Expr.Bin("and", Expr.Bin("=", cloneE(&ls[i]), cloneE(&rs[i])), x))
+        x = Expr.Bin("or", Expr.Bin(strict.clone(), cloneE(&ls[i]), cloneE(&rs[i])), Expr.Bin("and", Expr.Bin("=", cloneE(&ls[i]), cloneE(&rs[i])), x))
         i -= 1
     }
     if n > 1 { x = Expr.Bin("and", Expr.Bin(strict + "=", cloneE(&ls[0]), cloneE(&rs[0])), x) }
@@ -1604,7 +1604,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     if t.kind == T_IDENT && (t.text == "current_user" || t.text == "session_user" || t.text == "user" || t.text == "current_role" ||
                              t.text == "current_schema" || t.text == "current_catalog") && !p.isKw("(") && !p.isKw(".") {
         append(mut &p.seqs, CAT_MARK)
-        return Ok(Expr.Call(if t.text == "user" || t.text == "current_role" { "current_user" } else { t.text }, [], false))
+        return Ok(Expr.Call(if t.text == "user" || t.text == "current_role" { "current_user" } else { t.text.clone() }, [], false))
     }
     if t.kind == T_IDENT && t.text == "array" && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
         p.pos += 1
@@ -1658,7 +1658,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             Err(_) { return Err(lexdb_base.err("22003", &("numeric literal out of range: " + t.text))) }
         }
     }
-    if t.kind == T_STR { return Ok(Expr.Lit(if p.ora && len(t.text) == 0 { Val.Null } else { Val.Text(t.text) })) }     // Oracle: '' is NULL
+    if t.kind == T_STR { return Ok(Expr.Lit(if p.ora && len(t.text) == 0 { Val.Null } else { Val.Text(t.text.clone()) })) }     // Oracle: '' is NULL
     if t.kind == T_VAR { return p.variable(&t) }
     if t.kind == T_PARAM {
         let n = strings.parseIntOpt(&t.text).unwrapOr(0)
@@ -1699,9 +1699,9 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 if p.acceptKw("(") {
                     let n = try p.intLit()        // a precision: rounded to it
                     try p.expectKw(")")
-                    return Ok(Expr.Call(t.text, [Expr.Lit(Val.Int(n))], false))
+                    return Ok(Expr.Call(t.text.clone(), [Expr.Lit(Val.Int(n))], false))
                 }
-                return Ok(Expr.Call(t.text, [], false))
+                return Ok(Expr.Call(t.text.clone(), [], false))
             }
             "extract" {
                 if p.isKw("(") {
@@ -1725,7 +1725,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                             var lit = p.next().text
                             if p.ora && t.text == "interval" {
                                 // INTERVAL '1' DAY, INTERVAL '1-2' YEAR TO MONTH, INTERVAL '1 02:03:04' DAY(2) TO SECOND(3)
-                                let u = p.peek()
+                                let u = p.peek().clone()
                                 if u.kind == T_IDENT && (u.text == "day" || u.text == "month" || u.text == "year" || u.text == "hour" || u.text == "minute" || u.text == "second") {
                                     p.pos += 1
                                     if p.acceptKw("(") {
@@ -1785,12 +1785,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             p.pos += 1
             var args: []Expr = []
             var star = false
-            var fname = t.text
+            var fname = t.text.clone()
             if p.ora && fname == "listagg" { fname = "string_agg" }
             if p.mr > 0 && fname == "count" && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP &&
                p.peekAt(1).text == "." && p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
                 // COUNT(v.*): the rows mapped to v
-                let v = p.peek().text
+                let v = p.peek().text.clone()
                 p.pos += 3
                 try p.expectKw(")")
                 return Ok(Expr.Call("count", [Expr.Lit(Val.Text(v))], true))
@@ -1888,13 +1888,13 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 var d = try p.over()
                 var copied: []Expr = []
                 for a in args { append(mut &copied, cloneE(&a)) }
-                d.call = Expr.Call(fname, copied, star)
+                d.call = Expr.Call(fname.clone(), copied, star)
                 append(mut &p.wins, d)
                 return Ok(Expr.Call("#win", [Expr.Lit(Val.Int(len(p.wins) - 1)), Expr.Call(fname, args, star)], false))
             }
             return Ok(Expr.Call(fname, args, star))
         }
-        var name = t.text
+        var name = t.text.clone()
         if p.acceptKw(".") {
             let col = try p.name()
             name = t.text + "." + col     // qualified: table (or alias) dot column
@@ -1926,8 +1926,8 @@ fn tsqlDml(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
         for k in 0..len(all) {
             var f = replace(mut &all[k], FromItem{table: "", alias: "", join: 0, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
             if k == at {
-                s.table = f.table
-                if f.alias != lexdb_sql.baseName(&f.table) { s.alias = f.alias }
+                s.table = f.table.clone()
+                if f.alias != lexdb_sql.baseName(&f.table) { s.alias = f.alias.clone() }
                 match replace(mut &f.on, None) {
                     Some(c) {
                         s.where = match replace(mut &s.where, None) {
@@ -1947,7 +1947,7 @@ fn tsqlDml(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
     var items = out
     for i in 0..len(items) {
         if items[i].star {
-            if items[i].qual == "inserted" || items[i].qual == "deleted" { items[i].qual = q }
+            if items[i].qual == "inserted" || items[i].qual == "deleted" { items[i].qual = q.clone() }
             continue
         }
         match replace(mut &items[i].expr, None) {
@@ -2011,7 +2011,7 @@ fn tsqlCast(x: Expr, ty: TypeName, style: Option[Expr]): Expr {
 fn datePart(x: &Expr): Option[Expr] {
     var w = ""
     match x {
-        Expr.Col(n, _) { w = n }
+        Expr.Col(n, _) { w = n.clone() }
         Expr.Lit(v) { match v { Val.Text(s) { w = strings.toLowerAscii(&s) } else {} } }
         else {}
     }
@@ -2156,9 +2156,9 @@ fn propExpr(pr: &lexdb_dialect.Prop): Expr {
             var t = lexdb_sql.timeType(OID_TS)
             t.prec = lexdb_dialect.TS_DATETIME
             t.scale = 3
-            return Expr.Cast(Expr.Lit(Val.Text(pr.val)), t)
+            return Expr.Cast(Expr.Lit(Val.Text(pr.val.clone())), t)
         }
-        else { return Expr.Lit(Val.Text(pr.val)) }
+        else { return Expr.Lit(Val.Text(pr.val.clone())) }
     }
 }
 
@@ -2247,7 +2247,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         s.ifFlag = true
     }
     s.table = try p.rname()
-    s.spell = p.spelled
+    s.spell = p.spelled.clone()
     if p.isKw("as") || p.isKw("on") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     return p.tableBody(s)
 }
@@ -2271,8 +2271,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         } else {
             let n = try p.name()
             var c = lexdb_sql.noCol()
-            c.name = n
-            c.spell = p.spelled
+            c.name = n.clone()
+            c.spell = p.spelled.clone()
             try p.colType(mut &c)
             while true {
                 // CONSTRAINT name names the one after it (a UNIQUE's; the
@@ -2285,7 +2285,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("primary") {
                     try p.expectKw("key")
-                    append(mut &s.pk, n)
+                    append(mut &s.pk, n.clone())
                     s.pkName = cn
                     c.notNull = true
                 } else if p.acceptKw("default") {
@@ -2297,16 +2297,16 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
-                    append(mut &u.cols, n)
+                    append(mut &u.cols, n.clone())
                     append(mut &s.cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
                     if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
-                    append(mut &ck.cols, n)         // a column's: named for it
+                    append(mut &ck.cols, n.clone())         // a column's: named for it
                     append(mut &s.cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
-                    append(mut &fk.cols, n)
+                    append(mut &fk.cols, n.clone())
                     try p.fkTail(mut &fk)
                     if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &s.cons, fk)
@@ -2346,9 +2346,9 @@ fn (p: mut &P) onCommit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 fn (p: &P) nameListThenAs(): bool {
     var k = 1
     while true {
-        let t = p.peekAt(k)
+        let t = p.peekAt(k).clone()
         if t.kind != T_IDENT && t.kind != T_QIDENT { return false }
-        let u = p.peekAt(k + 1)
+        let u = p.peekAt(k + 1).clone()
         if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && (p.peekAt(k + 2).text == "as" || p.peekAt(k + 2).text == "on") }
         if !(u.kind == T_OP && u.text == ",") { return false }
         k += 2
@@ -2363,7 +2363,7 @@ fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("(") {
         while true {
             append(mut &s.names, try p.name())
-            append(mut &s.spells, p.spelled)
+            append(mut &s.spells, p.spelled.clone())
             if !p.acceptKw(",") { break }
         }
         try p.expectKw(")")
@@ -2574,7 +2574,7 @@ fn serialArgs(x: &Expr): Option[str] {
 // A column's type: serial, bigserial and smallserial are integers taking
 // their defaults from a sequence of their own.
 fn (p: mut &P) colType(c: mut &ColDef): Result[Unit, lexdb_base.DbErr] {
-    let w = p.peek()
+    let w = p.peek().clone()
     if w.kind == T_IDENT {
         var oid = 0
         if w.text == "serial" || w.text == "serial4" { oid = OID_INT4 }
@@ -2600,10 +2600,10 @@ fn (p: mut &P) colType(c: mut &ColDef): Result[Unit, lexdb_base.DbErr] {
 // A collation's name after COLLATE, as written: name or schema.name.
 fn (p: mut &P) collName(): Result[str, lexdb_base.DbErr] {
     var n = try p.name()
-    var sp = if len(p.spelled) > 0 { p.spelled } else { n }
+    var sp = if len(p.spelled) > 0 { p.spelled.clone() } else { n }
     if p.acceptKw(".") {
         n = try p.name()
-        sp = if len(p.spelled) > 0 { p.spelled } else { n }
+        sp = if len(p.spelled) > 0 { p.spelled.clone() } else { n }
     }
     return Ok(sp)
 }
@@ -2624,7 +2624,7 @@ fn (p: mut &P) tsqlIdentity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_ba
         o.hasInc = true
         try p.expectKw(")")
     }
-    append(mut &s.idOpts, IdOpts{col: c.name, opts: o})
+    append(mut &s.idOpts, IdOpts{col: c.name.clone(), opts: o})
     return Ok(Unit{})
 }
 
@@ -2647,7 +2647,7 @@ fn (p: mut &P) identity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_base.D
         var o = lexdb_sql.noSeqOpts()
         try p.seqOptions(mut &o, false)
         try p.expectKw(")")
-        append(mut &s.idOpts, IdOpts{col: c.name, opts: o})
+        append(mut &s.idOpts, IdOpts{col: c.name.clone(), opts: o})
     }
     return Ok(Unit{})
 }
@@ -2712,7 +2712,7 @@ fn (p: mut &P) seqOptions(o: mut &SeqOpts, alter: bool): Result[Unit, lexdb_base
                 while p.acceptKw(".") { append(mut &ns, try p.name()) }
                 if len(ns) < 2 || len(ns) > 3 { return Err(lexdb_base.err("42601", "invalid OWNED BY option (table.column or OWNED BY NONE)")) }
                 let col = pop(mut &ns)
-                var tn = ns[0]
+                var tn = ns[0].clone()
                 if len(ns) == 2 { tn = lexdb_sql.qual(&ns[0], &ns[1]) }
                 o.owned = [tn, col]
             }
@@ -2805,7 +2805,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         var sp = lexdb_sql.noCol()
         if p.acceptKw("to") {
             let to = try p.name()
-            sp.spell = p.spelled
+            sp.spell = p.spelled.clone()
             var a = lexdb_sql.alterOf(A_RENAME, &to)
             a.col = sp
             append(mut &s.alters, a)
@@ -2822,7 +2822,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         let from = try p.name()
         try p.expectKw("to")
         let to = try p.name()
-        sp.spell = p.spelled
+        sp.spell = p.spelled.clone()
         var a = lexdb_sql.alterOf(A_RENAME_COL, &from)
         a.col = sp
         a.to = to
@@ -2853,7 +2853,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 a.ifFlag = true
             }
             a.col.name = try p.name()
-            a.col.spell = p.spelled
+            a.col.spell = p.spelled.clone()
             try p.colType(mut &a.col)
             // its PRIMARY KEY, UNIQUE, CHECK and REFERENCES: added after it,
             // as ADD CONSTRAINT would (9.85)
@@ -2872,23 +2872,23 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("primary") {
                     try p.expectKw("key")
                     var pk = lexdb_sql.newConstraint(C_PRIMARY, &cn)
-                    append(mut &pk.cols, a.col.name)
+                    append(mut &pk.cols, a.col.name.clone())
                     append(mut &cons, pk)
                 } else if p.acceptKw("default") {
                     a.col.def = Some(try p.defaultExpr())
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
-                    append(mut &u.cols, a.col.name)
+                    append(mut &u.cols, a.col.name.clone())
                     append(mut &cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
                     if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
-                    append(mut &ck.cols, a.col.name)
+                    append(mut &ck.cols, a.col.name.clone())
                     append(mut &cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
-                    append(mut &fk.cols, a.col.name)
+                    append(mut &fk.cols, a.col.name.clone())
                     try p.fkTail(mut &fk)
                     if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &cons, fk)
@@ -2898,7 +2898,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     break
                 }
             }
-            let added = a.col.name
+            let added = a.col.name.clone()
             let ifNot = a.ifFlag
             append(mut &s.alters, a)
             // in the order written
@@ -2910,7 +2910,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             while len(cons) > 0 {
                 var ac = lexdb_sql.alterOf(A_ADD_CON, "")
                 // ADD COLUMN IF NOT EXISTS of a column there: its constraints not added either
-                if ifNot { ac.name = added }
+                if ifNot { ac.name = added.clone() }
                 append(mut &ac.cons, pop(mut &cons))
                 append(mut &s.alters, ac)
             }
@@ -3089,7 +3089,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
 fn (p: &P) identityNext(): bool {
     if p.isKw("restart") { return true }
     if !p.isKw("set") { return false }
-    let w = p.peekAt(1)
+    let w = p.peekAt(1).clone()
     if w.kind != T_IDENT { return false }
     if w.text == "generated" || w.text == "increment" || w.text == "minvalue" || w.text == "maxvalue" || w.text == "start" ||
        w.text == "cache" || w.text == "cycle" || w.text == "as" { return true }
@@ -3208,7 +3208,7 @@ fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
             try p.expectKw("(")
             for i in 0..len(cols) {
                 if i > 0 { try p.expectKw(",") }
-                append(mut &s.sets, SetItem{col: cols[i], expr: try p.valueOrDefault()})
+                append(mut &s.sets, SetItem{col: cols[i].clone(), expr: try p.valueOrDefault()})
             }
             try p.expectKw(")")
         } else {
@@ -3276,7 +3276,7 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
 // A role as GRANT and the like name it: a name, PUBLIC (""), CURRENT_USER
 // and the like (as "#current_user", resolved when run).
 fn (p: mut &P) roleSpec(): Result[str, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_IDENT && t.text == "public" {
         p.pos += 1
         return Ok("")
@@ -3308,7 +3308,7 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
         while true {
             let w = p.next()
             if w.kind != T_IDENT && w.kind != T_QIDENT { return Err(near(&w)) }
-            append(mut &g.names, w.text)
+            append(mut &g.names, w.text.clone())
             if p.isKw("(") { return Err(lexdb_base.err("0A000", "lexdb: column privileges are not supported")) }
             if !p.acceptKw(",") { break }
         }
@@ -3371,11 +3371,11 @@ fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     var v = lexdb_sql.newStmt(S_CREATE_VIEW)
     v.ifFlag = orReplace
     v.table = try p.rname()
-    v.spell = p.spelled
+    v.spell = p.spelled.clone()
     if p.acceptKw("(") {
         while true {
             append(mut &v.names, try p.name())
-            append(mut &v.spells, p.spelled)
+            append(mut &v.spells, p.spelled.clone())
             if !p.acceptKw(",") { break }
         }
         try p.expectKw(")")
@@ -3533,28 +3533,28 @@ fn (p: mut &P) itemList(items: mut &[]SelItem): Result[Unit, lexdb_base.DbErr] {
 // ("" none) once there is one, else stays [].
 fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result[Unit, lexdb_base.DbErr] {
     while true {
-        let q = p.peek()
+        let q = p.peek().clone()
         if p.acceptKw("*") {
             append(items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
         } else if (q.kind == T_IDENT || q.kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
                   p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
             p.pos += 3
-            append(items, SelItem{star: true, qual: q.text, expr: None, alias: "", spell: ""})
+            append(items, SelItem{star: true, qual: q.text.clone(), expr: None, alias: "", spell: ""})
         } else if p.tsql && q.kind == T_VAR && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" {
             // T-SQL: SELECT @v = expr (design/lexdb-tds.md)
             let target = try p.variable(&q)
             p.pos += 2
             let e = try p.expr()
             while len(assign) < len(items) { append(assign, "") }
-            append(assign, q.text)
-            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: q.text, spell: ""})
+            append(assign, q.text.clone())
+            append(items, SelItem{star: false, qual: "", expr: Some(e), alias: q.text.clone(), spell: ""})
         } else if p.tsql && (q.kind == T_QIDENT || q.kind == T_STR || (q.kind == T_IDENT && !lexdb_sql.isReserved(&q.text))) &&
                   p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" {
             // T-SQL: SELECT alias = expr
             p.pos += 2
             let e = try p.expr()
-            let al = if q.kind == T_STR { strings.toLowerAscii(&q.text) } else { q.text }
-            let sp = if q.kind == T_STR { q.text } else { q.spell }
+            let al = if q.kind == T_STR { strings.toLowerAscii(&q.text) } else { q.text.clone() }
+            let sp = if q.kind == T_STR { q.text.clone() } else { q.spell.clone() }
             append(items, SelItem{star: false, qual: "", expr: Some(e), alias: al, spell: sp})
         } else {
             let eStart = p.pos
@@ -3562,23 +3562,23 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
             let eEnd = p.pos
             // the column's name as written (L6): a bare column's, or the alias's
             var spell = ""
-            if isColExpr(&e) && p.pos > 0 { spell = p.toks[p.pos - 1].spell }
+            if isColExpr(&e) && p.pos > 0 { spell = p.toks[p.pos - 1].spell.clone() }
             var alias = ""
             if p.tsql && (p.peek().kind == T_STR || (p.isKw("as") && p.peekAt(1).kind == T_STR)) {
                 // T-SQL: expr [AS] 'alias'
                 let a0 = p.acceptKw("as")
                 let t = p.next()
                 alias = strings.toLowerAscii(&t.text)
-                spell = t.text
+                spell = t.text.clone()
             } else if p.acceptKw("as") {
                 alias = try p.name()
-                spell = p.spelled
+                spell = p.spelled.clone()
             } else {
-                let t = p.peek()
+                let t = p.peek().clone()
                 let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
                 if !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text) && !(p.tsql && tsqlStarts(&t.text)))) {
-                    alias = t.text
-                    spell = t.spell
+                    alias = t.text.clone()
+                    spell = t.spell.clone()
                     p.pos += 1
                 }
             }
@@ -3644,11 +3644,11 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         let ul = !s.temp && p.acceptKw("unlogged")
         let tb = p.acceptKw("table")
         s.into = try p.qname()
-        s.spell = p.spelled
+        s.spell = p.spelled.clone()
     }
     if p.acceptKw("from") {
         try p.fromList(mut &s.from, J_FIRST)
-        s.table = s.from[0].table
+        s.table = s.from[0].table.clone()
     }
     var rn = -1
     if p.acceptKw("where") {
@@ -3700,15 +3700,15 @@ fn oraHasOuter(x: &Expr): bool {
 
 fn oraStripOuter(x: &Expr): Expr {
     match x {
-        Expr.Unary(op, a) { return Expr.Unary(op, oraStripOuter(&a)) }
-        Expr.Bin(op, a, b) { return Expr.Bin(op, oraStripOuter(&a), oraStripOuter(&b)) }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), oraStripOuter(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), oraStripOuter(&a), oraStripOuter(&b)) }
         Expr.IsNull(a, neg) { return Expr.IsNull(oraStripOuter(&a), neg) }
         Expr.Cast(a, t) { return Expr.Cast(oraStripOuter(&a), t) }
         Expr.Call(n, args, star) {
             if n == "#outer" && len(args) == 1 { return oraStripOuter(&args[0]) }
             var out: []Expr = []
             for a in args { append(mut &out, oraStripOuter(&a)) }
-            return Expr.Call(n, out, star)
+            return Expr.Call(n.clone(), out, star)
         }
         else { return cloneE(x) }
     }
@@ -3753,7 +3753,7 @@ fn oraSplitAnd(x: &Expr, out: mut &[]Expr) {
     }
 }
 
-fn oraAndAll(es: []Expr): Option[Expr] {
+fn oraAndAll(es: &[]Expr): Option[Expr] {
     var acc: Option[Expr] = None
     for e in es {
         acc = match replace(mut &acc, None) {
@@ -3913,8 +3913,8 @@ fn (p: mut &P) groupItem(top: bool, special: mut &bool): Result[[][]Expr, lexdb_
         special = true
         return Ok([[]])
     }
-    let t = p.peek()
-    let kw = if t.kind == T_IDENT && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" { t.text } else { "" }
+    let t = p.peek().clone()
+    let kw = if t.kind == T_IDENT && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" { t.text.clone() } else { "" }
     if kw == "rollup" || kw == "cube" {
         p.pos += 2
         special = true
@@ -4259,7 +4259,7 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         return Ok(FromItem{table: rel, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     if ci >= 0 {
-        if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c) } }
+        if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c.clone()) } }
         // in its own body: its working table
         for k in 0..len(p.inCte) {
             if p.inCte[k].id == p.ctes[ci].id {
@@ -4289,7 +4289,7 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     let saved = replace(mut &p.subs, [])
     let savedW = replace(mut &p.wins, [])
     var s = lexdb_sql.newStmt(S_SELECT)
-    s.srf = name
+    s.srf = name.clone()
     s.use = SUB_FROM
     if !p.isKw(")") {
         while true {
@@ -4307,13 +4307,13 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     append(mut &p.subs, s)
     let i = len(p.subs) - 1
-    var alias = name
+    var alias = name.clone()
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
     // one column, an alias and no column names: the column is the alias
     let single = name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
                  len(p.subs[i].items) == 1
-    if single && alias != name && len(cols) == 0 { append(mut &cols, alias) }
+    if single && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
@@ -4344,14 +4344,14 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
         let old = replace(alias, try p.name())
         got = true
     } else {
-        let t = p.peek()
+        let t = p.peek().clone()
         // (T-SQL: OUTPUT and OPTION after a table are clauses)
         let tw = (p.tsql && t.kind == T_IDENT && (t.text == "output" || t.text == "option" || tsqlStarts(&t.text))) ||
                  (t.kind == T_IDENT && t.text == "match_recognize" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(")
         // (FETCH FIRST ... after a table: a clause, as OFFSET)
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
         if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))) {
-            let old = replace(alias, t.text)
+            let old = replace(alias, t.text.clone())
             p.pos += 1
             got = true
         }
@@ -4424,7 +4424,7 @@ fn (p: mut &P) matchRecognize(f0: FromItem): Result[FromItem, lexdb_base.DbErr] 
     var alias = "unnamed_subquery"
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
-    p.subs[len(p.subs) - 1].mr[0].alias = alias
+    p.subs[len(p.subs) - 1].mr[0].alias = alias.clone()
     return Ok(FromItem{table: "", alias: alias, join: outerJoin, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: outerLateral,
                        using: [], natural: false, comma: false})
 }
@@ -4493,15 +4493,15 @@ fn (p: mut &P) mrClause(): Result[MatchRec, lexdb_base.DbErr] {
             var spell = ""
             if p.acceptKw("as") {
                 alias = try p.name()
-                spell = p.spelled
+                spell = p.spelled.clone()
             } else {
-                let t = p.peek()
+                let t = p.peek().clone()
                 var ok = t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))
                 if ok && !p.ora && t.kind == T_IDENT && (t.text == "one" || t.text == "all" || t.text == "after" || t.text == "pattern" ||
                                                            t.text == "subset" || t.text == "define") { ok = false }
                 if ok {
-                    alias = t.text
-                    spell = t.spell
+                    alias = t.text.clone()
+                    spell = t.spell.clone()
                     p.pos += 1
                 }
             }
@@ -4545,8 +4545,8 @@ fn (p: mut &P) mrClause(): Result[MatchRec, lexdb_base.DbErr] {
                 m.skip = SKIP_NEXT
             } else {
                 m.skip = SKIP_LAST
-                let q = p.peek()
-                let nx = p.peekAt(1)
+                let q = p.peek().clone()
+                let nx = p.peekAt(1).clone()
                 if q.kind == T_IDENT && (q.text == "first" || q.text == "last") && (nx.kind == T_QIDENT || (nx.kind == T_IDENT && nx.text != "pattern")) {
                     p.pos += 1
                     if q.text == "first" { m.skip = SKIP_FIRST }
@@ -4564,7 +4564,7 @@ fn (p: mut &P) mrClause(): Result[MatchRec, lexdb_base.DbErr] {
     if p.acceptKw("subset") {
         while true {
             let nm = try p.name()
-            let spell = p.spelled
+            let spell = p.spelled.clone()
             try p.expectKw("=")
             try p.expectKw("(")
             var members: []int = []
@@ -4620,7 +4620,7 @@ fn (p: mut &P) mrAlt(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_mat
 fn (p: mut &P) mrSeq(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_match.PNode, lexdb_base.DbErr] {
     var xs: []lexdb_match.PNode = []
     while true {
-        let t = p.peek()
+        let t = p.peek().clone()
         if t.kind == T_EOF { break }
         if t.kind == T_OP && (t.text == "|" || t.text == ")" || t.text == ",") { break }
         if t.kind == T_OP && t.text == "-" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "}" { break }
@@ -4632,7 +4632,7 @@ fn (p: mut &P) mrSeq(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_mat
 }
 
 fn (p: mut &P) mrBound(): Result[int, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind != T_NUM { return Err(near(&t)) }
     for i in 0..len(t.text) { if !isDigit(t.text[i]) { return Err(near(&t)) } }
     p.pos += 1
@@ -4648,7 +4648,7 @@ fn (p: mut &P) mrBound(): Result[int, lexdb_base.DbErr] {
 fn (p: mut &P) mrTerm(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_match.PNode, lexdb_base.DbErr] {
     var x = try p.mrPrimary(m, exc, d)
     // a quantifier
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind != T_OP { return Ok(x) }
     var mn = 0
     var mx = -1
@@ -4680,7 +4680,7 @@ fn (p: mut &P) mrTerm(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_ma
 }
 
 fn (p: mut &P) mrPrimary(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb_match.PNode, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_OP {
         if t.text == "(" {
             p.pos += 1
@@ -4714,8 +4714,8 @@ fn (p: mut &P) mrPrimary(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb
         p.pos += 1
         var k = mrVarIndex(&m.vars, &t.text)
         if k < 0 {
-            append(mut &m.vars, t.text)
-            append(mut &m.shown, if len(t.spell) > 0 { t.spell } else { t.text })
+            append(mut &m.vars, t.text.clone())
+            append(mut &m.shown, if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() })
             k = len(m.vars) - 1
         }
         return Ok(lexdb_match.PNode.Var(k))
@@ -4789,10 +4789,10 @@ fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("collate") {
         // a collation's name as written: PostgreSQL's are matched by case ("C")
         let c = try p.qname()
-        let sp = if len(p.spelled) > 0 { p.spelled } else { lexdb_sql.baseName(&c) }
+        let sp = if len(p.spelled) > 0 { p.spelled.clone() } else { lexdb_sql.baseName(&c) }
         append(mut &opts, "COLLATE \"" + (if lexdb_sql.isQual(&c) { lexdb_sql.qual(&lexdb_sql.schemaOf(&c), &sp) } else { sp }) + "\"")
     }
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_IDENT && t.text != "asc" && t.text != "desc" && t.text != "nulls" {
         let oc = try p.qname()
         if !isOpClass(&lexdb_sql.baseName(&oc)) {
@@ -4839,7 +4839,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) batchOpt(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if !(p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "batch_rows") { return Ok(Unit{}) }
     p.pos += 3
-    let v = p.peek()
+    let v = p.peek().clone()
     if v.kind != T_NUM { return Err(near(&v)) }
     p.pos += 1
     let n = strings.parseIntOpt(&v.text).unwrapOr(0)
@@ -4926,7 +4926,7 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
         try tsqlMergeCheck(&s)
         try mergeOutput(mut &s, out)
         // SQL Server: the statement ends with a semicolon
-        let t = p.peek()
+        let t = p.peek().clone()
         if !(t.kind == T_OP && t.text == ";") {
             return Err(lexdb_base.err("TS10713", "A MERGE statement must be terminated by a semi-colon (;)."))
         }
@@ -4954,7 +4954,7 @@ fn (p: mut &P) mergeWhen(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     }
     if !p.ora && p.acceptKw("and") { c.cond = Some(try p.expr()) }
     try p.expectKw("then")
-    let t = p.peek()
+    let t = p.peek().clone()
     if p.ora && c.when == MC_MATCHED && !p.isKw("update") { return Err(oraKeyword("UPDATE")) }
     if p.ora && c.when == MC_NOT_MATCHED && !p.isKw("insert") { return Err(oraKeyword("INSERT")) }
     if p.acceptKw("update") {
@@ -5076,7 +5076,7 @@ fn mergeOutput(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
     var items = out
     for i in 0..len(items) {
         if items[i].star {
-            if items[i].qual == "inserted" { items[i].qual = q }
+            if items[i].qual == "inserted" { items[i].qual = q.clone() }
             if items[i].qual == "deleted" { items[i].qual = "\x01deleted" }
             continue
         }
@@ -5140,7 +5140,7 @@ fn (p: mut &P) truncate(): Result[Stmt, lexdb_base.DbErr] {
 //   CLUSTER [(option, ...)] [VERBOSE] [table [USING index]]
 fn (p: mut &P) maint(w: &str): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_MAINT)
-    let kw = if w == "analyse" { "analyze" } else { w }
+    let kw = if w == "analyse" { "analyze" } else { w.clone() }
     s.alias = strings.toUpperAscii(&kw)
     if kw == "checkpoint" { return Ok(s) }
     var analyze = kw == "analyze"
@@ -5293,10 +5293,10 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
     let with = p.acceptKw("with")
     if p.acceptKw("(") {
         while true {
-            let t = p.peek()
+            let t = p.peek().clone()
             if t.kind != T_IDENT { return Err(near(&t)) }
             p.pos += 1
-            let v = p.peek()
+            let v = p.peek().clone()
             match t.text {
                 "format" {
                     if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
@@ -5375,7 +5375,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         return Err(lexdb_base.err("0A000", &("COPY " + (if hasQuote { "quote" } else { "escape" }) + " available only in CSV mode")))
     }
     if !hasQuote { s.copy.quote = "\"" }
-    if !hasEscape { s.copy.escape = s.copy.quote }
+    if !hasEscape { s.copy.escape = s.copy.quote.clone() }
     if len(s.copy.delim) != 1 { return Err(lexdb_base.err("22023", "COPY delimiter must be a single one-byte character")) }
     if s.copy.delim == "\n" || s.copy.delim == "\r" { return Err(lexdb_base.err("22023", "COPY delimiter cannot be newline or carriage return")) }
     if !s.copy.csv && strings.indexOf(&"\\.abcdefghijklmnopqrstuvwxyz0123456789", &s.copy.delim, 0) >= 0 {
@@ -5404,8 +5404,8 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         // TO from a table: its query
         var q = lexdb_sql.newStmt(S_SELECT)
         if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""}) }
-        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n, -1)), alias: "", spell: ""}) }
-        append(mut &q.from, FromItem{table: s.table, alias: lexdb_sql.baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
+        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n.clone(), -1)), alias: "", spell: ""}) }
+        append(mut &q.from, FromItem{table: s.table.clone(), alias: lexdb_sql.baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
         append(mut &s.inner, q)
     }
     return Ok(s)
@@ -5440,7 +5440,7 @@ fn (p: mut &P) over(): Result[WinDef, lexdb_base.DbErr] {
 // [frame], and its ")".
 fn (p: mut &P) winSpec(): Result[WinDef, lexdb_base.DbErr] {
     var d = WinDef{call: Expr.Lit(Val.Null), ref: "", bare: false, part: [], order: [], frame: lexdb_sql.noFrame()}
-    let t = p.peek()
+    let t = p.peek().clone()
     if (t.kind == T_IDENT || t.kind == T_QIDENT) && !(t.kind == T_IDENT &&
         (t.text == "partition" || t.text == "order" || t.text == "rows" || t.text == "range" || t.text == "groups")) {
         d.ref = try p.name()
@@ -5534,14 +5534,14 @@ fn (p: mut &P) bound(f: mut &Frame, start: bool): Result[Unit, lexdb_base.DbErr]
 
 // A COPY option's value: a string.
 fn (p: mut &P) copyStr(): Result[str, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind != T_STR { return Err(near(&t)) }
     p.pos += 1
-    return Ok(t.text)
+    return Ok(t.text.clone())
 }
 
 fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind == T_EOF || (t.kind == T_OP && t.text == ";") { return Ok(lexdb_sql.newStmt(S_EMPTY)) }
     if t.kind != T_IDENT { return Err(near(&t)) }
     p.pos += 1
@@ -5635,12 +5635,12 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 let v = p.next()
                 if v.kind != T_STR { return Err(near(&v)) }
-                append(mut &ty.names, v.text)
+                append(mut &ty.names, v.text.clone())
                 if p.isKw("before") || p.isKw("after") {
                     ty.alias = p.next().text
                     let w = p.next()
                     if w.kind != T_STR { return Err(near(&w)) }
-                    ty.index = w.text
+                    ty.index = w.text.clone()
                 }
                 return Ok(ty)
             }
@@ -5731,7 +5731,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 var ty = lexdb_sql.newStmt(S_CREATE_TYPE)
                 let nameAt = p.peek().at
                 ty.table = try p.qname()
-                ty.spell = p.spelled
+                ty.spell = p.spelled.clone()
                 let nameEnd = p.peek().at
                 try p.expectKw("as")
                 if p.tsql && p.isKw("table") {
@@ -5743,7 +5743,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     let open = p.peek().at
                     var body = try p.tableBody(lexdb_sql.newStmt(S_CREATE))
                     if body.onCommit != ONC_NONE { return Err(near(&p.toks[p.pos - 1])) }
-                    let last = p.toks[p.pos - 1]
+                    let last = &p.toks[p.pos - 1]
                     ty.index = p.src[open..last.at + 1].toStr()
                     ty.alias = strings.trim(&p.src[nameAt..min(nameEnd, len(p.src))]).toStr()
                     ty.names = ["table"]
@@ -5756,7 +5756,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     while true {
                         let v = p.next()
                         if v.kind != T_STR { return Err(near(&v)) }
-                        append(mut &ty.names, v.text)
+                        append(mut &ty.names, v.text.clone())
                         if !p.acceptKw(",") { break }
                     }
                     try p.expectKw(")")
@@ -5782,7 +5782,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 // name [AUTHORIZATION role], or AUTHORIZATION role (the schema named for it)
                 if p.acceptKw("authorization") {
                     let r = try p.roleSpec()
-                    s.table = r
+                    s.table = r.clone()
                     append(mut &s.names, r)
                     return Ok(s)
                 }
@@ -5970,7 +5970,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if w.kind != T_IDENT || (w.text != "all" && w.text != "temp" && w.text != "temporary" && w.text != "plans" && w.text != "sequences") {
                     return Err(near(&w))
                 }
-                st.table = "discard:" + (if w.text == "temporary" { "temp" } else { w.text })
+                st.table = "discard:" + (if w.text == "temporary" { "temp" } else { w.text.clone() })
                 return Ok(st)
             }
             let u = p.acceptKw("session")
@@ -6003,8 +6003,8 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if t.text == "set" {
                     let eq = p.acceptKw("to") || p.acceptKw("=")
                     if !p.acceptKw("none") && !p.acceptKw("default") {
-                        let v = p.peek()
-                        if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text) } else { append(mut &st.names, try p.name()) }
+                        let v = p.peek().clone()
+                        if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text.clone()) } else { append(mut &st.names, try p.name()) }
                     }
                 }
                 return Ok(st)
@@ -6026,21 +6026,21 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if t.text == "set" && p.acceptKw("schema") {
                 // SET SCHEMA 'x': the search path x
                 st.table = "search_path"
-                let v = p.peek()
-                if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text) } else { append(mut &st.names, try p.name()) }
+                let v = p.peek().clone()
+                if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text.clone()) } else { append(mut &st.names, try p.name()) }
                 return Ok(st)
             }
             var known = false
             for name in lexdb_sql.settingsList() { if p.isKw(&name) { known = true } }
             if known && (t.text == "set" || t.text == "reset") {
-                st.table = p.toks[p.pos].text
+                st.table = p.toks[p.pos].text.clone()
                 p.pos += 1
                 if t.text == "set" && st.table == "search_path" {
                     // a list of schemas, names or strings ('a, b' splits too); DEFAULT
                     if !p.acceptKw("to") { try p.expectKw("=") }
                     if p.acceptKw("default") { return Ok(st) }
                     while true {
-                        let v = p.peek()
+                        let v = p.peek().clone()
                         if v.kind == T_STR {
                             p.pos += 1
                             for part in strings.split(&v.text, ",") {
@@ -6060,10 +6060,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     // lexdb_batch: on, off, true, false, 1, 0, a string of one of
                     // them, DEFAULT; lexdb_planner: cost, rules (optimizer 20), a word or a string
                     if !p.acceptKw("to") { try p.expectKw("=") }
-                    let v = p.peek()
+                    let v = p.peek().clone()
                     if v.kind == T_EOF { return Err(near(&v)) }
                     p.pos += 1
-                    if v.text != "default" { st.limit = Some(Expr.Lit(Val.Text(v.text))) }
+                    if v.text != "default" { st.limit = Some(Expr.Lit(Val.Text(v.text.clone()))) }
                     return Ok(st)
                 }
                 if t.text == "set" {
@@ -6096,7 +6096,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                         let w = p.next()
                         append(mut &vals, "-" + w.text)
                     } else {
-                        append(mut &vals, v.text)
+                        append(mut &vals, v.text.clone())
                     }
                     if !p.acceptKw(",") { break }
                 }
@@ -6121,14 +6121,14 @@ fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
     if p.acceptKw("interval") {
         let v = p.next()
         if v.kind != T_STR { return Err(near(&v)) }
-        var body = v.text
+        var body = v.text.clone()
         var unit = ""
         for u in ["year", "month", "day", "hour", "minute", "second"] { if unit == "" && p.acceptKw(&u) { unit = u } }
-        var last = unit
+        var last = unit.clone()
         if unit != "" && p.acceptKw("to") {
             let u2 = p.next()
             if u2.kind != T_IDENT { return Err(near(&u2)) }
-            last = u2.text
+            last = u2.text.clone()
         }
         var bare = len(body) > 0
         for i in 0..len(body) { if !((body[i] >= '0' && body[i] <= '9') || body[i] == '.' || body[i] == '-' || body[i] == '+' || body[i] == ' ') { bare = false } }
@@ -6137,7 +6137,7 @@ fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
         return Ok("INTERVAL '" + body + "'" + (if last == "hour" || last == "minute" { " " + last } else { "" }))
     }
     let v = p.next()
-    if v.kind == T_STR || v.kind == T_IDENT || v.kind == T_QIDENT || v.kind == T_NUM { return Ok(v.text) }
+    if v.kind == T_STR || v.kind == T_IDENT || v.kind == T_QIDENT || v.kind == T_NUM { return Ok(v.text.clone()) }
     if v.kind == T_OP && (v.text == "-" || v.text == "+") {
         let n = p.next()
         if n.kind != T_NUM { return Err(near(&n)) }
@@ -6178,14 +6178,14 @@ pub fn oraParseNls(sql: &str, nls: []str): Result[[]Stmt, lexdb_base.DbErr] { re
 fn connectLevel(sql: &str, toks: &[]Tok): Option[str] {
     var i = 0
     while i + 5 < len(toks) {
-        let a = toks[i]
-        let b = toks[i + 1]
+        let a = &toks[i]
+        let b = &toks[i + 1]
         if a.kind == T_IDENT && a.text == "dual" && b.kind == T_IDENT && b.text == "connect" && toks[i + 2].kind == T_IDENT && toks[i + 2].text == "by" &&
            toks[i + 3].kind == T_IDENT && toks[i + 3].text == "level" && toks[i + 4].kind == T_OP && (toks[i + 4].text == "<=" || toks[i + 4].text == "<") {
             var j = i + 5
             var depth = 0
             while j < len(toks) {
-                let t = toks[j]
+                let t = &toks[j]
                 if t.kind == T_EOF { break }
                 if t.kind == T_OP && t.text == "(" { depth += 1 }
                 else if t.kind == T_OP && t.text == ")" {
@@ -6238,7 +6238,7 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
             s.subs = replace(mut &p.subs, [])
             s.wins = replace(mut &p.wins, [])
         }
-        let t = p.peek()
+        let t = p.peek().clone()
         if t.kind == T_EOF {
             if s.kind != S_EMPTY || len(out) == 0 { append(mut &out, s) }
             break
@@ -6262,19 +6262,19 @@ pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
     var toks: []Tok = []
     var i = 0
     while i < len(raw) {
-        let t = raw[i]
+        let t = &raw[i]
         if t.kind == T_OP && t.text == "#" && i + 2 < len(raw) && raw[i + 1].kind == T_IDENT && raw[i + 1].at == t.at + 1 &&
            raw[i + 2].kind == T_OP && raw[i + 2].text == "(" {
             append(mut &toks, Tok{kind: T_IDENT, text: "#" + raw[i + 1].text, at: t.at, spell: ""})
             i += 2
             continue
         }
-        append(mut &toks, t)
+        append(mut &toks, t.clone())
         i += 1
     }
     var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0}
     let x = try p.expr()
-    let t = p.peek()
+    let t = p.peek().clone()
     if t.kind != T_EOF { return Err(near(&t)) }
     return Ok(x)
 }
@@ -6380,12 +6380,12 @@ pub fn tsqlParser(sql: &str, d: Dialect, vars: &[]str): Result[Parser, lexdb_bas
     dt.tsql = true
     let toks = try lexIn(sql, dt)
     var given: []str = []
-    for v in vars { append(mut &given, v) }
+    for v in vars { append(mut &given, v.clone()) }
     return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0}})
 }
 
-pub fn (q: &Parser) peek(): Tok { return q.p.peek() }
-pub fn (q: &Parser) peekAt(k: int): Tok { return q.p.peekAt(k) }
+pub fn (q: &Parser) peek(): &Tok { return q.p.peek() }
+pub fn (q: &Parser) peekAt(k: int): &Tok { return q.p.peekAt(k) }
 pub fn (q: mut &Parser) next(): Tok { return q.p.next() }
 pub fn (q: mut &Parser) skip(n: int) { q.p.pos += n }
 pub fn (q: &Parser) isKw(w: &str): bool { return q.p.isKw(w) }
@@ -6444,7 +6444,7 @@ pub fn (q: mut &Parser) assign(v: &str, e: Expr): Stmt {
 
 // SELECT xs, as PRINT, RAISERROR and THROW have their arguments; xs parsed
 // since the last fresh().
-pub fn (q: mut &Parser) values(xs: []Expr): Stmt {
+pub fn (q: mut &Parser) values(xs: &[]Expr): Stmt {
     var s = lexdb_sql.newStmt(S_SELECT)
     for x in xs { append(mut &s.items, SelItem{star: false, qual: "", expr: Some(cloneE(&x)), alias: "", spell: ""}) }
     q.p.finish(mut &s)
@@ -6536,12 +6536,12 @@ fn (p: mut &P) oraPrimary(t: &Tok): Result[Option[Expr], lexdb_base.DbErr] {
     if t.kind != T_IDENT && t.kind != T_QIDENT { return Ok(None) }
     // seq.nextval, schema.seq.nextval
     if p.isKw(".") {
-        let a = p.peekAt(1)
+        let a = p.peekAt(1).clone()
         if (a.kind == T_IDENT) && (a.text == "nextval" || a.text == "currval") {
             p.pos += 2
             return Ok(Some(p.oraSeq(&t.text, &a.text)))
         }
-        let b = p.peekAt(3)
+        let b = p.peekAt(3).clone()
         if (a.kind == T_IDENT || a.kind == T_QIDENT) && p.peekAt(2).kind == T_OP && p.peekAt(2).text == "." && b.kind == T_IDENT && (b.text == "nextval" || b.text == "currval") {
             p.pos += 4
             return Ok(Some(p.oraSeq(&(lexdb_sql.qual(&t.text, &a.text)), &b.text)))
@@ -6567,8 +6567,8 @@ fn (p: mut &P) oraPrimary(t: &Tok): Result[Option[Expr], lexdb_base.DbErr] {
 }
 
 fn (p: mut &P) oraSeq(name: &str, which: &str): Expr {
-    append(mut &p.seqs, name)
-    return Expr.Call(which.toStr(), [Expr.Lit(Val.Text(name))], false)
+    append(mut &p.seqs, name.clone())
+    return Expr.Call(which.toStr(), [Expr.Lit(Val.Text(name.clone()))], false)
 }
 
 fn cloneAll(a: &[]Expr): []Expr {
@@ -6708,17 +6708,17 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
         "to_char", "to_nchar" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
             // no format: a date follows the session's NLS formats
-            if n == 1 && len(p.nls) == 3 { return Ok(Expr.Call("#ora_tochar1", [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0])), Expr.Lit(Val.Text(p.nls[1])), Expr.Lit(Val.Text(p.nls[2]))], false)) }
+            if n == 1 && len(p.nls) == 3 { return Ok(Expr.Call("#ora_tochar1", [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone())), Expr.Lit(Val.Text(p.nls[1].clone())), Expr.Lit(Val.Text(p.nls[2].clone()))], false)) }
             return Ok(Expr.Call("#ora_tochar", a, false))
         }
         "to_date" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
-            if n == 1 && len(p.nls) == 3 && len(p.nls[0]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0]))] }
+            if n == 1 && len(p.nls) == 3 && len(p.nls[0]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone()))] }
             return Ok(Expr.Call("#ora_todate", a, false))
         }
         "to_timestamp" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
-            if n == 1 && len(p.nls) == 3 && len(p.nls[1]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[1]))] }
+            if n == 1 && len(p.nls) == 3 && len(p.nls[1]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[1].clone()))] }
             return Ok(Expr.Call("#ora_totimestamp", a, false))
         }
         "to_number" {
@@ -6909,7 +6909,7 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
         var hasOr = false
         var done = false
         while !done {
-            let t = p.toks[i]
+            let t = &p.toks[i]
             if t.kind == T_EOF { break }
             if t.kind == T_OP && t.text == "(" { depth += 1 }
             else if t.kind == T_OP && t.text == ")" {
@@ -6940,9 +6940,9 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
         var lim = -1
         for c in 0..len(starts) {
             if ends[c] - starts[c] != 3 { continue }
-            let a = p.toks[starts[c]]
-            let o = p.toks[starts[c] + 1]
-            let b = p.toks[starts[c] + 2]
+            let a = &p.toks[starts[c]]
+            let o = &p.toks[starts[c] + 1]
+            let b = &p.toks[starts[c] + 2]
             if !(a.kind == T_IDENT && a.text == "rownum" && o.kind == T_OP && b.kind == T_NUM) { continue }
             let nv = strings.parseIntOpt(&b.text).unwrapOr(-1)
             if nv < 0 || strings.contains(&b.text, ".") { continue }
@@ -6966,8 +6966,8 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
             from = from - 1
         }
         var nt: []Tok = []
-        for q in 0..from { append(mut &nt, p.toks[q]) }
-        for q in to..len(p.toks) { append(mut &nt, p.toks[q]) }
+        for q in 0..from { append(mut &nt, p.toks[q].clone()) }
+        for q in to..len(p.toks) { append(mut &nt, p.toks[q].clone()) }
         p.toks = nt
         if emptied { return limit }
     }
@@ -6988,7 +6988,7 @@ fn (p: mut &P) oraLimit(s0: Stmt, n: int): Stmt {
     var inner = lexdb_sql.newStmt(S_SELECT)
     append(mut &inner.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
     inner.from = replace(mut &s.from, [])
-    inner.table = s.table
+    inner.table = s.table.clone()
     inner.where = replace(mut &s.where, None)
     inner.limit = lim
     inner.use = SUB_FROM
@@ -6996,7 +6996,7 @@ fn (p: mut &P) oraLimit(s0: Stmt, n: int): Stmt {
     outer.items = replace(mut &s.items, [])
     outer.order = replace(mut &s.order, [])
     outer.offset = replace(mut &s.offset, None)
-    let al = inner.from[0].alias
+    let al = inner.from[0].alias.clone()
     append(mut &outer.from, FromItem{table: "", alias: al, join: J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false, using: [], natural: false, comma: true})
     p.subs = [inner]
     return outer

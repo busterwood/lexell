@@ -87,16 +87,16 @@ fn unName(u: int): &str {
 // x's value for row (aggs: #agg's slots), as eval gives it.
 pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Val, DbErr] {
     match x {
-        lexdb_bind.BX.Const(v) { return Ok(v) }
+        lexdb_bind.BX.Const(v) { return Ok(v.clone()) }
         lexdb_bind.BX.Param(i) {
             if i >= len(ce.params) { return Err(e("08P01", &("there is no parameter $" + (i + 1).toStr()))) }
-            return Ok(ce.params[i])
+            return Ok(ce.params[i].clone())
         }
         lexdb_bind.BX.Col(i) {
             if len(row) == 0 { return Ok(Val.Null) }
-            return Ok(row[i])
+            return Ok(row[i].clone())
         }
-        lexdb_bind.BX.Agg(i) { return Ok(aggs[i]) }
+        lexdb_bind.BX.Agg(i) { return Ok(aggs[i].clone()) }
         lexdb_bind.BX.Un(u, a) { return lexdb_ops.unaryVal(unName(u), try bxEval(&a, row, aggs, ce)) }
         lexdb_bind.BX.And(a, b) {
             let l = lexdb_ops.truth(&(try bxEval(&a, row, aggs, ce)))
@@ -117,19 +117,19 @@ pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Va
         lexdb_bind.BX.Op(op, a, b) {
             let l = try bxEval(&a, row, aggs, ce)
             let r = try bxEval(&b, row, aggs, ce)
-            return lexdb_ops.binOp(op, l, r, fn(): lexdb_time.Zone { return ce.zone })
+            return lexdb_ops.binOp(op, l, r, fn(): lexdb_time.Zone { return ce.zone.clone() })
         }
         lexdb_bind.BX.Cat(a, b, f) {
             let l = try bxEval(&a, row, aggs, ce)
             let r = try bxEval(&b, row, aggs, ce)
             if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return callAt(&f, &[l, r], 0, &lexdb_time.utc(), ce.up.entry) }
-            return lexdb_ops.binOp(lexdb_ops.OP_CAT, l, r, fn(): lexdb_time.Zone { return ce.zone })
+            return lexdb_ops.binOp(lexdb_ops.OP_CAT, l, r, fn(): lexdb_time.Zone { return ce.zone.clone() })
         }
         lexdb_bind.BX.IsNull(a, neg) {
             let v = try bxEval(&a, row, aggs, ce)
             return Ok(Val.Bool(lexdb_ops.isNull(&v) != neg))
         }
-        lexdb_bind.BX.Cast(a, t) { return lexdb_ops.castTo(try bxEval(&a, row, aggs, ce), &t, fn(): lexdb_time.Zone { return ce.zone }) }
+        lexdb_bind.BX.Cast(a, t) { return lexdb_ops.castTo(try bxEval(&a, row, aggs, ce), &t, fn(): lexdb_time.Zone { return ce.zone.clone() }) }
         lexdb_bind.BX.Case(cs, hasElse) {
             // only the branch taken is evaluated
             let pairs = if hasElse { (len(cs) - 1) / 2 } else { len(cs) / 2 }
@@ -152,7 +152,7 @@ pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Va
             if i >= len(ce.subs) { return Err(e("0A000", "a subquery is not supported here")) }
             if u == lexdb_sql.SUB_IN { return Ok(inProbe(&ce.subs[i], &(try bxEval(&xs[0], row, aggs, ce)), &ce.zone)) }
             if u == lexdb_sql.SUB_EXISTS { return Ok(Val.Bool(ce.subs[i].rows > 0)) }
-            return Ok(ce.subs[i].val)
+            return Ok(ce.subs[i].val.clone())
         }
     }
 }
@@ -660,7 +660,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                         if all {
                             var hasNull = false
                             var keep: []Val = []
-                            for v in vs {
+                            for v in move(vs) {
                                 if lexdb_ops.isNull(&v) { hasNull = true; continue }
                                 // compared as the row path compares them, one
                                 // order for the sorted set (bCmpKinds)
@@ -677,7 +677,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                                 for v in keep {
                                     var n = BNode.Const(0, true)
                                     if k == BK_VAL {
-                                        n = BNode.ValCmp(0, col - base, v, false)
+                                        n = BNode.ValCmp(0, col - base, v.clone(), false)
                                     } else if k == BK_INT {
                                         match v {
                                             Val.Int(iv) { n = BNode.Cmp(0, BNode.Col(col - base), BNode.Const(iv, false)) }
@@ -703,7 +703,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                             var sorted = keep
                             collections.sortBy(mut &sorted, fn(a: &Val, b: &Val): int { return sortCmp(a, b) })
                             var uniq: []Val = []
-                            for v in sorted {
+                            for v in move(sorted) {
                                 var dup = false
                                 if len(uniq) > 0 {
                                     match lexdb_ops.compare(&uniq[len(uniq) - 1], &v) {
@@ -1108,7 +1108,7 @@ pub fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
                     for j in 0..m {
                         let r = idx[j]
                         let v = if b.cols[c].nul[r] { Val.Null } else { bValAt(b, c, k, r) }
-                        append(mut &out, if lc { try lexdb_ops.binOp(code, v, kv, fn(): lexdb_time.Zone { return g.ce.zone }) } else { try lexdb_ops.binOp(code, kv, v, fn(): lexdb_time.Zone { return g.ce.zone }) })
+                        append(mut &out, if lc { try lexdb_ops.binOp(code, v, kv.clone(), fn(): lexdb_time.Zone { return g.ce.zone.clone() }) } else { try lexdb_ops.binOp(code, kv.clone(), v, fn(): lexdb_time.Zone { return g.ce.zone.clone() }) })
                     }
                     return Ok(out)
                 }
@@ -1135,12 +1135,12 @@ pub fn bGenVals(g: &BGen, b: &Batch, idx: &[]int): Result[[]Val, DbErr] {
 pub fn cxLit(x: &lexdb_bind.BX, ce: &Ctx, v: mut &Val): bool {
     match x {
         lexdb_bind.BX.Const(k) {
-            v = k
+            v = k.clone()
             return true
         }
         lexdb_bind.BX.Param(i) {
             if i >= len(ce.params) { return false }
-            v = ce.params[i]
+            v = ce.params[i].clone()
             return true
         }
         else { return false }
@@ -1173,7 +1173,7 @@ pub fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &Ctx): Option
         append(mut &cols, i - base)
         append(mut &ks, kinds[i])
     }
-    let gce = Ctx{now: ce.now, zone: ce.zone, params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up,
+    let gce = Ctx{now: ce.now, zone: ce.zone.clone(), params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up,
                   subs: if par && lexdb_bind.hasSub(x) { copySubs(&ce.subs) } else { [] }}
     return Some(BGen{cx: c, cols: cols, kinds: ks, ce: gce})
 }
@@ -1248,7 +1248,7 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
         match conds[ci] {
             BNode.Like(_, lp) {
                 var ps: []str = []
-                for x in lp.pieces { append(mut &ps, x) }
+                for x in lp.pieces { append(mut &ps, x.clone()) }
                 append(mut &pieces, ps)
             }
             else { append(mut &pieces, []) }
@@ -1416,7 +1416,7 @@ pub fn bFirstVals(b: &Batch, r: int, kinds: &[]int, cols: &[]int, out: mut &[]Va
             let k = kinds[i]
             // (as bRow: a numeric(p, s) column's units are its value)
             v = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) }
-                else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r] }
+                else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r].clone() }
         }
         n += valExtra(&v)
         append(out, v)
@@ -1432,7 +1432,7 @@ pub fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
         if !needCol[i] || len(b.cols[i].nul) == 0 || b.cols[i].nul[r] { continue }
         let k = kinds[i]
         out[i] = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) }
-                 else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r] }
+                 else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r].clone() }
     }
     return out
 }
@@ -1442,7 +1442,7 @@ pub fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
 pub fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     if c.typ == BT_OTHER {
         match c.n {
-            BNode.Col(i) { return b.vals[i][r] }
+            BNode.Col(i) { return b.vals[i][r].clone() }
             else { return Val.Null }
         }
     }
@@ -1501,7 +1501,7 @@ pub fn bValAt(b: &Batch, c: int, k: int, r: int): Val {
     if k == BK_INT { return Val.Int(b.cols[c].v[r]) }
     if k == BK_BOOL { return Val.Bool(b.cols[c].v[r] == 1) }
     if lexdb_rows.isDecKind(k) { return lexdb_rows.decVal(b.cols[c].v[r], lexdb_rows.decScale(k)) }
-    return b.vals[c][r]
+    return b.vals[c][r].clone()
 }
 
 // Adds the rows (gids: their groups) of a batch to a value aggregate's
@@ -1516,12 +1516,12 @@ pub fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int
         if b.cols[c].nul[r] { continue }
         let g = gids[j]
         if lexdb_ops.isNull(&av[g]) {
-            av[g] = b.vals[c][r]
+            av[g] = b.vals[c][r].clone()
         } else if summing {
             av[g] = try lexdb_ops.arith(lexdb_ops.OP_ADD, &av[g], &b.vals[c][r])
         } else {
             let x = try lexdb_ops.compare(&b.vals[c][r], &av[g])
-            if (mx && x >= 0) || (!mx && x <= 0) { av[g] = b.vals[c][r] }
+            if (mx && x >= 0) || (!mx && x <= 0) { av[g] = b.vals[c][r].clone() }
         }
         cn[g] += 1
     }
@@ -1829,7 +1829,7 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
 // table's decoded columns; the table the query's only columns), else -1.
 fn aggOps(i: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef): int {
     for c in a.calls {
-        let f = c.fname
+        let f = &c.fname
         if !(f == "count" || f == "sum" || f == "avg" || f == "min" || f == "max") || (c.star != c.arg.isNone()) || (c.star && f != "count") { return -1 }
     }
     match i {
@@ -2238,7 +2238,7 @@ fn oneRow(txn: mut &lexdb_store.Txn, r: mut &[]Val, sc: &lexdb_plan.PScan, conds
     while len(sr.vals) > 0 { let x = pop(mut &sr.vals) }
     for x in xs {
         match x {
-            BX.Col(i) { append(mut &sr.vals, sr.row[i]) }
+            BX.Col(i) { append(mut &sr.vals, sr.row[i].clone()) }
             else { append(mut &sr.vals, try bxEval(&x, &sr.row, &noAggs, cx)) }
         }
     }
@@ -2497,7 +2497,7 @@ fn aggState(a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef, kinds: &[]int, need:
     var specs: []BSpec = []
     var gens: []Option[BGen] = []
     for c in a.calls {
-        let f = c.fname
+        let f = &c.fname
         let kind = if c.star { BA_STAR } else if f == "count" { BA_COUNT } else if f == "sum" { BA_SUM } else if f == "avg" { BA_AVG }
                    else if f == "min" { BA_MIN } else { BA_MAX }
         var arg: Option[BNode] = None
@@ -2661,7 +2661,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                     g = ag.nullGroup
                 } else {
                     match b.vals[ag.textCol][r] {
-                        Val.Text(x) { ktext = x }
+                        Val.Text(x) { ktext = x.clone() }
                         else { return Ok(false) }
                     }
                     klen = len(ktext)
@@ -2764,7 +2764,7 @@ fn (ag: &AggSt) finish(nq: int, give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr])
     var accs: []PAcc = []
     for si in 0..ns { append(mut &accs, noAcc()) }
     for g in 0..ag.ngroups {
-        for fi in 0..nf { first[ag.fcols[fi]] = ag.fv[g * nf + fi] }
+        for fi in 0..nf { first[ag.fcols[fi]] = ag.fv[g * nf + fi].clone() }
         for si in 0..ns {
             let kd = ag.specs[si].kind
             let acc = mut &accs[si]
@@ -2772,8 +2772,8 @@ fn (ag: &AggSt) finish(nq: int, give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr])
             acc.sum = Val.Null
             acc.val = Val.Null
             if ag.an[si][g] > 0 && ag.specs[si].vcol >= 0 {
-                if kd == BA_SUM || kd == BA_AVG { acc.sum = ag.aval[si][g] }
-                if kd == BA_MIN || kd == BA_MAX { acc.val = ag.aval[si][g] }
+                if kd == BA_SUM || kd == BA_AVG { acc.sum = ag.aval[si][g].clone() }
+                if kd == BA_MIN || kd == BA_MAX { acc.val = ag.aval[si][g].clone() }
             } else if ag.an[si][g] > 0 && ag.specs[si].dsc >= 0 {
                 // as the row engine's Decimal sum of the same values (display scale dsc)
                 let ds = ag.specs[si].dsc
@@ -2828,13 +2828,13 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     var vals: []Val = []
     let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
         if ob.n == 0 {
-            for k in 0..len(slots) { rg.row[slots[k]] = r[k] }
+            for k in 0..len(slots) { rg.row[slots[k]] = r[k].clone() }
             try groupRow(mut &rg, a, cx, room, maxHeld)
             return Ok(true)
         }
         for j in 0..ob.n {
             obRow(ob, j, mut &vals)
-            for k in 0..len(slots) { rg.row[slots[k]] = vals[k] }
+            for k in 0..len(slots) { rg.row[slots[k]] = replace(mut &vals[k], Val.Null) }
             try groupRow(mut &rg, a, cx, room, maxHeld)
         }
         return Ok(true)
@@ -2900,7 +2900,7 @@ fn accOne(c: &lexdb_plan.PCall, acc: mut &PAcc, row: &[]Val, cx: &Ctx): Result[U
         None { Val.Null }
     }
     if lexdb_ops.isNull(&v) { return Ok(Unit{}) }
-    let f = c.fname
+    let f = &c.fname
     if f == "sum" || f == "avg" {
         let w = if f == "avg" && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
         if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
@@ -2927,7 +2927,7 @@ pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
         } else if ob.cols[c].nul[r] {
             append(out, Val.Null)
         } else {
-            append(out, if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) } else { ob.vals[c][r] })
+            append(out, if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) } else { ob.vals[c][r].clone() })
         }
     }
 }
@@ -2956,7 +2956,7 @@ pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(),
 pub fn copySub(s: &SubVal): SubVal {
     var set: Map[str, int] = newMap()
     for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
-    return SubVal{rows: s.rows, val: s.val, set: set, numeric: s.numeric, hasNull: s.hasNull}
+    return SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull}
 }
 
 pub fn copySubs(subs: &[]SubVal): []SubVal {
@@ -2964,7 +2964,7 @@ pub fn copySubs(subs: &[]SubVal): []SubVal {
     for s in subs {
         var set: Map[str, int] = newMap()
         for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
-        append(mut &out, SubVal{rows: s.rows, val: s.val, set: set, numeric: s.numeric, hasNull: s.hasNull})
+        append(mut &out, SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull})
     }
     return out
 }
@@ -3216,7 +3216,7 @@ pub fn inProbe(r: &SubVal, x: &Val, z: &lexdb_time.Zone): Val {
 pub fn subValue(n: &str, r: &SubVal, x: &Val, z: &lexdb_time.Zone): Val {
     if n == "#exists" { return Val.Bool(r.rows > 0) }
     if n == "#in" { return inProbe(r, x, z) }
-    return r.val
+    return r.val.clone()
 }
 
 // ---- joins (slice P2; design/lexdb-layers.md 6.2.3)
@@ -3692,7 +3692,7 @@ pub fn bGather(src: &Batch, c: int, kind: int, at: &[]int, out: mut &Batch, oc: 
         let sv = &src.vals[c]
         for p in 0..n {
             let r = at[p]
-            if r >= 0 { vs[p] = sv[r] }
+            if r >= 0 { vs[p] = sv[r].clone() }
         }
         out.vals[oc] = vs
     }
@@ -3765,7 +3765,7 @@ fn keyAt(jl: &JL, kv: &[]BVec, w: &Batch, i: int, r: int): Val {
     let t = jl.keyTyp[i]
     if t == BT_OTHER {
         let c = jl.keyCol[i]
-        return if w.cols[c].nul[r] { Val.Null } else { w.vals[c][r] }
+        return if w.cols[c].nul[r] { Val.Null } else { w.vals[c][r].clone() }
     }
     if kv[i].nul[r] { return Val.Null }
     if t == BT_BOOL { return Val.Bool(kv[i].v[r] == 1) }
@@ -3965,7 +3965,7 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                             Some(y) { bk = y }
                             None {
                                 bk = len(bd.head)
-                                bd.txts.put(x, bk)
+                                bd.txts.put(x.clone(), bk)
                             }
                         }
                     }
@@ -4020,7 +4020,7 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
             append(mut &bd.rows.cols[ci].v, b.cols[ci].v[r])
             append(mut &bd.rows.cols[ci].nul, b.cols[ci].nul[r])
             if bp.kinds[ci] == BK_VAL {
-                append(mut &bd.rows.vals[ci], b.vals[ci][r])
+                append(mut &bd.rows.vals[ci], b.vals[ci][r].clone())
                 match b.vals[ci][r] {
                     Val.Text(x) { bd.held += len(x) }
                     else {}
@@ -4075,7 +4075,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
             while at < len(vrows) && b.n < lexdb_rows.BROWS {
                 for ci in 0..len(bp.kinds) {
                     if !bp.needCol[ci] { continue }
-                    let v = if ci < len(vrows[at]) { vrows[at][ci] } else { Val.Null }
+                    let v = if ci < len(vrows[at]) { vrows[at][ci].clone() } else { Val.Null }
                     if !lexdb_rows.put(mut &b, ci, b.n, v, bp.kinds[ci]) { return Err(batErr()) }
                 }
                 b.n += 1
@@ -4116,7 +4116,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
 // rows' places (n rows). At the end the consumer's columns are gathered
 // and the joined rows given to out. false: stop.
 fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
-            at: [][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
+            at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
     if n == 0 { return Ok(true) }
     if j == len(jr.jls) {
@@ -4588,7 +4588,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     let nq = len(cols)
     var wl: []int = []
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
-    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone}
+    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone()}
     try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, dec, bud, cnt)
     let bottom = joinBottom(top)
     let none: []BX = []

@@ -239,23 +239,23 @@ pub type Db = record {
 // record names them so Store's serving methods do not carry them.
 pub type TestHooks = value record {
     pub audit: fn(lexdb_disk.Fs): Result[str, lexdb_base.DbErr]
-    pub cacheState: fn(Store): str
-    pub clearCountHook: fn(Store)
-    pub colCounts: fn(Store): []int
-    pub countHookCalls: fn(Store): int
-    pub cutCounts: fn(Store): []int
-    pub durWaiting: fn(Store): int
+    pub cacheState: fn(&Store): str
+    pub clearCountHook: fn(&Store)
+    pub colCounts: fn(&Store): []int
+    pub countHookCalls: fn(&Store): int
+    pub cutCounts: fn(&Store): []int
+    pub durWaiting: fn(&Store): int
     pub readsText: fn(&Txn): str
     pub segName: fn(int): str
-    pub setColumns: fn(Store, bool)
-    pub setCountHook: fn(Store, fn(Store, int, str, int), int, &str)
-    pub setCutChunk: fn(Store, int)
-    pub setDropReads: fn(Store, int)
-    pub setFrameMax: fn(Store, int)
-    pub setUpgradeBudget: fn(Store, int)
+    pub setColumns: fn(&Store, bool)
+    pub setCountHook: fn(&Store, fn(Store, int, str, int), int, &str)
+    pub setCutChunk: fn(&Store, int)
+    pub setDropReads: fn(&Store, int)
+    pub setFrameMax: fn(&Store, int)
+    pub setUpgradeBudget: fn(&Store, int)
     pub setWriteLogMax: fn(int)
     pub chunkKey: fn(&str, int): str
-    pub upgradeCounts: fn(Store): []int
+    pub upgradeCounts: fn(&Store): []int
 }
 
 pub fn testHooks(): TestHooks {
@@ -393,17 +393,17 @@ pub fn (t: &Txn) lockOwner(): int { return t.lockId }
 fn (t: mut &Txn) noteRead(tree: int, lo: &str, hi: &str, seq: int) {
     let n = len(t.reads)
     if n > 0 {
-        let p = t.reads[n - 1]
-        if p.tree == tree && p.seq == seq && p.hi == lo && len(lo) > 0 {
-            t.reads[n - 1].hi = hi
+        let last = n - 1
+        if t.reads[last].tree == tree && t.reads[last].seq == seq && t.reads[last].hi == lo && len(lo) > 0 {
+            t.reads[last].hi = hi.clone()
             return
         }
-        if p.tree == tree && p.seq == seq && p.lo == hi && len(hi) > 0 {
-            t.reads[n - 1].lo = lo
+        if t.reads[last].tree == tree && t.reads[last].seq == seq && t.reads[last].lo == hi && len(hi) > 0 {
+            t.reads[last].lo = lo.clone()
             return
         }
     }
-    append(mut &t.reads, Mark{tree: tree, lo: lo, hi: hi, seq: seq})
+    append(mut &t.reads, Mark{tree: tree, lo: lo.clone(), hi: hi.clone(), seq: seq})
 }
 
 // Whether the transaction's reads are noted: a live transaction's, and a
@@ -453,12 +453,12 @@ pub fn (t: &Txn) wrote(tree: int, key: &str): bool { return t.lastWrite(tree, ke
 fn (t: mut &Txn) noteWrite(tree: int, key: &str, i: int) {
     for k in 0..len(t.idxTrees) {
         if t.idxTrees[k] == tree {
-            t.idx[k].put(key, i)
+            t.idx[k].put(key.clone(), i)
             return
         }
     }
     var m: Map[str, int] = newMap()
-    m.put(key, i)
+    m.put(key.clone(), i)
     append(mut &t.idxTrees, tree)
     append(mut &t.idx, m)
     append(mut &t.sortedKeys, [])
@@ -478,7 +478,7 @@ pub fn (t: mut &Txn) putRow(tree: int, key: &str, val: &str, head: int): Result[
         return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr())))
     }
     t.noteWrite(tree, key, len(t.writes))
-    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key.clone(), val: val.clone(), head: head})
     return Ok(Unit{})
 }
 
@@ -492,7 +492,7 @@ pub fn (t: mut &Txn) indexWrites() {
     t.sortedN = []
     for i in 0..len(t.writes) {
         if t.writes[i].op == OP_DELRANGE { continue }
-        let k = t.writes[i].key
+        let k = t.writes[i].key.clone()
         t.noteWrite(t.writes[i].tree, &k, i)
     }
 }
@@ -507,13 +507,13 @@ pub fn (t: mut &Txn) putRowLoad(tree: int, key: &str, val: &str, head: int): Res
     if len(val) > MAX_VALUE {
         return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr())))
     }
-    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key.clone(), val: val.clone(), head: head})
     return Ok(Unit{})
 }
 
 pub fn (t: mut &Txn) del(tree: int, key: &str) {
     t.noteWrite(tree, key, len(t.writes))
-    append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key, val: "", head: 0})
+    append(mut &t.writes, TxWrite{op: OP_DEL, tree: tree, key: key.clone(), val: "", head: 0})
 }
 
 // A savepoint (9.80): the writes so far; undoTo forgets those after it. Its
@@ -532,7 +532,7 @@ pub fn (t: mut &Txn) undoTo(n: int) {
     for i in 0..len(t.writes) {
         // a range's key is its start, not a key written
         if t.writes[i].op == OP_DELRANGE { continue }
-        let k = t.writes[i].key
+        let k = t.writes[i].key.clone()
         t.noteWrite(t.writes[i].tree, &k, i)
     }
 }
@@ -544,11 +544,11 @@ pub fn (t: mut &Txn) undoTo(n: int) {
 pub fn (t: mut &Txn) delRange(tree: int, lo: &str, hi: &str) {
     var mine: []str = []
     for w in t.ownRange(tree, lo, hi) {
-        if w.op == OP_PUT { append(mut &mine, w.key) }
+        if w.op == OP_PUT { append(mut &mine, w.key.clone()) }
     }
     for k in mine { t.del(tree, &k) }
     append(mut &t.cuts, TCut{tree: tree, lo: lo.toStr(), hi: hi.toStr(), pos: len(t.writes)})
-    append(mut &t.writes, TxWrite{op: OP_DELRANGE, tree: tree, key: lo, val: hi, head: 0})
+    append(mut &t.writes, TxWrite{op: OP_DELRANGE, tree: tree, key: lo.clone(), val: hi.clone(), head: 0})
 }
 
 // Whether the transaction's range deletes hide stored key of tree (not
@@ -768,14 +768,14 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
     if n.lazy {
         c.lazy = true
         c.packed = true
-        c.body = n.body
+        c.body = n.body.clone()
         for e in n.ents { append(mut &c.ents, e) }
-        c.cols = n.cols
+        c.cols = n.cols.clone()
         for x in n.cdir { append(mut &c.cdir, x) }
         return c
     }
-    for k in n.keys { append(mut &c.keys, k) }
-    for v in n.vals { append(mut &c.vals, v) }
+    for k in n.keys { append(mut &c.keys, k.clone()) }
+    for v in n.vals { append(mut &c.vals, v.clone()) }
     for k in n.kids { append(mut &c.kids, k) }
     return c
 }
@@ -931,7 +931,7 @@ fn (st: &Store) load(slot: int): Result[Unit, lexdb_base.DbErr] {
     var f = lexdb_disk.File.Real(-1, false)
     st.sh.with(fn(db: mut &Db) {
         r = db.loadReq(slot)
-        f = db.data
+        f = db.data.clone()
     })
     if r.page < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a slot without a page")) }
     var b = array(PAGE, byte(0))
@@ -991,7 +991,7 @@ fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.D
     let n = len(run)
     if n <= 1 || run[0].slot != need { return st.load(need) }
     var f = lexdb_disk.File.Real(-1, false)
-    st.sh.with(fn(db: mut &Db) { f = db.data })
+    st.sh.with(fn(db: mut &Db) { f = db.data.clone() })
     var bufs: [][]byte = []
     for j in 0..n { append(mut &bufs, array(PAGE, byte(0))) }
     try f.readPages(run[0].page * PAGE, mut &bufs)
@@ -1039,7 +1039,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
     var f = lexdb_disk.File.Real(-1, false)
     var bad = false
     st.sh.with(fn(db: mut &Db) {
-        f = db.data
+        f = db.data.clone()
         for s in slots {
             if !db.meta[s].used || db.meta[s].loaded { continue }
             if db.meta[s].disk < 0 {
@@ -1069,7 +1069,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
         var batch: []PageRead = []
         var q = r
         while q < rend {
-            append(mut &batch, PageRead{f: f, page: reqs[runs[q]].page, n: runs[q + 1]})
+            append(mut &batch, PageRead{f: f.clone(), page: reqs[runs[q]].page, n: runs[q + 1]})
             q += 2
         }
         var got: []Result[[][]byte, lexdb_base.DbErr] = []
@@ -1082,7 +1082,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
                 Err(_) { res = Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a page read was cancelled")) }
             }
         })
-        try res
+        try res.clone()
         // (started from the batch's end: got is in reverse order)
         var pages: [][]byte = []
         while len(got) > 0 {
@@ -1164,21 +1164,21 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
                 let sl = db.lastLeaf.path[x]
                 db.meta[sl].ref = true
             }
-            return Descent{path: collections.copyOf(&db.lastLeaf.path), need: -1, upper: db.lastLeaf.hi[j], hasUpper: db.lastLeaf.hasHi[j]}
+            return Descent{path: collections.copyOf(&db.lastLeaf.path), need: -1, upper: db.lastLeaf.hi[j].clone(), hasUpper: db.lastLeaf.hasHi[j]}
         }
         for x in 0..j {
             let sl = db.lastLeaf.path[x]
             db.meta[sl].ref = true
             append(mut &d.path, sl)
-            append(mut &los, db.lastLeaf.lo[x])
+            append(mut &los, db.lastLeaf.lo[x].clone())
             append(mut &hasLos, db.lastLeaf.hasLo[x])
-            append(mut &his, db.lastLeaf.hi[x])
+            append(mut &his, db.lastLeaf.hi[x].clone())
             append(mut &hasHis, db.lastLeaf.hasHi[x])
         }
         s = db.lastLeaf.path[j]
-        lo = db.lastLeaf.lo[j]
+        lo = db.lastLeaf.lo[j].clone()
         hasLo = db.lastLeaf.hasLo[j]
-        d.upper = db.lastLeaf.hi[j]
+        d.upper = db.lastLeaf.hi[j].clone()
         d.hasUpper = db.lastLeaf.hasHi[j]
     } else {
         s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
@@ -1191,9 +1191,9 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         }
         db.meta[s].ref = true
         append(mut &d.path, s)
-        append(mut &los, lo)
+        append(mut &los, lo.clone())
         append(mut &hasLos, hasLo)
-        append(mut &his, d.upper)
+        append(mut &his, d.upper.clone())
         append(mut &hasHis, d.hasUpper)
         if db.pool[db.meta[s].frame].leaf {
             db.lastLeaf = LastLeaf{tree: tree, shape: db.shape, path: collections.copyOf(&d.path), lo: los, hasLo: hasLos, hi: his, hasHi: hasHis}
@@ -1226,7 +1226,7 @@ fn insertStr(xs: mut &[]str, i: int, x: &str) {
         xs[j] = replace(mut &xs[j - 1], "")
         j -= 1
     }
-    xs[i] = x
+    xs[i] = x.clone()
 }
 
 fn removeStr(xs: mut &[]str, i: int): str {
@@ -1291,8 +1291,8 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
             }
         }
         for i in m..n {
-            append(mut &right.keys, db.pool[db.meta[s].frame].keys[i])
-            append(mut &right.vals, db.pool[db.meta[s].frame].vals[i])
+            append(mut &right.keys, replace(mut &db.pool[db.meta[s].frame].keys[i], ""))
+            append(mut &right.vals, replace(mut &db.pool[db.meta[s].frame].vals[i], ""))
         }
         for i in m..n {
             let k = pop(mut &db.pool[db.meta[s].frame].keys)
@@ -1311,7 +1311,7 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
         if atEnd && n >= 3 { m = n - 2 }        // the left stays full: the last two children go right
         // keys[m] goes up; keys after it and kids after m go right
         sep = lexdb_base.own(&db.pool[db.meta[s].frame].key(m))
-        for i in m + 1..n { append(mut &right.keys, db.pool[db.meta[s].frame].keys[i]) }
+        for i in m + 1..n { append(mut &right.keys, replace(mut &db.pool[db.meta[s].frame].keys[i], "")) }
         for i in m + 1..n + 1 { append(mut &right.kids, db.pool[db.meta[s].frame].kids[i]) }
         for i in m..n {
             let k = pop(mut &db.pool[db.meta[s].frame].keys)
@@ -1352,7 +1352,7 @@ fn (db: mut &Db) hang(tree: int, path: &[]int, j: int, sp: &Descent, atEnd: bool
     let s = path[j]
     let r = sp.path[0]
     if j == 0 {
-        let root = lexdb_page.Node{leaf: false, keys: [sp.upper], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
+        let root = lexdb_page.Node{leaf: false, keys: [sp.upper.clone()], vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
         var rn = root
         rn.size = nodeSize(&rn)
         let ns = db.newNode(rn)
@@ -1450,8 +1450,8 @@ fn (db: mut &Db) cutLeaf(tree: int, path: &[]int, m: int) {
     let n = db.pool[db.meta[s].frame].count()
     var right = lexdb_page.newNode(true)
     for i in m..n {
-        append(mut &right.keys, db.pool[db.meta[s].frame].keys[i])
-        append(mut &right.vals, db.pool[db.meta[s].frame].vals[i])
+        append(mut &right.keys, replace(mut &db.pool[db.meta[s].frame].keys[i], ""))
+        append(mut &right.vals, replace(mut &db.pool[db.meta[s].frame].vals[i], ""))
     }
     for i in m..n {
         let k = pop(mut &db.pool[db.meta[s].frame].keys)
@@ -1583,10 +1583,10 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     let atEnd = !d.hasUpper && i == cnt
     // the size front coded: the entry's bytes after the key before it, and
     // the next entry's after it rather than after that one (lexdb_page T_FLEAF)
-    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1] } else { "" }
+    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1].clone() } else { "" }
     if i < cnt && db.pool[db.meta[leaf].frame].key(i) == key {
         db.pool[db.meta[leaf].frame].size += lexdb_page.frontEntry(&prev, key, val) - lexdb_page.frontEntry(&prev, key, &db.pool[db.meta[leaf].frame].vals[i])
-        db.pool[db.meta[leaf].frame].vals[i] = val
+        db.pool[db.meta[leaf].frame].vals[i] = val.clone()
     } else {
         var grow = lexdb_page.frontEntry(&prev, key, val)
         if i < cnt {
@@ -1613,7 +1613,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     db.willChange(leaf)
     db.pool[db.meta[leaf].frame].loosen()
     // the size front coded (as applyPut's): the next entry then follows the key before this one
-    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1] } else { "" }
+    let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1].clone() } else { "" }
     var shrink = lexdb_page.frontEntry(&prev, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
     if i + 1 < db.pool[db.meta[leaf].frame].count() {
         shrink += lexdb_page.frontEntry(&db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].keys[i + 1], &db.pool[db.meta[leaf].frame].vals[i + 1]) -
@@ -2133,7 +2133,7 @@ fn (db: mut &Db) rangeNeeds(tree: int, lo: &str, hi: &str): int {
         let d = db.descend(tree, &cursor)
         if d.need >= 0 { return d.need }
         if !d.hasUpper || d.upper >= hi { return -1 }
-        cursor = d.upper
+        cursor = d.upper.clone()
     }
     return -1
 }
@@ -2163,7 +2163,7 @@ fn (db: mut &Db) dropChunks(tree: int, key: &str) {
             i += 1
         }
         if !d.hasUpper || d.upper >= hi { break }
-        cursor = d.upper
+        cursor = d.upper.clone()
     }
     for k in gone { db.applyDel(ovf, &k) }
 }
@@ -2340,27 +2340,27 @@ pub fn (st: &Store) getUnnoted(t: mut &Txn, tree: int, key: &str): Result[Option
 // get, a large value given in part (partOf, whole).
 pub fn (st: &Store) getPart(t: mut &Txn, tree: int, key: &str): Result[Option[str], lexdb_base.DbErr] { return st.getIn(t, tree, key, M_PART) }
 
-fn (st: &Store) getIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
-    match t.lastWrite(tree, &key) {
+fn (st: &Store) getIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[Option[str], lexdb_base.DbErr] {
+    match t.lastWrite(tree, key) {
         Some(i) {
             if t.writes[i].op == OP_DEL { return Ok(None) }
-            return Ok(Some(t.writes[i].val))
+            return Ok(Some(t.writes[i].val.clone()))
         }
         None {}
     }
     // a key in one of its range deletes, not written since: gone
-    if t.cutKey(tree, &key) { return Ok(None) }
+    if t.cutKey(tree, key) { return Ok(None) }
     return st.getBaseIn(t, tree, key, mode)
 }
 
 // getIn without the transaction's own writes and range deletes: the stored
 // row (as the transaction's reads see the store).
-fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
+fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[Option[str], lexdb_base.DbErr] {
     match st.viewOf(t) {
         View.Repl {
-            let fo = st.fo.unwrap()
+            let fo = st.fo.clone().unwrap()
             let s = try repSnap(&fo, t)
-            return fo.get(&s, tree, &key)
+            return fo.get(&s, tree, key)
         }
         View.Snap { return st.snapGet(t, tree, key, mode) }
         View.Live {}
@@ -2371,10 +2371,10 @@ fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[O
         var bad: []lexdb_base.DbErr = []
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
-            let d = db.descend(tree, &key)
+            let d = db.descend(tree, key)
             if d.need >= 0 {
                 need = d.need
                 return
@@ -2389,7 +2389,7 @@ fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[O
                 var clear = len(d.path) == 0
                 if !clear {
                     let lf = db.meta[d.path[len(d.path) - 1]].frame
-                    let li = db.pool[lf].lower(&key)
+                    let li = db.pool[lf].lower(key)
                     // (an empty leaf: an empty tree; at a leaf's start, the key before
                     // is in another leaf: not looked for)
                     clear = db.pool[lf].count() == 0 || (li > 0 && db.pool[lf].key(li - 1) < t.reads[nr - 1].hi)
@@ -2399,19 +2399,19 @@ fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: str, mode: int): Result[O
                     widened = true
                 }
             }
-            if !widened && !t.quiet { t.noteRead(tree, &key, &(key + "\x00"), db.seq) }
+            if !widened && !t.quiet { t.noteRead(tree, key, &(key + "\x00"), db.seq) }
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
-            let i = db.pool[db.meta[leaf].frame].lower(&key)
+            let i = db.pool[db.meta[leaf].frame].lower(key)
             if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
                 out = Some(db.pool[db.meta[leaf].frame].val(i))
             }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need < 0 {
             match out {
                 Some(v) {
-                    if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) { return Ok(Some(try st.unstore(t, tree, &key, &v))) }
+                    if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) { return Ok(Some(try st.unstore(t, tree, key, &v))) }
                 }
                 None {}
             }
@@ -2447,7 +2447,7 @@ const COUNT_DEPTH = 64
 // For the tests: f(store, mode, arg, try) is called after a count has found
 // what to read and before it reads (try 0 the first), outside the store's
 // lock. A closure cannot be kept here, so mode and arg carry what it needs.
-fn setCountHook(st: Store, f: fn(Store, int, str, int), mode: int, arg: &str) {
+fn setCountHook(st: &Store, f: fn(Store, int, str, int), mode: int, arg: &str) {
     st.sh.with(fn(db: mut &Db) {
         db.countHook = [f]
         db.countMode = mode
@@ -2455,10 +2455,10 @@ fn setCountHook(st: Store, f: fn(Store, int, str, int), mode: int, arg: &str) {
         db.countCalls = 0
     })
 }
-fn clearCountHook(st: Store) { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
+fn clearCountHook(st: &Store) { st.sh.with(fn(db: mut &Db) { db.countHook = [] }) }
 
 // How many times the hook was called since it was set.
-fn countHookCalls(st: Store): int {
+fn countHookCalls(st: &Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = db.countCalls })
     return n
@@ -2471,14 +2471,14 @@ type Span = value record { act: int; cl: str; hasCl: bool; ch: str; hasCh: bool 
 fn childSpan(lo: &str, hi: &str, keys: &[]str, i: int, nlo: &str, hasNlo: bool, nhi: &str, hasNhi: bool): Span {
     var sp = Span{act: 0, cl: "", hasCl: false, ch: "", hasCh: false}
     if i > 0 {
-        sp.cl = keys[i - 1]
+        sp.cl = keys[i - 1].clone()
         sp.hasCl = true
     } else {
         sp.cl = nlo.toStr()
         sp.hasCl = hasNlo
     }
     if i < len(keys) {
-        sp.ch = keys[i]
+        sp.ch = keys[i].clone()
         sp.hasCh = true
     } else {
         sp.ch = nhi.toStr()
@@ -2547,7 +2547,7 @@ fn (db: &Db) countSlot(c: mut &Cnt, s: int, nlo: &str, hasNlo: bool, nhi: &str, 
 // A page that is wrong (a read, checksum or shape) is the error: a page
 // freed and reused since the slots were seen reads as another page, which
 // the caller's slot check finds first.
-fn (st: &Store) countPages(f: lexdb_disk.File, c: mut &Cnt): Result[Unit, lexdb_base.DbErr] {
+fn (st: &Store) countPages(f: &lexdb_disk.File, c: mut &Cnt): Result[Unit, lexdb_base.DbErr] {
     while len(c.items) > 0 {
         var batch: []CItem = []
         while len(c.items) > 0 && len(batch) < READS_IN_FLIGHT * AHEAD_MAX { append(mut &batch, pop(mut &c.items)) }
@@ -2568,7 +2568,7 @@ fn (st: &Store) countPages(f: lexdb_disk.File, c: mut &Cnt): Result[Unit, lexdb_
             var reads: []PageRead = []
             var q = r
             while q < rend {
-                append(mut &reads, PageRead{f: f, page: batch[runs[q]].page, n: runs[q + 1]})
+                append(mut &reads, PageRead{f: f.clone(), page: batch[runs[q]].page, n: runs[q + 1]})
                 q += 2
             }
             var got: []Result[[][]byte, lexdb_base.DbErr] = []
@@ -2627,7 +2627,7 @@ fn (c: mut &Cnt) countPage(it: &CItem, b: &[]byte): Result[Unit, lexdb_base.DbEr
     for i in 0..len(node.kids) {
         let sp = childSpan(&c.lo, &c.hi, &node.keys, i, &it.nlo, it.hasNlo, &it.nhi, it.hasNhi)
         if sp.act == 0 { continue }
-        append(mut &c.items, CItem{page: node.kids[i], top: it.top, nlo: sp.cl, hasNlo: sp.hasCl, nhi: sp.ch, hasNhi: sp.hasCh, whole: sp.act == 2, depth: it.depth + 1})
+        append(mut &c.items, CItem{page: node.kids[i], top: it.top, nlo: sp.cl.clone(), hasNlo: sp.hasCl, nhi: sp.ch.clone(), hasNhi: sp.hasCh, whole: sp.act == 2, depth: it.depth + 1})
     }
     return Ok(Unit{})
 }
@@ -2663,9 +2663,9 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
         var f = lexdb_disk.File.Real(-1, false)
         var bad: []lexdb_base.DbErr = []
         st.sh.with(fn(db: mut &Db) {
-            f = db.data
+            f = db.data.clone()
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             var root = -1
@@ -2680,7 +2680,7 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
             }
             if root >= 0 { db.countSlot(mut &c, root, &"", false, &"", false, false) }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if len(c.err) > 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, &c.err)) }
         if len(c.items) == 0 { return Ok(c.total) }
         var hook: []fn(Store, int, str, int) = []
@@ -2690,7 +2690,7 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
             if len(db.countHook) > 0 {
                 hook = [db.countHook[0]]
                 mode = db.countMode
-                arg = db.countArg
+                arg = db.countArg.clone()
                 db.countCalls += 1
             }
         })
@@ -2739,8 +2739,8 @@ pub fn (st: &Store) countView(t: mut &Txn, tree: int, lo: &str, hi: &str): Resul
         if c.tree != tree { continue }
         if len(hi) > 0 && c.lo >= hi { continue }
         if len(c.hi) > 0 && c.hi <= lo { continue }
-        let a = if c.lo > lo { c.lo } else { lo.toStr() }
-        let b = if len(hi) == 0 { c.hi } else if len(c.hi) == 0 || c.hi > hi { hi.toStr() } else { c.hi }
+        let a = if c.lo > lo { c.lo.clone() } else { lo.toStr() }
+        let b = if len(hi) == 0 { c.hi.clone() } else if len(c.hi) == 0 || c.hi > hi { hi.toStr() } else { c.hi.clone() }
         // insert in order of a, then merge with the neighbours it meets
         var at = len(ls)
         while at > 0 && ls[at - 1] > a { at -= 1 }
@@ -2753,10 +2753,10 @@ pub fn (st: &Store) countView(t: mut &Txn, tree: int, lo: &str, hi: &str): Resul
         let m = len(ml)
         // (an end "" is no end: the interval runs to the end of the tree)
         if m > 0 && (len(mh[m - 1]) == 0 || ls[i] <= mh[m - 1]) {
-            if len(mh[m - 1]) > 0 && (len(hs[i]) == 0 || hs[i] > mh[m - 1]) { mh[m - 1] = hs[i] }
+            if len(mh[m - 1]) > 0 && (len(hs[i]) == 0 || hs[i] > mh[m - 1]) { mh[m - 1] = hs[i].clone() }
         } else {
-            append(mut &ml, ls[i])
-            append(mut &mh, hs[i])
+            append(mut &ml, ls[i].clone())
+            append(mut &mh, hs[i].clone())
         }
     }
     for i in 0..len(ml) {
@@ -2802,7 +2802,7 @@ pub fn (st: &Store) noteRange(t: mut &Txn, tree: int, lo: &str, hi: &str) {
 
 // The nodes in memory, as text (slot, whether referenced, whether dirty,
 // version): a test's check that a read leaves the cache as it was.
-fn cacheState(st: Store): str {
+fn cacheState(st: &Store): str {
     var b = newStrBuf()
     st.sh.with(fn(db: mut &Db) {
         for s in 0..len(db.meta) {
@@ -2824,7 +2824,7 @@ fn newFinger(): Finger { return Finger{slots: [], vers: [], lo: [], hasLo: [], h
 
 fn (f: &Finger) holds(d: int, k: &str): bool { return (!f.hasLo[d] || f.lo[d] <= k) && (!f.hasHi[d] || k < f.hi[d]) }
 
-fn (f: mut &Finger) push(s: int, v: int, lo: &str, hasLo: bool, hi: &str, hasHi: bool) {
+fn (f: mut &Finger) push(s: int, v: int, lo: str, hasLo: bool, hi: str, hasHi: bool) {
     append(mut &f.slots, s)
     append(mut &f.vers, v)
     append(mut &f.lo, lo)
@@ -2880,14 +2880,14 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
                 lo = n.key(i - 1)
                 hasLo = true
             } else {
-                lo = f.lo[d]
+                lo = f.lo[d].clone()
                 hasLo = f.hasLo[d]
             }
             if i < n.count() {
                 hi = n.key(i)
                 hasHi = true
             } else {
-                hi = f.hi[d]
+                hi = f.hi[d].clone()
                 hasHi = f.hasHi[d]
             }
         }
@@ -2898,7 +2898,7 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
         }
         if v == -3 { return -2 }
         db.meta[c].ref = true
-        f.push(c, v, &lo, hasLo, &hi, hasHi)
+        f.push(c, v, lo, hasLo, hi, hasHi)
     }
     return -1
 }
@@ -2938,7 +2938,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
         var apart = false               // out's last value is stored apart: unstore it first
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             if snap && db.snapGone(t.snap) {
@@ -2952,7 +2952,7 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                 // the transaction's own write of it
                 match t.lastWrite(tree, &keys[i]) {
                     Some(w) {
-                        if t.writes[w].op == OP_DEL { append(out, None) } else { append(out, Some(t.writes[w].val)) }
+                        if t.writes[w].op == OP_DEL { append(out, None) } else { append(out, Some(t.writes[w].val.clone())) }
                         i += 1
                         continue
                     }
@@ -3012,14 +3012,14 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]str, part: bool, ou
                 if apart { return }
             }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
             continue
         }
         if apart {
             let at = len(out) - 1
-            let v = out[at].unwrap()
+            let v = out[at].clone().unwrap()
             out[at] = Some(try st.unstore(t, tree, &keys[i - 1], &v))
         }
     }
@@ -3112,7 +3112,7 @@ pub fn (st: &Store) treePages(tree: int): Result[int, lexdb_base.DbErr] {
             var bad: []lexdb_base.DbErr = []
             st.sh.with(fn(db: mut &Db) {
                 if len(db.failed) > 0 {
-                    append(mut &bad, db.failed[0])
+                    append(mut &bad, db.failed[0].clone())
                     return
                 }
                 let r = match db.trees.get(&tr) { Some(x) { x } None { -1 } }
@@ -3149,7 +3149,7 @@ pub fn (st: &Store) treePages(tree: int): Result[int, lexdb_base.DbErr] {
                     depth += 1
                 }
             })
-            if len(bad) > 0 { return Err(bad[0]) }
+            if len(bad) > 0 { return Err(bad[0].clone()) }
             if need < 0 {
                 total += count
                 break
@@ -3162,7 +3162,7 @@ pub fn (st: &Store) treePages(tree: int): Result[int, lexdb_base.DbErr] {
 
 // getIn for a snapshot's reads: the key's leaf as the snapshot sees it,
 // one descent (9.53; a one-key scan, as before, cost a point lookup 15%).
-fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Option[str], lexdb_base.DbErr] {
+fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: &str, mode: int): Result[Option[str], lexdb_base.DbErr] {
     let noting = t.noting()
     while true {
         var need = -1
@@ -3170,7 +3170,7 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Opt
         var bad: []lexdb_base.DbErr = []
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             if db.snapGone(t.snap) {
@@ -3192,7 +3192,7 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: str, mode: int): Result[Opt
             let i = n.lower(&key)
             if i < n.count() && n.key(i) == key { out = Some(n.val(i)) }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.load(need)
             continue
@@ -3231,7 +3231,7 @@ fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
     let n = t.idx[k].size()
     if t.sortedN[k] < n {
         var added: []str = []
-        for i in t.sortedN[k]..n { append(mut &added, t.idx[k].keyAt(i)) }
+        for i in t.sortedN[k]..n { append(mut &added, t.idx[k].keyAt(i).clone()) }
         collections.sortBy(mut &added, fn(a: &str, b: &str): int { return a.cmp(b) })
         let old = replace(mut &t.sortedKeys[k], [])
         var merged: []str = withCapacity(len(old) + len(added))
@@ -3239,10 +3239,10 @@ fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
         var b = 0
         while a < len(old) || b < len(added) {
             if b == len(added) || (a < len(old) && old[a] < added[b]) {
-                append(mut &merged, old[a])
+                append(mut &merged, old[a].clone())
                 a += 1
             } else {
-                append(mut &merged, added[b])
+                append(mut &merged, added[b].clone())
                 b += 1
             }
         }
@@ -3253,7 +3253,7 @@ fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
     while j < len(t.sortedKeys[k]) {
         if len(to) > 0 && t.sortedKeys[k][j] >= to { break }
         match t.idx[k].get(&t.sortedKeys[k][j]) {
-            Some(i) { append(mut &out, t.writes[i]) }
+            Some(i) { append(mut &out, t.writes[i].clone()) }
             None {}
         }
         j += 1
@@ -3274,11 +3274,11 @@ pub fn (st: &Store) scanPart(t: mut &Txn, tree: int, from: &str, to: &str, f: &f
 }
 
 // scan; raw: the stored forms, no reads noted (a companion tree's chunks).
-fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
+fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
     let view = st.viewOf(t)
     match view {
         View.Repl {
-            let fo = st.fo.unwrap()
+            let fo = st.fo.clone().unwrap()
             let s = try repSnap(&fo, t)
             return fo.scan(&s, tree, &from, &to, f)
         }
@@ -3289,7 +3289,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
     let cut = !raw && t.hasCuts(tree)           // stored keys in a range delete of its own are skipped
     let snap = view == View.Snap
     var oi = 0
-    var cursor = from
+    var cursor = from.clone()
     var more = true
     let noting = !raw && t.noting()
     var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
@@ -3304,7 +3304,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
         var hasUpper = false
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             rseq = if snap { t.snapSeq } else { db.seq }
@@ -3332,7 +3332,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                     append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                     i += 1
                 }
-                upper = d.fence
+                upper = d.fence.clone()
                 hasUpper = d.hasFence
                 return
             }
@@ -3351,10 +3351,10 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].val(i)})
                 i += 1
             }
-            upper = d.upper
+            upper = d.upper.clone()
             hasUpper = d.hasUpper
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.loadAhead(need, &run)
             if len(run) > 1 {
@@ -3373,12 +3373,12 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
                 takeOwn = ci >= len(chunk) || own[oi].key <= chunk[ci].key
             }
             if takeOwn {
-                let w = own[oi]
+                let w = own[oi].clone()
                 oi += 1
                 if ci < len(chunk) && chunk[ci].key == w.key { ci += 1 }
                 if w.op == OP_PUT {
                     seen = w.key.toStr()
-                    if !f(&Entry{key: w.key, val: w.val}) {
+                    if !f(&Entry{key: w.key.clone(), val: w.val.clone()}) {
                         if noting { t.noteRead(tree, &cursor, &(w.key + "\x00"), rseq) }
                         return Ok(Unit{})
                     }
@@ -3418,7 +3418,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry
 // false stops the scan; its cursor resumes at the key it stopped on.
 const MERGE_CHUNK = 1024
 
-fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: str,
+fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: &str,
                                  f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
     var ks: []str = []
     var vs: []str = []
@@ -3428,8 +3428,8 @@ fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: str,
     let noCols = ""
     let noDir: []int = []
     try st.scanPart(t, tree, from, &to, fn(en: &Entry): bool {
-        append(mut &ks, en.key)
-        append(mut &vs, en.val)
+        append(mut &ks, en.key.clone())
+        append(mut &vs, en.val.clone())
         if len(ks) < MERGE_CHUNK { return true }
         let lv = lexdb_rows.LeafView{isCols: false, lazy: false, n: len(ks), body: &noBody, ents: &noEnts,
                                      keys: &ks, vals: &vs, cols: &noCols, dir: &noDir}
@@ -3464,7 +3464,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
     if view == View.Repl { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
     let snap = view == View.Snap
-    var cursor: str = from
+    var cursor: str = from.clone()
     var more = true
     let noting = t.noting()
     var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
@@ -3480,7 +3480,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
         var seen = ""                   // the last key in the range given to f
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             rseq = if snap { t.snapSeq } else { db.seq }
@@ -3514,7 +3514,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                     let lv = lexdb_page.leafView(&n)
                     go = f(&lv, i, j)
                 }
-                upper = d.fence
+                upper = d.fence.clone()
                 hasUpper = d.hasFence
                 return
             }
@@ -3539,10 +3539,10 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 let lv = lexdb_page.leafView(n)
                 go = f(&lv, i, j)
             }
-            upper = d.upper
+            upper = d.upper.clone()
             hasUpper = d.hasUpper
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.loadAhead(need, &run)
             if len(run) > 1 {
@@ -3601,11 +3601,11 @@ pub fn (st: &Store) scanBackPart(t: mut &Txn, tree: int, from: &str, to: &str, f
     return st.scanBackIn(t, tree, from, to, f, M_PART)
 }
 
-fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
+fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&Entry): bool, mode: int): Result[Unit, lexdb_base.DbErr] {
     let view = st.viewOf(t)
     match view {
         View.Repl {
-            let fo = st.fo.unwrap()
+            let fo = st.fo.clone().unwrap()
             let s = try repSnap(&fo, t)
             return fo.scanBack(&s, tree, &from, &to, f)
         }
@@ -3615,7 +3615,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
     let cut = t.hasCuts(tree)
     let snap = view == View.Snap
     var oi = len(own) - 1
-    var cursor = to
+    var cursor = to.clone()
     var more = true
     let noting = t.noting()
     while more {
@@ -3627,7 +3627,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
         var hasLower = false
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             rseq = if snap { t.snapSeq } else { db.seq }
@@ -3654,7 +3654,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                     if n.key(i) < from { break }
                     append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                 }
-                lower = d.fence
+                lower = d.fence.clone()
                 hasLower = d.hasFence
                 return
             }
@@ -3672,10 +3672,10 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                 if k < from { break }
                 append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].val(i)})
             }
-            lower = d.upper
+            lower = d.upper.clone()
             hasLower = d.hasUpper
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.load(need)
             continue
@@ -3689,11 +3689,11 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: str, to: str, f: &fn(&E
                 takeOwn = ci >= len(chunk) || own[oi].key >= chunk[ci].key
             }
             if takeOwn {
-                let w = own[oi]
+                let w = &own[oi]
                 oi -= 1
                 if ci < len(chunk) && chunk[ci].key == w.key { ci += 1 }
                 if w.op == OP_PUT {
-                    if !f(&Entry{key: w.key, val: w.val}) {
+                    if !f(&Entry{key: w.key.clone(), val: w.val.clone()}) {
                         if noting { t.noteRead(tree, &w.key, &cursor, rseq) }
                         return Ok(Unit{})
                     }
@@ -3792,30 +3792,30 @@ fn (db: mut &Db) logWrites(t: &Txn) {
         if k == len(trees) {
             append(mut &trees, w.tree)
             append(mut &counts, 0)
-            append(mut &los, w.key)
-            append(mut &his, w.key)
+            append(mut &los, w.key.clone())
+            append(mut &his, w.key.clone())
         }
         counts[k] += 1
-        if w.key < los[k] { los[k] = w.key }
-        if w.key > his[k] { his[k] = w.key }
+        if w.key < los[k] { los[k] = w.key.clone() }
+        if w.key > his[k] { his[k] = w.key.clone() }
     }
     for k in 0..len(trees) {
-        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: los[k], hi: his[k], all: false, open: false}) }
+        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: replace(mut &los[k], ""), hi: replace(mut &his[k], ""), all: false, open: false}) }
     }
     for w in t.writes {
         if w.op == OP_PUT || w.op == OP_DEL {
             var k = 0
             while trees[k] != w.tree { k += 1 }
-            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: "", all: false, open: false}) }
+            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: "", all: false, open: false}) }
         }
         else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true, open: false}) }
-        else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key, hi: w.val, all: false, open: true}) }
+        else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: w.val.clone(), all: false, open: true}) }
     }
     if len(db.wlog) > WLOG_MAX {
         let half = len(db.wlog) / 2
         db.wlogFloor = db.wlog[half - 1].seq
         var keep: []WEntry = []
-        for k in half..len(db.wlog) { append(mut &keep, db.wlog[k]) }
+        for k in half..len(db.wlog) { append(mut &keep, db.wlog[k].clone()) }
         db.wlog = keep
     }
 }
@@ -3948,7 +3948,7 @@ fn commitOrder(ws: &[]TxWrite): []int {
     return ix
 }
 
-fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
+fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
     let order = commitOrder(&t.writes)
@@ -3958,7 +3958,7 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
         var held: []task.Future[Unit] = []
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             // Written nodes leave the cache only once a checkpoint has
@@ -4036,7 +4036,7 @@ fn (st: &Store) commitLive(t: Txn, durable: bool): Result[Unit, lexdb_base.DbErr
                 append(mut &wait, f)
             }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if len(held) > 0 {
             match pop(mut &held).wait() {
                 Ok(_) {}
@@ -4100,7 +4100,7 @@ fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
     var bad: []lexdb_base.DbErr = []
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
-            append(mut &bad, db.failed[0])
+            append(mut &bad, db.failed[0].clone())
             return
         }
         t.snap = db.nextSnap
@@ -4126,7 +4126,7 @@ fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
             k -= 1
         }
     })
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     return Ok(t)
 }
 
@@ -4178,7 +4178,7 @@ fn (st: &Store) endSnap(id: int) {
 }
 
 // Ends a transaction without committing it.
-pub fn (st: &Store) abort(t: Txn) {
+pub fn (st: &Store) abort(t: &Txn) {
     st.locks.release(t.lockId, &t.held)
     st.endSnapshot(&t)
 }
@@ -4337,7 +4337,7 @@ pub fn (st: &Store) framesAfter(after: int, upto: int, out: mut &[]PushFrame): b
 
 fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.logFs })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs.clone() })
     let name = segName(g)
     if !fs.exists(name) && fs.exists(SPARE) { try fs.rename(SPARE, name) }
     let f = try fs.open(&name, true)
@@ -4376,7 +4376,7 @@ fn (st: &Store) fail(e: lexdb_base.DbErr) {
     var ws: []Waiter = []
     var held: []task.Promise[Unit] = []
     st.sh.with(fn(db: mut &Db) {
-        if len(db.failed) == 0 { append(mut &db.failed, e) }
+        if len(db.failed) == 0 { append(mut &db.failed, e.clone()) }
         while len(db.waiters) > 0 { append(mut &ws, pop(mut &db.waiters)) }
         while len(db.ckptDone) > 0 { append(mut &held, pop(mut &db.ckptDone)) }
         while len(db.durWaits) > 0 {
@@ -4387,7 +4387,7 @@ fn (st: &Store) fail(e: lexdb_base.DbErr) {
     while len(held) > 0 { pop(mut &held).complete(Unit{}) }
     while len(ws) > 0 {
         let Waiter{batch: _, p: p} = pop(mut &ws)
-        p.complete(Err(e))
+        p.complete(Err(e.clone()))
     }
 }
 
@@ -4771,11 +4771,11 @@ fn (db: &Db) colsOn(): bool { return !db.colsOff }
 
 // Whether this store's checkpoints write column leaves: off, every leaf
 // is written as rows (tests compare the two).
-fn setColumns(st: Store, on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
+fn setColumns(st: &Store, on: bool) { st.sh.with(fn(db: mut &Db) { db.colsOff = !on }) }
 
 // Checkpoints taken whole under one with, cuts taken again, and cuts
 // written (9.136).
-fn cutCounts(st: Store): []int {
+fn cutCounts(st: &Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.ckptLocked, db.cutRetries, db.cutEnds] })
     return out
@@ -4783,7 +4783,7 @@ fn cutCounts(st: Store): []int {
 
 // Leaves checkpoints wrote as column leaves, and as rows (of trees with
 // layouts: their rows did not all encode), and cut to fit (refit): 9.112.
-fn colCounts(st: Store): []int {
+fn colCounts(st: &Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.colLeaves, db.rowLeaves, db.refitCuts] })
     return out
@@ -4811,7 +4811,7 @@ const UPG_QUEUE = 4096          // leaves queued at most
 const UPG_BUDGET = 256          // leaves a checkpoint converts at most (lexdb.md 9.114: its cost)
 
 // The leaves a checkpoint converts at most (tests set fewer).
-fn setUpgradeBudget(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
+fn setUpgradeBudget(st: &Store, n: int) { st.sh.with(fn(db: mut &Db) { db.upgBudget = n }) }
 
 // Leaf s of tree, just read by a scan: queued when it is a clean row leaf
 // of a table tree (one with layouts).
@@ -4920,7 +4920,7 @@ pub fn (st: &Store) upgradeTree(tree: int, from: &str, most: int): Result[Upgrad
     var out = Upgrade{next: "", done: true, converted: 0, kept: 0}
     if st.fo.isSome() { return Ok(out) }           // a replica writes nothing
     out.done = false
-    var cursor: str = from
+    var cursor: str = from.clone()
     var ahead = AHEAD_MIN
     while true {
         var need = -1
@@ -4932,7 +4932,7 @@ pub fn (st: &Store) upgradeTree(tree: int, from: &str, most: int): Result[Upgrad
         var r = -1
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             let d = db.descend(tree, &cursor)
@@ -4946,10 +4946,10 @@ pub fn (st: &Store) upgradeTree(tree: int, from: &str, most: int): Result[Upgrad
                 return
             }
             r = db.upgradeLeaf(tree, &d)
-            upper = d.upper
+            upper = d.upper.clone()
             hasUpper = d.hasUpper
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.loadAhead(need, &run)
             if len(run) > 1 { ahead = min(ahead * 2, AHEAD_MAX) }
@@ -4984,7 +4984,7 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
         var empty = false
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             let d = db.descend(tree, &cursor)
@@ -5005,10 +5005,10 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
                     out[1] += 1
                 }
             }
-            upper = d.upper
+            upper = d.upper.clone()
             hasUpper = d.hasUpper
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
             try st.load(need)
             continue
@@ -5021,7 +5021,7 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
 
 // Leaves converted while clean (upgradeLeaf), and those left as rows; the
 // leaves queued now.
-fn upgradeCounts(st: Store): []int {
+fn upgradeCounts(st: &Store): []int {
     var out: []int = []
     st.sh.with(fn(db: mut &Db) { out = [db.upgLeaves, db.upgFailed, len(db.upgTree)] })
     return out
@@ -5105,7 +5105,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     var ckPages = 0
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
-            append(mut &bad, db.failed[0])
+            append(mut &bad, db.failed[0].clone())
             return
         }
         if db.ckptRunning {
@@ -5115,16 +5115,16 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         db.ckptRunning = true
         todo = replace(mut &db.dropped, [])
         most = db.dropReads
-        f = db.data
+        f = db.data.clone()
     })
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     if busy { return Ok(Unit{}) }
     // Clean row leaves the scans queued, made column leaves (9.114): changed
     // nodes this checkpoint then writes.
     match st.upgradeQueued() {
         Ok(_) {}
         Err(e) {
-            st.fail(e)
+            st.fail(e.clone())
             return Err(e)
         }
     }
@@ -5134,22 +5134,22 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     match walkDropped(&f, mut &todo, mut &gone, most) {
         Ok(_) {}
         Err(e) {
-            st.fail(e)
+            st.fail(e.clone())
             return Err(e)
         }
     }
     st.sh.with(fn(db: mut &Db) {
         if len(db.failed) > 0 {
-            append(mut &bad, db.failed[0])
+            append(mut &bad, db.failed[0].clone())
             return
         }
         for x in db.dropped { append(mut &todo, x) }
         db.dropped = replace(mut &todo, [])
         for p in gone { db.freePage(p) }
-        f = db.data
-        fs = db.logFs
+        f = db.data.clone()
+        fs = db.logFs.clone()
     })
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     var tries = 0
     var done = false
     while !done && tries < CUT_TRIES {
@@ -5158,12 +5158,12 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         var c = emptyCut()
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             c = db.takeCut()
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
         // its leaves, encoded a chunk at a time
         var leaves: []int = []
         for i in 0..len(c.nodes) { if c.nodes[i].leaf { append(mut &leaves, i) } }
@@ -5244,7 +5244,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             // the end: pages, inner nodes, which nodes are clean, the lists
             st.sh.with(fn(db: mut &Db) {
                 if len(db.failed) > 0 {
-                    append(mut &bad, db.failed[0])
+                    append(mut &bad, db.failed[0].clone())
                     return
                 }
                 if !db.snapLive(c.snap) || !db.innersAt(&c) {
@@ -5263,7 +5263,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                 for s in 1..c.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
                 done = true
             })
-            if len(bad) > 0 { return Err(bad[0]) }
+            if len(bad) > 0 { return Err(bad[0].clone()) }
         }
         if !done {
             st.sh.with(fn(db: mut &Db) { db.endSnapIn(c.snap) })
@@ -5277,7 +5277,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         // whole, under one with
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
-                append(mut &bad, db.failed[0])
+                append(mut &bad, db.failed[0].clone())
                 return
             }
             db.ckptLocked += 1
@@ -5296,7 +5296,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
             ckPages = db.npages
             for s in 1..c.seg { if db.holdSeg < 0 || s < db.holdSeg { append(mut &oldSegs, s) } }
         })
-        if len(bad) > 0 { return Err(bad[0]) }
+        if len(bad) > 0 { return Err(bad[0].clone()) }
     }
     if len(reserve) == 2 {
         let ok = f.reserve(reserve[0], reserve[1] - reserve[0]).isOk()
@@ -5309,7 +5309,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
     match r {
         Ok(_) {}
         Err(e) {
-            st.fail(e)
+            st.fail(e.clone())
             return Err(e)
         }
     }
@@ -5622,7 +5622,7 @@ fn encodeLeaf(j: &LeafJob, specs: &[]lexdb_rows.Spec, colsOn: bool, check: bool)
     let n = &j.node
     if j.spec >= 0 {
         if colsOn {
-            if n.isCols() { return LeafEnc{body: n.body, kind: 1, conv: false, packed: None} }
+            if n.isCols() { return LeafEnc{body: n.body.clone(), kind: 1, conv: false, packed: None} }
             var conv = false
             match lexdb_page.colBodyRangeK(n, 0, n.count(), &specs[j.spec], check, mut &conv) {
                 Some(b) {
@@ -5691,14 +5691,14 @@ fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut, written: mut &int)
                     append(mut &pages, lexdb_page.bodyPage(p.leaf, p.n, &p.body, p.no))
                 }
             }
-            append(mut &batch, PageRun{f: f, off: out[keep[starts[r]]].no * PAGE, pages: pages})
+            append(mut &batch, PageRun{f: f.clone(), off: out[keep[starts[r]]].no * PAGE, pages: pages})
             r += 1
         }
         task.scope(fn(s: mut &task.Scope) {
             var fs: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
             while len(batch) > 0 { append(mut &fs, s.start(writeRun, pop(mut &batch))) }
             match task.all(fs) {
-                Ok(rs) { for x in rs { if x.isErr() && res.isOk() { res = x } } }
+                Ok(rs) { for x in rs { if x.isErr() && res.isOk() { res = x.clone() } } }
                 Err(_) { res = Err(lexdb_base.err(lexdb_base.S_INTERNAL, "checkpoint: a page write was cancelled")) }
             }
         })
@@ -5787,7 +5787,7 @@ fn hexOf(raw: &str): str {
 // A small file, replaced whole: written beside under another name,
 // flushed, then renamed over (the rename syncs the directory). Plain text,
 // through the page cache (before 9.125 a zero-padded page).
-fn putSmall(fs: &lexdb_disk.Fs, name: &str, text: str): Result[Unit, lexdb_base.DbErr] {
+fn putSmall(fs: &lexdb_disk.Fs, name: &str, text: &str): Result[Unit, lexdb_base.DbErr] {
     let tmp = name + ".tmp"
     if fs.exists(tmp) { try fs.remove(tmp) }
     let f = try fs.openBuffered(&tmp, true)
@@ -5813,7 +5813,7 @@ fn smallLines(text: &str): []str {
     var out: []str = []
     var i = 1
     while i < len(ls) {
-        append(mut &out, ls[i])
+        append(mut &out, ls[i].clone())
         i += 1
     }
     return out
@@ -5842,7 +5842,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
     if !split {
         if mark.isSome() {
             let l = smallLines(&mark.unwrap())
-            let where = if len(l) >= 2 { l[1] } else { "(unknown)" }
+            let where: &str = if len(l) >= 2 { &l[1] } else { "(unknown)" }
             return logRefuse(&("this data directory's log is in " + where + " (it was made with --log-dir): start it with --log-dir " + where))
         }
         return Ok(Unit{})
@@ -5851,7 +5851,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
         Some(text) {
             let l = smallLines(&text)
             if len(l) < 2 || len(l[0]) == 0 { return logRefuse(&("the data directory's " + LOGDIR_MARK + " file is damaged")) }
-            let where = l[1]
+            let where: &str = &l[1]
             let have = try getSmall(logFs, LOGID)
             match have {
                 None {
@@ -5918,7 +5918,7 @@ fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: O
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
 // checkpoint, then the log after it.
-pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] { return openIn(fs, fs, false, opts) }
+pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] { return openIn(fs.clone(), fs, false, opts) }
 
 // open with the log segments in logFs, a directory of their own (--log-dir,
 // design/lexdb.md 9.124): refused unless fs's data was made with this log.
@@ -6104,7 +6104,7 @@ fn frameLen(recs: &[]TxWrite): int {
 // goes on where the last valid frame ended.
 fn (st: &Store) replay(m: &lexdb_page.Meta): Result[Unit, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.logFs })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs.clone() })
     var seg = m.replaySeg
     var off = m.replayOff
     var batch = m.replayBatch
@@ -6200,14 +6200,14 @@ pub type Stats = value record {
 }
 
 // The most pages of dropped subtrees one checkpoint reads (tests).
-fn setFrameMax(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
-fn setCutChunk(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
-fn setDropReads(st: Store, n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
+fn setFrameMax(st: &Store, n: int) { st.sh.with(fn(db: mut &Db) { db.frameMax = n }) }
+fn setCutChunk(st: &Store, n: int) { st.sh.with(fn(db: mut &Db) { db.cutChunk = n }) }
+fn setDropReads(st: &Store, n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads = n }) }
 
 // The memo: values the SQL layer keeps while the store is open, outside any
 // transaction (lost when it closes).
 // A copy of the store's handle (it is a reference to the one store).
-pub fn (st: &Store) handle(): Store { return Store{sh: st.sh, fo: st.fo, memo: st.memo, locks: st.locks} }
+pub fn (st: &Store) handle(): Store { return Store{sh: st.sh.share(), fo: st.fo.clone(), memo: st.memo.clone(), locks: st.locks.clone()} }
 
 // ---- followers (9.71)
 
@@ -6270,7 +6270,7 @@ pub fn (st: &Store) durableCheckpoint(): int {
 }
 
 // The waitDurable calls waiting now (for the tests).
-fn durWaiting(st: Store): int {
+fn durWaiting(st: &Store): int {
     var n = 0
     st.sh.with(fn(db: mut &Db) { n = len(db.durWaits) })
     return n
@@ -6442,9 +6442,9 @@ fn runWith[R](opened: Result[Store, lexdb_base.DbErr], f: &fn(Store): R): Result
     let st = try opened
     var out: []R = []
     task.scope(fn(s: mut &task.Scope) {
-        s.spawn(writer, st)
-        s.spawn(checkpointer, st)
-        append(mut &out, f(st))
+        s.spawn(writer, st.clone())
+        s.spawn(checkpointer, st.clone())
+        append(mut &out, f(st.clone()))
         st.close()
     })
     return Ok(pop(mut &out))
@@ -6661,7 +6661,7 @@ fn loadBase(f: &lexdb_disk.File, m: &lexdb_page.Meta): Result[Base, lexdb_base.D
 // cacheBytes. It is ready (ready) once it has applied the log up to its
 // first checkpoint's covers batch.
 pub fn openFollower(link: Link, fs: lexdb_disk.Fs, cacheBytes: int): Result[Follower, lexdb_base.DbErr] {
-    return openFollowerHow(link, fs, fs, cacheBytes)
+    return openFollowerHow(link, fs.clone(), fs, cacheBytes)
 }
 
 // openFollower, with the log in logFs.
@@ -6718,17 +6718,17 @@ pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
             seg = f.seg
             off = f.off
             batch = f.applied + 1
-            fs = f.fs
-            if f.segNo == seg && len(f.segF) > 0 { append(mut &open, f.segF[0]) }
+            fs = f.fs.clone()
+            if f.segNo == seg && len(f.segF) > 0 { append(mut &open, f.segF[0].clone()) }
         })
         if batch > upto { break }
         if len(open) == 0 {
             if !fs.exists(segName(seg)) { return Err(logGone(batch, seg)) }
             append(mut &open, try fs.open(&(segName(seg)), false))
-            let fresh = open[0]
+            let fresh = open[0].clone()
             fo.sh.with(fn(f: mut &Fol) {
                 while len(f.segF) > 0 { pop(mut &f.segF).close() }
-                append(mut &f.segF, fresh)
+                append(mut &f.segF, fresh.clone())
                 f.segNo = seg
             })
         }
@@ -6750,7 +6750,7 @@ pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
             at = 0
             fo.sh.with(fn(f: mut &Fol) {
                 while len(f.segF) > 0 { pop(mut &f.segF).close() }
-                append(mut &f.segF, g)
+                append(mut &f.segF, g.clone())
                 f.segNo = seg + 1
             })
         }
@@ -6819,7 +6819,7 @@ fn (f: mut &Fol) apply(batch: int, w: &TxWrite) {
     if w.op == OP_PUT || w.op == OP_DEL {
         if !f.eps[e].deltas.has(&w.tree) { f.eps[e].deltas.put(w.tree, newDelta()) }
         let gone = w.op == OP_DEL
-        f.eps[e].deltas.atMut(w.tree).add(&w.key, Ver{batch: batch, val: if gone { "" } else { w.val }, gone: gone})
+        f.eps[e].deltas.atMut(w.tree).add(&w.key, Ver{batch: batch, val: if gone { "" } else { w.val.clone() }, gone: gone})
     } else if w.op == OP_DELRANGE {
         if len(w.val) > 0 && w.key >= w.val { return }      // an empty range (the master's applyDelRange does nothing)
         // each delta key in the range, of any epoch, gone at the cut unless it is already
@@ -6843,7 +6843,7 @@ fn (f: &Fol) keysIn(tree: int, from: &str, to: &str): []str {
         if !f.eps[i].deltas.has(&tree) { continue }
         let d = f.eps[i].deltas.at(tree)
         var ks: []str = []
-        for k in deltaKeysIn(d, from, to) { append(mut &ks, d.keys[k]) }
+        for k in deltaKeysIn(d, from, to) { append(mut &ks, d.keys[k].clone()) }
         out = if len(out) == 0 { ks } else { mergeStrs(&out, &ks) }
     }
     return out
@@ -6856,23 +6856,23 @@ fn mergeStrs(a: &[]str, b: &[]str): []str {
     var j = 0
     while i < len(a) && j < len(b) {
         if a[i] < b[j] {
-            append(mut &out, a[i])
+            append(mut &out, a[i].clone())
             i += 1
         } else if b[j] < a[i] {
-            append(mut &out, b[j])
+            append(mut &out, b[j].clone())
             j += 1
         } else {
-            append(mut &out, a[i])
+            append(mut &out, a[i].clone())
             i += 1
             j += 1
         }
     }
     while i < len(a) {
-        append(mut &out, a[i])
+        append(mut &out, a[i].clone())
         i += 1
     }
     while j < len(b) {
-        append(mut &out, b[j])
+        append(mut &out, b[j].clone())
         j += 1
     }
     return out
@@ -6947,7 +6947,7 @@ fn (fo: &Follower) checkMeta(): Result[Unit, lexdb_base.DbErr] {
     var data = lexdb_disk.File.Real(-1, false)
     var newest = 0
     fo.sh.with(fn(f: mut &Fol) {
-        data = f.data
+        data = f.data.clone()
         newest = if len(f.next) > 0 { f.next[0].ckpt } else if len(f.bases) > 0 { f.bases[len(f.bases) - 1].ckpt } else { 0 }
     })
     let m = try readMeta(&data)
@@ -7085,7 +7085,7 @@ fn (f: mut &Fol) install(p: int, n: lexdb_page.Node) {
 
 fn (fo: &Follower) load(p: int): Result[Unit, lexdb_base.DbErr] {
     var data = lexdb_disk.File.Real(-1, false)
-    fo.sh.with(fn(f: mut &Fol) { data = f.data })
+    fo.sh.with(fn(f: mut &Fol) { data = f.data.clone() })
     var b = array(PAGE, byte(0))
     try data.read(p * PAGE, mut &b[0..PAGE], PAGE)
     try lexdb_page.check(&b, p, lexdb_page.T_ANY)          // a leaf or an internal page
@@ -7220,7 +7220,7 @@ fn uncut(cuts: &[]Cut, batch: int, from: &str, to: &str): []Seg {
     for c in cuts {
         if c.batch > batch { continue }
         var i = len(cs)
-        append(mut &cs, c)
+        append(mut &cs, c.clone())
         while i > 0 && cs[i - 1].lo > cs[i].lo {
             swap(mut &cs, i - 1, i)
             i -= 1
@@ -7231,9 +7231,9 @@ fn uncut(cuts: &[]Cut, batch: int, from: &str, to: &str): []Seg {
     for c in cs {
         if len(c.hi) > 0 && c.hi <= cur { continue }
         if len(to) > 0 && c.lo >= to { break }
-        if c.lo > cur { append(mut &out, Seg{from: cur, to: c.lo}) }
+        if c.lo > cur { append(mut &out, Seg{from: cur, to: c.lo.clone()}) }
         if len(c.hi) == 0 { return out }
-        cur = c.hi
+        cur = c.hi.clone()
     }
     if len(to) == 0 || cur < to { append(mut &out, Seg{from: cur, to: lexdb_base.own(to)}) }
     return out
@@ -7245,7 +7245,7 @@ fn versionAt(d: &Delta, i: int, batch: int, out: mut &[]str): int {
     while j >= 0 {
         if d.vers[i][j].batch <= batch {
             if d.vers[i][j].gone { return 2 }
-            append(out, d.vers[i][j].val)
+            append(out, d.vers[i][j].val.clone())
             return 1
         }
         j -= 1
@@ -7272,7 +7272,7 @@ fn (f: mut &Fol) descend(root: int, k: &str): Step {
                 }
                 let c = childIndex(&f.pool[i].keys, k)
                 if c < len(f.pool[i].keys) {
-                    st.upper = f.pool[i].keys[c]
+                    st.upper = f.pool[i].keys[c].clone()
                     st.hasUpper = true
                 }
                 p = f.pool[i].kids[c]
@@ -7344,7 +7344,7 @@ fn (fo: &Follower) baseScan(bi: int, tree: int, from: &str, to: &str, f: &fn(&En
                         i += 1
                     }
                     last = !st.hasUpper || (len(to) > 0 && st.upper >= to)
-                    upper = st.upper
+                    upper = st.upper.clone()
                 }
                 None { none = true }
             }
@@ -7365,7 +7365,7 @@ fn (fo: &Follower) baseScan(bi: int, tree: int, from: &str, to: &str, f: &fn(&En
 // mark, a large one's chunks read back (from the base's companion tree)
 // and checked.
 fn (fo: &Follower) unstore(bi: int, tree: int, key: &str, v: &str): Result[str, lexdb_base.DbErr] {
-    if !marked(&v) { return Ok(v) }
+    if !marked(&v) { return Ok(v.clone()) }
     if !isStub(&v) { return Ok(v[1..len(v)]) }
     let total = int(binary.readU64LEStr(&v, 2))
     let want = binary.readU32LEStr(&v, 10)
@@ -7424,7 +7424,7 @@ fn (fo: &Follower) deltaRange(s: &FSnap, tree: int, from: &str, to: &str): DRang
         if !r.live || !fl.hasDelta(tree) { return }
         var cuts: []Cut = []
         for i in 0..len(fl.eps) {
-            if fl.eps[i].deltas.has(&tree) { for c in fl.eps[i].deltas.at(tree).cuts { append(mut &cuts, c) } }
+            if fl.eps[i].deltas.has(&tree) { for c in fl.eps[i].deltas.at(tree).cuts { append(mut &cuts, c.clone()) } }
         }
         r.segs = uncut(&cuts, s.batch, from, to)
         for k in fl.keysIn(tree, from, to) {
@@ -7457,7 +7457,7 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
         try fo.baseScan(bi, tree, &sg.from, &sg.to, fn(e: &Entry): bool {
             // the delta's keys before this one, then this one, its version first
             while j < len(dkeys) && dkeys[j] < e.key {
-                if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) {
+                if !dgone[j] && !f(&Entry{key: dkeys[j].clone(), val: dvals[j].clone()}) {
                     go = false
                     return false
                 }
@@ -7465,10 +7465,10 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
             }
             if j < len(dkeys) && dkeys[j] == e.key {
                 let gone = dgone[j]
-                let v = dvals[j]
+                let v = dvals[j].clone()
                 j += 1
                 if gone { return true }
-                if !f(&Entry{key: e.key, val: v}) {
+                if !f(&Entry{key: e.key.clone(), val: v}) {
                     go = false
                     return false
                 }
@@ -7476,7 +7476,7 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
             }
             match fo.unstore(bi, tree, &e.key, &e.val) {
                 Ok(v) {
-                    if !f(&Entry{key: e.key, val: v}) {
+                    if !f(&Entry{key: e.key.clone(), val: v}) {
                         go = false
                         return false
                     }
@@ -7490,9 +7490,9 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
             return true
         })
     }
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     while go && j < len(dkeys) {
-        if !dgone[j] && !f(&Entry{key: dkeys[j], val: dvals[j]}) { return Ok(Unit{}) }
+        if !dgone[j] && !f(&Entry{key: dkeys[j].clone(), val: dvals[j].clone()}) { return Ok(Unit{}) }
         j += 1
     }
     return Ok(Unit{})
@@ -7533,7 +7533,7 @@ fn (f: mut &Fol) descendBack(root: int, k: &str): Step {
                 }
                 let j = if len(k) == 0 { len(f.pool[i].keys) } else { lowerIndex(&f.pool[i].keys, k) }
                 if j > 0 {
-                    st.upper = f.pool[i].keys[j - 1]        // here: the lower fence
+                    st.upper = f.pool[i].keys[j - 1].clone()        // here: the lower fence
                     st.hasUpper = true
                 }
                 p = f.pool[i].kids[j]
@@ -7574,7 +7574,7 @@ fn (fo: &Follower) baseScanBack(bi: int, tree: int, from: &str, to: &str, f: &fn
                         append(mut &chunk, Entry{key: k, val: n.val(i)})
                     }
                     last = !st.hasUpper || st.upper <= from
-                    fence = st.upper
+                    fence = st.upper.clone()
                 }
                 None { none = true }
             }
@@ -7608,7 +7608,7 @@ pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &
         try fo.baseScanBack(bi, tree, &sg.from, &sg.to, fn(e: &Entry): bool {
             // the delta's keys after this one, then this one, its version first
             while j >= 0 && dr.keys[j] > e.key {
-                if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) {
+                if !dr.gone[j] && !f(&Entry{key: dr.keys[j].clone(), val: dr.vals[j].clone()}) {
                     go = false
                     return false
                 }
@@ -7616,10 +7616,10 @@ pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &
             }
             if j >= 0 && dr.keys[j] == e.key {
                 let gone = dr.gone[j]
-                let v = dr.vals[j]
+                let v = dr.vals[j].clone()
                 j -= 1
                 if gone { return true }
-                if !f(&Entry{key: e.key, val: v}) {
+                if !f(&Entry{key: e.key.clone(), val: v}) {
                     go = false
                     return false
                 }
@@ -7627,7 +7627,7 @@ pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &
             }
             match fo.unstore(bi, tree, &e.key, &e.val) {
                 Ok(v) {
-                    if !f(&Entry{key: e.key, val: v}) {
+                    if !f(&Entry{key: e.key.clone(), val: v}) {
                         go = false
                         return false
                     }
@@ -7641,9 +7641,9 @@ pub fn (fo: &Follower) scanBack(s: &FSnap, tree: int, from: &str, to: &str, f: &
             return true
         })
     }
-    if len(bad) > 0 { return Err(bad[0]) }
+    if len(bad) > 0 { return Err(bad[0].clone()) }
     while go && j >= 0 {
-        if !dr.gone[j] && !f(&Entry{key: dr.keys[j], val: dr.vals[j]}) { return Ok(Unit{}) }
+        if !dr.gone[j] && !f(&Entry{key: dr.keys[j].clone(), val: dr.vals[j].clone()}) { return Ok(Unit{}) }
         j -= 1
     }
     return Ok(Unit{})
@@ -7691,7 +7691,7 @@ pub fn (fo: &Follower) changes(): int {
 // its writes fail (25006, read_only_sql_transaction). It is ready once the
 // follower is (Follower.ready); poll applies the master's batches.
 pub fn openReplica(fs: lexdb_disk.Fs, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
-    return openReplicaIn(fs, fs, false, opts, link)
+    return openReplicaIn(fs.clone(), fs, false, opts, link)
 }
 
 // openReplica of a master whose log is in logFs (--log-dir): the same check as the master's.
@@ -7701,7 +7701,7 @@ pub fn openReplicaSplit(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options, 
 
 fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
     try checkLog(&fs, &logFs, split, false)
-    let fo = try openFollowerHow(link, fs, logFs, opts.cacheBytes)
+    let fo = try openFollowerHow(link, fs.clone(), logFs.clone(), opts.cacheBytes)
     // the Db keeps what the SQL layer keeps (the memo) and the counters
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
                             dropped: 0, runs: 0, covers: -1}
@@ -7710,7 +7710,7 @@ fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Opt
 }
 
 // A replica's follower.
-pub fn (st: &Store) follower(): Option[Follower] { return st.fo }
+pub fn (st: &Store) follower(): Option[Follower] { return st.fo.clone() }
 
 // A replica transaction's follower snapshot. Dropping it ends the
 // snapshot: the SQL layer drops some transactions without ending them (a
@@ -7724,7 +7724,7 @@ fn (p: mut &RepPin) drop() { p.fo.end(&p.s) }
 
 // The transaction's follower snapshot, taken at its first read.
 fn repSnap(fo: &Follower, t: mut &Txn): Result[FSnap, lexdb_base.DbErr] {
-    if len(t.fsnap) == 0 { append(mut &t.fsnap, RepPin{fo: fo, s: try fo.begin()}) }
+    if len(t.fsnap) == 0 { append(mut &t.fsnap, RepPin{fo: fo.clone(), s: try fo.begin()}) }
     return Ok(t.fsnap[0].s)
 }
 
