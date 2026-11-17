@@ -3148,6 +3148,260 @@ says otherwise; search for the names, since line numbers move.
   `exec_autostats`/`exec_turns`; `simple.sh` and `pts.sh` against m761
   and main, with the updates (DML is planned per run) watched.
 
+**2e slice 3c as built: a set's ORDER BY lends, MATCH_RECOGNIZE's
+definition, FOR UPDATE and DML go into the plan.** Four commits on
+`redesign/bind` from main 0b147ed9: 18a8952d (`planSet`'s ORDER BY),
+a07055e1 (`planMatch`), d7663151 (`Lock`), b3cc2219 (DML), and a fifth
+with this note. The suite passed (188, imports ok) on the snapshot of each.
+No plan and no result changes. Nothing reads the new arms but the checks.
+
+- A set's ORDER BY (18a8952d). `planSet` clones the parsed keys once,
+  into `Sel.order`; the `Sort` lends them (`[]` keys, `desc` as long:
+  `lpLentOrder`), as `planSelect`'s does where no rewrite runs. It was
+  cloned twice (`topPlan(set, s, cloneAll(&order), ...)`).
+  `lexdb_bind.lpRestore` keeps a lending `Sort`'s input as it is where
+  nothing under it lends (`xs` [], so no `Project` is looked for: a
+  `SetOp` or `Recursive` there), so `takeLp` restores a set that is a side
+  of another set, a FROM subquery, a view, a hashed subquery's or an
+  INSERT ... SELECT's source.
+- MATCH_RECOGNIZE (a07055e1). `planMatch` builds the `Match` over the
+  `Sel`'s plan (`planSub` wrapped it, with its columns only).
+  `LPlan.Match(input, MatchDef, cols)`; `lexdb_bind.MatchDef`: PARTITION
+  BY's input columns (`[]int`: they are names), ORDER BY's keys as
+  resolved with `desc`/`nullsFirst`, each pattern variable's DEFINE
+  (`None`: always true) and the MEASURES as resolved, navigations marked
+  (`#mrnav(k, arg)`, `k` the `MrPlan.navs` entry). DEFINE and MEASURES move
+  into the plan after `mrSlots` has built the planner's slotted trees from
+  them (no clone); ORDER BY's keys are cloned once for the planner's
+  collation keys (`collKeyOf` takes its argument; a key per MR clause,
+  planned once per statement). The pattern program, AFTER MATCH SKIP and
+  the navigations' kinds and offsets stay in `MrPlan`, the planner's.
+  - "Read from the plan": `planMatch` still reads its input columns from
+    `Sel.outs`, not from the plan's columns (`lpColumns(&sel.lp)`, the
+    same names and spells): `inCols` is built by `outType`, which carries
+    a dialect's wire hint (`OutCol.scale`: T-SQL's datetime, varchar(n),
+    int widths) into the `TypeName` that typing and `exprScale` read. A
+    `BCol`'s `Ty` keeps only the typmod (`tyOf`), so a `TypeName` rebuilt
+    from it differs for the T-SQL doors (`tds_mr`). Reading the plan's
+    columns there needs the hint on `Ty` (or `BCol`) first.
+- FOR UPDATE (d7663151). `LPlan.Lock(input, mode, wait, levels, [])`
+  over the FROM and WHERE part (under any `Agg`, `Project`, `Sort`,
+  `Limit`: FOR UPDATE allows no grouping or DISTINCT, and its rows are the
+  base tables'), `lexdb_sql.LOCK_*`, `WAIT_*`, and the query levels
+  `applyLocks` set `Level.lock` on (FOR ... OF's named ones, else every
+  table level). A pass-through (`lpColumns`); not on the `Sel`'s own chain,
+  so `lpLentExprs`, `lpLentOrder` and `lpRestore` need no arm.
+- DML (b3cc2219). Four arms, each with RETURNING's columns (`retBCols`:
+  `outBCols(&ret.outs)`, [] without RETURNING), built as a local beside
+  the executor's structures and dropped (no plan cache for DML: the
+  check reads it where it is built):
+  - `Insert(table, targets, source, cols)`: the target's name, the
+    columns the source's values go to in order, and the source: an
+    INSERT ... SELECT's plan, taken from its `Sel` by `takeLp` (the `Sel`
+    still runs; its lent lists are copied, once per statement); VALUES as
+    `Values(width, [], [])`, its rows the statement's (`insertRows` reads
+    `s.rows`, or its own resolved `rows` where there are subqueries or
+    RETURNING), each value coerced to its target column's type, so the
+    `Values` has no columns of its own. ON CONFLICT stays the executor's
+    (`Upsert`).
+  - `Update(source, targets, cols)`: the FROM and WHERE part (`q.lp`
+    moved out of the `Query`: nothing reads it after `planFrom`), the
+    target first; the columns SET assigns (`copyInts`). The SET
+    expressions stay the executor's (`sets`, resolved and `bpAssign`ed).
+  - `Delete(source, cols)`: as `Update`, USING's items after the target.
+  - `Merge(source, cols)`: the source item joined to the target (the
+    last item, `mergeFrom`) by ON; the WHEN clauses (`MClause`) stay the
+    executor's.
+  - Per run, UPDATE builds the `Update` node and a copy of SET's column
+    numbers, DELETE the `Delete` node; RETURNING adds `outBCols`. No
+    expression is cloned.
+- Found, not fixed (on main 0b147ed9 and on m761 76118b8a alike): FOR
+  UPDATE inside a FROM subquery (`select * from (select id from a where id
+  < 3 for update) s`) kills the server, "index out of range" in `tryRow`
+  (`lexdb_exec.lxl:5818` on main): the subquery's `Sel.exprs` has the
+  lock's key columns appended (`SelLock`) and its row is read as the outer
+  level's. Left out of the checks' statements.
+- The scratch checks (`~/tpch-w/bind/e8/tools/xpatch.py` and `patch.py`,
+  anchors asserted; each finds whether it patches main or a build with
+  3c's arms, `NEW`, and patches each at the same places):
+  - `xpatch.py`: `xTree` takes the `Sel`'s lists (`sx`, `so`) instead of
+    the `Sel`, so a plan can be printed with none (a DML source). On a 3c
+    build `xTree` prints a `Lock` as its input and a `Match` as before, so
+    `XSEL` lines compare with main's; three new lines compare the rest:
+    `XMR` at `planMatch`'s end (the `MatchDef` on the branch; on main the
+    same texts gathered from `planMatch`'s locals as it resolves them:
+    partitions, keys, directions, DEFINEs, MEASURES, the outputs' names and
+    OIDs), `XLOCK` beside each `planSelect` `XSEL` (the `Lock`'s mode, wait
+    and levels; on main from `Level.lock`), `XDML` per DML statement (the
+    source's tree, the targets, RETURNING's names and OIDs; on main from
+    `q.lp` or the INSERT ... SELECT's `Sel`, `targets` and `Ret.outs`).
+  - `patch.py`: `lpValid` checks a `Match`'s definition (keys as many as
+    their directions, PARTITION BY's columns within its input, no more
+    MEASURES than columns) and a `Lock` (a mode, some levels, its columns
+    its input's); `lpDml` checks each DML operator (its source by
+    `lpValid`, a VALUES source of the lent form and no wider than its
+    targets, RETURNING's columns against `Ret.outs` by `lpCmpOuts`, none
+    without RETURNING) and prints `LPCHK OK dml-KIND`; main prints the same
+    line after `lpValid` of its FROM part (or `lpValidT` of the INSERT ...
+    SELECT's `Sel`, lending at its top).
+  - Statements added for them (`~/tpch-w/bind/e8/extra.sql`, run by the
+    battery's `run.sh` with the file as its third argument; the battery's
+    tables a, b, c first): a set with ORDER BY as a FROM subquery, as an
+    operand of another set, in IN, EXISTS and a correlated scalar subquery
+    (hashed), in a CTE (used twice), a view and an INSERT ... SELECT, under
+    a recursive CTE; three MATCH_RECOGNIZE (ALL ROWS PER MATCH with
+    MATCH_NUMBER, CLASSIFIER, FIRST and COUNT; no PARTITION BY, two keys
+    one descending, NEXT; over a FROM subquery); FOR UPDATE, FOR SHARE, FOR
+    UPDATE OF over a join, FOR NO KEY UPDATE OF ... NOWAIT, FOR KEY SHARE
+    SKIP LOCKED, OF a missing table, an outer join's nullable side, with an
+    aggregate, in an IN subquery; INSERT VALUES (several rows, a column
+    list, DEFAULT), INSERT ... SELECT with ORDER BY and RETURNING, of a
+    UNION, ON CONFLICT DO NOTHING and DO UPDATE with RETURNING, a scalar
+    subquery in VALUES; UPDATE with and without RETURNING, UPDATE ... FROM,
+    a correlated SET; DELETE with RETURNING and USING; MERGE from a UNION,
+    from a table with DELETE and RETURNING `merge_action()`, from VALUES
+    with RETURNING *. 266 output lines, identical from main, the branch
+    and both check builds.
+- Gates: the suite on the snapshot of each commit (`~/tpch-w/bind/e8/
+  suitec.sh`, tags c1-c4: 188, imports ok); the naming battery (1,505
+  lines) identical to main from a build of each commit and from both
+  check builds; `extra.sql` identical from main and each commit's build (each
+  run with the statements added up to it) and both check builds; TPC-H
+  all 22 checksums the baseline's (fields [0] and [8] against
+  `~/tpch/out-baseline-1744ef99`) on every run (the check builds, main,
+  the branch and their copies).
+- The check chain (`~/tpch-w/bind/e8/ckchain.sh`; main 0b147ed9 as
+  `lexdb-ck-m`, b3cc2219 as `lexdb-ck-b`, both patches applied, the suite
+  from the snapshots `ck-m`, `ck-b` with slice 1's patched `run.py`):
+  - TPC-H's 214 `LPCHK` lines identical line for line (105 `XSEL`, 95
+    `OK`, slice 1's by-design `from-cols-end` and `sub-name`);
+  - the battery's 638 server lines and `extra.sql`'s 200 identical when
+    sorted (main prints `OK dml-insert-values` later in `insert`, after the
+    subqueries are planned; the branch where it builds the `Insert`);
+  - the suite's 227,267 and 226,231 lines, sorted: identical but for
+    1,042 lines of `exec_autostats` and 6 of `exec_turns`, whose counts
+    vary by run. Among them 15,624 DML checks (9,883 INSERT VALUES, 923
+    INSERT ... SELECT, 3,238 UPDATE, 1,422 DELETE, 158 MERGE), 465 `XMR`,
+    125 `XLOCK`; nothing flagged but slice 1's three by-design kinds
+    (`from-cols-end`, `subty`, `sub-name`).
+- Speed, one pass against main 0b147ed9 (`~/tpch-w/bind/e8/lexdb-m0b`,
+  from `git archive`, byte-identical to slice 3b's `lexdb-b`) and m761
+  (`~/tpch-w/bind/e6/lexdb-m761`); the branch at b3cc2219 (`lexdb-b`).
+  Boost on, a browser busy on the machine through both passes (main's
+  `pk_point20k` 668 and then 703 ms where slice 3b measured 657 for the
+  same binary): read the ratios, not the levels.
+  - TPC-H (`~/tpch-w/bind/e8/tpch1.sh`, SF1, 1 run): total 30,409
+    against 29,574 ms (1.028), most of it after q7 (q8 1.646: 369 to 607
+    ms; q11, q13, q17, q20 1.09-1.10). Against slice 3b's runs of the same
+    main binary (`~/tpch-w/bind/e7/out-b`, `out-bc`): 1.041, 1.040. The
+    one repeat, on byte-identical copies (`lexdb-bc` first, then
+    `lexdb-m0bc`): 29,744 against 29,317 (1.015); past 1.5%: q1 1.022,
+    q5 1.030, q7 1.035, q8 1.053, q13 1.043, q16 1.045, q17 1.053, q19
+    1.055, q20 1.033, q18 1.020; none faster. Nothing this slice adds runs
+    per row or per run of a SELECT (the `Lock` and `Match` only where the
+    statement has them, `planSet`'s change per set operation, the DML
+    nodes per DML statement), and TPC-H plans each query once, so read as
+    layout (the binary is 4 KB longer) or the machine's noise; not
+    verified further (no more runs, as asked). The branch's run kept for
+    main's stored result: `~/tpch-w/bind/e8/out-bc` (and `out-b`).
+  - `~/tpch-w/bind/e2/simple.sh` (pgbench `-M simple`, 4 clients, 10 s,
+    one round, binaries alternating), tps:
+
+    | | m761 | main 0b147ed9 | branch | branch / main | repeat (copies): branch / main |
+    |---|---|---|---|---|---|
+    | point selects | 49,312 | 46,238 | 45,278 | 0.979 | 46,849 / 46,568 = 1.006 |
+    | updates | 9,443 | 9,187 | 9,293 | 1.012 | 9,366 / 9,352 = 1.002 |
+    | 3-table join, ORDER BY, LIMIT | 21,110 | 19,245 | 19,466 | 1.012 | 19,857 / 19,546 = 1.016 |
+
+    The updates (planned per run, now building an `Update` node and a copy
+    of SET's columns) do not move.
+  - `pk_point20k` (`~/tpch-w/bind/e6/pts.sh`, 5 runs per server, one
+    round), server CPU ms, medians (range): m761 653 (646-658), main 668
+    (662-713), branch 683 (674-690), +2.2%; the repeat on copies: branch
+    709 (702-722), main 703 (700-706), +0.9%. A point select runs none of
+    this slice's code but `planSelect`'s `lockMode` test.
+  - Not run (as asked): more rounds, the 35 queries, OLTP and the loads,
+    `qmulti.sh`, `pstat.sh`, a profile.
+- Lines:
+
+  | Module | main 0b147ed9 | after |
+  |---|---|---|
+  | `lexdb_exec` | 28087 | 28124 |
+  | `lexdb_bind` | 1990 | 2025 |
+
+**Where 2e slice 3c left off, and how to start slice 3d (`bindFrom`
+into `lexdb_bind`).** Slice 3d moves the binder's FROM pass out of
+`lexdb_exec` (slice 2's way in, step 3). Everything named is in
+`lexdb_exec` unless the note says otherwise; search for the names, since
+line numbers move.
+
+- What is there after slice 3c:
+  - Every statement kind builds an `LPlan`: SELECT (`Sel.lp`, with `Match`
+    and `Lock` where it has them), set operations (`SetOp`, `Recursive`,
+    their ORDER BY lent), INSERT, UPDATE, DELETE, MERGE (a local `lp`,
+    dropped: read by nothing). What still lives only in the executor's
+    structures: LIMIT's count and offset (parsed, `optClone`), the SET and
+    VALUES expressions, ON CONFLICT (`Upsert`), MERGE's WHEN clauses
+    (`MClause`), RETURNING's expressions (`Ret.exprs`; only its columns are
+    in the plan), MATCH_RECOGNIZE's pattern and navigations (`MrPlan`).
+  - Lending: a SELECT's `Project` list and `Sort` keys, and a set
+    operation's `Sort` keys, are the `Sel`'s where no rewrite runs
+    (`lpLentExprs`, `lpLentOrder`; `takeLp` restores them). An INSERT's
+    VALUES is `Values(width, [], [])`: the statement's rows.
+- `bindFrom` (about 300 lines) and what it needs that `lexdb_bind` may not
+  import (`BIND_MAY_IMPORT` in `tests/lexdb/imports.py`: `lexdb_base`,
+  `lexdb_sql`, `lexdb_catalog`, `lexdb_dialect`, `lexdb_time`,
+  `lexdb_float`, `lexdb_ops`, `lexdb_lib`):
+  - the store and catalog: `findTable`, `findSeq`, `seqRelation`,
+    `viewQuery`, `readAcl` (a view's owner), `scCheck` (privileges),
+    `relObj`; all take `st`/`txn`;
+  - the planner, through `planSub` (three calls: a FROM subquery, a view,
+    each expression subquery) and `takeLp`; `pullCommonOr` (a planner
+    rewrite on the unresolved WHERE, kept in `bindFrom` for q19's sake:
+    slice 2's note);
+  - exec's types: `Query` (levels, `cols`, `subs`, `lp`), `Level`
+    (`newLevel`, `addCol`), `Scope`, `SubPlan`, `FromBound`; `outType` and
+    `outBCols` (a dialect's wire hint into a FROM subquery's row: a
+    `BCol`'s `Ty` cannot carry it, the same gap `planMatch` hits);
+    `unnest`'s columns, `hiddenName`.
+  So the move is not a cut and paste. Two shapes, as slice 2's note gave
+  them: exec fetches what the FROM names first (each item's `Table`, a
+  view's parsed `Stmt` and owner, a sequence's relation, the working
+  tables) and passes it in; or the binder returns what it lacks and is
+  called again. Either way the subqueries recurse: a FROM subquery is
+  bound and planned by one `planSub`, and the outer pass needs only its
+  output columns. A first step that keeps results: split `planSub`'s
+  binder half (`planSelect` up to the plan: `selectCols`, `srfCols`,
+  `#values:` typing, `planMatch`'s outputs) from its planner half, so
+  `bindFrom` can ask for a subquery's columns without planning it; then
+  replace `Level`/`addCol` in the binder by the `Get`/`Sub` columns it
+  already builds (`icols`).
+- Found on the way, not fixed: FOR UPDATE in a FROM subquery kills the
+  server (above; main and m761 alike). PostgreSQL accepts it.
+- Traps (3b's still hold; and):
+  - `lpRestore` restores under a lending `Sort` only where the `Project`
+    lends too (`xs` non-empty): a new lending operator under a set's
+    `Sort` would need its own case.
+  - The DML operators take `q.lp` out of the `Query` after binding;
+    nothing reads it then (`planFrom` has run). A reader added later must
+    read the operator, not `q.lp`.
+  - INSERT ... SELECT's `Sel` keeps running after `takeLp` has taken its
+    plan: fine while the executor reads `Sel.exprs`/`Sel.order`, not the
+    plan.
+  - `MatchDef`'s DEFINE and MEASURES hold `#mrnav(k, arg)` marks whose `k`
+    is `MrPlan.navs`' entry: the plan alone does not say a navigation's
+    kind or offset.
+  - The check tools now detect main or a 3c build (`NEW`: `LPlan.Insert(`
+    in exec) and patch each at its own anchors (single lines, so either
+    tool can go first). A new arm needs `xTree`, `xLockOf` (xpatch) and
+    `lpValidT`/`lpDml` (patch) updated, and a line main can print from its
+    own structures if the two are to compare.
+- Gates (as slice 3c's): the suite per commit (`~/tpch-w/bind/e8/
+  suitec.sh TAG REV`); the battery and `~/tpch-w/bind/e8/extra.sql`
+  identical; TPC-H all 22; the check chain (`~/tpch-w/bind/e8/
+  ckchain.sh`, the two tools in `~/tpch-w/bind/e8/tools`); `simple.sh` and
+  `pts.sh` against main.
+
 **The rest of 2c, planned:**
 
 1. **Bind once per plan.**
