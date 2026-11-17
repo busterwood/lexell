@@ -748,7 +748,12 @@ let name = match e { Expr.Num(n) { n.toStr() } Expr.Call(f, _) { f } else { "?" 
 - `for i in a..b` counts from `a` up to `b - 1` over `int`; `b` is evaluated
   once. `for x in xs` walks an array: `x` is a copy of each element when the
   element type is a copy type, and a `&T` borrow of it otherwise. The array is
-  borrowed for the whole loop.
+  borrowed for the whole loop. A temporary array of an owned element type (a
+  call's result, an array literal, or `move(xs)`) is **consumed**: `x` owns
+  each element in turn, and may move it (`for x in split(s, ",") {
+  append(mut &out, x) }` needs no copy). Each element is dropped at the end of
+  its turn unless the body moved it. On `break`, `return` or `try`, the
+  elements not yet taken are dropped with the array, last to first.
 - `for x in e`, when `e` is not a range, an array or a slice, **iterates**:
   `e` is moved (or copied) into a hidden variable `it`, and the loop runs as
   `{ var it = e; while true { match it.next() { Some(x) { body } None { break } } } }`.

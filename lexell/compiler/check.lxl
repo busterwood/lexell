@@ -2531,6 +2531,10 @@ fn (c: mut &Checker) sFor(s: int) {
         c.err(n.line, "for ... in needs an array, a slice or a range a..b, not " + c.tstr(v.t))
     }
     let et = c.pg.ta(v.t)
+    if k == sema.TK_ARR && !c.isCopy(et) && !c.pg.isBorrowClass(et) && (v.cat == CAT_RV || v.cat == CAT_TMP) {
+        c.forConsume(s, v, et)
+        return
+    }
     let ap = c.fresh("ap")
     let i = c.fresh("i")
     if v.cat == CAT_RV && k == sema.TK_ARR {
@@ -2567,6 +2571,47 @@ fn (c: mut &Checker) sFor(s: int) {
         c.vars[x].broot = eroot
         c.declare(x)
     }
+    c.loopEnd(n.c, n.line)
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+}
+
+// SPEC 8 (design/owned-str.md, issue 6): for x in a temporary array of owned elements (a call's
+// result, or move(xs)) consumes it: x owns each element in turn. The array is reversed in place and
+// each turn takes its last element, so at every point it holds exactly the elements not yet taken;
+// break, return and try leave those to its ordinary drop at the end of the statement.
+//     { reverse a; while (a.len > 0) { a.len -= 1; T x = a.data[a.len]; body } }
+fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
+    let n = c.nd(s)
+    let name = n.s
+    var v = v0
+    if v.cat == CAT_RV { v = c.holdtmp(v.c, v.t) }
+    let ct = c.T(et)
+    let i64 = c.ct("int64_t")
+    let ap = c.fresh("ap")
+    c.emit(c.x.decl(c.ct("lxl_arr*"), &ap, c.x.pre("&", v.c)))
+    let apn = c.nm(&ap)
+    let len = c.x.arrow(apn, "len")
+    let data = c.x.par(c.x.pcast(c.x.ptr(ct), c.x.arrow(apn, "data")))
+    let i = c.fresh("i")
+    let ixn = c.nm(&i)
+    c.emit(c.x.sfor(c.x.decl(i64, &i, c.lit(0)), c.x.bin("<", ixn, c.x.bin("/", len, c.lit(2))), c.x.post(ixn, "++")))
+    c.cx.ind += 1
+    let j = c.x.par(c.x.bin("-", c.x.bin("-", len, c.lit(1)), ixn))
+    let sw = c.fresh("sw")
+    c.emit(c.x.decl(ct, &sw, c.x.idx(data, ixn)))
+    c.emitx(c.x.asg(c.x.idx(data, ixn), c.x.idx(data, j)))
+    c.emitx(c.x.asg(c.x.idx(data, j), c.nm(&sw)))
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+    c.emit(c.x.swhile(c.x.bin(">", len, c.lit(0))))
+    c.cx.ind += 1
+    c.loopStart(c.snapshot(), false)
+    let xn = c.fresh(&("v_" + name + "_"))
+    c.emitx(c.x.asg(len, c.x.bin("-", len, c.lit(1))))
+    c.emit(c.x.decl(ct, &xn, c.x.idx(data, len)))
+    let x = c.newVar(&name, &xn, et, false, VK_LOCAL, n.line)
+    c.declare(x)
     c.loopEnd(n.c, n.line)
     c.cx.ind -= 1
     c.emit(c.x.send())
