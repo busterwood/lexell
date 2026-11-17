@@ -261,8 +261,8 @@ fn newGen(u: ir.Ir): Gen {
     g.a.peep = true
     g.siteIdx = array(2 * len(g.u.nodes), -1)
     g.siteStamp = array(2 * len(g.u.nodes), 0)
-    for i in 0..len(rtx.SYM_NAMES) { g.rtSym.put(rtx.SYM_NAMES[i], i) }
-    for n in rtx.FP_KEEP { g.fpKeep.put(n, true) }
+    for i in 0..len(rtx.SYM_NAMES) { g.rtSym.put(rtx.SYM_NAMES[i].clone(), i) }
+    for n in rtx.FP_KEEP { g.fpKeep.put(n.clone(), true) }
     for i in 0..len(g.u.funcs) {
         append(mut &g.funcSym, -1)
         append(mut &g.funcPos, -1)
@@ -370,23 +370,23 @@ fn rtHelper(name: &str): bool { return strings.startsWith(&name, "lxl_") || stri
 // C backend, plus libc's entry and the runtime's HOOKS.
 pub fn dynNames(p: &ir.Ir): []str {
     var rt: Map[str, bool] = newMapWith[str, bool](fxHashStr)
-    for n in rtx.SYM_NAMES { rt.put(n, true) }
+    for n in rtx.SYM_NAMES { rt.put(n.clone(), true) }
     var need = false
     var seen: Map[str, bool] = newMapWith[str, bool](fxHashStr)
     var out: []str = ["__libc_start_main"]
-    for h in HOOKS { append(mut &out, h) }
-    for n in out { seen.put(n, true) }
+    for h in HOOKS { append(mut &out, h.clone()) }
+    for n in out { seen.put(n.clone(), true) }
     for i in 0..len(p.nodes) {
         if p.nodes[i].k != ir.E_FUNC { continue }
         let f = p.nodes[i].a
         if p.funcs[f].body < 0 && p.funcs[f].name == "rt_blocking" { need = true }
         if p.funcs[f].body >= 0 || !p.funcs[f].isExtern { continue }
-        let name = p.funcs[f].asmName
+        let name = &p.funcs[f].asmName
         if rtHelper(&name) { continue }
         if !rt.has(&name) { need = true }
         if !seen.has(&name) {
-            seen.put(name, true)
-            append(mut &out, name)
+            seen.put(name.clone(), true)
+            append(mut &out, name.clone())
         }
     }
     if !need { return [] }
@@ -491,10 +491,10 @@ fn (g: mut &Gen) symFunc(f: int, e: int): int {
         g.pendN += 1
         if f < g.pendLo { g.pendLo = f }
     } else if g.dyn && g.u.funcs[f].isExtern && !rtHelper(&g.u.funcs[f].asmName) {
-        g.funcSym[f] = g.symImport(g.u.funcs[f].asmName)
+        g.funcSym[f] = g.symImport(g.u.funcs[f].asmName.clone())
         return g.funcSym[f]
     } else {
-        let name = g.u.funcs[f].asmName
+        let name = &g.u.funcs[f].asmName
         let rs = g.rtSym.getOr(&name, -1)
         if rs < 0 {
             let msg = if g.u.funcs[f].isExtern { "extern C function '" + name + "' needs dynamic linking" } else {
@@ -509,28 +509,28 @@ fn (g: mut &Gen) symFunc(f: int, e: int): int {
 }
 
 // The symbol of the GOT entry of an imported function.
-fn (g: mut &Gen) symImport(name: str): int {
+fn (g: mut &Gen) symImport(name: &str): int {
     let have = g.importSym.getOr(&name, -1)
     if have >= 0 { return have }
-    append(mut &g.imports, name)
+    append(mut &g.imports, name.clone())
     append(mut &g.syms, Sym{kind: SK_DYN, idx: len(g.imports) - 1})
-    g.importSym.put(name, len(g.syms) - 1)
+    g.importSym.put(name.clone(), len(g.syms) - 1)
     return len(g.syms) - 1
 }
 
-fn (g: mut &Gen) symRt(name: str): int {
+fn (g: mut &Gen) symRt(name: &str): int {
     let rs = g.rtSym.getOr(&name, -1)
     if rs < 0 { panic("native: the runtime has no " + name) }
     append(mut &g.syms, Sym{kind: SK_RT, idx: rs})
     return len(g.syms) - 1
 }
 
-fn (g: mut &Gen) symStr(s: str): int {
+fn (g: mut &Gen) symStr(s: &str): int {
     let have = g.strSym.getOr(&s, -1)
     if have >= 0 { return have }
-    append(mut &g.strs, s)
+    append(mut &g.strs, s.clone())
     append(mut &g.syms, Sym{kind: SK_STR, idx: len(g.strs) - 1})
-    g.strSym.put(s, len(g.syms) - 1)
+    g.strSym.put(s.clone(), len(g.syms) - 1)
     return len(g.syms) - 1
 }
 
@@ -2063,7 +2063,7 @@ fn (g: &Gen) quietRt(e: int): bool {
     let dv = divOp(&name)
     if dv.k >= 0 { return nargs == (if dv.op == ir.OP_SUB { 2 } else { 3 }) && g.isWhere(g.u.listAt(n.b, nargs - 1)) }
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
-    return name == "rt_str_dup" && nargs == 1 && !g.kern()
+    return false     // rt_str_dup copies (design/owned-str.md): a call of the runtime
 }
 
 // A kernel function (kernel.lxl) may run on a par pool thread: its str counts are changed by the
@@ -2079,7 +2079,7 @@ fn (g: &Gen) fpKeepCall(e: int): bool {
     if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return false }
     let f = g.u.nodes[g.u.nodes[c].a].a
     if g.u.funcs[f].body >= 0 || g.dyn { return false }
-    let name = g.u.funcs[f].asmName
+    let name = &g.u.funcs[f].asmName
     return g.fpKeep.getOr(&name, false)
 }
 
@@ -3617,7 +3617,7 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
         let t = en.ty
         let x = en.a
         if g.u.nk(x) == ir.E_STR && g.tk(t) == ir.TY_ARR {
-            let str = g.u.strs[g.u.nodes[x].v]
+            let str = g.u.strs[g.u.nodes[x].v].clone()
             var cnt = len(str) + 1
             if cnt > g.size(t) { cnt = g.size(t) }
             g.a.movRSym(RAX, g.symStr(str), 0)
@@ -3689,7 +3689,7 @@ fn (g: mut &Gen) genAddr(e: int) {
         let s = g.symFunc(n.a, e)
         if g.syms[s].kind == SK_DYN { g.a.loadAt(RAX, s) } else { g.a.movRSym(RAX, s, 0) }
     } else if k == ir.E_STR {
-        g.a.movRSym(RAX, g.symStr(g.u.strs[n.v]), 0)
+        g.a.movRSym(RAX, g.symStr(g.u.strs[n.v].clone()), 0)
     } else if k == ir.E_DEREF {
         g.gen(n.a)
         if g.inElement(e) || g.viaPtr(e) { g.wideAt = g.a.pos() }
@@ -3774,7 +3774,7 @@ fn (g: &Gen) pure(x: int): bool {
     if k == ir.E_CALL {
         let c = n.a
         if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return false }
-        let name = g.u.funcs[g.u.nodes[g.u.nodes[c].a].a].name
+        let name = &g.u.funcs[g.u.nodes[g.u.nodes[c].a].a].name
         if name != "rt_idx" && name != "rt_sidx" && name != "rt_str_byte" && name != "rt_str_word" && arOp(&name).k < 0 && divOp(&name).k < 0 { return false }
         for j in 0..g.u.listLen(n.b) {
             if !g.pure(g.u.listAt(n.b, j)) { return false }
@@ -4904,11 +4904,6 @@ fn (g: mut &Gen) genAssign(e: int) {
     var m = g.staticMem(lhs)
     // through a pointer local in a register the value might assign (it is generated first)
     if m.base != -9 && m.base != RBP && g.writesReg(n.b, m.base) { m = x64.mem(-9, 0) }
-    if m.base != -9 && g.u.nk(n.b) == ir.E_CALL && g.rtName(n.b) == "rt_str_dup" &&
-        g.sameMem(lhs, g.u.listAt(g.u.nodes[n.b].b, 0)) {
-        g.gen(n.b)                          // x = rt_str_dup(x): the count only
-        return
-    }
     if m.base != -9 && g.isAggr(t) && g.u.nk(lhs) == ir.E_LOCAL && g.u.nk(n.b) == ir.E_CALL && g.u.nodes[n.b].ty == t {
         // a result in registers stored in the local after the call (whole words: its slot is
         // rounded up to them); one in memory written there by the callee when the local's
@@ -5981,14 +5976,14 @@ fn (g: mut &Gen) genCall(e: int) {
         direct = g.u.nodes[g.u.nodes[callee].a].a
     }
     if direct >= 0 && g.u.funcs[direct].body < 0 && len(pts) >= 1 && len(pts) <= 3 && g.allF(&pts) && g.isF(rt) {
-        let asm = g.u.funcs[direct].asmName       // a copy: inlineMath takes g mutably
+        let asm = g.u.funcs[direct].asmName.clone()      // a copy: inlineMath takes g mutably
         if g.inlineMath(e, &asm) {
             g.destUsed = false
             return
         }
     }
     if direct >= 0 && g.u.funcs[direct].body < 0 && !g.u.funcs[direct].isExtern {
-        let rtName = g.u.funcs[direct].name       // a copy: inlineRt takes g mutably
+        let rtName = g.u.funcs[direct].name.clone()      // a copy: inlineRt takes g mutably
         if g.inlineRt(e, &rtName) {
             g.destUsed = false
             return
@@ -6308,7 +6303,7 @@ fn (g: &Gen) rtName(e: int): str {
     if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return "" }
     let f = g.u.nodes[g.u.nodes[c].a].a
     if g.u.funcs[f].body >= 0 || g.u.funcs[f].isExtern { return "" }
-    return g.u.funcs[f].name
+    return g.u.funcs[f].name.clone()
 }
 
 // Whether argument j of call e is rt_str_dup(s) of a str s in memory that needs no code (a
@@ -6318,6 +6313,7 @@ fn (g: &Gen) rtName(e: int): str {
 fn (g: mut &Gen) dupArg(e: int, j: int): bool {
     let l = g.u.nodes[e].b
     let x = g.u.listAt(l, j)
+    if true { return false }    // rt_str_dup copies the bytes now (design/owned-str.md): never free
     if g.u.nk(x) != ir.E_CALL || g.rtName(x) != "rt_str_dup" || g.u.listLen(g.u.nodes[x].b) != 1 || g.kern() { return false }
     let s = g.u.listAt(g.u.nodes[x].b, 0)
     if g.staticMem(s).base == -9 { return false }
@@ -6683,7 +6679,7 @@ fn (g: mut &Gen) stub(code: int, msg: &str, w: int): int {
     let have = g.stubOf.getOr(&key, -1)
     if have >= 0 { return have }
     let l = g.a.newLabel()
-    append(mut &g.stubs, Stub{label: l, code: code, msg: msg, where: w})
+    append(mut &g.stubs, Stub{label: l, code: code, msg: msg.clone(), where: w})
     g.stubOf.put(key, l)
     return l
 }
@@ -6694,7 +6690,7 @@ fn (g: mut &Gen) genStubs() {
         g.a.bind(st.label)
         g.a.movRI(RDI, st.code)
         g.a.movRSym(RSI, g.symStr(st.msg), 0)
-        g.a.movRSym(RDX, g.symStr(g.u.strs[g.u.nodes[g.u.nodes[st.where].a].v]), 0)
+        g.a.movRSym(RDX, g.symStr(g.u.strs[g.u.nodes[g.u.nodes[st.where].a].v].clone()), 0)
         g.callRt("rt_trap")
     }
     g.stubOf.clear()
@@ -6968,9 +6964,8 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
                 g.a.alu(x64.CMP, 8, RAX, RDX)
                 g.a.jcc(x64.CC_AE, g.stub(3, "string index out of range", g.u.listAt(n.b, 2)))
             }
-            g.a.loadZX(4, RAX, at(m, 8))                // off
-            g.a.aluRM(x64.ADD, 8, RAX, m)               // + the block
-            if wd { g.a.load(8, dst, x64.memx(RAX, ri, 1, 8)) } else { g.a.loadZX(1, dst, x64.memx(RAX, ri, 1, 8)) }
+            g.a.load(8, RAX, m)                         // p: the bytes (design/owned-str.md)
+            if wd { g.a.load(8, dst, x64.memx(RAX, ri, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, ri, 1, 0)) }
             return true
         }
         let br = if g.u.nk(sx) == ir.E_DEREF { g.regOf(g.u.nodes[sx].a) } else { -1 }
@@ -6994,9 +6989,8 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
                 g.a.alu(x64.CMP, 8, RAX, RDX)
                 g.a.jcc(x64.CC_AE, g.stub(3, "string index out of range", g.u.listAt(n.b, 2)))
             }
-            g.a.loadZX(4, RAX, x64.mem(br, 8))              // off
-            g.a.aluRM(x64.ADD, 8, RAX, x64.mem(br, 0))      // + the block
-            if wd { g.a.load(8, dst, x64.memx(RAX, ri, 1, 8)) } else { g.a.loadZX(1, dst, x64.memx(RAX, ri, 1, 8)) }
+            g.a.load(8, RAX, x64.mem(br, 0))                // p: the bytes
+            if wd { g.a.load(8, dst, x64.memx(RAX, ri, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, ri, 1, 0)) }
             return true
         }
         g.gen(sx)                                       // the address of the str
@@ -7018,38 +7012,8 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
             g.a.jcc(x64.CC_AE, g.stub(3, "string index out of range", g.u.listAt(n.b, 2)))
             g.a.aluI(x64.SUB, 8, RCX, 7)
         }
-        g.a.loadZX(4, RDX, x64.mem(RAX, 8))             // off
-        g.a.load(8, RAX, x64.mem(RAX, 0))               // the block
-        g.a.alu(x64.ADD, 8, RAX, RDX)
-        if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 8)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 8)) }
-        return true
-    }
-    if name == "rt_str_dup" && nargs == 1 && !g.kern() {
-        // if (b && b->rc >= 0) b->rc++; the result is the same str: a local or a member of
-        // one is its own result (an aggregate value is the address of its bytes, used at once)
-        let x = g.u.listAt(n.b, 0)
-        let m = g.staticMem(x)
-        var s = 0
-        if m.base != -9 {
-            g.a.load(8, RCX, m)
-        } else {
-            s = g.temp(16, 8)
-            g.gen(x)
-            g.a.load(8, RCX, x64.mem(RAX, 0))
-            g.a.load(8, RDX, x64.mem(RAX, 8))
-            g.a.store(8, rbp(s), RCX)
-            g.a.store(8, rbp(s + 8), RDX)
-        }
-        let done = g.a.newLabel()
-        g.a.test(8, RCX, RCX)
-        g.a.jcc(x64.CC_E, done)
-        g.a.load(8, RDX, x64.mem(RCX, 0))
-        g.a.test(8, RDX, RDX)
-        g.a.jcc(x64.CC_S, done)
-        g.a.aluI(x64.ADD, 8, RDX, 1)
-        g.a.store(8, x64.mem(RCX, 0), RDX)
-        g.a.bind(done)
-        g.a.lea(RAX, if m.base != -9 { m } else { rbp(s) })
+        g.a.load(8, RAX, x64.mem(RAX, 0))               // p: the bytes
+        if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 0)) }
         return true
     }
     if name == "rt_arr_push" && nargs == 2 && g.u.nk(g.u.listAt(n.b, 1)) == ir.E_INT &&
@@ -7076,28 +7040,6 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         g.a.movRR(8, RDI, RAX)
         g.a.movRI(RSI, size)
         g.callRt("rt_arr_push")
-        g.a.bind(done)
-        return true
-    }
-    if name == "rt_str_drop" && nargs == 1 && !g.kern() {
-        // if (b && b->rc > 0 && --b->rc == 0) rt_free(b)
-        let m = g.staticMem(g.u.listAt(n.b, 0))
-        if m.base != -9 {
-            g.a.load(8, RDI, m)
-        } else {
-            g.gen(g.u.listAt(n.b, 0))
-            g.a.load(8, RDI, x64.mem(RAX, 0))
-        }
-        let done = g.a.newLabel()
-        g.a.test(8, RDI, RDI)
-        g.a.jcc(x64.CC_E, done)
-        g.a.load(8, RCX, x64.mem(RDI, 0))
-        g.a.test(8, RCX, RCX)
-        g.a.jcc(x64.CC_LE, done)
-        g.a.aluI(x64.SUB, 8, RCX, 1)
-        g.a.store(8, x64.mem(RDI, 0), RCX)
-        g.a.jcc(x64.CC_NE, done)
-        g.callRt("rt_free")
         g.a.bind(done)
         return true
     }
@@ -7341,7 +7283,7 @@ fn (g: mut &Gen) constAddr(e: int): K {
         if g.syms[s].kind == SK_DYN { g.fail(e, "the address of a C library function in a constant") }
         return K{lo: 0, hi: 0, sym: s}
     }
-    if n.k == ir.E_STR { return K{lo: 0, hi: 0, sym: g.symStr(g.u.strs[n.v])} }
+    if n.k == ir.E_STR { return K{lo: 0, hi: 0, sym: g.symStr(g.u.strs[n.v].clone())} }
     if n.k == ir.E_MEMBER {
         let x = g.constAddr(n.a)
         return K{lo: x.lo + n.v, hi: 0, sym: x.sym}
@@ -7377,7 +7319,7 @@ fn (g: mut &Gen) initData(buf: mut &[]byte, ro: bool, off: int, ents: int, reloc
         let x = en.a
         let o = off + en.v
         if g.u.nk(x) == ir.E_STR && g.tk(t) == ir.TY_ARR {
-            let s = g.u.strs[g.u.nodes[x].v]
+            let s = &g.u.strs[g.u.nodes[x].v]
             for i in 0..len(s) {
                 if i < g.size(t) { buf[o + i] = strByte(s, i) }
             }
@@ -7443,7 +7385,7 @@ fn (g: mut &Gen) rtMark(sec: int, work: mut &[]int) {
     append(work, sec)
 }
 
-fn (g: &Gen) rtSymbol(name: str): int {
+fn (g: &Gen) rtSymbol(name: &str): int {
     let rs = g.rtSym.getOr(&name, -1)
     if rs < 0 { panic("native: the runtime has no " + name) }
     return rs
@@ -7531,7 +7473,7 @@ fn (g: mut &Gen) link(): []byte {
     // string literals (symStr may have been called by initData, so after the globals)
     var sAddr: []int = []
     for i in 0..len(g.strs) {
-        let s = g.strs[i]
+        let s = &g.strs[i]
         append(mut &sAddr, roBase + len(ro))
         for j in 0..len(s) { append(mut &ro, strByte(s, j)) }
         append(mut &ro, 0)
@@ -7567,7 +7509,7 @@ fn (g: mut &Gen) link(): []byte {
         }
         let hooks = g.rtSymAddr(g.rtSymbol("rt_n_libc"))
         for k in 0..len(HOOKS) {
-            let h = HOOKS[k]
+            let h = &HOOKS[k]
             let im = g.syms[g.importSym.getOr(&h, -1)].idx
             append(mut &rels, elf.DynRel{at: hooks + 8 * k, sym: im + 1, kind: elf.R_X86_64_GLOB_DAT, addend: 0})
         }
@@ -7651,7 +7593,7 @@ fn (g: mut &Gen) resolve(needed: mut &[]str, ims: mut &[]elf.Import) {
         }
         if found < 0 {
             var names: []str = []
-            for l in g.libs { append(mut &names, l.soname) }
+            for l in g.libs { append(mut &names, l.soname.clone()) }
             writeFd(2, "native: undefined C function '" + name + "' (not in " + strings.join(&names, ", ") + ")\n")
             exit(1)
         }
@@ -7661,10 +7603,10 @@ fn (g: mut &Gen) resolve(needed: mut &[]str, ims: mut &[]elf.Import) {
     var index: []int = []
     for li in 0..len(g.libs) {
         append(mut &index, len(needed))
-        if used[li] { append(needed, g.libs[li].soname) }
+        if used[li] { append(needed, g.libs[li].soname.clone()) }
     }
     for i in 0..len(g.imports) {
         let li = libOf[i]
-        append(ims, elf.Import{name: g.imports[i], lib: index[li], ver: g.libs[li].defs.getOr(&g.imports[i], "")})
+        append(ims, elf.Import{name: g.imports[i].clone(), lib: index[li], ver: g.libs[li].defs.getOr(&g.imports[i], "")})
     }
 }

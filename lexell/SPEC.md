@@ -178,24 +178,28 @@ block or one expression.
 | `str` | immutable byte string |
 | `ptr` | an opaque C pointer; only for `extern` declarations and their wrappers |
 
-`str` is reference counted inside the runtime, so for the language it is a
-copy type: copying a string never copies its bytes, and it is freed with its
-last copy. Its bytes are not required to be UTF-8. `s[a..b]` is the substring
-of bytes `a` to `b - 1`; it shares the bytes of `s` (no copy, no allocation)
-and is itself an ordinary `str`. `s[a..]` and `s[..b]` run to the end and from
+`str` is an **owned** type (design/owned-str.md): a string has one owner,
+`let t = s` moves it, and it is freed when its owner is dropped. `s.clone()`
+makes a second, independent string. A string that several owners read is an
+`rc str` (section 4.9). Its bytes are not required to be UTF-8. `s[a..b]` is
+the substring of bytes `a` to `b - 1`: where a `&str` is expected it is a view
+of the bytes of `s` (no copy), and elsewhere it is a new owned `str`. `s[a..]` and `s[..b]` run to the end and from
 the start. `s[i]` is the byte at index `i` (a `byte`), on an owned or
 borrowed `str`; it is a value, not a place, so it cannot be assigned or
 borrowed `mut` (a string is immutable). Out-of-range indices and bounds stop
 the program (exit 3). A string is at most
 4 GiB − 1 bytes long; making a longer one stops the program (exit 2).
 
-A shared `&str` is a **view**: the string's header (its block, offset and
-length) by value, with no count taken. `&s[a..b]` borrows the bytes `a` to
-`b - 1` of `s` without copying or counting them, and so does `s[a..b]` where a
-`&str` is expected; elsewhere `s[a..b]` is an owned `str` (it counts). A view
-is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str`
-converts to `str` where a `str` is expected (an argument, a stored value),
-which takes a count of the same bytes. `mut &str` borrows a `str` variable or
+A shared `&str` is a **view**: the string's header (a pointer to its bytes and
+its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`
+without copying them, and so does `s[a..b]` where a `&str` is expected;
+elsewhere `s[a..b]` is a new owned `str` holding a copy of those bytes. In the
+runtime a string owns a buffer of the heap, except the static bytes of
+literals and constants, which are never freed and which copies may share
+(design/owned-str.md, "Stage 2"). A view
+is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str` does
+not convert to `str` by itself: where an owned string is needed, write
+`s.clone()`. `mut &str` borrows a `str` variable or
 field for writing, as for any `T`. A shared borrow or slice of an array of
 `str` may be used as one of views (`&[]str` as `&[]&str`, `&[str]` as
 `&[&str]`): the elements are read as views rooted where the array is
@@ -206,14 +210,22 @@ expected (an argument, a typed `let`, a field of a record literal, an
 `Option` or `Result` payload, an array element, a `return`) is a view of
 static bytes. It has **no root**: it may be passed, kept in a value that holds
 borrows, joined with any root, and returned from any function
-(`fn kind(k: int): &str { return "word" }`). Elsewhere it is a `str`.
+(`fn kind(k: int): &str { return "word" }`). Elsewhere it is a new owned `str`,
+as is a `str` constant read where an owned value is wanted.
 
-All primitive types are copy types.
+All primitive types except `str` are copy types.
 
 ### 4.2 Arrays
 
 `[]T` is a growable array that owns its elements. It is an owned type for every
-`T`, including copy `T`. Elements are stored inline. Indexing is checked.
+`T`, including copy `T`. Elements are stored inline. Indexing is checked. In an array
+literal whose element type is a shared borrow `&T`, an element that is a `T`
+is borrowed as an argument is (section 7.5): a variable or field directly, a
+temporary held to the end of the statement. So `command(&["GET", key,
+n.toStr()])` passes three views without copying. Such a literal may be
+passed to a call, but not kept in a `let`, because its temporaries do not
+outlive the statement. A literal passed where a `&[]T` is expected takes `T` as its
+element type, so `f([])` needs no annotation.
 
 ### 4.2a Slices
 
@@ -347,15 +359,80 @@ let adults = count(&people, fn(p: &Person): bool { return p.age >= minAge })
 
 ### 4.7 Copy types and owned types
 
-A type is a **copy type** if it has no `drop` method and it is a primitive, a function type, a
-`value record` or `value closed` whose fields are all copy types, or a type
-parameter constrained by `copy`. Every other type is **owned**.
+A type is a **copy type** if it has no `drop` method and it is a primitive
+other than `str`, a function type, a `value record` or `value closed` whose
+fields are all copy types, or a type parameter constrained by `copy`. Every
+other type is **owned**, `str` and `task.Shared` handles included (before
+design/owned-str.md both were copy types, counted in the runtime).
+
+`x.clone()` makes a second owner of `x` (std's `Clone` interface). A type
+that declares a `clone` method uses it. Otherwise the compiler provides a deep
+copy for a type that is **cloneable**:
+- a copy type;
+- `str`, where the clone is an independent string;
+- an array whose elements are cloneable;
+- `task.Shared[T]`, where the copy is another handle;
+- a record or closed type without a `drop` method, holding no borrows, whose
+  fields are each cloneable.
+
+A type that contains itself is cloneable when the rest of it is
+(`type Node = record { name: str; kids: []Node }`). Such a type satisfies
+`Clone` without a method of its own. A type with a `drop` method holds a
+resource, and is cloneable only through a `clone` method it declares.
+`x.clone()` on a type that is not cloneable is an error that names the part
+that blocks it.
 
 ### 4.8 Type identity and aliases
 
 Types are nominal: two declarations make two types even with the same fields.
 `type A = B` declares an alias; `A` and `B` are then the same type. Generic
 types are equal when their declarations and arguments are equal.
+
+
+### 4.9 Counted handles: rc T
+
+`rc T` is a counted handle to a value of type `T` that does not change while
+it may be shared (design/owned-str.md). It is std's `Rc[T]`, a boxed record
+holding the count and the value. `rc` is a keyword only where a type is
+expected, so a variable may still be named `rc`.
+
+- **Making one.** `rc(v)` moves `v` into a new box and returns the first
+  handle.
+- **Handles are owned.** A handle is moved like any owned value.
+  `r.share()` returns another handle to the same box in O(1), and
+  `r.clone()` does the same: the value cannot change, so a deep copy could
+  not be told apart from it. The value is dropped, and the box freed, with
+  the last handle.
+- **Reading is transparent.** All of these read the value:
+  - `r.f`, a field of it;
+  - `r.m()`, a method of it (one not declared on `Rc` itself);
+  - `r[i]`, `r[a..b]` and `len(r)`;
+  - operators, so `r == "x"` and `r + "!"` work when `r` is an `rc str`;
+  - `for x in r`;
+  - a handle passed, returned or bound where a `&T` is expected, which lends
+    the value;
+  - a handle passed to a value parameter of the value's type (an intrinsic
+    such as `strByte(r, 0)`, or a copy type), which reads the value.
+  These reads are places rooted at the handle, so a borrow of the value
+  keeps the handle alive (section 10).
+- **The value is immutable through a handle.** Assigning to it, mutably
+  borrowing it, or moving out of it is an error.
+- **Changing it.** `r.unshare()`, on a handle in a variable or field that may
+  be changed, returns `mut &T`. When `r` is the only handle, it lends the
+  value in place. Otherwise `r` gives up its share and gets a new box holding
+  a clone of the value (so `T` must be cloneable, section 4.7), and the other
+  handles keep the old value.
+- **Forwarded interfaces.** `==`, `cmp`, `hash` and `toStr` on handles forward
+  to the value when `T` has them.
+
+A buffer that several readers walk is a natural `rc`: the TDS and TNS clients
+keep a reply in an `rc str` and their cursors share it (`Cur{s: r.share(),
+pos: p}`), so making a cursor costs a count, not a copy.
+
+Because no handle can change a shared value, handles cannot form cycles.
+Every box is freed with its last handle, without a collector. Counts are not
+atomic, so a `par.map` closure may read through a handle but not share or
+drop one: the kernel check refuses it (design/parallel.md).
 
 ## 5. Declarations and modules
 
@@ -376,8 +453,9 @@ name is visible throughout its module; `pub` makes it visible to importers.
 
 `const` names a compile-time value: an integer, float, bool, string or
 fractional literal, or an operator expression over constants. A global `var`
-has a copy type and a constant initializer (constants, and value record or
-variant literals of constants). A constant expression that overflows is a
+has a copy type, or an owned type with value-only access (below), and a
+constant initializer (constants, and value record or variant literals of
+constants). A constant expression that overflows is a
 compile error. A constant is folded in the arithmetic of its type: a typed
 constant that does not fit its type is an error, and `const C: u32 = ~0` is
 `0xffffffff`. A global may not be borrowed
@@ -385,7 +463,9 @@ constant that does not fit its type is an error, and `const C: u32 = ~0` is
 temporary copy; a `mut &Self` method on a global is an error).
 
 **Constant tables.** A `const` may also be an array literal of constants, or a
-value record or variant literal of constants, of a copy type:
+value record or variant literal of constants, of a copy type or of strings
+and values built from them (static data, read as views or as new owned
+values):
 `const POW10: []u128 = [1, 10, 100]`. A constant table lives in read-only
 static data; it is never freed and never changes. Using its name gives a
 `&[T]` slice (section 4.2a), so `POW10[i]`, `len(POW10)` and `for p in POW10`
@@ -410,11 +490,24 @@ owned or copy, that starts empty and is set at most once:
   `get()` or `set(v)` from then on (in a drop method, including its own) stops
   the program (exit 12).
 
-**Globals of owned types** are otherwise not allowed. Mutable state that owns
-heap data belongs to `main` (or a context record it creates) and is passed down
-by borrow. Borrowing mutable owned globals soundly would need the effect rules
-of section 13; they will be considered only if real programs need more than
-copy globals, constant tables and set-once globals.
+**Globals of owned types** (design/owned-str.md, issue 8) are allowed with
+**value-only access**, when their type has a constant initializer: a `str`,
+or a value record or value closed type built from such types
+(`var LOG: str = ""`, `var CACHE: Option[[]int] = None`).
+- A built-in operation that runs no code of the program may read the global
+  in place: `len(g)`, `g[i]`, `g + x` and comparisons on strings.
+- `g.clone()` reads a copy.
+- `g = v` stores, dropping the old value.
+- No borrow of the global may outlive such an operation. Passing it to a
+  function or method (`f(g)`, `g.m()`), moving it out (`return g`), `&g`,
+  and `for x in g` are errors; write `g.clone()`.
+
+Because no borrow of the global ever outlives a built-in operation, no code
+that might assign it runs while one is held, which is why borrowing mutable
+globals in general would need the effect rules of section 13. A global of a
+boxed type, or of an array type (an array global is a constant table), must
+be set-once. Larger mutable state that owns heap data belongs to `main`, or a
+context record it creates, and is passed down by borrow.
 
 ### 5.3 Functions and methods
 
@@ -608,7 +701,11 @@ declaring `eq`, and `<` and the other comparisons still need `cmp`. A compound a
 with `a` evaluated once: the index expressions in `a` run once, before `b`, and,
 as in `a = a + b`, the value is stored to the place they name after `b` has run
 (so `xs[i] += f(mut &xs)` is allowed, and `i` is checked again when it is
-stored to).
+stored to). The left operand of the operator is read like any operand: a value
+of a copy type is copied before `b` runs (`n += f(mut &n)` is allowed), and a
+value of an owned type is borrowed until the operator has run, so
+`s += f(mut &s)` is a borrow conflict (rule 3 of section 10) once `str` is an
+owned type (design/owned-str.md, issue 7). Write `let t = f(mut &s); s += t`.
 
 ### 7.5 Calls and method calls
 
@@ -622,7 +719,12 @@ parameter is a `std.Where` may leave that argument out: the compiler passes
 the call's location (section 15).
 
 An argument that already has a borrow type is passed to a parameter of a
-borrow type as it is: `f(r)` and `f(&r)` both pass the borrow `r`. A `mut &T`
+borrow type as it is: `f(r)` and `f(&r)` both pass the borrow `r`. An argument
+that is not a borrow, passed to a shared borrow parameter `&T`, is borrowed
+as if written `&x`: `show(name)` borrows `name`, and `show(make())` borrows a
+temporary that lives to the end of the statement. A `mut &T` parameter still
+needs `mut &x` written, because a mutable borrow changes what the caller may
+do with `x`. `print`, `println`, `eprint` and `eprintln` take `&T`. A `mut &T`
 may be passed where `&T` is expected. A copy-type argument is copied when it is
 evaluated, so `f(mut &n, n.v)` does not conflict (rule 10.3 concerns borrows
 and moves only).
@@ -727,7 +829,13 @@ let name = match e { Expr.Num(n) { n.toStr() } Expr.Call(f, _) { f } else { "?" 
 - `for i in a..b` counts from `a` up to `b - 1` over `int`; `b` is evaluated
   once. `for x in xs` walks an array: `x` is a copy of each element when the
   element type is a copy type, and a `&T` borrow of it otherwise. The array is
-  borrowed for the whole loop.
+  borrowed for the whole loop. A temporary array of an owned element type (a
+  call's result, an array literal, or `move(xs)`) is **consumed**: `x` owns
+  each element in turn, and may move it (`for x in split(s, ",") {
+  append(mut &out, x) }` needs no copy). Each element is dropped at the end of
+  its turn unless the body moved it. On `break`, `return` or `try`, the
+  current element is dropped first (innermost first), then the elements not
+  yet taken, with the array, last to first.
 - `for x in e`, when `e` is not a range, an array or a slice, **iterates**:
   `e` is moved (or copied) into a hidden variable `it`, and the loop runs as
   `{ var it = e; while true { match it.next() { Some(x) { body } None { break } } } }`.
@@ -776,9 +884,12 @@ it. The source then has no value until it is assigned again.
   only in the record's module. `var P{...} = e` makes the variables
   assignable. Unbound fields are dropped at once, in reverse declaration
   order; the bound ones are bound in the order of the pattern.
-- Only a whole local variable or by-value parameter can be moved out of.
-  Moving out of a field, an element, a borrow or a global is an error; use
-  `replace`, `swap` or `pop`.
+- Only a whole local variable or by-value parameter can be moved out of,
+  with one exception: a field of a temporary record (`make().name`). That
+  temporary is taken apart as by `let P{name} = make()`: the field is moved
+  out, the other fields are dropped at once, and the temporary is not dropped
+  again at the end of the statement. Moving out of a field of a variable, an
+  element, a borrow or a global is an error; use `replace`, `swap` or `pop`.
 - Where the paths of an `if` (with or without `else`), a `match`, or an `if` or
   `match` expression join, a variable moved on some of the paths that reach the
   join but not on others is dropped at the end of each path that did not move
@@ -807,8 +918,12 @@ or named fields of owned types are bound as `&T`, and of copy types as copies.
 Through a shared borrow (the scrutinee is a `&T`), a `str` field is bound as a
 view, `&str`, rooted where the scrutinee is: uncounted, and returnable through
 a borrowed parameter (`fn name(e: &E): &str { match e { E.S(s) { return s }
-... } }`). Matching a variable directly binds a `str` field as a copy, so the
-arm may still assign that variable.
+... } }`). Matching a variable directly binds a `str` field as a borrow too
+(it is owned, section 4.1); the arm writes `s.clone()` to keep a copy.
+A `match` directly on a local variable of an owned closed type without a
+`drop` method, where the variable is not used again (not in the arms, the
+rest of the statement, a later statement, or a loop around the match that it
+is declared outside of), consumes it as `match move(x)` would.
 `match` on any other expression (a call result, `move(x)`) consumes it: the
 bindings own the fields, and fields not bound (or bound to `_`) are dropped at
 the start of the arm, before its body runs; an arm naming several variants, like
@@ -894,6 +1009,10 @@ borrows, or a type parameter declared `borrow` (section 6.1).
    `mut &`, freezes its roots against any other use as well, except through
    it. A `for x in xs` loop freezes `xs` the same way for the loop body, and
    an iterating `for` freezes the iterator's roots.
+   A `let` borrow of a place, and a `for` loop over one, freeze only that
+   place: while `let s = &d.f` is live, `d.g` may be assigned or mutably
+   borrowed, but `d.f`, anything under it, and `d` itself may not (places
+   overlap as in rule 3). Other freezes cover the whole root.
    A local variable is live from its declaration to its last use: while its
    name occurs later in its block (in a statement after the current one, or
    in the rest of the current statement; the right side of a plain
@@ -950,7 +1069,7 @@ including `print`, `println`, string formatting and parsing, is in `std`.
 | `swap(mut &a, i, j)` | swap two elements of an array |
 | `replace(mut &p, v)` | store `v` at place `p` and return the old value |
 | `move(x)` | the value of local `x`, which is then moved |
-| `array(n, v)` | `n` copies of the copy value `v` |
+| `array(n, v)` | `n` copies of `v`: copies of a copy value, clones of an owned one (section 4.7) |
 | `withCapacity(n)` | an empty array with room for `n` elements before it grows (`n` rounded up to a power of two; negative stops the program, exit 2); its type is the array type expected where it is used (`var rows: []&str = withCapacity(n)`), so its elements may be views or of any type |
 | `panic(msg)` | print `Lexell: panic: msg` and stop with exit code 12 |
 | `assert(c)` | `panic("assertion failed")` with the line, when `c` is false |
@@ -1164,9 +1283,10 @@ The compiler knows these names from the library: `fromFraction` (section
 variants that may be written bare (`Some`, `None`, `Ok`, `Err`, section 4.4).
 It knows two types from the library. `Shared` in the library module `task`
 (section 16), declared there as `value record { p: ptr }`: a value of an
-instance of it is not plain data: copying it calls the runtime's `rt_sh_dup`
-on `p`, and dropping it `rt_sh_drop`, so that the handle is counted like a
-`str`. Everything else about tasks is library code.
+instance of it is an owned handle: `share()` or `clone()` calls the
+runtime's `rt_sh_dup` on `p`, and dropping it `rt_sh_drop`, so that the value
+is dropped with the last handle. It also knows `Rc` in `std`, what `rc T`
+names (section 4.9). Everything else about tasks is library code.
 
 `Where` in `std`, declared there as `value record { p: ptr }`, is a call
 site: `p` points to the text `"file:line"` (the file's name and the line of
@@ -1218,8 +1338,8 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   ordinary rules: a closure is not a `fn` value (section 4.6), and a borrow
   type, or a type that holds borrows, is not a type argument of `start`
   (section 10, rule 1). So a task reaches nothing of its starter's
-  but what was moved into it, and `Shared` values (and `Frozen` values,
-  library handles built on `Shared` that lend only `&T`; lib/README.md).
+  but what was moved into it: its own `Shared` handles, and `rc` handles
+  (section 4.9) to values that never change.
 - A task runs until it parks: it waits for an unfinished future (`wait`,
   `task.all`, `task.any`), calls `task.yield()` or `task.sleep(ms)`, makes a
   socket call that would block (`net`: it parks on `EAGAIN` until the socket
@@ -1293,9 +1413,10 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   again, and the work in `f` ends through its `Result`s. `within` itself
   does not park. The clock is `CLOCK_MONOTONIC`; timers fire in the order of
   their time, and those with the same time in the order they were set.
-- `Shared[T]` is a copy handle to one value, which is dropped with the last
-  handle. `sh.with(f)` lends the value to `f` as `mut &T`, and is the only
-  access. No other task runs during `with`: an operation that can park,
+- `Shared[T]` is a counted handle to one value, which is dropped with the
+  last handle. A handle is owned: `sh.share()` (or `sh.clone()`) makes
+  another, and passing one to a task moves it (design/owned-str.md). `sh.with(f)`
+  lends the value to `f` as `mut &T`, and is the only access. No other task runs during `with`: an operation that can park,
   called while any `with` is open, stops the program with exit 13 (the check
   is made whether or not the call would have parked), and so does a `with`
   on a value whose `with` is already open. `with` on different values may

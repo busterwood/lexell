@@ -80,7 +80,7 @@ pub fn (e: &Error) message(): str {
 }
 
 fn hint(e: &Error): str {
-    let x = e.expr
+    let x = &e.expr
     match e.code {
         ErrorCode.InvalidEscape {
             if len(x) == 2 && x[1] >= '1' && x[1] <= '9' { return " (backreferences are not supported)" }
@@ -247,7 +247,7 @@ pub fn (t: &Tree) capNames(re: int): []str {
 }
 
 fn (t: &Tree) fillCapNames(re: int, names: mut &[]str) {
-    if t.nodes[re].op == OP_CAPTURE { names[t.nodes[re].cap] = t.nodes[re].name }
+    if t.nodes[re].op == OP_CAPTURE { names[t.nodes[re].cap] = t.nodes[re].name.clone() }
     for s in t.nodes[re].sub { t.fillCapNames(s, names) }
 }
 
@@ -1142,9 +1142,8 @@ fn unhex(c: int): int {
 
 // An escape sequence at s (a backslash); the rune and the position after it.
 fn (p: mut &Parser) parseEscape(s: int): Step {
-    let w = p.whole
     var t = s + 1
-    if t >= len(w) {
+    if t >= len(p.whole) {
         p.fail(ErrorCode.TrailingBackslash, s, s)
         p.errExpr = ""
         return Step{r: 0, next: -1}
@@ -1155,18 +1154,18 @@ fn (p: mut &Parser) parseEscape(s: int): Step {
     t = st.next
     if c == int('1') || c == int('2') || c == int('3') || c == int('4') || c == int('5') || c == int('6') || c == int('7') || c == int('0') {
         // Octal escapes. A single non-zero digit is a backreference: not supported.
-        if c == int('0') || (t < len(w) && w[t] >= '0' && w[t] <= '7') {
+        if c == int('0') || (t < len(p.whole) && p.whole[t] >= '0' && p.whole[t] <= '7') {
             var r = c - int('0')
             for k in 1..3 {
-                if t >= len(w) || w[t] < '0' || w[t] > '7' { break }
-                r = r * 8 + int(w[t]) - int('0')
+                if t >= len(p.whole) || p.whole[t] < '0' || p.whole[t] > '7' { break }
+                r = r * 8 + int(p.whole[t]) - int('0')
                 t += 1
             }
             return Step{r: r, next: t}
         }
     } else if c == int('x') {
         // Hexadecimal escapes.
-        if t < len(w) {
+        if t < len(p.whole) {
             let s1 = p.nextRune(t)
             if s1.next < 0 { return s1 }
             t = s1.next
@@ -1176,7 +1175,7 @@ fn (p: mut &Parser) parseEscape(s: int): Step {
                 var r = 0
                 var ok = true
                 while true {
-                    if t >= len(w) {
+                    if t >= len(p.whole) {
                         ok = false
                         break
                     }
@@ -1200,7 +1199,7 @@ fn (p: mut &Parser) parseEscape(s: int): Step {
             } else {
                 // Two hex digits.
                 let x = unhex(s1.r)
-                if t >= len(w) {
+                if t >= len(p.whole) {
                     // Go: nextRune("") fails with invalid UTF-8 on the empty rest.
                     p.fail(ErrorCode.InvalidUtf8, t, t)
                     return Step{r: 0, next: -1}
@@ -1245,9 +1244,8 @@ fn (p: mut &Parser) parseClassChar(s: int, wholeClass: int): Step {
 // A Perl class escape like \d at s: appends its runes to r and returns the
 // position after it, or -1 when there is none.
 fn (p: mut &Parser) parsePerlClassEscape(s: int, r: mut &[]int): int {
-    let w = p.whole
-    if p.flags & PERL_X == 0 || s + 2 > len(w) || w[s] != '\\' { return -1 }
-    let c = w[s + 1]
+    if p.flags & PERL_X == 0 || s + 2 > len(p.whole) || p.whole[s] != '\\' { return -1 }
+    let c = p.whole[s + 1]
     var sign = 0
     var cls: []int = []
     if c == 'd' || c == 'D' {
@@ -1290,11 +1288,10 @@ fn posixGroup(name: str): []int {
 // A POSIX class like [:alnum:] at s: appends its runes to r and returns the
 // position after it, or -1 when there is none (an unknown name is an error).
 fn (p: mut &Parser) parseNamedClass(s: int, r: mut &[]int): int {
-    let w = p.whole
-    if s + 2 > len(w) || w[s] != '[' || w[s + 1] != ':' { return -1 }
-    let i = strings.indexOf(&w, ":]", s + 2)
+    if s + 2 > len(p.whole) || p.whole[s] != '[' || p.whole[s + 1] != ':' { return -1 }
+    let i = strings.indexOf(&p.whole, ":]", s + 2)
     if i < 0 { return -1 }
-    var name = w[s + 2..i]
+    var name = p.whole[s + 2..i]
     var sign = 1
     if len(name) > 0 && name[0] == '^' {
         sign = -1
@@ -1396,14 +1393,13 @@ fn foldRanges(fold: int, idx: int): []int {
 // A Unicode class like \p{Lu} or \pL at s: appends its runes to r and returns
 // the position after it, -1 when there is none, -2 after an error.
 fn (p: mut &Parser) parseUnicodeClass(s: int, r: mut &[]int): int {
-    let w = p.whole
-    if p.flags & UNICODE_GROUPS == 0 || s + 2 > len(w) || w[s] != '\\' || (w[s + 1] != 'p' && w[s + 1] != 'P') {
+    if p.flags & UNICODE_GROUPS == 0 || s + 2 > len(p.whole) || p.whole[s] != '\\' || (p.whole[s + 1] != 'p' && p.whole[s + 1] != 'P') {
         return -1
     }
     // Committed to parse or return an error.
     var sign = 1
-    if w[s + 1] == 'P' { sign = -1 }
-    if s + 2 >= len(w) {
+    if p.whole[s + 1] == 'P' { sign = -1 }
+    if s + 2 >= len(p.whole) {
         // Go: nextRune("") is invalid UTF-8 (err is returned, but r is nil:
         // the caller sees no class and goes on).
         return -1
@@ -1420,10 +1416,10 @@ fn (p: mut &Parser) parseUnicodeClass(s: int, r: mut &[]int): int {
         nameB = st.next
     } else {
         // Name in braces.
-        let end = strings.indexOf(&w, "}", s)
+        let end = strings.indexOf(&p.whole, "}", s)
         if end < 0 {
-            if !p.checkUtf8(s, len(w)) { return -2 }
-            p.fail(ErrorCode.InvalidCharRange, s, len(w))
+            if !p.checkUtf8(s, len(p.whole)) { return -2 }
+            p.fail(ErrorCode.InvalidCharRange, s, len(p.whole))
             return -2
         }
         seqEnd = end + 1
@@ -1431,7 +1427,7 @@ fn (p: mut &Parser) parseUnicodeClass(s: int, r: mut &[]int): int {
         nameB = end
         if !p.checkUtf8(nameA, nameB) { return -2 }
     }
-    var name = w[nameA..nameB]
+    var name = p.whole[nameA..nameB]
     // \p{^Lu} is \P{Lu}.
     if len(name) > 0 && name[0] == '^' {
         sign = -sign
@@ -1460,13 +1456,12 @@ fn (p: mut &Parser) parseUnicodeClass(s: int, r: mut &[]int): int {
 
 // A character class at s (a [): pushes it; the position after it, or -1.
 fn (p: mut &Parser) parseClass(s: int): int {
-    let w = p.whole
     var t = s + 1
     let re = p.newRegexp(OP_CHAR_CLASS)
     p.t.nodes[re].flags = p.flags
     var cls: []int = []
     var sign = 1
-    if t < len(w) && w[t] == '^' {
+    if t < len(p.whole) && p.whole[t] == '^' {
         sign = -1
         t += 1
         // If the class does not match \n, add it here, so that the negation
@@ -1477,17 +1472,17 @@ fn (p: mut &Parser) parseClass(s: int): int {
         }
     }
     var first = true   // ] and - are allowed as the first char
-    while t >= len(w) || w[t] != ']' || first {
+    while t >= len(p.whole) || p.whole[t] != ']' || first {
         // POSIX: - is allowed unescaped only first or last in a class.
-        if t < len(w) && w[t] == '-' && p.flags & PERL_X == 0 && !first && (t + 1 == len(w) || w[t + 1] != ']') {
+        if t < len(p.whole) && p.whole[t] == '-' && p.flags & PERL_X == 0 && !first && (t + 1 == len(p.whole) || p.whole[t + 1] != ']') {
             var size = 0
-            if t + 1 < len(w) { size = decodeRune(&w, t + 1).w }
+            if t + 1 < len(p.whole) { size = decodeRune(&p.whole, t + 1).w }
             p.fail(ErrorCode.InvalidCharRange, t, t + 1 + size)
             return -1
         }
         first = false
         // POSIX [:alnum:] and so on.
-        if t + 2 < len(w) && w[t] == '[' && w[t + 1] == ':' {
+        if t + 2 < len(p.whole) && p.whole[t] == '[' && p.whole[t + 1] == ':' {
             let nt = p.parseNamedClass(t, mut &cls)
             if nt == -2 { return -1 }
             if nt >= 0 {
@@ -1515,7 +1510,7 @@ fn (p: mut &Parser) parseClass(s: int): int {
         t = lo.next
         var hi = lo.r
         // [a-] means (a|-), so check for the final ].
-        if t + 2 <= len(w) && w[t] == '-' && w[t + 1] != ']' {
+        if t + 2 <= len(p.whole) && p.whole[t] == '-' && p.whole[t + 1] != ']' {
             t += 1
             let h = p.parseClassChar(t, s)
             if h.next < 0 { return -1 }
@@ -1739,7 +1734,7 @@ fn negateClass(r: mut &[]int) {
 
 // The parse result: the tree, or the error.
 pub fn parse(s: &str, flags: int): Result[Tree, Error] {
-    var p = Parser{flags: flags, stack: [], free: [], numCap: 0, whole: s, tmpClass: [], numRegexp: 0, numRunes: 0,
+    var p = Parser{flags: flags, stack: [], free: [], numCap: 0, whole: s.clone(), tmpClass: [], numRegexp: 0, numRunes: 0,
         repeats: 0, heightOn: false, height: [], sizeOn: false, size: [], t: Tree{nodes: [], root: -1},
         err: false, errCode: ErrorCode.InternalError, errExpr: "", errPos: 0}
     if flags & LITERAL != 0 {
@@ -1848,14 +1843,13 @@ pub fn parse(s: &str, flags: int): Result[Tree, Error] {
     return Ok(tree)
 }
 
-fn (p: &Parser) errorValue(): Error { return Error{code: p.errCode, expr: p.errExpr, pos: p.errPos} }
+fn (p: &Parser) errorValue(): Error { return Error{code: p.errCode, expr: p.errExpr.clone(), pos: p.errPos} }
 
 // A backslash at t: an assertion, \Q..\E, a class or an escaped rune. The
 // position after it, or -1.
 fn (p: mut &Parser) parseBackslash(t: int): int {
-    let s = p.whole
-    if p.flags & PERL_X != 0 && t + 2 <= len(s) {
-        let c = s[t + 1]
+    if p.flags & PERL_X != 0 && t + 2 <= len(p.whole) {
+        let c = p.whole[t + 1]
         if c == 'A' {
             p.op(OP_BEGIN_TEXT)
             return t + 2
@@ -1875,15 +1869,15 @@ fn (p: mut &Parser) parseBackslash(t: int): int {
         }
         if c == 'Q' {
             // \Q ... \E: the ... is always literals.
-            var end = strings.indexOf(&s, "\\E", t + 2)
+            var end = strings.indexOf(&p.whole, "\\E", t + 2)
             var next = end + 2
             if end < 0 {
-                end = len(s)
-                next = len(s)
+                end = len(p.whole)
+                next = len(p.whole)
             }
             var i = t + 2
             while i < end {
-                let d = decodeRuneIn(&s, i, end)
+                let d = decodeRuneIn(&p.whole, i, end)
                 if d.r == RUNE_ERROR && d.w == 1 {
                     p.fail(ErrorCode.InvalidUtf8, i, end)
                     return -1
@@ -1899,7 +1893,7 @@ fn (p: mut &Parser) parseBackslash(t: int): int {
         }
     }
     // Unicode classes like \p{Lu}.
-    if t + 2 <= len(s) && (s[t + 1] == 'p' || s[t + 1] == 'P') {
+    if t + 2 <= len(p.whole) && (p.whole[t + 1] == 'p' || p.whole[t + 1] == 'P') {
         var r: []int = []
         let ut = p.parseUnicodeClass(t, mut &r)
         if ut == -2 { return -1 }
@@ -1987,20 +1981,19 @@ fn parseIntAt(w: &str, s: int): Step {
 // (?i:, or a named capture (?P<name> or (?<name>, at s. The position after
 // it, or -1.
 fn (p: mut &Parser) parsePerlFlags(s: int): int {
-    let w = p.whole
-    let n = len(w) - s
-    let startsWithP = n > 4 && w[s + 2] == 'P' && w[s + 3] == '<'
-    let startsWithName = n > 3 && w[s + 2] == '<'
+    let n = len(p.whole) - s
+    let startsWithP = n > 4 && p.whole[s + 2] == 'P' && p.whole[s + 3] == '<'
+    let startsWithName = n > 3 && p.whole[s + 2] == '<'
     if startsWithP || startsWithName {
         let exprStart = if startsWithName { s + 3 } else { s + 4 }
-        let end = strings.indexOf(&w, ">", s)
+        let end = strings.indexOf(&p.whole, ">", s)
         if end < 0 {
-            if !p.checkUtf8(s, len(w)) { return -1 }
-            p.fail(ErrorCode.InvalidNamedCapture, s, len(w))
+            if !p.checkUtf8(s, len(p.whole)) { return -1 }
+            p.fail(ErrorCode.InvalidNamedCapture, s, len(p.whole))
             return -1
         }
         if !p.checkUtf8(exprStart, end) { return -1 }
-        let name = w[exprStart..end]
+        let name = p.whole[exprStart..end]
         if !isValidCaptureName(&name) {
             p.fail(ErrorCode.InvalidNamedCapture, s, end + 1)
             return -1
@@ -2017,7 +2010,7 @@ fn (p: mut &Parser) parsePerlFlags(s: int): int {
     var flags = p.flags
     var sign = 1
     var sawFlag = false
-    while t < len(w) {
+    while t < len(p.whole) {
         let st = p.nextRune(t)
         if st.next < 0 { return -1 }
         t = st.next
@@ -2435,7 +2428,7 @@ pub fn (t: mut &Tree) simplify(re: int): int {
                 copy.min = t.nodes[re].min
                 copy.max = t.nodes[re].max
                 copy.cap = t.nodes[re].cap
-                copy.name = t.nodes[re].name
+                copy.name = t.nodes[re].name.clone()
                 nre = t.add(copy)
                 for j in 0..i { append(mut &list, t.nodes[re].sub[j]) }
             }

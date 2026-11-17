@@ -291,9 +291,14 @@ pub type Program = record {
     pub std: int
     pub shared: int          // the TypeDecl of task.Shared (a lang item, SPEC 15), or -1
     pub where: int           // the TypeDecl of std.Where (a lang item, SPEC 15), or -1
+    pub rc: int              // the TypeDecl of std.Rc, what rc T names (design/owned-str.md), or -1
     pub main: int
     bcMemo: []int            // isBorrowClass per type: -1 unknown, 0, 1
     bcDecl: []int            // declBC per declaration: -1 unknown, 0, 1, 2 (being computed)
+    pub migrate: bool        // LXL_OWNED_STR=1 (or LXL_OWNED_SHARED=1): migration mode (design/owned-str.md):
+                             // a site that relied on str or Shared being copied is logged, not an error
+    pub legacy: bool         // inside isCopyLegacy: str and Shared count as copy types, as before the switch
+    pub paramReport: bool    // LXL_PARAM_REPORT=1: list the by-value owned parameters only read (check)
 }
 
 // ---------------------------------------------------------------- errors
@@ -343,14 +348,14 @@ pub fn dirName(path: &str): str {
 
 // Python's os.path.join of two paths.
 pub fn joinPath(a: &str, b: &str): str {
-    if len(b) > 0 && strByte(b, 0) == '/' { return b }
+    if len(b) > 0 && strByte(b, 0) == '/' { return b.clone() }
     if len(a) == 0 || strByte(a, len(a) - 1) == '/' { return a + b }
     return a + "/" + b
 }
 
 // Python's os.path.abspath: joined with the working directory, normalized.
 pub fn absPath(path: &str): str {
-    let p = if len(path) == 0 || strByte(path, 0) != '/' { os.cwd() + "/" + path } else { path }
+    let p = if len(path) == 0 || strByte(path, 0) != '/' { os.cwd() + "/" + path } else { path.clone() }
     var parts: []str = []
     for part in strings.splitByte(&p, '/') {
         if len(part) == 0 || part == "." { continue }
@@ -373,12 +378,12 @@ pub fn absPath(path: &str): str {
 pub fn stripExt(name: &str): str {
     var i = len(name) - 1
     while i >= 0 && strByte(name, i) != '.' { i -= 1 }
-    if i <= 0 { return name }
+    if i <= 0 { return name.clone() }
     // a name of dots then an extension has none (".lxl", "..lxl")
     for k in 0..i {
         if strByte(name, k) != '.' { return name[0..i] }
     }
-    return name
+    return name.clone()
 }
 
 // Python's s[:-n].
@@ -399,10 +404,12 @@ fn isAlnum(c: byte): bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= '
 // ---------------------------------------------------------------- the program
 
 pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
-    var pg = Program{libroots: libroots, mainFile: mainFile, mods: [], modIndex: newMapWith[str, int](fxHashStr), types: [],
+    var pg = Program{libroots: libroots, mainFile: mainFile.clone(), mods: [], modIndex: newMapWith[str, int](fxHashStr), types: [],
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
-        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, main: -1, bcMemo: [], bcDecl: []}
+        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
+        migrate: os.envOr("LXL_OWNED_STR", "") == "1" || os.envOr("LXL_OWNED_SHARED", "") == "1", legacy: false,
+        paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1"}
     let none: []int = []
     for p in 0..len(PRIM_NAMES) { pg.intern(TK_PRIM, p, 0, false, &none) }
     pg.intern(TK_SELF, 0, 0, false, &none)
@@ -478,7 +485,7 @@ pub fn (pg: &Program) isBorrow(t: int): bool { return pg.tys[t].k == TK_REF || p
 pub fn (pg: &Program) tstr(t: int): str {
     let k = pg.tk(t)
     match k {
-        TK_PRIM { return PRIM_NAMES[t] }
+        TK_PRIM { return PRIM_NAMES[t].clone() }
         TK_ARR { return "[]" + pg.tstr(pg.ta(t)) }
         TK_REF { return (if pg.tm(t) { "mut &" } else { "&" }) + pg.tstr(pg.ta(t)) }
         TK_SLICE { return (if pg.tm(t) { "mut &[" } else { "&[" }) + pg.tstr(pg.ta(t)) + "]" }
@@ -497,10 +504,11 @@ pub fn (pg: &Program) tstr(t: int): str {
             }
             return b.toStr()
         }
-        TK_TP { return pg.tparams[pg.ta(t)].name }
+        TK_TP { return pg.tparams[pg.ta(t)].name.clone() }
         TK_SELF { return "Self" }
         else {}
     }
+    if pg.isRc(t) { return "rc " + pg.tstr(pg.ti(t, 0)) }
     var b = newStrBuf()
     b.add(&pg.types[pg.ta(t)].name)
     if pg.tn(t) > 0 {
@@ -654,16 +662,105 @@ pub fn (pg: mut &Program) fieldTypes(t: int): []int {
 
 pub fn (pg: mut &Program) isCopy(t: int): bool { return pg.isCopyAt(t, 0) }
 
+// LXL_OWNED_STR: a type copied today that would be owned with str owned.
+pub fn (pg: mut &Program) soft(t: int): bool { return pg.migrate && pg.isCopyLegacy(t) }
+
+// A measurement line on stderr: OWNED_STR kind file:line name.
+pub fn (pg: &Program) note(kind: &str, m: int, line: int, what: &str) {
+    eprintln("OWNED_STR " + kind + " " + pg.mods[m].fname + ":" + intToStr(line) + " " + what)
+}
+
+// design/owned-str.md (issue 4): a type with no clone method of its own satisfies std's Clone when
+// it is cloneable; x.clone() then makes a deep copy (copy glue for a type copied while str is
+// counted, clone glue for the rest).
+pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
+    if pg.types[iface].mod != pg.std || pg.types[iface].name != "Clone" { return false }
+    if pg.tk(t) == TK_TP { return pg.tparams[pg.ta(t)].copy }     // a copy type parameter: cloned by copying
+    if pg.methodOf(t, "clone") >= 0 { return false }
+    return pg.cloneable(t)
+}
+
+// Whether t has a built-in deep copy: a type copied while str is counted; an array of cloneable
+// elements; task.Shared (another handle); a record or closed type with no drop method, holding no
+// borrows, whose fields are each cloneable or have a clone method. A type that contains itself is
+// cloneable when the rest of it is.
+// Whether t is rc T (std.Rc[T]).
+pub fn (pg: &Program) isRc(t: int): bool { return pg.rc >= 0 && pg.tk(t) == TK_INST && pg.ta(t) == pg.rc }
+
+pub fn (pg: mut &Program) cloneable(t: int): bool {
+    var seen: []int = []
+    return pg.cloneableAt(t, mut &seen)
+}
+
+// Why t is not cloneable: the first part found that blocks it (for the error), or "".
+pub fn (pg: mut &Program) cloneBlocker(t: int): str {
+    if pg.cloneable(t) { return "" }
+    let k = pg.tk(t)
+    if k == TK_ARR { return pg.cloneBlocker(pg.ta(t)) }
+    if k == TK_CLO || k == TK_REF || k == TK_SLICE { return pg.tstr(t) + " holds borrows" }
+    if k != TK_INST { return pg.tstr(t) + " cannot be copied" }
+    let d = pg.ta(t)
+    if pg.types[d].drop >= 0 { return pg.tstr(t) + " has a drop method" }
+    if pg.isBorrowClass(t) { return pg.tstr(t) + " holds borrows" }
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if !pg.cloneable(ft) { return pg.cloneBlocker(ft) }
+    }
+    return pg.tstr(t) + " cannot be cloned"
+}
+
+fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
+    if pg.isCopyLegacy(t) { return true }
+    let k = pg.tk(t)
+    if k == TK_TP {
+        // a type parameter constrained by copy or Clone: its instances clone (emit resolves each)
+        let tp = &pg.tparams[pg.ta(t)]
+        if tp.copy { return true }
+        for con in tp.cons {
+            if pg.tk(con) == TK_INST && pg.types[pg.ta(con)].mod == pg.std && pg.types[pg.ta(con)].name == "Clone" {
+                return true
+            }
+        }
+        return false
+    }
+    if k == TK_ARR { return pg.cloneableAt(pg.ta(t), seen) }
+    if k != TK_INST { return false }
+    if pg.methodOf(t, "clone") >= 0 { return true }
+    let d = pg.ta(t)
+    if d == pg.shared || d == pg.rc { return true }       // another handle (rc: the value never changes)
+    if pg.types[d].drop >= 0 || pg.isBorrowClass(t) { return false }
+    for x in seen {
+        if x == t { return true }
+    }
+    append(seen, t)
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if !pg.cloneableAt(ft, seen) { return false }
+    }
+    return true
+}
+
+// isCopy as if str were counted (LXL_OWNED_STR off): the measurement's "copied today".
+pub fn (pg: mut &Program) isCopyLegacy(t: int): bool {
+    let o = pg.legacy
+    pg.legacy = true
+    let r = pg.isCopyAt(t, 0)
+    pg.legacy = o
+    return r
+}
+
 fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     if depth > 5000 { pg.tooDeep() }
     match pg.tk(t) {
-        TK_PRIM, TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
+        TK_PRIM { return pg.ta(t) != T_STR || pg.legacy }       // str is owned (design/owned-str.md)
+        TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
         TK_ARR, TK_SELF { return false }
         TK_TP { return pg.tparams[pg.ta(t)].copy }
         else {}
     }
     let d = pg.ta(t)
     if !pg.types[d].value || pg.types[d].drop >= 0 { return false }
+    if d == pg.shared && !pg.legacy { return false }      // a Shared handle is owned: share() makes another
     let fts = pg.fieldTypes(t)
     for ft in fts {
         if !pg.isCopyAt(ft, depth + 1) { return false }
@@ -753,7 +850,7 @@ fn (pg: mut &Program) holdsMutAt(t: int, depth: int): bool {
 
 // ---------------------------------------------------------------- AST access
 
-pub fn (pg: &Program) nd(m: int, n: int): sx.Node { return pg.mods[m].ast.nodes[n] }
+pub fn (pg: &Program) nd(m: int, n: int): sx.Node { return pg.mods[m].ast.nodes[n].clone() }
 pub fn (pg: &Program) kind(m: int, n: int): int { return pg.mods[m].ast.nodes[n].kind }
 pub fn (pg: &Program) count(m: int, l: int): int { return pg.mods[m].ast.items[l] }
 pub fn (pg: &Program) item(m: int, l: int, i: int): int { return pg.mods[m].ast.items[l + 1 + i] }
@@ -766,8 +863,8 @@ fn (pg: mut &Program) load(path0: &str, chain0: &[]str, name: &str, isStd: bool,
     let known = pg.modIndex.getOr(&path, -1)
     if known >= 0 { return known }
     var chain: []str = []
-    for c in chain0 { append(mut &chain, c) }
-    append(mut &chain, path)
+    for c in chain0 { append(mut &chain, c.clone()) }
+    append(mut &chain, path.clone())
     var data = ""
     if readFile(path, mut &data) != 0 { pg.err(-1, 0, "cannot read " + path) }
     let fname = baseName(&path)
@@ -779,16 +876,16 @@ fn (pg: mut &Program) load(path0: &str, chain0: &[]str, name: &str, isStd: bool,
         base.addByte(if isAlnum(c) { c } else { '_' })
     }
     let bs = base.toStr()
-    var cp = bs
+    var cp = bs.clone()
     var n = 1
     while pg.cprefixUsed(&cp) {
         n += 1
         cp = bs + intToStr(n)
     }
-    append(mut &pg.mods, Module{path: path, name: name, fname: fname, cprefix: cp, isStd: isStd, isLib: isLib,
+    append(mut &pg.mods, Module{path: path.clone(), name: name.clone(), fname: fname, cprefix: cp, isStd: isStd, isLib: isLib,
         ast: ast, importNames: [], importMods: [], scope: newMapWith[str, Sym](fxHashStr), scopeNames: [], fns: [], loading: true})
     let m = len(pg.mods) - 1
-    pg.modIndex.put(path, m)
+    pg.modIndex.put(path.clone(), m)
     let imps = pg.mods[m].ast.imports
     for k in 0..pg.count(m, imps) {
         let imp = pg.nd(m, pg.item(m, imps, k))
@@ -813,7 +910,7 @@ fn (pg: mut &Program) load(path0: &str, chain0: &[]str, name: &str, isStd: bool,
         }
         let lib = !strings.startsWith(&imp.s, "./") && !strings.startsWith(&imp.s, "../")
         let sub = pg.load(&target, &chain, &(baseName(&imp.s)), false, lib)
-        let alias = if len(imp.t) == 0 { baseName(&imp.s) } else { imp.t }
+        let alias = if len(imp.t) == 0 { baseName(&imp.s) } else { imp.t.clone() }
         for a in pg.mods[m].importNames {
             if a == alias { pg.err(m, imp.line, "module name " + alias + " is imported twice") }
         }
@@ -880,13 +977,13 @@ fn (pg: mut &Program) add(m: int, name: str, s: Sym, line: int) {
         pg.err(m, line, name + " is a prelude variant (std's " + name + "); no other module may " +
             "declare a top-level name that clashes with it")
     }
-    pg.mods[m].scope.put(name, s)
+    pg.mods[m].scope.put(name.clone(), s)
     append(mut &pg.mods[m].scopeNames, name)
 }
 
 fn (pg: mut &Program) collect(m: int) {
     let decls = pg.mods[m].ast.decls
-    let cp = pg.mods[m].cprefix
+    let cp = pg.mods[m].cprefix.clone()
     let kp = "k" + intToStr(len(cp)) + "_" + cp + "_"
     let gp = "g" + intToStr(len(cp)) + "_" + cp + "_"
     for k in 0..pg.count(m, decls) {
@@ -895,12 +992,12 @@ fn (pg: mut &Program) collect(m: int) {
         let isPub = n.flags & sx.PUB != 0
         match n.kind {
             sx.N_TYPE {
-                append(mut &pg.types, TypeDecl{node: a, mod: m, name: n.s, line: n.line, isPub: isPub, form: n.b,
+                append(mut &pg.types, TypeDecl{node: a, mod: m, name: n.s.clone(), line: n.line, isPub: isPub, form: n.b,
                     value: n.flags & sx.VALUE != 0, tparams: [], fields: [], variants: [], members: [],
                     methods: newMapWith[str, int](fxHashStr), methodNames: [], drop: -1, target: -1, resolving: false,
                     cname: cp + "_" + n.s})
                 let d = len(pg.types) - 1
-                pg.add(m, n.s, Sym{k: D_TYPE, i: d}, n.line)
+                pg.add(m, n.s.clone(), Sym{k: D_TYPE, i: d}, n.line)
                 // SPEC 15: task.Shared, a value record { p: ptr }, is a counted handle
                 if pg.mods[m].isLib && pg.mods[m].name == "task" && n.s == "Shared" && n.b == sx.F_RECORD &&
                     pg.types[d].value {
@@ -908,39 +1005,41 @@ fn (pg: mut &Program) collect(m: int) {
                 }
                 // SPEC 15: std.Where, a value record { p: ptr }, is a call site
                 if pg.mods[m].isStd && n.s == "Where" && n.b == sx.F_RECORD && pg.types[d].value { pg.where = d }
+                // std.Rc, a record { n: int; v: T }, is what rc T names: a counted handle
+                if pg.mods[m].isStd && n.s == "Rc" && n.b == sx.F_RECORD && !pg.types[d].value { pg.rc = d }
                 if n.b == sx.F_CLOSED {
                     for i in 0..pg.count(m, n.c) {
                         let vn = pg.item(m, n.c, i)
                         let v = pg.nd(m, vn)
-                        append(mut &pg.variants, Variant{name: v.s, decl: d, index: i, node: vn, fields: [],
+                        append(mut &pg.variants, Variant{name: v.s.clone(), decl: d, index: i, node: vn, fields: [],
                             named: v.flags & sx.NAMED != 0, line: v.line})
                         let vi = len(pg.variants) - 1
                         append(mut &pg.types[d].variants, vi)
                         if pg.mods[m].isStd && isPrelude(&v.s) {
-                            if !pg.prelude.has(&v.s) { append(mut &pg.preludeNames, v.s) }
-                            pg.prelude.put(v.s, vi)
+                            if !pg.prelude.has(&v.s) { append(mut &pg.preludeNames, v.s.clone()) }
+                            pg.prelude.put(v.s.clone(), vi)
                         }
                     }
                 }
             }
             sx.N_FN {
-                append(mut &pg.fns, FnDecl{node: a, mod: m, name: n.s, line: n.line, isPub: isPub,
-                    isExtern: n.flags & sx.EXTERN != 0, lib: n.t, cname: n.u,
+                append(mut &pg.fns, FnDecl{node: a, mod: m, name: n.s.clone(), line: n.line, isPub: isPub,
+                    isExtern: n.flags & sx.EXTERN != 0, lib: n.t.clone(), cname: n.u.clone(),
                     varargs: n.flags & sx.DOTS != 0, blocking: n.flags & sx.BLOCKING != 0, tps: [], params: [], ret: T_VOID,
                     recvMode: RM_NONE, recvName: "", recvType: -1, ownerKind: O_NONE, owner: -1, bparam: "", bsrc: []})
                 let f = len(pg.fns) - 1
                 append(mut &pg.mods[m].fns, f)
-                if n.a < 0 { pg.add(m, n.s, Sym{k: D_FN, i: f}, n.line) }
+                if n.a < 0 { pg.add(m, n.s.clone(), Sym{k: D_FN, i: f}, n.line) }
             }
             sx.N_CONST {
-                append(mut &pg.consts, Const{node: a, mod: m, name: n.s, line: n.line, isPub: isPub,
+                append(mut &pg.consts, Const{node: a, mod: m, name: n.s.clone(), line: n.line, isPub: isPub,
                     cname: kp + n.s, busy: false, done: false, table: -1, value: noValue()})
-                pg.add(m, n.s, Sym{k: D_CONST, i: len(pg.consts) - 1}, n.line)
+                pg.add(m, n.s.clone(), Sym{k: D_CONST, i: len(pg.consts) - 1}, n.line)
             }
             else {
-                append(mut &pg.globals, Global{node: a, mod: m, name: n.s, line: n.line, isPub: isPub,
+                append(mut &pg.globals, Global{node: a, mod: m, name: n.s.clone(), line: n.line, isPub: isPub,
                     isOnce: n.flags & sx.ONCE != 0, ty: -1, cname: gp + n.s})
-                pg.add(m, n.s, Sym{k: D_GLOBAL, i: len(pg.globals) - 1}, n.line)
+                pg.add(m, n.s.clone(), Sym{k: D_GLOBAL, i: len(pg.globals) - 1}, n.line)
             }
         }
     }
@@ -957,7 +1056,7 @@ pub fn (pg: &Program) symPub(s: Sym): bool {
     }
 }
 
-pub fn (pg: &Program) scopeGet(m: int, name: str): Sym { return pg.mods[m].scope.getOr(&name, NOSYM) }
+pub fn (pg: &Program) scopeGet(m: int, name: &str): Sym { return pg.mods[m].scope.getOr(&name, NOSYM) }
 
 // ref's lookup: the module's own names, then std's public ones.
 pub fn (pg: &Program) lookup(m: int, name: &str): Sym {
@@ -980,7 +1079,7 @@ pub fn (pg: &Program) lookupIn(m: int, target: int, name: &str, line: int): Sym 
 // ref's FnDecl.label: name, or Owner.name for a method.
 pub fn (pg: &Program) label(f: int): str {
     return match pg.fns[f].ownerKind {
-        O_NONE { pg.fns[f].name }
+        O_NONE { pg.fns[f].name.clone() }
         O_PRIM { PRIM_NAMES[pg.fns[f].owner] + "." + pg.fns[f].name }
         else { pg.types[pg.fns[f].owner].name + "." + pg.fns[f].name }
     }
@@ -1046,10 +1145,10 @@ fn (pg: mut &Program) checkBorrowFields(d: int) {
     if form != sx.F_RECORD && form != sx.F_CLOSED { return }
     var fs: []Field = []
     if form == sx.F_RECORD {
-        for f in pg.types[d].fields { append(mut &fs, f) }
+        for f in pg.types[d].fields { append(mut &fs, f.clone()) }
     } else {
         for v in pg.types[d].variants {
-            for f in pg.variants[v].fields { append(mut &fs, f) }
+            for f in pg.variants[v].fields { append(mut &fs, f.clone()) }
         }
     }
     for f in fs {
@@ -1085,8 +1184,8 @@ fn (pg: mut &Program) makeTparams(d: int) {
         for s in seen {
             if s == tn.s { pg.err(m, tn.line, "type parameter " + tn.s + " is declared twice") }
         }
-        append(mut &seen, tn.s)
-        append(mut &pg.tparams, TParam{name: tn.s, line: tn.line, copy: pg.hasCopy(m, tn.a), cons: [],
+        append(mut &seen, tn.s.clone())
+        append(mut &pg.tparams, TParam{name: tn.s.clone(), line: tn.line, copy: pg.hasCopy(m, tn.a), cons: [],
             borrow: pg.hasBorrow(m, tn.a)})
         append(mut &pg.types[d].tparams, len(pg.tparams) - 1)
     }
@@ -1129,8 +1228,8 @@ fn (pg: mut &Program) resolveTypedecl(d: int) {
                 for s in names {
                     if s == f.s { pg.err(m, pg.types[d].line, "field " + f.s + " is declared twice") }
                 }
-                append(mut &names, f.s)
-                append(mut &pg.types[d].fields, Field{name: f.s, ty: pg.resolveType(f.a, m, &env, P_FIELD, 0),
+                append(mut &names, f.s.clone())
+                append(mut &pg.types[d].fields, Field{name: f.s.clone(), ty: pg.resolveType(f.a, m, &env, P_FIELD, 0),
                     isPub: f.flags & sx.PUB != 0})
             }
         }
@@ -1140,7 +1239,7 @@ fn (pg: mut &Program) resolveTypedecl(d: int) {
                 let vf = pg.nd(m, pg.variants[v].node).a
                 for i in 0..pg.count(m, vf) {
                     let f = pg.nd(m, pg.item(m, vf, i))
-                    append(mut &pg.variants[v].fields, Field{name: f.s, ty: pg.resolveType(f.a, m, &env, P_FIELD, 0),
+                    append(mut &pg.variants[v].fields, Field{name: f.s.clone(), ty: pg.resolveType(f.a, m, &env, P_FIELD, 0),
                         isPub: true})
                 }
             }
@@ -1155,7 +1254,7 @@ fn (pg: mut &Program) resolveTypedecl(d: int) {
                     append(mut &ps, pg.resolveType(pg.nd(m, pg.item(m, mb.a, j)).a, m, &senv, P_PARAM, 0))
                 }
                 let ret = if mb.b >= 0 { pg.resolveType(mb.b, m, &senv, P_RET, 0) } else { T_VOID }
-                append(mut &pg.types[d].members, Member{name: mb.s, mode: mb.c, params: ps, ret: ret, line: mb.line})
+                append(mut &pg.types[d].members, Member{name: mb.s.clone(), mode: mb.c, params: ps, ret: ret, line: mb.line})
             }
         }
     }
@@ -1196,7 +1295,7 @@ fn posWhat(pos: int): str {
 // or 0 (ref's '').
 fn (pg: &Program) typeWhere(m: int, a: int): int {
     var x = a
-    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE {
+    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE || pg.kind(m, x) == sx.N_TRC {
         x = pg.nd(m, x).a
     }
     let k = pg.kind(m, x)
@@ -1233,6 +1332,11 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
             return pg.mkSlice(pg.resolveType(n.a, m, env, P_ELEM, where), isMut)
         }
         sx.N_TARR { return pg.mkArr(pg.resolveType(n.a, m, env, P_ELEM, where)) }
+        sx.N_TRC {
+            if pg.rc < 0 { pg.err(m, pg.orWhere(where, m, a), "rc T needs std.Rc") }
+            let inner = pg.resolveType(n.a, m, env, P_TARG, where)
+            return pg.mkInst(pg.rc, &[inner])
+        }
         sx.N_TFN {
             if n.flags & sx.EXTERN != 0 {
                 pg.err(m, n.line, "an extern fn type can only be the type of a parameter of an extern function")
@@ -1308,7 +1412,7 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
 
 // A type argument t for type parameter p: a closure never, a borrow-class type only for `p: borrow`.
 pub fn (pg: mut &Program) checkBorrowTarg(t: int, p: int, m: int, line: int) {
-    let pn = pg.tparams[p].name
+    let pn = pg.tparams[p].name.clone()
     let k = pg.tk(t)
     if k == TK_CLO {
         pg.err(m, line, "a borrow type (" + pg.tstr(t) + ") cannot be a type argument (type parameter " +
@@ -1335,14 +1439,16 @@ pub fn (pg: mut &Program) checkTargs(targs: &[]int, tparams: &[]int, m: int, lin
     for i in 0..n {
         let p = tparams[i]
         let t = targs[i]
-        let pn = pg.tparams[p].name
+        let pn = pg.tparams[p].name.clone()
         if t == T_VOID || t == T_NEVER {     // SPEC 6.1: written or inferred (from a function's result)
             let what = if t == T_NEVER { "never" } else { "inferred as no result (nothing)" }
             pg.err(m, line, "type parameter " + pn + " cannot be " + what + ": never and no result are not " +
                 "types, so they cannot be type arguments")
         }
         pg.checkBorrowTarg(t, p, m, line)
-        if pg.tparams[p].copy && !pg.isCopy(t) {
+        if pg.tparams[p].copy && !pg.isCopy(t) && pg.soft(t) {
+            pg.note("tcopy", m, line, &pn)
+        } else if pg.tparams[p].copy && !pg.isCopy(t) {
             pg.err(m, line, pg.tstr(t) + " is not a copy type (type parameter " + pn + " needs copy)")
         }
         let cons = copyInts(&pg.tparams[p].cons)
@@ -1369,7 +1475,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
                     pg.err(m, pn.line, "blocking extern " + pg.fns[f].name + " cannot take the C function pointer " +
                         pn.s + ": C would call Lexell code on a helper thread")
                 }
-                append(mut &pg.fns[f].params, Param{name: pn.s, ty: pg.cfnType(m, pn.a, &pn), isVar: false, line: pn.line})
+                append(mut &pg.fns[f].params, Param{name: pn.s.clone(), ty: pg.cfnType(m, pn.a, &pn), isVar: false, line: pn.line})
                 continue
             }
             let t = pg.resolveType(pn.a, m, &env, P_PARAM, pn.line)
@@ -1391,7 +1497,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
                     " (a C function pointer is written extern fn(...))")
             }
             if !ok { pg.err(m, pn.line, "extern parameter " + pn.s + " cannot have type " + pg.tstr(t)) }
-            append(mut &pg.fns[f].params, Param{name: pn.s, ty: t, isVar: false, line: pn.line})
+            append(mut &pg.fns[f].params, Param{name: pn.s.clone(), ty: t, isVar: false, line: pn.line})
         }
         if pg.fns[f].varargs && len(pg.fns[f].params) == 0 {
             pg.err(m, a.line, "a C variadic function needs a parameter before ...")
@@ -1404,14 +1510,14 @@ fn (pg: mut &Program) resolveFn(f: int) {
             pg.fns[f].ret = r
             if pg.tk(r) != TK_PRIM { pg.err(m, a.line, "an extern function cannot return " + pg.tstr(r)) }
         }
-        let cname = a.u
+        let cname = a.u.clone()
         if cReserved(&cname) && !cHelper(&cname) {
             pg.err(m, a.line, "the C name " + cname + " is reserved: an extern cannot name main, rt_*, lxl_* " +
                 "or a name the compiler generates")
         }
         let other = pg.externs.getOr(&cname, -1)
         if other < 0 {
-            pg.externs.put(cname, f)
+            pg.externs.put(cname.clone(), f)
             append(mut &pg.externNames, cname)
         } else if !pg.sameSig(f, other) {
             pg.err(m, a.line, "extern " + pg.fns[f].name + " declares the C function " + cname +
@@ -1472,7 +1578,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
                 if !isTp && !(xn.kind == sx.N_TNAME && pg.count(m, xn.a) == 1 && pg.count(m, xn.b) == 0) {
                     pg.err(m, w, "the type arguments of a receiver must be type parameter names")
                 }
-                let nm = if isTp { xn.s } else { pg.nd(m, pg.item(m, xn.a, 0)).s }
+                let nm = if isTp { xn.s.clone() } else { pg.nd(m, pg.item(m, xn.a, 0)).s }
                 if pg.envLookup(&env, &nm) >= 0 { pg.err(m, xn.line, "type parameter " + nm + " is declared twice") }
                 let dp = pg.types[d].tparams[i]
                 append(mut &pg.tparams, TParam{name: nm, line: xn.line, copy: pg.tparams[dp].copy, cons: [],
@@ -1500,15 +1606,15 @@ fn (pg: mut &Program) resolveFn(f: int) {
             mode = RM_ASSOC
         }
         pg.fns[f].recvMode = mode
-        pg.fns[f].recvName = recv.s
-        let name = pg.fns[f].name
+        pg.fns[f].recvName = recv.s.clone()
+        let name = pg.fns[f].name.clone()
         if table < 0 {
             if pg.primMethods[prim].has(&name) { pg.err(m, a.line, "method " + pg.label(f) + " is declared twice") }
-            pg.primMethods[prim].put(name, f)
+            pg.primMethods[prim].put(name.clone(), f)
             append(mut &pg.primMethodNames[prim], name)
         } else {
             if pg.types[table].methods.has(&name) { pg.err(m, a.line, "method " + pg.label(f) + " is declared twice") }
-            pg.types[table].methods.put(name, f)
+            pg.types[table].methods.put(name.clone(), f)
             append(mut &pg.types[table].methodNames, name)
         }
     }
@@ -1516,7 +1622,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
     for i in 0..pg.count(m, a.b) {
         let tn = pg.nd(m, pg.item(m, a.b, i))
         if pg.envLookup(&env, &tn.s) >= 0 { pg.err(m, tn.line, "type parameter " + tn.s + " is declared twice") }
-        append(mut &pg.tparams, TParam{name: tn.s, line: tn.line, copy: pg.hasCopy(m, tn.a), cons: [],
+        append(mut &pg.tparams, TParam{name: tn.s.clone(), line: tn.line, copy: pg.hasCopy(m, tn.a), cons: [],
             borrow: pg.hasBorrow(m, tn.a)})
         append(mut &env, len(pg.tparams) - 1)
     }
@@ -1531,22 +1637,22 @@ fn (pg: mut &Program) resolveFn(f: int) {
     if rvar && mode != RM_VAL { pg.err(m, a.line, "var receiver " + pg.fns[f].recvName + " cannot be a borrow") }
     if mode == RM_VAL || mode == RM_REF || mode == RM_MUT {
         let rt = if mode == RM_VAL { pg.fns[f].recvType } else { pg.mkRef(pg.fns[f].recvType, mode == RM_MUT) }
-        append(mut &pg.fns[f].params, Param{name: pg.fns[f].recvName, ty: rt, isVar: rvar, line: a.line})
-        append(mut &names, pg.fns[f].recvName)
+        append(mut &pg.fns[f].params, Param{name: pg.fns[f].recvName.clone(), ty: rt, isVar: rvar, line: a.line})
+        append(mut &names, pg.fns[f].recvName.clone())
     }
     for i in 0..pg.count(m, a.c) {
         let pn = pg.nd(m, pg.item(m, a.c, i))
         for s in names {
             if s == pn.s { pg.err(m, pn.line, "parameter " + pn.s + " is declared twice") }
         }
-        append(mut &names, pn.s)
+        append(mut &names, pn.s.clone())
         let t = pg.resolveType(pn.a, m, &env, P_PARAM, pn.line)
         let isVar = pn.flags & sx.VAR != 0
         let k = pg.tk(t)
         if isVar && (k == TK_REF || k == TK_SLICE || k == TK_CLO) {
             pg.err(m, pn.line, "var parameter " + pn.s + " cannot be a borrow or a closure")
         }
-        append(mut &pg.fns[f].params, Param{name: pn.s, ty: t, isVar: isVar, line: pn.line})
+        append(mut &pg.fns[f].params, Param{name: pn.s.clone(), ty: t, isVar: isVar, line: pn.line})
     }
     if a.d >= 0 { pg.fns[f].ret = pg.resolveType(a.d, m, &env, P_RET, 0) }
     if pg.fns[f].name == "drop" && pg.fns[f].ownerKind != O_NONE {
@@ -1576,7 +1682,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
             if pg.isBorrowClass(pg.fns[f].params[i].ty) { append(mut &pg.fns[f].bsrc, i) }
         }
         // none: every borrow it returns is static (a string literal or constant; SPEC 10 rule 5)
-        if len(pg.fns[f].bsrc) > 0 { pg.fns[f].bparam = pg.fns[f].params[pg.fns[f].bsrc[0]].name }
+        if len(pg.fns[f].bsrc) > 0 { pg.fns[f].bparam = pg.fns[f].params[pg.fns[f].bsrc[0]].name.clone() }
     }
     if pg.isBorrow(ret) {
         var count = 0
@@ -1596,7 +1702,7 @@ fn (pg: mut &Program) resolveFn(f: int) {
             if pg.tm(ret) && !pg.tm(pg.fns[f].params[first].ty) {
                 pg.err(m, a.line, pg.label(f) + " returns a mut borrow, so its borrowed parameter must " + "be mut &")
             }
-            pg.fns[f].bparam = pg.fns[f].params[first].name
+            pg.fns[f].bparam = pg.fns[f].params[first].name.clone()
             append(mut &pg.fns[f].bsrc, first)
         }
     }
@@ -1676,11 +1782,23 @@ fn (pg: mut &Program) resolveGlobal(g: int) {
         pg.err(m, a.line, "global " + pg.globals[g].name + " cannot have the type " + pg.tstr(t) +
             ": it holds borrows, which are second class")
     }
-    if !pg.isCopy(t) && !pg.globals[g].isOnce {
+    // SPEC 5.2 (design/owned-str.md, issue 8): a global var of an owned type is allowed, with
+    // value-only access (check: no borrow of it outlives a built-in operation; g.clone() reads it).
+    // An array global keeps the constant-table form, so it must be set-once or owned by main.
+    if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_ARR && pg.soft(t) {
+        let gname = pg.globals[g].name.clone()
+        pg.note("gvar", m, a.line, &gname)
+    } else if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_ARR {
         let ts = pg.tstr(t)
-        let gn = pg.globals[g].name
-        pg.err(m, a.line, "global " + gn + " has the owned type " + ts + "; globals must have " +
-            "copy types (or be set-once: var " + gn + ": once " + ts + ")")
+        let gn: &str = &pg.globals[g].name
+        pg.err(m, a.line, "global " + gn + " has the array type " + ts + "; an array global must be " +
+            "set-once (var " + gn + ": once " + ts + ") or owned by main")
+    }
+    if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_INST && !pg.types[pg.ta(t)].value {
+        let gn: &str = &pg.globals[g].name
+        let ts = pg.tstr(t)
+        pg.err(m, a.line, "global " + gn + " has the boxed type " + ts + ", which has no constant initializer; " +
+            "make it set-once (var " + gn + ": once " + ts + ") or a value type")
     }
 }
 
@@ -1702,7 +1820,7 @@ fn cFloat(ty: int, x: float): CVal {
 
 fn cText(ty: int, kind: int, s: &str): CVal {
     var v = cv(ty, kind)
-    v.s = s
+    v.s = s.clone()
     return v
 }
 
@@ -1717,7 +1835,7 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
     if !pg.consts[c].done {
         let m = pg.consts[c].mod
         let line = pg.consts[c].line
-        let name = pg.consts[c].name
+        let name = pg.consts[c].name.clone()
         if pg.consts[c].busy { pg.err(m, line, "constant " + name + " refers to itself") }
         pg.consts[c].busy = true
         let a = pg.nd(m, pg.consts[c].node)
@@ -1727,12 +1845,14 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
         }
         if t >= 0 && (pg.tk(t) == TK_ARR || pg.tk(t) == TK_INST) {     // a constant table, or a record/variant constant
             let et = if pg.tk(t) == TK_ARR { pg.ta(t) } else { t }
-            if !pg.isCopy(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
+            // a constant is static data: a str (or a value built of strings) reads as a view, or as
+            // a new owned value where one is expected, as a literal does (design/owned-str.md)
+            if !pg.isCopyLegacy(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
             pg.consts[c].table = t
             pg.consts[c].value = cv(t, CK_TABLE)
             pg.consts[c].busy = false
             pg.consts[c].done = true
-            return pg.consts[c].value
+            return pg.consts[c].value.clone()
         }
         let ek = pg.kind(m, a.b)
         if t < 0 && (ek == sx.N_ARRLIT || ek == sx.N_LIT) {
@@ -1750,7 +1870,7 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
         pg.consts[c].busy = false
         pg.consts[c].done = true
     }
-    return pg.consts[c].value
+    return pg.consts[c].value.clone()
 }
 
 // The range of an integer type (ty -1: an untyped integer, 128 bits).
@@ -1772,9 +1892,9 @@ pub fn inRange(x: num.Big, ty: int): bool { return num.bigCmp(rangeLo(ty), x) <=
 pub fn (pg: &Program) cfit(v: CVal, m: int, line: int): CVal {
     match v.kind {
         CK_INT {
-            if !inRange(v.i, v.ty) {
+            if !inRange(v.i.clone(), v.ty) {
                 let what = if v.ty >= 0 { pg.tstr(v.ty) } else { "an integer" }
-                pg.err(m, line, "constant " + num.bigStr(v.i) + " does not fit " + what + " (overflow)")
+                pg.err(m, line, "constant " + num.bigStr(v.i.clone()) + " does not fit " + what + " (overflow)")
             }
         }
         CK_FLOAT {
@@ -1787,8 +1907,8 @@ pub fn (pg: &Program) cfit(v: CVal, m: int, line: int): CVal {
 }
 
 // A folded int or fractional value as a float (Python's float(x)).
-fn toFloat(v: CVal): float {
-    return match v.kind { CK_INT { num.bigToFloat(v.i) } CK_FRAC { num.floatOfText(&v.s) } else { v.f } }
+fn toFloat(v: &CVal): float {
+    return match v.kind { CK_INT { num.bigToFloat(v.i.clone()) } CK_FRAC { num.floatOfText(&v.s) } else { v.f } }
 }
 
 // ref's cto: a folded value as the type t (an untyped literal or constant takes the type).
@@ -1797,8 +1917,8 @@ pub fn (pg: &Program) cto(v: CVal, t: int, m: int, line: int): CVal {
     if v.ty < 0 && t == T_FLOAT && v.kind == CK_INT {
         return pg.cfit(cFloat(T_FLOAT, toFloat(v)), m, line)
     }
-    if v.ty < 0 && pg.isInt(t) && v.kind == CK_INT { return pg.cfit(cInt(t, v.i), m, line) }
-    let what = if v.ty >= 0 { pg.tstr(v.ty) } else { CK_NAMES[v.kind] }
+    if v.ty < 0 && pg.isInt(t) && v.kind == CK_INT { return pg.cfit(cInt(t, v.i.clone()), m, line) }
+    let what = if v.ty >= 0 { pg.tstr(v.ty) } else { CK_NAMES[v.kind].clone() }
     pg.err(m, line, "a " + what + " constant cannot be " + pg.tstr(t))
 }
 
@@ -1810,7 +1930,7 @@ pub fn (pg: &Program) constAs(v: CVal, t: int, m: int, line: int): CVal {
 
 fn isCmp(op: &str): bool { return op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" }
 
-fn cmpResult(op: str, c: int): bool {
+fn cmpResult(op: &str, c: int): bool {
     return match op { "==" { c == 0 } "!=" { c != 0 } "<" { c < 0 } "<=" { c <= 0 } ">" { c > 0 } else { c >= 0 } }
 }
 
@@ -1874,12 +1994,12 @@ pub fn (pg: mut &Program) fold(e: int, m: int, t0: int): CVal {
             }
             if n.s == "~" && v.kind == CK_INT {
                 v.i = if v.ty >= 0 && isUnsigned(v.ty) {
-                    num.bigXor(v.i, num.bigSub(num.bigPow2(BITS[v.ty]), num.bigOf(1)))
-                } else { num.bigNot(v.i) }
+                    num.bigXor(v.i.clone(), num.bigSub(num.bigPow2(BITS[v.ty]), num.bigOf(1)))
+                } else { num.bigNot(v.i.clone()) }
                 return v
             }
             if n.s == "-" && v.kind == CK_INT {
-                v.i = num.bigNeg(v.i)
+                v.i = num.bigNeg(v.i.clone())
                 return pg.cfit(v, m, w)
             }
             if n.s == "-" && v.kind == CK_FLOAT {
@@ -1897,8 +2017,8 @@ pub fn (pg: mut &Program) fold(e: int, m: int, t0: int): CVal {
     pg.err(m, w, "not a constant expression")
 }
 
-fn (pg: mut &Program) foldBin(n: sx.Node, m: int, t: int): CVal {
-    let op = n.s
+fn (pg: mut &Program) foldBin(n: &sx.Node, m: int, t: int): CVal {
+    let op = n.s.clone()
     let w = n.line
     let shift = op == "<<" || op == ">>"
     let sub = if isCmp(&op) || op == "&&" || op == "||" { -1 } else { t }
@@ -1908,11 +2028,11 @@ fn (pg: mut &Program) foldBin(n: sx.Node, m: int, t: int): CVal {
         if a.kind != CK_INT || b.kind != CK_INT { pg.err(m, w, op + " needs integer constants") }
         let width = if a.ty >= 0 { BITS[a.ty] } else { 128 }
         if num.bigCmp(b.i, num.bigOf(0)) < 0 || num.bigCmp(b.i, num.bigOf(width)) >= 0 {
-            pg.err(m, w, "shift count " + num.bigStr(b.i) + " out of range in a constant")
+            pg.err(m, w, "shift count " + num.bigStr(b.i.clone()) + " out of range in a constant")
         }
         let count = num.bigToInt(b.i)
-        if op == ">>" { return cInt(a.ty, num.bigShr(a.i, count)) }
-        let r = num.bigShl(a.i, count)
+        if op == ">>" { return cInt(a.ty, num.bigShr(a.i.clone(), count)) }
+        let r = num.bigShl(a.i.clone(), count)
         return pg.cfit(cInt(a.ty, if a.ty >= 0 { wrapTo(r, a.ty) } else { r }), m, w)
     }
     if a.ty < 0 && b.ty >= 0 {
@@ -1938,16 +2058,16 @@ fn (pg: mut &Program) foldBin(n: sx.Node, m: int, t: int): CVal {
     }
     let arith = op == "+" || op == "-" || op == "*"
     if kind == CK_INT {
-        let x = a.i
-        let y = b.i
+        let x = a.i.clone()
+        let y = b.i.clone()
         if arith {
             let r = match op { "-" { num.bigSub(x, y) } "*" { num.bigMul(x, y) } else { num.bigAdd(x, y) } }
             return pg.cfit(cInt(ty, r), m, w)
         }
         if op == "/" || op == "%" {
-            let qr = num.magDivMod(x, y)
-            let q = if x.neg != y.neg { num.bigNeg(qr.q) } else { qr.q }
-            if ty >= 0 && !inRange(q, ty) {     // MIN / -1 and MIN % -1
+            let qr = num.magDivMod(x.clone(), y)
+            let q = if x.neg != y.neg { num.bigNeg(qr.q.clone()) } else { qr.q.clone() }
+            if ty >= 0 && !inRange(q.clone(), ty) {     // MIN / -1 and MIN % -1
                 pg.err(m, w, num.bigStr(x) + " " + op + " " + num.bigStr(y) + " overflows " + pg.tstr(ty) +
                     " in a constant")
             }
@@ -1987,7 +2107,7 @@ fn (pg: &Program) methodsOf(t: int): int {
 }
 
 // The method name of type t, or -1 (ref's methods_of(t).get(name)).
-pub fn (pg: &Program) methodOf(t: int, name: str): int {
+pub fn (pg: &Program) methodOf(t: int, name: &str): int {
     let tab = pg.methodsOf(t)
     if tab == -1 { return -1 }
     if tab < -1 { return pg.primMethods[-2 - tab].getOr(&name, -1) }
@@ -2038,11 +2158,12 @@ fn sameInts(a: &[]int, b: &[]int): bool {
 // con (seen from module m), otherwise the reason.
 pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
     let iface = pg.ta(con)
+    if pg.builtinClone(t, iface) { return "" }
     var env = pg.declEnv(con)
     append(mut &env, -1)
     append(mut &env, t)
     for j in 0..len(pg.types[iface].members) {
-        let mname = pg.types[iface].members[j].name
+        let mname = pg.types[iface].members[j].name.clone()
         var want: []int = []
         for i in 0..len(pg.types[iface].members[j].params) {
             append(mut &want, pg.subst(pg.types[iface].members[j].params[i], &env))
@@ -2078,7 +2199,7 @@ pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
                         for c0 in cons {
                             if len(pg.satisfies(bt, pg.subst(c0, &bind), m)) > 0 { replace(mut &cands, []) }
                         }
-                        if pg.tparams[tp].copy && !pg.isCopy(bt) { replace(mut &cands, []) }
+                        if pg.tparams[tp].copy && !pg.isCopy(bt) && !pg.soft(bt) { replace(mut &cands, []) }
                     }
                 }
             }
@@ -2086,7 +2207,12 @@ pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
         if len(cands) == 0 { return "it has no method '" + mname + "'" }
         var ok = false
         for c in cands {
-            let modeOk = c.mode == wantMode || (wantMode == RM_REF && c.mode == RM_VAL && pg.isCopy(t))
+            var modeOk = c.mode == wantMode || (wantMode == RM_REF && c.mode == RM_VAL && pg.isCopy(t))
+            if !modeOk && wantMode == RM_REF && c.mode == RM_VAL && pg.soft(t) {
+                let what = pg.tstr(t) + "." + mname
+                pg.note("recv", m, 0, &what)
+                modeOk = true
+            }
             if modeOk && sameInts(&c.params, &want) && c.ret == wantR { ok = true }
         }
         if !ok {

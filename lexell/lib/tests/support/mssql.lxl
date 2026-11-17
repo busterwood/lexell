@@ -283,7 +283,7 @@ fn wide(s: str, what: str): Result[[]byte, Error] {
 pub type Diag = value record { pub state: str; pub native: int; pub msg: str }
 
 // "42S02 208: [Microsoft]...Invalid object name 'nope'."
-pub fn (d: Diag) toStr(): str { return d.state + " " + d.native.toStr() + ": " + d.msg }
+pub fn (d: &Diag) toStr(): str { return d.state + " " + d.native.toStr() + ": " + d.msg }
 
 // The diagnostic records of a handle (SQLGetDiagRecW), in order.
 fn diags(t: int, h: ptr): []Diag {
@@ -316,9 +316,9 @@ fn diags(t: int, h: ptr): []Diag {
 // `what` and the SQLRETURN r.
 pub fn errorOf(ds: &[Diag], r: int, what: str): Error {
     for d in ds {
-        if !strings.startsWith(&d.state, "01") { return Error{code: d.native, state: d.state, msg: d.msg} }
+        if !strings.startsWith(&d.state, "01") { return Error{code: d.native, state: d.state.clone(), msg: d.msg.clone()} }
     }
-    if len(ds) > 0 { return Error{code: ds[0].native, state: ds[0].state, msg: ds[0].msg} }
+    if len(ds) > 0 { return Error{code: ds[0].native, state: ds[0].state.clone(), msg: ds[0].msg.clone()} }
     return sqldialect.dbError(r, &(what + " failed (SQLRETURN " + r.toStr() + ") without a diagnostic record"))
 }
 
@@ -415,7 +415,7 @@ fn (c: &Conn) dbc(): ptr {
 // 'master'.", ...).
 pub fn (c: &Conn) diagnostics(): []Diag {
     var out: []Diag = []
-    c.st.with(fn(s) { for d in s.info { append(mut &out, d) } })
+    c.st.with(fn(s) { for d in s.info { append(mut &out, d.clone()) } })
     return out
 }
 
@@ -427,7 +427,7 @@ fn (c: &Conn) newStmt(): Result[Stmt, Error] {
     if !ok(r) { return Err(fail(H_DBC, dbc, r, "statement allocation")) }
     c.st.with(fn(s) { append(mut &s.stmts, h) })
     OPEN += 1
-    return Ok(Stmt{h: h, conn: c.st, binds: [], cols: [], cells: [], next: 0, row: false, affected: -1, info: [],
+    return Ok(Stmt{h: h, conn: c.st.share(), binds: [], cols: [], cells: [], next: 0, row: false, affected: -1, info: [],
                    buf: array(8192, byte(0)), maxValue: MAX_VALUE})
 }
 
@@ -460,7 +460,7 @@ pub fn (c: &Conn) query(sql: str, args: &[Value]): Result[Stmt, Error] {
 
 // Runs a fragment with `?` placeholders and its arguments.
 pub fn (c: &Conn) querySql(q: &Sql): Result[Stmt, Error] {
-    return c.query(&(q.render(sqldialect.Dialect.SqlServerOdbc)), q.args())
+    return c.query(q.render(sqldialect.Dialect.SqlServerOdbc), q.args())
 }
 
 // Runs one statement with args; the number of rows it changed (-1 when the
@@ -520,7 +520,7 @@ pub type Param = value record {
 // NaN or infinite float (SQL Server has none), E_DEC_RANGE for a decimal
 // that needs more than 38 digits.
 pub fn paramOf(v: Value): Result[Param, Error] {
-    match v {
+    match move(v) {
         Value.Null { return Ok(Param{cType: C_WCHAR, sqlType: SQL_WVARCHAR, size: 1, digits: 0, data: "", null: true}) }
         Value.Int(n) { return Ok(Param{cType: C_SBIGINT, sqlType: SQL_BIGINT, size: 19, digits: 0, data: le8(n), null: false}) }
         Value.Bool(b) {
@@ -543,9 +543,9 @@ pub fn paramOf(v: Value): Result[Param, Error] {
         }
         Value.Dec(d) {
             let t = try sqldialect.decimalText(d, 38)
-            let body = if len(t) > 0 && t[0] == '-' { t[1..] } else { t }
+            let body = if len(t) > 0 && t[0] == '-' { t[1..] } else { t.clone() }
             let dot = strings.indexOf(&body, ".", 0)
-            let ip = if dot < 0 { body } else { body[..dot] }
+            let ip = if dot < 0 { body.clone() } else { body[..dot] }
             let s = if dot < 0 { 0 } else { len(body) - dot - 1 }
             var lead = 0
             while lead < len(ip) && ip[lead] == '0' { lead += 1 }
@@ -645,7 +645,7 @@ fn (s: &Stmt) fail(r: int, what: str): Error { return fail(H_STMT, s.h, r, what)
 // less, warnings) of the last execute or nextResult and the steps after it.
 pub fn (s: &Stmt) diagnostics(): []Diag {
     var out: []Diag = []
-    for d in s.info { append(mut &out, d) }
+    for d in s.info { append(mut &out, d.clone()) }
     return out
 }
 
@@ -694,7 +694,7 @@ pub fn (s: mut &Stmt) bindDecimal(i: int, d: Decimal, p: int, sc: int): Result[U
 pub fn (s: mut &Stmt) bindParam(i: int, p: Param): Result[Unit, Error] {
     try s.live()
     if i < 1 || i > MAX_PARAMS { return Err(sqldialect.inputError(&("parameter " + i.toStr() + " out of range"))) }
-    var data = p.data
+    var data = p.data.clone()
     if p.cType == C_WCHAR { data = data + "\x00\x00" } else if p.cType == C_CHAR { data = data + "\x00" }
     let b = Bound{value: ffi.copyBytes(&data), ind: ffi.copyBytes(&(le8(if p.null { SQL_NULL_DATA } else { len(p.data) })))}
     let r = rc(SQLBindParameter(s.h, i32(i), i32(PARAM_INPUT), i32(p.cType), i32(p.sqlType), p.size, i32(p.digits),
@@ -711,7 +711,7 @@ pub fn (s: mut &Stmt) bindAll(args: &[Value]): Result[Unit, Error] {
     if len(args) != n {
         return Err(sqldialect.inputError(&(len(args).toStr() + " arguments for " + n.toStr() + " parameters")))
     }
-    for i in 0..len(args) { try s.bind(i + 1, args[i]) }
+    for i in 0..len(args) { try s.bind(i + 1, args[i].clone()) }
     return Ok(Unit{})
 }
 
@@ -798,7 +798,7 @@ pub fn (s: mut &Stmt) step(): Result[bool, Error] {
     let cc = task.onCancelCall(cancelStmt, s.h)   // cancelled or past the deadline: SQLCancel
     let r = rc(SQLFetch(s.h))
     if r == SQL_SUCCESS_WITH_INFO {
-        for d in diags(H_STMT, s.h) { append(mut &s.info, d) }
+        for d in diags(H_STMT, s.h) { append(mut &s.info, d.clone()) }
     }
     if r == SQL_NO_DATA { return Ok(false) }
     if !ok(r) { return Err(s.fail(r, "fetch")) }
@@ -839,10 +839,10 @@ fn (s: &Stmt) col(col: int): Result[Col, Error] {
     if col < 0 || col >= len(s.cols) {
         return Err(sqldialect.inputError(&("column " + col.toStr() + " out of range (" + len(s.cols).toStr() + " columns)")))
     }
-    return Ok(s.cols[col])
+    return Ok(s.cols[col].clone())
 }
 
-pub fn (s: &Stmt) columnName(col: int): Result[str, Error] { return Ok((try s.col(col)).name) }
+pub fn (s: &Stmt) columnName(col: int): Result[str, Error] { return Ok((try s.col(col)).name.clone()) }
 
 // The column's SQL type (SQL_INTEGER, SQL_WVARCHAR, ...).
 pub fn (s: &Stmt) columnType(col: int): Result[int, Error] { return Ok((try s.col(col)).sqlType) }
@@ -883,8 +883,8 @@ fn (s: mut &Stmt) cell(col: int): Result[Cell, Error] {
         s.next += 1
     }
     match s.cells[col] {
-        Cell.Failed(e) { return Err(e) }
-        else { return Ok(s.cells[col]) }
+        Cell.Failed(e) { return Err(e.clone()) }
+        else { return Ok(s.cells[col].clone()) }
     }
 }
 
@@ -997,7 +997,7 @@ pub fn (s: mut &Stmt) float(col: int): Result[float, Error] {
 // not .5000), an integer's or float's digits. E_TYPE for a binary column.
 pub fn (s: mut &Stmt) text(col: int): Result[str, Error] {
     let c = try s.cell(col)
-    match c {
+    match move(c) {
         Cell.Text(t) { return Ok(if s.cols[col].kind == K_DEC { leadingZero(t) } else { t }) }
         Cell.Int(n) { return Ok(n.toStr()) }
         Cell.Float(f) { return Ok(f.toStr()) }
@@ -1028,7 +1028,7 @@ fn leadingZero(t: str): str {
 // or an integer (scale 0). E_INEXACT for float and real, E_TYPE otherwise.
 pub fn (s: mut &Stmt) decimal(col: int): Result[Decimal, Error] {
     let c = try s.cell(col)
-    match c {
+    match move(c) {
         Cell.Null { return Err(nullError(col)) }
         Cell.Int(n) { return Ok(decimalOf(n)) }
         Cell.Float(_) { return Err(inexact(col)) }
@@ -1051,7 +1051,7 @@ pub fn (s: mut &Stmt) decimalOrNull(col: int): Result[Option[Decimal], Error] {
 pub fn (s: mut &Stmt) value(col: int): Result[Value, Error] {
     let c = try s.cell(col)
     let kind = s.cols[col].kind
-    match c {
+    match move(c) {
         Cell.Null { return Ok(Value.Null) }
         Cell.Int(n) { return Ok(if s.cols[col].sqlType == SQL_BIT { Value.Bool(n == 1) } else { Value.Int(n) }) }
         Cell.Float(f) { return Ok(Value.Float(f)) }

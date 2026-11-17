@@ -96,10 +96,10 @@ fn prelogin(encryption: int): str {
     return b.str()
 }
 
-fn le16(s: str, at: int): int { return int(s[at]) | (int(s[at + 1]) << 8) }
+fn le16(s: &str, at: int): int { return int(s[at]) | (int(s[at + 1]) << 8) }
 
 // A LOGIN7 field's text.
-fn field(s: str, at: int): str {
+fn field(s: &str, at: int): str {
     let off = le16(s, at)
     return tds.fromUtf16(s[off..off + 2 * le16(s, at + 2)]).unwrap()
 }
@@ -112,7 +112,7 @@ fn done(status: int, count: int): str {
 
 // An sp_executesql RPC's @stmt and @params (both nvarchar(4000)).
 fn rpcText(m: &Msg): str {
-    let d = m.data
+    let d = &m.data
     let at = le16(d, 0)                                 // past ALL_HEADERS
     var i = at + 6                                      // 0xFFFF, the proc id, the option flags
     var out = "rpc type " + m.ptype.toStr() + " proc " + le16(d, at + 2).toStr()
@@ -241,7 +241,7 @@ fn serve(ln: net.Listener): str {
     let m6 = c.message().unwrap()
     c.send(tds.PT_REPLY, prelogin(tds.ENCRYPT_NOT_SUP), 4096)
     let l6 = c.message().unwrap()
-    let ld = l6.data
+    let ld = &l6.data
     let pw = ld[le16(ld, 44)..le16(ld, 44) + 2 * le16(ld, 46)]
     append(mut &log, "login7 type " + l6.ptype.toStr() + " user " + field(ld, 40) + " db " + field(ld, 68) + " app " +
            field(ld, 48) + " password scrambled " + (pw == strFromBytes(&tds.scramble(&tds.toUtf16("p").unwrap()))).toStr())
@@ -277,18 +277,18 @@ fn serve(ln: net.Listener): str {
     // a transaction: begin, a batch with its descriptor, commit
     let desc = "\x11\x22\x33\x44\x00\x00\x00\x01"
     let t1 = c.message().unwrap()
-    append(mut &log, "begin type " + t1.ptype.toStr() + " request " + le16(t1.data, 22).toStr())
-    c.send(tds.PT_REPLY, txnEnv(8, desc) + done(0, 0), 512)
+    append(mut &log, "begin type " + t1.ptype.toStr() + " request " + le16(&t1.data, 22).toStr())
+    c.send(tds.PT_REPLY, txnEnv(8, desc.clone()) + done(0, 0), 512)
     let t2 = c.message().unwrap()
     append(mut &log, "batch in transaction " + (t2.data[10..18] == desc).toStr())
     c.send(tds.PT_REPLY, done(0x10, 1), 512)
     let t3 = c.message().unwrap()
-    append(mut &log, "commit request " + le16(t3.data, 22).toStr() + " with descriptor " + (t3.data[10..18] == desc).toStr())
-    c.send(tds.PT_REPLY, txnEnv(9, desc) + done(0, 0), 512)
+    append(mut &log, "commit request " + le16(&t3.data, 22).toStr() + " with descriptor " + (t3.data[10..18] == desc).toStr())
+    c.send(tds.PT_REPLY, txnEnv(9, desc.clone()) + done(0, 0), 512)
     // a transaction whose batch fails: two errors, then a rollback
     let u1 = c.message().unwrap()
-    append(mut &log, "begin type " + u1.ptype.toStr() + " request " + le16(u1.data, 22).toStr())
-    c.send(tds.PT_REPLY, txnEnv(8, desc) + done(0, 0), 512)
+    append(mut &log, "begin type " + u1.ptype.toStr() + " request " + le16(&u1.data, 22).toStr())
+    c.send(tds.PT_REPLY, txnEnv(8, desc.clone()) + done(0, 0), 512)
     let u2 = c.message().unwrap()
     var ue = tt.bytesOf()
     ue.message(tds.TK_ERROR, 2627, 1, 14, "Violation of PRIMARY KEY constraint.", 1)
@@ -296,7 +296,7 @@ fn serve(ln: net.Listener): str {
     ue.raw(done(0x02, 0))
     c.send(tds.PT_REPLY, ue.str(), 512)
     let u3 = c.message().unwrap()
-    append(mut &log, "rollback request " + le16(u3.data, 22).toStr() + " with descriptor " + (u3.data[10..18] == desc).toStr())
+    append(mut &log, "rollback request " + le16(&u3.data, 22).toStr() + " with descriptor " + (u3.data[10..18] == desc).toStr())
     var rb = tt.bytesOf()
     rb.message(tds.TK_INFO, 0, 1, 0, "rolled back", 1)
     c.send(tds.PT_REPLY, rb.str() + txnEnv(10, desc) + done(0, 0), 512)
@@ -315,7 +315,7 @@ fn code[T](r: Result[T, sqlserver.Error]): str {
 }
 
 fn connStr(extra: str): str {
-    let addr = ADDR
+    let addr = ADDR.clone()
     return "Server=tcp:" + strings.replaceAll(&addr, ":", ",") + ";UID=u;PWD=p;Database=app;" + extra
 }
 
@@ -370,7 +370,7 @@ fn main() {
         let tf = c.transaction(fn(k: mut &sqlserver.Conn): Result[int, sqlserver.Error] {
             return k.run("INSERT", &[])
         })
-        match tf {
+        match move(tf) {
             Ok(_) { println("failed transaction: ok") }
             Err(e) {
                 println("failed transaction: " + e.toStr() + " | errors " + len(c.errors()).toStr() + " | in transaction " +

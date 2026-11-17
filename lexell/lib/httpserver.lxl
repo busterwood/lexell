@@ -25,7 +25,7 @@
 // writing half), and reuses both for every request on the connection. A
 // handler and its middleware run in that task, under the route's deadline
 // (task.within), and are cancelled when the client hangs up. The router
-// and the middleware live in a task.Frozen, read by every connection's task
+// and the middleware live in an rc, read by every connection's task
 // at once.
 //
 // Strict by default (design/http-server.md section 3): anything two
@@ -87,14 +87,14 @@ pub type Error = value record {
     pub msg: str
 }
 
-pub fn (e: Error) toStr(): str { return intToStr(e.status) + " " + e.kind.toStr() + ": " + e.msg }
+pub fn (e: &Error) toStr(): str { return intToStr(e.status) + " " + e.kind.toStr() + ": " + e.msg }
 
 // An Error with status; its kind is Client for 4xx and Server otherwise.
 pub fn error(status: int, msg: &str): Error {
-    return Error{status: status, kind: if status >= 400 && status < 500 { ErrorKind.Client } else { ErrorKind.Server }, msg: msg}
+    return Error{status: status, kind: if status >= 400 && status < 500 { ErrorKind.Client } else { ErrorKind.Server }, msg: msg.clone()}
 }
 
-fn errOf(status: int, k: ErrorKind, msg: &str): Error { return Error{status: status, kind: k, msg: msg} }
+fn errOf(status: int, k: ErrorKind, msg: &str): Error { return Error{status: status, kind: k, msg: msg.clone()} }
 
 // Any error as an http Error with status (its text goes to msg):
 // `let c = try http.check(app.db.acquire(), 503)`.
@@ -350,7 +350,7 @@ pub fn (r: mut &Router[A]) handleWith(pattern: &str, h: Handler[A], o: RouteOpts
     match parsePattern(pattern) {
         Ok(p) {
             let Parsed{method: m, host: hs, segs: sg} = move(p)
-            append(mut &r.routes, Route[A]{pattern: pattern, method: m, host: hs, segs: sg, h: h, opts: o})
+            append(mut &r.routes, Route[A]{pattern: pattern.clone(), method: m, host: hs, segs: sg, h: h, opts: o})
         }
         Err(e) { append(mut &r.errs, "pattern \"" + pattern + "\": " + e) }
     }
@@ -361,7 +361,7 @@ pub fn (r: mut &Router[A]) handleWith(pattern: &str, h: Handler[A], o: RouteOpts
 pub fn (r: mut &Router[A]) use(m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: "", f: m}) }
 
 // Middleware for the requests whose path starts with prefix.
-pub fn (r: mut &Router[A]) useUnder(prefix: &str, m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: prefix, f: m}) }
+pub fn (r: mut &Router[A]) useUnder(prefix: &str, m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: prefix.clone(), f: m}) }
 
 type Parsed = record {
     method: str
@@ -380,7 +380,7 @@ fn isIdent(s: &str): bool {
 }
 
 fn parsePattern(p: &str): Result[Parsed, str] {
-    var rest: str = p
+    var rest: str = p.clone()
     var method = ""
     var i = 0
     while i < len(p) && p[i] != ' ' && p[i] != '\t' { i += 1 }
@@ -399,7 +399,7 @@ fn parsePattern(p: &str): Result[Parsed, str] {
     var names: []str = []
     let parts = strings.splitByte(path[1..], '/')
     for k in 0..len(parts) {
-        let s = parts[k]
+        let s = &parts[k]
         let last = k == len(parts) - 1
         if last && len(s) == 0 {
             append(mut &segs, Seg{kind: SEG_MULTI, s: ""})
@@ -414,12 +414,12 @@ fn parsePattern(p: &str): Result[Parsed, str] {
                 let name = inner[..len(inner) - 3]
                 if !isIdent(&name) { return Err("bad wildcard name \"" + name + "\"") }
                 if contains2(&names, &name) { return Err("duplicate wildcard name \"" + name + "\"") }
-                append(mut &names, name)
+                append(mut &names, name.clone())
                 append(mut &segs, Seg{kind: SEG_MULTI, s: name})
             } else {
                 if !isIdent(&inner) { return Err("bad wildcard name \"" + inner + "\"") }
                 if contains2(&names, &inner) { return Err("duplicate wildcard name \"" + inner + "\"") }
-                append(mut &names, inner)
+                append(mut &names, inner.clone())
                 append(mut &segs, Seg{kind: SEG_WILD, s: inner})
             }
         } else {
@@ -466,7 +466,7 @@ fn combine(r1: int, r2: int): int {
     return r2
 }
 
-fn compareSeg(a: Seg, b: Seg): int {
+fn compareSeg(a: &Seg, b: &Seg): int {
     if a.kind == SEG_MULTI && b.kind == SEG_MULTI { return REL_EQUIV }
     if a.kind == SEG_MULTI { return REL_GENERAL }
     if b.kind == SEG_MULTI { return REL_SPECIFIC }
@@ -485,7 +485,7 @@ fn comparePaths(a: &[]Seg, b: &[]Seg): int {
     var rel = REL_EQUIV
     var i = 0
     while i < len(a) && i < len(b) {
-        rel = combine(rel, compareSeg(a[i], b[i]))
+        rel = combine(rel, compareSeg(&a[i], &b[i]))
         if rel == REL_DISJOINT { return rel }
         i += 1
     }
@@ -514,7 +514,7 @@ fn compareRoutes[A](a: &Route[A], b: &Route[A]): int {
 // a host before those without); the errors and conflicts, if any.
 fn prepare[A](r: mut &Router[A]): []str {
     var errs: []str = []
-    for e in r.errs { append(mut &errs, e) }
+    for e in r.errs { append(mut &errs, e.clone()) }
     let n = len(r.routes)
     var gen: []int = array(n, 0)
     for i in 0..n {
@@ -558,13 +558,13 @@ fn matchSegs(segs: &[]Seg, path: &str, params: mut &[]Param): bool {
     let mark = len(params)
     var at = 1
     for k in 0..len(segs) {
-        let sg = segs[k]
+        let sg = &segs[k]
         if at > len(path) {
             truncate(params, mark)
             return false
         }
         if sg.kind == SEG_MULTI {
-            if len(sg.s) > 0 { append(params, Param{name: sg.s, value: path[at..]}) }
+            if len(sg.s) > 0 { append(params, Param{name: sg.s.clone(), value: path[at..]}) }
             return true
         }
         var e = at
@@ -584,7 +584,7 @@ fn matchSegs(segs: &[]Seg, path: &str, params: mut &[]Param): bool {
                 truncate(params, mark)
                 return false
             }
-            append(params, Param{name: sg.s, value: path[at..e]})
+            append(params, Param{name: sg.s.clone(), value: path[at..e]})
         }
         at = e + 1
     }
@@ -641,7 +641,7 @@ fn addMethod(ms: mut &[]str, m: &str) {
     for x in ms {
         if x == m { return }
     }
-    append(ms, m)
+    append(ms, m.clone())
     var k = len(ms) - 1
     while k > 0 && ms[k - 1] > ms[k] {
         swap(ms, k - 1, k)
@@ -675,9 +675,9 @@ fn slashMatch[A](r: &Router[A], i: int, method: &str, host: &str, path: &str): b
 
 // ---------------------------------------------------------------- the middleware chain
 
-// The rest of the chain, for a middleware to call (a copy value).
+// The rest of the chain, for a middleware to call (once: run consumes it).
 pub type Next[A] = value record {
-    site: task.Frozen[Router[A]]
+    site: rc Router[A]
     h: Handler[A]
     pos: int
 }
@@ -689,11 +689,8 @@ pub fn (n: Next[A]) run(app: &A, rq: mut &Request, w: mut &Response): Result[Uni
         return h(app, rq, w)
     }
     let idx = rq.chain[n.pos]
-    let m = n.site.read(fn(s: &Router[A]): Option[Middleware[A]] { return Some(s.mws[idx].f) })
-    match m {
-        Some(f) { return f(app, rq, w, Next[A]{site: n.site, h: n.h, pos: n.pos + 1}) }
-        None { return Err(error(500, "no middleware")) }
-    }
+    let f = n.site.mws[idx].f
+    return f(app, rq, w, Next[A]{site: n.site.share(), h: n.h, pos: n.pos + 1})
 }
 
 fn notFound[A](app: &A, rq: mut &Request, w: mut &Response): Result[Unit, Error] { return w.fail(404) }
@@ -733,8 +730,8 @@ type ConnError = value record {
     msg: str
 }
 
-fn (e: ConnError) toStr(): str { return e.msg }
-fn (e: ConnError) isTimeout(): bool { return e.timeout }
+fn (e: &ConnError) toStr(): str { return e.msg.clone() }
+fn (e: &ConnError) isTimeout(): bool { return e.timeout }
 
 fn ioConn(e: &io.IoError): ConnError { return ConnError{timeout: e.isTimeout(), msg: e.toStr()} }
 
@@ -868,7 +865,7 @@ pub type Request = record {
 // The value of the pattern's wildcard name ("" when there is none).
 pub fn (rq: &Request) param(name: &str): str {
     for p in rq.params {
-        if p.name == name { return p.value }
+        if p.name == name { return p.value.clone() }
     }
     return ""
 }
@@ -896,7 +893,7 @@ pub fn (rq: &Request) paramInt(name: &str): Result[int, Error] {
 // The first value of query parameter name (decoded: %XX and + for space),
 // or None. Parameters that do not decode are skipped.
 pub fn (rq: &Request) query(name: &str): Option[str] {
-    let q = rq.query
+    let q = &rq.query
     var i = 0
     while i < len(q) {
         var j = i
@@ -924,16 +921,16 @@ pub fn (rq: &Request) query(name: &str): Option[str] {
 pub fn (rq: &Request) header(name: &str): Option[str] { return rq.headers.get(name) }
 
 // The request target as sent ("/a%20b?x=1").
-pub fn (rq: &Request) rawTarget(): str { return rq.target }
+pub fn (rq: &Request) rawTarget(): str { return rq.target.clone() }
 
 // The query string as sent, without "?".
-pub fn (rq: &Request) rawQuery(): str { return rq.query }
+pub fn (rq: &Request) rawQuery(): str { return rq.query.clone() }
 
 // The trailers of a chunked body, once it has been read to its end.
 pub fn (rq: &Request) trailers(): &http.Headers { return &rq.trailers }
 
 // Adds a field to the request's access log line (escaped there).
-pub fn (rq: mut &Request) note(key: &str, value: &str) { append(mut &rq.notes, http.Header{name: key, value: value}) }
+pub fn (rq: mut &Request) note(key: &str, value: &str) { append(mut &rq.notes, http.Header{name: key.clone(), value: value.clone()}) }
 
 // The body bytes read so far.
 pub fn (rq: &Request) bodyRead(): int { return rq.got }
@@ -946,7 +943,7 @@ pub fn (rq: &Request) client(): str {
     if !rq.trusted { return ip }
     let xs = rq.headers.values("X-Forwarded-For")
     var proxies: []str = []
-    rq.st.with(fn(s: mut &State) { for p in s.proxies { append(mut &proxies, p) } })
+    rq.st.with(fn(s: mut &State) { for p in s.proxies { append(mut &proxies, p.clone()) } })
     var k = len(xs) - 1
     while k >= 0 {
         let parts = strings.splitByte(&xs[k], ',')
@@ -980,11 +977,11 @@ fn ipOf(addr: &str): str {
     if len(addr) > 0 && addr[0] == '[' {
         let e = strings.indexOf(addr, "]", 0)
         if e > 0 { return addr[1..e] }
-        return addr
+        return addr.clone()
     }
     let c = strings.lastIndexOf(addr, ":")
     if c > 0 { return addr[..c] }
-    return addr
+    return addr.clone()
 }
 
 fn trimOws(s: &str): str {
@@ -1172,7 +1169,7 @@ pub fn (rq: mut &Request) form(limit: int, at: Where): Result[Form, Error] {
 // part before the first ';', trimmed and lower-cased.
 fn mediaType(s: &str): str {
     let semi = strings.indexOf(s, ";", 0)
-    let head = if semi < 0 { s } else { s[..semi] }
+    let head: &str = if semi < 0 { s } else { s[..semi] }
     return strings.toLowerAscii(&(strings.trim(&head)))
 }
 
@@ -1235,7 +1232,7 @@ fn headerParams(s: &str): Result[HeaderParams, str] {
 
 fn paramOf(h: &HeaderParams, name: &str): Option[str] {
     for p in h.params {
-        if p.name == name { return Some(p.value) }
+        if p.name == name { return Some(p.value.clone()) }
     }
     return None
 }
@@ -1339,7 +1336,7 @@ fn parseMultipart(body: &str, boundary: &str, lim: Limits): Result[Form, Error] 
         }
         match filename {
             Some(fname) {
-                append(mut &files, File{field: name, filename: fname, headers: hs, data: strToBytes(data)})
+                append(mut &files, File{field: name, filename: fname.clone(), headers: hs, data: strToBytes(data)})
             }
             None {
                 if !strings.isValidUtf8(&data) { return Err(error(400, "a multipart field that is not UTF-8")) }
@@ -1613,7 +1610,7 @@ fn hexPair(s: &str, i: int): int {
 
 // A path segment percent-decoded once; None for a bad escape.
 fn decodeSeg(s: &str): Option[str] {
-    if strings.indexOf(s, "%", 0) < 0 { return Some(s) }
+    if strings.indexOf(s, "%", 0) < 0 { return Some(s.clone()) }
     var out: []byte = []
     var i = 0
     while i < len(s) {
@@ -1632,7 +1629,7 @@ fn decodeSeg(s: &str): Option[str] {
 
 // A query key or value decoded: %XX and + for a space; None for a bad escape.
 fn decodeQuery(s: &str): Option[str] {
-    if strings.indexOf(s, "%", 0) < 0 && strings.indexOf(s, "+", 0) < 0 { return Some(s) }
+    if strings.indexOf(s, "%", 0) < 0 && strings.indexOf(s, "+", 0) < 0 { return Some(s.clone()) }
     var out: []byte = []
     var i = 0
     while i < len(s) {
@@ -1655,7 +1652,7 @@ fn decodeQuery(s: &str): Option[str] {
 fn cleanPath(raw: &str): str {
     let pct = strings.indexOf(raw, "%", 0) >= 0
     let dot = strings.indexOf(raw, "/.", 0) >= 0
-    if !pct && !dot { return raw }
+    if !pct && !dot { return raw.clone() }
     var out: []byte = []
     var i = 0
     var segStart = 0       // in out
@@ -1733,17 +1730,17 @@ fn lowerAscii(s: &str): str {
     for i in 0..len(s) {
         if s[i] >= 'A' && s[i] <= 'Z' { any = true }
     }
-    if !any { return s }
+    if !any { return s.clone() }
     return strings.toLowerAscii(s)
 }
 
 fn hostName(h: &str): str {
     if len(h) > 0 && h[0] == '[' {
         let e = strings.indexOf(h, "]", 0)
-        return if e > 0 { h[..e + 1] } else { h }
+        return if e > 0 { h[..e + 1] } else { h.clone() }
     }
     let c = strings.indexOf(h, ":", 0)
-    return if c >= 0 { h[..c] } else { h }
+    return if c >= 0 { h[..c] } else { h.clone() }
 }
 
 fn eqName(a: &str, b: &str): bool { return len(a) == len(b) && http.equalFold(a, b) }
@@ -1773,8 +1770,8 @@ fn (rq: mut &Request) parseHead(head: &str): int {
     if major != 1 { return 505 }
     rq.minor = if version[7] == '0' { 0 } else { 1 }
     rq.proto = if rq.minor == 0 { "HTTP/1.0" } else { "HTTP/1.1" }
-    rq.method = method
-    rq.target = target
+    rq.method = method.clone()
+    rq.target = target.clone()
     // header lines
     var h = http.newHeaders()
     if e < len(head) {
@@ -1806,16 +1803,16 @@ fn (rq: mut &Request) parseHead(head: &str): int {
         let n = len(x.name)
         if n == 4 && eqName(&x.name, "Host") {
             hostN += 1
-            host = x.value
+            host = x.value.clone()
         } else if n == 14 && eqName(&x.name, "Content-Length") {
             clN += 1
-            cl = x.value
+            cl = x.value.clone()
         } else if n == 17 && eqName(&x.name, "Transfer-Encoding") {
             teN += 1
-            te = x.value
+            te = x.value.clone()
         } else if n == 6 && eqName(&x.name, "Expect") {
             expectN += 1
-            expect = x.value
+            expect = x.value.clone()
         } else if n == 10 && eqName(&x.name, "Connection") {
             if hasToken(&x.value, "close") { connClose = true }
             if hasToken(&x.value, "keep-alive") { connKeep = true }
@@ -1828,7 +1825,7 @@ fn (rq: mut &Request) parseHead(head: &str): int {
         host = lowerAscii(&host)
     }
     // the target's form
-    var pathPart = target
+    var pathPart = target.clone()
     if target[0] != '/' {
         let isHttp = len(target) > 7 && http.equalFold(target[..7], "http://")
         let isHttps = len(target) > 8 && http.equalFold(target[..8], "https://")
@@ -1851,7 +1848,7 @@ fn (rq: mut &Request) parseHead(head: &str): int {
         }
     }
     if method == "CONNECT" { return 405 }
-    rq.host = host
+    rq.host = host.clone()
     rq.hostName = hostName(&host)
     // the body's framing
     if clN > 1 || teN > 1 { return 400 }
@@ -1896,7 +1893,7 @@ fn (rq: mut &Request) parseHead(head: &str): int {
         rq.query = ""
     } else {
         let q = strings.indexOf(&pathPart, "?", 0)
-        rq.rawPath = if q >= 0 { pathPart[..q] } else { pathPart }
+        rq.rawPath = if q >= 0 { pathPart[..q] } else { pathPart.clone() }
         rq.query = if q >= 0 { pathPart[q + 1..] } else { "" }
         let p = cleanPath(&rq.rawPath)
         if len(p) == 0 { return 400 }
@@ -2067,7 +2064,7 @@ pub fn (w: mut &Response) trailer(name: &str, value: &str) {
     }
     if !known {
         if w.headSent { return }
-        append(mut &w.trailerNames, name)
+        append(mut &w.trailerNames, name.clone())
     }
     w.trailerVals.set(name, value)
 }
@@ -2087,7 +2084,7 @@ pub fn (w: mut &Response) write(data: &[byte], at: Where): Result[Unit, Error] {
 pub fn (w: mut &Response) writeStr(s: &str, at: Where): Result[Unit, Error] {
     if w.failed { return Err(errOf(499, ErrorKind.Gone, "the connection is gone")) }
     if !w.headSent && !w.useStr && w.body.n == 0 {
-        w.strBody = s
+        w.strBody = s.clone()
         w.useStr = true
         return Ok(Unit{})
     }
@@ -2329,7 +2326,7 @@ fn (w: mut &Response) finish(at: Where): Result[Unit, Error] {
     if w.mode == M_CHUNKED {
         w.out.add("0\r\n")
         for k in 0..len(w.trailerNames) {
-            let t = w.trailerNames[k]
+            let t = w.trailerNames[k].clone()
             match w.trailerVals.get(&t) {
                 Some(v) {
                     w.out.add(&t)
@@ -2512,19 +2509,19 @@ var ISO_TEXT: str = ""
 // "Tue, 03 Nov 2026 10:20:30 GMT" (RFC 9110 section 5.6.7) for now.
 fn httpDate(): str {
     let sec = time.unixSeconds()
-    if sec == DATE_SEC { return DATE_TEXT }
+    if sec == DATE_SEC { return DATE_TEXT.clone() }
     let t = time.httpDate(sec)
     DATE_SEC = sec
-    DATE_TEXT = t
+    DATE_TEXT = t.clone()
     return t
 }
 
 fn isoNow(): str {
     let sec = time.unixSeconds()
-    if sec == ISO_SEC { return ISO_TEXT }
+    if sec == ISO_SEC { return ISO_TEXT.clone() }
     let t = time.isoDateTime(sec)
     ISO_SEC = sec
-    ISO_TEXT = t
+    ISO_TEXT = t.clone()
     return t
 }
 
@@ -2574,7 +2571,7 @@ type ConnJob[A] = record {
     conn: net.Conn
     tlsCtx: Option[tls.Context]
     app: A
-    site: task.Frozen[Router[A]]
+    site: rc Router[A]
     st: task.Shared[State]
     slot: int
     lim: Limits
@@ -2582,7 +2579,7 @@ type ConnJob[A] = record {
 
 fn copyList(xs: &[]str): []str {
     var out: []str = []
-    for x in xs { append(mut &out, x) }
+    for x in xs { append(mut &out, x.clone()) }
     return out
 }
 
@@ -2596,7 +2593,7 @@ fn configErr(msg: &str): Error { return errOf(0, ErrorKind.Config, msg) }
 // is invalid or two conflict, or when RLIMIT_NOFILE (raised as far as the
 // hard limit allows) or vm.max_map_count is too low for cfg.maxConns. In a
 // worker (task.workers), it marks the worker ready once it accepts.
-pub fn serve[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
+pub fn serve[A: Clone](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
     return serveWith(ln, app, r, cfg, None, at)
 }
 
@@ -2605,7 +2602,7 @@ pub fn serve[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: W
 // context's alpn is "" (ALPN not answered) or "http/1.1" (a client that
 // offers ALPN without it is refused); any other protocol is a Config error,
 // as this server speaks only HTTP/1.1.
-pub fn serveTls[A: copy](ln: net.Listener, ctx: tls.Context, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
+pub fn serveTls[A: Clone](ln: net.Listener, ctx: tls.Context, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
     if !ctx.isServer() { return Err(configErr("serveTls needs a server context (tls.server)")) }
     let alpn = ctx.alpn()
     if len(alpn) > 0 && alpn != "http/1.1" {
@@ -2614,7 +2611,7 @@ pub fn serveTls[A: copy](ln: net.Listener, ctx: tls.Context, app: A, r: Router[A
     return serveWith(ln, app, r, cfg, Some(ctx), at)
 }
 
-fn serveWith[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Option[tls.Context], at: Where): Result[Stats, Error] {
+fn serveWith[A: Clone](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Option[tls.Context], at: Where): Result[Stats, Error] {
     var site = r
     let errs = prepare(mut &site)
     if len(errs) > 0 { return Err(configErr(&(strings.join(&errs, "; ")))) }
@@ -2651,13 +2648,13 @@ fn serveWith[A: copy](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx:
         memBudget: cfg.memBudget, hosts: lowerList(&cfg.hosts), redirectHosts: lowerList(&cfg.redirectHosts),
         proxies: copyList(&cfg.trustedProxies), perIp: newMap[str, int](), maxPerIp: cfg.maxConnsPerIp,
         pid: int(getpid()), logFd: cfg.logFd})
-    let sh = task.freeze(site)
+    let sh = rc(site)
     let ready = task.workerReady()
     var lst: Option[net.Listener] = Some(ln)
     task.scope(fn(s: mut &task.Scope) {
-        acceptLoop(s, mut &lst, mut &spare, app, sh, st, lim, ac, &tctx, at)
+        acceptLoop(s, mut &lst, mut &spare, app, sh, st.share(), lim, ac, &tctx, at)
     })
-    flushLog(st)
+    flushLog(st.share())
     var out = noStats()
     st.with(fn(x: mut &State) {
         out = x.stats
@@ -2683,13 +2680,13 @@ fn watchStop(st: task.Shared[State]): int {
 // Accepts connections and starts a task for each; every TICK ms it reaps
 // the ended ones, closes idle ones under pressure, writes the access log,
 // and looks for a stop.
-fn acceptLoop[A: copy](s: mut &task.Scope, lst: mut &Option[net.Listener], spare: mut &Option[net.Spare], app: A,
-                       sh: task.Frozen[Router[A]], st: task.Shared[State], lim: Limits, ac: AcceptCfg,
+fn acceptLoop[A: Clone](s: mut &task.Scope, lst: mut &Option[net.Listener], spare: mut &Option[net.Spare], app: &A,
+                       sh: &rc Router[A], st: task.Shared[State], lim: Limits, ac: AcceptCfg,
                        tctx: &Option[tls.Context], at: Where) {
     var futs: []Option[task.Future[int]] = []
     var free: []int = []
     var sig: Option[task.Future[int]] = None
-    if ac.signals { sig = Some(s.start(watchStop, st)) }
+    if ac.signals { sig = Some(s.start(watchStop, st.share())) }
     var live = 0
     var lastTick = nowMs()
     var drainUntil = -1
@@ -2726,7 +2723,7 @@ fn acceptLoop[A: copy](s: mut &task.Scope, lst: mut &Option[net.Listener], spare
             }
             live -= len(ended)
             for i in cancel { let f = replace(mut &futs[i], None) }
-            if logOut.n > 0 { writeAll(st, &logOut) }
+            if logOut.n > 0 { writeAll(st.share(), &logOut) }
             if stopping && drainUntil < 0 {
                 drainUntil = now + ac.drainMs
                 lst = None
@@ -2810,7 +2807,7 @@ fn acceptLoop[A: copy](s: mut &task.Scope, lst: mut &Option[net.Listener], spare
                     Some(ctx) { Some(ctx.share()) }
                     None { None }
                 }
-                let f = s.start(connTask[A], ConnJob[A]{conn: c, tlsCtx: jt, app: app, site: sh, st: st, slot: slot, lim: lim})
+                let f = s.start(connTask[A], ConnJob[A]{conn: c, tlsCtx: jt, app: app.clone(), site: sh.share(), st: st.share(), slot: slot, lim: lim})
                 futs[slot] = Some(f)
                 live += 1
                 batch += 1
@@ -2866,7 +2863,7 @@ fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Res
                     let peer = tc.peerAddr()
                     let fd = tc.fd()
                     let box = task.shared(TlsBox{c: Some(tc)})
-                    return Ok(Sides{read: ReadConn.Tls(box, fd), write: WriteConn.Tls(box), peer: peer})
+                    return Ok(Sides{read: ReadConn.Tls(box.share(), fd), write: WriteConn.Tls(box), peer: peer})
                 }
                 Err(e) { return Err(tlsConn(&e)) }
             }
@@ -2879,7 +2876,7 @@ fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Res
     }
 }
 
-fn connTask[A: copy](j: ConnJob[A]): int {
+fn connTask[A: Clone](j: ConnJob[A]): int {
     let ConnJob{conn: c, tlsCtx: tctx, app: app, site: site, st: st, slot: slot, lim: lim} = move(j)
     let sr = startSides(c, tctx, lim.headerTimeoutMs)
     if sr.isErr() {
@@ -2904,18 +2901,18 @@ fn connTask[A: copy](j: ConnJob[A]): int {
         if x.maxPerIp > 0 {
             counted = true
             let n = x.perIp.getOr(&ip, 0) + 1
-            x.perIp.put(ip, n)
+            x.perIp.put(ip.clone(), n)
             if n > x.maxPerIp { refuse = true }
         }
     })
     var rq = Request{method: "", path: "", host: "", proto: "", headers: http.newHeaders(), peer: peer, id: "", pattern: "",
         target: "", rawPath: "", query: "", hostName: "", minor: 1, params: [], chain: [], notes: [], trailers: http.newHeaders(),
         allow: "", conn: rh, buf: array(BUF, byte(0)), r: 0, n: 0, framing: F_NONE, left: 0, cstate: C_DONE, got: 0, maxBody: lim.maxBody,
-        extBytes: 0, expect: false, keep: true, broken: false, bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st,
+        extBytes: 0, expect: false, keep: true, broken: false, bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(),
         trusted: trusted, rnd: [], rndAt: 0, started: 0}
     var w = Response{conn: wh, code: 0, final: 0, headers: http.newHeaders(), trailerNames: [], trailerVals: http.newHeaders(),
         out: newBuf(OUT), body: newBuf(0), strBody: "", useStr: false, headSent: false, mode: M_NONE, declared: -1, sent: 0,
-        head: false, minor: 1, close: false, bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false, st: st}
+        head: false, minor: 1, close: false, bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false, st: st.share()}
     if refuse {
         w.close = true
         w.sendError(503)
@@ -2923,7 +2920,7 @@ fn connTask[A: copy](j: ConnJob[A]): int {
     } else {
         var served = 0
         while true {
-            if !serveOne(&app, site, mut &rq, mut &w, slot, served) { break }
+            if !serveOne(&app, &site, mut &rq, mut &w, slot, served) { break }
             served += 1
             if task.yield().isErr() { break }
         }
@@ -2940,7 +2937,7 @@ fn connTask[A: copy](j: ConnJob[A]): int {
             if n <= 0 {
                 let old = x.perIp.remove(&ip)
             } else {
-                x.perIp.put(ip, n)
+                x.perIp.put(ip.clone(), n)
             }
         }
     })
@@ -3092,12 +3089,12 @@ fn (rq: mut &Request) readHead(idleMs: int, at: Where): int {
 }
 
 // Reads, routes and answers one request: whether the connection carries on.
-fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w: mut &Response, slot: int, served: int, at: Where): bool {
+fn serveOne[A: Clone](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response, slot: int, served: int, at: Where): bool {
     let idleMs = if served == 0 { rq.lim.headerTimeoutMs } else { rq.lim.idleTimeoutMs }
     let end = rq.readHead(idleMs, at)
     if end == -1 { return false }
     reset(rq, w)
-    let st = rq.st
+    let st = rq.st.share()
     if end < 0 {
         // refused before a head could be read: answered, and the connection closes
         st.with(fn(x: mut &State) {
@@ -3120,7 +3117,7 @@ fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w:
     var stopping = false
     var overMem = false
     var misdirected = false
-    let hn = rq.hostName
+    let hn = &rq.hostName
     st.with(fn(x: mut &State) {
         x.stats.requests += 1
         if bad != 0 {
@@ -3153,7 +3150,8 @@ fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w:
     var h: Option[Handler[A]] = None
     var opts = routeOpts()
     if pre == 0 {
-        let _ = site.read(fn(s: &Router[A]): int {
+        let s: &Router[A] = site
+        if true {
             // Go's order: the redirect to the path with "/", the route, 405, 404
             let i = findRoute(s, &rq.method, &rq.hostName, &rq.path, mut &rq.params)
             if slashMatch(s, i, &rq.method, &rq.hostName, &rq.path) {
@@ -3162,7 +3160,7 @@ fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w:
             } else if i >= 0 {
                 h = Some(s.routes[i].h)
                 opts = s.routes[i].opts
-                rq.pattern = s.routes[i].pattern
+                rq.pattern = s.routes[i].pattern.clone()
             } else {
                 let allow = allowedMethods(s, &rq.hostName, &rq.path)
                 if len(allow) > 0 {
@@ -3173,11 +3171,10 @@ fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w:
                 }
             }
             for k in 0..len(s.mws) {
-                let p = s.mws[k].prefix
+                let p = &s.mws[k].prefix
                 if len(p) == 0 || strings.startsWith(&rq.path, &p) { append(mut &rq.chain, k) }
             }
-            return 0
-        })
+        }
         if opts.maxBody >= 0 { rq.maxBody = opts.maxBody }
         if rq.framing == F_LENGTH && rq.left > rq.maxBody {
             pre = 413
@@ -3197,7 +3194,7 @@ fn serveOne[A: copy](app: &A, site: task.Frozen[Router[A]], rq: mut &Request, w:
                 let g = rq.conn.cancelOnHangup(rq.lim.cancelOnHalfClose)
                 var old = 0
                 if deadline > 0 { old = rtWithin(deadline) }
-                let n = Next[A]{site: site, h: f, pos: 0}
+                let n = Next[A]{site: site.share(), h: f, pos: 0}
                 res = n.run(app, rq, w)
                 if deadline > 0 { rtRestore(old) }
             }
@@ -3274,8 +3271,8 @@ pub fn requestId[A](app: &A, rq: mut &Request, w: mut &Response, next: Next[A]):
         }
     }
     if len(id) == 0 { id = rq.newId() }
-    rq.id = id
-    w.id = id
+    rq.id = id.clone()
+    w.id = id.clone()
     w.header("X-Request-Id", &id)
     return next.run(app, rq, w)
 }
@@ -3367,7 +3364,7 @@ pub fn accessLog[A](app: &A, rq: mut &Request, w: mut &Response, next: Next[A]):
             if x.log.n >= LOG_FLUSH { out = replace(mut &x.log, newBuf(0)) }
         }
     })
-    if out.n > 0 { writeAll(rq.st, &out) }
+    if out.n > 0 { writeAll(rq.st.share(), &out) }
     return res
 }
 
@@ -3384,7 +3381,7 @@ fn logValue(s: &str): str {
             }
         }
     }
-    if plain { return s }
+    if plain { return s.clone() }
     var b = newBuf(len(s) + 8)
     b.addByte('"')
     let n = if len(s) > LOG_VALUE { LOG_VALUE } else { len(s) }

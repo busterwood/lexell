@@ -1,0 +1,98 @@
+// task and rc (SPEC 4.9): many tasks read one rc value, holding a borrow of it across a park (yield,
+// sleep) while the others read it too; a task gets its own handle with share(); the value is
+// dropped with the last handle (in a task or in main); an rc inside a Shared and an rc of rcs are
+// dropped once each.
+// expect: total 1860 from 60 readers
+// expect: order r0 r1 r2 r0 r1 r2 r0 r1 r2
+// expect: get 42 hello
+// expect: nested 3
+// expect: before scope
+// expect: drop last in task
+// expect: read in task 12
+// expect: after scope
+// expect: drop inner
+// expect: drop config
+import "task"
+
+type Note = record { s: str }
+
+fn (n: mut &Note) drop() { println("drop " + n.s) }
+
+type Config = record {
+    routes: Map[str, int]
+    note: Note
+}
+
+type Reader = record {
+    cfg: rc Config
+    i: int
+    log: task.Shared[[]str]
+}
+
+fn readMany(r: Reader): int {
+    var sum = 0
+    for k in 0..3 {
+        let c: &Config = &r.cfg
+        // park while holding the borrow: the other readers run and read too
+        if r.i % 2 == 0 { task.yield().unwrap() } else { task.sleep(1).unwrap() }
+        sum += c.routes.getOr(&("/r" + intToStr(r.i % 3)), -1)
+    }
+    return sum
+}
+
+fn ordered(r: Reader): int {
+    for k in 0..3 {
+        r.log.with(fn(l: mut &[]str) { append(l, "r" + intToStr(r.i)) })
+        task.yield().unwrap()
+    }
+    return 0
+}
+
+fn holdLast(n: rc Note): int {
+    task.yield().unwrap()
+    return len(n.s)
+}
+
+type Pair = record { a: rc Note; b: rc Note }
+
+fn main() {
+    var routes: Map[str, int] = newMap()
+    routes.put("/r0", 1)
+    routes.put("/r1", 10)
+    routes.put("/r2", 20)
+    let cfg = rc(Config{routes: routes, note: Note{s: "config"}})
+    let none: []str = []
+    let log = task.shared(none)
+    var total = 0
+    task.scope(fn(s: mut &task.Scope) {
+        var fs: []task.Future[int] = []
+        for i in 0..60 { append(mut &fs, s.start(readMany, Reader{cfg: cfg.share(), i: i, log: log.share()})) }
+        for f in task.all(fs).unwrap() { total += f }
+    })
+    println("total " + intToStr(total) + " from 60 readers")
+    task.scope(fn(s: mut &task.Scope) {
+        for i in 0..3 { s.spawn(ordered, Reader{cfg: cfg.share(), i: i, log: log.share()}) }
+    })
+    log.with(fn(l: mut &[]str) {
+        var line = "order"
+        for x in l { line += " " + x }
+        println(line)
+    })
+
+    let n = rc(42)
+    let h = rc("hello")
+    println("get " + intToStr(n) + " " + h)
+
+    let inner = rc(Note{s: "inner"})
+    let pair = rc(Pair{a: inner.share(), b: inner})
+    let sh = task.shared(pair.share())
+    println("nested " + intToStr(len(pair.a.s) - 2))
+
+    println("before scope")
+    task.scope(fn(s: mut &task.Scope) {
+        // the task holds the only handle: the value goes with the task's argument
+        let f = s.start(holdLast, rc(Note{s: "last in task"}))
+        println("read in task " + intToStr(f.wait().unwrap()))
+    })
+    println("after scope")
+}

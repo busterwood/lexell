@@ -27,7 +27,7 @@ pub const CTYPES: []str = ["int64_t", "int32_t", "uint32_t", "uint64_t", "uint8_
 // string); what holes stand for is not looked into.
 fn (c: &Checker) checks(n: int): bool {
     if n < 0 { return false }
-    let x = c.x.nodes[n]
+    let x = &c.x.nodes[n]
     if x.k == tm.X_STR { return true }
     if x.k == tm.X_HOLE || x.k == tm.X_NAME || x.k == tm.X_NUM { return false }
     if c.checks(x.a) || c.checks(x.b) || c.checks(x.c) { return true }
@@ -41,7 +41,7 @@ fn (c: &Checker) checks(n: int): bool {
 
 // Whether the C of n is a bare name or number.
 fn (c: &Checker) isWord(n: int): bool {
-    let x = c.x.nodes[n]
+    let x = &c.x.nodes[n]
     return (x.k == tm.X_NAME || x.k == tm.X_NUM) && isWordText(&x.s)
 }
 
@@ -82,6 +82,7 @@ pub const H_IASSOC = 10
 pub const H_ADDR = 11
 pub const H_DEREF = 12
 pub const H_SHARE = 13
+pub const H_CLONE = 14     // a deep copy (design/owned-str.md, issue 4): the type t and the value x
 
 pub type Hole = value record {
     pub k: int
@@ -165,6 +166,9 @@ type Var = value record {
     kind: int
     line: int
     moved: bool
+    mline: int      // LXL_OWNED_STR: the line of its last move
+    taken: bool     // LXL_PARAM_REPORT: consumed somewhere (moved, or an attempt the owned-str mode logs)
+    mctx: str       // and what took it
     broot: int      // the root of a borrow variable, or -1
     cap: int        // a closure's capture: the captured variable, or -1
     capmut: bool
@@ -209,6 +213,7 @@ type Cap = value record {
 
 type Freeze = value record {
     root: int
+    path: str       // the part of root that is borrowed ("" all of it): writes elsewhere in root go on
     m: bool
     by: str
     bv: int         // the variable it is made for: in force while that is live (-1: until its scope ends)
@@ -262,6 +267,7 @@ type Ctx = record {
     loops: []Loop
     pending: []Pend
     pmarks: []int
+    fscopes: []int  // per frame: how many scopes were open when it was pushed (cleanup's nesting)
     dead: bool
     nomove: []str
     n: int
@@ -276,8 +282,8 @@ type Ctx = record {
 }
 
 fn newCtx(f: int, label: &str, ret: int, env: []int, mod: int, closure: bool): Ctx {
-    return Ctx{fd: f, label: label, ret: ret, env: env, mod: mod, closure: closure, bvar: -1, lines: [], ind: 1,
-        scopes: [], frames: [], loops: [], pending: [], pmarks: [], dead: false, nomove: [], n: 0, tailOn: false,
+    return Ctx{fd: f, label: label.clone(), ret: ret, env: env, mod: mod, closure: closure, bvar: -1, lines: [], ind: 1,
+        scopes: [], frames: [], loops: [], pending: [], pmarks: [], fscopes: [], dead: false, nomove: [], n: 0, tailOn: false,
         tail: [], capNames: [], capVars: [], wconds: [], rsrc: [], blks: [], rhsAt: -1}
 }
 
@@ -343,6 +349,8 @@ type MatchX = record {
 }
 
 pub type Checker = record {
+    liveSkip: int   // a node usesIn ignores (the scrutinee of a match deciding whether it moves), or -1
+    octx: str       // LXL_OWNED_STR: what is consuming (let, arg, return, ...)
     pub pg: sema.Program
     pub x: tm.Arena            // the templates' nodes
     pub tmpls: []Tmpl          // per FnDecl
@@ -371,7 +379,7 @@ pub type Checker = record {
 pub fn newChecker(pg: sema.Program): Checker {
     var c = Checker{pg: pg, x: tm.newArena(), tmpls: [], ginits: [], cinits: [], vars: [], tmps: [], capl: [], statics: newMapWith[str, int](fxHashStr),
         podMemo: [], copyMemo: [], cids: 0, holes: [], lifted: [], cx: newCtx(-1, "", sema.T_VOID, [], 0, false),
-        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0}
+        outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0, octx: "", liveSkip: -1}
     for f in 0..len(c.pg.fns) { append(mut &c.tmpls, Tmpl{done: false, lines: [], holes: [], lifted: []}) }
     for g in 0..len(c.pg.globals) { append(mut &c.ginits, noInit()) }
     for k in 0..len(c.pg.consts) { append(mut &c.cinits, noInit()) }
@@ -392,7 +400,7 @@ fn rv(c: int, t: int): Val { return val(c, t, CAT_RV) }
 fn rvAt(c: int, t: int, root: int, path: &str): Val {
     var v = val(c, t, CAT_RV)
     v.root = root
-    v.path = path
+    v.path = path.clone()
     return v
 }
 
@@ -450,7 +458,7 @@ fn (c: mut &Checker) hole(h: Hole): int {
     return c.x.hole(len(c.holes) - 1)
 }
 
-fn mkHole(k: int, t: int, s: &str): Hole { return Hole{k: k, t: t, f: -1, s: s, x: -1, r: -1, args: []} }
+fn mkHole(k: int, t: int, s: &str): Hole { return Hole{k: k, t: t, f: -1, s: s.clone(), x: -1, r: -1, args: []} }
 
 fn mkHoleX(k: int, t: int, x: int): Hole { return Hole{k: k, t: t, f: -1, s: "", x: x, r: -1, args: []} }
 
@@ -533,7 +541,7 @@ fn (c: mut &Checker) isCopy(t: int): bool {
 fn (c: mut &Checker) tuple(ts: &[]int): int { return c.pg.mkFn(ts, sema.T_VOID) }
 
 fn (c: &Checker) rootName(r: int, dflt: &str): str {
-    return if r >= 0 { c.vars[r].name } else if r == R_FREE { "nothing" } else if r <= -2 { "a temporary" } else { dflt }
+    return if r >= 0 { c.vars[r].name.clone() } else if r == R_FREE { "nothing" } else if r <= -2 { "a temporary" } else { dflt.clone() }
 }
 
 // A root as messages show it: 'x', what 'p' borrows (a parameter's pseudo root), 'a' and 'b' (a
@@ -542,7 +550,7 @@ fn (c: &Checker) rootDesc(r: int): str {
     if r == R_FREE { return "nothing" }
     if r <= -2 { return "a temporary" }
     if r < 0 { return "something unknown" }
-    if c.vars[r].jn >= 0 || c.vars[r].tv { return c.vars[r].name }
+    if c.vars[r].jn >= 0 || c.vars[r].tv { return c.vars[r].name.clone() }
     if c.vars[r].kind == VK_PSEUDO && strings.startsWith(&c.vars[r].name, "*") {
         return "what '" + c.vars[r].name[1..len(c.vars[r].name)] + "' borrows"
     }
@@ -551,8 +559,8 @@ fn (c: &Checker) rootDesc(r: int): str {
 
 // A variable as messages show it: 'x', or a hidden one's description (the iterator of a for loop).
 fn (c: &Checker) varDesc(x: int): str {
-    let n = c.vars[x].name
-    return if strings.startsWith(&n, "the ") { n } else { "'" + n + "'" }
+    let n = &c.vars[x].name
+    return if strings.startsWith(n, "the ") { n.clone() } else { "'" + n + "'" }
 }
 
 // ---------------------------------------------------------------- borrow-class roots
@@ -623,7 +631,7 @@ fn (c: &Checker) cvar(x0: int): int {
 
 // The root of the borrows the value v holds (v borrow-class): R_FREE, a variable or pseudo root, a
 // temporary's root, or -1 when it is not known.
-fn (c: mut &Checker) crOf(v: Val): int {
+fn (c: mut &Checker) crOf(v: &Val): int {
     let k = c.pg.tk(v.t)
     let isB = k == sema.TK_REF || k == sema.TK_SLICE
     if v.cat == CAT_PLACE {
@@ -650,7 +658,7 @@ fn (c: mut &Checker) rebase(v: Val): Val {
     let k = c.pg.tk(v.t)
     if (k == sema.TK_REF || k == sema.TK_SLICE) && !c.pg.tm(v.t) && v.cat == CAT_PLACE && v.gk < 0 &&
             (len(v.path) > 0 || v.viaref) && v.root != -1 {
-        var r = v
+        var r = v.clone()
         r.root = c.crOf(v)
         r.path = pathAdd("", "*")
         r.vvar = -1
@@ -706,7 +714,7 @@ fn (c: mut &Checker) joinRoots(a: int, b: int): int {
 
 // v with the root of what it holds set to cr: a borrow's root, or a value's cr.
 fn (c: mut &Checker) withCr(v: Val, cr: int): Val {
-    var r = v
+    var r = v.clone()
     let k = c.pg.tk(v.t)
     if k == sema.TK_REF || k == sema.TK_SLICE {
         r.root = cr
@@ -789,7 +797,7 @@ fn (c: mut &Checker) checkResult(r: int, shown: int, line: int, isB: bool) {
     var k = 0
     let bsrc = copyInts(&c.pg.fns[f].bsrc)
     for i in bsrc {
-        let p = c.pg.fns[f].params[i]
+        let p = c.pg.fns[f].params[i].clone()
         if k > 0 { desc.add(" or ") }
         if c.inherits(p.ty) {
             anyInh = true
@@ -884,7 +892,7 @@ fn (c: mut &Checker) storeRoot(x0: int, r: int, t: int, line: int) {
     c.vars[x].croot = r
     let d = c.vars[x].depth
     if d >= 0 && d < len(c.cx.scopes) {
-        append(mut &c.cx.scopes[d].freezes, Freeze{root: r, m: c.pg.holdsMut(c.vars[x].t), by: name, bv: c.nllVar(x)})
+        append(mut &c.cx.scopes[d].freezes, Freeze{root: r, path: "", m: c.pg.holdsMut(c.vars[x].t), by: name, bv: c.nllVar(x)})
     }
 }
 
@@ -910,7 +918,7 @@ fn (c: &Checker) inDrop(): bool {
 }
 
 // AST access in the current module.
-fn (c: &Checker) nd(n: int): sx.Node { return c.pg.mods[c.cx.mod].ast.nodes[n] }
+fn (c: &Checker) nd(n: int): sx.Node { return c.pg.mods[c.cx.mod].ast.nodes[n].clone() }
 fn (c: &Checker) kind(n: int): int { return c.pg.mods[c.cx.mod].ast.nodes[n].kind }
 fn (c: &Checker) line(n: int): int { return c.pg.mods[c.cx.mod].ast.nodes[n].line }
 fn (c: &Checker) count(l: int): int { return if l < 0 { 0 } else { c.pg.mods[c.cx.mod].ast.items[l] } }
@@ -925,7 +933,7 @@ fn (c: &Checker) items(l: int): []int {
 // Nodes made by the checker (ref builds N nodes and type tuples on the fly).
 fn (c: mut &Checker) synth(kind: int, line: int, s: &str, a: int, b: int, flags: int): int {
     let m = c.cx.mod
-    append(mut &c.pg.mods[m].ast.nodes, sx.Node{kind: kind, line: line, flags: flags, s: s, t: "", u: "", a: a,
+    append(mut &c.pg.mods[m].ast.nodes, sx.Node{kind: kind, line: line, flags: flags, s: s.clone(), t: "", u: "", a: a,
         b: b, c: -1, d: -1, e: -1})
     return len(c.pg.mods[m].ast.nodes) - 1
 }
@@ -1023,17 +1031,20 @@ fn (c: mut &Checker) dropVars(vs: &[]int) {
     }
 }
 
+// Drops what leaving to nscopes scopes and nframes frames ends, innermost first: a scope opened
+// inside a statement (a block of a for over a temporary) goes before that statement's temporaries.
 fn (c: mut &Checker) cleanup(nscopes: int, nframes: int) {
     var i = len(c.cx.frames) - 1
-    while i >= nframes {
-        let fr = copyInts(&c.cx.frames[i])
-        c.dropFrame(&fr)
-        i -= 1
-    }
-    i = len(c.cx.scopes) - 1
-    while i >= nscopes {
-        c.dropScope(i)
-        i -= 1
+    var j = len(c.cx.scopes) - 1
+    while i >= nframes || j >= nscopes {
+        if j >= nscopes && (i < nframes || j >= c.cx.fscopes[i]) {
+            c.dropScope(j)
+            j -= 1
+        } else {
+            let fr = copyInts(&c.cx.frames[i])
+            c.dropFrame(&fr)
+            i -= 1
+        }
     }
 }
 
@@ -1046,9 +1057,11 @@ fn copyInts(xs: &[]int): []int {
 fn (c: mut &Checker) pushFrame() {
     append(mut &c.cx.frames, [])
     append(mut &c.cx.pmarks, len(c.cx.pending))
+    append(mut &c.cx.fscopes, len(c.cx.scopes))
 }
 
 fn (c: mut &Checker) popFrame(): []int {
+    let fs = pop(mut &c.cx.fscopes)
     let m = pop(mut &c.cx.pmarks)
     c.cutPending(m)
     return pop(mut &c.cx.frames)
@@ -1080,7 +1093,7 @@ fn (c: mut &Checker) tmpval(n: int, t: int): Val {
 // ref's holdtmp: cc evaluated now into a C variable; a slice keeps the root and path of src.
 fn (c: mut &Checker) holdtmp(cc: int, t: int): Val { return c.holdtmpSrc(cc, t, false, rv(-1, t)) }
 
-fn (c: mut &Checker) holdtmpSrc(cc: int, t: int, hasSrc: bool, src: Val): Val {
+fn (c: mut &Checker) holdtmpSrc(cc: int, t: int, hasSrc: bool, src: &Val): Val {
     let n = c.fresh("t")
     let ct = c.T(t)
     c.emit(c.x.decl(ct, &n, cc))
@@ -1137,17 +1150,17 @@ fn (c: mut &Checker) lookupAt(lvl: int, name: &str, capture: bool): int {
     if o < 0 || !capture { return o }
     let ncaps = if lvl == len(c.outers) { len(c.cx.capNames) } else { len(c.outers[lvl].capNames) }
     let ct = c.T(c.vars[o].t)
-    var p = c.vars[o]
+    var p = c.vars[o].clone()
     p.c = c.x.par(c.x.at(ct, c.x.idx(c.nm("ce_"), c.lit(ncaps))))
     p.cap = o
     p.capmut = false
     append(mut &c.vars, p)
     let id = len(c.vars) - 1
     if lvl == len(c.outers) {
-        append(mut &c.cx.capNames, name)
+        append(mut &c.cx.capNames, name.clone())
         append(mut &c.cx.capVars, id)
     } else {
-        append(mut &c.outers[lvl].capNames, name)
+        append(mut &c.outers[lvl].capNames, name.clone())
         append(mut &c.outers[lvl].capVars, id)
     }
     return id
@@ -1155,15 +1168,15 @@ fn (c: mut &Checker) lookupAt(lvl: int, name: &str, capture: bool): int {
 
 fn (c: mut &Checker) newVar(name: &str, cn: &str, t: int, mutable: bool, kind: int, line: int): int {
     let cx = c.nm(cn)
-    append(mut &c.vars, Var{name: name, c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false,
+    append(mut &c.vars, Var{name: name.clone(), c: cx, t: t, mutable: mutable, kind: kind, line: line, moved: false, mline: 0, mctx: "", taken: false,
         broot: -1, cap: -1, capmut: false, pjoin: 0, croot: -1, depth: len(c.cx.scopes) - 1, loops: len(c.cx.loops),
         jn: -1, tv: false, blk: len(c.cx.blks) - 1, bi: if len(c.cx.blks) > 0 { c.cx.blks[len(c.cx.blks) - 1].i } else { -1 }})
     return len(c.vars) - 1
 }
 
 fn (c: mut &Checker) declare(v: int) {
-    let name = c.vars[v].name
-    if c.lookupVar(&name, false) >= 0 {
+    let name = c.vars[v].name.clone()
+    if c.lookupVar(name, false) >= 0 {
         c.err(c.vars[v].line, "'" + c.vars[v].name + "' is already declared in this function (no shadowing)")
     }
     let s = len(c.cx.scopes) - 1
@@ -1174,16 +1187,20 @@ fn (c: mut &Checker) declare(v: int) {
 
 fn (c: mut &Checker) pushScope() { append(mut &c.cx.scopes, Scope{vars: [], freezes: []}) }
 
-fn (c: mut &Checker) freeze(root: int, m: bool, by: &str, bv: int) {
+fn (c: mut &Checker) freeze(root: int, m: bool, by: &str, bv: int) { c.freezeAt(root, "", m, by, bv) }
+
+// Freeze the place path of root (design/owned-str.md, issue 1): moves, writes and mutable borrows of
+// root conflict with it only where their paths overlap.
+fn (c: mut &Checker) freezeAt(root: int, path: &str, m: bool, by: &str, bv: int) {
     let s = len(c.cx.scopes) - 1
-    append(mut &c.cx.scopes[s].freezes, Freeze{root: root, m: m, by: by, bv: bv})
+    append(mut &c.cx.scopes[s].freezes, Freeze{root: root, path: path.clone(), m: m, by: by.clone(), bv: bv})
 }
 
 // Variable x, if its freezes may end at its last use (design/borrow-types.md 12.3): a local the
 // program names (not a hidden one), else -1.
 fn (c: &Checker) nllVar(x: int): int {
     if c.vars[x].kind != VK_LOCAL || c.vars[x].tv { return -1 }
-    let n = c.vars[x].name
+    let n = &c.vars[x].name
     if len(n) == 0 { return -1 }
     for i in 0..len(n) {
         let b = strByte(n, i)
@@ -1206,7 +1223,7 @@ fn (c: &Checker) isLive(x: int, depth: int): bool {
             if f.bv != x && c.hits(f.root, x) && c.inForce(&f, depth + 1) { return true }
         }
     }
-    let name = c.vars[x].name
+    let name = &c.vars[x].name
     let top = len(c.cx.blks) - 1
     if c.vars[x].blk > top { return true }      // not declared in a block of this function
     let bottom = if c.vars[x].blk < 0 { 0 } else { c.vars[x].blk }
@@ -1216,19 +1233,19 @@ fn (c: &Checker) isLive(x: int, depth: int): bool {
         let n = c.count(fr.stmts)
         // rule 1: a later statement of this block
         if fr.i + 1 < n {
-            if c.usesIn(c.item(fr.stmts, fr.i + 1), c.item(fr.stmts, n - 1), &name) { return true }
+            if c.usesIn(c.item(fr.stmts, fr.i + 1), c.item(fr.stmts, n - 1), name) { return true }
         }
         let cur = c.item(fr.stmts, fr.i)
         if k == top {
             // rule 3: the statement being checked
             if cur == c.cx.rhsAt {
-                if c.lhsUses(c.nd(cur).a, &name) { return true }
-            } else if c.usesIn(cur, cur, &name) {
+                if c.lhsUses(c.nd(cur).a, name) { return true }
+            } else if c.usesIn(cur, cur, name) {
                 return true
             }
         } else if !(k == c.vars[x].blk && fr.i == c.vars[x].bi) && !c.directBranch(cur, c.cx.blks[k + 1].b) {
             // rules 2 and 4: a loop around the point, or a statement the rest of which may run later
-            if c.usesIn(cur, cur, &name) { return true }
+            if c.usesIn(cur, cur, name) { return true }
         }
         k -= 1
     }
@@ -1250,7 +1267,7 @@ fn (c: &Checker) usesIn(a: int, b: int, name: &str): bool {
     let hi = ast.shi[b]
     if lo < 0 || hi < 0 { return true }
     for i in lo..hi + 1 {
-        if ast.nodes[i].kind == sx.N_NAME && ast.nodes[i].s == name { return true }
+        if i != c.liveSkip && ast.nodes[i].kind == sx.N_NAME && ast.nodes[i].s == name { return true }
     }
     return false
 }
@@ -1317,7 +1334,9 @@ fn (c: mut &Checker) join(snaps: &[][]int, line: int) {
         while i < len(snaps[k]) {
             let v = snaps[k][i]
             let s0 = snapGet(&snaps[0], v)
-            if s0 >= 0 && s0 != snaps[k][i + 1] { c.err(line, "'" + c.vars[v].name + "' is moved on one path but not another") }
+            if s0 >= 0 && s0 != snaps[k][i + 1] && c.soft(c.vars[v].t) {
+                c.noteClone(v)
+            } else if s0 >= 0 && s0 != snaps[k][i + 1] { c.err(line, "'" + c.vars[v].name + "' is moved on one path but not another") }
             i += 2
         }
     }
@@ -1365,10 +1384,14 @@ fn (c: mut &Checker) block(b: int, scope: bool, top: bool) {
 
 // ---------------------------------------------------------------- ownership checks
 
-fn (c: mut &Checker) frozen(root: int, kind: int, line: int) {
+fn (c: mut &Checker) frozen(root: int, kind: int, line: int) { c.frozenAt(root, "", kind, line) }
+
+// Whether path of root may be read, written, moved or mutably borrowed (kind): a freeze whose path
+// overlaps it stops the program being compiled.
+fn (c: mut &Checker) frozenAt(root: int, path: &str, kind: int, line: int) {
     if root < 0 { return }
     if c.vars[root].jn >= 0 {
-        for x in c.members(root) { c.frozen(x, kind, line) }
+        for x in c.members(root) { c.frozenAt(x, path, kind, line) }
         return
     }
     if c.vars[root].cap >= 0 && kind != FR_READ {
@@ -1378,13 +1401,32 @@ fn (c: mut &Checker) frozen(root: int, kind: int, line: int) {
     for s in 0..len(c.cx.scopes) {
         for f in c.cx.scopes[s].freezes {
             let hit = f.root == root || (f.root >= 0 && c.vars[f.root].jn >= 0 && hasInt(&c.joins[c.vars[f.root].jn], root))
-            if hit && (kind != FR_READ || f.m) && c.inForce(&f, 0) {
+            if hit && (kind != FR_READ || f.m) && overlap(&f.path, path) && c.inForce(&f, 0) {
                 let verb = match kind { FR_ASSIGN { "assigned" } FR_MOVE { "moved" } FR_MUT { "mutably borrowed" } else { "used" } }
                 c.err(line, "'" + c.vars[root].name + "' is borrowed by " + f.by + " and cannot be " + verb +
                     " while that borrow is in scope")
             }
         }
     }
+}
+
+// Under LXL_OWNED_STR: would frozen(root, FR_MOVE) stop (a captured variable, or a borrow in scope)?
+fn (c: mut &Checker) moveBlocked(root: int): bool {
+    if root < 0 { return false }
+    if c.vars[root].jn >= 0 {
+        for x in c.members(root) {
+            if c.moveBlocked(x) { return true }
+        }
+        return false
+    }
+    if c.vars[root].cap >= 0 { return true }
+    for s in 0..len(c.cx.scopes) {
+        for f in c.cx.scopes[s].freezes {
+            let hit = f.root == root || (f.root >= 0 && c.vars[f.root].jn >= 0 && hasInt(&c.joins[c.vars[f.root].jn], root))
+            if hit && c.inForce(&f, 0) { return true }
+        }
+    }
+    return false
 }
 
 // A move or assignment may not touch a place held by a call (or operator) in progress.
@@ -1397,6 +1439,23 @@ fn (c: mut &Checker) checkPending(root: int, path: &str, line: int, move: bool) 
                 " here: it overlaps a borrow held by the call being evaluated")
         }
     }
+}
+
+// A str indexed or sliced in place is held (SPEC 10 rule 3) while its index expressions run, so
+// one that moves or mutably borrows it is an error, as for s += f(mut &s) (design/owned-str.md,
+// issues 7 and 13). A global is snapshotted by before/snapVal instead. The pending mark to cut.
+fn (c: mut &Checker) holdBase(v: &Val, line: int): int {
+    let mark = len(c.cx.pending)
+    if v.cat == CAT_PLACE && v.gk < 0 && v.root >= 0 { c.hold(v.clone(), HM_SHARED, c.newCid(), line) }
+    return mark
+}
+
+// Under LXL_OWNED_STR: would moving root's path conflict with a borrow held by a call in progress?
+fn (c: &Checker) pendingHit(root: int, path: &str): bool {
+    for p in c.cx.pending {
+        if p.root == root && overlap(&p.path, path) { return true }
+    }
+    return false
 }
 
 fn (c: mut &Checker) newCid(): int {
@@ -1413,7 +1472,7 @@ fn (c: mut &Checker) holdRoots(r: int, m: bool, cid: int, line: int) {
 }
 
 // Register a borrowed argument of call cid (SPEC 10 rule 3, and nested calls).
-fn (c: mut &Checker) hold(v: Val, m: int, cid: int, line: int) {
+fn (c: mut &Checker) hold(v: &Val, m: int, cid: int, line: int) {
     let root = v.root
     if root == -1 || root <= -2 { return }
     if c.vars[root].jn >= 0 {      // a borrow joined from several roots (SPEC 7.8) holds each of them whole
@@ -1434,10 +1493,54 @@ fn (c: mut &Checker) hold(v: Val, m: int, cid: int, line: int) {
                 "borrow of it")
         }
     }
-    append(mut &c.cx.pending, Pend{root: root, path: v.path, m: m, cid: cid})
+    append(mut &c.cx.pending, Pend{root: root, path: v.path.clone(), m: m, cid: cid})
 }
 
 fn hm(m: bool): int { return if m { HM_MUT } else { HM_SHARED } }
+
+// SPEC 9.1 (design/owned-str.md, issue 3): a field moved out of a temporary record (f().x). The
+// temporary is taken apart as a destructuring let would: the field is moved out, the other fields
+// are dropped, a box is freed, and the temporary is no longer dropped at the end of the statement.
+// The C of the field, or -1 if v is not a direct field of such a temporary.
+fn (c: mut &Checker) moveOutOfTmp(v: &Val): int {
+    let ti = -2 - v.root
+    if ti < 0 || ti >= len(c.tmps) || !c.tmps[ti].live { return -1 }
+    let tt = c.tmps[ti].t
+    if c.pg.tk(tt) != sema.TK_INST || c.pg.isBorrowClass(tt) { return -1 }
+    let d = c.pg.ta(tt)
+    if c.pg.types[d].form != sx.F_RECORD || c.pg.types[d].drop >= 0 { return -1 }
+    // the path names one field (a boxed record field's path ends in a separator)
+    var fname = v.path.clone()
+    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1] }
+    for k in 0..len(fname) {
+        if strByte(fname, k) == 0 { return -1 }
+    }
+    let fi = c.fieldIndex(d, &fname)
+    if fi < 0 { return -1 }
+    let env = c.pg.declEnv(tt)
+    let sep = if c.pg.types[d].value { "." } else { "->" }
+    let base = c.tmps[ti].c
+    let n = c.fresh("mv")
+    c.emit(c.x.decl(c.T(v.t), &n, c.x.member(base, &sep, &("f_" + c.pg.types[d].fields[fi].name))))
+    var i = len(c.pg.types[d].fields) - 1
+    while i >= 0 {
+        let f = c.pg.types[d].fields[i].clone()
+        if i != fi { c.dropc(c.x.member(base, &sep, &("f_" + f.name)), c.pg.subst(f.ty, &env)) }
+        i -= 1
+    }
+    if !c.pg.types[d].value { c.emitx(c.x.call("rt_free", [base])) }
+    c.tmps[ti].live = false
+    return c.nm(&n)
+}
+
+// consume, recording what takes the value for LXL_OWNED_STR's notes.
+fn (c: mut &Checker) consumeAs(what: &str, v: Val, line: int): int {
+    let o = c.octx.clone()
+    c.octx = what.clone()
+    let r = c.consume(v, line)
+    c.octx = o
+    return r
+}
 
 // Take ownership of the value of v: copy (dup) a copy type, move otherwise.
 fn (c: mut &Checker) consume(v: Val, line: int): int {
@@ -1452,9 +1555,28 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
     }
     if v.cat == CAT_RV { return v.c }
     if c.isCopy(v.t) { return c.dup(v.c, v.t) }
+    let soft = c.soft(v.t)
     if v.vvar >= 0 && !v.viaref && len(v.path) == 0 && c.pg.tk(c.vars[v.vvar].t) != sema.TK_REF {
         let vx = v.vvar
+        c.vars[vx].taken = true
         if c.vars[vx].moved { c.movedErr(vx, line) }
+        if soft && len(c.cx.nomove) > 0 {
+            c.note("loop", line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft && c.moveBlocked(vx) {
+            c.note(if c.vars[vx].cap >= 0 { "captured" } else { "frozen" }, line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft && c.pendingHit(vx, "") {
+            c.note("held", line, &c.vars[vx].name)
+            return c.dup(v.c, v.t)
+        }
+        if soft {
+            c.note("move", line, &c.vars[vx].name)
+            c.vars[vx].mline = line
+            c.vars[vx].mctx = c.octx.clone()
+        }
         if len(c.cx.nomove) > 0 {
             c.err(line, "cannot move '" + c.vars[vx].name + "' " + c.cx.nomove[len(c.cx.nomove) - 1])
         }
@@ -1463,19 +1585,33 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
         c.vars[vx].moved = true
         return v.c
     }
+    if !v.viaref && v.gk < 0 && isTmpRoot(v.root) {
+        let mv = c.moveOutOfTmp(v)
+        if mv >= 0 { return mv }
+    }
     let hasName = v.root >= 0 || v.root <= -2
     let name = c.rootName(v.root, "")
+    if soft {
+        let what = if v.viaref { "borrow" } else if v.gk >= 0 { "global" } else { "place" }
+        if v.gk != sema.D_CONST { c.note(&what, line, &name) }
+        return c.dup(v.c, v.t)
+    }
     if v.viaref {
         let s = if hasName { " (" + name + ")" } else { "" }
         c.err(line, "cannot move a " + c.tstr(v.t) + " out of a borrow" + s + ": it is not a copy type")
     }
-    if v.gk >= 0 { c.err(line, "cannot move out of global " + c.gname(v.gk, v.gi)) }
+    // a constant read where an owned value is wanted is a new value, as a literal is
+    if v.gk == sema.D_CONST && c.pg.isCopyLegacy(v.t) { return c.dup(v.c, v.t) }
+    if v.gk >= 0 {
+        let gn = c.gname(v.gk, v.gi)
+        c.err(line, "cannot move out of global " + gn + ": read a copy with " + gn + ".clone()")
+    }
     let s = if hasName { " of " + sx.pyRepr(&name) } else { "" }
     c.err(line, "cannot move a " + c.tstr(v.t) + " out of a field or element" + s + "; use replace, swap or pop")
 }
 
 fn (c: &Checker) gname(gk: int, gi: int): str {
-    return if gk == sema.D_GLOBAL { c.pg.globals[gi].name } else { c.pg.consts[gi].name }
+    return if gk == sema.D_GLOBAL { c.pg.globals[gi].name.clone() } else { c.pg.consts[gi].name.clone() }
 }
 
 fn (c: mut &Checker) deref(v: Val): Val {
@@ -1483,7 +1619,7 @@ fn (c: mut &Checker) deref(v: Val): Val {
     let dc = if c.pg.tm(v.t) { c.x.par(c.x.pre("*", v.c)) } else { c.derefOf(c.pg.ta(v.t), v.c) }
     var r = val(dc, c.pg.ta(v.t), CAT_PLACE)
     r.root = v.root
-    r.path = v.path
+    r.path = v.path.clone()
     r.mutable = c.pg.tm(v.t)
     r.viaref = true
     return r
@@ -1495,14 +1631,14 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
     let k = c.pg.tk(v.t)
     if k == sema.TK_SLICE {
         if m && !c.pg.tm(v.t) { c.err(line, "cannot make a mut slice from a shared slice") }
-        if m { c.frozen(v.root, FR_MUT, line) }
+        if m { c.frozenAt(v.root, &v.path, FR_MUT, line) }
         return rvAt(v.c, c.pg.mkSlice(c.pg.ta(v.t), m), v.root, &v.path)
     }
     if k == sema.TK_REF {
         if m && !c.pg.tm(v.t) {
             c.err(line, "cannot mutably borrow through the shared borrow '" + c.rootName(v.root, "?") + "'")
         }
-        if m { c.frozen(v.root, FR_MUT, line) }
+        if m { c.frozenAt(v.root, &v.path, FR_MUT, line) }
         let rc = if !m && c.pg.tm(v.t) { c.shareOf(c.pg.ta(v.t), v.c) } else { v.c }
         return rvAt(rc, c.pg.mkRef(c.pg.ta(v.t), m), v.root, &v.path)
     }
@@ -1512,6 +1648,12 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
         if v.gk >= 0 {
             // a receiver, or a constant (SPEC 7.5): a borrow of a temporary copy
             if (recv || v.gk == sema.D_CONST) && !m {
+                if !c.isCopy(v.t) && v.gk == sema.D_GLOBAL {
+                    // SPEC 5.2: an owned global is read by value: a borrow of it could outlive it
+                    let gn = c.gname(v.gk, v.gi)
+                    c.err(line, "cannot borrow global " + gn + " of the owned type " + c.tstr(v.t) +
+                        ": read a copy with " + gn + ".clone()")
+                }
                 v = c.holdtmp(c.dup(v.c, v.t), v.t)
                 return c.borrow(v, m, line, false)
             }
@@ -1520,7 +1662,7 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
         }
         if m {
             if !v.mutable { c.immutable(v, line, "mutably borrow") }
-            c.frozen(v.root, FR_MUT, line)
+            c.frozenAt(v.root, &v.path, FR_MUT, line)
         }
         cc = if m { c.x.par(c.x.pre("&", v.c)) } else { c.addrOf(v.t, v.c) }
     } else if v.cat == CAT_TMP {
@@ -1534,15 +1676,20 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
     return rvAt(cc, c.pg.mkRef(v.t, m), v.root, &v.path)
 }
 
-fn (c: mut &Checker) immutable(v: Val, line: int, verb: str): never {
+fn (c: mut &Checker) immutable(v: &Val, line: int, verb: &str): never {
     let r = v.root
     if r >= 0 {
-        let name = c.vars[r].name
-        let vb = if strings.endsWith(&verb, " to") { verb[0..len(verb) - 3] } else { verb }
+        let name = c.vars[r].name.clone()
+        let vb = if strings.endsWith(&verb, " to") { verb[0..len(verb) - 3] } else { verb.clone() }
         let rk = c.pg.tk(c.vars[r].t)
         let isB = rk == sema.TK_REF || rk == sema.TK_SLICE
         if isB && !c.pg.tm(c.vars[r].t) {
             c.err(line, "cannot " + vb + " through '" + name + "': it is a shared borrow (&), not mut &")
+        }
+        let base0 = if isB { c.pg.ta(c.vars[r].t) } else { c.vars[r].t }
+        if v.viaref && c.pg.isRc(base0) {
+            c.err(line, "cannot " + vb + " the value of the rc handle '" + name + "': it does not change while " +
+                "it may be shared (" + name + ".unshare() lends it as mut &)")
         }
         if v.viaref && !isB { c.err(line, "cannot " + vb + " through a shared borrow or slice of '" + name + "'") }
         if c.vars[r].kind == VK_PARAM { c.err(line, "cannot " + verb + " parameter '" + name + "': declare it `var " + name + "`") }
@@ -1636,7 +1783,18 @@ fn (c: mut &Checker) snapVal(v: Val): Val {
     if v.cat == CAT_RV && v.t != sema.T_VOID && k != sema.TK_REF && !c.isWord(v.c) {
         return c.holdtmpSrc(v.c, v.t, true, v)
     }
-    if v.cat != CAT_PLACE || k == sema.TK_REF || !c.isCopy(v.t) { return v }
+    if v.cat != CAT_PLACE || k == sema.TK_REF { return v }
+    if !c.isCopy(v.t) {
+        // design/owned-str.md, issue 13: a value of a type that was copied before the switch (a str,
+        // a value holding one) read as an operand, with a later operand that may change or move its
+        // place (a global, or x in x.name[take(x)]), is snapshotted as a clone, as it was copied
+        // before. Other owned values keep the holds of rule 3.
+        if !c.pg.isCopyLegacy(v.t) || v.gk < 0 { return v }       // a local is held instead (rule 3)
+        let cr = c.crOf(v)
+        var r = c.holdtmp(c.hole(mkHoleX(H_CLONE, v.t, v.c)), v.t)
+        r.cr = cr
+        return r
+    }
     let cr = c.crOf(v)
     var r = c.holdtmp(c.dup(v.c, v.t), v.t)
     r.cr = cr
@@ -1695,8 +1853,15 @@ fn (c: mut &Checker) stmt(s: int) {
     }
 }
 
-fn (c: mut &Checker) coerce(v: Val, t: int, line: int, what: &str): Val {
+fn (c: mut &Checker) coerce(v0: Val, t: int, line: int, what: &str): Val {
+    var v = v0
     if v.t == t { return v }
+    if c.pg.tk(t) == sema.TK_REF && !c.pg.tm(t) && c.pg.tk(v.t) == sema.TK_REF && !c.pg.tm(v.t) &&
+            c.pg.isRc(c.pg.ta(v.t)) && !c.pg.isRc(c.pg.ta(t)) {
+        // SPEC 4.9: a &rc T where a &T is expected lends the value the handle holds
+        var p = c.rcRead(v.clone())
+        if p.t == c.pg.ta(t) { return c.borrow(p, false, line, false) }
+    }
     let vk = c.pg.tk(v.t)
     let k = c.pg.tk(t)
     if k == sema.TK_CLO && vk == sema.TK_FN && c.sameSig(v.t, t) {     // through a trampoline (emit)
@@ -1704,14 +1869,14 @@ fn (c: mut &Checker) coerce(v: Val, t: int, line: int, what: &str): Val {
         return rv(c.cloVal(h, v.c), t)
     }
     if vk == sema.TK_REF && k != sema.TK_REF {
-        let d = c.deref(v)
+        let d = c.deref(v.clone())
         if d.t == t { return d }
     }
     if vk == sema.TK_REF && k == sema.TK_REF && c.pg.ta(v.t) == c.pg.ta(t) && (c.pg.tm(v.t) || !c.pg.tm(t)) {
         let rc = if c.pg.tm(v.t) && !c.pg.tm(t) { c.shareOf(c.pg.ta(t), v.c) } else { v.c }
         var r = val(rc, t, v.cat)
         r.root = v.root
-        r.path = v.path
+        r.path = v.path.clone()
         r.vvar = v.vvar
         return r
     }
@@ -1721,17 +1886,17 @@ fn (c: mut &Checker) coerce(v: Val, t: int, line: int, what: &str): Val {
         c.pg.tk(c.pg.ta(t)) == sema.TK_ARR && c.strAsView(c.pg.ta(c.pg.ta(v.t)), c.pg.ta(c.pg.ta(t))) {
         var r = val(v.c, t, v.cat)
         r.root = v.root
-        r.path = v.path
+        r.path = v.path.clone()
         r.vvar = v.vvar
         return r
     }
     if k == sema.TK_SLICE {
-        let s = c.asSlice(v)
+        let s = c.asSlice(v.clone())
         if s.t >= 0 && (c.pg.ta(s.t) == c.pg.ta(t) && (c.pg.tm(s.t) || !c.pg.tm(t)) ||
             !c.pg.tm(t) && c.strAsView(c.pg.ta(s.t), c.pg.ta(t))) {
             var r = val(s.c, t, s.cat)
             r.root = s.root
-            r.path = s.path
+            r.path = s.path.clone()
             return r
         }
     }
@@ -1777,13 +1942,19 @@ fn (c: mut &Checker) resolve(a: int, pos: int, line: int): int {
 
 fn (c: mut &Checker) sLet(s: int) {
     let n = c.nd(s)
-    let name = n.s
+    let name = &n.s
     let mutable = n.flags & sx.MUTABLE != 0
     let exp = if n.a >= 0 { c.resolve(n.a, if mutable { sema.P_VAR } else { sema.P_LET }, n.line) } else { -1 }
     var v = c.expr(n.b, exp)
     if v.t == sema.T_VOID { c.err(n.line, "the initializer of '" + name + "' has no value") }
     let cn = c.fresh(&("v_" + name + "_"))
-    let et = if exp >= 0 { exp } else { v.t }
+    var et = if exp >= 0 { exp } else { v.t }
+    if mutable && exp < 0 && c.pg.tk(et) == sema.TK_REF && !c.pg.tm(et) && c.soft(c.pg.ta(et)) {
+        // LXL_OWNED_STR: a var initialised from a borrowed soft value (a loop variable): kept as a
+        // copy, and noted by consume as a value taken out of a borrow
+        v = c.deref(v)
+        et = v.t
+    }
     let what = "the initializer of '" + name + "'"
     if c.pg.tk(et) == sema.TK_CLO {
         v = c.coerce(v, et, n.line, &what)
@@ -1810,7 +1981,7 @@ fn (c: mut &Checker) sLet(s: int) {
             c.err(n.line, "cannot borrow a temporary into let '" + name + "': the temporary does not outlive " +
                 "the statement")
         }
-        if c.pg.tm(v.t) { c.frozen(root, FR_MUT, n.line) }
+        if c.pg.tm(v.t) { c.frozenAt(root, &v.path, FR_MUT, n.line) }
         let vx = c.newVar(&name, &cn, v.t, false, VK_LOCAL, n.line)
         c.vars[vx].broot = if root == R_FREE { -1 } else { root }
         if c.pg.tk(v.t) == sema.TK_REF {
@@ -1819,13 +1990,13 @@ fn (c: mut &Checker) sLet(s: int) {
             c.emit(c.x.decl(c.ct("lxl_slice"), &cn, v.c))
         }
         c.declare(vx)
-        if root != R_FREE { c.freeze(root, c.pg.tm(v.t), &("'" + name + "'"), c.nllVar(vx)) }
+        if root != R_FREE { c.freezeAt(root, &v.path, c.pg.tm(v.t), &("'" + name + "'"), c.nllVar(vx)) }
         return
     }
     if exp >= 0 { v = c.coerce(v, exp, n.line, &what) }
     let bc = c.pg.isBorrowClass(v.t)
     let cr = if bc { c.crOf(v) } else { -1 }
-    let cc = c.consume(v, n.line)
+    let cc = c.consumeAs("let", v.clone(), n.line)
     let ct = c.T(v.t)
     c.emit(c.x.decl(ct, &cn, cc))
     let x = c.newVar(&name, &cn, v.t, mutable, VK_LOCAL, n.line)
@@ -1867,12 +2038,14 @@ fn (c: mut &Checker) sDestructure(s: int) {
         c.err(n.line, b.toStr() + " is not a record type: only a record can be taken apart")
     }
     let di = d.i
-    let dname = c.pg.types[di].name
+    let dname = c.pg.types[di].name.clone()
     if c.pg.types[di].drop >= 0 { c.err(n.line, "cannot take apart a " + dname + ": it has a drop method") }
     var v = c.expr(n.c, exp)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
     if c.pg.tk(v.t) != sema.TK_INST || c.pg.ta(v.t) != di { c.err(n.line, "the value is " + c.tstr(v.t) + ", not a " + dname) }
-    if v.cat == CAT_PLACE && !c.isCopy(v.t) {
+    if v.cat == CAT_PLACE && !c.isCopy(v.t) && c.soft(v.t) {
+        c.note("apart", n.line, "")
+    } else if v.cat == CAT_PLACE && !c.isCopy(v.t) {
         c.err(n.line, "cannot take apart a place of the owned type " + c.tstr(v.t) + ": the value must not be a " +
             "variable, field or element (use move(x) for a local)")
     }
@@ -1893,13 +2066,13 @@ fn (c: mut &Checker) sDestructure(s: int) {
     let acc = c.fresh("ds")
     let ct = c.T(v.t)
     let dcr = if c.pg.isBorrowClass(v.t) { c.crOf(v) } else { -1 }
-    let cv = c.consume(v, n.line)
+    let cv = c.consumeAs("destructure", v, n.line)
     c.emit(c.x.decl(ct, &acc, cv))
     let accn = c.nm(&acc)
     let sep = if c.pg.types[di].value { "." } else { "->" }
     var i = len(c.pg.types[di].fields) - 1
     while i >= 0 {
-        let f = c.pg.types[di].fields[i]
+        let f = c.pg.types[di].fields[i].clone()
         if named.getOr(&f.name, "_") == "_" { c.dropc(c.x.member(accn, &sep, &("f_" + f.name)), c.pg.subst(f.ty, &env)) }
         i -= 1
     }
@@ -1957,7 +2130,7 @@ fn (c: mut &Checker) placeType(e: int): int {
     return -1
 }
 
-fn (c: &Checker) selfInDrop(v: Val, line: int) {
+fn (c: &Checker) selfInDrop(v: &Val, line: int) {
     let f = if len(c.outers) > 0 { c.outers[0].fd } else { c.cx.fd }
     if f >= 0 && c.pg.fns[f].ownerKind == sema.O_DECL && c.pg.types[c.pg.fns[f].owner].drop == f && v.root >= 0 &&
         c.vars[v.root].name == c.pg.fns[f].recvName && c.vars[v.root].kind == VK_PARAM && len(v.path) == 0 {
@@ -1969,7 +2142,7 @@ fn (c: mut &Checker) sAssign(s: int) {
     let n = c.nd(s)
     let tg = n.a
     let tn = c.nd(tg)
-    let op = n.s
+    let op = &n.s
     if tn.kind == sx.N_NAME {
         let vx = c.lookupVar(&tn.s, true)
         if vx < 0 {
@@ -1977,7 +2150,7 @@ fn (c: mut &Checker) sAssign(s: int) {
             if d.k == sema.D_CONST { c.err(n.line, "cannot assign to constant " + tn.s) }
             if d.k != sema.D_GLOBAL { c.err(n.line, "unknown name '" + tn.s + "'") }
         } else if c.pg.tk(c.vars[vx].t) != sema.TK_REF {
-            let vn = c.vars[vx].name
+            let vn = c.vars[vx].name.clone()
             if c.vars[vx].cap >= 0 && c.vars[vx].moved { c.movedErr(vx, n.line) }
             if !c.vars[vx].mutable {
                 if c.vars[vx].kind == VK_PARAM {
@@ -1994,7 +2167,7 @@ fn (c: mut &Checker) sAssign(s: int) {
                 c.frozen(vx, FR_ASSIGN, n.line)
                 c.cx.rhsAt = -1
                 if c.pg.isBorrowClass(vt) { c.storeRoot(vx, c.crOf(v), vt, n.line) }
-                let cc = c.consume(v, n.line)
+                let cc = c.consumeAs("assign", v, n.line)
                 var p = val(c.vars[vx].c, vt, CAT_PLACE)
                 p.vvar = vx
                 c.store(p, cc, !c.vars[vx].moved)
@@ -2012,28 +2185,28 @@ fn (c: mut &Checker) sAssign(s: int) {
         let mark = len(c.cx.pending)
         if c.effects(tg, false) { v = c.snapVal(v) }
         if c.placeActs(tg) || (c.acts(tg) && c.pod(v.t)) { v = c.seq(v) }
-        if v.cat == CAT_PLACE && !c.isCopy(v.t) { c.hold(v, HM_MOVE, c.newCid(), n.line) }
+        if v.cat == CAT_PLACE && !c.isCopy(v.t) && !c.soft(v.t) { c.hold(v, HM_MOVE, c.newCid(), n.line) }
         c.cx.rhsAt = s
         let p = c.place(tg)
         c.cx.rhsAt = -1
         c.cutPending(mark)
         v = c.coerce(v, p.t, n.line, "the assigned value")
         if c.pg.isBorrowClass(p.t) { c.storeRoot(p.root, c.crOf(v), p.t, n.line) }
-        let cc = c.consume(v, n.line)
+        let cc = c.consumeAs("assign", v, n.line)
         c.store(p, cc, true)
         return
     }
     let p = c.place(tg)
     if p.vvar >= 0 && c.vars[p.vvar].moved { c.movedErr(p.vvar, n.line) }
-    let lv = c.before1(p, n.b)
+    let lv = c.before1(p.clone(), n.b)
     var fixed = tg
     while c.kind(fixed) == sx.N_FIELDX || c.kind(fixed) == sx.N_INDEX { fixed = c.nd(fixed).a }
-    var r = c.binop(op, lv, Arg{isVal: false, n: n.b, v: lv}, n.line, p.t, c.kind(fixed) != sx.N_NAME, p)
+    var r = c.binop(op, lv.clone(), Arg{isVal: false, n: n.b, v: lv.clone()}, n.line, p.t, c.kind(fixed) != sx.N_NAME, p.clone())
     // the value is stored to the place after b has run: b may have moved the place's variable
     // (`x.v += take(x)`, or an if expression moving it on one path and dropping it on the others)
     if p.root >= 0 && p.vvar < 0 && c.vars[p.root].moved { c.movedErr(p.root, n.line) }
     if c.effects(n.b, false) && c.checks(p.c) && c.pod(p.t) { r = c.seq(r) }
-    let cc = c.consume(c.coerce(r, p.t, n.line, "the result"), n.line)
+    let cc = c.consumeAs("assign", c.coerce(r, p.t, n.line, "the result"), n.line)
     let live = !(p.vvar >= 0 && c.vars[p.vvar].moved)
     c.store(p, cc, live)
     if p.vvar >= 0 {
@@ -2063,13 +2236,13 @@ fn (c: mut &Checker) place(e: int): Val {
     if v.gk == sema.D_CONST { c.err(line, "cannot assign to constant " + c.pg.consts[v.gi].name) }
     if v.gk < 0 {
         if !v.mutable { c.immutable(v, line, "assign to") }
-        c.frozen(v.root, FR_ASSIGN, line)
+        c.frozenAt(v.root, &v.path, FR_ASSIGN, line)
         c.checkPending(v.root, &v.path, line, false)
     }
     return v
 }
 
-fn (c: mut &Checker) store(p: Val, cc: int, dropOld: bool) {
+fn (c: mut &Checker) store(p: &Val, cc: int, dropOld: bool) {
     if c.pod(p.t) || !dropOld {
         c.emitx(c.x.asg(p.c, cc))
         return
@@ -2095,7 +2268,34 @@ fn (c: mut &Checker) cond(e: int): int {
     return c.nm(&cn)
 }
 
-fn (c: &Checker) movedErr(vx: int, line: int): never {
+// LXL_OWNED_STR (design/owned-str.md): a type copied today that would be owned with str owned.
+fn (c: mut &Checker) soft(t: int): bool { return c.pg.migrate && !c.isCopy(t) && c.pg.isCopyLegacy(t) }
+
+// A measurement line on stderr: OWNED_STR kind file:line name.
+fn (c: &Checker) note(kind: &str, line: int, what: &str) {
+    let into: &str = if c.octx == "" { "other" } else { &c.octx }
+    eprintln("OWNED_STR " + kind + " " + c.pg.mods[c.cx.mod].fname + ":" + intToStr(line) + " " + what + " " + into)
+}
+
+// A move that a later use shows needed a clone: noted where it was, with what took it.
+fn (c: &Checker) noteClone(vx: int) {
+    let into: &str = if c.vars[vx].mctx == "" { "other" } else { &c.vars[vx].mctx }
+    eprintln("OWNED_STR clone " + c.pg.mods[c.cx.mod].fname + ":" + intToStr(c.vars[vx].mline) + " " +
+        c.vars[vx].name + " " + into)
+}
+
+// Under LXL_OWNED_STR, a use after a move of a soft variable: its last move needed a clone. The
+// variable is given its value back and checking goes on.
+fn (c: mut &Checker) movedErr(vx: int, line: int) {
+    if c.soft(c.vars[vx].t) {
+        c.noteClone(vx)
+        c.vars[vx].moved = false
+        return
+    }
+    c.movedErr0(vx, line)
+}
+
+fn (c: &Checker) movedErr0(vx: int, line: int): never {
     var m = "'" + c.vars[vx].name + "' was moved and has no value here"
     if c.vars[vx].pjoin > 0 {
         m = m + " (it is moved on some paths of the if or match at line " + intToStr(c.vars[vx].pjoin) +
@@ -2243,7 +2443,10 @@ fn (c: mut &Checker) loopEnd(body: int, line: int) {
         for b in lp.breaks {
             var i = 0
             while i < len(lp.entry) {
-                if snapGet(&b, lp.entry[i]) != lp.entry[i + 1] {
+                let lv = lp.entry[i]
+                if snapGet(&b, lv) != lp.entry[i + 1] && c.soft(c.vars[lv].t) {
+                    c.noteClone(lv)
+                } else if snapGet(&b, lv) != lp.entry[i + 1] {
                     c.err(line, "'" + c.vars[lp.entry[i]].name + "' is moved inside the loop")
                 }
                 i += 2
@@ -2253,12 +2456,16 @@ fn (c: mut &Checker) loopEnd(body: int, line: int) {
     }
 }
 
-fn (c: &Checker) loopState(line: int) {
+fn (c: mut &Checker) loopState(line: int) {
     let lp = len(c.cx.loops) - 1
     var i = 0
     while i < len(c.cx.loops[lp].entry) {
         let v = c.cx.loops[lp].entry[i]
-        if (if c.vars[v].moved { 1 } else { 0 }) != c.cx.loops[lp].entry[i + 1] {
+        let ch = (if c.vars[v].moved { 1 } else { 0 }) != c.cx.loops[lp].entry[i + 1]
+        if ch && c.soft(c.vars[v].t) {
+            c.noteClone(v)
+            c.vars[v].moved = false
+        } else if ch {
             c.err(line, "'" + c.vars[v].name + "' is moved inside the loop and not assigned again before the next " +
                 "iteration")
         }
@@ -2342,7 +2549,7 @@ fn (c: mut &Checker) sContinue(s: int) {
 
 fn (c: mut &Checker) sFor(s: int) {
     let n = c.nd(s)
-    let name = n.s
+    let name = &n.s
     if n.b >= 0 {
         let a = c.before1(c.rd(c.expr(n.a, sema.T_INT)), n.b)
         let b = c.rd(c.expr(n.b, sema.T_INT))
@@ -2366,6 +2573,7 @@ fn (c: mut &Checker) sFor(s: int) {
     }
     var v = c.expr(n.a, -1)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
+    while c.pg.isRc(v.t) { v = c.rcValue(v) }       // SPEC 4.9: for x in r walks the value
     let k = c.pg.tk(v.t)
     if k != sema.TK_ARR && k != sema.TK_SLICE {
         if k == sema.TK_INST || k == sema.TK_TP {
@@ -2375,6 +2583,10 @@ fn (c: mut &Checker) sFor(s: int) {
         c.err(n.line, "for ... in needs an array, a slice or a range a..b, not " + c.tstr(v.t))
     }
     let et = c.pg.ta(v.t)
+    if k == sema.TK_ARR && !c.isCopy(et) && !c.pg.isBorrowClass(et) && (v.cat == CAT_RV || v.cat == CAT_TMP) {
+        c.forConsume(s, v, et)
+        return
+    }
     let ap = c.fresh("ap")
     let i = c.fresh("i")
     if v.cat == CAT_RV && k == sema.TK_ARR {
@@ -2397,7 +2609,7 @@ fn (c: mut &Checker) sFor(s: int) {
     let ecr = if c.isCopy(et) && c.pg.isBorrowClass(et) { c.stmtRoot(c.innerCr(v.root, v.cr, et), mut &h, &hd, n.line) } else { -1 }
     let eroot = if !c.isCopy(et) && isTmpRoot(v.root) { c.stmtRoot(v.root, mut &h, &hd, n.line) } else { v.root }
     c.loopStart(c.snapshot(), false)
-    if v.root >= 0 { c.freeze(v.root, false, "the for loop", -1) }
+    if v.root >= 0 { c.freezeAt(v.root, &v.path, false, "the for loop", -1) }
     if c.isCopy(et) {
         let ct = c.T(et)
         c.emit(c.x.decl(ct, &xn, c.dup(elem, et)))
@@ -2416,6 +2628,47 @@ fn (c: mut &Checker) sFor(s: int) {
     c.emit(c.x.send())
 }
 
+// SPEC 8 (design/owned-str.md, issue 6): for x in a temporary array of owned elements (a call's
+// result, or move(xs)) consumes it: x owns each element in turn. The array is reversed in place and
+// each turn takes its last element, so at every point it holds exactly the elements not yet taken;
+// break, return and try leave those to its ordinary drop at the end of the statement.
+//     { reverse a; while (a.len > 0) { a.len -= 1; T x = a.data[a.len]; body } }
+fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
+    let n = c.nd(s)
+    let name = &n.s
+    var v = v0
+    if v.cat == CAT_RV { v = c.holdtmp(v.c, v.t) }
+    let ct = c.T(et)
+    let i64 = c.ct("int64_t")
+    let ap = c.fresh("ap")
+    c.emit(c.x.decl(c.ct("lxl_arr*"), &ap, c.x.pre("&", v.c)))
+    let apn = c.nm(&ap)
+    let len = c.x.arrow(apn, "len")
+    let data = c.x.par(c.x.pcast(c.x.ptr(ct), c.x.arrow(apn, "data")))
+    let i = c.fresh("i")
+    let ixn = c.nm(&i)
+    c.emit(c.x.sfor(c.x.decl(i64, &i, c.lit(0)), c.x.bin("<", ixn, c.x.bin("/", len, c.lit(2))), c.x.post(ixn, "++")))
+    c.cx.ind += 1
+    let j = c.x.par(c.x.bin("-", c.x.bin("-", len, c.lit(1)), ixn))
+    let sw = c.fresh("sw")
+    c.emit(c.x.decl(ct, &sw, c.x.idx(data, ixn)))
+    c.emitx(c.x.asg(c.x.idx(data, ixn), c.x.idx(data, j)))
+    c.emitx(c.x.asg(c.x.idx(data, j), c.nm(&sw)))
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+    c.emit(c.x.swhile(c.x.bin(">", len, c.lit(0))))
+    c.cx.ind += 1
+    c.loopStart(c.snapshot(), false)
+    let xn = c.fresh(&("v_" + name + "_"))
+    c.emitx(c.x.asg(len, c.x.bin("-", len, c.lit(1))))
+    c.emit(c.x.decl(ct, &xn, c.x.idx(data, len)))
+    let x = c.newVar(&name, &xn, et, false, VK_LOCAL, n.line)
+    c.declare(x)
+    c.loopEnd(n.c, n.line)
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+}
+
 // for x in it, it not an array or slice (design/borrow-types.md): an iterator, a value with a
 // method next(mut &self): Option[X]. It runs as
 //     { var it' = it; while true { match it'.next() { Some(x) { body } None { break } } } }
@@ -2423,7 +2676,7 @@ fn (c: mut &Checker) sFor(s: int) {
 fn (c: mut &Checker) forIter(s: int, v0: Val) {
     let n = c.nd(s)
     let line = n.line
-    let name = n.s
+    let name = &n.s
     let sig = c.methodSig(v0.t, "next", line, true)
     if sig.kind < 0 {
         c.err(line, "for ... in needs an array, a slice, a range a..b or an iterator (a value with a method " +
@@ -2433,7 +2686,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     let cr = if c.pg.isBorrowClass(v0.t) {
         c.stmtRoot(c.crOf(v0), mut &h, &("the temporary in the header of the for loop at line " + intToStr(line)), line)
     } else { -1 }
-    let cc = c.consume(v0, line)
+    let cc = c.consumeAs("for", v0.clone(), line)
     c.emit(c.x.sblock())
     c.cx.ind += 1
     c.pushScope()
@@ -2465,7 +2718,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     if some < 0 { c.err(line, "an iterator's next must return an Option, not " + c.tstr(ot)) }
     let rcr = if c.pg.isBorrowClass(ot) { c.crOf(r) } else { -1 }
     let on = c.fresh("nx")
-    c.emit(c.x.decl(c.T(ot), &on, c.consume(r, line)))
+    c.emit(c.x.decl(c.T(ot), &on, c.consumeAs("for", r, line)))
     let fr = c.popFrame()
     c.dropFrame(&fr)
     let sep = if c.pg.types[c.pg.ta(ot)].value { "." } else { "->" }
@@ -2473,7 +2726,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     c.emit(c.x.if1(c.x.bin("!=", c.x.member(acc, &sep, "tag"), c.lit(c.pg.variants[some].index)), c.x.sbreak()))
     c.loopStart(entry, false)
     let env = c.pg.declEnv(ot)
-    let f = c.pg.variants[some].fields[0]
+    let f = c.pg.variants[some].fields[0].clone()
     let xt = c.pg.subst(f.ty, &env)
     let fc = c.x.dot(c.x.dot(c.x.member(acc, &sep, "u"), "V_Some"), &("f_" + f.name))
     let xn = c.fresh(&("v_" + name + "_"))
@@ -2493,7 +2746,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
 fn (c: mut &Checker) sReturn(s: int) {
     let n = c.nd(s)
     let ret = c.cx.ret
-    let label = c.cx.label
+    let label = c.cx.label.clone()
     if ret == sema.T_NEVER { c.err(n.line, label + " returns never: it cannot return") }
     if n.a < 0 {
         if ret != sema.T_VOID { c.err(n.line, "return needs a " + c.tstr(ret) + " value in " + label) }
@@ -2512,7 +2765,7 @@ fn (c: mut &Checker) sReturn(s: int) {
                 c.checkResult(c.ultimate(v.root), v.root, n.line, true)
             } else if r != c.cx.bvar {
                 let name = c.rootName(v.root, "a temporary")
-                let bp = if c.cx.fd >= 0 { c.pg.fns[c.cx.fd].bparam } else { "" }
+                let bp = if c.cx.fd >= 0 { c.pg.fns[c.cx.fd].bparam.clone() } else { "" }
                 c.err(n.line, "cannot return a borrow of " + sx.pyRepr(&name) + ": a borrow result must be rooted at the " +
                     "borrowed parameter '" + bp + "', not a local or temporary")
             }
@@ -2520,7 +2773,7 @@ fn (c: mut &Checker) sReturn(s: int) {
         } else {
             v = c.coerce(v, ret, n.line, "the returned value")
             if c.cx.fd >= 0 && c.pg.isBorrowClass(ret) { c.checkResult(c.crOf(v), -1, n.line, false) }
-            cc = c.consume(v, n.line)
+            cc = c.consumeAs("return", v, n.line)
         }
         let rn = c.fresh("r")
         let ct = c.T(ret)
@@ -2538,9 +2791,35 @@ fn (c: mut &Checker) armBody(body: int, mx: bool) {
 }
 
 // A match statement (mx: a match expression's arms, each one expression).
+// SPEC 9.3 (design/owned-str.md, issue 9): a match on a local of an owned closed type that is not
+// used again (not in the arms, the rest of the statement, later statements or a loop around it)
+// consumes it, as match move(x) does.
+fn (c: mut &Checker) matchMoves(a: int): bool {
+    if c.kind(a) != sx.N_NAME { return false }
+    let vx = c.lookupVar(&(c.nd(a).s), true)
+    if vx < 0 || c.vars[vx].moved || c.vars[vx].cap >= 0 || len(c.cx.nomove) > 0 { return false }
+    if c.vars[vx].loops < len(c.cx.loops) { return false }     // declared outside a loop around the match
+    let t = c.vars[vx].t
+    if c.pg.tk(t) != sema.TK_INST || c.isCopy(t) { return false }
+    let d = c.pg.ta(t)
+    if c.pg.types[d].form != sx.F_CLOSED || c.pg.types[d].drop >= 0 { return false }
+    c.liveSkip = a
+    let live = c.isLive(vx, 0)
+    c.liveSkip = -1
+    return !live
+}
+
 fn (c: mut &Checker) sMatch(s: int, mx: bool) {
     let n = c.nd(s)
-    let v = c.expr(n.a, -1)
+    var v = voidVal(false)
+    if c.matchMoves(n.a) {
+        let mv = c.expr(n.a, -1)
+        let mcr = c.crOf(mv)
+        v = c.holdtmp(c.consumeAs("match", mv.clone(), n.line), mv.t)
+        v.cr = mcr
+    } else {
+        v = c.expr(n.a, -1)
+    }
     let base = if c.pg.tk(v.t) == sema.TK_REF { c.pg.ta(v.t) } else { v.t }
     if base == sema.T_VOID { c.err(n.line, "match needs a value") }
     if base < sema.NINTS || base == sema.T_STR {
@@ -2559,7 +2838,7 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
     var scr = -1            // a scrutinee holding borrows: their root
     var pcr = -1
     if borrowing {
-        var p = c.deref(v)
+        var p = c.deref(v.clone())
         if p.gk >= 0 { p = c.holdtmp(c.dup(p.c, p.t), p.t) }
         let sp = c.fresh("sp")
         let ct = c.T(base)
@@ -2580,7 +2859,7 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
         }
         let an = c.fresh("s")
         let ct = c.T(base)
-        let cv = c.consume(v, n.line)
+        let cv = c.consumeAs("match", v.clone(), n.line)
         c.emit(c.x.decl(ct, &an, cv))
         acc = c.nm(&an)
     }
@@ -2634,18 +2913,18 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
         if an.s == "" || multi {
             if !borrowing { c.dropc(acc, base) }
         } else {
-            let vname = c.pg.variants[vr].name
+            let vname = c.pg.variants[vr].name.clone()
             let nf = len(c.pg.variants[vr].fields)
             if an.b >= 0 && c.count(an.b) != nf {
                 c.err(an.line, vname + " has " + intToStr(nf) + " fields, but the pattern binds " + intToStr(c.count(an.b)))
             }
             for i in 0..nf {
-                let f = c.pg.variants[vr].fields[i]
+                let f = c.pg.variants[vr].fields[i].clone()
                 let ft = c.pg.subst(f.ty, &env)
                 let fc = c.x.dot(c.x.dot(c.x.member(acc, &sep, "u"), &("V_" + vname)), &("f_" + f.name))
                 var bn = if an.b >= 0 && c.count(an.b) > 0 { c.nd(c.item(an.b, i)).s } else { "" }
                 if bn == "_" { bn = "" }
-                let cn = c.fresh(&("v_" + (if bn == "" { "None" } else { bn }) + "_"))
+                let cn = c.fresh(&("v_" + (if bn == "" { "None" } else { bn.clone() }) + "_"))
                 if !borrowing {
                     if bn != "" {
                         let ct = c.T(ft)
@@ -2726,7 +3005,7 @@ fn (c: mut &Checker) armVariantAt(vpath: int, line: int, d: int, base: int): int
     return vr
 }
 
-fn (c: mut &Checker) matchLits(s: int, v: Val, t: int, mx: bool) {
+fn (c: mut &Checker) matchLits(s: int, v: &Val, t: int, mx: bool) {
     let n = c.nd(s)
     let sv = c.fresh("sv")
     let ct = c.T(t)
@@ -2762,7 +3041,7 @@ fn (c: mut &Checker) matchLits(s: int, v: Val, t: int, mx: bool) {
                     shown = c.vpathText(vpath)
                     named = true
                     let cv = c.armConst(vpath, t, an.line)
-                    if t == sema.T_STR { k = 2; xs = cv.s } else { x = cv.i }
+                    if t == sema.T_STR { k = 2; xs = cv.s.clone() } else { x = cv.i.clone() }
                 } else {
                     let ik = c.kind(it)
                     if ik == sx.N_LINT { x = num.bigParse(&(c.nd(it).s), c.flag(it, sx.MINUS)) }
@@ -2778,12 +3057,12 @@ fn (c: mut &Checker) matchLits(s: int, v: Val, t: int, mx: bool) {
                     if k == 1 && t != sema.T_BYTE {
                         c.err(an.line, "a char literal is a byte: it cannot be an arm of a match on " + c.tstr(t))
                     }
-                    if !sema.inRange(x, t) { c.err(an.line, "literal " + num.bigStr(x) + " does not fit " + c.tstr(t)) }
-                    cmp = c.x.bin("==", svn, c.cint(x, t))
+                    if !sema.inRange(x.clone(), t) { c.err(an.line, "literal " + num.bigStr(x) + " does not fit " + c.tstr(t)) }
+                    cmp = c.x.bin("==", svn, c.cint(x.clone(), t))
                 }
                 conds = if nc > 0 { c.x.bin("||", conds, cmp) } else { cmp }
                 nc += 1
-                let vs = if t == sema.T_STR { "\"" + xs + "\"" } else { num.bigStr(x) }
+                let vs = if t == sema.T_STR { "\"" + xs + "\"" } else { num.bigStr(x.clone()) }
                 let key = if t == sema.T_STR { "s" + xs } else { num.bigStr(x) }
                 if seen.has(&key) {
                     c.err(an.line, "the value " + vs + " is matched twice (" + seen.getOr(&key, "") + " and " +
@@ -2881,10 +3160,10 @@ pub fn cint(x: mut &tm.Arena, v: num.Big, t: int): int {
     if t == sema.T_I128 || t == sema.T_U128 {
         let ct = if t == sema.T_I128 { "__int128" } else { "unsigned __int128" }
         let u = num.bigMask(v, 128)
-        let hi = num.bigShr(u, 64)
+        let hi = num.bigShr(u.clone(), 64)
         let lo = num.bigMask(u, 64)
         // below 2^64 (and not negative): one conversion, which the native backend loads directly
-        if num.bigStr(hi) == "0" { return x.pcast(x.ct(&ct), x.num(&(num.bigStr(lo) + "ULL"))) }
+        if num.bigStr(hi.clone()) == "0" { return x.pcast(x.ct(&ct), x.num(&(num.bigStr(lo) + "ULL"))) }
         let h = x.par(x.bin("<<", x.cast(x.ct("unsigned __int128"), x.num(&(num.bigStr(hi) + "ULL"))), x.num("64")))
         return x.pcast(x.ct(&ct), x.par(x.bin("|", h, x.num(&(num.bigStr(lo) + "ULL")))))
     }
@@ -2900,7 +3179,7 @@ pub fn cint(x: mut &tm.Arena, v: num.Big, t: int): int {
 
 // The value of n when it is an int constant from 0 to 127 ("13LL", as cint writes it), else -1.
 fn (c: &Checker) shiftCount(n: int): int {
-    let x = c.x.nodes[n]
+    let x = &c.x.nodes[n]
     if x.k != tm.X_NUM || len(x.s) < 3 || len(x.s) > 5 || !strings.endsWith(&x.s, "LL") { return -1 }
     var v = 0
     for i in 0..len(x.s) - 2 {
@@ -2919,8 +3198,8 @@ fn (c: mut &Checker) cint(v: num.Big, t: int): int { return cint(mut &c.x, v, t)
 fn (c: mut &Checker) xInt(v: num.Big, line: int, exp: int): Val {
     let t = if exp >= 0 && (exp < sema.NINTS || exp == sema.T_FLOAT) { exp } else { sema.T_INT }
     if t == sema.T_FLOAT { return c.fconst(&(num.bigStr(v)), line) }
-    if !sema.inRange(v, t) {
-        c.err(line, "integer literal " + num.bigStr(v) + " does not fit " + sema.PRIM_NAMES[t] + " (out of range)")
+    if !sema.inRange(v.clone(), t) {
+        c.err(line, "integer literal " + num.bigStr(v.clone()) + " does not fit " + sema.PRIM_NAMES[t] + " (out of range)")
     }
     return rv(c.cint(v, t), t)
 }
@@ -2968,11 +3247,11 @@ fn (c: mut &Checker) xFrac(text: &str, line: int, exp: int, suf: int): Val {
         e = num.bigParse(&digits, eneg)
     }
     let scale = num.bigSub(num.bigOf(frac.size()), e)
-    if !sema.inRange(units, sema.T_I128) {
+    if !sema.inRange(units.clone(), sema.T_I128) {
         c.err(line, "fractional literal " + text + " has too many digits: its units do not fit an i128")
     }
-    if !sema.inRange(scale, sema.T_INT) {
-        c.err(line, "the exponent of fractional literal " + text + " is out of range: its scale " + num.bigStr(scale) +
+    if !sema.inRange(scale.clone(), sema.T_INT) {
+        c.err(line, "the exponent of fractional literal " + text + " is out of range: its scale " + num.bigStr(scale.clone()) +
             " does not fit an int")
     }
     var args: []Arg = []
@@ -3079,8 +3358,8 @@ fn (c: mut &Checker) texpr(x: int): int {
     let n = c.nd(x)
     let k = n.kind
     if k == sx.N_TARG { return n.a }
-    if k == sx.N_NAME { return c.synthTname(&[n.s], &[], n.line) }
-    if k == sx.N_FIELDX && c.kind(n.a) == sx.N_NAME { return c.synthTname(&[c.nd(n.a).s, n.s], &[], n.line) }
+    if k == sx.N_NAME { return c.synthTname(&[n.s.clone()], &[], n.line) }
+    if k == sx.N_FIELDX && c.kind(n.a) == sx.N_NAME { return c.synthTname(&[c.nd(n.a).s, n.s.clone()], &[], n.line) }
     if k == sx.N_INDEX {
         let b = c.texpr(n.a)
         if c.kind(b) == sx.N_TNAME && c.count(c.nd(b).b) == 0 {
@@ -3105,7 +3384,7 @@ fn (c: mut &Checker) staticType(st: St, line: int): int {
     if st.n == 2 && len(c.pg.types[d].tparams) > 0 && c.pg.types[d].form != sx.F_ALIAS { return c.pg.mkBare(d) }
     var args: []int = []
     if st.n > 2 { args = c.items(st.targs) }
-    let a = c.synthTname(&[c.pg.types[d].name], &args, line)
+    let a = c.synthTname(&[c.pg.types[d].name.clone()], &args, line)
     return c.resolveNamed(d, a, line)
 }
 
@@ -3173,11 +3452,11 @@ fn (c: mut &Checker) staticValue(st: St, e: int, exp: int): Val {
     let di = st.di
     if st.dk == sema.D_CONST { return c.constVal(di, exp, line) }
     if st.dk == sema.D_GLOBAL {
-        let name = c.pg.globals[di].name
+        let name = c.pg.globals[di].name.clone()
         if c.pg.globals[di].isOnce {
             c.err(line, name + " is a set-once global: use " + name + ".get(), .set(v) or .isSet()")
         }
-        let cname = c.pg.globals[di].cname
+        let cname = c.pg.globals[di].cname.clone()
         var v = val(c.nm(&cname), c.pg.globals[di].ty, CAT_PLACE)
         v.mutable = true
         v.gk = sema.D_GLOBAL
@@ -3193,7 +3472,7 @@ fn (c: mut &Checker) staticValue(st: St, e: int, exp: int): Val {
         return c.constructVariant(st, &none, line, exp, -1)
     }
     if st.dk == sema.D_FN {
-        let fname = c.pg.fns[di].name
+        let fname = c.pg.fns[di].name.clone()
         let tps = copyInts(&c.pg.fns[di].tps)
         if c.pg.fns[di].isExtern { c.err(line, "extern function " + fname + " cannot be used as a value") }
         var bind: []int = []
@@ -3240,11 +3519,11 @@ fn bindGet(bind: &[]int, tp: int): int {
 
 fn (c: &Checker) declName(st: St): str {
     return match st.dk {
-        sema.D_TYPE { c.pg.types[st.di].name }
-        sema.D_FN { c.pg.fns[st.di].name }
-        sema.D_CONST { c.pg.consts[st.di].name }
-        sema.D_GLOBAL { c.pg.globals[st.di].name }
-        else { c.pg.variants[st.di].name }
+        sema.D_TYPE { c.pg.types[st.di].name.clone() }
+        sema.D_FN { c.pg.fns[st.di].name.clone() }
+        sema.D_CONST { c.pg.consts[st.di].name.clone() }
+        sema.D_GLOBAL { c.pg.globals[st.di].name.clone() }
+        else { c.pg.variants[st.di].name.clone() }
     }
 }
 
@@ -3255,8 +3534,8 @@ fn (c: mut &Checker) staticVar(dk: int, di: int): int {
     if v >= 0 { return v }
     // copies of the names: newVar takes c mutably
     let isConst = dk == sema.D_CONST
-    let name = if isConst { c.pg.consts[di].name } else { c.pg.globals[di].name }
-    let cname = if isConst { c.pg.consts[di].cname } else { c.pg.globals[di].cname }
+    let name = if isConst { c.pg.consts[di].name.clone() } else { c.pg.globals[di].name.clone() }
+    let cname = if isConst { c.pg.consts[di].cname.clone() } else { c.pg.globals[di].cname.clone() }
     let line = if isConst { c.pg.consts[di].line } else { c.pg.globals[di].line }
     let id = c.newVar(&name, &cname, sema.T_VOID, false, VK_STATIC, line)
     c.statics.put(key, id)
@@ -3269,23 +3548,23 @@ fn (c: mut &Checker) constVal(k: int, exp: int, line: int): Val {
     var kind = v.kind
     if kind == sema.CK_TABLE {
         if c.pg.tk(ty) == sema.TK_ARR {
-            let cname = c.pg.consts[k].cname
+            let cname = c.pg.consts[k].cname.clone()
             return rvAt(c.nm(&cname), c.pg.mkSlice(c.pg.ta(ty), false), c.staticVar(sema.D_CONST, k), "")
         }
-        let cname = c.pg.consts[k].cname
+        let cname = c.pg.consts[k].cname.clone()
         var r = val(c.nm(&cname), ty, CAT_PLACE)
         r.gk = sema.D_CONST
         r.gi = k
         return r
     }
     if kind == sema.CK_TYPED {
-        if ty < sema.NINTS { return rv(c.cint(v.i, ty), ty) }
+        if ty < sema.NINTS { return rv(c.cint(v.i.clone(), ty), ty) }
         if ty == sema.T_FLOAT { return rv(c.x.num(&(num.pyFloatRepr(v.f))), sema.T_FLOAT) }
         kind = if ty == sema.T_BOOL { sema.CK_BOOL } else { sema.CK_STR }
     }
     if kind == sema.CK_INT {
-        if ty == sema.T_BYTE { return rv(c.x.pcast(c.ct("uint8_t"), c.x.num(&(num.bigStr(v.i)))), sema.T_BYTE) }
-        return c.xInt(v.i, line, exp)
+        if ty == sema.T_BYTE { return rv(c.x.pcast(c.ct("uint8_t"), c.x.num(&(num.bigStr(v.i.clone())))), sema.T_BYTE) }
+        return c.xInt(v.i.clone(), line, exp)
     }
     if kind == sema.CK_FRAC { return c.xFrac(&v.s, line, exp, 2) }
     if kind == sema.CK_FLOAT { return rv(c.x.num(&(num.pyFloatRepr(v.f))), sema.T_FLOAT) }
@@ -3318,8 +3597,74 @@ fn (c: mut &Checker) xField(e: int, exp: int): Val {
     return c.fieldOf(v, &n.s, n.line)
 }
 
+// rc T (design/owned-str.md, SPEC 4.9): the value an rc handle holds, as a place rooted at the handle
+// (a borrow of it keeps the handle alive) that cannot be assigned, mutably borrowed or moved out of.
+fn (c: mut &Checker) rcValue(v0: Val): Val {
+    var v = c.deref(v0)
+    if v.cat == CAT_RV { v = c.holdtmp(v.c, v.t) }
+    let vt = c.pg.targs(v.t)[0]
+    var r = val(c.x.member(v.c, "->", "f_v"), vt, CAT_PLACE)
+    r.root = v.root
+    r.path = pathAdd(&v.path, "v")
+    r.mutable = false
+    r.viaref = true
+    r.gk = v.gk
+    r.gi = v.gi
+    r.cr = v.cr
+    return r
+}
+
+// r.unshare() (SPEC 4.9): a mut & of the value of the rc handle r, which must be a mutable place. The
+// only handle lends its own value; otherwise r gives up its share and gets a new box holding a clone.
+//     if (r->n > 1) { r->n -= 1; Rc* q = rt_alloc(sizeof *q); q->n = 1; q->v = clone(r->v); r = q; }
+fn (c: mut &Checker) rcUnshare(recv: Val, t: int, line: int): Val {
+    let v = c.deref(recv)
+    if v.cat != CAT_PLACE { c.err(line, "unshare needs an rc handle in a variable or field: it changes the handle") }
+    if !v.mutable { c.immutable(v, line, "unshare") }
+    let vt = c.pg.targs(t)[0]
+    if !c.pg.cloneable(vt) && c.pg.methodOf(vt, "clone") < 0 {
+        c.err(line, "unshare needs a value it can clone, and " + c.tstr(vt) + " cannot be cloned: " + c.pg.cloneBlocker(vt))
+    }
+    c.frozenAt(v.root, &v.path, FR_MUT, line)
+    c.checkPending(v.root, &v.path, line, false)
+    let nf = c.x.arrow(v.c, "f_n")
+    c.emit(c.x.sif(c.x.bin(">", nf, c.lit(1))))
+    c.cx.ind += 1
+    c.emitx(c.x.asg(nf, c.x.bin("-", nf, c.lit(1))))
+    let q = c.fresh("rq")
+    let qn = c.nm(&q)
+    c.emit(c.x.decl(c.T(t), &q, c.x.call("rt_alloc", [c.x.szof(c.x.pre("*", qn))])))
+    c.emitx(c.x.asg(c.x.arrow(qn, "f_n"), c.lit(1)))
+    let src = c.x.arrow(v.c, "f_v")
+    let cl = if c.pod(vt) { src } else { c.hole(mkHoleX(H_CLONE, vt, src)) }
+    c.emitx(c.x.asg(c.x.arrow(qn, "f_v"), cl))
+    c.emitx(c.x.asg(v.c, qn))
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+    var p = val(c.x.member(v.c, "->", "f_v"), vt, CAT_PLACE)
+    p.root = v.root
+    p.path = pathAdd(&v.path, "v")
+    p.mutable = true
+    p.gk = v.gk
+    p.gi = v.gi
+    return c.borrow(p, true, line, false)
+}
+
+// The value v reads: a borrow dereferenced, and an rc handle's value (SPEC 4.9), any number of times.
+fn (c: mut &Checker) rcRead(v0: Val): Val {
+    var v = c.deref(v0)
+    while c.pg.isRc(v.t) { v = c.rcValue(v) }
+    return v
+}
+
+// Whether name on an rc handle reaches the value (outside std, every field name does).
+fn (c: &Checker) rcReaches(name: &str): bool {
+    return c.cx.mod != c.pg.types[c.pg.rc].mod || (name != "n" && name != "v")
+}
+
 fn (c: mut &Checker) fieldOf(v0: Val, name: &str, line: int): Val {
-    let v = c.deref(v0)
+    var v = c.deref(v0)
+    while c.pg.isRc(v.t) && c.rcReaches(name) { v = c.rcValue(v) }
     let t = v.t
     let isInst = c.pg.tk(t) == sema.TK_INST
     if !isInst || c.pg.types[c.pg.ta(t)].form != sx.F_RECORD {
@@ -3367,10 +3712,12 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
     }
     if c.count(n.b) != 1 { c.err(n.line, "an index takes one expression") }
     let ix = c.item(n.b, 0)
-    var v = c.deref(c.expr(n.a, -1))
+    var v = c.rcRead(c.expr(n.a, -1))
     if v.t == sema.T_STR {
+        let mark = c.holdBase(v, n.line)
         v = c.before1(v, ix)
         let i = c.intIndex(ix)
+        c.cutPending(mark)
         return rv(c.x.call("rt_str_byte", [v.c, i, c.W(n.line)]), sema.T_BYTE)
     }
     let k = c.pg.tk(v.t)
@@ -3405,24 +3752,28 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
 // xs[a..b], xs[a..], xs[..b] of an array or slice (a slice, SPEC 4.2a) or of a str.
 fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
     let n = c.nd(e)
-    var v = c.deref(c.expr(n.a, -1))
+    var v = c.rcRead(c.expr(n.a, -1))
     let W = c.W(n.line)
     if v.t == sema.T_STR && view {
         // a view (design/borrow-types.md): a shared &str of the bytes, rooted where s is, uncounted
         if v.cat == CAT_RV { v = c.holdtmp(v.c, sema.T_STR) }
+        let mark = c.holdBase(v, n.line)
         var b = c.borrow(v, false, n.line, false)
         b = c.beforeOpt(b, n.b, n.c)
         let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
         let hi = if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(b.c), "len") }
+        c.cutPending(mark)
         let vn = c.fresh("vw")
         let rt = c.pg.mkRef(sema.T_STR, false)
         c.emit(c.x.decl(c.T(rt), &vn, c.x.call("rt_str_view", [b.c, lo, hi, W])))
         return rvAt(c.nm(&vn), rt, b.root, &(pathAdd(&b.path, "*")))
     }
     if v.t == sema.T_STR {
+        let mark = c.holdBase(v, n.line)
         v = c.beforeOpt(v, n.b, n.c)
         let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
         let hi = if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(v.c), "len") }
+        c.cutPending(mark)
         return c.holdtmp(c.x.call("rt_str_sub", [v.c, lo, hi, W]), sema.T_STR)
     }
     let k = c.pg.tk(v.t)
@@ -3437,7 +3788,7 @@ fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
         if mut1 && !c.pg.tm(v.t) { c.err(n.line, "cannot make a mut slice from a shared slice") }
         base = v.c
     }
-    if mut1 { c.frozen(v.root, FR_MUT, n.line) }
+    if mut1 { c.frozenAt(v.root, &v.path, FR_MUT, n.line) }
     if c.actsOpt(n.b) || c.actsOpt(n.c) { v = c.seq(v) }
     let mark = len(c.cx.pending)
     c.hold(v, HM_SHARED, c.newCid(), n.line)
@@ -3487,7 +3838,7 @@ fn (c: mut &Checker) xBorrow(e: int, exp: int): Val {
 }
 
 // s[i] on a str is a byte read, not a place (SPEC 7.4): it cannot be assigned or borrowed mut.
-fn (c: &Checker) strByteRO(e: int, v: Val, line: int) {
+fn (c: &Checker) strByteRO(e: int, v: &Val, line: int) {
     if c.kind(e) == sx.N_INDEX && c.isCallTo(v.c, "rt_str_byte") {
         c.err(line, "a str is immutable: its bytes cannot be assigned or borrowed mut")
     }
@@ -3523,7 +3874,7 @@ fn isLitNode(k: int): bool { return k == sx.N_INT || k == sx.N_FRAC }
 
 fn (c: mut &Checker) xBin(e: int, exp: int): Val {
     let n = c.nd(e)
-    let op = n.s
+    let op = &n.s
     if op == "&&" || op == "||" { return c.logic(e) }
     let cmp = isCmpOp(&op)
     let nexp = if cmp { -1 } else { exp }
@@ -3531,17 +3882,17 @@ fn (c: mut &Checker) xBin(e: int, exp: int): Val {
         // The literal takes the type of the right operand, but its fromFraction runs first
         // (operands are evaluated left to right): find that type with a discarded check.
         let lv = c.expr(n.a, c.peekType(n.b, nexp))
-        return c.binop(op, lv, Arg{isVal: false, n: n.b, v: lv}, n.line, exp, false, lv)
+        return c.binop(op, lv.clone(), Arg{isVal: false, n: n.b, v: lv.clone()}, n.line, exp, false, lv)
     }
     if isLitNode(c.kind(n.a)) && !isLitNode(c.kind(n.b)) {     // an integer literal: no code, so no order
         let r = c.rd(c.expr(n.b, nexp))
         let lt = if op != "<<" && op != ">>" { r.t } else { exp }
         let lv = c.rd(c.expr(n.a, lt))
-        return c.binop(op, lv, Arg{isVal: true, n: -1, v: r}, n.line, exp, false, lv)
+        return c.binop(op, lv.clone(), Arg{isVal: true, n: -1, v: r}, n.line, exp, false, lv)
     }
     let hint = if !cmp && exp >= 0 && c.pg.tk(exp) == sema.TK_PRIM { exp } else { -1 }
     let lv = c.before1(c.rd(c.expr(n.a, hint)), n.b)
-    return c.binop(op, lv, Arg{isVal: false, n: n.b, v: lv}, n.line, exp, false, lv)
+    return c.binop(op, lv.clone(), Arg{isVal: false, n: n.b, v: lv.clone()}, n.line, exp, false, lv)
 }
 
 // The type of e: e is checked, then its code and its effects on the checker are undone.
@@ -3550,7 +3901,7 @@ fn (c: mut &Checker) peekType(e: int, exp: int): int {
     let nholes = len(c.holes)
     let nlifted = len(c.lifted)
     var pending: []Pend = []
-    for p in c.cx.pending { append(mut &pending, p) }
+    for p in c.cx.pending { append(mut &pending, p.clone()) }
     let ncaps = len(c.cx.capNames)
     var frames: []int = []
     for f in 0..len(c.cx.frames) { append(mut &frames, len(c.cx.frames[f])) }
@@ -3611,7 +3962,7 @@ fn (c: mut &Checker) xClosure(e: int, exp: int): Val {
             if x == pn { dup = true }
         }
         if dup { c.err(pw, "'" + pn + "' is already declared in this function (no shadowing)") }
-        append(mut &pnames, pn)
+        append(mut &pnames, pn.clone())
         append(mut &ptys, t)
         append(mut &pvars, c.newVar(&pn, &("p_" + pn), t, false, VK_PARAM, pw))
     }
@@ -3687,24 +4038,24 @@ fn (c: mut &Checker) logic(e: int): Val {
 }
 
 // lv: the evaluated left operand; r: the right operand (a node, or a value).
-fn (c: mut &Checker) binop(op: str, lv0: Val, r: Arg, line: int, exp: int, hasHeld: bool, held: Val): Val {
-    let lv = c.rd(lv0)
+fn (c: mut &Checker) binop(op: &str, lv0: Val, r: &Arg, line: int, exp: int, hasHeld: bool, held: Val): Val {
+    let lv = c.rcRead(lv0)          // SPEC 4.9: an operator reads an rc handle's value
     let lt = lv.t
-    var rv0 = r.v
+    var rv0 = r.v.clone()
     if !r.isVal {
         let rexp = if op == "<<" || op == ">>" { sema.T_INT } else { lt }
         let mark = len(c.cx.pending)
-        let h = if hasHeld { held } else { lv }
+        let h = if hasHeld { held } else { lv.clone() }
         if h.cat == CAT_PLACE { c.hold(h, HM_SHARED, c.newCid(), line) }
         rv0 = c.expr(r.n, rexp)
         c.cutPending(mark)
     }
-    let rv1 = c.rd(rv0)
+    let rv1 = c.rcRead(rv0)
     let rt = rv1.t
     let W = c.W(line)
     let cmp = isCmpOp(&op)
     if c.pg.tk(lt) == sema.TK_PRIM && c.pg.tk(rt) == sema.TK_PRIM {
-        let nm = sema.PRIM_NAMES[lt]
+        let nm = &sema.PRIM_NAMES[lt]
         if op == "<<" || op == ">>" {
             if lt >= sema.NINTS || rt != sema.T_INT {
                 c.err(line, op + " needs an integer and an int shift count, not " + c.tstr(lt) + " and " + c.tstr(rt))
@@ -3749,10 +4100,10 @@ fn (c: mut &Checker) binop(op: str, lv0: Val, r: Arg, line: int, exp: int, hasHe
     if c.pg.tk(lt) == sema.TK_PRIM {
         c.err(line, "operator " + op + " needs operands of the same type, not " + c.tstr(lt) + " and " + c.tstr(rt))
     }
-    let args = [rv1]
+    let args = [rv1.clone()]
     if isArith(&op) {
         let m = match op { "+" { "add" } "-" { "sub" } "*" { "mul" } "/" { "div" } else { "rem" } }
-        return c.opCall(lv, &m, &args, line, &op)
+        return c.opCall(lv.clone(), &m, &args, line, &op)
     }
     if (op == "==" || op == "!=") && c.tagEq(lt) {
         // a closed type whose variants have no fields, without an eq method: the tags (SPEC 7.4)
@@ -3760,14 +4111,14 @@ fn (c: mut &Checker) binop(op: str, lv0: Val, r: Arg, line: int, exp: int, hasHe
             c.err(line, "operator " + op + " needs operands of the same type, not " + c.tstr(lt) + " and " + c.tstr(rt))
         }
         let sep = if c.pg.types[c.pg.ta(lt)].value { "." } else { "->" }
-        var a = lv
+        var a = lv.clone()
         var b = rv1
         if a.cat == CAT_RV && !c.isCopy(lt) { a = c.holdtmp(a.c, lt) }
         if b.cat == CAT_RV && !c.isCopy(lt) { b = c.holdtmp(b.c, lt) }
         return rv(c.x.par(c.x.bin(&op, c.x.member(c.x.par(a.c), &sep, "tag"), c.x.member(c.x.par(b.c), &sep, "tag"))), sema.T_BOOL)
     }
     if op == "==" || op == "!=" {
-        let r2 = c.opCall(lv, "eq", &args, line, &op)
+        let r2 = c.opCall(lv.clone(), "eq", &args, line, &op)
         return rv(if op == "==" { r2.c } else { c.x.par(c.x.pre("!", r2.c)) }, sema.T_BOOL)
     }
     if cmp {
@@ -3801,7 +4152,7 @@ fn (c: mut &Checker) opCall(recv: Val, name: &str, args: &[]Val, line: int, op: 
     for i in 0..len(args) {
         if i + off < len(sig.params) {
             let p = sig.params[i + off]
-            let a = args[i]
+            let a = args[i].clone()
             let v = if c.pg.tk(p) == sema.TK_REF && c.pg.tk(a.t) != sema.TK_REF { c.borrow(a, false, line, false) } else { a }
             append(mut &conv, Arg{isVal: true, n: -1, v: v})
         }
@@ -3901,18 +4252,18 @@ fn (c: mut &Checker) ifBranch(x: int, want: int, snap: &[]int, r: int, bm: bool)
                     "every branch must be a borrow")
             }
             if want >= 0 { v = c.coerce(v, want, c.line(x), "this branch") }
-            bcr = c.branchRoot(v, len(c.cx.scopes), c.line(x), "an if branch")
+            bcr = c.branchRoot(v.clone(), len(c.cx.scopes), c.line(x), "an if branch")
         }
     } else {
         if c.kind(x) == sx.N_BORROW || k == sema.TK_SLICE || k == sema.TK_CLO {
             c.err(c.line(x), "an if expression cannot give a borrow, a slice or a closure")
         }
-        v = c.rd(v)
-        if !v.noreturn && c.pg.isBorrowClass(v.t) { bcr = c.branchRoot(v, len(c.cx.scopes), c.line(x), "an if branch") }
+        v = c.rd(v.clone())
+        if !v.noreturn && c.pg.isBorrowClass(v.t) { bcr = c.branchRoot(v.clone(), len(c.cx.scopes), c.line(x), "an if branch") }
     }
     let fr = c.popFrame()
     if !v.noreturn {
-        v = rv(c.consume(v, c.line(x)), v.t)
+        v = rv(c.consumeAs("if", v.clone(), c.line(x)), v.t)
         var live = false
         for t in fr {
             if c.tmps[t].live { live = true }
@@ -4031,15 +4382,15 @@ fn (c: mut &Checker) mxBody(x: int) {
                     "every arm must be a borrow")
             }
             if want >= 0 { v = c.coerce(v, want, c.line(x), "this arm") }
-            c.mxs[top].cr = c.joinRoots(c.mxs[top].cr, c.branchRoot(v, c.mxs[top].d, c.line(x), "a match arm"))
+            c.mxs[top].cr = c.joinRoots(c.mxs[top].cr, c.branchRoot(v.clone(), c.mxs[top].d, c.line(x), "a match arm"))
         }
     } else {
         if c.kind(x) == sx.N_BORROW || k == sema.TK_SLICE || k == sema.TK_CLO {
             c.err(c.line(x), "a match expression cannot give a borrow, a slice or a closure")
         }
-        v = c.rd(v)
+        v = c.rd(v.clone())
         if !v.noreturn && c.pg.isBorrowClass(v.t) {
-            c.mxs[top].cr = c.joinRoots(c.mxs[top].cr, c.branchRoot(v, c.mxs[top].d, c.line(x), "a match arm"))
+            c.mxs[top].cr = c.joinRoots(c.mxs[top].cr, c.branchRoot(v.clone(), c.mxs[top].d, c.line(x), "a match arm"))
         }
     }
     let fr = c.popFrame()
@@ -4052,7 +4403,7 @@ fn (c: mut &Checker) mxBody(x: int) {
             c.err(c.line(x), "the arms of a match expression have different types, " + c.tstr(c.mxs[top].t) + " and " +
                 c.tstr(v.t))
         }
-        let cc = c.consume(v, c.line(x))
+        let cc = c.consumeAs("match", v, c.line(x))
         c.emitx(c.x.asg(c.mxs[top].r, cc))
     }
     c.dropFrame(&fr)
@@ -4185,7 +4536,7 @@ fn (c: mut &Checker) xTry(e: int, exp: int): Val {
     // Err value returned, which must be rooted at the function's sources
     let tcr = if c.pg.isBorrowClass(t) { c.crOf(v) } else { R_FREE }
     if c.pg.isBorrowClass(a.erT) && len(c.cx.rsrc) > 0 { c.checkResult(tcr, -1, n.line, false) }
-    let cv = c.consume(v, n.line)
+    let cv = c.consumeAs("try", v, n.line)
     c.emit(c.x.decl(ct, &sn, cv))
     let snn = c.nm(&sn)
     c.emit(c.x.sif(c.x.bin("==", c.x.member(snn, &sep, "tag"), c.lit(c.pg.variants[a.er].index))))
@@ -4221,9 +4572,9 @@ fn (c: mut &Checker) build(t: int, vr: int, cs: &[]int): int {
     let d = c.pg.ta(t)
     var names: []str = []
     if vr >= 0 {
-        for f in c.pg.variants[vr].fields { append(mut &names, f.name) }
+        for f in c.pg.variants[vr].fields { append(mut &names, f.name.clone()) }
     } else {
-        for f in c.pg.types[d].fields { append(mut &names, f.name) }
+        for f in c.pg.types[d].fields { append(mut &names, f.name.clone()) }
     }
     let m = if len(names) < len(cs) { len(names) } else { len(cs) }
     if c.pg.types[d].value {
@@ -4253,7 +4604,7 @@ fn (c: mut &Checker) build(t: int, vr: int, cs: &[]int): int {
 fn (c: mut &Checker) constructVariant(st: St, args0: &[]Arg, line: int, exp: int, named: int): Val {
     let vr = st.di
     let d = c.pg.variants[vr].decl
-    let vname = c.pg.variants[vr].name
+    let vname = c.pg.variants[vr].name.clone()
     if c.pg.types[d].mod != c.cx.mod && !c.pg.types[d].isPub { c.err(line, vname + " is not public") }
     var tps = copyInts(&c.pg.types[d].tparams)
     var bind: []int = []
@@ -4287,9 +4638,9 @@ fn (c: mut &Checker) constructVariant(st: St, args0: &[]Arg, line: int, exp: int
     var fts: []int = []
     var names: []str = []
     for i in 0..len(c.pg.variants[vr].fields) {
-        let f = c.pg.variants[vr].fields[i]
+        let f = c.pg.variants[vr].fields[i].clone()
         append(mut &fts, c.pg.subst(f.ty, &env))
-        append(mut &names, f.name)
+        append(mut &names, f.name.clone())
     }
     var o = noOpts()
     var args: []Arg = []
@@ -4297,7 +4648,7 @@ fn (c: mut &Checker) constructVariant(st: St, args0: &[]Arg, line: int, exp: int
         args = c.orderInits(&names, named, &vname, line)
         o.order = copyInts(&c.initOrder)
     } else {
-        for a in args0 { append(mut &args, a) }
+        for a in args0 { append(mut &args, a.clone()) }
     }
     if len(args) != len(fts) {
         c.err(line, "variant " + vname + " takes " + intToStr(len(fts)) + " values, not " + intToStr(len(args)))
@@ -4370,7 +4721,7 @@ fn (c: mut &Checker) xLit(e: int, exp0: int): Val {
         hasTargs = false
         if exp < 0 || c.pg.tk(exp) != sema.TK_INST || c.pg.ta(exp) != d { exp = t }
     }
-    let dname = c.pg.types[d].name
+    let dname = c.pg.types[d].name.clone()
     if c.pg.types[d].form != sx.F_RECORD {
         c.err(n.line, dname + " is not a record type" + (if c.pg.types[d].form == sx.F_CLOSED { ": build one of its variants" } else { "" }))
     }
@@ -4404,7 +4755,7 @@ fn (c: mut &Checker) xLit(e: int, exp0: int): Val {
     var names: []str = []
     var fts: []int = []
     for f in c.pg.types[d].fields {
-        append(mut &names, f.name)
+        append(mut &names, f.name.clone())
         append(mut &fts, f.ty)
     }
     let args = c.orderInits(&names, n.b, &dname, n.line)
@@ -4432,12 +4783,21 @@ fn (c: mut &Checker) elemType(t: int, line: int): int {
 fn (c: mut &Checker) xArrlit(e: int, exp: int): Val {
     let n = c.nd(e)
     var et = if c.ek(exp) == sema.TK_ARR { c.pg.ta(exp) } else { -1 }
+    if c.ek(exp) == sema.TK_REF && !c.pg.tm(exp) && c.pg.tk(c.pg.ta(exp)) == sema.TK_ARR {
+        et = c.pg.ta(c.pg.ta(exp))      // a literal passed where a &[]T is expected (borrowed implicitly)
+    }
     var vals: []Val = []
     let items = c.items(n.a)
     for i in 0..len(items) {
         let it = items[i]
         var v = c.expr(it, et)
         if c.pg.tk(v.t) == sema.TK_REF && !(et >= 0 && c.pg.tk(et) == sema.TK_REF) { v = c.deref(v) }
+        if et >= 0 && c.pg.tk(et) == sema.TK_REF && !c.pg.tm(et) && c.pg.tk(v.t) != sema.TK_REF && v.t == c.pg.ta(et) {
+            // SPEC 4.2 (design/owned-str.md, issue 2): an element where a shared borrow is expected is
+            // borrowed as an argument would be; a temporary lives to the end of the statement
+            if v.cat == CAT_RV && !c.isCopy(v.t) { v = c.holdtmp(v.c, v.t) }
+            v = c.borrow(v, false, c.line(it), true)
+        }
         if et == -1 { et = c.elemType(v.t, c.line(it)) }
         if v.t != et { c.err(c.line(it), "array element is " + c.tstr(v.t) + ", not " + c.tstr(et)) }
         var later: []int = []
@@ -4451,7 +4811,7 @@ fn (c: mut &Checker) xArrlit(e: int, exp: int): Val {
         for v in vals { acr = c.joinRoots(acr, c.crOf(v)) }
     }
     var cs: []int = []
-    for v in vals { append(mut &cs, c.consume(v, n.line)) }
+    for v in vals { append(mut &cs, c.consumeAs("arrlit", v.clone(), n.line)) }
     let an = c.fresh("a")
     let ct = c.T(et)
     c.emit(c.x.decl(c.ct("lxl_arr"), &an, c.x.call("rt_arr_new", [c.lit(len(cs)), c.x.szof(ct)])))
@@ -4473,7 +4833,7 @@ fn (c: mut &Checker) xArrlit(e: int, exp: int): Val {
 // ---- calls
 
 fn newSig(label: &str, kind: int, params: []int, ret: int): Sig {
-    return Sig{label: label, kind: kind, params: params, ret: ret, tps: [], recv: sema.RM_NONE, fd: -1, c: -1,
+    return Sig{label: label.clone(), kind: kind, params: params, ret: ret, tps: [], recv: sema.RM_NONE, fd: -1, c: -1,
         tpt: -1, bind: [], nown: 0, variant: -1, loc: false, name: ""}
 }
 
@@ -4531,7 +4891,7 @@ fn (c: mut &Checker) assocSig(t: int, name: str, line: int, quiet: bool): Sig {
     if f < 0 || c.pg.fns[f].recvMode != sema.RM_ASSOC {
         if quiet { return noSig() }
         if f >= 0 { c.err(line, c.pg.label(f) + " is a method: call it on a value") }
-        let tn = if c.pg.isBare(t) { c.pg.types[c.pg.ta(t)].name } else { c.tstr(t) }
+        let tn = if c.pg.isBare(t) { c.pg.types[c.pg.ta(t)].name.clone() } else { c.tstr(t) }
         c.err(line, tn + " has no associated function '" + name + "'")
     }
     c.visible(f, line)
@@ -4557,7 +4917,7 @@ fn (c: mut &Checker) methodSig(t: int, name: &str, line: int, quiet: bool): Sig 
                 var s = newSig(&(c.tstr(t) + "." + name), SK_IMETH, ps, m.ret)
                 s.recv = m.mode
                 s.tpt = t
-                s.name = name
+                s.name = name.clone()
                 return s
             }
         }
@@ -4597,6 +4957,10 @@ fn (c: mut &Checker) late(a0: int): bool {
 
 // Take a late borrow: its place must still be there; rule 3 then holds it.
 fn (c: mut &Checker) take(v: Val, m: int, cid: int, line: int) {
+    if v.root >= 0 && c.vars[v.root].moved && c.soft(c.vars[v.root].t) {
+        c.noteClone(v.root)
+        c.vars[v.root].moved = false
+    }
     if v.root >= 0 && c.vars[v.root].moved {
         c.err(line, "'" + c.vars[v.root].name + "' was moved and has no value here: a later argument moved it, and the " +
             "borrow of it is taken when the call is made")
@@ -4730,9 +5094,9 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
         let ptk = c.pg.tk(pt)
         var v = voidVal(false)
         if isrecv {
-            v = recv
+            v = recv.clone()
         } else if an < 0 {
-            v = args[if hasRecv { i - 1 } else { i }].v
+            v = args[if hasRecv { i - 1 } else { i }].v.clone()
         } else if c.kind(an) == sx.N_CLOSURE {
             let save = replace(mut &c.calleeTps, copyInts(&tps))
             v = c.expr(an, if ptk == sema.TK_CLO { pe } else { -1 })
@@ -4746,13 +5110,13 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
         }
         let pm = c.pg.tm(pt)
         if ptk == sema.TK_SLICE {
-            let sv = c.asSlice(v)
+            let sv = c.asSlice(v.clone())
             if sv.t < 0 {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t) +
                     ": pass a slice or a borrow (" + (if pm { "mut &" } else { "&" }) + "x)")
             }
             if pm && !c.pg.tm(sv.t) { c.err(line, what + " needs a mut slice, not " + c.tstr(sv.t)) }
-            if pm { c.frozen(sv.root, FR_MUT, line) }
+            if pm { c.frozenAt(sv.root, &sv.path, FR_MUT, line) }
             v = rvAt(sv.c, c.pg.mkSlice(c.pg.ta(sv.t), pm), sv.root, &sv.path)
             if !pm && c.strAsView(c.pg.ta(v.t), c.pg.ta(pt)) { v.t = c.pg.mkSlice(c.pg.ta(pt), false) }
             if !c.pg.unify(c.pg.ta(pt), c.pg.ta(v.t), mut &bind, &tps) {
@@ -4761,15 +5125,30 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             c.hold(v, hm(pm), cid, line)
             vals[i] = CArg{b: true, v: v}
         } else if ptk == sema.TK_REF {
-            if c.pg.tk(v.t) != sema.TK_REF && !isrecv {
+            if c.pg.tk(v.t) != sema.TK_REF && !isrecv && pm {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t) +
-                    ": pass a borrow (" + (if pm { "mut &" } else { "&" }) + "x)")
+                    ": pass a borrow (mut &x)")
             }
+            // SPEC 7 (design/owned-str.md, issue 10): a value passed to a shared borrow parameter is
+            // borrowed as if written &x; a temporary lives to the end of the statement
+            if !isrecv && !pm {
+                // rc T (SPEC 4.9): a handle passed where a &T is expected lends the value it holds
+                var hv = if c.pg.tk(v.t) == sema.TK_REF { c.pg.ta(v.t) } else { v.t }
+                while c.pg.isRc(hv) {
+                    var trial = copyInts(&bind)
+                    if c.pg.unify(c.pg.ta(pt), hv, mut &trial, &tps) { break }
+                    v = c.rcValue(v)
+                    hv = v.t
+                }
+            }
+            let implicit = c.pg.tk(v.t) != sema.TK_REF && !isrecv
+            if implicit && v.t == sema.T_VOID { c.err(line, what + " has no value") }
+            if implicit && v.cat == CAT_RV && !c.isCopy(v.t) { v = c.holdtmp(v.c, v.t) }
             if pm && c.pg.tk(v.t) == sema.TK_REF && !c.pg.tm(v.t) {
                 let nm = if v.root >= 0 { " ('" + c.vars[v.root].name + "' is a shared borrow)" } else { "" }
                 c.err(line, what + " needs a mut borrow, not " + c.tstr(v.t) + nm)
             }
-            v = c.borrow(v, pm, line, isrecv)
+            v = c.borrow(v, pm, line, isrecv || implicit)
             if !pm && c.pg.tk(c.pg.ta(v.t)) == sema.TK_ARR && c.pg.tk(c.pg.ta(pt)) == sema.TK_ARR &&
                 c.strAsView(c.pg.ta(c.pg.ta(v.t)), c.pg.ta(c.pg.ta(pt))) {
                 v.t = c.pg.mkRef(c.pg.ta(pt), false)
@@ -4778,8 +5157,8 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t))
             }
             if c.late(if isrecv { o.rast } else { an }) {
-                append(mut &lates, Late{v: v, m: pm})
-                if c.checks(v.c) { append(mut &rechecks, Recheck{pos: pos, v: v}) }
+                append(mut &lates, Late{v: v.clone(), m: pm})
+                if c.checks(v.c) { append(mut &rechecks, Recheck{pos: pos, v: v.clone()}) }
             } else {
                 c.hold(v, hm(pm), cid, line)
             }
@@ -4804,6 +5183,16 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             // a borrow passed where a type argument is a borrow (Some(&x) as an Option[&T]) stays one
             let keepRef = c.pg.tk(c.pg.subst(pt, &bind)) == sema.TK_REF
             if c.pg.tk(v.t) == sema.TK_REF && !keepRef { v = c.deref(v) }
+            var rv2 = v.clone()
+            while c.pg.isRc(rv2.t) {
+                // SPEC 4.9: where the handle itself does not fit, the value it holds is read (a copy type
+                // is copied; an owned value cannot be moved out, as for a borrow)
+                var trial = copyInts(&bind)
+                if c.pg.unify(pt, rv2.t, mut &trial, &tps) { break }
+                rv2 = c.rcValue(rv2)
+                var trial2 = copyInts(&bind)
+                if c.pg.unify(pt, rv2.t, mut &trial2, &tps) { v = rv2.clone() }
+            }
             if v.t == sema.T_VOID { c.err(line, what + " has no value") }
             if !c.pg.unify(pt, v.t, mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t))
@@ -4819,14 +5208,14 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                 if effs[p] { later = true }
             }
             if later { v = c.snapVal(v) }
-            if v.cat == CAT_PLACE && !c.isCopy(v.t) { c.hold(v, HM_MOVE, cid, line) }
+            if v.cat == CAT_PLACE && !c.isCopy(v.t) && !c.soft(v.t) { c.hold(v, HM_MOVE, cid, line) }
             vals[i] = CArg{b: false, v: v}
         }
         if mayBC && ptk != sema.TK_CLO {
             let pbc = c.pg.subst(pt, &bind)
             if c.pg.isBorrowClass(pbc) {
                 isSrc[i] = true
-                srcs[i] = c.srcRoot(pbc, vals[i].v)
+                srcs[i] = c.srcRoot(pbc, vals[i].v.clone())
             }
         }
         var rb = false
@@ -4838,7 +5227,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
         for p in pos + 1..len(acts) {
             if acts[p] { actLater = true }
         }
-        if actLater || pend { vals[i].v = c.seq(vals[i].v) }
+        if actLater || pend { vals[i].v = c.seq(vals[i].v.clone()) }
     }
     var last = -1
     for pos in 0..len(order) {
@@ -4851,7 +5240,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
         }
         if r.pos != last && later { c.emitx(c.x.cast(c.ct("void"), c.x.par(r.v.c))) }
     }
-    for l in lates { c.take(l.v, hm(l.m), cid, line) }    // SPEC 7.5: taken now, after the arguments
+    for l in lates { c.take(l.v.clone(), hm(l.m), cid, line) }    // SPEC 7.5: taken now, after the arguments
     var missing = newStrBuf()
     var nm = 0
     for tp in sig.tps {
@@ -4872,7 +5261,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
     }
     var kept: []Pend = []
     for k in 0..len(c.cx.pending) {
-        let p = c.cx.pending[k]
+        let p = c.cx.pending[k].clone()
         if k < mark || p.m != HM_MOVE { append(mut &kept, p) }
     }
     c.cx.pending = kept
@@ -4885,14 +5274,16 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             // a str read from a global is held by a copy for the call: a callback (SPEC 12) may
             // assign the global while C still reads the bytes
             if vals[k].v.t == sema.T_STR && vals[k].v.cat == CAT_PLACE && vals[k].v.gk >= 0 {
-                vals[k].v = c.snapVal(vals[k].v)
+                // SPEC 12: a global str passed to C is held for the call: a callback may assign it
+                let g = vals[k].v.clone()
+                vals[k].v = c.holdtmp(c.dup(g.c, g.t), g.t)
             }
-            vals[k].v = c.seq(vals[k].v)
+            vals[k].v = c.seq(vals[k].v.clone())
         }
     }
     var cs: []int = []
     for x in vals {
-        if x.b || sig.kind == SK_INTR || sig.kind == SK_EXTERN { append(mut &cs, x.v.c) } else { append(mut &cs, c.consume(x.v, line)) }
+        if x.b || sig.kind == SK_INTR || sig.kind == SK_EXTERN { append(mut &cs, x.v.c) } else { append(mut &cs, c.consumeAs("arg", x.v.clone(), line)) }
     }
     c.cutPending(mark)
     let ret = c.pg.subst(sig.ret, &bind)
@@ -4924,7 +5315,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
     } else if sig.kind == SK_IMETH {
         var ras: []int = []
         for k in 1..len(cs) { append(mut &ras, cs[k]) }
-        text = c.hole(Hole{k: H_IMETH, t: sig.tpt, f: sig.recv, s: sig.name, x: -1, r: cs[0], args: ras})
+        text = c.hole(Hole{k: H_IMETH, t: sig.tpt, f: sig.recv, s: sig.name.clone(), x: -1, r: cs[0], args: ras})
     } else if sig.kind == SK_IASSOC {
         text = c.x.callx(c.hole(mkHole(H_IASSOC, sig.tpt, &sig.name)), cs)
     } else if sig.kind == SK_FNVAL {
@@ -5109,7 +5500,7 @@ fn (c: mut &Checker) convert(t: int, e: int): Val {
     if c.count(n.b) != 1 { c.err(n.line, "the conversion " + sema.PRIM_NAMES[t] + "(x) takes one argument") }
     let v = c.rd(c.expr(c.item(n.b, 0), -1))
     let s = v.t
-    let d = sema.PRIM_NAMES[t]
+    let d = &sema.PRIM_NAMES[t]
     let W = c.W(n.line)
     if !(s < sema.NINTS || s == sema.T_FLOAT) { c.err(n.line, "cannot convert " + c.tstr(s) + " to " + d) }
     if s == t { return v }
@@ -5236,7 +5627,7 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
                 let nm = if st.k == ST_TYPE { "?" } else { c.declName(st) }
                 c.err(fn1.line, nm + " has no associated function " + fn1.s)
             }
-            let sig = c.assocSig(t, fn1.s, n.line, false)
+            let sig = c.assocSig(t, fn1.s.clone(), n.line, false)
             c.implicitWhere(&sig, false, mut &args, n.line)
             let o = noOpts()
             return c.call(&sig, false, voidVal(false), &args, n.line, exp, &o)
@@ -5244,16 +5635,48 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         if st.k == ST_NONE {
             let recv = c.expr(fn1.a, -1)
             let base = if c.pg.tk(recv.t) == sema.TK_REF { c.pg.ta(recv.t) } else { recv.t }
-            let sig = c.methodSig(base, &fn1.s, n.line, c.pg.tk(base) == sema.TK_INST)
+            if fn1.s == "unshare" && len(args) == 0 && c.pg.isRc(base) { return c.rcUnshare(recv, base, n.line) }
+            let rcShare = fn1.s == "share" && len(args) == 0 &&
+                (c.pg.isRc(base) || (c.pg.tk(base) == sema.TK_INST && c.pg.ta(base) == c.pg.shared))
+            if rcShare || (fn1.s == "clone" && len(args) == 0 && c.pg.tk(base) != sema.TK_TP &&
+                    c.pg.methodOf(base, "clone") < 0 && c.pg.cloneable(base)) {
+                // design/owned-str.md: the built-in clone, a copy (counts) of a type copied while str is
+                // counted, a deep copy (clone glue) of any other cloneable type
+                let v = c.rd(recv)
+                var cc = -1
+                if v.cat != CAT_PLACE {
+                    cc = c.consume(v, n.line)
+                } else if c.pg.isCopyLegacy(base) {
+                    cc = c.dup(v.c, base)
+                } else {
+                    cc = c.hole(mkHoleX(H_CLONE, base, v.c))
+                }
+                // like a call's result: a temporary dropped at the end of the statement unless moved
+                return if c.pod(base) { rv(cc, base) } else { c.holdtmp(cc, base) }
+            }
+            if fn1.s == "clone" && len(args) == 0 && (c.pg.tk(base) == sema.TK_INST || c.pg.tk(base) == sema.TK_ARR) &&
+                    c.pg.methodOf(base, "clone") < 0 &&
+                    (c.pg.tk(base) == sema.TK_ARR || c.fieldIndex(c.pg.ta(base), "clone") < 0) {
+                c.err(n.line, c.tstr(base) + " cannot be cloned: " + c.pg.cloneBlocker(base) +
+                    " (give it a clone method to clone it)")
+            }
+            var recv2 = recv
+            var base2 = base
+            while c.pg.isRc(base2) && c.pg.methodOf(base2, &fn1.s) < 0 && c.rcReaches(&fn1.s) {
+                // a method of the value: called on the value the handle holds (immutable)
+                recv2 = c.rcValue(recv2)
+                base2 = recv2.t
+            }
+            let sig = c.methodSig(base2, &fn1.s, n.line, c.pg.tk(base2) == sema.TK_INST)
             if sig.kind < 0 {
-                let fv = c.fieldOf(recv, &fn1.s, n.line)
+                let fv = c.fieldOf(recv2, &fn1.s, n.line)
                 return c.callValue(fv, e, exp)
             }
             c.implicitWhere(&sig, true, mut &args, n.line)
             var o = noOpts()
             o.targs = targs
             o.rast = fn1.a
-            return c.call(&sig, true, recv, &args, n.line, exp, &o)
+            return c.call(&sig, true, recv2, &args, n.line, exp, &o)
         }
     }
     let st = c.static(f)
@@ -5274,7 +5697,7 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
                 let t = c.staticType(st, n.line)
                 if c.pg.tk(t) == sema.TK_PRIM { return c.convert(t, e) }
             }
-            let dn = c.pg.types[st.di].name
+            let dn = c.pg.types[st.di].name.clone()
             c.err(n.line, dn + " is a type: build it with " + dn + "{...}")
         }
         if st.dk == sema.D_GLOBAL { return c.callValue(c.staticValue(st, f, -1), e, exp) }
@@ -5295,7 +5718,7 @@ fn (c: mut &Checker) rawPtr(name: &str, e: int, exp: int): Val {
         if c.pg.tk(v.t) != sema.TK_INST || c.pg.types[c.pg.ta(v.t)].value {
             c.err(line, "intoPtr needs a boxed record or closed type, not " + c.tstr(v.t))
         }
-        let cc = c.consume(v, line)
+        let cc = c.consumeAs("rawptr", v, line)
         return rv(c.x.pcast(c.ct("void*"), cc), sema.T_PTR)
     }
     if exp < 0 || c.pg.tk(exp) != sema.TK_INST || c.pg.types[c.pg.ta(exp)].value {
@@ -5316,7 +5739,7 @@ fn (c: &Checker) isParMap(sig: &Sig): bool {
 // par.map's closure: written at the call (a closure, or a function named there), so the kernel
 // pass knows exactly what runs, and changing none of the variables it captures (the pool's
 // threads run it at once).
-fn (c: mut &Checker) parKernelArg(an: int, v: Val, line: int) {
+fn (c: mut &Checker) parKernelArg(an: int, v: &Val, line: int) {
     var named = false
     if an >= 0 && c.kind(an) != sx.N_CLOSURE {
         let st = c.static(an)
@@ -5373,8 +5796,8 @@ fn (c: mut &Checker) allTypeish(l: int): bool {
 fn (c: mut &Checker) onceCall(g: int, name: &str, e: int): Val {
     let n = c.nd(e)
     let W = c.W(n.line)
-    let gname = c.pg.globals[g].name
-    let cn = c.pg.globals[g].cname
+    let gname = c.pg.globals[g].name.clone()
+    let cn = c.pg.globals[g].cname.clone()
     let gt = c.pg.globals[g].ty
     let msg = "set-once global " + gname
     let setn = c.nm(&(cn + "_set"))
@@ -5389,7 +5812,7 @@ fn (c: mut &Checker) onceCall(g: int, name: &str, e: int): Val {
         return rvAt(c.addrOf(gt, c.nm(&cn)), c.pg.mkRef(gt, false), c.staticVar(sema.D_GLOBAL, g), "")
     }
     let v = c.seq(c.coerce(c.expr(c.item(n.b, 0), gt), gt, n.line, &("the value of " + gname)))
-    let cc = c.consume(v, n.line)
+    let cc = c.consumeAs("once", v, n.line)
     let m = c.x.cond(c.x.bin("==", setn, c.lit(2)), c.x.str(&(msg + " is dropped")), c.x.str(&(msg + " is set twice")))
     c.emit(c.x.if1(setn, c.x.sx(c.x.call("rt_trap", [c.lit(12), m, W]))))
     c.emit(c.x.seq([c.x.sx(c.x.asg(c.nm(&cn), cc)), c.x.sx(c.x.asg(setn, c.lit(1)))]))
@@ -5422,7 +5845,7 @@ fn (c: mut &Checker) callValue(fv0: Val, e: int, exp: int): Val {
 
 // ---- built-in functions
 
-fn (c: mut &Checker) builtin(name: str, e: int, exp: int): Val {
+fn (c: mut &Checker) builtin(name: &str, e: int, exp: int): Val {
     return match name {
         "len" { c.bLen(e) }
         "isNull" { c.bIsNull(e) }
@@ -5457,7 +5880,7 @@ fn (c: mut &Checker) arrArg(e: int, m: bool, slices: bool): Val {
     var v = c.expr(c.arg(e, 0), if slices { (if m { EXP_MUTSLICE } else { EXP_SLICE }) } else { -1 })
     if slices && c.pg.tk(v.t) != sema.TK_SLICE {
         var s = rv(-1, -1)
-        if c.pg.tk(v.t) == sema.TK_REF && (c.pg.tm(v.t) || !m) { s = c.asSlice(v) }
+        if c.pg.tk(v.t) == sema.TK_REF && (c.pg.tm(v.t) || !m) { s = c.asSlice(v.clone()) }
         if s.t < 0 {
             c.err(line, c.fname(e) + " needs a mut slice or mut &array as its first argument, not " + c.tstr(v.t))
         }
@@ -5485,7 +5908,7 @@ fn (c: mut &Checker) builtinBorrow(v0: Val, m: bool, line: int, ast: int): Val {
 
 fn (c: mut &Checker) bLen(e: int): Val {
     c.nargs(e, 1)
-    let v = c.deref(c.expr(c.arg(e, 0), -1))
+    let v = c.rcRead(c.expr(c.arg(e, 0), -1))
     if v.t == sema.T_STR { return rv(c.x.pcast(c.ct("int64_t"), c.x.dot(c.x.par(v.c), "len")), sema.T_INT) }
     let k = c.pg.tk(v.t)
     if k != sema.TK_SLICE && k != sema.TK_ARR {
@@ -5515,8 +5938,8 @@ fn (c: mut &Checker) bAppend(e: int): Val {
     var v = c.expr(c.arg(e, 1), et)
     v = c.coerce(v, et, line, "the appended value")
     if c.pg.isBorrowClass(et) { c.storeRoot(a.root, c.crOf(v), et, line) }
-    if a.late { c.take(a, HM_MUT, c.newCid(), line) }
-    let cc = c.consume(v, line)
+    if a.late { c.take(a.clone(), HM_MUT, c.newCid(), line) }
+    let cc = c.consumeAs("append", v, line)
     let n = c.fresh("ap")
     let ct = c.T(et)
     c.emit(c.x.decl(ct, &n, cc))
@@ -5563,11 +5986,11 @@ fn (c: mut &Checker) bReplace(e: int): Val {
     p = c.before1(p, c.arg(e, 1))
     var v = c.coerce(c.expr(c.arg(e, 1), t), t, line, "the new value")
     let bcT = c.pg.isBorrowClass(t)
-    let oldCr = if bcT { c.crOf(c.deref(p)) } else { -1 }
+    let oldCr = if bcT { c.crOf(c.deref(p.clone())) } else { -1 }
     if bcT { c.storeRoot(p.root, c.crOf(v), t, line) }
     if c.checks(p.c) { v = c.seq(v) }         // the value's checks, then the place's again
-    if p.late { c.take(p, HM_MUT, c.newCid(), line) }
-    let cc = c.consume(v, line)
+    if p.late { c.take(p.clone(), HM_MUT, c.newCid(), line) }
+    let cc = c.consumeAs("replace", v, line)
     let n = c.fresh("old")
     let ct = c.T(t)
     c.emit(c.x.decl(ct, &n, c.x.pre("*", p.c)))
@@ -5591,7 +6014,7 @@ fn (c: mut &Checker) bMove(e: int): Val {
     let v = c.expr(a, -1)
     if c.pg.tk(v.t) == sema.TK_REF { c.err(line, "cannot move the borrow '" + c.nd(a).s + "'") }
     let mcr = c.crOf(v)
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("move", v.clone(), line)
     var r = c.holdtmp(cc, v.t)
     r.cr = mcr
     return r
@@ -5606,12 +6029,16 @@ fn (c: mut &Checker) bArray(e: int, exp: int): Val {
     let et = if c.ek(exp) == sema.TK_ARR { c.pg.ta(exp) } else { -1 }
     let v = c.rd(c.expr(c.arg(e, 1), et))
     c.elemType(v.t, c.line(c.arg(e, 1)))
-    if !c.isCopy(v.t) { c.err(line, "array needs a copy value, and " + c.tstr(v.t) + " is not a copy type") }
+    // SPEC 11 (design/owned-str.md): an owned value is cloned into each element
+    if !c.isCopy(v.t) && !c.pg.cloneable(v.t) && c.pg.methodOf(v.t, "clone") < 0 {
+        c.err(line, "array needs a value it can copy or clone, and " + c.tstr(v.t) + " cannot be cloned: " +
+            c.pg.cloneBlocker(v.t))
+    }
     let vn = c.fresh("fill")
     let an = c.fresh("a")
     let i = c.fresh("i")
     let ct = c.T(v.t)
-    let cc = c.consume(v, line)
+    let cc = c.consumeAs("array", v.clone(), line)
     c.emit(c.x.decl(ct, &vn, cc))
     let ct2 = c.T(v.t)
     c.emit(c.x.decl(c.ct("lxl_arr"), &an, c.x.call("rt_arr_fill", [n.c, c.x.szof(ct2), c.W(line)])))
@@ -5619,7 +6046,7 @@ fn (c: mut &Checker) bArray(e: int, exp: int): Val {
     let vnn = c.nm(&vn)
     let ann = c.nm(&an)
     let iv = c.nm(&i)
-    let d = c.dup(vnn, v.t)
+    let d = if c.isCopy(v.t) { c.dup(vnn, v.t) } else { c.hole(mkHoleX(H_CLONE, v.t, vnn)) }
     let body = c.x.sx(c.x.asg(c.x.idx(c.x.pcast(c.x.ptr(ct3), c.x.dot(ann, "data")), iv), d))
     c.emit(c.x.for1(c.x.decl(c.ct("int64_t"), &i, c.lit(0)), c.x.bin("<", iv, c.x.dot(ann, "len")), c.x.post(iv, "++"), body))
     c.dropc(vnn, v.t)
@@ -5690,13 +6117,31 @@ fn (c: mut &Checker) startFn(f: int, label: &str, ret: int, env: []int, mod: int
     c.mxs = []
 }
 
+// LXL_PARAM_REPORT (design/owned-str.md, section 3): a by-value parameter of an owned type (with
+// LXL_OWNED_STR, also one that would be owned with str owned) that the function never consumes only
+// reads its argument: it can be &T, and the implicit shared borrow keeps every call site as it is.
+fn (c: mut &Checker) reportParams(f: int, vs: &[]int) {
+    if c.pg.fns[f].isExtern || c.pg.fns[f].name == "drop" { return }
+    for i in 0..len(c.pg.fns[f].params) {
+        let p = c.pg.fns[f].params[i].clone()
+        let v = vs[i]
+        let t = c.vars[v].t
+        let k = c.pg.tk(t)
+        if p.isVar || c.vars[v].taken || k == sema.TK_REF || k == sema.TK_SLICE || k == sema.TK_CLO || k == sema.TK_TP { continue }
+        if c.isCopy(t) && !c.soft(t) { continue }
+        let m = c.pg.fns[f].mod
+        eprintln(c.pg.mods[m].fname + ":" + intToStr(p.line) + ": parameter '" + p.name + "' of " + c.pg.label(f) +
+            " takes " + c.tstr(t) + " by value but only reads it: it can be &" + c.tstr(t))
+    }
+}
+
 pub fn (c: mut &Checker) checkFn(f: int) {
     let m = c.pg.fns[f].mod
     c.startFn(f, &(c.pg.label(f)), c.pg.fns[f].ret, copyInts(&c.pg.fns[f].tps), m)
     var vs: []int = []
-    let bp = c.pg.fns[f].bparam
+    let bp = c.pg.fns[f].bparam.clone()
     for i in 0..len(c.pg.fns[f].params) {
-        let p = c.pg.fns[f].params[i]
+        let p = c.pg.fns[f].params[i].clone()
         let v = c.newVar(&p.name, &("p_" + p.name), p.ty, p.isVar, VK_PARAM, p.line)
         append(mut &vs, v)
         if p.name == bp { c.cx.bvar = v }
@@ -5709,6 +6154,7 @@ pub fn (c: mut &Checker) checkFn(f: int) {
             append(mut &c.cx.rsrc, if c.vars[pv].croot >= 0 { c.vars[pv].croot } else { pv })
         }
     }
+    let pvs = copyInts(&vs)
     append(mut &c.cx.scopes, Scope{vars: vs, freezes: []})
     let line = c.pg.fns[f].line
     if c.pg.fns[f].name == "main" && c.pg.fns[f].ownerKind == sema.O_NONE && m == c.pg.main {
@@ -5717,6 +6163,7 @@ pub fn (c: mut &Checker) checkFn(f: int) {
         }
     }
     c.block(c.pg.nd(m, c.pg.fns[f].node).e, false, true)
+    if c.pg.paramReport { c.reportParams(f, &pvs) }
     if !c.cx.dead {
         let ret = c.pg.fns[f].ret
         if ret == sema.T_NEVER {
@@ -5737,7 +6184,7 @@ pub fn (c: mut &Checker) checkAll() {
             if !c.pg.fns[f].isExtern { c.checkFn(f) }
         }
         var names: []str = []
-        for n in c.pg.mods[m].scopeNames { append(mut &names, n) }
+        for n in c.pg.mods[m].scopeNames { append(mut &names, n.clone()) }
         for n in names {
             let s = c.pg.mods[m].scope.getOr(&n, sema.Sym{k: -1, i: -1})
             if s.k == sema.D_GLOBAL {
@@ -5752,7 +6199,7 @@ pub fn (c: mut &Checker) checkAll() {
 fn (c: mut &Checker) globalInit(dk: int, g: int) {
     let isG = dk == sema.D_GLOBAL
     let m = if isG { c.pg.globals[g].mod } else { c.pg.consts[g].mod }
-    let name = if isG { c.pg.globals[g].name } else { c.pg.consts[g].name }
+    let name = if isG { c.pg.globals[g].name.clone() } else { c.pg.consts[g].name.clone() }
     let node = if isG { c.pg.globals[g].node } else { c.pg.consts[g].node }
     let t = if isG { c.pg.globals[g].ty } else { c.pg.consts[g].table }
     c.startFn(-1, "<global>", sema.T_VOID, [], m)
@@ -5782,7 +6229,7 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
         if t == sema.T_STR { return c.hole(mkHole(H_GSTR, -1, &v.s)) }
         if t == sema.T_BOOL { return c.nm(if v.b { "true" } else { "false" }) }
         if t == sema.T_FLOAT { return c.x.num(&(num.pyFloatRepr(v.f))) }
-        return c.cint(v.i, t)
+        return c.cint(v.i.clone(), t)
     }
     if c.pg.tk(t) != sema.TK_INST { c.err(line, "not a constant") }
     let d = c.pg.ta(t)
@@ -5791,8 +6238,8 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
     let form = c.pg.types[d].form
     if k == sx.N_LIT && form == sx.F_RECORD {
         var names: []str = []
-        for f in c.pg.types[d].fields { append(mut &names, f.name) }
-        let tname = c.pg.types[d].name
+        for f in c.pg.types[d].fields { append(mut &names, f.name.clone()) }
+        let tname = c.pg.types[d].name.clone()
         let args = c.orderInits(&names, c.nd(e).b, &tname, line)
         var its: []int = []
         for i in 0..len(names) {
@@ -5808,10 +6255,10 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
         if st.k == ST_DECL && st.dk == D_VARIANT && c.pg.variants[st.di].decl == d {
             let vr = st.di
             var names: []str = []
-            for f in c.pg.variants[vr].fields { append(mut &names, f.name) }
+            for f in c.pg.variants[vr].fields { append(mut &names, f.name.clone()) }
             var args: []int = []
             if k == sx.N_LIT {
-                let vname = c.pg.variants[vr].name
+                let vname = c.pg.variants[vr].name.clone()
                 let ias = c.orderInits(&names, c.nd(e).b, &vname, line)
                 for a in ias { append(mut &args, a.n) }
             } else if k == sx.N_CALL {

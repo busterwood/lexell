@@ -25,7 +25,8 @@ const G_ACT = 1
 const G_REST = 2
 const G_DUP = 3
 const G_TRAMP = 4
-const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp"]
+const G_CLONE = 5
+const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone"]
 
 type Inst = value record {
     f: int
@@ -126,7 +127,7 @@ fn (e: mut &Emitter) pod(t: int): bool { return ck.isPod(mut &e.c.pg, mut &e.pod
 
 fn (e: &Emitter) tk(t: int): int { return e.c.pg.tk(t) }
 
-fn prefix(s: &str, n: int): str { return if len(s) > n { s[0..n] } else { s } }
+fn prefix(s: &str, n: int): str { return if len(s) > n { s[0..n] } else { s.clone() } }
 
 fn (e: &Emitter) fail(m: int, line: int, msg: str): never {
     if m < 0 { sx.failText(msg) }
@@ -137,7 +138,7 @@ fn (e: &Emitter) fail(m: int, line: int, msg: str): never {
 
 fn (e: mut &Emitter) ctype(t: int): str {
     let k = e.tk(t)
-    if k == sema.TK_PRIM { return ck.CTYPES[t] }
+    if k == sema.TK_PRIM { return ck.CTYPES[t].clone() }
     if k == sema.TK_ARR { return "lxl_arr" }
     if k == sema.TK_REF {
         if e.c.pg.ta(t) == sema.T_STR && !e.c.pg.tm(t) { return "lxl_str" }     // a shared &str: the header, uncounted
@@ -154,7 +155,7 @@ fn (e: mut &Emitter) ctype(t: int): str {
             for i in 0..e.c.pg.tn(t) { append(mut &ps, e.ctype(e.c.pg.ti(t, i))) }
             let r = e.ctype(e.c.pg.tb(t))
             n = "fn" + intToStr(e.nnames)
-            append(mut &e.fntypes, FnType{name: n, ret: r, ptys: ps})
+            append(mut &e.fntypes, FnType{name: n.clone(), ret: r, ptys: ps})
         } else {
             n = "S" + intToStr(e.nnames) + "_" + e.c.pg.types[e.c.pg.ta(t)].cname
             append(mut &e.structs, t)
@@ -187,7 +188,7 @@ fn (e: &Emitter) tooDeep(t: int): never {
     }
     if d < 0 && len(ds) > 0 { d = ds[0] }
     let ts = e.c.pg.tstr(t)
-    let nm = if d >= 0 { e.c.pg.types[d].name } else { prefix(&ts, 40) }
+    let nm = if d >= 0 { e.c.pg.types[d].name.clone() } else { prefix(&ts, 40) }
     let msg = "instantiation of type " + nm + " does not terminate: its type arguments grow without bound (" +
         prefix(&ts, 80) + "...)"
     if d < 0 { e.fail(-1, 0, msg) }
@@ -207,7 +208,7 @@ fn (e: mut &Emitter) fields(t: int, vr: int, env: &[]int, cts: mut &[]str, names
     let d = e.c.pg.ta(t)
     let n = if vr >= 0 { len(e.c.pg.variants[vr].fields) } else { len(e.c.pg.types[d].fields) }
     for i in 0..n {
-        let f = if vr >= 0 { e.c.pg.variants[vr].fields[i] } else { e.c.pg.types[d].fields[i] }
+        let f = if vr >= 0 { e.c.pg.variants[vr].fields[i].clone() } else { e.c.pg.types[d].fields[i].clone() }
         let ft = e.c.pg.subst(f.ty, env)
         append(cts, e.ctype(ft))
         append(names, "f_" + f.name)
@@ -234,7 +235,7 @@ fn (e: mut &Emitter) nameFields(t: int) {
 
 fn (e: mut &Emitter) irFields(u: mut &lw.Lower, cts: &[]str, names: &[]str): []ir.Field {
     var fs: []ir.Field = []
-    for i in 0..len(cts) { append(mut &fs, ir.Field{name: names[i], ty: u.ctName(cts[i]), off: 0}) }
+    for i in 0..len(cts) { append(mut &fs, ir.Field{name: names[i].clone(), ty: u.ctName(cts[i].clone()), off: 0}) }
     return fs
 }
 
@@ -282,6 +283,91 @@ fn (e: mut &Emitter) dropC(t: int, cc: int): int {
     if t == sema.T_STR { return e.call("rt_str_drop", [cc]) }
     let g = e.glueFn(G_DROP, t)
     return e.call(&g, [cc])
+}
+
+// A deep copy of the value cc of type t (design/owned-str.md, issue 4): itself for plain data, a copy
+// for a type copied while str is counted, a call of t's clone method if it has one, else clone glue.
+fn (e: mut &Emitter) cloneC(t: int, cc: int): int {
+    if e.pod(t) { return cc }
+    let f = e.c.pg.methodOf(t, "clone")
+    if f >= 0 && e.tk(t) == sema.TK_INST {
+        var bind: []int = []
+        if e.c.pg.unify(e.c.pg.fns[f].recvType, t, mut &bind, &e.c.pg.fns[f].tps) {
+            var ta: []int = []
+            for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
+            let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
+            let arg = if e.c.pg.fns[f].recvMode == sema.RM_VAL { e.dupC(t, cc) } else { e.c.x.pre("&", cc) }
+            return e.call(&fname, [arg])
+        }
+    }
+    if e.c.pg.isCopyLegacy(t) { return e.dupC(t, cc) }
+    let g = e.glueFn(G_CLONE, t)
+    return e.call(&g, [cc])
+}
+
+// The body of clone glue: a new buffer or box for v, each part cloned into it.
+fn (e: mut &Emitter) cloneBody(t: int, ct: &str): []int {
+    let r = e.nm("r")
+    if e.tk(t) == sema.TK_ARR {
+        let et = e.c.pg.ta(t)
+        let ec = e.ctype(et)
+        let size = e.c.x.szof(e.ct(&ec))
+        let src = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&ec)), e.c.x.dot(e.nm("v"), "data")), e.nm("i"))
+        let dst = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&ec)), e.c.x.dot(r, "data")), e.nm("i"))
+        let h = e.loopHead(e.c.x.lit(0), "<", e.c.x.dot(e.nm("v"), "len"), "++")
+        return [e.c.x.decl(e.ct(ct), "r", e.call("rt_arr_new", [e.c.x.dot(e.nm("v"), "len"), size])),
+            e.c.x.for1(h[0], h[1], h[2], e.c.x.sx(e.c.x.asg(dst, e.cloneC(et, src)))), e.c.x.sret(r)]
+    }
+    let d = e.c.pg.ta(t)
+    let env = e.c.pg.declEnv(t)
+    if d == e.c.pg.shared {
+        return [e.callS("rt_sh_dup", [e.c.x.dot(e.nm("v"), "f_p")]), e.c.x.sret(e.nm("v"))]
+    }
+    if e.c.pg.isRc(t) {        // another handle to the same box
+        let nf = e.c.x.arrow(e.nm("v"), "f_n")
+        return [e.c.x.sx(e.c.x.asg(nf, e.c.x.bin("+", nf, e.c.x.lit(1)))), e.c.x.sret(e.nm("v"))]
+    }
+    let boxed = !e.c.pg.types[d].value
+    var body: []int = []
+    if boxed {
+        append(mut &body, e.c.x.decl(e.ct(ct), "r", e.call("rt_alloc", [e.c.x.szof(e.c.x.pre("*", r))])))
+        append(mut &body, e.c.x.sx(e.c.x.asg(e.c.x.pre("*", r), e.c.x.pre("*", e.nm("v")))))
+    } else {
+        append(mut &body, e.c.x.decl(e.ct(ct), "r", e.nm("v")))
+    }
+    let sep = if boxed { "->" } else { "." }
+    if e.c.pg.types[d].form == sx.F_RECORD {
+        for i in 0..len(e.c.pg.types[d].fields) {
+            let f = e.c.pg.types[d].fields[i].clone()
+            let ft = e.c.pg.subst(f.ty, &env)
+            if e.pod(ft) { continue }
+            let src = if boxed { e.c.x.arrow(e.nm("v"), &("f_" + f.name)) } else { e.c.x.dot(e.nm("v"), &("f_" + f.name)) }
+            let dst = if boxed { e.c.x.arrow(r, &("f_" + f.name)) } else { e.c.x.dot(r, &("f_" + f.name)) }
+            append(mut &body, e.c.x.sx(e.c.x.asg(dst, e.cloneC(ft, src))))
+        }
+    } else {
+        let tagOf = if boxed { e.c.x.arrow(e.nm("v"), "tag") } else { e.c.x.dot(e.nm("v"), "tag") }
+        append(mut &body, e.c.x.sswitch(tagOf))
+        let vs = copyInts(&e.c.pg.types[d].variants)
+        for v in vs {
+            append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+            let vn = "V_" + e.c.pg.variants[v].name
+            for i in 0..len(e.c.pg.variants[v].fields) {
+                let fd = e.c.pg.variants[v].fields[i].clone()
+                let ft = e.c.pg.subst(fd.ty, &env)
+                if e.pod(ft) { continue }
+                let su = if boxed { e.c.x.arrow(e.nm("v"), "u") } else { e.c.x.dot(e.nm("v"), "u") }
+                let du = if boxed { e.c.x.arrow(r, "u") } else { e.c.x.dot(r, "u") }
+                let src = e.c.x.dot(e.c.x.dot(su, &vn), &("f_" + fd.name))
+                let dst = e.c.x.dot(e.c.x.dot(du, &vn), &("f_" + fd.name))
+                append(mut &body, e.c.x.sx(e.c.x.asg(dst, e.cloneC(ft, src))))
+            }
+            append(mut &body, e.c.x.sbreak())
+        }
+        append(mut &body, e.c.x.send())
+    }
+    append(mut &body, e.c.x.sret(r))
+    return body
 }
 
 fn (e: mut &Emitter) dupC(t: int, cc: int): int {
@@ -370,13 +456,13 @@ fn (e: mut &Emitter) us(t: int, vr: int, base: int, sep: &str, fts: mut &[]int, 
     let env = e.c.pg.declEnv(t)
     let n = if vr >= 0 { len(e.c.pg.variants[vr].fields) } else { len(e.c.pg.types[d].fields) }
     var b = base
-    var s: str = sep
+    var s: str = sep.clone()
     if vr >= 0 {
         b = e.c.x.dot(e.c.x.member(base, sep, "u"), &("V_" + e.c.pg.variants[vr].name))
         s = "."
     }
     for i in 0..n {
-        let f = if vr >= 0 { e.c.pg.variants[vr].fields[i] } else { e.c.pg.types[d].fields[i] }
+        let f = if vr >= 0 { e.c.pg.variants[vr].fields[i].clone() } else { e.c.pg.types[d].fields[i].clone() }
         let ft = e.c.pg.subst(f.ty, &env)
         if !e.pod(ft) {
             append(fts, ft)
@@ -542,7 +628,9 @@ fn (e: mut &Emitter) rest(t: int): []int {
 fn (e: mut &Emitter) glueFn(kind: int, t: int): str {
     let key = t * 8 + kind
     if !e.glue.has(&key) {
-        e.glue.put(key, "gl" + intToStr(e.nglue) + "_" + GLUE_NAMES[kind])
+        // an rc handle's glue ends in _rc: par.map's kernel check refuses it (the count is not atomic)
+        let sfx = if e.c.pg.isRc(t) { "_rc" } else { "" }
+        e.glue.put(key, "gl" + intToStr(e.nglue) + "_" + GLUE_NAMES[kind] + sfx)
         e.nglue += 1
         append(mut &e.gluework, Glue{kind: kind, t: t})
     }
@@ -550,14 +638,14 @@ fn (e: mut &Emitter) glueFn(kind: int, t: int): str {
 }
 
 fn (e: mut &Emitter) define(name: &str, ret: &str, ptys: []str, pnames: []str, lines: []int, res: int) {
-    append(mut &e.fns, FnDef{name: name, ret: ret, ptys: ptys, pnames: pnames, lines: lines, res: res})
+    append(mut &e.fns, FnDef{name: name.clone(), ret: ret.clone(), ptys: ptys, pnames: pnames, lines: lines, res: res})
 }
 
 fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
     let key = t * 8 + kind
     let n = e.glue.getOr(&key, "")
-    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of"]
-    e.fsrc.put(n, gk[kind] + " " + e.c.pg.tstr(t))
+    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of", "the clone of"]
+    e.fsrc.put(n.clone(), gk[kind] + " " + e.c.pg.tstr(t))
     let ct = e.ctype(t)
     if kind == G_TRAMP {        // a plain function seen as a closure: the environment is the function
         var ps: []str = ["void*"]
@@ -572,6 +660,24 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         let c = e.c.x.callx(e.c.x.par(e.c.x.cast(e.ct(&ct), e.nm("e"))), avs)
         let st = if rc == "void" { e.c.x.sx(c) } else { e.c.x.sret(c) }
         e.define(&n, &rc, ps, pns, [st], -1)
+        return
+    }
+    if (kind == G_DROP || kind == G_ACT || kind == G_REST) && e.c.pg.isRc(t) {
+        // rc T (design/owned-str.md): one handle fewer; the last drops the value and frees the box
+        let vt = e.c.pg.targs(t)[0]
+        var body: []int = []
+        if kind != G_DROP { append(mut &body, e.c.x.decl(e.ct(&ct), "v", e.nm("p"))) }
+        let nf = e.c.x.arrow(e.nm("v"), "f_n")
+        append(mut &body, e.c.x.sx(e.c.x.asg(nf, e.c.x.bin("-", nf, e.c.x.lit(1)))))
+        append(mut &body, e.c.x.sif(e.c.x.bin("==", nf, e.c.x.lit(0))))
+        if !e.pod(vt) { append(mut &body, e.c.x.sx(e.dropC(vt, e.c.x.arrow(e.nm("v"), "f_v")))) }
+        append(mut &body, e.callS("rt_free", [e.nm("v")]))
+        append(mut &body, e.c.x.send())
+        if kind == G_DROP {
+            e.define(&n, "void", [ct], ["v"], body, -1)
+        } else {
+            e.define(&n, "void", ["void*"], ["p"], body, -1)
+        }
         return
     }
     if kind == G_DROP || kind == G_ACT || kind == G_REST {
@@ -609,6 +715,11 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         }
         return
     }
+    if kind == G_CLONE {
+        let body = e.cloneBody(t, &ct)
+        e.define(&n, &ct, [ct.clone()], ["v"], body, -1)
+        return
+    }
     let d = e.c.pg.ta(t)
     let env = e.c.pg.declEnv(t)
     var body: []int = []
@@ -616,7 +727,7 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         append(mut &body, e.callS("rt_sh_dup", [e.c.x.dot(e.nm("v"), "f_p")]))
     } else if e.c.pg.types[d].form == sx.F_RECORD {
         for i in 0..len(e.c.pg.types[d].fields) {
-            let f = e.c.pg.types[d].fields[i]
+            let f = e.c.pg.types[d].fields[i].clone()
             let ft = e.c.pg.subst(f.ty, &env)
             let loc = e.c.x.dot(e.nm("v"), &("f_" + f.name))
             append(mut &body, e.c.x.sx(e.c.x.asg(loc, e.dupC(ft, loc))))
@@ -627,7 +738,7 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         for v in vs {
             append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
             for i in 0..len(e.c.pg.variants[v].fields) {
-                let fd = e.c.pg.variants[v].fields[i]
+                let fd = e.c.pg.variants[v].fields[i].clone()
                 let vv = e.c.x.dot(e.c.x.dot(e.nm("v"), "u"), &("V_" + e.c.pg.variants[v].name))
                 let loc = e.c.x.dot(vv, &("f_" + fd.name))
                 let ft = e.c.pg.subst(fd.ty, &env)
@@ -638,19 +749,20 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         append(mut &body, e.c.x.send())
     }
     append(mut &body, e.c.x.sret(e.nm("v")))
-    e.define(&n, &ct, [ct], ["v"], body, -1)
+    e.define(&n, &ct, [ct.clone()], ["v"], body, -1)
 }
 
 // ---- holes
 
-fn (e: mut &Emitter) strlit(b: str, glob: bool): int {
-    if !e.strs.has(&b) {
-        e.strs.put(b, "sl" + intToStr(len(e.strKeys)))
-        append(mut &e.strKeys, b)
+fn (e: mut &Emitter) strlit(b: &str, glob: bool): int {
+    if !e.strs.has(b) {
+        e.strs.put(b.clone(), "sl" + intToStr(len(e.strKeys)))
+        append(mut &e.strKeys, b.clone())
     }
-    let n = e.strs.getOr(&b, "")
+    let n = e.strs.getOr(b, "")
     if !glob { return e.nm(&n) }
-    let p = e.c.x.cast(e.c.x.ptr(e.ct("lxl_sblk")), e.c.x.pre("&", e.nm(&(n + "b"))))
+    // a literal: static bytes, cap 0 (never freed; a copy shares them; design/owned-str.md)
+    let p = e.c.x.cast(e.c.x.ptr(e.ct("char")), e.nm(&(n + "b")))
     return e.c.x.init([p, e.c.x.lit(0), e.c.x.lit(len(b))])
 }
 
@@ -705,6 +817,11 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         e.fill(h.x, holes, env, name, res)
         return e.dupC(t, h.x)
     }
+    if k == ck.H_CLONE {
+        let t = e.c.pg.subst(h.t, env)
+        e.fill(h.x, holes, env, name, res)
+        return e.cloneC(t, h.x)
+    }
     if k == ck.H_STR || k == ck.H_GSTR { return e.strlit(h.s, k == ck.H_GSTR) }
     if k == ck.H_ADDR || k == ck.H_DEREF || k == ck.H_SHARE {
         let t = e.c.pg.subst(h.t, env)
@@ -724,6 +841,12 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         return e.nm(&g)
     }
     let t = e.c.pg.subst(h.t, env)
+    if k == ck.H_IMETH && h.s == "clone" && e.c.pg.methodOf(t, "clone") < 0 && e.c.pg.cloneable(t) {
+        // design/owned-str.md: the built-in clone (sema.builtinClone)
+        e.fill(h.r, holes, env, name, res)
+        if h.f == sema.RM_VAL { return h.r }
+        return e.cloneC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
+    }
     let f = e.c.pg.methodOf(t, h.s)
     var bind: []int = []
     if f < 0 || !e.c.pg.unify(e.c.pg.fns[f].recvType, t, mut &bind, &e.c.pg.fns[f].tps) {
@@ -789,7 +912,7 @@ fn (e: mut &Emitter) instance(f: int, targs: int): str {
         if e.ninsts > MAX_INSTANCES {
             e.fail(m, line, "too many instances (instantiation of " + label + " does not terminate)")
         }
-        e.insts.put(key, "f" + intToStr(e.ninsts) + "_" + e.c.pg.mods[m].cprefix + "_" + cident(&label))
+        e.insts.put(key.clone(), "f" + intToStr(e.ninsts) + "_" + e.c.pg.mods[m].cprefix + "_" + cident(&label))
         e.ninsts += 1
         append(mut &e.work, Inst{f: f, targs: targs})
     }
@@ -807,24 +930,24 @@ fn (e: mut &Emitter) makeInstance(f: int, targs: int) {
     var ps: []str = []
     var pns: []str = []
     for i in 0..len(e.c.pg.fns[f].params) {
-        let p = e.c.pg.fns[f].params[i]
+        let p = e.c.pg.fns[f].params[i].clone()
         append(mut &ps, e.ctype(e.c.pg.subst(p.ty, &env)))
         append(mut &pns, "p_" + p.name)
     }
     let rc = e.ctype(e.c.pg.subst(e.c.pg.fns[f].ret, &env))
     let fm = e.c.pg.fns[f].mod
     let label = e.c.pg.label(f)
-    let file = e.c.pg.mods[fm].fname
-    e.fsrc.put(name, label + " (" + file + ":" + intToStr(e.c.pg.fns[f].line) + ")")
-    if e.c.pg.fns[f].ret == sema.T_NEVER { e.stops.put(name, true) }
+    let file = e.c.pg.mods[fm].fname.clone()
+    e.fsrc.put(name.clone(), label + " (" + file + ":" + intToStr(e.c.pg.fns[f].line) + ")")
+    if e.c.pg.fns[f].ret == sema.T_NEVER { e.stops.put(name.clone(), true) }
     var mask = ""
     for i in 0..len(e.c.pg.fns[f].params) { mask = mask + (if e.c.pg.fns[f].params[i].ty == sema.T_STR { "1" } else { "0" }) }
-    e.pstr.put(name, mask)
-    e.fpath.put(name, e.c.pg.mods[fm].path + ":" + intToStr(e.c.pg.fns[f].line))
+    e.pstr.put(name.clone(), mask)
+    e.fpath.put(name.clone(), e.c.pg.mods[fm].path + ":" + intToStr(e.c.pg.fns[f].line))
     if e.c.pg.mods[fm].isLib && e.c.pg.mods[fm].name == "par" {
-        let fnm = e.c.pg.fns[f].name
-        if fnm == "map" { e.parMaps.put(name, true) }
-        if fnm == "item" || fnm == "callAt" { e.parBounds.put(name, true) }
+        let fnm = &e.c.pg.fns[f].name
+        if fnm == "map" { e.parMaps.put(name.clone(), true) }
+        if fnm == "item" || fnm == "callAt" { e.parBounds.put(name.clone(), true) }
     }
     let tm = replace(mut &e.c.tmpls[f], ck.Tmpl{done: false, lines: [], holes: [], lifted: []})
     var res = newRes(len(tm.holes))
@@ -836,7 +959,7 @@ fn (e: mut &Emitter) makeInstance(f: int, targs: int) {
         var cns: []str = ["cv_"]
         for j in 0..len(l.pnames) {
             append(mut &cps, e.ctype(e.c.pg.subst(l.ptys[j], &env)))
-            append(mut &cns, l.pnames[j])
+            append(mut &cns, l.pnames[j].clone())
         }
         let lrc = e.ctype(e.c.pg.subst(l.ret, &env))
         for x in l.lines { e.fill(x, &tm.holes, &env, &name, mut &res) }
@@ -865,24 +988,24 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
     var seen: Map[str, bool] = newMapWith[str, bool](fxHashStr)
     var blocking: Map[str, bool] = newMapWith[str, bool](fxHashStr)
     for f in 0..len(e.c.pg.fns) {
-        if e.c.pg.fns[f].isExtern && e.c.pg.fns[f].blocking { blocking.put(e.c.pg.fns[f].cname, true) }
+        if e.c.pg.fns[f].isExtern && e.c.pg.fns[f].blocking { blocking.put(e.c.pg.fns[f].cname.clone(), true) }
     }
     for m in 0..len(e.c.pg.mods) {
         let fs = copyInts(&e.c.pg.mods[m].fns)
         for f in fs {
-            let cn = e.c.pg.fns[f].cname
+            let cn = e.c.pg.fns[f].cname.clone()
             if e.c.pg.fns[f].isExtern && cn != "" && !seen.has(&cn) {
-                seen.put(cn, true)
+                seen.put(cn.clone(), true)
                 var ps: []str = []
                 for i in 0..len(e.c.pg.fns[f].params) { append(mut &ps, e.externC(e.c.pg.fns[f].params[i].ty)) }
                 let rc = e.externC(e.c.pg.fns[f].ret)
                 append(mut &externs, Extern{name: cn, ret: rc, ptys: ps, va: e.c.pg.fns[f].varargs, blocking: blocking.has(&cn)})
-                let lib = e.c.pg.fns[f].lib
+                let lib = &e.c.pg.fns[f].lib
                 var known = lib == "c" || lib == ""
                 for l in libs {
                     if l == lib { known = true }
                 }
-                if !known { append(libs, lib) }
+                if !known { append(libs, lib.clone()) }
             }
         }
     }
@@ -901,7 +1024,7 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
     for m in 0..len(e.c.pg.mods) { append(mut &onces, []) }
     for m in post {
         var names: []str = []
-        for n in e.c.pg.mods[m].scopeNames { append(mut &names, n) }
+        for n in e.c.pg.mods[m].scopeNames { append(mut &names, n.clone()) }
         for n in names {
             let s = e.c.pg.mods[m].scope.getOr(&n, sema.Sym{k: -1, i: -1})
             let isG = s.k == sema.D_GLOBAL
@@ -909,15 +1032,15 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
             let gi = if isG { replace(mut &e.c.ginits[s.i], noInit()) } else { replace(mut &e.c.cinits[s.i], noInit()) }
             if !gi.has { continue }
             let t = if isG { e.c.pg.globals[s.i].ty } else { e.c.pg.consts[s.i].table }
-            let cn = if isG { e.c.pg.globals[s.i].cname } else { e.c.pg.consts[s.i].cname }
-            e.gsrc.put(cn, e.c.pg.mods[m].name + "." + n)
+            let cn = if isG { e.c.pg.globals[s.i].cname.clone() } else { e.c.pg.consts[s.i].cname.clone() }
+            e.gsrc.put(cn.clone(), e.c.pg.mods[m].name + "." + n)
             if isG && e.c.pg.mods[m].isLib && e.c.pg.mods[m].name == "hash" &&
                 (n == "sipKeyed" || n == "sipK0" || n == "sipK1" || n == "mapSeed") {
-                e.kglobals.put(cn, true)        // par.map derives the key before its workers run (hash.keyReady)
+                e.kglobals.put(cn.clone(), true)        // par.map derives the key before its workers run (hash.keyReady)
             }
             if gi.isOnce {          // a set-once global: 0 empty, 1 set, 2 dropped
                 let ct = e.ctype(t)
-                append(mut &globs, GDef{name: cn, ty: ct, n: -1, init: -1, isConst: false, res: []})
+                append(mut &globs, GDef{name: cn.clone(), ty: ct, n: -1, init: -1, isConst: false, res: []})
                 append(mut &globs, GDef{name: cn + "_set", ty: "uint8_t", n: -1, init: -1, isConst: false, res: []})
                 let set = e.nm(&(cn + "_set"))
                 let mark = e.c.x.sx(e.c.x.asg(set, e.c.x.lit(2)))
@@ -939,12 +1062,12 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
                 let its = if len(gi.items) == 0 { e.c.x.init([e.c.x.lit(0)]) } else { e.c.x.init(copyInts(&gi.items)) }
                 append(mut &globs, GDef{name: cn + "_d", ty: ct, n: nn, init: its, isConst: true, res: res})
                 let sl = e.c.x.init([e.c.x.cast(e.ct("void*"), e.nm(&(cn + "_d"))), e.c.x.lit(len(gi.items))])
-                append(mut &globs, GDef{name: cn, ty: "lxl_slice", n: -1, init: sl, isConst: true, res: []})
+                append(mut &globs, GDef{name: cn.clone(), ty: "lxl_slice", n: -1, init: sl, isConst: true, res: []})
             } else {
                 let ct = e.ctype(t)
                 var res = newRes(len(gi.holes))
                 e.fill(gi.c, &gi.holes, &[], &"", mut &res)
-                append(mut &globs, GDef{name: cn, ty: ct, n: -1, init: gi.c, isConst: !isG, res: res})
+                append(mut &globs, GDef{name: cn.clone(), ty: ct, n: -1, init: gi.c, isConst: !isG, res: res})
                 if !e.pod(t) {
                     var l: []int = [e.c.x.sx(e.dropC(t, e.nm(&cn)))]
                     for x in copies { append(mut &l, x) }
@@ -993,8 +1116,8 @@ fn (e: mut &Emitter) lower(entry: &str, externs: &[]Extern, globs: &[]GDef, gdro
     for t in structs { u.newStruct(&(e.names.getOr(&t, "")), false) }
     for ft in e.fntypes {
         var pts: []int = []
-        for p in ft.ptys { append(mut &pts, u.ctName(p)) }
-        let r = u.ctName(ft.ret)
+        for p in ft.ptys { append(mut &pts, u.ctName(p.clone())) }
+        let r = u.ctName(ft.ret.clone())
         u.typedef(&ft.name, u.ir.ptrTo(u.ir.fnType(r, &pts)))
     }
     var order: []int = []
@@ -1004,17 +1127,16 @@ fn (e: mut &Emitter) lower(entry: &str, externs: &[]Extern, globs: &[]GDef, gdro
     u.x = replace(mut &e.c.x, tm.newArena())
     for b in e.strKeys {
         let n = e.strs.getOr(&b, "")
-        let st = u.newStruct("<anonymous>", false)
-        u.layout(st, [ir.Field{name: "rc", ty: ir.TY_I64, off: 0}, ir.Field{name: "data", ty: u.ir.arrOf(ir.TY_I8, len(b) + 1), off: 0}])
-        u.global(&(n + "b"), st, u.x.init([u.x.num("-1"), u.x.str(&b)]), false)
-        u.ir.kglobals.put(n + "b", true)        // written by nothing: its count is -1
-        let p = u.x.cast(u.x.ptr(u.x.ct("lxl_sblk")), u.x.pre("&", u.x.nm(&(n + "b"))))
+        // the bytes and a NUL; the str is {bytes, cap 0, len}: static, never freed (design/owned-str.md)
+        u.global(&(n + "b"), u.ir.arrOf(ir.TY_I8, len(b) + 1), u.x.str(&b), false)
+        u.ir.kglobals.put(n + "b", true)        // written by nothing
+        let p = u.x.cast(u.x.ptr(u.x.ct("char")), u.x.nm(&(n + "b")))
         u.global(&n, u.ctName("lxl_str"), u.x.init([p, u.x.lit(0), u.x.lit(len(b))]), true)
     }
     for x in externs {
         var pts: []int = []
-        for p in x.ptys { append(mut &pts, u.ctName(p)) }
-        let r = u.ctName(x.ret)
+        for p in x.ptys { append(mut &pts, u.ctName(p.clone())) }
+        let r = u.ctName(x.ret.clone())
         let ty = if x.va { u.ir.varFnType(r, &pts) } else { u.ir.fnType(r, &pts) }
         u.declFunc("x_" + x.name, ty, &x.name, true)
         if x.blocking { u.declFunc("bk1_" + x.name, u.ir.fnType(ir.TY_VOID, &[u.ctName("void*")]), "", false) }
@@ -1022,23 +1144,23 @@ fn (e: mut &Emitter) lower(entry: &str, externs: &[]Extern, globs: &[]GDef, gdro
     u.declFunc("gx_end", u.ir.fnType(ir.TY_VOID, &[u.ctName("void*")]), "", false)
     for g in globs {
         u.res = copyInts(&g.res)
-        var ty = u.ctName(g.ty)
+        var ty = u.ctName(g.ty.clone())
         if g.n >= 0 { ty = u.ir.arrOf(ty, g.n) }
         u.global(&g.name, ty, g.init, g.isConst)
     }
     var ftys: []int = []
     for f in e.fns {
         var pts: []int = []
-        for p in f.ptys { append(mut &pts, u.ctName(p)) }
-        let r = u.ctName(f.ret)
+        for p in f.ptys { append(mut &pts, u.ctName(p.clone())) }
+        let r = u.ctName(f.ret.clone())
         let ty = u.ir.fnType(r, &pts)
-        u.declFunc(f.name, ty, "", false)
+        u.declFunc(f.name.clone(), ty, "", false)
         append(mut &ftys, ty)
     }
     for j in 0..len(e.fns) {
         let ri = e.fns[j].res
         u.res = if ri >= 0 { replace(mut &e.ress[ri], []) } else { [] }
-        u.defineFunc(e.fns[j].name, ftys[j], &e.fns[j].pnames, &e.fns[j].lines)
+        u.defineFunc(e.fns[j].name.clone(), ftys[j], &e.fns[j].pnames, &e.fns[j].lines)
         if ri >= 0 { e.ress[ri] = replace(mut &u.res, []) }
     }
     // a blocking extern's thunk, run on a helper thread (check.blockingCall):

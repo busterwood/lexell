@@ -275,9 +275,12 @@ fn putBytes2(b: mut &[]byte, s: &str) {
 
 // A cursor over received bytes. Every read checks the bytes there are; when
 // they run out, short is set (the message may continue in the next packet).
-pub type Cur = value record { s: str; pub pos: int; pub short: bool }
+pub type Cur = value record { s: rc str; pub pos: int; pub short: bool }     // s: the data, shared by the cursors over it
 
-pub fn cursor(s: &str): Cur { return Cur{s: s, pos: 0, short: false} }
+pub fn cursor(s: &str): Cur { return Cur{s: rc(s.clone()), pos: 0, short: false} }
+
+// A cursor at at over data already held in an rc: no copy of the bytes.
+fn cursorOf(s: &rc str, at: int): Cur { return Cur{s: s.share(), pos: at, short: false} }
 
 fn (c: &Cur) left(): int { return len(c.s) - c.pos }
 
@@ -394,7 +397,7 @@ pub fn (c: mut &Cur) str2(what: &str): Result[str, Error] {
 
 fn utf8(b: &str, what: &str): Result[str, Error] {
     if !strings.isValidUtf8(b) { return Err(proto(&(what + ": invalid UTF-8"))) }
-    return Ok(b)
+    return Ok(b.clone())
 }
 
 // UTF-8 text as UTF-16BE (NCHAR binds).
@@ -495,7 +498,7 @@ pub fn (n: &Num) int(): Option[int] {
 // (more than 40 digits, 1e126 and up, below 1e-130).
 pub fn encodeNumber(n: &Num): Result[str, Error] {
     if n.digits == "" { return Ok("\x80") }
-    var d = n.digits
+    var d = n.digits.clone()
     var dpi = len(d) + n.exp            // the digits before the decimal point
     if len(d) > 40 || dpi > 126 || dpi < -129 {
         return Err(sqldialect.inputError(&("a number outside Oracle NUMBER's range (at most 40 digits, from 1e-130 to below 1e126): " +
@@ -924,9 +927,9 @@ pub const K_EXECUTE = 2
 // An empty reply of a kind; columns and last row: the cursor's so far (a FETCH).
 pub fn newReply(kind: int, columns: &[]Column, last: &[]Cell): Reply {
     var cols: []Column = []
-    for x in columns { append(mut &cols, x) }
+    for x in columns { append(mut &cols, x.clone()) }
     var prev: []Cell = []
-    for x in last { append(mut &prev, x) }
+    for x in last { append(mut &prev, x.clone()) }
     return Reply{kind: kind, columns: cols, described: false, rows: [], hasError: false,
                  error: ErrorInfo{num: 0, msg: "", pos: 0, cursorId: 0, rowCount: 0, callStatus: 0}, params: [],
                  warnings: [], callStatus: 0,
@@ -1005,7 +1008,7 @@ pub fn decodeMessage(c: mut &Cur, r: mut &Reply, fv: int): Result[Unit, Error] {
                     let f = try c.ub4("parameter flags")
                     append(mut &kv, KeyValue{key: k, value: v, flags: f})
                 }
-                for x in kv { append(mut &r.params, x) }
+                for x in kv { append(mut &r.params, x.clone()) }
             } else {
                 let n = try c.ub2("return parameters")
                 try c.skipN(n, "return parameters")
@@ -1054,10 +1057,10 @@ pub fn decodeMessage(c: mut &Cur, r: mut &Reply, fv: int): Result[Unit, Error] {
                 var found: []RefCursor = []
                 for k in r.outIndex {
                     if k < 0 || k >= len(r.binds) { return Err(proto(&("an OUT value for bind " + k.toStr()))) }
-                    let col = r.binds[k]
+                    let col = &r.binds[k]
                     let n = if r.returning { try c.ub4("RETURNING values") } else { 1 }
                     var vals: []Cell = []
-                    for j in 0..n { append(mut &vals, try outValue(c, &col, fv, mut &found, len(r.cursors))) }
+                    for j in 0..n { append(mut &vals, try outValue(c, col, fv, mut &found, len(r.cursors))) }
                     append(mut &outs, vals)
                 }
                 r.outs = outs
@@ -1067,7 +1070,7 @@ pub fn decodeMessage(c: mut &Cur, r: mut &Reply, fv: int): Result[Unit, Error] {
             if r.raw { return rawRow(c, r) }
             let row = try rowData(c, r)
             r.last = []
-            for x in row { append(mut &r.last, x) }
+            for x in row { append(mut &r.last, x.clone()) }
             r.bitvec = ""
             append(mut &r.rows, row)
         }
@@ -1297,13 +1300,13 @@ fn describeInfo(c: mut &Cur, fv: int): Result[[]Column, Error] {
 fn rowData(c: mut &Cur, r: &Reply): Result[[]Cell, Error] {
     var row: []Cell = []
     for i in 0..len(r.columns) {
-        let col = r.columns[i]
+        let col = &r.columns[i]
         if len(r.bitvec) > 0 && (int(r.bitvec[i / 8]) & (1 << (i % 8))) == 0 {
             if i >= len(r.last) { return Err(proto("a repeated column without a previous row")) }
-            append(mut &row, r.last[i])
+            append(mut &row, r.last[i].clone())
             continue
         }
-        append(mut &row, try columnValue(c, &col))
+        append(mut &row, try columnValue(c, col))
     }
     return Ok(row)
 }
@@ -1338,7 +1341,7 @@ fn plainRaw(col: &Column): bool {
 // which is then decoded again with the next packet joined on. Plain values
 // (a length byte below 254, then the bytes) are read straight from d, the
 // rest (chunked values over 252 bytes, the other types) with columnRaw.
-fn scanRaw(d: &str, at: int, r: mut &Reply): Result[int, Error] {
+fn scanRaw(d: &rc str, at: int, r: mut &Reply): Result[int, Error] {
     let nc = len(r.columns)
     let n = len(d)
     let mark = len(r.rawData)
@@ -1380,7 +1383,7 @@ fn scanRaw(d: &str, at: int, r: mut &Reply): Result[int, Error] {
                 continue
             }
         }
-        var c = Cur{s: d, pos: p, short: false}
+        var c = cursorOf(d, p)
         match columnRaw(mut &c, &r.columns[i]) {
             Ok(v) {
                 append(mut &r.rawStarts, len(r.rawData))
@@ -1457,7 +1460,7 @@ pub fn rawCell(col: &Column, v: Option[str]): Cell {
         None { return Cell.Null }
         Some(b) {
             let t = col.oraType
-            if t == T_ROWID { return Cell.Text(b) }
+            if t == T_ROWID { return Cell.Text(b.clone()) }
             if t == T_CLOB || t == T_BLOB || t == T_BFILE { return Cell.Failed(col.typeName() + " columns are not supported yet") }
             return cellOf(col, &b)
         }
@@ -1552,42 +1555,42 @@ fn cellOf(col: &Column, b: &str): Cell {
         if col.csfrm == CS_NCHAR {
             match fromUtf16be(b) {
                 Ok(s) { return Cell.Text(s) }
-                Err(e) { return Cell.Failed(e.msg) }
+                Err(e) { return Cell.Failed(e.msg.clone()) }
             }
         }
         if !strings.isValidUtf8(b) { return Cell.Failed("invalid UTF-8 in column " + col.name) }
-        return Cell.Text(b)
+        return Cell.Text(b.clone())
     }
     if t == T_NUMBER || t == T_BINARY_INTEGER {
         match decodeNumber(b) {
             Ok(n) { return Cell.Number(n) }
-            Err(e) { return Cell.Failed(e.msg) }
+            Err(e) { return Cell.Failed(e.msg.clone()) }
         }
     }
     if t == T_DATE || t == T_TIMESTAMP || t == T_TIMESTAMP_TZ || t == T_TIMESTAMP_LTZ {
         match decodeStamp(b) {
             Ok(s) { return Cell.Stamp(s) }
-            Err(e) { return Cell.Failed(e.msg) }
+            Err(e) { return Cell.Failed(e.msg.clone()) }
         }
     }
     if t == T_BINARY_DOUBLE {
         match decodeDouble(b) {
             Ok(f) { return Cell.Float(f) }
-            Err(e) { return Cell.Failed(e.msg) }
+            Err(e) { return Cell.Failed(e.msg.clone()) }
         }
     }
     if t == T_BINARY_FLOAT {
         match decodeFloat(b) {
             Ok(f) { return Cell.Float(f) }
-            Err(e) { return Cell.Failed(e.msg) }
+            Err(e) { return Cell.Failed(e.msg.clone()) }
         }
     }
-    if t == T_RAW || t == T_LONG_RAW { return Cell.Bytes(b) }
+    if t == T_RAW || t == T_LONG_RAW { return Cell.Bytes(b.clone()) }
     if t == T_BOOLEAN { return Cell.Bool(len(b) > 0 && int(b[len(b) - 1]) == 1) }
     if t == T_INTERVAL_DS || t == T_INTERVAL_YM {
         match intervalText(t, b) {
             Ok(x) { return Cell.Text(x) }
-            Err(e) { return Cell.Failed(e.msg) }
+            Err(e) { return Cell.Failed(e.msg.clone()) }
         }
     }
     if t == T_UROWID { return Cell.Failed("UROWID values are not supported yet") }
@@ -1761,7 +1764,7 @@ pub fn bindSites(sql: &str): Sites {
 
 pub fn placeholders(sql: &str): []Placeholder {
     var out: []Placeholder = []
-    for s in bindSites(sql).sites { append(mut &out, Placeholder{name: s.name, returning: s.returning}) }
+    for s in bindSites(sql).sites { append(mut &out, Placeholder{name: s.name.clone(), returning: s.returning}) }
     return out
 }
 
@@ -1783,13 +1786,13 @@ pub fn nullBind(): Bind { return Bind{oraType: T_VARCHAR, csfrm: CS_IMPLICIT, bu
 pub fn textBind(s: &str, maxString: int): Result[Bind, Error] {
     if !strings.isValidUtf8(s) { return Err(sqldialect.inputError("text with invalid UTF-8")) }
     let t = if len(s) > maxString { T_LONG } else { T_VARCHAR }
-    return Ok(Bind{oraType: t, csfrm: CS_IMPLICIT, bufferSize: max(len(s), 1), data: Some(s), returning: false})
+    return Ok(Bind{oraType: t, csfrm: CS_IMPLICIT, bufferSize: max(len(s), 1), data: Some(s.clone()), returning: false})
 }
 
 // Bytes as RAW (LONG RAW beyond maxString bytes).
 pub fn bytesBind(b: &str, maxString: int): Bind {
     let t = if len(b) > maxString { T_LONG_RAW } else { T_RAW }
-    return Bind{oraType: t, csfrm: 0, bufferSize: max(len(b), 1), data: Some(b), returning: false}
+    return Bind{oraType: t, csfrm: 0, bufferSize: max(len(b), 1), data: Some(b.clone()), returning: false}
 }
 
 pub fn numberBind(n: &Num): Result[Bind, Error] {
@@ -1844,7 +1847,7 @@ pub type Execute = record {
 
 // An Execute of sql with binds; no cursor, no fetch-only.
 pub fn newExecute(sql: &str, kind: int, binds: []Bind, prefetch: int, commit: bool): Execute {
-    return Execute{sql: sql, kind: kind, cursorId: 0, binds: binds, prefetch: prefetch, commit: commit, fetchOnly: false}
+    return Execute{sql: sql.clone(), kind: kind, cursorId: 0, binds: binds, prefetch: prefetch, commit: commit, fetchOnly: false}
 }
 
 fn longBind(b: &Bind, maxString: int): bool { return b.bufferSize > maxString || b.oraType == T_LONG || b.oraType == T_LONG_RAW }
@@ -2010,7 +2013,7 @@ fn (s: mut &Stream) read(b: mut &[byte], w: Where): Result[int, Error] {
         s.put(t)
         return match r {
             Ok(n) { Ok(n) }
-            Err(e) { Err(tlsFail(e)) }
+            Err(e) { Err(tlsFail(e.clone())) }
         }
     }
     match s {
@@ -2031,7 +2034,7 @@ fn (s: mut &Stream) write(data: &[byte], w: Where): Result[Unit, Error] {
         s.put(t)
         return match r {
             Ok(_) { Ok(Unit{}) }
-            Err(e) { Err(tlsFail(e)) }
+            Err(e) { Err(tlsFail(e.clone())) }
         }
     }
     match s {
@@ -2540,7 +2543,7 @@ pub fn (s: mut &Session) sendFetch(cursorId: int, n: int, columns: &[]Column, w:
     }
     s.pending = true
     var cols: []Column = []
-    for x in columns { append(mut &cols, x) }
+    for x in columns { append(mut &cols, x.clone()) }
     s.pendingCols = cols
     return Ok(Unit{})
 }
@@ -2572,12 +2575,12 @@ fn (s: mut &Session) exchange(msg: &[]byte, r: mut &Reply, w: Where): Result[Uni
 
 // Reads one reply into r.
 fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
-    var data = ""
+    var data: rc str = rc("")          // shared by the cursors over it
     var total = 0
     while !r.done {
         if len(data) == 0 {
             let d = try s.nextData(w)
-            data = d.data
+            data = rc(d.data.clone())
             total += len(data)
         }
         if r.raw && int(data[0]) == MT_ROW_DATA && !(r.outMode && !r.described) {
@@ -2592,20 +2595,20 @@ fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
                 }
                 p = q
             }
-            data = data[p..]
+            data = rc(data[p..])
             if short {
                 let d = try s.nextData(w)
                 total += len(d.data)
                 if total > s.maxReply {
                     return Err(sqldialect.dbError(sqldialect.E_LIMIT, &("tns: a reply larger than " + s.maxReply.toStr() + " bytes")))
                 }
-                data = if d.reset { d.data } else { data + d.data }
+                data = rc(if d.reset { d.data.clone() } else { data + d.data })
             }
             continue
         }
-        var c = cursor(&data)
+        var c = cursorOf(&data, 0)
         match decodeMessage(mut &c, r, s.fieldVersion) {
-            Ok(_) { data = data[c.pos..] }
+            Ok(_) { data = rc(data[c.pos..]) }
             Err(e) {
                 if !c.short { return Err(e) }
                 let d = try s.nextData(w)
@@ -2613,18 +2616,18 @@ fn (s: mut &Session) receive(r: mut &Reply, w: Where): Result[Unit, Error] {
                 if total > s.maxReply {
                     return Err(sqldialect.dbError(sqldialect.E_LIMIT, &("tns: a reply larger than " + s.maxReply.toStr() + " bytes")))
                 }
-                data = if d.reset { d.data } else { data + d.data }
+                data = rc(if d.reset { d.data.clone() } else { data + d.data })
             }
         }
     }
     if len(data) > 0 { return Err(proto(&(len(data).toStr() + " bytes after the end of a reply"))) }
     s.inTransaction = (r.callStatus & 0x2) != 0
-    for x in r.warnings { append(mut &s.warnings, x) }
+    for x in r.warnings { append(mut &s.warnings, x.clone()) }
     return Ok(Unit{})
 }
 
 // The error a reply ends with as an Error: ORA-nnnnn with the server's text.
-pub fn serverError(e: &ErrorInfo): Error { return Error{code: e.num, state: "", msg: e.msg} }
+pub fn serverError(e: &ErrorInfo): Error { return Error{code: e.num, state: "", msg: e.msg.clone()} }
 
 fn hexUpper(s: &str): str { return strings.toUpperAscii(&(crypto.hex(s))) }
 
@@ -2636,7 +2639,7 @@ fn unhexOr(h: &str, what: &str): Result[str, Error] {
 }
 
 fn param(kv: &[]KeyValue, key: &str): str {
-    for p in kv { if p.key == key { return p.value } }
+    for p in kv { if p.key == key { return p.value.clone() } }
     return ""
 }
 
@@ -2764,13 +2767,13 @@ fn versionText(v: int, fv: int): str {
 fn tlsOver(sock: net.Conn, cfg: &Config, w: Where): Result[Stream, Error] {
     var o = tls.defaults()
     o.insecureSkipVerify = cfg.trustServerCertificate
-    o.caFile = cfg.caFile
+    o.caFile = cfg.caFile.clone()
     let ctx = match tls.client(o) {
         Ok(x) { x }
         Err(e) { return Err(tlsFail(e)) }
     }
-    let name = if cfg.serverCertName != "" { cfg.serverCertName } else { cfg.host }
-    return match ctx.connect(sock, &name, w) {
+    let name: &str = if cfg.serverCertName != "" { &cfg.serverCertName } else { &cfg.host }
+    return match ctx.connect(sock, name, w) {
         Ok(t) { Ok(Stream.Tls(t)) }
         Err(e) { Err(tlsFail(e)) }
     }
@@ -2864,7 +2867,7 @@ fn (s: mut &Session) useProtocol(info: &ProtocolInfo): Result[Unit, Error] {
     s.maxString = if len(info.runtimeCaps) > 6 && (int(info.runtimeCaps[6]) & 0x04) != 0 { 32767 } else { 4000 }
     s.charset = info.charset
     s.ncharset = info.ncharset
-    s.banner = info.banner
+    s.banner = info.banner.clone()
     if s.charset != CHARSET_UTF8 {
         return Err(sqldialect.dbError(sqldialect.E_PROTOCOL, &("tns: the database character set is " + s.charset.toStr() +
                                       "; only AL32UTF8 (873) is supported")))
@@ -2988,7 +2991,7 @@ pub fn (s: mut &Session) executeAs(e: &Execute, columns: &[]Column, raw: bool, w
     var r = s.reply(K_EXECUTE, columns, &[])
     r.raw = raw
     for i in 0..len(e.binds) {
-        let b = e.binds[i]
+        let b = &e.binds[i]
         append(mut &r.binds, Column{name: ":" + (i + 1).toStr(), oraType: b.oraType, csfrm: b.csfrm, precision: 0, scale: -127,
                                     bufferSize: b.bufferSize, maxSize: b.bufferSize, nullable: true})
         if b.returning {
@@ -3274,16 +3277,16 @@ fn oFloat(b: &str, col: &sqlrows.Column): Result[float, Error] {
 
 fn oText(b: &str, col: &sqlrows.Column): Result[str, Error] {
     let t = col.wire
-    if t == T_ROWID { return Ok(b) }
+    if t == T_ROWID { return Ok(b.clone()) }
     if t != T_VARCHAR && t != T_CHAR && t != T_LONG { return Err(sqlrows.wrongKind(col, "text")) }
     if col.aux == CS_NCHAR { return fromUtf16be(b) }
     if !strings.isValidUtf8(b) { return Err(typeErr("invalid UTF-8")) }
-    return Ok(b)
+    return Ok(b.clone())
 }
 
 fn oBytes(b: &str, col: &sqlrows.Column): Result[str, Error] {
     if col.wire != T_RAW && col.wire != T_LONG_RAW { return Err(sqlrows.wrongKind(col, "bytes")) }
-    return Ok(b)
+    return Ok(b.clone())
 }
 
 fn oBool(b: &str, col: &sqlrows.Column): Result[bool, Error] {

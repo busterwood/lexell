@@ -73,7 +73,7 @@ fn (Fake) open(cfg: &Cfg, w: Where): Result[Fake, Error] {
         }
     })
     if fail { return Err(Error{code: 7, msg: "open refused"}) }
-    return Ok(Fake{id: id, refuse: false, badReuse: false, ctl: cfg.ctl})
+    return Ok(Fake{id: id, refuse: false, badReuse: false, ctl: cfg.ctl.share()})
 }
 
 fn (Fake) waitFailed(why: task.Cancelled): Error {
@@ -141,16 +141,16 @@ fn tryAcquire(t: Try): str {
 
 fn main() {
     let ctl = task.shared(Ctl{nextId: 1, failOpens: 0, openMs: 0, live: 0, gone: []})
-    run(ctl)
+    run(ctl.share())
     ctl.with(fn(s: mut &Ctl) { println("live connections " + s.live.toStr()) })
 }
 
 fn run(ctl: task.Shared[Ctl]) {
-    let p = newPool(ctl, 2)
+    let p = newPool(ctl.share(), 2)
     let peak = task.shared(0)
     task.scope(fn(s: mut &task.Scope) {
         var fs: []task.Future[int] = []
-        for k in 0..8 { append(mut &fs, s.start(work, Work{pool: p, k: k, peak: peak})) }
+        for k in 0..8 { append(mut &fs, s.start(work, Work{pool: p.clone(), k: k, peak: peak.share()})) }
         var line = "results"
         for r in task.all(fs).unwrap() { line = line + " " + r.toStr() }
         println(line)
@@ -160,9 +160,9 @@ fn run(ctl: task.Shared[Ctl]) {
     peak.with(fn(n: mut &int) { println("most open at once: " + n.toStr() + ", opened " + opened.toStr()) })
     println("after: " + stats(&p))
 
-    let one = newPool(ctl, 1)
+    let one = newPool(ctl.share(), 1)
     task.scope(fn(s: mut &task.Scope) {
-        let h = s.start(hold, Hold{pool: one, ms: 200})
+        let h = s.start(hold, Hold{pool: one.clone(), ms: 200})
         task.sleep(20).unwrap()
         match task.within(50, fn(): Result[Lease, Error] { return one.acquire() }) {
             Ok(_) { println("waiter timeout: got one?") }
@@ -194,7 +194,7 @@ fn run(ctl: task.Shared[Ctl]) {
         println("reuse failed: closed " + wasClosed(&ctl, second).toStr() + ", a new one " + (l.conn().id != second).toStr())
     }
 
-    let fresh = newPool(ctl, 1)
+    let fresh = newPool(ctl.share(), 1)
     setCtl(&ctl, 1, 0)
     match fresh.acquire() {
         Ok(_) { println("failed open: got one?") }
@@ -207,11 +207,11 @@ fn run(ctl: task.Shared[Ctl]) {
 
     // The opener parks in a failing open; a second task queues for the only
     // place meanwhile and gets it when the open fails.
-    let race = newPool(ctl, 1)
+    let race = newPool(ctl.share(), 1)
     setCtl(&ctl, 1, 30)
     task.scope(fn(s: mut &task.Scope) {
-        let a = s.start(tryAcquire, Try{pool: race, delay: 0})
-        let b = s.start(tryAcquire, Try{pool: race, delay: 5})
+        let a = s.start(tryAcquire, Try{pool: race.clone(), delay: 0})
+        let b = s.start(tryAcquire, Try{pool: race.clone(), delay: 5})
         println("opener: " + a.wait().unwrap())
         println("waiter: " + b.wait().unwrap() + ", open " + race.stats().open.toStr() + ", waiting " + race.stats().waiting.toStr())
     })
