@@ -4507,6 +4507,247 @@ planted import.
 - The q1 placement effect of E0 (6.2.4) is still there; read q1 against
   main's stored run with that in mind.
 
+#### 6.2.6 P1 as built: slice P1a (scan, filter, project)
+
+Built 2026-11-17 on `redesign/bind` from main 9aa2c0b2. Scripts and
+outputs are in `~/tpch-w/bind/p1`. P1 was split in three (P1a scan,
+filter and project; P1b aggregates over one table; P1c sort and limit
+over them, and the deletions). This section is P1a; P1b and P1c are not
+built.
+
+**Commits:**
+
+- 44b8cc2d, the batch kernels move to `lexdb_pipe`, unchanged but for
+  their columns: `BNode`, `BComp`, `BGen`, `BSpec`, `LikePat`, their
+  compile (`bCompile`, `bCompileD`, `bAndOr`, the constant and kind
+  helpers), their evaluation (`bEval`, `bGenVals`, `bTrue`, `bNarrow`,
+  `bAddVals`), the two-step decode's plan (`lazyOf`, `placesOnly`), the
+  column leaves' ranges (`cRanges`), the aggregates' accumulation
+  (`bAccum`, `bAccVal`, `bAccDec`), `bRow`, `bFirstVals`, `bKeyVal`,
+  `bColsOf`, `bValAt`, `sortCmp`, `valExtra`. `bCompile` reads the
+  query's `ColDef`s, not its `Query` (the only thing it read of it).
+  `immutableName`, `isSeqFn` and `isAdvFn` go to `lexdb_bind` (binding
+  policy; `bxFixed` needs the first). Exec names the rest as
+  `lexdb_pipe.*`, with private aliases for the five types.
+- 37d6788b, the pipeline's first operators (below), `outNode`,
+  `bOutVal`, `ONode` and `condNode` (exec's `bCondOf`) into the pipe,
+  `OutBatch` into `lexdb_rows` (the wire writes it and may not import
+  the pipe; exec keeps a private alias), and the test `exec_pipe`.
+
+**The plan.**
+
+- `lexdb_plan.PPlan` gains `Scan(PScan, []PSub)` and `Filter(PPlan,
+  []BX)`; `Project` holds its outputs as `[]BX` ([] in a view); `Limit`
+  holds its count and offset (`Limit(PPlan, stops, count, offset)`).
+  `PScan` holds the level, the first slot, the query's columns' kinds,
+  the table's columns decoded, `part`, and whether its ranges are read
+  in batches (`batch`: false where bLevelPlan declined, below).
+- `pipeSel` (exec), after `bindSel` in `select()`, in EXPLAIN and in
+  EXPLAIN ANALYZE, builds `Limit? (Sort? (Project (Filter? (Scan))))`,
+  the Sort only the scan's order. The outputs `bindSel` bound (`Sel.ox`)
+  and the table's bound conditions (`Query.cc[0]`) are **moved** into
+  the Project and Filter arms; a column output is `BX.Col(slot)`.
+  `lexdb_pipe.compile(PPlan, cols): Result[Prog, PPlan]` checks it; on
+  `Ok` the `Prog` (which owns the plan) is kept in `Sel.pipe`, so the
+  plan cache keeps it; on `Err` the plan comes back and `unplan` returns
+  its outputs and conditions to the Sel.
+- The table and its path stay in `Query.levels[0]` (EXPLAIN's lines and
+  the row engine read them); `Sel.limit` stays (the row engine and
+  locking read it), so the Limit arm's count is a copy of an int. The
+  Level's fields move when `Levels` splits into scan and join arms (P2).
+- EXPLAIN prints the kept plan (`selLines`: `Sel.pipe`'s, else
+  `physOf`'s view). `Scan` prints as `Levels` did, `Filter` prints
+  nothing: the 22 TPC-H EXPLAINs are byte-identical to main's.
+
+**What compile accepts** (`opsOf`, and `pipeShape` in exec, which says
+what the Sel must give):
+
+- a SELECT that streams (`streams`: no sort, grouping, DISTINCT, window,
+  set, OFFSET, lock, set-returning call, correlated output), with no
+  MATCH_RECOGNIZE, `SELECT @v = ...` feedback, TOP PERCENT or WITH TIES,
+  MIN/MAX by the scan;
+- one table level read per row: not a subquery's or CTE's rows, not
+  LATERAL, no post-join WHERE, not a semi or anti level;
+- **no subqueries at all** (`scanRuns`: RUN_ONCE values in `Ctx` are not
+  built, below);
+- every output a column or bound for the plan, every condition bound,
+  each reading only the table's decoded columns (`reads`);
+- a Limit with a count and no offset, over the rest.
+
+Everything else is rejected and runs as before: joins, aggregates,
+sorts, DISTINCT, windows, sets, subqueries, DML's queries (they are not
+bound: `bindSel` runs only in `select()` and EXPLAIN), a subquery's own
+Sel.
+
+**What run does** (`lexdb_pipe.run`, `runScan`):
+
+- Exec gives it the table, a `Src` per run (`pipeSrc`: `pathScans` with
+  the run's parameters, `afterScans`, and optimizer 19's switch,
+  `firstSwitch`, as bLevelPlan and runLevel decide it), the context
+  (`cenvOf` and the parameters), `mut &rs.bud`, a cap, and one sink:
+  `give(txn, &OutBatch, &[]Val)`, a chunk as an OutBatch or one row
+  (two sinks would capture the same state mutably twice, which Lexell
+  rejects).
+- **In batches** when the plan's scan reads batches and a scan is a
+  range: `fillPickIn` with the conditions compiled per run (`condNode`:
+  a kernel, else `Gen`) narrowing the selection, two-step decode and
+  column-leaf ranges as before; the outputs over the chunk (`outNode`,
+  `bOutVal`); the chunk to the sink as an OutBatch, cut at the limit.
+  This is `eachOut`'s single-table branch, counted the same.
+- **Row by row** (a chunk of one) otherwise: a primary key's point, a
+  primary key read backward, IN lists, a non-covering index where the
+  reading may stop, a switched range's keys (`getRow`), scans of points
+  only. Each row through `bxEval`: conditions in order, then outputs, as
+  `tryRow` and `outRow` run them. Point selects take this path.
+- **A chunk the kernels cannot evaluate** (a value its batch cannot
+  hold, a condition's or an output's error on one of its rows) is read
+  again from its start row by row, with the rest of its scan, as the
+  batch drivers gave way. So an error is the row engine's (its first
+  failing row, its conditions before its outputs), and the rows before it
+  reach the sink first. This is a mode of the pipe's own scan, not a
+  hand-over to the row engine; a per-chunk return to batches is left
+  for later (it would change the tests' OutBatch counts and EXPLAIN
+  ANALYZE's batches in that case).
+- Held rows (`execSel` → `pipeHeld`) and streamed rows (`eachRowB`, for
+  the wire's OutBatches and for `eachRow`'s rows) both run the
+  pipeline when `lexdb_batch` is on; `pipeHeld` counts
+  `max_statement_mem` per row as execSel's row path does. With
+  `lexdb_batch` off the row engine runs the Sel, binding its outputs and
+  conditions per run (they are in the plan now).
+- Counts: `run` keeps one `Counts` per operator; the scan's (starts,
+  read, kept as `joined`, batches) go to the run's table counts, so
+  EXPLAIN ANALYZE prints what it printed (`exec_pipe` compares 24 shapes
+  with the pipeline on and off, batches included). The Project's rows
+  given are counted, not printed.
+- `runCounts` (runs, runs that read batches) and exec's `setPipe` (a
+  test's switch: off, `pipeSel` makes nothing and the batch drivers run)
+  are for the tests.
+
+**Behaviour change, one:** under LIMIT 0 the held rows' path read a
+first row and gave its error (`select x / 0 from t limit 0` failed when
+held, and gave no rows when streamed). The pipeline reads nothing, as
+the streamed path did and PostgreSQL's Limit does. Unavoidable: the two
+old paths disagreed, and the pipeline serves both.
+
+**Line counts:**
+
+| | main 9aa2c0b2 | 44b8cc2d | 37d6788b |
+|---|---:|---:|---:|
+| `lexdb_exec` | 27,782 | 26,498 | 26,691 |
+| `lexdb_pipe` | 291 | 1,598 | 2,049 |
+| `lexdb_plan` | 229 | 229 | 259 |
+| `lexdb_bind` | 2,025 | 2,043 | 2,043 |
+| `lexdb_rows` | 1,647 | 1,647 | 1,666 |
+
+1,091 lines left exec. The secret that left is the batch kernels'
+(how an expression and an aggregate run over a batch's columns: 6.2.1's
+`batch.core` and `bAccum`, 1,284 lines), and the output nodes. Exec
+gained the glue (`pipeSel`, `pipeShape`, `unplan`, `runPipe`,
+`pipeSrc`, `pipeHeld`, `obRow`, ~230 lines). **Nothing was deleted**:
+the old drivers still run what compile rejects, and compile does not yet
+accept everything the single-table drivers accepted (see the hand-over).
+Import edges 205 to 214, all within `imports.py`'s rules.
+
+**Gates:**
+
+- Suite from a snapshot of each commit (`e7/suite-p1a1`, `p1a2`): 189,
+  then 190 passed (with `exec_pipe`), imports ok.
+- `exec_pipe`: 500 random queries committed and 120 in a transaction
+  with its own writes, 30 fixed shapes, each four ways (rows; batch
+  drivers; pipeline held; pipeline sunk), rows and errors the same, the
+  sinks' rows before an error the same; every path; errors on one row of
+  a batch before and past a LIMIT; short-circuits under AND, OR and
+  CASE; NULLs; casts that fail; an integer's overflow; 12 runs of a
+  prepared statement with parameters from one plan cache against the row
+  engine; `max_statement_mem` (the same 53200 four ways, and the same
+  rows under it); EXPLAIN ANALYZE and EXPLAIN of 24 shapes the same with
+  the pipeline on and off.
+- Naming battery (`p1/nam-*.out`, 1,505 lines): identical to main's.
+- EXPLAIN of the 22 TPC-H queries (`p1/exp-*.txt`, 188 lines):
+  byte-identical to main's build.
+- TPC-H, SF1, one run of 37d6788b's build (`p1/out-a`): the 22 checksums
+  are the baseline's (1744ef99). Against `out-main-9aa2c0b2`: total
+  22,937 to 23,176 ms (+1.04%); q1 2,282 to 2,360 (+3.4%), q6 606 to
+  611 (+0.8%); q8 +2.2%, q13 +2.3%, every other query within 2%. No
+  TPC-H query runs in the pipeline (all aggregate or sort).
+  - q1 was repeated on copies (`p1/rep.sh`, 3 runs a pass, alternating,
+    two passes, medians): q1 2,428 and 2,421 ms for the branch against
+    2,343 and 2,338 for main (+3.6%), reproduced; q6 609 and 604 against
+    606 and 604, level.
+  - The first commit alone (44b8cc2d, the move, no new path; `p1/repk.sh`)
+    gives the same: q1 2,422 and 2,405 against 2,369 and 2,342 (+2.5%).
+  - Profiles of q1 (`p1/pq1-m.txt`, `pq1-k.txt`, resolved with the
+    native maps by `p1/res.py`): main's and the move's builds have the
+    same functions in the same order (the same numbers, `f2439` for
+    `bEval` in both), the same shares to 0.3 points but `dup` (7.6% and
+    5.6%), and the move's profile has 1.9% fewer samples. So the move
+    does not add work on q1's path: the harness's 2-4% is the effect 6.2.4
+    saw on E0, a placement or data-layout effect not explained. Not
+    resolved.
+- Point selects, main's build against 37d6788b's, one pass:
+  `simple.sh` point select 48,115 and 48,521 tps (+0.8%), update 9,491
+  and 9,491, 3-table join 20,406 and 20,428; `pts.sh` (20,000 planned
+  `select * from w where id = k`, now the pipeline's row-by-row scan)
+  wall 716 and 722 ms, server CPU 668 and 674 ms (+0.8%).
+  - Repeated on the copies (two rounds, 10 runs each): wall 713 and 723
+    ms, CPU 666 and 674 ms (+1.2%). So point selects are about 1% slower
+    in the pipeline's row-by-row scan, consistently, and within the
+    1.5% the TPC-H gate allows. A profile of each (`p1/ppts-*.txt`,
+    5,800 samples) is too coarse to place 1%: `dup` 2.2% to 3.1%, the
+    scan's `oneRow` 0.9%, the rest the same. Candidates: the plan-time
+    work per statement (`pipeSel`'s arrays and the plan, made for every
+    simple-protocol statement) and the run's (`pipeSrc`'s NULL row,
+    the counts array, the scan's row) against what it skips (`prepare`'s
+    `Mats`, `outC`). The OLTP gate (section 7) should see this profiled
+    at a finer grain before P1b adds to the path.
+
+**Hand-over (P1a's rest, then P1b and P1c):**
+
+- **RUN_ONCE subqueries as values** are the first gap. The binder does
+  not bind `#sub`, `#in` or `#exists`, so a condition or output that
+  reads one has no `BX`, and `scanRuns` rejects any subquery. The plan:
+  `Ctx` gains the values (a scalar's `Val`, an EXISTS's bool, an IN's
+  set keyed as `inValKeys` keys it), a `BX` arm reads them, and exec
+  runs the RUN_ONCE subqueries (prepare's `runSub`) before `run`. Until
+  then the single-table drivers still run plans with an uncorrelated
+  subquery (in a path bound, or in a condition the plan does not bind).
+- **Deletions.** Once compile accepts those: `outPlan`'s and `eachOut`'s
+  single-table branches (`op.joined` false), `batchLevel`'s
+  single-level `direct` branch become dead with the pipeline on;
+  `setPipe` goes with them. The joined branches go in P2. `pipeSrc` repeats bLevelPlan's
+  scan setup (`pathScans`, the switch, the index read): it should move
+  to `lexdb_access` with `pathScans` (6.2.1's access group), so the
+  pipe makes its own scans and exec stops building `Src`.
+- **P1b** (aggregates over one table, q1 and q6): `batchGroupsIn`'s
+  one-table branch becomes an `Agg` arm (keys, calls, FILTERs as `BX`,
+  moved from `Sel.groupBy` and `Sel.specs`, bound in `bindSel`) and a
+  hash-aggregate operator over the scan's chunks, units first. Notes
+  from reading it:
+  - its conditions and keys compile without `Gen` (`bCompileCond`,
+    `bCompileX`), so it declines `upper(x) = ...` or a text key of a
+    function; the pipe should take `condNode`'s generic step for
+    conditions, and needs a generic key and argument step (values
+    through `bxEval`, grouped by `encIdxPart`, accumulated as the row
+    path's `accumulate`) to accept everything the row path groups;
+  - which conditions compile as units depends on parameter values
+    (`bCompileD` folds constants), so compile at plan time cannot know;
+    the units retry (`batchGroups`: units, then values, then the row
+    path) becomes the operator's: on a spill, run its chunks again with
+    values, from the start (the groups are made at the end);
+  - a condition's error in a batch is raised from the batch (it does not
+    give way), so the reported row is the lowest of the first failing
+    step, as 4.4.1 says, not the row engine's;
+  - HAVING (`fuse`), the outputs and ORDER BY over the groups stay exec's
+    (`Groups`) until P1c brings Project and Sort over the Agg arm.
+- **P1c**: Sort, TopN and Limit over chunks (6.2.3's P3 moves
+  `sortBatches`); Limit with OFFSET; then the deletions above.
+- Traps: `pSubs`, `pLeaf` and `opLines` need a case for each new arm
+  (Scan, Filter were added). `Limit` has four fields now. A Sel's `ox`
+  and `q.cc[0]` are empty when `Sel.pipe` is set: code that reads them
+  must take the arms' (`runPipe`), or bind per run as the row engine
+  does. Two closures capturing the same state mutably are rejected:
+  give the pipe one sink.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
