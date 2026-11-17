@@ -144,3 +144,42 @@ Edits per file are concentrated: `check.lxl` has 197 and `sema.lxl` 104, then
   `copy`.
 - **The log is the worklist.** It lists every site per file, so the migration
   can go file by file.
+
+## 5. Follow-ups found during the migration
+
+These were found while migrating the library. None of them is a regression
+yet: while `str` is counted, a `clone` is a count change, exactly as the
+implicit copy was. They need doing before or at the switch to owned `str`.
+
+- **Shared buffers become `rc str`.** For example, the TDS cursor `Cur` takes
+  a `clone` of the whole reply buffer for every token it reads
+  (`tds.cursor`, `sub`, `other`). Once strings are owned, each of those would
+  copy the buffer, which can be quadratic on large replies. These are the
+  read-only, shared values `rc T` is for: the field becomes `rc str`, and
+  `clone()` becomes `share()`.
+- **Argument arrays of views.** `redis.command` takes `&[str]`, so callers
+  clone every key into a temporary array (`c.command(&["GET", key.clone()],
+  w)`, about 40 sites). Taking `&[&str]` would remove those clones. The
+  change is source-compatible for array arguments, but not for array
+  literals with an owned temporary element (`seconds.toStr()`): such an
+  element cannot be used as a view today. The language change is to let a
+  temporary inside an array literal that is an argument live to the end of
+  the statement, as a temporary argument does.
+- **Borrows should freeze only the field they borrow.** `let s = &d.s`
+  freezes all of `d`, so a later write to another field (`d.pos += 1`) or a
+  `mut &` call on another field is rejected. With copied strings,
+  `let s = d.s` sidestepped this; with owned strings, borrowing a field is the
+  normal pattern. Batches 2 and 5 worked around it, by reading through the
+  field each time (json, regex_syntax) or with a clone (http). Rule 3 already
+  compares paths for borrows taken at a call; a `let` borrow should freeze
+  just its path in the same way.
+- **Moving a field out of a temporary** (`c.poll(false).ev`) is cloned today.
+  Moving out of a temporary is safe, because the rest of it is dropped, so it
+  could be allowed.
+- **`array(n, v)`** should clone `v` for each element when `v` is
+  `Clone`-able. It needs no source edits, so the `fill` kind does not count
+  as an edit.
+- **Empty strings need no buffer.** An empty owned `str` is a header with
+  capacity 0, so creating and dropping it costs nothing. The same capacity-0
+  check could make every literal a free view of static bytes (copied before
+  any write) if literal allocations prove costly. Measure that at the switch.
