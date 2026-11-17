@@ -183,3 +183,61 @@ implicit copy was. They need doing before or at the switch to owned `str`.
   capacity 0, so creating and dropping it costs nothing. The same capacity-0
   check could make every literal a free view of static bytes (copied before
   any write) if literal allocations prove costly. Measure that at the switch.
+
+## 6. Language issues the migration exposed
+
+The user asked (2026-11-17) for deeper language issues found during this
+work to be collected and presented at the end, since this redesign is the
+time to change the language. Each entry says what was seen, where, and
+whether it was confirmed with a test.
+
+1. **A borrow of a field freezes the whole variable.** Confirmed:
+   `let s = &d.s` followed by `d.pos += 1` is rejected ("'d' is borrowed by
+   's' and cannot be assigned"), although the fields are disjoint. Liveness
+   is already precise: the write is accepted once `s` is dead. Owned strings
+   make borrowing a field the normal way to read one, so this will come up
+   everywhere. Freezes should record the borrowed path, as rule 3 already
+   does for borrows taken at a call. Seen in json, regex_syntax and http
+   (batches 2 and 5).
+2. **Temporaries inside an array-literal argument cannot be views.**
+   `f(&["GET", key, n.toStr()])` with `f(args: &[&str])` is rejected for the
+   temporary `n.toStr()`. A temporary argument already lives to the end of
+   its statement; an element of a literal argument could do the same. Without
+   this, APIs that take a list of strings force a clone of every element
+   (redis, about 40 sites).
+3. **No moving out of a temporary.** `c.poll(false).ev` must be cloned,
+   because a field cannot be moved out, even of a temporary that is about to
+   be dropped.
+4. **Records and arrays have no `clone`.** Today only types that are copied
+   while `str` is counted get the built-in `clone`. Once `str` is owned, a
+   record holding a `str`, and any `[]T`, needs one. The options are clone
+   code generated for every type whose parts are `Clone` (like drop code),
+   or an explicit opt-in on the declaration (like `derive`). This has to be
+   decided before the switch.
+5. **By-value receivers consume silently.** Many library methods take their
+   receiver by value (`fn (e: Error) toStr()`). For a copy type that cost
+   nothing; for an owned type, `e.toStr()` moves `e`. Batches 1, 4 and 5
+   changed these to `&Self`. The rule that "a by-value receiver on a copy
+   type satisfies `&Self`" is itself a special case that owned types expose.
+   One option: a by-value receiver on an owned type must be written as
+   consuming, so that it is visible.
+6. **Iterating an owned array gives borrows, unlike a copy array.**
+   `for m in xs { var name = m }` worked with counted `str` and fails with
+   owned `str`, because `m` becomes a borrow. The language has no consuming
+   loop (`for m in move(xs)`) to take the elements by value. Seen in pgwire
+   and the SQL Server tests.
+7. **Compound assignment with a mutable borrow of the target.**
+   `s += ch(mut &s)` (red-team test rt2_g09) relied on `s` being copied
+   before the call. With an owned `s` it is a conflict. The spec for `+=`
+   on owned types needs deciding: evaluate the right side first, or reject.
+8. **String globals.** SPEC 5.2 allows no global `var` of an owned type
+   (only `once`), because borrowing one soundly would need effect rules. With
+   counted `str`, string globals were copy globals and were allowed. 28
+   exist: caches (`httpserver.DATE_TEXT`, refreshed each second), a log
+   (`os.ENV_LOG`), and test fixtures (`ADDR`, `RESULT`). Making `str` owned
+   forbids them all. Option: allow owned global `var`s with value-only access
+   and no borrows. Reading takes `g.clone()`, writing replaces and drops the
+   old value, and `&g` stays an error. No reference into a global ever
+   exists, so the soundness argument that ruled them out does not apply.
+   Threads still need the separate answer from concurrency.md, as they do
+   for copy globals today.
