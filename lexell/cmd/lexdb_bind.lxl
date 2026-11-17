@@ -136,7 +136,21 @@ pub type LPlan = closed {
                                                                  // [] (its input's columns)
     SetOp(int, bool, LPlan, LPlan, []BCol)          // lexdb_sql.SET_*, ALL, left, right; the common types
     Recursive(int, LPlan, LPlan, []BCol)            // a recursive CTE: its number, the anchor, the recursive term
-    Match(LPlan, []BCol)                            // MATCH_RECOGNIZE over its input (the plan's MrPlan has the rest)
+    Match(LPlan, MatchDef, []BCol)                  // MATCH_RECOGNIZE over its input: its keys, DEFINE and MEASURES (the pattern,
+                                                    // AFTER MATCH SKIP and the navigations' details are the planner's MrPlan's);
+                                                    // its outputs at 0..
+}
+
+// MATCH_RECOGNIZE as the binder gives it (lexdb_exec's planMatch), over its
+// input's columns (the Match's input's outputs).
+pub type MatchDef = record {
+    pub part: []int                 // PARTITION BY: the input's columns
+    pub order: []Expr               // ORDER BY's keys, resolved
+    pub desc: []bool
+    pub nullsFirst: []bool
+    pub defs: []Option[Expr]        // per pattern variable, its DEFINE resolved (None: always true); a navigation
+                                    // (PREV, FIRST, CLASSIFIER, ...) is a #mrnav(k, arg) mark, k the MrPlan's
+    pub meas: []Expr                // MEASURES, resolved (navigations marked as in defs)
 }
 
 pub fn noPlan(): LPlan { return LPlan.One([]) }
@@ -162,7 +176,7 @@ pub fn lpColumns(p: &LPlan): &[]BCol {
         LPlan.Limit(i, _, _, _, _, c) { if len(c) > 0 { return &c } return lpColumns(&i) }
         LPlan.SetOp(_, _, _, _, c) { return &c }
         LPlan.Recursive(_, _, _, c) { return &c }
-        LPlan.Match(_, c) { return &c }
+        LPlan.Match(_, _, c) { return &c }
     }
 }
 
@@ -180,7 +194,7 @@ pub fn lpCols(p: &LPlan): []BCol { return copyBCols(lpColumns(p)) }
 // is no Project.
 pub fn lpLentExprs(p: &LPlan): int {
     match p {
-        LPlan.Match(i, _) { return lpLentExprs(&i) }
+        LPlan.Match(i, _, _) { return lpLentExprs(&i) }
         LPlan.Limit(i, _, _, _, _, _) { return lpLentExprs(&i) }
         LPlan.Sort(i, _, _, _, _) { return lpLentExprs(&i) }
         LPlan.Distinct(i, _, _) { return lpLentExprs(&i) }
@@ -192,7 +206,7 @@ pub fn lpLentExprs(p: &LPlan): int {
 // Whether the Sort lends its keys.
 pub fn lpLentOrder(p: &LPlan): bool {
     match p {
-        LPlan.Match(i, _) { return lpLentOrder(&i) }
+        LPlan.Match(i, _, _) { return lpLentOrder(&i) }
         LPlan.Limit(i, _, _, _, _, _) { return lpLentOrder(&i) }
         LPlan.Sort(_, k, d, _, _) { return len(k) == 0 && len(d) > 0 }
         else { return false }
@@ -204,7 +218,7 @@ pub fn lpLentOrder(p: &LPlan): bool {
 // a set operation's), the Sort's order.
 pub fn lpRestore(p: LPlan, xs: []Expr, order: []Expr): LPlan {
     match move(p) {
-        LPlan.Match(i, c) { return LPlan.Match(lpRestore(i, xs, order), c) }
+        LPlan.Match(i, d, c) { return LPlan.Match(lpRestore(i, xs, order), d, c) }
         LPlan.Limit(i, n, o, t, m, c) { return LPlan.Limit(lpRestore(i, xs, order), n, o, t, m, c) }
         LPlan.Sort(i, k, d, nf, c) {
             let lent = len(k) == 0 && len(d) > 0

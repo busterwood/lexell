@@ -6566,8 +6566,6 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var sel = try planSelect(st, txn, s, params, sc)
     if len(s.mr) > 0 {
         try planMatch(st, txn, &s.mr[0], mut &sel, params, sc)
-        let mcols = outBCols(&sel.mr[0].outs)
-        sel.lp = lexdb_bind.LPlan.Match(replace(mut &sel.lp, lexdb_bind.noPlan()), mcols)
     }
     // EXISTS stops at its first row, a scalar at its second (runSub): its
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
@@ -27446,7 +27444,9 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
     let unknown = fn(c: &str): DbErr {
         return mrErr(d, 904, &("\"" + strings.toUpperAscii(&(c.toStr())) + "\": invalid identifier"), "42703", 207, &("column \"" + c + "\" does not exist"))
     }
-    // keys: PARTITION BY, then ORDER BY
+    // keys: PARTITION BY, then ORDER BY (the plan's, lpOrder: as resolved;
+    // the planner's, keyX: collation keys)
+    var lpOrder: []Expr = []
     var keyX: []Expr = []
     var keyAt: []int = []
     var desc: []bool = []
@@ -27466,7 +27466,8 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         let r = try lexdb_bind.resolve(&o.expr, &rw.inCols, nIn, mut &sc.names)
         let k = lexdb_bind.exprKind(&r, &rw.inCols, &sc.names)
         append(mut &keyAt, if k == lexdb_sql.COLL_EXACT { colAtOf(&r, &rw.inCols) } else { -1 })
-        append(mut &keyX, lexdb_bind.collKeyOf(k, r))
+        append(mut &keyX, lexdb_bind.collKeyOf(k, clone(&r)))
+        append(mut &lpOrder, r)
         append(mut &desc, o.desc)
         append(mut &nullsFirst, o.nullsFirst)
         match o.expr {
@@ -27487,7 +27488,9 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         return Err(mrErr(d, 62518, "MATCH_RECOGNIZE pattern is too large.", "54001", 0, "MATCH_RECOGNIZE pattern is too large"))
     }
     let prog = cr.unwrap()
-    // DEFINE
+    // DEFINE (the plan's, lpDefs: as resolved, navigations marked; the
+    // planner's, defs: the marks as slots)
+    var lpDefs: []Option[Expr] = []
     var defs: []Option[Expr] = []
     var defNavs: [][]int = []
     var local = true
@@ -27496,6 +27499,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         for i in 0..len(m.defines) { if m.defines[i].v == v { found = i } }
         if found < 0 {
             append(mut &defs, None)
+            append(mut &lpDefs, None)
             append(mut &defNavs, [])
             continue
         }
@@ -27509,10 +27513,12 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         for k in n0..len(rw.navs) { append(mut &ids, k) }
         if !mrLocal(&rw.navs, &ids, v) { local = false }
         append(mut &defs, Some(e3))
+        append(mut &lpDefs, Some(e2))
         append(mut &defNavs, ids)
     }
     rw.inDefine = false
-    // MEASURES
+    // MEASURES (lpMeas and meas as DEFINE's)
+    var lpMeas: []Expr = []
     var meas: []Expr = []
     var measNavs: [][]int = []
     var measOuts: []OutCol = []
@@ -27545,6 +27551,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         if isCls { oid = lexdb_sql.OID_TEXT }
         if isMno { oid = lexdb_sql.OID_INT8 }
         append(mut &meas, e3)
+        append(mut &lpMeas, e2)
         append(mut &measNavs, ids)
         append(mut &measOuts, OutCol{name: it.alias, oid: oid, spell: it.spell, coll: if isCls || isMno { "" } else { cname }, scale: sc2})
     }
@@ -27593,6 +27600,10 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
             for s in m.subsets { if s.name == m.skipTo { for v in s.vars { skipSet[v] = true } } }
         }
     }
+    // the logical plan: Match over the Sel's, with the clauses as resolved
+    let mdef = lexdb_bind.MatchDef{part: copyInts(&partCols), order: lpOrder, desc: copyBools(&desc), nullsFirst: copyBools(&nullsFirst),
+                                   defs: lpDefs, meas: lpMeas}
+    sel.lp = lexdb_bind.LPlan.Match(replace(mut &sel.lp, lexdb_bind.noPlan()), mdef, outBCols(&outs))
     let pl = MrPlan{inCols: replace(mut &rw.inCols, []), keyX: keyX, keyAt: keyAt, np: len(m.part), desc: desc, nullsFirst: nullsFirst,
                     prog: prog, shown: copyStrs(&m.shown), navs: replace(mut &rw.navs, []), defs: defs, defNavs: defNavs, meas: meas,
                     measNavs: measNavs, local: local, rows: m.rows, skip: m.skip, skipSet: skipSet, outs: outs, outFrom: outFrom,
