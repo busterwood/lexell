@@ -213,7 +213,13 @@ All primitive types are copy types.
 ### 4.2 Arrays
 
 `[]T` is a growable array that owns its elements. It is an owned type for every
-`T`, including copy `T`. Elements are stored inline. Indexing is checked.
+`T`, including copy `T`. Elements are stored inline. Indexing is checked. In an array
+literal whose element type is a shared borrow `&T`, an element that is a `T`
+is borrowed as an argument is (section 7.5): a variable or field directly, a
+temporary held to the end of the statement. So `command(&["GET", key,
+n.toStr()])` passes three views without copying. Such a literal may be
+passed to a call, but not kept in a `let`, because its temporaries do not
+outlive the statement.
 
 ### 4.2a Slices
 

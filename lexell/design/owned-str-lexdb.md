@@ -34,8 +34,10 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | L | Issue 8, SPEC 5.2: global `var`s of owned types (str, and value records or value closed types built from them) with value-only access: built-in reads in place, `g.clone()`, `g = v`. A borrow (`f(g)`, `g.m()`), a move (`return g`) or `for x in g` is an error. Boxed and array globals must be `once`. | acacd80a | yes. Changed error texts: a global moved out now says "read a copy with g.clone()"; an owned non-array global that used to be rejected as "has the owned type" now compiles, or gets the boxed-type error. | none |
 
-Not yet decided (design/owned-str.md section 6): issue 2. Add it here when it
-lands.
+| M | Issue 2, SPEC 4.2: in an array literal of shared borrows `&T`, an element that is a `T` is borrowed (a temporary lives to the end of the statement). `redis.command`, `send` and their method forms take `&[&str]`. | (this commit) | yes: `&[]str` arguments still convert, and literals now need no clones. Code that passed `&[...]` literals of owned strings to redis keeps compiling. | none |
+
+All of design/owned-str.md section 6 has landed except `rc T` (the next
+step, not an issue on the list).
 
 **At the switch, for string globals:** a string global passed to a function,
 returned or stored needs `g.clone()` (the sweep's `global` kind lists them;
@@ -63,6 +65,8 @@ forms from the start:
 - **H:** `make().field` moves the field out; don't clone it.
 - **I:** in `for x in f() { append(mut &out, x) }`, `x` is owned; drop the
   `.clone()`. To consume a variable's array, write `for x in move(xs)`.
+- **M:** an API that takes a list of strings to read should take `&[&str]`;
+  call sites then pass `&["X", key, n.toStr()]` with no clones.
 - **L:** a string global read by a function call or a return becomes
   `g.clone()`; `len(g)`, `g + x` and comparisons stay as they are.
 - **J:** `x.clone().toStr()` on those types becomes `x.toStr()`; `Some(y.clone())
