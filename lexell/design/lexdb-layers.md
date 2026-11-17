@@ -450,6 +450,7 @@ by slot. The operators match lexdb-constructs.md's B rows:
 | `Sort`, `Limit(count, offset, ties, percent)`, `Distinct(on)` | ORDER BY, LIMIT/FETCH/TOP, DISTINCT [ON] | |
 | `SetOp(op, all, l, r)` | UNION, INTERSECT, EXCEPT | each side projected to the common types first |
 | `Match(def)`, `Lock(mode, tables, wait)` | MATCH_RECOGNIZE, FOR UPDATE | |
+| `One`, `Sub(view, src, plan)` | no FROM; a FROM item that is a query | added in 2e slice 1: `Sub` renames its plan's outputs into the joined row (alias.column at the row's slots); `CteRef(id, work)` also stands for a recursive CTE's working table |
 
 DML stays a layer-7 statement holding a bound source plan and bound
 SET/VALUES/RETURNING expressions over the target's columns.
@@ -553,7 +554,7 @@ each slice merges with the suite, the 22 checksums and an A/B.
 | 2b (built) | `BX`, `OpDef` and `lexdb_ops`; `cxOf` becomes the binder's `bindExpr`, `cEval` runs `BX`; delete `CX` and `FnB` | `BX` for compiled expressions; `eval` over `Expr` for the rest |
 | 2c | `bCompile` builds its batch nodes from `BX` (the generic node is a `BX` step); constants pre-scaled and common subexpressions once per chunk | `BX` in both evaluators; `BNode` shrinks to the kernels |
 | 2d | Scope and naming: `resolve`/`resolveName`/`Scope` frames, star, GROUP BY and ORDER BY resolution move to the binder; columns by slot | `Query.cols` as `BCol`s; `eval`'s name lookup (`colIndex`) gone |
-| 2e | The binder emits the logical plan for SELECT and DML sources; `planSelect`/`buildQuery` read it instead of the `Stmt` | step 3 then turns it into the operator tree |
+| 2e (slice 1 built) | The binder emits the logical plan for SELECT and DML sources; `planSelect`/`buildQuery` read it instead of the `Stmt` | step 3 then turns it into the operator tree |
 
 Each later slice deletes the code it replaces; nothing keeps two typings.
 
@@ -2194,6 +2195,351 @@ for the names, since line numbers move.
     q1, q2, q17, q20, q22. Under ~1.5% use byte-identical copies of each
     binary (`cp lexdb-X lexdb-Xc`) as their own labels: a copy's pages
     differ, and copies of one binary differ by that much (the q1 note).
+
+**2e slice 1 as built: `lexdb_bind.LPlan`, built beside the executor's
+structures.** Three commits on `redesign/bind` from main 76118b8a, each
+built and through the suite (188, imports ok): 5f7ab0ae (the type and its
+building), ff290e9d (a fix the scratch check found), 32afed0d (`Query.bcols`
+goes into the plan, fewer copies), and a fourth with this note. Nothing
+reads the plan yet; no plan and no result changes.
+
+- The type (`lexdb_bind`, after `bcolOf`): a closed `LPlan`, one arm per
+  operator, each with its output `[]BCol` last:
+  - leaves: `One` (no FROM), `Get(table, alias)`, `Values(width, values
+    row by row)`, `Func(name, ordinality, args)`, `CteRef(id, work)`;
+  - `Sub(view, src, plan)`: a FROM item that is a query (a subquery, a
+    view, a CTE's use, a function, VALUES, a working table) with its
+    plan's outputs renamed into the joined row (alias.column at the row's
+    slots). `src` is the item's number in `Query.subs` (`Level.src`), so a
+    later slice can find the planned `SubPlan`;
+  - `Join(kind, lateral, left, right, on)`: left-deep in FROM's order, as
+    the executor's levels are; `on` is the resolved ON and the ON that
+    USING/NATURAL makes (`[]Expr`, [] none); its columns the left's then
+    the right's (all of them: USING's merged columns are marked on
+    `ColDef.using`, which `BCol` does not carry);
+  - `Filter(pred)` (WHERE after `pullCommonOr`, and HAVING), `Agg(keys,
+    sets, nAggs)`, `Window(defs)`, `Project(exprs)`, `Distinct(on)`,
+    `Sort(keys, desc, nullsFirst)`, `Limit(count, offset, ties, topMode)`,
+    `SetOp(op, all, l, r)`, `Recursive(id, anchor, step)`, `Match`.
+  - Helpers: `noPlan()`, `lpCols(p)` (a copy), `copyBCols`, `outBCol(slot,
+    o, mod)`; exec's `outBCols(outs)` gives the mod from `outType` when a
+    dialect's wire hint is in `OutCol.scale` (below), else -1.
+  - `Query.bcols` is gone: 2d slice 1 made it as the natural column list
+    of the Get/Join part, read by nothing. The `Get`/`Sub` columns are
+    built where `addCol` adds the row's (`icols`, `bcolOf`), a `Join`'s are
+    its left's then its right's. (The semi-joins' hidden columns, added
+    later by `addCol`, have no `BCol`: the plan keeps the bound row.)
+- Where it is built (all `lexdb_exec`):
+  - `buildQuery`'s FROM walk appends a `Get` or `Sub` per item to `items`
+    (`icols`: the item's columns, `bcolOf` of each `ColDef` it adds);
+    a FROM subquery's or view's plan is moved out of its `SubPlan`
+    (`sp.sel.lp`), a CTE's use is `CteRef(cte, false)` and its body's plan
+    stays in its `SubPlan` (it is re-planned per use today), a working
+    table is `CteRef(id, true)`. The ON loop moves each resolved ON into
+    the `Join` (after `conjuncts` has copied it); the resolved WHERE is
+    moved into a `Filter`. `q.lp` is set before the planner's part
+    (implied equalities, join order, paths, semi-joins).
+  - `planSelect` keeps clones of the clauses as resolved (`lpExprs`,
+    `lpGroup` before the redundant keys are dropped, `lpOrder` after
+    DISTINCT ON's items are added, `lpHaving`, `lpWins`, `lpOn` moved)
+    and `selPlan` wraps `q.lp`: Agg, Filter (HAVING), Window, Project,
+    Distinct, then `topPlan`'s Sort and Limit. The expressions are the
+    binder's (resolve, resolveOrder, resolveGroup, enum positions), not
+    the planner's (`collectAggs`'s `#agg` slots, `setSubst`, `winSlots`):
+    the `Agg` carries the aggregates' number only.
+  - `planSet` moves both sides' plans into `SetOp` or `Recursive` (over
+    the common-typed `outs`) under `topPlan`.
+  - `planSub` replaces a function's or VALUES' plan by `Func`/`Values`
+    (with `srfCols`' columns; `planSelect` skips the select list's clone
+    for them) and wraps a MATCH_RECOGNIZE in `Match` (`mr[0].outs`).
+  - Not built: `Apply` (expression subqueries keep their numbering in
+    `Query.subs`, their own `Sel.lp` stays in their `SubPlan`), `Lock`
+    (FOR UPDATE is still `Level.lock`), DML (`insert`, `update`, `delete`,
+    `merge` keep the FROM/WHERE part in `q.lp` and add nothing).
+- Cost: expressions are moved where the executor no longer needs them (ON,
+  WHERE, DISTINCT ON) and cloned where it rewrites them (select list,
+  GROUP BY, ORDER BY, HAVING, windows, a function's arguments); column
+  lists are copied per operator. All per plan: a prepared SELECT is planned
+  once (the plan cache keeps the `Sel` with its `lp`); UPDATE and DELETE
+  build `Get` and `Filter` per run (no expression cloned).
+- The scratch check (`~/tpch-w/bind/e2/chk/patch.py` applied to a copy of
+  `lexell/cmd`; the suite from a snapshot whose `run.py` appends each
+  test's `LPCHK` stderr lines to `$LPCHK_OUT`): `lpCols(q.lp)` against
+  `q.bcols` (all fields; after 32afed0d against `bcolOf` of each of
+  `q.cols`) and `q.cols` (slot, name, spell) when `q.lp` is set and again
+  at `buildQuery`'s end; each `Sub`'s plan's columns
+  against the row's (types, and names where no AS list renames them);
+  each operator's columns against its input's (`lpValid`: Join = left ++
+  right; Filter, Agg, Window, Distinct, Sort, Limit = input; Project's
+  expressions one per column; Sort's keys, desc, nullsFirst alike; SetOp's
+  sides as wide); the top's columns against `fromCols(sel)` (name, spell,
+  OID, collation) at `select`'s plan, `selectWith` and `planSub`. Over the
+  suite, TPC-H's 22, the 35 queries and the naming battery:
+  - fixed: a FROM subquery's or view's row column carried the dialects'
+    wire hint as its typmod (`outType`: datetime(3) 1114/3, a T-SQL
+    varchar's length 1043/10 and /20), the Project's column had -1
+    (`OutCol` has no typmod). 929 sites in the suite (T-SQL tests).
+    `outBCol` takes a mod and exec's `outBCols` gives `outType`'s
+    (ff290e9d);
+  - left, by design: the joined row grows after binding: semi-joins'
+    hidden `\x00sjN.\x00rowidK` columns (`semiLookAdd`, `semiJoins`), 3,152
+    sites in the suite, 6 in TPC-H, 8 in the 35 queries, 9 in the battery
+    (`q.bcols` grew with `q.cols` through `addCol`); the `LPlan` keeps the
+    bound row. No column was renamed or retyped in
+    `q.cols` after binding (no `col` mismatch at the end);
+  - left, by design: a view with a column list (`create view v (a, b)`,
+    q15's `revenue0 (supplier_no, total_revenue)`) renames its plan's
+    outputs in `Sub` (the check's name test flagged it);
+  - left, a known difference: a FROM subquery's or view's column of type
+    oid (26), "char" (18), name (19), regproc (24), regclass (2205) or
+    regtype (2206) is text (25) in the outer row: `outType` goes through
+    `lexdb_sql.oidType`, which maps every OID it does not model to text.
+    The `Sub`'s plan has the true type; its row columns (from `q.bcols`)
+    have text. All in the catalog views (`pg_class`, `pg_attribute`,
+    `pg_index`, `pg_namespace`: 15,000 of the suite's 15,800 lines). So a
+    query over `pg_class` types `c.oid` as text and sends its client text,
+    where PostgreSQL sends oid. Changing `oidType` changes typing and
+    results (comparisons of those columns with integers); a commit of its
+    own with tests;
+  - nothing else: no length, slot or name mismatch, no operator whose
+    columns differ from its input's, no top whose columns differ from the
+    `Sel`'s outputs (sets with common types, SRFs, VALUES, MATCH_RECOGNIZE,
+    views, CTEs, recursive CTEs, LATERAL included).
+- The naming battery (`~/tpch-w/bind/bench/naming`): extended by 60
+  statements for 2e (now 1,505 output lines, 30 errors; the old file is
+  `naming.sql.s4`): VALUES in FROM with and without column lists (and too
+  many), functions in FROM with ORDINALITY, unnest of two arrays, LATERAL
+  functions and LATERAL subqueries under LEFT JOIN, a CTE used twice and
+  CTEs over CTEs, nested FROM subqueries with column lists, views with
+  column lists and views over views, UNION/UNION ALL/INTERSECT ALL/EXCEPT
+  with ORDER BY, LIMIT and OFFSET, unions of an int and a numeric and of a
+  text and a NULL, a column-count mismatch, a recursive CTE, DISTINCT,
+  DISTINCT ON (one and two keys), GROUPING SETS, ROLLUP, CUBE, a named
+  window, frames, windows over groups, FETCH ... WITH TIES, OFFSET, FOR
+  UPDATE, an output alias in ORDER BY, INSERT ... SELECT of a UNION,
+  UPDATE ... FROM a grouped subquery, DELETE with a row IN, MERGE from
+  VALUES, MATCH_RECOGNIZE (also as a FROM subquery), VALUES in a
+  correlated scalar subquery, `= ANY` over a function, a catalog view.
+  Identical output from main 76118b8a, the branch and the check build.
+- A/B against main 76118b8a (built from `git archive` into
+  `~/tpch-w/bind/src-m761`, `lexdb-m761`; the branch at 32afed0d,
+  `lexdb-e4`), binaries alternating, medians of 3 rounds:
+  - TPC-H (`tpch_ab.sh`, tags k1-k3, boost off by `run.sh`): total 0.993;
+    all 22 checksums the baseline's on every round. q1 0.969, q10 0.975,
+    q11 0.978; q16 1.015, q17 1.016 (44.6 to 45.3 ms), q19 1.017 (113.4
+    to 115.3 ms), q21 1.012; the rest within 1.2%. (At 5f7ab0ae, tags
+    h1-h3: total 0.993, q1 0.954, q20 0.962, q18 1.012, q16 1.011.) The
+    plan is built once per query here; these are the copy floor.
+  - The 35 queries (`ab35.sh`, boost off): total 1.006; `pk_point20k`
+    1.050 (909 to 954 ms; below), the rest within 3.2% on 3-260 ms
+    queries (filt_agg 1.031, pk_range100k 1.032, distinct2 0.970), as in
+    earlier slices' floors. `sort_all`, `idx_range1k`, `idx_range100k`,
+    `idx_range_agg` and `join_lookup_agg` fail on both binaries ("page
+    23349: type 2", the `la/base2` copy; also on slice 4's runs).
+  - Planned per statement (the cost this slice adds):
+    - `pk_point20k` (20,000 `select * from w where id = n` by the simple
+      protocol, each parsed and planned; `~/tpch-w/bind/e2/pts.sh`, 5 runs
+      per server, 3 rounds, server CPU from schedstat), CPU medians:
+
+      | Build | ms | copy | vs main |
+      |---|---|---|---|
+      | main 76118b8a | 841-850 | 848-855 | |
+      | 5f7ab0ae+ff290e9d (every list copied) | 927 | | +9% |
+      | ... outputs' typmod only from a hint, one copy fewer | 909 | 902 | +6.5% |
+      | 32afed0d (no `Query.bcols`, one copy per operator) | 883-893 | 889 | +5.3% |
+      | 32afed0d without `Sel.lp`'s part (scratch `x1`) | 870 | | +3.4% |
+      | ... nor `Get` columns, `Join` columns, `Filter` (`x2`) | 853 | | +1.4% |
+
+      A scratch variant whose pass-through operators (Filter, Agg,
+      Window, Distinct, Sort, Limit) carry [] instead of a copy (`x3`)
+      measured 878 against the branch's 885 and main's 841: the copies
+      are a small part, so the shape stays as asked (every operator with
+      its list). About 2.1 us per statement of 42 us: the `Filter`'s copy of the
+      `Get`'s columns, the `Project`'s columns (`outBCols`), the select
+      list's clone and the plan's drop (`rt_drun`). A profile of the
+      server (`perf record --call-graph fp --user-callchains -e cycles:u`,
+      symbols from `LXL_NATIVE_MAP`; `~/tpch-w/bind/e2/profg.sh`,
+      `incl.py`): `selPlan` 1.8% inclusive, `outBCols` 0.8%, `lpCols` 0.6%,
+      `copyBCols` 0.6%, `rt_drun` +1.1% before 32afed0d.
+    - `~/tpch-w/bind/e2/simple.sh` (pgbench `-M simple`, 4 clients, 10 s,
+      boost off, tps medians): point selects 38,390 against 37,386
+      (0.974); updates 9,030 against 9,005 (0.997); a 3-table join with
+      ORDER BY and LIMIT 16,384 against 15,521 (0.947: three `Get`s, two
+      `Join`s, Filter, Project, Sort, Limit, each with a list).
+  - DML, planned per run: updates in OLTP (`oltp.sh`, prepared, a commit
+    each), tps ratios 0.990, 1.002, 1.006 at 1, 8, 32 clients; by the
+    simple protocol 0.997 (above). The batch-insert loads (`INSERT ...
+    generate_series`, 1M rows, medians): acct 1.52 against 1.56 s, t 3.00
+    against 2.99 s.
+  - Prepared point selects (plan-cache hits; nothing of the plan is built
+    or read per run): `oltp.sh` 0.988, 0.992, 0.976 at 1, 8, 32 clients;
+    on byte-identical copies (`~/tpch-w/bind/e2/prep.sh`, 1M rows, 10 s,
+    boost off, tps medians of 3 rounds): 1 client main 48,457 and copy
+    48,766, branch 47,440 and copy 48,093 (0.983 of the pairs' means; the
+    floor 1.006 and 1.014); 32 clients main 80,461 and 80,374, branch
+    80,175 and 78,923 (0.989; floor 0.999 and 0.984). At or just past the
+    copy floor; nothing of the plan runs per execution (the `Sel` is
+    borrowed), so read it as layout, not verified further.
+  - The plan cache, counted (`pc.sh`, builds patched by
+    `~/tpch-w/bind/e2/chk/pcpatch.py`): 8 plans on main and the branch,
+    every other select a hit (190,483 of 190,491 on main; 214,554 of
+    214,562 at 32afed0d); the updates add no plan and no hit.
+- Verdict against the noise between byte-identical copies (~1.5%): no
+  regression on TPC-H (checksums all the baseline's), the 35 queries but
+  `pk_point20k`, prepared point selects (at the floor), updates and the
+  loads. A regression past the floor where a SELECT is planned per
+  statement by the simple protocol: `pk_point20k` +5% CPU, pgbench point
+  selects -2.6% tps, the 3-table join -5.3%. That is the cost of building
+  a second representation beside the old one; it goes when the planner
+  reads the `LPlan` instead of cloning the clauses (slices 2-3), and
+  prepared statements do not pay it. Not run (stopped by the
+  coordinator's instruction): more rounds or copies of the simple-protocol
+  runs, `qmulti.sh` row-path probes, `pstat.sh` instruction counts, the
+  check build over TPC-H and the 35 queries after 32afed0d (it ran at
+  5f7ab0ae; the suite and the battery ran on every stage's check build).
+- Lines:
+
+  | Module | main 76118b8a | after |
+  |---|---|---|
+  | `lexdb_exec` | 27828 | 27936 |
+  | `lexdb_bind` | 1856 | 1936 |
+
+**Where 2e slice 1 left off, and how to start slice 2.** Slice 2 splits
+`buildQuery` into the binder's FROM pass and the planner's pass, the
+planner reading the `LPlan`. Everything named is in `lexdb_exec` unless
+the note says otherwise; search for the names, since line numbers move.
+
+- What is there after slice 1:
+  - `lexdb_bind.LPlan` (arms in "2e slice 1 as built"), `noPlan`,
+    `lpCols`, `copyBCols`, `outBCol`; exec's `outBCols`, `selPlan`,
+    `topPlan`. `Query.lp` (FROM and WHERE) and `Sel.lp` (the whole SELECT;
+    `planSelect` moves `q.lp` into it, so a `Sel`'s `q.lp` is `One`).
+    Read by nothing; the only readers are the scratch check's.
+  - In `buildQuery`: `items` (per FROM item, `Get` or `Sub`), `item`,
+    `viewName`, `spLp` (a FROM subquery's plan, taken out of its
+    `SubPlan` before `fromCols` borrows it), `icols` (the item's `BCol`s,
+    made beside `addCol`); the ON loop's `jon`,
+    `jcols` and the left-deep `lp`; the WHERE's `Filter`; `q.lp = lp`
+    before `need`, the join order and the paths.
+- `buildQuery`'s phases today, binder (B) or planner (P):
+  1. B/P prologue: the hints `planSelect` leaves on the `Scope` (`early`,
+     `locking`, `noRefKeys`, `ordBy`, `ordLim`) are taken (P); the
+     semi-join candidates (`semiCand`, from WHERE's unresolved conjuncts
+     by `semiParsed`) (P).
+  2. The FROM walk (B), with three planner calls in it: `planSub` of a
+     FROM subquery or a view binds and plans it in one call (both); a
+     table's statistics (`loadEst`, P); and the frames' columns for the
+     subqueries (`Frame.cols`, `exact`) (B). Privileges (`scCheck`), the
+     catalog (`findTable`, `findSeq`, `viewQuery`, `readAcl` for a view's
+     owner, `sc.asRole`), USING/NATURAL (`usingSide`, `colExpr`, the
+     `using` marks, *'s order in `pos`) are binder work.
+  3. The expression subqueries (`for i in 0..len(subs)`): `planSub` each
+     (both), the semi-join alternatives planned again with `noRefKeys`
+     (`semiLooks`, `semiAlts`, P), then the frame's `subRefs`, `subOids`,
+     `subNames`, `subColls`, `subKinds`, `subReads` (B: resolve types a
+     `#sub`/`#in` call from them) and `q.corr`.
+  4. The views' plans numbered after the statement's subqueries (B: the
+     numbering `Level.src` and `Sub`'s `src` use).
+  5. `colAt` (P).
+  6. ON and USING's ON resolved over the row's prefix, `enumOrder` (B);
+     their conjuncts into `ms[k]` (P).
+  7. WHERE: `pullCommonOr` on the unresolved tree (P, a rewrite, before
+     resolve), resolve and `enumOrder` (B), then the placement into
+     `ms`/`ps`, `orLevels` (P).
+  8. `need` (from `selNames`), implied equalities, join order
+     (`pinnedOrder`, `costOrder`, `joinOrder`, `outerReadOnce`), paths
+     (`choosePath`), hashing, `semiJoins` (all P).
+- A way in:
+  1. Within `lexdb_exec` first: `bindFrom` (phases 2-4 and 6-7's resolve,
+     returning the `Query` with its levels' tables, `cols`, `bcols`,
+     `subs` and `q.lp`) and `planFrom` (the rest), `buildQuery` calling
+     both, so its 13 callers do not change. `planFrom` takes the ON and
+     WHERE conjuncts from `q.lp` (walk the left-deep `Join`s: the k-th
+     join's `on` is level k's; the `Filter` over them is WHERE's;
+     `conjuncts` clones). Keep `pullCommonOr` where it is (on the
+     unresolved WHERE, in `bindFrom`) for this slice: resolve adds casts
+     and `#bptrim` calls that its text matching may see differently, and
+     q19 depends on it. Moving it into the planner is its own commit, with
+     q19's plan and checksum as the gate.
+  2. The semi-join alternatives (phase 3's second `planSub`) are planner
+     work inside the binder's loop: `planFrom` should do them, after
+     `bindFrom` has numbered and typed every subquery. They need the
+     subquery's `Stmt` (`subs[i]`) and the `Scope` (`sc.noRefKeys`); the
+     candidate test reads `sp.use`, `sp.sel.q.refs`, `sp.hashed`, `sp.cte`
+     only.
+  3. Then move `bindFrom` into `lexdb_bind`. It cannot call the catalog:
+     `lexdb_bind` may import only `lexdb_base`, `lexdb_sql`,
+     `lexdb_catalog`, `lexdb_dialect`, `lexdb_time`, `lexdb_float`,
+     `lexdb_ops`, `lexdb_lib` (`tests/lexdb/imports.py`,
+     `BIND_MAY_IMPORT`), and `Names`' hooks are plain functions (no
+     captured `Store` or `Txn`: `Typing.fnOid`, `blank`, `constCast`,
+     `colScale`, `outScale`). Two ways: exec fetches what the FROM names
+     first (a catalog snapshot: each FROM item's `Table`, a view's parsed
+     `Stmt` and owner, a sequence's relation, the `Scope`'s working
+     tables) and passes it in; or the binder returns what it lacks and is
+     called again. Subqueries make either recursive: a FROM subquery is
+     bound and planned by one `planSub` today, and the outer FROM pass
+     needs only its output columns (binder work: `selectCols`, `srfCols`,
+     the `#values:` typing in `planSub`, `planMatch`'s outputs). So the
+     binder half of `planSub`/`planSelect` must be separable first: that
+     is slice 3's ground (planSelect reading its clauses from the
+     `LPlan`), and suggests doing slice 2's step 1-2 in exec, slice 3,
+     then the move.
+- Traps:
+  - Borrows: a field cannot be moved out of a match arm's binding ("cannot
+    move a []Expr out of a borrow"); read an `LPlan` by matching a `&LPlan`
+    and clone what you keep, or rebuild it. `replace(mut &x.lp,
+    lexdb_bind.noPlan())` takes a whole plan. A `let` borrowed by another
+    (`fcols = fromCols(&sp.sel)`) blocks `replace(mut &sp.sel.lp, ...)`
+    while it is in scope: take the plan first (`spLp`). `[]` in an `if`
+    needs the variable's type written.
+  - The row changes after binding: semi-joins add hidden
+    `\x00sjN.\x00rowidK` columns (`semiLookAdd`, `semiJoins`, through
+    `addCol`); `q.lp` keeps the bound row (there is no `Query.bcols` any
+    more: the row's `BCol`s are the `Get`/`Sub`/`Join` columns).
+    `planFrom` must read the level ranges from `q.levels` (which semi-joins
+    extend), not from the `LPlan`.
+  - `Join`'s columns include USING's merged-away ones; `*` and NATURAL
+    read `ColDef.using` and `pos`, which `BCol` does not carry. Add them
+    to `BCol` before anything expands `*` from the `LPlan`.
+  - A view's or FROM subquery's oid, "char", name, regproc, regclass and
+    regtype columns are text in the outer row (`outType` through
+    `lexdb_sql.oidType`), while the `Sub`'s plan has the true type: do not
+    "fix" the row from the plan in passing (it changes typing and
+    results); its own commit with tests.
+  - A CTE's use is `CteRef` with no plan (the body is re-planned per use
+    and its `Sel.lp` stays in its `SubPlan`); binding a CTE once is a
+    later change. Expression subqueries have no `Apply` yet: they keep
+    `Query.subs`' numbering (`SubPlan`, `subFixed`, `isSubCall`,
+    `Frame.sub*`, `endScope`'s `kind`/`readAs`), which step 5 replaces.
+  - `Agg` carries only the aggregates' number: the `#agg` slots come
+    from `collectAggs` (planner), and so does `Sel.specs`. `Sort`'s keys
+    are read over the Project's input and outputs (`orderValue`,
+    `orderOut`: "not an input column" means an output alias; the known
+    42803 difference from PostgreSQL rests on it).
+  - The plan cache keeps `Sel`s, and with them `Sel.lp`: nothing of a run
+    in it (no `Run`, no parameter values: `Limit` keeps the expressions,
+    not `evalInt`'s numbers, which go through `sc.looks`).
+  - Everything slice 1 does is per plan. A prepared SELECT is planned once
+    (8 plans, every other select a hit, below); simple-protocol queries and
+    UPDATE/DELETE are planned per run (UPDATE builds `Get` and `Filter`,
+    no clone). Keep the binder's pass free of per-run work.
+  - Tests compile against the sources: run the suite from a snapshot
+    (`cp -r lexell/{cmd,tests,lib,tools}` to a scratch tree). Wait on a PID
+    or file, not on `pgrep -f`. Timings under `flock ~/tpch/.bench.lock`.
+- Gates (as 2d's): the suite (188, imports ok); the naming battery
+  (`~/tpch-w/bind/bench/naming/run.sh BIN OUT`, 1,505 lines on main
+  76118b8a and slice 1) identical; TPC-H all 22 against
+  `~/tpch/out-baseline-1744ef99` (fields [0] and [8]), watching q2, q4,
+  q17, q19, q20, q21, q22 (the subquery and semi-join shapes slice 2
+  moves); the 35 queries; OLTP and the loads (`oltp.sh`); the plan cache
+  (`pc.sh` on builds patched by `~/tpch-w/bind/e2/chk/pcpatch.py`); the
+  simple-protocol planning A/B (`~/tpch-w/bind/e2/simple.sh OUT ROUNDS
+  LABEL BIN ...`: point selects, updates, a 3-table join, each planned per
+  run); and the scratch check (`~/tpch-w/bind/e2/chk/patch.py` on a copy
+  of `lexell/cmd`; its anchors are asserted, so update them as code moves):
+  after the split, `planFrom` reading `q.lp` must give the same `ms`/`ps`
+  per level as today (compare their `exprText`s in the check build).
 
 **The rest of 2c, planned:**
 
