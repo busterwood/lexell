@@ -219,7 +219,8 @@ is borrowed as an argument is (section 7.5): a variable or field directly, a
 temporary held to the end of the statement. So `command(&["GET", key,
 n.toStr()])` passes three views without copying. Such a literal may be
 passed to a call, but not kept in a `let`, because its temporaries do not
-outlive the statement.
+outlive the statement. A literal passed where a `&[]T` is expected takes `T` as its
+element type, so `f([])` needs no annotation.
 
 ### 4.2a Slices
 

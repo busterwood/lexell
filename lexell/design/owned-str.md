@@ -297,6 +297,9 @@ whether it was confirmed with a test.
       ownership, so making it implicit hides nothing that matters. `mut &`
       stays explicit, because it does matter.
     This is probably the biggest ergonomic question the switch raises.
+12. **An empty `[]` passed to a `&[]T` parameter could not infer `T`**
+    (found in compiler migration phase 1: `fail(..., [])`, `x.call("f", [])`).
+    Fixed: the literal takes its element type from the expected `&[]T`.
 11. **Comparing an `Option[str]` with a borrowed string allocates.**
     `if Some(d.path.clone()) == exclude` (zoxide) builds an owned `Option` to
     compare. This is a library gap rather than a language one:
