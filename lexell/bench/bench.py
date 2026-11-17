@@ -204,21 +204,21 @@ def main():
                 raise SystemExit(f"{name}: {exe} with LXL_CHECK=1 exited {code}: {err}")
         t_lxl, out_lxl, i_lxl, c_lxl = timed(lxl)
         t_lxln, out_lxln, i_lxln, c_lxln = timed(lxln)
-        if out_lxln != out_Lexell:
+        if out_lxln != out_lxl:
             raise SystemExit(f"{name}: outputs differ: C {out_lxl!r}, native {out_lxln!r}")
         t_lxlo, out_lxlo, i_lxlo, c_lxlo = timed(lxlo)
-        if lxlo is not None and out_lxlo != out_Lexell:
+        if lxlo is not None and out_lxlo != out_lxl:
             raise SystemExit(f"{name}: outputs differ: C {out_lxl!r}, native -O {out_lxlo!r}")
         t_obo, out_obo = (None, None)
         if obo:
             t_obo, out_obo = best(obo, name, a.n)
-        if obo and out_obo != out_Lexell:
+        if obo and out_obo != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, obo {out_obo!r}")
         t_plain, out_plain, i_plain, c_plain = timed(plain)
-        if plain and out_plain != out_Lexell:
+        if plain and out_plain != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, plain C {out_plain!r}")
         t_rust, out_rust, i_rust, c_rust = timed(rust)
-        if rust and out_rust != out_Lexell:
+        if rust and out_rust != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Rust {out_rust!r}")
         rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust,
                          out=out_lxl,

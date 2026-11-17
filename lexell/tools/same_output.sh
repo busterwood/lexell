@@ -14,7 +14,8 @@ OLD="$D/compiler/out/lxlc"
 "$OLD" compiler/main.lxl --native -o "$T/new" || { echo "the edited compiler does not build" >&2; exit 1; }
 export OLD
 { echo compiler/main.lxl
-  find tests cmd lib/tests -name '*.lxl' | grep -v -e '^tests/error' -e '^lib/tests/error' | xargs grep -l '^fn main'
+  find tests cmd lib/tests lib/examples bench redteam design/experiments -name '*.lxl' |
+      grep -v -e '^tests/error' -e '^lib/tests/error' | xargs grep -l '^fn main'
 } > "$T/progs"
 xargs -P "${P:-4}" -I{} sh -c '
     a=$("$OLD" "{}" --emit-c 2>&1 | md5sum)
