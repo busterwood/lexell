@@ -4,7 +4,7 @@
 #     lexell/tools/owned_str_sweep.sh [-a] [file.lxl ...]
 # Prints "kind file:line name what-took-it", sorted and unique. With file names (base names, such
 # as fs.lxl), only the sites in those files. Free moves (kind "move") are left out unless -a.
-# LXLC is the compiler to use (default compiler/out/lxlc). Programs the mode cannot finish are
+# LXLC is the compiler to use (default compiler/out/lxlc); P the parallel compiles (default 4). Programs the mode cannot finish are
 # listed on stderr as "STOPPED file: error".
 set -e
 D=$(cd "$(dirname "$0")/.." && pwd)
@@ -23,7 +23,7 @@ cd "$D"
 # also stops without the flag (an expected-error test).
 n=0
 while read -r f; do n=$((n + 1)); echo "$n $f"; done < "$T/progs" |
-    xargs -P 4 -L 1 sh -c '
+    xargs -P "${P:-4}" -L 1 sh -c '
         if ! timeout 60 "$LXLC" "$1" --emit-c > /dev/null 2> "$T/$0.err"; then
             if LXL_OWNED_STR= timeout 60 "$LXLC" "$1" --emit-c > /dev/null 2>&1; then
                 echo "STOPPED $1: $(grep -v "^OWNED_STR" "$T/$0.err" | head -1)" >&2
