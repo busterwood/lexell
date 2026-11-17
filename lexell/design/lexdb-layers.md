@@ -3669,6 +3669,262 @@ Main stays green after every step.
   and one TPC-H run of the branch against main's stored result; point
   selects only where per-statement planning or the row path changes.
 
+### 6.1 Step 3 and step 5: the plan, slice by slice
+
+Written 2026-11-17 on `redesign/bind` at main 413100d1, before step 3.
+The measurements are main's binary (`~/tpch-w/bind/e8/lexdb-bc`, b3cc2219,
+the same code), SF1, boost on, one run each after a warm-up pass: read
+them as shares, not levels. Scripts and outputs in `~/tpch-w/bind/s3`.
+
+**What the measurements say first.** The revised order rests on "TPC-H's
+worst gaps are plan shape". On main that no longer holds for the
+subquery queries. Their figures (q19 14×, q20 12×) are from 94536d12;
+at 2b605b2b (`~/tpch-w/int/out-main-2b605b2b`, against PostgreSQL at
+one core) q19 is 3.0× and q20 3.3×. Today's planner already gives each
+subquery query the plan shape PostgreSQL uses:
+
+| query | lexdb / PG | the subquery's plan on main | PostgreSQL | where the rest of the time is |
+|---|---:|---|---|---|
+| q21 | 9.6 | semi and anti join, looked up per row (`semiLook`) | nested loop semi and anti join | executor: see below |
+| q22 | 5.2 | anti join, index only, per row | nested loop anti join | the two customer scans' `substring(...) in (...)`, about 115 ms each of 458 |
+| q4 | 2.9 | semi join, looked up per row | nested loop semi join | orders read whole (1.5M rows for 57k): PostgreSQL takes a bitmap scan of `orders_date` |
+| q20 | 3.3 | scalar per row (8,508 runs) | subplan per row | reading 63,832 lineitem rows by index (lexdb-tpch-perf.md, q20 round 2: the reading, not the setup) |
+| q2, q17 | 0.4, 0.1 | scalar per row | q17: subplan per row over a lineitem scan | ahead |
+| q18 | 1.0 | IN over a grouped subquery: a key lookup per value | hash join | level |
+| q16 | 2.2 | NOT IN, uncorrelated: a set, run once | hashed subplan | part's scan |
+
+q21 in parts (`probe*.sql`): the joins through orders, counted, 1.07 s;
+with the EXISTS and NOT EXISTS added, counted, 2.77 s; the query as
+written (grouped by `s_name`) 6.65 s, against 1.60 s for the same grouping
+without them. So about 5 s of q21's 7.2 s is the semi and anti levels
+under the grouped batches. With `lexdb_batch = off` the counted query
+takes 14.3 s. Why the grouped run is so much slower than the counted one
+was not diagnosed.
+
+So unnesting, done as step 5 now, would make none of q4, q20, q21 or q22
+faster. Their gaps are the executor (q21's grouped semi and anti path,
+q22's `substring`, the scans), the access path (a bitmap or sorted
+row-id scan for q4, q14 and q19's middle selectivities) and, for q21, a
+hash of supplier joined to nation (step 6's bushy join). The owner should
+weigh this against the revised order: the proposal at the end puts step
+4 before step 5.
+
+**1. What the physical plan is.**
+
+- Today's `Sel` tree is the physical plan in all but name:
+  - the `Sel` holds what sits above the joins (aggregate, HAVING,
+    windows, the select list, DISTINCT, sort or top-N, LIMIT, FOR UPDATE,
+    MATCH_RECOGNIZE) and a set operation's parts;
+  - its `Query` holds the level chain: each table's path and join method,
+    hash keys, and semi and anti levels;
+  - each `SubPlan` holds a subquery's own `Sel` and how it runs.
+
+  It holds no run-time state (`Run` and `Mats` do), the plan cache keeps
+  it (`PlanCache.sels`), and EXPLAIN prints it. What it lacks is
+  operators: `execSel` reads the `Sel`'s fields in one fixed order.
+- Step 3's type is `lexdb_plan.PPlan`, a closed type with one arm per
+  operator. Each arm holds its input, and `Levels` is today's chain
+  whole:
+  `Levels(n, subs)`, `Result(subs)`, `Func(name, ordinality, subs)`,
+  `SetOp(op, all, rec, parts)`, then `MinMax`, `Agg`, `Having`,
+  `Window`, `Project`, `Distinct`, `Sort(sorted)`, `Lock`,
+  `Limit(stops)` and `Match`, in the order `execSel` applies them.
+  - Each subquery is a `PSub{use, run, anti, plan}`, where `run` says
+    how the executor runs it: `RUN_ONCE`, `RUN_PER_ROW` (step 4's Apply),
+    `RUN_HASHED` (decorrelated, 9.9), `RUN_SEMI` (a hashed semi or anti
+    level's rows) or `RUN_LOOKED` (not run: a looked-up level).
+  - The `run` modes are step 5's vocabulary. A future rewrite moves a
+    subquery from one mode to another.
+- **The first cut is a view.** `lexdb_exec.physOf(&Sel)` builds the tree
+  when asked. It holds no expressions, so:
+  - nothing is cloned;
+  - the plan cache still keeps only the `Sel`;
+  - planning does no extra work (only EXPLAIN builds the tree).
+
+  EXPLAIN prints by walking the tree, with the same text, and `execSel`
+  does not change. This is slice 3a.
+- **The tree then grows with step 4, not before.** When step 4 ports an
+  operator:
+  - that operator's arm takes its details, moved out of the `Sel`, not
+    copied;
+  - the planner stores the tree in the `Sel`, so it is cached with it;
+  - the pipeline runs a plan only if it supports every arm (a walk of
+    `PPlan`); otherwise `execSel` runs the `Sel`;
+  - `Levels` splits into scan and join arms when the hash join is ported.
+
+  A tree stored now would be a second copy of the `Sel` that nothing
+  runs, so step 3 has no slice beyond 3a.
+- Step 3 does not need the planner to move into `lexdb_plan` or to read
+  the `LPlan` (2e slice 3d). Both stay deferred, as the revised order
+  says.
+
+**2. Where unnesting plugs in.**
+
+- Today's unnesting is physical. It is decided after the subquery is
+  planned, from its paths and costs, and it rewrites `Query` and
+  `SubPlan`:
+  - `hashSub` (9.9) keys a subquery whose outer values appear only in
+    `inner = outer` conjuncts, with any other conditions kept as
+    residuals;
+  - `semiJoins` (9.104) makes a hashed semi or anti level and places it
+    by `orderRows`;
+  - `semiLook` makes a looked-up level;
+  - the `noRefKeys` alternative plans a semi candidate again without
+    outer values as keys, and its hash is taken if it costs less.
+- Coverage by shape:
+
+  | shape | today | missing |
+  |---|---|---|
+  | EXISTS / IN, correlated by equalities | hashed semi level, or looked up per row (one table, EXISTS only), chosen by cost | `semiLook` for IN, for two tables, for a range-keyed path |
+  | NOT EXISTS | anti level (hashed or looked up) | as above |
+  | NOT IN | uncorrelated: a set run once (9.8's NULL rules); correlated: per row | a null-aware anti join |
+  | EXISTS / IN under OR, in the select list, in an outer join's ON | per row (or once, uncorrelated) | the mark join |
+  | scalar aggregate, correlated | `hashSub` groups by the keys when no outer value is a path key; else per row (q2, q17, q20) | a cost choice between the two (the `noRefKeys` alternative is for semi candidates only); restricting the grouped side to the outer keys (magic set) |
+  | correlated FROM subquery (LATERAL) | per row | join plus grouping |
+  | IN over a grouped subquery (q18) | a lookup per value, or a hash | nothing for TPC-H |
+
+- **Recommendation: extend unnesting in today's structures, not in the
+  `LPlan`.**
+  - The choices are cost choices on planned subqueries: hash or lookup,
+    and where the level goes.
+  - Rewriting the `LPlan` first needs the planner to read FROM, WHERE and
+    subqueries from it: 2e slice 3d, an `Apply` arm, and `planSub`
+    split. That is large work with no gain.
+  - Step 4 throws none of it away: each kind of level maps to one
+    operator (a semi, anti or mark `HashProbe` over a build, or a semi or
+    anti index lookup), and `RUN_PER_ROW` is the Apply operator.
+  - The `Apply` arm, and moving the rules to rewrite the `LPlan`, come
+    once the planner reads the `LPlan`. That is a refactor, as step 5's
+    last slice.
+- None of these shapes makes q4, q20, q21 or q22 faster, as shown above.
+  Step 5's value now is generality (the missing rows of the table) and
+  deleting the per-row machinery once step 4 has an Apply operator. It
+  is not TPC-H speed.
+
+**3. The slices.**
+
+Step 3:
+
+| slice | what | gate |
+|---|---|---|
+| 3a | `PPlan`, `PSub` and `RUN_*` in `lexdb_plan`; `physOf` and `subsOf` in exec; EXPLAIN prints from the tree | the suite; the naming battery; EXPLAIN of the 22 queries byte-identical to main (`s3/explain.sh`); one TPC-H run |
+| (3b) | none: the tree is stored and owns data from step 4's first operator on | |
+
+Step 5, each slice in today's structures. Each gate is the suite, a test
+of the shape (batches on and off, against an independent formulation),
+the 22 checksums, and the shape's own A/B:
+
+| slice | what |
+|---|---|
+| 5a | NOT IN, correlated or not, as a null-aware anti join: a hashed anti level that also tracks NULLs on both sides |
+| 5b | the mark join: EXISTS and IN under OR and in the select list, as a hashed level that marks its rows instead of filtering them |
+| 5c | `semiLook` widened: IN whose value is the inner key; EXISTS over two tables (the second hashed); a range-keyed path |
+| 5d | a correlated scalar aggregate: per row or hashed, by cost (the `noRefKeys` alternative for scalars); a magic-set restriction where the outer side is small and has no index |
+| 5e | a correlated FROM subquery with an aggregate: a join and a grouping |
+| 5f | after step 4's Apply operator and the planner reading the `LPlan` (2e slice 3d): the `Apply` arm, the rules as `LPlan` rewrites, and the per-row machinery (`runSub`'s memo) deleted where unnested |
+
+**Proposed order:** 3a, then step 4, with step 5 after it. Step 4's
+first slices should take the measured TPC-H items:
+
+- q21's semi and anti levels under the grouped batches (about 5 s);
+- scan, filter and project (q1, q6, q21's lineitem scan, q22's
+  `substring`).
+
+Step 6's hash of a join (q21) and a sorted row-id scan (q4, q14, q19)
+are the plan-side gains, and neither needs step 3 or step 5. If the owner
+keeps 3 then 5, 5a to 5c are the most useful (correctness and
+generality), but the TPC-H totals will not move.
+
+**Step 3a as built.** There are two commits on `redesign/bind` from main
+413100d1: af5da38f (this note) and 3d48e049 (the code). The suite passed
+on the code commit's snapshot.
+
+- `lexdb_plan` gained the following, with no new imports:
+  - `PPlan`, the arms as in 1 above;
+  - `PSub{use, run, anti, plan}`;
+  - `RUN_ONCE`, `RUN_PER_ROW`, `RUN_HASHED`, `RUN_SEMI`, `RUN_LOOKED`;
+  - `pSubs(&PPlan)`, which returns the leaf's subqueries;
+  - `pLeaf(&PPlan)`.
+- `lexdb_exec`:
+  - `physOf(&Sel)` and `subsOf(&Query)` build the tree. `subsOf` uses
+    the classification `subLines` made inline before: looked up, then
+    semi, hashed, once, per row.
+  - `selLines` is `physOf` followed by `planLines`. `planLines` walks the
+    operators (`opLines`), then the subqueries (`subLines`, which now
+    takes the `PSub`s and recurses with each one's plan).
+  - `setLines` takes the parts' plans from the `SetOp` leaf.
+  - DML's EXPLAIN calls `subLines(&q, &subsOf(&q), ...)`.
+  - Only EXPLAIN builds the tree. Planning, the plan cache and
+    `execSel` are unchanged.
+- The order is kept for EXPLAIN:
+  - `Match` prints its line before its input's;
+  - `Func` and `Result` print the level lines first, as before;
+  - `Window`, `Project` and `Lock` print nothing;
+  - `Limit` prints only when it stops the scan;
+  - a set is still printed by `setLines`: its `Sort` always as "order:
+    sort", its `Limit` never.
+- Lines:
+
+  | Module | main 413100d1 | after |
+  |---|---|---|
+  | `lexdb_exec` | 28124 | 28224 |
+  | `lexdb_bind` | 2025 | 2025 |
+  | `lexdb_plan` | 154 | 229 |
+
+- Gates:
+  - the suite from a snapshot of 3d48e049
+    (`~/tpch-w/bind/e7/suitec.sh s3a`): 188 passed, imports ok;
+  - the naming battery: 1,505 lines, identical to main's
+    (`~/tpch-w/bind/s3/nam-*.out`);
+  - EXPLAIN of the 22 TPC-H queries (`s3/explain.sh`, 188 lines) is
+    byte-identical to main's binary;
+  - `s3/exx.sql`, 45 EXPLAINs over this slice's shapes, identical to
+    main once the times are masked (309 lines). It covers every `RUN_*`
+    mode, sets, a recursive CTE, functions, VALUES, MIN/MAX, DISTINCT
+    ON, windows, grouping sets, LIMIT and OFFSET, FOR UPDATE and FOR
+    SHARE, LATERAL, MATCH_RECOGNIZE, DML, and EXPLAIN ANALYZE;
+  - TPC-H: all 22 checksums match the baseline's (fields [0] and [8]) on
+    every run.
+    - The first run against main's stored result
+      (`~/tpch-w/int/out-main-2b605b2b`) was 30,756 against 29,744 ms
+      (1.034), with q21 at 1.077.
+    - The repeat used byte-identical copies, the branch first
+      (`s3/lexdb-ac`) and then main's binary (`s3/lexdb-mc`, a copy of
+      `e8/lexdb-bc`): 30,389 against 30,489 ms (0.997). q21 was 0.987,
+      and nothing moved past 4% (q20 1.039, q3 1.023).
+    - So the first run's gap was the machine, not the change. That fits:
+      the code runs only under EXPLAIN. The outputs are in `s3/out-a`,
+      `out-ac` and `out-mc`.
+  - Not run, as planning per statement does not change: `simple.sh`
+    and `pts.sh`.
+
+**Where 3a left off, and how to start step 4 (or step 5).**
+
+- The tree is a view, and nothing runs from it. Step 4's first slice
+  does three things:
+  - stores the tree in the `Sel`: built at the end of `planSelect` and
+    `planSet`, cached with the `Sel`. `pts.sh` and `simple.sh` measure
+    this, because it is per statement on the simple protocol;
+  - adds the check that the pipeline supports a plan (a walk of
+    `PPlan`, its subqueries included);
+  - moves the first ported operator's details into its arm, out of the
+    `Sel`. The `Sel` field goes when its last reader does.
+
+  Splitting `Levels` into scan and join arms is part of porting the
+  hash join.
+- For step 5 slices, in today's structures:
+  - a new way to run a subquery gets a `RUN_*` value, its line in
+    `subLines`, and its case in `subsOf`;
+  - a new kind of level (a mark join) gets its line in `explainLines`.
+- Traps:
+  - `pSubs` is exhaustive over the arms, and `pLeaf` ends in `else`. A
+    new unary arm needs a case in both.
+  - `Agg` and `MinMax` can both be present (EXPLAIN printed both lines
+    whenever both conditions held). `Limit` is also present for TOP
+    PERCENT and WITH TIES (`topMode`, `limit` -1).
+  - Lexell: the tree is built with `let` chains (`p1` ... `p9`). Each
+    arm moves its input in, and nothing is reassigned.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does

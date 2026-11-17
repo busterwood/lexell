@@ -152,3 +152,78 @@ pub fn rowsOf(cm: &Common, key: &str): int {
     }
     return (cm.entries + cm.d - 1) / cm.d
 }
+
+// ---- the physical plan (design/lexdb-layers.md 6.1, step 3)
+//
+// The operators the executor runs for a planned query, bottom up, each arm
+// over its input, in the order today's executor (lexdb_exec's execSel)
+// applies them. Slice 3a's cut is a view: lexdb_exec makes it from a
+// planned Sel when asked (physOf), holding no expressions and no run-time
+// state; the Sel, which the plan cache keeps, holds each operator's details.
+// An arm takes its operator's details when step 4 ports it.
+pub type PPlan = closed {
+    Levels(int, []PSub)             // today's level chain (Query.levels: the tables in join order, each by its path and
+                                    // join method; semi and anti levels), its number of levels; its subqueries by number
+    Result([]PSub)                  // no FROM: one row if the WHERE holds; its subqueries
+    Func(str, bool, []PSub)         // a function or VALUES in FROM: its name (Sel.srf), WITH ORDINALITY; its arguments' subqueries
+    SetOp(int, bool, int, []PPlan, []PSub)  // lexdb_sql.SET_*, ALL, a recursive CTE's number (-1 none), its parts; the
+                                            // set's own subqueries
+    MinMax(PPlan)                   // MIN or MAX served by the scan's order: its first value not NULL
+    Agg(PPlan, bool)                // GROUP BY and the aggregates; true: grouping sets
+    Having(PPlan)
+    Window(PPlan)                   // the window calls (over the groups when it aggregates)
+    Project(PPlan)                  // the select list
+    Distinct(PPlan, bool)           // true: DISTINCT ON
+    Sort(PPlan, bool)               // ORDER BY: true sorted (a top-N under a LIMIT), false the scan's order
+    Lock(PPlan)                     // FOR UPDATE and the like
+    Limit(PPlan, bool)              // LIMIT, OFFSET, FETCH, TOP; true: it stops the scan (no aggregate or sort under it)
+    Match(PPlan)                    // MATCH_RECOGNIZE over the query's rows
+}
+
+// A subquery of a query: what it is (lexdb_sql.SUB_*), how the executor
+// runs it (RUN_*), NOT EXISTS's (an anti join) for RUN_SEMI and
+// RUN_LOOKED, and its plan.
+pub type PSub = record { pub use: int; pub run: int; pub anti: bool; pub plan: PPlan }
+
+pub const RUN_ONCE: int = 0         // no outer values: once per execution, before the query (in FROM: its rows)
+pub const RUN_PER_ROW: int = 1      // correlated: per row of the query, its results kept per outer values (an Apply)
+pub const RUN_HASHED: int = 2       // correlated, decorrelated (9.9): once, by its keys "inner = outer", probed per row
+pub const RUN_SEMI: int = 3         // a semi or anti join's (9.104): once, its rows a level's hash
+pub const RUN_LOOKED: int = 4       // not run: its table is a semi or anti level looked up per row (semiLook)
+
+// The subqueries of p's query: its leaf's.
+pub fn pSubs(p: &PPlan): &[]PSub {
+    match p {
+        PPlan.Levels(_, s) { return &s }
+        PPlan.Result(s) { return &s }
+        PPlan.Func(_, _, s) { return &s }
+        PPlan.SetOp(_, _, _, _, s) { return &s }
+        PPlan.MinMax(i) { return pSubs(&i) }
+        PPlan.Agg(i, _) { return pSubs(&i) }
+        PPlan.Having(i) { return pSubs(&i) }
+        PPlan.Window(i) { return pSubs(&i) }
+        PPlan.Project(i) { return pSubs(&i) }
+        PPlan.Distinct(i, _) { return pSubs(&i) }
+        PPlan.Sort(i, _) { return pSubs(&i) }
+        PPlan.Lock(i) { return pSubs(&i) }
+        PPlan.Limit(i, _) { return pSubs(&i) }
+        PPlan.Match(i) { return pSubs(&i) }
+    }
+}
+
+// p's leaf: its Levels, Result, Func or SetOp.
+pub fn pLeaf(p: &PPlan): &PPlan {
+    match p {
+        PPlan.MinMax(i) { return pLeaf(&i) }
+        PPlan.Agg(i, _) { return pLeaf(&i) }
+        PPlan.Having(i) { return pLeaf(&i) }
+        PPlan.Window(i) { return pLeaf(&i) }
+        PPlan.Project(i) { return pLeaf(&i) }
+        PPlan.Distinct(i, _) { return pLeaf(&i) }
+        PPlan.Sort(i, _) { return pLeaf(&i) }
+        PPlan.Lock(i) { return pLeaf(&i) }
+        PPlan.Limit(i, _) { return pLeaf(&i) }
+        PPlan.Match(i) { return pLeaf(&i) }
+        else { return p }
+    }
+}
