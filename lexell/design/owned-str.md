@@ -48,10 +48,11 @@ special cases with it:
    an offset and a length, as `str` does today. A borrowed slice `&s[a..b]`
    stays free.
 6. **Literals.** A literal where a `&str` is expected stays a rootless static
-   view. Where an owned `str` is expected the choice is still open:
-   - an allocation;
-   - an immortal `rc str`;
-   - a static flag in the owned representation.
+   view. Where an owned `str` is expected it **allocates** a copy (decided
+   2026-11-17). An immortal `rc str` or a static flag inside the owned string
+   would also have worked, but each brings back special cases. A `str`
+   constant behaves the same way. Neither needs a source edit, so the sweep
+   does not count the `global` kind as an edit.
 
 ## 3. Migration plan
 
