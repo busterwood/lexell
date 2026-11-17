@@ -5252,23 +5252,6 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     for i in 0..len(subs) {
         if len(planned[i]) == 0 { append(mut &planned[i], try planSub(st, txn, &subs[i], params, sc, false)) }
         let sp = pop(mut &planned[i])
-        // a correlated EXISTS or IN of a semi-join's that 9.9 could not
-        // hash, its outer values a lookup's keys: planned again without
-        // them as keys, to be hashed if a hash costs less (semiJoins). Not
-        // where reading may stop early, nor in a transaction whose reads are
-        // noted: there the lookups' reads stand (as in the join order).
-        if semiCand[i] && !early && !txn.noting() && !txn.sql.rules && (sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) &&
-           len(sp.sel.q.refs) > 0 && !sp.hashed && sp.cte < 0 {
-            semiLooks[i] = true
-            sc.noRefKeys = true
-            let again = planSub(st, txn, &subs[i], params, sc, true)
-            sc.noRefKeys = false
-            let got = again.ok()
-            if got.isSome() {
-                let alt = got.unwrap()
-                if alt.hashed && semiAltOk(&alt, &sp) { semiAlts[i] = Some(alt) }
-            }
-        }
         let top = len(sc.names.frames) - 1
         append(mut &sc.names.frames[top].subRefs, cloneAll(&sp.sel.q.refs))
         append(mut &sc.names.frames[top].subOids, sp.oid)
@@ -5371,6 +5354,31 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
         None {}
     }
     q.lp = lp
+    // A correlated EXISTS or IN of a semi-join's that 9.9 could not hash,
+    // its outer values a lookup's keys: planned again without them as
+    // keys, to be hashed if a hash costs less (semiJoins). Not where
+    // reading may stop early, nor in a transaction whose reads are noted:
+    // there the lookups' reads stand (as in the join order). Planner work:
+    // after every subquery is numbered and typed.
+    if anySemi && !early && !txn.noting() && !txn.sql.rules {
+        for i in 0..len(subs) {
+            if !semiCand[i] { continue }
+            let sp = &q.subs[i]
+            if !((sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 && !sp.hashed && sp.cte < 0) { continue }
+            semiLooks[i] = true
+            sc.noRefKeys = true
+            let nf = len(sc.names.frames)
+            let again = planSub(st, txn, &subs[i], params, sc, true)
+            sc.noRefKeys = false
+            // (a plan that failed may have left its frame: this query's is the top one)
+            while len(sc.names.frames) > nf { let gone = pop(mut &sc.names.frames) }
+            let got = again.ok()
+            if got.isSome() {
+                let alt = got.unwrap()
+                if alt.hashed && semiAltOk(&alt, &q.subs[i]) { semiAlts[i] = Some(alt) }
+            }
+        }
+    }
     // the columns the SELECT names, for the index-only choice (9.31):
     // narrow's, but before the paths are chosen rather than after
     if !star {
