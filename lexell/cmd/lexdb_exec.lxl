@@ -2743,7 +2743,6 @@ fn isOuter(join: int): bool { return keepsLeft(join) || keepsRight(join) }
 pub type Query = record {
     levels: []Level
     cols: []lexdb_sql.ColDef    // the joined row's columns, named alias.column
-    bcols: []lexdb_bind.BCol    // the same as the binder's, cols[i] at slot i (addCol keeps them together)
     top: []Expr                 // no FROM: the WHERE
     subs: []SubPlan             // its subqueries, by number
     base: int                   // the statement's parameters; then refs' values
@@ -2760,9 +2759,9 @@ pub type Query = record {
     lp: lexdb_bind.LPlan        // FROM and WHERE as the binder gives them (buildQuery; planSelect moves it into Sel.lp)
 }
 
-// Column c added to q's joined row: at the next slot, in cols and bcols.
+// Column c added to q's joined row, at the next slot. (Its binder's
+// column, a BCol, is in q.lp's Get or Sub: buildQuery.)
 fn addCol(q: mut &Query, c: lexdb_sql.ColDef) {
-    append(mut &q.bcols, lexdb_bind.bcolOf(len(q.cols), &c))
     append(mut &q.cols, c)
 }
 
@@ -4983,7 +4982,7 @@ fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
 fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sql.FromItem,
               where: &Option[Expr], params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool,
               sc: mut &Scope, reorder: bool): Result[Query, DbErr] {
-    var q = Query{levels: [], cols: [], bcols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
+    var q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
     // this query's (its subqueries set their own)
     let early = sc.early
     sc.early = false
@@ -5147,6 +5146,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             }
         }
         let first = len(q.cols)
+        var icols: []lexdb_bind.BCol = []      // its columns in the row, as the binder's (the LPlan's)
         for k in 0..len(t.cols) {
             // a name repeated in one FROM item ((SELECT 1 AS a, 2 AS a) x,
             // unnest(a, b)): each its own column, the name ambiguous
@@ -5155,10 +5155,9 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             var qc = lexdb_sql.colDef(&(f.alias + "." + name), t.cols[k].typ, t.cols[k].notNull)
             qc.spell = t.cols[k].spell
             qc.coll = t.cols[k].coll
+            append(mut &icols, lexdb_bind.bcolOf(len(q.cols), &qc))
             addCol(mut &q, qc)
         }
-        var icols: []lexdb_bind.BCol = []
-        for i in first..len(q.bcols) { append(mut &icols, lexdb_bind.BCol{slot: i, name: q.bcols[i].name, spell: q.bcols[i].spell, ty: q.bcols[i].ty}) }
         if f.sub < 0 && f.work < 0 && viewSrc < 0 {
             append(mut &items, lexdb_bind.LPlan.Get(t.name.toStr(), f.alias.toStr(), icols))
         } else {
@@ -5328,10 +5327,9 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
             None {}
         }
         if k > 0 {
-            var jcols: []lexdb_bind.BCol = []
-            for i in 0..q.levels[k].first + len(q.levels[k].t.cols) {
-                append(mut &jcols, lexdb_bind.BCol{slot: i, name: q.bcols[i].name, spell: q.bcols[i].spell, ty: q.bcols[i].ty})
-            }
+            var jcols = lexdb_bind.lpCols(&lp)
+            let rc = lexdb_bind.lpCols(&items[k])
+            for c in rc { append(mut &jcols, lexdb_bind.BCol{slot: c.slot, name: c.name, spell: c.spell, ty: c.ty}) }
             lp = lexdb_bind.LPlan.Join(from[k].join, q.levels[k].lateral, lp, replace(mut &items[k], lexdb_bind.noPlan()), jon, jcols)
         }
     }
@@ -14366,7 +14364,11 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // each with the typmod a query reading it gives its column (outType's).
 fn outBCols(outs: &[]OutCol): []lexdb_bind.BCol {
     var out: []lexdb_bind.BCol = []
-    for i in 0..len(outs) { append(mut &out, lexdb_bind.outBCol(i, &outs[i], lexdb_bind.tyOf(&outType(&outs[i]), &outs[i].coll, false).mod)) }
+    for i in 0..len(outs) {
+        // (a typmod only from a dialect's wire hint: outType's, as buildQuery's row column has it)
+        let mod = if lexdb_syscat.hintCode(outs[i].scale) > 0 { lexdb_bind.tyOf(&outType(&outs[i]), &outs[i].coll, false).mod } else { -1 }
+        append(mut &out, lexdb_bind.outBCol(i, &outs[i], mod))
+    }
     return out
 }
 
@@ -14388,16 +14390,23 @@ fn selPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, exprs: []Expr, outs: &[]O
         lp = lexdb_bind.LPlan.Window(lp, wins, c)
     }
     lp = lexdb_bind.LPlan.Project(lp, exprs, outBCols(outs))
-    if s.distinct || len(on) > 0 { lp = lexdb_bind.LPlan.Distinct(lp, on, outBCols(outs)) }
-    return topPlan(lp, s, order, desc, nullsFirst, outs)
+    if s.distinct || len(on) > 0 {
+        let c = lexdb_bind.lpCols(&lp)
+        lp = lexdb_bind.LPlan.Distinct(lp, on, c)
+    }
+    return topPlan(lp, s, order, desc, nullsFirst)
 }
 
-// ORDER BY and LIMIT over lp, whose outputs are outs.
-fn topPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, order: []Expr, desc: []bool, nullsFirst: []bool, outs: &[]OutCol): lexdb_bind.LPlan {
+// ORDER BY and LIMIT over lp.
+fn topPlan(base: lexdb_bind.LPlan, s: &lexdb_sql.Stmt, order: []Expr, desc: []bool, nullsFirst: []bool): lexdb_bind.LPlan {
     var lp = base
-    if len(order) > 0 { lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, outBCols(outs)) }
+    if len(order) > 0 {
+        let c = lexdb_bind.lpCols(&lp)
+        lp = lexdb_bind.LPlan.Sort(lp, order, desc, nullsFirst, c)
+    }
     if s.limit.isSome() || s.offset.isSome() || s.withTies {
-        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, outBCols(outs))
+        let c = lexdb_bind.lpCols(&lp)
+        lp = lexdb_bind.LPlan.Limit(lp, optClone(&s.limit), optClone(&s.offset), s.withTies, s.topMode, c)
     }
     return lp
 }
@@ -14474,12 +14483,12 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let split = len(l.q.refs)
     let limit = try evalInt(&s.limit, params, "LIMIT", mut &sc.looks)
     let offset = try evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    let q = Query{levels: [], cols: [], bcols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
+    let q = Query{levels: [], cols: [], top: [], subs: [], base: sc.names.base, corr: false, refs: refs, implied: false, colAt: newMap(), pinned: false, noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan()}
     let lpl = replace(mut &l.lp, lexdb_bind.noPlan())
     let lpr = replace(mut &r.lp, lexdb_bind.noPlan())
     let set = if s.rec { lexdb_bind.LPlan.Recursive(s.cte, lpl, lpr, outBCols(&outs)) }
               else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, outBCols(&outs)) }
-    let lp = topPlan(set, s, cloneAll(&order), copyBools(&desc), copyBools(&nullsFirst), &outs)
+    let lp = topPlan(set, s, cloneAll(&order), copyBools(&desc), copyBools(&nullsFirst))
     return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
