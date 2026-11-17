@@ -379,6 +379,40 @@ Types are nominal: two declarations make two types even with the same fields.
 `type A = B` declares an alias; `A` and `B` are then the same type. Generic
 types are equal when their declarations and arguments are equal.
 
+
+### 4.9 Counted handles: rc T
+
+`rc T` is a counted handle to a value of type `T` that does not change while
+it may be shared (design/owned-str.md). It is std's `Rc[T]`, a boxed record
+holding the count and the value. `rc` is a keyword only where a type is
+expected, so a variable may still be named `rc`.
+
+- **Making one.** `rc(v)` moves `v` into a new box and returns the first
+  handle.
+- **Handles are owned.** A handle is moved like any owned value.
+  `r.share()` returns another handle to the same box in O(1), and
+  `r.clone()` does the same: the value cannot change, so a deep copy could
+  not be told apart from it. The value is dropped, and the box freed, with
+  the last handle.
+- **Reading is transparent.** `r.f` reads a field of the value, `r.m()` calls
+  a method of the value (one not declared on `Rc` itself), `for x in r`
+  walks it, and a handle passed where a `&T` is expected lends the value.
+  These reads are places rooted at the handle, so a borrow of the value
+  keeps the handle alive (section 10).
+- **The value is immutable through a handle.** Assigning to it, mutably
+  borrowing it, or moving out of it is an error.
+- **Changing it.** `r.unshare()`, on a handle in a variable or field that may
+  be changed, returns `mut &T`. When `r` is the only handle, it lends the
+  value in place. Otherwise `r` gives up its share and gets a new box holding
+  a clone of the value (so `T` must be cloneable, section 4.7), and the other
+  handles keep the old value.
+- **Forwarded interfaces.** `==`, `cmp`, `hash` and `toStr` on handles forward
+  to the value when `T` has them.
+
+Because no handle can change a shared value, handles cannot form cycles.
+Every box is freed with its last handle, without a collector. Counts are not
+atomic: a handle must not cross to another OS thread (`par.map` workers).
+
 ## 5. Declarations and modules
 
 ### 5.1 Modules

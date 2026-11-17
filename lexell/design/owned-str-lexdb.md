@@ -36,8 +36,10 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | M | Issue 2, SPEC 4.2: in an array literal of shared borrows `&T`, an element that is a `T` is borrowed (a temporary lives to the end of the statement). `redis.command`, `send` and their method forms take `&[&str]`. | d11e72ae | yes: `&[]str` arguments still convert, and literals now need no clones. Code that passed `&[...]` literals of owned strings to redis keeps compiling. | none |
 
-All of design/owned-str.md section 6 has landed except `rc T` (the next
-step, not an issue on the list).
+| N | `rc T`, SPEC 4.9: counted handles to immutable values. `rc(v)` makes one; `share()`/`clone()` add a handle; transparent reads (fields, methods, `&T` arguments, `for`); `unshare()` gives `mut &T` (copy-on-write). `rc` is a keyword only in type position. | (this commit) | yes. New std names `Rc` and `rc`: a local variable named `rc` still works, but calling `rc(...)` inside its scope does not. | none |
+
+Still to come: `rc str` slices that share the bytes, `task.Shared`/`Frozen`
+on `rc`, and the switch itself.
 
 **At the switch, for string globals:** a string global passed to a function,
 returned or stored needs `g.clone()` (the sweep's `global` kind lists them;
@@ -65,6 +67,9 @@ forms from the start:
 - **H:** `make().field` moves the field out; don't clone it.
 - **I:** in `for x in f() { append(mut &out, x) }`, `x` is owned; drop the
   `.clone()`. To consume a variable's array, write `for x in move(xs)`.
+- **N:** a large buffer or structure that several owners read (cursors over
+  a reply, a parsed catalog, a plan) is an `rc T`: `share()` instead of
+  `clone()`.
 - **M:** an API that takes a list of strings to read should take `&[&str]`;
   call sites then pass `&["X", key, n.toStr()]` with no clones.
 - **L:** a string global read by a function call or a return becomes

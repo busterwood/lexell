@@ -59,6 +59,17 @@ special cases with it:
 
 ## 3. Migration plan
 
+**Borrow inference after the switch (decided 2026-11-17).** compiler/borrow.lxl
+has an optimisation (`-O`) that removes the hidden `rt_str_dup`/`rt_str_drop`
+pair around a `str` parameter its callee only reads, and a report
+(`--borrow-report`) of such parameters. With owned `str` and explicit
+`share`, no hidden counts are left, so the optimisation goes. The report is
+generalised to every owned parameter type (`rc T`, `str`, records, arrays): a
+parameter `p: T` that the callee only reads should be `p: &T`, which the
+implicit borrow makes free at every call site, and callers' `x.clone()` or
+`r.share()` for it can then go. It is the clean-up tool for the compiler
+migration and for lexdb.
+
 1. Measure (this note, section 4).
 2. Add the new pieces without changing existing behaviour: `rc T`, `share`,
    and the `Clone` interface. Under counted `str`, `clone` on a `str` takes a
@@ -189,7 +200,7 @@ implicit copy was. They need doing before or at the switch to owned `str`.
 
 ## 6. Language issues the migration exposed
 
-**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too. **Next:** `rc T` and `share`.
+**Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). **Next:** `rc str` slices, `Shared`/`Frozen` on `rc`, the generalised borrow report, then the compiler migration and the switch.
 
 **Decided 2026-11-17:** implement 1 (freeze only the borrowed path), 10
 (implicit shared borrow of arguments), 9 (a match moves a local at its last

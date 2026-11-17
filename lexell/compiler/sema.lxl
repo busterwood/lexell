@@ -291,6 +291,7 @@ pub type Program = record {
     pub std: int
     pub shared: int          // the TypeDecl of task.Shared (a lang item, SPEC 15), or -1
     pub where: int           // the TypeDecl of std.Where (a lang item, SPEC 15), or -1
+    pub rc: int              // the TypeDecl of std.Rc, what rc T names (design/owned-str.md), or -1
     pub main: int
     bcMemo: []int            // isBorrowClass per type: -1 unknown, 0, 1
     bcDecl: []int            // declBC per declaration: -1 unknown, 0, 1, 2 (being computed)
@@ -403,7 +404,7 @@ pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
     var pg = Program{libroots: libroots, mainFile: mainFile, mods: [], modIndex: newMapWith[str, int](fxHashStr), types: [],
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
-        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, main: -1, bcMemo: [], bcDecl: [],
+        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
         ownedStr: os.envOr("LXL_OWNED_STR", "") == "1"}
     let none: []int = []
     for p in 0..len(PRIM_NAMES) { pg.intern(TK_PRIM, p, 0, false, &none) }
@@ -503,6 +504,7 @@ pub fn (pg: &Program) tstr(t: int): str {
         TK_SELF { return "Self" }
         else {}
     }
+    if pg.isRc(t) { return "rc " + pg.tstr(pg.ti(t, 0)) }
     var b = newStrBuf()
     b.add(&pg.types[pg.ta(t)].name)
     if pg.tn(t) > 0 {
@@ -677,6 +679,9 @@ pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
 // elements; task.Shared (another handle); a record or closed type with no drop method, holding no
 // borrows, whose fields are each cloneable or have a clone method. A type that contains itself is
 // cloneable when the rest of it is.
+// Whether t is rc T (std.Rc[T]).
+pub fn (pg: &Program) isRc(t: int): bool { return pg.rc >= 0 && pg.tk(t) == TK_INST && pg.ta(t) == pg.rc }
+
 pub fn (pg: mut &Program) cloneable(t: int): bool {
     var seen: []int = []
     return pg.cloneableAt(t, mut &seen)
@@ -706,7 +711,7 @@ fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
     if k != TK_INST { return false }
     if pg.methodOf(t, "clone") >= 0 { return true }
     let d = pg.ta(t)
-    if d == pg.shared { return true }
+    if d == pg.shared || d == pg.rc { return true }       // another handle (rc: the value never changes)
     if pg.types[d].drop >= 0 || pg.isBorrowClass(t) { return false }
     for x in seen {
         if x == t { return true }
@@ -983,6 +988,8 @@ fn (pg: mut &Program) collect(m: int) {
                 }
                 // SPEC 15: std.Where, a value record { p: ptr }, is a call site
                 if pg.mods[m].isStd && n.s == "Where" && n.b == sx.F_RECORD && pg.types[d].value { pg.where = d }
+                // std.Rc, a record { n: int; v: T }, is what rc T names: a counted handle
+                if pg.mods[m].isStd && n.s == "Rc" && n.b == sx.F_RECORD && !pg.types[d].value { pg.rc = d }
                 if n.b == sx.F_CLOSED {
                     for i in 0..pg.count(m, n.c) {
                         let vn = pg.item(m, n.c, i)
@@ -1271,7 +1278,7 @@ fn posWhat(pos: int): str {
 // or 0 (ref's '').
 fn (pg: &Program) typeWhere(m: int, a: int): int {
     var x = a
-    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE {
+    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE || pg.kind(m, x) == sx.N_TRC {
         x = pg.nd(m, x).a
     }
     let k = pg.kind(m, x)
@@ -1308,6 +1315,11 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
             return pg.mkSlice(pg.resolveType(n.a, m, env, P_ELEM, where), isMut)
         }
         sx.N_TARR { return pg.mkArr(pg.resolveType(n.a, m, env, P_ELEM, where)) }
+        sx.N_TRC {
+            if pg.rc < 0 { pg.err(m, pg.orWhere(where, m, a), "rc T needs std.Rc") }
+            let inner = pg.resolveType(n.a, m, env, P_TARG, where)
+            return pg.mkInst(pg.rc, &[inner])
+        }
         sx.N_TFN {
             if n.flags & sx.EXTERN != 0 {
                 pg.err(m, n.line, "an extern fn type can only be the type of a parameter of an extern function")

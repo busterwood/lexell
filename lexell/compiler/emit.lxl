@@ -301,6 +301,11 @@ fn (e: mut &Emitter) cloneC(t: int, cc: int): int {
         }
     }
     if e.c.pg.isCopyLegacy(t) { return e.dupC(t, cc) }
+    if e.c.pg.isRc(t) {
+        // another handle: (cc->f_n = cc->f_n + 1) ? cc : cc, the count being at least 1 (cc is a place)
+        let nf = e.c.x.arrow(cc, "f_n")
+        return e.c.x.par(e.c.x.cond(e.c.x.par(e.c.x.asg(nf, e.c.x.bin("+", nf, e.c.x.lit(1)))), cc, cc))
+    }
     let g = e.glueFn(G_CLONE, t)
     return e.call(&g, [cc])
 }
@@ -654,6 +659,24 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         let c = e.c.x.callx(e.c.x.par(e.c.x.cast(e.ct(&ct), e.nm("e"))), avs)
         let st = if rc == "void" { e.c.x.sx(c) } else { e.c.x.sret(c) }
         e.define(&n, &rc, ps, pns, [st], -1)
+        return
+    }
+    if (kind == G_DROP || kind == G_ACT || kind == G_REST) && e.c.pg.isRc(t) {
+        // rc T (design/owned-str.md): one handle fewer; the last drops the value and frees the box
+        let vt = e.c.pg.targs(t)[0]
+        var body: []int = []
+        if kind != G_DROP { append(mut &body, e.c.x.decl(e.ct(&ct), "v", e.nm("p"))) }
+        let nf = e.c.x.arrow(e.nm("v"), "f_n")
+        append(mut &body, e.c.x.sx(e.c.x.asg(nf, e.c.x.bin("-", nf, e.c.x.lit(1)))))
+        append(mut &body, e.c.x.sif(e.c.x.bin("==", nf, e.c.x.lit(0))))
+        if !e.pod(vt) { append(mut &body, e.c.x.sx(e.dropC(vt, e.c.x.arrow(e.nm("v"), "f_v")))) }
+        append(mut &body, e.callS("rt_free", [e.nm("v")]))
+        append(mut &body, e.c.x.send())
+        if kind == G_DROP {
+            e.define(&n, "void", [ct], ["v"], body, -1)
+        } else {
+            e.define(&n, "void", ["void*"], ["p"], body, -1)
+        }
         return
     }
     if kind == G_DROP || kind == G_ACT || kind == G_REST {

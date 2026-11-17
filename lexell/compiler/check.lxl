@@ -1667,6 +1667,11 @@ fn (c: mut &Checker) immutable(v: Val, line: int, verb: str): never {
         if isB && !c.pg.tm(c.vars[r].t) {
             c.err(line, "cannot " + vb + " through '" + name + "': it is a shared borrow (&), not mut &")
         }
+        let base0 = if isB { c.pg.ta(c.vars[r].t) } else { c.vars[r].t }
+        if v.viaref && c.pg.isRc(base0) {
+            c.err(line, "cannot " + vb + " the value of the rc handle '" + name + "': it does not change while " +
+                "it may be shared (" + name + ".unshare() lends it as mut &)")
+        }
         if v.viaref && !isB { c.err(line, "cannot " + vb + " through a shared borrow or slice of '" + name + "'") }
         if c.vars[r].kind == VK_PARAM { c.err(line, "cannot " + verb + " parameter '" + name + "': declare it `var " + name + "`") }
         c.err(line, "cannot " + verb + " '" + name + "': it is declared with let, not var")
@@ -2531,6 +2536,7 @@ fn (c: mut &Checker) sFor(s: int) {
     }
     var v = c.expr(n.a, -1)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
+    while c.pg.isRc(v.t) { v = c.rcValue(v) }       // SPEC 4.9: for x in r walks the value
     let k = c.pg.tk(v.t)
     if k != sema.TK_ARR && k != sema.TK_SLICE {
         if k == sema.TK_INST || k == sema.TK_TP {
@@ -3554,8 +3560,67 @@ fn (c: mut &Checker) xField(e: int, exp: int): Val {
     return c.fieldOf(v, &n.s, n.line)
 }
 
+// rc T (design/owned-str.md, SPEC 4.9): the value an rc handle holds, as a place rooted at the handle
+// (a borrow of it keeps the handle alive) that cannot be assigned, mutably borrowed or moved out of.
+fn (c: mut &Checker) rcValue(v0: Val): Val {
+    var v = c.deref(v0)
+    if v.cat == CAT_RV { v = c.holdtmp(v.c, v.t) }
+    let vt = c.pg.targs(v.t)[0]
+    var r = val(c.x.member(v.c, "->", "f_v"), vt, CAT_PLACE)
+    r.root = v.root
+    r.path = pathAdd(&v.path, "v")
+    r.mutable = false
+    r.viaref = true
+    r.gk = v.gk
+    r.gi = v.gi
+    r.cr = v.cr
+    return r
+}
+
+// r.unshare() (SPEC 4.9): a mut & of the value of the rc handle r, which must be a mutable place. The
+// only handle lends its own value; otherwise r gives up its share and gets a new box holding a clone.
+//     if (r->n > 1) { r->n -= 1; Rc* q = rt_alloc(sizeof *q); q->n = 1; q->v = clone(r->v); r = q; }
+fn (c: mut &Checker) rcUnshare(recv: Val, t: int, line: int): Val {
+    let v = c.deref(recv)
+    if v.cat != CAT_PLACE { c.err(line, "unshare needs an rc handle in a variable or field: it changes the handle") }
+    if !v.mutable { c.immutable(v, line, "unshare") }
+    let vt = c.pg.targs(t)[0]
+    if !c.pg.cloneable(vt) && c.pg.methodOf(vt, "clone") < 0 {
+        c.err(line, "unshare needs a value it can clone, and " + c.tstr(vt) + " cannot be cloned: " + c.pg.cloneBlocker(vt))
+    }
+    c.frozenAt(v.root, &v.path, FR_MUT, line)
+    c.checkPending(v.root, &v.path, line, false)
+    let nf = c.x.arrow(v.c, "f_n")
+    c.emit(c.x.sif(c.x.bin(">", nf, c.lit(1))))
+    c.cx.ind += 1
+    c.emitx(c.x.asg(nf, c.x.bin("-", nf, c.lit(1))))
+    let q = c.fresh("rq")
+    let qn = c.nm(&q)
+    c.emit(c.x.decl(c.T(t), &q, c.x.call("rt_alloc", [c.x.szof(c.x.pre("*", qn))])))
+    c.emitx(c.x.asg(c.x.arrow(qn, "f_n"), c.lit(1)))
+    let src = c.x.arrow(v.c, "f_v")
+    let cl = if c.pod(vt) { src } else { c.hole(mkHoleX(H_CLONE, vt, src)) }
+    c.emitx(c.x.asg(c.x.arrow(qn, "f_v"), cl))
+    c.emitx(c.x.asg(v.c, qn))
+    c.cx.ind -= 1
+    c.emit(c.x.send())
+    var p = val(c.x.member(v.c, "->", "f_v"), vt, CAT_PLACE)
+    p.root = v.root
+    p.path = pathAdd(&v.path, "v")
+    p.mutable = true
+    p.gk = v.gk
+    p.gi = v.gi
+    return c.borrow(p, true, line, false)
+}
+
+// Whether name on an rc handle reaches the value (outside std, every field name does).
+fn (c: &Checker) rcReaches(name: &str): bool {
+    return c.cx.mod != c.pg.types[c.pg.rc].mod || (name != "n" && name != "v")
+}
+
 fn (c: mut &Checker) fieldOf(v0: Val, name: &str, line: int): Val {
-    let v = c.deref(v0)
+    var v = c.deref(v0)
+    while c.pg.isRc(v.t) && c.rcReaches(name) { v = c.rcValue(v) }
     let t = v.t
     let isInst = c.pg.tk(t) == sema.TK_INST
     if !isInst || c.pg.types[c.pg.ta(t)].form != sx.F_RECORD {
@@ -5013,6 +5078,16 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             }
             // SPEC 7 (design/owned-str.md, issue 10): a value passed to a shared borrow parameter is
             // borrowed as if written &x; a temporary lives to the end of the statement
+            if !isrecv && !pm {
+                // rc T (SPEC 4.9): a handle passed where a &T is expected lends the value it holds
+                var hv = if c.pg.tk(v.t) == sema.TK_REF { c.pg.ta(v.t) } else { v.t }
+                while c.pg.isRc(hv) {
+                    var trial = copyInts(&bind)
+                    if c.pg.unify(c.pg.ta(pt), hv, mut &trial, &tps) { break }
+                    v = c.rcValue(v)
+                    hv = v.t
+                }
+            }
             let implicit = c.pg.tk(v.t) != sema.TK_REF && !isrecv
             if implicit && v.t == sema.T_VOID { c.err(line, what + " has no value") }
             if implicit && v.cat == CAT_RV && !c.isCopy(v.t) { v = c.holdtmp(v.c, v.t) }
@@ -5495,8 +5570,10 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         if st.k == ST_NONE {
             let recv = c.expr(fn1.a, -1)
             let base = if c.pg.tk(recv.t) == sema.TK_REF { c.pg.ta(recv.t) } else { recv.t }
-            if fn1.s == "clone" && len(args) == 0 && c.pg.tk(base) != sema.TK_TP && c.pg.methodOf(base, "clone") < 0 &&
-                    c.pg.cloneable(base) {
+            if fn1.s == "unshare" && len(args) == 0 && c.pg.isRc(base) { return c.rcUnshare(recv, base, n.line) }
+            let rcShare = fn1.s == "share" && len(args) == 0 && c.pg.isRc(base)
+            if rcShare || (fn1.s == "clone" && len(args) == 0 && c.pg.tk(base) != sema.TK_TP &&
+                    c.pg.methodOf(base, "clone") < 0 && c.pg.cloneable(base)) {
                 // design/owned-str.md: the built-in clone, a copy (counts) of a type copied while str is
                 // counted, a deep copy (clone glue) of any other cloneable type
                 let v = c.rd(recv)
@@ -5517,16 +5594,23 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
                 c.err(n.line, c.tstr(base) + " cannot be cloned: " + c.pg.cloneBlocker(base) +
                     " (give it a clone method to clone it)")
             }
-            let sig = c.methodSig(base, &fn1.s, n.line, c.pg.tk(base) == sema.TK_INST)
+            var recv2 = recv
+            var base2 = base
+            while c.pg.isRc(base2) && c.pg.methodOf(base2, &fn1.s) < 0 && c.rcReaches(&fn1.s) {
+                // a method of the value: called on the value the handle holds (immutable)
+                recv2 = c.rcValue(recv2)
+                base2 = recv2.t
+            }
+            let sig = c.methodSig(base2, &fn1.s, n.line, c.pg.tk(base2) == sema.TK_INST)
             if sig.kind < 0 {
-                let fv = c.fieldOf(recv, &fn1.s, n.line)
+                let fv = c.fieldOf(recv2, &fn1.s, n.line)
                 return c.callValue(fv, e, exp)
             }
             c.implicitWhere(&sig, true, mut &args, n.line)
             var o = noOpts()
             o.targs = targs
             o.rast = fn1.a
-            return c.call(&sig, true, recv, &args, n.line, exp, &o)
+            return c.call(&sig, true, recv2, &args, n.line, exp, &o)
         }
     }
     let st = c.static(f)
