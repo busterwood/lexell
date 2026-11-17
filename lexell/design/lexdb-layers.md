@@ -3645,6 +3645,30 @@ Steps 1 and 2 are independent and can run at the same time, one agent each
 (the two-agent limit). Step 3 needs step 2. Steps 4–7 are sequential.
 Main stays green after every step.
 
+**Revised order (agreed with the owner, 2026-11-17, after 2e slice 3c):**
+2 (through 2e slice 3c) → **3** → **5** → 4 → 6 → 7.
+
+- Steps 1–4 change no behaviour, and TPC-H's worst gaps (q19 14×, q20 12×,
+  q21 10.5×, q22 8.5× PostgreSQL on one core at `94536d12`) are plan
+  shape, not executor speed. So unnesting moves ahead of the pipeline
+  executor, and the first deliberate TPC-H gains no longer wait for all
+  of step 4.
+- Step 5 is a rewrite of the logical plan (layer 5's rewrites), and
+  today's executor already runs hash semi-joins and anti-joins (lexdb.md
+  9.104). It runs on today's executor through step 3's `Levels` operator;
+  a mark join, if needed, is added there and ported in step 4 with the
+  rest. Step 4 then ports operators for plans that already have the right
+  shape.
+- Deferred until something needs them: 2e slice 3d (`bindFrom` into
+  `lexdb_bind`) and 2e slice 4 (each expression bound against its
+  operator's own input; eval's name check dropped). Their notes stay in
+  4.4.1.
+- Optional, beside step 5: the OR-across-tables filters for q19
+  (joinorder's `orHull`, parked on `perf/joinorder` 6e514a3f).
+- Gates for these refactor steps are light: the suite, the 22 checksums,
+  and one TPC-H run of the branch against main's stored result; point
+  selects only where per-statement planning or the row path changes.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
