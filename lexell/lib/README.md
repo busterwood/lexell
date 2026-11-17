@@ -1993,7 +1993,9 @@ Intrinsics: `strByte`, `strSlice`, `strFromBytes`, `strToBytes`, `intToStr`,
 of any byte of a set, of a string, of a position `p` with `s[p + i1]` in one
 set and `s[p + i2]` in another; 16 bytes a step with SSE2, for the regex
 prefilters), `appendStr(mut &bytes, s)` (the bytes of `s` at the end of a
-`[]byte` in one copy: `StrBuf.add`), and the built-ins `isNull`, `exit`,
+`[]byte` in one copy: `StrBuf.add`), `strStatic(s)` (a copy of `s` that is
+never freed, so its copies and clones share the bytes: for strings that live
+until the program exits, such as a compiler's names), and the built-ins `isNull`, `exit`,
 `panic`. `task` also uses the library-only intrinsics `intoPtr` and
 `fromPtr` (SPEC 15), to keep a task's argument and result and a `Shared`
 value in the runtime's structures.

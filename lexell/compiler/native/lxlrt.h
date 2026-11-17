@@ -53,6 +53,7 @@ uint64_t rt_str_word(lxl_str s, int64_t i, const char* w);
 lxl_str rt_str_sub(lxl_str s, int64_t a, int64_t b, const char* w);
 lxl_str rt_str_view(lxl_str s, int64_t a, int64_t b, const char* w);
 lxl_str rt_str_from_bytes(lxl_slice b);
+lxl_str rt_str_static(lxl_str s);
 lxl_str rt_str_from_c(void* p);
 int64_t rt_str_find_byte(lxl_str s, int64_t from, uint8_t c);
 int64_t rt_str_find_any(lxl_str s, int64_t from, lxl_str set);

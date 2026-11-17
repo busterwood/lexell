@@ -54,6 +54,8 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | W | `task.Frozen` is deleted: use `rc T` (step 7). | f92dcdb1 | no: lexdb_time.lxl uses it | none |
 
+| X | `strStatic(s)` (SPEC 11): a copy never freed, whose clones are free. Clone glue leaves static `str` fields as copied. `LXL_RCSTAT=sites` and tools/strsites.py count heap string copies by site. | (this commit) | no | none |
+
 **What the switch does to lexdb, beyond strings:** `Shared` handles become
 owned, so lexdb's implicit `Shared` copies (32 lines mention `task.Shared`)
 need `share()`, and `task.Frozen` goes, so lexdb_time.lxl's three
@@ -160,6 +162,10 @@ until this is done. Do it on the lexdb branch.
    and TNS clients (change O). Look for these in the storage, wire and
    executor layers after the mechanical pass: a clone there is now a copy of
    the bytes (change U).
+   To find the clones that cost the most, build with `LXL_RCSTAT=sites` and
+   run a workload: `tools/strsites.py` lists the copies by clone site. Strings
+   kept until exit (catalog names, say) can be made with `strStatic(s)`, so
+   their clones are free (change X).
 6. **Verify.** lexdb compiles. Its suite passes (`LXL_NOCACHE=1`, the native
    compiler; see the project's lexdb test notes). The quick gate passes. Run
    the lexdb benchmarks against `main` before the merge, and log them as the

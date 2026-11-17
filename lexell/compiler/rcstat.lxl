@@ -184,6 +184,46 @@ pub fn instrument(p: mut &ir.Ir) {
     writeFd(2, "rcstat: " + intToStr(nb) + " of " + intToStr(nc) + " owned-convention str parameters found borrowed\n")
 }
 
+// LXL_RCSTAT=sites: every rt_str_dup becomes rt_str_dup_k with kind 3 + a number of its own, and
+// the compiler lists the numbers ("strsite K FUNCTION LINE", to stderr). The program counts the
+// copies of heap strings (cap > 0) at each site and prints "strsite K COPIES BYTES" at exit, so
+// the clones that cost the most can be found (tools/strsites.py joins the two).
+pub fn sites(p: mut &ir.Ir) {
+    var dupF = -1
+    var dupK = -1
+    for f in 0..p.nRtFuncs {
+        if p.funcs[f].name == "rt_str_dup" { dupF = f }
+        if p.funcs[f].name == "rt_str_dup_k" { dupK = f }
+    }
+    if dupF < 0 || dupK < 0 { return }
+    var next = 3
+    for f in p.nRtFuncs..len(p.funcs) {
+        if p.funcs[f].body >= 0 { siteWalk(p, f, p.funcs[f].body, 0, dupF, dupK, mut &next) }
+    }
+}
+
+fn siteWalk(p: mut &ir.Ir, f: int, x: int, line: int, dupF: int, dupK: int, next: mut &int) {
+    if x < 0 { return }
+    let ln = if p.nodes[x].line > 0 { p.nodes[x].line } else { line }
+    let ks = kids(p, x)
+    for k in ks { siteWalk(p, f, k, ln, dupF, dupK, next) }
+    if p.nk(x) != ir.E_CALL || callee(p, x) != dupF { return }
+    let ft = p.funcs[dupK].ty
+    append(mut &p.nodes, ir.Node{k: ir.E_FUNC, ty: ft, line: 0, a: dupK, b: -1, c: -1, d: -1, v: 0})
+    let fn0 = len(p.nodes) - 1
+    append(mut &p.nodes, ir.Node{k: ir.E_DECAY, ty: p.ptrTo(ft), line: 0, a: fn0, b: -1, c: -1, d: -1, v: 0})
+    let dec = len(p.nodes) - 1
+    append(mut &p.nodes, ir.Node{k: ir.E_INT, ty: ir.TY_I64, line: 0, a: -1, b: -1, c: -1, d: -1, v: next})
+    let ki = len(p.nodes) - 1
+    let args: []int = [p.listAt(p.nodes[x].b, 0), ki]
+    let l = p.list(&args)
+    p.nodes[x].a = dec
+    p.nodes[x].b = l
+    p.nodes[x].c = ft
+    writeFd(2, "strsite " + intToStr(next) + " " + p.funcs[f].name + " " + intToStr(ln) + "\n")
+    next += 1
+}
+
 fn rewrite(p: mut &ir.Ir, s: &St, f: int, x: int, px: int, i: int) {
     let ks = kids(p, x)
     for j in 0..len(ks) { rewrite(p, s, f, ks[j], x, j) }

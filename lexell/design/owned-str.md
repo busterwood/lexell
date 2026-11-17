@@ -273,6 +273,30 @@ implicit copy was. They need doing before or at the switch to owned `str`.
   borrow would work. A report like `LXL_PARAM_REPORT` for local clones
   whose result is never consumed would find them.
 
+**Outcome after the merge (2026-11-17).** The compiler's self-build had
+become 5.6% slower than stage 1. Profiles, with a per-site copy count
+(`LXL_RCSTAT=sites`, tools/strsites.py), found three causes, all fixed:
+- **Node accessors.** `c.nd(n)` and `pg.nd(m, n)` now return `&sx.Node`
+  (a borrow). Where the caller changes the checker while it holds the node,
+  `node()` returns the clone as before (about 70 sites).
+- **Strings that live as long as the compiler.** Token text, the AST's and
+  the C template's strings, and the IR's function, global and local names are
+  made with `strStatic(s)`, a new intrinsic (SPEC 11): a copy that is never
+  freed, so its copies and clones are free, as a literal's are. One
+  self-build made 1.84 million heap string copies (16.7 MB) before and
+  0.39 million after.
+- **Clone and dup glue rewrote static string fields.** A record clone wrote
+  each `str` field back with an equal value through `rt_str_dup`. Its 8-byte
+  stores then stalled the 16-byte loads of the record copy that followed
+  (store forwarding), which made `node()` cost twice what it did in stage 1.
+  The glue now leaves a field with cap 0 as copied.
+User time of the native self-build: stage 1 0.415 s, after the merge
+0.443 s, now 0.418 s; peak memory 199 MB, 192 MB, now 177 MB.
+
+`Shared.with` was not moved onto `rc`: a mutable `rc` would break the rule
+that handles cannot form cycles (SPEC 4.9). `unshare()` changes an `rc`
+value within a thread, and `task.Shared` across threads.
+
 ## 6. Language issues the migration exposed
 
 **Done 2026-11-17:** 1, 10, 9, 4 (first group), then 3, 6, 5, 11 and 7 (group A; 7 is spec only: it follows from the rules once `str` is owned, and red-team test rt2_g09's str half becomes an error test at the switch). 8 and 2 (group B) done too, then `rc T` (SPEC 4.9). Then the `rc` reads and the TDS/TNS cursors on `rc str`, the parameter report, and `Shared`/`Frozen`: `share()` everywhere a `Shared` is copied (outside lexdb), `Frozen` deprecated for `rc`. **Stage 1 of the switch done (2026-11-17):** `str` and `Shared` handles are owned in the language; the runtime still counts string blocks (clone is a count change). `LXL_OWNED_STR=1` (or `LXL_OWNED_SHARED=1`) is now the migration mode: sites that relied on implicit copies are logged and checking goes on. Conformance tests whose subject was copying were rewritten for owned semantics (two renamed: s04_value_record_with_str_is_owned, s04_str_clone_independent; rt2_g09's str half is the error test rt2_g09b). **Stage 2 done (2026-11-17)**: owned buffers in the runtime (section 2a).

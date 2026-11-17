@@ -1060,6 +1060,15 @@ lxl_str rt_str_of(const char* p, int64_t len) {
    counts (design/owned-str.md), so a par worker copies and frees as any thread does. */
 lxl_str rt_str_dup(lxl_str s) { return s.cap == 0 ? s : rt_str_of(RT_SP(s), s.len); }
 void rt_str_drop(lxl_str s) { if (s.cap) rt_free(s.p); }
+/* strStatic(s): a copy of s whose bytes are never freed, so copies of it share them (cap 0).
+   LXL_CHECK does not count them. */
+lxl_str rt_str_static(lxl_str s) {
+    if (s.cap == 0) return s;
+    lxl_str r = rt_str_of(RT_SP(s), s.len);
+    if (r.cap && rt_check) rt_live_add(-1);
+    r.cap = 0;
+    return r;
+}
 bool rt_str_eq(lxl_str a, lxl_str b) {
     return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
 }
@@ -4245,7 +4254,24 @@ static void rt_rcs_print(void) {
         write_all(2, ")\n", 2);
     }
 }
+/* LXL_RCSTAT=sites: kind 3 + a site's number; heap copies and their bytes, by site */
+#define RCS_SITES 65536
+static int64_t rt_rcs_site[RCS_SITES][2];
+static void rt_rcs_sites_print(void) {
+    for (int64_t k = 0; k < RCS_SITES; k++) {
+        if (!rt_rcs_site[k][0]) continue;
+        rt_rcs_put("strsite ", k);
+        rt_rcs_put(" ", rt_rcs_site[k][0]);
+        rt_rcs_put(" ", rt_rcs_site[k][1]);
+        write_all(2, "\n", 1);
+    }
+}
 lxl_str rt_str_dup_k(lxl_str s, int64_t k) {
+    if (k >= 3) {
+        rt_rc_report = rt_rcs_sites_print;
+        if (s.cap && k < RCS_SITES) { rt_rcs_site[k][0]++; rt_rcs_site[k][1] += s.len; }
+        return rt_str_dup(s);
+    }
     rt_rc_report = rt_rcs_print;
     rt_rcs[k][0][s.cap != 0]++;
     return rt_str_dup(s);

@@ -195,8 +195,8 @@ its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`
 without copying them, and so does `s[a..b]` where a `&str` is expected;
 elsewhere `s[a..b]` is a new owned `str` holding a copy of those bytes. In the
 runtime a string owns a buffer of the heap, except the static bytes of
-literals and constants, which are never freed and which copies may share
-(design/owned-str.md, "Stage 2"). A view
+literals and constants (and of `strStatic`, section 11), which are never
+freed and which copies may share (design/owned-str.md, "Stage 2"). A view
 is a borrow (sections 4.5 and 10): its root is the root of `s`. A `&str` does
 not convert to `str` by itself: where an owned string is needed, write
 `s.clone()`. `mut &str` borrows a `str` variable or
@@ -1074,6 +1074,7 @@ including `print`, `println`, string formatting and parsing, is in `std`.
 | `panic(msg)` | print `Lexell: panic: msg` and stop with exit code 12 |
 | `assert(c)` | `panic("assertion failed")` with the line, when `c` is false |
 | `exit(code)` | stop the program with `code`, without drops (and without the `LXL_CHECK` leak check) |
+| `strStatic(s)` | a copy of `s` whose bytes are never freed, like a literal's: copies and clones of it share them. For strings that live until the program exits (a compiler's names); it is not a leak for `LXL_CHECK` |
 
 String and runtime intrinsics used by `std` (`strByte`, `strSlice`,
 `strFromBytes`, `strToBytes`, `appendStr`, `intToStr`, `floatToStr`, `parseFloat`,
