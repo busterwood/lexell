@@ -38,7 +38,7 @@ the reasons are in [owned-str.md](owned-str.md).
 
 | N | `rc T`, SPEC 4.9: counted handles to immutable values. `rc(v)` makes one; `share()`/`clone()` add a handle; transparent reads (fields, methods, `&T` arguments, `for`); `unshare()` gives `mut &T` (copy-on-write). `rc` is a keyword only in type position. | 48716697 | yes. New std names `Rc` and `rc`: a local variable named `rc` still works, but calling `rc(...)` inside its scope does not. | none |
 
-| O | `rc` reads, SPEC 4.9: `len`, indexing, slicing, operators, value parameters, returns and `let`s of `&T` all reach an `rc` handle's value. The TDS and TNS clients keep replies in an `rc str`; their cursors share them. | (this commit) | yes (lexdb's TDS and TNS programs compile; the offline suites pass) | none |
+| O | `rc` reads, SPEC 4.9: `len`, indexing, slicing, operators, value parameters, returns and `let`s of `&T` all reach an `rc` handle's value. The TDS and TNS clients keep replies in an `rc str`; their cursors share them. | 64bf43d0 | yes (lexdb's TDS and TNS programs compile; the offline suites pass) | none |
 
 `rc str` needs no slicing of its own: a reader of a shared buffer is
 `rc str` plus positions (the cursor pattern), and a substring is a borrowed
