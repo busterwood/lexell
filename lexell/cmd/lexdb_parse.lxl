@@ -1060,7 +1060,7 @@ fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
 // 1 and leaves the rest.
 fn bitInt(x: Expr): Expr {
     match x {
-        Expr.Col(_) { return Expr.Call("#bitint", [x], false) }
+        Expr.Col(_, _) { return Expr.Call("#bitint", [x], false) }
         Expr.Param(_) { return Expr.Call("#bitint", [x], false) }
         else { return x }
     }
@@ -1198,7 +1198,7 @@ fn cloneE(x: &Expr): Expr {
     match x {
         Expr.Lit(v) { return Expr.Lit(v) }
         Expr.Param(n) { return Expr.Param(n) }
-        Expr.Col(n) { return Expr.Col(n) }
+        Expr.Col(n, s) { return Expr.Col(n, s) }
         Expr.Unary(op, a) { return Expr.Unary(op, cloneE(&a)) }
         Expr.Bin(op, a, b) { return Expr.Bin(op, cloneE(&a), cloneE(&b)) }
         Expr.IsNull(a, neg) { return Expr.IsNull(cloneE(&a), neg) }
@@ -1442,7 +1442,7 @@ fn (p: mut &P) rowSub(op: &str, row: &Expr): Result[Expr, lexdb_base.DbErr] {
     var cols: []Expr = []
     for i in 0..len(xs) {
         append(mut &names, "#" + (i + 1).toStr())
-        append(mut &cols, Expr.Col("#row.#" + (i + 1).toStr()))
+        append(mut &cols, Expr.Col("#row.#" + (i + 1).toStr(), -1))
     }
     append(mut &w.from, FromItem{table: "", alias: "#row", join: J_FIRST, on: None, sub: inner, cols: names, work: -1, lateral: false, using: [], natural: false, comma: false})
     var item = Expr.Lit(Val.Null)
@@ -1472,7 +1472,7 @@ fn (p: mut &P) arrayOfSub(): Result[Expr, lexdb_base.DbErr] {
     let inner = try p.subquery(SUB_FROM)
     var w = lexdb_sql.newStmt(S_SELECT)
     append(mut &w.from, FromItem{table: "", alias: "#arr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
-    let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a")], false)
+    let agg = Expr.Call("array_agg", [Expr.Col("#arr.#a", -1)], false)
     append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Lit(Val.Text("{}"))], false)), alias: "array", spell: ""})
     w.subs = replace(mut &p.subs, saved)
     w.use = SUB_SCALAR
@@ -1905,7 +1905,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 name = col + "." + c3
             }
         }
-        return Ok(Expr.Col(name))
+        return Ok(Expr.Col(name, -1))
     }
     return Err(near(&t))
 }
@@ -1961,18 +1961,18 @@ fn tsqlDml(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
 
 fn outputRefs(x: &Expr, q: &str, upd: bool): Expr {
     match x {
-        Expr.Col(n) {
+        Expr.Col(n, _) {
             if n == "$action" { return Expr.Call("#maction", [], false) }
             let d = strings.indexOf(&n, ".", 0)
-            if d < 0 { return Expr.Col(n.toStr()) }
+            if d < 0 { return Expr.Col(n.toStr(), -1) }
             let t = n[0..d].toStr()
             let c = n[d + 1..len(n)].toStr()
-            if t == "inserted" { return Expr.Col(q + "." + c) }
+            if t == "inserted" { return Expr.Col(q + "." + c, -1) }
             if t == "deleted" {
-                if upd { return Expr.Call("#old", [Expr.Col(q + "." + c)], false) }
-                return Expr.Col(q + "." + c)
+                if upd { return Expr.Call("#old", [Expr.Col(q + "." + c, -1)], false) }
+                return Expr.Col(q + "." + c, -1)
             }
-            return Expr.Col(n.toStr())
+            return Expr.Col(n.toStr(), -1)
         }
         Expr.Unary(op, a) { return Expr.Unary(op.toStr(), outputRefs(&a, q, upd)) }
         Expr.Bin(op, a, b) { return Expr.Bin(op.toStr(), outputRefs(&a, q, upd), outputRefs(&b, q, upd)) }
@@ -2011,7 +2011,7 @@ fn tsqlCast(x: Expr, ty: TypeName, style: Option[Expr]): Expr {
 fn datePart(x: &Expr): Option[Expr] {
     var w = ""
     match x {
-        Expr.Col(n) { w = n }
+        Expr.Col(n, _) { w = n }
         Expr.Lit(v) { match v { Val.Text(s) { w = strings.toLowerAscii(&s) } else {} } }
         else {}
     }
@@ -3518,7 +3518,7 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
 
 fn isColExpr(x: &Expr): bool {
     match x {
-        Expr.Col(n) { return true }
+        Expr.Col(n, _) { return true }
         else { return false }
     }
 }
@@ -3724,7 +3724,7 @@ fn oraQual(n: &str): str {
 // The qualifiers of the columns under a marker (marked) or anywhere (all); an unqualified one is "".
 fn oraAliases(x: &Expr, under: bool, out: mut &[]str) {
     match x {
-        Expr.Col(n) { if under { append(mut &out, oraQual(&n)) } }
+        Expr.Col(n, _) { if under { append(mut &out, oraQual(&n)) } }
         Expr.Unary(op, a) { oraAliases(&a, under, mut &out) }
         Expr.Bin(op, a, b) {
             oraAliases(&a, under, mut &out)
@@ -3824,7 +3824,7 @@ fn oraOuterJoins(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 // Every column's qualifier in x.
 fn oraAllAliases(x: &Expr, out: mut &[]str) {
     match x {
-        Expr.Col(n) { append(mut &out, oraQual(&n)) }
+        Expr.Col(n, _) { append(mut &out, oraQual(&n)) }
         Expr.Unary(op, a) { oraAllAliases(&a, mut &out) }
         Expr.Bin(op, a, b) {
             oraAllAliases(&a, mut &out)
@@ -4464,12 +4464,12 @@ fn (p: mut &P) mrClause(): Result[MatchRec, lexdb_base.DbErr] {
         while true {
             var x = Expr.Lit(Val.Null)
             if p.ora {
-                x = Expr.Col(try p.name())
+                x = Expr.Col(try p.name(), -1)
                 if p.isKw(".") { return Err(oraErr(1748, "only simple column names allowed here")) }
             } else {
                 x = try p.expr()
                 match x {
-                    Expr.Col(cn) { if strings.contains(&cn, &".") { return Err(near(&p.peek())) } }
+                    Expr.Col(cn, _) { if strings.contains(&cn, &".") { return Err(near(&p.peek())) } }
                     else {}
                 }
             }
@@ -5083,7 +5083,7 @@ fn mergeOutput(s: mut &Stmt, out: []SelItem): Result[Unit, lexdb_base.DbErr] {
         match replace(mut &items[i].expr, None) {
             Some(x) {
                 match x {
-                    Expr.Col(n) { if n == "$action" && len(items[i].alias) == 0 { items[i].alias = "$action" } }
+                    Expr.Col(n, _) { if n == "$action" && len(items[i].alias) == 0 { items[i].alias = "$action" } }
                     else {}
                 }
                 items[i].expr = Some(outputRefs(&x, &q, true))
@@ -5404,7 +5404,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         // TO from a table: its query
         var q = lexdb_sql.newStmt(S_SELECT)
         if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""}) }
-        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n)), alias: "", spell: ""}) }
+        for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n, -1)), alias: "", spell: ""}) }
         append(mut &q.from, FromItem{table: s.table, alias: lexdb_sql.baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
         append(mut &s.inner, q)
     }

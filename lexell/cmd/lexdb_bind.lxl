@@ -25,6 +25,55 @@ pub type Typing = value record {
     pub fnBind: fn(&str, int): FnRef  // a function's call bound (bindExpr): the executor's way for it, FN_NONE eval's alone
 }
 
+// ---- columns (design/lexdb-layers.md 4.4.1, step 2d)
+
+// A column's or an expression's type, as the binder gives it.
+pub type Ty = value record {
+    pub oid: int                // the type (lexdb_sql.OID_*, an enum's OID, an array's)
+    pub mod: int                // numeric p << 16 | s, varchar/char n, a time type's precision; -1 none
+    pub coll: str               // a text's collation, its name as written ("" exact, lexdb's default)
+    pub collLevel: int          // CL_*: the collation's strength
+    pub notNull: bool
+}
+
+// A collation's strength (Ty.collLevel): SQL Server's precedence, COLLATE
+// (explicit) over a column's (implicit) over a literal's, a variable's or a
+// parameter's (the session's default); CL_NONE: not a text.
+pub const CL_NONE = 0
+pub const CL_DEFAULT = 1
+pub const CL_IMPLICIT = 2
+pub const CL_EXPLICIT = 3
+
+// A query level's column: its slot (its place in the joined row), its name
+// as expressions name it (alias.column, lexdb_exec's DUPSEP for a name
+// repeated in one FROM item), its name as written where that differs
+// (spell; "" else) and its type.
+pub type BCol = record {
+    pub slot: int
+    pub name: str
+    pub spell: str
+    pub ty: Ty
+}
+
+// The type of a column of type t, collation coll ("" none).
+pub fn tyOf(t: &lexdb_sql.TypeName, coll: &str, notNull: bool): Ty {
+    var m = -1
+    if (t.oid == lexdb_sql.OID_VARCHAR || t.oid == lexdb_sql.OID_BPCHAR) && t.len > 0 {
+        m = t.len
+    } else if t.kind == lexdb_sql.K_NUM && t.prec > 0 {
+        m = (t.prec << 16) | t.scale
+    } else if lexdb_sql.isTimeKind(t.kind) && t.prec > 0 {
+        m = t.scale
+    }
+    let text = t.kind == lexdb_sql.K_TEXT
+    return Ty{oid: t.oid, mod: m, coll: if text { coll.toStr() } else { "" }, collLevel: if text { CL_IMPLICIT } else { CL_NONE }, notNull: notNull}
+}
+
+// Column c of a query level at slot.
+pub fn bcolOf(slot: int, c: &lexdb_sql.ColDef): BCol {
+    return BCol{slot: slot, name: c.name, spell: c.spell, ty: tyOf(&c.typ, &c.coll, c.notNull)}
+}
+
 // ---- common types (PostgreSQL's parse_coerce.c select_common_type)
 
 // No type yet: an untyped literal or parameter (705), or none (0).
@@ -135,7 +184,12 @@ pub fn isTextOid(o: int): bool {
            o == lexdb_sql.OID_BPCHAR
 }
 
-fn colAt(cols: &[]lexdb_sql.ColDef, name: &str): int {
+// Column name's place in cols: its slot as resolve gave it (Expr.Col's
+// second field) when that is the column of that name, else found by the
+// name (a column the planner made, slot -1, or an expression over other
+// columns than those it was resolved over).
+pub fn colSlot(cols: &[]lexdb_sql.ColDef, name: &str, slot: int): int {
+    if slot >= 0 && slot < len(cols) && cols[slot].name == name { return slot }
     for i in 0..len(cols) { if cols[i].name == name { return i } }
     return -1
 }
@@ -203,8 +257,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
             if n <= len(ptypes) && ptypes[n - 1] != 0 { return ptypes[n - 1] }
             return lexdb_sql.OID_TEXT
         }
-        Expr.Col(n) {
-            let i = colAt(cols, &n)
+        Expr.Col(n, s) {
+            let i = colSlot(cols, &n, s)
             return if i >= 0 { cols[i].typ.oid } else { lexdb_sql.OID_TEXT }
         }
         Expr.Unary(op, a) { return if op == "not" { lexdb_sql.OID_BOOL } else { exprOid(&a, cols, ptypes, ty) } }
@@ -585,18 +639,12 @@ pub type FnRef = record {
     pub dialect: bool           // a T-SQL or Oracle function's name: its dialect's call first, as eval
 }
 
-// x bound; None: eval evaluates it. cols: the row's columns; params: the
+// x bound; None: eval evaluates it. cols: the row's columns (a column is
+// Col(i), its place in the row: the slot resolve gave it); params: the
 // statement's, bound as constants ([]: each $n a slot, BX.Param, for a plan
-// bound once and run with other values). direct: the row is of cols (Col(i): its place i); else a
-// row of the columns slots lists (Col(s): slots[s] of cols, a column added
-// to slots when first used). aggs: #agg's slots are given.
-pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int,
-                ty: &Typing): Option[BX] {
-    return bindIn(x, cols, params, direct, aggs, slots, ty)
-}
-
-fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, aggs: bool, slots: mut &[]int,
-          ty: &Typing): Option[BX] {
+// bound once and run with other values). aggs: #agg's slots are given.
+// (lexdb_exec's bGenOf re-slots a bound tree for a batch's row: reslot.)
+pub fn bindExpr(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, ty: &Typing): Option[BX] {
     match x {
         Expr.Lit(v) { return Some(BX.Const(v)) }
         Expr.Param(n) {
@@ -605,24 +653,21 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, agg
             if n <= len(params) { return Some(BX.Const(params[n - 1])) }
             return Some(BX.Param(n - 1))
         }
-        Expr.Col(name) {
-            let i = colAt(cols, &name)
+        Expr.Col(name, slot) {
+            let i = colSlot(cols, &name, slot)
             if i < 0 { return None }
-            if direct { return Some(BX.Col(i)) }
-            for s in 0..len(slots) { if slots[s] == i { return Some(BX.Col(s)) } }
-            append(slots, i)
-            return Some(BX.Col(len(slots) - 1))
+            return Some(BX.Col(i))
         }
         Expr.Unary(op, a) {
-            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
+            let ba = bindExpr(&a, cols, params, aggs, ty)
             if ba.isNone() { return None }
             let u = lexdb_ops.unCode(&op)
             return Some(BX.Un(u, ba.unwrap()))
         }
         Expr.Bin(op, a, b) {
-            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
+            let ba = bindExpr(&a, cols, params, aggs, ty)
             if ba.isNone() { return None }
-            let bb = bindIn(&b, cols, params, direct, aggs, slots, ty)
+            let bb = bindExpr(&b, cols, params, aggs, ty)
             if bb.isNone() { return None }
             if op == "and" { return Some(BX.And(ba.unwrap(), bb.unwrap())) }
             if op == "or" { return Some(BX.Or(ba.unwrap(), bb.unwrap())) }
@@ -636,13 +681,13 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, agg
             return Some(BX.Op(code, ba.unwrap(), bb.unwrap()))
         }
         Expr.IsNull(a, neg) {
-            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
+            let ba = bindExpr(&a, cols, params, aggs, ty)
             if ba.isNone() { return None }
             return Some(BX.IsNull(ba.unwrap(), neg))
         }
         Expr.Cast(a, t) {
             if t.kind == lexdb_sql.K_REG { return None }
-            let ba = bindIn(&a, cols, params, direct, aggs, slots, ty)
+            let ba = bindExpr(&a, cols, params, aggs, ty)
             if ba.isNone() { return None }
             return Some(BX.Cast(ba.unwrap(), t))
         }
@@ -659,7 +704,7 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, direct: bool, agg
             if !special && fr.way == FN_NONE { return None }
             var bs: []BX = []
             for a in args {
-                let c = bindIn(&a, cols, params, direct, aggs, slots, ty)
+                let c = bindExpr(&a, cols, params, aggs, ty)
                 if c.isNone() { return None }
                 append(mut &bs, c.unwrap())
             }
@@ -702,9 +747,8 @@ pub fn hasParam(x: &BX): bool {
     }
 }
 
-// x, bound over a row of cols by place (direct), re-slotted for a row of
-// the columns slots lists, as bindExpr binds with direct false: Col(i)
-// becomes Col(s), slots[s] == i (i added to slots when first read). par:
+// x, bound over a row of cols by place, re-slotted for a row of the
+// columns slots lists: Col(i) becomes Col(s), slots[s] == i (i added to slots when first read). par:
 // set when x reads a parameter slot (BX.Param). A plan's bound tree run
 // over a batch's row (lexdb_exec's bGenOf), not bound again per run.
 pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
