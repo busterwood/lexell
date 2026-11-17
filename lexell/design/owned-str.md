@@ -241,3 +241,10 @@ whether it was confirmed with a test.
    exists, so the soundness argument that ruled them out does not apply.
    Threads still need the separate answer from concurrency.md, as they do
    for copy globals today.
+9. **A match on a dead local borrows instead of moving.** Confirmed:
+   `let r = f(); match r { Err(e) { wrap(e) } }` binds `e` as a borrow, so
+   `wrap(e)` needs `e.clone()`. `match move(r)` moves without a clone. The
+   agents wrote `Err(e) { Err(tlsFail(e.clone())) }` dozens of times, because
+   `move(r)` is easy to miss. A match on a local that is not used after the
+   match could move it implicitly, as `let` and argument passing already do
+   for a last use.
