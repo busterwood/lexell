@@ -248,3 +248,22 @@ whether it was confirmed with a test.
    `move(r)` is easy to miss. A match on a local that is not used after the
    match could move it implicitly, as `let` and argument passing already do
    for a last use.
+10. **Read-only functions that take a value consume it.** `println[T:
+    Show](x: T)` and `print` take their argument by value, so with owned
+    strings `println(name)` moves `name`, and printing a string that is used
+    again needs `println(name.clone())`. The w9 batch found this throughout
+    the tests, and user code will hit it constantly. Many other read-only
+    library functions are generic over `T` by value. There are two ways out:
+    - Such functions take `&T`, and callers write `println(&name)`. That is
+      explicit but noisy, and `println(n)` for an `int` would need `&n` too.
+    - **An implicit shared borrow for arguments:** where a parameter is
+      `&T` and the argument is a place or a temporary, the call borrows it
+      without writing `&`. A shared borrow has no effect on the caller's
+      ownership, so making it implicit hides nothing that matters. `mut &`
+      stays explicit, because it does matter.
+    This is probably the biggest ergonomic question the switch raises.
+11. **Comparing an `Option[str]` with a borrowed string allocates.**
+    `if Some(d.path.clone()) == exclude` (zoxide) builds an owned `Option` to
+    compare. This is a library gap rather than a language one:
+    `exclude.is(&d.path)` (an `Option[T]` method comparing with `&T`), or
+    `==` between `Option[T]` and `Option[&T]`.
