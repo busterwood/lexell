@@ -13971,11 +13971,18 @@ fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
 }
 
 // The columns a statement names, without their tables, in any of its
-// parts and subqueries; star: a * anywhere in it.
+// parts and subqueries; star: a * anywhere in it that reads every column.
+// An EXISTS's select list is not read (PostgreSQL drops it), so its * is
+// none, unless the rows it counts depend on their values: a set operation,
+// GROUP BY (a position names a column of *) or DISTINCT. q21's and q4's
+// "exists (select * from lineitem ...)" read every column of every table
+// before (design/lexdb-layers.md 6.2.2).
 fn stmtNames(s: &lexdb_sql.Stmt, names: mut &Map[str, int], star: mut &bool) {
     var xs: []str = []
+    let listRead = !(s.use == lexdb_sql.SUB_EXISTS && s.setop == 0 && len(s.group) == 0 && len(s.gsets) == 0 && !s.distinct &&
+                     len(s.distinctOn) == 0)
     for it in s.items {
-        if it.star { star = true }
+        if it.star && listRead { star = true }
         match it.expr { Some(x) { colNames(&x, mut &xs) } None {} }
     }
     match s.where { Some(x) { colNames(&x, mut &xs) } None {} }
@@ -13984,6 +13991,8 @@ fn stmtNames(s: &lexdb_sql.Stmt, names: mut &Map[str, int], star: mut &bool) {
     match s.offset { Some(x) { colNames(&x, mut &xs) } None {} }
     for g in s.group { colNames(&g, mut &xs) }
     for o in s.order { colNames(&o.expr, mut &xs) }
+    // DISTINCT ON's keys, which need not be in ORDER BY
+    for d in s.distinctOn { colNames(&d, mut &xs) }
     for f in s.from {
         match f.on { Some(x) { colNames(&x, mut &xs) } None {} }
         // USING's names join the sides; NATURAL's are known only from the
@@ -24481,6 +24490,24 @@ fn copyCounts(cs: &[]Counts): []Counts {
     return out
 }
 
+// The query's columns a grouped select reads after grouping: those its
+// outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.
+fn afterCols(sel: &Sel, q: &Query): []int {
+    var names: []str = []
+    for x in sel.exprs { colNames(&x, mut &names) }
+    match sel.having {
+        Some(h) { colNames(&h, mut &names) }
+        None {}
+    }
+    for x in sel.order { colNames(&x, mut &names) }
+    var out: []int = []
+    for n in names {
+        let ci = colIndex(&q.cols, &n)
+        if ci >= 0 { append(mut &out, ci) }
+    }
+    return out
+}
+
 // allowDec: numeric(p, s) columns as units (one table's batches); usedDec
 // set when the query reads such a column so.
 fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run,
@@ -24603,12 +24630,16 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
         }
         append(mut &specs, BSpec{kind: kind, arg: arg, filter: filt, vcol: vcol, dsc: dsc})
     }
-    // With no GROUP BY no column is used outside an aggregate (42803): the
-    // columns read are those of the conditions and the aggregates only
-    // (none for count(*)), large rows read in part.
-    if jn && len(keys) == 0 {
-        // the joins gather only the columns the aggregates use
+    // The joins gather only the columns read after them: the group keys',
+    // the aggregates' (arguments and FILTERs), and those a group's first row
+    // keeps (its outputs, HAVING, ORDER BY: below). With no GROUP BY no
+    // column is used outside an aggregate (42803), so none for count(*).
+    // Gathering every column read made q21's joins copy each one through
+    // each level (design/lexdb-layers.md 6.2.2).
+    if jn {
         var used: []bool = array(len(q.cols), false)
+        for kc in keys { bColsOf(&kc.n, mut &used) }
+        for ci in afterCols(sel, q) { used[ci] = true }
         for sp in specs {
             match sp.arg {
                 Some(x) { bColsOf(&x, mut &used) }
@@ -24690,18 +24721,8 @@ fn batchGroupsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m
     // outputs, HAVING, ORDER BY): the others, an aggregate's argument
     // among them, are not copied for each group (q18's 1.5M groups).
     {
-        var names: []str = []
-        for x in sel.exprs { colNames(&x, mut &names) }
-        match sel.having {
-            Some(h) { colNames(&h, mut &names) }
-            None {}
-        }
-        for x in sel.order { colNames(&x, mut &names) }
         var after: []bool = array(len(q.cols), false)
-        for n in names {
-            let ci = colIndex(&q.cols, &n)
-            if ci >= 0 { after[ci] = true }
-        }
+        for ci in afterCols(sel, q) { after[ci] = true }
         for i in 0..len(rowNeed) {
             let qc = if jn { i } else { lv.first + i }
             if qc < len(after) && !after[qc] { rowNeed[i] = false }
