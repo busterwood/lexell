@@ -1867,10 +1867,11 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
     var bail = false
     var bad: []DbErr = []
     var over = false
+    // per key its range: its prefix's, narrowed by the bounds (rangeScan's);
+    // an empty one [rlo, rlo)
+    var rlos: []str = withCapacity(len(ks))
+    var rhis: []str = withCapacity(len(ks))
     for x in 0..len(ks) {
-        if bail || over || len(bad) > 0 { break }
-        append(mut &lo, if index && !only { len(pks) } else { rows.n })
-        // the key's range: its prefix's, narrowed by the bounds (rangeScan's)
         var rlo = ks[x].clone()
         var rhi = succ(&ks[x])
         for sf in tail.lo {
@@ -1888,21 +1889,27 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
             let nulAt = nb
             if rhi == "" || nulAt < rhi { rhi = nulAt }
         }
-        if noRange || (rhi != "" && rlo >= rhi) {
-            append(mut &hi, if index && !only { len(pks) } else { rows.n })
-            continue
-        }
-        try st.scanLeaves(txn, tree, &rlo, rhi, fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
+        if noRange || (rhi != "" && rlo >= rhi) { rhi = rlo.clone() }
+        append(mut &rlos, rlo)
+        append(mut &rhis, rhi)
+    }
+    // range x's entries in a leaf, rows (or primary keys) taken: 0 go on,
+    // 1 the range is done (one), 2 stop (bail, over, bad); lo[x]: where its
+    // rows start (-1 none yet)
+    lo = array(len(ks), -1)
+    {
+        let take = fn(x: int, leaf: &lexdb_rows.LeafView, i0: int, j0: int): int {
+            if lo[x] < 0 { lo[x] = if index && !only { len(pks) } else { rows.n } }
             var e = i0
             while e < j0 {
                 if room0 >= 0 && (rows.n + len(pks)) * perRow > room0 {
                     over = true
-                    return false
+                    return 2
                 }
                 if index && !only {
                     append(mut &pks, lexdb_rows.leafVal(leaf, e))
                     e += 1
-                    if one { return false }
+                    if one { return 1 }
                     continue
                 }
                 let want = if one { 1 } else { j0 - e }
@@ -1910,36 +1917,36 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
                 if index {
                     if !bIdxInto(&lexdb_rows.leafKey(leaf, e), rows.n, mut &rows, bp, &dec) {
                         bail = true
-                        return false
+                        return 2
                     }
                     rows.n += 1
                     e += 1
-                    if one { return false }
+                    if one { return 1 }
                     continue
                 }
                 match lexdb_rows.decodeRun(leaf, e, e + want, mut &rows, bp, &rw) {
                     Ok(got) {
                         if got < 0 {
                             bail = true
-                            return false
+                            return 2
                         }
                         if got > 0 {
                             rows.n += got
                             e += got
-                            if one { return false }
+                            if one { return 1 }
                             continue
                         }
                     }
                     Err(er) {
                         append(mut &bad, er)
-                        return false
+                        return 2
                     }
                 }
                 match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, e), rows.n, mut &rows, bp, &rw) {
                     Ok(code) {
                         if code == 1 {
                             bail = true
-                            return false
+                            return 2
                         }
                         if code == 2 {
                             append(mut &apart, lexdb_rows.leafKey(leaf, e))
@@ -1948,16 +1955,40 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
                     }
                     Err(er) {
                         append(mut &bad, er)
-                        return false
+                        return 2
                     }
                 }
                 rows.n += 1
                 e += 1
-                if one { return false }
+                if one { return 1 }
             }
-            return true
-        })
-        append(mut &hi, if index && !only { len(pks) } else { rows.n })
+            return 0
+        }
+        if noted {
+            // range by range, in the keys' order (the reads noted as made)
+            for x in 0..len(ks) {
+                if len(rhis[x]) > 0 && rlos[x] >= rhis[x] { continue }
+                var code = 0
+                try st.scanLeaves(txn, tree, &rlos[x], rhis[x].clone(), fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
+                    code = take(x, leaf, i0, j0)
+                    return code == 0
+                })
+                if code == 2 { break }      // (bail, over or bad: take's)
+            }
+        } else {
+            // the ranges in key order, those in one leaf by one descent
+            try st.scanRanges(txn, tree, &rlos, &rhis, take)
+        }
+    }
+    // where each range's rows end: where the next range with rows starts
+    // (ranges are read in order), the last at the end
+    var next = if index && !only { len(pks) } else { rows.n }
+    hi = array(len(ks), 0)
+    var x = len(ks)
+    while x > 0 {
+        x -= 1
+        hi[x] = next
+        if lo[x] < 0 { lo[x] = next } else { next = lo[x] }
     }
     if len(bad) > 0 { return Err(bad[0].clone()) }
     if bail || over { return Ok(None) }

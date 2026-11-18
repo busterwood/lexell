@@ -3625,6 +3625,113 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
     return Ok(Unit{})
 }
 
+// scanLeaves over many ranges [los[x], his[x]) (his[x] "": to the end),
+// sorted by their starts: f(x, leaf, i, j) is given range x's entries in a
+// leaf, in order, and answers 0 (go on), 1 (range x is done) or 2 (stop).
+// Under one lock, each range's leaf is found from the last one's path
+// (a Finger, as getManyIn finds its keys': up to the lowest node holding
+// the range's start, then down), not from the root (an index's ranges per
+// key: q3's lineitem by order, 147k ranges). A range that crosses its
+// leaf's fence, or that the transaction's own writes or cuts meet, is read
+// by scanLeaves, as is every range of a replica's view or of a transaction
+// whose reads are noted. Leaves are marked as scanLeaves marks them.
+pub fn (st: &Store) scanRanges(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
+                               f: &fn(int, &lexdb_rows.LeafView, int, int): int): Result[Unit, lexdb_base.DbErr] {
+    let nr = len(los)
+    let view = st.viewOf(t)
+    let each = view == View.Repl || t.noting()
+    let snap = view == View.Snap
+    // per range: one the transaction's own writes or cuts meet (scanLeaves')
+    var slow: []bool = array(nr, each)
+    if !each { for z in 0..nr { slow[z] = len(t.ownRange(tree, &los[z], &his[z])) > 0 || t.cutsMeet(tree, &los[z], &his[z]) } }
+    var starts: []&str = withCapacity(nr)    // (for the read ahead: lookupAhead's keys)
+    for z in 0..nr { append(mut &starts, &los[z]) }
+    var x = 0
+    var stop = false
+    while x < nr && !stop {
+        if slow[x] {
+            try st.scanOne(t, tree, x, &los[x], &his[x], f, mut &stop)
+            x += 1
+            continue
+        }
+        var need = -1
+        var ahead: []int = []
+        var bad: []lexdb_base.DbErr = []
+        var empty = false
+        var cross = false               // range x crosses its leaf's fence
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0].clone())
+                return
+            }
+            if snap && db.snapGone(t.snap) {
+                append(mut &bad, snapCancelled())
+                return
+            }
+            let root = if snap { db.snapRoot(t, tree) } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            if root < 0 {
+                empty = true
+                return
+            }
+            let q = if snap { t.snapSeq } else { db.seq }
+            // each range's leaf from the last one's path (Finger): up to the
+            // lowest node holding its start, then down
+            var fg = newFinger()
+            while x < nr {
+                if slow[x] { return }
+                let d = db.fingerTo(mut &fg, root, snap, q, &los[x], mut &need)
+                if d == -1 {
+                    ahead = db.lookupAhead(root, snap, q, &starts, x, need)
+                    return
+                }
+                if d == -2 {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                if fg.vers[d] == -1 { db.noteLeaf(tree, fg.slots[d]) }
+                if fg.hasHi[d] && (len(his[x]) == 0 || his[x] > fg.hi[d]) {
+                    cross = true
+                    return
+                }
+                let n = db.snapNode(fg.slots[d], fg.vers[d])
+                let i = n.lower(&los[x])
+                let j = if len(his[x]) == 0 { n.count() } else { n.lower(&his[x]) }
+                x += 1
+                if j > i {
+                    let lv = lexdb_page.leafView(&n)
+                    if f(x - 1, &lv, i, j) == 2 {
+                        stop = true
+                        return
+                    }
+                }
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0].clone()) }
+        if need >= 0 {
+            if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
+            continue
+        }
+        if empty { return Ok(Unit{}) }
+        if cross {
+            try st.scanOne(t, tree, x, &los[x], &his[x], f, mut &stop)
+            x += 1
+        }
+    }
+    return Ok(Unit{})
+}
+
+// scanRanges' range x by scanLeaves; stop set when f says 2.
+fn (st: &Store) scanOne(t: mut &Txn, tree: int, x: int, lo: &str, hi: &str, f: &fn(int, &lexdb_rows.LeafView, int, int): int,
+                        stop: mut &bool): Result[Unit, lexdb_base.DbErr] {
+    var code = 0
+    try st.scanLeaves(t, tree, lo, hi.clone(), fn(lv: &lexdb_rows.LeafView, i: int, j: int): bool {
+        code = f(x, lv, i, j)
+        return code == 0
+    })
+    if code == 2 { stop = true }
+    return Ok(Unit{})
+}
+
 // A descent for a backward scan: the leaf with the largest keys below k (k
 // "": the last leaf). lower is the largest separator above it on the path:
 // the leaf holds no key below it, so the next leaf back is the one below it.
