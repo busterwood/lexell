@@ -77,6 +77,41 @@ Still open, found doing it:
   `max[&str](...)` or bind the result first.
 - **Lending** (the first limit) is unchanged: `Map[&str, V]` waits for it.
 
+## Lending from a value that holds borrows (what `Map[&str, V]` waits for)
+
+**Now.** design/borrow-types.md D5: a parameter whose type holds borrows
+"lends what it holds, not itself": a result may borrow what the parameter's
+borrows point into, never the parameter's own storage. So `fn (m:
+&Map[K, V]) at(k: &K): &V { return &m.vals[i] }` cannot be written when `K`
+is a borrow, nor `find`, `atMut` or an iterator: every one returns a borrow
+of the map's own arrays.
+
+**Why the rule exists.** A borrow-class value's roots are what it borrows.
+A result rooted there would outlive the parameter itself (the map), which
+may be a temporary or dropped first. One root cannot say both.
+
+**Proposal.** A result of a borrow-class parameter may have two roots: the
+parameter's own root (its storage, as for any `&p.f`) and what it borrows
+(its contents' roots). At the call, the result is rooted at both: the
+argument's variable and the variables its borrows point into, and both are
+frozen while the result lives (rule 4 applies to each). Written by the
+compiler from the return expression (`&m.vals[i]` is rooted at `m`; an
+element of type `V` read from it carries `m`'s contents' roots), so
+signatures do not change. Checking: rule 5's "rooted at its sources"
+accepts a root at the parameter itself when its type holds borrows, and the
+call site joins the argument's root and content root (Checker.joinRoots,
+already used for `if` results).
+
+**What it costs.** The result-root computation at the call (call() in
+check.lxl, where `bsrc` is applied) and rule 5's check; tests that the map
+cannot be dropped or changed while a looked-up value lives. Then `Map` and
+`Set` declare `K: borrow`, and their closure-based methods (`union`,
+`filter`) are rewritten as loops, since a `var`'s single set of roots cannot
+grow inside a closure.
+
+**What it breaks.** Nothing (only accepts more programs). Not started: it is
+the next borrow-checker change, after finding 5.
+
 ## Finding 5: `s[a..b]` is always a view
 
 **Now.** SPEC 4.1: `s[a..b]` is a view (`&str`) where a `&str` is expected

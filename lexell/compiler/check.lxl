@@ -1538,7 +1538,7 @@ fn (c: mut &Checker) moveOutOfTmp(v: &Val): int {
     if c.pg.types[d].form != sx.F_RECORD || c.pg.types[d].drop >= 0 { return -1 }
     // the path names one field (a boxed record field's path ends in a separator)
     var fname = v.path.clone()
-    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1] }
+    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1].clone() }
     for k in 0..len(fname) {
         if strByte(fname, k) == 0 { return -1 }
     }
@@ -1654,7 +1654,7 @@ fn (c: mut &Checker) moveFieldOfDead(v: &Val, line: int): int {
     let d = c.pg.ta(t)
     if c.pg.types[d].form != sx.F_RECORD || c.pg.types[d].drop >= 0 { return -1 }
     var fname = v.path.clone()
-    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1] }
+    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1].clone() }
     for k in 0..len(fname) {
         if strByte(fname, k) == 0 { return -1 }
     }
@@ -1752,7 +1752,7 @@ fn (c: mut &Checker) immutable(v: &Val, line: int, verb: &str): never {
     let r = v.root
     if r >= 0 {
         let name = c.vars[r].name.clone()
-        let vb = if strings.endsWith(&verb, " to") { verb[0..len(verb) - 3] } else { verb.clone() }
+        let vb = if strings.endsWith(&verb, " to") { verb[0..len(verb) - 3].clone() } else { verb.clone() }
         let rk = c.pg.tk(c.vars[r].t)
         let isB = rk == sema.TK_REF || rk == sema.TK_SLICE
         if isB && !c.pg.tm(c.vars[r].t) {
@@ -3329,8 +3329,9 @@ fn (c: mut &Checker) expr(e: int, exp: int): Val {
     }
     if k == sx.N_SUB {
         let mut1 = c.ek(exp) == sema.TK_SLICE && (exp == EXP_MUTSLICE || (exp >= 0 && c.pg.tm(exp)))
-        let view = c.ek(exp) == sema.TK_REF && exp >= 0 && !c.pg.tm(exp) && c.pg.ta(exp) == sema.T_STR
-        return c.xSub(e, mut1, view)
+        // s[a..b] on a string is always a view, as xs[a..b] on an array is always a slice; an owned
+        // substring is s[a..b].clone() (design/consistency-designs.md, finding 5)
+        return c.xSub(e, mut1, true)
     }
     return match k {
         sx.N_CHAR { rv(c.x.pcast(c.ct("uint8_t"), c.lit(c.nd(e).a)), sema.T_BYTE) }
@@ -3447,7 +3448,7 @@ fn (c: mut &Checker) xFrac(text: &str, line: int, exp: int, suf: int): Val {
     var e = num.bigOf(0)
     if len(es) > 0 {
         let eneg = strByte(es, 0) == '-'
-        let digits = if strByte(es, 0) == '-' || strByte(es, 0) == '+' { es[1..] } else { es }
+        let digits = if strByte(es, 0) == '-' || strByte(es, 0) == '+' { es[1..].clone() } else { es }
         e = num.bigParse(&digits, eneg)
     }
     let scale = num.bigSub(num.bigOf(len(frac)), e)
@@ -3961,8 +3962,30 @@ fn (c: mut &Checker) xIndex(e: int, exp: int): Val {
 // xs[a..b], xs[a..], xs[..b] of an array or slice (a slice, SPEC 4.2a) or of a str.
 fn (c: mut &Checker) xSub(e: int, mut1: bool, view: bool): Val {
     let n = c.node(e)
-    var v = c.rcRead(c.expr(n.a, -1))
+    // a str constant's bytes are static: read it as a view of them (not a new value) to slice it
+    let cst = c.static(n.a)
+    let isConstStr = cst.k == ST_DECL && cst.dk == sema.D_CONST && c.pg.consts[cst.di].value.ty == sema.T_STR
+    var v = if isConstStr { c.constVal(cst.di, c.pg.mkRef(sema.T_STR, false), c.line(n.a)) } else { c.rcRead(c.expr(n.a, -1)) }
+    if isConstStr { v.t = sema.T_STR; v.gk = sema.D_CONST }
     let W = c.W(n.line)
+    if v.t == sema.T_STR && view && (c.kind(n.a) == sx.N_STR || v.gk == sema.D_CONST) {
+        // a literal's or constant's bytes are static: its slice is a static view, with no root
+        let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
+        let hi = if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(v.c), "len") }
+        let vn = c.fresh("vw")
+        let rt = c.pg.mkRef(sema.T_STR, false)
+        c.emit(c.x.decl(c.T(rt), &vn, c.x.call("rt_str_view", [v.c, lo, hi, W])))
+        return rvAt(c.nm(&vn), rt, R_FREE, "")
+    }
+    if v.t == sema.T_STR && view && v.gk >= 0 {
+        // a global cannot be lent (SPEC 5.2): its slice is a copy, held for the statement and seen
+        // as a view of it (G[a..b].clone() keeps it)
+        v = c.beforeOpt(v, n.b, n.c)
+        let lo = if n.b >= 0 { c.intIndex(n.b) } else { c.lit(0) }
+        let hi = if n.b >= 0 || n.c >= 0 { (if n.c >= 0 { c.intIndex(n.c) } else { c.x.dot(c.x.par(v.c), "len") }) } else { c.x.dot(c.x.par(v.c), "len") }
+        let t = c.holdtmp(c.x.call("rt_str_sub", [v.c, lo, hi, W]), sema.T_STR)
+        return c.borrow(t, false, n.line, false)
+    }
     if v.t == sema.T_STR && view {
         // a view (design/borrow-types.md): a shared &str of the bytes, rooted where s is, uncounted
         if v.cat == CAT_RV { v = c.holdtmp(v.c, sema.T_STR) }

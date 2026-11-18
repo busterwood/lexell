@@ -326,6 +326,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AT | SPEC 7.4: a shared borrow `&U` satisfies `U`'s interfaces (not those needing `mut &Self`); `sort`, `dedup`, `equal`, `contains`, `find`, `min`, `max` take `borrow` type parameters, so views can be sorted and compared without copies; a borrow of a non-copy value passed for a `borrow` type parameter keeps `T` the borrow. | cdfdd397 | yes | none |
 
+| AU | SPEC 4.1 (finding 5): `s[a..b]` on a string is always a `&str` view, as `xs[a..b]` is always a slice; an owned substring is `s[a..b].clone()`. A slice of a literal or constant is a static view (no root); a slice of a string global is a copy held for the statement. | (this commit) | **no**, done on this branch: 32 `.clone()`s in lexdb's modules (where a substring is stored, returned or assigned to an owned variable) and those its tests needed. | none for correct programs: substrings that were copies and are only read are now free views |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
@@ -386,4 +388,11 @@ longer quadratic.
 tests; its suite passes). A composite key is built in a reused string:
 `k.clear()`, `k += part` / `k.addByte(sep)`, then `m.find(&k)`. New code
 writes strings, never a builder type.
+
+**AU for lexdb.** Done on lang/consistency with a compiler-driven fixer: each
+site where an owned substring is needed got `.clone()`; everywhere else the
+slice is now a free view (parsers and tokenizers: no copy per token). When
+new code stores a substring (a record field, an array of `str`, a return of
+`str`), write `s[a..b].clone()`; the compiler says where ("cannot move a str
+out of a borrow").
 

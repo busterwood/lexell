@@ -28,6 +28,10 @@ rule.
 - AP, AQ (lexdb's review): `s += x` in place; `StrBuf.text()`.
 - AR (the user, 2026-11-18): `StrBuf` removed; strings are their own buffers
   (`addByte`, `addInt`, `addLine`, `clear`, `bytes`).
+- AS, AT (finding 2): boxed types may hold borrows; `&U` satisfies `U`'s
+  interfaces. Containers of borrows wait for lending (consistency-designs.md).
+- AU (finding 5): `s[a..b]` always a view. Commands migrated by Haiku agents
+  (eza, zoxide, redis-cli), the rest by a compiler-driven fixer.
 
 ## Plan, in order
 

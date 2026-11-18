@@ -182,8 +182,12 @@ block or one expression.
 `let t = s` moves it, and it is freed when its owner is dropped. `s.clone()`
 makes a second, independent string. A string that several owners read is an
 `rc str` (section 4.9). Its bytes are not required to be UTF-8. `s[a..b]` is
-the substring of bytes `a` to `b - 1`: where a `&str` is expected it is a view
-of the bytes of `s` (no copy), and elsewhere it is a new owned `str`. `s[a..]` and `s[..b]` run to the end and from
+the substring of bytes `a` to `b - 1`, always a view of the bytes of `s` (a
+`&str`, no copy), as `xs[a..b]` is always a slice of an array; an owned
+substring is `s[a..b].clone()` (design/consistency-designs.md, finding 5). A
+slice of a literal or a `str` constant is a view of static bytes, with no
+root; a slice of a string global is a copy held for the statement (a global
+cannot be lent, section 5.2), so it too is kept with `.clone()`. `s[a..]` and `s[..b]` run to the end and from
 the start. `s[i]` is the byte at index `i` (a `byte`), on an owned or
 borrowed `str`; it is a value, not a place, so it cannot be assigned or
 borrowed `mut` (a string is immutable). Out-of-range indices and bounds stop
@@ -198,9 +202,8 @@ buffer: `s.addByte(c)`, `s.addInt(n)` and `s.addLine(x)` append the same way,
 separate string builder type).
 
 A shared `&str` is a **view**: the string's header (a pointer to its bytes and
-its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`
-without copying them, and so does `s[a..b]` where a `&str` is expected;
-elsewhere `s[a..b]` is a new owned `str` holding a copy of those bytes. In the
+its length) by value. `s[a..b]` (and `&s[a..b]`) borrows the bytes `a` to
+`b - 1` of `s` without copying them; `s[a..b].clone()` copies them. In the
 runtime a string owns a buffer of the heap, except the static bytes of
 literals and constants (and of `strStatic`, section 11), which are never
 freed and which copies may share (design/owned-str.md, "Stage 2"). A view
