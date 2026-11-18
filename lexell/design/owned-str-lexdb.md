@@ -317,8 +317,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AO | SPEC 5.2 (finding 3): a `var` global may have any type that holds no borrows. One without a constant form or with a calling initializer is initialized on first use (exit 12 if its initializer reaches it) and dropped at exit. `G.with(fn(x: mut &T) { ... })` changes it in place; a nested `with`, or assigning a heap-holding `G` while open, is exit 13. Value-only reads as before. Each `var` global's initializer is also a hidden function `__ginit_<name>` (errors in it say "the initializer of G"). | 6c8f4c7f | yes | none |
 
-| AP | `s += x` on an owned string appends in place; the buffer grows geometrically (100k/200k/400k one-byte appends: 0.07/0.31/1.22 s before, 0.001/0.001/0.002 s after; 4M in 0.015 s). Also when `x` is `s` or a slice of it. | (this commit) | yes | none (faster) |
-| AQ | `StrBuf.text(): &str` (takes `mut &StrBuf`): the bytes as a `&str` without a copy, via the new intrinsic `strView(mut &bytes)`; a reused buffer can be a lookup key (`m.find(b.text())`). | (this commit) | yes | none |
+| AP | `s += x` on an owned string appends in place; the buffer grows geometrically (100k/200k/400k one-byte appends: 0.07/0.31/1.22 s before, 0.001/0.001/0.002 s after; 4M in 0.015 s). Also when `x` is `s` or a slice of it. | 3f2a86a6 | yes | none (faster) |
+| AQ | `StrBuf.text(): &str` (takes `mut &StrBuf`): the bytes as a `&str` without a copy, via the new intrinsic `strView(mut &bytes)`; a reused buffer can be a lookup key (`m.find(b.text())`). | 3f2a86a6 | yes | none |
 
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
