@@ -3467,6 +3467,12 @@ type JL = record {
     single: []Val
     res: BNode
     resTyp: int
+    // cut by the next level's hash (reduceHashes): per bucket, the rows
+    // cut (a bucket left empty keeps its key), counted as read and joined
+    // here and probed there (the next level's place in jls), as the row
+    // engine counts them; -1 not cut
+    cutB: []int
+    cutTo: int
 }
 
 fn newJL(how: int, level: int, first: int, ncol: int): JL {
@@ -3474,7 +3480,8 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               mode: JK_GEN, ints: newMap(), txts: newMap(), gens: newMap(), head: [], next: [], rows: lexdb_rows.noRows(),
               conds: [], creads: [], post: [], preads: [], ktypes: [], tail: lexdb_access.noTail(), noRange: false, index: -1,
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
-              perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT}
+              perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
+              cutB: [], cutTo: -1}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -3675,7 +3682,7 @@ fn projOf(t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, kinds: &[]int): BPlan 
 
 // What reading a table did: rows read, those its conditions kept, its
 // batches, and the rows the first hash's keys dropped after them.
-type RC = record { read: int; kept: int; batches: int; pushed: int }
+type RC = record { read: int; kept: int; batches: int; pushed: int; cut: int }
 
 // Reads table t's rows as src says (the plan's arm sc), in chunks: each
 // batch (by the table's columns, bp) and the rows its conditions conds
@@ -3685,7 +3692,7 @@ type RC = record { read: int; kept: int; batches: int; pushed: int }
 // condition: raised. A value a batch cannot hold: batErr. Whether each
 // stopped it.
 fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, bp: &BPlan,
-            conds: &[]BNode, pushCol: int, push: &Map[int, int], rawOnErr: bool, rc: mut &RC,
+            conds: &[]BNode, pushCol: int, ph: &PushH, rawOnErr: bool, rc: mut &RC,
             each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     var ranges = false
@@ -3730,7 +3737,7 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
             match pick(conds, &b, collections.copyOf(&idx)) {
                 Ok(kept) {
                     rc.kept += len(kept)
-                    let fin = pushed(&b, kept, pushCol, push, rc)
+                    let fin = pushed(&b, kept, pushCol, ph, rc)
                     if !(try each(txn, mut &b, fin, false)) { return Ok(true) }
                 }
                 Err(x) {
@@ -3743,6 +3750,7 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
         return Ok(false)
     }
     let lazy = lazyOf(bp, t, conds, pushCol)
+    let hasCut = len(ph.cutB) > 0
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
     for s in src.scans {
         var cur = lexdb_access.newCursor()
@@ -3752,6 +3760,7 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
             var bad: []DbErr = []
             var keptN = 0
             var dropped = 0
+            var cutRows = 0
             let got = try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, bp, &src.rd, &lazy,
                                                   fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] {
                 var cur2 = idx
@@ -3774,8 +3783,21 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
                 if pushCol < 0 { return Some(cur2) }
                 var fin: []int = withCapacity(len(cur2))
                 let kc = &b.cols[pushCol]
+                // (holds, inline: the scan's every row)
                 for r in cur2 {
-                    if !kc.nul[r] && push.get(&kc.v[r]).isSome() { append(mut &fin, r) } else { dropped += 1 }
+                    if kc.nul[r] {
+                        dropped += 1
+                        continue
+                    }
+                    match ph.keys.get(&kc.v[r]) {
+                        Some(bk) {
+                            if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                dropped += 1
+                                if hasCut { cutRows += ph.cutB[bk] }
+                            }
+                        }
+                        None { dropped += 1 }
+                    }
                 }
                 return Some(fin)
             }, &lexdb_access.noBar(), mut &spare)
@@ -3810,6 +3832,7 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
             rc.read += nr
             rc.kept += keptN
             rc.pushed += dropped
+            rc.cut += cutRows
             rc.batches += 1
             if !(try each(txn, mut &b, idx, false)) { return Ok(true) }
             // (the batch back from its consumer, used again: lexdb_rows.reuse)
@@ -3834,14 +3857,32 @@ fn pick(conds: &[]BNode, b: &Batch, idx0: []int): Result[[]int, DbErr] {
 }
 
 // rows narrowed by the first hash's keys (readRows' push), the dropped counted.
-fn pushed(b: &Batch, rows: []int, pushCol: int, push: &Map[int, int], rc: mut &RC): []int {
+fn pushed(b: &Batch, rows: []int, pushCol: int, ph: &PushH, rc: mut &RC): []int {
     if pushCol < 0 { return rows }
     var fin: []int = withCapacity(len(rows))
     let kc = &b.cols[pushCol]
     for r in rows {
-        if !kc.nul[r] && push.get(&kc.v[r]).isSome() { append(mut &fin, r) } else { rc.pushed += 1 }
+        if ph.holds(kc, r, mut &rc.cut) { append(mut &fin, r) } else { rc.pushed += 1 }
     }
     return fin
+}
+
+// The first hash's keys as the scan narrows by them: its key map, its
+// buckets' first rows, and (reduceHashes) its rows cut per bucket.
+type PushH = record { keys: &Map[int, int]; head: &[]int; cutB: &[]int }
+
+// Whether row r's key (column kc) has rows in the hash; the rows a cut
+// took from its bucket added to cut.
+fn (ph: &PushH) holds(kc: &BVec, r: int, cut: mut &int): bool {
+    if kc.nul[r] { return false }
+    match ph.keys.get(&kc.v[r]) {
+        Some(bk) {
+            if ph.head[bk] >= 0 { return true }
+            if len(ph.cutB) > 0 { cut += ph.cutB[bk] }
+            return false
+        }
+        None { return false }
+    }
 }
 
 // Column c's rows at (its rows' places in src; -1 NULL) into out's column oc.
@@ -4088,6 +4129,93 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
     }
 }
 
+// Hashes reduced by the hashes after them (q7's and q21's supplier by
+// their nation): where a later inner hash join's one integer key is a
+// column of an earlier hash's table, the earlier hash's rows whose column
+// that later hash does not hold can join nothing (every row the join
+// gives passes the later level), so they are unlinked from their buckets
+// (the first hash's keys also narrow the scan, joinRows' pushCol: a key
+// whose bucket is empty drops its rows there). The levels from the earlier one to
+// the later one must join by columns only, with no condition per
+// candidate: a row dropped early must not be one whose condition would
+// have raised an error (exactness).
+var hashCuts: int = 0
+
+fn reduceHashes(jr: mut &JRun) {
+    // the last first: a hash cut by a later one cuts the earlier ones by what it keeps
+    var j = len(jr.jls)
+    while j > 2 {
+        j -= 1
+        let jh = jr.jls[j].how
+        if !(jh == lexdb_plan.JH_HASH || jh == lexdb_plan.JH_ROWS) || jr.jls[j].mode != JK_INT || jr.jls[j].left || jr.jls[j].right ||
+           jr.jls[j].mark == lexdb_plan.MK_ANTI || len(jr.jls[j].key) != 1 { continue }
+        var c = -1
+        match jr.jls[j].key[0] {
+            BNode.Col(x) { c = x }
+            else {}
+        }
+        if c < 0 { continue }
+        // the level just before (the counts of the rows cut are then the
+        // two levels'), keyed by one integer, a plain join
+        let k = jr.owner[c]
+        if k != j - 1 || k < 1 { continue }
+        let kh = jr.jls[k].how
+        if !(kh == lexdb_plan.JH_HASH || kh == lexdb_plan.JH_ROWS) || jr.jls[k].left || jr.jls[k].right || jr.jls[k].mode != JK_INT ||
+           jr.jls[k].mark != lexdb_plan.MK_JOIN || jr.jls[k].resCol >= 0 { continue }
+        var plain = true
+        for m in k..j {
+            let ml = &jr.jls[m]
+            if len(ml.conds) > 0 || len(ml.post) > 0 || ml.resCol >= 0 { plain = false }
+            for x in ml.key {
+                match x {
+                    BNode.Col(_) {}
+                    else { plain = false }
+                }
+            }
+        }
+        if !plain { continue }
+        let kc = c - jr.jls[k].first
+        if kc < 0 || kc >= len(jr.jls[k].rows.cols) || jr.jls[k].rkinds[kc] != BK_INT { continue }
+        // the earlier hash's rows the later one holds a key for, per row
+        var live: []bool = array(jr.jls[k].rows.n, false)
+        {
+            let rows = &jr.jls[k].rows
+            let held = &jr.jls[j].ints
+            for r in 0..rows.n { live[r] = !rows.cols[kc].nul[r] && held.get(&rows.cols[kc].v[r]).isSome() }
+        }
+        hashCuts += cutRows(mut &jr.jls[k], &live, j)
+    }
+}
+
+// jl's rows not live unlinked from their buckets (each bucket's order
+// kept; a bucket left empty keeps its key). The rows cut.
+fn cutRows(jl: mut &JL, live: &[]bool, to: int): int {
+    var cut = 0
+    var perB: []int = array(len(jl.head), 0)
+    for b in 0..len(jl.head) {
+        var r = jl.head[b]
+        var first = -1
+        var prev = -1
+        while r >= 0 {
+            let nx = jl.next[r]
+            if live[r] {
+                if prev < 0 { first = r } else { jl.next[prev] = r }
+                prev = r
+            } else {
+                cut += 1
+                perB[b] += 1
+            }
+            r = nx
+        }
+        if prev >= 0 { jl.next[prev] = -1 }
+        jl.head[b] = first
+    }
+    if cut == 0 { return 0 }
+    jl.cutTo = to
+    jl.cutB = perB
+    return cut
+}
+
 // A hash being built: its rows (by its table's columns), its buckets
 // (per bucket its first and last row, per row the next of its bucket),
 // and a "<>" summary's per bucket (more than one value, or its one value).
@@ -4259,8 +4387,10 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
         }
     } else {
         let none: Map[int, int] = newMap()
-        var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
-        let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &none, false, mut &rc,
+        let noInts: []int = []
+        let ph = PushH{keys: &none, head: &noInts, cutB: &noInts}
+        var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
+        let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &ph, false, mut &rc,
                                 fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
             try bd.add(b, &idx, &bp, &j.hcols, mode, false, keepAll, j.resCol, room, maxHeld)
             return Ok(true)
@@ -4333,6 +4463,13 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                     match jl.ints.get(&kv[0].v[r]) {
                         Some(x) { bk = x }
                         None {}
+                    }
+                    if bk >= 0 && jl.cutTo >= 0 {
+                        // the rows the next level's hash cut: as if read, joined and probed there
+                        let m = jl.cutB[bk]
+                        cnt[lv].read += m
+                        cnt[lv].joined += m
+                        cnt[jr.jls[jl.cutTo].level].starts += m
                     }
                 }
             } else if jl.mode == JK_TEXT {
@@ -4650,6 +4787,8 @@ fn postOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut
 // Chunks joined to a range per row (the tests' look).
 var rangeJoinChunks: int = 0
 
+pub fn hashCutRows(): int { return hashCuts }
+
 pub fn rangeJoins(): int { return rangeJoinChunks }
 
 // A level's candidates (per candidate, its row before pj and its row of
@@ -4761,6 +4900,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
     var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone()}
     try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, dec, bud, cnt)
+    reduceHashes(mut &jr)
     let bottom = joinBottom(top)
     let none: []BX = []
     let conds = match bottom {
@@ -4806,10 +4946,11 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
             js.seen = array(jr.jls[i].rows.n, false)
         }
     }
-    var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0}
-    let pm = &jr.jls[if pushCol >= 0 { 1 } else { 0 }].ints
+    var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
+    let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
+    let ph = PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB}
     var rawKept = 0
-    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &bp, &cn, pushCol, pm, exact, mut &rc,
+    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &bp, &cn, pushCol, &ph, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
@@ -4858,6 +4999,12 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     if pushCol >= 0 {
         cnt[jr.jls[1].level].starts += rc.pushed
         pushDrops += rc.pushed
+        if rc.cut > 0 {
+            // the rows the next hash cut from the first (reduceHashes)
+            cnt[jr.jls[1].level].read += rc.cut
+            cnt[jr.jls[1].level].joined += rc.cut
+            cnt[jr.jls[jr.jls[1].cutTo].level].starts += rc.cut
+        }
     }
     return Ok(Unit{})
 }
