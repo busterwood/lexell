@@ -5729,7 +5729,7 @@ the server's instructions and the output's md5).
   the row engine's sorts and windows share them. `imports.py`: it imports
   values, their operations and encodings only (`lexdb_sql`, `lexdb_ops`,
   `lexdb_vec`, `lexdb_access`); only the pipe and exec import it.
-- P3b and P3c (one commit): the operator, the plan's keys, the deletions,
+- 783e3c1e (P3b and P3c): the operator, the plan's keys, the deletions,
   and the top-N bar.
 
 **The plan** (`lexdb_plan`):
