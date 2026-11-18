@@ -372,6 +372,8 @@ pub type Checker = record {
     capl: [][]Cap
     statics: Map[str, int]
     palts: [][]RootPath     // Val.pa: the places an if or match expression's borrow may be
+    appendTo: int           // s += x on a str place: the C of &s, for binop to append in place (or -1)
+    appended: bool          // binop did so: the compound assignment stores nothing
     podMemo: []int
     copyMemo: []int
     cids: int
@@ -389,7 +391,7 @@ pub type Checker = record {
 }
 
 pub fn newChecker(pg: sema.Program): Checker {
-    var c = Checker{pg: pg, x: tm.newArena(), tmpls: [], ginits: [], cinits: [], vars: [], tmps: [], capl: [], palts: [], statics: newMapWith[str, int](fxHashStr),
+    var c = Checker{pg: pg, x: tm.newArena(), tmpls: [], ginits: [], cinits: [], vars: [], tmps: [], capl: [], palts: [], appendTo: -1, appended: false, statics: newMapWith[str, int](fxHashStr),
         podMemo: [], copyMemo: [], cids: 0, holes: [], lifted: [], cx: newCtx(-1, "", sema.T_VOID, [], 0, false),
         outers: [], calleeTps: [], initOrder: [], mxs: [], joins: [], joinVars: [], tmpVars: [], noRebase: 0, octx: "", liveSkip: -1}
     for f in 0..len(c.pg.fns) { append(mut &c.tmpls, Tmpl{done: false, lines: [], holes: [], lifted: []}) }
@@ -2338,10 +2340,16 @@ fn (c: mut &Checker) sAssign(s: int) {
     let lv = c.before1(p.clone(), n.b)
     var fixed = tg
     while c.kind(fixed) == sx.N_FIELDX || c.kind(fixed) == sx.N_INDEX { fixed = c.nd(fixed).a }
+    if op == "+" && p.t == sema.T_STR { c.appendTo = c.x.par(c.x.pre("&", p.c)) }
     var r = c.binop(op, lv.clone(), Arg{isVal: false, n: n.b, v: lv.clone()}, n.line, p.t, c.kind(fixed) != sx.N_NAME, p.clone())
+    c.appendTo = -1
     // the value is stored to the place after b has run: b may have moved the place's variable
     // (`x.v += take(x)`, or an if expression moving it on one path and dropping it on the others)
     if p.root >= 0 && p.vvar < 0 && c.vars[p.root].moved { c.movedErr(p.root, n.line) }
+    if c.appended {
+        c.appended = false
+        return
+    }
     if c.effects(n.b, false) && c.checks(p.c) && c.pod(p.t) { r = c.seq(r) }
     let cc = c.consumeAs("assign", c.coerce(r, p.t, n.line, "the result"), n.line)
     let live = !(p.vvar >= 0 && c.vars[p.vvar].moved)
@@ -4240,6 +4248,8 @@ fn (c: mut &Checker) logic(e: int): Val {
 
 // lv: the evaluated left operand; r: the right operand (a node, or a value).
 fn (c: mut &Checker) binop(op: &str, lv0: Val, r: &Arg, line: int, exp: int, hasHeld: bool, held: Val): Val {
+    let appendTo = c.appendTo       // s += x's place: for this operator only, not those in x
+    c.appendTo = -1
     let lv = c.rcRead(lv0)          // SPEC 4.9: an operator reads an rc handle's value
     let lt = lv.t
     var rv0 = r.v.clone()
@@ -4289,6 +4299,12 @@ fn (c: mut &Checker) binop(op: &str, lv0: Val, r: &Arg, line: int, exp: int, has
         } else if (lt == sema.T_BOOL || lt == sema.T_PTR) && (op == "==" || op == "!=") {
             return rv(c.x.par(c.x.bin(&op, lv.c, rv1.c)), sema.T_BOOL)
         } else if lt == sema.T_STR {
+            if op == "+" && appendTo >= 0 {
+                // s += x: appended to s's own buffer, which grows geometrically (design/consistency.md)
+                c.emitx(c.x.call("rt_str_append_to", [appendTo, rv1.c]))
+                c.appended = true
+                return voidVal(false)
+            }
             if op == "+" { return c.holdtmp(c.x.call("rt_str_concat", [lv.c, rv1.c]), sema.T_STR) }
             if op == "==" || op == "!=" {
                 let eq = c.x.call("rt_str_eq", [lv.c, rv1.c])
@@ -5771,11 +5787,11 @@ fn (c: mut &Checker) convert(t: int, e: int): Val {
 // The intrinsics (ref's INTRINSICS): their index, or -1.
 const INTR_NAMES: []str = ["strByte", "strSlice", "strFromBytes", "strToBytes", "intToStr", "i128ToStr", "u128ToStr",
     "u64ToStr", "floatToStr", "parseFloat", "writeFd", "readFile", "args", "getenv", "strFromC", "strFindByte", "strFindAny",
-    "strFind", "strFindPair", "appendStr", "strWord", "strStatic"]
+    "strFind", "strFindPair", "appendStr", "strWord", "strStatic", "strView"]
 const INTR_C: []str = ["rt_str_byte", "rt_str_sub", "rt_str_from_bytes", "rt_str_to_bytes", "rt_int_to_str",
     "rt_i128_to_str", "rt_u128_to_str", "rt_u64_to_str", "rt_float_to_str", "rt_parse_float", "rt_write_fd",
     "rt_read_file", "rt_args", "rt_getenv", "rt_str_from_c", "rt_str_find_byte", "rt_str_find_any", "rt_str_find",
-    "rt_str_find_pair", "rt_str_append", "rt_str_word", "rt_str_static"]
+    "rt_str_find_pair", "rt_str_append", "rt_str_word", "rt_str_static", "rt_str_view_bytes"]
 
 fn intrinsic(name: &str): int {
     for i in 0..len(INTR_NAMES) {
@@ -5811,6 +5827,7 @@ fn (c: mut &Checker) intrSig(i: int): Sig {
         19 { ps = [c.pg.mkRef(c.pg.mkArr(sema.T_BYTE), true), S]; ret = sema.T_VOID }
         20 { ps = [S, I]; ret = sema.T_U64 }
         21 { ps = [S] }
+        22 { ps = [c.pg.mkRef(c.pg.mkArr(sema.T_BYTE), true)]; ret = c.pg.mkRef(S, false) }
         else { ps = [sema.T_PTR] }
     }
     var s = newSig(&INTR_NAMES[i], SK_INTR, ps, ret)

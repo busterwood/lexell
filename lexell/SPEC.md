@@ -189,6 +189,10 @@ borrowed `str`; it is a value, not a place, so it cannot be assigned or
 borrowed `mut` (a string is immutable). Out-of-range indices and bounds stop
 the program (exit 3). A string is at most
 4 GiB − 1 bytes long; making a longer one stops the program (exit 2).
+`s += x` on an owned string variable, field or element appends to its own
+buffer, which grows geometrically, so a run of appends costs time linear in
+the final length; `s + x` makes a new string. A `strings.StrBuf`'s text is
+also readable as a `&str` without a copy (`b.text()`).
 
 A shared `&str` is a **view**: the string's header (a pointer to its bytes and
 its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`

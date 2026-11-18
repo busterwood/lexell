@@ -25,6 +25,7 @@ rule.
 - AN (finding 1, option a, with weak handles as the user agreed): the cycle
   check, `task.Weak`, `share()` for handle types, httpserver's app in an `rc`.
 - AO (finding 3): globals of any type, initialized on first use, `G.with`.
+- AP, AQ (lexdb's review): `s += x` in place; `StrBuf.text()`.
 
 ## Plan, in order
 

@@ -392,7 +392,7 @@ clamps to 0 (it used to trap).
 `substr`, `indexOf(s, sub, from)`, `startsWith`, `endsWith`, `contains`,
 `trim`, `repeat`, `isSpace`, `isDigit`, `parseIntOpt` returning `Option`,
 `StrBuf` (`newStrBuf`, `add`, `addByte`, `addInt`, `addLine`, `size`, `clear`,
-`toStr`), `lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
+`toStr`, `text` (the bytes so far as a `&str`, no copy: a reused buffer as a lookup key)), `lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
 `count`, `equalFoldAscii`, `split(&s, sep):
 []&str`, `splitN(&s, sep, n)` (n < 0: all), `fields(&s): []&str`, `cut(&s,
 sep): Option[Cut]` (`before` and `after` are views), `owned(&pieces): []str`,
@@ -1999,7 +1999,8 @@ they are passed as any `&T` argument is, so the caller keeps its string): `strBy
 of any byte of a set, of a string, of a position `p` with `s[p + i1]` in one
 set and `s[p + i2]` in another; 16 bytes a step with SSE2, for the regex
 prefilters), `appendStr(mut &bytes, s)` (the bytes of `s` at the end of a
-`[]byte` in one copy: `StrBuf.add`), `strStatic(s)` (a copy of `s` that is
+`[]byte` in one copy: `StrBuf.add`), `strView(mut &bytes)` (the bytes as a
+`&str`, no copy: `StrBuf.text`), `strStatic(s)` (a copy of `s` that is
 never freed, so its copies and clones share the bytes: for strings that live
 until the program exits, such as a compiler's names), and the built-ins `isNull`, `exit`,
 `panic`. `task` also uses the library-only intrinsics `intoPtr` and

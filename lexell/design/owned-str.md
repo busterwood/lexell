@@ -26,7 +26,8 @@ special cases with it:
 
 1. **`str` is owned.** It is an owned byte string (a wrapper around `[]byte`),
    moved like any other owned type and borrowed as `&str` / `mut &str`. With
-   one owner it may also be appended to in place.
+   one owner it may also be appended to in place (done 2026-11-18,
+   design/consistency.md: `s += x` grows the buffer geometrically).
 2. **`rc T` is declared reference counting**, marked where it is used, like
    `&T`. It is not marked on the declaration, so one `[]Node` or `str` can be
    unique in one place and shared in another.
