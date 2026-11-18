@@ -17,6 +17,8 @@
 #          with its default parallel workers and with none
 #          (max_parallel_workers_per_gather = 0); the results compared
 # PostgreSQL: shared_buffers 4GB (both servers hold all the data in memory),
+# effective_cache_size 34GB, work_mem 64MB, maintenance_work_mem 1GB,
+# random_page_cost 1.1, effective_io_concurrency 200, max_wal_size 8GB;
 # otherwise its defaults. lexdb: its defaults (io_uring and adaptive polling).
 # PostgreSQL is capped at 4 processes, lexdb's shape (a main process and 3
 # replicas; the user's rule of 2026-11-13): its parallel aggregates at a
@@ -57,7 +59,9 @@ start() {
     else
         local cap=(-p CPUAffinity="$SERVER_CPUS"); [ -n "${PG_UNCAPPED:-}" ] && cap=()
         systemd-run --user --quiet --collect -u "$(unit pg)" "${cap[@]}" /usr/bin/postgres -D "$W/pg" -k "$PSOCK" -p $PPORT \
-            -c listen_addresses= -c shared_buffers=4GB
+            -c listen_addresses= -c shared_buffers=4GB -c effective_cache_size=34GB \
+            -c work_mem=64MB -c maintenance_work_mem=1GB -c random_page_cost=1.1 \
+            -c effective_io_concurrency=200 -c max_wal_size=8GB
     fi
     ready "$1"
 }

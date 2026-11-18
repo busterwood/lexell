@@ -27,7 +27,7 @@
 #   TPCH_ONLY=lexdb,pg1,pg4   modes to run (default all three)
 #   TPCH_DBGEN=PATH           dbgen binary or kit directory;
 #                             default WORKDIR/tpch-kit/dbgen/dbgen
-#   PG_SHARED_BUFFERS=12GB
+#   PG_SHARED_BUFFERS=4GB
 #   TPCH_CPUS=0-3             CPUs both servers are confined to
 #   TPCH_INDEXES=conventional secondary index set, or none for PKs only
 #   QUERY_TIMEOUT=900         seconds per query; lexdb cancels on the server
@@ -36,7 +36,7 @@
 #   LEXDB_CKPT_POOL=1, LXL_PAR=N   passed to lexdb when set
 #   LEXDB_CPU_QUOTA=400%      lexdb cgroup quota (default: none; a 100%
 #                             quota throttles its parallel checkpoint pool)
-#   PG_CPU_QUOTA=400%         PostgreSQL cgroup quota (default: 400%)
+#   PG_CPU_QUOTA=400%         PostgreSQL cgroup quota (default: none, no quota)
 #   TPCH_CHECK_ONLY=1         check prerequisites and the plan; run nothing
 #   TPCH_REF=DIR              an earlier run's directory whose pg1.tsv checks
 #                             lexdb's results when this run has no pg1
@@ -70,7 +70,7 @@ OUT=$W/out
 DATA=$W/sf$SF
 UNIT_L=tpch-lexdb
 UNIT_P=tpch-pg
-PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-12GB}
+PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-4GB}
 QUERY_TIMEOUT=${QUERY_TIMEOUT:-900}
 TPCH_CPUS=${TPCH_CPUS:-0-3}
 TPCH_INDEXES=${TPCH_INDEXES:-conventional}
@@ -213,7 +213,9 @@ start_pg() {
     mkdir -p "$W/psock"
     systemd-run --user --quiet --collect -u "$UNIT_P" "${cap[@]}" \
         "$POSTGRES" -D "$W/pg" -k "$W/psock" -p "$PPORT" \
-        -c listen_addresses=127.0.0.1 -c shared_buffers="$PG_SHARED_BUFFERS"
+        -c listen_addresses=127.0.0.1 -c shared_buffers="$PG_SHARED_BUFFERS" \
+        -c effective_cache_size=34GB -c work_mem=64MB -c maintenance_work_mem=1GB \
+        -c random_page_cost=1.1 -c effective_io_concurrency=200 -c max_wal_size=8GB
     for _ in $(seq 100); do
         psql_admin "$PPORT" -Atc 'select 1' >/dev/null 2>&1 && return 0
         sleep 0.1
