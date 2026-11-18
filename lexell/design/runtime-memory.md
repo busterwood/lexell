@@ -17,8 +17,13 @@ glibc's: lexdb is linked dynamically, but imports no `malloc`.
     reuses it.
   - A chunk is shared by every class, so a page holds blocks of many
     classes.
-- **Large blocks** are each their own mapping, unmapped when freed. The
-  last one freed, up to 32 MB, is kept for reuse.
+- **Large blocks** are each their own mapping. A freed block of up to 32 MB
+  goes into a small pool (up to 8 blocks, at most 64 MB on the main heap and
+  32 MB on a worker's heap; the oldest is unmapped first); a larger one is
+  unmapped at once. A large allocation, and a realloc that grows a large
+  block, reuse the smallest pooled block between the request and twice the
+  request. An idle process returns the pool (LXL_TRIM_MS, LXL_TRIM=0 turns it
+  off).
 
 So after a peak the small-block memory stays mapped and resident. Its free
 blocks are reused only by allocations of the same class.
