@@ -21,7 +21,7 @@ Method: wall times are best of N; instruction counts are user-mode
 |---|---|---|
 | Compile, hello world | Rust | 14 ms against 44 ms; 20 KB against 330 KB |
 | Compile, nine benchmarks | Rust | 131 ms against 2,780 ms |
-| Microbenchmarks, native `-O` | Rust | level or ahead on eight of the nine with a Rust port; `tokens` 1.33 times slower |
+| Microbenchmarks, native `-O` | Rust | level or ahead on eight of the nine with a Rust port; `tokens` 2.0 times slower |
 | Regex, literal and class searches | Go regexp | ahead on most; `dates` about 100 times slower |
 | JSON, parse and output | Python json | 1.25 to 2 times faster |
 | JSON, query and visit | Python json | about 4 times slower |
@@ -64,8 +64,16 @@ Ten programs, native `-O`, wall time, best of 5. Nine have a Rust port in
 | strings | 210 ms | 277 ms | 0.76 |
 | lists | 191 ms | 450 ms | 0.42 |
 | trees | 136 ms | 334 ms | 0.41 |
-| tokens | 234 ms | 176 ms | 1.33 |
+| tokens | 186 ms | 93 ms | 2.00 |
 | maps | 365 ms | no reference | |
+
+`tokens` was rewritten for this run to use views of the source (identifiers are
+`&str` slices, and the intern table holds them), in both languages, with the same
+output. The same source compiled through the C backend takes 96 ms, level with Rust;
+the native backend executes about 1.6 times the instructions on the scanning loop.
+That gap is the native code generator's, not the program's; the native
+backend's code for the scanning loop is the cause, and the work on it is tracked
+in `lexell/design/codegen-audit.md`.
 
 ## Applications
 
