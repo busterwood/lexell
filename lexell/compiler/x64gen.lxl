@@ -1066,11 +1066,13 @@ fn (g: mut &Gen) allocRegs(f: int) {
         }
     }
     // the data pointer and the length of a str that loops hoisted (they save two loads and one a
-    // use): half the weight, and no register of their own to save
+    // use): half the weight, and a sixteenth of the raw weight: a register of their own to save
+    // only for a use in a loop in a loop (a loop over a short str runs a few times a call; a
+    // nested one is a scan that pays a load a byte, tokens' identifiers)
     for l in cands {
         if g.u.strHd.getOr(&l, -1) >= 0 {
             g.weight[l] = g.weight[l] / 2
-            g.rawW[l] = 0
+            g.rawW[l] = g.rawW[l] / 16
         }
     }
     // heaviest first (a stable insertion sort: the order of the touched list breaks ties)
@@ -2115,7 +2117,37 @@ fn (g: &Gen) quietRt(e: int): bool {
     if dv.k >= 0 { return nargs == (if dv.op == ir.OP_SUB { 2 } else { 3 }) && g.isWhere(g.u.listAt(n.b, nargs - 1)) }
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
     if name == "rt_arr_push" { return g.pushInline(e) }
+    if name == "rt_str_view" { return g.viewInline(e) }
     return false     // rt_str_dup copies (design/owned-str.md): a call of the runtime
+}
+
+// Whether the call e is an rt_str_view(s, a, b, w) that genView generates inline: s a str in
+// the frame (a local or a member of one: a str is never in a register) and a and b integers it
+// loads with no code but a move (constants, locals, members of a local), whatever registers the
+// locals get. The shape alone decides, so the scan (quietRt) and the code agree.
+fn (g: &Gen) viewInline(e: int): bool {
+    let n = g.u.nodes[e]
+    if g.rtName(e) != "rt_str_view" || g.u.listLen(n.b) != 4 || !g.isWhere(g.u.listAt(n.b, 3)) { return false }
+    return g.frameAggr(g.u.listAt(n.b, 0)) && g.viewArg(g.u.listAt(n.b, 1)) && g.viewArg(g.u.listAt(n.b, 2))
+}
+
+// Whether x is an aggregate local or a member of one, in the frame.
+fn (g: &Gen) frameAggr(x: int): bool {
+    let n = g.u.nodes[x]
+    if !g.isAggr(n.ty) { return false }
+    if n.k == ir.E_LOCAL { return !g.u.isScalar(g.u.locals[n.a].ty) }
+    return n.k == ir.E_MEMBER && g.frameAggr(n.a)
+}
+
+// Whether the integer x is a constant, a local or a member of an aggregate in the frame (simple,
+// whatever registers the locals get).
+fn (g: &Gen) viewArg(x: int): bool {
+    let n = g.u.nodes[x]
+    if n.k == ir.E_INT { return true }
+    if g.noopCast(x) { return g.viewArg(n.a) }
+    if g.isAggr(n.ty) || g.isF(n.ty) || g.is128(n.ty) || !g.u.isInt(n.ty) { return false }
+    if n.k == ir.E_LOCAL { return true }
+    return n.k == ir.E_MEMBER && g.frameAggr(n.a)
 }
 
 // Whether the call e is an rt_arr_push that inlineRt generates inline: an element of a constant
@@ -6109,6 +6141,10 @@ fn (g: mut &Gen) genCall(e: int) {
     }
     if direct >= 0 && g.u.funcs[direct].body < 0 && !g.u.funcs[direct].isExtern {
         let rtName = g.u.funcs[direct].name.clone()      // a copy: inlineRt takes g mutably
+        if rtName == "rt_str_view" && g.viewInline(e) {
+            g.destUsed = g.genView(e, dest)
+            return
+        }
         if g.inlineRt(e, &rtName) {
             g.destUsed = false
             return
@@ -6835,6 +6871,52 @@ fn (g: mut &Gen) genStubs() {
         g.callRt("rt_trap")
     }
     g.stubOf.clear()
+}
+
+// rt_str_view(s, a, b, w) inline (viewInline): if a < 0 || b < a || b > s.len the trap, else
+// the str {s.p + a, s.cap, b - a} (native/rt.c), in dest when the caller gave a place in the
+// frame (whether it did), else in a temporary whose address is left in rax. Two compares
+// unsigned: b above len (b < 0 too), then a above b (a < 0 too, b being >= 0). Only rax, rcx and
+// rdx change (quietRt); s, a and b are all read before the result is written (dest may be s).
+fn (g: mut &Gen) genView(e: int, dest: x64.Mem): bool {
+    let n = g.u.nodes[e]
+    let m = g.staticMem(g.u.listAt(n.b, 0))
+    let ax = g.u.listAt(n.b, 1)
+    let bx = g.u.listAt(n.b, 2)
+    let w = g.u.listAt(n.b, 3)
+    let zero = g.u.nk(ax) == ir.E_INT && g.u.nodes[ax].v == 0
+    var rb = g.regOf(bx)
+    if rb < 0 {
+        rb = RCX
+        g.genInto(bx, RCX)
+    }
+    var ra = g.regOf(ax)
+    if ra < 0 && !zero {
+        ra = RDX
+        g.genInto(ax, RDX)
+    }
+    g.a.loadZX(4, RAX, at(m, 12))                   // len
+    g.a.alu(x64.CMP, 8, rb, RAX)
+    g.a.jcc(x64.CC_A, g.stub(3, "string slice out of range", w))
+    if !zero {
+        g.a.alu(x64.CMP, 8, ra, rb)
+        g.a.jcc(x64.CC_A, g.stub(3, "string slice out of range", w))
+    }
+    let used = dest.base == RBP
+    let d = if used { dest } else { rbp(g.tempFor(g.u.nodes[e].ty)) }
+    g.a.load(8, RAX, m)                             // p + a
+    if !zero { g.a.alu(x64.ADD, 8, RAX, ra) }
+    g.a.store(8, d, RAX)
+    // cap (the same block: a view has no count of its own) and len b - a, one word: the copy
+    // that reads the result whole would wait for two stores of four bytes
+    g.a.movRR(4, RAX, rb)
+    if !zero { g.a.alu(x64.SUB, 4, RAX, ra) }
+    g.a.shiftI(x64.SHL, 8, RAX, 32)
+    g.a.loadZX(4, RCX, at(m, 8))
+    g.a.alu(x64.OR, 8, RAX, RCX)
+    g.a.store(8, at(d, 8), RAX)
+    if !used { g.a.lea(RAX, d) }
+    return used
 }
 
 // The integer kind and operation of a checked or wrapping runtime arithmetic function
