@@ -305,7 +305,7 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AH | SPEC 5.2: `G.getOrSet(f)` on a set-once global returns `G.get()`, first setting it to `f()` if empty. Tasks that reach an empty `G` while another's `f` is suspended run `f` too; the first value stored wins, the rest are dropped, nothing stops the program. | 14e45946 | yes (a new method) | none |
 
-| AI | SPEC 12: an extern's string parameter is `&str` (C only reads it); a `str` extern parameter is an error. Passing is unchanged: call sites lend the string implicitly. Intrinsics are documented with `&str`. | (this commit) | **no**: `cmd/lexdb.lxl` line 36 `openLock(path: str, ...)` and `cmd/lexdb_disk.lxl` line 29 `openFile(path: str, ...)` need `path: &str` (done on this branch) | none |
+| AI | SPEC 12: an extern's string parameter is `&str` (C only reads it); a `str` extern parameter is an error. Passing is unchanged: call sites lend the string implicitly. Intrinsics are documented with `&str`. | e6d26884 | **no**: `cmd/lexdb.lxl` line 36 `openLock(path: str, ...)` and `cmd/lexdb_disk.lxl` line 29 `openFile(path: str, ...)` need `path: &str` (done on this branch) | none |
 
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
