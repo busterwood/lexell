@@ -315,6 +315,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AN | SPEC 4.7, 4.9, 16 (finding 1): no cycles through counted handles: a `task.Shared[T]` whose `T` can reach that same `Shared[T]` is a compile error. `task.Weak[T]` (`sh.weak()`, `w.upgrade(): Option[Shared[T]]`, `w.share()`) points back without keeping the value, and the check does not follow it. A `Shared`, or a type holding one, is not cloneable: handle types declare `share()` (`http.Client`, `pool.Pool`, `sse.Feed`, `sse.Cursor` do now). httpserver keeps the app in one `rc` shared by every connection, so `serve[A]` needs no `A: Clone`. | 7b8090db | **no**, done on this branch: `share()` on `Store`, `Follower`, `Memo`, `Locks`, `Fs`, `File`, `SeqEnv` (`Store.handle()` now calls it), every `.clone()` of those became `.share()`, and `Link.Local`/`LocalId` hold a `StoreRef` (weak) instead of a `Store`, which closed a cycle (Fol -> Link -> Store -> Option[Follower] -> Shared[Fol]). Tests: `Link.Local(st.weakRef())`. | A weakly linked master must stay open while its in-process followers run (it panics otherwise; the tests do) |
 
+| AO | SPEC 5.2 (finding 3): a `var` global may have any type that holds no borrows. One without a constant form or with a calling initializer is initialized on first use (exit 12 if its initializer reaches it) and dropped at exit. `G.with(fn(x: mut &T) { ... })` changes it in place; a nested `with`, or assigning a heap-holding `G` while open, is exit 13. Value-only reads as before. Each `var` global's initializer is also a hidden function `__ginit_<name>` (errors in it say "the initializer of G"). | (this commit) | yes | none |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
@@ -357,4 +359,11 @@ code:
   `Store.follower()` now shares the follower.
 - New lexdb code that copies a handle writes `share()`; `clone()` on a type
   holding a `Shared` is a compile error naming `share()`.
+
+**AO for lexdb.** State kept as `var G: once task.Shared[T]` set in main, or
+`var G: Option[T] = None` replaced wholesale, can be a plain global:
+`var ZONES: Map[str, Zone] = loadZones()` (loaded on first use) and
+`ZONES.with(fn(z) { ... })` to change it. A lazily loaded registry no longer
+needs `isSet`/`set` or `getOrSet`. Keep `once` for a value set once and lent
+everywhere (`get()` returns a borrow; a plain global is read by value).
 

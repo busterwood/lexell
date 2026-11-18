@@ -122,6 +122,7 @@ pub type GInit = record {
     pub items: []int
     pub c: int
     pub holes: []Hole
+    pub rt: bool        // initialized on first use by its __ginit_ function (design/consistency.md)
 }
 
 // ---------------------------------------------------------------- checker state
@@ -397,7 +398,7 @@ pub fn newChecker(pg: sema.Program): Checker {
     return c
 }
 
-fn noInit(): GInit { return GInit{has: false, isOnce: false, table: false, items: [], c: -1, holes: []} }
+fn noInit(): GInit { return GInit{has: false, isOnce: false, table: false, items: [], c: -1, holes: [], rt: false} }
 
 // ---------------------------------------------------------------- values
 
@@ -1721,7 +1722,7 @@ fn (c: mut &Checker) borrow(v0: Val, m: bool, line: int, recv: bool): Val {
                     // SPEC 5.2: an owned global is read by value: a borrow of it could outlive it
                     let gn = c.gname(v.gk, v.gi)
                     c.err(line, "cannot borrow global " + gn + " of the owned type " + c.tstr(v.t) +
-                        ": read a copy with " + gn + ".clone()")
+                        ": read a copy with " + gn + ".clone(), or change it in " + gn + ".with(fn(x) { ... })")
                 }
                 v = c.holdtmp(c.dup(v.c, v.t), v.t)
                 return c.borrow(v, m, line, false)
@@ -2324,6 +2325,7 @@ fn (c: mut &Checker) sAssign(s: int) {
         let p = c.place(tg)
         c.cx.rhsAt = -1
         c.cutPending(mark)
+        c.globalOpenCheck(&p, n.line)
         v = c.coerce(v, p.t, n.line, "the assigned value")
         if c.pg.isBorrowClass(p.t) { c.storeRoot(p.root, c.crOf(v), p.t, n.line) }
         let cc = c.consumeAs("assign", v, n.line)
@@ -2332,6 +2334,7 @@ fn (c: mut &Checker) sAssign(s: int) {
     }
     let p = c.place(tg)
     if p.vvar >= 0 && c.vars[p.vvar].moved { c.movedErr(p.vvar, n.line) }
+    c.globalOpenCheck(&p, n.line)
     let lv = c.before1(p.clone(), n.b)
     var fixed = tg
     while c.kind(fixed) == sx.N_FIELDX || c.kind(fixed) == sx.N_INDEX { fixed = c.nd(fixed).a }
@@ -3650,7 +3653,9 @@ fn (c: mut &Checker) staticValue(st: St, e: int, exp: int): Val {
             c.err(line, name + " is a set-once global: use " + name + ".get(), .set(v) or .isSet()")
         }
         let cname = c.pg.globals[di].cname.clone()
-        var v = val(c.nm(&cname), c.pg.globals[di].ty, CAT_PLACE)
+        // one initialized on first use is reached through its accessor (design/consistency.md)
+        let gc = if c.pg.globals[di].rt { c.x.par(c.x.pre("*", c.x.call(&("gacc_" + cname), []))) } else { c.nm(&cname) }
+        var v = val(gc, c.pg.globals[di].ty, CAT_PLACE)
         v.mutable = true
         v.gk = sema.D_GLOBAL
         v.gi = di
@@ -5872,6 +5877,7 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         let fn1 = c.node(f)
         let og = c.static(fn1.a)
         if og.k == ST_DECL && og.dk == sema.D_GLOBAL && c.pg.globals[og.di].isOnce { return c.onceCall(og.di, &fn1.s, e) }
+        if og.k == ST_DECL && og.dk == sema.D_GLOBAL && fn1.s == "with" { return c.globalWith(og.di, og, fn1.a, e) }
         let st = c.staticNs(fn1.a)
         let vst = if st.k != ST_NONE && st.k != ST_MODULE { c.static(f) } else { NOST }
         if vst.k == ST_DECL && vst.dk == D_VARIANT { return c.constructVariant(vst, &args, n.line, exp, -1) }
@@ -6100,6 +6106,36 @@ fn (c: mut &Checker) onceCall(g: int, name: &str, e: int): Val {
     let m = c.x.cond(c.x.bin("==", setn, c.lit(2)), c.x.str(&(msg + " is dropped")), c.x.str(&(msg + " is set twice")))
     c.emit(c.x.if1(setn, c.x.sx(c.x.call("rt_trap", [c.lit(12), m, W]))))
     c.emit(c.x.seq([c.x.sx(c.x.asg(c.nm(&cn), cc)), c.x.sx(c.x.asg(setn, c.lit(1)))]))
+    return voidVal(false)
+}
+
+// An assignment to a var global (or a part of it) while its with is open would free what the with
+// lends: it stops the program (exit 13; design/consistency.md, finding 3).
+fn (c: mut &Checker) globalOpenCheck(p: &Val, line: int) {
+    if p.gk != sema.D_GLOBAL || p.gi < 0 || c.pg.globals[p.gi].isOnce { return }
+    if c.isCopy(c.pg.globals[p.gi].ty) { return }      // nothing a with lends is freed by the store
+    let open = c.nm(&(c.pg.globals[p.gi].cname + "_open"))
+    let msg = "global " + c.pg.globals[p.gi].name + " assigned while its with is open"
+    c.emit(c.x.if1(open, c.x.sx(c.x.call("rt_trap", [c.lit(13), c.x.str(&msg), c.W(line)]))))
+}
+
+// G.with(f) on a var global (design/consistency.md, finding 3): f gets the global as mut &T. While
+// it runs the global is open: another G.with, or an assignment to G, stops the program (exit 13).
+fn (c: mut &Checker) globalWith(g: int, st: St, gnode: int, e: int): Val {
+    let n = c.node(e)
+    let W = c.W(n.line)
+    let gname = c.pg.globals[g].name.clone()
+    let gt = c.pg.globals[g].ty
+    if c.count(n.b) != 1 { c.err(n.line, "G.with takes one function, fn(mut &T)") }
+    let open = c.nm(&(c.pg.globals[g].cname + "_open"))
+    let cloT = c.pg.mkClo(&[c.pg.mkRef(gt, true)], sema.T_VOID)
+    let fv = c.coerce(c.expr(c.item(n.b, 0), cloT), cloT, n.line, "the argument of with")
+    let place = c.staticValue(st, gnode, -1)
+    c.emit(c.x.if1(open, c.x.sx(c.x.call("rt_trap", [c.lit(13), c.x.str(&("with on global " + gname + ", whose with is open")), W]))))
+    c.emit(c.x.sx(c.x.asg(open, c.lit(1))))
+    let ft = c.T(c.pg.mkFn(&[sema.T_PTR, c.pg.mkRef(gt, true)], sema.T_VOID))
+    c.emit(c.x.sx(c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(fv.c), "fn")), [c.x.dot(c.x.par(fv.c), "env"), c.addrOf(gt, place.c)])))
+    c.emit(c.x.sx(c.x.asg(open, c.lit(0))))
     return voidVal(false)
 }
 
@@ -6489,10 +6525,12 @@ fn (c: mut &Checker) globalInit(dk: int, g: int) {
     c.startFn(-1, "<global>", sema.T_VOID, [], m)
     let n = c.pg.node(m, node)
     let e = n.b
-    var r = GInit{has: true, isOnce: false, table: false, items: [], c: -1, holes: []}
+    var r = GInit{has: true, isOnce: false, table: false, items: [], c: -1, holes: [], rt: false}
     c.pg.gwrap = "the initializer of " + (if isG { "global" } else { "const" }) + " " + name + " must be constant: "
     if isG && n.flags & sx.ONCE != 0 {
         r.isOnce = true
+    } else if isG && c.pg.globals[g].rt {
+        r.rt = true             // its __ginit_ function, on first use
     } else if c.pg.tk(t) == sema.TK_ARR {
         if c.kind(e) != sx.N_ARRLIT { c.err(c.line(e), "a constant table is an array literal") }
         r.table = true

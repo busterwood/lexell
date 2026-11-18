@@ -231,6 +231,8 @@ pub type Global = value record {
     pub isOnce: bool
     pub ty: int
     pub cname: str
+    pub rt: bool       // its initializer runs on first use (design/consistency.md, finding 3)
+    pub initFn: int    // that initializer as a function (__ginit_<name>), or -1
 }
 
 pub type Module = value record {
@@ -1177,7 +1179,7 @@ fn (pg: mut &Program) collect(m: int) {
             }
             else {
                 append(mut &pg.globals, Global{node: a, mod: m, name: n.s.clone(), line: n.line, isPub: isPub,
-                    isOnce: n.flags & sx.ONCE != 0, ty: -1, cname: gp + n.s})
+                    isOnce: n.flags & sx.ONCE != 0, ty: -1, cname: gp + n.s, rt: false, initFn: -1})
                 pg.add(m, n.s.clone(), Sym{k: D_GLOBAL, i: len(pg.globals) - 1}, n.line)
             }
         }
@@ -1217,6 +1219,8 @@ pub fn (pg: &Program) lookupIn(m: int, target: int, name: &str, line: int): Sym 
 
 // ref's FnDecl.label: name, or Owner.name for a method.
 pub fn (pg: &Program) label(f: int): str {
+    let n = &pg.fns[f].name
+    if pg.fns[f].ownerKind == O_NONE && strings.startsWith(n, "__ginit_") { return "the initializer of " + n[8..] }
     return match pg.fns[f].ownerKind {
         O_NONE { pg.fns[f].name.clone() }
         O_PRIM { PRIM_NAMES[pg.fns[f].owner] + "." + pg.fns[f].name }
@@ -1949,21 +1953,49 @@ fn (pg: mut &Program) resolveGlobal(g: int) {
     // SPEC 5.2 (design/owned-str.md, issue 8): a global var of an owned type is allowed, with
     // value-only access (check: no borrow of it outlives a built-in operation; g.clone() reads it).
     // An array global keeps the constant-table form, so it must be set-once or owned by main.
-    if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_ARR && pg.soft(t) {
-        let gname = pg.globals[g].name.clone()
-        pg.note("gvar", m, a.line, &gname)
-    } else if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_ARR {
-        let ts = pg.tstr(t)
-        let gn: &str = &pg.globals[g].name
-        pg.err(m, a.line, "global " + gn + " has the array type " + ts + "; an array global must be " +
-            "set-once (var " + gn + ": once " + ts + ") or owned by main")
+    // design/consistency.md, finding 3: a global of any type (holding no borrows). One whose type
+    // has no constant form (an array, a boxed type, an owned type other than strings and value
+    // types of them) or whose initializer calls a function runs its initializer on first use.
+    if !pg.globals[g].isOnce {
+        let k = pg.tk(t)
+        var rt = k == TK_ARR || (k == TK_INST && !pg.types[pg.ta(t)].value) || !pg.isCopyLegacy(t)
+        if !rt { rt = pg.callsIn(m, a.a, a.b) }
+        pg.globals[g].rt = rt
+        let s = pg.mods[m].scope.getOr(&("__ginit_" + pg.globals[g].name), Sym{k: -1, i: -1})
+        if s.k == D_FN { pg.globals[g].initFn = s.i }
     }
-    if !pg.isCopy(t) && !pg.globals[g].isOnce && pg.tk(t) == TK_INST && !pg.types[pg.ta(t)].value {
-        let gn: &str = &pg.globals[g].name
-        let ts = pg.tstr(t)
-        pg.err(m, a.line, "global " + gn + " has the boxed type " + ts + ", which has no constant initializer; " +
-            "make it set-once (var " + gn + ": once " + ts + ") or a value type")
+}
+
+// Whether the expression after type node ty, ending at node e (nodes are made children first), calls
+// a function: a call whose callee is not a variant of a closed type (Some, E.V(...)).
+fn (pg: mut &Program) callsIn(m: int, ty: int, e: int): bool {
+    if e < 0 { return false }
+    for i in ty + 1..e + 1 {
+        if pg.mods[m].ast.nodes[i].kind != sx.N_CALL { continue }
+        let f = pg.mods[m].ast.nodes[i].a
+        let fk = pg.mods[m].ast.nodes[f].kind
+        let fname = pg.mods[m].ast.nodes[f].s.clone()
+        if fk == sx.N_NAME {
+            if fname == "Some" || fname == "Ok" || fname == "Err" { continue }
+            return true
+        }
+        if fk == sx.N_FIELDX {
+            let base = pg.mods[m].ast.nodes[f].a
+            if pg.mods[m].ast.nodes[base].kind == sx.N_NAME {
+                let s = pg.lookup(m, &pg.mods[m].ast.nodes[base].s)
+                if s.k == D_TYPE && pg.types[s.i].form == sx.F_CLOSED && pg.hasVariant(s.i, &fname) { continue }
+            }
+        }
+        return true
     }
+    return false
+}
+
+fn (pg: &Program) hasVariant(d: int, name: &str): bool {
+    for v in pg.types[d].variants {
+        if pg.variants[v].name == name { return true }
+    }
+    return false
 }
 
 // ---------------------------------------------------------------- constants

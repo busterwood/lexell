@@ -391,6 +391,30 @@ fn (e: mut &Emitter) dupField(ft: int, loc: int): int {
     return e.c.x.sx(e.c.x.asg(loc, e.dupC(ft, loc)))
 }
 
+// A global initialized on first use (design/consistency.md, finding 3): gacc_<cname>() runs its
+// __ginit_ function the first time and returns the global's address. An initializer that reaches its
+// own global, or a use after the global was dropped at exit, stops the program (exit 12).
+fn (e: mut &Emitter) globalAccessor(g: int, t: int, cn: &str, m: int, name: &str) {
+    let ct = e.ctype(t)
+    let st = e.nm(&(cn + "_st"))
+    let fi = e.c.pg.globals[g].initFn
+    if fi < 0 { sx.failText("internal error: global " + name + " has no initializer function") }
+    let init = e.instance(fi, e.c.pg.mkFn(&[], sema.T_VOID))
+    let w = e.c.x.str(&(e.c.pg.mods[m].fname + ":" + intToStr(e.c.pg.globals[g].line)))
+    var body: []int = []
+    append(mut &body, e.c.x.sif(e.c.x.bin("!=", st, e.c.x.lit(1))))
+    append(mut &body, e.c.x.if1(e.c.x.bin("==", st, e.c.x.lit(2)), e.c.x.sx(e.c.x.call("rt_trap", [e.c.x.lit(12),
+        e.c.x.str(&("the initializer of global " + name + " uses " + name)), w]))))
+    append(mut &body, e.c.x.if1(e.c.x.bin("==", st, e.c.x.lit(3)), e.c.x.sx(e.c.x.call("rt_trap", [e.c.x.lit(12),
+        e.c.x.str(&("global " + name + " is dropped")), w]))))
+    append(mut &body, e.c.x.sx(e.c.x.asg(st, e.c.x.lit(2))))
+    append(mut &body, e.c.x.sx(e.c.x.asg(e.nm(cn), e.call(&init, []))))
+    append(mut &body, e.c.x.sx(e.c.x.asg(st, e.c.x.lit(1))))
+    append(mut &body, e.c.x.send())
+    append(mut &body, e.c.x.sret(e.c.x.pre("&", e.nm(cn))))
+    e.define(&("gacc_" + cn), &(ct + "*"), [], [], body, -1)
+}
+
 // ---- derived methods (design/consistency.md, finding 4): eq, hash and toStr glue for a record or
 // closed type without its own, each taking pointers to the values (&Self).
 
@@ -1277,6 +1301,27 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
                 (n == "sipKeyed" || n == "sipK0" || n == "sipK1" || n == "mapSeed") {
                 e.kglobals.put(cn.clone(), true)        // par.map derives the key before its workers run (hash.keyReady)
             }
+            if isG && !gi.isOnce {      // G.with's open flag (design/consistency.md, finding 3)
+                append(mut &globs, GDef{name: cn + "_open", ty: "uint8_t", n: -1, init: -1, isConst: false, res: []})
+            }
+            if gi.rt {                  // initialized on first use: 0 not yet, 1 set, 2 initializing, 3 dropped
+                let ct = e.ctype(t)
+                append(mut &globs, GDef{name: cn.clone(), ty: ct, n: -1, init: -1, isConst: false, res: []})
+                append(mut &globs, GDef{name: cn + "_st", ty: "uint8_t", n: -1, init: -1, isConst: false, res: []})
+                e.globalAccessor(s.i, t, &cn, m, &n)
+                let st = e.nm(&(cn + "_st"))
+                var l: []int = []
+                if !e.pod(t) {
+                    append(mut &l, e.c.x.sif(e.c.x.bin("==", st, e.c.x.lit(1))))
+                    append(mut &l, e.c.x.sx(e.c.x.asg(st, e.c.x.lit(3))))
+                    append(mut &l, e.c.x.sx(e.dropC(t, e.nm(&cn))))
+                    append(mut &l, e.c.x.send())
+                }
+                append(mut &l, e.c.x.sx(e.c.x.asg(st, e.c.x.lit(3))))
+                for x in onces[m] { append(mut &l, x) }
+                onces[m] = l
+                continue
+            }
             if gi.isOnce {          // a set-once global: 0 empty, 1 set, 2 dropped
                 let ct = e.ctype(t)
                 append(mut &globs, GDef{name: cn.clone(), ty: ct, n: -1, init: -1, isConst: false, res: []})
@@ -1437,7 +1482,7 @@ fn (e: &Emitter) thunkSlot(u: mut &lw.Lower, k: int): int {
     return u.x.par(u.x.bin("+", u.x.cast(u.x.ptr(u.x.ct("int64_t")), u.x.nm("a")), u.x.lit(k)))
 }
 
-fn noInit(): ck.GInit { return ck.GInit{has: false, isOnce: false, table: false, items: [], c: -1, holes: []} }
+fn noInit(): ck.GInit { return ck.GInit{has: false, isOnce: false, table: false, items: [], c: -1, holes: [], rt: false} }
 
 fn (e: &Emitter) visit(m: int, visited: mut &[]bool, post: mut &[]int) {
     if visited[m] { return }

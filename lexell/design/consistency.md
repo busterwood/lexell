@@ -24,6 +24,7 @@ rule.
   opt-in (e.g. a `derives Ord` marker) is not done yet.
 - AN (finding 1, option a, with weak handles as the user agreed): the cycle
   check, `task.Weak`, `share()` for handle types, httpserver's app in an `rc`.
+- AO (finding 3): globals of any type, initialized on first use, `G.with`.
 
 ## Plan, in order
 
@@ -63,7 +64,16 @@ rule.
      `s[a..b].clone()`. A migration like the owned-str switch.
    - Finding 7: `Scope.start` (and `spawn`) take a closure that may borrow,
      read-only, what the scope closure borrows from outside the scope.
-6. Finding 8 (rest): `Show` writing into a buffer — later, not in this round.
+6. From lexdb's review (design/lexdb-owned-str-review.md on main, "Language
+   and runtime", 2026-11-18), added at the user's request:
+   - `s += x` copies the whole string every time: 100k, 200k, 400k one-byte
+     appends take 0.07, 0.31, 1.22 s (quadratic). owned-str.md 2.1 says a
+     string with one owner may be appended to in place: give an owned heap
+     string spare capacity and grow it geometrically, so `s += x` on a
+     variable is amortized O(len(x)).
+   - A `&str` view of a `StrBuf`'s bytes (no copy), so a reused buffer can
+     serve as a lookup key (lexdb's composite GROUP BY and hash-join keys).
+7. Finding 8 (rest): `Show` writing into a buffer — later, not in this round.
 
 Smaller splits noted but not decided: by-value receivers consuming silently;
 `Where` for programs; a `try` conversion hook.

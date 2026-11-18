@@ -514,24 +514,35 @@ owned or copy, that starts empty and is set at most once:
   `get()` or `set(v)` from then on (in a drop method, including its own) stops
   the program (exit 12).
 
-**Globals of owned types** (design/owned-str.md, issue 8) are allowed with
-**value-only access**, when their type has a constant initializer: a `str`,
-or a value record or value closed type built from such types
-(`var LOG: str = ""`, `var CACHE: Option[[]int] = None`).
+**Globals of any type** that holds no borrows are allowed (design/owned-str.md,
+issue 8; design/consistency.md, finding 3), with **value-only access**:
+- A global whose initializer is constant and whose type has a constant form
+  (a copy type, a `str`, a value record or value closed type built from
+  them) is static data, as before. Any other (an array, a boxed type, an
+  owned type, or an initializer that calls a function) is **initialized on
+  first use**: its initializer runs when the program first reaches the
+  global, wherever that is. An initializer that reaches its own global
+  stops the program (exit 12). It is dropped at exit if it was initialized
+  (with the set-once globals, module by module), and using it after that
+  stops the program (exit 12).
 - A built-in operation that runs no code of the program may read the global
   in place: `len(g)`, `g[i]`, `g + x` and comparisons on strings.
 - `g.clone()` reads a copy.
 - `g = v` stores, dropping the old value.
-- No borrow of the global may outlive such an operation. Passing it to a
-  function or method (`f(g)`, `g.m()`), moving it out (`return g`), `&g`,
-  and `for x in g` are errors; write `g.clone()`.
+- `g.with(fn(x: mut &T) { ... })` lends the global mutably to the function:
+  the way to change a `Map`, an array or a record held in a global in place.
+  While it runs the global is open: another `g.with`, or an assignment to
+  `g` (when `g` holds heap data), stops the program (exit 13), since the
+  lent value would be freed or aliased.
+- No other borrow of the global may outlive such an operation. Passing it
+  to a function or method (`f(g)`, `g.m()`), moving it out (`return g`),
+  `&g`, and `for x in g` are errors; write `g.clone()` or use `g.with`.
 
-Because no borrow of the global ever outlives a built-in operation, no code
-that might assign it runs while one is held, which is why borrowing mutable
-globals in general would need the effect rules of section 13. A global of a
-boxed type, or of an array type (an array global is a constant table), must
-be set-once. Larger mutable state that owns heap data belongs to `main`, or a
-context record it creates, and is passed down by borrow.
+Because no borrow of the global outlives a built-in operation, and a `with`
+is checked at run time, no code can free what is lent. Set-once globals
+remain the form for a value set once and lent everywhere (`get()`); state
+that the program's parts share can also belong to `main`, or a context
+record it creates, and be passed down by borrow.
 
 ### 5.3 Functions and methods
 
