@@ -39,7 +39,7 @@ CORE = {
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
-    "lexdb_session", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
+    "lexdb_session", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time",
 }
 
@@ -101,7 +101,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec"}
 
@@ -112,6 +112,13 @@ STATS = "lexdb_stats"
 STATS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_store", "lexdb_catalog",
                     "lexdb_access"}
 STATS_USERS = {"lexdb_plan", "lexdb_exec"}
+
+# How rows are put in order (lexdb_sort, design/lexdb-layers.md 6.2.3, slice
+# P3): the sort keys the pipeline's Sort and the row engine share. Values and
+# their encodings only; only the pipeline and exec import it.
+SORT = "lexdb_sort"
+SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
+SORT_USERS = {"lexdb_pipe", "lexdb_exec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -178,6 +185,12 @@ def check():
     for m in sorted(mods):
         if STATS in mods[m] and m not in STATS_USERS:
             bad.append(f"{m} -> {STATS}: only {', '.join(sorted(STATS_USERS))} import the statistics")
+    for d in mods.get(SORT, []):
+        if d not in SORT_MAY_IMPORT:
+            bad.append(f"{SORT} -> {d}: the sort keys import above their layer")
+    for m in sorted(mods):
+        if SORT in mods[m] and m not in SORT_USERS:
+            bad.append(f"{m} -> {SORT}: only {', '.join(sorted(SORT_USERS))} import the sort keys")
     stats = os.path.join(CMD, STATS + ".lxl")
     if os.path.exists(stats):
         with open(stats, encoding="utf-8") as f:

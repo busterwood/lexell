@@ -1,0 +1,412 @@
+// lexdb_sort: how rows are put in order (design/lexdb-layers.md 6.2.3,
+// slice P3): ORDER BY's comparison of two values (sortCmp), a value under
+// its collation (collVal), and sorting by typed keys (SKey, skSort), which
+// the pipeline's Sort and the row engine's sorts and windows share.
+import "collections"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_vec"
+import "./lexdb_access"
+
+type Val = lexdb_sql.Val
+
+// Two values in ORDER BY's ascending order, NULLs last; values not
+// comparable by their kinds.
+pub fn sortCmp(a: &Val, b: &Val): int {
+    let na = lexdb_ops.isNull(a)
+    let nb = lexdb_ops.isNull(b)
+    if na && nb { return 0 }
+    if na { return 1 }          // NULLS LAST ascending
+    if nb { return -1 }
+    match lexdb_ops.compare(a, b) {
+        Ok(c) { return c }
+        Err(_) { return lexdb_ops.kindOf(a) - lexdb_ops.kindOf(b) }
+    }
+}
+
+// A value as a collation of kind k compares it (L2): a text's key.
+pub fn collVal(k: int, v: &Val): Val {
+    if k == lexdb_sql.COLL_EXACT { return v.clone() }
+    match v {
+        Val.Text(s) { return Val.Text(if k == lexdb_sql.COLL_CI { lexdb_access.ciKey(&s) } else { lexdb_access.padKey(&s) }) }
+        else { return v.clone() }
+    }
+}
+
+// ---- Sorting by typed keys (9.105)
+//
+// ORDER BY's keys, and a window's, are taken once per row into a column
+// per key, by type (SKey): integers (and integer-like values: booleans,
+// dates, times, timestamps) as ints with NULL flags, texts as strs, any
+// other value as it is. A permutation of the rows is sorted, not the rows:
+// - the leading integer keys that fit together in 62 bits are packed into
+//   one unsigned integer per row, and sorted by a radix sort (stable);
+// - a text key with few distinct values becomes its values' ranks first,
+//   so it is an integer key too;
+// - rows equal in the packed keys (or all rows, when none packs) are then
+//   sorted by the other keys with a stable merge sort, whose comparator
+//   (skCmp) is ordCmp's per type.
+// Ties keep the rows' order, as collections.sortBy does. A column of
+// values of mixed kinds is not sorted here (skOfVals gives false): compare
+// may not be a total order over them, and the old sort runs instead.
+
+pub const SK_INT = 0        // a key's values: integers and NULL flags ...
+pub const SK_TEXT = 1       // ... texts and NULL flags ...
+pub const SK_VAL = 2        // ... or values of one kind (ordCmp's comparison)
+
+pub type SKey = record {
+    pub kind: int
+    pub ints: []int
+    pub nul: []bool
+    pub strs: []str
+    pub vals: []Val
+    pub desc: bool
+    pub nf: bool                // NULLs first
+}
+
+pub fn newSKey(kind: int, desc: bool, nf: bool): SKey {
+    return SKey{kind: kind, ints: [], nul: [], strs: [], vals: [], desc: desc, nf: nf}
+}
+
+// An integer-like value's kind and integer (kind 0: not one).
+fn skIntOf(v: &Val, n: mut &int): int {
+    match v {
+        Val.Int(x) {
+            n = x
+            return lexdb_sql.K_INT
+        }
+        Val.Bool(x) {
+            n = if x { 1 } else { 0 }
+            return lexdb_sql.K_BOOL
+        }
+        Val.Date(x) {
+            n = x
+            return lexdb_sql.K_DATE
+        }
+        Val.Time(x) {
+            n = x
+            return lexdb_sql.K_TIME
+        }
+        Val.Ts(x) {
+            n = x
+            return lexdb_sql.K_TS
+        }
+        Val.Tstz(x) {
+            n = x
+            return lexdb_sql.K_TSTZ
+        }
+        else { return 0 }
+    }
+}
+
+// A key over vs (taken): integers if every value not NULL is integer-like
+// of one kind, texts if every one is a text, else the values, if of one
+// kind. False: of mixed kinds.
+// skOfVals of values borrowed (a window's, which the old way may read
+// after: 9.108), copied only into a key of values.
+pub fn skOfValsRef(vs: &[]Val, desc: bool, nf: bool, key: mut &SKey): bool {
+    let n = len(vs)
+    var kind = -1
+    for i in 0..n {
+        if lexdb_ops.isNull(&vs[i]) { continue }
+        let k = lexdb_ops.kindOf(&vs[i])
+        if kind < 0 { kind = k } else if k != kind { return false }
+    }
+    if kind == lexdb_sql.K_TEXT || !(kind < 0 || kind == lexdb_sql.K_INT || kind == lexdb_sql.K_BOOL || kind == lexdb_sql.K_DATE ||
+       kind == lexdb_sql.K_TIME || kind == lexdb_sql.K_TS || kind == lexdb_sql.K_TSTZ) { return skOfVals(collections.copyOf(vs), desc, nf, key) }
+    var x = 0
+    var k = newSKey(SK_INT, desc, nf)
+    k.ints = withCapacity(n)
+    k.nul = withCapacity(n)
+    for i in 0..n {
+        let got = skIntOf(&vs[i], mut &x)
+        append(mut &k.ints, if got == 0 { 0 } else { x })
+        append(mut &k.nul, got == 0)
+    }
+    key = k
+    return true
+}
+
+pub fn skOfVals(vs: []Val, desc: bool, nf: bool, key: mut &SKey): bool {
+    var all = vs
+    let n = len(all)
+    var kind = -1
+    for i in 0..n {
+        if lexdb_ops.isNull(&all[i]) { continue }
+        let k = lexdb_ops.kindOf(&all[i])
+        if kind < 0 { kind = k } else if k != kind { return false }
+    }
+    var x = 0
+    if kind < 0 || kind == lexdb_sql.K_INT || kind == lexdb_sql.K_BOOL || kind == lexdb_sql.K_DATE ||
+       kind == lexdb_sql.K_TIME || kind == lexdb_sql.K_TS || kind == lexdb_sql.K_TSTZ {
+        var k = newSKey(SK_INT, desc, nf)
+        k.ints = withCapacity(n)
+        k.nul = withCapacity(n)
+        for i in 0..n {
+            let got = skIntOf(&all[i], mut &x)
+            append(mut &k.ints, if got == 0 { 0 } else { x })
+            append(mut &k.nul, got == 0)
+        }
+        key = k
+        return true
+    }
+    if kind == lexdb_sql.K_TEXT {
+        var k = newSKey(SK_TEXT, desc, nf)
+        k.strs = withCapacity(n)
+        k.nul = withCapacity(n)
+        for i in 0..n {
+            match all[i] {
+                Val.Text(s) {
+                    append(mut &k.strs, s.toStr())
+                    append(mut &k.nul, false)
+                }
+                else {
+                    append(mut &k.strs, "")
+                    append(mut &k.nul, true)
+                }
+            }
+        }
+        key = k
+        return true
+    }
+    var k = newSKey(SK_VAL, desc, nf)
+    k.vals = all
+    key = k
+    return true
+}
+
+// A text key with few distinct values (at most 1,024 and an eighth of
+// the rows) becomes their ranks in the texts' byte order: an integer key.
+fn skRank(key: mut &SKey) {
+    if key.kind != SK_TEXT { return }
+    let n = len(key.strs)
+    let most = 1024 + n / 8
+    var ids: Map[str, int] = newMap()
+    var dist: []str = []
+    var code: []int = withCapacity(n)
+    for i in 0..n {
+        if key.nul[i] {
+            append(mut &code, 0)
+            continue
+        }
+        match ids.get(&key.strs[i]) {
+            Some(c) { append(mut &code, c) }
+            None {
+                if len(dist) >= most { return }
+                ids.put(key.strs[i].clone(), len(dist))
+                append(mut &code, len(dist))
+                append(mut &dist, key.strs[i].clone())
+            }
+        }
+    }
+    var ord: []int = []
+    for i in 0..len(dist) { append(mut &ord, i) }
+    collections.sortBy(mut &ord, fn(a: &int, b: &int): int { return dist[a].cmp(&dist[b]) })
+    var rank: []int = array(len(dist), 0)
+    for r in 0..len(ord) { rank[ord[r]] = r }
+    for i in 0..n { code[i] = if key.nul[i] { 0 } else { rank[code[i]] } }
+    key.ints = code
+    key.strs = []
+    key.kind = SK_INT
+}
+
+// How rows a and b compare by keys[from..to] (ordCmp's order): negative,
+// a first.
+pub fn skCmp(keys: &[]SKey, from: int, to: int, a: int, b: int): int {
+    for k in from..to {
+        let key = &keys[k]
+        var c = 0
+        if key.kind == SK_VAL {
+            let na = lexdb_ops.isNull(&key.vals[a])
+            let nb = lexdb_ops.isNull(&key.vals[b])
+            if na || nb {
+                if na && nb { continue }
+                if na { return if key.nf { -1 } else { 1 } }
+                return if key.nf { 1 } else { -1 }
+            }
+            c = sortCmp(&key.vals[a], &key.vals[b])
+        } else {
+            let na = key.nul[a]
+            let nb = key.nul[b]
+            if na || nb {
+                if na && nb { continue }
+                if na { return if key.nf { -1 } else { 1 } }
+                return if key.nf { 1 } else { -1 }
+            }
+            if key.kind == SK_INT {
+                let x = key.ints[a]
+                let y = key.ints[b]
+                c = if x < y { -1 } else if x > y { 1 } else { 0 }
+            } else {
+                c = key.strs[a].cmp(&key.strs[b])
+            }
+        }
+        if c != 0 { return if key.desc { -c } else { c } }
+    }
+    return 0
+}
+
+// The bits a value of 0 to m needs.
+fn bitsFor(m: int): int {
+    var b = 0
+    while b < 63 && (m >> b) > 0 { b += 1 }
+    return b
+}
+
+// The leading integer keys that fit in 62 bits, packed into one unsigned
+// integer per row (into out), in the keys' order: per key, NULL at its
+// end, DESC reversed. The number of keys packed, and their bits (in bits).
+fn skPack(keys: &[]SKey, n: int, out: mut &[]int, bits: mut &int): int {
+    var taken = 0
+    var total = 0
+    var los: []int = []
+    var his: []int = []
+    var nuls: []bool = []
+    var widths: []int = []
+    for k in 0..len(keys) {
+        let key = &keys[k]
+        if key.kind != SK_INT { break }
+        var lo = 0
+        var hi = 0
+        var any = false
+        var anyNul = false
+        for i in 0..n {
+            if key.nul[i] {
+                anyNul = true
+                continue
+            }
+            let v = key.ints[i]
+            if !any {
+                lo = v
+                hi = v
+                any = true
+            } else if v < lo { lo = v } else if v > hi { hi = v }
+        }
+        // hi - lo + 1, and a place for NULL, must fit
+        if lo < 0 && hi > 4611686018427387903 + lo { break }
+        let span = hi - lo
+        if span > 4611686018427387903 { break }
+        let top = span + (if anyNul { 1 } else { 0 })
+        let w = bitsFor(top)
+        if total + w > 62 { break }
+        total += w
+        append(mut &los, lo)
+        append(mut &his, hi)
+        append(mut &nuls, anyNul)
+        append(mut &widths, w)
+        taken += 1
+    }
+    bits = total
+    if taken == 0 { return 0 }
+    out = array(n, 0)
+    for k in 0..taken {
+        let key = &keys[k]
+        let w = widths[k]
+        if w == 0 { continue }
+        let lo = los[k]
+        let hi = his[k]
+        let span = hi - lo
+        let shiftNul = nuls[k] && key.nf
+        for i in 0..n {
+            var c = 0
+            if key.nul[i] {
+                c = if key.nf { 0 } else { span + 1 }
+            } else {
+                c = if key.desc { hi - key.ints[i] } else { key.ints[i] - lo }
+                if shiftNul { c += 1 }
+            }
+            out[i] = (out[i] << w) | c
+        }
+    }
+    return taken
+}
+
+// Sorts idx[lo..hi] stably by keys[from..to] (skCmp): insertion sort in
+// runs of 16, then merges; a merge whose halves are in order already is
+// skipped, so rows in order cost n - 1 comparisons.
+pub fn skMerge(keys: &[]SKey, from: int, to: int, idx: mut &[]int, lo: int, hi: int, tmp: mut &[]int) {
+    let n = hi - lo
+    if n < 2 { return }
+    var s = lo
+    while s < hi {
+        let e = min(s + 16, hi)
+        for i in s + 1..e {
+            let x = idx[i]
+            var j = i
+            while j > s && skCmp(keys, from, to, idx[j - 1], x) > 0 {
+                idx[j] = idx[j - 1]
+                j -= 1
+            }
+            idx[j] = x
+        }
+        s = e
+    }
+    var width = 16
+    while width < n {
+        var a = lo
+        while a < hi - width {
+            let mid = a + width
+            let b = min(a + 2 * width, hi)
+            if skCmp(keys, from, to, idx[mid - 1], idx[mid]) > 0 {
+                var i = a
+                var j = mid
+                for k in a..b {
+                    if j >= b || (i < mid && skCmp(keys, from, to, idx[i], idx[j]) <= 0) {
+                        tmp[k] = idx[i]
+                        i += 1
+                    } else {
+                        tmp[k] = idx[j]
+                        j += 1
+                    }
+                }
+                for k in a..b { idx[k] = tmp[k] }
+            }
+            a += 2 * width
+        }
+        width *= 2
+    }
+}
+
+// A partition key of values of any kind: their encoded keys (encIdxPart),
+// which tell partitions apart as winValues always has.
+pub fn skEnc(vs: &[]Val): SKey {
+    var k = newSKey(SK_TEXT, false, false)
+    for v in vs {
+        var kb = ""
+        lexdb_access.encIdxPart(mut &kb, &v)
+        append(mut &k.strs, kb)
+        append(mut &k.nul, false)
+    }
+    return k
+}
+
+// The permutation that sorts n rows by keys (stable). The keys' texts may
+// be ranked (skRank).
+pub fn skSort(keys: mut &[]SKey, n: int): []int {
+    for k in 0..len(keys) { skRank(mut &keys[k]) }
+    var packed: []int = []
+    var bits = 0
+    let taken = skPack(keys, n, mut &packed, mut &bits)
+    var idx: []int = []
+    if taken == 0 {
+        for i in 0..n { append(mut &idx, i) }
+    } else {
+        idx = lexdb_vec.radixPerm(&packed, bits)
+    }
+    let nk = len(keys)
+    if taken == nk { return idx }
+    var tmp: []int = array(n, 0)
+    if taken == 0 {
+        skMerge(keys, 0, nk, mut &idx, 0, n, mut &tmp)
+        return idx
+    }
+    // the rows equal in the packed keys, by the others
+    var lo = 0
+    while lo < n {
+        var hi = lo + 1
+        while hi < n && packed[idx[hi]] == packed[idx[lo]] { hi += 1 }
+        if hi - lo > 1 { skMerge(keys, taken, nk, mut &idx, lo, hi, mut &tmp) }
+        lo = hi
+    }
+    return idx
+}
