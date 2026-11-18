@@ -320,6 +320,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 | AP | `s += x` on an owned string appends in place; the buffer grows geometrically (100k/200k/400k one-byte appends: 0.07/0.31/1.22 s before, 0.001/0.001/0.002 s after; 4M in 0.015 s). Also when `x` is `s` or a slice of it. | 3f2a86a6 | yes | none (faster) |
 | AQ | `StrBuf.text(): &str` (takes `mut &StrBuf`): the bytes as a `&str` without a copy, via the new intrinsic `strView(mut &bytes)`; a reused buffer can be a lookup key (`m.find(b.text())`). | 3f2a86a6 | yes | none |
 
+| AR | `StrBuf` is gone (the user's decision: a string is its own buffer). `str` has `addByte(c)`, `addInt(n)`, `addLine(x)`, `clear()` (keeps the buffer) and `bytes(): &[byte]` (a borrowed slice, no copy), all in place like `s += x`. `binary.addU16LE` and the other builders take `mut &str`. AQ's `StrBuf.text()` is gone with it: the string is the text. | (this commit) | **no**, done on this branch: every `newStrBuf()` became `""`, `StrBuf` became `str`, `b.add(x)` became `b += x`, `b.size()` became `len(b)`, `b.toStr()` became `b` (moved) or `b.toStr()` (a copy, where `b` is used again), `w.out.view()` became `w.out.bytes()` and `lexdb_wire.sendTo` takes `&[byte]`. | none (no slower: same instructions and cycles for the compiler) |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
@@ -375,4 +377,9 @@ GROUP BY and hash-join keys can reuse one buffer: `b.clear()`, the parts
 added, then `m.find(b.text())` or `m.getOr(b.text(), ...)`, with no key
 string made per row. Building a string with `s += part` in a loop is no
 longer quadratic.
+
+**AR for lexdb.** Done on lang/consistency (202 `StrBuf` uses in lexdb and its
+tests; its suite passes). A composite key is built in a reused string:
+`k.clear()`, `k += part` / `k.addByte(sep)`, then `m.find(&k)`. New code
+writes strings, never a builder type.
 

@@ -191,8 +191,11 @@ the program (exit 3). A string is at most
 4 GiB − 1 bytes long; making a longer one stops the program (exit 2).
 `s += x` on an owned string variable, field or element appends to its own
 buffer, which grows geometrically, so a run of appends costs time linear in
-the final length; `s + x` makes a new string. A `strings.StrBuf`'s text is
-also readable as a `&str` without a copy (`b.text()`).
+the final length; `s + x` makes a new string. So a string is its own
+buffer: `s.addByte(c)`, `s.addInt(n)` and `s.addLine(x)` append the same way,
+`s.clear()` empties it but keeps the buffer for the next appends, and
+`s.bytes()` lends its bytes as a `&[byte]` slice without a copy (there is no
+separate string builder type).
 
 A shared `&str` is a **view**: the string's header (a pointer to its bytes and
 its length) by value. `&s[a..b]` borrows the bytes `a` to `b - 1` of `s`

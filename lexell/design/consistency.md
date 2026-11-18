@@ -26,6 +26,8 @@ rule.
   check, `task.Weak`, `share()` for handle types, httpserver's app in an `rc`.
 - AO (finding 3): globals of any type, initialized on first use, `G.with`.
 - AP, AQ (lexdb's review): `s += x` in place; `StrBuf.text()`.
+- AR (the user, 2026-11-18): `StrBuf` removed; strings are their own buffers
+  (`addByte`, `addInt`, `addLine`, `clear`, `bytes`).
 
 ## Plan, in order
 

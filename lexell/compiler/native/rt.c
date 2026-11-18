@@ -1092,7 +1092,7 @@ lxl_str rt_str_concat(lxl_str a, lxl_str b) {
 void rt_str_append_to(lxl_str* s, lxl_str b) {
     if (b.len == 0) return;
     int64_t n = (int64_t)s->len + b.len;
-    if (n > 0xFFFFFFF0LL) rt_trap(2, "string too long", "runtime");
+    if (n > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
     const char* bp = RT_SP(b);
     if (s->cap && bp >= s->p && bp <= s->p + s->cap) {
         lxl_str t = rt_str_concat(*s, b);
@@ -1109,7 +1109,7 @@ void rt_str_append_to(lxl_str* s, lxl_str b) {
     int64_t nc = (int64_t)s->cap * 2;
     if (nc < n) nc = n;
     if (nc < 16) nc = 16;
-    if (nc > 0xFFFFFFF0LL) nc = n;
+    if (nc > (int64_t)RT_STR_MAX) nc = n;
     char* q = rt_alloc((size_t)nc + 1);
     memcpy(q, RT_SP(*s), (size_t)s->len);
     memcpy(q + s->len, bp, (size_t)b.len);
@@ -1119,6 +1119,23 @@ void rt_str_append_to(lxl_str* s, lxl_str b) {
     s->cap = (uint32_t)nc;
     s->len = (uint32_t)n;
 }
+/* s.addByte(c) and s.clear() (design/consistency.md): in place, as s += x. clear keeps a heap
+   buffer for the next appends. */
+void rt_str_append_byte(lxl_str* s, uint8_t c) {
+    if (s->cap > s->len) {          /* room in the buffer (cap + 1 bytes, the last for the NUL) */
+        s->p[s->len++] = (char)c;
+        s->p[s->len] = 0;
+        return;
+    }
+    char b[2] = {(char)c, 0};
+    rt_str_append_to(s, (lxl_str){b, 0, 1});
+}
+void rt_str_clear(lxl_str* s) {
+    if (s->cap) { s->len = 0; s->p[0] = 0; return; }
+    *s = (lxl_str){rt_empty, 0, 0};
+}
+/* s.bytes() (design/consistency.md): the string's bytes as a borrowed slice, no copy. */
+lxl_slice rt_str_bytes(lxl_str s) { return (lxl_slice){s.p, (int64_t)s.len}; }
 uint8_t rt_str_byte(lxl_str s, int64_t i, const char* w) {
     if (i < 0 || i >= s.len) rt_trap(3, "string index out of range", w);
     return (uint8_t)RT_SP(s)[i];
@@ -1865,7 +1882,7 @@ void rt_str_append(lxl_arr* a, lxl_str s) {
    A NUL is written past the end, within the array's capacity (grown if need be): a string's
    p[len] is always readable. The view's cap is not 0, so a copy of it copies the bytes. */
 lxl_str rt_str_view_bytes(lxl_arr* a) {
-    if (a->len > 0xFFFFFFF0LL) rt_trap(2, "string too long", "runtime");
+    if (a->len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
     if (a->len + 1 > a->cap) {
         int64_t nc = a->cap ? a->cap * 2 : 16;
         while (nc < a->len + 1) nc *= 2;

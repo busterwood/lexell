@@ -61,7 +61,7 @@ type Wire = record {
     inBuf: []byte               // read into directly; [inPos, inEnd) not yet taken
     inPos: int
     inEnd: int
-    out: StrBuf
+    out: str
     sess: lexdb_exec.Session
     st: lexdb_store.Store
     skipping: bool
@@ -233,10 +233,10 @@ fn (r: mut &Rd) bytes(n: int): str {
 
 // ---- writing
 
-fn (w: mut &Wire) msg(typ: byte, body: &StrBuf) {
+fn (w: mut &Wire) msg(typ: byte, body: &str) {
     w.out.addByte(typ)
-    binary.addU32BE(mut &w.out, body.size() + 4)
-    w.out.add(&(body.toStr()))
+    binary.addU32BE(mut &w.out, len(body) + 4)
+    w.out += &(body)
 }
 
 fn (w: mut &Wire) empty(typ: byte) {
@@ -245,14 +245,14 @@ fn (w: mut &Wire) empty(typ: byte) {
 }
 
 fn (w: mut &Wire) flush(): Result[Unit, io.IoError] {
-    if w.out.size() == 0 { return Ok(Unit{}) }
-    let r = sendTo(&w.c, mut &w.eng, w.out.view())
+    if len(w.out) == 0 { return Ok(Unit{}) }
+    let r = sendTo(&w.c, mut &w.eng, w.out.bytes())
     w.out.clear()
     return r
 }
 
 // Bytes to the client, through TLS if the connection has it.
-fn sendTo(c: &net.Conn, eng: mut &[]tls.Engine, b: &[]byte): Result[Unit, io.IoError] {
+fn sendTo(c: &net.Conn, eng: mut &[]tls.Engine, b: &[byte]): Result[Unit, io.IoError] {
     if len(b) == 0 { return Ok(Unit{}) }
     if len(eng) > 0 {
         match eng[0].write(b) {
@@ -266,7 +266,7 @@ fn sendTo(c: &net.Conn, eng: mut &[]tls.Engine, b: &[]byte): Result[Unit, io.IoE
 
 // A FATAL error, sent now: the connection ends after it.
 fn (w: mut &Wire) fatal(state: &str, msg: &str): Result[bool, io.IoError] {
-    var b = newStrBuf()
+    var b = ""
     b.addByte('S')
     addC(mut &b, &"FATAL")
     b.addByte('V')
@@ -281,20 +281,20 @@ fn (w: mut &Wire) fatal(state: &str, msg: &str): Result[bool, io.IoError] {
     return Ok(false)
 }
 
-fn addC(b: mut &StrBuf, s: &str) {
-    b.add(s)
+fn addC(b: mut &str, s: &str) {
+    b += s
     b.addByte(0)
 }
 
 fn (w: mut &Wire) paramStatus(name: &str, value: &str) {
-    var b = newStrBuf()
+    var b = ""
     addC(mut &b, &name)
     addC(mut &b, &value)
     w.msg('S', &b)
 }
 
 fn (w: mut &Wire) error(e: &lexdb_base.DbErr) {
-    var b = newStrBuf()
+    var b = ""
     let sev = if e.state == "57P01" { "FATAL" } else { "ERROR" }
     b.addByte('S')
     addC(mut &b, &sev)
@@ -325,7 +325,7 @@ fn (w: mut &Wire) error(e: &lexdb_base.DbErr) {
 // the like, 9.117), as NoticeResponse messages, before its end.
 fn (w: mut &Wire) sendNotices() {
     for n in w.sess.takeNotices() {
-        var b = newStrBuf()
+        var b = ""
         b.addByte('S')
         addC(mut &b, &"NOTICE")
         b.addByte('V')
@@ -351,7 +351,7 @@ fn (w: mut &Wire) ready() {
         w.paramStatus("TimeZone", &tz)
         w.tzShown = tz
     }
-    var b = newStrBuf()
+    var b = ""
     b.addByte(w.sess.status())
     w.msg('Z', &b)
 }
@@ -367,7 +367,7 @@ fn typLen(oid: int): int {
 }
 
 fn (w: mut &Wire) rowDesc(cols: &[]lexdb_bind.OutCol) {
-    var b = newStrBuf()
+    var b = ""
     binary.addU16BE(mut &b, len(cols))
     for c in cols {
         addC(mut &b, &c.label())
@@ -430,22 +430,22 @@ fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_bind.OutCol, zone: &lexdb_ti
             Val.Null { binary.addU32BE(mut &w.out, 0xFFFFFFFF) }
             Val.Int(n) {
                 binary.addU32BE(mut &w.out, len(w.texts[j]))
-                w.out.add(&w.texts[j])
+                w.out += &w.texts[j]
                 j += 1
             }
             Val.Text(t) {
                 if plainText(oid, utc) {
                     binary.addU32BE(mut &w.out, len(t))
-                    w.out.add(&t)
+                    w.out += &t
                 } else {
                     binary.addU32BE(mut &w.out, len(w.texts[j]))
-                    w.out.add(&w.texts[j])
+                    w.out += &w.texts[j]
                     j += 1
                 }
             }
             else {
                 binary.addU32BE(mut &w.out, len(w.texts[j]))
-                w.out.add(&w.texts[j])
+                w.out += &w.texts[j]
                 j += 1
             }
         }
@@ -512,7 +512,7 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_rows.OutBatch, cols: &[]lexdb_bind.OutCol
         buf[at0 + 3] = byte((size >> 8) & 0xff)
         buf[at0 + 4] = byte(size & 0xff)
     }
-    w.out.add(&(strFromBytes(&buf)))
+    w.out += &(strFromBytes(&buf))
 }
 
 fn putU32(out: mut &[]byte, n: int) {
@@ -593,7 +593,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
             return true
         }
         if ob.n > 0 { w.dataBatch(ob, cols, &zone) } else { w.dataRow(row, cols, &zone) }
-        if w.out.size() > 65536 { return w.flush().isOk() }
+        if len(w.out) > 65536 { return w.flush().isOk() }
         return true
     })
     let parked = replace(mut &w.sess, sess)
@@ -602,7 +602,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
 
 fn (w: mut &Wire) complete(tag: &str) {
     w.sendNotices()
-    var b = newStrBuf()
+    var b = ""
     addC(mut &b, tag)
     w.msg('C', &b)
 }
@@ -613,7 +613,7 @@ fn protoErr(msg: &str): lexdb_base.DbErr { return lexdb_base.err("08P01", msg) }
 
 // CopyInResponse ('G') or CopyOutResponse ('H'): text, n columns.
 fn (w: mut &Wire) copyResponse(typ: byte, n: int) {
-    var b = newStrBuf()
+    var b = ""
     b.addByte(byte(0))
     binary.addU16BE(mut &b, n)
     for i in 0..n { binary.addU16BE(mut &b, 0) }
@@ -627,8 +627,8 @@ fn (w: mut &Wire) copyOut(r: &lexdb_exec.Res) {
         let l = lexdb_sql.text(&row[0])
         w.out.addByte('d')
         binary.addU32BE(mut &w.out, len(l) + 4)
-        w.out.add(&l)
-        if w.out.size() > 65536 { let f = w.flush() }
+        w.out += &l
+        if len(w.out) > 65536 { let f = w.flush() }
     }
     w.empty('c')
 }
@@ -667,20 +667,20 @@ fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_bind.OutCol): Resu
     if w.flush().isErr() { return Err(protoErr("the connection was lost during COPY")) }
     var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.share()))
     let r = sess.copyInFrom(s, fn(): lexdb_exec.CopyPart {
-        var b = newStrBuf()
+        var b = ""
         while true {
             let got = match w.readMsg(false) {
                 Ok(m) { m }
                 Err(_) { None }
             }
             match got {
-                None { return lexdb_exec.CopyPart{rows: [], data: b.toStr(), end: true, fail: "the connection was lost during COPY", proto: true} }
+                None { return lexdb_exec.CopyPart{rows: [], data: b, end: true, fail: "the connection was lost during COPY", proto: true} }
                 Some(m) {
                     if m.typ == 'd' {
-                        b.add(&m.body)
-                        if b.size() >= 65536 || !w.hasMsg() { return lexdb_exec.CopyPart{rows: [], data: b.toStr(), end: false, fail: "", proto: false} }
+                        b += &m.body
+                        if len(b) >= 65536 || !w.hasMsg() { return lexdb_exec.CopyPart{rows: [], data: b, end: false, fail: "", proto: false} }
                     } else if m.typ == 'c' {
-                        return lexdb_exec.CopyPart{rows: [], data: b.toStr(), end: true, fail: "", proto: false}
+                        return lexdb_exec.CopyPart{rows: [], data: b, end: true, fail: "", proto: false}
                     } else if m.typ == 'f' {
                         var rd = Rd{s: m.body.clone(), at: 0, bad: false}
                         let msg = rd.cstr()
@@ -748,7 +748,7 @@ fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
                             break
                         }
                     }
-                    if w.out.size() > 65536 { try w.flush() }
+                    if len(w.out) > 65536 { try w.flush() }
                 }
             }
         }
@@ -898,7 +898,7 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
     }
     let p = ps.stmts.at(stmtName.clone())
     if kind == "S" {
-        var b = newStrBuf()
+        var b = ""
         binary.addU16BE(mut &b, len(p.ptypes))
         for t in p.ptypes { binary.addU32BE(mut &b, t) }
         w.msg('t', &b)
@@ -1042,7 +1042,7 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                     }
                 }
                 if !(try w.authenticate(&user)) { return Ok(false) }
-                var b = newStrBuf()
+                var b = ""
                 binary.addU32BE(mut &b, 0)
                 w.msg('R', &b)                       // AuthenticationOk
                 w.paramStatus("server_version", "16.0")
@@ -1055,7 +1055,7 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 let tzs = w.tzShown.clone()
                 w.paramStatus("TimeZone", &tzs)
                 w.paramStatus("application_name", "")
-                var k = newStrBuf()
+                var k = ""
                 binary.addU32BE(mut &k, 1)
                 binary.addU32BE(mut &k, 0)
                 w.msg('K', &k)
@@ -1146,7 +1146,7 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
     }
     let plus = len(w.eng) > 0 && len(w.bind) > 0
     // AuthenticationSASL: the mechanisms, the bound one first when there is TLS
-    var b = newStrBuf()
+    var b = ""
     binary.addU32BE(mut &b, 10)
     if plus { addC(mut &b, &lexdb_auth.MECH_PLUS) }
     addC(mut &b, &lexdb_auth.MECH)
@@ -1172,9 +1172,9 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
         Ok(x) { x }
         Err(x) { return w.fatal(&x.state, &x.msg) }
     }
-    var c = newStrBuf()
+    var c = ""
     binary.addU32BE(mut &c, 11)                 // AuthenticationSASLContinue
-    c.add(&first)
+    c += &first
     w.msg('R', &c)
     try w.flush()
     let m2 = match try w.readMsg(false) {
@@ -1187,9 +1187,9 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
         Err(x) { return w.fatal(&x.state, &(if x.state == "28P01" { fail } else { x.msg.clone() })) }
     }
     if !login { return w.fatal(&"28000", &("role \"" + user + "\" is not permitted to log in")) }
-    var f = newStrBuf()
+    var f = ""
     binary.addU32BE(mut &f, 12)                 // AuthenticationSASLFinal
-    f.add(&fin)
+    f += &fin
     w.msg('R', &f)
     return Ok(true)
 }
@@ -1232,7 +1232,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
             w.skipping = true
         }
     }
-    if w.out.size() > 65536 { try w.flush() }
+    if len(w.out) > 65536 { try w.flush() }
     return Ok(true)
 }
 
@@ -1240,7 +1240,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
 pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
-    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: newStrBuf(), sess: lexdb_exec.newSession(st.share()), st: st,
+    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: "", sess: lexdb_exec.newSession(st.share()), st: st,
                  skipping: false, tzShown: "", streamed: false, texts: []}
     var ps = Ps{stmts: newMap(), portals: newMap()}
     if startup(mut &w, &ctx).unwrapOr(false) {

@@ -21,13 +21,13 @@ for leaks.
 
 | Module | Lines | Contents |
 |---|---:|---|
-| `std.lxl` | 537 | the prelude facade: Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives; checked arithmetic and float methods; print/println/eprint/eprintln; min/max; prelude aliases/wrappers for Decimal, Map, StrBuf and sort |
+| `std.lxl` | 537 | the prelude facade: Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives; checked arithmetic and float methods; print/println/eprint/eprintln; min/max; prelude aliases/wrappers for Decimal, Map and sort; in-place string building (addByte, addInt, addLine, clear, bytes) |
 | `hash.lxl` | 224 | SipHash-1-3 and the per-process hash key (AT_RANDOM); `sipHash13`, `sipStr`, `sipWords`, `hashSeed`; CRC32C with the CPU's crc32 instruction, `crc32c`, `crc32cMore` |
 | `decimal.lxl` | 1,041 | Decimal, Rounding, DecError, exact arithmetic, parse/format, POW10, sumDecimals (the `m` literal's implementation) |
 | `money.lxl` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
 | `math.lxl` | 306 | float constants, parse, fixed, toDecimal, near, IEEE bit patterns |
 | `collections.lxl` | 1,080 | Map (insertion-ordered, SipHash by default, opt-in Fx), sort (unstable heap sort), sortBy/sortStable, searching, rearranging, copying, Set, UniqueList, Heap |
-| `strings.lxl` | 1,025 | StrBuf; SIMD-backed search (indexOf/indexOfAny/count), split/splitByte/join, replace, trim, ASCII case (`toUpperAscii`/`toLowerAscii`/`equalFoldAscii`), int parse/format, padding, UTF-8, eza's natcmp/quoteName |
+| `strings.lxl` | 1,025 | SIMD-backed search (indexOf/indexOfAny/count), split/splitByte/join, replace, trim, ASCII case (`toUpperAscii`/`toLowerAscii`/`equalFoldAscii`), int parse/format, padding, UTF-8, eza's natcmp/quoteName |
 | `io.lxl` | 454 | IoError, whole-file read/write/append, readLines, readStdin, streaming Reader, buffered Writer, ChunkReader/copy/count/readAll |
 | `fs.lxl` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
 | `os.lxl` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
@@ -39,7 +39,7 @@ for leaks.
 | `unicode_data.lxl` | 2,170 | generated (`gen_unicode_data.py`): Unicode 15.0.0 categories, simple lower/upper, simple fold and White_Space |
 | `unicode_width.lxl` | 287 | generated from unicode-width 0.1.14: `displayWidth`, `runeWidth`, East Asian width ranges |
 | `errors.lxl` | 73 | Rust-style debugPath and osError |
-| `binary.lxl` | 286 | endian reads/writes over bytes, str, and StrBuf |
+| `binary.lxl` | 286 | endian reads/writes over bytes and str |
 | `glob.lxl` | 408 | Unix path globbing: `*`, `?`, sets, ASCII POSIX classes, dotfiles, optional `**`, options, `escape`, and `expand` under a root |
 | `base64.lxl` | 107 | standard base64, strict and jq-lenient decoders |
 | `uuid.lxl` | 260 | RFC 9562 UUIDs: parse/format, v4/v5/v7, bytes, version/variant |
@@ -81,7 +81,7 @@ for leaks.
 
 `std` is a facade over the modules below. The prelude names stay
 unqualified, but the implementations of `Decimal` are in `decimal`, `Map`
-and `sort` in `collections`, `StrBuf` in `strings`, and SipHash in `hash`.
+and `sort` in `collections`, and SipHash in `hash`.
 The basic string helpers (`substr`, `indexOf`, `startsWith`, `endsWith`,
 `contains`, `split`, `trim`, `repeat`, `isSpace`, `isDigit`, `parseInt`) are
 in `strings` only and are imported explicitly; `split` there is
@@ -137,9 +137,10 @@ methods of the primitive types there.
   `sqrt cbrt pow powi exp exp2 expm1 ln ln1p log2 log10 sin cos tan asin acos
   atan atan2 sinh cosh tanh floor ceil trunc round roundEven abs mod hypot
   copySign fma isNaN isInf isFinite`.
-- **StrBuf** (in `strings`, re-exported by the prelude): `newStrBuf`, `add`
-  (one copy of the string's bytes, `appendStr`), `addByte`, `addInt`,
-  `addLine`, `size`, `clear`, `toStr`. The string helpers are in `strings`
+- **Building strings**: a `str` is its own buffer (SPEC 4.1): `s += x`,
+  `s.addByte(c)`, `s.addInt(n)`, `s.addLine(x)` append in place, `s.clear()`
+  keeps the buffer, `s.bytes()` lends the bytes as `&[byte]`. (`StrBuf` is
+  gone, design/consistency.md.) The string helpers are in `strings`
   only: `substr`, `indexOf(s, sub, from)`, `startsWith`, `endsWith`,
   `contains`, `split(code point separator)` and `splitByte`, `trim`,
   `isSpace`, `isDigit`, `parseIntOpt(s): Option[int]` and `repeat`.
@@ -336,7 +337,7 @@ errno table (`io.errorText`); `errors.text` is a thin alias.
 
 `binary`: `readU16/32/64LE/BE`, signed `readI16/32/64LE/BE`, the `...Str`
 variants over `&str`, `appendU16/32/64LE/BE`, in-place `setU16/32LE/BE`, and
-`addU16/32/64LE/BE` into a `StrBuf`. Reads use the language's checked index
+`addU16/32/64LE/BE` onto a `str`. Reads use the language's checked index
 and trap if `at` is out of range; callers validate wire lengths. `math.bitsOf`
 /`fromBits` give the exact IEEE 754 double bit pattern as a 64-bit signed int
 (the sign bit makes it negative), a move of the bits through the runtimes'
@@ -391,8 +392,7 @@ clamps to 0 (it used to trap).
 
 `substr`, `indexOf(s, sub, from)`, `startsWith`, `endsWith`, `contains`,
 `trim`, `repeat`, `isSpace`, `isDigit`, `parseIntOpt` returning `Option`,
-`StrBuf` (`newStrBuf`, `add`, `addByte`, `addInt`, `addLine`, `size`, `clear`,
-`toStr`, `text` (the bytes so far as a `&str`, no copy: a reused buffer as a lookup key)), `lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
+`lastIndexOf`, `lastIndexOfByte`, `indexOfByte`, `indexOfAny(s, byteSet, from)`,
 `count`, `equalFoldAscii`, `split(&s, sep):
 []&str`, `splitN(&s, sep, n)` (n < 0: all), `fields(&s): []&str`, `cut(&s,
 sep): Option[Cut]` (`before` and `after` are views), `owned(&pieces): []str`,
@@ -1999,8 +1999,9 @@ they are passed as any `&T` argument is, so the caller keeps its string): `strBy
 of any byte of a set, of a string, of a position `p` with `s[p + i1]` in one
 set and `s[p + i2]` in another; 16 bytes a step with SSE2, for the regex
 prefilters), `appendStr(mut &bytes, s)` (the bytes of `s` at the end of a
-`[]byte` in one copy: `StrBuf.add`), `strView(mut &bytes)` (the bytes as a
-`&str`, no copy: `StrBuf.text`), `strStatic(s)` (a copy of `s` that is
+`[]byte` in one copy), `strView(mut &bytes)` (a byte array's contents as a
+`&str`, no copy), `strAddByte`, `strClear` and `strBytes` (`str.addByte`,
+`clear`, `bytes`), `strStatic(s)` (a copy of `s` that is
 never freed, so its copies and clones share the bytes: for strings that live
 until the program exits, such as a compiler's names), and the built-ins `isNull`, `exit`,
 `panic`. `task` also uses the library-only intrinsics `intoPtr` and
