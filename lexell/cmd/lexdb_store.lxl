@@ -268,6 +268,16 @@ pub fn testHooks(): TestHooks {
 
 pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks }
 
+// Another handle to the same store: its database, follower, memo and locks are shared (a Store is
+// a handle; clone, a copy, does not apply; design/consistency.md, finding 1).
+pub fn (s: &Store) share(): Store {
+    let fo = match s.fo {
+        Some(f) { Some(f.share()) }
+        None { None }
+    }
+    return Store{sh: s.sh.share(), fo: fo, memo: s.memo.share(), locks: s.locks.share()}
+}
+
 // Which tree a transaction's reads see: the live tree, its snapshot, or a
 // replica's follower. Read operations select once through viewOf, so every
 // path agrees on the choice and on what a snapshot's reads note.
@@ -931,7 +941,7 @@ fn (st: &Store) load(slot: int): Result[Unit, lexdb_base.DbErr] {
     var f = lexdb_disk.File.Real(-1, false)
     st.sh.with(fn(db: mut &Db) {
         r = db.loadReq(slot)
-        f = db.data.clone()
+        f = db.data.share()
     })
     if r.page < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "load: a slot without a page")) }
     var b = array(PAGE, byte(0))
@@ -991,7 +1001,7 @@ fn (st: &Store) loadAhead(need: int, run: &[]LoadReq): Result[Unit, lexdb_base.D
     let n = len(run)
     if n <= 1 || run[0].slot != need { return st.load(need) }
     var f = lexdb_disk.File.Real(-1, false)
-    st.sh.with(fn(db: mut &Db) { f = db.data.clone() })
+    st.sh.with(fn(db: mut &Db) { f = db.data.share() })
     var bufs: [][]byte = []
     for j in 0..n { append(mut &bufs, array(PAGE, byte(0))) }
     try f.readPages(run[0].page * PAGE, mut &bufs)
@@ -1039,7 +1049,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
     var f = lexdb_disk.File.Real(-1, false)
     var bad = false
     st.sh.with(fn(db: mut &Db) {
-        f = db.data.clone()
+        f = db.data.share()
         for s in slots {
             if !db.meta[s].used || db.meta[s].loaded { continue }
             if db.meta[s].disk < 0 {
@@ -1069,7 +1079,7 @@ fn (st: &Store) loadMany(slots: &[]int): Result[Unit, lexdb_base.DbErr] {
         var batch: []PageRead = []
         var q = r
         while q < rend {
-            append(mut &batch, PageRead{f: f.clone(), page: reqs[runs[q]].page, n: runs[q + 1]})
+            append(mut &batch, PageRead{f: f.share(), page: reqs[runs[q]].page, n: runs[q + 1]})
             q += 2
         }
         var got: []Result[[][]byte, lexdb_base.DbErr] = []
@@ -2358,7 +2368,7 @@ fn (st: &Store) getIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[Opti
 fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[Option[str], lexdb_base.DbErr] {
     match st.viewOf(t) {
         View.Repl {
-            let fo = st.fo.clone().unwrap()
+            let fo = st.follower().unwrap()
             let s = try repSnap(&fo, t)
             return fo.get(&s, tree, key)
         }
@@ -2568,7 +2578,7 @@ fn (st: &Store) countPages(f: &lexdb_disk.File, c: mut &Cnt): Result[Unit, lexdb
             var reads: []PageRead = []
             var q = r
             while q < rend {
-                append(mut &reads, PageRead{f: f.clone(), page: batch[runs[q]].page, n: runs[q + 1]})
+                append(mut &reads, PageRead{f: f.share(), page: batch[runs[q]].page, n: runs[q + 1]})
                 q += 2
             }
             var got: []Result[[][]byte, lexdb_base.DbErr] = []
@@ -2663,7 +2673,7 @@ pub fn (st: &Store) countRange(t: mut &Txn, tree: int, lo: &str, hi: &str): Resu
         var f = lexdb_disk.File.Real(-1, false)
         var bad: []lexdb_base.DbErr = []
         st.sh.with(fn(db: mut &Db) {
-            f = db.data.clone()
+            f = db.data.share()
             if len(db.failed) > 0 {
                 append(mut &bad, db.failed[0].clone())
                 return
@@ -3278,7 +3288,7 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&Ent
     let view = st.viewOf(t)
     match view {
         View.Repl {
-            let fo = st.fo.clone().unwrap()
+            let fo = st.follower().unwrap()
             let s = try repSnap(&fo, t)
             return fo.scan(&s, tree, &from, &to, f)
         }
@@ -3605,7 +3615,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(
     let view = st.viewOf(t)
     match view {
         View.Repl {
-            let fo = st.fo.clone().unwrap()
+            let fo = st.follower().unwrap()
             let s = try repSnap(&fo, t)
             return fo.scanBack(&s, tree, &from, &to, f)
         }
@@ -4337,7 +4347,7 @@ pub fn (st: &Store) framesAfter(after: int, upto: int, out: mut &[]PushFrame): b
 
 fn (st: &Store) openSeg(g: int, size: int): Result[lexdb_disk.File, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.logFs.clone() })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs.share() })
     let name = segName(g)
     if !fs.exists(name) && fs.exists(SPARE) { try fs.rename(SPARE, name) }
     let f = try fs.open(&name, true)
@@ -5115,7 +5125,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         db.ckptRunning = true
         todo = replace(mut &db.dropped, [])
         most = db.dropReads
-        f = db.data.clone()
+        f = db.data.share()
     })
     if len(bad) > 0 { return Err(bad[0].clone()) }
     if busy { return Ok(Unit{}) }
@@ -5146,8 +5156,8 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
         for x in db.dropped { append(mut &todo, x) }
         db.dropped = replace(mut &todo, [])
         for p in gone { db.freePage(p) }
-        f = db.data.clone()
-        fs = db.logFs.clone()
+        f = db.data.share()
+        fs = db.logFs.share()
     })
     if len(bad) > 0 { return Err(bad[0].clone()) }
     var tries = 0
@@ -5691,7 +5701,7 @@ fn writeCheckpointPages(f: &lexdb_disk.File, out: &[]PageOut, written: mut &int)
                     append(mut &pages, lexdb_page.bodyPage(p.leaf, p.n, &p.body, p.no))
                 }
             }
-            append(mut &batch, PageRun{f: f.clone(), off: out[keep[starts[r]]].no * PAGE, pages: pages})
+            append(mut &batch, PageRun{f: f.share(), off: out[keep[starts[r]]].no * PAGE, pages: pages})
             r += 1
         }
         task.scope(fn(s: mut &task.Scope) {
@@ -5918,7 +5928,7 @@ fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: O
 
 // Opens the store in fs (creating it when it is new) and recovers: the last
 // checkpoint, then the log after it.
-pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] { return openIn(fs.clone(), fs, false, opts) }
+pub fn open(fs: lexdb_disk.Fs, opts: Options): Result[Store, lexdb_base.DbErr] { return openIn(fs.share(), fs, false, opts) }
 
 // open with the log segments in logFs, a directory of their own (--log-dir,
 // design/lexdb.md 9.124): refused unless fs's data was made with this log.
@@ -6104,7 +6114,7 @@ fn frameLen(recs: &[]TxWrite): int {
 // goes on where the last valid frame ended.
 fn (st: &Store) replay(m: &lexdb_page.Meta): Result[Unit, lexdb_base.DbErr] {
     var fs = lexdb_disk.Fs.Real("")
-    st.sh.with(fn(db: mut &Db) { fs = db.logFs.clone() })
+    st.sh.with(fn(db: mut &Db) { fs = db.logFs.share() })
     var seg = m.replaySeg
     var off = m.replayOff
     var batch = m.replayBatch
@@ -6207,7 +6217,7 @@ fn setDropReads(st: &Store, n: int) { st.sh.with(fn(db: mut &Db) { db.dropReads 
 // The memo: values the SQL layer keeps while the store is open, outside any
 // transaction (lost when it closes).
 // A copy of the store's handle (it is a reference to the one store).
-pub fn (st: &Store) handle(): Store { return Store{sh: st.sh.share(), fo: st.fo.clone(), memo: st.memo.clone(), locks: st.locks.clone()} }
+pub fn (st: &Store) handle(): Store { return st.share() }
 
 // ---- followers (9.71)
 
@@ -6442,9 +6452,9 @@ fn runWith[R](opened: Result[Store, lexdb_base.DbErr], f: &fn(Store): R): Result
     let st = try opened
     var out: []R = []
     task.scope(fn(s: mut &task.Scope) {
-        s.spawn(writer, st.clone())
-        s.spawn(checkpointer, st.clone())
-        append(mut &out, f(st.clone()))
+        s.spawn(writer, st.share())
+        s.spawn(checkpointer, st.share())
+        append(mut &out, f(st.share()))
         st.close()
     })
     return Ok(pop(mut &out))
@@ -6481,9 +6491,25 @@ fn runWith[R](opened: Result[Store, lexdb_base.DbErr], f: &fn(Store): R): Result
 // Where a follower's master is. Local: a Store in this process (the
 // tests); a replica process's follower talks to its master over a socket
 // (9.72).
+// An in-process follower's master, held weakly: a follower's state reaches its link and a store
+// reaches its follower, so a strong link would be a cycle of handles, which the compiler refuses
+// (design/consistency.md, finding 1). The master must stay open while its followers run.
+pub type StoreRef = value record { sh: task.Weak[Db]; memo: lexdb_memo.Memo; locks: lexdb_locks.Locks }
+
+// A weak reference to the store, for an in-process follower's link (Link.Local).
+pub fn (st: &Store) weakRef(): StoreRef { return StoreRef{sh: st.sh.weak(), memo: st.memo.share(), locks: st.locks.share()} }
+
+// The master store (a primary: no follower of its own); it must still be open.
+fn (r: &StoreRef) store(): Store {
+    match r.sh.upgrade() {
+        Some(sh) { return Store{sh: sh, fo: None, memo: r.memo.share(), locks: r.locks.share()} }
+        None { panic("lexdb: an in-process follower's master store was closed before it") }
+    }
+}
+
 pub type Link = value closed {
-    Local(Store)
-    LocalId(Store, int)         // Local, holding as follower id (several in one process: the tests)
+    Local(StoreRef)
+    LocalId(StoreRef, int)      // Local, holding as follower id (several in one process: the tests)
     Remote(task.Shared[Outbox])
 }
 
@@ -6505,8 +6531,8 @@ pub fn newOutbox(first: int): task.Shared[Outbox] {
 // Asks the master to keep what the follower reads (Store.hold).
 fn (l: &Link) hold(ckpt: int, seg: int) {
     match l {
-        Link.Local(st) { st.hold(ckpt, seg) }
-        Link.LocalId(st, id) { st.holdFor(id, ckpt, seg) }
+        Link.Local(r) { r.store().hold(ckpt, seg) }
+        Link.LocalId(r, id) { r.store().holdFor(id, ckpt, seg) }
         Link.Remote(ob) {
             var wake: []task.Promise[Unit] = []
             ob.with(fn(o: mut &Outbox) {
@@ -6524,8 +6550,8 @@ fn (l: &Link) hold(ckpt: int, seg: int) {
 fn (l: &Link) holdNow(): int {
     var c = 0
     match l {
-        Link.Local(st) { c = st.holdNow() }
-        Link.LocalId(st, id) { c = st.holdNowFor(id) }
+        Link.Local(r) { c = r.store().holdNow() }
+        Link.LocalId(r, id) { c = r.store().holdNowFor(id) }
         Link.Remote(ob) { ob.with(fn(o: mut &Outbox) { c = o.first }) }
     }
     return c
@@ -6619,6 +6645,9 @@ type Fol = record {
 
 pub type Follower = value record { sh: task.Shared[Fol] }
 
+// Another handle to the same follower (a handle: clone, a copy, does not apply).
+pub fn (f: &Follower) share(): Follower { return Follower{sh: f.sh.share()} }
+
 // A snapshot: the store as of batch, read through checkpoint ckpt.
 pub type FSnap = value record { pub id: int; pub batch: int; pub ckpt: int }
 
@@ -6661,7 +6690,7 @@ fn loadBase(f: &lexdb_disk.File, m: &lexdb_page.Meta): Result[Base, lexdb_base.D
 // cacheBytes. It is ready (ready) once it has applied the log up to its
 // first checkpoint's covers batch.
 pub fn openFollower(link: Link, fs: lexdb_disk.Fs, cacheBytes: int): Result[Follower, lexdb_base.DbErr] {
-    return openFollowerHow(link, fs.clone(), fs, cacheBytes)
+    return openFollowerHow(link, fs.share(), fs, cacheBytes)
 }
 
 // openFollower, with the log in logFs.
@@ -6718,17 +6747,17 @@ pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
             seg = f.seg
             off = f.off
             batch = f.applied + 1
-            fs = f.fs.clone()
-            if f.segNo == seg && len(f.segF) > 0 { append(mut &open, f.segF[0].clone()) }
+            fs = f.fs.share()
+            if f.segNo == seg && len(f.segF) > 0 { append(mut &open, f.segF[0].share()) }
         })
         if batch > upto { break }
         if len(open) == 0 {
             if !fs.exists(segName(seg)) { return Err(logGone(batch, seg)) }
             append(mut &open, try fs.open(&(segName(seg)), false))
-            let fresh = open[0].clone()
+            let fresh = open[0].share()
             fo.sh.with(fn(f: mut &Fol) {
                 while len(f.segF) > 0 { pop(mut &f.segF).close() }
-                append(mut &f.segF, fresh.clone())
+                append(mut &f.segF, fresh.share())
                 f.segNo = seg
             })
         }
@@ -6750,7 +6779,7 @@ pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
             at = 0
             fo.sh.with(fn(f: mut &Fol) {
                 while len(f.segF) > 0 { pop(mut &f.segF).close() }
-                append(mut &f.segF, g.clone())
+                append(mut &f.segF, g.share())
                 f.segNo = seg + 1
             })
         }
@@ -6947,7 +6976,7 @@ fn (fo: &Follower) checkMeta(): Result[Unit, lexdb_base.DbErr] {
     var data = lexdb_disk.File.Real(-1, false)
     var newest = 0
     fo.sh.with(fn(f: mut &Fol) {
-        data = f.data.clone()
+        data = f.data.share()
         newest = if len(f.next) > 0 { f.next[0].ckpt } else if len(f.bases) > 0 { f.bases[len(f.bases) - 1].ckpt } else { 0 }
     })
     let m = try readMeta(&data)
@@ -7085,7 +7114,7 @@ fn (f: mut &Fol) install(p: int, n: lexdb_page.Node) {
 
 fn (fo: &Follower) load(p: int): Result[Unit, lexdb_base.DbErr] {
     var data = lexdb_disk.File.Real(-1, false)
-    fo.sh.with(fn(f: mut &Fol) { data = f.data.clone() })
+    fo.sh.with(fn(f: mut &Fol) { data = f.data.share() })
     var b = array(PAGE, byte(0))
     try data.read(p * PAGE, mut &b[0..PAGE], PAGE)
     try lexdb_page.check(&b, p, lexdb_page.T_ANY)          // a leaf or an internal page
@@ -7691,7 +7720,7 @@ pub fn (fo: &Follower) changes(): int {
 // its writes fail (25006, read_only_sql_transaction). It is ready once the
 // follower is (Follower.ready); poll applies the master's batches.
 pub fn openReplica(fs: lexdb_disk.Fs, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
-    return openReplicaIn(fs.clone(), fs, false, opts, link)
+    return openReplicaIn(fs.share(), fs, false, opts, link)
 }
 
 // openReplica of a master whose log is in logFs (--log-dir): the same check as the master's.
@@ -7701,7 +7730,7 @@ pub fn openReplicaSplit(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options, 
 
 fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
     try checkLog(&fs, &logFs, split, false)
-    let fo = try openFollowerHow(link, fs.clone(), logFs.clone(), opts.cacheBytes)
+    let fo = try openFollowerHow(link, fs.share(), logFs.share(), opts.cacheBytes)
     // the Db keeps what the SQL layer keeps (the memo) and the counters
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
                             dropped: 0, runs: 0, covers: -1}
@@ -7710,7 +7739,12 @@ fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Opt
 }
 
 // A replica's follower.
-pub fn (st: &Store) follower(): Option[Follower] { return st.fo.clone() }
+pub fn (st: &Store) follower(): Option[Follower] {
+    match st.fo {
+        Some(f) { return Some(f.share()) }
+        None { return None }
+    }
+}
 
 // A replica transaction's follower snapshot. Dropping it ends the
 // snapshot: the SQL layer drops some transactions without ending them (a
@@ -7724,7 +7758,7 @@ fn (p: mut &RepPin) drop() { p.fo.end(&p.s) }
 
 // The transaction's follower snapshot, taken at its first read.
 fn repSnap(fo: &Follower, t: mut &Txn): Result[FSnap, lexdb_base.DbErr] {
-    if len(t.fsnap) == 0 { append(mut &t.fsnap, RepPin{fo: fo.clone(), s: try fo.begin()}) }
+    if len(t.fsnap) == 0 { append(mut &t.fsnap, RepPin{fo: fo.share(), s: try fo.begin()}) }
     return Ok(t.fsnap[0].s)
 }
 

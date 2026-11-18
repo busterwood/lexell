@@ -295,7 +295,8 @@ User time of the native self-build: stage 1 0.415 s, after the merge
 
 `Shared.with` was not moved onto `rc`: a mutable `rc` would break the rule
 that handles cannot form cycles (SPEC 4.9). `unshare()` changes an `rc`
-value within a thread, and `task.Shared` across threads.
+value, and `task.Shared` state that several tasks change (on one thread: tasks
+share it; corrected 2026-11-18, design/consistency.md finding 1).
 
 ## 6. Language issues the migration exposed
 

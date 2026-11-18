@@ -371,9 +371,14 @@ copy for a type that is **cloneable**:
 - a copy type;
 - `str`, where the clone is an independent string;
 - an array whose elements are cloneable;
-- `task.Shared[T]`, where the copy is another handle;
 - a record or closed type without a `drop` method, holding no borrows, whose
   fields are each cloneable.
+
+A `task.Shared[T]` is not cloneable, nor is a type that holds one (outside an
+`rc`), unless it declares `clone`: a clone is an independent copy, and a
+second handle to the same changing value is not one. `sh.share()` makes
+another handle, and a type that is a handle (a pool, a client, a store)
+declares `share()` the same way (design/consistency.md, finding 1).
 
 A type that contains itself is cloneable when the rest of it is
 (`type Node = record { name: str; kids: []Node }`). Such a type satisfies
@@ -430,7 +435,14 @@ A buffer that several readers walk is a natural `rc`: the TDS and TNS clients
 keep a reply in an `rc str` and their cursors share it (`Cur{s: r.share(),
 pos: p}`), so making a cursor costs a count, not a copy.
 
-Because no handle can change a shared value, handles cannot form cycles.
+Because no `rc` handle can change its value, `rc` handles alone cannot form
+cycles: values are built bottom-up. A `task.Shared` can change, so it could
+close one; the compiler therefore refuses a `task.Shared[T]` whose `T` can
+reach that same `Shared[T]` (through fields, variants, elements, `rc` and
+other `Shared`s: `type Node = record { next: Option[task.Shared[Node]] }` is
+an error once `Shared[Node]` is used). A link back is made with a weak
+handle, `task.Weak[T]` (section 16), which the check does not follow. So
+counted values are always freed with their last handle.
 Every box is freed with its last handle, without a collector. Counts are not
 atomic, so a `par.map` closure may read through a handle but not share or
 drop one: the kernel check refuses it (design/parallel.md).
@@ -1487,8 +1499,15 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   does not park. The clock is `CLOCK_MONOTONIC`; timers fire in the order of
   their time, and those with the same time in the order they were set.
 - `Shared[T]` is a counted handle to one value, which is dropped with the
-  last handle. A handle is owned: `sh.share()` (or `sh.clone()`) makes
-  another, and passing one to a task moves it (design/owned-str.md). `sh.with(f)`
+  last handle. A handle is owned: `sh.share()` makes another (`clone()` does
+  not apply: section 4.7), and passing one to a task moves it
+  (design/owned-str.md). Tasks share one thread, so a `Shared` is for state
+  that several tasks change, not for threads (`par.map` kernels may not use
+  one). `sh.weak()` makes a `Weak[T]`, a handle that does not keep the value:
+  `w.upgrade()` gives `Some(Shared[T])` while a `Shared` handle exists and
+  `None` once the value was dropped; `w.share()` makes another weak handle.
+  A `Weak` is how a value points back at what holds it (a parent, an owner,
+  a master store) without a cycle of handles (section 4.9). `sh.with(f)`
   lends the value to `f` as `mut &T`, and is the only access. No other task runs during `with`: an operation that can park,
   called while any `with` is open, stops the program with exit 13 (the check
   is made whether or not the call would have parked), and so does a `with`

@@ -729,6 +729,89 @@ fn (pg: mut &Program) derivableAt(t: int, name: &str, seen: mut &[]int): bool {
     return true
 }
 
+// Design/consistency.md, finding 1: counted handles must not form cycles, which would never be
+// freed. An rc value never changes, so only a task.Shared can close one: a Shared[T] whose T can
+// reach that same Shared[T] (through fields, variants, arrays, rc and other Shareds) is an error.
+// Run once every instance is known (emit, after instantiation).
+pub fn (pg: mut &Program) checkHandleCycles() {
+    if pg.shared < 0 { return }
+    let n = len(pg.tys)
+    for t in 0..n {
+        if pg.tk(t) != TK_INST || pg.ta(t) != pg.shared { continue }
+        let payload = pg.targs(t)[0]
+        var seen: []int = []
+        var path: []int = []
+        if pg.reachesType(payload, t, mut &seen, mut &path) {
+            var where = -1
+            var names = newStrBuf()
+            for x in path {
+                if pg.tk(x) == TK_INST && pg.ta(x) != pg.shared && pg.ta(x) != pg.rc {
+                    if where < 0 { where = pg.ta(x) }
+                    if len(names.toStr()) > 0 { names.add(" -> ") }
+                    names.add(&pg.tstr(x))
+                }
+            }
+            let m = if where >= 0 { pg.types[where].mod } else { 0 }
+            let line = if where >= 0 { pg.types[where].line } else { 0 }
+            pg.err(m, line, pg.tstr(t) + " can hold itself (" + names.toStr() + " -> " + pg.tstr(t) + "): counted " +
+                "handles must not form cycles, which would never be freed; point back with a task.Weak (sh.weak()), " +
+                "or link by ids (an index or a map key)")
+        }
+    }
+}
+
+// Whether type x can contain target (path: the types on the way, when it can).
+fn (pg: mut &Program) reachesType(x: int, target: int, seen: mut &[]int, path: mut &[]int): bool {
+    if x == target { return true }
+    for s in seen {
+        if s == x { return false }
+    }
+    append(seen, x)
+    append(path, x)
+    let k = pg.tk(x)
+    if k == TK_ARR && pg.reachesType(pg.ta(x), target, seen, path) { return true }
+    if k == TK_INST {
+        let d = pg.ta(x)
+        if d == pg.shared {
+            if pg.reachesType(pg.targs(x)[0], target, seen, path) { return true }
+        } else if pg.types[d].form == sx.F_RECORD || pg.types[d].form == sx.F_CLOSED {
+            let fts = pg.fieldTypes(x)
+            for ft in fts {
+                if pg.reachesType(ft, target, seen, path) { return true }
+            }
+        }
+    }
+    pop(path)
+    return false
+}
+
+// Whether a value of type t holds a task.Shared handle of its own (in a field, a variant or an
+// element; not behind an rc, whose clone is another rc handle): such a value is not copied by
+// clone (design/consistency.md, finding 1), unless its type declares clone.
+pub fn (pg: mut &Program) holdsShared(t: int): bool {
+    var seen: []int = []
+    return pg.holdsSharedAt(t, mut &seen)
+}
+
+fn (pg: mut &Program) holdsSharedAt(t: int, seen: mut &[]int): bool {
+    let k = pg.tk(t)
+    if k == TK_ARR { return pg.holdsSharedAt(pg.ta(t), seen) }
+    if k != TK_INST { return false }
+    let d = pg.ta(t)
+    if d == pg.shared { return true }
+    if d == pg.rc || pg.methodOf(t, "clone") >= 0 { return false }
+    if pg.types[d].form != sx.F_RECORD && pg.types[d].form != sx.F_CLOSED { return false }
+    for x in seen {
+        if x == t { return false }
+    }
+    append(seen, t)
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if pg.holdsSharedAt(ft, seen) { return true }
+    }
+    return false
+}
+
 // Whether t is rc T (std.Rc[T]).
 pub fn (pg: &Program) isRc(t: int): bool { return pg.rc >= 0 && pg.tk(t) == TK_INST && pg.ta(t) == pg.rc }
 
@@ -742,9 +825,16 @@ pub fn (pg: mut &Program) cloneBlocker(t: int): str {
     if pg.cloneable(t) { return "" }
     let k = pg.tk(t)
     if k == TK_ARR { return pg.cloneBlocker(pg.ta(t)) }
+    if k == TK_INST && pg.ta(t) != pg.shared && pg.holdsShared(t) {
+        return pg.tstr(t) + " holds a task.Shared, which is shared, not copied: a handle type declares share() (another " +
+            "handle to the same state, as Shared.share does) and its users call that"
+    }
     if k == TK_CLO || k == TK_REF || k == TK_SLICE { return pg.tstr(t) + " holds borrows" }
     if k != TK_INST { return pg.tstr(t) + " cannot be copied" }
     let d = pg.ta(t)
+    if d == pg.shared {
+        return pg.tstr(t) + " is shared, not copied (share() makes another handle to the same value)"
+    }
     if pg.types[d].drop >= 0 { return pg.tstr(t) + " has a drop method" }
     if pg.isBorrowClass(t) { return pg.tstr(t) + " holds borrows" }
     let fts = pg.fieldTypes(t)
@@ -755,6 +845,7 @@ pub fn (pg: mut &Program) cloneBlocker(t: int): str {
 }
 
 fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
+    if pg.holdsShared(t) && pg.methodOf(t, "clone") < 0 { return false }
     if pg.isCopyLegacy(t) { return true }
     let k = pg.tk(t)
     if k == TK_TP {
@@ -772,7 +863,9 @@ fn (pg: mut &Program) cloneableAt(t: int, seen: mut &[]int): bool {
     if k != TK_INST { return false }
     if pg.methodOf(t, "clone") >= 0 { return true }
     let d = pg.ta(t)
-    if d == pg.shared || d == pg.rc { return true }       // another handle (rc: the value never changes)
+    if d == pg.rc { return true }       // another handle: the value never changes
+    // a task.Shared is not copied: share() makes another handle (design/consistency.md, finding 1)
+    if d == pg.shared { return false }
     if pg.types[d].drop >= 0 || pg.isBorrowClass(t) { return false }
     for x in seen {
         if x == t { return true }

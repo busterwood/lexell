@@ -586,7 +586,10 @@ task.Future[int], w: Where)` calls `f.wait(w)`).
   with no result cannot give `R`); `within` itself never parks.
 - `Cancelled` is `value closed { Cancelled; Abandoned; Timeout }` (`eq`,
   `toStr`).
-- `shared[T](v: T): Shared[T]`: a counted handle (a lang item, SPEC 15), owned: `sh.share()` makes another;
+- `shared[T](v: T): Shared[T]`: a counted handle (a lang item, SPEC 15), owned: `sh.share()` makes another
+  (`clone()` does not apply, SPEC 4.7); `sh.weak()` makes a `Weak[T]`, which does not keep the value
+  (`w.upgrade(): Option[Shared[T]]`, `w.share()`), for links back that would otherwise be a cycle of
+  handles, which the compiler refuses (SPEC 4.9);
   `sh.with(f: &fn(mut &T))` is the only access. Parking inside `with`, or a
   `with` on a value whose `with` is open, is exit 13. If every task is
   parked the program stops with exit 14 (deadlock). The messages name the
@@ -994,7 +997,7 @@ let r = try c.send(&rq)
   trusts that CA instead of the system's store (not as well as it: see
   tls above); `o.tls.insecureSkipVerify = true` turns verification
   off; pins and a client certificate are `tls` options too.
-- `Client` (`newClient(o)`) is a handle over a `task.Shared` pool (`clone()` gives another):
+- `Client` (`newClient(o)`) is a handle over a `task.Shared` pool (`share()` gives another):
   copies share it. `send(&rq)`, `get(u)`, `head(u)`,
   `post(u, contentType, body)`, `put(...)`, `delete(u)`; `options()`,
   `stats()` (`Stats {open, idle, waiting, dials, reuses, retries}`),
@@ -1084,14 +1087,15 @@ r.handle("GET /accounts/{id}", account)
 let st = try http.serve(net.listen(":8080").expect("listen"), app, r, http.defaults())
 ```
 
-- `serve[A: copy](ln, app: A, r: Router[A], cfg: Config): Result[Stats,
+- `serve[A](ln, app: A, r: Router[A], cfg: Config): Result[Stats,
   Error]` serves until `rq.stopServer()`, or `SIGTERM`/`SIGINT` when
   `cfg.signals`. Then it drains: it closes the listener (new connections are
   refused) and the idle connections, lets the requests in flight finish
   (their replies say `Connection: close`) for up to `drainMs`, cancels the
   rest, and returns its counters. One task per connection, keep-alive,
-  pipelined requests answered in order. Each handler gets `&app`, a copy per
-  connection. `Err` (kind `Config`) before anything is accepted when a
+  pipelined requests answered in order. Each handler gets `&app`: the app is
+  kept in one `rc` that every connection shares (so `A` needs no `Clone`; state
+  the handlers change goes in a `task.Shared` inside it). `Err` (kind `Config`) before anything is accepted when a
   pattern is invalid or two conflict, or when `RLIMIT_NOFILE` (raised as
   far as the hard limit allows) or `vm.max_map_count` is too low for
   `maxConns`. In a worker it marks the worker ready (`task.workerReady`);

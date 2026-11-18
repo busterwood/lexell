@@ -61,6 +61,21 @@ type App = value record {
     worker: int                       // the worker's index, or -1 without workers
 }
 
+// Other handles to the pools (the app gets these; main keeps its own for the counters).
+fn sharePg(p: &Option[postgres.Pool]): Option[postgres.Pool] {
+    match p {
+        Some(x) { return Some(x.share()) }
+        None { return None }
+    }
+}
+
+fn shareMs(p: &Option[sqlserver.Pool]): Option[sqlserver.Pool] {
+    match p {
+        Some(x) { return Some(x.share()) }
+        None { return None }
+    }
+}
+
 const HELLO = "hello, world\n"
 
 fn hello(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
@@ -75,7 +90,12 @@ fn db(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, htt
     }
     let r = match app.db {
         Some(pool) { query(&pool, n) }
-        None { queryMs(&app.ms.clone().unwrap(), n) }
+        None {
+            match app.ms {
+                Some(p) { queryMs(&p, n) }
+                None { panic("no database") }
+            }
+        }
     }
     match move(r) {
         Ok(v) { return w.text(&("db " + intToStr(v) + "\n")) }
@@ -156,7 +176,7 @@ fn run(ln: net.Listener, size: int, worker: int) {
     var cfg = http.defaults()
     cfg.maxConns = 30000                  // the gates hold 10,000 idle connections and more
     let who = if worker >= 0 { "worker " + intToStr(worker) + ": " } else { "" }
-    match http.serve(ln, App{db: pool.clone(), ms: ms.clone(), worker: worker}, routes(), cfg) {
+    match http.serve(ln, App{db: sharePg(&pool), ms: shareMs(&ms), worker: worker}, routes(), cfg) {
         Ok(s) {
             var pg = ""
             match &pool {

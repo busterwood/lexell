@@ -50,6 +50,9 @@ extern "c" fn rtAbandon(t: ptr) as "lxllib_task_abandon"
 extern "c" fn rtShNew(box: ptr, drop: extern fn(ptr)): ptr as "lxllib_sh_new"
 extern "c" fn rtShEnter(s: ptr, w: ptr): ptr as "lxllib_sh_enter"
 extern "c" fn rtShLeave(s: ptr, box: ptr) as "lxllib_sh_leave"
+extern "c" fn rtShWeak(s: ptr): ptr as "lxllib_sh_weak"
+extern "c" fn rtWeakDrop(s: ptr) as "lxllib_weak_drop"
+extern "c" fn rtWeakUpgrade(s: ptr): ptr as "lxllib_weak_upgrade"
 extern "c" fn rtSleep(ms: int, w: ptr): int as "lxllib_task_sleep"
 extern "c" fn rtWithin(ms: int): int as "lxllib_task_within"
 extern "c" fn rtRestore(old: int) as "lxllib_task_restore"
@@ -88,6 +91,12 @@ pub type Handoff[T] = record {
 // A counted handle to one value, dropped with the last handle. A handle is owned: share() makes
 // another (design/owned-str.md). A value no task changes is an rc T instead (SPEC 4.9).
 pub type Shared[T] = value record { p: ptr }
+
+// A weak handle to a Shared value (sh.weak()): it does not keep the value, so it may point back
+// to something that holds it (a parent, an owner, a master) without a cycle of handles, which the
+// compiler refuses (design/consistency.md, finding 1). w.upgrade() gives a Shared while one
+// exists. Not followed by the cycle check: its only field is the runtime's pointer.
+pub type Weak[T] = record { p: ptr }
 
 // What a task runs (boxed until it starts), and the box of a result or a
 // Shared value.
@@ -269,6 +278,21 @@ pub fn (p: mut &Promise[T]) drop() {
 pub fn shared[T](v: T): Shared[T] {
     return Shared[T]{p: rtShNew(intoPtr(Cell[T]{v: v}), dropCell[T])}
 }
+
+// A weak handle to the value: it does not keep the value alive.
+pub fn (s: &Shared[T]) weak(): Weak[T] { return Weak[T]{p: rtShWeak(s.p)} }
+
+// A strong handle to the value, or None when its last one is gone (the value was dropped).
+pub fn (w: &Weak[T]) upgrade(): Option[Shared[T]] {
+    let p = rtWeakUpgrade(w.p)
+    if isNull(p) { return None }
+    return Some(Shared[T]{p: p})
+}
+
+// Another weak handle to the same value.
+pub fn (w: &Weak[T]) share(): Weak[T] { return Weak[T]{p: rtShWeak(w.p)} }
+
+pub fn (w: mut &Weak[T]) drop() { rtWeakDrop(w.p) }
 
 // Runs f on the value. f must not park (exit 13), and a with on the same
 // value inside f stops the program (exit 13). w: the call of with.

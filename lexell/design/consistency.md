@@ -22,6 +22,8 @@ rule.
 - AL: `pure` externs callable from par.map kernels.
 - AM (finding 4): derived `eq`, `hash`, `toStr`. `cmp` is not derived; an
   opt-in (e.g. a `derives Ord` marker) is not done yet.
+- AN (finding 1, option a, with weak handles as the user agreed): the cycle
+  check, `task.Weak`, `share()` for handle types, httpserver's app in an `rc`.
 
 ## Plan, in order
 

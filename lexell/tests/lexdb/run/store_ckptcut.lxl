@@ -34,6 +34,9 @@ fn val(tag: str, i: int): str { return tag + i.toStr() + "-pad-pad-pad-pad-pad-p
 
 type Arg = value record { st: lexdb_store.Store; tree: int; during: task.Shared[int]; ckpt: task.Shared[int] }
 
+// Another handle on the same store and counters (Arg holds handles: share, not clone).
+fn (a: &Arg) share(): Arg { return Arg{st: a.st.share(), tree: a.tree, during: a.during.share(), ckpt: a.ckpt.share()} }
+
 fn ckptTask(a: Arg): int {
     a.ckpt.with(fn(x: mut &int) { x = 1 })
     let r = a.st.checkpoint()
@@ -48,13 +51,13 @@ fn opts(snap: int): lexdb_store.Options {
 // fs: lexdb_disk.sim's (crashed after the second checkpoint), or a real
 // directory's (closed, then opened again).
 fn rows(fs: lexdb_disk.Fs, snap: int, seed: int, label: str) {
-    var crashed = fs.clone()
+    var crashed = fs.share()
     var tree = 0
     var want: []str = []
     for i in 0..ROWS { append(mut &want, val("b", i)) }
     var during = 0
     var whole = 0
-    lexdb_store.run(fs.clone(), opts(snap), fn(st: lexdb_store.Store): int {
+    lexdb_store.run(fs.share(), opts(snap), fn(st: lexdb_store.Store): int {
         lexdb_store.testHooks().setCutChunk(st, 1)           // a yield after each leaf: the commits land between the cut and its end
         var t = lexdb_store.begin()
         tree = st.createTree(mut &t)
@@ -69,10 +72,10 @@ fn rows(fs: lexdb_disk.Fs, snap: int, seed: int, label: str) {
             }
             if tag == "a" { st.checkpointAll().unwrap() }
         }
-        let a = Arg{st: st.clone(), tree: tree, during: task.shared(0), ckpt: task.shared(0)}
+        let a = Arg{st: st.share(), tree: tree, during: task.shared(0), ckpt: task.shared(0)}
         task.scope(fn(s: mut &task.Scope) {
             let ends = lexdb_store.testHooks().cutCounts(st)[2]
-            s.spawn(ckptTask, a.clone())
+            s.spawn(ckptTask, a.share())
             for n in 0..COMMITS {
                 var c0 = 0
                 a.ckpt.with(fn(x: mut &int) { c0 = x })
@@ -140,9 +143,9 @@ fn main() {
     rows(lexdb_disk.real(&dir), 50000, 0, "real disk")
     let gone = fs.removeAll(&dir)
     let fs = lexdb_disk.sim(7)
-    lexdb_store.run(fs.clone(), opts(50000), fn(st: lexdb_store.Store): int {
+    lexdb_store.run(fs.share(), opts(50000), fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
-        var s = lexdb_exec.newSession(st.clone())
+        var s = lexdb_exec.newSession(st.share())
         let c = q(mut &s, &"create table w (id int primary key, a int, t text)")
         let i = q(mut &s, &"insert into w select g, g, 'text ' || (g % 17) from generate_series(1, 3000) g")
         st.checkpointAll().unwrap()

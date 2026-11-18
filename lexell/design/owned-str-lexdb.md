@@ -313,6 +313,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AM | SPEC 7.4 (finding 4): `eq`, `hash` and `toStr` are derived for a record or closed type that declares none, has no drop method, holds no borrows and whose fields all have them (like clone). Such types satisfy `Eq`, `Hash`, `Show`: they can be `Map` keys and be printed. Inside a type's own `eq`, `==` on a fieldless enum compares variants (no self-recursion). `cmp` is not derived. The library's `eq` methods that compared through two `toStr()` strings (`task.Cancelled`, `httpserver.ErrorKind`, `tls.Kind`, `regex_syntax.ErrorCode`, `strings.ParseError`) are gone. | 62cdc026 | yes | `==` on such types now works where it was a compile error |
 
+| AN | SPEC 4.7, 4.9, 16 (finding 1): no cycles through counted handles: a `task.Shared[T]` whose `T` can reach that same `Shared[T]` is a compile error. `task.Weak[T]` (`sh.weak()`, `w.upgrade(): Option[Shared[T]]`, `w.share()`) points back without keeping the value, and the check does not follow it. A `Shared`, or a type holding one, is not cloneable: handle types declare `share()` (`http.Client`, `pool.Pool`, `sse.Feed`, `sse.Cursor` do now). httpserver keeps the app in one `rc` shared by every connection, so `serve[A]` needs no `A: Clone`. | (this commit) | **no**, done on this branch: `share()` on `Store`, `Follower`, `Memo`, `Locks`, `Fs`, `File`, `SeqEnv` (`Store.handle()` now calls it), every `.clone()` of those became `.share()`, and `Link.Local`/`LocalId` hold a `StoreRef` (weak) instead of a `Store`, which closed a cycle (Fol -> Link -> Store -> Option[Follower] -> Shared[Fol]). Tests: `Link.Local(st.weakRef())`. | A weakly linked master must stay open while its in-process followers run (it panics otherwise; the tests do) |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
@@ -341,4 +343,18 @@ be deleted where the derived ones do the same: the derived `toStr` format is
 `P{x: 1, name: "a"}` / `E.V(1)` / `E.V{w: 2}`, so keep a `toStr` whose text
 matters (messages, SQL, wire formats). Types used as `Map` keys no longer
 need key strings built from their fields.
+
+**AN for lexdb, in detail.** Done on lang/consistency so lexdb keeps
+compiling (its suite passes, 190), and to be reviewed by whoever owns the
+code:
+- `share()` methods: `lexdb_store.Store` (`handle()` delegates to it),
+  `Follower`, `lexdb_memo.Memo`, `lexdb_locks.Locks`, `lexdb_disk.Fs`,
+  `lexdb_disk.File`, `lexdb_exec.SeqEnv`; and every `.clone()` of these (and
+  of `task.Shared` values) in cmd/ and tests/lexdb became `.share()`.
+- `lexdb_store.StoreRef` (weak: `task.Weak[Db]` plus the memo and locks) is
+  what `Link.Local` and `Link.LocalId` hold; `Store.weakRef()` makes one and
+  `StoreRef.store()` upgrades it (a primary: `fo` is `None`).
+  `Store.follower()` now shares the follower.
+- New lexdb code that copies a handle writes `share()`; `clone()` on a type
+  holding a `Shared` is a compile error naming `share()`.
 

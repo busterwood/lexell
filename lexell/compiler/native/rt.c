@@ -3068,6 +3068,7 @@ void lxllib_task_abandon(void* p) {
 
 struct rt_shared {
     int64_t rc;
+    int64_t wk;                     /* weak handles (task.Weak): the block outlives the value for them */
     bool busy;                      /* its with is open: opened at w, inside the with up */
     const char* w;
     rt_shared* up;
@@ -3079,14 +3080,15 @@ static void rt_nopark(const char* w) {
 }
 void* lxllib_sh_new(void* box, void* drop) {
     rt_shared* s = rt_alloc(sizeof *s);
-    s->rc = 1; s->busy = false; s->box = box; s->drop = (void (*)(void*))drop;
+    s->rc = 1; s->wk = 0; s->busy = false; s->box = box; s->drop = (void (*)(void*))drop;
     return s;
 }
 void rt_sh_dup(void* p) { if (p) ((rt_shared*)p)->rc++; }
 static void rt_sh_free(rt_shared* s) {
     void* b = s->box;
     void (*d)(void*) = s->drop;
-    rt_free(s);
+    s->box = 0;
+    if (s->wk == 0) rt_free(s);     /* else the last weak handle frees it */
     if (rt_cur->shdrop) { rt_dpush(d, b); return; }
     rt_cur->shdrop++;
     rt_drun(d, b);
@@ -3111,6 +3113,19 @@ void lxllib_sh_leave(void* p, void* box) {
     s->busy = false;
     rt_with_top = s->up;
     if (s->rc == 0) rt_sh_free(s);
+}
+/* task.Weak: a handle that does not keep the value (design/consistency.md, finding 1). */
+void* lxllib_sh_weak(void* p) { ((rt_shared*)p)->wk++; return p; }
+void lxllib_weak_drop(void* p) {
+    rt_shared* s = p;
+    if (--s->wk == 0 && s->rc == 0 && !s->busy) rt_free(s);
+}
+/* Another strong handle while one exists, else 0 (the value is gone). */
+void* lxllib_weak_upgrade(void* p) {
+    rt_shared* s = p;
+    if (s->rc == 0) return 0;
+    s->rc++;
+    return p;
 }
 
 /* ------------------------------------------------------------ the helper pool (stage C1c)

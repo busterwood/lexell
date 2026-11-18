@@ -62,7 +62,7 @@ type Inc = record { st: lexdb_store.Store; n: int }
 
 // n increments of acct 1, by read, FOR UPDATE, write; the failures.
 fn incrementer(a: Inc): int {
-    var s = lexdb_exec.newSession(a.st.clone())
+    var s = lexdb_exec.newSession(a.st.share())
     var bad = 0
     for i in 0..a.n {
         let b = one(mut &s, "begin")
@@ -79,7 +79,7 @@ type Worker = record { st: lexdb_store.Store; id: int }
 
 // Jobs taken until none is left: the failures (a job done twice counts).
 fn worker(a: Worker): int {
-    var s = lexdb_exec.newSession(a.st.clone())
+    var s = lexdb_exec.newSession(a.st.share())
     var bad = 0
     while true {
         let b = one(mut &s, "begin")
@@ -107,7 +107,7 @@ fn pause() { let z = task.sleep(30) }
 fn main() {
     lexdb_store.run(lexdb_disk.sim(29), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
         lexdb_exec.bootstrap(&st).unwrap()
-        var a = lexdb_exec.newSession(st.clone())
+        var a = lexdb_exec.newSession(st.share())
         let m1 = one(mut &a, "create table acct (id int primary key, bal int)")
         let m2 = one(mut &a, "insert into acct values (1, 100), (2, 200), (3, 300)")
         let m3 = one(mut &a, "create table jobs (id int primary key, state text, times int, who int)")
@@ -116,7 +116,7 @@ fn main() {
             // waits for a's lock, then reads what a committed
             let x1 = one(mut &a, "begin")
             let x2 = one(mut &a, "select bal from acct where id = 1 for update")
-            let fb = sc.start(runJob, Job{s: lexdb_exec.newSession(st.clone()), sqls: ["begin", "select bal from acct where id = 1 for update",
+            let fb = sc.start(runJob, Job{s: lexdb_exec.newSession(st.share()), sqls: ["begin", "select bal from acct where id = 1 for update",
                                                                                  "update acct set bal = bal + 10 where id = 1", "commit"]})
             pause()
             let x3 = one(mut &a, "update acct set bal = bal + 5 where id = 1")
@@ -126,13 +126,13 @@ fn main() {
 
             let y0 = one(mut &a, "update acct set bal = 0 where id = 1")
             var incs: []task.Future[int] = []
-            for i in 0..6 { append(mut &incs, sc.start(incrementer, Inc{st: st.clone(), n: 10})) }
+            for i in 0..6 { append(mut &incs, sc.start(incrementer, Inc{st: st.share(), n: 10})) }
             var bad = 0
             while len(incs) > 0 { bad += pop(mut &incs).wait().unwrap() }
             println("increments: " + one(mut &a, "select bal from acct where id = 1") + ", failures " + bad.toStr())
 
             var ws: []task.Future[int] = []
-            for i in 0..4 { append(mut &ws, sc.start(worker, Worker{st: st.clone(), id: i + 1})) }
+            for i in 0..4 { append(mut &ws, sc.start(worker, Worker{st: st.share(), id: i + 1})) }
             var wbad = 0
             while len(ws) > 0 { wbad += pop(mut &ws).wait().unwrap() }
             println("jobs: " + one(mut &a, "select count(*) from jobs where state = 'done'") + " done, each once: " +
@@ -161,7 +161,7 @@ fn main() {
 
             // a deadlock: a waits for c's row, c then for a's
             var cs = cs0
-            var da = lexdb_exec.newSession(st.clone())
+            var da = lexdb_exec.newSession(st.share())
             let d1 = one(mut &da, "begin")
             let d2 = one(mut &cs, "begin")
             let d3 = one(mut &da, "select id from acct where id = 1 for update")
@@ -179,7 +179,7 @@ fn main() {
             let r2 = one(mut &aa, "select id from acct where id = 1 for update")
             let r3 = one(mut &aa, "rollback")
             let r4 = one(mut &cs, "select id from acct where id = 1 for update nowait")
-            var gone = lexdb_exec.newSession(st.clone())
+            var gone = lexdb_exec.newSession(st.share())
             let g1 = one(mut &gone, "begin")
             let g2 = one(mut &gone, "select id from acct where id = 1 for update")
             gone.close()
