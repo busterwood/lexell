@@ -83,6 +83,7 @@ pub const H_ADDR = 11
 pub const H_DEREF = 12
 pub const H_SHARE = 13
 pub const H_CLONE = 14     // a deep copy (design/owned-str.md, issue 4): the type t and the value x
+pub const H_DERIVE = 15    // a derived method (eq, hash, toStr; design/consistency.md): t and the name s
 
 pub type Hole = value record {
     pub k: int
@@ -4332,7 +4333,9 @@ fn (c: mut &Checker) tagEq(t: int): bool {
     for x in c.pg.types[d].variants {
         if len(c.pg.variants[x].fields) > 0 { return false }
     }
-    return c.pg.methodOf(t, "eq") < 0
+    let own = c.pg.methodOf(t, "eq")
+    // inside the type's own eq, == compares tags: the method calling itself would never end
+    return own < 0 || own == c.cx.fd
 }
 
 fn (c: mut &Checker) opCall(recv: Val, name: &str, args: &[]Val, line: int, op: &str): Val {
@@ -5159,6 +5162,9 @@ fn (c: mut &Checker) methodSig(t: int, name: &str, line: int, quiet: bool): Sig 
         c.err(line, c.tstr(t) + " has no method '" + name + "' (its constraints do not provide it)")
     }
     let f = c.pg.methodOf(t, name)
+    if f < 0 && (name == "eq" || name == "hash" || name == "toStr") && c.pg.derivable(t, name) {
+        return c.derivedSig(t, name)
+    }
     if f < 0 || c.pg.fns[f].recvMode == sema.RM_ASSOC {
         if quiet && f < 0 { return noSig() }
         if f >= 0 { c.err(line, c.pg.label(f) + " is an associated function: call it as " + c.tstr(t) + "." + name + "(...)") }
@@ -5171,6 +5177,19 @@ fn (c: mut &Checker) methodSig(t: int, name: &str, line: int, quiet: bool): Sig 
     var bind: []int = []
     c.pg.unify(c.pg.fns[f].recvType, t, mut &bind, &c.pg.fns[f].tps)
     return c.fnSig(f, bind)
+}
+
+// A derived method of t (design/consistency.md, finding 4): fn (&Self) eq(other: &Self): bool,
+// hash(): u64 or toStr(): str, called as a function whose C name emit fills in (glue).
+fn (c: mut &Checker) derivedSig(t: int, name: &str): Sig {
+    let r = c.pg.mkRef(t, false)
+    let ps: []int = if name == "eq" { [r, r] } else { [r] }
+    let ret = if name == "eq" { sema.T_BOOL } else if name == "hash" { sema.T_U64 } else { sema.T_STR }
+    var s = newSig(&(c.tstr(t) + "." + name), SK_FNVAL, ps, ret)
+    s.recv = sema.RM_REF
+    s.c = c.hole(mkHole(H_DERIVE, t, name))
+    s.name = name.clone()
+    return s
 }
 
 // SPEC 7.5: whether the borrow argument a (&p, mut &p, a borrow variable, or a receiver p) is

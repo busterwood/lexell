@@ -26,7 +26,12 @@ const G_REST = 2
 const G_DUP = 3
 const G_TRAMP = 4
 const G_CLONE = 5
-const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone"]
+const G_EQ = 6          // derived methods (design/consistency.md, finding 4)
+const G_HASH = 7
+const G_SHOW = 8
+const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone", "eq", "hash", "toStr"]
+
+fn deriveKind(name: &str): int { return if name == "eq" { G_EQ } else if name == "hash" { G_HASH } else { G_SHOW } }
 
 type Inst = value record {
     f: int
@@ -386,6 +391,203 @@ fn (e: mut &Emitter) dupField(ft: int, loc: int): int {
     return e.c.x.sx(e.c.x.asg(loc, e.dupC(ft, loc)))
 }
 
+// ---- derived methods (design/consistency.md, finding 4): eq, hash and toStr glue for a record or
+// closed type without its own, each taking pointers to the values (&Self).
+
+// The C of &x for a value x of type t (a &str is the string itself).
+fn (e: mut &Emitter) refC(t: int, x: int): int {
+    return if t == sema.T_STR { x } else { e.c.x.par(e.c.x.pre("&", x)) }
+}
+
+// A call of t's method name (declared, or derived) on the value x, with the &Self argument y.
+fn (e: mut &Emitter) methodC(t: int, name: &str, x: int, y: int): int {
+    let f = e.c.pg.methodOf(t, name)
+    if f < 0 {
+        let g = e.glueFn(deriveKind(name), t)
+        return if y >= 0 { e.call(&g, [e.refC(t, x), e.refC(t, y)]) } else { e.call(&g, [e.refC(t, x)]) }
+    }
+    var bind: []int = []
+    e.c.pg.unify(e.c.pg.fns[f].recvType, t, mut &bind, &e.c.pg.fns[f].tps)
+    var ta: []int = []
+    for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
+    let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
+    let recv = if e.c.pg.fns[f].recvMode == sema.RM_VAL { e.dupC(t, x) } else { e.refC(t, x) }
+    return if y >= 0 { e.call(&fname, [recv, e.refC(t, y)]) } else { e.call(&fname, [recv]) }
+}
+
+// The fields of t's record, or of variant v of its closed type, as places of the value at pointer p.
+fn (e: mut &Emitter) derivedFields(t: int, d: int, v: int, p: int): []int {
+    let boxed = !e.c.pg.types[d].value
+    let base = e.c.x.par(e.c.x.pre("*", p))
+    var out: []int = []
+    let names = e.fieldNames(d, v)
+    if v < 0 {
+        for f in names {
+            append(mut &out, if boxed { e.c.x.arrow(base, &("f_" + f)) } else { e.c.x.dot(base, &("f_" + f)) })
+        }
+        return out
+    }
+    let u = if boxed { e.c.x.arrow(base, "u") } else { e.c.x.dot(base, "u") }
+    let vn = "V_" + e.c.pg.variants[v].name
+    for f in names { append(mut &out, e.c.x.dot(e.c.x.dot(u, &vn), &("f_" + f))) }
+    return out
+}
+
+fn (e: mut &Emitter) derivedTypes(t: int, d: int, v: int): []int {
+    let env = e.c.pg.declEnv(t)
+    var raw: []int = []
+    if v < 0 {
+        for f in e.c.pg.types[d].fields { append(mut &raw, f.ty) }
+    } else {
+        for f in e.c.pg.variants[v].fields { append(mut &raw, f.ty) }
+    }
+    var out: []int = []
+    for ty in raw { append(mut &out, e.c.pg.subst(ty, &env)) }
+    return out
+}
+
+fn (e: mut &Emitter) tagC(boxed: bool, p: int): int {
+    let base = e.c.x.par(e.c.x.pre("*", p))
+    return if boxed { e.c.x.arrow(base, "tag") } else { e.c.x.dot(base, "tag") }
+}
+
+// h = (h ^ x) * the FNV prime
+fn (e: mut &Emitter) mixC(x: int): int {
+    let h = e.nm("h")
+    let prime = e.c.x.cast(e.ct("uint64_t"), e.c.x.lit(1099511628211))
+    return e.c.x.sx(e.c.x.asg(h, e.c.x.bin("*", e.c.x.par(e.c.x.bin("^", h, e.c.x.cast(e.ct("uint64_t"), x))), prime)))
+}
+
+fn (e: mut &Emitter) deriveGlue(kind: int, t: int, n: &str) {
+    let d = e.c.pg.ta(t)
+    let pt = e.ctype(e.c.pg.mkRef(t, false))
+    let a = e.nm("a")
+    let b = e.nm("b")
+    let boxed = !e.c.pg.types[d].value
+    let isRec = e.c.pg.types[d].form == sx.F_RECORD
+    var body: []int = []
+    if kind == G_EQ {
+        // field by field, in declaration order; for a closed type the tags first
+        let no = e.c.x.sret(e.c.x.lit(0))
+        if isRec {
+            let fa = e.derivedFields(t, d, -1, a)
+            let fb = e.derivedFields(t, d, -1, b)
+            let fts = e.derivedTypes(t, d, -1)
+            for i in 0..len(fts) { append(mut &body, e.c.x.if1(e.c.x.pre("!", e.c.x.par(e.eqC(fts[i], fa[i], fb[i]))), no)) }
+        } else {
+            append(mut &body, e.c.x.if1(e.c.x.bin("!=", e.tagC(boxed, a), e.tagC(boxed, b)), no))
+            append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+            let vs = copyInts(&e.c.pg.types[d].variants)
+            for v in vs {
+                append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+                let fa = e.derivedFields(t, d, v, a)
+                let fb = e.derivedFields(t, d, v, b)
+                let fts = e.derivedTypes(t, d, v)
+                for i in 0..len(fts) { append(mut &body, e.c.x.if1(e.c.x.pre("!", e.c.x.par(e.eqC(fts[i], fa[i], fb[i]))), no)) }
+                append(mut &body, e.c.x.sbreak())
+            }
+            append(mut &body, e.c.x.send())
+        }
+        append(mut &body, e.c.x.sret(e.c.x.lit(1)))
+        e.define(n, "bool", [pt.clone(), pt], ["a", "b"], body, -1)
+        return
+    }
+    if kind == G_HASH {
+        // FNV-style: h = (h ^ part) * prime over the tag and the fields
+        let h = e.nm("h")
+        append(mut &body, e.c.x.decl(e.ct("uint64_t"), "h", e.c.x.cast(e.ct("uint64_t"), e.c.x.lit(1469598103934665603))))
+        if isRec {
+            let fa = e.derivedFields(t, d, -1, a)
+            let fts = e.derivedTypes(t, d, -1)
+            for i in 0..len(fts) { append(mut &body, e.mixC(e.methodC(fts[i], "hash", fa[i], -1))) }
+        } else {
+            append(mut &body, e.mixC(e.c.x.cast(e.ct("uint64_t"), e.tagC(boxed, a))))
+            append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+            let vs = copyInts(&e.c.pg.types[d].variants)
+            for v in vs {
+                append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+                let fa = e.derivedFields(t, d, v, a)
+                let fts = e.derivedTypes(t, d, v)
+                for i in 0..len(fts) { append(mut &body, e.mixC(e.methodC(fts[i], "hash", fa[i], -1))) }
+                append(mut &body, e.c.x.sbreak())
+            }
+            append(mut &body, e.c.x.send())
+        }
+        append(mut &body, e.c.x.sret(h))
+        e.define(n, "uint64_t", [pt], ["a"], body, -1)
+        return
+    }
+    // toStr: P{x: 1, name: "a"}, E.V, E.V(1, 2), E.V{s: "a"}; strings quoted
+    var k = 0
+    append(mut &body, e.c.x.decl(e.ct("lxl_str"), "s", e.strlit("", false)))
+    let tn = e.c.pg.types[d].name.clone()
+    if isRec {
+        e.showParts(&tn, t, d, -1, a, mut &body, mut &k)
+    } else {
+        append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+        let vs = copyInts(&e.c.pg.types[d].variants)
+        for v in vs {
+            append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+            e.showParts(&(tn + "." + e.c.pg.variants[v].name), t, d, v, a, mut &body, mut &k)
+            append(mut &body, e.c.x.sbreak())
+        }
+        append(mut &body, e.c.x.send())
+    }
+    append(mut &body, e.c.x.sret(e.nm("s")))
+    e.define(n, "lxl_str", [pt], ["a"], body, -1)
+}
+
+// x == y for values of type t: C == for a primitive, rt_str_eq for a string, else t's eq.
+fn (e: mut &Emitter) eqC(t: int, x: int, y: int): int {
+    if t == sema.T_STR { return e.call("rt_str_eq", [x, y]) }
+    if e.c.pg.tk(t) == sema.TK_PRIM { return e.c.x.bin("==", x, y) }
+    return e.methodC(t, "eq", x, y)
+}
+
+// Appends to s (an owned string being built) the text of the record, or variant v, at pointer p.
+fn (e: mut &Emitter) showParts(head: &str, t: int, d: int, v: int, p: int, body: mut &[]int, k: mut &int) {
+    let fs = e.fieldNames(d, v)
+    let fx = e.derivedFields(t, d, v, p)
+    let fts = e.derivedTypes(t, d, v)
+    let positional = len(fs) > 0 && strByte(fs[0], 0) >= '0' && strByte(fs[0], 0) <= '9'
+    e.showAdd(e.strlit(head, false), false, body, k)
+    if len(fs) == 0 && v >= 0 { return }
+    e.showAdd(e.strlit(if positional { "(" } else { "{" }, false), false, body, k)
+    for i in 0..len(fts) {
+        if i > 0 { e.showAdd(e.strlit(", ", false), false, body, k) }
+        if !positional { e.showAdd(e.strlit(&(fs[i] + ": "), false), false, body, k) }
+        if fts[i] == sema.T_STR {
+            e.showAdd(e.strlit("\"", false), false, body, k)
+            e.showAdd(fx[i], false, body, k)        // the field itself, borrowed: not dropped
+            e.showAdd(e.strlit("\"", false), false, body, k)
+        } else {
+            e.showAdd(e.methodC(fts[i], "toStr", fx[i], -1), true, body, k)
+        }
+    }
+    e.showAdd(e.strlit(if positional { ")" } else { "}" }, false), false, body, k)
+}
+
+fn (e: mut &Emitter) showAdd(piece: int, owned: bool, body: mut &[]int, k: mut &int) {
+    let pn = "p" + intToStr(k)
+    let nn = "n" + intToStr(k)
+    k += 1
+    append(body, e.c.x.decl(e.ct("lxl_str"), &pn, piece))
+    append(body, e.c.x.decl(e.ct("lxl_str"), &nn, e.call("rt_str_concat", [e.nm("s"), e.nm(&pn)])))
+    append(body, e.callS("rt_str_drop", [e.nm("s")]))
+    if owned { append(body, e.callS("rt_str_drop", [e.nm(&pn)])) }
+    append(body, e.c.x.sx(e.c.x.asg(e.nm("s"), e.nm(&nn))))
+}
+
+fn (e: &Emitter) fieldNames(d: int, v: int): []str {
+    var out: []str = []
+    if v < 0 {
+        for f in e.c.pg.types[d].fields { append(mut &out, f.name.clone()) }
+    } else {
+        for f in e.c.pg.variants[v].fields { append(mut &out, f.name.clone()) }
+    }
+    return out
+}
+
 fn (e: mut &Emitter) dupC(t: int, cc: int): int {
     if e.pod(t) { return cc }
     if t == sema.T_STR { return e.call("rt_str_dup", [cc]) }
@@ -642,7 +844,7 @@ fn (e: mut &Emitter) rest(t: int): []int {
 }
 
 fn (e: mut &Emitter) glueFn(kind: int, t: int): str {
-    let key = t * 8 + kind
+    let key = t * 16 + kind
     if !e.glue.has(&key) {
         // an rc handle's glue ends in _rc: par.map's kernel check refuses it (the count is not atomic)
         let sfx = if e.c.pg.isRc(t) { "_rc" } else { "" }
@@ -658,11 +860,16 @@ fn (e: mut &Emitter) define(name: &str, ret: &str, ptys: []str, pnames: []str, l
 }
 
 fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
-    let key = t * 8 + kind
+    let key = t * 16 + kind
     let n = e.glue.getOr(&key, "")
-    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of", "the clone of"]
+    let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of",
+        "the clone of", "the derived eq of", "the derived hash of", "the derived toStr of"]
     e.fsrc.put(n.clone(), gk[kind] + " " + e.c.pg.tstr(t))
     let ct = e.ctype(t)
+    if kind == G_EQ || kind == G_HASH || kind == G_SHOW {
+        e.deriveGlue(kind, t, &n)
+        return
+    }
     if kind == G_TRAMP {        // a plain function seen as a closure: the environment is the function
         var ps: []str = ["void*"]
         var pns: []str = ["e"]
@@ -838,6 +1045,11 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         e.fill(h.x, holes, env, name, res)
         return e.cloneC(t, h.x)
     }
+    if k == ck.H_DERIVE {
+        let t = e.c.pg.subst(h.t, env)
+        let g = e.glueFn(deriveKind(&h.s), t)
+        return e.nm(&g)
+    }
     if k == ck.H_STR || k == ck.H_GSTR { return e.strlit(h.s, k == ck.H_GSTR) }
     if k == ck.H_ADDR || k == ck.H_DEREF || k == ck.H_SHARE {
         let t = e.c.pg.subst(h.t, env)
@@ -862,6 +1074,16 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         e.fill(h.r, holes, env, name, res)
         if h.f == sema.RM_VAL { return h.r }
         return e.cloneC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
+    }
+    if k == ck.H_IMETH && (h.s == "eq" || h.s == "hash" || h.s == "toStr") && e.c.pg.methodOf(t, h.s) < 0 &&
+            e.c.pg.derivable(t, h.s) {
+        // a derived method (design/consistency.md, finding 4): its glue, given pointers (&Self)
+        e.fill(h.r, holes, env, name, res)
+        for a in h.args { e.fill(a, holes, env, name, res) }
+        let g = e.glueFn(deriveKind(&h.s), t)
+        var gargs: []int = [h.r]
+        for a in h.args { append(mut &gargs, a) }
+        return e.c.x.call(&g, gargs)
     }
     let f = e.c.pg.methodOf(t, h.s)
     var bind: []int = []

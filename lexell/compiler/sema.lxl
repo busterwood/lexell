@@ -685,6 +685,50 @@ pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
 // elements; task.Shared (another handle); a record or closed type with no drop method, holding no
 // borrows, whose fields are each cloneable or have a clone method. A type that contains itself is
 // cloneable when the rest of it is.
+// Derived methods (design/consistency.md, finding 4): eq, hash and toStr for a record or closed
+// type without its own, generated like clone glue when every part has one. The method of std's
+// interface iface that is derived (Eq: eq, Hash: hash, Show: toStr), or "".
+pub fn (pg: &Program) derivedMember(iface: int): str {
+    if pg.types[iface].mod != pg.std { return "" }
+    let n = &pg.types[iface].name
+    return if n == "Eq" { "eq" } else if n == "Hash" { "hash" } else if n == "Show" { "toStr" } else { "" }
+}
+
+// Whether t satisfies iface (Eq, Hash or Show) through a derived method.
+pub fn (pg: mut &Program) builtinDerived(t: int, iface: int): bool {
+    let m = pg.derivedMember(iface)
+    if m == "" || pg.tk(t) == TK_TP || pg.methodOf(t, &m) >= 0 { return false }
+    return pg.derivable(t, &m)
+}
+
+// Whether t has the method name (eq, hash or toStr), declared or derived: a type with the method;
+// a type parameter whose constraints give it; a record or closed type with no drop method, holding
+// no borrows, every part of which has it (a type containing itself has it when the rest does).
+pub fn (pg: mut &Program) derivable(t: int, name: &str): bool {
+    var seen: []int = []
+    return pg.derivableAt(t, name, mut &seen)
+}
+
+fn (pg: mut &Program) derivableAt(t: int, name: &str, seen: mut &[]int): bool {
+    let k = pg.tk(t)
+    if k == TK_TP { return len(pg.ifaceMembers(t, name)) > 0 }
+    if pg.methodOf(t, name) >= 0 { return true }
+    if k != TK_INST { return false }
+    let d = pg.ta(t)
+    if d == pg.shared || d == pg.rc { return false }
+    if pg.types[d].form != sx.F_RECORD && pg.types[d].form != sx.F_CLOSED { return false }
+    if pg.types[d].drop >= 0 || pg.isBorrowClass(t) { return false }
+    for x in seen {
+        if x == t { return true }
+    }
+    append(seen, t)
+    let fts = pg.fieldTypes(t)
+    for ft in fts {
+        if !pg.derivableAt(ft, name, seen) { return false }
+    }
+    return true
+}
+
 // Whether t is rc T (std.Rc[T]).
 pub fn (pg: &Program) isRc(t: int): bool { return pg.rc >= 0 && pg.tk(t) == TK_INST && pg.ta(t) == pg.rc }
 
@@ -2198,6 +2242,7 @@ fn sameInts(a: &[]int, b: &[]int): bool {
 pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
     let iface = pg.ta(con)
     if pg.builtinClone(t, iface) { return "" }
+    if pg.builtinDerived(t, iface) { return "" }
     var env = pg.declEnv(con)
     append(mut &env, -1)
     append(mut &env, t)

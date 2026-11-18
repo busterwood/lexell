@@ -20,6 +20,8 @@ rule.
   clone in `str.toStr()` stays until `Show` writes into a buffer.
 - AK: `for` over a dead local consumes it.
 - AL: `pure` externs callable from par.map kernels.
+- AM (finding 4): derived `eq`, `hash`, `toStr`. `cmp` is not derived; an
+  opt-in (e.g. a `derives Ord` marker) is not done yet.
 
 ## Plan, in order
 

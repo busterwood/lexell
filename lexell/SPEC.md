@@ -707,9 +707,25 @@ For operands that are not primitive, an operator is a method call:
 `bool` has `== != && || !`. A closed type all of whose variants have no fields
 (`type Sort = value closed { Name; Size }`) has built-in `==` and `!=`, which
 compare the variants, when it declares no `eq` method; when it declares one,
-`==` calls it. Both operands have that type (or are borrows of it). The
-built-in comparison is not a method: such a type satisfies `Eq` only by
-declaring `eq`, and `<` and the other comparisons still need `cmp`. A compound assignment `a += b` means `a = a + b`
+`==` calls it, except inside that `eq` itself, where `==` on the type
+compares the variants (so `eq` may be written `return a == b` without calling
+itself). Both operands have that type (or are borrows of it).
+
+**Derived methods.** A record or closed type that declares no `eq`, `hash`
+or `toStr` method has one derived, as it has `clone` (section 4.7), when it
+has no `drop` method, holds no borrows, and each of its fields has that
+method, declared or derived (a type that contains itself has it when the rest
+does; a type parameter has it when its constraints give it):
+- `eq` compares the variants, then the fields in declaration order;
+- `hash` combines the variant and the fields' hashes;
+- `toStr` gives `P{x: 1, name: "a"}` for a record, `E.V` for a variant
+  without fields, `E.V(1, 2)` for positional fields and `E.V{w: 2}` for named
+  ones; strings are quoted.
+
+So such a type satisfies `Eq`, `Hash` and `Show`, can be a `Map` key and can
+be printed. A declared method always wins. `cmp` is not derived: an order by
+declaration is not always meaningful, so `<` and the other comparisons still
+need `cmp`. A compound assignment `a += b` means `a = a + b`
 with `a` evaluated once: the index expressions in `a` run once, before `b`, and,
 as in `a = a + b`, the value is stored to the place they name after `b` has run
 (so `xs[i] += f(mut &xs)` is allowed, and `i` is checked again when it is

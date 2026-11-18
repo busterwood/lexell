@@ -311,6 +311,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 | AK | SPEC 8: `for x in xs`, where local array `xs` of owned elements is not used after the loop (nor in its body, nor in an enclosing loop it is declared outside of), consumes `xs` as `for x in move(xs)` does: `x` is an owned element. | 2553b077 | yes | **Drop timing:** such a loop's elements drop at the end of each turn instead of with the array after the loop (only visible through `drop` methods with side effects). |
 | AL | SPEC 12, 16: `pure` at the end of an extern declaration (like `blocking`; not both) promises no I/O, no shared state, no callbacks; a `par.map` kernel may call it. | 2553b077 | yes | none |
 
+| AM | SPEC 7.4 (finding 4): `eq`, `hash` and `toStr` are derived for a record or closed type that declares none, has no drop method, holds no borrows and whose fields all have them (like clone). Such types satisfy `Eq`, `Hash`, `Show`: they can be `Map` keys and be printed. Inside a type's own `eq`, `==` on a fieldless enum compares variants (no self-recursion). `cmp` is not derived. The library's `eq` methods that compared through two `toStr()` strings (`task.Cancelled`, `httpserver.ErrorKind`, `tls.Kind`, `regex_syntax.ErrorCode`, `strings.ParseError`) are gone. | (this commit) | yes | `==` on such types now works where it was a compile error |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
@@ -332,4 +334,11 @@ value.
 A C function that a `par.map` closure needs (a hash, a codec) can be
 declared `pure` instead of being reimplemented in Lexell, if it truly has no
 state.
+
+**AM for lexdb.** Hand-written `eq`, `hash` and `toStr` methods that compare
+or print field by field (and enum `eq`s that compare through `toStr()`) can
+be deleted where the derived ones do the same: the derived `toStr` format is
+`P{x: 1, name: "a"}` / `E.V(1)` / `E.V{w: 2}`, so keep a `toStr` whose text
+matters (messages, SQL, wire formats). Types used as `Map` keys no longer
+need key strings built from their fields.
 
