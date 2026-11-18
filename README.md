@@ -2,7 +2,7 @@
 
 Lexell is a small, straightforward language for command-line tools and database-backed services. It writes Linux executables directly, checks ownership and borrowing at compile time, and has a built-in decimal type.
 
-I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The 2.9 MB compiler rebuilds itself in about 0.65 seconds. The [benchmarks](#performance) compare generated code with Rust and C, and HTTP throughput with Go’s `net/http`.
+I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The compiler is about 3 MB and rebuilds itself in about 0.46 seconds. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
 
 **In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
 
@@ -10,11 +10,11 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 ## Performance
 
-- **Compile time.** Hello world compiles in about 13 ms and produces a 16 KB native executable.
-- **Generated code.** With `-O`, Lexell was level with or ahead of Rust on eight of nine microbenchmarks. Against the hand-written C versions, Lexell took about half the time on allocation and string workloads. The checked-array benchmark took 366 ms in Lexell and 102 ms in C.
-- **HTTP throughput.** With 100 load clients issuing a simple keep-alive `GET /` on loopback, the single-threaded Lexell server handled about 61,000 requests per second. The Go `net/http` reference, measured in an earlier run with `GOMAXPROCS=1`, handled about 44,500.
+- **Compile time.** Hello world compiles in about 14 ms and produces a 20 KB native executable; the nine benchmark programs compile in about 131 ms, against 2.8 s for Rust.
+- **Generated code.** With `-O`, Lexell was level with or ahead of Rust on eight of the nine microbenchmarks that have a Rust port. It is slower on the token scanner (1.33 times Rust's time).
+- **Other programs.** Against the external tools, Lexell is faster on most regex patterns (against Go), on JSON parsing and output (against Python), and on jq filters (against jq 1.7.1, 1.4 to 2.2 times faster). It is slower on Markdown (1.2 to 1.3 times cmark's time), on JSON queries (about four times Python's time), on one regex pattern (about 100 times Go's time), and on `sort` (1.8 times GNU sort). The [performance report](PERFORMANCE.md) gives every number, its method and what was not measured.
 
-The [performance report](PERFORMANCE.md) gives the full results, workload definitions, compiler flags and reproduction commands. These measurements come from one Ryzen 7 machine running Linux under WSL2.
+The [performance report](PERFORMANCE.md) gives the full results, workload definitions and reproduction commands. These measurements come from one AMD Ryzen 7 8745HS machine running Linux 7.2 (not WSL2), on 18 November 2026.
 
 ## Quick start
 
