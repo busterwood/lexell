@@ -4,6 +4,7 @@
 // and table types. Behavior stays in the modules that own it; this module
 // is the vocabulary they pass.
 import "binary"
+import "task"
 import "strings"
 import "time"
 import "./lexdb_base"
@@ -625,6 +626,44 @@ pub fn strsLen(xs: &[]str): int {
     var n = 4
     for x in xs { n += 4 + len(x) }
     return n
+}
+
+// Tables decoded, by catalog key, with the bytes each was decoded from:
+// decTableCached gives a copy when a read of the key gives the same bytes
+// (the same bytes decode to the same table, whatever store, snapshot or
+// transaction read them), so a statement does not decode its tables
+// again. At most TAB_CACHE entries (all dropped when full).
+type TabCache = record { m: Map[str, TabEnt] }
+type TabEnt = record { bytes: str; t: rc Table }
+const TAB_CACHE = 1024
+var TABS: once task.Shared[TabCache]
+
+fn tabCache(): task.Shared[TabCache] {
+    if !TABS.isSet() { TABS.set(task.shared(TabCache{m: newMap()})) }
+    return TABS.get().share()
+}
+
+// decTable, through the cache of tables decoded (TabCache): a handle
+// shared with the cache (unshare it to change it).
+pub fn decTableCached(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_base.DbErr]): Result[rc Table, lexdb_base.DbErr] {
+    let c = tabCache()
+    var hit: Option[rc Table] = None
+    c.with(fn(tc: mut &TabCache) {
+        match tc.m.get(name) {
+            Some(en) { if en.bytes == s { hit = Some(en.t.share()) } }
+            None {}
+        }
+    })
+    match hit {
+        Some(t) { return Ok(t) }
+        None {}
+    }
+    let t = rc(try decTable(name, s, parseExpr))
+    c.with(fn(tc: mut &TabCache) {
+        if tc.m.size() >= TAB_CACHE { tc.m = newMap() }
+        tc.m.put(name.clone(), TabEnt{bytes: s.clone(), t: t.share()})
+    })
+    return Ok(t)
 }
 
 pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_base.DbErr]): Result[Table, lexdb_base.DbErr] {

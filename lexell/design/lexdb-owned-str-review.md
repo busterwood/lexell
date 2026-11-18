@@ -204,3 +204,23 @@ up more than 0.32% (q5). Steps 1 and 2 together: −9.9%. Point selects
 from other processes during part of it): 17,958 to 15,452 ms (−14%).
 q17 −54%, q8 −31%, q14 −28%, q20 −30%, q9 −21%. q22 +4% and q13 +1%,
 which have unchanged instructions.
+
+**Step 3 (2026-11-18): finding 4, tables shared, not decoded per statement.**
+- `lexdb_catalog.decTableCached` keeps tables decoded, by catalog key,
+  with the bytes each came from. A read of the key that gives the same
+  bytes gets the table as an `rc Table` handle; any store, snapshot or
+  transaction is fine, because the same bytes decode to the same table.
+  The catalog is still read through the store, so the read is noted as
+  before and DDL still conflicts. At most 1,024 entries.
+- `Level.t` is an `rc Table`, and `bindFrom` takes its table from
+  `findTableRc`. Only `t AS x(a, b)` and the binder's own tables change
+  a table, through `unshare()`, so a plain `FROM t` copies nothing.
+  `findTable` (its 22 other callers: DDL, catalogs) still gives a
+  `Table` of its own.
+- Caching the decoded table and copying it out (tried first) saved only
+  0.4%: the copy cost what the decode did. Sharing it is the saving.
+
+Point selects: 205,400 to 189,100 instructions per statement (−8.0%,
+two runs each, alternating), cycles −6.5%. Below the 198,000 before
+the owned-str switch. TPC-H instructions unchanged (−0.03%), checksums
+unchanged, suite 190, quick gate PASS.

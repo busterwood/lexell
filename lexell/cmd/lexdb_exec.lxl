@@ -1039,13 +1039,25 @@ fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: b
 // is read quietly, so their DDL never conflicts with this transaction.
 
 fn findTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Table], DbErr] {
+    match try findTableRc(st, txn, name) {
+        Some(h) { return Ok(Some(copyTable(h))) }
+        None { return Ok(None) }
+    }
+}
+
+// A table of its own (h lent as &Table: the value copied, not the handle).
+fn copyTable(t: &Table): Table { return t.clone() }
+
+// findTable, the table shared with the cache of tables decoded
+// (lexdb_catalog.decTableCached): unshare it to change it.
+fn findTableRc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[rc Table], DbErr] {
     let k = try catKey(st, txn, name, false)
     match try st.get(txn, lexdb_catalog.CATALOG, &k) {
         Some(s) {
-            let t = try decTable(&k, &s)
+            let t = try lexdb_catalog.decTableCached(&k, &s, lexdb_parse.parseExpr)
             // its layouts, for the store's column leaves (9.112): committed
             // ones only, which rows may be converted to (9.114)
-            if !txn.wrote(lexdb_catalog.CATALOG, &k) { setSpec(st, &t) }
+            if !txn.wrote(lexdb_catalog.CATALOG, &k) { setSpec(st, t) }
             return Ok(Some(t))
         }
         None { return Ok(None) }
@@ -1350,7 +1362,7 @@ fn figCost(f: &Fig, index: int, first: bool): int {
 // matched by a hash of the equalities that link it to them (none: every
 // row, a cross product).
 pub type Level = record {
-    t: Table
+    t: rc Table             // shared with the cache of tables decoded (unshare to change)
     alias: str
     join: int
     first: int              // its first column in the joined row
@@ -3691,7 +3703,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     return Ok(lexdb_access.rangeScan(&lexdb_catalog.relOf(t), p.index, &eqs, &los, &his, p.noNulls))
 }
 
-fn newLevel(t: Table, alias: &str, join: int, first: int): Level {
+fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, need: [],
                  lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
@@ -3803,8 +3815,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         var viewSrc = -1
         var item = lexdb_bind.noPlan()         // its plan, before its columns are renamed into the row (Sub)
         var viewName = ""
-        var t = Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                      view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+        var t = rc(Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
+                         view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []})
         var lateral = false
         if f.sub >= 0 {
             sc.names.frames[me].hidden = !f.lateral
@@ -3828,7 +3840,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 var col = lexdb_sql.colDef(&name, outType(&fcols[i]), false)
                 if i >= len(f.cols) || (f.cols[i] == "dummy" && sp.sel.srf == "#values:01") { col.spell = if i >= len(f.cols) { fcols[i].spell.clone() } else { "DUMMY" } }
                 col.coll = fcols[i].coll.clone()
-                append(mut &t.cols, col)
+                append(mut &t.unshare().cols, col)
             }
             item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, outBCols(fcols)) } else { spLp }
             append(mut &planned[f.sub], sp)
@@ -3847,17 +3859,17 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 var col = lexdb_sql.colDef(&name, sc.works[w].cols[i].typ, false)
                 if i >= len(f.cols) || (f.cols[i] == "dummy" && sc.works[w].cols[i].spell == "DUMMY") { col.spell = sc.works[w].cols[i].spell.clone() }
                 col.coll = sc.works[w].cols[i].coll.clone()
-                append(mut &t.cols, col)
+                append(mut &t.unshare().cols, col)
             }
             var wcols: []lexdb_bind.BCol = []
             for i in 0..len(sc.works[w].cols) { append(mut &wcols, lexdb_bind.bcolOf(i, &sc.works[w].cols[i])) }
             item = lexdb_bind.LPlan.CteRef(f.work, true, wcols)
         } else {
-            let found = try findTable(st, txn, &f.table)
+            let found = try findTableRc(st, txn, &f.table)
             if found.isNone() {
                 // a sequence: its one row (9.117), as a view of it
                 match try findSeq(st, txn, &f.table) {
-                    Some(d) { t = seqRelation(&d) }
+                    Some(d) { t = rc(seqRelation(&d)) }
                     None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&f.table) + "\" does not exist"))) }
                 }
             } else {
@@ -3894,7 +3906,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 append(mut &views, sp)
-                t = vt
+                t = rc(vt)
             } else if len(f.cols) > 0 {
                 // t AS x(a, b): its first columns named so
                 if len(f.cols) > len(t.cols) {
@@ -3902,8 +3914,9 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                                  len(f.cols).toStr() + " columns specified")))
                 }
                 for i in 0..len(f.cols) {
-                    t.cols[i].name = f.cols[i].clone()
-                    t.cols[i].spell = ""
+                    let tw = t.unshare()
+                    tw.cols[i].name = f.cols[i].clone()
+                    tw.cols[i].spell = ""
                 }
             }
         }
@@ -4302,8 +4315,8 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
                     for i in 0..len(xs) { append(mut &post, replace(mut &xs[i], Expr.Lit(Val.Null))) }
                     xs = replace(mut &ps[0], [])
                     for i in 0..len(xs) { append(mut &post, replace(mut &xs[i], Expr.Lit(Val.Null))) }
-                    let la = replace(mut &q.levels[0], newLevel(noTable(), "", 0, 0))
-                    let lb = replace(mut &q.levels[1], newLevel(noTable(), "", 0, 0))
+                    let la = replace(mut &q.levels[0], newLevel(rc(noTable()), "", 0, 0))
+                    let lb = replace(mut &q.levels[1], newLevel(rc(noTable()), "", 0, 0))
                     q.levels[0] = lb
                     q.levels[1] = la
                     q.levels[0].join = lexdb_sql.J_FIRST
@@ -4322,7 +4335,7 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
                 for i in 0..len(xs) { append(mut &pool, replace(mut &xs[i], Expr.Lit(Val.Null))) }
             }
             var lvs: []Level = []
-            for i in 0..nl { append(mut &lvs, replace(mut &q.levels[perm[i]], newLevel(noTable(), "", 0, 0))) }
+            for i in 0..nl { append(mut &lvs, replace(mut &q.levels[perm[i]], newLevel(rc(noTable()), "", 0, 0))) }
             q.levels = lvs
             for i in 0..nl { q.levels[i].join = if i == 0 { lexdb_sql.J_FIRST } else { lexdb_sql.J_INNER } }
             for i in 0..len(pool) {
@@ -6064,7 +6077,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
         for n in ns { if n == want { used = true } }
         append(mut &need, used)
     }
-    var lv = newLevel(noTable(), &alias, lexdb_sql.J_INNER, first)
+    var lv = newLevel(rc(noTable()), &alias, lexdb_sql.J_INNER, first)
     lv.path = path
     lv.cond = conds
     lv.need = need
@@ -6081,7 +6094,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
 // level (which is no longer run), its columns added to q's, hidden.
 fn semiLookAdd(q: mut &Query, lv: mut &Level) {
     let i = lv.semiSub
-    lv.t = replace(mut &q.subs[i].sel.q.levels[0].t, noTable())
+    lv.t = replace(mut &q.subs[i].sel.q.levels[0].t, rc(noTable()))
     let t = &lv.t
     for j in 0..len(t.cols) {
         // a name no query can use, in no * (hiddenName)
@@ -6277,7 +6290,7 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
         append(mut &resFrom, n.toStr())
         append(mut &resTo, alias + "." + lexdb_catalog.ROWID + pos.toStr())
     }
-    var lv = newLevel(t, &alias, lexdb_sql.J_INNER, first)
+    var lv = newLevel(rc(t), &alias, lexdb_sql.J_INNER, first)
     lv.src = i
     lv.perRow = false
     lv.semi = true
@@ -6372,7 +6385,7 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
     for k in 0..nl { append(mut &placed, []) }
     var any = false
     for k in 0..nl {
-        var lv = replace(mut &olds[k], newLevel(noTable(), "", 0, 0))
+        var lv = replace(mut &olds[k], newLevel(rc(noTable()), "", 0, 0))
         var semis: []Level = []
         var ats: []int = []
         if !isOuter(lv.join) {
@@ -6422,9 +6435,9 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
                 lv.local = lkeep
             }
         }
-        for j in 0..len(semis) { append(mut &placed[ats[j]], replace(mut &semis[j], newLevel(noTable(), "", 0, 0))) }
+        for j in 0..len(semis) { append(mut &placed[ats[j]], replace(mut &semis[j], newLevel(rc(noTable()), "", 0, 0))) }
         append(mut &q.levels, lv)
-        for j in 0..len(placed[k]) { append(mut &q.levels, replace(mut &placed[k][j], newLevel(noTable(), "", 0, 0))) }
+        for j in 0..len(placed[k]) { append(mut &q.levels, replace(mut &placed[k][j], newLevel(rc(noTable()), "", 0, 0))) }
     }
     if !any { return Ok(Unit{}) }
     // its columns by name (levelOf); a subquery still run per row
