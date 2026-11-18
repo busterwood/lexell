@@ -139,6 +139,26 @@ that only read remove those clones. Finding 2 removes most of them anyway.
 (`Map[int, int]`, 2.5%) is an integer hash. Both are worth their own
 look, but owned strings did not shape them.
 
+## Status (2026-11-18, evening)
+
+| finding | status | where |
+|---|---|---|
+| 1. lookups move rows as encoded strings | **done**: key views (step 1), rows decoded in the leaf (step 2) | ddcc4ef9, 74ddbc6d |
+| 2. batch text one owned string per value | **open**: the largest left (copies and drops of `Val.Text` in batches; q10, q13); with the executor work | |
+| 3. page bodies plain strings | **measured, not taken**: a lazy leaf's body, entries, columns as `rc` made no difference to updates or commit latency (2026-11-18, reverted). A changed leaf's keys and values are counted instead (`Node.keys: rc []str`, `Node.vals: []rc str`), which fixed the update regression | eababf57 |
+| 4. tables re-decoded per statement | **done** (shared `rc Table`); the binder's per-statement name copies remain (`colDef`, `bindFrom`, `colPart`, `cloneExpr`: about 20 copies an executed `UPDATE`) | b487153f |
+| 5. hash keys built per row | **done**: views for one text key; composite keys in one reused string | ddcc4ef9, fea5295d |
+| 6. small functions returning owned strings | **mostly done**: `Node.key` callers read `keyView` (f387f7f0); `lexdb_sql.textIn` (a view of a text, 48c22c45) used by bpchar's trim; `text()` itself still copies at its other callers | 48c22c45, f387f7f0 |
+| 7. evaluation returns owned values | **open** (`bxEval`, `bValAt`, `bKeyVal`); finding 2 removes most | |
+| runtime: `memcmp` in descents | **done** in the runtime: `rt_str_cmp` compares short strings 8 bytes at a time | aaadeb1e |
+| runtime: allocator chunk headers sharing cache sets | **open**, not tried | |
+
+Found since (benchmark refresh, design/lexdb-benchmarks.md 1): updates at
+32 clients -52% (fixed, eababf57); commit latency p99 0.81 to 1.39 ms
+(open); COPY peak memory +30% (open; not copies: f387f7f0 cut COPY's copies
+by 30% and the peak did not move); the clone-site profile's other copies
+(f387f7f0).
+
 ## Suggested order
 
 1. Small and local, about a day: findings 5 and 6, the key views in
