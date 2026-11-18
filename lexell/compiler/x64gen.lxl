@@ -41,6 +41,9 @@ const LOCAL_REGS: []int = [3, 12, 13, 14, 15]     // rbx r12-r15 (callee-saved):
 // Caller-saved registers that the code generator uses only for calls and for the operations
 // that make a statement loud (scan): locals whose live range has no loud statement.
 const QUIET_REGS: []int = [6, 7, 8, 9]            // rsi rdi r8 r9
+// What the out-of-line growth of an inline rt_arr_push saves around its call (genStubs): an even
+// count, so that rsp stays 16-byte aligned.
+const GROW_SAVE: []int = [6, 7, 8, 9, 10, 11]      // rsi rdi r8 r9 r10 r11
 // The xmm registers of doubles (locals whose live range has no position fpLoud: the SysV ABI has
 // no callee-saved xmm registers, but native/math.c leaves these alone). The generated code uses
 // xmm0-xmm7 for values and arguments and xmm15 for copies.
@@ -196,6 +199,7 @@ type Gen = record {
     imports: []str              // the imported functions, in dynamic symbol order
     importSym: Map[str, int]
     stubs: []Stub               // the trap paths of the inlined runtime checks, after the function
+    grows: []Grow               // the growth paths of the inlined rt_arr_push, after the function
     stubOf: Map[str, int]       // their labels by (code, where)
     codeEnd: int
     posOf: []int                // per node: the position the scan saw it at (posSeen: when), or -1 (at several)
@@ -241,6 +245,13 @@ const SITE_WHOLE = 0
 const SITE_COND = 1
 
 // A call of rt_trap(code, msg, where) out of line, at the end of a function: its label.
+// An inline rt_arr_push's growth, after the function (genStubs): from label, back to back.
+type Grow = value record {
+    label: int
+    back: int
+    size: int
+}
+
 type Stub = value record {
     label: int
     code: int
@@ -251,7 +262,7 @@ type Stub = value record {
 fn newGen(u: ir.Ir): Gen {
     var g = Gen{u: u, a: x64.newAsm(), syms: [], rtSym: newMapWith[str, int](fxHashStr), rtLive: [], rtAt: [], rtCodeEnd: 0, rtDataEnd: 0, rtBssEnd: 0, codeBase: 0, funcSym: [], globalSym: [], strSym: newMapWith[str, int](fxHashStr),
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
-        caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [],
+        caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
         noInit: [], inner: [], pts: [], defAt: [], tmpRegs: [], tmpUsed: 0, unused: false, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
@@ -2103,7 +2114,20 @@ fn (g: &Gen) quietRt(e: int): bool {
     let dv = divOp(&name)
     if dv.k >= 0 { return nargs == (if dv.op == ir.OP_SUB { 2 } else { 3 }) && g.isWhere(g.u.listAt(n.b, nargs - 1)) }
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
+    if name == "rt_arr_push" { return g.pushInline(e) }
     return false     // rt_str_dup copies (design/owned-str.md): a call of the runtime
+}
+
+// Whether the call e is an rt_arr_push that inlineRt generates inline: an element of a constant
+// size, the growth a call of the runtime out of line that saves the registers it changes but rax,
+// rcx and rdx (genStubs), so quiet (quietRt); xmm registers are not saved: the scan marks the
+// position fpLoud.
+fn (g: &Gen) pushInline(e: int): bool {
+    if g.rtName(e) != "rt_arr_push" { return false }
+    let n = g.u.nodes[e]
+    if g.u.listLen(n.b) != 2 { return false }
+    let sz = g.u.listAt(n.b, 1)
+    return g.u.nk(sz) == ir.E_INT && x64.fits32(g.u.nodes[sz].v)
 }
 
 // A kernel function (kernel.lxl) may run on a par pool thread: its str counts are changed by the
@@ -2244,6 +2268,8 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         } else if !g.counting && !g.quietRt(x) {
             g.loud[g.pos] = true
             if !g.fpKeepCall(x) { g.fpLoud[g.pos] = true }
+        } else if !g.counting && g.pushInline(x) {
+            g.fpLoud[g.pos] = true          // its growth saves no xmm register
         }
     } else if k < ir.S_DECL {
         // the other expressions (ir numbers them below the statements): their operands in order,
@@ -6784,6 +6810,22 @@ fn (g: mut &Gen) stub(code: int, msg: &str, w: int): int {
 }
 
 fn (g: mut &Gen) genStubs() {
+    // the growths: rsi, rdi and r8-r11 saved (locals and held values in quiet code; six pushes
+    // keep rsp aligned), the array's address in rax as the inline code left it
+    let gs = replace(mut &g.grows, [])
+    for gr in gs {
+        g.a.bind(gr.label)
+        for r in GROW_SAVE { g.a.push(r) }
+        g.a.movRR(8, RDI, RAX)
+        g.a.movRI(RSI, gr.size)
+        g.callRt("rt_arr_push")
+        var i = len(GROW_SAVE) - 1
+        while i >= 0 {
+            g.a.pop(GROW_SAVE[i])
+            i -= 1
+        }
+        g.a.jmp(gr.back)
+    }
     let sts = replace(mut &g.stubs, [])
     for st in sts {
         g.a.bind(st.label)
@@ -7115,13 +7157,14 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 0)) }
         return true
     }
-    if name == "rt_arr_push" && nargs == 2 && g.u.nk(g.u.listAt(n.b, 1)) == ir.E_INT &&
-        x64.fits32(g.u.nodes[g.u.listAt(n.b, 1)].v) {
-        // if (a->len == a->cap) the runtime grows it; then data + len++ * size
+    if g.pushInline(e) {
+        // if (a->len == a->cap) the runtime grows it, out of line (genStubs: the registers the
+        // call would change saved around it, so that the push is quiet); then data + len++ * size
         let size = g.u.nodes[g.u.listAt(n.b, 1)].v
         g.gen(g.u.listAt(n.b, 0))
         let slow = g.a.newLabel()
         let done = g.a.newLabel()
+        append(mut &g.grows, Grow{label: slow, back: done, size: size})
         g.a.load(8, RCX, x64.mem(RAX, 8))
         g.a.aluRM(x64.CMP, 8, RCX, x64.mem(RAX, 16))
         g.a.jcc(x64.CC_E, slow)
@@ -7134,11 +7177,6 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
             g.a.imulI(8, RCX, RCX, size)
             g.a.lea(RAX, x64.memx(RDX, RCX, 1, 0))
         }
-        g.a.jmp(done)
-        g.a.bind(slow)
-        g.a.movRR(8, RDI, RAX)
-        g.a.movRI(RSI, size)
-        g.callRt("rt_arr_push")
         g.a.bind(done)
         return true
     }
