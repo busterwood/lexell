@@ -1164,6 +1164,7 @@ including `print`, `println`, string formatting and parsing, is in `std`.
 | `panic(msg)` | print `Lexell: panic: msg` and stop with exit code 12 |
 | `assert(c)` | `panic("assertion failed")` with the line, when `c` is false |
 | `exit(code)` | stop the program with `code`, without drops (and without the `LXL_CHECK` leak check) |
+| `bytesGrow(mut &b, n)` | add `n` zero bytes to the end of the byte array `b`, with one check of its capacity, and return the index of the first (the length before); for writing a value of known size by index (`binary.setU32BE(b, bytesGrow(b, 4), v)`). Negative `n` stops the program, exit 2 |
 | `strStatic(s)` | a copy of `s` whose bytes are never freed, like a literal's: copies and clones of it share them. For strings that live until the program exits (a compiler's names); it is not a leak for `LXL_CHECK` |
 
 String and runtime intrinsics used by `std` (`strByte`, `strSlice`,

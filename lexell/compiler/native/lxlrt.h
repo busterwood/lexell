@@ -87,6 +87,7 @@ lxl_arr rt_arr_cap(int64_t n, size_t size, const char* w);
 void rt_arr_free(lxl_arr a);
 void* rt_arr_push(lxl_arr* a, size_t size);
 void rt_str_append(lxl_arr* a, lxl_str s);
+int64_t rt_bytes_grow(lxl_arr* a, int64_t n, const char* w);
 void* rt_arr_pop(lxl_arr* a, size_t size, const char* w);
 void rt_swap(lxl_slice a, int64_t i, int64_t j, size_t size, const char* w);
 lxl_slice rt_as_slice(lxl_arr* a);
