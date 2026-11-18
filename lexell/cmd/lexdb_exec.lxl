@@ -443,9 +443,9 @@ pub type Env = value record {
 
 // The session's time zone an expression is evaluated in (9.95): UTC where
 // there is no session (a CHECK, a DEFAULT, an index's expression).
-fn envZone(env: &Env): lexdb_time.Zone {
+fn envZone(env: &Env): &lexdb_time.Zone {
     match env.seq {
-        Some(se) { return se.zone.clone() }
+        Some(se) { return &se.zone }
         None { return lexdb_time.utc() }
     }
 }
@@ -517,7 +517,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 }
                 if len(args) < lexdb_bind.subFixed(&name) || i >= len(env.subs) { return Err(e("0A000", "a subquery is not supported here")) }
                 let xv = if name == "#in" { try eval(&args[3], env) } else { Val.Null }
-                return Ok(lexdb_pipe.subValue(&name, &env.subs[i].v, &xv, &envZone(env)))
+                return Ok(lexdb_pipe.subValue(&name, &env.subs[i].v, &xv, envZone(env)))
             }
             if name == "#agg" {
                 match args[0] {
@@ -595,7 +595,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 return Ok(replace(mut &vs[0], Val.Null))
             }
             if isDialectFn(&name) {
-                match try callDialectFn(&name, &vs, &envZone(env)) {
+                match try callDialectFn(&name, &vs, envZone(env)) {
                     Some(v) { return Ok(v) }
                     None {}
                 }
@@ -628,7 +628,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
 fn seqZone(seq: &Option[SeqEnv]): lexdb_time.Zone {
     match seq {
         Some(se) { return se.zone.clone() }
-        None { return lexdb_time.utc() }
+        None { return lexdb_time.utc().clone() }
     }
 }
 
@@ -667,7 +667,7 @@ fn execUp(): lexdb_pipe.Up { return lexdb_pipe.Up{entry: catEntry, dialect: call
 // transaction's start and time zone, exec's hooks; no parameters yet.
 fn cenvOf(seq: &Option[SeqEnv]): Ctx {
     var now = 0
-    var z = lexdb_time.utc()
+    var z = lexdb_time.utc().clone()
     match seq {
         Some(se) {
             now = lexdb_time.fromUnixUs(se.now)
@@ -712,7 +712,7 @@ fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
 }
 
 // name's call at the clock's time, in UTC.
-fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return lexdb_pipe.callAt(name, vs, 0, &lexdb_time.utc(), catEntry) }
+fn call(name: &str, vs: &[]Val): Result[Val, DbErr] { return lexdb_pipe.callAt(name, vs, 0, lexdb_time.utc(), catEntry) }
 
 // The two catalog functions that read PostgreSQL's dialect (lexdb_pgcat,
 // lexdb_pg): the evaluator's entry hook (Up.entry).
@@ -3603,7 +3603,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     }
     var eqs: []Val = []
     for k in 0..len(p.eqs) {
-        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok([]) } }
+        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), envZone(env)) { Some(x) { x } None { return Ok([]) } }
         if lexdb_ops.isNull(&v) { return Ok([]) }
         append(mut &eqs, v)
     }
@@ -3622,7 +3622,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
         // the subquery's values; one not of the column's type is left to
         // the condition, which stays (it decides what IN means)
         for x in env.subs[p.inSub].vals {
-            match lexdb_ops.coerceZ(x.clone(), &typ, &envZone(env)) {
+            match lexdb_ops.coerceZ(x.clone(), &typ, envZone(env)) {
                 Ok(v) { append(mut &vs, v) }
                 Err(_) {}
             }
@@ -3635,7 +3635,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
                 for part in try lexdb_ops.arrayParts(&a) {
                     match part {
                         Some(x) {
-                            match lexdb_ops.coerceZ(Val.Text(x), &typ, &envZone(env)) {
+                            match lexdb_ops.coerceZ(Val.Text(x), &typ, envZone(env)) {
                                 Ok(v) { append(mut &vs, v) }
                                 Err(_) {}
                             }
@@ -3648,7 +3648,7 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
         }
     } else {
         for x in p.ins {
-            match try keyVal(try eval(&x, env), &typ, &envZone(env)) {
+            match try keyVal(try eval(&x, env), &typ, envZone(env)) {
                 Some(v) { append(mut &vs, v) }
                 None {}
             }
@@ -3674,7 +3674,7 @@ fn keyVal(v: Val, typ: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Option[
 fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     var eqs: []Val = []
     for k in 0..len(p.eqs) {
-        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), &envZone(env)) { Some(x) { x } None { return Ok(lexdb_access.noScan()) } }
+        let v = match try keyVal(try eval(&p.eqs[k], env), &keyType(t, p.index, k), envZone(env)) { Some(x) { x } None { return Ok(lexdb_access.noScan()) } }
         if lexdb_ops.isNull(&v) { return Ok(lexdb_access.noScan()) }
         append(mut &eqs, v)
     }
@@ -3683,7 +3683,7 @@ fn pathScan(t: &Table, p: &Path, env: &Env): Result[Scan, DbErr] {
     if len(p.rng) > 0 && (p.index >= 0 || len(p.eqs) < len(t.pk)) {
         let typ = keyType(t, p.index, len(p.eqs))
         for b in p.rng {
-            let v = try lexdb_ops.coerceZ(try eval(&b.val, env), &typ, &envZone(env))
+            let v = try lexdb_ops.coerceZ(try eval(&b.val, env), &typ, envZone(env))
             if lexdb_ops.isNull(&v) { return Ok(lexdb_access.noScan()) }
             if b.op == ">" || b.op == ">=" { append(mut &los, v) } else { append(mut &his, v) }
         }
@@ -6829,7 +6829,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
                 var kv: []Val = []
                 for ko in q.subs[i].keyOuter { append(mut &kv, try eval(&ko, &kenv)) }
                 rs.stats[i].hits += 1
-                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv, &envZone(env))
+                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv, envZone(env))
                 return Ok(Unit{})
             }
             let key = valsKey(&refVals)
@@ -6840,14 +6840,14 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             }
             if at >= 0 {
                 rs.stats[i].hits += 1
-                cur[i] = lexdb_pipe.subValue(&n, &rs.memoRes[i][at].v, &xv, &envZone(env))
+                cur[i] = lexdb_pipe.subValue(&n, &rs.memoRes[i][at].v, &xv, envZone(env))
                 return Ok(Unit{})
             }
             var ps: []Val = []
             for j in 0..q.base { append(mut &ps, env.params[j].clone()) }
             for v in move(refVals) { append(mut &ps, v) }
             let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
-            cur[i] = lexdb_pipe.subValue(&n, &r.v, &xv, &envZone(env))
+            cur[i] = lexdb_pipe.subValue(&n, &r.v, &xv, envZone(env))
             if len(rs.memoRes[i]) < MEMO_MAX {
                 try rs.bud.hold(resBytes(&r) + len(key) + 48)
                 rs.memo[i].put(key, len(rs.memoRes[i]))
@@ -8142,7 +8142,7 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef, se: &Option[SeqEnv]): Result[Val
     let noCols: []lexdb_sql.ColDef = []
     let noSubs: []SubRes = []
     let env = Env{cols: &noCols, row: &none, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: se}
-    return lexdb_ops.coerceZ(try eval(&bpFix(x, &noCols), &env), &c.typ, &envZone(&env))
+    return lexdb_ops.coerceZ(try eval(&bpFix(x, &noCols), &env), &c.typ, envZone(&env))
 }
 
 // ---- ALTER TABLE (9.34)
@@ -15698,7 +15698,7 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
     }
     if k == "timezone" {
         // SET TIME ZONE (9.95): "\x01" or DEFAULT, lexdb's default, UTC
-        if value == "\x01" || strings.toLowerAscii(&value) == "default" { s.setZone(lexdb_time.utc()) } else { s.setZone(try lexdb_time.settingZone(value)) }
+        if value == "\x01" || strings.toLowerAscii(&value) == "default" { s.setZone(lexdb_time.utc().clone()) } else { s.setZone(try lexdb_time.settingZone(value)) }
         return Ok(Unit{})
     }
     if k == "lexdb_planner" {
@@ -15783,7 +15783,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -15791,7 +15791,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memo.put(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc(), savedZone: [], tmp: "", onCommit: [], fresh: false}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false}
 }
 
 // max_statement_mem's default.
@@ -15994,7 +15994,7 @@ fn (s: mut &Session) discard(what: &str): Result[Res, DbErr] {
 
 // RESET ALL: lexdb's settings to their defaults.
 fn (s: mut &Session) resetAll() {
-    s.setZone(lexdb_time.utc())
+    s.setZone(lexdb_time.utc().clone())
     if len(s.path) > 0 { s.setPath(&["public"]) }
     s.maxRecursion = MAX_RECURSION
     s.maxSteps = MAX_MATCH_STEPS
@@ -16182,7 +16182,7 @@ fn writesOn(s: &lexdb_sql.Stmt): Option[str] {
 }
 
 // Converts the parameters a client sent as text to values of their types.
-pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] { return paramValsIn(texts, ptypes, &lexdb_time.utc()) }
+pub fn paramVals(texts: &[]Option[str], ptypes: &[]int): Result[[]Val, DbErr] { return paramValsIn(texts, ptypes, lexdb_time.utc()) }
 
 // paramVals, a date or time read in zone z (the session's).
 fn paramValsIn(texts: &[]Option[str], ptypes: &[]int, z: &lexdb_time.Zone): Result[[]Val, DbErr] {
@@ -19573,7 +19573,7 @@ fn copyMsgEnd(b: mut &[]byte, at: int) { binary.setU32BE(b, at + 1, len(b) - at 
 fn copyHeader(cols: &[]OutCol, o: &lexdb_sql.CopyOpts, b: mut &[]byte) {
     for k in 0..len(cols) {
         if k > 0 { appendStr(b, o.delim) }
-        copyField(&Val.Text(cols[k].name.clone()), o, len(cols) == 1, false, lexdb_sql.OID_TEXT, &lexdb_time.utc(), b)
+        copyField(&Val.Text(cols[k].name.clone()), o, len(cols) == 1, false, lexdb_sql.OID_TEXT, lexdb_time.utc(), b)
     }
     append(b, '\n')
 }
