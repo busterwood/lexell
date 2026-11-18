@@ -5870,6 +5870,29 @@ TPC-H at 89cf0a59 (lexdb-benchmarks.md 1.6): summed 13.52 s against
 PostgreSQL's 13.96 s on one core, geometric mean 1.03. Point selects
 level (instructions), cycles 1.5% to 2.7% lower than at 48c22c45.
 
+- **a71052de, an index's ranges per key in one pass (-0.44%; q3 -3.3%, q4
+  -3.1%, q5 -4.8%).** `Store.scanRanges`: rangeMany's ranges, sorted, under
+  one lock, each leaf found from the last one's path (a Finger, as
+  getManyIn's keys) instead of a descent from the root with its bounds
+  copied per range; a range crossing its leaf's fence or meeting the
+  transaction's own writes or cuts, a replica's view, or noted reads: by
+  scanLeaves as before. Smaller than hoped: a chunk's keys are sparse
+  (about a thousand orders over 6M lineitem rows), so the ranges rarely
+  share a leaf, and the cost left is the search itself (below).
+
+**q20 and q11, profiled (2026-11-18).** Both are index lookups whose rows
+are then fetched by primary key (`rowsOfKeys`, `getManyIn`: 48% of q20,
+40% of q11), where PostgreSQL fetches by tuple id. q20 also pays its
+correlated subquery's setup per run (8,508 runs: the aggregate's state,
+batches and kernels compiled again; malloc and free 13.5%): an Apply that
+prepares once and runs per row (6.2.3's hand-over) is the fix. q11 runs
+the same join twice (the HAVING's subquery), as PostgreSQL does. Across
+q3, q11, q20 the B-tree search is the rest: the in-leaf binary search
+(`Node.lower`) and descents compare keys through `rt_str_cmp`, which
+always calls `memcmp`; most keys are 8 to 16 bytes, so a runtime fast path
+(the first 8 bytes compared as a byte-swapped integer) would serve every
+string comparison. That is the language runtime's (rt.h, native/rt.c).
+
 The largest ratios left: q19 2.6× (plan: PostgreSQL drives from part by a
 BitmapOr; the parked orHull), q20 2.3×, q11 2.1×, q22 1.9×; the largest
 absolute gaps q21 (+406 ms), q7 (+357), q3 (+304), q15 (+272), q12 (+240).
