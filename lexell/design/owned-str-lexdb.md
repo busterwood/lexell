@@ -303,7 +303,7 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 | AF | SPEC 10 rule 5: a function with several borrowed parameters may return a shared borrow (`fn longer(a: &str, b: &str): &str`); the result borrows all its arguments, as a result holding borrows already did. A `mut &` result still needs exactly one. | a4f8001c | yes | none |
 | AG | SPEC 10 rule 7: a `var` borrow initialised from a static string (`var s: &str = ""`) takes its roots from its first store that borrows something, as a `var` of a type holding borrows does (AC fixed the roots at the initializer). | a4f8001c | yes | none |
 
-| AH | SPEC 5.2: `G.getOrSet(f)` on a set-once global returns `G.get()`, first setting it to `f()` if empty. Tasks that reach an empty `G` while another's `f` is suspended run `f` too; the first value stored wins, the rest are dropped, nothing stops the program. | (this commit) | yes (a new method) | none |
+| AH | SPEC 5.2: `G.getOrSet(f)` on a set-once global returns `G.get()`, first setting it to `f()` if empty. Tasks that reach an empty `G` while another's `f` is suspended run `f` too; the first value stored wins, the rest are dropped, nothing stops the program. | 14e45946 | yes (a new method) | none |
 
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
