@@ -1312,14 +1312,14 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
         var acc = 8
         var m = 1
         while m < n - 1 {
-            let e = lexdb_page.kidEntry(&db.pool[db.meta[s].frame].key(m - 1))
+            let e = lexdb_page.kidEntry(db.pool[db.meta[s].frame].keyView(m - 1))
             if acc + e > total / 2 { break }
             acc += e
             m += 1
         }
         if atEnd && n >= 3 { m = n - 2 }        // the left stays full: the last two children go right
         // keys[m] goes up; keys after it and kids after m go right
-        sep = lexdb_base.own(&db.pool[db.meta[s].frame].key(m))
+        sep = lexdb_base.own(db.pool[db.meta[s].frame].keyView(m))
         for i in m + 1..n { append(right.keys.unshare(), db.pool[db.meta[s].frame].keys[i].clone()) }
         for i in m + 1..n + 1 { append(mut &right.kids, db.pool[db.meta[s].frame].kids[i]) }
         for i in m..n {
@@ -1565,7 +1565,7 @@ fn (db: mut &Db) refitLeaf(tree: int, i: int, first: &str) {
             }
         }
         if m <= 0 || m >= n { return }
-        let next = lexdb_base.own(&db.pool[f].key(m))
+        let next = lexdb_base.own(db.pool[f].keyView(m))
         db.refitCuts += 1
         db.cutLeaf(tree, &d.path, m)
         if len(body) > 0 {
@@ -1593,7 +1593,7 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     // the size front coded: the entry's bytes after the key before it, and
     // the next entry's after it rather than after that one (lexdb_page T_FLEAF)
     let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1].clone() } else { "" }
-    if i < cnt && db.pool[db.meta[leaf].frame].key(i) == key {
+    if i < cnt && db.pool[db.meta[leaf].frame].keyView(i) == key {
         db.pool[db.meta[leaf].frame].size += lexdb_page.frontEntry(&prev, key, val) - lexdb_page.frontEntry(&prev, key, &db.pool[db.meta[leaf].frame].vals[i])
         db.pool[db.meta[leaf].frame].vals[i] = rc(val.clone())
     } else {
@@ -1617,7 +1617,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     if len(d.path) == 0 { return }
     let leaf = d.path[len(d.path) - 1]
     let i = db.pool[db.meta[leaf].frame].lower(key)
-    if i >= db.pool[db.meta[leaf].frame].count() || db.pool[db.meta[leaf].frame].key(i) != key { return }
+    if i >= db.pool[db.meta[leaf].frame].count() || db.pool[db.meta[leaf].frame].keyView(i) != key { return }
     for s in d.path { db.markDirty(s) }
     db.willChange(leaf)
     db.pool[db.meta[leaf].frame].loosen()
@@ -2129,7 +2129,7 @@ fn (db: mut &Db) leafVal(tree: int, key: &str): Option[str] {
     if len(d.path) == 0 || d.need >= 0 { return None }
     let leaf = d.path[len(d.path) - 1]
     let i = db.pool[db.meta[leaf].frame].lower(key)
-    if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
+    if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].keyView(i) == key {
         return Some(db.pool[db.meta[leaf].frame].val(i))
     }
     return None
@@ -2167,8 +2167,8 @@ fn (db: mut &Db) dropChunks(tree: int, key: &str) {
         if len(d.path) == 0 || d.need >= 0 { break }
         let leaf = d.path[len(d.path) - 1]
         var i = db.pool[db.meta[leaf].frame].lower(&cursor)
-        while i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) < hi {
-            append(mut &gone, lexdb_base.own(&db.pool[db.meta[leaf].frame].key(i)))
+        while i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].keyView(i) < hi {
+            append(mut &gone, lexdb_base.own(db.pool[db.meta[leaf].frame].keyView(i)))
             i += 1
         }
         if !d.hasUpper || d.upper >= hi { break }
@@ -2401,7 +2401,7 @@ fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[
                     let li = db.pool[lf].lower(key)
                     // (an empty leaf: an empty tree; at a leaf's start, the key before
                     // is in another leaf: not looked for)
-                    clear = db.pool[lf].count() == 0 || (li > 0 && db.pool[lf].key(li - 1) < t.reads[nr - 1].hi)
+                    clear = db.pool[lf].count() == 0 || (li > 0 && db.pool[lf].keyView(li - 1) < t.reads[nr - 1].hi)
                 }
                 if clear {
                     t.reads[nr - 1].hi = key + "\x00"
@@ -2412,7 +2412,7 @@ fn (st: &Store) getBaseIn(t: mut &Txn, tree: int, key: &str, mode: int): Result[
             if len(d.path) == 0 { return }
             let leaf = d.path[len(d.path) - 1]
             let i = db.pool[db.meta[leaf].frame].lower(key)
-            if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].key(i) == key {
+            if i < db.pool[db.meta[leaf].frame].count() && db.pool[db.meta[leaf].frame].keyView(i) == key {
                 out = Some(db.pool[db.meta[leaf].frame].val(i))
             }
         })
@@ -2827,28 +2827,39 @@ fn cacheState(st: &Store): str {
 // getMany's path from the root to the leaf of the last key: per node its
 // slot, its version as snapNode takes it (-1 the current), and the keys it
 // holds, [lo, hi) (each end bounded or not).
-type Finger = record { slots: []int; vers: []int; lo: []str; hasLo: []bool; hi: []str; hasHi: []bool }
+type Finger = record { slots: []int; vers: []int; los: []Bound; his: []Bound }
 
-fn newFinger(): Finger { return Finger{slots: [], vers: [], lo: [], hasLo: [], hi: [], hasHi: []} }
+// Where a finger's bound is: key i of node s at version v (s -1: none). The
+// key is read in place (Db.boundKey), not copied: a finger lives under one
+// lock, while its nodes do not change.
+type Bound = value record { s: int; v: int; i: int }
 
-fn (f: &Finger) holds(d: int, k: &str): bool { return (!f.hasLo[d] || f.lo[d] <= k) && (!f.hasHi[d] || k < f.hi[d]) }
+const NO_BOUND: Bound = Bound{s: -1, v: -1, i: -1}
 
-fn (f: mut &Finger) push(s: int, v: int, lo: str, hasLo: bool, hi: str, hasHi: bool) {
+fn newFinger(): Finger { return Finger{slots: [], vers: [], los: [], his: []} }
+
+// The key at b (b.s >= 0).
+fn (db: &Db) boundKey(b: Bound): &str { return db.snapNode(b.s, b.v).keyView(b.i) }
+
+// Whether depth d of f holds k: [lo, hi), each end bounded or not.
+fn (db: &Db) fHolds(f: &Finger, d: int, k: &str): bool {
+    let lo = f.los[d]
+    let hi = f.his[d]
+    return (lo.s < 0 || db.boundKey(lo) <= k) && (hi.s < 0 || k < db.boundKey(hi))
+}
+
+fn (f: mut &Finger) push(s: int, v: int, lo: Bound, hi: Bound) {
     append(mut &f.slots, s)
     append(mut &f.vers, v)
-    append(mut &f.lo, lo)
-    append(mut &f.hasLo, hasLo)
-    append(mut &f.hi, hi)
-    append(mut &f.hasHi, hasHi)
+    append(mut &f.los, lo)
+    append(mut &f.his, hi)
 }
 
 fn (f: mut &Finger) pop() {
     let s = pop(mut &f.slots)
     let v = pop(mut &f.vers)
-    let l = pop(mut &f.lo)
-    let hl = pop(mut &f.hasLo)
-    let h = pop(mut &f.hi)
-    let hh = pop(mut &f.hasHi)
+    let l = pop(mut &f.los)
+    let h = pop(mut &f.his)
 }
 
 // A node's version for a read as of q (snap: a snapshot's; else the live
@@ -2862,7 +2873,7 @@ fn (db: &Db) fingerVer(s: int, snap: bool, q: int): int {
 // node whose range holds k, then down. Its depth in f; -1 with need set: a
 // node to load first; -2 a snapshot's version missing.
 fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str, need: mut &int): int {
-    while len(f.slots) > 0 && !f.holds(len(f.slots) - 1, k) { f.pop() }
+    while len(f.slots) > 0 && !db.fHolds(f, len(f.slots) - 1, k) { f.pop() }
     if len(f.slots) == 0 {
         let v = db.fingerVer(root, snap, q)
         if v == -2 {
@@ -2871,34 +2882,20 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
         }
         if v == -3 { return -2 }
         db.meta[root].ref = true
-        f.push(root, v, "", false, "", false)
+        f.push(root, v, NO_BOUND, NO_BOUND)
     }
     while true {
         let d = len(f.slots) - 1
         var c = -1
-        var lo = ""
-        var hasLo = false
-        var hi = ""
-        var hasHi = false
+        var lo = f.los[d]
+        var hi = f.his[d]
         {
             let n = db.snapNode(f.slots[d], f.vers[d])
             if n.leaf { return d }
             let i = childIndex(&n.keys, k)
             c = n.kids[i]
-            if i > 0 {
-                lo = n.key(i - 1)
-                hasLo = true
-            } else {
-                lo = f.lo[d].clone()
-                hasLo = f.hasLo[d]
-            }
-            if i < n.count() {
-                hi = n.key(i)
-                hasHi = true
-            } else {
-                hi = f.hi[d].clone()
-                hasHi = f.hasHi[d]
-            }
+            if i > 0 { lo = Bound{s: f.slots[d], v: f.vers[d], i: i - 1} }
+            if i < n.count() { hi = Bound{s: f.slots[d], v: f.vers[d], i: i} }
         }
         let v = db.fingerVer(c, snap, q)
         if v == -2 {
@@ -2907,7 +2904,7 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
         }
         if v == -3 { return -2 }
         db.meta[c].ref = true
-        f.push(c, v, lo, hasLo, hi, hasHi)
+        f.push(c, v, lo, hi)
     }
     return -1
 }
@@ -3250,7 +3247,7 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: &str, mode: int): Result[Op
             }
             let n = db.snapNode(d.leaf, d.ver)
             let i = n.lower(&key)
-            if i < n.count() && n.key(i) == key { out = Some(n.val(i)) }
+            if i < n.count() && n.keyView(i) == key { out = Some(n.val(i)) }
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -3388,12 +3385,12 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&Ent
                 let n = db.snapNode(d.leaf, d.ver)
                 var i = n.lower(&cursor)
                 while i < n.count() {
-                    if len(to) > 0 && n.key(i) >= to { break }
+                    if len(to) > 0 && n.keyView(i) >= to { break }
                     append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                     i += 1
                 }
-                upper = d.fence.clone()
                 hasUpper = d.hasFence
+                upper = d.fence                     // (moved: d is not used again)
                 return
             }
             let d = db.descend(tree, &cursor)
@@ -3411,8 +3408,8 @@ fn (st: &Store) scanIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&Ent
                 append(mut &chunk, Entry{key: k, val: db.pool[db.meta[leaf].frame].val(i)})
                 i += 1
             }
-            upper = d.upper.clone()
             hasUpper = d.hasUpper
+            upper = d.upper
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -3570,12 +3567,12 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 var j = n.count()
                 if len(to) > 0 { j = n.lower(&to) }
                 if j > i {
-                    seen = n.key(j - 1)
+                    if noting { seen = n.key(j - 1) }      // (read only to note the read)
                     let lv = lexdb_page.leafView(&n)
                     go = f(&lv, i, j)
                 }
-                upper = d.fence.clone()
                 hasUpper = d.hasFence
+                upper = d.fence                     // (moved: d is not used again)
                 return
             }
             let d = db.descend(tree, &cursor)
@@ -3595,12 +3592,12 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
             var j = n.count()
             if len(to) > 0 { j = n.lower(&to) }
             if j > i {
-                seen = n.key(j - 1)
+                if noting { seen = n.key(j - 1) }
                 let lv = lexdb_page.leafView(n)
                 go = f(&lv, i, j)
             }
-            upper = d.upper.clone()
             hasUpper = d.hasUpper
+            upper = d.upper
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -3688,7 +3685,7 @@ pub fn (st: &Store) scanRanges(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
                     return
                 }
                 if fg.vers[d] == -1 { db.noteLeaf(tree, fg.slots[d]) }
-                if fg.hasHi[d] && (len(his[x]) == 0 || his[x] > fg.hi[d]) {
+                if fg.his[d].s >= 0 && (len(his[x]) == 0 || his[x] > db.boundKey(fg.his[d])) {
                     cross = true
                     return
                 }
@@ -3818,7 +3815,7 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(
                 var i = if len(cursor) == 0 { n.count() } else { n.lower(&cursor) }
                 while i > 0 {
                     i -= 1
-                    if n.key(i) < from { break }
+                    if n.keyView(i) < from { break }
                     append(mut &chunk, Entry{key: n.key(i), val: n.val(i)})
                 }
                 lower = d.fence.clone()
@@ -4403,6 +4400,7 @@ type SnapLeaf = value record { leaf: int; ver: int; need: int; missing: bool; fe
 fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapLeaf {
     var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false, par: -1, pver: -1, at: -1}
     var s = root
+    var fb = NO_BOUND           // the fence's place, copied once at the leaf
     while true {
         let v = db.verOf(s, q)
         if v == -2 {
@@ -4418,24 +4416,22 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
         if n.leaf {
             r.leaf = s
             r.ver = v
+            if fb.s >= 0 {
+                r.fence = db.boundKey(fb).clone()
+                r.hasFence = true
+            }
             return r
         }
         if back {
             let j = if len(cursor) == 0 { n.count() } else { n.lower(cursor) }
-            if j > 0 {
-                r.fence = n.key(j - 1)
-                r.hasFence = true
-            }
+            if j > 0 { fb = Bound{s: s, v: v, i: j - 1} }
             r.par = s
             r.pver = v
             r.at = j
             s = n.kids[j]
         } else {
             let i = childIndex(&n.keys, cursor)
-            if i < n.count() {
-                r.fence = n.key(i)
-                r.hasFence = true
-            }
+            if i < n.count() { fb = Bound{s: s, v: v, i: i} }
             r.par = s
             r.pver = v
             r.at = i
@@ -5113,8 +5109,8 @@ pub fn (st: &Store) upgradeTree(tree: int, from: &str, most: int): Result[Upgrad
                 return
             }
             r = db.upgradeLeaf(tree, &d)
-            upper = d.upper.clone()
             hasUpper = d.hasUpper
+            upper = d.upper
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -5172,8 +5168,8 @@ pub fn (st: &Store) leafKinds(tree: int): Result[[]int, lexdb_base.DbErr] {
                     out[1] += 1
                 }
             }
-            upper = d.upper.clone()
             hasUpper = d.hasUpper
+            upper = d.upper
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -5368,7 +5364,7 @@ pub fn (st: &Store) checkpoint(): Result[Unit, lexdb_base.DbErr] {
                     let ci = leaves[x]
                     if encs[j].kind == 2 {
                         append(mut &offTree, c.nodes[ci].tree)
-                        append(mut &offKey, lexdb_base.own(&jobs[j].node.key(0)))
+                        append(mut &offKey, lexdb_base.own(jobs[j].node.keyView(0)))
                         continue
                     }
                     let body = replace(mut &encs[j].body, "")
@@ -7488,7 +7484,7 @@ fn (fo: &Follower) baseGet(bi: int, tree: int, key: &str): Result[Option[str], l
                     }
                     let n = &f.pool[st.leaf]
                     let i = n.lower(key)
-                    if i < n.count() && n.key(i) == key { append(mut &out, n.val(i)) }
+                    if i < n.count() && n.keyView(i) == key { append(mut &out, n.val(i)) }
                 }
                 None {}
             }
