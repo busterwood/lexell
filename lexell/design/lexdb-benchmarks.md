@@ -115,6 +115,28 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
+**Now, main `48c22c45` (2026-11-18):** lexdb alone, one run, boost off
+(3.8 GHz), the setup below; PostgreSQL's times are its one-core run at
+`94536d12` (same machine, clock and data). After the layered redesign's
+pipeline (P1-P3), the owned-string migration and its review. **Geometric
+mean of lexdb / PG one core: 1.05**; summed 14,083 ms against 13,955; level
+or ahead on 9 of 22. Results: `~/tpch-w/int/out-main-48c22c45`.
+
+| | lexdb `48c22c45` | PG one core | ratio |
+|---|---:|---:|---:|
+| q1 | 1,714 | 3,300 | 0.52 |
+| q3 | 809 | 516 | 1.57 |
+| q7 | 1,192 | 585 | 2.04 |
+| q9 | 1,935 | 1,732 | 1.12 |
+| q11 | 129 | 61 | 2.12 |
+| q17 | 36 | 579 | 0.06 |
+| q19 | 101 | 40 | 2.53 |
+| q20 | 279 | 123 | 2.27 |
+| q21 | 1,448 | 820 | 1.77 |
+| q22 | 171 | 88 | 1.94 |
+| all 22, summed | 14.08 s | 13.96 s | |
+
+
 lexdb at `1744ef99` (main, 2026-11-16) against PostgreSQL 18.6 with
 parallel query off, both pinned to CPUs 0-3, conventional secondary
 indexes (`bench/tpch/indexes.sql`). **Geometric mean of lexdb / PG one
@@ -225,6 +247,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-18 | 48c22c45 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.05 (geometric mean, wall; was 2.48), 9 of 22 level or ahead; summed 14.08 s against PG's 13.96 s; worst q19 2.5×, q20 2.3×, q11 2.1×, q7 2.0× | this page, 1.6 |
 | 2026-11-16 | 94536d12 | TPC-H derived, SF1, boost off | lexdb / PG one core 2.48 (geometric mean, wall; was 3.77), 4 of 22 level or ahead; worst q19 14×, q20 12×, q21 10.5×, q22 8.5×; pinned 0-3, 3.8 GHz | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-16 | 1744ef99 | TPC-H derived, SF1 | lexdb / PG one core 3.77 (geometric mean, wall), 2 of 22 level or ahead; q4 22×, q21 20×, q1 5.6×; pinned 0-3 | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-15 | exp/ckpt-incremental | commit latency | the checkpoint's stall gone: commit max 70 → 8-11 ms, p99.9 4.2-4.5 → 3.9-4.4, p99 0.72-0.76 → 0.88-0.91 (master alone, 8 clients, pinned) | this page, 1.2; lexdb.md 9.136 |
