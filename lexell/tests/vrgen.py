@@ -9,8 +9,8 @@ around small functions: by value, by borrow, as receivers, results, moves, clone
 `replace`, `swap`, `pop`, match arms, loops and `x = f(x)`. `str` is owned, so the records are
 owned: the generator tracks which variables hold a value and moves or clones them by the rules of
 SPEC section 9.1, so every program it writes is valid Lexell. Each program is built through C and
-with --native, both run under LXL_CHECK=1 (a leak exits 5), and their exit codes, stdout and
-stderr must be equal; the C run must also exit 0 with output. A program either build rejects
+with --native and with --native -O, all three run under LXL_CHECK=1 (a leak exits 5), and their
+exit codes, stdout and stderr must be equal; the C run must also exit 0 with output. A program either build rejects
 counts as `not compiled`, and like `differ` (outputs differ, or a timeout) and `failed alike`
 (both exit nonzero) it fails the step: exit 1 unless every program is `same`. Failing programs
 are kept (in --keep, or a temporary directory the summary names).
@@ -274,11 +274,11 @@ def one(k, a, out):
     with open(base + '.lxl', 'w') as f:
         f.write(program(a.seed, k))
     builds = {}
-    for mode in ('c', 'native'):
-        b = subprocess.run([a.compiler, base + '.lxl', '--' + mode, '-o', base + '_' + mode[0]],
+    for mode, flags in (('c', ['--c']), ('native', ['--native']), ('opt', ['--native', '-O'])):
+        b = subprocess.run([a.compiler, base + '.lxl'] + flags + ['-o', base + '_' + mode[0]],
                            capture_output=True, text=True)
         builds[mode] = (b.returncode == 0, 'exit %d: %s' % (b.returncode, (b.stdout + b.stderr).strip()))
-    ok = (builds['c'][0], builds['native'][0])
+    ok = (builds['c'][0], builds['native'][0], builds['opt'][0])
     if not all(ok):
         why = '; '.join('%s build failed: %s' % (m, builds[m][1][:300]) for m in builds if not builds[m][0])
         return ('nocompile', k, why, ok)
@@ -287,12 +287,15 @@ def one(k, a, out):
     try:
         rc = subprocess.run([base + '_c'], env=env, capture_output=True, timeout=20)
         rn = subprocess.run([base + '_n'], env=env, capture_output=True, timeout=20)
+        ro = subprocess.run([base + '_o'], env=env, capture_output=True, timeout=20)
     except subprocess.TimeoutExpired:
         return ('differ', k, 'timeout', ok)
-    for f in ('_c', '_n'):
+    for f in ('_c', '_n', '_o'):
         os.remove(base + f)
     if (rc.returncode, rc.stdout, rc.stderr) != (rn.returncode, rn.stdout, rn.stderr):
         return ('differ', k, 'C exit %d, native exit %d: %r' % (rc.returncode, rn.returncode, rn.stderr[:200]), ok)
+    if (rc.returncode, rc.stdout, rc.stderr) != (ro.returncode, ro.stdout, ro.stderr):
+        return ('differ', k, 'C exit %d, native -O exit %d: %r' % (rc.returncode, ro.returncode, ro.stderr[:200]), ok)
     if rc.returncode != 0 or not rc.stdout:
         return ('badexit', k, 'both exit %d, %d bytes out: %r' % (rc.returncode, len(rc.stdout), rc.stderr[:200]), ok)
     os.remove(base + '.lxl')
@@ -318,11 +321,12 @@ def main():
     with ThreadPoolExecutor(max_workers=a.j) as ex:
         res = list(ex.map(lambda k: one(k, a, out), range(a.n)))
     count = {'same': 0, 'differ': 0, 'nocompile': 0, 'badexit': 0}
-    c_ok = n_ok = 0
+    c_ok = n_ok = o_ok = 0
     for kind, k, why, ok in res:
         count[kind] += 1
         c_ok += ok[0]
         n_ok += ok[1]
+        o_ok += ok[2]
         if kind == 'differ':
             print('DIFFER p%d.lxl: %s' % (k, why))
         elif kind == 'badexit':
@@ -330,9 +334,9 @@ def main():
         elif kind == 'nocompile' and count[kind] <= 5:
             print('NOT COMPILED p%d.lxl: %s' % (k, why[:400]))
     bad = a.n - count['same']
-    print('vrgen: seed %d: %d programs, %d compiled with --c, %d with --native; '
+    print('vrgen: seed %d: %d programs, %d compiled with --c, %d with --native, %d with --native -O; '
           '%d same, %d differ, %d failed alike, %d not compiled%s' % (
-              a.seed, a.n, c_ok, n_ok, count['same'], count['differ'], count['badexit'], count['nocompile'],
+              a.seed, a.n, c_ok, n_ok, o_ok, count['same'], count['differ'], count['badexit'], count['nocompile'],
               ' (programs in %s)' % out if bad else ''))
     if not bad and not a.keep:
         shutil.rmtree(out, ignore_errors=True)
