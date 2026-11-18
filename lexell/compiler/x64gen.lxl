@@ -1738,11 +1738,51 @@ fn (g: mut &Gen) forwardLit(l: int, j: int) {
         root = g.u.nodes[y].b
     }
     if root < 0 { return }
-    let at = g.fwdSite(root, t, v)
+    var at = g.fwdSite(root, t, v)
+    if at < 0 && yk == ir.S_EXPR && g.u.nk(root) == ir.E_ASSIGN {
+        // `*P = t` through a pointer (an element pushed: `*(T*)rt_arr_push(&a, n) = t`): the
+        // literal is built at P after P's code (genAssign) when what it reads, P's code cannot
+        // change (litLeaves): it reads no memory P's code or the stores into P could change
+        let rhs = g.u.nodes[root].b
+        let lhs = g.u.nodes[root].a
+        if g.u.nk(rhs) == ir.E_LOCAL && g.u.nodes[rhs].a == t && g.u.nk(lhs) == ir.E_DEREF &&
+            g.walk(lhs, 0, t, -1) == 0 && g.litLeaves(v, lhs) {
+            at = rhs
+        }
+    }
     if at < 0 || g.u.nodes[at].ty != ty { return }
     g.u.nodes[at] = g.u.nodes[v]
     g.u.items[l + 1 + j] = g.emptyS
     g.uses[t] = 0
+}
+
+// Whether every value of the compound literal v (and of the literals in it) is a constant, a
+// string or function address, a constant global, or a local (or a member of one) whose address
+// is never taken and that the code of lhs does not assign: nothing the code of lhs (calls
+// included) can change, nothing that can fail, and nothing a store through lhs can reach. Then
+// v may be built at lhs's address after lhs's code, a value at a time (genAssign).
+fn (g: mut &Gen) litLeaves(v: int, lhs: int): bool {
+    let ents = g.u.nodes[v].b
+    for j in 0..g.u.listLen(ents) {
+        var x = g.u.nodes[g.u.listAt(ents, j)].a
+        while g.u.nk(x) == ir.E_CAST { x = g.u.nodes[x].a }
+        let k = g.u.nk(x)
+        if k == ir.E_CLIT {
+            if !g.litLeaves(x, lhs) { return false }
+            continue
+        }
+        if k == ir.E_INT || k == ir.E_FLT || k == ir.E_STR || k == ir.E_FUNC { continue }
+        if (k == ir.E_DECAY || k == ir.E_ADDR) && (g.u.nk(g.u.nodes[x].a) == ir.E_STR || g.u.nk(g.u.nodes[x].a) == ir.E_FUNC) {
+            continue
+        }
+        if k == ir.E_GLOBAL && g.u.globals[g.u.nodes[x].a].isConst { continue }
+        var r = x
+        while g.u.nk(r) == ir.E_MEMBER { r = g.u.nodes[r].a }
+        if g.u.nk(r) != ir.E_LOCAL { return false }
+        let l = g.u.nodes[r].a
+        if g.aTaken[l] || g.walk(lhs, 1, l, -1) > 0 { return false }
+    }
+    return true
 }
 
 // For forward: in the tree x, the name of local t when x's other values are as forward needs
@@ -3542,6 +3582,7 @@ fn (g: mut &Gen) initResult(s: int, n: int, ents: int) {
 fn (g: mut &Gen) initAt(d: int): x64.Mem {
     if g.initVia == 0 { return rbp(d) }
     if g.initVia == -1 { return x64.mem(RSP, d) }
+    if g.initVia == -2 { return x64.mem(R11, d) }
     if !g.viaLoaded {
         g.a.load(8, R11, rbp(g.initVia))
         g.viaLoaded = true
@@ -3625,6 +3666,15 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
         } else if g.isAggr(t) && g.u.nk(x) == ir.E_CLIT && g.u.nodes[x].ty == t {
             // a literal inside: built in its place
             g.fillEntries(s + en.v, g.size(t), g.u.nodes[x].b)
+        } else if g.aggrLeaf(x, t) {
+            // an aggregate local or constant global: copied from its place (through r10; rax
+            // holds a global's address), r11 left alone
+            if g.u.nk(x) == ir.E_LOCAL {
+                g.copyMem(g.initAt(s + en.v), rbp(g.slots[g.u.nodes[x].a]), g.size(t))
+            } else {
+                g.a.movRSym(RAX, g.globalSym[g.u.nodes[x].a], 0)
+                g.copyMem(g.initAt(s + en.v), x64.mem(RAX, 0), g.size(t))
+            }
         } else if len(alone) > 0 && alone[j] && g.directOk(x, t) {
             let cv = g.intConst(x, t)
             if cv.c == 0 && x64.fits32(cv.v) {
@@ -3646,6 +3696,32 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
             }
         }
     }
+}
+
+// Whether x, of aggregate type t, is a local in the frame or a constant global, which fillEntries
+// copies with no code for x (r10 and rax only, at most 128 bytes).
+fn (g: &Gen) aggrLeaf(x: int, t: int): bool {
+    let n = g.u.nodes[x]
+    if !g.isAggr(t) || n.ty != t || g.size(t) > 128 { return false }
+    if n.k == ir.E_LOCAL { return g.reg[n.a] < 0 && g.preg[n.a] < 0 && g.freg[n.a] < 0 }
+    return n.k == ir.E_GLOBAL && g.u.globals[n.a].isConst
+}
+
+// Whether fillEntries fills the entries ents with no code that may change r11: constants,
+// locals in registers, string bytes, and aggrLeaf's copies (and literals of those).
+fn (g: &Gen) litQuiet(ents: int): bool {
+    for j in 0..g.u.listLen(ents) {
+        let en = g.u.nodes[g.u.listAt(ents, j)]
+        let x = en.a
+        let t = en.ty
+        if g.u.nk(x) == ir.E_STR && g.tk(t) == ir.TY_ARR { continue }
+        if g.isAggr(t) && g.u.nk(x) == ir.E_CLIT && g.u.nodes[x].ty == t {
+            if !g.litQuiet(g.u.nodes[x].b) { return false }
+            continue
+        }
+        if !g.aggrLeaf(x, t) && !g.directOk(x, t) { return false }
+    }
+    return true
 }
 
 // Whether storeDirect stores x.
@@ -4946,6 +5022,29 @@ fn (g: mut &Gen) genAssign(e: int) {
         }
         g.a.store(g.size(t), pm, r)
         if !unused { g.a.movRR(8, RAX, r) }
+        return
+    }
+    if lk == ir.E_DEREF && g.isAggr(t) && g.u.nk(n.b) == ir.E_CLIT && g.u.nodes[n.b].ty == t && g.litLeaves(n.b, lhs) {
+        // a literal of values the address's code cannot change (forwardLit): built at the
+        // address, r11, a value at a time, not in a temporary copied there; the address kept in
+        // a slot too when a value's code may change r11
+        g.genAddr(lhs)
+        g.a.movRR(8, R11, RAX)
+        let via = g.initVia
+        let ents = g.u.nodes[n.b].b
+        if g.size(t) <= 128 && g.litQuiet(ents) {
+            g.initVia = -2                  // r11 itself (initAt): no slot
+        } else {
+            g.initVia = g.temp(8, 8)
+            g.a.store(8, rbp(g.initVia), R11)
+        }
+        g.viaLoaded = true
+        g.fillEntries(0, g.size(t), ents)
+        if !unused {
+            if g.viaLoaded { g.a.movRR(8, RAX, R11) } else { g.a.load(8, RAX, rbp(g.initVia)) }
+        }
+        g.initVia = via
+        g.viaLoaded = false
         return
     }
     if g.u.nk(lhs) == ir.E_GLOBAL {
