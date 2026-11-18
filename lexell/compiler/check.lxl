@@ -205,6 +205,7 @@ type Val = value record {
     late: bool
     cr: int         // a borrow-class value that is not a place: its root (R_FREE: none), or -1: unknown
     pa: int         // a borrow an if or match expression gives: its branches' places (Checker.palts), or -1
+    nn: int         // h.f read from a local h: the name node of h (consume may move h.f), or -1
 }
 
 // A place a branch of an if or match expression borrows: a variable and the path in it ("" all of it).
@@ -401,7 +402,7 @@ fn noInit(): GInit { return GInit{has: false, isOnce: false, table: false, items
 
 fn val(c: int, t: int, cat: int): Val {
     return Val{c: c, t: t, cat: cat, tmp: -1, root: -1, path: "", mutable: false, viaref: false, vvar: -1, gk: -1,
-        gi: -1, noreturn: false, caps: -1, late: false, cr: -1, pa: -1}
+        gi: -1, noreturn: false, caps: -1, late: false, cr: -1, pa: -1, nn: -1}
 }
 
 fn rv(c: int, t: int): Val { return val(c, t, CAT_RV) }
@@ -824,7 +825,7 @@ fn (c: mut &Checker) checkResult(r: int, shown: int, line: int, isB: bool) {
             ": " + c.cx.label + " has no borrowed parameter, so its result may only borrow static data " +
             "(literals, constants and set-once globals)")
     }
-    if isB && !anyInh {
+    if isB && !anyInh && len(bsrc) == 1 {
         c.err(line, "cannot return a borrow of " + name + ": a borrow result must be rooted at the " +
             "borrowed parameter '" + c.pg.fns[f].bparam + "', not a local or temporary")
     }
@@ -1628,8 +1629,53 @@ fn (c: mut &Checker) consume(v: Val, line: int): int {
         let gn = c.gname(v.gk, v.gi)
         c.err(line, "cannot move out of global " + gn + ": read a copy with " + gn + ".clone()")
     }
+    if v.nn >= 0 && v.root >= 0 {
+        let mv = c.moveFieldOfDead(v, line)
+        if mv >= 0 { return mv }
+    }
     let s = if hasName { " of " + sx.pyRepr(&name) } else { "" }
-    c.err(line, "cannot move a " + c.tstr(v.t) + " out of a field or element" + s + "; use replace, swap or pop")
+    let why = if v.nn >= 0 { " (a field moves out only of a local record without a drop method that is not used " +
+        "afterwards)" } else { "" }
+    c.err(line, "cannot move a " + c.tstr(v.t) + " out of a field or element" + s + "; use replace, swap or pop" + why)
+}
+
+// SPEC 9.1: h.f read by value, where local h is a record (no drop method) not used after this, moves
+// h.f as move(h).f would: the C of the value, h's other fields dropped (its box freed); -1 if not.
+fn (c: mut &Checker) moveFieldOfDead(v: &Val, line: int): int {
+    let vx = v.root
+    if c.vars[vx].kind != VK_LOCAL || c.vars[vx].moved || c.vars[vx].cap >= 0 || len(c.cx.nomove) > 0 { return -1 }
+    if c.vars[vx].loops < len(c.cx.loops) { return -1 }
+    let t = c.vars[vx].t
+    if c.pg.tk(t) != sema.TK_INST || c.isCopy(t) || c.pg.isBorrowClass(t) { return -1 }
+    let d = c.pg.ta(t)
+    if c.pg.types[d].form != sx.F_RECORD || c.pg.types[d].drop >= 0 { return -1 }
+    var fname = v.path.clone()
+    if len(fname) > 0 && strByte(fname, len(fname) - 1) == 0 { fname = fname[..len(fname) - 1] }
+    for k in 0..len(fname) {
+        if strByte(fname, k) == 0 { return -1 }
+    }
+    let fi = c.fieldIndex(d, &fname)
+    if fi < 0 { return -1 }
+    c.liveSkip = v.nn
+    let live = c.isLive(vx, 0)
+    c.liveSkip = -1
+    if live { return -1 }
+    c.frozen(vx, FR_MOVE, line)
+    c.checkPending(vx, "", line, true)
+    let env = c.pg.declEnv(t)
+    let sep = if c.pg.types[d].value { "." } else { "->" }
+    let base = c.vars[vx].c
+    let n = c.fresh("mv")
+    c.emit(c.x.decl(c.T(v.t), &n, c.x.member(base, &sep, &("f_" + c.pg.types[d].fields[fi].name))))
+    var i = len(c.pg.types[d].fields) - 1
+    while i >= 0 {
+        let f = c.pg.types[d].fields[i].clone()
+        if i != fi { c.dropc(c.x.member(base, &sep, &("f_" + f.name)), c.pg.subst(f.ty, &env)) }
+        i -= 1
+    }
+    if !c.pg.types[d].value { c.emitx(c.x.call("rt_free", [base])) }
+    c.vars[vx].moved = true
+    return c.nm(&n)
 }
 
 fn (c: &Checker) gname(gk: int, gi: int): str {
@@ -2168,6 +2214,31 @@ fn (c: &Checker) selfInDrop(v: &Val, line: int) {
     }
 }
 
+// Var borrow vx, static so far, first borrows from root r: the checks bindBC makes for a var holding
+// borrows, then r is frozen while vx is live.
+fn (c: mut &Checker) firstBorrowRoots(vx: int, r: int, line: int) {
+    let name = "'" + c.vars[vx].name + "'"
+    if r == vx || !c.outlives(r, vx) {
+        c.err(line, "var " + name + " cannot borrow " + c.rootDesc(r) + ": " + c.rootDesc(r) +
+            " does not live as long as " + name)
+    }
+    if len(c.cx.loops) > c.vars[vx].loops {
+        for m in c.members(r) {
+            if m >= 0 && c.vars[m].mutable {
+                c.err(line, "var " + name + " first borrows the var '" + c.vars[m].name + "' inside a loop: give " +
+                    name + " its root before the loop (initialise it from a value that borrows '" +
+                    c.vars[m].name + "')")
+            }
+        }
+    }
+    for m in c.members(r) { c.frozen(m, FR_READ, line) }
+    c.vars[vx].broot = r
+    let d = c.vars[vx].depth
+    if d >= 0 && d < len(c.cx.scopes) {
+        append(mut &c.cx.scopes[d].freezes, Freeze{root: r, path: "", m: false, by: name, bv: c.nllVar(vx)})
+    }
+}
+
 // x = e, for var x of a shared borrow type (SPEC 10 rule 7): e must borrow from x's roots, which
 // its initializer gave and which stay frozen while x is live, or be static.
 fn (c: mut &Checker) storeBorrowVar(vx: int, e: int, op: &str, line: int) {
@@ -2180,13 +2251,17 @@ fn (c: mut &Checker) storeBorrowVar(vx: int, e: int, op: &str, line: int) {
         c.err(line, "cannot store a borrow of a temporary in var '" + vn + "': the temporary does not outlive " +
             "the statement")
     }
-    if r != R_FREE {
-        let have = if c.vars[vx].broot >= 0 { c.members(c.vars[vx].broot) } else { [] }
+    if r != R_FREE && c.vars[vx].broot < 0 {
+        // the first store that borrows something gives the roots (a static initializer has none), as
+        // for a var of a type holding borrows (bindBC)
+        c.firstBorrowRoots(vx, r, line)
+    } else if r != R_FREE {
+        let have = c.members(c.vars[vx].broot)
         for m in c.members(r) {
             if !hasInt(&have, m) {
-                let first = if c.vars[vx].broot >= 0 { c.rootDesc(c.vars[vx].broot) } else { "static data only" }
-                c.err(line, "var '" + vn + "' borrows " + first + ", so it cannot also borrow " + c.rootDesc(r) +
-                    " (a var keeps the roots of its initializer: give it one that borrows " + c.rootDesc(r) + ")")
+                c.err(line, "var '" + vn + "' borrows " + c.rootDesc(c.vars[vx].broot) + ", so it cannot also borrow " +
+                    c.rootDesc(r) + " (a var keeps the roots it first borrowed: initialise it from a value that " +
+                    "borrows both)")
             }
         }
     }
@@ -3686,7 +3761,10 @@ fn (c: mut &Checker) xField(e: int, exp: int): Val {
         c.err(n.line, n.s + " on a type is an associated function: call it")
     }
     let v = c.expr(n.a, -1)
-    return c.fieldOf(v, &n.s, n.line)
+    let local = c.kind(n.a) == sx.N_NAME && v.vvar >= 0 && !v.viaref
+    var r = c.fieldOf(v, &n.s, n.line)
+    if local && r.cat == CAT_PLACE { r.nn = n.a }
+    return r
 }
 
 // rc T (design/owned-str.md, SPEC 4.9): the value an rc handle holds, as a place rooted at the handle

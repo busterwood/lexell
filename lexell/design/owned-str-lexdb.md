@@ -291,3 +291,21 @@ directly (`&d.s`) where the other fields are written. A branch that borrows
 through another borrow (`if c { x } else { &d.b }` with `let x = &d.a`)
 freezes `d` whole.
 
+## 6. Consistency fixes (branch lang/consistency, 2026-11-18)
+
+Three rules that applied in one construct and not in its neighbours, made
+uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
+190, natively). All only accept more programs.
+
+| # | Change | Commit | lexdb compiles unchanged? | Behaviour change |
+|---|---|---|---|---|
+| AE | SPEC 9.1: a field of a local record (no drop method) that is not used afterwards moves out wherever it is read by value (`let s = h.name`, `f(h.name)`, `return h.name`, an element of a literal), as `move(h).name` would; AB's `match h.f` was one case of it. | (this commit) | yes | **Drop timing:** `h`'s other fields drop where the field moves out, not at the end of `h`'s scope. Only visible through `drop` methods with side effects. |
+| AF | SPEC 10 rule 5: a function with several borrowed parameters may return a shared borrow (`fn longer(a: &str, b: &str): &str`); the result borrows all its arguments, as a result holding borrows already did. A `mut &` result still needs exactly one. | (this commit) | yes | none |
+| AG | SPEC 10 rule 7: a `var` borrow initialised from a static string (`var s: &str = ""`) takes its roots from its first store that borrows something, as a `var` of a type holding borrows does (AC fixed the roots at the initializer). | (this commit) | yes | none |
+
+**What lexdb can remove:** clones made only to take a field out of a record
+that is not used again (`let name = rec.name.clone()` before `rec` goes out
+of use); helpers duplicated to return either of two borrowed strings; and
+`var best: &str = &first` initialisers invented only to give a `var` its
+roots (`""` now works).
+

@@ -887,11 +887,16 @@ it. The source then has no value until it is assigned again.
   assignable. Unbound fields are dropped at once, in reverse declaration
   order; the bound ones are bound in the order of the pattern.
 - Only a whole local variable or by-value parameter can be moved out of,
-  with one exception: a field of a temporary record (`make().name`). That
+  with two exceptions. A field of a temporary record (`make().name`): that
   temporary is taken apart as by `let P{name} = make()`: the field is moved
   out, the other fields are dropped at once, and the temporary is not dropped
-  again at the end of the statement. Moving out of a field of a variable, an
-  element, a borrow or a global is an error; use `replace`, `swap` or `pop`.
+  again at the end of the statement. And a field of a local record variable
+  without a `drop` method that is not used afterwards (`let s = h.name`,
+  `f(h.name)`, `return h.name`, with `h` used nowhere else in the statement
+  or after it, nor in a loop around it that it is declared outside of): it is
+  taken apart the same way, as `move(h).name` would be, and `h` is moved.
+  Moving out of a field of any other variable, an element, a borrow or a
+  global is an error; use `replace`, `swap` or `pop`.
 - Where the paths of an `if` (with or without `else`), a `match`, or an `if` or
   `match` expression join, a variable moved on some of the paths that reach the
   join but not on others is dropped at the end of each path that did not move
@@ -1035,10 +1040,12 @@ borrows, or a type parameter declared `borrow` (section 6.1).
 5. **Results.** A function whose result holds borrows has as its *sources*
    the parameters (and receiver) that are or hold borrows. A result that is a
    plain borrow has at most one, and a `mut &` result exactly one, a `mut &`
-   parameter. A method whose receiver is a borrow and that returns a plain
-   borrow has its receiver as its one source, whatever else it borrows: its
-   other borrowed parameters are only read (`m.at(&k)` borrows `m`, not
-   `k`). A function without sources may return only static borrows
+   parameter. A function with several borrowed parameters whose result is a
+   shared borrow has all of them as sources, as for a result holding borrows
+   (`fn longer(a: &str, b: &str): &str`: the result borrows both arguments).
+   A method whose receiver is a borrow and that returns a plain borrow has
+   its receiver as its one source, whatever else it borrows: its other
+   borrowed parameters are only read (`m.at(&k)` borrows `m`, not `k`). A function without sources may return only static borrows
    (string literals, constants, and the values of set-once globals, section
    5.2), and its result has no root. Every `return` (and every `try` that
    returns an `Err` holding borrows) must be rooted at its
@@ -1057,10 +1064,12 @@ borrows, or a type parameter declared `borrow` (section 6.1).
    be declared before the variable, in its block or around it. The first such
    store inside a loop that the variable is declared outside of may not take a
    `var` as a root. A `var` may also have a shared borrow type (`var best:
-   &str = &xs[0]`): its initializer gives its roots, every later store must
-   borrow from them or be static, and while the `var` is live its roots are
-   frozen whole (not just the place first borrowed). A `var` of a `mut &`
-   type is an error.
+   &str = &xs[0]`), with the same rule: the first value stored in it that
+   borrows something (its initializer, or a later store if the initializer is
+   static, such as `""`) gives its roots, every later store must borrow from
+   them or be static, and while the `var` is live its roots are frozen whole
+   (not just the place first borrowed). A `var` of a `mut &` type is an
+   error.
 
 A `match` on a place of an owned type whose arm binds a field as a borrow
 freezes the place's root (rule 4) while the binding is live.
