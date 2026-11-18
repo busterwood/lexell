@@ -6,7 +6,46 @@ run, newest first. Each run's detail (plans, profiles, what changed) stays
 in the design note it came from, linked from its row. When a suite is run
 again, add its row to section 4 and update section 1.
 
-## 1. Now (2026-11-15)
+## 1. Now (2026-11-18)
+
+**Refresh at `eababf57` (main), pinned (section 2), boost on as before;
+results in `~/Work/lexdb-bench/saved/results/2026-11-18-refresh/`.** The
+sections below (1.1 to 1.5) are the 2026-11-15 figures; what changed:
+
+| | 2026-11-15 | 2026-11-18 | PostgreSQL today |
+|---|---:|---:|---:|
+| point selects, 1 / 8 / 32 clients (1 process) | 80,100 / 133,900 / 128,400/s | **88,000 / 151,000 / 145,000/s** | 81,000 / 445,000 / 405,000/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients | 79,600 / 244,000-346,000 / 377,000/s | 87,000 / 334,000-340,000 / **401,000/s** | (4 cores) |
+| updates, 1 / 8 / 32 clients | 3,726 / 17,846 / 40,124/s | 3,691 / 16,687 / 38,711/s | 1,660 / 6,859 / 26,700/s |
+| mixed: replica selects / master updates | 317,000-319,000 / 16,500/s | 321,000-324,000 / 15,000-15,400/s | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.42 / 0.88-0.91 / 3.9-4.4 / 8.0-11.1 ms | 0.42 / **1.38-1.40** / 4.2-4.3 / 9.2-9.6 ms | |
+| replica lag under the mixed load, p50 / p99 | 0.23-0.26 / 0.80-1.27 ms | 0.26-0.29 / **0.39-0.46** ms | |
+| 35 analytic queries, lexdb / PG one core (CPU) / PG 4 processes (wall) | 0.78 / 1.30 (not pinned) | **0.63 / 1.19** (pinned; 25 of 35 level or ahead) | |
+| COPY wide / wide + 2 indexes / no key / 10M narrow (not pinned) | 1.48 / 7.11 / 3.29 / 5.32 s | 1.54 / 6.74 / 3.16 / 5.51 s | 1.79 / 4.54 / 1.32 / 5.53 s |
+| COPY peak RSS, wide / wide + 2 indexes | 583 / 1,181 MB | **758 / 1,638 MB** | |
+
+- **Updates** fell 52% at 32 clients with the owned-string migration
+  (`9aeeeadb`: a leaf copied for snapshots per update, each key and value
+  a malloc); restored by `eababf57` (keys one counted array, values each
+  counted). Before it: 19,300/s at 32 clients.
+- **Commit latency p99** rose 0.81 to 1.39 ms with the migration (the
+  pre-migration binary measured today: 0.80-0.82); `eababf57` brought the
+  max back (15-18 to 9.2-9.6 ms), not p99. Not resolved.
+- **COPY's peak memory** rose about 30% with the migration (580 to 740 MB
+  wide, 1,178 to 1,582 MB with indexes, measured today on the old and new
+  binaries; `eababf57` adds 2-4%); the time is level. A leaf's keys and
+  values were slices of one string (one allocation a page, 9.13) and are
+  now each their own. Not resolved.
+- **Aggregates** (1.3): vspg runs them after the update rounds, and they
+  overlap that load's checkpoints (q4 36 to 59 ms, q5 49 to 59 ms over the
+  rounds). On a settled server lexdb is faster than before the migration
+  (q4 30.5 against 37.5 ms, q5 22.0 against 26.5): measure them settled.
+- **The analytic data:** `la/base2` (2026-11-15) holds a page in the
+  T_LEAF format, which lexdb no longer reads since 5808f012 (it gives
+  "page 23349: type 2"); `la/base3` is the same data loaded by the
+  current binary (results checked against PostgreSQL's).
+
+## 1.0 As of 2026-11-15
 
 lexdb at `exp/ckpt-incremental` (checkpoints from a cut, lexdb.md 9.136)
 for sections 1.1 to 1.3, pinned (section 2: both servers on the same four
@@ -259,6 +298,8 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-18 | eababf57 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 88k / 151k / 145k/s (+10-14%); replicas 401k/s at 32 clients (PG 405k); updates 3,691 / 16,687 / 38,711/s after restoring the 32-client rate (19,300/s at aaadeb1e: owned-string regression); commit p99 1.38-1.40 ms (0.81 before the migration, unresolved) | this page, 1 |
+| 2026-11-18 | eababf57 | analytic queries (pinned), bulk loads | 35 queries: lexdb / PG one core 0.63 (CPU), / PG 4 processes 1.19 (wall); COPY level in time, peak RSS +30% since the migration | this page, 1 |
 | 2026-11-18 | aaadeb1e | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 0.98 (geometric mean, wall; first below 1); summed 12.98 s against PG's 13.96 s; the runtime's short-string compare (rt_str_cmp): -4.0% wall, q19 -11%, q3 -10%, q21 -9%; worst q19 2.3×, q20 2.2×, q11 1.9×, q22 1.8× | this page, 1.6 |
 | 2026-11-18 | 89cf0a59 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.03 (geometric mean, wall); summed 13.52 s against PG's 13.96 s (lexdb's first sum below PG's); q7 -21%, q21 -15% (hash cut by the next hash), q22 -46% instructions (IN over an expression); worst q19 2.6×, q20 2.3×, q11 2.1×, q22 1.9× | this page, 1.6; lexdb-layers.md 6.2.13 |
 | 2026-11-18 | 48c22c45 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.05 (geometric mean, wall; was 2.48), 9 of 22 level or ahead; summed 14.08 s against PG's 13.96 s; worst q19 2.5×, q20 2.3×, q11 2.1×, q7 2.0× | this page, 1.6 |

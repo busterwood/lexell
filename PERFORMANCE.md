@@ -1090,21 +1090,22 @@ and SQL Server 2022 on this machine's bare-metal Linux (2026-11-15). The
 full record, its host, rules and history, and how to run each suite:
 [design/lexdb-benchmarks.md](lexell/design/lexdb-benchmarks.md).
 PostgreSQL is capped at 4 processes, lexdb's shape (a master and 3 read
-replicas); all figures warm. The first four rows are pinned: each server
-on the same four physical cores, the clients on the other four.
+replicas); all figures warm. Refreshed 2026-11-18 at `eababf57` (pinned:
+each server on the same four physical cores, the clients on the other four;
+the COPY rows unpinned, as before).
 
 | | lexdb | PostgreSQL |
 |---|---:|---:|
-| pgbench point selects, 32 clients (lexdb: 3 read replicas) | 376,000-377,700/s | 386,600/s |
-| pgbench updates, 8 clients | **17,846/s** | 6,793/s |
-| an update's commit latency, p99 / max (8 clients) | 0.88 / 8-11 ms | |
-| a commit visible on the read replicas, p50 / p99 | 0.23-0.26 / 0.80-1.27 ms | |
+| pgbench point selects, 32 clients (lexdb: 3 read replicas) | **401,000/s** | 404,600-408,700/s |
+| pgbench updates, 8 clients | **16,687/s** | 6,859/s |
+| an update's commit latency, p99 / max (8 clients) | 1.38-1.40 / 9.2-9.6 ms (p99 0.81 before the owned-string migration) | |
+| a commit visible on the read replicas, p50 / p99 | 0.26-0.29 / 0.39-0.46 ms | |
 | single-row autocommit inserts, 1 client | **3,843/s** (0.26 ms) | 1,577/s (0.63 ms) |
 | `count(*)`, 1M rows | **3.9 ms** | 19.4 (one core), 12.1 (4 processes) |
-| 35 analytic queries, geometric mean of lexdb's time over PG's | 0.78 against one core, 1.30 against 4 processes | |
+| 35 analytic queries, geometric mean of lexdb's time over PG's | **0.63** (CPU) against one core, 1.19 against 4 processes | |
 | TPC-H derived, SF1, 22 queries: geometric mean of lexdb's time over PG's (pinned, boost off, 2026-11-18, `aaadeb1e`; PG's from 2026-11-16) | **0.98** against one core (2.48 at `94536d12`, 3.77 at `1744ef99`); summed **12.98 s** against PG's 13.96 s | |
-| COPY of 1M wide rows (12 columns) | **1.48 s** | 1.79 s (SQL Server bcp 3.34 s) |
-| COPY of 10M narrow rows | **5.32 s** | 5.81 s (bcp 10.86 s) |
+| COPY of 1M wide rows (12 columns) | **1.54 s** | 1.79 s (SQL Server bcp 3.34 s) |
+| COPY of 10M narrow rows | 5.51 s | 5.53 s (bcp 10.86 s) |
 
 ## Reproducing
 
