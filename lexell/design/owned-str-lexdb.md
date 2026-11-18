@@ -297,11 +297,11 @@ freezes `d` whole.
 - UTC: `lexdb_time.utc()` now lends one zone from a set-once global
   (`var UTC_ZONE: once Zone`); callers that stored a zone clone it, which
   copies nothing (its strings are literals). `envZone` lends the session's
-  zone or UTC instead of copying one per call. Set-once globals are not
-  safe to set from two tasks at once (`set` is not atomic: the second stops
-  the program), so `lexdb_store`'s open sets `UTC_ZONE`, the zone registry
-  and the dictionary pool before any task starts (`initGlobals`); the lazy
-  set in each getter remains for programs that never open a store.
+  zone or UTC instead of copying one per call. `UTC_ZONE` is set on first
+  use. (fea3ca7a also set it, the zone registry and the dictionary pool at
+  store open, believing two tasks could race to set one; they cannot: tasks
+  run on one thread and `set` does not park, and `par.map` kernels may not
+  touch set-once globals. That was removed again.)
   `compare()` keeps its zone-free date/timestamp path (`timeCmpLocal`): it
   is faster than any zone.
 - The access layer's cursors are back in their natural order
