@@ -411,8 +411,9 @@ expected, so a variable may still be named `rc`.
   - `for x in r`;
   - a handle passed, returned or bound where a `&T` is expected, which lends
     the value;
-  - a handle passed to a value parameter of the value's type (an intrinsic
-    such as `strByte(r, 0)`, or a copy type), which reads the value.
+  - a handle passed to a value parameter of a copy type, which reads the
+    value (an intrinsic's or extern's string parameter is a `&T` one:
+    `strByte(r, 0)`).
   These reads are places rooted at the handle, so a borrow of the value
   keeps the handle alive (section 10).
 - **The value is immutable through a handle.** Assigning to it, mutably
@@ -1121,7 +1122,7 @@ library-only intrinsics, `intoPtr` and `fromPtr`, are in section 15.
 ## 12. C interop
 
 ```lxl
-extern "sqlite3" fn sqlite3_open(path: str, out: mut &ptr): i32
+extern "sqlite3" fn sqlite3_open(path: &str, out: mut &ptr): i32
 extern "c" fn getpid(): i32
 ```
 
@@ -1140,7 +1141,8 @@ named), or a name of the form the compiler generates (`f1_x`, `g1_x`, `k1_x`,
 an underscore).
 
 Parameter and result types are limited to integers, `float`, `bool`, `ptr`,
-`mut &ptr`, `mut &int` and `str`; a parameter may also be an array or a slice
+`mut &ptr` and `mut &int`, a `&str` parameter and a `str` result; a parameter
+may also be an array or a slice
 of integers, `float` or `ptr` (`&[]T`, `mut &[]T`, `&[T]`, `mut &[T]`; `bool`
 elements read-only), passed as a pointer to the elements and borrowed as for
 any call (section 10): the pointer is valid during the call only, C gets no
@@ -1148,7 +1150,9 @@ length (pass `len(a)` as another argument), and with `mut` C may write the
 elements. An empty array or slice passes a valid pointer, never NULL, to no
 elements. A `str` result copies a NUL-terminated
 `char *` the C function returns (a NULL result gives `""`); the C memory is
-not freed. A `str` argument is passed as
+not freed. C only reads a string it is given, so a string parameter is
+`&str` (a `str` parameter is an error: C cannot take ownership of a Lexell
+string), borrowed as for any `&T` parameter (`f(s)` lends `s`). It is passed as
 a NUL-terminated pointer valid for the call (the runtime copies the bytes
 when the string is a substring without a NUL after it), and stops the program if it
 contains a NUL byte (exit code 12). `strFromC(p: ptr): str` copies a

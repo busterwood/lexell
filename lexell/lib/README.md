@@ -1986,7 +1986,9 @@ attributes, `hardbreaks` and `nobreaks`.
 
 ## What the library uses
 
-Intrinsics: `strByte`, `strSlice`, `strFromBytes`, `strToBytes`, `intToStr`,
+Intrinsics (each string they read is a `&str` parameter: `strByte(s: &str, i: int)`;
+they are passed as any `&T` argument is, so the caller keeps its string): `strByte`,
+`strSlice`, `strFromBytes`, `strToBytes`, `intToStr`,
 `i128ToStr`, `u128ToStr`, `u64ToStr`, `floatToStr`, `parseFloat`, `writeFd`,
 `readFile`, `args`, `getenv`, `strFromC`, `strFindByte`, `strFindAny`,
 `strFind` and `strFindPair` (the first index at or after `from` of a byte,
