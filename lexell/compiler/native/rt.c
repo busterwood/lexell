@@ -164,15 +164,23 @@ static int str_eqn(const char* a, const char* b, size_t n) {
    EXPERIMENT (design/runtime-memory.md 8): the free lists moved from the heap into the chunk, and
    a chunk is retired whole when its last live block is freed. The intent is to return memory with
    no scan: a wholly free chunk's blocks are all in its own lists, so it can be detached from the
-   heap's per-class chunk lists without walking them. The last large block freed, up to KEEP bytes,
-   is kept for the next large malloc it fits, as before. */
+   heap's per-class chunk lists without walking them.
+
+   Freed large blocks of up to KEEP bytes each are kept in a small pool per heap (POOL blocks, at
+   most POOL_MAIN bytes in all on the main thread's heap, KEEP on a worker's), the oldest unmapped
+   first when it is full. A large malloc, or a large block's growth in realloc, takes the smallest
+   kept block of its size to twice its size, so a vector built by doubling again and again reuses
+   the blocks of the last one instead of mapping and faulting fresh pages. The idle trim unmaps
+   the main heap's pool. */
 
 #define NCLASS 40
 #define LARGE_MARK 0xff                 /* a large block's class byte */
 static size_t class_size[NCLASS];
 #define CHUNK ((size_t)2 << 20)          /* a huge page (HUGE) */
 #define LARGE (1 << 16)
-#define KEEP ((size_t)32 << 20)
+#define KEEP ((size_t)32 << 20)          /* the largest freed large block kept */
+#define POOL 8                           /* freed large blocks kept per heap */
+#define POOL_MAIN ((size_t)64 << 20)     /* their bytes at most, the main thread's heap */
 /* A thread's heap (design/parallel.md 2.2). The main thread's is rt_mheap; each par worker has
    its own in its context (rt_wctx). A block's header word is its class (or LARGE_MARK) in the
    low 8 bits and its owner's tag in the other 56: 0 for the main thread, a fresh tag for each
@@ -188,7 +196,9 @@ typedef struct rt_hp {
     rt_chunk* queue;                /* chunks with no live block, to retire */
     int64_t queued;                 /* the queue's length */
     void* legacy[NCLASS];           /* blocks freed here whose chunk another heap owns */
-    size_t* large_kept;             /* the kept mapping (its size in word 0), or 0 */
+    size_t* pool[POOL];             /* freed large blocks kept (size in word 0), oldest first */
+    int npool;
+    size_t pool_bytes;
     uint64_t tag;                   /* the owner tag written into each block's header */
 } rt_hp;
 struct rt_chunk {
@@ -337,13 +347,28 @@ static int class_of(size_t n) {
         if (class_size[i] >= n) return i;
     return -1;
 }
+/* The kept block that best fits a large block of m bytes (mapping size): the smallest of m to
+   2m, taken out of the pool; or 0. The pool's code is cold, out of the way of the hot paths
+   (where the runtime's code lies moves the allocator's speed: gen_rtx.py). */
+__attribute__((noinline, cold)) static size_t* pool_take(rt_hp* h, size_t m) {
+    int b = -1;
+    for (int i = 0; i < h->npool; i++) {
+        size_t s = h->pool[i][0];
+        if (s >= m && s / 2 <= m && (b < 0 || s < h->pool[b][0])) b = i;
+    }
+    if (b < 0) return 0;
+    size_t* k = h->pool[b];
+    h->pool_bytes -= k[0];
+    h->npool--;
+    for (int i = b; i < h->npool; i++) h->pool[i] = h->pool[i + 1];
+    return k;
+}
 /* The large blocks, out of line: the small classes' paths in malloc and free stay straight. */
 __attribute__((noinline)) static void* malloc_large(rt_hp* h, size_t need) {
     size_t m = (need + 16 + 4095) & ~(size_t)4095;
     if (m < need) return 0;
-    size_t* k = h->large_kept;
-    if (k && k[0] >= m && k[0] / 2 <= m) {
-        h->large_kept = 0;
+    size_t* k = pool_take(h, m);
+    if (k) {
         k[1] = LARGE_MARK | h->tag << 8;
         return (char*)k + 16;       /* k[0] stays its mapping size */
     }
@@ -358,14 +383,32 @@ __attribute__((noinline)) static void* malloc_large(rt_hp* h, size_t need) {
     ((size_t*)p)[1] = LARGE_MARK | h->tag << 8;
     return p + 16;
 }
-__attribute__((noinline)) static void free_large(rt_hp* h, size_t* k) {
-    if (k[0] <= KEEP) {
-        size_t* old = h->large_kept;
-        h->large_kept = k;
-        k = old;
-        if (!k) return;
+/* A freed large block goes into the pool, and the oldest kept blocks out of it (unmapped) while
+   it holds more than POOL blocks or its heap's bytes. */
+__attribute__((noinline, cold)) static void pool_put(rt_hp* h, size_t* k) {
+    size_t cap = h == &rt_mheap ? POOL_MAIN : KEEP;
+    while (h->npool == POOL || (h->npool && h->pool_bytes + k[0] > cap)) {
+        size_t* o = h->pool[0];
+        h->pool_bytes -= o[0];
+        h->npool--;
+        for (int i = 0; i < h->npool; i++) h->pool[i] = h->pool[i + 1];
+        SYS(S_MUNMAP, o, o[0], 0);
     }
-    SYS(S_MUNMAP, k, k[0], 0);
+    h->pool[h->npool++] = k;
+    h->pool_bytes += k[0];
+}
+/* A block over KEEP is unmapped at once. */
+__attribute__((noinline)) static void free_large(rt_hp* h, size_t* k) {
+    if (k[0] <= KEEP) pool_put(h, k);
+    else SYS(S_MUNMAP, k, k[0], 0);
+}
+/* Unmap a heap's kept large blocks (the idle trim). */
+static void pool_release(rt_hp* h) {
+    while (h->npool) {
+        size_t* o = h->pool[--h->npool];
+        SYS(S_MUNMAP, o, o[0], 0);
+    }
+    h->pool_bytes = 0;
 }
 /* The main thread's paths test one word (rt_par_span: 0 until the pool starts) and then work on
    rt_mheap at fixed addresses, as before there were workers. A block popped from the main thread's
@@ -489,6 +532,13 @@ void* realloc(void* p, size_t n) {
         size_t* k = (size_t*)((char*)p - 16);
         size_t m = (n + 16 + 4095) & ~(size_t)4095;
         if (m < n) return 0;
+        rt_hp* h = rt_hp_me();
+        size_t* q = pool_take(h, m);        /* a kept block: a copy, but no fresh pages to fault */
+        if (q) {
+            memcpy(q + 1, k + 1, have + 8);     /* the header word (its owner's tag) and the bytes */
+            free_large(h, k);
+            return q + 2;
+        }
         i64 r = sys6(S_MREMAP, (i64)k, (i64)k[0], (i64)m, 1, 0, 0);    /* MREMAP_MAYMOVE */
         if (r < 0 && r > -4096) return 0;
         ((size_t*)r)[0] = m;
@@ -2589,8 +2639,9 @@ static void rt_spin_note(int64_t took) {
         if (in * 5 >= n * 4) { rt_spin_cur = w; return; }
     }
 }
-/* When the heap is idle: the retire queue is drained after this long with nothing to run
-   (LXL_TRIM_MS, default 300 ms); LXL_TRIM=0 turns it off. */
+/* When the heap is idle: the retire queue is drained (when it holds 4 chunks or more), and the
+   kept large blocks unmapped, after this long with nothing to run (LXL_TRIM_MS, default 300 ms);
+   LXL_TRIM=0 turns it off. */
 static int rt_trim_on = -1;
 static int64_t rt_trim_delay;
 static int64_t rt_idle_from;
@@ -2638,18 +2689,21 @@ static void rt_poll(bool block, const char* w) {
         }
         if (wait < 0 && !rt_nio && !rt_njobs) rt_trap(14, "deadlock: every task is parked", w);
         if (rt_trim_on < 0) rt_trim_cfg();
-        if (!block || rt_rq_head || !rt_trim_on || rt_mheap.queued < 4) {
+        if (!block || rt_rq_head || !rt_trim_on || (rt_mheap.queued < 4 && !rt_mheap.npool)) {
             rt_idle_from = 0;
         } else if (rt_nio || rt_njobs) {
             int64_t now = rt_mono();
             if (!rt_idle_from) rt_idle_from = now;
             int64_t idle = now - rt_idle_from;
             if (idle >= rt_trim_delay) {
-                int64_t until = now + 250000;            /* at most 250 us of retiring */
-                while (rt_mheap.queue && lxllib_heaptrim() && rt_mono() < until) {}
-                if (rt_mheap.queue) {
-                    int64_t cap = 5 * 1000000;           /* drain the rest while idle */
-                    if (wait < 0 || wait > cap) wait = cap;
+                pool_release(&rt_mheap);                 /* a few munmaps */
+                if (rt_mheap.queued >= 4) {
+                    int64_t until = now + 250000;        /* at most 250 us of retiring */
+                    while (rt_mheap.queue && lxllib_heaptrim() && rt_mono() < until) {}
+                    if (rt_mheap.queue) {
+                        int64_t cap = 5 * 1000000;       /* drain the rest while idle */
+                        if (wait < 0 || wait > cap) wait = cap;
+                    }
                 }
             } else {
                 int64_t rem = rt_trim_delay - idle;
