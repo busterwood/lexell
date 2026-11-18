@@ -147,3 +147,36 @@ look, but owned strings did not shape them.
 2. Finding 1's decode in the leaf.
 3. Finding 4's table cache (point selects).
 4. Finding 3, then finding 2, with the executor redesign.
+
+## Done
+
+**Step 1 (2026-11-18).**
+- Finding 1's key views: `getMany`, `warm` and `lookupAhead` take
+  `&[]&str`. `fetchMany` and `rangeMany` pass views of the probe keys
+  instead of copies. `getMany` compares keys through `Node.keyView`.
+- Finding 5, text keys: GROUP BY on one text column looks up the batch's
+  own value and copies it only for a new group.
+- Finding 7: a column-to-column comparison (`BNode.VCmp`) reads value
+  columns in place (`bCmpCols`). A composite group key encodes a value
+  column in place (`bKeyEnc`) instead of encoding a copy.
+
+Instructions per query against main (165bd30b), each query counted once
+after a warm-up: all 22 down 1.67%. The largest drops are q21 −4.97%,
+q1 −3.19%, q12 −2.54% and q4 −1.43%; none went up. Point selects:
+207,452 to 207,456 per statement (unchanged; nothing here is on their
+path). Checksums unchanged, suite 190, quick gate PASS. Wall times were
+not usable: four other processes held CPUs 12 to 15 at 100% during the
+runs.
+
+**Left out of step 1, and why:**
+- Finding 6's `text()`, `bpTrim` and `Node.key`: by time they are 0.04%
+  of TPC-H. A point select's 0.5% in `text()` is numbers and dates being
+  formatted (text values are written from the batch already).
+- Finding 7's `bxEval`: its leaf clones feed `binOp` and call arguments,
+  which take values. 0.4% of TPC-H; finding 2 removes most of it.
+- Finding 5's composite keys (GROUP BY and hash join): one reused buffer
+  needs a `&str` view of a `StrBuf`'s bytes, or appending to a `str` in
+  place. The language has neither. `s += x` copies the whole string each
+  time: 100,000, 200,000 and 400,000 one-byte appends take 0.07 s, 0.31 s
+  and 1.22 s, so it is quadratic (owned-str.md 2.1 says a string with
+  one owner may be appended to in place).
