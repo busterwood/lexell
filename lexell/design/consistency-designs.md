@@ -61,6 +61,22 @@ Also, `Set`'s `union`/`filter` build a set from two others inside closures,
 and a `var`'s fixed roots (rule 7) cannot express "what a or b borrows".
 Point 3 (boxed constants) is not done yet.
 
+**Then (2026-11-18): interfaces through a borrow type** (the second limit):
+`&U` satisfies the interfaces `U` does when none needs `mut &Self`; generic
+code calls `U`'s methods on the borrowed value. `sort`, `dedup`, `equal`,
+`contains`, `find`, `min` and `max` take `borrow` type parameters, so a
+`[]&str` of views can be sorted, deduplicated and compared. A borrow of a
+non-copy value passed for a `borrow` type parameter keeps `T` the borrow
+(`max(ws[0], ws[1])` is `max[&str]`).
+Still open, found doing it:
+- **No `&&T`.** Borrowing a borrow re-borrows it (`&g` with `g: &str` is a
+  `&str`), so a generic `&T` parameter cannot be passed a value when `T` is
+  itself a borrow (`contains(&ws, &x)` with `ws: []&str`). Rust has `&&str`.
+- **Inference from the expected type first.** In `max(a, b) + "!"` the `+`
+  expects a `str`, so `T = str` and the arguments would be moved; write
+  `max[&str](...)` or bind the result first.
+- **Lending** (the first limit) is unchanged: `Map[&str, V]` waits for it.
+
 ## Finding 5: `s[a..b]` is always a view
 
 **Now.** SPEC 4.1: `s[a..b]` is a view (`&str`) where a `&str` is expected

@@ -753,7 +753,9 @@ does; a type parameter has it when its constraints give it):
   ones; strings are quoted.
 
 So such a type satisfies `Eq`, `Hash` and `Show`, can be a `Map` key and can
-be printed. A declared method always wins. `cmp` is not derived: an order by
+be printed. A shared borrow `&U` satisfies the interfaces `U` satisfies,
+except one whose methods take `mut &Self`: its methods are `U`'s, on the
+borrowed value (so a `[]&str` can be sorted with `sort`). A declared method always wins. `cmp` is not derived: an order by
 declaration is not always meaningful, so `<` and the other comparisons still
 need `cmp`. A compound assignment `a += b` means `a = a + b`
 with `a` evaluated once: the index expressions in `a` run once, before `b`, and,
