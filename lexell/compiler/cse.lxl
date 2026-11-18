@@ -45,6 +45,7 @@ type Avail = value record {
     sid: int        // the statement it is in
     dead: bool      // something it reads may have changed
     mask: int       // a bit per local it names (by canon, mod 62)
+    held: bool      // made by held (not counted against MAX_AVAIL's candidates)
 }
 
 type Cse = record {
@@ -61,13 +62,15 @@ type Cse = record {
     sid: int
     n: int                  // reuses
     dry: bool
+    inCand: int             // visit: the candidates (cand) the expression being visited is in
+    nHeld: int              // the entries of avail that held made (at most MAX_AVAIL of them)
 }
 
 // The program p with repeated loads in straight-line code read once.
 pub fn optimize(p: ir.Ir): ir.Ir {
     let ev = os.envOr("LXL_CSE", "")
     if ev == "0" { return p }
-    var o = Cse{u: p, pureFn: [], idxFn: -1, taken: [], canon: [], copies: [], avail: [], blks: [], cb: -1, cp: 0, sid: 0, n: 0, dry: ev == "dry"}
+    var o = Cse{u: p, pureFn: [], idxFn: -1, taken: [], canon: [], copies: [], avail: [], blks: [], cb: -1, cp: 0, sid: 0, n: 0, dry: ev == "dry", inCand: 0, nHeld: 0}
     for f in 0..o.u.nRtFuncs {
         let name = o.u.funcs[f].name.clone()
         append(mut &o.pureFn, pureName(&name))
@@ -99,6 +102,7 @@ fn pureName(name: &str): bool {
 
 fn (o: mut &Cse) function(body: int) {
     o.avail = []
+    o.nHeld = 0
     o.resetCanon()
     o.u.nodes[body].a = o.seq(o.u.nodes[body].a)
 }
@@ -165,7 +169,9 @@ fn (o: mut &Cse) body(x: int): int {
 }
 
 fn (o: mut &Cse) cut(n: int) {
-    while len(o.avail) > n { pop(mut &o.avail) }
+    while len(o.avail) > n {
+        if pop(mut &o.avail).held { o.nHeld -= 1 }
+    }
 }
 
 fn (o: mut &Cse) killAll() {
@@ -185,6 +191,7 @@ fn (o: mut &Cse) killLocal(l: int) {
     let bit = 1 << (l % 62)
     for i in 0..len(o.avail) {
         if !o.avail[i].dead && o.avail[i].mask & bit != 0 && o.names(o.avail[i].x, l) { o.avail[i].dead = true }
+        if o.avail[i].t == l { o.avail[i].dead = true }        // the local holding it (held)
     }
     if o.canon[l] >= 0 { o.canon[l] = -1 }
     for j in 0..len(o.copies) {
@@ -236,6 +243,7 @@ fn (o: mut &Cse) stmt(s: int, bi: int, i: int) {
         }
         o.visit(n.b, false, false)
         o.killLocal(n.a)
+        o.held(n.a, n.b)
         if n.b >= 0 && o.u.nk(n.b) == ir.E_LOCAL && !o.taken[n.a] && !o.taken[o.u.nodes[n.b].a] &&
             o.u.nodes[n.b].ty == o.u.locals[n.a].ty {
             o.canon[n.a] = o.canonOf(o.u.nodes[n.b].a)
@@ -399,7 +407,10 @@ fn (o: &Cse) rtFn(x: int): int {
 fn (o: mut &Cse) visit(x: int, cond: bool, lv: bool) {
     if x < 0 { return }
     let k = o.u.nodes[x].k
-    if !lv && o.cand(x) {
+    let cd = !lv && o.cand(x)
+    if cd || (!lv && o.inCand == 0 && o.oneLoad(x)) {
+        // one load is looked for (held may have it in a local) but not made available here, nor
+        // reused inside a larger candidate (which then would not compare the same as itself later)
         let h = o.hash(x)
         for i in 0..len(o.avail) {
             let a = o.avail[i]
@@ -408,10 +419,16 @@ fn (o: mut &Cse) visit(x: int, cond: bool, lv: bool) {
                 return
             }
         }
-        if !cond && len(o.avail) < MAX_AVAIL {
-            append(mut &o.avail, Avail{x: x, h: h, t: -1, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x)})
+        if cd && !cond && len(o.avail) - o.nHeld < MAX_AVAIL {
+            append(mut &o.avail, Avail{x: x, h: h, t: -1, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: false})
         }
     }
+    if cd { o.inCand += 1 }
+    o.kidsOf(x, k, cond)
+    if cd { o.inCand -= 1 }
+}
+
+fn (o: mut &Cse) kidsOf(x: int, k: int, cond: bool) {
     let a = o.u.nodes[x].a
     let b = o.u.nodes[x].b
     if k == ir.E_MEMBER || k == ir.E_ADDR || k == ir.E_DECAY {
@@ -430,6 +447,28 @@ fn (o: mut &Cse) visit(x: int, cond: bool, lv: bool) {
         o.visit(a, cond, false)
         o.visit(b, cond, false)
     }
+}
+
+// `T t = X;` with X one load of a scalar (`*(p + i)`, `s->f`: not worth a local of its own, cand)
+// and t a local whose address is never taken, of X's type: X is available in t (its holder) for
+// the rest of t's block, until t, a local X names or memory may change. A later X in the run
+// reads t: no new local, the load not repeated (a byte tested in both arms of a branch).
+fn (o: mut &Cse) held(t: int, x: int) {
+    if x < 0 || o.taken[t] || o.nHeld >= MAX_AVAIL || !o.oneLoad(x) { return }
+    if o.u.nodes[x].ty != o.u.locals[t].ty || o.names(x, t) { return }
+    append(mut &o.avail, Avail{x: x, h: o.hash(x), t: t, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: true})
+    o.nHeld += 1
+}
+
+// Whether x is a scalar read through exactly one load (no bounds check, no call but checks).
+fn (o: &Cse) oneLoad(x: int): bool {
+    let k = o.u.nk(x)
+    if k != ir.E_MEMBER && k != ir.E_DEREF { return false }
+    let tk = o.u.tk(o.u.nodes[x].ty)
+    if !(tk >= ir.TY_BOOL && tk <= ir.TY_U64 || tk == ir.TY_PTR) { return false }
+    var loads = 0
+    var idx = false
+    return o.plain(x, mut &loads, mut &idx) && loads == 1 && !idx
 }
 
 // Whether x is worth a local: a scalar or pointer (no float, no 128-bit integer) read through
