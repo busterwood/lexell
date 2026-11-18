@@ -1,0 +1,235 @@
+// bfold: a bool computed by an if-chain and then only tested to jump, in the IR after loops and
+// before cse, under -O (design/native.md, section 4). The checker's && and || (logic()) reach
+// the IR as a bool local assigned and then tested; a loop condition `i < n && (p(s[i]) || ..)`
+// whose right operand needs statements (the inlined load of s[i]) becomes
+//
+//     bool b = A;  if (b) { S; b = V; }  [bool c = b;]  if (!c) break;
+//
+// The native code generator folds `bool b = A; if (b) { b = V; }` into one condition itself
+// (x64gen simplify, (1)), but not with statements S in the then part: there b is made as 0 or
+// 1, copied, and tested. Here the jump is moved into the branches (the right operand is tested
+// where it is computed), and b goes:
+//
+//     and, jump when false:  if (!A) J;  { S; if (!V) J; }
+//     and, jump when true:   if (A) { S; if (V) J; }
+//     or (`if (!b)`), when false:  if (!A) { S; if (!V) J; }
+//     or, when true:         if (A) J;  { S; if (V) J; }
+//
+// J is a break or a continue (its target unchanged: no loop or switch is entered or left). The
+// same evaluations in the same order: A first; S and V only when A says so, as before; the jump
+// taken exactly when it was. b is named only in the declaration, the first condition, the
+// assignment and the copy or test after (so S and V do not name it and its address is never
+// taken), and the copy c only in the test. A rewrite can bring `bool b2 = ..; if (!b2) {..};`
+// next to the new `if (!V) J` (V is b2): a list is rewritten before the statements in it.
+// LXL_BFOLD=0 turns the pass off; LXL_BFOLD=v prints the count.
+
+import "os"
+
+import "./ir"
+
+type Bf = record {
+    u: ir.Ir
+    uses: []int             // per local: the E_LOCAL nodes naming it in the function bodies
+    n: int                  // rewrites
+}
+
+// The program p with the bools that are only tested to jump folded into the jumps.
+pub fn optimize(p: ir.Ir): ir.Ir {
+    let ev = os.envOr("LXL_BFOLD", "")
+    if ev == "0" { return p }
+    var o = Bf{u: p, uses: [], n: 0}
+    for l in 0..len(o.u.locals) { append(mut &o.uses, 0) }
+    for f in 0..len(o.u.funcs) { o.count(o.u.funcs[f].body) }
+    for f in o.u.nRtFuncs..len(o.u.funcs) { o.stmt(o.u.funcs[f].body) }
+    if ev == "v" { eprintln("bfold: " + intToStr(o.n) + " tests folded into jumps") }
+    return replace(mut &o.u, ir.newIr())
+}
+
+// Counts the names of locals in the tree x.
+fn (o: mut &Bf) count(x: int) {
+    if x < 0 { return }
+    let k = o.u.nodes[x].k
+    if k == ir.E_LOCAL {
+        let a = o.u.nodes[x].a
+        o.uses[a] = o.uses[a] + 1
+        return
+    }
+    let kd = ir.KIDS[k]
+    let na = o.u.nodes[x].a
+    let nb = o.u.nodes[x].b
+    let nc = o.u.nodes[x].c
+    let nd = o.u.nodes[x].d
+    if kd == ir.K_A {
+        o.count(na)
+    } else if kd == ir.K_AB {
+        o.count(na)
+        o.count(nb)
+    } else if kd == ir.K_ABC {
+        o.count(na)
+        o.count(nb)
+        o.count(nc)
+    } else if kd == ir.K_CALL {
+        o.count(na)
+        o.countList(nb)
+    } else if kd == ir.K_CLIT {
+        o.countList(nb)
+    } else if kd == ir.K_BLOCK {
+        o.countList(na)
+    } else if kd == ir.K_DECL {
+        o.count(nb)
+        o.countList(nc)
+    } else if kd == ir.K_FOR {
+        o.count(na)
+        o.count(nb)
+        o.count(nc)
+        o.count(nd)
+    }
+}
+
+fn (o: mut &Bf) countList(l: int) {
+    if l < 0 { return }
+    for j in 0..o.u.listLen(l) { o.count(o.u.listAt(l, j)) }
+}
+
+// The statement x: its lists rewritten, then the statements in them.
+fn (o: mut &Bf) stmt(x: int) {
+    if x < 0 { return }
+    let k = o.u.nodes[x].k
+    if k == ir.S_BLOCK {
+        let l = o.u.nodes[x].a
+        var j = 0
+        while j < o.u.listLen(l) {
+            if o.fold(l, j) { o.n += 1 }
+            j += 1
+        }
+        for i in 0..o.u.listLen(l) { o.stmt(o.u.listAt(l, i)) }
+    } else if k == ir.S_IF {
+        o.stmt(o.u.nodes[x].b)
+        o.stmt(o.u.nodes[x].c)
+    } else if k == ir.S_WHILE || k == ir.S_SWITCH {
+        o.stmt(o.u.nodes[x].b)
+    } else if k == ir.S_FOR {
+        o.stmt(o.u.nodes[x].a)
+        o.stmt(o.u.nodes[x].d)
+    }
+}
+
+// Statement s without the blocks of one statement around it.
+fn (o: &Bf) lone(s: int): int {
+    var b = s
+    while b >= 0 && o.u.nk(b) == ir.S_BLOCK && o.u.listLen(o.u.nodes[b].a) == 1 { b = o.u.listAt(o.u.nodes[b].a, 0) }
+    return b
+}
+
+// Whether local l is a bool the loop optimisations left alone.
+fn (o: &Bf) plainBool(l: int): bool {
+    return o.u.tk(o.u.locals[l].ty) == ir.TY_BOOL && o.u.hoisted.getOr(&l, -1) < 0 && o.u.strHd.getOr(&l, -1) < 0
+}
+
+fn (o: mut &Bf) add(k: int, ty: int, line: int, a: int, b: int): int {
+    append(mut &o.u.nodes, ir.Node{k: k, ty: ty, line: line, a: a, b: b, c: -1, d: -1, v: 0})
+    return len(o.u.nodes) - 1
+}
+
+// The condition e tested for when: e, or its negation.
+fn (o: mut &Bf) truth(e: int, when: bool): int {
+    if when { return e }
+    if o.u.nk(e) == ir.E_LNOT { return o.u.nodes[e].a }
+    return o.add(ir.E_LNOT, ir.TY_I32, o.u.nodes[e].line, e, -1)
+}
+
+// `if (c) J` with a new copy of the jump j.
+fn (o: mut &Bf) jumpIf(c: int, j: int): int {
+    let jn = o.u.nodes[j]
+    let jc = o.add(jn.k, jn.ty, jn.line, -1, -1)
+    return o.add(ir.S_IF, 0, jn.line, c, jc)
+}
+
+// The rewrite (above) of the statements of list l from item j, and true; else false, nothing
+// changed.
+fn (o: mut &Bf) fold(l: int, j: int): bool {
+    let cnt = o.u.listLen(l)
+    if j + 2 >= cnt { return false }
+    // bool b = A;
+    let d = o.u.listAt(l, j)
+    let dn = o.u.nodes[d]
+    if dn.k != ir.S_DECL || dn.b < 0 || dn.c >= 0 { return false }
+    let b = dn.a
+    let a = dn.b
+    if !o.plainBool(b) || o.uses[b] != 3 || o.u.tk(o.u.nodes[a].ty) != ir.TY_BOOL { return false }
+    // if (b) { S; b = V; } or if (!b) ...
+    let s = o.u.listAt(l, j + 1)
+    let sn = o.u.nodes[s]
+    if sn.k != ir.S_IF || sn.c >= 0 { return false }
+    var cond = sn.a
+    var isAnd = true
+    if o.u.nk(cond) == ir.E_LNOT {
+        cond = o.u.nodes[cond].a
+        isAnd = false
+    }
+    if o.u.nk(cond) != ir.E_LOCAL || o.u.nodes[cond].a != b { return false }
+    let th = sn.b
+    if o.u.nk(th) != ir.S_BLOCK || o.u.nodes[th].v == 1 { return false }
+    let tl = o.u.nodes[th].a        // the then part's list, with the assignment its item li
+    var li = o.u.listLen(tl) - 1
+    while li >= 0 && o.u.nk(o.u.listAt(tl, li)) == ir.S_EMPTY { li -= 1 }
+    if li < 0 { return false }
+    var ns = 0
+    for i in 0..li {
+        let ik = o.u.nk(o.u.listAt(tl, i))
+        if ik == ir.S_CASE || ik == ir.S_DEFAULT { return false }
+        if ik != ir.S_EMPTY { ns += 1 }
+    }
+    if ns == 0 { return false }             // no S: the code generator folds A && V itself
+    let asgS = o.u.listAt(tl, li)
+    if o.u.nk(asgS) != ir.S_EXPR { return false }
+    let asg = o.u.nodes[asgS].a
+    if o.u.nk(asg) != ir.E_ASSIGN { return false }
+    let lhs = o.u.nodes[asg].a
+    if o.u.nk(lhs) != ir.E_LOCAL || o.u.nodes[lhs].a != b { return false }
+    let v = o.u.nodes[asg].b
+    if o.u.tk(o.u.nodes[v].ty) != ir.TY_BOOL { return false }
+    // [bool c = b;]
+    var k2 = j + 2
+    var c = -1
+    let x = o.u.listAt(l, k2)
+    let xn = o.u.nodes[x]
+    if xn.k == ir.S_DECL && xn.b >= 0 && xn.c < 0 && o.u.nk(xn.b) == ir.E_LOCAL && o.u.nodes[xn.b].a == b {
+        c = xn.a
+        if !o.plainBool(c) || o.uses[c] != 1 { return false }
+        k2 = j + 3
+        if k2 >= cnt { return false }
+    }
+    // if (c) J or if (!c) J
+    let f = o.u.listAt(l, k2)
+    let fn0 = o.u.nodes[f]
+    if fn0.k != ir.S_IF || fn0.c >= 0 { return false }
+    var fc = fn0.a
+    var when = true
+    if o.u.nk(fc) == ir.E_LNOT {
+        fc = o.u.nodes[fc].a
+        when = false
+    }
+    if o.u.nk(fc) != ir.E_LOCAL || o.u.nodes[fc].a != (if c >= 0 { c } else { b }) { return false }
+    let jmp = o.lone(fn0.b)
+    if jmp < 0 || o.u.nk(jmp) != ir.S_BREAK && o.u.nk(jmp) != ir.S_CONTINUE { return false }
+    // commit: the then part ends in `if (V) J` (or !V)
+    o.u.items[tl + 1 + li] = o.jumpIf(o.truth(v, when), jmp)
+    var out: []int = []
+    if isAnd == when {
+        // and, jump when true: if (A) { S; if (V) J; }   or, when false: if (!A) { S; if (!V) J; }
+        append(mut &out, o.add(ir.S_IF, sn.ty, sn.line, o.truth(a, when), th))
+    } else {
+        // and, when false: if (!A) J; { S; if (!V) J; }   or, when true: if (A) J; { S; if (V) J; }
+        append(mut &out, o.jumpIf(o.truth(a, when), jmp))
+        append(mut &out, th)
+    }
+    // the items j..k2 replaced by out, the rest moved up
+    let gone = k2 + 1 - j - len(out)
+    for i in 0..len(out) { o.u.items[l + 1 + j + i] = out[i] }
+    for i in k2 + 1..cnt { o.u.items[l + 1 + i - gone] = o.u.items[l + 1 + i] }
+    o.u.items[l] = cnt - gone
+    o.uses[b] = 0
+    if c >= 0 { o.uses[c] = 0 }
+    return true
+}
