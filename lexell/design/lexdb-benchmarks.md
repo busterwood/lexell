@@ -115,7 +115,13 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
-**Now, main `48c22c45` (2026-11-18):** lexdb alone, one run, boost off
+**Now, main `89cf0a59` (2026-11-18), the same setup:** summed 13,524 ms
+against PostgreSQL's 13,955 (one core): lexdb's sum is below PG's for the
+first time; geometric mean 1.03. q7 942 ms (1.61×), q21 1,226 (1.49×) after
+the hash cut (lexdb-layers.md 6.2.13); the rest within run spread of
+`48c22c45`. Results: `~/tpch-w/int/out-main-89cf0a59`.
+
+**Before, main `48c22c45` (2026-11-18):** lexdb alone, one run, boost off
 (3.8 GHz), the setup below; PostgreSQL's times are its one-core run at
 `94536d12` (same machine, clock and data). After the layered redesign's
 pipeline (P1-P3), the owned-string migration and its review. **Geometric
@@ -247,6 +253,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-18 | 89cf0a59 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.03 (geometric mean, wall); summed 13.52 s against PG's 13.96 s (lexdb's first sum below PG's); q7 -21%, q21 -15% (hash cut by the next hash), q22 -46% instructions (IN over an expression); worst q19 2.6×, q20 2.3×, q11 2.1×, q22 1.9× | this page, 1.6; lexdb-layers.md 6.2.13 |
 | 2026-11-18 | 48c22c45 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.05 (geometric mean, wall; was 2.48), 9 of 22 level or ahead; summed 14.08 s against PG's 13.96 s; worst q19 2.5×, q20 2.3×, q11 2.1×, q7 2.0× | this page, 1.6 |
 | 2026-11-16 | 94536d12 | TPC-H derived, SF1, boost off | lexdb / PG one core 2.48 (geometric mean, wall; was 3.77), 4 of 22 level or ahead; worst q19 14×, q20 12×, q21 10.5×, q22 8.5×; pinned 0-3, 3.8 GHz | this page, 1.6; lexdb-tpch-perf.md |
 | 2026-11-16 | 1744ef99 | TPC-H derived, SF1 | lexdb / PG one core 3.77 (geometric mean, wall), 2 of 22 level or ahead; q4 22×, q21 20×, q1 5.6×; pinned 0-3 | this page, 1.6; lexdb-tpch-perf.md |

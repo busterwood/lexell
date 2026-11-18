@@ -5834,6 +5834,46 @@ top-N and DISTINCT run over batches (the pipe).
 - `runSelTo` streams a sort's rows as one OutBatch; a large sort's output
   could go in pieces.
 
+#### 6.2.13 After P3: three measured fixes
+
+Built 2026-11-18 on `redesign/bind` from main 96e2663f, each chosen from a
+profile of the 22 TPC-H queries and their ratios to PostgreSQL one core.
+
+- **48c22c45, q22 (-46% instructions).** `x IN (constants)` whose `x` is
+  not a column but an expression (`substring(c_phone from 1 for 2)`) was
+  wholly the generic step: per row, the list's seven texts copied and
+  compared. `BNode.InGen` makes `x` by the generic step once per row and
+  looks it up in the list sorted; a value of another kind than the list's
+  is compared with the list in order, as `lexdb_lib.inFn` does (errors and
+  NULLs as the row path's). `substring` cuts an ASCII text by bytes and
+  reads its arguments where they are (`lexdb_sql.text` copies since
+  strings are owned; `lexdb_sql.textIn(v, buf)` is the view form).
+- **0b7624eb, numerics read as values (-1.0%; q7 -5%).** `Decimal.fromUnits`
+  (lib/decimal) builds a 64-bit value directly instead of through the
+  256-bit path and a `Result`.
+- **89cf0a59, a hash cut by the next level's hash (q7 -20%, q21 -17%).**
+  q7 and q21 hash all of `supplier`, then join `nation` on `s_nationkey`
+  with a hash of one or two nations: 1.83M (3.79M) lineitem rows passed the
+  supplier join for 146k (157k) to survive nation. After the hashes are
+  built, `reduceHashes` unlinks a hash's rows whose key column the next
+  level's inner integer-keyed hash does not hold; the scan's narrowing by
+  the first hash's keys (P2's late decoding) then drops those lineitem
+  rows before decoding their other columns. Only between adjacent levels
+  joined by plain columns with no condition per candidate (exactness: no
+  row whose condition would raise an error is skipped). The rows cut are
+  counted per bucket and added back where a probe or the narrowing meets
+  them, so EXPLAIN ANALYZE's counts stay the row engine's (`exec_pipe`,
+  `exec_semilook` compare them). Open: q13 +0.75% instructions with no
+  cut.
+
+TPC-H at 89cf0a59 (lexdb-benchmarks.md 1.6): summed 13.52 s against
+PostgreSQL's 13.96 s on one core, geometric mean 1.03. Point selects
+level (instructions), cycles 1.5% to 2.7% lower than at 48c22c45.
+
+The largest ratios left: q19 2.6× (plan: PostgreSQL drives from part by a
+BitmapOr; the parked orHull), q20 2.3×, q11 2.1×, q22 1.9×; the largest
+absolute gaps q21 (+406 ms), q7 (+357), q3 (+304), q15 (+272), q12 (+240).
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
