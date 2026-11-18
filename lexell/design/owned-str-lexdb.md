@@ -322,7 +322,7 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AR | `StrBuf` is gone (the user's decision: a string is its own buffer). `str` has `addByte(c)`, `addInt(n)`, `addLine(x)`, `clear()` (keeps the buffer) and `bytes(): &[byte]` (a borrowed slice, no copy), all in place like `s += x`. `binary.addU16LE` and the other builders take `mut &str`. AQ's `StrBuf.text()` is gone with it: the string is the text. | ac0db6ce | **no**, done on this branch: every `newStrBuf()` became `""`, `StrBuf` became `str`, `b.add(x)` became `b += x`, `b.size()` became `len(b)`, `b.toStr()` became `b` (moved) or `b.toStr()` (a copy, where `b` is used again), `w.out.view()` became `w.out.bytes()` and `lexdb_wire.sendTo` takes `&[byte]`. | none (no slower: same instructions and cycles for the compiler) |
 
-| AS | SPEC 10 rule 1 (finding 2, first part): a boxed record or closed type may hold borrows (a recursive syntax tree of `&str` views of its source); it is then borrow-class, second class like a value type holding borrows. Library containers (`Map[&str, V]`) are not yet borrow-capable: see design/consistency-designs.md. | (this commit) | yes | none |
+| AS | SPEC 10 rule 1 (finding 2, first part): a boxed record or closed type may hold borrows (a recursive syntax tree of `&str` views of its source); it is then borrow-class, second class like a value type holding borrows. Library containers (`Map[&str, V]`) are not yet borrow-capable: see design/consistency-designs.md. | 9f220529 | yes | none |
 
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
