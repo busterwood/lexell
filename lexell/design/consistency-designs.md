@@ -43,6 +43,24 @@ instances; the instance check already does this for `borrow` parameters.
 **What it breaks.** Nothing: it only accepts more programs. lexdb can then
 key per-statement maps by views of its input (finding 5 of its review).
 
+**As built (2026-11-18).** Point 1 is done: the field rule was the only
+thing tying borrows to value types (declBC already covered boxed types); one
+walk (holdsMut) had to learn that recursive types can now hold borrows.
+Point 2 is blocked by two limits of the checker, found when `Map`'s
+parameters were declared `borrow`:
+- **Lending from a borrow-holding value.** `Map.at`, `find`, `atMut` and
+  iteration return borrows of the map's own storage. For a parameter whose
+  type holds borrows, design/borrow-types.md D5 lets a result borrow only
+  what the parameter holds, never the parameter itself ("no lending"), so
+  these methods cannot be written for `Map[&str, V]`. Allowing it needs
+  results with two roots (the container, and what it holds).
+- **Interfaces through a borrow type.** `&str` does not satisfy `Ord`
+  (`cmp` is declared on `str` with a `&Self` receiver), so even `sort` of a
+  `[]&str` is refused; `Eq` and `Hash` likewise, which a map key needs.
+Also, `Set`'s `union`/`filter` build a set from two others inside closures,
+and a `var`'s fixed roots (rule 7) cannot express "what a or b borrows".
+Point 3 (boxed constants) is not done yet.
+
 ## Finding 5: `s[a..b]` is always a view
 
 **Now.** SPEC 4.1: `s[a..b]` is a view (`&str`) where a `&str` is expected

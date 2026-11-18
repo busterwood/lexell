@@ -1039,13 +1039,13 @@ borrows, an instance whose argument for a `borrow` type parameter holds
 borrows, or a type parameter declared `borrow` (section 6.1).
 
 1. **Second class.** A borrow, and any value of a type that holds borrows,
-   may be a parameter, receiver, `let`, function result, field of a value
-   record or value closed type, array element, or type argument of a `borrow`
-   type parameter; a value that holds borrows but is not itself a borrow may
-   also be a `var` (rule 7). None may be a global, a constant, a field of a
-   boxed record or closed type, a closure's result (a closure may capture
-   one), a task's argument or result, or a type argument of another type
-   parameter.
+   may be a parameter, receiver, `let`, function result, field of a record
+   or closed type (boxed or value: a recursive syntax tree may hold `&str`
+   views of its source), array element, or type argument of a `borrow` type
+   parameter; a value that holds borrows but is not itself a borrow may also
+   be a `var` (rule 7). None may be a global, a constant, a closure's result
+   (a closure may capture one), a task's argument or result, or a type
+   argument of another type parameter.
 2. **Roots.** Every borrow expression `&p` or `mut &p` has a root: the local
    variable or parameter that the place `p` starts from. Borrowing a global or
    a temporary that does not outlive the statement into a `let` is an error.

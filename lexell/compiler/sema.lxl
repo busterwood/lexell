@@ -969,18 +969,26 @@ fn (pg: mut &Program) declBC(d: int): bool {
 }
 
 // Whether t holds a mut borrow (a borrow-class value that freezes its root against any other use).
-pub fn (pg: mut &Program) holdsMut(t: int): bool { return pg.holdsMutAt(t, 0) }
+pub fn (pg: mut &Program) holdsMut(t: int): bool {
+    var seen: []int = []
+    return pg.holdsMutAt(t, mut &seen)
+}
 
-fn (pg: mut &Program) holdsMutAt(t: int, depth: int): bool {
-    if depth > 50 { return false }
+// (seen: the instances already walked: a recursive type, which may hold borrows now that a boxed
+// type may, would otherwise be walked once per path)
+fn (pg: mut &Program) holdsMutAt(t: int, seen: mut &[]int): bool {
     match pg.tk(t) {
         TK_REF, TK_SLICE { return pg.tm(t) }
-        TK_ARR { return pg.holdsMutAt(pg.ta(t), depth + 1) }
+        TK_ARR { return pg.holdsMutAt(pg.ta(t), seen) }
         TK_INST {
             if !pg.isBorrowClass(t) { return false }
+            for x in seen {
+                if x == t { return false }
+            }
+            append(seen, t)
             let fts = pg.fieldTypes(t)
             for ft in fts {
-                if pg.holdsMutAt(ft, depth + 1) { return true }
+                if pg.holdsMutAt(ft, seen) { return true }
             }
             return false
         }
@@ -1294,12 +1302,9 @@ fn (pg: mut &Program) checkBorrowFields(d: int) {
             for f in pg.variants[v].fields { append(mut &fs, f.clone()) }
         }
     }
-    for f in fs {
-        if pg.isBorrowClass(f.ty) && !pg.types[d].value {
-            pg.err(pg.types[d].mod, pg.types[d].line, "field " + f.name + " of " + pg.types[d].name + " is " +
-                pg.tstr(f.ty) + ", which holds borrows: only a value record or value closed type can hold them")
-        }
-    }
+    // design/consistency-designs.md, finding 2: a boxed record or closed type may hold borrows too;
+    // it is then borrow-class (second class, rooted where its borrows are), as a value type is
+    if len(fs) < 0 { return }
 }
 
 // Whether the constraint list l (module m) contains `copy`.
