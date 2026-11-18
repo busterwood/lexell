@@ -291,6 +291,35 @@ directly (`&d.s`) where the other fields are written. A branch that borrows
 through another borrow (`if c { x } else { &d.b }` with `let x = &d.a`)
 freezes `d` whole.
 
+**Workarounds removed in lexdb (2026-11-18, on redesign/bind):**
+
+- UTC: `lexdb_time.utc()` now lends one zone from a set-once global
+  (`var UTC_ZONE: once Zone`); callers that stored a zone clone it, which
+  copies nothing (its strings are literals). `envZone` lends the session's
+  zone or UTC instead of copying one per call. `UTC_ZONE` is set on first
+  use. (fea3ca7a also set it, the zone registry and the dictionary pool at
+  store open, believing two tasks could race to set one; they cannot: tasks
+  run on one thread and `set` does not park, and `par.map` kernels may not
+  touch set-once globals. That was removed again.)
+  `compare()` keeps its zone-free date/timestamp path (`timeCmpLocal`): it
+  is faster than any zone.
+- The access layer's cursors are back in their natural order
+  (`let from = if cur.started { &cur.at } else { &sc.lo }`, then
+  `cur.started = true`; AA).
+- pgwire's `Map.at`/`atMut` lookups no longer clone the key (Y). Describe's
+  statement name is still a clone: borrowing it from `ps.portals.at(...)`
+  freezes the whole `ps`, which is written later (the unchanged
+  method-borrow point above).
+- TNS: the request's statement kind is read from the text in place, not
+  from a copy of it.
+- No `match` on a field of a dead local cloned in its arms (AB): the
+  migration's remaining arm clones are all through borrows.
+
+Measured: suite 190, quick gate PASS, checksums unchanged. Instructions
+per query and per point select equal the merge's (q22, q14 within 0.01%;
+points 205,342 to 205,327); q14 and q22 run 2 to 3% more cycles for the
+same instructions, a code-layout effect.
+
 ## 6. Consistency fixes (branch lang/consistency, 2026-11-18)
 
 Three rules that applied in one construct and not in its neighbours, made

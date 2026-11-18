@@ -122,7 +122,7 @@ pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Va
         lexdb_bind.BX.Cat(a, b, f) {
             let l = try bxEval(&a, row, aggs, ce)
             let r = try bxEval(&b, row, aggs, ce)
-            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return callAt(&f, &[l, r], 0, &lexdb_time.utc(), ce.up.entry) }
+            if len(f) > 0 && (looksArray(&l) || looksArray(&r)) { return callAt(&f, &[l, r], 0, lexdb_time.utc(), ce.up.entry) }
             return lexdb_ops.binOp(lexdb_ops.OP_CAT, l, r, fn(): lexdb_time.Zone { return ce.zone.clone() })
         }
         lexdb_bind.BX.IsNull(a, neg) {
@@ -944,7 +944,7 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     out.nul[j] = true
                     continue
                 }
-                let x = try lexdb_ops.compare(&bValAt(b, ca, ka, r), &bValAt(b, cb, kb, r))
+                let x = try bCmpCols(b, ca, ka, cb, kb, r)
                 let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
                         else if op == 4 { x > 0 } else { x >= 0 }
                 out.v[j] = if t { 1 } else { 0 }
@@ -1452,6 +1452,20 @@ pub fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     return Val.Int(kv.v[j])
 }
 
+// encIdxPart of bKeyVal, a column's value encoded in place rather than copied.
+fn bKeyEnc(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int) {
+    if c.typ == BT_OTHER {
+        match c.n {
+            BNode.Col(i) {
+                lexdb_access.encIdxPart(kb, &b.vals[i][r])
+                return
+            }
+            else {}
+        }
+    }
+    lexdb_access.encIdxPart(kb, &bKeyVal(c, kv, j, b, r))
+}
+
 // Marks the columns n reads.
 pub fn bColsOf(n: &BNode, used: mut &[]bool) {
     match n {
@@ -1497,6 +1511,20 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
 }
 
 // Column c (of kind k) of b at row r, not NULL, as a value.
+// Whether bValAt of kind k reads a value column (b.vals) rather than making a Val.
+fn isValKind(k: int): bool { return k != BK_INT && k != BK_BOOL && !lexdb_rows.isDecKind(k) }
+
+// compare of columns ca and cb at row r (kinds ka, kb), a value column's
+// value read in place rather than copied.
+fn bCmpCols(b: &Batch, ca: int, ka: int, cb: int, kb: int, r: int): Result[int, DbErr] {
+    let va = isValKind(ka)
+    let vb = isValKind(kb)
+    if va && vb { return lexdb_ops.compare(&b.vals[ca][r], &b.vals[cb][r]) }
+    if va { return lexdb_ops.compare(&b.vals[ca][r], &bValAt(b, cb, kb, r)) }
+    if vb { return lexdb_ops.compare(&bValAt(b, ca, ka, r), &b.vals[cb][r]) }
+    return lexdb_ops.compare(&bValAt(b, ca, ka, r), &bValAt(b, cb, kb, r))
+}
+
 pub fn bValAt(b: &Batch, c: int, k: int, r: int): Val {
     if k == BK_INT { return Val.Int(b.cols[c].v[r]) }
     if k == BK_BOOL { return Val.Bool(b.cols[c].v[r] == 1) }
@@ -2654,25 +2682,26 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 }
             }
             var kstr = ""
-            var ktext = ""
             if ag.textCol >= 0 {
                 let r = idx[j]
                 if b.cols[ag.textCol].nul[r] {
                     g = ag.nullGroup
                 } else {
+                    // looked up by the batch's own text; copied only for a new group
                     match b.vals[ag.textCol][r] {
-                        Val.Text(x) { ktext = x.clone() }
+                        Val.Text(x) {
+                            klen = len(x)
+                            match ag.byText.get(x) {
+                                Some(y) { g = y }
+                                None {}
+                            }
+                        }
                         else { return Ok(false) }
-                    }
-                    klen = len(ktext)
-                    match ag.byText.get(&ktext) {
-                        Some(x) { g = x }
-                        None {}
                     }
                 }
             } else if !ag.oneKey {
                 var kb = ""
-                for ki in 0..len(ag.keys) { lexdb_access.encIdxPart(mut &kb, &bKeyVal(&ag.keys[ki], &kvs[ki], j, b, idx[j])) }
+                for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j]) }
                 kstr = kb
                 klen = len(kstr)
                 match ag.byKey.get(&kstr) {
@@ -2688,7 +2717,14 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
                 ag.newGroup()
                 if ag.textCol >= 0 {
-                    if b.cols[ag.textCol].nul[idx[j]] { ag.nullGroup = g } else { ag.byText.put(ktext, g) }
+                    if b.cols[ag.textCol].nul[idx[j]] {
+                        ag.nullGroup = g
+                    } else {
+                        match b.vals[ag.textCol][idx[j]] {
+                            Val.Text(x) { ag.byText.put(x.clone(), g) }
+                            else {}
+                        }
+                    }
                 } else if ag.oneKey {
                     if kvs[0].nul[j] {
                         ag.nullGroup = g
