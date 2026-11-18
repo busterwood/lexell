@@ -18,7 +18,7 @@ share of samples with the function on the stack.
 
 | | TPC-H | point selects |
 |---|---:|---:|
-| `malloc` + `free` (self) | 6.9% | 11.9% |
+| the runtime's `malloc` + `rt_free` (self) | 6.9% | 11.9% |
 | `Val` clone + drop glue (`gl112_dup`, `gl114_drop`) | 5.3% | 1.1%+ |
 | everything under allocation, copy and drop | 16.8% | |
 | heap string copies | 23.9M (337 MB) | 110 per statement |
@@ -114,10 +114,19 @@ that only read remove those clones. Finding 2 removes most of them anyway.
 
 ### Language and runtime, not lexdb
 
-- `malloc` is glibc's: 4.3% self of TPC-H and 7.6% of a point select.
-  Strings now have one owner and a known size, so the runtime could keep
-  free lists per size class (one thread: no locking). This would help
-  every program and needs no lexdb change.
+- `malloc` and `rt_free` are Lexell's own allocator (compiler/native/rt.c):
+  size classes, free lists per 2 MB chunk, and a fast path through the
+  current chunk's lists. The samples sit on two loads, not on the
+  allocator's logic. In `malloc` (4.3% of TPC-H, 7.6% of a point select)
+  about 55% fall on popping a block from an older chunk's list: reading
+  the freed block's next pointer and adding to the chunk's `live` count.
+  In `rt_free` (2.6%, 4.3%) they fall on reading the block's header word
+  and, for a block of an older chunk, on its chunk's list head and
+  `live` count. So this is the cost of touching cold memory per
+  allocation; fewer allocations (the findings above) is the fix. One
+  thing to try in the runtime (not measured): every chunk's header is
+  2 MB-aligned, so the headers of all chunks share the same cache sets,
+  and each allocation or free in an older chunk writes one of them.
 - Correction to fea3ca7a: it said a set-once global set by two tasks at
   once stops the program. Tasks run on one thread and `set` does not
   park, so that cannot happen; `par.map` kernels may not touch set-once
