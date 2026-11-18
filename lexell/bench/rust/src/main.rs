@@ -224,9 +224,9 @@ fn bench_trees() {
 
 // ---------------------------------------------------------------- tokens
 
-struct Token {
+struct Token<'a> {
     kind: i32,
-    text: String,
+    text: &'a str,
     #[allow(dead_code)] // recorded as in the lxl and C references, not counted
     line: i64,
 }
@@ -239,32 +239,35 @@ fn is_digit(c: u8) -> bool {
     c.is_ascii_digit()
 }
 
-fn scan(src: &[u8], toks: &mut Vec<Token>) {
+// Identifiers are views of `src`. Slicing is always on a char boundary: an
+// identifier starts and ends next to an ASCII byte.
+fn scan<'a>(src: &'a str) -> Vec<Token<'a>> {
+    let bytes = src.as_bytes();
+    let mut toks: Vec<Token<'a>> = Vec::new();
     let mut i = 0usize;
     let mut line: i64 = 1;
-    while i < src.len() {
-        let c = src[i];
+    while i < bytes.len() {
+        let c = bytes[i];
         if c == b'\n' {
             line += 1;
             i += 1;
         } else if is_letter(c) {
             let start = i;
-            while i < src.len() && (is_letter(src[i]) || is_digit(src[i])) {
+            while i < bytes.len() && (is_letter(bytes[i]) || is_digit(bytes[i])) {
                 i += 1;
             }
-            let text = String::from_utf8_lossy(&src[start..i]).into_owned();
             toks.push(Token {
                 kind: 1,
-                text,
+                text: &src[start..i],
                 line,
             });
         } else if is_digit(c) {
-            while i < src.len() && is_digit(src[i]) {
+            while i < bytes.len() && is_digit(bytes[i]) {
                 i += 1;
             }
             toks.push(Token {
                 kind: 2,
-                text: String::new(),
+                text: "",
                 line,
             });
         } else if c == b' ' || c == b'\t' {
@@ -272,12 +275,13 @@ fn scan(src: &[u8], toks: &mut Vec<Token>) {
         } else {
             toks.push(Token {
                 kind: 3,
-                text: String::new(),
+                text: "",
                 line,
             });
             i += 1;
         }
     }
+    toks
 }
 
 fn hash(s: &str) -> usize {
@@ -288,34 +292,35 @@ fn hash(s: &str) -> usize {
     h as usize
 }
 
-// The table stores indices into the token stream: that is the same 8-byte
-// entry per name as the C reference's char *, without a new allocation per
-// interned identifier (lxl shares the refcounted text).
-fn intern(table: &mut [Vec<usize>], toks: &[Token], idx: usize) -> bool {
-    let s = &toks[idx].text;
+// The table holds views of the source, not copies: a name is added only if no
+// equal view is in its bucket.
+fn intern<'a>(table: &mut [Vec<&'a str>], s: &'a str) -> bool {
     let k = hash(s) % table.len();
-    for &j in &table[k] {
-        if toks[j].text == *s {
+    for name in &table[k] {
+        if *name == s {
             return false;
         }
     }
-    table[k].push(idx);
+    table[k].push(s);
     true
 }
 
 fn bench_tokens(path: &str) {
-    let src = std::fs::read(path).unwrap_or_else(|e| {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("tokens: cannot read {path}: {e}");
+        std::process::exit(1);
+    });
+    let src = std::str::from_utf8(&bytes).unwrap_or_else(|e| {
+        eprintln!("tokens: {path} is not UTF-8: {e}");
         std::process::exit(1);
     });
     let mut tokens: i64 = 0;
     let mut unique: i64 = 0;
     for _round in 0..200 {
-        let mut toks: Vec<Token> = Vec::new();
-        scan(&src, &mut toks);
-        let mut table: Vec<Vec<usize>> = vec![Vec::new(); 1024];
-        for (i, t) in toks.iter().enumerate() {
-            if t.kind == 1 && intern(&mut table, &toks, i) {
+        let toks = scan(src);
+        let mut table: Vec<Vec<&str>> = vec![Vec::new(); 1024];
+        for t in &toks {
+            if t.kind == 1 && intern(&mut table, t.text) {
                 unique += 1;
             }
         }
