@@ -251,12 +251,12 @@ programs, except where noted, so the workarounds can be removed at leisure.
 
 | # | Change | Commit | lexdb compiles unchanged? | Behaviour change |
 |---|---|---|---|---|
-| Y | SPEC 10 rule 5: a method whose receiver is a borrow returns a borrow of its receiver; its other borrowed parameters are only read. `Map.at` and `Map.atMut` take the key as `&K`. | (this commit) | yes (call sites borrow implicitly; a method that returned a borrow of another parameter could not exist before) | none |
-| Z | SPEC 5.2, 10 rule 5: a set-once global's value is static data, so a function may return a borrow of it (`fn utc(): &Zone { return UTC.get() }`). The error for a function without borrowed parameters now says "static data (literals, constants and set-once globals)". | (this commit) | yes | none |
-| AA | SPEC 10 rule 4: a `let` of a borrow given by an `if` or `match` freezes only the places its branches borrow (`let to = if c { &cur.at } else { hi }` leaves `cur.started` writable). | (this commit) | yes | none |
-| AB | SPEC 9.3: `match h.f`, where local record `h` (no drop method) is not used after the match and `f` is of an owned closed type (no drop method), moves `h.f`, as `match move(h).f` does. | (this commit) | yes | **Drop timing:** `h`'s other fields drop at the match instead of at the end of `h`'s scope. Only visible through `drop` methods with side effects. |
-| AC | SPEC 10 rule 7: a `var` may hold a shared borrow (`var best: &str = &xs[0]`; `&[]T` too). Its initializer gives its roots; later stores borrow from them or are static; the roots are frozen whole while it is live. `var` of `mut &` is still an error. Also: `xs[i] = v` after the last use of a borrow of `xs` is no longer refused. | (this commit) | yes | none |
-| AD | The error for a constant of a boxed type says to declare a `value record` / `value closed`, or to use a set-once global. | (this commit) | yes | none |
+| Y | SPEC 10 rule 5: a method whose receiver is a borrow returns a borrow of its receiver; its other borrowed parameters are only read. `Map.at` and `Map.atMut` take the key as `&K`. | c7389c74 | yes (call sites borrow implicitly; a method that returned a borrow of another parameter could not exist before) | none |
+| Z | SPEC 5.2, 10 rule 5: a set-once global's value is static data, so a function may return a borrow of it (`fn utc(): &Zone { return UTC.get() }`). The error for a function without borrowed parameters now says "static data (literals, constants and set-once globals)". | c7389c74 | yes | none |
+| AA | SPEC 10 rule 4: a `let` of a borrow given by an `if` or `match` freezes only the places its branches borrow (`let to = if c { &cur.at } else { hi }` leaves `cur.started` writable). | c7389c74 | yes | none |
+| AB | SPEC 9.3: `match h.f`, where local record `h` (no drop method) is not used after the match and `f` is of an owned closed type (no drop method), moves `h.f`, as `match move(h).f` does. | c7389c74 | yes | **Drop timing:** `h`'s other fields drop at the match instead of at the end of `h`'s scope. Only visible through `drop` methods with side effects. |
+| AC | SPEC 10 rule 7: a `var` may hold a shared borrow (`var best: &str = &xs[0]`; `&[]T` too). Its initializer gives its roots; later stores borrow from them or are static; the roots are frozen whole while it is live. `var` of `mut &` is still an error. Also: `xs[i] = v` after the last use of a borrow of `xs` is no longer refused. | c7389c74 | yes | none |
+| AD | The error for a constant of a boxed type says to declare a `value record` / `value closed`, or to use a set-once global. | c7389c74 | yes | none |
 
 **Against section 4's points:**
 
