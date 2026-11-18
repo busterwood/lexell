@@ -1626,8 +1626,8 @@ pub fn valExtra(v: &Val): int {
     }
 }
 
-// An output or ORDER BY key over a batch (outPlan): its node, its kind
-// (BK_*) and source as OutPlan has them.
+// An output or ORDER BY key over a batch: its node, its kind (BK_*) and
+// its source (bOutVal's).
 pub type ONode = record {
     pub n: BNode
     pub kind: int
@@ -1738,7 +1738,9 @@ pub fn condNode(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base
 var runs: int = 0
 var batchRuns: int = 0
 
-pub fn runCounts(): []int { return [runs, batchRuns] }
+var sortRuns: int = 0
+
+pub fn runCounts(): []int { return [runs, batchRuns, sortRuns] }
 
 // A plan the pipeline runs.
 pub type Prog = record {
@@ -1749,6 +1751,9 @@ pub type Prog = record {
     // ORDER BY and LIMIT of them; else its rows (run)
     pub groups: bool
     pub joins: bool                 // it joins tables (runJ, runAggJ: its tables and their reads per level)
+    // its top is a Sort or Distinct (slice P3): the rows are held, then
+    // given as one OutBatch (the run holds their bytes in its budget)
+    pub sorts: bool
 }
 
 // p's program; Err(p): an operator or an expression the pipeline does
@@ -1763,7 +1768,8 @@ pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, le
     }
     let j = hasJoin(&p)
     if j { p = lexdb_plan.needs(p, len(cols)) }
-    return Ok(Prog{plan: p, ops: n, groups: g, joins: j})
+    let so = !g && sortArm(&p)
+    return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so})
 }
 
 // p under the operators its caller runs over an aggregate's groups (the
@@ -1772,8 +1778,8 @@ pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, le
 fn underViews(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
     match p {
         lexdb_plan.PPlan.Limit(i, stops, _, _) { if !stops { return underViews(&i) } }
-        lexdb_plan.PPlan.Sort(i, _) { return underViews(&i) }
-        lexdb_plan.PPlan.Distinct(i, _) { return underViews(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return underViews(&i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return underViews(&i) }
         lexdb_plan.PPlan.Project(i, xs) { if len(xs) == 0 { return underViews(&i) } }
         lexdb_plan.PPlan.Having(i) { return underViews(&i) }
         lexdb_plan.PPlan.Match(i) { return underViews(&i) }
@@ -1798,14 +1804,39 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
     }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
+            // over a Sort or Distinct (slice P3): its count and offset theirs
+            if sortArm(&i) {
+                let k = opsOf(&i, cols)
+                return if k < 0 { -1 } else { k + 1 }
+            }
             // a count, no offset (an OFFSET is not streamed: the row engine's)
             if !stops || n < 0 || off > 0 { return -1 }
             let k = opsOf(&i, cols)
             return if k < 0 { -1 } else { k + 1 }
         }
-        lexdb_plan.PPlan.Sort(i, sorted) {
-            // the scan's order: nothing to do
-            if sorted { return -1 }
+        lexdb_plan.PPlan.Sort(i, sorted, ps) {
+            // sorted (slice P3): by its keys, the Project's columns; else the
+            // scan's order, nothing to do
+            if sorted {
+                match ps {
+                    Some(k) {
+                        let w = projLen(projUnder(&i))
+                        for c in k.out { if c < 0 || c >= w { return -1 } }
+                        if k.shown < 1 || k.shown > w { return -1 }
+                    }
+                    None { return -1 }
+                }
+            }
+            let k = opsOf(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Distinct(i, on, ks) {
+            // over the Project (slice P3); not DISTINCT ON
+            if on || len(ks) == 0 { return -1 }
+            match i {
+                lexdb_plan.PPlan.Project(_, _) {}
+                else { return -1 }
+            }
             let k = opsOf(&i, cols)
             return if k < 0 { -1 } else { k + 1 }
         }
@@ -1986,9 +2017,9 @@ fn joinSrc(p: &lexdb_plan.PPlan, k: int, t: &lexdb_catalog.Table, scans: []lexdb
         lexdb_plan.PPlan.Agg(i, _, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Project(i, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Limit(i, _, _, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
-        lexdb_plan.PPlan.Sort(i, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Having(i) { return joinSrc(&i, k, t, scans, index, desc, covers) }
-        lexdb_plan.PPlan.Distinct(i, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Match(i) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         else { return Ok(noSrc()) }
     }
@@ -2041,26 +2072,34 @@ pub fn run(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &
     runs += 1
     if src.batch { batchRuns += 1 }
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
-    return runOp(st, txn, &pg.plan, cols, t, src, cx, cap, bud, cnt, give)
+    if pg.sorts {
+        // its rows held by the Sort or Distinct, then given (slice P3)
+        var sr = SortRun{st: [sortRun(&pg.plan, cap, bud)]}
+        let got = try runOp(st, txn, projUnder(&pg.plan), cols, t, src, cx, -1, bud, cnt, mut &sr, give)
+        sortRuns += 1
+        return sr.st[0].finish(txn, bud, give)
+    }
+    var none = noSortRun()
+    return runOp(st, txn, &pg.plan, cols, t, src, cx, cap, bud, cnt, mut &none, give)
 }
 
 // Runs p (Limit, the scan's Sort, Project): at most lim rows (-1 no limit).
 fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-         src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+         src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts, srt: mut &SortRun,
          give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give) }
-        lexdb_plan.PPlan.Sort(i, _) { return runOp(st, txn, &i, cols, t, src, cx, lim, bud, cnt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, srt, give) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return runOp(st, txn, &i, cols, t, src, cx, lim, bud, cnt, srt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
             match j {
                 lexdb_plan.PPlan.Filter(k, cs) {
                     match k {
-                        lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &cs, &xs, cols, t, src, cx, lim, bud, cnt, give) }
+                        lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &cs, &xs, cols, t, src, cx, lim, bud, cnt, srt, give) }
                         else {}
                     }
                 }
-                lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &none, &xs, cols, t, src, cx, lim, bud, cnt, give) }
+                lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &none, &xs, cols, t, src, cx, lim, bud, cnt, srt, give) }
                 else {}
             }
         }
@@ -2074,7 +2113,7 @@ fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan
 // the last: the rows given.
 fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX,
            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
-           give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+           srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     let last = len(cnt) - 1
     cnt[0].starts += 1
@@ -2094,7 +2133,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
                 match try lexdb_access.getRow(st, txn, &rel, &rr, &src.keys[i]) {
                     Some(r0) {
                         var r = r0
-                        try oneRow(txn, mut &r, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+                        try oneRow(txn, mut &r, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
                         if sr.stop { return Ok(sr.n) }
                     }
                     None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
@@ -2105,7 +2144,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
         for s in src.scans {
             var cur = lexdb_access.newCursor()
-            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
             if sr.stop { return Ok(sr.n) }
         }
         return Ok(sr.n)
@@ -2138,7 +2177,15 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     let needP = lexdb_access.placesNeeded(&rel, &need)
     var bp = lexdb_rows.projectionOf(kinds, collections.copyOf(&sc.need), &t.slots, lexdb_catalog.rowWidth(t), lexdb_access.placesMissing(&rel), needP)
     bp.ranges = cRanges(&cn, &bp.kinds, t)
-    let lazy = lazyOf(&bp, t, &cn, -1)
+    // a top-N's first key an integer column of the table: that column
+    // decoded first, with the conditions', and a row it puts after the
+    // heap's last dropped before the rest are decoded (9.108)
+    var barCol = -1
+    if len(srt.st) > 0 && srt.st[0].topK > 0 && len(srt.st[0].keyCol) > 0 {
+        let kc = srt.st[0].keyCol[0]
+        if isIntKind(okinds[kc]) && osrc[kc] >= 0 { barCol = osrc[kc] }
+    }
+    let lazy = lazyOf(&bp, t, &cn, barCol)
     let no = len(nodes)
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
     for s in src.scans {
@@ -2147,9 +2194,10 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
         while !cur.done {
             let saved = cur.copy()
+            let bar = if barCol >= 0 { srt.st[0].bar(barCol) } else { lexdb_access.noBar() }
             let got = try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, &bp, &src.rd, &lazy,
                                                   fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(&cn, skip, b, idx) },
-                                                  &lexdb_access.noBar(), mut &spare)
+                                                  &bar, mut &spare)
             if got.isNone() {
                 // a value a batch cannot hold, or a condition's error on one
                 // of its rows: row by row from its start
@@ -2161,6 +2209,8 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             var b = replace(mut &pk.b, lexdb_rows.noRows())
             let idx = replace(mut &pk.idx, [])
             let nr = b.n
+            // the rows the bar dropped: counted as kept, as the row path counts them
+            cnt[0].joined += pk.kept - len(idx)
             if nr == 0 {
                 spare = b
                 continue
@@ -2196,7 +2246,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
                 sr.n += take
                 cnt[last].joined += take
                 let noRow: []Val = []
-                if !(try give(txn, &ob, &noRow)) { return Ok(sr.n) }
+                if !(try emitTo(txn, srt, give, &ob, &noRow)) { return Ok(sr.n) }
                 // the table's columns back, the outputs' added ones dropped
                 b.cols = replace(mut &ob.cols, [])
                 b.vals = replace(mut &ob.vals, [])
@@ -2207,7 +2257,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
         }
         if rowPath {
-            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, give, mut &sr)
+            try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
             if sr.stop { return Ok(sr.n) }
         }
     }
@@ -2227,12 +2277,12 @@ type Scalar = record {
 // The rest of scan s from cur, row by row.
 fn rowsFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, src: &Src, s: &lexdb_access.Scan, need: &[]bool,
             cur: mut &lexdb_access.Cursor, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget,
-            cnt: mut &[]Counts, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+            cnt: mut &[]Counts, srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
     while !cur.done {
         var rows: [][]Val = []
         try lexdb_access.fetch(st, txn, rel, src.index, src.desc, s, need, cur, mut &rows)
         for k in 0..len(rows) {
-            try oneRow(txn, mut &rows[k], sc, conds, xs, cx, lim, bud, cnt, give, sr)
+            try oneRow(txn, mut &rows[k], sc, conds, xs, cx, lim, bud, cnt, srt, give, sr)
             if sr.stop { return Ok(Unit{}) }
         }
     }
@@ -2243,7 +2293,7 @@ fn rowsFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_acces
 // the outputs, by the scalar evaluator, as the row engine runs it: counted
 // read, its conditions in order, counted joined, its outputs, given.
 fn oneRow(txn: mut &lexdb_store.Txn, r: mut &[]Val, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget,
-          cnt: mut &[]Counts, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+          cnt: mut &[]Counts, srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
     try bud.tick()
     for i in 0..len(r) { sr.row[sc.first + i] = replace(mut &r[i], Val.Null) }
     cnt[0].read += 1
@@ -2258,7 +2308,7 @@ fn oneRow(txn: mut &lexdb_store.Txn, r: mut &[]Val, sc: &lexdb_plan.PScan, conds
         }
     }
     cnt[len(cnt) - 1].joined += 1
-    if !(try give(txn, &sr.none, &sr.vals)) {
+    if !(try emitTo(txn, srt, give, &sr.none, &sr.vals)) {
         sr.stop = true
         return Ok(Unit{})
     }
@@ -2850,7 +2900,8 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], added: 0, kb: ""}
     let maxHeld = bud.maxHeld
     var vals: []Val = []
-    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+    var noSort = noSortRun()
+    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
         if ob.n == 0 {
             for k in 0..len(slots) { rg.row[slots[k]] = r[k].clone() }
             try groupRow(mut &rg, a, cx, room, maxHeld)
@@ -3391,9 +3442,9 @@ pub fn hasJoin(p: &lexdb_plan.PPlan): bool {
         lexdb_plan.PPlan.Agg(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Project(i, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Limit(i, _, _, _) { return hasJoin(&i) }
-        lexdb_plan.PPlan.Sort(i, _) { return hasJoin(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Having(i) { return hasJoin(&i) }
-        lexdb_plan.PPlan.Distinct(i, _) { return hasJoin(&i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Match(i) { return hasJoin(&i) }
         else { return false }
     }
@@ -4778,9 +4829,23 @@ pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: 
     joinRuns += 1
     batchRuns += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    if pg.sorts {
+        // its rows held by the Sort or Distinct, then given (slice P3)
+        var sr = sortRun(&pg.plan, cap, bud)
+        let got = try runJProj(st, txn, pg, projUnder(&pg.plan), cols, tabs, srcs, vrows, cx, -1, bud, cnt,
+                               fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] { return sr.eat(ob, r) })
+        sortRuns += 1
+        return sr.finish(txn, bud, give)
+    }
     var lim = cap
     limitOf(&pg.plan, mut &lim)
-    let pr = projOf2(&pg.plan)
+    return runJProj(st, txn, pg, projOf2(&pg.plan), cols, tabs, srcs, vrows, cx, lim, bud, cnt, give)
+}
+
+// runJ's Project pr over the joins: at most lim rows (-1 no limit).
+fn runJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, pr: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
+            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     match pr {
         lexdb_plan.PPlan.Project(top, xs) {
             let nq = len(cols)
@@ -4835,7 +4900,7 @@ pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: 
 fn projOf2(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
     match p {
         lexdb_plan.PPlan.Limit(i, _, _, _) { return projOf2(&i) }
-        lexdb_plan.PPlan.Sort(i, _) { return projOf2(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return projOf2(&i) }
         else { return p }
     }
 }
@@ -4847,7 +4912,7 @@ fn limitOf(p: &lexdb_plan.PPlan, lim: mut &int) {
             if lim < 0 || n < lim { lim = n }
             limitOf(&i, lim)
         }
-        lexdb_plan.PPlan.Sort(i, _) { limitOf(&i, lim) }
+        lexdb_plan.PPlan.Sort(i, _, _) { limitOf(&i, lim) }
         else {}
     }
 }
@@ -4994,6 +5059,512 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     return Ok(rg.added)
 }
 
+// ---- ORDER BY, top-N and DISTINCT over chunks (slice P3; design/lexdb.md 9.105)
+//
+// A Sort the plan sorts by (Sort(_, true, Some(keys))), or a Distinct,
+// over the Project of one table's scan or of joins: the Project's chunks
+// (its outputs, then the ORDER BY keys that are not outputs) are held here,
+// not given, and the rows kept go on at the end as one OutBatch.
+// - each chunk's rows' outputs and keys go into columns (SortSet),
+//   integers as integers: no row and no value made per row;
+// - DISTINCT keeps a row whose outputs were not seen (by the integer or
+//   text itself when there is one output, else by their encoding under
+//   their collations);
+// - ORDER BY with LIMIT keeps the first LIMIT + OFFSET in a bounded heap,
+//   its root the last of them: a row it beats costs its keys' copy and one
+//   comparison, and its outputs are not taken;
+// - DISTINCT with LIMIT and no ORDER BY stops the scan at the rows wanted;
+// - the rows kept are sorted by their typed keys (lexdb_sort.skSort; ties
+//   in the scan's order), then cut by OFFSET and LIMIT.
+// A column's kind is its first chunk's (a row read one by one: values).
+// Keys of values of mixed kinds, or a DISTINCT text output that is not a
+// text, are not sorted here: the run ends in batErr before any row is
+// given, and the caller runs the row engine.
+
+type SortSet = record {
+    outs: []BVec            // per output: its integers (BK_INT, BK_BOOL) and NULL flags (all)
+    ovals: [][]Val          // per output of values: its values
+    keys: []lexdb_sort.SKey // per ORDER BY key: SK_INT, or SK_VAL (values under its collation)
+    vk: []int               // per key of values: their kind (kindOf), 0 none yet
+    seq: []int              // per row kept: its place in the input
+    bytes: []int            // ... and its bytes (outputs and keys, as rowBytes counts)
+    n: int
+}
+
+fn putI(xs: mut &[]int, s: int, v: int) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+fn putF(xs: mut &[]bool, s: int, v: bool) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+fn putV(xs: mut &[]Val, s: int, v: Val) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
+
+fn isIntKind(k: int): bool { return k == lexdb_rows.BK_INT || k == BK_BOOL }
+
+// A DISTINCT's outputs seen: by the integer, the text, or the encoding.
+type DistSet = record {
+    ints: Map[int, int]
+    keys: Map[str, int]
+    nul: bool
+    kb: str                 // a key, built in one string
+}
+
+// A one-table run's Sort, if any: st holds its state (one), or nothing
+// (the rows stream to the caller; a run that does not sort makes nothing).
+type SortRun = record { st: []SortSt }
+
+// A Sort's (or Distinct's) run: what it holds, and how.
+type SortSt = record {
+    sorting: bool
+    distinct: bool
+    shown: int              // the outputs given (the Project's columns after them: keys only)
+    keyCol: []int           // per key: the Project's column it is
+    desc: []bool
+    nf: []bool
+    coll: []int             // per key: its collation's kind
+    dcoll: []int            // DISTINCT: per output its collation's kind
+    kinds: []int            // per column of the Project: its kind here ([] before the first chunk)
+    limit: int              // the rows given (-1 all) after offset
+    offset: int
+    topK: int               // ORDER BY with LIMIT: the rows kept (-1 all)
+    early: bool             // DISTINCT with LIMIT, not sorted: stops at limit + offset rows
+    dmode: int              // DISTINCT: 1 one integer output, 2 one text output, 3 the outputs' encoding
+    ds: []DistSet           // DISTINCT: its outputs seen (one; none else: a run that does not sort makes no map)
+    set: SortSet
+    heap: []int
+    scr: int                // top-N: the slot a row is tried in
+    seq: int
+    held: int
+    room: int
+    maxHeld: int
+    bad: bool               // a value not sorted here: the row engine's
+    row: []Val              // a row read one by one, as values
+}
+
+// Whether p (under its Limit) is a Sort or Distinct that holds its rows
+// (false: they stream).
+fn sortArm(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return sortArm(&i) }
+        lexdb_plan.PPlan.Sort(i, sorted, _) { return sorted || sortArm(&i) }
+        lexdb_plan.PPlan.Distinct(_, _, _) { return true }
+        else { return false }
+    }
+}
+
+// The Project under p's Limit, Sort and Distinct.
+fn projUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return projUnder(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return projUnder(&i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return projUnder(&i) }
+        else { return p }
+    }
+}
+
+// The run of p's Sort or Distinct, at most cap rows (-1 no cap: a
+// subquery's; 1 any one row, unsorted); room: the bytes it may hold.
+fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
+    var sr = SortSt{sorting: false, distinct: false, shown: 0, keyCol: [], desc: [], nf: [], coll: [], dcoll: [], kinds: [],
+                     limit: -1, offset: 0, topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0}, heap: [], scr: -1,
+                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, bad: false, row: []}
+    sr.shown = projLen(projUnder(p))
+    sortArmOf(p, mut &sr)
+    if cap >= 0 && (sr.limit < 0 || cap < sr.limit) { sr.limit = cap }
+    if cap == 1 { sr.sorting = false }
+    if !sr.sorting {
+        sr.keyCol = []
+        sr.desc = []
+        sr.nf = []
+        sr.coll = []
+    }
+    sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct { sr.limit + max(sr.offset, 0) } else { -1 }
+    sr.early = !sr.sorting && sr.limit >= 0
+    if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: newMap(), nul: false, kb: ""}) }
+    return sr
+}
+
+// No Sort: the rows go to the caller as they are made.
+fn noSortRun(): SortRun { return SortRun{st: []} }
+
+// What a run made (a chunk ob, or the row r when ob.n is 0) to srt when it
+// holds the rows, else to give.
+fn emitTo(txn: mut &lexdb_store.Txn, srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr],
+          ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+    if len(srt.st) > 0 { return srt.st[0].eat(ob, r) }
+    return give(txn, ob, r)
+}
+
+// A top-N's bar for the scan (batch column col, its first key's): the
+// heap's last row's first key once the heap is full, else none.
+fn (sr: &SortSt) bar(col: int): lexdb_access.Bar {
+    if len(sr.heap) < sr.topK || len(sr.set.keys) == 0 || sr.set.keys[0].kind != lexdb_sort.SK_INT { return lexdb_access.noBar() }
+    let root = sr.heap[0]
+    let k = &sr.set.keys[0]
+    return lexdb_access.Bar{on: true, col: col, v: k.ints[root], nul: k.nul[root], desc: k.desc, nf: k.nf}
+}
+
+// The columns a Project makes.
+fn projLen(p: &lexdb_plan.PPlan): int {
+    match p {
+        lexdb_plan.PPlan.Project(_, xs) { return len(xs) }
+        else { return 0 }
+    }
+}
+
+fn sortArmOf(p: &lexdb_plan.PPlan, sr: mut &SortSt) {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, n, off) {
+            sr.limit = n
+            sr.offset = off
+            sortArmOf(&i, sr)
+        }
+        lexdb_plan.PPlan.Sort(i, sorted, ps) {
+            match ps {
+                Some(k) {
+                    if sorted {
+                        sr.sorting = true
+                        sr.shown = k.shown
+                        for x in k.out { append(mut &sr.keyCol, x) }
+                        for x in k.desc { append(mut &sr.desc, x) }
+                        for x in k.nf { append(mut &sr.nf, x) }
+                        for x in k.coll { append(mut &sr.coll, x) }
+                    }
+                }
+                None {}
+            }
+            sortArmOf(&i, sr)
+        }
+        lexdb_plan.PPlan.Distinct(_, _, ks) {
+            sr.distinct = true
+            for x in ks { append(mut &sr.dcoll, x) }
+        }
+        else {}
+    }
+}
+
+// The kinds of the Project's columns, from the first input: a chunk's, or
+// values (a row read one by one); the set's columns and keys made.
+fn (sr: mut &SortSt) begin(ob: &lexdb_rows.OutBatch, ncol: int) {
+    sr.kinds = []
+    for c in 0..ncol { append(mut &sr.kinds, if ob.n > 0 && isIntKind(ob.kinds[c]) { ob.kinds[c] } else { BK_VAL }) }
+    for o in 0..sr.shown {
+        append(mut &sr.set.outs, lexdb_rows.bvec(0))
+        append(mut &sr.set.ovals, [])
+    }
+    for k in 0..len(sr.keyCol) {
+        let kind = sr.kinds[sr.keyCol[k]]
+        append(mut &sr.set.keys, lexdb_sort.newSKey(if kind == BK_VAL { lexdb_sort.SK_VAL } else { lexdb_sort.SK_INT }, sr.desc[k], sr.nf[k]))
+        append(mut &sr.set.vk, 0)
+    }
+    if sr.distinct {
+        sr.dmode = if sr.shown == 1 && sr.kinds[0] != BK_VAL { 1 } else if sr.shown == 1 { 2 } else { 3 }
+    }
+}
+
+// Column c of row j of what the run gave (ob, or the row r when ob.n is
+// 0) as a column of kind holds it: its integer in iv (an integer kind),
+// its value in vv. True: NULL. A value an integer column cannot hold: bad.
+fn (sr: mut &SortSt) cell(kind: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int, c: int, iv: mut &int, vv: mut &Val): bool {
+    if ob.n == 0 {
+        if lexdb_ops.isNull(&r[c]) { return true }
+        if kind == BK_VAL {
+            vv = r[c].clone()
+            return false
+        }
+        match r[c] {
+            Val.Int(x) {
+                if kind == lexdb_rows.BK_INT {
+                    iv = x
+                    return false
+                }
+            }
+            Val.Bool(x) {
+                if kind == BK_BOOL {
+                    iv = if x { 1 } else { 0 }
+                    return false
+                }
+            }
+            else {}
+        }
+        sr.bad = true
+        return true
+    }
+    let ok = ob.kinds[c]
+    let src = ob.src[c]
+    var x = 0
+    if src < 0 {
+        if ob.ex[c].nul[j] { return true }
+        x = ob.ex[c].v[j]
+    } else {
+        let rr = ob.idx[j]
+        if ob.cols[src].nul[rr] { return true }
+        if !isIntKind(ok) {
+            if kind != BK_VAL {
+                sr.bad = true
+                return true
+            }
+            vv = ob.vals[src][rr].clone()
+            return false
+        }
+        x = ob.cols[src].v[rr]
+    }
+    if kind == BK_VAL {
+        vv = if ok == BK_BOOL { Val.Bool(x == 1) } else { Val.Int(x) }
+        return false
+    }
+    if kind != ok {
+        sr.bad = true
+        return true
+    }
+    iv = x
+    return false
+}
+
+// Row j's ORDER BY keys into slot s; their bytes in bytes. False: not
+// sorted here (bad).
+fn (sr: mut &SortSt) keysAt(s: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int, bytes: mut &int): bool {
+    var n = 32
+    for k in 0..len(sr.keyCol) {
+        n += 24
+        let c = sr.keyCol[k]
+        let kind = sr.kinds[c]
+        var iv = 0
+        var vv = Val.Null
+        let nul = sr.cell(kind, ob, r, j, c, mut &iv, mut &vv)
+        if sr.bad { return false }
+        if kind == BK_VAL {
+            let v = if nul { Val.Null } else { lexdb_sort.collVal(sr.coll[k], &vv) }
+            if !nul {
+                let vk = lexdb_ops.kindOf(&v)
+                if sr.set.vk[k] == 0 { sr.set.vk[k] = vk } else if sr.set.vk[k] != vk {
+                    sr.bad = true
+                    return false
+                }
+                n += valExtra(&v)
+            }
+            putV(mut &sr.set.keys[k].vals, s, v)
+        } else {
+            putI(mut &sr.set.keys[k].ints, s, iv)
+            putF(mut &sr.set.keys[k].nul, s, nul)
+        }
+    }
+    bytes = n
+    return true
+}
+
+// Row j's outputs into slot s. Their bytes (bad: not held here).
+fn (sr: mut &SortSt) outsAt(s: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int): int {
+    var n = 32
+    for o in 0..sr.shown {
+        n += 24
+        let kind = sr.kinds[o]
+        var iv = 0
+        var vv = Val.Null
+        let nul = sr.cell(kind, ob, r, j, o, mut &iv, mut &vv)
+        putF(mut &sr.set.outs[o].nul, s, nul)
+        if kind == BK_VAL {
+            if !nul { n += valExtra(&vv) }
+            putV(mut &sr.set.ovals[o], s, vv)
+        } else {
+            putI(mut &sr.set.outs[o].v, s, iv)
+        }
+    }
+    return n
+}
+
+// Whether row j's outputs were seen (DISTINCT); if not, they are now.
+fn (sr: mut &SortSt) seen(ob: &lexdb_rows.OutBatch, r: &[]Val, j: int): bool {
+    var iv = 0
+    var vv = Val.Null
+    if sr.dmode == 1 {
+        if sr.cell(sr.kinds[0], ob, r, j, 0, mut &iv, mut &vv) {
+            if sr.ds[0].nul { return true }
+            sr.ds[0].nul = true
+            return false
+        }
+        if sr.ds[0].ints.get(&iv).isSome() { return true }
+        sr.ds[0].ints.put(iv, 1)
+        return false
+    }
+    if sr.dmode == 2 {
+        if sr.cell(BK_VAL, ob, r, j, 0, mut &iv, mut &vv) {
+            if sr.ds[0].nul { return true }
+            sr.ds[0].nul = true
+            return false
+        }
+        let k0 = if len(sr.dcoll) > 0 { sr.dcoll[0] } else { lexdb_sql.COLL_EXACT }
+        match replace(mut &vv, Val.Null) {
+            Val.Text(x) {
+                let tk = if k0 == lexdb_sql.COLL_EXACT { x } else if k0 == lexdb_sql.COLL_CI { lexdb_access.ciKey(&x) } else { lexdb_access.padKey(&x) }
+                if sr.ds[0].keys.get(&tk).isSome() { return true }
+                sr.ds[0].keys.put(tk, 1)
+                return false
+            }
+            else {
+                sr.bad = true
+                return true
+            }
+        }
+    }
+    sr.ds[0].kb.clear()
+    for o in 0..sr.shown {
+        let kind = sr.kinds[o]
+        let nul = sr.cell(kind, ob, r, j, o, mut &iv, mut &vv)
+        let v = if nul { Val.Null } else if kind == lexdb_rows.BK_INT { Val.Int(iv) } else if kind == BK_BOOL { Val.Bool(iv == 1) } else { replace(mut &vv, Val.Null) }
+        lexdb_access.encIdxPart(mut &sr.ds[0].kb, &(if o < len(sr.dcoll) { lexdb_sort.collVal(sr.dcoll[o], &v) } else { v }))
+    }
+    if sr.ds[0].keys.get(&sr.ds[0].kb).isSome() { return true }
+    sr.ds[0].keys.put(sr.ds[0].kb.clone(), 1)
+    return false
+}
+
+// The heap's order: by the keys, then the input's (a later row tied with
+// an earlier one sorts after it).
+fn hCmp(set: &SortSet, a: int, b: int): int {
+    let c = lexdb_sort.skCmp(&set.keys, 0, len(set.keys), a, b)
+    if c != 0 { return c }
+    return set.seq[a] - set.seq[b]
+}
+
+// The heap (its root the last row in the order) after heap[i] rose.
+fn hUp(set: &SortSet, heap: mut &[]int, i: int) {
+    var c = i
+    while c > 0 {
+        let p = (c - 1) / 2
+        if hCmp(set, heap[c], heap[p]) <= 0 { break }
+        let x = heap[c]
+        heap[c] = heap[p]
+        heap[p] = x
+        c = p
+    }
+}
+
+// ... after heap[i] fell.
+fn hDown(set: &SortSet, heap: mut &[]int, i: int) {
+    let n = len(heap)
+    var c = i
+    while true {
+        let l = 2 * c + 1
+        if l >= n { break }
+        var big = l
+        if l + 1 < n && hCmp(set, heap[l + 1], heap[l]) > 0 { big = l + 1 }
+        if hCmp(set, heap[big], heap[c]) <= 0 { break }
+        let x = heap[c]
+        heap[c] = heap[big]
+        heap[big] = x
+        c = big
+    }
+}
+
+// What a run gave (a chunk ob, or the row r when ob.n is 0) taken in;
+// false: no more is wanted (the rows a DISTINCT's LIMIT wants, or a value
+// not sorted here).
+fn (sr: mut &SortSt) eat(ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+    let ncol = if ob.n > 0 { len(ob.kinds) } else { len(r) }
+    if len(sr.kinds) == 0 { sr.begin(ob, ncol) }
+    let m = if ob.n > 0 { ob.n } else { 1 }
+    for j in 0..m {
+        sr.seq += 1
+        if sr.distinct {
+            if sr.seen(ob, r, j) { if sr.bad { return Ok(false) } else { continue } }
+        }
+        var kb2 = 0
+        if sr.topK >= 0 {
+            if sr.topK == 0 { continue }
+            if len(sr.heap) < sr.topK {
+                let s = sr.set.n
+                if !sr.keysAt(s, ob, r, j, mut &kb2) { return Ok(false) }
+                let obytes = sr.outsAt(s, ob, r, j)
+                if sr.bad { return Ok(false) }
+                putI(mut &sr.set.seq, s, sr.seq)
+                putI(mut &sr.set.bytes, s, kb2 + obytes)
+                sr.set.n += 1
+                sr.held += kb2 + obytes
+                append(mut &sr.heap, s)
+                hUp(&sr.set, mut &sr.heap, len(sr.heap) - 1)
+            } else {
+                if sr.scr < 0 {
+                    sr.scr = sr.set.n
+                    sr.set.n += 1
+                }
+                let s = sr.scr
+                if !sr.keysAt(s, ob, r, j, mut &kb2) { return Ok(false) }
+                putI(mut &sr.set.seq, s, sr.seq)
+                // the last kept beats it (or ties: it came first)
+                if hCmp(&sr.set, s, sr.heap[0]) >= 0 { continue }
+                let obytes = sr.outsAt(s, ob, r, j)
+                if sr.bad { return Ok(false) }
+                putI(mut &sr.set.bytes, s, kb2 + obytes)
+                sr.held += kb2 + obytes - sr.set.bytes[sr.heap[0]]
+                let gone = sr.heap[0]
+                sr.heap[0] = s
+                sr.scr = gone
+                hDown(&sr.set, mut &sr.heap, 0)
+            }
+        } else {
+            let s = sr.set.n
+            if !sr.keysAt(s, ob, r, j, mut &kb2) { return Ok(false) }
+            let obytes = sr.outsAt(s, ob, r, j)
+            if sr.bad { return Ok(false) }
+            putI(mut &sr.set.seq, s, sr.seq)
+            putI(mut &sr.set.bytes, s, kb2 + obytes)
+            sr.set.n += 1
+            sr.held += kb2 + obytes
+        }
+        if sr.room >= 0 && sr.held > sr.room { return Err(memErr(sr.maxHeld)) }
+        if sr.early && sr.set.n >= sr.limit + max(sr.offset, 0) { return Ok(false) }
+    }
+    return Ok(true)
+}
+
+// The rows kept, in order, cut by OFFSET and LIMIT, given to give as one
+// OutBatch (none when there are none); their bytes held in bud. The rows
+// given. batErr: a value not sorted here (nothing given).
+fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
+                             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    if sr.bad { return Err(batErr()) }
+    var perm: []int = []
+    let nk = len(sr.keyCol)
+    if sr.topK >= 0 {
+        // the heap's rows in the input's order, then sorted by their keys (stable)
+        var hs: []int = []
+        for x in sr.heap { append(mut &hs, x) }
+        let seqs = &sr.set.seq
+        collections.sortBy(mut &hs, fn(a: &int, b: &int): int { return seqs[a] - seqs[b] })
+        var tmp: []int = array(len(hs), 0)
+        lexdb_sort.skMerge(&sr.set.keys, 0, nk, mut &hs, 0, len(hs), mut &tmp)
+        perm = hs
+    } else if sr.sorting && sr.set.n > 0 {
+        for k in 0..nk {
+            if sr.set.keys[k].kind != lexdb_sort.SK_VAL { continue }
+            let vs = replace(mut &sr.set.keys[k].vals, [])
+            var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, sr.desc[k], sr.nf[k])
+            if !lexdb_sort.skOfVals(vs, sr.desc[k], sr.nf[k], mut &key) { return Err(batErr()) }
+            sr.set.keys[k] = key
+        }
+        perm = lexdb_sort.skSort(mut &sr.set.keys, sr.set.n)
+    } else {
+        for i in 0..sr.set.n { append(mut &perm, i) }
+    }
+    try bud.hold(sr.held)
+    let from = min(max(sr.offset, 0), len(perm))
+    var to = len(perm)
+    if sr.limit >= 0 && from + sr.limit < to { to = from + sr.limit }
+    if to <= from { return Ok(0) }
+    // one OutBatch, its places the sorted rows': less work than pieces
+    // (gathered in order, or each its places), measured (9.105)
+    var oidx: []int = withCapacity(to - from)
+    for i in from..to { append(mut &oidx, perm[i]) }
+    var srcs: []int = []
+    var kinds: []int = []
+    for o in 0..sr.shown {
+        append(mut &srcs, o)
+        append(mut &kinds, sr.kinds[o])
+    }
+    let ob = lexdb_rows.OutBatch{n: to - from, kinds: kinds, src: srcs, idx: oidx, cols: replace(mut &sr.set.outs, []),
+                                 vals: replace(mut &sr.set.ovals, []), ex: []}
+    let noRow: []Val = []
+    let more = try give(txn, &ob, &noRow)
+    return Ok(to - from)
+}
+
 // ---- the row engine's joined rows (slice P2c)
 //
 // A query the pipeline does not run whole (its rows sorted, DISTINCT,
@@ -5015,7 +5586,7 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
     var avail: []bool = array(len(cols), false)
     let n = joinOps(&p, cols, mut &avail)
     if n < 0 { return Err(p) }
-    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true})
+    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false})
 }
 
 // Runs a levels program (compileLevels): each joined row (the query's

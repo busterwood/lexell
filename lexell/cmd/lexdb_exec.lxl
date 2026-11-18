@@ -7130,7 +7130,7 @@ fn physOf(sel: &Sel): lexdb_plan.PPlan {
         var parts: []lexdb_plan.PPlan = []
         for i in 0..len(sel.parts) { append(mut &parts, physOf(&sel.parts[i])) }
         let set = lexdb_plan.PPlan.SetOp(sel.setop, sel.setAll, sel.rec, parts, subs)
-        let sorted = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(set, sel.sort) } else { set }
+        let sorted = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(set, sel.sort, None) } else { set }
         return if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(sorted, false, sel.limit, max(sel.offset, 0)) } else { sorted }
     }
     let leaf = if len(sel.srf) > 0 { lexdb_plan.PPlan.Func(sel.srf.toStr(), sel.ordin, subs) }
@@ -7149,8 +7149,8 @@ fn physAbove(sel: &Sel, p2: lexdb_plan.PPlan): lexdb_plan.PPlan {
     let p4 = if len(sel.wins) > 0 { lexdb_plan.PPlan.Window(p3) } else { p3 }
     // a function's select list is its arguments
     let p5 = if len(sel.srf) == 0 { lexdb_plan.PPlan.Project(p4, []) } else { p4 }
-    let p6 = if sel.distinct { lexdb_plan.PPlan.Distinct(p5, sel.donKey > 0) } else { p5 }
-    let p7 = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(p6, sel.sort) } else { p6 }
+    let p6 = if sel.distinct { lexdb_plan.PPlan.Distinct(p5, sel.donKey > 0, []) } else { p5 }
+    let p7 = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(p6, sel.sort, None) } else { p6 }
     let p8 = if len(sel.locks) > 0 { lexdb_plan.PPlan.Lock(p7) } else { p7 }
     let p9 = if sel.limit >= 0 || sel.offset > 0 || sel.topMode != 0 { lexdb_plan.PPlan.Limit(p8, sel.limit >= 0 && !sel.aggQ && !sel.sort, sel.limit, max(sel.offset, 0)) } else { p8 }
     return if len(sel.mr) > 0 { lexdb_plan.PPlan.Match(p9) } else { p9 }
@@ -11611,21 +11611,42 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     let noRow: []Val = []
     let noB = noBatch()
     if !streams(sel) {
-        // sorted or DISTINCT (9.105): the rows sortBatches makes go to the
-        // sink as one OutBatch if it wants them so (it is asked once, only
-        // then); else they are held, as runSel holds them
-        if !sortSinks(sel) { return runSel(st, txn, sel, params, lim) }
+        // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
+        // to the sink as one OutBatch if it wants them so (it is asked once,
+        // only then); else they are held, as runSel holds them
+        if !pipeSorts(sel) { return runSel(st, txn, sel, params, lim) }
         var rs = newRun(&sel.q)
         rs.limit(&lim)
+        if !rs.batch || rs.noLimit { return runSel(st, txn, sel, params, lim) }
         var asked = false
-        return execSelTo(st, txn, sel, params, -1, mut &rs, true, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] {
+        var want = false
+        var rows: [][]Val = []
+        var row: []Val = []
+        let got = runPipe(st, txn, sel, params, -1, mut &rs, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
             if !asked {
                 asked = true
-                if !sink(&sel.outs, &noRow, &noB, true) { return Ok(false) }
+                want = sink(&sel.outs, &noRow, &noB, true)
             }
-            if !sink(&sel.outs, &noRow, ob, false) { return Err(lostRows()) }
+            if want {
+                if !sink(&sel.outs, &noRow, ob, false) { return Err(lostRows()) }
+                return Ok(true)
+            }
+            for j in 0..ob.n {
+                lexdb_pipe.obRow(ob, j, mut &row)
+                append(mut &rows, collections.copyOf(&row))
+            }
             return Ok(true)
         })
+        var outs: []OutCol = []
+        for oc in sel.outs { append(mut &outs, oc.clone()) }
+        match got {
+            Ok(n) { return Ok(Res{cols: outs, rows: rows, tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE}) }
+            Err(x) {
+                // (a value it does not sort: the row engine, nothing given)
+                if !lexdb_pipe.isBat(&x) || asked { return Err(x) }
+                return runSel(st, txn, sel, params, lim)
+            }
+        }
     }
     if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
     let n = try eachRowB(st, txn, sel, params, lim, true, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
@@ -11718,7 +11739,7 @@ fn eachRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 fn noEachB(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] { return Ok(false) }
 
 // eachRow, giving the number of rows given. batched: a query whose rows a
-// scan in batches makes, outputs and all (outPlan), gives them to eachB a
+// scan in batches makes, outputs and all (the pipeline's), gives them to eachB a
 // batch at a time (OutBatch, 9.101), not to each; each still gets those
 // the row path makes (from a batch on one of whose rows an expression
 // gives an error, as batchLevel).
@@ -11892,7 +11913,7 @@ fn streams(sel: &Sel): bool {
 // Sel; what it did not bind for a subquery run once is bound for the plan
 // (lexdb_bind.bindSubs). With SET lexdb_batch on, every run of the Sel is
 // the pipeline's (runPipe, pipeGroups): streamed (eachRowB) and held
-// (execSelTo) alike, the subqueries run once first and their values given.
+// (execSelIn) alike, the subqueries run once first and their values given.
 // With it off the row engine runs it, binding per run.
 
 // Makes sel's plan the pipeline's when it runs it (Sel.pipe); else
@@ -11983,10 +12004,42 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
             return
         }
     }
+    // ORDER BY sorted (slice P3): per key the output it is, else its
+    // expression made after the outputs
+    var ps: Option[lexdb_plan.PSort] = None
+    if sel.sort {
+        var srt = lexdb_plan.PSort{shown: len(xs), out: [], desc: [], nf: [], coll: []}
+        for oi in 0..len(sel.order) {
+            var o = lexdb_bind.orderOut(&sel.order[oi], &sel.q.cols, &sel.outs, len(sel.exprs))
+            if o == -2 {
+                // a position not in the list: the row path's error
+                oxBack(sel, xs)
+                unplan(sel, jp)
+                return
+            }
+            if o < 0 {
+                match planX(&sel.order[oi], &sel.q) {
+                    Some(b) { append(mut &xs, b) }
+                    None {
+                        oxBack(sel, xs)
+                        unplan(sel, jp)
+                        return
+                    }
+                }
+                o = len(xs) - 1
+            }
+            append(mut &srt.out, o)
+            append(mut &srt.desc, sel.desc[oi])
+            append(mut &srt.nf, sel.nullsFirst[oi])
+            append(mut &srt.coll, if oi < len(sel.ordKinds) { sel.ordKinds[oi] } else { lexdb_sql.COLL_EXACT })
+        }
+        ps = Some(srt)
+    }
     let proj = lexdb_plan.PPlan.Project(jp, xs)
-    // ORDER BY in the scan's order (sel.sort false: streams' rule)
-    let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(proj, false) } else { proj }
-    let plan = if sel.limit >= 0 { lexdb_plan.PPlan.Limit(ordered, true, sel.limit, 0) } else { ordered }
+    // the operators over it as physAbove makes them (EXPLAIN prints them)
+    let dist = if sel.distinct { lexdb_plan.PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
+    let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(dist, sel.sort, ps) } else { dist }
+    let plan = if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) } else { ordered }
     match lexdb_pipe.compile(plan, &sel.q.cols) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { unplan(sel, back) }
@@ -12176,10 +12229,24 @@ fn joinsOver(sel: &Sel, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_
 // subquery, its outputs and conditions bound for the plan.
 fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
-    if !streams(sel) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
     if len(q.levels) == 0 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
     if !tableRead(&q.levels[0]) { return false }
     return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs) && boundOnce(q)
+}
+
+// Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
+// (slice P3): rows of one select list, no grouping, window, set
+// operation, lock, DISTINCT ON, WITH TIES, TOP, SELECT @v, or function
+// returning rows in it.
+fn sortShape(sel: &Sel): bool {
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 { return false }
+    if !(sel.sort || sel.distinct) || sel.donKey > 0 || sel.withTies || sel.topMode != 0 || hasSrfCall(&sel.exprs) { return false }
+    if sel.q.corr {
+        for x in sel.exprs { if hasCorr(&x) { return false } }
+        for x in sel.order { if hasCorr(&x) { return false } }
+    }
+    return true
 }
 
 // Whether lv is a table read per row: not a subquery's or CTE's rows, not
@@ -12279,6 +12346,14 @@ fn pipeRows(sel: &Sel): bool {
 fn pipeJoins(sel: &Sel): bool {
     match sel.pipe {
         Some(pg) { return pg.joins }
+        None { return false }
+    }
+}
+
+// Whether sel's pipeline plan sorts or is DISTINCT (slice P3).
+fn pipeSorts(sel: &Sel): bool {
+    match sel.pipe {
+        Some(pg) { return pg.sorts }
         None { return false }
     }
 }
@@ -12390,8 +12465,8 @@ fn scanCounts(rs: mut &Run, cnt: &[]lexdb_pipe.Counts) {
 fn unplan(sel: mut &Sel, p: lexdb_plan.PPlan) {
     match move(p) {
         lexdb_plan.PPlan.Limit(i, _, _, _) { unplan(sel, i) }
-        lexdb_plan.PPlan.Sort(i, _) { unplan(sel, i) }
-        lexdb_plan.PPlan.Distinct(i, _) { unplan(sel, i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { unplan(sel, i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { unplan(sel, i) }
         lexdb_plan.PPlan.Having(i) { unplan(sel, i) }
         // (its keys and calls were bound for the plan only)
         lexdb_plan.PPlan.Agg(i, _, _) { unplan(sel, i) }
@@ -12420,7 +12495,8 @@ fn unplan(sel: mut &Sel, p: lexdb_plan.PPlan) {
 // bound for the plan alone.
 fn oxBack(sel: mut &Sel, xs: []BX) {
     var v = xs
-    for k in 0..len(v) {
+    // (keys made after the outputs, slice P3: the plan's alone)
+    for k in 0..min(len(v), len(sel.exprs)) {
         let col = match sel.exprs[k] {
             Expr.Col(name, sl) { lexdb_bind.colSlot(&sel.q.cols, &name, sl) >= 0 }
             else { false }
@@ -12573,7 +12649,9 @@ fn levelCounts(rs: mut &Run, cnt: &[]lexdb_pipe.Counts) {
 // sel's rows held (execSel), by its pipeline plan: counted against
 // max_statement_mem as execSel's row path counts them.
 fn pipeHeld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
-    let room = rs.bud.room()
+    // (a Sort's or Distinct's rows: held, and counted, by the pipeline)
+    let counted = !pipeSorts(sel)
+    let room = if counted { rs.bud.room() } else { -1 }
     let rs0max = rs.bud.maxHeld
     var held = 0
     var rows: [][]Val = []
@@ -12594,7 +12672,7 @@ fn pipeHeld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
         }
         return Ok(true)
     })
-    try rs.bud.hold(held)
+    if counted { try rs.bud.hold(held) }
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc.clone()) }
     let tag = "SELECT " + len(rows).toStr()
@@ -14274,11 +14352,11 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         }
         lexdb_plan.PPlan.Window(i) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Project(i, _) { opLines(sel, &i, cnt, out) }
-        lexdb_plan.PPlan.Distinct(i, _) {
+        lexdb_plan.PPlan.Distinct(i, _, _) {
             opLines(sel, &i, cnt, out)
             append(out, "distinct")
         }
-        lexdb_plan.PPlan.Sort(i, sorted) {
+        lexdb_plan.PPlan.Sort(i, sorted, _) {
             opLines(sel, &i, cnt, out)
             append(out, if sorted { "order: sort" } else { "order: the scan's" })
         }
@@ -14404,16 +14482,15 @@ fn sortOutRows(sel: &Sel, rows: mut &[]OutRow) {
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
     if len(sel.mr) > 0 {
-        let r = try execSelTo(st, txn, sel, params, -1, rs, false, noEachB)
+        let r = try execSelIn(st, txn, sel, params, -1, rs)
         return execMatch(&sel.mr[0], r, params, rs)
     }
-    return execSelTo(st, txn, sel, params, cap, rs, false, noEachB)
+    return execSelIn(st, txn, sel, params, cap, rs)
 }
 
-// execSel; toSink: a query sortBatches runs gives its rows to eachB as one
-// OutBatch (runSelTo), unless eachB gives false (then they are in the Res).
-fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
-             rs: mut &Run, toSink: bool, eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr]): Result[Res, DbErr] {
+// execSel but MATCH_RECOGNIZE.
+fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
+             rs: mut &Run): Result[Res, DbErr] {
     let sqe = seqEnv(st, txn)
     if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
     if rs.batch && pipeRows(sel) && !rs.noLimit {
@@ -14652,11 +14729,6 @@ fn execSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             append(mut &outRows, OutRow{vals: vals, ord: ord})
         }
     } else {
-        // sorted or DISTINCT over batches (9.105): done whole there, or not at all
-        if sorting || sel.distinct {
-            var bres = Res{cols: [], rows: [], tag: "", hasRows: true, copy: COPY_NONE}
-            if try sortBatches(st, txn, sel, &m, params, limit, offset, sorting, rs, toSink, eachB, mut &bres) { return Ok(bres) }
-        }
         // ORDER BY with LIMIT: only the first limit + offset rows are kept
         // (top-N); a row that sorts after the last of them is dropped
         let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
@@ -20037,7 +20109,7 @@ type BPlan = lexdb_rows.Projection
 // table's (lexdb_store.setColSpec was given others) is read row by row,
 // its rows rebuilt.
 
-// The first level of q scanned in batches (batchLevel, outPlan): its
+// The first level of q scanned in batches (batchLevel): its
 // conditions the batches evaluate (all: every one), its scans, where its
 // batches read the columns used, the query's columns' kinds (BK_NONE those
 // of the other tables), whether a scan is of a range (not key lookups).
@@ -20346,533 +20418,6 @@ fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     }
     return Ok(0)
 }
-
-// How a streamed SELECT's rows are made in batches, outputs and all
-// (sortBatches): its first table scanned in batches, every condition evaluated
-// by them, the tables after it joined over them (jp, joined: 9.102); per
-// output its node over the batch (a column of any type, or an integer or
-// boolean expression), its kind and batch column as OutBatch has them (a
-// joined batch's columns are the query's).
-type OutPlan = record {
-    lp: LPlan
-    nodes: []BNode
-    kinds: []int
-    src: []int
-    // ORDER BY's keys (keyed, sortBatches, 9.105): per key, the output it
-    // is (kout >= 0: by position or by its name), else its node, kind and
-    // batch column as for an output
-    kout: []int
-    knodes: []BNode
-    kkinds: []int
-    ksrc: []int
-}
-
-// outNode of x, bound now (bxOf).
-fn outNodeX(x: &Expr, q: &Query, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[ONode] {
-    match bxOf(x, q) {
-        Some(b) { return lexdb_pipe.outNode(&b, &q.cols, kinds, ce, base, need) }
-        None { return None }
-    }
-}
-
-// outNode of output i of sel, bound as the plan bound it (Sel.ox), else
-// now (bxOf: a column, which the plan does not bind); its constants in ce.
-fn outNodeOut(sel: &Sel, i: int, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[ONode] {
-    if len(sel.ox) == len(sel.exprs) {
-        match sel.ox[i] {
-            Some(b) { return lexdb_pipe.outNode(&b, &sel.q.cols, kinds, ce, base, need) }
-            None {}
-        }
-    }
-    return outNodeX(&sel.exprs[i], &sel.q, kinds, ce, base, need)
-}
-
-// sel's OutPlan; None: its rows are made by the row path (runQuery).
-fn outPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, rs: mut &Run, keyed: bool): Result[Option[OutPlan], DbErr] {
-    let q = &sel.q
-    if !rs.batch || len(q.levels) == 0 || len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) { return Ok(None) }
-    if len(q.levels[0].post) > 0 { return Ok(None) }
-    let got = try bLevelPlan(st, txn, q, m, params, rs)
-    if got.isNone() { return Ok(None) }
-    let lp = got.unwrap()
-    if !lp.all || !lp.ranges { return Ok(None) }
-    // (joins: the pipeline's, slice P2)
-    if len(q.levels) > 1 { return Ok(None) }
-    let base = q.levels[0].first
-    let qk = &lp.qkinds
-    let need = &lp.bp.needCol
-    var nodes: []BNode = []
-    var kinds: []int = []
-    var src: []int = []
-    for xi in 0..len(sel.exprs) {
-        let c = outNodeOut(sel, xi, qk, &m.ce, base, need)
-        if c.isNone() { return Ok(None) }
-        let on = c.unwrap()
-        append(mut &kinds, on.kind)
-        append(mut &src, on.src)
-        append(mut &nodes, lexdb_pipe.takeON(on))
-    }
-    var kout: []int = []
-    var knodes: []BNode = []
-    var kkinds: []int = []
-    var ksrc: []int = []
-    if keyed {
-        for oi in 0..len(sel.order) {
-            let o = lexdb_bind.orderOut(&sel.order[oi], &q.cols, &sel.outs, len(sel.exprs))
-            if o == -2 { return Ok(None) }      // a position not in the list: the row path's error
-            append(mut &kout, o)
-            if o >= 0 {
-                append(mut &knodes, BNode.Const(0, true))
-                append(mut &kkinds, kinds[o])
-                append(mut &ksrc, -1)
-                continue
-            }
-            let c = outNodeX(&sel.order[oi], q, qk, &m.ce, base, need)
-            if c.isNone() { return Ok(None) }
-            let on = c.unwrap()
-            append(mut &kkinds, on.kind)
-            append(mut &ksrc, on.src)
-            append(mut &knodes, lexdb_pipe.takeON(on))
-        }
-    }
-    return Ok(Some(OutPlan{lp: lp, nodes: nodes, kinds: kinds, src: src,
-                           kout: kout, knodes: knodes, kkinds: kkinds, ksrc: ksrc}))
-}
-
-// ---- ORDER BY, top-N and DISTINCT over batches (9.105)
-//
-// A SELECT that sorts or is DISTINCT, with no grouping, window, set
-// operation or correlated output, whose rows a scan in batches makes,
-// outputs and ORDER BY keys all (outPlan, keyed), is run here, not by
-// runQuery and execSel's row closure:
-// - each batch's chosen rows' outputs and keys go into columns (SortSet),
-//   integers as integers: no row and no value made per row;
-// - DISTINCT keeps a row whose outputs were not seen (hashed as execSel's
-//   valsKeyIn, or by the integer or text itself when there is one output);
-// - ORDER BY with LIMIT keeps the first LIMIT + OFFSET in a bounded heap,
-//   its root the last of them: a row it beats costs its keys' copy and
-//   one comparison, and its outputs are not taken;
-// - the rows kept are sorted by their typed keys (lexdb_sort.skSort; ties in the scan's
-//   order), then cut by OFFSET and LIMIT, and given as one OutBatch (the
-//   wire writes it from the columns) or made into rows.
-// Anything the batches cannot do (a value a batch cannot hold, an error on
-// a row, keys of mixed kinds) gives false before a row is given, the
-// counts put back: execSel's row path runs the query from its start, as it
-// did before, and gives its error if it reaches it.
-
-type SortSet = record {
-    outs: []BVec            // per output: its integers (BK_INT, BK_BOOL) and NULL flags (all)
-    ovals: [][]Val          // per output of kind BK_VAL: its values
-    keys: []lexdb_sort.SKey            // per ORDER BY key: lexdb_sort.SK_INT, or lexdb_sort.SK_VAL (values under its collation)
-    vk: []int               // per key of values: their kind (kindOf), 0 none yet
-    seq: []int              // per row kept: its place in the scan
-    bytes: []int            // ... and its rowBytes count (outputs and keys)
-    n: int
-}
-
-fn putI(xs: mut &[]int, s: int, v: int) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
-fn putF(xs: mut &[]bool, s: int, v: bool) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
-fn putV(xs: mut &[]Val, s: int, v: Val) { if s < len(xs) { xs[s] = v } else { append(xs, v) } }
-
-// A cell of a batch row (r, at j among the rows chosen): from batch column
-// src, or from ex (an expression's values). Its integer (BK_INT, BK_BOOL)
-// in iv, its value (BK_VAL) in vv; true: NULL.
-fn bCell(kind: int, src: int, b: &Batch, ex: &BVec, r: int, j: int, iv: mut &int, vv: mut &Val): bool {
-    if src < 0 {
-        iv = ex.v[j]
-        return ex.nul[j]
-    }
-    if b.cols[src].nul[r] { return true }
-    if kind == BK_VAL { vv = b.vals[src][r].clone() } else { iv = b.cols[src].v[r] }
-    return false
-}
-
-fn cellVal(kind: int, nul: bool, iv: int, vv: &Val): Val {
-    if nul { return Val.Null }
-    if kind == BK_INT { return Val.Int(iv) }
-    if kind == BK_BOOL { return Val.Bool(iv == 1) }
-    return vv.clone()
-}
-
-// Row r's ORDER BY keys into slot s; false: a key of values of another
-// kind than the earlier rows' (not sorted here). Its bytes.
-fn ssKeys(set: mut &SortSet, s: int, sel: &Sel, op: &OutPlan, srcs: &[]int, ksrcs: &[]int, b: &Batch, ex: &[]BVec, kex: &[]BVec,
-          r: int, j: int, bytes: mut &int): bool {
-    var n = 32
-    for k in 0..len(set.keys) {
-        n += 24
-        let o = op.kout[k]
-        let kind = if o >= 0 { op.kinds[o] } else { op.kkinds[k] }
-        var iv = 0
-        var vv = Val.Null
-        let nul = if o >= 0 { bCell(kind, srcs[o], b, &ex[o], r, j, mut &iv, mut &vv) } else { bCell(kind, ksrcs[k], b, &kex[k], r, j, mut &iv, mut &vv) }
-        if kind == BK_VAL {
-            let v = if nul { Val.Null } else { ordVal(sel, k, vv) }
-            if !nul {
-                let vk = lexdb_ops.kindOf(&v)
-                if set.vk[k] == 0 { set.vk[k] = vk } else if set.vk[k] != vk { return false }
-                n += lexdb_pipe.valExtra(&v)
-            }
-            putV(mut &set.keys[k].vals, s, v)
-        } else {
-            putI(mut &set.keys[k].ints, s, iv)
-            putF(mut &set.keys[k].nul, s, nul)
-        }
-    }
-    bytes = n
-    return true
-}
-
-// Row r's outputs into slot s. Their bytes.
-fn ssOuts(set: mut &SortSet, s: int, op: &OutPlan, srcs: &[]int, b: &Batch, ex: &[]BVec, r: int, j: int): int {
-    var n = 32
-    for o in 0..len(op.kinds) {
-        n += 24
-        let kind = op.kinds[o]
-        var iv = 0
-        var vv = Val.Null
-        let nul = bCell(kind, srcs[o], b, &ex[o], r, j, mut &iv, mut &vv)
-        putF(mut &set.outs[o].nul, s, nul)
-        if kind == BK_VAL {
-            if !nul { n += lexdb_pipe.valExtra(&vv) }
-            putV(mut &set.ovals[o], s, vv)
-        } else {
-            putI(mut &set.outs[o].v, s, iv)
-        }
-    }
-    return n
-}
-
-// The heap's order: by the keys, then the scan's (a later row tied with an
-// earlier one sorts after it).
-fn hCmp(set: &SortSet, a: int, b: int): int {
-    let c = lexdb_sort.skCmp(&set.keys, 0, len(set.keys), a, b)
-    if c != 0 { return c }
-    return set.seq[a] - set.seq[b]
-}
-
-// The heap (its root the last row in the order) after heap[i] rose.
-fn hUp(set: &SortSet, heap: mut &[]int, i: int) {
-    var c = i
-    while c > 0 {
-        let p = (c - 1) / 2
-        if hCmp(set, heap[c], heap[p]) <= 0 { break }
-        let x = heap[c]
-        heap[c] = heap[p]
-        heap[p] = x
-        c = p
-    }
-}
-
-// ... after heap[i] fell.
-fn hDown(set: &SortSet, heap: mut &[]int, i: int) {
-    let n = len(heap)
-    var c = i
-    while true {
-        let l = 2 * c + 1
-        if l >= n { break }
-        var big = l
-        if l + 1 < n && hCmp(set, heap[l + 1], heap[l]) > 0 { big = l + 1 }
-        if hCmp(set, heap[big], heap[c]) <= 0 { break }
-        let x = heap[c]
-        heap[c] = heap[big]
-        heap[big] = x
-        c = big
-    }
-}
-
-// Whether sel may give its sorted (or DISTINCT) rows as an OutBatch
-// (sortBatches through runSelTo's sink): a query execSel's last branch runs.
-fn sortSinks(sel: &Sel): bool {
-    return sel.setop == 0 && len(sel.srf) == 0 && !sel.aggQ && len(sel.wins) == 0 && len(sel.locks) == 0 &&
-           len(sel.feedback) == 0 && (sel.sort || sel.distinct)
-}
-
-// Runs sel (sorting, or DISTINCT) over batches into res; false: not a
-// query the batches run, or one they gave up (nothing done, the counts as
-// they were). toSink: the rows go to eachB as one OutBatch, which it may
-// refuse (false): it wants them in res.rows.
-fn sortBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: &Mats, params: &[]Val, limit: int,
-               offset: int, sorting: bool, rs: mut &Run, toSink: bool,
-               eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], res: mut &Res): Result[bool, DbErr] {
-    let q = &sel.q
-    if !rs.batch || sel.setop != 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.feedback) > 0 || sel.donKey > 0 ||
-       sel.withTies || sel.topMode != 0 || len(sel.locks) > 0 || len(q.levels) == 0 || hasSrfCall(&sel.exprs) { return Ok(false) }
-    if !sorting && !sel.distinct { return Ok(false) }
-    let got = try outPlan(st, txn, sel, m, params, rs, sorting)
-    if got.isNone() { return Ok(false) }
-    let op = got.unwrap()
-    let lp = &op.lp
-    let bp = &lp.bp
-    let lv = &q.levels[0]
-    let t = &lv.t
-    let zone = txn.sql.zone.clone()
-    let no = len(op.nodes)
-    let nk = if sorting { len(op.knodes) } else { 0 }
-    // ORDER BY with LIMIT: the first limit + offset rows (top-N)
-    let topK = if sorting && limit >= 0 && !sel.distinct { limit + max(offset, 0) } else { -1 }
-    // DISTINCT with LIMIT and no ORDER BY: the scan stops at the rows wanted
-    let early = !sorting && limit >= 0
-    let stopAt = if offset > 0 { limit + offset } else { limit }
-    var cnt0: []lexdb_pipe.Counts = []
-    for c in rs.cnt { append(mut &cnt0, c) }
-    var set = SortSet{outs: [], ovals: [], keys: [], vk: array(nk, 0), seq: [], bytes: [], n: 0}
-    for o in 0..no {
-        append(mut &set.outs, lexdb_rows.bvec(0))
-        append(mut &set.ovals, [])
-    }
-    for k in 0..nk {
-        let kind = if op.kout[k] >= 0 { op.kinds[op.kout[k]] } else { op.kkinds[k] }
-        append(mut &set.keys, lexdb_sort.newSKey(if kind == BK_VAL { lexdb_sort.SK_VAL } else { lexdb_sort.SK_INT }, sel.desc[k], sel.nullsFirst[k]))
-    }
-    // DISTINCT: one integer output by its integer, one text output by its
-    // text (its collation's key), else valsKeyIn's key
-    var dmode = 0
-    if sel.distinct { dmode = if no == 1 && op.kinds[0] != BK_VAL { 1 } else if no == 1 { 2 } else { 3 } }
-    let dkind0 = if len(sel.outKinds) > 0 { sel.outKinds[0] } else { lexdb_sql.COLL_EXACT }
-    var dInts: Map[int, int] = newMap()
-    var dKeys: Map[str, int] = newMap()
-    var dNull = false
-    var heap: []int = []
-    var scr = -1                        // top-N: the slot a row is tried in
-    var held = 0
-    var seq = 0
-    let room = rs.bud.room()
-    let rs0max = rs.bud.maxHeld
-    var stopped = false
-    // top-N whose first key is an integer column of the first table: that
-    // column decoded first, with the conditions', and a row it puts after
-    // the heap's last dropped before its outputs are decoded (9.108)
-    var barCol = -1
-    if topK > 0 && nk > 0 && op.kkinds[0] != BK_VAL {
-        barCol = if op.kout[0] >= 0 { op.src[op.kout[0]] } else { op.ksrc[0] }
-    }
-    let lz = lexdb_pipe.lazyOf(bp, t, &lp.conds, barCol)
-    rs.cnt[0].starts += 1
-    try warmPoints(st, txn, t, &lp.scans)
-    for sc in lp.scans {
-        if stopped { break }
-        var cur = lexdb_access.newCursor()
-        while !cur.done {
-            var bar = lexdb_access.noBar()
-            if barCol >= 0 && len(heap) == topK && set.keys[0].kind == lexdb_sort.SK_INT {
-                let root = heap[0]
-                bar = Bar{on: true, col: barCol, v: set.keys[0].ints[root], nul: set.keys[0].nul[root], desc: set.keys[0].desc,
-                          nf: set.keys[0].nf}
-            }
-            let got1 = try fillPick(st, txn, t, &sc, lp.part, mut &cur, bp, &lp.rd, &lz, &lp.conds, &bar)
-            if got1.isNone() {
-                rs.cnt = cnt0
-                return Ok(false)
-            }
-            var pk = got1.unwrap()
-            var b = replace(mut &pk.b, lexdb_rows.noRows())
-            var idx = replace(mut &pk.idx, [])
-            let nr = b.n
-            if nr == 0 { continue }
-            let nChosen = pk.kept
-            var ex: []BVec = []
-            var kex: []BVec = []
-            var srcs: []int = []
-            var ksrcs: []int = []
-            var failed = false
-            for o in 0..no {
-                match lexdb_pipe.bOutVal(&op.nodes[o], op.src[o], mut &b, &idx, mut &ex, mut &srcs) {
-                    Ok(_) {}
-                    Err(_) { failed = true }
-                }
-                if failed { break }
-            }
-            for k in 0..nk {
-                if failed { break }
-                if op.kout[k] >= 0 {
-                    append(mut &kex, lexdb_rows.bvec(0))
-                    append(mut &ksrcs, -1)
-                    continue
-                }
-                match lexdb_pipe.bOutVal(&op.knodes[k], op.ksrc[k], mut &b, &idx, mut &kex, mut &ksrcs) {
-                    Ok(_) {}
-                    Err(_) { failed = true }
-                }
-            }
-            if failed {
-                rs.cnt = cnt0
-                return Ok(false)
-            }
-            rs.cnt[0].batches += 1
-            var went = nChosen                  // (the rows a bar dropped included)
-            for j in 0..len(idx) {
-                let r = idx[j]
-                seq += 1
-                if dmode > 0 {
-                    var iv = 0
-                    var vv = Val.Null
-                    if dmode == 1 {
-                        if bCell(op.kinds[0], srcs[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
-                            if dNull { continue }
-                            dNull = true
-                        } else {
-                            if dInts.get(&iv).isSome() { continue }
-                            dInts.put(iv, 1)
-                        }
-                    } else if dmode == 2 {
-                        if bCell(op.kinds[0], srcs[0], &b, &ex[0], r, j, mut &iv, mut &vv) {
-                            if dNull { continue }
-                            dNull = true
-                        } else {
-                            var tk = ""
-                            var isText = false
-                            match vv {
-                                Val.Text(x) {
-                                    tk = if dkind0 == lexdb_sql.COLL_EXACT { x } else if dkind0 == lexdb_sql.COLL_CI { lexdb_access.ciKey(&x) } else { lexdb_access.padKey(&x) }
-                                    isText = true
-                                }
-                                else {}
-                            }
-                            if !isText {
-                                rs.cnt = cnt0
-                                return Ok(false)
-                            }
-                            if dKeys.get(&tk).isSome() { continue }
-                            dKeys.put(tk, 1)
-                        }
-                    } else {
-                        var kb = ""
-                        for o in 0..no {
-                            let nul = bCell(op.kinds[o], srcs[o], &b, &ex[o], r, j, mut &iv, mut &vv)
-                            let v = cellVal(op.kinds[o], nul, iv, &vv)
-                            lexdb_access.encIdxPart(mut &kb, &(if o < len(sel.outKinds) { lexdb_sort.collVal(sel.outKinds[o], &v) } else { v }))
-                        }
-                        let dk = kb
-                        if dKeys.get(&dk).isSome() { continue }
-                        dKeys.put(dk, 1)
-                    }
-                }
-                var kb2 = 0
-                if topK >= 0 {
-                    if topK == 0 { continue }
-                    if len(heap) < topK {
-                        let s = set.n
-                        if !ssKeys(mut &set, s, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
-                            rs.cnt = cnt0
-                            return Ok(false)
-                        }
-                        let ob = ssOuts(mut &set, s, &op, &srcs, &b, &ex, r, j)
-                        putI(mut &set.seq, s, seq)
-                        putI(mut &set.bytes, s, kb2 + ob)
-                        set.n += 1
-                        held += kb2 + ob
-                        append(mut &heap, s)
-                        hUp(&set, mut &heap, len(heap) - 1)
-                    } else {
-                        if scr < 0 {
-                            scr = set.n
-                            set.n += 1
-                        }
-                        if !ssKeys(mut &set, scr, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
-                            rs.cnt = cnt0
-                            return Ok(false)
-                        }
-                        putI(mut &set.seq, scr, seq)
-                        // the last kept beats it (or ties: it came first)
-                        if hCmp(&set, scr, heap[0]) >= 0 { continue }
-                        let ob = ssOuts(mut &set, scr, &op, &srcs, &b, &ex, r, j)
-                        putI(mut &set.bytes, scr, kb2 + ob)
-                        held += kb2 + ob - set.bytes[heap[0]]
-                        let gone = heap[0]
-                        heap[0] = scr
-                        scr = gone
-                        hDown(&set, mut &heap, 0)
-                    }
-                } else {
-                    let s = set.n
-                    if !ssKeys(mut &set, s, sel, &op, &srcs, &ksrcs, &b, &ex, &kex, r, j, mut &kb2) {
-                        rs.cnt = cnt0
-                        return Ok(false)
-                    }
-                    let ob = ssOuts(mut &set, s, &op, &srcs, &b, &ex, r, j)
-                    putI(mut &set.seq, s, seq)
-                    putI(mut &set.bytes, s, kb2 + ob)
-                    set.n += 1
-                    held += kb2 + ob
-                }
-                if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
-                if early && set.n >= stopAt {
-                    went = j + 1
-                    stopped = true
-                    break
-                }
-            }
-            // counted as the row path counts them (batchLevel)
-            rs.cnt[0].read += nr - nChosen + went
-            rs.cnt[0].joined += went
-            try rs.bud.tickN(nr - nChosen + went)
-            if stopped { break }
-        }
-    }
-    // the order
-    var perm: []int = []
-    if topK >= 0 {
-        // the heap's rows in the scan's order, then sorted by their keys (stable)
-        var hs: []int = []
-        for x in heap { append(mut &hs, x) }
-        collections.sortBy(mut &hs, fn(a: &int, b: &int): int { return set.seq[a] - set.seq[b] })
-        var tmp: []int = array(len(hs), 0)
-        lexdb_sort.skMerge(&set.keys, 0, nk, mut &hs, 0, len(hs), mut &tmp)
-        perm = hs
-    } else if sorting {
-        for k in 0..nk {
-            if set.keys[k].kind != lexdb_sort.SK_VAL { continue }
-            let vs = replace(mut &set.keys[k].vals, [])
-            var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, sel.desc[k], sel.nullsFirst[k])
-            if !lexdb_sort.skOfVals(vs, sel.desc[k], sel.nullsFirst[k], mut &key) {
-                rs.cnt = cnt0
-                return Ok(false)
-            }
-            set.keys[k] = key
-        }
-        perm = lexdb_sort.skSort(mut &set.keys, set.n)
-    } else {
-        for i in 0..set.n { append(mut &perm, i) }
-    }
-    try rs.bud.hold(held)
-    let from = min(if offset > 0 { offset } else { 0 }, len(perm))
-    var to = len(perm)
-    if limit >= 0 && from + limit < to { to = from + limit }
-    var outs: []OutCol = []
-    for oc in sel.outs { append(mut &outs, oc.clone()) }
-    res = Res{cols: outs, rows: [], tag: "SELECT " + (to - from).toStr(), hasRows: true, copy: COPY_NONE}
-    if toSink && to > from {
-        // one OutBatch, its places the sorted rows': less work than pieces
-        // (gathered in order, or each its places), measured (9.105)
-        var oidx: []int = withCapacity(to - from)
-        for i in from..to { append(mut &oidx, perm[i]) }
-        var srcs: []int = []
-        for o in 0..no { append(mut &srcs, o) }
-        var ob = OutBatch{n: to - from, kinds: collections.copyOf(&op.kinds), src: srcs, idx: oidx, cols: replace(mut &set.outs, []),
-                          vals: replace(mut &set.ovals, []), ex: []}
-        if try eachB(txn, &ob) { return Ok(true) }
-        // not wanted so: the rows in res
-        set.outs = replace(mut &ob.cols, [])
-        set.ovals = replace(mut &ob.vals, [])
-    }
-    for i in from..to {
-        let s = perm[i]
-        var row: []Val = withCapacity(no)
-        for o in 0..no {
-            let kind = op.kinds[o]
-            if set.outs[o].nul[s] { append(mut &row, Val.Null) }
-            else if kind == BK_VAL { append(mut &row, replace(mut &set.ovals[o][s], Val.Null)) }
-            else if kind == BK_BOOL { append(mut &row, Val.Bool(set.outs[o].v[s] == 1)) }
-            else { append(mut &row, Val.Int(set.outs[o].v[s])) }
-        }
-        append(mut &res.rows, row)
-    }
-    return Ok(true)
-}
-
-
-
 
 // The query's columns a grouped select reads after grouping: those its
 // outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.

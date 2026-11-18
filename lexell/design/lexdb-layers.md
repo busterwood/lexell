@@ -5715,6 +5715,125 @@ So 1,041 lines left exec (6.2 estimated ~1,000).
   `cols`, `cnd`, `lo`, `hi`, `span` directly. Narrowing that is E5's,
   with the planner's move.
 
+#### 6.2.12 P3 as built: Sort, top-N and DISTINCT in the pipeline
+
+Built 2026-11-18 on `redesign/bind` from main f0dddc5e. Scripts and
+outputs are in the session scratchpad's `p3/` (`qc.sh`: per statement,
+the server's instructions and the output's md5).
+
+**Commits:**
+
+- 25aeed14 (P3a): the sort keys move unchanged into a new module,
+  `lexdb_sort` (412 lines): `SKey`, `skSort` and its helpers (from exec),
+  `sortCmp` (from the pipe), `collVal` (from exec). The pipe's Sort and
+  the row engine's sorts and windows share them. `imports.py`: it imports
+  values, their operations and encodings only (`lexdb_sql`, `lexdb_ops`,
+  `lexdb_vec`, `lexdb_access`); only the pipe and exec import it.
+- P3b and P3c (one commit): the operator, the plan's keys, the deletions,
+  and the top-N bar.
+
+**The plan** (`lexdb_plan`):
+
+- `Sort(PPlan, bool, Option[PSort])`: a sort the pipeline runs holds its
+  keys (`PSort`: per key the Project's column it reads, DESC, NULLS
+  FIRST, its collation's kind; `shown`, the outputs given). `None` in a
+  view (physOf's).
+- `Distinct(PPlan, bool, []int)`: the outputs' collation kinds (`[]` in a
+  view).
+- exec's `pipeSelMain` makes `Limit? (Sort? (Distinct? (Project (...))))`
+  as `physAbove` makes them, so EXPLAIN prints the same lines. An ORDER BY
+  key that is an output (by position or name: `orderOut`) reads it; any
+  other is bound for the plan (`planX`) and made by the Project after the
+  outputs (a "hidden" column the Sort does not give). `sortShape` is the
+  accept check: no grouping, window, set operation, lock, DISTINCT ON,
+  WITH TIES, TOP, SELECT @v, function returning rows, or correlated
+  output or key.
+
+**What the pipe does** (`lexdb_pipe`, the section "ORDER BY, top-N and
+DISTINCT over chunks"): the Sort sits over the Project's output, so the
+scan, the joins and the Project are unchanged. Its state (`SortSt`) takes
+each chunk (`eat`: an OutBatch, or a row read one by one) into typed
+columns (`SortSet`), keeps a bounded heap for ORDER BY with LIMIT, a set
+of seen outputs for DISTINCT (`DistSet`, made only for a DISTINCT), stops
+the scan for DISTINCT with LIMIT and no ORDER BY, and at the end sorts by
+the typed keys and gives the rows kept as one OutBatch (`finish`), their
+bytes held in the budget. It is `sortBatches`' logic, now fed by any
+Project the pipe runs, so it serves:
+
+- one table, in batches or row by row (point lookups, a range's keys
+  read first): the row path is no longer a give-way;
+- joins (`runJ`'s chunks): ORDER BY and DISTINCT over joins are the
+  pipeline's again (P2 had sent them to the row engine's sort);
+- the top-N bar (P3c, 9.108): for ORDER BY with LIMIT whose first key is
+  an integer column of the first table, the scan decodes that column first
+  and drops the rows the heap's last row beats before decoding the rest.
+  The sort's state is passed down the one-table scan (`runOp`, `runScan`,
+  `rowsFrom`, `oneRow` take a `SortRun`: one state, or none when the rows
+  stream), so the scan reads the bar per batch; joins feed the sort
+  through their callback (no bar).
+
+A column's kind is its first input's (a row read one by one: values).
+Keys of values of mixed kinds, or a DISTINCT text output that is not a
+text, end the run in `batErr` before any row is given, and exec runs the
+row engine, as `sortBatches` gave way.
+
+**Exec:** `pipeHeld` does not count a sorted program's rows again (the
+Sort held them); `runSelTo` streams a sorted program's one OutBatch to the
+client's sink (asked once; refused, the rows are held), and falls back to
+`runSel` on `batErr`.
+
+**Deleted from exec:** `sortBatches`, `SortSet`, `ssKeys`, `ssOuts`,
+`bCell`, `cellVal`, the heap (`hCmp`, `hUp`, `hDown`), `sortSinks`,
+`outPlan`, `OutPlan`, `outNodeX`, `outNodeOut`; `execSelTo`'s sink
+parameters (it is `execSelIn`). The batch engine's sort is the pipe's now.
+
+**Line counts:**
+
+| | main f0dddc5e | P3a | P3b+c |
+|---|---:|---:|---:|
+| `lexdb_exec` | 24,315 | 23,929 | 23,474 |
+| `lexdb_pipe` | 5,087 | 5,074 | 5,645 |
+| `lexdb_sort` | | 412 | 412 |
+| `lexdb_plan` | 394 | 394 | 410 |
+
+841 lines left exec (6.2.3 estimated ~550 for `batch.sort` and the rest
+of `batch.out`; the sort keys' module is the difference). The secrets
+that left it: how rows are put in order (`lexdb_sort`), and how a sort,
+top-N and DISTINCT run over batches (the pipe).
+
+**Gates:**
+
+- Suite: 190 passed, imports ok (48 modules, 229 edges), at P3a and at
+  the end. Two counters moved up, as intended: `exec_batchsort` "given as
+  an OutBatch" 155 to 198 of 400 (P2's 198 again: sorted joins), and
+  `exec_batchindex` 134 to 171 (164 before P2). Every query the same three
+  ways; the counts of a sort, a top-N and a DISTINCT stopped by its LIMIT
+  the row path's.
+- TPC-H, SF1: the 22 results are main's (md5 of each output); instructions
+  -0.01% (its sorts are over grouped output: unchanged).
+- 16 sort statements over the TPC-H data (`qc.sh`), against main: all
+  the same results; a sorted join -40%, top-N by an integer column not in
+  the scan's order -43% (before the bar: +257%, so P3c is needed), DISTINCT
+  over two columns -6%, top-N by a numeric -8.5%, the rest within 1%
+  (two read an index in order and do not sort).
+- Point selects (`icount.sh`, three rounds): instructions +0.12% (187.4k
+  to 187.6k a statement); cycles +1.5% to 2.2%, P3a alone +0.0% to 0.9%;
+  with `LXL_PADB 32 / LXL_FALIGN 128` +1.2% to 2.0%. A cycles profile of
+  both shows no function changed (5,757 against 5,776 samples). Not
+  resolved: an empty `SortRun` per run and the plan's larger arms are what
+  a point select pays. An earlier form that made two empty maps per run
+  cost +1.1% instructions.
+
+**Hand-over:**
+
+- Not taken: DISTINCT ON, WITH TIES, TOP (PERCENT), the sort of a set
+  operation's rows, of grouped rows (the views over an aggregate's groups
+  are still exec's), of windowed rows. A Sort over the Agg's groups is the
+  next step for these (TPC-H's final sorts).
+- The bar is one table's: a top-N over joins sorts every joined row.
+- `runSelTo` streams a sort's rows as one OutBatch; a large sort's output
+  could go in pieces.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does

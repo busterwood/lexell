@@ -129,8 +129,12 @@ pub type PPlan = closed {
     Window(PPlan)                   // the window calls (over the groups when it aggregates)
     Project(PPlan, []lexdb_bind.BX) // the select list: per output its expression bound over the query's columns (moved
                                     // from Sel.ox; a column as its slot); [] in a view, where the Sel holds them
-    Distinct(PPlan, bool)           // true: DISTINCT ON
-    Sort(PPlan, bool)               // ORDER BY: true sorted (a top-N under a LIMIT), false the scan's order
+    // true: DISTINCT ON; the outputs' collations' kinds (lexdb_sql.COLL_*), a
+    // DISTINCT the pipeline runs (slice P3; [] in a view)
+    Distinct(PPlan, bool, []int)
+    // ORDER BY: true sorted (a top-N under a LIMIT), false the scan's order;
+    // the keys of a sort the pipeline runs (slice P3; None in a view)
+    Sort(PPlan, bool, Option[PSort])
     Lock(PPlan)                     // FOR UPDATE and the like
     // LIMIT, OFFSET, FETCH, TOP; true: it stops the scan (no aggregate or
     // sort under it); the count (-1 none: TOP PERCENT, WITH TIES, or an
@@ -195,6 +199,18 @@ pub type PJoin = record {
     pub rng: []PBound           // JH_RANGE: its bounds on the column after the equalities (constants of the run)
     pub capNulls: bool          // JH_RANGE: an index's range leaves out its next column's NULLs
     pub noNulls: bool           // JH_RANGE: the path's (Path.noNulls), for a range read in pieces
+}
+
+// ORDER BY's keys for a Sort the pipeline runs (slice P3). The Project
+// under it makes the outputs, then (after shown of them) the keys that are
+// not outputs. Per key: the Project's column it reads, DESC, NULLS FIRST,
+// and its collation's kind (lexdb_sql.COLL_*).
+pub type PSort = record {
+    pub shown: int
+    pub out: []int
+    pub desc: []bool
+    pub nf: []bool
+    pub coll: []int
 }
 
 // A range's bound: ">", ">=", "<" or "<=" its value.
@@ -288,9 +304,9 @@ fn planUses(p: &PPlan, used: mut &[]bool) {
             for x in xs { uses(&x, used) }
         }
         PPlan.Limit(i, _, _, _) { planUses(&i, used) }
-        PPlan.Sort(i, _) { planUses(&i, used) }
+        PPlan.Sort(i, _, _) { planUses(&i, used) }
         PPlan.Having(i) { planUses(&i, used) }
-        PPlan.Distinct(i, _) { planUses(&i, used) }
+        PPlan.Distinct(i, _, _) { planUses(&i, used) }
         PPlan.Match(i) { planUses(&i, used) }
         else {}
     }
@@ -309,9 +325,9 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Agg(i, sets, pa) { return PPlan.Agg(withNeeds(i, used), sets, pa) }
         PPlan.Project(i, xs) { return PPlan.Project(withNeeds(i, used), xs) }
         PPlan.Limit(i, stops, n, off) { return PPlan.Limit(withNeeds(i, used), stops, n, off) }
-        PPlan.Sort(i, sorted) { return PPlan.Sort(withNeeds(i, used), sorted) }
+        PPlan.Sort(i, sorted, ps) { return PPlan.Sort(withNeeds(i, used), sorted, ps) }
         PPlan.Having(i) { return PPlan.Having(withNeeds(i, used)) }
-        PPlan.Distinct(i, on) { return PPlan.Distinct(withNeeds(i, used), on) }
+        PPlan.Distinct(i, on, ks) { return PPlan.Distinct(withNeeds(i, used), on, ks) }
         PPlan.Match(i) { return PPlan.Match(withNeeds(i, used)) }
         PPlan.Levels(n, subs) { return PPlan.Levels(n, subs) }
         PPlan.Result(subs) { return PPlan.Result(subs) }
@@ -366,8 +382,8 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.Having(i) { return pSubs(&i) }
         PPlan.Window(i) { return pSubs(&i) }
         PPlan.Project(i, _) { return pSubs(&i) }
-        PPlan.Distinct(i, _) { return pSubs(&i) }
-        PPlan.Sort(i, _) { return pSubs(&i) }
+        PPlan.Distinct(i, _, _) { return pSubs(&i) }
+        PPlan.Sort(i, _, _) { return pSubs(&i) }
         PPlan.Lock(i) { return pSubs(&i) }
         PPlan.Limit(i, _, _, _) { return pSubs(&i) }
         PPlan.Match(i) { return pSubs(&i) }
@@ -384,8 +400,8 @@ pub fn pLeaf(p: &PPlan): &PPlan {
         PPlan.Having(i) { return pLeaf(&i) }
         PPlan.Window(i) { return pLeaf(&i) }
         PPlan.Project(i, _) { return pLeaf(&i) }
-        PPlan.Distinct(i, _) { return pLeaf(&i) }
-        PPlan.Sort(i, _) { return pLeaf(&i) }
+        PPlan.Distinct(i, _, _) { return pLeaf(&i) }
+        PPlan.Sort(i, _, _) { return pLeaf(&i) }
         PPlan.Lock(i) { return pLeaf(&i) }
         PPlan.Limit(i, _, _, _) { return pLeaf(&i) }
         PPlan.Match(i) { return pLeaf(&i) }
