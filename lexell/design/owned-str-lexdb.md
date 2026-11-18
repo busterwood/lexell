@@ -241,3 +241,53 @@ servers' binds, the follower's reads, the store's own-write paths).
   so each arm that keeps it clones.
 - `Map.at`/`Map.get` take the key by value: lookups with a borrowed key
   clone it (per wire message in pgwire).
+
+## 5. After the migration: the language points fixed (2026-11-18)
+
+Each of section 4's "language points met" was checked against the compiler
+and fixed on `main`. lexdb compiles unchanged with all of them (verified:
+it builds, and its suite passes, 190, natively). They only accept more
+programs, except where noted, so the workarounds can be removed at leisure.
+
+| # | Change | Commit | lexdb compiles unchanged? | Behaviour change |
+|---|---|---|---|---|
+| Y | SPEC 10 rule 5: a method whose receiver is a borrow returns a borrow of its receiver; its other borrowed parameters are only read. `Map.at` and `Map.atMut` take the key as `&K`. | (this commit) | yes (call sites borrow implicitly; a method that returned a borrow of another parameter could not exist before) | none |
+| Z | SPEC 5.2, 10 rule 5: a set-once global's value is static data, so a function may return a borrow of it (`fn utc(): &Zone { return UTC.get() }`). The error for a function without borrowed parameters now says "static data (literals, constants and set-once globals)". | (this commit) | yes | none |
+| AA | SPEC 10 rule 4: a `let` of a borrow given by an `if` or `match` freezes only the places its branches borrow (`let to = if c { &cur.at } else { hi }` leaves `cur.started` writable). | (this commit) | yes | none |
+| AB | SPEC 9.3: `match h.f`, where local record `h` (no drop method) is not used after the match and `f` is of an owned closed type (no drop method), moves `h.f`, as `match move(h).f` does. | (this commit) | yes | **Drop timing:** `h`'s other fields drop at the match instead of at the end of `h`'s scope. Only visible through `drop` methods with side effects. |
+| AC | SPEC 10 rule 7: a `var` may hold a shared borrow (`var best: &str = &xs[0]`; `&[]T` too). Its initializer gives its roots; later stores borrow from them or are static; the roots are frozen whole while it is live. `var` of `mut &` is still an error. Also: `xs[i] = v` after the last use of a borrow of `xs` is no longer refused. | (this commit) | yes | none |
+| AD | The error for a constant of a boxed type says to declare a `value record` / `value closed`, or to use a set-once global. | (this commit) | yes | none |
+
+**Against section 4's points:**
+
+- *A global cannot be borrowed, and a const must be a copy type* (the UTC
+  `Zone`). Keep one `Zone` in a set-once global and lend it from a function
+  (Z): `var UTC_ZONE: once Zone`, set once at start-up (or on first use with
+  `isSet()`), and `fn utc(): &Zone { return UTC_ZONE.get() }`. Callers that
+  make and drop a UTC zone per comparison can take `utc()` instead. A plain
+  `var` global still has value-only access, and a `const` must still be a
+  value type: neither changed.
+- *A `var` cannot hold a `&str`, so a borrow chosen in a loop is a clone.*
+  It can now (AC): `var best: &str = &rows[0].k; for ... { best = &rows[i].k }`.
+  Initialise it from a value that borrows every root it will later borrow
+  (an `if` over them, if there are several), or a static string won't do:
+  `var s: &str = ""` has no roots, so it can later hold only static strings.
+- *A field borrowed through a `mut &` parameter still blocked writes to the
+  other fields.* The cause was the `if` choosing the borrow, not the
+  parameter (a direct `let to = &cur.at` already froze only `cur.at`). Fixed
+  by AA; the reordered code can go back to its natural order.
+- *`match` on a field cannot move the bound value.* For a local that is not
+  used afterwards it now moves (AB): drop the arms' clones there. Through a
+  `mut &` (`match b.v` with `b: mut &Rec`) it is still a borrow, as it must
+  be: write `match replace(mut &b.v, X.Empty) { ... }` to take the value.
+- *`Map.at`/`Map.get` take the key by value.* `get`, `getOr` and `has`
+  already took `&K`; `at` and `atMut` now do too (Y). pgwire's per-message
+  key clones for these lookups can go: pass the key as it is.
+
+**Not changed:** a method returning a borrow of one field still freezes its
+whole receiver (`let s = d.name()` then `d.pos += 1` is refused), because
+the signature does not say which field it borrows. Borrow the field
+directly (`&d.s`) where the other fields are written. A branch that borrows
+through another borrow (`if c { x } else { &d.b }` with `let x = &d.a`)
+freezes `d` whole.
+

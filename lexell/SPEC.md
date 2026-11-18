@@ -484,7 +484,9 @@ owned or copy, that starts empty and is set at most once:
 - `CONFIG.get()` returns a `&Config` borrow. Reading it before it is set
   stops the program (exit 12). `CONFIG.isSet()` tells which.
 - Once set, the value never changes and is not freed until the program ends,
-  so a borrow from `get()` is valid everywhere and freezes nothing.
+  so a borrow from `get()` is valid everywhere and freezes nothing. A
+  function may return it, even one without borrowed parameters
+  (`fn utc(): &Zone { return UTC.get() }`).
 - When `main` returns, the set-once globals are dropped (section 9.4). Each
   is first marked dropped, which makes it empty again: `isSet()` is false, and
   `get()` or `set(v)` from then on (in a drop method, including its own) stops
@@ -923,7 +925,11 @@ a borrowed parameter (`fn name(e: &E): &str { match e { E.S(s) { return s }
 A `match` directly on a local variable of an owned closed type without a
 `drop` method, where the variable is not used again (not in the arms, the
 rest of the statement, a later statement, or a loop around the match that it
-is declared outside of), consumes it as `match move(x)` would.
+is declared outside of), consumes it as `match move(x)` would. In the same
+way, `match h.f`, where `h` is such an unused local of a record type without
+a `drop` method and `f` is of an owned closed type without one, consumes
+`h.f` as `match move(h).f` would: `h`'s other fields are dropped there
+(section 9.1).
 `match` on any other expression (a call result, `move(x)`) consumes it: the
 bindings own the fields, and fields not bound (or bound to `_`) are dropped at
 the start of the arm, before its body runs; an arm naming several variants, like
@@ -1012,7 +1018,11 @@ borrows, or a type parameter declared `borrow` (section 6.1).
    A `let` borrow of a place, and a `for` loop over one, freeze only that
    place: while `let s = &d.f` is live, `d.g` may be assigned or mutably
    borrowed, but `d.f`, anything under it, and `d` itself may not (places
-   overlap as in rule 3). Other freezes cover the whole root.
+   overlap as in rule 3). A `let` of a borrow given by an `if` or `match`
+   expression freezes each place a branch borrows in the same way
+   (`let to = if c { &cur.at } else { hi }` leaves `cur.started` writable); a
+   branch that borrows through another borrow freezes that borrow's roots
+   whole. Other freezes cover the whole root.
    A local variable is live from its declaration to its last use: while its
    name occurs later in its block (in a statement after the current one, or
    in the rest of the current statement; the right side of a plain
@@ -1025,10 +1035,13 @@ borrows, or a type parameter declared `borrow` (section 6.1).
 5. **Results.** A function whose result holds borrows has as its *sources*
    the parameters (and receiver) that are or hold borrows. A result that is a
    plain borrow has at most one, and a `mut &` result exactly one, a `mut &`
-   parameter. A function without sources may return only static borrows
-   (string literals and constants), and its result has no root. Every
-   `return` (and every
-   `try` that returns an `Err` holding borrows) must be rooted at its
+   parameter. A method whose receiver is a borrow and that returns a plain
+   borrow has its receiver as its one source, whatever else it borrows: its
+   other borrowed parameters are only read (`m.at(&k)` borrows `m`, not
+   `k`). A function without sources may return only static borrows
+   (string literals, constants, and the values of set-once globals, section
+   5.2), and its result has no root. Every `return` (and every `try` that
+   returns an `Err` holding borrows) must be rooted at its
    sources: at a borrowed parameter itself, written `return &p.f` or
    `return mut &p.f` (or a borrow returned by such a call), or, when that
    parameter holds borrows or borrows a value that does, at what it holds,
@@ -1043,7 +1056,11 @@ borrows, or a type parameter declared `borrow` (section 6.1).
    borrows; every later store must have roots among them, and the roots must
    be declared before the variable, in its block or around it. The first such
    store inside a loop that the variable is declared outside of may not take a
-   `var` as a root. A `var` of a plain borrow type is an error.
+   `var` as a root. A `var` may also have a shared borrow type (`var best:
+   &str = &xs[0]`): its initializer gives its roots, every later store must
+   borrow from them or be static, and while the `var` is live its roots are
+   frozen whole (not just the place first borrowed). A `var` of a `mut &`
+   type is an error.
 
 A `match` on a place of an owned type whose arm binds a field as a borrow
 freezes the place's root (rule 4) while the binding is live.

@@ -1325,7 +1325,9 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
     }
     match k {
         sx.N_TREF, sx.N_TSLICE {
-            if pos != P_PARAM && pos != P_RET && pos != P_LET && pos != P_FIELD && pos != P_ELEM && pos != P_TARG {
+            // a var may hold a shared borrow (SPEC 10 rule 7)
+            if pos != P_PARAM && pos != P_RET && pos != P_LET && pos != P_FIELD && pos != P_ELEM && pos != P_TARG &&
+                    !(pos == P_VAR && !isMut) {
                 pg.err(m, pg.orWhere(where, m, a), "a borrow type cannot be " + posWhat(pos) +
                     ": borrows are second class")
             }
@@ -1694,6 +1696,9 @@ fn (pg: mut &Program) resolveFn(f: int) {
                 if first < 0 { first = i }
             }
         }
+        // a method with a borrowed receiver returns a borrow of it: its other borrowed parameters are
+        // only read (m.at(&k); SPEC 10 rule 5)
+        if count > 1 && first == 0 && (pg.fns[f].recvMode == RM_REF || pg.fns[f].recvMode == RM_MUT) { count = 1 }
         // none: every borrow it returns is static (a string literal or constant; SPEC 10 rule 5)
         if count > 1 || (count == 0 && pg.tm(ret)) {
             pg.err(m, a.line, pg.label(f) + " returns a" + (if pg.tm(ret) { " mut" } else { "" }) + " borrow, so it " +
@@ -1848,7 +1853,19 @@ pub fn (pg: mut &Program) constValue(c: int): CVal {
             let et = if pg.tk(t) == TK_ARR { pg.ta(t) } else { t }
             // a constant is static data: a str (or a value built of strings) reads as a view, or as
             // a new owned value where one is expected, as a literal does (design/owned-str.md)
-            if !pg.isCopyLegacy(et) { pg.err(m, line, "const " + name + ": " + pg.tstr(et) + " is not a copy type") }
+            if !pg.isCopyLegacy(et) {
+                let tn = pg.tstr(et)
+                let hint = " For one shared value made at run time, use a set-once global (var " + name + ": once " +
+                    pg.tstr(t) + ") and lend it with " + name + ".get()."
+                if pg.tk(et) == TK_INST && (pg.types[pg.ta(et)].form == sx.F_RECORD || pg.types[pg.ta(et)].form ==
+                        sx.F_CLOSED) && !pg.types[pg.ta(et)].value {
+                    pg.err(m, line, "const " + name + ": " + tn + " is boxed, and a constant must be a value type: " +
+                        "declare it `value " + (if pg.types[pg.ta(et)].form == sx.F_RECORD { "record" } else { "closed" }) +
+                        "` if its fields are copy types, strings or value types." + hint)
+                }
+                pg.err(m, line, "const " + name + ": " + tn + " cannot be a constant: a constant is built from copy " +
+                    "types, strings and value records or closed types." + hint)
+            }
             pg.consts[c].table = t
             pg.consts[c].value = cv(t, CK_TABLE)
             pg.consts[c].busy = false

@@ -409,3 +409,53 @@ whether it was confirmed with a test.
     compare. This is a library gap rather than a language one:
     `exclude.is(&d.path)` (an `Option[T]` method comparing with `&T`), or
     `==` between `Option[T]` and `Option[&T]`.
+
+### Found migrating lexdb (fixed 2026-11-18)
+
+lexdb's migration (design/owned-str-lexdb.md section 4) listed five
+"language points met". Checked against the compiler, four were right; the
+fifth had a different cause. Fixed on `main` (changes Y to AD in the lexdb
+note):
+
+14. **A lookup with a borrowed key cloned it.** `Map.at` and `Map.atMut`
+    took the key by value (`get`, `getOr` and `has` already borrowed it):
+    pgwire cloned a key per message. They could not take `&K`, because a
+    function returning a borrow needed exactly one borrowed parameter, and
+    the map and the key are two. Rule: a method whose receiver is a borrow
+    returns a borrow of its receiver; its other borrowed parameters are only
+    read (SPEC 10 rule 5). It only accepts more programs.
+15. **No shared record for the whole program.** A `const` must be a value
+    type (a `Zone` holding an `rc` is not), and a plain global cannot be
+    borrowed. A set-once global (`var UTC: once Zone`) holds any type, and
+    `UTC.get()` is a borrow valid everywhere, but a function could not
+    return it (`fn utc(): &Zone { return UTC.get() }`: no borrowed parameter,
+    so only literals and constants). Now a set-once global's value is static
+    data a function may return (SPEC 5.2, 10 rule 5). Sound because a
+    set-once global is never changed or freed before exit, and at exit it is
+    marked dropped before its drop runs, so a later `get()` stops the program
+    (exit 12; red-team case o15 now checks this under the sanitizers).
+    The const error now names both ways out (`value record`, `once`).
+16. **A borrow chosen by `if` or `match` froze its roots whole.**
+    `let to: &str = if started { &cur.at } else { hi }` blocked
+    `cur.started = true`. lexdb's note blamed the `mut &` parameter; the
+    cause was the `if`: issue 1's path freezes applied only to a direct
+    `&p.f`. Now each branch's place is frozen (SPEC 10 rule 4). A branch
+    that borrows through another borrow still freezes that borrow's roots
+    whole.
+17. **`match b.v` could not move the bound value**, so arms that kept it
+    cloned. Issue 9's rule covered a whole local only. Now a `match` on a
+    field of a local record (no drop method) that is not used afterwards,
+    of an owned closed type (no drop method), moves the field, as
+    `match move(b).v` does: the record's other fields drop at the match
+    (SPEC 9.3). Through a `mut &` parameter it is still a borrow (it would
+    leave a hole in the caller's record): `replace` it.
+18. **A `var` could not hold a borrow**, so a borrow chosen in a loop
+    (`best`) was a clone. Now a `var` may hold a shared borrow: its
+    initializer gives its roots, later stores borrow from them (or are
+    static), and the roots are frozen whole while it is live (SPEC 10 rule
+    7, as for `var`s of types holding borrows). `var` of `mut &` stays an
+    error. Found with it: a write to an element (`xs[i] = v`) was refused
+    for as long as any borrow of `xs` was in scope, even after its last use,
+    because the liveness check treated an index target as using every name;
+    it now looks only at the base and the index expressions.
+
