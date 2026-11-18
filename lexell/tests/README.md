@@ -73,9 +73,11 @@ every program's behaviour.
 
 `python3 lexell/tests/vrgen.py [-n N] [--seed S] [--keep DIR]` generates programs that pass
 value records with heap fields through small functions (by value, by borrow, receivers,
-results, copies, array elements, match arms, loops, `x = f(x)`), builds each through C and
-natively, and requires the same output and exit code under LXL_CHECK=1: a check of the
-native backend's inlining and record rewrites (compiler/opt.lxl), where a leak shows.
+results, copies, array elements, match arms, loops, `x = f(x)`), and reads, writes and reads
+again fields of heap records in straight-line code (directly and through `mut &` callees), builds
+each through C, natively and with `--native -O`, and requires the same output and exit code under
+LXL_CHECK=1: a check of the native backend's inlining and record rewrites (compiler/opt.lxl),
+where a leak shows, and of -O's load reuse (compiler/cse.lxl).
 
 `python3 lexell/tests/loopgen.py [-n N] [--seed S] [--keep DIR]` does the same with programs of
 array loops (steps up and down, `<=` bounds, for ranges, nested loops; bodies that read and

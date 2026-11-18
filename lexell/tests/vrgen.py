@@ -8,7 +8,11 @@ Each program passes value records with `str` fields (every other program also an
 around small functions: by value, by borrow, as receivers, results, moves, clones, array elements,
 `replace`, `swap`, `pop`, match arms, loops and `x = f(x)`. `str` is owned, so the records are
 owned: the generator tracks which variables hold a value and moves or clones them by the rules of
-SPEC section 9.1, so every program it writes is valid Lexell. Each program is built through C and
+SPEC section 9.1, so every program it writes is valid Lexell. Each program also has a part for
+native -O's load reuse (compiler/cse.lxl): straight-line reads of int fields of heap records (in
+locals, an array, and through `mut &` parameters of functions too big to inline), written
+between the reads directly or by callees that take `mut &` (small ones, inlined, and big ones,
+left calls), then read again, the same field or another. Each program is built through C and
 with --native and with --native -O, all three run under LXL_CHECK=1 (a leak exits 5), and their
 exit codes, stdout and stderr must be equal; the C run must also exit 0 with output. A program either build rejects
 counts as `not compiled`, and like `differ` (outputs differ, or a timeout) and `failed alike`
@@ -264,9 +268,176 @@ def gen(rng, opt_field):
     return head(opt_field) + 'fn main() {\n' + '\n'.join(lines) + '\n}\n'
 
 
+# Heap records for the native -O load reuse (compiler/cse.lxl): a field read through memory in
+# two loads or more (`h.r.a` of a local, `r.a` of a `mut &CA` parameter, `arr[i].a`) is held
+# along straight-line code, and a statement that writes memory or calls must drop what it held.
+# The callees take `mut &CA` (or `mut &CH`) and write one field: csa and csb are small, so the
+# inliner (compiler/opt.lxl, limit 25 nodes) makes their writes direct; cwa, cwb, cva, cvb and
+# cwd are bigger than that limit and stay calls. Field c of CA is written only directly, so a
+# read of c after a call checks that a call does not change what it cannot reach.
+CSE_HEAD = '''
+type CA = record { a: int; b: int; c: int }
+type CH = record { r: CA; d: int }
+
+fn csa(r: mut &CA, k: int) { r.a = r.a + k + 1 }
+fn csb(r: mut &CA, k: int) { r.b = r.b + k + 2 }
+fn cwa(r: mut &CA, k: int) {
+    var t = k * 7 + r.c % 13
+    t = t * 5 % 101 + 3
+    if t > 50 { t = t - 17 } else { t = t + 11 }
+    let u = t * 3 % 11 + r.b % 5
+    r.a = r.a + 1 + t % 13 + u
+}
+fn cwb(r: mut &CA, k: int) {
+    var t = k * 11 + r.a % 7
+    t = t * 3 % 97 + 5
+    if t > 40 { t = t - 13 } else { t = t + 7 }
+    let u = t * 5 % 13 + r.c % 3
+    r.b = r.b + 2 + t % 11 + u
+}
+fn cva(r: mut &CA, k: int): int {
+    var t = k * 5 + r.b % 11
+    t = t * 7 % 89 + 1
+    if t > 30 { t = t - 9 } else { t = t + 4 }
+    let u = t * 3 % 7 + r.c % 5
+    r.a = r.a + 3 + t % 17 + u
+    return t % 10 + u
+}
+fn cvb(r: mut &CA, k: int): int {
+    var t = k * 13 + r.c % 9
+    t = t * 3 % 83 + 2
+    if t > 35 { t = t - 11 } else { t = t + 6 }
+    let u = t * 7 % 9 + r.a % 4
+    r.b = r.b + 1 + t % 19 + u
+    return t % 8 + u
+}
+fn cwd(h: mut &CH, k: int) {
+    var t = k * 3 + h.d % 17
+    t = t * 7 % 61 + 2
+    if t > 25 { t = t - 8 } else { t = t + 5 }
+    let u = t * 3 % 5 + h.r.a % 3
+    h.d = h.d + 1 + t % 7
+    h.r.c = h.r.c + 2 + u
+}
+'''
+
+CSE_WRITERS = {'a': ['csa', 'cwa', 'cva'], 'b': ['csb', 'cwb', 'cvb']}
+CSE_VALUED = ('cva', 'cvb')
+
+
+def gen_cse(rng):
+    """The functions of the load-reuse part and the line of main that runs it. Each csefN takes
+    `r: mut &CA` and `h: mut &CH` (too big to be inlined, so its reads go through the
+    pointers); csetop has its own records, in locals and an array, and calls the csefN. All of
+    it is straight-line code (no loop or match between reads), mostly runs of a read of a
+    field, a write of it (direct, or through a callee that takes `mut &`) and a read of the
+    same field or another of the same record, whose values reach acc (returned) and the
+    output."""
+    out = [CSE_HEAD]
+
+    def body(places, borrow, hname, lines, xs, ind='    '):
+        """Statements over places (CA places as written; borrow[p] passes p as `mut &CA`) and
+        hname (the CH as written, and as passed to cwd), appended to lines; xs, the int locals
+        declared so far, grows."""
+
+        def newx():
+            nm = 'x%d' % (len(xs) + 1)
+            xs.append(nm)
+            return nm
+
+        def fld():
+            return rng.choice('abc')
+
+        def write(p, f):
+            """A statement that changes field f of place p (directly or by a call)."""
+            if f == 'c' or rng.random() < 0.35:
+                v = rng.choice(['%s.%s + %d' % (p, f, rng.randrange(1, 9)),
+                                '(%s.%s + %s) %% 1000 + %d' % (p, f, rng.choice(xs) if xs else 'k', rng.randrange(1, 9)),
+                                '%s.%s * 3 %% 1000 + %d' % (p, rng.choice('abc'), rng.randrange(1, 9))])
+                return '%s%s.%s = %s' % (ind, p, f, v)
+            w = rng.choice(CSE_WRITERS[f])
+            arg = '%s(%s, %s)' % (w, borrow[p], rng.choice([str(rng.randrange(10)), 'k % 10', 'acc % 10']))
+            if w in CSE_VALUED:
+                if rng.random() < 0.5:
+                    return '%sacc += %s' % (ind, arg)
+                return '%slet %s = %s' % (ind, newx(), arg)
+            return ind + arg
+
+        for _ in range(rng.randrange(6, 16)):
+            r = rng.randrange(10)
+            p = rng.choice(places)
+            if r < 5:
+                # read, write, read again: the same field or another of the same record
+                f = fld()
+                if f == 'c' and rng.random() < 0.5:
+                    f = rng.choice('ab')
+                x1 = newx()
+                lines.append('%slet %s = %s.%s' % (ind, x1, p, f))
+                if rng.random() < 0.3:
+                    lines.append('%sacc = acc + %s.%s' % (ind, p, rng.choice('abc')))
+                lines.append(write(p, f))
+                g = f if rng.random() < 0.6 else rng.choice([c for c in 'abc' if c != f])
+                if rng.random() < 0.5:
+                    x2 = newx()
+                    lines.append('%slet %s = %s.%s' % (ind, x2, p, g))
+                    lines.append('%sacc += %s * %d + %s' % (ind, x2, rng.randrange(1, 9), x1))
+                else:
+                    lines.append('%sacc = acc + %s.%s * %d + %s' % (ind, p, g, rng.randrange(1, 9), x1))
+                if rng.random() < 0.3:
+                    lines.append('%sprintln("%s " + intToStr(%s) + " " + intToStr(%s.%s))' % (ind, x1, x1, p, g))
+            elif r == 5:
+                # reads with nothing written between: reused
+                x1 = newx()
+                f = fld()
+                lines.append('%slet %s = %s.%s + %s.%s' % (ind, x1, p, f, rng.choice(places), fld()))
+                lines.append('%sacc = acc + %s.%s + %s' % (ind, p, f, x1))
+            elif r == 6:
+                lines.append(write(p, fld()))
+            elif r == 7:
+                # the CH: its own field, and its record's c through cwd
+                if rng.random() < 0.5:
+                    lines.append('%s%s.d = %s.d + %d' % (ind, hname[0], hname[0], rng.randrange(1, 9)))
+                else:
+                    lines.append('%scwd(%s, %d)' % (ind, hname[1], rng.randrange(10)))
+                lines.append('%sacc = acc + %s.d + %s.c' % (ind, hname[0], p))
+            elif r == 8 and xs:
+                lines.append('%sprintln("v " + intToStr(%s) + " " + intToStr(%s.%s))' % (ind, rng.choice(xs), p, fld()))
+            else:
+                lines.append('%sacc = acc + %s.%s * %d' % (ind, p, fld(), rng.randrange(1, 9)))
+
+    nf = rng.randrange(1, 4)
+    for i in range(nf):
+        lines = ['    var acc = k']
+        xs = []
+        body(['r', 'h.r'], {'r': 'r', 'h.r': 'mut &h.r'}, ('h', 'h'), lines, xs)
+        lines.append('    println("f%d " + %s)' % (i, ' + " " + '.join('intToStr(%s)' % x for x in xs[-6:]) or '""'))
+        lines.append('    return acc + r.a + r.b + r.c + h.r.a + h.r.b + h.r.c + h.d')
+        out.append('fn csef%d(r: mut &CA, h: mut &CH, k: int): int {\n%s\n}\n' % (i, '\n'.join(lines)))
+    lines = ['    var r = CA{a: k, b: k + 1, c: k + 2}',
+             '    var h = CH{r: CA{a: k + 3, b: k + 4, c: k + 5}, d: k + 6}',
+             '    var arr: []CA = []',
+             '    for i in 0..3 { append(mut &arr, CA{a: i + k, b: i * 2, c: i + 7}) }',
+             '    var acc = 0']
+    places = ['r', 'h.r', 'arr[0]', 'arr[1]', 'arr[2]']
+    borrow = {p: 'mut &' + p for p in places}
+    xs = []
+    for i in range(nf + rng.randrange(2)):
+        body(places, borrow, ('h', 'mut &h'), lines, xs)
+        lines.append('    acc += csef%d(mut &%s, mut &h, acc %% 10)' % (i % nf, rng.choice(['r', 'arr[%d]' % rng.randrange(3)])))
+    lines.append('    for x in arr { acc = acc + x.a + x.b + x.c }')
+    lines.append('    println("top " + intToStr(r.a) + " " + intToStr(h.r.b) + " " + intToStr(h.d))')
+    lines.append('    return acc + r.a + r.b + r.c + h.r.a + h.r.b + h.r.c + h.d')
+    out.append('fn csetop(k: int): int {\n%s\n}\n' % '\n'.join(lines))
+    return '\n'.join(out), '    println("cse " + intToStr(csetop(%d)))' % rng.randrange(20)
+
+
 def program(seed, k):
-    """Program k of a run with this seed: a function of (seed, k) only."""
-    return gen(random.Random('vrgen %d %d' % (seed, k)), k % 2 == 1)
+    """Program k of a run with this seed: a function of (seed, k) only. The load-reuse part
+    has a random stream of its own, so the rest of the program is what it was before it."""
+    p = gen(random.Random('vrgen %d %d' % (seed, k)), k % 2 == 1)
+    fns, call = gen_cse(random.Random('vrgen cse %d %d' % (seed, k)))
+    assert p.endswith('\n}\n')
+    return p[:-3] + '\n' + call + '\n}\n' + fns
 
 
 def one(k, a, out):
