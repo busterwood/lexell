@@ -357,6 +357,8 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AU | SPEC 4.1 (finding 5): `s[a..b]` on a string is always a `&str` view, as `xs[a..b]` is always a slice; an owned substring is `s[a..b].clone()`. A slice of a literal or constant is a static view (no root); a slice of a string global is a copy held for the statement. | 2baeec81 | **no**, done on this branch: 32 `.clone()`s in lexdb's modules (where a substring is stored, returned or assigned to an owned variable) and those its tests needed. | none for correct programs: substrings that were copies and are only read are now free views |
 
+| AV | SPEC 11: `bytesGrow(mut &b, n): int` adds `n` zero bytes to a byte array with one capacity check and returns the index of the first, for writing a value of known size by index (`binary.setU32BE(b, bytesGrow(b, 4), v)`); a negative `n` stops the program (exit 2). An intrinsic, like `appendStr`. | 6a8f1555 | yes | none; lexdb's wire writer uses it (d0f00b92) |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and

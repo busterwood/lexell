@@ -40,6 +40,11 @@ sections below (1.1 to 1.5) are the 2026-11-15 figures; what changed:
   overlap that load's checkpoints (q4 36 to 59 ms, q5 49 to 59 ms over the
   rounds). On a settled server lexdb is faster than before the migration
   (q4 30.5 against 37.5 ms, q5 22.0 against 26.5): measure them settled.
+- **Text columns** (`d0f00b92`, review finding 2): a batch keeps a text
+  column as one buffer plus offsets, and the wire writes each value's
+  bytes at once (`bytesGrow`). lexdb's own CPU on the 35 analytic queries
+  fell 6.7% (geometric mean; PostgreSQL not re-run): `select *` of 1M rows
+  -23%, text hash joins -19 to -24%. TPC-H level (+0.7% instructions).
 - **The analytic data:** `la/base2` (2026-11-15) holds a page in the
   T_LEAF format, which lexdb no longer reads since 5808f012 (it gives
   "page 23349: type 2"); `la/base3` is the same data loaded by the
@@ -298,6 +303,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-18 | d0f00b92 | analytic queries (lexdb only, pinned, `la/base3`, CPU against the build before), TPC-H and point-select instruction counts | text columns as one buffer plus offsets, and the wire writer on `bytesGrow`: 35 queries geometric mean -6.7% CPU (scans -5 to -23%, `select *` -23%, text joins -19 to -24%, text min/max -31%, text group -12%; `distinct2` +3%); TPC-H +0.66% instructions, +0.75% cycles (results unchanged); point selects +0.1% instructions, -1.4% cycles | this page, 1 |
 | 2026-11-18 | eababf57 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 88k / 151k / 145k/s (+10-14%); replicas 401k/s at 32 clients (PG 405k); updates 3,691 / 16,687 / 38,711/s after restoring the 32-client rate (19,300/s at aaadeb1e: owned-string regression); commit p99 1.38-1.40 ms (0.81 before the migration, unresolved) | this page, 1 |
 | 2026-11-18 | eababf57 | analytic queries (pinned), bulk loads | 35 queries: lexdb / PG one core 0.63 (CPU), / PG 4 processes 1.19 (wall); COPY level in time, peak RSS +30% since the migration | this page, 1 |
 | 2026-11-18 | aaadeb1e | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 0.98 (geometric mean, wall; first below 1); summed 12.98 s against PG's 13.96 s; the runtime's short-string compare (rt_str_cmp): -4.0% wall, q19 -11%, q3 -10%, q21 -9%; worst q19 2.3×, q20 2.2×, q11 1.9×, q22 1.8× | this page, 1.6 |

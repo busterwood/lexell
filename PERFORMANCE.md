@@ -1102,7 +1102,7 @@ the COPY rows unpinned, as before).
 | a commit visible on the read replicas, p50 / p99 | 0.26-0.29 / 0.39-0.46 ms | |
 | single-row autocommit inserts, 1 client | **3,843/s** (0.26 ms) | 1,577/s (0.63 ms) |
 | `count(*)`, 1M rows | **3.9 ms** | 19.4 (one core), 12.1 (4 processes) |
-| 35 analytic queries, geometric mean of lexdb's time over PG's | **0.63** (CPU) against one core, 1.19 against 4 processes | |
+| 35 analytic queries, geometric mean of lexdb's time over PG's | **0.63** (CPU) against one core, 1.19 against 4 processes (at `eababf57`; lexdb's CPU 6.7% lower since, `d0f00b92`: text columns as one buffer) | |
 | TPC-H derived, SF1, 22 queries: geometric mean of lexdb's time over PG's (pinned, boost off, 2026-11-18, `aaadeb1e`; PG's from 2026-11-16) | **0.98** against one core (2.48 at `94536d12`, 3.77 at `1744ef99`); summed **12.98 s** against PG's 13.96 s | |
 | COPY of 1M wide rows (12 columns) | **1.54 s** | 1.79 s (SQL Server bcp 3.34 s) |
 | COPY of 10M narrow rows | 5.51 s | 5.53 s (bcp 10.86 s) |

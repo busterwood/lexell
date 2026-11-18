@@ -144,12 +144,12 @@ look, but owned strings did not shape them.
 | finding | status | where |
 |---|---|---|
 | 1. lookups move rows as encoded strings | **done**: key views (step 1), rows decoded in the leaf (step 2) | ddcc4ef9, 74ddbc6d |
-| 2. batch text one owned string per value | **open**: the largest left (copies and drops of `Val.Text` in batches; q10, q13); with the executor work | |
+| 2. batch text one owned string per value | **done** in the pipeline: a text column is one buffer per batch plus offsets (`BK_TEXT`); comparisons, LIKE, IN, sort, hash and group keys, min/max, gathers and the wire read the bytes in place. Analytic suite -6.7% CPU, TPC-H level. exec's older batch paths still hold values | d0f00b92 |
 | 3. page bodies plain strings | **measured, not taken**: a lazy leaf's body, entries, columns as `rc` made no difference to updates or commit latency (2026-11-18, reverted). A changed leaf's keys and values are counted instead (`Node.keys: rc []str`, `Node.vals: []rc str`), which fixed the update regression | eababf57 |
 | 4. tables re-decoded per statement | **done** (shared `rc Table`); the binder's per-statement name copies remain (`colDef`, `bindFrom`, `colPart`, `cloneExpr`: about 20 copies an executed `UPDATE`) | b487153f |
 | 5. hash keys built per row | **done**: views for one text key; composite keys in one reused string | ddcc4ef9, fea5295d |
 | 6. small functions returning owned strings | **mostly done**: `Node.key` callers read `keyView` (f387f7f0); `lexdb_sql.textIn` (a view of a text, 48c22c45) used by bpchar's trim; `text()` itself still copies at its other callers | 48c22c45, f387f7f0 |
-| 7. evaluation returns owned values | **open** (`bxEval`, `bValAt`, `bKeyVal`); finding 2 removes most | |
+| 7. evaluation returns owned values | **open** (`bxEval`, `bValAt`, `bKeyVal`); finding 2 removed the text cases from the hot paths | |
 | runtime: `memcmp` in descents | **done** in the runtime: `rt_str_cmp` compares short strings 8 bytes at a time | aaadeb1e |
 | runtime: allocator chunk headers sharing cache sets | **open**, not tried | |
 
