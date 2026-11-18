@@ -2666,6 +2666,8 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
     } else {
         var kvs: []BVec = []
         for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
+        // a composite key built in one reused string; copied only for a new group
+        var kb = ""
         for j in 0..nc {
             var g = -1
             var klen = 9
@@ -2681,7 +2683,6 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                     }
                 }
             }
-            var kstr = ""
             if ag.textCol >= 0 {
                 let r = idx[j]
                 if b.cols[ag.textCol].nul[r] {
@@ -2700,11 +2701,10 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                     }
                 }
             } else if !ag.oneKey {
-                var kb = ""
+                kb.clear()
                 for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j]) }
-                kstr = kb
-                klen = len(kstr)
-                match ag.byKey.get(&kstr) {
+                klen = len(kb)
+                match ag.byKey.get(&kb) {
                     Some(x) { g = x }
                     None {}
                 }
@@ -2735,7 +2735,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                         ag.byInt.put(kvs[0].v[j], g)
                     }
                 } else {
-                    ag.byKey.put(kstr, g)
+                    ag.byKey.put(kb.clone(), g)
                 }
             }
             gid[j] = g
@@ -2839,6 +2839,7 @@ type RowGroups = record {
     firsts: [][]Val
     accs: []PAcc
     added: int
+    kb: str    // the key being looked up, reused row to row
 }
 
 // The aggregate over the scan's rows evaluated one by one, as the row
@@ -2859,7 +2860,7 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             append(mut &slots, sc.first + i)
         }
     }
-    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], added: 0}
+    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], added: 0, kb: ""}
     let maxHeld = bud.maxHeld
     var vals: []Val = []
     let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
@@ -2894,16 +2895,15 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
     let ns = len(a.calls)
     var g = 0
     if len(a.keys) > 0 {
-        var kb = ""
-        for k in a.keys { lexdb_access.encIdxPart(mut &kb, &(try bxEval(&k, &rg.row, &noAggs, cx))) }
-        let key = kb
-        match rg.index.get(&key) {
+        rg.kb.clear()
+        for k in a.keys { lexdb_access.encIdxPart(mut &rg.kb, &(try bxEval(&k, &rg.row, &noAggs, cx))) }
+        match rg.index.get(&rg.kb) {
             Some(x) { g = x }
             None {
                 g = len(rg.firsts)
-                rg.added += rowBytes(&rg.row) + 64 * (ns + 1) + len(key)
+                rg.added += rowBytes(&rg.row) + 64 * (ns + 1) + len(rg.kb)
                 if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
-                rg.index.put(key, g)
+                rg.index.put(rg.kb.clone(), g)
                 append(mut &rg.firsts, collections.copyOf(&rg.row))
                 for i in 0..ns { append(mut &rg.accs, noAcc()) }
             }
@@ -3979,6 +3979,7 @@ type Builder = record {
 fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: int, raw: bool, keepAll: bool, resCol: int,
                           room: int, maxHeld: int): Result[Unit, DbErr] {
     let ncol = len(bp.kinds)
+    var kb = ""
     for r in idx {
         var bk = -1
         var nul = false
@@ -4009,19 +4010,18 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                 }
             }
         } else {
-            var kb = ""
+            kb.clear()
             for k in 0..len(hc) {
                 let v = if b.cols[hc[k]].nul[r] { Val.Null } else { bValAt(b, hc[k], bp.kinds[hc[k]], r) }
                 if lexdb_ops.isNull(&v) { nul = true }
                 if raw { keyPart(mut &kb, &v) } else { lexdb_access.encIdxPart(mut &kb, &v) }
             }
             if !nul {
-                let key = kb
-                match bd.gens.get(&key) {
+                match bd.gens.get(&kb) {
                     Some(x) { bk = x }
                     None {
                         bk = len(bd.head)
-                        bd.gens.put(key, bk)
+                        bd.gens.put(kb.clone(), bk)
                     }
                 }
             }
@@ -4191,6 +4191,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
         }
         // a semi join with no condition: its first match only
         let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
+        var kb = ""
         for r in 0..n {
             var bk = -1
             if jl.mode == JK_INT {
@@ -4214,7 +4215,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                     }
                 }
             } else {
-                var kb = ""
+                kb.clear()
                 var nul = false
                 for i in 0..len(jl.key) {
                     if jl.raw {
@@ -4984,7 +4985,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     let want = aggWant(a, nq)
     var wl: []int = []
     for c in 0..nq { if want[c] { append(mut &wl, c) } }
-    var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], added: 0}
+    var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], added: 0, kb: ""}
     let ks = collections.copyOf(&kinds)
     try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
