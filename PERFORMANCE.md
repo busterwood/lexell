@@ -1,1174 +1,179 @@
 # Lexell performance
 
-Lexell builds a program in two ways:
+Measured on 18 November 2026 on the `bench/perf-main` branch (commit 591cf112): `main` at 8a890f21 with the command-program fixes and the tuned
+PostgreSQL settings merged in. Every number here is from that build and
+compares Lexell only with external tools or databases. Lexell's own C backend
+and earlier builds are not compared.
 
-- **native**: `lxlc --native`, the compiler's own x86-64 backend. It writes an
-  ELF executable directly, with no gcc and, unless the program calls C
-  libraries, no libc.
-- **via C**: `lxlc`, which writes C and runs gcc (`-O2 -march=x86-64-v3
-  -mmove-max=128 -mstore-max=128 -ffp-contract=off -falign-functions=64
-  -falign-loops=32`).
+Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
+Versions: rustc and cargo 1.99.1, Go 1.27.3, Java 21.0.13, Python 3.14.8,
+cmark 0.31.2, ripgrep 15.2.0, eza 0.23.5, jq 1.7.1 (built from its tarball),
+GNU grep and sort from the system.
 
-Both are built from the same IR and must behave identically; the gate checks
-that on every test program. Lexell is the program's build; the C backend is
-kept for the bootstrap seed, portability and differential testing. Its
-performance comparison is not part of this report: it is in
-[design/native-vs-c.md](lexell/design/native-vs-c.md).
+Method: wall times are best of N; instruction counts are user-mode
+`perf stat` instructions, the stable figure. Benchmark processes are pinned
+(server CPUs 0-3, client CPUs 4-7 and 12-15). Lexell runs with
+`LXL_HASH_SEED=42`. One benchmark ran at a time.
 
-This page is the current state: the measured tables and what they say about
-the code today, against external references and in absolute terms. The
-figures for the benchmark, application-suite, eza and binary-size tables are
-from 8 November 2026 at `93b295c5`; the compile-time and compiler tables are
-from the Fx-hash compiler at `5bfa9856`; the grep, jq large-input, Markdown,
-Decimal, HTTP, TLS and database tables are from earlier sweeps and say so. Three references could not be re-run in this environment: the jq
-1.7.1 column, the cmark column of the Markdown table, and the Go and Node
-columns of the HTTP tables.
+## Summary
 
-The host is shared and variable: absolute times for I/O-bound and
-process-heavy tables (eza, grep, Markdown, HTTP, TLS) move by up to 2x
-between runs. Those tables use the best observed run; every ratio is from an
-interleaved same-run comparison and is stable to a few percent.
-The instruction columns are the most reproducible figure. The numbers are
-host-dependent: use them to compare the columns, not as portable constants.
+| area | Lexell against | result |
+|---|---|---|
+| Compile, hello world | Rust | 14 ms against 44 ms; 20 KB against 330 KB |
+| Compile, nine benchmarks | Rust | 131 ms against 2,780 ms |
+| Microbenchmarks, native `-O` | Rust | level or ahead on eight of the nine with a Rust port; `tokens` 1.33 times slower |
+| Regex, literal and class searches | Go regexp | ahead on most; `dates` about 100 times slower |
+| JSON, parse and output | Python json | 1.25 to 2 times faster |
+| JSON, query and visit | Python json | about 4 times slower |
+| jq filters (80 MB) | jq 1.7.1 | 1.4 to 2.2 times faster |
+| Markdown | cmark 0.31.2 | 1.17 to 1.28 times slower |
+| Decimal | Java BigDecimal | mixed: 0.27 to 5.2 times the Java time |
+| grep, `-c` | GNU grep | 1.5 times faster in wall time, 2.1 times the instructions |
+| grep, `-o -w` | GNU grep | 1.3 times faster |
+| sort (100 MB) | GNU sort | 1.8 times slower |
+| tail, `-n 5` of 100 MB | GNU tail | level |
+| eza, `-T` (tree) | eza 0.23.5 | 4 times faster |
 
-The history behind these numbers — earlier figures, the passes that got the
-code here, and the experiments that did not pay — is in
-[HISTORY.md](HISTORY.md), "The performance record".
+## Compile time
 
-## Host and method
+From `bench/compile.py -n 3`. The table is from the run that printed it; the
+script then crashed while sizing the Rust sysroot (a broken system symlink),
+so the Rust toolchain sizes are missing.
 
-- AMD Ryzen 7 8745HS (8 cores, 16 threads; CPUs 2k and 2k+1 are the two
-  hardware threads of core k, and all cores share one L3), WSL2, Linux 6.18,
-  gcc 13.3, glibc 2.39. Programs require x86-64 with AVX2: Intel Haswell
-  (2013) or AMD Excavator (2015) and later, otherwise exit code 16.
-- Wall clock, best of N runs (11 for the benchmarks and the compiler, 9 for
-  eza, 5 or 3 where a table says so), warm cache, output to `/dev/null` or a
-  pipe. Cycle and instruction counts are `perf stat`, user mode, least of N,
-  pinned to one CPU. Timings vary by 5–10% between runs on this machine;
-  below about 50 ms, process start-up is part of the figure.
-- A server and its load client, or two measurements at once, never share a
-  core: the HTTP and TLS benchmarks put the server on CPU 0 and the client
-  on CPU 2.
-- This machine's memory-bound figures move with its state from day to day:
-  the plain C sieve, whose code does not change, varies by about 14% between
-  consecutive days. Compare columns within this page, not with the figures
-  in HISTORY.md.
-- Every row checks its outputs first: both builds print the same result and
-  are leak free under `LXL_CHECK=1`, and the tools' outputs equal the
-  reference tool's.
-
-## Benchmarks
-
-`python3 lexell/bench/bench.py --opt -n 11`
-([lexell/bench/](lexell/bench/README.md)), best of 11, one core:
-
-| benchmark | Lexell -O | plain C | Rust | lexell/Rust | lexell/plain C | what it does |
-|---|---:|---:|---:|---:|---:|---|
-| fib | 888 ms | 886 ms | 891 ms | 1.00 | 1.00 | recursive calls |
-| loop | 443 ms | 447 ms | 440 ms | 1.01 | 0.99 | two overflow-checked operations per iteration |
-| array | 366 ms | 102 ms | 371 ms | 0.99 | 3.60 | checked indexing |
-| alloc | 250 ms | 487 ms | 486 ms | 0.51 | 0.51 | 80 million records allocated and freed |
-| lists | 195 ms | 201 ms | 263 ms | 0.74 | 0.97 | linked list build, sum, drop |
-| strings | 218 ms | 439 ms | 379 ms | 0.58 | 0.50 | concatenation and `toStr` |
-| trees | 139 ms | 185 ms | 176 ms | 0.79 | 0.75 | binary trees |
-| tokens | 207 ms | 169 ms | 170 ms | 1.22 | 1.23 | byte scanning and hashing |
-| sieve | 361 ms | 398 ms | 674 ms | 0.54 | 0.91 | the sieve of Eratosthenes to 10 million, 30 rounds |
-| maps | 568 ms | - | - | - | - | `Map[str, int]` with short and long keys, `Map[int, int]` (keyed hashing) |
-
-The ratios use the unrounded wall times (best of 11); the millisecond column
-is rounded, so two equal-looking values can differ by a few percent: a 1.06
-ratio, for instance, can come from two times that both round to 12 ms.
-
-The hand-written C references are in `lexell/bench/c/` (nine programs; `maps`
-has none), built with `gcc -O2`. The Rust ports are in `lexell/bench/rust/`, one
-dependency-free Cargo project built once with `cargo build --release
---offline`; `maps` has no Rust reference either (Lexell's map is
-insertion-ordered and keyed-hashed, with `u32` index slots, and has no direct
-Rust std equivalent). Their build settings and anti-optimisation rules are in
-[lexell/bench/README.md](lexell/bench/README.md). The same-IR C build's column is in
-[design/native-vs-c.md](lexell/design/native-vs-c.md).
-
-The plain fast-compile path (`--native`, no `-O`) is slower where the loop
-passes matter: loop 890 ms, array 710 ms, sieve 562 ms; it is level on alloc
-(251 vs 250) and strings (219 vs 218). `maps` moves with the hash seed;
-[design/codegen-audit.md](lexell/design/codegen-audit.md) records the remaining
-code-shape gaps.
-
-- **Allocation and strings are cheap** (alloc, lists, strings, trees).
-  Small functions and glue are inlined before code generation; the
-  freestanding runtime has a size-class allocator with no locks or libc
-  bookkeeping and an 8-byte block header; the string and index checks are
-  generated inline.
-- **`loop` is level; `array` is the clear loss.** The native backend tests
-  at the bottom of loops and aligns their bodies, reads array headers once
-  per loop, and drops the bounds and overflow checks that conditions,
-  passed checks and induction variables prove cannot fail
-  ([design/native.md](lexell/design/native.md) sections 4 and 8). `loop` is 460
-  ms against plain C's 461. `array` is 361 against 98: gcc turns its inner
-  loop into AVX2, while Lexell keeps one bounds check per element (its bound is
-  unrelated to the array's length). Rust is level with Lexell there (363).
-- **The sieve is ahead of plain C** (337 vs 359 ms) and 1.8x ahead of Rust
-  (615). Rust keeps a bounds check on every `prime[j]` and a checked
-  `j += i`; C has no checks.
-- **fib is within 4%** (Lexell 914, Rust 884, C 878 ms): calls and returns.
-  Rust's checked `n - 1` and `n - 2` add branches; C has none.
-- **Rust is level on fib, loop and array; ahead on tokens.** Rust's token
-  scanner is 21% faster (167 vs 202 ms). Lexell is ahead on alloc (2x), strings
-  (1.7x), trees (1.3x), lists (1.3x) and sieve (1.8x).
-- **C's auto-vectorisation is the array gap.** gcc turns `array`'s inner
-  loop into AVX2 (98 ms, 3.66x Lexell); Rust's bounds checks keep it scalar
-  (363 ms, level with Lexell's 361). On `sieve`, C is 359 against Lexell's 337.
-- **Rust uses the system allocator.** `alloc` is 487 ms, the same as plain
-  C (485) and 2x Lexell (247): libc `malloc`/`free` against the freestanding
-  size-class allocator. `lists` is 270 vs 205 ms (Rust's recursive `Drop`
-  walks the 10,000-node list; C frees it iteratively) and `trees` 173 vs
-  135.
-- **Strings: `String` and `Rc<str>`.** Lexell is 227 ms and plain C 456; Rust
-  `String` is 391. The `Rc<str>` version (`dbench strings-rc`, the closer
-  analogue of Lexell's refcounted `str`) is slower still: a safe concatenation
-  builds a `String` and then copies it into a fresh `Rc` allocation, two
-  allocations per `+`, whereas Lexell makes one refcounted block per `+` in its
-  size-class allocator.
-- **maps** runs 568 ms (4,277M instructions, 1.6% more than the 4,212M
-  before the Map hasher field; the wall time moves with the machine state).
-  `str`, `i128`, `u128` and `Decimal` hash with
-  SipHash-1-3 under a per-process key, and `Map` mixes a per-process seed
-  into its slots (lib/README.md, "Keyed hashing").
-  Map's index slots are `u32`: an entry number with the high bits of the
-  mixed hash beside it, so a probe skips other keys' slots without loading
-  their entries; a Map holds at most 2^31 entries. The probes wait on memory:
-  what is left is the misses on the keys' strings and the entries.
-- **Code placement.** The same instructions can take different cycles
-  depending on where they fall relative to 32- and 64-byte boundaries. Native
-  functions start at multiples of 64 and the native backend aligns loop
-  heads; gcc gets `-falign-functions=64 -falign-loops=32`, in programs and in
-  the native runtime. `python3 lexell/tools/placement.py` builds a benchmark
-  eight times with its code shifted by 0, 8, ..., 56 bytes (Lexell:
-  `LXL_PADB=n`) and reports the spread. Lexell fib, loop, array and alloc move
-  by under 1%, trees and sieve by 2–4%; maps moves as much between runs
-  of one binary on a loaded machine, which is memory, not placement.
-
-### String search
-
-The runtime has SIMD byte and substring search (`strFindByte` over memchr,
-`strFindAny` over SSE2, `strFind` over memchr plus a two-byte prefilter), and
-the public string API now uses it. Before 8 November, `std.indexOf`,
-`strings.indexOfByte` and `strings.count` were scalar loops and
-`std.split(byte)` scanned every byte. On a 50 MB file, three passes
-(instructions; cycles in brackets):
-
-| operation | before | after |
+| case | Lexell | Rust |
 |---|---:|---:|
-| first absent byte | 1.66B (498M) | 61.3M (76M) |
-| first absent substring | 3.31B (636M) | 103.5M (88M) |
-| `count("omega")` | 3.90B (743M) | 410.5M (153M) |
-| `split('\n')` | 1.74B (523M) | 186.1M (133M) |
+| hello world, compile | 14 ms | 43.5 ms |
+| hello world, binary | 20 KB | 330 KB |
+| nine benchmark programs, clean compile | 131 ms | 2,780 ms |
+| nine benchmark programs, binaries | 188 KB | 430 KB |
 
-The gain is 27x to 32x fewer instructions on the byte and substring scans,
-9.5x on `count` and 9.3x on `split`. On a 5-byte haystack the runtime call
-costs more than a scan, so the library keeps a scalar path: the byte search
-is still 11% cheaper, and the substring probe is 5% more instructions, mostly
-the new clamp of a negative `from` (it used to trap) plus the threshold.
-`strings.indexOfAny` exposes the memchr2/3 set search and
-`lastIndexOfByte` the reverse byte scan.
+The compiler's own self-build takes 464 ms (no external reference).
 
-### Map and hashing
+## Microbenchmarks
 
-The default `Map` hasher is still `K.hash()` — SipHash-1-3 under the process
-key for `str` — and the map mixes its own per-process seed into the slots. A
-`Map` now also carries the hasher for the opt-in `newMapWith`; every hash site
-tests a predictable `fast` flag, so the default path pays a branch rather than
-an indirect call. 500k keys, put + get (instructions):
+Ten programs, native `-O`, wall time, best of 5. Nine have a Rust port in
+`bench/rust`; `maps` has none.
 
-| keys | before | default map | `newMapWith` |
+| program | Lexell | Rust | Lexell / Rust |
 |---|---:|---:|---:|
-| `str` | 782.2M | 789.2M (+0.9%) | 626.9M with `fxHashStr` (-19.9%) |
-| `int` | 262.5M | 266.1M (+1.4%) | 277.5M with `fxHashInt` (+5.7%) |
+| fib | 823 ms | 826 ms | 1.00 |
+| loop | 415 ms | 416 ms | 1.00 |
+| array | 343 ms | 349 ms | 0.98 |
+| sieve | 302 ms | 393 ms | 0.77 |
+| alloc | 292 ms | 342 ms | 0.85 |
+| strings | 210 ms | 277 ms | 0.76 |
+| lists | 191 ms | 450 ms | 0.42 |
+| trees | 136 ms | 334 ms | 0.41 |
+| tokens | 234 ms | 176 ms | 1.33 |
+| maps | 365 ms | no reference | |
 
-The Fx hasher (rustc-hash's rotate/xor/multiply) is ~20% cheaper for large
-trusted string-keyed tables. It is slower for `int` keys, where the default
-hash is already one multiply, and it is **not** collision-resistant: `newMap`
-stays the default, and the module says to use `newMapWith` only for trusted
-input, never for keys chosen by a network peer.
+## Applications
 
-## Compile time and size
+### Regex
 
-`python3 lexell/bench/compile.py -n 3`, best of 3, one core. The builds are not
-identical: Lexell emits nine small executables, the Rust project emits one
-binary with nine subcommands, and cargo measures its own build system.
+`bench/regex/bench.py`, a 3.2 MB corpus; match counts agree across Lexell,
+Go and ripgrep. Times are as the script prints them, best of 5 runs of 5
+searches. The Rust regex column is missing: the `regex` crate is not in the
+offline cargo cache.
 
-| what | Lexell | Rust | C |
+| pattern | Lexell | Go regexp | Lexell / Go |
 |---|---:|---:|---:|
-| hello, compile | 12.7 ms | 154.1 ms | 61.0 ms |
-| hello, binary | 16 KB | 357 KB (stripped) | 16 KB |
-| nine benchmark programs, clean compile | 124.1 ms | 2.23 s | - |
-| nine benchmark programs, binaries | 172 KB | 443 KB | - |
-| compiler self-build (`--native`) | 651 ms | over 30 min* | - |
-| compiler, binary + libraries | 2.9 MB (static) | 316.0 MB | - |
-| compiler toolchain, bin + lib | 2.9 MB | 559.9 MB (1.3 GB installed) | - |
-
-The compiler is 39,436 lines of Lexell (28,348 hand-written) and builds itself
-in 0.65 s; its binary is 2.9 MB and needs no libc. A hello world compiles in
-13 ms to 16 KB, against Rust's 154 ms and 357 KB (stripped) and gcc's 61 ms
-and 16 KB. The nine benchmark programs compile in 124 ms with Lexell; the Rust
-suite takes 2.23 s. Rust's figures include std and the cargo build system;
-Lexell links its own freestanding runtime.
-
-Rust's compiler is `rustc` (636 KB) plus `librustc_driver` (138 MB) and
-`libLLVM` (178 MB): 316 MB, or 560 MB for the installed `bin` and `lib`
-(1.3 GB with the documentation and share files). The
-[Rust compiler development guide](https://rustc-dev-guide.rust-lang.org/)
-estimates over 30 minutes for a full self-build on a
-moderately powerful laptop; that figure was not measured here, because it
-needs the rust-lang/rust source and bootstrap, and its tests are a separate
-`./x.py test` (so the estimate does not include the test suite).
-
-\* Rust self-build: the guide's estimate, not measured here. It is a
-different language and toolchain (LLVM, a full borrow checker and optimiser),
-so the ratio is a scale comparison, not a like-for-like build of the same
-work.
-
-## Regex
-
-`python3 lexell/bench/regex/bench.py -n 7` ([lexell/bench/regex/](lexell/bench/regex/bench.py)),
-the benchmark set of [design/regex.md](lexell/design/regex.md) section 4. The
-corpus is 3.2 MB written by `gen_corpus.py` from a fixed seed (prose with the
-names the patterns look for, a log, C-like source; ASCII). Each driver times
-its own searches after reading the file: the best of 5 searches, best of 7
-runs, in ms. "Matches" is the same for every driver (the script checks);
-`(a*)*b` runs over 100,000 `a`s. Go is go1.26.4's `regexp`, Rust the `regex`
-crate 1.12.3, and rg is ripgrep 14.1.1 counting matches as a whole process,
-start-up and file reading included: a reference point, not a like-for-like
-figure.
-
-| pattern | matches | Lexell | Go | Rust | rg |
-|---|---:|---:|---:|---:|---:|
-| `Sherlock Holmes` | 926 | 0.21 | 0.48 | 0.08 | 1.7 |
-| `Sherlock\|Holmes\|Watson\|Irene` | 7,350 | 0.88 | 139.90 | 0.44 | 2.6 |
-| `\w+` (all matches) | 669,532 | 34.41 | 169.42 | 17.77 | 43.6 |
-| `(?i)sherlock` | 4,280 | 0.79 | 73.38 | 0.48 | 3.4 |
-| `[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}` | 848 | 0.19 | 80.62 | 0.09 | 1.9 |
-| `(?m)^ERROR .*timeout$` | 197 | 0.35 | 33.01 | 0.62 | 2.1 |
-| `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` (captures) | 10,755 | 4.11 | 74.97 | 1.33 | 8.3 |
-| `(a*)*b` over 100,000 `a`s | 0 | 0.00 | 3.42 | 0.00 | 1.4 |
-
-The table is the plain `--native` build. With `--native -O`, `\w+` is
-30.9 ms, the alternation 0.82, `(?i)` 0.74 and the captures 4.01. The
-same-IR C build's column and the per-match instruction ratios are in
-[design/native-vs-c.md](lexell/design/native-vs-c.md).
-
-- **Lexell and Rust.** The engine has RE2's lazy DFA and Rust's literal
-  searches (design/regex.md, "R2 as built"). Lexell takes 1.7 to 3.1 times
-  Rust's time on the matching patterns and a little over half on the
-  `ERROR` lines (a prefilter on `ERROR ` and the suffix check on `timeout`).
-- **Where the gap is.** The literal: Rust's memchr uses AVX2 (32 bytes a
-  step), the runtime SSE2 (16). `\w+` and the captures are per-match costs
-  (670,000 and 10,755 matches): each match is a forward and a reverse DFA
-  run plus, for captures, the backtracker on the span. The span path runs
-  `forward` and `backward` in one loop, takes the DFA's text by borrow
-  (no dup/drop per call), keys the start-state cache by the byte itself
-  (there is no byte-to-context table load on the hot path), and scans ASCII
-  in a fast loop whose constant step lets `loops.lxl` prove the byte bounds
-  check; `findAllIndexN` has a span-specialized driver that appends `Span`
-  directly instead of calling a delivery callback with a two-slot `[]int`.
-  Per-match overhead is **16 instructions**, and the `-O` `\w+` instruction
-  count is level with the same work in the other builds. The byte loop takes
-  two taken branches per byte; a one-branch-per-byte loop would run the same
-  instructions about 13% faster.
-- **`(a*)*b`** takes no time: the text has no `b`, and every match ends with
-  one (the suffix check), so the search stops before any matcher runs. The
-  DFA on such patterns is covered by the tests (`regex_linear`,
-  `regex_dfa`), not by this row.
-- **Lexell and Go.** Lexell is 2 to 700 times faster than Go's `regexp`, which has
-  no DFA.
-- **Go's matchers** (the Pike VM, the backtracker and one-pass), which the
-  engine uses for short texts (under 128 bytes), for one-pass patterns, and
-  when the DFA's cache fills too often, are slower than the DFA path: short
-  loops over the fields of a `mut &` record's arrays, each access with its
-  bounds check and each index sum with its overflow check.
-- **Linear time.** The library test `regex_linear` checks that 100,000 bytes
-  take about ten times as long as 10,000 for six such patterns under the
-  Pike VM, the backtracker and the DFA (also in a tiny cache), among them
-  `(a|b)*a(a|b){20}`, whose DFA has 2^21 states; `regex_dfa` does the same
-  on random text, where the cache fills and the search falls back to the
-  Pike VM.
-
-## eza
-
-[lexell/cmd/eza.lxl](lexell/cmd/eza.lxl), a 1,677-line implementation of the
-common subset of eza 0.23.3 at `38e114e` (1,857 lines, with the full long
-view). `LC_ALL=C TZ=UTC`; the long listings use
-`--bytes --time-style=long-iso -n`, which that build required. Best of 9; both
-builds write byte-identical listings.
-
-| listing | output | Lexell |
-|---|---:|---:|
-| `-T /usr/share` (tree) | 2.1 MB | 130 ms |
-| `-T -l /usr/share` (long tree) | 3.8 MB | 262 ms |
-| `-l /usr/lib/x86_64-linux-gnu` | 51 KB | 5 ms |
-
-These are the 8 November sweep; the host was about 10% slower than the
-previous one. The tree walk is 517M instructions, slightly below the
-previous commit (the library migration removed per-entry path and name-order
-allocations), so the wall difference is the host, not the code. The golden
-suite (`python3 lexell/cmd/eza_gate.py -j 12`) passes on both builds.
-
-## grep
-
-[lexell/cmd/grep.lxl](lexell/cmd/grep.lxl) against GNU grep 3.11 on 100 MB of
-generated text (1.8 million lines; the generator is in
-[lexell/cmd/README.md](lexell/cmd/README.md)). Best of 5, output to a pipe,
-`LC_ALL=C` (under `C.UTF-8` GNU grep's `-w` takes 2.3 times as long; the Lexell
-port has no locale). Every output equals GNU grep's.
-
-| search | GNU | Lexell |
-|---|---:|---:|
-| `needle5007` (a literal) | 27 ms | 17 ms |
-| `-c omega` | 89 ms | 64 ms |
-| `-c '[0-9]*7 alpha'` | 73 ms | 18 ms |
-| `-c -w eta` | 213 ms | 182 ms |
-| `-c -v '^0'` (every line) | 49 ms | 51 ms |
-| `-c -E 'a.*z.*e'` | 218 ms | 115 ms |
-| `-n omega` | 237 ms | 211 ms |
-| `-o -w eta` | 400 ms | 323 ms |
-
-`-n omega` is the slowest row (2,191M instructions / 629M cycles); the cost
-is the line-numbering and match walk, not the DFA. The rest are ahead of GNU
-grep except `-c -v '^0'`. A `93b295c5` re-run of `-c omega` gives the same
-1,084.4M instructions: grep's matcher already used the runtime search
-builtins, so the library string-search change does not touch this table. The
-wall times above are from the earlier quiet sweep.
-
-What makes it fast:
-
-- **Lines, not matches.** The regex library's `matchingLines` runs the lazy
-  DFA over a chunk and reports the lines with a match. It starts again after
-  each such line, with no call per line.
-- **A required literal first.** `[0-9]*7 alpha` must contain `7 alpha`; a
-  memory search finds it and only its line is checked.
-- **`-w` as one regex.** The word with a non-word character or a line end on
-  each side.
-- **Output in pieces.** The prefix, the line and the newline go into a byte
-  buffer; no string is built per line.
-
-## The command-program review (18 November 2026)
-
-The command programs were reviewed for code written to the old rules (copies
-that views now avoid, strings built by repeated `+`, hand-written methods the
-generated ones replace), and the mechanical fixes were applied on the
-`cmd/oldassump` branch, based on `8a890f21`. Each row is the same program built
-from `main` and from the branch, with `perf stat` (user-mode instructions and
-task-clock); the two builds are interleaved and each figure is the best of two
-runs. The outputs are identical in every row.
-
-| case | main | branch | |
-|---|---:|---:|---|
-| jq `reduce range(80000) as $i (""; . + "x")` | 491 ms | 13 ms | the quadratic copy is gone |
-| jq `[range(20000) \| tostring] \| add` | 167 ms | 8 ms | |
-| jq `reduce range(3000) as $i ([]; setpath([$i]; $i))` | 537.4M ins, 31 ms | 537.4M ins, 33 ms | unchanged; still quadratic (below) |
-| jq `-c .` on 21 MB | 3,642.5M ins, 236 ms | 3,642.5M ins, 237 ms | unchanged |
-| grep `-o -w eta` on 100 MB | 3,971.0M ins, 275 ms | 3,887.3M ins, 275 ms | −2.1% instructions |
-| grep `-c omega` on 100 MB | 795.0M ins, 53 ms | 795.0M ins, 55 ms | unchanged |
-| eza `-T /usr/share` | 1,337.5M ins, 202 ms | 1,304.7M ins, 199 ms | −2.5% instructions |
-| sort of 100 MB | 5,989.2M ins, 637 ms | 5,989.2M ins, 647 ms | unchanged (see below) |
-| tail `-n 5` of a 100 MB file; head `-n 5` of a pipe | 0.6M and 0.3M ins | the same | unchanged |
-
-The reference tools, on this host and by the same method: GNU grep `-c omega`
-374.5M ins, 83 ms; `-o -w eta` 4,063.0M ins, 364 ms; GNU sort 2,683.1M ins,
-732 ms. The reference grep writes its output to a file: GNU grep stops at the
-first match when its output is `/dev/null`, so a `/dev/null` count would be
-wrong.
-
-- **Wall time shows the string fix, not instructions.** The copies are a
-  `memcpy`, which costs few counted instructions. The 80,000-step string build
-  moves 11% in instructions and 37 times in wall time.
-- **Open: `setpath` and `delpaths` in `reduce`.** They still copy their
-  container on each call, because the reduce state keeps a reference to it, so
-  the loop is quadratic. Fixing it needs the reduce state handed to the update,
-  a change to the jq evaluator's design.
-- **Tried and reverted: `sort`'s output blocks filled by `addByte`.** Filling
-  the 64 KiB blocks byte by byte cost 13.5% more instructions than the byte array
-  it replaced (6,798M against 5,989M), so `sort` is unchanged on this branch.
-
-## jq
-
-[lexell/cmd/jq.lxl](lexell/cmd/jq.lxl), the jq 1.7.1 port, against jq 1.7.1 built
-from its release tarball (`./configure --with-oniguruma=builtin`, the default
-`-O2`). Wall times; figures vary by 5–10% between runs. The wall times are
-from an earlier quiet window (the host was too variable to re-baseline); the
-instruction counts are current.
-
-**Large input.** `python3 lexell/bench/json/bench.py --jq JQ`, on an 80 MB file
-of 182,290 generated records. Best of 3; the output goes to a file, and the
-three outputs of each filter must be identical.
-
-| filter | jq 1.7.1 | Lexell |
-|---|---:|---:|
-| `.` | 2.50 s | 1.74 s |
-| `-c .` | 2.24 s | 1.62 s |
-| `length` | 1.59 s | 1.15 s |
-| `[.[].items[].qty] \| add` | 1.90 s | 1.31 s |
-| `map(select(.active and .score > 0) \| {id, city: .address.city})` | 1.75 s | 1.39 s |
-| `group_by(.address.city) \| map({city: .[0].address.city, n: length})` | 2.15 s | 1.95 s |
-
-The jq 1.7.1 column is from an earlier sweep (jq is not installed here); the
-Lexell columns were measured at 80 MB with `--mb 80 -n 3`. The application
-suite at `93b295c5` measures `-c .` on 20 MB at 4,282.1M instructions, the
-same figure as the table's 4,282.3M; the large-input wall times remain from
-the earlier quiet window.
-
-The same script times the JSON library on the file (ms, best of 3), against
-Python's `json`:
-
-| step | Lexell | Python |
-|---|---:|---:|
-| parse | 771 | 846 |
-| compact output | 542 | 818 |
-| pretty output | 654 | 2,952 |
-| query | 209 | 50 |
-| visit | 200 | 50 |
-
-**Computation.** Programs with no input (`jq -n`), best of 5 (`group_by`
-best of 9); the outputs are identical. The table is from an earlier sweep
-(it needs the jq reference).
-
-| program | jq 1.7.1 | Lexell |
-|---|---:|---:|
-| `1` (start-up) | 2 ms | 5 ms |
-| `reduce range(3000000) as $i (0; . + $i)` | 503 ms | 540 ms |
-| `[range(1000000)] \| map(. * 2) \| add` | 417 ms | 281 ms |
-| `[range(200000) \| tostring] \| sort \| length` | 123 ms | 91 ms |
-| `def fib: ...; 25 \| fib` (recursive, 250,000 calls) | 61 ms | 111 ms |
-| `[limit(100000; repeat(1))] \| length` | 46 ms | 11 ms |
-| `[range(100000) \| {a: ., b: "x\(.)"}] \| group_by(.a % 10) \| map(length)` | 251 ms | 285 ms |
-| `[range(50000) \| tostring \| test("7$")] \| map(select(.)) \| length` | 74 ms | 79 ms |
-
-**Where the port wins.** Wherever JSON is parsed or written: jq builds a
-decNumber for every literal, and its writer goes through `jv_dump_term`; the
-JSON library keeps the literal's text and writes it back. Also on simple
-generators: `limit`, `range` and `map` are built into the port, and
-continuation calls cost less than jq's bytecode with its fork points.
-Compiled regexes are cached for the run.
-
-**Where jq wins:**
-
-- **Calls of jq-defined functions.** `fib` is 1.5–2× slower: each call pushes
-  frames and closures, and runs its body through a capturing continuation.
-- **Start-up.** The port parses and resolves `builtin.jq` on every run
-  (2 ms).
-- **Sorting objects by key.** `sort_by` and `group_by` on objects are a
-  little slower: the comparison walks the counted boxes.
-- **Queries over a parsed document**, in the library table: Python's dicts
-  are faster to walk than the library's counted boxes.
-
-The library's own design and numbers are in
-[lexell/design/json.md](lexell/design/json.md), section 9.
-
-## Markdown
-
-[lexell/cmd/cmark.lxl](lexell/cmd/cmark.lxl) (the `markdown` library) against cmark
-0.31.2 (`-O3` release build, cmake), rendering 10 MB documents with
-`--unsafe` to a pipe. Best of 3, seconds (`python3 lexell/tests/markdown.py
---perf --ref CMARK`). The wall times are from an earlier quiet window: the
-host was too variable to re-baseline the pipe-bound times (the same binary
-moved by 1.7x between runs). The instruction and cycle ratios below are
-current.
-
-| document | cmark | Lexell |
-|---|---:|---:|
-| the spec, repeated to 10 MB | 0.18 | 0.20 |
-| the repo's Markdown files, repeated to 10 MB | 0.22 | 0.25 |
-| the spec's examples, repeated to 10 MB | 0.62 | 0.72 |
-
-The Lexell columns are the plain `--native` build, with line endings and inline
-text runs found in runs rather than byte by byte.
-With `-O` the spec is 0.169 s: 1343.0M instructions / 487.3M cycles. The
-application suite at `93b295c5` measures its 10 MB document at 1,337.9M
-instructions, within 0.4% of the previous sweep. The
-cmark column is from an earlier sweep; the same-IR C ratios are in
-[design/native-vs-c.md](lexell/design/native-vs-c.md).
-
-The Lexell renderer takes 1.1 to 1.2 times cmark's time in the plain build and
-0.94 to 1.10 with `-O`. cmark's pathological
-inputs (nested emphasis, brackets and block quotes 30,000 to 100,000 deep, a
-million backticks, unclosed constructs) all finish in well under a second,
-within a small factor of cmark; the one quadratic case (a run of blank lines
-inside deeply nested lists) is cut by the same early exit as cmark's. The
-parser keeps the tree in one array of 200-byte nodes: the 10 MB spec takes
-114 MB of memory at its peak (cmark: 68 MB).
-
-## The compiler
-
-The Lexell compiler compiling itself (`lexell/compiler/main.lxl`), Lexell build,
-best of 11:
-
-| | Lexell build |
-|---|---:|
-| self-build to an executable (`--native`) | 704 ms |
-| self-build to C (`--emit-c`) | 475 ms |
-| compiler binary | 3,068,569 bytes (static, no libc) |
-
-The compiler is 39,436 lines of Lexell (1.78 MB, 706 KB of it the generated
-runtime tables `rt.lxl` and `rtx.lxl`; 28,348 hand-written lines) and 5,634
-lines of C runtime (the C backend's `rt.h` and the native backend's
-freestanding `rt.c`). The Lexell-built compiler runs 4,981M instructions on
-`--native`; the commit before the compiler's Fx string hash ran 5,080M
-(−1.9%). Cycles move with the host. Absolute times move with the host; the
-instruction counts are the stable comparison. The compiler's string-keyed
-internal tables (`modIndex`, `tindex`, the lowering scopes and the emit and
-x64gen symbol tables) use `newMapWith(fxHashStr)`; int-keyed tables keep the
-default hash, which is one multiply. The `perfsuite.py main
-compiler-fast-hash` comparison gives a compile suite of −2.21% instructions
-and −3.37% cycles (geometric mean) with the run suite at 0.00%, and the
-generated output is byte-identical. The gcc-built comparison is in
-[design/native-vs-c.md](lexell/design/native-vs-c.md).
-
-- What is left is spread thin: it is in the mix (register-to-register moves,
-  stores to the stack and compares: spills, and loads and bounds checks
-  repeated from one statement to the next), not in a few functions. A
-  compiler is call-heavy and branchy; the IR inliner closes much of the gap.
-- Both backends start from one IR: `--native` does not print and re-read C,
-  and `--emit-c` builds the IR before printing it.
-
-### Judging a change
-
-A backend pass is judged by `lexell/tools/perfsuite.py`, not by the self-build
-alone: each pass adds to the compiler's own sources, and the compiler is one
-program.
-
-    python3 lexell/tools/perfsuite.py main BRANCH     # or two compiler paths
-
-It builds both revisions' native compilers from their seeds, then measures
-them on inputs frozen at one revision (`af99f933`; they move only on purpose,
-with a note in HISTORY.md):
-
-- **Compile suite:** the frozen compiler (`--native` and `--emit-c`) and the
-  frozen eza, grep and zoxide, compiled by each compiler. This is the compile
-  speed a user sees: the new analysis's cost minus what the compiler gains
-  from being compiled better itself.
-- **Run suite:** the frozen bench programs and grep, sort, wc and eza, built
-  by each compiler and run on fixed inputs (a generated 100 MB text). Both
-  builds must print the same output.
-
-Each suite is summarised as the geometric mean of new/base. On two builds of
-the same code, instructions are identical and cycles vary by up to ±3% on one
-program and ±0.5% on the means, so instructions decide and cycles must agree
-in sign. A pass is kept when:
-
-- the run suite gains at least 1% (geometric mean), or 5% on at least two
-  programs with none worse than 1%, and the compile suite costs at most 1%;
-  or
-- the compile suite gains and the run suite is not worse.
-
-The compile suite's total cost over `af99f933` stays under 5%
-(`perfsuite.py af99f933 main`). Because the inputs are frozen, a change to
-the library (std's Map, say) shows in perfsuite only through the compiler,
-not in the frozen programs; measure such changes with bench.py and `perf
-stat` as well. The passes tried and shelved are in HISTORY.md.
-
-These rules are for the **default** path. `--native -O` is the optimising
-path: it may cost up to **30% more compile time** than the default
-(`python3 lexell/tools/optcost.py --compiler <native-built lxlc>`, instructions
-and cycles, best of N). Its target is a compiled program's running time, not
-a smaller compile-suite figure.
-
-### The optimization level (`-O`)
-
-`--native` is the fast path. It runs `opt` (small-function inlining) and
-nothing else. `--native -O` adds `loops` (array headers and str headers out
-of loops, the bounds and overflow facts), perf17's range facts in loop-free
-functions, and `cse` (loads and checked element addresses reused along a
-straight run). The generated code differs only between `-O` and the default.
-
-Compile cost of `-O` over the default (`optcost.py`, native-built compiler,
-best of 3, one core):
-
-| program | default Minstr | -O Minstr | -O/default | default Mcyc | -O Mcyc | -O/default |
-|---|---:|---:|---:|---:|---:|---:|
-| compiler | 5,009 | 6,181 | +23.4% | 2,852 | 3,708 | +30.0% |
-| eza | 513 | 596 | +16.3% | 302 | 358 | +18.4% |
-| grep | 1,225 | 1,449 | +18.3% | 635 | 791 | +24.6% |
-| zoxide | 499 | 564 | +13.1% | 259 | 330 | +27.5% |
-| jq | 2,595 | 3,031 | +16.8% | 1,313 | 1,521 | +15.9% |
-| cmark | 609 | 692 | +13.6% | 298 | 316 | +6.1% |
-| tokens | 82 | 88 | +7.4% | 37 | 39 | +4.7% |
-| maps | 96 | 107 | +11.3% | 43 | 45 | +5.3% |
-| **geomean** | | | **+14.9%** | | | **+16.1%** |
-
-The code `-O` makes is judged by `lexell/bench/bench.py --opt` (the ten
-benchmarks, Lexell `-O` against the hand-written C references) and by the
-regex, JSON/jq, Markdown and Decimal harnesses. The ladder pays on loops,
-allocation, strings, trees, sieve and Markdown; it does not move the DFA's
-per-match work or jq's boxes. The `-O`/C cycle ratios are in
-[design/native-vs-c.md](lexell/design/native-vs-c.md). Check elimination and branch folding were
-measured and rejected: the losses are memory, calls and copies, not
-instruction selection. Those experiments are in HISTORY.md, "Tried and
-shelved". The application rows below carry their external references; the
-remaining gaps are regex's byte loop and cmark's parse instructions, and
-Decimal is 1.2 times .NET on add and 1.5 on multiply.
-
-`-O` is part of the quick gate: `run_native.py --lib --opt` builds the
-library programs with `-O` and requires the same output, exit code and stderr
-as the C build.
-
-### The application suite
-
-`python3 lexell/bench/apps.py -n 5 --pin 2` is the Tier-1 table: the same source
-built with Lexell `-O`, output checked, timed with `perf` on one core, best
-of N, as a table, JSON and TSV. Measured at `93b295c5` (8 November;
-`LXL_HASH_SEED=42`, core 2, 60 s). The host was busy: wall times are 1.2 to
-1.5 times the previous sweep, while every instruction count is within 0.4%
-of it:
-
-| application | Lexell wall | instructions | cycles |
+| literal `Sherlock Holmes` | 0.20 ms | 0.41 ms | 0.49 |
+| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.59 ms | 132.6 ms | 0.004 |
+| `\w+` | 19.6 ms | 120.3 ms | 0.16 |
+| `(?i)sherlock` | 0.55 ms | 71.0 ms | 0.008 |
+| email | 0.09 ms | 75.2 ms | 0.001 |
+| `(?m)^ERROR .*timeout$` | 0.38 ms | 30.2 ms | 0.013 |
+| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 7,025 ms | 69.2 ms | 101.6 |
+| `(a*)*b` on 100 KB | below timer resolution | 3.2 ms | |
+
+The dates pattern is the one case where Lexell is much slower. The cause has
+not been checked yet.
+
+### JSON
+
+`bench/json/bench.py --jq`, an 80.2 MB generated document. Library times are
+best of 3, in-process; jq times are whole-process wall time, best of 3. Each
+driver's output is identical (sha256 checked).
+
+| step | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| regex (8 patterns, 3 MB) | 47 ms | 582.7M | 159.9M |
-| json (20 MB, parse/query/visit) | 619 ms | 4,410.7M | 2,202.2M |
-| jq (`-c .`, 20 MB) | 442 ms | 4,282.1M | 1,455.6M |
-| cmark (10 MB) | 198 ms | 1,337.9M | 581.8M |
-| decimal (all cases) | 2,378 ms | 45,076.7M | 9,747.8M |
+| parse | 395 ms | Python json 808 ms | 0.49 |
+| compact output | 455 ms | Python json 585 ms | 0.78 |
+| pretty output | 493 ms | Python json 615 ms | 0.80 |
+| query (sum of qty) | 190 ms | Python json 44 ms | 4.3 |
+| visit (eachItem) | 193 ms | Python json 44 ms | 4.4 |
+| jq `.` | 970 ms | jq 1.7.1 2,180 ms | 0.45 |
+| jq `-c .` | 910 ms | jq 1.7.1 1,940 ms | 0.47 |
+| jq `length` | 620 ms | jq 1.7.1 990 ms | 0.63 |
+| jq `[.[].items[].qty] \| add` | 750 ms | jq 1.7.1 1,230 ms | 0.61 |
+| jq `map(select(...))` | 770 ms | jq 1.7.1 1,210 ms | 0.64 |
+| jq `group_by(.address.city)` | 1,050 ms | jq 1.7.1 1,460 ms | 0.72 |
 
-The external references for each application are in its own section: Rust,
-Go and ripgrep for regex; jq for the jq port; cmark for Markdown; .NET and
-Java for Decimal. The same-IR C comparison is in
-[design/native-vs-c.md](lexell/design/native-vs-c.md). Wall times move by
-several percent between runs; instructions are the stable figure.
+The jq times are rounded to 10 ms by the script.
 
-The benchmark harnesses set `LXL_HASH_SEED` (42 by default, `--hash-seed` or
-`--random-hash` to change it), so the map layout is identical across runs and
-in both backends; without it production keeps the per-process random key.
-The maps instruction count is reproducible across runs and seeds; its cycles
-move with the machine and the slot layout.
+### Markdown
 
-## Binary sizes
+`tests/markdown.py` perf mode, against cmark 0.31.2, wall time, best of 3.
+The perf mode checks no output.
 
-| program | Lexell |
-|---|---:|
-| empty program | 12,288 bytes (static) |
-| hello | 16,416 bytes (static) |
-| `import "regex"`, one call (`regex.quote`) | 20,512 bytes (static) |
-| eza | 353,328 bytes (static) |
-| HTTP server (`cmd/httpd.lxl`) | 848,440 bytes (dynamic) |
-| compiler | 3,068,569 bytes (static) |
-
-The native backend generates only the functions and globals reachable from
-`main` (design/native.md section 5, "Reachability"), as gcc drops a C
-program's unused static functions: an imported module costs only what the
-program uses of it. The runtime is linked
-the same way, by sections, as `ld --gc-sections` would: every function and
-datum of rt.c is a section of its own in `rtx.lxl`, and the link keeps those
-reachable from the runtime functions the program calls. Native functions
-start at multiples of 64 bytes (code placement, above), which costs about 1%
-of a large program's size.
-
-A native executable carries its own runtime instead of linking libc. When a
-program calls C libraries (libssl, sqlite3), it is dynamically linked against
-them. A program that imports `postgres_libpq` is linked against libpq too; the
-Lexell `postgres` client needs no libpq (it still uses libssl for TLS).
-
-## Math
-
-The float math functions are the runtime's own (musl 1.2.5, one C text for
-both backends, `lexell/compiler/lxlmath.inc`), not libm's. sqrt, floor, ceil,
-trunc, round, rint, fabs, copysign and fma are single instructions (sqrtsd,
-roundsd, masks, vfmadd213sd). The polynomials of exp, exp2, log, log2, pow,
-sin and cos use explicit fma; everything else is compiled with
-`-ffp-contract=off`, so a result's bits do not depend on the gcc version or
-the backend. The native runtime compiles the text apart (`native/math.c`,
-with `-ffixed-xmm8` to `-ffixed-xmm15`), so that a native program keeps its
-doubles in `xmm8`-`xmm14` across the calls.
-
-5M calls of one function in a loop, the argument varying
-(`lexell/bench/math/calls.lxl`), ms, best of 7, pinned, both builds interleaved;
-both print the same checksum. Cycles per call in brackets (user cycles, least
-of 7, divided by 5M):
-
-| function | Lexell |
-|---|---:|
-| exp | 12 (9.6) |
-| ln | 15 (12.9) |
-| sin | 9 (7.0) |
-| pow | 47 (41.7) |
-| atan | 19 (15.9) |
-| tan | 20 (16.9) |
-
-What is left on exp and sin is the call: the Lexell loop calls the kernel,
-and the kernel loads its polynomial constants on every call (49 operations
-an iteration). The loop is bound by dispatch, not by a latency chain
-(`perf`: 85% of the dispatch slots used, the rest mostly back-end stalls).
-The loop around the call is seven instructions: the argument moved from its
-register, the call, `addsd` into the sum's register, `addsd` of a rodata
-constant into the argument's, the count and the branch.
-
-Mixing the native code's legacy SSE with the runtime's VEX code costs nothing
-here. In a test loop, legacy SSE around a call of VEX code ran at the speed of
-VEX everywhere (5.0 cycles an iteration). Only dirty upper halves of the
-`ymm` registers slow it (7.2), and gcc's `vzeroupper` keeps them clean.
-Explicit fma in more kernels (atan, tan, expm1) is the deterministic way to
-get more of the speed that contraction would give.
-
-## Decimal
-
-`lexell/bench/decimal`: micro-benchmarks of the Decimal operations
-(`dbench.lxl`, M0 to M10 on 4096 fixed-seed inputs each) and `run.py`, which
-builds them with two trees and compares user cycles and instructions (`perf
-stat`, least of N). `diff.py` is the differential test that every change to
-Decimal must pass: 11 operations on 10^6 inputs each, old and new tree,
-native and C, identical text, errors and scales.
-
-A matched comparison with .NET's `System.Decimal` and Java's `BigDecimal` is
-in [design/decimal-performance.md](lexell/design/decimal-performance.md):
-19-digit add, 6x6 multiply, 12/6 divide at scale 2, 20-digit parse,
-19-digit format and compare, plus 38-digit cases that .NET cannot represent.
-In short: .NET's 16-byte decimal is 1.2 times faster on add, 1.5 times on
-multiply and 3 times on compare; Lexell is about twice as fast at parse and 1.6
-times at format; Java is fast on small arithmetic but its parse is about
-twice Lexell's and its 38-digit format 3 times. At 38 digits Lexell is ahead of
-Java on add and multiply too.
-
-Cycles per operation (dbench under `perf stat`, least of 5, pinned to one
-core; measured 7 November 2026 at `fb50b4f1`):
-
-| operation | Lexell |
-|---|---:|
-| add, 6 / 19 digits at 2 places (M2) | 66 / 66 |
-| mul, 6 / 19 digits (M3) | 80 / 83 |
-| div, 12 by 6 digits at scale 2 (M5:s2) | 237 |
-| quantize to 2 places from 6 digits (M6) | 73 |
-| parse, 20 digits (M7) | 247 |
-| format, 38 digits fixed (M8:f38) | 452 |
-| cmp, same leading digit position (M10:diff) | 50 |
-| `Decimal.fromUnits(u, 2)` and one add, a row of a 10M-row sum | 191 |
-
-The last row is from an earlier sweep. The per-operation numbers are noisy
-at this size; the aggregate application row below is the reliable one. The
-same-IR C comparison is in [design/native-vs-c.md](lexell/design/native-vs-c.md).
-
-The expensive operations are parse, format and cmp. Parse carries the digit
-loop's checks and its 128-bit accumulation through a pointer; format is
-`rt_digits` plus an allocation and a copy per call; cmp spends half its
-branch misses in `digits`' compare tree. The records still passed by value
-on the stack cost the ABI's copies; the receiver pass removes one of them.
-Parse is at the inlining ceiling (`digits` into `cmp`, `sumOf` into
-`errSum`); the Stage-B ceiling is design/record-abi.md.
-
-`add`/`mul` return the `Decimal` directly on their hot path, through
-`makeDecCore` and a `mut &int` error flag; `addExact`/`mulExact` keep their
-`Result` body and `sub` is `a.add(b.neg())`. Equal-exponent `add` skips both
-`digits()` bound checks, and `makeDec` counts digits for the exponent check
-only when the exponent is above `EXP_MAX` and runs the trailing-zero strip
-only when `coef % 10 == 0`. The matched comparison
-(`bench/decimal/compare`) puts add at 13.3 ns and 6x6 multiply at 17.1,
-against .NET's 11.2 and 11.7; `addExact` is 12.8 and `mulExact` 16.8, and the
-bare 128-bit operation is 1.2/1.3 ns. div is 45.9 ns. What is left against
-.NET is the normalisation and the 32-byte copy (1.2 times on add, 1.5 on
-multiply); compare is 3 times, in `digits` and its branches. Not normalising
-at all is the remaining representation change.
-
-The digit count is a compare tree, trailing zeros are stripped by exact
-division, long division is Knuth's algorithm D in base 2^64, text is written
-in 10^19 chunks two digits at a time, and parse reads eight digits at a time
-(design/decimal-perf-research.md, section 8).
-
-## Tasks
-
-The cost of the concurrency primitives (`lib/task.lxl`, `lib/net.lxl`, SPEC
-16), from `lexell/bench/tasks.lxl`, ns per operation, best of 3 runs:
-
-| operation | Lexell |
-|---|---:|
-| task switch (`task.yield`) | 7.7 |
-| start a task (stack reused) | 21.3 |
-| start plus a wait that parks (round trip) | 82.1 |
-| the same inside `task.within` (a timer set and removed) | 93.9 |
-| wait on a finished task | 12.9 |
-| promise complete | 11.3 |
-| `Shared.with` | 5.8 |
-| a `task.sleep(1)` that fires, beyond a yield | 53.2 |
-| a socket read that finds data (no park) | 742 |
-| a one-byte round trip between two tasks over loopback TCP | 196,853 |
-| a `blocking` extern call run inline (no other task could run) | 3.5 |
-| the same through the pool, the process on one CPU | 6,465 |
-
-The `sleep` row is one run and noisy (the overshoot is divided among 10,000
-tasks). The unpinned helper-pool row is from an earlier sweep: 433–451 ns.
-
-The task operations are far below a system call. The runtime reads the
-clock through the vDSO, as libc does (design/native.md, section 2). The
-round trip is this machine's loopback: a Python ping-pong over
-loopback TCP takes about 190,000 ns with two blocking threads and 205,000 ns
-with epoll on one thread. The switch is not tuned.
-
-The blocking rows call C's `abs` through a `blocking` extern (SPEC 12).
-Inline it is a plain extern call plus a test of the scheduler's state.
-Through the pool, the task parks, a helper thread runs the call and the event
-loop wakes the task: the helpers and the event loop each spin up to 50 µs
-before they sleep, so a busy pool round trip needs no system call. When the
-process may use only one CPU (`taskset -c 0`) the spinning is off and every
-call costs an `eventfd` write and an `epoll_wait`. For scale: one
-`sqlite3_step` over a cached table takes 30 ns, so SQLite's steps in a
-program with other tasks cost 10 to 20 times more; a query that reads the
-disk does not notice.
-
-## HTTP server
-
-`lexell/cmd/httpd.lxl` on the server library `lexell/lib/httpserver.lxl`
-(design/http-server.md): a keep-alive HTTP/1.1 server on one thread, one task
-per connection, with every limit and timeout of the design on, the hangup
-cancellation armed around each handler, the request parsed strictly and the
-reply built by the library. Measured by `python3 lexell/cmd/http_gate.py
---servers native,go,node`: the server on CPU 0, the load client
-`lexell/cmd/httpload.lxl` (Lexell, one thread) on CPU 2, another core. 10,000
-idle keep-alive connections are opened first and stay open during the load;
-each load client sends `GET /` and waits for the reply, 5 s per row. Go
-1.26's net/http (GOMAXPROCS=1) and Node 24's http serve the same reply, as
-references. This machine's numbers move by 5 to 10% from one run to the next.
-
-| | Lexell | Go net/http | Node 24 |
+| input | Lexell | cmark | Lexell / cmark |
 |---|---:|---:|---:|
-| RSS per idle connection | 15.0 KB | 19.8 KB | 9.5 KB |
-| RSS with 10,000 idle connections | 150 MiB | 195 MiB | 139 MiB |
-| 1 client: requests/s | 4,185 | 3,790 | 3,650 |
-| 10 clients: requests/s | 35,839 | 34,800 | 32,900 |
-| 100 clients: requests/s | 60,763 | 44,500 | 43,100 |
-| 1 client: latency p50 / p99 | 230 / 403 µs | 254 / 410 µs | 260 / 452 µs |
-| 10 clients: latency p50 / p99 | 272 / 415 µs | 268 / 503 µs | 289 / 524 µs |
-| 100 clients: latency p50 / p99 | 1.63 / 2.40 ms | 2.10 / 6.36 ms | 2.07 / 4.95 ms |
+| spec text, 49 times (10.0 MB) | 124 ms | 97 ms | 1.28 |
+| repository Markdown, 3 times (12.6 MB) | 173 ms | 142 ms | 1.22 |
+| spec examples, 643 times (10.0 MB) | 379 ms | 325 ms | 1.17 |
 
-The Go and Node columns are from an earlier sweep (their toolchains were not
-re-run).
+### Decimal
 
-What a request costs the server beyond reading and writing the socket: the
-router's lookup (the router is a `task.Frozen`, read by every connection's
-task at once), the strict head parse (every field checked), a `poll` system
-call when the hangup cancellation is armed (it checks for a half-close that
-came with the request, which must not cancel it), the `Date` and
-`X-Content-Type-Options` headers and the counters.
+`bench/decimal/compare/run.sh`, Lexell against Java BigDecimal, nanoseconds
+per operation, minimum of 3 runs. The .NET comparison is not run.
 
-An idle connection's resident cost is two pages of its task's stack (8 KiB;
-the stack is 256 KiB of address space), a 4 KiB read buffer, a 512-byte
-output buffer, and the request and response records with their header lists,
-kept for reuse. Under the gate's `LXL_CHECK=1`, `GET /shutdown` with the
-10,000 connections open drains them all and ends the program in 0.5 to 0.6 s,
-exit 0, no leak. One client is bound by this machine's loopback round trip;
-with 100 clients the single-threaded load client may be the limit as much as
-the server. The `ulimit -n` here is 1,048,576; the gate raises the soft
-limit when it can and stops when it cannot.
+| operation | Lexell | Java | Lexell / Java |
+|---|---:|---:|---:|
+| add, 19 digits | 12.6 ns | 13.0 ns | 0.97 |
+| mul, 6 by 6 digits | 15.8 ns | 9.7 ns | 1.63 |
+| div, 12 by 6, scale 2 | 42.7 ns | 11.1 ns | 3.8 |
+| parse, 20 digits | 36.2 ns | 105.6 ns | 0.34 |
+| format, 19 digits | 46.4 ns | 45.4 ns | 1.02 |
+| cmp, 19 digits | 8.0 ns | 1.6 ns | 5.2 |
+| add, 37 digits | 13.0 ns | 15.5 ns | 0.84 |
+| mul, 19 digits | 18.2 ns | 19.5 ns | 0.93 |
+| parse, 38 digits | 53.5 ns | 202 ns | 0.27 |
+| format, 38 digits | 74.2 ns | 234 ns | 0.32 |
 
-### The HTTP client
+The outputs are not verified against Java. The two harnesses print different
+checksums, so eight of the ten cases cannot be compared; the two format cases
+print the same checksum in both.
 
-`httpload --client` sends the same load through one `http.Client`
-(`lexell/lib/http.lxl`: `get` and `text()` per request, `maxPerHost` equal to
-the connections), against the Lexell server on CPU 0, the loader on CPU 2,
-5 s per row, the median of three alternating rounds (the Lexell columns:
-`http_gate.py --servers native --client --conns 1,100,1000`), beside
-httpload's own loop (a fixed request, only Content-Length parsed). No idle
-connections are held open here.
+## Commands
 
-| connections | raw, Lexell | client, Lexell |
-|---:|---:|---:|
-| 1: requests/s | 4,360 | 4,030 |
-| 100: requests/s | 68,800 | 57,653 |
-| 1,000: requests/s | 57,200 | 44,022 |
-| 1: latency p50 / p99 | 219 / 380 µs | 233 / 556 µs |
-| 100: latency p50 / p99 | 1.43 / 2.59 ms | 1.72 / 2.46 ms |
-| 1,000: latency p50 / p99 | 16.4 / 21.6 ms | 21.9 / 28.2 ms |
+The programs in `lexell/cmd`, built with the native backend, against the
+system tools. Wall time is best of 5, interleaved; instructions are user-mode
+counts. Output was compared with `cmp` where noted.
 
-The raw columns are from an earlier sweep. The client does more work per
-request than the raw loop: it builds a full request, parses every reply
-header, works out the framing and goes through the pool. With the loader's
-core full, that is 83% to 87% of the raw throughput from 100 connections on;
-with one connection the loopback round trip is the limit and they are level.
-At 1,000 connections the client is 77% of raw. The design's gate asked for
-parity, so it is not met (design/http-client.md, section 8).
+| case | Lexell | Reference | Lexell / reference |
+|---|---:|---:|---:|
+| grep `-c omega`, 100 MB, wall | 59 ms | GNU grep 90 ms | 0.66 |
+| grep `-c omega`, instructions | 795 M | GNU grep 375 M | 2.1 |
+| grep `-c omega`, wall | 59 ms | ripgrep 45 ms | 1.3 |
+| grep `-o -w eta`, 100 MB, wall | 269 ms | GNU grep 354 ms | 0.76 |
+| sort, 100 MB, wall | 641 ms | GNU sort 359 ms | 1.78 |
+| sort, instructions | 5,989 M | GNU sort 2,683 M | 2.2 |
+| tail `-n 5`, 100 MB file, wall | 7.9 ms | GNU tail 7.7 ms | 1.02 |
+| eza `-T /usr/share`, wall | 198 ms | eza 0.23.5 814 ms | 0.24 |
+| eza `-l /usr/lib`, wall | 26 ms | eza 0.23.5 44 ms | 0.60 |
 
-### With a Postgres pool
+The grep, sort, tail and tree outputs are identical. The `-l` outputs differ in
+column padding and in one extended-attribute marker, so that row is indicative
+only. The requested `/usr/lib/x86_64-linux-gnu` does not exist on this host.
 
-`python3 lexell/cmd/http_gate.py --servers native --db 4,16`: the same server
-and load, each request `GET /db`, which takes a connection from a
-`postgres.Pool` of 4 or 16 connections, runs `SELECT $1::int8 + 1` with the
-request's number, and returns the connection. PostgreSQL 16 on the same
-machine, over its Unix socket. The queries go through the Lexell client
-(`postgres`, over `pgwire`, design/pgwire.md): each request's task parks on
-the socket, and the server's one thread serves the 10,000 idle connections
-and the load meanwhile.
+## Not measured in this round
 
-Two complete gate runs (each cell: requests/s the best of the two, with the
-latency of that same run), the one-minute load 1.92 and 2.11 at the start of
-each. Each figure is one 5 s
-run; the cells moved by 1% to 8% between runs:
-
-| | Lexell, pool 4 | Lexell, pool 16 |
-|---|---:|---:|
-| 1 client: requests/s | 2,594 | 2,633 |
-| 10 clients: requests/s | 20,818 | 20,310 |
-| 100 clients: requests/s | 20,016 | 21,217 |
-| 1 client: latency p50 / p99 | 368 / 665 µs | 362 / 693 µs |
-| 10 clients: latency p50 / p99 | 469 / 739 µs | 483 / 746 µs |
-| 100 clients: latency p50 / p99 | 4.88 / 6.37 ms | 4.63 / 6.14 ms |
-
-The libpq comparison is in design/pgwire.md, section 27: the two clients
-were within -5% to +8% of each other in every row, in both directions, and
-the idle connections cost the same with both (about 15 KB each).
-
-One client pays two round trips, the HTTP one and the server's to
-PostgreSQL (about 100 µs). From 10 clients on, the server's one thread is the
-limit: 1 / 20,700 requests/s is about 48 µs of it per request (the breakdown
-was not measured for the Lexell client). With 100 clients, most of them wait
-in the pool's queue (first come, first served), which is where the 5 ms comes
-from. After the load, `/shutdown` with the 10,000 idle connections open took
-0.53 to 0.59 s, exit 0, no leak under `LXL_CHECK=1`, every pool connection
-idle and nobody waiting. An idle connection cost 14.9 to 15.3 KB.
-
-The Lexell client does not wait in a thread for a running query: the task
-parks on the socket, so a waiting query can be cancelled (a CancelRequest on
-a second connection, design/pgwire.md section 13) when its task is, and its
-cost is the one thread's, the same budget the HTTP side uses; more cores come
-from processes (below). The libpq client had the same budget through
-libpq's asynchronous API (`PQcancel`).
-
-### With a SQL Server pool
-
-`python3 lexell/cmd/http_gate.py --servers native --db 4,16 --db-server
-sqlserver`: the same server and load, but `GET /db` takes a connection from
-a `sqlserver.Pool` (the shared pool of design/pool.md) and runs `SELECT
-CAST(@p1 AS bigint) + 1` with the request's number through sp_executesql.
-SQL Server 2025 (17.0.5035) on the same machine, over TCP on loopback with
-TLS for everything (`Encrypt=yes`), packets of 4,096 bytes; the client is
-`sqlserver` over `tds`, written in Lexell (design/tds.md). Measured
-2026-11-09.
-
-Two complete gate runs (each cell: requests/s the best of the two, with the
-latency of that same run), the one-minute load 0.35 and 3.38 at their
-starts. Each figure is one 5 s run; the pool-of-4 cells moved by up to 48%
-between the two runs, the pool-of-16 ones by up to 19%:
-
-| | Lexell, pool 4 | Lexell, pool 16 |
-|---|---:|---:|
-| 1 client: requests/s | 1,432 | 1,426 |
-| 10 clients: requests/s | 8,302 | 11,664 |
-| 100 clients: requests/s | 8,281 | 15,086 |
-| 1 client: latency p50 / p99 | 665 / 1,228 µs | 670 / 1,167 µs |
-| 10 clients: latency p50 / p99 | 1.15 / 2.15 ms | 808 / 1,356 µs |
-| 100 clients: latency p50 / p99 | 11.9 / 14.0 ms | 6.46 / 8.95 ms |
-
-Both runs passed the gate: the 10,000 idle connections still answered,
-exit 0, no leak under `LXL_CHECK=1`, every pool connection idle and nobody
-waiting. In the first run (the second's other lines were not kept)
-`/shutdown` took 0.53 to 0.54 s and an idle connection cost 15.3 KB.
-The 200 ms maxima at 10 and 100 clients are the requests that waited for a
-pool connection's login (TLS and LOGIN7), as the pool opens them when the
-load arrives.
-
-**Where the time goes.** The query, not the client. One connection running
-the same statement sequentially, 4,000 times after 200 to warm up (each
-variant in a process of its own, its CPU time from `getrusage`; two runs):
-
-| client | per query | client CPU per query |
-|---|---:|---:|
-| `sqlserver` (TDS), sp_executesql with `@p1` | 350 to 396 µs | 35 µs |
-| `sqlserver` (TDS), the same as a plain batch | 458 to 466 µs | 33 µs |
-| the ODBC client (`lib/tests/support/mssql.lxl`, ODBC Driver 18.7), `?` parameter | 736 to 788 µs | 87 to 88 µs |
-
-So about 90% of a TDS round trip is the server's (and TLS on both ends);
-the Lexell client is about twice as fast as ODBC per query and uses 2.5
-times less CPU. Against PostgreSQL's table above, one client gets about
-half the requests per second (1,430 against 2,600), which is that round
-trip: about 0.35 ms on top of the HTTP one's. With the pool of 4, four
-queries in flight at about 0.5 ms each bound it near 8,000 requests/s; with
-16, it reaches 15,000. An ODBC-backed httpd was not run: the ODBC client
-blocks a thread per call and is a test oracle, not a library module, so the
-comparison is the sequential one above.
-
-### With worker processes
-
-`python3 lexell/cmd/http_gate.py --workers 1,2,4,8 --db 4`: `httpd ADDR POOL
-WORKERS`, n worker processes under `task.workers` sharing one listener made
-before the fork, each with its own event loop and (for `/db`) its own pool of
-4 PostgreSQL connections. No idle connections; 256 keep-alive load
-connections spread over 8 load processes (`httpload -p 8`), 5 s per row,
-`LXL_CHECK=1`. Pinning: the n workers on the first n of CPUs 0, 2, 4, 6, 1,
-3, 5, 7 (1 to 4 workers each have a core of their own; 8 workers share four
-cores with SMT), the load on CPUs 8-15 (the other four cores); the gate
-stops if the two sets would share a core. PostgreSQL is not pinned.
-Two complete gate runs with the Lexell client (each cell: requests/s the best
-of the two), the one-minute load 2.15 and 10.07 at the starts (the second run
-overlapped the tail of another gate). Requests/s, one 5 s run each:
-
-| workers | Lexell `/` | Lexell `/db` |
-|---:|---:|---:|
-| 1 | 56,215 | 19,275 |
-| 2 | 95,292 | 31,919 |
-| 4 | 122,990 | 47,674 |
-| 8 | 124,333 | 60,852 |
-
-Most cells moved by 2% to 6% from run to run; the 1-worker Lexell `/` row
-moved by 13% (49,102 then 56,215), which is why the table is the best of
-two. The libpq comparison is in design/pgwire.md, section 27.
-
-`/` scales 1.5 to 1.7 times at 2 workers and 2.0 to 2.1 at 4, then stops
-(2.05 to 2.12 at 8): the ceiling is the machine's, the loopback TCP of both
-sides and the WSL2 virtual machine's cross-CPU wake-ups, not the workers.
-`/db` keeps scaling to 8 workers (3.3 to 3.6 times): each request is mostly
-waiting for PostgreSQL, whose backends run on whatever CPUs are free, and 8
-workers keep 32 queries in flight. A listener of its own in each worker
-(`httpd ... WORKERS reuseport`, `SO_REUSEPORT`) is the other mode; the shared
-listener is the default because connections waiting in a killed worker's own
-accept queue are reset with its socket. Only the shared listener is
-measured here; the reuseport mode is unchanged.
-
-The kill test (4 workers, `/`, the load reconnecting after an error): a third
-of the way in, `SIGKILL` to one worker. It passed in every run. The runs lost
-46, 48, 100 and 100 requests,
-the ones in flight on the killed worker's connections. The
-supervisor started the worker again after 105 to 108 ms (the 100 ms backoff;
-a crash after the worker is ready never counts toward giving up), it
-accepted from the same queue, and every worker drained at `/shutdown` with
-exit 0, the restart counted.
-
-## TLS
-
-`lexell/lib/tls.lxl` over OpenSSL 3.0.13 (design/tls.md), and https in the http
-client. Measured by `python3 lexell/cmd/tls_bench.py`:
-
-- `lexell/cmd/tlsbench.lxl`, built with Lexell, against OpenSSL's own clients and
-  curl; the server on CPU 0 and the client on CPU 2;
-- a P-256 ECDSA certificate from a test CA, verified by every client; TLS
-  1.3, TLS_AES_256_GCM_SHA384, X25519; each row the median of three runs.
-- **Handshakes:** full handshakes one after another (connect, handshake,
-  close_notify, no resumption) against `openssl s_server -www`.
-- **Bulk:** one GET of 1 GiB from `tlsbench serve` (an https server written
-  with `tls`, Lexell), its body streamed in 64 KiB reads.
-- **Requests:** 20,000 small GETs over kept-alive connections to the same
-  server (5,000 for curl, one URL list).
-
-| | Lexell | OpenSSL / curl |
-|---|---:|---:|
-| handshakes/s (s_server is the limit) | 752 | 560 (`openssl s_time -new`) |
-| client CPU per handshake | 527 µs | 595 µs (`s_time`) |
-| GET 1 GiB: MB/s | 1,961 | 2,021 (curl) |
-| GET 1 GiB: client CPU | 0.47 s | 0.44 s (curl) |
-| requests/s, 1 connection | 3,887 | 2,986 (curl) |
-| requests/s, 10 connections | 29,399 | |
-
-**Handshakes.** A handshake's client side costs what OpenSSL's own client
-costs. Most of the 0.5 ms is in OpenSSL 3.0: the per-connection `SSL` setup
-(provider lookups), verifying the ECDSA chain and the X25519 exchange. The
-engine's memory BIOs and the parking add nothing measurable. The rate is
-bound by s_server, which handshakes one connection at a time.
-
-**Bulk.** Bulk throughput is decryption: AES-GCM with AES-NI, under 0.5 s of
-client CPU for 1 GiB, the same as curl's. The bulk row moves by up to a third
-between runs on this machine.
-
-**Requests.** The one-connection row is the loopback round trip, and it moves
-by 15 to 25% from run to run. For scale, plain http to `httpd` reaches about
-4,300 per second on one connection (above). These runs are also the H2
-gate's "1,000 https requests over kept-alive connections"
-(design/http-client.md), under no `LXL_CHECK`; the tests run under
-`LXL_CHECK=1` with no leak.
-
-## Database streaming
-
-`conn.stream(sql, args, bind, read)` in the SQL Server, PostgreSQL and
-Oracle clients decodes each row straight into the program's own record,
-a caller-owned buffer at a time, instead of holding the whole result in
-memory ([design/db-streaming.md](lexell/design/db-streaming.md): the API,
-the column matching, each client's mechanism and early close). Measured
-by `python3 lexell/bench/dbstream/run.py`: one run of all four clients, pinned
-to CPU 10, with the one-minute load
-average 0.84 at the start: 1,000,000 rows of (bigint, int, text,
-decimal(12,2)), every
-value decoded into a record and folded into a checksum, which is equal in
-every row of the table; a buffer of 1,024 rows; peak RSS of the process;
-each figure the least of 5 interleaved runs. The servers run on the same machine,
-unpinned; Oracle runs in a rootless podman container,
-whose networking adds about 0.38 ms a round trip. `PostgreSQL` is the Lexell
-client; `PostgreSQL (libpq)` is `postgres_libpq`, the old client, kept as
-the comparison.
-
-| client | streamed | buffered | streamed, 100,000 rows |
-|---|---|---:|---:|
-| SQL Server | 417 ms, 12.0 MB | 1,068 ms, 365.8 MB | 107 ms, 12.1 MB |
-| PostgreSQL | 388 ms, 9.4 MB | 763 ms, 91.0 MB | 43 ms, 9.2 MB |
-| PostgreSQL (libpq) | 543 ms, 8.8 MB | 845 ms, 109.8 MB | 61 ms, 8.8 MB |
-| Oracle | 473 ms, 13.6 MB | 630 ms, 111.6 MB | 84 ms, 13.6 MB |
-
-- **Memory is flat while streaming:** the same at 100,000 and 1,000,000
-  rows (8.2 to 14.0 MB: the program, its buffer and, for Oracle, a fetch of
-  about 10,000 rows). Buffered memory grows with the result: 91 MB for
-  PostgreSQL's Lexell client (its whole result), 109 to 110 MB for
-  PostgreSQL through libpq (libpq's whole result), 111 MB for Oracle (each
-  value's bytes, decoded when read) and 365 MB for SQL Server (a decoded
-  cell per value).
-- **Streaming is never slower:** 2.6 to 2.7 times faster for SQL Server,
-  2.0 times for PostgreSQL's Lexell client (1.6 for libpq) and 1.3 to 1.5
-  times for Oracle.
-- **How each client streams:** SQL Server decodes the reply a packet at a
-  time. The Lexell PostgreSQL client sends one Execute with no row limit and
-  reads the rows off the socket as the buffer needs them, at most 256 KB a
-  batch (design/pgwire.md, section 12): the server sends the whole result,
-  and TCP holds it back while the program reads slowly. The libpq client
-  uses libpq's single-row mode, batched into the buffer. Oracle fetches
-  about 256 KB a round trip (at the widest row for the first FETCH, then at
-  the size the rows took: about 9,900 rows here) and sends the next FETCH
-  before the program uses the last rows.
-- **Latency:** with a 2.5 ms one-way delay (6.1 to 6.2 ms round trip through
-  the proxy), Lexell streams 1M rows in 458 ms against libpq's 633; at 0 ms
-  they are 415 and 598 ms (design/pgwire.md, section 28).
-- **Client cost per row:** cycles per row (earlier sweep, Lexell,
-  streamed / buffered): Oracle 1,169 / 1,010 and SQL Server 1,290 / 2,515.
-  Oracle's wall time is mostly the server's work and about 100 round trips. The breakdown (client
-  CPU, server, network) and the slow-network runs are in
-  design/db-streaming.md, section 7.
-
-## lexdb against PostgreSQL and SQL Server
-
-lexdb, the SQL server written in Lexell, measured against PostgreSQL 18.6
-and SQL Server 2022 on this machine's bare-metal Linux (2026-11-15). The
-full record, its host, rules and history, and how to run each suite:
-[design/lexdb-benchmarks.md](lexell/design/lexdb-benchmarks.md).
-PostgreSQL is capped at 4 processes, lexdb's shape (a master and 3 read
-replicas); all figures warm. Refreshed 2026-11-18 at `eababf57` (pinned:
-each server on the same four physical cores, the clients on the other four;
-the COPY rows unpinned, as before).
-
-| | lexdb | PostgreSQL |
-|---|---:|---:|
-| pgbench point selects, 32 clients (lexdb: 3 read replicas) | **401,000/s** | 404,600-408,700/s |
-| pgbench updates, 8 clients | **16,687/s** | 6,859/s |
-| an update's commit latency, p99 / max (8 clients) | 1.38-1.40 / 9.2-9.6 ms (p99 0.81 before the owned-string migration) | |
-| a commit visible on the read replicas, p50 / p99 | 0.26-0.29 / 0.39-0.46 ms | |
-| single-row autocommit inserts, 1 client | **3,843/s** (0.26 ms) | 1,577/s (0.63 ms) |
-| `count(*)`, 1M rows | **3.9 ms** | 19.4 (one core), 12.1 (4 processes) |
-| 35 analytic queries, geometric mean of lexdb's time over PG's | **0.63** (CPU) against one core, 1.19 against 4 processes (at `eababf57`; lexdb's CPU 6.7% lower since, `d0f00b92`: text columns as one buffer) | |
-| TPC-H derived, SF1, 22 queries: geometric mean of lexdb's time over PG's (pinned, boost off, 2026-11-18, `aaadeb1e`; PG's from 2026-11-16) | **0.98** against one core (2.48 at `94536d12`, 3.77 at `1744ef99`); summed **12.98 s** against PG's 13.96 s | |
-| COPY of 1M wide rows (12 columns) | **1.54 s** | 1.79 s (SQL Server bcp 3.34 s) |
-| COPY of 10M narrow rows | 5.51 s | 5.53 s (bcp 10.86 s) |
-
-## Reproducing
-
-```sh
-lexell/compiler/build.sh                                  # out/lxlc from the seed
-python3 lexell/bench/bench.py --opt --perf -n 11          # the microbenchmarks (hand-written C and Lexell -O)
-python3 lexell/bench/compile.py -n 3                      # compile time and binary size
-python3 lexell/bench/apps.py -n 5 --pin 2                 # the Tier-1 application suite
-python3 lexell/bench/regex/bench.py -n 7                  # the regex table (Go, Rust and rg built by it)
-python3 lexell/bench/json/bench.py --jq JQ                # the JSON library and jq large-input tables
-python3 lexell/tests/markdown.py --perf --ref CMARK       # the Markdown table
-python3 lexell/cmd/eza_gate.py -j 12                      # eza correctness on both builds
-lexell/compiler/out/lxlc lexell/cmd/eza.lxl -o eza
-lexell/tools/native_selfbuild.sh                          # the Lexell-built compiler
-lexell/compiler/out/lxlc lexell/bench/tasks.lxl --native -o tasks && ./tasks
-lexell/compiler/out/lxlc lexell/bench/math/calls.lxl --native -o calls && ./calls exp
-python3 lexell/bench/decimal/run.py --base DIR            # Decimal, two trees compared
-python3 lexell/tools/placement.py                         # code placement spreads
-python3 lexell/cmd/http_gate.py                           # the server table (about 2 minutes)
-python3 lexell/cmd/http_gate.py --servers native --client --conns 1,100,1000   # the client table
-python3 lexell/cmd/http_gate.py --servers native --db 4,16   # with Postgres ($LXL_PG_DSN)
-python3 lexell/cmd/http_gate.py --workers 1,2,4,8 --db 4  # worker processes (about 3 minutes)
-python3 lexell/tests/httpsrvgen.py -n 100000              # the server's parsing against Go and llhttp
-python3 lexell/cmd/tls_bench.py                           # TLS handshakes, bulk and https requests (about 2 minutes)
-python3 lexell/bench/dbstream/run.py                      # database streaming against buffered (the servers' DSNs; a quiet machine)
-python3 lexell/bench/dbstream/run.py --latency 0,0.12,1.75  # Oracle over ~1 ms and ~5 ms round trips (delayproxy.py)
-```
+- **Rust toolchain sizes** in the compile table: the sizing step crashed on a
+  broken system symlink.
+- **Regex against the Rust crate:** the `regex` crate is not in the offline cargo cache.
+- **Plain C references** for the microbenchmarks.
+- **HTTP server and client, TLS, tasks, database streaming, and LexDB.** Each
+  needs its own references and runs; LexDB has its own document,
+  `lexell/design/lexdb-benchmarks.md`, which is to be redone.
+- **.NET and Oracle** comparisons: dropped for now, to be added back later.
