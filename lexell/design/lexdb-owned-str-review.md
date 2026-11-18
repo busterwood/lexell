@@ -224,3 +224,14 @@ Point selects: 205,400 to 189,100 instructions per statement (−8.0%,
 two runs each, alternating), cycles −6.5%. Below the 198,000 before
 the owned-str switch. TPC-H instructions unchanged (−0.03%), checksums
 unchanged, suite 190, quick gate PASS.
+
+**Finding 5's composite keys, done (2026-11-18, fea5295d)** after the
+language changes AP (`s += x` appends in place) and AR (a string is its
+own buffer, `clear()` keeps it). The vector aggregate (`AggSt.eat`), the
+row-by-row aggregate (`groupRow`, buffer kept in `RowGroups.kb`), the hash
+build (`Builder.add`) and the probe (`joinFrom`) clear one string per
+operator, look up by it, and copy it only for a new group or bucket.
+TPC-H instructions −0.86% (q1 −3.7%, q5 −3.6%, q10 −1.6%); all 22
+results unchanged; suite 190. The row engine's keys (`lexdb_exec`: its
+GROUP BY, DISTINCT aggregates, materialised hash keys) still build a
+string per row; they go with the executor redesign.
