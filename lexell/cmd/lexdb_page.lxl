@@ -76,8 +76,14 @@ const LIST_ROOM = (PAGE - 28) / 8
 // is lazy. Internal nodes are never lazy.
 pub type Node = record {
     pub leaf: bool
-    pub keys: []str
-    pub vals: []str
+    // keys as one counted array (shared by a kept version until an entry
+    // is added or removed), values each counted (a kept version shares
+    // them: the store's copyNode)
+    pub keys: rc []str
+    // values counted (rc): a version kept for snapshots (the store's
+    // copyNode, one per commit to a leaf before it is durable) copies the
+    // array, sharing each value
+    pub vals: []rc str
     pub kids: []int
     pub size: int        // the bytes its entries take on a page
     pub packed: bool     // its keys and values are slices of one string (read or written as a page since it changed)
@@ -93,7 +99,13 @@ pub type Node = record {
     pub cdir: []int
 }
 
-pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: [], vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []} }
+// An empty key array (rc).
+pub fn noKeys(): rc []str {
+    let e: []str = []
+    return rc(e)
+}
+
+pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: noKeys(), vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []} }
 
 // Whether n is a column leaf (its rows by column: cols, cdir).
 pub fn (n: &Node) isCols(): bool { return len(n.cdir) > 0 }
@@ -135,7 +147,7 @@ pub fn (n: &Node) keyView(i: int): &str {
 
 // Value i (a leaf's); a column leaf's row is rebuilt.
 pub fn (n: &Node) val(i: int): str {
-    if !n.lazy { return n.vals[i].clone() }
+    if !n.lazy { return n.vals[i].toStr() }
     if len(n.cdir) > 0 { return lexdb_cols.rowOf(&n.cols, &n.cdir, i) }
     let e = n.ents[i]
     return n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)].clone()
@@ -192,13 +204,13 @@ pub fn (n: mut &Node) loosen() {
     }
     let cnt = len(n.ents)
     var keys: []str = array(cnt, "")
-    var vals: []str = array(cnt, "")
+    var vals: []rc str = withCapacity(cnt)
     for i in 0..cnt {
         let e = n.ents[i]
         keys[i] = n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)].clone()
-        vals[i] = n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)].clone()
+        append(mut &vals, rc(n.body[lexdb_rows.vStart(e)..lexdb_rows.vEnd(e)].clone()))
     }
-    n.keys = keys
+    n.keys = rc(keys)
     n.vals = vals
     n.lazy = false
     n.packed = true
@@ -212,13 +224,13 @@ fn (n: mut &Node) loosenCols() {
     var ends: []int = array(cnt, 0)
     let rows = lexdb_cols.allRows(&n.cols, &n.cdir, mut &ends)
     var keys: []str = array(cnt, "")
-    var vals: []str = array(cnt, "")
+    var vals: []rc str = withCapacity(cnt)
     for i in 0..cnt {
         let e = n.ents[i]
         keys[i] = n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)].clone()
-        vals[i] = rows[if i == 0 { 0 } else { ends[i - 1] }..ends[i]].clone()
+        append(mut &vals, rc(rows[if i == 0 { 0 } else { ends[i - 1] }..ends[i]].clone()))
     }
-    n.keys = keys
+    n.keys = rc(keys)
     n.vals = vals
     n.lazy = false
     n.packed = false
@@ -251,7 +263,7 @@ fn lazyLeaf(body: &str, cnt: int): Node {
             at += 4 + kl + vl
         }
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: 0, packed: true, lazy: true, body: body.clone(), ents: ents, cols: "", cdir: []}
+    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: 0, packed: true, lazy: true, body: body.clone(), ents: ents, cols: "", cdir: []}
 }
 
 // The bytes of an entry whole: what bounds an entry (MAX_ENTRY), and
@@ -430,7 +442,7 @@ fn frontLeaf(b: &[]byte, cnt: int): Node {
         at = h.at + n
         prev = ks
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents, cols: "", cdir: []}
+    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents, cols: "", cdir: []}
 }
 
 // Leaf n's page, numbered pageNo, front coded (T_FLEAF). A leaf whose
@@ -477,7 +489,7 @@ fn colNode(body: str, cnt: int): Node {
         Some(d) { d }
         None { panic("a column leaf's columns") }
     }
-    return Node{leaf: true, keys: [], vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir}
+    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir}
 }
 
 // Leaf n as a column leaf's body (lexdb_rows.colBody), its rows encoded
@@ -707,7 +719,7 @@ pub fn decodeNode(b: &[]byte): Node {
     for i in 0..n {
         end += 2 + binary.readU16LE(b, end) + 8
     }
-    var node = Node{leaf: false, keys: array(n, ""), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: [], cols: "", cdir: []}
+    var node = Node{leaf: false, keys: rc(array(n, "")), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: [], cols: "", cdir: []}
     unpack(mut &node, &getStr(b, 18, end - 18), true)
     return node
 }
@@ -766,7 +778,7 @@ pub fn repack(n: mut &Node, body: &str) {
         return
     }
     var keys: []str = array(len(n.keys), "")
-    n.keys = keys
+    n.keys = rc(keys)
     var kids: []int = array(len(n.kids), 0)
     for i in 0..len(n.kids) { kids[i] = n.kids[i] }
     n.kids = kids
@@ -783,7 +795,7 @@ pub fn packedLeaf(body: &str, cnt: int): Node {
 
 // Leaf n made l (packedLeaf of its own entries' body), as repack makes it.
 pub fn adopt(n: mut &Node, var l: Node) {
-    n.keys = []
+    n.keys = noKeys()
     n.vals = []
     n.ents = replace(mut &l.ents, [])
     n.cdir = replace(mut &l.cdir, [])
@@ -797,13 +809,14 @@ pub fn adopt(n: mut &Node, var l: Node) {
 // body (a page from byte 18), and with kids its kids' page numbers.
 fn unpack(n: mut &Node, body: &str, kids: bool) {
     let cnt = len(n.keys)
+    var ks: []str = array(cnt, "")
     if n.leaf {
         var at = 0
         for i in 0..cnt {
             let kl = binary.readU16LEStr(body, at)
             let vl = binary.readU16LEStr(body, at + 2)
-            n.keys[i] = body[at + 4..at + 4 + kl].clone()
-            n.vals[i] = body[at + 4 + kl..at + 4 + kl + vl].clone()
+            ks[i] = body[at + 4..at + 4 + kl].clone()
+            n.vals[i] = rc(body[at + 4 + kl..at + 4 + kl + vl].clone())
             at += 4 + kl + vl
         }
         n.size = at
@@ -812,12 +825,13 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
         var at = 8
         for i in 0..cnt {
             let kl = binary.readU16LEStr(body, at)
-            n.keys[i] = body[at + 2..at + 2 + kl].clone()
+            ks[i] = body[at + 2..at + 2 + kl].clone()
             if kids { n.kids[i + 1] = int(binary.readU64LEStr(body, at + 2 + kl)) }
             at += 2 + kl + 8
         }
         n.size = at
     }
+    n.keys = rc(ks)
     n.packed = true
 }
 
