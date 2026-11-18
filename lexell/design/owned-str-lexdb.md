@@ -303,9 +303,20 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 | AF | SPEC 10 rule 5: a function with several borrowed parameters may return a shared borrow (`fn longer(a: &str, b: &str): &str`); the result borrows all its arguments, as a result holding borrows already did. A `mut &` result still needs exactly one. | a4f8001c | yes | none |
 | AG | SPEC 10 rule 7: a `var` borrow initialised from a static string (`var s: &str = ""`) takes its roots from its first store that borrows something, as a `var` of a type holding borrows does (AC fixed the roots at the initializer). | a4f8001c | yes | none |
 
+| AH | SPEC 5.2: `G.getOrSet(f)` on a set-once global returns `G.get()`, first setting it to `f()` if empty. Tasks that reach an empty `G` while another's `f` is suspended run `f` too; the first value stored wins, the rest are dropped, nothing stops the program. | (this commit) | yes (a new method) | none |
+
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
 of use); helpers duplicated to return either of two borrowed strings; and
 `var best: &str = &first` initialisers invented only to give a `var` its
 roots (`""` now works).
+
+**Lazily set globals (AH).** lexdb's zone registry and dictionary pool were
+set lazily with `if !G.isSet() { G.set(load()) }`; tasks starting together
+could race on the first use (a `load` that suspends lets a second task find
+`G` empty, and the second `set` stops the program, exit 12). lexdb now sets
+them when the store opens and keeps the lazy set for programs that never
+open one. That lazy path can become `G.getOrSet(fn(): T { load() })`. `f`
+may run more than once under a race, so it must have no effects but its
+value.
 

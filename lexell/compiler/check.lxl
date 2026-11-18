@@ -6012,8 +6012,37 @@ fn (c: mut &Checker) onceCall(g: int, name: &str, e: int): Val {
     let msg = "set-once global " + gname
     let setn = c.nm(&(cn + "_set"))
     let na = c.count(n.b)
-    if (name != "set" && name != "get" && name != "isSet") || na != (if name == "set" { 1 } else { 0 }) {
-        c.err(n.line, "a set-once global has set(v), get() and isSet(), not " + name + " with " + intToStr(na) + " arguments")
+    if (name != "set" && name != "get" && name != "isSet" && name != "getOrSet") ||
+            na != (if name == "set" || name == "getOrSet" { 1 } else { 0 }) {
+        c.err(n.line, "a set-once global has set(v), get(), getOrSet(f) and isSet(), not " + name + " with " +
+            intToStr(na) + " arguments")
+    }
+    if name == "getOrSet" {
+        // SPEC 5.2: f() runs when the global is empty; if another task set it while f was suspended,
+        // f's value is dropped and the first one kept, so racing first uses do not stop the program
+        c.emit(c.x.sif(c.x.bin("!=", setn, c.lit(1))))
+        c.cx.ind += 1
+        c.emit(c.x.if1(c.x.bin("==", setn, c.lit(2)), c.x.sx(c.x.call("rt_trap", [c.lit(12),
+            c.x.str(&(msg + " is dropped")), W]))))
+        c.pushFrame()
+        let call = c.synth(sx.N_CALL, n.line, "", c.item(n.b, 0), c.synthList(&[]), 0)
+        let v = c.coerce(c.expr(call, gt), gt, n.line, &("the value of " + gname))
+        let tn = c.fresh("once")
+        c.emit(c.x.decl(c.T(gt), &tn, c.consumeAs("once", v, n.line)))
+        let fr = c.popFrame()
+        c.dropFrame(&fr)
+        c.emit(c.x.sif(c.x.bin("==", setn, c.lit(1))))
+        c.cx.ind += 1
+        c.dropc(c.nm(&tn), gt)
+        c.cx.ind -= 1
+        c.emit(c.x.selse())
+        c.cx.ind += 1
+        c.emit(c.x.seq([c.x.sx(c.x.asg(c.nm(&cn), c.nm(&tn))), c.x.sx(c.x.asg(setn, c.lit(1)))]))
+        c.cx.ind -= 1
+        c.emit(c.x.send())
+        c.cx.ind -= 1
+        c.emit(c.x.send())
+        return rvAt(c.addrOf(gt, c.nm(&cn)), c.pg.mkRef(gt, false), c.staticVar(sema.D_GLOBAL, g), "")
     }
     if name == "isSet" { return rv(c.x.par(c.x.bin("==", setn, c.lit(1))), sema.T_BOOL) }
     if name == "get" {

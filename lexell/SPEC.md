@@ -483,6 +483,15 @@ owned or copy, that starts empty and is set at most once:
   (exit 12).
 - `CONFIG.get()` returns a `&Config` borrow. Reading it before it is set
   stops the program (exit 12). `CONFIG.isSet()` tells which.
+- `CONFIG.getOrSet(f)`, with `f` a function or closure taking nothing and
+  returning a `Config`, returns `CONFIG.get()`, first setting it to `f()` if
+  it is empty. This is the way to set one lazily from tasks: `if
+  !CONFIG.isSet() { CONFIG.set(load()) }` stops the program when `load`
+  suspends (I/O, `sleep`) and another task meanwhile finds it empty and sets
+  it first. With `getOrSet`, a task that reaches an empty global while
+  another's `f` is suspended runs `f` too; the first value stored is kept,
+  and the others are dropped as their calls finish. So `f` may run more
+  than once, and should have no effects but its value.
 - Once set, the value never changes and is not freed until the program ends,
   so a borrow from `get()` is valid everywhere and freezes nothing. A
   function may return it, even one without borrowed parameters

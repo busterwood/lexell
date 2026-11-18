@@ -1,0 +1,35 @@
+// G.getOrSet(f) on a set-once global (SPEC 5.2): f runs when G is empty; tasks that reach it while
+// f is suspended run f too, the first value stored is kept and the others are dropped, so racing
+// first uses do not stop the program (contrast lib/tests/run/task_once_set_race.lxl, exit 12).
+// Run with LXL_CHECK=1: nothing leaks.
+// expect: drop zones 2
+// expect: drop zones 3
+// expect: first value kept: loads 1
+// expect: f ran 3 times
+// expect: drop zones 1
+import "task"
+type Zones = record { names: []str; loads: int }
+fn (z: mut &Zones) drop() { println("drop zones " + z.loads.toStr()) }
+var ZONES: once Zones
+var LOADS: once task.Shared[int]
+fn zones(): &Zones {
+    return ZONES.getOrSet(fn(): Zones {
+        var k = 0
+        LOADS.get().with(fn(n) { n += 1; k = n })
+        match task.sleep(5) { Ok(_) { } Err(_) { } }       // suspends: other tasks get here meanwhile
+        return Zones{names: ["UTC" + "", "CET" + ""], loads: k}
+    })
+}
+fn worker(i: int): int { return len(zones().names) + i }
+fn main() {
+    LOADS.set(task.shared(0))
+    let r = task.scoped(fn(s: mut &task.Scope): int {
+        var fs: []task.Future[int] = []
+        for i in 0..3 { append(mut &fs, s.start(worker, i)) }
+        return match task.all(fs) { Ok(xs) { len(xs) } Err(_) { -1 } }
+    })
+    println("first value kept: loads " + zones().loads.toStr())
+    var total = 0
+    LOADS.get().with(fn(n) { total = n })
+    println("f ran " + total.toStr() + " times")
+}
