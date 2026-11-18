@@ -324,7 +324,7 @@ uniform. lexdb compiles unchanged (verified: it builds, its suite passes,
 
 | AS | SPEC 10 rule 1 (finding 2, first part): a boxed record or closed type may hold borrows (a recursive syntax tree of `&str` views of its source); it is then borrow-class, second class like a value type holding borrows. Library containers (`Map[&str, V]`) are not yet borrow-capable: see design/consistency-designs.md. | 9f220529 | yes | none |
 
-| AT | SPEC 7.4: a shared borrow `&U` satisfies `U`'s interfaces (not those needing `mut &Self`); `sort`, `dedup`, `equal`, `contains`, `find`, `min`, `max` take `borrow` type parameters, so views can be sorted and compared without copies; a borrow of a non-copy value passed for a `borrow` type parameter keeps `T` the borrow. | (this commit) | yes | none |
+| AT | SPEC 7.4: a shared borrow `&U` satisfies `U`'s interfaces (not those needing `mut &Self`); `sort`, `dedup`, `equal`, `contains`, `find`, `min`, `max` take `borrow` type parameters, so views can be sorted and compared without copies; a borrow of a non-copy value passed for a `borrow` type parameter keeps `T` the borrow. | cdfdd397 | yes | none |
 
 **What lexdb can remove:** clones made only to take a field out of a record
 that is not used again (`let name = rec.name.clone()` before `rec` goes out
