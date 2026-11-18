@@ -1072,9 +1072,23 @@ lxl_str rt_str_static(lxl_str s) {
 bool rt_str_eq(lxl_str a, lxl_str b) {
     return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
 }
+/* Short strings (a database's keys: 8 to 16 bytes mostly) compared 8 bytes at a time as
+   big-endian integers, with no call to memcmp; longer ones by memcmp. */
 int rt_str_cmp(lxl_str a, lxl_str b) {
     int64_t n = a.len < b.len ? a.len : b.len;
-    int c = memcmp(RT_SP(a), RT_SP(b), (size_t)n);
+    const unsigned char *pa = (const unsigned char*)RT_SP(a), *pb = (const unsigned char*)RT_SP(b);
+    if (n <= 32) {
+        int64_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t x, y;
+            __builtin_memcpy(&x, pa + i, 8);
+            __builtin_memcpy(&y, pb + i, 8);
+            if (x != y) return __builtin_bswap64(x) < __builtin_bswap64(y) ? -1 : 1;
+        }
+        for (; i < n; i++) if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
+        return a.len < b.len ? -1 : a.len > b.len;
+    }
+    int c = memcmp(pa, pb, (size_t)n);
     if (c) return c < 0 ? -1 : 1;
     return a.len < b.len ? -1 : a.len > b.len;
 }
