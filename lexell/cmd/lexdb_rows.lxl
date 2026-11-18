@@ -374,6 +374,15 @@ pub fn fixedVal(s: &str, p: int, k: byte, lay: &FixedLay): Result[Val, DbErr] {
     return varVal(k, s, lay.v0 + start, lay.v0 + end)
 }
 
+// A fixed row's text at place p (its kind PK_TEXT, not NULL): a view of
+// its bytes.
+pub fn fixedText(s: &str, p: int, lay: &FixedLay): Result[&str, DbErr] {
+    let end = binary.readU16LEStr(s, lay.off[p])
+    let start = if lay.prev[p] < 0 { 0 } else { binary.readU16LEStr(s, lay.prev[p]) }
+    if start > end || lay.v0 + end > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
+    return Ok(&s[lay.v0 + start..lay.v0 + end])
+}
+
 // decodeRowNeed for a row in the fixed layout.
 pub fn decodeFixed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]FixedLay): Result[[]Val, DbErr] {
     let lay = &lays[try layOf(s, lays)]
@@ -870,6 +879,12 @@ pub const BK_INT: int = 0    // a column's kind in a batch: an integer ...
 pub const BK_BOOL: int = 1   // ... a boolean (0, 1) ...
 pub const BK_VAL: int = 2    // ... or any other, as values
 pub const BK_NONE: int = -1  // a query's column not in the batch (of another table)
+// ... or a text (text, varchar): its bytes in the batch's txt[c], the row's
+// v[r] where (start << 24 | length); a value longer than TEXT_MAX does not
+// fit (put's false: the batch gives way). Only where the operator asks for
+// it (textColKind): its readers take views (textAt), no value per row.
+pub const BK_TEXT: int = 3
+pub const TEXT_MAX: int = 16777215
 // ... or a numeric(p, s) of p at most DEC_MAX_P as its units, the value
 // times 10^s, in an integer: BK_DEC + s (decKind). Only where the
 // operator asks for it (decColKind); every value read must have display
@@ -927,6 +942,7 @@ pub type BVec = record {
 pub type Batch = record {
     pub cols: []BVec
     pub vals: [][]Val
+    pub txt: []str          // per BK_TEXT column: its rows' bytes (each other column's "")
     pub n: int
 }
 
@@ -944,10 +960,19 @@ pub type OutBatch = record {
     pub idx: []int
     pub cols: []BVec
     pub vals: [][]Val
+    pub txt: []str          // a BK_TEXT column's bytes (Batch.txt)
     pub ex: []BVec
 }
 
-pub fn noOutBatch(): OutBatch { return OutBatch{n: 0, kinds: [], src: [], idx: [], cols: [], vals: [], ex: []} }
+pub fn noOutBatch(): OutBatch { return OutBatch{n: 0, kinds: [], src: [], idx: [], cols: [], vals: [], txt: [], ex: []} }
+
+// Output o's text at row j (its kind BK_TEXT, not NULL), a view.
+pub fn obText(ob: &OutBatch, o: int, j: int): &str {
+    let c = ob.src[o]
+    let w = ob.cols[c].v[ob.idx[j]]
+    let a = w >> 24
+    return &ob.txt[c][a..a + (w & TEXT_MAX)]
+}
 
 // What a reader needs of a table's rows: per column its batch kind, the
 // places used in order and each place's column, the last one's end (a
@@ -985,9 +1010,48 @@ pub fn emptyProjection(): Projection {
     return Projection{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []}
 }
 
-pub fn noRows(): Batch { return Batch{cols: [], vals: [], n: 0} }
+pub fn noRows(): Batch { return Batch{cols: [], vals: [], txt: [], n: 0} }
 
 pub fn bvec(m: int): BVec { return BVec{v: array(m, 0), nul: array(m, false)} }
+
+// A column's kind in a batch where the operator reads texts as BK_TEXT:
+// a text or varchar is BK_TEXT, any other as colKind.
+pub fn textColKind(c: &lexdb_sql.ColDef): int {
+    let o = c.typ.oid
+    if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { return BK_TEXT }
+    return colKind(c)
+}
+
+// Whether column c of b, read as a value (not an integer, boolean or
+// units column), holds texts (BK_TEXT): its rows' bytes, no values.
+pub fn isTextCol(b: &Batch, c: int): bool { return len(b.vals[c]) == 0 && len(b.cols[c].nul) > 0 }
+
+// A column's kind in the pipeline's batches (lexdb_pipe): a text as
+// BK_TEXT; with dec, a numeric as its units (decColKind); else colKind.
+pub fn pipeKind(c: &lexdb_sql.ColDef, dec: bool): int {
+    if dec {
+        let k = decColKind(c)
+        if k != BK_VAL { return k }
+    }
+    return textColKind(c)
+}
+
+// Row r of BK_TEXT column c of b (not NULL), a view of its bytes.
+pub fn textAt(b: &Batch, c: int, r: int): &str {
+    let w = b.cols[c].v[r]
+    let a = w >> 24
+    return &b.txt[c][a..a + (w & TEXT_MAX)]
+}
+
+// Row r of BK_TEXT column c of b set to text t (appended to the column's
+// bytes); false: longer than TEXT_MAX.
+pub fn putText(b: mut &Batch, c: int, r: int, t: &str): bool {
+    if len(t) > TEXT_MAX { return false }
+    let a = len(b.txt[c])
+    b.txt[c] += t
+    b.cols[c].v[r] = (a << 24) | len(t)
+    return true
+}
 
 // A column's kind in a batch, from its type.
 pub fn colKind(c: &lexdb_sql.ColDef): int {
@@ -999,10 +1063,11 @@ pub fn colKind(c: &lexdb_sql.ColDef): int {
 
 // A batch of a projection's columns, cap rows each.
 pub fn newBatch(bp: &Projection, cap: int): Batch {
-    var b = Batch{cols: [], vals: [], n: 0}
+    var b = Batch{cols: [], vals: [], txt: [], n: 0}
     for i in 0..len(bp.kinds) {
         if bp.needCol[i] { append(mut &b.cols, bvec(cap)) } else { append(mut &b.cols, bvec(0)) }
         if bp.needCol[i] && bp.kinds[i] == BK_VAL { append(mut &b.vals, array(cap, Val.Null)) } else { append(mut &b.vals, []) }
+        append(mut &b.txt, "")
     }
     return b
 }
@@ -1022,7 +1087,7 @@ pub fn setNull(b: mut &Batch, c: int, r: int) {
 // per batch read (lexdb-layers.md, after 2d slice 3).
 pub fn reuse(spare: mut &Batch, bp: &Projection): Batch {
     var b = replace(spare, noRows())
-    var fits = len(b.cols) == len(bp.kinds) && len(b.vals) == len(bp.kinds)
+    var fits = len(b.cols) == len(bp.kinds) && len(b.vals) == len(bp.kinds) && len(b.txt) == len(bp.kinds)
     if fits {
         for i in 0..len(bp.kinds) {
             let want = if bp.needCol[i] && bp.kinds[i] == BK_VAL { BROWS } else { 0 }
@@ -1031,7 +1096,10 @@ pub fn reuse(spare: mut &Batch, bp: &Projection): Batch {
     }
     if !fits { return newBatch(bp, BROWS) }
     b.n = 0
-    for i in 0..len(bp.kinds) { if bp.needCol[i] { b.cols[i] = bvec(BROWS) } }
+    for i in 0..len(bp.kinds) {
+        if bp.needCol[i] { b.cols[i] = bvec(BROWS) }
+        b.txt[i].clear()                // (its buffer kept)
+    }
     return b
 }
 
@@ -1065,6 +1133,7 @@ pub fn put(b: mut &Batch, c: int, r: int, v: Val, kind: int): bool {
                 }
             }
         }
+        Val.Text(x) { if kind == BK_TEXT { return putText(b, c, r, &x) } }
         else {}
     }
     if kind != BK_VAL { return false }
@@ -1145,6 +1214,8 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
                 b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
             } else if pk == PK_BOOL && k == BK_BOOL {
                 b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
+            } else if k == BK_TEXT {
+                if pk != PK_TEXT || !putText(b, c, r, try fixedText(s, pl, lay)) { return Ok(1) }
             } else if isDecKind(k) {
                 if !put(b, c, r, try fixedVal(s, pl, pk, lay), k) { return Ok(1) }
             } else if k != BK_VAL {
@@ -1204,6 +1275,12 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
                 Ok(d) { if !put(b, c, r, Val.Num(d), k) { return Ok(1) } }
                 Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
             }
+        } else if k == BK_TEXT {
+            // a text's bytes into the batch's (anything else gives way)
+            if tag != 4 { return Ok(1) }
+            let l = binary.readU32LEStr(s, at)
+            if !putText(b, c, r, &s[at + 4..at + 4 + l]) { return Ok(1) }
+            at += 4 + l
         } else if k != BK_VAL {
             return Ok(1)
         } else if tag == 1 {
@@ -1337,6 +1414,11 @@ pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projec
                 if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
             }
             b.cols[c] = col
+        } else if k == BK_TEXT && pk == PK_TEXT {
+            for q in 0..n {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { setNull(b, c, r0 + q) } else if !putText(b, c, r0 + q, try fixedText(s, pl, lay)) { return Ok(-1) }
+            }
         } else if k == BK_VAL {
             // a NULL row's value written too: the batch may be used again (reuse)
             for q in 0..n {
@@ -1419,6 +1501,11 @@ pub fn runCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp
                 if (int(s[at]) >> bit) & 1 == 1 { col.nul[r0 + q] = true } else { col.v[r0 + q] = if s[o] == 1 { 1 } else { 0 } }
             }
             b.cols[c] = col
+        } else if k == BK_TEXT && pk == PK_TEXT {
+            for q in qs {
+                let s = rows[q]
+                if (int(s[at]) >> bit) & 1 == 1 { b.cols[c].nul[r0 + q] = true } else if !putText(b, c, r0 + q, try fixedText(s, pl, lay)) { return Ok(false) }
+            }
         } else if k == BK_VAL {
             for q in qs {
                 let s = rows[q]
@@ -1559,6 +1646,51 @@ pub fn colsPick(leaf: &LeafView, from: int, qs: &[]int, rs: &[]int, all: bool, r
                     if b.cols[c].nul[r] { continue }
                     let v = try varVal(pk, s, lexdb_cols.spanStart(sp[x]), lexdb_cols.spanEnd(sp[x]))
                     if !put(b, c, r, v, k) { return Ok(false) }
+                }
+            }
+        } else if k == BK_TEXT {
+            // a text column's bytes from the page: its dictionary's entry or
+            // its own span, appended (no value made)
+            if pk != PK_TEXT { return Ok(false) }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            if codec == lexdb_cols.C_DICT && !all && 4 * n < lexdb_cols.dictSize(dir, pl) {
+                // a few rows picked (a lookup's): their entries only
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let sp = lexdb_cols.entryAt(s, dir, pl, lexdb_cols.codeAt(s, dir, pl, from + qs[x]))
+                    if !putText(b, c, r, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { return Ok(false) }
+                }
+            } else if codec == lexdb_cols.C_DICT {
+                // each entry's bytes into the batch once, the first time a
+                // row uses it; its rows point at them (a text's place is
+                // its start and length: rows may share bytes)
+                var codes: []int = array(n, 0)
+                if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
+                    for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
+                }
+                var placed: []int = array(lexdb_cols.dictSize(dir, pl), -1)
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let code = codes[x]
+                    if placed[code] < 0 {
+                        let sp = lexdb_cols.entryAt(s, dir, pl, code)
+                        if !putText(b, c, r, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { return Ok(false) }
+                        placed[code] = b.cols[c].v[r]
+                    } else {
+                        b.cols[c].v[r] = placed[code]
+                    }
+                }
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    if !putText(b, c, r, &s[lexdb_cols.spanStart(sp[x])..lexdb_cols.spanEnd(sp[x])]) { return Ok(false) }
                 }
             }
         } else if k == BK_VAL {

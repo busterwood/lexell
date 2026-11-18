@@ -461,11 +461,10 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_rows.OutBatch, cols: &[]lexdb_bind.OutCol
     let nc = len(ob.kinds)
     var buf: []byte = withCapacity(ob.n * (7 + 12 * nc))
     for j in 0..ob.n {
-        let at0 = len(buf)
-        append(mut &buf, 'D')
-        putU32(mut &buf, 0)
-        append(mut &buf, byte((nc >> 8) & 0xff))
-        append(mut &buf, byte(nc & 0xff))
+        let at0 = bytesGrow(mut &buf, 7)
+        buf[at0] = 'D'
+        buf[at0 + 5] = byte((nc >> 8) & 0xff)
+        buf[at0 + 6] = byte(nc & 0xff)
         for o in 0..nc {
             let c = ob.src[o]
             let k = ob.kinds[o]
@@ -483,6 +482,18 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_rows.OutBatch, cols: &[]lexdb_bind.OutCol
                 putInt(mut &buf, ob.cols[c].v[r])
             } else if k == lexdb_exec.BK_BOOL {
                 putBool(mut &buf, ob.cols[c].v[r] == 1)
+            } else if k == lexdb_rows.BK_TEXT {
+                // a text from the batch's bytes (no value made)
+                let oid = if o < len(cols) { cols[o].oid } else { 0 }
+                let t = lexdb_rows.obText(ob, o, j)
+                if plainText(oid, utc) {
+                    putU32(mut &buf, len(t))
+                    appendStr(mut &buf, t)
+                } else {
+                    let x = lexdb_ops.textOut(&Val.Text(t.clone()), oid, zone)
+                    putU32(mut &buf, len(x))
+                    appendStr(mut &buf, x)
+                }
             } else {
                 let oid = if o < len(cols) { cols[o].oid } else { 0 }
                 match ob.vals[c][r] {
@@ -512,19 +523,18 @@ fn (w: mut &Wire) dataBatch(ob: &lexdb_rows.OutBatch, cols: &[]lexdb_bind.OutCol
         buf[at0 + 3] = byte((size >> 8) & 0xff)
         buf[at0 + 4] = byte(size & 0xff)
     }
-    w.out += &(strFromBytes(&buf))
+    w.out += strView(mut &buf)
 }
 
+// (Each value's bytes are added at once, bytesGrow, and written by index.)
 fn putU32(out: mut &[]byte, n: int) {
-    append(out, byte((n >> 24) & 0xff))
-    append(out, byte((n >> 16) & 0xff))
-    append(out, byte((n >> 8) & 0xff))
-    append(out, byte(n & 0xff))
+    binary.setU32BE(out, bytesGrow(out, 4), n)
 }
 
 fn putBool(out: mut &[]byte, v: bool) {
-    putU32(out, 1)
-    append(out, if v { 't' } else { 'f' })
+    let at = bytesGrow(out, 5)
+    out[at + 3] = 1
+    out[at + 4] = if v { 't' } else { 'f' }
 }
 
 const PAIRS: str = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
@@ -544,11 +554,10 @@ fn putInt(out: mut &[]byte, n: int) {
         nd += 1
         if nd < 19 { p = p * 10 }
     }
-    putU32(out, nd)
-    let at = len(out)
-    for i in 0..nd { append(out, '0') }
+    let at = bytesGrow(out, 4 + nd)
+    out[at + 3] = byte(nd)
     var v = n
-    var k = at + nd - 1
+    var k = at + 4 + nd - 1
     while v >= 100 {
         let r = (v % 100) * 2
         v = v / 100

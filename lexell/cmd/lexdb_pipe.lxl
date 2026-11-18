@@ -365,13 +365,14 @@ pub type BNode = closed {
     Or(BNode, BNode)
     Not(BNode)
     IsNull(BNode, bool)     // true: IS NOT NULL
-    // a column of values (BK_VAL) compared with a constant, as eval
-    // compares them (compare); true: the constant on the left
-    ValCmp(int, int, Val, bool)
+    // a column of values (BK_VAL) or texts (BK_TEXT: the last true)
+    // compared with a constant, as eval compares them (compare); true: the
+    // constant on the left
+    ValCmp(int, int, Val, bool, bool)
     Like(int, LikePat)      // a column of values LIKE (ILIKE) a constant pattern
     // a column IN a constant list too long for the OR chain: its values
     // sorted, and whether the list had a NULL (a no-match row is NULL)
-    InVals(int, []Val, bool)
+    InVals(int, []Val, bool, bool)    // ... the last true: a BK_TEXT column
     InInts(int, []int, bool)
     // a compiled expression's values IN a constant list: the list's values
     // not NULL sorted (one kind, kindOf: the last int), the list as written
@@ -407,6 +408,7 @@ pub type LikePat = record {
     pub fold: bool              // ILIKE
     pub simple: bool            // literal text and % only (likeSimple): pieces
     pub pieces: []str
+    pub txt: bool               // the column BK_TEXT (its bytes), else values
 }
 
 pub type BComp = record {
@@ -566,7 +568,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                 // comparison is the row path's for their types (bCmpKinds)
                 let ia = colOf(&a, kinds)
                 let ib = colOf(&b, kinds)
-                if ia >= 0 && ib >= 0 && (kinds[ia] == BK_VAL || kinds[ib] == BK_VAL) {
+                if ia >= 0 && ib >= 0 && (isValK(kinds[ia]) || isValK(kinds[ib])) {
                     let ka = cols[ia].typ.kind
                     let kb = cols[ib].typ.kind
                     if !bCmpKinds(ka, kb, ce) || !bCmpKinds(kb, ka, ce) { return None }
@@ -582,7 +584,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                         Ok(v) {
                             let c = if va >= 0 { va } else { vb }
                             if !lexdb_ops.isNull(&v) && !bCmpKinds(cols[c + base].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
-                            return Some(BComp{n: BNode.ValCmp(cc, c, v, vb >= 0), typ: BT_BOOL})
+                            return Some(BComp{n: BNode.ValCmp(cc, c, v, vb >= 0, kinds[c + base] == BK_TEXT), typ: BT_BOOL})
                         }
                         Err(_) { return None }
                     }
@@ -636,7 +638,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                 }
                 if col >= 0 && col < len(kinds) {
                     let k = kinds[col]
-                    if k == BK_INT || k == BK_BOOL || k == BK_VAL {
+                    if k == BK_INT || k == BK_BOOL || isValK(k) {
                         // the list once: a literal, a parameter, or a call
                         // like char(n)'s padding of one
                         var vs: []Val = []
@@ -656,7 +658,7 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                                 if lexdb_ops.isNull(&v) { hasNull = true; continue }
                                 // compared as the row path compares them, one
                                 // order for the sorted set (bCmpKinds)
-                                if k == BK_VAL && !bCmpKinds(cols[col].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
+                                if isValK(k) && !bCmpKinds(cols[col].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
                                 append(mut &keep, v)
                             }
                             // A short list is a chain of equality tests; a
@@ -668,8 +670,8 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                                 var any = false
                                 for v in keep {
                                     var n = BNode.Const(0, true)
-                                    if k == BK_VAL {
-                                        n = BNode.ValCmp(0, col - base, v.clone(), false)
+                                    if isValK(k) {
+                                        n = BNode.ValCmp(0, col - base, v.clone(), false, k == BK_TEXT)
                                     } else if k == BK_INT {
                                         match v {
                                             Val.Int(iv) { n = BNode.Cmp(0, BNode.Col(col - base), BNode.Const(iv, false)) }
@@ -705,8 +707,8 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                                 }
                                 if !dup { append(mut &uniq, v) }
                             }
-                            if k == BK_VAL {
-                                return Some(BComp{n: BNode.InVals(col - base, uniq, hasNull), typ: BT_BOOL})
+                            if isValK(k) {
+                                return Some(BComp{n: BNode.InVals(col - base, uniq, hasNull, k == BK_TEXT), typ: BT_BOOL})
                             }
                             var ints: []int = []
                             for v in uniq {
@@ -747,7 +749,8 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
             let fold = fr.name == "ilike"
             let simple = !fold && lexdb_like.likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
             let pieces = if simple { lexdb_like.likeSplit(&pat) } else { [] }
-            return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces}), typ: BT_BOOL})
+            return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces,
+                                                       txt: kinds[c + base] == BK_TEXT}), typ: BT_BOOL})
         }
         else { return None }
     }
@@ -771,11 +774,17 @@ pub fn bAndOr(and: bool, a: &BX, b: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]in
 // lists are a sorted set (search by halves).
 pub const IN_CHAIN_MAX = 8
 
-// The batch column of x when it is a column of values (BK_VAL), else -1.
+// Whether a column of kind k holds values or texts (BK_VAL, BK_TEXT).
+pub fn isValK(k: int): bool { return k == BK_VAL || k == lexdb_rows.BK_TEXT }
+
+const BK_TEXT: int = lexdb_rows.BK_TEXT
+
+// The batch column of x when it is a column of values or texts (isValK),
+// else -1.
 pub fn bValCol(x: &BX, kinds: &[]int, base: int): int {
     match x {
         BX.Col(i) {
-            if i >= len(kinds) || kinds[i] != BK_VAL { return -1 }
+            if i >= len(kinds) || !isValK(kinds[i]) { return -1 }
             return i - base
         }
         else { return -1 }
@@ -875,9 +884,25 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             return Ok(a)
         }
-        BNode.ValCmp(op, c, k, left) {
+        BNode.ValCmp(op, c, k, left, txt) {
             var out = lexdb_rows.bvec(m)
             let kn = lexdb_ops.isNull(&k)
+            if txt {
+                // (a loop of its own: the kind is the node's, not the row's)
+                for j in 0..m {
+                    let r = idx[j]
+                    if kn || b.cols[c].nul[r] {
+                        out.nul[j] = true
+                        continue
+                    }
+                    let y = try textCmp(lexdb_rows.textAt(b, c, r), &k)
+                    let x = if left { -y } else { y }
+                    let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
+                            else if op == 4 { x > 0 } else { x >= 0 }
+                    out.v[j] = if t { 1 } else { 0 }
+                }
+                return Ok(out)
+            }
             for j in 0..m {
                 let r = idx[j]
                 if kn || b.cols[c].nul[r] {
@@ -891,18 +916,17 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             return Ok(out)
         }
-        BNode.InVals(c, vs, hasNull) {
+        BNode.InVals(c, vs, hasNull, txt) {
             var out = lexdb_rows.bvec(m)
             for j in 0..m {
                 let r = idx[j]
                 if b.cols[c].nul[r] { out.nul[j] = true; continue }
-                let x = &b.vals[c][r]
                 var lo = 0
                 var hi = len(vs)
                 var hit = false
                 while lo < hi {
                     let mid = (lo + hi) / 2
-                    let cm = try lexdb_ops.compare(x, &vs[mid])
+                    let cm = if txt { try textCmp(lexdb_rows.textAt(b, c, r), &vs[mid]) } else { try lexdb_ops.compare(&b.vals[c][r], &vs[mid]) }
                     if cm == 0 { hit = true; break }
                     if cm < 0 { hi = mid } else { lo = mid + 1 }
                 }
@@ -951,7 +975,10 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     out.nul[j] = true
                     continue
                 }
-                let hit = if lp.simple {
+                let hit = if lp.txt {
+                    if lp.simple { lexdb_like.likePieces(lexdb_rows.textAt(b, c, r), &lp.pieces) }
+                    else { try lexdb_lib.likeMatch(lexdb_rows.textAt(b, c, r), &lp.pat, &lp.esc, lp.fold) }
+                } else if lp.simple {
                     match b.vals[c][r] {
                         Val.Text(x) { lexdb_like.likePieces(&x, &lp.pieces) }
                         else { lexdb_like.likePieces(&lexdb_sql.text(&b.vals[c][r]), &lp.pieces) }
@@ -1203,6 +1230,7 @@ pub fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &Ctx): Option
 // vals, of b's rows idx, added to b as a column of values (BK_VAL): its place.
 pub fn bAddVals(b: mut &Batch, idx: &[]int, vals: []Val): int {
     let c = len(b.cols)
+    append(mut &b.txt, "")
     var col = BVec{v: [], nul: array(b.n, true)}
     var vs = vals
     if len(idx) == b.n {
@@ -1376,7 +1404,7 @@ pub fn cRangesOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, out: mut &[]
             if col < 0 || col >= len(kinds) || kinds[col] != BK_INT || o == 1 { return }
             cRangeAdd(o, v, col, 0, t, out)
         }
-        BNode.ValCmp(op, c, k, left) {
+        BNode.ValCmp(op, c, k, left, _) {
             // a date or time column compared with a value of its own kind
             // (9.113): as the words its places hold (compare orders them so)
             if op == 1 || c >= len(t.cols) { return }
@@ -1438,7 +1466,8 @@ pub fn bFirstVals(b: &Batch, r: int, kinds: &[]int, cols: &[]int, out: mut &[]Va
             let k = kinds[i]
             // (as bRow: a numeric(p, s) column's units are its value)
             v = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) }
-                else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r].clone() }
+                else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) }
+                else if k == BK_TEXT { Val.Text(lexdb_rows.textAt(b, i, r).clone()) } else { b.vals[i][r].clone() }
         }
         n += valExtra(&v)
         append(out, v)
@@ -1454,7 +1483,8 @@ pub fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
         if !needCol[i] || len(b.cols[i].nul) == 0 || b.cols[i].nul[r] { continue }
         let k = kinds[i]
         out[i] = if k == BK_INT { Val.Int(b.cols[i].v[r]) } else if k == BK_BOOL { Val.Bool(b.cols[i].v[r] == 1) }
-                 else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) } else { b.vals[i][r].clone() }
+                 else if lexdb_rows.isDecKind(k) { lexdb_rows.decVal(b.cols[i].v[r], lexdb_rows.decScale(k)) }
+                 else if k == BK_TEXT { Val.Text(lexdb_rows.textAt(b, i, r).clone()) } else { b.vals[i][r].clone() }
     }
     return out
 }
@@ -1464,7 +1494,11 @@ pub fn bRow(b: &Batch, r: int, kinds: &[]int, needCol: &[]bool): []Val {
 pub fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     if c.typ == BT_OTHER {
         match c.n {
-            BNode.Col(i) { return b.vals[i][r].clone() }
+            BNode.Col(i) {
+                if b.cols[i].nul[r] { return Val.Null }
+                if lexdb_rows.isTextCol(b, i) { return Val.Text(lexdb_rows.textAt(b, i, r).clone()) }
+                return b.vals[i][r].clone()
+            }
             else { return Val.Null }
         }
     }
@@ -1474,12 +1508,33 @@ pub fn bKeyVal(c: &BComp, kv: &BVec, j: int, b: &Batch, r: int): Val {
     return Val.Int(kv.v[j])
 }
 
-// encIdxPart of bKeyVal, a column's value encoded in place rather than copied.
-fn bKeyEnc(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int) {
+// Per key, whether it is a BK_TEXT column of b (bKeyEnc's txt).
+fn keyTexts(keys: &[]BComp, b: &Batch): []bool {
+    var out: []bool = []
+    for k in keys {
+        var t = false
+        if k.typ == BT_OTHER {
+            match k.n {
+                BNode.Col(i) { t = lexdb_rows.isTextCol(b, i) }
+                else {}
+            }
+        }
+        append(mut &out, t)
+    }
+    return out
+}
+
+// encIdxPart of bKeyVal, a column's value encoded in place rather than
+// copied; txt: the key a BK_TEXT column (keyTexts', once per batch).
+fn bKeyEnc(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool) {
     if c.typ == BT_OTHER {
         match c.n {
             BNode.Col(i) {
-                lexdb_access.encIdxPart(kb, &b.vals[i][r])
+                if txt {
+                    if b.cols[i].nul[r] { kb.addByte(2) } else { lexdb_access.encIdxText(kb, lexdb_rows.textAt(b, i, r)) }
+                } else {
+                    lexdb_access.encIdxPart(kb, &b.vals[i][r])
+                }
                 return
             }
             else {}
@@ -1512,9 +1567,9 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
         }
         BNode.Not(a) { bColsOf(&a, used) }
         BNode.IsNull(a, _) { bColsOf(&a, used) }
-        BNode.ValCmp(_, c, _, _) { used[c] = true }
+        BNode.ValCmp(_, c, _, _, _) { used[c] = true }
         BNode.Like(c, _) { used[c] = true }
-        BNode.InVals(c, _, _) { used[c] = true }
+        BNode.InVals(c, _, _, _) { used[c] = true }
         BNode.InInts(c, _, _) { used[c] = true }
         BNode.VCmp(_, a, b, _, _) {
             used[a] = true
@@ -1540,18 +1595,32 @@ fn isValKind(k: int): bool { return k != BK_INT && k != BK_BOOL && !lexdb_rows.i
 // compare of columns ca and cb at row r (kinds ka, kb), a value column's
 // value read in place rather than copied.
 fn bCmpCols(b: &Batch, ca: int, ka: int, cb: int, kb: int, r: int): Result[int, DbErr] {
-    let va = isValKind(ka)
-    let vb = isValKind(kb)
+    // texts by their bytes; a text and a value as compare compares them
+    if ka == BK_TEXT && kb == BK_TEXT { return Ok(lexdb_rows.textAt(b, ca, r).cmp(lexdb_rows.textAt(b, cb, r))) }
+    if ka == BK_TEXT && kb == BK_VAL { return textCmp(lexdb_rows.textAt(b, ca, r), &b.vals[cb][r]) }
+    if ka == BK_VAL && kb == BK_TEXT { return Ok(-(try textCmp(lexdb_rows.textAt(b, cb, r), &b.vals[ca][r]))) }
+    let va = ka == BK_VAL
+    let vb = kb == BK_VAL
     if va && vb { return lexdb_ops.compare(&b.vals[ca][r], &b.vals[cb][r]) }
     if va { return lexdb_ops.compare(&b.vals[ca][r], &bValAt(b, cb, kb, r)) }
     if vb { return lexdb_ops.compare(&bValAt(b, ca, ka, r), &b.vals[cb][r]) }
     return lexdb_ops.compare(&bValAt(b, ca, ka, r), &bValAt(b, cb, kb, r))
 }
 
+// A text t compared with value k as compare compares a text with it:
+// another text by its bytes, any other kind through the value.
+pub fn textCmp(t: &str, k: &Val): Result[int, DbErr] {
+    match k {
+        Val.Text(y) { return Ok(t.cmp(&y)) }
+        else { return lexdb_ops.compare(&Val.Text(t.clone()), k) }
+    }
+}
+
 pub fn bValAt(b: &Batch, c: int, k: int, r: int): Val {
     if k == BK_INT { return Val.Int(b.cols[c].v[r]) }
     if k == BK_BOOL { return Val.Bool(b.cols[c].v[r] == 1) }
     if lexdb_rows.isDecKind(k) { return lexdb_rows.decVal(b.cols[c].v[r], lexdb_rows.decScale(k)) }
+    if k == BK_TEXT { return Val.Text(lexdb_rows.textAt(b, c, r).clone()) }
     return b.vals[c][r].clone()
 }
 
@@ -1562,6 +1631,25 @@ pub fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int
     let c = sp.vcol
     let summing = sp.kind == BA_SUM || sp.kind == BA_AVG
     let mx = sp.kind == BA_MAX
+    if lexdb_rows.isTextCol(b, c) {
+        // a text column's min or max (a text's sum errs as the row path's)
+        for j in 0..len(rows) {
+            let r = rows[j]
+            if b.cols[c].nul[r] { continue }
+            let g = gids[j]
+            let t = lexdb_rows.textAt(b, c, r)
+            if lexdb_ops.isNull(&av[g]) {
+                av[g] = Val.Text(t.clone())
+            } else if summing {
+                av[g] = try lexdb_ops.arith(lexdb_ops.OP_ADD, &av[g], &Val.Text(t.clone()))
+            } else {
+                let x = try textCmp(t, &av[g])
+                if (mx && x >= 0) || (!mx && x <= 0) { av[g] = Val.Text(t.clone()) }
+            }
+            cn[g] += 1
+        }
+        return Ok(Unit{})
+    }
     for j in 0..len(rows) {
         let r = rows[j]
         if b.cols[c].nul[r] { continue }
@@ -2245,7 +2333,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     // compiled over them (constants in cx: the run's parameters)
     let base = sc.first
     var kinds: []int = []
-    for c in t.cols { append(mut &kinds, lexdb_rows.colKind(&c)) }
+    for c in t.cols { append(mut &kinds, lexdb_rows.pipeKind(&c, false)) }
     var cn: []BNode = []
     for c in conds {
         match condNode(&c, cols, &sc.kinds, cx, base, &sc.need) {
@@ -2334,7 +2422,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             try bud.tickN(nr - len(idx) + take)
             if take > 0 {
                 var ob = lexdb_rows.OutBatch{n: take, kinds: collections.copyOf(&okinds), src: srcs, idx: idx,
-                                            cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), ex: ex}
+                                            cols: replace(mut &b.cols, []), vals: replace(mut &b.vals, []), txt: replace(mut &b.txt, []), ex: ex}
                 sr.n += take
                 cnt[last].joined += take
                 let noRow: []Val = []
@@ -2342,8 +2430,10 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
                 // the table's columns back, the outputs' added ones dropped
                 b.cols = replace(mut &ob.cols, [])
                 b.vals = replace(mut &ob.vals, [])
+                b.txt = replace(mut &ob.txt, [])
                 while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
                 while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
+                while len(b.txt) > len(bp.kinds) { let gone3 = pop(mut &b.txt) }
             }
             spare = b
             if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
@@ -2523,7 +2613,7 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     let rel = lexdb_catalog.relOf(t)
     // the table's columns' kinds (the query's: they are its only ones)
     var kinds: []int = []
-    for c in t.cols { append(mut &kinds, if dec { lexdb_rows.decColKind(&c) } else { lexdb_rows.colKind(&c) }) }
+    for c in t.cols { append(mut &kinds, lexdb_rows.pipeKind(&c, dec)) }
     let needCol = collections.copyOf(&sc.need)
     if dec { for i in 0..len(kinds) { if needCol[i] && lexdb_rows.isDecKind(kinds[i]) { usedDec = true } } }
     // the conditions, the group keys and the calls over batches
@@ -2589,6 +2679,7 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
             // (the columns the calls' generic steps added dropped)
             while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
             while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
+            while len(b.txt) > len(bp.kinds) { let gone3 = pop(mut &b.txt) }
             spare = b
         }
     }
@@ -2793,6 +2884,9 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
             ag.newGroup()
         }
     } else {
+        // (per batch: which keys are texts, the text key's column a text one)
+        let ktxt = keyTexts(&ag.keys, b)
+        let tcol = ag.textCol >= 0 && lexdb_rows.isTextCol(b, ag.textCol)
         var kvs: []BVec = []
         for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
         // a composite key built in one reused string; copied only for a new group
@@ -2816,6 +2910,14 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 let r = idx[j]
                 if b.cols[ag.textCol].nul[r] {
                     g = ag.nullGroup
+                } else if tcol {
+                    // looked up by the batch's bytes; copied only for a new group
+                    let x = lexdb_rows.textAt(b, ag.textCol, r)
+                    klen = len(x)
+                    match ag.byText.get(x) {
+                        Some(y) { g = y }
+                        None {}
+                    }
                 } else {
                     // looked up by the batch's own text; copied only for a new group
                     match b.vals[ag.textCol][r] {
@@ -2831,7 +2933,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 }
             } else if !ag.oneKey {
                 kb.clear()
-                for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j]) }
+                for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
                 klen = len(kb)
                 match ag.byKey.get(&kb) {
                     Some(x) { g = x }
@@ -2848,6 +2950,8 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 if ag.textCol >= 0 {
                     if b.cols[ag.textCol].nul[idx[j]] {
                         ag.nullGroup = g
+                    } else if tcol {
+                        ag.byText.put(lexdb_rows.textAt(b, ag.textCol, idx[j]).clone(), g)
                     } else {
                         match b.vals[ag.textCol][idx[j]] {
                             Val.Text(x) { ag.byText.put(x.clone(), g) }
@@ -3093,7 +3197,8 @@ pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
         } else if ob.cols[c].nul[r] {
             append(out, Val.Null)
         } else {
-            append(out, if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) } else { ob.vals[c][r].clone() })
+            append(out, if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) }
+                        else if k == lexdb_rows.BK_TEXT { Val.Text(lexdb_rows.obText(ob, o, j).clone()) } else { ob.vals[c][r].clone() })
         }
     }
 }
@@ -3665,7 +3770,7 @@ fn joinKinds(p: &lexdb_plan.PPlan, tabs: &[]&lexdb_catalog.Table, dec: bool, kin
 fn setKinds(sc: &lexdb_plan.PScan, t: &lexdb_catalog.Table, dec: bool, kinds: mut &[]int, owner: mut &[]int, lvl: int) {
     for i in 0..len(t.cols) {
         if sc.first + i >= len(kinds) { break }
-        kinds[sc.first + i] = if dec { lexdb_rows.decColKind(&t.cols[i]) } else { lexdb_rows.colKind(&t.cols[i]) }
+        kinds[sc.first + i] = lexdb_rows.pipeKind(&t.cols[i], dec)
         owner[sc.first + i] = lvl
     }
 }
@@ -3897,6 +4002,18 @@ pub fn bGather(src: &Batch, c: int, kind: int, at: &[]int, out: mut &Batch, oc: 
             col.nul[p] = s.nul[r]
         }
     }
+    if kind == BK_TEXT {
+        // the texts' bytes, each row's place moved to the new buffer
+        var buf = replace(mut &out.txt[oc], "")
+        buf.clear()
+        for p in 0..n {
+            if col.nul[p] { continue }
+            let t = lexdb_rows.textAt(src, c, at[p])
+            col.v[p] = (len(buf) << 24) | len(t)
+            buf += t
+        }
+        out.txt[oc] = buf
+    }
     out.cols[oc] = col
     if kind == BK_VAL {
         var vs: []Val = array(n, Val.Null)
@@ -3911,10 +4028,11 @@ pub fn bGather(src: &Batch, c: int, kind: int, at: &[]int, out: mut &Batch, oc: 
 
 // An empty batch of nq columns, n rows.
 pub fn bJoined(nq: int, n: int): Batch {
-    var b = Batch{cols: [], vals: [], n: n}
+    var b = Batch{cols: [], vals: [], txt: [], n: n}
     for i in 0..nq {
         append(mut &b.cols, lexdb_rows.bvec(0))
         append(mut &b.vals, [])
+        append(mut &b.txt, "")
     }
     return b
 }
@@ -3976,7 +4094,9 @@ fn keyAt(jl: &JL, kv: &[]BVec, w: &Batch, i: int, r: int): Val {
     let t = jl.keyTyp[i]
     if t == BT_OTHER {
         let c = jl.keyCol[i]
-        return if w.cols[c].nul[r] { Val.Null } else { w.vals[c][r].clone() }
+        if w.cols[c].nul[r] { return Val.Null }
+        if lexdb_rows.isTextCol(w, c) { return Val.Text(lexdb_rows.textAt(w, c, r).clone()) }
+        return w.vals[c][r].clone()
     }
     if kv[i].nul[r] { return Val.Null }
     if t == BT_BOOL { return Val.Bool(kv[i].v[r] == 1) }
@@ -4256,6 +4376,17 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                     }
                 }
             }
+        } else if mode == JK_TEXT && bp.kinds[hc[0]] == BK_TEXT {
+            if b.cols[hc[0]].nul[r] { nul = true } else {
+                let x = lexdb_rows.textAt(b, hc[0], r)
+                match bd.txts.get(x) {
+                    Some(y) { bk = y }
+                    None {
+                        bk = len(bd.head)
+                        bd.txts.put(x.clone(), bk)
+                    }
+                }
+            }
         } else if mode == JK_TEXT {
             if b.cols[hc[0]].nul[r] { nul = true } else {
                 match b.vals[hc[0]][r] {
@@ -4315,6 +4446,19 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
         let at = bd.rows.n
         for ci in 0..ncol {
             if !bp.needCol[ci] { continue }
+            if bp.kinds[ci] == BK_TEXT {
+                // the text's bytes into the hash's buffer, its place there
+                var w = 0
+                if !b.cols[ci].nul[r] {
+                    let t = lexdb_rows.textAt(b, ci, r)
+                    w = (len(bd.rows.txt[ci]) << 24) | len(t)
+                    bd.rows.txt[ci] += t
+                    bd.held += len(t)
+                }
+                append(mut &bd.rows.cols[ci].v, w)
+                append(mut &bd.rows.cols[ci].nul, b.cols[ci].nul[r])
+                continue
+            }
             append(mut &bd.rows.cols[ci].v, b.cols[ci].v[r])
             append(mut &bd.rows.cols[ci].nul, b.cols[ci].nul[r])
             if bp.kinds[ci] == BK_VAL {
@@ -4455,6 +4599,8 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
         }
         // a semi join with no condition: its first match only
         let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
+        // (per chunk: a text key's column BK_TEXT)
+        let wtxt = jl.mode == JK_TEXT && lexdb_rows.isTextCol(&w, jl.keyCol[0])
         var kb = ""
         for r in 0..n {
             var bk = -1
@@ -4474,7 +4620,12 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                 }
             } else if jl.mode == JK_TEXT {
                 let c = jl.keyCol[0]
-                if !w.cols[c].nul[r] {
+                if !w.cols[c].nul[r] && wtxt {
+                    match jl.txts.get(lexdb_rows.textAt(&w, c, r)) {
+                        Some(y) { bk = y }
+                        None {}
+                    }
+                } else if !w.cols[c].nul[r] {
                     match w.vals[c][r] {
                         Val.Text(x) {
                             match jl.txts.get(&x) {
@@ -4620,6 +4771,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
             let rows = replace(mut &rg.rows, lexdb_rows.noRows())
             held = (rows.n + rg.pks) * jl.perRow
             for c in 0..len(jl.bp.needCol) {
+                if jl.bp.needCol[c] && jl.bp.kinds[c] == BK_TEXT { held += len(rows.txt[c]) }
                 if !jl.bp.needCol[c] || jl.bp.kinds[c] != BK_VAL { continue }
                 for r in 0..rows.n {
                     match rows.vals[c][r] {
@@ -5126,7 +5278,7 @@ fn runJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, pr: &l
                 if lim >= 0 && given + take > lim { take = lim - given }
                 if take <= 0 { return Ok(false) }
                 let ob = lexdb_rows.OutBatch{n: take, kinds: collections.copyOf(&okinds), src: srcs2, idx: all,
-                                             cols: replace(mut &f.cols, []), vals: replace(mut &f.vals, []), ex: ex}
+                                             cols: replace(mut &f.cols, []), vals: replace(mut &f.vals, []), txt: replace(mut &f.txt, []), ex: ex}
                 given += take
                 let noRow: []Val = []
                 if !(try give(tx, &ob, &noRow)) { return Ok(false) }
@@ -5538,6 +5690,14 @@ fn (sr: mut &SortSt) cell(kind: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int
     } else {
         let rr = ob.idx[j]
         if ob.cols[src].nul[rr] { return true }
+        if ok == lexdb_rows.BK_TEXT {
+            if kind != BK_VAL {
+                sr.bad = true
+                return true
+            }
+            vv = Val.Text(lexdb_rows.obText(ob, c, j).clone())
+            return false
+        }
         if !isIntKind(ok) {
             if kind != BK_VAL {
                 sr.bad = true
@@ -5802,7 +5962,7 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
         append(mut &kinds, sr.kinds[o])
     }
     let ob = lexdb_rows.OutBatch{n: to - from, kinds: kinds, src: srcs, idx: oidx, cols: replace(mut &sr.set.outs, []),
-                                 vals: replace(mut &sr.set.ovals, []), ex: []}
+                                 vals: replace(mut &sr.set.ovals, []), txt: [], ex: []}
     let noRow: []Val = []
     let more = try give(txn, &ob, &noRow)
     return Ok(to - from)
