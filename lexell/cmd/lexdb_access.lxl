@@ -1117,22 +1117,12 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
     var order: []int = withCapacity(n)
     for i in 0..n { append(mut &order, i) }
     if !txn.noting() { sortKeysPerm(&pks, mut &order) }
-    var ks: []str = withCapacity(n)
-    for i in order { append(mut &ks, replace(mut &pks[i], "")) }
-    var got: []Option[str] = withCapacity(n)
-    try st.getMany(txn, t.tree, &ks, part, mut &got)
-    let rw = rowsFor(t)
-    for j in 0..n {
-        let r = order[j]
-        match got[j] {
-            Some(v) {
-                let code = try lexdb_rows.decodeRow(&v, r, mut &b, bp, &rw)
-                if code == 1 { return Ok(None) }
-                if code == 2 && !(try bRowOf(st, txn, t, &ks[j], &v, r, mut &b, bp)) { return Ok(None) }
-            }
-            None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
-        }
-    }
+    let pkl = move(pks)                       // (a let: ks borrows it in a loop)
+    var ks: []&str = withCapacity(n)
+    for i in order { append(mut &ks, &pkl[i]) }
+    var at: []int = []
+    if !(try rowsOfKeys(st, txn, t, &ks, part, bp, &order, mut &b, mut &at)) { return Ok(None) }
+    for r in at { if r < 0 { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) } }
     b.n = n
     return Ok(Some(b))
 }
@@ -1689,6 +1679,96 @@ pub type Fetched = record {
     pub at: []int
 }
 
+// The rows of keys ks read at once (getManyIn) and decoded where they lie:
+// a column leaf's a column at a time, a row leaf's row by row, then the
+// values not in a leaf (the transaction's own writes, a replica's) and
+// the rows stored apart (get, getPart). Key x's row goes to b's row
+// dest[x], or with dest empty is added at b.n (b.n counts it). at[x]: key
+// x's row, -1 not found. false: a value its column's batch cannot hold.
+fn rowsOfKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ks: &[]&str, part: bool, bp: &BPlan,
+              dest: &[]int, b: mut &Batch, at: mut &[]int): Result[bool, DbErr] {
+    let dense = len(dest) == 0
+    let rw = rowsFor(t)
+    for x in 0..len(ks) { append(at, -1) }
+    var apart: []int = []                     // keys whose rows are stored apart: read after
+    var bail = false
+    var bad: []DbErr = []
+    var got: []Option[str] = withCapacity(len(ks))
+    let whole = try st.getManyIn(txn, t.tree, ks, part, fn(leaf: &lexdb_rows.LeafView, es: &[]int, xs: &[]int): bool {
+        let m = len(es)
+        if leaf.isCols && lexdb_rows.layoutOk(leaf, &rw) {
+            var rs: []int = withCapacity(m)
+            for k in 0..m { append(mut &rs, if dense { b.n + k } else { dest[xs[k]] }) }
+            match lexdb_rows.colsPick(leaf, 0, es, &rs, false, 0, &bp.usedP, b, bp) {
+                Ok(ok) {
+                    if !ok {
+                        bail = true
+                        return false
+                    }
+                }
+                Err(x) {
+                    append(mut &bad, x)
+                    return false
+                }
+            }
+            for k in 0..m { at[xs[k]] = rs[k] }
+            if dense { b.n += m }
+            return true
+        }
+        for k in 0..m {
+            // a row leaf's row in place; a column leaf's in another layout rebuilt
+            let rebuilt = if leaf.isCols { lexdb_rows.leafVal(leaf, es[k]) } else { "" }
+            let v: &str = if leaf.isCols { &rebuilt } else { lexdb_rows.leafValAt(leaf, es[k]) }
+            let r = if dense { b.n } else { dest[xs[k]] }
+            match lexdb_rows.decodeRow(v, r, b, bp, &rw) {
+                Ok(code) {
+                    if code == 1 {
+                        bail = true
+                        return false
+                    }
+                    if code == 2 {
+                        append(mut &apart, xs[k])
+                        continue
+                    }
+                }
+                Err(x) {
+                    append(mut &bad, x)
+                    return false
+                }
+            }
+            at[xs[k]] = r
+            if dense { b.n += 1 }
+        }
+        return true
+    }, mut &got)
+    if len(bad) > 0 { return Err(bad[0].clone()) }
+    if bail || !whole { return Ok(false) }
+    for x in 0..len(ks) {
+        match got[x] {
+            Some(v) {
+                let r = if dense { b.n } else { dest[x] }
+                let code = try lexdb_rows.decodeRow(&v, r, b, bp, &rw)
+                if code == 1 { return Ok(false) }
+                if code == 2 && !(try bRowOf(st, txn, t, ks[x], &v, r, b, bp)) { return Ok(false) }
+                at[x] = r
+                if dense { b.n += 1 }
+            }
+            None {}
+        }
+    }
+    for x in apart {
+        let v = if part { try st.getPart(txn, t.tree, ks[x]) } else { try st.get(txn, t.tree, ks[x]) }
+        let r = if dense { b.n } else { dest[x] }
+        match v {
+            Some(w) { if !(try bRowOf(st, txn, t, ks[x], &w, r, b, bp)) { return Ok(false) } }
+            None { return Err(lexdb_base.corrupt(&("a row of \"" + t.name + "\" read and gone"))) }
+        }
+        at[x] = r
+        if dense { b.n += 1 }
+    }
+    return Ok(true)
+}
+
 // The rows of the primary keys pr made, decoded into a batch by bp (part:
 // only some columns used, as getPart reads them). The keys are read at once
 // (getMany): each from the leaf of the one before, not from the root.
@@ -1715,24 +1795,10 @@ pub fn fetchMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, pr:
         first[i] = len(ks)
         append(mut &ks, &keys[i])
     }
-    var got: []Option[str] = withCapacity(len(ks))
-    try st.getMany(txn, t.tree, &ks, part, mut &got)
     // each row read decoded once, in the order read
-    let rw = rowsFor(t)
     var rows = lexdb_rows.newBatch(bp, len(ks))
-    var at: []int = array(len(ks), -1)        // per key read: its row in rows
-    for x in 0..len(ks) {
-        match got[x] {
-            Some(v) {
-                let code = try lexdb_rows.decodeRow(&v, rows.n, mut &rows, bp, &rw)
-                if code == 1 { return Ok(None) }
-                if code == 2 && !(try bRowOf(st, txn, t, &ks[x], &v, rows.n, mut &rows, bp)) { return Ok(None) }
-                at[x] = rows.n
-                rows.n += 1
-            }
-            None {}
-        }
-    }
+    var at: []int = []                        // per key read: its row in rows
+    if !(try rowsOfKeys(st, txn, t, &ks, part, bp, &[], mut &rows, mut &at)) { return Ok(None) }
     var each: []int = withCapacity(nk)
     for i in 0..nk { append(mut &each, at[first[i]]) }
     return Ok(Some(Fetched{rows: rows, at: each}))
@@ -1902,6 +1968,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
             None { return Err(lexdb_base.corrupt(&("a row of \"" + t.name + "\" read and gone"))) }
         }
     }
+    let npks = len(pks)
     if index && !only {
         // an index's entries: their rows by primary key, in key order
         // unless the reads are noted
@@ -1909,22 +1976,13 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         var po: []int = withCapacity(ne)
         for e in 0..ne { append(mut &po, e) }
         if !noted { sortKeysPerm(&pks, mut &po) }
-        var sk: []str = withCapacity(ne)
-        for e in po { append(mut &sk, replace(mut &pks[e], "")) }
-        var got: []Option[str] = withCapacity(ne)
-        try st.getMany(txn, t.tree, &sk, part, mut &got)
+        let pkl = move(pks)                   // (a let: sk borrows it in a loop)
+        var sk: []&str = withCapacity(ne)
+        for e in po { append(mut &sk, &pkl[e]) }
         rows = lexdb_rows.newBatch(bp, ne)
-        for y in 0..ne {
-            let e = po[y]
-            match got[y] {
-                Some(v) {
-                    let code = try lexdb_rows.decodeRow(&v, e, mut &rows, bp, &rw)
-                    if code == 1 { return Ok(None) }
-                    if code == 2 && !(try bRowOf(st, txn, t, &sk[y], &v, e, mut &rows, bp)) { return Ok(None) }
-                }
-                None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
-            }
-        }
+        var at: []int = []
+        if !(try rowsOfKeys(st, txn, t, &sk, part, bp, &po, mut &rows, mut &at)) { return Ok(None) }
+        for r in at { if r < 0 { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) } }
         rows.n = ne
     }
     var eachLo: []int = withCapacity(nk)
@@ -1933,7 +1991,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         append(mut &eachLo, lo[first[i]])
         append(mut &eachHi, hi[first[i]])
     }
-    return Ok(Some(Ranged{rows: rows, lo: eachLo, hi: eachHi, pks: len(pks)}))
+    return Ok(Some(Ranged{rows: rows, lo: eachLo, hi: eachHi, pks: npks}))
 }
 
 // b with room for m rows at least (room: its rows now; its n kept): its

@@ -1495,6 +1495,12 @@ fn dictVals(s: &str, dir: &[]int, pl: int): []Val {
 // (all: qs is 0, 1, 2 ... in order, read as a run); false: a value of a
 // kind its column's batch does not hold.
 pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
+    return colsPick(leaf, from, qs, qs, all, r0, ps, b, bp)
+}
+
+// colsInto with the batch's rows given apart: leaf row from + qs[x] into
+// b's row r0 + rs[x] (all: both are 0, 1, 2 ... in order).
+pub fn colsPick(leaf: &LeafView, from: int, qs: &[]int, rs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
     let s = leaf.cols
     let dir = leaf.dir
     let np = lexdb_cols.places(dir)
@@ -1505,30 +1511,30 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
         let k = bp.kinds[c]
         if pl >= np {
             let mv = if pl < len(bp.missing) { bp.missing[pl].clone() } else { Val.Null }
-            for q in qs { if !put(b, c, r0 + q, mv.clone(), k) { return Ok(false) } }
+            for x in 0..n { if !put(b, c, r0 + rs[x], mv.clone(), k) { return Ok(false) } }
             continue
         }
         let pk = lexdb_cols.kindOf(s, pl)
         if pk == PK_NONE {
-            for q in qs { setNull(b, c, r0 + q) }
+            for x in 0..n { setNull(b, c, r0 + rs[x]) }
             continue
         }
         let nulls = lexdb_cols.hasNulls(dir, pl)
         if nulls {
             if all { lexdb_cols.nullsInto(s, dir, pl, from, n, mut &b.cols[c].nul, r0) } else {
-                for q in qs { if lexdb_cols.isNull(s, dir, pl, from + q) { b.cols[c].nul[r0 + q] = true } }
+                for x in 0..n { if lexdb_cols.isNull(s, dir, pl, from + qs[x]) { b.cols[c].nul[r0 + rs[x]] = true } }
             }
         }
         if k == BK_INT && isIntKind(pk) {
             var col = replace(mut &b.cols[c], bvec(0))
             if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
-                for q in qs { col.v[r0 + q] = lexdb_cols.intAt(s, dir, pl, from + q) }
+                for x in 0..n { col.v[r0 + rs[x]] = lexdb_cols.intAt(s, dir, pl, from + qs[x]) }
             }
             b.cols[c] = col
         } else if k == BK_BOOL && pk == PK_BOOL {
             var col = replace(mut &b.cols[c], bvec(0))
             if all { lexdb_cols.boolsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
-                for q in qs { col.v[r0 + q] = if lexdb_cols.boolAt(s, dir, pl, from + q) { 1 } else { 0 } }
+                for x in 0..n { col.v[r0 + rs[x]] = if lexdb_cols.boolAt(s, dir, pl, from + qs[x]) { 1 } else { 0 } }
             }
             b.cols[c] = col
         } else if isDecKind(k) {
@@ -1540,7 +1546,7 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
                 if lexdb_cols.scaleOf(dir, pl) != ds { return Ok(false) }
                 var col = replace(mut &b.cols[c], bvec(0))
                 if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
-                    for q in qs { col.v[r0 + q] = lexdb_cols.intAt(s, dir, pl, from + q) }
+                    for x in 0..n { col.v[r0 + rs[x]] = lexdb_cols.intAt(s, dir, pl, from + qs[x]) }
                 }
                 b.cols[c] = col
             } else {
@@ -1549,23 +1555,37 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
                     for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
                 }
                 for x in 0..n {
-                    let q = qs[x]
-                    if b.cols[c].nul[r0 + q] { continue }
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
                     let v = try varVal(pk, s, lexdb_cols.spanStart(sp[x]), lexdb_cols.spanEnd(sp[x]))
-                    if !put(b, c, r0 + q, v, k) { return Ok(false) }
+                    if !put(b, c, r, v, k) { return Ok(false) }
                 }
             }
         } else if k == BK_VAL {
             var vals = replace(mut &b.vals[c], [])
             // a NULL row's value written too: a batch's value columns are
             // used again (reuse, 9.111)
-            if nulls { for q in qs { if b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Null } } }
+            if nulls { for x in 0..n { if b.cols[c].nul[r0 + rs[x]] { vals[r0 + rs[x]] = Val.Null } } }
             let codec = lexdb_cols.codecOf(dir, pl)
             if isWordKind(pk) {
                 // an integer, a date or time, a float's bits (9.113)
-                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = wordVal(pk, lexdb_cols.intAt(s, dir, pl, from + q)) } }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = wordVal(pk, lexdb_cols.intAt(s, dir, pl, from + qs[x])) }
+                }
             } else if pk == PK_BOOL {
-                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + q)) } }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + qs[x])) }
+                }
+            } else if codec == lexdb_cols.C_DICT && !all && 4 * n < lexdb_cols.dictSize(dir, pl) {
+                // a few rows picked (a lookup's): their entries only
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let sp = lexdb_cols.entryAt(s, dir, pl, lexdb_cols.codeAt(s, dir, pl, from + qs[x]))
+                    vals[r] = Val.Text(s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)])
+                }
             } else if codec == lexdb_cols.C_DICT {
                 // each entry made once, pooled (dictVals)
                 let dv = dictVals(s, dir, pl)
@@ -1574,28 +1594,31 @@ pub fn colsInto(leaf: &LeafView, from: int, qs: &[]int, all: bool, r0: int, ps: 
                     for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
                 }
                 for x in 0..n {
-                    let q = qs[x]
-                    if !b.cols[c].nul[r0 + q] { vals[r0 + q] = dv[codes[x]].clone() }
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = dv[codes[x]].clone() }
                 }
             } else if codec == lexdb_cols.C_UNITS {
                 let ds = lexdb_cols.scaleOf(dir, pl)
-                for q in qs { if !b.cols[c].nul[r0 + q] { vals[r0 + q] = Val.Num(Decimal.fromUnits(lexdb_cols.intAt(s, dir, pl, from + q), ds)) } }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = Val.Num(Decimal.fromUnits(lexdb_cols.intAt(s, dir, pl, from + qs[x]), ds)) }
+                }
             } else {
                 var sp: []int = array(n, 0)
                 if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
                     for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
                 }
                 for x in 0..n {
-                    let q = qs[x]
-                    if b.cols[c].nul[r0 + q] { continue }
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
                     let a = lexdb_cols.spanStart(sp[x])
                     let e = lexdb_cols.spanEnd(sp[x])
                     if pk == PK_TEXT {
-                        vals[r0 + q] = Val.Text(s[a..e])
+                        vals[r] = Val.Text(s[a..e])
                     } else {
                         // a numeric, a uuid, a bytea (9.113)
                         match varVal(pk, s, a, e) {
-                            Ok(v) { vals[r0 + q] = v }
+                            Ok(v) { vals[r] = v }
                             Err(bad) {
                                 b.vals[c] = vals
                                 return Err(bad)

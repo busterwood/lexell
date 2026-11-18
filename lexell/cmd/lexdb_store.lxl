@@ -2920,22 +2920,83 @@ const LOOKUP_GAP = 256
 // (none up, on the same leaf). Keys in order (a batch's lookups sorted, or
 // an index's keys in its order) mostly stay on a leaf or go to the next.
 pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]&str, part: bool, out: mut &[]Option[str]): Result[Unit, lexdb_base.DbErr] {
-    let mode = if part { M_PART } else { M_FULL }
     let n = len(keys)
+    var inLeaf: []Option[str] = array(n, None)
+    var vals: []Option[str] = []
+    let done = try st.getManyIn(t, tree, keys, part, fn(leaf: &lexdb_rows.LeafView, es: &[]int, xs: &[]int): bool {
+        for k in 0..len(es) { inLeaf[xs[k]] = Some(lexdb_rows.leafVal(leaf, es[k])) }
+        return true
+    }, mut &vals)
+    let mode = if part { M_PART } else { M_FULL }
+    for x in 0..n {
+        match replace(mut &inLeaf[x], None) {
+            Some(v) {
+                // a value stored apart, unstored as get unstores it
+                if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) {
+                    append(out, Some(try st.unstore(t, tree, keys[x], &v)))
+                } else {
+                    append(out, Some(v))
+                }
+            }
+            None { append(out, replace(mut &vals[x], None)) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// getMany's noting of its lookup of k, as getIn notes it: a snapshot's
+// key by key; the live tree's widening the last read when no key is
+// between (d: the leaf's depth in fg, -1 none).
+fn noteLookup(t: mut &Txn, db: &Db, fg: &Finger, d: int, tree: int, k: &str, q: int, snap: bool, noting: bool) {
+    if snap {
+        if noting { t.noteRead(tree, k, &(k + "\x00"), q) }
+        return
+    }
+    let nr = len(t.reads)
+    var widened = false
+    if !t.quiet && nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == q && len(t.reads[nr - 1].hi) > 0 &&
+       k >= t.reads[nr - 1].hi {
+        var clear = d < 0
+        if !clear {
+            let lf = db.snapNode(fg.slots[d], fg.vers[d])
+            let li = lf.lower(k)
+            clear = lf.count() == 0 || (li > 0 && lf.keyView(li - 1) < t.reads[nr - 1].hi)
+        }
+        if clear {
+            t.reads[nr - 1].hi = k + "\x00"
+            widened = true
+        }
+    }
+    if !widened && !t.quiet { t.noteRead(tree, k, &(k + "\x00"), q) }
+}
+
+// getMany for a reader that decodes rows where they lie. Each key found
+// in a leaf is handed to f inside the store's lock, with the keys after
+// it found in the same leaf: f(leaf, es, xs) has leaf's entry es[k] for
+// keys[xs[k]], its value as stored (a row stored apart is the reader's
+// to get after: get or getPart). A key whose value is not in a leaf (the
+// transaction's own write; a replica's reads) has it in vals[x], filled
+// to len(keys); a key found nowhere is in neither. Reads are noted as
+// getMany notes them. f gives false to stop: then false.
+pub fn (st: &Store) getManyIn(t: mut &Txn, tree: int, keys: &[]&str, part: bool, f: &fn(&lexdb_rows.LeafView, &[]int, &[]int): bool,
+                              vals: mut &[]Option[str]): Result[bool, lexdb_base.DbErr] {
+    let n = len(keys)
+    for x in 0..n { append(vals, None) }
     let view = st.viewOf(t)
     if view == View.Repl {
-        // a replica's reads: one by one
-        for k in keys { append(out, try st.getIn(t, tree, k, mode)) }
-        return Ok(Unit{})
+        // a replica's reads: one by one, as values
+        let mode = if part { M_PART } else { M_FULL }
+        for x in 0..n { vals[x] = try st.getIn(t, tree, keys[x], mode) }
+        return Ok(true)
     }
     let snap = view == View.Snap
     let noting = t.noting()
     var i = 0
-    while i < n {
+    var go = true
+    while i < n && go {
         var need = -1
         var ahead: []int = []           // need, and the nodes the next keys need (read ahead)
         var bad: []lexdb_base.DbErr = []
-        var apart = false               // out's last value is stored apart: unstore it first
         st.sh.with(fn(db: mut &Db) {
             if len(db.failed) > 0 {
                 append(mut &bad, db.failed[0].clone())
@@ -2947,83 +3008,73 @@ pub fn (st: &Store) getMany(t: mut &Txn, tree: int, keys: &[]&str, part: bool, o
             }
             let root = if snap { db.snapRoot(t, tree) } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
             let q = if snap { t.snapSeq } else { db.seq }
-            var f = newFinger()
+            var fg = newFinger()
+            var gs = -1                     // the leaf of the keys found in a row: slot, version
+            var gv = -1
+            var es: []int = []
+            var xs: []int = []
             while i < n {
-                // the transaction's own write of it
-                match t.lastWrite(tree, &keys[i]) {
+                match t.lastWrite(tree, keys[i]) {
                     Some(w) {
-                        if t.writes[w].op == OP_DEL { append(out, None) } else { append(out, Some(t.writes[w].val.clone())) }
+                        if t.writes[w].op != OP_DEL { vals[i] = Some(t.writes[w].val.clone()) }
                         i += 1
                         continue
                     }
                     None {}
                 }
-                if t.cutKey(tree, &keys[i]) {
-                    append(out, None)
+                if t.cutKey(tree, keys[i]) {
                     i += 1
                     continue
                 }
                 var d = -1
                 if root >= 0 {
-                    d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
+                    d = db.fingerTo(mut &fg, root, snap, q, keys[i], mut &need)
                     if d == -1 {
                         ahead = db.lookupAhead(root, snap, q, keys, i, need)
-                        return
+                        break
                     }
                     if d == -2 {
                         append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
-                        return
+                        break
                     }
                 }
-                // noted as getIn notes it: a snapshot's key by key; the live
-                // tree's widening the last read when no key is between
-                if snap {
-                    if noting { t.noteRead(tree, &keys[i], &(keys[i] + "\x00"), q) }
-                } else {
-                    let nr = len(t.reads)
-                    var widened = false
-                    if !t.quiet && nr > 0 && t.reads[nr - 1].tree == tree && t.reads[nr - 1].seq == q && len(t.reads[nr - 1].hi) > 0 &&
-                       keys[i] >= t.reads[nr - 1].hi {
-                        var clear = d < 0
-                        if !clear {
-                            let lf = db.snapNode(f.slots[d], f.vers[d])
-                            let li = lf.lower(&keys[i])
-                            clear = lf.count() == 0 || (li > 0 && lf.keyView(li - 1) < t.reads[nr - 1].hi)
-                        }
-                        if clear {
-                            t.reads[nr - 1].hi = keys[i] + "\x00"
-                            widened = true
-                        }
-                    }
-                    if !widened && !t.quiet { t.noteRead(tree, &keys[i], &(keys[i] + "\x00"), q) }
-                }
-                var got: Option[str] = None
+                noteLookup(t, db, &fg, d, tree, keys[i], q, snap, noting)
                 if d >= 0 {
-                    let lf = db.snapNode(f.slots[d], f.vers[d])
-                    let li = lf.lower(&keys[i])
+                    let ls = fg.slots[d]
+                    let lv = fg.vers[d]
+                    let lf = db.snapNode(ls, lv)
+                    let li = lf.lower(keys[i])
                     if li < lf.count() && lf.keyView(li) == keys[i] {
-                        let v = lf.val(li)
-                        apart = marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v))
-                        got = Some(v)
+                        if (ls != gs || lv != gv) && len(es) > 0 {
+                            let gl = lexdb_page.leafView(db.snapNode(gs, gv))
+                            if !f(&gl, &es, &xs) {
+                                go = false
+                                es = []
+                                break
+                            }
+                            es = []
+                            xs = []
+                        }
+                        gs = ls
+                        gv = lv
+                        append(mut &es, li)
+                        append(mut &xs, i)
                     }
                 }
-                append(out, got)
                 i += 1
-                if apart { return }
+            }
+            if len(es) > 0 {
+                let gl = lexdb_page.leafView(db.snapNode(gs, gv))
+                if !f(&gl, &es, &xs) { go = false }
             }
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
+        if !go { return Ok(false) }
         if need >= 0 {
             if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
-            continue
-        }
-        if apart {
-            let at = len(out) - 1
-            let v = out[at].clone().unwrap()
-            out[at] = Some(try st.unstore(t, tree, &keys[i - 1], &v))
         }
     }
-    return Ok(Unit{})
+    return Ok(go)
 }
 
 // The nodes to read for getMany at keys[i], which needs node need: need,

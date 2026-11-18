@@ -180,3 +180,27 @@ runs.
   time: 100,000, 200,000 and 400,000 one-byte appends take 0.07 s, 0.31 s
   and 1.22 s, so it is quadratic (owned-str.md 2.1 says a string with
   one owner may be appended to in place).
+
+**Step 2 (2026-11-18): finding 1, lookups decode in the leaf.**
+- `Store.getManyIn` hands each run of keys found in one leaf to the
+  reader inside the store's lock (`f(leaf, es, xs)`). Values not in a leaf
+  (the transaction's own writes, a replica's reads) come back as values.
+  `getMany` is now built on it, so there is one lookup loop, and its
+  read-noting is shared in `noteLookup`.
+- `access.rowsOfKeys` decodes the rows where they lie. A column leaf's
+  rows go through `lexdb_rows.colsPick` (colsInto with the batch rows
+  given apart), a row leaf's are decoded from views, and rows stored apart
+  are read with `get`/`getPart` after the lock, as scans do. A few rows
+  of a large dictionary read only their entries. `fetchMany`, the
+  index-entry fetch and `rangeMany`'s primary-key fetch all use it; none
+  rebuilds a row from a column leaf (`rowOf`) any more.
+
+Instructions against step 1, per query counted once: all 22 down 8.35%.
+q14 −38.9%, q8 −38.6%, q11 −30.8%, q20 −27.8%, q9 −24.9%, q17 −21.0%,
+q3 −15.6%, q7 −13.0%, q19 −11.3%, q2 −9.5%, q10 −9.0%, q21 −6.5%; none
+up more than 0.32% (q5). Steps 1 and 2 together: −9.9%. Point selects
+207,452 to 205,463 per statement (−1.0%). Checksums unchanged, suite
+190, quick gate PASS. Times (best of 2, alternating with 165bd30b, load
+from other processes during part of it): 17,958 to 15,452 ms (−14%).
+q17 −54%, q8 −31%, q14 −28%, q20 −30%, q9 −21%. q22 +4% and q13 +1%,
+which have unchanged instructions.
