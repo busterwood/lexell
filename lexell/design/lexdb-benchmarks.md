@@ -115,7 +115,13 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
-**Now, main `89cf0a59` (2026-11-18), the same setup:** summed 13,524 ms
+**Now, main `aaadeb1e` (2026-11-18), the same setup:** summed 12,984 ms
+against PostgreSQL's 13,955 (one core); geometric mean 0.98, below 1 for
+the first time; level or ahead on 9 of 22. The runtime's string compare
+compares short strings 8 bytes at a time (no memcmp call): lexdb's B-tree
+searches. Results: `~/tpch-w/int/out-main-aaadeb1e`.
+
+**Before, main `89cf0a59` (2026-11-18), the same setup:** summed 13,524 ms
 against PostgreSQL's 13,955 (one core): lexdb's sum is below PG's for the
 first time; geometric mean 1.03. q7 942 ms (1.61×), q21 1,226 (1.49×) after
 the hash cut (lexdb-layers.md 6.2.13); the rest within run spread of
@@ -253,6 +259,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-18 | aaadeb1e | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 0.98 (geometric mean, wall; first below 1); summed 12.98 s against PG's 13.96 s; the runtime's short-string compare (rt_str_cmp): -4.0% wall, q19 -11%, q3 -10%, q21 -9%; worst q19 2.3×, q20 2.2×, q11 1.9×, q22 1.8× | this page, 1.6 |
 | 2026-11-18 | 89cf0a59 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.03 (geometric mean, wall); summed 13.52 s against PG's 13.96 s (lexdb's first sum below PG's); q7 -21%, q21 -15% (hash cut by the next hash), q22 -46% instructions (IN over an expression); worst q19 2.6×, q20 2.3×, q11 2.1×, q22 1.9× | this page, 1.6; lexdb-layers.md 6.2.13 |
 | 2026-11-18 | 48c22c45 | TPC-H derived, SF1, boost off (lexdb only; PG one core from 94536d12's run) | lexdb / PG one core 1.05 (geometric mean, wall; was 2.48), 9 of 22 level or ahead; summed 14.08 s against PG's 13.96 s; worst q19 2.5×, q20 2.3×, q11 2.1×, q7 2.0× | this page, 1.6 |
 | 2026-11-16 | 94536d12 | TPC-H derived, SF1, boost off | lexdb / PG one core 2.48 (geometric mean, wall; was 3.77), 4 of 22 level or ahead; worst q19 14×, q20 12×, q21 10.5×, q22 8.5×; pinned 0-3, 3.8 GHz | this page, 1.6; lexdb-tpch-perf.md |
