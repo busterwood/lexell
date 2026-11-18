@@ -618,6 +618,14 @@ pub fn rest(name: &str, vs: &[]Val): Result[Val, DbErr] {
 pub fn restFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return rest(name, vs) }
 
 // A function's integer argument.
+// intArg of a borrowed value (an integer read, not copied).
+fn intArgOf(v: &Val, fname: &str): Result[int, DbErr] {
+    match v {
+        Val.Int(n) { return Ok(n) }
+        else { return intArg(v.clone(), fname) }
+    }
+}
+
 pub fn intArg(v: Val, fname: &str): Result[int, DbErr] {
     match v {
         Val.Int(n) { return Ok(n) }
@@ -1532,7 +1540,8 @@ fn similarFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val,
 
 fn bpTrimFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
-    return Ok(Val.Text(lexdb_ops.bpTrim(&lexdb_sql.text(&vs[0]))))
+    var buf = ""
+    return Ok(Val.Text(lexdb_ops.bpTrim(lexdb_sql.textIn(&vs[0], mut &buf))))
 }
 
 fn bpPadFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
@@ -1735,8 +1744,24 @@ fn concatFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, 
 
 // substr(s, from [, count]), by characters, from 1, as PostgreSQL clips it.
 fn substr(s: &str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
-    let rs = strings.runes(&s)
     if hasCount && count < 0 { return Err(e("22011", "negative substring length not allowed")) }
+    // ASCII: a rune is a byte, the substring a slice (no runes decoded)
+    var ascii = true
+    for i in 0..len(s) {
+        if s[i] >= 128 {
+            ascii = false
+            break
+        }
+    }
+    if ascii {
+        var lo = from
+        var hi = if hasCount { from + count } else { len(s) + 1 }
+        if lo < 1 { lo = 1 }
+        if hi > len(s) + 1 { hi = len(s) + 1 }
+        if hi <= lo { return Ok("") }
+        return Ok(s[lo - 1..hi - 1].clone())
+    }
+    let rs = strings.runes(&s)
     var lo = from
     var hi = if hasCount { from + count } else { len(rs) + 1 }
     if lo < 1 { lo = 1 }
@@ -1750,8 +1775,8 @@ fn substr(s: &str, from: int, count: int, hasCount: bool): Result[str, DbErr] {
 // substr(a, from [, count]) of vs (none NULL), a vs[0]'s text.
 fn substrOf(a: &str, vs: &[]Val, name: &str): Result[Val, DbErr] {
     let n = len(vs)
-    let from = try intArg(vs[1].clone(), name)
-    let count = if n == 3 { try intArg(vs[2].clone(), name) } else { 0 }
+    let from = try intArgOf(&vs[1], name)
+    let count = if n == 3 { try intArgOf(&vs[2], name) } else { 0 }
     return Ok(Val.Text(try substr(a, from, count, n == 3)))
 }
 
@@ -1760,7 +1785,10 @@ fn substrOf(a: &str, vs: &[]Val, name: &str): Result[Val, DbErr] {
 fn substrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if anyNull(vs) { return Ok(Val.Null) }
     if len(vs) > 3 { return rest(name, vs) }
-    return substrOf(&lexdb_sql.text(&vs[0]), vs, name)
+    match vs[0] {
+        Val.Text(a) { return substrOf(&a, vs, name) }
+        else { return substrOf(&lexdb_sql.text(&vs[0]), vs, name) }
+    }
 }
 
 // substring(x FROM pattern) (9.92): the first group's match, or the whole
@@ -1769,6 +1797,13 @@ fn substrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, 
 fn substringFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if anyNull(vs) { return Ok(Val.Null) }
     let n = len(vs)
+    // FROM n FOR m of a text: read where it is (no copy)
+    if n <= 3 && lexdb_ops.kindOf(&vs[1]) != lexdb_sql.K_TEXT {
+        match vs[0] {
+            Val.Text(t) { return substrOf(&t, vs, name) }
+            else {}
+        }
+    }
     let a = lexdb_sql.text(&vs[0])
     if lexdb_ops.kindOf(&vs[1]) == lexdb_sql.K_TEXT {
         if n == 3 {

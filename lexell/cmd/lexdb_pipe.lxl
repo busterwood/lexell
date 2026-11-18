@@ -373,6 +373,11 @@ pub type BNode = closed {
     // sorted, and whether the list had a NULL (a no-match row is NULL)
     InVals(int, []Val, bool)
     InInts(int, []int, bool)
+    // a compiled expression's values IN a constant list: the list's values
+    // not NULL sorted (one kind, kindOf: the last int), the list as written
+    // (a value of another kind is compared with it in order, as the row
+    // path's in), whether it had a NULL (q22's substring(c_phone ...) IN)
+    InGen(BGen, []Val, []Val, bool, int)
     // two columns compared, one at least of values, as eval compares them
     // (bCmpKinds): op, the columns, their kinds (BK_*)
     VCmp(int, int, int, int, int)
@@ -1038,6 +1043,36 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             return Ok(a)
         }
+        BNode.InGen(g, vs, orig, hasNull, kc) {
+            let xs = try bGenVals(&g, b, idx)
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let x = &xs[j]
+                if lexdb_ops.isNull(x) { out.nul[j] = true; continue }
+                if lexdb_ops.kindOf(x) != kc {
+                    // as the row path's in (lexdb_lib.inFn): the list in order
+                    var hit = false
+                    var sawNull = false
+                    for v in orig {
+                        if lexdb_ops.isNull(&v) { sawNull = true; continue }
+                        if (try lexdb_ops.compareZ(x, &v, &g.ce.zone)) == 0 { hit = true; break }
+                    }
+                    if hit { out.v[j] = 1 } else if sawNull { out.nul[j] = true }
+                    continue
+                }
+                var lo = 0
+                var hi = len(vs)
+                var hit = false
+                while lo < hi {
+                    let mid = (lo + hi) / 2
+                    let cm = try lexdb_ops.compareZ(x, &vs[mid], &g.ce.zone)
+                    if cm == 0 { hit = true; break }
+                    if cm < 0 { hi = mid } else { lo = mid + 1 }
+                }
+                if hit { out.v[j] = 1 } else if hasNull { out.nul[j] = true }
+            }
+            return Ok(out)
+        }
         BNode.Gen(g) {
             // a condition: 1 where it holds (its value true), as the row path checks it
             let vs = try bGenVals(&g, b, idx)
@@ -1486,6 +1521,7 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
             used[b] = true
         }
         BNode.Gen(g) { for c in g.cols { used[c] = true } }
+        BNode.InGen(g, _, _, _, _) { for c in g.cols { used[c] = true } }
         BNode.DArith(_, a, _, b, _) {
             bColsOf(&a, used)
             bColsOf(&b, used)
@@ -1700,9 +1736,65 @@ pub fn condNode(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base
         let cc = c.unwrap()
         if boolLike(cc.typ) { return Some(takeN(cc)) }
     }
+    match inGenOf(x, kinds, ce, base, need) {
+        Some(n) { return Some(n) }
+        None {}
+    }
     match bGenOf(x, kinds, base, need, ce) {
         Some(g) { return Some(BNode.Gen(g)) }
         None { return None }
+    }
+}
+
+// x IN (a, b, ...) whose x is not a column (the IN kernels') but a
+// compiled expression, the list constants of one kind: InGen, its values
+// made once per row and looked up in the list sorted. None: not one.
+fn inGenOf(x: &BX, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[BNode] {
+    match x {
+        BX.Call(fr, args) {
+            if fr.name != "in" || len(args) < 2 { return None }
+            match args[0] {
+                BX.Col(_) { return None }
+                else {}
+            }
+            let none: []Val = []
+            var orig: []Val = []
+            var keep: []Val = []
+            var hasNull = false
+            var kc = -1
+            for i in 1..len(args) {
+                if !bxFixed(&args[i]) { return None }
+                let v = match bxEval(&args[i], &none, &none, ce) {
+                    Ok(v) { v }
+                    Err(_) { return None }
+                }
+                if lexdb_ops.isNull(&v) {
+                    hasNull = true
+                } else {
+                    let k = lexdb_ops.kindOf(&v)
+                    if kc < 0 { kc = k } else if k != kc { return None }
+                    append(mut &keep, v.clone())
+                }
+                append(mut &orig, v)
+            }
+            if kc < 0 { return None }
+            collections.sortBy(mut &keep, fn(a: &Val, b: &Val): int { return lexdb_sort.sortCmp(a, b) })
+            var uniq: []Val = []
+            for v in move(keep) {
+                if len(uniq) > 0 {
+                    match lexdb_ops.compare(&uniq[len(uniq) - 1], &v) {
+                        Ok(c) { if c == 0 { continue } }
+                        Err(_) { return None }
+                    }
+                }
+                append(mut &uniq, v)
+            }
+            match bGenOf(&args[0], kinds, base, need, ce) {
+                Some(g) { return Some(BNode.InGen(g, uniq, orig, hasNull, kc)) }
+                None { return None }
+            }
+        }
+        else { return None }
     }
 }
 
@@ -3419,6 +3511,10 @@ fn condNodeD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, base: i
     if c.isSome() {
         let cc = c.unwrap()
         if boolLike(cc.typ) { return Some(takeN(cc)) }
+    }
+    match inGenOf(x, kinds, ce, base, need) {
+        Some(n) { return Some(n) }
+        None {}
     }
     match bGenOf(x, kinds, base, need, ce) {
         Some(g) { return Some(BNode.Gen(g)) }
