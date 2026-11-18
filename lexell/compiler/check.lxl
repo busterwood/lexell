@@ -2704,7 +2704,7 @@ fn (c: mut &Checker) sFor(s: int) {
         c.emit(c.x.send())
         return
     }
-    var v = c.expr(n.a, -1)
+    var v = c.expr(c.forMoves(n.a), -1)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
     while c.pg.isRc(v.t) { v = c.rcValue(v) }       // SPEC 4.9: for x in r walks the value
     let k = c.pg.tk(v.t)
@@ -2766,6 +2766,31 @@ fn (c: mut &Checker) sFor(s: int) {
 // each turn takes its last element, so at every point it holds exactly the elements not yet taken;
 // break, return and try leave those to its ordinary drop at the end of the statement.
 //     { reverse a; while (a.len > 0) { a.len -= 1; T x = a.data[a.len]; body } }
+// SPEC 8: for x in xs, where local xs is an array of owned elements not used after the loop (nor in
+// its body, nor in a loop around it that it is declared outside of), consumes xs as
+// for x in move(xs) does: the node to check instead (else a itself).
+fn (c: mut &Checker) forMoves(a: int): int {
+    if c.kind(a) != sx.N_NAME { return a }
+    let name = c.nd(a).s.clone()
+    let vx = c.lookupVar(&name, true)
+    if vx < 0 || c.vars[vx].kind != VK_LOCAL || c.vars[vx].moved || c.vars[vx].cap >= 0 || len(c.cx.nomove) > 0 {
+        return a
+    }
+    if c.vars[vx].loops < len(c.cx.loops) { return a }
+    let t = c.vars[vx].t
+    if c.pg.tk(t) != sema.TK_ARR { return a }
+    let et = c.pg.ta(t)
+    if c.isCopy(et) || c.pg.isBorrowClass(et) { return a }
+    c.liveSkip = a
+    let live = c.isLive(vx, 0)
+    c.liveSkip = -1
+    if live { return a }
+    let line = c.line(a)
+    let mv = c.synth(sx.N_NAME, line, "move", -1, -1, 0)
+    let arg = c.synth(sx.N_NAME, line, &name, -1, -1, 0)
+    return c.synth(sx.N_CALL, line, "", mv, c.synthList(&[arg]), 0)
+}
+
 fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
     let n = c.node(s)
     let name = &n.s

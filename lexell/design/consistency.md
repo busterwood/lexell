@@ -16,6 +16,10 @@ rule.
 - AH: `G.getOrSet(f)` on set-once globals.
 - AI (finding 6): extern string parameters are `&str`; intrinsics documented
   with `&str`.
+- AJ (finding 8, part): `Map.find`; `println` without the concatenation. The
+  clone in `str.toStr()` stays until `Show` writes into a buffer.
+- AK: `for` over a dead local consumes it.
+- AL: `pure` externs callable from par.map kernels.
 
 ## Plan, in order
 

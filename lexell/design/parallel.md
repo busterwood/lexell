@@ -192,7 +192,9 @@ captures mutably.
     allocation, checks and traps, the drop stack, hashing, maths and float
     text. Nothing that parks, does I/O, or touches tasks, `Shared`, the
     loop, arguments or the environment.
-  - **Extern calls** (C libraries) are refused.
+  - **Extern calls** (C libraries) are refused, unless the extern is declared
+    `pure` (SPEC 12, 2026-11-18): emit passes their C names to the IR
+    (`kexterns`), and the walk treats them as leaves like the allowed maths.
   - **Globals:** reading or writing an `E_GLOBAL` that is not `isConst` is
     refused. A string literal's block is exempt: it is in writable data
     only because its count field lives there, and it is never written.

@@ -842,7 +842,10 @@ let name = match e { Expr.Num(n) { n.toStr() } Expr.Call(f, _) { f } else { "?" 
   once. `for x in xs` walks an array: `x` is a copy of each element when the
   element type is a copy type, and a `&T` borrow of it otherwise. The array is
   borrowed for the whole loop. A temporary array of an owned element type (a
-  call's result, an array literal, or `move(xs)`) is **consumed**: `x` owns
+  call's result, an array literal, or `move(xs)`), or a local array variable
+  of one that is not used after the loop (nor in its body, nor in a loop
+  around it that it is declared outside of; as for `match`, section 9.3), is
+  **consumed**: `x` owns
   each element in turn, and may move it (`for x in split(s, ",") {
   append(mut &out, x) }` needs no copy). Each element is dropped at the end of
   its turn unless the body moved it. On `break`, `return` or `try`, the
@@ -1208,6 +1211,19 @@ without returning to C. A callback
 cannot reach the caller's locals: only arguments and globals, and a global
 cannot be borrowed (section 5.2).
 
+**Pure calls.** `pure` at the end of an extern declaration (like
+`blocking`, not a keyword; the two may not be combined) is the declarer's
+promise that the C function does no I/O, shares no state with anything (no
+globals, no static buffers, no locale or `errno` it relies on afterwards) and
+makes no callbacks: what it computes depends only on its arguments. A
+`par.map` kernel may call such a function (section 16; otherwise kernels may
+call only the C maths and the runtime's own helpers). The compiler cannot
+check the promise.
+
+```lxl
+extern "c" fn labs(x: int): int pure
+```
+
 **Blocking calls.** `blocking` at the end of an extern declaration, after
 `as` (it is not a keyword), marks a C function that may take long: a query,
 a file system call, a name lookup, a sleep:
@@ -1421,7 +1437,8 @@ loop for sockets (`net`) and timers. The rules the language relies on:
   meanwhile. `f` must be written at the call (a closure or a named
   function) and may not change what it captures. Everything `f` can reach,
   after instantiation, must be a kernel: no I/O, no park, no `var` or
-  `once` global, and no extern other than the maths functions. A call
+  `once` global, and no extern other than the maths functions and those
+  declared `pure` (section 12). A call
   through a function value counts every function of its type whose address
   is taken. A function whose result is `never` may write to stderr and exit.
   Otherwise the call is a compile error naming the chain of calls. A trap in
