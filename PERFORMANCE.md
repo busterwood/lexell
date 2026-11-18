@@ -351,6 +351,45 @@ What makes it fast:
 - **Output in pieces.** The prefix, the line and the newline go into a byte
   buffer; no string is built per line.
 
+## The command-program review (18 November 2026)
+
+The command programs were reviewed for code written to the old rules (copies
+that views now avoid, strings built by repeated `+`, hand-written methods the
+generated ones replace), and the mechanical fixes were applied on the
+`cmd/oldassump` branch, based on `8a890f21`. Each row is the same program built
+from `main` and from the branch, with `perf stat` (user-mode instructions and
+task-clock); the two builds are interleaved and each figure is the best of two
+runs. The outputs are identical in every row.
+
+| case | main | branch | |
+|---|---:|---:|---|
+| jq `reduce range(80000) as $i (""; . + "x")` | 491 ms | 13 ms | the quadratic copy is gone |
+| jq `[range(20000) \| tostring] \| add` | 167 ms | 8 ms | |
+| jq `reduce range(3000) as $i ([]; setpath([$i]; $i))` | 537.4M ins, 31 ms | 537.4M ins, 33 ms | unchanged; still quadratic (below) |
+| jq `-c .` on 21 MB | 3,642.5M ins, 236 ms | 3,642.5M ins, 237 ms | unchanged |
+| grep `-o -w eta` on 100 MB | 3,971.0M ins, 275 ms | 3,887.3M ins, 275 ms | −2.1% instructions |
+| grep `-c omega` on 100 MB | 795.0M ins, 53 ms | 795.0M ins, 55 ms | unchanged |
+| eza `-T /usr/share` | 1,337.5M ins, 202 ms | 1,304.7M ins, 199 ms | −2.5% instructions |
+| sort of 100 MB | 5,989.2M ins, 637 ms | 5,989.2M ins, 647 ms | unchanged (see below) |
+| tail `-n 5` of a 100 MB file; head `-n 5` of a pipe | 0.6M and 0.3M ins | the same | unchanged |
+
+The reference tools, on this host and by the same method: GNU grep `-c omega`
+374.5M ins, 83 ms; `-o -w eta` 4,063.0M ins, 364 ms; GNU sort 2,683.1M ins,
+732 ms. The reference grep writes its output to a file: GNU grep stops at the
+first match when its output is `/dev/null`, so a `/dev/null` count would be
+wrong.
+
+- **Wall time shows the string fix, not instructions.** The copies are a
+  `memcpy`, which costs few counted instructions. The 80,000-step string build
+  moves 11% in instructions and 37 times in wall time.
+- **Open: `setpath` and `delpaths` in `reduce`.** They still copy their
+  container on each call, because the reduce state keeps a reference to it, so
+  the loop is quadratic. Fixing it needs the reduce state handed to the update,
+  a change to the jq evaluator's design.
+- **Tried and reverted: `sort`'s output blocks filled by `addByte`.** Filling
+  the 64 KiB blocks byte by byte cost 13.5% more instructions than the byte array
+  it replaced (6,798M against 5,989M), so `sort` is unchanged on this branch.
+
 ## jq
 
 [lexell/cmd/jq.lxl](lexell/cmd/jq.lxl), the jq 1.7.1 port, against jq 1.7.1 built
