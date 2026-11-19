@@ -150,9 +150,9 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 
 | # | Construct | Owner | Today | Path | Row-only feature | Tests |
 |---|---|---|---|---|---|---|
-| D1 | `UNION [ALL \| DISTINCT]` | O:SetOp | `planSet`, `runSet`, `runChild`, `combine`, `distinctRows` | row (combining); each branch both (row engine, its joins as a levels program; the pipeline takes a branch's aggregates only: `pipeSelIn`) | — | exec_with, exec_limits, exec_bindtypes |
-| D2 | `INTERSECT [ALL]` | O:SetOp | as D1 | row | — | exec_with, exec_index_diff |
-| D3 | `EXCEPT [ALL]`, Oracle `MINUS` | O:SetOp | as D1 (MINUS lexed as EXCEPT) | row | — | exec_with, tns_oracle |
+| D1 | `UNION [ALL \| DISTINCT]` | O:SetOp | `planSet`, `runSet`, `runChild`, `combine`, `distinctRows`; `runSetTo`, `giveSet` (UNION ALL to a sink, `streamsSet`) | UNION ALL: both, streamed: each branch's batches go to the sink as it makes them (no coercion, no ORDER BY/OFFSET/lock/recursion; LIMIT counted); UNION DISTINCT: row (combining, held); each branch both through its pipeline row plan (`pipeSelMain`, rows true for branches) | — | exec_with, exec_limits, exec_bindtypes, exec_setstream |
+| D2 | `INTERSECT [ALL]` | O:SetOp | as D1 | row (combining, held); branches both | — | exec_with, exec_index_diff |
+| D3 | `EXCEPT [ALL]`, Oracle `MINUS` | O:SetOp | as D1 (MINUS lexed as EXCEPT) | row (combining, held); branches both | — | exec_with, tns_oracle |
 | D4 | set operation with `ORDER BY/LIMIT/OFFSET`; a parenthesised branch with its own | B + O:Sort/Limit over SetOp | `planSet`, `execSelIn` | row | — | exec_with, exec_sub |
 
 ## 5. DML

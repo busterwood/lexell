@@ -11610,6 +11610,12 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     let noRow: []Val = []
     let noB = noBatch()
+    if sel.setop == lexdb_sql.SET_UNION && sel.setAll && streamsSet(sel) {
+        // UNION ALL: each part's rows go to the sink as the part makes them
+        // (asked once, as a SELECT's; refused, the rows are held)
+        if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
+        return runSetTo(st, txn, sel, params, lim, sink)
+    }
     if !streams(sel) {
         // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
         // to the sink as one OutBatch if it wants them so (it is asked once,
@@ -11958,7 +11964,7 @@ fn levelsProg(sel: mut &Sel) {
 fn pipeSelMain(sel: mut &Sel, rows: bool) {
     // (a subquery in FROM: its rows too, held for its level, slice P2)
     for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, sel.q.subs[i].use == lexdb_sql.SUB_FROM) }
-    for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], false) }
+    for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], true) }
     if sel.aggQ {
         if aggShape(sel) { pipeAgg(sel) }
         return
@@ -14264,6 +14270,97 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
     try convRows(mut &rres.rows, sel, 2, &txn.sql.zone)
     try rs.bud.hold(lexdb_pipe.rowsBytes(&rres.rows))
     return Ok(combine(sel.setop, sel.setAll, replace(mut &lres.rows, []), replace(mut &rres.rows, []), &sel.outKinds))
+}
+
+// Whether a set operation's rows can go to a sink as its parts make them:
+// UNION ALL, with no coercion of a part's values, no ORDER BY, OFFSET,
+// lock, MATCH_RECOGNIZE or recursion (those need every row first).
+fn streamsSet(sel: &Sel): bool {
+    if sel.rec >= 0 || sel.sort || sel.offset > 0 || len(sel.locks) > 0 || len(sel.mr) > 0 { return false }
+    for c in sel.conv { if c != 0 { return false } }
+    return true
+}
+
+// What a UNION ALL has given so far: rows still allowed by its LIMIT (-1
+// none), rows given, and whether the LIMIT is reached.
+type SetGive = record { left: int; total: int; full: bool }
+
+// Gives one row, or a batch of them, to the sink, within the LIMIT. false:
+// stop (the LIMIT is reached, or the sink refused: g.full tells which).
+fn giveSet(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol, g: mut &SetGive, row: &[]Val,
+           ob: &OutBatch): bool {
+    if g.full { return false }
+    let noRow: []Val = []
+    let noB = noBatch()
+    if ob.n == 0 {
+        if !sink(outs, row, &noB, false) { return false }
+        g.total += 1
+        if g.left >= 0 { g.left -= 1 }
+    } else if g.left < 0 || ob.n <= g.left {
+        if !sink(outs, &noRow, ob, false) { return false }
+        g.total += ob.n
+        if g.left >= 0 { g.left -= ob.n }
+    } else {
+        // the LIMIT ends inside the batch: its first rows, as rows
+        var r: []Val = []
+        for j in 0..g.left {
+            lexdb_pipe.obRow(ob, j, mut &r)
+            if !sink(outs, &r, &noB, false) { return false }
+        }
+        g.total += g.left
+        g.left = 0
+    }
+    if g.left == 0 { g.full = true }
+    return true
+}
+
+// A UNION ALL given to a sink: the left part's rows, then the right's, each
+// part run as a SELECT with the statement's parameters that it reads.
+fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+            sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    let base = sel.q.base
+    var lp: []Val = []
+    var rp: []Val = []
+    for j in 0..base {
+        append(mut &lp, params[j].clone())
+        append(mut &rp, params[j].clone())
+    }
+    for j in base..base + sel.split { append(mut &lp, params[j].clone()) }
+    for j in base + sel.split..len(params) { append(mut &rp, params[j].clone()) }
+    var g = SetGive{left: sel.limit, total: 0, full: sel.limit == 0}
+    for i in 0..2 {
+        if g.full { break }
+        let ps: []Val = if i == 0 { collections.copyOf(&lp) } else { collections.copyOf(&rp) }
+        var asked = false
+        let r = runSelTo(st, txn, &sel.parts[i], &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+            if start {
+                asked = true
+                return true
+            }
+            return giveSet(sink, &sel.outs, mut &g, row, ob)
+        })
+        match r {
+            Ok(res) {
+                // a part that held its rows (not streamed): given here
+                if !asked {
+                    let noB = noBatch()
+                    for row in res.rows {
+                        if !giveSet(sink, &sel.outs, mut &g, &row, &noB) {
+                            if !g.full { return Err(lostRows()) }
+                            break
+                        }
+                    }
+                }
+            }
+            Err(x) {
+                // the LIMIT stopped the part: its refusal is no error
+                if !g.full { return Err(x) }
+            }
+        }
+    }
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc.clone()) }
+    return Ok(Res{cols: outs, rows: [], tag: "SELECT " + g.total.toStr(), hasRows: true, copy: COPY_NONE})
 }
 
 // A recursive CTE: the first query's rows, then rounds of the second over

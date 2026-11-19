@@ -1,0 +1,165 @@
+// lexdb_exec: UNION ALL given to a sink as its parts make their rows
+// (runSetTo, giveSet) against the same statement held (Session.exec). Each
+// shape runs both ways and the text of their rows (or their error) must
+// agree: LIMIT inside a batch, across the parts and at a batch's edge,
+// LIMIT 0, parameters in both parts, nested and chained unions, parts that
+// are aggregates, DISTINCT or converted (not streamed: held as before),
+// ORDER BY and OFFSET (held), NULLs, and errors in the first part and
+// after the first part has given rows.
+// expect: union all through a sink: 27 queries, 27 the same as held
+// expect: errors after rows: first part ERR 22012, second part ERR 22012
+
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+import "../../../cmd/lexdb_parse"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+// The rows as the held path gives them, one text per row, or the error.
+fn held(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERR " + e.state }
+    }
+}
+
+// The same through runRows' sink: rows as they come, OutBatch rows read
+// by their outputs' kinds (text through obText).
+fn sunk(s: mut &lexdb_exec.Session, sql: &str): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERR " + e.state }
+    }
+    var pc = lexdb_exec.newPlanCache()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    var lines: []str = []
+    let r = s.runRows(&stmts[0], &none, &nt, mut &pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
+        if start { return true }
+        if ob.n > 0 {
+            for j in 0..ob.n {
+                var vs: []str = []
+                for o in 0..len(ob.kinds) {
+                    let c = ob.src[o]
+                    let k = ob.kinds[o]
+                    var v = lexdb_sql.Val.Null
+                    if c < 0 {
+                        if !ob.ex[o].nul[j] { v = if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.ex[o].v[j] == 1) } else { lexdb_sql.Val.Int(ob.ex[o].v[j]) } }
+                    } else {
+                        let at = ob.idx[j]
+                        if !ob.cols[c].nul[at] {
+                            v = if k == lexdb_exec.BK_INT { lexdb_sql.Val.Int(ob.cols[c].v[at]) } else if k == lexdb_exec.BK_BOOL { lexdb_sql.Val.Bool(ob.cols[c].v[at] == 1) } else if k == lexdb_rows.BK_TEXT { lexdb_sql.Val.Text(lexdb_rows.obText(ob, o, j).clone()) } else { ob.vals[c][at].clone() }
+                        }
+                    }
+                    append(mut &vs, lexdb_sql.text(&v))
+                }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERR " + e.state }
+    }
+}
+
+fn load(s: mut &lexdb_exec.Session) {
+    let a = held(s, &"create table t (id int primary key, x int, w varchar(20))")
+    let b = held(s, &"create table u (id int primary key, x int, w text)")
+    var id = 1
+    for chunk in 0..26 {
+        var rows: []str = []
+        for i in 0..100 {
+            append(mut &rows, "(" + id.toStr() + ", " + ((id * 37) % 101).toStr() + ", 'w" + (id % 13).toStr() + "')")
+            id += 1
+        }
+        let c = held(s, &("insert into t values " + strings.join(&rows, ", ")))
+    }
+    var rows2: []str = []
+    for i in 1..1501 {
+        let w = if i % 9 == 0 { "null" } else { "'v" + (i % 7).toStr() + "'" }
+        append(mut &rows2, "(" + i.toStr() + ", " + ((i * 11) % 97).toStr() + ", " + w + ")")
+    }
+    let d = held(s, &("insert into u values " + strings.join(&rows2, ", ")))
+    let an = held(s, &"analyze t")
+    let an2 = held(s, &"analyze u")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(67), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        load(mut &s)
+        let shapes = [
+            "select id, x from t union all select id, x from u where id < 700",
+            "select id, x from t union all select id, x from u where id < 700 limit 1",
+            "select id, x from t union all select id, x from u where id < 700 limit 0",
+            "select id, x from t union all select id, x from u limit 1500",
+            "select id, x from t union all select id, x from u limit 1024",
+            "select id, x from t union all select id, x from u limit 2600",
+            "select id, x from t union all select id, x from u limit 2601",
+            "select id, x from t where id < 90 union all select id, x from u where id < 90 limit 130",
+            "select id, x from t union all select id, cast(x as numeric(10,2)) from u where id < 50",
+            "select id from t where id < 5 union all select id from u where id < 5 union all select id from t where id < 3 limit 9",
+            "select count(*) from t union all select count(*) from u",
+            "select distinct w from t union all select distinct w from u",
+            "select id from t union all select id from u order by id desc limit 5",
+            "select id from t where id < 40 union all select id from u where id < 40 limit 4 offset 2",
+            "select w, id from t where id < 50 union all select w, id from u where id < 50",
+            "select x from t union all select null from u where id < 10",
+            "select id, 1 from t where id < 100 union all select id, 1/0 from u",
+            "select id, 1/0 from t union all select id, 1 from u where id < 10",
+            "select id from t where id < 30 except select id from u where id < 10",
+            "select id from t where id < 30 union select id from u where id < 10",
+            "select id, x from t where id between 100 and 1400 union all select id, x from u where id between 1000 and 1400 limit 700",
+            "select id from t where id > 2590 union all select id from t where id > 2590 union all select id from u where id < 1",
+            "select count(*) from (select id from t union all select id from u) s",
+            "select w from u where id < 3 union all select w from t where id < 3",
+            "select 1 union all select 2 union all select 3 limit 2",
+            "select id from t where id < 1025 union all select id from u where id < 1025 order by 1 limit 3",
+            "select id from t where id < 1025 union all select id from u where id < 1025 limit 2 offset 1024"
+        ]
+        var same = 0
+        for sql in shapes {
+            let a = held(mut &s, sql)
+            let b = sunk(mut &s, sql)
+            if a == b { same += 1 } else { println("DIFFERENT " + sql + "\n  held: " + a + "\n  sink: " + b) }
+        }
+        println("union all through a sink: " + len(shapes).toStr() + " queries, " + same.toStr() + " the same as held")
+        // errors after rows: the first part gives rows, the second fails
+        let late = sunk(mut &s, "select id from t where id < 3 union all select id/0 from u where id < 3")
+        let early = sunk(mut &s, "select id/0 from t where id < 3 union all select id from u where id < 3")
+        println("errors after rows: first part " + early + ", second part " + late)
+        return 0
+    })
+}
