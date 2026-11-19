@@ -918,7 +918,7 @@ pub fn (rq: &Request) query(name: &str): Option[str] {
 }
 
 // The first value of header name.
-pub fn (rq: &Request) header(name: &str): Option[str] { return rq.headers.get(name) }
+pub fn (rq: &Request) header(name: &str): Option[&str] { return rq.headers.get(name) }
 
 // The request target as sent ("/a%20b?x=1").
 pub fn (rq: &Request) rawTarget(): str { return rq.target.clone() }
@@ -1146,7 +1146,7 @@ pub fn (f: &Form) file(name: &str): Option[&File] {
 // another type is 415. The body is parsed into memory, so a file part is
 // held whole: raise RouteOpts.maxBody only for a body that fits.
 pub fn (rq: mut &Request) form(limit: int, at: Where): Result[Form, Error] {
-    let ct = rq.headers.get("Content-Type").unwrapOr("")
+    let ct = rq.headers.get("Content-Type").unwrapOr("").clone()
     let mt = mediaType(&ct)
     if mt == "application/x-www-form-urlencoded" {
         let body = try rq.text(limit, at)
@@ -1725,12 +1725,15 @@ fn validHost(h: &str): bool {
     return i > p0 && i - p0 <= 5
 }
 
-fn lowerAscii(s: &str): str {
-    var any = false
+fn hasUpperAscii(s: &str): bool {
     for i in 0..len(s) {
-        if s[i] >= 'A' && s[i] <= 'Z' { any = true }
+        if s[i] >= 'A' && s[i] <= 'Z' { return true }
     }
-    if !any { return s.clone() }
+    return false
+}
+
+fn lowerAscii(s: &str): str {
+    if !hasUpperAscii(s) { return s.clone() }
     return strings.toLowerAscii(s)
 }
 
@@ -1799,7 +1802,7 @@ fn (rq: mut &Request) parseHead(head: &str): int {
     var connClose = false
     var connKeep = false
     for i in 0..h.size() {
-        let x = h.at(i)
+        let x = h.line(i)
         let n = len(x.name)
         if n == 4 && eqName(&x.name, "Host") {
             hostN += 1
@@ -1822,7 +1825,7 @@ fn (rq: mut &Request) parseHead(head: &str): int {
     if hostN > 1 || (rq.minor == 1 && hostN == 0) { return 400 }
     if hostN == 1 {
         if !validHost(&host) { return 400 }
-        host = lowerAscii(&host)
+        if hasUpperAscii(&host) { host = strings.toLowerAscii(&host) }
     }
     // the target's form
     var pathPart = target.clone()
@@ -2327,7 +2330,11 @@ fn (w: mut &Response) finish(at: Where): Result[Unit, Error] {
         w.out.add("0\r\n")
         for k in 0..len(w.trailerNames) {
             let t = w.trailerNames[k].clone()
-            match w.trailerVals.get(&t) {
+            let tv = match w.trailerVals.get(&t) {
+                Some(v) { Some(v.clone()) }
+                None { None }
+            }
+            match tv {
                 Some(v) {
                     w.out.add(&t)
                     w.out.add(": ")
@@ -2354,12 +2361,12 @@ fn (w: mut &Response) putHead(length: int) {
     w.out.add("HTTP/1.1 ")
     w.out.addInt(code)
     w.out.addByte(' ')
-    w.out.add(&(reason(code)))
+    if code == 200 { w.out.add("OK") } else { w.out.add(&(reason(code))) }
     w.out.add("\r\nDate: ")
-    w.out.add(&(httpDate()))
+    addDate(mut &w.out)
     w.out.add("\r\n")
     for i in 0..w.headers.size() {
-        let x = w.headers.at(i)
+        let x = w.headers.line(i)
         w.out.add(&x.name)
         w.out.add(": ")
         w.out.add(&x.value)
@@ -2502,27 +2509,32 @@ fn reason(code: int): str {
 // ---- dates, cached per second
 
 var DATE_SEC: int = -1
-var DATE_TEXT: str = ""
+var DATE_TEXT: rc str = rc("")
 var ISO_SEC: int = -1
-var ISO_TEXT: str = ""
+var ISO_TEXT: rc str = rc("")
 
-// "Tue, 03 Nov 2026 10:20:30 GMT" (RFC 9110 section 5.6.7) for now.
-fn httpDate(): str {
+// Adds the Date value, "Tue, 03 Nov 2026 10:20:30 GMT" (RFC 9110 section 5.6.7),
+// to out. The text is kept per second as a shared rc str, so a response takes a
+// count, not a copy.
+fn addDate(out: mut &Buf) {
     let sec = time.unixSeconds()
-    if sec == DATE_SEC { return DATE_TEXT.clone() }
-    let t = time.httpDate(sec)
-    DATE_SEC = sec
-    DATE_TEXT = t.clone()
-    return t
+    if sec != DATE_SEC {
+        DATE_TEXT = rc(time.httpDate(sec))
+        DATE_SEC = sec
+    }
+    let t = DATE_TEXT.clone()
+    out.add(&t[..])
 }
 
-fn isoNow(): str {
+// Adds the ISO time of the log lines to out (shared per second, as addDate).
+fn addIso(out: mut &Buf) {
     let sec = time.unixSeconds()
-    if sec == ISO_SEC { return ISO_TEXT.clone() }
-    let t = time.isoDateTime(sec)
-    ISO_SEC = sec
-    ISO_TEXT = t.clone()
-    return t
+    if sec != ISO_SEC {
+        ISO_TEXT = rc(time.isoDateTime(sec))
+        ISO_SEC = sec
+    }
+    let t = ISO_TEXT.clone()
+    out.add(&t[..])
 }
 
 
@@ -3267,14 +3279,14 @@ pub fn requestId[A](app: &A, rq: mut &Request, w: mut &Response, next: Next[A]):
     var id = ""
     if rq.trusted {
         match rq.headers.get("X-Request-Id") {
-            Some(v) { if len(v) <= 64 && http.isToken(&v) { id = v } }
+            Some(v) { if len(v) <= 64 && http.isToken(&v) { id = v.clone() } }
             None {}
         }
     }
     if len(id) == 0 { id = rq.newId() }
-    rq.id = id.clone()
-    w.id = id.clone()
     w.header("X-Request-Id", &id)
+    rq.id = id.clone()
+    w.id = id
     return next.run(app, rq, w)
 }
 
@@ -3322,7 +3334,7 @@ pub fn accessLog[A](app: &A, rq: mut &Request, w: mut &Response, next: Next[A]):
     if gone { outcome = "client-gone" }
     var b = newBuf(256)
     b.add("time=")
-    b.add(&(isoNow()))
+    addIso(mut &b)
     if len(rq.id) > 0 {
         b.add(" id=")
         b.add(&rq.id)
