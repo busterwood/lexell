@@ -8,6 +8,7 @@
 //! constant-folding or closing the work up. Bounds checks stay on, and the
 //! release profile leaves overflow checks on (`Cargo.toml`).
 
+use std::collections::HashMap;
 use std::env;
 use std::hint::black_box;
 use std::rc::Rc;
@@ -359,6 +360,68 @@ fn bench_sieve() {
     println!("{}", count);
 }
 
+// ---------------------------------------------------------------- maps
+// Port of lexell/bench/maps.lxl (no C reference): std HashMap with its
+// default SipHash, keys built the same way, same checksum line.
+
+const MAP_N: usize = 400_000;
+const PAD: &str = "a fairly long common prefix for every key of the table: ";
+
+fn str_round(keys: &[String], miss: &[String]) -> i64 {
+    let mut m: HashMap<String, i64> = HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        m.insert(k.clone(), i as i64);
+    }
+    let mut sum: i64 = 0;
+    for _r in 0..4 {
+        for k in keys {
+            sum += m.get(k.as_str()).copied().unwrap_or(-1);
+        }
+    }
+    for k in miss {
+        if m.contains_key(k.as_str()) {
+            sum += 1;
+        }
+    }
+    sum + m.len() as i64
+}
+
+fn int_round(n: usize) -> i64 {
+    let mut m: HashMap<i64, i64> = HashMap::new();
+    for i in 0..n {
+        m.insert(i as i64 * 4096, i as i64);
+    }
+    let mut sum: i64 = 0;
+    for _r in 0..4 {
+        for i in 0..n {
+            sum += m.get(&(i as i64 * 4096)).copied().unwrap_or(-1);
+        }
+    }
+    for i in 0..n {
+        if m.contains_key(&(i as i64 * 4096 + 1)) {
+            sum += 1;
+        }
+    }
+    sum + m.len() as i64
+}
+
+fn bench_maps() {
+    let n = MAP_N;
+    let mut short: Vec<String> = Vec::with_capacity(n);
+    let mut long: Vec<String> = Vec::with_capacity(n);
+    let mut short_miss: Vec<String> = Vec::with_capacity(n);
+    let mut long_miss: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        short.push(format!("k{}", i as i64 * 7919));
+        long.push(format!("{PAD}{i}"));
+        short_miss.push(format!("m{i}"));
+        long_miss.push(format!("{PAD}x{i}"));
+    }
+    let s = str_round(&short, &short_miss);
+    let l = str_round(&long, &long_miss);
+    println!("{} {} {}", s, l, int_round(n));
+}
+
 // ---------------------------------------------------------------- main
 
 fn main() {
@@ -388,6 +451,7 @@ fn main() {
             bench_tokens(path);
         }
         "sieve" => bench_sieve(),
+        "maps" => bench_maps(),
         other => {
             eprintln!("dbench: unknown benchmark {other}");
             std::process::exit(2);

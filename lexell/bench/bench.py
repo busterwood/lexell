@@ -44,9 +44,10 @@ OBO_SRC = os.path.join(OBO, 'bench')
 NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps']
 TOKENS_INPUT = os.path.join(ROOT, 'lexell', 'compiler', 'sema.lxl')   # any text file; same for both
 RUST_DIR = os.path.join(HERE, 'rust')
-# maps has no Rust reference: Lexell's Map is insertion-ordered and keyed-hashed,
-# with u32 index slots; there is no direct std equivalent.
-RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve'}
+# maps: the Rust port uses std HashMap (same operations and keys, same checksum),
+# not Lexell's Map layout: Lexell's Map is insertion-ordered with u32 index slots,
+# HashMap is not. So the comparison is of the operations, not the data structure.
+RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps'}
 HASH_SEED = None     # set from the command line; see base_env
 RUST_EXE = None      # the one dbench binary, once built
 
