@@ -11610,11 +11610,13 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     let noRow: []Val = []
     let noB = noBatch()
-    if sel.setop == lexdb_sql.SET_UNION && sel.setAll && streamsSet(sel) {
-        // UNION ALL: each part's rows go to the sink as the part makes them
-        // (asked once, as a SELECT's; refused, the rows are held)
+    if sel.setop != 0 && streamsSet(sel) && (!sel.setAll || sel.setop == lexdb_sql.SET_UNION) {
+        // UNION ALL, or UNION, INTERSECT and EXCEPT without ALL: each part's
+        // rows go to the sink as the part makes them (asked once, as a
+        // SELECT's; refused, the rows are held)
         if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
-        return runSetTo(st, txn, sel, params, lim, sink)
+        if sel.setAll { return runSetTo(st, txn, sel, params, lim, sink) }
+        return runSetKeys(st, txn, sel, params, lim, sink)
     }
     if !streams(sel) {
         // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
@@ -14192,7 +14194,14 @@ fn outRefKind(x: &Expr, outs: &[]OutCol): int {
 // rowKey with its columns' collations (L2).
 fn rowKeyIn(vs: &[]Val, kinds: &[]int): str {
     var kb = ""
-    for i in 0..len(vs) { lexdb_pipe.keyPart(mut &kb, &(if i < len(kinds) { lexdb_sort.collVal(kinds[i], &vs[i]) } else { vs[i].clone() })) }
+    // (an exact collation's value is its own key: no copy made for it)
+    for i in 0..len(vs) {
+        if i < len(kinds) && kinds[i] != lexdb_sql.COLL_EXACT {
+            lexdb_pipe.keyPart(mut &kb, &lexdb_sort.collVal(kinds[i], &vs[i]))
+        } else {
+            lexdb_pipe.keyPart(mut &kb, &vs[i])
+        }
+    }
     return kb
 }
 
@@ -14316,21 +14325,26 @@ fn giveSet(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol,
 
 // A UNION ALL given to a sink: the left part's rows, then the right's, each
 // part run as a SELECT with the statement's parameters that it reads.
+// The parameters a set operation's part i reads: the statement's shared
+// ones, then its own (the split).
+fn setParamsOf(sel: &Sel, params: &[]Val, i: int): []Val {
+    let base = sel.q.base
+    var out: []Val = []
+    for j in 0..base { append(mut &out, params[j].clone()) }
+    if i == 0 {
+        for j in base..base + sel.split { append(mut &out, params[j].clone()) }
+    } else {
+        for j in base + sel.split..len(params) { append(mut &out, params[j].clone()) }
+    }
+    return out
+}
+
 fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
-    let base = sel.q.base
-    var lp: []Val = []
-    var rp: []Val = []
-    for j in 0..base {
-        append(mut &lp, params[j].clone())
-        append(mut &rp, params[j].clone())
-    }
-    for j in base..base + sel.split { append(mut &lp, params[j].clone()) }
-    for j in base + sel.split..len(params) { append(mut &rp, params[j].clone()) }
     var g = SetGive{left: sel.limit, total: 0, full: sel.limit == 0}
     for i in 0..2 {
         if g.full { break }
-        let ps: []Val = if i == 0 { collections.copyOf(&lp) } else { collections.copyOf(&rp) }
+        let ps = setParamsOf(sel, params, i)
         var asked = false
         let r = runSelTo(st, txn, &sel.parts[i], &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
             if start {
@@ -14357,6 +14371,120 @@ fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
                 if !g.full { return Err(x) }
             }
         }
+    }
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc.clone()) }
+    return Ok(Res{cols: outs, rows: [], tag: "SELECT " + g.total.toStr(), hasRows: true, copy: COPY_NONE})
+}
+
+// One part of a set operation run for its rows: proc gets each row (a batch's
+// rows one at a time, in order) and returns false to stop. Ok(true): stopped
+// (by proc, or by the sink's refusal, which the caller tells apart). A part
+// that held its rows is given to proc here.
+fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: []Val, lim: Limits,
+           proc: &fn(&[]Val): bool): Result[bool, DbErr] {
+    var asked = false
+    var stopped = false
+    var one: []Val = []
+    let r = runSelTo(st, txn, child, &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+        if start {
+            asked = true
+            return true
+        }
+        if stopped { return false }
+        if ob.n == 0 {
+            if !proc(row) {
+                stopped = true
+                return false
+            }
+            return true
+        }
+        for j in 0..ob.n {
+            lexdb_pipe.obRow(ob, j, mut &one)
+            if !proc(&one) {
+                stopped = true
+                return false
+            }
+        }
+        return true
+    })
+    match r {
+        Ok(res) {
+            if !asked {
+                for row in res.rows {
+                    if !proc(&row) { return Ok(true) }
+                }
+            }
+            return Ok(stopped)
+        }
+        Err(x) {
+            // (a part stopped by proc or the sink: its refusal is no error)
+            if stopped { return Ok(true) }
+            return Err(x)
+        }
+    }
+}
+
+// What a distinct set operation keeps of a row's key in its sets, per key
+// (the map's share, charged with the key against max_statement_mem).
+const SET_KEY_BYTES = 48
+
+// UNION, INTERSECT and EXCEPT without ALL given to a sink as their parts make
+// their rows: UNION gives the left part's rows, then the right's that the
+// left did not give (each once); INTERSECT and EXCEPT read the right part's
+// keys first, then give the left's rows the right has (INTERSECT) or lacks
+// (EXCEPT), each once. A row's key is rowKeyIn's, as combine's, so the
+// same rows are alike here and in the held path. Keys are charged against
+// lim.mem (a statement holding more fails as the held path does).
+fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+              sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    let noB = noBatch()
+    let kinds: []int = collections.copyOf(&sel.outKinds)
+    let mode = sel.setop
+    var g = SetGive{left: sel.limit, total: 0, full: sel.limit == 0}
+    var seen: Map[str, int] = newMap()
+    var rset: Map[str, int] = newMap()
+    var bytes = 0
+    var over = false
+    if mode != lexdb_sql.SET_UNION && !g.full {
+        // the right part's keys (no rows given)
+        let rps = setParamsOf(sel, params, 1)
+        let rstop = try setPart(st, txn, &sel.parts[1], rps, lim, fn(r: &[]Val): bool {
+            let k = rowKeyIn(r, &kinds)
+            if rset.get(&k).isSome() { return true }
+            bytes += len(k) + SET_KEY_BYTES
+            if lim.mem > 0 && bytes > lim.mem {
+                over = true
+                return false
+            }
+            rset.put(k, 1)
+            return true
+        })
+        if over { return Err(lexdb_pipe.memErr(lim.mem)) }
+    }
+    let noRow: []Val = []
+    let sides: []int = if mode == lexdb_sql.SET_UNION { [0, 1] } else { [0] }
+    for i in sides {
+        if g.full { break }
+        let ps = setParamsOf(sel, params, i)
+        let stopped = try setPart(st, txn, &sel.parts[i], ps, lim, fn(r: &[]Val): bool {
+            if g.full { return false }
+            let k = rowKeyIn(r, &kinds)
+            if mode != lexdb_sql.SET_UNION {
+                let present = rset.get(&k).isSome()
+                if (mode == lexdb_sql.SET_INTERSECT) != present { return true }
+            }
+            if seen.get(&k).isSome() { return true }
+            bytes += len(k) + SET_KEY_BYTES
+            if lim.mem > 0 && bytes > lim.mem {
+                over = true
+                return false
+            }
+            seen.put(k, 1)
+            return giveSet(sink, &sel.outs, mut &g, r, &noB)
+        })
+        if over { return Err(lexdb_pipe.memErr(lim.mem)) }
+        if stopped && !g.full { return Err(lostRows()) }
     }
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc.clone()) }

@@ -1,13 +1,15 @@
-// lexdb_exec: UNION ALL given to a sink as its parts make their rows
-// (runSetTo, giveSet) against the same statement held (Session.exec). Each
+// lexdb_exec: UNION, INTERSECT and EXCEPT given to a sink as their parts
+// make their rows (runSetTo, runSetKeys, giveSet) against the same statement
+// held (Session.exec). Each
 // shape runs both ways and the text of their rows (or their error) must
 // agree: LIMIT inside a batch, across the parts and at a batch's edge,
 // LIMIT 0, parameters in both parts, nested and chained unions, parts that
 // are aggregates, DISTINCT or converted (not streamed: held as before),
 // ORDER BY and OFFSET (held), NULLs, and errors in the first part and
 // after the first part has given rows.
-// expect: union all through a sink: 27 queries, 27 the same as held
+// expect: union all through a sink: 45 queries, 45 the same as held
 // expect: errors after rows: first part ERR 22012, second part ERR 22012
+// expect: memory: same same ERR 53200 / ERR 53200
 
 import "strings"
 import "../../../cmd/lexdb_base"
@@ -147,7 +149,25 @@ fn main() {
             "select w from u where id < 3 union all select w from t where id < 3",
             "select 1 union all select 2 union all select 3 limit 2",
             "select id from t where id < 1025 union all select id from u where id < 1025 order by 1 limit 3",
-            "select id from t where id < 1025 union all select id from u where id < 1025 limit 2 offset 1024"
+            "select id from t where id < 1025 union all select id from u where id < 1025 limit 2 offset 1024",
+            "select id, x from t union select id, x from u where id < 900",
+            "select id, x from t union select id, x from u where id < 900 limit 1",
+            "select id, x from t union select id, x from u where id < 900 limit 1100",
+            "select w from u union select w from t limit 3",
+            "select w from u union select w from t",
+            "select id from t intersect select id from u where id < 1500",
+            "select id from t intersect select id from u where id < 1500 limit 7",
+            "select id from t except select id from u where id < 2000",
+            "select id from t except select id from u where id < 2000 limit 40",
+            "select w from u except select w from t",
+            "select w from t intersect select w from u",
+            "select x from t union select x from u union select x from t intersect select x from u where id < 50",
+            "select id from t where id < 10 except select id from t where id < 10",
+            "select id from t where id < 10 intersect all select id from u where id < 10",
+            "select id from t where id < 10 except all select id from u where id < 10",
+            "select id, 1/0 from t union select id, 1 from u where id < 10",
+            "select id, 1 from t where id < 10 except select id, 1/0 from u where id < 10",
+            "select id from t where id < 10 union select id from t where id < 3 order by 1 desc"
         ]
         var same = 0
         for sql in shapes {
@@ -160,6 +180,14 @@ fn main() {
         let late = sunk(mut &s, "select id from t where id < 3 union all select id/0 from u where id < 3")
         let early = sunk(mut &s, "select id/0 from t where id < 3 union all select id from u where id < 3")
         println("errors after rows: first part " + early + ", second part " + late)
+        // the memory limit: the same statement held and through a sink
+        let ms = held(mut &s, &"set max_statement_mem = 16")
+        let mh = held(mut &s, &"select id, x from t union select id, x from u")
+        let mk = sunk(mut &s, "select id, x from t union select id, x from u")
+        let mh2 = held(mut &s, &"select id, x from t except select id, x from u")
+        let mk2 = sunk(mut &s, "select id, x from t except select id, x from u")
+        let mr = held(mut &s, &"set max_statement_mem = 0")
+        println("memory: " + (if mh == mk { "same" } else { "DIFFERENT" }) + " " + (if mh2 == mk2 { "same" } else { "DIFFERENT" }) + " " + mh + " / " + mh2)
         return 0
     })
 }
