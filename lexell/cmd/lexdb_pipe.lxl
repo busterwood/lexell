@@ -1233,8 +1233,12 @@ pub fn bAddVals(b: mut &Batch, idx: &[]int, vals: []Val): int {
     append(mut &b.txt, "")
     var col = BVec{v: [], nul: array(b.n, true)}
     var vs = vals
-    if len(idx) == b.n {
-        // every row of b (idx is 0, 1, ...): the values are the column
+    // (idx is 0, 1, ... only when it is every row in order: a point list's
+    // rows come in key order, which the batch need not hold)
+    var ident = len(idx) == b.n
+    if ident { for j in 0..len(idx) { if idx[j] != j { ident = false } } }
+    if ident {
+        // every row of b in order: the values are the column
         for j in 0..b.n { if !lexdb_ops.isNull(&vs[j]) { col.nul[j] = false } }
     } else {
         var all: []Val = array(b.n, Val.Null)
@@ -2164,6 +2168,7 @@ pub type Src = record {
     pub index: int                  // the path's index (-1 the primary key) and direction (row by row)
     pub desc: bool
     pub keys: []str                 // row by row: a range's primary keys, already read (optimizer 19); [] none
+    pub pts: []str                  // in batches: a primary key's points (an IN list's keys, sorted), read together; [] none
 }
 
 // Where a run of pg reads its table t, from what its caller found for the
@@ -2206,20 +2211,28 @@ fn joinSrc(p: &lexdb_plan.PPlan, k: int, t: &lexdb_catalog.Table, scans: []lexdb
 }
 
 // A Src that reads nothing (a table looked up per row).
-pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: []} }
+pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: [], pts: []} }
 
 fn srcFor(ps: &lexdb_plan.PScan, groups: bool, t: &lexdb_catalog.Table, scans: []lexdb_access.Scan, index: int, desc: bool, covers: bool, how: int,
           keys: []str): Result[Src, DbErr] {
-    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: []}
+    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: [], pts: []}
     var ranges = false
     for s in scans { if !s.point && !s.empty { ranges = true } }
     src.scans = if how == 1 { [lexdb_access.wholeScan()] } else { scans }
-    if !ps.batch || !(ranges || groups) {
+    // a primary key's points, forward (an IN list's, or an aggregate's): read
+    // together in batches (pts), in key order
+    var points = how != 1 && len(src.scans) > 0 && !desc
+    for s in src.scans { if !s.point || s.empty { points = false } }
+    if !ps.batch || !(ranges || groups || points) {
         if how == 0 { src.keys = keys }
         return Ok(src)
     }
     src.batch = true
-    if index < 0 { return Ok(src) }
+    if index < 0 {
+        src.rd.desc = desc
+        if points { for s in src.scans { append(mut &src.pts, s.lowKey()) } }
+        return Ok(src)
+    }
     src.rd.ix = index
     src.rd.desc = desc
     if covers {
@@ -2302,10 +2315,10 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     var need: []bool = []
     if sc.part { for x in sc.need { append(mut &need, x) } }
     var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
-    // (an aggregate's scan of points only, given way: row by row)
+    // (points only: read row by row, unless they are a batch's point list)
     var ranges = false
     for s in src.scans { if !s.point && !s.empty { ranges = true } }
-    if !src.batch || !ranges {
+    if !src.batch || (!ranges && len(src.pts) == 0) {
         if len(src.keys) > 0 {
             // the range's primary keys, already read: its rows, one by one
             let rr = lexdb_access.rowRead(&rel, &need)
@@ -2368,16 +2381,24 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     let lazy = lazyOf(&bp, t, &cn, barCol)
     let no = len(nodes)
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
-    for s in src.scans {
+    // a point list (src.pts) is one pass over its keys, read together; else
+    // one pass per scan
+    let pmode = len(src.pts) > 0
+    for pi in 0..(if pmode { 1 } else { len(src.scans) }) {
+        let s = if pmode { lexdb_access.noScan() } else { src.scans[pi].copy() }
         var cur = lexdb_access.newCursor()
         var rowPath = false
         var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
         while !cur.done {
             let saved = cur.copy()
             let bar = if barCol >= 0 { srt.st[0].bar(barCol) } else { lexdb_access.noBar() }
-            let got = try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, &bp, &src.rd, &lazy,
-                                                  fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(&cn, skip, b, idx) },
-                                                  &bar, mut &spare)
+            let got = if pmode {
+                try pointsPick(st, txn, &rel, &src.pts, sc.part, mut &cur, &bp, &cn)
+            } else {
+                try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, &bp, &src.rd, &lazy,
+                                            fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(&cn, skip, b, idx) },
+                                            &bar, mut &spare)
+            }
             if got.isNone() {
                 // a value a batch cannot hold, or a condition's error on one
                 // of its rows: row by row from its start
@@ -2438,12 +2459,42 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             spare = b
             if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
         }
-        if rowPath {
+        if rowPath && pmode {
+            // the points from the batch's start on, row by row
+            let start = cur.resumeAt(&src.pts)
+            for k in start..len(src.scans) {
+                let one = src.scans[k].copy()
+                var c2 = lexdb_access.newCursor()
+                try rowsFrom(st, txn, &rel, src, &one, &need, mut &c2, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
+                if sr.stop { return Ok(sr.n) }
+            }
+        } else if rowPath {
             try rowsFrom(st, txn, &rel, src, &s, &need, mut &cur, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
             if sr.stop { return Ok(sr.n) }
         }
     }
     return Ok(sr.n)
+}
+
+// The next batch of a point list (src.pts, sorted keys) read together by
+// fillPoints, its rows through the conditions cn. None: a value its batch
+// does not hold, or a condition's error on one of its rows (the caller
+// reads the points row by row, which raises the error).
+fn pointsPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, ks: &[]str, part: bool,
+              cur: mut &lexdb_access.Cursor, bp: &lexdb_rows.Projection, cn: &[]BNode): Result[Option[lexdb_access.Picked], DbErr] {
+    let got = try lexdb_access.fillPoints(st, txn, rel, ks, part, cur, bp)
+    match got {
+        Some(pk0) {
+            var pk = pk0
+            let none: []bool = []
+            let idx0 = replace(mut &pk.idx, [])
+            match bNarrow(cn, &none, &pk.b, idx0) {
+                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows())})) }
+                None { return Ok(None) }
+            }
+        }
+        None { return Ok(None) }
+    }
 }
 
 // A scan's rows read one by one: the row it is building (the query's

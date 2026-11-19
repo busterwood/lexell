@@ -363,6 +363,9 @@ pub type Scan = record {
     pub whole: bool     // the whole table, in primary key order, whatever the path's index
 }
 
+// The lower bound of a scan: a point's key.
+pub fn (sc: &Scan) lowKey(): str { return sc.lo.clone() }
+
 // No row: a bound is NULL, or one its column cannot hold.
 pub fn noScan(): Scan { return Scan{empty: true, point: false, lo: "", hi: "", whole: false} }
 
@@ -499,11 +502,23 @@ pub fn tailOf(ix: int, los: &[]Val, his: &[]Val, capNulls: bool): Tail {
 
 // Where a scan read in parts is: forward, the key to go on from; backward,
 // the end (exclusive).
-pub type Cursor = record { at: str; started: bool; pub done: bool }
+// want: the rows the next batch of a backward or point read takes (0: its
+// first size); it doubles per batch up to BROWS, so a LIMIT reads little
+// past its rows.
+pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int }
 
-pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false} }
+pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0} }
 
-pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done} }
+pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want} }
+
+// The first batch size of a backward or point read, and the next one.
+const FIRST_WANT = 32
+fn nextWant(cur: mut &Cursor): int {
+    if cur.want == 0 { cur.want = FIRST_WANT }
+    let n = cur.want
+    cur.want = min(BROWS, n * 2)
+    return n
+}
 
 // The scans of a primary key path from key from on (a batched statement's resume): a point before it is dropped, a range starts
 // at it at the latest, and the whole table is a range from it.
@@ -1000,6 +1015,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
 // spare as fillBatch's).
 pub fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &IxRead, sc: &Scan, part: bool, cur: mut &Cursor,
              bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
+    if rd.ix < 0 && rd.desc && !sc.empty && !sc.point { return fillBackBatch(st, txn, t, sc, part, cur, bp, spare) }
     if rd.ix < 0 || sc.whole { return fillBatch(st, txn, t, sc, part, cur, bp, spare) }
     if sc.empty {
         cur.done = true
@@ -1427,6 +1443,91 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
     return Ok(n)
 }
 
+// The index in ks (sorted point keys) of the first point a cursor has not
+// read: 0 before its first batch, else the first key after its last one.
+pub fn (c: &Cursor) resumeAt(ks: &[]str): int {
+    if !c.started { return 0 }
+    return firstAfter(ks, &c.at)
+}
+
+// The index of the first key after key in ks (sorted): ks[i] > key.
+pub fn firstAfter(ks: &[]str, key: &str): int {
+    var lo = 0
+    var hi = len(ks)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if ks[mid] <= key { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+// The next batch of an IN list's primary keys: ks (sorted, unique, as
+// inScans makes them), the keys after cur's, up to cur's next size, read
+// together (fetchMany) and given in key order. cur.at is the last key read.
+// None: a value its column's batch cannot hold.
+pub fn fillPoints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ks: &[]str, part: bool, cur: mut &Cursor,
+                  bp: &BPlan): Result[Option[Picked], DbErr] {
+    let from = if cur.started { firstAfter(ks, &cur.at) } else { 0 }
+    let to = min(len(ks), from + nextWant(cur))
+    var pr = probes(-1, to - from)
+    for i in from..to { append(mut &pr.keys, ks[i].clone()) }
+    if to == len(ks) { cur.done = true }
+    if to > from {
+        cur.started = true
+        cur.at = ks[to - 1].clone()
+    }
+    if to == from { return Ok(Some(Picked{kept: 0, idx: [], b: lexdb_rows.newBatch(bp, 0)})) }
+    let got = try fetchMany(st, txn, t, &pr, part, bp)
+    match got {
+        Some(f) {
+            var idx: []int = withCapacity(len(f.at))
+            for r in f.at { if r >= 0 { append(mut &idx, r) } }
+            return Ok(Some(Picked{kept: len(idx), idx: idx, b: f.rows}))
+        }
+        None { return Ok(None) }
+    }
+}
+
+// The next batch of a primary key's backward read: up to cur's next size of
+// the entries of [sc.lo, cur's end or sc.hi), from the last one backward,
+// their rows decoded in that order (descending). A stored-apart value is
+// read whole. None: a value its column's batch does not hold.
+fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
+                 bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
+    let n = nextWant(cur)
+    let to: &str = if cur.started { &cur.at } else { &sc.hi }
+    cur.started = true
+    var keys: []str = withCapacity(n)
+    var vals: []str = withCapacity(n)
+    try st.scanBack(txn, t.tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key.clone())
+        append(mut &vals, en.val.clone())
+        return len(keys) < n
+    })
+    if len(keys) < n { cur.done = true } else { cur.at = keys[len(keys) - 1].clone() }
+    var b = lexdb_rows.reuse(spare, bp)
+    let rw = rowsFor(t)
+    for i in 0..len(keys) {
+        let r = b.n
+        let code = try lexdb_rows.decodeRow(&vals[i], r, mut &b, bp, &rw)
+        if code == 1 { return Ok(None) }
+        if code == 2 {
+            // a stored-apart value: read whole, by its key
+            let got = if part { try st.getPart(txn, t.tree, &keys[i]) } else { try st.get(txn, t.tree, &keys[i]) }
+            match got {
+                Some(v) {
+                    if !(try bRowOf(st, txn, t, &keys[i], &v, r, mut &b, bp)) { return Ok(None) }
+                    b.n += 1
+                }
+                None {}
+            }
+            continue
+        }
+        b.n += 1
+    }
+    return Ok(Some(b))
+}
+
 // The next batch of a level, decoded in two steps when lz is on and the
 // level is a scan of its table (else as fillLevel reads it, whole), its
 // rows chosen by the level's conditions (narrow: idx narrowed to the rows
@@ -1439,6 +1540,20 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
 pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
                   bp: &BPlan, rd: &IxRead, lz: &Lazy, narrow: &fn(&[]bool, &Batch, []int): Option[[]int], bar: &Bar,
                   spare: mut &Batch): Result[Option[Picked], DbErr] {
+    // a primary key read backward, its batch decoded then narrowed (the
+    // lazy reading is for forward reads)
+    if rd.desc && rd.ix < 0 && !sc.empty && !sc.point {
+        let got = try fillBackBatch(st, txn, t, sc, part, cur, bp, spare)
+        if got.isNone() { return Ok(None) }
+        let b = got.unwrap()
+        var all: []int = withCapacity(b.n)
+        for r in 0..b.n { append(mut &all, r) }
+        let none: []bool = []
+        let ch = narrow(&none, &b, all)
+        if ch.isNone() { return Ok(None) }
+        let idx = ch.unwrap()
+        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
+    }
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
     if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
