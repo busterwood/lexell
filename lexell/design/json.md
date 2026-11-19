@@ -34,13 +34,16 @@ pub type Json = value closed { Null; Bool(bool); Num(Number); Str(str); Arr(Arra
 pub type Number = value record { f: float; text: str }
 ```
 
-**A Json is a value, with shared copy-on-write arrays and objects.** `Array`
-and `Object` are handles to a counted box. `clone()` shares the box and adds
-one to its count. Changing a Json whose box is shared (`set`, `push`,
-`remove`, `setAt`) copies the box first. Small values are cheap to copy and
-large ones are shared, so a Json can be stored, returned and passed around
-without thinking about ownership. Every reader returns an owned Json:
-`field`, `item` and `items()` hand out shared copies, not borrows.
+**A Json is a value, with shared copy-on-write arrays and objects.** An array
+or object is an `rc T` box (`ArrBox`, `ObjBox`), held in the `Arr` and `Obj`
+variants. `clone()` shares the box in O(1). Changing a Json whose box is shared
+(`set`, `push`, `remove`, `setAt`, `pop`) copies the box first: the value is
+taken out of its place, its box made unique with `unshare()`, changed, and put
+back. Small values are cheap to copy and large ones are shared, so a Json can
+be stored, returned and passed around without thinking about ownership.
+`get()` returns a borrow of the value (`Option[&Json]`), nothing copied.
+`field`, `item` and `items()` return owned values (a shared copy for an array
+or object, a copy of the text for a number).
 
 This matters most for jq. jq values are immutable, and `.a.b = 1` on a large
 document must not copy the whole document. With copy on write, only the path
@@ -53,18 +56,18 @@ the value or return a borrow. Borrows into a tree cannot outlive a change to
 the tree, so jq's evaluator, which keeps values in environments and on
 generator stacks, would have to copy everything.
 
-The boxes use `intoPtr`/`fromPtr`, the same unchecked boxing as `std.Map`'s
-internals. That is the one unsafe corner. It is contained in about 150
-lines: `newArr`, `newObj`, `clone`, `drop` and the mutators. Leak freedom is
-checked under `LXL_CHECK=1` by every json test, by the JSONTestSuite run, by
-the benchmark driver and by the jq harness, on both backends.
+The boxes were first hand-counted pointers (`intoPtr`/`fromPtr`, unchecked).
+They are now `rc T`, which counts without unchecked code, and `json.lxl` has
+no unsafe corner left. Leak freedom is checked under `LXL_CHECK=1` by every
+json test, by the JSONTestSuite run, by the benchmark driver and by the jq
+harness, on both backends.
 
-**Review point.** A borrow-class view (`&Json` into a box) would make
-`items()` and `field()` free. Today they cost a count increment and, for
-`items()`, an allocated `[]Json`. `eachItem`, `eachEntry` and `withItems`
-lend the elements instead. A language-level answer would be a borrow that
-can be returned from a method whose receiver is borrowed; borrow-class types
-(branch `borrow-types-v2`) may give one.
+**Borrowed reads.** `get()` returns `Option[&Json]`: a method whose receiver
+is borrowed may return a borrow of it, so a lookup costs no copy and no count
+change. `eachItem`, `eachEntry` and `withItems` lend the elements as before.
+`field()` and `items()` stay owned; a read that needs no ownership should use
+`get` or the lending iterators. Making `items()` lend too would need the
+array's elements returned as borrows, which the owned API does not yet do.
 
 ## 2. Objects: insertion order, lookup by key
 

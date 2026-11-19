@@ -42,8 +42,8 @@ pub type Json = value closed {
     Bool(bool)
     Num(Number)
     Str(str)
-    Arr(Array)
-    Obj(Object)
+    Arr(rc ArrBox)
+    Obj(rc ObjBox)
 }
 
 // A number: its double, and the text it was written with ("" when it was
@@ -54,17 +54,13 @@ pub type Number = value record {
     text: str
 }
 
-// The handles of an array and an object: counted, shared, copied on write.
-pub type Array = value record { p: ptr }
-pub type Object = value record { p: ptr }
-
+// The boxes of an array and an object are rc T: a clone shares the box, and a
+// change to a shared box copies it first (unshare).
 type ArrBox = record {
-    rc: int
     items: []Json
 }
 
 type ObjBox = record {
-    rc: int
     keys: []str
     vals: []Json
     index: []int    // empty, or slots of -1 / an entry, a power of two, at most half full
@@ -86,36 +82,12 @@ pub fn (k: Kind) toStr(): str {
 
 const SMALL = 16    // objects up to this many keys have no index
 
-fn (a: mut &Array) drop() {
-    var b: ArrBox = fromPtr(a.p)
-    b.rc -= 1
-    if b.rc > 0 { let back = intoPtr(b) }
-}
-
-fn (o: mut &Object) drop() {
-    var b: ObjBox = fromPtr(o.p)
-    b.rc -= 1
-    if b.rc > 0 { let back = intoPtr(b) }
-}
-
-fn newArr(items: []Json): Json { return Json.Arr(Array{p: intoPtr(ArrBox{rc: 1, items: items})}) }
+fn newArr(items: []Json): Json { return Json.Arr(rc(ArrBox{items: items})) }
 
 fn newObj(keys: []str, vals: []Json): Json {
-    var b = ObjBox{rc: 1, keys: keys, vals: vals, index: []}
+    var b = ObjBox{keys: keys, vals: vals, index: []}
     if len(b.keys) > SMALL { reindex(mut &b) }
-    return Json.Obj(Object{p: intoPtr(b)})
-}
-
-fn share(p: ptr): ptr {
-    var b: ArrBox = fromPtr(p)
-    b.rc += 1
-    return intoPtr(b)
-}
-
-fn shareObj(p: ptr): ptr {
-    var b: ObjBox = fromPtr(p)
-    b.rc += 1
-    return intoPtr(b)
+    return Json.Obj(rc(b))
 }
 
 // ---------------------------------------------------------------- making values
@@ -166,8 +138,8 @@ pub fn (j: &Json) clone(): Json {
         Json.Bool(b) { return Json.Bool(b) }
         Json.Num(n) { return Json.Num(n.clone()) }
         Json.Str(s) { return Json.Str(s.clone()) }
-        Json.Arr(a) { return Json.Arr(Array{p: share(a.p)}) }
-        Json.Obj(o) { return Json.Obj(Object{p: shareObj(o.p)}) }
+        Json.Arr(a) { return Json.Arr(a.share()) }
+        Json.Obj(o) { return Json.Obj(o.share()) }
     }
 }
 
@@ -245,6 +217,22 @@ pub fn (n: &Number) toInt(): Option[int] {
         if n.f != n.f || n.f.trunc() != n.f || n.f < -9223372036854775808.0f || n.f >= 9223372036854775808.0f { return None }
         return Some(int(n.f))
     }
+    // plain digits, at most 18 of them: the value is direct, no decimal parse
+    let neg = n.text[0] == '-'
+    let at = if neg { 1 } else { 0 }
+    if len(n.text) - at >= 1 && len(n.text) - at <= 18 {
+        var v = 0
+        var plain = true
+        for k in at..len(n.text) {
+            let c = n.text[k]
+            if c < '0' || c > '9' {
+                plain = false
+                break
+            }
+            v = v * 10 + int(c - '0')
+        }
+        if plain { return Some(if neg { -v } else { v }) }
+    }
     match n.toDecimal() {
         Some(d) {
             if d.isZero() { return Some(0) }
@@ -274,15 +262,11 @@ pub fn (n: &Number) toDecimal(): Option[Decimal] {
 pub fn (j: &Json) size(): int {
     match j {
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
-            let n = len(b.items)
-            let back = intoPtr(b)
+            let n = len(a.items)
             return n
         }
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            let n = len(b.keys)
-            let back = intoPtr(b)
+            let n = len(o.keys)
             return n
         }
         Json.Str(s) { return len(s) }
@@ -295,12 +279,10 @@ pub fn (j: &Json) size(): int {
 pub fn (j: &Json) at(i: int): Option[Json] {
     match j {
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
             var k = i
-            if k < 0 { k += len(b.items) }
+            if k < 0 { k += len(a.items) }
             var r: Option[Json] = None
-            if k >= 0 && k < len(b.items) { r = Some(b.items[k].clone()) }
-            let back = intoPtr(b)
+            if k >= 0 && k < len(a.items) { r = Some(a.items[k].clone()) }
             return r
         }
         else { return None }
@@ -315,25 +297,23 @@ pub fn (j: &Json) item(i: int): Json {
     }
 }
 
-// The value of key k of an object; None when j is not an object or has no k.
-pub fn (j: &Json) get(k: &str): Option[Json] {
+// The value of key k of an object, borrowed from j (nothing copied); None when
+// j is not an object or has no k.
+pub fn (j: &Json) get(k: &str): Option[&Json] {
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            let e = findKey(&b, k)
-            var r: Option[Json] = None
-            if e >= 0 { r = Some(b.vals[e].clone()) }
-            let back = intoPtr(b)
-            return r
+            let e = findKey(o, k)
+            if e >= 0 { return Some(&o.vals[e]) }
+            return None
         }
         else { return None }
     }
 }
 
-// The value of key k, or null (jq's .k).
+// The value of key k, or null (jq's .k). An owned copy: for a read, use get.
 pub fn (j: &Json) field(k: &str): Json {
     match j.get(k) {
-        Some(v) { return v }
+        Some(v) { return v.clone() }
         None { return Json.Null }
     }
 }
@@ -341,9 +321,7 @@ pub fn (j: &Json) field(k: &str): Json {
 pub fn (j: &Json) has(k: &str): bool {
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            let e = findKey(&b, k)
-            let back = intoPtr(b)
+            let e = findKey(o, k)
             return e >= 0
         }
         else { return false }
@@ -362,7 +340,7 @@ pub fn (j: &Json) path(keys: &[str]): Option[Json] {
                 None {}
             }
         } else {
-            next = cur.get(&k)
+            next = cur.get(&k).map(fn(v: &Json): Json { return v.clone() })
         }
         match move(next) {
             Some(v) { cur = v }
@@ -377,9 +355,7 @@ pub fn (j: &Json) items(): []Json {
     var out: []Json = []
     match j {
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
-            for x in b.items { append(mut &out, x.clone()) }
-            let back = intoPtr(b)
+            for x in a.items { append(mut &out, x.clone()) }
         }
         else {}
     }
@@ -391,9 +367,7 @@ pub fn (j: &Json) keys(): []str {
     var out: []str = []
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            for k in b.keys { append(mut &out, k.clone()) }
-            let back = intoPtr(b)
+            for k in o.keys { append(mut &out, k.clone()) }
         }
         else {}
     }
@@ -404,9 +378,7 @@ pub fn (j: &Json) keys(): []str {
 pub fn (j: &Json) keyAt(i: int): str {
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            let k = b.keys[i].clone()
-            let back = intoPtr(b)
+            let k = o.keys[i].clone()
             return k
         }
         else { panic("json: keyAt on a " + j.kind().toStr()) }
@@ -417,9 +389,7 @@ pub fn (j: &Json) keyAt(i: int): str {
 pub fn (j: &Json) valueAt(i: int): Json {
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
-            let v = b.vals[i].clone()
-            let back = intoPtr(b)
+            let v = o.vals[i].clone()
             return v
         }
         else { panic("json: valueAt on a " + j.kind().toStr()) }
@@ -431,17 +401,15 @@ pub fn (j: &Json) valueAt(i: int): Json {
 pub fn (j: &Json) eachItem(f: &fn(int, &Json): bool): bool {
     match j {
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
             var done = true
             var i = 0
-            while i < len(b.items) {
-                if !f(i, &b.items[i]) {
+            while i < len(a.items) {
+                if !f(i, a.items[i]) {
                     done = false
                     break
                 }
                 i += 1
             }
-            let back = intoPtr(b)
             return done
         }
         else { return true }
@@ -453,17 +421,15 @@ pub fn (j: &Json) eachItem(f: &fn(int, &Json): bool): bool {
 pub fn (j: &Json) eachEntry(f: &fn(str, &Json): bool): bool {
     match j {
         Json.Obj(o) {
-            let b: ObjBox = fromPtr(o.p)
             var done = true
             var i = 0
-            while i < len(b.keys) {
-                if !f(b.keys[i].clone(), &b.vals[i]) {
+            while i < len(o.keys) {
+                if !f(o.keys[i].clone(), o.vals[i]) {
                     done = false
                     break
                 }
                 i += 1
             }
-            let back = intoPtr(b)
             return done
         }
         else { return true }
@@ -475,9 +441,7 @@ pub fn (j: &Json) eachEntry(f: &fn(str, &Json): bool): bool {
 pub fn (j: &Json) withItems[R](f: &fn(&[Json]): R): R {
     match j {
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
-            let r = f(&b.items)
-            let back = intoPtr(b)
+            let r = f(&a.items)
             return r
         }
         else {
@@ -489,106 +453,103 @@ pub fn (j: &Json) withItems[R](f: &fn(&[Json]): R): R {
 
 // ---------------------------------------------------------------- changing
 
-// The box of an array j, unshared first (copied when another Json holds it).
-fn uniqueArr(j: mut &Json): ptr {
-    let p = arrPtr(j)
-    if isNull(p) { panic("json: not an array: " + j.kind().toStr()) }
-    let b: ArrBox = fromPtr(p)
-    if b.rc == 1 { return intoPtr(b) }
-    var items: []Json = []
-    for x in b.items { append(mut &items, x.clone()) }
-    let back = intoPtr(b)
-    j = newArr(items)
-    return arrPtr(j)
-}
-
-fn uniqueObj(j: mut &Json): ptr {
-    let p = objPtr(j)
-    if isNull(p) { panic("json: not an object: " + j.kind().toStr()) }
-    let b: ObjBox = fromPtr(p)
-    if b.rc == 1 { return intoPtr(b) }
-    var keys: []str = []
-    var vals: []Json = []
-    for k in b.keys { append(mut &keys, k.clone()) }
-    for v in b.vals { append(mut &vals, v.clone()) }
-    let back = intoPtr(b)
-    j = newObj(keys, vals)
-    return objPtr(j)
-}
-
-fn arrPtr(j: &Json): ptr {
-    match j {
-        Json.Arr(a) { return a.p }
-        else { return nullPtr() }
-    }
-}
-
-fn objPtr(j: &Json): ptr {
-    match j {
-        Json.Obj(o) { return o.p }
-        else { return nullPtr() }
-    }
-}
-
-// Adds v at the end of an array (stops the program if j is not one).
+// Changing a Json: the value is taken out of j, its box made unique (copied
+// when another Json holds it), changed, and put back. Stops the program when j
+// is not the kind the change needs.
 pub fn (j: mut &Json) push(v: Json) {
-    var b: ArrBox = fromPtr(uniqueArr(j))
-    append(mut &b.items, v)
-    let back = intoPtr(b)
+    if !j.isArray() { panic("json: not an array: " + j.kind().toStr()) }
+    var cur = replace(j, Json.Null)
+    match move(cur) {
+        Json.Arr(h) {
+            var a = h
+            let b = a.unshare()
+            append(mut &b.items, v)
+            let back = replace(j, Json.Arr(a))
+        }
+        else {}
+    }
 }
 
 // Adds copies of the elements of the array other at the end of the array j.
 pub fn (j: mut &Json) extend(other: &Json) {
     let items = other.items()
-    var b: ArrBox = fromPtr(uniqueArr(j))
-    for x in items { append(mut &b.items, x.clone()) }
-    let back = intoPtr(b)
+    for x in items { j.push(x) }
 }
 
 // Replaces element i (0 <= i < size()) of an array.
 pub fn (j: mut &Json) setAt(i: int, v: Json) {
-    var b: ArrBox = fromPtr(uniqueArr(j))
-    if i < 0 || i >= len(b.items) {
-        let back = intoPtr(b)
-        panic("json: setAt: index " + intToStr(i) + " out of range")
+    if !j.isArray() { panic("json: not an array: " + j.kind().toStr()) }
+    if i < 0 || i >= j.size() { panic("json: setAt: index " + intToStr(i) + " out of range") }
+    var cur = replace(j, Json.Null)
+    match move(cur) {
+        Json.Arr(h) {
+            var a = h
+            let b = a.unshare()
+            replace(mut &b.items[i], v)
+            let back = replace(j, Json.Arr(a))
+        }
+        else {}
     }
-    replace(mut &b.items[i], v)
-    let back = intoPtr(b)
 }
 
 // Removes the last element of an array and returns it; None when empty.
 pub fn (j: mut &Json) pop(): Option[Json] {
-    var b: ArrBox = fromPtr(uniqueArr(j))
+    if !j.isArray() { panic("json: not an array: " + j.kind().toStr()) }
     var r: Option[Json] = None
-    if len(b.items) > 0 { r = Some(pop(mut &b.items)) }
-    let back = intoPtr(b)
+    var cur = replace(j, Json.Null)
+    match move(cur) {
+        Json.Arr(h) {
+            var a = h
+            let b = a.unshare()
+            if len(b.items) > 0 { r = Some(pop(mut &b.items)) }
+            let back = replace(j, Json.Arr(a))
+        }
+        else {}
+    }
     return r
 }
 
 // Sets key k of an object to v; a new key goes last, an existing one keeps
 // its place (stops the program if j is not an object).
 pub fn (j: mut &Json) set(k: &str, v: Json) {
-    var b: ObjBox = fromPtr(uniqueObj(j))
-    putKey(mut &b, &k, v)
-    let back = intoPtr(b)
+    if j.kind() != Kind.Object { panic("json: not an object: " + j.kind().toStr()) }
+    var cur = replace(j, Json.Null)
+    match move(cur) {
+        Json.Obj(h) {
+            var o = h
+            let b = o.unshare()
+            putKey(b, &k, v)
+            let back = replace(j, Json.Obj(o))
+        }
+        else {}
+    }
 }
 
 // Removes key k of an object, keeping the order of the others; its value,
 // or None when it was not there.
 pub fn (j: mut &Json) remove(k: &str): Option[Json] {
     if !j.has(k) { return None }
-    var b: ObjBox = fromPtr(uniqueObj(j))
-    let e = findKey(&b, k)
-    let n = len(b.keys)
-    for i in e..n - 1 {
-        swap(mut &b.keys, i, i + 1)
-        swap(mut &b.vals, i, i + 1)
+    var r: Option[Json] = None
+    var cur = replace(j, Json.Null)
+    match move(cur) {
+        Json.Obj(h) {
+            var o = h
+            let b = o.unshare()
+            let e = findKey(b, k)
+            let n = len(b.keys)
+            for i in e..n - 1 {
+                swap(mut &b.keys, i, i + 1)
+                swap(mut &b.vals, i, i + 1)
+            }
+            pop(mut &b.keys)
+            let v = pop(mut &b.vals)
+            if len(b.index) > 0 { reindex(b) }
+            r = Some(v)
+            let back = replace(j, Json.Obj(o))
+        }
+        else {}
     }
-    pop(mut &b.keys)
-    let v = pop(mut &b.vals)
-    if len(b.index) > 0 { reindex(mut &b) }
-    let back = intoPtr(b)
-    return Some(v)
+    return r
 }
 
 // The object j with key k set to v, for building in one expression:
@@ -608,8 +569,13 @@ pub fn (j: Json) and(v: Json): Json {
 
 fn findKey(b: &ObjBox, k: &str): int {
     if len(b.index) == 0 {
+        // lengths and first bytes first: most keys differ there, and a string
+        // compare is a call
         for i in 0..len(b.keys) {
-            if b.keys[i] == k { return i }
+            let key = &b.keys[i]
+            if len(key) != len(k) { continue }
+            if len(k) > 0 && key[0] != k[0] { continue }
+            if key == k { return i }
         }
         return -1
     }
@@ -723,19 +689,14 @@ fn cmpArrays(a: &Json, b: &Json): int {
         Json.Arr(x) {
             match b {
                 Json.Arr(y) {
-                    if x.p == y.p { return 0 }
-                    let bx: ArrBox = fromPtr(x.p)
-                    let by: ArrBox = fromPtr(y.p)
-                    let n = len(bx.items)
-                    let m = len(by.items)
+                    let n = len(x.items)
+                    let m = len(y.items)
                     var c = 0
                     var i = 0
                     while c == 0 && i < n && i < m {
-                        c = bx.items[i].cmp(&by.items[i])
+                        c = x.items[i].cmp(&y.items[i])
                         i += 1
                     }
-                    let backX = intoPtr(bx)
-                    let backY = intoPtr(by)
                     if c != 0 { return c }
                     return if n < m { -1 } else if n > m { 1 } else { 0 }
                 }
@@ -1266,12 +1227,12 @@ fn (d: mut &Decoder) objectValue(): Result[Json, Error] {
     d.depth += 1
     if d.depth > d.opts.maxDepth { return Err(d.fail(ErrorKind.Depth, "nested too deep", start)) }
     d.pos += 1
-    var b = ObjBox{rc: 1, keys: [], vals: [], index: []}
+    var b = ObjBox{keys: [], vals: [], index: []}
     d.skipSpace()
     if d.pos < len(d.s) && d.s[d.pos] == '}' {
         d.pos += 1
         d.depth -= 1
-        return Ok(Json.Obj(Object{p: intoPtr(b)}))
+        return Ok(Json.Obj(rc(b)))
     }
     while true {
         d.skipSpace()
@@ -1298,7 +1259,7 @@ fn (d: mut &Decoder) objectValue(): Result[Json, Error] {
         }
     }
     d.depth -= 1
-    return Ok(Json.Obj(Object{p: intoPtr(b)}))
+    return Ok(Json.Obj(rc(b)))
 }
 
 // The length of the UTF-8 sequence that byte c starts (jq's table): 0 for a
@@ -1604,43 +1565,39 @@ fn writeValue[W: Sink](w: mut &W, j: &Json, o: &WriteOptions, level: int) {
         Json.Num(n) { w.write(&(formatNumber(&n, o.jqNumbers))) }
         Json.Str(s) { writeString(w, s, o.ascii) }
         Json.Arr(a) {
-            let b: ArrBox = fromPtr(a.p)
-            if len(b.items) == 0 {
+            if len(a.items) == 0 {
                 w.write("[]")
             } else {
                 w.writeByte('[')
-                for i in 0..len(b.items) {
+                for i in 0..len(a.items) {
                     if i > 0 { w.writeByte(',') }
                     if pretty { newline(w, o, level + 1) }
-                    writeValue(w, &b.items[i], o, level + 1)
+                    writeValue(w, a.items[i], o, level + 1)
                 }
                 if pretty { newline(w, o, level) }
                 w.writeByte(']')
             }
-            let back = intoPtr(b)
         }
         Json.Obj(ob) {
-            let b: ObjBox = fromPtr(ob.p)
-            if len(b.keys) == 0 {
+            if len(ob.keys) == 0 {
                 w.write("{}")
             } else {
                 var order: []int = []
-                for i in 0..len(b.keys) { append(mut &order, i) }
-                if o.sortKeys { sortByKeys(mut &order, &b.keys) }
+                for i in 0..len(ob.keys) { append(mut &order, i) }
+                if o.sortKeys { sortByKeys(mut &order, ob.keys) }
                 w.writeByte('{')
                 for x in 0..len(order) {
                     let i = order[x]
                     if x > 0 { w.writeByte(',') }
                     if pretty { newline(w, o, level + 1) }
-                    writeString(w, &b.keys[i], o.ascii)
+                    writeString(w, ob.keys[i], o.ascii)
                     w.writeByte(':')
                     if pretty { w.writeByte(' ') }
-                    writeValue(w, &b.vals[i], o, level + 1)
+                    writeValue(w, ob.vals[i], o, level + 1)
                 }
                 if pretty { newline(w, o, level) }
                 w.writeByte('}')
             }
-            let back = intoPtr(b)
         }
     }
 }

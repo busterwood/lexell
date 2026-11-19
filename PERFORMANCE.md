@@ -20,7 +20,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Compile time | Rust | Much faster: about 3 times for hello world, about 20 times for nine programs |
 | Microbenchmarks | Rust | Level or faster on nine of ten |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on most |
-| JSON | Python, jq | Faster to parse, slower to query; level with jq |
+| JSON | Python, jq | Faster to parse, slower to query; 7 to 9 percent slower than jq |
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Mixed |
 | HTTP server | Go net/http | Faster at 1, 10 and 100 clients, about 1.5 times |
@@ -114,20 +114,21 @@ driver's output is identical (sha256 checked).
 
 | step | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| parse | 429 ms | Python json 870 ms | 0.49 |
-| compact output | 452 ms | Python json 620 ms | 0.73 |
-| pretty output | 501 ms | Python json 642 ms | 0.78 |
-| query (sum of qty) | 196 ms | Python json 48 ms | 4.1 |
-| visit (eachItem) | 199 ms | Python json 48 ms | 4.1 |
-| jq `.` | 1,040 ms | jq 1.7.1 1,030 ms | 1.01 |
-| jq `-c .` | 960 ms | jq 1.7.1 960 ms | 1.00 |
-| jq `length` | 650 ms | jq 1.7.1 650 ms | 1.00 |
-| jq `[.[].items[].qty] \| add` | 800 ms | jq 1.7.1 790 ms | 1.01 |
-| jq `map(select(...))` | 820 ms | jq 1.7.1 810 ms | 1.01 |
-| jq `group_by(.address.city)` | 1,120 ms | jq 1.7.1 1,120 ms | 1.00 |
+| parse | 408 ms | Python json 821 ms | 0.50 |
+| compact output | 419 ms | Python json 587 ms | 0.71 |
+| pretty output | 461 ms | Python json 615 ms | 0.75 |
+| query (sum of qty) | 164 ms | Python json 46 ms | 3.6 |
+| visit (eachItem) | 163 ms | Python json 46 ms | 3.5 |
+| jq `.` | 1,060 ms | jq 1.7.1 990 ms | 1.07 |
+| jq `-c .` | 990 ms | jq 1.7.1 910 ms | 1.09 |
+| jq `length` | 670 ms | jq 1.7.1 620 ms | 1.08 |
+| jq `[.[].items[].qty] \| add` | 810 ms | jq 1.7.1 750 ms | 1.08 |
+| jq `map(select(...))` | 830 ms | jq 1.7.1 770 ms | 1.08 |
+| jq `group_by(.address.city)` | 1,130 ms | jq 1.7.1 1,050 ms | 1.08 |
 
-The jq times are rounded to 10 ms by the script. The Lexell jq times are level with
-jq 1.7.1 on every filter, within 1.3 percent.
+The jq times are rounded to 10 ms by the script. The Lexell jq times are 7 to 9
+percent slower than jq 1.7.1 on every filter. The query and visit steps read values
+through `get()` and `eachItem`, which borrow, so they copy nothing.
 
 ### Markdown
 
