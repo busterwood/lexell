@@ -8482,12 +8482,114 @@ fn intRank(oid: int): int {
     return 3
 }
 
+// What column i of t holds: whether any row has a value there, and the longest text (in bytes).
+fn columnData(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[[]int, DbErr] {
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    let sc = lexdb_access.allScan()
+    var need: []bool = []
+    for k in 0..len(t.cols) { append(mut &need, k == col) }
+    var has = 0
+    var longest = 0
+    var cur = lexdb_access.newCursor()
+    while !cur.done {
+        var batch: [][]Val = []
+        try fetch(st, txn, t, &path, &sc, &need, mut &cur, mut &batch)
+        for r in batch {
+            match r[col] {
+                Val.Null {}
+                Val.Text(x) {
+                    has = 1
+                    if len(x) > longest { longest = len(x) }
+                }
+                else { has = 1 }
+            }
+        }
+    }
+    return Ok([has, longest])
+}
+
+// Oracle's MODIFY of a column's type: a column with values keeps its kind of type (numbers, text, dates), a text may not be
+// made shorter than its longest value (ORA-01441), a number's precision or scale not lower (ORA-01440); another type needs
+// the column empty (ORA-01439).
+fn oracleModify(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, i: int, nw: &lexdb_sql.TypeName): Result[Unit, DbErr] {
+    let old = &t.cols[i].typ
+    if old.oid == nw.oid && old.len == nw.len && old.prec == nw.prec && old.scale == nw.scale { return Ok(Unit{}) }
+    let data = try columnData(st, txn, t, i)
+    if data[0] == 0 { return Ok(Unit{}) }
+    let fo = oraFamily(old.kind)
+    if fo != oraFamily(nw.kind) { return Err(e("ORA01439", "column to be modified must be empty to change datatype")) }
+    if old.kind == lexdb_sql.K_TEXT && nw.len > 0 && data[1] > nw.len {
+        return Err(e("ORA01441", "cannot decrease column length because some value is too big"))
+    }
+    if fo == 1 && nw.kind != lexdb_sql.K_FLOAT && old.kind != lexdb_sql.K_FLOAT {
+        let lower = nw.prec > 0 && (old.prec == 0 || nw.prec < old.prec || nw.scale < old.scale)
+        if lower { return Err(e("ORA01440", "column to be modified must be empty to decrease precision or scale")) }
+    }
+    return Ok(Unit{})
+}
+
+fn oraFamily(k: int): int {
+    if k == lexdb_sql.K_INT || k == lexdb_sql.K_NUM || k == lexdb_sql.K_FLOAT { return 1 }
+    if k == lexdb_sql.K_TEXT { return 2 }
+    if k == lexdb_sql.K_DATE || k == lexdb_sql.K_TS || k == lexdb_sql.K_TSTZ { return 3 }
+    return 100 + k
+}
+
+// A rewrite's error for a type change: SQL Server's overflow of a conversion to a small integer is its own.
+fn retypeErr(bad: DbErr, dia: int, changes: &[]Retype, fromInt4: &[]int): DbErr {
+    var small = false
+    for ch in changes { if ch.typ.oid == lexdb_sql.OID_INT2 { for k in fromInt4 { if k == ch.col { small = true } } } }
+    // (a text that is no number: 8114 for a decimal or float, 245 for an integer)
+    var toNum = false
+    for ch in changes { if ch.typ.kind == lexdb_sql.K_NUM || ch.typ.kind == lexdb_sql.K_FLOAT { toNum = true } }
+    if dia == lexdb_sql.MD_TSQL && bad.state == "22P02" && toNum { return e("TS8114", &("Error converting data type varchar to numeric.")) }
+    if dia == lexdb_sql.MD_TSQL && bad.state == "22003" && small { return e("TS220", "Arithmetic overflow error for data type smallint.") }
+    return bad
+}
+
+// The object that stops SQL Server from changing column i of t to type nt, "" none: its key, an index, a CHECK or a
+// foreign key on it, unless a varchar only grows; a default unless the type stays (its length, precision, scale change).
+fn tsqlBlocker(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, i: int, nt: &lexdb_sql.TypeName): Result[str, DbErr] {
+    let old = &t.cols[i].typ
+    if old.oid == nt.oid && old.len == nt.len && old.prec == nt.prec && old.scale == nt.scale { return Ok("") }
+    let name = t.cols[i].name.clone()
+    if t.cols[i].def.isSome() && old.oid != nt.oid { return Ok("DF_" + lexdb_sql.baseName(&t.name) + "_" + name) }
+    let grows = old.kind == lexdb_sql.K_TEXT && nt.kind == lexdb_sql.K_TEXT && old.oid == nt.oid && old.len > 0 && nt.len >= old.len
+    if grows { return Ok("") }
+    for k in t.pk { if k == i { return Ok(lexdb_catalog.pkConName(t)) } }
+    for ix in t.indexes {
+        for c in ix.cols { if c == i { return Ok(lexdb_sql.baseName(&ix.name)) } }
+        for x in ix.exprs {
+            var ns: []str = []
+            lexdb_sql.colNames(&x, mut &ns)
+            for n in ns { if n == name { return Ok(lexdb_sql.baseName(&ix.name)) } }
+        }
+    }
+    for c in t.checks {
+        var ns: []str = []
+        lexdb_sql.colNames(&c.expr, mut &ns)
+        for n in ns { if n == name { return Ok(c.name.clone()) } }
+    }
+    for f in t.fks { for n in f.cols { if n == name { return Ok(f.name.clone()) } } }
+    if try fkUses(st, txn, t, &name) { return Ok("FK_" + lexdb_sql.baseName(&t.name)) }
+    return Ok("")
+}
+
 // Whether a column of type a may become b with no USING: PostgreSQL's
 // assignment casts among lexdb's types.
 fn autoCast(a: &lexdb_sql.TypeName, b: &lexdb_sql.TypeName): bool {
-    if a.kind == b.kind && (a.kind != lexdb_sql.K_ARRAY || a.oid == b.oid) { return true }
+    if a.kind == b.kind && a.kind != lexdb_sql.K_ARRAY { return true }
+    if a.kind == lexdb_sql.K_ARRAY && b.kind == lexdb_sql.K_ARRAY {
+        return a.oid == b.oid || autoCast(&lexdb_sql.oidType(lexdb_sql.elemOid(a.oid)), &lexdb_sql.oidType(lexdb_sql.elemOid(b.oid)))
+    }
     if b.kind == lexdb_sql.K_TEXT { return true }
-    return (a.kind == lexdb_sql.K_INT && b.kind == lexdb_sql.K_NUM) || (a.kind == lexdb_sql.K_NUM && b.kind == lexdb_sql.K_INT)
+    // the numbers among themselves, the date and time stamps among themselves
+    let an = a.kind == lexdb_sql.K_INT || a.kind == lexdb_sql.K_NUM || a.kind == lexdb_sql.K_FLOAT
+    let bn = b.kind == lexdb_sql.K_INT || b.kind == lexdb_sql.K_NUM || b.kind == lexdb_sql.K_FLOAT
+    if an && bn { return true }
+    let at = a.kind == lexdb_sql.K_DATE || a.kind == lexdb_sql.K_TS || a.kind == lexdb_sql.K_TSTZ
+    let bt = b.kind == lexdb_sql.K_DATE || b.kind == lexdb_sql.K_TS || b.kind == lexdb_sql.K_TSTZ
+    return at && bt
 }
 
 // Whether every value of type a is one of type b as it is stored: then
@@ -8767,6 +8869,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist, skipping"), &"")
             return Ok(tagOnly("ALTER TABLE"))
         }
+        if s.mdialect == lexdb_sql.MD_TSQL {
+            return Err(e("TS4902", &("Cannot find the object \"" + lexdb_sql.baseName(&s.table) + "\" because it does not exist or you do not have permissions.")))
+        }
         return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist")))
     }
     var follow: []Follow = []
@@ -8796,12 +8901,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                         if pg && a.kind == lexdb_sql.A_RENAME && len(follow) == 0 { follow = try followPlan(st, txn, &ft.name) }
                         continue
                     }
-                    if a.kind == lexdb_sql.A_TYPE {
-                        let used = if pg { try viewUsing(st, txn, &ft.name, &a.name) } else { "" }
-                        if len(used) == 0 { continue }
-                        return Err(lexdb_base.errDetail("0A000", "cannot alter type of a column used by a view or rule",
-                                                        &("view " + lexdb_sql.baseName(&used) + " depends on column \"" + a.name + "\" of table " + lexdb_sql.baseName(&ft.name)), ""))
-                    }
+                    // (a retyped column: checked with the type's other conditions, below)
+                    if a.kind == lexdb_sql.A_TYPE { continue }
                     return Err(e("2BP01", &("cannot alter table " + lexdb_sql.shown(&ft.name) + " because view " +
                                  lexdb_sql.shown(&deps[0]) + " depends on it (lexdb keeps a view's text: drop the view, then make it again)")))
                 }
@@ -8810,6 +8911,22 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         None {}
     }
     var t = found.unwrap()
+    // SQL Server's ALTER COLUMN of a type: refused where an index, key or constraint is on the column (its length may grow)
+    if s.mdialect == lexdb_sql.MD_TSQL {
+        for a in s.alters {
+            if a.kind == lexdb_sql.A_DROP_NOT_NULL {
+                let pi = colIndex(&t.cols, &a.name)
+                if pi >= 0 && t.cols[pi].notNull { for k in t.pk { if k == pi && lexdb_catalog.hasPk(&t) {
+                    return Err(e("TS5074", &("The object '" + lexdb_catalog.pkConName(&t) + "' is dependent on column '" + a.name + "'.")))
+                } } }
+            }
+            if a.kind != lexdb_sql.A_TYPE { continue }
+            let ci = colIndex(&t.cols, &a.name)
+            if ci < 0 { return Err(e("TS4924", &("ALTER TABLE ALTER COLUMN failed because column '" + a.name + "' does not exist in table '" + lexdb_sql.baseName(&t.name) + "'."))) }
+            let blocker = try tsqlBlocker(st, txn, &t, ci, &a.col.typ)
+            if len(blocker) > 0 { return Err(e("TS5074", &("The object '" + blocker + "' is dependent on column '" + a.name + "'."))) }
+        }
+    }
     // the key as it was, by its columns' names ([] the hidden one)
     var keyWas: []str = []
     if lexdb_catalog.hasPk(&t) { for i in t.pk { append(mut &keyWas, t.cols[i].name.clone()) } }
@@ -8964,6 +9081,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             } else if a.kind == lexdb_sql.A_SET_NOT_NULL {
                 let nulls = !t.cols[i].notNull && try anyRow(st, txn, &t, i)
                 if nulls {
+                    if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA02296", "cannot enable - null values found")) }
                     return Err(e("23502", &("column \"" + a.name + "\" of relation \"" + rel + "\" contains null values")))
                 }
                 t.cols[i].notNull = true
@@ -9019,6 +9137,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
     }
     var changes: []Retype = []
+    var fromInt4: []int = []
     var retyped = false
     for j in types {
         let a = &s.alters[j]
@@ -9030,15 +9149,35 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if len(t.cols[i].seq) > 0 && a.col.typ.kind != lexdb_sql.K_INT {
             return Err(e("0A000", &("lexdb: column \"" + a.name + "\" takes its default from a sequence, so its type stays an integer")))
         }
-        if try fkUses(st, txn, &t, &a.name) {
+        if s.mdialect != lexdb_sql.MD_TSQL && (try fkUses(st, txn, &t, &a.name)) {
             return Err(e("0A000", &("lexdb: column \"" + a.name + "\" is in a foreign key, so its type cannot be changed (drop the constraint first)")))
         }
-        if a.using.isNone() && !autoCast(&t.cols[i].typ, &a.col.typ) {
+        if s.mdialect == lexdb_sql.MD_ORA { try oracleModify(st, txn, &t, i, &a.col.typ) }
+        if s.mdialect == lexdb_sql.MD_PG && a.using.isNone() && !autoCast(&t.cols[i].typ, &a.col.typ) {
             return Err(e("42804", &("column \"" + a.name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&a.col.typ) +
                          " (USING " + a.name + "::" + lexdb_sql.typeText(&a.col.typ) + " would)")))
         }
+        // PostgreSQL's view over a retyped column stops it (SQL Server's and Oracle's views are not stopped)
+        if s.mdialect == lexdb_sql.MD_PG {
+            let used = try viewUsing(st, txn, &t.name, &a.name)
+            if len(used) > 0 {
+                return Err(lexdb_base.errDetail("0A000", "cannot alter type of a column used by a view or rule",
+                                                &("view " + lexdb_sql.baseName(&used) + " depends on column \"" + a.name + "\" of table " + lexdb_sql.baseName(&t.name)), ""))
+            }
+        }
         if a.using.isSome() || !widens(&t.cols[i].typ, &a.col.typ) { retyped = true }
-        let u = match a.using { Some(x) { Some(lexdb_sql.cloneExpr(&x)) } None { None } }
+        var u = match a.using { Some(x) { Some(lexdb_sql.cloneExpr(&x)) } None { None } }
+        // SQL Server's bit converts to a number
+        if s.mdialect == lexdb_sql.MD_TSQL && u.isNone() && t.cols[i].typ.kind == lexdb_sql.K_BOOL && a.col.typ.kind == lexdb_sql.K_INT {
+            u = Some(Expr.Cast(Expr.Col(a.name.clone(), -1), a.col.typ))
+            retyped = true
+        }
+        // (and a decimal or float to an integer drops the fraction: SQL Server does not round)
+        if s.mdialect == lexdb_sql.MD_TSQL && u.isNone() && (t.cols[i].typ.kind == lexdb_sql.K_NUM || t.cols[i].typ.kind == lexdb_sql.K_FLOAT) && a.col.typ.kind == lexdb_sql.K_INT {
+            u = Some(Expr.Cast(Expr.Call("trunc", [Expr.Col(a.name.clone(), -1)], false), a.col.typ))
+            retyped = true
+        }
+        if t.cols[i].typ.oid == lexdb_sql.OID_INT4 { append(mut &fromInt4, i) }
         append(mut &changes, Retype{col: i, typ: a.col.typ, using: u})
     }
     // the key: none left, the hidden one (9.88); one like the old, nothing
@@ -9077,7 +9216,11 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if c >= 0 { append(mut &rw.fills, c) }
     }
     if retyped || rw.rekey || len(rw.fills) > 0 {
-        let n = try rewrite(st, txn, mut &t, &changes, &rw, lim)
+        let rr = rewrite(st, txn, mut &t, &changes, &rw, lim)
+        let n = match rr {
+            Ok(x) { x }
+            Err(bad) { return Err(retypeErr(bad, s.mdialect, &changes, &fromInt4)) }
+        }
         // the hidden key's sequence goes on after the rows numbered
         if rw.rowid >= 0 {
             if n > 0 {
@@ -9093,7 +9236,15 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // a default must be one of the new type
     for ch in changes {
         match t.cols[ch.col].def {
-            Some(x) { let v = try defaultValue(&x, &t.cols[ch.col], &Option[SeqEnv].None) }
+            Some(x) {
+                match defaultValue(&x, &t.cols[ch.col], &Option[SeqEnv].None) {
+                    Ok(v) {}
+                    Err(bad) {
+                        if s.mdialect != lexdb_sql.MD_PG || (bad.state != "22P02" && bad.state != "22003" && bad.state != "22007") { return Err(bad) }
+                        return Err(lexdb_base.errDetail("42804", &("default for column \"" + t.cols[ch.col].name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&ch.typ)), "", &("You will need to rewrite or remove the default expression.")))
+                    }
+                }
+            }
             None {}
         }
         // an identity column's sequence takes its new type, its bounds the

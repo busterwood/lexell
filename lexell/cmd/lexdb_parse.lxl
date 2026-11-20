@@ -2857,6 +2857,9 @@ fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) alterDatabase(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_ALTER_DB)
     s.mdialect = MD_TSQL
+    if p.isKw("scoped") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "configuration" {
+        return Err(lexdb_base.err("0A000", "lexdb: ALTER DATABASE SCOPED CONFIGURATION is not supported yet"))
+    }
     if !p.acceptKw("current") {
         let t = p.peek().clone()
         if t.kind == T_IDENT && t.text == "set" { return Err(near(&t)) }
@@ -3162,6 +3165,37 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             append(mut &s.alters, lexdb_sql.alterOf(A_VALIDATE, &(try p.name())))
         } else if p.acceptKw("alter") {
             let c = p.acceptKw("column")
+            // Oracle changes a column with MODIFY
+            if p.ora { return Err(lexdb_base.err("ORA00905", "missing keyword")) }
+            if p.tsql {
+                // ALTER COLUMN name type [NULL | NOT NULL]: a new type; without NULL or NOT NULL the column takes NULL
+                if !c { return Err(near(&p.peek())) }
+                let tn = try p.name()
+                var ta = lexdb_sql.alterOf(A_TYPE, &tn)
+                // a word that begins another action is not a type; a type name SQL Server does not know is 2715, found after the rest reads
+                let tk = p.peek().clone()
+                if (tk.kind != T_IDENT && tk.kind != T_QIDENT) || (tk.kind == T_IDENT && (tk.text == "set" || tk.text == "drop" || tk.text == "add" || tk.text == "alter" || tk.text == "with")) { return Err(near(&tk)) }
+                let at = p.pos
+                match p.typeName() {
+                    Ok(ty) { ta.col.typ = ty }
+                    Err(er) {
+                        if er.state != "42704" { return Err(er) }
+                        p.pos = at + 1
+                        if !(p.peek().kind == T_EOF || p.isKw(";") || p.isKw("not") || p.isKw("null") || p.isKw(",")) { return Err(near(&p.peek())) }
+                        return Err(lexdb_base.err("TS2715", &("Column, parameter, or variable #1: Cannot find data type " + tk.text + ".")))
+                    }
+                }
+                if p.isKw("collate") { return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN ... COLLATE is not supported yet")) }
+                append(mut &s.alters, ta)
+                if p.acceptKw("not") {
+                    try p.expectKw("null")
+                    append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &tn))
+                } else {
+                    let nl = p.acceptKw("null")
+                    append(mut &s.alters, lexdb_sql.alterOf(A_DROP_NOT_NULL, &tn))
+                }
+                break
+            }
             let n = try p.name()
             let data = p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "data"
             if data {
