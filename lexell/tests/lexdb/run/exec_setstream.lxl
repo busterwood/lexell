@@ -6,9 +6,12 @@
 // LIMIT 0, parameters in both parts, nested and chained unions, parts that
 // are aggregates, DISTINCT or converted (not streamed: held as before),
 // ORDER BY and OFFSET (held), NULLs, and errors in the first part and
-// after the first part has given rows.
-// expect: union all through a sink: 45 queries, 45 the same as held
+// after the first part has given rows. A CTE runs once in the statement
+// through a sink as held: its rows shared by the parts (a volatile one's
+// too), and nested parts read it from the same run.
+// expect: union all through a sink: 51 queries, 51 the same as held
 // expect: errors after rows: first part ERR 22012, second part ERR 22012
+// expect: a CTE once: except none, intersect 1 row, union all the same value twice, nested the same value thrice
 // expect: memory: same same ERR 53200 / ERR 53200
 
 import "strings"
@@ -167,7 +170,13 @@ fn main() {
             "select id from t where id < 10 except all select id from u where id < 10",
             "select id, 1/0 from t union select id, 1 from u where id < 10",
             "select id, 1 from t where id < 10 except select id, 1/0 from u where id < 10",
-            "select id from t where id < 10 union select id from t where id < 3 order by 1 desc"
+            "select id from t where id < 10 union select id from t where id < 3 order by 1 desc",
+            "with c as (select id, x from t where id < 50) select id from c union all select x from c",
+            "with c as (select id, x from t where id < 50) select id from c union all select x from c limit 60",
+            "with c as (select id, x from t where id < 50) select id from c union select x from c",
+            "with c as (select id from u where id < 20) select id from t where id < 40 except select id from c",
+            "with c as (select id from u where id < 20) select id from t where id < 40 intersect select id from c limit 5",
+            "with c as (select id from t where id < 5) select id from c union all select id from c union all select id + 100 from c"
         ]
         var same = 0
         for sql in shapes {
@@ -180,6 +189,18 @@ fn main() {
         let late = sunk(mut &s, "select id from t where id < 3 union all select id/0 from u where id < 3")
         let early = sunk(mut &s, "select id/0 from t where id < 3 union all select id from u where id < 3")
         println("errors after rows: first part " + early + ", second part " + late)
+        // a volatile CTE: one run in the statement, so both parts read the same rows
+        let sq = held(mut &s, &"create sequence sq")
+        let c1 = sunk(mut &s, "with r as (select random() as x) select x from r except select x from r")
+        let c2 = sunk(mut &s, "with r as (select random() as x) select x from r intersect select x from r")
+        let r3 = sunk(mut &s, "with r as (select nextval('sq') as x) select x from r union all select x from r")
+        let r4 = sunk(mut &s, "with r as (select nextval('sq') as x) select x from r union all select x from r union all select x from r")
+        let c3 = strings.split(&r3, " ")
+        let c4 = strings.split(&r4, " ")
+        println("a CTE once: except " + (if c1 == "" { "none" } else { c1 }) + ", intersect " +
+                (if c2 != "" && len(strings.split(&c2, " ")) == 1 { "1 row" } else { "rows: " + c2 }) + ", union all " +
+                (if len(c3) == 2 && c3[0] == c3[1] { "the same value twice" } else { r3.clone() }) + ", nested " +
+                (if len(c4) == 3 && c4[0] == c4[1] && c4[1] == c4[2] { "the same value thrice" } else { r4.clone() }))
         // the memory limit: the same statement held and through a sink
         let ms = held(mut &s, &"set max_statement_mem = 16")
         let mh = held(mut &s, &"select id, x from t union select id, x from u")

@@ -1490,8 +1490,10 @@ pub fn fillPoints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ks
 
 // The next batch of a primary key's backward read: up to cur's next size of
 // the entries of [sc.lo, cur's end or sc.hi), from the last one backward,
-// their rows decoded in that order (descending). A stored-apart value is
-// read whole. None: a value its column's batch does not hold.
+// their rows decoded in that order (descending). With part, a stored-apart
+// value comes in part (scanBackPart), as the row path reads it, not whole
+// for columns the query may not use. None: a value its column's batch does
+// not hold.
 fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
                  bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
     let n = nextWant(cur)
@@ -1499,11 +1501,19 @@ fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
     cur.started = true
     var keys: []str = withCapacity(n)
     var vals: []str = withCapacity(n)
-    try st.scanBack(txn, t.tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
-        append(mut &keys, en.key.clone())
-        append(mut &vals, en.val.clone())
-        return len(keys) < n
-    })
+    if part {
+        try st.scanBackPart(txn, t.tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &keys, en.key.clone())
+            append(mut &vals, en.val.clone())
+            return len(keys) < n
+        })
+    } else {
+        try st.scanBack(txn, t.tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
+            append(mut &keys, en.key.clone())
+            append(mut &vals, en.val.clone())
+            return len(keys) < n
+        })
+    }
     if len(keys) < n { cur.done = true } else { cur.at = keys[len(keys) - 1].clone() }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
@@ -1511,18 +1521,9 @@ fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
         let r = b.n
         let code = try lexdb_rows.decodeRow(&vals[i], r, mut &b, bp, &rw)
         if code == 1 { return Ok(None) }
-        if code == 2 {
-            // a stored-apart value: read whole, by its key
-            let got = if part { try st.getPart(txn, t.tree, &keys[i]) } else { try st.get(txn, t.tree, &keys[i]) }
-            match got {
-                Some(v) {
-                    if !(try bRowOf(st, txn, t, &keys[i], &v, r, mut &b, bp)) { return Ok(None) }
-                    b.n += 1
-                }
-                None {}
-            }
-            continue
-        }
+        // a stored-apart value: the row path's decoding of it, as the scan
+        // gave it (as getPart or get would, so not read again; fillPoint)
+        if code == 2 && !(try bRowOf(st, txn, t, &keys[i], &vals[i], r, mut &b, bp)) { return Ok(None) }
         b.n += 1
     }
     return Ok(Some(b))

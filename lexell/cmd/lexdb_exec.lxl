@@ -11608,24 +11608,58 @@ fn planVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, D
 // (08006).
 fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    var sh = newShare()
+    return runSelToIn(st, txn, sel, params, lim, sink, mut &sh)
+}
+
+// What the runs of one statement that are not each other's children (a
+// set operation's parts given to a sink, each run by runSelToIn) hand on
+// from one to the next, as runChild hands them from a parent to its
+// child: the CTEs' rows (a CTE runs once in the statement, so a volatile
+// one gives every part the same rows), the rows held before the run, and
+// the steps and turns taken.
+type Share = record { cache: CteCache; held: int; ticks: int; turnEnd: int }
+
+fn newShare(): Share { return Share{cache: newCache(), held: 0, ticks: 0, turnEnd: 0} }
+
+// A run starts from what sh holds: the CTEs' rows move into it.
+fn (rs: mut &Run) takeShare(sh: mut &Share) {
+    rs.cache = replace(mut &sh.cache, newCache())
+    rs.bud.held = sh.held
+    rs.bud.ticks = sh.ticks
+    rs.bud.turnEnd = sh.turnEnd
+}
+
+// A run done (or given up for another): the CTEs' rows back to sh, with
+// its steps and turns (the rows it held are its own, let go).
+fn (sh: mut &Share) giveBack(rs: mut &Run) {
+    sh.cache = replace(mut &rs.cache, newCache())
+    sh.ticks = rs.bud.ticks
+    sh.turnEnd = rs.bud.turnEnd
+}
+
+// runSelTo, its runs starting from sh and handing back to it.
+fn runSelToIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+              sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, sh: mut &Share): Result[Res, DbErr] {
     let noRow: []Val = []
     let noB = noBatch()
     if sel.setop != 0 && streamsSet(sel) && (!sel.setAll || sel.setop == lexdb_sql.SET_UNION) {
         // UNION ALL, or UNION, INTERSECT and EXCEPT without ALL: each part's
         // rows go to the sink as the part makes them (asked once, as a
         // SELECT's; refused, the rows are held)
-        if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
-        if sel.setAll { return runSetTo(st, txn, sel, params, lim, sink) }
-        return runSetKeys(st, txn, sel, params, lim, sink)
+        if !sink(&sel.outs, &noRow, &noB, true) { return runSelIn(st, txn, sel, params, lim, sh) }
+        if sel.setAll { return runSetTo(st, txn, sel, params, lim, sink, sh) }
+        return runSetKeys(st, txn, sel, params, lim, sink, sh)
     }
     if !streams(sel) {
         // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
         // to the sink as one OutBatch if it wants them so (it is asked once,
         // only then); else they are held, as runSel holds them
-        if !pipeSorts(sel) { return runSel(st, txn, sel, params, lim) }
+        if !pipeSorts(sel) { return runSelIn(st, txn, sel, params, lim, sh) }
         var rs = newRun(&sel.q)
         rs.limit(&lim)
-        if !rs.batch || rs.noLimit { return runSel(st, txn, sel, params, lim) }
+        if !rs.batch || rs.noLimit { return runSelIn(st, txn, sel, params, lim, sh) }
+        rs.takeShare(sh)
         var asked = false
         var want = false
         var rows: [][]Val = []
@@ -11645,6 +11679,7 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             }
             return Ok(true)
         })
+        sh.giveBack(mut &rs)
         var outs: []OutCol = []
         for oc in sel.outs { append(mut &outs, oc.clone()) }
         match got {
@@ -11652,18 +11687,18 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             Err(x) {
                 // (a value it does not sort: the row engine, nothing given)
                 if !lexdb_pipe.isBat(&x) || asked { return Err(x) }
-                return runSel(st, txn, sel, params, lim)
+                return runSelIn(st, txn, sel, params, lim, sh)
             }
         }
     }
-    if !sink(&sel.outs, &noRow, &noB, true) { return runSel(st, txn, sel, params, lim) }
-    let n = try eachRowB(st, txn, sel, params, lim, true, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+    if !sink(&sel.outs, &noRow, &noB, true) { return runSelIn(st, txn, sel, params, lim, sh) }
+    let n = try eachRowBIn(st, txn, sel, params, lim, true, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         if !sink(&sel.outs, r, &noB, false) { return Err(lostRows()) }
         return Ok(true)
     }, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] {
         if !sink(&sel.outs, &noRow, ob, false) { return Err(lostRows()) }
         return Ok(true)
-    })
+    }, sh)
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc.clone()) }
     return Ok(Res{cols: outs, rows: [], tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE})
@@ -11679,10 +11714,20 @@ fn noSink(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool { return fa
 const PLAN_VARIANTS: int = 4
 
 fn runSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+    var sh = newShare()
+    return runSelIn(st, txn, sel, params, lim, mut &sh)
+}
+
+// runSel, its run starting from sh and handing back to it.
+fn runSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
+            sh: mut &Share): Result[Res, DbErr] {
     if len(sel.locks) > 0 { return runLocking(st, txn, sel, params, lim) }
     var rs = newRun(&sel.q)
     rs.limit(&lim)
-    return execSel(st, txn, sel, params, -1, mut &rs)
+    rs.takeShare(sh)
+    let r = execSel(st, txn, sel, params, -1, mut &rs)
+    sh.giveBack(mut &rs)
+    return r
 }
 
 // A SELECT ... FOR UPDATE (9.86). Its rows are made without LIMIT and
@@ -11754,10 +11799,16 @@ fn noEachB(tx: mut &lexdb_store.Txn, ob: &OutBatch): Result[bool, DbErr] { retur
 fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits, batched: bool,
             each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
             eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr]): Result[int, DbErr] {
-    var rs = newRun(&sel.q)
-    rs.limit(&lim)
+    var sh = newShare()
+    return eachRowBIn(st, txn, sel, params, lim, batched, each, eachB, mut &sh)
+}
+
+// eachRowB, its runs starting from sh and handing back to it.
+fn eachRowBIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits, batched: bool,
+              each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr],
+              eachB: &fn(mut &lexdb_store.Txn, &OutBatch): Result[bool, DbErr], sh: mut &Share): Result[int, DbErr] {
     if !streams(sel) {
-        var res = try runSel(st, txn, sel, params, lim)
+        var res = try runSelIn(st, txn, sel, params, lim, sh)
         var k = 0
         for i in 0..len(res.rows) {
             let r = replace(mut &res.rows[i], [])
@@ -11767,6 +11818,9 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
         return Ok(k)
     }
     if sel.limit == 0 { return Ok(0) }
+    var rs = newRun(&sel.q)
+    rs.limit(&lim)
+    rs.takeShare(sh)
     if rs.batch && pipeRows(sel) {
         var row: []Val = []
         var given = 0
@@ -11780,6 +11834,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
             }
             return Ok(true)
         })
+        sh.giveBack(mut &rs)
         match got {
             Ok(n) { return Ok(n) }
             Err(x) {
@@ -11788,6 +11843,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
                 if !lexdb_pipe.isBat(&x) || given > 0 { return Err(x) }
                 rs = newRun(&sel.q)
                 rs.limit(&lim)
+                rs.takeShare(sh)
             }
         }
     }
@@ -11803,6 +11859,7 @@ fn eachRowB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
         n += 1
         return Ok(sel.limit < 0 || n < sel.limit)
     }, mut &rs)
+    sh.giveBack(mut &rs)
     return Ok(n)
 }
 
@@ -14323,8 +14380,6 @@ fn giveSet(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol,
     return true
 }
 
-// A UNION ALL given to a sink: the left part's rows, then the right's, each
-// part run as a SELECT with the statement's parameters that it reads.
 // The parameters a set operation's part i reads: the statement's shared
 // ones, then its own (the split).
 fn setParamsOf(sel: &Sel, params: &[]Val, i: int): []Val {
@@ -14339,20 +14394,24 @@ fn setParamsOf(sel: &Sel, params: &[]Val, i: int): []Val {
     return out
 }
 
+// A UNION ALL given to a sink: the left part's rows, then the right's, each
+// part run as a SELECT with the statement's parameters that it reads, from
+// what the statement's runs share (sh: its CTEs' rows, run once). A part
+// stops as soon as the LIMIT is reached.
 fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
-            sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+            sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, sh: mut &Share): Result[Res, DbErr] {
     var g = SetGive{left: sel.limit, total: 0, full: sel.limit == 0}
     for i in 0..2 {
         if g.full { break }
         let ps = setParamsOf(sel, params, i)
         var asked = false
-        let r = runSelTo(st, txn, &sel.parts[i], &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+        let r = runSelToIn(st, txn, &sel.parts[i], &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
             if start {
                 asked = true
                 return true
             }
-            return giveSet(sink, &sel.outs, mut &g, row, ob)
-        })
+            return giveSet(sink, &sel.outs, mut &g, row, ob) && !g.full
+        }, sh)
         match r {
             Ok(res) {
                 // a part that held its rows (not streamed): given here
@@ -14363,6 +14422,7 @@ fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
                             if !g.full { return Err(lostRows()) }
                             break
                         }
+                        if g.full { break }
                     }
                 }
             }
@@ -14380,13 +14440,14 @@ fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 // One part of a set operation run for its rows: proc gets each row (a batch's
 // rows one at a time, in order) and returns false to stop. Ok(true): stopped
 // (by proc, or by the sink's refusal, which the caller tells apart). A part
-// that held its rows is given to proc here.
+// that held its rows is given to proc here. The part runs from sh, as
+// runSetTo's do.
 fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: []Val, lim: Limits,
-           proc: &fn(&[]Val): bool): Result[bool, DbErr] {
+           proc: &fn(&[]Val): bool, sh: mut &Share): Result[bool, DbErr] {
     var asked = false
     var stopped = false
     var one: []Val = []
-    let r = runSelTo(st, txn, child, &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+    let r = runSelToIn(st, txn, child, &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
         if start {
             asked = true
             return true
@@ -14407,7 +14468,7 @@ fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: [
             }
         }
         return true
-    })
+    }, sh)
     match r {
         Ok(res) {
             if !asked {
@@ -14435,16 +14496,19 @@ const SET_KEY_BYTES = 48
 // keys first, then give the left's rows the right has (INTERSECT) or lacks
 // (EXCEPT), each once. A row's key is rowKeyIn's, as combine's, so the
 // same rows are alike here and in the held path. Keys are charged against
-// lim.mem (a statement holding more fails as the held path does).
+// lim.mem with what the statement held before (a statement holding more
+// fails as the held path does), and a part runs holding them (sh.held), as
+// the held path's right part runs holding the left's rows.
 fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
-              sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+              sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, sh: mut &Share): Result[Res, DbErr] {
     let noB = noBatch()
     let kinds: []int = collections.copyOf(&sel.outKinds)
     let mode = sel.setop
     var g = SetGive{left: sel.limit, total: 0, full: sel.limit == 0}
     var seen: Map[str, int] = newMap()
     var rset: Map[str, int] = newMap()
-    var bytes = 0
+    let base = sh.held
+    var bytes = base
     var over = false
     if mode != lexdb_sql.SET_UNION && !g.full {
         // the right part's keys (no rows given)
@@ -14459,7 +14523,7 @@ fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
             }
             rset.put(k, 1)
             return true
-        })
+        }, sh)
         if over { return Err(lexdb_pipe.memErr(lim.mem)) }
     }
     let noRow: []Val = []
@@ -14467,6 +14531,7 @@ fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
     for i in sides {
         if g.full { break }
         let ps = setParamsOf(sel, params, i)
+        sh.held = bytes
         let stopped = try setPart(st, txn, &sel.parts[i], ps, lim, fn(r: &[]Val): bool {
             if g.full { return false }
             let k = rowKeyIn(r, &kinds)
@@ -14481,11 +14546,12 @@ fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
                 return false
             }
             seen.put(k, 1)
-            return giveSet(sink, &sel.outs, mut &g, r, &noB)
-        })
+            return giveSet(sink, &sel.outs, mut &g, r, &noB) && !g.full
+        }, sh)
         if over { return Err(lexdb_pipe.memErr(lim.mem)) }
         if stopped && !g.full { return Err(lostRows()) }
     }
+    sh.held = base
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc.clone()) }
     return Ok(Res{cols: outs, rows: [], tag: "SELECT " + g.total.toStr(), hasRows: true, copy: COPY_NONE})
