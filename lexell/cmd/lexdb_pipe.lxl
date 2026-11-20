@@ -5553,7 +5553,7 @@ type DistSet = record {
 
 // A one-table run's Sort, if any: st holds its state (one), or nothing
 // (the rows stream to the caller; a run that does not sort makes nothing).
-type SortRun = record { st: []SortSt }
+pub type SortRun = record { st: []SortSt }
 
 // A Sort's (or Distinct's) run: what it holds, and how.
 type SortSt = record {
@@ -5627,7 +5627,38 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
 }
 
 // No Sort: the rows go to the caller as they are made.
-fn noSortRun(): SortRun { return SortRun{st: []} }
+pub fn noSortRun(): SortRun { return SortRun{st: []} }
+
+// The sort of a set operation's rows (UNION, INTERSECT, EXCEPT with ORDER
+// BY, LIMIT, OFFSET), fed by the parts' chunks and rows as they come: the
+// output's columns (ncol), the ORDER BY keys as output columns (keyCol,
+// with desc, nf and the collations' kinds coll), the rows given after
+// offset (limit, -1 all), and the bytes the statement may still hold
+// (room, -1 no limit; maxMem: max_statement_mem, for the error). With a LIMIT
+// only limit + offset rows are kept, as a SELECT's top-N keeps them.
+pub fn setSort(ncol: int, keyCol: []int, desc: []bool, nf: []bool, coll: []int, limit: int, offset: int,
+               room: int, maxMem: int): SortRun {
+    var sr = SortSt{sorting: true, distinct: false, shown: ncol, keyCol: keyCol, desc: desc, nf: nf, coll: coll, dcoll: [], kinds: [],
+                     limit: limit, offset: max(offset, 0), topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0},
+                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: []}
+    sr.topK = if limit >= 0 { limit + sr.offset } else { -1 }
+    return SortRun{st: [sr]}
+}
+
+// Whether srt sorts (a SortRun of setSort), and what it holds now.
+pub fn (srt: &SortRun) active(): bool { return len(srt.st) > 0 }
+pub fn (srt: &SortRun) held(): int { return if len(srt.st) > 0 { srt.st[0].held } else { 0 } }
+
+// A chunk ob, or the row r when ob.n is 0, taken in. Ok(false): stop (a
+// value not sorted here: done gives batErr).
+pub fn (srt: mut &SortRun) take(ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] { return srt.st[0].eat(ob, r) }
+
+// The rows kept, in order, given as one chunk to give; their bytes held in
+// bud. The rows given. batErr: a value not sorted here (nothing given).
+pub fn (srt: mut &SortRun) done(txn: mut &lexdb_store.Txn, bud: mut &Budget,
+                                give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    return srt.st[0].finish(txn, bud, give)
+}
 
 // What a run made (a chunk ob, or the row r when ob.n is 0) to srt when it
 // holds the rows, else to give.
@@ -5751,6 +5782,13 @@ fn (sr: mut &SortSt) cell(kind: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int
         }
         if !isIntKind(ok) {
             if kind != BK_VAL {
+                // (a set operation's other part gives values where the first
+                // gave integers: its integers and booleans, as the first's)
+                match ob.vals[src][rr] {
+                    Val.Int(n) { if kind == lexdb_rows.BK_INT { iv = n; return false } }
+                    Val.Bool(b) { if kind == BK_BOOL { iv = if b { 1 } else { 0 }; return false } }
+                    else {}
+                }
                 sr.bad = true
                 return true
             }

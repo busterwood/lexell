@@ -1,18 +1,21 @@
-// lexdb_exec: UNION, INTERSECT and EXCEPT given to a sink as their parts
-// make their rows (runSetTo, runSetKeys, giveSet) against the same statement
-// held (Session.exec). Each
+// lexdb_exec: UNION, INTERSECT and EXCEPT (with and without ALL) given to a
+// sink as their parts make their rows (runSetTo, runSetKeys, giveSet), with
+// ORDER BY through a sort the parts feed (runSetSorted) and OFFSET counted as
+// the rows come, against the same statement held (Session.exec). Each
 // shape runs both ways and the text of their rows (or their error) must
 // agree: LIMIT inside a batch, across the parts and at a batch's edge,
 // LIMIT 0, parameters in both parts, nested and chained unions, parts that
 // are aggregates, DISTINCT or converted (not streamed: held as before),
-// ORDER BY and OFFSET (held), NULLs, and errors in the first part and
+// ORDER BY (top-N with LIMIT, NULLS FIRST/LAST, DESC, a collation), OFFSET,
+// INTERSECT ALL and EXCEPT ALL with counts on both sides, NULLs, and errors in the first part and
 // after the first part has given rows. A CTE runs once in the statement
 // through a sink as held: its rows shared by the parts (a volatile one's
 // too), and nested parts read it from the same run.
-// expect: union all through a sink: 51 queries, 51 the same as held
+// expect: union all through a sink: 192 queries, 192 the same as held
 // expect: errors after rows: first part ERR 22012, second part ERR 22012
 // expect: a CTE once: except none, intersect 1 row, union all the same value twice, nested the same value thrice
-// expect: memory: same same ERR 53200 / ERR 53200
+// expect: a CTE once, sorted and counted: union all the same value twice, except all none, intersect all 1 row, random 1 row, 1 row
+// expect: memory: same same same same same same same ERR 53200 / ERR 53200 / ERR 53200 / ERR 53200 / ERR 53200 / 97|0 / ERR 53200
 
 import "strings"
 import "../../../cmd/lexdb_base"
@@ -116,6 +119,20 @@ fn load(s: mut &lexdb_exec.Session) {
         append(mut &rows2, "(" + i.toStr() + ", " + ((i * 11) % 97).toStr() + ", " + w + ")")
     }
     let d = held(s, &("insert into u values " + strings.join(&rows2, ", ")))
+    // texts under a case-insensitive collation: 'apple', 'Apple', 'APPLE' are alike
+    let k1 = held(s, &"create table k1 (id int primary key, n text collate \"Latin1_General_CI_AS\", m text)")
+    let k2 = held(s, &"create table k2 (id int primary key, n text collate \"Latin1_General_CI_AS\", m text)")
+    let names = ["apple", "Apple", "APPLE", "banana", "Banana", "cherry", "Cherry", "date", "DATE"]
+    var kr1: []str = []
+    var kr2: []str = []
+    for i in 1..61 {
+        let na = if i % 11 == 0 { "null" } else { "'" + names[i % 9] + "'" }
+        let nb = if i % 13 == 0 { "null" } else { "'" + names[(i * 5) % 9] + "'" }
+        append(mut &kr1, "(" + i.toStr() + ", " + na + ", " + na + ")")
+        append(mut &kr2, "(" + i.toStr() + ", " + nb + ", " + nb + ")")
+    }
+    let k3 = held(s, &("insert into k1 values " + strings.join(&kr1, ", ")))
+    let k4 = held(s, &("insert into k2 values " + strings.join(&kr2, ", ")))
     let an = held(s, &"analyze t")
     let an2 = held(s, &"analyze u")
 }
@@ -176,7 +193,152 @@ fn main() {
             "with c as (select id, x from t where id < 50) select id from c union select x from c",
             "with c as (select id from u where id < 20) select id from t where id < 40 except select id from c",
             "with c as (select id from u where id < 20) select id from t where id < 40 intersect select id from c limit 5",
-            "with c as (select id from t where id < 5) select id from c union all select id from c union all select id + 100 from c"
+            "with c as (select id from t where id < 5) select id from c union all select id from c union all select id + 100 from c",
+            // ORDER BY over the parts (a sort fed by them), LIMIT, OFFSET
+            "select id, x from t union all select id, x from u order by x, id",
+            "select id, x from t union all select id, x from u order by x desc, id desc limit 10",
+            "select id, x from t union all select id, x from u order by 2, 1 limit 1023",
+            "select id, x from t union all select id, x from u order by 2, 1 limit 1024",
+            "select id, x from t union all select id, x from u order by 2, 1 limit 1025",
+            "select id, x from t union all select id, x from u order by x limit 7 offset 3",
+            "select id, x from t union all select id, x from u order by x desc limit 5 offset 1020",
+            "select id, x from t union all select id, x from u order by x offset 4090",
+            "select id, x from t union all select id, x from u order by x, id limit 3 offset 9000",
+            "select id, x from t union all select id, x from u order by x, id limit 0",
+            "select id, x from t union all select id, x from u order by x, id limit 1",
+            "select id from t where id <= 1024 union all select id from u where id <= 1024 order by id desc limit 1025 offset 1",
+            "select id from t where id <= 1023 union all select id from u where id <= 1025 order by id limit 2048 offset 1",
+            "select id from t where id between 1000 and 1030 union all select id from u where id between 1000 and 1030 order by id",
+            "select x from t union all select x from u order by x",
+            "select x from t union all select x from u order by 1 desc limit 100",
+            "select x as k, id from t where id < 30 union all select x, id from u where id < 30 order by k desc, id",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w, id",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w desc, id",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w nulls first, id",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w desc nulls last, id desc",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w nulls last, id limit 15 offset 5",
+            "select w, id from u union all select w, id from u order by w desc nulls first, id desc limit 400 offset 200",
+            "select w, id from u where id < 40 union all select w, id from u where id between 20 and 60 order by w, id limit 5",
+            "select w from t where id < 20 union all select w from u where id < 20 order by w",
+            "select id, w from t where id < 30 union all select id, w from u where id < 30 order by 2 desc, 1",
+            "select x, id from t where id < 60 union all select null, id from u where id < 60 order by x nulls first, id",
+            "select x, id from t where id < 60 union all select null, id from u where id < 60 order by x desc nulls last, id limit 25",
+            "select null, id from t where id < 10 union all select x, id from u where id < 10 order by 1 nulls last, 2 desc",
+            "select 1 as a union all select 3 union all select 2 order by a desc",
+            "select 1 as a union all select 3 union all select 2 order by a limit 2 offset 1",
+            "select id, x from t where id < 1500 union all select id, x from u order by id desc, x limit 20",
+            "select id, x from t where id < 50 union all select id, x from u where id < 50 order by id, x desc",
+            "select id, x from t union select id, x from u where id < 900 order by x, id limit 50",
+            "select id, x from t union select id, x from u where id < 900 order by x desc, id desc limit 50 offset 20",
+            "select x from t union select x from u order by x",
+            "select x from t union select x from u order by 1 desc limit 3",
+            "select w from u union select w from t order by w nulls first",
+            "select w from u union select w from t order by w desc nulls last limit 4",
+            "select id from t intersect select id from u where id < 1500 order by id desc limit 7",
+            "select id from t intersect select id from u where id < 1500 order by 1 offset 1495",
+            "select id from t except select id from u where id < 2000 order by id desc limit 40",
+            "select id from t except select id from u where id < 2000 order by id limit 40 offset 590",
+            "select w from u except select w from t order by w",
+            "select x from t union select x from u union select x from t intersect select x from u where id < 50 order by x desc",
+            "(select id from t where id < 10 union all select id from u where id < 10 order by id desc limit 8) union all select id from t where id < 3 order by id limit 9",
+            "(select id from t where id < 10 order by id desc limit 3) union all (select id from u where id < 10 order by id limit 3) order by id",
+            "select id from t where id < 1025 union all select id from u where id < 1025 order by 1 limit 3 offset 2",
+            "select id, x from t where id < 100 union all select id, cast(x as numeric(10,2)) from u where id < 50 order by x, id limit 20",
+            "select id, x from t where id < 200 union all select id, x * 1.5 from u where id < 200 order by 2, 1",
+            "select id, 1/0 from t union all select id, 1 from u where id < 10 order by 1",
+            "select id, 1 from t where id < 10 union all select id, 1/0 from u order by 1",
+            "select id from t where id < 5 union all select id from u where id < 5 order by id offset 3",
+            "select count(*), 1 from t union all select count(*), 2 from u order by 1 desc",
+            "select distinct w from t union all select distinct w from u order by w",
+            "with c as (select id, x from t where id < 50) select id from c union all select x from c order by 1 desc limit 10",
+            "with c as (select id, x from t where id < 50) select id from c union select x from c order by 1",
+            "with c as (select id, x from t where id < 50) select x from c intersect all select x from c order by 1 desc",
+            "with c as (select id from u where id < 20) select id from t where id < 40 except select id from c order by id desc limit 5",
+            "with c as (select id from t where id < 5) select id from c union all select id from c union all select id + 100 from c order by 1 desc offset 2",
+            // texts under a collation: sorted, counted and keyed by it
+            "select n, id from k1 union all select n, id from k2 order by n, id",
+            "select n, id from k1 union all select n, id from k2 order by n desc nulls first, id desc limit 10",
+            "select n, id from k1 union all select n, id from k2 order by n nulls last, id limit 20 offset 30",
+            "select n from k1 union all select n from k2 order by 1 limit 15",
+            "select m, id from k1 union all select m, id from k2 order by m, id",
+            "select m from k1 union all select m from k2 order by m desc nulls last, 1 limit 15",
+            "select n from k1 union select n from k2 order by n",
+            "select n from k1 union select n from k2 order by n desc nulls last limit 3",
+            "select m from k1 union select m from k2 order by m",
+            "select n from k1 intersect select n from k2",
+            "select n from k1 except select n from k2",
+            "select n from k1 intersect all select n from k2",
+            "select n from k1 except all select n from k2",
+            "select n from k2 except all select n from k1 limit 9",
+            "select m from k1 intersect all select m from k2",
+            "select m from k1 except all select m from k2",
+            "select n from k1 intersect all select n from k2 order by n desc nulls first limit 12",
+            "select n, id from k1 except all select n, id from k2 order by n, id",
+            "select n from k1 except all select n from k2 order by n nulls first offset 5",
+            "select n from k1 union all select n from k2 intersect all select n from k1 order by 1",
+            // OFFSET without ORDER BY: rows skipped as they come
+            "select id from t union all select id from u offset 1500",
+            "select id from t union all select id from u offset 1024 limit 1024",
+            "select id from t union all select id from u offset 1023 limit 3",
+            "select id from t union all select id from u offset 2600",
+            "select id from t union all select id from u offset 2601 limit 5",
+            "select id from t union all select id from u offset 4100",
+            "select id from t union all select id from u offset 9000",
+            "select id from t union all select id from u limit 4 offset 1",
+            "select id from t union all select id from u limit 0 offset 1",
+            "select x from t union select x from u offset 90",
+            "select x from t union select x from u limit 5 offset 90",
+            "select id from t intersect select id from u offset 1400",
+            "select id from t except select id from u where id < 1000 limit 3 offset 1500",
+            // INTERSECT ALL, EXCEPT ALL: counted keys
+            "select x from t intersect all select x from u",
+            "select x from t except all select x from u",
+            "select x from u intersect all select x from t",
+            "select x from u except all select x from t",
+            "select x from t intersect all select x from u limit 7",
+            "select x from t intersect all select x from u limit 1024",
+            "select x from t except all select x from u limit 1025",
+            "select x from t except all select x from u limit 3 offset 1020",
+            "select x from t intersect all select x from u offset 100 limit 10",
+            "select x from t intersect all select x from u order by x desc limit 12",
+            "select x from t except all select x from u order by x limit 5",
+            "select x from t except all select x from u order by 1 desc offset 1400",
+            "select w from u intersect all select w from u where id % 2 = 0",
+            "select w from u except all select w from u where id % 2 = 0",
+            "select w from u except all select w from u where id < 300",
+            "select w from u intersect all select w from u where id > 1200",
+            "select w from u intersect all select w from u where id > 1200 order by w nulls first limit 40",
+            "select w from u except all select w from t",
+            "select w from u intersect all select w from t",
+            "select id, x from t intersect all select id, x from u",
+            "select id, x from t except all select id, x from u where id < 800",
+            "select id from t where id < 10 intersect all select id from t where id < 10",
+            "select id from t where id < 10 except all select id from t where id < 10",
+            "select x from t where id < 200 except all select x from u where id < 100 union all select x from t where id < 5",
+            "select x from t where id < 200 except all select x from t where id < 100 except all select x from t where id < 50",
+            "select x from t where id < 200 intersect all select x from t where id < 100 intersect all select x from t where id < 150",
+            "select x from t intersect all select x from u intersect select x from t where id < 100",
+            "select x from t where id < 300 except select x from u where id < 100 intersect all select x from u",
+            "select x from t where id < 300 union select x from u where id < 100 except all select x from u where id < 50",
+            "select x from t where id < 100 union all select x from u where id < 100 intersect all select x from t where id < 100",
+            "(select x from t where id < 100 union all select x from u where id < 100) intersect all select x from t where id < 100",
+            "(select x from t where id < 100 union all select x from u where id < 100) except all (select x from t where id < 50 union all select x from t where id < 50)",
+            "select x from t where id < 100 except all (select x from t where id < 50 intersect all select x from u)",
+            "(select 1 union all select 1 union all select 1 union all select 2 union all select null union all select null) intersect all (select 1 union all select 1 union all select null union all select 3)",
+            "(select 1 union all select 1 union all select 1 union all select 2 union all select null union all select null) except all (select 1 union all select 1 union all select null union all select 3)",
+            "(select 1 union all select 1 union all select 1 union all select 2 union all select null union all select null) except all (select 1 union all select null union all select null union all select null)",
+            "(select 1 union all select 1 union all select 2 union all select 2 union all select 2) except all select 2 where false",
+            "(select 1 union all select 1 union all select 2 union all select 2 union all select 2) intersect all select 2 where false",
+            "select 1 where false intersect all select 1",
+            "select 1 where false except all select 1",
+            "(select 2 union all select 1 union all select 2 union all select 1 union all select 2) intersect all (select 2 union all select 2 union all select 1) order by 1",
+            "select id, x from t intersect all select id, x from u order by x desc, id limit 9 offset 2",
+            "select id, 1/0 from t intersect all select id, 1 from u where id < 10",
+            "select id, 1 from t where id < 10 except all select id, 1/0 from u where id < 10",
+            "with c as (select id, x from t where id < 50) select x from c intersect all select x from c",
+            "with c as (select id, x from t where id < 50) select x from c except all select x from c",
+            "with c as (select id, x from t where id < 50) select id from c except all select x from c limit 10",
+            "with c as (select id from u where id < 20) select id % 5 from c intersect all select id % 3 from c"
         ]
         var same = 0
         for sql in shapes {
@@ -201,14 +363,35 @@ fn main() {
                 (if c2 != "" && len(strings.split(&c2, " ")) == 1 { "1 row" } else { "rows: " + c2 }) + ", union all " +
                 (if len(c3) == 2 && c3[0] == c3[1] { "the same value twice" } else { r3.clone() }) + ", nested " +
                 (if len(c4) == 3 && c4[0] == c4[1] && c4[1] == c4[2] { "the same value thrice" } else { r4.clone() }))
+        // ... through a sort and through counted keys: the same value in every part
+        let o1 = sunk(mut &s, "with r as (select nextval('sq') as x) select x from r union all select x from r order by x desc")
+        let o2 = sunk(mut &s, "with r as (select nextval('sq') as x) select x from r except all select x from r")
+        let o3 = sunk(mut &s, "with r as (select nextval('sq') as x) select x from r intersect all select x from r")
+        let o4 = sunk(mut &s, "with r as (select random() as x) select x from r intersect all select x from r order by x")
+        let o5 = sunk(mut &s, "with r as (select random() as x) select x from r except all select x from r union all select x from r order by x")
+        let c5 = strings.split(&o1, " ")
+        println("a CTE once, sorted and counted: union all " + (if len(c5) == 2 && c5[0] == c5[1] { "the same value twice" } else { o1.clone() }) +
+                ", except all " + (if o2 == "" { "none" } else { o2.clone() }) + ", intersect all " +
+                (if o3 != "" && len(strings.split(&o3, " ")) == 1 { "1 row" } else { "rows: " + o3 }) + ", random " +
+                (if o4 != "" && len(strings.split(&o4, " ")) == 1 { "1 row" } else { "rows: " + o4 }) + ", " +
+                (if o5 != "" && len(strings.split(&o5, " ")) == 1 { "1 row" } else { "rows: " + o5 }))
         // the memory limit: the same statement held and through a sink
         let ms = held(mut &s, &"set max_statement_mem = 16")
-        let mh = held(mut &s, &"select id, x from t union select id, x from u")
-        let mk = sunk(mut &s, "select id, x from t union select id, x from u")
-        let mh2 = held(mut &s, &"select id, x from t except select id, x from u")
-        let mk2 = sunk(mut &s, "select id, x from t except select id, x from u")
+        let mems = ["select id, x from t union select id, x from u", "select id, x from t except select id, x from u",
+                    "select id, x from t intersect all select id, x from u", "select id, x from t except all select id, x from u",
+                    "select id, x from t union all select id, x from u order by x, id",
+                    "select id, x from t union all select id, x from u order by x, id limit 1",
+                    "select id, x from t union select id, x from u order by x, id limit 3"]
+        var msame: []str = []
+        var mres: []str = []
+        for m in mems {
+            let a = held(mut &s, m)
+            let b = sunk(mut &s, m)
+            append(mut &msame, if a == b { "same" } else { "DIFFERENT" })
+            append(mut &mres, a)
+        }
         let mr = held(mut &s, &"set max_statement_mem = 0")
-        println("memory: " + (if mh == mk { "same" } else { "DIFFERENT" }) + " " + (if mh2 == mk2 { "same" } else { "DIFFERENT" }) + " " + mh + " / " + mh2)
+        println("memory: " + strings.join(&msame, " ") + " " + strings.join(&mres, " / "))
         return 0
     })
 }
