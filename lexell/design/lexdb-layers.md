@@ -5897,6 +5897,54 @@ The largest ratios left: q19 2.6× (plan: PostgreSQL drives from part by a
 BitmapOr; the parked orHull), q20 2.3×, q11 2.1×, q22 1.9×; the largest
 absolute gaps q21 (+406 ms), q7 (+357), q3 (+304), q15 (+272), q12 (+240).
 
+### 6.3 After the batch and dialect work: the queue (2026-11-20)
+
+Written at main 9cfcbe8e, after design/lexdb-batch-gaps.md (all twelve
+items merged) and design/lexdb-dialect-gaps.md (packages A-E, F1-F2 merged;
+F3 running). The owner is away and asked the coordinator to drive this in
+an order of its choosing, with these rules (owner, 2026-11-20):
+
+- **Optimizer and planner changes: one Opus subagent at a time** ("this is
+  hard stuff"). Mechanical work (the bisect, dialect follow-ups) may use a
+  Sonnet agent alongside it: at most one Opus and one Sonnet at once.
+- **Step 7 (parallel pipelines) is on hold** until the owner is back: take
+  everything as far as it goes sequentially first (par.map is an option to
+  discuss then, not now).
+- Gates as before: the suite; TPC-H once per merge alternated with the
+  previous main (the machine drifts), 22 checksums equal; point selects must
+  not get slower (instructions per statement, A/B, any real increase fixed
+  before merging); every slice reports lexdb_exec's line count.
+
+State at the start (from lexdb-optimizer.md and this note): the cost-based
+planner of lexdb-optimizer.md 18-46 is built and on main (switch, ANALYZE
+and automatic statistics, stat4 samples, per-parameter plans, cost join
+order with SQLite's bounded search to 24 tables, implied equalities, LEFT
+and semi joins by cost, measured read costs, `SET lexdb_planner`); step 4
+is far along (P1-P3 and the batch gaps); TPC-H on 2026-11-18 was level
+with PostgreSQL on one core (geomean 0.98). Not built: bushy joins,
+a row-id-ordered (bitmap-style) index read, predicate pushdown into
+derived tables, outer-to-inner join conversion, unnesting (step 5),
+retiring the row engine, step 7.
+
+The queue, in order:
+
+| # | What | Who | Why now |
+|---|---|---|---|
+| Q1 | Bisect the q1 (+14%) / q21 (+11%) regression between aaadeb1e and 39451078 | Sonnet | every later TPC-H comparison stands on it |
+| Q2 | Virtual columns computed on read (dialect-gaps open decision, section 8 there) | Sonnet | the coordinator's recommendation, taken as the owner did not choose |
+| Q3 | Exec extraction: the planner and cost model into lexdb_plan (2e slice 3d), and the glue the dialect packages added (routines, privileges, doors) out of exec | Opus | the module goal; makes Q4-Q7 easier to do in isolation |
+| Q4 | A row-id-ordered index read for middling selectivities (PostgreSQL's bitmap heap scan): collect the matching primary keys from the index, sort, read the rows in key order; by cost | Opus | q4, q14, q19: the largest plan-shape gap left in TPC-H |
+| Q5 | Rewrites that keep results: predicate pushdown into derived tables and views; outer-to-inner join conversion when WHERE rejects the NULL rows | Opus | app workloads; pairs with batch-gaps item 6 (views in batches) |
+| Q6 | Bushy join search (step 6) | Opus | q21's (supplier, nation) hash |
+| Q7 | Step 5, unnesting for generality: null-aware anti join, mark join; correlated subqueries in batches (batch-gaps section 8 item 4) | Opus | the last per-row machinery |
+| Q8 | Retire the row engine where the pipeline covers everything (step 4's end), behind the OLTP gate | Opus | decision 1 of section 8; before step 7 |
+| -- | Step 7, parallel pipelines | on hold | the owner decides |
+
+Each Opus item starts with a design section of its own (here or in
+lexdb-optimizer.md), then slices, each merged with the gates. A TPC-H run
+against PostgreSQL (one core and four processes, lexdb-benchmarks.md) is
+recorded after Q1 and again after Q4-Q6.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
