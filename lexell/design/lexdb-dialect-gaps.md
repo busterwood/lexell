@@ -636,6 +636,12 @@ one stay refused (428C9, 271, ORA-54013 / 54017), the catalogs are as package C 
   the column reads what it computes from: `lexdb_gen.needDeps` adds the expression's columns to `Level.need` (SELECT's `narrow` and
   `narrowSub`, DELETE's `delNarrow`, the range delete's `slowNeed`); an UPDATE, MERGE or upsert reads whole rows. ON CONFLICT DO
   UPDATE's alias and `excluded` rows get their own (`setQueryGen` over `up.cols`). A select list item that is the column keeps its name.
+  A column alias list (`t AS x(p, q, r)`, PostgreSQL: it renames the first columns, the virtual column too) renames the table's columns
+  before the FROM item is bound; `lexdb_gen.renamedGens` then gives each virtual column's expression the new names and keeps the
+  place each column read has in the table, and `termsOf` / `needDeps` follow that place (a name only where the expression carries
+  none), so the expression reads the table's own columns whatever the query calls them, as PostgreSQL 18 does (`exec_computed`: the
+  select list, WHERE, ORDER BY, joins, `x.*`, a partial list, a swapped or repeated name, a correlated subquery, a CTE's list; T-SQL
+  has the alias list on derived tables only, `tds_computed`).
 - *Write.* `genFill` computes only what a write checks: `Defs.fill` (`lexdb_gen.fillCols`) is the stored and kept columns and a virtual
   one with NOT NULL or read by a CHECK; `Defs.gens` (every generated column) still refuses a value given. An index on a virtual column
   (Oracle, T-SQL; PostgreSQL refuses, 0A000) keeps the computed value: `lexdb_access.ixPart` asks `lexdb_exec.idxVal`, which computes it from the row's
@@ -650,7 +656,7 @@ one stay refused (428C9, 271, ORA-54013 / 54017), the catalogs are as package C 
   statement stores the table's new layout, such a table's rows are written in the tagged form, not the fixed one (the catalog row has no
   layout for the place's new kind yet); the first DDL on it (or a rebuild) repairs that. There is no migration test: no table of
   the old format is made by this tree.
-- *Code.* New code is in `lexdb_gen` (`setQueryGen`, `inTerms`, `typed`, `fillCols`, `needDeps`, `keepKeyed`, `keyOnVirtual`,
+- *Code.* New code is in `lexdb_gen` (`setQueryGen`, `termsOf`, `renamedGens`, `typed`, `fillCols`, `needDeps`, `keepKeyed`, `keyOnVirtual`,
   `indexable`; it now imports `lexdb_catalog`, and `lexdb_plan` imports it) and one line each in `lexdb_bind`, `lexdb_rows`,
   `lexdb_access`, `lexdb_plan`; `lexdb_exec` has the glue: 19,608 lines before, 19,676 after (the Defs, `idxVal`, `virtualsOf`, `buildQuery`'s call, ADD COLUMN,
   CREATE INDEX checks). `Level.gen` and `Names.virt` keep the checks off the path of a table with no virtual column.
@@ -665,8 +671,7 @@ one stay refused (428C9, 271, ORA-54013 / 54017), the catalogs are as package C 
 **Left.** ALTER COLUMN TYPE of a virtual column still rewrites the table where it could not (PostgreSQL 18 does not); `ORDER BY v` on an
 indexed virtual column is a sort (the index serves `WHERE v = x`, not the order: `servesOrder` sees the expression); statistics are
 not gathered for a virtual column (its estimates are the defaults); a table with a virtual column is not copied by COPY's fast path
-(unchanged); a column alias list on a table with virtual columns (`t AS x(a, b)`) renames the columns its expressions read
-(42703 when a virtual column is read); the Oracle answers added (the `r1`
+(unchanged); the Oracle answers added (the `r1`
 lines of `oracle_computed_queries.txt`) are by hand, from the documentation: no Oracle was at hand. The T-SQL ones (the `nd`
 tables of `mssql_computed_queries.txt`) were first written by hand and were regenerated against SQL Server 2022
 (`gen_mssql.py computed`, 2026-11-20): all 121 answers equal the hand-written ones, no difference.
