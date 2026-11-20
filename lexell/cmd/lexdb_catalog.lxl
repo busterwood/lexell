@@ -145,6 +145,7 @@ pub type CatSnap = record {
     pub enums: []EnumType       // enum types (9.90)
     pub procs: []ProcSrc        // stored PL/SQL procedures and functions (O6)
     pub ttypes: []TabType       // T-SQL table types
+    pub routines: []Routine     // stored procedures and functions (package F)
 }
 
 // A stored procedure or function: its owner, kind (PROCEDURE or FUNCTION), name and source (lexdb_plsql keeps them in the
@@ -434,6 +435,9 @@ pub type TabType = record {
     pub body: str               // its column list as CREATE TABLE wrote it
     pub cols: []lexdb_sql.ColDef // body's columns, parsed where the record is read
 }
+
+type Routine = lexdb_sql.Routine
+type RParam = lexdb_sql.RParam
 
 // ---- the catalog tree: keys, encoding, readers, snapshot
 
@@ -1119,6 +1123,58 @@ pub fn allTabTypes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]
     return Ok(out)
 }
 
+pub const RTN_PRE: str = "\x02rtn\x00"
+
+// A routine's catalog key: dialect, name's key and signature (PostgreSQL's identity argument types, so that functions of
+// one name overload; "" for T-SQL's).
+pub fn routineKey(dialect: int, key: &str, sig: &str): str { return RTN_PRE + dialect.toStr() + "\x00" + key + "\x00" + sig }
+
+fn typeStr(t: &TypeName): str { return t.kind.toStr() + "," + t.oid.toStr() + "," + t.prec.toStr() + "," + t.scale.toStr() + "," + t.len.toStr() }
+
+fn strType(s: &str): TypeName {
+    let f = strings.split(s, ",")
+    if len(f) < 5 { return TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0} }
+    return TypeName{kind: lexdb_base.num(&f[0]), oid: lexdb_base.num(&f[1]), prec: lexdb_base.num(&f[2]), scale: lexdb_base.num(&f[3]), len: lexdb_base.num(&f[4])}
+}
+
+pub fn encRoutine(r: &Routine): str {
+    var b = ""
+    addStrs(mut &b, &[r.key.clone(), r.spell.clone(), r.kind.toStr(), r.dialect.toStr(), typeStr(&r.ret), r.retSpell.clone(),
+                      if r.retSet { "1" } else { "0" }, r.lang.clone(), r.body.clone(), r.def.clone(), r.owner.clone(), if r.atomic { "1" } else { "0" }, r.attrs.clone()])
+    binary.addU32LE(mut &b, len(r.params))
+    for p in r.params {
+        addStrs(mut &b, &[p.name.clone(), typeStr(&p.typ), p.spell.clone(), p.mode.clone(), if p.has { "1" } else { "0" }, p.dflt.clone(),
+                          if p.readonly { "1" } else { "0" }])
+    }
+    return b
+}
+
+pub fn decRoutine(v: &str): Routine {
+    let f = strsAt(v, 0)
+    var at = strsLen(&f)
+    let n = binary.readU32LEStr(v, at)
+    at += 4
+    var ps: []RParam = []
+    for i in 0..n {
+        let g = strsAt(v, at)
+        at += strsLen(&g)
+        append(mut &ps, RParam{name: g[0].clone(), typ: strType(&g[1]), spell: g[2].clone(), mode: g[3].clone(), has: g[4] == "1", dflt: g[5].clone(), readonly: g[6] == "1"})
+    }
+    return Routine{key: f[0].clone(), spell: f[1].clone(), kind: lexdb_base.num(&f[2]), dialect: lexdb_base.num(&f[3]), params: ps, ret: strType(&f[4]),
+                   retSpell: f[5].clone(), retSet: f[6] == "1", lang: f[7].clone(), attrs: f[12].clone(), body: f[8].clone(), def: f[9].clone(), owner: f[10].clone(),
+                   atomic: f[11] == "1"}
+}
+
+// The routines of the catalog, in key order.
+pub fn allRoutines(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Routine, lexdb_base.DbErr] {
+    var out: []Routine = []
+    try st.scan(txn, CATALOG, RTN_PRE, &(RTN_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, decRoutine(&en.val))
+        return true
+    })
+    return Ok(out)
+}
+
 pub fn seqRow(k: &str): str { return "\x04" + k }
 
 pub fn encSeq(d: &Seq): str {
@@ -1314,7 +1370,7 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
     })
     var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.sql.path),
                        user: st.memo.get(&userKey(txn.sql.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn), procs: procs,
-                       ttypes: try allTabTypes(st, txn)}
+                       ttypes: try allTabTypes(st, txn), routines: try allRoutines(st, txn)}
     var aclKeys: []str = []
     var aclVals: []str = []
     try catScan(st, txn, &ACL_PRE, &(ACL_PRE + "\xff"), &(ACL_PRE + "r:"), fn(en: &lexdb_store.Entry): bool {

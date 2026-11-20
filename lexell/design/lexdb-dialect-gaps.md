@@ -139,11 +139,11 @@ Queue (pairs that touch different files):
 | Package | Branch | State |
 |---|---|---|
 | A | `worktree-agent-a904a69d9594c5747` | merged (a1aa79e3; TPC-H 0.998 of 6dc5e38f alternated, checksums equal; with the session's SYSTEM_USER memo entry dropped at close); section 5 |
-| B | worktree-agent-a1e05408b04aabd79 | merged (MERGE_B); done 2026-11-20: `a3eacc68` (CREATE OR ALTER VIEW, ALTER VIEW, OR REPLACE in each dialect's rules, the misleading CREATE error), `16e65314` (ALTER DATABASE ... SET, new module lexdb_dbopt), `3faf9a1a` (renames: sp_rename, Oracle RENAME, PostgreSQL views following), and `13dafca3` (ALTER COLUMN type: T-SQL, PostgreSQL, Oracle MODIFY); suite 218 of 218. Tests: exec_ddl (PostgreSQL 18), tds_ddl (SQL Server 2022), tds_ddlgaps (hand: "not supported yet" messages), tns_ddl (Oracle: answers by hand from the documentation, no Oracle at hand). Left: views follow renames by a recorded overlay (Table.rn), so pg_get_viewdef and OBJECT_DEFINITION keep the text as written; a PostgreSQL view on a retyped column is found by the names in its text (it may refuse a column PostgreSQL would allow); a foreign key's column cannot be retyped (0A000, PostgreSQL allows compatible types); retyping a serial or identity column to text; PostgreSQL's re-binding of a CHECK after a type change (42883) is not done (the rows are rechecked); T-SQL nvarchar is not told from varchar (so varchar to nvarchar on an indexed column is not 5074), tinyint is smallint, ALTER COLUMN ... COLLATE, ALTER DATABASE READ_ONLY/SINGLE_USER/OFFLINE and its other forms, `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` does not check ALLOW_SNAPSHOT_ISOLATION (3952), a table named as another table's index (SQL Server allows, lexdb's indexes share the schema's names), CREATE VIEW not first in a batch is not 111; Oracle: from memory ORA-14155 (RENAME without COLUMN), ORA-00905 (ALTER COLUMN), ORA-01439/01440/01441/02296, a `select *` view over a renamed column is not invalidated, CREATE OR REPLACE FORCE VIEW |
+| B | worktree-agent-a1e05408b04aabd79 | merged (fdee644f; TPC-H 0.993 of f07b6e5d alternated, checksums equal); done 2026-11-20: `a3eacc68` (CREATE OR ALTER VIEW, ALTER VIEW, OR REPLACE in each dialect's rules, the misleading CREATE error), `16e65314` (ALTER DATABASE ... SET, new module lexdb_dbopt), `3faf9a1a` (renames: sp_rename, Oracle RENAME, PostgreSQL views following), and `13dafca3` (ALTER COLUMN type: T-SQL, PostgreSQL, Oracle MODIFY); suite 218 of 218. Tests: exec_ddl (PostgreSQL 18), tds_ddl (SQL Server 2022), tds_ddlgaps (hand: "not supported yet" messages), tns_ddl (Oracle: answers by hand from the documentation, no Oracle at hand). Left: views follow renames by a recorded overlay (Table.rn), so pg_get_viewdef and OBJECT_DEFINITION keep the text as written; a PostgreSQL view on a retyped column is found by the names in its text (it may refuse a column PostgreSQL would allow); a foreign key's column cannot be retyped (0A000, PostgreSQL allows compatible types); retyping a serial or identity column to text; PostgreSQL's re-binding of a CHECK after a type change (42883) is not done (the rows are rechecked); T-SQL nvarchar is not told from varchar (so varchar to nvarchar on an indexed column is not 5074), tinyint is smallint, ALTER COLUMN ... COLLATE, ALTER DATABASE READ_ONLY/SINGLE_USER/OFFLINE and its other forms, `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` does not check ALLOW_SNAPSHOT_ISOLATION (3952), a table named as another table's index (SQL Server allows, lexdb's indexes share the schema's names), CREATE VIEW not first in a batch is not 111; Oracle: from memory ORA-14155 (RENAME without COLUMN), ORA-00905 (ALTER COLUMN), ORA-01439/01440/01441/02296, a `select *` view over a renamed column is not invalidated, CREATE OR REPLACE FORCE VIEW |
 | C | | not started |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
 | E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
-| F | | not started |
+| F | `worktree-agent-a5c6d6b7ae9c4bd2c` | merged F1 (e2c93002; TPC-H 1.003 of fdee644f alternated, checksums equal; point selects +0.6% instructions, fixed: see open points); slice F1 done 2026-11-20 (not merged): `8d2ee116` (the routine record, T-SQL procedures, PostgreSQL functions and procedures), `b082a983` (DROP SCHEMA, Describe, Oracle's kind clash, tests), `7908d6e3` (a procedure called by name over TDS), `d4f23aea` (OBJECTPROPERTY, refusals), merge of main `a0607c4a`; suite green on the merged tree; section 7. Later slices: T-SQL functions (scalar, inline table-valued) and `OUTPUT ... INTO @table_variable` (S12), PostgreSQL's set-returning SQL functions and table-reading bodies over columns, GRANT EXECUTE |
 
 ## 5. Package A: what was done
 
@@ -267,3 +267,155 @@ refuse WITH GRANT OPTION, Oracle accepts and ignores it); column privileges, DEN
 permissions are not done; Oracle object privileges other than SELECT/INSERT/UPDATE/DELETE
 (ALTER, INDEX, ...) are still accepted and ignored; the TNS and TDS expectations (error numbers,
 view columns) are from documentation, not run against real servers.
+
+## 7. Package F, slice F1: what was done
+
+**One record for every dialect.** A stored routine is a `lexdb_sql.Routine`
+(name key as tables are keyed, kind procedure or function, dialect, parameters
+with mode, type, as-written spelling and DEFAULT text, return type, language,
+body, the statement's text as the dialect keeps it, owner), kept in the catalog
+tree under `lexdb_catalog.routineKey(dialect, key, signature)` (signature:
+PostgreSQL's identity argument types, so functions overload; none for T-SQL),
+read into `CatSnap.routines`, made, replaced, dropped and found by the new
+core module `lexdb_routine`. The statements are `S_CREATE_ROUTINE`,
+`S_DROP_ROUTINE` and `S_CALL` (numbers 70 to 72: B took 60 and 61); `lexdb_exec`
+holds their hooks and the CALL runner (`createRoutine`, `dropRoutine`,
+`callRoutine`, `Session.routines`), about 250 lines at the end of the file. A
+routine runs only for the dialect that made it: its body is that dialect's
+text, so the PostgreSQL door does not CALL a T-SQL procedure and TDS does not
+EXEC a PostgreSQL one (each says not found, 42883 / 2812); the catalog views
+list each dialect's own. Oracle's PL/SQL units stay `lexdb_plsql`'s (their own
+`ProcSrc` rows).
+
+**SQL Server (TDS), answers from SQL Server 2022 (`tds_proc`, 198 batches;
+`tds_procrpc`, 16 RPC calls through `callProc`).**
+`CREATE [OR ALTER] PROC[EDURE]` and `ALTER PROCEDURE` are read whole by
+`lexdb_tsqlparse.procBatch` before the batch's table variables are rewritten:
+the header (`@p type [= default] [OUT[PUT]] [READONLY]`, optionally in
+parentheses, WITH options, `AS`), then the rest of the batch is the body, read
+as a batch to check it (a syntax error creates nothing: 156/102) and kept as
+text. `OBJECT_DEFINITION` and `sys.sql_modules` give the text as SQL Server
+keeps it: `CREATE OR ALTER` loses its two words and keeps the blanks around
+them (`CREATE   PROCEDURE`), `ALTER` is kept as `CREATE` (checked on the
+container). `EXEC` takes positional and named arguments (119 for a positional
+one after a named), DEFAULT, OUTPUT, `EXEC @rc = p`, `WITH RECOMPILE`, and as
+the first statement of a batch the name alone (`p 1, 2`; a first statement
+that does not parse and is a name, as `selec 1`, is this: 2812). The body runs
+as a batch (`lexdb_tsql.callProc`) with the parameters as its first variables;
+`RETURN expr` gives the return code (and a count of 1, as SQL Server's does;
+the value outside a procedure is 178); `@@NESTLEVEL`, 217 at depth 32 (EXEC
+(string) and sp_executesql count a level too); `ERROR_PROCEDURE()`, `@@PROCID`
+and `OBJECT_NAME(@@PROCID)`; SET NOCOUNT, XACT_ABORT and ROWCOUNT are the
+procedure's own and go back at its end; its #temporary tables and table
+variables are dropped there. Errors as SQL Server gives them: 2714 (an object
+of the name is there, table or procedure), 2812, 201 (a parameter with no
+default not given, checked before an unknown name), 8143, 8144, 8145, 8162,
+8114 (a value that will not convert, not 245), 179 (OUTPUT of a constant), 111
+(CREATE PROCEDURE not first in its batch), 2010 (ALTER of a table), 208
+(ALTER of nothing), 3701 and 3705 (DROP PROCEDURE of nothing, of a table or
+view). An error that ends the *scope* (208, 207: `endsBatch`) ends the
+procedure and the caller goes on (flow `F_SCOPE`); THROW and XACT_ABORT end the
+batch; 208 and 207 for a statement in a TRY block of the same procedure or
+batch are not caught (SQL Server finds them compiling) and no `(0)` count goes
+out for a caught 208, 207 or 2812; 2812 no longer ends the batch. `DROP
+PROCEDURE [IF EXISTS] a, b` (also `PROC`). `sys.procedures`, `sys.objects`
+(type `P`), `sys.parameters`, `sys.sql_modules`, `OBJECT_ID(name, 'P')` (the
+type argument is read now: it was dropped) and `OBJECTPROPERTY(id,
+'IsProcedure')`. An RPC that names a procedure (`callProc`, a driver's
+CallableStatement) is the same EXEC (`lexdb_tds.userProc`): parameters bound by
+name or place to the procedure's own, DEFAULT and left-out ones taking their
+defaults, OUTPUT and input-output parameters returned as the client sent them,
+the return code as RETURNSTATUS.
+
+**PostgreSQL, answers from PostgreSQL 18 (`exec_routine`, 144 queries;
+`wire_routine`; `exec_routine_reopen`).** `CREATE [OR REPLACE] FUNCTION |
+PROCEDURE name(args) ... LANGUAGE sql` with `$$ ... $$` bodies (the lexer
+reads dollar quotes now), quoted bodies, `BEGIN ATOMIC ... END`, `RETURN
+expr`; modes IN, OUT, INOUT (VARIADIC parsed, not run), DEFAULT, overloads by
+argument types, schemas, STRICT and the volatility words kept; typmods of
+arguments and results ignored as PostgreSQL ignores them. A language other than
+sql is `42704 language "plpgsql" does not exist` (lexdb has no PL/pgSQL;
+pg_language lists internal, c and sql); the body's syntax is checked at
+CREATE (not its names: PostgreSQL resolves them there). `CALL name(args)`
+(positional and `name => value`): the arguments run as a SELECT and are
+converted to the parameters' types, the OUT/INOUT values are the result row,
+the body's statements run in the call's transaction or one of their own (all
+or none), `$n` or the parameters' names in the body (a column of a table the
+body reads wins over a parameter of its name, as in PostgreSQL's SQL
+functions); a CALL with OUT is described as columns (NoData for none) for the
+extended protocol. A SQL function in a query is written as its body before the
+query is planned (`lexdb_routine.inlineCalls`, also for Describe): a body that
+is one SELECT of an expression is substituted with the arguments cast to the
+parameter types and the result cast to the return type; a body that reads
+tables becomes a scalar subquery of the statement, for arguments that are
+values (no column, no subquery); STRICT becomes a CASE. `schema.f(args)`
+parses now. `DROP FUNCTION | PROCEDURE | ROUTINE [IF EXISTS]
+name[(types)], ...` (42883; 42725 for an ambiguous name; 42809 for the wrong
+kind, with a list only). `pg_proc` rows (proname, prokind, pronargs,
+pronargdefaults, prorettype with void and record now in `pg_type`,
+proargtypes, proallargtypes, proargmodes, proargnames, prosrc, ...). DROP
+SCHEMA refuses a schema holding routines without CASCADE and drops them with
+it.
+
+**Oracle (`tns_routine`, answers by hand: no Oracle at hand).** CREATE, CREATE
+OR REPLACE and DROP of procedures and functions, CALL, `user_objects` were
+right through the TNS door. One fault, fixed in `lexdb_plsql.createUnit`:
+`CREATE OR REPLACE FUNCTION p` over a procedure `p` replaced it; Oracle's is
+ORA-00955.
+
+**Changed expectations.** `tds_client`'s `selec 1` gave 102; SQL Server gives
+2812 (the name of a procedure; checked on the container), so the test sends
+`select 1 2`. `tds_ddlgaps`'s first two batches pinned CREATE [OR ALTER]
+PROCEDURE as refused (package B's honest error until F); procedures are made
+now. T-SQL functions keep B's messages.
+
+**Left for later slices.** T-SQL user-defined functions (scalar and inline
+table-valued: `CREATE FUNCTION` is B's 0A000 still) and `OUTPUT ... INTO
+@table_variable` (S12); `GRANT EXECUTE` and permission checks for routines
+(any role that can reach the schema runs one; DROP needs the owner or a
+superuser); PostgreSQL: a function whose body writes (`insert ...; select
+...`) or reads tables with a column as its argument, inside a query (0A000
+"cannot be used in a query yet": that wants a per-row call or LATERAL),
+set-returning functions and RETURNS TABLE, `pg_get_functiondef` and
+`pg_get_function_arguments` (`\sf`, `\df+`), `information_schema.routines`, the
+3F000 of a function of a schema that is not there (42883 now), the 22003 of an
+int4 product past its width in a body (lexdb's integers are 64-bit), named
+notation in a function call in a query (`f(a => 1)`; CALL has it), VARIADIC;
+T-SQL: `sp_stored_procedures` and `sp_sproc_columns` (JDBC's getProcedures)
+still answer empty, `WITH EXECUTE AS` and `ENCRYPTION` are accepted and
+ignored, error 266 (transaction count mismatch at a procedure's end) is not
+given, table-valued parameters of a procedure (`READONLY` is read and kept, not
+bound), and an old difference met on the way, not fixed: a conversion error
+(245) ends the batch in SQL Server, lexdb goes on.
+
+**Hand-over.** The inliner is the seam for PostgreSQL's richer functions;
+T-SQL's scalar functions are a different thing: found by
+`Session.routines(RD_TSQL, key)` and run by `lexdb_tsql`, so a call inside a
+query needs a per-row hook in the evaluator that PostgreSQL's substitution does
+not (inline table-valued ones are a substitution as a derived table:
+`lexdb_routine.mapStmt` walks every expression of a statement, `FromItem` is
+where it would go). OUTPUT INTO: `lexdb_tsqlparse` has `TS_INSERTEXEC`,
+`tableVariables` and the `#@name` tables, and `tsqlDml` turns OUTPUT into the
+statement's RETURNING items; `OUTPUT INTO @t` is `INSERT INTO @t` of those rows
+in the same statement. New work goes in `lexdb_routine` (core) and
+`lexdb_tsql`/`lexdb_tsqlparse` (T-SQL), not `lexdb_exec`. Generators:
+`gen_mssql.py proc` (mssql_proc_queries.txt) and `gen_pg.py routine`
+(routine_queries.txt); `tds_procrpc` (run with `LEXDB_MSSQL` it prints the
+oracle's answers), `tns_routine`, `wire_routine` and `exec_routine_reopen`
+are written by hand.
+
+Open point from review (package F1): every statement now checks for PostgreSQL SQL functions to inline
+(`Session.inlineFunctions` reads the shared memo's name list, a lock and a string copy, even when no
+function exists): +0.6% instructions per primary-key point select (20,000 statements, 3.3955 to 3.4157
+billion, repeated). A cheaper gate (a flag or count that needs no copy, kept with the catalog version)
+would remove it. Fixed after review: each session caches the names with lexdb_routine's generation
+(`namesGen`, moved by every `setNames`); a statement compares one integer. Point selects back to
+before F1 (3.3990 / 3.3982 billion against 3.3999 / 3.3983; F1 3.4125 / 3.4134). Test:
+`exec_routine_sessions` (a function made, replaced and dropped in one session seen by another that
+had cached none; it fails with the invalidation removed).
+A second hole, found from a user question about transactions (and in F1 from the start): the shared list
+was built from the building session's transaction, so a function another session made in a transaction still
+open at that moment was left out after it committed (every session then got 42883 until a restart). The list
+must only ever hold more names than some transaction can see, never fewer: a function made before the list
+exists is now kept aside and merged when the list is built (`noteFunction`, `loadNames`). Definitions
+themselves were always transactional (catalog rows; calls resolve through the caller's transaction).

@@ -1,0 +1,121 @@
+// lexdb over TDS: a stored procedure called by its name (an RPC, not sp_executesql: a driver's CallableStatement, ADO.NET's
+// StoredProcedure), through lib/sqlserver's callProc, checked against SQL Server 2022 (run with LEXDB_MSSQL set to its
+// connection string, in a database of its own: the program then prints what the oracle gives): parameters by place and by name,
+// a default left out, DEFAULT, OUTPUT and input-output parameters, the return status, result sets, the procedure's errors, one
+// that is not there (2812), a name with a schema.
+// expect: positional: status 7 sets 1 | s 3 | out  2
+// expect: named: status 7 sets 1 | s 11 | out @c 10
+// expect: named, other order: status 7 sets 1 | s 6 | out @c 2
+// expect: default left out: status 7 sets 1 | s 6 | out @c 2
+// expect: DEFAULT: status 7 sets 1 | s 6 | out  2
+// expect: input-output: status 0 sets 0 |  | out @n 8
+// expect: by place, input-output: status 0 sets 0 |  | out  10
+// expect: missing: error 201
+// expect: too many: error 8144
+// expect: unknown name: error 8145
+// expect: conversion: error 8114
+// expect: not there: error 2812
+// expect: error in the body: error 8134
+// expect: schema: status 0 sets 1 | v 42 | out 
+// expect: bracketed: status 0 sets 1 | v 42 | out 
+// expect: dbo: status 0 sets 0 |  | out @n 2
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type V = sqldialect.Value
+
+fn setup(c: mut &sqlserver.Conn) {
+    for sql in ["IF OBJECT_ID('p1') IS NOT NULL DROP PROCEDURE p1", "IF OBJECT_ID('p2') IS NOT NULL DROP PROCEDURE p2",
+                "IF OBJECT_ID('p3') IS NOT NULL DROP PROCEDURE p3", "IF OBJECT_ID('s2.p5') IS NOT NULL DROP PROCEDURE s2.p5",
+                "IF SCHEMA_ID('s2') IS NOT NULL DROP SCHEMA s2",
+                "CREATE PROCEDURE p1 @a int, @b int = 5, @c int OUTPUT AS BEGIN SELECT @a + @b AS s; SET @c = @a * 2; RETURN 7 END",
+                "CREATE PROCEDURE p2 @n int OUTPUT AS SET @n = @n * 2",
+                "CREATE PROCEDURE p3 @a int AS SELECT 1 / @a AS x",
+                "CREATE SCHEMA s2", "CREATE PROCEDURE s2.p5 AS SELECT 42 AS v"] {
+        match c.exec(&sql) {
+            Ok(_) {}
+            Err(e) { println("setup: error " + e.code.toStr() + " " + sql) }
+        }
+    }
+}
+
+fn cells(r: &sqlserver.Rows): str {
+    if r.rowCount() == 0 { return "" }
+    var out: []str = []
+    for j in 0..r.columnCount() { append(mut &out, r.columnName(j).unwrap() + " " + r.value(0, j).unwrap().toStr()) }
+    return strings.join(&out, " ")
+}
+
+fn call(c: mut &sqlserver.Conn, label: str, proc: str, args: &[sqlserver.Arg]) {
+    match c.callProc(&proc, args, &[]) {
+        Ok(x) {
+            let st = match x.returnStatus {
+                Some(n) { n.toStr() }
+                None { "none" }
+            }
+            var first = ""
+            if len(x.sets) > 0 { first = cells(&x.sets[0]) }
+            println(label + ": status " + st + " sets " + len(x.sets).toStr() + " | " + first + " | out " + cells(&x.outputs))
+        }
+        Err(e) { println(label + ": error " + e.code.toStr()) }
+    }
+}
+
+fn run(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            setup(mut &c)
+            call(mut &c, "positional", "p1", &[sqlserver.arg("", V.Int(1)), sqlserver.arg("", V.Int(2)), sqlserver.outArg("", "int")])
+            call(mut &c, "named", "p1", &[sqlserver.arg("@a", V.Int(5)), sqlserver.arg("@b", V.Int(6)), sqlserver.outArg("@c", "int")])
+            call(mut &c, "named, other order", "p1", &[sqlserver.outArg("@c", "int"), sqlserver.arg("@a", V.Int(1))])
+            call(mut &c, "default left out", "p1", &[sqlserver.arg("@a", V.Int(1)), sqlserver.outArg("@c", "int")])
+            call(mut &c, "DEFAULT", "p1", &[sqlserver.arg("", V.Int(1)), sqlserver.defaultArg(""), sqlserver.outArg("", "int")])
+            call(mut &c, "input-output", "p2", &[sqlserver.inOutArg("@n", V.Int(4))])
+            call(mut &c, "by place, input-output", "p2", &[sqlserver.inOutArg("", V.Int(5))])
+            call(mut &c, "missing", "p1", &[sqlserver.arg("@a", V.Int(1))])
+            call(mut &c, "too many", "p1", &[sqlserver.arg("", V.Int(1)), sqlserver.arg("", V.Int(2)), sqlserver.arg("", V.Int(3)), sqlserver.arg("", V.Int(4))])
+            call(mut &c, "unknown name", "p1", &[sqlserver.arg("@a", V.Int(1)), sqlserver.outArg("@c", "int"), sqlserver.arg("@zz", V.Int(1))])
+            call(mut &c, "conversion", "p1", &[sqlserver.arg("@a", V.Text("abc")), sqlserver.outArg("@c", "int")])
+            call(mut &c, "not there", "nothing", &[])
+            call(mut &c, "error in the body", "p3", &[sqlserver.arg("@a", V.Int(0))])
+            call(mut &c, "schema", "s2.p5", &[])
+            call(mut &c, "bracketed", "[s2].[p5]", &[])
+            call(mut &c, "dbo", "dbo.p2", &[sqlserver.inOutArg("@n", V.Int(1))])
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        run(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { run(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(40), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
