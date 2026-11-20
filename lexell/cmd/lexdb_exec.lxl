@@ -424,21 +424,6 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
 }
 
-pub fn hasAgg(x: &Expr): bool {
-    match x {
-        Expr.Call(name, args, _) {
-            if lexdb_bind.isAgg(&name) { return true }
-            for a in args { if hasAgg(&a) { return true } }
-            return false
-        }
-        Expr.Unary(_, a) { return hasAgg(&a) }
-        Expr.Bin(_, a, b) { return hasAgg(&a) || hasAgg(&b) }
-        Expr.IsNull(a, _) { return hasAgg(&a) }
-        Expr.Cast(a, _) { return hasAgg(&a) }
-        else { return false }
-    }
-}
-
 // What an expression is evaluated against: the columns, a row, the values
 // of the query's aggregates for the row's group (an aggregate call is
 // rewritten to its slot, "#agg"; none outside a grouped query) and the
@@ -462,11 +447,6 @@ fn envZone(env: &Env): &lexdb_time.Zone {
     }
 }
 
-fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
-    for i in 0..len(cols) { if cols[i].name == name { return i } }
-    return -1
-}
-
 pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
     match x {
         Expr.Lit(v) { return Ok(v.clone()) }
@@ -477,7 +457,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
         Expr.Col(name, slot) {
             // the slot it was resolved at, when the row is that list's
             // (lexdb_bind.colSlot's rule); else found by name
-            let i = if slot >= 0 && slot < len(env.cols) && env.cols[slot].name == name { slot } else { colIndex(&env.cols, &name) }
+            let i = if slot >= 0 && slot < len(env.cols) && env.cols[slot].name == name { slot } else { lexdb_bind.colIndex(&env.cols, &name) }
             if i < 0 { return Err(e("42703", &("column \"" + name + "\" does not exist"))) }
             if len(env.row) == 0 { return Ok(Val.Null) }
             return Ok(env.row[i].clone())
@@ -1515,7 +1495,7 @@ fn (q: &Query) keyBefore(x: &Expr, k: int): bool { return q.maxLevel(x) < k && !
 // Column name's slot in q's joined row (-1: none).
 fn (q: &Query) slotOf(name: &str): int {
     let i = q.colAt.getOr(name, -1)
-    return if i >= 0 { i } else { colIndex(&q.cols, name) }
+    return if i >= 0 { i } else { lexdb_bind.colIndex(&q.cols, name) }
 }
 
 fn (q: &Query) levelOf(name: &str): int {
@@ -1637,7 +1617,7 @@ fn exprBounds(cs: &[]Expr, target: &Expr, k: int, q: &Query): []Bound {
 fn constVal(x: &Expr, params: &[]Val): Option[Val] {
     var ns: []str = []
     lexdb_sql.colNames(x, mut &ns)
-    if len(ns) > 0 || hasAgg(x) { return None }
+    if len(ns) > 0 || lexdb_bind.hasAgg(x) { return None }
     let noCols: []lexdb_sql.ColDef = []
     let noRow: []Val = []
     let noAggs: []Val = []
@@ -1896,7 +1876,7 @@ fn likeBounds(c: &Expr, col: &str, q: &Query, out: mut &[]Bound) {
                 Expr.Col(x, _) { if x != col { return } }
                 else { return }
             }
-            let ci = colIndex(&q.cols, col)
+            let ci = lexdb_bind.colIndex(&q.cols, col)
             if ci < 0 || q.cols[ci].typ.kind != lexdb_sql.K_TEXT { return }
             match args[1] {
                 Expr.Lit(v) {
@@ -1965,7 +1945,7 @@ fn keyCols(t: &Table, index: int): []int {
 // a = c true), so the results are the same.
 
 fn (q: &Query) colKind(name: &str): int {
-    let i = colIndex(&q.cols, name)
+    let i = lexdb_bind.colIndex(&q.cols, name)
     return if i < 0 { -1 } else { q.cols[i].typ.kind }
 }
 
@@ -2122,8 +2102,8 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
 // a collation), floats (NaN, -0) or others, where a written equality is
 // kept as written.
 fn (q: &Query) plainEqCols(a: &str, b: &str): bool {
-    let i = colIndex(&q.cols, a)
-    let j = colIndex(&q.cols, b)
+    let i = lexdb_bind.colIndex(&q.cols, a)
+    let j = lexdb_bind.colIndex(&q.cols, b)
     if i < 0 || j < 0 { return false }
     let o = q.cols[i].typ.oid
     if o != q.cols[j].typ.oid { return false }
@@ -2664,7 +2644,7 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
 // with it; -1 not known.
 fn (q: &Query) distinctKnown(name: &str, k: int): float {
     let lv = &q.levels[k]
-    let i = colIndex(&q.cols, name) - lv.first
+    let i = lexdb_bind.colIndex(&q.cols, name) - lv.first
     let t = fmax(float(lv.est.rows), 1.0f)
     if len(lv.t.pk) == 1 && lv.t.pk[0] == i { return t }
     for x in 0..len(lv.t.indexes) + 1 {
@@ -2941,7 +2921,7 @@ fn (q: &Query) rightCheaper(ms: &[][]Expr, ps: &[][]Expr, cap: float, ro: &[]boo
     for k in 0..2 {
         for c in ms[k] {
             let mk = q.levelMask(&c)
-            if mk < 0 || hasSubCall(&c) || !immutable(&c) { return false }
+            if mk < 0 || hasSubCall(&c) || !lexdb_bind.immutable(&c) { return false }
             if k == 0 && mk == 1 {
                 append(mut &ownA, lexdb_sql.cloneExpr(&c))
                 append(mut &maskA, mk)
@@ -2964,7 +2944,7 @@ fn (q: &Query) rightCheaper(ms: &[][]Expr, ps: &[][]Expr, cap: float, ro: &[]boo
                 }
             }
         }
-        for c in ps[k] { if q.levelMask(&c) < 0 || hasSubCall(&c) || !immutable(&c) { return false } }
+        for c in ps[k] { if q.levelMask(&c) < 0 || hasSubCall(&c) || !lexdb_bind.immutable(&c) { return false } }
     }
     if !eq { return false }
     var g = false
@@ -3160,7 +3140,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
 // aggregate, DISTINCT, a window (optimizer 33).
 fn stmtGathers(s: &lexdb_sql.Stmt): bool {
     if len(s.group) > 0 || len(s.gsets) > 0 || s.having.isSome() || s.distinct || len(s.distinctOn) > 0 || len(s.wins) > 0 { return true }
-    for it in s.items { match it.expr { Some(x) { if hasAgg(&x) { return true } } None {} } }
+    for it in s.items { match it.expr { Some(x) { if lexdb_bind.hasAgg(&x) { return true } } None {} } }
     return false
 }
 
@@ -3914,7 +3894,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 for r in sc.rn {
                     let rp = strings.split(&r, lexdb_catalog.RN_SEP)
                     if len(rp) != 4 || rp[0] != "c" || rp[1] != t.name { continue }
-                    let ci = colIndex(&t.cols, &rp[2].toStr())
+                    let ci = lexdb_bind.colIndex(&t.cols, &rp[2].toStr())
                     if ci >= 0 {
                         let tw = t.unshare()
                         tw.cols[ci].name = rp[3].toStr()
@@ -4014,7 +3994,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             }
             // the subqueries see the same
             for i in 0..len(sc.names.frames[me].cols) {
-                let ci = colIndex(&q.cols, &sc.names.frames[me].cols[i].name)
+                let ci = lexdb_bind.colIndex(&q.cols, &sc.names.frames[me].cols[i].name)
                 if ci >= 0 { sc.names.frames[me].cols[i].using = q.cols[ci].using.clone() }
             }
         }
@@ -4210,7 +4190,7 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
             // ("b.y is null") would lose that row's match. Not a
             // volatile OR: its copy would draw again (random()).
             let om = q.levelMask(&c)
-            if lastRight < 0 && matchesOr(&c) && (om & (om - 1)) != 0 && !hasSubCall(&c) && immutable(&c) {
+            if lastRight < 0 && matchesOr(&c) && (om & (om - 1)) != 0 && !hasSubCall(&c) && lexdb_bind.immutable(&c) {
                 for lev in 0..nl {
                     if (om & (1 << lev)) == 0 || isOuter(q.levels[lev].join) { continue }
                     let got = orLevels(&c, lev, q)
@@ -4395,11 +4375,11 @@ fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs
                             let ka = keyedCol(&a)
                             let kb = keyedCol(&b)
                             if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
-                                append(mut &hcols, colIndex(&q.cols, &ka.name) - q.levels[k].first)
+                                append(mut &hcols, lexdb_bind.colIndex(&q.cols, &ka.name) - q.levels[k].first)
                                 append(mut &hvals, lexdb_sql.cloneExpr(&b))
                                 append(mut &hkinds, ka.kind)
                             } else if len(kb.name) > 0 && q.levelOf(&kb.name) == k && q.valBefore(&a, k) {
-                                append(mut &hcols, colIndex(&q.cols, &kb.name) - q.levels[k].first)
+                                append(mut &hcols, lexdb_bind.colIndex(&q.cols, &kb.name) - q.levels[k].first)
                                 append(mut &hvals, lexdb_sql.cloneExpr(&a))
                                 append(mut &hkinds, kb.kind)
                             }
@@ -5434,7 +5414,7 @@ type HashKeys = record {
 fn outerOnly(x: &Expr, base: int): bool {
     var ns: []str = []
     lexdb_sql.colNames(x, mut &ns)
-    return len(ns) == 0 && usesRefs(x, base) && !hasAgg(x) && !hasSubCall(x)
+    return len(ns) == 0 && usesRefs(x, base) && !lexdb_bind.hasAgg(x) && !hasSubCall(x)
 }
 
 fn hasSubCall(x: &Expr): bool {
@@ -5511,7 +5491,7 @@ fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool,
             // not inner = outer: a filter the once-run subquery cannot keep
             // (the outer value is a parameter now), checked per candidate
             // row of the key's bucket instead
-            if hasAgg(&c) || hasSubCall(&c) { return false }
+            if lexdb_bind.hasAgg(&c) || hasSubCall(&c) { return false }
             append(mut &hk.res, lexdb_sql.cloneExpr(&c))
             append(mut &hk.texts, lexdb_sql.exprText(&c))
         }
@@ -5811,16 +5791,16 @@ fn semiAltOk(alt: &SubPlan, sp: &SubPlan): bool {
     let b = &sp.sel.q
     if len(a.refs) != len(b.refs) || len(a.subs) > 0 || len(b.subs) > 0 { return false }
     for i in 0..len(a.refs) { if lexdb_sql.exprText(&a.refs[i]) != lexdb_sql.exprText(&b.refs[i]) { return false } }
-    for x in alt.sel.exprs { if !immutable(&x) { return false } }
-    for x in alt.keyOuter { if !immutable(&x) { return false } }
+    for x in alt.sel.exprs { if !lexdb_bind.immutable(&x) { return false } }
+    for x in alt.keyOuter { if !lexdb_bind.immutable(&x) { return false } }
     // a residual is checked per outer row (or once per key's summary)
-    for x in alt.res { if !immutable(&x) { return false } }
-    for x in a.top { if !immutable(&x) { return false } }
+    for x in alt.res { if !lexdb_bind.immutable(&x) { return false } }
+    for x in a.top { if !lexdb_bind.immutable(&x) { return false } }
     for lv in a.levels {
         if lv.virt() { return false }
-        for x in lv.cond { if !immutable(&x) { return false } }
-        for x in lv.post { if !immutable(&x) { return false } }
-        for x in lv.local { if !immutable(&x) { return false } }
+        for x in lv.cond { if !lexdb_bind.immutable(&x) { return false } }
+        for x in lv.post { if !lexdb_bind.immutable(&x) { return false } }
+        for x in lv.local { if !lexdb_bind.immutable(&x) { return false } }
     }
     return true
 }
@@ -5989,13 +5969,13 @@ fn semiLookable(q: &Query, i: int): bool {
     for x in p.eqs {
         var ns: []str = []
         lexdb_sql.colNames(&x, mut &ns)
-        if len(ns) > 0 || hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false }
+        if len(ns) > 0 || hasSubCall(&x) || lexdb_bind.hasAgg(&x) || !lexdb_bind.immutable(&x) { return false }
         if usesRefs(&x, q.base) { keyed = true }
     }
     if !keyed { return false }
-    for x in sl.cond { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
-    for x in sl.local { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
-    for x in sq.top { if hasSubCall(&x) || hasAgg(&x) || !immutable(&x) { return false } }
+    for x in sl.cond { if hasSubCall(&x) || lexdb_bind.hasAgg(&x) || !lexdb_bind.immutable(&x) { return false } }
+    for x in sl.local { if hasSubCall(&x) || lexdb_bind.hasAgg(&x) || !lexdb_bind.immutable(&x) { return false } }
+    for x in sq.top { if hasSubCall(&x) || lexdb_bind.hasAgg(&x) || !lexdb_bind.immutable(&x) { return false } }
     // Nothing of it may use q's own outer values (q a subquery, the
     // EXISTS's outer value one of the query around q): q's level would
     // carry a condition on them, which q's own unnesting (hashSub) could
@@ -6050,7 +6030,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
         for x in sq.top { append(mut &xs, lexdb_sql.cloneExpr(&x)) }
         for x in xs {
             var rc = lexdb_sql.cloneExpr(&x)
-            for j in 0..len(from) { rc = renameCol(&rc, &from[j], &to[j], first + j) }
+            for j in 0..len(from) { rc = lexdb_bind.renameCol(&rc, &from[j], &to[j], first + j) }
             // (local repeats some of cond: each once)
             let r2 = substRefs(&rc, q.base, &sq.refs)
             let tx = lexdb_sql.exprText(&r2)
@@ -6292,7 +6272,7 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
             var ns: []str = []
             lexdb_sql.colNames(&x, mut &ns)
             for n in move(ns) {
-                let ci = colIndex(&sq.cols, &n)
+                let ci = lexdb_bind.colIndex(&sq.cols, &n)
                 if ci < 0 { continue }
                 var have = false
                 for y in resCols { if y == n { have = true } }
@@ -6326,7 +6306,7 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     var lcond: []Expr = []
     for x in keys.res {
         var rc = lexdb_sql.cloneExpr(&x)
-        for j in 0..len(resFrom) { rc = renameCol(&rc, &resFrom[j], &resTo[j], first + w + j) }
+        for j in 0..len(resFrom) { rc = lexdb_bind.renameCol(&rc, &resFrom[j], &resTo[j], first + w + j) }
         append(mut &lcond, rc)
     }
     // one "inner <> outer" filter: a bucket needs only whether it holds
@@ -6697,7 +6677,7 @@ fn orOf(xs: &[]Expr): Expr {
 fn cannotFail(x: &Expr): bool {
     var ns: []str = []
     lexdb_sql.colNames(x, mut &ns)
-    if len(ns) == 0 { return !hasSubCall(x) && immutable(x) }
+    if len(ns) == 0 { return !hasSubCall(x) && lexdb_bind.immutable(x) }
     match x {
         Expr.Col(_, _) { return true }
         Expr.Unary(op, a) { return op == "not" && cannotFail(&a) }
@@ -6736,7 +6716,7 @@ fn pullCommonOr(x: &Expr): Expr {
     }
     var common: []Expr = []
     for c in parts[0] {
-        if !immutable(&c) || hasSubCall(&c) || !cannotFail(&c) { continue }
+        if !lexdb_bind.immutable(&c) || hasSubCall(&c) || !cannotFail(&c) { continue }
         var all = true
         for j in 1..len(parts) {
             var found = false
@@ -7475,23 +7455,6 @@ fn keyType(t: &Table, index: int, k: int): lexdb_sql.TypeName {
     return boundType(&t.cols[cols[k]].typ)
 }
 
-// Whether an index expression's value depends on the row alone: no
-// function whose value changes (time, random, sequences).
-fn immutable(x: &Expr): bool {
-    match x {
-        Expr.Call(n, args, _) {
-            if !lexdb_bind.immutableName(&n) { return false }
-            for a in args { if !immutable(&a) { return false } }
-            return true
-        }
-        Expr.Unary(_, a) { return immutable(&a) }
-        Expr.Bin(_, a, b) { return immutable(&a) && immutable(&b) }
-        Expr.IsNull(a, _) { return immutable(&a) }
-        Expr.Cast(a, _) { return immutable(&a) }
-        else { return true }
-    }
-}
-
 // The error for row's value in unique index ix that another row holds
 // already (lexdb_access reports the conflict).
 fn uniqueErr(t: &Table, ix: &Index, row: &[]Val): Result[DbErr, DbErr] {
@@ -7577,7 +7540,7 @@ fn genConstraint(t: &Table, c: &lexdb_sql.Constraint, md: int): Result[Unit, DbE
         for n in c.cols { append(mut &names, n.clone()) }
     }
     for n in names {
-        let i = colIndex(&t.cols, &n)
+        let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 || t.cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
         if md == lexdb_sql.MD_TSQL {
             if c.kind == lexdb_sql.C_CHECK || c.kind == lexdb_sql.C_FOREIGN {
@@ -7610,7 +7573,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     var t = lexdb_catalog.emptyTable(&key)
     t.spell = s.spell.clone()
     for c in s.cols {
-        if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", &("column \"" + c.name + "\" specified more than once"))) }
+        if lexdb_bind.colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", &("column \"" + c.name + "\" specified more than once"))) }
         if c.typ.oid == 0 && c.genKind == lexdb_sql.GEN_NONE { return Err(e("42601", "syntax error at or near \"generated\"")) }
         var col = lexdb_sql.colDef(&c.name, c.typ, c.notNull)
         col.identity = c.identity
@@ -7634,7 +7597,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     }
     for i in 0..len(t.cols) { if t.cols[i].genKind != lexdb_sql.GEN_NONE { try genSetup(mut &t, i, s.mdialect) } }
     for p in s.pk {
-        let i = colIndex(&t.cols, &p)
+        let i = lexdb_bind.colIndex(&t.cols, &p)
         if i < 0 { return Err(e("42703", &("column \"" + p + "\" named in key does not exist"))) }
         if s.mdialect == lexdb_sql.MD_PG && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "primary keys on virtual generated columns are not supported")) }
         t.cols[i].notNull = true
@@ -8302,7 +8265,7 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef, se: &Option[SeqEnv]): Result[Val
     var ns: []str = []
     lexdb_sql.colNames(x, mut &ns)
     if len(ns) > 0 { return Err(e("0A000", "cannot use column reference in DEFAULT expression")) }
-    if hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in DEFAULT expressions")) }
+    if lexdb_bind.hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in DEFAULT expressions")) }
     if isVolatile(x) { return Ok(Val.Null) }        // nextval's: per row (defaultsOf)
     let none: []Val = []
     let noCols: []lexdb_sql.ColDef = []
@@ -8312,23 +8275,6 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef, se: &Option[SeqEnv]): Result[Val
 }
 
 // ---- ALTER TABLE (9.34)
-
-// x with column from named to, at slot (-1: not known).
-fn renameCol(x: &Expr, from: &str, to: &str, slot: int): Expr {
-    match x {
-        Expr.Col(n, s) { return if n == from { Expr.Col(to.clone(), slot) } else { Expr.Col(n.clone(), s) } }
-        Expr.Unary(op, a) { return Expr.Unary(op.clone(), renameCol(&a, from, to, slot)) }
-        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), renameCol(&a, from, to, slot), renameCol(&b, from, to, slot)) }
-        Expr.IsNull(a, neg) { return Expr.IsNull(renameCol(&a, from, to, slot), neg) }
-        Expr.Call(f, args, star) {
-            var xs: []Expr = []
-            for a in args { append(mut &xs, renameCol(&a, from, to, slot)) }
-            return Expr.Call(f.clone(), xs, star)
-        }
-        Expr.Cast(a, ty) { return Expr.Cast(renameCol(&a, from, to, slot), ty) }
-        else { return lexdb_sql.cloneExpr(x) }
-    }
-}
 
 // Whether the table has a row (col < 0), or a row whose column col is NULL.
 fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
@@ -8737,7 +8683,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
                 Some(u) { lexdb_sql.cloneExpr(&u) }
                 None { Expr.Col(t.cols[ch.col].name.clone(), -1) }
             }
-            if hasAgg(&x) { return Err(e("42803", "cannot use aggregate function in transform expression")) }
+            if lexdb_bind.hasAgg(&x) { return Err(e("42803", "cannot use aggregate function in transform expression")) }
             append(mut &xs, try lexdb_bind.resolve(&x, &q.cols, len(q.cols), mut &sc.names))
         }
         endScope(mut &sc, mut &q)
@@ -8791,7 +8737,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             var ixn: []str = []
             lexdb_sql.colNames(&ixe, mut &ixn)
             for n in ixn {
-                let ci = colIndex(&t.cols, &n)
+                let ci = lexdb_bind.colIndex(&t.cols, &n)
                 if ci >= 0 && changed[ci] { uses = true }
             }
         }
@@ -8800,7 +8746,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
                 var ns: []str = []
                 lexdb_sql.colNames(&x, mut &ns)
                 for n in ns {
-                    let c = colIndex(&t.cols, &n)
+                    let c = lexdb_bind.colIndex(&t.cols, &n)
                     if c >= 0 && changed[c] { uses = true }
                 }
             }
@@ -9000,18 +8946,18 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for a in s.alters {
             // a computed column is not altered, and a column one reads may not be (its type nor its nullability)
             if a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_NOT_NULL || a.kind == lexdb_sql.A_DROP_NOT_NULL {
-                let gi = colIndex(&t.cols, &a.name)
+                let gi = lexdb_bind.colIndex(&t.cols, &a.name)
                 if gi >= 0 && t.cols[gi].genKind != lexdb_sql.GEN_NONE { return Err(lexdb_gen.computedErr(s.mdialect, &a.name)) }
                 for g in lexdb_gen.readers(&t.cols, &a.name) { return Err(lexdb_gen.usedErr(s.mdialect, "alter", &t.cols[g].name, &a.name, &lexdb_sql.baseName(&t.name))) }
             }
             if a.kind == lexdb_sql.A_DROP_NOT_NULL {
-                let pi = colIndex(&t.cols, &a.name)
+                let pi = lexdb_bind.colIndex(&t.cols, &a.name)
                 if pi >= 0 && t.cols[pi].notNull { for k in t.pk { if k == pi && lexdb_catalog.hasPk(&t) {
                     return Err(e("TS5074", &("The object '" + lexdb_catalog.pkConName(&t) + "' is dependent on column '" + a.name + "'.")))
                 } } }
             }
             if a.kind != lexdb_sql.A_TYPE { continue }
-            let ci = colIndex(&t.cols, &a.name)
+            let ci = lexdb_bind.colIndex(&t.cols, &a.name)
             if ci < 0 { return Err(e("TS4924", &("ALTER TABLE ALTER COLUMN failed because column '" + a.name + "' does not exist in table '" + lexdb_sql.baseName(&t.name) + "'."))) }
             let blocker = try tsqlBlocker(st, txn, &t, ci, &a.col.typ)
             if len(blocker) > 0 { return Err(e("TS5074", &("The object '" + blocker + "' is dependent on column '" + a.name + "'."))) }
@@ -9060,7 +9006,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         } else if a.kind == lexdb_sql.A_SET_SCHEMA {
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
-            if colIndex(&t.cols, &a.col.name) >= 0 {
+            if lexdb_bind.colIndex(&t.cols, &a.col.name) >= 0 {
                 if a.ifFlag {
                     append(mut &skipped, a.col.name.clone())
                     notice(st, txn, &"42701", &("column \"" + a.col.name + "\" of relation \"" + rel + "\" already exists, skipping"), &"")
@@ -9109,7 +9055,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try makeColSeqs(st, txn, mut &t, len(t.cols) - 1, &s.idOpts)
             try ownColSeq(st, txn, &t, len(t.cols) - 1)
         } else if a.kind == lexdb_sql.A_DROP_COL {
-            let i = colIndex(&t.cols, &a.name)
+            let i = lexdb_bind.colIndex(&t.cols, &a.name)
             if i < 0 {
                 if a.ifFlag {
                     notice(st, txn, &"00000", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist, skipping"), &"")
@@ -9134,10 +9080,10 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 append(mut &gone, t.cols[g].name.clone())
             }
             for gn in gone {
-                let gi = colIndex(&t.cols, &gn)
+                let gi = lexdb_bind.colIndex(&t.cols, &gn)
                 if gi >= 0 { try dropColumn(txn, mut &t, gi) }
             }
-            let at = colIndex(&t.cols, &a.name)
+            let at = lexdb_bind.colIndex(&t.cols, &a.name)
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
             try dropColumn(txn, mut &t, at)
@@ -9164,7 +9110,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for ix in t.indexes { try txn.put(lexdb_catalog.CATALOG, &(idxName(&ix.name)), &key) }
             try followApply(st, txn, &follow, &old, &key)
         } else {
-            let i = colIndex(&t.cols, &a.name)
+            let i = lexdb_bind.colIndex(&t.cols, &a.name)
             if i < 0 { return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))) }
             if a.kind == lexdb_sql.A_RENAME_COL {
                 // SQL Server and Oracle refuse to rename a column a generated column reads (and SQL Server a computed one);
@@ -9175,7 +9121,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 t.cols[i].spell = a.col.spell.clone()
                 if a.to == a.name && s.mdialect == lexdb_sql.MD_TSQL { continue }
-                if colIndex(&t.cols, &a.to) >= 0 {
+                if lexdb_bind.colIndex(&t.cols, &a.to) >= 0 {
                     return Err(e(if s.mdialect == lexdb_sql.MD_ORA { "ORA00957" } else { "42701" },
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
@@ -9184,18 +9130,18 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 for k in 0..len(t.indexes) {
                     var renamed: Option[Expr] = None
                     match t.indexes[k].pred {
-                        Some(x) { renamed = Some(renameCol(&x, &a.name, &a.to, -1)) }
+                        Some(x) { renamed = Some(lexdb_bind.renameCol(&x, &a.name, &a.to, -1)) }
                         None {}
                     }
                     if renamed.isSome() { t.indexes[k].pred = renamed }
                     var rx: []Expr = []
-                    for x in t.indexes[k].exprs { append(mut &rx, renameCol(&x, &a.name, &a.to, -1)) }
+                    for x in t.indexes[k].exprs { append(mut &rx, lexdb_bind.renameCol(&x, &a.name, &a.to, -1)) }
                     t.indexes[k].exprs = rx
                 }
-                for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to, -1) }
+                for k in 0..len(t.checks) { t.checks[k].expr = lexdb_bind.renameCol(&t.checks[k].expr, &a.name, &a.to, -1) }
                 for k in 0..len(t.cols) {
                     match t.cols[k].gen {
-                        Some(gx) { t.cols[k].gen = Some(renameCol(&gx, &a.name, &a.to, -1)) }
+                        Some(gx) { t.cols[k].gen = Some(lexdb_bind.renameCol(&gx, &a.name, &a.to, -1)) }
                         None {}
                     }
                 }
@@ -9295,7 +9241,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var retyped = false
     for j in types {
         let a = &s.alters[j]
-        let i = colIndex(&t.cols, &a.name)
+        let i = lexdb_bind.colIndex(&t.cols, &a.name)
         if i < 0 { return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
         for ch in changes {
             if ch.col == i { return Err(e("42601", &("multiple changes of the type of column \"" + a.name + "\""))) }
@@ -9367,13 +9313,13 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             rw.rekey = true
             rw.sorted = rw.rowid >= 0
             for n in pk.nn {
-                let c = colIndex(&t.cols, &n)
+                let c = lexdb_bind.colIndex(&t.cols, &n)
                 if c >= 0 { append(mut &rw.nn, c) }
             }
         }
     }
     for n in fills {
-        let c = colIndex(&t.cols, &n)
+        let c = lexdb_bind.colIndex(&t.cols, &n)
         if c >= 0 { append(mut &rw.fills, c) }
     }
     if retyped || rw.rekey || len(rw.fills) > 0 {
@@ -9474,7 +9420,7 @@ fn addPrimary(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
         txn.del(lexdb_catalog.CATALOG, &(idxName(&ix.name)))
     } else {
         for n in c.cols {
-            let i = colIndex(&t.cols, &n)
+            let i = lexdb_bind.colIndex(&t.cols, &n)
             if i < 0 { return Err(e("42703", &("column \"" + n + "\" of relation \"" + rel + "\" does not exist"))) }
             for x in cols { if x == i { return Err(e("42701", &("column \"" + n + "\" appears twice in primary key constraint"))) } }
             append(mut &cols, i)
@@ -9912,12 +9858,12 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             var ns: []str = []
             lexdb_sql.colNames(x, mut &ns)
             for cn in ns {
-                let ci = colIndex(&t.cols, &cn)
+                let ci = lexdb_bind.colIndex(&t.cols, &cn)
                 if ci < 0 { return Err(e("42703", &("column \"" + cn + "\" does not exist"))) }
                 if s.mdialect == lexdb_sql.MD_PG && t.cols[ci].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
             }
-            if hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in index expressions")) }
-            if !immutable(x) {
+            if lexdb_bind.hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in index expressions")) }
+            if !lexdb_bind.immutable(x) {
                 if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA01743", "only pure functions can be indexed")) }
                 return Err(e("42P17", "functions in index expression must be marked IMMUTABLE"))
             }
@@ -9926,7 +9872,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             anyExpr = true
             continue
         }
-        let i = colIndex(&t.cols, &n)
+        let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
         if s.mdialect == lexdb_sql.MD_PG && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
         append(mut &cols, i)
@@ -9941,14 +9887,14 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             var ns: []str = []
             lexdb_sql.colNames(&w, mut &ns)
             for n in ns {
-                let wi = colIndex(&t.cols, &n)
+                let wi = lexdb_bind.colIndex(&t.cols, &n)
                 if wi < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
                 if s.mdialect == lexdb_sql.MD_TSQL && t.cols[wi].genKind != lexdb_sql.GEN_NONE {
                     return Err(e("TS10609", &("Filtered index '" + ixName + "' cannot be created on table '" + lexdb_sql.baseName(&t.name) + "' because the column '" + n +
                                   "' in the filter expression is a computed column. Rewrite the filter expression so that it does not include this column.")))
                 }
             }
-            if hasAgg(&w) { return Err(e("42803", "aggregate functions are not allowed in index predicates")) }
+            if lexdb_bind.hasAgg(&w) { return Err(e("42803", "aggregate functions are not allowed in index predicates")) }
             if len(s.subs) > 0 { return Err(e("0A000", "cannot use subquery in index predicate")) }
             if s.params > 0 { return Err(e("42P02", "there is no parameter $1")) }
             pred = Some(lexdb_sql.slotted(&w, &t.cols))
@@ -10096,7 +10042,7 @@ fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c, later) }
     var cols: []int = []
     for n in c.cols {
-        let i = colIndex(&t.cols, &n)
+        let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 { return Err(e("42703", &("column \"" + n + "\" named in key does not exist"))) }
         for k in cols { if k == i { return Err(e("42701", &("column \"" + n + "\" appears twice in unique constraint"))) } }
         append(mut &cols, i)
@@ -10125,12 +10071,12 @@ fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c:
     lexdb_sql.colNames(&x, mut &ns)
     var refs: []str = []
     for n in ns {
-        if colIndex(&t.cols, &n) < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
+        if lexdb_bind.colIndex(&t.cols, &n) < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
         var seen = false
         for r in refs { if r == n { seen = true } }
         if !seen { append(mut &refs, n.clone()) }
     }
-    if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in check constraints")) }
+    if lexdb_bind.hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in check constraints")) }
     var name = c.name.clone()
     if len(name) == 0 {
         // a column's is named for it, a table's for its one column, or none
@@ -10297,7 +10243,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         for i in 0..len(t.cols) { if t.cols[i].name != lexdb_catalog.ROWID && !(skipGen && t.cols[i].genKind != lexdb_sql.GEN_NONE) { append(mut &targets, i) } }
     } else {
         for n in s.names {
-            let i = colIndex(&t.cols, &n)
+            let i = lexdb_bind.colIndex(&t.cols, &n)
             if i < 0 { return Err(e("42703", &("column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
             append(mut &targets, i)
         }
@@ -10511,7 +10457,7 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
     if !r.on { return Ok(r) }
     r.outs = try lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &r.exprs)
     for x in r.exprs {
-        if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
+        if lexdb_bind.hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
     }
     return Ok(r)
 }
@@ -10794,7 +10740,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
     if len(s.conflictCols) > 0 {
         var cs: []int = []
         for n in s.conflictCols {
-            let i = colIndex(&t.cols, &n)
+            let i = lexdb_bind.colIndex(&t.cols, &n)
             if i < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
             append(mut &cs, i)
         }
@@ -10821,7 +10767,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
     for c in t.cols { append(mut &up.cols, lexdb_sql.colDef(&(alias + "." + c.name), c.typ, false)) }
     for c in t.cols { append(mut &up.cols, lexdb_sql.colDef(&("excluded." + c.name), c.typ, false)) }
     for set in s.sets {
-        let i = colIndex(&t.cols, &set.col)
+        let i = lexdb_bind.colIndex(&t.cols, &set.col)
         if i < 0 { return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + tname + "\" does not exist"))) }
         if t.cols[i].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&set.expr) {
             return Err(lexdb_base.errDetail("428C9", &("column \"" + t.cols[i].name + "\" can only be updated to DEFAULT"),
@@ -10910,7 +10856,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var targets: []int = []
     var sets: []Expr = []
     for set in s.sets {
-        let i = colIndex(&q.levels[0].t.cols, &set.col)
+        let i = lexdb_bind.colIndex(&q.levels[0].t.cols, &set.col)
         if i < 0 {
             return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + lexdb_sql.baseName(&q.levels[0].t.name) + "\" does not exist")))
         }
@@ -11650,7 +11596,7 @@ fn mergeRetAdd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
 fn oraTarget(x: &Expr, t: &Table, alias: &str): Expr {
     match x {
         Expr.Col(n, _) {
-            if !strings.contains(&n, ".") && colIndex(&t.cols, &n) >= 0 { return Expr.Col(alias + "." + n, -1) }
+            if !strings.contains(&n, ".") && lexdb_bind.colIndex(&t.cols, &n) >= 0 { return Expr.Col(alias + "." + n, -1) }
             return Expr.Col(n.toStr(), -1)
         }
         Expr.Unary(op, a) { return Expr.Unary(op.clone(), oraTarget(&a, t, alias)) }
@@ -11725,7 +11671,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         match c.delWhere { Some(x) { m.delWhere = Some(try lexdb_bind.resolve(&(if ou { oraTarget(&x, &t, &alias) } else { lexdb_sql.cloneExpr(&x) }), &q.cols, len(q.cols), mut &sc.names)) } None {} }
         if c.act == lexdb_sql.MA_UPDATE {
             for set in c.sets {
-                let i = colIndex(&t.cols, &set.col)
+                let i = lexdb_bind.colIndex(&t.cols, &set.col)
                 if i < 0 {
                     return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")))
                 }
@@ -11741,7 +11687,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
                 for i in 0..nt { if t.cols[i].name != lexdb_catalog.ROWID { append(mut &m.targets, i) } }
             } else {
                 for n in c.names {
-                    let i = colIndex(&t.cols, &n)
+                    let i = lexdb_bind.colIndex(&t.cols, &n)
                     if i < 0 { return Err(e("42703", &("column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
                     append(mut &m.targets, i)
                 }
@@ -11764,7 +11710,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
                 for x in c.vals { lexdb_sql.colNames(&x, mut &used) }
                 for n in move(used) {
                     var col = ""
-                    if !strings.contains(&n, ".") { if colIndex(&t.cols, &n) >= 0 { col = n } }
+                    if !strings.contains(&n, ".") { if lexdb_bind.colIndex(&t.cols, &n) >= 0 { col = n } }
                     else if n[0..strings.indexOf(&n, ".", 0)] == alias { col = n[strings.indexOf(&n, ".", 0) + 1..len(n)].toStr() }
                     if len(col) > 0 {
                         return Err(e("ORA38101", &("Invalid column in the INSERT VALUES Clause: \"" + strings.toUpperAscii(&alias) + "\".\"" + strings.toUpperAscii(&col) + "\"")))
@@ -11779,7 +11725,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     if ret.on {
         let items = mergeItems(s, &t, &alias)
         ret.outs = try lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &ret.exprs)
-        for x in ret.exprs { if hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) } }
+        for x in ret.exprs { if lexdb_bind.hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) } }
     }
     // the logical plan (read by nothing yet): the source joined to the target its source
     let lp = lexdb_bind.LPlan.Merge(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
@@ -13074,7 +13020,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             // HAVING drops it, as the select's empty group)
             var fuse = false
             match sel.having {
-                Some(h) { fuse = len(sel.groupBy) > 0 && len(sel.gsets) == 0 && immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
+                Some(h) { fuse = len(sel.groupBy) > 0 && len(sel.gsets) == 0 && lexdb_bind.immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
                 None {}
             }
             let sqe = seqEnv(st, txn)
@@ -13434,13 +13380,13 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                     var rev: []Expr = []
                     for k in 0..len(dirs) { append(mut &rev, pop(mut &aargs)) }
                     while len(rev) > 0 { append(mut &order, pop(mut &rev)) }
-                    for o in order { if hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+                    for o in order { if lexdb_bind.hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
                 }
             }
-            for a in aargs { if hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+            for a in aargs { if lexdb_bind.hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
             for a in aargs { if hasWin(&a) { return Err(e("42803", "aggregate function calls cannot contain window function calls")) } }
             match filter {
-                Some(f) { if hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
+                Some(f) { if lexdb_bind.hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
                 None {}
             }
             let want = if base == "string_agg" || pct { 2 } else { 1 }
@@ -14024,8 +13970,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if s.limit.isSome() && len(s.order) > 0 && len(s.group) == 0 && !s.distinct && len(s.distinctOn) == 0 && len(s.wins) == 0 &&
        s.having.isNone() && len(s.gsets) == 0 {
         var agg = false
-        for it in s.items { match it.expr { Some(x) { if hasAgg(&x) { agg = true } } None {} } }
-        for o in s.order { if hasAgg(&o.expr) { agg = true } }
+        for it in s.items { match it.expr { Some(x) { if lexdb_bind.hasAgg(&x) { agg = true } } None {} } }
+        for o in s.order { if lexdb_bind.hasAgg(&o.expr) { agg = true } }
         if !agg {
             sc.ordLim = limitGuess(&s.limit) + limitGuess(&s.offset)
             for o in s.order { append(mut &sc.ordBy, lexdb_sql.OrderItem{expr: lexdb_sql.cloneExpr(&o.expr), desc: o.desc, nullsFirst: o.nullsFirst}) }
@@ -14052,7 +13998,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var groupKinds: []int = []
     for g in s.group {
         let r = try lexdb_bind.resolveGroup(&g, &q.cols, &outs, &exprs, mut &sc.names)
-        if hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
+        if lexdb_bind.hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
         append(mut &groupKinds, lexdb_bind.exprKind(&r, &q.cols, &sc.names))
         append(mut &groupBy, r)
     }
@@ -14184,8 +14130,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     endScope(sc, mut &q)
     var aggQ = len(groupBy) > 0 || having.isSome() || len(s.gsets) > 0
     if len(s.gsets) > 0 && len(wdefs) > 0 { return Err(e("0A000", "lexdb: window functions with ROLLUP, CUBE or GROUPING SETS are not supported")) }
-    for x in exprs { if hasAgg(&x) { aggQ = true } }
-    for x in order { if hasAgg(&x) { aggQ = true } }
+    for x in exprs { if lexdb_bind.hasAgg(&x) { aggQ = true } }
+    for x in order { if lexdb_bind.hasAgg(&x) { aggQ = true } }
     for d in wdefs { if winHasAgg(&d) { aggQ = true } }
     if aggQ && s.lockMode > 0 { return Err(e("0A000", &(lexdb_sql.lockName(s.lockMode) + " is not allowed with aggregate functions"))) }
     if s.distinct {
@@ -15552,13 +15498,13 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
                     if s.kind == lexdb_sql.S_INSERT {
                         for r in s.rows {
                             for k in 0..len(r) {
-                                let ci = if len(s.names) == 0 { k } else { colIndex(&tb.cols, &s.names[k]) }
+                                let ci = if len(s.names) == 0 { k } else { lexdb_bind.colIndex(&tb.cols, &s.names[k]) }
                                 if ci >= 0 && ci < len(tb.cols) { setParam(&r[k], tb.cols[ci].typ.oid, out) }
                             }
                         }
                     }
                     for si in s.sets {
-                        let ci = colIndex(&tb.cols, &si.col)
+                        let ci = lexdb_bind.colIndex(&tb.cols, &si.col)
                         if ci >= 0 { setParam(&si.expr, tb.cols[ci].typ.oid, out) }
                     }
                 }
@@ -15574,11 +15520,11 @@ fn guessParams(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, out: mut &[]int, path
                     Some(tb) {
                         for c in s.merges {
                             for si in c.sets {
-                                let ci = colIndex(&tb.cols, &si.col)
+                                let ci = lexdb_bind.colIndex(&tb.cols, &si.col)
                                 if ci >= 0 { setParam(&si.expr, tb.cols[ci].typ.oid, out) }
                             }
                             for k in 0..len(c.vals) {
-                                let ci = if len(c.names) == 0 { k } else if k < len(c.names) { colIndex(&tb.cols, &c.names[k]) } else { -1 }
+                                let ci = if len(c.names) == 0 { k } else if k < len(c.names) { lexdb_bind.colIndex(&tb.cols, &c.names[k]) } else { -1 }
                                 if ci >= 0 && ci < len(tb.cols) { setParam(&c.vals[k], tb.cols[ci].typ.oid, out) }
                             }
                         }
@@ -16971,10 +16917,10 @@ fn waitCol(x: &Expr, t: &Table, alias: &str): int {
     match x {
         Expr.Col(n, _) {
             let d = strings.indexOf(&n, ".", 0)
-            if d < 0 { return colIndex(&t.cols, &n) }
+            if d < 0 { return lexdb_bind.colIndex(&t.cols, &n) }
             let q = n[0..d]
             if q != alias && q != lexdb_sql.baseName(&t.name) { return -1 }
-            return colIndex(&t.cols, &n[d + 1..len(n)])
+            return lexdb_bind.colIndex(&t.cols, &n[d + 1..len(n)])
         }
         else { return -1 }
     }
@@ -17026,7 +16972,7 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
     var gathers = len(stmt.group) > 0 || stmt.having.isSome() || stmt.distinct || len(stmt.distinctOn) > 0 || len(stmt.wins) > 0
     for it in stmt.items {
         match it.expr {
-            Some(x) { if hasAgg(&x) { gathers = true } }
+            Some(x) { if lexdb_bind.hasAgg(&x) { gathers = true } }
             None {}
         }
     }
@@ -17062,7 +17008,7 @@ fn waitShape(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexdb_sql
     var eqs: []int = []
     var bound = false
     for c in conj {
-        if hasAgg(&c) { return Err(waitRefused("cannot have aggregates, GROUP BY, DISTINCT or windows")) }
+        if lexdb_bind.hasAgg(&c) { return Err(waitRefused("cannot have aggregates, GROUP BY, DISTINCT or windows")) }
         match c {
             Expr.Bin(op, a, b) {
                 let ca = waitCol(&a, &t, &alias)
@@ -17230,7 +17176,7 @@ fn dropKey(xs: mut &[]str, k: &str) {
 
 fn colsOf(t: &Table, names: &[]str): []int {
     var out: []int = []
-    for n in names { append(mut &out, colIndex(&t.cols, &n)) }
+    for n in names { append(mut &out, lexdb_bind.colIndex(&t.cols, &n)) }
     return out
 }
 
@@ -17789,14 +17735,14 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     }
     var cols: []int = []
     for n in c.cols {
-        let i = colIndex(&t.cols, &n)
+        let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 { return Err(e("42703", &("column \"" + n + "\" referenced in foreign key constraint does not exist"))) }
         for k in cols { if k == i { return Err(e("42701", &("column \"" + n + "\" appears twice in foreign key constraint"))) } }
         append(mut &cols, i)
     }
     var rc: []int = []
     for n in refCols {
-        let i = colIndex(&p.cols, &n)
+        let i = lexdb_bind.colIndex(&p.cols, &n)
         if i < 0 { return Err(e("42703", &("column \"" + n + "\" referenced in foreign key constraint does not exist"))) }
         for k in rc { if k == i { return Err(e("42701", &("column \"" + n + "\" appears twice in foreign key constraint"))) } }
         append(mut &rc, i)
@@ -18477,7 +18423,7 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let found = try findTable(st, txn, &nameOfText(&tc[0..z]))
             if found.isNone() { continue }
             let t = found.unwrap()
-            let ci = colIndex(&t.cols, &strings.toLowerAscii(&(tc[z + 1..len(tc)].toStr())))
+            let ci = lexdb_bind.colIndex(&t.cols, &strings.toLowerAscii(&(tc[z + 1..len(tc)].toStr())))
             if ci < 0 || len(t.cols[ci].seq) == 0 { continue }
             match try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.seqRow(&t.cols[ci].seq))) {
                 Some(v) { st.memo.put(&bindKey(txn.sql.sess, &seqShown(&t.cols[ci].seq)), &(no.toStr() + "\n" + v)) }
@@ -18798,7 +18744,7 @@ fn ownSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: mut &Seq, owned:
         return Ok(Unit{})
     }
     let t = try needTable(st, txn, &owned[0])
-    if colIndex(&t.cols, &owned[1]) < 0 {
+    if lexdb_bind.colIndex(&t.cols, &owned[1]) < 0 {
         return Err(e("42703", &("column \"" + owned[1] + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")))
     }
     if lexdb_sql.schemaOf(&t.name) != lexdb_sql.schemaOf(&d.key) {
@@ -19085,7 +19031,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         match try findTable(st, txn, &s.table) {
             Some(gt) {
                 for n in s.names {
-                    let gi = colIndex(&gt.cols, &n)
+                    let gi = lexdb_bind.colIndex(&gt.cols, &n)
                     if gi >= 0 && gt.cols[gi].genKind != lexdb_sql.GEN_NONE {
                         return Err(lexdb_base.errDetail("42P10", &("column \"" + n + "\" is a generated column"), "Generated columns cannot be used in COPY.", ""))
                     }
@@ -19109,7 +19055,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         for i in 0..len(t.cols) { if t.cols[i].name != lexdb_catalog.ROWID && t.cols[i].genKind == lexdb_sql.GEN_NONE { append(mut &targets, i) } }
     } else {
         for n in s.names {
-            let i = colIndex(&t.cols, &n)
+            let i = lexdb_bind.colIndex(&t.cols, &n)
             if i < 0 { return Err(e("42703", &("column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
             for k in targets { if k == i { return Err(e("42701", &("column \"" + n + "\" specified more than once"))) } }
             append(mut &targets, i)
@@ -19656,7 +19602,7 @@ fn bulkStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     try needRel(st, txn, &(try whoNow(st, txn)), &t.name, &"a", &"table")
     var targets: []int = []
     for n in s.names {
-        let i = colIndex(&t.cols, &n)
+        let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 || t.cols[i].name == lexdb_catalog.ROWID { return Err(e("42703", &("column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
         append(mut &targets, i)
     }
@@ -20083,11 +20029,11 @@ fn hasWinOpt(x: &Option[Expr]): bool {
 // query is then grouped; a window aggregate itself does not make it so).
 fn winHasAgg(d: &lexdb_sql.WinDef): bool {
     match d.call {
-        Expr.Call(_, args, _) { for a in args { if hasAgg(&a) { return true } } }
+        Expr.Call(_, args, _) { for a in args { if lexdb_bind.hasAgg(&a) { return true } } }
         else {}
     }
-    for x in d.part { if hasAgg(&x) { return true } }
-    for o in d.order { if hasAgg(&o.expr) { return true } }
+    for x in d.part { if lexdb_bind.hasAgg(&x) { return true } }
+    for o in d.order { if lexdb_bind.hasAgg(&o.expr) { return true } }
     return false
 }
 
@@ -20842,7 +20788,7 @@ fn afterCols(sel: &Sel, q: &Query): []int {
     for x in sel.order { lexdb_sql.colNames(&x, mut &names) }
     var out: []int = []
     for n in names {
-        let ci = colIndex(&q.cols, &n)
+        let ci = lexdb_bind.colIndex(&q.cols, &n)
         if ci >= 0 { append(mut &out, ci) }
     }
     return out
@@ -22480,10 +22426,10 @@ fn spColumn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     let t = found.unwrap()
     if len(t.view) > 0 { return Ok(None) }
     let from = parts[n - 1].clone()
-    if colIndex(&t.cols, &from) < 0 { return Ok(None) }
+    if lexdb_bind.colIndex(&t.cols, &from) < 0 { return Ok(None) }
     let newName = s.index.clone()
     let to = strings.toLowerAscii(&newName)
-    if colIndex(&t.cols, &to) >= 0 && to != from {
+    if lexdb_bind.colIndex(&t.cols, &to) >= 0 && to != from {
         return Err(tsE(15335, "Error: The new name '" + newName + "' is already in use as a COLUMN name and would cause a duplicate that is not permitted."))
     }
     // a column a CHECK constraint names cannot be renamed: SQL Server binds the constraint's text to it
@@ -23514,7 +23460,7 @@ fn mrStrip(x: &Expr, rw: &MrRw, qual: mut &MrQual): Result[Expr, DbErr] {
                 for s in rw.subsets { if s.name == q { isSub = true } }
                 if !isSub { return Err(rw.badVar(&q, &n)) }
             }
-            if colIndex(&rw.inCols, &c) < 0 { return Err(rw.unknownCol(&c)) }
+            if lexdb_bind.colIndex(&rw.inCols, &c) < 0 { return Err(rw.unknownCol(&c)) }
             if qual.seen && qual.q != q {
                 return Err(mrErr(rw.d, 62508, "illegal use of aggregates or navigation operators in MATCH_RECOGNIZE clause", "42601", 0,
                                  "an argument of a navigation or aggregate names more than one variable"))
@@ -23799,7 +23745,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
     var partCols: []int = []
     var ordCols: []int = []
     for pn in m.part {
-        let at = colIndex(&rw.inCols, &pn)
+        let at = lexdb_bind.colIndex(&rw.inCols, &pn)
         if at < 0 { return Err(unknown(&pn)) }
         append(mut &partCols, at)
         let r = try lexdb_bind.resolve(&Expr.Col(pn.toStr(), -1), &rw.inCols, nIn, mut &sc.names)
@@ -23817,7 +23763,7 @@ fn planMatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &lexdb_sql.Ma
         append(mut &nullsFirst, o.nullsFirst)
         match o.expr {
             Expr.Col(cn, _) {
-                let at = colIndex(&rw.inCols, &cn)
+                let at = lexdb_bind.colIndex(&rw.inCols, &cn)
                 if at >= 0 { append(mut &ordCols, at) }
             }
             else {}
