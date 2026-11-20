@@ -21787,9 +21787,11 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for d in deps { if d == key { return Err(e("42P17", &("infinite recursion detected in rules for relation \"" + base + "\""))) } }
     match old {
         Some(o) {
+            // CREATE OR ALTER (SQL Server) and CREATE OR REPLACE (Oracle) give the view any new
+            // definition; only PostgreSQL's OR REPLACE keeps the old columns
             // OR REPLACE: the old columns kept, in order, with their names and types; new ones after
-            if len(cols) < len(o.cols) { return Err(e("42P16", "cannot drop columns from view")) }
-            for i in 0..len(o.cols) {
+            if s.mdialect == lexdb_sql.MD_PG && len(cols) < len(o.cols) { return Err(e("42P16", "cannot drop columns from view")) }
+            for i in 0..(if s.mdialect == lexdb_sql.MD_PG { len(o.cols) } else { 0 }) {
                 if cols[i].name != o.cols[i].name {
                     return Err(e("42P16", &("cannot change name of view column \"" + o.cols[i].name + "\" to \"" + cols[i].name + "\"")))
                 }
@@ -21819,13 +21821,16 @@ fn viewOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, s: &lex
             None { false }
         }
         if !isView {
-            if s.ifFlag { return Err(e("42809", &("\"" + base + "\" is not a view"))) }
+            if s.ifFlag && s.mdialect == lexdb_sql.MD_TSQL { return Err(e("TS2010", &("Cannot perform alter on '" + base + "' because it is an incompatible object type."))) }
+            if s.ifFlag && s.mdialect == lexdb_sql.MD_PG { return Err(e("42809", &("\"" + base + "\" is not a view"))) }
             return Err(e("42P07", &("relation \"" + base + "\" already exists")))
         }
         if !s.ifFlag { return Err(e("42P07", &("relation \"" + base + "\" already exists"))) }
         try needRelOwner(st, txn, key, &"view")
         return Ok(Some(lexdb_catalog.decView(key, &have.unwrap())))
     }
+    // ALTER VIEW (T-SQL) changes a view that is there
+    if s.alter { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(key) + "\" does not exist"))) }
     try needCreate(st, txn, key)
     return Ok(None)
 }
