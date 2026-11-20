@@ -969,6 +969,13 @@ fn (o: mut &Out) returnStatus(n: int) {
 // output parameters, DONEPROC. handle > 0: sp_prepexec's handle, returned
 // first.
 fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int, handle: int, more: bool) {
+    let none: []str = []
+    c.executeAs(sql, decls, call, first, handle, more, &none, false)
+}
+
+// execute; proc: a procedure called by its name (a value that will not convert to a parameter's type is 8114), sent: the
+// names its output parameters go back under (as the client sent them), by declaration.
+fn (c: mut &Conn) executeAs(sql: &str, decls: &str, call: &tds.RpcCall, first: int, handle: int, more: bool, outAs: &[]str, proc: bool) {
     var f = lexdb_tsql.newFrame()
     var outs: []int = []                        // the frame's indexes of the output parameters
     var outNames: []str = []
@@ -1019,7 +1026,7 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
             append(mut &types, lexdb_catalog.TabType{key: "", spell: "", body: "", cols: []})
             if d.output {
                 append(mut &outs, k)
-                append(mut &outNames, d.name.clone())
+                append(mut &outNames, if j < len(outAs) { outAs[j].clone() } else { d.name.clone() })
             }
             if bad.isSome() { continue }
             if len(d.tableType) > 0 {
@@ -1084,7 +1091,15 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
                 Ok(v) {
                     match lexdb_ops.coerce(v, &list[k].typ) {
                         Ok(x) { f.vals[base + k] = x }
-                        Err(e) { bad = Some(e) }
+                        Err(e) {
+                            if proc {
+                                let at = strings.indexOf(&lexdb_sql.typeText(&list[k].typ), "(", 0)
+                                let tn = if at > 0 { lexdb_sql.typeText(&list[k].typ)[0..at].toStr() } else { lexdb_sql.typeText(&list[k].typ) }
+                                bad = Some(tsErr(8114, &("Error converting data type " + p.column.typeName() + " to " + tn + ".")))
+                            } else {
+                                bad = Some(e)
+                            }
+                        }
                     }
                 }
                 Err(e) { bad = Some(e) }
@@ -1149,6 +1164,7 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
         if len(tvNames) > 0 { runSql = lexdb_tsqlparse.renameVars(sql, &tvNames, &tvTables) }
     }
     var status = 0
+    var rcode = 0
     match bad {
         Some(e) {
             c.o.error(&e)
@@ -1160,11 +1176,19 @@ fn (c: mut &Conn) execute(sql: &str, decls: &str, call: &tds.RpcCall, first: int
             let quiet = c.sess.takeNotices()
             let failed = c.emit(&ev, true)
             if failed { status = c.ts.error }
+            // a procedure called by its name: its return code is the status
+            let rk = f.find("@__rc")
+            if !failed && rk >= 0 {
+                match f.vals[rk] {
+                    Val.Int(n) { rcode = n }
+                    else {}
+                }
+            }
         }
     }
     lexdb_tsql.dropTables(mut &c.sess, mut &c.ts)
     let dropped = c.sess.takeNotices()
-    c.o.returnStatus(status)
+    c.o.returnStatus(if rcode != 0 { rcode } else { status })
     var ordinal = 0
     if handle > 0 {
         c.o.returnValue(0, &call.params[0].name, &lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, &Val.Int(handle))
@@ -1326,11 +1350,65 @@ fn (c: mut &Conn) rpc(d: &str) {
                 }
                 Err(e) { c.procError(&e, more) }
             }
-        } else {
+        } else if !c.userProc(call, more) {
             let name = if len(call.procName) > 0 { call.procName.clone() } else { "procedure " + call.procId.toStr() }
             c.procError(&tsErr(2812, &("Could not find stored procedure '" + name + "'.")), more)
         }
     }
+}
+
+// An RPC that names a procedure of the user's (a driver's CallableStatement, ADO.NET's StoredProcedure): EXEC of it, its parameters
+// bound by name or place to the procedure's own (a DEFAULT one left out), its return code the RETURNSTATUS. false: there is none of
+// the name.
+fn (c: mut &Conn) userProc(call: &tds.RpcCall, more: bool): bool {
+    if len(call.procName) == 0 { return false }
+    var parts: []str = []
+    for x in strings.split(&strings.replaceAll(&strings.replaceAll(&call.procName, "[", ""), "]", ""), ".") { append(mut &parts, strings.toLowerAscii(&x)) }
+    let nm = parts[len(parts) - 1].clone()
+    let sc = if len(parts) >= 2 { parts[len(parts) - 2].clone() } else { "" }
+    let key = if sc == "" || sc == "dbo" { nm.clone() } else { lexdb_sql.qual(&sc, &nm) }
+    var rt: Option[lexdb_sql.Routine] = None
+    match c.sess.routines(lexdb_sql.RD_TSQL, &key) {
+        Ok(found) { for r in found { if r.kind == lexdb_sql.RK_PROC { rt = Some(r.clone()) } } }
+        Err(_) {}
+    }
+    if rt.isNone() { return false }
+    let r = rt.unwrap()
+    let shown = call.procName.clone()
+    var decls: []str = []
+    var args: []str = []
+    var sentNames: []str = []
+    var kept: tds.RpcCall = call.clone()
+    kept.params = []
+    var pos = 0
+    for i in 0..len(call.params) {
+        let p = &call.params[i]
+        var k = pos
+        if len(p.name) > 0 {
+            k = -1
+            for j in 0..len(r.params) { if r.params[j].name == strings.toLowerAscii(&p.name) { k = j } }
+        }
+        pos += 1
+        if k < 0 {
+            c.procError(&tsErr(8145, &(p.name + " is not a parameter for procedure " + lexdb_sql.baseName(&key) + ".")), more)
+            return true
+        }
+        if k >= len(r.params) {
+            c.procError(&tsErr(8144, &("Procedure or function " + lexdb_sql.baseName(&key) + " has too many arguments specified.")), more)
+            return true
+        }
+        if p.byDefault { continue }
+        let pr = &r.params[k]
+        var q = p.clone()
+        q.name = pr.name.clone()
+        append(mut &kept.params, q)
+        append(mut &sentNames, p.name.clone())
+        append(mut &decls, pr.name + " " + pr.spell + (if p.output { " OUTPUT" } else { "" }))
+        append(mut &args, pr.name + " = " + pr.name + (if p.output { " OUTPUT" } else { "" }))
+    }
+    let sql = "DECLARE @__rc int; EXEC @__rc = " + (if len(sc) > 0 && sc != "dbo" { "[" + sc + "]." } else { "" }) + "[" + nm + "] " + strings.join(&args, ", ")
+    c.executeAs(&sql, &strings.join(&decls, ", "), &kept, 0, 0, more, &sentNames, true)
+    return true
 }
 
 // ---- Transaction Manager requests: begin, commit, rollback, save
