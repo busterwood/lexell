@@ -131,7 +131,7 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # and Txn handles only. Only the pipeline and exec import it.
 PLAN = "lexdb_plan"
 PLAN_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_bind", "lexdb_stats", "lexdb_catalog", "lexdb_access", "lexdb_store",
-                   "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match"}
+                   "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match", "lexdb_gen"}
 PLAN_STORE_NAMES = {"Store", "Txn"}
 PLAN_USERS = {"lexdb_pipe", "lexdb_exec"}
 

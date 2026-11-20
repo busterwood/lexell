@@ -22,6 +22,7 @@ import "./lexdb_rows"
 import "./lexdb_agg"
 import "./lexdb_window"
 import "./lexdb_match"
+import "./lexdb_gen"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -760,6 +761,7 @@ pub type Level = record {
     pub src: int                // a subquery in FROM (or a CTE): its number, its rows read from the run; -1 a table
     pub work: int               // a recursive CTE's working table: the CTE's number; -1
     pub lateral: bool           // a subquery in FROM using outer values (LATERAL): run per row
+    pub gen: bool               // its table has a virtual column (lexdb_gen): computed where it is read
     pub need: []bool            // a table's columns the statement uses (the others are read as NULL); [] all (9.31)
     pub lock: int               // SELECT ... FOR UPDATE and the like: its rows locked (lexdb_sql.LOCK_*, 9.86); 0 none
     pub lockWait: int           // lexdb_sql.WAIT_*
@@ -2698,11 +2700,15 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         for pos in 0..len(cols) {
             let ci = cols[pos]
             let ck = if ci >= 0 { lexdb_access.colCollKind(&lv.t.cols[ci]) } else { lexdb_sql.COLL_EXACT }
-            if ci < 0 || ck != lexdb_sql.COLL_EXACT {
+            let virt = lv.gen && ci >= 0 && lv.t.cols[ci].genKind == lexdb_sql.GEN_VIRTUAL
+            if ci < 0 || ck != lexdb_sql.COLL_EXACT || virt {
                 // an expression's (9.89): the conditions on the same
                 // expression; a column under a collation's keys (L2): the
-                // conditions on its key, #ci(col) or #pad(col)
+                // conditions on its key, #ci(col) or #pad(col); a virtual
+                // column (lexdb_gen): on its expression, which is what a
+                // reference to it means in the query
                 let target = if ci < 0 { qualified(&lv.t.indexes[c].exprs[pos], &lv.alias) }
+                             else if virt { lexdb_bind.colAt(&q.cols, lv.first + ci) }
                              else { lexdb_bind.collKeyOf(ck, Expr.Col(lv.alias + "." + lv.t.cols[ci].name, -1)) }
                 var xb = q.onceBounds(exprBounds(cs, &target, k, q), lv.readOnce)
                 var xeq = -1
@@ -2887,7 +2893,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}, cond: [],
-                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, need: [],
+                 post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
                  lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
 }
 
@@ -3058,6 +3064,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             if q.levels[k].virt() { continue }
             var need: []bool = []
             for c in q.levels[k].t.cols { append(mut &need, selNames.has(&c.name)) }
+            if q.levels[k].gen { lexdb_gen.needDeps(&q.levels[k].t.cols, mut &need) }
             q.levels[k].need = need
         }
     }
@@ -4017,6 +4024,7 @@ fn narrowSub(sel: mut &Sel) {
         if sel.q.levels[k].virt() { continue }
         var need: []bool = []
         for c in sel.q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
+        if sel.q.levels[k].gen { lexdb_gen.needDeps(&sel.q.levels[k].t.cols, mut &need) }
         sel.q.levels[k].need = need
     }
 }

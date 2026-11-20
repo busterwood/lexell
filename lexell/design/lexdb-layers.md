@@ -5932,7 +5932,7 @@ The queue, in order:
 | # | What | Who | Why now |
 |---|---|---|---|
 | Q1 | Bisect the q1 (+14%) / q21 (+11%) regression between aaadeb1e and 39451078 | Sonnet | every later TPC-H comparison stands on it |
-| Q2 | Virtual columns computed on read (dialect-gaps open decision, section 8 there) | Sonnet | the coordinator's recommendation, taken as the owner did not choose |
+| Q2 | Virtual columns computed on read (dialect-gaps open decision, section 8 there) | Sonnet | the coordinator's recommendation, taken as the owner did not choose. Built (branch `worktree-agent-a6cb66b9db918f762`, suite 244 of 244): dialect-gaps.md section 8, "Q2" |
 | Q3 | Exec extraction: the planner and cost model into lexdb_plan (2e slice 3d), and the glue the dialect packages added (routines, privileges, doors) out of exec | Opus | the module goal; makes Q4-Q7 easier to do in isolation |
 | Q4 | A row-id-ordered index read for middling selectivities (PostgreSQL's bitmap heap scan): collect the matching primary keys from the index, sort, read the rows in key order; by cost | Opus | q4, q14, q19: the largest plan-shape gap left in TPC-H |
 | Q5 | Rewrites that keep results: predicate pushdown into derived tables and views; outer-to-inner join conversion when WHERE rejects the NULL rows | Opus | app workloads; pairs with batch-gaps item 6 (views in batches) |

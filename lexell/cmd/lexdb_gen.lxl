@@ -2,17 +2,27 @@
 // STORED | VIRTUAL, SQL Server's computed columns (AS expr [PERSISTED]) and Oracle's virtual columns (GENERATED ALWAYS AS (expr)
 // [VIRTUAL], or the short form AS (expr)): a column whose value is an expression of the same row's other columns, computed as the
 // row is written (lexdb_exec.genFill; a row is written by INSERT, UPDATE, COPY, MERGE and the rewrites of ALTER TABLE) and
-// refused as a target of any write. A column's kind says only what each dialect calls it (STORED, PERSISTED / VIRTUAL, not
-// persisted) and which rules it applies; the value is kept in the row either way, so scans, indexes, constraints and the batch
-// pipeline see an ordinary column.
+// refused as a target of any write. A column's kind says what each dialect calls it (STORED, PERSISTED / VIRTUAL, not persisted)
+// and which rules it applies, and where its value is:
+// - stored (GEN_STORED), and virtual ones a key holds (GEN_KEPT): kept in the row, so scans, indexes, constraints and the batch
+//   pipeline see an ordinary column;
+// - virtual (GEN_VIRTUAL): not in the row (its place is lexdb_rows.PK_NONE: nothing is written and ADD COLUMN rewrites nothing),
+//   computed where it is read: the query's binder (lexdb_exec.buildQuery, lexdb_bind.colAt) puts its expression, resolved in
+//   the query's terms, where a reference to it is, so the row path, the batch pipeline, WHERE, ORDER BY, GROUP BY, joins and
+//   RETURNING evaluate it as they evaluate any expression, and an error (a division by zero) comes at the read. A write computes
+//   it only where something checks its value then (NOT NULL, a CHECK) or an index holds it: the index entry is computed at the
+//   write (lexdb_exec.idxVal), and the planner reads the index for the column's expression (lexdb_plan.choosePath). A value
+//   stored in a row by the first version of package C is ignored (the place reads as NULL: a row's layout says so).
 //
 // This module holds what does not need the evaluator: which columns are generated, whether an expression may generate one, the
-// errors of each dialect. It imports the language model, the binder's function classes and the dialects' facts only.
+// expression of a virtual column in a query's terms, the errors of each dialect. It imports the language model, the binder's
+// function classes and the dialects' facts only.
 
 import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_bind"
+import "./lexdb_catalog"
 import "./lexdb_dialect"
 
 type Expr = lexdb_sql.Expr
@@ -32,6 +42,93 @@ pub fn genCols(cols: &[]ColDef): []int {
 pub fn anyGen(cols: &[]ColDef): bool {
     for c in cols { if c.genKind != lexdb_sql.GEN_NONE { return true } }
     return false
+}
+
+// Whether any column is virtual (not in the row).
+pub fn anyVirtual(cols: &[]ColDef): bool {
+    for i in 0..len(cols) { if cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return true } }
+    return false
+}
+
+// The generated columns a write computes (their places): the stored and kept ones, and the virtual ones whose value the write
+// checks: NOT NULL, or read by a CHECK (its CHECKs). The other virtual columns are not computed at a write.
+pub fn fillCols(t: &lexdb_catalog.Table): []int {
+    var out: []int = []
+    for i in 0..len(t.cols) {
+        if t.cols[i].genKind == lexdb_sql.GEN_NONE { continue }
+        if t.cols[i].genKind != lexdb_sql.GEN_VIRTUAL || t.cols[i].notNull { append(mut &out, i); continue }
+        for c in t.checks { if reads(&c.expr, &t.cols[i].name) { append(mut &out, i); break } }
+    }
+    return out
+}
+
+// ---- a virtual column read: its expression in a query's terms
+
+// need (per column: decoded) with the columns a needed virtual column's expression reads added: a scan that reads a virtual
+// column reads what it is computed from.
+pub fn needDeps(cols: &[]ColDef, need: mut &[]bool) {
+    if len(need) != len(cols) { return }
+    for i in 0..len(cols) {
+        if cols[i].genKind != lexdb_sql.GEN_VIRTUAL || !need[i] { continue }
+        match cols[i].gen {
+            Some(x) {
+                var ns: []str = []
+                lexdb_sql.colNames(&x, mut &ns)
+                for n in ns {
+                    let j = lexdb_bind.colIndex(cols, &n)
+                    if j >= 0 { need[j] = true }
+                }
+            }
+            None {}
+        }
+    }
+}
+
+// x with each column's name qualified by alias.
+fn qualify(x: &Expr, alias: &str): Expr {
+    match x {
+        Expr.Col(n, _) { return Expr.Col(alias + "." + n, -1) }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), qualify(&a, alias)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), qualify(&a, alias), qualify(&b, alias)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(qualify(&a, alias), neg) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, qualify(&a, alias)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        Expr.Cast(a, t) { return Expr.Cast(qualify(&a, alias), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// A table column's generation expression x (the table's terms) in the terms of a query's columns qcols, the table being alias in
+// it: names alias.column, the query's slots.
+pub fn inTerms(x: &Expr, alias: &str, qcols: &[]ColDef): Expr {
+    return lexdb_sql.slotted(&qualify(x, alias), qcols)
+}
+
+// Virtual column k of a table (cols: the table's columns), the table being alias in the query whose columns are qcols: its
+// expression resolved in the query's terms and of the column's type (what a reference to it means there; ColDef.gen of the
+// query's column), set in qcols[at].
+pub fn setQueryGen(cols: &[]ColDef, k: int, alias: &str, qcols: mut &[]ColDef, at: int, ns: mut &lexdb_bind.Names): Result[Unit, DbErr] {
+    if cols[k].genKind != lexdb_sql.GEN_VIRTUAL { return Ok(Unit{}) }
+    match cols[k].gen {
+        Some(g) {
+            let r = try lexdb_bind.resolve(&inTerms(&g, alias, qcols), qcols, len(qcols), ns)
+            let have = lexdb_bind.exprOid(&r, qcols, &lexdb_bind.ptypesOf(ns), &ns.ty)
+            ns.virt = true
+            qcols[at].genKind = lexdb_sql.GEN_VIRTUAL
+            qcols[at].gen = Some(typed(r, have, &cols[k].typ))
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// r, an expression whose type is oid have, as a value of column type t: itself where that is the type, else cast to it.
+pub fn typed(r: Expr, have: int, t: &lexdb_sql.TypeName): Expr {
+    if have == t.oid && t.prec == 0 && t.scale == 0 && t.len <= 0 { return r }
+    return Expr.Cast(r, lexdb_sql.TypeName{kind: t.kind, oid: t.oid, prec: t.prec, scale: t.scale, len: t.len})
 }
 
 // Whether x holds a subquery's call.
@@ -246,11 +343,56 @@ pub fn checkWrite(cols: &[]ColDef, i: int, isDef: bool, md: int, insert: bool): 
     return Err(writeErr(md, &cols[i].name, insert))
 }
 
+// The virtual columns the primary key (pk: places) and the foreign keys among cons hold become kept (GEN_KEPT): the row keeps
+// their value.
+pub fn keepKeyed(cols: mut &[]ColDef, pk: &[]int, cons: &[]lexdb_sql.Constraint) {
+    for i in pk { if cols[i].genKind == lexdb_sql.GEN_VIRTUAL { cols[i].genKind = lexdb_sql.GEN_KEPT } }
+    for c in cons {
+        if c.kind != lexdb_sql.C_FOREIGN { continue }
+        for n in c.cols {
+            let i = lexdb_bind.colIndex(cols, &n)
+            if i >= 0 && cols[i].genKind == lexdb_sql.GEN_VIRTUAL { cols[i].genKind = lexdb_sql.GEN_KEPT }
+        }
+    }
+}
+
+// Column i of cols in an index or key, where the dialect refuses it: SQL Server's computed column that is not deterministic
+// (2729). t: the table's base name.
+pub fn indexable(cols: &[]ColDef, i: int, md: int, t: &str): Result[Unit, DbErr] {
+    if md != lexdb_sql.MD_TSQL || !lexdb_sql.isVirtual(&cols[i]) { return Ok(Unit{}) }
+    match cols[i].gen {
+        Some(x) {
+            if !lexdb_bind.immutable(&x) {
+                return Err(err("TS2729", &("Column '" + cols[i].name + "' in table '" + t + "' cannot be used in an index or statistics or as a partition key because it is non-deterministic.")))
+            }
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// Whether constraint c is a primary or foreign key that names a column not in the row (virtual): CREATE TABLE makes the column
+// kept (GEN_KEPT), ALTER TABLE ADD does not.
+pub fn keyOnVirtual(cols: &[]ColDef, c: &lexdb_sql.Constraint): bool {
+    if c.kind != lexdb_sql.C_PRIMARY && c.kind != lexdb_sql.C_FOREIGN { return false }
+    for n in c.cols {
+        let i = lexdb_bind.colIndex(cols, &n)
+        if i >= 0 && cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return true }
+    }
+    return false
+}
+
 // A constraint on a generated column that is not stored, where the dialect refuses it: SQL Server's CHECK and FOREIGN KEY need
 // the computed column persisted (8183); PostgreSQL's virtual columns take no unique nor foreign key.
-pub fn checkConstraint(cols: &[]ColDef, c: &lexdb_sql.Constraint, md: int): Result[Unit, DbErr] {
+pub fn checkConstraint(cols: &[]ColDef, c: &lexdb_sql.Constraint, md: int, tn: &str): Result[Unit, DbErr] {
     if md == lexdb_sql.MD_ORA || !anyGen(cols) { return Ok(Unit{}) }
     var names: []str = []
+    if c.kind == lexdb_sql.C_UNIQUE || c.kind == lexdb_sql.C_PRIMARY {
+        for n in c.cols {
+            let i = lexdb_bind.colIndex(cols, &n)
+            if i >= 0 { try indexable(cols, i, md, tn) }
+        }
+    }
     if c.kind == lexdb_sql.C_CHECK {
         match c.expr { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
     } else {
@@ -258,7 +400,7 @@ pub fn checkConstraint(cols: &[]ColDef, c: &lexdb_sql.Constraint, md: int): Resu
     }
     for n in names {
         let i = lexdb_bind.colIndex(cols, &n)
-        if i < 0 || cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
+        if i < 0 || !lexdb_sql.isVirtual(&cols[i]) { continue }
         if md == lexdb_sql.MD_TSQL {
             if c.kind == lexdb_sql.C_CHECK || c.kind == lexdb_sql.C_FOREIGN {
                 return Err(err("TS8183", "Only UNIQUE or PRIMARY KEY constraints can be created on computed columns, while CHECK, FOREIGN KEY, and NOT NULL constraints require that computed columns be persisted."))

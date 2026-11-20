@@ -94,8 +94,10 @@ pub fn placeKinds(r: &Rows): []byte {
     return out
 }
 
-// The kind of place a column has in the current layout.
+// The kind of place a column has in the current layout: PK_NONE for a virtual column (design/lexdb-dialect-gaps.md, package C:
+// it is computed where it is read, its place holds nothing), as for a dropped one.
 pub fn placeKind(c: &lexdb_sql.ColDef): byte {
+    if c.genKind == lexdb_sql.GEN_VIRTUAL { return PK_NONE }
     let o = c.typ.oid
     var k = PK_TEXT
     if o == lexdb_sql.OID_INT8 { k = PK_INT }
@@ -345,7 +347,9 @@ pub fn kindsFit(r: &Rows, kinds: &[]byte): bool {
     if len(kinds) != r.width { return false }
     var none = 0
     for k in kinds { if k == PK_NONE { none += 1 } }
-    if none != len(kinds) - len(r.cols) { return false }
+    var virt = 0
+    for i in 0..len(r.cols) { if r.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { virt += 1 } }
+    if none != len(kinds) - len(r.cols) + virt { return false }
     for i in 0..len(r.cols) {
         let k = placeKind(&r.cols[i])
         let have = kinds[if len(r.slots) == 0 { i } else { r.slots[i] }]
@@ -567,7 +571,19 @@ pub fn varLen(x: int): int { return if x < 0x80 { 1 } else if x < 0x4000 { 2 } e
 
 // A table's row as stored: its values at their places, NULL at a dropped
 // column's.
-pub fn encodeRowOf(r: &Rows, row: &[]Val): str {
+pub fn encodeRowOf(r: &Rows, row0: &[]Val): str {
+    // a virtual column's value is not kept: NULL at its place
+    var virt = false
+    for i in 0..len(r.cols) { if r.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { virt = true } }
+    if virt {
+        var blank: []Val = []
+        for i in 0..len(row0) { append(mut &blank, if r.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { Val.Null } else { row0[i].clone() }) }
+        return encodeRowOfPlain(r, &blank)
+    }
+    return encodeRowOfPlain(r, row0)
+}
+
+fn encodeRowOfPlain(r: &Rows, row: &[]Val): str {
     if fixedRows {
         // the fixed layout (9.50) when every value fits it
         if len(r.slots) == 0 {
