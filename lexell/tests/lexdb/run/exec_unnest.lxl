@@ -17,6 +17,14 @@
 //   JOIN), NULLs, an empty subquery, a text key, under an aggregate;
 //   those that stay as they were: a key that may fail, LIMIT inside, a
 //   select list's subquery looked up by an index, a grouped query's.
+// - look (5c): x IN (subquery) read per outer row by x where it is the
+//   inner table's primary key or an index's first column (integers, a
+//   text key), uncorrelated and correlated, by cost against the hash (few
+//   outer rows); a numeric x and an expression stay hashed; EXISTS whose
+//   path has a range after its equalities (constants, an outer value: the
+//   row engine's only); EXISTS over two tables, the first looked up, the
+//   second's rows a set run once (integer and text keys; a condition of
+//   the second that may fail, or one on both: stays per row).
 // - EXPLAIN ANALYZE's counts with batches on and off.
 // timeout: 120
 // expect: create table t1 (id int primary key, a int, b text, c int, d numeric) -> CREATE TABLE
@@ -29,11 +37,16 @@
 // expect: create table nn (id int primary key, k int, v int not null, s text not null) -> CREATE TABLE
 // expect: insert into nn select g, g % 20, (g * 3) % 40, 'b' || (g % 20) from generate_series(1, 200) g -> INSERT 0 200
 // expect: create table e (id int primary key, k int, v int, s text) -> CREATE TABLE
+// expect: create table lr (ok int, ln int, v int, primary key (ok, ln)) -> CREATE TABLE
+// expect: insert into lr select g / 6, g % 6, case when g % 7 = 0 then null else g % 9 end from generate_series(0, 239) g where g % 11 <> 3 -> INSERT 0 218
+// expect: create table tx (s text primary key, k int) -> CREATE TABLE
+// expect: insert into tx select 'b' || g, g % 5 from generate_series(0, 40) g where g % 4 <> 1 -> INSERT 0 31
 // expect: analyze -> ANALYZE
 // expect: notin: 27 queries, 27 the same, made yyyyyyyyyyyynynyyyyyynnnyyy, piped yyyyyyyyyyyynynnynyyynnnyyy
 // expect: notin in a transaction: 23 queries, 23 the same, made yyyynyyyyyyyyyyyynnnynn, piped yyyynyyyyyynynyyynnnynn
 // expect: in over an aggregate: 516|21786, the same: true
 // expect: mark: 34 queries, 34 the same, made yyyyyyyyyynyyyyyyyyyynyyyyynnyyyyy, piped yyyyyyyyyynyyyyyyyyynnyyyyynnyyyyy
+// expect: look: 22 queries, 22 the same, made yyyynynnnynyyyynyyynny, piped yyyyyyyyyynyynyyyyynyy
 // expect: counts notin: same: true
 // expect: counts mark or: same: true
 // expect: counts mark select list: same: true
@@ -52,6 +65,15 @@
 // expect: plan mark select list: scan t1: primary key range; mark join t3: hash on (k, v) over rows of subquery 1; mark join t3: hash on (k, v) over rows of subquery 2; order: the scan's; subquery 1 (in): mark join on t3.k = t1.c, run once;   scan t3: full scan; subquery 2 (in): mark join on t3.k = t1.c, run once;   scan t3: full scan
 // expect: plan mark order by: scan t1: primary key range; mark join t3: hash on (k) over rows of subquery 1; order: sort; subquery 1 (exists): mark join on t3.k = t1.c, run once;   scan t3: full scan
 // expect: plan mark key may fail: scan t1: full scan; aggregate; subquery 1 (exists): hashed on t3.k = an outer expression;   scan t3: full scan
+// expect: plan look in: scan t1: primary key range (estimated 19 rows); semi join t3: primary key lookup per row, filter per row read; order: the scan's; subquery 1 (in): semi join, looked up per row by the join
+// expect: plan look in hashed: scan t1: primary key range; semi join t3: primary key lookup per row, filter per row read; order: the scan's; subquery 1 (in): semi join, looked up per row by the join
+// expect: plan look in text: scan t1: primary key range (estimated 7 rows); semi join tx: primary key lookup per row, filter per row read; order: the scan's; subquery 1 (in): semi join, looked up per row by the join
+// expect: plan look in index: scan t1: primary key range (estimated 7 rows); semi join t2: index t2k lookup per row, filter per row read; order: the scan's; subquery 1 (in): semi join, looked up per row by the join
+// expect: plan look in many rows: scan t1: full scan; semi join t3: hash on (id) over rows of subquery 1; aggregate; subquery 1 (in): semi join, run once;   scan t3: full scan
+// expect: plan look range: scan t1: primary key range; semi join lr: primary key range per row, filter per row read; order: the scan's; subquery 1 (exists): semi join, looked up per row by the join
+// expect: plan look range outer: scan t1: primary key range; semi join lr: primary key range per row, filter per row read; order: the scan's; subquery 1 (exists): semi join, looked up per row by the join
+// expect: plan look two tables: scan t1: primary key range; semi join lr: primary key range (estimated 6 rows) per row, filter per row read; order: the scan's; subquery 1 (exists): semi join, looked up per row by the join; subquery 2 (in): run once;   scan nn: full scan
+// expect: plan look two tables text: scan t1: primary key range; semi join t2: index t2k lookup (estimated 23 rows) per row, filter per row read; order: the scan's; subquery 1 (exists): semi join, looked up per row by the join; subquery 2 (in): run once;   scan nn: full scan
 // expect: plan mark grouped: scan t1: full scan; aggregate; order: sort; subquery 1 (exists): hashed on t3.k = t1.c;   scan t3: full scan
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -153,6 +175,11 @@ fn body(st: lexdb_store.Store): int {
     show(mut &s, "create table nn (id int primary key, k int, v int not null, s text not null)")
     show(mut &s, "insert into nn select g, g % 20, (g * 3) % 40, 'b' || (g % 20) from generate_series(1, 200) g")
     show(mut &s, "create table e (id int primary key, k int, v int, s text)")
+    // lr: lines keyed by (order, line), an order's lines 0 to 5; tx: a text key
+    show(mut &s, "create table lr (ok int, ln int, v int, primary key (ok, ln))")
+    show(mut &s, "insert into lr select g / 6, g % 6, case when g % 7 = 0 then null else g % 9 end from generate_series(0, 239) g where g % 11 <> 3")
+    show(mut &s, "create table tx (s text primary key, k int)")
+    show(mut &s, "insert into tx select 'b' || g, g % 5 from generate_series(0, 40) g where g % 4 <> 1")
     show(mut &s, "analyze")
     var g = newGroup(&"notin", &"null-aware")
     let qs = [
@@ -237,6 +264,33 @@ fn body(st: lexdb_store.Store): int {
     ]
     for x in ms { check(mut &s, mut &gm, &x) }
     report(&gm)
+    var gl = newGroup(&"look", &"looked up per row")
+    let ls = [
+        "select id, c from t1 where id < 20 and c in (select id from t3 where t3.v > 20) order by id",
+        "select count(*) from t1 where id < 60 and c in (select id from t3)",
+        "select id, a from t1 where id < 40 and a in (select id from t3 where t3.k = t1.c) order by id",
+        "select id, b from t1 where id < 8 and b in (select s from tx where tx.k > 1) order by id",
+        "select id, b from t1 where id < 50 and b in (select s from tx where tx.k = t1.c % 5) order by id",
+        "select id from t1 where id < 8 and c in (select k from t2 where t2.v > 10) order by id",
+        "select id from t1 where id < 40 and d in (select id from t3) order by id",
+        "select count(*) from t1 where c in (select id from t3 where t3.v > 20)",
+        "select id from t1 where id < 30 and c in (select id from e) order by id",
+        "select id from t1 where id < 30 and c + 1 in (select id from t3 where t3.v is null) order by id",
+        "select id from t1 where id < 30 and c in (select id from t3 where 10 / (t3.v - 8) > 0) order by id",
+        "select id, c from t1 where id < 50 and exists (select 1 from lr where lr.ok = t1.c and lr.ln > 2) order by id",
+        "select id, c from t1 where id < 50 and not exists (select 1 from lr where lr.ok = t1.c and lr.ln >= 4 and lr.v > 3) order by id",
+        "select id, c from t1 where id < 50 and exists (select 1 from lr where lr.ok = t1.c and lr.ln > t1.a % 6) order by id",
+        "select id, c from t1 where id < 50 and exists (select 1 from lr where lr.ok = t1.c and lr.ln between 1 and 3 and lr.v is null) order by id",
+        "select count(*) from t1 where exists (select 1 from lr where lr.ok = t1.c and lr.ln < 2)",
+        "select id, c from t1 where id < 4 and exists (select 1 from lr join nn on nn.k = lr.v where lr.ok = t1.c and nn.v > 10) order by id",
+        "select id, c from t1 where id < 50 and not exists (select 1 from lr join nn on nn.k = lr.v where lr.ok = t1.c and nn.v > 30) order by id",
+        "select id from t1 where id < 4 and exists (select 1 from t2 join nn on nn.s = t2.s where t2.k = t1.c and nn.v < 20) order by id",
+        "select id from t1 where id < 30 and exists (select 1 from lr join nn on nn.k = lr.v where lr.ok = t1.c and nn.v / (nn.k - 3) > 1) order by id",
+        "select id from t1 where id < 30 and exists (select 1 from lr join nn on nn.k = lr.v where lr.ok = t1.c and lr.ln + nn.v > 12) order by id",
+        "select id from t1 where id < 30 and exists (select 1 from lr join e on e.k = lr.v where lr.ok = t1.c) order by id",
+    ]
+    for x in ls { check(mut &s, mut &gl, &x) }
+    report(&gl)
     counts(mut &s, &"notin", &"select count(*) from t1 where a not in (select v from t3 where t3.k = t1.c)")
     counts(mut &s, &"mark or", &"select count(*) from t1 where a = 3 or a in (select v from t3 where t3.k = t1.c)")
     counts(mut &s, &"mark select list", &"select id, exists (select 1 from t3 where t3.k = t1.c) from t1 where id < 100")
@@ -255,6 +309,15 @@ fn body(st: lexdb_store.Store): int {
     explain(mut &s, &"mark select list", &"select id, a in (select v from t3 where t3.k = t1.c), a not in (select v from t3 where t3.k = t1.c) from t1 where id < 200 order by id")
     explain(mut &s, &"mark order by", &"select id from t1 where id < 300 order by exists (select 1 from t3 where t3.k = t1.c and t3.v > 30), id")
     explain(mut &s, &"mark key may fail", &"select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c / (t1.id - 2500))")
+    explain(mut &s, &"look in", &"select id, c from t1 where id < 20 and c in (select id from t3 where t3.v > 20) order by id")
+    explain(mut &s, &"look in hashed", &"select id, a from t1 where id < 40 and a in (select id from t3 where t3.k = t1.c) order by id")
+    explain(mut &s, &"look in text", &"select id, b from t1 where id < 8 and b in (select s from tx where tx.k > 1) order by id")
+    explain(mut &s, &"look in index", &"select id from t1 where id < 8 and c in (select k from t2 where t2.v > 10) order by id")
+    explain(mut &s, &"look in many rows", &"select count(*) from t1 where c in (select id from t3 where t3.v > 20)")
+    explain(mut &s, &"look range", &"select id, c from t1 where id < 50 and exists (select 1 from lr where lr.ok = t1.c and lr.ln > 2) order by id")
+    explain(mut &s, &"look range outer", &"select id, c from t1 where id < 50 and exists (select 1 from lr where lr.ok = t1.c and lr.ln > t1.a % 6) order by id")
+    explain(mut &s, &"look two tables", &"select id, c from t1 where id < 4 and exists (select 1 from lr join nn on nn.k = lr.v where lr.ok = t1.c and nn.v > 10) order by id")
+    explain(mut &s, &"look two tables text", &"select id from t1 where id < 4 and exists (select 1 from t2 join nn on nn.s = t2.s where t2.k = t1.c and nn.v < 20) order by id")
     explain(mut &s, &"mark grouped", &"select c, count(*), exists (select 1 from t3 where t3.k = t1.c) from t1 group by c order by c")
     return 0
 }

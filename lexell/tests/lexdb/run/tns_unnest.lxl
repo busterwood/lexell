@@ -1,0 +1,121 @@
+// lexdb over TNS: subquery unnesting (optimizer 50) through the Oracle door. NOT IN and <> ALL (uncorrelated,
+// correlated, NULLs on both sides, an empty subquery, a text key), EXISTS and IN under OR and in CASE in the select list,
+// NOT (x IN ...), FETCH FIRST, GROUP BY, IN by the inner key, EXISTS over two tables, an error after the NOT IN (ORA-01476).
+// Its answers are SQL's NULL rules as Oracle documents them (no Oracle was at hand; they are the T-SQL door's, checked
+// against SQL Server in tds_unnest, but for the text key, compared case-sensitively here). Each query runs with the new
+// levels and with today's plans (lexdb_plan.setUnnest(0)) in this process: a difference is shown after the answer. The
+// last line: how many queries the pipeline's joins ran with the new levels and with today's plans.
+// expect: setup: 86 statements
+// expect: N = 0
+// expect: ID = 
+// expect: ID = 11;12;13;23;24;26;35;39
+// expect: ID = 5;6;7;8;10;11;12;13;14;15;16;17;19;20;21;22;23;24;25;26;31;32;33;34;39;40
+// expect: ID = 4;5;6;7;8;9;13;14;15;16;17;18;19;24;25;26;27;28;29;34;35;36;37;38;39
+// expect: N = 40
+// expect: ID = 1;2;3;5;6;7;8;10;11;12;14;17;18;19;20;23;24;25;29;30;31;32;35;36;37;38
+// expect: ID = 1;2;3;4;5;6;14;15;16;17;20;23;28;29;30;31;33;37
+// expect: ID,E = 1|1;2|1;3|1;4|1;5|1;6|1;7|1;8|1;9|1;10|1;11|1;12|1;13|0;14|1;15|1;16|1;17|1;18|1;19|1;20|1;21|1;22|1;23|1;24|1;25|1;26|0;27|1;28|1;29|1;30|1;31|1;32|1;33|1;34|1;35|1;36|1;37|1;38|1;39|0;40|1
+// expect: ID,M = 1|1;2|NULL;3|1;4|1;5|1;6|1;7|NULL;8|NULL;9|NULL;10|NULL;11|0;12|0;13|0;14|1;15|1;16|1;17|1;18|NULL;19|NULL;20|1;21|NULL;22|NULL;23|0;24|0;25|NULL;26|0;27|NULL;28|1;29|1;30|1;31|1;32|NULL;33|1;34|NULL;35|0;36|NULL;37|NULL;38|NULL;39|0;40|NULL
+// expect: ID = 40;39;34;33;32
+// expect: C,N = 0|3;1|5;2|5;3|4;4|5;5|4;NULL|3
+// expect: ID = 2;3;4
+// expect: ID = 1;3;4
+// expect: error 1476
+// expect: piped: 14 new, 1 today's
+import "strings"
+import "task"
+import "net"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_pipe"
+
+const SETUP = "create table a (id number primary key, x number, s varchar2(10), c number)\ncreate table b (id number primary key, k number, v number, s varchar2(10))\ncreate table n (id number primary key, k number not null, v number not null)\ncreate table e (id number primary key, k number, v number)\ninsert into a values (1, 1, 'k1', 1)\ninsert into a values (2, 2, 'k2', 2)\ninsert into a values (3, 3, 'k3', 3)\ninsert into a values (4, 4, 'k4', 4)\ninsert into a values (5, 5, 'k0', 5)\ninsert into a values (6, 6, 'k1', 0)\ninsert into a values (7, 0, 'k2', 1)\ninsert into a values (8, 1, 'k3', 2)\ninsert into a values (9, NULL, 'k4', 3)\ninsert into a values (10, 3, 'k0', 4)\ninsert into a values (11, 4, NULL, 5)\ninsert into a values (12, 5, 'k2', 0)\ninsert into a values (13, 6, 'k3', NULL)\ninsert into a values (14, 0, 'k4', 2)\ninsert into a values (15, 1, 'k0', 3)\ninsert into a values (16, 2, 'k1', 4)\ninsert into a values (17, 3, 'k2', 5)\ninsert into a values (18, NULL, 'k3', 0)\ninsert into a values (19, 5, 'k4', 1)\ninsert into a values (20, 6, 'k0', 2)\ninsert into a values (21, 0, 'k1', 3)\ninsert into a values (22, 1, NULL, 4)\ninsert into a values (23, 2, 'k3', 5)\ninsert into a values (24, 3, 'k4', 0)\ninsert into a values (25, 4, 'k0', 1)\ninsert into a values (26, 5, 'k1', NULL)\ninsert into a values (27, NULL, 'k2', 3)\ninsert into a values (28, 0, 'k3', 4)\ninsert into a values (29, 1, 'k4', 5)\ninsert into a values (30, 2, 'k0', 0)\ninsert into a values (31, 3, 'k1', 1)\ninsert into a values (32, 4, 'k2', 2)\ninsert into a values (33, 5, NULL, 3)\ninsert into a values (34, 6, 'k4', 4)\ninsert into a values (35, 0, 'k0', 5)\ninsert into a values (36, NULL, 'k1', 0)\ninsert into a values (37, 2, 'k2', 1)\ninsert into a values (38, 3, 'k3', 2)\ninsert into a values (39, 4, 'k4', NULL)\ninsert into a values (40, 5, 'k0', 4)\ninsert into b values (1, 1, 3, 'K1')\ninsert into b values (2, 2, 6, 'K2')\ninsert into b values (3, 3, 1, 'K3')\ninsert into b values (4, 4, 4, 'K0')\ninsert into b values (5, 5, 7, 'K1')\ninsert into b values (6, 0, 2, 'K2')\ninsert into b values (7, 1, NULL, 'K3')\ninsert into b values (8, 2, 0, 'K0')\ninsert into b values (9, 3, 3, 'K1')\ninsert into b values (10, NULL, 6, 'K2')\ninsert into b values (11, 5, 1, 'K3')\ninsert into b values (12, 0, 4, 'K0')\ninsert into b values (13, 1, 7, 'K1')\ninsert into b values (14, 2, NULL, 'K2')\ninsert into b values (15, 3, 5, 'K3')\ninsert into b values (16, 4, 0, 'K0')\ninsert into b values (17, 5, 3, 'K1')\ninsert into b values (18, 0, 6, 'K2')\ninsert into b values (19, 1, 1, 'K3')\ninsert into b values (20, NULL, 4, 'K0')\ninsert into b values (21, 3, NULL, 'K1')\ninsert into b values (22, 4, 2, 'K2')\ninsert into b values (23, 5, 5, 'K3')\ninsert into b values (24, 0, 0, 'K0')\ninsert into b values (25, 1, 3, 'K1')\ninsert into b values (26, 2, 6, 'K2')\ninsert into b values (27, 3, 1, 'K3')\ninsert into b values (28, 4, NULL, 'K0')\ninsert into b values (29, 5, 7, 'K1')\ninsert into b values (30, NULL, 2, 'K2')\ninsert into n values (1, 1, 1)\ninsert into n values (2, 2, 2)\ninsert into n values (3, 3, 3)\ninsert into n values (4, 4, 4)\ninsert into n values (5, 5, 0)\ninsert into n values (6, 0, 1)\ninsert into n values (7, 1, 2)\ninsert into n values (8, 2, 3)\ninsert into n values (9, 3, 4)\ninsert into n values (10, 4, 0)\ninsert into n values (11, 5, 1)\ninsert into n values (12, 0, 2)"
+const QUERIES = "select count(*) as n from a where x not in (select v from b)\nselect id from a where x not in (select v from b where v is not null) order by id\nselect id from a where x not in (select v from b where b.k = a.c) order by id\nselect id from a where x <> all (select v from n where n.k = a.c) order by id\nselect id from a where s not in (select lower(s) from b where b.k = a.c) order by id\nselect count(*) as n from a where x not in (select v from e)\nselect id from a where x = 3 or exists (select 1 from b where b.k = a.c and b.v > 5) order by id\nselect id from a where x = 2 or x in (select v from b where b.k = a.c) order by id\nselect id, case when exists (select 1 from b where b.k = a.c) then 1 else 0 end as e from a order by id\nselect id, case when x in (select v from b where b.k = a.c) then 1 when x not in (select v from b where b.k = a.c) then 0 end as m from a order by id\nselect id from a where not (x in (select v from n where n.k = a.c)) order by id desc fetch first 5 rows only\nselect c, count(*) as n from a where x not in (select v from n where n.k = a.c) or s = 'k2' group by c order by c\nselect id from a where id < 6 and x in (select id from n where n.v > 1) order by id\nselect id from a where id < 6 and exists (select 1 from b join n on n.k = b.v where b.id = a.c) order by id\nselect id from a where x not in (select v from b where b.k = a.c) and 10 / (id - 40) > -100 order by id"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr()) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            var pipedNew = 0
+            var pipedOld = 0
+            let text: str = QUERIES
+            for q in strings.lines(&text) {
+                lexdb_plan.setUnnest(7)
+                let j0 = lexdb_pipe.joinCounts()[0]
+                let x = qtext(mut &c, &q)
+                let j1 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(0)
+                let y = qtext(mut &c, &q)
+                let j2 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(7)
+                if j1 > j0 { pipedNew += 1 }
+                if j2 > j1 { pipedOld += 1 }
+                println(if x == y { x } else { x + " (today's plan: " + y + ")" })
+            }
+            println("piped: " + pipedNew.toStr() + " new, " + pipedOld.toStr() + " today's")
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(46), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

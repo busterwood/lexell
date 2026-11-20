@@ -3625,6 +3625,8 @@ fn semiAlternatives(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query
             let semi = i < len(hs.semiCand) && hs.semiCand[i]
             if !semi && !(i < len(markCand) && markCand[i]) { continue }
             let sp = &q.subs[i]
+            // (an IN by its value's key: optimizer 50, 5c)
+            if semi && sp.use == lexdb_sql.SUB_IN && sp.cte < 0 && (unnestMode & UN_LOOK) != 0 { looks[i] = true }
             if !((sp.use == lexdb_sql.SUB_EXISTS || sp.use == lexdb_sql.SUB_IN) && len(sp.sel.q.refs) > 0 && !sp.hashed && sp.cte < 0) { continue }
             looks[i] = semi
             sc.noRefKeys = true
@@ -4584,18 +4586,31 @@ fn semiRun(lv: &Level, inner: float): float {
 // outer value; its filters with no subquery and nothing whose value may
 // change between rows (the subquery read them per row too, but a range
 // read once for two outer rows of one key must give both the same rows).
-fn semiLookable(q: &Query, i: int): bool {
+fn semiLookable(q: &Query, i: int): bool { return semiLookableN(q, i, 1, 0) }
+
+// semiLookable over a subquery of nl tables (2: twoKey's), its level at
+// the one looked up.
+fn semiLookableN(q: &Query, i: int, nl: int, at: int): bool {
     let sp = &q.subs[i]
     if sp.use != lexdb_sql.SUB_EXISTS || sp.cte >= 0 || sp.semi || sp.hashed { return false }
     let sel = &sp.sel
     if sel.setop != 0 || sel.aggQ || sel.having.isSome() || len(sel.groupBy) > 0 || sel.limit >= 0 || sel.offset > 0 || len(sel.wins) > 0 ||
        len(sel.locks) > 0 || len(sel.srf) > 0 || sel.rec >= 0 || len(sel.mr) > 0 || len(sel.gsets) > 0 { return false }
     let sq = &sel.q
-    if len(sq.levels) != 1 || len(sq.subs) > 0 || len(sq.refs) == 0 { return false }
-    let sl = &sq.levels[0]
+    if len(sq.levels) != nl || len(sq.subs) > 0 || len(sq.refs) == 0 { return false }
+    let sl = &sq.levels[at]
     if sl.virt() || sl.lateral || sl.lock != 0 || len(sl.post) > 0 || len(sl.t.cols) == 0 { return false }
     let p = &sl.path
-    if len(p.eqs) == 0 || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || p.desc { return false }
+    if len(p.eqs) == 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || p.desc { return false }
+    // a range on the next column (optimizer 50, 5c): its bounds of outer
+    // values and constants only, read per outer row as the subquery read them
+    if len(p.rng) > 0 && (unnestMode & UN_LOOK) == 0 { return false }
+    for b in p.rng {
+        var ns: []str = []
+        lexdb_sql.colNames(&b.val, mut &ns)
+        if len(ns) > 0 || hasSubCall(&b.val) || lexdb_bind.hasAgg(&b.val) || !lexdb_bind.immutable(&b.val) { return false }
+        if usesRefs(&substRefs(&b.val, q.base, &sq.refs), q.base) { return false }
+    }
     var keyed = false
     for x in p.eqs {
         var ns: []str = []
@@ -4618,6 +4633,178 @@ fn semiLookable(q: &Query, i: int): bool {
     return true
 }
 
+// EXISTS over two tables (optimizer 50, 5c): one (at, of the subquery's
+// two levels) looked up per outer row (semiLookableN), the other's rows a
+// set read once by one column equal to a column of the first, its other
+// conditions its own. Looked up, the other's rows become a set run once (a
+// new subquery of q, "b.col IN"), probed by each row of the first: acol
+// and bcol the two columns, eq the equality's text (taken out of the
+// looked-up level's conditions).
+pub type TwoKey = record { pub at: int; pub acol: int; pub bcol: int; pub eq: str }
+
+fn twoKey(q: &Query, i: int, at: int): Option[TwoKey] {
+    if (unnestMode & UN_LOOK) == 0 || !semiLookableN(q, i, 2, at) { return None }
+    let sq = &q.subs[i].sel.q
+    let a = &sq.levels[at]
+    let b = &sq.levels[1 - at]
+    // the second level (hashed) holds the equality: its hash's key and value
+    let h = &sq.levels[1]
+    if h.join != lexdb_sql.J_INNER || h.virt() || h.lateral || h.lock != 0 || h.perRow || len(h.post) > 0 || h.semi || h.anti || h.grp != 0 ||
+       h.mode != 0 || h.semiSub >= 0 || len(h.hashCols) != 1 || len(h.hashVals) != 1 { return None }
+    if b.virt() || b.lateral || b.lock != 0 || len(b.post) > 0 || b.semiSub >= 0 { return None }
+    for hk in h.hashKinds { if hk != lexdb_sql.COLL_EXACT { return None } }
+    let l0 = &sq.levels[0]
+    var vcol = -1
+    match h.hashVals[0] {
+        Expr.Col(n, _) { for j in 0..len(l0.t.cols) { if sq.cols[l0.first + j].name == n { vcol = j } } }
+        else {}
+    }
+    if vcol < 0 { return None }
+    let acol = if at == 0 { vcol } else { h.hashCols[0] }
+    let bcol = if at == 0 { h.hashCols[0] } else { vcol }
+    let ao = a.t.cols[acol].typ.oid
+    let bo = b.t.cols[bcol].typ.oid
+    let ints = lexdb_bind.isIntOid(ao) && lexdb_bind.isIntOid(bo)
+    let texts = (ao == lexdb_sql.OID_TEXT || ao == lexdb_sql.OID_VARCHAR) && (bo == lexdb_sql.OID_TEXT || bo == lexdb_sql.OID_VARCHAR) &&
+                len(a.t.cols[acol].coll) == 0 && len(b.t.cols[bcol].coll) == 0
+    if !ints && !texts { return None }
+    let an = sq.cols[a.first + acol].name.clone()
+    let bn = sq.cols[b.first + bcol].name.clone()
+    let want = lexdb_sql.exprText(&Expr.Bin("=", Expr.Col(bn.clone(), -1), Expr.Col(an.clone(), -1)))
+    let back = lexdb_sql.exprText(&Expr.Bin("=", Expr.Col(an, -1), Expr.Col(bn, -1)))
+    // the second's conditions: the key's equality, and its own; the
+    // other's own (run once over all its rows now: none may fail, none
+    // read an outer value)
+    var eq = ""
+    for x in h.cond {
+        let t = lexdb_sql.exprText(&x)
+        if t == want || t == back {
+            eq = t
+            continue
+        }
+        if sq.minLevel(&x) < 1 { return None }
+        if at == 0 && !twoOwn(&x, q.base) { return None }
+    }
+    if len(eq) == 0 { return None }
+    for x in b.cond { if lexdb_sql.exprText(&x) != eq && !twoOwn(&x, q.base) { return None } }
+    for x in b.local { if !twoOwn(&x, q.base) { return None } }
+    return Some(TwoKey{at: at, acol: acol, bcol: bcol, eq: eq})
+}
+
+// The alias of the table a looked-up semi or anti level reads (semiLook's:
+// its subquery's level whose table it took; twoSet left the other's blank).
+pub fn lookName(q: &Query, lv: &Level): str {
+    for l in q.subs[lv.semiSub].sel.q.levels { if len(l.alias) > 0 { return l.alias.clone() } }
+    return ""
+}
+
+fn twoOwn(x: &Expr, base: int): bool { return grpSafe(x) && !hasSubCall(x) && lexdb_bind.immutable(x) && !usesRefs(x, base) }
+
+// The other table of EXISTS subquery i (twoKey tk) as a new subquery of q,
+// its rows by its own conditions, its key column out (an IN's set, run
+// once); the lookup level lk of the first gets "acol IN (it)".
+fn twoSet(q: mut &Query, i: int, tk: &TwoKey, lk: mut &Level) {
+    let n = len(q.subs)
+    var b = replace(mut &q.subs[i].sel.q.levels[1 - tk.at], newLevel(rc(noTable()), "", 0, 0))
+    let slot = b.first + tk.bcol
+    let oid = b.t.cols[tk.bcol].typ.oid
+    var cols: []lexdb_sql.ColDef = []
+    for c in q.subs[i].sel.q.cols {
+        var d = lexdb_sql.colDef(&c.name, c.typ, c.notNull)
+        d.coll = c.coll.clone()
+        d.using = c.using.clone()
+        append(mut &cols, d)
+    }
+    let name = cols[slot].name.clone()
+    // read on its own: its own conditions (a hashed level's are its local's)
+    var own: []Expr = []
+    for x in b.cond { if lexdb_sql.exprText(&x) != tk.eq { append(mut &own, lexdb_sql.cloneExpr(&x)) } }
+    b.cond = if b.perRow { own } else { replace(mut &b.local, []) }
+    b.local = []
+    b.perRow = true
+    b.hashCols = []
+    b.hashVals = []
+    b.hashKinds = []
+    b.hashInt = false
+    b.readOnce = false
+    b.join = lexdb_sql.J_INNER
+    b.stops = false
+    b.keeps = false
+    let nq = Query{levels: [b], cols: cols, top: [], subs: [], base: q.base, corr: false, refs: [], implied: false, colAt: newMap(), pinned: false,
+                   noRefKeys: false, cc: [], cp: [], lp: lexdb_bind.noPlan(), jp: None}
+    let outs: []lexdb_bind.OutCol = [lexdb_bind.OutCol{name: "?column?", oid: oid, spell: "", coll: "", scale: -1}]
+    let sel = Sel{q: nq, exprs: [Expr.Col(name, slot)], outs: outs, groupBy: [], order: [], aggQ: false, sort: false, first: -1, limit: -1, offset: 0,
+                  having: None, specs: [], distinct: false, desc: [], nullsFirst: [], parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: "",
+                  ordin: false, wins: [], nAggs: 0, locks: [], nOut: 1, donKey: 0, withTies: false, gsets: [], gx: [], gord: [], gh: [],
+                  groupKinds: [], ordKinds: [], outKinds: [lexdb_sql.COLL_EXACT], topMode: 0, topN: -1, feedback: [], mr: [], conv: [], ox: [],
+                  oxParam: false, lp: lexdb_bind.noPlan(), pipe: None}
+    append(mut &q.subs, SubPlan{use: lexdb_sql.SUB_IN, sel: sel, oid: oid, name: "?column?", hashed: false, keyOuter: [], keyText: [], cte: -1,
+                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None})
+    let ax = Expr.Col(lk.alias + "." + lexdb_catalog.ROWID + tk.acol.toStr(), lk.first + tk.acol)
+    append(mut &lk.cond, Expr.Call("#in", [Expr.Lit(Val.Int(n)), Expr.Lit(Val.Int(oid)), Expr.Lit(Val.Text("?column?")), ax], false))
+    if tk.acol < len(lk.need) { lk.need[tk.acol] = true }
+}
+
+// Whether x IN (subquery i of q), conjunct c, may be a semi join looked
+// up per row by x (optimizer 50, 5c): one table, no grouping, aggregate,
+// LIMIT, set operation, window or lock, its value a plain column that
+// leads its primary key or an index, x and the column both integers or
+// both texts (varchar) under IN's exact collation (kind), x and the
+// conditions immutable with no subquery (semiLookable's), nothing using
+// q's own outer values.
+fn inLook(q: &Query, i: int, c: &Expr, kind: int, pt: &[]int): Option[InLook] {
+    let sp = &q.subs[i]
+    if sp.use != lexdb_sql.SUB_IN || sp.cte >= 0 || sp.semi || kind != lexdb_sql.COLL_EXACT || sp.readAs != 0 || len(sp.res) > 0 { return None }
+    let sel = &sp.sel
+    if sel.setop != 0 || sel.aggQ || sel.having.isSome() || len(sel.groupBy) > 0 || sel.limit >= 0 || sel.offset > 0 || len(sel.wins) > 0 ||
+       len(sel.locks) > 0 || len(sel.srf) > 0 || sel.rec >= 0 || len(sel.mr) > 0 || len(sel.gsets) > 0 { return None }
+    let sq = &sel.q
+    if len(sq.levels) != 1 || len(sq.subs) > 0 { return None }
+    let sl = &sq.levels[0]
+    if sl.virt() || sl.lateral || sl.lock != 0 || len(sl.post) > 0 || len(sl.t.cols) == 0 { return None }
+    // its value: a hashed one's last output, else its only one
+    let vi = if sp.hashed { len(sp.keyOuter) } else { 0 }
+    if vi >= len(sel.exprs) { return None }
+    var col = -1
+    match sel.exprs[vi] {
+        Expr.Col(n, _) { for j in 0..len(sl.t.cols) { if sq.cols[sl.first + j].name == n { col = j } } }
+        else {}
+    }
+    if col < 0 { return None }
+    var x = Expr.Lit(Val.Null)
+    match c {
+        Expr.Call(n, args, _) { if n == "#in" && len(args) > 3 { x = lexdb_sql.cloneExpr(&args[3]) } else { return None } }
+        else { return None }
+    }
+    if hasSubCall(&x) || lexdb_bind.hasAgg(&x) || !lexdb_bind.immutable(&x) || usesRefs(&x, q.base) { return None }
+    let co = sl.t.cols[col].typ.oid
+    let xo = exprOid(&x, &q.cols, pt)
+    let ints = lexdb_bind.isIntOid(co) && lexdb_bind.isIntOid(xo)
+    let texts = (co == lexdb_sql.OID_TEXT || co == lexdb_sql.OID_VARCHAR) && (xo == lexdb_sql.OID_TEXT || xo == lexdb_sql.OID_VARCHAR) && len(sl.t.cols[col].coll) == 0
+    if !ints && !texts { return None }
+    // the key: the primary key's first column, else an index's
+    let t = &sl.t
+    var ix = -2
+    if len(t.pk) > 0 && t.pk[0] == col { ix = -1 }
+    if ix == -2 {
+        for k in 0..len(t.indexes) {
+            let kc = keyCols(t, k)
+            if len(kc) > 0 && kc[0] == col && ix == -2 { ix = k }
+        }
+    }
+    if ix == -2 { return None }
+    for x2 in sl.cond { if hasSubCall(&x2) || lexdb_bind.hasAgg(&x2) || !lexdb_bind.immutable(&x2) || usesRefs(&substRefs(&x2, q.base, &sq.refs), q.base) { return None } }
+    for x2 in sl.local { if hasSubCall(&x2) || lexdb_bind.hasAgg(&x2) || !lexdb_bind.immutable(&x2) || usesRefs(&substRefs(&x2, q.base, &sq.refs), q.base) { return None } }
+    for x2 in sq.top { if hasSubCall(&x2) || lexdb_bind.hasAgg(&x2) || !lexdb_bind.immutable(&x2) || usesRefs(&substRefs(&x2, q.base, &sq.refs), q.base) { return None } }
+    for x2 in sp.keyOuter { if !lexdb_bind.immutable(&x2) || usesRefs(&substRefs(&x2, q.base, &sq.refs), q.base) { return None } }
+    // its conditions now evaluated on the rows of x's key only, where the
+    // subquery's run evaluated them on its path's: none may fail (50.3)
+    for x2 in sl.cond { if !grpSafe(&x2) { return None } }
+    for x2 in sl.local { if !grpSafe(&x2) { return None } }
+    for x2 in sq.top { if !grpSafe(&x2) { return None } }
+    return Some(InLook{col: col, ix: ix, x: x, eq: !ints, point: ix == -1 && len(t.pk) == 1})
+}
+
 // A looked-up semi/anti level's cost per outer row (optimizer 45's
 // units): a descent and the first row's read (a lookup's, COST_DESCENT +
 // COST_KEY_ROW), then each further row of the key's range: a primary
@@ -4638,6 +4825,17 @@ fn semiLookRun(t: &Table, lv: &Level, rows: float): float {
 // the subquery's columns renamed to the level's and its outer values as q
 // has them.
 fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
+    let none: Option[InLook] = None
+    return semiLookOf(q, i, anti, pt, &none, 0, &"")
+}
+
+// An IN's lookup (optimizer 50, 5c): the subquery's table read per outer
+// row by its column col (the IN's value), leading its primary key (ix -1)
+// or index ix, at x; eq: col = x kept as a filter (not both integers).
+pub type InLook = record { pub col: int; pub ix: int; pub x: Expr; pub eq: bool; pub point: bool }
+
+// semiLook, or an IN's lookup (inl: its key) in place of its path.
+fn semiLookOf(q: &Query, i: int, anti: bool, pt: &[]int, inl: &Option[InLook], at: int, skip: &str): Level {
     let alias = "\x00sj" + (i + 1).toStr()
     let first = len(q.cols)
     var names: []str = []
@@ -4647,7 +4845,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
     var estMax = false
     {
         let sq = &q.subs[i].sel.q
-        let sl = &sq.levels[0]
+        let sl = &sq.levels[at]
         var from: []str = []
         var to: []str = []
         for j in 0..len(sl.t.cols) {
@@ -4656,9 +4854,14 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
             append(mut &to, alias + "." + lexdb_catalog.ROWID + j.toStr())
         }
         var xs: []Expr = []
-        for x in sl.cond { append(mut &xs, lexdb_sql.cloneExpr(&x)) }
+        for x in sl.cond { if lexdb_sql.exprText(&x) != skip { append(mut &xs, lexdb_sql.cloneExpr(&x)) } }
         for x in sl.local { append(mut &xs, lexdb_sql.cloneExpr(&x)) }
         for x in sq.top { append(mut &xs, lexdb_sql.cloneExpr(&x)) }
+        // a hashed IN's keys "inner = outer" (9.9 took them out of its levels)
+        let sp = &q.subs[i]
+        if inl.isSome() && sp.hashed {
+            for j in 0..len(sp.keyOuter) { append(mut &xs, Expr.Bin("=", lexdb_sql.cloneExpr(&sp.sel.exprs[j]), lexdb_sql.cloneExpr(&sp.keyOuter[j]))) }
+        }
         for x in xs {
             var rc = lexdb_sql.cloneExpr(&x)
             for j in 0..len(from) { rc = lexdb_bind.renameCol(&rc, &from[j], &to[j], first + j) }
@@ -4669,8 +4872,20 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
             for c in conds { if lexdb_sql.exprText(&c) == tx { have = true } }
             if !have { append(mut &conds, r2) }
         }
-        path.index = sl.path.index
-        for x in sl.path.eqs { append(mut &path.eqs, substRefs(&x, q.base, &sq.refs)) }
+        match inl {
+            Some(il) {
+                // IN by its value's column: the lookup's key is x
+                path.index = il.ix
+                append(mut &path.eqs, lexdb_sql.cloneExpr(&il.x))
+                if il.eq { append(mut &conds, Expr.Bin("=", Expr.Col(to[il.col].clone(), first + il.col), lexdb_sql.cloneExpr(&il.x))) }
+            }
+            None {
+                path.index = sl.path.index
+                for x in sl.path.eqs { append(mut &path.eqs, substRefs(&x, q.base, &sq.refs)) }
+                for b in sl.path.rng { append(mut &path.rng, Bound{op: b.op.clone(), val: substRefs(&b.val, q.base, &sq.refs)}) }
+                path.noNulls = sl.path.noNulls
+            }
+        }
         // a key column's equality with its path value, both integers: the
         // range holds exactly its rows (keyVal: a value out of the
         // column's range reads none), so no filter is left and a range
@@ -4705,6 +4920,13 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
         conds = kept
         estRows = sl.estRows
         estMax = sl.estMax
+        match inl {
+            Some(il) {
+                estRows = if il.point { 1 } else { -1 }
+                estMax = false
+            }
+            None {}
+        }
     }
     // its columns read: those its filters name
     var ns: []str = []
@@ -4731,9 +4953,9 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
 
 // Level lv of semiLook taken: its table moved in from the subquery's
 // level (which is no longer run), its columns added to q's, hidden.
-fn semiLookAdd(q: mut &Query, lv: mut &Level) {
+fn semiLookAdd(q: mut &Query, lv: mut &Level, at: int) {
     let i = lv.semiSub
-    lv.t = replace(mut &q.subs[i].sel.q.levels[0].t, rc(noTable()))
+    lv.t = replace(mut &q.subs[i].sel.q.levels[at].t, rc(noTable()))
     let t = &lv.t
     for j in 0..len(t.cols) {
         // a name no query can use, in no * (hiddenName)
@@ -4849,11 +5071,39 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     // subquery run per row
     var look: Option[Level] = None
     var lookRun = 0.0f
+    var inLooked = false
+    var two: Option[TwoKey] = None
     if lookOk && !na && semiLookable(q, i) {
         let lk = semiLook(q, i, anti, pt)
         let rows = try semiRows(st, txn, mut &q.subs[i].sel.q.levels[0], params, rules)
         lookRun = semiLookRun(&q.subs[i].sel.q.levels[0].t, &lk, rows)
         look = Some(lk)
+    } else if lookOk && !na && len(q.subs[i].sel.q.levels) == 2 {
+        // EXISTS over two tables, one looked up, the other's rows a set
+        // (optimizer 50, 5c)
+        two = twoKey(q, i, 0)
+        if two.isNone() { two = twoKey(q, i, 1) }
+        match two {
+            Some(tk) {
+                let none: Option[InLook] = None
+                let lk = semiLookOf(q, i, anti, pt, &none, tk.at, &tk.eq)
+                let rows = try semiRows(st, txn, mut &q.subs[i].sel.q.levels[tk.at], params, rules)
+                lookRun = semiLookRun(&q.subs[i].sel.q.levels[tk.at].t, &lk, rows)
+                look = Some(lk)
+            }
+            None {}
+        }
+    } else if lookOk && !anti && (unnestMode & UN_LOOK) != 0 {
+        // x IN (subquery) read per row by x (optimizer 50, 5c)
+        match inLook(q, i, c, kind, pt) {
+            Some(il) {
+                let lk = semiLookOf(q, i, false, pt, &Some(il), 0, &"")
+                lookRun = semiLookRun(&q.subs[i].sel.q.levels[0].t, &lk, if lk.estRows >= 0 { float(lk.estRows) } else { -1.0f })
+                look = Some(lk)
+                inLooked = true
+            }
+            None {}
+        }
     }
     if alts[i].isSome() && !q.subs[i].hashed {
         var alt = replace(mut &alts[i], None).unwrap()
@@ -4880,20 +5130,36 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
             }
         }
     } else {
-        match semiKeys(q, &q.subs[i], c, pt) {
-            Some(sk) {
-                if (!na || len(sk.res) == 0) && (!exact || valsFree(q, &sk.vals)) {
-                    keys = sk
-                    ok = true
+        // (an IN looked up per row instead where a hash costs more, by the statistics)
+        var hashIt = true
+        if inLooked {
+            let inner = try semiInner(st, txn, mut &q.subs[i].sel.q, params, rules)
+            hashIt = !(outer >= 0.0f && inner >= 0.0f && !semiCheaper(outer, inner, lookRun))
+        }
+        if hashIt {
+            match semiKeys(q, &q.subs[i], c, pt) {
+                Some(sk) {
+                    if (!na || len(sk.res) == 0) && (!exact || valsFree(q, &sk.vals)) {
+                        keys = sk
+                        ok = true
+                    }
                 }
+                None {}
             }
-            None {}
         }
     }
     if !ok {
         if look.isSome() {
             var lk = look.unwrap()
-            semiLookAdd(q, mut &lk)
+            var at = 0
+            match two {
+                Some(tk) {
+                    twoSet(q, i, &tk, mut &lk)
+                    at = tk.at
+                }
+                None {}
+            }
+            semiLookAdd(q, mut &lk, at)
             return Ok(Some(lk))
         }
         return Ok(None)
