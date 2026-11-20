@@ -6173,6 +6173,19 @@ Level (the spread is about 0.15%). TPC-H is the coordinator's.
   `semiLevel`, `semiLook`, `semiKeys`, `semiAltOk`, with `planFrom`'s
   semi-join alternative through `Up.planSub`.
 
+### 6.3.Q4 as built (2026-11-20)
+
+Index ranges read in key order (PostgreSQL's bitmap heap scan for an
+index-organised table), chosen by cost: lexdb-optimizer.md 47 (47.8 as
+built, 47.9 the calibration). The reading is `lexdb_access`'s
+(`sortedChunk`, `fillSorted`, `fetchSorted`), the choice and EXPLAIN text
+`lexdb_plan`'s (`Path.sorted`, `keyOrdered`, `scanFirst` by
+`COST_SORTED_ROW`), `lexdb_pipe.srcFor` passes it on; exec has glue only
+(19,680 -> 19,687 lines). TPC-H q4 291 -> 188 ms, q14 228 -> 171 (medians
+of four alternated); q15's view range now by its index (instructions
+-67%); no query slower. q19's OR of index paths (BitmapOr) is left as the
+next step.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
