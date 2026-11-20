@@ -3112,3 +3112,43 @@ collected into one chunk, sorted and deduplicated, and the rows read once
 with the whole condition checked again. That is a second slice of this
 item (an OR of index paths), taken if the first lands cleanly; it needs no
 new executor beyond the chunk's collection over several ranges.
+
+### 47.8 Q4 where it stands (2026-11-20, paused for usage limits; WIP commit)
+
+- **Done (uncommitted until this WIP, not yet gated):** the executor and
+  the marking (47.6). `lexdb_access`: `Cursor.sorted/chunk/tail`,
+  `sortedChunk`, `fillSorted`, `fetchSorted`, `sortedKeys`, the test knobs
+  `setSortChunk`, `sortedChunks`; `fillLevel` and `fetch` read a marked
+  range in key order (not under noted reads). `lexdb_plan`: `Path.sorted`
+  (set in `planFrom`, cost mode), `PScan.sorted`, `sortable`,
+  `keyOrdered(q, k)`, `pathTextAt` (EXPLAIN's ", rows in key order"), the
+  process-wide knob `setKeyOrder` (KO_COST, KO_NEVER, KO_SORTED, KO_PLAIN),
+  `scanFirst` (still the old 1/SCAN_SHARE rule in KO_COST). `lexdb_pipe`:
+  `srcFor` sets `IxRead.sorted`. `lexdb_exec` glue: `runLevel`,
+  `materialize`, `bLevelPlan`, `explainLines`.
+- **Found:** the batch path (`fillIdxRows`) reads a batch's keys sorted but
+  puts the rows back in the index's order; the key-ordered read gives them
+  in key order (within a chunk), batches on and off alike. The switch's
+  short ranges (keys counted, at most 64) stay in the index's order both
+  ways.
+- **Tests:** new `tests/lexdb/run/exec_keyorder.lxl` passes (36 statements
+  the same six ways and as without the index; the same order on and off;
+  a later batch's division by zero; several chunks; a writing block).
+  Eleven suite tests changed only by EXPLAIN's new text: ten updated
+  (exec_analyze, autostats, estimates, join, joincost, joinreview, samples,
+  scanchoice, switch) by a script checking the only change is the inserted
+  text; exec_batchindex and exec_pipe failed only under an intermediate
+  edit and pass now. The full suite was interrupted by the pause: not yet
+  run 100% on this state.
+- **Measured:** q14 182 -> 130 ms (warm, server, `-O`) with the plan
+  unchanged (its hashed lineitem range now read in key order). q4 still
+  scans orders (3.8% > 1/32): the planner's band (slice 3) is next.
+- **Next:** the full suite; commit slice 2 cleanly; point-select A/B
+  (`scratchpad/q3/pts.lxl` pattern, base `git archive 95b9968d`);
+  calibration `design/experiments/calib_sorted.lxl` (written, builds;
+  not run) to set `COST_SORTED_ROW` and the scan band in `scanFirst`
+  (`2 * sorted(n) < scan`), and decide whether the counted switch's
+  `SWITCH_TIMES` follows; TPC-H q4/q14/q19 A/B in `~/tpch-w/q4` (set up:
+  data copy, base binary `bin/lexdb-base`, branch `bin/lexdb-b1`); then
+  the OR-of-index-paths slice for q19 if time allows; the as-built notes.
+- **No decision pending** from the owner.
