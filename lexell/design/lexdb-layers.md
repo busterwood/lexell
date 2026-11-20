@@ -6006,6 +6006,165 @@ binaries (q1 near 1,950 ms) is probably all built without `-O` (only
 18 Nov record (q1 near 1,690). The q18 -21% and q10 -7% "gains" of the same
 pair were not examined here.
 
+#### 6.3.Q3 as built (2026-11-20)
+
+Built on `worktree-agent-a6093c872adedcdc3` from main 0f96fee9. No
+behaviour change: the moved code is unchanged but for names, the hook and
+the arguments below. Tools (a declaration mover, a dependency counter over
+6.2.1's `decls.py`, a pass that makes private what no other file names)
+were scratch scripts, not kept.
+
+**Slices and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 0f96fee9 | | 24,744 | `lexdb_plan` 441 |
+| b6d5e5e9 | `hasAgg`, `immutable`, `renameCol`, `colIndex` to `lexdb_bind`; `lexdb_gen`'s copies deleted | 24,690 | |
+| 1aa01466 | slice 1: the planner and the plan structures to `lexdb_plan`; dead code | 20,298 | `lexdb_plan` 4,860 |
+| 65732940 | slice 2: `lexdb_priv`; routine, UDF and generated-column glue | 19,827 | `lexdb_priv` 373, `lexdb_routine` 953, `lexdb_gen` 273 |
+| 987206dd | slice 3: the physical plan's builders to `lexdb_plan` | 19,290 | `lexdb_plan` 5,414 |
+
+So 5,454 lines left exec (22%). They moved: `lexell/cmd` as a whole is 27
+lines longer than at main (the hook, two module headers and aliases,
+against about 150 lines of dead code, duplicates and forwards deleted).
+
+**Slice 1: the planner (`lexdb_plan`).** 180 declarations, 4,367 lines:
+
+- The plan structures: `Query` with its 46 methods (the planner's: they
+  had to move with the type, SPEC 5.3), `Level`, `SubPlan`, `Sel`,
+  `SelLock`, `MrPlan`, `MrNav`, `Scope` (the planning state, privileges'
+  `Who` with it: `Who` went to `lexdb_catalog`), `Work`, `FromHints`,
+  `FromBound`; and `lexdb_pipe.Prog` (pure data; the pipe keeps `compile`
+  and an alias), which `Query.jp` and `Sel.pipe` hold. Their fields are
+  public: exec builds and reads them.
+- Path choice: `choosePath`, the bounds and IN lists, filtered indexes'
+  implication (`impliesOne`, `looksHold`), `pathFig`, `pathEst`,
+  `figCost`, `servesOrder`, `orderedScan`, `orderLookups`, `minMax`,
+  `ixCovers`, `pathText`/`estText` (EXPLAIN's text of a path).
+- The cost model and the join order: `costOrder`, `nBest`, `joinStep`,
+  `wayCands`, `wayInto`, `setRows`, the shares (`localShare`, `andShare`,
+  `rangeShare`, `eqShare`, ...), `outerReadOnce`, `rightCheaper`,
+  `joinOrder`, `pinnedOrder`, implied equalities and the classes of equal
+  columns.
+- `planFrom` (the conjuncts placed per level, the join order, the paths,
+  hashing), the semi and anti joins (`semiJoins`, `semiLevel`,
+  `semiLook`, `semiCheaper`, `semiRun`, `semiKeys`, `orderRows`),
+  `hashSub`'s decorrelation, `narrowSub`, `physOf`/`subsOf` (the physical
+  plan's view).
+- **The hook** `lexdb_plan.Up`, a value record set once (`lexdb_plan.hook`,
+  a set-once global) by `newSession`: `eval` (an expression with no row,
+  exec's evaluator: the planner's constant folding in `constVal`,
+  `litValue`, `evalInt`), `typing` (the dialects' typing for `exprOid`),
+  `planSub` (`planFrom`'s semi-join alternative planned again). A global
+  rather than an argument: about 30 planner functions fold constants, few
+  of them with the query at hand.
+- **No `Txn.sql`**: the planner mode and the statement's memory limit
+  come in `FromHints` (`rules`, `memMax`, filled by `buildQuery`),
+  `semiRows`' mode as an argument. `imports.py` checks it, with
+  `lexdb_plan`'s imports (base, sql, bind, stats, catalog, access, store's
+  `Store` and `Txn` only, ops, rows, agg, window, match) and its users
+  (`lexdb_pipe`, `lexdb_exec`).
+- 118 of the moved functions are private (no other file names them).
+- Dead code deleted on the way: exec's `rowKey`, `rowOf`, `fillLevel`,
+  `placeKinds`, `cloneOptE` and 23 unused aliases; pipe's `isValKind`.
+
+**Slice 2: the glue.**
+
+- `lexdb_priv` (new): roles' rows, owners and grants (ACLs), who a session
+  acts as (`currentRole`, `sessionUser`, `whoIs`, `whoNow`, `setRoleIn`,
+  the door memo `doorKey`/`doorOf`), the checks with each door's errors
+  (`needRel`, `needOwner`, `needCreate`, `needRelOwner`, `needGrantor`),
+  `renameInAcls`. It imports base, sql, store, catalog; exec and the
+  protocol modules (for `roles`, authentication) import it. GRANT, REVOKE,
+  ALTER ... OWNER and the ROLE statements stay in exec: they resolve their
+  objects through exec's catalog lookups (`findTable`, `findSeq`,
+  `schemaExists`, the temporary schemas), which are layer 7's (E4).
+  `applyRoleOpts` stays: it needs `lexdb_auth` (a protocol module).
+- `lexdb_routine`: `routinesIn`, CALL's procedure choice (`pickProc`, its
+  42809/42883), `bodyTables`, the T-SQL UDF publication (`udfKey`,
+  `udfFind`) and the table-reading function hook (`setUdfQuery`: lexdb_tds
+  sets it on `lexdb_routine` now). `Session.routines`, `callRoutine`,
+  `tsqlFunctions`, `inlineFunctions` stay as the session's drivers (they
+  run statements); `udfEval` stays with the evaluator; `createRoutine`'s
+  body check stays (it names `lexdb_pgcat`, a dialect module).
+- `lexdb_gen`: `checkWrite` (was `genTarget`, `genSet`) and
+  `checkConstraint` (was `genConstraint`), over the columns. `genFill` and
+  `genSetup` stay: they need exec's evaluator and typing, and moving them
+  would add a closure at each of the seven call sites.
+
+**Slice 3: the physical plan's builders.** `planX`, `planConds`,
+`scanArm`, `filterOver`, `joinsOver` (the `Join` arms of a level chain),
+`pipeShape`, `sortShape`, `pipeAgg`, `aggShape`, `unplan`, `oxBack`,
+`tableRead`, `heldRead`, `firstRead`, `isKeyEq`, `rangePath`,
+`lookupPath`, `afterCols`, `streams`, `lazySeries`, `boundOnce` (551
+lines). `pipeAgg` returns its plan; exec's `pipeSelMain` compiles it
+(`lexdb_pipe.compile`, which the planner cannot import) as it compiles the
+others.
+
+**Gates.** Suite 236 of 236 after each slice (imports ok: 59 modules and
+307 edges after slice 1, 60 and 316 after slice 2). Point selects: a
+program of 20,000 primary-key point selects through `Session.exec` in
+process (`pts.lxl`, 1,000 rows), built `-O` against main's tree (`git
+archive 0f96fee9`) and the branch, `perf stat -e instructions:u taskset -c
+6`, alternated twice under the bench lock (about 187k instructions a
+statement, setup included):
+
+| | main 0f96fee9 | branch | |
+|---|---:|---:|---:|
+| after slice 1, round 1 | 3,744.01M | 3,744.57M | +0.015% |
+| after slice 1, round 2 | 3,745.71M | 3,745.56M | -0.004% |
+| after slice 3, round 1 | 3,746.36M | 3,745.56M | -0.021% |
+| after slice 3, round 2 | 3,746.92M | 3,745.20M | -0.046% |
+
+Level (the spread is about 0.15%). TPC-H is the coordinator's.
+
+**What is left in exec of planning, and why:**
+
+- `bindFrom` (334), `buildQuery`, `planSub`/`viewPlanned`, `scCheck`:
+  binding FROM resolves tables, views, sequences and temporary objects
+  through exec's catalog lookups and checks privileges as the view's
+  owner; it plans FROM's subqueries and views recursively (planSub to
+  planSelect). This is E3 (6.2.1, 6.2.11's hand-over): the lookups must
+  come in as a catalog snapshot first.
+- `planSelect` (479), `planSet`, `planMatch` with MATCH_RECOGNIZE's
+  rewrite: the select list, aggregates (`collectAggs`), windows
+  (`winPlan`), grouping sets, ORDER BY, LIMIT, locks; they name the
+  binder's leftovers in exec (`srfCols`, `outType`, `enumOrder`,
+  `stmtNames`, `checkGrouped`). With E3.
+- The plan cache (`select`, `planVersion`, `PLAN_VARIANTS`, `PlanCache`):
+  session state (the cache is the prepared statement's); its variant test
+  is `lexdb_plan.looksHold` already.
+- The run-time switch from an index to a scan (`indexOrScan`,
+  `firstSwitch`, optimizer 19): it counts entries as the statement runs.
+- EXPLAIN's lines with run counts (`explainLines`, `subLines`,
+  `opLines`): they read `Run`'s counts (`SubStat`, `lexdb_pipe.Counts`).
+
+**Seams for Q4-Q7** (all in `lexdb_plan` now):
+
+- Q4, a row-id-ordered index read: a path's choice is `choosePath` (a
+  flag on `Path` beside `stats`), its figure and cost `pathFig`/`figCost`
+  and the join order's first-table cost (`wayInto`, `constWay`; the
+  `SCAN_SHARE` switch constants), its text `pathText`. The reading itself
+  is the executor's: exec's `pathScans`/`runLevel` for the row engine,
+  `lexdb_pipe.srcOf` for batches; the counted switch (`indexOrScan`) stays
+  in exec.
+- Q5, predicate pushdown and outer-to-inner: `planFrom` places WHERE's
+  conjuncts per level (`ms`, `ps`, `lastRight`) and is where a LEFT JOIN
+  whose NULL rows WHERE rejects can become inner (before
+  `q.innerOnly()` decides the join order). Pushdown into a derived table
+  or view must happen before its subquery is planned, which is
+  `bindFrom`/`planSub` (still exec): either a rewrite of the statement
+  before binding, or E3 first.
+- Q6, bushy joins: the search is `costOrder`/`nBest`/`joinStep`/`setRows`
+  over sets of levels (`Way`); its result is a permutation of the level
+  chain (`perm` in `planFrom`), and the pipeline's joins are built
+  left-deep by `joinsOver` (`PPlan.Join(outer, PJoin)`). A bushy plan
+  changes both, and the row engine's level chain cannot run it: bushy
+  plans are the pipeline's only.
+- Q7, unnesting: `hashSub` (9.9's decorrelation), `semiJoins`,
+  `semiLevel`, `semiLook`, `semiKeys`, `semiAltOk`, with `planFrom`'s
+  semi-join alternative through `Up.planSub`.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
