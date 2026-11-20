@@ -142,7 +142,7 @@ Queue (pairs that touch different files):
 | B | | not started |
 | C | | not started |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
-| E | | not started |
+| E | `worktree-agent-a5b25663707eeb5fb` | done, awaiting review; section 6 |
 | F | | not started |
 
 ## 5. Package A: what was done
@@ -195,3 +195,69 @@ what the committed tests use.
   FROM <DATE>)` (ORA-30076) and `TIMEZONE_HOUR` of a literal's own offset
   (a time with a zone keeps no offset); `DBMS_METADATA.GET_DDL`;
   `quote_ident(123)` (PostgreSQL has no such function: 42883).
+
+## 6. Package E: what was done
+
+**What reproduced (O3, O4).** The grants were not dropped: lexdb stored them
+(catalog rows `ACL_PRE + "r:" + table`, owner and grants, durable like any
+catalog row, removed with the table). They did nothing across schemas because
+every read went through `needRel`, which asks PostgreSQL's USAGE on the
+table's schema first, and a user's schema (Oracle `CREATE USER`, T-SQL
+`CREATE SCHEMA ... AUTHORIZATION`) gives other users none: ORA-01031 / 229
+whatever was granted. `*_tab_privs` were the empty templates; TDS had
+`sys.database_permissions` of class 0 only and `HAS_PERMS_BY_NAME` answered 1.
+
+**The model (one, in `lexdb_exec`).** Owner, grants, `GRANT`/`REVOKE` and
+`has_table_privilege` are as 9.83 made them for PostgreSQL. New: a session
+knows its door (`Session.setDoor`, set by `lexdb_tds` and `lexdb_tns`; kept in
+the store's memo). SQL Server and Oracle have no schema privilege, so for
+those doors `needRel` does not ask for USAGE (only after the USAGE test has
+failed: no extra work for a session that passes it, nor for a superuser, whose
+check returns first). The PostgreSQL door is unchanged: USAGE still needed.
+Errors per door, raised where the check fails: TDS 229 with SQL Server's text
+(`The SELECT permission was denied on the object 't', database 'lexdb', schema
+'s1'.`), 4613 (grantor without the right), 15151 (object or user not found);
+TNS ORA-00942 for a table the user cannot read, ORA-01031 for one it can read
+and not write, ORA-01720 for a user that holds the privilege and cannot grant
+it (no grant option), ORA-03001 for a column list (it was widened to the whole
+table). `GRANT ALL` on a table is the five privileges SQL Server and Oracle
+have (not TRUNCATE and TRIGGER). T-SQL parsing: `ON [OBJECT::]name`,
+`REVOKE ... TO`, an honest 0A000 (number 50000) for ALTER/CONTROL/other
+classes (`SCHEMA::`), `WITH GRANT OPTION`; `TRUNCATE`/`TRIGGER` are syntax
+errors (102).
+
+**Catalog views.** `lexdb_catalog.privRows` is the one list of grants the
+views read. PostgreSQL: `information_schema.role_table_grants` (new), and
+`table_privileges` now shows only what its roles are grantor or grantee of
+(PUBLIC too, in table_privileges), as PostgreSQL's view does (checked against
+18.6 with gen_pg.py). Oracle: `DBA_/ALL_/USER_TAB_PRIVS` (columns as Oracle's;
+one row a privilege, GRANTOR the owner, GRANTABLE NO, TYPE TABLE/VIEW/SEQUENCE;
+USER_ the grants the user holds, owns or made, ALL_ those and PUBLIC's and its
+roles'). SQL Server: `sys.database_permissions` class 1 rows (`type` `SL  `,
+`IN  `, `UP  `, `DL  `, `RF  `, state `G`), grantee and grantor by the
+principal ids of `sys.database_principals` (which now also lists roles that
+cannot log in, as `DATABASE_ROLE`); `sp_table_privileges` adds them to the
+dbo rows; `HAS_PERMS_BY_NAME(name, 'OBJECT', perm)` answers from the same
+privileges (NULL for a name not found).
+
+**Tests.** `tns_privs` (55 lines), `tds_privs` (57), `exec_privsdoor` (the
+three doors on one table, the disk crashed and the store opened again, REVOKE,
+DROP TABLE, a table of the same name made again), `exec_privs` regenerated
+against PostgreSQL 18.6 with the new `role_table_grants`/`table_privileges`
+cases. Suite 217 of 217. Point select (PK, in process, `perf stat
+instructions:u`, pinned, base and branch interleaved three times): 119.6k
+instructions per statement as a superuser either side, 129.2k for a role with
+SELECT either side (differences under 0.1%, noise).
+
+**Left, and unsure.** `WITH GRANT OPTION` / grant options are not modelled in
+any dialect (PostgreSQL and SQL Server refuse, Oracle accepts and ignores it,
+GRANTABLE is always NO); column privileges (refused: 0A000, ORA-03001); DENY;
+the other Oracle object privileges (ALTER, INDEX, ...) are accepted and
+ignored as before; `GRANT ... ON SCHEMA::` and schema permissions of SQL
+Server; Oracle's ORA-01927 for a REVOKE of nothing. No Oracle or SQL Server
+was at hand: ORA-00942/01031/01720/03001 and 229/4613/15151 with their texts
+are from the documentation and memory (ORA-01720 versus 01031 for a grantor
+without privilege on the table is the least sure; 23ai's ORA-41900 for DML
+without privilege on a readable table is still 01031 here). A view's text is
+kept unqualified and resolved along the reader's path, so a view made in
+another schema must name its tables with their schema to be read by others.
