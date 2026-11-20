@@ -234,7 +234,7 @@ pub fn collOf(oid: int): int {
               oid == 1014 { 100 } else { 0 }
 }
 
-pub fn attRow(rel: int, name: &str, typ: int, mod: int, num: int, notNull: bool, hasDef: bool, ident: &str): []lexdb_sql.Val {
+pub fn attRow(rel: int, name: &str, typ: int, mod: int, num: int, notNull: bool, hasDef: bool, ident: &str, gen: &str): []lexdb_sql.Val {
     let ty = lexdb_pgcat.typeOf(typ)
     let byval = match ty {
         Some(t) { t.byval }
@@ -249,9 +249,24 @@ pub fn attRow(rel: int, name: &str, typ: int, mod: int, num: int, notNull: bool,
             lexdb_sql.Val.Int(num), lexdb_sql.Val.Int(-1), lexdb_sql.Val.Int(mod), lexdb_sql.Val.Int(if isArr { 1 } else { 0 }),
             lexdb_sql.Val.Bool(byval), lexdb_sql.Val.Text(align), lexdb_sql.Val.Text(if byval { "p" } else { "x" }),
             lexdb_sql.Val.Text(""), lexdb_sql.Val.Bool(notNull), lexdb_sql.Val.Bool(hasDef), lexdb_sql.Val.Bool(false),
-            lexdb_sql.Val.Text(ident.toStr()), lexdb_sql.Val.Text(""), lexdb_sql.Val.Bool(false), lexdb_sql.Val.Bool(true),
+            lexdb_sql.Val.Text(ident.toStr()), lexdb_sql.Val.Text(gen.toStr()), lexdb_sql.Val.Bool(false), lexdb_sql.Val.Bool(true),
             lexdb_sql.Val.Int(0), lexdb_sql.Val.Int(-1), lexdb_sql.Val.Int(collOf(typ)), lexdb_sql.Val.Null,
             lexdb_sql.Val.Null, lexdb_sql.Val.Null, lexdb_sql.Val.Null]
+}
+
+// attgenerated: s a stored generated column, v a virtual one.
+pub fn genOf(c: &lexdb_sql.ColDef): str {
+    if c.genKind == lexdb_sql.GEN_STORED { return "s" }
+    if c.genKind == lexdb_sql.GEN_VIRTUAL { return "v" }
+    return ""
+}
+
+// A generated column's expression as pg_attrdef shows it (a generated column's default is its expression).
+pub fn genText(c: &lexdb_sql.ColDef): Option[str] {
+    match c.gen {
+        Some(x) { return Some(exprText(&x, &Some(c.typ))) }
+        None { return None }
+    }
 }
 
 pub fn identOf(c: &lexdb_sql.ColDef): str {
@@ -433,35 +448,37 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                     if c.name == ROWID { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
-                    append(mut &rows, attRow(ct.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome(), &(identOf(c))))
+                    append(mut &rows, attRow(ct.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome() || c.genKind != lexdb_sql.GEN_NONE, &(identOf(c)), &(genOf(c))))
                 }
                 for ix in ct.idxs {
                     for k in 0..len(ix.cols) {
                         let cn = ix.cols[k]
                         if cn < 1 || cn > len(ct.t.cols) { continue }
                         let c = &ct.t.cols[cn - 1]
-                        append(mut &rows, attRow(ix.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), k + 1, false, false, ""))
+                        append(mut &rows, attRow(ix.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), k + 1, false, false, "", ""))
                     }
                 }
             }
             for v in snap.views {
                 for i in 0..len(v.t.cols) {
                     let c = &v.t.cols[i]
-                    append(mut &rows, attRow(v.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, false, false, ""))
+                    append(mut &rows, attRow(v.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, false, false, "", ""))
                 }
             }
             for r in lexdb_pgcat.relNames() {
                 let dot = strings.indexOf(&r, ".", 0)
                 let o = if dot < 0 { sysRelOid(&r) } else { catOid(&"r", &(r[0..dot] + "\x1f" + r[dot + 1..len(r)])) }
                 let cs = lexdb_pgcat.relCols(&r)
-                for k in 0..len(cs) { append(mut &rows, attRow(o, &cs[k].name, cs[k].oid, -1, k + 1, false, false, "")) }
+                for k in 0..len(cs) { append(mut &rows, attRow(o, &cs[k].name, cs[k].oid, -1, k + 1, false, false, "", "")) }
             }
         }
         "pg_attrdef" {
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
                     if ct.t.cols[i].name == ROWID { continue }
-                    match defaultText(&snap, &ct.t.cols[i]) {
+                    var shown = defaultText(&snap, &ct.t.cols[i])
+                    if shown.isNone() { shown = genText(&ct.t.cols[i]) }
+                    match shown {
                         Some(d) { append(mut &rows, [iv(catOid(&"d", &(ct.key + "\x00" + ct.t.cols[i].name))), iv(ct.oid), iv(i + 1), tv(&d)]) }
                         None {}
                     }
@@ -712,7 +729,8 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                                        if isId { tv(&sq.start.toStr()) } else { Val.Null }, if isId { tv(&sq.inc.toStr()) } else { Val.Null },
                                        if isId { tv(&sq.max.toStr()) } else { Val.Null }, if isId { tv(&sq.min.toStr()) } else { Val.Null },
                                        if isId { tv(&if sq.cycle { "YES" } else { "NO" }) } else { tv(&"NO") },
-                                       tv(&"NEVER"), Val.Null, tv(&(if len(ct.t.view) > 0 { "NO" } else { "YES" }))])
+                                       tv(&(if c.genKind != lexdb_sql.GEN_NONE { "ALWAYS" } else { "NEVER" })),
+                                       match genText(c) { Some(g) { tv(&g) } None { Val.Null } }, tv(&(if len(ct.t.view) > 0 { "NO" } else { "YES" }))])
                 }
             }
             }

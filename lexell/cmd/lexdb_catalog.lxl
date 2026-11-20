@@ -555,7 +555,7 @@ pub fn encTable(t: &Table): str {
         for c in t.cols {
             let missing = !isNullVal(&c.missing)
             b.addByte((if c.def.isSome() { 1 } else { 0 }) + (if missing { 2 } else { 0 }) + (if len(c.seq) > 0 { 4 } else { 0 }) +
-                      (if len(c.coll) > 0 { 8 } else { 0 }))
+                      (if len(c.coll) > 0 { 8 } else { 0 }) + (if c.genKind != lexdb_sql.GEN_NONE { 16 } else { 0 }))
             match c.def {
                 Some(x) {
                     let text = lexdb_sql.exprText(&x)
@@ -574,6 +574,14 @@ pub fn encTable(t: &Table): str {
                 addStr(mut &b, &c.seq)
             }
             if len(c.coll) > 0 { addStr(mut &b, &c.coll) }      // its collation (L2)
+            if c.genKind != lexdb_sql.GEN_NONE {
+                // a generated column: its kind, its expression's text
+                b.addByte(byte(c.genKind))
+                match c.gen {
+                    Some(x) { addStr(mut &b, &lexdb_sql.exprText(&x)) }
+                    None { addStr(mut &b, "") }
+                }
+            }
         }
     }
     // then the checks
@@ -844,6 +852,15 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
                 t.cols[i].coll = strAt(s, at)
                 at += 4 + len(t.cols[i].coll)
             }
+            if flags & 16 != 0 {
+                t.cols[i].genKind = int(s[at])
+                let gt = strAt(s, at + 1)
+                at += 5 + len(gt)
+                match parseExpr(&gt) {
+                    Ok(x) { t.cols[i].gen = Some(x) }
+                    Err(_) { return Err(lexdb_base.corrupt(&("the expression of generated column \"" + t.cols[i].name + "\""))) }
+                }
+            }
         }
     }
     if at + 4 <= len(s) {
@@ -916,6 +933,12 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
 // Its CHECKs and its indexes' expressions and predicates with each column at
 // its place in the row (lexdb_sql.slotted), as eval reads them.
 pub fn slotExprs(t: mut &Table) {
+    for i in 0..len(t.cols) {
+        match t.cols[i].gen {
+            Some(x) { t.cols[i].gen = Some(lexdb_sql.slotted(&x, &t.cols)) }
+            None {}
+        }
+    }
     for k in 0..len(t.checks) {
         let x = lexdb_sql.slotted(&t.checks[k].expr, &t.cols)
         t.checks[k].expr = x
