@@ -1384,6 +1384,9 @@ type Run = record {
     swKeys: []str
     swScan: Scan
     after: str                  // a batched DELETE or UPDATE (stage 8): the first level's primary key scan starts at this key; "" none
+    // the subqueries' results a pipeline run was given up for the row engine
+    // after (a few held rows first in a join: keepSubs), kept for its runSubs
+    pre: []SubRes
 }
 
 // A session's limits on one statement (SET max_recursion,
@@ -1441,7 +1444,7 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), lexdb_pipe.noCounts()),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               bud: lexdb_pipe.newBudget(), batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: ""}
+               bud: lexdb_pipe.newBudget(), batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: "", pre: []}
 }
 
 fn keepsRight(join: int): bool { return join == lexdb_sql.J_RIGHT || join == lexdb_sql.J_FULL }
@@ -7013,6 +7016,10 @@ fn prepareIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, param
 // q's subqueries run before it: those run once, in FROM, of a semi-join or
 // hashed; a correlated one's result is made per row (emptyRes here).
 fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val, rs: mut &Run): Result[[]SubRes, DbErr] {
+    // (the results of a run the pipeline gave up: kept, not run again)
+    if len(rs.pre) > 0 && len(rs.pre) == len(q.subs) {
+        return Ok(replace(mut &rs.pre, []))
+    }
     var subs: []SubRes = []
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
@@ -11677,13 +11684,14 @@ fn runSelTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 // child: the CTEs' rows (a CTE runs once in the statement, so a volatile
 // one gives every part the same rows), the rows held before the run, and
 // the steps and turns taken.
-type Share = record { cache: CteCache; held: int; ticks: int; turnEnd: int }
+type Share = record { cache: CteCache; held: int; ticks: int; turnEnd: int; pre: []SubRes }
 
-fn newShare(): Share { return Share{cache: newCache(), held: 0, ticks: 0, turnEnd: 0} }
+fn newShare(): Share { return Share{cache: newCache(), held: 0, ticks: 0, turnEnd: 0, pre: []} }
 
 // A run starts from what sh holds: the CTEs' rows move into it.
 fn (rs: mut &Run) takeShare(sh: mut &Share) {
     rs.cache = replace(mut &sh.cache, newCache())
+    rs.pre = replace(mut &sh.pre, [])
     rs.bud.held = sh.held
     rs.bud.ticks = sh.ticks
     rs.bud.turnEnd = sh.turnEnd
@@ -11693,6 +11701,9 @@ fn (rs: mut &Run) takeShare(sh: mut &Share) {
 // its steps and turns (the rows it held are its own, let go).
 fn (sh: mut &Share) giveBack(rs: mut &Run) {
     sh.cache = replace(mut &rs.cache, newCache())
+    // (results kept for the next run: their bytes held, counted in sh)
+    if len(rs.pre) > 0 { sh.held = rs.bud.held }
+    sh.pre = replace(mut &rs.pre, [])
     sh.ticks = rs.bud.ticks
     sh.turnEnd = rs.bud.turnEnd
 }
@@ -12244,8 +12255,10 @@ fn scanArm(sel: &Sel, aggs: bool): lexdb_plan.PScan {
     for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
     var need: []bool = withCapacity(len(t.cols))
     for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
-    let batch = lexdb_plan.firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
-    return lexdb_plan.PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops}
+    // (rows the run holds: always read as batches, or row by row if few)
+    let held = if lv.virt() { lv.src } else { -1 }
+    let batch = held >= 0 || lexdb_plan.firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
+    return lexdb_plan.PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, held: held}
 }
 
 // Scan (ps, its query's subqueries), under a Filter of cs if any.
@@ -12292,7 +12305,7 @@ fn joinsOver(sel: &Sel, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_
         for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
         let batch = lexdb_plan.scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
         var j = lexdb_plan.PJoin{how: lexdb_plan.JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: lexdb_plan.MK_JOIN, resCol: -1, res: [],
-                                 scan: lexdb_plan.PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false},
+                                 scan: lexdb_plan.PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, held: -1},
                                  build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
                                  rng: [], capNulls: false, noNulls: lv.path.noNulls}
         j.mark = mark
@@ -12378,7 +12391,7 @@ fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
     if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
     if len(q.levels) == 0 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
-    if !tableRead(&q.levels[0]) { return false }
+    if !firstRead(q, &q.levels[0]) { return false }
     return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs) && boundOnce(q)
 }
 
@@ -12401,6 +12414,26 @@ fn sortShape(sel: &Sel): bool {
 fn tableRead(lv: &Level): bool {
     return lv.perRow && !lv.lateral && !lv.virt() && lv.lock == 0 && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0
 }
+
+// Whether lv is rows the run holds that the pipeline reads as q's first
+// table, cut into batches (lexdb_held; item 6 of design/lexdb-batch-gaps.md):
+// a subquery in FROM's (a derived table, view, CTE, VALUES, a function
+// scan, a catalog relation, an integer series made as it is read), not a
+// recursive CTE's working table, not LATERAL, locked, with a WHERE after
+// it, or a semi or anti join's. A series is one of smallint, integer or
+// bigint (its end is the type's range: lexdb_held.seriesOf).
+fn heldRead(q: &Query, lv: &Level): bool {
+    if lv.src < 0 || lv.work >= 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
+    if lazySeries(q, lv.src) {
+        let oid = q.subs[lv.src].sel.outs[0].oid
+        return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8
+    }
+    return true
+}
+
+// Whether lv is a first table the pipeline reads: a table (tableRead) or
+// rows the run holds (heldRead).
+fn firstRead(q: &Query, lv: &Level): bool { return tableRead(lv) || heldRead(q, lv) }
 
 // Makes an aggregate's plan the pipeline's when it runs it (slice P1b):
 // Agg (Filter? (Scan)) under physOf's operators over the groups (views:
@@ -12488,7 +12521,7 @@ fn aggShape(sel: &Sel): bool {
     let q = &sel.q
     if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters)
-    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !tableRead(&q.levels[0]) || !boundOnce(q) { return false }
+    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
     for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } }
@@ -12538,7 +12571,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
     let q = &sel.q
     match sel.pipe {
         Some(pg) {
-            let src = if pg.joins { lexdb_pipe.noSrc() } else { try pipeSrc(st, txn, sel, &pg, params, &m.subs, rs) }
+            let src = if pg.joins { lexdb_pipe.noSrc() } else { try pipeSrc(st, txn, sel, &pg, params, &m.subs, len(m.vrows[0]), rs) }
             // (not without GROUP BY: there the one group stays even when
             // HAVING drops it, as the select's empty group)
             var fuse = false
@@ -12559,7 +12592,9 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
                 // (its path's values read before the subqueries' are lent)
-                srcs = try joinSrcs(st, txn, sel, &pg, params, &m.subs, rs)
+                srcs = try joinSrcs(st, txn, sel, &pg, params, &m.subs, if q.levels[0].virt() { len(m.vrows[0]) } else { 0 }, rs)
+                // (a few rows held first: the row engine, from the rows prepared)
+                if srcs[0].held && !srcs[0].batch { return Err(lexdb_pipe.batErr()) }
                 for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
             }
             var cx = pipeCtx(st, txn, params, mut &m.subs)
@@ -12660,6 +12695,18 @@ fn oxBack(sel: mut &Sel, xs: []BX) {
 // run evaluates (a subquery's value).
 fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) { None } else { Some(b) } }
 
+// A pipeline run given up before anything was given, for the row engine
+// (batErr): subs, the subqueries' results (a derived table's rows too),
+// kept in rs for its runSubs, not run again (a volatile call in them is
+// made once); their bytes stay held (a Share given them carries the count).
+fn heldFew(pg: &lexdb_pipe.Prog, sr: &SubRes): bool {
+    return lexdb_pipe.heldSmall(len(sr.data), sr.series, &sr.vals, sr.sOid, sr.sOrdin)
+}
+
+fn keepSubs(rs: mut &Run, subs: []SubRes) {
+    rs.pre = subs
+}
+
 // Runs sel's pipeline plan: at most cap rows (-1 no cap), given to give
 // (lexdb_pipe.run's: a chunk, or a row read one by one), its subqueries
 // run once first. The scan's counts go to the run's (EXPLAIN ANALYZE).
@@ -12671,7 +12718,14 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             var subs = try runSubs(st, txn, &sel.q, params, rs)
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
-                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, rs)
+                let l0 = &sel.q.levels[0]
+                if l0.virt() && heldFew(&pg, &subs[l0.src]) {
+                    // a few rows held first: joined row by row, as before they were
+                    // the pipeline's (a join's set-up costs more than they save)
+                    keepSubs(rs, subs)
+                    return Err(lexdb_pipe.batErr())
+                }
+                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
                 let cx = pipeCtx(st, txn, params, mut &subs)
                 var tabs: []&Table = []
                 for k in 0..len(sel.q.levels) { append(mut &tabs, &sel.q.levels[k].t) }
@@ -12698,10 +12752,14 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                 levelCounts(rs, &cnt)
                 return Ok(n)
             }
-            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, rs)
+            // (rows the run holds as the first level: read from the subquery's result)
+            let l0 = &sel.q.levels[0]
+            let none: [][]Val = []
+            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
             let cx = pipeCtx(st, txn, params, mut &subs)
+            let held = if l0.virt() { &subs[l0.src].data } else { &none }
             var cnt: []lexdb_pipe.Counts = []
-            let n = try lexdb_pipe.run(st, txn, &pg, &sel.q.cols, &sel.q.levels[0].t, &src, &cx, cap, mut &rs.bud, mut &cnt, give)
+            let n = try lexdb_pipe.run(st, txn, &pg, &sel.q.cols, &sel.q.levels[0].t, &src, held, &cx, cap, mut &rs.bud, mut &cnt, give)
             scanCounts(rs, &cnt)
             return Ok(n)
         }
@@ -12714,13 +12772,21 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 // optimizer 19's switch, decided once a run as runLevel decides it; the
 // pipeline reads them (lexdb_pipe.srcOf: in batches or row by row).
 fn pipeSrc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
-           rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
-    return pipeSrcQ(st, txn, &sel.q, pg, params, subs, rs)
+           held: int, rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
+    return pipeSrcQ(st, txn, &sel.q, pg, params, subs, held, rs)
 }
 
+// held: the rows of a first level the run holds (a plan without joins reads
+// them in batches when there are enough), else 0.
 fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
-            rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
+            held: int, rs: mut &Run): Result[lexdb_pipe.Src, DbErr] {
     let lv = &q.levels[0]
+    if lv.virt() {
+        // rows the run holds: its caller gives them to the run, a series
+        // (made as it is read) its arguments
+        let sr = &subs[lv.src]
+        return lexdb_pipe.srcHeld(pg, held, sr.series, &sr.vals, sr.sOid, sr.sOrdin)
+    }
     let p = &lv.path
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
@@ -12738,14 +12804,14 @@ fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &l
 // pipeSrc reads it; a hash's by its path, read once (as materialize reads
 // it); a table looked up per row: nothing.
 fn joinSrcs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
-            rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
-    return joinSrcsQ(st, txn, &sel.q, pg, params, subs, rs)
+            held: int, rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
+    return joinSrcsQ(st, txn, &sel.q, pg, params, subs, held, rs)
 }
 
 fn joinSrcsQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &lexdb_pipe.Prog, params: &[]Val, subs: &[]SubRes,
-             rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
+             held: int, rs: mut &Run): Result[[]lexdb_pipe.Src, DbErr] {
     var out: []lexdb_pipe.Src = []
-    append(mut &out, try pipeSrcQ(st, txn, q, pg, params, subs, rs))
+    append(mut &out, try pipeSrcQ(st, txn, q, pg, params, subs, held, rs))
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let sqe1 = seqEnv(st, txn)
@@ -12767,7 +12833,7 @@ fn joinSrcsQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &
 // context, a subquery's rows a level's).
 fn runLevelsProg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, pg: &lexdb_pipe.Prog,
                  emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
-    let srcs = try joinSrcsQ(st, txn, q, pg, params, &m.subs, rs)
+    let srcs = try joinSrcsQ(st, txn, q, pg, params, &m.subs, 0, rs)
     var cx = cenvOf(seqEnv(st, txn))
     cx.params = collections.copyOf(params)
     for i in 0..len(m.subs) { append(mut &cx.subs, lexdb_pipe.copySub(&m.subs[i].v)) }

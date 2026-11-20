@@ -35,7 +35,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
-    "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_lib", "lexdb_like",
+    "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_held", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
@@ -101,7 +101,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
@@ -134,6 +134,13 @@ SETOP = "lexdb_setop"
 SETOP_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_bind", "lexdb_pipe", "lexdb_sort", "lexdb_store"}
 SETOP_STORE_NAMES = {"Txn"}
 SETOP_USERS = {"lexdb_exec"}
+
+# Rows a run holds, read as the pipeline's batches (lexdb_held, design/
+# lexdb-batch-gaps.md item 6): values and the batch type only; only the
+# pipeline imports it.
+HELD = "lexdb_held"
+HELD_MAY_IMPORT = {"lexdb_sql", "lexdb_rows"}
+HELD_USERS = {"lexdb_pipe"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -227,6 +234,12 @@ def check():
             bad.append(f"{SETOP} uses lexdb_store beyond Txn: " + ", ".join(sorted(names)))
         if re.search(r"\.sql\.", body):
             bad.append(f"{SETOP} reads a transaction's SQL state (Txn.sql)")
+    for d in mods.get(HELD, []):
+        if d not in HELD_MAY_IMPORT:
+            bad.append(f"{HELD} -> {d}: the held rows' batches import above their layer")
+    for m in sorted(mods):
+        if HELD in mods[m] and m not in HELD_USERS:
+            bad.append(f"{m} -> {HELD}: only {', '.join(sorted(HELD_USERS))} imports the held rows' batches")
     stats = os.path.join(CMD, STATS + ".lxl")
     if os.path.exists(stats):
         with open(stats, encoding="utf-8") as f:
