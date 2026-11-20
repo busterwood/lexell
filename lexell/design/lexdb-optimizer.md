@@ -3888,12 +3888,17 @@ whether k's bucket has a row.
 ### 50.4 EXPLAIN
 
 ```
-anti join (null-aware) t2: hash on (k, v) over rows of subquery 1
-mark join t2: hash on (k) over rows of subquery 2
+anti join (null-aware) t3: hash on (k, v) over rows of subquery 1
+mark join t3: hash on (k, v) over rows of subquery 1, filter per row
 semi join t3: primary key lookup per row, filter per row read
-subquery 1 (in): anti join (null-aware) on t2.k = t1.k, run once
-subquery 2 (exists): mark join on t2.k = t1.k, run once
+subquery 1 (in): anti join (null-aware) on t3.k = t1.c, run once
+subquery 1 (in): mark join on t3.k = t1.c, run once
 ```
+
+(A mark's "filter per row" is its conjunct's, evaluated once per row
+after the mark; an IN looked up by its key, or EXISTS over two tables,
+is a looked-up semi join as `semiLook`'s, the other table's set a
+subquery "run once" of its own.)
 
 ### 50.5 The switch and the tests
 
@@ -3909,3 +3914,129 @@ under OR and NOT, in the select list and ORDER BY, under an aggregate,
 ORDER BY and LIMIT, an error in a later batch, the plans; the PostgreSQL,
 T-SQL and Oracle doors where they have the syntax.
 
+
+### 50.6 As built (2026-11-20)
+
+Branch `worktree-agent-a7ed8cb9808946f75` from main 01b0250c: 89fa917b
+(this design), e7f7550f (5a), dac32824 (5b), 897563d8 (5c), 9b2fcfc6 (the
+point-select and join costs, below). `lexdb_exec` 19,700 -> 19,737 lines
+(glue: `naLevel` in the row engine, `materialize`'s summary, `bindSel`'s
+hook, EXPLAIN's words); `lexdb_plan` 6,356 -> 7,204; `lexdb_pipe` 7,084 ->
+7,300.
+
+- **The plan (lexdb_plan).** `Level.mode` (`LV_NOTIN`, `LV_MARK`: the
+  mark is the level's last column, boolean, hidden), `PJoin.mark`
+  `MK_NOTIN`, `MK_MARK_EX`, `MK_MARK_IN`, `RUN_MARK`; the switch
+  `setUnnest` (`UN_NOTIN`, `UN_MARK`, `UN_LOOK`).
+  - 5a: `semiParsedNot` and `semiResolvedNot` take NOT IN (so it is a
+    semi join's candidate, planned again by section 42 when correlated);
+    `semiLevel`'s null-aware case (no residual, its keys' outer values
+    `valsFree` when anything is evaluated after it, `altSafe` for a plan
+    to be hashed); `keyLevel` (the hashed level of `semiKeys`, out of
+    `semiLevel`); `takeOutOk`, `noFail`/`stripSubs` (50.3's rules:
+    `grpSafe` with a subquery run once read as a value).
+  - 5b: `markCands` (WHERE's calls below its top level, planned again in
+    `semiAlternatives`, the alternatives' loop out of `planFrom`),
+    `markJoins`/`markKeys` (in `semiJoins`: every call of the conjunct
+    that may be one, the conjunct the last level's condition, its calls
+    replaced by the marks), `selMarks` (the select list and ORDER BY, from
+    exec's `bindSel`: hashed subqueries only), `markCalls`, `subUses`,
+    `condUses`, `callOf`, `markRepl`, `markable`.
+  - 5c: `semiLookableN` (a range after the equalities; the looked-up
+    level's place of two), `semiLookOf` (IN's key or the range in place of
+    the path; a hashed IN's keys back as filters), `inLook`, `twoKey` and
+    `twoSet` (EXISTS over two tables: the other table's rows a new
+    subquery of the query, `acol IN` it on the looked-up level; either
+    level of the subquery may be the one looked up), `lookName`.
+  - A fix on the way: `narrowSub` reads the aggregates' arguments (a semi
+    join over `x IN (select max(v) ... group by k)` read v as NULL: 0 rows
+    for 516; `exec_unnest`'s "in over an aggregate").
+- **The pipeline (lexdb_pipe).** `JL.na`, `nk`, `sumAll`; `summarize`
+  (the build's summary, in the hash's key map under a 0 byte, which no
+  key's encoding starts with); `naFrom`/`naProbe` (NOT IN's rows whose IN
+  is not false given to `joinTail` as an anti join's matches; a mark's
+  every row once, its mark in a batch made per chunk, which `gatherAt`
+  reads for that level); `naBucket`, `inMark`;
+  `joinOps` takes them over a subquery's rows only; `reduceHashes` skips
+  them. The row engine's: `inSummary` (its summary the same way) and
+  `inProbe1`.
+- **Tests.** `exec_unnest`: 108 queries, each with the new levels,
+  today's plans and both with batches off: notin 27 (and 23 again in a
+  transaction that wrote), mark 34, look 24, the plans, EXPLAIN ANALYZE's
+  counts with batches on and off (3 shapes); `tds_unnest` (16 T-SQL
+  queries: SQL Server 2022's answers, new and today's plans the same, 14
+  through the pipeline's joins with the new levels and 1 with today's);
+  `tns_unnest` (15 queries through the Oracle door, the same answers);
+  `exec_semijoin`, `exec_sub` and `exec_narrow` show the new plans;
+  `exec_subbatch` keeps NOT IN as a batch condition (`setUnnest(0)`).
+  Suite 250 of 250.
+
+**Measured, per shape** (`shapes.lxl`, in process, `-O`, batches on, median
+of 5 after a warm-up; 200,000 outer rows, a 20,000-row subquery table
+with and without an index on its key, an 80,000-row (order, line) table):
+
+| shape | today | new | today's plan |
+|---|---:|---:|---|
+| NOT IN, uncorrelated | 47.4 | 20.6 | a set probed per row |
+| NOT IN, correlated | 197.8 | 45.6 | hashed (9.9), probed per row |
+| NOT IN, correlated, an index on the key | 201.2 | 46.7 | per row (planned again: hashed by cost) |
+| `a = 3 OR EXISTS` | 173.0 | 23.1 | hashed, probed per row |
+| `a = 3 OR a IN`, an index on the key | 234.4 | 50.4 | per row (planned again: hashed by cost) |
+| the select list's EXISTS, 50,000 rows out | 28.3 | 10.2 | hashed, probed per row |
+| IN by the inner key, 100 outer rows | 4.35 | 0.11 | the subquery hashed (20,000 rows) |
+| EXISTS, a range after the key, 5,000 outer rows | 5.15 | 2.15 | hashed by cost |
+| EXISTS over two tables, 2,000 outer rows | 263.9 | 4.11 | hashed by cost (a join per run of the alternative) |
+
+Same rows in each (ms; the outer rows reach the pipeline's joins where no
+correlated subquery is left).
+
+**TPC-H** (SF1, `-O`, base main 01b0250c, alternated twice; ms):
+
+| query | base 1 | branch 1 | base 2 | branch 2 | ratio | server instructions |
+|---|---:|---:|---:|---:|---:|---|
+| q16 | 275.1 | 248.7 | 276.8 | 248.0 | 0.900 | 2.510G -> 2.214G (-11.8%) |
+| q2 | 52.0 | 50.0 | 53.4 | 49.7 | 0.946 | 384.67M -> 384.67M |
+| q4 | 183.6 | 187.2 | 185.0 | 184.7 | 1.009 | 1.4969G -> 1.4960G |
+| q17 | 36.3 | 34.7 | 36.9 | 35.3 | 0.956 | 246.68M -> 246.54M |
+| q18 | 793.1 | 816.1 | 793.5 | 804.4 | 1.021 | 1.0058G -> 1.0046G |
+| q20 | 299.2 | 295.8 | 289.5 | 303.3 | 1.018 | 1.7558G -> 1.7549G |
+| q21 | 1110.6 | 1108.2 | 1105.1 | 1095.1 | 0.994 | 12.382G -> 12.393G (+0.09%) |
+| q22 | 170.4 | 173.3 | 168.4 | 168.5 | 1.009 | 1.7682G -> 1.7709G (+0.15%; base runs vary 0.3%) |
+| all 22, both runs | 24,842 | 24,540 | | | 0.988 | |
+
+Only q16's plan changed (EXPLAIN of the 22: `ps_suppkey not in (select
+s_suppkey ...)` now an anti join (null-aware) on s_suppkey); checksums
+equal in every run. q6 (1.050: one run at 506 ms) and q18, q20 over 1.5%
+have equal plans and equal instructions (placement and drift). A first
+build (897563d8) had q2 +0.3% and q13 +0.15% instructions with plans
+unchanged: a summary map made per join level and run (`newJL`, q2's
+subquery runs), and the new branch in `joinFrom`'s probe; both removed
+(9b2fcfc6).
+
+**Point selects** (20,000 primary-key selects in process, `-O`,
+`LXL_HASH_SEED=1`, `perf stat -e instructions:u`, under the exclusive
+lock):
+base 3,725,407,891 instructions, branch 3,724,968,962 (three alternated
+rounds each, every round within 1,000): -21.9 a select (-0.012%). Per
+slice before the fix: 5a +7 (Level.mode, runLevel's test), 5b +5 (the
+select list's hook in `bindSel`), 5c 0; runLevel tests the mode only on a
+hashed level, and `planFrom` makes its per-subquery arrays (semiAlts,
+semiLooks: `array(0)` about 29 a select) only for a query with
+subqueries.
+
+**Left** (for 5d, 5e and later):
+- 5d: a correlated scalar aggregate (q2, q17, q20) by cost between per row
+  and hashed; a magic set.
+- 5e: a correlated FROM subquery (LATERAL) with an aggregate as a join and
+  a grouping.
+- A select list's EXISTS or IN that 9.9 could not hash (an index on its
+  key) stays per row: no plan to be hashed is made for it (the select list
+  is resolved after FROM is planned).
+- A mark join with a residual filter (a correlated condition that is not
+  a key); in an outer join's ON, HAVING, a grouped query, DML.
+- NOT IN looked up per row (a null-aware lookup); IN looked up by a
+  numeric key (Oracle's NUMBER), a key under a collation (the T-SQL
+  door's text keys run in the row engine).
+- A range lookup whose bounds are outer values runs in the row engine
+  only (the pipeline's range join takes constant bounds).
+- EXISTS over more than two tables, or two joined by more than one column.

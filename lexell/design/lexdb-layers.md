@@ -6283,6 +6283,53 @@ Branch `worktree-agent-a0cb1a031d1cae494` from main 1ccb366c.
   prices within 4% of left-deep; q9's supplier lookups (the rows estimated
   low).
 
+### 6.3.Q7 as built (2026-11-20)
+
+Step 5's slices 5a-5c (6.1, "The slices"), each a kind of level in
+today's structures, run by the row engine and by the pipeline's joins:
+lexdb-optimizer.md 50 (50.2 the NULL rules, 50.3 validity, 50.6 as built
+and measured). Branch `worktree-agent-a7ed8cb9808946f75` from main
+01b0250c.
+
+- **5a, NOT IN as a null-aware anti join** (`LV_NOTIN`, `MK_NOTIN`): `x
+  NOT IN (subquery)` and `x <> ALL`, a top-level WHERE conjunct,
+  uncorrelated or correlated by equalities (hashed as 9.9 planned it, or
+  planned again without outer keys and taken by cost); the subquery's rows
+  hashed on (keys, value) with a summary per key (rows; rows and a NULL),
+  the row kept when IN is false. Placed right after its level, where no
+  error moves.
+- **5b, the mark join** (`LV_MARK`, `MK_MARK_EX`/`MK_MARK_IN`, `RUN_MARK`):
+  a correlated EXISTS or IN under OR, NOT, CASE or IS NULL in WHERE (its
+  conjunct the level's condition), or in the select list and ORDER BY of
+  a query that does not group (`selMarks`, from `bindSel`): every row
+  goes on once with the subquery's value (true, false, NULL) in the
+  level's last column, which the expression reads.
+- **5c, semiLook widened** (`inLook`, `semiLookOf`, `twoKey`/`twoSet`): IN
+  looked up per row by its value where it leads the inner table's primary
+  key or an index (by cost); EXISTS whose path has a range after its
+  equalities; EXISTS over two tables, one looked up, the other's rows a
+  set run once (a new IN subquery).
+- **The switch:** `lexdb_plan.setUnnest` (`UN_NOTIN`, `UN_MARK`,
+  `UN_LOOK`; 0 today's plans). Under `SET lexdb_planner = rules` no
+  alternative is planned and nothing is chosen by cost (the levels from
+  subqueries already hashed or uncorrelated are made).
+- **What a query gains:** with no correlated subquery left, the pipeline
+  takes it (`q.corr`). In `tds_unnest`, 14 of 16 T-SQL queries ran
+  through the pipeline's joins with the new levels, 1 with today's.
+- **Measured (50.6):** per shape 2.3x to 64x faster (NOT IN 47 -> 21 ms
+  uncorrelated, 198 -> 46 hashed, 201 -> 47 indexed; OR EXISTS 173 -> 23;
+  the select list's EXISTS 28 -> 10; IN by its key 4.4 -> 0.11; a range
+  5.2 -> 2.2; EXISTS over two tables 264 -> 4.1). TPC-H: q16 248 ms
+  from 276 (-10%; instructions -11.8%), its plan the only one changed;
+  all 22 0.988 of main alternated twice, checksums equal. Point selects:
+  -21.9 instructions a select (-0.012%; `LXL_HASH_SEED=1`, three rounds).
+- **Gates:** suite 250 of 250 (new: `exec_unnest`, `tds_unnest`,
+  `tns_unnest`); `lexdb_exec` 19,700 -> 19,737 lines (glue).
+- **Left:** 5d and 5e; a select list's subquery that 9.9 could not hash
+  stays per row; marks with a residual, in ON, HAVING, grouped queries
+  and DML; a null-aware lookup; a numeric or collated key's lookup; outer
+  bounds of a range lookup in the pipeline; EXISTS over three tables.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
