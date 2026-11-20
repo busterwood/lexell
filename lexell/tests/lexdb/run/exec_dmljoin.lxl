@@ -1,0 +1,238 @@
+// lexdb_exec and lexdb_pipe: the joins of UPDATE ... FROM, DELETE ... USING
+// and MERGE run as a levels program (the batched join a SELECT's join
+// takes; design/lexdb-batch-gaps.md item 7; constructs M8, M10, M14-M16),
+// the statement consuming each joined row as it consumes the row engine's.
+// Each statement runs in a transaction rolled back, with batches off (the
+// row engine, the reference) and on, from the same data: the same tag,
+// RETURNING rows and error (SQLSTATE, message, detail), and the same
+// contents of the tables afterwards (tg, its children kid; checked by a
+// digest of every row), and with batches on the levels program is counted
+// (lexdb_pipe.joinCounts: runs of a join's batches) where the statement's
+// shape takes it, and not with batches off.
+// - sources of more than 1,024 rows (3,000, and 1,500 through a view): a
+//   table with no key (a hash join), one with a primary key (a lookup per
+//   row, or a hash), a view, VALUES (rows the run holds), a derived table;
+// - a target row matched twice (dup: the first match wins, its values used),
+//   for UPDATE and DELETE; MERGE refuses it (21000), also in a later batch;
+// - RETURNING (UPDATE, DELETE, MERGE with merge_action());
+// - an FK error (23503) and a CHECK error (23514) on a row in a later batch,
+//   atomic: nothing is left changed; a unique violation of MERGE's INSERT;
+// - DELETE ... USING of rows others reference (ON DELETE CASCADE: kid);
+// - MERGE: matched only (an inner join), with NOT MATCHED (a left join),
+//   clause conditions (the first that holds), DELETE, DO NOTHING, a VALUES
+//   source and a view source (held rows first); BY SOURCE (a RIGHT join) and
+//   a source of a few rows stay row by row (counted 0);
+// - a WHERE with a condition on the target only, on the source only, and on
+//   both; a subquery in SET; two sources joined to each other.
+// "batched": statements whose levels program ran with batches on.
+// timeout: 120
+// expect: loaded: 4000|e68fc894898ac3e9a788383d69a4a807 / 1900|111a97ecfa1c5e4fdabe5982225147ba
+// expect: update hash: 9 statements, 9 the same, 9 batched, 0 batched with batches off, 2 errors or no rows seen
+// expect: update lookup and views: 8 statements, 8 the same, 8 batched, 0 batched with batches off, 0 errors or no rows seen
+// expect: update twice matched: 4 statements, 4 the same, 4 batched, 0 batched with batches off, 0 errors or no rows seen
+// expect: update errors: 6 statements, 6 the same, 6 batched, 0 batched with batches off, 5 errors or no rows seen
+// expect: delete: 9 statements, 9 the same, 9 batched, 0 batched with batches off, 2 errors or no rows seen
+// expect: merge: 18 statements, 18 the same, 15 batched, 0 batched with batches off, 5 errors or no rows seen
+// expect: levels programs ran: 51, hashes built: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg + " [" + e.detail + "]" }
+    }
+}
+
+type Group = record { n: int; same: int; batched: int; off: int; odd: int; seen: []str }
+
+fn newGroup(): Group { return Group{n: 0, same: 0, batched: 0, off: 0, odd: 0, seen: []} }
+
+// The tables' contents: a digest of each row, in key order.
+fn digest(s: mut &lexdb_exec.Session): str {
+    let a = q(s, &"select count(*), md5(string_agg(id || ':' || coalesce(v::text, 'N') || ':' || coalesce(w::text, 'N') || ':' || coalesce(r::text, 'N') || ':' || coalesce(name, 'N'), ',' order by id)) from tg")
+    let b = q(s, &"select count(*), md5(string_agg(id || ':' || tid, ',' order by id)) from kid")
+    return a + " / " + b
+}
+
+// One run of sql in a transaction rolled back: its result, the tables after
+// it (the statement's changes if it ran, else as they were), and the runs of
+// the levels program it made.
+fn trial(s: mut &lexdb_exec.Session, sql: &str, on: bool): Option[str] {
+    let m = q(s, &(if on { "set lexdb_batch = on" } else { "set lexdb_batch = off" }))
+    let b = q(s, &"begin")
+    let j0 = lexdb_pipe.joinCounts()
+    let res = q(s, sql)
+    let j1 = lexdb_pipe.joinCounts()
+    var d = ""
+    if !strings.startsWith(&res, "ERROR") { d = digest(s) }
+    let r = q(s, &"rollback")
+    if len(d) == 0 { d = digest(s) }
+    let ran = j1[0] - j0[0]
+    return Some(res + " // " + d + " // " + (if ran > 0 { "batched" } else { "row" }))
+}
+
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, batched: bool) {
+    let off = trial(s, sql, false).unwrap()
+    let on = trial(s, sql, true).unwrap()
+    g.n += 1
+    let offData = off[0..strings.lastIndexOf(&off, " // ")]
+    let onData = on[0..strings.lastIndexOf(&on, " // ")]
+    if offData == onData {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  on:  " + strings.substr(&on, 0, min(len(on), 300)))
+    }
+    if strings.endsWith(&on, "// batched") { g.batched += 1 }
+    if strings.endsWith(&off, "// batched") { g.off += 1 }
+    if strings.startsWith(&off, "ERROR") || strings.startsWith(&off, "UPDATE 0") || strings.startsWith(&off, "DELETE 0") || strings.startsWith(&off, "MERGE 0") { g.odd += 1 }
+    if batched != strings.endsWith(&on, "// batched") && len(g.seen) < 3 {
+        append(mut &g.seen, "EXPECTED " + (if batched { "batched" } else { "row" }) + ": " + sql)
+    }
+}
+
+fn report(name: &str, g: &Group) {
+    println(name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same, " + g.batched.toStr() + " batched, " + g.off.toStr() +
+            " batched with batches off, " + g.odd.toStr() + " errors or no rows seen")
+    for x in g.seen { println(x) }
+}
+
+// VALUES of n rows (k, v), k from lo.
+fn values(lo: int, n: int): str {
+    var xs: []str = []
+    for i in 0..n { append(mut &xs, "(" + (lo + i).toStr() + ", " + ((lo + i) * 3).toStr() + ")") }
+    return "(values " + strings.join(&xs, ", ") + ") as x(k, v)"
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), lexdb_store.Options{cacheBytes: 8 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c0 = q(mut &s, &"create table par (id int primary key)")
+        let c1 = q(mut &s, &"insert into par select g from generate_series(1, 100) g")
+        let c2 = q(mut &s, &"create table tg (id int primary key, v int, w int check (w >= 0), r int references par (id), name text)")
+        let c3 = q(mut &s, &"insert into tg select g, g, g % 10, g % 100 + 1, case when g % 17 = 0 then null else 'n' || g end from generate_series(1, 4000) g")
+        let c4 = q(mut &s, &"create table kid (id int primary key, tid int references tg (id) on delete cascade)")
+        let c5 = q(mut &s, &"insert into kid select g, g * 2 from generate_series(1, 1900) g")
+        // sources: no key (hash), a primary key (lookup), a key twice (dup), bad rows in the second batch
+        let c6 = q(mut &s, &"create table src (k int, v int, w int, r int, name text)")
+        let c7 = q(mut &s, &"insert into src select g, g * 10, g % 7, g % 100 + 1, 's' || g from generate_series(1, 3000) g")
+        let c8 = q(mut &s, &"create table srcp (k int primary key, v int, w int, r int)")
+        let c9 = q(mut &s, &"insert into srcp select g, g * 100, g % 7, g % 100 + 1 from generate_series(1, 3000) g")
+        let d1 = q(mut &s, &"create table dup (k int, v int)")
+        let d2 = q(mut &s, &"insert into dup select g, g + 1000000 from generate_series(1, 1500) g")
+        let d3 = q(mut &s, &"insert into dup select g, g + 2000000 from generate_series(1, 1500) g")
+        let d4 = q(mut &s, &"create table badr (k int, r int)")
+        let d5 = q(mut &s, &"insert into badr select g, case when g = 2500 then 9999 else g % 100 + 1 end from generate_series(1, 3000) g")
+        let d6 = q(mut &s, &"create table badw (k int, w int)")
+        let d7 = q(mut &s, &"insert into badw select g, case when g = 2500 then -1 else g % 7 end from generate_series(1, 3000) g")
+        let d8 = q(mut &s, &"create view sv as select k, v + 1 as v, w, r from src where k % 2 = 0")
+        let d9 = q(mut &s, &"create table msrc (k int, v int)")
+        let e1 = q(mut &s, &"insert into msrc select g, g * 5 from generate_series(1, 5000) g")
+        let e2 = q(mut &s, &"create table mdup (k int, v int)")
+        let e3 = q(mut &s, &"insert into mdup select g, g from generate_series(1, 3000) g")
+        let e4 = q(mut &s, &"insert into mdup values (2900, 0)")
+        let e5 = q(mut &s, &"analyze")
+        println("loaded: " + digest(mut &s))
+
+        // UPDATE ... FROM, a hash join, in its forms
+        var g = newGroup()
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k", true)
+        check(mut &s, mut &g, "update tg set v = src.v, name = src.name from src where tg.id = src.k and src.k % 3 = 0", true)
+        check(mut &s, mut &g, "update tg set v = src.v + tg.v from src where src.k = tg.id and tg.id > 1500 and src.w > 2", true)
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k returning tg.id, tg.v, src.k, src.name", true)
+        check(mut &s, mut &g, "update tg t set v = s.v from src s where t.id = s.k and t.v < 0", true)
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k and src.k > 5000", true)
+        check(mut &s, mut &g, "update tg set v = (select count(*) from par) + src.v from src where tg.id = src.k and src.k <= 2000", true)
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k and tg.v + 1 = src.k + 1", true)
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k and src.name like 's1%'", true)
+        report("update hash", &g)
+
+        // a lookup per row (a primary key), a view, VALUES, a derived table
+        g = newGroup()
+        check(mut &s, mut &g, "update tg set v = srcp.v from srcp where tg.id = srcp.k", true)
+        check(mut &s, mut &g, "update tg set v = srcp.v from srcp where tg.id = srcp.k returning tg.id, tg.v", true)
+        check(mut &s, mut &g, "update tg set v = sv.v, w = sv.w from sv where tg.id = sv.k", true)
+        check(mut &s, mut &g, "update tg set v = x.v from " + values(500, 1100) + " where tg.id = x.k", true)
+        check(mut &s, mut &g, "update tg set v = x.v from " + values(3900, 1100) + " where tg.id = x.k returning tg.id, x.k, tg.v", true)
+        check(mut &s, mut &g, "update tg set v = d.s from (select k, v + 7 as s from src where k > 100) d where tg.id = d.k", true)
+        check(mut &s, mut &g, "update tg set v = d.s from (select k, sum(v) as s from src group by k) d where tg.id = d.k", true)
+        check(mut &s, mut &g, "update tg set v = a.v + b.v from src a, srcp b where tg.id = a.k and a.k = b.k", true)
+        report("update lookup and views", &g)
+
+        // a target row matched twice: the first match wins
+        g = newGroup()
+        check(mut &s, mut &g, "update tg set v = dup.v from dup where tg.id = dup.k", true)
+        check(mut &s, mut &g, "update tg set v = dup.v from dup where tg.id = dup.k returning tg.id, tg.v", true)
+        check(mut &s, mut &g, "update tg set v = d.v from (select k, v from dup order by v desc) d where tg.id = d.k", true)
+        check(mut &s, mut &g, "update tg set v = dup.v from dup where tg.id = dup.k and dup.v > 1500000", true)
+        report("update twice matched", &g)
+
+        // FK, CHECK and errors in a later batch
+        g = newGroup()
+        check(mut &s, mut &g, "update tg set r = badr.r from badr where tg.id = badr.k", true)
+        check(mut &s, mut &g, "update tg set w = badw.w from badw where tg.id = badw.k", true)
+        check(mut &s, mut &g, "update tg set v = 100 / (src.k - 2800) from src where tg.id = src.k", true)
+        check(mut &s, mut &g, "update tg set v = src.v from src where tg.id = src.k and 100 / (src.k - 2600) > 0", true)
+        check(mut &s, mut &g, "update tg set r = badr.r from badr where tg.id = badr.k returning tg.id", true)
+        check(mut &s, mut &g, "update tg set w = badw.w from badw where tg.id = badw.k and badw.k > 2600", true)
+        report("update errors", &g)
+
+        // DELETE ... USING
+        g = newGroup()
+        check(mut &s, mut &g, "delete from tg using src where tg.id = src.k and src.k % 3 = 0", true)
+        check(mut &s, mut &g, "delete from tg using srcp where tg.id = srcp.k and srcp.v > 90000", true)
+        check(mut &s, mut &g, "delete from tg using sv where tg.id = sv.k returning tg.id, tg.v, sv.v", true)
+        check(mut &s, mut &g, "delete from tg using " + values(900, 1500) + " where tg.id = x.k returning tg.id", true)
+        check(mut &s, mut &g, "delete from tg using dup where tg.id = dup.k returning tg.id, dup.v", true)
+        check(mut &s, mut &g, "delete from tg using src where tg.id = src.k and src.k > 9000", true)
+        check(mut &s, mut &g, "delete from tg using src, srcp where tg.id = src.k and src.k = srcp.k and srcp.w = 3", true)
+        check(mut &s, mut &g, "delete from tg t using (select k from src where k <= 1000) d where t.id = d.k returning t.id", true)
+        check(mut &s, mut &g, "delete from par using src where par.id = src.k", true)
+        report("delete", &g)
+
+        // MERGE: the source's join, in its forms
+        g = newGroup()
+        let up = "when matched then update set v = m.v "
+        let ins = "when not matched then insert (id, v, w, r, name) values (m.k, m.v, 1, 1, 'new') "
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + up + ins, true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + up, true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched then delete", true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched and m.k % 2 = 0 then delete when matched then update set v = -m.v " + ins, true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched and m.k > 3000 then do nothing " + up + ins + "returning merge_action(), tg.id, m.k, tg.v", true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched then insert (id, v, w, r) values (m.k, m.v, 1, 1)", true)
+        check(mut &s, mut &g, "merge into tg using " + values(3500, 1200) + " on tg.id = x.k when matched then update set v = x.v when not matched then insert (id, v, w, r) values (x.k, x.v, 2, 2)", true)
+        check(mut &s, mut &g, "merge into tg using sv m on tg.id = m.k when matched then update set v = m.v, w = m.w", true)
+        check(mut &s, mut &g, "merge into tg using (select k, v from msrc where k > 2000) m on tg.id = m.k when matched then update set v = m.v " + ins, true)
+        check(mut &s, mut &g, "merge into tg using mdup m on tg.id = m.k when matched then update set v = m.v", true)
+        check(mut &s, mut &g, "merge into tg using mdup m on tg.id = m.k when matched then delete", true)
+        check(mut &s, mut &g, "merge into tg using mdup m on tg.id = m.k when matched and m.v > 0 then update set v = m.v", true)
+        check(mut &s, mut &g, "merge into tg using badr m on tg.id = m.k when matched then update set r = m.r", true)
+        check(mut &s, mut &g, "merge into tg using badw m on tg.id = m.k when matched then update set w = m.w", true)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched and m.k > 4500 then insert (id, v, w, r) values (m.k - 1000, 1, 1, 1)", true)
+        // not batched: BY SOURCE (a RIGHT join), a few source rows (held, under a batch)
+        check(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched then update set v = m.v when not matched by source then delete", false)
+        check(mut &s, mut &g, "merge into tg using (values (1, 5), (2, 6), (5000, 7)) as x(k, v) on tg.id = x.k when matched then update set v = x.v when not matched then insert (id, v, w, r) values (x.k, x.v, 1, 1)", false)
+        check(mut &s, mut &g, "merge into tg using (values (1, 5), (2, 6), (5000, 7)) as x(k, v) on tg.id = x.k when matched then delete returning merge_action(), tg.id", false)
+        report("merge", &g)
+        let j = lexdb_pipe.joinCounts()
+        println("levels programs ran: " + j[0].toStr() + ", hashes built: " + (j[2] > 20).toStr())
+        s.close()
+        return 0
+    }).unwrap()
+}
