@@ -1,0 +1,167 @@
+// lexdb_dbopt: the options of T-SQL's ALTER DATABASE ... SET (design/lexdb-dialect-gaps.md,
+// package B, S6): which options exist and the shape of their values (what the parser reads),
+// which sys.databases columns each sets, and the settings kept (what ALTER DATABASE changed,
+// as lines "option<TAB>value"; the catalog row "\x02dbopt\x00" holds them).
+//
+// lexdb has one database and no locking readers: its reads are always snapshots. So
+// ALLOW_SNAPSHOT_ISOLATION and READ_COMMITTED_SNAPSHOT are recorded and shown (sys.databases:
+// snapshot_isolation_state, is_read_committed_snapshot_on) and change nothing else; the same
+// holds for the options that only describe how SQL Server keeps its files (RECOVERY, PAGE_VERIFY,
+// AUTO_SHRINK ...). The options that would change what lexdb does (READ_ONLY, SINGLE_USER,
+// OFFLINE ...) are refused as not supported yet, not accepted and ignored.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+pub const KEY: str = "\x02dbopt\x00"
+
+// The shape of an option's value.
+pub const SH_ONOFF = 1          // OPTION ON | OFF
+pub const SH_WORD = 2           // OPTION word
+pub const SH_EQWORD = 3         // OPTION = word
+pub const SH_EQNUM = 4          // OPTION = n [SECONDS | MINUTES]
+pub const SH_EQONOFF = 5        // OPTION = ON | OFF [(settings)]
+pub const SH_FLAG = 6           // OPTION alone
+pub const SH_REST = 7           // valid in SQL Server, not supported here: the rest of the option is skipped
+
+pub type Spec = record {
+    pub name: str
+    pub shape: int
+    pub vals: []str             // SH_WORD, SH_EQWORD: the words
+    pub known: bool             // lexdb does what it says (else: not supported yet)
+}
+
+fn sp(name: &str, shape: int, vals: []str): Spec { return Spec{name: name.clone(), shape: shape, vals: vals, known: true} }
+
+// OPTION ON | OFF, each a sys.databases column.
+const ONOFF: []str = ["allow_snapshot_isolation", "read_committed_snapshot", "auto_close", "auto_shrink", "auto_create_statistics",
+                      "auto_update_statistics", "auto_update_statistics_async", "trustworthy", "db_chaining", "recursive_triggers",
+                      "numeric_roundabort", "arithabort", "ansi_nulls", "ansi_null_default", "ansi_padding", "ansi_warnings",
+                      "concat_null_yields_null", "quoted_identifier", "cursor_close_on_commit"]
+
+// Options of SQL Server's that lexdb does not do (yet): given as one option, they are refused as not supported.
+const OTHER: []str = ["read_only", "single_user", "restricted_user", "offline", "emergency", "change_tracking", "encryption",
+                      "automatic_tuning", "date_correlation_optimization", "nested_triggers", "transform_noise_words",
+                      "two_digit_year_cutoff", "default_language", "default_fulltext_language", "enable_broker", "disable_broker",
+                      "new_broker", "error_broker_conversations", "honor_broker_priority", "filestream", "containment",
+                      "memory_optimized_elevate_to_snapshot", "result_set_caching", "optimized_locking", "hadr",
+                      "partner", "witness", "temporal_history_retention", "legacy_cardinality_estimation",
+                      "maxdop", "parameter_sniffing", "query_optimizer_hotfixes", "ledger"]
+
+// The option name (lower case); None: SQL Server's syntax error.
+pub fn spec(name: &str): Option[Spec] {
+    for o in ONOFF { if o == name { return Some(sp(name, SH_ONOFF, [])) } }
+    if name == "recovery" { return Some(sp(name, SH_WORD, ["full", "bulk_logged", "simple"])) }
+    if name == "page_verify" { return Some(sp(name, SH_WORD, ["checksum", "torn_page_detection", "none"])) }
+    if name == "parameterization" { return Some(sp(name, SH_WORD, ["simple", "forced"])) }
+    if name == "cursor_default" { return Some(sp(name, SH_WORD, ["local", "global"])) }
+    if name == "delayed_durability" { return Some(sp(name, SH_EQWORD, ["disabled", "allowed", "forced"])) }
+    if name == "compatibility_level" || name == "target_recovery_time" { return Some(sp(name, SH_EQNUM, [])) }
+    if name == "query_store" || name == "accelerated_database_recovery" { return Some(sp(name, SH_EQONOFF, [])) }
+    // the states lexdb is in: no change
+    if name == "multi_user" || name == "read_write" || name == "online" { return Some(sp(name, SH_FLAG, [])) }
+    for o in OTHER { if o == name { return Some(Spec{name: name.clone(), shape: SH_REST, vals: [], known: false}) } }
+    return None
+}
+
+// The compatibility levels SQL Server 2022 takes.
+fn levelOk(n: int): bool { return n == 100 || n == 110 || n == 120 || n == 130 || n == 140 || n == 150 || n == 160 }
+
+fn tsErr(n: int, msg: &str): lexdb_base.DbErr { return lexdb_base.err("TS" + n.toStr(), msg) }
+
+// The settings after items (each "option<TAB>value[<TAB>arg]", lower case) are made over cur: an option given twice in one
+// statement is 5062, the two snapshot options together 5082, an unknown compatibility level 15048.
+pub fn apply(cur: &str, items: &[]str): Result[str, lexdb_base.DbErr] {
+    var seen: []str = []
+    var lines: []str = []
+    for l in strings.lines(cur) { if len(l) > 0 { append(mut &lines, l.toStr()) } }
+    for it in items {
+        let f = strings.split(it, "\t")
+        let opt = f[0].toStr()
+        for s in seen { if s == opt { return Err(tsErr(5062, "The option '" + strings.toUpperAscii(&opt) + "' was given more than once in the statement.")) } }
+        append(mut &seen, opt.clone())
+        let val = if len(f) > 1 { f[1].toStr() } else { "" }
+        if opt == "compatibility_level" && !levelOk(strings.parseIntOpt(&val).unwrapOr(0)) {
+            return Err(tsErr(15048, "Valid values of the database compatibility level are 100, 110, 120, 130, 140, 150 or 160."))
+        }
+        if opt == "target_recovery_time" && strings.parseIntOpt(&val).unwrapOr(0) < 0 {
+            return Err(tsErr(5005, "Invalid value for option TARGET_RECOVERY_TIME."))
+        }
+        if opt == "multi_user" || opt == "read_write" || opt == "online" { continue }
+        var out: []str = []
+        for l in lines { if !strings.startsWith(&l, &(opt + "\t")) { append(mut &out, l.clone()) } }
+        lines = out
+        append(mut &lines, opt + "\t" + val + (if len(f) > 2 { "\t" + f[2] } else { "" }))
+    }
+    var snap = false
+    var rc = false
+    for s in seen {
+        if s == "allow_snapshot_isolation" { snap = true }
+        if s == "read_committed_snapshot" { rc = true }
+    }
+    if snap && rc { return Err(tsErr(5082, "The options READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION cannot be changed in one statement.")) }
+    return Ok(strings.join(&lines, "\n"))
+}
+
+// sys.databases' column for each ON/OFF option.
+fn column(opt: &str): str {
+    if opt == "auto_create_statistics" { return "is_auto_create_stats_on" }
+    if opt == "auto_update_statistics" { return "is_auto_update_stats_on" }
+    if opt == "auto_update_statistics_async" { return "is_auto_update_stats_async_on" }
+    if opt == "read_committed_snapshot" { return "is_read_committed_snapshot_on" }
+    if opt == "query_store" { return "is_query_store_on" }
+    if opt == "accelerated_database_recovery" { return "is_accelerated_database_recovery_on" }
+    return "is_" + opt + "_on"
+}
+
+// The sys.databases columns the settings give, as names and values (the rest of the row is as it was).
+pub fn columns(cur: &str, names: mut &[]str, vals: mut &[]Val) {
+    for l in strings.lines(cur) {
+        let f = strings.split(l, "\t")
+        if len(f) < 2 { continue }
+        let opt = f[0].toStr()
+        let v = f[1].toStr()
+        if opt == "allow_snapshot_isolation" {
+            append(names, "snapshot_isolation_state")
+            append(vals, Val.Int(if v == "on" { 1 } else { 0 }))
+            append(names, "snapshot_isolation_state_desc")
+            append(vals, Val.Text(strings.toUpperAscii(&v)))
+        } else if opt == "recovery" {
+            append(names, "recovery_model")
+            append(vals, Val.Int(if v == "full" { 1 } else if v == "bulk_logged" { 2 } else { 3 }))
+            append(names, "recovery_model_desc")
+            append(vals, Val.Text(strings.toUpperAscii(&v)))
+        } else if opt == "page_verify" {
+            append(names, "page_verify_option")
+            append(vals, Val.Int(if v == "none" { 0 } else if v == "torn_page_detection" { 1 } else { 2 }))
+            append(names, "page_verify_option_desc")
+            append(vals, Val.Text(strings.toUpperAscii(&v)))
+        } else if opt == "compatibility_level" {
+            append(names, "compatibility_level")
+            append(vals, Val.Int(strings.parseIntOpt(&v).unwrapOr(160)))
+        } else if opt == "target_recovery_time" {
+            append(names, "target_recovery_time_in_seconds")
+            append(vals, Val.Int(strings.parseIntOpt(&v).unwrapOr(60)))
+        } else if opt == "parameterization" {
+            append(names, "is_parameterization_forced")
+            append(vals, Val.Bool(v == "forced"))
+        } else if opt == "cursor_default" {
+            append(names, "is_local_cursor_default")
+            append(vals, Val.Bool(v == "local"))
+        } else if opt == "delayed_durability" {
+            append(names, "delayed_durability")
+            append(vals, Val.Int(if v == "disabled" { 0 } else if v == "allowed" { 1 } else { 2 }))
+            append(names, "delayed_durability_desc")
+            append(vals, Val.Text(strings.toUpperAscii(&v)))
+        } else {
+            append(names, column(&opt))
+            append(vals, Val.Bool(v == "on"))
+            if opt == "auto_create_statistics" && len(f) > 2 {
+                append(names, "is_auto_create_stats_incremental_on")
+                append(vals, Val.Bool(f[2] == "on"))
+            }
+        }
+    }
+}

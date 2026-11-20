@@ -1,0 +1,106 @@
+// lexdb over TDS: what T-SQL DDL lexdb does not do yet says so, naming it (design/lexdb-dialect-gaps.md, package B): written by hand
+// (SQL Server accepts all of these), so each expect line gives the error number lexdb sends (50000) and its message: CREATE [OR ALTER]
+// FUNCTION and TRIGGER and CREATE SYNONYM (packages F and later; PROCEDURE is made since package F's first slice: the first two
+// batches are the procedure made, and made again), ALTER DATABASE options that would change what lexdb
+// does (READ_ONLY, SINGLE_USER, OFFLINE, CHANGE_TRACKING ...) and its other forms, sp_rename of a database, ALTER COLUMN ... COLLATE.
+// expect: ok
+// expect: error 2714 There is already an object named 'p' in the database.
+// expect: error 50000 lexdb: CREATE OR ALTER FUNCTION is not supported yet (CREATE OR ALTER takes a view)
+// expect: error 50000 lexdb: CREATE OR ALTER TRIGGER is not supported yet (CREATE OR ALTER takes a view)
+// expect: error 50000 lexdb: CREATE FUNCTION is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
+// expect: error 50000 lexdb: CREATE SYNONYM is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
+// expect: error 50000 lexdb: ALTER DATABASE ... SET READ_ONLY is not supported yet
+// expect: error 50000 lexdb: ALTER DATABASE ... SET SINGLE_USER is not supported yet
+// expect: error 50000 lexdb: ALTER DATABASE ... SET OFFLINE is not supported yet
+// expect: error 50000 lexdb: ALTER DATABASE MODIFY is not supported yet (ALTER DATABASE ... SET takes the options of SQL Server's that lexdb has)
+// expect: error 50000 lexdb: ALTER DATABASE SCOPED CONFIGURATION is not supported yet
+// expect: error 50000 lexdb: ALTER DATABASE ... SET CHANGE_TRACKING is not supported yet
+// expect: error 50000 lexdb: sp_rename of a database is not supported yet
+// expect: error 50000 lexdb: ALTER COLUMN ... COLLATE is not supported yet
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const QUERIES = "CREATE OR ALTER PROCEDURE p AS SELECT 1\nCREATE PROCEDURE p AS SELECT 1\nCREATE OR ALTER FUNCTION f() RETURNS int AS BEGIN RETURN 1 END\nCREATE OR ALTER TRIGGER tr ON t AFTER INSERT AS SELECT 1\nCREATE FUNCTION f() RETURNS int AS BEGIN RETURN 1 END\nCREATE SYNONYM s FOR t\nALTER DATABASE CURRENT SET READ_ONLY\nALTER DATABASE CURRENT SET SINGLE_USER\nALTER DATABASE CURRENT SET OFFLINE\nALTER DATABASE CURRENT MODIFY NAME = x\nALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4\nALTER DATABASE CURRENT SET CHANGE_TRACKING = OFF\nEXEC sp_rename 'x', 'y', 'DATABASE'\nALTER TABLE t ALTER COLUMN c int COLLATE Latin1_General_CI_AS"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn batches(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let text: str = QUERIES
+            for q in strings.lines(&text) { println(show(mut &c, &q)) }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines (gen_mssql.py)
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(38), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

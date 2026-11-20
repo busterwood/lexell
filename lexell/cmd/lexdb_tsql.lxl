@@ -81,10 +81,19 @@ pub type Caught = record { pub number: int; pub message: str; pub severity: int;
 fn caughtOf(e: &DbErr): Caught {
     var n = sqlNumber(&e.state)
     var msg = sqlMessage(n, &e.msg)
+    // a type name SQL Server does not know
+    if e.state == "42704" && strings.startsWith(&e.msg, "type \"") {
+        n = 2715
+        msg = "Column, parameter, or variable #1: Cannot find data type " + quotedName(&e.msg) + "."
+    }
     if n == 102 && strings.startsWith(&e.msg, "syntax error at or near \"") {
         // SQL Server says "near the keyword 'x'" (156) for a reserved word, else "near 'x'" (102)
         let tok = quotedName(&e.msg)
-        if lexdb_sql.isReservedWord(&strings.toLowerAscii(&tok)) {
+        let low = strings.toLowerAscii(&tok)
+        // (SQL Server reserves DROP, ALTER and ADD, and not USING, LIMIT and the like)
+        let reserved = (lexdb_sql.isReservedWord(&low) && low != "using" && low != "limit" && low != "ilike" && low != "returning" && low != "window" && low != "natural") ||
+                       low == "drop" || low == "alter" || low == "add"
+        if reserved {
             n = 156
             msg = "Incorrect syntax near the keyword '" + tok + "'."
         } else {
@@ -442,6 +451,10 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
         }
     }
     let inTx = sess.status() != 'I' && !txStmt(s.kind)
+    if s.kind == lexdb_sql.S_ALTER_DB && sess.status() != 'I' {
+        st.failErr(ev, &tsErr(226, "ALTER DATABASE statement not allowed within multi-statement transaction."), 0)
+        return st.tryDepth > 0
+    }
     if inTx {
         let sp = simple(sess, &("SAVEPOINT " + SAVE))
     }
@@ -1450,6 +1463,51 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         doneEv(ev, if st.nocount { -1 } else { n }, CMD_SELECT, false)
         return F_NEXT
     }
+    if proc == "sp_rename" || proc == "dbo.sp_rename" {
+        // sp_rename @objname, @newname [, @objtype]: lexdb_exec's S_SP_RENAME does it, as a statement
+        let ia = argAt(&vals, &t.names, &"@objname", 0)
+        let ib = argAt(&vals, &t.names, &"@newname", 1)
+        let ic = argAt(&vals, &t.names, &"@objtype", 2)
+        if ia < 0 || ib < 0 {
+            st.fail(ev, Caught{number: 201, message: "Procedure or function 'sp_rename' expects parameter '" + (if ia < 0 { "@objname" } else { "@newname" }) +
+                               "', which was not supplied.", severity: 16, state: 4}, 0)
+            return F_NEXT
+        }
+        if lexdb_ops.isNull(&vals[ia]) || lexdb_ops.isNull(&vals[ib]) {
+            st.fail(ev, Caught{number: 15223, message: "Error: Object name or new name is NULL.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        let objname = lexdb_sql.text(&vals[ia])
+        let newname = lexdb_sql.text(&vals[ib])
+        let objtype = if ic >= 0 && !lexdb_ops.isNull(&vals[ic]) { strings.toLowerAscii(&lexdb_sql.text(&vals[ic])) } else { "" }
+        if len(strings.trim(&objname)) == 0 {
+            st.fail(ev, Caught{number: 15253, message: "Syntax error parsing SQL identifier ''.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        if len(newname) == 0 {
+            st.fail(ev, Caught{number: 15004, message: "Name cannot be NULL or an empty string.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        if !(objtype == "" || objtype == "object" || objtype == "column" || objtype == "index" || objtype == "userdatatype" || objtype == "statistics" || objtype == "database") {
+            st.fail(ev, Caught{number: 15249, message: "Error: The type of the object '" + lexdb_sql.text(&vals[ic]) +
+                               "' is not valid. It must be COLUMN, DATABASE, INDEX, OBJECT, STATISTICS or USERDATATYPE.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        var rs = lexdb_sql.newStmt(lexdb_sql.S_SP_RENAME)
+        rs.table = objname.toStr()
+        rs.index = newname.toStr()
+        rs.alias = objtype
+        rs.mdialect = lexdb_sql.MD_TSQL
+        let before = len(ev)
+        if !st.sqlStmt(sess, &rs, f, ev, true) { return F_END }
+        // SQL Server's caution, before the statement's end
+        if st.error == 0 && len(ev) == before + 1 {
+            let done = pop(mut &ev)
+            caughtEv(ev, &Caught{number: 15477, message: "Caution: Changing any part of an object name could break scripts and stored procedures.", severity: 0, state: 1}, EV_INFO)
+            append(ev, done)
+        }
+        return F_NEXT
+    }
     let cat = catalogProcSql(&proc, &vals, &t.names)
     if len(cat) > 0 {
         var fr = newFrame()
@@ -1692,6 +1750,15 @@ fn argLit(vals: &[]Val, names: &[]str, name: &str, pos: int): str {
         }
     }
     return "NULL"
+}
+
+// The place in vals of the argument named name (or at place pos among those without a name) of a call, -1 none.
+fn argAt(vals: &[]Val, names: &[]str, name: &str, pos: int): int {
+    for j in 0..len(vals) {
+        let pn = if 1 + j < len(names) { names[1 + j].clone() } else { "" }
+        if (len(pn) > 0 && strings.toLowerAscii(&pn) == name) || (len(pn) == 0 && j == pos) { return j }
+    }
+    return -1
 }
 
 // "col LIKE lit" for a pattern argument, nothing for NULL (an empty owner or name matches nothing but a blank, as SQL Server's).

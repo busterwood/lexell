@@ -9,6 +9,7 @@ import "./lexdb_time"
 import "./lexdb_float"
 import "./lexdb_sql"
 import "./lexdb_dialect"
+import "./lexdb_dbopt"
 import "./lexdb_match"
 
 // The language model, by name (the parser reads and builds it).
@@ -169,6 +170,7 @@ const OVR_SYSTEM = lexdb_sql.OVR_SYSTEM
 const OVR_USER = lexdb_sql.OVR_USER
 const OVR_TSQL = lexdb_sql.OVR_TSQL
 const A_ADD = lexdb_sql.A_ADD
+const S_ALTER_DB = lexdb_sql.S_ALTER_DB
 const A_RENAME_COL = lexdb_sql.A_RENAME_COL
 const A_RENAME = lexdb_sql.A_RENAME
 const A_SET_NOT_NULL = lexdb_sql.A_SET_NOT_NULL
@@ -2879,6 +2881,114 @@ fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
     return p.expr()
 }
 
+// T-SQL's ALTER DATABASE name | CURRENT SET option [, option ...] [WITH termination], after "database"
+// (design/lexdb-dialect-gaps.md, package B, S6): each option as lexdb_dbopt gives its shape; an option
+// SQL Server has that lexdb does not do is 0A000, any other word SQL Server's syntax error.
+fn (p: mut &P) alterDatabase(): Result[Stmt, lexdb_base.DbErr] {
+    var s = lexdb_sql.newStmt(S_ALTER_DB)
+    s.mdialect = MD_TSQL
+    if p.isKw("scoped") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "configuration" {
+        return Err(lexdb_base.err("0A000", "lexdb: ALTER DATABASE SCOPED CONFIGURATION is not supported yet"))
+    }
+    if !p.acceptKw("current") {
+        let t = p.peek().clone()
+        if t.kind == T_IDENT && t.text == "set" { return Err(near(&t)) }
+        s.table = try p.name()
+    }
+    if !p.isKw("set") {
+        let w = p.peek().clone()
+        if w.kind == T_IDENT && (w.text == "modify" || w.text == "add" || w.text == "remove" || w.text == "collate" || w.text == "scoped") {
+            return Err(lexdb_base.err("0A000", &("lexdb: ALTER DATABASE " + strings.toUpperAscii(&w.text) + " is not supported yet (ALTER DATABASE ... SET takes the options of SQL Server's that lexdb has)")))
+        }
+        return Err(near(&w))
+    }
+    p.pos += 1
+    while true {
+        let t = p.next()
+        if t.kind != T_IDENT { return Err(near(&t)) }
+        let sp = match lexdb_dbopt.spec(&t.text) {
+            Some(x) { x }
+            None { return Err(near(&t)) }
+        }
+        if !sp.known {
+            return Err(lexdb_base.err("0A000", &("lexdb: ALTER DATABASE ... SET " + strings.toUpperAscii(&t.text) + " is not supported yet")))
+        }
+        var val = ""
+        var arg = ""
+        if sp.shape == lexdb_dbopt.SH_ONOFF || sp.shape == lexdb_dbopt.SH_EQONOFF {
+            if sp.shape == lexdb_dbopt.SH_EQONOFF { try p.expectKw("=") }
+            let v = p.next()
+            if v.kind != T_IDENT || (v.text != "on" && v.text != "off") { return Err(near(&v)) }
+            val = v.text.clone()
+            if p.isKw("(") {
+                // AUTO_CREATE_STATISTICS ON (INCREMENTAL = ON | OFF); QUERY_STORE = ON (settings)
+                if t.text == "auto_create_statistics" {
+                    if val != "on" { return Err(near(&p.peek())) }
+                    p.pos += 1
+                    try p.expectKw("incremental")
+                    try p.expectKw("=")
+                    let iv = p.next()
+                    if iv.kind != T_IDENT || (iv.text != "on" && iv.text != "off") { return Err(near(&iv)) }
+                    arg = iv.text.clone()
+                    try p.expectKw(")")
+                } else if sp.shape == lexdb_dbopt.SH_EQONOFF {
+                    var depth = 0
+                    while true {
+                        let x = p.next()
+                        if x.kind == T_EOF { return Err(near(&x)) }
+                        if x.kind == T_OP && x.text == "(" { depth += 1 }
+                        if x.kind == T_OP && x.text == ")" {
+                            depth -= 1
+                            if depth == 0 { break }
+                        }
+                    }
+                } else {
+                    return Err(near(&p.peek()))
+                }
+            }
+        } else if sp.shape == lexdb_dbopt.SH_WORD || sp.shape == lexdb_dbopt.SH_EQWORD {
+            if sp.shape == lexdb_dbopt.SH_EQWORD { try p.expectKw("=") }
+            let v = p.next()
+            var ok = false
+            if v.kind == T_IDENT { for w in sp.vals { if w == v.text { ok = true } } }
+            if !ok { return Err(near(&v)) }
+            val = v.text.clone()
+        } else if sp.shape == lexdb_dbopt.SH_EQNUM {
+            try p.expectKw("=")
+            let neg = t.text == "target_recovery_time" && p.acceptKw("-")
+            let v = p.next()
+            if v.kind != T_NUM || strings.parseIntOpt(&v.text).isNone() { return Err(near(&v)) }
+            val = (if neg { "-" } else { "" }) + v.text
+            if t.text == "target_recovery_time" {
+                let u = p.next()
+                if u.kind != T_IDENT || (u.text != "seconds" && u.text != "minutes") { return Err(near(&u)) }
+                if u.text == "minutes" { val = (strings.parseIntOpt(&val).unwrapOr(0) * 60).toStr() }
+            }
+        }
+        append(mut &s.names, t.text + "\t" + val + (if len(arg) > 0 { "\t" + arg } else { "" }))
+        if !p.acceptKw(",") { break }
+    }
+    // WITH ROLLBACK IMMEDIATE | ROLLBACK AFTER n [SECONDS] | NO_WAIT (not with ALLOW_SNAPSHOT_ISOLATION: 5083)
+    if p.acceptKw("with") {
+        for it in s.names {
+            if strings.startsWith(&it, "allow_snapshot_isolation\t") {
+                return Err(lexdb_base.err("TS5083", "The termination option cannot be used with ALLOW_SNAPSHOT_ISOLATION."))
+            }
+        }
+        if p.acceptKw("rollback") {
+            if !p.acceptKw("immediate") {
+                try p.expectKw("after")
+                let n = p.next()
+                if n.kind != T_NUM { return Err(near(&n)) }
+                let sec = p.acceptKw("seconds")
+            }
+        } else {
+            try p.expectKw("no_wait")
+        }
+    }
+    return Ok(s)
+}
+
 // ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b,
 // RENAME CONSTRAINT a TO b, RENAME TO name or SET SCHEMA name (each alone),
 // or actions separated by commas: ADD [COLUMN] [IF NOT EXISTS] name type
@@ -2889,6 +2999,7 @@ fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
 // DEFAULT, and the identity forms (9.117).
 fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_ALTER)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.acceptKw("if") {
         try p.expectKw("exists")
         s.ifFlag = true
@@ -2900,6 +3011,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.alters, lexdb_sql.alterOf(A_SET_SCHEMA, &(try p.name())))
         return Ok(s)
     }
+    // SQL Server renames with sp_rename: ALTER TABLE has no RENAME
+    if p.tsql && p.isKw("rename") { return Err(near(&p.peek())) }
     if p.acceptKw("rename") {
         // the new name's spelling in col.spell (L6)
         var sp = lexdb_sql.noCol()
@@ -2919,6 +3032,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             return Ok(s)
         }
         let c = p.acceptKw("column")
+        // Oracle's RENAME without COLUMN is a partition's
+        if p.ora && !c { return Err(lexdb_base.err("ORA14155", "missing PARTITION or SUBPARTITION keyword")) }
         let from = try p.name()
         try p.expectKw("to")
         let to = try p.name()
@@ -3080,6 +3195,37 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             append(mut &s.alters, lexdb_sql.alterOf(A_VALIDATE, &(try p.name())))
         } else if p.acceptKw("alter") {
             let c = p.acceptKw("column")
+            // Oracle changes a column with MODIFY
+            if p.ora { return Err(lexdb_base.err("ORA00905", "missing keyword")) }
+            if p.tsql {
+                // ALTER COLUMN name type [NULL | NOT NULL]: a new type; without NULL or NOT NULL the column takes NULL
+                if !c { return Err(near(&p.peek())) }
+                let tn = try p.name()
+                var ta = lexdb_sql.alterOf(A_TYPE, &tn)
+                // a word that begins another action is not a type; a type name SQL Server does not know is 2715, found after the rest reads
+                let tk = p.peek().clone()
+                if (tk.kind != T_IDENT && tk.kind != T_QIDENT) || (tk.kind == T_IDENT && (tk.text == "set" || tk.text == "drop" || tk.text == "add" || tk.text == "alter" || tk.text == "with")) { return Err(near(&tk)) }
+                let at = p.pos
+                match p.typeName() {
+                    Ok(ty) { ta.col.typ = ty }
+                    Err(er) {
+                        if er.state != "42704" { return Err(er) }
+                        p.pos = at + 1
+                        if !(p.peek().kind == T_EOF || p.isKw(";") || p.isKw("not") || p.isKw("null") || p.isKw(",")) { return Err(near(&p.peek())) }
+                        return Err(lexdb_base.err("TS2715", &("Column, parameter, or variable #1: Cannot find data type " + tk.text + ".")))
+                    }
+                }
+                if p.isKw("collate") { return Err(lexdb_base.err("0A000", "lexdb: ALTER COLUMN ... COLLATE is not supported yet")) }
+                append(mut &s.alters, ta)
+                if p.acceptKw("not") {
+                    try p.expectKw("null")
+                    append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &tn))
+                } else {
+                    let nl = p.acceptKw("null")
+                    append(mut &s.alters, lexdb_sql.alterOf(A_DROP_NOT_NULL, &tn))
+                }
+                break
+            }
             let n = try p.name()
             let data = p.isKw("set") && p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_IDENT && p.toks[p.pos + 1].text == "data"
             if data {
@@ -3485,19 +3631,32 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
 // CREATE [OR REPLACE] VIEW name [(column, ...)] AS query, after "view":
 // the query is parsed to check it, and kept as its text (from its first
 // token to the statement's end), to be parsed again where it is used (9.82).
-fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
+fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_base.DbErr] {
     var v = lexdb_sql.newStmt(S_CREATE_VIEW)
     // where its CREATE is (a few tokens back: CREATE [OR ALTER | OR REPLACE] [TEMP] VIEW)
     var from = -1
     var k = p.pos
     while k > 0 && p.pos - k < 8 {
         k -= 1
-        if p.toks[k].kind == T_IDENT && p.toks[k].text == "create" {
+        if p.toks[k].kind == T_IDENT && (p.toks[k].text == "create" || (alterOnly && p.toks[k].text == "alter")) {
             from = p.toks[k].at
             break
         }
     }
-    v.ifFlag = orReplace
+    v.ifFlag = orReplace || alterOnly
+    v.alter = alterOnly
+    v.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
+    // T-SQL keeps CREATE OR ALTER's definition without its "OR ALTER" (SQL Server shows CREATE   VIEW)
+    var cutAt = -1
+    var cutAlter = -1
+    if p.tsql && orReplace && from >= 0 {
+        for k2 in 0..len(p.toks) - 3 {
+            if p.toks[k2].at == from && p.toks[k2 + 1].text == "or" && p.toks[k2 + 2].text == "alter" {
+                cutAt = p.toks[k2 + 1].at
+                cutAlter = p.toks[k2 + 2].at
+            }
+        }
+    }
     v.table = try p.rname()
     v.spell = p.spelled.clone()
     if p.acceptKw("(") {
@@ -3533,7 +3692,17 @@ fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.tsql {
         v.index = TSQL_VIEW + v.index
         // the statement's text from its CREATE to the end of the batch, as SQL Server keeps it
-        if from >= 0 { v.index = v.index + lexdb_sql.DEF_MARK + p.src[from..len(p.src)] }
+        if from >= 0 {
+            v.index = v.index + lexdb_sql.DEF_MARK
+            if cutAt >= 0 {
+                v.index = v.index + p.src[from..cutAt] + p.src[cutAt + 2..cutAlter] + p.src[cutAlter + 5..len(p.src)]
+            } else if alterOnly {
+                // SQL Server keeps an ALTER VIEW's text as CREATE VIEW's
+                v.index = v.index + "CREATE" + p.src[from + 5..len(p.src)]
+            } else {
+                v.index = v.index + p.src[from..len(p.src)]
+            }
+        }
     }
     else if p.ora { v.index = ORA_VIEW + v.index }
     // the query's subqueries were parsed into the statement's: dropped (the
@@ -5739,6 +5908,15 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 p.pos = back
             }
+            if p.tsql && p.isKw("database") {
+                p.pos += 1
+                return p.alterDatabase()
+            }
+            if p.tsql && p.isKw("view") {
+                // ALTER VIEW name [(columns)] AS query: the view there is given a new definition
+                p.pos += 1
+                return p.createView(false, true)
+            }
             if p.acceptKw("view") {
                 var v = lexdb_sql.newStmt(S_ALTER_VIEW)
                 if p.acceptKw("if") {
@@ -5822,15 +6000,52 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "delete" { return p.delete() }
         "merge" { return p.merge() }
         "truncate" { return p.truncate() }
+        "rename" {
+            // Oracle's RENAME old TO new: a table, view or sequence (design/lexdb-dialect-gaps.md, package B)
+            if !p.ora { return Err(near(&t)) }
+            var s = lexdb_sql.newStmt(S_ALTER)
+            s.mdialect = MD_ORA
+            s.table = try p.rname()
+            try p.expectKw("to")
+            let to = try p.name()
+            var a = lexdb_sql.alterOf(A_RENAME, &to)
+            a.col.spell = p.spelled.clone()
+            append(mut &s.alters, a)
+            return Ok(s)
+        }
         "vacuum", "analyze", "analyse", "checkpoint", "reindex", "cluster" { return p.maint(&t.text) }
         "copy" { return p.copyStmt() }
         "create" {
+            // CREATE OR REPLACE (PostgreSQL, Oracle) and CREATE OR ALTER (T-SQL) each take their own
+            // dialect's keyword: the other's is a syntax error, as the server gives it
             var orReplace = false
-            if p.isKw("or") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "replace" {
-                p.pos += 2
-                orReplace = true
-                if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") {
-                    return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE is supported for views, functions and procedures only"))
+            if p.isKw("or") {
+                let w = p.peekAt(1).clone()
+                if w.kind == T_IDENT && ((p.tsql && w.text == "alter") || (!p.tsql && w.text == "replace")) {
+                    p.pos += 2
+                    orReplace = true
+                    if p.ora && p.isKw("force") {
+                        return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE FORCE VIEW (a view with errors) is not supported"))
+                    }
+                    if p.ora && p.isKw("noforce") { p.pos += 1 }
+                    if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") {
+                        // the kinds the dialect's server has OR ALTER | OR REPLACE for, lexdb not yet; for any other kind
+                        // the server's syntax error (Oracle's: ORA-00922, missing or invalid option)
+                        let kind = p.peek().text.clone()
+                        let has = if p.tsql { ["procedure", "proc", "function", "trigger"] }
+                                  else if p.ora { ["procedure", "function", "package", "trigger", "synonym", "type", "editionable", "noneditionable", "public"] }
+                                  else { ["function", "procedure", "trigger", "rule", "language", "aggregate", "transform", "constraint"] }
+                        var found = false
+                        for h in has { if h == kind { found = true } }
+                        if !found { return Err(if p.ora { lexdb_base.err("ORA00922", "missing or invalid option") } else { near(&p.peek()) }) }
+                        let how = if p.tsql { "ALTER" } else { "REPLACE" }
+                        return Err(lexdb_base.err("0A000", &("lexdb: CREATE OR " + how + " " + strings.toUpperAscii(&kind) +
+                                                             " is not supported yet (CREATE OR " + how + " takes a view)")))
+                    }
+                } else if p.ora {
+                    return Err(lexdb_base.err("ORA00922", "missing or invalid option"))
+                } else {
+                    return Err(near(&w))
                 }
             }
             if p.isKw("function") || p.isKw("procedure") {
@@ -5850,7 +6065,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 p.pos += 1
             }
             if p.acceptKw("view") {
-                var v = try p.createView(orReplace)
+                var v = try p.createView(orReplace, false)
                 v.temp = temp
                 return Ok(v)
             }
@@ -5935,7 +6150,16 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw("index")
                 return p.createIndex(true)
             }
-            return Err(lexdb_base.err("0A000", "only CREATE TABLE, CREATE INDEX, CREATE SCHEMA and CREATE SEQUENCE are supported"))
+            // a kind of object lexdb does not make yet, or not an object kind at all
+            let kind = p.peek().text.clone()
+            if p.peek().kind == T_IDENT && lexdb_base.hasStr(&["procedure", "proc", "function", "trigger", "synonym", "domain", "extension", "aggregate",
+                                                                "operator", "rule", "policy", "publication", "subscription", "tablespace", "database",
+                                                                "materialized", "foreign", "event", "language", "cast", "collation", "conversion",
+                                                                "statistics", "default", "login", "package", "global", "private", "public", "edition"], &kind) {
+                return Err(lexdb_base.err("0A000", &("lexdb: CREATE " + strings.toUpperAscii(&kind) + " is not supported yet (CREATE makes tables, views, " +
+                                                     "indexes, schemas, sequences, types, roles and users)")))
+            }
+            return Err(near(&p.peek()))
         }
         "explain" {
             var s = lexdb_sql.newStmt(S_EXPLAIN)
@@ -7258,7 +7482,12 @@ fn (p: &P) unnamedParam(): bool {
 // that is not installed).
 fn (p: mut &P) createRoutine(orReplace: bool, proc: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.tsql && proc { return Err(lexdb_base.err("TS111", "'CREATE/ALTER PROCEDURE' must be the first statement in a query batch.")) }
-    if p.tsql || p.ora { return Err(lexdb_base.err("0A000", "lexdb: CREATE FUNCTION is not supported in this dialect yet")) }
+    if p.tsql {
+        // T-SQL's functions are a later slice of package F
+        return Err(lexdb_base.err("0A000", if orReplace { "lexdb: CREATE OR ALTER FUNCTION is not supported yet (CREATE OR ALTER takes a view)" }
+                                           else { "lexdb: CREATE FUNCTION is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)" }))
+    }
+    if p.ora { return Err(lexdb_base.err("0A000", "lexdb: CREATE FUNCTION is not supported in this dialect yet")) }
     var s = lexdb_sql.newStmt(S_CREATE_ROUTINE)
     s.ifFlag = orReplace
     var r = emptyRoutine(proc, lexdb_sql.RD_PG)

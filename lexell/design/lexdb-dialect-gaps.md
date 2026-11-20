@@ -139,10 +139,10 @@ Queue (pairs that touch different files):
 | Package | Branch | State |
 |---|---|---|
 | A | `worktree-agent-a904a69d9594c5747` | merged (a1aa79e3; TPC-H 0.998 of 6dc5e38f alternated, checksums equal; with the session's SYSTEM_USER memo entry dropped at close); section 5 |
-| B | | not started |
+| B | worktree-agent-a1e05408b04aabd79 | merged (fdee644f; TPC-H 0.993 of f07b6e5d alternated, checksums equal); done 2026-11-20: `a3eacc68` (CREATE OR ALTER VIEW, ALTER VIEW, OR REPLACE in each dialect's rules, the misleading CREATE error), `16e65314` (ALTER DATABASE ... SET, new module lexdb_dbopt), `3faf9a1a` (renames: sp_rename, Oracle RENAME, PostgreSQL views following), and `13dafca3` (ALTER COLUMN type: T-SQL, PostgreSQL, Oracle MODIFY); suite 218 of 218. Tests: exec_ddl (PostgreSQL 18), tds_ddl (SQL Server 2022), tds_ddlgaps (hand: "not supported yet" messages), tns_ddl (Oracle: answers by hand from the documentation, no Oracle at hand). Left: views follow renames by a recorded overlay (Table.rn), so pg_get_viewdef and OBJECT_DEFINITION keep the text as written; a PostgreSQL view on a retyped column is found by the names in its text (it may refuse a column PostgreSQL would allow); a foreign key's column cannot be retyped (0A000, PostgreSQL allows compatible types); retyping a serial or identity column to text; PostgreSQL's re-binding of a CHECK after a type change (42883) is not done (the rows are rechecked); T-SQL nvarchar is not told from varchar (so varchar to nvarchar on an indexed column is not 5074), tinyint is smallint, ALTER COLUMN ... COLLATE, ALTER DATABASE READ_ONLY/SINGLE_USER/OFFLINE and its other forms, `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` does not check ALLOW_SNAPSHOT_ISOLATION (3952), a table named as another table's index (SQL Server allows, lexdb's indexes share the schema's names), CREATE VIEW not first in a batch is not 111; Oracle: from memory ORA-14155 (RENAME without COLUMN), ORA-00905 (ALTER COLUMN), ORA-01439/01440/01441/02296, a `select *` view over a renamed column is not invalidated, CREATE OR REPLACE FORCE VIEW |
 | C | | not started |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
-| E | `worktree-agent-a5b25663707eeb5fb` | done, awaiting review; section 6 |
+| E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
 | F | | not started |
 
 ## 5. Package A: what was done
@@ -261,3 +261,9 @@ without privilege on the table is the least sure; 23ai's ORA-41900 for DML
 without privilege on a readable table is still 01031 here). A view's text is
 kept unqualified and resolved along the reader's path, so a view made in
 another schema must name its tables with their schema to be read by others.
+
+Open points from review (package E): grant options are not modelled (PostgreSQL and SQL Server
+refuse WITH GRANT OPTION, Oracle accepts and ignores it); column privileges, DENY and schema
+permissions are not done; Oracle object privileges other than SELECT/INSERT/UPDATE/DELETE
+(ALTER, INDEX, ...) are still accepted and ignored; the TNS and TDS expectations (error numbers,
+view columns) are from documentation, not run against real servers.
