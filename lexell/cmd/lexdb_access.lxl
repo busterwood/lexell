@@ -504,12 +504,12 @@ pub fn tailOf(ix: int, los: &[]Val, his: &[]Val, capNulls: bool): Tail {
 // the end (exclusive).
 // want: the rows the next batch of a backward or point read takes (0: its
 // first size); it doubles per batch up to BROWS, so a LIMIT reads little
-// past its rows.
-pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int }
+// past its rows. pos: a lookup list's scans taken so far (fillRanges).
+pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int; pub pos: int }
 
-pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0} }
+pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0, pos: 0} }
 
-pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want} }
+pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos} }
 
 // The first batch size of a backward or point read, and the next one.
 const FIRST_WANT = 32
@@ -1508,6 +1508,75 @@ pub fn fillPoints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ks
     }
 }
 
+// The rows a lookup list's batch may hold (bytes at ROOM_ROW each): past
+// it fewer keys are read together.
+const ROOM_BYTES = 8 * 1024 * 1024
+const ROOM_ROW = 64
+
+// The keys of a lookup list's first chunk where the read may stop early
+// (a LIMIT): a few keys' rows are often enough.
+const FIRST_KEYS = 2
+
+// The chunks of lookup lists read (the tests).
+var rangeChunkN: int = 0
+pub fn rangeChunks(): int { return rangeChunkN }
+
+// The next batch of a lookup list over index ix (-1 the primary key): scans
+// (an IN list's values or a primary key's prefixes, each a range [key, its
+// successor), as inScans makes them: unique, in key order, backward when
+// desc), the keys after cur's, up to cur's next size, read together
+// (rangeMany: in one pass over the sorted ranges, an index's entries decoded
+// when they cover the columns used, else their rows by getMany) and given in
+// the list's order: each range's rows in index order (reversed when desc).
+// cur.pos: the scans taken. A chunk whose rows do not fit in room (bytes; -1
+// ROOM_BYTES) is read in halves. stops: the read may stop early (a LIMIT):
+// the first chunk is FIRST_KEYS keys, not 32. None: a value its column's batch cannot
+// hold, or one key's rows past room.
+pub fn fillRanges(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, scans: &[]Scan, desc: bool, part: bool,
+                  cur: mut &Cursor, bp: &BPlan, room: int, stops: bool): Result[Option[Picked], DbErr] {
+    let from = cur.pos
+    // (a read that may stop early starts with few keys)
+    if stops && cur.want == 0 { cur.want = FIRST_KEYS }
+    var n = nextWant(cur)
+    let room0 = if room >= 0 && room < ROOM_BYTES { room } else { ROOM_BYTES }
+    while true {
+        let to = min(len(scans), from + n)
+        var pr = probes(ix, to - from)
+        for i in from..to { append(mut &pr.keys, scans[i].lo.clone()) }
+        var over = false
+        let got = try rangeManyIn(st, txn, t, ix, &pr, &noTail(), false, false, bp, part, room0, ROOM_ROW, mut &over)
+        match got {
+            Some(rg0) {
+                var rg = rg0
+                let rows = replace(mut &rg.rows, lexdb_rows.newBatch(bp, 0))
+                var idx: []int = withCapacity(rows.n)
+                for i in 0..(to - from) {
+                    if desc {
+                        var r = rg.hi[i]
+                        while r > rg.lo[i] {
+                            r -= 1
+                            append(mut &idx, r)
+                        }
+                    } else {
+                        for r in rg.lo[i]..rg.hi[i] { append(mut &idx, r) }
+                    }
+                }
+                rangeChunkN += 1
+                cur.pos = to
+                cur.started = true
+                cur.done = to >= len(scans)
+                cur.want = min(BROWS, n * 2)
+                return Ok(Some(Picked{kept: len(idx), idx: idx, b: rows}))
+            }
+            None {
+                if !over || n == 1 { return Ok(None) }
+                n = n / 2
+            }
+        }
+    }
+    return Ok(None)
+}
+
 // The next batch of a primary key's backward read: up to cur's next size of
 // the entries of [sc.lo, cur's end or sc.hi), from the last one backward,
 // their rows decoded in that order (descending). With part, a stored-apart
@@ -1969,6 +2038,14 @@ pub type Ranged = record {
 // hold.
 pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, pr: &Probes, tail: &Tail, noRange: bool,
                  one: bool, bp: &BPlan, part: bool, room0: int, perRow: int): Result[Option[Ranged], DbErr] {
+    var over = false
+    return rangeManyIn(st, txn, t, ix, pr, tail, noRange, one, bp, part, room0, perRow, mut &over)
+}
+
+// rangeMany, telling whether a None is for room (over: fewer keys may
+// fit), not for a value its column's batch cannot hold.
+pub fn rangeManyIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, pr: &Probes, tail: &Tail, noRange: bool,
+                   one: bool, bp: &BPlan, part: bool, room0: int, perRow: int, outOver: mut &bool): Result[Option[Ranged], DbErr] {
     let index = ix >= 0
     var dec = IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}
     var only = false
@@ -2133,6 +2210,7 @@ pub fn rangeMany(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix:
         if lo[x] < 0 { lo[x] = next } else { next = lo[x] }
     }
     if len(bad) > 0 { return Err(bad[0].clone()) }
+    outOver = over && !bail
     if bail || over { return Ok(None) }
     for a in 0..len(apart) {
         let got = if part { try st.getPart(txn, t.tree, &apart[a]) } else { try st.get(txn, t.tree, &apart[a]) }

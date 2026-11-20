@@ -1,0 +1,226 @@
+// lexdb_exec: an index's IN list, = ANY (array) and IN (subquery) lookups,
+// and a composite primary key's prefix list, read in batches: one pass over
+// the sorted ranges, a chunk of keys at a time (32 doubling to BROWS,
+// lexdb_access.fillRanges over rangeMany), against the same statements with
+// SET lexdb_batch = off. The rows (or the error) must agree: lists of 1, 31,
+// 32, 33, 63, 64, 65, 1,025 and 2,000 values; values missing, repeated, and
+// NULL; an index with equal values (a few rows per value); ASC and DESC; ORDER
+// BY the indexed column with LIMIT and OFFSET; a text under a case-insensitive
+// collation; an index read alone and with its rows; IN (subquery) and an array
+// parameter; a leading equality then an IN list on the next column; a
+// primary key of two columns and a list on its first; a filter rejecting most
+// rows; an aggregate and a join over a list; an error in a later chunk.
+// expect: shapes: 102 queries, 102 the same on and off
+// expect: errors: reached ERR 22012, not reached rows
+// expect: array parameter: same, 1 plans
+// expect: chunks: list of 1 0, 31 1, 32 1, 33 2, 65 2, 2000 values 6, limit 5 of 2000 1, desc 2000 6, composite 2000 4, subquery 5, another table 4
+// expect: not batched: aggregate 0, a point list on the primary key 0
+
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_access"
+import "../../../cmd/lexdb_parse"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn held(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERR " + e.state }
+    }
+}
+
+fn load(s: mut &lexdb_exec.Session) {
+    // c: three rows to a value (id / 3), NULL for every 17th row; ci: a
+    // text, upper and lower case; d: 0 to 9
+    let a = held(s, &"create table t (id int primary key, c int, d int, ci text collate \"Latin1_General_CI_AS\", w text)")
+    let b = held(s, &"create index t_c on t (c)")
+    let b2 = held(s, &"create index t_cd on t (d, c)")
+    let b3 = held(s, &"create index t_ci on t (ci)")
+    var id = 1
+    for chunk in 0..30 {
+        var rows: []str = []
+        for i in 0..100 {
+            let c = if id % 17 == 0 { "null" } else { (id / 3).toStr() }
+            let ci = "'" + (if id % 2 == 0 { "K" } else { "k" }) + (id % 40).toStr() + "'"
+            append(mut &rows, "(" + id.toStr() + ", " + c + ", " + (id % 10).toStr() + ", " + ci + ", 'w" + (id % 13).toStr() + "')")
+            id += 1
+        }
+        let r = held(s, &("insert into t values " + strings.join(&rows, ", ")))
+    }
+    let p = held(s, &"create table p (a int, b int, v int, primary key (a, b))")
+    let pi = held(s, &"create index p_v on p (v)")
+    var rows: []str = []
+    for i in 0..3000 { append(mut &rows, "(" + (i / 4).toStr() + ", " + (i % 4).toStr() + ", " + (i % 97).toStr() + ")") }
+    let pr = held(s, &("insert into p values " + strings.join(&rows, ", ")))
+    let k = held(s, &"create table k (id int primary key, x int)")
+    var ks: []str = []
+    for i in 1..2501 { append(mut &ks, "(" + i.toStr() + ", " + ((i * 7) % 1500).toStr() + ")") }
+    let kr = held(s, &("insert into k values " + strings.join(&ks, ", ")))
+    let an = held(s, &"analyze")
+}
+
+// n values from 0, stepping by step modulo m (repeats once n passes m / step),
+// then a NULL if nul.
+fn list(n: int, step: int, m: int, nul: bool): str {
+    var vs: []str = []
+    for i in 0..n { append(mut &vs, ((i * step) % m).toStr()) }
+    if nul { append(mut &vs, "null") }
+    return strings.join(&vs, ", ")
+}
+
+fn chunks(s: mut &lexdb_exec.Session, sql: &str): int {
+    let c0 = lexdb_access.rangeChunks()
+    let r = held(s, sql)
+    return lexdb_access.rangeChunks() - c0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        load(mut &s)
+        let l1 = list(1, 1, 1000, false)
+        let l31 = list(31, 37, 1100, false)
+        let l32 = list(32, 37, 1100, false)
+        let l33 = list(33, 37, 1100, true)
+        let l65 = list(65, 41, 1300, false)
+        let l1025 = list(1025, 13, 1500, false)
+        let l2000 = list(2000, 7, 1500, true)
+        let lists = [l1.clone(), l31.clone(), l32.clone(), l33.clone(), l65.clone(), l1025.clone(), l2000.clone()]
+        var shapes: []str = []
+        for l in lists {
+            append(mut &shapes, "select * from t where c in (" + l + ") order by c, id")
+            append(mut &shapes, "select * from t where c in (" + l + ") order by c desc, id desc")
+            append(mut &shapes, "select c, id from t where c in (" + l + ") order by c")
+            append(mut &shapes, "select id, w from t where c in (" + l + ") order by c limit 10")
+            append(mut &shapes, "select id, w from t where c in (" + l + ") order by c desc limit 10")
+            append(mut &shapes, "select c from t where c in (" + l + ") order by c limit 40 offset 3")
+            append(mut &shapes, "select id from t where c in (" + l + ") and d = 3 order by c, id")
+            append(mut &shapes, "select count(*), sum(id) from t where c in (" + l + ")")
+        }
+        let more = [
+            "select * from t where c in (5, 5, 5, 6) order by c, id",
+            "select * from t where c in (null) order by c",
+            "select * from t where c in (null, 7) order by c, id",
+            "select * from t where c in (99999, -5) order by c",
+            "select * from t where c in (1, 2, 3) and d > 100",
+            "select * from t where c = any (array[3, 1, 2, 2, 900]) order by c, id",
+            "select * from t where c = any (array[3, 1, 2, null, 900]) order by c desc, id",
+            "select c, id from t where c = any (array[3, 1, 2, null, 900]) limit 5",
+            "select * from t where c in (select x from k where id < 40) order by c, id",
+            "select * from t where c in (select x from k where id < 40) order by c desc, id",
+            "select * from t where c in (select x from k where id < 40) order by c limit 7",
+            "select * from t where c in (select x from k) order by c, id",
+            "select * from t where c in (select x from k) order by c desc limit 100",
+            "select * from t where c in (select x from k) order by c limit 1025",
+            "select count(*) from t where c in (select x from k)",
+            "select * from t where c not in (select x from k) order by c limit 5",
+            "select * from t where d = 3 and c in (5, 99, 180, 300, 301, 302) order by c, id",
+            "select * from t where d = 3 and c in (5, 99, 180, 300, 301, 302) order by c desc, id",
+            "select id from t where d = 3 and c in (5, 99, 180, 300, 301, 302)",
+            "select id, c from t where d = 4 and c in (select x from k where id < 400) order by c limit 9",
+            "select * from t where ci in ('k5', 'K6', 'k17', 'k39', 'nope') order by ci, id",
+            "select * from t where ci in ('K5', 'k6', 'K17') order by ci desc, id limit 12",
+            "select ci from t where ci in ('k5', 'K6', 'k17') order by ci",
+            "select t.id, p.v from t join p on p.a = t.d where t.c in (3, 5, 7, 100, 200) order by t.c, t.id, p.b limit 40",
+            "select t.id, p.v from t join p on p.a = t.d where t.c in (3, 5, 7, 100, 200) order by t.c desc, t.id, p.b limit 40",
+            "select p.a, count(*) from p where p.a in (1, 5, 9, 400, 401) group by p.a order by p.a",
+            "select * from p where a in (1, 5, 9, 400, 401, 17, 2) order by a, b",
+            "select * from p where a in (1, 5, 9, 400, 401, 17, 2) order by a desc, b desc",
+            "select * from p where a in (1, 5, 9, 400, 401, 17, 2) order by a, b limit 6",
+            "select * from p where a in (1, 5, 9, 400, 401, 17, 2) order by a desc, b desc limit 6",
+            "select * from p where a in (select x from k where id < 90) order by a, b",
+            "select * from p where a in (select x from k where id < 90) order by a desc, b limit 30",
+            "select * from p where a in (" + list(300, 3, 700, false) + ") order by a, b",
+            "select * from p where a in (" + list(300, 3, 700, false) + ") order by a desc, b desc limit 700",
+            "select * from p where a = 5 and b in (0, 2, 9)",
+            "select * from p where a = any (array[5, 7, 9]) and v > 20 order by a, b",
+            "select * from p where v in (3, 5, 7, 11, 13, 17) order by v, a, b",
+            "select * from p where v in (3, 5, 7, 11, 13, 17) order by v desc, a, b limit 20",
+            "select v, count(*) from p where v in (3, 5, 7, 11, 13, 17) group by v order by v",
+            "select * from t where id in (5, 7, 9, 2999, 3001) order by id",
+            "select * from t where id in (5, 7, 9, 2999, 3001) order by id desc",
+            "select * from t where c in (" + l65 + ") and w in ('w1', 'w2') order by c, id limit 20",
+            "select 100 / (c - 300) from t where c in (" + l2000 + ") order by c limit 900",
+            "select 100 / (c - 300) from t where c in (" + l2000 + ") order by c limit 50",
+            "select 100 / (c - 300) from t where c in (" + l2000 + ") order by c desc limit 1500",
+            "select 100 / (c - 300) from t where c in (" + l2000 + ") order by c desc limit 60"
+        ]
+        for m in more { append(mut &shapes, m.clone()) }
+        var same = 0
+        var shown = 0
+        for sql in shapes {
+            let x = held(mut &s, &"set lexdb_batch = off")
+            let off = held(mut &s, &sql)
+            let y = held(mut &s, &"set lexdb_batch = on")
+            let on = held(mut &s, &sql)
+            if off == on {
+                same += 1
+            } else if shown < 4 {
+                shown += 1
+                println("DIFFERENT: " + sql[0..min(len(sql), 160)] + "\n  off: " + off[0..min(len(off), 200)] + "\n  on:  " + on[0..min(len(on), 200)])
+            }
+        }
+        println("shapes: " + len(shapes).toStr() + " queries, " + same.toStr() + " the same on and off")
+
+        let r1 = held(mut &s, &("select 100 / (c - 300) from t where c in (" + l2000 + ") order by c limit 900"))
+        let r2 = held(mut &s, &("select 100 / (c - 300) from t where c in (" + l2000 + ") order by c limit 50"))
+        println("errors: reached " + (if strings.startsWith(&r1, "ERR") { r1.clone() } else { "no error" }) + ", not reached " +
+                (if strings.startsWith(&r2, "ERR") { r2.clone() } else { "rows" }))
+
+        // an array parameter, its plan kept
+        let ps = lexdb_parse.parse(&"select id from t where c = any($1) order by c, id").unwrap()
+        let pt = s.paramTypes(&ps[0], &[])
+        var pc = lexdb_exec.newPlanCache()
+        let pv = lexdb_exec.paramVals(&[Some("{4,5,6,900}")], &pt).unwrap()
+        let pv2 = lexdb_exec.paramVals(&[Some("{7,8,300,301}")], &pt).unwrap()
+        let q1 = held(mut &s, &"set lexdb_batch = on")
+        let a1 = s.runCached(&ps[0], &pv, &pt, mut &pc).unwrap()
+        let a2 = s.runCached(&ps[0], &pv2, &pt, mut &pc).unwrap()
+        let q2 = held(mut &s, &"set lexdb_batch = off")
+        let b1 = s.runCached(&ps[0], &pv, &pt, mut &pc).unwrap()
+        let b2 = s.runCached(&ps[0], &pv2, &pt, mut &pc).unwrap()
+        var ok = len(a1.rows) == len(b1.rows) && len(a2.rows) == len(b2.rows) && len(a1.rows) > 0 && len(a2.rows) > 0
+        for i in 0..min(len(a1.rows), len(b1.rows)) { if lexdb_sql.text(&a1.rows[i][0]) != lexdb_sql.text(&b1.rows[i][0]) { ok = false } }
+        for i in 0..min(len(a2.rows), len(b2.rows)) { if lexdb_sql.text(&a2.rows[i][0]) != lexdb_sql.text(&b2.rows[i][0]) { ok = false } }
+        println("array parameter: " + (if ok { "same" } else { "DIFFERENT" }) + ", " + pc.plans.toStr() + " plans")
+
+        // the chunks a list is read in: 32 keys, then 64, ... (distinct, non-NULL values)
+        let z = held(mut &s, &"set lexdb_batch = on")
+        let c1 = chunks(mut &s, &("select * from t where c in (" + l1 + ") order by c"))
+        let c31 = chunks(mut &s, &("select * from t where c in (" + l31 + ") order by c"))
+        let c32 = chunks(mut &s, &("select * from t where c in (" + l32 + ") order by c"))
+        let c33 = chunks(mut &s, &("select * from t where c in (" + l33 + ") order by c"))
+        let c65 = chunks(mut &s, &("select * from t where c in (" + l65 + ") order by c"))
+        let c2000 = chunks(mut &s, &("select * from t where c in (" + l2000 + ") order by c"))
+        let cl = chunks(mut &s, &("select * from t where c in (" + l2000 + ") order by c limit 5"))
+        let cd = chunks(mut &s, &("select * from t where c in (" + l2000 + ") order by c desc"))
+        let cc = chunks(mut &s, &("select * from p where a in (" + list(2000, 3, 1200, false) + ") order by a, b"))
+        let cs = chunks(mut &s, &"select * from t where c in (select x from k where id < 700) order by c")
+        let co = chunks(mut &s, &("select * from p where v in (" + list(2000, 3, 1200, false) + ") order by v"))
+        println("chunks: list of 1 " + c1.toStr() + ", 31 " + c31.toStr() + ", 32 " + c32.toStr() + ", 33 " + c33.toStr() + ", 65 " + c65.toStr() +
+                ", 2000 values " + c2000.toStr() + ", limit 5 of 2000 " + cl.toStr() + ", desc 2000 " + cd.toStr() + ", composite 2000 " + cc.toStr() +
+                ", subquery " + cs.toStr() + ", another table " + co.toStr())
+        let ca = chunks(mut &s, &("select count(*) from t where c in (" + l65 + ")"))
+        let cp = chunks(mut &s, &"select * from t where id in (5, 7, 9) order by id")
+        println("not batched: aggregate " + ca.toStr() + ", a point list on the primary key " + cp.toStr())
+        s.close()
+        return 0
+    }).unwrap()
+}

@@ -364,7 +364,7 @@ the suite rerun) before review.
 
 | Item | Branch | State |
 |---|---|---|
-| 1 + 2 | | not started |
+| 1 + 2 | `worktree-agent-a4419715dc0aa104e` (commits `1d3f4fe3` item 1, then item 2 as its own commit) | both done, merged by the coordinator when reviewed. Item 1: `IxRead.small` / `PScan.stops`, `fillIdxRows` and `fillIdxOnly` take the cursor's 32 doubling to BROWS where the read may stop, the `index >= 0 && !covers && stops` refusal dropped from `scanBatches` and `firstBatches`; test `exec_idxlimit`. Item 2: `lexdb_access.fillRanges` (over `rangeManyIn`), `Src.multi`, `lexdb_pipe.rangesPick`, `firstBatches` admits an index's list (both directions) and a composite primary key's prefix list (forward); test `exec_idxin`. Left: the aggregate run's and the join run's first-table readers read a list one range at a time (batches per range), not chunked; a joined table's list (`scanBatches`) and `bLevelPlan` still refuse lists; a pure PK forward range with LIMIT still reads BROWS (not the doubling); a single key whose rows pass 8 MB falls to the row path |
 | 3 | | not started |
 | 4 + 5 | | not started |
 | 6 | | not started |

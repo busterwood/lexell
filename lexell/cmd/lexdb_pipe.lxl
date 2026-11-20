@@ -2169,6 +2169,7 @@ pub type Src = record {
     pub desc: bool
     pub keys: []str                 // row by row: a range's primary keys, already read (optimizer 19); [] none
     pub pts: []str                  // in batches: a primary key's points (an IN list's keys, sorted), read together; [] none
+    pub multi: bool                 // in batches: a lookup list's ranges (an index's IN list, a primary key's prefixes), read together a chunk at a time
 }
 
 // Where a run of pg reads its table t, from what its caller found for the
@@ -2211,11 +2212,11 @@ fn joinSrc(p: &lexdb_plan.PPlan, k: int, t: &lexdb_catalog.Table, scans: []lexdb
 }
 
 // A Src that reads nothing (a table looked up per row).
-pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: [], pts: []} }
+pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: [], pts: [], multi: false} }
 
 fn srcFor(ps: &lexdb_plan.PScan, groups: bool, t: &lexdb_catalog.Table, scans: []lexdb_access.Scan, index: int, desc: bool, covers: bool, how: int,
           keys: []str): Result[Src, DbErr] {
-    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: [], pts: []}
+    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: [], pts: [], multi: false}
     var ranges = false
     for s in scans { if !s.point && !s.empty { ranges = true } }
     src.scans = if how == 1 { [lexdb_access.wholeScan()] } else { scans }
@@ -2223,11 +2224,23 @@ fn srcFor(ps: &lexdb_plan.PScan, groups: bool, t: &lexdb_catalog.Table, scans: [
     // together in batches (pts), in key order
     var points = how != 1 && len(src.scans) > 0 && !desc
     for s in src.scans { if !s.point || s.empty { points = false } }
-    if !ps.batch || !(ranges || groups || points) {
+    // a lookup list's ranges (an IN list on an index, a primary key's
+    // prefixes): read a chunk of keys at a time (multi). Backward, a whole
+    // table in its place (an IN subquery past its limit) is read row by row,
+    // as the row path reads it, backward.
+    var lists = how != 1 && len(src.scans) > 1
+    var wholes = false
+    for s in src.scans {
+        if s.point || s.empty { lists = false }
+        if s.whole { wholes = true }
+    }
+    if wholes { lists = false }
+    if !ps.batch || !(ranges || groups || points) || (desc && wholes && how != 1) {
         if how == 0 { src.keys = keys }
         return Ok(src)
     }
     src.batch = true
+    src.multi = lists
     if index < 0 {
         src.rd.desc = desc
         if points { for s in src.scans { append(mut &src.pts, s.lowKey()) } }
@@ -2385,8 +2398,12 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     // a point list (src.pts) is one pass over its keys, read together; else
     // one pass per scan
     let pmode = len(src.pts) > 0
-    for pi in 0..(if pmode { 1 } else { len(src.scans) }) {
-        let s = if pmode { lexdb_access.noScan() } else { src.scans[pi].copy() }
+    let mmode = src.multi
+    // (the rows a chunk of a lookup list may hold: what the statement's
+    // memory leaves)
+    let room = if bud.maxHeld > 0 { bud.maxHeld - bud.held - bud.aside } else { -1 }
+    for pi in 0..(if pmode || mmode { 1 } else { len(src.scans) }) {
+        let s = if pmode || mmode { lexdb_access.noScan() } else { src.scans[pi].copy() }
         var cur = lexdb_access.newCursor()
         var rowPath = false
         var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
@@ -2395,6 +2412,8 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             let bar = if barCol >= 0 { srt.st[0].bar(barCol) } else { lexdb_access.noBar() }
             let got = if pmode {
                 try pointsPick(st, txn, &rel, &src.pts, sc.part, mut &cur, &bp, &cn)
+            } else if mmode {
+                try rangesPick(st, txn, &rel, src.index, &src.scans, src.desc, sc.part, mut &cur, &bp, &cn, room, sc.stops)
             } else {
                 try lexdb_access.fillPickIn(st, txn, &rel, &s, sc.part, mut &cur, &bp, &src.rd, &lazy,
                                             fn(skip: &[]bool, b: &Batch, idx: []int): Option[[]int] { return bNarrow(&cn, skip, b, idx) },
@@ -2460,9 +2479,9 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             spare = b
             if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
         }
-        if rowPath && pmode {
-            // the points from the batch's start on, row by row
-            let start = cur.resumeAt(&src.pts)
+        if rowPath && (pmode || mmode) {
+            // the points (or ranges) from the batch's start on, row by row
+            let start = if pmode { cur.resumeAt(&src.pts) } else { cur.pos }
             for k in start..len(src.scans) {
                 let one = src.scans[k].copy()
                 var c2 = lexdb_access.newCursor()
@@ -2484,6 +2503,27 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
 fn pointsPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, ks: &[]str, part: bool,
               cur: mut &lexdb_access.Cursor, bp: &lexdb_rows.Projection, cn: &[]BNode): Result[Option[lexdb_access.Picked], DbErr] {
     let got = try lexdb_access.fillPoints(st, txn, rel, ks, part, cur, bp)
+    match got {
+        Some(pk0) {
+            var pk = pk0
+            let none: []bool = []
+            let idx0 = replace(mut &pk.idx, [])
+            match bNarrow(cn, &none, &pk.b, idx0) {
+                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows())})) }
+                None { return Ok(None) }
+            }
+        }
+        None { return Ok(None) }
+    }
+}
+
+// The next batch of a lookup list (scans: an index's IN list, ranges in key
+// order) read together by fillRanges, its rows through the conditions cn.
+// None: as pointsPick's.
+fn rangesPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, ix: int, scans: &[]lexdb_access.Scan, desc: bool,
+              part: bool, cur: mut &lexdb_access.Cursor, bp: &lexdb_rows.Projection, cn: &[]BNode,
+              room: int, stops: bool): Result[Option[lexdb_access.Picked], DbErr] {
+    let got = try lexdb_access.fillRanges(st, txn, rel, ix, scans, desc, part, cur, bp, room, stops)
     match got {
         Some(pk0) {
             var pk = pk0
