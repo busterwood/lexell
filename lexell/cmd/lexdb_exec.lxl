@@ -7608,6 +7608,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     t.spell = s.spell.clone()
     for c in s.cols {
         if colIndex(&t.cols, &c.name) >= 0 { return Err(e("42701", &("column \"" + c.name + "\" specified more than once"))) }
+        if c.typ.oid == 0 && c.genKind == lexdb_sql.GEN_NONE { return Err(e("42601", "syntax error at or near \"generated\"")) }
         var col = lexdb_sql.colDef(&c.name, c.typ, c.notNull)
         col.identity = c.identity
         col.spell = c.spell.clone()
@@ -9067,6 +9068,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             // the rows there read the default as it is now (no row is
             // written), unless it is a sequence's or volatile: then each row
             // is given one when the table is rewritten (9.117)
+            if a.col.typ.oid == 0 && a.col.genKind == lexdb_sql.GEN_NONE { return Err(e("42601", "syntax error at or near \"generated\"")) }
             var col = lexdb_sql.colDef(&a.col.name, a.col.typ, a.col.notNull)
             col.identity = a.col.identity
             col.spell = a.col.spell.clone()
@@ -9242,6 +9244,30 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e("42601", &("column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column")))
                 }
                 t.cols[i].notNull = false
+            } else if a.kind == lexdb_sql.A_DROP_EXPR || a.kind == lexdb_sql.A_SET_EXPR {
+                // PostgreSQL's: a stored generated column made ordinary (its values stay), or given a new expression (its rows recomputed)
+                if t.cols[i].genKind == lexdb_sql.GEN_NONE {
+                    if a.kind == lexdb_sql.A_DROP_EXPR && a.ifFlag {
+                        notice(st, txn, &"00000", &("column \"" + a.name + "\" of relation \"" + rel + "\" is not a generated column, skipping"), &"")
+                        continue
+                    }
+                    return Err(e("55000", &("column \"" + a.name + "\" of relation \"" + rel + "\" is not a generated column")))
+                }
+                if a.kind == lexdb_sql.A_DROP_EXPR {
+                    if t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL {
+                        return Err(lexdb_base.errDetail("0A000", "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns",
+                                                        &("Column \"" + a.name + "\" of relation \"" + rel + "\" is a virtual generated column."), ""))
+                    }
+                    t.cols[i].genKind = lexdb_sql.GEN_NONE
+                    t.cols[i].gen = None
+                } else {
+                    match a.col.gen {
+                        Some(gx) { t.cols[i].gen = Some(lexdb_sql.cloneExpr(&gx)) }
+                        None {}
+                    }
+                    try genSetup(mut &t, i, s.mdialect)
+                    append(mut &fills, a.name.clone())
+                }
             } else if a.kind == lexdb_sql.A_ADD_IDENTITY {
                 try addIdentity(st, txn, mut &t, i, a)
             } else if a.kind == lexdb_sql.A_SET_IDENTITY {
@@ -18662,9 +18688,10 @@ type Defs = record {
 }
 
 fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Defs, DbErr] {
-    var d = Defs{vals: [], seqs: [], exprs: [], gens: lexdb_gen.genCols(&t.cols)}
+    var d = Defs{vals: [], seqs: [], exprs: [], gens: []}
     var names: []str = []
     for c in t.cols {
+        if c.genKind != lexdb_sql.GEN_NONE { append(mut &d.gens, len(d.vals)) }
         var v = Val.Null
         var sq = lexdb_catalog.noSeq()
         var x: Option[Expr] = None
@@ -19024,6 +19051,19 @@ fn noPull(): CopyPart { return CopyPart{rows: [], data: "", end: true, fail: "",
 
 fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart): Result[Res, DbErr] {
+    if len(s.names) > 0 && len(s.table) > 0 && !s.copy.bulk {
+        match try findTable(st, txn, &s.table) {
+            Some(gt) {
+                for n in s.names {
+                    let gi = colIndex(&gt.cols, &n)
+                    if gi >= 0 && gt.cols[gi].genKind != lexdb_sql.GEN_NONE {
+                        return Err(lexdb_base.errDetail("42P10", &("column \"" + n + "\" is a generated column"), "Generated columns cannot be used in COPY.", ""))
+                    }
+                }
+            }
+            None {}
+        }
+    }
     if !s.copy.from {
         if s.copy.batchRows > 0 { return Err(e("0A000", "lexdb: COPY's batch_rows only available using COPY FROM")) }
         if input.stream { return copyStream(st, txn, s, params, ptypes, lim, out) }
@@ -19235,6 +19275,7 @@ type FastCopyPlan = record {
 }
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
+    if lexdb_gen.anyGen(&t.cols) { return None }          // (a generated column is computed row by row)
     if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 { return None }
     if s.copy.delim != "\t" || s.copy.null != "\\N" { return None }
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
