@@ -888,6 +888,19 @@ fn appendRows(rows: mut &[][]Val, more: [][]Val) {
     for i in 0..len(m) { append(rows, replace(mut &m[i], [])) }
 }
 
+// A role's principal_id in sys.database_principals: public 0, a superuser (or a name no role has: a trusted login) dbo 1,
+// else 5 and on over the other roles in their order.
+fn sysPrincipalId(roles: &[]lexdb_catalog.Role, name: &str): int {
+    if len(name) == 0 { return 0 }
+    var n = 0
+    for role in roles {
+        if role.superuser { continue }
+        if role.name == name { return 5 + n }
+        n += 1
+    }
+    return 1
+}
+
 pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] {
     let snap = &cq.snap
     let roles = &cq.roles
@@ -931,7 +944,37 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
             }
         }
         "configurations", "syslanguages", "fulltext_languages", "database_scoped_configurations", "data_spaces",
-        "database_files", "dm_os_host_info", "database_permissions" { rows = sysFull(view) }
+        "database_files", "dm_os_host_info" { rows = sysFull(view) }
+        "database_permissions" {
+            // SQL Server's own, then each GRANT on a table or view: class 1 (an object), its object_id, the grantee and the
+            // grantor (the owner) by their principal ids, one row a permission (a table's five; lexdb's TRUNCATE and
+            // TRIGGER are no permission of SQL Server's)
+            rows = sysFull(&"database_permissions")
+            for r in lexdb_catalog.privRows(snap) {
+                if r.kind == "sequence" { continue }
+                var type_ = ""
+                var pname = ""
+                if r.letter == "r" { type_ = "SL  "; pname = "SELECT" }
+                else if r.letter == "a" { type_ = "IN  "; pname = "INSERT" }
+                else if r.letter == "w" { type_ = "UP  "; pname = "UPDATE" }
+                else if r.letter == "d" { type_ = "DL  "; pname = "DELETE" }
+                else if r.letter == "x" { type_ = "RF  "; pname = "REFERENCES" }
+                else { continue }
+                if !lexdb_catalog.privSeen(cq, &r.owner, &r.to, true) { continue }
+                var p = sysTemplate(&"database_permissions")
+                p.set(&"class", iv(1))
+                p.set(&"class_desc", tv(&"OBJECT_OR_COLUMN"))
+                p.set(&"major_id", iv(r.oid))
+                p.set(&"minor_id", iv(0))
+                p.set(&"grantee_principal_id", iv(sysPrincipalId(roles, &r.to)))
+                p.set(&"grantor_principal_id", iv(sysPrincipalId(roles, &r.owner)))
+                p.set(&"type", tv(&type_))
+                p.set(&"permission_name", tv(&pname))
+                p.set(&"state", tv(&"G"))
+                p.set(&"state_desc", tv(&"GRANT"))
+                append(mut &rows, p.row())
+            }
+        }
         "databases" {
             rows = sysFull(&"databases")
             append(mut &rows, sysDbRow(&snap))
@@ -958,13 +1001,21 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
             }
         }
         "database_principals" {
-            // superusers are dbo; another role that logs in is a user of its name
+            // superusers are dbo; another role that logs in is a user of its name, one that does not a database role
+            // (their ids are sysPrincipalId's: sys.database_permissions names them)
             rows = sysFull(&"database_principals")
             var n = 0
             for role in roles {
-                if !role.login || role.superuser { continue }
+                if role.superuser { continue }
                 var r = sysTemplate(&"database_principals")
                 r.set(&"name", tv(&role.name))
+                if !role.login {
+                    r.set(&"type", tv(&"R"))
+                    r.set(&"type_desc", tv(&"DATABASE_ROLE"))
+                    r.set(&"default_schema_name", Val.Null)
+                    r.set(&"authentication_type", iv(0))
+                    r.set(&"authentication_type_desc", tv(&"NONE"))
+                }
                 r.set(&"principal_id", iv(5 + n))
                 r.set(&"sid", Val.Bytes(lexdb_catalog.sysSid(&role.name)))
                 r.set(&"create_date", sysTs())

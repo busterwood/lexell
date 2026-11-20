@@ -168,6 +168,16 @@ pub type CatView = record {
     pub mems: []str              // role memberships, as pg_auth_members reads them
     pub used: Map[str, int]      // a sequence's last value given, by its key: those used (pg_sequences, sys.sequences, sys.identity_columns)
     pub cur: Map[str, int]       // a sequence's current value: that last given, or the next one to give while none is (sys.sequences' current_value)
+    pub who: []str               // the privilege views: the roles the session acts as (its role, those it is a member of, PUBLIC "")
+    pub whoSuper: bool           // ... and whether it is a superuser (it sees every grant)
+}
+
+// Whether the privilege views show a grant to the session: it holds the grantee's role or the owner's (the grantor), or
+// the grantee is PUBLIC and the view lists those too; a superuser sees all.
+pub fn privSeen(cq: &CatView, owner: &str, to: &str, publicToo: bool): bool {
+    if cq.whoSuper { return true }
+    if len(to) == 0 { return publicToo || lexdb_base.hasStr(&cq.who, owner) }
+    return lexdb_base.hasStr(&cq.who, owner) || lexdb_base.hasStr(&cq.who, to)
 }
 
 // A hex digit's value, -1 not one.
@@ -258,7 +268,8 @@ pub type PrivRow = record {
     pub kind: str           // "table", "view" or "sequence"
     pub oid: int            // 0 for a sequence
     pub schema: str
-    pub name: str           // as the relation was spelled
+    pub name: str           // its name as lexdb folds it
+    pub spell: str          // as it was written ("" where it was not kept)
     pub owner: str          // the owning role (the session's user where none is known)
     pub to: str
     pub letter: str         // r a w d D x t (U for a sequence)
@@ -273,6 +284,7 @@ pub fn privRows(snap: &CatSnap): []PrivRow {
             var key = ""
             var oid = 0
             var name = ""
+            var spell = ""
             var kind = "table"
             if which == 2 {
                 key = snap.seqs[i].key.clone()
@@ -282,7 +294,8 @@ pub fn privRows(snap: &CatSnap): []PrivRow {
                 let ct = if which == 0 { &snap.tabs[i] } else { &snap.views[i] }
                 key = ct.key.clone()
                 oid = ct.oid
-                name = if len(ct.t.spell) > 0 { ct.t.spell.clone() } else { ct.name.clone() }
+                name = ct.name.clone()
+                spell = ct.t.spell.clone()
                 if which == 1 { kind = "view" }
             }
             let schema = lexdb_sql.schemaOf(&key)
@@ -296,7 +309,7 @@ pub fn privRows(snap: &CatSnap): []PrivRow {
             for g in a.grants {
                 if g.to == owner { continue }
                 for k in 0..len(g.privs) {
-                    append(mut &out, PrivRow{key: key.clone(), kind: kind, oid: oid, schema: schema.clone(), name: name.clone(), owner: owner.clone(), to: g.to.clone(), letter: g.privs[k..k + 1].toStr()})
+                    append(mut &out, PrivRow{key: key.clone(), kind: kind.clone(), oid: oid, schema: schema.clone(), name: name.clone(), spell: spell.clone(), owner: owner.clone(), to: g.to.clone(), letter: g.privs[k..k + 1].toStr()})
                 }
             }
         }

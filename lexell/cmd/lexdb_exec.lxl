@@ -21110,7 +21110,14 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             }
         }
     }
-    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur}
+    var who: []str = []
+    var whoSuper = false
+    if rel == "information_schema.table_privileges" || rel == "information_schema.role_table_grants" || rel == "sys.database_permissions" || strings.endsWith(rel, "_TAB_PRIVS") {
+        let w = try whoNow(st, txn)
+        who = w.roles.clone()
+        whoSuper = w.super
+    }
+    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
@@ -21520,7 +21527,27 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
             }
             return Ok(Some(Val.Int(if sysSuper(se) && r != "db_denydatareader" && r != "db_denydatawriter" { 1 } else { 0 })))
         }
-        "#has_perms_by_name" { return Ok(Some(Val.Int(1))) }
+        "#has_perms_by_name" {
+            // HAS_PERMS_BY_NAME('schema.table', 'OBJECT', 'SELECT'): the session's privilege on a table or view (NULL where
+            // it is none, as SQL Server's for a name it cannot find); the other classes and permissions are not modelled
+            if n >= 3 && !lexdb_ops.isNull(&vs[0]) && strings.toLowerAscii(&lexdb_sql.text(&vs[1])) == "object" {
+                let perm = strings.toLowerAscii(&lexdb_sql.text(&vs[2]))
+                if perm == "select" || perm == "insert" || perm == "update" || perm == "delete" || perm == "references" {
+                    var nm = strings.replaceAll(&(strings.replaceAll(&lexdb_sql.text(&vs[0]), "[", "")), "]", "")
+                    if strings.startsWith(&strings.toLowerAscii(&nm), "dbo.") { nm = "public." + nm[4..len(nm)] }
+                    match hasPrivFn(se, "has_table_privilege", &[Val.Text(nm), Val.Text(perm)]) {
+                        Ok(v) {
+                            match v {
+                                Val.Bool(b) { return Ok(Some(Val.Int(if b { 1 } else { 0 }))) }
+                                else { return Ok(Some(Val.Null)) }
+                            }
+                        }
+                        Err(_) { return Ok(Some(Val.Null)) }
+                    }
+                }
+            }
+            return Ok(Some(Val.Int(1)))
+        }
         else { return Ok(none) }
     }
 }
@@ -22044,6 +22071,11 @@ fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: &str
     if !(try may(st, txn, w, &lexdb_catalog.relObj(key), letter)) {
         if len(door) == 0 { door = doorOf(st, txn.sql.sess) }
         if door == "tds" { return Err(deniedTsql(letter, key)) }
+        // Oracle: a table the user cannot read is ORA-00942 (it is not there for it), one it can read but not use so is ORA-01031
+        if door == "tns" {
+            if letter == "r" || !(try may(st, txn, w, &lexdb_catalog.relObj(key), &"r")) { return Err(e("ORA00942", "table or view does not exist")) }
+            return Err(e("ORA01031", "insufficient privileges"))
+        }
         return Err(denied(kind, key))
     }
     return Ok(Unit{})

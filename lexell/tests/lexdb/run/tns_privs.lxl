@@ -1,0 +1,226 @@
+// lexdb over TNS: object privileges (design/lexdb-dialect-gaps.md, package E: O3 and O4). A table's owner grants SELECT,
+// INSERT, UPDATE, DELETE (REFERENCES, ALL) on it to another user or to PUBLIC, and the grantee reads and writes it across
+// schemas (u1.t) on that grant alone; REVOKE takes it away; a user that cannot see the table is told ORA-00942, one that
+// can read it but not write ORA-01031; a user that holds a privilege and cannot grant it is told ORA-01720, one that holds
+// none ORA-01031; a column list is ORA-03001 (not widened to the table); USER_, ALL_ and DBA_TAB_PRIVS list exactly what
+// is granted, in Oracle's columns; DROP TABLE and DROP VIEW take the grants with them. The expectations are Oracle's
+// as its documentation gives them (not run against a server here).
+// expect: before grant: error 942
+// expect: views before: 0
+// expect: grant select: 0
+// expect: select: 10;20
+// expect: insert denied: error 1031
+// expect: update denied: error 1031
+// expect: delete denied: error 1031
+// expect: grant insert update: 0
+// expect: insert: 1
+// expect: update: 2
+// expect: delete denied 2: error 1031
+// expect: grant delete: 0
+// expect: delete: 1
+// expect: owner sees: 1|11;2|21
+// expect: u3 before: error 942
+// expect: u3 insert: error 942
+// expect: u3 grants: error 1031
+// expect: u2 regrants: error 1720
+// expect: u2 grants nothing it holds not: error 1031
+// expect: missing table: error 942
+// expect: missing user: error 1917
+// expect: column grant: error 3001
+// expect: still not granted: error 942
+// expect: user_tab_privs u1: 'U2'|'U1'|'T'|'U1'|'DELETE'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U2'|'U1'|'T'|'U1'|'INSERT'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U2'|'U1'|'T'|'U1'|'SELECT'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U2'|'U1'|'T'|'U1'|'UPDATE'|'NO'|'NO'|'NO'|'TABLE'|'NO'
+// expect: user_tab_privs u2: 'U2'|'U1'|'T'|'U1'|'DELETE'|'NO';'U2'|'U1'|'T'|'U1'|'INSERT'|'NO';'U2'|'U1'|'T'|'U1'|'SELECT'|'NO';'U2'|'U1'|'T'|'U1'|'UPDATE'|'NO'
+// expect: user_tab_privs u3: 0
+// expect: all_tab_privs u2: 'U1'|'U2'|'U1'|'T'|'DELETE'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U1'|'U2'|'U1'|'T'|'INSERT'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U1'|'U2'|'U1'|'T'|'SELECT'|'NO'|'NO'|'NO'|'TABLE'|'NO';'U1'|'U2'|'U1'|'T'|'UPDATE'|'NO'|'NO'|'NO'|'TABLE'|'NO'
+// expect: all_tab_privs u3: 0
+// expect: dba_tab_privs: 'U2'|'U1'|'T'|'U1'|'DELETE'|'NO';'U2'|'U1'|'T'|'U1'|'INSERT'|'NO';'U2'|'U1'|'T'|'U1'|'SELECT'|'NO';'U2'|'U1'|'T'|'U1'|'UPDATE'|'NO'
+// expect: grant public: 0
+// expect: u3 as public: 11;21
+// expect: all_tab_privs u3 public: 'PUBLIC'|'SELECT'
+// expect: dba_tab_privs public: 'PUBLIC'|'SELECT';'U2'|'DELETE';'U2'|'INSERT';'U2'|'SELECT';'U2'|'UPDATE'
+// expect: revoke select: 0
+// expect: revoked select: 11;21
+// expect: revoke public: 0
+// expect: u3 revoked: error 942
+// expect: revoke update: 0
+// expect: update revoked: error 942
+// expect: insert still: 1
+// expect: dba after revokes: 'U2'|'DELETE';'U2'|'INSERT'
+// expect: grant all: 0
+// expect: all rows: 'DELETE';'INSERT';'REFERENCES';'SELECT';'UPDATE'
+// expect: u3 reads: 3
+// expect: grant view: 0
+// expect: view row: 'U2'|'TV'|'SELECT'|'VIEW'
+// expect: u2 reads view: 1;2;4
+// expect: revoke all: 0
+// expect: u3 after revoke all: error 942
+// expect: drop view: 0
+// expect: grants after drop view: 
+// expect: drop: 0
+// expect: grants after drop: 
+// expect: new table not granted: error 942
+// expect: new table privs: 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a statement's count, or its error's number
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var sa = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    for u in ["u1", "u2", "u3"] {
+        sa.exec(&("create user " + u + " identified by pw")).unwrap()
+        sa.exec(&("grant create session, create table to " + u)).unwrap()
+    }
+    var a = connect(&("User Id=u1;Password=pw;Data Source=" + dsn))
+    var b = connect(&("User Id=u2;Password=pw;Data Source=" + dsn))
+    var c = connect(&("User Id=u3;Password=pw;Data Source=" + dsn))
+    a.exec("create table t (id number primary key, v number)").unwrap()
+    a.exec("create view tv as select id from u1.t").unwrap()
+    a.exec("insert into t values (1, 10)").unwrap()
+    a.exec("insert into t values (2, 20)").unwrap()
+    a.exec("commit").unwrap()
+    say("before grant", q1(mut &b, &"select v from u1.t order by id"))
+    say("views before", q1(mut &sa, &"select count(*) from dba_tab_privs where owner = 'U1'"))
+    // SELECT
+    say("grant select", err(a.run("grant select on t to u2", &[])))
+    say("select", q1(mut &b, &"select v from u1.t order by id"))
+    say("insert denied", err(b.run("insert into u1.t values (3, 30)", &[])))
+    say("update denied", err(b.run("update u1.t set v = 0", &[])))
+    say("delete denied", err(b.run("delete from u1.t", &[])))
+    // INSERT, UPDATE, DELETE
+    say("grant insert update", err(a.run("grant insert, update on u1.t to u2", &[])))
+    say("insert", err(b.run("insert into u1.t values (3, 30)", &[])))
+    say("update", err(b.run("update u1.t set v = v + 1 where id < 3", &[])))
+    say("delete denied 2", err(b.run("delete from u1.t where id = 3", &[])))
+    say("grant delete", err(a.run("grant delete on t to u2", &[])))
+    say("delete", err(b.run("delete from u1.t where id = 3", &[])))
+    b.exec("commit").unwrap()
+    say("owner sees", q1(mut &a, &"select id, v from t order by id"))
+    // a user with no grant, and one that cannot grant
+    say("u3 before", q1(mut &c, &"select v from u1.t"))
+    say("u3 insert", err(c.run("insert into u1.t values (9, 9)", &[])))
+    say("u3 grants", err(c.run("grant select on u1.t to u3", &[])))
+    say("u2 regrants", err(b.run("grant select on u1.t to u3", &[])))
+    say("u2 grants nothing it holds not", err(b.run("grant references on u1.t to u3", &[])))
+    say("missing table", err(a.run("grant select on nothing to u2", &[])))
+    say("missing user", err(a.run("grant select on t to nobody", &[])))
+    say("column grant", err(a.run("grant update (v) on t to u3", &[])))
+    say("still not granted", q1(mut &c, &"select v from u1.t"))
+    // the views
+    say("user_tab_privs u1", q1(mut &a, &"select grantee, owner, table_name, grantor, privilege, grantable, hierarchy, common, type, inherited from user_tab_privs order by privilege"))
+    say("user_tab_privs u2", q1(mut &b, &"select grantee, owner, table_name, grantor, privilege, grantable from user_tab_privs order by privilege"))
+    say("user_tab_privs u3", q1(mut &c, &"select count(*) from user_tab_privs"))
+    say("all_tab_privs u2", q1(mut &b, &"select grantor, grantee, table_schema, table_name, privilege, grantable, hierarchy, common, type, inherited from all_tab_privs order by privilege"))
+    say("all_tab_privs u3", q1(mut &c, &"select count(*) from all_tab_privs"))
+    say("dba_tab_privs", q1(mut &sa, &"select grantee, owner, table_name, grantor, privilege, grantable from dba_tab_privs where owner = 'U1' order by privilege"))
+    // PUBLIC
+    say("grant public", err(a.run("grant select on t to public", &[])))
+    say("u3 as public", q1(mut &c, &"select v from u1.t order by id"))
+    say("all_tab_privs u3 public", q1(mut &c, &"select grantee, privilege from all_tab_privs order by 1"))
+    say("dba_tab_privs public", q1(mut &sa, &"select grantee, privilege from dba_tab_privs where owner = 'U1' order by 1, 2"))
+    // REVOKE
+    say("revoke select", err(a.run("revoke select on t from u2", &[])))
+    say("revoked select", q1(mut &b, &"select v from u1.t order by id"))
+    say("revoke public", err(a.run("revoke select on t from public", &[])))
+    say("u3 revoked", q1(mut &c, &"select v from u1.t"))
+    say("revoke update", err(a.run("revoke update on t from u2", &[])))
+    say("update revoked", err(b.run("update u1.t set v = 0", &[])))
+    say("insert still", err(b.run("insert into u1.t values (4, 40)", &[])))
+    b.exec("commit").unwrap()
+    say("dba after revokes", q1(mut &sa, &"select grantee, privilege from dba_tab_privs where owner = 'U1' order by 1, 2"))
+    // ALL and REFERENCES; a view
+    say("grant all", err(a.run("grant all on t to u3", &[])))
+    say("all rows", q1(mut &sa, &"select privilege from dba_tab_privs where owner = 'U1' and grantee = 'U3' order by 1"))
+    say("u3 reads", q1(mut &c, &"select count(*) from u1.t"))
+    say("grant view", err(a.run("grant select on tv to u2", &[])))
+    say("view row", q1(mut &sa, &"select grantee, table_name, privilege, type from dba_tab_privs where table_name = 'TV'"))
+    say("u2 reads view", q1(mut &b, &"select id from u1.tv order by id"))
+    say("revoke all", err(a.run("revoke all on t from u3", &[])))
+    say("u3 after revoke all", q1(mut &c, &"select count(*) from u1.t"))
+    // DROP TABLE takes the grants with it
+    say("drop view", err(a.run("drop view tv", &[])))
+    say("grants after drop view", q1(mut &sa, &"select grantee, table_name, privilege from dba_tab_privs where owner = 'U1' and table_name = 'TV'"))
+    say("drop", err(a.run("drop table t", &[])))
+    say("grants after drop", q1(mut &sa, &"select grantee, table_name, privilege from dba_tab_privs where owner = 'U1' order by 1, 2, 3"))
+    a.exec("create table t (id number primary key, v number)").unwrap()
+    a.exec("insert into t values (7, 70)").unwrap()
+    a.exec("commit").unwrap()
+    say("new table not granted", q1(mut &b, &"select v from u1.t"))
+    say("new table privs", q1(mut &sa, &"select count(*) from dba_tab_privs where owner = 'U1' and table_name = 'T'"))
+    c.logoff()
+    b.logoff()
+    a.logoff()
+    sa.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
