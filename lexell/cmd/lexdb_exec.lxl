@@ -572,6 +572,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
             if name == "#udf" { return udfEval(&vs, env) }
+            if name == "#plf" { return plfEval(&vs, env) }
             if name == "#tdiv" && len(vs) == 3 { return lexdb_lib.tdiv(&vs) }
             if name == "#tavg" && len(vs) == 2 { return lexdb_lib.tavg(&vs) }
             if isDialectFn(&name) {
@@ -673,7 +674,7 @@ fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val
 // (lexdb_pipe.entryAt; lexdb_lib.entry1Of for one argument: FN_ONE), after its
 // dialect's call for a T-SQL or Oracle name, as eval.
 fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
-    if lexdb_bind.isAgg(name) || name == "#win" || name == "#wmark" || name == "#udf" || name == "row" || lexdb_bind.isWinFn(name) ||
+    if lexdb_bind.isAgg(name) || name == "#win" || name == "#wmark" || name == "#udf" || name == "#plf" || name == "row" || lexdb_bind.isWinFn(name) ||
        lexdb_bind.isSeqFn(name) || isSessFn(name) || lexdb_bind.isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
         return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}
     }
@@ -25058,6 +25059,65 @@ fn udfEval(vs: &[]Val, env: &Env): Result[Val, DbErr] {
         }
         None { return Err(e("0A000", "lexdb: a function of the user's cannot be called here")) }
     }
+}
+
+// ---- Oracle's stored functions of a column in a query (package F, slice F3; lexdb_plcall)
+//
+// The call is Call("#plf", [function, arguments]) cast to the function's type. lexdb_plcall computes the function for each
+// combination of arguments the query will use before it runs (and again for any it missed), and keeps the values, as text, in the
+// store's memo under the session: the evaluator reads them. A combination it finds none for is noted (PLF_MISS) and gives NULL: the
+// run is not an answer, and lexdb_plcall computes it and runs the query again.
+
+fn plfKey(sess: int, fnid: &str, args: &str): str { return "\x00plf\x00" + sess.toStr() + "\x00" + fnid + "\x00" + args }
+
+fn plfMissKey(sess: int): str { return "\x00plfmiss\x00" + sess.toStr() }
+
+fn plfEval(vs: &[]Val, env: &Env): Result[Val, DbErr] {
+    match env.seq {
+        Some(se) {
+            let fnid = lexdb_sql.text(&vs[0])
+            let args = lexdb_ops.keyOfVals(vs, 1)
+            match se.st.memo.get(&plfKey(se.sess, &fnid, &args)) {
+                Some(v) {
+                    if v == "\x00" { return Ok(Val.Null) }
+                    return Ok(Val.Text(v[1..len(v)].toStr()))
+                }
+                None {
+                    // not computed: noted (once), for lexdb_plcall to compute
+                    let mk = plfMissKey(se.sess)
+                    let note = fnid + "\x00" + args
+                    let seen = se.st.memo.get(&mk).unwrapOr("")
+                    if !strings.contains(&("\x02" + seen + "\x02"), &("\x02" + note + "\x02")) { se.st.memo.put(&mk, &(if len(seen) > 0 { seen + "\x02" + note } else { note })) }
+                    return Ok(Val.Null)
+                }
+            }
+        }
+        None { return Err(e("0A000", "lexdb: a stored function of a column cannot be called here")) }
+    }
+}
+
+// The value a stored function was computed to for these arguments, kept for the query that is about to run (value: None NULL).
+pub fn (s: &Session) plfPut(fnid: &str, args: &str, value: &Option[str]) {
+    let v = match value {
+        Some(t) { "\x01" + t }
+        None { "\x00".toStr() }
+    }
+    s.st.memo.put(&plfKey(s.id, fnid, args), &v)
+}
+
+pub fn (s: &Session) plfHas(fnid: &str, args: &str): bool { return s.st.memo.get(&plfKey(s.id, fnid, args)).isSome() }
+
+pub fn (s: &Session) plfDrop(fnid: &str, args: &str) { s.st.memo.del(&plfKey(s.id, fnid, args)) }
+
+// The combinations the last run missed: function and arguments' key of each; the list is cleared.
+pub fn (s: &Session) plfMisses(): []str {
+    let mk = plfMissKey(s.id)
+    let seen = s.st.memo.get(&mk).unwrapOr("")
+    var out: []str = []
+    if len(seen) == 0 { return out }
+    s.st.memo.del(&mk)
+    for n in strings.split(&seen, "\x02") { append(mut &out, n.toStr()) }
+    return out
 }
 
 // The statement with its calls of T-SQL functions of the user's written out; None when it calls none. The functions are

@@ -1,0 +1,246 @@
+// lexdb_plcall: stored PL/SQL functions called in a query with a column's values (design/lexdb-dialect-gaps.md, package F, slice
+// F3). Oracle evaluates such a function for each row; here the call is written as Call("#plf", [function, arguments]) cast to the
+// function's type (the evaluator reads the value computed for its arguments from the store's memo: lexdb_exec.plfEval), and the
+// function is run (by lexdb_plsql) for each combination of arguments the query will use before it runs: a query that finds the
+// arguments of each call (the block's FROM and the conditions of it that call no function, its select list replaced by the
+// arguments, DISTINCT) gives them; one that missed a combination gives it back and the query is run again. So a function runs once
+// for each distinct combination of arguments in a query, not once for each row (Oracle does not say how often: only that it may be
+// cached for a deterministic function), and not at all for rows no condition leaves. A call in a DML statement, an argument that
+// is an aggregate or calls another stored function, and a call of a function through a database link are not done.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_exec"
+import "./lexdb_routine"
+import "./lexdb_ops"
+import "./lexdb_time"
+import "./lexdb_bind"
+import "./lexdb_plsql"
+
+type Stmt = lexdb_sql.Stmt
+type Expr = lexdb_sql.Expr
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+// A call of a stored function in a block of a query: the function, its result's type, and the query that gives its arguments.
+pub type Site = record { pub fnid: str; pub oid: int; pub driver: Stmt; pub hasDriver: bool }
+
+pub type Plan = record { pub sites: []Site }
+
+pub fn noPlan(): Plan { return Plan{sites: []} }
+
+pub type Rewritten = record { pub stmt: Stmt; pub plan: Plan }
+
+fn err(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// ---- the rewriting of a query
+
+// Whether an expression calls a stored function of the user's (or an aggregate): a call inside the arguments of a call is not done.
+fn callsStored(x: &Expr, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, aggs: bool): bool {
+    var found = false
+    let y = lexdb_routine.mapE(x, fn(e: &Expr): Option[Expr] {
+        match e {
+            Expr.Call(nm, args, star) {
+                if len(nm) > 0 && nm[0] != '#' {
+                    if lexdb_plsql.findFunction(pg, ip, &nm).isSome() { found = true }
+                    if aggs && lexdb_bind.isAgg(&nm) { found = true }
+                }
+            }
+            else {}
+        }
+        return None
+    })
+    return found
+}
+
+fn hasPlf(x: &Expr): bool {
+    var found = false
+    let y = lexdb_routine.mapE(x, fn(e: &Expr): Option[Expr] {
+        match e {
+            Expr.Call(nm, args, star) { if nm == "#plf" { found = true } }
+            else {}
+        }
+        return None
+    })
+    return found
+}
+
+// The conjuncts of a condition that call none of the functions: what the arguments' query keeps.
+fn plain(w: &Option[Expr]): Option[Expr] {
+    match w {
+        None { return None }
+        Some(x) {
+            var parts: []Expr = []
+            conjuncts(&x, mut &parts)
+            var out: Option[Expr] = None
+            for p in parts {
+                if hasPlf(&p) { continue }
+                let cur = replace(mut &out, None)
+                match cur {
+                    None { out = Some(p.clone()) }
+                    Some(a) { out = Some(Expr.Bin("and", a, p.clone())) }
+                }
+            }
+            return out
+        }
+    }
+}
+
+fn conjuncts(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" {
+                conjuncts(&a, out)
+                conjuncts(&b, out)
+                return
+            }
+        }
+        else {}
+    }
+    append(out, lexdb_sql.cloneExpr(x))
+}
+
+// The query that gives the arguments of a call of block t (its expressions already written): its FROM and what of its conditions
+// calls no function, the arguments as its select list, DISTINCT.
+fn driverOf(t: &Stmt, args: &[]Expr): Stmt {
+    var d = t.clone()
+    d.kind = lexdb_sql.S_SELECT
+    var items: []lexdb_sql.SelItem = []
+    for i in 0..len(args) { append(mut &items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.cloneExpr(&args[i])), alias: "a" + i.toStr(), spell: "a" + i.toStr()}) }
+    d.items = items
+    d.distinct = true
+    d.distinctOn = []
+    d.group = []
+    d.gsets = []
+    d.having = None
+    d.order = []
+    d.limit = None
+    d.offset = None
+    d.withTies = false
+    d.lockMode = 0
+    d.assign = []
+    d.where = plain(&t.where)
+    for i in 0..len(d.from) { d.from[i].on = plain(&t.from[i].on) }
+    return d
+}
+
+// A block of the query with its calls written, its subqueries' too; the calls found are added to plan.
+fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, plan: mut &Plan, failure: mut &Option[DbErr]): Stmt {
+    var found: []Site = []
+    var argLists: [][]Expr = []
+    var t = lexdb_routine.mapStmtTop(b, fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Call(nm, args, star) {
+                if star || len(nm) == 0 || nm[0] == '#' { return None }
+                match lexdb_plsql.findFunction(pg, ip, &nm) {
+                    Some(fi) {
+                        for a in args {
+                            if callsStored(&a, pg, ip, true) {
+                                if failure.isNone() { failure = Some(err("0A000", "lexdb: an argument of a stored function that is an aggregate or calls a stored function is not supported")) }
+                                return None
+                            }
+                        }
+                        var xs: []Expr = [Expr.Lit(Val.Text(fi.id.clone()))]
+                        var cl: []Expr = []
+                        for a in args {
+                            append(mut &xs, lexdb_sql.cloneExpr(&a))
+                            append(mut &cl, lexdb_sql.cloneExpr(&a))
+                        }
+                        append(mut &found, Site{fnid: fi.id.clone(), oid: fi.oid, driver: lexdb_sql.newStmt(lexdb_sql.S_SELECT), hasDriver: false})
+                        append(mut &argLists, cl)
+                        return Some(Expr.Cast(Expr.Call("#plf", xs, false), fi.ret.clone()))
+                    }
+                    None { return None }
+                }
+            }
+            else { return None }
+        }
+    })
+    if len(found) > 0 {
+        if t.setop != 0 && failure.isNone() { failure = Some(err("0A000", "lexdb: a stored function of a column in the ORDER BY of a set operation is not supported")) }
+        let driven = !(t.limit.isSome() && len(t.order) == 0)
+        for k in 0..len(found) {
+            if driven {
+                found[k].driver = driverOf(&t, &argLists[k])
+                found[k].hasDriver = true
+            }
+            append(mut &plan.sites, found[k].clone())
+        }
+    }
+    for i in 0..len(t.subs) { t.subs[i] = block(&t.subs[i], pg, ip, plan, failure) }
+    for i in 0..len(t.inner) { t.inner[i] = block(&t.inner[i], pg, ip, plan, failure) }
+    return t
+}
+
+// The query with each call of a stored function written as a lookup, and what it takes to fill them; None when it calls none.
+pub fn rewrite(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Option[Rewritten], DbErr] {
+    if !lexdb_plsql.hasUnits(pg) || s.kind != lexdb_sql.S_SELECT { return Ok(None) }
+    var plan = noPlan()
+    var failure: Option[DbErr] = None
+    let t = block(s, pg, ip, mut &plan, mut &failure)
+    match failure {
+        Some(e) { return Err(e) }
+        None {}
+    }
+    if len(plan.sites) == 0 { return Ok(None) }
+    return Ok(Some(Rewritten{stmt: t, plan: plan}))
+}
+
+// ---- running one
+
+fn oidOfSite(plan: &Plan, fnid: &str): int {
+    for s in plan.sites { if s.fnid == fnid { return s.oid } }
+    return lexdb_sql.OID_TEXT
+}
+
+// The function computed for one combination of arguments (key: lexdb_ops.keyOfVals), kept for the query: the keys put are noted.
+fn compute(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, fnid: &str, key: &str, put: mut &[]str): Result[Unit, DbErr] {
+    if sess.plfHas(fnid, key) { return Ok(Unit{}) }
+    let args = lexdb_ops.valsOfKey(key)
+    let v = try lexdb_plsql.callFunction(pg, ip, sess, fnid, &args)
+    var value: Option[str] = None
+    if !lexdb_ops.isNull(&v) { value = Some(lexdb_ops.textOut(&v, oidOfSite(plan, fnid), &lexdb_time.utc())) }
+    sess.plfPut(fnid, key, &value)
+    append(put, fnid + "\x00" + key)
+    return Ok(Unit{})
+}
+
+fn runIn(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, stmt: &Stmt, params: &[]Val, ptypes: &[]int,
+         pc: mut &lexdb_exec.PlanCache, put: mut &[]str): Result[lexdb_exec.Res, DbErr] {
+    // the arguments the queries of the calls give
+    for site in plan.sites {
+        if !site.hasDriver { continue }
+        match sess.run(&site.driver, params, ptypes) {
+            Ok(res) {
+                for row in res.rows { try compute(pg, ip, sess, plan, &site.fnid, &lexdb_ops.keyOfVals(&row, 0), put) }
+            }
+            Err(_) {}           // a shape that is not one (an outer reference): the misses of the run give them
+        }
+    }
+    var pass = 0
+    while true {
+        pass += 1
+        let r = sess.runCached(stmt, params, ptypes, pc)
+        let misses = sess.plfMisses()
+        if len(misses) == 0 { return r }
+        if pass > 50 { return Err(err("54000", "lexdb: the stored functions in the query did not settle")) }
+        for m in misses {
+            let z = strings.indexOf(&m, "\x00", 0)
+            try compute(pg, ip, sess, plan, &m[0..z], &m[z + 1..len(m)], put)
+        }
+    }
+    return Err(err("XX000", "unreachable"))
+}
+
+// The query run with its functions' values: computed first, and again where a run missed one; the values dropped after.
+pub fn run(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, stmt: &Stmt, params: &[]Val, ptypes: &[]int,
+           pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, DbErr] {
+    var put: []str = []
+    let r = runIn(pg, ip, sess, plan, stmt, params, ptypes, pc, mut &put)
+    for k in put {
+        let z = strings.indexOf(&k, "\x00", 0)
+        sess.plfDrop(&k[0..z], &k[z + 1..len(k)])
+    }
+    let rest = sess.plfMisses()
+    return r
+}

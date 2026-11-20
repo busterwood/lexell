@@ -4165,6 +4165,45 @@ fn sqlLiteral(v: &Val): str {
     }
 }
 
+// ---- stored functions called from SQL with a column's values (lexdb_plcall)
+
+pub fn hasUnits(pg: &Prog): bool { return len(pg.units) > 0 }
+
+pub type FnInfo = record { pub id: str; pub ret: lexdb_sql.TypeName; pub oid: int }
+
+// The stored function a call's name means to the user (the parser's: lower case, owner and name joined by a dot or the qualifier's
+// separator); None for a name that is none, or is a procedure, or the user may not run.
+pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
+    if len(pg.units) == 0 || len(name) == 0 { return None }
+    var names: []str = []
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    let i = pg.find(&names, &ip.user)
+    if i < 0 { return None }
+    let u = &pg.units[i]
+    if u.kind != U_FUNC || len(u.bad) > 0 { return None }
+    let o = oidOf(&u.ret)
+    return Some(FnInfo{id: u.owner + "." + (if len(u.pkg) > 0 { u.pkg + "." } else { "" }) + u.name, ret: lexdb_sql.oidType(o), oid: o})
+}
+
+// A stored function called with these values: its result, or the error it raised.
+pub fn callFunction(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, id: &str, args: &[]Val): Result[Val, DbErr] {
+    var binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
+    var blk = "BEGIN :r__ := " + id + "("
+    for k in 0..len(args) {
+        if k > 0 { blk += ", " }
+        blk += ":a" + k.toStr()
+        append(mut &binds, BindIn{name: "A" + k.toStr(), v: args[k].clone(), array: false, cursor: false})
+    }
+    blk += "); END;"
+    let res = runBlock(pg, ip, sess, &blk, &binds, false)
+    match res.err {
+        Some(e) { return Err(e.clone()) }
+        None {}
+    }
+    for o in res.outs { if o.name == "R__" { return Ok(o.v.clone()) } }
+    return Ok(Val.Null)
+}
+
 // A SQL statement with the calls of stored functions in it that take constants as their arguments replaced by their
 // values (`SELECT f(5) FROM dual`): run first, as blocks. A call with another argument is left to fail in the
 // executor (a function of a column is not done).

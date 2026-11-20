@@ -1,0 +1,189 @@
+// lexdb over TNS: stored PL/SQL functions called in a query with a column's values (design/lexdb-dialect-gaps.md, package F, slice F3;
+// lexdb_plcall). Over a table of 3,000 rows: a function of a column in the select list, in WHERE, GROUP BY, ORDER BY, an aggregate, a
+// join, IN and scalar subqueries, UNION, CASE, with two arguments, an expression as the argument, a bind, a package's function and
+// one that reads a table, each answered with the batch engine on (SET lexdb_batch = on) and off and by the same query with the
+// function written out: the three must agree (a line says DIFFERENT if not). A function that returns NULL, one that raises
+// (ORA-20001), a name that is no function (ORA-00904), an aggregate as the argument (not supported: ORA-03001), and another user's
+// function (owner.f(column)): ORA-00904 until EXECUTE is granted. Each function runs once for each distinct combination of
+// arguments in a query. No Oracle was at hand: the answers are the plain queries' own.
+// expect: rows: 3000|7
+// expect: select list: 1|2;2|4;3|6;4|8
+// expect: sum: 17996|3000
+// expect: where: 856
+// expect: group by: 0|'lo'|428;1|'lo'|429;2|'lo'|429;3|'mid'|429;4|'mid'|429;5|'hi'|428;6|'hi'|428
+// expect: two arguments: 1|'k1:1';2|'k2:2';3|'k3:3';4|'k4:4';5|'k0:5';6|'k1:6'
+// expect: null result: 3000|2572|882574
+// expect: order by: 6;13;20;27;34
+// expect: rownum: 2;4;6
+// expect: join: 1|4;2|6;3|8
+// expect: in subquery: 1286
+// expect: scalar subquery: 1|4;2|6;3|8
+// expect: union: 2;6
+// expect: expression argument: 9020996
+// expect: nested: 9020996
+// expect: reads a table: 1|429;2|429;3|429;4|429;5|428;6|428;0|428
+// expect: in a CASE: 856
+// expect: package function: 26994
+// expect: a constant too: 6|10
+// expect: bind: 10
+// expect: bind argument: 30
+// expect: error raised: error 20001
+// expect: again: 12
+// expect: not a function: error 904
+// expect: aggregate argument: error 3001
+// expect: other user, no execute: error 904
+// expect: other user, granted: 8
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr()) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn q1b(c: mut &oracle.Conn, sql: &str, vs: &[]sqldialect.Value): str {
+    match c.query(&(sql.toStr()), vs) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a statement's count, or its error's number
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// What a query gives with the batch engine on and with it off, and what the same query gives with the function written out: the
+// three must be the same; the answer (cut to its first 120 characters) is the line.
+fn check(c: mut &oracle.Conn, label: &str, withFn: &str, plain: &str) {
+    let a = q1(mut &c, &withFn)
+    let x = c.exec("set lexdb_batch = off")
+    if x.isErr() { println("set off: error") }
+    let b = q1(mut &c, &withFn)
+    let y = c.exec("set lexdb_batch = on")
+    let p = if len(plain) > 0 { q1(mut &c, &plain) } else { a.clone() }
+    let shown = if len(a) > 120 { a[0..120].toStr() + "..." } else { a.clone() }
+    println(label + ": " + (if a == b && a == p { shown } else { "DIFFERENT: on " + a + " | off " + b + " | plain " + p }))
+}
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var sa = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    for u in ["u1", "u2"] {
+        sa.exec(&("create user " + u + " identified by pw")).unwrap()
+        sa.exec(&("grant create session, create table, create procedure to " + u)).unwrap()
+    }
+    var a = connect(&("User Id=u1;Password=pw;Data Source=" + dsn))
+    var b = connect(&("User Id=u2;Password=pw;Data Source=" + dsn))
+    a.exec("create table big (id number primary key, v number, s varchar2(10))").unwrap()
+    a.exec("insert into big select level, mod(level, 7), 'k' || mod(level, 5) from dual connect by level <= 3000").unwrap()
+    a.exec("commit").unwrap()
+    println("rows: " + q1(mut &a, &"select count(*), count(distinct v) from big"))
+    let fs = ["create function dbl (a number) return number is begin return a * 2; end;",
+              "create function cls (a number) return varchar2 is begin if a > 4 then return 'hi'; elsif a > 2 then return 'mid'; else return 'lo'; end if; end;",
+              "create function pick (s varchar2, n number) return varchar2 is begin return s || ':' || n; end;",
+              "create function inv (a number) return number is begin if a = 0 then return null; end if; return 840 / a; end;",
+              "create function boom (a number) return number is begin if a = 3 then raise_application_error(-20001, 'three'); end if; return a; end;",
+              "create function cnt (a number) return number is n number; begin select count(*) into n from big where v = a; return n; end;"]
+    for f in fs { a.exec(&(f.toStr())).unwrap() }
+    a.exec("create package pk as function trip (a number) return number; end pk;").unwrap()
+    a.exec("create package body pk as function trip (a number) return number is begin return a * 3; end; end pk;").unwrap()
+    // a column as the argument, in each place of a query
+    check(mut &a, "select list", "select id, dbl(v) from big where id <= 4 order by id", "select id, v * 2 from big where id <= 4 order by id")
+    check(mut &a, "sum", "select sum(dbl(v)), count(*) from big", "select sum(v * 2), count(*) from big")
+    check(mut &a, "where", "select count(*) from big where dbl(v) > 8", "select count(*) from big where v * 2 > 8")
+    check(mut &a, "group by", "select v, cls(v), count(*) from big group by v, cls(v) order by v", "select v, case when v > 4 then 'hi' when v > 2 then 'mid' else 'lo' end, count(*) from big group by v order by v")
+    check(mut &a, "two arguments", "select id, pick(s, v) from big where id <= 6 order by id", "select id, s || ':' || v from big where id <= 6 order by id")
+    check(mut &a, "null result", "select count(*), count(inv(v)), sum(inv(v)) from big", "select count(*), count(case when v = 0 then null else 840 / v end), sum(case when v = 0 then null else 840 / v end) from big")
+    check(mut &a, "order by", "select id from (select id from big order by dbl(v) desc, id) where rownum <= 5", "select id from (select id from big order by v * 2 desc, id) where rownum <= 5")
+    check(mut &a, "rownum", "select dbl(v) from big where rownum <= 3", "select v * 2 from big where rownum <= 3")
+    check(mut &a, "join", "select b1.id, dbl(b2.v) from big b1 join big b2 on b2.id = b1.id + 1 where b1.id < 4 order by 1", "select b1.id, b2.v * 2 from big b1 join big b2 on b2.id = b1.id + 1 where b1.id < 4 order by 1")
+    check(mut &a, "in subquery", "select count(*) from big where v in (select dbl(v) from big where id < 4)", "select count(*) from big where v in (select v * 2 from big where id < 4)")
+    check(mut &a, "scalar subquery", "select id, (select dbl(x.v) from big x where x.id = big.id + 1) from big where id < 4 order by id", "select id, (select x.v * 2 from big x where x.id = big.id + 1) from big where id < 4 order by id")
+    check(mut &a, "union", "select dbl(v) from big where id = 1 union all select dbl(v + 1) from big where id = 2", "select v * 2 from big where id = 1 union all select (v + 1) * 2 from big where id = 2")
+    check(mut &a, "expression argument", "select sum(dbl(v + id)) from big", "select sum((v + id) * 2) from big")
+    check(mut &a, "nested", "select sum(dbl(v) + dbl(id)) from big", "select sum(v * 2 + id * 2) from big")
+    check(mut &a, "reads a table", "select v, cnt(v) from big where id < 8 order by id", "select v, (select count(*) from big x where x.v = big.v) from big where id < 8 order by id")
+    check(mut &a, "in a CASE", "select count(*) from big where case when v > 3 then dbl(v) else 0 end > 8", "select count(*) from big where case when v > 3 then v * 2 else 0 end > 8")
+    check(mut &a, "package function", "select sum(pk.trip(v)) from big", "select sum(v * 3) from big")
+    check(mut &a, "a constant too", "select dbl(3), dbl(v) from big where id = 5", "select 6, v * 2 from big where id = 5")
+    println("bind: " + q1b(mut &a, &"select dbl(v) from big where id = :1", &[sqldialect.Value.Int(5)]))
+    println("bind argument: " + q1b(mut &a, &"select dbl(:1 + v) from big where id = 5", &[sqldialect.Value.Int(10)]))
+    println("error raised: " + q1(mut &a, &"select boom(v) from big where id <= 7"))
+    println("again: " + q1(mut &a, &"select dbl(v) from big where id = 6"))
+    println("not a function: " + q1(mut &a, &"select nosuch(v) from big where id = 1"))
+    println("aggregate argument: " + q1(mut &a, &"select dbl(sum(v)) from big"))
+    // another user's: only with EXECUTE
+    a.exec("grant select on big to u2").unwrap()
+    println("other user, no execute: " + q1(mut &b, &"select u1.dbl(v) from u1.big where id = 4"))
+    a.exec("grant execute on dbl to u2").unwrap()
+    println("other user, granted: " + q1(mut &b, &"select u1.dbl(v) from u1.big where id = 4"))
+    b.logoff()
+    a.logoff()
+    sa.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(8), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

@@ -53,6 +53,7 @@ import "./lexdb_orafn"
 import "./lexdb_oraadm"
 import "./lexdb_oratext"
 import "./lexdb_plsql"
+import "./lexdb_plcall"
 import "./lexdb_parse"
 
 type Val = lexdb_sql.Val
@@ -618,6 +619,7 @@ type Cursor = record {
     pts: []int              // the types the plan in pc was made for
     dyn: bool               // its text had calls of stored functions made at prepare: prepared again at each execute
     dirs: []int             // a PL/SQL block's binds: 16 OUT, 32 IN, 48 IN OUT, as the IO vector told the client
+    plan: lexdb_plcall.Plan // a query's calls of stored functions of a column (lexdb_plcall): what it takes to run it
 }
 
 // A bind as the client describes it.
@@ -631,7 +633,7 @@ type BindMeta = value record {
 
 fn newCursor(id: int, sql: &str): Cursor {
     return Cursor{id: id, sql: sql.clone(), query: false, cols: [], ts: [], rows: [], pos: 0, count: 0, meta: [], sites: [], into: -1,
-                  stmts: [], prepared: false, special: 0, lobPre: false, modes: [], pc: lexdb_exec.newPlanCache(), pts: [], dyn: false, dirs: []}
+                  stmts: [], prepared: false, special: 0, lobPre: false, modes: [], pc: lexdb_exec.newPlanCache(), pts: [], dyn: false, dirs: [], plan: lexdb_plcall.noPlan()}
 }
 
 // ---- what a request says
@@ -1700,6 +1702,23 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
             Err(e) { return Err(syntaxRefined(&text, &e)) }
         }
         if len(stmts) != 1 { return Err(lexdb_base.err("42601", "SQL command not properly ended")) }
+        // a query's calls of stored functions of a column are written as lookups (lexdb_plcall)
+        c.cursors[i].plan = lexdb_plcall.noPlan()
+        if sk == tns.S_QUERY && lexdb_plsql.hasUnits(&c.prog) {
+            match lexdb_plcall.rewrite(&c.prog, &c.pl, &stmts[0]) {
+                Ok(rw) {
+                    match rw {
+                        Some(x0) {
+                            var x = x0
+                            stmts[0] = replace(mut &x.stmt, lexdb_sql.newStmt(lexdb_sql.S_SELECT))
+                            c.cursors[i].plan = replace(mut &x.plan, lexdb_plcall.noPlan())
+                        }
+                        None {}
+                    }
+                }
+                Err(e) { return Err(e) }
+            }
+        }
     }
     c.cursors[i].stmts = stmts
     c.cursors[i].prepared = true
@@ -1856,7 +1875,14 @@ fn (c: mut &Conn) runCursor(i: int, kind: int, params: &[][]Val, ptypes: &[][]in
         if out.failed.isNone() {
             if len(ptypes) > 0 && !sameTypes(&c.cursors[i].pts, &ptypes[0]) { pc = lexdb_exec.newPlanCache() }
             if len(ptypes) > 0 { setTypes(mut &c.cursors[i].pts, &ptypes[0]) }
-            match c.sess.runCached(&stmts[0], if len(params) > 0 { &params[0] } else { &none }, if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc) {
+            var ran: Result[lexdb_exec.Res, DbErr] = Err(lexdb_base.err("XX000", "not run"))
+            if len(c.cursors[i].plan.sites) > 0 {
+                ran = lexdb_plcall.run(&c.prog, mut &c.pl, mut &c.sess, &c.cursors[i].plan, &stmts[0], if len(params) > 0 { &params[0] } else { &none },
+                                       if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc)
+            } else {
+                ran = c.sess.runCached(&stmts[0], if len(params) > 0 { &params[0] } else { &none }, if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc)
+            }
+            match ran {
                 Ok(r) {
                     out.res = r
                     if guard { let x = c.simple("RELEASE SAVEPOINT lxl_stmt") }
