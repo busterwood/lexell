@@ -6011,8 +6011,8 @@ pair were not examined here.
 
 Q2 merged as a85d6a02 (2026-11-20): virtual columns computed on read; suite 244; TPC-H 1.023 of bc0c6a21
 alternated, server instructions equal within 0.01% on q20, q13, q3 (placement); point selects +0.07%, INSERT level.
-Open: a column alias list on a table with virtual columns breaks their expressions; its new T-SQL and Oracle
-answers were written by hand (to regenerate from the SQL Server container, which runs under podman).
+Open: a column alias list on a table with virtual columns breaks their expressions; its new Oracle
+answers were written by hand; the T-SQL ones were regenerated from SQL Server 2022 (podman container lxl-mssql) and equal the hand-written ones.
 
 ### 6.3.Q3 as built (2026-11-20)
 

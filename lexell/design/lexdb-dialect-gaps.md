@@ -666,6 +666,8 @@ one stay refused (428C9, 271, ORA-54013 / 54017), the catalogs are as package C 
 indexed virtual column is a sort (the index serves `WHERE v = x`, not the order: `servesOrder` sees the expression); statistics are
 not gathered for a virtual column (its estimates are the defaults); a table with a virtual column is not copied by COPY's fast path
 (unchanged); a column alias list on a table with virtual columns (`t AS x(a, b)`) renames the columns its expressions read
-(42703 when a virtual column is read); the T-SQL and Oracle answers added (the `nd` tables of `mssql_computed_queries.txt`, the `r1`
-lines of `oracle_computed_queries.txt`) are by hand, from the documentation: no SQL Server or Oracle was at hand.
+(42703 when a virtual column is read); the Oracle answers added (the `r1`
+lines of `oracle_computed_queries.txt`) are by hand, from the documentation: no Oracle was at hand. The T-SQL ones (the `nd`
+tables of `mssql_computed_queries.txt`) were first written by hand and were regenerated against SQL Server 2022
+(`gen_mssql.py computed`, 2026-11-20): all 121 answers equal the hand-written ones, no difference.
 
