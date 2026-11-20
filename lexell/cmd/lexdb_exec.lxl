@@ -19802,34 +19802,15 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
                     done[wj] = true
                     byCol[wj] = true
                     let wv = &sel.wins[wj]
-                    var srcs: []lexdb_window.ArgSrc = []
-                    for ax in wv.args {
-                        var a = lexdb_window.ArgSrc{kind: lexdb_window.AK_EXPR, slot: -1, konst: Val.Null}
-                        match ax {
-                            Expr.Col(name, sl) {
-                                let c = lexdb_bind.colSlot(&q.cols, &name, sl)
-                                if c >= 0 {
-                                    a.kind = lexdb_window.AK_COL
-                                    a.slot = c
-                                }
-                            }
-                            Expr.Lit(v) {
-                                a.kind = lexdb_window.AK_CONST
-                                a.konst = v.clone()
-                            }
-                            Expr.Param(pn) {
-                                if pn <= len(params) {
-                                    a.kind = lexdb_window.AK_CONST
-                                    a.konst = params[pn - 1].clone()
-                                }
-                            }
-                            else {}
-                        }
-                        append(mut &srcs, a)
-                    }
-                    try lexdb_window.values(rows, wv, &srcs, &srt, fn(ai: int, r: int): Result[Val, DbErr] {
+                    let so = try frameOff(&wv.startOff, wv, true, params)
+                    let eo = try frameOff(&wv.endOff, wv, false, params)
+                    let wargs = lexdb_window.argsOf(wv)
+                    let srcs = lexdb_window.argSrcs(&wargs, params, fn(name: &str, sl: int): int { return lexdb_bind.colSlot(&q.cols, name, sl) })
+                    // (an aggregate's argument is evaluated plainly, as accumulate does)
+                    try lexdb_window.values(rows, wv, &srcs, &srt, &so, &eo, fn(ai: int, r: int): Result[Val, DbErr] {
                         let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                        return evalX(st, txn, q, &wv.args[ai], &env, rs)
+                        if wv.agg { return eval(&wargs[ai], &env) }
+                        return evalX(st, txn, q, &wargs[ai], &env, rs)
                     }, mut &cols[wj])
                 }
                 continue
@@ -20029,7 +20010,7 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
         // the frame only grows: one accumulator, its value made again only when it does
         var acc = lexdb_agg.newAccs(1)
         var added = -1
-        var lastEnd = -2
+        var lastEnd = -(1 << 62)
         var val = Val.Null
         for k in 0..n {
             var a = 0

@@ -16,7 +16,8 @@
 // - tables of 1,023, 1,024, 1,025 and 5,000 rows;
 // - several windows in a query (covered; one not covered: the row path
 //   whole), named windows, calls inside expressions, in a subquery under
-//   a WHERE, with ORDER BY and LIMIT over the windowed rows, over a join;
+//   a WHERE, with ORDER BY and LIMIT over the windowed rows, over a join
+//   (the window aggregates, 10b, are exec_winagg's);
 // - errors: in a later batch of the input, in an argument at the row the
 //   row path reaches it, an ntile or nth_value argument that is not allowed.
 // timeout: 300
@@ -25,7 +26,7 @@
 // expect: errors among them: 0
 // expect: mixed: 29 queries, 29 the same, 29 on the batches' path as expected, 0 on it with batches off
 // expect: errors among them: 0
-// expect: not covered: 22 queries, 22 the same, 22 off the batches' path as expected
+// expect: not covered: 9 queries, 9 the same, 9 off the batches' path as expected
 // expect: errors: 24 queries, 24 the same, 24 on the batches' path as expected, states 22012 22012 22012 22012 22012 22012 22012 22012 22012 22014 22014 22014 22014 22016 22016 22016 22016 22012 22012 22012 22P02 22P02 22P02 22P02
 // expect: sizes: 29 queries, 29 the same
 // expect: ranks: 1|1|1|0|0.2 2|2|1|0.5|0.4 3|2|1|0.5|0.6 4|2|2|0|0.8 5|1|2|1|1
@@ -186,28 +187,15 @@ fn main() {
         // a call it does not cover: the whole query takes the row path
         var tn = newTally()
         let no = [
-            "select id, row_number() over (order by o, id), sum(v) over (order by o, id) from w1025",
-            "select id, row_number() over (order by id), count(*) over (partition by g1) from w5000",
-            "select id, rank() over (order by o), max(v) over (order by o rows between 1 preceding and 1 following) from w1024",
             "select id, lag(v) over (order by id), first_value(v) over (order by id rows between 1 preceding and current row) from w1025",
-            "select id, last_value(v) over (order by o), row_number() over (order by id), avg(v) over (partition by g1) from w1023",
             "select id, first_value(v) over (partition by g1 order by id rows between current row and unbounded following) from w5000",
             "select id, last_value(v) over (partition by g1 order by o range between unbounded preceding and current row exclude current row) from w5000",
             "select id, nth_value(v, 2) over (partition by g1 order by o groups between 1 preceding and 1 following) from w1025",
             "select id, last_value(v) over (order by o range between 1 preceding and 1 following), dense_rank() over (order by o) from w1025",
             "select id, ntile(3) over (order by id rows between 1 preceding and unbounded following) , lead(v) over (order by id) from w1025",
-            "select id, sum(v) over (partition by g1 order by id), rank() over (partition by g1 order by id) from w5000",
-            "select id, count(v) over (), row_number() over () from w1024",
             "select id, string_agg(s, ',') over (partition by g1 order by id), rank() over (order by id) from w1025",
-            "select id, min(v) over (order by o), cume_dist() over (order by o) from w1025",
-            "select id, row_number() over (order by id), sum(v) over (partition by g1) from w5000 where g2 = 1",
             "select id, rank() over (order by id), count(*) filter (where v > 50) over (partition by g1) from w1024",
-            "select id, first_value(v) over w, sum(v) over w from w1025 window w as (partition by g1 order by id)",
-            "select id, lag(v) over w, sum(v) over (w rows between 1 preceding and current row) from w1025 window w as (partition by g1 order by id)",
-            "select id, row_number() over (order by id), avg(v) over (order by id rows between 3 preceding and current row) from w5000",
-            "select id, ntile(2) over (order by id), sum(v) over () from w1023",
-            "select id, dense_rank() over (order by o), sum(o) over (order by o groups between unbounded preceding and current row) from w1025",
-            "select id, lead(v, 2) over (order by id), count(*) over (partition by big) from w5000"]
+            "select id, dense_rank() over (order by o), sum(o) over (order by o groups between unbounded preceding and current row) from w1025"]
         for sql in no { both(mut &s, &sql, false, mut &tn) }
         println("not covered: " + tn.n.toStr() + " queries, " + tn.same.toStr() + " the same, " + tn.ran.toStr() + " off the batches' path as expected" +
                 (if tn.offRan > 0 { ", " + tn.offRan.toStr() + " on it with batches off" } else { "" }))
@@ -251,7 +239,7 @@ fn main() {
             }
             both(mut &s, &("select id, ntile(10) over (order by id), nth_value(id, 1000) over (order by id), first_value(v) over (order by id desc) from " + tn2), true, mut &tz)
         }
-        both(mut &s, &"select id, count(*) over () from w1024 where id > 1020", false, mut &tz)
+        both(mut &s, &"select id, count(*) over () from w1024 where id > 1020", true, mut &tz)
         both(mut &s, &"select id, row_number() over () from w1025 where id = 1025", true, mut &tz)
         for i in 0..8 {
             both(mut &s, &("select id, rank() over (partition by id % " + (i + 1).toStr() + " order by o, id) from w1024 where id % 3 <> " + (i % 3).toStr()), true, mut &tz)
@@ -267,7 +255,7 @@ fn main() {
         let w0 = lexdb_exec.winRuns()
         let r1 = q(mut &s, &"select id, row_number() over (order by id), lag(v) over (order by id), ntile(2) over (order by id) from h")
         let w1 = lexdb_exec.winRuns()
-        let r2 = q(mut &s, &"select id, row_number() over (order by id), sum(v) over (order by id) from h")
+        let r2 = q(mut &s, &"select id, row_number() over (order by id), first_value(v) over (order by id rows between 1 preceding and current row) from h")
         let w2 = lexdb_exec.winRuns()
         let r3 = q(mut &s, &"set lexdb_batch = off")
         let r4 = q(mut &s, &"select id, row_number() over (order by id) from h")
