@@ -147,7 +147,7 @@ HELD_USERS = {"lexdb_pipe"}
 # their orders and the aggregate spec type only (the engine evaluates what
 # needs its scope, through a hook); only exec imports it.
 WINDOW = "lexdb_window"
-WINDOW_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_sort", "lexdb_agg"}
+WINDOW_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_sort", "lexdb_agg", "lexdb_access"}
 WINDOW_USERS = {"lexdb_exec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
