@@ -1,0 +1,272 @@
+// lexdb_gen: generated columns (design/lexdb-dialect-gaps.md, package C): the one model of PostgreSQL's GENERATED ALWAYS AS (expr)
+// STORED | VIRTUAL, SQL Server's computed columns (AS expr [PERSISTED]) and Oracle's virtual columns (GENERATED ALWAYS AS (expr)
+// [VIRTUAL], or the short form AS (expr)): a column whose value is an expression of the same row's other columns, computed as the
+// row is written (lexdb_exec.genFill; a row is written by INSERT, UPDATE, COPY, MERGE and the rewrites of ALTER TABLE) and
+// refused as a target of any write. A column's kind says only what each dialect calls it (STORED, PERSISTED / VIRTUAL, not
+// persisted) and which rules it applies; the value is kept in the row either way, so scans, indexes, constraints and the batch
+// pipeline see an ordinary column.
+//
+// This module holds what does not need the evaluator: which columns are generated, whether an expression may generate one, the
+// errors of each dialect. It imports the language model, the binder's function classes and the dialects' facts only.
+
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_bind"
+import "./lexdb_dialect"
+
+type Expr = lexdb_sql.Expr
+type ColDef = lexdb_sql.ColDef
+type DbErr = lexdb_base.DbErr
+type Val = lexdb_sql.Val
+
+pub fn isGen(c: &ColDef): bool { return c.genKind != lexdb_sql.GEN_NONE }
+
+// The generated columns of cols (their places).
+pub fn genCols(cols: &[]ColDef): []int {
+    var out: []int = []
+    for i in 0..len(cols) { if cols[i].genKind != lexdb_sql.GEN_NONE { append(mut &out, i) } }
+    return out
+}
+
+pub fn anyGen(cols: &[]ColDef): bool {
+    for c in cols { if c.genKind != lexdb_sql.GEN_NONE { return true } }
+    return false
+}
+
+// Whether x gives the same value for the same row whenever it is computed: no clock, session, random or sequence function
+// (lexdb_bind.immutableName), and none of the Oracle names that are volatile.
+pub fn immutable(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if !lexdb_bind.immutableName(&n) { return false }
+            for a in args { if !immutable(&a) { return false } }
+            return true
+        }
+        Expr.Unary(_, a) { return immutable(&a) }
+        Expr.Bin(_, a, b) { return immutable(&a) && immutable(&b) }
+        Expr.IsNull(a, _) { return immutable(&a) }
+        Expr.Cast(a, _) { return immutable(&a) }
+        else { return true }
+    }
+}
+
+// Whether x holds a subquery's call.
+pub fn hasSub(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) { return true }
+            for a in args { if hasSub(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return hasSub(&a) }
+        Expr.Bin(_, a, b) { return hasSub(&a) || hasSub(&b) }
+        Expr.IsNull(a, _) { return hasSub(&a) }
+        Expr.Cast(a, _) { return hasSub(&a) }
+        else { return false }
+    }
+}
+
+pub fn hasAgg(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if lexdb_bind.isAgg(&name) { return true }
+            for a in args { if hasAgg(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return hasAgg(&a) }
+        Expr.Bin(_, a, b) { return hasAgg(&a) || hasAgg(&b) }
+        Expr.IsNull(a, _) { return hasAgg(&a) }
+        Expr.Cast(a, _) { return hasAgg(&a) }
+        else { return false }
+    }
+}
+
+// Whether x reads column name.
+pub fn reads(x: &Expr, name: &str): bool {
+    var ns: []str = []
+    lexdb_sql.colNames(x, mut &ns)
+    for n in ns { if n == name { return true } }
+    return false
+}
+
+// The generated columns of cols whose expression reads column name (their places).
+pub fn readers(cols: &[]ColDef, name: &str): []int {
+    var out: []int = []
+    for i in 0..len(cols) {
+        match cols[i].gen {
+            Some(x) { if reads(&x, name) { append(mut &out, i) } }
+            None {}
+        }
+    }
+    return out
+}
+
+// What is wrong with a generation expression x over cols, the column being made at place self (its own name is not among the
+// readable ones): kind "col" (a column that is not there: name), "gen" (a generated column: name), "agg", "sub", "vol" (not
+// immutable); "" when none.
+pub type Problem = record { pub kind: str; pub name: str }
+
+pub fn problem(x: &Expr, cols: &[]ColDef, self: int): Problem {
+    if hasSub(x) { return Problem{kind: "sub", name: ""} }
+    if hasAgg(x) { return Problem{kind: "agg", name: ""} }
+    var ns: []str = []
+    lexdb_sql.colNames(x, mut &ns)
+    for n in ns {
+        var at = -1
+        for i in 0..len(cols) { if cols[i].name == n { at = i } }
+        if at < 0 { return Problem{kind: "col", name: n} }
+        if at == self || cols[at].genKind != lexdb_sql.GEN_NONE { return Problem{kind: "gen", name: n} }
+    }
+    if !immutable(x) { return Problem{kind: "vol", name: ""} }
+    return Problem{kind: "", name: ""}
+}
+
+// ---- the dialects' errors (lexdb_sql.MD_*)
+
+fn err(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// A generation expression refused: p as problem gives it, for column c of table t (base names).
+pub fn exprErr(md: int, p: &Problem, t: &str, c: &str): DbErr {
+    if p.kind == "col" { return err("42703", &("column \"" + p.name + "\" does not exist")) }
+    if md == lexdb_sql.MD_TSQL {
+        if p.kind == "gen" { return err("TS1759", &("Computed column '" + p.name + "' in table '" + t + "' is not allowed to be used in another computed-column definition.")) }
+        if p.kind == "sub" { return err("TS1046", "Subqueries are not allowed in this context. Only scalar expressions are allowed.") }
+        if p.kind == "agg" { return err("TS4101", "Aggregates on the right side of an APPLY cannot reference columns from the left side.") }
+        return err("TS4936", &("Computed column '" + c + "' in table '" + t + "' cannot be persisted because the column is non-deterministic."))
+    }
+    if md == lexdb_sql.MD_ORA {
+        if p.kind == "gen" { return err("ORA54012", "virtual column is referenced in a column expression") }
+        if p.kind == "sub" || p.kind == "agg" { return err("ORA54016", "invalid column expression was specified") }
+        return err("ORA54002", "only pure functions can be specified in a virtual column expression")
+    }
+    if p.kind == "col" { return err("42703", &("column \"" + p.name + "\" does not exist")) }
+    if p.kind == "gen" {
+        return lexdb_base.errDetail("42P17", &("cannot use generated column \"" + p.name + "\" in column generation expression"),
+                                    "A generated column cannot reference another generated column.", "")
+    }
+    if p.kind == "sub" { return err("0A000", "cannot use subquery in column generation expression") }
+    if p.kind == "agg" { return err("42803", "aggregate functions are not allowed in column generation expressions") }
+    return err("42P17", "generation expression is not immutable")
+}
+
+// A value given to generated column c, by INSERT (ins) or UPDATE.
+pub fn writeErr(md: int, c: &str, ins: bool): DbErr {
+    if md == lexdb_sql.MD_TSQL {
+        return err("TS271", &("The column \"" + c + "\" cannot be modified because it is either a computed column or is the result of a UNION operator."))
+    }
+    if md == lexdb_sql.MD_ORA {
+        return if ins { err("ORA54013", "INSERT operation disallowed on virtual columns") } else { err("ORA54017", "UPDATE operation disallowed on virtual columns") }
+    }
+    if ins {
+        return lexdb_base.errDetail("428C9", &("cannot insert a non-DEFAULT value into column \"" + c + "\""),
+                                    &("Column \"" + c + "\" is a generated column."), "")
+    }
+    return lexdb_base.errDetail("428C9", &("column \"" + c + "\" can only be updated to DEFAULT"), &("Column \"" + c + "\" is a generated column."), "")
+}
+
+// A column a generated column reads, changed (retyped, dropped, renamed): g the generated column, c the column, t the table
+// (base names), what "alter" "drop" or "rename".
+pub fn usedErr(md: int, what: str, g: &str, c: &str, t: &str): DbErr {
+    if md == lexdb_sql.MD_TSQL {
+        if what == "rename" { return err("TS15336", &("Object '" + t + "." + c + "' cannot be renamed because the object participates in enforced dependencies.")) }
+        return err("TS5074", &("The column '" + g + "' is dependent on column '" + c + "'."))
+    }
+    if md == lexdb_sql.MD_ORA {
+        if what == "rename" { return err("ORA54031", "column to be renamed is used in a virtual column expression") }
+        if what == "drop" { return err("ORA54027", "column to be dropped is used in a virtual column expression") }
+        return err("ORA54033", "column to be modified is used in a virtual column expression")
+    }
+    if what == "alter" {
+        return lexdb_base.errDetail("0A000", "cannot alter type of a column used by a generated column", &("Column \"" + c + "\" is used by generated column \"" + g + "\"."), "")
+    }
+    return lexdb_base.errDetail("2BP01", &("cannot drop column " + c + " of table " + t + " because other objects depend on it"),
+                                &("column " + g + " of table " + t + " depends on column " + c + " of table " + t), "Use DROP ... CASCADE to drop the dependent objects too.")
+}
+
+// ALTER COLUMN or a rename of a generated column itself, where the dialect refuses: SQL Server 4928.
+pub fn computedErr(md: int, c: &str): DbErr {
+    if md == lexdb_sql.MD_TSQL { return err("TS4928", &("Cannot alter column '" + c + "' because it is 'COMPUTED'.")) }
+    return err("ORA54018", "virtual column cannot be altered this way")
+}
+
+// ---- the type of a SQL Server computed column (derived from its expression, by SQL Server's rules)
+
+// The precision and scale of a number as an operand: an integer is numeric(10,0) (smallint 5, tinyint 3, bigint 19), a decimal its own.
+fn numPS(t: &lexdb_sql.TypeName): Option[[]int] {
+    if t.kind == lexdb_sql.K_NUM && t.prec > 0 { return Some([t.prec, t.scale]) }
+    if t.kind == lexdb_sql.K_INT {
+        if t.oid == lexdb_sql.OID_INT8 { return Some([19, 0]) }
+        if t.oid == lexdb_sql.OID_INT2 { return Some([if t.prec == lexdb_dialect.TS_TINYINT { 3 } else { 5 }, 0]) }
+        return Some([10, 0])
+    }
+    return None
+}
+
+// SQL Server's result type of x over cols, where lexdb knows it: a cast's type, a column's, a text literal's, integer arithmetic's
+// (int, or bigint with a bigint), decimal arithmetic's precision and scale (capped at 38), and varchar + varchar's added
+// lengths; None for the rest (the caller takes the type lexdb's own typing gives).
+pub fn tsqlType(x: &Expr, cols: &[]ColDef): Option[lexdb_sql.TypeName] {
+    match x {
+        Expr.Cast(_, t) { return Some(t) }
+        Expr.Col(n, _) {
+            for c in cols { if c.name == n { return Some(c.typ) } }
+            return None
+        }
+        Expr.Lit(v) {
+            match v {
+                Val.Text(s) { return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_VARCHAR, prec: lexdb_dialect.TS_VARCHAR, scale: 0, len: if len(s) > 0 { len(s) } else { 1 }}) }
+                Val.Int(_) { return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}) }
+                else { return None }
+            }
+        }
+        Expr.Call(f, args, _) {
+            // (a column in T-SQL arithmetic is read through #bitint)
+            if f == "#bitint" && len(args) == 1 { return tsqlType(&args[0], cols) }
+            // upper and the like keep their argument's type; CAST(x AS varchar(n)) is left(x, n)
+            if (f == "upper" || f == "lower" || f == "ltrim" || f == "rtrim" || f == "trim" || f == "reverse") && len(args) == 1 { return tsqlType(&args[0], cols) }
+            if f == "left" && len(args) == 2 {
+                let n = lexdb_sql.litInt(&args[1])
+                if n > 0 { return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_VARCHAR, prec: lexdb_dialect.TS_VARCHAR, scale: 0, len: n}) }
+            }
+            return None
+        }
+        Expr.Bin(op, a, b) {
+            let ta = match tsqlType(&a, cols) { Some(t) { t } None { return None } }
+            let tb = match tsqlType(&b, cols) { Some(t) { t } None { return None } }
+            if op == "t+" && ta.kind == lexdb_sql.K_TEXT && tb.kind == lexdb_sql.K_TEXT {
+                if ta.len <= 0 || tb.len <= 0 { return None }
+                let narrow = (ta.prec == lexdb_dialect.TS_VARCHAR || ta.prec == lexdb_dialect.TS_CHAR) && (tb.prec == lexdb_dialect.TS_VARCHAR || tb.prec == lexdb_dialect.TS_CHAR)
+                return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_VARCHAR, prec: if narrow { lexdb_dialect.TS_VARCHAR } else { 0 }, scale: 0, len: ta.len + tb.len})
+            }
+            if op != "t+" && op != "+" && op != "-" && op != "*" && op != "/" && op != "%" { return None }
+            if ta.kind == lexdb_sql.K_INT && tb.kind == lexdb_sql.K_INT {
+                let big = ta.oid == lexdb_sql.OID_INT8 || tb.oid == lexdb_sql.OID_INT8
+                return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: if big { lexdb_sql.OID_INT8 } else { lexdb_sql.OID_INT4 }, prec: 0, scale: 0, len: 0})
+            }
+            let pa = match numPS(&ta) { Some(v) { v } None { return None } }
+            let pb = match numPS(&tb) { Some(v) { v } None { return None } }
+            var p = 0
+            var sc = 0
+            if op == "*" {
+                p = pa[0] + pb[0] + 1
+                sc = pa[1] + pb[1]
+            } else if op == "/" {
+                sc = max(6, pa[1] + pb[0] + 1)
+                p = pa[0] - pa[1] + pb[1] + sc
+            } else if op == "%" {
+                sc = max(pa[1], pb[1])
+                p = min(pa[0] - pa[1], pb[0] - pb[1]) + sc
+            } else {
+                sc = max(pa[1], pb[1])
+                p = max(pa[0] - pa[1], pb[0] - pb[1]) + sc + 1
+            }
+            if p > 38 {
+                sc = max(min(sc, 38 - (p - sc)), min(sc, 6))
+                p = 38
+            }
+            return Some(lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: p, scale: sc, len: lexdb_dialect.TS_NUMERIC})
+        }
+        else { return None }
+    }
+}

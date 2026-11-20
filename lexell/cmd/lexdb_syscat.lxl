@@ -604,11 +604,14 @@ fn tsqlText(x: &Expr): str {
         }
         Expr.Bin(op, a, b) {
             if op == "and" || op == "or" { return tsqlText(&a) + " " + strings.toUpperAscii(&op) + " " + tsqlText(&b) }
-            return "(" + tsqlText(&a) + op + tsqlText(&b) + ")"
+            // (T-SQL's + is "t+", and a column or variable in arithmetic is read through #bitint)
+            let o: &str = if op == "t+" { "+" } else { op }
+            return "(" + tsqlText(&a) + o + tsqlText(&b) + ")"
         }
         Expr.IsNull(a, not) { return tsqlText(&a) + (if not { " IS NOT NULL" } else { " IS NULL" }) }
         Expr.Call(f, args, star) {
             var n = f.toStr()
+            if n == "#bitint" && len(args) == 1 { return tsqlText(&args[0]) }
             if n == "#utcnow" { n = "sysutcdatetime" }
             if n == "localtimestamp" { n = "getdate" }
             if n == "gen_random_uuid" { n = "newid" }
@@ -620,6 +623,16 @@ fn tsqlText(x: &Expr): str {
         Expr.Cast(a, t) { return tsqlText(&a) }
         else { return lexdb_sql.exprText(x) }
     }
+}
+
+// A computed column's definition as SQL Server shows it: in one pair of parentheses (an operator's own are that).
+fn tsqlOuter(x: &Expr): str {
+    let t = tsqlText(x)
+    match x {
+        Expr.Bin(op, _, _) { if op != "and" && op != "or" { return t } }
+        else {}
+    }
+    return "(" + t + ")"
 }
 
 fn sysDefText(c: &lexdb_sql.ColDef): str {
@@ -758,7 +771,7 @@ fn sysTabTypeColumns(snap: &CatSnap): [][]Val {
             let ty = sqlTypeOf(&c.typ, &c.coll)
             let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
             let shown: &str = if len(c.spell) > 0 { &c.spell } else { &c.name }
-            append(mut &rows, sysColumn(lexdb_sql.nameOid("tt", &t.key), shown, i + 1, &ty, !c.notNull, ident, 0))
+            append(mut &rows, sysColumn(lexdb_sql.nameOid("tt", &t.key), shown, i + 1, &ty, !c.notNull, ident, 0, false))
         }
     }
     return rows
@@ -774,7 +787,7 @@ fn sysSysObjects(): [][]Val {
 fn tabShown(ct: &CatTab): str { return if len(ct.t.spell) > 0 { ct.t.spell.clone() } else { ct.name.clone() } }
 
 // A column row (sys.columns, all_columns) of a column of type ty.
-fn sysColumn(objId: int, name: &str, colId: int, ty: &SqlT, nullable: bool, identity: bool, defId: int): []Val {
+fn sysColumn(objId: int, name: &str, colId: int, ty: &SqlT, nullable: bool, identity: bool, defId: int, computed: bool): []Val {
     var r = sysTemplate(&"columns")
     r.set(&"object_id", iv(objId))
     r.set(&"name", tv(name))
@@ -790,6 +803,7 @@ fn sysColumn(objId: int, name: &str, colId: int, ty: &SqlT, nullable: bool, iden
                  ty.name == "binary" || ty.name == "varbinary"
     r.set(&"is_ansi_padded", bv(padded))
     r.set(&"is_identity", bv(identity))
+    r.set(&"is_computed", bv(computed))
     r.set(&"default_object_id", iv(defId))
     return r.row()
 }
@@ -806,7 +820,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
             for p in ct.t.pk { if p == i { nn = true } }
             let ty = sqlTypeOf(&c.typ, &c.coll)
             let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
-            append(mut &rows, sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, ident, if sysHasDefault(c) { sysDefOid(&ct, c) } else { 0 }))
+            append(mut &rows, sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, ident, if sysHasDefault(c) { sysDefOid(&ct, c) } else { 0 }, c.genKind != lexdb_sql.GEN_NONE))
         }
     }
     for v in snap.views {
@@ -836,7 +850,7 @@ fn sysUserColumns(snap: &CatSnap): [][]Val {
                 ty = sqlTypeOf(&c.typ, &c.coll)
                 nullable = true
             }
-            append(mut &rows, sysColumn(v.oid, &lexdb_sql.colShown(c), i + 1, &ty, nullable, false, 0))
+            append(mut &rows, sysColumn(v.oid, &lexdb_sql.colShown(c), i + 1, &ty, nullable, false, 0, false))
         }
     }
     return rows
@@ -850,7 +864,7 @@ fn sysSysColumns(): [][]Val {
         for k in 0..len(cs) {
             let c = &cs[k]
             let ty = sqlT(&c.typ, c.maxLen, c.prec, c.scale, &c.coll)
-            append(mut &rows, sysColumn(id, &c.name, k + 1, &ty, c.nullable, false, 0))
+            append(mut &rows, sysColumn(id, &c.name, k + 1, &ty, c.nullable, false, 0, false))
         }
     }
     return rows
@@ -1243,6 +1257,26 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 }
             }
         }
+        "computed_columns" {
+            // the generated columns: PERSISTED ones are stored, the others not (lexdb keeps both in the row; the catalog says which)
+            for ct in snap.tabs {
+                if lexdb_base.isTempSchema(&ct.schema) { continue }
+                let ids = sysColIds(&ct.t)
+                for i in 0..len(ct.t.cols) {
+                    let c = &ct.t.cols[i]
+                    if ids[i] == 0 || c.genKind == lexdb_sql.GEN_NONE { continue }
+                    let ty = sqlTypeOf(&c.typ, &c.coll)
+                    var r = sysTemplate(&"computed_columns")
+                    var cr = sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !c.notNull, false, 0, true)
+                    let ccols = cols(&"columns")
+                    for k in 0..len(ccols) { if k < len(cr) { r.set(&ccols[k].name, replace(mut &cr[k], Val.Null)) } }
+                    r.set(&"definition", tv(&(match c.gen { Some(x) { tsqlOuter(&x) } None { "" } })))
+                    r.set(&"is_persisted", bv(c.genKind == lexdb_sql.GEN_STORED))
+                    r.set(&"uses_database_collation", bv(false))
+                    append(mut &rows, r.row())
+                }
+            }
+        }
         "identity_columns" {
             for ct in snap.tabs {
                 if lexdb_base.isTempSchema(&ct.schema) { continue }
@@ -1256,7 +1290,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     var r = sysTemplate(&"identity_columns")
-                    var cr = sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, true, 0)
+                    var cr = sysColumn(ct.oid, &lexdb_sql.colShown(c), ids[i], &ty, !nn, true, 0, false)
                     let ccols = cols(&"columns")
                     for k in 0..len(ccols) { if k < len(cr) { r.set(&ccols[k].name, replace(mut &cr[k], Val.Null)) } }
                     r.set(&"seed_value", iv(sq.start))
@@ -1427,7 +1461,7 @@ pub fn bind(snap: &CatSnap, b: mut &str) {
             for p in ct.t.pk { if p == i { nn = true } }
             let ident = c.identity == lexdb_sql.ID_ALWAYS || c.identity == lexdb_sql.ID_BY_DEFAULT || c.identity == lexdb_sql.ID_SERIAL
             b += &("K\t" + ct.oid.toStr() + "\t" + lexdb_sql.colShown(c) + "\t" + ids[i].toStr() + "\t" + (if nn { "0" } else { "1" }) + "\t" +
-                  (if ident { "1" } else { "0" }) + "\n")
+                  (if ident { "1" } else { "0" }) + "\t" + (if c.genKind != lexdb_sql.GEN_NONE { "1" } else { "0" }) + "\n")
         }
         for x in sysIdxs(&ct) {
             if x.heap { continue }

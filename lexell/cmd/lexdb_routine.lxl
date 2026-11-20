@@ -178,9 +178,19 @@ pub fn setNames(st: &lexdb_store.Store, names: &[]str) {
     var b = ""
     for n in names { b += n + "\x00" }
     st.memo.put(&FN_KEY, &b)
+    namesAt += 1
 }
 
-// A function named base was made.
+// The generation of the names (any store's in the process): moved by every setNames, so a session that cached the list
+// (Session.fnNames) looks again only when it has moved. The process's tasks share one thread, so a plain counter.
+var namesAt: int = 0
+
+pub fn namesGen(): int { return namesAt }
+
+// A function named base was made (its transaction may not have committed: the list only has to hold every name some
+// transaction can see; a name more costs a look at the catalog). Before the list is built, the name is kept aside
+// (FN_EXTRA) for loadNames: else a list built from a transaction that could not see this one's uncommitted function
+// would leave it out after it commits.
 pub fn noteFunction(st: &lexdb_store.Store, base: &str) {
     match knownNames(st) {
         Some(ns) {
@@ -190,8 +200,28 @@ pub fn noteFunction(st: &lexdb_store.Store, base: &str) {
                 setNames(st, &all)
             }
         }
+        None {
+            let x = st.memo.get(&FN_EXTRA).unwrapOr("")
+            st.memo.put(&FN_EXTRA, &(x + base + "\x00"))
+            namesAt += 1
+        }
+    }
+}
+
+// Names made before the list was built (noteFunction).
+const FN_EXTRA: str = "rtn.fnx"
+
+// The list built: the names the catalog gave (read first, by the caller) and those kept aside, set with no
+// suspension between the read of the aside names and the set, so a function made meanwhile is not lost.
+pub fn loadNames(st: &lexdb_store.Store, fromCatalog: []str): []str {
+    var all = fromCatalog
+    match st.memo.get(&FN_EXTRA) {
+        Some(x) { for n in strings.split(&x, "\x00") { if len(n) > 0 && !lexdb_base.hasStr(&all, n) { append(mut &all, n.toStr()) } } }
         None {}
     }
+    setNames(st, &all)
+    st.memo.del(&FN_EXTRA)
+    return all
 }
 
 // ---- a call's arguments

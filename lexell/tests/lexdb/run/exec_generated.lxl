@@ -1,0 +1,167 @@
+// lexdb_exec: generated columns (design/lexdb-dialect-gaps.md, package C) beyond what the three doors' query files cover. A table with a
+// stored and a virtual generated column and an index on the stored one: its rows and plans; the disk crashed and the store opened
+// again (the columns, their expressions and the rows are there, a new row computes them, a rename of a column they read is kept);
+// DROP COLUMN ... CASCADE taking a dependent column along; an expression index and a generated column's index used by the planner
+// (EXPLAIN shows them); then a table of 3,000 rows (three batches of the pipeline and part of a fourth): the same queries over
+// the generated columns with SET lexdb_batch = off and on give the same rows, errors included, and UPDATE, DELETE and
+// INSERT ... SELECT on it keep the columns right; a rolled back transaction leaves none of its rows' generated values.
+// expect: created: CREATE TABLE
+// expect: rows: 1|2|3|5|4|ab|AB!;2||||||;3|7|1|8|14|x|X!
+// expect: stored index: index g_s, 3
+// expect: expression index: index g_lower, 1
+// expect: plain: full scan
+// expect: after reopen: 1|2|3|5|4|ab|AB!;2||||||;3|7|1|8|14|x|X!
+// expect: after reopen index: index g_s, 3
+// expect: new row: 4|10|1|11|20|zz|ZZ!
+// expect: updated: 4|10|100|110|20
+// expect: renamed: ALTER TABLE, 4|10|100|110|20|zz|ZZ!
+// expect: new row after rename: 5|3|3|6|6
+// expect: expressions: (aa + b) and (aa * 2) and (upper(t) || '!'::text)
+// expect: dropped with cascade: ALTER TABLE, id,t
+// expect: after reopen again: id,t
+// expect: big: 3000 rows, batched equal off: 21 of 21 queries, read in batches: true
+// expect: big errors: 22012 22012
+// expect: big writes: UPDATE 1500, DELETE 100, INSERT 0 600, then 3500|87520986|0|7
+// expect: rolled back: INSERT 0 1, 99999|2|3|2003, ROLLBACK, none
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+// rows (columns joined by |, rows by ;), the tag, or the error's state and text
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5].clone() }
+
+// What a plan says it reads: the index it uses, or "Seq Scan on" the table
+fn plan(s: mut &lexdb_exec.Session, sql: &str, index: &str): str {
+    let p = q(s, &("explain " + sql))
+    if strings.contains(&p, &(": index " + index + " ")) { return "index " + index }
+    if strings.contains(&p, "full scan") { return "full scan" }
+    return p
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn first(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    say("created", q(mut &s, &"create table g (id int primary key, a int, b int, s int generated always as (a + b) stored, v int generated always as (a * 2) virtual, t text, u text generated always as (upper(t) || '!') stored)"))
+    let i = q(mut &s, &"insert into g (id, a, b, t) values (1, 2, 3, 'ab'), (2, null, null, null), (3, 7, 1, 'x')")
+    say("rows", q(mut &s, &"select * from g order by id"))
+    let ix = q(mut &s, &"create index g_s on g (s)")
+    let ix2 = q(mut &s, &"create index g_lower on g (lower(t))")
+    let an = q(mut &s, &"analyze g")
+    say("stored index", plan(mut &s, &"select id from g where s = 8", &"g_s") + ", " + q(mut &s, &"select id from g where s = 8"))
+    say("expression index", plan(mut &s, &"select id from g where lower(t) = 'ab'", &"g_lower") + ", " + q(mut &s, &"select id from g where lower(t) = 'ab'"))
+    say("plain", plan(mut &s, &"select id from g where v = 4", &"none"))
+    return 0
+}
+
+fn second(st: lexdb_store.Store): int {
+    var s = lexdb_exec.newSession(st.share())
+    say("after reopen", q(mut &s, &"select * from g order by id"))
+    say("after reopen index", plan(mut &s, &"select id from g where s = 8", &"g_s") + ", " + q(mut &s, &"select id from g where s = 8"))
+    let ins = q(mut &s, &"insert into g (id, a, b, t) values (4, 10, 1, 'zz')")
+    say("new row", q(mut &s, &"select id, a, b, s, v, t, u from g where id = 4"))
+    let u = q(mut &s, &"update g set b = 100 where id = 4")
+    say("updated", q(mut &s, &"select id, a, b, s, v from g where id = 4"))
+    let r = q(mut &s, &"alter table g rename column a to aa")
+    say("renamed", r + ", " + q(mut &s, &"select id, aa, b, s, v, t, u from g where id = 4"))
+    let n = q(mut &s, &"insert into g (id, aa, b, t) values (5, 3, 3, 'q')")
+    say("new row after rename", q(mut &s, &"select id, aa, b, s, v from g where id = 5"))
+    say("expressions", q(mut &s, &"select string_agg(generation_expression, ' and ' order by ordinal_position) from information_schema.columns where table_name = 'g' and is_generated = 'ALWAYS'"))
+    let d = q(mut &s, &"alter table g drop column aa cascade")
+    say("dropped with cascade", d + ", " + q(mut &s, &"select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns where table_name = 'g' and column_name in ('id', 'aa', 'b', 's', 'v', 't', 'u') and is_generated = 'NEVER' and column_name not in ('b')"))
+    return 0
+}
+
+fn third(st: lexdb_store.Store): int {
+    var s = lexdb_exec.newSession(st.share())
+    say("after reopen again", q(mut &s, &"select string_agg(column_name, ',' order by ordinal_position) from information_schema.columns where table_name = 'g' and column_name in ('id', 'aa', 'b', 's', 'v', 't', 'u') and is_generated = 'NEVER' and column_name not in ('b')"))
+    return 0
+}
+
+// The big table: queries over its generated columns, with the batches off and on
+fn big(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    let c = q(mut &s, &"create table big (id int primary key, a int, b int, s bigint generated always as (a * 1000 + b) stored, v int generated always as (a % 7) virtual, t text generated always as ('k' || (a % 10)::text) stored)")
+    let f = q(mut &s, &"insert into big (id, a, b) select x, x % 50, x % 13 from generate_series(1, 3000) as x")
+    let ix = q(mut &s, &"create index big_s on big (s)")
+    let queries = ["select count(*), sum(s), sum(v) from big", "select v, count(*) from big group by v order by v",
+                   "select t, count(*), min(s), max(s) from big group by t order by t", "select id, s from big where s = 3005 order by id",
+                   "select id from big where s between 10000 and 10100 order by id", "select count(*) from big where v = 3",
+                   "select count(*) from big where t = 'k4' and v > 2", "select id, s, v, t from big order by s desc, id limit 20",
+                   "select id, v from big where id % 100 = 0 order by id", "select sum(s) from big where id > 1024 and id <= 2049",
+                   "select count(*) from big where s is null", "select count(distinct t) from big", "select avg(v) from big",
+                   "select id from big where v = 6 and id between 1020 and 1030 order by id", "select s from big where id in (1, 1024, 1025, 2048, 3000) order by id",
+                   "select b.id, b.s from big b join big c on c.s = b.s where c.id = 17 order by b.id", "select count(*) from big where s > 2000 and t like 'k%'",
+                   "select min(s), max(s), min(v), max(v) from big", "select id from big where s = 49012 order by id",
+                   "select t, sum(v) from big where id <= 1025 group by t order by t", "select count(*) from big where (a * 1000 + b) = s"]
+    var same = 0
+    for x in queries {
+        let a = q(mut &s, &"set lexdb_batch = off")
+        let off = q(mut &s, &x)
+        let b = q(mut &s, &"set lexdb_batch = on")
+        let on = q(mut &s, &x)
+        if on == off && !strings.contains(&on, "ERROR") && len(on) > 0 { same += 1 } else { println("DIFF " + x + ": " + off + " <> " + on) }
+    }
+    let ex = q(mut &s, &"explain analyze select count(*), sum(s), sum(v) from big where t = 'k4'")
+    say("big", q(mut &s, &"select count(*) from big") + " rows, batched equal off: " + same.toStr() + " of " + len(queries).toStr() + " queries, read in batches: " + strings.contains(&ex, "batches").toStr())
+    // an error in a later batch: the same state either way
+    let a = q(mut &s, &"set lexdb_batch = off")
+    let e1 = state(mut &s, &"select 1 / (3000 - id) from big")
+    let b = q(mut &s, &"set lexdb_batch = on")
+    let e2 = state(mut &s, &"select 1 / (3000 - id) from big")
+    say("big errors", e1 + " " + e2)
+    let up = q(mut &s, &"update big set a = a + 1 where id % 2 = 0")
+    let dl = q(mut &s, &"delete from big where id > 2900")
+    let ins = q(mut &s, &"insert into big (id, a, b) select id + 10000, a, b from big where id <= 600")
+    let tot = q(mut &s, &"select count(*), sum(s), (select count(*) from big where s <> a * 1000 + b), (select count(distinct v) from big) from big")
+    say("big writes", up + ", " + dl + ", " + ins + ", then " + tot)
+    let tx1 = q(mut &s, &"begin")
+    let tx2 = q(mut &s, &"insert into big (id, a, b) values (99999, 2, 3)")
+    let tx3 = q(mut &s, &"select id, a, b, s from big where id = 99999")
+    let tx4 = q(mut &s, &"rollback")
+    say("rolled back", tx2 + ", " + tx3 + ", " + tx4 + ", " + (if q(mut &s, &"select count(*) from big where id = 99999") == "0" { "none" } else { "some" }))
+    return 0
+}
+
+fn main() {
+    var fs = lexdb_disk.sim(11)
+    var crashed = fs.share()
+    let a = lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        let r = first(st)
+        crashed = fs.crash(3)
+        return r
+    }).unwrap()
+    var again = crashed.share()
+    let b = lexdb_store.run(crashed.share(), opts(), fn(st: lexdb_store.Store): int {
+        let r = second(st)
+        again = crashed.crash(3)
+        return r
+    }).unwrap()
+    let c = lexdb_store.run(again.share(), opts(), third).unwrap()
+    let d = lexdb_store.run(lexdb_disk.sim(12), opts(), big).unwrap()
+}

@@ -140,10 +140,10 @@ Queue (pairs that touch different files):
 |---|---|---|
 | A | `worktree-agent-a904a69d9594c5747` | merged (a1aa79e3; TPC-H 0.998 of 6dc5e38f alternated, checksums equal; with the session's SYSTEM_USER memo entry dropped at close); section 5 |
 | B | worktree-agent-a1e05408b04aabd79 | merged (fdee644f; TPC-H 0.993 of f07b6e5d alternated, checksums equal); done 2026-11-20: `a3eacc68` (CREATE OR ALTER VIEW, ALTER VIEW, OR REPLACE in each dialect's rules, the misleading CREATE error), `16e65314` (ALTER DATABASE ... SET, new module lexdb_dbopt), `3faf9a1a` (renames: sp_rename, Oracle RENAME, PostgreSQL views following), and `13dafca3` (ALTER COLUMN type: T-SQL, PostgreSQL, Oracle MODIFY); suite 218 of 218. Tests: exec_ddl (PostgreSQL 18), tds_ddl (SQL Server 2022), tds_ddlgaps (hand: "not supported yet" messages), tns_ddl (Oracle: answers by hand from the documentation, no Oracle at hand). Left: views follow renames by a recorded overlay (Table.rn), so pg_get_viewdef and OBJECT_DEFINITION keep the text as written; a PostgreSQL view on a retyped column is found by the names in its text (it may refuse a column PostgreSQL would allow); a foreign key's column cannot be retyped (0A000, PostgreSQL allows compatible types); retyping a serial or identity column to text; PostgreSQL's re-binding of a CHECK after a type change (42883) is not done (the rows are rechecked); T-SQL nvarchar is not told from varchar (so varchar to nvarchar on an indexed column is not 5074), tinyint is smallint, ALTER COLUMN ... COLLATE, ALTER DATABASE READ_ONLY/SINGLE_USER/OFFLINE and its other forms, `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` does not check ALLOW_SNAPSHOT_ISOLATION (3952), a table named as another table's index (SQL Server allows, lexdb's indexes share the schema's names), CREATE VIEW not first in a batch is not 111; Oracle: from memory ORA-14155 (RENAME without COLUMN), ORA-00905 (ALTER COLUMN), ORA-01439/01440/01441/02296, a `select *` view over a renamed column is not invalidated, CREATE OR REPLACE FORCE VIEW |
-| C | | not started |
+| C | `worktree-agent-aca063a259081a2aa` | done, 2026-11-20 (not merged; merged with main 650b5753, suite 232 of 232): `da2d720a` (the model, `lexdb_gen`, the write path, PostgreSQL door), `8fc87e14` (SQL Server computed columns, catalogs), `8645e600` (Oracle virtual columns, function-based indexes, catalogs), `5aec6a69` (DROP / SET EXPRESSION, COPY, `exec_generated`), `cb6ed31c` (parser: INSERT 218 instructions cheaper than the base, 148,350 against 148,568); section 8. Left: a T-SQL computed column that is not persisted and not deterministic is refused (virtual columns are kept in the row, not computed when read); Oracle's ORA-54027 / 54031 / 54033, the SYS_NC numbering and DEFAULT for a virtual column are from memory (no Oracle was at hand, `tns_computed` is by hand) |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
 | E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
-| F | `worktree-agent-a5c6d6b7ae9c4bd2c` | slice F1 done 2026-11-20 (not merged): `8d2ee116` (the routine record, T-SQL procedures, PostgreSQL functions and procedures), `b082a983` (DROP SCHEMA, Describe, Oracle's kind clash, tests), `7908d6e3` (a procedure called by name over TDS), `d4f23aea` (OBJECTPROPERTY, refusals), merge of main `a0607c4a`; suite green on the merged tree; section 7. Later slices: T-SQL functions (scalar, inline table-valued) and `OUTPUT ... INTO @table_variable` (S12), PostgreSQL's set-returning SQL functions and table-reading bodies over columns, GRANT EXECUTE |
+| F | `worktree-agent-a5c6d6b7ae9c4bd2c` | merged F1 (e2c93002; TPC-H 1.003 of fdee644f alternated, checksums equal; point selects +0.6% instructions, fixed: see open points); slice F1 done 2026-11-20 (not merged): `8d2ee116` (the routine record, T-SQL procedures, PostgreSQL functions and procedures), `b082a983` (DROP SCHEMA, Describe, Oracle's kind clash, tests), `7908d6e3` (a procedure called by name over TDS), `d4f23aea` (OBJECTPROPERTY, refusals), merge of main `a0607c4a`; suite green on the merged tree; section 7. Later slices: T-SQL functions (scalar, inline table-valued) and `OUTPUT ... INTO @table_variable` (S12), PostgreSQL's set-returning SQL functions and table-reading bodies over columns, GRANT EXECUTE |
 
 ## 5. Package A: what was done
 
@@ -403,3 +403,84 @@ in the same statement. New work goes in `lexdb_routine` (core) and
 (routine_queries.txt); `tds_procrpc` (run with `LEXDB_MSSQL` it prints the
 oracle's answers), `tns_routine`, `wire_routine` and `exec_routine_reopen`
 are written by hand.
+
+Open point from review (package F1): every statement now checks for PostgreSQL SQL functions to inline
+(`Session.inlineFunctions` reads the shared memo's name list, a lock and a string copy, even when no
+function exists): +0.6% instructions per primary-key point select (20,000 statements, 3.3955 to 3.4157
+billion, repeated). A cheaper gate (a flag or count that needs no copy, kept with the catalog version)
+would remove it. Fixed after review: each session caches the names with lexdb_routine's generation
+(`namesGen`, moved by every `setNames`); a statement compares one integer. Point selects back to
+before F1 (3.3990 / 3.3982 billion against 3.3999 / 3.3983; F1 3.4125 / 3.4134). Test:
+`exec_routine_sessions` (a function made, replaced and dropped in one session seen by another that
+had cached none; it fails with the invalidation removed).
+A second hole, found from a user question about transactions (and in F1 from the start): the shared list
+was built from the building session's transaction, so a function another session made in a transaction still
+open at that moment was left out after it committed (every session then got 42883 until a restart). The list
+must only ever hold more names than some transaction can see, never fewer: a function made before the list
+exists is now kept aside and merged when the list is built (`noteFunction`, `loadNames`). Definitions
+themselves were always transactional (catalog rows; calls resolve through the caller's transaction).
+
+## 8. Package C: what was done
+
+**What reproduced (S9, O1, O8, and the PostgreSQL counterparts).** Every form: PostgreSQL `GENERATED ALWAYS AS (...)` was 0A000
+("generated columns are not supported"), SQL Server `col AS (expr)` a syntax error (156), Oracle `GENERATED ALWAYS AS (...) VIRTUAL`
+ORA-03001 and the short form ORA-00900. Oracle's function-based index worked only for a call (`CREATE INDEX ... (UPPER(s))`); a CASE or
+an arithmetic expression was ORA-00900, and USER_IND_COLUMNS showed lexdb's internal text as the column name with USER_IND_EXPRESSIONS
+empty. PostgreSQL's expression indexes (9.89) were there, as was `exprindex_queries.txt`; SQL Server has no function-based index.
+
+**The model (one, in `lexdb_gen` and `lexdb_exec`).** A column's `ColDef` has `gen` (an expression of the same row's other columns) and
+`genKind` (stored: PostgreSQL STORED, T-SQL PERSISTED; virtual: PostgreSQL 18's VIRTUAL and default, Oracle VIRTUAL, T-SQL's computed
+column that is not persisted); the catalog row has a flag for them (16, after the collation). The value is computed as the row is written
+(`genFill`, from `Defs.gens`, before the NOT NULL and CHECK tests) by INSERT, INSERT ... SELECT, ON CONFLICT DO UPDATE, COPY (its fast
+path refuses such a table), MERGE, INSERT BULK, UPDATE (also joined and with batch_rows), a foreign key action's update and the rewrite
+of ALTER TABLE; and kept in the row, **for the virtual kind too**: lexdb does not compute a virtual column when it is read. The kind says
+what the catalogs call it and which rules apply; scans, indexes, constraints, statistics and the batch pipeline see an ordinary column
+(the 3,000-row test in `exec_generated` reads one with `lexdb_batch` off and on). The price: ADD COLUMN of a generated column over rows
+rewrites the table (SQL Server and Oracle add a virtual one without), and an expression that fails (a division by zero) fails at the
+INSERT, where SQL Server's and PostgreSQL's virtual columns fail at the read. `Stmt.mdialect` is now set for CREATE TABLE, INSERT, UPDATE
+and CREATE INDEX (it was for ALTER, MERGE and views): the write errors and the rules below are each dialect's.
+
+**Per dialect.**
+- PostgreSQL: `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]` (VIRTUAL when neither: 18's), 428C9 for a value given (DEFAULT is taken),
+  42P17 for another generated column or an expression that is not immutable, 42803, 0A000 for a subquery, 42601 with a DEFAULT or BY
+  DEFAULT; virtual columns take no index, primary key, unique nor foreign key (0A000, as 18); stored ones take all of them; `COPY` leaves
+  them out of its default columns and names one 42P10; RENAME COLUMN rewrites the expressions, ALTER COLUMN TYPE of a column one reads is
+  0A000, of a generated one is allowed (USING 42611), DROP COLUMN of a column one reads is 2BP01 (CASCADE drops the generated one),
+  `DROP EXPRESSION` (stored only), `SET EXPRESSION AS` (rows recomputed, indexes made again); `pg_attribute.attgenerated`, `pg_attrdef`,
+  `information_schema.columns.is_generated` / `generation_expression`, psql's `\d` (checked against 18.6, `exec_computed`).
+- SQL Server: `col AS expr [PERSISTED [NOT NULL]]` at CREATE TABLE and ADD, the type from the expression by SQL Server's rules
+  (`lexdb_gen.tsqlType`: casts, columns, varchar + varchar, integer and decimal arithmetic), 271 for a value given (and for DEFAULT), a
+  list-less INSERT leaves computed columns out (213 for the wrong count, 109 / 110 with a list), 1759, 4936, 1046, 207, 8183 (NOT NULL,
+  DEFAULT, CHECK and FOREIGN KEY on one that is not persisted), 10609 (a filtered index over one), 5074 / 4922 for ALTER COLUMN and DROP
+  COLUMN of a column one reads, 4928 for ALTER COLUMN of one, 15336 for sp_rename of a column one reads; indexes and unique constraints
+  on them; `sys.columns.is_computed`, `sys.computed_columns`, `COLUMNPROPERTY(.., 'IsComputed')` (checked against SQL Server 2022,
+  `tds_computed`).
+- Oracle: `[type] GENERATED ALWAYS AS (expr) [VIRTUAL]` and `[type] AS (expr)` (the type optional), ORA-54013 / ORA-54017 for a value
+  given, ORA-00947 for fewer values than columns (so an INSERT needs its column list), ORA-54012, 54002, 54016, 904, and 54031 / 54033 /
+  54027 for RENAME, MODIFY and DROP of a column one reads; indexes, NOT NULL, CHECK, PRIMARY KEY and UNIQUE on virtual columns;
+  function-based indexes take any expression (O8: `CASE`, arithmetic, calls; ORA-01743 for one that is not pure), USER_IND_COLUMNS names
+  them SYS_NCnnnnn$ and USER_IND_EXPRESSIONS gives the expression as Oracle writes it, USER_TAB_COLS / TAB_COLUMNS give VIRTUAL_COLUMN
+  and DATA_DEFAULT (`tns_computed`).
+
+**A side fix.** T-SQL's `+` in a CHECK, DEFAULT or index expression broke the catalog round trip (the stored text "t+" was not read
+back): `CREATE TABLE t (a int, b int, CHECK (a + b > 0))` over TDS failed. parseExpr reads it now, and `sys.check_constraints` shows `+`.
+
+**Tests.** `exec_computed` (PostgreSQL 18, gen_pg.py), `tds_computed` (SQL Server 2022, gen_mssql.py), `tns_computed` (by hand: no
+Oracle was at hand), `exec_generated` (hand written: the disk crashed twice and the store opened again, EXPLAIN showing the index of a
+stored generated column and an expression index, 3,000 rows batched against `lexdb_batch = off`, an error in a later batch, writes
+checked against a recomputation, a rolled back INSERT). Single-row INSERT (in process, five columns and an index, a transaction of
+2,000, `perf stat instructions:u`, pinned, base and branch interleaved): 148.5k instructions per statement at the base, 148.4k on the
+branch (the additive-operator test in the parser, `isAddOp`, is cheaper than the two `isKw` calls it replaces, and pays for the two
+fields every column record gained).
+
+**Left, and unsure.**
+- A T-SQL computed column that is not persisted and not deterministic (`AS (DATEDIFF(day, born, GETDATE()))`, `AS (NEWID())`) is
+  refused (0A000): it must be computed when read, and lexdb keeps virtual columns in the row. Reading virtual columns at read time (the
+  name resolver substituting the expression, an index on one an expression index) would remove this, the rewrite at ADD COLUMN and the
+  failing INSERT above.
+- PostgreSQL: `CREATE TABLE ... (LIKE t INCLUDING GENERATED)` (lexdb has no LIKE); a virtual column's NOT NULL is checked at the write.
+- SQL Server: `COLUMNPROPERTY(.., 'IsDeterministic' / 'IsPrecise')`; a unique index's NULLs are distinct (SQL Server's are equal) and its
+  violation is 2627, not 2601 (both existing); a computed column in a table variable or a table type is parsed, not tested.
+- Oracle (documentation and memory, no server): ORA-54027 for DROP COLUMN of a column a virtual one reads, 54031 and 54033, the
+  numbering of the SYS_NC columns (after the table's columns, in the order the indexes were made), DEFAULT taken for a virtual column
+  in INSERT, MODIFY of a virtual column's own type (allowed here), the hidden SYS_NC rows of USER_TAB_COLS (not listed).
