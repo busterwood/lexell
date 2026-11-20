@@ -3237,3 +3237,201 @@ The unit is a row of the table scanned with a filter (`k + 0 < N/2`): 31 ns
 - A first calibration run without the second index measured the counted
   switch's counting with the read (no statistics: the switch ran) and is
   not used.
+
+## 48. Rewrites that keep results: outer joins made inner, conjuncts pushed into derived tables (2026-11-20)
+
+Item Q5 of lexdb-layers.md 6.3. lexdb-constructs.md section 9 found neither
+rewrite in the planner. Two costs follow from their absence:
+
+- **A filter on a view or derived table is applied after its whole query
+  runs.** `SELECT * FROM v WHERE id = 5` over `CREATE VIEW v AS SELECT ...
+  FROM big` reads all of `big` into held rows (batch-gaps item 6 cuts them
+  into batches) and filters them; the view's own query never sees the
+  equality, so `big`'s primary key is not used. A view grouped by a key and
+  filtered on it aggregates every group.
+- **An outer join that WHERE makes inner keeps FROM's order and its join
+  methods.** `a LEFT JOIN b ON ... WHERE b.x = 1` returns only joined rows,
+  yet the planner keeps `a` first (section 41: outer joins are not
+  reordered) and checks `b.x = 1` after the NULL row is made
+  (`Level.post`).
+
+### 48.1 Where the rewrites run
+
+**Outer to inner: in `lexdb_plan.planFrom`,** before WHERE's conjuncts are
+placed. `fromConds` has just given the ON conjuncts per level (`ms`) and
+WHERE's (`cs`), resolved; the conversion changes `Level.join`, and
+everything after it (the placement, `lastRight`, `innerOnly`, the cost
+search, `Level.post`) sees an inner join. Nothing before `planFrom` reads a
+level's join kind for planning; the logical plan (`Query.lp`) keeps the
+join as written (it is the binder's).
+
+**Pushdown: also in `planFrom`, by planning the derived table's query
+again.** A derived table's (or view's, or CTE use's) query is planned by
+`bindFrom` before WHERE is resolved, and it has to be: its output columns'
+names and types are what the outer query's names resolve against, and an
+unqualified name in WHERE can mean a column of any FROM item, known only
+once all are bound. So a rewrite of the statement before binding cannot
+tell which conjuncts read only the derived table without doing the
+binder's work twice, and moving `bindFrom`/`planSub` out of exec is E3
+(the catalog snapshot), not this item. Instead:
+
+1. `bindFrom` (exec, glue only) keeps what a second planning needs: WHERE
+   as written (after `pullCommonOr`, before `resolve`) in
+   `FromBound.whereAst` when some FROM item is a query, and for each view
+   its query, owner and renames (`FromBound.views`).
+2. `planFrom` (`pushDown`, after the outer-to-inner step) takes each WHERE
+   conjunct whose resolved form reads the columns of one derived level
+   only, writes its unresolved form in the derived query's terms (each
+   column replaced by the expression of the derived query's select list
+   that makes it), adds it to that query's WHERE or HAVING, and plans the
+   query again through the hook (`Up.planSub`, as the semi-join
+   alternative does), with the scope `bindFrom` used (this query's frame
+   hidden; a view's owner as the role, its renames). The new plan replaces
+   the derived level's `SubPlan`; the conjunct leaves the outer WHERE. If
+   the second planning fails, or its columns differ, the first plan and
+   the outer conjunct stay.
+
+The first planning of a derived query whose WHERE gets a conjunct is
+wasted; only statements with a derived table, a view or a CTE and a WHERE
+conjunct on it pay it, and they are the ones the rewrite speeds up. A
+statement without a derived level pays one flag test.
+
+### 48.2 Outer to inner: when it is valid
+
+A conjunct **rejects the NULLs of a set of levels** when it cannot be true
+on a row whose columns of those levels are all NULL. Decided on the
+resolved conjunct (`rejectsNulls`, `nullOn`):
+
+- a column of those levels is NULL; a NULL literal is NULL;
+- a comparison (`= <> < <= > >=`), arithmetic (`+ - * / %`), unary minus,
+  a cast, NOT, and the calls `in` (by its first argument), `like`,
+  `ilike`, T-SQL's like, `similar`, the regular-expression matches,
+  `lower`, `upper`, `length`, `substring`, `substr`, `trim`, `abs`,
+  `date_trunc`, `extract` and the collation and char wrappers the binder
+  adds (`#ci`, `#pad`, `#bptrim`, T-SQL's decimal division) are NULL when
+  an argument (for a call: its first) is;
+- such an expression, `x IS NOT NULL` and `NOT (x IS NULL)` reject when
+  x is NULL; `a AND b` rejects when either rejects; `a OR b` when both do;
+- nothing else: not `IS NULL`, `IS DISTINCT FROM`, COALESCE, NULLIF, CASE,
+  `||` (Oracle's concatenation skips NULLs), T-SQL's `+` on texts, a
+  subquery, a user's function, or any other call (a function may be called
+  on NULL input).
+
+**The conjuncts above join j** (levels are left-deep: level j joins the
+levels before it): WHERE's, and the ON conjuncts of each later level whose
+join drops rows of the levels before it, an inner (or cross) join's and a
+RIGHT JOIN's; not a later LEFT or FULL JOIN's ON, which keeps those rows.
+
+**The rule**, the levels from last to first (so a later join's own kind is
+settled before its ON is counted):
+
+| join at level j | becomes | when a conjunct above it rejects the NULLs of |
+|---|---|---|
+| LEFT | INNER | level j |
+| RIGHT | INNER | the levels before j (any one of their columns) |
+| FULL | LEFT | the levels before j |
+| FULL | RIGHT | level j |
+| FULL | INNER | both |
+
+Why it is valid, also through a later RIGHT or FULL join (PostgreSQL's
+`reduce_outer_joins` passes nothing through a FULL join; lexdb's rule is
+wider): turning level j's LEFT JOIN inner removes exactly the rows whose
+level-j columns were made NULL. A later inner or LEFT join removes the rows
+made from them; a later RIGHT or FULL join may instead add rows of its own
+table with every column before it NULL, level j's included. So the two
+plans differ only in rows whose level-j columns are all NULL, and the
+rejecting conjunct, which is above all of them, removes every such row in
+both. The same holds for the other cases with the other side's columns.
+
+What follows from an inner join: the join order is searched by cost
+(section 26) when no outer join is left, the implied equalities apply
+(section 27), the conjunct is a condition of the level (not `Level.post`),
+and a hash or lookup is chosen for it as for any inner join. FOR UPDATE on
+the formerly nullable side is allowed then, as PostgreSQL allows it (its
+check comes after its own reduction).
+
+### 48.3 Pushdown: when it is valid
+
+A WHERE conjunct goes into a derived level L (a derived table, a view, or
+a CTE used once) when all of these hold, and otherwise stays where it is:
+
+- **It reads L's columns only**, and at least one (its resolved form's
+  level mask is L alone: no other table, no outer query's value). It has
+  no subquery and nothing volatile: `random`, `clock_timestamp`,
+  `gen_random_uuid`, the sequence and advisory-lock functions, a user's
+  function (`#udf`, `#plf`). Stable functions (`now()`, `current_user`)
+  are allowed: they have one value in a statement.
+- **L is not on the nullable side of an outer join** after 48.2 (a LEFT
+  JOIN's right side, anything before a RIGHT JOIN, either side of a FULL
+  JOIN). A conjunct that rejects L's NULLs has made such a join inner
+  already; one that does not (`x.k IS NULL OR x.k = 5`) would keep a row
+  the outer query drops.
+- **L is not LATERAL** (it runs per row), not a recursive CTE's working
+  table, and **a CTE is used once** in the statement (`Stmt.cteOnce`, set
+  by the parser): a CTE used twice shares its rows (`SubPlan.cte`), and
+  pushing into one use would either filter the other's rows or run the
+  CTE twice. A CTE used once is planned as a derived table then (its
+  `SubPlan.cte` -1).
+- **The derived query's shape lets the filter through:**
+  - no LIMIT, OFFSET, FETCH, TOP (any form, WITH TIES too) and no Oracle
+    ROWNUM (made a LIMIT or a window by the parser): the filter would
+    change which rows are counted;
+  - no window function, no DISTINCT ON: the filter would change the
+    partitions or the first rows;
+  - not a function scan, VALUES or a catalog relation: nothing to push
+    into;
+  - no FOR UPDATE, no MATCH_RECOGNIZE, no T-SQL `SELECT @v = ...`, no
+    grouping sets (ROLLUP, CUBE, GROUPING SETS: a super-aggregate row has
+    its grouping key NULL, so a filter on the key below the aggregate
+    changes the totals);
+  - nothing volatile in its select list (the number of calls would change:
+    `nextval` per row of the derived table; PostgreSQL pushes quals on the
+    other columns there, lexdb refuses);
+  - a set operation (UNION [ALL], INTERSECT, EXCEPT [ALL]): into **every**
+    part, each with its own select list's expression, and only when no
+    part's column is converted to the result's type (`Sel.conv` empty:
+    a filter on an integer part's column could differ from the same filter
+    on the numeric it becomes). Each part must pass these rules itself.
+- **Through the select list:** each column of L in the conjunct is
+  replaced by the expression that makes it (a rename, an expression, a
+  constant: substituted). With `*` in the select list only a plain column
+  is substituted (by its qualified name); an expression column beside `*`
+  is not pushed.
+- **Through aggregation:** in a grouped query (GROUP BY, no grouping sets)
+  a conjunct whose substituted form has no aggregate (it reads grouping
+  keys or what they determine: the select list allows nothing else outside
+  an aggregate) goes to the query's WHERE, filtering the rows before they
+  are grouped; one with an aggregate goes to its HAVING. An aggregate
+  without GROUP BY (one row, even of no input), or a HAVING without GROUP
+  BY: HAVING always (in WHERE, `x.c = 6` over `SELECT count(*) c` would
+  still give one row).
+- **Through DISTINCT:** to WHERE (a filter on the output's columns commutes
+  with removing duplicates).
+
+**Errors.** A pushed conjunct is ANDed after the derived query's own WHERE
+(or HAVING), so where both land on one level it is checked after them,
+row by row as before (the batch path's selection vector keeps the order).
+It may still run on rows a later join of the derived query, or the outer
+query, would have dropped: the rule lexdb already follows for WHERE's
+conjuncts in one query (`planFrom` places each at the earliest level that
+has its columns), and PostgreSQL's, SQL Server's and Oracle's (SQL leaves
+the order of evaluation open; PostgreSQL pushes quals into subqueries in
+the same way, `subquery_push_qual`). So: a conjunct that fails on a row
+the derived query's join would have removed can now raise its error. The
+same rule holds in the three doors.
+
+**Representatives.** Through GROUP BY and DISTINCT under a case-insensitive
+collation (T-SQL's default) or for numerics of different scales, a group
+keeps one of several equal values as its output; a filter that tells them
+apart (`k LIKE 'a%'` with a case-sensitive LIKE, `k::text = '1.0'`) can then
+keep another group member. PostgreSQL accepts the same; the answer the
+outer filter gave there depended on which member the grouping showed.
+
+### 48.4 The switch
+
+Both rewrites belong to the cost planner: `SET lexdb_planner = rules`
+makes neither (the rules planner is the reference the differential tests
+compare against). `lexdb_plan.setRewrites(mode)` (bits `RW_OUTER`,
+`RW_PUSH`; both by default) switches each off in process, for the tests
+(each query run with the rewrite and without, the results compared) and
+for measuring.
