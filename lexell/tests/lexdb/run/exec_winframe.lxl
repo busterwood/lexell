@@ -1,0 +1,514 @@
+// lexdb_window, slice 10c (design/lexdb-batch-gaps.md item 10): every window
+// call made column-wise, against the row path (SET lexdb_batch = off:
+// lexdb_window.rowValues) over the same queries, compared as text, row order
+// included. Each query is run on both; the counters (lexdb_exec.winRuns and
+// winRowRuns) say which path made its calls: with batches on every call must be
+// made by columns and none by the row path (there is no window shape that
+// still falls back), with batches off the other way round.
+// - GROUPS frames (offsets of 0, 1, 2, 5 and past the partition; UNBOUNDED,
+//   CURRENT ROW), RANGE frames with offsets over integer, float, numeric, date
+//   and timestamp keys (with interval offsets), DESC, NULLS FIRST and LAST,
+//   NULL keys (their frame is their peers), keys of mixed kinds;
+// - every EXCLUDE mode (CURRENT ROW, GROUP, TIES, NO OTHERS) over ROWS, RANGE
+//   and GROUPS frames and the default one;
+// - first_value, last_value and nth_value over frames with offsets and EXCLUDE;
+// - string_agg (separators from columns, NULLs), FILTER on every aggregate;
+// - a query mixing every kind of call, several windows, named windows, a
+//   grouped query, a join, a subquery; partitions of one row and of more than
+//   1,024 rows; tables of 1,023, 1,024, 1,025 and 5,000 rows;
+// - errors at the row the row path reaches them (a value-specific message, so
+//   a different row is a different text), in frames, filters, separators,
+//   offsets and keys;
+// - the values of the frames by hand (the same as PostgreSQL's).
+// timeout: 900
+// expect: tables: INSERT 0 1023 INSERT 0 1024 INSERT 0 1025 INSERT 0 5000
+// expect: groups: 600 queries, 600 the same, 600 by columns, 600 by the row path with batches off, 0 errors
+// expect: range: 594 queries, 594 the same, 594 by columns, 594 by the row path with batches off, 0 errors
+// expect: exclude: 373 queries, 373 the same, 373 by columns, 373 by the row path with batches off, 19 errors
+// expect: values: 691 queries, 691 the same, 691 by columns, 691 by the row path with batches off, 0 errors
+// expect: filter: 410 queries, 410 the same, 410 by columns, 410 by the row path with batches off, 0 errors
+// expect: mixed keys: 13 queries, 13 the same, 13 by columns, 13 by the row path with batches off, 0 errors
+// expect: mixed: 30 queries, 30 the same, 28 by columns, 28 by the row path with batches off, 2 errors
+// expect: sizes: 30 queries, 30 the same, 30 by columns, 30 by the row path with batches off, 0 errors
+// expect: errors: 46 queries, 46 the same, 39 by columns, 39 by the row path with batches off, 41 errors
+// expect: error states: 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22P02 22016 42883 42883 42883 22003 22013 22004 22013 42P20 42P20 22016 22016 22003 22003 22003 22P02 22P02 22P02 22012 42P10
+// expect: by hand, groups: 1|60 2|100 3|100 4|140 5|90 6|60
+// expect: by hand, groups exclude: 1||3 2|10|2 3|10|2 4|50|2 5|60|1 6|40|2
+// expect: by hand, range: 1|60|3 2|60|2 3|60|2 4|40|1 5|50|1 6|60|1
+// expect: by hand, range dates: 1|30 2|30 3|50 4|40 5|50 6|60
+// expect: by hand, range floats: 1|10 2|60 3|60 4|90 5|50 6|60
+// expect: by hand, exclude: 1|200|200|210|210 2|190|160|180|210 3|180|160|190|210 4|170|170|210|210 5|160|160|210|210 6|150|150|210|210
+// expect: by hand, values: 1|20|20|| 2|30|30||10 3|40|40||10 4|50|50|20| 5|60|60|20| 6||50|20|
+// expect: by hand, strings: 1|| 2||30 3|30|20 4|30/40| 5|30/40/50| 6|40/50/60|
+// expect: counter: 4 0 0 2
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+type Tally = record { n: int; same: int; ran: int; offRan: int; errs: int; states: []str }
+
+fn newTally(): Tally { return Tally{n: 0, same: 0, ran: 0, offRan: 0, errs: 0, states: []} }
+
+// sql on the row path (batches off) and on the batches' path: the batches' path
+// must make every call by columns (ran), the row path must make them all (offRan).
+fn both(s: mut &lexdb_exec.Session, sql: &str, t: mut &Tally) {
+    let a = q(s, &"set lexdb_batch = off")
+    let w0 = lexdb_exec.winRuns()
+    let r0 = lexdb_exec.winRowRuns()
+    let off = q(s, sql)
+    let w1 = lexdb_exec.winRuns()
+    let r1 = lexdb_exec.winRowRuns()
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let w2 = lexdb_exec.winRuns()
+    let r2 = lexdb_exec.winRowRuns()
+    t.n += 1
+    if r1 > r0 && w1 == w0 { t.offRan += 1 } else if !strings.startsWith(&off, "ERROR ") { println("OFF PATH: " + sql) }
+    if w2 > w1 && r2 == r1 { t.ran += 1 } else if !strings.startsWith(&on, "ERROR ") { println("PATH: " + sql) }
+    if off == on { t.same += 1 } else {
+        var i = 0
+        while i < len(off) && i < len(on) && off[i..i + 1] == on[i..i + 1] { i += 1 }
+        let from = if i > 80 { i - 80 } else { 0 }
+        println("DIFFERENT: " + sql)
+        println("  rows:    ..." + off[from..min(from + 160, len(off))])
+        println("  batches: ..." + on[from..min(from + 160, len(on))])
+    }
+    if strings.startsWith(&on, "ERROR ") {
+        t.errs += 1
+        append(mut &t.states, on[6..11].clone())
+    }
+}
+
+fn report(name: &str, t: &Tally) {
+    println(name + ": " + t.n.toStr() + " queries, " + t.same.toStr() + " the same, " + t.ran.toStr() + " by columns, " + t.offRan.toStr() + " by the row path with batches off, " + t.errs.toStr() + " errors")
+}
+
+// The frame to use with a spec and an EXCLUDE (which needs a frame clause), or "-" when
+// the pair is not a query: GROUPS needs an ORDER BY, RANGE with an offset exactly one key.
+fn pick(spec: &str, fr: &str, ex: &str): str {
+    var f = fr.clone()
+    if f == "" && ex != "" { f = "range between unbounded preceding and current row" }
+    let ord = strings.contains(spec, "order by")
+    if strings.startsWith(&f, "groups") && !ord { return "-" }
+    var digit = false
+    for i in 0..len(f) { if f[i..i + 1] >= "0" && f[i..i + 1] <= "9" { digit = true } }
+    if strings.startsWith(&f, "range") && digit {
+        if !ord { return "-" }
+        match strings.cut(spec, "order by") {
+            Some(c) { if strings.contains(c.after, ",") { return "-" } }
+            None {}
+        }
+    }
+    return f
+}
+
+fn createTable(s: mut &lexdb_exec.Session, name: &str, n: int): str {
+    let c = q(s, &("create table " + name + " (id int primary key, g1 int, g2 int, s text, sc text, v int, o int, f float8, nm numeric(8,2), dt date, ts timestamp, " +
+                   "big int, uniq int, b boolean, nu numeric, hb bigint)"))
+    if c != "CREATE TABLE" { return c }
+    return q(s, &("insert into " + name + " select i, case when i % 17 = 0 then null else i % 7 end, case when i % 13 = 0 then null else (i / 3) % 5 end, " +
+                  "case when i % 11 = 0 then null else 'k' || (i % 9)::text end, " +
+                  "case when i % 10 = 0 then null else case i % 5 when 0 then 'a' when 1 then 'A' when 2 then 'b' when 3 then 'B' else 'ab' end end, " +
+                  "case when i % 6 = 0 then null else (i * 37) % 101 end, (i * 7) % 23, (i % 40) * 0.5, ((i % 50) * 3) * 0.01, " +
+                  "case when i % 23 = 0 then null else date '2024-01-01' + (i % 30) end, " +
+                  "case when i % 19 = 0 then null else timestamp '2024-01-01 00:00:00' + ((i * 37) % 500) * interval '1 minute' * 11 end, " +
+                  "case when i % 4 = 0 then 0 else 1 end, i, case when i % 3 = 0 then null else i % 2 = 0 end, " +
+                  "case i % 4 when 0 then (i % 50)::numeric when 1 then (i % 50) * 0.5 when 2 then (i % 50) * 0.125 else null end, " +
+                  "case when i % 1000 in (100, 200, 300) then 4611686018427387000 when i % 1000 in (400, 500, 600) then -4611686018427387000 else i % 10 end " +
+                  "from generate_series(1, " + n.toStr() + ") i"))
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(63), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var made: []str = []
+        for nn in [1023, 1024, 1025, 5000] { append(mut &made, createTable(mut &s, &("w" + nn.toStr()), nn)) }
+        let c2 = q(mut &s, &"create table d (k int primary key, lab text)")
+        let c3 = q(mut &s, &"insert into d values (0,'z'),(1,'y'),(2,'x'),(3,'w'),(4,'v'),(5,'u'),(6,'t'),(9,'none')")
+        println("tables: " + strings.join(&made, " "))
+        // (the wide frames on the small tables: the row path is quadratic in them)
+        let small = ["w1023", "w1024", "w1025", "w1025", "w1024", "w1023"]
+        let tnames = ["w1023", "w1024", "w1025", "w5000", "w1025", "w5000"]
+
+        let aggs = ["count(*)", "count(v)", "sum(v)", "avg(o)", "min(v)", "max(s)", "sum(f)", "avg(nm)", "max(nu)", "variance(f)", "bool_or(b)", "array_agg(v)",
+                    "min(case when id % 2 = 0 then v else f end)", "sum(v * 2)", "sum(nm)", "count(s)", "max(dt)", "sum(coalesce(v, 0))"]
+        let excl = ["", "", " exclude no others", " exclude current row", " exclude group", " exclude ties"]
+
+        // GROUPS frames
+        let gspecs = ["order by o", "order by v nulls first", "order by v desc nulls last", "partition by g1 order by o", "partition by g2 order by v nulls first, id",
+                      "partition by g1, g2 order by o desc", "partition by uniq order by o", "partition by big order by o", "order by s", "order by sc desc nulls first",
+                      "order by dt", "partition by b order by o", "order by f", "order by nm desc", "order by id", "partition by g1 order by o, id",
+                      "order by case when id % 2 = 0 then v else 0.5 end", "partition by case when id % 2 = 0 then v else 0.5 end order by o"]
+        let gframes = ["groups between 1 preceding and 1 following", "groups between unbounded preceding and current row", "groups between current row and current row",
+                       "groups between unbounded preceding and 2 following", "groups between 2 preceding and unbounded following", "groups between 2 preceding and 1 preceding",
+                       "groups between 1 following and 3 following", "groups between 0 preceding and 0 following", "groups between current row and 3 following",
+                       "groups between 5 preceding and 5 following", "groups between 1000 preceding and 1000 following", "groups 1 preceding",
+                       "groups between unbounded preceding and unbounded following", "groups between 3 preceding and current row", "groups between 4 following and 100 following",
+                       "groups between current row and unbounded following", "groups between 1 preceding and 1 preceding", "groups between 9223372036854775807 preceding and current row"]
+        var tg = newTally()
+        var k = 0
+        for ag in aggs {
+            for sp in 0..len(gspecs) {
+                if (sp + k) % 2 != 0 { continue }
+                let tn = small[(sp + k) % 6].clone()
+                let fr = gframes[(sp * 5 + k * 7) % len(gframes)].clone()
+                let ex = excl[(sp + k * 3) % len(excl)].clone()
+                both(mut &s, &("select id, " + ag + " over (" + gspecs[sp] + " " + fr + ex + ") from " + tn), mut &tg)
+            }
+            k += 1
+        }
+        // every frame over a few specs and calls (with every mode of EXCLUDE)
+        for fr in gframes {
+            for ex in excl {
+                for ag in ["count(*)", "sum(v)", "min(s)", "first_value(v)", "last_value(v)", "nth_value(v, 2)"] {
+                    for sp in ["order by o", "partition by g1 order by o desc, id", "partition by uniq order by id"] {
+                        if (len(fr) + len(ex) + len(ag) + len(sp)) % 4 != 0 { continue }
+                        both(mut &s, &("select id, " + ag + " over (" + sp + " " + fr + ex + ") from w1025"), mut &tg)
+                    }
+                }
+            }
+        }
+        report("groups", &tg)
+
+        // RANGE frames with offsets, by the kind of the key
+        // (key spec, offsets of that kind)
+        let rkeys = [
+            "order by o|10|3", "order by o desc|10|3", "order by v|10|3", "order by v nulls first|10|3", "order by v desc nulls last|10|3", "order by id|10|3",
+            "partition by g1 order by o|5|0", "partition by g2 order by v desc|1|2", "partition by big order by id|100|7", "partition by uniq order by o|3|1",
+            "order by f|1.5|2", "order by f desc nulls first|1.5|0.5", "order by nm|0.5|3", "order by nm desc|2|0.25", "partition by g1 order by nm nulls first|1|0.07",
+            "order by dt|interval '3 days'|interval '1 month'", "order by dt desc|interval '2 days'|interval '1 day'", "partition by g1 order by dt|interval '1 week'|interval '0 days'",
+            "order by dt|3|10", "order by ts|interval '90 minutes'|interval '1 day'", "order by ts desc nulls first|interval '2 hours'|interval '30 minutes'",
+            "partition by g2 order by ts|interval '1 month'|interval '5 hours'", "order by case when id % 2 = 0 then v else 0.5 end|3|1.5",
+            "order by case when id % 2 = 0 then v else 0.5 end desc|3|0.5", "partition by uniq order by id|0|1000", "order by hb|5|10"]
+        var tr = newTally()
+        k = 0
+        for ag in aggs {
+            for sp in 0..len(rkeys) {
+                if (sp + k) % 2 != 0 { continue }
+                let parts = strings.split(&rkeys[sp], "|")
+                let o1 = parts[1].clone()
+                let o2 = parts[2].clone()
+                let frs = ["range between " + o1 + " preceding and " + o1 + " following", "range between " + o1 + " preceding and current row",
+                           "range between current row and " + o2 + " following", "range between unbounded preceding and " + o2 + " following",
+                           "range between " + o1 + " preceding and unbounded following", "range between " + o2 + " preceding and " + o2 + " preceding",
+                           "range between " + o2 + " following and " + o1 + " following", "range between " + o1 + " preceding and " + o2 + " preceding",
+                           "range between " + o2 + " preceding and " + o1 + " following", "range between current row and current row", "range " + o1 + " preceding"]
+                let fr = frs[(sp * 3 + k * 5) % len(frs)].clone()
+                let ex = excl[(sp + k) % len(excl)].clone()
+                let tn = small[(sp + k) % 6].clone()
+                both(mut &s, &("select id, " + ag + " over (" + parts[0] + " " + fr + ex + ") from " + tn), mut &tr)
+            }
+            k += 1
+        }
+        // every frame form over a key, the calls that read the frame by position too
+        for ks in ["order by o|10|3", "order by v nulls first|10|3", "order by dt desc|interval '2 days'|interval '1 day'", "order by ts|interval '90 minutes'|interval '1 day'",
+                   "order by nm desc|2|0.25"] {
+            let parts = strings.split(&ks, "|")
+            let o1 = parts[1].clone()
+            let o2 = parts[2].clone()
+            for fr in ["between " + o1 + " preceding and " + o1 + " following", "between " + o1 + " preceding and current row", "between current row and " + o2 + " following",
+                       "between unbounded preceding and " + o2 + " following", "between " + o2 + " following and " + o1 + " following", "between " + o1 + " preceding and " + o2 + " preceding"] {
+                for ex in excl {
+                    for ag in ["sum(v)", "count(*)", "first_value(v)", "last_value(v)", "nth_value(id, 3)", "max(s)"] {
+                        if (len(fr) + len(ex) + len(ag) + len(ks)) % 3 != 0 { continue }
+                        both(mut &s, &("select id, " + ag + " over (" + parts[0] + " range " + fr + ex + ") from w1024"), mut &tr)
+                    }
+                }
+            }
+        }
+        report("range", &tr)
+
+        // EXCLUDE over ROWS frames and the default frame, the calls that count, sum, add again
+        var te = newTally()
+        let eaggs = ["count(*)", "count(v)", "sum(v)", "avg(v)", "sum(o)", "avg(o)", "sum(f)", "min(v)", "max(s)", "array_agg(o)", "sum(nm)", "sum(v * 2)", "count(s)", "bool_or(b)",
+                     "string_agg(s, ',')", "sum(hb)", "avg(hb)", "count(hb)", "max(hb)"]
+        let especs = ["order by id", "order by o", "partition by g1 order by o", "partition by g2 order by v nulls first, id", "partition by uniq order by id", "partition by big order by o",
+                      "", "partition by g1", "order by s", "partition by b order by id desc"]
+        let eframes = ["", "rows between unbounded preceding and unbounded following", "rows between 3 preceding and 3 following", "rows between 1 preceding and 1 following",
+                       "rows between unbounded preceding and current row", "rows between current row and unbounded following", "rows between 2 preceding and 1 preceding",
+                       "rows between 1 following and 3 following", "range between unbounded preceding and unbounded following", "range between current row and current row",
+                       "range between unbounded preceding and current row", "rows between 0 preceding and 0 following", "rows between 100 preceding and 100 following"]
+        k = 0
+        for ag in eaggs {
+            for sp in 0..len(especs) {
+                for ex in 2..6 {
+                    if (sp + ex + k) % 3 != 0 { continue }
+                    let fr = pick(&especs[sp], &eframes[(sp * 3 + ex * 5 + k) % len(eframes)], &excl[ex])
+                    if fr == "-" { continue }
+                    both(mut &s, &("select id, " + ag + " over (" + especs[sp] + " " + fr + excl[ex] + ") from " + small[(sp + k) % 6]), mut &te)
+                }
+            }
+            k += 1
+        }
+        // the big tables, the integer sums made from prefixes (narrow and whole-partition frames)
+        for sp in ["partition by g1 order by o", "partition by big order by id", "order by id", "partition by uniq order by id"] {
+            for ex in ["exclude current row", "exclude group", "exclude ties"] {
+                for ag in ["sum(v)", "count(v)", "avg(o)", "count(*)", "sum(hb)"] {
+                    both(mut &s, &("select id, " + ag + " over (" + sp + " rows between unbounded preceding and unbounded following " + ex + ") from w5000"), mut &te)
+                    both(mut &s, &("select id, " + ag + " over (" + sp + " range between unbounded preceding and current row " + ex + ") from w5000 where id % 5 = 0"), mut &te)
+                }
+            }
+        }
+        report("exclude", &te)
+
+        // first_value, last_value and nth_value over frames with offsets
+        var tv = newTally()
+        let vcalls = ["first_value(v)", "last_value(v)", "nth_value(v, 2)", "nth_value(v, 3)", "nth_value(id, 1)", "nth_value(v, 50)", "first_value(v + 1)", "last_value(s)",
+                      "nth_value(s, o % 4 + 1)", "last_value(id * 2)", "nth_value(v, null)", "first_value(f)", "last_value(dt)", "nth_value(nm, 2)"]
+        let vframes = ["rows between 1 preceding and 1 following", "rows between 3 preceding and current row", "rows between current row and 3 following",
+                       "rows between 2 preceding and 1 preceding", "rows between 1 following and 3 following", "rows between 5 following and 7 following",
+                       "rows between unbounded preceding and 2 following", "rows between 2 preceding and unbounded following", "rows between 0 preceding and 0 following",
+                       "rows between 100 preceding and 100 following", "rows between 9223372036854775807 preceding and 9223372036854775807 following",
+                       "groups between 1 preceding and 1 following", "groups between unbounded preceding and 1 following", "groups between 1 preceding and current row",
+                       "groups between current row and 2 following", "groups between 2 preceding and 1 preceding",
+                       "range between 10 preceding and 10 following", "range between current row and 5 following", "range between 3 preceding and current row",
+                       "range between unbounded preceding and unbounded following", "range between current row and unbounded following", "range between current row and current row"]
+        let vspecs = ["order by o", "order by o, id", "partition by g1 order by o, id", "partition by g2 order by v nulls first", "partition by uniq order by o",
+                      "partition by big order by o desc", "order by v desc nulls last"]
+        k = 0
+        for ag in vcalls {
+            for sp in 0..len(vspecs) {
+                for fi in 0..len(vframes) {
+                    if (sp + fi + k) % 3 != 0 { continue }
+                    let ex = excl[(sp + fi + k) % len(excl)].clone()
+                    let fr = pick(&vspecs[sp], &vframes[fi], &ex)
+                    if fr == "-" { continue }
+                    both(mut &s, &("select id, " + ag + " over (" + vspecs[sp] + " " + fr + ex + ") from " + small[(sp + fi + k) % 6]), mut &tv)
+                }
+            }
+            k += 1
+        }
+        report("values", &tv)
+
+        // string_agg and FILTER
+        var tf = newTally()
+        let fcalls = ["string_agg(s, ',')", "string_agg(s, sc)", "string_agg(s || 'x', '-')", "string_agg(case when id % 3 = 0 then null else s end, ', ')", "string_agg(s, null)",
+                      "string_agg(sc, s)", "string_agg(s, ',') filter (where v > 30)", "string_agg(s, sc) filter (where o > 5)",
+                      "count(*) filter (where v > 50)", "count(v) filter (where g1 = 1)", "sum(v) filter (where o > 10)", "avg(v) filter (where v % 2 = 0)",
+                      "min(v) filter (where g2 is not null)", "max(s) filter (where v > 20)", "array_agg(v) filter (where v > 50)", "sum(f) filter (where b)",
+                      "bool_or(b) filter (where v > 10)", "count(*) filter (where false)", "sum(v) filter (where null)", "sum(nm) filter (where id % 2 = 0)",
+                      "count(*) filter (where b)", "count(*) filter (where o % 3 = 0)", "sum(hb) filter (where id % 7 <> 0)", "min(s) filter (where v is not null)",
+                      "variance(v) filter (where v > 10)"]
+        let fspecs = ["order by id", "order by o", "partition by g1 order by o, id", "partition by g2 order by v nulls first, id", "partition by uniq order by id", "partition by big order by id",
+                      "", "partition by g1", "order by o desc"]
+        let fframes = ["", "rows between unbounded preceding and unbounded following", "rows between 3 preceding and 3 following", "rows between unbounded preceding and current row",
+                       "rows between current row and 2 following", "rows between 2 preceding and 1 preceding", "range between unbounded preceding and current row",
+                       "range between current row and unbounded following", "groups between 1 preceding and 1 following", "range between 5 preceding and current row",
+                       "rows between 5 following and 7 following", "groups between unbounded preceding and current row", "range between 3 preceding and 3 following",
+                       "rows between 100 preceding and 100 following"]
+        k = 0
+        for ag in fcalls {
+            for sp in 0..len(fspecs) {
+                for ex in 0..6 {
+                    if (sp + ex + k) % 3 != 0 { continue }
+                    let fr = pick(&fspecs[sp], &fframes[(sp * 3 + ex * 5 + k) % len(fframes)], &excl[ex])
+                    if fr == "-" { continue }
+                    both(mut &s, &("select id, " + ag + " over (" + fspecs[sp] + " " + fr + excl[ex] + ") from " + small[(sp + ex + k) % 6]), mut &tf)
+                }
+            }
+            k += 1
+        }
+        report("filter", &tf)
+
+        // keys of mixed kinds: the old sort, the calls by columns
+        var tx = newTally()
+        let mk = "case when id % 2 = 0 then v else 0.5 end"
+        let mixed = [
+            "select id, sum(v) over (order by " + mk + ", id groups between 1 preceding and 1 following) from w1025",
+            "select id, count(*) over (order by " + mk + " range between 3 preceding and current row) from w1025",
+            "select id, sum(v) over (order by " + mk + " range between 2 preceding and 2 following exclude ties) from w1024",
+            "select id, first_value(id) over (order by " + mk + ", id groups between 1 preceding and 1 following exclude current row) from w1024",
+            "select id, nth_value(id, 2) over (partition by " + mk + " order by id rows between 1 preceding and 1 following exclude group) from w1025",
+            "select id, string_agg(s, ',') over (partition by " + mk + " order by id), rank() over (order by " + mk + ") from w1025",
+            "select id, count(*) filter (where v > 20) over (partition by g1 order by " + mk + " groups between unbounded preceding and current row) from w1023",
+            "select id, sum(v) over (order by " + mk + " desc nulls last, id rows between 3 preceding and 3 following), dense_rank() over (order by " + mk + ") from w1024",
+            "select id, max(v) over (partition by g1 order by " + mk + " range between current row and 1 following exclude current row) from w1025",
+            "select id, last_value(v) over (order by case when id % 3 = 0 then s else 'k' end, id rows between 2 preceding and 1 following) from w1025",
+            "select id, sum(v) over (order by case when id % 2 = 0 then dt else null end range between 5 preceding and current row) from w1025",
+            "select id, sum(v) over (partition by case when id % 3 = 0 then g1 else 0.5 end order by o groups between 1 preceding and 1 following) from w1024",
+            "select id, row_number() over w, sum(v) over (w groups between 1 preceding and current row), first_value(v) over (w rows between 2 preceding and 1 following) from w1025 " +
+                "window w as (partition by g2 order by " + mk + ", id)"]
+        for sql in mixed { both(mut &s, &sql, mut &tx) }
+        report("mixed keys", &tx)
+
+        // queries with every kind of call, named windows, grouped queries, joins, subqueries
+        var tm = newTally()
+        let sh = [
+            "select id, row_number() over w, rank() over w, dense_rank() over w, percent_rank() over w, cume_dist() over w, ntile(4) over w, lag(v) over w, lead(v, 2, 0) over w, " +
+                "first_value(v) over w, last_value(v) over w, nth_value(v, 2) over w, sum(v) over w, count(*) over w, avg(v) over w, min(v) over w, max(s) over w, " +
+                "sum(v) over (w groups between 1 preceding and 1 following), count(*) over (w range between 2 preceding and 2 following exclude ties), " +
+                "first_value(v) over (w rows between 2 preceding and 2 following), last_value(v) over (w groups between current row and 1 following exclude group), " +
+                "nth_value(v, 2) over (w rows between 1 preceding and unbounded following exclude current row), string_agg(s, ',') over (w rows between 3 preceding and current row), " +
+                "count(*) filter (where v > 10) over (w range between unbounded preceding and 3 following), sum(v) over (w rows between 1 preceding and 1 following exclude current row) " +
+                "from w1025 window w as (partition by g1 order by o, id)",
+            "select id, row_number() over (order by o, id), sum(v) over (order by o groups between 1 preceding and 1 following), count(*) over (partition by g1 range between unbounded preceding and unbounded following exclude current row) from w5000",
+            "select id, sum(v) over (partition by g1 order by o range between 3 preceding and 3 following), sum(v) over (partition by g1 order by o desc range between 3 preceding and 3 following), " +
+                "sum(v) over (partition by g2 order by o groups between 1 preceding and 1 following) from w1024",
+            "select id, sum(v) over w1, string_agg(s, ',') over w2, count(*) filter (where o > 3) over w3, first_value(v) over w4 from w1025 " +
+                "window w1 as (order by o groups between 1 preceding and 1 following), w2 as (partition by g1 order by id rows between 2 preceding and current row), " +
+                "w3 as (order by o, id range between 5 preceding and 5 following), w4 as (partition by g2 order by id rows between 1 following and 3 following exclude ties)",
+            "select id, sum(v) over (order by id rows between 1 preceding and 1 following) * 2 + coalesce(count(v) over (order by o groups between current row and 1 following), 0) from w5000",
+            "select id, case when sum(v) over (partition by g1 order by o groups between 1 preceding and current row) > 100 then 'big' else 'small' end, max(v) over (partition by g1) from w1023",
+            "select id, rs from (select id, sum(v) over (partition by g1 order by o range between 3 preceding and 3 following exclude current row) rs from w5000) x where rs > 200 order by id limit 20",
+            "select g1, count(*), max(rs) from (select g1, sum(v) over (partition by g1 order by o groups between unbounded preceding and current row) rs from w5000) x group by g1 order by g1",
+            "select id, sum(v) over (order by o groups between 1 preceding and 1 following) rs from w5000 order by rs desc, id limit 17 offset 5",
+            "select id, sum(v) over (partition by g1 order by o range between 3 preceding and 3 following) from w5000 where id % 3 = 1",
+            "select id, count(*) over (partition by g1 order by o groups between 1 preceding and 1 following) from w5000 where g1 is null",
+            "select id, sum(v) over (order by o groups between 1 preceding and 1 following) from w5000 where false",
+            "select id, max(v) over (partition by g1 order by o range between 2 preceding and 2 following exclude ties) from w5000 where id = 7",
+            "select distinct g1, sum(v) over (partition by g1 order by g1 groups between current row and current row) from w1025",
+            "select w.id, d.lab, sum(w.v) over (partition by d.lab order by w.o groups between 1 preceding and 1 following), " +
+                "count(*) over (partition by d.lab order by w.o range between 2 preceding and 2 following exclude current row) from w5000 w join d on d.k = w.g1",
+            "select w.id, d.lab, string_agg(w.s, ',') over (partition by d.lab order by w.id rows between 3 preceding and current row), " +
+                "last_value(w.v) over (partition by d.lab order by w.o, w.id rows between 1 preceding and 1 following) from w1025 w left join d on d.k = w.g1",
+            "select id, sum(v) over (order by case when id % 2 = 0 then v else 0.5 end, id groups between 1 preceding and 1 following) from w1025",
+            "select id, sum(v + (select 1)) over (order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, sum(v) over (partition by g1 order by o, id rows between 1 preceding and 1 following exclude current row) from w5000 order by id desc limit 7",
+            "select g1, sum(v), sum(sum(v)) over (order by g1 groups between 1 preceding and 1 following), avg(sum(v)) over (order by g1 range between 1 preceding and 1 following), " +
+                "count(*) filter (where g1 > 2) over (order by g1 rows between unbounded preceding and current row exclude current row), rank() over (order by sum(v) desc nulls last) from w5000 group by g1",
+            "select g1, g2, count(*), max(count(*)) over (partition by g1 order by g2 range between 1 preceding and 1 following), sum(count(*)) over (partition by g1 order by g2 groups between current row and 1 following exclude group), " +
+                "string_agg(g2::text, ',') over (partition by g1 order by g2) from w5000 group by g1, g2",
+            "select id, count(*) over (rows between unbounded preceding and unbounded following exclude current row), sum(v) over (order by id rows between unbounded preceding and unbounded following exclude ties) from w1025",
+            "select id, sum(v) over (order by id groups between current row and current row exclude group), sum(v) over (order by o groups between current row and current row exclude ties) from w1024",
+            "select id, sum(v) over (order by o range between 0 preceding and 0 following), count(*) over (partition by g1 order by o range between 0 preceding and 0 following exclude current row) from w1025",
+            "select id, sum(v) over (order by id rows between 5 following and 7 following exclude current row), min(v) over (order by id rows between 2 preceding and 1 preceding exclude ties) from w1025",
+            "select id, sum(v) over (order by id rows between 1 following and 1 following exclude current row), count(*) over (order by id rows between current row and current row exclude current row) from w1024",
+            "select id, sum(v) over (order by id rows between current row and current row exclude group), count(v) over (order by id rows between current row and current row exclude ties) from w1024",
+            "select id, last_value(v) over (order by id rows between current row and current row exclude current row), first_value(v) over (order by id rows between 1 preceding and 1 preceding exclude group), " +
+                "nth_value(v, 2) over (partition by g1 order by o groups between unbounded preceding and unbounded following exclude ties) from w1025",
+            "select id, sum(v) over (partition by id % 2 order by o groups between 1 preceding and 1 following exclude ties) from w1025 where id % 3 <> 0",
+            "select id, sum(v) over (partition by g1 order by o range between 3 preceding and 3 following), count(*) over (partition by g1 order by o desc range between 3 preceding and 3 following) from w1024 where v is not null"]
+        for sql in sh { both(mut &s, &sql, mut &tm) }
+        report("mixed", &tm)
+
+        // sizes at the batch edges (the sizes of the tables, partitions of one row and of more than 1,024 rows)
+        var tz = newTally()
+        for tn2 in ["w1023", "w1024", "w1025"] {
+            for over in ["partition by g1 order by o, id", "order by id", "partition by big order by v nulls first, id", "partition by uniq order by id", "partition by g2 order by o"] {
+                var rf = pick(&over, &"range between 2 preceding and 2 following", &" exclude")
+                if rf == "-" { rf = "rows between 2 preceding and 2 following" }
+                both(mut &s, &("select id, sum(v) over (" + over + " groups between 1 preceding and 1 following), count(*) over (" + over + " " + rf + " exclude current row), " +
+                               "first_value(v) over (" + over + " rows between 1 preceding and 1 following exclude ties), string_agg(s, ',') over (" + over + " rows between 3 preceding and current row) from " + tn2), mut &tz)
+            }
+        }
+        for over in ["order by id", "partition by uniq order by id", "partition by big order by o, id", "partition by g1 order by o"] {
+            var rf = pick(&over, &"range between 3 preceding and 3 following", &" exclude")
+            if rf == "-" { rf = "rows between 3 preceding and 3 following" }
+            both(mut &s, &("select id, sum(v) over (" + over + " groups between 1 preceding and 1 following), max(v) filter (where o > 4) over (" + over + " " + rf + "), " +
+                           "last_value(v) over (" + over + " rows between 2 preceding and 2 following exclude current row) from w5000"), mut &tz)
+        }
+        for i in 0..8 {
+            both(mut &s, &("select id, sum(v) over (partition by id % " + (i + 1).toStr() + " order by o, id groups between 1 preceding and 1 following exclude ties) from w1024 where id % 3 <> " + (i % 3).toStr()), mut &tz)
+        }
+        both(mut &s, &"select id, count(*) over (order by id groups between current row and current row) from w1024 where id > 1020", mut &tz)
+        both(mut &s, &"select id, sum(v) over (order by id range between 1 preceding and 1 following exclude group) from w1025 where id = 1025", mut &tz)
+        both(mut &s, &"select id, string_agg(s, ',') over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025 where id > 1022", mut &tz)
+        report("sizes", &tz)
+
+        // errors at the row the row path reaches (the message names the value, so another row is another text)
+        var ter = newTally()
+        let x = "('x' || id::text)::int"
+        let bad = [
+            "select id, sum(case when id in (3, 5) then " + x + " else 1 end) over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025",
+            "select id, sum(case when id in (1, 3) then " + x + " else 1 end) over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025",
+            "select id, sum(case when id in (2, 3) then " + x + " else 1 end) over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025",
+            "select id, sum(case when id in (7, 4) then " + x + " else 1 end) over (order by id rows between 1 preceding and 1 following exclude current row) from w1025",
+            "select id, count(case when id in (900, 20) then " + x + " else 1 end) over (order by id rows between 1 preceding and 1 following exclude group) from w1025",
+            "select id, min(case when id in (900, 20) then " + x + " else 1 end) over (order by id rows between 3 preceding and 3 following exclude ties) from w1025",
+            "select id, sum(case when id in (50, 30) then " + x + " else 1 end) over (order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, sum(case when id in (50, 30) then " + x + " else 1 end) over (order by o groups between 1 preceding and 1 following exclude group) from w1025",
+            "select id, sum(case when id in (50, 30) then " + x + " else 1 end) over (order by o range between 1 preceding and 1 following) from w1025",
+            "select id, sum(case when id in (50, 30) then " + x + " else 1 end) over (order by o range between 1 preceding and 1 following exclude ties) from w1025",
+            "select id, sum(case when id in (50, 30) then " + x + " else 1 end) over (partition by g1 order by o range between 5 following and 6 following) from w1025",
+            "select id, string_agg(case when id in (40, 12) then " + x + "::text else s end, ',') over (order by id rows between 2 preceding and current row) from w1025",
+            "select id, string_agg(s, case when id in (40, 12) then " + x + "::text else ',' end) over (order by id rows between 2 preceding and current row) from w1025",
+            "select id, string_agg(s, case when id in (40, 12) then " + x + "::text else ',' end) over (order by id) from w1025",
+            "select id, sum(v) filter (where case when id in (40, 12) then " + x + " > 0 else true end) over (order by id rows between 2 preceding and current row) from w1025",
+            "select id, sum(v) filter (where case when id in (40, 12) then " + x + " > 0 else true end) over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025",
+            "select id, count(*) filter (where case when id in (40, 12) then " + x + " > 0 else true end) over (partition by g1 order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, first_value(case when id in (3, 2) then " + x + " else 1 end) over (order by id rows between 1 preceding and 1 following) from w1025",
+            "select id, last_value(case when id in (30, 20) then " + x + " else 1 end) over (order by id rows between 1 preceding and 1 following exclude current row) from w1025",
+            "select id, nth_value(case when id in (30, 20) then " + x + " else 1 end, 2) over (order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, nth_value(v, case when id in (30, 20) then " + x + " else 2 end) over (order by id rows between 1 preceding and 1 following) from w1025",
+            "select id, nth_value(v, case when id in (30, 20) then 0 - id else 2 end) over (order by o range between 1 preceding and 1 following) from w1025",
+            "select id, sum(v) over (order by s range between 1 preceding and current row) from w1025",
+            "select id, sum(v) over (order by dt range between 1.5 preceding and current row) from w1025",
+            "select id, sum(v) over (order by o range between interval '1 day' preceding and current row) from w1025",
+            "select id, sum(v) over (order by o range between 9223372036854775807 preceding and current row) from w1025",
+            "select id, sum(v) over (order by hb range between 5 preceding and 5 following) from w1025",
+            "select id, sum(v) over (order by hb range between current row and 5 following) from w1025",
+            "select id, sum(v) over (order by hb range between 5 preceding and current row) from w1025",
+            "select id, count(*) over (order by o range between 9223372036854775807 following and unbounded following) from w1025",
+            "select id, sum(v) over (order by o range between -1 preceding and current row) from w1025",
+            "select id, sum(v) over (order by o range between null preceding and current row) from w1025",
+            "select id, sum(v) over (order by o groups between -1 preceding and current row) from w1025",
+            "select id, sum(v) over (order by o groups between 1.5 preceding and current row) from w1025",
+            "select id, sum(v) over (groups between 1 preceding and current row) from w1025",
+            "select id, sum(v) over (order by o, id range between 1 preceding and current row) from w1025",
+            "select id, nth_value(v, 0) over (order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, nth_value(v, -1) over (order by id rows between 1 preceding and 1 following exclude current row) from w1025",
+            "select id, sum(hb) over (order by id rows between unbounded preceding and unbounded following exclude current row) from w1025",
+            "select id, sum(hb) over (order by id groups between 600 preceding and 600 following exclude ties) from w1025",
+            "select id, sum(hb) over (order by id range between 600 preceding and 600 following) from w1025",
+            "select id, sum(v) over (partition by g1 order by o range between 3 preceding and 3 following), sum(case when id in (900, 20) then " + x + " else 1 end) over (order by o groups between 1 preceding and 1 following) from w1025",
+            "select id, sum(case when id in (900, 20) then " + x + " else 1 end) over (order by o groups between 1 preceding and 1 following), sum(case when id in (7, 800) then " + x + " else 1 end) over (order by id) from w1025",
+            "select id, sum(case when id in (900, 20) then " + x + " else 1 end) over (order by o range between 1 preceding and current row exclude ties), string_agg(s, ',') over (order by id) from w1025",
+            "select id, sum(v) over (order by 100 / (id - 4500) groups between 1 preceding and current row) from w5000",
+            "select id, sum(v) over (order by o range between 100 / (id - 1) preceding and current row) from w1025"]
+        for sql in bad { both(mut &s, &sql, mut &ter) }
+        report("errors", &ter)
+        println("error states: " + strings.join(&ter.states, " "))
+
+        // by hand: PostgreSQL's values
+        let c4 = q(mut &s, &"create table h (id int primary key, g int, o int, v int, dt date, f float8)")
+        let c5 = q(mut &s, &"insert into h values (1,1,1,10,date '2024-01-01',1.0),(2,1,2,20,date '2024-01-02',2.5),(3,1,2,30,date '2024-01-05',2.5),(4,1,4,40,date '2024-01-09',4.0)," +
+                            "(5,1,null,50,null,null),(6,2,7,60,date '2024-02-01',7.0)")
+        println("by hand, groups: " + q(mut &s, &"select id, sum(v) over (partition by g order by o groups between 1 preceding and 1 following) from h order by id"))
+        println("by hand, groups exclude: " + q(mut &s, &"select id, sum(v) over (order by o groups between 1 preceding and current row exclude group), count(*) over (order by o groups between current row and 1 following exclude ties) from h order by id"))
+        println("by hand, range: " + q(mut &s, &"select id, sum(v) over (partition by g order by o range between 1 preceding and 1 following), count(*) over (partition by g order by o desc range between 1 preceding and current row) from h order by id"))
+        println("by hand, range dates: " + q(mut &s, &"select id, sum(v) over (partition by g order by dt range between interval '3 days' preceding and interval '1 day' following) from h order by id"))
+        println("by hand, range floats: " + q(mut &s, &"select id, sum(v) over (order by f nulls first range between 1.5 preceding and 0.5 following) from h order by id"))
+        println("by hand, exclude: " + q(mut &s, &"select id, sum(v) over (order by o rows between unbounded preceding and unbounded following exclude current row), sum(v) over (order by o range between unbounded preceding and unbounded following exclude group), " +
+                                "sum(v) over (order by o range between unbounded preceding and unbounded following exclude ties), sum(v) over (order by o range between unbounded preceding and unbounded following exclude no others) from h order by id"))
+        println("by hand, values: " + q(mut &s, &"select id, first_value(v) over (order by id rows between 1 following and 2 following), last_value(v) over (order by id rows between 1 preceding and 1 following exclude current row), " +
+                                "nth_value(v, 2) over (order by o groups between unbounded preceding and current row exclude group), first_value(v) over (order by o range between 1 preceding and current row exclude current row) from h order by id"))
+        println("by hand, strings: " + q(mut &s, &"select id, string_agg(v::text, '/') filter (where v > 20) over (order by id rows between 2 preceding and current row), string_agg(v::text, '/') over (order by o groups between current row and current row exclude current row) from h order by id"))
+        // the counters: a query of every kind takes only the batches' path, then only the row path
+        let w0 = lexdb_exec.winRuns()
+        let r0 = lexdb_exec.winRowRuns()
+        let z1 = q(mut &s, &"select id, rank() over (order by o), sum(v) over (order by o groups between 1 preceding and 1 following), string_agg(v::text, ',') over (order by id), first_value(v) over (order by o range between 1 preceding and 1 following exclude ties) from h")
+        let w1 = lexdb_exec.winRuns()
+        let r1 = lexdb_exec.winRowRuns()
+        let z2 = q(mut &s, &"set lexdb_batch = off")
+        let z3 = q(mut &s, &"select id, rank() over (order by o), sum(v) over (order by o groups between 1 preceding and 1 following) from h")
+        let w2 = lexdb_exec.winRuns()
+        let r2 = lexdb_exec.winRowRuns()
+        println("counter: " + (w1 - w0).toStr() + " " + (r1 - r0).toStr() + " " + (w2 - w1).toStr() + " " + (r2 - r1).toStr())
+        return 0
+    }).unwrap()
+}

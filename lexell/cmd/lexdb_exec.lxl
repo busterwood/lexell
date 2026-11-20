@@ -19732,30 +19732,28 @@ fn frameOff(x: &Option[Expr], w: &WinPlan, start: bool, params: &[]Val): Result[
                 }
                 return Ok(n)
             }
-            if try lexdb_ops.compare(&r, &Val.Int(0)) < 0 { return Err(e("22013", "invalid preceding or following size in window function")) }
+            // (an interval offset is compared with a zero interval: a date-time key's)
+            var zero = Val.Int(0)
+            match r { Val.Ival(_) { zero = Val.Ival(lexdb_time.Ival{months: 0, days: 0, us: 0}) } else {} }
+            if try lexdb_ops.compare(&r, &zero) < 0 { return Err(e("22013", "invalid preceding or following size in window function")) }
             return Ok(r)
         }
         None { return Ok(Val.Int(0)) }
     }
 }
 
-// The values of a query's window calls for each of its rows.
+// The values of a query's window calls for each of its rows: per call a column
+// (lexdb_window), by the batches' path (batches on: over typed key columns,
+// every call) or by the row path (lexdb_batch off: the tests' reference);
+// the engine evaluates what needs its scope, through a hook.
 fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows: &[]WinRow, m: &Mats, params: &[]Val,
              rs: mut &Run): Result[[][]Val, DbErr] {
     let sqe = seqEnv(st, txn)
     let q = &sel.q
     let n = len(rows)
-    // every call one lexdb_window takes (and batches on): its order and values
-    // by the key columns of the rows (10a); any other query takes the row path
-    var fast = rs.batch
-    for w in sel.wins { if !lexdb_window.covers(&w) { fast = false } }
-    // the values: per row (a row's, the row path's), or by that path a column
-    // per call (cols), put in the rows at the end
-    var out: [][]Val = []
+    let fast = rs.batch
     var cols: [][]Val = []
-    var byCol: []bool = array(len(sel.wins), false)
-    if fast { for w in sel.wins { append(mut &cols, array(n, Val.Null)) } }
-    else { for b in 0..n { append(mut &out, array(len(sel.wins), Val.Null)) } }
+    for w in sel.wins { append(mut &cols, array(n, Val.Null)) }
     let noAggs: []Val = []
     // windows of one partitioning and order share their sort (as PostgreSQL's)
     var specs: []str = []
@@ -19784,6 +19782,9 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
             if c < 0 { plain = false }
         }
         var vcols: [][]Val = []
+        var srt = lexdb_window.noSorted()
+        var okey = lexdb_window.KeyCol{slot: -1, vals: []}
+        var sorted = false
         if fast {
             // a column read at its place stays in the rows; the others' values made
             var kcols: []lexdb_window.KeyCol = []
@@ -19795,30 +19796,13 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
                     for i in 0..len(xs) { if at[i] < 0 { append(mut &kcols[i].vals, try evalX(st, txn, q, &xs[i], &env, rs)) } }
                 }
             }
-            var srt = lexdb_window.noSorted()
             if lexdb_window.sortRows(rows, mut &kcols, np, w, mut &srt) {
-                for wj in wi..len(sel.wins) {
-                    if done[wj] || specs[wj] != specs[wi] { continue }
-                    done[wj] = true
-                    byCol[wj] = true
-                    let wv = &sel.wins[wj]
-                    let so = try frameOff(&wv.startOff, wv, true, params)
-                    let eo = try frameOff(&wv.endOff, wv, false, params)
-                    let wargs = lexdb_window.argsOf(wv)
-                    let srcs = lexdb_window.argSrcs(&wargs, params, fn(name: &str, sl: int): int { return lexdb_bind.colSlot(&q.cols, name, sl) })
-                    // (an aggregate's argument is evaluated plainly, as accumulate does)
-                    try lexdb_window.values(rows, wv, &srcs, &srt, &so, &eo, fn(ai: int, r: int): Result[Val, DbErr] {
-                        let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                        if wv.agg { return eval(&wargs[ai], &env) }
-                        return evalX(st, txn, q, &wargs[ai], &env, rs)
-                    }, mut &cols[wj])
-                }
-                continue
+                sorted = true
+                if nob > 0 { okey = lexdb_window.KeyCol{slot: kcols[np].slot, vals: replace(mut &kcols[np].vals, [])} }
+            } else {
+                // an order key of mixed kinds: every column's values are made, and sorted by value
+                for i in 0..len(xs) { append(mut &vcols, replace(mut &kcols[i].vals, [])) }
             }
-            // an order key of mixed kinds: every column's values are made now,
-            // and this group's calls are the row path's, into the rows' values
-            for i in 0..len(xs) { append(mut &vcols, replace(mut &kcols[i].vals, [])) }
-            if len(out) == 0 { for b in 0..n { append(mut &out, array(len(sel.wins), Val.Null)) } }
         } else {
             for i in 0..len(xs) { append(mut &vcols, withCapacity(n)) }
             for b in 0..n {
@@ -19836,72 +19820,9 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
         }
         // the rows in partition order, then the window's (peers keep the
         // rows' order); where a partition and a peer group start
-        var idx: []int = []
-        var partBreak: []bool = array(n, false)
-        var peerBreak: []bool = array(n, false)
-        var typed = true
-        var keys: []lexdb_sort.SKey = []
-        if typed {
-            // (the values borrowed, copied only into a key of values: if a
-            // key turns out to be of mixed kinds, the old way below reads them)
-            for i in 0..len(xs) {
-                let part = i < np
-                let desc = if part { false } else { w.desc[i - np] }
-                let nf = if part { false } else { w.nullsFirst[i - np] }
-                var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, desc, nf)
-                if part {
-                    if !lexdb_sort.skOfValsRef(&vcols[i], false, false, mut &key) || key.kind == lexdb_sort.SK_VAL { key = lexdb_sort.skEnc(&vcols[i]) }
-                } else if !lexdb_sort.skOfValsRef(&vcols[i], desc, nf, mut &key) {
-                    typed = false
-                    break
-                }
-                append(mut &keys, key)
-            }
-        }
-        var ocols: [][]Val = []
-        for k in 0..nob { append(mut &ocols, replace(mut &vcols[np + k], [])) }
-        if typed {
-            idx = lexdb_sort.skSort(mut &keys, n)
-            for p in 1..n {
-                if lexdb_sort.skCmp(&keys, 0, np, idx[p - 1], idx[p]) != 0 {
-                    partBreak[p] = true
-                    peerBreak[p] = true
-                } else if lexdb_sort.skCmp(&keys, np, np + nob, idx[p - 1], idx[p]) != 0 { peerBreak[p] = true }
-            }
-        } else {
-            // the old way (lexdb_batch off): the partition's encoded key, and
-            // the order's values compared by winCmp
-            var pkeys: []str = []
-            var ords: [][]Val = []
-            for b in 0..n {
-                var kb = ""
-                for i in 0..np { lexdb_access.encIdxPart(mut &kb, &vcols[i][b]) }
-                append(mut &pkeys, kb)
-                var ov: []Val = []
-                for k in 0..nob { append(mut &ov, ocols[k][b].clone()) }
-                append(mut &ords, ov)
-            }
-            for b in 0..n { append(mut &idx, b) }
-            // rows often come in the window's order already (ORDER BY the key the scan follows)
-            var sorted = true
-            for b in 1..n {
-                if pkeys[b - 1] != pkeys[b] || lexdb_window.winCmp(&ords[b - 1], &ords[b], w) > 0 {
-                    sorted = false
-                    break
-                }
-            }
-            if !sorted { collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
-                if pkeys[a] != pkeys[b] { return if pkeys[a] < pkeys[b] { -1 } else { 1 } }
-                let c = lexdb_window.winCmp(&ords[a], &ords[b], w)
-                if c != 0 { return c }
-                return a - b                        // peers keep the rows' order
-            }) }
-            for p in 1..n {
-                if pkeys[idx[p - 1]] != pkeys[idx[p]] {
-                    partBreak[p] = true
-                    peerBreak[p] = true
-                } else if lexdb_window.winCmp(&ords[idx[p - 1]], &ords[idx[p]], w) != 0 { peerBreak[p] = true }
-            }
+        if !sorted {
+            lexdb_window.sortVals(&vcols, np, n, w, mut &srt)
+            if nob > 0 { okey = lexdb_window.KeyCol{slot: -1, vals: replace(mut &vcols[np], [])} }
         }
         for wj in wi..len(sel.wins) {
             if done[wj] || specs[wj] != specs[wi] { continue }
@@ -19909,181 +19830,24 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
             let wv = &sel.wins[wj]
             let so = try frameOff(&wv.startOff, wv, true, params)
             let eo = try frameOff(&wv.endOff, wv, false, params)
-            var lo = 0
-            while lo < n {
-                var hi = lo + 1
-                while hi < n && !partBreak[hi] { hi += 1 }
-                try winPartition(st, txn, sel, wj, rows, &idx, lo, hi, &peerBreak, &ocols, &so, &eo, m, params, rs, mut &out)
-                lo = hi
-            }
+            let wargs = lexdb_window.argsOf(wv)
+            let srcs = lexdb_window.argSrcs(&wargs, params, fn(name: &str, sl: int): int { return lexdb_bind.colSlot(&q.cols, name, sl) })
+            // (an aggregate's arguments and FILTER are evaluated plainly, as accumulate does)
+            try lexdb_window.compute(fast, rows, wv, &srcs, &srt, &okey, &so, &eo, fn(ai: int, r: int): Result[Val, DbErr] {
+                let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+                if wv.agg { return eval(&wargs[ai], &env) }
+                return evalX(st, txn, q, &wargs[ai], &env, rs)
+            }, mut &cols[wj])
         }
     }
-    if fast {
-        // the calls made by columns, put in the rows' values
-        let built = len(out) > 0
-        for b in 0..n {
-            if !built { append(mut &out, array(len(sel.wins), Val.Null)) }
-            for wj in 0..len(sel.wins) { if byCol[wj] { out[b][wj] = replace(mut &cols[wj][b], Val.Null) } }
-        }
+    // the calls' columns, put in the rows' values
+    var out: [][]Val = []
+    for b in 0..n {
+        var vs: []Val = withCapacity(len(sel.wins))
+        for wj in 0..len(sel.wins) { append(mut &vs, replace(mut &cols[wj][b], Val.Null)) }
+        append(mut &out, vs)
     }
     return Ok(out)
-}
-
-// One partition's values of window call wi: its rows rows[idx[lo..hi]],
-// in its order.
-fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi: int, rows: &[]WinRow, idx: &[]int, lo: int,
-                hi: int, peerBreak: &[]bool, ocols: &[][]Val, so: &Val, eo: &Val, m: &Mats, params: &[]Val, rs: mut &Run,
-                out: mut &[][]Val): Result[Unit, DbErr] {
-    let sqe = seqEnv(st, txn)
-    let q = &sel.q
-    let w = &sel.wins[wi]
-    let n = hi - lo
-    let noAggs: []Val = []
-    // peer groups: rows equal in the window's ORDER BY
-    var grp: []int = []
-    var gStart: []int = []
-    var gEnd: []int = []
-    for k in 0..n {
-        if k == 0 || peerBreak[lo + k] {
-            if k > 0 { append(mut &gEnd, k) }
-            append(mut &gStart, k)
-        }
-        append(mut &grp, len(gStart) - 1)
-    }
-    append(mut &gEnd, n)
-    var keyAt: []Val = []
-    if w.mode == lexdb_sql.FR_RANGE && len(w.order) == 1 { for k in 0..n { append(mut &keyAt, ocols[0][idx[lo + k]].clone()) } }
-    let f = &w.fname
-    if f == "row_number" || f == "rank" || f == "dense_rank" || f == "percent_rank" || f == "cume_dist" {
-        for k in 0..n {
-            let g = grp[k]
-            var v = Val.Int(k + 1)
-            if f == "rank" { v = Val.Int(gStart[g] + 1) }
-            if f == "dense_rank" { v = Val.Int(g + 1) }
-            // double precision, as PostgreSQL's (9.94)
-            if f == "percent_rank" { v = Val.Float(if n <= 1 { 0.0f } else { float(gStart[g]) / float(n - 1) }) }
-            if f == "cume_dist" { v = Val.Float(float(gEnd[g]) / float(n)) }
-            out[idx[lo + k]][wi] = v
-        }
-        return Ok(Unit{})
-    }
-    if f == "ntile" || f == "lag" || f == "lead" {
-        for k in 0..n {
-            let r = idx[lo + k]
-            let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-            if f == "ntile" {
-                let bv = try evalX(st, txn, q, &w.args[0], &env, rs)
-                if lexdb_ops.isNull(&bv) { continue }
-                let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
-                let nb = lexdb_window.offInt(&(try lexdb_ops.coerce(bv, &t)))
-                if nb <= 0 { return Err(e("22014", "argument of ntile must be greater than zero")) }
-                // n rows in nb buckets: the first n % nb one row bigger
-                let size = n / nb
-                let extra = n % nb
-                var bucket = k + 1
-                if size > 0 {
-                    bucket = if k < (size + 1) * extra { k / (size + 1) + 1 } else { extra + (k - (size + 1) * extra) / size + 1 }
-                }
-                out[r][wi] = Val.Int(bucket)
-                continue
-            }
-            var off = 1
-            if len(w.args) > 1 {
-                let ov = try evalX(st, txn, q, &w.args[1], &env, rs)
-                if lexdb_ops.isNull(&ov) { continue }
-                let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
-                off = lexdb_window.offInt(&(try lexdb_ops.coerce(ov, &t)))
-            }
-            let at = if f == "lag" { k - off } else { k + off }
-            if at >= 0 && at < n {
-                let tr = idx[lo + at]
-                let env2 = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                out[r][wi] = try evalX(st, txn, q, &w.args[0], &env2, rs)
-            } else if len(w.args) > 2 {
-                out[r][wi] = try evalX(st, txn, q, &w.args[2], &env, rs)
-            }
-        }
-        return Ok(Unit{})
-    }
-    // over the frame: an aggregate, first_value, last_value, nth_value
-    if w.agg && w.start == lexdb_sql.B_UNBOUNDED_PRECEDING && w.exclude == lexdb_sql.EX_NONE {
-        // the frame only grows: one accumulator, its value made again only when it does
-        var acc = lexdb_agg.newAccs(1)
-        var added = -1
-        var lastEnd = -(1 << 62)
-        var val = Val.Null
-        for k in 0..n {
-            var a = 0
-            var b = 0
-            try lexdb_window.frameBounds(w, k, n, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
-            while added < b {
-                added += 1
-                let tr = idx[lo + added]
-                let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                try accumulate(&w.spec, mut &acc[0], &env)
-            }
-            if b != lastEnd {
-                val = try lexdb_agg.finish(&w.spec, &acc[0])
-                lastEnd = b
-            }
-            out[idx[lo + k]][wi] = val.clone()
-        }
-        return Ok(Unit{})
-    }
-    for k in 0..n {
-        let r = idx[lo + k]
-        var a = 0
-        var b = 0
-        try lexdb_window.frameBounds(w, k, n, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
-        if w.agg {
-            var acc = lexdb_agg.newAccs(1)
-            for p in a..b + 1 {
-                if lexdb_window.excluded(w, p, k, &grp) { continue }
-                let tr = idx[lo + p]
-                let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                try accumulate(&w.spec, mut &acc[0], &env)
-            }
-            out[r][wi] = try lexdb_agg.finish(&w.spec, &acc[0])
-            continue
-        }
-        var nth = 1
-        if f == "nth_value" {
-            let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-            let nv = try evalX(st, txn, q, &w.args[1], &env, rs)
-            if lexdb_ops.isNull(&nv) { continue }
-            let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
-            nth = lexdb_window.offInt(&(try lexdb_ops.coerce(nv, &t)))
-            if nth <= 0 { return Err(e("22016", "argument of nth_value must be greater than zero")) }
-        }
-        // the frame's rows, those excluded left out
-        var at = -1
-        var seen = 0
-        if f == "last_value" {
-            var p = b
-            while p >= a {
-                if !lexdb_window.excluded(w, p, k, &grp) {
-                    at = p
-                    break
-                }
-                p -= 1
-            }
-        } else {
-            for p in a..b + 1 {
-                if lexdb_window.excluded(w, p, k, &grp) { continue }
-                seen += 1
-                if seen == nth {
-                    at = p
-                    break
-                }
-            }
-        }
-        if at >= 0 {
-            let tr = idx[lo + at]
-            let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-            out[r][wi] = try evalX(st, txn, q, &w.args[0], &env, rs)
-        }
-    }
-    return Ok(Unit{})
 }
 
 // ---- Batches (design/lexdb.md 9.47, a prototype; the kernels are lexdb_pipe's)
@@ -20104,8 +19868,10 @@ pub const BK_VAL: int = lexdb_rows.BK_VAL    // ... or any other, as values
 // Grouped queries run over batches with numerics as units, and those that
 // gave way to the row path (a result past its units), for the tests.
 
-// Window calls whose values lexdb_window made (10a), for the tests.
+// Window calls whose values lexdb_window made by columns (the batches' path), and
+// by the row path (lexdb_batch off), for the tests.
 pub fn winRuns(): int { return lexdb_window.runCount() }
+pub fn winRowRuns(): int { return lexdb_window.rowRunCount() }
 
 pub fn decCounts(): []int {
     let pc = lexdb_pipe.aggCounts()
