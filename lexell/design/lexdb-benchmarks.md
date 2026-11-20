@@ -159,7 +159,19 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
-**Now, main `aaadeb1e` (2026-11-18), the same setup:** summed 12,984 ms
+**Now, main `0f96fee9` (2026-11-20), the same setup, lexdb and PostgreSQL
+both run today (one run each, lexdb built with `-O`):** summed 13,435 ms
+against PostgreSQL's 15,231 on one core (PostgreSQL ran 9% slower than its
+18 Nov figure: the machine's state, not lexdb); geometric mean 1.03 on wall,
+0.94 on server CPU; level or ahead on 9 of 22; against PostgreSQL's four
+processes 1.58 (sum 9,713). q1, q8 and q17 differ from PostgreSQL only in
+decimal formatting, as before. Since 18 Nov: the batch-gaps work (q16
+-16%) and the dialect packages; the 20 Nov gate binaries, built without
+`-O`, were about 14% slower on q1 (lexdb-layers.md 6.3, Q1). Worst ratios
+against one core: q15 2.5, q20 2.2, q11 2.1, q19 2.1, q22 1.8.
+Results: `~/tpch-w/int/out-pgcmp-0f96fee9`.
+
+**Before, main `aaadeb1e` (2026-11-18), the same setup:** summed 12,984 ms
 against PostgreSQL's 13,955 (one core); geometric mean 0.98, below 1 for
 the first time; level or ahead on 9 of 22. The runtime's string compare
 compares short strings 8 bytes at a time (no memcmp call): lexdb's B-tree
@@ -303,6 +315,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-20 | 0f96fee9 | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | lexdb / PG one core 1.03 (geometric mean, wall; 0.94 server CPU), 9 of 22 level or ahead; summed 13.44 s against PG's 15.23 s; against PG four processes 1.58; worst q15 2.5, q20 2.2, q11 2.1, q19 2.1 | this page, 1.6 |
 | 2026-11-18 | d0f00b92 | analytic queries (lexdb only, pinned, `la/base3`, CPU against the build before), TPC-H and point-select instruction counts | text columns as one buffer plus offsets, and the wire writer on `bytesGrow`: 35 queries geometric mean -6.7% CPU (scans -5 to -23%, `select *` -23%, text joins -19 to -24%, text min/max -31%, text group -12%; `distinct2` +3%); TPC-H +0.66% instructions, +0.75% cycles (results unchanged); point selects +0.1% instructions, -1.4% cycles | this page, 1 |
 | 2026-11-18 | eababf57 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 88k / 151k / 145k/s (+10-14%); replicas 401k/s at 32 clients (PG 405k); updates 3,691 / 16,687 / 38,711/s after restoring the 32-client rate (19,300/s at aaadeb1e: owned-string regression); commit p99 1.38-1.40 ms (0.81 before the migration, unresolved) | this page, 1 |
 | 2026-11-18 | eababf57 | analytic queries (pinned), bulk loads | 35 queries: lexdb / PG one core 0.63 (CPU), / PG 4 processes 1.19 (wall); COPY level in time, peak RSS +30% since the migration | this page, 1 |
