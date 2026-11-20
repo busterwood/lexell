@@ -1,0 +1,538 @@
+// lexdb_window: window functions' values (design/lexdb-batch-gaps.md item 10,
+// slice 10a). A window call f(args) OVER (PARTITION BY ... ORDER BY ... frame)
+// ranges over a query's rows (WinRow: a row, and a group's aggregates); the
+// engine (lexdb_exec) evaluates what needs its scope and this module does the
+// rest, column-wise:
+// - sortRows: the rows' permutation by (partition, order), over typed key
+//   columns (lexdb_sort) read from the rows' own columns where the key is a
+//   plain column, with where each partition and each peer group starts;
+// - values: a call's value for each row of that order, by position: the rank
+//   family (row_number, rank, dense_rank, percent_rank, cume_dist), ntile,
+//   lag and lead, and first_value, last_value and nth_value over the frames
+//   covers lists, written into the engine's per-row window values.
+// A call's arguments are read from the rows' columns, a constant, or by the
+// engine's hook (ArgSrc), so a value the engine would evaluate is evaluated
+// at the same row, in the same order, as its row path does. What covers
+// refuses (aggregates over frames, frames with offsets, EXCLUDE) is the row
+// path's: winPartition in lexdb_exec, over the frame code kept here.
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_agg"
+import "./lexdb_sort"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type DbErr = lexdb_base.DbErr
+type AggSpec = lexdb_agg.AggSpec
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// A row a window call ranges over: the query's row (a group's first), and
+// its aggregates' values.
+pub type WinRow = record { pub row: []Val; pub aggs: []Val }
+
+pub type WinPlan = record {
+    pub fname: str              // row_number ... nth_value, or an aggregate's
+    pub agg: bool               // an aggregate over the frame, with spec
+    pub spec: AggSpec
+    pub args: []Expr            // a ranking or value function's arguments
+    pub part: []Expr
+    pub order: []Expr
+    pub desc: []bool
+    pub nullsFirst: []bool
+    pub mode: int               // FR_ROWS, FR_RANGE, FR_GROUPS
+    pub start: int              // B_*
+    pub startOff: Option[Expr]
+    pub end: int
+    pub endOff: Option[Expr]
+    pub exclude: int            // EX_*
+}
+
+// Windows that went through values (the tests' look: that the batches' path ran).
+var valueRuns: int = 0
+
+pub fn runCount(): int { return valueRuns }
+
+// ---- What the batch path takes
+
+const F_ROW_NUMBER = 0
+const F_RANK = 1
+const F_DENSE_RANK = 2
+const F_PERCENT_RANK = 3
+const F_CUME_DIST = 4
+const F_NTILE = 5
+const F_LAG = 6
+const F_LEAD = 7
+const F_FIRST = 8
+const F_LAST = 9
+const F_NTH = 10
+const F_NONE = -1
+
+fn funcOf(f: &str): int {
+    if f == "row_number" { return F_ROW_NUMBER }
+    if f == "rank" { return F_RANK }
+    if f == "dense_rank" { return F_DENSE_RANK }
+    if f == "percent_rank" { return F_PERCENT_RANK }
+    if f == "cume_dist" { return F_CUME_DIST }
+    if f == "ntile" { return F_NTILE }
+    if f == "lag" { return F_LAG }
+    if f == "lead" { return F_LEAD }
+    if f == "first_value" { return F_FIRST }
+    if f == "last_value" { return F_LAST }
+    if f == "nth_value" { return F_NTH }
+    return F_NONE
+}
+
+// Whether the batch path computes call w: not an aggregate, a frame
+// without offsets; the value functions over the frame from the partition's
+// start to the current row (its peers, or the row: ROWS) or to its end, none
+// excluded. The ranking functions, ntile, lag and lead ignore the frame.
+pub fn covers(w: &WinPlan): bool {
+    if w.agg { return false }
+    let f = funcOf(&w.fname)
+    if f == F_NONE { return false }
+    let offs = w.start == lexdb_sql.B_PRECEDING || w.start == lexdb_sql.B_FOLLOWING || w.end == lexdb_sql.B_PRECEDING ||
+               w.end == lexdb_sql.B_FOLLOWING
+    if offs { return false }
+    if f < F_FIRST { return true }
+    if w.exclude != lexdb_sql.EX_NONE || w.start != lexdb_sql.B_UNBOUNDED_PRECEDING { return false }
+    return w.end == lexdb_sql.B_CURRENT || w.end == lexdb_sql.B_UNBOUNDED_FOLLOWING
+}
+
+// ---- The order
+
+// A key column of the rows: the slot of the rows' column it is (slot >= 0,
+// vals not made), or its values.
+pub type KeyCol = record { pub slot: int; pub vals: []Val }
+
+// The rows in the windows' order: the permutation, and where a partition
+// and a peer group start (by position).
+pub type Sorted = record { pub idx: []int; pub partBreak: []bool; pub peerBreak: []bool }
+
+pub fn noSorted(): Sorted { return Sorted{idx: [], partBreak: [], peerBreak: []} }
+
+// A key column's values made, from the rows' column (the slot given up).
+pub fn materialize(rows: &[]WinRow, kc: mut &KeyCol) {
+    if kc.slot < 0 { return }
+    let n = len(rows)
+    var vs: []Val = withCapacity(n)
+    for b in 0..n {
+        let r = &rows[b].row
+        append(mut &vs, if kc.slot < len(r) { r[kc.slot].clone() } else { Val.Null })
+    }
+    kc.vals = vs
+    kc.slot = -1
+}
+
+// The sort key of column kc: a partition's (any kind: by its encoding where
+// not typed) or an order's (false: values of mixed kinds, which lexdb_sort
+// does not sort). A rows' column of integers or texts is read in place; any
+// other is made first.
+fn keyOf(rows: &[]WinRow, kc: mut &KeyCol, part: bool, desc: bool, nf: bool, key: mut &lexdb_sort.SKey): bool {
+    let n = len(rows)
+    if kc.slot >= 0 {
+        let c = kc.slot
+        var ints: []int = withCapacity(n)
+        var nul: []bool = withCapacity(n)
+        var kind = -1
+        var intlike = true
+        var x = 0
+        for b in 0..n {
+            let r = &rows[b].row
+            if c >= len(r) || lexdb_ops.isNull(&r[c]) {
+                append(mut &ints, 0)
+                append(mut &nul, true)
+                continue
+            }
+            let got = lexdb_sort.skIntOf(&r[c], mut &x)
+            if got == 0 || (kind >= 0 && got != kind) {
+                intlike = false
+                break
+            }
+            kind = got
+            append(mut &ints, x)
+            append(mut &nul, false)
+        }
+        if intlike {
+            var k = lexdb_sort.newSKey(lexdb_sort.SK_INT, desc, nf)
+            k.ints = ints
+            k.nul = nul
+            key = k
+            return true
+        }
+        var strs: []str = withCapacity(n)
+        nul = withCapacity(n)
+        var texts = true
+        for b in 0..n {
+            let r = &rows[b].row
+            if c >= len(r) || lexdb_ops.isNull(&r[c]) {
+                append(mut &strs, "")
+                append(mut &nul, true)
+                continue
+            }
+            match r[c] {
+                Val.Text(s) {
+                    append(mut &strs, s.toStr())
+                    append(mut &nul, false)
+                }
+                else {
+                    texts = false
+                    break
+                }
+            }
+        }
+        if texts {
+            var k = lexdb_sort.newSKey(lexdb_sort.SK_TEXT, desc, nf)
+            k.strs = strs
+            k.nul = nul
+            key = k
+            return true
+        }
+        materialize(rows, kc)
+    }
+    if part {
+        if !lexdb_sort.skOfValsRef(&kc.vals, false, false, key) || key.kind == lexdb_sort.SK_VAL { key = lexdb_sort.skEnc(&kc.vals) }
+        return true
+    }
+    return lexdb_sort.skOfValsRef(&kc.vals, desc, nf, key)
+}
+
+// The rows in the order of w's partitions (cols[0..np]) then its order
+// (the rest), ties in the rows' order; false (nothing made, every column's
+// values made) if an order key is of mixed kinds, for the row path's sort.
+pub fn sortRows(rows: &[]WinRow, cols: mut &[]KeyCol, np: int, w: &WinPlan, out: mut &Sorted): bool {
+    let n = len(rows)
+    var keys: []lexdb_sort.SKey = []
+    for i in 0..len(cols) {
+        let part = i < np
+        let desc = if part { false } else { w.desc[i - np] }
+        let nf = if part { false } else { w.nullsFirst[i - np] }
+        var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, desc, nf)
+        if !keyOf(rows, mut &cols[i], part, desc, nf, mut &key) {
+            for j in 0..len(cols) { materialize(rows, mut &cols[j]) }
+            return false
+        }
+        append(mut &keys, key)
+    }
+    let idx = lexdb_sort.skSort(mut &keys, n)
+    var partBreak: []bool = array(n, false)
+    var peerBreak: []bool = array(n, false)
+    let nk = len(keys)
+    for p in 1..n {
+        if lexdb_sort.skCmp(&keys, 0, np, idx[p - 1], idx[p]) != 0 {
+            partBreak[p] = true
+            peerBreak[p] = true
+        } else if lexdb_sort.skCmp(&keys, np, nk, idx[p - 1], idx[p]) != 0 { peerBreak[p] = true }
+    }
+    out = Sorted{idx: idx, partBreak: partBreak, peerBreak: peerBreak}
+    return true
+}
+
+// ---- The values
+
+pub const AK_COL = 0            // an argument: a column of the rows (slot) ...
+pub const AK_CONST = 1          // ... a constant (konst) ...
+pub const AK_EXPR = 2           // ... or the engine's to evaluate at a row
+
+pub type ArgSrc = record { pub kind: int; pub slot: int; pub konst: Val }
+
+// Argument ai of a call, at row r (an index of the rows).
+fn getArg(rows: &[]WinRow, a: &ArgSrc, ai: int, r: int, ev: &fn(int, int): Result[Val, DbErr]): Result[Val, DbErr] {
+    if a.kind == AK_COL {
+        let row = &rows[r].row
+        if a.slot < len(row) { return Ok(row[a.slot].clone()) }
+    } else if a.kind == AK_CONST { return Ok(a.konst.clone()) }
+    return ev(ai, r)
+}
+
+// A constant number argument, made once: not constant, NULL, or this.
+type KInt = record { kind: int; v: int }
+const KI_NONE = 0
+const KI_NULL = 1
+const KI_INT = 2
+
+// A value (not NULL) as a whole number.
+fn toInt(v: Val): Result[int, DbErr] {
+    match v {
+        Val.Int(i) { return Ok(i) }
+        else {}
+    }
+    let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+    return Ok(offInt(&(try lexdb_ops.coerce(v, &t))))
+}
+
+// Window call w's value for each of the rows, in col[row] (n NULLs, given), by the
+// order srt; args (one per argument of the call) say where an argument comes
+// from, and ev evaluates the others: ev(ai, r), argument ai at row r. The
+// call must be one covers takes. An error is the row path's: the first
+// row in the windows' order that has one.
+pub fn values(rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: &Sorted, ev: &fn(int, int): Result[Val, DbErr],
+              col: mut &[]Val): Result[Unit, DbErr] {
+    valueRuns += 1
+    let n = len(rows)
+    let f = funcOf(&w.fname)
+    // lag and lead read the rows in the windows' order, which is not the
+    // rows': a plain column's values are gathered from a column of their own
+    var cached: []Val = []
+    if (f == F_LAG || f == F_LEAD) && args[0].kind == AK_COL && n > 64 {
+        cached = withCapacity(n)
+        for b in 0..n {
+            let r = &rows[b].row
+            if args[0].slot >= len(r) {
+                cached = []
+                break
+            }
+            append(mut &cached, r[args[0].slot].clone())
+        }
+    }
+    // the number argument (ntile's, the offset of lag and lead, nth_value's) when a
+    // constant: made once (an error is the first row's, as it is the first thing
+    // evaluated at it)
+    var ki = KInt{kind: KI_NONE, v: 0}
+    let ni = if f == F_NTILE { 0 } else if f == F_LAG || f == F_LEAD || f == F_NTH { 1 } else { -1 }
+    if ni >= 0 && ni < len(args) && args[ni].kind == AK_CONST && n > 0 {
+        if lexdb_ops.isNull(&args[ni].konst) { ki = KInt{kind: KI_NULL, v: 0} }
+        else { ki = KInt{kind: KI_INT, v: try toInt(args[ni].konst.clone())} }
+    }
+    var lo = 0
+    while lo < n {
+        var hi = lo + 1
+        while hi < n && !srt.partBreak[hi] { hi += 1 }
+        if f <= F_CUME_DIST { ranks(f, srt, lo, hi, col) }
+        else { try byArgs(f, rows, w, args, srt, &cached, &ki, lo, hi, ev, col) }
+        lo = hi
+    }
+    return Ok(Unit{})
+}
+
+// One partition's (the positions lo..hi) row_number, rank, dense_rank,
+// percent_rank or cume_dist.
+fn ranks(f: int, srt: &Sorted, lo: int, hi: int, col: mut &[]Val) {
+    let n = hi - lo
+    let idx = &srt.idx
+    let pbk = &srt.peerBreak
+    var gs = 0                  // where the row's peer group starts, in the partition
+    var ge = 0                  // ... and ends
+    var dense = 1
+    for k in 0..n {
+        if k > 0 && pbk[lo + k] {
+            gs = k
+            dense += 1
+        }
+        var v = Val.Int(k + 1)
+        if f == F_RANK { v = Val.Int(gs + 1) }
+        else if f == F_DENSE_RANK { v = Val.Int(dense) }
+        else if f == F_PERCENT_RANK {
+            // double precision, as PostgreSQL's (9.94)
+            v = Val.Float(if n <= 1 { 0.0f } else { float(gs) / float(n - 1) })
+        } else if f == F_CUME_DIST {
+            if k == gs {
+                ge = k + 1
+                while ge < n && !pbk[lo + ge] { ge += 1 }
+            }
+            v = Val.Float(float(ge) / float(n))
+        }
+        col[idx[lo + k]] = v
+    }
+}
+
+// One partition's ntile, lag, lead, first_value, last_value or nth_value.
+fn byArgs(f: int, rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: &Sorted, cached: &[]Val, ki: &KInt, lo: int, hi: int,
+          ev: &fn(int, int): Result[Val, DbErr], col: mut &[]Val): Result[Unit, DbErr] {
+    let n = hi - lo
+    let idx = &srt.idx
+    let pbk = &srt.peerBreak
+    // the frame's end: the partition's, the row's (ROWS), or its peers'
+    let whole = w.end == lexdb_sql.B_UNBOUNDED_FOLLOWING
+    let byRow = w.mode == lexdb_sql.FR_ROWS
+    var ge = 0
+    for k in 0..n {
+        let r = idx[lo + k]
+        if f == F_NTILE {
+            var nb = ki.v
+            if ki.kind == KI_NULL { continue }
+            if ki.kind == KI_NONE {
+                let bv = try getArg(rows, &args[0], 0, r, ev)
+                if lexdb_ops.isNull(&bv) { continue }
+                nb = try toInt(bv)
+            }
+            if nb <= 0 { return Err(e("22014", "argument of ntile must be greater than zero")) }
+            // n rows in nb buckets: the first n % nb one row bigger
+            let size = n / nb
+            let extra = n % nb
+            var bucket = k + 1
+            if size > 0 {
+                bucket = if k < (size + 1) * extra { k / (size + 1) + 1 } else { extra + (k - (size + 1) * extra) / size + 1 }
+            }
+            col[r] = Val.Int(bucket)
+            continue
+        }
+        if f == F_LAG || f == F_LEAD {
+            var off = 1
+            if len(args) > 1 {
+                if ki.kind == KI_NULL { continue }
+                if ki.kind == KI_INT { off = ki.v } else {
+                    let ov = try getArg(rows, &args[1], 1, r, ev)
+                    if lexdb_ops.isNull(&ov) { continue }
+                    off = try toInt(ov)
+                }
+            }
+            let at = if f == F_LAG { k - off } else { k + off }
+            if at >= 0 && at < n {
+                if len(cached) > 0 { col[r] = cached[idx[lo + at]].clone() }
+                else { col[r] = try getArg(rows, &args[0], 0, idx[lo + at], ev) }
+            } else if len(args) > 2 {
+                col[r] = try getArg(rows, &args[2], 2, r, ev)
+            }
+            continue
+        }
+        // over the frame: its first row is the partition's; its last, the
+        // partition's, the row's (ROWS) or its peers' (found where a group starts)
+        if !whole && !byRow && (k == 0 || pbk[lo + k]) {
+            ge = k + 1
+            while ge < n && !pbk[lo + ge] { ge += 1 }
+        }
+        var nth = 1
+        if f == F_NTH {
+            if ki.kind == KI_NULL { continue }
+            if ki.kind == KI_INT { nth = ki.v } else {
+                let nv = try getArg(rows, &args[1], 1, r, ev)
+                if lexdb_ops.isNull(&nv) { continue }
+                nth = try toInt(nv)
+            }
+            if nth <= 0 { return Err(e("22016", "argument of nth_value must be greater than zero")) }
+        }
+        var b = n - 1
+        if !whole { b = if byRow { k } else { ge - 1 } }
+        var at = -1
+        if f == F_LAST { at = b } else if nth - 1 <= b { at = nth - 1 }
+        if at >= 0 { col[r] = try getArg(rows, &args[0], 0, idx[lo + at], ev) }
+    }
+    return Ok(Unit{})
+}
+
+// ---- The frames (the row path's: winPartition in lexdb_exec)
+
+// Two rows' ORDER BY values in a window's order (0: peers).
+pub fn winCmp(a: &[]Val, b: &[]Val, w: &WinPlan): int {
+    for k in 0..len(a) {
+        let na = lexdb_ops.isNull(&a[k])
+        let nb = lexdb_ops.isNull(&b[k])
+        if na && nb { continue }
+        if na { return if w.nullsFirst[k] { -1 } else { 1 } }
+        if nb { return if w.nullsFirst[k] { 1 } else { -1 } }
+        var c = lexdb_sort.sortCmp(&a[k], &b[k])
+        if w.desc[k] { c = -c }
+        if c != 0 { return c }
+    }
+    return 0
+}
+
+pub fn offInt(v: &Val): int {
+    match v {
+        Val.Int(i) { return i }
+        else { return 0 }
+    }
+}
+
+// A window's partitioning and order as text: windows with the same share
+// a sort.
+pub fn winSpecText(w: &WinPlan): str {
+    var b = ""
+    for x in w.part {
+        b += &(lexdb_sql.exprText(&x))
+        b += ";"
+    }
+    b += "|"
+    for k in 0..len(w.order) {
+        b += &(lexdb_sql.exprText(&w.order[k]))
+        b += if w.desc[k] { " d" } else { " a" }
+        b += if w.nullsFirst[k] { "f;" } else { "l;" }
+    }
+    return b
+}
+
+// The frame's first and last positions in the partition (k the current
+// row's; may be empty: first > last).
+pub fn frameBounds(w: &WinPlan, k: int, n: int, grp: &[]int, gStart: &[]int, gEnd: &[]int, keyAt: &[]Val, so: &Val, eo: &Val,
+                   first: mut &int, last: mut &int): Result[Unit, DbErr] {
+    let g = grp[k]
+    let ng = len(gStart)
+    var a = 0
+    var b = n - 1
+    if w.mode == lexdb_sql.FR_ROWS {
+        if w.start == lexdb_sql.B_PRECEDING { a = k - offInt(so) }
+        else if w.start == lexdb_sql.B_CURRENT { a = k }
+        else if w.start == lexdb_sql.B_FOLLOWING { a = k + offInt(so) }
+        if w.end == lexdb_sql.B_PRECEDING { b = k - offInt(eo) }
+        else if w.end == lexdb_sql.B_CURRENT { b = k }
+        else if w.end == lexdb_sql.B_FOLLOWING { b = k + offInt(eo) }
+    } else if w.mode == lexdb_sql.FR_GROUPS {
+        if w.start == lexdb_sql.B_PRECEDING { a = if g - offInt(so) < 0 { 0 } else { gStart[g - offInt(so)] } }
+        else if w.start == lexdb_sql.B_CURRENT { a = gStart[g] }
+        else if w.start == lexdb_sql.B_FOLLOWING { a = if g + offInt(so) >= ng { n } else { gStart[g + offInt(so)] } }
+        if w.end == lexdb_sql.B_PRECEDING { b = if g - offInt(eo) < 0 { -1 } else { gEnd[g - offInt(eo)] - 1 } }
+        else if w.end == lexdb_sql.B_CURRENT { b = gEnd[g] - 1 }
+        else if w.end == lexdb_sql.B_FOLLOWING { b = if g + offInt(eo) >= ng { n - 1 } else { gEnd[g + offInt(eo)] - 1 } }
+    } else {
+        // RANGE: by the one ORDER BY value; a NULL one's frame is its peers
+        if w.start == lexdb_sql.B_CURRENT { a = gStart[g] }
+        if w.end == lexdb_sql.B_CURRENT { b = gEnd[g] - 1 }
+        let sOff = w.start == lexdb_sql.B_PRECEDING || w.start == lexdb_sql.B_FOLLOWING
+        let eOff = w.end == lexdb_sql.B_PRECEDING || w.end == lexdb_sql.B_FOLLOWING
+        if sOff || eOff {
+            let v = &keyAt[k]
+            if lexdb_ops.isNull(v) {
+                if sOff { a = gStart[g] }
+                if eOff { b = gEnd[g] - 1 }
+            } else {
+                if sOff {
+                    let t = try rangeTarget(v, so, w.start == lexdb_sql.B_PRECEDING, w.desc[0])
+                    a = try firstNot(keyAt, &t, w, false)
+                }
+                if eOff {
+                    let t = try rangeTarget(v, eo, w.end == lexdb_sql.B_PRECEDING, w.desc[0])
+                    b = (try firstNot(keyAt, &t, w, true)) - 1
+                }
+            }
+        }
+    }
+    first = if a < 0 { 0 } else { a }
+    last = if b > n - 1 { n - 1 } else { b }
+    return Ok(Unit{})
+}
+
+// v - off or v + off: the value a RANGE bound stands at (preceding rows
+// have smaller values going up, larger going down).
+fn rangeTarget(v: &Val, off: &Val, preceding: bool, desc: bool): Result[Val, DbErr] {
+    return lexdb_ops.arith(if preceding != desc { lexdb_ops.OP_SUB } else { lexdb_ops.OP_ADD }, v, off)
+}
+
+// The first position whose value is not before t (after: not after t is
+// the test, so this is one past the last at or before it), in the
+// window's order: the values sorted, NULLs at one end.
+fn firstNot(keyAt: &[]Val, t: &Val, w: &WinPlan, after: bool): Result[int, DbErr] {
+    var lo = 0
+    var hi = len(keyAt)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        var c = 0
+        if lexdb_ops.isNull(&keyAt[mid]) { c = if w.nullsFirst[0] { -1 } else { 1 } } else {
+            c = try lexdb_ops.compare(&keyAt[mid], t)
+            if w.desc[0] { c = -c }
+        }
+        // before: c < 0; at or before: c <= 0
+        let moveOn = if after { c <= 0 } else { c < 0 }
+        if moveOn { lo = mid + 1 } else { hi = mid }
+    }
+    return Ok(lo)
+}
+
+// Whether frame position p is left out of row k's frame (EXCLUDE).
+pub fn excluded(w: &WinPlan, p: int, k: int, grp: &[]int): bool {
+    if w.exclude == lexdb_sql.EX_CURRENT { return p == k }
+    if w.exclude == lexdb_sql.EX_GROUP { return grp[p] == grp[k] }
+    if w.exclude == lexdb_sql.EX_TIES { return grp[p] == grp[k] && p != k }
+    return false
+}

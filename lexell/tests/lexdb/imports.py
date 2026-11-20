@@ -40,7 +40,7 @@ CORE = {
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
-    "lexdb_store", "lexdb_time",
+    "lexdb_store", "lexdb_time", "lexdb_window",
 }
 
 PG_DATA = {"lexdb_pgdata"}
@@ -118,13 +118,13 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # their encodings only; only the pipeline and exec import it.
 SORT = "lexdb_sort"
 SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
-SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop"}
+SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_window"}
 
 # The aggregate accumulators (lexdb_agg, design/lexdb-batch-gaps.md item 3):
 # values and their orders only; the row engine and the pipeline import them.
 AGG = "lexdb_agg"
 AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort"}
-AGG_USERS = {"lexdb_pipe", "lexdb_exec"}
+AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window"}
 
 # How a set operation combines its parts' rows (lexdb_setop, design/
 # lexdb-batch-gaps.md item 11): their keys and the streamed run, with the
@@ -141,6 +141,14 @@ SETOP_USERS = {"lexdb_exec"}
 HELD = "lexdb_held"
 HELD_MAY_IMPORT = {"lexdb_sql", "lexdb_rows"}
 HELD_USERS = {"lexdb_pipe"}
+
+# The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item
+# 10): the sort keys and the frame code of the row engine's windows. Values,
+# their orders and the aggregate spec type only (the engine evaluates what
+# needs its scope, through a hook); only exec imports it.
+WINDOW = "lexdb_window"
+WINDOW_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_sort", "lexdb_agg"}
+WINDOW_USERS = {"lexdb_exec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -219,6 +227,12 @@ def check():
     for m in sorted(mods):
         if AGG in mods[m] and m not in AGG_USERS:
             bad.append(f"{m} -> {AGG}: only {', '.join(sorted(AGG_USERS))} import the aggregate accumulators")
+    for d in mods.get(WINDOW, []):
+        if d not in WINDOW_MAY_IMPORT:
+            bad.append(f"{WINDOW} -> {d}: the window functions import above or beside their layer")
+    for m in sorted(mods):
+        if WINDOW in mods[m] and m not in WINDOW_USERS:
+            bad.append(f"{m} -> {WINDOW}: only {', '.join(sorted(WINDOW_USERS))} import the window functions")
     for d in mods.get(SETOP, []):
         if d not in SETOP_MAY_IMPORT:
             bad.append(f"{SETOP} -> {d}: the set operations import above or beside their layer")
