@@ -15642,6 +15642,7 @@ pub fn (s: mut &Session) close() {
     s.st.memo.del(&collKey(s.id))
     s.st.memo.del(&identKey(s.id))
     s.st.memo.del(&noticeKey(s.id))
+    s.st.memo.del(&doorKey(s.id))
 }
 
 // ---- notices (9.117): what a statement tells the client besides its
@@ -21952,12 +21953,41 @@ fn may(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, le
 
 fn denied(kind: &str, name: &str): DbErr { return e("42501", &("permission denied for " + kind + " " + lexdb_sql.baseName(name))) }
 
-// A relation's privilege (and its schema's USAGE): 42501 without them.
+// The door a session came in by, kept in the store's memo (lexdb_tds and lexdb_tns set it): "tds" (SQL Server's), "tns"
+// (Oracle's), "" the PostgreSQL wire and in-process sessions. Neither SQL Server nor Oracle has a schema privilege to
+// read an object through (an object's own GRANT is all a user needs of it), as PostgreSQL's USAGE on a schema is.
+fn doorKey(sess: int): str { return "\x00door\x00" + sess.toStr() }
+fn doorOf(st: &lexdb_store.Store, sess: int): str { return st.memo.get(&doorKey(sess)).unwrapOr("") }
+
+// The session's door (lexdb_tds, lexdb_tns).
+pub fn (s: &Session) setDoor(d: &str) { s.st.memo.put(&doorKey(s.id), d) }
+
+// A privilege letter's name as SQL Server's messages say it.
+fn tsqlPriv(letter: &str): str {
+    return match letter { "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "x" { "REFERENCES" } "D" { "ALTER" } else { "EXECUTE" } }
+}
+
+// SQL Server's 229 for a table: "The SELECT permission was denied on the object 't', database 'lexdb', schema 'dbo'."
+fn deniedTsql(letter: &str, key: &str): DbErr {
+    let sc = lexdb_sql.schemaOf(key)
+    return e("TS229", &("The " + tsqlPriv(letter) + " permission was denied on the object '" + lexdb_sql.baseName(key) + "', database 'lexdb', schema '" +
+                        (if sc == "public" { "dbo" } else { sc }) + "'."))
+}
+
+// A relation's privilege (and its schema's USAGE, for the PostgreSQL door): 42501 without them.
 fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: &str, letter: &str, kind: &str): Result[Unit, DbErr] {
     if w.super { return Ok(Unit{}) }
     let sc = lexdb_sql.schemaOf(key)
-    if !(try may(st, txn, w, &lexdb_catalog.nspObj(&sc), &"U")) { return Err(denied(&"schema", &sc)) }
-    if !(try may(st, txn, w, &lexdb_catalog.relObj(key), letter)) { return Err(denied(kind, key)) }
+    var door = ""
+    if !(try may(st, txn, w, &lexdb_catalog.nspObj(&sc), &"U")) {
+        door = doorOf(st, txn.sql.sess)
+        if len(door) == 0 { return Err(denied(&"schema", &sc)) }
+    }
+    if !(try may(st, txn, w, &lexdb_catalog.relObj(key), letter)) {
+        if len(door) == 0 { door = doorOf(st, txn.sql.sess) }
+        if door == "tds" { return Err(deniedTsql(letter, key)) }
+        return Err(denied(kind, key))
+    }
     return Ok(Unit{})
 }
 
@@ -22079,15 +22109,37 @@ fn grantTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql
     return Ok(out)
 }
 
+// Who may GRANT or REVOKE letters on an object: its owner, a role it is a member of, a superuser. The other doors say
+// no as their own systems do: SQL Server's 4613, Oracle's 1720 for a user that holds the privilege without a grant
+// option (lexdb has none), else 1031 (the 42501).
+fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, tg: &Target, letters: &str, door: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let a = try readAcl(st, txn, &tg.obj)
+    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
+    if door == "tds" { return Err(e("TS4613", "Grantor does not have GRANT permission.")) }
+    if door == "tns" && (tg.kind == "table" || tg.kind == "view") {
+        for k in 0..len(letters) {
+            if allows(w, &a, &letters[k..k + 1]) {
+                return Err(e("ORA01720", &("grant option does not exist for '" + strings.toUpperAscii(&lexdb_sql.schemaOf(&tg.name)) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&tg.name)) + "'")))
+            }
+        }
+    }
+    return needOwner(st, txn, w, &tg.obj, &tg.kind, &tg.name)
+}
+
 fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let grant = s.kind == lexdb_sql.S_GRANT
     let tag = if grant { "GRANT" } else { "REVOKE" }
     if s.index == "database" { return Ok(tagOnly(&tag)) }       // lexdb has no database privileges: CONNECT and the rest hold
     let w = try whoNow(st, txn)
+    let door = doorOf(st, txn.sql.sess)
     var grantees: []str = []
     for g in s.pk {
         let r = roleName(st, txn, &g)
-        if len(r) > 0 && !(try roleExists(st, txn, &r)) { return Err(e("42704", &("role \"" + r + "\" does not exist"))) }
+        if len(r) > 0 && !(try roleExists(st, txn, &r)) {
+            if door == "tds" { return Err(e("TS15151", &("Cannot find the user '" + r + "', because it does not exist or you do not have permission."))) }
+            return Err(e("42704", &("role \"" + r + "\" does not exist")))
+        }
         append(mut &grantees, r)
     }
     if s.index == "role" {
@@ -22111,17 +22163,28 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         try bumpCatalog(st, txn)
         return Ok(tagOnly(&(tag + " ROLE")))
     }
-    let targets = try grantTargets(st, txn, s)
+    var targets: []Target = []
+    match grantTargets(st, txn, s) {
+        Ok(ts) { targets = ts }
+        Err(x) {
+            if door == "tds" && x.state == "42P01" && len(s.cols) > 0 {
+                return Err(e("TS15151", &("Cannot find the object '" + lexdb_sql.baseName(&s.cols[0].name) + "', because it does not exist or you do not have permission.")))
+            }
+            return Err(x)
+        }
+    }
     for tg in targets {
         var letters = ""
         for pn in s.names {
-            let l = privLetters(&pn, if tg.kind == "view" { "table" } else { &tg.kind })
+            var l = privLetters(&pn, if tg.kind == "view" { "table" } else { &tg.kind })
+            // ALL on a table is the five privileges SQL Server and Oracle have (neither has TRUNCATE or TRIGGER)
+            if pn == "all" && len(door) > 0 && (tg.kind == "table" || tg.kind == "view") { l = "arwdx" }
             if len(l) == 0 && pn != "maintain" {
                 return Err(e("0LP01", &("invalid privilege type " + strings.toUpperAscii(&pn) + " for " + tg.kind)))
             }
             letters = addLetters(&letters, &l)
         }
-        try needOwner(st, txn, &w, &tg.obj, &tg.kind, &tg.name)
+        try needGrantor(st, txn, &w, &tg, &letters, &door)
         var a = try readAcl(st, txn, &tg.obj)
         if !a.set { a.set = true }
         for g in grantees {
