@@ -159,7 +159,32 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
-**Now, main `0f96fee9` (2026-11-20), the same setup, lexdb and PostgreSQL
+**Now, main `01b0250c` (2026-11-20, after optimizer Q4-Q6), the same
+setup, lexdb and PostgreSQL in the same run (one run each, lexdb `-O`):**
+summed 12,239 ms against PostgreSQL's 14,960 on one core; **geometric mean
+0.94 on wall** (was 1.03), 0.85 on server CPU; level or ahead on 11 of 22
+(was 9); against PostgreSQL's four processes 1.47 (sum 9,300; was 1.58).
+Since `0f96fee9`: Q4's key-ordered index read (q4 0.9, q14 1.1, q15 2.5 to
+1.8), Q6's bushy build groups (q7 1.2 from about 1.6, q21 1.3); Q5 changed
+no TPC-H plan. Worst ratios against one core: q19 2.1, q20 2.1, q11 1.9,
+q22 1.9, q15 1.8, q6 1.6. Results: `~/tpch-w/int/out-pgcmp-01b0250c`.
+
+| | lexdb `01b0250c` | PG one core | ratio | PG four processes |
+|---|---:|---:|---:|---:|
+| q1 | 1,719 | 3,277 | 0.52 | 881 |
+| q4 | 183 | 194 | 0.94 | 111 |
+| q6 | 459 | 282 | 1.63 | 221 |
+| q7 | 702 | 597 | 1.18 | 309 |
+| q11 | 117 | 63 | 1.87 | 69 |
+| q15 | 633 | 349 | 1.82 | 351 |
+| q18 | 694 | 2,844 | 0.24 | 3,053 |
+| q19 | 95 | 45 | 2.12 | 43 |
+| q20 | 286 | 133 | 2.15 | 137 |
+| q21 | 1,106 | 837 | 1.32 | 273 |
+| q22 | 166 | 88 | 1.89 | 50 |
+| all 22, summed | 12.24 s | 14.96 s | | 9.30 s |
+
+**Before, main `0f96fee9` (2026-11-20), the same setup, lexdb and PostgreSQL
 both run today (one run each, lexdb built with `-O`):** summed 13,435 ms
 against PostgreSQL's 15,231 on one core (PostgreSQL ran 9% slower than its
 18 Nov figure: the machine's state, not lexdb); geometric mean 1.03 on wall,
@@ -315,6 +340,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-20 | 01b0250c | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | after optimizer Q4-Q6: lexdb / PG one core 0.94 (geometric mean, wall; 0.85 server CPU), 11 of 22 level or ahead; summed 12.24 s against PG's 14.96 s; against PG four processes 1.47; worst q19 2.1, q20 2.1, q11 1.9, q22 1.9, q15 1.8 | this page, 1.6 |
 | 2026-11-20 | 0f96fee9 | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | lexdb / PG one core 1.03 (geometric mean, wall; 0.94 server CPU), 9 of 22 level or ahead; summed 13.44 s against PG's 15.23 s; against PG four processes 1.58; worst q15 2.5, q20 2.2, q11 2.1, q19 2.1 | this page, 1.6 |
 | 2026-11-18 | d0f00b92 | analytic queries (lexdb only, pinned, `la/base3`, CPU against the build before), TPC-H and point-select instruction counts | text columns as one buffer plus offsets, and the wire writer on `bytesGrow`: 35 queries geometric mean -6.7% CPU (scans -5 to -23%, `select *` -23%, text joins -19 to -24%, text min/max -31%, text group -12%; `distinct2` +3%); TPC-H +0.66% instructions, +0.75% cycles (results unchanged); point selects +0.1% instructions, -1.4% cycles | this page, 1 |
 | 2026-11-18 | eababf57 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 88k / 151k / 145k/s (+10-14%); replicas 401k/s at 32 clients (PG 405k); updates 3,691 / 16,687 / 38,711/s after restoring the 32-client rate (19,300/s at aaadeb1e: owned-string regression); commit p99 1.38-1.40 ms (0.81 before the migration, unresolved) | this page, 1 |
