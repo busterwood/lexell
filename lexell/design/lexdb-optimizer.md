@@ -3542,3 +3542,165 @@ Q5 +0.073% (+118 instructions a select); measured one piece at a time, the large
 +21. With `SubPlan.view`, WHERE passed to `planFrom` and the CTE marks
 made on the statement in `out`: +0.009% (+14).
 
+## 49. Bushy joins: a hash of a join (2026-11-20)
+
+Item Q6 of lexdb-layers.md 6.3. The join search (sections 26-30) builds
+left-deep orders only: each table after the first is looked up per row or
+read once and hashed, alone. PostgreSQL's plans for TPC-H's
+multi-dimension joins hash a join instead (lexdb-tpch-perf.md, "Bushy
+plans"): q7 hashes supplier joined to its nation and customer joined to
+its nation, q5 and q8 the region's customers (region, nation, customer),
+q21 supplier joined to nation. lexdb's left-deep answer to two of them is
+`reduceHashes` (lexdb-layers.md 6.2.13: a hash cut by the next level's
+hash, q7 and q21), which needs the two hashes adjacent and joined by one
+integer key; q7's customer is looked up per row instead (146k lookups,
+about 1.6 us each), because a hash of all 150k customers costs more than
+the lookups in the model.
+
+### 49.1 The shape
+
+One bushy shape, the one that pays: **a hash whose build side is a join.**
+A *build group* is a hub table h and one or two member tables S, joined
+inside the build by hash joins (h read first, each member hashed and
+probed by h's rows, then by the next member's); the joined rows h ⋈ S are
+hashed by their key columns and probed by the rows of the tables placed
+before the group, as any hash join is. The probe side stays left-deep, and
+tables after the group join its rows as they join any level's. Examples:
+q7's (customer, nation n2) probed by `o_custkey`; q21's (supplier, nation)
+probed by `l_suppkey`; q5's (customer, nation, region) probed by
+`o_custkey`.
+
+Not done: a build side that is itself bushy, a group whose members are
+looked up per row (a member is always hashed: its tables are dimensions),
+more than two members (`GRP_MAX`), a general DP over connected subsets
+(DPccp), groups in the N-best search past 8 tables.
+
+### 49.2 When a group is valid
+
+- **Inner joins only.** The cost search (section 26) runs only when every
+  join is inner (after 48.2's conversion); a query with an outer join
+  keeps FROM's order (section 41), so no group crosses or nests in an
+  outer join.
+- **Plain tables:** every level of the search is one already (no derived
+  table, LATERAL, lock); not in a query with outer values (a correlated
+  subquery's: the pipeline does not run it).
+- **A key:** some column of the group equals (written or implied) a
+  column of a table placed before it, a plain column on each side; each
+  member equals a column of the hub or an earlier member the same way
+  (its key in the build). A key under a collation (`#ci(x) = #ci(y)`) is
+  checked per candidate, not hashed.
+- **No error moved.** The build evaluates the group's join conditions on
+  every pair of its tables' rows, where the left-deep order evaluates them
+  only on rows the earlier tables joined; and a condition between the
+  earlier tables and the hub is evaluated only on hub rows the members
+  kept. So every conjunct reading a group's table and another table must
+  be one that cannot fail (`cannotFail`, with the char and collation
+  wrappers the binder adds, `#bptrim`, `#pad`, `#ci`, which cannot fail
+  either). A table's own conditions are evaluated on all its rows in both
+  plans (a hash reads its whole table by its constants). Two tables'
+  own conditions that both fail fail in both plans, perhaps with the
+  other table's error (as with any join order).
+- **Memory:** the group's rows (estimated) times its tables' row bytes,
+  and each member's hash, within the cap a hash has (section 29's review:
+  half the statement's memory, 64 MB at most).
+- **Not** where reading may stop early (`lookups`: a hash is built
+  whole), not under `SET lexdb_planner = rules`, not in a transaction
+  whose reads are noted (the cost search does not run there).
+
+### 49.3 The search and the cost
+
+In the exact search (up to `JOIN_EXACT_MAX`, 8 tables): from each set of
+tables reached (not the empty one), besides adding one table, a group
+(h, S) is added at once, h linked to the set and each member linked to
+the hub or the member before it by an equality, giving the set with all of
+them. The DP over sets takes it as any extension: the cheapest way to each
+set wins, and the order is read back as h, then S in their build order.
+The N-best search (9 to 24 tables) adds one table at a time and is
+unchanged: its steps are by number of tables, and a group adds several.
+
+The group's cost, in the model's units, with rows(X) section 26's rows of
+a set (`setRows`: by the lowest table, any set) and rin the rows of the
+set placed:
+
+- the hub read by its constants as the build's first table, in batches:
+  its constant way's cost (`base.cost`, as the first table of a query);
+- each member m joined to the build's rows so far (P): hashed and probed,
+  as `joinStep` prices a hash: `base.inner + rows(m) * HASH_BUILD +
+  rows(P) * HASH_PROBE + rows(P + m) * ROW_COST`;
+- the build's rows hashed: `rows(G) * HASH_BUILD`;
+- the probes: `rin * HASH_PROBE + rows(set + G) * ROW_COST`.
+
+The hub's read is the first table's cost, not a hashed table's
+(`base.inner`, 44 a row: a row read one by one, section 45): the group is
+only ever run by the pipeline, whose build reads the hub by its scan, in
+batches. (The pipeline reads a left-deep hash's table in batches too since
+P2, so `base.inner` overprices every hash it builds; re-pricing those
+would move many plans and is its own item, not this one.)
+
+Planning time: only joins of three tables or more in the exact search
+pay; a group is tried per set reached, per hub linked to it, per member
+order (at most a few dozen per set); a single-table statement never
+reaches the search.
+
+### 49.4 How the pipeline runs it
+
+`PJoin.how = JH_JOIN` (lexdb_plan): its `scan` is the hub's, `build` the
+hub's own conditions, `sub` the members' joins (each a `JH_HASH` arm over
+the hub's rows, its keys reading the group's tables only), `hcols` the key
+columns as the query's slots (any of the group's tables), `keys` their
+values (the tables before), `conds` every conjunct between the group and
+the tables before (the keys' equalities among them, as a hash's).
+`joinsOver` builds it from the levels' conditions; the levels themselves
+stay a left-deep chain (49.5).
+
+`lexdb_pipe.joinSetup` builds the hash by running the build as a join of
+its own (`joinRows` over Filter? (Scan hub) and the members' Join arms:
+their hashes, the scan narrowed by the first one's keys, `reduceHashes`),
+its joined rows (the group's columns the statement reads) going into the
+hash builder by the key slots. The level's rows are then the query's
+columns (`first` 0), its key as any hash's (by value for one integer, by
+text, else encoded), and the probe, the rows' gathering, the scan's
+narrowing by the first hash's keys and `reduceHashes` treat it as a hash
+level. The members' hashes are freed after the build; the group's hash is
+held against `max_statement_mem` as any.
+
+### 49.5 The row engine
+
+The row engine cannot run a hash of a join, and it need not: the group's
+levels are a valid left-deep chain (the hub read once and hashed, then
+each member read once and hashed), placed in that order with their
+conditions at the latest table they use, as any order. So:
+
+- **the plan's level chain is left-deep** with the group marked
+  (`Level.grp`: the hub's count of members after it);
+- the pipeline runs the group as one hash wherever it runs the joins (a
+  SELECT's plan, an aggregate's, or the joins program the row engine
+  takes, `Query.jp`);
+- **where no pipeline program holds the joins** (the pipeline does not
+  run the statement), the marks are cleared (`lexdb_plan.flatGroups`,
+  exec's glue) and the row engine runs the same order left-deep: a
+  correct plan, EXPLAIN showing what runs. A run that gives up at run
+  time (a value a batch cannot hold), or `SET lexdb_batch = off` (tests
+  only), runs the chain left-deep too.
+
+### 49.6 EXPLAIN
+
+The hub's line names the hash and its keys, the members follow indented:
+
+```
+join customer: hash of a join on (c_custkey) over full scan (table rows 11927 of 150000 read, probes ..., ...)
+  with nation n2: hash on (n_nationkey) over full scan (table rows 2 of 25 read, probes 150000, ...)
+```
+
+EXPLAIN ANALYZE's counts: on the hub's line, the rows the build read of
+the hub and those it hashed (after the members), then its probes; on each
+member's, its own hash and the build's probes of it.
+
+### 49.7 The switches
+
+`SET lexdb_planner = rules` makes no group (the rules planner keeps FROM's
+order or section 25's). `lexdb_plan.setBushy(mode)`: `BU_COST` (default)
+by cost, `BU_OFF` left-deep only (the reference the tests compare
+against), `BU_FORCE` a group wherever one is valid (its cost taken as
+tiny; tests only, to run the executor over many shapes).
+
