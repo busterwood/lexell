@@ -3253,6 +3253,90 @@ pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
         }
     }
 }
+
+// keyPart of the integer n (an integer's number: lexdb_access.encNum of its
+// decimal), made from its digits without a Decimal.
+pub fn keyInt(b: mut &str, n: int) {
+    if n == 0 {
+        b.addByte(3)
+        b.addByte(0x80)
+        return
+    }
+    if n < -9223372036854775807 {
+        keyPart(b, &Val.Int(n))
+        return
+    }
+    let m0 = if n < 0 { -n } else { n }
+    // its digits: nd of them, the last z of them zeros (not in the key)
+    var nd = 1
+    var p = 1
+    while p <= m0 / 10 {
+        p *= 10
+        nd += 1
+    }
+    var z = 0
+    var t = m0
+    while t % 10 == 0 {
+        t /= 10
+        z += 1
+    }
+    let ex = nd + 0x40000000
+    b.addByte(3)
+    let neg = n < 0
+    let w = if neg { 0x7FFFFFFF - ex } else { ex }
+    b.addByte(if neg { 0x7F } else { 0x81 })
+    b.addByte(byte((w >> 24) & 0xff))
+    b.addByte(byte((w >> 16) & 0xff))
+    b.addByte(byte((w >> 8) & 0xff))
+    b.addByte(byte(w & 0xff))
+    var m = m0
+    for i in 0..nd - z {
+        let d = m / p
+        m = m % p
+        p /= 10
+        b.addByte(byte(if neg { 0xFF - (0x30 + d) } else { 0x30 + d }))
+    }
+    b.addByte(if neg { 0xFF } else { 0 })
+}
+
+// Row j of an OutBatch as a set operation's key: rowKey's of its values
+// (obRow's) under the columns' collation kinds colls (keyPart of
+// collVal), made from the columns: an integer from its digits, a text from
+// its bytes, no value made. kb is cleared first.
+pub fn obKey(ob: &lexdb_rows.OutBatch, j: int, colls: &[]int, kb: mut &str) {
+    kb.clear()
+    let r = ob.idx[j]
+    for o in 0..len(ob.kinds) {
+        let k = ob.kinds[o]
+        let c = ob.src[o]
+        let ck = if o < len(colls) { colls[o] } else { lexdb_sql.COLL_EXACT }
+        if c < 0 {
+            let x = &ob.ex[o]
+            if x.nul[j] { kb.addByte(2) }
+            else if k == BK_BOOL {
+                kb.addByte(1)
+                kb.addByte(if x.v[j] == 1 { 1 } else { 0 })
+            } else { keyInt(kb, x.v[j]) }
+        } else if ob.cols[c].nul[r] {
+            kb.addByte(2)
+        } else if k == lexdb_rows.BK_INT {
+            keyInt(kb, ob.cols[c].v[r])
+        } else if k == BK_BOOL {
+            kb.addByte(1)
+            kb.addByte(if ob.cols[c].v[r] == 1 { 1 } else { 0 })
+        } else if k == lexdb_rows.BK_TEXT {
+            let s = lexdb_rows.obText(ob, o, j)
+            if ck == lexdb_sql.COLL_EXACT { lexdb_access.encIdxText(kb, s) }
+            else if ck == lexdb_sql.COLL_CI { lexdb_access.encIdxText(kb, &lexdb_access.ciKey(s)) }
+            else { lexdb_access.encIdxText(kb, &lexdb_access.padKey(s)) }
+        } else if ck == lexdb_sql.COLL_EXACT {
+            keyPart(kb, &ob.vals[c][r])
+        } else {
+            keyPart(kb, &lexdb_sort.collVal(ck, &ob.vals[c][r]))
+        }
+    }
+}
+
 // ---- subqueries' values, IN's sets and hash keys
 //
 // A subquery run once (lexdb_plan.RUN_ONCE) is a value to the plans that

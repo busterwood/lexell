@@ -11,7 +11,7 @@
 // after the first part has given rows. A CTE runs once in the statement
 // through a sink as held: its rows shared by the parts (a volatile one's
 // too), and nested parts read it from the same run.
-// expect: union all through a sink: 192 queries, 192 the same as held
+// expect: union all through a sink: 227 queries, 227 the same as held
 // expect: errors after rows: first part ERR 22012, second part ERR 22012
 // expect: a CTE once: except none, intersect 1 row, union all the same value twice, nested the same value thrice
 // expect: a CTE once, sorted and counted: union all the same value twice, except all none, intersect all 1 row, random 1 row, 1 row
@@ -133,6 +133,28 @@ fn load(s: mut &lexdb_exec.Session) {
     }
     let k3 = held(s, &("insert into k1 values " + strings.join(&kr1, ", ")))
     let k4 = held(s, &("insert into k2 values " + strings.join(&kr2, ", ")))
+    // keys of every kind of column: integers with zeros and at the edges of 64 bits, booleans, numerics, dates, floats, texts with spaces
+    let n1 = held(s, &"create table n1 (id int primary key, i bigint, b boolean, d date, nn numeric(14,2), f float8, tx text collate \"SQL_Latin1_General_CP1_CI_AS\")")
+    let n2 = held(s, &"create table n2 (id int primary key, i bigint, b boolean, d date, nn numeric(14,2), f float8, tx text collate \"SQL_Latin1_General_CP1_CI_AS\")")
+    let ivals = ["0", "1", "-1", "10", "-10", "100", "-100", "1000000", "-1000000", "9223372036854775807", "-9223372036854775807",
+                 "(-9223372036854775807 - 1)", "123456789012345678", "1200", "-1200", "5", "50", "500", "-5", "-50", "9000000000000000000",
+                 "-9000000000000000000", "1000000000000000000", "-1000000000000000000", "99", "101", "-99", "-101", "7", "70", "null"]
+    var nr1: []str = []
+    var nr2: []str = []
+    for i in 0..len(ivals) {
+        let bv = if i % 7 == 0 { "null" } else if i % 2 == 0 { "true" } else { "false" }
+        let dv = if i % 5 == 0 { "null" } else { "date '2024-01-" + (1 + i % 9).toStr() + "'" }
+        let nv = if i % 6 == 0 { "null" } else { ((i * 37) % 11 - 5).toStr() + "." + (if i % 3 == 0 { "50" } else { "00" }) }
+        let fv = if i % 4 == 0 { "null" } else { (i % 5).toStr() + ".5" }
+        let tv = if i % 8 == 0 { "null" } else { "'" + (if i % 2 == 0 { "ab" } else { "AB" }) + (if i % 3 == 0 { " " } else { "" }) + "'" }
+        append(mut &nr1, "(" + (i + 1).toStr() + ", " + ivals[i] + ", " + bv + ", " + dv + ", " + nv + ", " + fv + ", " + tv + ")")
+        // the second: some rows alike, some not, some twice
+        if i % 3 != 1 { append(mut &nr2, "(" + (i + 1).toStr() + ", " + ivals[i] + ", " + bv + ", " + dv + ", " + nv + ", " + fv + ", " + tv + ")") }
+        if i % 4 == 0 { append(mut &nr2, "(" + (i + 100).toStr() + ", " + ivals[i] + ", " + bv + ", " + dv + ", " + nv + ", " + fv + ", " + tv + ")") }
+        if i % 10 == 3 { append(mut &nr2, "(" + (i + 200).toStr() + ", " + ivals[(i + 1) % len(ivals)] + ", " + bv + ", " + dv + ", " + nv + ", " + fv + ", " + tv + ")") }
+    }
+    let n3 = held(s, &("insert into n1 values " + strings.join(&nr1, ", ")))
+    let n4 = held(s, &("insert into n2 values " + strings.join(&nr2, ", ")))
     let an = held(s, &"analyze t")
     let an2 = held(s, &"analyze u")
 }
@@ -276,6 +298,42 @@ fn main() {
             "select n, id from k1 except all select n, id from k2 order by n, id",
             "select n from k1 except all select n from k2 order by n nulls first offset 5",
             "select n from k1 union all select n from k2 intersect all select n from k1 order by 1",
+            // keys of integers (zeros, signs, the edges of 64 bits), booleans, numerics, dates, floats, texts
+            "select i from n1 union select i from n2",
+            "select i from n1 intersect select i from n2",
+            "select i from n1 except select i from n2",
+            "select i from n2 intersect all select i from n1",
+            "select i from n1 except all select i from n2",
+            "select i from n1 union select i from n2 order by i",
+            "select b from n1 union select b from n2",
+            "select b from n1 intersect all select b from n2",
+            "select b from n1 except all select b from n2",
+            "select d from n1 union select d from n2",
+            "select d from n1 intersect all select d from n2",
+            "select nn from n1 union select nn from n2",
+            "select nn from n1 intersect all select nn from n2",
+            "select nn from n1 except all select nn from n2",
+            "select f from n1 union select f from n2",
+            "select f from n1 intersect all select f from n2",
+            "select tx from n1 union select tx from n2",
+            "select tx from n1 intersect all select tx from n2",
+            "select tx from n1 except all select tx from n2",
+            "select i, b, d, nn, f, tx from n1 union select i, b, d, nn, f, tx from n2",
+            "select i, b, d, nn, f, tx from n1 intersect select i, b, d, nn, f, tx from n2",
+            "select i, b, d, nn, f, tx from n1 except select i, b, d, nn, f, tx from n2",
+            "select i, b, d, nn, f, tx from n1 intersect all select i, b, d, nn, f, tx from n2",
+            "select i, b, d, nn, f, tx from n1 except all select i, b, d, nn, f, tx from n2",
+            "select i, b, d, nn, f, tx from n2 except all select i, b, d, nn, f, tx from n1",
+            "select i, b, tx from n1 intersect all select i, b, tx from n2 order by i desc nulls last, tx",
+            "select i, nn from n1 union select i, nn from n2 order by nn nulls first, i",
+            "select i / 2, b from n1 union select i, b from n2",
+            "select i from n1 union select cast(i as numeric(25,0)) from n2",
+            "select i from n1 intersect all select cast(i as numeric(25,0)) from n2",
+            "select i + 0 from n1 union select i * 1 from n2",
+            "select i from n1 union select 100",
+            "select 100 from n1 intersect all select i from n2",
+            "select 1.0 as a union select 1",
+            "select 1 as a intersect all select 1.0",
             // OFFSET without ORDER BY: rows skipped as they come
             "select id from t union all select id from u offset 1500",
             "select id from t union all select id from u offset 1024 limit 1024",

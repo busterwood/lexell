@@ -14583,16 +14583,20 @@ fn runSetTo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     return Ok(Unit{})
 }
 
-// One part of a set operation run for its rows: proc gets each row (a batch's
-// rows one at a time, in order) and returns false to stop. Ok(true): stopped
-// (by proc, or by the sink's refusal, which the caller tells apart). A part
-// that held its rows is given to proc here. The part runs from sh, as
-// runSetTo's do.
-fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: []Val, lim: Limits,
-           proc: &fn(&[]Val): bool, sh: mut &Share): Result[bool, DbErr] {
+// One part of a set operation run for its rows' keys: proc gets each row's
+// key (rowKeyIn's under kinds, the collations of the columns), then the
+// batch ob and the row's place j in it (ob.n > 0), or the row (ob.n 0), in
+// order, and returns false to stop. A batch's keys are made from its
+// columns (lexdb_pipe.obKey), no row made. Ok(true): stopped (by proc, or
+// by the sink's refusal, which the caller tells apart). A part that held
+// its rows is given to proc here. The part runs from sh, as runSetTo's do.
+fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: []Val, lim: Limits, kinds: &[]int,
+           proc: &fn(&str, &OutBatch, int, &[]Val): bool, sh: mut &Share): Result[bool, DbErr] {
     var asked = false
     var stopped = false
-    var one: []Val = []
+    var kb = ""
+    let noRow: []Val = []
+    let noB = noBatch()
     let r = runSelToIn(st, txn, child, &ps, lim, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
         if start {
             asked = true
@@ -14600,15 +14604,16 @@ fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: [
         }
         if stopped { return false }
         if ob.n == 0 {
-            if !proc(row) {
+            kb = rowKeyIn(row, kinds)
+            if !proc(&kb, &noB, 0, row) {
                 stopped = true
                 return false
             }
             return true
         }
         for j in 0..ob.n {
-            lexdb_pipe.obRow(ob, j, mut &one)
-            if !proc(&one) {
+            lexdb_pipe.obKey(ob, j, kinds, mut &kb)
+            if !proc(&kb, ob, j, &noRow) {
                 stopped = true
                 return false
             }
@@ -14619,7 +14624,8 @@ fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: [
         Ok(res) {
             if !asked {
                 for row in res.rows {
-                    if !proc(&row) { return Ok(true) }
+                    kb = rowKeyIn(&row, kinds)
+                    if !proc(&kb, &noB, 0, &row) { return Ok(true) }
                 }
             }
             return Ok(stopped)
@@ -14630,6 +14636,16 @@ fn setPart(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, child: &Sel, ps: [
             return Err(x)
         }
     }
+}
+
+// The row a part gave to setPart's proc (place j of the batch ob, or r),
+// given by giveSet; one holds a batch's row.
+fn giveAt(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol, g: mut &SetGive, ob: &OutBatch, j: int,
+          r: &[]Val, one: mut &[]Val): bool {
+    let noB = noBatch()
+    if ob.n == 0 { return giveSet(sink, outs, g, r, &noB) && !g.full }
+    lexdb_pipe.obRow(ob, j, one)
+    return giveSet(sink, outs, g, one, &noB) && !g.full
 }
 
 // What a distinct set operation keeps of a row's key in its sets, per key
@@ -14651,7 +14667,6 @@ const SET_KEY_BYTES = 48
 // holding the left's rows.
 fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
               sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, sh: mut &Share, g: mut &SetGive): Result[Unit, DbErr] {
-    let noB = noBatch()
     let kinds: []int = collections.copyOf(&sel.outKinds)
     let mode = sel.setop
     let all = sel.setAll
@@ -14663,11 +14678,10 @@ fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
     if mode != lexdb_sql.SET_UNION && !g.full {
         // the right part's keys (no rows given), with ALL their counts
         let rps = setParamsOf(sel, params, 1)
-        let rstop = try setPart(st, txn, &sel.parts[1], rps, lim, fn(r: &[]Val): bool {
-            let k = rowKeyIn(r, &kinds)
-            let n = rset.get(&k).unwrapOr(0)
+        let rstop = try setPart(st, txn, &sel.parts[1], rps, lim, &kinds, fn(k: &str, ob: &OutBatch, j: int, r: &[]Val): bool {
+            let n = rset.get(k).unwrapOr(0)
             if n > 0 {
-                if all { rset.put(k, n + 1) }
+                if all { rset.put(k.clone(), n + 1) }
                 return true
             }
             bytes += len(k) + SET_KEY_BYTES
@@ -14675,42 +14689,41 @@ fn runSetKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
                 over = true
                 return false
             }
-            rset.put(k, 1)
+            rset.put(k.clone(), 1)
             return true
         }, sh)
         if over { return Err(lexdb_pipe.memErr(lim.mem)) }
     }
-    let noRow: []Val = []
+    var one: []Val = []
     let sides: []int = if mode == lexdb_sql.SET_UNION { [0, 1] } else { [0] }
     for i in sides {
         if g.full { break }
         let ps = setParamsOf(sel, params, i)
         sh.held = bytes + g.srt.held()
-        let stopped = try setPart(st, txn, &sel.parts[i], ps, lim, fn(r: &[]Val): bool {
+        let stopped = try setPart(st, txn, &sel.parts[i], ps, lim, &kinds, fn(k: &str, ob: &OutBatch, j: int, r: &[]Val): bool {
             if g.full { return false }
-            let k = rowKeyIn(r, &kinds)
             if mode != lexdb_sql.SET_UNION {
-                let n = rset.get(&k).unwrapOr(0)
+                let n = rset.get(k).unwrapOr(0)
                 if all {
                     if mode == lexdb_sql.SET_INTERSECT {
                         if n <= 0 { return true }
-                        rset.put(k, n - 1)
+                        rset.put(k.clone(), n - 1)
                     } else if n > 0 {
-                        rset.put(k, n - 1)
+                        rset.put(k.clone(), n - 1)
                         return true
                     }
-                    return giveSet(sink, &sel.outs, mut &g, r, &noB) && !g.full
+                    return giveAt(sink, &sel.outs, mut &g, ob, j, r, mut &one)
                 }
                 if (mode == lexdb_sql.SET_INTERSECT) != (n > 0) { return true }
             }
-            if seen.get(&k).isSome() { return true }
+            if seen.get(k).isSome() { return true }
             bytes += len(k) + SET_KEY_BYTES
             if lim.mem > 0 && bytes > lim.mem {
                 over = true
                 return false
             }
-            seen.put(k, 1)
-            return giveSet(sink, &sel.outs, mut &g, r, &noB) && !g.full
+            seen.put(k.clone(), 1)
+            return giveAt(sink, &sel.outs, mut &g, ob, j, r, mut &one)
         }, sh)
         if over { return Err(lexdb_pipe.memErr(lim.mem)) }
         try setFailed(mut &g)
