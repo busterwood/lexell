@@ -21,6 +21,7 @@ import "./lexdb_ops"
 import "./lexdb_lib"
 import "./lexdb_like"
 import "./lexdb_rows"
+import "./lexdb_held"
 import "./lexdb_vec"
 import "./lexdb_sort"
 import "./lexdb_catalog"
@@ -1907,6 +1908,15 @@ fn inGenOf(x: &BX, kinds: &[]int, ce: &Ctx, base: int, need: &[]bool): Option[BN
 //
 // the views (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) the
 // caller's, over the groups.
+// The scan's table may be rows the run holds (PScan.held: a derived
+// table, view, CTE, VALUES, function scan or catalog relation, which the
+// caller ran first; design/lexdb-batch-gaps.md item 6): cut into batches
+// of BROWS rows by the columns' kinds (lexdb_held), or, a few of them
+// (HELD_BATCH) or where a value gives its batch up, read row by row, from
+// the batch's start, as a table's rows are. An integer generate_series the
+// first level reads is made batch by batch as it is read (Src.ser), never
+// held. The rows are the caller's, borrowed: a run that gives way as a
+// whole (batErr) leaves them for the row engine.
 // A scan whose ranges are read in batches gives chunks (a batch and the
 // rows its conditions chose); the outputs are made over the chunk and go
 // to the caller as an OutBatch. A scan of key lookups, or one the plan
@@ -1925,6 +1935,19 @@ var batchRuns: int = 0
 var sortRuns: int = 0
 
 pub fn runCounts(): []int { return [runs, batchRuns, sortRuns] }
+
+// Runs whose first table is rows the run holds (Src.held), and those read
+// in batches (the tests' look).
+var heldRuns: int = 0
+var heldBatched: int = 0
+
+pub fn heldCounts(): []int { return [heldRuns, heldBatched, lexdb_held.gaveUpCount()] }
+
+fn heldRun(src: &Src) {
+    if !src.held { return }
+    heldRuns += 1
+    if src.batch { heldBatched += 1 }
+}
 
 // A plan the pipeline runs.
 pub type Prog = record {
@@ -1951,9 +1974,18 @@ pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, le
         else { false }
     }
     let j = hasJoin(&p)
-    if j { p = lexdb_plan.needs(p, len(cols)) }
+    // (the columns a plan reads of rows the run holds only, as a join's tables')
+    if j || heldScan(&p) { p = lexdb_plan.needs(p, len(cols)) }
     let so = !g && sortArm(&p)
     return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so})
+}
+
+// Whether p's scan reads rows the run holds (PScan.held).
+fn heldScan(p: &lexdb_plan.PPlan): bool {
+    match lexdb_plan.pLeaf(p) {
+        lexdb_plan.PPlan.Scan(sc, _) { return sc.held >= 0 }
+        else { return false }
+    }
 }
 
 // p under the operators its caller runs over an aggregate's groups (the
@@ -2114,9 +2146,14 @@ fn aggRead(a: &lexdb_plan.PAgg, sc: &lexdb_plan.PScan): bool {
 
 // Whether a scan's arm is one run runs: a table's (its query's columns'
 // kinds and the table's need agree), its subqueries each run once before
-// it, their values in the run's context (Ctx.subs; not in FROM).
+// it, their values in the run's context (Ctx.subs; not in FROM, but the
+// one whose rows the scan holds: PScan.held).
 fn scanRuns(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
-    for s in subs { if s.run != lexdb_plan.RUN_ONCE || s.use == lexdb_sql.SUB_FROM { return false } }
+    for i in 0..len(subs) {
+        let s = &subs[i]
+        if s.run != lexdb_plan.RUN_ONCE { return false }
+        if s.use == lexdb_sql.SUB_FROM && i != sc.held { return false }
+    }
     return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
 }
 
@@ -2170,6 +2207,11 @@ pub type Src = record {
     pub keys: []str                 // row by row: a range's primary keys, already read (optimizer 19); [] none
     pub pts: []str                  // in batches: a primary key's points (an IN list's keys, sorted), read together; [] none
     pub multi: bool                 // in batches: a lookup list's ranges (an index's IN list, a primary key's prefixes), read together a chunk at a time
+    // the scan's rows are held by the run (PScan.held): read from the rows its
+    // caller gives (a plan's run takes them as a parameter), or, if ser.on,
+    // made as an integer series; in batches if batch (else row by row)
+    pub held: bool
+    pub ser: lexdb_held.Series
 }
 
 // Where a run of pg reads its table t, from what its caller found for the
@@ -2212,11 +2254,33 @@ fn joinSrc(p: &lexdb_plan.PPlan, k: int, t: &lexdb_catalog.Table, scans: []lexdb
 }
 
 // A Src that reads nothing (a table looked up per row).
-pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: [], pts: [], multi: false} }
+pub fn noSrc(): Src { return Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: -1, desc: false, keys: [], pts: [], multi: false, held: false, ser: lexdb_held.noSeries()} }
+
+// Held rows ahead of this many are read in batches by a plan's run; fewer
+// row by row (a batch's kernels cost more to set up than a few rows to read).
+const HELD_BATCH: int = 64
+
+// Where a run of pg reads a first table the run holds (PScan.held): rows
+// its caller gives to the run, n of them, or a series (series' arguments
+// as seriesRes gives them, its type oid, WITH ORDINALITY) made as it is
+// read. In batches from HELD_BATCH rows on.
+pub fn srcHeld(pg: &Prog, n: int, series: bool, vals: &[]Val, oid: int, ordin: bool): Result[Src, DbErr] {
+    var src = noSrc()
+    src.held = true
+    var held = n
+    if series {
+        let none: [][]Val = []
+        src.ser = lexdb_held.seriesOf(vals, oid, ordin)
+        held = lexdb_held.size(&none, &src.ser)
+    }
+    if src.ser.bad { return Err(e("XX000", "a series the pipeline does not read")) }
+    src.batch = held >= HELD_BATCH
+    return Ok(src)
+}
 
 fn srcFor(ps: &lexdb_plan.PScan, groups: bool, t: &lexdb_catalog.Table, scans: []lexdb_access.Scan, index: int, desc: bool, covers: bool, how: int,
           keys: []str): Result[Src, DbErr] {
-    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: [], pts: [], multi: false}
+    var src = Src{batch: false, scans: [], rd: lexdb_access.noIxRead(), index: index, desc: desc, keys: [], pts: [], multi: false, held: false, ser: lexdb_held.noSeries()}
     var ranges = false
     for s in scans { if !s.point && !s.empty { ranges = true } }
     src.scans = if how == 1 { [lexdb_access.wholeScan()] } else { scans }
@@ -2274,39 +2338,40 @@ fn srcFor(ps: &lexdb_plan.PScan, groups: bool, t: &lexdb_catalog.Table, scans: [
 // its counts (the scan's as EXPLAIN ANALYZE prints a table's). The rows
 // given.
 pub fn run(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-           src: &Src, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+           src: &Src, hrows: &[][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     runs += 1
     if src.batch { batchRuns += 1 }
+    heldRun(src)
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     if pg.sorts {
         // its rows held by the Sort or Distinct, then given (slice P3)
         var sr = SortRun{st: [sortRun(&pg.plan, cap, bud)]}
-        let got = try runOp(st, txn, projUnder(&pg.plan), cols, t, src, cx, -1, bud, cnt, mut &sr, give)
+        let got = try runOp(st, txn, projUnder(&pg.plan), cols, t, src, hrows, cx, -1, bud, cnt, mut &sr, give)
         sortRuns += 1
         return sr.st[0].finish(txn, bud, give)
     }
     var none = noSortRun()
-    return runOp(st, txn, &pg.plan, cols, t, src, cx, cap, bud, cnt, mut &none, give)
+    return runOp(st, txn, &pg.plan, cols, t, src, hrows, cx, cap, bud, cnt, mut &none, give)
 }
 
 // Runs p (Limit, the scan's Sort, Project): at most lim rows (-1 no limit).
 fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-         src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts, srt: mut &SortRun,
+         src: &Src, hrows: &[][]Val, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts, srt: mut &SortRun,
          give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, srt, give) }
-        lexdb_plan.PPlan.Sort(i, _, _) { return runOp(st, txn, &i, cols, t, src, cx, lim, bud, cnt, srt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, srt, give) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, lim, bud, cnt, srt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
             match j {
                 lexdb_plan.PPlan.Filter(k, cs) {
                     match k {
-                        lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &cs, &xs, cols, t, src, cx, lim, bud, cnt, srt, give) }
+                        lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &cs, &xs, cols, t, src, hrows, cx, lim, bud, cnt, srt, give) }
                         else {}
                     }
                 }
-                lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &none, &xs, cols, t, src, cx, lim, bud, cnt, srt, give) }
+                lexdb_plan.PPlan.Scan(sc, _) { return runScan(st, txn, &sc, &none, &xs, cols, t, src, hrows, cx, lim, bud, cnt, srt, give) }
                 else {}
             }
         }
@@ -2319,7 +2384,7 @@ fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan
 // no limit). cnt[0]: the scan's counts (its filter's rows as joined);
 // the last: the rows given.
 fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX,
-           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
            srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     let last = len(cnt) - 1
@@ -2329,10 +2394,16 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     var need: []bool = []
     if sc.part { for x in sc.need { append(mut &need, x) } }
     var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
+    // (rows the run holds, a few: row by row)
+    if src.held && !src.batch {
+        var pos = lexdb_held.newPos()
+        try rowsHeld(txn, hrows, &src.ser, mut &pos, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
+        return Ok(sr.n)
+    }
     // (points only: read row by row, unless they are a batch's point list)
     var ranges = false
     for s in src.scans { if !s.point && !s.empty { ranges = true } }
-    if !src.batch || (!ranges && len(src.pts) == 0) {
+    if !src.held && (!src.batch || (!ranges && len(src.pts) == 0)) {
         if len(src.keys) > 0 {
             // the range's primary keys, already read: its rows, one by one
             let rr = lexdb_access.rowRead(&rel, &need)
@@ -2383,34 +2454,40 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     }
     let needP = lexdb_access.placesNeeded(&rel, &need)
     var bp = lexdb_rows.projectionOf(kinds, collections.copyOf(&sc.need), &t.slots, lexdb_catalog.rowWidth(t), lexdb_access.placesMissing(&rel), needP)
-    bp.ranges = cRanges(&cn, &bp.kinds, t)
+    if !src.held { bp.ranges = cRanges(&cn, &bp.kinds, t) }
     // a top-N's first key an integer column of the table: that column
     // decoded first, with the conditions', and a row it puts after the
-    // heap's last dropped before the rest are decoded (9.108)
+    // heap's last dropped before the rest are decoded (9.108); not of rows
+    // the run holds (no decoding to save)
     var barCol = -1
-    if len(srt.st) > 0 && srt.st[0].topK > 0 && len(srt.st[0].keyCol) > 0 {
+    if !src.held && len(srt.st) > 0 && srt.st[0].topK > 0 && len(srt.st[0].keyCol) > 0 {
         let kc = srt.st[0].keyCol[0]
         if isIntKind(okinds[kc]) && osrc[kc] >= 0 { barCol = osrc[kc] }
     }
+    let hmode = src.held
     let lazy = lazyOf(&bp, t, &cn, barCol)
     let no = len(nodes)
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
     // a point list (src.pts) is one pass over its keys, read together; else
-    // one pass per scan
+    // one pass per scan (the rows the run holds: one pass over them)
     let pmode = len(src.pts) > 0
     let mmode = src.multi
     // (the rows a chunk of a lookup list may hold: what the statement's
     // memory leaves)
     let room = if bud.maxHeld > 0 { bud.maxHeld - bud.held - bud.aside } else { -1 }
-    for pi in 0..(if pmode || mmode { 1 } else { len(src.scans) }) {
-        let s = if pmode || mmode { lexdb_access.noScan() } else { src.scans[pi].copy() }
+    for pi in 0..(if pmode || mmode || hmode { 1 } else { len(src.scans) }) {
+        let s = if pmode || mmode || hmode { lexdb_access.noScan() } else { src.scans[pi].copy() }
         var cur = lexdb_access.newCursor()
+        var pos = lexdb_held.newPos()
         var rowPath = false
         var spare = lexdb_rows.noRows()            // the last batch, used again (bReuse)
-        while !cur.done {
+        while !(if hmode { pos.done } else { cur.done }) {
             let saved = cur.copy()
+            let psaved = pos.copy()
             let bar = if barCol >= 0 { srt.st[0].bar(barCol) } else { lexdb_access.noBar() }
-            let got = if pmode {
+            let got = if hmode {
+                heldPick(hrows, &src.ser, mut &pos, &bp, &cn, mut &spare)
+            } else if pmode {
                 try pointsPick(st, txn, &rel, &src.pts, sc.part, mut &cur, &bp, &cn)
             } else if mmode {
                 try rangesPick(st, txn, &rel, src.index, &src.scans, src.desc, sc.part, mut &cur, &bp, &cn, room, sc.stops)
@@ -2423,6 +2500,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
                 // a value a batch cannot hold, or a condition's error on one
                 // of its rows: row by row from its start
                 cur = saved
+                pos = psaved
                 rowPath = true
                 break
             }
@@ -2451,6 +2529,7 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             }
             if failed {
                 cur = saved
+                pos = psaved
                 rowPath = true
                 break
             }
@@ -2479,7 +2558,11 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             spare = b
             if lim >= 0 && sr.n >= lim { return Ok(sr.n) }
         }
-        if rowPath && (pmode || mmode) {
+        if rowPath && hmode {
+            // the rows from the batch's start on, row by row
+            try rowsHeld(txn, hrows, &src.ser, mut &pos, sc, conds, xs, cx, lim, bud, cnt, srt, give, mut &sr)
+            if sr.stop { return Ok(sr.n) }
+        } else if rowPath && (pmode || mmode) {
             // the points (or ranges) from the batch's start on, row by row
             let start = if pmode { cur.resumeAt(&src.pts) } else { cur.pos }
             for k in start..len(src.scans) {
@@ -2494,6 +2577,38 @@ fn runScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         }
     }
     return Ok(sr.n)
+}
+
+// The next batch of rows the run holds from pos (lexdb_held.fill), through
+// the conditions cn. None: as pointsPick's.
+fn heldPick(hrows: &[][]Val, ser: &lexdb_held.Series, pos: mut &lexdb_held.HPos, bp: &lexdb_rows.Projection, cn: &[]BNode,
+            spare: mut &Batch): Option[lexdb_access.Picked] {
+    match lexdb_held.fill(hrows, ser, pos, bp, spare) {
+        Some(b0) {
+            var b = b0
+            var all: []int = withCapacity(b.n)
+            for r in 0..b.n { append(mut &all, r) }
+            let none: []bool = []
+            match bNarrow(cn, &none, &b, all) {
+                Some(idx) { return Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: b}) }
+                None { return None }
+            }
+        }
+        None { return None }
+    }
+}
+
+// The rows the run holds from pos on, one by one (the scan's row by row: a
+// few rows, or a batch that gave way).
+fn rowsHeld(txn: mut &lexdb_store.Txn, hrows: &[][]Val, ser: &lexdb_held.Series, pos: mut &lexdb_held.HPos, sc: &lexdb_plan.PScan, conds: &[]BX,
+            xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts, srt: mut &SortRun,
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+    while lexdb_held.next(hrows, ser, pos, mut &sr.row, sc.first) {
+        try bud.tick()
+        try scanRow(txn, sc, conds, xs, cx, lim, cnt, srt, give, sr)
+        if sr.stop { return Ok(Unit{}) }
+    }
+    return Ok(Unit{})
 }
 
 // The next batch of a point list (src.pts, sorted keys) read together by
@@ -2570,6 +2685,12 @@ fn oneRow(txn: mut &lexdb_store.Txn, r: mut &[]Val, sc: &lexdb_plan.PScan, conds
           cnt: mut &[]Counts, srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
     try bud.tick()
     for i in 0..len(r) { sr.row[sc.first + i] = replace(mut &r[i], Val.Null) }
+    return scanRow(txn, sc, conds, xs, cx, lim, cnt, srt, give, sr)
+}
+
+// oneRow's row in place (sr.row, the table's columns set), past its tick.
+fn scanRow(txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int,
+           cnt: mut &[]Counts, srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
     cnt[0].read += 1
     let noAggs: []Val = []
     for c in conds { if lexdb_ops.truth(&(try bxEval(&c, &sr.row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
@@ -2630,9 +2751,10 @@ fn noAcc(): PAcc { return PAcc{n: 0, sum: Val.Null, val: Val.Null} }
 // hold (-1 no limit), counted as the row engine and the batch driver
 // counted them; past it max_statement_mem's error. The bytes counted.
 pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-              src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+              src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
               give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     runs += 1
+    heldRun(src)
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     let none: []BX = []
     match underViews(&pg.plan) {
@@ -2642,11 +2764,11 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                     match i {
                         lexdb_plan.PPlan.Filter(j, cs) {
                             match j {
-                                lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &cs, &a, cols, t, src, cx, room, bud, cnt, give) }
+                                lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &cs, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
                                 else {}
                             }
                         }
-                        lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, cx, room, bud, cnt, give) }
+                        lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
                         else {}
                     }
                 }
@@ -2660,7 +2782,7 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
 
 // The aggregate a over scan sc filtered by conds: units, values, rows.
 fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
-          cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+          cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
           give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the counts so far: each try counts from the start again
     let c0 = cnt[0]
@@ -2668,7 +2790,7 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
         batchRuns += 1
         var usedDec = false
         var values = false
-        match aggBatches(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give, true, mut &usedDec) {
+        match aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give, true, mut &usedDec) {
             Ok(x) {
                 match x {
                     Some(n) { return Ok(n) }
@@ -2687,20 +2809,20 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
         }
         if values {
             var none = false
-            match try aggBatches(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give, false, mut &none) {
+            match try aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give, false, mut &none) {
                 Some(n) { return Ok(n) }
                 None { cnt[0] = c0 }
             }
         }
     }
-    return aggRows(st, txn, sc, conds, a, cols, t, src, cx, room, bud, cnt, give)
+    return aggRows(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give)
 }
 
 // The aggregate over the scan's batches; dec: numeric(p, s) columns as
 // units (usedDec set when one is read so). None: the batches give way
 // (nothing given).
 fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
-              cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+              cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
               give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr], dec: bool, usedDec: mut &bool): Result[Option[int], DbErr] {
     let rel = lexdb_catalog.relOf(t)
     // the table's columns' kinds (the query's: they are its only ones)
@@ -2731,7 +2853,7 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     // over presorted input, nodeAgg.c), so a row is in the group before it
     // or starts one; no map of the groups. (q18's subquery: lineitem by
     // l_orderkey.)
-    if ag.oneKey && src.index < 0 && !src.desc && len(src.scans) == 1 && len(t.pk) > 0 {
+    if !src.held && ag.oneKey && src.index < 0 && !src.desc && len(src.scans) == 1 && len(t.pk) > 0 {
         match ag.keys[0].n {
             BNode.Col(c) { ag.sorted = c == t.pk[0] }
             else {}
@@ -2740,11 +2862,16 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     var nRead = 0
     var nJoined = 0
     var nBatches = 0
-    for sj in 0..len(src.scans) {
+    // (rows the run holds: one pass over them, in place of the scans)
+    let held = src.held
+    for sj in 0..(if held { 1 } else { len(src.scans) }) {
         var cur = lexdb_access.newCursor()
+        var hpos = lexdb_held.newPos()
         var spare = lexdb_rows.noRows()            // the last batch read, used again (lexdb_rows.reuse)
-        while !cur.done {
-            let got = try lexdb_access.fillLevel(st, txn, &rel, &src.rd, &src.scans[sj], sc.part, mut &cur, &bp, mut &spare)
+        while !(if held { hpos.done } else { cur.done }) {
+            let got = if held { lexdb_held.fill(hrows, &src.ser, mut &hpos, &bp, mut &spare) } else {
+                try lexdb_access.fillLevel(st, txn, &rel, &src.rd, &src.scans[sj], sc.part, mut &cur, &bp, mut &spare)
+            }
             if got.isNone() { return Ok(None) }
             var b = got.unwrap()
             let nr = b.n
@@ -3174,7 +3301,7 @@ type RowGroups = record {
 // batchLevel), each row it keeps grouped and accumulated by the scalar
 // evaluator.
 fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
-           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
            give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the scan's outputs: its columns decoded, at their slots
     var xs: []BX = []
@@ -3189,7 +3316,28 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     let maxHeld = bud.maxHeld
     var vals: []Val = []
     var noSort = noSortRun()
-    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, cx, -1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+    if src.held && !src.batch {
+        // a few rows the run holds: each straight into the groups' row
+        var pos = lexdb_held.newPos()
+        let noAggs: []Val = []
+        cnt[0].starts += 1
+        while lexdb_held.next(hrows, &src.ser, mut &pos, mut &rg.row, sc.first) {
+            try bud.tick()
+            cnt[0].read += 1
+            var pass = true
+            for c in conds {
+                if lexdb_ops.truth(&(try bxEval(&c, &rg.row, &noAggs, cx))) != Some(true) {
+                    pass = false
+                    break
+                }
+            }
+            if !pass { continue }
+            cnt[0].joined += 1
+            try groupRow(mut &rg, a, cx, room, maxHeld)
+        }
+        return aggGive(mut &rg, a, give)
+    }
+    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, hrows, cx, -1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
         if ob.n == 0 {
             for k in 0..len(slots) { rg.row[slots[k]] = r[k].clone() }
             try groupRow(mut &rg, a, cx, room, maxHeld)
@@ -3202,6 +3350,12 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         }
         return Ok(true)
     })
+    return aggGive(mut &rg, a, give)
+}
+
+// A row-by-row aggregate's groups given, each with its calls' states; the
+// bytes counted.
+fn aggGive(rg: mut &RowGroups, a: &lexdb_plan.PAgg, give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     let ns = len(a.calls)
     let ng = len(rg.firsts)
     var accs: []PAcc = []
@@ -5410,7 +5564,8 @@ pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
                  src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                  give: &fn(&[]Val, &[]PAcc): Result[Unit, DbErr]): Result[int, DbErr] {
     if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give) }
-    return runAgg(st, txn, pg, cols, t, src, cx, room, bud, cnt, give)
+    let none: [][]Val = []
+    return runAgg(st, txn, pg, cols, t, src, if len(vrows) > 0 { &vrows[0] } else { &none }, cx, room, bud, cnt, give)
 }
 
 // Runs an aggregate over joins (pg.groups, pg.joins: Agg (joins) under

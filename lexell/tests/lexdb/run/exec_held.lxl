@@ -1,0 +1,439 @@
+// lexdb_exec, lexdb_pipe and lexdb_held: a derived table, view, CTE, VALUES,
+// function scan (generate_series, unnest) or catalog relation as the first
+// table of a SELECT, read by the pipeline from the rows the run holds, cut
+// into batches (design/lexdb-batch-gaps.md item 6; constructs F10-F16, F19,
+// F20), against the row engine (SET lexdb_batch = off). Each query runs both
+// ways: the same rows in the same order, or the same error; and with
+// batches on it counts the runs whose first table was held rows
+// (lexdb_pipe.heldCounts) and those read in batches.
+// - views, CTEs used once, derived tables, VALUES, a derived table over
+//   generate_series, over unnest: each of 1,023, 1,024, 1,025 and 3,000
+//   rows, with a filter, a plain and a grouped aggregate, a top-N and an
+//   offset, a sort, DISTINCT, an inner join, an aggregate over a join and
+//   a LEFT JOIN, and a division by zero in the second batch;
+// - generate_series and unnest as the first table itself (the series made as
+//   it is read): both directions, a step, empty, NULL, WITH ORDINALITY,
+//   smallint, integer and bigint ends;
+// - a catalog relation of more than a batch (pg_attribute);
+// - a CTE read twice (a join of it with itself, its parts of a UNION), and
+//   a volatile one (nextval, random) giving one value per statement, also
+//   where the pipeline gives way (a sort of a column of mixed kinds);
+// - few rows (below a batch: read row by row), parameters (a plan kept and
+//   run with other values), a transaction's own writes, max_statement_mem,
+//   and shapes the pipeline does not take (LATERAL, a correlated output,
+//   DISTINCT ON, WITH TIES, a window, a recursive CTE's working table);
+// - texts, NULLs, numerics of mixed scales in one VALUES column, numerics as
+//   units, columns holding values of another kind than their type (a UNION
+//   typed by its first branch, a catalog's text-typed numbers): the batch
+//   gives way to row by row ("gave way"), the third batch too after two
+//   were given; an error (a cast) in a later batch, before and past a LIMIT.
+// "held": runs whose first table was held rows; "batched": those read in
+// batches.
+// timeout: 120
+// expect: views: 56 queries, 56 the same, 44 held, 44 batched, 0 gave way
+// expect: ctes: 56 queries, 56 the same, 44 held, 44 batched, 0 gave way
+// expect: derived tables: 56 queries, 56 the same, 44 held, 44 batched, 0 gave way
+// expect: values: 56 queries, 56 the same, 44 held, 44 batched, 0 gave way
+// expect: derived tables over generate_series: 56 queries, 56 the same, 56 held, 56 batched, 0 gave way
+// expect: derived tables over unnest: 56 queries, 56 the same, 56 held, 56 batched, 0 gave way
+// expect: generate_series: 40 queries, 40 the same, 32 held, 30 batched, 0 gave way
+// expect: unnest: 19 queries, 19 the same, 15 held, 15 batched, 0 gave way
+// expect: catalog: 6 queries, 6 the same, 5 held, 5 batched, 1 gave way
+// expect: ctes used twice: 16 queries, 16 the same, 4 held, 4 batched, 0 gave way
+// expect: small: 14 queries, 14 the same, 13 held, 1 batched, 0 gave way, 1 returned nothing
+// expect: refused: 6 queries, 6 the same, 0 held, 0 batched, 0 gave way
+// expect: parameters, transactions and memory: 18 queries, 18 the same, 16 held, 15 batched, 0 gave way
+// expect: mixed: 28 queries, 28 the same, 27 held, 27 batched, 9 gave way
+// expect: errors: 12 queries, 12 the same, 9 held, 9 batched, 0 gave way
+// expect: errors seen: ERROR 22P02 | ERROR 22P02 | ERROR 22P02 | ERROR 22P02 | ERROR 22P02 | rows
+// expect: memory: ERROR 53200
+// expect: volatile ctes: t|1 | 1100|1100 | last 1101 | 1100|1100 | 1 | 2000|1|2000 | last 2000
+// expect: volatile ctes after a sort: 300|2001 | last 2300
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_base"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// What a group of queries did: how many, how many gave the same both ways,
+// how many had the held rows as the first table of a run, how many read them
+// in batches.
+type Group = record { n: int; same: int; held: int; batched: int; gave: int; empty: int; seen: []str }
+
+fn newGroup(): Group { return Group{n: 0, same: 0, held: 0, batched: 0, gave: 0, empty: 0, seen: []} }
+
+// sql with batches off (the row engine, the reference) and on.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let h0 = lexdb_pipe.heldCounts()
+    let on = q(s, sql)
+    let h1 = lexdb_pipe.heldCounts()
+    g.n += 1
+    if len(on) == 0 { g.empty += 1 }
+    if off == on {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + strings.substr(&off, 0, min(len(off), 200)) + "\n  on:  " + strings.substr(&on, 0, min(len(on), 200)))
+    }
+    if h1[0] > h0[0] { g.held += 1 }
+    if h1[1] > h0[1] { g.batched += 1 }
+    if h1[2] > h0[2] { g.gave += 1 }
+}
+
+// check of a statement with parameters, its plan kept in pc (run with each
+// value), against the row engine's one-shot plan.
+fn checkP(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache) {
+    let stmts = lexdb_parse.parse(sql).unwrap()
+    let nt: []int = []
+    let a = q(s, &"set lexdb_batch = off")
+    var po = lexdb_exec.oneShot()
+    let off = rowsOf(s.runCached(&stmts[0], params, &nt, mut &po))
+    let b = q(s, &"set lexdb_batch = on")
+    let h0 = lexdb_pipe.heldCounts()
+    let on = rowsOf(s.runCached(&stmts[0], params, &nt, pc))
+    let h1 = lexdb_pipe.heldCounts()
+    g.n += 1
+    if len(on) == 0 { g.empty += 1 }
+    if off == on {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + off + "\n  on:  " + on)
+    }
+    if h1[0] > h0[0] { g.held += 1 }
+    if h1[1] > h0[1] { g.batched += 1 }
+    if h1[2] > h0[2] { g.gave += 1 }
+}
+
+fn rowsOf(r: Result[lexdb_exec.Res, lexdb_base.DbErr]): str {
+    match r {
+        Ok(res) {
+            var out: []str = []
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn report(label: &str, g: &Group) {
+    println(label + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, " + g.held.toStr() + " held, " + g.batched.toStr() + " batched, " + g.gave.toStr() + " gave way" + (if g.empty > 0 { ", " + g.empty.toStr() + " returned nothing" } else { "" }))
+    for x in g.seen { println(x) }
+}
+
+// The rows of a source, its columns id, g, x (NULL every seventh), w, as
+// the queries below read them (alias s).
+fn valuesOf(n: int): str {
+    var rows: []str = []
+    for i in 1..n + 1 {
+        let x = if i % 7 == 0 { "null" } else { (i % 101).toStr() }
+        let w = if i % 29 == 0 { "null" } else if i % 31 == 0 { "''" } else if i % 37 == 0 { "'café ''q'''" } else { "'w" + (i % 13).toStr() + "'" }
+        append(mut &rows, "(" + i.toStr() + ", " + (i % 10).toStr() + ", " + x + ", " + w + ")")
+    }
+    return "(values " + strings.join(&rows, ", ") + ") s(id, g, x, w)"
+}
+
+// The same shapes over a source: pre (a WITH) and from (its alias s).
+fn shapes(pre: &str, from: &str, n: int): []str {
+    let f = pre + "select "
+    let src = " from " + from
+    var out: []str = []
+    append(mut &out, f + "s.id, s.x + 1, s.w" + src + " where s.x > 50 and s.g <> 3")
+    append(mut &out, f + "count(*), count(s.x), sum(s.x), min(s.w), max(s.id), avg(s.x)" + src)
+    append(mut &out, f + "s.g, count(*), sum(s.x), min(s.w)" + src + " where s.id % 3 = 0 group by s.g")
+    append(mut &out, f + "s.w, count(*), max(s.x)" + src + " group by s.w order by s.w")
+    append(mut &out, f + "s.id, s.w" + src + " where s.x is not null order by s.x desc, s.id limit 7")
+    append(mut &out, f + "s.id" + src + " order by s.w, s.id desc limit 10 offset 100")
+    append(mut &out, f + "s.w, s.id" + src + " where s.g = 2 order by s.w desc, s.id")
+    append(mut &out, f + "distinct s.g, s.w" + src + " where s.x < 30")
+    append(mut &out, f + "distinct s.w" + src + " order by s.w")
+    append(mut &out, f + "s.id, t.w" + src + " join t on t.id = s.id where s.g = 4 and t.x > 10")
+    append(mut &out, f + "count(*), sum(t.x)" + src + " join t on t.id = s.id + 1")
+    append(mut &out, f + "count(*), count(t.id)" + src + " left join t on t.id = s.id * 2")
+    append(mut &out, f + "s.id, s.w" + src + " where s.g = 1 limit 5")
+    append(mut &out, f + "1 / (s.id - 1025)" + src + " where s.g < 5 or s.id = 1025")
+    return out
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(67), lexdb_store.Options{cacheBytes: 8 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table t (id int primary key, g int, x int, w text)")
+        let i1 = q(mut &s, &"insert into t select i, i % 10, case when i % 7 = 0 then null else i % 101 end, case when i % 29 = 0 then null when i % 31 = 0 then '' when i % 37 = 0 then 'café ''q''' else 'w' || (i % 13) end from generate_series(1, 3000) i")
+        let sizes = [1023, 1024, 1025, 3000]
+        for n in sizes {
+            let cv = q(mut &s, &("create view v" + n.toStr() + " as select id, g, x, w from t where id <= " + n.toStr()))
+        }
+        let sq = q(mut &s, &"create sequence sq")
+        let sq2 = q(mut &s, &"create sequence sq2")
+
+        var gv = newGroup()
+        var gc = newGroup()
+        var gd = newGroup()
+        var gl = newGroup()
+        var gs = newGroup()
+        var gu = newGroup()
+        for n in sizes {
+            let ns = n.toStr()
+            for sql in shapes("", "v" + ns + " s", n) { check(mut &s, mut &gv, &sql) }
+            for sql in shapes("with s as (select id, g, x, w from t where id <= " + ns + ") ", "s", n) { check(mut &s, mut &gc, &sql) }
+            for sql in shapes("", "(select id, g, x, w from t where id <= " + ns + ") s", n) { check(mut &s, mut &gd, &sql) }
+            for sql in shapes("", valuesOf(n), n) { check(mut &s, mut &gl, &sql) }
+            let ser = "(select i as id, i % 10 as g, case when i % 7 = 0 then null else i % 101 end as x, " +
+                      "case when i % 29 = 0 then null when i % 31 = 0 then '' when i % 37 = 0 then 'café ''q''' else 'w' || (i % 13) end as w from generate_series(1, " + ns + ") i) s"
+            for sql in shapes("", ser, n) { check(mut &s, mut &gs, &sql) }
+            let un = "(select u as id, u % 10 as g, case when u % 7 = 0 then null else u % 101 end as x, " +
+                     "case when u % 29 = 0 then null when u % 31 = 0 then '' when u % 37 = 0 then 'café ''q''' else 'w' || (u % 13) end as w " +
+                     "from unnest((select array_agg(id order by id) from t where id <= " + ns + ")) u) s"
+            for sql in shapes("", un, n) { check(mut &s, mut &gu, &sql) }
+        }
+        report("views", &gv)
+        report("ctes", &gc)
+        report("derived tables", &gd)
+        report("values", &gl)
+        report("derived tables over generate_series", &gs)
+        report("derived tables over unnest", &gu)
+
+        // the functions as the first table: the series made as it is read
+        var gg = newGroup()
+        for n in sizes {
+            let ns = n.toStr()
+            let f = "generate_series(1, " + ns + ") g(id)"
+            check(mut &s, mut &gg, &("select id, id * 2 from " + f + " where id % 7 = 3"))
+            check(mut &s, mut &gg, &("select count(*), sum(id), min(id), max(id) from " + f + " where id % 3 = 0"))
+            check(mut &s, mut &gg, &("select id % 10, count(*) from " + f + " group by id % 10"))
+            check(mut &s, mut &gg, &("select id from " + f + " order by id desc limit 5"))
+            check(mut &s, mut &gg, &("select distinct id % 17 from " + f))
+            check(mut &s, mut &gg, &("select g.id, t.w from " + f + " join t on t.id = g.id where t.g = 3"))
+            check(mut &s, mut &gg, &("select count(*) from " + f + " left join t on t.id = g.id * 2"))
+        }
+        check(mut &s, mut &gg, &"select id, n from generate_series(1, 2500) with ordinality as g(id, n) where n % 500 = 0")
+        check(mut &s, mut &gg, &"select count(*), sum(id) from generate_series(3000, 1, -1) g(id)")
+        check(mut &s, mut &gg, &"select id from generate_series(1, 5000, 7) g(id) where id > 4000 order by id desc limit 4")
+        check(mut &s, mut &gg, &"select count(*) from generate_series(5, 1) g(id)")
+        check(mut &s, mut &gg, &"select count(*) from generate_series(1, null) g(id)")
+        check(mut &s, mut &gg, &"select count(*), sum(id) from generate_series(1::bigint, 2000::bigint) g(id)")
+        check(mut &s, mut &gg, &"select count(*), sum(id) from generate_series(1::smallint, 2000::smallint) g(id)")
+        check(mut &s, mut &gg, &"select id from generate_series(2147483000, 2147483647) g(id) where id > 2147483640 order by id")
+        check(mut &s, mut &gg, &"select count(*), max(id) from generate_series(9223372036854774000, 9223372036854775807) g(id)")
+        check(mut &s, mut &gg, &"select count(*), max(id) from generate_series(32000::smallint, 32767::smallint) g(id)")
+        check(mut &s, mut &gg, &"select count(*), min(id) from generate_series(-2147483648, -2147483000) g(id)")
+        check(mut &s, mut &gg, &"select count(*) from generate_series(1, 3000) g(id) where 1000 / (id - 2900) > 0")
+        report("generate_series", &gg)
+        var gn = newGroup()
+        for n in sizes {
+            let u = "unnest((select array_agg(id order by id) from t where id <= " + n.toStr() + ")) u(id)"
+            check(mut &s, mut &gn, &("select id, id + 1 from " + u + " where id % 11 = 0"))
+            check(mut &s, mut &gn, &("select count(*), sum(id), max(id) from " + u))
+            check(mut &s, mut &gn, &("select id from " + u + " order by id desc limit 3"))
+            check(mut &s, mut &gn, &("select u.id, t.w from " + u + " join t on t.id = u.id where t.g = 7"))
+        }
+        check(mut &s, mut &gn, &"select u.x, u.n from unnest((select array_agg(w order by id) from t where id <= 2000)) with ordinality as u(x, n) where n % 400 = 0")
+        check(mut &s, mut &gn, &"select count(*), count(x), min(x) from unnest((select array_agg(w order by id) from t where id <= 1500)) as u(x)")
+        check(mut &s, mut &gn, &"select distinct x from unnest((select array_agg(w order by id) from t where id <= 1500)) as u(x) order by x")
+        report("unnest", &gn)
+
+        // a catalog relation of more than a batch: 40 tables of 30 columns
+        for k in 0..40 {
+            var cols: []str = []
+            for j in 0..30 { append(mut &cols, "c" + j.toStr() + " int") }
+            let ct = q(mut &s, &("create table wide" + k.toStr() + " (" + strings.join(&cols, ", ") + ")"))
+        }
+        var gk = newGroup()
+        check(mut &s, mut &gk, &"select count(*), min(attnum), max(attnum) from pg_attribute where attnum > 0")
+        check(mut &s, mut &gk, &"select attname, attnum from pg_attribute where attnum = 7 and attname like 'c%' order by attrelid limit 5")
+        check(mut &s, mut &gk, &"select distinct attname from pg_attribute where attnum < 4 and attname like 'c%' order by attname")
+        check(mut &s, mut &gk, &"select attnum, count(*) from pg_attribute where attname like 'c1%' group by attnum order by attnum")
+        check(mut &s, mut &gk, &"select c.relname, count(*) from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname like 'wide1%' group by c.relname order by 2 desc, 1 limit 5")
+        check(mut &s, mut &gk, &"select count(*) from information_schema.columns where table_name like 'wide%'")
+        report("catalog", &gk)
+
+        // a CTE read twice: its rows run once and shared
+        var g2 = newGroup()
+        for n in [1025, 3000] {
+            let w = "with c as (select id, g, x, w from t where id <= " + n.toStr() + ") "
+            check(mut &s, mut &g2, &(w + "select count(*), sum(b.x) from c a join c b on b.id = a.id + 1"))
+            check(mut &s, mut &g2, &(w + "select a.id, b.w from c a join c b on b.id = a.id * 2 where a.g = 3 order by a.id limit 20"))
+            check(mut &s, mut &g2, &(w + "select id from c where g = 1 union all select id from c where g = 2"))
+            check(mut &s, mut &g2, &(w + "select count(*) from c where g < 5 and id in (select id from c where x > 50)"))
+            check(mut &s, mut &g2, &(w + "select g, count(*) from c where x > (select avg(x) from c) group by g order by g"))
+            check(mut &s, mut &g2, &(w + "select a.g, count(*), sum(b.x) from c a left join c b on b.id = a.id - 1 and b.x > 50 group by a.g order by a.g"))
+            check(mut &s, mut &g2, &(w + "select distinct a.w from c a join c b on b.id = a.id and b.g = 0 order by a.w"))
+            check(mut &s, mut &g2, &(w + "select count(*) from c a, c b where a.id = b.id and a.x = b.x"))
+        }
+        report("ctes used twice", &g2)
+
+        // few rows: row by row (below the batch threshold), the same
+        var g3 = newGroup()
+        check(mut &s, mut &g3, &"select * from (values (1, 'a'), (2, null), (3, 'c')) v(a, b) where a > 1")
+        check(mut &s, mut &g3, &"select count(*), sum(a), min(b) from (values (1, 'a'), (2, null), (3, 'c')) v(a, b)")
+        check(mut &s, mut &g3, &"select b, a from (values (1, 'a'), (2, null), (3, 'c')) v(a, b) order by b desc nulls last, a limit 2")
+        check(mut &s, mut &g3, &"select distinct b from (values (1, 'a'), (2, 'a'), (3, 'c')) v(a, b)")
+        check(mut &s, mut &g3, &"select v.a, t.w from (values (1), (5), (9)) v(a) join t on t.id = v.a")
+        check(mut &s, mut &g3, &"select relname from pg_class where relname = 'wide3'")
+        check(mut &s, mut &g3, &"select count(*) from generate_series(1, 20) g where g % 2 = 0")
+        check(mut &s, mut &g3, &"select * from unnest(array[3, 1, 2]) u(x) order by x")
+        check(mut &s, mut &g3, &"with c as (select id, x from t where id < 10) select count(*), sum(x) from c")
+        check(mut &s, mut &g3, &"select * from (select id, w from t where id < 5) d where id > 2")
+        check(mut &s, mut &g3, &"select count(*) from (values (1)) v(a) where a > 5")
+        check(mut &s, mut &g3, &"select 1 / (a - 2) from (values (1), (2), (3)) v(a)")
+        check(mut &s, mut &g3, &"select a from (select 1 as a union all select 2) v where a = 5")
+        check(mut &s, mut &g3, &"select a, count(*) from (values (1), (1), (2)) v(a) group by a having count(*) > 1")
+        report("small", &g3)
+
+        // shapes the pipeline does not take with held rows first (LATERAL, a
+        // correlated output, DISTINCT ON, WITH TIES, a window, a lock): the row engine
+        var gx = newGroup()
+        check(mut &s, mut &gx, &"select s.id, l.n from v1025 s, lateral (select count(*) n from t where t.g = s.g and t.id < 100) l where s.id < 50")
+        check(mut &s, mut &gx, &"select s.id, (select count(*) from t where t.g = s.g) from v1025 s where s.id < 30")
+        check(mut &s, mut &gx, &"select distinct on (s.g) s.g, s.id from v1025 s order by s.g, s.id desc")
+        check(mut &s, mut &gx, &"select s.id, s.x from v1025 s order by s.x desc fetch first 5 rows with ties")
+        check(mut &s, mut &gx, &"select s.id, row_number() over (partition by s.g order by s.id) from v1025 s where s.id < 12 order by 1")
+        check(mut &s, mut &gx, &"with recursive r(n) as (select 1 union all select n + 1 from r where n < 1500) select count(*), sum(n) from r where n % 2 = 0")
+        report("refused", &gx)
+
+        // parameters (a prepared plan run again with others), a transaction's
+        // own writes, and max_statement_mem
+        var gp = newGroup()
+        var pc1 = lexdb_exec.newPlanCache()
+        var pc2 = lexdb_exec.newPlanCache()
+        var pc3 = lexdb_exec.newPlanCache()
+        for v in [50, 90, 100, 200] {
+            checkP(mut &s, mut &gp, &"select count(*), sum(s.x), min(s.w) from v1025 s where s.x > $1 and s.id % $2 = 0", &[lexdb_sql.Val.Int(v), lexdb_sql.Val.Int(3)], mut &pc1)
+            checkP(mut &s, mut &gp, &"select s.g, count(*) from (select id, g, x from t where id <= 3000) s where s.x < $1 group by s.g order by s.g", &[lexdb_sql.Val.Int(v)], mut &pc2)
+            checkP(mut &s, mut &gp, &"with c as (select id, x from t where id <= 1100) select c.id from c where c.x = $1 order by c.id limit 4", &[lexdb_sql.Val.Int(v / 2)], mut &pc3)
+        }
+        check(mut &s, mut &gp, &"begin; update t set x = 1000 where id = 5; select count(*), max(s.x) from v1025 s where s.x >= 100; rollback")
+        check(mut &s, mut &gp, &"begin; insert into t values (5000, 1, 7, 'new'); select s.id, s.w from (select id, w from t where id > 2999) s order by s.id; rollback")
+        let mm1 = q(mut &s, &"set max_statement_mem = '256kB'")
+        check(mut &s, mut &gp, &"select s.id, s.w from v3000 s where s.id % 2 = 0")
+        check(mut &s, mut &gp, &"select count(*) from v3000 s where s.id % 2 = 0")
+        check(mut &s, mut &gp, &"select count(*) from (select id, w, x from t where id <= 1025) s where s.x > 5")
+        check(mut &s, mut &gp, &"select s.w, s.id from v1025 s order by s.w, s.id")
+        let mm2 = q(mut &s, &"set max_statement_mem = 0")
+        report("parameters, transactions and memory", &gp)
+
+        // numeric scales mixed in one column, a text column with NULLs and
+        // empty strings, a column of mixed kinds (typed by the first branch)
+        var gm = newGroup()
+        var nums: []str = []
+        for i in 1..1500 {
+            let sc = i % 4
+            append(mut &nums, "(" + (if sc == 0 { i.toStr() } else if sc == 1 { i.toStr() + ".5" } else if sc == 2 { i.toStr() + ".25" } else { "null" }) + ")")
+        }
+        let nv = "(values " + strings.join(&nums, ", ") + ") v(a)"
+        check(mut &s, mut &gm, &("select count(*), sum(a), avg(a), min(a), max(a) from " + nv))
+        check(mut &s, mut &gm, &("select a, a * 2 from " + nv + " where a > 1400 order by a desc limit 9"))
+        check(mut &s, mut &gm, &("select distinct a - floor(a) from " + nv))
+        check(mut &s, mut &gm, &("select a from " + nv + " where a is null limit 3"))
+        let mixed = "(select 1 as a union all select 2.5 union all select i from generate_series(3, 300) i union all select i + 0.5 from generate_series(3, 300) i) v"
+        check(mut &s, mut &gm, &("select count(*), sum(a), max(a) from " + mixed))
+        check(mut &s, mut &gm, &("select a, a + 1 from " + mixed + " where a > 296 order by a"))
+        check(mut &s, mut &gm, &("select a * 2 from " + mixed + " where a < 5"))
+        check(mut &s, mut &gm, &("select distinct a from " + mixed + " where a > 295 order by a"))
+        check(mut &s, mut &gm, &("select a from " + mixed + " order by a desc limit 4"))
+        check(mut &s, mut &gm, &("select a, count(*) from " + mixed + " group by a having count(*) > 0 order by a limit 5"))
+        // numerics of a column's scale read as units
+        let cn = q(mut &s, &"create table nm (id int primary key, n numeric(10,2), r numeric(12,4))")
+        let in1 = q(mut &s, &"insert into nm select i, case when i % 9 = 0 then null else (i * 37 % 1000) / 4.0 end, case when i % 11 = 0 then null else i / 7.0 end from generate_series(1, 1500) i")
+        let cn2 = q(mut &s, &"create view vnm as select id, n, r, n * 2 as n2, r + n as rn from nm")
+        check(mut &s, mut &gm, &"select count(*), sum(n), avg(n), min(n), max(n), sum(n2), sum(rn) from vnm")
+        check(mut &s, mut &gm, &"select id % 5, sum(n), sum(r), count(r), max(rn) from vnm group by id % 5 order by 1")
+        check(mut &s, mut &gm, &"select id, n, r from vnm where n > 200 order by n desc, id limit 5")
+        check(mut &s, mut &gm, &"select distinct n from vnm where id < 400 order by n limit 10")
+        check(mut &s, mut &gm, &"select v.id, nm.r from vnm v join nm on nm.id = v.id where v.n > 240 and v.rn > 100")
+        let tx = "(select 1 as a union all select '2' union all select i::text from generate_series(3, 300) i) v"
+        check(mut &s, mut &gm, &("select count(*), sum(a), max(a) from " + tx))
+        check(mut &s, mut &gm, &("select a + 1 from " + tx + " where a > 290 order by a desc"))
+        check(mut &s, mut &gm, &("select a, count(*) from " + tx + " group by a order by a limit 3"))
+        // (a value of another kind in the third batch: the batches before it were given)
+        let t2 = "(select i as a from generate_series(1, 2400) i union all select '5' union all select i::text from generate_series(2402, 3000) i) v"
+        check(mut &s, mut &gm, &("select a from " + t2))
+        check(mut &s, mut &gm, &("select count(*), count(a) from " + t2))
+        check(mut &s, mut &gm, &("select a from " + t2 + " order by 1 desc limit 5"))
+        check(mut &s, mut &gm, &("select a from " + t2 + " limit 2450"))
+        // (a catalog's columns are typed loosely: attrelid is a text holding numbers)
+        check(mut &s, mut &gm, &"select count(*), min(attrelid), max(attrelid) from pg_attribute")
+        check(mut &s, mut &gm, &"select attrelid, attname from pg_attribute where attnum = 3 order by attrelid desc, attname limit 5")
+        let big = "(select 1 as a union all select 2147483647 union all select 2147483646 union all select i from generate_series(3, 100) i) v"
+        check(mut &s, mut &gm, &("select a + 1, a * 2 from " + big + " where a > 90"))
+        check(mut &s, mut &gm, &("select sum(a), max(a * 2) from " + big))
+        let words = "(select case when i % 5 = 0 then null when i % 7 = 0 then '' else 'x' || i end as w from generate_series(1, 1300) i) v"
+        check(mut &s, mut &gm, &("select count(*), count(w), min(w), max(w), max(length(w)) from " + words))
+        check(mut &s, mut &gm, &("select w from " + words + " where w like 'x12%' order by w desc"))
+        report("mixed", &gm)
+
+        // an error in a later batch (a cast), before and past a LIMIT
+        var ge = newGroup()
+        let bad = "(select id, case when id = 2500 then 'zz' else id::text end as t from t) b"
+        check(mut &s, mut &ge, &("select b.t::int from " + bad))
+        check(mut &s, mut &ge, &("select sum(b.t::int) from " + bad))
+        check(mut &s, mut &ge, &("select b.t::int from " + bad + " order by b.id limit 2400"))
+        check(mut &s, mut &ge, &("select b.t::int from " + bad + " limit 2000"))
+        check(mut &s, mut &ge, &("select b.t::int from " + bad + " order by b.id limit 2600"))
+        check(mut &s, mut &ge, &("select b.id from " + bad + " where b.t::int > 2400"))
+        check(mut &s, mut &ge, &("select count(*) from " + bad + " where b.t::int > 0"))
+        check(mut &s, mut &ge, &("select b.id from " + bad + " where b.t <> 'zz' and b.t::int > 2400"))
+        check(mut &s, mut &ge, &("select count(*) from " + bad + " join t on t.id = b.id where b.t::int > 0"))
+        check(mut &s, mut &ge, &("select distinct b.t::int from " + bad))
+        check(mut &s, mut &ge, &("select b.t::int from " + bad + " join t on t.id = b.id limit 2000"))
+        check(mut &s, mut &ge, &("select b.t::int, t.w from " + bad + " join t on t.id = b.id"))
+        report("errors", &ge)
+        var seen: []str = []
+        for sql in ["select b.t::int from " + bad + " order by b.id limit 2600", "select sum(b.t::int) from " + bad, "select count(*) from " + bad + " where b.t::int > 0",
+                    "select distinct b.t::int from " + bad, "select b.t::int, t.w from " + bad + " join t on t.id = b.id", "select b.t::int from " + bad + " limit 2000"] {
+            let r = q(mut &s, &sql)
+            append(mut &seen, if strings.startsWith(&r, "ERROR") { r.clone() } else { "rows" })
+        }
+        println("errors seen: " + strings.join(&seen, " | "))
+        let mm3 = q(mut &s, &"set max_statement_mem = '256kB'")
+        let me = q(mut &s, &"select count(*) from v3000 s where s.id % 2 = 0")
+        let mm4 = q(mut &s, &"set max_statement_mem = 0")
+        println("memory: " + me)
+
+        // a volatile CTE: one value per statement, however many times it is read
+        let a1 = q(mut &s, &"set lexdb_batch = on")
+        let r1 = q(mut &s, &"with c as (select nextval('sq') n) select a.n = b.n, a.n from c a, c b")
+        let r2 = q(mut &s, &"with c as (select id, nextval('sq') n from t where id <= 1100) select count(*), count(distinct a.n) from c a join c b on b.id = a.id and b.n = a.n")
+        let last = q(mut &s, &"select last_value from sq")
+        let r3 = q(mut &s, &"with c as (select id, random() r from t where id <= 1100) select count(*), count(distinct a.id) from c a join c b on b.id = a.id and b.r = a.r")
+        let r4 = q(mut &s, &"with c as (select id, random() r from t where id <= 1100) select count(*) from c a, c b where a.id = 5 and b.id = 5 and a.r = b.r")
+        let r5 = q(mut &s, &"with c as (select nextval('sq2') n from generate_series(1, 2000)) select count(*), min(n), max(n) from c where n > 0")
+        let l2 = q(mut &s, &"select last_value from sq2")
+        println("volatile ctes: " + r1 + " | " + r2 + " | last " + last + " | " + r3 + " | " + r4 + " | " + r5 + " | last " + l2)
+        // (a sort of a column of mixed kinds: the pipeline gives way, the CTE is not run again)
+        let ms = "with c as (select nextval('sq2') n, a from (select 1 as a union all select 2.5 union all select i from generate_series(3, 300) i) m) select count(*), min(n) from (select n, a from c order by a) o"
+        let m1 = q(mut &s, &ms)
+        let m2 = q(mut &s, &"select last_value from sq2")
+        println("volatile ctes after a sort: " + m1 + " | last " + m2)
+        s.close()
+        return 0
+    }).unwrap()
+}

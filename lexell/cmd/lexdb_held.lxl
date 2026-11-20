@@ -1,0 +1,172 @@
+// lexdb_held: rows a run holds as the pipeline's first table (design/
+// lexdb-batch-gaps.md item 6): a derived table's, a view's, a CTE's,
+// VALUES', a function's (unnest, generate_series, ...) or a catalog
+// relation's rows ([][]Val, as runFrom and execSrf give them), or an
+// integer generate_series made as it is read (lazySeries), cut into batches
+// of BROWS rows by the columns' kinds (lexdb_rows.pipeKind) as a table's
+// rows are. A value its column's kind cannot hold (a text in an integer
+// column, a numeric of another scale as units) gives the batch up
+// (fill: None): the reader goes on row by row from the batch's start
+// (next), as it does for a table.
+//
+// The rows stay the caller's: they are borrowed, never moved, so a run
+// that gives way as a whole (a join's batErr) leaves them for the row
+// engine.
+import "./lexdb_sql"
+import "./lexdb_rows"
+
+type Val = lexdb_sql.Val
+type Batch = lexdb_rows.Batch
+
+// An integer generate_series made as it is read: its values from, from +
+// step, ... while not past to (by the step's sign) and in the type's range
+// lo..hi (the row engine's end: the next value does not fit its type); its
+// ordinality in a second column. on false: no series, rows are held.
+pub type Series = record {
+    pub on: bool
+    pub from: int
+    pub to: int
+    pub step: int
+    pub lo: int
+    pub hi: int
+    pub ordin: bool
+    pub bad: bool           // not a series of integers (the caller's error)
+}
+
+pub fn noSeries(): Series { return Series{on: false, from: 0, to: 0, step: 1, lo: 0, hi: 0, ordin: false, bad: false} }
+
+// The series of a lazy generate_series' arguments (start, stop, step as
+// seriesRes gives them; [] when one was NULL: no rows) of type oid.
+pub fn seriesOf(vals: &[]Val, oid: int, ordin: bool): Series {
+    var s = Series{on: true, from: 1, to: 0, step: 1, lo: 0, hi: 0, ordin: ordin, bad: false}
+    if oid == lexdb_sql.OID_INT2 {
+        s.lo = -32768
+        s.hi = 32767
+    } else if oid == lexdb_sql.OID_INT4 {
+        s.lo = -2147483648
+        s.hi = 2147483647
+    } else if oid == lexdb_sql.OID_INT8 {
+        s.lo = -9223372036854775807 - 1
+        s.hi = 9223372036854775807
+    } else {
+        s.bad = true
+        return s
+    }
+    if len(vals) != 3 { return s }
+    match vals[0] { Val.Int(x) { s.from = x } else { s.bad = true } }
+    match vals[1] { Val.Int(x) { s.to = x } else { s.bad = true } }
+    match vals[2] { Val.Int(x) { s.step = x } else { s.bad = true } }
+    if s.step == 0 { s.bad = true }
+    return s
+}
+
+// Where a reader is: the next row of held rows (at), or of a series its next
+// value (v) and how many were given (n); done once the last is given.
+pub type HPos = record { pub at: int; pub v: int; pub n: int; pub started: bool; pub done: bool }
+
+pub fn newPos(): HPos { return HPos{at: 0, v: 0, n: 0, started: false, done: false} }
+
+pub fn (p: &HPos) copy(): HPos { return HPos{at: p.at, v: p.v, n: p.n, started: p.started, done: p.done} }
+
+// How many rows there are (a series' by its arithmetic: a figure for
+// choosing how to read, capped at 2^60).
+pub fn size(rows: &[][]Val, s: &Series): int {
+    if !s.on { return len(rows) }
+    if (s.step > 0 && s.from > s.to) || (s.step < 0 && s.from < s.to) { return 0 }
+    let big = 1 << 60
+    if s.from < -big || s.from > big || s.to < -big || s.to > big { return big }
+    let d = if s.step > 0 { s.to - s.from } else { s.from - s.to }
+    let st = if s.step > 0 { s.step } else if s.step < -big { 2 * big } else { -s.step }
+    return d / st + 1
+}
+
+// The series' first value, once, and whether it has none.
+fn begin(s: &Series, pos: mut &HPos) {
+    pos.started = true
+    pos.v = s.from
+    pos.n = 0
+    if (s.step > 0 && s.from > s.to) || (s.step < 0 && s.from < s.to) { pos.done = true }
+}
+
+// The series' value after pos.v, or done: the next does not fit its type,
+// or is past the stop.
+fn advance(s: &Series, pos: mut &HPos) {
+    if s.step > 0 {
+        if pos.v > s.hi - s.step || pos.v + s.step > s.to { pos.done = true } else { pos.v += s.step }
+    } else {
+        if pos.v < s.lo - s.step || pos.v + s.step < s.to { pos.done = true } else { pos.v += s.step }
+    }
+}
+
+// Batches given up for a value their column cannot hold (the tests' look).
+var gaveUp: int = 0
+
+pub fn gaveUpCount(): int { return gaveUp }
+
+// The next batch (at most BROWS rows) from pos, its columns by bp (kinds,
+// those used): of the series, or of rows. spare: a batch the caller is done
+// with (lexdb_rows.reuse). None: a value a column cannot hold; pos has then
+// moved, the caller's copy of it from before is the batch's start.
+pub fn fill(rows: &[][]Val, s: &Series, pos: mut &HPos, bp: &lexdb_rows.Projection, spare: mut &Batch): Option[Batch] {
+    // (a batch no larger than the rows left: a few rows are not given BROWS slots)
+    let left = if s.on { size(rows, s) - pos.n } else { len(rows) - pos.at }
+    var b = if left >= lexdb_rows.BROWS { lexdb_rows.reuse(spare, bp) } else { lexdb_rows.newBatch(bp, max(left, 0)) }
+    let nc = len(bp.kinds)
+    var r = 0
+    if s.on {
+        if nc < 1 || bp.kinds[0] != lexdb_rows.BK_INT || (s.ordin && (nc < 2 || bp.kinds[1] != lexdb_rows.BK_INT)) { return None }
+        if !pos.started { begin(s, pos) }
+        let want0 = bp.needCol[0]
+        let want1 = s.ordin && bp.needCol[1]
+        while r < lexdb_rows.BROWS && !pos.done {
+            pos.n += 1
+            if want0 { b.cols[0].v[r] = pos.v }
+            if want1 { b.cols[1].v[r] = pos.n }
+            r += 1
+            advance(s, pos)
+        }
+        b.n = r
+        return Some(b)
+    }
+    let n = len(rows)
+    while r < lexdb_rows.BROWS && pos.at < n {
+        let row = &rows[pos.at]
+        for c in 0..nc {
+            if !bp.needCol[c] { continue }
+            if c >= len(row) {
+                lexdb_rows.setNull(mut &b, c, r)
+            } else if !lexdb_rows.putRef(mut &b, c, r, &row[c], bp.kinds[c]) {
+                gaveUp += 1
+                return None
+            }
+        }
+        pos.at += 1
+        r += 1
+    }
+    b.n = r
+    if pos.at >= n { pos.done = true }
+    return Some(b)
+}
+
+// The next row from pos, its values (cloned: the rows stay held) set in dst
+// from column first on; false at the end.
+pub fn next(rows: &[][]Val, s: &Series, pos: mut &HPos, dst: mut &[]Val, first: int): bool {
+    if s.on {
+        if !pos.started { begin(s, pos) }
+        if pos.done { return false }
+        pos.n += 1
+        dst[first] = Val.Int(pos.v)
+        if s.ordin { dst[first + 1] = Val.Int(pos.n) }
+        advance(s, pos)
+        return true
+    }
+    if pos.at >= len(rows) {
+        pos.done = true
+        return false
+    }
+    let row = &rows[pos.at]
+    for i in 0..len(row) { dst[first + i] = row[i].clone() }
+    pos.at += 1
+    if pos.at >= len(rows) { pos.done = true }
+    return true
+}
