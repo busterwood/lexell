@@ -57,6 +57,7 @@ import "./lexdb_syscat"
 import "./lexdb_oracat"
 import "./lexdb_match"
 import "./lexdb_parse"
+import "./lexdb_routine"
 
 type SqlT = lexdb_syscat.SqlT
 type OraT = lexdb_oracat.OraT
@@ -15191,7 +15192,7 @@ fn compared(c: &Expr, q: &Query, out: mut &[]int) {
 // Whether a statement returns rows (so Describe has columns for it).
 pub fn returnsRows(s: &lexdb_sql.Stmt): bool {
     let k = s.kind
-    if k == lexdb_sql.S_SELECT || k == lexdb_sql.S_SHOW || k == lexdb_sql.S_EXPLAIN { return true }
+    if k == lexdb_sql.S_SELECT || k == lexdb_sql.S_SHOW || k == lexdb_sql.S_EXPLAIN || k == lexdb_sql.S_CALL { return true }
     return (k == lexdb_sql.S_INSERT || k == lexdb_sql.S_UPDATE || k == lexdb_sql.S_DELETE || k == lexdb_sql.S_MERGE) && len(s.items) > 0
 }
 
@@ -15296,7 +15297,13 @@ type SavePt = record { name: str; mark: int; fresh: bool }     // fresh: Session
 
 // The columns a statement returns, its names looked up along the session's
 // search path.
-pub fn (s: &Session) describe(stmt: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
+pub fn (s: mut &Session) describe(stmt: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]OutCol, DbErr] {
+    // a CALL's columns are its procedure's OUT parameters; a query's calls of SQL functions are written as their bodies (package F)
+    if stmt.kind == lexdb_sql.S_CALL { return s.callCols(stmt) }
+    match try s.inlineFunctions(stmt) {
+        Some(t) { return describe(&s.st, &t, ptypes, &s.txnPath()) }
+        None {}
+    }
     return describe(&s.st, stmt, ptypes, &s.txnPath())
 }
 
@@ -15807,7 +15814,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
-           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE
+           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE ||
+           kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE
 }
 
 fn stmtName(kind: int): str {
@@ -15842,6 +15850,8 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_SEQ { "DROP SEQUENCE" }
         lexdb_sql.S_COPY { "COPY FROM" }
         lexdb_sql.S_MERGE { "MERGE" }
+        lexdb_sql.S_CREATE_ROUTINE { "CREATE FUNCTION" }
+        lexdb_sql.S_DROP_ROUTINE { "DROP FUNCTION" }
         else { "DELETE" }
     }
 }
@@ -15935,6 +15945,8 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_CREATE_SEQ { return createSeq(st, txn, s) }
         lexdb_sql.S_ALTER_SEQ { return alterSeq(st, txn, s) }
         lexdb_sql.S_DROP_SEQ { return dropSeq(st, txn, s) }
+        lexdb_sql.S_CREATE_ROUTINE { return createRoutine(st, txn, s) }
+        lexdb_sql.S_DROP_ROUTINE { return dropRoutine(st, txn, s) }
         lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
@@ -16067,8 +16079,17 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     // savepoint's (and BEGIN's, which does nothing in a block) ends that
     if !stmt.waitFor && stmt.kind != lexdb_sql.S_SAVEPOINT && stmt.kind != lexdb_sql.S_RELEASE &&
        stmt.kind != lexdb_sql.S_ROLLBACK_TO && stmt.kind != lexdb_sql.S_BEGIN { s.fresh = false }
+    // PostgreSQL's SQL functions it calls, written as their bodies (package F)
+    if stmt.kind == lexdb_sql.S_SELECT || stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE ||
+       stmt.kind == lexdb_sql.S_MERGE {
+        match try s.inlineFunctions(stmt) {
+            Some(t) { return s.runStmt(&t, params, ptypes, pc, input, out, pull, sink) }
+            None {}
+        }
+    }
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
+        lexdb_sql.S_CALL { return s.callRoutine(stmt, params, ptypes) }
         lexdb_sql.S_SHOW { return s.show(&stmt.table) }
         lexdb_sql.S_SET {
             if strings.startsWith(&stmt.table, "discard:") { return s.discard(&stmt.table[8..len(stmt.table)]) }
@@ -20931,14 +20952,26 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         if isTempName(&strings.toLowerAscii(&nm)) { look = "\"" + tempSchema(se.sess) + "\"." + look }
         else if sc != "" && sc != "dbo" { look = "\"" + sc + "\"." + look }
         let o = relOidOf(se, &look)
+        var found = if o == 0 { Val.Null } else { Val.Int(o) }
         if o == 0 && !isTempName(&strings.toLowerAscii(&nm)) {
             // a sys view's, a constraint's, a default's (design/lexdb-tds.md, section 13)
             match try sysCall(name, vs, se) {
-                Some(v) { return Ok(Some(v)) }
+                Some(v) { found = v }
                 None {}
             }
         }
-        return Ok(Some(if o == 0 { Val.Null } else { Val.Int(o) }))
+        // OBJECT_ID(name, type): only an object of that type (U, V, P, PK, ...)
+        if n >= 2 && !lexdb_ops.isNull(&vs[1]) {
+            match found {
+                Val.Int(id) {
+                    let l = sysObjLine(se, id)
+                    let have = if len(l) > 0 { strings.trim(&l[3]) } else { "V" }
+                    if have != strings.trim(&strings.toUpperAscii(&lexdb_sql.text(&vs[1]))) { found = Val.Null }
+                }
+                else {}
+            }
+        }
+        return Ok(Some(found))
     }
     if strings.startsWith(&name, "#") {
         match try sysCall(name, vs, se) {
@@ -23511,3 +23544,278 @@ type Way = lexdb_plan.Way
 type Est = lexdb_stats.Est
 type Fig = lexdb_plan.Fig
 
+
+// ---- stored procedures and functions (design/lexdb-dialect-gaps.md, package F). lexdb_routine keeps them in the catalog and
+// writes PostgreSQL's SQL functions into the queries that call them; here a statement makes, drops and calls them, in the
+// session's transaction. T-SQL's procedures are run by lexdb_tsql, which finds them with Session.routines.
+
+type Routine = lexdb_sql.Routine
+
+// The routines of a dialect that a name means: qualified, in its schema; else in the first schema of the search path that
+// has one.
+fn routinesIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, name: &str): Result[[]Routine, DbErr] {
+    if lexdb_sql.isQual(name) || dialect == lexdb_sql.RD_TSQL { return lexdb_routine.find(st, txn, dialect, name) }
+    let path: []str = if len(txn.sql.path) == 0 { ["public"] } else { txn.sql.path.clone() }
+    for sc in path {
+        let found = try lexdb_routine.find(st, txn, dialect, &lexdb_sql.qual(&sc, name))
+        if len(found) > 0 { return Ok(found) }
+    }
+    return Ok([])
+}
+
+pub fn (s: mut &Session) routines(dialect: int, name: &str): Result[[]Routine, DbErr] {
+    if len(s.txn) > 0 { return routinesIn(&s.st, mut &s.txn[0], dialect, name) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let r = routinesIn(&s.st, mut &t, dialect, name)
+    s.st.abort(t)
+    return r
+}
+
+// Every routine of a dialect.
+pub fn (s: mut &Session) allRoutines(dialect: int): Result[[]Routine, DbErr] {
+    if len(s.txn) > 0 { return lexdb_routine.ofDialect(&s.st, mut &s.txn[0], dialect) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let r = lexdb_routine.ofDialect(&s.st, mut &t, dialect)
+    s.st.abort(t)
+    return r
+}
+
+fn createRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if len(s.rtn) == 0 { return Err(e("XX000", "no routine")) }
+    var r = s.rtn[0].clone()
+    let proc = r.kind == lexdb_sql.RK_PROC
+    if r.dialect == lexdb_sql.RD_PG {
+        if r.lang != "sql" { return Err(e("42704", &("language \"" + r.lang + "\" does not exist"))) }
+        // the body's syntax (PostgreSQL also resolves its names: lexdb reads them where it runs)
+        let stmts = try lexdb_parse.parse(&r.body)
+        if !proc && r.ret.oid != 2278 {
+            var ok = len(stmts) > 0
+            if ok {
+                let l = &stmts[len(stmts) - 1]
+                ok = l.kind == lexdb_sql.S_SELECT || ((l.kind == lexdb_sql.S_INSERT || l.kind == lexdb_sql.S_UPDATE || l.kind == lexdb_sql.S_DELETE) && len(l.items) > 0)
+            }
+            if !ok {
+                var d = e("42P13", &("return type mismatch in function declared to return " + lexdb_pgcat.formatType(r.ret.oid, -1)))
+                d.detail = "Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING."
+                return Err(d)
+            }
+        }
+    }
+    r.key = try createKey(st, txn, &r.key, false)
+    try needCreate(st, txn, &r.key)
+    r.owner = currentRole(st, txn.sql.sess)
+    let taken = r.dialect == lexdb_sql.RD_TSQL && (try relExists(st, txn, &r.key))
+    if r.dialect == lexdb_sql.RD_TSQL && taken && s.ifFlag {
+        // ALTER, OR ALTER of a table or a view
+        return Err(e("TS2010", &("Cannot perform alter on '" + lexdb_sql.baseName(&r.key) + "' because it is an incompatible object type.")))
+    }
+    if s.alias == "alter" && len(try lexdb_routine.find(st, txn, r.dialect, &r.key)) == 0 {
+        return Err(e("TS208", &("Invalid object name '" + lexdb_sql.baseName(&r.key) + "'.")))
+    }
+    try lexdb_routine.create(st, txn, &r, s.ifFlag, taken)
+    if r.dialect == lexdb_sql.RD_PG { lexdb_routine.noteFunction(st, &lexdb_sql.baseName(&r.key)) }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly(if proc { "CREATE PROCEDURE" } else { "CREATE FUNCTION" }))
+}
+
+fn dropRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let w = try whoNow(st, txn)
+    let dialect = if s.mdialect == lexdb_sql.MD_TSQL { lexdb_sql.RD_TSQL } else { lexdb_sql.RD_PG }
+    for i in 0..len(s.names) {
+        let parts = strings.split(&s.names[i], "\x00")
+        var key = parts[0].toStr()
+        // a bare name: in the first schema of the path that has one
+        if dialect == lexdb_sql.RD_PG && !lexdb_sql.isQual(&key) {
+            let have = try routinesIn(st, txn, dialect, &key)
+            if len(have) > 0 { key = have[0].key.clone() }
+        }
+        if dialect == lexdb_sql.RD_TSQL && (try relExists(st, txn, &key)) && len(try lexdb_routine.find(st, txn, dialect, &key)) == 0 {
+            // a table or view under DROP PROCEDURE's name
+            var isView = false
+            match try findTable(st, txn, &key) {
+                Some(t) { isView = len(t.view) > 0 }
+                None {}
+            }
+            let nm = lexdb_sql.baseName(&key)
+            let what = if isView { "view. Use DROP VIEW." } else { "table. Use DROP TABLE." }
+            return Err(e("TS3705", &("Cannot use DROP " + strings.toUpperAscii(&s.index) + " with '" + nm + "' because '" + nm + "' is a " + what)))
+        }
+        let d = try lexdb_routine.dropOne(st, txn, dialect, &key, &parts[1], &s.index, &s.spells[i], s.ifFlag, fn(o: int): str { return lexdb_pgcat.formatType(o, -1) }, &w.roles, w.super)
+        if len(d.notice) > 0 { notice(st, txn, &"00000", &d.notice, &"") }
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly(if s.index == "procedure" { "DROP PROCEDURE" } else if s.index == "function" { "DROP FUNCTION" } else { "DROP ROUTINE" }))
+}
+
+// The text PostgreSQL gives an argument's type in "procedure p(integer) does not exist": what the value shows of it.
+fn argTypeName(v: &Val): str {
+    match v {
+        Val.Int(n) { return if n >= -2147483648 && n <= 2147483647 { "integer" } else { "bigint" } }
+        Val.Bool(_) { return "boolean" }
+        Val.Num(_) { return "numeric" }
+        else { return "unknown" }
+    }
+}
+
+// One row of values of the expressions xs, run as SELECT in the call's own parameters.
+fn (s: mut &Session) valuesOf(xs: &[]Expr, call: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[[]Val, DbErr] {
+    if len(xs) == 0 { return Ok([]) }
+    var sel = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    for x in xs { append(mut &sel.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.cloneExpr(&x)), alias: "", spell: ""}) }
+    sel.subs = call.subs.clone()
+    sel.wins = call.wins.clone()
+    sel.params = call.params
+    sel.seqNames = call.seqNames.clone()
+    var r = try s.run(&sel, params, ptypes)
+    if len(r.rows) == 0 { return Ok([]) }
+    return Ok(replace(mut &r.rows[0], []))
+}
+
+// The tables a body's statements read or write (their subqueries' too).
+fn bodyTables(stmts: &[]lexdb_sql.Stmt, out: mut &[]str) {
+    for st in stmts {
+        if (st.kind == lexdb_sql.S_INSERT || st.kind == lexdb_sql.S_UPDATE || st.kind == lexdb_sql.S_DELETE) && len(st.table) > 0 { append(out, st.table.clone()) }
+        for f in st.from { if f.sub < 0 && len(f.table) > 0 { append(out, f.table.clone()) } }
+        bodyTables(&st.subs, out)
+        bodyTables(&st.inner, out)
+    }
+}
+
+// CALL name(arguments): PostgreSQL's procedure, its SQL body run in the transaction the call is in (or one of its own: all of
+// it or none), the values of its OUT and INOUT parameters its result row.
+fn (s: mut &Session) callRoutine(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int): Result[Res, DbErr] {
+    let none: []Val = []
+    let nt: []int = []
+    let args: []Expr = if len(stmt.rows) > 0 { stmt.rows[0].clone() } else { [] }
+    let cands = try s.routines(lexdb_sql.RD_PG, &stmt.table)
+    let vals = try s.valuesOf(&args, stmt, params, ptypes)
+    var best = -1
+    var bestScore = -1
+    var isFunc = ""
+    for ci in 0..len(cands) {
+        let c = &cands[ci]
+        let sl = lexdb_routine.slots(c, len(args), &stmt.names)
+        if sl.isNone() { continue }
+        if c.kind != lexdb_sql.RK_PROC {
+            isFunc = c.key.clone()
+            continue
+        }
+        var score = 0
+        let sx = sl.unwrap()
+        for i in 0..len(c.params) { if sx[i] >= 0 && lexdb_routine.kindFits(&vals[sx[i]], &c.params[i].typ) { score += 1 } }
+        if score > bestScore {
+            best = ci
+            bestScore = score
+        }
+    }
+    let base = if len(stmt.spell) > 0 { stmt.spell.clone() } else { lexdb_sql.baseName(&stmt.table) }
+    if best < 0 {
+        var ts: []str = []
+        for v in vals { append(mut &ts, argTypeName(&v)) }
+        if len(isFunc) > 0 { return Err(e("42809", &(base + "(" + strings.join(&ts, ", ") + ") is not a procedure"))) }
+        var d = e("42883", &("procedure " + base + "(" + strings.join(&ts, ", ") + ") does not exist"))
+        d.hint = "No procedure matches the given name and argument types. You might need to add explicit type casts."
+        return Err(d)
+    }
+    let r = cands[best].clone()
+    let sl = lexdb_routine.slots(&r, len(args), &stmt.names).unwrap()
+    var ins: []Val = []
+    var inTypes: []int = []
+    for i in 0..len(r.params) {
+        let p = &r.params[i]
+        if p.mode == "out" { continue }
+        var v = Val.Null
+        if sl[i] >= 0 {
+            v = vals[sl[i]].clone()
+        } else if p.has {
+            let de = try lexdb_parse.parseExpr(&p.dflt)
+            let dv = try s.valuesOf(&[de], &lexdb_sql.newStmt(lexdb_sql.S_SELECT), &none, &nt)
+            if len(dv) > 0 { v = dv[0].clone() }
+        }
+        append(mut &ins, try lexdb_ops.coerce(v, &p.typ))
+        append(mut &inTypes, p.typ.oid)
+    }
+    // the body, its parameters named as $n unless a column of a table it reads has the name
+    let first = try lexdb_parse.parse(&r.body)
+    var tabs: []str = []
+    bodyTables(&first, mut &tabs)
+    var skip: []str = []
+    for t in tabs {
+        match s.tableColumns(&t) {
+            Ok(cols) { for c in cols { append(mut &skip, c.name.clone()) } }
+            Err(_) {}
+        }
+    }
+    let text = try lexdb_routine.bindNames(&r.body, &lexdb_sql.baseName(&r.key), &r, &skip)
+    let body = try lexdb_parse.parse(&text)
+    let own = len(s.txn) == 0
+    if own { let b = try s.run(&lexdb_sql.newStmt(lexdb_sql.S_BEGIN), &none, &nt) }
+    var last: Option[Res] = None
+    for b in body {
+        match s.run(&b, &ins, &inTypes) {
+            Ok(res) { last = Some(res) }
+            Err(x) {
+                if own { let rb = s.run(&lexdb_sql.newStmt(lexdb_sql.S_ROLLBACK), &none, &nt) }
+                return Err(x)
+            }
+        }
+    }
+    if own { let c = try s.run(&lexdb_sql.newStmt(lexdb_sql.S_COMMIT), &none, &nt) }
+    var outs: []int = []
+    for i in 0..len(r.params) { if r.params[i].mode == "out" || r.params[i].mode == "inout" { append(mut &outs, i) } }
+    if len(outs) == 0 { return Ok(tagOnly("CALL")) }
+    var cols: []OutCol = []
+    var row: []Val = []
+    var got: []Val = []
+    match last {
+        Some(res) { if len(res.rows) > 0 { got = res.rows[0].clone() } }
+        None {}
+    }
+    for k in 0..len(outs) {
+        let p = &r.params[outs[k]]
+        append(mut &cols, OutCol{name: p.name.clone(), oid: p.typ.oid, spell: "", coll: "", scale: 0})
+        append(mut &row, if k < len(got) { got[k].clone() } else { Val.Null })
+    }
+    return Ok(Res{cols: cols, rows: [row], tag: "CALL", hasRows: true, copy: COPY_NONE})
+}
+
+// The names of PostgreSQL's SQL functions (lexdb_routine keeps the list once known: a function made adds to it).
+fn (s: mut &Session) functionNames(): Result[[]str, DbErr] {
+    match lexdb_routine.knownNames(&s.st) {
+        Some(ns) { return Ok(ns) }
+        None {}
+    }
+    var ns: []str = []
+    for r in try s.allRoutines(lexdb_sql.RD_PG) { append(mut &ns, lexdb_sql.baseName(&r.key)) }
+    lexdb_routine.setNames(&s.st, &ns)
+    return Ok(ns)
+}
+
+// The columns CALL gives: the OUT and INOUT parameters of its procedure (none: a command, no rows).
+fn (s: mut &Session) callCols(stmt: &lexdb_sql.Stmt): Result[[]OutCol, DbErr] {
+    let nargs = if len(stmt.rows) > 0 { len(stmt.rows[0]) } else { 0 }
+    let cands = try s.routines(lexdb_sql.RD_PG, &stmt.table)
+    for c in cands {
+        if c.kind != lexdb_sql.RK_PROC || lexdb_routine.slots(&c, nargs, &stmt.names).isNone() { continue }
+        var cols: []OutCol = []
+        for p in c.params {
+            if p.mode == "out" || p.mode == "inout" { append(mut &cols, OutCol{name: p.name.clone(), oid: p.typ.oid, spell: "", coll: "", scale: 0}) }
+        }
+        return Ok(cols)
+    }
+    var ts: []str = []
+    for i in 0..nargs { append(mut &ts, "unknown") }
+    let base = if len(stmt.spell) > 0 { stmt.spell.clone() } else { lexdb_sql.baseName(&stmt.table) }
+    return Err(e("42883", &("procedure " + base + "(" + strings.join(&ts, ", ") + ") does not exist")))
+}
+
+// The statement with PostgreSQL's SQL functions it calls written as their bodies; None when it calls none.
+fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
+    let names = try s.functionNames()
+    if len(names) == 0 || !lexdb_routine.callsAny(stmt, &names) { return Ok(None) }
+    let fns = try s.allRoutines(lexdb_sql.RD_PG)
+    let path: []str = if len(s.path) == 0 { ["public"] } else { s.path.clone() }
+    return lexdb_routine.inlineCalls(stmt, &fns, &path)
+}

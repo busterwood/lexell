@@ -6,6 +6,7 @@ import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_pgcat"
 import "./lexdb_catalog"
+import "./lexdb_routine"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -545,6 +546,41 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         "pg_database" {
             append(mut &rows, [iv(16384), tv(&db), iv(OID_OWNER), iv(6), tv(&"c"), bv(false), bv(true), iv(-1), iv(0), iv(1), iv(1663),
                                tv(&"C"), tv(&"C"), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null])
+        }
+        "pg_proc" {
+            // the functions and procedures made in this dialect (package F); lexdb has no built-in ones to list
+            for r in snap.routines {
+                if r.dialect != lexdb_sql.RD_PG { continue }
+                let ra = aclOf(&snap, &lexdb_catalog.relObj(&r.key))
+                var ins: []int = []
+                var all: []str = []
+                var modes: []str = []
+                var names: []str = []
+                var anyName = false
+                var anyOut = false
+                var ndef = 0
+                var outs = 0
+                for p in r.params {
+                    if p.mode != "out" { append(mut &ins, p.typ.oid) }
+                    append(mut &all, p.typ.oid.toStr())
+                    append(mut &modes, if p.mode == "out" { "o" } else if p.mode == "inout" { "b" } else if p.mode == "variadic" { "v" } else { "i" })
+                    append(mut &names, p.name.clone())
+                    if len(p.name) > 0 { anyName = true }
+                    if p.mode == "out" || p.mode == "inout" { anyOut = true }
+                    if p.mode == "out" { outs += 1 }
+                    if p.has { ndef += 1 }
+                }
+                let proc = r.kind == lexdb_sql.RK_PROC
+                let ret = if proc { (if anyOut { 2249 } else { 2278 }) } else { r.ret.oid }
+                let vol = if strings.contains(&r.attrs, "immutable") { "i" } else if strings.contains(&r.attrs, "stable") { "s" } else { "v" }
+                append(mut &rows, [iv(catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r)))), tv(&lexdb_sql.baseName(&r.key)), iv(nspOid(&lexdb_sql.schemaOf(&r.key))),
+                                   iv(roleOid(&r.owner, roles)), iv(14), Val.Real(100.0f), Val.Real(0.0f), iv(0), tv(&"-"), tv(&(if proc { "p" } else { "f" })), bv(false), bv(false),
+                                   bv(strings.contains(&r.attrs, "strict")), bv(r.retSet), tv(&vol), tv(&"u"), iv(len(ins)), iv(ndef), iv(ret), vecOf(&ins),
+                                   if anyOut { Val.Text("{" + strings.join(&all, ",") + "}") } else { Val.Null },
+                                   if anyOut { Val.Text("{" + strings.join(&modes, ",") + "}") } else { Val.Null },
+                                   if anyName { Val.Text("{" + strings.join(&names, ",") + "}") } else { Val.Null },
+                                   Val.Null, Val.Null, tv(&r.body), Val.Null, Val.Null, Val.Null, Val.Null])
+            }
         }
         "pg_language" {
             // the languages PostgreSQL has before CREATE EXTENSION (lexdb runs none of them)
