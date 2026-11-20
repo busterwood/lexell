@@ -1,0 +1,345 @@
+// lexdb_window, slice 10b (design/lexdb-batch-gaps.md item 10): window
+// aggregates over frames made column-wise, against the row path (SET
+// lexdb_batch = off: lexdb_exec's winPartition) over the same queries,
+// compared as text, row order included. The batches' path counts the calls it
+// computed (lexdb_exec.winRuns); the tests say which queries must take it
+// and which must not (a query with any call it does not cover runs the row
+// path whole).
+// - count(*), count, sum, avg, min, max, bool_and, bool_or, every, array_agg
+//   and the variances, over integers, floats, reals, numerics (of mixed
+//   scales), texts (under a collation too), dates, booleans, expressions, and
+//   arguments of mixed kinds (the deque and the totals give way to the row
+//   path's order);
+// - the default frame (peers share a value), the whole partition, ROWS and
+//   RANGE from UNBOUNDED PRECEDING, and sliding frames: 0, 1, 3, 100 and
+//   1,000 rows preceding and following, frames past the partition, empty
+//   frames, frames that skip rows (an error in a skipped row is none);
+// - PARTITION BY none, one and two columns, ORDER BY with ties and NULLs,
+//   partitions of one row and of more than 1,024 rows, tables of 1,023,
+//   1,024, 1,025 and 5,000 rows;
+// - integer overflow in a running and a sliding sum (the row path's error,
+//   also where the frame's total fits but a partial sum of it does not),
+//   float and numeric sums (digits and scales);
+// - calls mixed with ones this slice does not cover, several windows,
+//   named windows, calls in expressions, a grouped query, a join;
+// - errors: in an argument at the row the row path reaches it, a frame
+//   offset that is negative or NULL.
+// timeout: 600
+// expect: tables: INSERT 0 1023 INSERT 0 1024 INSERT 0 1025 INSERT 0 5000
+// expect: aggregates: 612 queries, 612 the same, 612 on the batches' path as expected, 0 on it with batches off
+// expect: errors among them: 8
+// expect: frames: 992 queries, 992 the same, 992 on the batches' path as expected, 0 on it with batches off
+// expect: errors among them: 0
+// expect: overflow: 424 queries, 424 the same, 424 on the batches' path as expected, 158 errors, 0 of them not 22003
+// expect: mixed: 34 queries, 34 the same, 34 on the batches' path as expected, 0 on it with batches off
+// expect: errors among them: 0
+// expect: not covered: 9 queries, 9 the same, 9 off the batches' path as expected
+// expect: errors: 32 queries, 32 the same, 32 on the batches' path as expected, states 22012 22012 22012 22012 22012 22012 22012 22012 22012 22012 22012 22012 22012 22012 22003 22012 22P02 22P02 22P02 22012 22012 22012 22013 22013 22004 22004 0A000 22P02 22012
+// expect: sizes: 25 queries, 25 the same
+// expect: running: 1|10|1|10.0000000000000000 2|60|3|20.0000000000000000 3|60|3|20.0000000000000000 4|10|1|10.0000000000000000 5|10|2|10.0000000000000000 6|40|1|40.0000000000000000
+// expect: sliding: 1|30|10|2 2|60|10|2 3|60|10|2 4|40|10|1 5|50|10|1 6|40|40|1
+// expect: floats: 1|0.30000000000000004|0.1 2|0.6000000000000001|0.30000000000000004 3|0.9|0.6000000000000001 4|0.7|1 5|1|1 6|0.6|1.6
+// expect: numerics: 1|1.5|2.25 2|3.75|2.25 3|2.75|2.25 4|1.500|1.000 5|1.000|3 6|3|3
+// expect: counter: 3 0 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+type Tally = record { n: int; same: int; ran: int; offRan: int; errs: int; states: []str }
+
+fn newTally(): Tally { return Tally{n: 0, same: 0, ran: 0, offRan: 0, errs: 0, states: []} }
+
+// sql on the row path (batches off) and on the batches' path; want: that it
+// must take the new path (else must not). Counted in t.
+fn both(s: mut &lexdb_exec.Session, sql: &str, want: bool, t: mut &Tally) {
+    let a = q(s, &"set lexdb_batch = off")
+    let r0 = lexdb_exec.winRuns()
+    let off = q(s, sql)
+    let r1 = lexdb_exec.winRuns()
+    let b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    let r2 = lexdb_exec.winRuns()
+    t.n += 1
+    if r1 > r0 { t.offRan += 1 }
+    if (r2 > r1) == want { t.ran += 1 } else { println("PATH (wanted " + want.toStr() + "): " + sql) }
+    if off == on { t.same += 1 } else {
+        var i = 0
+        while i < len(off) && i < len(on) && off[i..i + 1] == on[i..i + 1] { i += 1 }
+        let from = if i > 80 { i - 80 } else { 0 }
+        println("DIFFERENT: " + sql)
+        println("  rows:    ..." + off[from..min(from + 160, len(off))])
+        println("  batches: ..." + on[from..min(from + 160, len(on))])
+    }
+    if strings.startsWith(&on, "ERROR ") {
+        t.errs += 1
+        append(mut &t.states, on[6..11].clone())
+    }
+}
+
+fn createTable(s: mut &lexdb_exec.Session, name: &str, n: int): str {
+    let c = q(s, &("create table " + name + " (id int primary key, g1 int, g2 int, s text, sc text collate \"Latin1_General_CI_AS\", v int, o int, f float8, nm numeric(8,2), dt date, big int, uniq int, b boolean, " +
+                   "fz float8, r real, nu numeric, h bigint, hb bigint)"))
+    if c != "CREATE TABLE" { return c }
+    return q(s, &("insert into " + name + " select i, case when i % 17 = 0 then null else i % 7 end, case when i % 13 = 0 then null else (i / 3) % 5 end, " +
+                  "case when i % 11 = 0 then null else 'k' || (i % 9)::text end, " +
+                  "case when i % 10 = 0 then null else case i % 5 when 0 then 'a' when 1 then 'A' when 2 then 'b' when 3 then 'B' else 'ab' end end, " +
+                  "case when i % 6 = 0 then null else (i * 37) % 101 end, (i * 7) % 23, (i % 40) * 0.5, ((i % 50) * 3) * 0.01, date '2024-01-01' + (i % 30), " +
+                  "case when i % 4 = 0 then 0 else 1 end, i, case when i % 3 = 0 then null else i % 2 = 0 end, " +
+                  "case when i % 9 = 0 then null else ((i * 7919) % 1009) / 7.0 end, ((i * 13) % 100) / 3.0::real, " +
+                  "case i % 4 when 0 then (i % 50)::numeric when 1 then (i % 50) * 0.5 when 2 then (i % 50) * 0.125 else null end, " +
+                  "case when i % 250 = 0 then 4611686018427387000 else i % 100 end, " +
+                  "case when i % 1000 in (100, 200, 300) then 4611686018427387000 when i % 1000 in (400, 500, 600) then -4611686018427387000 else i % 10 end " +
+                  "from generate_series(1, " + n.toStr() + ") i"))
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(62), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        var made: []str = []
+        for nn in [1023, 1024, 1025, 5000] { append(mut &made, createTable(mut &s, &("w" + nn.toStr()), nn)) }
+        let c2 = q(mut &s, &"create table d (k int primary key, lab text)")
+        let c3 = q(mut &s, &"insert into d values (0,'z'),(1,'y'),(2,'x'),(3,'w'),(4,'v'),(5,'u'),(6,'t'),(9,'none')")
+        println("tables: " + strings.join(&made, " "))
+
+        // every aggregate, over a rotation of the window specs and frames
+        let aggs = ["count(*)", "count(v)", "count(s)", "count(f)", "count(v + g2)", "count(b)", "sum(v)", "sum(o)", "sum(v * 2)", "sum(v + g1)", "sum(f)", "sum(fz)",
+                    "sum(nm)", "sum(nu)", "sum(r)", "sum(h)", "sum(big)", "sum(v + f)", "sum(case when id % 7 = 0 then v else f end)", "sum(case when id % 5 = 0 then nm else v end)",
+                    "avg(v)", "avg(o)", "avg(f)", "avg(fz)", "avg(nm)", "avg(nu)", "avg(r)", "avg(h)", "avg(coalesce(v, 0))",
+                    "min(v)", "max(v)", "min(s)", "max(s)", "min(sc)", "max(sc)", "min(f)", "max(fz)", "min(nm)", "max(nu)", "min(nu)", "min(dt)", "max(dt)", "min(r)", "max(r)",
+                    "min(v * 2)", "max(coalesce(v, -1))", "min(case when id % 2 = 0 then v else f end)", "max(case when id % 3 = 0 then s end)", "min(o)", "max(o)",
+                    "bool_and(b)", "bool_or(b)", "every(b)", "array_agg(v)", "variance(v)", "stddev(f)", "var_pop(nm)", "stddev_pop(fz)", "var_samp(o)", "stddev_samp(r)"]
+        let specs = ["", "order by o", "order by o desc", "order by v nulls first", "order by v desc nulls last", "order by id", "order by s", "order by sc desc", "order by f",
+                     "order by dt, id", "partition by g1", "partition by g1 order by o", "partition by g1 order by id", "partition by g1, g2 order by o, id",
+                     "partition by g2 order by v nulls first", "partition by s order by o", "partition by sc order by id", "partition by big order by o", "partition by uniq",
+                     "partition by g1 order by o desc, id", "partition by b order by id", "partition by nm order by o", "partition by dt order by o"]
+        let frames = ["", "", "rows between unbounded preceding and unbounded following", "range between unbounded preceding and unbounded following",
+                      "rows between unbounded preceding and current row", "rows unbounded preceding", "range between unbounded preceding and current row",
+                      "rows between 1 preceding and 1 following", "rows between 3 preceding and 3 following", "rows between 0 preceding and 0 following",
+                      "rows between 3 preceding and current row", "rows between current row and 3 following", "rows between current row and unbounded following",
+                      "rows between 2 preceding and 1 preceding", "rows between 1 following and 3 following", "rows between 5 following and 7 following",
+                      "rows between 3 preceding and 1 following", "rows between unbounded preceding and 2 preceding", "rows between 2 following and unbounded following",
+                      "range between current row and unbounded following", "range between current row and current row", "rows between 100 preceding and current row",
+                      "rows between 1 preceding and 1 preceding", "rows between 0 preceding and 5 following", "rows between unbounded preceding and 4 following",
+                      "rows between 1 + 1 preceding and (2 * 2) following", "rows 2 preceding", "rows between current row and current row"]
+        let tnames = ["w1023", "w1024", "w1025", "w5000", "w1025", "w5000"]
+        var ta = newTally()
+        var k = 0
+        for ag in aggs {
+            for sp in 0..len(specs) {
+                if (sp + k) % 3 != 0 { continue }
+                let tn = tnames[(sp + k) % 6].clone()
+                // a frame by rotation: those with an ORDER BY or not (RANGE frames need not one)
+                let fr = frames[(sp * 5 + k * 3) % len(frames)].clone()
+                let over = specs[sp] + (if fr != "" { " " + fr } else { "" })
+                both(mut &s, &("select id, " + ag + " over (" + over + ") from " + tn), true, mut &ta)
+                if (sp + k) % 9 == 0 {
+                    both(mut &s, &("select id, " + ag + " over (" + over + ") from " + tn + " order by id desc"), true, mut &ta)
+                }
+            }
+            k += 1
+        }
+        println("aggregates: " + ta.n.toStr() + " queries, " + ta.same.toStr() + " the same, " + ta.ran.toStr() + " on the batches' path as expected, " + ta.offRan.toStr() + " on it with batches off")
+        println("errors among them: " + ta.errs.toStr())
+
+        // every frame, over the kinds of aggregate (running, count, total, deque, rows added again)
+        let kinds = ["count(*)", "count(v)", "sum(v)", "avg(o)", "min(v)", "max(s)", "sum(fz)", "avg(nm)", "max(nu)", "variance(f)", "bool_or(b)", "min(case when id % 2 = 0 then v else f end)"]
+        let oneSpecs = ["order by id", "order by o", "partition by g1 order by o, id", "partition by g2 order by v desc nulls last, id", "partition by uniq order by id", "partition by big order by id"]
+        var tf = newTally()
+        var kk = 0
+        for fr in frames {
+            for ag in kinds {
+                for sp in 0..len(oneSpecs) {
+                    if (sp + kk) % 3 != 0 { continue }
+                    both(mut &s, &("select id, " + ag + " over (" + oneSpecs[sp] + " " + fr + ") from " + tnames[(sp + kk) % 6]), true, mut &tf)
+                }
+                kk += 1
+            }
+        }
+        // frames past the partition and as wide as 1,000 rows
+        for fr in ["rows between 1000 preceding and 1000 following", "rows between 1000 preceding and current row", "rows between current row and 1000 following",
+                   "rows between 1000 preceding and 1000 preceding", "rows between 1000 following and 1000 following", "rows between 1 following and 1000 following",
+                   "rows between 100000 preceding and 100000 following", "rows between 9223372036854775807 preceding and 9223372036854775807 following",
+                   "rows between 9223372036854775807 preceding and current row", "rows between current row and 9223372036854775807 following"] {
+            for ag in ["count(*)", "count(v)", "sum(v)", "avg(o)", "min(v)", "max(s)", "sum(fz)", "avg(nm)"] {
+                for sp in ["order by id", "partition by g1 order by o, id", "partition by uniq order by id", "partition by big order by id"] {
+                    both(mut &s, &("select id, " + ag + " over (" + sp + " " + fr + ") from w1025"), true, mut &tf)
+                }
+            }
+        }
+        println("frames: " + tf.n.toStr() + " queries, " + tf.same.toStr() + " the same, " + tf.ran.toStr() + " on the batches' path as expected, " + tf.offRan.toStr() + " on it with batches off")
+        println("errors among them: " + tf.errs.toStr())
+
+        // overflow: the row path's error, also where a frame's total fits
+        var to = newTally()
+        for sp in ["order by id", "order by id desc", "partition by g1 order by id", "order by o, id", "partition by uniq", "partition by id % 3 order by id", ""] {
+            for fr in ["", "rows between unbounded preceding and current row", "rows between 600 preceding and 600 following", "rows between 700 preceding and current row",
+                       "rows between 300 preceding and 300 following", "rows between 2 preceding and 2 following", "rows between current row and unbounded following",
+                       "rows between 1000 preceding and 1000 following", "rows between unbounded preceding and unbounded following", "rows between 450 preceding and 150 following"] {
+                for ag in ["sum(h)", "sum(hb)", "avg(hb)", "avg(h)", "max(hb)", "count(hb)"] {
+                    both(mut &s, &("select id, " + ag + " over (" + sp + " " + fr + ") from w1025"), true, mut &to)
+                }
+            }
+        }
+        both(mut &s, &"select id, sum(hb) over (order by id rows between 600 preceding and 600 following) from w5000", true, mut &to)
+        both(mut &s, &"select id, sum(hb) over (order by id rows between 600 preceding and 600 following) from w5000 where id < 550", true, mut &to)
+        both(mut &s, &"select id, sum(hb) over (order by id rows between 600 preceding and 600 following) from w5000 where id % 1000 not in (100, 200, 300)", true, mut &to)
+        both(mut &s, &"select id, sum(hb) over (order by id rows between 100 preceding and 100 following) from w5000", true, mut &to)
+        var other = 0
+        for st2 in to.states { if st2 != "22003" { other += 1 } }
+        println("overflow: " + to.n.toStr() + " queries, " + to.same.toStr() + " the same, " + to.ran.toStr() + " on the batches' path as expected, " + to.errs.toStr() + " errors, " + other.toStr() + " of them not 22003")
+
+        // several windows, named windows, calls in expressions, subqueries, a grouped query, a join
+        var tm = newTally()
+        let sh = [
+            "select id, sum(v) over (order by id), count(*) over (partition by g1), min(v) over (order by id rows between 3 preceding and 3 following) from w5000",
+            "select id, row_number() over (partition by g1 order by o, id), sum(v) over (partition by g1 order by o, id), lag(v) over (partition by g1 order by o, id) from w5000",
+            "select id, rank() over (order by o), avg(v) over (order by o rows between 1 preceding and 1 following), last_value(v) over (order by o) from w1024",
+            "select id, sum(v) over w, avg(v) over w, first_value(v) over w, count(*) over w from w1025 window w as (partition by g1 order by id)",
+            "select id, sum(v) over (w rows between 1 preceding and current row), max(v) over (w rows between 5 preceding and 5 following) from w5000 window w as (partition by g1 order by id)",
+            "select id, sum(v) over w1, sum(v) over w2, count(*) over w3 from w1025 window w1 as (order by id), w2 as (order by id desc), w3 as (partition by g2)",
+            "select id, v - avg(v) over (partition by g1), 100.0 * v / nullif(sum(v) over (partition by g1), 0) from w1025",
+            "select id, sum(v) over (order by id) * 2 + coalesce(count(v) over (order by id rows between 2 preceding and current row), 0) from w5000",
+            "select id, case when sum(v) over (partition by g1 order by id) > 100 then 'big' else 'small' end, max(v) over (partition by g1) from w1023",
+            "select id, s from (select id, s, count(*) over (partition by s) c from w5000) x where c > 500 order by id limit 20",
+            "select g1, count(*), max(rs) from (select g1, sum(v) over (partition by g1 order by id) rs from w5000) x group by g1 order by g1",
+            "select id, sum(v) over (order by id) rs from w5000 order by rs desc, id limit 17 offset 5",
+            "select id, sum(v) over (order by id rows between 1 preceding and 1 following) r from w1024 order by r, id limit 1",
+            "select id, sum(v) over (partition by g1 order by id) from w5000 where id % 3 = 1",
+            "select id, count(*) over (partition by g1), min(v) over (partition by g1 order by id) from w5000 where g1 is null",
+            "select id, sum(v) over (order by id) from w5000 where false",
+            "select id, max(v) over (partition by g1 order by id rows between 2 preceding and 2 following) from w5000 where id = 7",
+            "select distinct g1, sum(v) over (partition by g1) from w1025",
+            "select w.id, d.lab, sum(w.v) over (partition by d.lab order by w.id), count(*) over (partition by d.lab rows between 3 preceding and 1 following) from w5000 w join d on d.k = w.g1",
+            "select w.id, d.lab, max(w.o) over (partition by d.lab order by w.o, w.id), avg(w.v) over (partition by d.lab order by w.id rows between 5 preceding and 5 following) from w1025 w left join d on d.k = w.g1",
+            "select id, sum(v) over (partition by case when id % 2 = 0 then v else 0.5 end order by id) from w1025",
+            "select id, sum(v) over (order by case when id % 2 = 0 then v else 0.5 end, id) from w1025",
+            "select id, sum(v) over (partition by g1 order by (select 1), id) from w1025",
+            "select id, sum(v) over (partition by g1 order by id) from w5000 order by id desc limit 7",
+            "select g1, sum(v), sum(sum(v)) over (order by g1), avg(sum(v)) over (order by g1 rows between 1 preceding and 1 following), rank() over (order by sum(v) desc nulls last) from w5000 group by g1",
+            "select g1, g2, count(*), max(count(*)) over (partition by g1 order by g2), sum(count(*)) over (partition by g1) from w5000 group by g1, g2",
+            "select id, count(*) over (), sum(v) over (), min(v) over (), max(s) over () from w1025",
+            "select id, count(v) over (), row_number() over () from w1024",
+            "select id, sum(v) over (order by id), sum(v) over (order by id desc), sum(v) over (partition by g1 order by id) from w1025",
+            "select id, sum(v + (select 1)) over (order by id) from w1025",
+            "select id, sum(v) over (order by id), sum(nullif(v, 7)) over (order by id), sum(abs(v - 50)) over (order by id) from w1025",
+            "select id, count(*) over (partition by g1 order by o range between current row and current row), sum(v) over (partition by g1 order by o range between current row and unbounded following) from w5000",
+            "select id, sum(1) over (partition by g1 order by id), count(null) over (order by id), min('a') over (partition by g1 order by id rows between 2 preceding and current row), max(5) over (order by id rows between 1 following and 3 following) from w1025",
+            "select id, count(1) over (partition by g1 order by id rows between 3 preceding and 1 following), sum(2.5) over (order by id rows between 2 preceding and 2 following), avg(7) over (partition by g2) from w1024"]
+        for sql in sh { both(mut &s, &sql, true, mut &tm) }
+        println("mixed: " + tm.n.toStr() + " queries, " + tm.same.toStr() + " the same, " + tm.ran.toStr() + " on the batches' path as expected, " + tm.offRan.toStr() + " on it with batches off")
+        println("errors among them: " + tm.errs.toStr())
+
+        // a call that is not covered: the whole query takes the row path
+        var tn = newTally()
+        let no = [
+            "select id, sum(v) over (order by id), first_value(v) over (order by id rows between 1 preceding and current row) from w1025",
+            "select id, string_agg(s, ',') over (partition by g1 order by id), sum(v) over (partition by g1 order by id) from w1025",
+            "select id, count(*) filter (where v > 50) over (partition by g1), sum(v) over (partition by g1) from w1024",
+            "select id, sum(v) over (order by o groups between unbounded preceding and current row) from w1025",
+            "select id, sum(v) over (order by o range between 1 preceding and 1 following), count(*) over (order by o) from w1025",
+            "select id, sum(v) over (partition by g1 order by o range between unbounded preceding and current row exclude current row) from w1025",
+            "select id, avg(v) over (order by id rows between 3 preceding and current row exclude ties), min(v) over (order by id) from w5000",
+            "select id, max(v) over (partition by g1 order by id range between 5 preceding and current row) from w1025",
+            "select id, count(*) over (order by id groups between 1 preceding and 1 following) from w1025"]
+        for sql in no { both(mut &s, &sql, false, mut &tn) }
+        println("not covered: " + tn.n.toStr() + " queries, " + tn.same.toStr() + " the same, " + tn.ran.toStr() + " off the batches' path as expected")
+
+        // errors: an argument at the row the row path reaches it (not at a row no frame has), a frame offset
+        var te = newTally()
+        let bad = [
+            "select id, sum(100 / (id - 4000)) over (order by id) from w5000",
+            "select id, sum(100 / (id - 4000)) over (order by id rows between 1 preceding and 1 following) from w5000",
+            "select id, sum(100 / (id - 4000)) over (order by id rows between 5 preceding and current row) from w5000",
+            "select id, min(100 / (id - 4000)) over (order by id rows between 5 preceding and current row) from w5000",
+            "select id, count(100 / (id - 4000)) over (order by id rows between 5 preceding and current row) from w5000",
+            "select id, sum(100 / (id - 4000)) over (order by id desc rows between 2 preceding and 2 following) from w5000",
+            "select id, sum(100 / (id - 4000)) over (partition by g1 order by id rows between 7 following and 9 following) from w5000",
+            "select id, sum(100 / (id - 3)) over (order by id rows between 5 following and 7 following) from w1025",
+            "select id, sum(100 / (id - 1)) over (order by id rows between 5 following and 7 following) from w1025",
+            "select id, sum(100 / (id - 7)) over (order by id rows between 5 following and 7 following) from w1025",
+            "select id, sum(100 / (id - 8)) over (order by id rows between 5 following and 7 following) from w1025",
+            "select id, sum(100 / (id - 1020)) over (order by id rows between 5 following and 7 following) from w1025",
+            "select id, avg(100 / (id - 500)) over (order by id rows between unbounded preceding and 3 preceding) from w1025",
+            "select id, max(100 / (id - 500)) over (order by id rows between 2 following and unbounded following) from w1025",
+            "select id, sum(100 / (id - 500)) over (partition by id % 2 order by id range between current row and unbounded following) from w1025",
+            "select id, sum(hb + 100 / (id - 300)) over (order by id rows between unbounded preceding and current row) from w1025",
+            "select id, sum(hb + 100 / (id - 800)) over (order by id rows between 600 preceding and 600 following) from w1025",
+            "select id, sum(hb + 100 / (id - 200)) over (order by id rows between 600 preceding and 600 following) from w1025",
+            "select id, sum(s::int) over (partition by g1 order by id) from w1025",
+            "select id, sum(s::int) over (partition by g1 order by id rows between 1 preceding and 1 following) from w1025",
+            "select id, min(s::int) over (partition by g1 order by id rows between 1 preceding and 1 following) from w1025",
+            "select id, sum(v) over (order by id rows between 1.5 preceding and current row) from w1025",
+            "select id, sum(v) over (partition by g1 order by id), sum(100 / (id - 4000)) over (order by id) from w5000",
+            "select id, sum(100 / (id - 10)) over (order by id), sum(100 / (id - 5)) over (order by id) from w1025",
+            "select id, sum(100 / (id - 5)) over (order by id), sum(100 / (id - 10)) over (order by id rows between 1 preceding and 1 following) from w1025"]
+        for sql in bad { both(mut &s, &sql, true, mut &te) }
+        // (an error in a frame's offset or an order key comes before any value is made)
+        for sql in ["select id, sum(v) over (order by id rows between -1 preceding and current row) from w1025",
+                    "select id, sum(v) over (order by id rows between 1 preceding and -2 following) from w1025",
+                    "select id, sum(v) over (order by id rows between null preceding and current row) from w1025",
+                    "select id, count(*) over (order by id rows between current row and null following) from w1025",
+                    "select id, count(*) over (order by id rows between 1 preceding and (select 1) following) from w1025",
+                    "select id, sum(v) over (order by id rows between 1 preceding and 'x' following) from w1025",
+                    "select id, sum(v) over (order by 100 / (id - 4500) rows between 1 preceding and current row) from w5000"] {
+            both(mut &s, &sql, false, mut &te)
+        }
+        println("errors: " + te.n.toStr() + " queries, " + te.same.toStr() + " the same, " + te.ran.toStr() + " on the batches' path as expected, states " + strings.join(&te.states, " "))
+
+        // sizes at the batch edges, whole result compared
+        var tz = newTally()
+        for tn2 in ["w1023", "w1024", "w1025"] {
+            for over in ["partition by g1 order by o, id", "order by id", "partition by big order by v nulls first, id", "partition by uniq order by id", "partition by g2 order by o"] {
+                both(mut &s, &("select id, sum(v) over (" + over + "), count(*) over (" + over + "), avg(v) over (" + over + " rows between 3 preceding and 3 following), min(v) over (" + over + " rows between 100 preceding and current row) from " + tn2), true, mut &tz)
+            }
+        }
+        for i in 0..8 {
+            both(mut &s, &("select id, sum(v) over (partition by id % " + (i + 1).toStr() + " order by o, id rows between 1 preceding and 2 following) from w1024 where id % 3 <> " + (i % 3).toStr()), true, mut &tz)
+        }
+        both(mut &s, &"select id, count(*) over () from w1024 where id > 1020", true, mut &tz)
+        both(mut &s, &"select id, sum(v) over () from w1025 where id = 1025", true, mut &tz)
+        println("sizes: " + tz.n.toStr() + " queries, " + tz.same.toStr() + " the same")
+
+        // values, by hand
+        let c4 = q(mut &s, &"create table h (id int primary key, g int, o int, v int, f float8, n numeric)")
+        let c5 = q(mut &s, &"insert into h values (1,1,5,10,0.1,1.5),(2,1,7,20,0.2,2.25),(3,1,7,30,0.3,0.5),(4,2,1,10,0.4,1.000),(5,2,null,null,null,null),(6,3,2,40,0.6,3)")
+        println("running: " + q(mut &s, &"select id, sum(v) over (partition by g order by o), count(*) over (partition by g order by o), avg(v) over (partition by g order by o) from h order by id"))
+        println("sliding: " + q(mut &s, &"select id, sum(v) over (order by id rows between 1 preceding and 1 following), min(v) over (order by id rows between 1 preceding and 1 following), count(v) over (order by id rows between current row and 1 following) from h order by id"))
+        println("floats: " + q(mut &s, &"select id, sum(f) over (order by id rows between 1 preceding and 1 following), sum(f) over (order by id) from h order by id"))
+        println("numerics: " + q(mut &s, &"select id, sum(n) over (order by id rows between 1 preceding and current row), max(n) over (order by id rows between 1 preceding and 1 following) from h order by id"))
+        let w0 = lexdb_exec.winRuns()
+        let r1 = q(mut &s, &"select id, row_number() over (order by id), sum(v) over (order by id), count(*) over (order by id rows between 1 preceding and 1 following) from h")
+        let w1 = lexdb_exec.winRuns()
+        let r2 = q(mut &s, &"select id, sum(v) over (order by id), string_agg(g::text, ',') over (order by id) from h")
+        let w2 = lexdb_exec.winRuns()
+        let r3 = q(mut &s, &"set lexdb_batch = off")
+        let r4 = q(mut &s, &"select id, sum(v) over (order by id) from h")
+        let w3 = lexdb_exec.winRuns()
+        println("counter: " + (w1 - w0).toStr() + " " + (w2 - w1).toStr() + " " + (w3 - w2).toStr())
+        return 0
+    }).unwrap()
+}
