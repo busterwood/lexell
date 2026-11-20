@@ -565,7 +565,7 @@ it. The design and its state are in
 | `lexdb_disk.lxl` | files with O_DIRECT, and a simulated disk that crashes |
 | `lexdb_base.lxl` | errors, CRC32C, a deterministic generator |
 
-    compiler/out/lxlc cmd/lexdb.lxl -o lexdb
+    compiler/out/lxlc cmd/lexdb.lxl -O -o lexdb
     ./lexdb /tmp/lexdb-data &
     psql "host=127.0.0.1 port=5433 user=me dbname=lexdb"
 

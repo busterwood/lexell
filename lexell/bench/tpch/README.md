@@ -31,7 +31,7 @@ The plan comparison and the planner gaps it found are in
 
 ```sh
 lexell/compiler/build.sh
-lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o /tmp/lexdb
+lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -O -o /tmp/lexdb    # -O: every recorded run uses it (q1 is ~14% slower without)
 
 W=~/tpch
 lexell/bench/tpch/fetch.sh "$W/tpch-kit"

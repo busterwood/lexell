@@ -786,8 +786,9 @@ unless named; search for the names, since line numbers move.
     and `immutableName` are shared.
 - Build, test and measure:
   - Build: `flock -s ~/tpch/.bench.lock env LXL_NOCACHE=1 taskset -c
-    4-7,12-15 lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -o OUT`
-    (the native backend; never the gcc path).
+    4-7,12-15 lexell/compiler/out/lxlc lexell/cmd/lexdb.lxl -O -o OUT`
+    (the native backend; never the gcc path; always `-O`: section 6.3's Q1
+    bisect found binaries built without it about 14% slower on q1).
   - Suite: `flock -s ~/tpch/.bench.lock python3 lexell/tests/lexdb.py
     --compiler .../lxlc -j 2` (187 tests; a test's name as an argument
     runs it alone).
