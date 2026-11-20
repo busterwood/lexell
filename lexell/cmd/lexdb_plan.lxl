@@ -3632,29 +3632,6 @@ fn semiAlternatives(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query
             None {}
         }
     }
-    // A correlated scalar aggregate 9.9 could not hash: its plan to be
-    // hashed, a grouped level's where it costs less (optimizer 51, 5d)
-    var anyScal = false
-    if (unnestMode & UN_SCALAR) != 0 && !early && !txn.noting() && !hs.rules {
-        for i in 0..len(subs) {
-            if i < len(q.subs) && !q.subs[i].hashed && scalarCand(q, i) { anyScal = true }
-        }
-    }
-    if anyScal {
-        for i in 0..len(subs) {
-            if !(i < len(q.subs) && !q.subs[i].hashed && scalarCand(q, i)) { continue }
-            sc.noRefKeys = true
-            let nf = len(sc.names.frames)
-            let again = up().planSub(st, txn, &subs[i], params, sc, false)
-            sc.noRefKeys = false
-            while len(sc.names.frames) > nf { let gone = pop(mut &sc.names.frames) }
-            let got = again.ok()
-            if got.isSome() {
-                let alt = got.unwrap()
-                if alt.hashed && semiAltOk(&alt, &q.subs[i]) && scalarShape(&alt.sel, true) && groupSafe(&alt) { alts[i] = Some(alt) }
-            }
-        }
-    }
     if (hs.anySemi || anyMark) && !early && !txn.noting() && !hs.rules {
         for i in 0..len(subs) {
             let semi = i < len(hs.semiCand) && hs.semiCand[i]
@@ -3971,7 +3948,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     if semis != 0 && nl > 0 {
         if (semis & 1) != 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc, hs.rules, (unnestMode & UN_MARK) != 0) }
         // correlated scalar aggregates as grouped levels (optimizer 51)
-        if q.corr && (unnestMode & UN_SCALAR) != 0 { try scalarJoins(st, txn, q, mut &semiAlts, params, sc, hs.rules, hs.memMax) }
+        if q.corr && (unnestMode & UN_SCALAR) != 0 { try scalarJoins(st, txn, q, params, subs, sc, hs) }
     }
     return Ok(Unit{})
 }
@@ -5760,6 +5737,46 @@ fn scalarCalls(x: &Expr, out: mut &[]int) {
 // at most half of it).
 const GROUP_ROW_BYTES: float = 200.0f
 
+// Subquery i's plan to be hashed (planned again without outer values as
+// keys, section 42's alternative), where taking it may pay: planned only
+// when a hash of the per-row plan's largest table, read whole, could cost
+// less than the runs per row (outer rows reaching it); a planning of its
+// own for each such subquery, so not for q2's, q17's and q20's (their runs
+// cost a fraction of reading the table). None: not planned, or not one to
+// hash (semiAltOk, its shape, groupSafe). Not where reading may stop early,
+// in a transaction whose reads are noted, or in the rules mode.
+fn scalarAlt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, i: int, subs: &[]lexdb_sql.Stmt, params: &[]Val, sc: mut &Scope,
+             hs: &FromHints, outer: float): Result[Option[SubPlan], DbErr] {
+    if hs.early || txn.noting() || hs.rules || outer < 0.0f || i >= len(subs) { return Ok(None) }
+    let sq = &q.subs[i].sel.q
+    var big = -1.0f
+    for lv in sq.levels {
+        if lv.virt() { return Ok(None) }
+        let rows = if lv.est.rows >= 0 { lv.est.rows } else { (try lexdb_stats.loadEst(st, txn, &lv.t, true, hs.rules)).rows }
+        if rows < 0 { return Ok(None) }
+        if float(rows) > big { big = float(rows) }
+    }
+    let run = if len(sq.levels) > 0 { semiRun(&sq.levels[0], big) } else { SEMI_RUN_PK + COST_DESCENT + COST_KEY_ROW }
+    if groupJoin(big, len(sq.levels)) >= outer * run { return Ok(None) }
+    sc.noRefKeys = true
+    let nf = len(sc.names.frames)
+    let again = up().planSub(st, txn, &subs[i], params, sc, false)
+    sc.noRefKeys = false
+    // (a plan that failed may have left its frame: this query's is the top one)
+    while len(sc.names.frames) > nf { let gone = pop(mut &sc.names.frames) }
+    let got = again.ok()
+    if got.isNone() { return Ok(None) }
+    let alt = got.unwrap()
+    if alt.hashed && semiAltOk(&alt, &q.subs[i]) && scalarShape(&alt.sel, true) && groupSafe(&alt) { return Ok(Some(alt)) }
+    return Ok(None)
+}
+
+// A grouped plan's cost over its rows (inner, read once and grouped as a
+// hash is built), its later tables (of n) at least a lookup for each: a
+// join's grouping is not one table's (q2's subquery over partsupp,
+// supplier, nation and region: 800,000 rows, each joined three times).
+fn groupJoin(inner: float, n: int): float { return inner * (COST_SCAN + HASH_BUILD) + inner * COST_KEY_ROW * float(if n > 1 { n - 1 } else { 0 }) }
+
 // Whether subquery i's grouped plan to be hashed (alt) costs less than its
 // run per outer row (outer rows reaching it), and its groups fit: the
 // choice of optimizer 51 (semiCheaper's terms; the groups as the hash).
@@ -5772,7 +5789,8 @@ fn groupCheaper(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, i:
     if memMax > 0 && float(memMax) / 2.0f < cap { cap = float(memMax) / 2.0f }
     if inner * GROUP_ROW_BYTES > cap { return Ok(false) }
     let run = if len(q.subs[i].sel.q.levels) > 0 { semiRun(&q.subs[i].sel.q.levels[0], inner) } else { SEMI_RUN_PK + COST_DESCENT + COST_KEY_ROW }
-    return Ok(semiCheaper(outer, inner, run))
+    if outer <= 1.0f { return Ok(false) }
+    return Ok(groupJoin(inner, len(alt.sel.q.levels)) + outer * HASH_PROBE < outer * run)
 }
 
 // The grouped level of subquery i of q (hashed: hashSub's form; 9.9's, or
@@ -5984,18 +6002,25 @@ fn isConstLit(x: &Expr): bool {
 // level (a build group's last member), the conjunct with the calls read
 // from them the last one's WHERE conjunct (post). Placed only where no
 // error moves (takeOutOk).
-fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, alts: mut &[]Option[SubPlan], params: &[]Val, sc: &Scope,
-               rules: bool, memMax: int): Result[Unit, DbErr] {
+fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope,
+               hs: &FromHints): Result[Unit, DbErr] {
+    let rules = hs.rules
+    let memMax = hs.memMax
+    var alts: []Option[SubPlan] = []
+    for i in 0..len(q.subs) { append(mut &alts, None) }
     let pt = lexdb_bind.ptypesOf(&sc.names)
     let nl = len(q.levels)
     if nl == 0 { return Ok(Unit{}) }
     var total: []int = []
     for i in 0..len(q.subs) { append(mut &total, condUses(q, i)) }
     var cands = false
-    for i in 0..len(q.subs) { if scalarCand(q, i) && (q.subs[i].hashed || (i < len(alts) && alts[i].isSome())) { cands = true } }
+    for i in 0..len(q.subs) { if scalarCand(q, i) { cands = true } }
     if !cands { return Ok(Unit{}) }
-    let first = try semiRows(st, txn, mut &q.levels[0], params, rules)
+    // the rows reaching a level: the join order's estimates, else (none:
+    // one table's query) its first table's (statistics loaded only then)
     let est = q.orderRows()
+    var first = -1.0f
+    if len(est) != nl { first = try semiRows(st, txn, mut &q.levels[0], params, rules) }
     var gEnd: []int = []
     for k in 0..nl { append(mut &gEnd, k) }
     for h in 0..nl { for l in h..h + q.levels[h].grp { if l < nl { gEnd[l] = h + q.levels[h].grp } } }
@@ -6041,7 +6066,8 @@ fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
                         if !safe {
                             // 9.9 could not hash it (an outer value its path's key)
                             var took = false
-                            if i < len(alts) && alts[i].isSome() {
+                            if alts[i].isNone() { alts[i] = try scalarAlt(st, txn, q, i, subs, params, sc, hs, outer) }
+                            if alts[i].isSome() {
                                 var a = replace(mut &alts[i], None).unwrap()
                                 if try groupCheaper(st, txn, q, i, mut &a, outer, params, rules, memMax) {
                                     append(mut &olds2, replace(mut &q.subs[i], a))
@@ -6102,8 +6128,10 @@ fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
     // made per group without fail (selScalars makes the level; where it
     // cannot, 9.9's hashed probe reads it, as it would any hashed one)
     for i in 0..len(q.subs) {
-        if total[i] > 0 || !scalarCand(q, i) || q.subs[i].hashed || !(i < len(alts) && alts[i].isSome()) { continue }
+        if total[i] > 0 || !scalarCand(q, i) || q.subs[i].hashed { continue }
         let outer = if len(est) == nl { est[nl - 1] } else { first }
+        if alts[i].isNone() { alts[i] = try scalarAlt(st, txn, q, i, subs, params, sc, hs, outer) }
+        if alts[i].isNone() { continue }
         var a = replace(mut &alts[i], None).unwrap()
         if try groupCheaper(st, txn, q, i, mut &a, outer, params, rules, memMax) {
             let back = replace(mut &q.subs[i], a)
