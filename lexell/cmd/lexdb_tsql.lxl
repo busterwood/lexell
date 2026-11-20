@@ -1978,19 +1978,77 @@ fn catalogProcSql(proc: &str, vals: &[]Val, names: &[]str): str {
     }
     if strings.startsWith(&p, "sp_datatype_info") { return DATATYPE_INFO_SQL }
     if p == "sp_stored_procedures" {
-        return "SELECT PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, NULL), PROCEDURE_NAME = CONVERT(nvarchar(134), NULL), " +
-               "NUM_INPUT_PARAMS = CONVERT(int, NULL), NUM_OUTPUT_PARAMS = CONVERT(int, NULL), NUM_RESULT_SETS = CONVERT(int, NULL), REMARKS = CONVERT(varchar(254), NULL), " +
-               "PROCEDURE_TYPE = CONVERT(smallint, NULL) WHERE 1 = 0"
+        // the user's procedures and functions (SQL Server's own, in sys, are not listed); a name is "name;1" for a procedure, "name;0" for a function
+        let nm = argLit(vals, names, "@sp_name", 0)
+        let ow = argLit(vals, names, "@sp_owner", 1)
+        let cond = likeCond("o.name", &nm) + likeCond("schema_name(o.schema_id)", &ow)
+        return "SELECT PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), " +
+               "PROCEDURE_NAME = CONVERT(nvarchar(134), o.name + CASE o.type WHEN 'P' THEN ';1' ELSE ';0' END), " +
+               "NUM_INPUT_PARAMS = CONVERT(int, -1), NUM_OUTPUT_PARAMS = CONVERT(int, -1), NUM_RESULT_SETS = CONVERT(int, -1), REMARKS = CONVERT(varchar(254), NULL), " +
+               "PROCEDURE_TYPE = CONVERT(smallint, 2) FROM sys.objects o WHERE o.type IN ('P', 'FN', 'IF', 'TF')" + cond + " ORDER BY 2, 3"
     }
     if p == "sp_sproc_columns" || p == "sp_sproc_columns_100" {
-        return "SELECT PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, NULL), PROCEDURE_NAME = CONVERT(nvarchar(134), NULL), " +
-               "COLUMN_NAME = CONVERT(sysname, NULL), COLUMN_TYPE = CONVERT(smallint, NULL), DATA_TYPE = CONVERT(smallint, NULL), TYPE_NAME = CONVERT(sysname, NULL), " +
-               "PRECISION = CONVERT(int, NULL), LENGTH = CONVERT(int, NULL), SCALE = CONVERT(smallint, NULL), RADIX = CONVERT(smallint, NULL), NULLABLE = CONVERT(smallint, NULL), " +
-               "REMARKS = CONVERT(varchar(254), NULL), COLUMN_DEF = CONVERT(nvarchar(4000), NULL), SQL_DATA_TYPE = CONVERT(smallint, NULL), SQL_DATETIME_SUB = CONVERT(smallint, NULL), " +
-               "CHAR_OCTET_LENGTH = CONVERT(int, NULL), ORDINAL_POSITION = CONVERT(int, NULL), IS_NULLABLE = CONVERT(varchar(254), NULL), SS_TYPE_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
-               "SS_TYPE_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_CATALOG_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), " +
-               "SS_UDT_ASSEMBLY_TYPE_NAME = CONVERT(nvarchar(max), NULL), SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
-               "SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_XML_SCHEMACOLLECTION_NAME = CONVERT(nvarchar(128), NULL), SS_DATA_TYPE = CONVERT(tinyint, NULL) WHERE 1 = 0"
+        let nm = argLit(vals, names, "@procedure_name", 0)
+        let ow = argLit(vals, names, "@procedure_owner", 1)
+        let cn = argLit(vals, names, "@column_name", 3)
+        let odbc3 = argLit(vals, names, "@odbcver", 4) == "3"
+        let cond = likeCond("o.name", &nm) + likeCond("schema_name(o.schema_id)", &ow)
+        let more = p == "sp_sproc_columns_100"
+        let head = "PROCEDURE_QUALIFIER = CONVERT(sysname, " + db + "), PROCEDURE_OWNER = CONVERT(sysname, schema_name(o.schema_id)), " +
+                   "PROCEDURE_NAME = CONVERT(nvarchar(134), o.name + CASE o.type WHEN 'P' THEN ';1' ELSE ';0' END), "
+        let ssx = if more { ", SS_TYPE_CATALOG_NAME = CONVERT(nvarchar(128), NULL), SS_TYPE_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
+                            "SS_UDT_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_UDT_ASSEMBLY_TYPE_NAME = CONVERT(nvarchar(max), NULL), SS_XML_SCHEMACOLLECTION_CATALOG_NAME = CONVERT(nvarchar(128), NULL), " +
+                            "SS_XML_SCHEMACOLLECTION_SCHEMA_NAME = CONVERT(nvarchar(128), NULL), SS_XML_SCHEMACOLLECTION_NAME = CONVERT(nvarchar(128), NULL)" } else { "" }
+        let stamp = if odbc3 { "93" } else { "11" }
+        // the parameter's type as ODBC describes it (SQL Server's rules, ODBC 2 unless @ODBCVer = 3)
+        let dtype = "CASE ty.name WHEN 'int' THEN 4 WHEN 'bigint' THEN -5 WHEN 'smallint' THEN 5 WHEN 'tinyint' THEN -6 WHEN 'bit' THEN -7 WHEN 'decimal' THEN 3 WHEN 'numeric' THEN 2 " +
+                    "WHEN 'money' THEN 3 WHEN 'smallmoney' THEN 3 WHEN 'float' THEN 6 WHEN 'real' THEN 7 WHEN 'varchar' THEN 12 WHEN 'char' THEN 1 WHEN 'nvarchar' THEN -9 WHEN 'nchar' THEN -8 " +
+                    "WHEN 'datetime' THEN " + stamp + " WHEN 'smalldatetime' THEN " + stamp + " WHEN 'datetime2' THEN " + stamp + " WHEN 'date' THEN " + (if odbc3 { "91" } else { "9" }) +
+                    " WHEN 'time' THEN -154 WHEN 'datetimeoffset' THEN -155 WHEN 'uniqueidentifier' THEN -11 WHEN 'varbinary' THEN -3 WHEN 'binary' THEN -2 WHEN 'xml' THEN -152 ELSE 12 END"
+        let sized = "CASE WHEN c.max_length < 0 THEN 0 ELSE c.max_length END"
+        let prec = "CASE ty.name WHEN 'int' THEN 10 WHEN 'bigint' THEN 19 WHEN 'smallint' THEN 5 WHEN 'tinyint' THEN 3 WHEN 'bit' THEN 1 WHEN 'decimal' THEN c.precision WHEN 'numeric' THEN c.precision " +
+                   "WHEN 'money' THEN 19 WHEN 'smallmoney' THEN 10 WHEN 'float' THEN " + (if odbc3 { "53" } else { "15" }) + " WHEN 'real' THEN " + (if odbc3 { "24" } else { "7" }) +
+                   " WHEN 'varchar' THEN " + sized + " WHEN 'char' THEN " + sized + " WHEN 'binary' THEN " + sized + " WHEN 'varbinary' THEN " + sized +
+                   " WHEN 'nvarchar' THEN " + sized + " / 2 WHEN 'nchar' THEN " + sized + " / 2 WHEN 'datetime' THEN 23 WHEN 'smalldatetime' THEN 16 " +
+                   "WHEN 'datetime2' THEN CASE WHEN c.scale > 0 THEN 20 + c.scale ELSE 19 END WHEN 'date' THEN 10 WHEN 'time' THEN CASE WHEN c.scale > 0 THEN 9 + c.scale ELSE 8 END " +
+                   "WHEN 'datetimeoffset' THEN CASE WHEN c.scale > 0 THEN 27 + c.scale ELSE 26 END WHEN 'uniqueidentifier' THEN 36 ELSE 0 END"
+        let len = "CASE ty.name WHEN 'int' THEN 4 WHEN 'bigint' THEN 8 WHEN 'smallint' THEN 2 WHEN 'tinyint' THEN 1 WHEN 'bit' THEN 1 WHEN 'decimal' THEN c.precision + 2 WHEN 'numeric' THEN c.precision + 2 " +
+                  "WHEN 'money' THEN 21 WHEN 'smallmoney' THEN 12 WHEN 'float' THEN 8 WHEN 'real' THEN 4 WHEN 'varchar' THEN " + sized + " WHEN 'char' THEN " + sized + " WHEN 'binary' THEN " + sized +
+                  " WHEN 'varbinary' THEN " + sized + " WHEN 'nvarchar' THEN " + sized + " WHEN 'nchar' THEN " + sized + " WHEN 'datetime' THEN 16 WHEN 'smalldatetime' THEN 16 WHEN 'datetime2' THEN 16 " +
+                  "WHEN 'date' THEN 6 WHEN 'time' THEN 12 WHEN 'datetimeoffset' THEN 20 WHEN 'uniqueidentifier' THEN 16 ELSE 0 END"
+        let scale = "CASE ty.name WHEN 'int' THEN 0 WHEN 'bigint' THEN 0 WHEN 'smallint' THEN 0 WHEN 'tinyint' THEN 0 WHEN 'decimal' THEN c.scale WHEN 'numeric' THEN c.scale WHEN 'money' THEN 4 " +
+                    "WHEN 'smallmoney' THEN 4 WHEN 'datetime' THEN 3 WHEN 'smalldatetime' THEN 0 WHEN 'datetime2' THEN c.scale WHEN 'date' THEN 0 WHEN 'time' THEN c.scale " +
+                    "WHEN 'datetimeoffset' THEN c.scale ELSE NULL END"
+        let radix = "CASE WHEN ty.name IN ('int', 'bigint', 'smallint', 'tinyint', 'decimal', 'numeric', 'money', 'smallmoney') THEN 10 " +
+                    "WHEN ty.name IN ('float', 'real') THEN " + (if odbc3 { "2" } else { "10" }) + " ELSE NULL END"
+        let sub = "CASE WHEN ty.name IN ('datetime', 'smalldatetime', 'datetime2') THEN 3 WHEN ty.name = 'date' THEN 1 WHEN ty.name IN ('time', 'datetimeoffset') THEN 0 ELSE NULL END"
+        let octet = "CASE WHEN ty.name IN ('char', 'varchar', 'binary', 'varbinary', 'nchar', 'nvarchar', 'xml') THEN " + sized + " ELSE NULL END"
+        // the (legacy) type code of a TDS stream's column
+        let sstype = "CASE WHEN ty.name IN ('int', 'smallint', 'tinyint') THEN 38 WHEN ty.name = 'bigint' THEN 108 WHEN ty.name = 'bit' THEN 50 WHEN ty.name IN ('float', 'real') THEN 109 " +
+                     "WHEN ty.name IN ('money', 'smallmoney') THEN 110 WHEN ty.name IN ('datetime', 'smalldatetime') THEN 111 " +
+                     "WHEN ty.name IN ('varchar', 'char', 'nvarchar', 'nchar') THEN 39 WHEN ty.name IN ('varbinary', 'binary', 'uniqueidentifier') THEN 37 " +
+                     "WHEN ty.name = 'decimal' THEN 106 WHEN ty.name = 'numeric' THEN 108 ELSE 0 END"
+        // one row for each parameter (a scalar function's result is its parameter 0: @RETURN_VALUE)
+        let params = "SELECT " + head + "COLUMN_NAME = CONVERT(sysname, CASE WHEN c.parameter_id = 0 THEN '@RETURN_VALUE' ELSE c.name END), " +
+               "COLUMN_TYPE = CONVERT(smallint, CASE WHEN c.parameter_id = 0 THEN 5 WHEN c.is_output = 1 THEN 2 ELSE 1 END), DATA_TYPE = CONVERT(smallint, " + dtype + "), " +
+               "TYPE_NAME = CONVERT(sysname, ty.name), PRECISION = CONVERT(int, " + prec + "), LENGTH = CONVERT(int, " + len + "), SCALE = CONVERT(smallint, " + scale + "), " +
+               "RADIX = CONVERT(smallint, " + radix + "), NULLABLE = CONVERT(smallint, 1), REMARKS = CONVERT(varchar(254), NULL), COLUMN_DEF = CONVERT(nvarchar(4000), NULL), " +
+               "SQL_DATA_TYPE = CONVERT(smallint, CASE WHEN ty.name IN ('datetime', 'smalldatetime', 'datetime2', 'date') THEN 9 ELSE " + dtype + " END), " +
+               "SQL_DATETIME_SUB = CONVERT(smallint, " + sub + "), CHAR_OCTET_LENGTH = CONVERT(int, " + octet + "), " +
+               "ORDINAL_POSITION = CONVERT(int, c.parameter_id), IS_NULLABLE = CONVERT(varchar(254), 'YES')" + ssx +
+               ", SS_DATA_TYPE = CONVERT(tinyint, " + sstype + ") FROM sys.parameters c JOIN sys.objects o ON o.object_id = c.object_id " +
+               "JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE o.type IN ('P', 'FN', 'IF', 'TF')" + cond
+        // a procedure's return code (@RETURN_VALUE, an int, not nullable) and an inline or multi-statement function's table
+        let rets = "SELECT " + head + "COLUMN_NAME = CONVERT(sysname, CASE WHEN o.type = 'P' THEN '@RETURN_VALUE' ELSE '@TABLE_RETURN_VALUE' END), " +
+               "COLUMN_TYPE = CONVERT(smallint, CASE WHEN o.type = 'P' THEN 5 ELSE 3 END), DATA_TYPE = CONVERT(smallint, CASE WHEN o.type = 'P' THEN 4 ELSE NULL END), " +
+               "TYPE_NAME = CONVERT(sysname, CASE WHEN o.type = 'P' THEN 'int' ELSE 'table' END), PRECISION = CONVERT(int, CASE WHEN o.type = 'P' THEN 10 ELSE 0 END), " +
+               "LENGTH = CONVERT(int, CASE WHEN o.type = 'P' THEN 4 ELSE 0 END), SCALE = CONVERT(smallint, 0), " +
+               "RADIX = CONVERT(smallint, CASE WHEN o.type = 'P' THEN 10 ELSE 0 END), NULLABLE = CONVERT(smallint, 0), " +
+               "REMARKS = CONVERT(varchar(254), CASE WHEN o.type = 'P' THEN NULL ELSE 'Result table returned by table valued function' END), COLUMN_DEF = CONVERT(nvarchar(4000), NULL), " +
+               "SQL_DATA_TYPE = CONVERT(smallint, CASE WHEN o.type = 'P' THEN 4 ELSE NULL END), SQL_DATETIME_SUB = CONVERT(smallint, NULL), CHAR_OCTET_LENGTH = CONVERT(int, NULL), " +
+               "ORDINAL_POSITION = CONVERT(int, 0), IS_NULLABLE = CONVERT(varchar(254), 'NO')" + ssx +
+               ", SS_DATA_TYPE = CONVERT(tinyint, CASE WHEN o.type = 'P' THEN 56 ELSE 0 END) FROM sys.objects o WHERE o.type IN ('P', 'IF', 'TF')" + cond
+        return "SELECT * FROM (" + rets + " UNION ALL " + params + ") sc WHERE 1 = 1" + likeCond("COLUMN_NAME", &cn) + " ORDER BY 2, 3, 18"
     }
     if p == "sp_table_privileges" || p == "sp_column_privileges" {
         let col = p == "sp_column_privileges"
