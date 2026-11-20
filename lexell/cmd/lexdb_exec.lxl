@@ -15485,6 +15485,10 @@ pub type Session = record {
     tmp: str                    // its temporary schema once it has made one (9.96): pg_temp_ and id
     onCommit: []str             // its temporary tables ON COMMIT DELETE ROWS (and DROP, made in the open block)
     fresh: bool                 // the open block has run no statement yet: a WAITFOR may begin it (design/lexdb-events.md)
+    // PostgreSQL's SQL functions' names as of lexdb_routine's generation fnGen (-1: not looked up): a statement compares
+    // one integer, not the store's memo, to know whether it may call one (inlineFunctions)
+    fnGen: int
+    fnNames: []str
 }
 
 // The session's time zone (SET TimeZone, 9.95).
@@ -15783,7 +15787,7 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -15791,7 +15795,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memo.put(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
 }
 
 // max_statement_mem's default.
@@ -24356,15 +24360,23 @@ fn (s: mut &Session) callRoutine(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: 
     return Ok(Res{cols: cols, rows: [row], tag: "CALL", hasRows: true, copy: COPY_NONE})
 }
 
-// The names of PostgreSQL's SQL functions (lexdb_routine keeps the list once known: a function made adds to it).
+// The names of PostgreSQL's SQL functions (lexdb_routine keeps the list once known: a function made adds to it),
+// cached in the session until lexdb_routine's generation moves.
 fn (s: mut &Session) functionNames(): Result[[]str, DbErr] {
+    if s.fnGen == lexdb_routine.namesGen() { return Ok(s.fnNames.clone()) }
     match lexdb_routine.knownNames(&s.st) {
-        Some(ns) { return Ok(ns) }
+        Some(ns) {
+            s.fnNames = ns.clone()
+            s.fnGen = lexdb_routine.namesGen()
+            return Ok(ns)
+        }
         None {}
     }
     var ns: []str = []
     for r in try s.allRoutines(lexdb_sql.RD_PG) { append(mut &ns, lexdb_sql.baseName(&r.key)) }
     lexdb_routine.setNames(&s.st, &ns)
+    s.fnNames = ns.clone()
+    s.fnGen = lexdb_routine.namesGen()
     return Ok(ns)
 }
 
@@ -24388,6 +24400,8 @@ fn (s: mut &Session) callCols(stmt: &lexdb_sql.Stmt): Result[[]OutCol, DbErr] {
 
 // The statement with PostgreSQL's SQL functions it calls written as their bodies; None when it calls none.
 fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
+    // (no function known, as of the generation the session saw: nothing to look at; the usual case, a point select's)
+    if s.fnGen == lexdb_routine.namesGen() && len(s.fnNames) == 0 { return Ok(None) }
     let names = try s.functionNames()
     if len(names) == 0 || !lexdb_routine.callsAny(stmt, &names) { return Ok(None) }
     let fns = try s.allRoutines(lexdb_sql.RD_PG)

@@ -1,0 +1,54 @@
+// lexdb: a PostgreSQL SQL function made, replaced and dropped in one session is seen by another that had already looked
+// and found none (design/lexdb-dialect-gaps.md, package F: each session caches the function names until
+// lexdb_routine's generation moves, so a statement that calls none costs no look at the store's memo).
+// expect: before: 2 | 42883
+// expect: made elsewhere: 11 | 11
+// expect: replaced elsewhere: 101
+// expect: dropped elsewhere: 42883
+// expect: a third session: 42883 | 5
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, ","))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var a = lexdb_exec.newSession(st.share())
+        var b = lexdb_exec.newSession(st.share())
+        // b looks first and finds no function (its cache: none)
+        println("before: " + q(mut &b, &"select 1 + 1") + " | " + q(mut &b, &"select plus10(1)"))
+        let c1 = q(mut &a, &"create function plus10(x int) returns int language sql as 'select x + 10'")
+        println("made elsewhere: " + q(mut &b, &"select plus10(1)") + " | " + q(mut &a, &"select plus10(1)"))
+        let c2 = q(mut &a, &"create or replace function plus10(x int) returns int language sql as 'select x + 100'")
+        println("replaced elsewhere: " + q(mut &b, &"select plus10(1)"))
+        let c3 = q(mut &a, &"drop function plus10(int)")
+        println("dropped elsewhere: " + q(mut &b, &"select plus10(1)"))
+        var c = lexdb_exec.newSession(st.share())
+        let c4 = q(mut &b, &"create function twice(x int) returns int language sql as 'select 2 * x'")
+        println("a third session: " + q(mut &c, &"select plus10(1)") + " | " + q(mut &c, &"select twice(2) + 1"))
+        return 0
+    }).unwrap()
+}
