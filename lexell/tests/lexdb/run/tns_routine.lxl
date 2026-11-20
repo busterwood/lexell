@@ -1,0 +1,131 @@
+// lexdb_tns, stored procedures and functions (design/lexdb-dialect-gaps.md, package F: Oracle's exist, checked, not rebuilt):
+// CREATE, CREATE OR REPLACE, a name used by another kind (ORA-00955), CALL and a block's call, DROP PROCEDURE and DROP FUNCTION and
+// their errors (ORA-04043), a call of one dropped (ORA-06550), the dictionary's USER_OBJECTS. No Oracle was at hand: the answers
+// are as Oracle's documentation gives them.
+// expect: create: ok
+// expect: again: error 955
+// expect: replace: ok 12
+// expect: kind clash: error 955
+// expect: function: 21 22
+// expect: call: 16
+// expect: objects: 'QF1' 'FUNCTION', 'QP1' 'PROCEDURE'
+// expect: drop: ok
+// expect: drop again: error 4043
+// expect: drop function of a procedure: error 4043
+// expect: drop procedure of a function: error 4043
+// expect: call dropped: error 6550
+// expect: recreate: ok 5
+// expect: objects after: 'QF1' 'FUNCTION', 'QP1' 'PROCEDURE'
+// expect: drop both: ok ok
+// expect: objects none: 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn text(r: &oracle.Rows, row: int, col: int): str {
+    match r.isNull(row, col) {
+        Ok(n) {
+            if n { return "NULL" }
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+    match r.value(row, col) {
+        Ok(v) { return v.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn row(r: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..r.columnCount() { append(mut &out, text(r, row, i)) }
+    return strings.join(&out, " ")
+}
+
+fn rowsOf(r: &oracle.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() { append(mut &out, row(r, i)) }
+    return strings.join(&out, ", ")
+}
+
+fn outs(c: mut &oracle.Conn, sql: str, os: &[oracle.Out]): oracle.Results {
+    let none: []sqldialect.Value = []
+    match c.call(&sql, &none, os) {
+        Ok(r) { return r }
+        Err(e) {
+            println("call: error " + e.code.toStr() + " " + e.msg + " for " + sql)
+            exit(1)
+        }
+    }
+}
+
+fn failure(c: mut &oracle.Conn, sql: str, os: &[oracle.Out]): str {
+    let none: []sqldialect.Value = []
+    match c.call(&sql, &none, os) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    var c = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb"))
+    let none: []sqldialect.Value = []
+    println("create: " + failure(mut &c, "create procedure qp1(a number, b out number) is begin b := a * 2; end;", &[]))
+    println("again: " + failure(mut &c, "create procedure qp1(a number, b out number) is begin b := a * 2; end;", &[]))
+    let r1 = failure(mut &c, "create or replace procedure qp1(a number, b out number) is begin b := a * 3; end;", &[])
+    let r2 = outs(mut &c, "begin qp1(4, :b); end;", &[oracle.out("b", "NUMBER")])
+    println("replace: " + r1 + " " + row(&r2.outputs, 0))
+    println("kind clash: " + failure(mut &c, "create or replace function qp1(a number) return number is begin return a; end;", &[]))
+    let f = failure(mut &c, "create function qf1(a number, b number default 1) return number is begin return a * 10 + b; end;", &[])
+    let r3 = outs(mut &c, "begin :x := qf1(2); :y := qf1(2, 2); end;", &[oracle.out("x", "NUMBER"), oracle.out("y", "NUMBER")])
+    println("function: " + row(&r3.outputs, 0))
+    let r4 = outs(mut &c, "call qp1(2, :b)", &[oracle.out("b", "NUMBER")])
+    let r5 = outs(mut &c, "call qf1(1, 6) into :r", &[oracle.out("r", "NUMBER")])
+    println("call: " + row(&r5.outputs, 0))
+    println("objects: " + rowsOf(&c.query("select object_name, object_type from user_objects where object_type in ('PROCEDURE', 'FUNCTION') order by object_name", &none).unwrap()))
+    println("drop: " + failure(mut &c, "drop procedure qp1", &[]))
+    println("drop again: " + failure(mut &c, "drop procedure qp1", &[]))
+    println("drop function of a procedure: " + failure(mut &c, "drop function qp1", &[]))
+    println("drop procedure of a function: " + failure(mut &c, "drop procedure qf1", &[]))
+    println("call dropped: " + failure(mut &c, "begin qp1(1, :b); end;", &[oracle.out("b", "NUMBER")]))
+    let again = failure(mut &c, "create procedure qp1(a number, b out number) is begin b := a + 1; end;", &[])
+    let r6 = outs(mut &c, "begin qp1(4, :b); end;", &[oracle.out("b", "NUMBER")])
+    println("recreate: " + again + " " + row(&r6.outputs, 0))
+    println("objects after: " + rowsOf(&c.query("select object_name, object_type from user_objects where object_type in ('PROCEDURE', 'FUNCTION') order by object_name", &none).unwrap()))
+    let d1 = failure(mut &c, "drop procedure qp1", &[])
+    let d2 = failure(mut &c, "drop function qf1", &[])
+    println("drop both: " + d1 + " " + d2)
+    println("objects none: " + rowsOf(&c.query("select count(*) from user_objects where object_type in ('PROCEDURE', 'FUNCTION')", &none).unwrap()))
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(6), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

@@ -1,0 +1,517 @@
+// lexdb_routine: stored procedures and functions (design/lexdb-dialect-gaps.md, package F). The catalog records
+// (lexdb_sql.Routine, kept by lexdb_catalog) made, replaced, dropped and found; a call's arguments matched to the
+// parameters; and PostgreSQL's SQL functions written into the queries that call them. Running a body is the session's:
+// lexdb_exec for PostgreSQL's procedures, lexdb_tsql for T-SQL's. This module takes the store and statements only.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+import "./lexdb_parse"
+
+type Routine = lexdb_sql.Routine
+type RParam = lexdb_sql.RParam
+type DbErr = lexdb_base.DbErr
+type Expr = lexdb_sql.Expr
+type Stmt = lexdb_sql.Stmt
+type Val = lexdb_sql.Val
+type TypeName = lexdb_sql.TypeName
+
+fn err(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// ---- the catalog's records
+
+// A routine's identity among those of its name: PostgreSQL's, the types of the arguments it is called with (the IN,
+// INOUT and VARIADIC ones, comma-separated oids); T-SQL's has none.
+pub fn sigOf(r: &Routine): str {
+    if r.dialect == lexdb_sql.RD_TSQL { return "" }
+    var o: []str = []
+    for p in r.params { if p.mode != "out" { append(mut &o, p.typ.oid.toStr()) } }
+    return strings.join(&o, ",")
+}
+
+// The routines of a dialect named key (a table's key: public's unqualified), every signature.
+pub fn find(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, key: &str): Result[[]Routine, DbErr] {
+    let pre = lexdb_catalog.routineKey(dialect, key, "")
+    let hi = pre + "\xff"
+    var out: []Routine = []
+    try st.scan(txn, lexdb_catalog.CATALOG, &pre, &hi, fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, lexdb_catalog.decRoutine(&en.val))
+        return true
+    })
+    return Ok(out)
+}
+
+// The routines of a dialect, whatever their names.
+pub fn ofDialect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int): Result[[]Routine, DbErr] {
+    var out: []Routine = []
+    for r in try lexdb_catalog.allRoutines(st, txn) { if r.dialect == dialect { append(mut &out, r) } }
+    return Ok(out)
+}
+
+// Makes a routine, or with replace changes the one of its name and signature. taken: the name is a table's, a view's or
+// a sequence's (T-SQL's objects share their names). The errors are the dialect's.
+pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, replace: bool, taken: bool): Result[Unit, DbErr] {
+    let sig = sigOf(r)
+    let have = try find(st, txn, r.dialect, &r.key)
+    var old: Option[Routine] = None
+    for h in have { if sigOf(&h) == sig { old = Some(h) } }
+    let base = lexdb_sql.baseName(&r.key)
+    if r.dialect == lexdb_sql.RD_TSQL {
+        if taken || (old.isSome() && !replace) { return Err(err("TS2714", &("There is already an object named '" + base + "' in the database."))) }
+        // OR ALTER of a function made by the other kind: SQL Server's, "is not a procedure" (later slices)
+    } else {
+        match old {
+            Some(o) {
+                if !replace { return Err(err("42723", &((if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }) + " \"" + base + "\" already exists with same argument types"))) }
+                if o.kind != r.kind { return Err(err("42809", &("\"" + base + "\" is not a " + (if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" })))) }
+                if r.kind == lexdb_sql.RK_FUNC && (o.ret.oid != r.ret.oid || o.ret.kind != r.ret.kind) { return Err(err("42P13", "cannot change return type of existing function")) }
+                // the names of the input parameters stay
+                var k = 0
+                for i in 0..len(o.params) {
+                    if o.params[i].mode == "out" { continue }
+                    while k < len(r.params) && r.params[k].mode == "out" { k += 1 }
+                    if k < len(r.params) && len(o.params[i].name) > 0 && o.params[i].name != r.params[k].name {
+                        return Err(err("42P13", &("cannot change name of input parameter \"" + o.params[i].name + "\"")))
+                    }
+                    k += 1
+                }
+            }
+            None {}
+        }
+    }
+    try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(r.dialect, &r.key, &sig)), &(lexdb_catalog.encRoutine(r)))
+    return Ok(Unit{})
+}
+
+// What DROP did to one name: the routines dropped, or the notice for IF EXISTS.
+pub type Dropped = record { pub notice: str }
+
+// DROP FUNCTION | PROCEDURE | ROUTINE for one name: kw the keyword; sig the signature written ("*": none); spell the name as
+// written; fmt a type's name for the messages (oid to text); roles and super: who drops.
+pub fn dropOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, key: &str, sig: &str, kw: &str, spell: &str, ifExists: bool,
+               fmt: &fn(int): str, roles: &[]str, super: bool): Result[Dropped, DbErr] {
+    let have = try find(st, txn, dialect, key)
+    var hit: []Routine = []
+    if dialect == lexdb_sql.RD_TSQL {
+        for h in have { if (kw == "procedure" && h.kind == lexdb_sql.RK_PROC) || (kw == "function" && h.kind == lexdb_sql.RK_FUNC) || kw == "routine" { append(mut &hit, h) } }
+        if len(hit) == 0 {
+            if ifExists { return Ok(Dropped{notice: ""}) }
+            return Err(err("TS3701", &("Cannot drop the " + kw + " '" + spell + "', because it does not exist or you do not have permission.")))
+        }
+    } else {
+        for h in have {
+            if sig == "*" {
+                if kw == "routine" || (kw == "function" && h.kind == lexdb_sql.RK_FUNC) || (kw == "procedure" && h.kind == lexdb_sql.RK_PROC) { append(mut &hit, h) }
+            } else if sigOf(&h) == sig {
+                append(mut &hit, h)
+            }
+        }
+        let what = kw.toStr()
+        if len(hit) == 0 {
+            var shown = "()"
+            if sig != "*" {
+                var ts: []str = []
+                if len(sig) > 0 { for o in strings.split(sig, ",") { append(mut &ts, fmt(lexdb_base.num(&o))) } }
+                shown = "(" + strings.join(&ts, ", ") + ")"
+            }
+            if ifExists { return Ok(Dropped{notice: what + " " + spell + shown + " does not exist, skipping"}) }
+            if sig == "*" { return Err(err("42883", &("could not find a " + what + " named \"" + spell + "\""))) }
+            return Err(err("42883", &(what + " " + spell + shown + " does not exist")))
+        }
+        if len(hit) > 1 { return Err(err("42725", &(what + " name \"" + spell + "\" is not unique"))) }
+        let h = &hit[0]
+        let isProc = h.kind == lexdb_sql.RK_PROC
+        if (kw == "function" && isProc) || (kw == "procedure" && !isProc) {
+            var ts: []str = []
+            for p in h.params { if p.mode != "out" { append(mut &ts, fmt(p.typ.oid)) } }
+            return Err(err("42809", &(spell + "(" + strings.join(&ts, ", ") + ") is not a " + kw)))
+        }
+    }
+    for h in hit {
+        if !super && !lexdb_base.hasStr(roles, &h.owner) {
+            return Err(err("42501", &("must be owner of " + (if h.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }) + " " + spell)))
+        }
+        txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(dialect, key, &sigOf(&h))))
+    }
+    return Ok(Dropped{notice: ""})
+}
+
+// The names of PostgreSQL's SQL functions, kept in the store's memo once known (a function made adds to it; one dropped is
+// left: a name more only costs a look at the catalog).
+const FN_KEY: str = "rtn.fn"
+
+pub fn knownNames(st: &lexdb_store.Store): Option[[]str] {
+    match st.memo.get(&FN_KEY) {
+        Some(v) {
+            var out: []str = []
+            if len(v) == 0 { return Some(out) }
+            for n in strings.split(&v, "\x00") { if len(n) > 0 { append(mut &out, n.toStr()) } }
+            return Some(out)
+        }
+        None { return None }
+    }
+}
+
+pub fn setNames(st: &lexdb_store.Store, names: &[]str) {
+    var b = ""
+    for n in names { b += n + "\x00" }
+    st.memo.put(&FN_KEY, &b)
+}
+
+// A function named base was made.
+pub fn noteFunction(st: &lexdb_store.Store, base: &str) {
+    match knownNames(st) {
+        Some(ns) {
+            if !lexdb_base.hasStr(&ns, base) {
+                var all = ns.clone()
+                append(mut &all, base.toStr())
+                setNames(st, &all)
+            }
+        }
+        None {}
+    }
+}
+
+// ---- a call's arguments
+
+// The slot of each parameter of r in a call of nargs arguments (names: each one's name, "" by place): the argument's
+// place, or -1 for a default (and for an output parameter a function call leaves out). None: the call does not fit r.
+// A procedure's arguments run over all its parameters, a function's over its inputs (PostgreSQL's CALL names the
+// outputs, a query's function call does not).
+pub fn slots(r: &Routine, nargs: int, names: &[]str): Option[[]int] {
+    let proc = r.kind == lexdb_sql.RK_PROC
+    var out: []int = []
+    for p in r.params { append(mut &out, -2) }
+    var k = 0
+    var named = false
+    for a in 0..nargs {
+        let nm = if a < len(names) { names[a].toStr() } else { "" }
+        if len(nm) == 0 {
+            if named { return None }
+            while k < len(r.params) && !proc && r.params[k].mode == "out" { k += 1 }
+            if k >= len(r.params) { return None }
+            out[k] = a
+            k += 1
+        } else {
+            named = true
+            var f = -1
+            for i in 0..len(r.params) { if r.params[i].name == nm && (proc || r.params[i].mode != "out") { f = i } }
+            if f < 0 || out[f] != -2 { return None }
+            out[f] = a
+        }
+    }
+    for i in 0..len(r.params) {
+        if out[i] == -2 {
+            if r.params[i].mode == "out" {
+                if proc { return None }         // a procedure's call gives its outputs too
+                out[i] = -1
+            }
+            else if r.params[i].has { out[i] = -1 }
+            else { return None }
+        }
+    }
+    return Some(out)
+}
+
+// Whether a value's kind is the kind of a parameter's type (the overload that fits the arguments best).
+pub fn kindFits(v: &Val, t: &TypeName): bool {
+    match v {
+        Val.Int(_) { return t.kind == lexdb_sql.K_INT }
+        Val.Text(_) { return t.kind == lexdb_sql.K_TEXT }
+        Val.Bool(_) { return t.kind == lexdb_sql.K_BOOL }
+        Val.Num(_) { return t.kind == lexdb_sql.K_NUM }
+        else { return false }
+    }
+}
+
+// ---- a body's parameters
+
+// The text of a body with each use of a named input parameter written as $n (its place among the inputs, from 1): fname.name
+// too. A name after a "." or before a "(" is a column's or a function's, and stays; so does a name in skip (a column of a
+// table the body reads: PostgreSQL's columns win over parameters).
+pub fn bindNames(body: &str, fname: &str, r: &Routine, skip: &[]str): Result[str, DbErr] {
+    var names: []str = []
+    var nums: []int = []
+    var n = 0
+    for p in r.params {
+        if p.mode == "out" { continue }
+        n += 1
+        if len(p.name) > 0 && !lexdb_base.hasStr(skip, &p.name) {
+            append(mut &names, p.name.clone())
+            append(mut &nums, n)
+        }
+    }
+    if len(names) == 0 { return Ok(body.toStr()) }
+    return lexdb_parse.substParams(body, fname, &names, &nums)
+}
+
+// ---- PostgreSQL's SQL functions in queries
+
+fn mapE(x: &Expr, f: &fn(&Expr): Option[Expr]): Expr {
+    match f(x) {
+        Some(y) { return y }
+        None {}
+    }
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), mapE(&a, f)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), mapE(&a, f), mapE(&b, f)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(mapE(&a, f), neg) }
+        Expr.Call(nm, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, mapE(&a, f)) }
+            return Expr.Call(nm.clone(), out, star)
+        }
+        Expr.Cast(a, t) { return Expr.Cast(mapE(&a, f), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+fn mapO(x: &Option[Expr], f: &fn(&Expr): Option[Expr]): Option[Expr] {
+    match x {
+        Some(e) { return Some(mapE(&e, f)) }
+        None { return None }
+    }
+}
+
+fn mapWin(w: &lexdb_sql.WinDef, f: &fn(&Expr): Option[Expr]): lexdb_sql.WinDef {
+    var out = w.clone()
+    out.call = mapE(&w.call, f)
+    for i in 0..len(w.part) { out.part[i] = mapE(&w.part[i], f) }
+    for i in 0..len(w.order) { out.order[i].expr = mapE(&w.order[i].expr, f) }
+    out.frame.startOff = mapO(&w.frame.startOff, f)
+    out.frame.endOff = mapO(&w.frame.endOff, f)
+    return out
+}
+
+// s with f applied to each of its expressions (and its subqueries'): f's Some replaces the expression it was given.
+pub fn mapStmt(s: &Stmt, f: &fn(&Expr): Option[Expr]): Stmt {
+    var out = mapStmtTop(s, f)
+    for i in 0..len(s.subs) { out.subs[i] = mapStmt(&s.subs[i], f) }
+    for i in 0..len(s.inner) { out.inner[i] = mapStmt(&s.inner[i], f) }
+    return out
+}
+
+// mapStmt for the statement's own expressions only.
+pub fn mapStmtTop(s: &Stmt, f: &fn(&Expr): Option[Expr]): Stmt {
+    var out = s.clone()
+    for i in 0..len(s.items) { out.items[i].expr = mapO(&s.items[i].expr, f) }
+    out.where = mapO(&s.where, f)
+    for i in 0..len(s.group) { out.group[i] = mapE(&s.group[i], f) }
+    for i in 0..len(s.order) { out.order[i].expr = mapE(&s.order[i].expr, f) }
+    out.limit = mapO(&s.limit, f)
+    out.offset = mapO(&s.offset, f)
+    out.having = mapO(&s.having, f)
+    for i in 0..len(s.sets) { out.sets[i].expr = mapE(&s.sets[i].expr, f) }
+    for i in 0..len(s.rows) { for j in 0..len(s.rows[i]) { out.rows[i][j] = mapE(&s.rows[i][j], f) } }
+    for i in 0..len(s.exprs) { out.exprs[i] = mapE(&s.exprs[i], f) }
+    for i in 0..len(s.distinctOn) { out.distinctOn[i] = mapE(&s.distinctOn[i], f) }
+    for i in 0..len(s.from) { out.from[i].on = mapO(&s.from[i].on, f) }
+    for i in 0..len(s.wins) { out.wins[i] = mapWin(&s.wins[i], f) }
+    for i in 0..len(s.merges) {
+        out.merges[i].cond = mapO(&s.merges[i].cond, f)
+        for j in 0..len(s.merges[i].sets) { out.merges[i].sets[j].expr = mapE(&s.merges[i].sets[j].expr, f) }
+        for j in 0..len(s.merges[i].vals) { out.merges[i].vals[j] = mapE(&s.merges[i].vals[j], f) }
+    }
+    return out
+}
+
+// Whether a statement calls a function of one of these names (lower case, unqualified): its expressions walked.
+pub fn callsAny(s: &Stmt, names: &[]str): bool {
+    var found = false
+    let t = mapStmt(s, fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Call(nm, args, star) {
+                let b = lexdb_sql.baseName(&nm)
+                for n in names { if n == b { found = true } }
+            }
+            else {}
+        }
+        return None
+    })
+    return found
+}
+
+// The routine a call resolves to: by name through the schemas of path (a qualified name: its schema), then by the number of
+// its arguments. A procedure of that name is an error here (42809): a query calls functions.
+fn resolve(fns: &[]Routine, path: &[]str, name: &str, nargs: int): Result[Option[Routine], DbErr] {
+    let base = lexdb_sql.baseName(name)
+    let qualified = lexdb_sql.isQual(name)
+    let sch: []str = if qualified { [lexdb_sql.schemaOf(name)] } else { path.clone() }
+    for sc in sch {
+        let key = lexdb_sql.qual(&sc, &base)
+        for r in fns {
+            if r.key == key && !r.retSet {
+                let names: []str = []
+                if slots(&r, nargs, &names).isNone() { continue }
+                if r.kind == lexdb_sql.RK_PROC {
+                    var d = err("42809", &(base + "() is a procedure"))
+                    d.hint = "To call a procedure, use CALL."
+                    return Err(d)
+                }
+                return Ok(Some(r.clone()))
+            }
+        }
+    }
+    return Ok(None)
+}
+
+// Whether an argument is a value the statement is given (no column, no subquery of its own).
+fn constArg(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Col(_, _) { return false }
+        Expr.Unary(_, a) { return constArg(&a) }
+        Expr.Bin(_, a, b) { return constArg(&a) && constArg(&b) }
+        Expr.IsNull(a, _) { return constArg(&a) }
+        Expr.Cast(a, _) { return constArg(&a) }
+        Expr.Call(n, args, _) {
+            if len(n) > 0 && n[0] == '#' { return false }
+            for a in args { if !constArg(&a) { return false } }
+            return true
+        }
+    }
+}
+
+// What a function's call becomes: its body's expression with the arguments for its parameters, or, for a body that reads
+// tables, a scalar subquery of the statement (added to extra: the statement's subs from base) over arguments that are
+// values.
+fn expand(r: &Routine, args: &[]Expr, extra: mut &[]Stmt, base: int): Result[Expr, DbErr] {
+    let fname = lexdb_sql.baseName(&r.key)
+    let bound = try bindNames(&r.body, &fname, r, &[])
+    let stmts = try lexdb_parse.parse(&bound)
+    let names: []str = []
+    let sl = slots(r, len(args), &names).unwrap()
+    // the input parameters' arguments (a default's text parsed where it is used)
+    var ins: []Expr = []
+    var strictNull: []Expr = []
+    var allConst = true
+    for i in 0..len(r.params) {
+        if r.params[i].mode == "out" { continue }
+        var a: Expr = Expr.Lit(Val.Null)
+        if sl[i] >= 0 { a = lexdb_sql.cloneExpr(&args[sl[i]]) } else { a = try lexdb_parse.parseExpr(&r.params[i].dflt) }
+        if !constArg(&a) { allConst = false }
+        let c = Expr.Cast(a, r.params[i].typ)
+        append(mut &strictNull, Expr.IsNull(lexdb_sql.cloneExpr(&c), false))
+        append(mut &ins, c)
+    }
+    let subst = fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Param(n) {
+                if n >= 1 && n <= len(ins) { return Some(lexdb_sql.cloneExpr(&ins[n - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    }
+    // the last statement is the value (PostgreSQL's: a function's final SELECT)
+    if len(stmts) == 0 || stmts[len(stmts) - 1].kind != lexdb_sql.S_SELECT || len(stmts[len(stmts) - 1].items) != 1 || stmts[len(stmts) - 1].items[0].star {
+        return Err(err("0A000", &("lexdb: the function " + fname + " cannot be used in a query yet: its body must end in a SELECT of one value")))
+    }
+    let b = &stmts[len(stmts) - 1]
+    let simple = len(stmts) == 1 && len(b.from) == 0 && b.where.isNone() && len(b.group) == 0 && b.having.isNone() && len(b.order) == 0 && b.limit.isNone() &&
+                 b.offset.isNone() && !b.distinct && len(b.subs) == 0 && len(b.wins) == 0 && b.items[0].expr.isSome() && len(b.assign) == 0 && b.setop == 0
+    var e: Expr = Expr.Lit(Val.Null)
+    if simple {
+        let body = b.items[0].expr.clone().unwrap()
+        e = mapE(&body, subst)
+    } else {
+        if len(stmts) > 1 { return Err(err("0A000", &("lexdb: the function " + fname + " cannot be used in a query yet: its body must be one SELECT"))) }
+        if !allConst { return Err(err("0A000", &("lexdb: the function " + fname + " reads tables: it cannot be given a column or a subquery as an argument yet"))) }
+        var sq = mapStmt(b, subst)
+        sq.use = lexdb_sql.SUB_SCALAR
+        sq.params = 0
+        sq.src = ""
+        append(extra, sq)
+        e = Expr.Call("#sub", [Expr.Lit(Val.Int(base + len(extra) - 1))], false)
+    }
+    if r.ret.oid != 0 && r.ret.oid != 2278 && r.ret.oid != 2249 { e = Expr.Cast(e, r.ret) }
+    if strings.contains(&r.attrs, "strict") && len(strictNull) > 0 {
+        var cond = lexdb_sql.cloneExpr(&strictNull[0])
+        for i in 1..len(strictNull) { cond = Expr.Bin("or", cond, lexdb_sql.cloneExpr(&strictNull[i])) }
+        e = Expr.Call("case else", [cond, Expr.Lit(Val.Null), e], false)
+    }
+    return Ok(e)
+}
+
+// x with the calls of PostgreSQL's SQL functions in it written as their bodies (the arguments' first).
+fn inlineExpr(x: &Expr, fns: &[]Routine, path: &[]str, depth: int, failure: mut &Option[DbErr], changed: mut &bool, extra: mut &[]Stmt, base: int): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), inlineExpr(&a, fns, path, depth, failure, changed, extra, base)) }
+        Expr.Bin(op, a, b) {
+            let l = inlineExpr(&a, fns, path, depth, failure, changed, extra, base)
+            return Expr.Bin(op.clone(), l, inlineExpr(&b, fns, path, depth, failure, changed, extra, base))
+        }
+        Expr.IsNull(a, neg) { return Expr.IsNull(inlineExpr(&a, fns, path, depth, failure, changed, extra, base), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(inlineExpr(&a, fns, path, depth, failure, changed, extra, base), t) }
+        Expr.Call(nm, args, star) {
+            var done: []Expr = []
+            for a in args { append(mut &done, inlineExpr(&a, fns, path, depth, failure, changed, extra, base)) }
+            if star || len(nm) == 0 || nm[0] == '#' { return Expr.Call(nm.clone(), done, star) }
+            match resolve(fns, path, &nm, len(done)) {
+                Ok(found) {
+                    match found {
+                        Some(r) {
+                            if depth > 32 {
+                                if failure.isNone() { failure = Some(err("54001", "stack depth limit exceeded")) }
+                                return lexdb_sql.cloneExpr(x)
+                            }
+                            match expand(&r, &done, extra, base) {
+                                Ok(e) {
+                                    changed = true
+                                    return inlineExpr(&e, fns, path, depth + 1, failure, changed, extra, base)
+                                }
+                                Err(e) {
+                                    if failure.isNone() { failure = Some(e) }
+                                    return lexdb_sql.cloneExpr(x)
+                                }
+                            }
+                        }
+                        None { return Expr.Call(nm.clone(), done, star) }
+                    }
+                }
+                Err(e) {
+                    if failure.isNone() { failure = Some(e) }
+                    return lexdb_sql.cloneExpr(x)
+                }
+            }
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// s with the calls of PostgreSQL's SQL functions (fns: all of them, in the catalog) written as their bodies; None when it
+// calls none. A body that reads tables becomes a subquery of the statement, so each statement and subquery is done by itself.
+pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt], DbErr] {
+    var failure: Option[DbErr] = None
+    var changed = false
+    var extra: []Stmt = []
+    let base = len(s.subs)
+    var t = mapStmtTop(s, fn(x: &Expr): Option[Expr] { return Some(inlineExpr(x, fns, path, 0, mut &failure, mut &changed, mut &extra, base)) })
+    match failure {
+        Some(e) { return Err(e) }
+        None {}
+    }
+    for i in 0..len(t.subs) {
+        match try inlineCalls(&t.subs[i], fns, path) {
+            Some(u) {
+                t.subs[i] = u
+                changed = true
+            }
+            None {}
+        }
+    }
+    for i in 0..len(t.inner) {
+        match try inlineCalls(&t.inner[i], fns, path) {
+            Some(u) {
+                t.inner[i] = u
+                changed = true
+            }
+            None {}
+        }
+    }
+    for x in extra { append(mut &t.subs, x) }
+    if !changed { return Ok(None) }
+    return Ok(Some(t))
+}

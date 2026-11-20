@@ -1,0 +1,101 @@
+// lexdb_wire, stored functions and procedures through lib/postgres (design/lexdb-dialect-gaps.md, package F): the extended protocol's
+// Parse and Describe of a query that calls a SQL function with a $1 (the call written as its body before it is planned), a function
+// run for several values, a CALL with an OUT parameter (described as the columns it gives: a row), a CALL with none (NoData), a
+// procedure that writes, its error, and one connection seeing what another made.
+// expect: function: 7 9 11
+// expect: prepared in a query: 6 | 8
+// expect: call with OUT: columns c, 1 row, value 15
+// expect: call with none: 0 rows, affected 0
+// expect: written: 2 | 5
+// expect: call error: 23505
+// expect: unknown: 42883
+// expect: other connection: 12
+// expect: call prepared: 21 | 42
+// expect: plpgsql: 42704
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type V = sqldialect.Value
+
+fn state(e: &postgres.Error): str {
+    let t = e.toStr()
+    for code in ["23505", "42883", "42P01", "42704"] { if strings.contains(&t, &code) { return code } }
+    return t
+}
+
+fn firsts(r: &postgres.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() { append(mut &out, r.text(i, 0).unwrapOr("?")) }
+    return strings.join(&out, " ")
+}
+
+fn client(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(&dsn)
+    var other = try postgres.connect(&dsn)
+    try c.exec("create table log (id int primary key, note text)")
+    try c.exec("create function add5(a int) returns int language sql as $$ select a + 5 $$")
+    try c.exec("create procedure add_out(a int, out c int) language sql as $$ select a * 3 $$")
+    try c.exec("create procedure note(n int) language sql as $$ insert into log values (n, 'n'); insert into log values (n + 1, 'm') $$")
+    let q = try c.prepare("select add5($1)")
+    var vs: []str = []
+    for x in [2, 4, 6] { let rr = try c.queryPrepared(&q, &[V.Int(x)])
+        append(mut &vs, firsts(&rr))
+    }
+    println("function: " + strings.join(&vs, " "))
+    let r1 = try c.query("select add5($1), add5($2) + 1", &[V.Int(1), V.Int(2)])
+    println("prepared in a query: " + r1.text(0, 0).unwrapOr("?") + " | " + r1.text(0, 1).unwrapOr("?"))
+    let r2 = try c.query("call add_out($1, null)", &[V.Int(5)])
+    println("call with OUT: columns " + r2.columnName(0).unwrapOr("?") + ", " + r2.rowCount().toStr() + " row, value " + r2.text(0, 0).unwrapOr("?"))
+    let r3 = try c.query("call note($1)", &[V.Int(1)])
+    println("call with none: " + r3.rowCount().toStr() + " rows, affected " + r3.affected().toStr())
+    let r4 = try c.query("select count(*), max(id) + 3 from log", &[])
+    println("written: " + r4.text(0, 0).unwrapOr("?") + " | " + r4.text(0, 1).unwrapOr("?"))
+    match c.query("call note($1)", &[V.Int(1)]) {
+        Ok(_) { println("call error: ran") }
+        Err(e) { println("call error: " + state(&e)) }
+    }
+    match c.query("call nothing($1)", &[V.Int(1)]) {
+        Ok(_) { println("unknown: ran") }
+        Err(e) { println("unknown: " + state(&e)) }
+    }
+    let r5 = try other.query("select add5(7)", &[])
+    println("other connection: " + firsts(&r5))
+    let p = try c.prepare("call add_out($1, null)")
+    let a = try c.queryPrepared(&p, &[V.Int(7)])
+    let b = try c.queryPrepared(&p, &[V.Int(14)])
+    println("call prepared: " + a.text(0, 0).unwrapOr("?") + " | " + b.text(0, 0).unwrapOr("?"))
+    // PL/pgSQL is not installed in lexdb: the language is refused as PostgreSQL refuses one it does not have
+    match c.exec("create function pl() returns int language plpgsql as $$ begin return 1; end $$") {
+        Ok(_) { println("plpgsql: ran") }
+        Err(e) { println("plpgsql: " + state(&e)) }
+    }
+    return Ok(Unit{})
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st.share()})
+        match client(addr) {
+            Ok(_) {}
+            Err(e) { println("client: " + e.toStr()) }
+        }
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(14), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

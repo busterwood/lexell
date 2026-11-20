@@ -651,8 +651,26 @@ fn sysObj(name: &str, id: int, schemaId: int, parent: int, typ: &str, desc: &str
     return r.row()
 }
 
+// T-SQL's stored procedures (design/lexdb-dialect-gaps.md, package F): those the catalog has, their object ids and names as
+// written. (A routine made in another dialect is not one: its body is not T-SQL.)
+fn tsqlProcs(snap: &CatSnap): []lexdb_sql.Routine {
+    var out: []lexdb_sql.Routine = []
+    for r in snap.routines { if r.dialect == lexdb_sql.RD_TSQL && r.kind == lexdb_sql.RK_PROC { append(mut &out, r.clone()) } }
+    return out
+}
+
+pub fn procOid(r: &lexdb_sql.Routine): int { return lexdb_sql.nameOid(&"R", &r.key) }
+
+fn procName(r: &lexdb_sql.Routine): str {
+    var n = if len(r.spell) > 0 { r.spell.toStr() } else { lexdb_sql.baseName(&r.key) }
+    let d = strings.lastIndexOf(&n, ".")
+    if d >= 0 { n = n[d + 1..len(n)].toStr() }
+    if len(n) > 1 && ((n[0] == '[' && n[len(n) - 1] == ']') || (n[0] == '"' && n[len(n) - 1] == '"')) { n = n[1..len(n) - 1].toStr() }
+    return n
+}
+
 // The user objects SQL Server lists in sys.objects: tables, views,
-// constraints, defaults, sequences.
+// constraints, defaults, sequences, procedures.
 fn sysObjects(snap: &CatSnap): [][]Val {
     var rows: [][]Val = []
     for ct in snap.tabs {
@@ -678,6 +696,9 @@ fn sysObjects(snap: &CatSnap): [][]Val {
         let sc = lexdb_sql.schemaOf(&d.key)
         if lexdb_base.isTempSchema(&sc) { continue }
         append(mut &rows, sysObj(&lexdb_sql.baseName(&d.key), lexdb_catalog.seqOid(&d), sysSchemaId(&sc), 0, &"SO", &"SEQUENCE_OBJECT", false))
+    }
+    for r in tsqlProcs(snap) {
+        append(mut &rows, sysObj(&procName(&r), procOid(&r), sysSchemaId(&lexdb_sql.schemaOf(&r.key)), 0, &"P", &"SQL_STORED_PROCEDURE", false))
     }
     // a table type's table: TT_name_hex, SQL Server's own
     for t in snap.ttypes {
@@ -1229,7 +1250,54 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 }
             }
         }
+        "procedures" {
+            for r in tsqlProcs(&snap) {
+                var x = sysTemplate(&"procedures")
+                x.set(&"name", tv(&procName(&r)))
+                x.set(&"object_id", iv(procOid(&r)))
+                x.set(&"principal_id", Val.Null)
+                x.set(&"schema_id", iv(sysSchemaId(&lexdb_sql.schemaOf(&r.key))))
+                x.set(&"parent_object_id", iv(0))
+                x.set(&"type", tv(&"P "))
+                x.set(&"type_desc", tv(&"SQL_STORED_PROCEDURE"))
+                x.set(&"create_date", sysTs())
+                x.set(&"modify_date", sysTs())
+                x.set(&"is_ms_shipped", bv(false))
+                append(mut &rows, x.row())
+            }
+        }
+        "parameters" {
+            for r in tsqlProcs(&snap) {
+                for i in 0..len(r.params) {
+                    let p = &r.params[i]
+                    let ty = sqlTypeOf(&p.typ, &"")
+                    var x = sysTemplate(&"parameters")
+                    x.set(&"object_id", iv(procOid(&r)))
+                    x.set(&"name", tv(&p.name))
+                    x.set(&"parameter_id", iv(i + 1))
+                    x.set(&"system_type_id", iv(ty.sys))
+                    x.set(&"user_type_id", iv(ty.user))
+                    x.set(&"max_length", iv(ty.maxLen))
+                    x.set(&"precision", iv(ty.prec))
+                    x.set(&"scale", iv(ty.scale))
+                    x.set(&"is_output", bv(p.mode == "out"))
+                    x.set(&"is_cursor_ref", bv(false))
+                    x.set(&"has_default_value", bv(false))
+                    x.set(&"is_xml_document", bv(false))
+                    x.set(&"xml_collection_id", iv(0))
+                    x.set(&"is_readonly", bv(p.readonly))
+                    x.set(&"is_nullable", bv(true))
+                    append(mut &rows, x.row())
+                }
+            }
+        }
         "sql_modules" {
+            for r in tsqlProcs(&snap) {
+                var x = sysTemplate(&"sql_modules")
+                x.set(&"object_id", iv(procOid(&r)))
+                x.set(&"definition", tv(&r.def))
+                append(mut &rows, x.row())
+            }
             for v in snap.views {
                 if lexdb_base.isTempSchema(&v.schema) { continue }
                 var r = sysTemplate(&"sql_modules")
@@ -1305,6 +1373,7 @@ pub fn bind(snap: &CatSnap, b: mut &str) {
         let d = viewDef(&v)
         if len(d) > 0 { b += &("D\t" + v.oid.toStr() + "\t" + escDef(&d) + "\n") }
     }
+    for r in tsqlProcs(snap) { b += &("D\t" + procOid(&r).toStr() + "\t" + escDef(&r.def) + "\n") }
     // Y table types (user_type_id, schema_id, name)
     for t in snap.ttypes { b += &("Y\t" + lexdb_sql.nameOid("T", &t.key).toStr() + "\t" + sysSchemaId(&lexdb_sql.schemaOf(&t.key)).toStr() + "\t" + lexdb_catalog.clean(&t.spell) + "\n") }
     for r in sysObjects(snap) {

@@ -466,6 +466,11 @@ pub const S_ANALYZE = 58        // ANALYZE, or VACUUM with ANALYZE: S_MAINT's fo
 pub const S_MERGE = 59          // MERGE (design/lexdb.md 9.121), one statement for the three dialects: the target in table
                                 // (alias in alias), the source in from[0], ON in where, the WHEN clauses in merges, RETURNING
                                 // (T-SQL OUTPUT) in items, T-SQL's TOP in limit, the dialect in mdialect
+pub const S_CREATE_ROUTINE = 70 // CREATE [OR REPLACE | OR ALTER] PROCEDURE | FUNCTION (package F): the routine in rtn[0] (its name
+                                // in table too), OR REPLACE | OR ALTER in ifFlag
+pub const S_DROP_ROUTINE = 71   // DROP PROCEDURE | FUNCTION [IF EXISTS] name [(types)], ...: each "key\x00signature" (signature "*": none
+                                // given) in names, as written in spells; the kind in index ("procedure", "function", "routine")
+pub const S_CALL = 72           // CALL name(args): the name in table, the arguments in rows[0]
 pub const S_SP_RENAME = 61     // T-SQL's sp_rename: the object's name as given in table, the new name in index (as given: the new name is one
                                 // part, taken as written), the type (COLUMN, INDEX, OBJECT) in alias, lower case, "" none
 pub const S_ALTER_DB = 60       // T-SQL's ALTER DATABASE name | CURRENT SET option, ...: the name in table ("" CURRENT), each option in names as
@@ -625,6 +630,47 @@ pub fn baseName(n: &str): str {
 // A possibly qualified name as SQL shows it: schema.name.
 pub fn shown(n: &str): str { return strings.replaceAll(n, QSEP, ".") }
 
+// A stored procedure or function (design/lexdb-dialect-gaps.md, package F): one record for every dialect that has them,
+// kept in the catalog tree (lexdb_catalog.routineKey). Oracle's PL/SQL units are not these (lexdb_plsql keeps and runs
+// them). A routine runs only for the dialect that made it (RD_*): its body is that dialect's text.
+pub const RK_PROC = 0
+pub const RK_FUNC = 1
+pub const RD_PG = 0             // PostgreSQL's: LANGUAGE sql, the body SQL statements
+pub const RD_TSQL = 1           // T-SQL's: the body a batch
+
+// A parameter: its name (T-SQL's with the @), type (and as written, for the catalog views), mode ("in", "out", "inout";
+// T-SQL's OUTPUT is "out") and DEFAULT (its expression's text; has says whether there is one).
+pub type RParam = record {
+    pub name: str
+    pub typ: TypeName
+    pub spell: str
+    pub mode: str
+    pub has: bool
+    pub dflt: str
+    pub readonly: bool          // T-SQL's READONLY (a table-valued parameter)
+}
+
+// key: the name as tables are keyed (public's unqualified); spell: as written. def: the statement's text as the dialect
+// keeps it (OBJECT_DEFINITION); body: what runs (T-SQL: the text after AS; PostgreSQL: the text between the quotes).
+// lang: PostgreSQL's LANGUAGE; attrs: its other attributes (strict, immutable, stable, ...), space-separated. ret: a
+// function's result type (ignored for a procedure).
+pub type Routine = record {
+    pub key: str
+    pub spell: str
+    pub kind: int
+    pub dialect: int
+    pub params: []RParam
+    pub ret: TypeName
+    pub retSpell: str
+    pub retSet: bool            // RETURNS SETOF / TABLE (later slices)
+    pub lang: str
+    pub attrs: str
+    pub body: str
+    pub def: str
+    pub owner: str
+    pub atomic: bool            // BEGIN ATOMIC ... END, RETURN expr (PostgreSQL 14)
+}
+
 pub type Stmt = record {
     pub kind: int
     pub table: str
@@ -707,6 +753,7 @@ pub type Stmt = record {
     pub mdialect: int           // S_MERGE, S_CREATE_VIEW: MD_*
     pub alter: bool             // S_CREATE_VIEW: T-SQL's ALTER VIEW (the view must be there; ifFlag is set too)
     pub mr: []MatchRec          // a MATCH_RECOGNIZE wrapper subquery: its clause (zero or one)
+    pub rtn: []Routine          // S_CREATE_ROUTINE: the routine (one)
 }
 
 // A result column with no name (T-SQL's 1 + 1, count(*)): its OutCol's
@@ -786,7 +833,7 @@ pub fn newStmt(kind: int): Stmt {
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
                 copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
-                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, waitMul: 1, pkName: "", merges: [], mdialect: MD_PG, alter: false, mr: []}
+                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, waitMul: 1, pkName: "", merges: [], mdialect: MD_PG, alter: false, mr: [], rtn: []}
 }
 
 // ---- the lexer

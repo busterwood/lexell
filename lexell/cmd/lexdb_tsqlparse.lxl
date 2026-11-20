@@ -46,7 +46,9 @@ pub const TS_USE = 19       // USE database: names[0]
 pub const TS_EXECSTR = 20   // EXEC (string): stmt[0] SELECT the string
 pub const TS_EXEC = 21      // EXEC [@r =] procedure args: names[0] the procedure (its last part); stmt[0] SELECT the
                             // arguments; names[1 + i] argument i's parameter name ("" positional); value: per
-                            // argument, the variable an OUTPUT one sets ("" none), \x1f between them
+                            // argument, the variable an OUTPUT one sets ("" none), \x1f between them; key: the
+                            // procedure's catalog key (dbo as public); ret: the variable @r takes its return code
+                            // ("" none); flags: the places of the arguments that are DEFAULT
 pub const TS_INSERTEXEC = 22 // INSERT [INTO] t [(columns)] EXEC ...: names[0] the table, names[1..] its columns; body[0] the EXEC
 // (design/lexdb-tds.md, section 14)
 pub const TS_INSERTBULK = 23 // INSERT BULK t (column type, ...) [WITH (...)]: names[0] the table, names[1..] the columns (folded),
@@ -61,6 +63,9 @@ pub type TStmt = record {
     pub value: str          // TS_SETOPT: the value
     pub body: []TStmt       // TS_IF, TS_WHILE, TS_BLOCK, TS_TRY: the statements run
     pub els: []TStmt        // TS_IF's ELSE, TS_TRY's CATCH
+    pub key: str            // TS_EXEC: the procedure's catalog key
+    pub ret: str            // TS_EXEC: the variable of EXEC @r = ...
+    pub flags: []int        // TS_EXEC: the arguments that are DEFAULT
 }
 
 // A parsed batch: its statements, and its variables (those given, then
@@ -84,7 +89,7 @@ fn isSetOption(w: &str): bool {
     return false
 }
 
-fn tstmt(kind: int): TStmt { return TStmt{kind: kind, stmt: [], names: [], types: [], value: "", body: [], els: []} }
+fn tstmt(kind: int): TStmt { return TStmt{kind: kind, stmt: [], names: [], types: [], value: "", body: [], els: [], key: "", ret: "", flags: []} }
 
 // Statements to the END that closes their block (not read).
 fn block(q: mut &Parser, types: mut &[]TypeName): Result[[]TStmt, DbErr] {
@@ -209,9 +214,15 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
     }
     var ts = tstmt(TS_EXEC)
     let r = q.peek().clone()
-    if r.kind == lexdb_parse.T_VAR && q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "=" { q.skip(2) }
+    if r.kind == lexdb_parse.T_VAR && q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "=" {
+        ts.ret = r.text.clone()
+        q.skip(2)
+    }
     let parts = try multiName(q)
     append(mut &ts.names, strings.toLowerAscii(&parts[len(parts) - 1]))
+    let sch = if len(parts) >= 2 { strings.toLowerAscii(&parts[len(parts) - 2]) } else { "" }
+    ts.key = if sch == "" || sch == "dbo" { strings.toLowerAscii(&parts[len(parts) - 1]) } else { lexdb_sql.qual(&sch, &strings.toLowerAscii(&parts[len(parts) - 1])) }
+    var seenNamed = false
     var args: []Expr = []
     var outs: []str = []
     while !atEnd(q) && !(q.peek().kind == lexdb_parse.T_IDENT && lexdb_parse.isTsqlStart(&q.peek().text)) {
@@ -223,12 +234,19 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
         }
         var out = ""
         let v = q.peek().clone()
+        if len(pname) > 0 { seenNamed = true }
+        else if seenNamed {
+            return Err(lexdb_base.err("TS119", &("Must pass parameter number " + (len(args) + 1).toStr() + " and subsequent parameters as '@name = value'. After the form '@name = value' has been used, all subsequent parameters must be passed in the form '@name = value'.")))
+        }
         if q.acceptKw("default") {
+            append(mut &ts.flags, len(args))
             append(mut &args, Expr.Lit(lexdb_sql.Val.Null))
         } else {
             append(mut &args, try q.expr())
             if q.acceptKw("output") || q.acceptKw("out") {
-                if v.kind != lexdb_parse.T_VAR { return Err(q.unexpected()) }
+                if v.kind != lexdb_parse.T_VAR {
+                    return Err(lexdb_base.err("TS179", "Cannot use the OUTPUT option when passing a constant to a stored procedure."))
+                }
                 out = v.text.clone()
             }
         }
@@ -237,6 +255,8 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
         if !q.acceptKw(",") { break }
     }
     ts.value = strings.join(&outs, "\x1f")
+    // EXEC p ... WITH RECOMPILE
+    if q.isKw("with") && q.peekAt(1).kind == lexdb_parse.T_IDENT && q.peekAt(1).text == "recompile" { q.skip(2) }
     append(mut &ts.stmt, q.values(args))
     return Ok(ts)
 }
@@ -423,11 +443,13 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
         }
         if t.text == "return" {
             q.skip(1)
+            var ts = tstmt(TS_RETURN)
             if !atEnd(q) && (q.peek().kind == lexdb_parse.T_NUM || q.peek().kind == lexdb_parse.T_VAR || q.isKw("(") || q.isKw("-")) {
                 q.fresh()
                 let x = try q.expr()
+                append(mut &ts.stmt, q.values([x]))
             }
-            return Ok(tstmt(TS_RETURN))
+            return Ok(ts)
         }
         if t.text == "print" {
             q.skip(1)
@@ -771,8 +793,67 @@ fn replaceDeclare(text: &str, nm: &str): str {
     return strFromBytes(&out)
 }
 
-// A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order).
+// A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order). A batch that is CREATE [OR ALTER] PROCEDURE
+// or ALTER PROCEDURE is that statement alone: its header is read here, the rest of the batch is the procedure's body (read
+// as a batch of its own, to check it, and kept as its text).
 pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBatch, DbErr] {
+    match try procBatch(sql0, d, vars) {
+        Some(b) { return Ok(b) }
+        None {}
+    }
+    return parseStmts(sql0, d, vars)
+}
+
+// CREATE [OR ALTER] PROC[EDURE] name [parameters] AS body, or ALTER PROC[EDURE]: the batch it is, else None.
+fn procBatch(sql: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[Option[TBatch], DbErr] {
+    let low = strings.toLowerAscii(sql)
+    if !strings.contains(&low, "proc") { return Ok(None) }
+    var q = match lexdb_parse.tsqlParser(sql, d, vars) {
+        Ok(x) { x }
+        Err(_) { return Ok(None) }
+    }
+    let first = q.peek().clone()
+    if first.kind != lexdb_parse.T_IDENT || (first.text != "create" && first.text != "alter") { return Ok(None) }
+    let create = first.text == "create"
+    var k = 1
+    var orAt = -1
+    var alterAt = -1
+    if create && q.peekAt(1).kind == lexdb_parse.T_IDENT && q.peekAt(1).text == "or" && q.peekAt(2).kind == lexdb_parse.T_IDENT && q.peekAt(2).text == "alter" {
+        orAt = q.peekAt(1).at
+        alterAt = q.peekAt(2).at
+        k = 3
+    }
+    let w = q.peekAt(k).clone()
+    if w.kind != lexdb_parse.T_IDENT || (w.text != "proc" && w.text != "procedure") { return Ok(None) }
+    q.skip(k + 1)
+    var r = try q.procHeader()
+    try q.expectKw("as")
+    let at = q.here()
+    let src = q.source()
+    r.body = src[at..len(src)].toStr()
+    // the text as SQL Server keeps it: from CREATE, OR ALTER left out (its words gone, the blanks between them kept)
+    // (ALTER is kept as CREATE, in capitals whatever it was written)
+    r.def = if orAt >= 0 { src[first.at..orAt].toStr() + src[orAt + 2..alterAt].toStr() + src[alterAt + 5..len(src)].toStr() }
+            else if !create { "CREATE" + src[first.at + 5..len(src)].toStr() } else { src[first.at..len(src)].toStr() }
+    r.lang = "tsql"
+    // the body, as a batch of its own, to be sure it is one (a procedure's parameters its variables)
+    var names: []str = []
+    for p in r.params { append(mut &names, p.name.clone()) }
+    var all: []str = []
+    for v in vars { append(mut &all, v.clone()) }
+    for n in names { append(mut &all, n.clone()) }
+    let b = try parseStmts(&r.body, d, &all)
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_ROUTINE)
+    s.table = r.key.clone()
+    s.ifFlag = orAt >= 0 || !create
+    if !create { s.alias = "alter" }
+    append(mut &s.rtn, r)
+    var ts = tstmt(TS_SQL)
+    append(mut &ts.stmt, s)
+    return Ok(Some(TBatch{stmts: [ts], vars: [], types: []}))
+}
+
+fn parseStmts(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBatch, DbErr] {
     let sql = tableVariables(sql0)
     var q = try lexdb_parse.tsqlParser(&sql, d, vars)
     var out: []TStmt = []
@@ -780,6 +861,22 @@ pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBat
     while true {
         while q.acceptKw(";") {}
         if q.peek().kind == lexdb_parse.T_EOF { break }
+        if len(out) == 0 && (q.peek().kind == lexdb_parse.T_IDENT || q.peek().kind == lexdb_parse.T_QIDENT) && q.peek().text != "call" &&
+           !(q.peek().kind == lexdb_parse.T_IDENT && (lexdb_sql.isReservedWord(&q.peek().text) || lexdb_parse.isTsqlStart(&q.peek().text))) {
+            // a procedure's name where a statement starts, EXEC left out: allowed for the first statement of a batch
+            let m = q.mark()
+            match tsqlStmt(mut &q, mut &types) {
+                Ok(t) { append(mut &out, t) }
+                Err(e) {
+                    q.reset(m)
+                    match execStmt(mut &q) {
+                        Ok(t) { append(mut &out, t) }
+                        Err(_) { return Err(e) }
+                    }
+                }
+            }
+            continue
+        }
         append(mut &out, try tsqlStmt(mut &q, mut &types))
     }
     return Ok(TBatch{stmts: out, vars: q.takeVars(), types: types})

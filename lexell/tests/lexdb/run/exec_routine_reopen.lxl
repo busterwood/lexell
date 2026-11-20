@@ -1,0 +1,103 @@
+// lexdb: stored procedures and functions across a store's reopen (design/lexdb-dialect-gaps.md, package F). PostgreSQL's
+// function and procedure are made through a session, T-SQL's procedure through lexdb_tsql (as the TDS door runs a batch),
+// the store is closed and opened again from the same disk: each is there, runs, and what was dropped stays dropped; a
+// replaced one has its new body. Oracle's PL/SQL units are lexdb_plsql's (tns_plsql).
+// expect: before: CREATE FUNCTION CREATE PROCEDURE ok ok ok
+// expect: pg: 6 | 12 | CALL | 1 row
+// expect: tsql: 7 10 7
+// expect: catalog: add2 f | bump p | t_add
+// expect: after drop and replace: 4 / 99 / proc 2812
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_tsql"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, ","))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// A batch as the TDS door runs it: the rows of its result sets and its error numbers, as text.
+fn t(s: mut &lexdb_exec.Session, ts: mut &lexdb_tsql.State, sql: &str): str {
+    var f = lexdb_tsql.newFrame()
+    var ev: []lexdb_tsql.Event = []
+    lexdb_tsql.run(s, ts, sql, mut &f, mut &ev)
+    var out: []str = []
+    for e in ev {
+        if e.kind == lexdb_tsql.EV_ROWS {
+            for row in e.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, ","))
+            }
+        } else if e.kind == lexdb_tsql.EV_ERROR {
+            append(mut &out, e.number.toStr())
+        }
+    }
+    if len(out) == 0 { return "ok" }
+    return strings.join(&out, ";")
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(61)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        var ts = lexdb_tsql.newState(51)
+        let a = q(mut &s, &"create table log (id int primary key, note text)")
+        let f = q(mut &s, &"create function add2(a int, b int default 2) returns int language sql as $$ select a + b $$")
+        let p = q(mut &s, &"create procedure bump(n int) language sql as $$ insert into log values (n, 'bumped') $$")
+        let x1 = t(mut &s, mut &ts, &"CREATE PROCEDURE t_add @a int, @b int = 3, @c int OUTPUT AS BEGIN SET @c = @a + @b; RETURN @c END")
+        let x2 = t(mut &s, mut &ts, &"CREATE TABLE tt (id int)")
+        let x3 = t(mut &s, mut &ts, &"CREATE PROCEDURE t_gone AS SELECT 1")
+        println("before: " + f + " " + p + " " + x1 + " " + x2 + " " + x3)
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st.share())
+        var ts = lexdb_tsql.newState(52)
+        let v1 = q(mut &s, &"select add2(4)")
+        let v2 = q(mut &s, &"select add2(4, 8)")
+        let c = q(mut &s, &"call bump(1)")
+        let n = q(mut &s, &"select count(*) || ' row' from log")
+        println("pg: " + v1 + " | " + v2 + " | " + c + " | " + n)
+        let r1 = t(mut &s, mut &ts, &"DECLARE @o int; EXEC t_add 4, @c = @o OUTPUT; SELECT @o")
+        let r2 = t(mut &s, mut &ts, &"DECLARE @o int, @r int; EXEC @r = t_add 4, 6, @o OUTPUT; SELECT @o")
+        let r3 = t(mut &s, mut &ts, &"DECLARE @o int, @r int; EXEC @r = t_add 4, 3, @o OUTPUT; SELECT @r")
+        println("tsql: " + r1 + " " + r2 + " " + r3)
+        println("catalog: " + q(mut &s, &"select proname || ' ' || prokind from pg_proc where proname = 'add2'") + " | " +
+                q(mut &s, &"select proname || ' ' || prokind from pg_proc where proname = 'bump'") + " | " +
+                t(mut &s, mut &ts, &"SELECT name FROM sys.procedures WHERE name = 't_add'"))
+        // dropped and replaced, then the store closed
+        let d1 = t(mut &s, mut &ts, &"DROP PROCEDURE t_gone")
+        let d2 = q(mut &s, &"create or replace function add2(a int, b int default 2) returns int language sql as $$ select a * b $$")
+        let d3 = t(mut &s, mut &ts, &"CREATE OR ALTER PROCEDURE t_add @a int AS SELECT 99")
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st.share())
+        var ts = lexdb_tsql.newState(53)
+        println("after drop and replace: " + q(mut &s, &"select add2(2, 2)") + " / " + t(mut &s, mut &ts, &"EXEC t_add 1") + " / proc " + t(mut &s, mut &ts, &"EXEC t_gone"))
+        return 0
+    }).unwrap()
+}

@@ -245,6 +245,18 @@ pub type State = record {
     pub bulk: []BulkReq         // an INSERT BULK accepted: its rows come next (lexdb_tds), one at most
     roTables: []str             // the table-valued parameters' temporary tables while their call runs (bindTable)
     roParams: []str             // ... their parameters' names, parallel
+    // stored procedures (design/lexdb-dialect-gaps.md, package F): how deep the call is (@@NESTLEVEL), the procedure's object
+    // id (@@PROCID) and name (ERROR_PROCEDURE), what its RETURN gave, and whether an error ended its scope (the procedure,
+    // not the batch)
+    nest: int
+    procId: int
+    procs: []str                // the procedures running, innermost last
+    retVal: int
+    scopeEnd: bool
+    tryNest: int                // the procedure depth the innermost TRY block is at
+    uncatchable: bool           // the error just given is one a TRY block does not catch
+    pendingProc: str            // the procedure the error that leaves a TRY block happened in
+    caughtProc: []str           // ... and those of the errors the CATCH blocks handle, parallel to caught
 }
 
 // An INSERT BULK accepted (design/lexdb-tds.md, section 14): the table, the
@@ -257,7 +269,7 @@ pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
                  rowcount: 0, rowLimit: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
                  pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
-                 fmtOnly: false, bulk: [], roTables: [], roParams: []}
+                 fmtOnly: false, bulk: [], roTables: [], roParams: [], nest: 0, procId: 0, procs: [], retVal: 0, scopeEnd: false, tryNest: 0, uncatchable: false, pendingProc: "", caughtProc: []}
 }
 
 // An error: to the client, or (in a TRY block) to its CATCH block.
@@ -267,9 +279,14 @@ fn (st: mut &State) fail(ev: mut &[]Event, c: Caught, cmd: int) { st.failAs(ev, 
 // count of 0; RAISERROR and THROW with none).
 fn (st: mut &State) failAs(ev: mut &[]Event, c: Caught, cmd: int, counted: bool) {
     st.error = c.number
-    if st.tryDepth > 0 {
-        if counted { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
+    // (an unknown table or column found where the TRY block is, in the same procedure or batch, is not caught: SQL Server
+    // finds it compiling the statement; and no count for a statement that did not get to run)
+    let compiling = c.number == 208 || c.number == 207
+    st.uncatchable = compiling && st.tryDepth > 0 && st.nest == st.tryNest
+    if st.tryDepth > 0 && !st.uncatchable {
+        if counted && !compiling && c.number != 2812 { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
         st.pending = c
+        st.pendingProc = if len(st.procs) > 0 { st.procs[len(st.procs) - 1].clone() } else { "" }
         st.jump = true
         return
     }
@@ -287,7 +304,7 @@ pub type Frame = record {
 
 const SYSVARS: []str = ["@@trancount", "@@rowcount", "@@error", "@@spid", "@@version", "@@servername", "@@language", "@@identity",
                          "@@error_number", "@@error_message", "@@error_severity", "@@error_state", "@@error_line", "@@error_procedure",
-                         "@@xact_state"]
+                         "@@xact_state", "@@nestlevel", "@@procid"]
 
 fn intType(oid: int): TypeName { return TypeName{kind: lexdb_sql.K_INT, oid: oid, prec: 0, scale: 0, len: 0} }
 fn textType(): TypeName { return TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0} }
@@ -339,11 +356,13 @@ fn (st: &State) refresh(sess: &lexdb_exec.Session, f: mut &Frame) {
         f.vals[10] = Val.Int(c.severity)
         f.vals[11] = Val.Int(c.state)
         f.vals[12] = Val.Int(1)
-        f.vals[13] = Val.Null
+        f.vals[13] = if k <= len(st.caughtProc) && len(st.caughtProc[k - 1]) > 0 { Val.Text(st.caughtProc[k - 1].clone()) } else { Val.Null }
     } else {
         for i in 8..14 { f.vals[i] = Val.Null }
     }
     f.vals[14] = Val.Int(if sess.status() == 'I' { 0 } else if st.doomed { -1 } else { 1 })
+    f.vals[15] = Val.Int(st.nest)
+    f.vals[16] = if st.procId != 0 { Val.Int(st.procId) } else { Val.Null }
 }
 
 fn (f: &Frame) oids(): []int {
@@ -471,7 +490,10 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
         } else if st.xactAbort && st.tryDepth == 0 {
             return false
         }
-        return st.tryDepth > 0 || !endsBatch(&e)
+        let ends = (st.tryDepth == 0 || st.uncatchable) && endsBatch(&e)
+        st.uncatchable = false
+        if ends { st.scopeEnd = true }
+        return !ends
     }
     var res = r.unwrap()
     if inTx {
@@ -728,6 +750,10 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
             }
         }
     }
+    if hasValueReturn(&b.stmts) {
+        st.fail(ev, Caught{number: 178, message: "A RETURN statement with a return value cannot be used in this context.", severity: 15, state: 1}, 0)
+        return
+    }
     let r = st.block(sess, &b.stmts, f, ev)
     if r == F_END {
         // SET FMTONLY takes effect as the batch is compiled, as in SQL Server:
@@ -744,6 +770,15 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         let tv = pop(mut &st.tableVars)
         let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tv)))
     }
+}
+
+// Whether RETURN gives a value somewhere in the statements (not in a procedure's body: SQL Server's 178).
+fn hasValueReturn(ts: &[]lexdb_tsqlparse.TStmt): bool {
+    for t in ts {
+        if t.kind == lexdb_tsqlparse.TS_RETURN && len(t.stmt) > 0 { return true }
+        if hasValueReturn(&t.body) || hasValueReturn(&t.els) { return true }
+    }
+    return false
 }
 
 // ---- table-valued parameters (design/lexdb-tds.md, "As built: table-valued parameters")
@@ -1002,6 +1037,7 @@ const F_CONTINUE = 2
 const F_RETURN = 3
 const F_END = 4
 const F_ERROR = 5
+const F_SCOPE = 6           // an error ended the procedure being run (or the batch, outside one)
 
 fn (st: mut &State) block(sess: mut &lexdb_exec.Session, ts: &[]lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): int {
     for t in ts {
@@ -1123,17 +1159,35 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
     }
     if k == lexdb_tsqlparse.TS_BREAK { return F_BREAK }
     if k == lexdb_tsqlparse.TS_CONTINUE { return F_CONTINUE }
-    if k == lexdb_tsqlparse.TS_RETURN { return F_RETURN }
+    if k == lexdb_tsqlparse.TS_RETURN {
+        st.retVal = 0
+        if len(t.stmt) > 0 {
+            // RETURN expr: the procedure's return code (a count of one, as SET's)
+            match st.args(sess, &t.stmt[0], f, ev) {
+                Some(vs) {
+                    st.retVal = if len(vs) > 0 { intVal(&vs[0]) } else { 0 }
+                    if !st.nocount { doneEv(ev, 1, CMD_SELECT, false) }
+                }
+                None { return st.flowAfterError() }
+            }
+        }
+        return F_RETURN
+    }
     if k == lexdb_tsqlparse.TS_TRY {
         st.tryDepth += 1
+        let nest0 = st.tryNest
+        st.tryNest = st.nest
         let r = st.block(sess, &t.body, f, ev)
+        st.tryNest = nest0
         st.tryDepth -= 1
         if r != F_ERROR { return r }
         // the CATCH block, with the error it handles
         let pc = Caught{number: st.pending.number, message: st.pending.message.clone(), severity: st.pending.severity, state: st.pending.state}
         append(mut &st.caught, pc)
+        append(mut &st.caughtProc, st.pendingProc.clone())
         let r2 = st.block(sess, &t.els, f, ev)
         let x = pop(mut &st.caught)
+        let y = pop(mut &st.caughtProc)
         return r2
     }
     if k == lexdb_tsqlparse.TS_PRINT {
@@ -1213,13 +1267,19 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
     }
     st.committed = false
     let before = sess.status()
+    st.scopeEnd = false
     let go = st.exec(sess, t, f, ev)
     st.after(sess, before, ev)
     if st.jump {
         st.jump = false
         return F_ERROR
     }
-    return if go { F_NEXT } else { F_END }
+    if go { return F_NEXT }
+    if st.scopeEnd {
+        st.scopeEnd = false
+        return F_SCOPE
+    }
+    return F_END
 }
 
 // ---- USE and EXEC (design/lexdb-tds.md, section 13)
@@ -1453,8 +1513,226 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         var fr = newFrame()
         return st.nested(sess, &cat, mut &fr, ev)
     }
+    // a procedure of the user's (package F)
+    match sess.routines(lexdb_sql.RD_TSQL, &t.key) {
+        Ok(found) {
+            for rt in found {
+                if rt.kind == lexdb_sql.RK_PROC { return st.callProc(sess, t, &rt, &vals, f, ev) }
+            }
+        }
+        Err(e) {
+            st.failErr(ev, &e, 0)
+            return F_NEXT
+        }
+    }
     st.fail(ev, Caught{number: 2812, message: "Could not find stored procedure '" + proc + "'.", severity: 16, state: 62}, 0)
-    return if st.tryDepth > 0 { F_NEXT } else { F_END }
+    return F_NEXT
+}
+
+// ---- stored procedures (design/lexdb-dialect-gaps.md, package F): CREATE PROCEDURE keeps the routine in the catalog
+// (lexdb_routine); EXEC runs its body as a batch of its own with the parameters as its first variables.
+
+// A procedure's name as it was written, without its schema ("Procedure or function 'p1' expects parameter ...").
+fn procShown(rt: &lexdb_sql.Routine): str {
+    var n = if len(rt.spell) > 0 { rt.spell.toStr() } else { lexdb_sql.baseName(&rt.key) }
+    let d = strings.lastIndexOf(&n, ".")
+    if d >= 0 { n = n[d + 1..len(n)].toStr() }
+    if len(n) > 1 && ((n[0] == '[' && n[len(n) - 1] == ']') || (n[0] == '"' && n[len(n) - 1] == '"')) { n = n[1..len(n) - 1].toStr() }
+    return n
+}
+
+// The type's name in SQL Server's "Error converting data type varchar to int.": a value's, and a parameter's as written
+// (without its length).
+fn valueTypeName(v: &Val): str {
+    match v {
+        Val.Int(_) { return "int" }
+        Val.Num(_) { return "numeric" }
+        Val.Bool(_) { return "bit" }
+        else { return "varchar" }
+    }
+}
+
+fn paramTypeName(p: &lexdb_sql.RParam): str {
+    let sp = strings.toLowerAscii(&p.spell)
+    let par = strings.indexOf(&sp, "(", 0)
+    return if par > 0 { strings.trim(&sp[0..par]) } else { sp }
+}
+
+// The value an argument gives a parameter: text cut to its length, then its type's (8114, SQL Server's, if it will not).
+fn bindArg(v: Val, p: &lexdb_sql.RParam): Result[Val, DbErr] {
+    var x = v
+    match x {
+        Val.Text(tx) {
+            if p.typ.kind == lexdb_sql.K_TEXT && p.typ.len > 0 && len(tx) > p.typ.len { x = Val.Text(tx[0..p.typ.len].toStr()) }
+        }
+        else {}
+    }
+    let src = valueTypeName(&x)
+    match lexdb_ops.coerce(x, &p.typ) {
+        Ok(c) { return Ok(c) }
+        Err(_) { return Err(tsErr(8114, &("Error converting data type " + src + " to " + paramTypeName(p) + "."))) }
+    }
+}
+
+// The value of a parameter's default.
+fn paramDefault(sess: mut &lexdb_exec.Session, st: &State, p: &lexdb_sql.RParam): Result[Val, DbErr] {
+    let none: []str = []
+    let b = try lexdb_tsqlparse.parseBatch(&("SELECT " + p.dflt), lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &none)
+    let nv: []Val = []
+    let nt: []int = []
+    let r = try sess.run(&b.stmts[0].stmt[0], &nv, &nt)
+    if len(r.rows) > 0 && len(r.rows[0]) > 0 { return Ok(r.rows[0][0].clone()) }
+    return Ok(Val.Null)
+}
+
+// EXEC of a procedure of the user's: its arguments (vals) bound to its parameters, its body run, its OUTPUT parameters and return
+// code given back. Errors as SQL Server gives them: 8144 for too many arguments, 8143 for one given twice, 201 for a parameter
+// not given, 8145 for a name that is no parameter, 8162 for OUTPUT asked of one that is not, 8114 for a value that will not
+// convert, 217 for a call nested too deep.
+fn (st: mut &State) callProc(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, rt: &lexdb_sql.Routine, vals: &[]Val, f: mut &Frame,
+                             ev: mut &[]Event): int {
+    let outs = strings.split(&t.value, "\x1f")
+    let np = len(rt.params)
+    let shown = procShown(rt)
+    var slot: []int = []
+    for i in 0..np { append(mut &slot, -1) }
+    var unknown = ""
+    for j in 0..len(vals) {
+        let pn = if 1 + j < len(t.names) { t.names[1 + j].clone() } else { "" }
+        var k = j
+        if len(pn) > 0 {
+            k = -1
+            for i in 0..np { if rt.params[i].name == pn { k = i } }
+            if k < 0 {
+                if len(unknown) == 0 { unknown = pn }
+                continue
+            }
+        } else if j >= np {
+            st.fail(ev, Caught{number: 8144, message: "Procedure or function " + shown + " has too many arguments specified.", severity: 16, state: 2}, 0)
+            return F_NEXT
+        }
+        if slot[k] >= 0 {
+            st.fail(ev, Caught{number: 8143, message: "Parameter '" + rt.params[k].name + "' was supplied multiple times.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        slot[k] = j
+    }
+    // a parameter with no argument takes its default; else the call is refused
+    var given: []bool = []
+    for i in 0..np {
+        var dflt = slot[i] < 0
+        if slot[i] >= 0 { for fl in t.flags { if fl == slot[i] { dflt = true } } }
+        append(mut &given, !dflt)
+        if dflt && !rt.params[i].has {
+            st.fail(ev, Caught{number: 201, message: "Procedure or function '" + shown + "' expects parameter '" + rt.params[i].name + "', which was not supplied.", severity: 16, state: 4}, 0)
+            return F_NEXT
+        }
+    }
+    if len(unknown) > 0 {
+        st.fail(ev, Caught{number: 8145, message: unknown + " is not a parameter for procedure " + shown + ".", severity: 16, state: 2}, 0)
+        return F_NEXT
+    }
+    var fr = newFrame()
+    st.refresh(sess, mut &fr)
+    let pbase = len(fr.names)
+    for i in 0..np {
+        let p = &rt.params[i]
+        var v = Val.Null
+        if given[i] {
+            let j = slot[i]
+            if j < len(outs) && len(outs[j]) > 0 && p.mode != "out" {
+                st.fail(ev, Caught{number: 8162, message: "Formal parameter '" + p.name + "' was not declared as an OUTPUT parameter, but the actual parameter passed in requested output.", severity: 16, state: 1}, 0)
+                return F_NEXT
+            }
+            match bindArg(vals[j].clone(), p) {
+                Ok(c) { v = c }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return F_NEXT
+                }
+            }
+        } else {
+            match paramDefault(sess, st, p) {
+                Ok(c) { v = c }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return F_NEXT
+                }
+            }
+            match bindArg(v.clone(), p) {
+                Ok(c) { v = c }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return F_NEXT
+                }
+            }
+        }
+        let x = fr.add(&p.name, p.typ, v)
+    }
+    if st.nest >= 32 {
+        st.fail(ev, Caught{number: 217, message: "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).", severity: 16, state: 1}, 0)
+        return if st.tryDepth > 0 { F_NEXT } else { F_END }
+    }
+    let text = withTableTypes(sess, &rt.body)
+    let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
+    if parsed.isErr() {
+        let e = parsed.unwrapErr()
+        st.failErr(ev, &e, 0)
+        return F_NEXT
+    }
+    let b = parsed.unwrap()
+    let given0 = len(fr.names)
+    for k in given0..len(b.vars) { let x = fr.add(&b.vars[k], b.types[k - given0], Val.Null) }
+    // the scope: its depth, its name, the temporary tables and table variables it makes are its own
+    let tempMark = len(st.temps)
+    let tvMark = len(st.tableVars)
+    let nocount0 = st.nocount
+    let abort0 = st.xactAbort
+    let rows0 = st.rowLimit
+    let savedId = st.procId
+    st.nest += 1
+    st.procId = lexdb_sql.nameOid(&"R", &rt.key)
+    append(mut &st.procs, procShown(rt))
+    st.retVal = 0
+    let r = st.block(sess, &b.stmts, mut &fr, ev)
+    let rc = if r == F_RETURN { st.retVal } else { 0 }
+    let px = pop(mut &st.procs)
+    st.nocount = nocount0
+    st.xactAbort = abort0
+    st.rowLimit = rows0
+    st.nest -= 1
+    st.procId = savedId
+    while len(st.temps) > tempMark {
+        let tn = pop(mut &st.temps)
+        let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tn)))
+    }
+    while len(st.tableVars) > tvMark {
+        let tn = pop(mut &st.tableVars)
+        let d = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tn)))
+    }
+    if r == F_ERROR || r == F_END { return r }
+    // the OUTPUT parameters to the caller's variables, the return code to its @r
+    for i in 0..np {
+        if !given[i] { continue }
+        let j = slot[i]
+        if j >= len(outs) || len(outs[j]) == 0 { continue }
+        let ko = f.find(&outs[j])
+        if ko < 0 { continue }
+        match lexdb_ops.coerce(fr.vals[pbase + i].clone(), &f.types[ko]) {
+            Ok(cv) { f.vals[ko] = cv }
+            Err(_) {}
+        }
+    }
+    if len(t.ret) > 0 {
+        let ko = f.find(&t.ret)
+        if ko >= 0 {
+            match lexdb_ops.coerce(Val.Int(rc), &f.types[ko]) {
+                Ok(cv) { f.vals[ko] = cv }
+                Err(_) {}
+            }
+        }
+    }
+    return F_NEXT
 }
 
 // ---- the catalog procedures a driver calls for its metadata (mssql-jdbc's DatabaseMetaData: sp_tables, sp_columns_100,
@@ -1707,7 +1985,13 @@ fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Fr
     let b = parsed.unwrap()
     let given = len(fr.names)
     for k in given..len(b.vars) { let i = fr.add(&b.vars[k], b.types[k - given], Val.Null) }
+    if hasValueReturn(&b.stmts) {
+        st.fail(ev, Caught{number: 178, message: "A RETURN statement with a return value cannot be used in this context.", severity: 15, state: 1}, 0)
+        return F_NEXT
+    }
+    st.nest += 1
     let r = st.block(sess, &b.stmts, fr, ev)
+    st.nest -= 1
     return if r == F_ERROR { F_ERROR } else { F_NEXT }
 }
 
