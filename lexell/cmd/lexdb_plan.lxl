@@ -33,6 +33,7 @@ type Names = lexdb_bind.Names
 type AggSpec = lexdb_agg.AggSpec
 type WinPlan = lexdb_window.WinPlan
 type Who = lexdb_catalog.Who
+type BX = lexdb_bind.BX
 
 fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 
@@ -923,7 +924,7 @@ fn qualified(x: &Expr, alias: &str): Expr {
 }
 
 // Whether two expressions are the same.
-pub fn sameExpr(a: &Expr, b: &Expr): bool { return lexdb_sql.exprText(a) == lexdb_sql.exprText(b) }
+fn sameExpr(a: &Expr, b: &Expr): bool { return lexdb_sql.exprText(a) == lexdb_sql.exprText(b) }
 
 // bounds for an index expression (9.89): conjuncts comparing target with a
 // value known before level k.
@@ -4502,7 +4503,7 @@ pub fn physOf(sel: &Sel): PPlan {
 // physOf's operators over the groups (or the rows): HAVING, the window
 // calls, the select list, DISTINCT, ORDER BY, the locks, the LIMIT and
 // MATCH_RECOGNIZE, as views over p2.
-pub fn physAbove(sel: &Sel, p2: PPlan): PPlan {
+fn physAbove(sel: &Sel, p2: PPlan): PPlan {
     let p3 = if sel.having.isSome() { PPlan.Having(p2) } else { p2 }
     let p4 = if len(sel.wins) > 0 { PPlan.Window(p3) } else { p3 }
     // a function's select list is its arguments
@@ -4803,7 +4804,7 @@ pub fn takeLp(sel: mut &Sel): lexdb_bind.LPlan {
 // values from the tables before it (a point: pathScan), as the batches
 // look it up (bLookup): not an index's, a range's, an IN list's, a
 // correlated value's.
-pub fn lookupPath(q: &Query, lv: &Level): bool {
+fn lookupPath(q: &Query, lv: &Level): bool {
     let p = &lv.path
     if lv.virt() || lv.lateral || p.index >= 0 || p.desc || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return false }
     if q.corr && pathCorr(p) { return false }
@@ -4857,4 +4858,557 @@ pub type MrPlan = record {
     pub outFrom: []int                // per output column: input column j (j >= 0) or measure -1 - i
     pub dialect: int
     pub text: str                     // the clause as one line (EXPLAIN)
+}
+
+// ---- what the physical plan's builders ask of a planned query (lazySeries,
+// boundOnce, streams)
+
+// Whether subquery i of q, in FROM, is an integer generate_series read by
+// q's first level only, as a series made as it is read: nothing reads it
+// again (a hash join's or a second scan's rows are held), and its values
+// do not depend on the row.
+pub fn lazySeries(q: &Query, i: int): bool {
+    let sp = &q.subs[i]
+    if sp.use != lexdb_sql.SUB_FROM || sp.sel.srf != "generate_series" || sp.cte >= 0 || len(sp.sel.q.refs) > 0 || len(sp.sel.outs) == 0 { return false }
+    if lexdb_sql.oidType(sp.sel.outs[0].oid).kind != lexdb_sql.K_INT { return false }
+    if len(q.levels) == 0 || q.levels[0].src != i || q.levels[0].lateral { return false }
+    for k in 1..len(q.levels) { if q.levels[k].src == i { return false } }
+    return true
+}
+
+// Whether q's levels' conditions were bound for the plan (bindSel) and
+// are still its conditions, one each.
+pub fn boundOnce(q: &Query): bool {
+    if len(q.cc) != len(q.levels) || len(q.cp) != len(q.levels) { return false }
+    for k in 0..len(q.levels) { if len(q.cc[k]) != len(q.levels[k].cond) || len(q.cp[k]) != len(q.levels[k].post) { return false } }
+    return true
+}
+
+// Whether a planned SELECT's rows can be given as the scan reads them
+// (eachRow): execSel's last branch, with nothing kept for after it.
+pub fn streams(sel: &Sel): bool {
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || sel.offset > 0 || len(sel.locks) > 0 { return false }
+    if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
+    return !hasSrfCall(&sel.exprs)
+}
+
+// ---- the pipeline's plans (lexdb_pipe; design/lexdb-layers.md 6.2.3, slice P1):
+// their arms made here (planX, scanArm, filterOver, joinsOver, pipeAgg),
+// compiled and run by lexdb_exec (pipeSel, lexdb_pipe.compile)
+//
+// A SELECT the pipeline runs has its plan made at the end of planning
+// (pipeSel, after bindSel) and kept with the Sel, so the plan cache keeps
+// it: Limit? (Project (Filter? (Scan))) over one table, or an Agg over
+// the same under the Sel's views. Its arms take what the plan bound (the
+// outputs, Sel.ox; the table's conditions, Query.cc), moved out of the
+// Sel; what it did not bind for a subquery run once is bound for the plan
+// (lexdb_bind.bindSubs). With SET lexdb_batch on, every run of the Sel is
+// the pipeline's (runPipe, pipeGroups): streamed (eachRowB) and held
+// (execSelIn) alike, the subqueries run once first and their values given.
+// With it off the row engine runs it, binding per run.
+
+// x bound for a plan the pipeline runs: over q's columns by place, its
+// parameters as slots, a subquery run once as its value (BX.Sub).
+pub fn planX(x: &Expr, q: &Query): Option[BX] {
+    let none: []Val = []
+    return lexdb_bind.bindSubs(x, &q.cols, &none, &up().typing)
+}
+
+// sel's table's conditions for its plan: moved from Query.cc[0], one the
+// plan did not bind bound now (planX); None if one does not bind
+// (nothing moved).
+pub fn planConds(sel: mut &Sel): Option[[]BX] {
+    var more = match condsMore(&sel.q) {
+        Some(x) { x }
+        None { return None }
+    }
+    var cc = replace(mut &sel.q.cc[0], [])
+    var cs: []BX = withCapacity(len(cc))
+    for i in 0..len(cc) {
+        match replace(mut &cc[i], None) {
+            Some(b) { append(mut &cs, b) }
+            None { append(mut &cs, replace(mut &more[i], None).unwrap()) }
+        }
+    }
+    return Some(cs)
+}
+
+// Per condition of q's table the plan did not bind, its binding for the
+// plan (planX); [] when the plan bound every one; None if one does not
+// bind.
+fn condsMore(q: &Query): Option[[]Option[BX]] {
+    var more: []Option[BX] = []
+    for i in 0..len(q.cc[0]) {
+        if q.cc[0][i].isSome() { continue }
+        let b = planX(&q.levels[0].cond[i], q)
+        if b.isNone() { return None }
+        while len(more) < i { append(mut &more, None) }
+        append(mut &more, b)
+    }
+    return Some(more)
+}
+
+// The scan of sel's only table (lexdb_plan.PScan): its columns' kinds by
+// their slots, those decoded, and whether it reads batches (aggs: an
+// aggregate's, which reads a primary key's points as a batch too).
+pub fn scanArm(q: &Query, aggs: bool): PScan {
+    let lv = &q.levels[0]
+    let t = &lv.t
+    var kinds: []int = array(len(q.cols), lexdb_rows.BK_NONE)
+    for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
+    var need: []bool = withCapacity(len(t.cols))
+    for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
+    // (rows the run holds: always read as batches, or row by row if few)
+    let held = if lv.virt() { lv.src } else { -1 }
+    let batch = held >= 0 || firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
+    return PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, held: held}
+}
+
+// Scan (ps, its query's subqueries), under a Filter of cs if any.
+pub fn filterOver(ps: PScan, cs: []BX, subs: []PSub): PPlan {
+    let leaf = PPlan.Scan(ps, subs)
+    return if len(cs) > 0 { PPlan.Filter(leaf, cs) } else { leaf }
+}
+
+// The tables after sel's first joined over base (its Filter? (Scan)):
+// a Join arm per level (slice P2), its keys, conditions and WHERE
+// conjuncts bound for the plan, its table's arm (lexdb_plan.PJoin): a
+// hash (read once) of a table, a lookup per row by its whole primary key,
+// or a range per row (as the batch driver chose them, bJoinPlan: not
+// where the first table's reading may stop early). Err(base): a level the
+// pipeline does not join (a subquery's or CTE's rows, LATERAL, a semi or
+// anti join, RIGHT or FULL, a locked table, a per-row path of another
+// kind, a collation's key, an expression that does not bind).
+pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
+    let l0 = &q.levels[0]
+    var p = base
+    for k in 1..len(q.levels) {
+        let lv = &q.levels[k]
+        let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
+        let rj = keepsRight(lv.join)
+        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 { return Err(p) }
+        if lv.src >= 0 && lazySeries(q, lv.src) { return Err(p) }
+        if inner && len(lv.post) > 0 { return Err(p) }
+        if q.corr && pathCorr(&lv.path) { return Err(p) }
+        // (a RIGHT or FULL JOIN: hashed, each with its own marks of the rows that joined)
+        if rj && lv.perRow { return Err(p) }
+        let mark = if lv.anti { MK_ANTI } else if lv.semi || lv.semiSub >= 0 { MK_SEMI } else { MK_JOIN }
+        let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
+        let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
+        if lv.perRow && !look && !range { return Err(p) }
+        let t = &lv.t
+        var kinds: []int = array(len(q.cols), lexdb_rows.BK_NONE)
+        for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
+        var need: []bool = withCapacity(len(t.cols))
+        for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
+        let batch = scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
+        var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
+                                 scan: PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, held: -1},
+                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
+                                 rng: [], capNulls: false, noNulls: lv.path.noNulls}
+        j.mark = mark
+        if !lv.perRow {
+            if lv.virt() { j.how = JH_ROWS }
+            if lv.resNot {
+                j.resCol = lv.resCol
+                match planX(&lv.resVal, q) {
+                    Some(b) { append(mut &j.res, b) }
+                    None { return Err(p) }
+                }
+            }
+            // (no key: an inner join of every pair, its conditions per pair)
+            if len(lv.hashCols) == 0 {
+                if !inner || mark != MK_JOIN || lv.resNot { return Err(p) }
+            } else if len(lv.hashVals) != len(lv.hashCols) { return Err(p) }
+            for hk in lv.hashKinds { if hk != lexdb_sql.COLL_EXACT { return Err(p) } }
+            for i in 0..len(lv.hashCols) {
+                append(mut &j.hcols, lv.hashCols[i])
+                append(mut &j.ktypes, boundType(&t.cols[lv.hashCols[i]].typ))
+                match planX(&lv.hashVals[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None { return Err(p) }
+                }
+            }
+            for x in lv.local {
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.build, b) }
+                    None { return Err(p) }
+                }
+            }
+            // its conditions but those on its own columns (applied as its
+            // rows are read: Level.local)
+            for x in lv.cond {
+                // (a semi join's and a RIGHT JOIN's: every one, none applied as read)
+                if !rj && !lv.semi && q.minLevel(&x) >= k { continue }
+                if len(lv.hashCols) == 1 && isKeyEq(&x, q, lv) { j.keq = len(j.conds) }
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.conds, b) }
+                    None { return Err(p) }
+                }
+            }
+        } else {
+            j.how = if look { JH_LOOK } else { JH_RANGE }
+            let ix = if look { -1 } else { lv.path.index }
+            for i in 0..len(lv.path.eqs) {
+                append(mut &j.ktypes, keyType(t, ix, i))
+                match planX(&lv.path.eqs[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None { return Err(p) }
+                }
+            }
+            if range && len(lv.path.rng) > 0 {
+                append(mut &j.ktypes, keyType(t, ix, len(lv.path.eqs)))
+                for b in lv.path.rng {
+                    match planX(&b.val, q) {
+                        Some(v) { append(mut &j.rng, PBound{op: b.op.toStr(), val: v}) }
+                        None { return Err(p) }
+                    }
+                }
+            }
+            j.capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
+            for x in lv.cond {
+                match planX(&x, q) {
+                    Some(b) { append(mut &j.conds, b) }
+                    None { return Err(p) }
+                }
+            }
+        }
+        for x in lv.post {
+            match planX(&x, q) {
+                Some(b) { append(mut &j.post, b) }
+                None { return Err(p) }
+            }
+        }
+        p = PPlan.Join(p, j)
+    }
+    return Ok(p)
+}
+
+// Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
+// takes, and what this Sel must give it): streamed (no sort, grouping,
+// DISTINCT, window, set or OFFSET), one table read per row, no correlated
+// subquery, its outputs and conditions bound for the plan.
+pub fn pipeShape(sel: &Sel): bool {
+    let q = &sel.q
+    if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    if len(q.levels) == 0 || len(q.refs) > 0 || q.corr || len(q.top) > 0 { return false }
+    if !firstRead(q, &q.levels[0]) { return false }
+    return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs) && boundOnce(q)
+}
+
+// Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
+// (slice P3): rows of one select list, no grouping, window, set
+// operation, lock, DISTINCT ON, WITH TIES, TOP, SELECT @v, or function
+// returning rows in it.
+fn sortShape(sel: &Sel): bool {
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 { return false }
+    if !(sel.sort || sel.distinct) || sel.donKey > 0 || sel.withTies || sel.topMode != 0 || hasSrfCall(&sel.exprs) { return false }
+    if sel.q.corr {
+        for x in sel.exprs { if hasCorr(&x) { return false } }
+        for x in sel.order { if hasCorr(&x) { return false } }
+    }
+    return true
+}
+
+// Whether lv is a table read per row: not a subquery's or CTE's rows, not
+// LATERAL, not locked, no WHERE after it, not a semi or anti join's.
+pub fn tableRead(lv: &Level): bool {
+    return lv.perRow && !lv.lateral && !lv.virt() && lv.lock == 0 && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0
+}
+
+// Whether lv is rows the run holds that the pipeline reads as q's first
+// table, cut into batches (lexdb_held; item 6 of design/lexdb-batch-gaps.md):
+// a subquery in FROM's (a derived table, view, CTE, VALUES, a function
+// scan, a catalog relation, an integer series made as it is read), not a
+// recursive CTE's working table, not LATERAL, locked, with a WHERE after
+// it, or a semi or anti join's. A series is one of smallint, integer or
+// bigint (its end is the type's range: lexdb_held.seriesOf).
+pub fn heldRead(q: &Query, lv: &Level): bool {
+    if lv.src < 0 || lv.work >= 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
+    if lazySeries(q, lv.src) {
+        let oid = q.subs[lv.src].sel.outs[0].oid
+        return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8
+    }
+    return true
+}
+
+// Whether lv is a first table the pipeline reads: a table (tableRead) or
+// rows the run holds (heldRead).
+fn firstRead(q: &Query, lv: &Level): bool { return tableRead(lv) || heldRead(q, lv) }
+
+// An aggregate's plan for the pipeline (slice P1b; lexdb_exec compiles it, lexdb_pipe.compile):
+// Agg (Filter? (Scan)) under physOf's operators over the groups (views:
+// HAVING, the outputs, DISTINCT, ORDER BY and LIMIT stay execSel's, over
+// the groups the pipeline gives). The keys and calls bound for the plan,
+// and the table's conditions (Query.cc) moved, into the arms. None: no plan (what was moved is given back).
+pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
+    var keys: []BX = []
+    for x in sel.groupBy {
+        match planX(&x, &sel.q) {
+            Some(b) { append(mut &keys, b) }
+            None { return None }
+        }
+    }
+    var calls: []PCall = []
+    for sp in sel.specs {
+        let f = &sp.fname
+        // (the calls it accumulates: lexdb_pipe.compile's)
+        if sp.kind != lexdb_sql.COLL_EXACT { return None }
+        var arg: Option[BX] = None
+        // (the values besides the argument: string_agg's separator, the ORDER BY keys)
+        var more: []BX = []
+        if !sp.star {
+            if len(sp.args) < 1 || len(sp.args) > 2 { return None }
+            arg = planX(&sp.args[0], &sel.q)
+            if arg.isNone() { return None }
+            for k in 1..len(sp.args) {
+                match planX(&sp.args[k], &sel.q) {
+                    Some(b) { append(mut &more, b) }
+                    None { return None }
+                }
+            }
+        }
+        for o in sp.order {
+            match planX(&o, &sel.q) {
+                Some(b) { append(mut &more, b) }
+                None { return None }
+            }
+        }
+        var filt: Option[BX] = None
+        match sp.filter {
+            Some(fx) {
+                filt = planX(&fx, &sel.q)
+                if filt.isNone() { return None }
+            }
+            None {}
+        }
+        append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia})
+    }
+    let cs = match planConds(sel) {
+        Some(x) { x }
+        None { return None }
+    }
+    var ps = scanArm(&sel.q, true)
+    // (over joins every table's columns are the plan's: lexdb_plan.needs)
+    if len(keys) == 0 && len(sel.q.levels) == 1 {
+        ps.need = callsNeed(len(ps.need), &cs, &calls)
+        ps.part = true
+    }
+    var keep: []bool = array(len(sel.q.cols), false)
+    for ci in afterCols(sel, &sel.q) { keep[ci] = true }
+    let base = filterOver(ps, cs, subsOf(&sel.q))
+    // (over joins: slice P2)
+    let joined = if len(sel.q.levels) > 1 { joinsOver(&sel.q, base) } else { Ok(base) }
+    var input = PPlan.Result([])
+    match move(joined) {
+        Ok(x) { input = x }
+        Err(b) {
+            unplan(sel, b)
+            return None
+        }
+    }
+    let agg = PPlan.Agg(input, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
+    return Some(physAbove(sel, agg))
+}
+
+// Whether sel is an aggregate the pipeline may run: one table read per
+// row (the query's only columns), GROUP BY (grouping sets too; no
+// collation's keys), no window, no correlated subquery, no MIN/MAX by the
+// scan's order.
+pub fn aggShape(sel: &Sel): bool {
+    let q = &sel.q
+    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.locks) > 0 { return false }
+    // (a correlated subquery's own: its outer values are its parameters)
+    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
+    // (one table: the query's only columns; joins: each level's, joinsOver)
+    if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
+    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    return true
+}
+
+// A plan the pipeline did not take: its outputs and conditions back to
+// sel, those bound for the plan alone (a subquery's value) as unbound.
+pub fn unplan(sel: mut &Sel, p: PPlan) {
+    match move(p) {
+        PPlan.Limit(i, _, _, _) { unplan(sel, i) }
+        PPlan.Sort(i, _, _) { unplan(sel, i) }
+        PPlan.Distinct(i, _, _) { unplan(sel, i) }
+        PPlan.Having(i) { unplan(sel, i) }
+        // (its keys and calls were bound for the plan only)
+        PPlan.Agg(i, _, _) { unplan(sel, i) }
+        // (a join's expressions were bound for the plan only)
+        PPlan.Join(i, _) { unplan(sel, i) }
+        PPlan.Project(i, xs) {
+            if len(xs) == 0 {
+                // a view: the Sel holds its outputs
+                unplan(sel, i)
+                return
+            }
+            oxBack(sel, xs)
+            unplan(sel, i)
+        }
+        PPlan.Filter(i, cs) {
+            var v = cs
+            var cc: []Option[BX] = []
+            for k in 0..len(v) { append(mut &cc, unbound(replace(mut &v[k], BX.Const(Val.Null)), false)) }
+            sel.q.cc[0] = cc
+        }
+        else {}
+    }
+}
+
+// The outputs xs (the first len(xs)) back to sel.ox, as unbound those
+// bound for the plan alone.
+pub fn oxBack(sel: mut &Sel, xs: []BX) {
+    var v = xs
+    // (keys made after the outputs, slice P3: the plan's alone)
+    for k in 0..min(len(v), len(sel.exprs)) {
+        let col = match sel.exprs[k] {
+            Expr.Col(name, sl) { lexdb_bind.colSlot(&sel.q.cols, &name, sl) >= 0 }
+            else { false }
+        }
+        sel.ox[k] = unbound(replace(mut &v[k], BX.Const(Val.Null)), col)
+    }
+}
+
+// b as the Sel holds it: None for a column (col) or what only a plan's
+// run evaluates (a subquery's value).
+fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) { None } else { Some(b) } }
+
+pub fn copySets(xs: &[][]int): [][]int {
+    var out: [][]int = []
+    for x in xs { append(mut &out, collections.copyOf(&x)) }
+    return out
+}
+
+// Whether x has no column (its value is the same for every row).
+fn bConst(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Col(_, _) { return false }
+        Expr.Unary(_, a) { return bConst(&a) }
+        Expr.Bin(_, a, b) { return bConst(&a) && bConst(&b) }
+        Expr.IsNull(a, _) { return bConst(&a) }
+        Expr.Cast(a, _) { return bConst(&a) }
+        // a char(n) constant's padding (#bppad, the parser's for 'F' compared
+        // with a char(1) column: q21's o_orderstatus = 'F'): of constants, a
+        // constant
+        Expr.Call(n, args, star) {
+            if n != "#bppad" || star || len(args) != 2 { return false }
+            return bConst(&args[0]) && bConst(&args[1])
+        }
+    }
+}
+
+// Whether x is the equality of level lv's one hash column with its value
+// (hashVals[0]): col = x or x = col, under no collation.
+fn isKeyEq(x: &Expr, q: &Query, lv: &Level): bool {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op != "=" { return false }
+            let want = lv.first + lv.hashCols[0]
+            match a {
+                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&b, &lv.hashVals[0]) { return true } }
+                else {}
+            }
+            match b {
+                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&a, &lv.hashVals[0]) { return true } }
+                else {}
+            }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether a semi/anti level looked up per row (semiLook) reads a range
+// the batches read (bRange): its path's leading equalities only.
+fn rangePath(q: &Query, lv: &Level): bool {
+    let p = &lv.path
+    if lv.virt() || lv.lateral || p.desc || len(p.eqs) == 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return false }
+    // bounds on the next column: constants only (made once: rangeBounds)
+    for b in p.rng { if !bConst(&b.val) { return false } }
+    if q.corr && pathCorr(p) { return false }
+    return true
+}
+
+// ---- Indexes read in batches (9.107)
+//
+// The first table read through an index, in batches:
+// - read alone (index-only), when the index's entries hold every column
+//   the level uses (its own columns, then the primary key's, which every
+//   entry ends with): each entry's key is decoded into the batch's
+//   columns, and no row is read. Its reads are the index's range, as the
+//   row path's (fetch reads such an index alone too). Entries are
+//   versioned with the store, so what the index holds is what the rows
+//   hold, as of the read.
+// - else its entries' primary keys a batch at a time, the rows read in
+//   key order (getMany: from the leaf of the key before, not from the root)
+//   and each put at its entry's place, so the batch is in the index's
+//   order (a bitmap heap scan's effect, the rows' order kept). In a
+//   transaction whose reads are noted the rows are read in the index's
+//   order, as the row path reads them, so the reads are noted the same.
+
+// The query's columns a grouped select reads after grouping: those its
+// outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.
+fn afterCols(sel: &Sel, q: &Query): []int {
+    var names: []str = []
+    for x in sel.exprs { lexdb_sql.colNames(&x, mut &names) }
+    match sel.having {
+        Some(h) { lexdb_sql.colNames(&h, mut &names) }
+        None {}
+    }
+    for x in sel.order { lexdb_sql.colNames(&x, mut &names) }
+    var out: []int = []
+    for n in names {
+        let ci = lexdb_bind.colIndex(&q.cols, &n)
+        if ci >= 0 { append(mut &out, ci) }
+    }
+    return out
+}
+
+
+// ---- The row layout (design/lexdb.md 9.48, 9.50)
+//
+// A row: FIXED; its layout's number in its table's (Table.layouts), 2
+// bytes; a NULL bitmap (bit p%8 of byte p/8); the fixed part, per place in
+// order: 8, 4 or 2 bytes an integer (its column's type's width), 1 a
+// boolean, 2 a variable-length value's end (from the start of the variable
+// part), none a dropped place; then the variable part: texts, and numerics
+// in their binary form (Decimal.toBin). Each place is at an offset its
+// layout gives, so reading one is a load, not a walk over the places before
+// it. A row this cannot hold is in the tagged form (encRow): one with a
+// long text (LONG, lexdb_rows.encodeLong), over 255 places, a value not of its place's
+// kind, or written with the test hook setFixedRows(false).
+//
+// Since 9.113 a date, a time, a timestamp and a timestamptz are words in
+// the fixed part too (4 bytes the date's days; 8 the others' microseconds),
+// as are a double's and a real's bits (8, 4); a uuid (its 16 bytes) and a
+// bytea are variable-length values, as texts are. Before, their places
+// were text places (PK_TEXT) and a row with such a value was in the tagged
+// form; a table keeps such a layout as its current one until its catalog
+// row is written again (encFixed: compatible).
+
+// Whether a select list calls a set-returning function: only then are its
+// rows looked through for marked values.
+pub fn hasSrfCall(xs: &[]Expr): bool {
+    for x in xs { if srfIn(&x) { return true } }
+    return false
+}
+
+fn srfIn(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "unnest" || n == "generate_subscripts" || n == "pg_partition_ancestors" || n == "regexp_matches" ||
+               n == "regexp_split_to_table" || n == "string_to_table" { return true }
+            for a in args { if srfIn(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return srfIn(&a) }
+        Expr.Bin(_, a, b) { return srfIn(&a) || srfIn(&b) }
+        Expr.IsNull(a, _) { return srfIn(&a) }
+        Expr.Cast(a, _) { return srfIn(&a) }
+        else { return false }
+    }
 }
