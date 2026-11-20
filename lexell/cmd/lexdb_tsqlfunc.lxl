@@ -1,0 +1,255 @@
+// lexdb_tsqlfunc: a T-SQL scalar function that reads tables, written as a query (design/lexdb-dialect-gaps.md, package F, F2).
+//
+// A function whose body only computes (DECLARE, SET, IF, WHILE, RETURN) is run by lexdb_udf, once per call, outside any
+// query. One that reads tables (SELECT @v = col FROM t WHERE ..., RETURN (SELECT ...)) cannot be, with no session in the
+// evaluator; it is written instead as a scalar subquery of the statement that calls it, as SQL Server inlines such functions
+// itself: the body is run symbolically, a variable being the expression it was last given, an IF a CASE over the rest of the
+// body in each branch, a SELECT @v = ... FROM a scalar subquery, RETURN the result. The call's arguments are put in for the
+// parameters; one that reads a column of the calling query comes through a derived table of one row (FROM (SELECT arg AS
+// __a0) __uN) so that no name in the body can capture it. A loop (WHILE) cannot be written so: refused as not supported yet.
+// lexdb_tds gives lexdb_exec this module's query (lexdb_exec.setUdfQuery).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_parse"
+import "./lexdb_routine"
+import "./lexdb_tsqlparse"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type Stmt = lexdb_sql.Stmt
+type TStmt = lexdb_tsqlparse.TStmt
+type TypeName = lexdb_sql.TypeName
+type DbErr = lexdb_base.DbErr
+type Routine = lexdb_sql.Routine
+
+type Sym = record { subs: []Stmt; types: []TypeName; names: []str; ret: TypeName; steps: int }
+
+fn unsupported(msg: &str): DbErr { return lexdb_base.err("0A000", &("lexdb: " + msg + " is not supported yet in a function that reads tables")) }
+
+fn hasSub(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasSub(&a) }
+        Expr.Bin(_, a, b) { return hasSub(&a) || hasSub(&b) }
+        Expr.IsNull(a, _) { return hasSub(&a) }
+        Expr.Cast(a, _) { return hasSub(&a) }
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) { return true }
+            for a in args { if hasSub(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// x with each variable ($n) the expression env has for it.
+fn substE(x: &Expr, env: &[]Expr): Expr {
+    return lexdb_routine.mapE(x, fn(y: &Expr): Option[Expr] {
+        match y {
+            Expr.Param(n) {
+                if n >= 1 && n <= len(env) { return Some(lexdb_sql.cloneExpr(&env[n - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    })
+}
+
+// x with the numbers of its subqueries moved on by base.
+fn shiftSubs(x: &Expr, base: int): Expr {
+    return lexdb_routine.mapE(x, fn(y: &Expr): Option[Expr] {
+        match y {
+            Expr.Call(n, args, star) {
+                if lexdb_sql.isSubCall(&n) && len(args) > 0 {
+                    var out: []Expr = []
+                    for a in args { append(mut &out, shiftSubs(&a, base)) }
+                    match args[0] {
+                        Expr.Lit(v) {
+                            match v {
+                                Val.Int(i) { out[0] = Expr.Lit(Val.Int(i + base)) }
+                                else {}
+                            }
+                        }
+                        else {}
+                    }
+                    return Some(Expr.Call(n.clone(), out, star))
+                }
+                return None
+            }
+            else { return None }
+        }
+    })
+}
+
+// A statement of the body (a subquery) with the variables put in: an expression that is itself a subquery's value cannot be
+// (its number would be of another list).
+fn substS(s: &Stmt, env: &[]Expr): Result[Stmt, DbErr] {
+    for x in env { if hasSub(&x) { return Err(unsupported("a variable that holds the result of a query, read in another query")) } }
+    return Ok(lexdb_routine.mapStmt(s, fn(y: &Expr): Option[Expr] {
+        match y {
+            Expr.Param(n) {
+                if n >= 1 && n <= len(env) { return Some(lexdb_sql.cloneExpr(&env[n - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    }))
+}
+
+fn firstExpr(s: &Stmt, i: int): Expr {
+    if i < len(s.items) {
+        match s.items[i].expr {
+            Some(x) { return lexdb_sql.cloneExpr(&x) }
+            None {}
+        }
+    }
+    return Expr.Lit(Val.Null)
+}
+
+fn condOf(s: &Stmt): Expr {
+    let x = firstExpr(s, 0)
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "case else" && len(args) == 3 { return lexdb_sql.cloneExpr(&args[0]) }
+        }
+        else {}
+    }
+    return x
+}
+
+fn varAt(g: &Sym, name: &str): int {
+    for i in 0..len(g.names) { if g.names[i] == name { return i } }
+    return -1
+}
+
+// The expression x of statement s (its subqueries adopted into the result's), the variables put in.
+fn adopt(g: mut &Sym, s: &Stmt, x: Expr, env: &[]Expr): Result[Expr, DbErr] {
+    let base = len(g.subs)
+    for sub in s.subs { append(mut &g.subs, try substS(&sub, env)) }
+    return Ok(substE(&shiftSubs(&x, base), env))
+}
+
+fn run(g: mut &Sym, ts0: []TStmt, env0: []Expr): Result[Expr, DbErr] {
+    var ts = ts0
+    var env = env0
+    var i = 0
+    while i < len(ts) {
+        g.steps += 1
+        if g.steps > 400 { return Err(unsupported("a body this branched")) }
+        let t = ts[i].clone()
+        let k = t.kind
+        if k == lexdb_tsqlparse.TS_BLOCK {
+            var rest: []TStmt = []
+            for x in t.body { append(mut &rest, x.clone()) }
+            for j in i + 1..len(ts) { append(mut &rest, ts[j].clone()) }
+            ts = rest
+            i = 0
+            continue
+        }
+        if k == lexdb_tsqlparse.TS_DECLARE {
+            for n in 0..len(t.names) {
+                let idx = varAt(g, &t.names[n])
+                var v = Expr.Lit(Val.Null)
+                for s in t.stmt {
+                    if len(s.assign) > 0 && s.assign[0] == t.names[n] {
+                        if len(s.from) > 0 { return Err(unsupported("a query in DECLARE")) }
+                        v = try adopt(g, &s, firstExpr(&s, 0), &env)
+                    }
+                }
+                env[idx] = Expr.Cast(v, g.types[idx])
+            }
+        } else if k == lexdb_tsqlparse.TS_SQL {
+            let s = &t.stmt[0]
+            if s.kind != lexdb_sql.S_SELECT || len(s.assign) == 0 { return Err(unsupported("this statement")) }
+            // each assigned item, in order: a value, or the query's column as a scalar subquery
+            var vals: []Expr = []
+            for n in 0..len(s.assign) {
+                if len(s.assign[n]) == 0 || n >= len(s.items) { append(mut &vals, Expr.Lit(Val.Null)); continue }
+                if len(s.from) > 0 {
+                    var q = try substS(s, &env)
+                    q.assign = []
+                    q.assignAt = []
+                    q.items = [q.items[n].clone()]
+                    q.use = lexdb_sql.SUB_SCALAR
+                    q.params = 0
+                    q.src = ""
+                    append(mut &g.subs, q)
+                    append(mut &vals, Expr.Call("#sub", [Expr.Lit(Val.Int(len(g.subs) - 1))], false))
+                } else {
+                    append(mut &vals, try adopt(g, s, firstExpr(s, n), &env))
+                }
+            }
+            for n in 0..len(s.assign) {
+                if len(s.assign[n]) == 0 { continue }
+                let idx = varAt(g, &s.assign[n])
+                env[idx] = Expr.Cast(vals[n].clone(), g.types[idx])
+            }
+        } else if k == lexdb_tsqlparse.TS_IF {
+            let c = try adopt(g, &t.stmt[0], condOf(&t.stmt[0]), &env)
+            var thenL: []TStmt = []
+            var elseL: []TStmt = []
+            for x in t.body { append(mut &thenL, x.clone()) }
+            for x in t.els { append(mut &elseL, x.clone()) }
+            for j in i + 1..len(ts) {
+                append(mut &thenL, ts[j].clone())
+                append(mut &elseL, ts[j].clone())
+            }
+            let a = try run(g, thenL, env.clone())
+            let b = try run(g, elseL, env.clone())
+            return Ok(Expr.Call("case else", [c, a, b], false))
+        } else if k == lexdb_tsqlparse.TS_RETURN {
+            if len(t.stmt) == 0 { return Ok(Expr.Lit(Val.Null)) }
+            let v = try adopt(g, &t.stmt[0], firstExpr(&t.stmt[0], 0), &env)
+            return Ok(Expr.Cast(v, g.ret))
+        } else if k == lexdb_tsqlparse.TS_WHILE {
+            return Err(unsupported("a WHILE loop"))
+        } else if k == lexdb_tsqlparse.TS_EXEC {
+            return Err(lexdb_base.err("TS557", "Only functions and some extended stored procedures can be executed from within a function."))
+        } else {
+            return Err(unsupported("this statement"))
+        }
+        i += 1
+    }
+    return Ok(Expr.Lit(Val.Null))
+}
+
+// The query SELECT result for a call of r with args (Routine, arguments, tag: lexdb_routine.QueryFn).
+pub fn query(r: &Routine, args: &[]Expr, tag: int): Result[Stmt, DbErr] {
+    var names: []str = []
+    for p in r.params { append(mut &names, p.name.clone()) }
+    let b = try lexdb_tsqlparse.parseBatch(&r.body, lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &names)
+    var g = Sym{subs: [], types: [], names: b.vars.clone(), ret: r.ret, steps: 0}
+    for p in r.params { append(mut &g.types, p.typ) }
+    for t in b.types { append(mut &g.types, t) }
+    while len(g.types) < len(g.names) { append(mut &g.types, TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}) }
+    // the parameters: a constant argument as it is, another through a derived table of one row
+    let alias = "__u" + tag.toStr()
+    var env: []Expr = []
+    var aitems: []lexdb_sql.SelItem = []
+    for i in 0..len(g.names) {
+        if i < len(args) {
+            if lexdb_routine.constArg(&args[i]) {
+                append(mut &env, Expr.Cast(lexdb_sql.cloneExpr(&args[i]), g.types[i]))
+            } else {
+                let cn = "__a" + i.toStr()
+                append(mut &aitems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Cast(lexdb_sql.cloneExpr(&args[i]), g.types[i])), alias: cn.clone(), spell: cn.clone()})
+                append(mut &env, Expr.Col(alias + "." + cn, -1))
+            }
+        } else {
+            append(mut &env, Expr.Lit(Val.Null))
+        }
+    }
+    let res = try run(mut &g, b.stmts.clone(), env)
+    var out = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    out.items = [lexdb_sql.SelItem{star: false, qual: "", expr: Some(res), alias: "", spell: ""}]
+    out.subs = g.subs.clone()
+    if len(aitems) > 0 {
+        var a = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+        a.use = lexdb_sql.SUB_FROM
+        a.items = aitems
+        append(mut &out.subs, a)
+        out.from = [lexdb_sql.FromItem{table: "", alias: alias, join: lexdb_sql.J_FIRST, on: None, sub: len(out.subs) - 1, cols: [], work: -1, lateral: false,
+                                       using: [], natural: false, comma: true}]
+    }
+    return Ok(out)
+}

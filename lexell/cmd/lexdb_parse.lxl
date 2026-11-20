@@ -555,6 +555,7 @@ type P = record {
     nls: []str          // Oracle: the session's NLS_DATE_FORMAT, NLS_TIMESTAMP_FORMAT, NLS_TIMESTAMP_TZ_FORMAT as set; [] none (O5)
     ora: bool           // Oracle (design/lexdb-oracle.md O3): its names, types, functions, ROWNUM, DUAL, ...
     mr: int             // inside a MATCH_RECOGNIZE clause (how deep): PREV, FIRST, RUNNING, CLASSIFIER, ... are read
+    udf: bool           // T-SQL: a schema-qualified function call or a function in FROM was read (Stmt.udf)
 }
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
@@ -1499,6 +1500,15 @@ fn (p: mut &P) arrayOfSub(): Result[Expr, lexdb_base.DbErr] {
     return Ok(subRef("#sub", len(p.subs) - 1))
 }
 
+// A function call's argument: an expression; of a T-SQL function of the user's, DEFAULT too (#default).
+fn (p: mut &P) callArg(udf: bool): Result[Expr, lexdb_base.DbErr] {
+    if udf && p.isKw("default") && p.peekAt(1).kind == T_OP && (p.peekAt(1).text == "," || p.peekAt(1).text == ")") {
+        p.pos += 1
+        return Ok(Expr.Call("#default", [], false))
+    }
+    return p.expr()
+}
+
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     // pg_catalog.f(...): f (9.80)
     if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
@@ -1522,7 +1532,9 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             p.toks[p.pos].text = "utl_raw_cast"
         }
     }
-    // T-SQL: db.schema.f(...), schema.f(...): f (design/lexdb-tds.md, section 13)
+    // T-SQL: db.schema.f(...): f (design/lexdb-tds.md, section 13); schema.f(...) is a function of the user's (package F):
+    // the call named "schema.f", the statement marked (udf), for lexdb_routine to resolve
+    var qual = ""
     if p.tsql && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." {
         var k = 0
         while (p.peekAt(k).kind == T_IDENT || p.peekAt(k).kind == T_QIDENT) && p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "." { k += 2 }
@@ -1532,7 +1544,11 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 p.pos += k + 3
                 return Ok(Expr.Lit(Val.Int(1)))
             }
-            if k == 4 || (k == 2 && p.peekAt(0).text == "dbo") { p.pos += k }
+            if k == 4 { p.pos += k }
+            if k == 2 {
+                qual = strings.toLowerAscii(&p.peek().text)
+                p.pos += 2
+            }
         }
     }
     let t = p.next()
@@ -1825,6 +1841,10 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             var argNames: []str = []        // name => value arguments' names ("" a positional one)
             var star = false
             var fname = t.text.clone()
+            if len(qual) > 0 {
+                fname = qual + "." + fname
+                p.udf = true
+            }
             if p.ora && fname == "listagg" { fname = "string_agg" }
             if p.mr > 0 && fname == "count" && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP &&
                p.peekAt(1).text == "." && p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
@@ -1840,10 +1860,10 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 // agg(DISTINCT x): the name carries it, "count distinct"
                 if p.acceptKw("distinct") { fname = fname + " distinct" } else { let al = p.acceptKw("all") }
                 append(mut &argNames, p.namedArg())
-                append(mut &args, try p.expr())
+                append(mut &args, try p.callArg(len(qual) > 0))
                 while p.acceptKw(",") {
                     append(mut &argNames, p.namedArg())
-                    append(mut &args, try p.expr())
+                    append(mut &args, try p.callArg(len(qual) > 0))
                 }
                 if p.acceptKw("order") {
                     // agg(x ORDER BY k [ASC | DESC] [NULLS FIRST | LAST], ...): the
@@ -1960,6 +1980,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                     return Ok(Expr.Call(fname, args, false))
                 }
             }
+            if len(qual) > 0 { return Ok(Expr.Call(fname, args, star)) }
             if p.tsql && !p.isKw("over") { return p.tsqlCall(&fname, args, star) }
             if p.ora && !p.isKw("over") { return p.oraCall(&fname, args, star) }
             if p.acceptKw("over") {
@@ -2000,6 +2021,25 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Col(name, -1))
     }
     return Err(near(&t))
+}
+
+// T-SQL's OUTPUT list, after OUTPUT: its items in out, and INTO target [(columns)] (a table variable, a #temporary or
+// a table) in s.outInto and s.outCols: the rows the statement outputs are inserted there (lexdb_tsql). A second OUTPUT
+// after INTO (rows to the client as well) is not supported yet.
+fn (p: mut &P) outputList(s: mut &Stmt, out: mut &[]SelItem): Result[Unit, lexdb_base.DbErr] {
+    try p.itemList(out)
+    if !p.acceptKw("into") { return Ok(Unit{}) }
+    let t = p.peek().clone()
+    if t.kind == T_VAR { return Err(lexdb_base.err("TS1087", &("Must declare the table variable \"" + t.text + "\"."))) }
+    s.outInto = try p.rname()
+    if p.isKw("(") && !p.selectNext() {
+        p.pos += 1
+        append(mut &s.outCols, try p.name())
+        while p.acceptKw(",") { append(mut &s.outCols, try p.name()) }
+        try p.expectKw(")")
+    }
+    if p.isKw("output") { return Err(lexdb_base.err("0A000", "lexdb: OUTPUT INTO followed by an OUTPUT clause that returns rows is not supported yet")) }
+    return Ok(Unit{})
 }
 
 // T-SQL's UPDATE and DELETE (design/lexdb-tds.md S3): a target named in
@@ -3362,9 +3402,9 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw(")")
     }
     if p.tsql && p.acceptKw("output") {
-        // T-SQL: OUTPUT INSERTED.col, ...: RETURNING
+        // T-SQL: OUTPUT INSERTED.col, ... [INTO target [(columns)]]: RETURNING
         var out: []SelItem = []
-        try p.itemList(mut &out)
+        try p.outputList(mut &s, mut &out)
         try tsqlDml(mut &s, out)
     }
     if p.acceptKw("overriding") {
@@ -4505,6 +4545,16 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
        p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
         return p.fromFunction(join)
     }
+    // T-SQL: [schema.]f(arguments), a table-valued function of the user's (an inline one is read as its query: lexdb_routine)
+    if p.tsql && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) {
+        let k = if p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." && (p.peekAt(2).kind == T_IDENT || p.peekAt(2).kind == T_QIDENT) { 2 } else { 0 }
+        let h = p.peekAt(k + 2)
+        let hint = h.kind == T_IDENT && (h.text == "nolock" || h.text == "readuncommitted" || h.text == "holdlock" || h.text == "updlock" ||
+                                         h.text == "rowlock" || h.text == "tablock" || h.text == "readcommitted" || h.text == "serializable" || h.text == "index")
+        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "(" && !hint && !(p.peek().kind == T_IDENT && lexdb_sql.isReserved(&p.peek().text)) {
+            return p.udfFrom(join)
+        }
+    }
     if lateral && !p.isKw("(") { return Err(lexdb_base.err("0A000", "LATERAL is supported before a subquery or a function only")) }
     if p.isKw("(") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "values" {
         // (VALUES (...), ...) [AS] alias [(columns)] (9.80)
@@ -4616,6 +4666,40 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
                  len(p.subs[i].items) == 1
     if single && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
+}
+
+// T-SQL: a function of the user's in FROM, [schema.]f(arguments) [[AS] alias]: a subquery (SUB_FROM) whose items are the
+// arguments and whose srf is "#udf:" and the function's key; it may use the FROM items before it (as APPLY does). Where
+// it is not an inline table-valued function, lexdb_routine says so (208 for none of the name).
+fn (p: mut &P) udfFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let key = try p.rname()
+    let spell = p.spelled.clone()
+    try p.expectKw("(")
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    var s = lexdb_sql.newStmt(S_SELECT)
+    s.srf = "#udf:" + key
+    s.spell = spell.clone()
+    s.use = SUB_FROM
+    if !p.isKw(")") {
+        while true {
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.callArg(true)), alias: "", spell: ""})
+            if !p.acceptKw(",") { break }
+        }
+    }
+    try p.expectKw(")")
+    s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
+    p.depth -= 1
+    append(mut &p.subs, s)
+    let i = len(p.subs) - 1
+    var alias = lexdb_sql.baseName(&key)
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols)
+    p.udf = true
+    if len(cols) > 0 { return Err(lexdb_base.err("TS317", &("Table-valued function '" + lexdb_sql.baseName(&key) + "' cannot have a column alias."))) }
+    return Ok(FromItem{table: key, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
 // T-SQL's table hints, WITH (NOLOCK, ...) or (NOLOCK): read, not used
@@ -5123,7 +5207,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("set")
     try p.setList(mut &s)
     var out: []SelItem = []
-    if p.tsql && p.acceptKw("output") { try p.itemList(mut &out) }
+    if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     if p.acceptKw("from") { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
@@ -5158,7 +5242,7 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     if !(p.tsql || p.ora) || p.isKw("from") { try p.expectKw("from") }
     try p.dmlTarget(mut &s)
     var out: []SelItem = []
-    if p.tsql && p.acceptKw("output") { try p.itemList(mut &out) }
+    if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.fromList(mut &s.from, J_CROSS) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
@@ -5208,7 +5292,7 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     while p.isKw("when") { try p.mergeWhen(mut &s) }
     if s.mdialect == MD_ORA && len(s.merges) > 2 { return Err(near(&p.peek())) }
     var out: []SelItem = []
-    if p.tsql && p.acceptKw("output") { try p.itemList(mut &out) }
+    if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     if !p.tsql { try p.returning(mut &s) }
     for i in 0..len(s.items) {
         match replace(mut &s.items[i].expr, None) {
@@ -6659,7 +6743,7 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
         }
     }
     let sql = if len(rewritten) > 0 { &rewritten } else { sql0 }
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: ora, rnLimit: -1, nls: nls, mr: 0}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: ora, rnLimit: -1, nls: nls, mr: 0, udf: false}
     var out: []Stmt = []
     while true {
         p.params = 0
@@ -6711,7 +6795,7 @@ pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
         append(mut &toks, t.clone())
         i += 1
     }
-    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0}
+    var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0, udf: false}
     let x = try p.expr()
     let t = p.peek().clone()
     if t.kind != T_EOF { return Err(near(&t)) }
@@ -6820,7 +6904,7 @@ pub fn tsqlParser(sql: &str, d: Dialect, vars: &[]str): Result[Parser, lexdb_bas
     let toks = try lexIn(sql, dt)
     var given: []str = []
     for v in vars { append(mut &given, v.clone()) }
-    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0}})
+    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0, udf: false}})
 }
 
 pub fn (q: &Parser) peek(): &Tok { return q.p.peek() }
@@ -6934,6 +7018,8 @@ fn (p: mut &P) fresh() {
 fn (p: mut &P) finish(s: mut &Stmt) {
     s.params = p.params
     s.seqNames = replace(mut &p.seqs, [])
+    s.udf = p.udf
+    p.udf = false
     if s.kind != S_EXPLAIN {
         s.subs = replace(mut &p.subs, [])
         s.wins = replace(mut &p.wins, [])
@@ -7453,7 +7539,7 @@ fn (p: mut &P) oraLimit(s0: Stmt, n: int): Stmt {
 fn emptyRoutine(proc: bool, dialect: int): lexdb_sql.Routine {
     return lexdb_sql.Routine{key: "", spell: "", kind: if proc { lexdb_sql.RK_PROC } else { lexdb_sql.RK_FUNC }, dialect: dialect, params: [],
                              ret: TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, retSpell: "", retSet: false, lang: "sql", attrs: "", body: "",
-                             def: "", owner: "", atomic: false}
+                             def: "", owner: "", atomic: false, code: ""}
 }
 
 // A type as a function's parameter or result has it: PostgreSQL ignores a modifier (varchar(5), numeric(10, 2)) there.
@@ -7482,11 +7568,8 @@ fn (p: &P) unnamedParam(): bool {
 // that is not installed).
 fn (p: mut &P) createRoutine(orReplace: bool, proc: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.tsql && proc { return Err(lexdb_base.err("TS111", "'CREATE/ALTER PROCEDURE' must be the first statement in a query batch.")) }
-    if p.tsql {
-        // T-SQL's functions are a later slice of package F
-        return Err(lexdb_base.err("0A000", if orReplace { "lexdb: CREATE OR ALTER FUNCTION is not supported yet (CREATE OR ALTER takes a view)" }
-                                           else { "lexdb: CREATE FUNCTION is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)" }))
-    }
+    // (a function that is the batch's first statement is read whole by lexdb_tsqlparse.funcBatch)
+    if p.tsql { return Err(lexdb_base.err("TS111", "'CREATE FUNCTION' must be the first statement in a query batch.")) }
     if p.ora { return Err(lexdb_base.err("0A000", "lexdb: CREATE FUNCTION is not supported in this dialect yet")) }
     var s = lexdb_sql.newStmt(S_CREATE_ROUTINE)
     s.ifFlag = orReplace
@@ -7716,6 +7799,18 @@ pub fn (q: mut &Parser) procHeader(): Result[lexdb_sql.Routine, lexdb_base.DbErr
     // a procedure number, ;1
     if q.p.isKw(";") && q.p.peekAt(1).kind == T_NUM { q.p.pos += 2 }
     let paren = q.p.acceptKw("(")
+    try q.routineParams(mut &r)
+    if paren { try q.p.expectKw(")") }
+    // WITH options (RECOMPILE, ENCRYPTION, EXECUTE AS ...), FOR REPLICATION: read to AS
+    while !q.p.isKw("as") {
+        if q.p.peek().kind == T_EOF { return Err(near(&q.p.peek())) }
+        q.p.pos += 1
+    }
+    return Ok(r)
+}
+
+// The parameters of a T-SQL procedure or function: @p [AS] type [VARYING] [= default] [OUT | OUTPUT] [READONLY], ...
+fn (q: mut &Parser) routineParams(r: mut &lexdb_sql.Routine): Result[Unit, lexdb_base.DbErr] {
     while q.p.peek().kind == T_VAR {
         let v = q.p.next()
         for x in r.params {
@@ -7740,13 +7835,75 @@ pub fn (q: mut &Parser) procHeader(): Result[lexdb_sql.Routine, lexdb_base.DbErr
         append(mut &r.params, prm)
         if !q.p.acceptKw(",") { break }
     }
-    if paren { try q.p.expectKw(")") }
-    // WITH options (RECOMPILE, ENCRYPTION, EXECUTE AS ...), FOR REPLICATION: read to AS
-    while !q.p.isKw("as") {
-        if q.p.peek().kind == T_EOF { return Err(near(&q.p.peek())) }
+    return Ok(Unit{})
+}
+
+// A T-SQL function's header, after CREATE [OR ALTER] FUNCTION (or ALTER FUNCTION): its name, (parameters), RETURNS and WITH
+// options, up to the body's BEGIN (a scalar or multi-statement function) or RETURN (an inline one), which it leaves
+// unread; an AS before it is read. attrs: "scalar", "inline" or "multi", then the options kept (schemabinding). A scalar
+// function's type is in ret (and as written in retSpell); the others have retSet, a multi-statement function's table
+// declaration (@t TABLE (...)) in retSpell.
+pub fn (q: mut &Parser) funcHeader(): Result[lexdb_sql.Routine, lexdb_base.DbErr] {
+    var r = emptyRoutine(false, lexdb_sql.RD_TSQL)
+    r.lang = "tsql"
+    let at = q.p.peek().at
+    r.key = try q.p.qname()
+    r.spell = strings.trim(&q.p.src[at..min(q.p.peek().at, len(q.p.src))]).toStr()
+    try q.p.expectKw("(")
+    try q.routineParams(mut &r)
+    try q.p.expectKw(")")
+    try q.p.expectKw("returns")
+    var attrs = ""
+    if q.p.peek().kind == T_VAR {
+        // RETURNS @t TABLE (columns)
+        let ts = q.p.peek().at
         q.p.pos += 1
+        try q.p.expectKw("table")
+        try q.p.expectKw("(")
+        var depth = 1
+        while depth > 0 {
+            let t = q.p.next()
+            if t.kind == T_EOF { return Err(near(&t)) }
+            if t.kind == T_OP && t.text == "(" { depth += 1 }
+            if t.kind == T_OP && t.text == ")" { depth -= 1 }
+        }
+        r.retSet = true
+        r.retSpell = strings.trim(&q.p.src[ts..min(q.p.peek().at, len(q.p.src))]).toStr()
+        attrs = "multi"
+    } else if q.p.acceptKw("table") {
+        r.retSet = true
+        attrs = "inline"
+    } else {
+        let ts = q.p.peek().at
+        let pt = try q.paramType()
+        if len(pt.key) > 0 { return Err(lexdb_base.err("TS2715", &("Column, parameter, or variable #1: Cannot find data type " + pt.written + "."))) }
+        r.ret = pt.typ
+        r.retSpell = strings.trim(&q.p.src[ts..min(q.p.peek().at, len(q.p.src))]).toStr()
+        attrs = "scalar"
     }
+    if q.p.acceptKw("with") {
+        // the options up to the body (EXECUTE AS CALLER has its own AS)
+        while true {
+            let t = q.p.peek().clone()
+            if t.kind == T_EOF { return Err(near(&t)) }
+            if t.kind == T_IDENT && (t.text == "begin" || t.text == "return" || t.text == "as") { break }
+            if t.kind == T_IDENT && t.text == "schemabinding" { attrs += " schemabinding" }
+            q.p.pos += 1
+            if t.kind == T_IDENT && t.text == "execute" && q.p.isKw("as") { q.p.pos += 1 }
+        }
+    }
+    let a = q.p.acceptKw("as")
+    r.attrs = attrs
     return Ok(r)
+}
+
+// A T-SQL query (an inline table-valued function's body) read with the variables vars ($1, $2, ... in that order).
+pub fn tsqlSelect(sql: &str, vars: &[]str): Result[Stmt, lexdb_base.DbErr] {
+    var q = try tsqlParser(sql, Dialect{tsql: true, quotedIdent: true}, vars)
+    let s = try q.statement()
+    while q.p.acceptKw(";") {}
+    if q.p.peek().kind != T_EOF { return Err(near(&q.p.peek())) }
+    return Ok(s)
 }
 
 // Where the next token starts, and the source text (a procedure's body, after its AS).

@@ -1,0 +1,121 @@
+// lexdb over TDS: T-SQL user-defined functions (design/lexdb-dialect-gaps.md, package F, slice F2) on the batches' path and on
+// the row engine (SET lexdb_batch = off), the same queries over a table of 3,000 rows (and across the 1,024-row batch edges): a
+// scalar function in the select list, WHERE, ORDER BY, GROUP BY and an aggregate's argument, a function with a loop, one that
+// recurses, one that reads a table, nested functions, an inline table-valued function applied to every row, NULLs, and an error
+// in a late row (a divide by zero in row 2,500). Each expect line: same and the answer's beginning, or DIFFERENT and both.
+// (The answers are checked against SQL Server in tds_func.)
+// expect: same: id,v: 1|1;2|4;3|9;4|16;5|25;6|36;7|49;8|64;9|81;10|100;11|12 (36441 bytes)
+// expect: same: id,v: 1|1;2|0;3|9;4|0;5|25;6|0;7|49;8|0;9|81;10|0;11|121;12| (28167 bytes)
+// expect: same: id: 39;40;41;43;44;45;46;47;48;50;51;52;53;54;55;57;58;59 (57 bytes)
+// expect: same: id,s: 3000|9000000;2999|8994001;2998|8988004;2997|8982009;29 (70 bytes)
+// expect: same: c,n: 0|1500;1|500;9|500;25|500 (30 bytes)
+// expect: same: s: 9004500500 (13 bytes)
+// expect: same: g,s: 0|2000;1|2500;2|2000;3|6500;4|2000;5|14500 (47 bytes)
+// expect: same: id,w: 1|2;2|2;3|2;4|2;5|2;6|2;7|1;8|2;9|2;10|4;11|4;12|4;13| (19898 bytes)
+// expect: same: id,f: 1|2;2|6;3|24;4|120;5|720;6|5040;7|40320;8|362880;9|362 (41798 bytes)
+// expect: same: id,r: 1|'one';2|'two';3|'three';4|NULL;5|'five';6|'six';7|NU (32327 bytes)
+// expect: same: id,n: 1|1;2|2;3|3;4|3;5|4;6|5;7|0;8|1;9|2;10|3;11|3;12|4;13| (19898 bytes)
+// expect: same: id,k,name: 1|1|'one';2|1|'one';2|2|'two';3|1|'one';3|2|'two' (101720 bytes)
+// expect: same: id,t: 100|9;101|9;102|9;103|9;104|9;105|9;106|9;107|9;108|9; (21413 bytes)
+// expect: same: error 8134 (10 bytes)
+// expect: same: error 8134 (10 bytes)
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE ft (id int IDENTITY(1,1) PRIMARY KEY, g int, x int, s varchar(10))\nCREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nINSERT INTO ft (g, x, s) SELECT n % 6, CASE WHEN n % 7 = 0 THEN NULL ELSE n END, CASE WHEN n % 5 = 0 THEN NULL ELSE 'k' + CAST(n % 13 AS varchar(5)) END FROM (SELECT a.i + b.i * 10 + c.i * 100 + d.i * 1000 + 1 AS n FROM dg a CROSS JOIN dg b CROSS JOIN dg c CROSS JOIN dg d) t WHERE n <= 3000 ORDER BY n\nCREATE TABLE lk (k int PRIMARY KEY, name varchar(10))\nINSERT INTO lk VALUES (1, 'one'), (2, 'two'), (3, 'three'), (5, 'five'), (6, 'six')\nCREATE FUNCTION dbo.sq(@a int) RETURNS int AS BEGIN RETURN @a * @a END\nCREATE FUNCTION dbo.alt(@a int) RETURNS int AS BEGIN IF @a % 2 = 0 RETURN 0; RETURN @a * @a END\nCREATE FUNCTION dbo.digits(@a int) RETURNS int AS BEGIN DECLARE @n int = 0; WHILE @a > 0 BEGIN SET @n += 1; SET @a = @a / 10 END; RETURN @n END\nCREATE FUNCTION dbo.fact(@n int) RETURNS bigint AS BEGIN IF @n <= 1 RETURN 1; RETURN @n * dbo.fact(@n - 1) END\nCREATE FUNCTION dbo.nm(@k int) RETURNS varchar(10) AS BEGIN DECLARE @r varchar(10); SELECT @r = name FROM lk WHERE k = @k; RETURN @r END\nCREATE FUNCTION dbo.cnt(@k int) RETURNS int AS BEGIN RETURN (SELECT COUNT(*) FROM lk WHERE k <= @k) END\nCREATE FUNCTION dbo.up(@n int) RETURNS TABLE AS RETURN (SELECT k, name FROM lk WHERE k <= @n)\nCREATE FUNCTION dbo.dz(@n int) RETURNS int AS BEGIN RETURN 100 / (@n - 2500) END"
+const QS = "SELECT id, dbo.sq(id) v FROM ft ORDER BY id\nSELECT id, dbo.alt(id) v FROM ft ORDER BY id\nSELECT id FROM ft WHERE dbo.sq(id) BETWEEN 1500 AND 3500 AND x IS NOT NULL ORDER BY id\nSELECT TOP 5 id, dbo.sq(id) s FROM ft ORDER BY dbo.sq(id) DESC\nSELECT dbo.alt(g) c, COUNT(*) n FROM ft GROUP BY dbo.alt(g) ORDER BY c\nSELECT SUM(CAST(dbo.sq(id) AS bigint)) s FROM ft\nSELECT g, SUM(dbo.alt(g) + dbo.digits(1000)) s FROM ft GROUP BY g ORDER BY g\nSELECT id, dbo.digits(id) + dbo.digits(x) w FROM ft ORDER BY id\nSELECT id, dbo.fact(id % 20 + 1) f FROM ft ORDER BY id\nSELECT id, dbo.nm(id % 7) r FROM ft ORDER BY id\nSELECT id, dbo.cnt(id % 7) n FROM ft ORDER BY id\nSELECT f.id, u.k, u.name FROM (SELECT id FROM ft WHERE id <= 3000) f CROSS APPLY dbo.up(f.id % 7) u ORDER BY f.id, u.k\nSELECT id, dbo.sq(dbo.digits(id)) t FROM ft WHERE dbo.digits(id) > 2 ORDER BY id\nSELECT id, dbo.dz(id) FROM ft ORDER BY id\nSELECT id FROM ft WHERE dbo.dz(id) > 0 ORDER BY id"
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn batches(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) { let r = show(mut &c, &q) }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = show(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = show(mut &c, &q)
+                // the row engine's answer, and the batches' path's: the same (or both shown)
+                if off == on { println("same: " + strings.substr(&on, 0, min(len(on), 60)) + " (" + len(on).toStr() + " bytes)") } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + strings.substr(&off, 0, min(len(off), 300)))
+                    println("  batches: " + strings.substr(&on, 0, min(len(on), 300)))
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines (gen_mssql.py)
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(43), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
