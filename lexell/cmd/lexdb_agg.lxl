@@ -32,6 +32,35 @@ pub type AggSpec = record {
     pub dirs: str               // per key: a, A (NULLs first), d, D (NULLs last), as the parser gives them
     pub text: str               // to share one accumulator between equal calls
     pub kind: int               // its argument's collation kind (L2): min, max and DISTINCT compare its keys
+    pub op: int                 // fname as an OP_* (set by spec: what add dispatches on)
+}
+
+const OP_COUNT = 0
+const OP_SUM = 1
+const OP_AVG = 2
+const OP_MIN = 3
+const OP_MAX = 4
+const OP_BOOL = 5               // bool_and, every, bool_or
+const OP_ARRAY = 6
+const OP_STRING = 7
+const OP_VAR = 8                // the variances and standard deviations
+
+fn opOf(f: &str): int {
+    if f == "count" { return OP_COUNT }
+    if f == "sum" { return OP_SUM }
+    if f == "avg" { return OP_AVG }
+    if f == "min" { return OP_MIN }
+    if f == "max" { return OP_MAX }
+    if f == "bool_and" || f == "every" || f == "bool_or" { return OP_BOOL }
+    if f == "array_agg" { return OP_ARRAY }
+    if f == "string_agg" { return OP_STRING }
+    return OP_VAR
+}
+
+// A call's spec.
+pub fn spec(fname: str, args: []Expr, star: bool, distinct: bool, filter: Option[Expr], order: []Expr, dirs: str, text: str, kind: int): AggSpec {
+    let op = opOf(&fname)
+    return AggSpec{fname: fname, args: args, star: star, distinct: distinct, filter: filter, order: order, dirs: dirs, text: text, kind: kind, op: op}
 }
 
 pub type Acc = record {
@@ -68,7 +97,10 @@ pub fn extras(sp: &AggSpec): int {
 // them, as elements), and for DISTINCT not one seen in this accumulator
 // (it is now).
 pub fn admit(sp: &AggSpec, acc: mut &Acc, v: &Val): bool {
-    if lexdb_ops.isNull(v) && sp.fname != "array_agg" { return false }
+    match v {
+        Val.Null { if sp.op != OP_ARRAY { return false } }
+        else {}
+    }
     if sp.distinct {
         var kb = ""
         if sp.kind == lexdb_sql.COLL_EXACT { lexdb_access.encIdxPart(mut &kb, v) } else { lexdb_access.encIdxPart(mut &kb, &lexdb_sort.collVal(sp.kind, v)) }
@@ -83,37 +115,38 @@ pub fn admit(sp: &AggSpec, acc: mut &Acc, v: &Val): bool {
 // other values the call reads (extras): string_agg's separator, then the
 // ORDER BY keys.
 pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr] {
+    let op = sp.op
     let f = &sp.fname
-    if f == "sum" || f == "avg" {
+    if op == OP_SUM || op == OP_AVG {
         // avg of reals adds in double precision, as PostgreSQL's float4_accum
-        let w = if f == "avg" && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
+        let w = if op == OP_AVG && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
         // and squares them, so overflows where PostgreSQL's float8_accum does
-        if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
+        if op == OP_AVG && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
         acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &w) }
-    } else if f == "min" {
+    } else if op == OP_MIN {
         // of equal values the last, as PostgreSQL's numeric_smaller gives
         // (0.5 and 0.500: 0.500 if it comes after)
         if sp.kind != lexdb_sql.COLL_EXACT {
             // under a collation's keys: of equal ones the first (L2, as SQL Server)
             if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&lexdb_sort.collVal(sp.kind, &v), &lexdb_sort.collVal(sp.kind, &acc.val))) < 0 { acc.val = v }
         } else if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) <= 0 { acc.val = v }
-    } else if f == "max" {
+    } else if op == OP_MAX {
         if sp.kind != lexdb_sql.COLL_EXACT {
             if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&lexdb_sort.collVal(sp.kind, &v), &lexdb_sort.collVal(sp.kind, &acc.val))) > 0 { acc.val = v }
         } else if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) >= 0 { acc.val = v }
-    } else if f == "bool_and" || f == "every" || f == "bool_or" {
+    } else if op == OP_BOOL {
         let b = match lexdb_ops.truth(&v) {
             Some(x) { x }
             None { return Err(e("42883", &("function " + f + " needs a boolean"))) }
         }
         let prev = match acc.val { Val.Bool(x) { x } else { f != "bool_or" } }
         acc.val = Val.Bool(if f == "bool_or" { prev || b } else { prev && b })
-    } else if f == "array_agg" {
+    } else if op == OP_ARRAY {
         // the values, and their ORDER BY keys (parts keeps orderIdx's count)
         append(mut &acc.seps, v)
         append(mut &acc.parts, "")
         if len(sp.dirs) > 0 { append(mut &acc.ords, more) }
-    } else if f == "string_agg" {
+    } else if op == OP_STRING {
         let sep = &more[0]
         if len(sp.dirs) > 0 {
             var ks: []Val = []
@@ -125,7 +158,7 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
             if acc.n > 0 && !lexdb_ops.isNull(sep) { append(mut &acc.parts, lexdb_sql.text(sep)) }
             append(mut &acc.parts, lexdb_sql.text(&v))
         }
-    } else if f != "count" {
+    } else if op == OP_VAR {
         // the variances and standard deviations
         let x = try numOf(&v, &f)
         let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &x, &x)
