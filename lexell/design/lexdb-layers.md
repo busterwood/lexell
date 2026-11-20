@@ -6006,7 +6006,10 @@ binaries (q1 near 1,950 ms) is probably all built without `-O` (only
 18 Nov record (q1 near 1,690). The q18 -21% and q10 -7% "gains" of the same
 pair were not examined here.
 
-#### 6.3.Q3 as built (2026-11-20)
+#Q3 merged as 95b9968d (2026-11-20): suite 236; TPC-H 1.003 of 0f96fee9 alternated, both built with
+`-O`, checksums equal; point selects level (the agent's A/B, -0.05% to +0.02%).
+
+### 6.3.Q3 as built (2026-11-20)
 
 Built on `worktree-agent-a6093c872adedcdc3` from main 0f96fee9. No
 behaviour change: the moved code is unchanged but for names, the hook and
