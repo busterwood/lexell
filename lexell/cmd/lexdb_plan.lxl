@@ -2982,6 +2982,116 @@ fn onConds(p: &lexdb_bind.LPlan, ms: mut &[][]Expr): int {
     return 1
 }
 
+// ---- rewrites that keep results (optimizer 48): outer joins made inner,
+// WHERE's conjuncts pushed into derived tables, views and CTEs used once
+
+pub const RW_OUTER: int = 1     // outer-to-inner join conversion (48.2)
+pub const RW_PUSH: int = 2      // pushdown into a derived level's query (48.3)
+
+var rewriteMode: int = RW_OUTER | RW_PUSH
+
+// Which of the rewrites the cost planner makes (the tests' and a
+// measurement's switch; SET lexdb_planner = rules makes neither).
+pub fn setRewrites(mode: int) { rewriteMode = mode }
+
+// The binary operators NULL in, NULL out.
+fn strictOp(op: &str): bool {
+    return op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=" ||
+           op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+}
+
+// The calls that are NULL when their first argument is (and that the
+// binder adds around a compared value: collation keys, char trimming).
+fn strictCall(f: &str): bool {
+    return f == "in" || f == "like" || f == "ilike" || f == "#tlike" || f == "similar" || f == "~" || f == "!~" ||
+           f == "~*" || f == "!~*" || f == "#ci" || f == "#pad" || f == "#bptrim" || f == "#tdiv" || f == "lower" ||
+           f == "upper" || f == "length" || f == "char_length" || f == "substring" || f == "substr" || f == "btrim" ||
+           f == "trim" || f == "ltrim" || f == "rtrim" || f == "abs" || f == "date_trunc" || f == "extract" || f == "date_part"
+}
+
+// Whether x is NULL whenever every column of the levels in mask is NULL.
+fn (q: &Query) nullOn(x: &Expr, mask: int): bool {
+    match x {
+        Expr.Col(n, _) {
+            let l = q.levelOf(&n)
+            return l >= 0 && (mask & (1 << l)) != 0
+        }
+        Expr.Lit(v) {
+            match v {
+                Val.Null { return true }
+                else { return false }
+            }
+        }
+        Expr.Unary(op, a) { return (op == "-" || op == "not") && q.nullOn(&a, mask) }
+        Expr.Bin(op, a, b) { return strictOp(&op) && (q.nullOn(&a, mask) || q.nullOn(&b, mask)) }
+        Expr.Cast(a, _) { return q.nullOn(&a, mask) }
+        Expr.Call(f, args, star) { return !star && len(args) > 0 && strictCall(&f) && q.nullOn(&args[0], mask) }
+        else { return false }
+    }
+}
+
+// Whether conjunct x is never true on a row whose columns of the levels in
+// mask are all NULL: it rejects their NULL-extended rows (48.2).
+fn (q: &Query) rejectsNulls(x: &Expr, mask: int): bool {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" { return q.rejectsNulls(&a, mask) || q.rejectsNulls(&b, mask) }
+            if op == "or" { return q.rejectsNulls(&a, mask) && q.rejectsNulls(&b, mask) }
+        }
+        Expr.IsNull(a, neg) { return neg && q.nullOn(&a, mask) }
+        Expr.Unary(op, a) {
+            if op == "not" {
+                match a {
+                    Expr.IsNull(b, neg) { return !neg && q.nullOn(&b, mask) }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return q.nullOn(x, mask)
+}
+
+// Whether a conjunct above level j's join rejects the NULLs of the levels
+// in mask: one of WHERE's (cs), or of the ON of a later level whose join
+// drops rows of the levels before it (inner, cross, RIGHT).
+fn (q: &Query) rejectedAbove(j: int, mask: int, ms: &[][]Expr, cs: &[]Expr): bool {
+    for c in cs { if q.rejectsNulls(&c, mask) { return true } }
+    for m in j + 1..len(q.levels) {
+        if keepsLeft(q.levels[m].join) { continue }
+        for c in ms[m] { if q.rejectsNulls(&c, mask) { return true } }
+    }
+    return false
+}
+
+// Outer joins made inner (48.2), the last first: a LEFT JOIN whose NULL
+// rows a conjunct above it rejects, a RIGHT JOIN whose rows of the tables
+// before it are rejected; a FULL JOIN loses the side whose rows are.
+fn (q: mut &Query) innerJoins(ms: &[][]Expr, cs: &[]Expr) {
+    let nl = len(q.levels)
+    if nl > 62 { return }
+    for i in 1..nl {
+        let j = nl - i
+        let jn = q.levels[j].join
+        if !isOuter(jn) { continue }
+        let rightGone = keepsLeft(jn) && q.rejectedAbove(j, 1 << j, ms, cs)
+        let leftGone = keepsRight(jn) && q.rejectedAbove(j, (1 << j) - 1, ms, cs)
+        var to = jn
+        if jn == lexdb_sql.J_LEFT {
+            if rightGone { to = lexdb_sql.J_INNER }
+        } else if jn == lexdb_sql.J_RIGHT {
+            if leftGone { to = lexdb_sql.J_INNER }
+        } else if rightGone && leftGone {
+            to = lexdb_sql.J_INNER
+        } else if leftGone {
+            to = lexdb_sql.J_LEFT
+        } else if rightGone {
+            to = lexdb_sql.J_RIGHT
+        }
+        q.levels[j].join = to
+    }
+}
+
 // The planner's pass over FROM (2e slice 2), after bindFrom: the semi-join
 // alternatives, the ON and WHERE conjuncts placed per level (read from
 // q.lp), the implied equalities, the join order, the paths, hashing, the
@@ -3028,10 +3138,6 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     let nl = len(q.levels)
     // the columns by name, for levelOf (the planner asks it often: optimizer 30)
     if nl >= 2 { for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } } }
-    // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
-    // conjunct goes below the last one.
-    var lastRight = -1
-    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
     var ms: [][]Expr = []
     var ps: [][]Expr = []
     for k in 0..nl {
@@ -3040,6 +3146,12 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     }
     var cs: []Expr = []                    // WHERE's conjuncts
     fromConds(&q.lp, bf.where, mut &ms, mut &cs)
+    // outer joins whose NULL rows WHERE or a later join rejects: inner (optimizer 48.2)
+    if nl >= 2 && !hs.rules && (rewriteMode & RW_OUTER) != 0 && !q.innerOnly() { q.innerJoins(&ms, &cs) }
+    // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
+    // conjunct goes below the last one.
+    var lastRight = -1
+    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
     for i in 0..len(cs) {
         let c = replace(mut &cs[i], Expr.Lit(Val.Null))
         if nl == 0 {

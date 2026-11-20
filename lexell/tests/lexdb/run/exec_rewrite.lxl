@@ -1,0 +1,173 @@
+// lexdb_plan: rewrites that keep results (optimizer 48). Outer joins made
+// inner where WHERE (or a later join's ON) rejects their NULL rows (48.2):
+// LEFT, RIGHT and FULL joins, nested, through later outer joins, with
+// USING, LATERAL and derived tables; what does not reject (IS NULL,
+// COALESCE, CASE, OR with a NULL-keeping arm). Each query runs with the
+// rewrites, without (lexdb_plan.setRewrites(0)), with batches off and under
+// SET lexdb_planner = rules: the same rows (sorted) or the same error.
+// "rewritten": per query, y when its plan differs from the plan without
+// the rewrites.
+// expect: create table a (id int primary key, x int, y text) -> CREATE TABLE
+// expect: insert into a select g, case when g % 7 = 0 then null else g % 5 end, 'y' || (g % 3) from generate_series(1, 40) g -> INSERT 0 40
+// expect: create table b (id int primary key, aid int, v int, w text) -> CREATE TABLE
+// expect: insert into b select g, case when g % 11 = 0 then null else g % 30 + 1 end, case when g % 4 = 0 then null else g % 9 end, case when g % 5 = 0 then null else 'w' || (g % 4) end from generate_series(1, 60) g -> INSERT 0 60
+// expect: create index b_aid on b (aid) -> CREATE INDEX
+// expect: create table c (id int primary key, bid int, z int) -> CREATE TABLE
+// expect: insert into c select g, g % 70 + 1, case when g % 6 = 0 then null else g % 4 end from generate_series(1, 50) g -> INSERT 0 50
+// expect: analyze -> ANALYZE
+// expect: outer: 37 queries, 37 the same, rewritten ynnnyyynyyyynnnyynyyynyynnyyyyyynyyyn
+// expect: before: select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3 -> scan b: full scan; right join a: hash on (id) over full scan
+// expect: after: select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3 -> scan b: full scan; join a: primary key lookup per row
+// expect: before: select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 -> scan a: full scan; full join b: hash on (aid) over full scan
+// expect: after: select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 -> scan a: full scan; left join b: index b_aid lookup, index only (estimated 2 rows) per row
+// expect: before: select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1 -> scan a: full scan; left join b: index b_aid lookup, index only (estimated 2 rows) per row; left join c: hash on (bid) over full scan
+// expect: after: select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1 -> scan c: full scan; join b: primary key lookup per row; join a: primary key lookup per row
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_plan"
+import "collections"
+import "strings"
+
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            collections.sort(mut &lines)
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn show(s: mut &lexdb_exec.Session, sql: str) { println(sql + " -> " + run(s, &sql)) }
+
+// EXPLAIN's lines, in one.
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(&("explain " + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows { append(mut &lines, lexdb_sql.text(&row[0])) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn explain(s: mut &lexdb_exec.Session, sql: str) {
+    lexdb_plan.setRewrites(0)
+    println("before: " + sql + " -> " + plan(s, &sql))
+    lexdb_plan.setRewrites(lexdb_plan.RW_OUTER | lexdb_plan.RW_PUSH)
+    println("after: " + sql + " -> " + plan(s, &sql))
+}
+
+type Group = record { name: str; n: int; same: int; marks: str; seen: []str }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, marks: "", seen: []} }
+
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let all = lexdb_plan.RW_OUTER | lexdb_plan.RW_PUSH
+    lexdb_plan.setRewrites(all)
+    let on = run(s, sql)
+    let pOn = plan(s, sql)
+    lexdb_plan.setRewrites(0)
+    let off = run(s, sql)
+    let pOff = plan(s, sql)
+    lexdb_plan.setRewrites(all)
+    let x = run(s, &"set lexdb_batch = off")
+    let rows = run(s, sql)
+    let y = run(s, &"set lexdb_batch = on")
+    let z = run(s, &"set lexdb_planner = rules")
+    let rules = run(s, sql)
+    let w = run(s, &"reset lexdb_planner")
+    g.n += 1
+    if on == off && on == rows && on == rules {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  on: " + on + "\n  off: " + off + "\n  rows: " + rows + "\n  rules: " + rules)
+    }
+    g.marks += if pOn != pOff { "y" } else { "n" }
+}
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, rewritten " + g.marks)
+    for x in g.seen { println(x) }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    // a: 40 rows; b: 60 rows, aid 1..30 (some NULL), v with NULLs; c: 50 rows over b
+    show(mut &s, "create table a (id int primary key, x int, y text)")
+    show(mut &s, "insert into a select g, case when g % 7 = 0 then null else g % 5 end, 'y' || (g % 3) from generate_series(1, 40) g")
+    show(mut &s, "create table b (id int primary key, aid int, v int, w text)")
+    show(mut &s, "insert into b select g, case when g % 11 = 0 then null else g % 30 + 1 end, case when g % 4 = 0 then null else g % 9 end, case when g % 5 = 0 then null else 'w' || (g % 4) end from generate_series(1, 60) g")
+    show(mut &s, "create index b_aid on b (aid)")
+    show(mut &s, "create table c (id int primary key, bid int, z int)")
+    show(mut &s, "insert into c select g, g % 70 + 1, case when g % 6 = 0 then null else g % 4 end from generate_series(1, 50) g")
+    show(mut &s, "analyze")
+    var g = newGroup(&"outer")
+    let qs = [
+        // LEFT: rejected, kept
+        "select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is null",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v > 3 or b.v is null",
+        "select a.id, b.id from a left join b on b.aid = a.id where coalesce(b.v, 0) = 0",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is not null",
+        "select a.id, b.id from a left join b on b.aid = a.id where not (b.v is null)",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v > 3 or b.w = 'w1'",
+        "select a.id, b.id from a left join b on b.aid = a.id where case when b.v is null then 1 else b.v end > 2",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v in (1, 2, 3)",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.w like 'w1%'",
+        "select a.id, b.id from a left join b on b.aid = a.id where upper(b.w) = 'W2'",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v + a.x > 4",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.w || 'x' = 'w1x'",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is distinct from 3",
+        "select a.id, b.id from a left join b on b.aid = a.id and b.v > 3 where a.x > 1",
+        "select a.id, b.id from a left join b on b.aid = a.id where a.x = 2 and b.v < 5",
+        // RIGHT and FULL
+        "select a.id, b.id from a right join b on b.aid = a.id where a.x > 2",
+        "select a.id, b.id from a right join b on b.aid = a.id where b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 and b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 or b.v > 2",
+        // nested, and through later joins
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z is null",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id right join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id full join c on c.bid = b.id where b.w like 'w%'",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id full join c on c.bid = b.id where c.z > 0",
+        "select a.id, b.id, c.id from a full join b on b.aid = a.id left join c on c.bid = b.id where c.z = 2",
+        "select a.id, b.id, c.id from a right join b on b.aid = a.id right join c on c.bid = b.id where a.y = 'y1'",
+        // USING, LATERAL, grouping, a derived table on the nullable side
+        "select id, a.x, b.v from a left join b using (id) where b.v > 2",
+        "select id, a.x, b.v from a full join b using (id) where id > 30",
+        "select a.id, l.v from a left join lateral (select b.v from b where b.aid = a.id) l on true where l.v > 4",
+        "select a.x, count(*), sum(b.v) from a left join b on b.aid = a.id where b.w <> 'w3' group by a.x",
+        "select a.id, d.n from a left join (select aid, count(*) n from b group by aid) d on d.aid = a.id where d.n >= 2",
+        "select a.id, d.n from a left join (select aid, count(*) n from b group by aid) d on d.aid = a.id where d.n is null"
+    ]
+    for q in qs { check(mut &s, mut &g, &q) }
+    report(&g)
+    explain(mut &s, "select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3")
+    explain(mut &s, "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2")
+    explain(mut &s, "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
