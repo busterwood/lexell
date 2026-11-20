@@ -233,7 +233,7 @@ pub fn copyStrs(xs: &[]str): []str {
 pub fn privName(l: &str): str {
     return match l {
         "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "D" { "TRUNCATE" } "x" { "REFERENCES" }
-        "t" { "TRIGGER" } "U" { "USAGE" } "C" { "CREATE" } else { "" }
+        "t" { "TRIGGER" } "U" { "USAGE" } "C" { "CREATE" } "X" { "EXECUTE" } else { "" }
     }
 }
 
@@ -250,6 +250,8 @@ pub type Acl = record {
 // for PUBLIC (PostgreSQL 15 on: not CREATE).
 pub fn defaultGrants(obj: &str): []Grant {
     if obj == "n:public" { return [Grant{to: "", privs: "U"}] }
+    // a PostgreSQL function or procedure: EXECUTE for PUBLIC (SQL Server's and Oracle's routines have none for anyone but the owner)
+    if strings.startsWith(obj, "f:0\x00") { return [Grant{to: "", privs: "X"}] }
     // a session's temporary schema (9.96): its own, to use and make in
     if len(obj) > 2 && obj[0] == 'n' && lexdb_base.isTempSchema(&obj[2..len(obj)]) { return [Grant{to: "", privs: "UC"}] }
     return []
@@ -277,7 +279,8 @@ pub type PrivRow = record {
     pub spell: str          // as it was written ("" where it was not kept)
     pub owner: str          // the owning role (the session's user where none is known)
     pub to: str
-    pub letter: str         // r a w d D x t (U for a sequence)
+    pub letter: str         // r a w d D x t (U for a sequence; X for a routine)
+    pub dialect: int        // -1 a relation; a routine's: lexdb_sql.RD_TSQL (a procedure or function) or RD_ORA (a stored unit)
 }
 
 // The grants made on tables, views and sequences (the owner's own are not among them), in the catalog's order.
@@ -314,12 +317,66 @@ pub fn privRows(snap: &CatSnap): []PrivRow {
             for g in a.grants {
                 if g.to == owner { continue }
                 for k in 0..len(g.privs) {
-                    append(mut &out, PrivRow{key: key.clone(), kind: kind.clone(), oid: oid, schema: schema.clone(), name: name.clone(), spell: spell.clone(), owner: owner.clone(), to: g.to.clone(), letter: g.privs[k..k + 1].toStr()})
+                    append(mut &out, PrivRow{key: key.clone(), kind: kind.clone(), oid: oid, schema: schema.clone(), name: name.clone(), spell: spell.clone(), owner: owner.clone(), to: g.to.clone(), letter: g.privs[k..k + 1].toStr(), dialect: -1})
                 }
             }
         }
     }
+    // the routines of SQL Server and Oracle (PostgreSQL's are read by its own views: its owner's and PUBLIC's rows are listed too)
+    for r in snap.routines {
+        if r.dialect != lexdb_sql.RD_TSQL { continue }
+        let a = routineAcl(snap, &r)
+        for g in a.grants {
+            if g.to == a.owner { continue }
+            for k in 0..len(g.privs) {
+                append(mut &out, PrivRow{key: r.key.clone(), kind: if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }, oid: lexdb_sql.nameOid(&"R", &r.key),
+                                         schema: lexdb_sql.schemaOf(&r.key), name: lexdb_sql.baseName(&r.key), spell: lexdb_sql.baseName(&r.key), owner: a.owner.clone(), to: g.to.clone(),
+                                         letter: g.privs[k..k + 1].toStr(), dialect: lexdb_sql.RD_TSQL})
+            }
+        }
+    }
+    for u in snap.procs {
+        if u.kind != "PROCEDURE" && u.kind != "FUNCTION" { continue }
+        let obj = unitObj(&u.owner, &u.name)
+        let raw = snap.acls.get(&obj)
+        if raw.isNone() { continue }
+        let a = decAcl(&obj, &raw.unwrap())
+        let owner = if len(a.owner) > 0 { a.owner.clone() } else { strings.toLowerAscii(&u.owner) }
+        for g in a.grants {
+            if g.to == owner { continue }
+            for k in 0..len(g.privs) {
+                append(mut &out, PrivRow{key: strings.toLowerAscii(&u.owner) + "." + strings.toLowerAscii(&u.name), kind: strings.toLowerAscii(&u.kind), oid: 0, schema: strings.toLowerAscii(&u.owner),
+                                         name: strings.toLowerAscii(&u.name), spell: u.name.clone(), owner: owner.clone(), to: g.to.clone(), letter: g.privs[k..k + 1].toStr(), dialect: lexdb_sql.RD_ORA})
+            }
+        }
+    }
     return out
+}
+
+// The catalog's object a privilege on a routine is on: its dialect, name's key and signature (PostgreSQL's identity argument
+// types; "" for T-SQL's). An Oracle stored unit (lexdb_plsql's, kept as source text) is dialect RD_ORA, named by its owner's
+// and its own name in lower case.
+pub fn routineObj(dialect: int, key: &str, sig: &str): str { return "f:" + dialect.toStr() + "\x00" + key + "\x00" + sig }
+pub fn unitObj(owner: &str, name: &str): str { return routineObj(lexdb_sql.RD_ORA, &(strings.toLowerAscii(owner) + "." + strings.toLowerAscii(name)), "") }
+
+// A PostgreSQL routine's identity: the types of the arguments it is called with (comma-separated oids); T-SQL's has none.
+pub fn sigKey(r: &Routine): str {
+    if r.dialect == lexdb_sql.RD_TSQL { return "" }
+    var o: []str = []
+    for p in r.params { if p.mode != "out" { append(mut &o, p.typ.oid.toStr()) } }
+    return strings.join(&o, ",")
+}
+
+pub fn routineObjOf(r: &Routine): str { return routineObj(r.dialect, &r.key, &sigKey(r)) }
+
+// The privileges on a routine: its row, else the default (PostgreSQL's PUBLIC EXECUTE) with the owner the routine records.
+pub fn routineAcl(snap: &CatSnap, r: &Routine): Acl {
+    let obj = routineObjOf(r)
+    let raw = snap.acls.get(&obj)
+    if raw.isNone() { return Acl{owner: r.owner.clone(), grants: defaultGrants(&obj), set: false} }
+    var a = decAcl(&obj, &raw.unwrap())
+    if len(a.owner) == 0 { a.owner = r.owner.clone() }
+    return a
 }
 
 // The catalog key of an object a privilege is on: a relation's or a schema's.
@@ -1162,7 +1219,7 @@ pub fn decRoutine(v: &str): Routine {
     }
     return Routine{key: f[0].clone(), spell: f[1].clone(), kind: lexdb_base.num(&f[2]), dialect: lexdb_base.num(&f[3]), params: ps, ret: strType(&f[4]),
                    retSpell: f[5].clone(), retSet: f[6] == "1", lang: f[7].clone(), attrs: f[12].clone(), body: f[8].clone(), def: f[9].clone(), owner: f[10].clone(),
-                   atomic: f[11] == "1", code: if len(f) > 13 { f[13].clone() } else { "" }}
+                   atomic: f[11] == "1", code: if len(f) > 13 { f[13].clone() } else { "" }, denied: ""}
 }
 
 // The routines of the catalog, in key order.
@@ -1174,6 +1231,21 @@ pub fn allRoutines(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]
     })
     return Ok(out)
 }
+
+// The stored PL/SQL units (lexdb_plsql's rows: owner, kind, name, source).
+pub fn units(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]ProcSrc, lexdb_base.DbErr] {
+    var procs: []ProcSrc = []
+    let srcPre = "\x02src\x00"
+    try st.scan(txn, CATALOG, &srcPre, &(srcPre + "\xff"), fn(en: &lexdb_store.Entry): bool {
+        let f = strings.split(&en.key[len(srcPre)..len(en.key)], "\x00")
+        if len(f) == 3 { append(mut &procs, ProcSrc{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val.clone()}) }
+        return true
+    })
+    return Ok(procs)
+}
+
+// The store's memo key lexdb_plsql keeps its version of the units in (a change to a unit or to who may run one moves it).
+pub const PLSQL_VER: str = "plsql.ver"
 
 pub fn seqRow(k: &str): str { return "\x04" + k }
 
@@ -1361,13 +1433,7 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
     })
     var seqs: []Seq = []
     for d in try allSeqs(st, txn, &"") { if !hiddenName(&d.key) { append(mut &seqs, seqCopy(&d)) } }
-    var procs: []ProcSrc = []
-    let srcPre = "\x02src\x00"
-    try st.scan(txn, CATALOG, &srcPre, &(srcPre + "\xff"), fn(en: &lexdb_store.Entry): bool {
-        let f = strings.split(&en.key[len(srcPre)..len(en.key)], "\x00")
-        if len(f) == 3 { append(mut &procs, ProcSrc{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val.clone()}) }
-        return true
-    })
+    let procs = try units(st, txn)
     var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.sql.path),
                        user: st.memo.get(&userKey(txn.sql.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn), procs: procs,
                        ttypes: try allTabTypes(st, txn), routines: try allRoutines(st, txn)}

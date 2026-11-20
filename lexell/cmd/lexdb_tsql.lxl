@@ -1587,7 +1587,17 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     match sess.routines(lexdb_sql.RD_TSQL, &t.key) {
         Ok(found) {
             for rt in found {
-                if rt.kind == lexdb_sql.RK_PROC { return st.callProc(sess, t, &rt, &vals, f, ev) }
+                if rt.kind == lexdb_sql.RK_PROC {
+                    // EXECUTE on it (229); its body then runs with its owner's rights
+                    match sess.needExecute(&rt) {
+                        Ok(_) {}
+                        Err(e) {
+                            st.failErr(ev, &e, 0)
+                            return F_NEXT
+                        }
+                    }
+                    return st.callProc(sess, t, &rt, &vals, f, ev)
+                }
             }
         }
         Err(e) {
@@ -1764,7 +1774,10 @@ fn (st: mut &State) callProc(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.
     st.procId = lexdb_sql.nameOid(&"R", &rt.key)
     append(mut &st.procs, procShown(rt))
     st.retVal = 0
+    // (SQL Server's ownership chain: what the body touches is checked as its owner, as long as both own what they use)
+    let callerRole = if len(rt.owner) > 0 { sess.actAs(&rt.owner) } else { "" }
     let r = st.block(sess, &b.stmts, mut &fr, ev)
+    if len(rt.owner) > 0 { sess.backTo(&callerRole) }
     let rc = if r == F_RETURN { st.retVal } else { 0 }
     let px = pop(mut &st.procs)
     st.nocount = nocount0

@@ -5352,6 +5352,18 @@ fn viewPlanned(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, pla
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
            sc: mut &Scope, res: bool): Result[SubPlan, DbErr] {
+    // a function's body written into the query: what it reads is checked as its owner (SQL Server's ownership chain)
+    if len(s.runAs) > 0 {
+        append(mut &sc.asRole, s.runAs.clone())
+        let r = planSubIn(st, txn, s, params, sc, res)
+        let x = pop(mut &sc.asRole)
+        return r
+    }
+    return planSubIn(st, txn, s, params, sc, res)
+}
+
+fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
+             sc: mut &Scope, res: bool): Result[SubPlan, DbErr] {
     // EXISTS stops at its first row; a scalar subquery at its second, unless
     // it aggregates, groups or is DISTINCT (then it reads everything:
     // optimizer 33)
@@ -9851,7 +9863,10 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if (len(keys) > 0 || len(seqs) > 0 || len(rtns) > 0) && !s.cascade {
         return Err(e("2BP01", &("cannot drop schema " + s.table + " because other objects depend on it")))
     }
-    for r in rtns { txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(r.dialect, &r.key, &lexdb_routine.sigOf(&r)))) }
+    for r in rtns {
+        txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(r.dialect, &r.key, &lexdb_routine.sigOf(&r))))
+        dropAcl(txn, &lexdb_catalog.routineObjOf(&r))
+    }
     for k in keys {
         match try byKeyOpt(st, txn, &k) {
             Some(t) {
@@ -21123,6 +21138,10 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     }
     for c in snap.cons { b += &("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n") }
     lexdb_syscat.bind(&snap, mut &b)
+    // the routines (has_function_privilege, HAS_PERMS_BY_NAME): ACL object, name's key, signature, owner, dialect, privilege a use needs
+    for r in snap.routines {
+        b += &("f\t" + lexdb_catalog.routineObjOf(&r) + "\t" + r.key + "\t" + lexdb_catalog.sigKey(&r) + "\t" + r.owner + "\t" + r.dialect.toStr() + "\t" + useLetter(&r) + "\n")
+    }
     for s in snap.schemas { b += &("n\t" + lexdb_pg.nspOid(&s).toStr() + "\t" + s + "\n") }
     b += "n\t11\tpg_catalog\nn\t13000\tinformation_schema\n"
     st.memo.put(&catMemoKey(txn.sql.sess), &b)
@@ -21491,7 +21510,7 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         return Ok(Some(Val.Text(catUser(se))))
     }
     if name == "has_database_privilege" { return Ok(Some(Val.Bool(true))) }
-    if name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_sequence_privilege" || name == "has_any_column_privilege" {
+    if name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_sequence_privilege" || name == "has_any_column_privilege" || name == "has_function_privilege" {
         for v in vs { if lexdb_ops.isNull(&v) { return Ok(Some(Val.Null)) } }
         return Ok(Some(try hasPrivFn(se, name, vs)))
     }
@@ -21633,7 +21652,8 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     }
     var who: []str = []
     var whoSuper = false
-    if rel == "information_schema.table_privileges" || rel == "information_schema.role_table_grants" || rel == "sys.database_permissions" || strings.endsWith(rel, "_TAB_PRIVS") {
+    if rel == "information_schema.table_privileges" || rel == "information_schema.role_table_grants" || rel == "sys.database_permissions" || strings.endsWith(rel, "_TAB_PRIVS") ||
+       rel == "information_schema.routine_privileges" || rel == "information_schema.role_routine_grants" {
         let w = try whoNow(st, txn)
         who = w.roles.clone()
         whoSuper = w.super
@@ -22060,6 +22080,19 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
             // it is none, as SQL Server's for a name it cannot find); the other classes and permissions are not modelled
             if n >= 3 && !lexdb_ops.isNull(&vs[0]) && strings.toLowerAscii(&lexdb_sql.text(&vs[1])) == "object" {
                 let perm = strings.toLowerAscii(&lexdb_sql.text(&vs[2]))
+                if perm == "execute" || perm == "exec" {
+                    var nm = strings.replaceAll(&(strings.replaceAll(&lexdb_sql.text(&vs[0]), "[", "")), "]", "")
+                    if strings.startsWith(&strings.toLowerAscii(&nm), "dbo.") { nm = nm[4..len(nm)].toStr() }
+                    match hasPrivFn(se, "#has_routine_privilege", &[Val.Text(nm), Val.Text("execute")]) {
+                        Ok(v) {
+                            match v {
+                                Val.Bool(b) { return Ok(Some(Val.Int(if b { 1 } else { 0 }))) }
+                                else { return Ok(Some(Val.Null)) }
+                            }
+                        }
+                        Err(_) { return Ok(Some(Val.Null)) }
+                    }
+                }
                 if perm == "select" || perm == "insert" || perm == "update" || perm == "delete" || perm == "references" {
                     var nm = strings.replaceAll(&(strings.replaceAll(&lexdb_sql.text(&vs[0]), "[", "")), "]", "")
                     if strings.startsWith(&strings.toLowerAscii(&nm), "dbo.") { nm = "public." + nm[4..len(nm)] }
@@ -22957,6 +22990,80 @@ fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: &str
     return Ok(Unit{})
 }
 
+// The routines a GRANT or REVOKE of PostgreSQL's names (FUNCTION, PROCEDURE, ROUTINE with its argument types or without, or ALL
+// FUNCTIONS | PROCEDURES | ROUTINES IN SCHEMA): the objects whose privileges it changes.
+fn grantRoutineTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[[]Target, DbErr] {
+    var out: []Target = []
+    let all = strings.startsWith(&s.index, "all ")
+    let kw = if all { s.index[4..len(s.index)].toStr() } else { s.index.toStr() }
+    let funcs = kw == "function" || kw == "functions"
+    let procs = kw == "procedure" || kw == "procedures"
+    let what = if funcs { "function" } else if procs { "procedure" } else { "routine" }
+    for c in s.cols {
+        if all {
+            if !(try schemaExists(st, txn, &c.name)) { return Err(e("3F000", &("schema \"" + c.name + "\" does not exist"))) }
+            for r in try lexdb_catalog.allRoutines(st, txn) {
+                if r.dialect != lexdb_sql.RD_PG || lexdb_sql.schemaOf(&r.key) != c.name { continue }
+                if (funcs && r.kind != lexdb_sql.RK_FUNC) || (procs && r.kind != lexdb_sql.RK_PROC) { continue }
+                append(mut &out, Target{obj: lexdb_catalog.routineObjOf(&r), kind: if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }, name: r.key.clone(), owner: r.owner.clone()})
+            }
+            continue
+        }
+        let parts = strings.split(&c.name, "\x00")
+        let key = parts[0].toStr()
+        let sig = parts[1].toStr()
+        let have = try routinesIn(st, txn, lexdb_sql.RD_PG, &key)
+        var hit: []Routine = []
+        for h in have {
+            if sig == "*" || lexdb_routine.sigOf(&h) == sig { append(mut &hit, h.clone()) }
+        }
+        let shownName = lexdb_sql.shown(&key)
+        if len(hit) == 0 {
+            var shown = "()"
+            if sig != "*" {
+                var ts: []str = []
+                if len(sig) > 0 { for o in strings.split(&sig, ",") { append(mut &ts, lexdb_pgcat.formatType(lexdb_base.num(&o), -1)) } }
+                shown = "(" + strings.join(&ts, ", ") + ")"
+            }
+            if sig == "*" { return Err(e("42883", &("could not find a " + what + " named \"" + shownName + "\""))) }
+            return Err(e("42883", &(what + " " + shownName + shown + " does not exist")))
+        }
+        if len(hit) > 1 { return Err(e("42725", &(what + " name \"" + shownName + "\" is not unique"))) }
+        let r = hit[0].clone()
+        if (funcs && r.kind != lexdb_sql.RK_FUNC) || (procs && r.kind != lexdb_sql.RK_PROC) {
+            var ts: []str = []
+            for p in r.params { if p.mode != "out" { append(mut &ts, lexdb_pgcat.formatType(p.typ.oid, -1)) } }
+            return Err(e("42809", &(shownName + "(" + strings.join(&ts, ", ") + ") is not a " + what)))
+        }
+        append(mut &out, Target{obj: lexdb_catalog.routineObjOf(&r), kind: if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }, name: r.key.clone(), owner: r.owner.clone()})
+    }
+    return Ok(out)
+}
+
+// A name GRANT finds no relation for, as an object of the door's: SQL Server's procedure or function (a table-valued function takes
+// SELECT, the others EXECUTE), Oracle's stored procedure or function.
+fn grantOtherTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Option[Target], DbErr] {
+    let door = doorOf(st, txn.sql.sess)
+    if door == "tds" {
+        let key = try catKey(st, txn, name, false)
+        for r in try lexdb_routine.find(st, txn, lexdb_sql.RD_TSQL, &key) {
+            let tvf = r.kind == lexdb_sql.RK_FUNC && r.retSet
+            return Ok(Some(Target{obj: lexdb_catalog.routineObjOf(&r), kind: if r.kind == lexdb_sql.RK_PROC { "procedure" } else if tvf { "tvf" } else { "function" }, name: r.key.clone(), owner: r.owner.clone()}))
+        }
+    } else if door == "tns" {
+        // [owner.]name: the owner's own unit unless it is named
+        let nm = lexdb_sql.baseName(name)
+        let owner = if lexdb_sql.isQual(name) { lexdb_sql.schemaOf(name) } else { currentRole(st, txn.sql.sess) }
+        for u in try lexdb_catalog.units(st, txn) {
+            if (u.kind == "PROCEDURE" || u.kind == "FUNCTION") && strings.toLowerAscii(&u.owner) == strings.toLowerAscii(&owner) && strings.toLowerAscii(&u.name) == strings.toLowerAscii(&nm) {
+                return Ok(Some(Target{obj: lexdb_catalog.unitObj(&u.owner, &u.name), kind: strings.toLowerAscii(&u.kind),
+                                      name: lexdb_sql.qual(&strings.toLowerAscii(&u.owner), &strings.toLowerAscii(&u.name)), owner: strings.toLowerAscii(&u.owner)}))
+            }
+        }
+    }
+    return Ok(None)
+}
+
 fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, kind: &str, name: &str): Result[Unit, DbErr] {
     if w.super { return Ok(Unit{}) }
     let a = try readAcl(st, txn, obj)
@@ -22982,6 +23089,8 @@ fn needRelOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, ki
 // The letters a privilege name stands for on an object of a kind
 // (table, sequence, schema); "" if it is not one of them.
 fn privLetters(name: &str, kind: &str): str {
+    if kind == "function" || kind == "procedure" { return match name { "execute" { "X" } "all" { "X" } else { "" } } }
+    if kind == "tvf" { return match name { "select" { "r" } "all" { "r" } else { "" } } }
     if kind == "schema" {
         return match name { "usage" { "U" } "create" { "C" } "all" { "UC" } else { "" } }
     }
@@ -23007,7 +23116,7 @@ fn addLetters(have: &str, more: &str): str {
     for i in 0..len(more) { if !strings.contains(&out, &more[i..i + 1]) { out = out + more[i..i + 1] } }
     // in PostgreSQL's order
     var sorted = ""
-    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C"] { if strings.contains(&out, &c) { sorted = sorted + c } }
+    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C", "X"] { if strings.contains(&out, &c) { sorted = sorted + c } }
     return sorted
 }
 
@@ -23029,14 +23138,17 @@ fn roleExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &str): Resul
 }
 
 // The objects a GRANT or REVOKE names: (object, kind word, name) for each.
-type Target = record { obj: str; kind: str; name: str }
+type Target = record { obj: str; kind: str; name: str; owner: str }
 
 fn grantTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[[]Target, DbErr] {
     var out: []Target = []
+    if s.index == "function" || s.index == "procedure" || s.index == "routine" || strings.startsWith(&s.index, "all f") || strings.startsWith(&s.index, "all p") || strings.startsWith(&s.index, "all r") {
+        return grantRoutineTargets(st, txn, s)
+    }
     for c in s.cols {
         if s.index == "schema" {
             if !(try schemaExists(st, txn, &c.name)) { return Err(e("3F000", &("schema \"" + c.name + "\" does not exist"))) }
-            append(mut &out, Target{obj: lexdb_catalog.nspObj(&c.name), kind: "schema", name: c.name.clone()})
+            append(mut &out, Target{obj: lexdb_catalog.nspObj(&c.name), kind: "schema", name: c.name.clone(), owner: ""})
         } else if s.index == "all tables" || s.index == "all sequences" {
             if !(try schemaExists(st, txn, &c.name)) { return Err(e("3F000", &("schema \"" + c.name + "\" does not exist"))) }
             if s.index == "all tables" {
@@ -23048,25 +23160,31 @@ fn grantTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql
                     if lexdb_sql.schemaOf(&en.key) == c.name { append(mut &keys, en.key.clone()) }
                     return true
                 })
-                for k in keys { append(mut &out, Target{obj: lexdb_catalog.relObj(&k), kind: "table", name: k.clone()}) }
+                for k in keys { append(mut &out, Target{obj: lexdb_catalog.relObj(&k), kind: "table", name: k.clone(), owner: ""}) }
             } else {
                 for d in try lexdb_catalog.allSeqs(st, txn, if c.name == "public" { "" } else { &c.name }) {
-                    if lexdb_sql.schemaOf(&d.key) == c.name { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone()}) }
+                    if lexdb_sql.schemaOf(&d.key) == c.name { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone(), owner: ""}) }
                 }
             }
         } else if s.index == "sequence" {
             match try findSeq(st, txn, &c.name) {
-                Some(d) { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone()}) }
+                Some(d) { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone(), owner: ""}) }
                 None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&c.name) + "\" does not exist"))) }
             }
         } else {
             // a table or a view; a sequence named as a table is one too, as in PostgreSQL
             match try findTable(st, txn, &c.name) {
-                Some(t) { append(mut &out, Target{obj: lexdb_catalog.relObj(&t.name), kind: if len(t.view) > 0 { "view" } else { "table" }, name: t.name.clone()}) }
+                Some(t) { append(mut &out, Target{obj: lexdb_catalog.relObj(&t.name), kind: if len(t.view) > 0 { "view" } else { "table" }, name: t.name.clone(), owner: ""}) }
                 None {
                     match try findSeq(st, txn, &c.name) {
-                        Some(d) { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone()}) }
-                        None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&c.name) + "\" does not exist"))) }
+                        Some(d) { append(mut &out, Target{obj: lexdb_catalog.relObj(&d.key), kind: "sequence", name: d.key.clone(), owner: ""}) }
+                        None {
+                            // SQL Server's procedures and functions, Oracle's stored units: objects of the same name space
+                            match try grantOtherTarget(st, txn, &c.name) {
+                                Some(tg) { append(mut &out, tg) }
+                                None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&c.name) + "\" does not exist"))) }
+                            }
+                        }
                     }
                 }
             }
@@ -23081,9 +23199,14 @@ fn grantTargets(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql
 fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, tg: &Target, letters: &str, door: &str): Result[Unit, DbErr] {
     if w.super { return Ok(Unit{}) }
     let a = try readAcl(st, txn, &tg.obj)
-    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
+    let own = if len(a.owner) > 0 { a.owner.clone() } else { tg.owner.clone() }
+    if len(own) > 0 && lexdb_base.hasStr(&w.roles, &own) { return Ok(Unit{}) }
+    // SQL Server tells a user that may not grant what it holds that it cannot find the object (15151), tables and routines alike
+    if door == "tds" {
+        return Err(e("TS15151", &("Cannot find the object '" + lexdb_sql.baseName(&tg.name) + "', because it does not exist or you do not have permission.")))
+    }
     if door == "tds" { return Err(e("TS4613", "Grantor does not have GRANT permission.")) }
-    if door == "tns" && (tg.kind == "table" || tg.kind == "view") {
+    if door == "tns" && (tg.kind == "table" || tg.kind == "view" || tg.kind == "procedure" || tg.kind == "function") {
         for k in 0..len(letters) {
             if allows(w, &a, &letters[k..k + 1]) {
                 return Err(e("ORA01720", &("grant option does not exist for '" + strings.toUpperAscii(&lexdb_sql.schemaOf(&tg.name)) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&tg.name)) + "'")))
@@ -23146,12 +23269,25 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             // ALL on a table is the five privileges SQL Server and Oracle have (neither has TRUNCATE or TRIGGER)
             if pn == "all" && len(door) > 0 && (tg.kind == "table" || tg.kind == "view") { l = "arwdx" }
             if len(l) == 0 && pn != "maintain" {
+                // a privilege the object's kind has not: SQL Server's 4606, Oracle's 990 (EXECUTE on a table) and 942 (the others on a unit)
+                let isRtn = tg.kind == "function" || tg.kind == "procedure" || tg.kind == "tvf"
+                if door == "tds" { return Err(e("TS4606", "Granted or revoked privilege " + strings.toUpperAscii(&pn) + " is not compatible with object.")) }
+                if door == "tns" { return Err(if isRtn { e("ORA00942", "table or view does not exist") } else { e("ORA00990", "missing or invalid privilege") }) }
                 return Err(e("0LP01", &("invalid privilege type " + strings.toUpperAscii(&pn) + " for " + tg.kind)))
             }
             letters = addLetters(&letters, &l)
         }
-        try needGrantor(st, txn, &w, &tg, &letters, &door)
+        // (SQL Server: a user that did not grant a permission revokes nothing, without complaint)
+        if !grant && door == "tds" {
+            match needGrantor(st, txn, &w, &tg, &letters, &door) {
+                Ok(_) {}
+                Err(_) { continue }
+            }
+        } else {
+            try needGrantor(st, txn, &w, &tg, &letters, &door)
+        }
         var a = try readAcl(st, txn, &tg.obj)
+        if len(a.owner) == 0 && len(tg.owner) > 0 { a.owner = tg.owner.clone() }
         if !a.set { a.set = true }
         for g in grantees {
             var found = -1
@@ -23167,6 +23303,7 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         for g in a.grants { if len(g.privs) > 0 { append(mut &kept, Grant{to: g.to.clone(), privs: g.privs.clone()}) } }
         a.grants = kept
         try writeAcl(txn, &tg.obj, &a)
+        if tg.kind == "procedure" || tg.kind == "function" || tg.kind == "tvf" { st.memo.put(&lexdb_catalog.PLSQL_VER, &((lexdb_base.num(&st.memo.get(&lexdb_catalog.PLSQL_VER).unwrapOr("0")) + 1).toStr())) }
     }
     try bumpCatalog(st, txn)
     return Ok(tagOnly(&tag))
@@ -23365,9 +23502,52 @@ fn hasPrivFn(se: &SeqEnv, name: &str, vs: &[]Val): Result[Val, DbErr] {
         if len(sess) == 0 || sess[0][0] != role { return Err(e("42704", &("role \"" + role + "\" does not exist"))) }
     }
     let target = &vs[n - 2]
-    let kind = if name == "has_schema_privilege" { "schema" } else if name == "has_sequence_privilege" { "sequence" } else { "table" }
+    let kind = if name == "has_schema_privilege" { "schema" } else if name == "has_sequence_privilege" { "sequence" } else if name == "has_function_privilege" { "function" }
+               else if name == "#has_routine_privilege" { "troutine" } else { "table" }
     var obj = ""
-    if kind == "schema" {
+    var routineOwner = ""
+    if kind == "troutine" {
+        // SQL Server's procedure or function by its (schema-qualified) name
+        let want = strings.toLowerAscii(&lexdb_sql.text(target))
+        for l in catLines(se, &"f") {
+            if l[4] == "1" && l[1] == want {
+                obj = l[0].clone()
+                routineOwner = l[3].clone()
+            }
+        }
+        if len(obj) == 0 { return Err(e("42883", &("routine " + want + " does not exist"))) }
+    } else if kind == "function" {
+        // 'name(argument types)' as a regprocedure, by name through the search path or schema-qualified
+        let txt = lexdb_sql.text(target)
+        let lp = strings.indexOf(&txt, "(", 0)
+        if lp < 0 { return Err(e("42883", &("function " + txt + " does not exist"))) }
+        let nm = strings.trim(&txt[0..lp])
+        var ts: []str = []
+        let rp = strings.lastIndexOf(&txt, ")")
+        let argText = if rp > lp { strings.trim(&txt[lp + 1..rp]) } else { "" }
+        if len(argText) > 0 {
+            for a in strings.split(&argText, ",") {
+                let o = lexdb_pgcat.typeByName(&a)
+                if o == 0 { return Err(e("42704", &("type \"" + strings.trim(&a) + "\" does not exist"))) }
+                append(mut &ts, o.toStr())
+            }
+        }
+        let sig = strings.join(&ts, ",")
+        var path: []str = []
+        for l in catLines(se, &"p") { append(mut &path, l[0].clone()) }
+        if len(path) == 0 { path = ["public"] }
+        for l in catLines(se, &"f") {
+            if l[4] != "0" || l[2] != sig { continue }
+            let sc = lexdb_sql.schemaOf(&l[1])
+            let base = lexdb_sql.baseName(&l[1])
+            let want = strings.toLowerAscii(&nm)
+            if (want == base && lexdb_base.hasStr(&path, &sc)) || want == sc + "." + base {
+                obj = l[0].clone()
+                routineOwner = l[3].clone()
+            }
+        }
+        if len(obj) == 0 { return Err(e("42883", &("function " + txt + " does not exist"))) }
+    } else if kind == "schema" {
         let sn = lexdb_sql.text(target)
         for l in catLines(se, &"n") { if l[1] == sn || l[0] == sn { obj = lexdb_catalog.nspObj(&l[1]) } }
         if len(obj) == 0 { return Err(e("3F000", &("schema \"" + sn + "\" does not exist"))) }
@@ -23379,11 +23559,12 @@ fn hasPrivFn(se: &SeqEnv, name: &str, vs: &[]Val): Result[Val, DbErr] {
     }
     var a = Acl{owner: "", grants: lexdb_catalog.defaultGrants(&obj), set: false}
     for l in catLines(se, &"A") { if l[0] == obj { a = lexdb_catalog.decAcl(&obj, &strings.replaceAll(&(strings.replaceAll(&l[1], "\x1e", "\n")), "\x1d", "\t")) } }
+    if len(a.owner) == 0 && len(routineOwner) > 0 { a.owner = routineOwner.clone() }
     for part in strings.split(&lexdb_sql.text(&vs[n - 1]), ",") {
         var p = strings.toLowerAscii(&(strings.trim(&part)))
         let grantOpt = strings.endsWith(&p, " with grant option")
         if grantOpt { p = strings.trim(&p[0..len(p) - 18]) }
-        let letters = privLetters(&p, &kind)
+        let letters = privLetters(&p, if kind == "troutine" { "function" } else { &kind })
         if len(letters) == 0 { return Err(e("22023", &("unrecognized privilege type: \"" + strings.trim(&part) + "\""))) }
         if grantOpt {
             // the owner's and a superuser's only: lexdb gives no grant options
@@ -24425,6 +24606,118 @@ pub fn (s: mut &Session) allRoutines(dialect: int): Result[[]Routine, DbErr] {
     return r
 }
 
+// ---- privileges on routines (package F, slice F3): EXECUTE ("X") on a procedure or function, SELECT ("r") on a table-valued function
+//
+// A routine's privileges are an ACL row of its own (lexdb_catalog.routineObj), written when the first GRANT or REVOKE changes them:
+// before that a PostgreSQL routine is EXECUTE for PUBLIC (as PostgreSQL's), a T-SQL one is its owner's alone. The owner is the role
+// that made it (the routine's own record), and a superuser may do anything. A statement that calls no routine reads none of this.
+
+// The privilege the session's role lacks on a routine, "" none.
+fn lackOn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, r: &Routine, letter: &str): Result[str, DbErr] {
+    if w.super { return Ok("") }
+    // PostgreSQL finds a function by its schema: USAGE on it first
+    if r.dialect == lexdb_sql.RD_PG && !(try may(st, txn, w, &lexdb_catalog.nspObj(&lexdb_sql.schemaOf(&r.key)), &"U")) { return Ok("U") }
+    var a = try readAcl(st, txn, &lexdb_catalog.routineObjOf(r))
+    if len(a.owner) == 0 { a.owner = r.owner.clone() }
+    return Ok(if allows(w, &a, letter) { "" } else { letter.toStr() })
+}
+
+// The privilege a use of a routine needs: a table-valued function is read as a table (SELECT), the others run (EXECUTE).
+fn useLetter(r: &Routine): str { return if r.dialect == lexdb_sql.RD_TSQL && r.kind == lexdb_sql.RK_FUNC && r.retSet { "r" } else { "X" } }
+
+fn needRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    let letter = useLetter(r)
+    let lack = try lackOn(st, txn, &w, r, &letter)
+    if len(lack) == 0 { return Ok(Unit{}) }
+    var d = r.clone()
+    d.denied = lack
+    return Err(lexdb_routine.deniedErr(&d))
+}
+
+// The routine called, or the session may not use it: PostgreSQL's 42501, SQL Server's 229 (its text names the permission).
+pub fn (s: mut &Session) needExecute(r: &Routine): Result[Unit, DbErr] {
+    if len(s.txn) > 0 { return needRoutine(&s.st, mut &s.txn[0], r) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let res = needRoutine(&s.st, mut &t, r)
+    s.st.abort(t)
+    return res
+}
+
+// The routines in fns the session may not use (their .denied set), for those the statement calls (by name; all when names is empty).
+fn markDenied(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fns: mut &[]Routine, names: &[]str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    if w.super { return Ok(Unit{}) }
+    for i in 0..len(fns) {
+        if len(names) > 0 && !lexdb_base.hasStr(names, &lexdb_sql.baseName(&fns[i].key)) { continue }
+        fns[i].denied = try lackOn(st, txn, &w, &fns[i], &useLetter(&fns[i]))
+    }
+    return Ok(Unit{})
+}
+
+fn (s: mut &Session) markDeniedFns(fns: mut &[]Routine, names: &[]str): Result[Unit, DbErr] {
+    if len(s.txn) > 0 { return markDenied(&s.st, mut &s.txn[0], fns, names) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let res = markDenied(&s.st, mut &t, fns, names)
+    s.st.abort(t)
+    return res
+}
+
+// A body runs with its owner's rights where its dialect's routines do (SQL Server's ownership chain, Oracle's definer's rights):
+// the session acts as the owner until backTo gives the role it had back.
+pub fn (s: &Session) actAs(owner: &str): str {
+    let prev = s.st.memo.get(&roleKeyOf(s.id)).unwrapOr("")
+    s.st.memo.put(&roleKeyOf(s.id), owner)
+    return prev
+}
+
+pub fn (s: &Session) backTo(prev: &str) { s.st.memo.put(&roleKeyOf(s.id), prev) }
+
+// What an Oracle unit's run replaces: the session's role and its search path (the owner's schema is where the unit's names are).
+pub type RoleSave = record { pub role: str; pub path: []str }
+pub fn noSave(): RoleSave { return RoleSave{role: "", path: []} }
+
+pub fn (s: mut &Session) actAsSchema(owner: &str): RoleSave {
+    let prev = RoleSave{role: s.st.memo.get(&roleKeyOf(s.id)).unwrapOr(""), path: s.path.clone()}
+    s.st.memo.put(&roleKeyOf(s.id), owner)
+    s.setPath(&[owner.toStr(), "public".toStr()])
+    return prev
+}
+
+pub fn (s: mut &Session) backToSchema(prev: &RoleSave) {
+    s.st.memo.put(&roleKeyOf(s.id), &prev.role)
+    s.setPath(&prev.path)
+}
+
+// Of Oracle's stored units, named "OWNER.NAME", those the session's role may not execute: not its own, and no EXECUTE granted to it,
+// to PUBLIC or to a role it holds (a superuser may run all).
+fn unitsDeniedIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[[]str, DbErr] {
+    var out: []str = []
+    let w = try whoNow(st, txn)
+    if w.super { return Ok(out) }
+    for n in names {
+        let at = strings.indexOf(n, ".", 0)
+        let owner = n[0..at]
+        let name = n[at + 1..len(n)]
+        if lexdb_base.hasStr(&w.roles, &strings.toLowerAscii(&owner)) { continue }
+        var a = try readAcl(st, txn, &lexdb_catalog.unitObj(&owner, &name))
+        if len(a.owner) == 0 { a.owner = strings.toLowerAscii(&owner) }
+        if !allows(&w, &a, &"X") { append(mut &out, n.toStr()) }
+    }
+    return Ok(out)
+}
+
+pub fn (s: mut &Session) unitsDenied(names: &[]str): Result[[]str, DbErr] {
+    if len(s.txn) > 0 { return unitsDeniedIn(&s.st, mut &s.txn[0], names) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let res = unitsDeniedIn(&s.st, mut &t, names)
+    s.st.abort(t)
+    return res
+}
+
 fn createRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if len(s.rtn) == 0 { return Err(e("XX000", "no routine")) }
     var r = s.rtn[0].clone()
@@ -24487,6 +24780,7 @@ fn dropRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         let d = try lexdb_routine.dropOne(st, txn, dialect, &key, &parts[1], &s.index, &s.spells[i], s.ifFlag, fn(o: int): str { return lexdb_pgcat.formatType(o, -1) }, &w.roles, w.super)
         if len(d.notice) > 0 { notice(st, txn, &"00000", &d.notice, &"") }
+        for o in d.objs { dropAcl(txn, &o) }
     }
     try bumpCatalog(st, txn)
     return Ok(tagOnly(if s.index == "procedure" { "DROP PROCEDURE" } else if s.index == "function" { "DROP FUNCTION" } else { "DROP ROUTINE" }))
@@ -24563,6 +24857,7 @@ fn (s: mut &Session) callRoutine(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: 
         return Err(d)
     }
     let r = cands[best].clone()
+    try s.needExecute(&r)
     let sl = lexdb_routine.slots(&r, len(args), &stmt.names).unwrap()
     var ins: []Val = []
     var inTypes: []int = []
@@ -24716,6 +25011,7 @@ fn (s: mut &Session) tsqlFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_s
     var fns: []Routine = []
     for r in try s.allRoutines(lexdb_sql.RD_TSQL) { if r.kind == lexdb_sql.RK_FUNC { append(mut &fns, r) } }
     for r in fns { s.st.memo.put(&udfKey(s.id, &r.key), &lexdb_catalog.encRoutine(&r)) }
+    try s.markDeniedFns(mut &fns, &[])
     return lexdb_routine.tsqlCalls(stmt, &fns, udfQuery)
 }
 
@@ -24737,8 +25033,10 @@ fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb
     // (no function known, as of the generation the session saw: nothing to look at; the usual case, a point select's)
     if s.fnGen == lexdb_routine.namesGen() && len(s.fnNames) == 0 { return Ok(None) }
     let names = try s.functionNames()
-    if len(names) == 0 || !lexdb_routine.callsAny(stmt, &names) { return Ok(None) }
-    let fns = try s.allRoutines(lexdb_sql.RD_PG)
+    let called = lexdb_routine.callNames(stmt, &names)
+    if len(called) == 0 { return Ok(None) }
+    var fns = try s.allRoutines(lexdb_sql.RD_PG)
+    try s.markDeniedFns(mut &fns, &called)
     let path: []str = if len(s.path) == 0 { ["public"] } else { s.path.clone() }
     return lexdb_routine.inlineCalls(stmt, &fns, &path)
 }

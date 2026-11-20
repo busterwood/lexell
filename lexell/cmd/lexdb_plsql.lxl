@@ -563,7 +563,7 @@ pub fn newIp(st: lexdb_store.Store): Ip {
 // ---- stored source (the catalog tree's "\x02src\x00" keys: owner, kind and name)
 
 const SRC_PRE: str = "\x02src\x00"
-const MEMO_VER: str = "plsql.ver"
+const MEMO_VER: str = lexdb_catalog.PLSQL_VER
 
 fn srcKey(owner: &str, kind: &str, name: &str): str { return SRC_PRE + owner + "\x00" + kind + "\x00" + name }
 
@@ -587,6 +587,8 @@ pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, sr
         }
     } else {
         t.del(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)))
+        // (a procedure's or function's grants go with it: a unit made again of the name starts without them)
+        if kind == "PROCEDURE" || kind == "FUNCTION" { t.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + lexdb_catalog.unitObj(owner, name))) }
     }
     try st.commit(t)
     bumpVer(st)
@@ -674,9 +676,16 @@ pub type Prog = record {
     ver: int
     ddl: int
     errs: []str
+    denied: []str           // "OWNER.NAME" of the standalone units the session's user may not execute (another owner's, not granted to it)
 }
 
-pub fn newProg(): Prog { return Prog{units: [], ver: -1, ddl: -1, errs: []} }
+pub fn newProg(): Prog { return Prog{units: [], ver: -1, ddl: -1, errs: [], denied: []} }
+
+// Whether the user may not run a unit of its own name (EXECUTE was not granted; the owner's, a superuser's and a package's are free).
+fn (pg: &Prog) deniedUnit(owner: &str, name: &str): bool {
+    if len(pg.denied) == 0 { return false }
+    return lexdb_base.hasStr(&pg.denied, &(owner + "." + name))
+}
 
 // The index of the compiled procedure or function that names (NAME, OWNER.NAME or PKG.NAME) mean, -1 none.
 fn (pg: &Prog) find(names: &[]str, user: &str): int {
@@ -686,6 +695,7 @@ fn (pg: &Prog) find(names: &[]str, user: &str): int {
     for i in 0..len(pg.units) {
         let u = &pg.units[i]
         if u.name != nm || (u.kind != U_PROC && u.kind != U_FUNC) { continue }
+        if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
         if len(names) == 1 {
             if len(u.pkg) == 0 && (pick < 0 || u.owner == user) { pick = i }
         } else if len(names) == 2 {
@@ -718,6 +728,7 @@ fn (pg: &Prog) pkgOf(owner: &str, name: &str): int {
 fn sigsOf(pg: &Prog): []SigEntry {
     var out: []SigEntry = []
     for u in pg.units {
+        if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
         if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub}) }
     }
     return out
@@ -2994,9 +3005,13 @@ fn callUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p:
         callerPi = pkgIndex(ip, &u.owner, &u.pkg)
         if callerPi >= 0 { pkgSave(u, fr, ip, callerPi) }
     }
+    // (definer's rights: a unit of another owner reads and writes with its owner's privileges)
+    let switched = cu.owner != u.owner && len(cu.owner) > 0
+    let callerSave = if switched { sess.actAsSchema(&strings.toLowerAscii(&cu.owner)) } else { lexdb_exec.noSave() }
     ip.depth += 1
     let r = execBlock(pg, ip, sess, cu, &cu.body, mut &f2)
     ip.depth -= 1
+    if switched { sess.backToSchema(&callerSave) }
     if calleePi >= 0 { pkgSave(cu, &f2, ip, calleePi) }
     if callerPi >= 0 { pkgLoad(u, fr, ip, callerPi) }
     match r {
@@ -3793,7 +3808,10 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
     var units: []PUnit = []
     var sigs: []SigEntry = []
     for s in srcs {
-        match compileStored(ip, sess, &s.src, &s.owner, [], true) {
+        let save = if s.owner != ip.user { sess.actAsSchema(&strings.toLowerAscii(&s.owner)) } else { lexdb_exec.noSave() }
+        let hdr = compileStored(ip, sess, &s.src, &s.owner, [], true)
+        if s.owner != ip.user { sess.backToSchema(&save) }
+        match hdr {
             Ok(u) { append(mut &sigs, SigEntry{owner: u.owner.clone(), pkg: "", name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true}) }
             Err(_) {}
         }
@@ -3810,7 +3828,10 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         }
     }
     for s in srcs {
-        match compileStored(ip, sess, &s.src, &s.owner, cloneSigs(&sigs), false) {
+        let save = if s.owner != ip.user { sess.actAsSchema(&strings.toLowerAscii(&s.owner)) } else { lexdb_exec.noSave() }
+        let built = compileStored(ip, sess, &s.src, &s.owner, cloneSigs(&sigs), false)
+        if s.owner != ip.user { sess.backToSchema(&save) }
+        match built {
             Ok(u) { append(mut &units, u) }
             Err(e) {
                 var u = emptyUnit()
@@ -3833,10 +3854,14 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
             Err(_) {}
         }
     }
+    // the units of other owners the user may not run
+    var names: []str = []
+    for u in units { if len(u.pkg) == 0 && (u.kind == U_PROC || u.kind == U_FUNC) { append(mut &names, u.owner + "." + u.name) } }
     pg.units = units
     pg.ver = ip.storedVer
     pg.ddl = ip.ddl
     ip.keep = len(ip.scache)
+    pg.denied = try sess.unitsDenied(&names)
     return Ok(Unit{})
 }
 
@@ -4166,6 +4191,14 @@ pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
         }
         if len(names) > 0 && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "(" {
             let pi = pg.find(&names, &ip.user)
+            // another owner's function the user may not run: as Oracle's, an identifier that is none
+            if pi < 0 && len(names) == 2 {
+                for u in pg.units {
+                    if u.kind == U_FUNC && len(u.pkg) == 0 && u.owner == names[0] && u.name == names[1] && pg.deniedUnit(&u.owner, &u.name) {
+                        return Err(ora(904, &("\"" + u.owner + "\".\"" + u.name + "\": invalid identifier")))
+                    }
+                }
+            }
             if pi >= 0 && pg.units[pi].kind == U_FUNC {
                 var d = 0
                 var close = -1
