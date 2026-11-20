@@ -22,6 +22,8 @@
 // expect: errors ran in the pipeline: 14 of 14
 // expect: more: 14 queries, 14 the same both ways
 // expect: more ran in the pipeline: 14 of 14
+// expect: parameters: 12 of 12 the same
+// expect: floats: 16 queries, 16 the same both ways, 16 in the pipeline
 // expect: q16: same, in the pipeline: true, 39 rows
 // expect: in a transaction: same, in the pipeline: true
 import "strings"
@@ -30,6 +32,9 @@ import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_sql"
 import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
     match s.exec(sql) {
@@ -76,6 +81,29 @@ fn both(s: mut &lexdb_exec.Session, sql: &str): Got {
         println("  pipeline: " + on)
     }
     return Got{same: on == off, piped: piped, ran: ran, rows: on}
+}
+
+// sql run with parameters through runRows, its plan kept in pc (run again
+// with other values): its rows as text, or the error.
+fn withParams(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    let nt: []int = []
+    let r = s.runRows(&stmts[0], params, &nt, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool { return true })
+    match r {
+        Ok(res) {
+            var lines: []str = []
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
 }
 
 fn main() {
@@ -179,6 +207,65 @@ fn main() {
         }
         println("more: " + len(more).toStr() + " queries, " + sameM.toStr() + " the same both ways")
         println("more ran in the pipeline: " + pipedM.toStr() + " of " + len(more).toStr())
+
+        // parameters: the plan kept, run again with other values (a separator, a DISTINCT
+        // argument, a key, a FILTER, a boolean's comparison)
+        let seps = ["-", "+", ";;", ""]
+        let psqls = ["select g, string_agg(name, $1 order by id), count(distinct k + $2) from t where id < 300 group by g order by g",
+                     "select count(distinct k) filter (where id > $1), bool_and(k > $2), array_agg(k order by k * $2, id) from t where id < 200",
+                     "select id % 13, stddev(f) filter (where k > $1), bool_or(id > $2) from t group by id % 13 order by 1"]
+        var sameP = 0
+        var totalP = 0
+        for pi in 0..len(psqls) {
+            var pc = lexdb_exec.newPlanCache()
+            for v in 0..4 {
+                let p1 = if pi == 0 { lexdb_sql.Val.Text(seps[v].clone()) } else { lexdb_sql.Val.Int(v * 40) }
+                let params = [p1, lexdb_sql.Val.Int(v * 7 - 5)]
+                let a = q(mut &s, &"set lexdb_batch = off")
+                var pc2 = lexdb_exec.oneShot()
+                let off = withParams(mut &s, &psqls[pi], &params, mut &pc2)
+                let b = q(mut &s, &"set lexdb_batch = on")
+                let on = withParams(mut &s, &psqls[pi], &params, mut &pc)
+                totalP += 1
+                if on == off { sameP += 1 } else { println("PARAMS DIFFERENT: " + psqls[pi] + " " + off + " / " + on) }
+            }
+        }
+        println("parameters: " + sameP.toStr() + " of " + totalP.toStr() + " the same")
+
+        // the variances over floats (their own kernel): a float8 and a float4 column,
+        // NULLs, and the values arith's overflow and underflow checks answer to
+        one(mut &s, &"create table fl (id int primary key, g int, d float8, r real, i int)")
+        for c in 0..3 {
+            var fv: []str = []
+            for j in 0..1000 {
+                let i = c * 1000 + j
+                append(mut &fv, "(" + i.toStr() + ", " + (i % 5).toStr() + ", " + (if i % 9 == 0 { "null" } else { ((i * 37) % 1000).toStr() + ".125" }) + ", " + (if i % 7 == 0 { "null" } else { ((i * 13) % 500).toStr() + ".25" }) + ", " + (i % 100).toStr() + ")")
+            }
+            one(mut &s, &("insert into fl values " + strings.join(&fv, ", ")))
+        }
+        one(mut &s, &"update fl set d = 1e200 where id = 2000")
+        one(mut &s, &"update fl set d = 1e-200 where id = 2100")
+        one(mut &s, &"update fl set d = 'Infinity' where id = 2200")
+        one(mut &s, &"update fl set d = 'NaN' where id = 2300")
+        one(mut &s, &"update fl set d = -0.0 where id = 2400")
+        one(mut &s, &"update fl set d = 1e154 where id in (2600, 2601, 2602)")
+        let fls = ["select stddev(d), variance(d), var_pop(r), stddev_pop(r), stddev_samp(r), var_samp(d) from fl where id < 2000",
+                   "select g, stddev(d), variance(r), var_pop(d) from fl where id < 2000 group by g order by g",
+                   "select stddev(d) from fl where id between 1900 and 2100", "select variance(d) from fl where id between 2050 and 2150",
+                   "select g, var_pop(d) from fl where id between 2150 and 2250 group by g order by g",
+                   "select stddev(d), variance(d) from fl where id between 2250 and 2350", "select variance(d), var_pop(d) from fl where id between 2350 and 2450",
+                   "select variance(d) from fl where id between 2590 and 2600", "select variance(d) from fl where id between 2600 and 2602",
+                   "select g, stddev(d) from fl where id >= 2603 group by g order by g", "select id % 1300, var_samp(d), stddev_pop(r) from fl where id < 2000 group by id % 1300 order by 1",
+                   "select stddev(d) filter (where i > 50), variance(r) filter (where g = 2) from fl where id < 2000", "select stddev(d), stddev(r), stddev(i) from fl where id < 40",
+                   "select variance(d) from fl where id = 5", "select var_pop(d), stddev_pop(d) from fl where id = 5", "select variance(d) from fl where id < 0"]
+        var sameF = 0
+        var pipedF = 0
+        for sql in fls {
+            let r = both(mut &s, &sql)
+            if r.same { sameF += 1 }
+            if r.ran { pipedF += 1 }
+        }
+        println("floats: " + len(fls).toStr() + " queries, " + sameF.toStr() + " the same both ways, " + pipedF.toStr() + " in the pipeline")
 
         // TPC-H q16's shape: count(DISTINCT) grouped by three columns, a NOT IN subquery
         one(mut &s, &"create table part (p_partkey int primary key, p_brand text, p_type text, p_size int)")
