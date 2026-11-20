@@ -177,7 +177,7 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 | M15 | `MERGE` (T-SQL): `TOP (n)`, `BY SOURCE`, `OUTPUT $action, INSERTED.*, DELETED.*` | S | as M14; `tsqlMergeCheck`, `mergeOutput` (parse) | row* (joins as M14) | as M14 | mssql_merge_queries (tds_merge) |
 | M16 | `MERGE` (Oracle): `UPDATE SET … WHERE … DELETE WHERE …`, `INSERT … WHERE` | S | as M14; `MergeClause.delWhere`, `oraTarget` | row* (joins as M14) | as M14 | oracle_merge_queries (tns_merge) |
 | M17 | `RETURNING` (INSERT, UPDATE, DELETE, MERGE) | S + B | `retOf`, `retAdd`, `retAddOld`, `retRes` | row* | per written row | exec_returning, exec_dmlscale |
-| M18 | T-SQL `OUTPUT INSERTED.c, DELETED.c` | B (parse → RETURNING, `#old`) + S | `tsqlDml`, `outputRefs`, `mergeOutput` (parse) | row* | per written row | mssql_app_queries, tds_merge, tds_rangedel |
+| M18 | T-SQL `OUTPUT INSERTED.c, DELETED.c [INTO target [(cols)]]` | B (parse → RETURNING, `#old`) + S; INTO: the rows inserted in the statement's transaction | `tsqlDml`, `outputRefs`, `mergeOutput`, `outputList` (parse); `outputInto` (lexdb_tsql) | row* | per written row | mssql_app_queries, tds_merge, tds_rangedel, tds_output |
 | M19 | `COPY t FROM STDIN` (text, CSV, options, `batch_rows`) | S | `copyStmt`, `copyRecord`, `fastCopyPlan`, `fastCopyRun` (the fast path has no foreign keys); with foreign keys, `copyStmt` parses the records after the one read (those the buffer holds whole and well formed) ahead in chunks of 32 doubling to 1,024 and has `fkAhead` probe their parents together, then takes each as it reaches it | row* | checks per row | exec_copy, exec_copy_fast, exec_copystream, wire_copy, exec_fkchunk |
 | M20 | `COPY t TO STDOUT`, `COPY (query) TO STDOUT` | S + its query | `copyOut`, `copyStream` | query both | — | exec_copy, wire_copy |
 | M21 | T-SQL `INSERT BULK` | S | `bulkStmt`, `lexdb_tds` | row* | — | tds_bulk |
@@ -337,7 +337,7 @@ with a subquery; multi-dimensional arrays and arrays of enums; MERGE `TOP …
 PERCENT`; MATCH_RECOGNIZE over a recursive CTE; WAIT with SELECT INTO;
 Oracle `(+)` in some positions; Oracle CONNECT BY other than `dual CONNECT
 BY LEVEL <= n` (fails as unsupported); T-SQL `DECLARE … CURSOR`; T-SQL
-`OUTPUT … INTO` (not parsed). A CTE body must be a SELECT (`subquery`
+`OUTPUT … INTO` followed by a second, row-returning `OUTPUT`. A CTE body must be a SELECT (`subquery`
 expects SELECT), so writable CTEs and `WITH x AS (VALUES …)` are refused.
 
 **Oddities:**
