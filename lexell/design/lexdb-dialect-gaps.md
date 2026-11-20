@@ -413,3 +413,9 @@ would remove it. Fixed after review: each session caches the names with lexdb_ro
 before F1 (3.3990 / 3.3982 billion against 3.3999 / 3.3983; F1 3.4125 / 3.4134). Test:
 `exec_routine_sessions` (a function made, replaced and dropped in one session seen by another that
 had cached none; it fails with the invalidation removed).
+A second hole, found from a user question about transactions (and in F1 from the start): the shared list
+was built from the building session's transaction, so a function another session made in a transaction still
+open at that moment was left out after it committed (every session then got 42883 until a restart). The list
+must only ever hold more names than some transaction can see, never fewer: a function made before the list
+exists is now kept aside and merged when the list is built (`noteFunction`, `loadNames`). Definitions
+themselves were always transactional (catalog rows; calls resolve through the caller's transaction).
