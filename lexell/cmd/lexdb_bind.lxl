@@ -1226,6 +1226,7 @@ pub type Names = record {
     pub constCast: fn(Val, &lexdb_sql.TypeName): Result[Val, DbErr]  // a constant cast when resolved (castConst)
     pub colScale: fn(&lexdb_sql.TypeName): int  // a column's OutCol.scale (lexdb_exec.typScale: the dialects' wire types)
     pub outScale: fn(&Expr, &[]lexdb_sql.ColDef): int  // an expression's (lexdb_exec.exprScale)
+    pub virt: bool                  // a query's table has a virtual column (lexdb_gen.setQueryGen)
 }
 
 pub fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
@@ -2019,6 +2020,27 @@ pub fn (o: &OutCol) label(): str {
     return if len(o.spell) > 0 { o.spell.clone() } else { o.name.clone() }
 }
 
+fn isColRef(x: &Expr): bool {
+    match x {
+        Expr.Col(_, _) { return true }
+        else { return false }
+    }
+}
+
+// The name of the column x names where it is virtual (resolved to its expression, whose own name is name), else name.
+fn virtualName(x: &Expr, name: &str, cols: &[]lexdb_sql.ColDef): str {
+    match x {
+        Expr.Col(xn, _) {
+            match resolveName(cols, len(cols), &xn) {
+                Ok(ci) { if cols[ci].genKind == lexdb_sql.GEN_VIRTUAL { return colPart(&cols[ci].name) } }
+                Err(_) {}
+            }
+        }
+        else {}
+    }
+    return name.clone()
+}
+
 fn exprName(x: &Expr): str {
     match x {
         Expr.Col(n, _) { return colPart(&n) }
@@ -2086,22 +2108,7 @@ pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColD
                 let r = try resolve(&x, cols, len(cols), ns)
                 var name = if it.alias != "" { it.alias.clone() } else { exprName(&r) }
                 // (a virtual column's expression stands for the column: it keeps its name)
-                match x {
-                    Expr.Col(xn, _) {
-                        match r {
-                            Expr.Col(_, _) {}
-                            else {
-                                if it.alias == "" {
-                                    match resolveName(cols, len(cols), &xn) {
-                                        Ok(ci) { if cols[ci].genKind == lexdb_sql.GEN_VIRTUAL { name = colPart(&cols[ci].name) } }
-                                        Err(_) {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else {}
-                }
+                if ns.virt && it.alias == "" && !isColRef(&r) { name = virtualName(&x, &name, cols) }
                 let pt = ptypesOf(ns)
                 // (its scale or SQL Server type as written, where resolving folded a cast away)
                 let rs = ns.outScale(&r, cols)

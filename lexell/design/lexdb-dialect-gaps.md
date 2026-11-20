@@ -652,7 +652,15 @@ one stay refused (428C9, 271, ORA-54013 / 54017), the catalogs are as package C 
   the old format is made by this tree.
 - *Code.* New code is in `lexdb_gen` (`setQueryGen`, `inTerms`, `typed`, `fillCols`, `needDeps`, `keepKeyed`, `keyOnVirtual`,
   `indexable`; it now imports `lexdb_catalog`, and `lexdb_plan` imports it) and one line each in `lexdb_bind`, `lexdb_rows`,
-  `lexdb_access`, `lexdb_plan`; `lexdb_exec` has the glue: 19,608 lines before, 19,673 after (the Defs, `idxVal`, `virtualsOf`, ADD COLUMN, CREATE INDEX checks).
+  `lexdb_access`, `lexdb_plan`; `lexdb_exec` has the glue: 19,608 lines before, 19,676 after (the Defs, `idxVal`, `virtualsOf`, `buildQuery`'s call, ADD COLUMN,
+  CREATE INDEX checks). `Level.gen` and `Names.virt` keep the checks off the path of a table with no virtual column.
+- *Cost.* In process, `-O`, pinned, `perf stat instructions:u`, base (main 4a39ed20) and branch alternated, ten rounds each, setup
+  subtracted: a primary-key point select (20,000 of them) 168,253 instructions (median; 167,069 least) at the base, 168,373 (167,254)
+  on the branch (+0.07%, inside the 0.15% spread of the runs); a single-row INSERT of a table with no generated column (2,000 in a
+  transaction, a primary key and an index) 219.4k median (209.4k least) at the base, 218.8k (209.5k) on the branch (the runs are
+  bimodal, 210k / 219k / 229k, by the process: the two variants fall in the same modes). The first cut was 0.5% slower on the point
+  select and the INSERT 0.4%: `for c in cols` over `[]ColDef` in `encodeRowOf` (an index loop costs less), and `setQueryGen` and
+  `needDeps` called for every column of every table: now an index loop there and the calls guarded by `Level.gen`.
 
 **Left.** ALTER COLUMN TYPE of a virtual column still rewrites the table where it could not (PostgreSQL 18 does not); `ORDER BY v` on an
 indexed virtual column is a sort (the index serves `WHERE v = x`, not the order: `servesOrder` sees the expression); statistics are
