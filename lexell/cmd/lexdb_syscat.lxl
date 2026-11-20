@@ -1168,7 +1168,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                     for k in 0..len(ccols) { if k < len(cr) { r.set(&ccols[k].name, replace(mut &cr[k], Val.Null)) } }
                     r.set(&"seed_value", iv(sq.start))
                     r.set(&"increment_value", iv(sq.inc))
-                    r.set(&"last_value", Val.Null)
+                    r.set(&"last_value", if cq.used.has(&c.seq) { iv(cq.used.getOr(&c.seq, 0)) } else { Val.Null })
                     append(mut &rows, r.row())
                 }
             }
@@ -1178,7 +1178,8 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 if lexdb_base.isTempSchema(&v.schema) { continue }
                 var r = sysTemplate(&"sql_modules")
                 r.set(&"object_id", iv(v.oid))
-                r.set(&"definition", tv(&("CREATE VIEW " + sysSchemaName(&v.schema) + "." + tabShown(&v) + " AS " + lexdb_sql.viewShown(&v.t.view))))
+                let made = viewDef(&v)
+                r.set(&"definition", tv(&(if len(made) > 0 { made } else { "CREATE VIEW " + sysSchemaName(&v.schema) + "." + tabShown(&v) + " AS " + lexdb_sql.viewShown(&v.t.view) })))
                 append(mut &rows, r.row())
             }
         }
@@ -1199,6 +1200,9 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 r.set(&"maximum_value", iv(d.max))
                 r.set(&"is_cycling", bv(d.cycle))
                 r.set(&"cache_size", iv(d.cache))
+                // current_value: the last value given, the start before any; last_used_value: NULL until one is
+                r.set(&"current_value", iv(cq.cur.getOr(&d.key, d.start)))
+                r.set(&"last_used_value", if cq.used.has(&d.key) { iv(cq.used.getOr(&d.key, 0)) } else { Val.Null })
                 append(mut &rows, r.row())
             }
         }
@@ -1213,7 +1217,38 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
 // (table, name, column_id, nullable, identity), I indexes (table, name,
 // index_id, clustered, unique).
 
+// A definition's text as one line of the bound catalog (a tab, a line end, a backslash each as a backslash and a letter), and back.
+pub fn escDef(s: &str): str {
+    return strings.replaceAll(&strings.replaceAll(&strings.replaceAll(&strings.replaceAll(s, "\\", "\\\\"), "\t", "\\t"), "\n", "\\n"), "\r", "\\r")
+}
+
+pub fn unescDef(s: &str): str {
+    var out = ""
+    var i = 0
+    while i < len(s) {
+        if s[i] == '\\' && i + 1 < len(s) {
+            let c = s[i + 1]
+            if c == 't' { out.addByte('\t') } else if c == 'n' { out.addByte('\n') } else if c == 'r' { out.addByte('\r') } else { out.addByte(c) }
+            i += 2
+        } else {
+            out.addByte(s[i])
+            i += 1
+        }
+    }
+    return out
+}
+
+// The definition text of an object as created: a view's, kept by lexdb_sql.DEF_MARK (the one entry
+// every dialect's lookup uses: OBJECT_DEFINITION, sys.sql_modules; a procedure's is added here by its package).
+pub fn viewDef(v: &lexdb_catalog.CatTab): str { return lexdb_sql.viewDefinition(&v.t.view) }
+
 pub fn bind(snap: &CatSnap, b: mut &str) {
+    // D object_id, definition
+    for v in snap.views {
+        if lexdb_base.isTempSchema(&v.schema) { continue }
+        let d = viewDef(&v)
+        if len(d) > 0 { b += &("D\t" + v.oid.toStr() + "\t" + escDef(&d) + "\n") }
+    }
     // Y table types (user_type_id, schema_id, name)
     for t in snap.ttypes { b += &("Y\t" + lexdb_sql.nameOid("T", &t.key).toStr() + "\t" + sysSchemaId(&lexdb_sql.schemaOf(&t.key)).toStr() + "\t" + lexdb_catalog.clean(&t.spell) + "\n") }
     for r in sysObjects(snap) {

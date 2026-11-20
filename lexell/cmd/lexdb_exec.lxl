@@ -7490,7 +7490,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         col.coll = c.coll.clone()
         match c.def {
             Some(x) {
-                let v = try defaultValue(&x, &col, &Option[SeqEnv].None)
+                let v = try defaultValue(&x, &col, &seqEnv(st, txn))
                 col.def = Some(lexdb_sql.cloneExpr(&x))
             }
             None {}
@@ -8893,7 +8893,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 match a.col.def {
                     Some(x) {
-                        let v = try defaultValue(&x, &t.cols[i], &Option[SeqEnv].None)
+                        let v = try defaultValue(&x, &t.cols[i], &seqEnv(st, txn))
                         t.cols[i].def = Some(lexdb_sql.cloneExpr(&x))
                         try defaultSeqs(st, txn, &t.cols[i])
                     }
@@ -20487,6 +20487,11 @@ fn cloneOptE(x: &Option[Expr]): Option[Expr] {
 
 fn catMemoKey(sess: int): str { return "\x00cat\x00" + sess.toStr() }
 
+fn sysUserKey(sess: int): str { return "\x00sysuser\x00" + sess.toStr() }
+
+// PostgreSQL's SYSTEM_USER of the session: how the login was authenticated and as whom ("scram-sha-256:name").
+pub fn (s: &Session) setSystemUser(u: &str) { s.st.memo.put(&sysUserKey(s.id), u) }
+
 // The session's user, from its startup message.
 pub fn (s: &Session) setUser(u: &str) { s.st.memo.put(&lexdb_catalog.userKey(s.id), u) }
 
@@ -20907,6 +20912,13 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         }
     }
     if name == "current_user" { return Ok(Some(Val.Text(catUser(se)))) }
+    // PostgreSQL's SYSTEM_USER: "method:identity" of an authenticated login, NULL of a trusted one
+    if name == "system_user" {
+        match se.st.memo.get(&sysUserKey(se.sess)) {
+            Some(u) { return Ok(Some(Val.Text(u))) }
+            None { return Ok(Some(Val.Null)) }
+        }
+    }
     if name == "session_user" {
         for l in catLines(se, &"U") { return Ok(Some(Val.Text(l[0].clone()))) }
         return Ok(Some(Val.Text(catUser(se))))
@@ -21041,7 +21053,29 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             return true
         })
     }
-    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems}
+    var used: Map[str, int] = newMap()
+    var cur: Map[str, int] = newMap()
+    if rel == "pg_sequences" || rel == "sys.sequences" || rel == "sys.identity_columns" {
+        for d in snap.seqs {
+            let sv = try seqState(st, &d)
+            match sv[0] {
+                Val.Int(n) { cur.put(d.key.clone(), n) }
+                else {}
+            }
+            match sv[2] {
+                Val.Bool(called) {
+                    if called {
+                        match sv[0] {
+                            Val.Int(n) { used.put(d.key.clone(), n) }
+                            else {}
+                        }
+                    }
+                }
+                else {}
+            }
+        }
+    }
+    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
@@ -21308,6 +21342,15 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
             if len(l) == 0 { return Ok(Some(Val.Null)) }
             if name == "#object_name" { return Ok(Some(Val.Text(l[2].clone()))) }
             return Ok(Some(Val.Text(sysSchemaNameOf(se, strings.parseIntOpt(&l[1]).unwrapOr(0)))))
+        }
+        "#object_definition" {
+            // a view's text as created (the bound catalog's D lines: lexdb_syscat.bind); NULL for the rest
+            if n < 1 || lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+            let id = sysInt(&vs[0]).unwrapOr(0)
+            for l in catLines(se, &"D") {
+                if l[0] == id.toStr() && len(l) > 1 { return Ok(Some(Val.Text(lexdb_syscat.unescDef(&l[1])))) }
+            }
+            return Ok(Some(Val.Null))
         }
         "#object_id" {
             // a sys view's, a constraint's or a default's (a relation's is callCat's)

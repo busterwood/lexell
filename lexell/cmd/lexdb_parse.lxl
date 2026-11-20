@@ -1601,6 +1601,19 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         try p.expectKw(")")
         return Ok(Expr.Call(f, [x], false))
     }
+    // T-SQL: NEXT VALUE FOR [schema.]sequence
+    if p.tsql && t.kind == T_IDENT && t.text == "next" && p.isKw("value") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "for" {
+        p.pos += 2
+        let n = try p.qname()
+        append(mut &p.seqs, n.clone())
+        return Ok(Expr.Call("nextval", [Expr.Lit(Val.Text(n))], false))
+    }
+    // SYSTEM_USER (PostgreSQL 16, T-SQL): a keyword, not called (SYSTEM_USER() is a syntax error in both)
+    if t.kind == T_IDENT && t.text == "system_user" && !p.ora && !p.isKw(".") {
+        if p.isKw("(") { return Err(near(&p.peek().clone())) }
+        append(mut &p.seqs, CAT_MARK)
+        return Ok(Expr.Call(if p.tsql { "#suser_sname" } else { "system_user" }, [], false))
+    }
     if t.kind == T_IDENT && (t.text == "current_user" || t.text == "session_user" || t.text == "user" || t.text == "current_role" ||
                              t.text == "current_schema" || t.text == "current_catalog") && !p.isKw("(") && !p.isKw(".") {
         append(mut &p.seqs, CAT_MARK)
@@ -1784,6 +1797,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         if p.isKw("(") && t.kind == T_IDENT {
             p.pos += 1
             var args: []Expr = []
+            var argNames: []str = []        // name => value arguments' names ("" a positional one)
             var star = false
             var fname = t.text.clone()
             if p.ora && fname == "listagg" { fname = "string_agg" }
@@ -1800,8 +1814,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             } else if !p.isKw(")") {
                 // agg(DISTINCT x): the name carries it, "count distinct"
                 if p.acceptKw("distinct") { fname = fname + " distinct" } else { let al = p.acceptKw("all") }
+                append(mut &argNames, p.namedArg())
                 append(mut &args, try p.expr())
-                while p.acceptKw(",") { append(mut &args, try p.expr()) }
+                while p.acceptKw(",") {
+                    append(mut &argNames, p.namedArg())
+                    append(mut &args, try p.expr())
+                }
                 if p.acceptKw("order") {
                     // agg(x ORDER BY k [ASC | DESC] [NULLS FIRST | LAST], ...): the
                     // keys follow the arguments, the name carries their order:
@@ -1827,6 +1845,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 }
             }
             try p.expectKw(")")
+            if len(argNames) > 0 || len(paramsOf(&fname)) > len(args) { args = try namedArgs(&fname, args, &argNames) }
             if p.ora && fname == "string_agg" && len(args) == 1 { append(mut &args, Expr.Lit(Val.Text(""))) }     // LISTAGG(x): no separator
             if (p.tsql || p.ora) && p.isKw("within") {
                 // STRING_AGG(x, sep) WITHIN GROUP (ORDER BY k [ASC | DESC], ...):
@@ -2066,6 +2085,10 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         "replicate" { return Ok(Expr.Call("repeat", a, false)) }
         "space" { if n == 1 { return Ok(Expr.Call("repeat", [Expr.Lit(Val.Text(" ")), replace(mut &a[0], Expr.Lit(Val.Null))], false)) } }
         "stuff" { return Ok(Expr.Call("#stuff", a, false)) }
+        "quotename" {
+            if n < 1 || n > 2 { return Err(lexdb_base.err("TS189", "The quotename function requires 1 to 2 argument(s).")) }
+            return Ok(Expr.Call("#quotename", a, false))
+        }
         // T-SQL's own, not lexdb's: a bit shown as 1 (lexdb_tsqlfn)
         "concat_ws" { return Ok(Expr.Call("#concat_ws", a, false)) }
         "reverse" { return Ok(Expr.Call("#reverse", a, false)) }
@@ -2231,6 +2254,11 @@ fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lex
                 append(mut &p.seqs, CAT_MARK)
                 return Ok(Some(Expr.Call("#suser_sname", replace(a, []), false)))
             }
+        }
+        "object_definition" {
+            if n != 1 { return Err(lexdb_base.err("TS189", "The object_definition function requires 1 argument(s).")) }
+            append(mut &p.seqs, CAT_MARK)
+            return Ok(Some(Expr.Call("#object_definition", replace(a, []), false)))
         }
         else {}
     }
@@ -3369,6 +3397,16 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
 // token to the statement's end), to be parsed again where it is used (9.82).
 fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     var v = lexdb_sql.newStmt(S_CREATE_VIEW)
+    // where its CREATE is (a few tokens back: CREATE [OR ALTER | OR REPLACE] [TEMP] VIEW)
+    var from = -1
+    var k = p.pos
+    while k > 0 && p.pos - k < 8 {
+        k -= 1
+        if p.toks[k].kind == T_IDENT && p.toks[k].text == "create" {
+            from = p.toks[k].at
+            break
+        }
+    }
     v.ifFlag = orReplace
     v.table = try p.rname()
     v.spell = p.spelled.clone()
@@ -3402,7 +3440,11 @@ fn (p: mut &P) createView(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: WITH CHECK OPTION is not supported")) }
     v.index = strings.trim(&p.src[start..end]).toStr()
     // made over TDS: T-SQL, tagged so (parseView)
-    if p.tsql { v.index = TSQL_VIEW + v.index }
+    if p.tsql {
+        v.index = TSQL_VIEW + v.index
+        // the statement's text from its CREATE to the end of the batch, as SQL Server keeps it
+        if from >= 0 { v.index = v.index + lexdb_sql.DEF_MARK + p.src[from..len(p.src)] }
+    }
     else if p.ora { v.index = ORA_VIEW + v.index }
     // the query's subqueries were parsed into the statement's: dropped (the
     // text is parsed again where the view is used)
@@ -6146,6 +6188,64 @@ fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
     return Err(near(&v))
 }
 
+// The name of a name => value argument, consumed ("" a positional argument).
+fn (p: mut &P) namedArg(): str {
+    if (p.peek().kind == T_IDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" && p.peekAt(2).kind == T_OP && p.peekAt(2).text == ">" &&
+       p.peekAt(2).at == p.peekAt(1).at + 1 {
+        let n = p.peek().text.clone()
+        p.pos += 3
+        return n
+    }
+    return ""
+}
+
+// The functions with named parameters (PostgreSQL's name => value notation), their parameters' names in order and
+// the defaults of those a call may leave out ("" none).
+fn paramsOf(fname: &str): []str {
+    match fname {
+        "make_interval" { return ["years", "months", "weeks", "days", "hours", "mins", "secs"] }
+        else { return [] }
+    }
+}
+
+// A call's arguments in the parameters' order, the named ones put where they belong; a parameter left out is 0.
+fn namedArgs(fname: &str, args: []Expr, names: &[]str): Result[[]Expr, lexdb_base.DbErr] {
+    var named = false
+    for n in names { if len(n) > 0 { named = true } }
+    let ps = paramsOf(fname)
+    if len(ps) == 0 {
+        if named { return Err(lexdb_base.err("42883", &("function " + fname + " does not accept named arguments"))) }
+        return Ok(args)
+    }
+    var out: []Expr = []
+    var set: []bool = []
+    for i in 0..len(ps) {
+        append(mut &out, Expr.Lit(Val.Int(0)))
+        append(mut &set, false)
+    }
+    var xs = args
+    var pos = 0
+    var seenNamed = false
+    for i in 0..len(xs) {
+        if i >= len(names) || len(names[i]) == 0 {
+            if seenNamed { return Err(lexdb_base.err("42601", "positional argument cannot follow named argument")) }
+            if pos >= len(ps) { return Err(lexdb_base.err("42883", &("function " + fname + " does not exist"))) }
+            out[pos] = replace(mut &xs[i], Expr.Lit(Val.Null))
+            set[pos] = true
+            pos += 1
+        } else {
+            seenNamed = true
+            var at = -1
+            for k in 0..len(ps) { if ps[k] == names[i] { at = k } }
+            if at < 0 { return Err(lexdb_base.err("42883", &("function " + fname + " does not exist"))) }
+            if set[at] { return Err(lexdb_base.err("42883", &("argument name \"" + names[i] + "\" used more than once"))) }
+            out[at] = replace(mut &xs[i], Expr.Lit(Val.Null))
+            set[at] = true
+        }
+    }
+    return Ok(out)
+}
+
 // Skips the rest of a statement (the options of BEGIN, a SET's value).
 fn (p: mut &P) skipToEnd() {
     while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") { p.pos += 1 }
@@ -6155,9 +6255,10 @@ fn (p: mut &P) skipToEnd() {
 // highest $n in each.
 
 // A view's query, from its text as kept (TSQL_VIEW: T-SQL).
-pub fn parseView(text: &str): Result[[]Stmt, lexdb_base.DbErr] {
-    if strings.startsWith(text, ORA_VIEW) { return oraParse(&text[len(ORA_VIEW)..len(text)]) }
-    if !strings.startsWith(text, TSQL_VIEW) { return parse(text) }
+pub fn parseView(kept: &str): Result[[]Stmt, lexdb_base.DbErr] {
+    let text = lexdb_sql.viewKept(kept)
+    if strings.startsWith(&text, ORA_VIEW) { return oraParse(&text[len(ORA_VIEW)..len(text)]) }
+    if !strings.startsWith(&text, TSQL_VIEW) { return parse(&text) }
     var q = try tsqlParser(&text[len(TSQL_VIEW)..len(text)], Dialect{tsql: true, quotedIdent: true}, &[])
     let st = try q.statement()
     return Ok([st])
