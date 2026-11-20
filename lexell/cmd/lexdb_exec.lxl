@@ -12473,7 +12473,7 @@ fn pipeAgg(sel: mut &Sel) {
             return
         }
     }
-    let agg = lexdb_plan.PPlan.Agg(input, false, Some(lexdb_plan.PAgg{keys: keys, calls: calls, keep: keep}))
+    let agg = lexdb_plan.PPlan.Agg(input, len(sel.gsets) > 0, Some(lexdb_plan.PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
     match lexdb_pipe.compile(physAbove(sel, agg), &sel.q.cols) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { unplan(sel, back) }
@@ -12481,12 +12481,12 @@ fn pipeAgg(sel: mut &Sel) {
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
-// row (the query's only columns), plain GROUP BY (no grouping sets, no
+// row (the query's only columns), GROUP BY (grouping sets too; no
 // collation's keys), no window, no correlated subquery, no MIN/MAX by the
 // scan's order.
 fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 { return false }
+    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters)
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !tableRead(&q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
@@ -12543,7 +12543,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             // HAVING drops it, as the select's empty group)
             var fuse = false
             match sel.having {
-                Some(h) { fuse = len(sel.groupBy) > 0 && immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
+                Some(h) { fuse = len(sel.groupBy) > 0 && len(sel.gsets) == 0 && immutable(&h) && !hasSubCall(&h) && len(q.subs) == 0 }
                 None {}
             }
             let sqe = seqEnv(st, txn)
@@ -12551,6 +12551,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             let noSubs: []SubRes = []
             var firsts: [][]Val = []
             var accss: [][]Acc = []
+            var sets: []int = []
             var cnt: []lexdb_pipe.Counts = []
             var vals: []Val = []
             var srcs: []lexdb_pipe.Src = []
@@ -12563,7 +12564,7 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             }
             var cx = pipeCtx(st, txn, params, mut &m.subs)
             let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, mut &rs.bud, mut &cnt,
-                                        fn(first: &[]Val, ps: mut &[]Acc): Result[Unit, DbErr] {
+                                        fn(first: &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
                 if fuse {
                     while len(vals) > 0 { let gone = pop(mut &vals) }
                     for i in 0..len(ps) { append(mut &vals, try lexdb_agg.finish(&sel.specs[i], &ps[i])) }
@@ -12575,12 +12576,14 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 }
                 append(mut &firsts, collections.copyOf(first))
                 append(mut &accss, replace(mut &ps, []))
+                if set >= 0 { append(mut &sets, set) }
                 return Ok(Unit{})
             })
             subsBack(mut &m.subs, replace(mut &cx.subs, []))
             let n = try got
             gs.firsts = firsts
             gs.accs = accss
+            gs.sets = sets
             if pg.joins { levelCounts(rs, &cnt) } else { scanCounts(rs, &cnt) }
             return Ok(n)
         }

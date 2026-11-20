@@ -90,7 +90,7 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 | E43 | `agg(…) FILTER (WHERE c)` | B + O:HashAgg | name `" filter"`; `PCall.filter`, `BSpec.filter` | both | — | exec_agg, exec_batch, exec_like |
 | E44 | `agg(x ORDER BY …)`; `STRING_AGG/LISTAGG … WITHIN GROUP (ORDER BY …)` | B + O:HashAgg (sorted per group) or SortAgg | name `" order:"`; `lexdb_agg` `orderedParts`; `PCall.more`/`dirs` (separator and keys per value) | both (`BA_GEN`) | order within group | exec_aggorder, exec_aggpipe, tds_tsql, tns_oracle |
 | E45 | `count(v.*)` (MATCH_RECOGNIZE) | B | `primary` (parse) | row | — | exec_mr |
-| E46 | `GROUPING(a, …)` | B | `setSubst`, `hasGrouping` | row (with grouping sets: `aggShape`, `opsOf` refuse them) | — | forms_queries |
+| E46 | `GROUPING(a, …)` | B | `setSubst`, `hasGrouping` | both (a constant per grouping set: the groups' views, `Sel.gx`, hold it; the sets run in the pipeline, C4) | — | forms_queries |
 | E47 | window calls `f(…) OVER (PARTITION BY … ORDER BY …)`: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag/lead`, `first/last/nth_value`, aggregates | B (`winPlan`, `mergeWin`) + O:Window | `winValues`, `winPartition`, `winCmp`; input rows by `winBatch` | row (window values); its input rows batch for one table (`winBatch`) or over joins by a levels program (`Query.jp`) | order within partition | exec_window, exec_batchsort |
 | E48 | frames `ROWS/RANGE/GROUPS BETWEEN … PRECEDING/FOLLOWING`, `EXCLUDE CURRENT ROW/GROUP/TIES` | O:Window | `frameBounds`, `frameOff`, `rangeTarget`, `excluded` | row | — | exec_window |
 | E49 | named windows `WINDOW w AS (…)`, `OVER w`, `OVER (w …)` | B | `mergeWin`, `winSpecText` | row | — | exec_window |
@@ -127,9 +127,9 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 | # | Construct | Owner | Today | Path | Row-only feature | Tests |
 |---|---|---|---|---|---|---|
 | C1 | `WHERE` | B + R (conjuncts to levels, bounds, OR hull) + O:Filter, Scan bounds | `conjuncts`, `bounds`, `Level.cond`, `pathScans`; row engine `bLevelPlan`/`bCondNode`; pipeline `Filter` (`planConds`) | both (row engine: a conjunct that does not bind runs per row, `bCondNode`; pipeline: every one must bind, `planConds`) | — | exec_batch, exec_join, exec_sub |
-| C2 | `GROUP BY` exprs, ordinals, output names | B (`resolveGroup`) + R (columns of a grouped PK dropped from the key) + O:HashAgg | `addToGroup`; pipe `runAgg`/`runAggJ` (`AggSt`) | both (guard: `aggShape`: no set op, SRF, window, grouping sets, lock, correlation, MIN/MAX by the scan, virtual first table, collation's key; `pipeAgg`/`aggOps`: every call, E40–E44 (a non-exact collation's argument: row); joins as F3) | — | exec_agg, exec_groupkeys, exec_hashagg, exec_narrow, exec_pipe |
+| C2 | `GROUP BY` exprs, ordinals, output names | B (`resolveGroup`) + R (columns of a grouped PK dropped from the key) + O:HashAgg | `addToGroup`; pipe `runAgg`/`runAggJ` (`AggSt`) | both (guard: `aggShape`: no set op, SRF, window, lock, correlation, MIN/MAX by the scan, virtual first table, collation's key; `pipeAgg`/`aggOps`: every call, E40–E44 (a non-exact collation's argument: row); joins as F3) | — | exec_agg, exec_groupkeys, exec_hashagg, exec_narrow, exec_pipe |
 | C3 | `MIN/MAX` read from an index's order | R + O:Scan + O:Limit | `minMax`, `Sel.first` | row (`aggShape` refuses `sel.first`) | order | exec_index_diff |
-| C4 | `GROUPING SETS`, `ROLLUP`, `CUBE`, `()`, `GROUP BY DISTINCT` | B (parse expands sets) + O:HashAgg per set | `groupBy`, `groupItem` (parse); `setSubst`, `Sel.gsets/gx` | row (`aggShape`, `opsOf` refuse sets) | — | forms_queries |
+| C4 | `GROUPING SETS`, `ROLLUP`, `CUBE`, `()`, `GROUP BY DISTINCT` | B (parse expands sets) + O:HashAgg per set | `groupBy`, `groupItem` (parse); `setSubst`, `Sel.gsets/gx`; pipe `AggSets`, `aggSets` | both (one `AggSt` per set in `lexdb_pipe.AggSets`, every batch fed to each, the groups merged in the row engine's order by the row that made them, a row's in the sets' order; a key the batches do not evaluate: `groupRowSets`, row by row; a non-exact collation's key: row) | — | forms_queries, exec_aggsets |
 | C5 | `HAVING` | B + O:Filter | `execSelIn`; `pipeGroups` (drops groups first) | both (with C2); evaluated per group | — | exec_agg, exec_groupkeys |
 | C6 | `SELECT DISTINCT` | O:Distinct | `seen` map in `execSelIn`; pipe `SortSt` (`DistSet`) | both (guard: `sortShape`) | — | exec_batchsort, exec_agg |
 | C7 | `DISTINCT ON (…)` | B (ORDER BY reordered) + O:Sort + Distinct (first per key) | `Sel.donKey`, `execSelIn` | row (`sortShape` refuses `donKey`) | order | forms_queries |
@@ -295,7 +295,7 @@ Row-only today only because no batch code exists (no row semantics; plain
 operators in the new design): FULL JOIN (F7), CROSS JOIN without a key (F4),
 derived tables, CTEs, VALUES, function scans and catalog relations as a first
 level (F10–F16, F19), recursive CTEs (F13), SRFs in the select list (F17),
-set operations (D1–D4), grouping sets and GROUPING (C4, E46), aggregates
+set operations (D1–D4), grouping sets and GROUPING (C4, E46: done, `AggSets`), aggregates
 other than count/sum/avg/min/max and DISTINCT/ORDER BY aggregates
 (E41, E42, E44), window values (E47–E49), IN-list, `= ANY` and IN-subquery
 lookups and PK point reads (E18, E20, E35, F1), uncorrelated subqueries

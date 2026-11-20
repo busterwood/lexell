@@ -1,0 +1,355 @@
+// lexdb_exec and lexdb_pipe: GROUPING SETS, ROLLUP, CUBE, GROUP BY DISTINCT and
+// () run by the pipeline (design/lexdb-batch-gaps.md item 12) against the row
+// engine (SET lexdb_batch = off, the reference): one pass over the batches
+// feeding one hash table per grouping set, the groups given in the order the
+// row engine makes them (a row's groups, set by set), GROUPING() a constant
+// per set. The output is compared as text, rows in their order: with and
+// without ORDER BY.
+// The table gs has 3,000 rows (three batches): NULL key values (the grouping
+// NULL of a rolled-up key is another thing), repeated values across batches,
+// a text column of numbers with one that is not (a cast failing in the third
+// batch). Shapes: ROLLUP of two and three columns, CUBE of two and three, GROUPING
+// SETS with repeated and empty sets, GROUP BY DISTINCT, (), plain columns
+// beside a ROLLUP, sets nested in sets, expression keys, more groups than a
+// batch holds; each with calls of every kind the pipeline runs (counts,
+// DISTINCT, ORDER BY in the call, FILTER, string_agg, array_agg, booleans,
+// variances, numerics); over no rows, a few, over a join, with HAVING,
+// ORDER BY, LIMIT and OFFSET; errors; parameters; a transaction's writes.
+// timeout: 600
+// expect: sets and calls: 336 queries, 336 the same both ways
+// expect: ran in the pipeline: 315 of 336, 21 grouped row by row
+// expect: forms: 75 queries, 75 the same both ways
+// expect: forms ran in the pipeline: 75 of 75
+// expect: edges: 18 queries, 18 the same both ways
+// expect: edges ran in the pipeline: 18 of 18
+// expect: errors: 11 queries, 11 the same, 11 errors
+// expect: errors ran in the pipeline: 11 of 11
+// expect: collation: 3 queries, 3 the same, 0 in the pipeline
+// expect: parameters: 12 of 12 the same
+// expect: in a transaction: same, in the pipeline: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+// sql with batches off (the row engine), then on: whether the rows (or the
+// error) are the same, whether the pipeline ran a grouped aggregate over
+// batches for it (piped), and whether it ran it at all (ran: the groups
+// made row by row for a key the batches do not evaluate count too).
+type Got = record { same: bool; piped: bool; ran: bool; rows: str }
+
+fn both(s: mut &lexdb_exec.Session, sql: &str): Got {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let g0 = lexdb_exec.decCounts()[2]
+    let r0 = lexdb_pipe.runCounts()[0]
+    let on = q(s, sql)
+    let piped = lexdb_exec.decCounts()[2] > g0
+    let ran = lexdb_pipe.runCounts()[0] > r0
+    if on != off {
+        println("DIFFERENT: " + sql)
+        println("  rows: " + off)
+        println("  pipeline: " + on)
+    }
+    return Got{same: on == off, piped: piped, ran: ran, rows: on}
+}
+
+fn withParams(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    let nt: []int = []
+    let r = s.runRows(&stmts[0], params, &nt, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool { return true })
+    match r {
+        Ok(res) {
+            var lines: []str = []
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// "1, 2, ... n"
+fn places(n: int): str {
+    var xs: []str = []
+    for i in 1..n + 1 { append(mut &xs, i.toStr()) }
+    return strings.join(&xs, ", ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table gs (id int primary key, a int, b text, c int, d int, f float8, n numeric(10,2), s text)")
+        one(mut &s, &"create table gu (uid int primary key, tid int, w text)")
+        for c in 0..3 {
+            var vals: []str = []
+            for j in 0..1000 {
+                let i = c * 1000 + j
+                let a = if i % 5 == 0 { "null" } else { (i % 4).toStr() }
+                let b = if i % 9 == 0 { "null" } else { "'b" + (i % 6).toStr() + "'" }
+                let cv = if i % 17 == 0 { "null" } else { (i % 23 - 5).toStr() }
+                let f = if i % 13 == 0 { "null" } else { (i % 31).toStr() + ".5" }
+                let sv = if i == 2500 { "'zz'" } else if i % 23 == 0 { "null" } else { "'" + (i % 40).toStr() + "'" }
+                append(mut &vals, "(" + i.toStr() + ", " + a + ", " + b + ", " + cv + ", " + (i % 10).toStr() + ", " + f + ", " + (i % 97).toStr() + ".25, " + sv + ")")
+            }
+            one(mut &s, &("insert into gs values " + strings.join(&vals, ", ")))
+        }
+        var uv: []str = []
+        for i in 0..1500 { append(mut &uv, "(" + i.toStr() + ", " + (i * 2 % 3000).toStr() + ", 'w" + (i % 9).toStr() + "')") }
+        one(mut &s, &("insert into gu values " + strings.join(&uv, ", ")))
+
+        // each grouping clause, the keys it selects (nk of them), the keys' GROUPING()
+        let gcl = ["rollup(a, b)", "rollup(a, b, d)", "cube(a, b)", "cube(a, b, d)", "grouping sets ((a), (b), ())",
+                   "grouping sets ((a, b), (a), (a), ())", "grouping sets ((), ())", "distinct rollup(a, b), rollup(a)",
+                   "rollup(a, b), rollup(a)", "()", "a, rollup(b)", "rollup(a), cube(b)", "rollup((a, b), d)",
+                   "grouping sets (rollup(a, b), cube(d))", "rollup(id % 1300, d)", "rollup(a + 1, upper(b))"]
+        let keys = ["a, b", "a, b, d", "a, b", "a, b, d", "a, b", "a, b", "0", "a, b", "a, b", "0", "a, b", "a, b", "a, b, d", "a, b, d",
+                    "id % 1300, d", "a + 1, upper(b)"]
+        let nks = [2, 3, 2, 3, 2, 2, 1, 2, 2, 1, 2, 2, 3, 3, 2, 2]
+        let grs = ["grouping(a, b)", "grouping(a, b, d)", "grouping(b, a)", "grouping(d, a, b)", "grouping(a, b)", "grouping(a) * 10 + grouping(b)", "0",
+                   "grouping(a, b)", "grouping(a) + grouping(b)", "0", "grouping(b)", "grouping(a, b)", "grouping(a, b, d)", "grouping(a, b, d)",
+                   "grouping(id % 1300, d)", "grouping(a + 1, upper(b))"]
+        let aggs = ["count(*), sum(c), avg(c), min(c), max(c)", "count(distinct d), count(distinct b), sum(distinct c)",
+                    "string_agg(distinct b, ',' order by b), array_agg(d order by id desc) filter (where id < 30)",
+                    "bool_and(c > 3), bool_or(d > 8), every(c is not null), count(c) filter (where d > 4)",
+                    "stddev(f), variance(f), var_pop(c), stddev_pop(n)", "sum(n), avg(n), min(n), max(f), sum(f)",
+                    "string_agg(b, '-' order by c desc, id), count(*)"]
+        var same = 0
+        var piped = 0
+        var total = 0
+        var ranRows = 0
+        for gi in 0..len(gcl) {
+            for ai in 0..len(aggs) {
+                let head = "select " + keys[gi] + ", " + grs[gi] + ", " + aggs[ai]
+                let grp = " group by " + gcl[gi]
+                let ord = " order by " + places(nks[gi] + 1)
+                var sqls: []str = [head + " from gs" + grp + ord]
+                if ai % 2 == 0 { append(mut &sqls, head + " from gs" + grp) }
+                if ai % 3 == 0 { append(mut &sqls, head + " from gs join gu on gs.id = gu.tid" + grp + ord) }
+                if ai % 2 == 1 { append(mut &sqls, head + " from gs" + grp + " having " + grs[gi] + " >= 0 and count(*) > 5" + ord) }
+                if ai % 3 == 1 { append(mut &sqls, head + " from gs where id between 1000 and 1030" + grp) }
+                if ai == 0 { append(mut &sqls, head + " from gs where id < 0" + grp + ord) }
+                if ai == 2 { append(mut &sqls, head + " from gs" + grp + ord + " limit 7 offset 2") }
+                for sql in sqls {
+                    let r = both(mut &s, &sql)
+                    total += 1
+                    if r.same { same += 1 }
+                    // (a key the batches do not evaluate, upper(b): grouped row by row, the pipeline's scalar step)
+                    if r.piped { piped += 1 } else if r.ran && gi == 15 { ranRows += 1 } else { println("not in the pipeline: " + sql) }
+                }
+            }
+        }
+        println("sets and calls: " + total.toStr() + " queries, " + same.toStr() + " the same both ways")
+        println("ran in the pipeline: " + piped.toStr() + " of " + total.toStr() + ", " + ranRows.toStr() + " grouped row by row")
+
+        // the forms of forms_queries' grouping sets cases over this table (the ones that run), more groups
+        // than a batch, NULL key values beside the grouping NULL, GROUPING() in HAVING and ORDER BY
+        let forms = ["select a, b, sum(c), grouping(a), grouping(a, b), grouping(b, a) from gs group by rollup(a, b) order by 1, 2, 4",
+                     "select a, b, count(*) from gs group by cube(a, b) order by 1, 2, 3",
+                     "select a, b, count(*) from gs group by cube(a, b)",
+                     "select a, b, count(*) from gs group by grouping sets ((a), (b), ()) order by 1, 2, 3",
+                     "select a, b, count(*) from gs group by grouping sets ((b), (a), ())",
+                     "select a, count(*) from gs group by rollup(a) having count(*) > 1 order by 1",
+                     "select count(*) from gs where false group by rollup(a)",
+                     "select count(*) from gs where false group by ()",
+                     "select count(*), sum(c) from gs group by ()",
+                     "select count(*) from gs where false group by a, rollup(b)",
+                     "select a, b, count(*) from gs group by a, rollup(b) order by 1, 2",
+                     "select a, b, c, count(*), grouping(a, b, c) from gs group by grouping sets (rollup(a, b), cube(c)) order by 5, 1, 2, 3",
+                     "select a, b, count(*) from gs group by rollup((a, b)) order by 1, 2",
+                     "select a, b, count(*) from gs group by distinct rollup(a, b), rollup(a) order by 1, 2, 3",
+                     "select a, b, count(*) from gs group by rollup(a, b), rollup(a) order by 1, 2, 3",
+                     "select a + 1, sum(c), grouping(a + 1) from gs group by rollup(a + 1) order by 3, 1",
+                     "select a, b, sum(c) from gs group by grouping sets (a, b) order by grouping(a, b), 1, 2",
+                     "select a, max(b) from gs group by rollup(a) order by a nulls first, 2",
+                     "select b, sum(c) filter (where a = 1), string_agg(b, ',' order by b) from gs group by rollup(b) order by 1",
+                     "select coalesce(b, 'all'), sum(c) from gs group by rollup(b) order by grouping(b), 1",
+                     "select case when grouping(a) = 1 then 'total' else a::text end, sum(c) from gs group by rollup(a) order by grouping(a), a",
+                     "select distinct grouping(a), count(*) > 0 from gs group by cube(a, b) order by 1",
+                     "select a, b, count(*) from gs group by grouping sets ((a, b), grouping sets ((a), ())) order by 1, 2, 3",
+                     "select a, sum(c) from gs group by rollup(a) order by sum(c) desc, a fetch first 2 rows only",
+                     "select distinct on (grouping(a)) grouping(a), a, sum(c) from gs group by rollup(a) order by grouping(a), sum(c) desc",
+                     "select a, (select count(*) from gs g2 where g2.a = gs.a) from gs group by rollup(a) order by 1",
+                     "select b, count(*) from gs group by 1, rollup(a) order by 1, 2",
+                     "select pg_typeof(grouping(a)), grouping(a) from gs group by a order by a limit 1",
+                     "select a, b, count(*) from gs group by rollup(a, b) having grouping(a) = 1",
+                     "select a, b, count(*) from gs group by rollup(a, b) having grouping(b) = 1 and a is not null",
+                     "select a, b, count(*) from gs group by rollup(a, b) having a is null and grouping(a) = 0",
+                     "select a, b, count(*) from gs group by cube(a, b) order by grouping(a, b) desc, a, b limit 5",
+                     "select a, b, count(*) from gs group by cube(a, b) order by grouping(a, b) desc, a, b limit 5 offset 5",
+                     "select a, grouping(a), count(*) from gs group by rollup(a)",
+                     "select a, grouping(a), count(*) from gs where a is null group by rollup(a)",
+                     "select a, count(*) from gs where a is null group by grouping sets ((a), ())",
+                     "select a, b, count(*) from gs where a is null and b is null group by cube(a, b)",
+                     "select a, b, grouping(a, b), count(*) from gs where a is null group by cube(a, b) order by 3, 1, 2",
+                     "select d, count(*), sum(c) from gs group by rollup(d) order by d nulls first",
+                     "select d, count(*), sum(c) from gs group by rollup(d)",
+                     "select id % 1300, count(*), sum(c) from gs group by rollup(id % 1300) order by 1",
+                     "select id % 1300, count(*), sum(c) from gs group by rollup(id % 1300)",
+                     "select id % 1300, d, count(*) from gs group by cube(id % 1300, d) order by 1, 2, 3",
+                     "select id % 1300, d, count(*) from gs group by cube(id % 1300, d)",
+                     "select id, count(*), sum(d) from gs group by rollup(id) order by id nulls last limit 10",
+                     "select id, count(*), sum(d) from gs group by rollup(id)",
+                     "select id, d, count(*) from gs group by grouping sets ((id), (d), (id, d), ())",
+                     "select id % 3000, count(*) from gs group by grouping sets ((id % 3000), ()) order by 1",
+                     "select count(*) from gs group by rollup(a, b) order by 1",
+                     "select count(*), sum(c) from gs group by grouping sets (())",
+                     "select count(*), grouping(a) from gs group by grouping sets ((), (a)) order by 2, 1",
+                     "select count(*) from gs group by grouping sets ((a), (a), (a)) order by 1",
+                     "select a, count(*) from gs group by grouping sets ((a), (a), (a))",
+                     "select a, count(distinct b), count(distinct c) from gs group by rollup(a) order by a",
+                     "select a, b, count(distinct c), sum(distinct d) from gs group by cube(a, b) order by 1, 2",
+                     "select a, b, string_agg(distinct s, ',' order by s) from gs where id < 200 group by rollup(a, b) order by 1, 2",
+                     "select a, b, array_agg(id order by id) from gs where id < 50 group by rollup(a, b) order by 1, 2",
+                     "select a, b, count(*) filter (where c > 5), sum(c) filter (where d = 3) from gs group by cube(a, b) order by 1, 2",
+                     "select a, bool_and(c > 0), bool_or(c > 15), every(d < 11) from gs group by rollup(a) order by 1",
+                     "select a, stddev(f), var_pop(f), stddev(c), variance(n) from gs group by rollup(a) order by 1",
+                     "select a, b, sum(c), avg(c) from gs group by rollup(a, b) order by 1, 2",
+                     "select a, b, sum(n), avg(n), min(n), max(n) from gs group by rollup(a, b) order by 1, 2",
+                     "select a, sum(f), avg(f), min(f), max(f) from gs group by cube(a) order by 1",
+                     "select gs.a, gu.w, count(*), sum(gs.c) from gs join gu on gs.id = gu.tid group by rollup(gs.a, gu.w) order by 1, 2",
+                     "select gs.a, gu.w, count(*), sum(gs.c) from gs join gu on gs.id = gu.tid group by cube(gs.a, gu.w)",
+                     "select gu.w, count(distinct gs.b), string_agg(gs.b, ',' order by gs.id) from gs join gu on gs.id = gu.tid group by grouping sets ((gu.w), ()) order by 1",
+                     "select gs.a, gu.w, count(gu.uid) from gs left join gu on gs.id = gu.tid and gu.uid < 30 group by rollup(gs.a, gu.w) order by 1, 2",
+                     "select gs.id % 1300, gu.w, count(*) from gs join gu on gs.id = gu.tid group by rollup(gs.id % 1300, gu.w) order by 1, 2",
+                     "select a, b, count(*) from gs where id % 2 = 0 and c > 0 group by rollup(a, b) order by 1, 2",
+                     "select a, b, count(*) from gs where id in (1, 2, 3, 2000, 2999) group by cube(a, b)",
+                     "select a, b, count(*) from gs where id in (1, 2, 3, 2000, 2999) group by cube(a, b) order by 1, 2",
+                     "select a, count(*) from gs group by rollup(a) having count(*) > (select count(*) from gu) order by 1",
+                     "select a, b, sum(c) from gs group by rollup(a, b) having sum(c) > (select avg(uid) from gu) order by 1, 2",
+                     "select a, count(*) c1 from gs group by rollup(a) order by c1 desc, a nulls last",
+                     "select a, count(*) from gs group by rollup(a) order by count(*), a"]
+        var sameF = 0
+        var pipedF = 0
+        for sql in forms {
+            let r = both(mut &s, &sql)
+            if r.same { sameF += 1 }
+            if r.piped { pipedF += 1 } else { println("not in the pipeline: " + sql) }
+        }
+        println("forms: " + len(forms).toStr() + " queries, " + sameF.toStr() + " the same both ways")
+        println("forms ran in the pipeline: " + pipedF.toStr() + " of " + len(forms).toStr())
+
+        // rows at a batch's edges (1,023, 1,024 and 1,025), with groups of every set across them
+        var sameE = 0
+        var pipedE = 0
+        var totalE = 0
+        for lim in [1023, 1024, 1025, 2047, 2048, 2049] {
+            let r1 = both(mut &s, &("select a, b, count(*), sum(c), grouping(a, b) from gs where id < " + lim.toStr() + " group by rollup(a, b)"))
+            let r2 = both(mut &s, &("select d, id % 1030, count(distinct a), grouping(d, id % 1030) from gs where id < " + lim.toStr() + " group by cube(d, id % 1030)"))
+            let r3 = both(mut &s, &("select b, count(*), string_agg(b, ',' order by id) from gs where id < " + lim.toStr() + " group by grouping sets ((b), (), (b))"))
+            for r in [r1, r2, r3] {
+                totalE += 1
+                if r.same { sameE += 1 }
+                if r.piped { pipedE += 1 }
+            }
+        }
+        println("edges: " + totalE.toStr() + " queries, " + sameE.toStr() + " the same both ways")
+        println("edges ran in the pipeline: " + pipedE.toStr() + " of " + totalE.toStr())
+
+        // errors: the same error both ways (a cast failing in the third batch, a division by
+        // zero in a key, an argument, a FILTER or a HAVING)
+        let errs = ["select a, sum(cast(s as int)) from gs group by rollup(a)", "select a, b, count(distinct cast(s as int)) from gs group by cube(a, b)",
+                    "select a, string_agg(s, ',' order by cast(s as int)) from gs group by grouping sets ((a), ())",
+                    "select a, count(*) from gs group by rollup(a, 1 / (id - 2000))", "select a, count(*) from gs group by cube(a, cast(s as int))",
+                    "select a, count(*) filter (where 1 / (id - 2900) > 0) from gs group by rollup(a)", "select a, sum(1 / (id - 1500)) from gs group by rollup(a, b)",
+                    "select a, count(*) from gs group by rollup(a) having 1 / (count(*) - count(*)) > 0",
+                    "select a, bool_and(c) from gs group by rollup(a)", "select a, stddev(b) from gs group by cube(a)",
+                    "select gs.a, sum(cast(gs.s as int)) from gs join gu on gs.id = gu.tid group by rollup(gs.a)"]
+        var sameR = 0
+        var pipedR = 0
+        var nerr = 0
+        for sql in errs {
+            let r = both(mut &s, &sql)
+            if r.same { sameR += 1 }
+            if strings.contains(&r.rows, "ERROR") { nerr += 1 } else { println("no error: " + sql + " => " + r.rows) }
+            if r.ran { pipedR += 1 } else { println("not run: " + sql + " => " + r.rows) }
+        }
+        println("errors: " + len(errs).toStr() + " queries, " + sameR.toStr() + " the same, " + nerr.toStr() + " errors")
+        println("errors ran in the pipeline: " + pipedR.toStr() + " of " + len(errs).toStr())
+
+        // a key under a collation that is not exact stays the row engine's (as a plain GROUP BY's)
+        one(mut &s, &"create table cw (id int primary key, t text collate \"SQL_Latin1_General_CP1_CI_AS\", v int)")
+        one(mut &s, &"insert into cw values (1, 'a', 1), (2, 'A', 2), (3, 'b', 3), (4, null, 4), (5, 'B', 5)")
+        var sameC = 0
+        var pipedC = 0
+        let colls = ["select t, count(*), sum(v), grouping(t) from cw group by rollup(t) order by 1, 4",
+                     "select t, count(*), grouping(t) from cw group by grouping sets ((t), ())",
+                     "select v % 2, t, count(*) from cw group by cube(v % 2, t) order by 1, 2, 3"]
+        for sql in colls {
+            let r = both(mut &s, &sql)
+            if r.same { sameC += 1 }
+            if r.piped { pipedC += 1 }
+        }
+        println("collation: " + len(colls).toStr() + " queries, " + sameC.toStr() + " the same, " + pipedC.toStr() + " in the pipeline")
+
+        // parameters: the plan kept, run again with other values (a key's expression, a FILTER, a
+        // HAVING's bound, a call's separator)
+        let psqls = ["select a % $1, b, count(*), grouping(a % $1, b) from gs where id < 400 group by rollup(a % $1, b) order by 1, 2",
+                     "select a, b, count(*) filter (where c > $1), string_agg(b, $2 order by id) from gs where id < 500 group by cube(a, b) order by 1, 2",
+                     "select a, d, count(*), sum(c) from gs where id < 800 group by rollup(a, d) having count(*) > $1 order by 1, 2"]
+        var sameP = 0
+        var totalP = 0
+        for pi in 0..len(psqls) {
+            var pc = lexdb_exec.newPlanCache()
+            for v in 0..4 {
+                let p2 = if pi == 1 { lexdb_sql.Val.Text(["-", "+", ";;", ""][v].clone()) } else { lexdb_sql.Val.Int(v) }
+                let params = [lexdb_sql.Val.Int(v * 2 + 2), p2]
+                let a = q(mut &s, &"set lexdb_batch = off")
+                var pc2 = lexdb_exec.oneShot()
+                let off = withParams(mut &s, &psqls[pi], &params, mut &pc2)
+                let b = q(mut &s, &"set lexdb_batch = on")
+                let on = withParams(mut &s, &psqls[pi], &params, mut &pc)
+                totalP += 1
+                if on == off { sameP += 1 } else { println("PARAMS DIFFERENT: " + psqls[pi] + " " + off + " / " + on) }
+            }
+        }
+        println("parameters: " + sameP.toStr() + " of " + totalP.toStr() + " the same")
+
+        // a transaction's own writes
+        let bg = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into gs values (9001, 3, 'b1', 7, 2, 1.5, 2.25, '5'), (9002, null, null, null, 3, null, 1.00, null)")
+        let w2 = q(mut &s, &"delete from gs where id % 11 = 5")
+        let tx = both(mut &s, &"select a, b, count(*), sum(c), count(distinct d), grouping(a, b) from gs group by rollup(a, b)")
+        let rb = q(mut &s, &"rollback")
+        println("in a transaction: " + (if tx.same { "same" } else { "DIFFERENT" }) + ", in the pipeline: " + tx.piped.toStr())
+        return 0
+    }).unwrap()
+}
