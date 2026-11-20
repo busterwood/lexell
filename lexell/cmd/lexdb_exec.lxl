@@ -40,6 +40,7 @@ import "./lexdb_stats"
 import "./lexdb_bind"
 import "./lexdb_ops"
 import "./lexdb_pipe"
+import "./lexdb_agg"
 import "./lexdb_sort"
 import "./lexdb_lib"
 import "./lexdb_dialect"
@@ -60,6 +61,8 @@ type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
 type DbErr = lexdb_base.DbErr
 type Ctx = lexdb_pipe.Ctx
+type AggSpec = lexdb_agg.AggSpec
+type Acc = lexdb_agg.Acc
 
 type Index = lexdb_catalog.Index
 type Table = lexdb_catalog.Table
@@ -5612,8 +5615,8 @@ fn runHashed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, pa
         // a key with no rows: the aggregate over none (count 0, sum NULL)
         var vals: []Val = []
         for spec in sp.sel.specs {
-            let a = newAccs(1)
-            append(mut &vals, try finish(&spec, &a[0]))
+            let a = lexdb_agg.newAccs(1)
+            append(mut &vals, try lexdb_agg.finish(&spec, &a[0]))
         }
         let noRow: []Val = array(len(sp.sel.q.cols), Val.Null)
         let noSubs: []SubRes = []
@@ -12337,12 +12340,26 @@ fn pipeAgg(sel: mut &Sel) {
     for sp in sel.specs {
         let f = &sp.fname
         // (the calls it accumulates: lexdb_pipe.compile's)
-        if sp.distinct || len(sp.order) > 0 || sp.kind != lexdb_sql.COLL_EXACT { return }
+        if sp.kind != lexdb_sql.COLL_EXACT { return }
         var arg: Option[BX] = None
+        // (the values besides the argument: string_agg's separator, the ORDER BY keys)
+        var more: []BX = []
         if !sp.star {
-            if len(sp.args) != 1 { return }
+            if len(sp.args) < 1 || len(sp.args) > 2 { return }
             arg = planX(&sp.args[0], &sel.q)
             if arg.isNone() { return }
+            for k in 1..len(sp.args) {
+                match planX(&sp.args[k], &sel.q) {
+                    Some(b) { append(mut &more, b) }
+                    None { return }
+                }
+            }
+        }
+        for o in sp.order {
+            match planX(&o, &sel.q) {
+                Some(b) { append(mut &more, b) }
+                None { return }
+            }
         }
         var filt: Option[BX] = None
         match sp.filter {
@@ -12352,7 +12369,7 @@ fn pipeAgg(sel: mut &Sel) {
             }
             None {}
         }
-        append(mut &calls, lexdb_plan.PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt})
+        append(mut &calls, lexdb_plan.PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone()})
     }
     let cs = match planConds(sel) {
         Some(x) { x }
@@ -12456,8 +12473,6 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             var firsts: [][]Val = []
             var accss: [][]Acc = []
             var cnt: []lexdb_pipe.Counts = []
-            // a group HAVING drops is checked in these, not kept
-            var look = newAccs(len(sel.specs))
             var vals: []Val = []
             var srcs: []lexdb_pipe.Src = []
             var tabs: []&Table = []
@@ -12469,29 +12484,18 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             }
             var cx = pipeCtx(st, txn, params, mut &m.subs)
             let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, mut &rs.bud, mut &cnt,
-                                        fn(first: &[]Val, ps: &[]lexdb_pipe.PAcc): Result[Unit, DbErr] {
+                                        fn(first: &[]Val, ps: mut &[]Acc): Result[Unit, DbErr] {
                 if fuse {
                     while len(vals) > 0 { let gone = pop(mut &vals) }
-                    for i in 0..len(ps) {
-                        look[i].n = ps[i].n
-                        look[i].sum = ps[i].sum.clone()
-                        look[i].val = ps[i].val.clone()
-                        append(mut &vals, try finish(&sel.specs[i], &look[i]))
-                    }
+                    for i in 0..len(ps) { append(mut &vals, try lexdb_agg.finish(&sel.specs[i], &ps[i])) }
                     let henv = Env{cols: &q.cols, row: first, aggs: &vals, params: params, subs: &noSubs, cur: &noAggs, seq: &sqe}
                     match sel.having {
                         Some(h) { if lexdb_ops.truth(&(try eval(&h, &henv))) != Some(true) { return Ok(Unit{}) } }
                         None {}
                     }
                 }
-                var accs = newAccs(len(sel.specs))
-                for i in 0..len(ps) {
-                    accs[i].n = ps[i].n
-                    accs[i].sum = ps[i].sum.clone()
-                    accs[i].val = ps[i].val.clone()
-                }
                 append(mut &firsts, collections.copyOf(first))
-                append(mut &accss, accs)
+                append(mut &accss, replace(mut &ps, []))
                 return Ok(Unit{})
             })
             subsBack(mut &m.subs, replace(mut &cx.subs, []))
@@ -12755,36 +12759,6 @@ pub fn oneShot(): PlanCache { return PlanCache{sels: [], looks: [], ver: "", kee
 // ---- aggregates: one accumulator per call and group, so a grouped
 // query holds its groups, not its rows
 
-// An aggregate call of the query: its function, arguments, modifiers.
-type AggSpec = record {
-    fname: str
-    args: []Expr
-    star: bool
-    distinct: bool
-    filter: Option[Expr]
-    order: []Expr           // ORDER BY in the call (string_agg's result depends on it; the others' not)
-    dirs: str               // per key: a, A (NULLs first), d, D (NULLs last), as the parser gives them
-    text: str               // to share one accumulator between equal calls
-    kind: int               // its argument's collation kind (L2): min, max and DISTINCT compare its keys
-}
-
-type Acc = record {
-    n: int
-    val: Val                // min, max, bool_and, bool_or
-    sum: Val                // sum, avg; the variances: the sum ...
-    sumsq: Val              // ... and the sum of squares
-    parts: []str            // string_agg
-    seps: []Val             // ... with ORDER BY: each value's separator
-    ords: [][]Val           // ... and its keys (sorted when it finishes)
-    seen: Map[str, int]     // DISTINCT
-}
-
-fn newAccs(n: int): []Acc {
-    var out: []Acc = []
-    for i in 0..n { append(mut &out, Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seps: [], ords: [], seen: newMap()}) }
-    return out
-}
-
 fn slotRef(i: int): Expr { return Expr.Call("#agg", [Expr.Lit(Val.Int(i))], false) }
 
 // x with each aggregate call replaced by its slot, the calls added to specs.
@@ -12825,7 +12799,7 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
             }
             let text = lexdb_sql.exprText(x)
             for i in 0..len(specs) { if specs[i].text == text { return Ok(slotRef(i)) } }
-            append(specs, AggSpec{fname: base, args: aargs, star: star, distinct: strings.contains(&name, " distinct"),
+            append(specs, lexdb_agg.AggSpec{fname: base, args: aargs, star: star, distinct: strings.contains(&name, " distinct"),
                                   filter: filter, order: order, dirs: dirs, text: text, kind: lexdb_sql.COLL_EXACT})
             return Ok(slotRef(len(specs) - 1))
         }
@@ -12838,14 +12812,6 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
         Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try collectAggs(&a, specs), neg)) }
         Expr.Cast(a, t) { return Ok(Expr.Cast(try collectAggs(&a, specs), t)) }
         else { return Ok(lexdb_sql.cloneExpr(x)) }
-    }
-}
-
-fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {
-    if lexdb_ops.isFloat(v) { return Ok(Val.Float(lexdb_ops.asFloat(v).unwrap())) }      // a float's variance is a double precision
-    match lexdb_ops.asNum(v) {
-        Some(d) { return Ok(Val.Num(d)) }
-        None { return Err(e("42883", &("function " + fname + " needs a number"))) }
     }
 }
 
@@ -12880,7 +12846,7 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
                     if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     gs.index.put(k, g)
                     append(mut &gs.firsts, collections.copyOf(r))
-                    append(mut &gs.accs, newAccs(len(sel.specs)))
+                    append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
                     append(mut &gs.sets, si)
                 }
             }
@@ -12904,12 +12870,12 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
                 if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 gs.index.put(k, g)
                 append(mut &gs.firsts, collections.copyOf(r))
-                append(mut &gs.accs, newAccs(len(sel.specs)))
+                append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
             }
         }
     } else if len(gs.firsts) == 0 {
         append(mut &gs.firsts, collections.copyOf(r))
-        append(mut &gs.accs, newAccs(len(sel.specs)))
+        append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
     }
     for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &gs.accs[g][i], env) }
     return Ok(Unit{})
@@ -12930,7 +12896,9 @@ fn groupCorr(sel: &Sel): bool {
     return false
 }
 
-// Adds one row (env) to an accumulator.
+// Adds one row (env) to an accumulator: the call's FILTER, then its
+// argument's value (a NULL not counted); lexdb_agg takes the value, with
+// the separator and ORDER BY keys read only for a value it accumulates.
 fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     match sp.filter {
         Some(f) { if lexdb_ops.truth(&(try eval(&f, env))) != Some(true) { return Ok(Unit{}) } }
@@ -12941,161 +12909,11 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
         return Ok(Unit{})
     }
     let v = try eval(&sp.args[0], env)
-    if lexdb_ops.isNull(&v) && sp.fname != "array_agg" { return Ok(Unit{}) }      // array_agg keeps NULLs, as elements
-    if sp.distinct {
-        var kb = ""
-        lexdb_access.encIdxPart(mut &kb, &lexdb_sort.collVal(sp.kind, &v))
-        let k = kb
-        if acc.seen.get(&k).isSome() { return Ok(Unit{}) }
-        acc.seen.put(k, 1)
-    }
-    let f = &sp.fname
-    if f == "sum" || f == "avg" {
-        // avg of reals adds in double precision, as PostgreSQL's float4_accum
-        let w = if f == "avg" && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
-        // and squares them, so overflows where PostgreSQL's float8_accum does
-        if f == "avg" && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
-        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &w) }
-    } else if f == "min" {
-        // of equal values the last, as PostgreSQL's numeric_smaller gives
-        // (0.5 and 0.500: 0.500 if it comes after)
-        if sp.kind != lexdb_sql.COLL_EXACT {
-            // under a collation's keys: of equal ones the first (L2, as SQL Server)
-            if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&lexdb_sort.collVal(sp.kind, &v), &lexdb_sort.collVal(sp.kind, &acc.val))) < 0 { acc.val = v }
-        } else if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) <= 0 { acc.val = v }
-    } else if f == "max" {
-        if sp.kind != lexdb_sql.COLL_EXACT {
-            if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&lexdb_sort.collVal(sp.kind, &v), &lexdb_sort.collVal(sp.kind, &acc.val))) > 0 { acc.val = v }
-        } else if lexdb_ops.isNull(&acc.val) || (try lexdb_ops.compare(&v, &acc.val)) >= 0 { acc.val = v }
-    } else if f == "bool_and" || f == "every" || f == "bool_or" {
-        let b = match lexdb_ops.truth(&v) {
-            Some(x) { x }
-            None { return Err(e("42883", &("function " + f + " needs a boolean"))) }
-        }
-        let prev = match acc.val { Val.Bool(x) { x } else { f != "bool_or" } }
-        acc.val = Val.Bool(if f == "bool_or" { prev || b } else { prev && b })
-    } else if f == "array_agg" {
-        // the values, and their ORDER BY keys (parts keeps orderIdx's count)
-        append(mut &acc.seps, v)
-        append(mut &acc.parts, "")
-        if len(sp.order) > 0 {
-            var ks: []Val = []
-            for o in sp.order { append(mut &ks, try eval(&o, env)) }
-            append(mut &acc.ords, ks)
-        }
-    } else if f == "string_agg" {
-        let sep = try eval(&sp.args[1], env)
-        if len(sp.order) > 0 {
-            var ks: []Val = []
-            for o in sp.order { append(mut &ks, try eval(&o, env)) }
-            append(mut &acc.parts, lexdb_sql.text(&v))
-            append(mut &acc.seps, sep)
-            append(mut &acc.ords, ks)
-        } else {
-            if acc.n > 0 && !lexdb_ops.isNull(&sep) { append(mut &acc.parts, lexdb_sql.text(&sep)) }
-            append(mut &acc.parts, lexdb_sql.text(&v))
-        }
-    } else if f != "count" {
-        // the variances and standard deviations
-        let x = try numOf(&v, &f)
-        let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &x, &x)
-        acc.sum = if lexdb_ops.isNull(&acc.sum) { x } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &x) }
-        acc.sumsq = if lexdb_ops.isNull(&acc.sumsq) { sq } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sumsq, &sq) }
-    }
-    acc.n += 1
-    return Ok(Unit{})
-}
-
-// The square root at 16 places (Newton's method at 20).
-fn sqrtNum(v: &Val): Result[Val, DbErr] {
-    if lexdb_ops.isFloat(v) { return Ok(Val.Float(lexdb_ops.asFloat(v).unwrap().sqrt())) }
-    let a = lexdb_ops.asNum(v).unwrap()
-    if a.isNeg() { return Err(e("2201F", "cannot take square root of a negative number")) }
-    if a.isZero() { return Ok(Val.Num(a)) }
-    var x = if (try lexdb_ops.compare(v, &Val.Int(1))) > 0 { a } else { Decimal.fromInt(1) }
-    let two = Decimal.fromInt(2)
-    for i in 0..200 {
-        let q = match a.div(x, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
-        let next = match q.addExact(x) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
-        let half = match next.div(two, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
-        if half.canonical() == x.canonical() { break }
-        x = half
-    }
-    match x.quantize(16, Rounding.HALF_EVEN) {
-        Ok(d) { return Ok(Val.Num(d)) }
-        Err(_) { return Err(lexdb_ops.decErr()) }
-    }
-}
-
-// string_agg with ORDER BY: its values sorted by their keys (stable: equal
-// keys keep their order), each after its own separator but the first.
-fn orderedParts(sp: &AggSpec, acc: &Acc): Result[str, DbErr] {
-    let idx = try orderIdx(sp, acc)
-    var b = ""
-    for j in 0..len(idx) {
-        let i = idx[j]
-        if j > 0 && !lexdb_ops.isNull(&acc.seps[i]) { b += &(lexdb_sql.text(&acc.seps[i])) }
-        b += &(acc.parts[i])
-    }
-    return Ok(b)
-}
-
-// The order of an ordered aggregate's values (string_agg's, array_agg's):
-// by its ORDER BY keys, ties as they came.
-fn orderIdx(sp: &AggSpec, acc: &Acc): Result[[]int, DbErr] {
-    var idx: []int = []
-    for i in 0..len(acc.parts) { append(mut &idx, i) }
-    var bad = false
-    collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
-        for k in 0..len(sp.dirs) {
-            let d = sp.dirs[k]
-            let desc = d == 'd' || d == 'D'
-            let nullsFirst = d == 'A' || d == 'd'
-            let x = &acc.ords[a][k]
-            let y = &acc.ords[b][k]
-            let xn = lexdb_ops.isNull(x)
-            let yn = lexdb_ops.isNull(y)
-            if xn || yn {
-                if xn && yn { continue }
-                return if xn == nullsFirst { -1 } else { 1 }
-            }
-            let r = lexdb_ops.compare(x, y)
-            if r.isErr() { bad = true }
-            let c = r.unwrapOr(0)
-            if c != 0 { return if desc { -c } else { c } }
-        }
-        return a - b
-    })
-    if bad { return Err(e("42804", &(sp.fname + ": its ORDER BY keys cannot be compared"))) }
-    return Ok(idx)
-}
-
-// An accumulator's result.
-fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
-    let f = &sp.fname
-    if f == "count" { return Ok(Val.Int(acc.n)) }
-    if acc.n == 0 { return Ok(Val.Null) }
-    if f == "sum" { return Ok(acc.sum.clone()) }
-    if f == "avg" { return lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
-    if f == "string_agg" && len(sp.order) > 0 { return Ok(Val.Text(try orderedParts(sp, acc))) }
-    if f == "string_agg" { return Ok(Val.Text(strings.join(&acc.parts, ""))) }
-    if f == "array_agg" {
-        // its values in order, as an array's text (9.27)
-        let idx = if len(sp.order) > 0 { try orderIdx(sp, acc) } else { [] }
-        var vals: []Val = []
-        if len(sp.order) > 0 { for i in idx { append(mut &vals, acc.seps[i].clone()) } } else { for v in acc.seps { append(mut &vals, v.clone()) } }
-        return Ok(Val.Text(lexdb_ops.arrayText(&vals)))
-    }
-    if f == "min" || f == "max" || f == "bool_and" || f == "bool_or" || f == "every" { return Ok(acc.val.clone()) }
-    // variance: (n * sum of squares - sum * sum) / (n * (n - 1)), or n * n for the population's
-    let pop = f == "var_pop" || f == "stddev_pop"
-    if !pop && acc.n < 2 { return Ok(Val.Null) }
-    let n = Val.Int(acc.n)
-    let num = try lexdb_ops.arith(lexdb_ops.OP_SUB, &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &n, &acc.sumsq)), &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &acc.sum)))
-    let den = Val.Int(if pop { acc.n * acc.n } else { acc.n * (acc.n - 1) })
-    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&num, &f)), &(try numOf(&den, &f)))
-    if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
-    return sqrtNum(&vr)
+    if !lexdb_agg.admit(sp, acc, &v) { return Ok(Unit{}) }
+    var more: []Val = []
+    if sp.fname == "string_agg" { append(mut &more, try eval(&sp.args[1], env)) }
+    for o in sp.order { append(mut &more, try eval(&o, env)) }
+    return lexdb_agg.add(sp, acc, v, more)
 }
 
 // A grouped query's output may use a column only inside an aggregate, as
@@ -14896,21 +14714,21 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         var gsets = replace(mut &gs.sets, [])
         if len(firsts) == 0 && len(sel.groupBy) == 0 && len(sel.gsets) == 0 {
             append(mut &firsts, [])         // no rows, no GROUP BY: one group, empty
-            append(mut &accs, newAccs(len(sel.specs)))
+            append(mut &accs, lexdb_agg.newAccs(len(sel.specs)))
         }
         if len(firsts) == 0 {
             // no rows: a group for each empty grouping set (9.94)
             for si in 0..len(sel.gsets) {
                 if len(sel.gsets[si]) > 0 { continue }
                 append(mut &firsts, [])
-                append(mut &accs, newAccs(len(sel.specs)))
+                append(mut &accs, lexdb_agg.newAccs(len(sel.specs)))
                 append(mut &gsets, si)
             }
         }
         for gi in 0..len(firsts) {
             let si = if len(sel.gsets) > 0 { gsets[gi] } else { -1 }
             var vals: []Val = []
-            for i in 0..len(sel.specs) { append(mut &vals, try finish(&sel.specs[i], &accs[gi][i])) }
+            for i in 0..len(sel.specs) { append(mut &vals, try lexdb_agg.finish(&sel.specs[i], &accs[gi][i])) }
             let env = Env{cols: &q.cols, row: &firsts[gi], aggs: &vals, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
             if si >= 0 {
                 // a grouping set's group: its own expressions
@@ -19792,7 +19610,7 @@ fn mergeWin(d: &lexdb_sql.WinDef, named: &[]lexdb_sql.NamedWin, depth: int): Res
 }
 
 fn noSpec(): AggSpec {
-    return AggSpec{fname: "", args: [], star: false, distinct: false, filter: None, order: [], dirs: "", text: "", kind: lexdb_sql.COLL_EXACT}
+    return lexdb_agg.AggSpec{fname: "", args: [], star: false, distinct: false, filter: None, order: [], dirs: "", text: "", kind: lexdb_sql.COLL_EXACT}
 }
 
 fn modeName(m: int): str {
@@ -20226,7 +20044,7 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
     // over the frame: an aggregate, first_value, last_value, nth_value
     if w.agg && w.start == lexdb_sql.B_UNBOUNDED_PRECEDING && w.exclude == lexdb_sql.EX_NONE {
         // the frame only grows: one accumulator, its value made again only when it does
-        var acc = newAccs(1)
+        var acc = lexdb_agg.newAccs(1)
         var added = -1
         var lastEnd = -2
         var val = Val.Null
@@ -20241,7 +20059,7 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
                 try accumulate(&w.spec, mut &acc[0], &env)
             }
             if b != lastEnd {
-                val = try finish(&w.spec, &acc[0])
+                val = try lexdb_agg.finish(&w.spec, &acc[0])
                 lastEnd = b
             }
             out[idx[lo + k]][wi] = val.clone()
@@ -20254,14 +20072,14 @@ fn winPartition(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, wi
         var b = 0
         try frameBounds(w, k, n, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
         if w.agg {
-            var acc = newAccs(1)
+            var acc = lexdb_agg.newAccs(1)
             for p in a..b + 1 {
                 if excluded(w, p, k, &grp) { continue }
                 let tr = idx[lo + p]
                 let env = Env{cols: &q.cols, row: &rows[tr].row, aggs: &rows[tr].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
                 try accumulate(&w.spec, mut &acc[0], &env)
             }
-            out[r][wi] = try finish(&w.spec, &acc[0])
+            out[r][wi] = try lexdb_agg.finish(&w.spec, &acc[0])
             continue
         }
         var nth = 1
@@ -23378,7 +23196,7 @@ fn newMrMatch(s: int, navs: &[]MrNav, ids: &[]int, single: bool): MrMatch {
     }
     var lists: [][]int = []
     for k in 0..nn { append(mut &lists, []) }
-    return MrMatch{s: s, single: single, lists: lists, built: array(nn, false), accAt: accAt, accs: newAccs(na), fed: array(nn, 0)}
+    return MrMatch{s: s, single: single, lists: lists, built: array(nn, false), accAt: accAt, accs: lexdb_agg.newAccs(na), fed: array(nn, 0)}
 }
 
 // How many rows of nav's set are at or before relative row limit.
@@ -23475,7 +23293,7 @@ fn mrNavVal(mi: &MrIn, k: int, mm: mut &MrMatch, lab: &[]int, extra: int, limit0
     if nav.kind == NV_AGG {
         let a = mm.accAt[k]
         if mm.fed[k] > c {
-            var fresh = newAccs(1)
+            var fresh = lexdb_agg.newAccs(1)
             mm.accs[a] = pop(mut &fresh)
             mm.fed[k] = 0
         }
@@ -23488,7 +23306,7 @@ fn mrNavVal(mi: &MrIn, k: int, mm: mut &MrMatch, lab: &[]int, extra: int, limit0
             try accumulate(&nav.spec, mut &mm.accs[a], &env)
             mm.fed[k] += 1
         }
-        let v = try finish(&nav.spec, &mm.accs[a])
+        let v = try lexdb_agg.finish(&nav.spec, &mm.accs[a])
         match nav.wrap {
             Some(w) {
                 let one: []Val = [v]

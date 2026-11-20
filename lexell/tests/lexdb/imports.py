@@ -34,7 +34,7 @@ CMD = os.path.normpath(os.path.join(HERE, "..", "..", "cmd"))
 IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
-    "lexdb_access", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
+    "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_float", "lexdb_func", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
@@ -101,7 +101,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec"}
 
@@ -118,7 +118,13 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # their encodings only; only the pipeline and exec import it.
 SORT = "lexdb_sort"
 SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
-SORT_USERS = {"lexdb_pipe", "lexdb_exec"}
+SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg"}
+
+# The aggregate accumulators (lexdb_agg, design/lexdb-batch-gaps.md item 3):
+# values and their orders only; the row engine and the pipeline import them.
+AGG = "lexdb_agg"
+AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort"}
+AGG_USERS = {"lexdb_pipe", "lexdb_exec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -191,6 +197,12 @@ def check():
     for m in sorted(mods):
         if SORT in mods[m] and m not in SORT_USERS:
             bad.append(f"{m} -> {SORT}: only {', '.join(sorted(SORT_USERS))} import the sort keys")
+    for d in mods.get(AGG, []):
+        if d not in AGG_MAY_IMPORT:
+            bad.append(f"{AGG} -> {d}: the aggregate accumulators import above their layer")
+    for m in sorted(mods):
+        if AGG in mods[m] and m not in AGG_USERS:
+            bad.append(f"{m} -> {AGG}: only {', '.join(sorted(AGG_USERS))} import the aggregate accumulators")
     stats = os.path.join(CMD, STATS + ".lxl")
     if os.path.exists(stats):
         with open(stats, encoding="utf-8") as f:
