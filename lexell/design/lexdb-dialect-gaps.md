@@ -144,6 +144,7 @@ Queue (pairs that touch different files):
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
 | E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
 | F | `worktree-agent-a5c6d6b7ae9c4bd2c` | merged F2 (fa2eaaa0; TPC-H 1.003 of 0c7dbe94 alternated, checksums equal; point selects equal: 3.3937/3.3969 bn against 3.3953/3.3969); merged F1 (e2c93002; TPC-H 1.003 of fdee644f alternated, checksums equal; point selects +0.6% instructions, fixed: see open points); slice F1 done 2026-11-20 (not merged): `8d2ee116` (the routine record, T-SQL procedures, PostgreSQL functions and procedures), `b082a983` (DROP SCHEMA, Describe, Oracle's kind clash, tests), `7908d6e3` (a procedure called by name over TDS), `d4f23aea` (OBJECTPROPERTY, refusals), merge of main `a0607c4a`; suite green on the merged tree; section 7. Later slices: T-SQL functions (scalar, inline table-valued) and `OUTPUT ... INTO @table_variable` (S12), PostgreSQL's set-returning SQL functions and table-reading bodies over columns, GRANT EXECUTE |
+| F3 | `worktree-agent-aef37fd3888ca784e` | slice F3 done 2026-11-20 (not merged; branched from main 9cfcbe8e, suite 243 of 243): `15ae0aa4` (sp_stored_procedures and sp_sproc_columns), `5ad8ef30` (EXECUTE privileges in each dialect), `88acfc13` (set-returning functions, pg_get_functiondef, information_schema.routines and parameters), `6b84551c` (Oracle functions of a column), `e014ae45` (point selects: the FROM name test), then this note; point selects 0.5% fewer instructions than the base (139,141 against 139,834 per statement, three interleaved runs each); `lexdb_exec` 25,163 lines against 24,744 (the checks, the grant targets, the evaluator's `#plf` and the catalog functions; the rest is in `lexdb_routine`, `lexdb_pg`, `lexdb_catalog` and the new `lexdb_plcall`); EXECUTE privileges in each dialect, PostgreSQL's set-returning functions and `pg_get_functiondef`, `sp_stored_procedures` / `sp_sproc_columns`, Oracle's PL/SQL functions of a column in a query; section 7b. Tests `exec_routinepriv` (PostgreSQL 18), `exec_routinesrf` (PostgreSQL 18), `tds_perm` (SQL Server 2022), `tds_procmeta` (SQL Server 2022), `tns_routinepriv` and `tns_plcolumn` (by hand: no Oracle at hand), `exec_routinepriv_reopen`, `wire_routine` (extended). Left for F3 (7b): see there |
 | F2 | `worktree-agent-a41e5e133714c96b3` | slice F2 done 2026-11-20 (not merged; merged with main 0c7dbe94, suite 236 of 236): `81640550` (functions and OUTPUT INTO), `efc9794c` (merge of main), `7f85e2a6` (last row of a SELECT @v, tests, notes), then this note; T-SQL scalar and inline table-valued functions, `OUTPUT ... INTO` (S12); section 7a. Tests `tds_func` (SQL Server 2022), `tds_output` (SQL Server 2022), `tds_funcbatch`, `tds_funcgaps`. Left for F2 (7a): multi-statement table-valued functions, a function in a column DEFAULT, CHECK, index or view, a table-reading function with a loop, cursors, EXEC of a function. Left for F3: `GRANT EXECUTE` and routine permissions (any role that reaches the schema runs one), PostgreSQL's set-returning functions and `RETURNS TABLE`, `pg_get_functiondef` and `pg_get_function_arguments`, `information_schema.routines`, `sp_stored_procedures` and `sp_sproc_columns` (JDBC's getProcedures), Oracle PL/SQL functions of a column in a query |
 
 ## 5. Package A: what was done
@@ -482,8 +483,75 @@ at the first call), the 3705/3701 partial effect of `DROP FUNCTION a, b` (SQL Se
 OUTPUT y` (both clauses: 0A000), sys.columns rows for a table-valued function, a program parsed again at each call (a cache would
 make a loop-heavy function a few times faster). PostgreSQL and Oracle: PostgreSQL has no OUTPUT INTO (`RETURNING` into a variable
 is PL/pgSQL; its writable CTEs are refused in lexdb as before); Oracle has `RETURNING ... INTO` in PL/SQL and through OCI binds
-(`tns_binds`), unchanged; an Oracle PL/SQL function of a column in a query is still refused (`lexdb_plsql.expandCalls` takes
-constants only): a gap, not small.
+(`tns_binds`), unchanged; an Oracle PL/SQL function of a column in a query was still refused (`lexdb_plsql.expandCalls` takes
+constants only): done in F3 (7b).
+
+## 7b. Package F, slice F3: what was done
+
+**Privileges on routines (one model, three doors).** A routine's privileges are an ACL row of its own (`lexdb_catalog.routineObj`:
+dialect, name's key, signature; `PrivRow` and `privRows` list the grants of T-SQL's routines and Oracle's units with the tables'),
+written by the first GRANT or REVOKE; before that a PostgreSQL routine is EXECUTE for PUBLIC (as PostgreSQL's) and a T-SQL routine or
+Oracle unit its owner's alone. The owner is the role that made it (`Routine.owner`; for a unit the schema it is in). Letter `X` is
+EXECUTE; `r` is SELECT on a T-SQL table-valued function. DROP takes the row (PostgreSQL, SQL Server and, in `putSource`, Oracle's
+units; DROP SCHEMA CASCADE); CREATE OR REPLACE and ALTER keep it. Checks are made where a routine is used, never on a statement that
+calls none (`Session.needExecute`, `markDeniedFns`, which only run for a statement `callNames` found a call in, or the TDS EXEC):
+- PostgreSQL: `GRANT/REVOKE EXECUTE | ALL ON FUNCTION | PROCEDURE | ROUTINE name[(types)] [, ...]` and `ALL FUNCTIONS | PROCEDURES |
+  ROUTINES IN SCHEMA` (42883, 42725 for a name with overloads and no list, 42809 for the wrong kind, 3F000, 0LP01 for another
+  privilege), 42501 for a function inlined into a query or a CALL without EXECUTE and for one of a schema without USAGE;
+  `information_schema.routine_privileges` and `role_routine_grants`, `has_function_privilege`, `pg_proc.proacl`.
+- SQL Server: `GRANT/REVOKE EXECUTE (EXEC, ALL) ON [OBJECT::]proc | function` and SELECT on a table-valued function; 229 for EXEC,
+  a scalar function or a TVF without it, 4606 for a permission the object's kind has not, 15151 for a grantor that may not grant (and
+  for a REVOKE by one it is a silent no-op). Checked against SQL Server 2022: that 15151, not 4613, is what a user that holds SELECT on
+  a table without the right to pass it on is told too (tds_privs's 4613 was from the documentation, changed with this reason). The
+  body of a procedure or function runs with its owner's rights (SQL Server's ownership chaining, as lexdb has no schema owners: the
+  session acts as `Routine.owner` for the run, `Session.actAs`; the query of a table-valued or table-reading function is planned as
+  its owner, `Stmt.runAs`, the way a view is), so a user with EXECUTE on `p` reads what `p` reads and nothing else (a nested EXEC
+  needs no EXECUTE either). `sys.database_permissions` class 1, type `EX  `, `HAS_PERMS_BY_NAME(.., 'OBJECT', 'EXECUTE')`.
+- Oracle: `GRANT/REVOKE EXECUTE | ALL ON [owner.]unit TO user | PUBLIC` (lexdb_tns builds the same GRANT; `grantOtherTarget` finds the
+  unit among lexdb_plsql's sources); a call without it is ORA-06550 (PLS-00201) from a block and ORA-00904 `"U1"."F"` from SQL
+  (`Prog.denied`: the units of other owners the user may not run, found when the units are compiled and left out of the signatures and
+  of the lookup; GRANT and REVOKE move `plsql.ver` so each connection looks again). A unit runs, and is compiled, as its owner
+  (definer's rights: `Session.actAsSchema` sets the role and the search path), so it reads the tables of its schema its caller cannot.
+  ORA-00942 for a privilege other than EXECUTE on a unit, ORA-00990 for EXECUTE on a table, ORA-01720 and ORA-01031, USER_, ALL_ and
+  DBA_TAB_PRIVS with privilege EXECUTE and type PROCEDURE or FUNCTION. Packages are not given EXECUTE (any user may call a package).
+
+**Set-returning SQL functions (PostgreSQL).** `RETURNS SETOF type`, `RETURNS TABLE (...)` (OUT parameters with `table` in the routine's
+attrs), `RETURNS SETOF record` with OUT parameters. A function of the user's in FROM (`[schema.]f(args) [AS alias [(columns)]]`, named
+and default arguments; the parser's `pgFunctionFrom` marks the statement `udf`) is written as its query before the statement is planned
+(`lexdb_routine.inlineSrf`): constants put into the body, a column as an argument through a derived table of one row placed before it (an
+implicit LATERAL), the columns named as the function declares them. It composes with joins, WHERE, aggregates, IN / EXISTS, CTEs and
+UNION. CREATE checks the number of columns the last statement gives against the declared (42P13) and a changed SETOF. `pg_get_functiondef`,
+`pg_get_function_arguments`, `_identity_arguments`, `_result` (they were NULL), `regproc`, `pg_proc` modes (`t` for TABLE columns) and
+`information_schema.routines` and `parameters` (all 82 and 32 columns, values as PostgreSQL 18's; the renderers are `lexdb_pg.fnDef`
+and its parts, handed to a statement through the bound catalog's `f` and `g` lines).
+
+**SQL Server's metadata.** `sp_stored_procedures` and `sp_sproc_columns` / `_100` answer from sys.objects and sys.parameters: `;1` and
+`;0` names, `@RETURN_VALUE` and `@TABLE_RETURN_VALUE`, each type's ODBC code, size, scale, radix, octet length and TDS code (ODBC 2's
+or, with `@ODBCVer = 3`, ODBC 3's), patterns for name, owner and column. `tds_procmeta` (34 batches, SQL Server 2022).
+
+**Oracle: a PL/SQL function of a column in a query** (`lexdb_plcall`, a new Oracle behavior module; `expandCalls` took constants only).
+After the query is parsed, each call of a stored function is `Cast(Call("#plf", [function, arguments]))`; the evaluator reads the value
+for its arguments from the store's memo (`plfEval`; a combination with none is noted and gives NULL). Before the query runs, for each
+call a query made of the block's FROM, its conditions that call no function and the arguments as its select list (DISTINCT) gives the
+combinations, and the function is run for each (`runBlock`); a run that missed one gives it back, it is computed and the query run again
+(a query with a row limit and no ORDER BY has no such first query: it runs until it has all). So a function runs once for each distinct
+combination of arguments in a query, as Oracle may do for a deterministic one, not once for each row; a function that raises raises
+its error. Owner.function and package.function work (the parser now reads `a.f(` in Oracle's SQL). `tns_plcolumn`: 3,000 rows, each
+shape answered with `lexdb_batch` on, off and by the same query written without the function.
+
+**Not done / left (F3).** PostgreSQL: SECURITY DEFINER (parsed, ignored: a function runs as the caller), a set-returning function in the
+select list, WITH ORDINALITY and RETURNS SETOF of a table's row type, `ALTER FUNCTION ... OWNER TO`, `DROP OWNED BY`, GRANT OPTION,
+the regprocedure form with argument types and `pg_get_functiondef` of a `BEGIN ATOMIC` body (PostgreSQL deparses it; lexdb shows the
+text as written), the dependency PostgreSQL finds for DROP ROLE (2BP01) on a role with routine privileges. SQL Server: DENY, the
+`SCHEMA::` class, the ownership chain breaking at an object another owner has (lexdb runs the body as its owner: a procedure made by
+a superuser reads everything), sp_sproc_columns's SQL Server 2000 types of the non-`_100` form for date, max and xml parameters (given
+as the `_100`'s), money and numeric (lexdb's types keep them as decimal), the `sp_stored_procedures` list of SQL Server's own
+procedures (the user's only), `@sp_qualifier` (15250), HAS_PERMS_BY_NAME for a name that is none (NULL; SQL Server gives 0 to a user
+without rights). Oracle: EXECUTE on a package, ORA-06576 for a CALL of a denied unit (06550 here), a stored function of a column in
+DML (INSERT ... SELECT f(col): ORA-00904), an aggregate or another stored function as the argument (ORA-03001), a function in a
+cursor (`OPEN c FOR SELECT f(col)` inside PL/SQL), `owner.f(column)` for a name that is none (904 now), a non-deterministic function
+(each distinct argument once per query) and all Oracle expectations are by hand. Errors from memory: ORA-00942 / 00990 for the wrong
+privilege and ORA-01031 for a user with no privilege on a unit.
 
 ## 8. Package C: what was done
 
