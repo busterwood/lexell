@@ -1345,6 +1345,28 @@ pub fn placesOnly(bp: &BPlan, ps: &[]int): BPlan {
                  missing: collections.copyOf(&bp.missing), needP: np, width: bp.width, ranges: []}
 }
 
+// A batch b of rows read without a batch reader (row by row, or held by
+// the run), counted as read, through the conditions and the first hash's
+// keys, given to each. Whether each stopped it.
+fn eachChunk(txn: mut &lexdb_store.Txn, b: mut &Batch, conds: &[]BNode, pushCol: int, ph: &PushH, rawOnErr: bool, rc: mut &RC,
+             each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
+    var idx: []int = withCapacity(b.n)
+    for r in 0..b.n { append(mut &idx, r) }
+    rc.read += b.n
+    match pick(conds, b, collections.copyOf(&idx)) {
+        Ok(kept) {
+            rc.kept += len(kept)
+            let fin = pushed(b, kept, pushCol, ph, rc)
+            return Ok(!(try each(txn, b, fin, false)))
+        }
+        Err(x) {
+            // the caller's, row by row (an error past a LIMIT is not reached)
+            if !rawOnErr { return Err(x) }
+            return Ok(!(try each(txn, b, idx, true)))
+        }
+    }
+}
+
 // idx0 narrowed to the rows of b every one of conds (not marked in skip)
 // holds for, in order; None: one gives an error on one of them.
 pub fn bNarrow(conds: &[]BNode, skip: &[]bool, b: &Batch, idx0: []int): Option[[]int] {
@@ -2263,7 +2285,7 @@ const HELD_BATCH: int = 64
 // Where a run of pg reads a first table the run holds (PScan.held): rows
 // its caller gives to the run, n of them, or a series (series' arguments
 // as seriesRes gives them, its type oid, WITH ORDINALITY) made as it is
-// read. In batches from HELD_BATCH rows on.
+// read. In batches from HELD_BATCH rows on, and always for a join's.
 pub fn srcHeld(pg: &Prog, n: int, series: bool, vals: &[]Val, oid: int, ordin: bool): Result[Src, DbErr] {
     var src = noSrc()
     src.held = true
@@ -2274,7 +2296,7 @@ pub fn srcHeld(pg: &Prog, n: int, series: bool, vals: &[]Val, oid: int, ordin: b
         held = lexdb_held.size(&none, &src.ser)
     }
     if src.ser.bad { return Err(e("XX000", "a series the pipeline does not read")) }
-    src.batch = held >= HELD_BATCH
+    src.batch = pg.joins || held >= HELD_BATCH
     return Ok(src)
 }
 
@@ -4042,10 +4064,28 @@ type RC = record { read: int; kept: int; batches: int; pushed: int; cut: int }
 // too, before the batch's other columns are decoded. An error of a
 // condition: raised. A value a batch cannot hold: batErr. Whether each
 // stopped it.
-fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, bp: &BPlan,
+fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, hrows: &[][]Val, bp: &BPlan,
             conds: &[]BNode, pushCol: int, ph: &PushH, rawOnErr: bool, rc: mut &RC,
             each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
     let rel = lexdb_catalog.relOf(t)
+    if src.held {
+        // rows the run holds (a derived table's, a view's, ...): their batches
+        var pos = lexdb_held.newPos()
+        var spare = lexdb_rows.noRows()
+        while !pos.done {
+            let got = lexdb_held.fill(hrows, &src.ser, mut &pos, bp, mut &spare)
+            if got.isNone() { return Err(batErr()) }
+            var b = got.unwrap()
+            if b.n == 0 {
+                spare = b
+                continue
+            }
+            rc.batches += 1
+            if try eachChunk(txn, mut &b, conds, pushCol, ph, rawOnErr, rc, each) { return Ok(true) }
+            spare = b
+        }
+        return Ok(false)
+    }
     var ranges = false
     for s in src.scans { if !s.point && !s.empty { ranges = true } }
     if !src.batch || !ranges {
@@ -4081,22 +4121,8 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
                 b.n += 1
                 at += 1
             }
-            var idx: []int = withCapacity(b.n)
-            for r in 0..b.n { append(mut &idx, r) }
             // (counted as read row by row: no batch)
-            rc.read += b.n
-            match pick(conds, &b, collections.copyOf(&idx)) {
-                Ok(kept) {
-                    rc.kept += len(kept)
-                    let fin = pushed(&b, kept, pushCol, ph, rc)
-                    if !(try each(txn, mut &b, fin, false)) { return Ok(true) }
-                }
-                Err(x) {
-                    // the caller's, row by row (an error past a LIMIT is not reached)
-                    if !rawOnErr { return Err(x) }
-                    if !(try each(txn, mut &b, idx, true)) { return Ok(true) }
-                }
-            }
+            if try eachChunk(txn, mut &b, conds, pushCol, ph, rawOnErr, rc, each) { return Ok(true) }
         }
         return Ok(false)
     }
@@ -4780,7 +4806,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
         let noInts: []int = []
         let ph = PushH{keys: &none, head: &noInts, cutB: &noInts}
         var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
-        let stop = try readRows(st, txn, t, sc, src, &bp, &conds, -1, &ph, false, mut &rc,
+        let noHeld: [][]Val = []
+        let stop = try readRows(st, txn, t, sc, src, &noHeld, &bp, &conds, -1, &ph, false, mut &rc,
                                 fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
             try bd.add(b, &idx, &bp, &j.hcols, mode, false, keepAll, j.resCol, room, maxHeld)
             return Ok(true)
@@ -5334,6 +5361,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         }
     }
     cnt[sc.level].starts += 1
+    heldRun(&srcs[sc.level])
     var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}}
     for i in 0..len(jr.jls) { append(mut &js.cur, lexdb_rows.noRows()) }
     // a RIGHT JOIN's rows that joined (at most one)
@@ -5348,7 +5376,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
     let ph = PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB}
     var rawKept = 0
-    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &bp, &cn, pushCol, &ph, exact, mut &rc,
+    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
