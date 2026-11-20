@@ -3582,6 +3582,90 @@ pub fn obRow(ob: &lexdb_rows.OutBatch, j: int, out: mut &[]Val) {
         }
     }
 }
+
+// keyPart of the integer n (an integer's number: lexdb_access.encNum of its
+// decimal), made from its digits without a Decimal.
+pub fn keyInt(b: mut &str, n: int) {
+    if n == 0 {
+        b.addByte(3)
+        b.addByte(0x80)
+        return
+    }
+    if n < -9223372036854775807 {
+        keyPart(b, &Val.Int(n))
+        return
+    }
+    let m0 = if n < 0 { -n } else { n }
+    // its digits: nd of them, the last z of them zeros (not in the key)
+    var nd = 1
+    var p = 1
+    while p <= m0 / 10 {
+        p *= 10
+        nd += 1
+    }
+    var z = 0
+    var t = m0
+    while t % 10 == 0 {
+        t /= 10
+        z += 1
+    }
+    let ex = nd + 0x40000000
+    b.addByte(3)
+    let neg = n < 0
+    let w = if neg { 0x7FFFFFFF - ex } else { ex }
+    b.addByte(if neg { 0x7F } else { 0x81 })
+    b.addByte(byte((w >> 24) & 0xff))
+    b.addByte(byte((w >> 16) & 0xff))
+    b.addByte(byte((w >> 8) & 0xff))
+    b.addByte(byte(w & 0xff))
+    var m = m0
+    for i in 0..nd - z {
+        let d = m / p
+        m = m % p
+        p /= 10
+        b.addByte(byte(if neg { 0xFF - (0x30 + d) } else { 0x30 + d }))
+    }
+    b.addByte(if neg { 0xFF } else { 0 })
+}
+
+// Row j of an OutBatch as a set operation's key: rowKey's of its values
+// (obRow's) under the columns' collation kinds colls (keyPart of
+// collVal), made from the columns: an integer from its digits, a text from
+// its bytes, no value made. kb is cleared first.
+pub fn obKey(ob: &lexdb_rows.OutBatch, j: int, colls: &[]int, kb: mut &str) {
+    kb.clear()
+    let r = ob.idx[j]
+    for o in 0..len(ob.kinds) {
+        let k = ob.kinds[o]
+        let c = ob.src[o]
+        let ck = if o < len(colls) { colls[o] } else { lexdb_sql.COLL_EXACT }
+        if c < 0 {
+            let x = &ob.ex[o]
+            if x.nul[j] { kb.addByte(2) }
+            else if k == BK_BOOL {
+                kb.addByte(1)
+                kb.addByte(if x.v[j] == 1 { 1 } else { 0 })
+            } else { keyInt(kb, x.v[j]) }
+        } else if ob.cols[c].nul[r] {
+            kb.addByte(2)
+        } else if k == lexdb_rows.BK_INT {
+            keyInt(kb, ob.cols[c].v[r])
+        } else if k == BK_BOOL {
+            kb.addByte(1)
+            kb.addByte(if ob.cols[c].v[r] == 1 { 1 } else { 0 })
+        } else if k == lexdb_rows.BK_TEXT {
+            let s = lexdb_rows.obText(ob, o, j)
+            if ck == lexdb_sql.COLL_EXACT { lexdb_access.encIdxText(kb, s) }
+            else if ck == lexdb_sql.COLL_CI { lexdb_access.encIdxText(kb, &lexdb_access.ciKey(s)) }
+            else { lexdb_access.encIdxText(kb, &lexdb_access.padKey(s)) }
+        } else if ck == lexdb_sql.COLL_EXACT {
+            keyPart(kb, &ob.vals[c][r])
+        } else {
+            keyPart(kb, &lexdb_sort.collVal(ck, &ob.vals[c][r]))
+        }
+    }
+}
+
 // ---- subqueries' values, IN's sets and hash keys
 //
 // A subquery run once (lexdb_plan.RUN_ONCE) is a value to the plans that
@@ -5876,7 +5960,7 @@ type DistSet = record {
 
 // A one-table run's Sort, if any: st holds its state (one), or nothing
 // (the rows stream to the caller; a run that does not sort makes nothing).
-type SortRun = record { st: []SortSt }
+pub type SortRun = record { st: []SortSt }
 
 // A Sort's (or Distinct's) run: what it holds, and how.
 type SortSt = record {
@@ -5950,7 +6034,38 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
 }
 
 // No Sort: the rows go to the caller as they are made.
-fn noSortRun(): SortRun { return SortRun{st: []} }
+pub fn noSortRun(): SortRun { return SortRun{st: []} }
+
+// The sort of a set operation's rows (UNION, INTERSECT, EXCEPT with ORDER
+// BY, LIMIT, OFFSET), fed by the parts' chunks and rows as they come: the
+// output's columns (ncol), the ORDER BY keys as output columns (keyCol,
+// with desc, nf and the collations' kinds coll), the rows given after
+// offset (limit, -1 all), and the bytes the statement may still hold
+// (room, -1 no limit; maxMem: max_statement_mem, for the error). With a LIMIT
+// only limit + offset rows are kept, as a SELECT's top-N keeps them.
+pub fn setSort(ncol: int, keyCol: []int, desc: []bool, nf: []bool, coll: []int, limit: int, offset: int,
+               room: int, maxMem: int): SortRun {
+    var sr = SortSt{sorting: true, distinct: false, shown: ncol, keyCol: keyCol, desc: desc, nf: nf, coll: coll, dcoll: [], kinds: [],
+                     limit: limit, offset: max(offset, 0), topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0},
+                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: []}
+    sr.topK = if limit >= 0 { limit + sr.offset } else { -1 }
+    return SortRun{st: [sr]}
+}
+
+// Whether srt sorts (a SortRun of setSort), and what it holds now.
+pub fn (srt: &SortRun) active(): bool { return len(srt.st) > 0 }
+pub fn (srt: &SortRun) held(): int { return if len(srt.st) > 0 { srt.st[0].held } else { 0 } }
+
+// A chunk ob, or the row r when ob.n is 0, taken in. Ok(false): stop (a
+// value not sorted here: done gives batErr).
+pub fn (srt: mut &SortRun) take(ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] { return srt.st[0].eat(ob, r) }
+
+// The rows kept, in order, given as one chunk to give; their bytes held in
+// bud. The rows given. batErr: a value not sorted here (nothing given).
+pub fn (srt: mut &SortRun) done(txn: mut &lexdb_store.Txn, bud: mut &Budget,
+                                give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    return srt.st[0].finish(txn, bud, give)
+}
 
 // What a run made (a chunk ob, or the row r when ob.n is 0) to srt when it
 // holds the rows, else to give.
@@ -6074,6 +6189,13 @@ fn (sr: mut &SortSt) cell(kind: int, ob: &lexdb_rows.OutBatch, r: &[]Val, j: int
         }
         if !isIntKind(ok) {
             if kind != BK_VAL {
+                // (a set operation's other part gives values where the first
+                // gave integers: its integers and booleans, as the first's)
+                match ob.vals[src][rr] {
+                    Val.Int(n) { if kind == lexdb_rows.BK_INT { iv = n; return false } }
+                    Val.Bool(b) { if kind == BK_BOOL { iv = if b { 1 } else { 0 }; return false } }
+                    else {}
+                }
                 sr.bad = true
                 return true
             }

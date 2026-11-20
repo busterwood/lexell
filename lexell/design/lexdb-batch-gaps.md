@@ -1,6 +1,6 @@
 # lexdb: the row-only gaps, moved to batches
 
-Status: plan, 2026-11-20, on main `ab9c8a3e`. Source: the review of the
+Status: plan, 2026-11-20, on main `ab9c8a3e` (item 11 done on its branch, section 4). Source: the review of the
 batching commits e1cc5c26, 19e016f7 and f82e0a94, and the construct
 inventory [lexdb-constructs.md](lexdb-constructs.md) (sections 1-5 and 8).
 Each item below is a construct that runs row by row today only because no
@@ -379,5 +379,5 @@ the suite rerun) before review.
 | 8 | | not started |
 | 9 | | not started |
 | 10 | | not started |
-| 11 | | not started |
+| 11 | `worktree-agent-a4b1bd5f4d52444ba` (bdcef23d 11a, 883e640e 11b, 7041572a 11c, 446ac0c6 the move) | merged (MERGE_11) . 11a: ORDER BY [LIMIT] [OFFSET] over a set operation to a sink feeds the parts into `lexdb_pipe.setSort` (a `SortSt`: top-N of LIMIT + OFFSET), OFFSET alone skipped as the rows come; UNION ALL ORDER BY LIMIT 100 at 200,000 rows a side 188 to 21 ms, ORDER BY with 400,000 rows out 320 to 51 ms. 11b: INTERSECT ALL and EXCEPT ALL streamed by counted keys, 93 to 66 and 86 to 55 ms. 11c: keys from the batch's columns (`lexdb_pipe.obKey`, `keyInt`): texts -33%, integers 0 to -13%; most of what is left of an integer UNION/INTERSECT (about 55 ms at 400,000 rows) is the string-keyed map and the rows given one by one. The runners are in `lexdb_setop` (488 lines), run parts through a hook; exec 23,765 to 23,562 lines. Suite 192 of 192. Left: a typed set for a single integer column (`Map[int, int]`) and giving kept rows as a chunk (a selection of the batch) instead of row by row; WITH TIES, coercion (`sel.conv`) and recursion still run held; a value the sort does not hold (keys of mixed kinds) re-runs the statement held (parts run twice: a volatile non-CTE expression in a part would be evaluated twice) |
 | 12 | | not started |

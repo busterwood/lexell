@@ -39,7 +39,7 @@ CORE = {
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
-    "lexdb_session", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
+    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time",
 }
 
@@ -103,7 +103,7 @@ PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexd
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
                    "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
-PIPE_USERS = {"lexdb_exec"}
+PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
 # The statistics (design/lexdb-layers.md 6.2, E2): what they may import (and
 # lexell's own libraries), and who may import them. The session's settings
@@ -118,13 +118,22 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # their encodings only; only the pipeline and exec import it.
 SORT = "lexdb_sort"
 SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
-SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg"}
+SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop"}
 
 # The aggregate accumulators (lexdb_agg, design/lexdb-batch-gaps.md item 3):
 # values and their orders only; the row engine and the pipeline import them.
 AGG = "lexdb_agg"
 AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort"}
 AGG_USERS = {"lexdb_pipe", "lexdb_exec"}
+
+# How a set operation combines its parts' rows (lexdb_setop, design/
+# lexdb-batch-gaps.md item 11): their keys and the streamed run, with the
+# pipeline's sort. It runs a part through a hook of lexdb_exec, never
+# imports it, and takes only the transaction from the store.
+SETOP = "lexdb_setop"
+SETOP_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_bind", "lexdb_pipe", "lexdb_sort", "lexdb_store"}
+SETOP_STORE_NAMES = {"Txn"}
+SETOP_USERS = {"lexdb_exec"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -203,6 +212,21 @@ def check():
     for m in sorted(mods):
         if AGG in mods[m] and m not in AGG_USERS:
             bad.append(f"{m} -> {AGG}: only {', '.join(sorted(AGG_USERS))} import the aggregate accumulators")
+    for d in mods.get(SETOP, []):
+        if d not in SETOP_MAY_IMPORT:
+            bad.append(f"{SETOP} -> {d}: the set operations import above or beside their layer")
+    for m in sorted(mods):
+        if SETOP in mods[m] and m not in SETOP_USERS:
+            bad.append(f"{m} -> {SETOP}: only {', '.join(sorted(SETOP_USERS))} import the set operations")
+    setop = os.path.join(CMD, SETOP + ".lxl")
+    if os.path.exists(setop):
+        with open(setop, encoding="utf-8") as f:
+            body = f.read()
+        names = set(re.findall(r"\blexdb_store\.([A-Za-z_][A-Za-z0-9_]*)", body)) - SETOP_STORE_NAMES
+        if names:
+            bad.append(f"{SETOP} uses lexdb_store beyond Txn: " + ", ".join(sorted(names)))
+        if re.search(r"\.sql\.", body):
+            bad.append(f"{SETOP} reads a transaction's SQL state (Txn.sql)")
     stats = os.path.join(CMD, STATS + ".lxl")
     if os.path.exists(stats):
         with open(stats, encoding="utf-8") as f:
