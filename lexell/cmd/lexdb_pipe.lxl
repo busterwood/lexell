@@ -4360,7 +4360,20 @@ type JL = record {
     // engine counts them; -1 not cut
     cutB: []int
     cutTo: int
+    // optimizer 50's levels (NA_*): a null-aware anti join (mark MK_ANTI)
+    // or a mark join (mark MK_JOIN, its rows made per probe in the chunk's
+    // batch, the mark its last column); nk of its keys the correlation's
+    // (then IN's value); the summary per keys (1 rows, 3 rows and a NULL
+    // value) in gens under a 0 byte and the keys' keyPart encoding (no
+    // key's starts with a 0 byte: nk > 0 is a JK_GEN hash), sumAll for nk 0
+    na: int
+    nk: int
+    sumAll: int
 }
+
+const NA_NOTIN: int = 1
+const NA_MARK_EX: int = 2
+const NA_MARK_IN: int = 3
 
 fn newJL(how: int, level: int, first: int, ncol: int): JL {
     return JL{how: how, left: false, level: level, first: first, ncol: ncol, rkinds: [], key: [], keyTyp: [], keyCol: [], kreads: [],
@@ -4368,7 +4381,7 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               conds: [], creads: [], post: [], preads: [], ktypes: [], tail: lexdb_access.noTail(), noRange: false, index: -1,
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
               perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, cross: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
-              cutB: [], cutTo: -1}
+              cutB: [], cutTo: -1, na: 0, nk: 0, sumAll: 0}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -4459,6 +4472,8 @@ fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool):
             let hash = j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS
             if (j.kind == lexdb_sql.J_RIGHT || j.kind == lexdb_sql.J_FULL) && (!hash || j.mark != lexdb_plan.MK_JOIN) { return -1 }
             if j.mark != lexdb_plan.MK_JOIN && j.kind != lexdb_sql.J_INNER { return -1 }
+            // (optimizer 50's levels: a subquery's rows, hashed, no "<>" summary)
+            if j.mark >= lexdb_plan.MK_NOTIN && (j.how != lexdb_plan.JH_ROWS || j.resCol >= 0 || len(j.hcols) == 0) { return -1 }
             if j.resCol >= 0 && (!hash || len(j.res) != 1 || !allIn(&j.res, avail)) { return -1 }
             if hash {
                 // (no key: an inner join of every pair, its conditions per pair)
@@ -4532,7 +4547,7 @@ fn allIn1(x: &BX, avail: &[]bool): bool {
 // rows a level's).
 fn joinRuns1(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
     for s in subs {
-        let ok = s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_LOOKED || (s.run == lexdb_plan.RUN_ONCE)
+        let ok = s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_MARK || s.run == lexdb_plan.RUN_LOOKED || (s.run == lexdb_plan.RUN_ONCE)
         if !ok { return false }
     }
     return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
@@ -4874,7 +4889,8 @@ fn gatherAt(jr: &JRun, cur: &[]Batch, at: &[][]int, n: int, reads: &[]int): Batc
         let o = jr.owner[c]
         if o < 0 || o >= len(at) { continue }
         let jl = &jr.jls[o]
-        let src = if hashed(jl) { &jl.rows } else { &cur[o] }
+        // (a mark join's rows are the probe's, made per chunk)
+        let src = if hashed(jl) && jl.na < NA_MARK_EX { &jl.rows } else { &cur[o] }
         if c - jl.first >= len(src.cols) {
             // (no rows of it: a RIGHT JOIN's unmatched rows' tables before it)
             var col = lexdb_rows.bvec(n)
@@ -4974,6 +4990,19 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             jl.left = j.kind == lexdb_sql.J_LEFT || j.kind == lexdb_sql.J_FULL
             jl.right = j.kind == lexdb_sql.J_RIGHT || j.kind == lexdb_sql.J_FULL
             jl.mark = j.mark
+            if j.mark >= lexdb_plan.MK_NOTIN {
+                // optimizer 50: an anti join that keeps the rows whose IN is
+                // false, or a join of every row once to its mark
+                jl.na = if j.mark == lexdb_plan.MK_NOTIN { NA_NOTIN } else if j.mark == lexdb_plan.MK_MARK_EX { NA_MARK_EX } else { NA_MARK_IN }
+                jl.mark = if jl.na == NA_NOTIN { lexdb_plan.MK_ANTI } else { lexdb_plan.MK_JOIN }
+                jl.nk = if jl.na == NA_MARK_EX { len(j.hcols) } else { len(j.hcols) - 1 }
+                if jl.na != NA_NOTIN {
+                    // the probe's rows: the mark alone (its keys hidden, read by nothing)
+                    var bp = projOf(t, sc, &jr.kinds)
+                    for c in 0..len(bp.needCol) { bp.needCol[c] = c == len(t.cols) - 1 }
+                    jl.bp = bp
+                }
+            }
             jl.raw = j.how == lexdb_plan.JH_ROWS
             jl.cross = (j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS) && len(j.hcols) == 0
             jl.resCol = j.resCol
@@ -5218,7 +5247,7 @@ fn reduceHashes(jr: mut &JRun) {
         j -= 1
         let jh = jr.jls[j].how
         if !(jh == lexdb_plan.JH_HASH || jh == lexdb_plan.JH_ROWS || jh == lexdb_plan.JH_JOIN) || jr.jls[j].mode != JK_INT || jr.jls[j].left || jr.jls[j].right ||
-           jr.jls[j].mark == lexdb_plan.MK_ANTI || len(jr.jls[j].key) != 1 { continue }
+           jr.jls[j].mark == lexdb_plan.MK_ANTI || jr.jls[j].na != 0 || len(jr.jls[j].key) != 1 { continue }
         var c = -1
         match jr.jls[j].key[0] {
             BNode.Col(x) { c = x }
@@ -5231,7 +5260,7 @@ fn reduceHashes(jr: mut &JRun) {
         if k != j - 1 || k < 1 { continue }
         let kh = jr.jls[k].how
         if !(kh == lexdb_plan.JH_HASH || kh == lexdb_plan.JH_ROWS || kh == lexdb_plan.JH_JOIN) || jr.jls[k].left || jr.jls[k].right || jr.jls[k].mode != JK_INT ||
-           jr.jls[k].mark != lexdb_plan.MK_JOIN || jr.jls[k].resCol >= 0 { continue }
+           jr.jls[k].mark != lexdb_plan.MK_JOIN || jr.jls[k].na != 0 || jr.jls[k].resCol >= 0 { continue }
         var plain = true
         for m in k..j {
             let ml = &jr.jls[m]
@@ -5477,6 +5506,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
             for r in 0..b.n { append(mut &idx, r) }
             nread += b.n
             let kept = try pick(&conds, &b, idx)
+            if jl.na == NA_NOTIN || jl.na == NA_MARK_IN { jl.summarize(&b, &kept, &bp, &j.hcols, mut &bd.gens) }
             try bd.add(&b, &kept, &bp, &j.hcols, mode, true, keepAll, j.resCol, room, maxHeld)
         }
     } else {
@@ -5505,6 +5535,188 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
     jl.mixed = replace(mut &bd.mixed, [])
     jl.single = replace(mut &bd.single, [])
     return Ok(Unit{})
+}
+
+// ---- optimizer 50's levels: IN by a hash of a subquery's rows (keys,
+// value) and a summary per keys (inSum: 1 rows, 3 rows and a NULL value)
+
+// Adds b's rows idx (by their keys hc: nk correlation keys, then IN's
+// value) to jl's summary (sumAll, or into gens, the hash's being built); a
+// row with a NULL key is in no key's.
+fn (jl: mut &JL) summarize(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, gens: mut &Map[str, int]) {
+    var kb = ""
+    for r in idx {
+        kb.clear()
+        kb.addByte(0)
+        var nul = false
+        for k in 0..jl.nk {
+            if b.cols[hc[k]].nul[r] {
+                nul = true
+                break
+            }
+            keyPart(mut &kb, &bValAt(b, hc[k], bp.kinds[hc[k]], r))
+        }
+        if nul { continue }
+        let f = if b.cols[hc[jl.nk]].nul[r] { 3 } else { 1 }
+        if jl.nk == 0 {
+            if f > jl.sumAll { jl.sumAll = f }
+            continue
+        }
+        if gens.getOr(&kb, 0) < f { gens.put(kb.clone(), f) }
+    }
+}
+
+// IN's value (optimizer 50.2) for keys of nk correlation values then x:
+// f the summary of their keys (0 no rows), found whether (keys, x) is in
+// the hash.
+pub fn inMark(f: int, xNull: bool, found: bool): Val {
+    if f == 0 { return Val.Bool(false) }
+    if xNull { return Val.Null }
+    if found { return Val.Bool(true) }
+    return if f == 3 { Val.Null } else { Val.Bool(false) }
+}
+
+// The row engine's summary of a level's rows (nk keys, then IN's value),
+// as summarize's, into its hash's keys (lexdb_exec's materialize): under
+// "\x00" and the keys' keyPart encoding (no key's encoding starts with a
+// 0 byte).
+pub fn inSummary(rows: &[][]Val, nk: int, keys: mut &Map[str, int]) {
+    var kb = ""
+    for r in rows {
+        if nk >= len(r) { continue }
+        kb.clear()
+        kb.addByte(0)
+        var nul = false
+        for k in 0..nk {
+            if lexdb_ops.isNull(&r[k]) { nul = true }
+            keyPart(mut &kb, &r[k])
+        }
+        if nul { continue }
+        let f = if lexdb_ops.isNull(&r[nk]) { 3 } else { 1 }
+        if keys.getOr(&kb, 0) < f { keys.put(kb.clone(), f) }
+    }
+}
+
+// The row engine's IN, EXISTS or NOT IN by such a level (vals: its keys'
+// values, then IN's x; keys: its hash's keys by keyPart, with inSummary's;
+// exists: an EXISTS's mark, the keys only).
+pub fn inProbe1(vals: &[]Val, nk: int, exists: bool, keys: &Map[str, int]): Val {
+    var kb = ""
+    for k in 0..nk {
+        if lexdb_ops.isNull(&vals[k]) { return Val.Bool(false) }
+        keyPart(mut &kb, &vals[k])
+    }
+    if exists { return Val.Bool(keys.get(&kb).isSome()) }
+    var sk = ""
+    sk.addByte(0)
+    sk += &kb
+    let f = keys.getOr(&sk, 0)
+    if f == 0 || lexdb_ops.isNull(&vals[nk]) { return inMark(f, true, false) }
+    keyPart(mut &kb, &vals[nk])
+    return inMark(f, false, keys.get(&kb).isSome())
+}
+
+// The probe of an optimizer 50 level (jl.na) over n rows (w the rows
+// gathered, kv their keys): NOT IN's rows whose IN is not false as its
+// matches (pj, pi -1: the anti join drops them), the others read; a mark's
+// every row once (pi its row of the batch made, cur, its mark in the last
+// column).
+fn naProbe(jl: &JL, kv: &[]BVec, w: &Batch, n: int, pj: mut &[]int, pi: mut &[]int, cur: mut &Batch,
+           c: mut &Counts): Result[Unit, DbErr] {
+    let mc = jl.ncol - 1
+    if jl.na != NA_NOTIN {
+        cur = lexdb_rows.newBatch(&jl.bp, n)
+        cur.n = n
+    }
+    var kb = ""
+    var sk = ""
+    for r in 0..n {
+        var res = Val.Bool(false)
+        var nul = false
+        kb.clear()
+        for k in 0..jl.nk {
+            let v = keyAt(jl, kv, w, k, r)
+            if lexdb_ops.isNull(&v) {
+                nul = true
+                break
+            }
+            keyPart(mut &kb, &v)
+        }
+        if !nul {
+            if jl.na == NA_MARK_EX {
+                res = Val.Bool(naBucket(jl, kv, w, r, &kb) >= 0)
+            } else {
+                var f = jl.sumAll
+                if jl.nk > 0 {
+                    sk.clear()
+                    sk.addByte(0)
+                    sk += &kb
+                    f = jl.gens.getOr(&sk, 0)
+                }
+                let x = keyAt(jl, kv, w, jl.nk, r)
+                let xNull = lexdb_ops.isNull(&x)
+                var found = false
+                if f > 0 && !xNull {
+                    keyPart(mut &kb, &x)
+                    found = naBucket(jl, kv, w, r, &kb) >= 0
+                }
+                res = inMark(f, xNull, found)
+            }
+        }
+        if jl.na == NA_NOTIN {
+            var drop = true
+            match res {
+                Val.Bool(b) { drop = b }
+                else {}
+            }
+            if drop {
+                append(pj, r)
+                append(pi, -1)
+            } else {
+                c.read += 1
+            }
+            continue
+        }
+        if !lexdb_rows.put(cur, mc, r, res, jl.rkinds[mc]) { return Err(batErr()) }
+        append(pj, r)
+        append(pi, r)
+    }
+    return Ok(Unit{})
+}
+
+// joinFrom at an optimizer 50 level j: its probe (naProbe), then the rows
+// it gives joined on, as joinFrom's tail.
+fn naFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+          at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
+          out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    let jl = &jr.jls[j]
+    let lv = jl.level
+    let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
+    let kv = try keyVecs(jl, &w)
+    var pj: []int = withCapacity(n)
+    var pi: []int = withCapacity(n)
+    try naProbe(jl, &kv, &w, n, mut &pj, mut &pi, mut &js.cur[j], mut &cnt[lv])
+    cnt[lv].starts += n
+    if one { return tailOne(st, txn, jr, js, tabs, j, at, &pj, &pi, cx, bud, cnt, out) }
+    let at2 = try joinTail(jr, js, j, at, n, &pj, pi, bud, cnt)
+    let n2 = len(at2[0])
+    return joinFrom(st, txn, jr, js, tabs, j + 1, at2, n2, cx, bud, cnt, false, out)
+}
+
+// The bucket of row r's whole key (kb: its keyPart encoding, JK_GEN) in an
+// optimizer 50 level's hash, by its mode; -1 none.
+fn naBucket(jl: &JL, kv: &[]BVec, w: &Batch, r: int, kb: &str): int {
+    if jl.mode == JK_INT {
+        if kv[0].nul[r] { return -1 }
+        return jl.ints.getOr(&kv[0].v[r], -1)
+    }
+    if jl.mode == JK_TEXT {
+        match keyAt(jl, kv, w, 0, r) {
+            Val.Text(x) { return jl.txts.getOr(&x, -1) }
+            else { return -1 }
+        }
+    }
+    return jl.gens.getOr(kb, -1)
 }
 
 // The rest of a chunk's join from level j: at, per level before it, its
@@ -5536,6 +5748,8 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
     let jl = &jr.jls[j]
     let lv = jl.level
     if jl.cross && !one { return crossFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, out) }
+    // a null-aware anti join or a mark join (optimizer 50)
+    if jl.na != 0 { return naFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, one, out) }
     let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
     let kv = try keyVecs(jl, &w)
     var pj: []int = withCapacity(n)
@@ -7076,6 +7290,8 @@ fn decoded(p: &lexdb_plan.PPlan, want: mut &[]bool) {
             decoded(&i, want)
             if j.how == lexdb_plan.JH_JOIN { decodedAll(&j.sub[0], want) }
             for c in 0..len(j.scan.need) { if j.scan.need[c] && j.mark == lexdb_plan.MK_JOIN { want[j.scan.first + c] = true } }
+            // a mark join's mark (optimizer 50)
+            if (j.mark == lexdb_plan.MK_MARK_EX || j.mark == lexdb_plan.MK_MARK_IN) && len(j.scan.need) > 0 { want[j.scan.first + len(j.scan.need) - 1] = true }
         }
         lexdb_plan.PPlan.Filter(i, _) { decoded(&i, want) }
         lexdb_plan.PPlan.Scan(sc, _) { for c in 0..len(sc.need) { if sc.need[c] { want[sc.first + c] = true } } }
