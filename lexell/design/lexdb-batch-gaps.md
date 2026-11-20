@@ -366,7 +366,8 @@ the suite rerun) before review.
 |---|---|---|
 | 1 + 2 | | not started |
 | 3 | | not started |
-| 4 + 5 | | not started |
+| 4 | `worktree-agent-adb56b613f1267a19`, 511ee7d2 | done, awaiting review: `#tdiv`/`#tavg` are `lexdb_lib` entries (`tdivFn`, `tavgFn`; eval calls `tdiv`/`tavg` direct), bound by `fnRefOf`; test `exec_tsqlbatch`. Left: reg casts (`::regclass`, `::regtype`): `regCast` reads the catalog through the session's `SeqEnv`, which `Ctx`/`Up` do not carry (stateless entries; workers' contexts would each need one) |
+| 5 | `worktree-agent-adb56b613f1267a19`, 8b6a488f | done, awaiting review: `bSubNode`/`condSubVals`/`subOnce`/`subCalls` in `lexdb_exec`: a first-table condition holding an uncorrelated scalar subquery, NOT IN, `x op ANY/ALL (subquery)` or EXISTS binds with `bindSubs` over the values `prepareIn` copies into `Mats.ce.subs`; test `exec_subbatch`. Left: a positive IN / `= ANY` (subquery) is a semi join level, not a condition, so unchanged; conditions of later levels (`post`, k > 0) |
 | 6 | | not started |
 | 7 | | not started |
 | 8 | | not started |
