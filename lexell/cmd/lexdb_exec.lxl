@@ -11313,8 +11313,8 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     // the logical plan (read by nothing yet): the source joined to the target its source
     let lp = lexdb_bind.LPlan.Merge(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
-    // its source join in batches (Query.jp), but a RIGHT or FULL join's (BY SOURCE) rows
-    if !keepsRight(q.levels[tl].join) { levelsProgQ(mut &q, true) }
+    // its source join in batches (Query.jp; a BY SOURCE's RIGHT or FULL join too)
+    levelsProgQ(mut &q, true)
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
@@ -12301,20 +12301,16 @@ fn filterOver(ps: lexdb_plan.PScan, cs: []BX, subs: []lexdb_plan.PSub): lexdb_pl
 fn joinsOver(q: &Query, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_plan.PPlan] {
     let l0 = &q.levels[0]
     var p = base
-    var rights = 0
     for k in 1..len(q.levels) {
         let lv = &q.levels[k]
         let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
-        let rj = lv.join == lexdb_sql.J_RIGHT
+        let rj = keepsRight(lv.join)
         if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 { return Err(p) }
         if lv.src >= 0 && lazySeries(q, lv.src) { return Err(p) }
         if inner && len(lv.post) > 0 { return Err(p) }
         if q.corr && pathCorr(&lv.path) { return Err(p) }
-        // (a RIGHT JOIN: hashed, one at most)
-        if rj {
-            rights += 1
-            if lv.perRow || rights > 1 { return Err(p) }
-        }
+        // (a RIGHT or FULL JOIN: hashed, each with its own marks of the rows that joined)
+        if rj && lv.perRow { return Err(p) }
         let mark = if lv.anti { lexdb_plan.MK_ANTI } else if lv.semi || lv.semiSub >= 0 { lexdb_plan.MK_SEMI } else { lexdb_plan.MK_JOIN }
         let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
@@ -12339,7 +12335,10 @@ fn joinsOver(q: &Query, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_
                     None { return Err(p) }
                 }
             }
-            if len(lv.hashCols) == 0 || len(lv.hashVals) != len(lv.hashCols) { return Err(p) }
+            // (no key: an inner join of every pair, its conditions per pair)
+            if len(lv.hashCols) == 0 {
+                if !inner || mark != lexdb_plan.MK_JOIN || lv.resNot { return Err(p) }
+            } else if len(lv.hashVals) != len(lv.hashCols) { return Err(p) }
             for hk in lv.hashKinds { if hk != lexdb_sql.COLL_EXACT { return Err(p) } }
             for i in 0..len(lv.hashCols) {
                 append(mut &j.hcols, lv.hashCols[i])
