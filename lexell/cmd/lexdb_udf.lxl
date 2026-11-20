@@ -1,0 +1,176 @@
+// lexdb_udf: a T-SQL scalar function's body, run for one call (design/lexdb-dialect-gaps.md, package F, slice F2).
+//
+// CREATE FUNCTION is read by lexdb_tsqlparse, which compiles the body (DECLARE, SET, SELECT @v = ..., IF, WHILE, BREAK,
+// CONTINUE, RETURN) to a short program of this module's ops and keeps it as text in the routine (Routine.code). A query
+// that calls the function reaches it as Call("#udf", [name, arguments]) in the evaluator, which calls run here: each op's
+// expression is read back (lexdb_parse.parseExpr), its calls of other functions of the user's written out
+// (lexdb_routine.resolveUdf) and evaluated by the caller's own evaluator (ev) over the program's variables. The body
+// needs no session: what it may do is what SQL Server lets a function do (no writes, no rows to the client), and a body
+// that reads tables is compiled to an op that says so (a later slice runs those).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_parse"
+import "./lexdb_catalog"
+import "./lexdb_routine"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type TypeName = lexdb_sql.TypeName
+type DbErr = lexdb_base.DbErr
+type Routine = lexdb_sql.Routine
+
+pub const OP_SET = 1        // variable k := the expression
+pub const OP_JF = 2         // jump to op l unless the expression is true
+pub const OP_JMP = 3        // jump to op l
+pub const OP_RET = 4        // the function's value: the expression
+pub const OP_ERR = 5        // raise: k its SQL Server number (0: lexdb's 0A000), text its message
+
+// One op: its code, variable or error number k, jump target l, and the expression's text (exprText), or an error's message.
+pub type Op = record { pub code: int; pub k: int; pub l: int; pub text: str }
+
+// A compiled body: the types of its variables (the function's parameters first, then those it declares) and its ops.
+pub type Prog = record { pub types: []TypeName; pub ops: []Op }
+
+fn esc(s: &str): str {
+    var out = ""
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '\\' { out += "\\\\" }
+        else if c == '\n' { out += "\\n" }
+        else if c == '\t' { out += "\\t" }
+        else if c == '\r' { out += "\\r" }
+        else { out.addByte(c) }
+    }
+    return out
+}
+
+fn unesc(s: &str): str {
+    var out = ""
+    var i = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == '\\' && i + 1 < len(s) {
+            let d = s[i + 1]
+            if d == 'n' { out.addByte('\n') }
+            else if d == 't' { out.addByte('\t') }
+            else if d == 'r' { out.addByte('\r') }
+            else { out.addByte(d) }
+            i += 2
+        } else {
+            out.addByte(c)
+            i += 1
+        }
+    }
+    return out
+}
+
+// T-SQL's + (the operator "t+": numbers added and strings joined) has no spelling lexdb_parse reads back: it is written as a
+// call of #tplus, and read again as the operator.
+fn swapPlus(x: &Expr, out: bool): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), swapPlus(&a, out)) }
+        Expr.Bin(op, a, b) {
+            let l = swapPlus(&a, out)
+            let r = swapPlus(&b, out)
+            if out && op == "t+" { return Expr.Call("#tplus", [l, r], false) }
+            return Expr.Bin(op.clone(), l, r)
+        }
+        Expr.IsNull(a, neg) { return Expr.IsNull(swapPlus(&a, out), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(swapPlus(&a, out), t) }
+        Expr.Call(n, args, star) {
+            var xs: []Expr = []
+            for a in args { append(mut &xs, swapPlus(&a, out)) }
+            if !out && n == "#tplus" && len(xs) == 2 {
+                let r = pop(mut &xs)
+                let l = pop(mut &xs)
+                return Expr.Bin("t+", l, r)
+            }
+            return Expr.Call(n.clone(), xs, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// An expression as the text an op keeps it as.
+pub fn exprOut(x: &Expr): str { return lexdb_sql.exprText(&swapPlus(x, true)) }
+
+// The program as text: a line of the variables' types, then a line a op.
+pub fn encode(p: &Prog): str {
+    var ts: []str = []
+    for t in p.types { append(mut &ts, lexdb_catalog.typeStr(&t)) }
+    var out = strings.join(&ts, ";") + "\n"
+    for o in p.ops { out += o.code.toStr() + "\t" + o.k.toStr() + "\t" + o.l.toStr() + "\t" + esc(&o.text) + "\n" }
+    return out
+}
+
+pub fn decode(code: &str): Prog {
+    var p = Prog{types: [], ops: []}
+    let lines = strings.split(code, "\n")
+    if len(lines) == 0 { return p }
+    if len(lines[0]) > 0 { for t in strings.split(&lines[0], ";") { append(mut &p.types, lexdb_catalog.strType(&t)) } }
+    for i in 1..len(lines) {
+        if len(lines[i]) == 0 { continue }
+        let f = strings.split(&lines[i], "\t")
+        if len(f) < 4 { continue }
+        append(mut &p.ops, Op{code: lexdb_base.num(&f[0]), k: lexdb_base.num(&f[1]), l: lexdb_base.num(&f[2]), text: unesc(&f[3])})
+    }
+    return p
+}
+
+// A value as a variable or parameter of type t holds it: text cut to its length (SQL Server's), then converted.
+pub fn fit(v: Val, t: &TypeName): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&v) { return Ok(Val.Null) }
+    var x = v
+    match x {
+        Val.Text(tx) {
+            if t.kind == lexdb_sql.K_TEXT && t.len > 0 && len(tx) > t.len { x = Val.Text(tx[0..t.len].toStr()) }
+        }
+        else {}
+    }
+    return lexdb_ops.coerce(x, t)
+}
+
+// The function rt called with args (one per parameter, in order): its program run, ev the caller's evaluator of an
+// expression over the program's variables, lookup the functions of the user's it calls in turn.
+pub fn run(rt: &Routine, args: &[]Val, ev: &fn(&Expr, &[]Val): Result[Val, DbErr], lookup: &fn(&str): Option[Routine]): Result[Val, DbErr] {
+    let prog = decode(&rt.code)
+    var vals: []Val = array(len(prog.types), Val.Null)
+    for i in 0..len(rt.params) {
+        if i < len(args) && i < len(vals) { vals[i] = try fit(args[i].clone(), &prog.types[i]) }
+    }
+    var xs: []Expr = []
+    var have: []bool = []
+    for o in prog.ops {
+        append(mut &xs, Expr.Lit(Val.Null))
+        append(mut &have, false)
+    }
+    var pc = 0
+    while pc < len(prog.ops) {
+        let op = &prog.ops[pc]
+        if op.code == OP_JMP {
+            pc = op.l
+            continue
+        }
+        if op.code == OP_ERR {
+            let state: str = if op.k == 0 { "0A000" } else { "TS" + op.k.toStr() }
+            return Err(lexdb_base.err(&state, &op.text))
+        }
+        if !have[pc] {
+            let parsed = swapPlus(&(try lexdb_parse.parseExpr(&op.text)), false)
+            xs[pc] = try lexdb_routine.resolveUdf(&parsed, lookup)
+            have[pc] = true
+        }
+        let v = try ev(&xs[pc], &vals)
+        if op.code == OP_SET {
+            vals[op.k] = try fit(v, &prog.types[op.k])
+            pc += 1
+        } else if op.code == OP_JF {
+            if lexdb_ops.truth(&v) == Some(true) { pc += 1 } else { pc = op.l }
+        } else {
+            return fit(v, &rt.ret)
+        }
+    }
+    return Ok(Val.Null)
+}

@@ -144,6 +144,7 @@ Queue (pairs that touch different files):
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
 | E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
 | F | `worktree-agent-a5c6d6b7ae9c4bd2c` | merged F1 (e2c93002; TPC-H 1.003 of fdee644f alternated, checksums equal; point selects +0.6% instructions, fixed: see open points); slice F1 done 2026-11-20 (not merged): `8d2ee116` (the routine record, T-SQL procedures, PostgreSQL functions and procedures), `b082a983` (DROP SCHEMA, Describe, Oracle's kind clash, tests), `7908d6e3` (a procedure called by name over TDS), `d4f23aea` (OBJECTPROPERTY, refusals), merge of main `a0607c4a`; suite green on the merged tree; section 7. Later slices: T-SQL functions (scalar, inline table-valued) and `OUTPUT ... INTO @table_variable` (S12), PostgreSQL's set-returning SQL functions and table-reading bodies over columns, GRANT EXECUTE |
+| F2 | `worktree-agent-a41e5e133714c96b3` | slice F2 done 2026-11-20 (not merged; merged with main 0c7dbe94, suite 236 of 236): `81640550` (functions and OUTPUT INTO), `efc9794c` (merge of main), `7f85e2a6` (last row of a SELECT @v, tests, notes), then this note; T-SQL scalar and inline table-valued functions, `OUTPUT ... INTO` (S12); section 7a. Tests `tds_func` (SQL Server 2022), `tds_output` (SQL Server 2022), `tds_funcbatch`, `tds_funcgaps`. Left for F2 (7a): multi-statement table-valued functions, a function in a column DEFAULT, CHECK, index or view, a table-reading function with a loop, cursors, EXEC of a function. Left for F3: `GRANT EXECUTE` and routine permissions (any role that reaches the schema runs one), PostgreSQL's set-returning functions and `RETURNS TABLE`, `pg_get_functiondef` and `pg_get_function_arguments`, `information_schema.routines`, `sp_stored_procedures` and `sp_sproc_columns` (JDBC's getProcedures), Oracle PL/SQL functions of a column in a query |
 
 ## 5. Package A: what was done
 
@@ -419,6 +420,70 @@ open at that moment was left out after it committed (every session then got 4288
 must only ever hold more names than some transaction can see, never fewer: a function made before the list
 exists is now kept aside and merged when the list is built (`noteFunction`, `loadNames`). Definitions
 themselves were always transactional (catalog rows; calls resolve through the caller's transaction).
+
+## 7a. Package F, slice F2: what was done
+
+**T-SQL functions (S4).** `CREATE [OR ALTER] FUNCTION` and `ALTER FUNCTION` are read whole, like procedures, by
+`lexdb_tsqlparse.funcBatch` (the header: `lexdb_parse.funcHeader`: parameters with defaults, `RETURNS type | TABLE |
+@t TABLE (...)`, `WITH` options, an optional `AS`); the routine is the F1 record (kind function; `attrs` says `scalar`,
+`inline` or `multi`, then `schemabinding`, `reads` and one `calls:key` for each function its body calls). A body is read at
+CREATE to check it and refused as SQL Server refuses it: 443 (PRINT, RAISERROR, THROW, TRY, BEGIN TRAN, DML on anything but a
+table variable, EXECUTE string, SET ...), 444 (a SELECT that gives rows), 2772 (#temporary tables), 154 (USE), 455 (the last
+statement not a RETURN), 1075 and 178 (a RETURN with or without value), 135/136, 134/137, 111 (not first in the batch), 2714,
+2010 (ALTER of the other kind), 208 (ALTER of nothing); `OBJECT_DEFINITION`/`sys.sql_modules` give the text as SQL Server
+does. `DROP FUNCTION [IF EXISTS] a, b` (3701, 3705 for a procedure, and DROP PROCEDURE of a function). Catalogs: `sys.objects`
+`FN`/`IF`/`TF`, `sys.sql_modules`, `sys.parameters` (a scalar function's result is its parameter 0), `OBJECT_ID(name, 'FN')`,
+`OBJECTPROPERTY(IsScalarFunction | IsTableFunction | IsInlineFunction)`.
+
+*Calls.* The parser names `schema.f(args)` a call "schema.f" and marks the statement (`Stmt.udf`; DEFAULT is `#default`; the old
+`dbo.f` that dropped the schema is gone: SQL Server says 4121 for `dbo.len(x)` too). Only a marked statement costs anything: its
+`Session.inlineFunctions` branch is a flag test ahead of PostgreSQL's cache check, so a statement that calls none is as before.
+`lexdb_routine.tsqlCalls` writes a marked statement out (4121, 313, 8144, 208 and 317 for what SQL Server gives them):
+
+- a scalar function that only computes: `Cast(#udf("key", arguments), result type)`. The evaluator (`lexdb_exec.udfEval`) finds
+  the function in the session's memo (`udfKey`, published by `tsqlFunctions` from the caller's transaction, so what an open
+  transaction made or dropped is its own) and runs its program with `lexdb_udf.run`. The program is the body compiled at CREATE
+  (`lexdb_tsqlparse.genFunc`: SET, JF, JMP, RET, ERR ops with each expression as `exprText`, kept in `Routine.code`), run over
+  variables by the caller's `eval`: DECLARE, SET, SELECT @v = ..., IF, WHILE, BREAK, CONTINUE, RETURN, recursion to SQL Server's
+  nesting limit of 32 (217; the depth rides as a last, unnumbered parameter, as a statement's evaluation may run on several
+  tasks), calls of other functions, any builtin. The program is read back (parseExpr) at each call; 3,000 calls of a body with a
+  loop cost 0.3 s.
+- a function that reads tables (`SELECT @r = b FROM t WHERE a = @a`, `RETURN (SELECT ...)`), or calls one, has no program: it is
+  written as a scalar subquery of the statement (`lexdb_tsqlfunc.query`, given to lexdb_exec once by `lexdb_tds` through
+  `setUdfQuery`: core does not import a dialect). The body is run symbolically: a variable is the expression it was last given, an
+  IF a CASE over the rest of the body in each branch, a SELECT @v = ... FROM a scalar subquery (of several rows SQL Server keeps the last: the
+  query's order reversed and its first row taken), RETURN the result. A call's column argument comes through a derived table of one row
+  (`FROM (SELECT arg AS __a0) __uN`), so no name in the body can capture it (the outer `t` of `dbo.f(t.a)` against the body's own
+  `t`). A WHILE in such a body is refused (0A000).
+- an inline table-valued function in FROM (`FROM dbo.f(args) [AS x]`, also `f(args)` without the schema, as SQL Server allows,
+  CROSS and OUTER APPLY, JOIN, IN/EXISTS subqueries, defaults through DEFAULT): `lexdb_routine.inlineTvf` replaces the item by the
+  function's query with the arguments put in (constants as they are, others through the one-row derived table placed before it as
+  a lateral item).
+
+**OUTPUT ... INTO (S12).** `OUTPUT list INTO target [(columns)]` for INSERT, UPDATE, DELETE and MERGE (`lexdb_parse.outputList`:
+the target in `Stmt.outInto`, its columns in `outCols`; the list is RETURNING's, `$action`, `inserted.`, `deleted.` as before):
+`lexdb_tsql.outputInto` inserts the rows the statement returned into the target (a table variable, a #temporary table or a
+table) in the statement's own transaction (begun when there is none), so a failing insert undoes the statement; the statement
+returns no result set, its count is the rows it changed. 208 (before the statement), 1087 (an undeclared table variable), 120,
+121, 213 for the lists, and the insert's own errors (245, 2627, 2628, 515).
+
+**Tests.** `tds_func` (184 batches, answers from SQL Server 2022: gen_mssql.py `func`), `tds_output` (42, `output`),
+`tds_funcbatch` (3,000 rows, batches on and off, same answers, and the lines equal SQL Server's run of the same file),
+`tds_funcgaps` (by hand: two connections, a function made, dropped and replaced in an open transaction seen or not by the other; what
+is refused). `tds_ddlgaps`'s CREATE [OR ALTER] FUNCTION lines changed: the functions are made now.
+
+**Left (F2).** Multi-statement table-valued functions (`RETURNS @t TABLE`: read, checked, kept as `TF`, called: 0A000 "not supported
+yet"); a function of the user's in a column DEFAULT, CHECK, computed column, index or view (0A000: those are kept as text and read
+again by the PostgreSQL parser: they need the `#udf` form in the catalog); a function that reads tables called per row from another
+function's loop, a reads function with a WHILE, `GROUP BY dbo.f(col)` of one that reads tables (the subquery's column is not the
+grouped one); cursors (`DECLARE @c CURSOR`), `@@NESTLEVEL` and the other system variables in a body, EXEC of a function (2812: SQL
+Server runs it), SCHEMABINDING checks (4513), 195 for an unknown builtin in a body at CREATE (SQL Server finds it compiling; lexdb
+at the first call), the 3705/3701 partial effect of `DROP FUNCTION a, b` (SQL Server drops a before it fails on b), `OUTPUT x INTO @t
+OUTPUT y` (both clauses: 0A000), sys.columns rows for a table-valued function, a program parsed again at each call (a cache would
+make a loop-heavy function a few times faster). PostgreSQL and Oracle: PostgreSQL has no OUTPUT INTO (`RETURNING` into a variable
+is PL/pgSQL; its writable CTEs are refused in lexdb as before); Oracle has `RETURNING ... INTO` in PL/SQL and through OCI binds
+(`tns_binds`), unchanged; an Oracle PL/SQL function of a column in a query is still refused (`lexdb_plsql.expandCalls` takes
+constants only): a gap, not small.
 
 ## 8. Package C: what was done
 

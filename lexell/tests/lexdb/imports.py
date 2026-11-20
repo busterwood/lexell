@@ -40,13 +40,13 @@ CORE = {
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
-    "lexdb_store", "lexdb_time", "lexdb_window",
+    "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
 }
 
 PG_DATA = {"lexdb_pgdata"}
 PG_BEHAVIOR = {"lexdb_pg", "lexdb_pgcat"}
 SYS_DATA = {"lexdb_sysdata"}
-SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsql", "lexdb_tsqlparse"}
+SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsql", "lexdb_tsqlparse", "lexdb_tsqlfunc"}
 ORA_DATA = {"lexdb_oradata"}
 ORA_BEHAVIOR = {"lexdb_oracat", "lexdb_orafn", "lexdb_oraadm", "lexdb_oratext", "lexdb_plsql"}
 PROTO = {"lexdb_wire", "lexdb_tds", "lexdb_tns", "lexdb_auth"}

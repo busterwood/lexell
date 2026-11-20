@@ -15,6 +15,8 @@ import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_parse"
+import "./lexdb_udf"
+import "./lexdb_routine"
 
 type DbErr = lexdb_base.DbErr
 type TypeName = lexdb_sql.TypeName
@@ -444,7 +446,8 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
         if t.text == "return" {
             q.skip(1)
             var ts = tstmt(TS_RETURN)
-            if !atEnd(q) && (q.peek().kind == lexdb_parse.T_NUM || q.peek().kind == lexdb_parse.T_VAR || q.isKw("(") || q.isKw("-")) {
+            // (a value: what is not the next statement's start; a function's RETURN may give any expression)
+            if !atEnd(q) && !(q.peek().kind == lexdb_parse.T_IDENT && lexdb_parse.isTsqlStart(&q.peek().text)) {
                 q.fresh()
                 let x = try q.expr()
                 append(mut &ts.stmt, q.values([x]))
@@ -553,7 +556,12 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
         }
     }
     var ts = tstmt(TS_SQL)
-    append(mut &ts.stmt, try q.statement())
+    let one = try q.statement()
+    // a function of the user's in what is kept as text and read again by the other parser (a default, a CHECK, a view): later
+    if one.udf && (one.kind == lexdb_sql.S_CREATE || one.kind == lexdb_sql.S_ALTER || one.kind == lexdb_sql.S_CREATE_VIEW || one.kind == lexdb_sql.S_CREATE_INDEX) {
+        return Err(lexdb_base.err("0A000", "lexdb: a function of the user's in a column default, a CHECK constraint, a computed column, an index or a view is not supported yet"))
+    }
+    append(mut &ts.stmt, one)
     return Ok(ts)
 }
 
@@ -801,7 +809,328 @@ pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBat
         Some(b) { return Ok(b) }
         None {}
     }
+    match try funcBatch(sql0, d) {
+        Some(b) { return Ok(b) }
+        None {}
+    }
     return parseStmts(sql0, d, vars)
+}
+
+fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+
+fn sideEffect(what: &str): DbErr { return tsErr(443, &("Invalid use of a side-effecting operator '" + what + "' within a function.")) }
+
+// A function body's statements as SQL Server compiles them: what a function may not do (443 side effects, 444 a SELECT that
+// gives rows, 2772 #temporary tables, 154 USE), and a RETURN's value (1075 for a scalar function's without one, 178 for a
+// table-valued function's with one). Writes to table variables (#tv_...) are allowed. multi: a multi-statement table-valued
+// function's.
+fn checkBody(ts: &[]TStmt, multi: bool): Result[Unit, DbErr] {
+    for t in ts {
+        let k = t.kind
+        if k == TS_BLOCK { try checkBody(&t.body, multi) }
+        else if k == TS_IF || k == TS_WHILE {
+            try checkBody(&t.body, multi)
+            try checkBody(&t.els, multi)
+        }
+        else if k == TS_TRY { return Err(sideEffect("BEGIN TRY")) }
+        else if k == TS_PRINT { return Err(sideEffect("PRINT")) }
+        else if k == TS_RAISERROR { return Err(sideEffect("RAISERROR")) }
+        else if k == TS_THROW { return Err(sideEffect("THROW")) }
+        else if k == TS_BEGIN { return Err(sideEffect("BEGIN TRANSACTION")) }
+        else if k == TS_COMMIT { return Err(sideEffect("COMMIT TRANSACTION")) }
+        else if k == TS_ROLLBACK { return Err(sideEffect("ROLLBACK TRANSACTION")) }
+        else if k == TS_SAVE { return Err(sideEffect("SAVEPOINT")) }
+        else if k == TS_EXECSTR { return Err(sideEffect("EXECUTE STRING")) }
+        else if k == TS_INSERTBULK { return Err(sideEffect("INSERT BULK")) }
+        else if k == TS_INSERTEXEC { return Err(sideEffect("INSERT")) }
+        else if k == TS_SETOPT {
+            if len(t.names) > 0 && t.names[0] == "identity_insert" { return Err(sideEffect("SET IDENTITY_INSERT " + strings.toUpperAscii(&t.value))) }
+            return Err(sideEffect("SET OPTION " + (if t.value == "off" { "OFF" } else { "ON" })))
+        }
+        else if k == TS_USE { return Err(tsErr(154, "a USE database statement is not allowed in a procedure, function or trigger.")) }
+        else if k == TS_RETURN {
+            if len(t.stmt) == 0 && !multi { return Err(tsErr(1075, "RETURN statements in scalar valued functions must include an argument.")) }
+            if len(t.stmt) > 0 && multi { return Err(tsErr(178, "A RETURN statement with a return value cannot be used in this context.")) }
+        }
+        else if k == TS_SQL {
+            let s = &t.stmt[0]
+            let tv = strings.startsWith(&s.table, "#tv_")
+            if s.kind == lexdb_sql.S_SELECT {
+                if len(s.into) > 0 { return Err(tsErr(2772, "Cannot access temporary tables from within a function.")) }
+                if len(s.assign) == 0 { return Err(tsErr(444, "Select statements included within a function cannot return data to a client.")) }
+            }
+            else if s.kind == lexdb_sql.S_INSERT && !tv { return Err(sideEffect("INSERT")) }
+            else if s.kind == lexdb_sql.S_UPDATE && !tv { return Err(sideEffect("UPDATE")) }
+            else if s.kind == lexdb_sql.S_DELETE && !tv { return Err(sideEffect("DELETE")) }
+            else if s.kind == lexdb_sql.S_MERGE && !tv { return Err(sideEffect("MERGE")) }
+            else if s.kind == lexdb_sql.S_CREATE && !tv && strings.startsWith(&s.table, "#") { return Err(tsErr(2772, "Cannot access temporary tables from within a function.")) }
+            else if s.kind == lexdb_sql.S_DROP && !tv { return Err(sideEffect("DROP OBJECT")) }
+            else if s.kind == lexdb_sql.S_TRUNCATE { return Err(sideEffect("TRUNCATE TABLE")) }
+            else if s.kind != lexdb_sql.S_INSERT && s.kind != lexdb_sql.S_UPDATE && s.kind != lexdb_sql.S_DELETE && s.kind != lexdb_sql.S_MERGE &&
+                    s.kind != lexdb_sql.S_CREATE && s.kind != lexdb_sql.S_DROP && s.kind != lexdb_sql.S_EMPTY { return Err(sideEffect("DDL")) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---- a scalar function's body, compiled (lexdb_udf)
+
+type Gen = record { ops: []lexdb_udf.Op; vars: []str; reads: bool }
+
+fn varAt(g: &Gen, name: &str): int {
+    for i in 0..len(g.vars) { if g.vars[i] == name { return i } }
+    return -1
+}
+
+fn emit(g: mut &Gen, code: int, k: int, l: int, text: &str): int {
+    append(mut &g.ops, lexdb_udf.Op{code: code, k: k, l: l, text: text.toStr()})
+    return len(g.ops) - 1
+}
+
+// A statement that reads tables or has subqueries: the evaluator cannot run it per call (a later slice does).
+fn readsTables(s: &Stmt): bool { return len(s.from) > 0 || len(s.subs) > 0 || len(s.inner) > 0 || len(s.wins) > 0 }
+
+fn firstExpr(s: &Stmt): Expr {
+    if len(s.items) > 0 {
+        match s.items[0].expr {
+            Some(x) { return lexdb_sql.cloneExpr(&x) }
+            None {}
+        }
+    }
+    return Expr.Lit(lexdb_sql.Val.Null)
+}
+
+// IF's and WHILE's condition: the expression inside the SELECT CASE WHEN cond THEN 1 ELSE 0 the parser made of it.
+fn condOf(s: &Stmt): Expr {
+    let x = firstExpr(s)
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "case else" && len(args) == 3 { return lexdb_sql.cloneExpr(&args[0]) }
+        }
+        else {}
+    }
+    return x
+}
+
+fn genRaise(g: mut &Gen, n: int, msg: &str) { let k = emit(g, lexdb_udf.OP_ERR, n, 0, msg) }
+
+fn genReads(g: mut &Gen) {
+    g.reads = true
+    genRaise(g, 0, "lexdb: a function that reads tables is not supported yet in this place (only a call with constant arguments, in a statement of its own, reads them)")
+}
+
+fn genStmts(g: mut &Gen, ts: &[]TStmt, inLoop: bool, top: int, brk: mut &[]int): Result[Unit, DbErr] {
+    for t in ts {
+        let k = t.kind
+        if k == TS_BLOCK {
+            try genStmts(g, &t.body, inLoop, top, brk)
+        } else if k == TS_DECLARE {
+            for i in 0..len(t.names) {
+                let idx = varAt(g, &t.names[i])
+                var done = false
+                for s in t.stmt {
+                    if len(s.assign) > 0 && s.assign[0] == t.names[i] {
+                        done = true
+                        if readsTables(&s) { genReads(g) } else { let o = emit(g, lexdb_udf.OP_SET, idx, 0, &lexdb_udf.exprOut(&firstExpr(&s))) }
+                    }
+                }
+                if !done { let o = emit(g, lexdb_udf.OP_SET, idx, 0, "null") }
+            }
+        } else if k == TS_SQL {
+            let s = &t.stmt[0]
+            if s.kind == lexdb_sql.S_SELECT && len(s.assign) > 0 {
+                if readsTables(s) { genReads(g) } else {
+                    for i in 0..len(s.assign) {
+                        if len(s.assign[i]) == 0 || i >= len(s.items) { continue }
+                        match s.items[i].expr {
+                            Some(x) { let o = emit(g, lexdb_udf.OP_SET, varAt(g, &s.assign[i]), 0, &lexdb_udf.exprOut(&x)) }
+                            None {}
+                        }
+                    }
+                }
+            } else {
+                genRaise(g, 0, "lexdb: this statement is not supported in a function yet")
+            }
+        } else if k == TS_IF {
+            let c = &t.stmt[0]
+            if readsTables(c) { genReads(g) } else {
+                let jf = emit(g, lexdb_udf.OP_JF, 0, 0, &lexdb_udf.exprOut(&condOf(c)))
+                try genStmts(g, &t.body, inLoop, top, brk)
+                if len(t.els) > 0 {
+                    let j = emit(g, lexdb_udf.OP_JMP, 0, 0, "")
+                    g.ops[jf].l = len(g.ops)
+                    try genStmts(g, &t.els, inLoop, top, brk)
+                    g.ops[j].l = len(g.ops)
+                } else {
+                    g.ops[jf].l = len(g.ops)
+                }
+            }
+        } else if k == TS_WHILE {
+            let c = &t.stmt[0]
+            if readsTables(c) { genReads(g) } else {
+                let top2 = len(g.ops)
+                let jf = emit(g, lexdb_udf.OP_JF, 0, 0, &lexdb_udf.exprOut(&condOf(c)))
+                var brk2: []int = []
+                try genStmts(g, &t.body, true, top2, mut &brk2)
+                let back = emit(g, lexdb_udf.OP_JMP, 0, top2, "")
+                g.ops[jf].l = len(g.ops)
+                for b in brk2 { g.ops[b].l = len(g.ops) }
+            }
+        } else if k == TS_BREAK {
+            if !inLoop { return Err(tsErr(135, "Cannot use a BREAK statement outside the scope of a WHILE statement.")) }
+            append(brk, emit(g, lexdb_udf.OP_JMP, 0, 0, ""))
+        } else if k == TS_CONTINUE {
+            if !inLoop { return Err(tsErr(136, "Cannot use a CONTINUE statement outside the scope of a WHILE statement.")) }
+            let j = emit(g, lexdb_udf.OP_JMP, 0, top, "")
+        } else if k == TS_RETURN {
+            if len(t.stmt) > 0 {
+                if readsTables(&t.stmt[0]) { genReads(g) } else { let o = emit(g, lexdb_udf.OP_RET, 0, 0, &lexdb_udf.exprOut(&firstExpr(&t.stmt[0]))) }
+            }
+        } else if k == TS_EXEC {
+            genRaise(g, 557, "Only functions and some extended stored procedures can be executed from within a function.")
+        } else {
+            genRaise(g, 0, "lexdb: this statement is not supported in a function yet")
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Whether a body calls a function of the user's (a schema-qualified call: Call "schema.f").
+fn callsUdf(ts: &[]TStmt, out: mut &[]str) {
+    for t in ts {
+        callsUdf(&t.body, out)
+        callsUdf(&t.els, out)
+        for s in t.stmt {
+            if !s.udf { continue }
+            let x = lexdb_routine.mapStmt(&s, fn(y: &Expr): Option[Expr] {
+                match y {
+                    Expr.Call(n, args, star) {
+                        if strings.contains(&n, ".") || strings.contains(&n, lexdb_sql.QSEP) {
+                            let k = lexdb_routine.tsqlKey(&n)
+                            if !lexdb_base.hasStr(out, &k) { append(out, k) }
+                        }
+                    }
+                    else {}
+                }
+                return None
+            })
+        }
+    }
+}
+
+// The program of a scalar function whose body is b (parsed with its parameters r.params as its first variables).
+fn genFunc(r: &lexdb_sql.Routine, b: &TBatch, reads: mut &bool): Result[lexdb_udf.Prog, DbErr] {
+    var g = Gen{ops: [], vars: b.vars.clone(), reads: false}
+    var brk: []int = []
+    try genStmts(mut &g, &b.stmts, false, 0, mut &brk)
+    reads = g.reads
+    var types: []TypeName = []
+    for p in r.params { append(mut &types, p.typ) }
+    for t in b.types { append(mut &types, t) }
+    while len(types) < len(g.vars) { append(mut &types, TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}) }
+    return Ok(lexdb_udf.Prog{types: types, ops: g.ops})
+}
+
+// CREATE [OR ALTER] FUNCTION name (parameters) RETURNS ... AS body, or ALTER FUNCTION: the batch it is, else None. A scalar
+// or multi-statement function's body is BEGIN ... END, an inline table-valued function's RETURN [(] SELECT ... [)] (kept
+// without its parentheses). The body is read here to check it (a syntax error or a statement a function may not have makes
+// nothing: 102/156, 443, 444, 455 ...) and kept as text.
+fn funcBatch(sql: &str, d: lexdb_parse.Dialect): Result[Option[TBatch], DbErr] {
+    let low = strings.toLowerAscii(sql)
+    if !strings.contains(&low, "function") { return Ok(None) }
+    let none: []str = []
+    var q = match lexdb_parse.tsqlParser(sql, d, &none) {
+        Ok(x) { x }
+        Err(_) { return Ok(None) }
+    }
+    let first = q.peek().clone()
+    if first.kind != lexdb_parse.T_IDENT || (first.text != "create" && first.text != "alter") { return Ok(None) }
+    let create = first.text == "create"
+    var k = 1
+    var orAt = -1
+    var alterAt = -1
+    if create && q.peekAt(1).kind == lexdb_parse.T_IDENT && q.peekAt(1).text == "or" && q.peekAt(2).kind == lexdb_parse.T_IDENT && q.peekAt(2).text == "alter" {
+        orAt = q.peekAt(1).at
+        alterAt = q.peekAt(2).at
+        k = 3
+    }
+    let w = q.peekAt(k).clone()
+    if w.kind != lexdb_parse.T_IDENT || w.text != "function" { return Ok(None) }
+    q.skip(k + 1)
+    var r = try q.funcHeader()
+    let at = q.here()
+    let src = q.source()
+    let body0 = src[at..len(src)]
+    let inline = strings.contains(&r.attrs, "inline")
+    if inline {
+        // RETURN [(] SELECT ... [)]
+        let t = q.peek().clone()
+        if t.kind != lexdb_parse.T_IDENT || t.text != "return" { return Err(q.unexpected()) }
+        var text = strings.trim(&src[t.at + 6..len(src)])
+        while len(text) > 0 && text[len(text) - 1] == ';' { text = strings.trim(&text[0..len(text) - 1]) }
+        // the outer parentheses, when the first closes at the end
+        if len(text) > 0 && text[0] == '(' {
+            var depth = 0
+            var closeAt = -1
+            var i = 0
+            var inStr = false
+            while i < len(text) {
+                let c = text[i]
+                if c == '\'' { inStr = !inStr }
+                else if !inStr && c == '(' { depth += 1 }
+                else if !inStr && c == ')' {
+                    depth -= 1
+                    if depth == 0 { closeAt = i; break }
+                }
+                i += 1
+            }
+            if closeAt == len(text) - 1 { text = strings.trim(&text[1..closeAt]) }
+        }
+        r.body = text.toStr()
+    } else {
+        let t = q.peek().clone()
+        if t.kind != lexdb_parse.T_IDENT || t.text != "begin" { return Err(q.unexpected()) }
+        r.body = body0.toStr()
+    }
+    r.def = if orAt >= 0 { src[first.at..orAt].toStr() + src[orAt + 2..alterAt].toStr() + src[alterAt + 5..len(src)].toStr() }
+            else if !create { "CREATE" + src[first.at + 5..len(src)].toStr() } else { src[first.at..len(src)].toStr() }
+    // the body, as a batch of its own, to be sure it is one (the parameters its variables)
+    var names: []str = []
+    for p in r.params { append(mut &names, p.name.clone()) }
+    // (a multi-statement function's result table, RETURNS @t TABLE (...), is a table variable its body declares first)
+    let multiBody = strings.contains(&r.attrs, "multi")
+    let checked: str = if multiBody && len(r.body) >= 5 { r.body[0..5].toStr() + " declare " + r.retSpell + ";" + r.body[5..len(r.body)].toStr() } else { r.body.clone() }
+    let b = try parseStmts(&checked, d, &names)
+    if inline {
+        if len(b.stmts) != 1 || b.stmts[0].kind != TS_SQL || (b.stmts[0].stmt[0].kind != lexdb_sql.S_SELECT || len(b.stmts[0].stmt[0].assign) > 0) {
+            return Err(tsErr(156, "Incorrect syntax near the keyword 'RETURN'."))
+        }
+    } else {
+        if len(b.stmts) != 1 || b.stmts[0].kind != TS_BLOCK { return Err(tsErr(156, "Incorrect syntax near the keyword 'select'.")) }
+        let multi = strings.contains(&r.attrs, "multi")
+        try checkBody(&b.stmts, multi)
+        let body = &b.stmts[0].body
+        if len(body) == 0 || body[len(body) - 1].kind != TS_RETURN {
+            return Err(tsErr(455, "The last statement included within a function must be a return statement."))
+        }
+        if !multi {
+            var reads = false
+            let prog = try genFunc(&r, &b, mut &reads)
+            r.code = lexdb_udf.encode(&prog)
+            if reads { r.attrs += " reads" }
+            var called: []str = []
+            callsUdf(&b.stmts, mut &called)
+            for ck in called { r.attrs += " calls:" + ck }
+        }
+    }
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_ROUTINE)
+    s.table = r.key.clone()
+    s.ifFlag = orAt >= 0 || !create
+    if !create { s.alias = "alter" }
+    append(mut &s.rtn, r)
+    var ts = tstmt(TS_SQL)
+    append(mut &ts.stmt, s)
+    return Ok(Some(TBatch{stmts: [ts], vars: [], types: []}))
 }
 
 // CREATE [OR ALTER] PROC[EDURE] name [parameters] AS body, or ALTER PROC[EDURE]: the batch it is, else None.

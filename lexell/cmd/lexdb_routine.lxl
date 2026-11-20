@@ -49,6 +49,14 @@ pub fn ofDialect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int
     return Ok(out)
 }
 
+// What a T-SQL routine is: "p" a procedure, "scalar", "inline" or "multi" a function (ALTER keeps the kind).
+pub fn tclass(r: &Routine): str {
+    if r.kind == lexdb_sql.RK_PROC { return "p" }
+    if strings.contains(&r.attrs, "inline") { return "inline" }
+    if strings.contains(&r.attrs, "multi") { return "multi" }
+    return "scalar"
+}
+
 // Makes a routine, or with replace changes the one of its name and signature. taken: the name is a table's, a view's or
 // a sequence's (T-SQL's objects share their names). The errors are the dialect's.
 pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, replace: bool, taken: bool): Result[Unit, DbErr] {
@@ -59,7 +67,15 @@ pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, re
     let base = lexdb_sql.baseName(&r.key)
     if r.dialect == lexdb_sql.RD_TSQL {
         if taken || (old.isSome() && !replace) { return Err(err("TS2714", &("There is already an object named '" + base + "' in the database."))) }
-        // OR ALTER of a function made by the other kind: SQL Server's, "is not a procedure" (later slices)
+        // OR ALTER and ALTER of a routine of the other kind (a function over a procedure, a scalar over a table-valued one)
+        match old {
+            Some(o) {
+                if tclass(&o) != tclass(r) {
+                    return Err(err("TS2010", &("Cannot perform alter on '" + base + "' because it is an incompatible object type.")))
+                }
+            }
+            None {}
+        }
     } else {
         match old {
             Some(o) {
@@ -94,7 +110,12 @@ pub fn dropOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, 
     let have = try find(st, txn, dialect, key)
     var hit: []Routine = []
     if dialect == lexdb_sql.RD_TSQL {
-        for h in have { if (kw == "procedure" && h.kind == lexdb_sql.RK_PROC) || (kw == "function" && h.kind == lexdb_sql.RK_FUNC) || kw == "routine" { append(mut &hit, h) } }
+        for h in have { if (kw == "procedure" && h.kind == lexdb_sql.RK_PROC) || (kw == "function" && h.kind == lexdb_sql.RK_FUNC) || kw == "routine" { append(mut &hit, h.clone()) } }
+        if len(hit) == 0 && len(have) > 0 {
+            // a routine of the other kind
+            let other = if have[0].kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }
+            return Err(err("TS3705", &("Cannot use DROP " + strings.toUpperAscii(kw) + " with '" + spell + "' because '" + spell + "' is a " + other + ". Use DROP " + strings.toUpperAscii(&other) + ".")))
+        }
         if len(hit) == 0 {
             if ifExists { return Ok(Dropped{notice: ""}) }
             return Err(err("TS3701", &("Cannot drop the " + kw + " '" + spell + "', because it does not exist or you do not have permission.")))
@@ -278,7 +299,7 @@ pub fn bindNames(body: &str, fname: &str, r: &Routine, skip: &[]str): Result[str
 
 // ---- PostgreSQL's SQL functions in queries
 
-fn mapE(x: &Expr, f: &fn(&Expr): Option[Expr]): Expr {
+pub fn mapE(x: &Expr, f: &fn(&Expr): Option[Expr]): Expr {
     match f(x) {
         Some(y) { return y }
         None {}
@@ -387,7 +408,7 @@ fn resolve(fns: &[]Routine, path: &[]str, name: &str, nargs: int): Result[Option
 }
 
 // Whether an argument is a value the statement is given (no column, no subquery of its own).
-fn constArg(x: &Expr): bool {
+pub fn constArg(x: &Expr): bool {
     match x {
         Expr.Lit(_) { return true }
         Expr.Param(_) { return true }
@@ -542,6 +563,300 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         }
     }
     for x in extra { append(mut &t.subs, x) }
+    if !changed { return Ok(None) }
+    return Ok(Some(t))
+}
+
+// ---- T-SQL's functions of the user's in queries (package F, slice F2)
+//
+// A scalar call, dbo.f(args) (the parser names it "dbo.f" and marks the statement), is written Cast(#udf("f", args), result type)
+// for the evaluator, which runs the function's program (lexdb_udf); an inline table-valued function in FROM is written as its
+// query, the arguments put in for the parameters (a column the call reads comes through a derived table of one row, so that
+// no name in the function's query can capture it).
+
+// A routine's catalog key from a call's name: dbo's is the bare name, as tables'.
+pub fn tsqlKey(nm0: &str): str {
+    let nm = strings.replaceAll(nm0, lexdb_sql.QSEP, ".")
+    let parts = strings.split(nm, ".")
+    let base = parts[len(parts) - 1].toStr()
+    let sch = if len(parts) >= 2 { parts[len(parts) - 2].toStr() } else { "dbo" }
+    return if sch == "dbo" { base } else { sch + "." + base }
+}
+
+fn argCountErr(nm: &str, n: int, want: int): DbErr {
+    if n > want { return err("TS8144", &("Procedure or function " + nm + " has too many arguments specified.")) }
+    return err("TS313", &("An insufficient number of arguments were supplied for the procedure or function " + nm + "."))
+}
+
+// The arguments of a call of r with each DEFAULT (#default) put as the parameter's default: SQL Server needs one for each
+// parameter (313 for too few, 8144 for too many); a parameter without a default takes NULL for DEFAULT.
+fn fillArgs(r: &Routine, nm: &str, args: &[]Expr): Result[[]Expr, DbErr] {
+    if len(args) != len(r.params) { return Err(argCountErr(nm, len(args), len(r.params))) }
+    var out: []Expr = []
+    for i in 0..len(args) {
+        var isDefault = false
+        match args[i] {
+            Expr.Call(f, a, _) { isDefault = f == "#default" }
+            else {}
+        }
+        if !isDefault {
+            append(mut &out, lexdb_sql.cloneExpr(&args[i]))
+        } else if r.params[i].has {
+            append(mut &out, try lexdb_parse.parseExpr(&r.params[i].dflt))
+        } else {
+            append(mut &out, Expr.Lit(Val.Null))
+        }
+    }
+    return Ok(out)
+}
+
+// The query a function that reads tables is written as (lexdb_tsqlfunc, set by lexdb_tds): SELECT of its result, over the
+// arguments; tag makes the names it makes for them its own.
+pub type QueryFn = fn(&Routine, &[]Expr, int): Result[Stmt, DbErr]
+
+fn hasSubRef(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasSubRef(&a) }
+        Expr.Bin(_, a, b) { return hasSubRef(&a) || hasSubRef(&b) }
+        Expr.IsNull(a, _) { return hasSubRef(&a) }
+        Expr.Cast(a, _) { return hasSubRef(&a) }
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) { return true }
+            for a in args { if hasSubRef(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether a function reads tables, or calls (as its attrs list: calls:key) one that does.
+fn readsDeep(r: &Routine, lookup: &fn(&str): Option[Routine], depth: int): bool {
+    if strings.contains(&r.attrs, "reads") { return true }
+    if depth > 32 { return false }
+    for w in strings.split(&r.attrs, " ") {
+        if strings.startsWith(&w, "calls:") {
+            match lookup(&w[6..len(w)].toStr()) {
+                Some(c) { if readsDeep(&c, lookup, depth + 1) { return true } }
+                None {}
+            }
+        }
+    }
+    return false
+}
+
+fn scalarCall(nm: &str, args: &[]Expr, lookup: &fn(&str): Option[Routine], qry: &QueryFn, extra: mut &[]Stmt, base: int): Result[Expr, DbErr] {
+    let key = tsqlKey(nm)
+    match lookup(&key) {
+        Some(r) {
+            let ins = try fillArgs(&r, nm, args)
+            if readsDeep(&r, lookup, 0) {
+                // a function that reads tables (or calls one): its result as a scalar subquery of the statement
+                for a in ins { if hasSubRef(&a) { return Err(err("0A000", &("lexdb: the function " + nm + " reads tables: an argument that is a subquery is not supported yet"))) } }
+                var sq = try qry(&r, &ins, base + len(extra))
+                sq.use = lexdb_sql.SUB_SCALAR
+                sq.params = 0
+                sq.src = ""
+                append(extra, sq)
+                return Ok(Expr.Cast(Expr.Call("#sub", [Expr.Lit(Val.Int(base + len(extra) - 1))], false), r.ret))
+            }
+            var xs: []Expr = [Expr.Lit(Val.Text(key))]
+            for a in ins { append(mut &xs, a) }
+            return Ok(Expr.Cast(Expr.Call("#udf", xs, false), r.ret))
+        }
+        None {
+            let parts = strings.split(nm, ".")
+            let sch = if len(parts) >= 2 { parts[len(parts) - 2].toStr() } else { "dbo" }
+            return Err(err("TS4121", &("Cannot find either column \"" + sch + "\" or the user-defined function or aggregate \"" + nm + "\", or the name is ambiguous.")))
+        }
+    }
+}
+
+fn resolveE(x: &Expr, lookup: &fn(&str): Option[Routine], qry: &QueryFn, extra: mut &[]Stmt, base: int, failure: mut &Option[DbErr], changed: mut &bool): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), resolveE(&a, lookup, qry, extra, base, failure, changed)) }
+        Expr.Bin(op, a, b) {
+            let l = resolveE(&a, lookup, qry, extra, base, failure, changed)
+            return Expr.Bin(op.clone(), l, resolveE(&b, lookup, qry, extra, base, failure, changed))
+        }
+        Expr.IsNull(a, neg) { return Expr.IsNull(resolveE(&a, lookup, qry, extra, base, failure, changed), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(resolveE(&a, lookup, qry, extra, base, failure, changed), t) }
+        Expr.Call(nm0, args, star) {
+            // (a name read back by the PostgreSQL parser has its schema joined by QSEP)
+            let nm = strings.replaceAll(&nm0, lexdb_sql.QSEP, ".")
+            var done: []Expr = []
+            for a in args { append(mut &done, resolveE(&a, lookup, qry, extra, base, failure, changed)) }
+            if star || len(nm) == 0 || nm[0] == '#' || !strings.contains(&nm, ".") { return Expr.Call(nm0.clone(), done, star) }
+            changed = true
+            match scalarCall(&nm, &done, lookup, qry, extra, base) {
+                Ok(e) { return e }
+                Err(e) {
+                    if failure.isNone() { failure = Some(e) }
+                    return lexdb_sql.cloneExpr(x)
+                }
+            }
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+fn noQuery(r: &Routine, args: &[]Expr, tag: int): Result[Stmt, DbErr] {
+    return Err(err("0A000", &("lexdb: the function " + lexdb_sql.baseName(&r.key) + " reads tables: a function that reads tables cannot be called from another function yet")))
+}
+
+// x with its calls of T-SQL functions of the user's (by their schema-qualified names) written out; lookup finds a scalar
+// function by its key.
+pub fn resolveUdf(x: &Expr, lookup: &fn(&str): Option[Routine]): Result[Expr, DbErr] {
+    var failure: Option[DbErr] = None
+    var changed = false
+    var extra: []Stmt = []
+    let r = resolveE(x, lookup, noQuery, mut &extra, 0, mut &failure, mut &changed)
+    match failure {
+        Some(e) { return Err(e) }
+        None {}
+    }
+    return Ok(r)
+}
+
+// The inline table-valued function an item of FROM (f: a function's call, its arguments the items of subs[f.sub]) names, written
+// as its query in the same place: items to the new FROM list.
+fn inlineTvf(t: mut &Stmt, f: &lexdb_sql.FromItem, fns: &[]Routine, nfrom: mut &[]lexdb_sql.FromItem, depth: int, qry: &QueryFn): Result[Unit, DbErr] {
+    let call = t.subs[f.sub].clone()
+    let key = call.srf[5..len(call.srf)].toStr()
+    var found: Option[Routine] = None
+    for r in fns { if r.key == key && r.kind == lexdb_sql.RK_FUNC && r.retSet { found = Some(r.clone()) } }
+    let shown = if len(call.spell) > 0 { call.spell.clone() } else { key.clone() }
+    if found.isNone() { return Err(err("TS208", &("Invalid object name '" + shown + "'."))) }
+    let r = found.unwrap()
+    if strings.contains(&r.attrs, "multi") {
+        return Err(err("0A000", &("lexdb: the multi-statement table-valued function " + shown + " is not supported yet (an inline one is)")))
+    }
+    if depth > 32 { return Err(err("TS217", "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).")) }
+    var args: []Expr = []
+    for it in call.items {
+        match it.expr {
+            Some(x) { append(mut &args, lexdb_sql.cloneExpr(&x)) }
+            None {}
+        }
+    }
+    let ins = try fillArgs(&r, &shown, &args)
+    var names: []str = []
+    for p in r.params { append(mut &names, p.name.clone()) }
+    let body0 = try lexdb_parse.tsqlSelect(&r.body, &names)
+    // an argument that reads a column (or a subquery) comes as a column of a derived table of one row, before the function's query
+    var vals: []Expr = []
+    var aitems: []lexdb_sql.SelItem = []
+    let at = len(t.subs)
+    let aalias = "__udf" + at.toStr()
+    for i in 0..len(ins) {
+        if constArg(&ins[i]) {
+            append(mut &vals, lexdb_sql.cloneExpr(&ins[i]))
+        } else {
+            let cn = "__a" + i.toStr()
+            append(mut &aitems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.cloneExpr(&ins[i])), alias: cn.clone(), spell: cn.clone()})
+            append(mut &vals, Expr.Col(aalias + "." + cn, -1))
+        }
+    }
+    var body = mapStmt(&body0, fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Param(n) {
+                if n >= 1 && n <= len(vals) { return Some(lexdb_sql.cloneExpr(&vals[n - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    })
+    body.use = lexdb_sql.SUB_FROM
+    body.params = 0
+    // (its own calls of functions)
+    match try tsqlCallsAt(&body, fns, depth + 1, qry) {
+        Some(b2) { body = b2 }
+        None {}
+    }
+    var g = f.clone()
+    g.table = ""
+    t.subs[f.sub] = body
+    if len(aitems) > 0 {
+        var a = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+        a.use = lexdb_sql.SUB_FROM
+        a.items = aitems
+        a.subs = call.subs.clone()
+        a.wins = call.wins.clone()
+        append(mut &t.subs, a)
+        let first = f.join == lexdb_sql.J_FIRST
+        append(nfrom, lexdb_sql.FromItem{table: "", alias: aalias, join: if first { lexdb_sql.J_FIRST } else { lexdb_sql.J_CROSS }, on: None, sub: at, cols: [],
+                                         work: -1, lateral: true, using: [], natural: false, comma: f.comma})
+        g.comma = false
+        if first { g.join = lexdb_sql.J_CROSS }
+    }
+    append(nfrom, g)
+    return Ok(Unit{})
+}
+
+// s with its calls of T-SQL functions of the user's written out (fns: those of the catalog); None when it calls none. An
+// error as SQL Server gives it for a name that is none (4121, 208), a call with too few or too many arguments (313, 8144).
+pub fn tsqlCalls(s: &Stmt, fns: &[]Routine, qry: &QueryFn): Result[Option[Stmt], DbErr] { return tsqlCallsAt(s, fns, 0, qry) }
+
+fn tsqlCallsAt(s: &Stmt, fns: &[]Routine, depth: int, qry: &QueryFn): Result[Option[Stmt], DbErr] {
+    if depth > 32 { return Err(err("TS217", "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).")) }
+    var failure: Option[DbErr] = None
+    var changed = false
+    var extra: []Stmt = []
+    let base = len(s.subs)
+    var t = mapStmtTop(s, fn(x: &Expr): Option[Expr] {
+        return Some(resolveE(x, fn(k: &str): Option[Routine] {
+            for r in fns {
+                if r.key == k && r.kind == lexdb_sql.RK_FUNC && !r.retSet { return Some(r.clone()) }
+            }
+            return None
+        }, qry, mut &extra, base, mut &failure, mut &changed))
+    })
+    match failure {
+        Some(e) { return Err(e) }
+        None {}
+    }
+    // (the queries of functions that read tables, with their own calls written out)
+    for i in 0..len(extra) {
+        match try tsqlCallsAt(&extra[i], fns, depth + 1, qry) {
+            Some(u) { extra[i] = u }
+            None {}
+        }
+    }
+    for i in 0..len(t.subs) {
+        match try tsqlCallsAt(&t.subs[i], fns, depth, qry) {
+            Some(u) {
+                t.subs[i] = u
+                changed = true
+            }
+            None {}
+        }
+    }
+    for i in 0..len(t.inner) {
+        match try tsqlCallsAt(&t.inner[i], fns, depth, qry) {
+            Some(u) {
+                t.inner[i] = u
+                changed = true
+            }
+            None {}
+        }
+    }
+    // the table-valued functions in FROM
+    var any = false
+    for f in t.from { if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#udf:") { any = true } }
+    for x in extra { append(mut &t.subs, x.clone()) }
+    if len(extra) > 0 { changed = true }
+    if any {
+        var nfrom: []lexdb_sql.FromItem = []
+        let from = t.from.clone()
+        for f in from {
+            if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#udf:") {
+                try inlineTvf(mut &t, &f, fns, mut &nfrom, depth, qry)
+            } else {
+                append(mut &nfrom, f)
+            }
+        }
+        t.from = nfrom
+        changed = true
+    }
     if !changed { return Ok(None) }
     return Ok(Some(t))
 }

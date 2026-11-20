@@ -1,0 +1,128 @@
+// lexdb over TDS: T-SQL user-defined functions (design/lexdb-dialect-gaps.md, package F, slice F2): what lexdb does not do yet says so,
+// and two connections: written by hand (SQL Server accepts the refusals; the sessions' lines are what SQL Server's isolation gives). Each
+// line of the script is "connection|batch"; each expect line is its answer (the refusals' messages are lexdb's, number 50000).
+// A function made in a transaction is the connection's own until it commits; one made and committed is seen by the other at once;
+// one dropped in a transaction is still there for the other until the commit.
+// expect: (3)
+// expect: ok
+// expect: : 10
+// expect: ok
+// expect: ok
+// expect: : 10
+// expect: error 4121
+// expect: ok
+// expect: : 10
+// expect: : 1
+// expect: : 10
+// expect: ok
+// expect: error 4121
+// expect: ok
+// expect: error 50000 lexdb: the multi-statement table-valued function mt is not supported yet (an inline one is)
+// expect: ok
+// expect: error 50000 lexdb: a WHILE loop is not supported yet in a function that reads tables
+// expect: ok
+// expect: : 3
+// expect: error 50000 lexdb: a function of the user's in a column default, a CHECK constraint, a computed column, an index or a view is not supported yet
+// expect: error 50000 lexdb: a function of the user's in a column default, a CHECK constraint, a computed column, an index or a view is not supported yet
+// expect: ok
+// expect: ok
+// expect: error 50000 lexdb: OUTPUT INTO followed by an OUTPUT clause that returns rows is not supported yet
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SCRIPT = "1|create table t(a int primary key); insert t values (1),(2),(3)\n1|create function dbo.ten() returns int as begin return 10 end\n2|select dbo.ten()\n1|begin tran\n1|create function dbo.tx() returns int as begin return 10 end\n1|select dbo.tx()\n2|select dbo.tx()\n1|commit\n2|select dbo.tx()\n1|begin tran; drop function dbo.tx; select 1\n2|select dbo.tx()\n1|commit\n2|select dbo.tx()\n2|create function dbo.mt() returns @r table (a int) as begin insert @r select a from t; return end\n2|select * from dbo.mt()\n2|create function dbo.wl(@n int) returns int as begin declare @i int = 0; while @i < @n set @i += 1; return @i + (select count(*) from t) end\n2|select dbo.wl(2)\n2|create function dbo.cn() returns int as begin return (select count(*) from t) end\n2|select dbo.cn()\n2|create table d1(a int default dbo.ten())\n2|create view v1 as select dbo.ten() x\n2|create function dbo.ex() returns int as begin exec sp_who; return 1 end\n2|create function dbo.ex2() returns int as begin exec dbo.nosuchproc; return 1 end\n2|declare @x table (a int); insert t output inserted.a into @x output inserted.a values (7)"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error (and, for 50000, its message)
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() + (if e.code == 50000 { " " + e.msg } else { "" }) }
+    }
+}
+
+fn batches(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(a0) {
+            match sqlserver.connect(&(dsn.toStr())) {
+                Ok(b0) {
+                    var a = a0
+                    var b = b0
+                    let text: str = SCRIPT
+                    for line in strings.lines(&text) {
+                        let bar = strings.indexOf(&line, "|", 0)
+                        let who = line[0..bar]
+                        let q = line[bar + 1..len(line)]
+                        println(if who == "1" { show(mut &a, &q) } else { show(mut &b, &q) })
+                    }
+                    a.close()
+                    b.close()
+                }
+                Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+            }
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(44), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

@@ -59,6 +59,7 @@ import "./lexdb_match"
 import "./lexdb_parse"
 import "./lexdb_routine"
 import "./lexdb_dbopt"
+import "./lexdb_udf"
 import "./lexdb_gen"
 
 type SqlT = lexdb_syscat.SqlT
@@ -570,6 +571,7 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             }
             var vs: []Val = []
             for a in args { append(mut &vs, try eval(&a, env)) }
+            if name == "#udf" { return udfEval(&vs, env) }
             if name == "#tdiv" && len(vs) == 3 { return lexdb_lib.tdiv(&vs) }
             if name == "#tavg" && len(vs) == 2 { return lexdb_lib.tavg(&vs) }
             if isDialectFn(&name) {
@@ -671,7 +673,7 @@ fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val
 // (lexdb_pipe.entryAt; lexdb_lib.entry1Of for one argument: FN_ONE), after its
 // dialect's call for a T-SQL or Oracle name, as eval.
 fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
-    if lexdb_bind.isAgg(name) || name == "#win" || name == "#wmark" || name == "row" || lexdb_bind.isWinFn(name) ||
+    if lexdb_bind.isAgg(name) || name == "#win" || name == "#wmark" || name == "#udf" || name == "row" || lexdb_bind.isWinFn(name) ||
        lexdb_bind.isSeqFn(name) || isSessFn(name) || lexdb_bind.isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
         return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}
     }
@@ -21961,7 +21963,10 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
                 "isuniquecnst" { return Ok(flag(typ == "UQ")) }
                 "isconstraint" { return Ok(flag(typ == "PK" || typ == "UQ" || typ == "F" || typ == "C" || typ == "D")) }
                 "isprocedure" { return Ok(flag(typ == "P")) }
-                "isscalarfunction", "istablefunction", "isinlinefunction", "istrigger", "isextendedproc",
+                "isscalarfunction" { return Ok(flag(typ == "FN")) }
+                "istablefunction" { return Ok(flag(typ == "IF" || typ == "TF")) }
+                "isinlinefunction" { return Ok(flag(typ == "IF")) }
+                "istrigger", "isextendedproc",
                 "isencrypted", "isschemabound", "isreplproc", "isqueue", "isrule", "isdefault" { return Ok(flag(false)) }
                 "ownerid", "schemaid" {
                     if p == "ownerid" { return Ok(Some(Val.Int(1))) }
@@ -24658,8 +24663,77 @@ fn (s: mut &Session) callCols(stmt: &lexdb_sql.Stmt): Result[[]OutCol, DbErr] {
     return Err(e("42883", &("procedure " + base + "(" + strings.join(&ts, ", ") + ") does not exist")))
 }
 
+// ---- T-SQL's functions of the user's in queries (lexdb_routine.tsqlCalls writes them out; lexdb_udf runs a scalar one)
+
+fn udfKey(sess: int, key: &str): str { return "\x00udf\x00" + sess.toStr() + "\x00" + key }
+
+// The scalar function key, as the statement being run published it (tsqlFunctions).
+fn udfFind(se: &SeqEnv, key: &str): Option[Routine] {
+    match se.st.memo.get(&udfKey(se.sess, key)) {
+        Some(v) { return Some(lexdb_catalog.decRoutine(&v)) }
+        None { return None }
+    }
+}
+
+// Call("#udf", [key, arguments]): the function's program run over the arguments, by lexdb_udf, with this evaluator for its
+// expressions. A body calling bodies nests (SQL Server's limit is 32): the depth rides as a last, unnumbered value of the
+// parameters a body's expressions are evaluated over (a statement's evaluation may run on several tasks: no shared counter).
+const UDF_DEPTH: str = "\x00udf depth "
+
+fn udfEval(vs: &[]Val, env: &Env): Result[Val, DbErr] {
+    match env.seq {
+        Some(se) {
+            let key = lexdb_sql.text(&vs[0])
+            let found = udfFind(&se, &key)
+            if found.isNone() { return Err(e("TS4121", &("Cannot find the user-defined function \"" + key + "\"."))) }
+            var depth = 0
+            if len(env.params) > 0 {
+                match env.params[len(env.params) - 1] {
+                    Val.Text(t) { if strings.startsWith(&t, UDF_DEPTH) { depth = lexdb_base.num(&t[len(UDF_DEPTH)..len(t)].toStr()) } }
+                    else {}
+                }
+            }
+            if depth >= 32 { return Err(e("TS217", "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).")) }
+            var args: []Val = []
+            for i in 1..len(vs) { append(mut &args, vs[i].clone()) }
+            return lexdb_udf.run(&found.unwrap(), &args, fn(x: &Expr, params: &[]Val): Result[Val, DbErr] {
+                let noRow: []Val = []
+                let noCols: []lexdb_sql.ColDef = []
+                let noSubs: []SubRes = []
+                var deeper = params.clone()
+                append(mut &deeper, Val.Text(UDF_DEPTH + (depth + 1).toStr()))
+                let env2 = Env{cols: &noCols, row: &noRow, aggs: &noRow, params: &deeper, subs: &noSubs, cur: &noRow, seq: env.seq}
+                return eval(x, &env2)
+            }, fn(k: &str): Option[Routine] { return udfFind(&se, k) })
+        }
+        None { return Err(e("0A000", "lexdb: a function of the user's cannot be called here")) }
+    }
+}
+
+// The statement with its calls of T-SQL functions of the user's written out; None when it calls none. The functions are
+// published for the evaluator (udfFind) first.
+fn (s: mut &Session) tsqlFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
+    var fns: []Routine = []
+    for r in try s.allRoutines(lexdb_sql.RD_TSQL) { if r.kind == lexdb_sql.RK_FUNC { append(mut &fns, r) } }
+    for r in fns { s.st.memo.put(&udfKey(s.id, &r.key), &lexdb_catalog.encRoutine(&r)) }
+    return lexdb_routine.tsqlCalls(stmt, &fns, udfQuery)
+}
+
+// The query a function that reads tables is written as: lexdb_tsqlfunc's, set once by lexdb_tds (a dialect module, which
+// core does not import).
+var UDF_QUERY: once []fn(&Routine, &[]Expr, int): Result[lexdb_sql.Stmt, DbErr]
+
+pub fn setUdfQuery(f: fn(&Routine, &[]Expr, int): Result[lexdb_sql.Stmt, DbErr]) { if !UDF_QUERY.isSet() { UDF_QUERY.set([f]) } }
+
+fn udfQuery(r: &Routine, args: &[]Expr, tag: int): Result[lexdb_sql.Stmt, DbErr] {
+    if !UDF_QUERY.isSet() { return Err(e("0A000", "lexdb: a function that reads tables needs the SQL Server door")) }
+    return UDF_QUERY.get()[0](r, args, tag)
+}
+
 // The statement with PostgreSQL's SQL functions it calls written as their bodies; None when it calls none.
 fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
+    // T-SQL's functions of the user's: the parser marked the statement (a flag test, nothing more, for the rest)
+    if stmt.udf { return s.tsqlFunctions(stmt) }
     // (no function known, as of the generation the session saw: nothing to look at; the usual case, a point select's)
     if s.fnGen == lexdb_routine.namesGen() && len(s.fnNames) == 0 { return Ok(None) }
     let names = try s.functionNames()

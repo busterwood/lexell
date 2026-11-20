@@ -672,6 +672,21 @@ fn tsqlProcs(snap: &CatSnap): []lexdb_sql.Routine {
     return out
 }
 
+// T-SQL's procedures and functions.
+fn tsqlRoutines(snap: &CatSnap): []lexdb_sql.Routine {
+    var out: []lexdb_sql.Routine = []
+    for r in snap.routines { if r.dialect == lexdb_sql.RD_TSQL { append(mut &out, r.clone()) } }
+    return out
+}
+
+// A routine's sys.objects type and its description: P, FN (scalar), IF (inline table-valued), TF (multi-statement).
+fn routineType(r: &lexdb_sql.Routine): []str {
+    if r.kind == lexdb_sql.RK_PROC { return ["P", "SQL_STORED_PROCEDURE"] }
+    if strings.contains(&r.attrs, "inline") { return ["IF", "SQL_INLINE_TABLE_VALUED_FUNCTION"] }
+    if strings.contains(&r.attrs, "multi") { return ["TF", "SQL_TABLE_VALUED_FUNCTION"] }
+    return ["FN", "SQL_SCALAR_FUNCTION"]
+}
+
 pub fn procOid(r: &lexdb_sql.Routine): int { return lexdb_sql.nameOid(&"R", &r.key) }
 
 fn procName(r: &lexdb_sql.Routine): str {
@@ -710,8 +725,9 @@ fn sysObjects(snap: &CatSnap): [][]Val {
         if lexdb_base.isTempSchema(&sc) { continue }
         append(mut &rows, sysObj(&lexdb_sql.baseName(&d.key), lexdb_catalog.seqOid(&d), sysSchemaId(&sc), 0, &"SO", &"SEQUENCE_OBJECT", false))
     }
-    for r in tsqlProcs(snap) {
-        append(mut &rows, sysObj(&procName(&r), procOid(&r), sysSchemaId(&lexdb_sql.schemaOf(&r.key)), 0, &"P", &"SQL_STORED_PROCEDURE", false))
+    for r in tsqlRoutines(snap) {
+        let rt = routineType(&r)
+        append(mut &rows, sysObj(&procName(&r), procOid(&r), sysSchemaId(&lexdb_sql.schemaOf(&r.key)), 0, &rt[0], &rt[1], false))
     }
     // a table type's table: TT_name_hex, SQL Server's own
     for t in snap.ttypes {
@@ -1301,7 +1317,28 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
             }
         }
         "parameters" {
-            for r in tsqlProcs(&snap) {
+            for r in tsqlRoutines(&snap) {
+                // a scalar function's result is its parameter 0, unnamed
+                if r.kind == lexdb_sql.RK_FUNC && !r.retSet {
+                    let ty = sqlTypeOf(&r.ret, &"")
+                    var x = sysTemplate(&"parameters")
+                    x.set(&"object_id", iv(procOid(&r)))
+                    x.set(&"name", tv(&""))
+                    x.set(&"parameter_id", iv(0))
+                    x.set(&"system_type_id", iv(ty.sys))
+                    x.set(&"user_type_id", iv(ty.user))
+                    x.set(&"max_length", iv(ty.maxLen))
+                    x.set(&"precision", iv(ty.prec))
+                    x.set(&"scale", iv(ty.scale))
+                    x.set(&"is_output", bv(true))
+                    x.set(&"is_cursor_ref", bv(false))
+                    x.set(&"has_default_value", bv(false))
+                    x.set(&"is_xml_document", bv(false))
+                    x.set(&"xml_collection_id", iv(0))
+                    x.set(&"is_readonly", bv(false))
+                    x.set(&"is_nullable", bv(true))
+                    append(mut &rows, x.row())
+                }
                 for i in 0..len(r.params) {
                     let p = &r.params[i]
                     let ty = sqlTypeOf(&p.typ, &"")
@@ -1326,7 +1363,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
             }
         }
         "sql_modules" {
-            for r in tsqlProcs(&snap) {
+            for r in tsqlRoutines(&snap) {
                 var x = sysTemplate(&"sql_modules")
                 x.set(&"object_id", iv(procOid(&r)))
                 x.set(&"definition", tv(&r.def))
@@ -1407,7 +1444,7 @@ pub fn bind(snap: &CatSnap, b: mut &str) {
         let d = viewDef(&v)
         if len(d) > 0 { b += &("D\t" + v.oid.toStr() + "\t" + escDef(&d) + "\n") }
     }
-    for r in tsqlProcs(snap) { b += &("D\t" + procOid(&r).toStr() + "\t" + escDef(&r.def) + "\n") }
+    for r in tsqlRoutines(snap) { b += &("D\t" + procOid(&r).toStr() + "\t" + escDef(&r.def) + "\n") }
     // Y table types (user_type_id, schema_id, name)
     for t in snap.ttypes { b += &("Y\t" + lexdb_sql.nameOid("T", &t.key).toStr() + "\t" + sysSchemaId(&lexdb_sql.schemaOf(&t.key)).toStr() + "\t" + lexdb_catalog.clean(&t.spell) + "\n") }
     for r in sysObjects(snap) {

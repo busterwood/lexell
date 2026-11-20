@@ -450,7 +450,27 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
             }
         }
     }
-    let inTx = sess.status() != 'I' && !txStmt(s.kind)
+    // OUTPUT ... INTO: the statement and the insert of its output are one, in a transaction of their own if there is none
+    var ownTx = false
+    if len(s.outInto) > 0 {
+        match sess.tableDecl(&s.outInto) {
+            Ok(_) {}
+            Err(e) {
+                st.failErr(ev, &e, cmdOf(s.kind))
+                return st.tryDepth > 0 || !endsBatch(&e)
+            }
+        }
+        if sess.status() == 'I' {
+            match simple(sess, &"BEGIN") {
+                Ok(_) { ownTx = true }
+                Err(e) {
+                    st.failErr(ev, &e, 0)
+                    return false
+                }
+            }
+        }
+    }
+    let inTx = sess.status() != 'I' && !txStmt(s.kind) && !ownTx
     if s.kind == lexdb_sql.S_ALTER_DB && sess.status() != 'I' {
         st.failErr(ev, &tsErr(226, "ALTER DATABASE statement not allowed within multi-statement transaction."), 0)
         return st.tryDepth > 0
@@ -465,9 +485,14 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
         f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
     }
     let oids = f.oids()
-    let r = if bulk { sess.copyInFrom(s, pull) } else { sess.run(s, &f.vals, &oids) }
+    var r = if bulk { sess.copyInFrom(s, pull) } else { sess.run(s, &f.vals, &oids) }
+    if len(s.outInto) > 0 && r.isOk() { r = outputInto(sess, s, r.unwrap()) }
     if r.isErr() {
         let e = r.unwrapErr()
+        if ownTx {
+            // (the transaction is not the batch's: its error ends the statement, not it)
+            let rb = simple(sess, &"ROLLBACK")
+        }
         if bulk && st.tryDepth == 0 {
             // as SQL Server ends a bulk load: the error, then 3621
             st.error = sqlNumber(&e.state)
@@ -498,6 +523,15 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     var res = r.unwrap()
     if inTx {
         let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
+    }
+    if ownTx {
+        match simple(sess, &"COMMIT") {
+            Ok(_) {}
+            Err(e) {
+                st.failErr(ev, &e, cmd)
+                return st.tryDepth > 0 || !endsBatch(&e)
+            }
+        }
     }
     st.error = 0
     if len(s.assign) > 0 {
@@ -535,6 +569,42 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     // a #temporary table made: dropped with the connection
     if s.kind == lexdb_sql.S_CREATE && strings.startsWith(&s.table, "#") && !strings.startsWith(&s.table, "#@") { append(mut &st.temps, s.table.clone()) }
     return true
+}
+
+// OUTPUT ... INTO target [(columns)]: the rows the statement output (res, its RETURNING's) inserted into the target, a table
+// variable, a #temporary or a table; the statement then returns no rows, only its count. The target's own errors are the
+// INSERT's (an unconvertible value 245, a duplicate key 2627, a value too long 2628); the lists' lengths are 120, 121 and
+// 213 as SQL Server's INSERT ... SELECT gives them.
+fn outputInto(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, res0: lexdb_exec.Res): Result[lexdb_exec.Res, DbErr] {
+    var res = res0
+    let n = len(res.cols)
+    if len(s.outCols) > 0 && n != len(s.outCols) {
+        if n > len(s.outCols) { return Err(tsErr(121, "The select list for the INSERT statement contains more items than the insert list. The number of SELECT values must match the number of INSERT columns.")) }
+        return Err(tsErr(120, "The select list for the INSERT statement contains fewer items than the insert list. The number of SELECT values must match the number of INSERT columns."))
+    }
+    if len(s.outCols) == 0 {
+        let decl = try sess.tableDecl(&s.outInto)
+        var want = 0
+        for c in decl { if !c.identity { want += 1 } }
+        if n != len(decl) && n != want { return Err(tsErr(213, "Column name or number of supplied values does not match table definition.")) }
+    }
+    if len(res.rows) > 0 {
+        var ins = lexdb_sql.newStmt(lexdb_sql.S_INSERT)
+        ins.table = s.outInto.clone()
+        ins.names = s.outCols.clone()
+        for row in res.rows {
+            var xs: []lexdb_sql.Expr = []
+            for v in row { append(mut &xs, lexdb_sql.Expr.Lit(v.clone())) }
+            append(mut &ins.rows, xs)
+        }
+        let none: []Val = []
+        let nt: []int = []
+        let r = try sess.run(&ins, &none, &nt)
+    }
+    res.rows = []
+    res.cols = []
+    res.hasRows = false
+    return Ok(res)
 }
 
 // The first n of rows.
