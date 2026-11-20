@@ -6209,7 +6209,7 @@ measured). Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6.
   derived query a second time when it has something to push (E3 would
   let the binder do this once).
 - Both off under `SET lexdb_planner = rules`; `lexdb_plan.setRewrites`
-  switches each off for tests. `exec_rewrite` runs 108 queries (outer
+  switches each off for tests. `exec_rewrite` runs 110 queries (outer
   joins of all three kinds, nested, USING, LATERAL; views, derived tables,
   CTEs, parameters, a view as its owner and after a rename) with the
   rewrites, without, with batches off and under the rules: the same rows.
