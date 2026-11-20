@@ -345,10 +345,11 @@ pub type Txn = record {
     // the write's own key string (shared, not copied), one map per tree.
     idxTrees: []int
     idx: []Map[str, int]
-    // Per tree written, the keys of idx[k] sorted, as of its first
-    // sortedN[k] keys (a map's keys stay in the order added): ownRange
-    // sorts only the keys added since, and merges them in.
-    sortedKeys: [][]str
+    // Per tree written, the keys of idx[k] as of its first sortedN[k]
+    // keys (a map's keys stay in the order added), in sorted runs, each
+    // less than half the one before (ownFold): ownRange folds in the keys
+    // added since once they are many, and reads the few left as they are.
+    runs: [][][]str
     sortedN: []int
     created: []int
     snap: int                   // its reads' snapshot's id, -1 for none (reads of the live tree)
@@ -387,7 +388,7 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], sortedKeys: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
+    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], runs: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
                raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
@@ -471,7 +472,7 @@ fn (t: mut &Txn) noteWrite(tree: int, key: &str, i: int) {
     m.put(key.clone(), i)
     append(mut &t.idxTrees, tree)
     append(mut &t.idx, m)
-    append(mut &t.sortedKeys, [])
+    append(mut &t.runs, [])
     append(mut &t.sortedN, 0)
 }
 
@@ -498,7 +499,7 @@ pub fn (t: mut &Txn) putRow(tree: int, key: &str, val: &str, head: int): Result[
 pub fn (t: mut &Txn) indexWrites() {
     t.idxTrees = []
     t.idx = []
-    t.sortedKeys = []
+    t.runs = []
     t.sortedN = []
     for i in 0..len(t.writes) {
         if t.writes[i].op == OP_DELRANGE { continue }
@@ -537,7 +538,7 @@ pub fn (t: mut &Txn) undoTo(n: int) {
     while len(t.cuts) > 0 && t.cuts[len(t.cuts) - 1].pos >= n { let c = pop(mut &t.cuts) }
     t.idxTrees = []
     t.idx = []
-    t.sortedKeys = []
+    t.runs = []
     t.sortedN = []
     for i in 0..len(t.writes) {
         // a range's key is its start, not a key written
@@ -3275,47 +3276,108 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: &str, mode: int): Result[Op
 pub type Entry = value record { pub key: str; pub val: str }
 
 // The transaction's own writes to tree with keys in [from, to) (to "" for no
-// end), sorted, the last write of each key. The tree's keys are kept
-// sorted (sortedKeys), so a scan's call costs the keys in its range and a
-// binary search, not a pass over every write the transaction made: an
-// INSERT ... SELECT's source scan called this per batch while its writes
-// grew, quadratic in the rows (design/lexdb.md 9.109).
+// end), sorted, the last write of each key. The tree's keys are kept in
+// sorted runs (runs), so a scan's call costs the keys in its range and a
+// binary search per run, not a pass over every write the transaction made:
+// an INSERT ... SELECT's source scan called this per batch while its writes
+// grew, quadratic in the rows (design/lexdb.md 9.109). A call that follows
+// a few writes (a unique index's check after each row's entry) reads the
+// keys added since as they are; once they are OWN_PEND or more they are
+// folded into the runs, which keeps each key merged O(log n) times in all:
+// the whole key list merged anew at every call was quadratic again for
+// that case (design/lexdb-batch-gaps.md item 8a).
 fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
     var out: []TxWrite = []
     var k = 0
     while k < len(t.idxTrees) && t.idxTrees[k] != tree { k += 1 }
     if k == len(t.idxTrees) { return out }
     let n = t.idx[k].size()
-    if t.sortedN[k] < n {
-        var added: []str = []
-        for i in t.sortedN[k]..n { append(mut &added, t.idx[k].keyAt(i).clone()) }
-        collections.sortBy(mut &added, fn(a: &str, b: &str): int { return a.cmp(b) })
-        let old = replace(mut &t.sortedKeys[k], [])
-        var merged: []str = withCapacity(len(old) + len(added))
-        var a = 0
-        var b = 0
-        while a < len(old) || b < len(added) {
-            if b == len(added) || (a < len(old) && old[a] < added[b]) {
-                append(mut &merged, old[a].clone())
-                a += 1
-            } else {
-                append(mut &merged, added[b].clone())
-                b += 1
+    if n - t.sortedN[k] >= OWN_PEND { t.ownFold(k) }
+    // the keys added since, in the range, sorted: one more source, after the runs
+    var pend: []str = []
+    for i in t.sortedN[k]..n {
+        let key = t.idx[k].keyAt(i)
+        if key >= from && (len(to) == 0 || key < to) { append(mut &pend, key.clone()) }
+    }
+    if len(pend) > 1 { collections.sortBy(mut &pend, fn(a: &str, b: &str): int { return a.cmp(b) }) }
+    // per source with keys in the range: where they are, next and end
+    var src: []int = []
+    var at: []int = []
+    var end: []int = []
+    for r in 0..len(t.runs[k]) {
+        let lo = collections.lowerBound(&t.runs[k][r], from)
+        let hi = if len(to) == 0 { len(t.runs[k][r]) } else { collections.lowerBound(&t.runs[k][r], to) }
+        if lo < hi {
+            append(mut &src, r)
+            append(mut &at, lo)
+            append(mut &end, hi)
+        }
+    }
+    if len(pend) > 0 {
+        append(mut &src, len(t.runs[k]))
+        append(mut &at, 0)
+        append(mut &end, len(pend))
+    }
+    while len(src) > 0 {
+        var best = 0
+        if len(src) > 1 {
+            for x in 1..len(src) {
+                let a: &str = if src[x] < len(t.runs[k]) { &t.runs[k][src[x]][at[x]] } else { &pend[at[x]] }
+                let b: &str = if src[best] < len(t.runs[k]) { &t.runs[k][src[best]][at[best]] } else { &pend[at[best]] }
+                if a < b { best = x }
             }
         }
-        t.sortedKeys[k] = merged
-        t.sortedN[k] = n
-    }
-    var j = collections.lowerBound(&t.sortedKeys[k], from)
-    while j < len(t.sortedKeys[k]) {
-        if len(to) > 0 && t.sortedKeys[k][j] >= to { break }
-        match t.idx[k].get(&t.sortedKeys[k][j]) {
+        let key: &str = if src[best] < len(t.runs[k]) { &t.runs[k][src[best]][at[best]] } else { &pend[at[best]] }
+        match t.idx[k].get(key) {
             Some(i) { append(mut &out, t.writes[i].clone()) }
             None {}
         }
-        j += 1
+        at[best] += 1
+        if at[best] == end[best] {
+            let last = len(src) - 1
+            src[best] = src[last]
+            at[best] = at[last]
+            end[best] = end[last]
+            let d1 = pop(mut &src)
+            let d2 = pop(mut &at)
+            let d3 = pop(mut &end)
+        }
     }
     return out
+}
+
+// How many keys added since the runs were made ownRange reads as they are.
+const OWN_PEND: int = 64
+
+// The keys of idx[k] added since its runs were made, sorted, made a run;
+// then while the last run is not less than half the one before, the two
+// merged.
+fn (t: mut &Txn) ownFold(k: int) {
+    let n = t.idx[k].size()
+    var added: []str = withCapacity(n - t.sortedN[k])
+    for i in t.sortedN[k]..n { append(mut &added, t.idx[k].keyAt(i).clone()) }
+    collections.sortBy(mut &added, fn(a: &str, b: &str): int { return a.cmp(b) })
+    append(mut &t.runs[k], added)
+    t.sortedN[k] = n
+    while len(t.runs[k]) >= 2 {
+        let r = len(t.runs[k])
+        if len(t.runs[k][r - 1]) * 2 <= len(t.runs[k][r - 2]) { break }
+        let b = pop(mut &t.runs[k])
+        let a = pop(mut &t.runs[k])
+        var merged: []str = withCapacity(len(a) + len(b))
+        var i = 0
+        var j = 0
+        while i < len(a) || j < len(b) {
+            if j == len(b) || (i < len(a) && a[i] < b[j]) {
+                append(mut &merged, a[i].clone())
+                i += 1
+            } else {
+                append(mut &merged, b[j].clone())
+                j += 1
+            }
+        }
+        append(mut &t.runs[k], merged)
+    }
 }
 
 // Calls f on the entries of tree with keys in [from, to) (to "": to the
