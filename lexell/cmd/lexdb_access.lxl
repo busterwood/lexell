@@ -505,11 +505,17 @@ pub fn tailOf(ix: int, los: &[]Val, his: &[]Val, capNulls: bool): Tail {
 // want: the rows the next batch of a backward or point read takes (0: its
 // first size); it doubles per batch up to BROWS, so a LIMIT reads little
 // past its rows. pos: a lookup list's scans taken so far (fillRanges).
-pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int; pub pos: int }
+// An index range read in key order (optimizer 47: sorted): chunk, its
+// entries' primary keys up to at, sorted (a counted handle: a copy of the
+// cursor shares it), pos the next of them to read; at, the index's key to
+// go on from after the chunk; tail, the range has no entries after it.
+pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int; pub pos: int; pub sorted: bool; chunk: Option[rc []str]; tail: bool }
 
-pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0, pos: 0} }
+pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0, pos: 0, sorted: false, chunk: None, tail: false} }
 
-pub fn (c: &Cursor) copy(): Cursor { return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos} }
+pub fn (c: &Cursor) copy(): Cursor {
+    return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos, sorted: c.sorted, chunk: c.chunk.clone(), tail: c.tail}
+}
 
 // The first batch size of a backward or point read, and the next one.
 const FIRST_WANT = 32
@@ -620,6 +626,8 @@ pub fn fetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int
         }
         return Ok(Unit{})
     }
+    // a range read in key order (optimizer 47), or one a batch began so
+    if cur.sorted && ix >= 0 && !sc.whole && !desc { return fetchSorted(st, txn, t, ix, sc, need, cur, out) }
     let byIndex = ix >= 0 && !sc.whole
     let tree = if byIndex { t.indexes[ix].tree } else { t.tree }
     // an index whose entries hold every column used (a SELECT's: need
@@ -882,9 +890,10 @@ pub type IxRead = record {
     pub byKeys: bool
     pub keys: []str
     pub small: bool     // the read may stop early (a LIMIT): its batches start at 32 entries and double to BROWS (the cursor's want)
+    pub sorted: bool    // its range's rows read in key order (optimizer 47: fillSorted), unless the reads are noted
 }
 
-pub fn noIxRead(): IxRead { return IxRead{ix: -1, only: false, dec: IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}, desc: false, byKeys: false, keys: [], small: false} }
+pub fn noIxRead(): IxRead { return IxRead{ix: -1, only: false, dec: IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}, desc: false, byKeys: false, keys: [], small: false, sorted: false} }
 
 // The index entries the batch reads have taken (the tests: a LIMIT's first
 // batch is 32 of them, not BROWS).
@@ -1035,7 +1044,145 @@ pub fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd:
         return Ok(Some(lexdb_rows.newBatch(bp, 0)))
     }
     if rd.only { return fillIdxOnly(st, txn, t, rd, sc, cur, bp) }
+    if (rd.sorted || cur.sorted) && !rd.desc && !rd.byKeys && !txn.noting() { return fillSorted(st, txn, t, rd.ix, sc, part, cur, bp) }
     return fillIdxRows(st, txn, t, rd, sc, part, cur, bp)
+}
+
+// ---- an index range read in key order (optimizer 47)
+//
+// PostgreSQL's bitmap heap scan in lexdb's terms: the range's entries'
+// primary keys are collected (a chunk of at most SORT_CHUNK), sorted, and
+// the rows read by them in that order, so that the rows of a leaf are read
+// together and the leaves in order. The cursor holds the chunk (Cursor);
+// the batches (fillSorted) and the row path (fetchSorted) read from it
+// alike, so a batch that gives way is read again by the row path from its
+// first key.
+
+// The keys a chunk holds at most (about 40 bytes each with their handles).
+const SORT_CHUNK = 262144
+
+var sortChunk: int = SORT_CHUNK
+
+// The chunks' size (the tests: several chunks of a small table; 0 SORT_CHUNK).
+pub fn setSortChunk(n: int) { sortChunk = if n > 0 { n } else { SORT_CHUNK } }
+
+// The chunks of keys sorted (the tests).
+var sortedChunkN: int = 0
+pub fn sortedChunks(): int { return sortedChunkN }
+
+// The cursor's chunk, the next one collected when it is read (none left:
+// done): index ix's entries of sc from the cursor's place on, at most
+// SORT_CHUNK, their primary keys sorted. cur.sorted is set.
+fn sortedChunk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, sc: &Scan, cur: mut &Cursor): Result[Unit, DbErr] {
+    cur.sorted = true
+    match &cur.chunk {
+        Some(ks) { if cur.pos < len(ks) { return Ok(Unit{}) } }
+        None {}
+    }
+    if cur.tail || sc.empty {
+        cur.done = true
+        return Ok(Unit{})
+    }
+    let tree = t.indexes[ix].tree
+    var pks: []str = []
+    var stopKey = ""
+    var full = false
+    let from: str = if cur.started { cur.at.clone() } else { sc.lo.clone() }
+    cur.started = true
+    try st.scanLeaves(txn, tree, &from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        var k = i
+        while k < j {
+            if len(pks) == sortChunk {
+                full = true
+                stopKey = lexdb_rows.leafKey(leaf, k)
+                return false
+            }
+            append(mut &pks, lexdb_rows.leafVal(leaf, k))
+            k += 1
+        }
+        return true
+    })
+    if full { cur.at = stopKey } else { cur.tail = true }
+    idxTaken += len(pks)
+    sortedChunkN += 1
+    let n = len(pks)
+    cur.chunk = Some(rc(sortedKeys(pks)))
+    cur.pos = 0
+    if n == 0 { cur.done = true }
+    return Ok(Unit{})
+}
+
+// Keys ks in key order (sortKeysPerm's), moved.
+pub fn sortedKeys(ks0: []str): []str {
+    var ks = ks0
+    let n = len(ks)
+    var order: []int = withCapacity(n)
+    for i in 0..n { append(mut &order, i) }
+    sortKeysPerm(&ks, mut &order)
+    var out: []str = withCapacity(n)
+    for i in order { append(mut &out, replace(mut &ks[i], "")) }
+    return out
+}
+
+// The next keys of the cursor's chunk to read, at most n (a handle on the
+// chunk and the places [from, to)); the cursor moves past them, done when
+// they are the range's last.
+fn sortedTake(cur: mut &Cursor, n: int, from: mut &int, to: mut &int): Option[rc []str] {
+    let got: Option[rc []str] = cur.chunk.clone()
+    match &got {
+        Some(ks) {
+            from = cur.pos
+            to = min(len(ks), cur.pos + n)
+        }
+        None { return None }
+    }
+    cur.pos = to
+    match &got { Some(ks) { if to == len(ks) && cur.tail { cur.done = true } } None {} }
+    return got
+}
+
+// The next batch of an index range read in key order: up to BROWS rows of
+// the cursor's chunk (the next chunk collected when it is read), read
+// together (rowsOfKeys) and decoded where they lie. None: a value its
+// column's batch does not hold.
+fn fillSorted(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, sc: &Scan, part: bool, cur: mut &Cursor,
+              bp: &BPlan): Result[Option[Batch], DbErr] {
+    try sortedChunk(st, txn, t, ix, sc, cur)
+    if cur.done && cur.chunk.isNone() { return Ok(Some(lexdb_rows.newBatch(bp, 0))) }
+    var from = 0
+    var to = 0
+    let got = sortedTake(cur, BROWS, mut &from, mut &to)
+    if got.isNone() || to == from { return Ok(Some(lexdb_rows.newBatch(bp, 0))) }
+    let ks = got.unwrap()
+    var views: []&str = withCapacity(to - from)
+    for i in from..to { append(mut &views, &ks[i]) }
+    var b = lexdb_rows.newBatch(bp, to - from)
+    var at: []int = []
+    let none: []int = []
+    if !(try rowsOfKeys(st, txn, t, &views, part, bp, &none, mut &b, mut &at)) { return Ok(None) }
+    for r in at { if r < 0 { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) } }
+    return Ok(Some(b))
+}
+
+// fetch's reading of an index range in key order: up to BATCH rows of the
+// cursor's chunk (the next chunk collected when it is read), by key, as
+// the row path reads them (need: fetch's).
+fn fetchSorted(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: int, sc: &Scan, need: &[]bool, cur: mut &Cursor,
+               out: mut &[][]Val): Result[Unit, DbErr] {
+    try sortedChunk(st, txn, t, ix, sc, cur)
+    var from = 0
+    var to = 0
+    let got = sortedTake(cur, BATCH, mut &from, mut &to)
+    if got.isNone() || to == from { return Ok(Unit{}) }
+    let ks = got.unwrap()
+    let rr = rowRead(t, need)
+    for i in from..to {
+        match try getRow(st, txn, t, &rr, &ks[i]) {
+            Some(r) { append(out, r) }
+            None { return Err(lexdb_base.corrupt(&("an index entry of \"" + t.name + "\" without its row"))) }
+        }
+    }
+    return Ok(Unit{})
 }
 
 // The next batch of an index read alone: up to BROWS entries from the

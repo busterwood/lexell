@@ -1688,8 +1688,10 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
                 let scans = try pathScans(&lv.t, &lv.path, &env)
+                let srt = lexdb_plan.keyOrdered(q, k) && !txn.noting()     // (optimizer 47)
                 for sc in scans {
                     var cur = lexdb_access.newCursor()
+                    cur.sorted = srt
                     while !cur.done { try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &rows) }
                 }
             }
@@ -2177,6 +2179,9 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 byKeys = true
             }
         }
+        // a range read in key order (optimizer 47), as the batches read it
+        // (not its keys the switch counted: in the index's order, as theirs)
+        let srt = k == 0 && lexdb_plan.keyOrdered(q, k) && !txn.noting()
         if byKeys {
             // the range's primary keys, already read: its rows, one by one
             let t = &lv.t
@@ -2195,6 +2200,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
             try warmPoints(st, txn, &lv.t, &scans)
             for sc in scans {
                 var cur = lexdb_access.newCursor()
+                cur.sorted = srt
                 while !cur.done {
                     var batch: [][]Val = []
                     try fetch(st, txn, &lv.t, &lv.path, &sc, &lv.need, mut &cur, mut &batch)
@@ -3301,7 +3307,7 @@ fn explainLines(q: &Query, cnt: &[]lexdb_pipe.Counts): []str {
         let tn = lexdb_sql.baseName(&lv.t.name)
         let name = if lv.alias == tn { tn } else { tn + " " + lv.alias }
         if k == 0 {
-            append(mut &out, "scan " + name + ": " + lexdb_plan.pathText(lv) + tail)
+            append(mut &out, "scan " + name + ": " + lexdb_plan.pathTextAt(q, k) + tail)
             continue
         }
         let kind = match lv.join {
@@ -3317,9 +3323,9 @@ fn explainLines(q: &Query, cnt: &[]lexdb_pipe.Counts): []str {
         } else if len(lv.hashCols) > 0 {
             var cs: []str = []
             for c in lv.hashCols { append(mut &cs, lv.t.cols[c].name.clone()) }
-            how = "hash on (" + strings.join(&cs, ", ") + ") over " + lexdb_plan.pathText(lv)
+            how = "hash on (" + strings.join(&cs, ", ") + ") over " + lexdb_plan.pathTextAt(q, k)
         } else {
-            how = "loop over " + lexdb_plan.pathText(lv)
+            how = "loop over " + lexdb_plan.pathTextAt(q, k)
         }
         append(mut &out, kind + name + ": " + how + tail)
     }
@@ -4242,7 +4248,7 @@ fn defaultValue(x: &Expr, c: &lexdb_sql.ColDef, se: &Option[SeqEnv]): Result[Val
 
 // Whether the table has a row (col < 0), or a row whose column col is NULL.
 fn anyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[bool, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     let sc = lexdb_access.allScan()
     var need: []bool = []
     if col >= 0 {
@@ -4477,7 +4483,7 @@ fn intRank(oid: int): int {
 
 // What column i of t holds: whether any row has a value there, and the longest text (in bytes).
 fn columnData(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: int): Result[[]int, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     let sc = lexdb_access.allScan()
     var need: []bool = []
     for k in 0..len(t.cols) { append(mut &need, k == col) }
@@ -4738,7 +4744,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             n += 1
         }
     } else {
-        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+        let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
         let sc = lexdb_access.allScan()
         var cur = lexdb_access.newCursor()
         while !cur.done {
@@ -5631,7 +5637,7 @@ fn pruneInvalid(t: mut &Table) {
 
 // The rows of t against check c (23514).
 fn checkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &Check): Result[Unit, DbErr] {
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     let sc = lexdb_access.allScan()
     var cur = lexdb_access.newCursor()
     while !cur.done {
@@ -6840,7 +6846,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         // always reads by the key, so that a row it changed is not found again (the Halloween problem across
         // batches), and may not change the key, which would move a row past the cursor
         if q.levels[0].path.index >= 0 || q.levels[0].path.desc {
-            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+            q.levels[0].path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
         }
         win.keyed = true
         for k in targets { for p in q.levels[0].t.pk { if p == k {
@@ -12602,7 +12608,7 @@ fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &
     let n = len(cols)
     var crow = array(len(c.cols), Val.Null)
     for j in 0..n { crow[cols[j]] = vals[j].clone() }
-    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     var sc = lexdb_access.allScan()
     if prefixSame(&c.pk, n, cols) {
         sc = lexdb_access.prefixScan(&lexdb_catalog.relOf(c), -1, &crow, n)
@@ -13128,7 +13134,7 @@ fn fkName(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, c: &lexd
 // The rows of t against its foreign key f to table p (23503).
 fn fkRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, f: &ForeignKey, p: &Table): Result[Unit, DbErr] {
     let fc = fkCols(t, f, p)
-    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    let path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     let sc = lexdb_access.allScan()
     var cur = lexdb_access.newCursor()
     while !cur.done {
@@ -15853,6 +15859,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
                 rd.byKeys = true
                 rd.keys = keys
             }
+            rd.sorted = lexdb_plan.keyOrdered(q, 0)      // (optimizer 47)
         }
     }
     let part = len(lv.need) > 0

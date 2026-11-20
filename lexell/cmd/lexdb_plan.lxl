@@ -74,18 +74,19 @@ pub const COST_PK_RANGE: float = 1.8f
 pub const COST_DESCENT: float = 12.0f
 pub const COST_KEY_ROW: float = 36.0f
 pub const COST_IX_ROW: float = 49.0f
+// a row of an index range read in key order (optimizer 47.9: 10 to 13 units
+// at 3% to 5% of an orders-wide table, 14 to 16 of a narrow one)
+pub const COST_SORTED_ROW: float = 12.0f
 pub const HASH_PROBE: float = 2.0f
 pub const HASH_BUILD: float = 19.0f
 pub const ROW_COST: float = 2.0f
 pub const EQ_GUESS: float = 0.25f
 pub const HASH_MAX_BYTES: float = 67108864.0f
-// A range over at least this share of the table is read as a scan: the
-// index's entries and rows cost more than reading the table once. The
-// threshold is twice the measured crossover (SWITCH_TIMES), so a sampling
-// error does not put the plan on the wrong path; PostgreSQL would keep a
-// 3% index range and use a bitmap scan, which LexDB does not have yet.
-// The plan decides from ANALYZE's samples; the counted switch (optimizer
-// 38) is the fallback for a range they do not estimate.
+// A range over at least this share of the table was read as a scan, before
+// ranges were read in key order (optimizer 47: scanFirst now decides by
+// COST_SORTED_ROW; this is KO_NEVER's rule). The plan decides from
+// ANALYZE's samples; the counted switch (optimizer 38) is the fallback for
+// a range they do not estimate.
 pub const SCAN_SHARE: int = 32
 // The switch is for tables where reading the index is real work; a small
 // table's index-only range is cheap and keeps its order.
@@ -105,6 +106,9 @@ pub type Path = record {
     pub inArr: []Expr       // or x = ANY (array): its one expression, a lookup per element (9.28); [] none
     pub stats: bool         // a pure range the planner chose from its samples: the executor need not recount (optimizer 19)
     pub inMax: int          // inSub: the most values looked up one by one; more and the table is read whole (0: IN_LOOKUP_MAX)
+    // an index's range (or equality prefix) the cost planner reads in key
+    // order where keyOrdered says it may (optimizer 47)
+    pub sorted: bool
 }
 
 // Whether a table read by path p is read in batches when its scans are
@@ -225,6 +229,7 @@ pub type PScan = record {
     // read alone that its entries cannot give)
     pub batch: bool
     pub stops: bool         // the reading may stop early (a LIMIT): an index's batches start small and double (Cursor.want)
+    pub sorted: bool        // its index range read in key order (optimizer 47: keyOrdered)
     // the rows the run holds (item 6 of design/lexdb-batch-gaps.md: a derived
     // table, view, CTE, VALUES, function scan or catalog relation) the level
     // reads, as the subquery in FROM it is: its number; -1 a table. Cut into
@@ -428,7 +433,7 @@ fn scanNeed(sc: PScan, used: &[]bool): PScan {
     return s
 }
 
-pub fn noScan(): PScan { return PScan{level: -1, first: 0, kinds: [], need: [], part: false, batch: false, stops: false, held: -1} }
+pub fn noScan(): PScan { return PScan{level: -1, first: 0, kinds: [], need: [], part: false, batch: false, stops: false, sorted: false, held: -1} }
 
 // The query's columns x reads, set in used.
 fn uses(x: &lexdb_bind.BX, used: mut &[]bool) {
@@ -1626,7 +1631,7 @@ fn (q: &Query) constWay(k: int, cands: &[]WayCand, cs: &[]Expr, cols: &[]int): b
             if !konst { break }
             append(mut &eqs, Expr.Lit(Val.Null))
         }
-        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+        let p = Path{index: wc.index, eqs: eqs, rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
         if !servesOrder(&lv.t, &p, cols) { return true }
     }
     return false
@@ -2521,7 +2526,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
     for c0 in 0..len(t.indexes) + 1 {
         let c = c0 - 1
         if c >= 0 && t.indexes[c].pred.isSome() { continue }
-        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+        let p = Path{index: c, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
         if servesOrder(t, &p, &cols) {
             for x in cols { append(out, x) }
             return lv
@@ -2765,14 +2770,15 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if c < 0 { score = 500 } else if lv.t.indexes[c].unique { score = 499 }
         }
         if score == 0 { continue }
-        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr, stats: false, inMax: 0}
+        var p = Path{index: c, eqs: eqs, rng: rng, desc: false, noNulls: false, ins: ins, inSub: inSub, inArr: inArr, stats: false, inMax: 0, sorted: false}
         if lv.readOnce && q.pathOuter(&p) { continue }          // read once (optimizer 26)
         let po = q.pathOuter(&p)
         var saved: []Expr = []
         if fdiff { saved = replace(mut &p.eqs, feqs) }
         let f = pathFig(lv, &p, params)
-        // The first table's pure range, if the samples estimate it over
-        // 1/SCAN_SHARE of the table, is read as a scan: skip the candidate.
+        // The first table's pure range, if the samples estimate it as
+        // costing more than a scan (scanFirst: read in key order, optimizer
+        // 47, over about 1/24 of the table), is read as a scan: skip it.
         // (A later table's range is a hash build, read once: q10's orders
         // range of 3.8% is 57k rows to build from and 1.5M to scan.) A
         // range they estimate as narrower is the planner's index (stats: the
@@ -2781,9 +2787,12 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         if !q.pinned && k == 0 && c >= 0 && lv.est.rows >= SCAN_MIN_ROWS &&
            len(p.eqs) == 0 && len(p.rng) > 0 && len(cols) > 0 && cols[0] >= 0 &&
            f.rows >= 0 && !f.bound && lv.est.rows > 0 && !ixCovers(lv, c) {
-            if f.rows * SCAN_SHARE >= lv.est.rows { continue }
+            if scanFirst(f.rows, lv.est.rows) { continue }
             p.stats = true
         }
+        // the calibration's forced modes: the first table's pure range by
+        // its index whatever its size (no counted switch)
+        if forcedIndex() && k == 0 && c >= 0 && len(p.eqs) == 0 && len(p.rng) > 0 && !ixCovers(lv, c) { p.stats = true }
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_stats.noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
@@ -2816,7 +2825,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         append(mut &looks, lo)
         if best < 0 || score > scores[best] { best = len(scores) - 1 }
     }
-    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} }
+    if best < 0 { return Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false} }
     var pick = best
     if scores[best] < 999 && figs[best].rows >= 0 {
         var pc = figCost(&figs[best], paths[best].index, k == 0)
@@ -2842,7 +2851,7 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             }
         }
     }
-    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0})
+    return replace(mut &paths[pick], Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false})
 }
 
 // A level read once (a hash join, optimizer 26) takes only the bounds whose
@@ -2892,7 +2901,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 }
 
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
-    return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}, cond: [],
+    return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
                  lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
 }
@@ -3206,14 +3215,17 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         if !q.levels[k].virt() && q.levels[k].est.rows < 0 && !hs.rules && !txn.noting() && hasInSub(&m) {
             q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, true, hs.rules)
         }
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0} } else {
+        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false} } else {
             choosePath(q, k, &m, params, mut &sc.looks)
         }
+        // the cost planner's index range: read in key order where keyOrdered
+        // says it may (optimizer 47)
+        if !hs.rules && !q.levels[k].virt() { path.sorted = sortable(&q.levels[k].t, &path) }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
             // Every row of it is kept: read it all once, and remember which joined.
-            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+            path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
             perRow = false
         }
         var local: []Expr = []
@@ -3840,7 +3852,7 @@ fn semiLook(q: &Query, i: int, anti: bool, pt: &[]int): Level {
     let alias = "\x00sj" + (i + 1).toStr()
     let first = len(q.cols)
     var names: []str = []
-    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+    var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
     var conds: []Expr = []
     var estRows = -1
     var estMax = false
@@ -4529,7 +4541,12 @@ fn estText(lv: &Level): str {
     return if lv.estMax { " (at most " } else { " (estimated " } + lv.estRows.toStr() + " rows)"
 }
 
-pub fn pathText(lv: &Level): str {
+pub fn pathText(lv: &Level): str { return pathTextOf(lv, false) }
+
+// Level k's path's text, naming a range read in key order (optimizer 47).
+pub fn pathTextAt(q: &Query, k: int): str { return pathTextOf(&q.levels[k], keyOrdered(q, k)) }
+
+fn pathTextOf(lv: &Level, keyOrder: bool): str {
     if lv.lateral { return "rows of subquery " + (lv.src + 1).toStr() + ", run" }
     if lv.src >= 0 { return "rows of subquery " + (lv.src + 1).toStr() }
     if lv.work >= 0 { return "rows of the working table" }
@@ -4549,7 +4566,7 @@ pub fn pathText(lv: &Level): str {
     }
     let what = if len(p.eqs) == len(cols) { " lookup" } else if len(p.eqs) > 0 || len(p.rng) > 0 { " range" } else { " scan" }
     let filtered = if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" }
-    let alone = if ixCovers(lv, p.index) { ", index only" } else { "" }
+    let alone = if ixCovers(lv, p.index) { ", index only" } else if keyOrder { ", rows in key order" } else { "" }
     return "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + filtered + what + (if p.desc { " backward" } else { "" }) + alone + estText(lv)
 }
 
@@ -4765,7 +4782,7 @@ pub fn orderedScan(q: &Query, cols: &[]int, params: &[]Val, lk: mut &[]Look): Op
     let t = &q.levels[0].t
     for c0 in 0..len(t.indexes) + 1 {
         if !q.usable(0, c0 - 1, &q.levels[0].cond, params, lk) { continue }
-        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0}
+        let p = Path{index: c0 - 1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
         if servesOrder(t, &p, cols) { return Some(c0 - 1) }
     }
     return None
@@ -4824,6 +4841,63 @@ fn lookupPath(q: &Query, lv: &Level): bool {
 pub fn ixCovers(lv: &Level, ix: int): bool {
     if ix < 0 || lv.lock != 0 || len(lv.need) == 0 || lv.virt() { return false }
     return lexdb_access.idxDecOf(&lexdb_catalog.relOf(&lv.t), ix, &lv.need).isSome()
+}
+
+// ---- index ranges read in key order (optimizer 47)
+
+// How the cost planner reads a range in key order: KO_COST by its cost
+// (the default); the others for the tests and the calibration, process
+// wide: KO_NEVER never (the plans before it), KO_SORTED the first table's
+// range always by its index and in key order, KO_PLAIN always by its index
+// and in the index's order.
+pub const KO_COST: int = 0
+pub const KO_NEVER: int = 1
+pub const KO_SORTED: int = 2
+pub const KO_PLAIN: int = 3
+
+var keyOrderMode: int = KO_COST
+
+pub fn setKeyOrder(mode: int) { keyOrderMode = mode }
+
+// Whether the first table's pure range of n entries (by its samples) of a
+// table of rows is read as a scan rather than by its index (choosePath).
+// Its rows are read in key order (keyOrdered), so the scan wins where
+// twice that read's cost is over the scan's: 2 * (COST_DESCENT + n *
+// COST_SORTED_ROW) >= rows * COST_SCAN, about 1/24 of the table (the factor
+// 2 leans to the scan, whose cost does not depend on the estimate; the
+// measured crossover is near 1/10, optimizer 47.9). KO_NEVER: the rule
+// before it, over 1/SCAN_SHARE. KO_SORTED and KO_PLAIN: never.
+fn forcedIndex(): bool { return keyOrderMode == KO_SORTED || keyOrderMode == KO_PLAIN }
+
+fn scanFirst(n: int, rows: int): bool {
+    if forcedIndex() { return false }
+    if keyOrderMode == KO_NEVER { return n * SCAN_SHARE >= rows }
+    return 2.0f * (COST_DESCENT + float(n) * COST_SORTED_ROW) >= float(rows) * COST_SCAN
+}
+
+// Whether path p is one the cost planner may read in key order: an
+// index's range or equality prefix (not a whole unique key's lookup), read
+// forward, not a lookup list.
+pub fn sortable(t: &Table, p: &Path): bool {
+    if p.index < 0 || p.desc || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 { return false }
+    if len(p.eqs) == 0 && len(p.rng) == 0 { return false }
+    return !(t.indexes[p.index].unique && len(p.eqs) == len(t.indexes[p.index].cols))
+}
+
+// Whether level k of q reads its path's range in key order (optimizer 47:
+// its entries' primary keys collected, sorted, its rows read by them): a
+// path the cost planner marked (Path.sorted), of the first table or of one
+// read once (a hash's), not chosen for its order (keeps), not where the
+// reading may stop early (stops), not locked, not an index read alone. (A
+// transaction whose reads are noted reads it in the index's order: the
+// readers' check.)
+pub fn keyOrdered(q: &Query, k: int): bool {
+    let lv = &q.levels[k]
+    let p = &lv.path
+    if !p.sorted || keyOrderMode == KO_NEVER || keyOrderMode == KO_PLAIN { return false }
+    if (k > 0 && lv.perRow) || lv.keeps || lv.stops || lv.lock != 0 || lv.virt() || lv.lateral || lv.semi || lv.anti || lv.semiSub >= 0 ||
+       !sortable(&lv.t, p) { return false }
+    return !ixCovers(lv, p.index)
 }
 
 pub const NV_LAST = 1         // MrNav.kind: LAST(x, off), and a plain column
@@ -4969,7 +5043,7 @@ pub fn scanArm(q: &Query, aggs: bool): PScan {
     // (rows the run holds: always read as batches, or row by row if few)
     let held = if lv.virt() { lv.src } else { -1 }
     let batch = held >= 0 || firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
-    return PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, held: held}
+    return PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, sorted: batch && keyOrdered(q, 0), held: held}
 }
 
 // Scan (ps, its query's subqueries), under a Filter of cs if any.
@@ -5011,7 +5085,7 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
         let batch = scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
         var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
-                                 scan: PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, held: -1},
+                                 scan: PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, sorted: batch && !lv.perRow && keyOrdered(q, k), held: -1},
                                  build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
                                  rng: [], capNulls: false, noNulls: lv.path.noNulls}
         j.mark = mark

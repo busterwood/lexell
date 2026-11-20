@@ -1,0 +1,240 @@
+// lexdb_exec: index ranges read in key order (lexdb-optimizer.md 47:
+// PostgreSQL's bitmap heap scan for lexdb). A range's entries' primary
+// keys are collected in chunks, sorted, and the rows read by them.
+// The same statements run six ways must give the same rows (sorted where
+// the statement leaves their order open; as given where ORDER BY sets it)
+// and the same errors: read in key order (lexdb_plan.KO_SORTED) with
+// batches on and off, in the index's order (KO_PLAIN) on and off, the
+// plans before this (KO_NEVER), the rules planner; and the same as the
+// table without the index (its column wrapped: k + 0). Read in key order,
+// batches on and off give their rows in the same order: by the primary
+// key within a chunk. Chunks of 1,000 keys (setSortChunk) so that the
+// wider ranges take several.
+// - Ranges of 0.1%, 1%, 5%, 20% and 50% of 20,000 rows, NULLs in the
+//   column (never in a range), rows out, aggregates, ORDER BY the index's
+//   column (read in its order, not in key order) and another, a LIMIT
+//   (never in key order), a composite index's equality and range, a
+//   composite primary key, a covering index (read alone, never in key
+//   order), a hash join's table read once through its range.
+// - The scan's cut-off: 3.5% of the table read by its index in key order,
+//   5% scanned (and 3.5% scanned by the rule before it, 1/32).
+// - A division by zero on a row of a later batch: the same error every way.
+// - In a block that writes (its reads noted): the index's order; its own
+//   rows seen.
+// expect: explain: scan t: index t_k range, rows in key order (estimated 297 rows)
+// expect: explain covering: scan t: index t_k range, index only (estimated 297 rows)
+// expect: explain order by k: scan t: index t_k range (estimated 297 rows); order: the scan's
+// expect: explain limit: scan t: index t_k range (estimated 297 rows); limit: stops the scan
+// expect: explain 3.5%: scan t: index t_k range, rows in key order (estimated 693 rows)
+// expect: explain 5%: scan t: full scan
+// expect: explain composite: scan t: index t_ab range, rows in key order (at most 400 rows)
+// expect: explain rules: scan t: index t_k range
+// expect: explain plain: scan t: index t_k range (estimated 297 rows)
+// expect: explain 3.5% before: scan t: full scan
+// expect: explain hash: scan p: full scan; join t: hash on (b) over index t_k range, rows in key order (estimated 989 rows); aggregate
+// expect: statements 36, the same every way 36, key order the same on and off 36; longer ranges 28, read in key order 28
+// expect: error: ERROR 22012 division by zero
+// expect: chunks: true
+// expect: noted: the same true; read in key order 0
+// timeout: 120
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_access"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): []str {
+    var out: []str = []
+    match s.exec(sql) {
+        Ok(rs) {
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+        }
+        Err(e) { append(mut &out, "ERROR " + e.state + " " + e.msg) }
+    }
+    return out
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): str { return strings.join(&q(s, sql), "; ") }
+
+fn sorted(xs: []str): []str {
+    var ys = xs
+    collections.sortBy(mut &ys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    return ys
+}
+
+fn same(a: &[]str, b: &[]str): bool {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) { if a[i] != b[i] { return false } }
+    return true
+}
+
+// sql read the six ways and without the index (ref, the same statement
+// over k + 0); ordered: its order is the statement's. Whether all agree;
+// inOrder: key order's rows came in the same order with batches on and off;
+// keyed: the key-ordered read ran (chunks were sorted).
+fn sixWays(s: mut &lexdb_exec.Session, sql: &str, ref: &str, ordered: bool, inOrder: mut &bool, keyed: mut &bool): bool {
+    var outs: [][]str = []
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_SORTED)
+    let c0 = lexdb_access.sortedChunks()
+    let k1 = q(s, sql)
+    let c1 = lexdb_access.sortedChunks()
+    let x = q(s, &"set lexdb_batch = off")
+    let k2 = q(s, sql)
+    let c2 = lexdb_access.sortedChunks()
+    let y = q(s, &"set lexdb_batch = on")
+    keyed = c1 > c0 && c2 > c1
+    inOrder = same(&k1, &k2)
+    append(mut &outs, k1)
+    append(mut &outs, k2)
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_PLAIN)
+    append(mut &outs, q(s, sql))
+    let x2 = q(s, &"set lexdb_batch = off")
+    append(mut &outs, q(s, sql))
+    let y2 = q(s, &"set lexdb_batch = on")
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_NEVER)
+    append(mut &outs, q(s, sql))
+    let r1 = q(s, &"set lexdb_planner = rules")
+    append(mut &outs, q(s, sql))
+    let r2 = q(s, &"set lexdb_planner = cost")
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_COST)
+    append(mut &outs, q(s, ref))
+    let want = if ordered { outs[len(outs) - 1].clone() } else { sorted(outs[len(outs) - 1].clone()) }
+    for o in outs {
+        let got = if ordered { o.clone() } else { sorted(o.clone()) }
+        if !same(&got, &want) {
+            println("differs: " + sql + "\n  got " + strings.join(&got, " ") + "\n  want " + strings.join(&want, " "))
+            return false
+        }
+    }
+    return true
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str { return one(s, &("explain " + sql)) }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for x in [
+        // k: a permutation of 0..19999 (7 is prime to 20000), NULL every 97th row
+        "create table t (id int primary key, k int, a int, b int, v int, name text)",
+        "insert into t select g, case when g % 97 = 0 then null else (g * 7) % 20000 end, g % 50, (g * 13) % 1000, (g * 31) % 1009, 'n' || (g % 211) from generate_series(1, 20000) g",
+        "create index t_k on t (k)",
+        "create index t_ab on t (a, b)",
+        "create table u (x int, y int, z int, w text, primary key (x, y))",
+        "insert into u select g % 300, g, (g * 11) % 9000, 'w' || g from generate_series(1, 9000) g",
+        "create index u_z on u (z)",
+        "create table p (id int primary key, g int, tag text)",
+        "insert into p select g, g % 1000, 't' || (g % 7) from generate_series(0, 29999) g",
+        "analyze",
+    ] { let r = q(mut &s, &x) }
+    lexdb_access.setSortChunk(1000)
+    println("explain: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1300"))
+    println("explain covering: " + plan(mut &s, &"select id, k from t where k >= 1000 and k < 1300"))
+    println("explain order by k: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1300 order by k"))
+    println("explain limit: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1300 limit 5"))
+    // the scan's cut-off by the key-ordered read's cost (scanFirst): 3.5% of
+    // the table by its index, 5% scanned; before it (KO_NEVER), over 1/32
+    println("explain 3.5%: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1700"))
+    println("explain 5%: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 2000"))
+    println("explain composite: " + plan(mut &s, &"select id, v from t where a = 3 and b < 100"))
+    let r1 = q(mut &s, &"set lexdb_planner = rules")
+    println("explain rules: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1300"))
+    let r2 = q(mut &s, &"set lexdb_planner = cost")
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_NEVER)
+    println("explain plain: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1300"))
+    println("explain 3.5% before: " + plan(mut &s, &"select id, v from t where k >= 1000 and k < 1700"))
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_SORTED)
+    println("explain hash: " + plan(mut &s, &"select count(*), sum(t.v) from p join t on t.b = p.g where t.k < 1000"))
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_COST)
+    // (statement, its reference without the index, whether its order is
+    // set, whether its range is short: up to 64 entries, read by the keys the
+    // switch counted, sorted, not by chunks)
+    var cases: [][]str = []
+    for r in [[0, 20], [5000, 5200], [7000, 8000], [3000, 7000], [10000, 20000]] {
+        let lo = r[0].toStr()
+        let hi = r[1].toStr()
+        let short = if r[1] - r[0] <= 64 { "s" } else { "" }
+        let w = "k >= " + lo + " and k < " + hi
+        let wr = "k + 0 >= " + lo + " and k + 0 < " + hi
+        append(mut &cases, ["select id, k, v, name from t where " + w, "select id, k, v, name from t where " + wr, "n", short.clone()])
+        append(mut &cases, ["select count(*), sum(v), min(name), max(id) from t where " + w, "select count(*), sum(v), min(name), max(id) from t where " + wr, "y", short.clone()])
+        append(mut &cases, ["select id, v from t where " + w + " order by v, id", "select id, v from t where " + wr + " order by v, id", "y", short.clone()])
+        append(mut &cases, ["select name, count(*), sum(v) from t where " + w + " group by name", "select name, count(*), sum(v) from t where " + wr + " group by name", "n", short.clone()])
+        append(mut &cases, ["select id, v from t where " + w + " and v > 500", "select id, v from t where " + wr + " and v > 500", "n", short.clone()])
+        append(mut &cases, ["select count(*), sum(t.v), min(p.tag) from p join t on t.b = p.g where t." + w, "select count(*), sum(t.v), min(p.tag) from p join t on t.b = p.g where t." + wr, "y", short.clone()])
+    }
+    append(mut &cases, ["select id, b, v from t where a = 3 and b < 100", "select id, b, v from t where a + 0 = 3 and b + 0 < 100", "n", "s"])
+    append(mut &cases, ["select id, b, v from t where a = 3 and b < 900", "select id, b, v from t where a + 0 = 3 and b + 0 < 900", "n", ""])
+    append(mut &cases, ["select x, y, w from u where z < 17", "select x, y, w from u where z + 0 < 17", "n", "s"])
+    append(mut &cases, ["select x, y, w from u where z < 4000", "select x, y, w from u where z + 0 < 4000", "n", ""])
+    append(mut &cases, ["select id, k from t where a = 7", "select id, k from t where a + 0 = 7", "n", ""])
+    // a condition the batches cannot take on a later batch's rows (10 / 0 on
+    // the OR's right, which the row path does not reach): that batch read by
+    // the row path from its first key, and on, over several chunks
+    append(mut &cases, ["select id, v from t where k >= 2000 and k < 9000 and (v = 0 or 10 / v > 0)",
+                        "select id, v from t where k + 0 >= 2000 and k + 0 < 9000 and (v = 0 or 10 / v > 0)", "n", ""])
+    var n = 0
+    var good = 0
+    var orderOk = 0
+    var keyedN = 0
+    var longN = 0
+    for c in cases {
+        n += 1
+        var inOrder = false
+        var keyed = false
+        if sixWays(mut &s, &c[0], &c[1], c[2] == "y", mut &inOrder, mut &keyed) { good += 1 }
+        if inOrder { orderOk += 1 } else { println("order differs on and off: " + c[0]) }
+        if c[3] != "s" {
+            longN += 1
+            if keyed { keyedN += 1 } else { println("not read in key order: " + c[0]) }
+        }
+    }
+    println("statements " + n.toStr() + ", the same every way " + good.toStr() + ", key order the same on and off " + orderOk.toStr() +
+            "; longer ranges " + longN.toStr() + ", read in key order " + keyedN.toStr())
+    // a division by zero on a later batch's row (v = 0 at id 1009 and its multiples)
+    var errs: []str = []
+    let dz = "select id from t where k >= 2000 and k < 9000 and 10 / v > 0"
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_SORTED)
+    append(mut &errs, one(mut &s, &dz))
+    let e1 = q(mut &s, &"set lexdb_batch = off")
+    append(mut &errs, one(mut &s, &dz))
+    let e2 = q(mut &s, &"set lexdb_batch = on")
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_PLAIN)
+    append(mut &errs, one(mut &s, &dz))
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_COST)
+    append(mut &errs, one(mut &s, &"select id from t where k + 0 >= 2000 and k + 0 < 9000 and 10 / v > 0"))
+    var allSame = true
+    for e in errs { if e != errs[0] { allSame = false } }
+    println("error: " + (if allSame { errs[0].clone() } else { strings.join(&errs, " / ") }))
+    let c0 = lexdb_access.sortedChunks()
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_SORTED)
+    let big = q(mut &s, &"select count(*), sum(v) from t where k >= 1000 and k < 9000")
+    println("chunks: " + (lexdb_access.sortedChunks() - c0 >= 8).toStr())
+    // in a block that writes: read in the index's order, its own rows seen
+    let b1 = q(mut &s, &"begin")
+    let b2 = q(mut &s, &"insert into t values (30001, 7500, 1, 1, 5, 'own'), (30002, 7501, 1, 1, 6, 'own')")
+    let b3 = q(mut &s, &"delete from t where id = 1072")
+    let c1 = lexdb_access.sortedChunks()
+    let inBlock = q(mut &s, &"select id, k, v from t where k >= 7000 and k < 8000")
+    let c2 = lexdb_access.sortedChunks()
+    let refBlock = q(mut &s, &"select id, k, v from t where k + 0 >= 7000 and k + 0 < 8000")
+    let b4 = q(mut &s, &"rollback")
+    lexdb_plan.setKeyOrder(lexdb_plan.KO_COST)
+    println("noted: the same " + same(&sorted(inBlock), &sorted(refBlock)).toStr() + "; read in key order " + (c2 - c1).toStr())
+    return 0
+}
+
+fn main() {
+    let o = lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}
+    lexdb_store.run(lexdb_disk.sim(47), o, body).unwrap()
+}

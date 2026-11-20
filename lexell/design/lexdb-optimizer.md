@@ -2901,3 +2901,339 @@ a first store run, measured in a second. Run with the costs before section
   batches, column leaves and the work since), the rules' from 5.55 s to
   1.64. The point queries Q1 to Q4 are slower on settled tables (60
   against 53 µs for Q1): a row taken from a column leaf costs more.
+
+## 47. Index ranges read in key order: PostgreSQL's bitmap heap scan for lexdb (2026-11-20)
+
+Item Q4 of lexdb-layers.md 6.3. The largest plan-shape gap left in TPC-H
+(lexdb-layers.md 6.1): q4 reads all of orders (1.5M rows for 57k) where
+PostgreSQL bitmap-scans `orders_date`, and q14 reads lineitem's
+`lineitem_shipdate` range (76k of 6M rows) entry by entry where PostgreSQL
+bitmap-scans it. TPC-H on 20 Nov (lexdb-benchmarks.md 1.6, main 0f96fee9,
+`-O`): q4 296.9 ms against PostgreSQL's 192.9 on one core, q14 216.3 against
+147.5, q19 94.8 against 44.6.
+
+### 47.1 What the access path is, in lexdb's terms
+
+PostgreSQL's tables are heaps: an index entry holds a tuple's address, and a
+bitmap heap scan collects the addresses of an index range (or of several,
+ANDed or ORed: `BitmapAnd`, `BitmapOr`) into a bitmap by page, then reads the
+pages in physical order, each once, rechecking the condition on its tuples.
+lexdb's tables are index-organised: a row lives in its primary key's B-tree,
+and a secondary index entry holds the row's primary key. The same idea in
+lexdb's terms:
+
+1. read the index range's entries (in place, `scanLeaves`; 2.4 units an
+   entry, section 45), keeping each entry's primary key;
+2. sort the keys (a radix sort for an integer key, `sortKeysPerm`);
+3. read the rows by key in that order (`getManyIn`: each key found from the
+   leaf of the one before, a column leaf's rows picked together,
+   `colsPick`), in batches of `BROWS` rows, and apply the level's
+   conditions to them.
+
+Rows of the same leaf are then read together and the leaves in order: each
+leaf of the table is visited at most once per chunk, and the B-tree walk
+between two keys goes up only as far as their common node. The keys are
+collected in chunks, not without bound: past `SORT_CHUNK` keys (256k, about
+10 MB) the chunk read so far is sorted and read, then the next one.
+
+**How far the batch path already goes.** The batch path (9.107, section 43)
+already sorts each batch's keys: `fillIdxRows` reads 1,024 entries, sorts
+their primary keys and reads them with `getManyIn`. A batch of 1,024 keys
+spread over a 1.5M-row table lands about one key per leaf, so the sort helps
+the walk between leaves but no two rows share a leaf. Measured on the TPC-H
+data (SF1, a server, warm, `-O`, ms, the median of 5; an experiment build
+whose index batches were one batch of the whole range):
+
+| | q4 | q14 |
+|---|---:|---:|
+| main's plan (q4: orders scanned; q14: the index, 1,024 keys a batch) | 231 | 182 |
+| q4: orders by `orders_date`, 1,024 keys a batch | 230 | |
+| the whole range's keys sorted, then read | **184** | **132** |
+
+So the batches' own sort gives nothing on q4 (230 against the scan's 231);
+sorting the whole range gives 20% on q4 and 27% on q14. Most of it is the
+reading of the rows, and on q4 also the semi join after it: orders' rows
+come in key order, so the 57,218 lookups into lineitem by `l_orderkey` come
+in key order too.
+
+### 47.2 When it wins
+
+- **Selectivity.** Against the plain index read: always, once a range holds
+  more than one batch (below that both are one sorted batch). Against a
+  scan: up to a share of the table where reading the picked rows costs as
+  much as scanning every row (47.3; the band starts where section 45's index
+  read stops, near 1/49 of the table, and goes up to the share calibration
+  finds).
+- **Row width.** A scan pays for every row's columns used, decoded a column
+  at a time; the sorted read pays a descent and a pick per row. Wider rows
+  put fewer rows in a leaf, so a range of the same share touches more
+  leaves, and a scan also reads more leaves. Statistics hold no leaf counts,
+  so the model is per row, calibrated on a TPC-H-like width (as section 45).
+- **A covering index: never.** An index read alone (9.107) costs 2.4 units
+  an entry and never reads a row; the sorted read is for ranges whose rows
+  must be read.
+- **Not for a primary key range** (it is in key order already), an IN list
+  or an array's elements (`fillRanges` reads their ranges a chunk at a time,
+  each in key order), or a range read backward.
+
+### 47.3 Its cost
+
+In the model's units (a row scanned in batches is 1; section 45):
+
+    sorted(n) = COST_DESCENT + n * COST_SORTED_ROW
+    scan      = rows * COST_SCAN
+    index(n)  = COST_DESCENT + n * COST_IX_ROW          (49, section 45)
+
+`COST_SORTED_ROW` is measured as sections 36 and 45 measured theirs
+(`design/experiments/calib_sorted.lxl`: settled tables, in process, the
+median of five), per row at shares from 0.1% to 50% of a 1M-row table, and
+taken where the plan's choice turns on it (the band against the scan). A
+per-row figure is a simplification: the sorted read's cost per row falls as
+the range grows (more rows per leaf visited: a leaf's fixed cost is shared,
+the Cardenas or Mackert-Lohman shape PostgreSQL's `index_pages_fetched`
+models). The measurement says whether one figure is close enough over the
+band; if not, the leaf share is modelled.
+
+**The choice (`choosePath`, the first table).** Today a pure range on an
+index's leading column, estimated from ANALYZE's samples, is skipped (read
+as a scan) when it holds over `1/SCAN_SHARE` of the table (1/32: twice the
+counted switch's crossover, so a sampling error leans to the scan). Then:
+the range is read in key order when `2 * sorted(n) < scan` (the same lean to
+the scan, a factor of 2), else scanned. The factor stays: an underestimated
+range read by key is the costly mistake (a scan's cost does not depend on
+the estimate). A range below the band was an index read already; it is now
+read in key order too.
+
+**A table read once (a hash build).** Its rows' order does not matter, so
+an index range there is always read in key order (q14's lineitem). The join
+order's cost of such a way (`wayInto`'s `inner`) is left as it is in this
+item: changing it moves hash-or-lookup choices across the suite (section 43
+said the same of the lookup's cost); the measured figure is recorded for
+that change.
+
+### 47.4 ORDER BY, LIMIT, locks, writes
+
+- **ORDER BY.** The rows come in primary key order within a chunk, not in
+  the index's order, so a path chosen for its order (`Level.keeps`: ORDER BY
+  or MIN/MAX served by the index) is never read so, and no sort is elided
+  for a key-ordered read. The order the rows come in is not promised to
+  anyone.
+- **LIMIT.** A reading that may stop early (`Level.stops`: a LIMIT without a
+  sort, EXISTS, a scalar subquery) is never read so: every key of the range
+  would be read before the first row. Under a top-N (ORDER BY ... LIMIT not
+  served by an index) the whole range is read anyway, and it is.
+- **Locks** (`FOR UPDATE`, `Level.lock`): not read so (locks are taken in
+  the order rows are read, as before).
+- **A transaction whose reads are noted** (a block that writes; section 21):
+  read in the index's order, as the row path reads it, so the reads are
+  noted as before (`fillIdxRows` does the same with its per-batch sort).
+
+### 47.5 The run-time switch and per-parameter plans
+
+- With samples and literal bounds, the plan decides (`Path.stats`, no
+  count at run time) between the scan and the key-ordered index.
+- Without them (no ANALYZE, a bound that is a parameter: section 37 does
+  not estimate a parameter's range), the plan takes the index and the
+  counted switch (sections 19, 38) decides per run between it and a scan.
+  The index it keeps is read in key order. The switch's ratio (a scan at
+  most `SWITCH_TIMES` = 16 times the range's entries) was measured for the
+  index read by key in batches; with the key-ordered read the crossover
+  moves, and the ratio follows the calibration.
+- So a statement whose range comes from parameters keeps one plan (the
+  plan does not depend on the parameters' values) and decides scan or
+  sorted index per execution by counting, as today. A leading equality from
+  a parameter is a look (section 23) as before; the key order adds no look.
+- `SET lexdb_planner = rules` is unchanged: the rules never read a range in
+  key order.
+
+### 47.6 The executor
+
+- **lexdb_access.** `Cursor` holds the chunk being read (a counted handle,
+  `rc []str`, so the copy of a cursor taken before each batch, for the row
+  path to start again from, costs a count), the place in it, and whether
+  the range goes on after it. `fillLevel` reads a key-ordered range by
+  `fillSorted` (the chunk collected when the last is done, then `BROWS`
+  keys' rows by `rowsOfKeys`); `fetch`, the row path's reader, goes on with
+  the same cursor by `fetchSorted` (the rest of the chunk by key, then the
+  next chunks), so a batch that gives way (a value its column cannot hold,
+  a condition's error) is read by the row path from that batch's first key,
+  and nothing is read twice or skipped.
+- **lexdb_pipe.** `PScan.sorted` (the planner's: the first table's or a
+  hashed table's path read in key order) sets the index read's
+  `IxRead.sorted` in `srcFor`; the pipeline's readers (`runScan`,
+  `readRows`, the aggregates', the hash builds') need nothing else.
+- **lexdb_plan.** `Path.sorted` (set by `planFrom` in the cost mode for an
+  index path that is a range or an equality prefix) and `keyOrdered(q, k)`,
+  which adds what is known only later (the first table or one read once,
+  not `keeps`, `stops`, locked or covering).
+- **lexdb_exec (glue).** The row engine (`lexdb_batch = off`, and plans the
+  pipeline does not run) reads the same paths in key order too (`runLevel`,
+  `materialize`, the batch driver's `bLevelPlan`), so a statement gives its
+  rows in the same order with batches on and off.
+- **EXPLAIN** names it: `index orders_date range, rows in key order
+  (estimated 57291 rows)`.
+
+### 47.7 q4, q14, q19: the plans before and after
+
+Before (main 95b9968d, EXPLAIN):
+
+```
+q4   scan orders: full scan
+     semi join lineitem: primary key range (estimated 5 rows) per row, filter per row read
+     aggregate
+     order: sort
+     subquery 1 (exists): semi join, looked up per row by the join
+q14  scan part: full scan
+     join lineitem: hash on (l_partkey) over index lineitem_shipdate range (estimated 74685 rows)
+     aggregate
+q19  scan part: full scan
+     join lineitem: index lineitem_part_supp range (estimated 61 rows) per row
+     aggregate
+```
+
+After (expected; the as-built section records what EXPLAIN shows):
+
+```
+q4   scan orders: index orders_date range, rows in key order (estimated 57291 rows)
+     semi join lineitem: ... (as before)
+q14  scan part: full scan
+     join lineitem: hash on (l_partkey) over index lineitem_shipdate range, rows in key order (estimated 74685 rows)
+q19  unchanged: see below
+```
+
+**q19 is not a range of middling selectivity.** Its time (78 ms warm in this
+session, profiled) is part's full scan under the three-way OR (48%: 200,000
+rows for 485) and the 485 lookups into lineitem (43%). PostgreSQL's plan
+reads part by a `BitmapOr` of three `part_brand_container` scans (2,322
+entries: a brand, and a container IN four values, each) and looks lineitem
+up per part row as lexdb does. The key-ordered read makes the OR natural:
+the keys of several index paths, one per disjunct of an OR conjunct, are
+collected into one chunk, sorted and deduplicated, and the rows read once
+with the whole condition checked again. That is a second slice of this
+item (an OR of index paths), taken if the first lands cleanly; it needs no
+new executor beyond the chunk's collection over several ranges.
+
+### 47.8 Q4 as built (2026-11-20)
+
+Three slices, on main 2579e090 (after F3, Q2 and the alias-list fix):
+
+1. **The design** (fd1ad0e2): 47.1-47.7.
+2. **The executor, the planner's mark, EXPLAIN** (the paused WIP bfdf4c83
+   merged and finished): as 47.6 says. `lexdb_access`: `Cursor.sorted`,
+   `chunk`, `tail`; `sortedChunk` (a chunk of at most `SORT_CHUNK` = 256k
+   primary keys from the index range, sorted by `sortedKeys`),
+   `fillSorted` (a batch of `BROWS` rows of the chunk by `rowsOfKeys`),
+   `fetchSorted` (the row path's reading of the same cursor); test knobs
+   `setSortChunk`, `sortedChunks`. `lexdb_plan`: `Path.sorted` (set in
+   `planFrom` in the cost mode by `sortable`), `PScan.sorted`,
+   `keyOrdered(q, k)`, `pathTextAt` (EXPLAIN's ", rows in key order"), the
+   process-wide knob `setKeyOrder` (`KO_COST`, `KO_NEVER`, `KO_SORTED`,
+   `KO_PLAIN`). `lexdb_pipe.srcFor` sets `IxRead.sorted`. `lexdb_exec`
+   glue: `runLevel`, `materialize`, `bLevelPlan`, `explainLines` (exec
+   19,680 -> 19,687 lines). The rules planner never reads in key order:
+   three tests' expectations under `SET lexdb_planner = rules` were wrong
+   in the WIP and corrected.
+3. **The scan's cut-off by cost** (47.9): `COST_SORTED_ROW` = 12, and
+   `scanFirst` scans the first table's pure range where
+   `2 * (COST_DESCENT + n * COST_SORTED_ROW) >= rows * COST_SCAN` (about
+   1/24 of the table; `KO_NEVER` keeps the old 1/`SCAN_SHARE` = 1/32).
+   `KO_SORTED`/`KO_PLAIN` (the calibration's modes) take the index at any
+   size without the counted switch (`forcedIndex`: `Path.stats` set).
+   `exec_keyorder` checks the cut-off (3.5% by the index, 5% scanned, 3.5%
+   scanned under the old rule).
+
+**Found.** The batch path (`fillIdxRows`) reads a batch's keys sorted but
+puts the rows back in the index's order; the key-ordered read gives them in
+key order within a chunk, batches on and off alike. The switch's short
+ranges (keys counted, at most 64) stay in the index's order both ways. The
+planner loads a table's statistics only when they choose between two
+candidates (`lexdb_stats.loadEst`: two indexes, or one and a primary key of
+several columns) or for a join: a table with one index and a one-column
+primary key has no estimate, and its range is decided by the counted
+switch at run time (the calibration program adds a second index for this).
+
+**The counted switch's `SWITCH_TIMES` (16) is kept.** It scans when the
+range holds at least 1/16 of the table (counted, no estimate). The
+key-ordered read's measured crossover with the scan is 1/10 of an
+orders-wide table and 1/7 of a narrow one (47.9), so 1/16 leans to the scan
+by 1.1x to 1.6x, which costs little near the crossover and nothing in
+tests' plans; moving it to 10 would trade the narrow table's loss for the
+wide one's gain.
+
+**Point selects** (20,000 primary-key point selects in process, `-O`,
+`perf stat -e instructions:u`, `taskset -c 6`, base main 2579e090 and the
+branch alternated three times): 3,734.8M against 3,736.8M instructions
+(medians), +0.05%, inside the 0.15% spread.
+
+**TPC-H** (SF1, `~/tpch-w/q4`, `-O`, one timed run after a warm run per
+invocation, main 2579e090 and the branch alternated four times, medians,
+ms; checksums equal; before a co-tenant load started at 16:05):
+
+| | main | key order | |
+|---|---:|---:|---:|
+| q4 | 291.0 | 187.5 | -36% (orders by `orders_date` in key order, 3.8%) |
+| q14 | 227.8 | 171.2 | -25% (the hashed lineitem range in key order) |
+| q19 | 99.5 | 94.7 | plan unchanged (noise) |
+
+All 22 once each way, alternated (the branch's run partly under the
+co-tenant load): no query over 5% slower. Plans changed in q4, q10 (its
+hashed orders range in key order), q14, q15 (the view's lineitem range,
+3.8%, now read by its index: it was scanned), q17 and q20 (small ranges
+under a subquery, in key order). Server instructions per query (`iq.sh`,
+a warm run and two counted; valid under load): q4 2.79G -> 1.50G (-46%),
+q15 12.09G -> 4.02G (-67%), q10 -2.7%, q14 +2.0% (the sort's work, against
+25% less time: fewer cache misses), q8 +0.6%, q20 +0.6%, every other
+query within 0.2%. The timing differences of the queries whose plans did
+not change (q3 -10%, q13 -18% in the single run) are placement: their
+instructions are the same.
+
+**Next.** q19 is the OR of index paths (47.7: a chunk collected from the
+ranges of several index paths, one per disjunct of an OR conjunct, sorted,
+deduplicated, the rows read once and the whole condition checked again;
+PostgreSQL's `BitmapOr` over three `part_brand_container` scans). Not
+taken in this item: it needs the OR split into per-disjunct index
+conditions in `choosePath` and a cost for the union. Also open: the join
+order's cost of a key-ordered way (`wayInto`'s `inner`, 47.3) and
+`figCost`'s per-row index figure between candidates, both left as they
+were.
+
+### 47.9 The key-ordered read's cost, measured
+
+`design/experiments/calib_sorted.lxl`: tables of 1M rows (wide: about
+orders' width; narrow: three integers), `k` a permutation of the primary
+key, an index on `k` and a second one on `c` (so the statistics load);
+settled (loaded, VACUUMed, ANALYZEd and checkpointed in a first store run,
+measured in a second), in process, `-O`, `taskset -c 6`, the median of 5.
+The unit is a row of the table scanned with a filter (`k + 0 < N/2`): 31 ns
+(wide), 21 ns (narrow). Per row of the range, in units, the index forced
+(no counted switch):
+
+| share | wide, index order | wide, key order | narrow, index order | narrow, key order |
+|---:|---:|---:|---:|---:|
+| 0.1% | 26.9 | 15.2 | 33.9 | 23.4 |
+| 0.5% | 29.7 | 26.7 | 30.5 | 20.9 |
+| 1% | 29.5 | 23.4 | 45.9 | 34.8 |
+| 2% | 31.7 | 16.0 | 45.7 | 19.2 |
+| 3% | 33.7 | 13.2 | 45.3 | 15.8 |
+| 4% | 32.1 | 11.4 | 50.6 | 14.7 |
+| 5% | 31.5 | 10.5 | 46.1 | 14.4 |
+| 7% | 31.5 | 10.0 | 45.5 | 15.6 |
+| 10% | 32.5 | 9.8 | 44.5 | 13.5 |
+| 20% | 32.9 | 9.5 | 52.3 | 14.8 |
+| 50% | 32.9 | 10.6 | 50.8 | 14.9 |
+
+- The key-ordered read costs a third of the index-order read from 3% up,
+  and its cost per row levels off near 10 (wide) and 14.5 (narrow) units:
+  from about 3% every leaf of the table is visited, and the rest is the
+  walk from the key before and the row's pick, per row. Below 1% the
+  figures are noisy (one or a few batches).
+- It beats the scan up to about 10% of the wide table and 7% of the narrow
+  one (index order: about 1/32 and 1/46). At 50% it costs 5 to 7 scans: a
+  sampling error past the cut-off is bounded.
+- `COST_SORTED_ROW` = 12: the wide (TPC-H-like) table's figure where the
+  choice turns (3% to 5%: 13.2 to 10.5). With the factor 2 of 47.3 the
+  cut-off is at about 1/24 of the table (4.2%), where the read costs about
+  half a scan; q4's 3.8% range is under it.
+- A first calibration run without the second index measured the counted
+  switch's counting with the read (no statistics: the switch ran) and is
+  not used.
