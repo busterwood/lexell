@@ -109,17 +109,17 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 | F7 | `FULL [OUTER] JOIN` | O:HashProbe(full) | `runRows`, `keepsRight` | row (`joinsOver`, `joinOps` refuse FULL) | — | exec_join, joinusing_queries |
 | F8 | `NATURAL JOIN`, `JOIN … USING (…)` (FULL USING: COALESCE) | B | `buildQuery` (`ColDef.using`), `usingSide`, `resolveName` (`lexdb_bind`) | as the join | — | exec_joinusing |
 | F9 | Oracle `(+)` outer join | B (parse → LEFT JOIN) | `oraOuterJoins` (parse) | as F5 | — | tns_catalog, tns_oracle |
-| F10 | derived table `(SELECT …) AS x(a, …)` | B + O:CTE scan (held rows) | `runFrom`, `materialize`, `Level.src`; `narrowSub` | inner query both; as the first level row (`tableRead`, `bLevelPlan` refuse virtual levels); as a later level joined by an equality, a hash of its rows (`JH_ROWS`) | — | exec_with, exec_limits, exec_groupkeys |
+| F10 | derived table `(SELECT …) AS x(a, …)` | B + O:CTE scan (held rows) | `runFrom`, `materialize`, `Level.src`; `narrowSub` | inner query both; as the first level its held rows are cut into batches by the pipeline (`heldRead`, `PScan.held`, `lexdb_held.fill`; filter, project, aggregate, sort, DISTINCT, and as a join's first table, `readRows`), a few rows (under `HELD_BATCH`) or a value its column cannot hold read row by row; `bLevelPlan` and `levelsProg` (the row engine's batches and joins) still refuse a virtual first level; as a later level joined by an equality, a hash of its rows (`JH_ROWS`) | — | exec_with, exec_limits, exec_groupkeys, exec_held |
 | F11 | `LATERAL (…)`; T-SQL and Oracle `CROSS APPLY`, `OUTER APPLY` | B (scope) + R:decorrelate + O:NestedLoop | `Level.lateral`, run per row in `runLevel` | row (`joinsOver`, `tableRead` refuse LATERAL) | correlated | exec_with, tns_oracle, tds_app, mssql_app_queries |
-| F12 | CTE `WITH x [(cols)] AS [NOT] MATERIALIZED (…)` (the hint is parsed and ignored) | B (naming) + O:CTE scan | `withList`, `cteRef` (parse; re-parsed per use); `SubPlan.cte`, `cacheAt` (rows shared) | as F10 | — | exec_with, exec_insertsel |
-| F13 | `WITH RECURSIVE` (UNION [ALL]; `max_recursion`) | B + O:CTE scan + a recursive union (not in 4.6's table) | `runRecursive`, `Level.work` | row (rounds); each round's query both, its working table as a later level a hash (`JH_ROWS`) | — | exec_with, exec_limits |
-| F14 | `(VALUES …) AS x(…)`; `VALUES` as a query; Oracle `DUAL` | B + O:Values | `valuesSub` (parse), `execSrf` (`#values:`) | as F10 | — | merge_queries, catalog_queries, tns_client |
-| F15 | `generate_series(…)` in FROM (integer series made as read) | O:function scan (not in 4.6's table; Values-like) | `execSrf`, `lazySeries`, `seriesRes` | as F10 (as the first level a lazy series) | — | exec_srf |
-| F16 | `unnest(…)`, `regexp_matches`, `regexp_split_to_table`, `string_to_table`, `pg_partition_ancestors`; `WITH ORDINALITY` | O:function scan | `execSrf`, `srfCols` | as F10 | — | exec_srf, funcs_queries |
+| F12 | CTE `WITH x [(cols)] AS [NOT] MATERIALIZED (…)` (the hint is parsed and ignored) | B (naming) + O:CTE scan | `withList`, `cteRef` (parse; re-parsed per use); `SubPlan.cte`, `cacheAt` (rows shared) | as F10 (its rows run once and shared: a volatile CTE gives every use the same rows, also where the pipeline gives way) | — | exec_with, exec_insertsel, exec_held |
+| F13 | `WITH RECURSIVE` (UNION [ALL]; `max_recursion`) | B + O:CTE scan + a recursive union (not in 4.6's table) | `runRecursive`, `Level.work` | row (rounds); each round's query both, its working table as a later level a hash (`JH_ROWS`), as the first level (`Level.work`) still row (`heldRead` refuses it); the outer query reading the CTE as F10 | — | exec_with, exec_limits, exec_held |
+| F14 | `(VALUES …) AS x(…)`; `VALUES` as a query; Oracle `DUAL` | B + O:Values | `valuesSub` (parse), `execSrf` (`#values:`) | as F10 | — | merge_queries, catalog_queries, tns_client, exec_held |
+| F15 | `generate_series(…)` in FROM (integer series made as read) | O:function scan (not in 4.6's table; Values-like) | `execSrf`, `lazySeries`, `seriesRes` | as F10; an integer series (smallint, integer, bigint) read first is cut into batches as it is made (`lexdb_held.Series`), never held, also as a join's first table; other types' rows held as F10 | — | exec_srf, exec_held |
+| F16 | `unnest(…)`, `regexp_matches`, `regexp_split_to_table`, `string_to_table`, `pg_partition_ancestors`; `WITH ORDINALITY` | O:function scan | `execSrf`, `srfCols` | as F10 | — | exec_srf, funcs_queries, exec_held |
 | F17 | set-returning call in the select list (`SELECT unnest(a)`) | B + O:ProjectSet (not in 4.6's table) | `hasSrfCall`, `expandSrfs` | row (`streams`, `sortShape` refuse `hasSrfCall`) | — | forms_queries, catalog_queries |
 | F18 | Oracle `FROM dual CONNECT BY LEVEL <= n` | B (parse text rewrite → `generate_series`) | `connectLevel` (parse) | row | — | tns_oracle |
-| F19 | catalog relations: `pg_catalog.*`, `information_schema.*`, `sys.*`, Oracle `ALL_*`/`V$*`; a sequence read as a relation | B + O:Values | `catRows` (`lexdb_pgcat`, `lexdb_syscat`, `lexdb_oracat`), `execSrf` | as F10 | — | catalog_queries, tds_pgcatalog, tns_catalog |
-| F20 | views | B (expanded as a derived table) | `viewQuery`, `buildQuery` | as F10 | — | exec_views, exec_viewsx |
+| F19 | catalog relations: `pg_catalog.*`, `information_schema.*`, `sys.*`, Oracle `ALL_*`/`V$*`; a sequence read as a relation | B + O:Values | `catRows` (`lexdb_pgcat`, `lexdb_syscat`, `lexdb_oracat`), `execSrf` | as F10 (a catalog's columns are typed loosely, a number in a text column: the batch gives way to row by row where it is read) | — | catalog_queries, tds_pgcatalog, tns_catalog, exec_held |
+| F20 | views | B (expanded as a derived table) | `viewQuery`, `buildQuery` | as F10 | — | exec_views, exec_viewsx, exec_held |
 | F21 | temporary tables; T-SQL table variables (`DECLARE @t TABLE`) and table-valued parameters | B (name → session temp table) + S (TVP rows loaded) | `tempRel` (`lexdb_catalog`); `tableVariables`, `renameVars` (`lexdb_tsqlparse`), `lexdb_tds` | as F1 | — | exec_temp, tds_tvp, tds_tvp_wire, tds_batch |
 
 ## 3. SELECT clauses
@@ -239,7 +239,7 @@ today and left out below, so 119 are supported.
 
 A construct that is both as a filter and row as an index lookup (E18, E20)
 counts as both; E47 (window values row, input rows batch) counts as row;
-F10's kin (first level row, later level a hash) count as both.
+F10's kin (first level batches of held rows, later level a hash) count as both.
 
 ## 8. Row-only constructs that need special handling in a chunk pipeline
 
@@ -293,9 +293,8 @@ why, and what the new design does.
 
 Row-only today only because no batch code exists (no row semantics; plain
 operators in the new design): FULL JOIN (F7), CROSS JOIN without a key (F4),
-derived tables, CTEs, VALUES, function scans and catalog relations as a first
-level (F10–F16, F19), recursive CTEs (F13), SRFs in the select list (F17),
-set operations (D1–D4), grouping sets and GROUPING (C4, E46), aggregates
+a recursive CTE's working table as a first level (F13), SRFs in the select
+list (F17), set operations (D1–D4), grouping sets and GROUPING (C4, E46), aggregates
 other than count/sum/avg/min/max and DISTINCT/ORDER BY aggregates
 (E41, E42, E44), window values (E47–E49), IN-list, `= ANY` and IN-subquery
 lookups and PK point reads (E18, E20, E35, F1), uncorrelated subqueries
