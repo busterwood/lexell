@@ -1337,6 +1337,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
     append(mut &sc.names.frames, Frame{cols: [], exact: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], subReads: [], hidden: false})
     let me = len(sc.names.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
+    var viewSrcs: []lexdb_plan.ViewSrc = []  // ... their queries (the planner's pushdown, optimizer 48.3)
+    var anySub = false                     // a FROM item is a query (a subquery, a view, a CTE)
     var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
     var order: []int = []                  // the columns in *'s order
     var anyUsing = false
@@ -1378,6 +1380,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             }
             item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, outBCols(fcols)) } else { spLp }
             append(mut &planned[f.sub], sp)
+            anySub = true
         } else if f.work >= 0 {
             var w = -1
             for i in 0..len(sc.works) { if sc.works[i].id == f.work { w = i } }
@@ -1448,6 +1451,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 append(mut &views, sp)
+                append(mut &viewSrcs, lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})
+                anySub = true
                 t = rc(vt)
             } else if len(f.cols) > 0 {
                 // t AS x(a, b): its first columns named so
@@ -1653,17 +1658,19 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         }
     }
     var hasWhere = false
+    var whereAst: Option[Expr] = None
     match where {
         Some(w0) {
             let w = lexdb_plan.pullCommonOr(w0)
             let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
             lp = lexdb_bind.LPlan.Filter(lp, [r], [])
             hasWhere = true
+            if anySub { whereAst = Some(w) }
         }
         None {}
     }
     q.lp = lp
-    return Ok(FromBound{anyUsing: anyUsing, where: hasWhere})
+    return Ok(FromBound{anyUsing: anyUsing, where: hasWhere, whereAst: whereAst, views: viewSrcs})
 }
 
 fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: mut &Mats, params: &[]Val,

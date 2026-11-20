@@ -10,6 +10,7 @@
 // executor builds and reads the plan structures, so their fields are
 // public.
 import "collections"
+import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_bind"
@@ -2945,7 +2946,16 @@ pub type FromHints = record {
 pub type FromBound = record {
     pub anyUsing: bool              // a JOIN ... USING or NATURAL JOIN (*'s order in ColDef.pos)
     pub where: bool                 // Query.lp's top is WHERE's Filter
+    // with a FROM item that is a query: WHERE as written (after
+    // pullCommonOr, not resolved), and per view read (its level's src past
+    // the statement's subqueries) what planning it again needs (pushDown)
+    pub whereAst: Option[Expr]
+    pub views: []ViewSrc
 }
+
+// A view's query as bindFrom planned it: the query, its owner (the role
+// its relations are read as; "" the session's) and its renames (Table.rn).
+pub type ViewSrc = record { pub stmt: lexdb_sql.Stmt; pub owner: str; pub rn: []str }
 
 // The ON conjuncts of q.lp's FROM part, per level (ms[k]: the k-th
 // left-deep Join's), and WHERE's (where: q.lp's top is its Filter), as
@@ -3092,6 +3102,284 @@ fn (q: mut &Query) innerJoins(ms: &[][]Expr, cs: &[]Expr) {
     }
 }
 
+// Whether x has what a pushed filter must not carry or change the calls of
+// (48.3): a subquery, a window, a volatile function (random, a sequence's,
+// an advisory lock's, gen_random_uuid, clock_timestamp), a user's function.
+fn unpushable(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) || n == "#win" || n == "#udf" || n == "#plf" || lexdb_bind.isSeqFn(&n) || lexdb_bind.isAdvFn(&n) ||
+               n == "gen_random_uuid" || n == "random" || n == "setseed" || n == "clock_timestamp" { return true }
+            for a in args { if unpushable(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return unpushable(&a) }
+        Expr.Bin(_, a, b) { return unpushable(&a) || unpushable(&b) }
+        Expr.IsNull(a, _) { return unpushable(&a) }
+        Expr.Cast(a, _) { return unpushable(&a) }
+        else { return false }
+    }
+}
+
+// Whether a filter on the rows of query s (planned as sel) may go into it
+// (48.3): no LIMIT, OFFSET, TOP, window, DISTINCT ON, grouping sets, FOR
+// UPDATE, function scan, nothing volatile or set-returning in its select
+// list; a set operation's parts each, their columns not converted.
+fn pushable(s: &lexdb_sql.Stmt, sel: &Sel): bool {
+    if s.kind != lexdb_sql.S_SELECT || s.limit.isSome() || s.offset.isSome() || s.topMode != 0 || s.withTies ||
+       len(s.distinctOn) > 0 || len(s.wins) > 0 || len(s.srf) > 0 || len(s.mr) > 0 || s.lockMode != 0 || len(s.assign) > 0 ||
+       len(s.gsets) > 0 || s.rec || s.waitFor || len(s.into) > 0 || len(sel.mr) > 0 || len(sel.wins) > 0 {
+        return false
+    }
+    if s.setop != 0 {
+        if len(s.inner) != 2 || len(sel.parts) != 2 { return false }
+        for c in sel.conv { if c != 0 { return false } }
+        return pushable(&s.inner[0], &sel.parts[0]) && pushable(&s.inner[1], &sel.parts[1])
+    }
+    for it in s.items {
+        match it.expr {
+            Some(x) { if unpushable(&x) || srfIn(&x) { return false } }
+            None {}
+        }
+    }
+    for x in sel.exprs { if unpushable(&x) || srfIn(&x) { return false } }
+    for sp in sel.specs { for a in sp.args { if unpushable(&a) { return false } } }
+    return true
+}
+
+// Output column j of query s (planned as sel) in s's own terms, as
+// written: its select item's expression, or beside a * a plain column by
+// its qualified name; None for anything else.
+fn outAst(s: &lexdb_sql.Stmt, sel: &Sel, j: int): Option[Expr] {
+    var star = false
+    for it in s.items { if it.star { star = true } }
+    if !star {
+        if len(s.items) != len(sel.outs) || j >= len(s.items) { return None }
+        match s.items[j].expr {
+            Some(x) { return Some(lexdb_sql.cloneExpr(&x)) }
+            None { return None }
+        }
+    }
+    if j >= len(sel.exprs) || j >= len(sel.outs) { return None }
+    match sel.exprs[j] {
+        Expr.Col(n, slot) {
+            if strings.contains(&n, lexdb_bind.DUPSEP) { return None }
+            if slot >= 0 && slot < len(sel.q.cols) && len(sel.q.cols[slot].using) > 0 { return None }
+            return Some(Expr.Col(n.clone(), -1))
+        }
+        else { return None }
+    }
+}
+
+// x, a WHERE conjunct as written, with each column of level l as a
+// placeholder for the derived query's column: Col("", j). None when a name
+// is not one of l's columns (or not this query's alone).
+fn (q: &Query) toOuts(x: &Expr, l: int): Option[Expr] {
+    match x {
+        Expr.Col(n, _) {
+            match lexdb_bind.resolveName(&q.cols, len(q.cols), &n) {
+                Ok(i) {
+                    let f = q.levels[l].first
+                    if i < f || i >= f + len(q.levels[l].t.cols) || len(q.cols[i].using) > 0 { return None }
+                    return Some(Expr.Col("", i - f))
+                }
+                Err(_) { return None }
+            }
+        }
+        Expr.Lit(_) { return Some(lexdb_sql.cloneExpr(x)) }
+        Expr.Param(_) { return Some(lexdb_sql.cloneExpr(x)) }
+        Expr.Unary(op, a) {
+            match q.toOuts(&a, l) {
+                Some(y) { return Some(Expr.Unary(op.clone(), y)) }
+                None { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            let ya = q.toOuts(&a, l)
+            let yb = q.toOuts(&b, l)
+            if ya.isNone() || yb.isNone() { return None }
+            return Some(Expr.Bin(op.clone(), ya.unwrap(), yb.unwrap()))
+        }
+        Expr.IsNull(a, neg) {
+            match q.toOuts(&a, l) {
+                Some(y) { return Some(Expr.IsNull(y, neg)) }
+                None { return None }
+            }
+        }
+        Expr.Cast(a, t) {
+            match q.toOuts(&a, l) {
+                Some(y) { return Some(Expr.Cast(y, t)) }
+                None { return None }
+            }
+        }
+        Expr.Call(f, args, star) {
+            if lexdb_sql.isSubCall(&f) || f == "#win" { return None }
+            var ys: []Expr = []
+            for a in args {
+                match q.toOuts(&a, l) {
+                    Some(y) { append(mut &ys, y) }
+                    None { return None }
+                }
+            }
+            return Some(Expr.Call(f.clone(), ys, star))
+        }
+    }
+}
+
+// t (toOuts') with each placeholder replaced by query s's column (outAst).
+fn fillOuts(t: &Expr, s: &lexdb_sql.Stmt, sel: &Sel): Option[Expr] {
+    match t {
+        Expr.Col(n, j) {
+            if len(n) == 0 { return outAst(s, sel, j) }
+            return Some(lexdb_sql.cloneExpr(t))
+        }
+        Expr.Unary(op, a) {
+            match fillOuts(&a, s, sel) {
+                Some(y) { return Some(Expr.Unary(op.clone(), y)) }
+                None { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            let ya = fillOuts(&a, s, sel)
+            let yb = fillOuts(&b, s, sel)
+            if ya.isNone() || yb.isNone() { return None }
+            return Some(Expr.Bin(op.clone(), ya.unwrap(), yb.unwrap()))
+        }
+        Expr.IsNull(a, neg) {
+            match fillOuts(&a, s, sel) {
+                Some(y) { return Some(Expr.IsNull(y, neg)) }
+                None { return None }
+            }
+        }
+        Expr.Cast(a, ty) {
+            match fillOuts(&a, s, sel) {
+                Some(y) { return Some(Expr.Cast(y, ty)) }
+                None { return None }
+            }
+        }
+        Expr.Call(f, args, star) {
+            var ys: []Expr = []
+            for a in args {
+                match fillOuts(&a, s, sel) {
+                    Some(y) { append(mut &ys, y) }
+                    None { return None }
+                }
+            }
+            return Some(Expr.Call(f.clone(), ys, star))
+        }
+        else { return Some(lexdb_sql.cloneExpr(t)) }
+    }
+}
+
+fn andAfter(x: &Option[Expr], y: Expr): Expr {
+    match x {
+        Some(a) { return Expr.Bin("and", lexdb_sql.cloneExpr(&a), y) }
+        None { return y }
+    }
+}
+
+// Filter t (toOuts') put into query s (planned as sel): into its WHERE,
+// or with an aggregate, or over an aggregate without GROUP BY, into its
+// HAVING; a set operation's into each part. False when a column is not
+// one outAst can write (s is then partly changed: the caller's copy).
+fn intoQuery(s: mut &lexdb_sql.Stmt, sel: &Sel, t: &Expr): bool {
+    if s.setop != 0 { return intoQuery(mut &s.inner[0], &sel.parts[0], t) && intoQuery(mut &s.inner[1], &sel.parts[1], t) }
+    match fillOuts(t, s, sel) {
+        Some(x) {
+            let having = if len(s.group) > 0 { lexdb_bind.hasAgg(&x) } else { sel.aggQ }
+            if having { s.having = Some(andAfter(&s.having, x)) } else { s.where = Some(andAfter(&s.where, x)) }
+            return true
+        }
+        None { return false }
+    }
+}
+
+// Whether two plans of a query give the same columns.
+fn sameOuts(a: &Sel, b: &Sel): bool {
+    if len(a.outs) != len(b.outs) { return false }
+    for i in 0..len(a.outs) { if a.outs[i].oid != b.outs[i].oid { return false } }
+    return true
+}
+
+// Predicate pushdown (48.3): each WHERE conjunct that reads one derived
+// level's columns only (a FROM subquery, a view, a CTE used once), not on
+// an outer join's nullable side, goes into its query as written (each
+// column as the query's expression for it), and the query is planned
+// again as bindFrom planned it; the conjuncts pushed leave cs.
+fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, bf: &FromBound, subs: &[]lexdb_sql.Stmt,
+            params: &[]Val, sc: mut &Scope, cs: mut &[]Expr): Result[Unit, DbErr] {
+    var uc: []Expr = []
+    match bf.whereAst {
+        Some(w) { conjuncts(&w, mut &uc) }
+        None { return Ok(Unit{}) }
+    }
+    let nl = len(q.levels)
+    if len(uc) != len(cs) || nl > 62 { return Ok(Unit{}) }
+    var lastRight = -1
+    for k in 0..nl { if keepsRight(q.levels[k].join) { lastRight = k } }
+    var gone: []bool = array(len(cs), false)
+    var any = false
+    for l in 0..nl {
+        let src = q.levels[l].src
+        if src < 0 || src >= len(q.subs) || q.levels[l].lateral || q.levels[l].work >= 0 { continue }
+        // not an outer join's nullable side
+        if (l > 0 && keepsLeft(q.levels[l].join)) || l < lastRight { continue }
+        let view = src >= len(subs)
+        let vi = src - len(subs)
+        if view && vi >= len(bf.views) { continue }
+        let s0 = if view { &bf.views[vi].stmt } else { &subs[src] }
+        if (s0.cte >= 0 && !s0.cteOnce) || !pushable(s0, &q.subs[src].sel) { continue }
+        var s = s0.clone()
+        s.cte = -1
+        var took: []int = []
+        for i in 0..len(cs) {
+            if gone[i] || q.levelMask(&cs[i]) != (1 << l) || unpushable(&cs[i]) { continue }
+            match q.toOuts(&uc[i], l) {
+                Some(t) {
+                    var s2 = s.clone()
+                    if intoQuery(mut &s2, &q.subs[src].sel, &t) {
+                        s = s2
+                        append(mut &took, i)
+                    }
+                }
+                None {}
+            }
+        }
+        if len(took) == 0 { continue }
+        // planned again as bindFrom did: this query's columns hidden; a
+        // view's relations read as its owner, its text's names renamed
+        let top = len(sc.names.frames) - 1
+        let nf = len(sc.names.frames)
+        sc.names.frames[top].hidden = true
+        let owner = if view { bf.views[vi].owner.clone() } else { "" }
+        if len(owner) > 0 { append(mut &sc.asRole, owner.clone()) }
+        let outerRn = replace(mut &sc.rn, if view { bf.views[vi].rn.clone() } else { [] })
+        let again = up().planSub(st, txn, &s, params, sc, false)
+        sc.rn = outerRn
+        if len(owner) > 0 { let r = pop(mut &sc.asRole) }
+        while len(sc.names.frames) > nf { let f = pop(mut &sc.names.frames) }
+        sc.names.frames[top].hidden = false
+        match again {
+            Ok(sp0) {
+                var sp = sp0
+                if sameOuts(&sp.sel, &q.subs[src].sel) && len(sp.sel.q.refs) == 0 {
+                    let lp = takeLp(mut &sp.sel)
+                    q.subs[src] = sp
+                    for i in took { gone[i] = true }
+                    any = true
+                }
+            }
+            Err(_) {}
+        }
+    }
+    if any {
+        var keep: []Expr = []
+        for i in 0..len(cs) { if !gone[i] { append(mut &keep, replace(mut &cs[i], Expr.Lit(Val.Null))) } }
+        let was = replace(cs, keep)
+    }
+    return Ok(Unit{})
+}
+
 // The planner's pass over FROM (2e slice 2), after bindFrom: the semi-join
 // alternatives, the ON and WHERE conjuncts placed per level (read from
 // q.lp), the implied equalities, the join order, the paths, hashing, the
@@ -3148,6 +3436,8 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     fromConds(&q.lp, bf.where, mut &ms, mut &cs)
     // outer joins whose NULL rows WHERE or a later join rejects: inner (optimizer 48.2)
     if nl >= 2 && !hs.rules && (rewriteMode & RW_OUTER) != 0 && !q.innerOnly() { q.innerJoins(&ms, &cs) }
+    // WHERE's conjuncts on a derived table, view or CTE used once: into its query (optimizer 48.3)
+    if bf.whereAst.isSome() && !hs.rules && (rewriteMode & RW_PUSH) != 0 { try pushDown(st, txn, q, bf, subs, params, sc, mut &cs) }
     // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
     // conjunct goes below the last one.
     var lastRight = -1
