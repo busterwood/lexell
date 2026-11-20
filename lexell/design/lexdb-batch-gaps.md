@@ -371,7 +371,7 @@ the suite rerun) before review.
 | Item | Branch | State |
 |---|---|---|
 | 1 + 2 | | not started |
-| 3 | | not started |
+| 3 | worktree-agent-afe32cba03d1569d1 | Done, awaiting review (2026-11-20, from main 32e8ac9e): 333a804a (3a: `lexdb_agg`, the generic `BA_GEN` call kind, every aggregate admitted, DISTINCT and ORDER BY in the call too), 17a5fd2a (3b: kernels `BA_AND/BA_OR`, `BA_CNTD` for `count(DISTINCT int)`, `BA_VAR` for float columns; a call the typed kernels refuse, such as a float's sum or avg, now takes the generic step instead of the whole aggregate going row by row), 418b60cf (an op code in `add`). Suite 192/192. `lexdb_exec` 23,765 -> 23,582 lines, `lexdb_agg` 270. 200,000 rows, exclusive lock, base -> branch ms: `count(distinct k)` 32 -> 4, grouped (50) 51 -> 8, 5,000 groups 62 -> 15; `bool_and/or` 34 -> 4; `stddev/variance(float)` 73 -> 15; `string_agg` 74 -> 37; `string_agg ... order by` 146 -> 109 (the sort); `count/sum/avg/min/max` unchanged (2, 4, 6, 16, 26 ms); `count, sum, avg(float)...` 106 -> 40. Left: a non-exact collation's argument or key (`pipeAgg`, `aggShape`) stays row; numeric and integer `stddev/var*` and `count(DISTINCT text)` are generic (no kernel); the row-by-row grouping fallback (a key the batches do not evaluate) is about 3% slower than before; TPC-H q16 not run (coordinator). Within one batch a call's FILTER, argument, separator and keys are evaluated each over the whole batch in turn, so where two of them fail on different rows the error is the first step's, not strictly the first row's (as before for FILTER and argument). |
 | 4 + 5 | | not started |
 | 6 | | not started |
 | 7 | | not started |
