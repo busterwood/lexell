@@ -253,6 +253,13 @@ pub const JH_JOIN: int = 4
 pub const MK_JOIN: int = 0
 pub const MK_SEMI: int = 1
 pub const MK_ANTI: int = 2
+// (optimizer 50) a null-aware anti join, x NOT IN (subquery): the outer
+// rows whose IN is false; its hash on (keys, value), a summary per key
+pub const MK_NOTIN: int = 3
+// a mark join: every outer row once, the level's last column its EXISTS
+// (MK_MARK_EX: hash on the keys) or its IN (MK_MARK_IN: on keys, value)
+pub const MK_MARK_EX: int = 4
+pub const MK_MARK_IN: int = 5
 
 // A table joined to the rows below it (slice P2; design/lexdb-layers.md
 // 6.2.3), an inner, LEFT or RIGHT join, or a semi or anti join. Its expressions are bound over the
@@ -484,6 +491,7 @@ pub const RUN_PER_ROW: int = 1      // correlated: per row of the query, its res
 pub const RUN_HASHED: int = 2       // correlated, decorrelated (9.9): once, by its keys "inner = outer", probed per row
 pub const RUN_SEMI: int = 3         // a semi or anti join's (9.104): once, its rows a level's hash
 pub const RUN_LOOKED: int = 4       // not run: its table is a semi or anti level looked up per row (semiLook)
+pub const RUN_MARK: int = 5         // a mark join's (optimizer 50): once, its rows a level's hash, every outer row marked
 
 // The subqueries of p's query: its leaf's.
 pub fn pSubs(p: &PPlan): &[]PSub {
@@ -802,7 +810,13 @@ pub type Level = record {
     // a build group's hub (optimizer 49): the levels after it hashed with
     // it as one join (its members); 0 none
     pub grp: int
+    // a subquery's level of optimizer 50 (LV_*): a null-aware anti join or
+    // a mark join (its last column the mark); 0 neither
+    pub mode: int
 }
+
+pub const LV_NOTIN: int = 1
+pub const LV_MARK: int = 2
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
 pub fn (lv: &Level) virt(): bool { return lv.src >= 0 || lv.work >= 0 }
@@ -3106,7 +3120,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0}
+                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0, mode: 0}
 }
 
 // Marks in cand the subqueries of x's top-level conjuncts (conjuncts')
@@ -4179,13 +4193,42 @@ fn semiParsed(c: &Expr): int {
     return -1
 }
 
-// NOT EXISTS's subquery number; NOT IN keeps its row path's NULL rules.
+// NOT EXISTS's subquery number; NOT IN's when its null-aware anti join is
+// on (optimizer 50), else it keeps its row path's NULL rules.
 fn semiParsedNot(x: &Expr): int {
     match x {
-        Expr.Call(n, args, _) { if n == "#exists" && len(args) == 1 { return lexdb_sql.litInt(&args[0]) } }
+        Expr.Call(n, args, _) {
+            if n == "#exists" && len(args) == 1 { return lexdb_sql.litInt(&args[0]) }
+            if n == "#in" && len(args) == 2 && (unnestMode & UN_NOTIN) != 0 { return lexdb_sql.litInt(&args[0]) }
+        }
         else {}
     }
     return -1
+}
+
+// ---- subquery unnesting (optimizer 50): which of its levels the planner
+// makes (tests and measuring; 0: today's plans)
+pub const UN_NOTIN: int = 1     // x NOT IN (subquery) as a null-aware anti join (50.1, 5a)
+pub const UN_MARK: int = 2      // EXISTS / IN under OR, in the select list: a mark join (5b)
+pub const UN_LOOK: int = 4      // semiLook widened: IN by the inner key, a range-keyed path (5c)
+
+var unnestMode: int = UN_NOTIN | UN_MARK | UN_LOOK
+
+pub fn setUnnest(mode: int) { unnestMode = mode }
+
+// Whether conjunct c (resolved) is NOT (x IN (subquery)).
+fn isNotIn(c: &Expr): bool {
+    match c {
+        Expr.Unary(op, a) {
+            if op != "not" { return false }
+            match a {
+                Expr.Call(n, _, _) { return n == "#in" }
+                else {}
+            }
+        }
+        else {}
+    }
+    return false
 }
 
 // The same, resolved.
@@ -4202,7 +4245,10 @@ fn semiResolved(c: &Expr): int {
 
 fn semiResolvedNot(x: &Expr): int {
     match x {
-        Expr.Call(n, args, _) { if n == "#exists" && len(args) >= lexdb_bind.subFixed(&n) { return lexdb_sql.litInt(&args[0]) } }
+        Expr.Call(n, args, _) {
+            if n == "#exists" && len(args) >= lexdb_bind.subFixed(&n) { return lexdb_sql.litInt(&args[0]) }
+            if n == "#in" && len(args) >= lexdb_bind.subFixed(&n) && (unnestMode & UN_NOTIN) != 0 { return lexdb_sql.litInt(&args[0]) }
+        }
         else {}
     }
     return -1
@@ -4254,6 +4300,109 @@ fn semiAltOk(alt: &SubPlan, sp: &SubPlan): bool {
         for x in lv.cond { if !lexdb_bind.immutable(&x) { return false } }
         for x in lv.post { if !lexdb_bind.immutable(&x) { return false } }
         for x in lv.local { if !lexdb_bind.immutable(&x) { return false } }
+    }
+    return true
+}
+
+// Whether subquery alt, planned again to be hashed (semiAltOk), may run
+// once in place of per outer row in optimizer 50's levels: nothing in it
+// can fail (an error a per-row run reaches for some outer rows only, or
+// for none, must not appear).
+fn altSafe(alt: &SubPlan): bool {
+    let a = &alt.sel.q
+    for x in alt.sel.exprs { if !noFail(a, &x) { return false } }
+    for x in a.top { if !noFail(a, &x) { return false } }
+    for lv in a.levels {
+        for x in lv.cond { if !noFail(a, &x) { return false } }
+        for x in lv.post { if !noFail(a, &x) { return false } }
+        for x in lv.local { if !noFail(a, &x) { return false } }
+        for x in lv.path.eqs { if !noFail(a, &x) { return false } }
+        for b in lv.path.rng { if !noFail(a, &b.val) { return false } }
+        for x in lv.hashVals { if !noFail(a, &x) { return false } }
+    }
+    return true
+}
+
+fn valsFree(q: &Query, xs: &[]Expr): bool {
+    for x in xs { if !noFail(q, &x) { return false } }
+    return true
+}
+
+// Whether x cannot fail (optimizer 50.3): grpSafe's, with a subquery of
+// q's that runs once (uncorrelated, hashed or a level's: its value is
+// there whatever reads it) read as a value, its arguments checked; a
+// subquery run per row may fail.
+fn noFail(q: &Query, x: &Expr): bool {
+    match stripSubs(q, x) {
+        Some(s) { return grpSafe(&s) }
+        None { return false }
+    }
+}
+
+fn stripSubs(q: &Query, x: &Expr): Option[Expr] {
+    match x {
+        Expr.Unary(op, a) {
+            match stripSubs(q, &a) {
+                Some(s) { return Some(Expr.Unary(op.clone(), s)) }
+                None { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            let sa = stripSubs(q, &a)
+            let sb = stripSubs(q, &b)
+            if sa.isNone() || sb.isNone() { return None }
+            return Some(Expr.Bin(op.clone(), sa.unwrap(), sb.unwrap()))
+        }
+        Expr.IsNull(a, neg) {
+            match stripSubs(q, &a) {
+                Some(s) { return Some(Expr.IsNull(s, neg)) }
+                None { return None }
+            }
+        }
+        Expr.Cast(a, t) {
+            match stripSubs(q, &a) {
+                Some(s) { return Some(Expr.Cast(s, t)) }
+                None { return None }
+            }
+        }
+        Expr.Call(n, args, star) {
+            if lexdb_sql.isSubCall(&n) {
+                let i = if len(args) > 0 { lexdb_sql.litInt(&args[0]) } else { -1 }
+                if i < 0 || i >= len(q.subs) { return None }
+                let sp = &q.subs[i]
+                if len(sp.sel.q.refs) > 0 && !sp.hashed && !sp.semi { return None }
+                for j in 3..len(args) { if !noFail(q, &args[j]) { return None } }
+                return Some(Expr.Lit(Val.Bool(true)))
+            }
+            var out: []Expr = []
+            for a in args {
+                match stripSubs(q, &a) {
+                    Some(s) { append(mut &out, s) }
+                    None { return None }
+                }
+            }
+            return Some(Expr.Call(n.clone(), out, star))
+        }
+        else { return Some(lexdb_sql.cloneExpr(x)) }
+    }
+}
+
+// Whether conjunct ci of level k's conditions cs (those after it as they
+// were) may be taken out to a level placed right after level at (k, or a
+// build group's last member), optimizer 50.3: what is then evaluated
+// before it (the conditions after it at k, the levels' to at) cannot
+// fail; exact: there is such a condition, so its own outer values must
+// not fail either (they are then evaluated on fewer rows).
+fn takeOutOk(q: &Query, cs: &[]Expr, ci: int, olds: &[]Level, k: int, at: int, exact: mut &bool): bool {
+    for j in ci + 1..len(cs) {
+        exact = true
+        if !noFail(q, &cs[j]) { return false }
+    }
+    for p in k + 1..at + 1 {
+        if p >= len(olds) { break }
+        exact = true
+        for x in olds[p].cond { if !noFail(q, &x) { return false } }
+        for x in olds[p].post { if !noFail(q, &x) { return false } }
     }
     return true
 }
@@ -4631,6 +4780,12 @@ fn narrowSub(sel: mut &Sel) {
     var xs: []str = []
     for x in sel.exprs { lexdb_sql.colNames(&x, mut &xs) }
     for g in sel.groupBy { lexdb_sql.colNames(&g, mut &xs) }
+    // (an aggregate's arguments: its select list reads its slot)
+    for sp in sel.specs {
+        for a in sp.args { lexdb_sql.colNames(&a, mut &xs) }
+        for o in sp.order { lexdb_sql.colNames(&o, mut &xs) }
+        match sp.filter { Some(f) { lexdb_sql.colNames(&f, mut &xs) } None {} }
+    }
     match sel.having { Some(x) { lexdb_sql.colNames(&x, mut &xs) } None {} }
     for x in sel.order { lexdb_sql.colNames(&x, mut &xs) }
     for x in sel.q.top { lexdb_sql.colNames(&x, mut &xs) }
@@ -4655,14 +4810,17 @@ fn narrowSub(sel: mut &Sel) {
 // The semi-join level of conjunct c (subquery i) of q, or None: c stays.
 // kind: IN's collation kind (resolve's); outer: about the rows reaching it.
 fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c: &Expr, i: int, kind: int, pt: &[]int,
-             alts: mut &[]Option[SubPlan], outer: float, params: &[]Val, anti: bool, lookOk: bool, rules: bool): Result[Option[Level], DbErr] {
+             alts: mut &[]Option[SubPlan], outer: float, params: &[]Val, anti: bool, lookOk: bool, rules: bool,
+             exact: bool): Result[Option[Level], DbErr] {
     var keys = SemiKeys{vals: [], oids: [], names: [], res: []}
     var ok = false
+    // NOT IN: a null-aware anti join (optimizer 50), no residual filter
+    let na = anti && q.subs[i].use == lexdb_sql.SUB_IN
     // a lookup per row as a join's level (semiLook), in place of the
     // subquery run per row
     var look: Option[Level] = None
     var lookRun = 0.0f
-    if lookOk && semiLookable(q, i) {
+    if lookOk && !na && semiLookable(q, i) {
         let lk = semiLook(q, i, anti, pt)
         let rows = try semiRows(st, txn, mut &q.subs[i].sel.q.levels[0], params, rules)
         lookRun = semiLookRun(&q.subs[i].sel.q.levels[0].t, &lk, rows)
@@ -4679,19 +4837,28 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
         } else if len(q.subs[i].sel.q.levels) > 0 {
             run = semiRun(&q.subs[i].sel.q.levels[0], inner)
         }
-        if outer >= 0.0f && inner >= 0.0f && semiCheaper(outer, inner, run) {
-            let got = semiKeys(q, &alt, c, pt)
-            if got.isSome() {
-                keys = got.unwrap()
-                ok = true
-                q.subs[i] = alt
+        if outer >= 0.0f && inner >= 0.0f && semiCheaper(outer, inner, run) && (!na || altSafe(&alt)) {
+            match semiKeys(q, &alt, c, pt) {
+                Some(sk) {
+                    // (its keys' outer sides now evaluated per outer row, not inside each run)
+                    if !na || (len(sk.res) == 0 && valsFree(q, &sk.vals)) {
+                        keys = sk
+                        ok = true
+                        q.subs[i] = alt
+                    }
+                }
+                None {}
             }
         }
     } else {
-        let got = semiKeys(q, &q.subs[i], c, pt)
-        if got.isSome() {
-            keys = got.unwrap()
-            ok = true
+        match semiKeys(q, &q.subs[i], c, pt) {
+            Some(sk) {
+                if (!na || len(sk.res) == 0) && (!exact || valsFree(q, &sk.vals)) {
+                    keys = sk
+                    ok = true
+                }
+            }
+            None {}
         }
     }
     if !ok {
@@ -4702,6 +4869,16 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
         }
         return Ok(None)
     }
+    return Ok(Some(keyLevel(q, i, keys, kind, anti, na, false, pt)))
+}
+
+// The hashed level of subquery i of q (its rows run once, hashed by keys:
+// semiKeys'): its columns added to q's, hidden; a semi or anti join's
+// (anti), a null-aware one's (na: NOT IN, optimizer 50), a mark join's
+// (mark: a last column, boolean, its mark; the level's slot of it is
+// first + len(t.cols) - 1).
+fn keyLevel(q: mut &Query, i: int, keys0: SemiKeys, kind: int, anti: bool, na: bool, mark: bool, pt: &[]int): Level {
+    var keys = keys0
     let w = len(keys.vals)
     let nk = if q.subs[i].use == lexdb_sql.SUB_IN { w - 1 } else { w }
     // its name and its columns' are no names a query can use: no table, a
@@ -4751,6 +4928,14 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
         if !have { append(mut &q.subs[i].sel.exprs, Expr.Col(n.toStr(), -1)) }
         append(mut &resFrom, n.toStr())
         append(mut &resTo, alias + "." + lexdb_catalog.ROWID + pos.toStr())
+    }
+    if mark {
+        // a mark join's mark: true, false or NULL (IN), per outer row
+        let pos = len(t.cols)
+        append(mut &t.cols, lexdb_sql.colDef(&"mark", lexdb_sql.oidType(lexdb_sql.OID_BOOL), false))
+        var qc = lexdb_sql.colDef(&(alias + "." + lexdb_catalog.ROWID + pos.toStr()), lexdb_sql.oidType(lexdb_sql.OID_BOOL), false)
+        qc.using = lexdb_sql.USING_HIDDEN
+        addCol(q, qc)
     }
     var lv = newLevel(rc(t), &alias, lexdb_sql.J_INNER, first)
     lv.src = i
@@ -4813,14 +4998,17 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     lv.hashKinds = hk
     // one integer key on both sides: materialize's own map (q4/q21's
     // order keys; a numeric's value is not an integer's key)
-    if len(lv.hashCols) == 1 && len(keys.oids) == 1 && lexdb_bind.isIntOid(keys.oids[0]) && lexdb_bind.isIntOid(exprOid(&lv.hashVals[0], &q.cols, pt)) {
+    if !na && !mark && len(lv.hashCols) == 1 && len(keys.oids) == 1 && lexdb_bind.isIntOid(keys.oids[0]) && lexdb_bind.isIntOid(exprOid(&lv.hashVals[0], &q.cols, pt)) {
         lv.hashInt = true
     }
+    // (the row engine keys a null-aware level by keyPart, its summary too)
+    if na { lv.mode = LV_NOTIN }
+    if mark { lv.mode = LV_MARK }
     q.subs[i].semi = true
     // run whole, once: not stopping at its first row (EXISTS)
     if len(q.subs[i].sel.q.levels) > 0 { q.subs[i].sel.q.levels[0].stops = false }
     narrowSub(mut &q.subs[i].sel)
-    return Ok(Some(lv))
+    return lv
 }
 
 // The semi-joins of q (planned to its last level): each conjunct that is
@@ -4867,9 +5055,11 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
                         Expr.Unary(op, _) { if op == "not" { anti = true } }
                         else {}
                     }
+                    // NOT IN (optimizer 50): right after its level, no error moved
+                    let na = isNotIn(&c)
                     var at = k
                     var outer = first
-                    if len(est) == nl {
+                    if len(est) == nl && !na {
                         for p in k + 1..nl {
                             if isOuter(olds[p].join) { break }
                             if est[p] < est[at] { at = p }
@@ -4880,7 +5070,11 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
                         at = gEnd[at]
                         if len(est) == nl { outer = est[at] }
                     }
-                    let got = try semiLevel(st, txn, q, &c, i, fr.subKinds[i], &pt, alts, outer, params, anti, i < len(looks) && looks[i], rules)
+                    var exact = false
+                    var placeOk = true
+                    if na { placeOk = takeOutOk(q, &cs, ci, &olds, k, at, mut &exact) }
+                    var got: Option[Level] = None
+                    if placeOk { got = try semiLevel(st, txn, q, &c, i, fr.subKinds[i], &pt, alts, outer, params, anti, i < len(looks) && looks[i], rules, exact) }
                     if got.isSome() {
                         append(mut &semis, got.unwrap())
                         append(mut &ats, at)
@@ -5108,7 +5302,10 @@ pub fn subsOf(q: &Query): []PSub {
         } else if sp.semi {
             // NOT EXISTS's level is an anti join (Level.anti)
             run = RUN_SEMI
-            for lv in q.levels { if lv.semi && lv.src == i && lv.anti { anti = true } }
+            for lv in q.levels {
+                if lv.semi && lv.src == i && lv.anti { anti = true }
+                if lv.src == i && lv.mode == LV_MARK { run = RUN_MARK }
+            }
         } else if sp.hashed {
             run = RUN_HASHED
         } else if len(sp.sel.q.refs) == 0 {
@@ -5703,7 +5900,9 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         if q.corr && pathCorr(&lv.path) { return Err(p) }
         // (a RIGHT or FULL JOIN: hashed, each with its own marks of the rows that joined)
         if rj && lv.perRow { return Err(p) }
-        let mark = if lv.anti { MK_ANTI } else if lv.semi || lv.semiSub >= 0 { MK_SEMI } else { MK_JOIN }
+        let mark = if lv.mode == LV_NOTIN { MK_NOTIN } else if lv.mode == LV_MARK { markOf(q, lv) }
+                   else if lv.anti { MK_ANTI } else if lv.semi || lv.semiSub >= 0 { MK_SEMI } else { MK_JOIN }
+        if lv.mode != 0 && !(lv.virt() && !lv.perRow) { return Err(p) }
         let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
         if lv.perRow && !look && !range { return Err(p) }
@@ -5790,6 +5989,33 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
     }
     return Ok(p)
 }
+
+// An optimizer 50 level's correlation keys when it holds IN's summary (a
+// null-aware anti join's, an IN's mark: its hash columns but the value);
+// -1 none.
+pub fn inKeys(q: &Query, k: int): int {
+    let lv = &q.levels[k]
+    if lv.mode == 0 || (lv.mode == LV_MARK && q.subs[lv.src].use != lexdb_sql.SUB_IN) { return -1 }
+    return len(lv.hashCols) - 1
+}
+
+// EXPLAIN's word for a hashed semi, anti or mark join's level.
+pub fn semiWord(lv: &Level): str {
+    if lv.mode == LV_NOTIN { return "anti join (null-aware) " }
+    if lv.mode == LV_MARK { return "mark join " }
+    return if lv.anti { "anti join " } else { "semi join " }
+}
+
+// EXPLAIN's word for a subquery whose rows are a level's (RUN_SEMI,
+// RUN_MARK; use its lexdb_sql.SUB_*): NOT IN's anti join is null-aware.
+pub fn runWord(ps: &PSub, use: int): str {
+    if ps.run == RUN_MARK { return "mark join" }
+    if ps.anti && use == lexdb_sql.SUB_IN { return "anti join (null-aware)" }
+    return if ps.anti { "anti join" } else { "semi join" }
+}
+
+// A mark join's PJoin.mark: its subquery's EXISTS or IN.
+fn markOf(q: &Query, lv: &Level): int { return if q.subs[lv.src].use == lexdb_sql.SUB_IN { MK_MARK_IN } else { MK_MARK_EX } }
 
 // Level k's table as a join reads it (PScan): its columns' kinds by their
 // slots, those decoded, in batches where its path reads ranges.

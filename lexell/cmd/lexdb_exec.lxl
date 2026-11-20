@@ -1773,6 +1773,9 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
             }
         }
         if lexdb_plan.keepsRight(q.levels[k].join) { rs.seen[k] = array(len(mat), false) }
+        // IN's summary per correlation key (optimizer 50), beside the keys
+        let nk = lexdb_plan.inKeys(q, k)
+        if nk >= 0 { lexdb_pipe.inSummary(&m.vrows[k], nk, mut &keys) }
         m.mat[k] = mat
         m.keys[k] = keys
         m.ikeys[k] = ikeys
@@ -1903,6 +1906,32 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     if bl == 1 { return Ok(false) }
     if bl == 0 {
         // done: its rows went on
+    } else if lv.mode != 0 {
+        // a null-aware anti join or a mark join (optimizer 50): the row's
+        // IN (EXISTS) by the hash and its summary
+        var vals: []Val = []
+        {
+            let noAggs: []Val = []
+            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+            for x in lv.hashVals { append(mut &vals, try eval(&x, &env)) }
+        }
+        let nk = lexdb_plan.inKeys(q, k)
+        let v = lexdb_pipe.inProbe1(&vals, if nk >= 0 { nk } else { len(vals) }, nk < 0, &m.keys[k])
+        if lv.mode == lexdb_plan.LV_NOTIN {
+            // as an anti join: the rows whose IN is not false dropped
+            rs.cnt[k].read += 1
+            if lexdb_ops.truth(&v) != Some(false) {
+                rs.cnt[k].joined += 1
+                return Ok(true)
+            }
+            return runLevel(st, txn, q, m, k + 1, row, params, emit, rs)
+        }
+        // the mark: the level's last column (its others hidden, NULL)
+        var r: []Val = array(len(lv.t.cols), Val.Null)
+        r[len(r) - 1] = v
+        let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
+        if got < 0 { return Ok(false) }
+        if got > 0 { matched = true }
     } else if !lv.perRow {
         let useFast = lexdb_plan.semiIntKey(lv)
         var fastKey = 0
@@ -3226,8 +3255,9 @@ fn subLines(q: &Query, subs: &[]lexdb_plan.PSub, stats: &[]SubStat, out: mut &[]
             append(out, head + (if ps.anti { "anti join" } else { "semi join" }) + ", looked up per row by the join")
             continue
         }
-        if ps.run == lexdb_plan.RUN_SEMI {
-            head = head + (if ps.anti { "anti join" } else { "semi join" }) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
+        let semi = ps.run == lexdb_plan.RUN_SEMI || ps.run == lexdb_plan.RUN_MARK
+        if semi {
+            head = head + lexdb_plan.runWord(ps, sp.use) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
             if len(sp.resText) > 0 { head = head + ", filter " + strings.join(&sp.resText, " and ") }
             head = head + ", run once"
         } else if ps.run == lexdb_plan.RUN_HASHED {
@@ -3245,7 +3275,7 @@ fn subLines(q: &Query, subs: &[]lexdb_plan.PSub, stats: &[]SubStat, out: mut &[]
             head = head + "per row, on " + strings.join(&rs, ", ")
         }
         var inner: []str = []
-        if i < len(stats) && ps.run == lexdb_plan.RUN_SEMI {
+        if i < len(stats) && semi {
             head = head + " (runs " + stats[i].runs.toStr() + ")"
             inner = planLines(&sp.sel, &ps.plan, &stats[i].cnt, &stats[i].inner)
         } else if i < len(stats) && ps.run == lexdb_plan.RUN_HASHED {
@@ -3302,7 +3332,7 @@ fn explainLines(q: &Query, cnt: &[]lexdb_pipe.Counts): []str {
             // a residual filter: the subquery's line names it
             var filt = ""
             if lv.resNot { filt = ", filter by a summary per key" } else if len(lv.cond) > 0 { filt = ", filter per candidate" }
-            append(mut &out, (if lv.anti { "anti join " } else { "semi join " }) + sn + ": hash on (" + strings.join(&cs, ", ") + ") over " + lexdb_plan.pathText(lv) + filt + tail)
+            append(mut &out, lexdb_plan.semiWord(lv) + sn + ": hash on (" + strings.join(&cs, ", ") + ") over " + lexdb_plan.pathText(lv) + filt + tail)
             continue
         }
         // a build group's (optimizer 49)
