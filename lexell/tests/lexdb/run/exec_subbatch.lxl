@@ -1,0 +1,183 @@
+// lexdb_exec: the row engine's batch conditions (bLevelPlan, bCondNode) with
+// a subquery run once in the first table's WHERE (bSubNode, condSubVals):
+// a scalar subquery (E31), IN and NOT IN (subquery) (E35), x op ANY and
+// ALL (subquery) (E37), EXISTS. The queries are ones the pipeline refuses
+// (FOR UPDATE, DISTINCT ON, WITH TIES, a correlated output), so the row
+// engine runs them. Each query runs with SET lexdb_batch = off (the
+// reference) and on: the same rows or the same error, and, with batches on,
+// EXPLAIN ANALYZE says the first table was read in batches (b) and a
+// condition holding a subquery was evaluated by them (s: lexdb_exec.subConds).
+// - a subquery giving one row, no row (NULL), two rows (21000), NULL.
+// - IN and NOT IN over a set holding NULL, an empty set, a set of text, of
+//   numbers of another type (1 = 1.0).
+// - ANY and ALL with each comparison, over an empty subquery too. (A positive
+//   IN and = ANY over a subquery is a semi join level, not a condition: no s.)
+// - 3,000 rows (three batches); a condition that gives an error in the
+//   third batch, before and after the subquery's condition.
+// expect: scalar: same b s
+// expect: scalar max: same b s
+// expect: scalar no row: same b s
+// expect: scalar null: same b s
+// expect: scalar two rows: same ERROR 21000
+// expect: scalar compared both ways: same b s
+// expect: in: same
+// expect: not in: same b s
+// expect: in with null: same
+// expect: not in with null: same b s
+// expect: in empty: same
+// expect: not in empty: same b s
+// expect: in text: same
+// expect: in numeric against int: same
+// expect: in on a function: same b
+// expect: any lt: same b s
+// expect: any gt: same b s
+// expect: any eq: same
+// expect: all lt: same b s
+// expect: all ge: same b s
+// expect: all ne: same b s
+// expect: any of none: same b s
+// expect: all of none: same b s
+// expect: all with null: same b s
+// expect: exists: same b s
+// expect: not exists: same b s
+// expect: two subqueries: same b s
+// expect: subquery in an or: same b s
+// expect: subquery in arithmetic: same b s
+// expect: subquery and a column in a case: same b s
+// expect: error after a subquery condition: same ERROR 22012 s
+// expect: error before it: same ERROR 22012 s
+// expect: nested subquery: same s
+// expect: distinct on: same b s
+// expect: with ties: same b s
+// expect: lock: same b s
+// expect: lock in: same b s
+// expect: correlated output: same b s
+// expect: correlated output in: same b s
+// expect: correlated subquery in the where: same b
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// The batches the first table of sql was read in (EXPLAIN ANALYZE's first "batches n"), 0 none.
+fn batches(s: mut &lexdb_exec.Session, sql: &str): int {
+    let out = q(s, &("explain analyze " + sql))
+    let at = strings.indexOf(&out, &"batches ", 0)
+    let nl = strings.indexOf(&out, &" subquery ", 0)
+    if at < 0 || (nl >= 0 && at > nl) { return 0 }
+    var n = 0
+    var i = at + 8
+    while i < len(out) && out[i] >= '0' && out[i] <= '9' {
+        n = n * 10 + int(out[i] - '0')
+        i += 1
+    }
+    return n
+}
+
+fn show(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let c0 = lexdb_exec.subConds()
+    let on = q(s, sql)
+    let conds = lexdb_exec.subConds() - c0
+    let n = batches(s, sql)
+    var out = label + ": " + (if off == on { "same" } else { "DIFFERENT" })
+    if strings.startsWith(&off, &"ERROR") { out = out + " " + off }
+    if n > 0 { out = out + " b" }
+    if conds > 0 { out = out + " s" }
+    println(out)
+    if off != on { println("  rows: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  batches: " + strings.substr(&on, 0, min(len(on), 300))) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(67), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table t (id int primary key, g int, x int, w text, d int)")
+        let c2 = q(mut &s, &"create table u (id int primary key, g int, x int, w text, n numeric(6,1))")
+        var id = 1
+        for chunk in 0..30 {
+            var rows: []str = []
+            for k in 0..100 {
+                let x = if id == 2700 { "100" } else if id % 9 == 0 { "null" } else { ((id * 37) % 101).toStr() }
+                // d is never zero but in row 2,700
+                let d = if id == 2700 { "0" } else { ((id % 5) + 1).toStr() }
+                append(mut &rows, "(" + id.toStr() + ", " + (id % 10).toStr() + ", " + x + ", 'w" + (id % 13).toStr() + "', " + d + ")")
+                id += 1
+            }
+            let ins = q(mut &s, &("insert into t values " + strings.join(&rows, ", ")))
+            if ins != "INSERT 0 100" { println("insert: " + ins) }
+        }
+        var urows: []str = []
+        for i in 1..61 {
+            let x = if i % 7 == 0 { "null" } else { ((i * 13) % 101).toStr() }
+            append(mut &urows, "(" + i.toStr() + ", " + (i % 10).toStr() + ", " + x + ", 'w" + (i % 11).toStr() + "', " + (i % 20).toStr() + ".0)")
+        }
+        let ui = q(mut &s, &("insert into u values " + strings.join(&urows, ", ")))
+        let tot = q(mut &s, &"analyze t")
+        let tou = q(mut &s, &"analyze u")
+        let lk = " for update"
+        show(mut &s, &"scalar", &("select id, x from t where x > (select avg(x) from u) and id > 100 order by id" + lk))
+        show(mut &s, &"scalar max", &("select id from t where x = (select max(x) from u) order by id" + lk))
+        show(mut &s, &"scalar no row", &("select id from t where x = (select x from u where id = 999) order by id" + lk))
+        show(mut &s, &"scalar null", &("select id from t where x < (select x from u where id = 7) order by id" + lk))
+        show(mut &s, &"scalar two rows", &("select id from t where x = (select x from u) order by id" + lk))
+        show(mut &s, &"scalar compared both ways", &("select id from t where (select min(x) from u) < x and x <= (select max(x) from u) - 20 order by id" + lk))
+        show(mut &s, &"in", &("select id from t where x in (select x from u where g < 5) order by id" + lk))
+        show(mut &s, &"not in", &("select id from t where x not in (select x from u where x is not null) order by id" + lk))
+        show(mut &s, &"in with null", &("select id from t where x in (select x from u) order by id" + lk))
+        show(mut &s, &"not in with null", &("select id from t where x not in (select x from u) order by id" + lk))
+        show(mut &s, &"in empty", &("select id from t where x in (select x from u where id < 0) order by id" + lk))
+        show(mut &s, &"not in empty", &("select id from t where x not in (select x from u where id < 0) order by id" + lk))
+        show(mut &s, &"in text", &("select id from t where w in (select w from u where g = 3) order by id" + lk))
+        show(mut &s, &"in numeric against int", &("select id from t where d in (select n from u where n < 5) order by id" + lk))
+        show(mut &s, &"in on a function", &("select id from t where x + 1 in (select x from u) and abs(g - 5) < 3 order by id" + lk))
+        show(mut &s, &"any lt", &("select id from t where x < any (select x from u where g = 2) order by id" + lk))
+        show(mut &s, &"any gt", &("select id from t where x > any (select x from u where g = 2) order by id" + lk))
+        show(mut &s, &"any eq", &("select id from t where x = any (select x from u where g = 2) order by id" + lk))
+        show(mut &s, &"all lt", &("select id from t where x < all (select x from u where x is not null and g = 2) order by id" + lk))
+        show(mut &s, &"all ge", &("select id from t where x >= all (select x from u where x is not null and g = 2) order by id" + lk))
+        show(mut &s, &"all ne", &("select id from t where x <> all (select x from u where x is not null) order by id" + lk))
+        show(mut &s, &"any of none", &("select id from t where x > any (select x from u where id < 0) order by id" + lk))
+        show(mut &s, &"all of none", &("select id from t where x > all (select x from u where id < 0) order by id" + lk))
+        show(mut &s, &"all with null", &("select id from t where x > all (select x from u where g = 0) order by id" + lk))
+        show(mut &s, &"exists", &("select id from t where exists (select 1 from u where x > 90) and g = 1 order by id" + lk))
+        show(mut &s, &"not exists", &("select id from t where not exists (select 1 from u where x > 190) and g = 1 order by id" + lk))
+        show(mut &s, &"two subqueries", &("select id from t where x > (select min(x) from u) + 10 and g in (select g from u where x > 80) order by id" + lk))
+        show(mut &s, &"subquery in an or", &("select id from t where x > (select max(x) from u) - 5 or g in (select g from u where id = 3) order by id" + lk))
+        show(mut &s, &"subquery in arithmetic", &("select id from t where x * 2 > (select sum(x) from u) / 10 + d order by id" + lk))
+        show(mut &s, &"subquery and a column in a case", &("select id from t where case when g > 4 then x else d end > (select avg(x) from u) order by id" + lk))
+        show(mut &s, &"error after a subquery condition", &("select id from t where x > (select min(x) from u) and 100 / d > 1 order by id" + lk))
+        show(mut &s, &"error before it", &("select id from t where 100 / d > 1 and x > (select min(x) from u) order by id" + lk))
+        show(mut &s, &"nested subquery", &("select id from t where x in (select x from u where g in (select g from u where x > (select avg(x) from u))) order by id" + lk))
+        show(mut &s, &"distinct on", &"select distinct on (g) g, id from t where x > (select avg(x) from u) order by g, id")
+        show(mut &s, &"with ties", &"select id, x from t where x < (select avg(x) from u) - 10 order by x desc fetch first 5 rows with ties")
+        show(mut &s, &"lock", &("select id from t where x < (select avg(x) from u) and id < 2500 order by id limit 40" + lk))
+        show(mut &s, &"lock in", &("select id from t where g not in (select g from u where x > 50) and id < 700 order by id" + lk))
+        show(mut &s, &"correlated output", &"select id, (select count(*) from u where u.g = t.g) from t where x > (select avg(x) from u) and id < 1500 order by id")
+        show(mut &s, &"correlated output in", &"select id, (select max(x) from u where u.g = t.g) from t where g not in (select g from u where x > 99) and id < 1500 order by id")
+        show(mut &s, &"correlated subquery in the where", &("select id from t where x > (select avg(x) from u where u.g = t.g) and id < 800 order by id" + lk))
+        return 0
+    }).unwrap()
+}
