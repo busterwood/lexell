@@ -16,10 +16,16 @@
 //   sums, GROUP BY), ORDER BY ... LIMIT, DISTINCT, a join after it, a
 //   subquery or view around it, an error in a later batch (in the select
 //   list, in ON, in WHERE).
+// - two and three RIGHT or FULL JOINs (also with LEFT and inner joins, and
+//   USING) in one query: each hash keeps its own marks of the rows that
+//   joined; the unmatched rows come level by level, as the row engine
+//   gives them (a level's unmatched rows joined to a later level are noted
+//   there before that level's own tail).
 // "batched": statements whose join ran in batches with them on.
 // timeout: 120
 // expect: loaded: 1500|1300|0|800
 // expect: full: 42 statements, 42 the same, 42 batched, 0 batched with batches off, 4 errors or no rows seen
+// expect: multi: 40 statements, 40 the same, 40 batched, 0 batched with batches off, 3 errors or no rows seen
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -100,6 +106,8 @@ fn main() {
         let c6 = q(mut &s, &"create table fc (id int primary key, k int, x int)")
         let c7 = q(mut &s, &"insert into fc select g, case when g % 7 = 0 then null else (g * 5) % 700 end, g % 50 from generate_series(1, 800) g")
         let c8 = q(mut &s, &"create view fv as select k, count(*) as n from fb group by k")
+        let c8b = q(mut &s, &"create table fd (id int primary key, k int, y int)")
+        let c8c = q(mut &s, &"insert into fd select g, case when g % 9 = 0 then null else (g * 7) % 500 end, g % 30 from generate_series(1, 1100) g")
         let c9 = q(mut &s, &"analyze")
         println("loaded: " + q(mut &s, &"select (select count(*) from fa), (select count(*) from fb), (select count(*) from fe), (select count(*) from fc)"))
 
@@ -157,6 +165,57 @@ fn main() {
         check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and 100 / (fb.id - 1250) > 0", true)
         check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where 100 / (coalesce(fb.id, 0) - 1290) > 0", true)
         report("full", &g)
+
+        // two and three RIGHT or FULL joins in a query: each hash its own marks, the unmatched rows given
+        // level by level (what one level's tail joins to a later level is noted before that level's tail)
+        g = newGroup()
+        let two = "fa full join fb on fa.k = fb.k full join fc on fc.k = fb.k"
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two, true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k full join fc on fc.k = fa.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k full join fc on fc.k = coalesce(fa.k, fb.k)", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k full join fc on fc.k = fb.k and fc.x < 20 and fa.v > 100", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa right join fb on fa.k = fb.k right join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa right join fb on fa.k = fb.k full join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k right join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa left join fb on fa.k = fb.k full join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa join fb on fa.k = fb.k full join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k left join fc on fc.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k left join fc on fc.k = fb.k and fc.x < 5 where fc.id is null", true)
+        check(mut &s, mut &g, "select count(*), count(fa.id), count(fb.id), count(fc.id), sum(fc.x) from " + two, true)
+        check(mut &s, mut &g, "select fc.x, count(*), count(fa.id), count(fb.id) from " + two + " group by fc.x order by fc.x nulls first", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " order by fc.id nulls first, fb.id nulls first, fa.id nulls first limit 40", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " order by fa.id nulls last, fb.id nulls last, fc.id nulls last limit 12 offset 2000", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " limit 50", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " where fa.v > 900 or fb.w > 2000 or fc.x = 3", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " where fc.id is null", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " where fa.id is null and fb.id is null", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " where fb.id is null", true)
+        // three: a fourth table
+        let three = two + " full join fd on fd.k = fc.k"
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id, fd.id from " + three, true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id, fd.id from fa full join fb on fa.k = fb.k full join fc on fc.k = fa.k full join fd on fd.k = fb.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id, fd.id from fa right join fb on fa.k = fb.k right join fc on fc.k = fb.k right join fd on fd.k = fc.k", true)
+        check(mut &s, mut &g, "select count(*), count(fa.id), count(fb.id), count(fc.id), count(fd.id), sum(fd.y) from " + three, true)
+        check(mut &s, mut &g, "select fd.y, count(*), count(fa.id) from " + three + " group by fd.y order by fd.y nulls first", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id, fd.id from " + three + " order by fd.id desc nulls last, fc.id nulls first, fb.id nulls first, fa.id nulls first limit 33", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id, fd.id from " + three + " where fa.id is null or fd.id is null", true)
+        // USING, chained
+        check(mut &s, mut &g, "select k, fa.id, fb.id, fc.id from fa full join fb using (k) full join fc using (k)", true)
+        check(mut &s, mut &g, "select * from fa full join fb using (k) full join fc using (k)", true)
+        check(mut &s, mut &g, "select k, count(*), count(fa.id), count(fb.id), count(fc.id) from fa full join fb using (k) full join fc using (k) group by k order by k nulls first", true)
+        check(mut &s, mut &g, "select k, fa.id, fb.id, fc.id, fd.id from fa full join fb using (k) full join fc using (k) full join fd using (k) where k < 100", true)
+        // a view and a subquery as a level, empty sides
+        check(mut &s, mut &g, "select fa.id, fv.n, fc.id from fa full join fv on fa.k = fv.k full join fc on fc.k = fv.k", true)
+        check(mut &s, mut &g, "select fa.id, fe.id, fc.id from fa full join fe on fa.k = fe.k full join fc on fc.k = fa.k", true)
+        check(mut &s, mut &g, "select fe.id, fa.id, fc.id from fe full join fa on fa.k = fe.k full join fc on fc.k = fa.k", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fe.id from fa full join fb on fa.k = fb.k full join fe on fe.k = fb.k", true)
+        check(mut &s, mut &g, "select count(*), count(a), count(b), count(c) from (select fa.id as a, fb.id as b, fc.id as c from " + two + ") d where a is null or c is null", true)
+        // errors in a later batch
+        check(mut &s, mut &g, "select 100 / (fc.id - 780), fa.id from " + two, true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from fa full join fb on fa.k = fb.k full join fc on fc.k = fb.k and 100 / (fc.id - 790) > 0", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + two + " where 100 / (coalesce(fa.id, 0) - 1450) > 0", true)
+        report("multi", &g)
         s.close()
         return 0
     }).unwrap()

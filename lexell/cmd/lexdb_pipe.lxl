@@ -5604,8 +5604,9 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
 type Skip = record { skip: int; given: int }
 
 // A join run's state: per level its rows for the chunk (the scan's batch,
-// a lookup's or range's rows), a RIGHT JOIN's rows that joined, the skip.
-type JState = record { cur: []Batch; seen: []bool; sk: Skip }
+// a lookup's or range's rows), per level a RIGHT or FULL JOIN's hash rows
+// that joined (each its own marks; [] for the others), the skip.
+type JState = record { cur: []Batch; seen: [][]bool; sk: Skip }
 
 // One row's candidates at level j (pj all 0, pi their rows), as the row
 // engine tries them: each one's conditions, then the levels after it for
@@ -5638,7 +5639,7 @@ fn tailCands(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: m
             let w = gatherAt(jr, &js.cur, &atc, 1, &jl.creads)
             if len(try pick(&jl.conds, &w, [0])) == 0 { continue }
         }
-        if jl.right && pi[c] >= 0 { js.seen[pi[c]] = true }
+        if jl.right && pi[c] >= 0 { js.seen[j][pi[c]] = true }
         cnt[lv].joined += 1
         any = true
         // an anti join drops the row; a semi join gives it once
@@ -5757,7 +5758,7 @@ fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int
         }
     }
     // a RIGHT JOIN's rows that joined
-    if jl.right { for x in keep { if cat[j][x] >= 0 { js.seen[cat[j][x]] = true } } }
+    if jl.right { for x in keep { if cat[j][x] >= 0 { js.seen[j][cat[j][x]] = true } } }
     var outAt: [][]int = []
     if jl.mark == lexdb_plan.MK_ANTI {
         // the outer rows with no passing candidate, once; joined: those
@@ -5873,13 +5874,11 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     heldRun(&srcs[sc.level])
     var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}}
     for i in 0..len(jr.jls) { append(mut &js.cur, lexdb_rows.noRows()) }
-    // a RIGHT JOIN's rows that joined (at most one)
-    var rightAt = -1
+    // a RIGHT or FULL JOIN's rows that joined, per level
+    var rights: []int = []
     for i in 0..len(jr.jls) {
-        if jr.jls[i].right {
-            rightAt = i
-            js.seen = array(jr.jls[i].rows.n, false)
-        }
+        append(mut &js.seen, if jr.jls[i].right { array(jr.jls[i].rows.n, false) } else { [] })
+        if jr.jls[i].right { append(mut &rights, i) }
     }
     var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
     let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
@@ -5896,17 +5895,20 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         return got
     })
     cnt[sc.level].joined += rawKept
-    if rightAt >= 0 && !stopped {
-        // a RIGHT JOIN's rows that joined nothing, with NULLs for the
-        // tables before it, its WHERE conjuncts after it, then joined with
-        // the tables after it (as runQuery adds them)
+    // each RIGHT or FULL JOIN's rows that joined nothing, a level at a
+    // time as runRows gives them (what an earlier level's tail joined to a
+    // later one is noted before its own), with NULLs for the tables before
+    // it, its WHERE conjuncts after it, then joined with the tables after it
+    var more = !stopped
+    for rightAt in rights {
+        if !more { break }
         let jl = &jr.jls[rightAt]
-        let total = len(js.seen)
+        let total = len(js.seen[rightAt])
         var x = 0
         while x < total {
             var idx: []int = []
             while x < total && len(idx) < lexdb_rows.BROWS {
-                if !js.seen[x] { append(mut &idx, x) }
+                if !js.seen[rightAt][x] { append(mut &idx, x) }
                 x += 1
             }
             let n = len(idx)
@@ -5925,7 +5927,10 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
             }
             let m = len(at[0])
             js.sk.skip = 0
-            if !(try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false, out)) { break }
+            if !(try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false, out)) {
+                more = false
+                break
+            }
         }
     }
     cnt[sc.level].read += rc.read
