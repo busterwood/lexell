@@ -1,0 +1,163 @@
+// lexdb_exec and lexdb_pipe: FULL JOIN, more than one RIGHT or FULL JOIN in a
+// query, and CROSS JOIN or a join with no key, in batches (design/
+// lexdb-batch-gaps.md item 9; constructs F3-F8, M14). Every query runs with
+// SET lexdb_batch = off (the row engine, the reference) and on, from the same
+// data: the rows, in the order they come out, must be the same as text, with
+// and without an ORDER BY (the row engine's order is the algorithm's: the
+// first table's rows in turn, each with its matches in the order read, then a
+// RIGHT or FULL JOIN's rows that joined nothing, level by level), and so must
+// the error (SQLSTATE and message). A counter (lexdb_pipe.joinCounts, the runs
+// of a join's batches) says the batches ran the query where its shape takes
+// them: not with batches off.
+// - FULL JOIN: NULL keys on both sides, duplicates on both sides, an empty
+//   side or two, FULL JOIN ... USING (the merged column COALESCEs both), a
+//   condition in ON against one in WHERE (on either side, on the NULL rows),
+//   1,024 rows and more each side, an aggregate over it (count of each side,
+//   sums, GROUP BY), ORDER BY ... LIMIT, DISTINCT, a join after it, a
+//   subquery or view around it, an error in a later batch (in the select
+//   list, in ON, in WHERE).
+// "batched": statements whose join ran in batches with them on.
+// timeout: 120
+// expect: loaded: 1500|1300|0|800
+// expect: full: 42 statements, 42 the same, 42 batched, 0 batched with batches off, 4 errors or no rows seen
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+fn text(rs: &[lexdb_exec.Res]): str {
+    var out: []str = []
+    for r in rs {
+        if !r.hasRows { append(mut &out, r.tag.clone()) }
+        for row in r.rows {
+            var vs: []str = []
+            for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+            append(mut &out, strings.join(&vs, "|"))
+        }
+    }
+    return strings.join(&out, ";")
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return text(&rs) }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+type Group = record { n: int; same: int; batched: int; off: int; odd: int; seen: []str }
+
+fn newGroup(): Group { return Group{n: 0, same: 0, batched: 0, off: 0, odd: 0, seen: []} }
+
+// sql run with batches off or on: its result, and whether a join ran in batches.
+fn trial(s: mut &lexdb_exec.Session, sql: &str, on: bool, ran: mut &bool): str {
+    let m = q(s, &(if on { "set lexdb_batch = on" } else { "set lexdb_batch = off" }))
+    let j0 = lexdb_pipe.joinCounts()
+    let res = q(s, sql)
+    let j1 = lexdb_pipe.joinCounts()
+    ran = j1[0] > j0[0]
+    return res
+}
+
+// sql with batches off and on: the same text; batched: it ran in batches.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, batched: bool) {
+    var ranOff = false
+    var ranOn = false
+    let off = trial(s, sql, false, mut &ranOff)
+    let on = trial(s, sql, true, mut &ranOn)
+    g.n += 1
+    if off == on {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  on:  " + strings.substr(&on, 0, min(len(on), 300)))
+    }
+    if ranOn { g.batched += 1 }
+    if ranOff { g.off += 1 }
+    if strings.startsWith(&off, "ERROR") || len(off) == 0 || off == "0" { g.odd += 1 }
+    if batched != ranOn && len(g.seen) < 3 {
+        append(mut &g.seen, "EXPECTED " + (if batched { "batched" } else { "row" }) + ": " + sql)
+    }
+}
+
+fn report(name: &str, g: &Group) {
+    println(name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same, " + g.batched.toStr() + " batched, " + g.off.toStr() +
+            " batched with batches off, " + g.odd.toStr() + " errors or no rows seen")
+    for x in g.seen { println(x) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(73), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // fa and fb: 1,500 and 1,300 rows, keys with NULLs (every 13th and 11th row) and duplicates on both sides
+        let c1 = q(mut &s, &"create table fa (id int primary key, k int, v int, t text)")
+        let c2 = q(mut &s, &"insert into fa select g, case when g % 13 = 0 then null else g % 400 end, g, 'a' || g from generate_series(1, 1500) g")
+        let c3 = q(mut &s, &"create table fb (id int primary key, k int, w int, t text)")
+        let c4 = q(mut &s, &"insert into fb select g, case when g % 11 = 0 then null else (g * 3) % 600 end, g * 2, 'b' || g from generate_series(1, 1300) g")
+        let c5 = q(mut &s, &"create table fe (id int primary key, k int, w int, t text)")
+        let c6 = q(mut &s, &"create table fc (id int primary key, k int, x int)")
+        let c7 = q(mut &s, &"insert into fc select g, case when g % 7 = 0 then null else (g * 5) % 700 end, g % 50 from generate_series(1, 800) g")
+        let c8 = q(mut &s, &"create view fv as select k, count(*) as n from fb group by k")
+        let c9 = q(mut &s, &"analyze")
+        println("loaded: " + q(mut &s, &"select (select count(*) from fa), (select count(*) from fb), (select count(*) from fe), (select count(*) from fc)"))
+
+        var g = newGroup()
+        let on = "fa full join fb on fa.k = fb.k"
+        // the rows, in order, and sorted
+        check(mut &s, mut &g, "select fa.id, fa.k, fb.id, fb.k from " + on, true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " order by fa.id nulls first, fb.id nulls first", true)
+        check(mut &s, mut &g, "select * from " + on, true)
+        check(mut &s, mut &g, "select fa.t, fb.t, fa.v + fb.w from " + on + " order by 1 nulls last, 2 nulls last", true)
+        // an aggregate over it
+        check(mut &s, mut &g, "select count(*), count(fa.id), count(fb.id), sum(fa.v), sum(fb.w) from " + on, true)
+        check(mut &s, mut &g, "select fa.k, count(*), count(fb.id), sum(fb.w) from " + on + " group by fa.k order by fa.k nulls first", true)
+        check(mut &s, mut &g, "select coalesce(fa.k, fb.k) as kk, count(fa.id), count(fb.id) from " + on + " group by coalesce(fa.k, fb.k) order by kk nulls first", true)
+        check(mut &s, mut &g, "select count(*), min(fa.id), max(fb.id), avg(fa.v) from " + on + " where fa.id is null or fb.id is null", true)
+        // ORDER BY ... LIMIT, DISTINCT
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " order by fb.id desc nulls last, fa.id limit 25", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " order by fa.id nulls first, fb.id nulls first limit 7 offset 1400", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " limit 30", true)
+        check(mut &s, mut &g, "select distinct fa.k, fb.k from " + on + " order by 1 nulls first, 2 nulls first", true)
+        // a condition in ON against one in WHERE
+        check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and fa.v > 700", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and fb.w > 1000", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and fa.v % 2 = 0 and fb.w % 3 = 0", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and fa.v + fb.w > 2500", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where fa.v > 700", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where fb.w > 1000", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where fa.v > 700 or fb.w > 1000", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where fa.id is null", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where fb.id is null", true)
+        check(mut &s, mut &g, "select count(*) from " + on + " where fa.id is null or fb.id is null", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where coalesce(fa.v, 0) + coalesce(fb.w, 0) > 3000", true)
+        // empty sides
+        check(mut &s, mut &g, "select fa.id, fe.id from fa full join fe on fa.k = fe.k", true)
+        check(mut &s, mut &g, "select fa.id, fe.id from fe full join fa on fa.k = fe.k", true)
+        check(mut &s, mut &g, "select fe.id, fe2.id from fe full join fe fe2 on fe.k = fe2.k", true)
+        check(mut &s, mut &g, "select count(*), count(fe.id) from fa full join fe on fa.k = fe.k", true)
+        // FULL JOIN ... USING: the merged column, * and its order
+        check(mut &s, mut &g, "select k, fa.v, fb.w from fa full join fb using (k)", true)
+        check(mut &s, mut &g, "select * from fa full join fb using (k)", true)
+        check(mut &s, mut &g, "select k, count(*), count(fa.id), count(fb.id) from fa full join fb using (k) group by k order by k nulls first", true)
+        check(mut &s, mut &g, "select k, fa.id, fb.id from fa full join fb using (k) where k > 300 order by k, 2 nulls first, 3 nulls first", true)
+        check(mut &s, mut &g, "select * from fa full join fb using (id, k)", true)
+        check(mut &s, mut &g, "select id, k from fa natural full join fb", true)
+        // a join after it, a view, a subquery around it
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + on + " join fc on fc.k = coalesce(fa.k, fb.k)", true)
+        check(mut &s, mut &g, "select fa.id, fb.id, fc.id from " + on + " left join fc on fc.k = fb.k and fc.x < 10", true)
+        check(mut &s, mut &g, "select fa.id, fv.n from fa full join fv on fa.k = fv.k", true)
+        check(mut &s, mut &g, "select sum(d.n), count(*) from (select fa.id as a, fb.id as b, fa.v + fb.w as n from " + on + ") d where d.a is null or d.b is null", true)
+        // a larger table first, a smaller one first
+        check(mut &s, mut &g, "select fb.id, fc.id from fb full join fc on fb.k = fc.k", true)
+        check(mut &s, mut &g, "select fc.id, fb.id from fc full join fb on fb.k = fc.k", true)
+        // errors in a later batch: the select list, ON, WHERE
+        check(mut &s, mut &g, "select 100 / (fa.id - 1400), fb.id from " + on, true)
+        check(mut &s, mut &g, "select fa.id, fb.id from fa full join fb on fa.k = fb.k and 100 / (fb.id - 1250) > 0", true)
+        check(mut &s, mut &g, "select fa.id, fb.id from " + on + " where 100 / (coalesce(fb.id, 0) - 1290) > 0", true)
+        report("full", &g)
+        s.close()
+        return 0
+    }).unwrap()
+}
