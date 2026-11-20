@@ -1,0 +1,127 @@
+// lexdb_exec: T-SQL's decimal division (#tdiv) and AVG (#tavg) over batches
+// (lexdb_lib's tdivFn and tavgFn, bound through lexdb_exec.fnRefOf): a session
+// under SQL Server's collation (the TDS server's), each query run with
+// SET lexdb_batch = off (the row path, the reference) and on: the same
+// rows, and over the pipeline's batches (b).
+// - decimal / decimal, / int, int / decimal, / a literal, int / int (not
+//   decimal division), in a select list, WHERE, ORDER BY, a sum's argument,
+//   with NULLs, over 3,000 rows (three batches).
+// - AVG of an int (cut to an int), a decimal (scale max(s, 6)), a money-like
+//   numeric(19,4), a float, grouped, filtered, empty, all NULL, HAVING,
+//   and a division of averages and sums.
+// - a divide by zero in the third batch gives 22012 both ways, and with a
+//   filter that skips the zero none.
+// expect: select list: same b
+// expect: where: same b
+// expect: order by: same b
+// expect: sum of a division: same b
+// expect: int by int: same b
+// expect: int by decimal: same b
+// expect: decimal by int: same b
+// expect: literals: same b
+// expect: nulls: same b
+// expect: avg: same b
+// expect: avg grouped: same b
+// expect: avg filtered: same b
+// expect: avg empty: same b
+// expect: avg all null: same b
+// expect: avg having: same b
+// expect: avg of float: same b
+// expect: avg division: same b
+// expect: sums division: same b
+// expect: avg order by: same b
+// expect: group by division: same b
+// expect: divide by zero: same ERROR 22012 b
+// expect: divide by zero past a filter: same b
+// expect: values: 3|3.500000|2.000000|5|5.500000
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// sql without batches and with: the same text, and whether the pipeline ran it (b).
+fn both(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let r0 = lexdb_pipe.runCounts()[1]
+    let on = q(s, sql)
+    let ran = lexdb_pipe.runCounts()[1] > r0
+    var out = label + ": " + (if off == on { "same" } else { "DIFFERENT" })
+    if strings.startsWith(&off, &"ERROR") { out = out + " " + off }
+    if ran { out = out + " b" }
+    println(out)
+    if off != on { println("  rows: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  batches: " + strings.substr(&on, 0, min(len(on), 300))) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        s.setCollation(&lexdb_sql.TSQL_COLLATION)
+        let c1 = q(mut &s, &"create table t (id int primary key, g int, a numeric(12,2), b numeric(10,4), i int, j int, m numeric(19,4), f float8)")
+        var id = 1
+        for chunk in 0..30 {
+            var rows: []str = []
+            for k in 0..100 {
+                let a = if id % 13 == 0 { "null" } else { ((id * 37) % 5000 - 1500).toStr() + "." + (id % 100 / 10).toStr() + (id % 10).toStr() }
+                // b is never zero but in row 2,602
+                let bu = (id * 91) % 997 + 1
+                let b = if id % 17 == 0 { "null" } else if id == 2602 { "0" } else { (bu / 100).toStr() + "." + (bu % 100 / 10).toStr() + (bu % 10).toStr() + "5" }
+                let i = if id % 11 == 0 { "null" } else { ((id * 53) % 201 - 100).toStr() }
+                let j = if id % 7 == 0 { "null" } else { ((id * 29) % 40 + 1).toStr() }
+                let m = if id % 19 == 0 { "null" } else { ((id * 12345) % 1000000 - 300000).toStr() + "." + (id % 10000 / 1000).toStr() + (id % 10).toStr() + "00" }
+                let f = if id % 23 == 0 { "null" } else { (id % 50).toStr() + ".5" }
+                append(mut &rows, "(" + id.toStr() + ", " + (id % 5).toStr() + ", " + a + ", " + b + ", " + i + ", " + j + ", " + m + ", " + f + ")")
+                id += 1
+            }
+            let ins = q(mut &s, &("insert into t values " + strings.join(&rows, ", ")))
+            if ins != "INSERT 0 100" { println("insert: " + ins) }
+        }
+        let tot = q(mut &s, &"analyze t")
+        both(mut &s, &"select list", &"select id, a / b, m / b, a / m from t where b <> 0 order by id")
+        both(mut &s, &"where", &"select count(*), sum(id) from t where b <> 0 and a / b > 2")
+        both(mut &s, &"order by", &"select id from t where b <> 0 order by a / b desc, id limit 50")
+        both(mut &s, &"sum of a division", &"select g, sum(a / b), min(m / b), max(a / b), count(a / b) from t where b <> 0 group by g order by g")
+        both(mut &s, &"int by int", &"select id, i / j, i / 7, (i + 5) / (j + 1) from t where id % 3 = 0 order by id")
+        both(mut &s, &"int by decimal", &"select id, i / b, j / a from t where b <> 0 and a <> 0 order by id")
+        both(mut &s, &"decimal by int", &"select id, a / j, m / i, b / 3 from t where j is not null and i <> 0 order by id")
+        both(mut &s, &"literals", &"select id, a / 3, a / 0.5, 10 / b, 1.0 / a, a / 7.25 from t where b <> 0 and a <> 0 order by id")
+        both(mut &s, &"nulls", &"select count(*), count(a / b), count(i / j), sum(a / b) from t where b <> 0")
+        both(mut &s, &"avg", &"select avg(i), avg(j), avg(a), avg(b), avg(m), avg(id) from t")
+        both(mut &s, &"avg grouped", &"select g, avg(i), avg(a), avg(b), avg(m), count(*) from t group by g order by g")
+        both(mut &s, &"avg filtered", &"select g, avg(i) filter (where i > 0), avg(a) filter (where a < 0), avg(m * 2) from t where id > 5 group by g order by g")
+        both(mut &s, &"avg empty", &"select avg(i), avg(a), avg(m) from t where id < 0")
+        both(mut &s, &"avg all null", &"select g, avg(i), avg(a) from t where id % 13 = 0 and id % 11 = 0 group by g")
+        both(mut &s, &"avg having", &"select g, avg(a) from t group by g having avg(i) > 0 and avg(a) < 100 order by g")
+        both(mut &s, &"avg of float", &"select g, avg(f), avg(f * 2) from t group by g order by g")
+        both(mut &s, &"avg division", &"select g, avg(a) / avg(j), avg(m) / (avg(i) + 1000), avg(i) / avg(j) from t group by g order by g")
+        both(mut &s, &"sums division", &"select g, sum(a) / sum(b), sum(m) / count(*), sum(i) / sum(j) from t where b <> 0 group by g order by g")
+        both(mut &s, &"avg order by", &"select g from t group by g order by avg(a) desc, g")
+        both(mut &s, &"group by division", &"select i / 10 as q, count(*), avg(a) from t group by i / 10 order by q")
+        both(mut &s, &"divide by zero", &"select id, a / b from t")
+        both(mut &s, &"divide by zero past a filter", &"select id, a / b from t where id <> 2602 and a is not null and id > 2000 and b <> 0")
+        println("values: " + q(mut &s, &"select 7 / 2, 7.0 / 2, 1.0 / 0.5, avg(5), avg(5.5) from t where id = 1"))
+        return 0
+    }).unwrap()
+}

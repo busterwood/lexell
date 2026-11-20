@@ -308,6 +308,8 @@ pub fn entryOf(name: &str, n: int): LibFn {
         "div" { if n == 2 { return divFn } }
         "gcd" { if n == 2 { return gcdFn } }
         "lcm" { if n == 2 { return lcmFn } }
+        "#tdiv" { if n == 3 { return tdivFn } }
+        "#tavg" { if n == 2 { return tavgFn } }
         "width_bucket" { if n == 4 { return widthBucketFn } }
         "to_char" { if n == 2 { return toCharFn } }
         "to_number" { if n == 2 { return toNumberFn } }
@@ -1226,6 +1228,66 @@ fn modFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbE
 fn divFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return intMathOf(name, vs, IM_DIV) }
 fn gcdFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return intMathOf(name, vs, IM_GCD) }
 fn lcmFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return intMathOf(name, vs, IM_LCM) }
+
+// T-SQL's decimal division (#tdiv(a, b, scale), lexdb_bind's `/` under a T-SQL
+// collation): a / b at the scale its types give (the bound argument).
+fn tdivFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) != 3 { return Err(noSuch(name, len(vs))) }
+    return tdiv(vs)
+}
+
+// tdivFn's, its three arguments given (the row path's eval calls it direct).
+pub fn tdiv(vs: &[]Val): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    let a = try lexdb_ops.coerce(vs[0].clone(), &lexdb_sql.oidType(lexdb_sql.OID_NUMERIC))
+    let b = try lexdb_ops.coerce(vs[1].clone(), &lexdb_sql.oidType(lexdb_sql.OID_NUMERIC))
+    match a {
+        Val.Num(da) {
+            match b {
+                Val.Num(db) {
+                    if db.isZero() { return Err(e("22012", "division by zero")) }
+                    match da.div(db, lexdb_ops.intOf(&vs[2]).unwrapOr(6), Rounding.HALF_AWAY) {
+                        Ok(q) { return Ok(Val.Num(q)) }
+                        Err(_) { return Err(e("22003", "numeric field overflow")) }
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return lexdb_ops.arith(lexdb_ops.OP_DIV, &vs[0], &vs[1])
+}
+
+// T-SQL's AVG (#tavg(avg, mode), lexdb_bind): the average cut to an integer
+// (mode -1) or to a decimal's scale (mode >= 0), else as it is.
+fn tavgFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) != 2 { return Err(noSuch(name, len(vs))) }
+    return tavg(vs)
+}
+
+// tavgFn's, its two arguments given (eval calls it direct).
+pub fn tavg(vs: &[]Val): Result[Val, DbErr] {
+    let m = lexdb_ops.intOf(&vs[1]).unwrapOr(-2)
+    match vs[0] {
+        Val.Num(d) {
+            if m == -1 {
+                match d.toInt(Rounding.TOWARD_ZERO) {
+                    Ok(n) { return Ok(Val.Int(n)) }
+                    Err(_) {}
+                }
+            }
+            if m >= 0 {
+                match d.quantize(m, Rounding.HALF_AWAY) {
+                    Ok(q) { return Ok(Val.Num(q)) }
+                    Err(_) {}
+                }
+            }
+        }
+        else {}
+    }
+    return Ok(vs[0].clone())
+}
 
 fn widthBucketFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if anyNull(vs) { return Ok(Val.Null) }
