@@ -314,9 +314,15 @@ and HAVING, NULL key values against a grouping NULL, batched against off.
   The whole suite must pass before reporting.
 - **Measure in-process, pinned, one at a time.** A scratch program (not
   committed) that times shapes with batches on and off and against the
-  branch's base, `taskset -c` on the CPU the brief gives, under `flock -s
-  ~/tpch/.bench.lock`. Warm the table first (the first query after a load
-  pays the cache). The coordinator runs TPC-H; agents do not.
+  branch's base, `taskset -c` on the CPU the brief gives, under the
+  exclusive lock: `flock ~/tpch/.bench.lock taskset -c N program`. Tests
+  and builds take the lock shared (`flock -s`), so a timing never overlaps
+  another agent's suite, a build or a TPC-H run; never run a test or a
+  build inside an exclusive section (it deadlocks). Keep a section short
+  (seconds to a minute) and interleave base and branch inside it (base,
+  branch, base, branch) so drift cancels. Warm the table first (the first
+  query after a load pays the cache). The coordinator runs TPC-H; agents
+  do not.
 - **Lexell notes.** A closure that borrows a local keeps the borrow while
   it is in scope: pass the closure inline (`f(..., fn(...) {...})`) rather
   than binding it to a `let` and using the local after. `&fn` parameters
