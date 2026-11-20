@@ -237,9 +237,69 @@ pub fn needRelOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str
     return needOwner(st, txn, &w, &lexdb_catalog.relObj(key), kind, key)
 }
 
+// ---- privileges on routines (package F, slice F3): EXECUTE ("X") on a procedure or function, SELECT ("r") on a table-valued function
+//
+// A routine's privileges are an ACL row of its own (lexdb_catalog.routineObj), written when the first GRANT or REVOKE changes them:
+// before that a PostgreSQL routine is EXECUTE for PUBLIC (as PostgreSQL's), a T-SQL one is its owner's alone. The owner is the role
+// that made it (the routine's own record), and a superuser may do anything. A statement that calls no routine reads none of this.
+
+// A body runs with its owner's rights where its dialect's routines do (SQL Server's ownership chain, Oracle's definer's rights): the
+// session acts as the owner until backTo gives the role it had (what actAs returns) back.
+pub fn actAs(st: &lexdb_store.Store, sess: int, owner: &str): str {
+    let prev = st.memo.get(&roleKeyOf(sess)).unwrapOr("")
+    st.memo.put(&roleKeyOf(sess), owner)
+    return prev
+}
+
+pub fn backTo(st: &lexdb_store.Store, sess: int, prev: &str) { st.memo.put(&roleKeyOf(sess), prev) }
+
+// The privilege the session's role lacks on a routine, "" none.
+pub fn lackOn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, r: &lexdb_sql.Routine, letter: &str): Result[str, DbErr] {
+    if w.super { return Ok("") }
+    // PostgreSQL finds a function by its schema: USAGE on it first
+    if r.dialect == lexdb_sql.RD_PG && !(try may(st, txn, w, &lexdb_catalog.nspObj(&lexdb_sql.schemaOf(&r.key)), &"U")) { return Ok("U") }
+    var a = try readAcl(st, txn, &lexdb_catalog.routineObjOf(r))
+    if len(a.owner) == 0 { a.owner = r.owner.clone() }
+    return Ok(if allows(w, &a, letter) { "" } else { letter.toStr() })
+}
+
+// The privilege a use of a routine needs: a table-valued function is read as a table (SELECT), the others run (EXECUTE).
+pub fn useLetter(r: &lexdb_sql.Routine): str { return if r.dialect == lexdb_sql.RD_TSQL && r.kind == lexdb_sql.RK_FUNC && r.retSet { "r" } else { "X" } }
+
+// The routines in fns the session may not use (their .denied set), for those the statement calls (by name; all when names is empty).
+pub fn markDenied(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fns: mut &[]lexdb_sql.Routine, names: &[]str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    if w.super { return Ok(Unit{}) }
+    for i in 0..len(fns) {
+        if len(names) > 0 && !lexdb_base.hasStr(names, &lexdb_sql.baseName(&fns[i].key)) { continue }
+        fns[i].denied = try lackOn(st, txn, &w, &fns[i], &useLetter(&fns[i]))
+    }
+    return Ok(Unit{})
+}
+
+// Of Oracle's stored units, named "OWNER.NAME", those the session's role may not execute: not its own, and no EXECUTE granted to it,
+// to PUBLIC or to a role it holds (a superuser may run all).
+pub fn unitsDeniedIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): Result[[]str, DbErr] {
+    var out: []str = []
+    let w = try whoNow(st, txn)
+    if w.super { return Ok(out) }
+    for n in names {
+        let at = strings.indexOf(n, ".", 0)
+        let owner = n[0..at]
+        let name = n[at + 1..len(n)]
+        if lexdb_base.hasStr(&w.roles, &strings.toLowerAscii(&owner)) { continue }
+        var a = try readAcl(st, txn, &lexdb_catalog.unitObj(&owner, &name))
+        if len(a.owner) == 0 { a.owner = strings.toLowerAscii(&owner) }
+        if !allows(&w, &a, &"X") { append(mut &out, n.toStr()) }
+    }
+    return Ok(out)
+}
+
 // The letters a privilege name stands for on an object of a kind
 // (table, sequence, schema); "" if it is not one of them.
 pub fn privLetters(name: &str, kind: &str): str {
+    if kind == "function" || kind == "procedure" { return match name { "execute" { "X" } "all" { "X" } else { "" } } }
+    if kind == "tvf" { return match name { "select" { "r" } "all" { "r" } else { "" } } }
     if kind == "schema" {
         return match name { "usage" { "U" } "create" { "C" } "all" { "UC" } else { "" } }
     }
@@ -265,7 +325,7 @@ pub fn addLetters(have: &str, more: &str): str {
     for i in 0..len(more) { if !strings.contains(&out, &more[i..i + 1]) { out = out + more[i..i + 1] } }
     // in PostgreSQL's order
     var sorted = ""
-    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C"] { if strings.contains(&out, &c) { sorted = sorted + c } }
+    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C", "X"] { if strings.contains(&out, &c) { sorted = sorted + c } }
     return sorted
 }
 
@@ -287,7 +347,8 @@ pub fn roleExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &str): R
 }
 
 // The objects a GRANT or REVOKE names: (object, kind word, name) for each.
-pub type Target = record { pub obj: str; pub kind: str; pub name: str }
+// owner: a routine's own owner, for one with no ACL row yet ("" for the others, which carry theirs).
+pub type Target = record { pub obj: str; pub kind: str; pub name: str; pub owner: str }
 
 // Who may GRANT or REVOKE letters on an object: its owner, a role it is a member of, a superuser. The other doors say
 // no as their own systems do: SQL Server's 4613, Oracle's 1720 for a user that holds the privilege without a grant
@@ -295,9 +356,13 @@ pub type Target = record { pub obj: str; pub kind: str; pub name: str }
 pub fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, tg: &Target, letters: &str, door: &str): Result[Unit, DbErr] {
     if w.super { return Ok(Unit{}) }
     let a = try readAcl(st, txn, &tg.obj)
-    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
-    if door == "tds" { return Err(e("TS4613", "Grantor does not have GRANT permission.")) }
-    if door == "tns" && (tg.kind == "table" || tg.kind == "view") {
+    let own = if len(a.owner) > 0 { a.owner.clone() } else { tg.owner.clone() }
+    if len(own) > 0 && lexdb_base.hasStr(&w.roles, &own) { return Ok(Unit{}) }
+    // SQL Server tells a user that may not grant what it holds that it cannot find the object (15151), tables and routines alike
+    if door == "tds" {
+        return Err(e("TS15151", &("Cannot find the object '" + lexdb_sql.baseName(&tg.name) + "', because it does not exist or you do not have permission.")))
+    }
+    if door == "tns" && (tg.kind == "table" || tg.kind == "view" || tg.kind == "procedure" || tg.kind == "function") {
         for k in 0..len(letters) {
             if allows(w, &a, &letters[k..k + 1]) {
                 return Err(e("ORA01720", &("grant option does not exist for '" + strings.toUpperAscii(&lexdb_sql.schemaOf(&tg.name)) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&tg.name)) + "'")))

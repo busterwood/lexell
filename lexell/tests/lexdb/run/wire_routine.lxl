@@ -1,7 +1,9 @@
 // lexdb_wire, stored functions and procedures through lib/postgres (design/lexdb-dialect-gaps.md, package F): the extended protocol's
 // Parse and Describe of a query that calls a SQL function with a $1 (the call written as its body before it is planned), a function
 // run for several values, a CALL with an OUT parameter (described as the columns it gives: a row), a CALL with none (NoData), a
-// procedure that writes, its error, and one connection seeing what another made.
+// procedure that writes, its error, and one connection seeing what another made. Slice F3: a set-returning function in FROM
+// prepared with a $1 and run for several values, and EXECUTE revoked from PUBLIC and granted to a role that connects (42501, then the
+// value).
 // expect: function: 7 9 11
 // expect: prepared in a query: 6 | 8
 // expect: call with OUT: columns c, 1 row, value 15
@@ -12,6 +14,10 @@
 // expect: other connection: 12
 // expect: call prepared: 21 | 42
 // expect: plpgsql: 42704
+// expect: srf prepared: 3 4 | 4
+// expect: srf columns: id v
+// expect: execute denied: 42501
+// expect: execute granted: 6
 import "task"
 import "net"
 import "postgres"
@@ -26,7 +32,7 @@ type V = sqldialect.Value
 
 fn state(e: &postgres.Error): str {
     let t = e.toStr()
-    for code in ["23505", "42883", "42P01", "42704"] { if strings.contains(&t, &code) { return code } }
+    for code in ["23505", "42883", "42P01", "42704", "42501"] { if strings.contains(&t, &code) { return code } }
     return t
 }
 
@@ -78,6 +84,26 @@ fn client(addr: str): Result[Unit, postgres.Error] {
         Ok(_) { println("plpgsql: ran") }
         Err(e) { println("plpgsql: " + state(&e)) }
     }
+    // slice F3: a set-returning function in FROM, EXECUTE revoked and granted
+    try c.exec("create table pt (id int primary key, v int)")
+    try c.exec("insert into pt values (1, 10), (2, 20), (3, 30), (4, 40)")
+    try c.exec("create function pts(minv int) returns table (id int, v int) language sql as $$ select id, v from pt where v >= minv $$")
+    let q2 = try c.prepare("select id from pts($1) order by id")
+    let s1 = try c.queryPrepared(&q2, &[V.Int(25)])
+    let s2 = try c.queryPrepared(&q2, &[V.Int(35)])
+    println("srf prepared: " + firsts(&s1) + " | " + firsts(&s2))
+    let s3 = try c.query("select * from pts($1)", &[V.Int(0)])
+    println("srf columns: " + s3.columnName(0).unwrapOr("?") + " " + s3.columnName(1).unwrapOr("?"))
+    try c.exec("create role w_a login")
+    try c.exec("revoke execute on function add5(int) from public")
+    var a2 = try postgres.connect(&("host=127.0.0.1 port=" + port + " user=w_a dbname=test sslmode=disable"))
+    match a2.query("select add5(1)", &[]) {
+        Ok(_) { println("execute denied: ran") }
+        Err(e) { println("execute denied: " + state(&e)) }
+    }
+    try c.exec("grant execute on function add5(int) to w_a")
+    let g1 = try a2.query("select add5(1)", &[])
+    println("execute granted: " + firsts(&g1))
     return Ok(Unit{})
 }
 

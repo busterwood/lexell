@@ -81,7 +81,7 @@ pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, re
             Some(o) {
                 if !replace { return Err(err("42723", &((if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }) + " \"" + base + "\" already exists with same argument types"))) }
                 if o.kind != r.kind { return Err(err("42809", &("\"" + base + "\" is not a " + (if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" })))) }
-                if r.kind == lexdb_sql.RK_FUNC && (o.ret.oid != r.ret.oid || o.ret.kind != r.ret.kind) { return Err(err("42P13", "cannot change return type of existing function")) }
+                if r.kind == lexdb_sql.RK_FUNC && (o.ret.oid != r.ret.oid || o.ret.kind != r.ret.kind || o.retSet != r.retSet) { return Err(err("42P13", "cannot change return type of existing function")) }
                 // the names of the input parameters stay
                 var k = 0
                 for i in 0..len(o.params) {
@@ -101,7 +101,7 @@ pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, re
 }
 
 // What DROP did to one name: the routines dropped, or the notice for IF EXISTS.
-pub type Dropped = record { pub notice: str }
+pub type Dropped = record { pub notice: str; pub objs: []str }      // objs: the privileges' objects of the routines dropped (lexdb_catalog.routineObj)
 
 // DROP FUNCTION | PROCEDURE | ROUTINE for one name: kw the keyword; sig the signature written ("*": none); spell the name as
 // written; fmt a type's name for the messages (oid to text); roles and super: who drops.
@@ -117,7 +117,7 @@ pub fn dropOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, 
             return Err(err("TS3705", &("Cannot use DROP " + strings.toUpperAscii(kw) + " with '" + spell + "' because '" + spell + "' is a " + other + ". Use DROP " + strings.toUpperAscii(&other) + ".")))
         }
         if len(hit) == 0 {
-            if ifExists { return Ok(Dropped{notice: ""}) }
+            if ifExists { return Ok(Dropped{notice: "", objs: []}) }
             return Err(err("TS3701", &("Cannot drop the " + kw + " '" + spell + "', because it does not exist or you do not have permission.")))
         }
     } else {
@@ -136,7 +136,7 @@ pub fn dropOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, 
                 if len(sig) > 0 { for o in strings.split(sig, ",") { append(mut &ts, fmt(lexdb_base.num(&o))) } }
                 shown = "(" + strings.join(&ts, ", ") + ")"
             }
-            if ifExists { return Ok(Dropped{notice: what + " " + spell + shown + " does not exist, skipping"}) }
+            if ifExists { return Ok(Dropped{notice: what + " " + spell + shown + " does not exist, skipping", objs: []}) }
             if sig == "*" { return Err(err("42883", &("could not find a " + what + " named \"" + spell + "\""))) }
             return Err(err("42883", &(what + " " + spell + shown + " does not exist")))
         }
@@ -149,13 +149,15 @@ pub fn dropOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, 
             return Err(err("42809", &(spell + "(" + strings.join(&ts, ", ") + ") is not a " + kw)))
         }
     }
+    var objs: []str = []
     for h in hit {
         if !super && !lexdb_base.hasStr(roles, &h.owner) {
             return Err(err("42501", &("must be owner of " + (if h.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }) + " " + spell)))
         }
         txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(dialect, key, &sigOf(&h))))
+        append(mut &objs, lexdb_catalog.routineObjOf(&h))
     }
-    return Ok(Dropped{notice: ""})
+    return Ok(Dropped{notice: "", objs: objs})
 }
 
 // The names of PostgreSQL's SQL functions, kept in the store's memo once known (a function made adds to it; one dropped is
@@ -297,6 +299,17 @@ pub fn bindNames(body: &str, fname: &str, r: &Routine, skip: &[]str): Result[str
     return lexdb_parse.substParams(body, fname, &names, &nums)
 }
 
+// The error for a call of a routine the session may not use (r.denied: the privilege it lacks): PostgreSQL's 42501, SQL Server's 229.
+pub fn deniedErr(r: &Routine): DbErr {
+    if r.dialect == lexdb_sql.RD_TSQL {
+        let sc = lexdb_sql.schemaOf(&r.key)
+        return err("TS229", &("The " + (if r.denied == "r" { "SELECT" } else { "EXECUTE" }) + " permission was denied on the object '" + lexdb_sql.baseName(&r.key) + "', database 'lexdb', schema '" +
+                              (if sc == "public" { "dbo" } else { sc }) + "'."))
+    }
+    if r.denied == "U" { return err("42501", &("permission denied for schema " + lexdb_sql.schemaOf(&r.key))) }
+    return err("42501", &("permission denied for " + (if r.kind == lexdb_sql.RK_PROC { "procedure " } else { "function " }) + lexdb_sql.baseName(&r.key)))
+}
+
 // ---- PostgreSQL's SQL functions in queries
 
 pub fn mapE(x: &Expr, f: &fn(&Expr): Option[Expr]): Expr {
@@ -368,13 +381,26 @@ pub fn mapStmtTop(s: &Stmt, f: &fn(&Expr): Option[Expr]): Stmt {
 }
 
 // Whether a statement calls a function of one of these names (lower case, unqualified): its expressions walked.
-pub fn callsAny(s: &Stmt, names: &[]str): bool {
-    var found = false
+pub fn callsAny(s: &Stmt, names: &[]str): bool { return len(callNames(s, names)) > 0 }
+
+fn srfNames(s: &Stmt, names: &[]str, found: mut &[]str) {
+    if strings.startsWith(&s.srf, "#pgf:") {
+        let b = lexdb_sql.baseName(&s.srf[5..len(s.srf)])
+        if lexdb_base.hasStr(names, &b) && !lexdb_base.hasStr(found, &b) { append(found, b.toStr()) }
+    }
+    for x in s.subs { srfNames(&x, names, found) }
+    for x in s.inner { srfNames(&x, names, found) }
+}
+
+// The names among these that a statement calls.
+pub fn callNames(s: &Stmt, names: &[]str): []str {
+    var found: []str = []
+    srfNames(s, names, mut &found)
     let t = mapStmt(s, fn(x: &Expr): Option[Expr] {
         match x {
             Expr.Call(nm, args, star) {
                 let b = lexdb_sql.baseName(&nm)
-                for n in names { if n == b { found = true } }
+                for n in names { if n == b && !lexdb_base.hasStr(&found, &b) { append(mut &found, b.toStr()) } }
             }
             else {}
         }
@@ -400,11 +426,138 @@ fn resolve(fns: &[]Routine, path: &[]str, name: &str, nargs: int): Result[Option
                     d.hint = "To call a procedure, use CALL."
                     return Err(d)
                 }
+                if len(r.denied) > 0 { return Err(deniedErr(&r)) }
                 return Ok(Some(r.clone()))
             }
         }
     }
     return Ok(None)
+}
+
+// The set-returning function a FROM item calls: by name through the path, then by what its arguments (each one's name, "" by place) fit.
+fn resolveSrf(fns: &[]Routine, path: &[]str, name: &str, nargs: int, names: &[]str): Option[Routine] {
+    let base = lexdb_sql.baseName(name)
+    let sch: []str = if lexdb_sql.isQual(name) { [lexdb_sql.schemaOf(name)] } else { path.clone() }
+    for sc in sch {
+        let key = lexdb_sql.qual(&sc, &base)
+        for r in fns {
+            if r.key == key && r.retSet && r.kind == lexdb_sql.RK_FUNC && r.dialect == lexdb_sql.RD_PG && slots(&r, nargs, names).isSome() { return Some(r.clone()) }
+        }
+    }
+    return None
+}
+
+// A set-returning function's columns: its OUT (or TABLE) parameters', else one named for the function.
+fn srfColumns(r: &Routine): []str {
+    var out: []str = []
+    for p in r.params {
+        if p.mode == "out" { append(mut &out, if len(p.name) > 0 { p.name.clone() } else { "column" + (len(out) + 1).toStr() }) }
+    }
+    if len(out) == 0 { append(mut &out, lexdb_sql.baseName(&r.key)) }
+    return out
+}
+
+// The set-returning function an item of FROM (f: its arguments the items of subs[f.sub]) calls, written as its query in the same
+// place: items to the new FROM list. An argument that reads a column comes through a derived table of one row, before it.
+fn inlineSrf(t: mut &Stmt, f: &lexdb_sql.FromItem, fns: &[]Routine, path: &[]str, nfrom: mut &[]lexdb_sql.FromItem, depth: int): Result[Unit, DbErr] {
+    let call = t.subs[f.sub].clone()
+    let key = call.srf[5..len(call.srf)].toStr()
+    let shown = if len(call.spell) > 0 { call.spell.clone() } else { lexdb_sql.baseName(&key) }
+    var args: []Expr = []
+    var names: []str = []
+    for it in call.items {
+        match it.expr {
+            Some(x) {
+                append(mut &args, lexdb_sql.cloneExpr(&x))
+                append(mut &names, it.alias.clone())
+            }
+            None {}
+        }
+    }
+    let found = resolveSrf(fns, path, &key, len(args), &names)
+    if found.isNone() {
+        var ts: []str = []
+        for a in args { append(mut &ts, "unknown") }
+        var d = err("42883", &("function " + shown + "(" + strings.join(&ts, ", ") + ") does not exist"))
+        d.hint = "No function matches the given name and argument types. You might need to add explicit type casts."
+        return Err(d)
+    }
+    let r = found.unwrap()
+    if len(r.denied) > 0 { return Err(deniedErr(&r)) }
+    if depth > 32 { return Err(err("54001", "stack depth limit exceeded")) }
+    if call.ordin { return Err(err("0A000", &("lexdb: WITH ORDINALITY on the function " + shown + " is not supported yet"))) }
+    let fname = lexdb_sql.baseName(&r.key)
+    let sl = slots(&r, len(args), &names).unwrap()
+    let bound = try bindNames(&r.body, &fname, &r, &[])
+    let stmts = try lexdb_parse.parse(&bound)
+    if len(stmts) != 1 || stmts[0].kind != lexdb_sql.S_SELECT {
+        return Err(err("0A000", &("lexdb: the function " + fname + " cannot be used in FROM yet: its body must be one SELECT")))
+    }
+    // the input parameters' arguments, converted to the parameters' types (a default's text parsed where it is used)
+    var vals: []Expr = []
+    var aitems: []lexdb_sql.SelItem = []
+    let at = len(t.subs)
+    let aalias = "__pgf" + at.toStr()
+    var n = 0
+    for i in 0..len(r.params) {
+        if r.params[i].mode == "out" { continue }
+        var a: Expr = Expr.Lit(Val.Null)
+        if sl[i] >= 0 { a = lexdb_sql.cloneExpr(&args[sl[i]]) } else { a = try lexdb_parse.parseExpr(&r.params[i].dflt) }
+        let c = Expr.Cast(a, r.params[i].typ)
+        if constArg(&c) {
+            append(mut &vals, c)
+        } else {
+            let cn = "__a" + n.toStr()
+            append(mut &aitems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(c), alias: cn.clone(), spell: cn.clone()})
+            append(mut &vals, Expr.Col(aalias + "." + cn, -1))
+        }
+        n += 1
+    }
+    var body = mapStmt(&stmts[0], fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Param(k) {
+                if k >= 1 && k <= len(vals) { return Some(lexdb_sql.cloneExpr(&vals[k - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    })
+    body.use = lexdb_sql.SUB_FROM
+    body.params = 0
+    body.src = ""
+    // (its own calls of functions)
+    match try inlineCallsAt(&body, fns, path, depth + 1) {
+        Some(b2) { body = b2 }
+        None {}
+    }
+    var g = f.clone()
+    g.table = ""
+    // the columns: those the function declares, the first ones renamed by a list the call gave (a scalar one's column by its alias)
+    var cols = srfColumns(&r)
+    var hasOut = false
+    for q in r.params { if q.mode == "out" { hasOut = true } }
+    if len(f.cols) > 0 {
+        for k in 0..len(f.cols) { if k < len(cols) { cols[k] = f.cols[k].clone() } }
+    } else if !hasOut && f.alias != fname {
+        cols[0] = f.alias.clone()
+    }
+    g.cols = cols
+    t.subs[f.sub] = body
+    if len(aitems) > 0 {
+        var a = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+        a.use = lexdb_sql.SUB_FROM
+        a.items = aitems
+        a.subs = call.subs.clone()
+        a.wins = call.wins.clone()
+        append(mut &t.subs, a)
+        let first = f.join == lexdb_sql.J_FIRST
+        append(nfrom, lexdb_sql.FromItem{table: "", alias: aalias, join: if first { lexdb_sql.J_FIRST } else { lexdb_sql.J_CROSS }, on: None, sub: at, cols: [],
+                                         work: -1, lateral: true, using: [], natural: false, comma: f.comma})
+        g.comma = false
+        if first { g.join = lexdb_sql.J_CROSS }
+    }
+    append(nfrom, g)
+    return Ok(Unit{})
 }
 
 // Whether an argument is a value the statement is given (no column, no subquery of its own).
@@ -534,7 +687,9 @@ fn inlineExpr(x: &Expr, fns: &[]Routine, path: &[]str, depth: int, failure: mut 
 
 // s with the calls of PostgreSQL's SQL functions (fns: all of them, in the catalog) written as their bodies; None when it
 // calls none. A body that reads tables becomes a subquery of the statement, so each statement and subquery is done by itself.
-pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt], DbErr] {
+pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt], DbErr] { return inlineCallsAt(s, fns, path, 0) }
+
+fn inlineCallsAt(s: &Stmt, fns: &[]Routine, path: &[]str, depth: int): Result[Option[Stmt], DbErr] {
     var failure: Option[DbErr] = None
     var changed = false
     var extra: []Stmt = []
@@ -545,7 +700,7 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         None {}
     }
     for i in 0..len(t.subs) {
-        match try inlineCalls(&t.subs[i], fns, path) {
+        match try inlineCallsAt(&t.subs[i], fns, path, depth) {
             Some(u) {
                 t.subs[i] = u
                 changed = true
@@ -554,7 +709,7 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         }
     }
     for i in 0..len(t.inner) {
-        match try inlineCalls(&t.inner[i], fns, path) {
+        match try inlineCallsAt(&t.inner[i], fns, path, depth) {
             Some(u) {
                 t.inner[i] = u
                 changed = true
@@ -563,6 +718,22 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         }
     }
     for x in extra { append(mut &t.subs, x) }
+    // the set-returning functions in FROM
+    var any = false
+    for f in t.from { if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#pgf:") { any = true } }
+    if any {
+        var nfrom: []lexdb_sql.FromItem = []
+        let from = t.from.clone()
+        for f in from {
+            if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#pgf:") {
+                try inlineSrf(mut &t, &f, fns, path, mut &nfrom, depth)
+            } else {
+                append(mut &nfrom, f)
+            }
+        }
+        t.from = nfrom
+        changed = true
+    }
     if !changed { return Ok(None) }
     return Ok(Some(t))
 }
@@ -648,6 +819,7 @@ fn scalarCall(nm: &str, args: &[]Expr, lookup: &fn(&str): Option[Routine], qry: 
     let key = tsqlKey(nm)
     match lookup(&key) {
         Some(r) {
+            if len(r.denied) > 0 { return Err(deniedErr(&r)) }
             let ins = try fillArgs(&r, nm, args)
             if readsDeep(&r, lookup, 0) {
                 // a function that reads tables (or calls one): its result as a scalar subquery of the statement
@@ -656,6 +828,7 @@ fn scalarCall(nm: &str, args: &[]Expr, lookup: &fn(&str): Option[Routine], qry: 
                 sq.use = lexdb_sql.SUB_SCALAR
                 sq.params = 0
                 sq.src = ""
+                sq.runAs = r.owner.clone()
                 append(extra, sq)
                 return Ok(Expr.Cast(Expr.Call("#sub", [Expr.Lit(Val.Int(base + len(extra) - 1))], false), r.ret))
             }
@@ -727,6 +900,7 @@ fn inlineTvf(t: mut &Stmt, f: &lexdb_sql.FromItem, fns: &[]Routine, nfrom: mut &
     let shown = if len(call.spell) > 0 { call.spell.clone() } else { key.clone() }
     if found.isNone() { return Err(err("TS208", &("Invalid object name '" + shown + "'."))) }
     let r = found.unwrap()
+    if len(r.denied) > 0 { return Err(deniedErr(&r)) }
     if strings.contains(&r.attrs, "multi") {
         return Err(err("0A000", &("lexdb: the multi-statement table-valued function " + shown + " is not supported yet (an inline one is)")))
     }
@@ -767,6 +941,7 @@ fn inlineTvf(t: mut &Stmt, f: &lexdb_sql.FromItem, fns: &[]Routine, nfrom: mut &
     })
     body.use = lexdb_sql.SUB_FROM
     body.params = 0
+    body.runAs = r.owner.clone()
     // (its own calls of functions)
     match try tsqlCallsAt(&body, fns, depth + 1, qry) {
         Some(b2) { body = b2 }
@@ -950,4 +1125,76 @@ pub fn setUdfQuery(f: fn(&Routine, &[]Expr, int): Result[lexdb_sql.Stmt, DbErr])
 pub fn udfQuery(r: &Routine, args: &[]Expr, tag: int): Result[lexdb_sql.Stmt, DbErr] {
     if !UDF_QUERY.isSet() { return Err(err("0A000", "lexdb: a function that reads tables needs the SQL Server door")) }
     return UDF_QUERY.get()[0](r, args, tag)
+}
+
+// ---- Oracle's stored functions of a column in a query (package F, slice F3; lexdb_plcall)
+//
+// The call is Call("#plf", [function, arguments]) cast to the function's type. lexdb_plcall computes the function for each
+// combination of arguments the query will use before it runs (and again for any it missed), and keeps the values, as text, in the
+// store's memo under the session: lexdb_exec's evaluator reads them (plfEval). A combination it finds none for is noted (plfNote) and
+// gives NULL: the run is not an answer, and lexdb_plcall computes it and runs the query again.
+
+fn plfKey(sess: int, fnid: &str, args: &str): str { return "\x00plf\x00" + sess.toStr() + "\x00" + fnid + "\x00" + args }
+
+fn plfMissKey(sess: int): str { return "\x00plfmiss\x00" + sess.toStr() }
+
+// The value kept for these arguments: "\x00" NULL, else "\x01" and the text.
+pub fn plfGet(st: &lexdb_store.Store, sess: int, fnid: &str, args: &str): Option[str] { return st.memo.get(&plfKey(sess, fnid, args)) }
+
+// The value a stored function was computed to for these arguments, kept for the query that is about to run (value: None NULL).
+pub fn plfPut(st: &lexdb_store.Store, sess: int, fnid: &str, args: &str, value: &Option[str]) {
+    let v = match value {
+        Some(t) { "\x01" + t }
+        None { "\x00".toStr() }
+    }
+    st.memo.put(&plfKey(sess, fnid, args), &v)
+}
+
+pub fn plfDrop(st: &lexdb_store.Store, sess: int, fnid: &str, args: &str) { st.memo.del(&plfKey(sess, fnid, args)) }
+
+// A combination the run found no value for: noted (once), for lexdb_plcall to compute.
+pub fn plfNote(st: &lexdb_store.Store, sess: int, fnid: &str, args: &str) {
+    let mk = plfMissKey(sess)
+    let note = fnid + "\x00" + args
+    let seen = st.memo.get(&mk).unwrapOr("")
+    if !strings.contains(&("\x02" + seen + "\x02"), &("\x02" + note + "\x02")) { st.memo.put(&mk, &(if len(seen) > 0 { seen + "\x02" + note } else { note })) }
+}
+
+// The combinations the last run missed: function and arguments' key of each; the list is cleared.
+pub fn plfMisses(st: &lexdb_store.Store, sess: int): []str {
+    let mk = plfMissKey(sess)
+    let seen = st.memo.get(&mk).unwrapOr("")
+    var out: []str = []
+    if len(seen) == 0 { return out }
+    st.memo.del(&mk)
+    for n in strings.split(&seen, "\x02") { append(mut &out, n.toStr()) }
+    return out
+}
+
+// The one routine a GRANT or REVOKE of PostgreSQL's names (FUNCTION, PROCEDURE, ROUTINE: funcs, procs, else either) means among have,
+// those of its name: by its argument types' oids sig ("*": the name alone, which must be unique). fmt writes a type's name.
+pub fn grantPick(have: &[]Routine, key: &str, sig: &str, funcs: bool, procs: bool, what: &str, fmt: &fn(int): str): Result[Routine, DbErr] {
+    var hit: []Routine = []
+    for h in have {
+        if sig == "*" || sigOf(&h) == sig { append(mut &hit, h.clone()) }
+    }
+    let shownName = lexdb_sql.shown(key)
+    if len(hit) == 0 {
+        var shown = "()"
+        if sig != "*" {
+            var ts: []str = []
+            if len(sig) > 0 { for o in strings.split(sig, ",") { append(mut &ts, fmt(lexdb_base.num(&o))) } }
+            shown = "(" + strings.join(&ts, ", ") + ")"
+        }
+        if sig == "*" { return Err(err("42883", &("could not find a " + what + " named \"" + shownName + "\""))) }
+        return Err(err("42883", &(what + " " + shownName + shown + " does not exist")))
+    }
+    if len(hit) > 1 { return Err(err("42725", &(what + " name \"" + shownName + "\" is not unique"))) }
+    let r = hit[0].clone()
+    if (funcs && r.kind != lexdb_sql.RK_FUNC) || (procs && r.kind != lexdb_sql.RK_PROC) {
+        var ts: []str = []
+        for p in r.params { if p.mode != "out" { append(mut &ts, fmt(p.typ.oid)) } }
+        return Err(err("42809", &(shownName + "(" + strings.join(&ts, ", ") + ") is not a " + what)))
+    }
+    return Ok(r)
 }
