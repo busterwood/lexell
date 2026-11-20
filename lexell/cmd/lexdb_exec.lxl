@@ -1892,6 +1892,35 @@ fn firstSwitch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, sca
     return Ok(rs.sw)
 }
 
+// Level k of q, a null-aware anti join or a mark join (optimizer 50): the
+// row's IN (EXISTS) by the hash and its summary; NOT IN's row goes on when
+// it is false, a mark's always, its value the level's last column (the
+// others hidden, NULL), the level's condition on it.
+fn naLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
+           params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
+    let lv = &q.levels[k]
+    var vals: []Val = []
+    {
+        let sqe = seqEnv(st, txn)
+        let noAggs: []Val = []
+        let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+        for x in lv.hashVals { append(mut &vals, try eval(&x, &env)) }
+    }
+    let nk = lexdb_plan.inKeys(q, k)
+    let v = lexdb_pipe.inProbe1(&vals, if nk >= 0 { nk } else { len(vals) }, nk < 0, &m.keys[k])
+    if lv.mode == lexdb_plan.LV_NOTIN {
+        rs.cnt[k].read += 1
+        if lexdb_ops.truth(&v) != Some(false) {
+            rs.cnt[k].joined += 1
+            return Ok(true)
+        }
+        return runLevel(st, txn, q, m, k + 1, row, params, emit, rs)
+    }
+    var r: []Val = array(len(lv.t.cols), Val.Null)
+    r[len(r) - 1] = v
+    return Ok(try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs) >= 0)
+}
+
 // Joins the rows of level k on to the joined row (levels before k filled),
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
@@ -1906,33 +1935,9 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     if bl == 1 { return Ok(false) }
     if bl == 0 {
         // done: its rows went on
-    } else if lv.mode != 0 {
-        // a null-aware anti join or a mark join (optimizer 50): the row's
-        // IN (EXISTS) by the hash and its summary
-        var vals: []Val = []
-        {
-            let noAggs: []Val = []
-            let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-            for x in lv.hashVals { append(mut &vals, try eval(&x, &env)) }
-        }
-        let nk = lexdb_plan.inKeys(q, k)
-        let v = lexdb_pipe.inProbe1(&vals, if nk >= 0 { nk } else { len(vals) }, nk < 0, &m.keys[k])
-        if lv.mode == lexdb_plan.LV_NOTIN {
-            // as an anti join: the rows whose IN is not false dropped
-            rs.cnt[k].read += 1
-            if lexdb_ops.truth(&v) != Some(false) {
-                rs.cnt[k].joined += 1
-                return Ok(true)
-            }
-            return runLevel(st, txn, q, m, k + 1, row, params, emit, rs)
-        }
-        // the mark: the level's last column (its others hidden, NULL)
-        var r: []Val = array(len(lv.t.cols), Val.Null)
-        r[len(r) - 1] = v
-        let got = try tryRow(st, txn, q, m, k, &r, -1, row, params, emit, rs)
-        if got < 0 { return Ok(false) }
-        if got > 0 { matched = true }
     } else if !lv.perRow {
+        // a null-aware anti join or a mark join (optimizer 50)
+        if lv.mode != 0 { return naLevel(st, txn, q, m, k, row, params, emit, rs) }
         let useFast = lexdb_plan.semiIntKey(lv)
         var fastKey = 0
         var hasKey = false

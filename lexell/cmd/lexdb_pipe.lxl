@@ -4363,11 +4363,11 @@ type JL = record {
     // optimizer 50's levels (NA_*): a null-aware anti join (mark MK_ANTI)
     // or a mark join (mark MK_JOIN, its rows made per probe in the chunk's
     // batch, the mark its last column); nk of its keys the correlation's
-    // (then IN's value), sum per keys' encoding 1 rows, 3 rows and a NULL
-    // value (sumAll: nk 0)
+    // (then IN's value); the summary per keys (1 rows, 3 rows and a NULL
+    // value) in gens under a 0 byte and the keys' keyPart encoding (no
+    // key's starts with a 0 byte: nk > 0 is a JK_GEN hash), sumAll for nk 0
     na: int
     nk: int
-    sum: Map[str, int]
     sumAll: int
 }
 
@@ -4381,7 +4381,7 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               conds: [], creads: [], post: [], preads: [], ktypes: [], tail: lexdb_access.noTail(), noRange: false, index: -1,
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
               perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, cross: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
-              cutB: [], cutTo: -1, na: 0, nk: 0, sum: newMap(), sumAll: 0}
+              cutB: [], cutTo: -1, na: 0, nk: 0, sumAll: 0}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -5506,7 +5506,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
             for r in 0..b.n { append(mut &idx, r) }
             nread += b.n
             let kept = try pick(&conds, &b, idx)
-            if jl.na == NA_NOTIN || jl.na == NA_MARK_IN { jl.summarize(&b, &kept, &bp, &j.hcols) }
+            if jl.na == NA_NOTIN || jl.na == NA_MARK_IN { jl.summarize(&b, &kept, &bp, &j.hcols, mut &bd.gens) }
             try bd.add(&b, &kept, &bp, &j.hcols, mode, true, keepAll, j.resCol, room, maxHeld)
         }
     } else {
@@ -5541,11 +5541,13 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
 // value) and a summary per keys (inSum: 1 rows, 3 rows and a NULL value)
 
 // Adds b's rows idx (by their keys hc: nk correlation keys, then IN's
-// value) to jl's summary; a row with a NULL key is in no key's.
-fn (jl: mut &JL) summarize(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int) {
+// value) to jl's summary (sumAll, or into gens, the hash's being built); a
+// row with a NULL key is in no key's.
+fn (jl: mut &JL) summarize(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, gens: mut &Map[str, int]) {
     var kb = ""
     for r in idx {
         kb.clear()
+        kb.addByte(0)
         var nul = false
         for k in 0..jl.nk {
             if b.cols[hc[k]].nul[r] {
@@ -5560,7 +5562,7 @@ fn (jl: mut &JL) summarize(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int) {
             if f > jl.sumAll { jl.sumAll = f }
             continue
         }
-        if jl.sum.getOr(&kb, 0) < f { jl.sum.put(kb.clone(), f) }
+        if gens.getOr(&kb, 0) < f { gens.put(kb.clone(), f) }
     }
 }
 
@@ -5627,6 +5629,7 @@ fn naProbe(jl: &JL, kv: &[]BVec, w: &Batch, n: int, pj: mut &[]int, pi: mut &[]i
         cur.n = n
     }
     var kb = ""
+    var sk = ""
     for r in 0..n {
         var res = Val.Bool(false)
         var nul = false
@@ -5643,7 +5646,13 @@ fn naProbe(jl: &JL, kv: &[]BVec, w: &Batch, n: int, pj: mut &[]int, pi: mut &[]i
             if jl.na == NA_MARK_EX {
                 res = Val.Bool(naBucket(jl, kv, w, r, &kb) >= 0)
             } else {
-                let f = if jl.nk == 0 { jl.sumAll } else { jl.sum.getOr(&kb, 0) }
+                var f = jl.sumAll
+                if jl.nk > 0 {
+                    sk.clear()
+                    sk.addByte(0)
+                    sk += &kb
+                    f = jl.gens.getOr(&sk, 0)
+                }
                 let x = keyAt(jl, kv, w, jl.nk, r)
                 let xNull = lexdb_ops.isNull(&x)
                 var found = false
@@ -5673,6 +5682,25 @@ fn naProbe(jl: &JL, kv: &[]BVec, w: &Batch, n: int, pj: mut &[]int, pi: mut &[]i
         append(pi, r)
     }
     return Ok(Unit{})
+}
+
+// joinFrom at an optimizer 50 level j: its probe (naProbe), then the rows
+// it gives joined on, as joinFrom's tail.
+fn naFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+          at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
+          out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    let jl = &jr.jls[j]
+    let lv = jl.level
+    let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
+    let kv = try keyVecs(jl, &w)
+    var pj: []int = withCapacity(n)
+    var pi: []int = withCapacity(n)
+    try naProbe(jl, &kv, &w, n, mut &pj, mut &pi, mut &js.cur[j], mut &cnt[lv])
+    cnt[lv].starts += n
+    if one { return tailOne(st, txn, jr, js, tabs, j, at, &pj, &pi, cx, bud, cnt, out) }
+    let at2 = try joinTail(jr, js, j, at, n, &pj, pi, bud, cnt)
+    let n2 = len(at2[0])
+    return joinFrom(st, txn, jr, js, tabs, j + 1, at2, n2, cx, bud, cnt, false, out)
 }
 
 // The bucket of row r's whole key (kb: its keyPart encoding, JK_GEN) in an
@@ -5720,16 +5748,14 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
     let jl = &jr.jls[j]
     let lv = jl.level
     if jl.cross && !one { return crossFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, out) }
+    // a null-aware anti join or a mark join (optimizer 50)
+    if jl.na != 0 { return naFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, one, out) }
     let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
     let kv = try keyVecs(jl, &w)
     var pj: []int = withCapacity(n)
     var pi: []int = withCapacity(n)
     var held = 0
-    if jl.na != 0 {
-        // a null-aware anti join or a mark join (optimizer 50)
-        try naProbe(jl, &kv, &w, n, mut &pj, mut &pi, mut &js.cur[j], mut &cnt[lv])
-        cnt[lv].starts += n
-    } else if hashed(jl) {
+    if hashed(jl) {
         // a "<>" summary's outer value
         var rv = lexdb_rows.bvec(0)
         if jl.resCol >= 0 {

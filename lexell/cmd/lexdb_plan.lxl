@@ -3596,8 +3596,8 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, wh
 // The plans to be hashed of q's subqueries that semi joins (WHERE's
 // top-level EXISTS and IN, hs.semiCand) and mark joins (an EXISTS or IN
 // under OR, NOT or CASE in WHERE, optimizer 50) may take, into alts;
-// looks: those a semi join may look up per row. Whether any is a mark
-// join's candidate.
+// looks: those a semi join may look up per row. Whether semiJoins has work:
+// a semi join's candidate or a mark join's.
 fn semiAlternatives(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, hs: &FromHints, where: &Option[Expr], params: &[]Val,
                     subs: &[]lexdb_sql.Stmt, sc: mut &Scope, early: bool, reorder: bool, alts: mut &[]Option[SubPlan],
                     looks: mut &[]bool): bool {
@@ -3643,7 +3643,7 @@ fn semiAlternatives(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query
             }
         }
     }
-    return anyMark
+    return hs.anySemi || anyMark
 }
 
 // The planner's pass over FROM (2e slice 2), after bindFrom: the semi-join
@@ -3661,12 +3661,18 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     for k in 0..len(q.levels) {
         if q.levels[k].src < 0 && q.levels[k].work < 0 { q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, false, hs.rules) }
     }
+    // the semi and mark joins' plans to be hashed (semiAlternatives), per
+    // subquery; whether semiJoins runs (a semi join's candidate, or a mark
+    // join's). (Made only for a query with subqueries: a point select's
+    // planning makes none.)
     var semiAlts: []Option[SubPlan] = []
-    for i in 0..len(subs) { append(mut &semiAlts, None) }
-    var semiLooks: []bool = array(len(subs), false)    // ... may be a lookup per row as a join's level (semiLook)
-    // (the semi and mark joins' plans to be hashed: semiAlternatives)
-    var anyMark = false
-    if len(subs) > 0 { anyMark = semiAlternatives(st, txn, q, hs, where, params, subs, sc, early, reorder, mut &semiAlts, mut &semiLooks) }
+    var semiLooks: []bool = []         // ... may be a lookup per row as a join's level (semiLook)
+    var semis = false
+    if len(subs) > 0 {
+        for i in 0..len(subs) { append(mut &semiAlts, None) }
+        semiLooks = array(len(subs), false)
+        semis = semiAlternatives(st, txn, q, hs, where, params, subs, sc, early, reorder, mut &semiAlts, mut &semiLooks)
+    }
     let nl = len(q.levels)
     // the columns by name, for levelOf (the planner asks it often: optimizer 30)
     if nl >= 2 { for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } } }
@@ -3924,7 +3930,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         q.levels[k].hashKinds = hkinds
     }
     for i in 0..len(rightLocal) { append(mut &q.levels[1].local, replace(mut &rightLocal[i], Expr.Lit(Val.Null))) }
-    if (hs.anySemi || anyMark) && nl > 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc, hs.rules, anyMark) }
+    if semis && nl > 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc, hs.rules, (unnestMode & UN_MARK) != 0) }
     return Ok(Unit{})
 }
 
