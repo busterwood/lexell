@@ -1,0 +1,201 @@
+// lexdb_exec: an index's rows read in batches where the reading may stop
+// early (a LIMIT), forward and backward: the batches start at 32 entries
+// and double to BROWS (Cursor.want), so a LIMIT reads little past its rows.
+// Every shape runs with SET lexdb_batch = off and on and the text of its
+// rows (or its error) must agree: ASC and DESC, with and without a range,
+// a filter that rejects most rows, LIMIT 1 / 31 / 32 / 33 / 1,025, OFFSET,
+// a NULL-holding index column, an index read alone, a join's first table,
+// and an expression that errors in a later batch (only a LIMIT that reaches
+// the row gives the error).
+// expect: shapes: 77 queries, 77 the same on and off
+// expect: errors: reached ERR 22012, not reached rows
+// expect: entries taken: limit 1 32, limit 10 32, limit 33 96, desc limit 10 32, desc limit 40 96, covering 32, filtered 224, no limit 2824
+// expect: batched runs: all
+
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_access"
+import "../../../cmd/lexdb_pipe"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+// The rows as text, one per row, or the error.
+fn held(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERR " + e.state }
+    }
+}
+
+fn load(s: mut &lexdb_exec.Session) {
+    // c: ascending with runs of equal values (id / 3), NULL for every 17th
+    // row; d: 7 for one row in 50; w: a text
+    let a = held(s, &"create table t (id int primary key, c int, d int, w text)")
+    let b = held(s, &"create index t_c on t (c)")
+    let b2 = held(s, &"create table u (id int primary key, t_id int, v int)")
+    var id = 1
+    for chunk in 0..30 {
+        var rows: []str = []
+        for i in 0..100 {
+            let c = if id % 17 == 0 { "null" } else { (id / 3).toStr() }
+            append(mut &rows, "(" + id.toStr() + ", " + c + ", " + (if id % 50 == 0 { 7 } else { id % 11 + 20 }).toStr() + ", 'w" + (id % 13).toStr() + "')")
+            id += 1
+        }
+        let r = held(s, &("insert into t values " + strings.join(&rows, ", ")))
+    }
+    var us: []str = []
+    for i in 1..401 { append(mut &us, "(" + i.toStr() + ", " + (i * 7).toStr() + ", " + (i % 5).toStr() + ")") }
+    let c = held(s, &("insert into u values " + strings.join(&us, ", ")))
+    let an = held(s, &"analyze t")
+    let an2 = held(s, &"analyze u")
+}
+
+// The index entries a statement's batches take.
+fn taken(s: mut &lexdb_exec.Session, sql: &str): int {
+    let e0 = lexdb_access.idxEntries()
+    let r = held(s, sql)
+    return lexdb_access.idxEntries() - e0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        load(mut &s)
+        let shapes = [
+            "select * from t where c > 100 order by c limit 20",
+            "select * from t where c > 100 order by c desc limit 20",
+            "select * from t order by c limit 20",
+            "select * from t order by c desc limit 20",
+            "select * from t where c > 100 order by c, id limit 1",
+            "select * from t where c > 100 order by c, id limit 31",
+            "select * from t where c > 100 order by c, id limit 32",
+            "select * from t where c > 100 order by c, id limit 33",
+            "select * from t where c > 100 order by c, id limit 63",
+            "select * from t where c > 100 order by c, id limit 64",
+            "select * from t where c > 100 order by c, id limit 1025",
+            "select * from t where c > 100 order by c desc, id limit 1",
+            "select * from t where c > 100 order by c desc, id limit 31",
+            "select * from t where c > 100 order by c desc, id limit 32",
+            "select * from t where c > 100 order by c desc, id limit 33",
+            "select * from t where c > 100 order by c desc, id limit 1025",
+            "select * from t where c between 200 and 400 order by c limit 40",
+            "select * from t where c between 200 and 400 order by c desc limit 40",
+            "select * from t where c >= 200 and c < 220 order by c limit 100",
+            "select * from t where c >= 200 and c < 220 order by c desc limit 100",
+            "select * from t where c = 300 order by c limit 2",
+            "select * from t where c = 300 limit 2",
+            "select * from t where c < 5 order by c limit 5",
+            "select * from t where c > 100 and d = 7 order by c limit 5",
+            "select * from t where c > 100 and d = 7 order by c limit 40",
+            "select * from t where c > 100 and d = 7 order by c desc limit 5",
+            "select * from t where c > 100 and d = 7 order by c desc limit 40",
+            "select * from t where d = 7 order by c limit 10",
+            "select * from t where w = 'w3' and c > 10 order by c limit 70",
+            "select * from t where w = 'w3' and c > 10 order by c desc limit 70",
+            "select * from t where c > 100 order by c limit 10 offset 5",
+            "select * from t where c > 100 order by c limit 10 offset 40",
+            "select * from t where c > 100 order by c limit 10 offset 1030",
+            "select * from t where c > 100 order by c desc limit 10 offset 5",
+            "select * from t where c > 100 order by c desc limit 10 offset 40",
+            "select * from t where c > 100 order by c desc limit 10 offset 1030",
+            "select * from t where c > 100 order by c offset 990 limit 100",
+            "select * from t order by c limit 25",
+            "select * from t order by c desc limit 25",
+            "select * from t order by c nulls first limit 25",
+            "select * from t order by c desc nulls last limit 25",
+            "select * from t where c is null limit 8",
+            "select * from t where c is not null order by c limit 30",
+            "select * from t where c is not null order by c desc limit 30",
+            "select c from t where c > 100 order by c limit 20",
+            "select c from t where c > 100 order by c desc limit 20",
+            "select c from t where c > 100 order by c limit 70",
+            "select c from t where c > 100 order by c desc limit 70",
+            "select c from t order by c limit 25",
+            "select c from t order by c desc limit 25",
+            "select c, count(*) from t where c > 100 group by c order by c limit 20",
+            "select c from t where c > 100 order by c limit 1025",
+            "select c from t where c > 100 order by c desc limit 1025",
+            "select id, w from t where c > 700 order by c limit 3000",
+            "select id, w from t where c > 700 order by c desc limit 3000",
+            "select id, w from t where c > 100 order by c limit 0",
+            "select * from t where c > 100 limit 15",
+            "select * from t where c > 100 limit 100",
+            "select count(*) from (select * from t where c > 100 order by c limit 50) x",
+            "select t.id, u.v from t join u on u.t_id = t.id where t.c > 20 order by t.c limit 30",
+            "select t.id, u.v from t join u on u.t_id = t.id where t.c > 20 order by t.c desc limit 30",
+            "select t.id, u.v from t join u on u.t_id = t.id where t.c > 20 order by t.c, t.id limit 1",
+            "select t.id, u.v from t join u on u.t_id = t.id where t.c > 20 order by t.c, t.id limit 65",
+            "select u.id, (select t.id from t where t.c > u.id order by t.c limit 1) from u where u.id < 50",
+            "select u.id, exists (select 1 from t where t.c > u.id * 3) from u where u.id < 50",
+            "select id from t where c > 100 and id in (select id from t where c < 700) order by c limit 20",
+            "select * from t where c > 100 and 1 / (c - 500) > 0 order by c limit 20",
+            "select 1000 / (c - 500) from t where c > 300 order by c limit 400",
+            "select 1000 / (c - 500) from t where c > 300 order by c limit 700",
+            "select 1000 / (c - 500) from t where c > 300 order by c desc limit 100",
+            "select 1000 / (c - 500) from t where c < 700 order by c desc limit 900",
+            "select 1000 / (c - 100) from t where c > 100 order by c limit 20",
+            "select 1000 / (c - 100) from t where c >= 100 order by c limit 20",
+            "select 1000 / (c - 400) from t where c > 300 order by c limit 20",
+            "select 1000 / (c - 400) from t where c > 300 order by c limit 120",
+            "select 1000 / (c - 400) from t where c < 500 order by c desc limit 120",
+            "select 1000 / (c - 400) from t where c < 500 order by c desc limit 20"
+        ]
+        var same = 0
+        var shown = 0
+        for sql in shapes {
+            let x = held(mut &s, &"set lexdb_batch = off")
+            let off = held(mut &s, &sql)
+            let y = held(mut &s, &"set lexdb_batch = on")
+            let on = held(mut &s, &sql)
+            if off == on {
+                same += 1
+            } else if shown < 4 {
+                shown += 1
+                println("DIFFERENT: " + sql + "\n  off: " + off + "\n  on:  " + on)
+            }
+        }
+        println("shapes: " + len(shapes).toStr() + " queries, " + same.toStr() + " the same on and off")
+
+        // an error in a later batch: given only by a LIMIT that reaches the row
+        let r1 = held(mut &s, &"select 1000 / (c - 500) from t where c > 300 order by c limit 700")
+        let r2 = held(mut &s, &"select 1000 / (c - 500) from t where c > 300 order by c limit 100")
+        println("errors: reached " + (if strings.startsWith(&r1, "ERR") { r1.clone() } else { "no error" }) + ", not reached " +
+                (if strings.startsWith(&r2, "ERR") { r2.clone() } else { "rows" }))
+
+        // the entries the batches take: 32, then 64 more, ... (BROWS at most)
+        let z = held(mut &s, &"set lexdb_batch = on")
+        let l1 = taken(mut &s, &"select * from t where c > 100 order by c limit 1")
+        let l10 = taken(mut &s, &"select * from t where c > 100 order by c limit 10")
+        let l33 = taken(mut &s, &"select * from t where c > 100 order by c limit 33")
+        let d10 = taken(mut &s, &"select * from t where c > 100 order by c desc limit 10")
+        let d40 = taken(mut &s, &"select * from t where c > 100 order by c desc limit 40")
+        let cv = taken(mut &s, &"select c from t where c > 100 order by c limit 10")
+        let fl = taken(mut &s, &"select * from t where c > 100 and d = 7 order by c limit 3")
+        let all = taken(mut &s, &"select * from t where c > 0 order by c")
+        println("entries taken: limit 1 " + l1.toStr() + ", limit 10 " + l10.toStr() + ", limit 33 " + l33.toStr() + ", desc limit 10 " + d10.toStr() +
+                ", desc limit 40 " + d40.toStr() + ", covering " + cv.toStr() + ", filtered " + fl.toStr() + ", no limit " + all.toStr())
+        let b0 = lexdb_pipe.runCounts()[1]
+        let g = held(mut &s, &"select * from t where c > 100 order by c limit 10")
+        let g2 = held(mut &s, &"select * from t where c > 100 order by c desc limit 10")
+        let g3 = held(mut &s, &"select c from t where c > 100 order by c limit 10")
+        println("batched runs: " + (if lexdb_pipe.runCounts()[1] - b0 == 3 { "all" } else { "only " + (lexdb_pipe.runCounts()[1] - b0).toStr() }))
+        s.close()
+        return 0
+    }).unwrap()
+}
