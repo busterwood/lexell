@@ -21140,7 +21140,14 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
     lexdb_syscat.bind(&snap, mut &b)
     // the routines (has_function_privilege, HAS_PERMS_BY_NAME): ACL object, name's key, signature, owner, dialect, privilege a use needs
     for r in snap.routines {
-        b += &("f\t" + lexdb_catalog.routineObjOf(&r) + "\t" + r.key + "\t" + lexdb_catalog.sigKey(&r) + "\t" + r.owner + "\t" + r.dialect.toStr() + "\t" + useLetter(&r) + "\n")
+        let oid = lexdb_pg.catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r))).toStr()
+        b += &("f\t" + lexdb_catalog.routineObjOf(&r) + "\t" + r.key + "\t" + lexdb_catalog.sigKey(&r) + "\t" + r.owner + "\t" + r.dialect.toStr() + "\t" + useLetter(&r) + "\t" + oid + "\n")
+        if r.dialect == lexdb_sql.RD_PG {
+            // what pg_get_functiondef and its parts answer, as the line a tab and a newline cannot be in
+            let one = fn(x: &str): str { return strings.replaceAll(&(strings.replaceAll(x, "\n", "\x1e")), "\t", "\x1d") }
+            b += &("g\t" + oid + "\t" + one(&lexdb_pg.fnDef(&r)) + "\t" + one(&lexdb_pg.fnArgs(&r, false)) + "\t" + one(&lexdb_pg.fnArgs(&r, true)) + "\t" +
+                   one(&lexdb_pg.fnResult(&r)) + "\t" + (if r.kind == lexdb_sql.RK_PROC { "p" } else { "f" }) + "\n")
+        }
     }
     for s in snap.schemas { b += &("n\t" + lexdb_pg.nspOid(&s).toStr() + "\t" + s + "\n") }
     b += "n\t11\tpg_catalog\nn\t13000\tinformation_schema\n"
@@ -21263,6 +21270,28 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
             Some(n) { return Ok(Val.Reg(n, n.toStr())) }
             None { return Err(e("3F000", &("schema \"" + name + "\" does not exist"))) }
         }
+    }
+    if oid != lexdb_sql.OID_REGCLASS && num.isNone() {
+        // a function: by its name through the search path or schema-qualified (the name of a unique one, else with its argument types)
+        var path: []str = []
+        for l in catLines(&q, &"p") { append(mut &path, l[0].clone()) }
+        if len(path) == 0 { path = ["public"] }
+        let nm = strings.toLowerAscii(&(strings.trim(strings.split(name, "(")[0])))
+        var hit = ""
+        var shown = ""
+        var many = 0
+        for l in catLines(&q, &"f") {
+            if l[4] != "0" { continue }
+            let sc = lexdb_sql.schemaOf(&l[1])
+            let base = lexdb_sql.baseName(&l[1])
+            if (nm == base && lexdb_base.hasStr(&path, &sc)) || nm == sc + "." + base {
+                hit = l[6].clone()
+                shown = if lexdb_base.hasStr(&path, &sc) { base.toStr() } else { sc + "." + base }
+                many += 1
+            }
+        }
+        if many == 1 { return Ok(Val.Reg(strings.parseIntOpt(&hit).unwrapOr(0), shown)) }
+        if many > 1 { return Err(e("42725", &("more than one function named \"" + name + "\""))) }
     }
     match num {
         Some(n) { return Ok(Val.Reg(n, relShown(&q, n).unwrapOr(n.toStr()))) }
@@ -21605,6 +21634,18 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         var o = lexdb_ops.oidArg(&vs[0]).unwrapOr(0)
         if o == 0 { o = relOidOf(se, &lexdb_sql.text(&vs[0])) }
         for l in catLines(se, &"w") { if l[0] == o.toStr() { return Ok(Some(Val.Text(l[1] + ";"))) } }
+        return Ok(Some(Val.Null))
+    }
+    if (name == "pg_get_functiondef" || name == "pg_get_function_arguments" || name == "pg_get_function_identity_arguments" || name == "pg_get_function_result") && n == 1 {
+        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        let o = lexdb_ops.oidArg(&vs[0]).unwrapOr(0).toStr()
+        for l in catLines(se, &"g") {
+            if l[0] != o { continue }
+            let k = if name == "pg_get_functiondef" { 1 } else if name == "pg_get_function_arguments" { 2 } else if name == "pg_get_function_identity_arguments" { 3 } else { 4 }
+            // (a procedure has no result: NULL; a function's definition, as PostgreSQL's, ends the line)
+            if name == "pg_get_function_result" && l[5] == "p" { return Ok(Some(Val.Null)) }
+            return Ok(Some(Val.Text(strings.replaceAll(&(strings.replaceAll(&l[k], "\x1e", "\n")), "\x1d", "\t"))))
+        }
         return Ok(Some(Val.Null))
     }
     if name == "pg_partition_ancestors" && n == 1 {
@@ -24737,6 +24778,20 @@ fn createRoutine(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
                 d.detail = "Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING."
                 return Err(d)
             }
+            // the columns it gives: its OUT parameters' (TABLE's), else one (a record or a void function takes what there is)
+            let l = &stmts[len(stmts) - 1]
+            var outs = 0
+            for q in r.params { if q.mode == "out" || q.mode == "inout" { outs += 1 } }
+            var star = false
+            for it in l.items { if it.star { star = true } }
+            if l.kind == lexdb_sql.S_SELECT && l.srf == "" && l.setop == 0 && !star && (outs > 0 || r.ret.oid != 2249) {
+                let want = if outs > 0 { outs } else { 1 }
+                if len(l.items) != want {
+                    var d = e("42P13", &("return type mismatch in function declared to return " + lexdb_pgcat.formatType(r.ret.oid, -1)))
+                    d.detail = "Final statement returns " + (if len(l.items) > want { "too many" } else { "too few" }) + " columns."
+                    return Err(d)
+                }
+            }
         }
     }
     r.key = try createKey(st, txn, &r.key, false)
@@ -25028,8 +25083,14 @@ fn udfQuery(r: &Routine, args: &[]Expr, tag: int): Result[lexdb_sql.Stmt, DbErr]
 
 // The statement with PostgreSQL's SQL functions it calls written as their bodies; None when it calls none.
 fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
-    // T-SQL's functions of the user's: the parser marked the statement (a flag test, nothing more, for the rest)
-    if stmt.udf { return s.tsqlFunctions(stmt) }
+    // T-SQL's functions of the user's, and PostgreSQL's in FROM: the parser marked the statement (a flag test, nothing more, for the rest)
+    if stmt.udf {
+        if doorOf(&s.st, s.id) == "tds" { return s.tsqlFunctions(stmt) }
+        var fns = try s.allRoutines(lexdb_sql.RD_PG)
+        try s.markDeniedFns(mut &fns, &[])
+        let path: []str = if len(s.path) == 0 { ["public"] } else { s.path.clone() }
+        return lexdb_routine.inlineCalls(stmt, &fns, &path)
+    }
     // (no function known, as of the generation the session saw: nothing to look at; the usual case, a point select's)
     if s.fnGen == lexdb_routine.namesGen() && len(s.fnNames) == 0 { return Ok(None) }
     let names = try s.functionNames()

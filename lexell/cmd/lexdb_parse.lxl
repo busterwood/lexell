@@ -4653,6 +4653,13 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
        p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
         return p.fromFunction(join)
     }
+    // PostgreSQL: [schema.]f(arguments), a set-returning SQL function of the user's (written as its query: lexdb_routine)
+    if !p.tsql && !p.ora && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) {
+        let k = if p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." && (p.peekAt(2).kind == T_IDENT || p.peekAt(2).kind == T_QIDENT) { 2 } else { 0 }
+        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "(" && !(p.peek().kind == T_IDENT && lexdb_sql.isReserved(&p.peek().text)) {
+            return p.pgFunctionFrom(join)
+        }
+    }
     // T-SQL: [schema.]f(arguments), a table-valued function of the user's (an inline one is read as its query: lexdb_routine)
     if p.tsql && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) {
         let k = if p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." && (p.peekAt(2).kind == T_IDENT || p.peekAt(2).kind == T_QIDENT) { 2 } else { 0 }
@@ -4774,6 +4781,49 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
                  len(p.subs[i].items) == 1
     if single && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
+}
+
+// PostgreSQL: a function of the user's in FROM, [schema.]f(arguments) [[AS] alias [(columns)]]: a subquery (SUB_FROM) whose items are
+// the arguments (a name in the item's alias for name => value) and whose srf is "#pgf:" and the function's key; it may use the FROM
+// items before it (LATERAL, as in PostgreSQL). lexdb_routine writes it as the function's query; the statement is marked (udf).
+fn (p: mut &P) pgFunctionFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let key = try p.rname()
+    let spell = p.spelled.clone()
+    try p.expectKw("(")
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    var s = lexdb_sql.newStmt(S_SELECT)
+    s.srf = "#pgf:" + key
+    s.spell = spell.clone()
+    s.use = SUB_FROM
+    if !p.isKw(")") {
+        while true {
+            var nm = ""
+            if (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP && p.peekAt(2).kind == T_OP &&
+               ((p.peekAt(1).text == "=" && p.peekAt(2).text == ">") || (p.peekAt(1).text == ":" && p.peekAt(2).text == "=")) {
+                nm = p.peek().text.clone()
+                p.pos += 3
+            }
+            append(mut &s.items, SelItem{star: false, qual: "", expr: Some(try p.expr()), alias: nm, spell: ""})
+            if !p.acceptKw(",") { break }
+        }
+    }
+    try p.expectKw(")")
+    s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
+    p.depth -= 1
+    if p.acceptKw("with") {
+        try p.expectKw("ordinality")
+        s.ordin = true
+    }
+    append(mut &p.subs, s)
+    let i = len(p.subs) - 1
+    var alias = lexdb_sql.baseName(&key)
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols)
+    p.udf = true
+    return Ok(FromItem{table: key, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
 // T-SQL: a function of the user's in FROM, [schema.]f(arguments) [[AS] alias]: a subquery (SUB_FROM) whose items are the
@@ -6877,6 +6927,8 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
         var s = try p.statement()
         s.params = p.params
         s.seqNames = replace(mut &p.seqs, [])
+        s.udf = p.udf
+        p.udf = false
         if s.kind != S_EXPLAIN {
             s.subs = replace(mut &p.subs, [])
             s.wins = replace(mut &p.wins, [])
@@ -7767,8 +7819,26 @@ fn (p: mut &P) createRoutine(orReplace: bool, proc: bool): Result[Stmt, lexdb_ba
                 } else {
                     haveReturns = true
                     if p.acceptKw("setof") { r.retSet = true }
-                    if p.isKw("table") { return Err(lexdb_base.err("0A000", "lexdb: RETURNS TABLE is not supported yet")) }
-                    if p.acceptKw("void") { r.ret = TypeName{kind: K_TEXT, oid: 2278, prec: 0, scale: 0, len: 0} }
+                    if p.isKw("table") && !r.retSet {
+                        // RETURNS TABLE (name type, ...): OUT parameters of a set-returning function ("table" in its attrs says so)
+                        p.pos += 1
+                        for q in r.params { if q.mode == "out" || q.mode == "inout" { return Err(lexdb_base.err("42P13", "OUT and INOUT arguments aren't allowed in TABLE functions")) } }
+                        try p.expectKw("(")
+                        var cols = 0
+                        while true {
+                            let cn = try p.name()
+                            let ct = plainType(try p.typeName())
+                            for q in r.params { if len(cn) > 0 && q.name == cn && q.mode == "out" { return Err(lexdb_base.err("42P13", &("parameter name \"" + cn + "\" used more than once"))) } }
+                            append(mut &r.params, lexdb_sql.RParam{name: cn.clone(), typ: ct, spell: "", mode: "out", has: false, dflt: "", readonly: false})
+                            cols += 1
+                            if !p.acceptKw(",") { break }
+                        }
+                        try p.expectKw(")")
+                        r.retSet = true
+                        r.attrs = r.attrs + " table"
+                        r.ret = if cols == 1 { r.params[len(r.params) - 1].typ } else { TypeName{kind: K_TEXT, oid: 2249, prec: 0, scale: 0, len: 0} }
+                    } else if p.acceptKw("void") { r.ret = TypeName{kind: K_TEXT, oid: 2278, prec: 0, scale: 0, len: 0} }
+                    else if p.acceptKw("record") { r.ret = TypeName{kind: K_TEXT, oid: 2249, prec: 0, scale: 0, len: 0} }
                     else { r.ret = plainType(try p.typeName()) }
                 }
             }
@@ -7827,6 +7897,7 @@ fn (p: mut &P) createRoutine(orReplace: bool, proc: bool): Result[Stmt, lexdb_ba
                 let e = try p.expr()
                 r.body = "SELECT " + strings.trim(&p.src[a..min(p.peek().at, len(p.src))])
                 r.atomic = true
+                r.attrs = r.attrs + " return"
                 haveBody = true
             }
             else { return Err(near(&t)) }

@@ -81,7 +81,7 @@ pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, re
             Some(o) {
                 if !replace { return Err(err("42723", &((if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" }) + " \"" + base + "\" already exists with same argument types"))) }
                 if o.kind != r.kind { return Err(err("42809", &("\"" + base + "\" is not a " + (if r.kind == lexdb_sql.RK_PROC { "procedure" } else { "function" })))) }
-                if r.kind == lexdb_sql.RK_FUNC && (o.ret.oid != r.ret.oid || o.ret.kind != r.ret.kind) { return Err(err("42P13", "cannot change return type of existing function")) }
+                if r.kind == lexdb_sql.RK_FUNC && (o.ret.oid != r.ret.oid || o.ret.kind != r.ret.kind || o.retSet != r.retSet) { return Err(err("42P13", "cannot change return type of existing function")) }
                 // the names of the input parameters stay
                 var k = 0
                 for i in 0..len(o.params) {
@@ -383,9 +383,19 @@ pub fn mapStmtTop(s: &Stmt, f: &fn(&Expr): Option[Expr]): Stmt {
 // Whether a statement calls a function of one of these names (lower case, unqualified): its expressions walked.
 pub fn callsAny(s: &Stmt, names: &[]str): bool { return len(callNames(s, names)) > 0 }
 
+fn srfNames(s: &Stmt, names: &[]str, found: mut &[]str) {
+    if strings.startsWith(&s.srf, "#pgf:") {
+        let b = lexdb_sql.baseName(&s.srf[5..len(s.srf)])
+        if lexdb_base.hasStr(names, &b) && !lexdb_base.hasStr(found, &b) { append(found, b.toStr()) }
+    }
+    for x in s.subs { srfNames(&x, names, found) }
+    for x in s.inner { srfNames(&x, names, found) }
+}
+
 // The names among these that a statement calls.
 pub fn callNames(s: &Stmt, names: &[]str): []str {
     var found: []str = []
+    srfNames(s, names, mut &found)
     let t = mapStmt(s, fn(x: &Expr): Option[Expr] {
         match x {
             Expr.Call(nm, args, star) {
@@ -422,6 +432,132 @@ fn resolve(fns: &[]Routine, path: &[]str, name: &str, nargs: int): Result[Option
         }
     }
     return Ok(None)
+}
+
+// The set-returning function a FROM item calls: by name through the path, then by what its arguments (each one's name, "" by place) fit.
+fn resolveSrf(fns: &[]Routine, path: &[]str, name: &str, nargs: int, names: &[]str): Option[Routine] {
+    let base = lexdb_sql.baseName(name)
+    let sch: []str = if lexdb_sql.isQual(name) { [lexdb_sql.schemaOf(name)] } else { path.clone() }
+    for sc in sch {
+        let key = lexdb_sql.qual(&sc, &base)
+        for r in fns {
+            if r.key == key && r.retSet && r.kind == lexdb_sql.RK_FUNC && r.dialect == lexdb_sql.RD_PG && slots(&r, nargs, names).isSome() { return Some(r.clone()) }
+        }
+    }
+    return None
+}
+
+// A set-returning function's columns: its OUT (or TABLE) parameters', else one named for the function.
+fn srfColumns(r: &Routine): []str {
+    var out: []str = []
+    for p in r.params {
+        if p.mode == "out" { append(mut &out, if len(p.name) > 0 { p.name.clone() } else { "column" + (len(out) + 1).toStr() }) }
+    }
+    if len(out) == 0 { append(mut &out, lexdb_sql.baseName(&r.key)) }
+    return out
+}
+
+// The set-returning function an item of FROM (f: its arguments the items of subs[f.sub]) calls, written as its query in the same
+// place: items to the new FROM list. An argument that reads a column comes through a derived table of one row, before it.
+fn inlineSrf(t: mut &Stmt, f: &lexdb_sql.FromItem, fns: &[]Routine, path: &[]str, nfrom: mut &[]lexdb_sql.FromItem, depth: int): Result[Unit, DbErr] {
+    let call = t.subs[f.sub].clone()
+    let key = call.srf[5..len(call.srf)].toStr()
+    let shown = if len(call.spell) > 0 { call.spell.clone() } else { lexdb_sql.baseName(&key) }
+    var args: []Expr = []
+    var names: []str = []
+    for it in call.items {
+        match it.expr {
+            Some(x) {
+                append(mut &args, lexdb_sql.cloneExpr(&x))
+                append(mut &names, it.alias.clone())
+            }
+            None {}
+        }
+    }
+    let found = resolveSrf(fns, path, &key, len(args), &names)
+    if found.isNone() {
+        var ts: []str = []
+        for a in args { append(mut &ts, "unknown") }
+        var d = err("42883", &("function " + shown + "(" + strings.join(&ts, ", ") + ") does not exist"))
+        d.hint = "No function matches the given name and argument types. You might need to add explicit type casts."
+        return Err(d)
+    }
+    let r = found.unwrap()
+    if len(r.denied) > 0 { return Err(deniedErr(&r)) }
+    if depth > 32 { return Err(err("54001", "stack depth limit exceeded")) }
+    if call.ordin { return Err(err("0A000", &("lexdb: WITH ORDINALITY on the function " + shown + " is not supported yet"))) }
+    let fname = lexdb_sql.baseName(&r.key)
+    let sl = slots(&r, len(args), &names).unwrap()
+    let bound = try bindNames(&r.body, &fname, &r, &[])
+    let stmts = try lexdb_parse.parse(&bound)
+    if len(stmts) != 1 || stmts[0].kind != lexdb_sql.S_SELECT {
+        return Err(err("0A000", &("lexdb: the function " + fname + " cannot be used in FROM yet: its body must be one SELECT")))
+    }
+    // the input parameters' arguments, converted to the parameters' types (a default's text parsed where it is used)
+    var vals: []Expr = []
+    var aitems: []lexdb_sql.SelItem = []
+    let at = len(t.subs)
+    let aalias = "__pgf" + at.toStr()
+    var n = 0
+    for i in 0..len(r.params) {
+        if r.params[i].mode == "out" { continue }
+        var a: Expr = Expr.Lit(Val.Null)
+        if sl[i] >= 0 { a = lexdb_sql.cloneExpr(&args[sl[i]]) } else { a = try lexdb_parse.parseExpr(&r.params[i].dflt) }
+        let c = Expr.Cast(a, r.params[i].typ)
+        if constArg(&c) {
+            append(mut &vals, c)
+        } else {
+            let cn = "__a" + n.toStr()
+            append(mut &aitems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(c), alias: cn.clone(), spell: cn.clone()})
+            append(mut &vals, Expr.Col(aalias + "." + cn, -1))
+        }
+        n += 1
+    }
+    var body = mapStmt(&stmts[0], fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Param(k) {
+                if k >= 1 && k <= len(vals) { return Some(lexdb_sql.cloneExpr(&vals[k - 1])) }
+                return None
+            }
+            else { return None }
+        }
+    })
+    body.use = lexdb_sql.SUB_FROM
+    body.params = 0
+    body.src = ""
+    // (its own calls of functions)
+    match try inlineCallsAt(&body, fns, path, depth + 1) {
+        Some(b2) { body = b2 }
+        None {}
+    }
+    var g = f.clone()
+    g.table = ""
+    // the columns: those the function declares, the first ones renamed by a list the call gave (a scalar one's column by its alias)
+    var cols = srfColumns(&r)
+    var hasOut = false
+    for q in r.params { if q.mode == "out" { hasOut = true } }
+    if len(f.cols) > 0 {
+        for k in 0..len(f.cols) { if k < len(cols) { cols[k] = f.cols[k].clone() } }
+    } else if !hasOut && f.alias != fname {
+        cols[0] = f.alias.clone()
+    }
+    g.cols = cols
+    t.subs[f.sub] = body
+    if len(aitems) > 0 {
+        var a = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+        a.use = lexdb_sql.SUB_FROM
+        a.items = aitems
+        a.subs = call.subs.clone()
+        a.wins = call.wins.clone()
+        append(mut &t.subs, a)
+        let first = f.join == lexdb_sql.J_FIRST
+        append(nfrom, lexdb_sql.FromItem{table: "", alias: aalias, join: if first { lexdb_sql.J_FIRST } else { lexdb_sql.J_CROSS }, on: None, sub: at, cols: [],
+                                         work: -1, lateral: true, using: [], natural: false, comma: f.comma})
+        g.comma = false
+        if first { g.join = lexdb_sql.J_CROSS }
+    }
+    append(nfrom, g)
+    return Ok(Unit{})
 }
 
 // Whether an argument is a value the statement is given (no column, no subquery of its own).
@@ -551,7 +687,9 @@ fn inlineExpr(x: &Expr, fns: &[]Routine, path: &[]str, depth: int, failure: mut 
 
 // s with the calls of PostgreSQL's SQL functions (fns: all of them, in the catalog) written as their bodies; None when it
 // calls none. A body that reads tables becomes a subquery of the statement, so each statement and subquery is done by itself.
-pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt], DbErr] {
+pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt], DbErr] { return inlineCallsAt(s, fns, path, 0) }
+
+fn inlineCallsAt(s: &Stmt, fns: &[]Routine, path: &[]str, depth: int): Result[Option[Stmt], DbErr] {
     var failure: Option[DbErr] = None
     var changed = false
     var extra: []Stmt = []
@@ -562,7 +700,7 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         None {}
     }
     for i in 0..len(t.subs) {
-        match try inlineCalls(&t.subs[i], fns, path) {
+        match try inlineCallsAt(&t.subs[i], fns, path, depth) {
             Some(u) {
                 t.subs[i] = u
                 changed = true
@@ -571,7 +709,7 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         }
     }
     for i in 0..len(t.inner) {
-        match try inlineCalls(&t.inner[i], fns, path) {
+        match try inlineCallsAt(&t.inner[i], fns, path, depth) {
             Some(u) {
                 t.inner[i] = u
                 changed = true
@@ -580,6 +718,22 @@ pub fn inlineCalls(s: &Stmt, fns: &[]Routine, path: &[]str): Result[Option[Stmt]
         }
     }
     for x in extra { append(mut &t.subs, x) }
+    // the set-returning functions in FROM
+    var any = false
+    for f in t.from { if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#pgf:") { any = true } }
+    if any {
+        var nfrom: []lexdb_sql.FromItem = []
+        let from = t.from.clone()
+        for f in from {
+            if f.sub >= 0 && f.sub < len(t.subs) && strings.startsWith(&t.subs[f.sub].srf, "#pgf:") {
+                try inlineSrf(mut &t, &f, fns, path, mut &nfrom, depth)
+            } else {
+                append(mut &nfrom, f)
+            }
+        }
+        t.from = nfrom
+        changed = true
+    }
     if !changed { return Ok(None) }
     return Ok(Some(t))
 }
