@@ -1,0 +1,302 @@
+// lexdb_exec, lexdb_agg and lexdb_pipe: every aggregate function, run by the
+// pipeline (design/lexdb-batch-gaps.md item 3) against the row engine
+// (SET lexdb_batch = off, the reference). Each aggregate call (count, sum,
+// avg, min, max of one value; DISTINCT and ORDER BY inside the call;
+// string_agg, array_agg, bool_and, bool_or, every, the variances and
+// standard deviations; FILTER) in each shape: the plain aggregate, over no
+// rows, over a few, grouped by a column (7 groups), by an expression with a
+// group of only NULL values (13 groups), by an expression with more groups
+// than a batch holds (1,300), and over a join. The table t has 3,000 rows
+// (three batches, the last part full): NULLs in every column the calls
+// read, values repeated across batches (DISTINCT sees one in an earlier
+// batch), a text column of numbers with one that is not (a cast failing in
+// the third batch).
+// Then errors (a cast, a division by zero, an overflow, a non-boolean in
+// bool_and, a non-number in stddev: the same error both ways), TPC-H q16's
+// shape (count(DISTINCT) grouped by three columns, NOT IN a subquery), and
+// the pipeline ran each of them (its grouped runs counted).
+// timeout: 120
+// expect: calls and shapes: 183 queries, 183 the same both ways
+// expect: ran in the pipeline: 183 of 183
+// expect: errors: 14 queries, 14 the same, 14 errors
+// expect: errors ran in the pipeline: 14 of 14
+// expect: more: 14 queries, 14 the same both ways
+// expect: more ran in the pipeline: 14 of 14
+// expect: parameters: 12 of 12 the same
+// expect: floats: 16 queries, 16 the same both ways, 16 in the pipeline
+// expect: q16: same, in the pipeline: true, 39 rows
+// expect: in a transaction: same, in the pipeline: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+// sql with batches off (the row engine), then on: whether the rows (or the
+// error) are the same, and whether the pipeline ran a grouped aggregate
+// for it.
+type Got = record { same: bool; piped: bool; ran: bool; rows: str }
+
+fn both(s: mut &lexdb_exec.Session, sql: &str): Got {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let g0 = lexdb_exec.decCounts()[2]
+    let r0 = lexdb_pipe.runCounts()[0]
+    let on = q(s, sql)
+    let piped = lexdb_exec.decCounts()[2] > g0
+    let ran = lexdb_pipe.runCounts()[0] > r0
+    if on != off {
+        println("DIFFERENT: " + sql)
+        println("  rows: " + off)
+        println("  pipeline: " + on)
+    }
+    return Got{same: on == off, piped: piped, ran: ran, rows: on}
+}
+
+// sql run with parameters through runRows, its plan kept in pc (run again
+// with other values): its rows as text, or the error.
+fn withParams(s: mut &lexdb_exec.Session, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    let nt: []int = []
+    let r = s.runRows(&stmts[0], params, &nt, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool { return true })
+    match r {
+        Ok(res) {
+            var lines: []str = []
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table t (id int primary key, g int, name text, k int, f float8, n numeric(10,2), b bool, s text)")
+        one(mut &s, &"create table u (uid int primary key, tid int, w text)")
+        for c in 0..3 {
+            var vals: []str = []
+            for j in 0..1000 {
+                let i = c * 1000 + j
+                let name = if i % 11 == 0 { "null" } else { "'n" + (i % 50).toStr() + "'" }
+                let k = if i % 13 == 0 { "null" } else { (i % 100).toStr() }
+                let f = if i % 17 == 0 { "null" } else { (i % 31).toStr() + ".5" }
+                let b = if i % 19 == 0 { "null" } else if i % 3 == 0 { "true" } else { "false" }
+                let sv = if i == 2500 { "'zz'" } else if i % 23 == 0 { "null" } else { "'" + (i % 40).toStr() + "'" }
+                append(mut &vals, "(" + i.toStr() + ", " + (i % 7).toStr() + ", " + name + ", " + k + ", " + f + ", " + (i % 97).toStr() + ".25, " + b + ", " + sv + ")")
+            }
+            one(mut &s, &("insert into t values " + strings.join(&vals, ", ")))
+        }
+        var uv: []str = []
+        for i in 0..1500 { append(mut &uv, "(" + i.toStr() + ", " + (i * 2 % 3000).toStr() + ", 'w" + (i % 9).toStr() + "')") }
+        one(mut &s, &("insert into u values " + strings.join(&uv, ", ")))
+
+        let calls = ["count(distinct k)", "count(distinct name)", "count(distinct b)", "count(distinct f)", "count(distinct n)", "count(distinct k + 1)",
+                     "sum(distinct k)", "avg(distinct k)", "min(distinct name)", "max(distinct f)", "string_agg(name, ',')",
+                     "string_agg(distinct name, ',' order by name)", "string_agg(name, '-' order by k desc, id)",
+                     "string_agg(name, case when id % 2 = 0 then '+' else ';' end order by id desc)", "string_agg(name, null)",
+                     "array_agg(k)", "array_agg(k order by id desc)", "array_agg(distinct k)", "array_agg(name order by name nulls first, id)",
+                     "bool_and(b)", "bool_or(b)", "every(b)", "bool_and(k > 10)", "bool_or(id > 2990)",
+                     "stddev(k)", "stddev_pop(k)", "stddev_samp(f)", "variance(f)", "var_pop(n)", "var_samp(k)", "stddev(n)", "variance(distinct k)",
+                     "sum(k order by id)", "max(name order by id)", "count(k order by id)",
+                     "count(k) filter (where g > 2)", "string_agg(name, ',') filter (where k > 50)", "count(distinct k) filter (where id > 1500)",
+                     "bool_and(b) filter (where id % 2 = 0)", "stddev(k) filter (where g < 3)", "array_agg(id order by k, id) filter (where id < 40)",
+                     "count(distinct id)", "count(distinct g)"]
+        // (the calls in each shape in turn; joins are in the next list)
+        let shapes = ["select A from t", "select A from t where id < 0", "select g, A from t where id < 40 group by g order by g",
+                      "select id % 13, A from t group by id % 13 order by 1", "select id % 1300, A from t group by id % 1300 order by 1"]
+        var same = 0
+        var piped = 0
+        var total = 0
+        for ci in 0..len(calls) {
+            for si in 0..len(shapes) {
+                // (every call in the first four shapes, every fourth in the last)
+                if si == 4 && ci % 4 != 0 { continue }
+                let sql = strings.replaceAll(&shapes[si], "A", &calls[ci])
+                let r = both(mut &s, &sql)
+                total += 1
+                if r.same { same += 1 }
+                if r.piped { piped += 1 }
+            }
+        }
+        println("calls and shapes: " + total.toStr() + " queries, " + same.toStr() + " the same both ways")
+        println("ran in the pipeline: " + piped.toStr() + " of " + total.toStr())
+
+        // errors: the same error, from the first row the row engine fails on
+        let errs = ["select count(distinct cast(s as int)) from t", "select string_agg(s, ',' order by cast(s as int)) from t",
+                    "select g, array_agg(cast(s as int)) from t group by g", "select bool_and(k) from t", "select stddev(name) from t",
+                    "select g, sum(distinct k * 10000000000000000) from t group by g",
+                    "select count(distinct k) filter (where 1 / (id - 2000) > 0) from t",
+                    "select string_agg(name, ',' order by 1 / (id - 2000)) from t", "select array_agg(distinct 1 / (id - 2900)) from t",
+                    "select g, bool_or(cast(s as int) > 5) from t group by g", "select variance(cast(s as int)) from t",
+                    "select id % 1300, string_agg(s, cast(s as int)::text) from t group by id % 1300",
+                    "select count(distinct cast(s as int)) from t join u on t.id = u.tid",
+                    "select string_agg(name, ',' order by 1 / (k - 50)) from t where id > 2400"]
+        var sameE = 0
+        var pipedE = 0
+        var nerr = 0
+        for sql in errs {
+            let r = both(mut &s, &sql)
+            if r.same { sameE += 1 }
+            // (a run that fails gives no groups: the pipeline's run is counted at its start)
+            if strings.contains(&r.rows, "ERROR") { nerr += 1 } else { println("no error: " + sql + " => " + r.rows) }
+            if r.ran { pipedE += 1 }
+        }
+        println("errors: " + len(errs).toStr() + " queries, " + sameE.toStr() + " the same, " + nerr.toStr() + " errors")
+        println("errors ran in the pipeline: " + pipedE.toStr() + " of " + len(errs).toStr())
+
+        // joins, parameters of a different kind, ordered aggregates beside others
+        let more = ["select t.g, count(distinct u.w), string_agg(u.w, ',' order by u.uid desc) from t join u on t.id = u.tid group by t.g order by t.g",
+                    "select count(distinct t.k), bool_and(t.b), stddev(t.k) from t join u on t.id = u.tid",
+                    "select u.w, array_agg(t.k order by t.id desc), count(distinct t.name) from t join u on t.id = u.tid group by u.w order by u.w",
+                    "select t.g, count(distinct u.uid), variance(t.f) from t left join u on t.id = u.tid and u.uid < 30 group by t.g order by t.g",
+                    "select t.id % 1300, count(distinct u.tid), string_agg(u.w, '/') from t join u on t.id = u.tid group by t.id % 1300 order by 1",
+                    "select g, count(*), count(distinct k), sum(k), avg(k), min(name), max(name), string_agg(name, ',' order by id) from t group by g order by g",
+                    "select g, count(*), sum(k), string_agg(distinct name, ',' order by name), max(f) from t group by g having count(distinct k) > 50 order by g",
+                    "select count(distinct k), count(distinct id), count(*) from t where id between 1000 and 1100",
+                    "select count(distinct k) from t where id < 1025",
+                    "select g, count(distinct k) from t where id > 1023 and id < 1026 group by g order by g",
+                    "select name, count(distinct g), string_agg(distinct k::text, ',' order by k::text) from t group by name order by name",
+                    "select g, bool_and(b), bool_or(b), every(b), count(b) from t group by g order by g",
+                    "select id, count(distinct k), string_agg(name, ',') from t where id < 5 group by id order by id",
+                    "select string_agg(name, ',' order by name, id desc), array_agg(id order by id) from t where id < 100"]
+        var sameM = 0
+        var pipedM = 0
+        for sql in more {
+            let r = both(mut &s, &sql)
+            if r.same { sameM += 1 }
+            if r.piped { pipedM += 1 }
+        }
+        println("more: " + len(more).toStr() + " queries, " + sameM.toStr() + " the same both ways")
+        println("more ran in the pipeline: " + pipedM.toStr() + " of " + len(more).toStr())
+
+        // parameters: the plan kept, run again with other values (a separator, a DISTINCT
+        // argument, a key, a FILTER, a boolean's comparison)
+        let seps = ["-", "+", ";;", ""]
+        let psqls = ["select g, string_agg(name, $1 order by id), count(distinct k + $2) from t where id < 300 group by g order by g",
+                     "select count(distinct k) filter (where id > $1), bool_and(k > $2), array_agg(k order by k * $2, id) from t where id < 200",
+                     "select id % 13, stddev(f) filter (where k > $1), bool_or(id > $2) from t group by id % 13 order by 1"]
+        var sameP = 0
+        var totalP = 0
+        for pi in 0..len(psqls) {
+            var pc = lexdb_exec.newPlanCache()
+            for v in 0..4 {
+                let p1 = if pi == 0 { lexdb_sql.Val.Text(seps[v].clone()) } else { lexdb_sql.Val.Int(v * 40) }
+                let params = [p1, lexdb_sql.Val.Int(v * 7 - 5)]
+                let a = q(mut &s, &"set lexdb_batch = off")
+                var pc2 = lexdb_exec.oneShot()
+                let off = withParams(mut &s, &psqls[pi], &params, mut &pc2)
+                let b = q(mut &s, &"set lexdb_batch = on")
+                let on = withParams(mut &s, &psqls[pi], &params, mut &pc)
+                totalP += 1
+                if on == off { sameP += 1 } else { println("PARAMS DIFFERENT: " + psqls[pi] + " " + off + " / " + on) }
+            }
+        }
+        println("parameters: " + sameP.toStr() + " of " + totalP.toStr() + " the same")
+
+        // the variances over floats (their own kernel): a float8 and a float4 column,
+        // NULLs, and the values arith's overflow and underflow checks answer to
+        one(mut &s, &"create table fl (id int primary key, g int, d float8, r real, i int)")
+        for c in 0..3 {
+            var fv: []str = []
+            for j in 0..1000 {
+                let i = c * 1000 + j
+                append(mut &fv, "(" + i.toStr() + ", " + (i % 5).toStr() + ", " + (if i % 9 == 0 { "null" } else { ((i * 37) % 1000).toStr() + ".125" }) + ", " + (if i % 7 == 0 { "null" } else { ((i * 13) % 500).toStr() + ".25" }) + ", " + (i % 100).toStr() + ")")
+            }
+            one(mut &s, &("insert into fl values " + strings.join(&fv, ", ")))
+        }
+        one(mut &s, &"update fl set d = 1e200 where id = 2000")
+        one(mut &s, &"update fl set d = 1e-200 where id = 2100")
+        one(mut &s, &"update fl set d = 'Infinity' where id = 2200")
+        one(mut &s, &"update fl set d = 'NaN' where id = 2300")
+        one(mut &s, &"update fl set d = -0.0 where id = 2400")
+        one(mut &s, &"update fl set d = 1e154 where id in (2600, 2601, 2602)")
+        let fls = ["select stddev(d), variance(d), var_pop(r), stddev_pop(r), stddev_samp(r), var_samp(d) from fl where id < 2000",
+                   "select g, stddev(d), variance(r), var_pop(d) from fl where id < 2000 group by g order by g",
+                   "select stddev(d) from fl where id between 1900 and 2100", "select variance(d) from fl where id between 2050 and 2150",
+                   "select g, var_pop(d) from fl where id between 2150 and 2250 group by g order by g",
+                   "select stddev(d), variance(d) from fl where id between 2250 and 2350", "select variance(d), var_pop(d) from fl where id between 2350 and 2450",
+                   "select variance(d) from fl where id between 2590 and 2600", "select variance(d) from fl where id between 2600 and 2602",
+                   "select g, stddev(d) from fl where id >= 2603 group by g order by g", "select id % 1300, var_samp(d), stddev_pop(r) from fl where id < 2000 group by id % 1300 order by 1",
+                   "select stddev(d) filter (where i > 50), variance(r) filter (where g = 2) from fl where id < 2000", "select stddev(d), stddev(r), stddev(i) from fl where id < 40",
+                   "select variance(d) from fl where id = 5", "select var_pop(d), stddev_pop(d) from fl where id = 5", "select variance(d) from fl where id < 0"]
+        var sameF = 0
+        var pipedF = 0
+        for sql in fls {
+            let r = both(mut &s, &sql)
+            if r.same { sameF += 1 }
+            if r.ran { pipedF += 1 }
+        }
+        println("floats: " + len(fls).toStr() + " queries, " + sameF.toStr() + " the same both ways, " + pipedF.toStr() + " in the pipeline")
+
+        // TPC-H q16's shape: count(DISTINCT) grouped by three columns, a NOT IN subquery
+        one(mut &s, &"create table part (p_partkey int primary key, p_brand text, p_type text, p_size int)")
+        one(mut &s, &"create table partsupp (ps_partkey int, ps_suppkey int, primary key (ps_partkey, ps_suppkey))")
+        one(mut &s, &"create table supplier (s_suppkey int primary key, s_comment text)")
+        var pv: []str = []
+        var psv: []str = []
+        var sv: []str = []
+        for i in 0..1200 {
+            append(mut &pv, "(" + i.toStr() + ", 'Brand#" + (i % 5 + 41).toStr() + "', '" + (if i % 4 == 0 { "MEDIUM POLISHED " } else { "SMALL PLATED " }) + (i % 3).toStr() + "', " + (i % 50 + 1).toStr() + ")")
+            for j in 0..4 { append(mut &psv, "(" + i.toStr() + ", " + ((i * 7 + j * 11) % 400).toStr() + ")") }
+        }
+        for i in 0..400 { append(mut &sv, "(" + i.toStr() + ", '" + (if i % 37 == 0 { "Customer xx Complaints" } else { "fine" }) + "')") }
+        one(mut &s, &("insert into part values " + strings.join(&pv, ", ")))
+        one(mut &s, &("insert into partsupp values " + strings.join(&psv, ", ")))
+        one(mut &s, &("insert into supplier values " + strings.join(&sv, ", ")))
+        let q16 = "select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey " +
+                  "and p_brand <> 'Brand#45' and p_type not like 'MEDIUM POLISHED%' and p_size in (49, 14, 23, 45, 19, 3, 36, 9, 1, 2, 4, 5, 6, 7, 8) " +
+                  "and ps_suppkey not in (select s_suppkey from supplier where s_comment like '%Customer%Complaints%') " +
+                  "group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size"
+        let r16 = both(mut &s, &q16)
+        let rows16 = len(strings.split(&r16.rows, "Brand#")) - 1
+        println("q16: " + (if r16.same { "same" } else { "DIFFERENT" }) + ", in the pipeline: " + r16.piped.toStr() + ", " + rows16.toStr() + " rows")
+
+        // a transaction's own writes
+        let bg = q(mut &s, &"begin")
+        let w1 = q(mut &s, &"insert into t values (9001, 3, 'n1', 7, 1.5, 2.25, true, '5'), (9002, 3, null, null, null, 1.00, null, null)")
+        let w2 = q(mut &s, &"delete from t where id % 11 = 5")
+        let tx = both(mut &s, &"select g, count(distinct k), string_agg(name, ',' order by id), bool_and(b), stddev(k) from t group by g order by g")
+        let rb = q(mut &s, &"rollback")
+        println("in a transaction: " + (if tx.same { "same" } else { "DIFFERENT" }) + ", in the pipeline: " + tx.piped.toStr())
+        return 0
+    }).unwrap()
+}
