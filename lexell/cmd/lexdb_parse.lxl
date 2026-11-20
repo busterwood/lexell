@@ -9,6 +9,7 @@ import "./lexdb_time"
 import "./lexdb_float"
 import "./lexdb_sql"
 import "./lexdb_dialect"
+import "./lexdb_dbopt"
 import "./lexdb_match"
 
 // The language model, by name (the parser reads and builds it).
@@ -166,6 +167,7 @@ const OVR_SYSTEM = lexdb_sql.OVR_SYSTEM
 const OVR_USER = lexdb_sql.OVR_USER
 const OVR_TSQL = lexdb_sql.OVR_TSQL
 const A_ADD = lexdb_sql.A_ADD
+const S_ALTER_DB = lexdb_sql.S_ALTER_DB
 const A_RENAME_COL = lexdb_sql.A_RENAME_COL
 const A_RENAME = lexdb_sql.A_RENAME
 const A_SET_NOT_NULL = lexdb_sql.A_SET_NOT_NULL
@@ -2847,6 +2849,111 @@ fn (p: mut &P) defaultExpr(): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
     if p.acceptKw("default") { return Ok(Expr.Call(DEFAULT_MARK, [], false)) }
     return p.expr()
+}
+
+// T-SQL's ALTER DATABASE name | CURRENT SET option [, option ...] [WITH termination], after "database"
+// (design/lexdb-dialect-gaps.md, package B, S6): each option as lexdb_dbopt gives its shape; an option
+// SQL Server has that lexdb does not do is 0A000, any other word SQL Server's syntax error.
+fn (p: mut &P) alterDatabase(): Result[Stmt, lexdb_base.DbErr] {
+    var s = lexdb_sql.newStmt(S_ALTER_DB)
+    s.mdialect = MD_TSQL
+    if !p.acceptKw("current") {
+        let t = p.peek().clone()
+        if t.kind == T_IDENT && t.text == "set" { return Err(near(&t)) }
+        s.table = try p.name()
+    }
+    if !p.isKw("set") {
+        let w = p.peek().clone()
+        if w.kind == T_IDENT && (w.text == "modify" || w.text == "add" || w.text == "remove" || w.text == "collate" || w.text == "scoped") {
+            return Err(lexdb_base.err("0A000", &("lexdb: ALTER DATABASE " + strings.toUpperAscii(&w.text) + " is not supported yet (ALTER DATABASE ... SET takes the options of SQL Server's that lexdb has)")))
+        }
+        return Err(near(&w))
+    }
+    p.pos += 1
+    while true {
+        let t = p.next()
+        if t.kind != T_IDENT { return Err(near(&t)) }
+        let sp = match lexdb_dbopt.spec(&t.text) {
+            Some(x) { x }
+            None { return Err(near(&t)) }
+        }
+        if !sp.known {
+            return Err(lexdb_base.err("0A000", &("lexdb: ALTER DATABASE ... SET " + strings.toUpperAscii(&t.text) + " is not supported yet")))
+        }
+        var val = ""
+        var arg = ""
+        if sp.shape == lexdb_dbopt.SH_ONOFF || sp.shape == lexdb_dbopt.SH_EQONOFF {
+            if sp.shape == lexdb_dbopt.SH_EQONOFF { try p.expectKw("=") }
+            let v = p.next()
+            if v.kind != T_IDENT || (v.text != "on" && v.text != "off") { return Err(near(&v)) }
+            val = v.text.clone()
+            if p.isKw("(") {
+                // AUTO_CREATE_STATISTICS ON (INCREMENTAL = ON | OFF); QUERY_STORE = ON (settings)
+                if t.text == "auto_create_statistics" {
+                    if val != "on" { return Err(near(&p.peek())) }
+                    p.pos += 1
+                    try p.expectKw("incremental")
+                    try p.expectKw("=")
+                    let iv = p.next()
+                    if iv.kind != T_IDENT || (iv.text != "on" && iv.text != "off") { return Err(near(&iv)) }
+                    arg = iv.text.clone()
+                    try p.expectKw(")")
+                } else if sp.shape == lexdb_dbopt.SH_EQONOFF {
+                    var depth = 0
+                    while true {
+                        let x = p.next()
+                        if x.kind == T_EOF { return Err(near(&x)) }
+                        if x.kind == T_OP && x.text == "(" { depth += 1 }
+                        if x.kind == T_OP && x.text == ")" {
+                            depth -= 1
+                            if depth == 0 { break }
+                        }
+                    }
+                } else {
+                    return Err(near(&p.peek()))
+                }
+            }
+        } else if sp.shape == lexdb_dbopt.SH_WORD || sp.shape == lexdb_dbopt.SH_EQWORD {
+            if sp.shape == lexdb_dbopt.SH_EQWORD { try p.expectKw("=") }
+            let v = p.next()
+            var ok = false
+            if v.kind == T_IDENT { for w in sp.vals { if w == v.text { ok = true } } }
+            if !ok { return Err(near(&v)) }
+            val = v.text.clone()
+        } else if sp.shape == lexdb_dbopt.SH_EQNUM {
+            try p.expectKw("=")
+            let neg = t.text == "target_recovery_time" && p.acceptKw("-")
+            let v = p.next()
+            if v.kind != T_NUM || strings.parseIntOpt(&v.text).isNone() { return Err(near(&v)) }
+            val = (if neg { "-" } else { "" }) + v.text
+            if t.text == "target_recovery_time" {
+                let u = p.next()
+                if u.kind != T_IDENT || (u.text != "seconds" && u.text != "minutes") { return Err(near(&u)) }
+                if u.text == "minutes" { val = (strings.parseIntOpt(&val).unwrapOr(0) * 60).toStr() }
+            }
+        }
+        append(mut &s.names, t.text + "\t" + val + (if len(arg) > 0 { "\t" + arg } else { "" }))
+        if !p.acceptKw(",") { break }
+    }
+    // WITH ROLLBACK IMMEDIATE | ROLLBACK AFTER n [SECONDS] | NO_WAIT (not with ALLOW_SNAPSHOT_ISOLATION: 5083)
+    if p.acceptKw("with") {
+        for it in s.names {
+            if strings.startsWith(&it, "allow_snapshot_isolation\t") {
+                return Err(lexdb_base.err("TS5083", "The termination option cannot be used with ALLOW_SNAPSHOT_ISOLATION."))
+            }
+        }
+        if p.acceptKw("rollback") {
+            if !p.acceptKw("immediate") {
+                try p.expectKw("after")
+                let n = p.next()
+                if n.kind != T_NUM { return Err(near(&n)) }
+                let sec = p.acceptKw("seconds")
+            }
+        } else {
+            try p.expectKw("no_wait")
+        }
+    }
+    return Ok(s)
 }
 
 // ALTER TABLE [IF EXISTS] [ONLY] name, then RENAME [COLUMN] a TO b,
@@ -5713,6 +5820,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     return Ok(o)
                 }
                 p.pos = back
+            }
+            if p.tsql && p.isKw("database") {
+                p.pos += 1
+                return p.alterDatabase()
             }
             if p.tsql && p.isKw("view") {
                 // ALTER VIEW name [(columns)] AS query: the view there is given a new definition

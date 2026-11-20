@@ -57,6 +57,7 @@ import "./lexdb_syscat"
 import "./lexdb_oracat"
 import "./lexdb_match"
 import "./lexdb_parse"
+import "./lexdb_dbopt"
 
 type SqlT = lexdb_syscat.SqlT
 type OraT = lexdb_oracat.OraT
@@ -15806,7 +15807,7 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
-           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE
+           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB
 }
 
 fn stmtName(kind: int): str {
@@ -15841,6 +15842,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_SEQ { "DROP SEQUENCE" }
         lexdb_sql.S_COPY { "COPY FROM" }
         lexdb_sql.S_MERGE { "MERGE" }
+        lexdb_sql.S_ALTER_DB { "ALTER DATABASE" }
         else { "DELETE" }
     }
 }
@@ -15927,6 +15929,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_MAINT { return maint(st, txn, s) }
         lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
         lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
+        lexdb_sql.S_ALTER_DB { return alterDatabase(st, txn, s) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
@@ -21109,7 +21112,9 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
             }
         }
     }
-    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur}
+    var dbopts = ""
+    if rel == "sys.databases" { dbopts = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("") }
+    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, dbopts: dbopts}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
@@ -21856,6 +21861,19 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if len(keys) == 0 { append(mut &keys, "") }
     try bumpKeys(st, txn, &keys)
     return Ok(tagOnly("DROP VIEW"))
+}
+
+// T-SQL's ALTER DATABASE ... SET: the settings kept in a catalog row (lexdb_dbopt), shown by sys.databases.
+// lexdb has the one database, which CURRENT and its own name mean.
+fn alterDatabase(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if len(s.table) > 0 && strings.toLowerAscii(&s.table) != lexdb_syscat.SYS_DB_NAME {
+        return Err(e("TS5011", &("User does not have permission to alter database '" + s.table +
+                     "', the database does not exist, or the database is not in a state that allows access checks.")))
+    }
+    let cur = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("")
+    let now = try lexdb_dbopt.apply(&cur, &s.names)
+    try txn.put(lexdb_catalog.CATALOG, &lexdb_dbopt.KEY, &now)
+    return Ok(tagOnly("ALTER DATABASE"))
 }
 
 // ALTER VIEW name RENAME TO new: refused while another view reads it.
