@@ -12163,7 +12163,7 @@ fn scanArm(sel: &Sel, aggs: bool): lexdb_plan.PScan {
     var need: []bool = withCapacity(len(t.cols))
     for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
     let batch = lexdb_plan.firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
-    return lexdb_plan.PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch}
+    return lexdb_plan.PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops}
 }
 
 // Scan (ps, its query's subqueries), under a Filter of cs if any.
@@ -12210,7 +12210,7 @@ fn joinsOver(sel: &Sel, base: lexdb_plan.PPlan): Result[lexdb_plan.PPlan, lexdb_
         for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
         let batch = lexdb_plan.scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
         var j = lexdb_plan.PJoin{how: lexdb_plan.JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: lexdb_plan.MK_JOIN, resCol: -1, res: [],
-                                 scan: lexdb_plan.PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch},
+                                 scan: lexdb_plan.PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false},
                                  build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
                                  rng: [], capNulls: false, noNulls: lv.path.noNulls}
         j.mark = mark
@@ -20424,10 +20424,10 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     let lv = &q.levels[0]
     if !lv.perRow || lv.lateral || lv.virt() || (q.corr && pathCorr(&lv.path)) { return Ok(None) }
     let p = &lv.path
-    // an index read alone; else its entries' rows, not where reading may
-    // stop early (a LIMIT: a batch's rows would be read for rows never
-    // wanted); not a primary key's point: a row, not a batch's (no plan
-    // made: every caller wants a range)
+    // an index read alone, or its entries' rows (where reading may stop
+    // early, a LIMIT, in batches that start small: rd.small); not a primary
+    // key's point: a row, not a batch's (no plan made: every caller wants a
+    // range)
     let only = ixCovers(lv, p.index)
     if !lexdb_plan.scanBatches(p, len(lv.t.pk), only, lv.stops, false) { return Ok(None) }
     let t = &lv.t
@@ -20475,6 +20475,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     if p.index >= 0 {
         rd.ix = p.index
         rd.desc = p.desc
+        rd.small = lv.stops
         if only {
             rd.only = true
             match idxDecOf(t, p.index, &needCol) {

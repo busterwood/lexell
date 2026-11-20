@@ -881,9 +881,22 @@ pub type IxRead = record {
     pub desc: bool
     pub byKeys: bool
     pub keys: []str
+    pub small: bool     // the read may stop early (a LIMIT): its batches start at 32 entries and double to BROWS (the cursor's want)
 }
 
-pub fn noIxRead(): IxRead { return IxRead{ix: -1, only: false, dec: IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}, desc: false, byKeys: false, keys: []} }
+pub fn noIxRead(): IxRead { return IxRead{ix: -1, only: false, dec: IdxDec{cols: [], codes: [], marked: [], want: [], last: 0}, desc: false, byKeys: false, keys: [], small: false} }
+
+// The index entries the batch reads have taken (the tests: a LIMIT's first
+// batch is 32 of them, not BROWS).
+var idxTaken: int = 0
+pub fn idxEntries(): int { return idxTaken }
+
+// The entries the next batch of an index read takes: BROWS, or where the
+// read may stop early the cursor's next size (32, doubling to BROWS).
+fn idxWant(rd: &IxRead, cur: mut &Cursor): int {
+    if rd.small { return nextWant(cur) }
+    return BROWS
+}
 
 // ---- batches
 
@@ -1034,7 +1047,8 @@ pub fn fillLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd:
 fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &IxRead, sc: &Scan, cur: mut &Cursor,
                bp: &BPlan): Result[Option[Batch], DbErr] {
     let tree = t.indexes[rd.ix].tree
-    var b = lexdb_rows.newBatch(bp, BROWS)
+    let want = idxWant(rd, cur)
+    var b = lexdb_rows.newBatch(bp, want)
     var bail = false
     if rd.desc {
         let to: &str = if cur.started { &cur.at } else { &sc.hi }
@@ -1047,13 +1061,14 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
             }
             b.n += 1
             last = en.key.clone()
-            return b.n < BROWS
+            return b.n < want
         })
         if bail { return Ok(None) }
-        if b.n < BROWS { cur.done = true } else { cur.at = last }
+        idxTaken += b.n
+        if b.n < want { cur.done = true } else { cur.at = last }
         return Ok(Some(b))
     }
-    while b.n < BROWS && !cur.done {
+    while b.n < want && !cur.done {
         let from: &str = if cur.started { &cur.at } else { &sc.lo }
         cur.started = true
         var stopKey = ""
@@ -1061,7 +1076,7 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
         try st.scanLeaves(txn, tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             var k = i
             while k < j {
-                if b.n == BROWS {
+                if b.n == want {
                     full = true
                     stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
@@ -1078,10 +1093,12 @@ fn fillIdxOnly(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
         if bail { return Ok(None) }
                 if full {
             cur.at = stopKey
+            idxTaken += b.n
             return Ok(Some(b))
         }
         cur.done = true
     }
+    idxTaken += b.n
     return Ok(Some(b))
 }
 
@@ -1097,17 +1114,19 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
         cur.done = true
         for k in rd.keys { append(mut &pks, k.clone()) }
     } else if rd.desc {
+        let want = idxWant(rd, cur)
         let to: &str = if cur.started { &cur.at } else { &sc.hi }
         cur.started = true
         var last = ""
         try st.scanBack(txn, tree, &sc.lo, to, fn(en: &lexdb_store.Entry): bool {
             append(mut &pks, en.val.clone())
             last = en.key.clone()
-            return len(pks) < BROWS
+            return len(pks) < want
         })
-        if len(pks) < BROWS { cur.done = true } else { cur.at = last }
+        if len(pks) < want { cur.done = true } else { cur.at = last }
     } else {
-        while len(pks) < BROWS && !cur.done {
+        let want = idxWant(rd, cur)
+        while len(pks) < want && !cur.done {
             let from: &str = if cur.started { &cur.at } else { &sc.lo }
             cur.started = true
             var stopKey = ""
@@ -1115,7 +1134,7 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
             try st.scanLeaves(txn, tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
                 var k = i
                 while k < j {
-                    if len(pks) == BROWS {
+                    if len(pks) == want {
                         full = true
                         stopKey = lexdb_rows.leafKey(leaf, k)
                         return false
@@ -1133,6 +1152,7 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
         }
     }
     let n = len(pks)
+    idxTaken += n
     var b = lexdb_rows.newBatch(bp, n)
     // the rows in key order, unless the reads are noted (then in the
     // index's, as the row path reads them)
