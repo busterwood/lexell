@@ -4342,7 +4342,8 @@ type JL = record {
     los: []Val              // a range's bounds after its equalities, as values (rangeOne)
     his: []Val
     noNulls: bool
-    right: bool             // a RIGHT JOIN's: its rows that joined are noted (JState.seen)
+    right: bool             // a RIGHT or FULL JOIN's: its rows that joined are noted (JState.seen)
+    cross: bool             // an inner join with no key (CROSS JOIN, a pair condition only): every row of its hash for each row before it
     raw: bool               // a subquery's rows: keys by their values' own encoding (keyPart), not coerced
     resCol: int             // a "<>" summary's column (-1 none): mixed, single per bucket; res its outer value
     mixed: []bool
@@ -4362,7 +4363,7 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               mode: JK_GEN, ints: newMap(), txts: newMap(), gens: newMap(), head: [], next: [], rows: lexdb_rows.noRows(),
               conds: [], creads: [], post: [], preads: [], ktypes: [], tail: lexdb_access.noTail(), noRange: false, index: -1,
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
-              perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
+              perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, cross: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
               cutB: [], cutTo: -1}
 }
 
@@ -4452,7 +4453,9 @@ fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool):
             if j.mark != lexdb_plan.MK_JOIN && j.kind != lexdb_sql.J_INNER { return -1 }
             if j.resCol >= 0 && (!hash || len(j.res) != 1 || !allIn(&j.res, avail)) { return -1 }
             if hash {
-                if len(j.hcols) == 0 || len(j.hcols) != len(j.keys) || len(j.ktypes) != len(j.keys) || !j.exact { return -1 }
+                // (no key: an inner join of every pair, its conditions per pair)
+                let keyless = len(j.hcols) == 0 && j.kind == lexdb_sql.J_INNER && j.mark == lexdb_plan.MK_JOIN && j.resCol < 0
+                if (len(j.hcols) == 0 && !keyless) || len(j.hcols) != len(j.keys) || len(j.ktypes) != len(j.keys) || !j.exact { return -1 }
                 for c in j.hcols { if c < 0 || c >= len(sc.need) || !sc.need[c] { return -1 } }
                 // its own conditions read its own columns only
                 var own: []bool = array(len(cols), false)
@@ -4927,6 +4930,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             jl.right = j.kind == lexdb_sql.J_RIGHT || j.kind == lexdb_sql.J_FULL
             jl.mark = j.mark
             jl.raw = j.how == lexdb_plan.JH_ROWS
+            jl.cross = (j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS) && len(j.hcols) == 0
             jl.resCol = j.resCol
             for k in 0..len(t.cols) { append(mut &jl.rkinds, jr.kinds[sc.first + k]) }
             var avail: []bool = array(jr.nq, false)
@@ -4961,7 +4965,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             }
             if j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS {
                 // one integer key of an integer column, no collation: by value; one text key of texts: by its text
-                let hc = j.hcols[0]
+                let hc = if len(j.hcols) > 0 { j.hcols[0] } else { -1 }
                 if len(j.keys) == 1 && jl.keyTyp[0] == BT_INT && jl.rkinds[hc] == BK_INT {
                     jl.mode = JK_INT
                 } else if len(j.keys) == 1 && jl.keyTyp[0] == BT_OTHER && jl.keyCol[0] >= 0 {
@@ -5366,6 +5370,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
     }
     let jl = &jr.jls[j]
     let lv = jl.level
+    if jl.cross && !one { return crossFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, out) }
     let w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
     let kv = try keyVecs(jl, &w)
     var pj: []int = withCapacity(n)
@@ -5597,6 +5602,50 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
     let go = joinFrom(st, txn, jr, js, tabs, j + 1, at2, n2, cx, bud, cnt, false, out)
     bud.held -= held
     return go
+}
+
+// The rest of a chunk's join from level j, an inner join with no key: each
+// of the n rows before it crossed with every row of its hash (the rows held
+// once, read in order), in pieces of at most BROWS pairs: several outer rows
+// to a piece when the hash is small, else one outer row and BROWS of the hash's
+// rows at a time. The pieces follow in the row engine's order (outer row by
+// outer row, the hash's rows in the order read), its conditions on each pair
+// as any join's (joinTail), counted as the row engine counts them.
+fn crossFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+             at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    let jl = &jr.jls[j]
+    cnt[jl.level].starts += n
+    let m = jl.rows.n
+    if m == 0 { return Ok(true) }
+    var per = lexdb_rows.BROWS / m
+    if per < 1 { per = 1 }
+    var r0 = 0
+    while r0 < n {
+        let r1 = min(n, r0 + per)
+        let nr = r1 - r0
+        var sel: []int = withCapacity(nr)
+        for r in r0..r1 { append(mut &sel, r) }
+        var i0 = 0
+        while i0 < m {
+            let i1 = min(m, i0 + lexdb_rows.BROWS)
+            var pj: []int = withCapacity(nr * (i1 - i0))
+            var pi: []int = withCapacity(nr * (i1 - i0))
+            for r in 0..nr {
+                for x in i0..i1 {
+                    append(mut &pj, r)
+                    append(mut &pi, x)
+                }
+            }
+            let atg = compose(at, &sel)
+            let at2 = try joinTail(jr, js, j, &atg, nr, &pj, pi, bud, cnt)
+            let n2 = len(at2[0])
+            if !(try joinFrom(st, txn, jr, js, tabs, j + 1, at2, n2, cx, bud, cnt, false, out)) { return Ok(false) }
+            i0 = i1
+        }
+        r0 = r1
+    }
+    return Ok(true)
 }
 
 // What a chunk's join gave its consumer (given rows), and how many of
