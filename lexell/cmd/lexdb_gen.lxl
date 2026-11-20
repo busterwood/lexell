@@ -238,3 +238,36 @@ pub fn tsqlType(x: &Expr, cols: &[]ColDef): Option[lexdb_sql.TypeName] {
         else { return None }
     }
 }
+
+// A write's value for generated column i (isDef: the DEFAULT keyword; insert: an INSERT's, else an UPDATE's assignment):
+// refused, as the dialect refuses it (PostgreSQL and Oracle take DEFAULT).
+pub fn checkWrite(cols: &[]ColDef, i: int, isDef: bool, md: int, insert: bool): Result[Unit, DbErr] {
+    if cols[i].genKind == lexdb_sql.GEN_NONE || (isDef && md != lexdb_sql.MD_TSQL) { return Ok(Unit{}) }
+    return Err(writeErr(md, &cols[i].name, insert))
+}
+
+// A constraint on a generated column that is not stored, where the dialect refuses it: SQL Server's CHECK and FOREIGN KEY need
+// the computed column persisted (8183); PostgreSQL's virtual columns take no unique nor foreign key.
+pub fn checkConstraint(cols: &[]ColDef, c: &lexdb_sql.Constraint, md: int): Result[Unit, DbErr] {
+    if md == lexdb_sql.MD_ORA || !anyGen(cols) { return Ok(Unit{}) }
+    var names: []str = []
+    if c.kind == lexdb_sql.C_CHECK {
+        match c.expr { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
+    } else {
+        for n in c.cols { append(mut &names, n.clone()) }
+    }
+    for n in names {
+        let i = lexdb_bind.colIndex(cols, &n)
+        if i < 0 || cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
+        if md == lexdb_sql.MD_TSQL {
+            if c.kind == lexdb_sql.C_CHECK || c.kind == lexdb_sql.C_FOREIGN {
+                return Err(err("TS8183", "Only UNIQUE or PRIMARY KEY constraints can be created on computed columns, while CHECK, FOREIGN KEY, and NOT NULL constraints require that computed columns be persisted."))
+            }
+        } else if c.kind == lexdb_sql.C_UNIQUE {
+            return Err(err("0A000", "unique constraints on virtual generated columns are not supported"))
+        } else if c.kind == lexdb_sql.C_FOREIGN {
+            return Err(err("0A000", "foreign key constraints on virtual generated columns are not supported"))
+        }
+    }
+    return Ok(Unit{})
+}

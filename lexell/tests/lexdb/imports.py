@@ -27,6 +27,9 @@
   store it uses the Store and Txn handles only, and it never reads a
   transaction's SQL state (Txn.sql). Only lexdb_pipe and lexdb_exec import
   it.
+- The privileges lexdb_priv (roles, owners, grants, the checks) import only
+  the catalog, the store and the vocabulary below them; exec and the
+  protocol modules import them.
 - No cycle.
 
 Run by lexdb.py before the tests; also usable directly.
@@ -44,7 +47,7 @@ CORE = {
     "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
-    "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows", "lexdb_routine",
+    "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
 }
@@ -131,6 +134,15 @@ PLAN_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_bind", "lexdb_stats", "lexd
                    "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match"}
 PLAN_STORE_NAMES = {"Store", "Txn"}
 PLAN_USERS = {"lexdb_pipe", "lexdb_exec"}
+
+# Roles, owners and privileges (lexdb_priv, design/lexdb-layers.md 6.3, Q3):
+# the roles' and ACLs' catalog rows, who a session acts as and the checks.
+# It reads the catalog and the store's memo only; the statements that
+# change privileges and the catalog lookups stay in exec. Exec and the
+# protocol modules (the roles for authentication) import it.
+PRIV = "lexdb_priv"
+PRIV_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_store", "lexdb_catalog"}
+PRIV_USERS = {"lexdb_exec", "lexdb_wire", "lexdb_tds", "lexdb_tns"}
 
 # How rows are put in order (lexdb_sort, design/lexdb-layers.md 6.2.3, slice
 # P3): the sort keys the pipeline's Sort and the row engine share. Values and
@@ -251,6 +263,12 @@ def check():
             bad.append(f"{PLAN} uses lexdb_store beyond Store and Txn: " + ", ".join(sorted(names)))
         if re.search(r"\.sql\.", body):
             bad.append(f"{PLAN} reads a transaction's SQL state (Txn.sql)")
+    for d in mods.get(PRIV, []):
+        if d not in PRIV_MAY_IMPORT:
+            bad.append(f"{PRIV} -> {d}: the privileges import above their layer")
+    for m in sorted(mods):
+        if PRIV in mods[m] and m not in PRIV_USERS:
+            bad.append(f"{m} -> {PRIV}: only {', '.join(sorted(PRIV_USERS))} import the privileges")
     for d in mods.get(SORT, []):
         if d not in SORT_MAY_IMPORT:
             bad.append(f"{SORT} -> {d}: the sort keys import above their layer")

@@ -1,0 +1,373 @@
+// lexdb_priv: roles, owners and privileges (design/lexdb.md 9.83;
+// design/lexdb-dialect-gaps.md 6, package E): the roles' catalog rows, the
+// objects' owners and grants (ACLs), who a session acts as (SET ROLE, SET
+// SESSION AUTHORIZATION, its door), and the checks a statement makes before
+// it reads or writes (needRel, needOwner, needCreate, needGrantor), with
+// each door's errors. The statements that change them (GRANT, REVOKE, ALTER
+// ... OWNER, CREATE ROLE) are lexdb_exec's; they and the planner's view
+// checks (lexdb_exec.scCheck) call these.
+//
+// Owners and privileges as PostgreSQL's: an object's owner may do anything
+// with it; others what was granted to them, to a role they are a member of
+// (transitively), or to PUBLIC. A role that is a superuser, and a session
+// whose user is no role (it came in by trust), are not checked. The facts
+// are catalog rows of their own: ACL_PRE and an object ("r:" a relation's
+// catalog key, "n:" a schema) holds its owner and grants; MEM_PRE, a role
+// and a member, a membership. Privileges are letters, as in PostgreSQL's
+// aclitem: r SELECT, a INSERT, w UPDATE, d DELETE, x REFERENCES, t TRIGGER,
+// U USAGE, C CREATE.
+//
+// A role is a catalog row of its own, roleKey(name): whether it may log in,
+// whether it is a superuser, and its password's SCRAM verifier ("" none).
+// Roles matter to SCRAM authentication (lexdb_wire); a session that came in
+// by trust is not checked against them.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+
+type DbErr = lexdb_base.DbErr
+type Role = lexdb_catalog.Role
+type Acl = lexdb_catalog.Acl
+type Who = lexdb_catalog.Who
+type Grant = lexdb_catalog.Grant
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+pub fn roleKey(n: &str): str { return "\x05" + n }
+
+pub fn encRole(r: &Role): str { return (if r.login { "1" } else { "0" }) + "\t" + (if r.superuser { "1" } else { "0" }) + "\t" + r.verifier + "\t" + r.oraVerifier }
+
+pub fn decRole(name: &str, v: &str): Role {
+    let f = strings.split(&v, "\t")
+    return Role{name: name.toStr(), login: len(f) > 0 && f[0] == "1", superuser: len(f) > 1 && f[1] == "1",
+                verifier: if len(f) > 2 { f[2].toStr() } else { "" },
+                oraVerifier: if len(f) > 3 { f[3].toStr() } else { "" }}
+}
+
+pub fn rolesIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Role, DbErr] {
+    var out: []Role = []
+    try st.scan(txn, lexdb_catalog.CATALOG, "\x05", "\x06", fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, decRole(&en.key[1..len(en.key)], &en.val))
+        return true
+    })
+    return Ok(out)
+}
+
+// The roles as committed (the wire's authentication reads them).
+pub fn roles(st: &lexdb_store.Store): Result[[]Role, DbErr] {
+    var t = try st.beginSnapshot()
+    let r = rolesIn(st, mut &t)
+    st.abort(t)
+    return r
+}
+
+pub const MEM_PRE: str = "\x02mem\x00"
+
+fn encAcl(a: &Acl): str {
+    var b = ""
+    b += &a.owner
+    b += if a.set { "\n1" } else { "\n0" }
+    for g in a.grants {
+        b.addByte('\n')
+        b += &g.to
+        b.addByte('\t')
+        b += &g.privs
+    }
+    return b
+}
+
+pub fn readAcl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, obj: &str): Result[Acl, DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + obj)) {
+        Some(v) { return Ok(lexdb_catalog.decAcl(obj, &v)) }
+        None { return Ok(Acl{owner: "", grants: lexdb_catalog.defaultGrants(obj), set: false}) }
+    }
+}
+
+pub fn writeAcl(txn: mut &lexdb_store.Txn, obj: &str, a: &Acl): Result[Unit, DbErr] {
+    try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + obj), &(encAcl(a)))
+    return Ok(Unit{})
+}
+
+pub fn dropAcl(txn: mut &lexdb_store.Txn, obj: &str) { txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + obj)) }
+
+pub fn moveAcl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &str, to: &str): Result[Unit, DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + from)) {
+        Some(v) {
+            txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + from))
+            try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + to), &v)
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// A new object's owner: the session's current role.
+pub fn ownNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, obj: &str): Result[Unit, DbErr] {
+    return writeAcl(txn, obj, &Acl{owner: currentRole(st, txn.sql.sess), grants: [], set: false})
+}
+
+pub fn roleKeyOf(sess: int): str { return "\x00role\x00" + sess.toStr() }
+pub fn sessAuthKey(sess: int): str { return "\x00sessauth\x00" + sess.toStr() }
+
+// The session's user as SET SESSION AUTHORIZATION made it, else its login's.
+pub fn sessionUser(st: &lexdb_store.Store, sess: int): str {
+    match st.memo.get(&sessAuthKey(sess)) {
+        Some(u) { if len(u) > 0 { return u } }
+        None {}
+    }
+    return st.memo.get(&lexdb_catalog.userKey(sess)).unwrapOr("lexdb")
+}
+
+// The role privileges are checked as: SET ROLE's, else the session user.
+pub fn currentRole(st: &lexdb_store.Store, sess: int): str {
+    match st.memo.get(&roleKeyOf(sess)) {
+        Some(r) { if len(r) > 0 { return r } }
+        None {}
+    }
+    return sessionUser(st, sess)
+}
+
+pub fn whoIs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Who, DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &(roleKey(name))) {
+        Some(v) {
+            let r = decRole(name, &v)
+            var w = Who{name: name.toStr(), super: r.superuser, roles: [name.toStr(), ""]}
+            if w.super { return Ok(w) }
+            // memberships: role, member pairs, followed from name up
+            var pairs: []str = []
+            try st.scan(txn, lexdb_catalog.CATALOG, MEM_PRE, &(MEM_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
+                append(mut &pairs, en.key[len(MEM_PRE)..len(en.key)].toStr())
+                return true
+            })
+            var todo: []str = [name.toStr()]
+            while len(todo) > 0 {
+                let m = pop(mut &todo)
+                for pr in pairs {
+                    let z = strings.indexOf(&pr, "\x00", 0)
+                    let role = pr[0..z].toStr()
+                    if pr[z + 1..len(pr)] == m && !lexdb_base.hasStr(&w.roles, &role) {
+                        append(mut &w.roles, role.clone())
+                        append(mut &todo, role)
+                    }
+                }
+            }
+            return Ok(w)
+        }
+        None { return Ok(Who{name: name.toStr(), super: true, roles: [name.toStr(), ""]}) }
+    }
+}
+
+pub fn whoNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Who, DbErr] { return whoIs(st, txn, &currentRole(st, txn.sql.sess)) }
+
+pub fn allows(w: &Who, a: &Acl, letter: &str): bool {
+    if w.super { return true }
+    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return true }
+    for g in a.grants { if lexdb_base.hasStr(&w.roles, &g.to) && strings.contains(&g.privs, letter) { return true } }
+    return false
+}
+
+fn may(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, letter: &str): Result[bool, DbErr] {
+    if w.super { return Ok(true) }
+    return Ok(allows(w, &(try readAcl(st, txn, obj)), letter))
+}
+
+pub fn denied(kind: &str, name: &str): DbErr { return e("42501", &("permission denied for " + kind + " " + lexdb_sql.baseName(name))) }
+
+// The door a session came in by, kept in the store's memo (lexdb_tds and lexdb_tns set it): "tds" (SQL Server's), "tns"
+// (Oracle's), "" the PostgreSQL wire and in-process sessions. Neither SQL Server nor Oracle has a schema privilege to
+// read an object through (an object's own GRANT is all a user needs of it), as PostgreSQL's USAGE on a schema is.
+pub fn doorKey(sess: int): str { return "\x00door\x00" + sess.toStr() }
+pub fn doorOf(st: &lexdb_store.Store, sess: int): str { return st.memo.get(&doorKey(sess)).unwrapOr("") }
+
+// A privilege letter's name as SQL Server's messages say it.
+fn tsqlPriv(letter: &str): str {
+    return match letter { "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "x" { "REFERENCES" } "D" { "ALTER" } else { "EXECUTE" } }
+}
+
+// SQL Server's 229 for a table: "The SELECT permission was denied on the object 't', database 'lexdb', schema 'dbo'."
+fn deniedTsql(letter: &str, key: &str): DbErr {
+    let sc = lexdb_sql.schemaOf(key)
+    return e("TS229", &("The " + tsqlPriv(letter) + " permission was denied on the object '" + lexdb_sql.baseName(key) + "', database 'lexdb', schema '" +
+                        (if sc == "public" { "dbo" } else { sc }) + "'."))
+}
+
+// A relation's privilege (and its schema's USAGE, for the PostgreSQL door): 42501 without them.
+pub fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: &str, letter: &str, kind: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let sc = lexdb_sql.schemaOf(key)
+    var door = ""
+    if !(try may(st, txn, w, &lexdb_catalog.nspObj(&sc), &"U")) {
+        door = doorOf(st, txn.sql.sess)
+        if len(door) == 0 { return Err(denied(&"schema", &sc)) }
+    }
+    if !(try may(st, txn, w, &lexdb_catalog.relObj(key), letter)) {
+        if len(door) == 0 { door = doorOf(st, txn.sql.sess) }
+        if door == "tds" { return Err(deniedTsql(letter, key)) }
+        // Oracle: a table the user cannot read is ORA-00942 (it is not there for it), one it can read but not use so is ORA-01031
+        if door == "tns" {
+            if letter == "r" || !(try may(st, txn, w, &lexdb_catalog.relObj(key), &"r")) { return Err(e("ORA00942", "table or view does not exist")) }
+            return Err(e("ORA01031", "insufficient privileges"))
+        }
+        return Err(denied(kind, key))
+    }
+    return Ok(Unit{})
+}
+
+pub fn needOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, obj: &str, kind: &str, name: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let a = try readAcl(st, txn, obj)
+    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
+    return Err(e("42501", &("must be owner of " + kind + " " + lexdb_sql.baseName(name))))
+}
+
+// CREATE in a schema.
+pub fn needCreate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Unit, DbErr] {
+    let sc = lexdb_sql.schemaOf(key)
+    if sc == lexdb_catalog.tmpName(txn.sql.sess) { return Ok(Unit{}) }        // a session's temporary tables
+    let w = try whoNow(st, txn)
+    if !(try may(st, txn, &w, &lexdb_catalog.nspObj(&sc), &"C")) { return Err(denied(&"schema", &sc)) }
+    return Ok(Unit{})
+}
+
+// The owner check for a relation's DDL (ALTER, DROP, CREATE INDEX on it).
+pub fn needRelOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, kind: &str): Result[Unit, DbErr] {
+    let w = try whoNow(st, txn)
+    return needOwner(st, txn, &w, &lexdb_catalog.relObj(key), kind, key)
+}
+
+// The letters a privilege name stands for on an object of a kind
+// (table, sequence, schema); "" if it is not one of them.
+pub fn privLetters(name: &str, kind: &str): str {
+    if kind == "schema" {
+        return match name { "usage" { "U" } "create" { "C" } "all" { "UC" } else { "" } }
+    }
+    if kind == "sequence" {
+        return match name { "select" { "r" } "update" { "w" } "usage" { "U" } "all" { "rwU" } else { "" } }
+    }
+    return match name {
+        "select" { "r" }
+        "insert" { "a" }
+        "update" { "w" }
+        "delete" { "d" }
+        "references" { "x" }
+        "trigger" { "t" }
+        "truncate" { "D" }
+        "maintain" { "" }
+        "all" { "arwdDxt" }
+        else { "" }
+    }
+}
+
+pub fn addLetters(have: &str, more: &str): str {
+    var out = have.toStr()
+    for i in 0..len(more) { if !strings.contains(&out, &more[i..i + 1]) { out = out + more[i..i + 1] } }
+    // in PostgreSQL's order
+    var sorted = ""
+    for c in ["a", "r", "w", "d", "D", "x", "t", "U", "C"] { if strings.contains(&out, &c) { sorted = sorted + c } }
+    return sorted
+}
+
+pub fn dropLetters(have: &str, gone: &str): str {
+    var out = ""
+    for i in 0..len(have) { if !strings.contains(&gone, &have[i..i + 1]) { out = out + have[i..i + 1] } }
+    return out
+}
+
+// A role spec's name: CURRENT_USER and SESSION_USER resolved.
+pub fn roleName(st: &lexdb_store.Store, txn: &lexdb_store.Txn, r: &str): str {
+    if r == "#current_user" { return currentRole(st, txn.sql.sess) }
+    if r == "#session_user" { return sessionUser(st, txn.sql.sess) }
+    return r.toStr()
+}
+
+pub fn roleExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &str): Result[bool, DbErr] {
+    return Ok((try st.get(txn, lexdb_catalog.CATALOG, &(roleKey(r)))).isSome())
+}
+
+// The objects a GRANT or REVOKE names: (object, kind word, name) for each.
+pub type Target = record { pub obj: str; pub kind: str; pub name: str }
+
+// Who may GRANT or REVOKE letters on an object: its owner, a role it is a member of, a superuser. The other doors say
+// no as their own systems do: SQL Server's 4613, Oracle's 1720 for a user that holds the privilege without a grant
+// option (lexdb has none), else 1031 (the 42501).
+pub fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, tg: &Target, letters: &str, door: &str): Result[Unit, DbErr] {
+    if w.super { return Ok(Unit{}) }
+    let a = try readAcl(st, txn, &tg.obj)
+    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return Ok(Unit{}) }
+    if door == "tds" { return Err(e("TS4613", "Grantor does not have GRANT permission.")) }
+    if door == "tns" && (tg.kind == "table" || tg.kind == "view") {
+        for k in 0..len(letters) {
+            if allows(w, &a, &letters[k..k + 1]) {
+                return Err(e("ORA01720", &("grant option does not exist for '" + strings.toUpperAscii(&lexdb_sql.schemaOf(&tg.name)) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&tg.name)) + "'")))
+            }
+        }
+    }
+    return needOwner(st, txn, w, &tg.obj, &tg.kind, &tg.name)
+}
+
+pub fn setRoleIn(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, id: int, what: &str, name: &str): Result[Unit, DbErr] {
+    if len(name) > 0 && !(try roleExists(st, t, name)) { return Err(e("22023", &("role \"" + name + "\" does not exist"))) }
+    if what == "session_authorization" {
+        let login = st.memo.get(&lexdb_catalog.userKey(id)).unwrapOr("lexdb")
+        if !(try whoIs(st, t, &login)).super && name != login {
+            return Err(e("42501", "permission denied to set session authorization"))
+        }
+        st.memo.put(&sessAuthKey(id), name)
+        st.memo.put(&roleKeyOf(id), &"")
+        return Ok(Unit{})
+    }
+    if len(name) > 0 {
+        let w = try whoIs(st, t, &sessionUser(st, id))
+        if !w.super && !lexdb_base.hasStr(&w.roles, name) { return Err(e("42501", &("permission denied to set role \"" + name + "\""))) }
+    }
+    st.memo.put(&roleKeyOf(id), name)
+    return Ok(Unit{})
+}
+
+// A role's name in the owners, grants and memberships: renamed to to, or
+// ("" ) taken out of grants and memberships. With check, nothing changes:
+// the first object it owns, "" if none.
+pub fn renameInAcls(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &str, to: &str, check: bool): Result[str, DbErr] {
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, lexdb_catalog.CATALOG, lexdb_catalog.ACL_PRE, &(lexdb_catalog.ACL_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key.clone())
+        append(mut &vals, en.val.clone())
+        return true
+    })
+    for i in 0..len(keys) {
+        let obj = keys[i][len(lexdb_catalog.ACL_PRE)..len(keys[i])].toStr()
+        var a = try readAcl(st, txn, &obj)
+        if check {
+            if a.owner == from { return Ok(if strings.startsWith(&obj, "n:") { "schema " + obj[2..len(obj)] } else { lexdb_sql.shown(&obj[2..len(obj)]) }) }
+            continue
+        }
+        if a.owner == from { a.owner = to.toStr() }
+        var kept: []Grant = []
+        for g in a.grants {
+            if g.to == from { if len(to) > 0 { append(mut &kept, Grant{to: to.toStr(), privs: g.privs.clone()}) } }
+            else { append(mut &kept, Grant{to: g.to.clone(), privs: g.privs.clone()}) }
+        }
+        a.grants = kept
+        try writeAcl(txn, &obj, &a)
+    }
+    if check { return Ok("") }
+    var mems: []str = []
+    try st.scan(txn, lexdb_catalog.CATALOG, MEM_PRE, &(MEM_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
+        append(mut &mems, en.key[len(MEM_PRE)..len(en.key)].toStr())
+        return true
+    })
+    for pr in mems {
+        let z = strings.indexOf(&pr, "\x00", 0)
+        let role = pr[0..z].toStr()
+        let member = pr[z + 1..len(pr)].toStr()
+        if role != from && member != from { continue }
+        txn.del(lexdb_catalog.CATALOG, &(MEM_PRE + pr))
+        if len(to) > 0 {
+            try txn.put(lexdb_catalog.CATALOG, &(MEM_PRE + (if role == from { to.toStr() } else { role }) + "\x00" + (if member == from { to.toStr() } else { member })), "")
+        }
+    }
+    return Ok("")
+}
