@@ -5945,6 +5945,66 @@ lexdb-optimizer.md), then slices, each merged with the gates. A TPC-H run
 against PostgreSQL (one core and four processes, lexdb-benchmarks.md) is
 recorded after Q1 and again after Q4-Q6.
 
+#### Q1 bisect result (2026-11-20)
+
+**There is no code regression of 14%: the two binaries were built with
+different compiler flags.** `~/tpch-w/bind/os/lexdb-aaadeb1e` (built 18 Nov)
+is `lxlc lexdb.lxl -O`; `~/tpch-w/bind/os/lexdb-39451078` (and every binary
+from 20 Nov) is `lxlc lexdb.lxl -o ...` with no `-O` (what
+`bench/tpch/README.md` and `cmd/README.md` say to type). Rebuilt here from
+each commit's own compiler (gcc build of its seed; the rebuilt `-O` good
+binary is byte-identical to the stored one, the rebuilt no-`-O` bad binary
+to the stored bad one), then alternated in one session on the same data
+(`TPCH_QUERIES=q1,q21`, 1 run each, 3 rounds, medians, ms; checksums equal
+in every run):
+
+| build | q1 | q21 |
+|---|---:|---:|
+| aaadeb1e `-O` | 1,696 | 1,107 |
+| aaadeb1e no `-O` | 1,961 | 1,162 |
+| 39451078 `-O` | 1,725 | 1,132 |
+| 39451078 no `-O` | 1,971 | 1,190 |
+
+Like for like the gap is q1 +1.7% / +0.5% (`-O` / not) and q21 +2.2% / +2.4%;
+the `-O` flag alone is worth 13-14% on q1 and 5% on q21. A q1 profile
+(perf, `LXL_NATIVE_MAP` symbol map; 7,121 samples with `-O`, 7,972 without)
+puts the `-O` gain in the loop and load-reuse passes (`bEval` 950 to 652
+samples, `vec_arith` 466 to 284, `rows_bvec` 288 to 63, `vec_sum` 759 to
+625, `encKeyPart`, `sipKeyedStr`); the same `-O` builds of aaadeb1e and
+39451078 have 7,121 and 7,032 samples, with the same functions in the same
+order (only inlining of `encKeyPart` into `bKeyEnc` moves samples).
+
+The residual `-O` drift over the candidate commits (medians of 3 alternated
+rounds, `-O`, ms; q1 / q21; noise per build about 1%, code placement up to
+2-4% on q7):
+
+| commit | q1 | q21 |
+|---|---:|---:|
+| aaadeb1e | 1,675 | 1,167 |
+| eababf57 | 1,707 (+1.9%) | 1,201 (+2.9%) |
+| f387f7f0 | 1,687 | 1,201 |
+| d0f00b92 | 1,700 | 1,208 (+3.5%) |
+| 800ff80b | 1,690 | 1,201 |
+| 448b8bef | 1,694 | 1,189 |
+| 2c0df08b | 1,683 | 1,197 |
+| 5c42570d | 1,690 | 1,202 |
+| dbee498f | 1,702 | 1,202 |
+| 39451078 | 1,702 (+1.6%) | 1,217 (+4.3%) |
+
+q21 steps up once, at eababf57 (the leaf's keys as one counted array; q21
+samples +1.3%, spread over `colsPick`, `Node.lower`, `drop`, `malloc`, no
+single hotspot), and later commits add nothing measurable; q1 is flat
+within code placement. The decimal, bfold, cse, x64gen and runtime commits
+are not culprits. q7 +2-3% and q12 +0.5% (not +9% and +8%) at the same
+steps. Consequences: build every TPC-H binary the same way (decide `-O` or
+not once, and write it in `bench/tpch/README.md`; the `-O` build is the
+faster one and the one the 18 Nov numbers used), and compare only
+binaries built with the same flags. The 20 Nov series of `~/tpch-w/bind/os`
+binaries (q1 near 1,950 ms) is probably all built without `-O` (only
+39451078's was checked byte for byte), so it is not comparable with the
+18 Nov record (q1 near 1,690). The q18 -21% and q10 -7% "gains" of the same
+pair were not examined here.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
