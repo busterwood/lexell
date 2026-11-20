@@ -3220,7 +3220,7 @@ fn (q: &Query) orderedLevel(items: &[]lexdb_sql.OrderItem, out: mut &[]int): int
 // A table of nothing (a level's place while levels are moved).
 fn noTable(): Table {
     return Table{name: "", tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+                 view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []}
 }
 
 // Whether a table is pinned to one row by its key's equalities with
@@ -3795,7 +3795,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         var item = lexdb_bind.noPlan()         // its plan, before its columns are renamed into the row (Sub)
         var viewName = ""
         var t = rc(Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                         view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []})
+                         view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []})
         var lateral = false
         if f.sub >= 0 {
             sc.names.frames[me].hidden = !f.lateral
@@ -3844,7 +3844,12 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             for i in 0..len(sc.works[w].cols) { append(mut &wcols, lexdb_bind.bcolOf(i, &sc.works[w].cols[i])) }
             item = lexdb_bind.LPlan.CteRef(f.work, true, wcols)
         } else {
-            let found = try findTableRc(st, txn, &f.table)
+            var tname = f.table.clone()
+            for r in sc.rn {
+                let rp = strings.split(&r, lexdb_catalog.RN_SEP)
+                if len(rp) == 3 && rp[0] == "t" && rp[1] == f.table { tname = rp[2].toStr() }
+            }
+            let found = try findTableRc(st, txn, &tname)
             if found.isNone() {
                 // a sequence: its one row (9.117), as a view of it
                 match try findSeq(st, txn, &f.table) {
@@ -3864,10 +3869,13 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 let vowner = (try readAcl(st, txn, &lexdb_catalog.relObj(&t.name))).owner
                 if len(vowner) > 0 { append(mut &sc.asRole, vowner.clone()) }
                 sc.names.frames[me].hidden = true
+                let outerRn = replace(mut &sc.rn, t.rn.clone())
                 let planning = planSub(st, txn, &vs, params, sc, false)
+                sc.rn = outerRn
                 sc.names.frames[me].hidden = false
                 if len(vowner) > 0 { let x = pop(mut &sc.asRole) }
-                var sp = try planning
+                // Oracle: a view whose query no longer plans (a table or a column it names was renamed or dropped) has errors
+                var sp = try viewPlanned(st, txn, &t, move(planning))
                 item = takeLp(mut &sp.sel)
                 viewName = t.name.toStr()
                 if len(f.cols) > len(t.cols) {
@@ -3875,7 +3883,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                                  len(f.cols).toStr() + " columns specified")))
                 }
                 var vt = Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                               view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+                               view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []}
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i].clone() } else if i < len(t.cols) { t.cols[i].name.clone() } else { sp.sel.outs[i].name.clone() }
                     var col = lexdb_sql.colDef(&name, outType(&sp.sel.outs[i]), false)
@@ -3896,6 +3904,18 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                     let tw = t.unshare()
                     tw.cols[i].name = f.cols[i].clone()
                     tw.cols[i].spell = ""
+                }
+            } else if len(sc.rn) > 0 && f.sub < 0 && f.work < 0 {
+                // in a view's query: a column renamed since is named as the query's text names it
+                for r in sc.rn {
+                    let rp = strings.split(&r, lexdb_catalog.RN_SEP)
+                    if len(rp) != 4 || rp[0] != "c" || rp[1] != t.name { continue }
+                    let ci = colIndex(&t.cols, &rp[2].toStr())
+                    if ci >= 0 {
+                        let tw = t.unshare()
+                        tw.cols[ci].name = rp[3].toStr()
+                        tw.cols[ci].spell = ""
+                    }
                 }
             }
         }
@@ -5140,6 +5160,8 @@ pub type Scope = record {
     // nothing reads (select runs the Sel): its Sel.lp is not built (a point
     // select's planning cost). Set by select, taken by planSelect.
     noLp: bool
+    // the renames (Table.rn) of the view whose query is being planned: its text's names are what they became
+    rn: []str
 }
 
 type Work = record { id: int; cols: []lexdb_sql.ColDef }
@@ -5169,7 +5191,7 @@ fn constLit(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
     var pt: []int = []
     for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
-    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false, noLp: false}
+    return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false, noLp: false, rn: []}
 }
 
 // newScope for a statement of txn's session: its default collation (L2).
@@ -5304,6 +5326,23 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
     q.refs = replace(mut &f.refs, [])
     for i in 0..len(f.subKinds) { if i < len(q.subs) { q.subs[i].kind = f.subKinds[i] } }
     for i in 0..len(f.subReads) { if i < len(q.subs) { q.subs[i].readAs = f.subReads[i] } }
+}
+
+// A view's plan, or its error: Oracle says a view whose query no longer plans (a table or a column it names was renamed or
+// dropped) has errors (ORA-04063).
+fn viewPlanned(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, planning: Result[SubPlan, DbErr]): Result[SubPlan, DbErr] {
+    match planning {
+        Ok(x) { return Ok(x) }
+        Err(pe) {
+            let ora = strings.startsWith(&t.view, lexdb_sql.ORA_VIEW)
+            let gone = pe.state == "42P01" || pe.state == "42703"
+            if ora && gone {
+                let owner = if lexdb_sql.isQual(&t.name) { lexdb_sql.schemaOf(&t.name) } else { currentRole(st, txn.sql.sess) }
+                return Err(e("ORA04063", &("view \"" + strings.toUpperAscii(&owner) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&t.name)) + "\" has errors")))
+            }
+            return Err(pe)
+        }
+    }
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
@@ -8730,11 +8769,20 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
         return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist")))
     }
+    var follow: []Follow = []
     match found {
         Some(ft) {
-            if len(ft.view) > 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is a view (use ALTER VIEW)"))) }
+            if len(ft.view) > 0 {
+                // Oracle's RENAME renames a view too
+                if s.mdialect == lexdb_sql.MD_ORA && len(s.alters) == 1 && s.alters[0].kind == lexdb_sql.A_RENAME {
+                    return renameView(st, txn, &ft, &s.alters[0].name, &s.alters[0].col.spell, false, "ALTER TABLE")
+                }
+                return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is a view (use ALTER VIEW)")))
+            }
             try needRelOwner(st, txn, &ft.name, &"table")
-            // a view keeps its query's text: names it reads may not change under it
+            // a view keeps its query's text. PostgreSQL's follow a renamed table or column (what the view records is applied
+            // after); SQL Server's and Oracle's keep their text and stop working, a retyped column changes under them; a
+            // PostgreSQL view using a retyped column, a dropped column or a moved table stops it
             for a in s.alters {
                 if a.kind == lexdb_sql.A_SET_SCHEMA && (lexdb_catalog.tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
                     return Err(e("0A000", "cannot move objects into or out of temporary schemas"))
@@ -8742,10 +8790,20 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
                    a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
                     let deps = try lexdb_catalog.dependentViews(st, txn, &ft.name)
-                    if len(deps) > 0 {
-                        return Err(e("2BP01", &("cannot alter table " + lexdb_sql.shown(&ft.name) + " because view " +
-                                     lexdb_sql.shown(&deps[0]) + " depends on it (lexdb keeps a view's text: drop the view, then make it again)")))
+                    if len(deps) == 0 { continue }
+                    let pg = s.mdialect == lexdb_sql.MD_PG
+                    if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL {
+                        if pg && a.kind == lexdb_sql.A_RENAME && len(follow) == 0 { follow = try followPlan(st, txn, &ft.name) }
+                        continue
                     }
+                    if a.kind == lexdb_sql.A_TYPE {
+                        let used = if pg { try viewUsing(st, txn, &ft.name, &a.name) } else { "" }
+                        if len(used) == 0 { continue }
+                        return Err(lexdb_base.errDetail("0A000", "cannot alter type of a column used by a view or rule",
+                                                        &("view " + lexdb_sql.baseName(&used) + " depends on column \"" + a.name + "\" of table " + lexdb_sql.baseName(&ft.name)), ""))
+                    }
+                    return Err(e("2BP01", &("cannot alter table " + lexdb_sql.shown(&ft.name) + " because view " +
+                                 lexdb_sql.shown(&deps[0]) + " depends on it (lexdb keeps a view's text: drop the view, then make it again)")))
                 }
             }
         }
@@ -8854,7 +8912,11 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
             t.spell = a.col.spell.clone()
-            if key == t.name { continue }
+            // (PostgreSQL's and Oracle's say so for the table's own name; SQL Server's sp_rename does not)
+            if key == t.name {
+                if s.mdialect == lexdb_sql.MD_TSQL { continue }
+                return Err(e("42P07", &("relation \"" + a.name + "\" already exists")))
+            }
             if try relExists(st, txn, &key) {
                 return Err(e("42P07", &("relation \"" + a.name + "\" already exists")))
             }
@@ -8868,14 +8930,16 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try lexdb_stats.moveStats(st, txn, &old, &t.name)
             try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(lexdb_catalog.CATALOG, &(idxName(&ix.name)), &key) }
+            try followApply(st, txn, &follow, &old, &key)
         } else {
             let i = colIndex(&t.cols, &a.name)
             if i < 0 { return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))) }
             if a.kind == lexdb_sql.A_RENAME_COL {
                 t.cols[i].spell = a.col.spell.clone()
-                if a.to == a.name { continue }
+                if a.to == a.name && s.mdialect == lexdb_sql.MD_TSQL { continue }
                 if colIndex(&t.cols, &a.to) >= 0 {
-                    return Err(e("42701", &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
+                    return Err(e(if s.mdialect == lexdb_sql.MD_ORA { "ORA00957" } else { "42701" },
+                                 &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
                 t.cols[i].name = a.to.clone()
                 // a filtered index's predicate names its columns
@@ -8892,6 +8956,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 for k in 0..len(t.checks) { t.checks[k].expr = renameCol(&t.checks[k].expr, &a.name, &a.to, -1) }
                 try renameFkCol(st, txn, mut &t, &a.name, &a.to)
+                if s.mdialect == lexdb_sql.MD_PG { try followColumn(st, txn, &t.name, &a.name, &a.to) }
                 let tn = t.name.clone()
                 try ownerMoved(st, txn, mut &t, &tn, &a.name, &a.to, &"")
                 for k in 0..len(pk.nn) { if pk.nn[k] == a.name { pk.nn[k] = a.to.clone() } }
@@ -15807,7 +15872,7 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_VIEW || kind == lexdb_sql.S_DROP_VIEW || kind == lexdb_sql.S_ALTER_VIEW ||
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
-           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB
+           kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB || kind == lexdb_sql.S_SP_RENAME
 }
 
 fn stmtName(kind: int): str {
@@ -15843,6 +15908,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_COPY { "COPY FROM" }
         lexdb_sql.S_MERGE { "MERGE" }
         lexdb_sql.S_ALTER_DB { "ALTER DATABASE" }
+        lexdb_sql.S_SP_RENAME { "EXECUTE" }
         else { "DELETE" }
     }
 }
@@ -15930,6 +15996,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_VIEW { return dropView(st, txn, s) }
         lexdb_sql.S_ALTER_VIEW { return alterView(st, txn, s) }
         lexdb_sql.S_ALTER_DB { return alterDatabase(st, txn, s) }
+        lexdb_sql.S_SP_RENAME { return spRename(st, txn, s, lim) }
         lexdb_sql.S_DROP_SCHEMA { return dropSchema(st, txn, s) }
         lexdb_sql.S_ALTER { return alterTable(st, txn, s, lim) }
         lexdb_sql.S_ALTER_INDEX { return alterIndex(st, txn, s) }
@@ -21863,6 +21930,199 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     return Ok(tagOnly("DROP VIEW"))
 }
 
+// ---- T-SQL's sp_rename (design/lexdb-dialect-gaps.md, package B, S10)
+
+// A name as sp_rename takes it, [db.][schema.]object[.column]: its parts, each with its brackets or quotes off and
+// folded to lower case.
+fn nameParts(t: &str): []str {
+    var parts: []str = []
+    var cur = ""
+    var i = 0
+    while i < len(t) {
+        let c = t[i]
+        if c == '[' || c == '"' {
+            let close: byte = if c == '[' { ']' } else { '"' }
+            i += 1
+            while i < len(t) {
+                if t[i] == close {
+                    if i + 1 < len(t) && t[i + 1] == close {
+                        cur.addByte(close)
+                        i += 2
+                        continue
+                    }
+                    break
+                }
+                cur.addByte(t[i])
+                i += 1
+            }
+        } else if c == '.' {
+            append(mut &parts, strings.toLowerAscii(&cur))
+            cur = ""
+        } else {
+            cur.addByte(c)
+        }
+        i += 1
+    }
+    append(mut &parts, strings.toLowerAscii(&cur))
+    return parts
+}
+
+fn tsE(n: int, msg: &str): DbErr { return e("TS" + n.toStr(), msg) }
+
+// The catalog key of the relation named by parts[0..n] (schema.name or name; dbo is public).
+fn spKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parts: &[]str, n: int): Result[str, DbErr] {
+    if n >= 2 {
+        let sc = if parts[n - 2] == "dbo" { "public" } else { parts[n - 2].toStr() }
+        return Ok(lexdb_sql.qual(&sc, &parts[n - 1]))
+    }
+    return catKey(st, txn, &parts[0], false)
+}
+
+// The name a rename gives: its key's name (folded) and its spelling.
+fn spNewName(name: &str): lexdb_sql.Alter {
+    let low = strings.toLowerAscii(name)
+    var a = lexdb_sql.alterOf(lexdb_sql.A_RENAME, &low)
+    a.col.spell = if low == name { "" } else { name.toStr() }
+    return a
+}
+
+// A column of a table renamed (sp_rename 'table.column', 'new' [, 'COLUMN']): None when there is no such table or column.
+fn spColumn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, parts: &[]str, lim: Limits): Result[Option[Res], DbErr] {
+    let n = len(parts)
+    if n < 2 || n > 4 { return Ok(None) }
+    let tkey = try spKey(st, txn, parts, n - 1)
+    let found = try findTable(st, txn, &tkey)
+    if found.isNone() { return Ok(None) }
+    let t = found.unwrap()
+    if len(t.view) > 0 { return Ok(None) }
+    let from = parts[n - 1].clone()
+    if colIndex(&t.cols, &from) < 0 { return Ok(None) }
+    let newName = s.index.clone()
+    let to = strings.toLowerAscii(&newName)
+    if colIndex(&t.cols, &to) >= 0 && to != from {
+        return Err(tsE(15335, "Error: The new name '" + newName + "' is already in use as a COLUMN name and would cause a duplicate that is not permitted."))
+    }
+    // a column a CHECK constraint names cannot be renamed: SQL Server binds the constraint's text to it
+    for c in t.checks {
+        var ns: []str = []
+        lexdb_sql.colNames(&c.expr, mut &ns)
+        for x in ns { if x == from { return Err(tsE(15336, "Object '" + s.table + "' cannot be renamed because the object participates in enforced dependencies.")) } }
+    }
+    var rs = lexdb_sql.newStmt(lexdb_sql.S_ALTER)
+    rs.table = tkey
+    rs.mdialect = lexdb_sql.MD_TSQL
+    var a = lexdb_sql.alterOf(lexdb_sql.A_RENAME_COL, &from)
+    a.to = to.clone()
+    a.col.spell = if to == newName { "" } else { newName.toStr() }
+    append(mut &rs.alters, a)
+    let r = try alterTable(st, txn, &rs, lim)
+    return Ok(Some(tagOnly("ALTER TABLE")))
+}
+
+// An index of a table renamed (sp_rename 'table.index', 'new' [, 'INDEX']): None when there is no such table or index.
+fn spIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, parts: &[]str): Result[Option[Res], DbErr] {
+    let n = len(parts)
+    if n < 2 || n > 4 { return Ok(None) }
+    let tkey = try spKey(st, txn, parts, n - 1)
+    let found = try findTable(st, txn, &tkey)
+    if found.isNone() { return Ok(None) }
+    let t = found.unwrap()
+    let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &parts[n - 1])
+    var has = false
+    for ix in t.indexes { if ix.name == ixKey { has = true } }
+    if !has && !(lexdb_catalog.hasPk(&t) && lexdb_catalog.pkConName(&t) == parts[n - 1]) { return Ok(None) }
+    let na = spNewName(&s.index)
+    if na.name == parts[n - 1] { return Ok(Some(tagOnly("ALTER INDEX"))) }
+    if try relExists(st, txn, &lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &na.name)) {
+        return Err(tsE(15335, "Error: The new name '" + s.index + "' is already in use as a INDEX name and would cause a duplicate that is not permitted."))
+    }
+    var rs = lexdb_sql.newStmt(lexdb_sql.S_ALTER_INDEX)
+    rs.index = ixKey
+    rs.mdialect = lexdb_sql.MD_TSQL
+    append(mut &rs.alters, na)
+    let r = try alterIndex(st, txn, &rs)
+    return Ok(Some(tagOnly("ALTER INDEX")))
+}
+
+// sp_rename 'name', 'new' [, 'COLUMN' | 'INDEX' | 'OBJECT']: s.table the name, s.index the new name, s.alias the type ("" none).
+fn spRename(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    let parts = nameParts(&s.table)
+    let n = len(parts)
+    let newName = s.index.clone()
+    let lowName = strings.toLowerAscii(&newName)
+    let kind = s.alias.clone()
+    let typeName = if len(kind) == 0 { "(null)" } else { strings.toUpperAscii(&kind) }
+    let notFound = tsE(15225, "No item by the name '" + s.table + "' could be found in the current database '" + lexdb_syscat.SYS_DB_NAME +
+                       "', given that @itemtype was input as '" + typeName + "'.")
+    let wrongType = tsE(15248, "Either the parameter @objname is ambiguous or the claimed @objtype (" + (if len(kind) == 0 { "OBJECT" } else { typeName }) + ") is wrong.")
+    if kind == "database" { return Err(e("0A000", "lexdb: sp_rename of a database is not supported yet")) }
+    if kind == "userdatatype" || kind == "statistics" { return Err(wrongType) }
+    if kind == "column" {
+        match try spColumn(st, txn, s, &parts, lim) {
+            Some(r) { return Ok(r) }
+            None { return Err(wrongType) }
+        }
+    }
+    if kind == "index" {
+        match try spIndex(st, txn, s, &parts) {
+            Some(r) { return Ok(r) }
+            None { return Err(wrongType) }
+        }
+    }
+    // an object: a table, a view, a constraint
+    if n <= 2 || (n == 3 && parts[0] == lexdb_syscat.SYS_DB_NAME) {
+        let key = try spKey(st, txn, &parts, n)
+        match try findTable(st, txn, &key) {
+            Some(t) {
+                if (try relExists(st, txn, &lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &lowName))) && lowName != lexdb_sql.baseName(&t.name) {
+                    return Err(tsE(15335, "Error: The new name '" + newName + "' is already in use as a OBJECT name and would cause a duplicate that is not permitted."))
+                }
+                if len(t.view) > 0 {
+                    let na = spNewName(&newName)
+                    return renameView(st, txn, &t, &na.name, &na.col.spell, false, "ALTER VIEW")
+                }
+                var rs = lexdb_sql.newStmt(lexdb_sql.S_ALTER)
+                rs.table = t.name.clone()
+                rs.mdialect = lexdb_sql.MD_TSQL
+                append(mut &rs.alters, spNewName(&newName))
+                let r = try alterTable(st, txn, &rs, lim)
+                return Ok(tagOnly("ALTER TABLE"))
+            }
+            None {}
+        }
+        // a constraint of that name (in the schema's tables)
+        let sc = lexdb_sql.schemaOf(&key)
+        let cn = lexdb_sql.baseName(&key)
+        for t in try allTables(st, txn) {
+            if lexdb_sql.schemaOf(&t.name) != sc || !conTaken(&t, &cn) { continue }
+            if conTaken(&t, &lowName) && lowName != cn {
+                return Err(tsE(15335, "Error: The new name '" + newName + "' is already in use as a OBJECT name and would cause a duplicate that is not permitted."))
+            }
+            var rs = lexdb_sql.newStmt(lexdb_sql.S_ALTER)
+            rs.table = t.name.clone()
+            rs.mdialect = lexdb_sql.MD_TSQL
+            var a = lexdb_sql.alterOf(lexdb_sql.A_RENAME_CON, &cn)
+            a.to = lowName.clone()
+            append(mut &rs.alters, a)
+            let r = try alterTable(st, txn, &rs, lim)
+            return Ok(tagOnly("ALTER TABLE"))
+        }
+    }
+    // without a type, table.column and table.index are names too
+    if len(kind) == 0 {
+        match try spColumn(st, txn, s, &parts, lim) {
+            Some(r) { return Ok(r) }
+            None {}
+        }
+        match try spIndex(st, txn, s, &parts) {
+            Some(r) { return Ok(r) }
+            None {}
+        }
+        return Err(notFound)
+    }
+    return Err(wrongType)
+}
+
 // T-SQL's ALTER DATABASE ... SET: the settings kept in a catalog row (lexdb_dbopt), shown by sys.databases.
 // lexdb has the one database, which CURRENT and its own name mean.
 fn alterDatabase(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -21876,7 +22136,157 @@ fn alterDatabase(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     return Ok(tagOnly("ALTER DATABASE"))
 }
 
-// ALTER VIEW name RENAME TO new: refused while another view reads it.
+// ---- renames and the views that read what is renamed (design/lexdb-dialect-gaps.md, package B)
+//
+// PostgreSQL's views follow ALTER TABLE ... RENAME and ALTER VIEW ... RENAME TO, and a column's
+// RENAME COLUMN: a view keeps working, and its output columns keep their names. lexdb keeps a
+// view's query as text, so the view records what was renamed (Table.rn: the table a name in its
+// text means now, the column a name in its text means now) and its query is planned with those
+// names (Scope.rn). SQL Server's and Oracle's views are not followed: they keep their text and
+// stop working (T-SQL: 208, 207; Oracle: ORA-04063) until the names are back.
+
+// A view that reads a relation about to be renamed: the names its text gives that relation.
+type Follow = record { view: str; names: []str }
+
+// The tables a statement's FROM items name (its subqueries' too) that are relation old (by a name
+// in the text of a view with renames rn).
+fn viewTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, rn: &[]str, old: &str, out: mut &[]str): Result[Unit, DbErr] {
+    for f in s.from {
+        if f.sub >= 0 || f.work >= 0 || len(f.table) == 0 { continue }
+        var eff = ""
+        for r in rn {
+            let rp = strings.split(&r, lexdb_catalog.RN_SEP)
+            if len(rp) == 3 && rp[0] == "t" && rp[1] == f.table { eff = rp[2].toStr() }
+        }
+        if len(eff) == 0 { eff = try catKey(st, txn, &f.table, false) }
+        if eff == old && !lexdb_base.hasStr(out, &f.table) { append(out, f.table.clone()) }
+    }
+    for q in s.subs { try viewTables(st, txn, &q, rn, old, out) }
+    for q in s.inner { try viewTables(st, txn, &q, rn, old, out) }
+    return Ok(Unit{})
+}
+
+// The views reading relation old, directly, with the names of their text for it (before it is renamed).
+fn followPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str): Result[[]Follow, DbErr] {
+    var out: []Follow = []
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if !lexdb_base.hasStr(&v.deps, old) { continue }
+        var names: []str = []
+        let ss = try lexdb_parse.parseView(&v.view)
+        for q in ss { try viewTables(st, txn, &q, &v.rn, old, mut &names) }
+        append(mut &out, Follow{view: v.name.clone(), names: names})
+    }
+    return Ok(out)
+}
+
+fn putView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, v: &Table, deps: &[]str, rn: &[]str): Result[Unit, DbErr] {
+    try txn.put(lexdb_catalog.CATALOG, &v.name, &(lexdb_catalog.encViewRn(&v.cols, &v.view, deps, &v.spell, rn)))
+    try bumpFor(st, txn, &v.name)
+    return Ok(Unit{})
+}
+
+// Relation old is now new: its views follow.
+fn followApply(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, plan: &[]Follow, old: &str, new: &str): Result[Unit, DbErr] {
+    for p in plan {
+        let raw = (try st.get(txn, lexdb_catalog.CATALOG, &p.view)).unwrap()
+        let v = lexdb_catalog.decView(&p.view, &raw)
+        var deps: []str = []
+        for d in v.deps { append(mut &deps, if d == old { new.toStr() } else { d.clone() }) }
+        var rn: []str = []
+        for r in v.rn {
+            var rp = strings.split(&r, lexdb_catalog.RN_SEP)
+            if len(rp) == 3 && rp[0] == "t" && rp[2] == old { append(mut &rn, "t" + lexdb_catalog.RN_SEP + rp[1] + lexdb_catalog.RN_SEP + new) }
+            else if len(rp) == 4 && rp[0] == "c" && rp[1] == old { append(mut &rn, "c" + lexdb_catalog.RN_SEP + new + lexdb_catalog.RN_SEP + rp[2] + lexdb_catalog.RN_SEP + rp[3]) }
+            else { append(mut &rn, r.clone()) }
+        }
+        for n in p.names {
+            var have = false
+            for r in rn {
+                let rp = strings.split(&r, lexdb_catalog.RN_SEP)
+                if len(rp) == 3 && rp[0] == "t" && rp[1] == n { have = true }
+            }
+            if !have { append(mut &rn, "t" + lexdb_catalog.RN_SEP + n + lexdb_catalog.RN_SEP + new) }
+        }
+        try putView(st, txn, &v, &deps, &rn)
+    }
+    return Ok(Unit{})
+}
+
+// Column from of table key is now to: the views reading the table follow.
+fn followColumn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, from: &str, to: &str): Result[Unit, DbErr] {
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if !lexdb_base.hasStr(&v.deps, key) { continue }
+        var rn: []str = []
+        var found = false
+        for r in v.rn {
+            let rp = strings.split(&r, lexdb_catalog.RN_SEP)
+            if len(rp) == 4 && rp[0] == "c" && rp[1] == key && rp[2] == from {
+                append(mut &rn, "c" + lexdb_catalog.RN_SEP + key + lexdb_catalog.RN_SEP + to + lexdb_catalog.RN_SEP + rp[3])
+                found = true
+            } else {
+                append(mut &rn, r.clone())
+            }
+        }
+        if !found { append(mut &rn, "c" + lexdb_catalog.RN_SEP + key + lexdb_catalog.RN_SEP + to + lexdb_catalog.RN_SEP + from) }
+        try putView(st, txn, &v, &v.deps, &rn)
+    }
+    return Ok(Unit{})
+}
+
+// Whether a statement's query names column col (by itself or as any qualifier's), or takes every column (*).
+fn queryUses(s: &lexdb_sql.Stmt, col: &str): bool {
+    var names: []str = []
+    for it in s.items {
+        if it.star { return true }
+        match it.expr {
+            Some(x) { lexdb_sql.colNames(&x, mut &names) }
+            None {}
+        }
+    }
+    match s.where { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
+    match s.having { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
+    for x in s.group { lexdb_sql.colNames(&x, mut &names) }
+    for o in s.order { lexdb_sql.colNames(&o.expr, mut &names) }
+    for f in s.from {
+        match f.on { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
+        for u in f.using { append(mut &names, u.clone()) }
+        if f.natural { return true }
+    }
+    for n in names { if n == col || strings.endsWith(&n, &("." + col)) { return true } }
+    for q in s.subs { if queryUses(&q, col) { return true } }
+    for q in s.inner { if queryUses(&q, col) { return true } }
+    return false
+}
+
+// A view reading table key that uses its column col (PostgreSQL refuses a retyped or dropped column then): its name, or "".
+fn viewUsing(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, col: &str): Result[str, DbErr] {
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if !lexdb_base.hasStr(&v.deps, key) { continue }
+        let ss = try lexdb_parse.parseView(&v.view)
+        for q in ss { if queryUses(&q, col) { return Ok(v.name.clone()) } }
+    }
+    return Ok("")
+}
+
+// A view renamed: its row moves to the new key, and (PostgreSQL's) the views reading it follow.
+fn renameView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, name: &str, spell: &str, follow: bool, tag: &str): Result[Res, DbErr] {
+    try needRelOwner(st, txn, &t.name, &"view")
+    let to = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), name)
+    if to == t.name { return Ok(tagOnly(tag)) }
+    if try relExists(st, txn, &to) { return Err(e("42P07", &("relation \"" + name + "\" already exists"))) }
+    var plan: []Follow = []
+    if follow { plan = try followPlan(st, txn, &t.name) }
+    let raw = (try st.get(txn, lexdb_catalog.CATALOG, &t.name)).unwrap()
+    let v = lexdb_catalog.decView(&t.name, &raw)
+    txn.del(lexdb_catalog.CATALOG, &t.name)
+    try txn.put(lexdb_catalog.CATALOG, &to, &(lexdb_catalog.encViewRn(&v.cols, &v.view, &v.deps, spell, &v.rn)))
+    try moveAcl(st, txn, &lexdb_catalog.relObj(&t.name), &lexdb_catalog.relObj(&to))
+    try followApply(st, txn, &plan, &t.name, &to)
+    try bumpFor(st, txn, &to)
+    return Ok(tagOnly(tag))
+}
+
+// ALTER VIEW name RENAME TO new: the views reading it follow.
 fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let found = try findTable(st, txn, &s.table)
     if found.isNone() {
@@ -21888,20 +22298,7 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     }
     let t = found.unwrap()
     if len(t.view) == 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a view"))) }
-    try needRelOwner(st, txn, &t.name, &"view")
-    let deps = try lexdb_catalog.dependentViews(st, txn, &t.name)
-    if len(deps) > 0 {
-        return Err(e("2BP01", &("cannot rename view " + lexdb_sql.shown(&t.name) + " because view " + lexdb_sql.shown(&deps[0]) +
-                     " depends on it (lexdb keeps a view's text)")))
-    }
-    let to = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)
-    if try relExists(st, txn, &to) { return Err(e("42P07", &("relation \"" + s.index + "\" already exists"))) }
-    let v = (try st.get(txn, lexdb_catalog.CATALOG, &t.name)).unwrap()
-    txn.del(lexdb_catalog.CATALOG, &t.name)
-    try txn.put(lexdb_catalog.CATALOG, &to, &v)
-    try moveAcl(st, txn, &lexdb_catalog.relObj(&t.name), &lexdb_catalog.relObj(&to))
-    try bumpFor(st, txn, &to)
-    return Ok(tagOnly("ALTER VIEW"))
+    return renameView(st, txn, &t, &s.index, &"", true, "ALTER VIEW")
 }
 
 // ---- privileges (9.83)

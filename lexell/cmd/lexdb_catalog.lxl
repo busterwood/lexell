@@ -47,6 +47,9 @@ pub type Table = record {
     // the relations it reads; its cols are its output columns.
     pub view: str
     pub deps: []str
+    // A view's renames since it was made (PostgreSQL's views follow ALTER TABLE ... RENAME): "t" + SEP + name as its text has the
+    // table + SEP + the table's key now; "c" + SEP + the table's key now + SEP + the column's name now + SEP + its name in the text
+    pub rn: []str
     // A temporary table's ON COMMIT (lexdb_sql.ONC_*, 9.96): kept for
     // DELETE ROWS and DROP
     pub onCommit: int
@@ -77,7 +80,7 @@ pub type ForeignKey = record {
 
 pub fn emptyTable(name: &str): Table {
     return Table{name: name.toStr(), tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+                 view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []}
 }
 
 // t's layout, lent to lexdb_access.
@@ -1062,7 +1065,11 @@ pub fn allSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Res
     return Ok(out)
 }
 
-pub fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str): str {
+pub const RN_SEP: str = "\x1e"
+
+pub fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str): str { return encViewRn(cols, text, deps, spell, &[]) }
+
+pub fn encViewRn(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str, rn: &[]str): str {
     var b = ""
     b += &VIEW_MARK
     var names: []str = []
@@ -1078,8 +1085,9 @@ pub fn encView(cols: &[]lexdb_sql.ColDef, text: &str, deps: &[]str, spell: &str)
     addStrs(mut &b, &mods)
     addStrs(mut &b, &[text.toStr()])
     addStrs(mut &b, deps)
-    // then its name as written, if that is not its key's (L6)
-    if len(spell) > 0 { addStr(mut &b, spell) }
+    // then its name as written, if that is not its key's (L6); its renames after it
+    if len(spell) > 0 || len(rn) > 0 { addStr(mut &b, spell) }
+    if len(rn) > 0 { addStrs(mut &b, rn) }
     return b
 }
 
@@ -1112,7 +1120,11 @@ pub fn decView(name: &str, s: &str): Table {
     at += strsLen(&text)
     t.deps = strsAt(s, at)
     at += strsLen(&t.deps)
-    if at + 4 <= len(s) { t.spell = strAt(s, at) }
+    if at + 4 <= len(s) {
+        t.spell = strAt(s, at)
+        at += 4 + len(t.spell)
+        if at + 4 <= len(s) { t.rn = strsAt(s, at) }
+    }
     t.tree = -1
     t.view = if len(text) > 0 { text[0].clone() } else { "select" }
     for i in 0..len(names) {

@@ -2966,6 +2966,7 @@ fn (p: mut &P) alterDatabase(): Result[Stmt, lexdb_base.DbErr] {
 // DEFAULT, and the identity forms (9.117).
 fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_ALTER)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.acceptKw("if") {
         try p.expectKw("exists")
         s.ifFlag = true
@@ -2977,6 +2978,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.alters, lexdb_sql.alterOf(A_SET_SCHEMA, &(try p.name())))
         return Ok(s)
     }
+    // SQL Server renames with sp_rename: ALTER TABLE has no RENAME
+    if p.tsql && p.isKw("rename") { return Err(near(&p.peek())) }
     if p.acceptKw("rename") {
         // the new name's spelling in col.spell (L6)
         var sp = lexdb_sql.noCol()
@@ -2996,6 +2999,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             return Ok(s)
         }
         let c = p.acceptKw("column")
+        // Oracle's RENAME without COLUMN is a partition's
+        if p.ora && !c { return Err(lexdb_base.err("ORA14155", "missing PARTITION or SUBPARTITION keyword")) }
         let from = try p.name()
         try p.expectKw("to")
         let to = try p.name()
@@ -5909,6 +5914,19 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "delete" { return p.delete() }
         "merge" { return p.merge() }
         "truncate" { return p.truncate() }
+        "rename" {
+            // Oracle's RENAME old TO new: a table, view or sequence (design/lexdb-dialect-gaps.md, package B)
+            if !p.ora { return Err(near(&t)) }
+            var s = lexdb_sql.newStmt(S_ALTER)
+            s.mdialect = MD_ORA
+            s.table = try p.rname()
+            try p.expectKw("to")
+            let to = try p.name()
+            var a = lexdb_sql.alterOf(A_RENAME, &to)
+            a.col.spell = p.spelled.clone()
+            append(mut &s.alters, a)
+            return Ok(s)
+        }
         "vacuum", "analyze", "analyse", "checkpoint", "reindex", "cluster" { return p.maint(&t.text) }
         "copy" { return p.copyStmt() }
         "create" {
