@@ -1,0 +1,211 @@
+// lexdb_plan: subquery unnesting, the second half (optimizer 51). Each
+// query runs with the new levels (setUnnest(all)), with the plans before
+// them (setUnnest(7): 5a-5c only), and each of them with batches off (the
+// row engine): the same rows (sorted, unless it orders them) or the same
+// error. "made": per query, y when its EXPLAIN shows the new level;
+// "piped": whether a run with the new plan went through the pipeline's
+// joins.
+// - scalar (5d): a correlated scalar aggregate in WHERE, the select list
+//   and ORDER BY as a grouped level LEFT joined on its keys: hashed as 9.9
+//   planned it (no index on the key), or planned again and taken by cost
+//   (an index on the key, many outer rows), or per row (few outer rows);
+//   count, count(*), sum, avg, min, max and expressions over them (count's
+//   0 and the others' NULL for a key with no rows; an expression whose value
+//   over no rows is not NULL), NULL keys on both sides, an empty inner
+//   table, duplicates, two keys, a text key, two in one conjunct, under OR,
+//   after a join, a grouped outer query, LIMIT and ORDER BY outside, errors
+//   in the aggregate's argument (run once already; or stays per row) and in
+//   the expression over it (per outer row, as a run per row).
+// timeout: 120
+// expect: create table t1 (id int primary key, a int, b text, c int, d numeric) -> CREATE TABLE
+// expect: insert into t1 select g, case when g % 23 = 0 then null else g % 50 end, case when g % 19 = 0 then null else 'b' || (g % 30) end, case when g % 29 = 0 then null else g % 40 end, (g % 7) * 1.5 from generate_series(1, 3000) g -> INSERT 0 3000
+// expect: create table t2 (id int primary key, k int, v int, s text, w int) -> CREATE TABLE
+// expect: insert into t2 select g, case when g % 31 = 0 then null else g % 35 end, case when g % 37 = 0 then null else (g * 7) % 45 end, case when g % 41 = 0 then null else 'b' || (g % 25) end, g % 3 from generate_series(1, 800) g -> INSERT 0 800
+// expect: create index t2k on t2 (k) -> CREATE INDEX
+// expect: create table t3 (id int primary key, k int, v int, s text) -> CREATE TABLE
+// expect: insert into t3 select g, case when g % 17 = 0 then null else g % 30 end, case when g % 13 = 0 then null else (g * 11) % 48 end, case when g % 11 = 0 then null else 'b' || (g % 33) end from generate_series(1, 300) g -> INSERT 0 300
+// expect: create table nn (id int primary key, k int, v int not null, s text not null) -> CREATE TABLE
+// expect: insert into nn select g, g % 20, (g * 3) % 40, 'b' || (g % 20) from generate_series(1, 200) g -> INSERT 0 200
+// expect: create table e (id int primary key, k int, v int, s text) -> CREATE TABLE
+// expect: analyze -> ANALYZE
+// expect: scalar: 36 queries, 36 the same, made yyyyyyyyyyyynyyyyyyyyyyyyyynnyyyyyyn, piped yyyyyyyyyyyynyyyyyyyynyyyyynnyyyyyyn
+// expect: over no rows, lazily: 1565, as a join: 1565, the plan before: ERROR 22012
+// expect: plan scalar hashed: scan t1: full scan; left join subquery 1: hash on (k) over rows of subquery 1; aggregate; subquery 1 (scalar): grouped on t3.k = t1.c, run once;   scan t3: full scan;   aggregate
+// expect: plan scalar by cost: scan t1: full scan; left join subquery 1: hash on (k) over rows of subquery 1; aggregate; subquery 1 (scalar): grouped on t2.k = t1.c, run once;   scan t2: full scan;   aggregate
+// expect: plan scalar per row: scan t1: primary key range; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup, index only;   aggregate
+// expect: plan scalar select list: scan t1: primary key range; left join subquery 1: hash on (k) over rows of subquery 1; order: the scan's; subquery 1 (scalar): grouped on t3.k = t1.c, run once;   scan t3: full scan;   aggregate
+// expect: plan scalar argument may fail: scan t1: full scan; aggregate; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup, rows in key order;   aggregate
+// expect: plan scalar rules: scan t1: full scan; aggregate; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup;   aggregate
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_pipe"
+import "collections"
+import "strings"
+
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn show(s: mut &lexdb_exec.Session, sql: str) { println(sql + " -> " + run(s, &sql)) }
+
+// EXPLAIN's lines, in one.
+fn planOf(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(&("explain " + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for i in 0..len(r.rows) { append(mut &lines, lexdb_sql.text(&r.rows[i][0])) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+type Group = record { name: str; word: str; n: int; same: int; made: str; piped: str; seen: []str }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, made: "", piped: "", seen: []} }
+
+const ALL: int = 15
+const BEFORE: int = 7
+
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    lexdb_plan.setUnnest(ALL)
+    let j0 = lexdb_pipe.joinCounts()[0]
+    let on = run(s, sql)
+    let j1 = lexdb_pipe.joinCounts()[0]
+    let p = planOf(s, sql)
+    lexdb_plan.setUnnest(BEFORE)
+    let off = run(s, sql)
+    let x = run(s, &"set lexdb_batch = off")
+    let offRows = run(s, sql)
+    lexdb_plan.setUnnest(ALL)
+    let onRows = run(s, sql)
+    let y = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off && on == offRows && on == onRows {
+        g.same += 1
+    } else if len(g.seen) < 6 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  new: " + on + "\n  old: " + off + "\n  old, rows: " + offRows + "\n  new, rows: " + onRows + "\n  plan: " + p)
+    }
+    g.made += if strings.contains(&p, &g.word) { "y" } else { "n" }
+    g.piped += if j1 > j0 { "y" } else { "n" }
+}
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, made " + g.made + ", piped " + g.piped)
+    for x in g.seen { println(x) }
+}
+
+fn planBefore(s: mut &lexdb_exec.Session, sql: &str): str {
+    lexdb_plan.setUnnest(BEFORE)
+    let r = run(s, sql)
+    lexdb_plan.setUnnest(ALL)
+    return r
+}
+
+fn explain(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    lexdb_plan.setUnnest(ALL)
+    println("plan " + label + ": " + planOf(s, sql))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    // t1: 3000 rows (a NULL every 23rd, b every 19th, c every 29th; c's
+    // values 0-39, t3's keys 0-29: keys with no inner rows); t2: 800, an
+    // index on k; t3: 300, no index; nn: no NULL; e: empty
+    show(mut &s, "create table t1 (id int primary key, a int, b text, c int, d numeric)")
+    show(mut &s, "insert into t1 select g, case when g % 23 = 0 then null else g % 50 end, case when g % 19 = 0 then null else 'b' || (g % 30) end, case when g % 29 = 0 then null else g % 40 end, (g % 7) * 1.5 from generate_series(1, 3000) g")
+    show(mut &s, "create table t2 (id int primary key, k int, v int, s text, w int)")
+    show(mut &s, "insert into t2 select g, case when g % 31 = 0 then null else g % 35 end, case when g % 37 = 0 then null else (g * 7) % 45 end, case when g % 41 = 0 then null else 'b' || (g % 25) end, g % 3 from generate_series(1, 800) g")
+    show(mut &s, "create index t2k on t2 (k)")
+    show(mut &s, "create table t3 (id int primary key, k int, v int, s text)")
+    show(mut &s, "insert into t3 select g, case when g % 17 = 0 then null else g % 30 end, case when g % 13 = 0 then null else (g * 11) % 48 end, case when g % 11 = 0 then null else 'b' || (g % 33) end from generate_series(1, 300) g")
+    show(mut &s, "create table nn (id int primary key, k int, v int not null, s text not null)")
+    show(mut &s, "insert into nn select g, g % 20, (g * 3) % 40, 'b' || (g % 20) from generate_series(1, 200) g")
+    show(mut &s, "create table e (id int primary key, k int, v int, s text)")
+    show(mut &s, "analyze")
+    var g = newGroup(&"scalar", &"left join subquery")
+    let qs = [
+        // hashed as 9.9 planned it (t3: no index)
+        "select count(*), sum(a) from t1 where a > (select count(*) from t3 where t3.k = t1.c)",
+        "select count(*), sum(a) from t1 where a >= (select count(t3.v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(a) from t1 where a > (select sum(v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where d < (select avg(v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where a = (select max(v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where a <= (select min(v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select 0.5 * sum(v) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select count(*) + 20 from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select coalesce(sum(v), -1) from t3 where t3.k = t1.c)",
+        "select count(*), sum(id) from t1 where (select count(*) from t3 where t3.k = t1.c) = 0",
+        "select count(*), sum(id) from t1 where (select sum(v) from t3 where t3.k = t1.c) is null",
+        "select count(*), sum(id) from t1 where a > (select sum(v) from t3 where t3.k = t1.c and t3.v > 10)",
+        "select count(*), sum(id) from t1 where a > (select count(*) from t3 where t3.k = t1.c and t3.v = t1.a % 48)",
+        "select count(*), sum(id) from t1 where c < (select count(*) from e where e.k = t1.c)",
+        "select count(*), sum(id) from t1 where (select sum(v) from e where e.k = t1.c) is null and id < 100",
+        "select count(*), sum(id) from t1 where (select count(*) from t3 where t3.s = t1.b) > 1",
+        "select count(*), sum(id) from t1 where (select count(*) from t3 where t3.k = t1.c) > (select count(*) from nn where nn.k = t1.a)",
+        "select count(*), sum(id) from t1 where a = 1 or a > (select count(*) from t3 where t3.k = t1.c)",
+        "select count(*) from t1 join nn on nn.id = t1.id where t1.a > (select count(*) from t3 where t3.k = nn.k)",
+        "select a, count(*) from t1 where a > (select count(*) from t3 where t3.k = t1.c) group by a order by a",
+        "select id, a from t1 where a > (select max(v) from t3 where t3.k = t1.c) order by id desc limit 7",
+        // errors: in the aggregate's argument (9.9 ran it once already), in the expression over it
+        "select count(*) from t1 where a > (select sum(10 / v) from t3 where t3.k = t1.c)",
+        "select count(*) from t1 where a > (select 100 / count(*) from t3 where t3.k = t1.c)",
+        // an index on the key: planned again, by cost (3000 outer rows), or per row (few)
+        "select count(*), sum(id) from t1 where a > (select sum(v) from t2 where t2.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select count(*) from t2 where t2.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select 0.2 * avg(v) from t2 where t2.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select 1000 / sum(v) from t2 where t2.k = t1.c)",
+        "select count(*), sum(id) from t1 where a > (select sum(10 / (v - 3)) from t2 where t2.k = t1.c)",
+        "select id, a from t1 where id < 6 and a > (select count(*) from t2 where t2.k = t1.c) order by id",
+        // the select list and ORDER BY
+        "select id, (select count(*) from t3 where t3.k = t1.c) from t1 where id < 60 order by id",
+        "select id, (select sum(v) from t3 where t3.k = t1.c), (select max(v) from t3 where t3.k = t1.a) from t1 where id < 60 order by id",
+        "select id, (select count(*) + 1 from t3 where t3.k = t1.c) as n from t1 where id between 100 and 160 order by n desc, id",
+        "select id from t1 where id < 300 order by (select sum(v) from t3 where t3.k = t1.c) desc nulls last, id limit 10",
+        "select id, (select sum(v) from t2 where t2.k = t1.c) from t1 order by id limit 40",
+        "select distinct (select count(*) from t3 where t3.k = t1.c) from t1",
+        "select c, (select count(*) from t3 where t3.k = t1.c) from t1 group by c order by c",
+    ]
+    for x in qs { check(mut &s, mut &g, &x) }
+    report(&g)
+    // every key of these rows has a group: a run per row divides by no 0; 9.9's
+    // hashed probe (the plan before) evaluated the value over no rows once,
+    // eagerly (22012); the level evaluates it only for a key with no group
+    lexdb_plan.setUnnest(ALL)
+    println("over no rows, lazily: " + run(mut &s, &"select count(*) from t1 where c < 30 and a > (select 100 / count(v) from t3 where t3.k = t1.c and t3.v is not null)") +
+            ", as a join: " + run(mut &s, &"select count(*) from t1 join (select k, count(v) n from t3 where v is not null group by k) g on g.k = t1.c where t1.c < 30 and t1.a > 100 / g.n") +
+            ", the plan before: " + planBefore(mut &s, &"select count(*) from t1 where c < 30 and a > (select 100 / count(v) from t3 where t3.k = t1.c and t3.v is not null)"))
+    explain(mut &s, &"scalar hashed", &"select count(*) from t1 where a > (select count(*) from t3 where t3.k = t1.c)")
+    explain(mut &s, &"scalar by cost", &"select count(*) from t1 where a > (select 0.2 * avg(v) from t2 where t2.k = t1.c)")
+    explain(mut &s, &"scalar per row", &"select id from t1 where id < 6 and a > (select count(*) from t2 where t2.k = t1.c)")
+    explain(mut &s, &"scalar select list", &"select id, (select count(*) from t3 where t3.k = t1.c) from t1 where id < 60 order by id")
+    explain(mut &s, &"scalar argument may fail", &"select count(*) from t1 where a > (select sum(10 / (v - 3)) from t2 where t2.k = t1.c)")
+    let r = run(mut &s, &"set lexdb_planner = rules")
+    explain(mut &s, &"scalar rules", &"select count(*) from t1 where a > (select 0.2 * avg(v) from t2 where t2.k = t1.c)")
+    let r2 = run(mut &s, &"set lexdb_planner = cost")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
