@@ -3542,3 +3542,265 @@ Q5 +0.073% (+118 instructions a select); measured one piece at a time, the large
 +21. With `SubPlan.view`, WHERE passed to `planFrom` and the CTE marks
 made on the statement in `out`: +0.009% (+14).
 
+## 49. Bushy joins: a hash of a join (2026-11-20)
+
+Item Q6 of lexdb-layers.md 6.3. The join search (sections 26-30) builds
+left-deep orders only: each table after the first is looked up per row or
+read once and hashed, alone. PostgreSQL's plans for TPC-H's
+multi-dimension joins hash a join instead (lexdb-tpch-perf.md, "Bushy
+plans"): q7 hashes supplier joined to its nation and customer joined to
+its nation, q5 and q8 the region's customers (region, nation, customer),
+q21 supplier joined to nation. lexdb's left-deep answer to two of them is
+`reduceHashes` (lexdb-layers.md 6.2.13: a hash cut by the next level's
+hash, q7 and q21), which needs the two hashes adjacent and joined by one
+integer key; q7's customer is looked up per row instead (146k lookups,
+about 1.6 us each), because a hash of all 150k customers costs more than
+the lookups in the model.
+
+### 49.1 The shape
+
+One bushy shape, the one that pays: **a hash whose build side is a join.**
+A *build group* is a hub table h and one or two member tables S, joined
+inside the build by hash joins (h read first, each member hashed and
+probed by h's rows, then by the next member's); the joined rows h ⋈ S are
+hashed by their key columns and probed by the rows of the tables placed
+before the group, as any hash join is. The probe side stays left-deep, and
+tables after the group join its rows as they join any level's. Examples:
+q7's (customer, nation n2) probed by `o_custkey`; q21's (supplier, nation)
+probed by `l_suppkey`; q5's (customer, nation, region) probed by
+`o_custkey`.
+
+Not done: a build side that is itself bushy, a group whose members are
+looked up per row (a member is always hashed: its tables are dimensions),
+more than two members (`GRP_MAX`), a group whose tables are not next to
+each other in the left-deep order the search chose (49.3), a general DP
+over connected subsets (DPccp).
+
+### 49.2 When a group is valid
+
+- **Inner joins only.** The cost search (section 26) runs only when every
+  join is inner (after 48.2's conversion); a query with an outer join
+  keeps FROM's order (section 41), so no group crosses or nests in an
+  outer join.
+- **Plain tables:** every level of the search is one already (no derived
+  table, LATERAL, lock); not in a query with outer values (a correlated
+  subquery's), nor in one with a correlated subquery that stays one (in
+  WHERE, not a semi or anti join's candidate: q2's): the pipeline does not
+  run those joins (`grpRuns`). A semi or anti level that `semiJoins`
+  would place inside a group goes after its last member.
+- **A key:** some column of the group equals (written or implied) a
+  column of a table placed before it, a plain column on each side; each
+  member equals a column of the hub or an earlier member the same way
+  (its key in the build). A key under a collation (`#ci(x) = #ci(y)`) is
+  checked per candidate, not hashed.
+- **No error moved.** The build evaluates the group's join conditions on
+  every pair of its tables' rows, where the left-deep order evaluates them
+  only on rows the earlier tables joined; and a condition between the
+  earlier tables and the hub is evaluated only on hub rows the members
+  kept. So every conjunct reading a group's table and another table must
+  be one that cannot fail (`cannotFail`, with the char and collation
+  wrappers the binder adds, `#bptrim`, `#pad`, `#ci`, which cannot fail
+  either). A table's own conditions are evaluated on all its rows in both
+  plans (a hash reads its whole table by its constants). Two tables'
+  own conditions that both fail fail in both plans, perhaps with the
+  other table's error (as with any join order).
+- **Memory:** the group's rows (estimated) times its tables' row bytes,
+  and each member's hash, within the cap a hash has (section 29's review:
+  half the statement's memory, 64 MB at most).
+- **Not** where reading may stop early (`lookups`: a hash is built
+  whole), not under `SET lexdb_planner = rules`, not in a transaction
+  whose reads are noted (the cost search does not run there).
+
+### 49.3 The search and the cost
+
+**A pass over the order the search chose** (`grpPass`, after the exact
+search or the N-best one, and after section 32's ORDER BY ... LIMIT
+choice, which keeps lookups and takes no group). A join step's cost depends
+only on the set before it and the table added, so a run of the order (a
+hub at place i, the one or two tables after it as its members) can be
+replaced by one group at the same place without changing what the steps
+after it cost: the plan's cost becomes the order's, minus the run's steps,
+plus the group's. Every run whose members are linked to the hub or the
+member before by an equality, and the group to the set before by one, is
+costed; a run is a candidate when the group costs less than the steps it
+replaces (a member that was looked up per row, or the hub's lookups, count
+as the order costed them); the candidates gaining most are taken, not
+overlapping, **when the plan with them costs under `GRP_GAIN` (0.9) of the
+order's.** Near-ties keep the left-deep plan: a group's rows are a join's
+estimate and its build reads its hub whole. Under `BU_FORCE` every valid
+run is taken, first come first.
+
+First built (and measured: 49.8) as part of the exact search: from each
+set reached, a group added at once, the DP taking it as any extension.
+That found the same TPC-H plans, but an 8-table star with implied
+equalities (every pair linked) tried a group per set, hub and member pair:
+planning went from 246 to 2,065 us. The pass costs at most a few dozen
+groups per statement.
+
+The group's cost, in the model's units, with rows(X) section 26's rows of
+a set (`setRows`: by the lowest table, any set), rin the rows of the set
+placed and G the group:
+
+- the hub read by its constants and hashed, as a left-deep hash's table is
+  priced (`base.inner`, section 45's row-by-row read);
+- each member m joined to the build's rows so far (P): hashed and probed,
+  as `joinStep` prices a hash: `base.inner + rows(m) * HASH_BUILD +
+  rows(P) * HASH_PROBE + rows(P + m) * ROW_COST`;
+- the build's rows hashed: `rows(G) * HASH_BUILD`;
+- the probes: `rin * HASH_PROBE + rows(set + G) * ROW_COST`.
+
+So a group wins by its shape alone: the members are probed by the hub's
+rows instead of the set's joined rows, and the hash holds the hub's rows
+the members keep. **The hub's read priced as a row read one by one is
+deliberate.** The pipeline reads every hashed table in batches since P2, a
+left-deep hash's too, so `base.inner` (44 a row) overprices both; the
+first build priced the hub alone at the first table's batched cost
+(`base.cost`, 1 a row), and that let a group win against plans whose own
+hash was still priced row by row: exec_joincost's `mid m join big b join
+small s where s.label = 'x'` went from small's index (1 row), big's index
+(200 lookups) and a hash of mid (163 us) to a full scan of big probing a
+group of (mid, small) (475 us). Re-pricing the hashed read for the
+pipeline is its own item (it moves left-deep plans as well; q7's customer
+would then be hashed left-deep too).
+
+Memory: each member's estimated rows times its row's bytes, and the
+group's rows times its tables' row bytes, within the cap.
+
+Planning time (`design/experiments/plan_time.lxl`, changed to switch
+`setBushy`, in process, `-O`, microseconds per EXPLAIN, two rounds):
+point select 11-12 either way; 4 tables 66 / 67; 6-table star 122 / 126;
+8 tables 122 / 126; 8-table star 260 / 267; 12 tables 203 / 212 (left-deep
+/ with the pass).
+
+### 49.4 How the pipeline runs it
+
+`PJoin.how = JH_JOIN` (lexdb_plan): its `scan` is the hub's, `build` the
+hub's own conditions, `sub` the members' joins (each a `JH_HASH` arm over
+the hub's rows, its keys reading the group's tables only), `hcols` the key
+columns as the query's slots (any of the group's tables), `keys` their
+values (the tables before), `conds` every conjunct between the group and
+the tables before (the keys' equalities among them, as a hash's).
+`joinsOver` builds it from the levels' conditions; the levels themselves
+stay a left-deep chain (49.5).
+
+`lexdb_pipe.joinSetup` builds the hash by running the build as a join of
+its own (`joinRows` over Filter? (Scan hub) and the members' Join arms:
+their hashes, the scan narrowed by the first one's keys, `reduceHashes`),
+its joined rows (the group's columns the statement reads) going into the
+hash builder by the key slots. The level's rows are then the query's
+columns (`first` 0), its key as any hash's (by value for one integer, by
+text, else encoded), and the probe, the rows' gathering, the scan's
+narrowing by the first hash's keys and `reduceHashes` treat it as a hash
+level. The members' hashes are freed after the build; the group's hash is
+held against `max_statement_mem` as any.
+
+### 49.5 The row engine
+
+The row engine cannot run a hash of a join, and it need not: the group's
+levels are a valid left-deep chain (the hub read once and hashed, then
+each member read once and hashed), placed in that order with their
+conditions at the latest table they use, as any order. So:
+
+- **the plan's level chain is left-deep** with the group marked
+  (`Level.grp`: the hub's count of members after it);
+- the pipeline runs the group as one hash wherever it runs the joins (a
+  SELECT's plan, an aggregate's, or the joins program the row engine
+  takes, `Query.jp`);
+- **where no pipeline program holds the joins** (the pipeline does not
+  run the statement), the marks are cleared (`lexdb_plan.flatGroups`,
+  exec's glue) and the row engine runs the same order left-deep: a
+  correct plan, EXPLAIN showing what runs. A run that gives up at run
+  time (a value a batch cannot hold), or `SET lexdb_batch = off` (tests
+  only), runs the chain left-deep too.
+
+### 49.6 EXPLAIN
+
+The hub's line names the hash and its keys, the members follow indented:
+
+```
+join customer: hash of a join on (c_custkey) over full scan (table rows 11927 of 150000 read, probes ..., ...)
+  with nation n2: hash on (n_nationkey) over full scan (table rows 2 of 25 read, probes 150000, ...)
+```
+
+EXPLAIN ANALYZE's counts: on the hub's line, the rows the build read of
+the hub and those it hashed (after the members), then its probes; on each
+member's, its own hash and the build's probes of it.
+
+### 49.7 The switches
+
+`SET lexdb_planner = rules` makes no group (the rules planner keeps FROM's
+order or section 25's). `lexdb_plan.setBushy(mode)`: `BU_COST` (default)
+by cost, `BU_OFF` left-deep only (the reference the tests compare
+against), `BU_FORCE` a group wherever one is valid (its cost taken as
+tiny; tests only, to run the executor over many shapes).
+
+### 49.8 As built (2026-11-20)
+
+Branch `worktree-agent-a0cb1a031d1cae494` from main 1ccb366c: 20ae7fd2
+(this design), 6966f138 (the executor and the plan structures, groups off
+by default), then the choice by cost. `lexdb_exec` 19,688 -> 19,700 lines
+(glue: explainLines' group lines, `levelsProgQ` clearing the marks);
+`lexdb_plan` 5,902 -> 6,356; `lexdb_pipe` 6,905 -> 7,084.
+
+- **lexdb_plan:** `Level.grp`; `PJoin.sub` (a build's join plan) and
+  `JH_JOIN`; `grpSearch`, `grpCost`, `grpPass` (49.3), `grpRuns` (49.2),
+  `grpArm` (the arm from the levels' conditions), `grpKey`, `grpLine`
+  (EXPLAIN), `flatGroups`, `grpSafe`; `oneEqPerClass` keeps a member's
+  equality within its group first (a class spanning the group and the
+  tables before: q5's nation key); `semiJoins` puts a semi or anti level
+  after a group's last member; `joinsOver` makes a group's arm or fails
+  (then the row engine runs the chain and the marks are cleared).
+- **lexdb_pipe:** `grpOps` (a build is a join plan the pipeline runs over
+  the group's tables alone), `grpKinds` (the group's columns one level's),
+  `grpSetup` (the build run by `joinRows` into a `Builder` by the key
+  slots; the members' bytes released, the group's held; the build's
+  counts folded into the levels'), `decodedAll`, `joinSrc`/`grpHas` (the
+  group's tables' reads), `hashed`, the first hash's scan narrowing and
+  `reduceHashes` over a group's level.
+- **Tests:** `exec_bushy` (34 queries: forced, by cost, left-deep, batches
+  off and under the rules, the same rows; NULL keys both sides, duplicate
+  keys in a member, empty builds and probe sides, a text key, two keys, a
+  condition in the build, an OR across two groups on char columns, an
+  aggregate, ORDER BY with LIMIT, DISTINCT, a derived table, a LEFT JOIN
+  around it, a semi join after it, a correlated subquery (no group),
+  errors in a later batch (the hub's own condition, the first table's),
+  max_statement_mem at 256kB and 16kB). `exec_pipe`'s and `exec_semilook`'s
+  count comparisons (the row engine's counts against the pipeline's for one
+  plan) run left-deep; `exec_semilook`'s q21 plan line shows its group.
+  Suite 247 of 247.
+
+**Plans changed** (TPC-H SF1; the 22 queries' EXPLAIN, base main 1ccb366c
+against the branch, both `-O`): q7 (two groups: supplier with nation n1,
+customer with nation n2, where customer was looked up per row) and q21
+(supplier with nation); no other. q5's and q8's (nation, region) groups
+cost under `GRP_GAIN` of the order's and are not taken; q9's supplier
+lookups stay (the rows reaching them are estimated at about 1,200 where
+there are 319k: lexdb-tpch-perf.md, multi-column join selectivity); q2 keeps its lookups (its correlated subquery stays one).
+
+**Measured** (`~/tpch-w/q6/logs`; `-O`; `TPCH_ONLY=lexdb`; base and branch
+alternated; ms, wall, warm. The wall times are the first build's (groups
+inside the DP: the same 22 plans as the final pass, compared line by
+line); server instructions per run from `iq.sh` (one warm-up, two
+counted) are the final build's and agree with the first's to 0.1%):
+
+| query | base | branch | | instructions |
+|---|---:|---:|---:|---:|
+| q7 | 934 | 712 | -23.8% | 9.327G -> 7.886G (-15.4%) |
+| q21 | 1,218 | 1,096 | -10.0% | 12.903G -> 12.349G (-4.3%) |
+| all 22 | 12,406 | 12,025 | -3.1% | |
+
+Two alternated rounds of all 22 (medians of each pair): no other query
+more than 1.9% slower (q17 +1.9%: 0.6 ms; q5 +1.7%, plan unchanged,
+instructions +0.07%); checksums equal in every run. q8's plan is
+unchanged and its instructions are +0.5% (placement). Against PostgreSQL
+one core (lexdb-benchmarks 1.6, 0f96fee9's run): q7 606 ms (now 1.2x,
+was 1.7x), q21 953 (now 1.15x, was 1.3x).
+
+**Point selects** (20,000 primary-key selects in process, `-O`,
+`LXL_HASH_SEED=1`, `perf stat -e instructions:u taskset -c 6`, base main
+1ccb366c, three alternated rounds): +0.001% for the first build (under the
+bench lock), +0.0006% for the final one (about 1 instruction a select of
+162k; run without the lock, which another job held: the count does not
+depend on load), every round alike. The join search is not reached by a
+single-table statement; `Level` has one more integer.
+

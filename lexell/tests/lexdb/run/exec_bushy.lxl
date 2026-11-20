@@ -1,0 +1,216 @@
+// lexdb_plan, lexdb_pipe: bushy joins, a hash of a join (optimizer 49).
+// Each query runs with build groups wherever valid (BU_FORCE), by cost
+// (BU_COST), left-deep only (BU_OFF), with batches off (the row engine
+// runs the groups' levels left-deep) and under SET lexdb_planner = rules:
+// the same rows (sorted) or the same error. "grouped": per query, y when
+// its EXPLAIN under BU_FORCE has a hash of a join ("by cost": under
+// BU_COST). Shapes: a hub and one
+// or two members (a chain hub, member, member's member), two groups in one
+// join, an aggregate over it, a derived table and a LEFT JOIN around one,
+// NULL keys on either side, duplicate keys in a member, empty builds and
+// empty probe sides, a text key, two keys, a condition between the group
+// and the tables before (an OR across them, char columns), one in the
+// build, conditions that may fail (no group: a division), errors in a
+// later batch (the hub's own condition, the first table's), and
+// max_statement_mem.
+// expect: create table f (id int primary key, cid int, sid int, v int, code text) -> CREATE TABLE
+// expect: insert into f select g, case when g % 17 = 0 then null else g % 400 + 1 end, g % 60 + 1, g % 23, 'k' || (g % 50) from generate_series(1, 3000) g -> INSERT 0 3000
+// expect: create table c (id int primary key, nid int, sid2 int, code text, name text) -> CREATE TABLE
+// expect: insert into c select g, case when g % 13 = 0 then null else g % 25 + 1 end, g % 60 + 1, 'k' || (g % 50), 'c' || g from generate_series(1, 300) g -> INSERT 0 300
+// expect: create table n (id int primary key, rid int, name char(10)) -> CREATE TABLE
+// expect: insert into n select g, g % 5 + 1, 'n' || g from generate_series(1, 25) g -> INSERT 0 25
+// expect: create table r (id int primary key, name text) -> CREATE TABLE
+// expect: insert into r select g, 'r' || g from generate_series(1, 5) g -> INSERT 0 5
+// expect: create table s (id int primary key, nid int, name text) -> CREATE TABLE
+// expect: insert into s select g, case when g % 11 = 0 then null else g % 25 + 1 end, 's' || g from generate_series(1, 60) g -> INSERT 0 60
+// expect: create table dup (k int, label text) -> CREATE TABLE
+// expect: insert into dup select g % 9 + 1, 'd' || g from generate_series(1, 30) g -> INSERT 0 30
+// expect: create table e (id int primary key, nid int) -> CREATE TABLE
+// expect: analyze -> ANALYZE
+// expect: shapes: 28 queries, 28 the same, grouped yyyyyyyyyyyyyyynnnyyyyynyyyn, by cost yyyyyyynyynnyyynnnyyyyynnyyn
+// expect: errors: 4 queries, 4 the same, grouped yyyn, by cost yynn
+// expect: memory: 2 queries, 2 the same, grouped yn, by cost yn
+// expect: force: select f.id, c.name, n.name from f join c on c.id = f.cid join n on n.id = c.nid where n.name in ('n1', 'n2') -> scan f: full scan; join c: hash of a join on (id) over full scan;   with n: hash on (id) over full scan
+// expect: force: select count(*) from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name = 'r2' -> scan f: full scan (rows read 3000, kept 3000, batches 3); join c: hash of a join on (id) over full scan (table rows 277 of 300 read, probes 3000, rows read 2000, joined 2000, batches 1);   with n: hash on (id) over full scan (table rows 25 of 25 read, probes 300, rows read 277, joined 277); join r: hash on (id) over full scan (table rows 1 of 5 read, probes 2000, rows read 404, joined 404); aggregate
+// expect: cost: select count(*) from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name = 'r2' -> scan f: full scan (rows read 3000, kept 3000, batches 3); join c: hash of a join on (id) over full scan (table rows 56 of 300 read, probes 3000, rows read 404, joined 404, batches 1);   with n: hash on (id) over full scan (table rows 25 of 25 read, probes 300, rows read 277, joined 277);   with r: hash on (id) over full scan (table rows 1 of 5 read, probes 277, rows read 56, joined 56); aggregate
+// expect: cost: select f.id, ns.name, nc.name from f join s on s.id = f.sid join n ns on ns.id = s.nid join c on c.id = f.cid join n nc on nc.id = c.nid where (ns.name = 'n1' and nc.name = 'n2') or (ns.name = 'n2' and nc.name = 'n1') -> scan f: full scan (rows read 3000, kept 3000, batches 3); join s: hash of a join on (id) over full scan (table rows 5 of 60 read, probes 3000, rows read 250, joined 250, batches 1);   with n ns: hash on (id) over full scan (table rows 2 of 25 read, probes 60, rows read 5, joined 5); join c: primary key lookup per row (lookups 250, rows read 181, joined 181); join n nc: hash on (id) over full scan (table rows 2 of 25 read, probes 181, rows read 30, joined 0)
+// expect: off: select count(*) from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name = 'r2' -> scan f: full scan (rows read 3000, kept 3000, batches 3); join c: hash on (id) over full scan (table rows 300 of 300 read, probes 3000, rows read 2166, joined 2166); join n: hash on (id) over full scan (table rows 25 of 25 read, probes 2166, rows read 2000, joined 2000); join r: hash on (id) over full scan (table rows 1 of 5 read, probes 2000, rows read 404, joined 404); aggregate
+// expect: off: select f.id, ns.name, nc.name from f join s on s.id = f.sid join n ns on ns.id = s.nid join c on c.id = f.cid join n nc on nc.id = c.nid where (ns.name = 'n1' and nc.name = 'n2') or (ns.name = 'n2' and nc.name = 'n1') -> scan f: full scan (rows read 3000, kept 3000, batches 3); join s: hash on (id) over full scan (table rows 60 of 60 read, probes 3000, rows read 3000, joined 3000); join n ns: hash on (id) over full scan (table rows 2 of 25 read, probes 3000, rows read 250, joined 250); join c: primary key lookup per row (lookups 250, rows read 181, joined 181); join n nc: hash on (id) over full scan (table rows 2 of 25 read, probes 181, rows read 30, joined 0)
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_plan"
+import "collections"
+import "strings"
+
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            collections.sort(mut &lines)
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn show(s: mut &lexdb_exec.Session, sql: str) { println(sql + " -> " + run(s, &sql)) }
+
+// EXPLAIN's lines, in one; analyze: EXPLAIN ANALYZE's, its counts but not its time.
+fn planOf(s: mut &lexdb_exec.Session, sql: &str, analyze: bool): str {
+    let head = if analyze { "explain analyze " } else { "explain " }
+    match s.exec(&(head + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            let n = if analyze { len(r.rows) - 1 } else { len(r.rows) }
+            var lines: []str = []
+            for i in 0..n { append(mut &lines, lexdb_sql.text(&r.rows[i][0])) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+type Group = record { name: str; n: int; same: int; marks: str; costed: str; seen: []str }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, marks: "", costed: "", seen: []} }
+
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    lexdb_plan.setBushy(lexdb_plan.BU_FORCE)
+    let force = run(s, sql)
+    let pf = planOf(s, sql, false)
+    lexdb_plan.setBushy(lexdb_plan.BU_COST)
+    let cost = run(s, sql)
+    let pc = planOf(s, sql, false)
+    lexdb_plan.setBushy(lexdb_plan.BU_OFF)
+    let off = run(s, sql)
+    lexdb_plan.setBushy(lexdb_plan.BU_FORCE)
+    let x = run(s, &"set lexdb_batch = off")
+    let rows = run(s, sql)
+    let y = run(s, &"set lexdb_batch = on")
+    let z = run(s, &"set lexdb_planner = rules")
+    let rules = run(s, sql)
+    let w = run(s, &"reset lexdb_planner")
+    lexdb_plan.setBushy(lexdb_plan.BU_COST)
+    g.n += 1
+    if force == cost && force == off && force == rows && force == rules {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  force: " + force + "\n  cost: " + cost + "\n  off: " + off + "\n  rows: " + rows + "\n  rules: " + rules)
+    }
+    g.marks += if strings.contains(&pf, &"hash of a join") { "y" } else { "n" }
+    g.costed += if strings.contains(&pc, &"hash of a join") { "y" } else { "n" }
+}
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, grouped " + g.marks + ", by cost " + g.costed)
+    for x in g.seen { println(x) }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    // f: 3000 rows (cid NULL every 17th); c: 300 (nid NULL every 13th); n: 25; r: 5; s: 60 (nid NULL every 11th);
+    // dup: keys 1..9, about 3 rows each; e: empty
+    show(mut &s, "create table f (id int primary key, cid int, sid int, v int, code text)")
+    show(mut &s, "insert into f select g, case when g % 17 = 0 then null else g % 400 + 1 end, g % 60 + 1, g % 23, 'k' || (g % 50) from generate_series(1, 3000) g")
+    show(mut &s, "create table c (id int primary key, nid int, sid2 int, code text, name text)")
+    show(mut &s, "insert into c select g, case when g % 13 = 0 then null else g % 25 + 1 end, g % 60 + 1, 'k' || (g % 50), 'c' || g from generate_series(1, 300) g")
+    show(mut &s, "create table n (id int primary key, rid int, name char(10))")
+    show(mut &s, "insert into n select g, g % 5 + 1, 'n' || g from generate_series(1, 25) g")
+    show(mut &s, "create table r (id int primary key, name text)")
+    show(mut &s, "insert into r select g, 'r' || g from generate_series(1, 5) g")
+    show(mut &s, "create table s (id int primary key, nid int, name text)")
+    show(mut &s, "insert into s select g, case when g % 11 = 0 then null else g % 25 + 1 end, 's' || g from generate_series(1, 60) g")
+    show(mut &s, "create table dup (k int, label text)")
+    show(mut &s, "insert into dup select g % 9 + 1, 'd' || g from generate_series(1, 30) g")
+    show(mut &s, "create table e (id int primary key, nid int)")
+    show(mut &s, "analyze")
+    var g = newGroup(&"shapes")
+    let qs = [
+        // a hub and a member; two members; a member's member
+        "select f.id, c.name, n.name from f join c on c.id = f.cid join n on n.id = c.nid where n.name in ('n1', 'n2')",
+        "select f.id, c.name from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name = 'r2'",
+        "select count(*) from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name = 'r2'",
+        "select f.id, s.name, n.name from f join s on s.id = f.sid join n on n.id = s.nid where n.rid = 3",
+        // two groups (q7's shape), an OR across them on char columns
+        "select f.id, ns.name, nc.name from f join s on s.id = f.sid join n ns on ns.id = s.nid join c on c.id = f.cid join n nc on nc.id = c.nid " +
+            "where (ns.name = 'n1' and nc.name = 'n2') or (ns.name = 'n2' and nc.name = 'n1')",
+        "select ns.name, nc.name, count(*), sum(f.v) from f join s on s.id = f.sid join n ns on ns.id = s.nid join c on c.id = f.cid join n nc on nc.id = c.nid " +
+            "where ns.rid = 1 and nc.rid = 2 group by ns.name, nc.name",
+        // an aggregate over it, grouped by the member's column
+        "select n.name, count(*), sum(f.v), min(c.name) from f join c on c.id = f.cid join n on n.id = c.nid where n.rid in (1, 4) group by n.name",
+        // a member with duplicate keys; the group's rows multiplied
+        "select f.id, dup.label from f join c on c.id = f.cid join dup on dup.k = c.nid where f.v = 3",
+        "select count(*), count(distinct dup.label) from f join c on c.id = f.cid join dup on dup.k = c.nid",
+        // empty build, empty member, empty probe side, empty table
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where n.name = 'none'",
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where c.name = 'x'",
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where f.v < 0",
+        "select f.id from f join c on c.id = f.cid join e on e.nid = c.nid",
+        // a text key; two keys; a condition in the build beside its key
+        "select f.id, c.id from f join c on c.code = f.code join n on n.id = c.nid where n.rid = 2 and f.v = 1",
+        "select f.id, c.id from f join c on c.id = f.cid and c.sid2 = f.sid join n on n.id = c.nid where n.rid < 3",
+        "select f.id, c.id from f join c on c.id = f.cid join n on n.id = c.nid and n.rid > c.id % 3 where n.rid < 5",
+        // a condition between the group and the table before that may fail: no group
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where f.v / n.rid > 2 and n.rid > 1",
+        // a LEFT JOIN: no cost search, no group; a group in a derived table under one
+        "select f.id, c.name, n.name from f join c on c.id = f.cid left join n on n.id = c.nid where f.v = 5",
+        "select r.id, d.cnt from r left join (select n.rid, count(*) cnt from f join c on c.id = f.cid join n on n.id = c.nid group by n.rid) d on d.rid = r.id",
+        "select x.id, x.nm from (select f.id, n.name nm from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 4) x where x.id < 500",
+        // the hub joined to the tables before by a member's column as well (an implied equality)
+        "select f.id, s.id, c.id from f join s on s.id = f.sid join c on c.id = f.cid join n on n.id = c.nid and n.id = s.nid where n.rid = 5",
+        // NULL keys on the probe side and in the build
+        "select f.id, c.nid from f join c on c.id = f.cid join n on n.id = c.nid where f.cid is null or c.nid is null",
+        "select count(*), count(c.nid), count(f.cid) from f join c on c.id = f.cid join n on n.id = c.nid",
+        // ORDER BY, LIMIT over it
+        "select f.id, n.name from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 2 order by f.id desc limit 7",
+        "select distinct n.name from f join c on c.id = f.cid join n on n.id = c.nid where f.v = 4",
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid join r on r.id = n.rid where r.name like 'r%' and f.id % 97 = 0",
+        // a semi join after it (q21's shape); a correlated subquery that stays one (no group: the row engine runs it)
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 2 and exists (select 1 from dup where dup.k = c.nid and dup.label <> 'd3')",
+        "select f.id from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 3 and f.v = (select max(f2.v) from f f2 where f2.cid = f.cid)"
+    ]
+    for q in qs { check(mut &s, mut &g, &q) }
+    report(&g)
+    // errors: the hub's own condition failing late in its rows, the first
+    // table's in a later batch (both plans read every row of each)
+    var eg = newGroup(&"errors")
+    check(mut &s, mut &eg, &"select f.id from f join c on c.id = f.cid join n on n.id = c.nid where 1000 / (c.id - 290) > -2000")
+    check(mut &s, mut &eg, &"select f.id from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 1 and 100 / (n.id - 25) < 1000")
+    check(mut &s, mut &eg, &"select f.id from f join c on c.id = f.cid join n on n.id = c.nid where 1000 / (f.id - 2900) > -2000")
+    check(mut &s, mut &eg, &"select f.id from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 2 and f.v / (c.id - 7) > 0")
+    report(&eg)
+    // the statement's memory: a group's hash counted, and over it
+    var mg = newGroup(&"memory")
+    let a = run(mut &s, &"set max_statement_mem = '256kB'")
+    check(mut &s, mut &mg, &"select count(*) from f join c on c.id = f.cid join n on n.id = c.nid where n.rid = 2")
+    let b = run(mut &s, &"set max_statement_mem = '16kB'")
+    check(mut &s, mut &mg, &"select count(*), max(c.name) from f join c on c.id = f.cid join n on n.id = c.nid where n.rid < 5")
+    let c = run(mut &s, &"reset max_statement_mem")
+    report(&mg)
+    lexdb_plan.setBushy(lexdb_plan.BU_FORCE)
+    println("force: " + qs[0] + " -> " + planOf(mut &s, &qs[0], false))
+    println("force: " + qs[2] + " -> " + planOf(mut &s, &qs[2], true))
+    lexdb_plan.setBushy(lexdb_plan.BU_COST)
+    println("cost: " + qs[2] + " -> " + planOf(mut &s, &qs[2], true))
+    println("cost: " + qs[4] + " -> " + planOf(mut &s, &qs[4], true))
+    lexdb_plan.setBushy(lexdb_plan.BU_OFF)
+    println("off: " + qs[2] + " -> " + planOf(mut &s, &qs[2], true))
+    println("off: " + qs[4] + " -> " + planOf(mut &s, &qs[4], true))
+    lexdb_plan.setBushy(lexdb_plan.BU_COST)
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
