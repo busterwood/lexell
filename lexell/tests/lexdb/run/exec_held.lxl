@@ -22,6 +22,11 @@
 //   run with other values), a transaction's own writes, max_statement_mem,
 //   and shapes the pipeline does not take (LATERAL, a correlated output,
 //   DISTINCT ON, WITH TIES, a window, a recursive CTE's working table);
+// - a join whose held first level has under 64 rows (a few VALUES, unnest($1) of
+//   three elements, a short series) is the row engine's, with the subqueries'
+//   results kept, not run again ("join paths": row or batch; "small volatile
+//   joins": a nextval in the derived table made once); from 64 rows on the
+//   batched join;
 // - texts, NULLs, numerics of mixed scales in one VALUES column, numerics as
 //   units, columns holding values of another kind than their type (a UNION
 //   typed by its first branch, a catalog's text-typed numbers): the batch
@@ -41,7 +46,10 @@
 // expect: catalog: 6 queries, 6 the same, 5 held, 5 batched, 1 gave way
 // expect: ctes used twice: 16 queries, 16 the same, 16 held, 16 batched, 0 gave way
 // expect: joins: 12 queries, 12 the same, 12 held, 12 batched, 0 gave way
-// expect: small: 14 queries, 14 the same, 14 held, 2 batched, 0 gave way, 1 returned nothing
+// expect: small joins: 32 queries, 32 the same, 16 held, 16 batched, 0 gave way, 1 returned nothing
+// expect: join paths: values 3 row, series 3 row, values 63 row, series 63 row, values 64 batch, series 64 batch, values 65 batch, series 65 batch, values 1100 batch, series 1100 batch, unnest 100 batch, unnest 3 row
+// expect: small volatile joins: 5|5|1|5 last 5 | 5|6 last 10
+// expect: small: 14 queries, 14 the same, 13 held, 1 batched, 0 gave way, 1 returned nothing
 // expect: refused: 6 queries, 6 the same, 0 held, 0 batched, 0 gave way
 // expect: parameters, transactions and memory: 18 queries, 18 the same, 16 held, 15 batched, 0 gave way
 // expect: mixed: 28 queries, 28 the same, 28 held, 28 batched, 9 gave way
@@ -107,14 +115,26 @@ fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
 // check of a statement with parameters, its plan kept in pc (run with each
 // value), against the row engine's one-shot plan.
 fn checkP(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache) {
-    let stmts = lexdb_parse.parse(sql).unwrap()
     let nt: []int = []
+    checkPT(s, g, sql, params, &nt, pc)
+}
+
+// checkP over an array parameter given as text ("{1,5,9}"), typed by the statement.
+fn checkA(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, text: &str, pc: mut &lexdb_exec.PlanCache) {
+    let stmts = lexdb_parse.parse(sql).unwrap()
+    let pt = s.paramTypes(&stmts[0], &[])
+    let vals = lexdb_exec.paramVals(&[Some(text.clone())], &pt).unwrap()
+    checkPT(s, g, sql, &vals, &pt, pc)
+}
+
+fn checkPT(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, params: &[]lexdb_sql.Val, nt: &[]int, pc: mut &lexdb_exec.PlanCache) {
+    let stmts = lexdb_parse.parse(sql).unwrap()
     let a = q(s, &"set lexdb_batch = off")
     var po = lexdb_exec.oneShot()
-    let off = rowsOf(s.runCached(&stmts[0], params, &nt, mut &po))
+    let off = rowsOf(s.runCached(&stmts[0], params, nt, mut &po))
     let b = q(s, &"set lexdb_batch = on")
     let h0 = lexdb_pipe.heldCounts()
-    let on = rowsOf(s.runCached(&stmts[0], params, &nt, pc))
+    let on = rowsOf(s.runCached(&stmts[0], params, nt, pc))
     let h1 = lexdb_pipe.heldCounts()
     g.n += 1
     if len(on) == 0 { g.empty += 1 }
@@ -308,6 +328,54 @@ fn main() {
         check(mut &s, mut &gj, &"select s.id, t.x / (t.g - 3) from v1025 s join t on t.id = s.id where s.id > 1000")
         check(mut &s, mut &gj, &"select s.id from v1025 s join t on t.id = s.id order by t.x desc, s.id limit 7")
         report("joins", &gj)
+
+        // a join whose held first level has fewer than 64 rows is the row engine's (as
+        // before the rows were the pipeline's: its set-up costs more than the rows
+        // save); from 64 rows on the batched join. "row" / "batch": the path taken.
+        var gt = newGroup()
+        var paths: []str = []
+        let sq3 = q(mut &s, &"create sequence sq3")
+        for n in [3, 63, 64, 65, 1100] {
+            var rows: []str = []
+            for i in 1..n + 1 { append(mut &rows, "(" + i.toStr() + ")") }
+            let v = "(values " + strings.join(&rows, ", ") + ") v(a)"
+            let h0 = lexdb_pipe.heldCounts()
+            check(mut &s, mut &gt, &("select v.a, t.w from " + v + " join t on t.id = v.a"))
+            let h1 = lexdb_pipe.heldCounts()
+            append(mut &paths, "values " + n.toStr() + " " + (if h1[1] > h0[1] { "batch" } else { "row" }))
+            check(mut &s, mut &gt, &("select count(*), sum(t.x) from " + v + " join t on t.id = v.a"))
+            check(mut &s, mut &gt, &("select v.a, t.w from " + v + " left join t on t.id = v.a * 40 order by v.a desc limit 5"))
+            check(mut &s, mut &gt, &("select t.g, count(*) from " + v + " join t on t.g = v.a % 10 group by t.g order by t.g"))
+            let g0 = lexdb_pipe.heldCounts()
+            check(mut &s, mut &gt, &("select g.id, t.w from generate_series(1, " + n.toStr() + ") g(id) join t on t.id = g.id where t.g = 3"))
+            let g1 = lexdb_pipe.heldCounts()
+            append(mut &paths, "series " + n.toStr() + " " + (if g1[1] > g0[1] { "batch" } else { "row" }))
+        }
+        var pcu = lexdb_exec.newPlanCache()
+        for arr in ["{1,5,9}", "{}", "{4,4,NULL}"] {
+            checkA(mut &s, mut &gt, &"select u.x, t.w from unnest($1::int[]) u(x) join t on t.id = u.x", &arr, mut &pcu)
+        }
+        var bigl: []str = []
+        for i in 1..101 { append(mut &bigl, (i * 3).toStr()) }
+        let u0 = lexdb_pipe.heldCounts()
+        checkA(mut &s, mut &gt, &"select u.x, t.w from unnest($1::int[]) u(x) join t on t.id = u.x", &("{" + strings.join(&bigl, ",") + "}"), mut &pcu)
+        let u1 = lexdb_pipe.heldCounts()
+        append(mut &paths, "unnest 100 " + (if u1[1] > u0[1] { "batch" } else { "row" }))
+        let u2 = lexdb_pipe.heldCounts()
+        checkA(mut &s, mut &gt, &"select u.x, t.w from unnest($1::int[]) u(x) join t on t.id = u.x", &"{1,5,9}", mut &pcu)
+        let u3 = lexdb_pipe.heldCounts()
+        append(mut &paths, "unnest 3 " + (if u3[1] > u2[1] { "batch" } else { "row" }))
+        check(mut &s, mut &gt, &"select s.id, t.w from (select id from t where id <= 20) s join t on t.id = s.id + 1 where s.id % 2 = 0")
+        check(mut &s, mut &gt, &"with c as (select id, x from t where id < 30) select count(*) from c join t on t.id = c.id * 2")
+        // (a volatile derived table: run once, the row engine given its rows)
+        let nvz = q(mut &s, &"set lexdb_batch = on")
+        let nva = q(mut &s, &"select count(*), count(distinct n), min(n), max(n) from (select nextval('sq3') n from generate_series(1, 5)) d join t on t.id = d.n")
+        let nval = q(mut &s, &"select last_value from sq3")
+        let nvb = q(mut &s, &"select count(*), min(n) from (select nextval('sq3') n from generate_series(1, 5)) d join t on t.id = d.n + 1000")
+        let nvbl = q(mut &s, &"select last_value from sq3")
+        report("small joins", &gt)
+        println("join paths: " + strings.join(&paths, ", "))
+        println("small volatile joins: " + nva + " last " + nval + " | " + nvb + " last " + nvbl)
 
         // few rows: row by row (below the batch threshold), the same
         var g3 = newGroup()
