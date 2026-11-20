@@ -22,6 +22,9 @@
 //   clause conditions (the first that holds), DELETE, DO NOTHING, a VALUES
 //   source and a view source (held rows first); BY SOURCE (a RIGHT join) and
 //   a source of a few rows stay row by row (counted 0);
+// - T-SQL (parsed as the TDS front end does): UPDATE TOP (n) and DELETE TOP (n)
+//   FROM t JOIN s (the first n rows found), OUTPUT, a LEFT JOIN with the
+//   target first, MERGE TOP (n) and OUTPUT $action;
 // - a WHERE with a condition on the target only, on the source only, and on
 //   both; a subquery in SET; two sources joined to each other.
 // "batched": statements whose levels program ran with batches on.
@@ -33,28 +36,49 @@
 // expect: update errors: 6 statements, 6 the same, 6 batched, 0 batched with batches off, 5 errors or no rows seen
 // expect: delete: 9 statements, 9 the same, 9 batched, 0 batched with batches off, 2 errors or no rows seen
 // expect: merge: 18 statements, 18 the same, 15 batched, 0 batched with batches off, 5 errors or no rows seen
-// expect: levels programs ran: 51, hashes built: true
+// expect: t-sql: 11 statements, 11 the same, 11 batched, 0 batched with batches off, 1 errors or no rows seen
+// expect: levels programs ran: 62, hashes built: true
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_pipe"
 import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+
+fn text(rs: &[]lexdb_exec.Res): str {
+    var out: []str = []
+    for r in rs {
+        if !r.hasRows { append(mut &out, r.tag.clone()) }
+        for row in r.rows {
+            var vs: []str = []
+            for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+            append(mut &out, strings.join(&vs, "|"))
+        }
+    }
+    return strings.join(&out, " ")
+}
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
-    match s.exec(sql) {
-        Ok(rs) {
-            var out: []str = []
-            for r in rs {
-                if !r.hasRows { append(mut &out, r.tag.clone()) }
-                for row in r.rows {
-                    var vs: []str = []
-                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
-                    append(mut &out, strings.join(&vs, "|"))
+    // "T: " begins a statement in T-SQL's dialect (TOP, OUTPUT, UPDATE ... FROM t JOIN)
+    if strings.startsWith(sql, "T: ") {
+        let none: []str = []
+        var p = lexdb_parse.tsqlParser(sql[3..len(sql)], lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &none).unwrap()
+        match p.statement() {
+            Ok(stmt) {
+                var pc = lexdb_exec.oneShot()
+                let noVals: []lexdb_sql.Val = []
+                let noTypes: []int = []
+                match s.runCached(&stmt, &noVals, &noTypes, mut &pc) {
+                    Ok(r) { return text(&[r]) }
+                    Err(e) { return "ERROR " + e.state + " " + e.msg + " [" + e.detail + "]" }
                 }
             }
-            return strings.join(&out, " ")
+            Err(e) { return "PARSE " + e.state + " " + e.msg }
         }
+    }
+    match s.exec(sql) {
+        Ok(rs) { return text(&rs) }
         Err(e) { return "ERROR " + e.state + " " + e.msg + " [" + e.detail + "]" }
     }
 }
@@ -98,6 +122,7 @@ fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, batched: bool) {
     } else if len(g.seen) < 3 {
         append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  on:  " + strings.substr(&on, 0, min(len(on), 300)))
     }
+    if strings.startsWith(&on, "PARSE") && len(g.seen) < 3 { append(mut &g.seen, "NOT PARSED: " + sql + " " + on) }
     if strings.endsWith(&on, "// batched") { g.batched += 1 }
     if strings.endsWith(&off, "// batched") { g.off += 1 }
     if strings.startsWith(&off, "ERROR") || strings.startsWith(&off, "UPDATE 0") || strings.startsWith(&off, "DELETE 0") || strings.startsWith(&off, "MERGE 0") { g.odd += 1 }
@@ -230,6 +255,22 @@ fn main() {
         check(mut &s, mut &g, "merge into tg using (values (1, 5), (2, 6), (5000, 7)) as x(k, v) on tg.id = x.k when matched then update set v = x.v when not matched then insert (id, v, w, r) values (x.k, x.v, 1, 1)", false)
         check(mut &s, mut &g, "merge into tg using (values (1, 5), (2, 6), (5000, 7)) as x(k, v) on tg.id = x.k when matched then delete returning merge_action(), tg.id", false)
         report("merge", &g)
+
+        // T-SQL: TOP (n) with a join (the first n rows found, in arrival order), OUTPUT, a LEFT JOIN
+        // with the target first, MERGE's TOP and OUTPUT $action
+        g = newGroup()
+        check(mut &s, mut &g, "T: UPDATE TOP (5) tg SET v = src.v FROM tg JOIN src ON tg.id = src.k", true)
+        check(mut &s, mut &g, "T: UPDATE TOP (1100) tg SET v = src.v OUTPUT inserted.id, deleted.v, inserted.v FROM tg JOIN src ON tg.id = src.k WHERE src.w > 1", true)
+        check(mut &s, mut &g, "T: UPDATE TOP (1700) tg SET v = dup.v FROM tg JOIN dup ON tg.id = dup.k", true)
+        check(mut &s, mut &g, "T: UPDATE tg SET v = ISNULL(src.v, -1) FROM tg LEFT JOIN src ON tg.id = src.k", true)
+        check(mut &s, mut &g, "T: UPDATE tg SET v = 0 FROM tg LEFT JOIN src ON tg.id = src.k WHERE src.k IS NULL", true)
+        check(mut &s, mut &g, "T: DELETE TOP (1100) tg FROM tg JOIN src ON tg.id = src.k WHERE src.k % 2 = 0", true)
+        check(mut &s, mut &g, "T: DELETE tg OUTPUT deleted.id, deleted.v FROM tg JOIN srcp ON tg.id = srcp.k WHERE srcp.k > 2000", true)
+        check(mut &s, mut &g, "T: MERGE TOP (1200) tg USING msrc m ON tg.id = m.k WHEN MATCHED THEN UPDATE SET v = m.v WHEN NOT MATCHED THEN INSERT (id, v, w, r) VALUES (m.k, m.v, 1, 1);", true)
+        check(mut &s, mut &g, "T: MERGE tg USING msrc m ON tg.id = m.k WHEN MATCHED AND m.k % 2 = 0 THEN DELETE WHEN MATCHED THEN UPDATE SET v = 7 WHEN NOT MATCHED THEN INSERT (id, v, w, r) VALUES (m.k, m.v, 1, 1) OUTPUT $action, inserted.id, deleted.id;", true)
+        check(mut &s, mut &g, "T: MERGE tg USING mdup m ON tg.id = m.k WHEN MATCHED THEN UPDATE SET v = m.v;", true)
+        check(mut &s, mut &g, "T: MERGE tg USING mdup m ON tg.id = m.k WHEN MATCHED THEN DELETE;", true)
+        report("t-sql", &g)
         let j = lexdb_pipe.joinCounts()
         println("levels programs ran: " + j[0].toStr() + ", hashes built: " + (j[2] > 20).toStr())
         s.close()
