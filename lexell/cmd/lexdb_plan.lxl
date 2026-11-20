@@ -3546,7 +3546,7 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, wh
     var any = false
     for l in 0..nl {
         let src = q.levels[l].src
-        if src < 0 || src >= len(q.subs) || q.levels[l].lateral || q.levels[l].work >= 0 { continue }
+        if src < 0 || src >= len(q.subs) || q.levels[l].lateral || q.levels[l].work >= 0 || q.subs[src].hashed { continue }
         // not an outer join's nullable side
         if (l > 0 && keepsLeft(q.levels[l].join)) || l < lastRight { continue }
         let view = src >= len(subs)
@@ -3724,6 +3724,8 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     if nl >= 2 && !hs.rules && (rewriteMode & RW_OUTER) != 0 && !q.innerOnly() { q.innerJoins(&ms, &cs) }
     // WHERE's conjuncts on a derived table, view or CTE used once: into its query (optimizer 48.3)
     if len(q.subs) > 0 {
+        // a LATERAL subquery made a join: its keys' equalities, its ON (optimizer 51)
+        lateralMs(q, mut &ms)
         if bf.where && !hs.rules && (rewriteMode & RW_PUSH) != 0 { try pushDown(st, txn, q, where, subs, params, sc, mut &cs) }
         for i in 0..len(q.subs) { q.subs[i].view = None }
     }
@@ -4001,6 +4003,8 @@ pub type SubPlan = record {
     // clears it). Here, not in FromBound, so a query with no subquery pays
     // nothing for it (a point select: optimizer 48.5).
     pub view: Option[ViewSrc]
+    // a LATERAL subquery made a join and a grouping (optimizer 51, 5e): its keys; [] not
+    pub lat: []LateralKeys
 }
 
 pub type Scope = record {
@@ -4289,8 +4293,9 @@ pub const UN_NOTIN: int = 1     // x NOT IN (subquery) as a null-aware anti join
 pub const UN_MARK: int = 2      // EXISTS / IN under OR, in the select list: a mark join (5b)
 pub const UN_LOOK: int = 4      // semiLook widened: IN by the inner key, a range-keyed path (5c)
 pub const UN_SCALAR: int = 8    // a correlated scalar aggregate as a grouped level, hashed or per row by cost (optimizer 51, 5d)
+pub const UN_LATERAL: int = 16  // a correlated FROM subquery (LATERAL, APPLY) with an aggregate as a join and a grouping (5e)
 
-var unnestMode: int = UN_NOTIN | UN_MARK | UN_LOOK | UN_SCALAR
+var unnestMode: int = UN_NOTIN | UN_MARK | UN_LOOK | UN_SCALAR | UN_LATERAL
 
 pub fn setUnnest(mode: int) { unnestMode = mode }
 
@@ -4786,7 +4791,7 @@ fn twoSet(q: mut &Query, i: int, tk: &TwoKey, lk: mut &Level) {
                   groupKinds: [], ordKinds: [], outKinds: [lexdb_sql.COLL_EXACT], topMode: 0, topN: -1, feedback: [], mr: [], conv: [], ox: [],
                   oxParam: false, lp: lexdb_bind.noPlan(), pipe: None}
     append(mut &q.subs, SubPlan{use: lexdb_sql.SUB_IN, sel: sel, oid: oid, name: "?column?", hashed: false, keyOuter: [], keyText: [], cte: -1,
-                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None})
+                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: []})
     let ax = Expr.Col(lk.alias + "." + lexdb_catalog.ROWID + tk.acol.toStr(), lk.first + tk.acol)
     append(mut &lk.cond, Expr.Call("#in", [Expr.Lit(Val.Int(n)), Expr.Lit(Val.Int(oid)), Expr.Lit(Val.Text("?column?")), ax], false))
     if tk.acol < len(lk.need) { lk.need[tk.acol] = true }
@@ -6115,6 +6120,244 @@ fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query,
     return Ok(Unit{})
 }
 
+// ---- a correlated FROM subquery (LATERAL, CROSS and OUTER APPLY) with an
+// aggregate as a join and a grouping (optimizer 51, 5e): its outer values
+// only in WHERE equalities "inner = outer" (hashSub's keys), the
+// equalities taken out and their inner sides added to its GROUP BY and,
+// hidden, to its columns; run once, its rows joined on them by hash.
+// - With a GROUP BY: a key with no rows has no group, as a run of it has
+//   no row: CROSS or INNER joined, a LEFT JOIN's row kept with NULLs.
+// - Without: one row for every outer row (its aggregates over no rows for a
+//   key with none): LEFT joined, a column whose value over no rows is not
+//   the join's NULL (count's 0) read as that value where the key had no
+//   group (dflt). Only CROSS (APPLY, a comma) or a LEFT or INNER JOIN ON
+//   true: another ON would drop or keep the row by the values.
+// Not where it may stop or order per outer row (LIMIT, a window, a set
+// operation, DISTINCT), nor where anything run once over every key's rows
+// could fail where a run per row would not (its conditions, the
+// aggregates' arguments, its outputs and HAVING over the aggregates).
+// By the rule 9.9 hashes by: not where an outer value is its path's key
+// (an index on it: a run per row reads only its rows).
+pub type LateralKeys = record {
+    pub outer: []Expr               // per key, its outer side in the outer query's terms (the hidden column's equal)
+    pub dflt: []Option[Expr]        // per output column: its value for a key with no group where not NULL
+    pub left: bool                  // LEFT joined (no GROUP BY)
+    pub on: []Expr                  // its keys' equalities, its level's ON conjuncts (lateralOn; planFrom adds them)
+}
+
+// lateralGroup's checks of sel: -1 not; 0 no GROUP BY; 1 GROUP BY.
+fn lateralShape(sel: &Sel, base: int, join: int, onTrue: bool): int {
+    if !sel.aggQ || sel.setop != 0 || sel.limit >= 0 || sel.offset > 0 || sel.distinct || len(sel.wins) > 0 || len(sel.srf) > 0 ||
+       len(sel.mr) > 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 || sel.topMode != 0 || sel.withTies || len(sel.feedback) > 0 ||
+       sel.donKey > 0 || len(sel.q.levels) == 0 || len(sel.exprs) != len(sel.outs) || len(sel.exprs) == 0 { return -1 }
+    let grouped = len(sel.groupBy) > 0
+    let inner = join == lexdb_sql.J_INNER || join == lexdb_sql.J_CROSS
+    if !(inner || join == lexdb_sql.J_LEFT) { return -1 }
+    if !grouped && (sel.having.isSome() || !(join == lexdb_sql.J_CROSS || onTrue)) { return -1 }
+    if !noRefs(&sel.exprs, base) || !noRefs(&sel.order, base) || !noRefs(&sel.groupBy, base) { return -1 }
+    match sel.having {
+        Some(h) { if usesRefs(&h, base) || !grpSafe(&aggRepl(&h, &aggCols(len(sel.specs)))) { return -1 } }
+        None {}
+    }
+    return if grouped { 1 } else { 0 }
+}
+
+// The keys "inner = outer" of sel's conditions, its outer values used in
+// no other way (hashSub's, no residual); None not.
+fn lateralKeys(sel: &Sel, base: int): Option[HashKeys] {
+    var hk = HashKeys{inner: [], outer: [], texts: [], res: []}
+    let q = &sel.q
+    for lv in q.levels {
+        if lv.virt() || lv.lateral { return None }
+        if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return None }
+        if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return None }
+        for b in lv.path.rng { if usesRefs(&b.val, base) { return None } }
+        if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
+        if !keyConjs(&lv.post, base, mut &hk, true, false, &q.cols) { return None }
+        if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
+    }
+    if !keyConjs(&q.top, base, mut &hk, true, false, &q.cols) { return None }
+    if len(hk.inner) == 0 { return None }
+    for x in hk.outer { if hasSubCall(&x) || !lexdb_bind.immutable(&x) { return None } }
+    return Some(hk)
+}
+
+// lateralGroup's, kept on sp (SubPlan.lat): how many hidden key columns
+// it adds after its own; 0 not one.
+pub fn lateralGroup(sp: mut &SubPlan, base: int, join: int, onTrue: bool): int {
+    match lateralGroupOf(sp, base, join, onTrue) {
+        Some(lk) {
+            let n = len(lk.outer)
+            sp.lat = [lk]
+            return n
+        }
+        None { return 0 }
+    }
+}
+
+// Its level's ON conjuncts (lateralOn's) into ms (planFrom: after the ONs
+// are read from the logical plan).
+fn lateralMs(q: &Query, ms: mut &[][]Expr) {
+    for k in 0..len(q.levels) {
+        let src = q.levels[k].src
+        if src < 0 || src >= len(q.subs) || len(q.subs[src].lat) == 0 || k >= len(ms) { continue }
+        for x in q.subs[src].lat[0].on { append(mut &ms[k], lexdb_sql.cloneExpr(&x)) }
+    }
+}
+
+fn lateralGroupOf(sp: mut &SubPlan, base: int, join: int, onTrue: bool): Option[LateralKeys] {
+    if (unnestMode & UN_LATERAL) == 0 || sp.cte >= 0 || len(sp.sel.q.refs) == 0 || sp.hashed { return None }
+    let shape = lateralShape(&sp.sel, base, join, onTrue)
+    if shape < 0 { return None }
+    let grouped = shape == 1
+    // run once over every key's rows: nothing in it may fail
+    if !groupSafeAll(sp) { return None }
+    var hk = match lateralKeys(&sp.sel, base) {
+        Some(h) { h }
+        None { return None }
+    }
+    // the values over no rows: per output, where the LEFT join's NULL is not it
+    var dflt: []Option[Expr] = []
+    if !grouped {
+        var empties: []Expr = []
+        for spec in sp.sel.specs {
+            let a = lexdb_agg.newAccs(1)
+            match lexdb_agg.finish(&spec, &a[0]) {
+                Ok(v) { append(mut &empties, Expr.Lit(v)) }
+                Err(_) { return None }
+            }
+        }
+        for x in sp.sel.exprs {
+            let none = aggRepl(&x, &empties)
+            if hasParamIn(&none) || !lexdb_bind.immutable(&none) { return None }
+            let noVals: []Val = []
+            match up().eval(&none, &noVals) {
+                Ok(v) { append(mut &dflt, if lexdb_ops.isNull(&v) { None } else { Some(Expr.Lit(v)) }) }
+                Err(_) { return None }
+            }
+        }
+    }
+    for k in 0..len(sp.sel.q.levels) {
+        sp.sel.q.levels[k].cond = dropTexts(replace(mut &sp.sel.q.levels[k].cond, []), &hk.texts)
+        sp.sel.q.levels[k].post = dropTexts(replace(mut &sp.sel.q.levels[k].post, []), &hk.texts)
+        sp.sel.q.levels[k].local = dropTexts(replace(mut &sp.sel.q.levels[k].local, []), &hk.texts)
+    }
+    sp.sel.q.top = dropTexts(replace(mut &sp.sel.q.top, []), &hk.texts)
+    var koids: []int = []
+    for x in hk.inner { append(mut &koids, exprOid(&x, &sp.sel.q.cols, &[])) }
+    for xi in 0..len(hk.inner) {
+        let x = &hk.inner[xi]
+        append(mut &sp.sel.groupBy, lexdb_sql.cloneExpr(x))
+        append(mut &sp.sel.groupKinds, lexdb_sql.COLL_EXACT)
+        append(mut &sp.sel.exprs, lexdb_sql.cloneExpr(x))
+        let nm = match x {
+            Expr.Col(n, _) { lexdb_bind.colPart(&n) }
+            else { lexdb_sql.exprText(x) }
+        }
+        append(mut &sp.sel.outs, lexdb_bind.OutCol{name: nm, oid: koids[xi], spell: "", coll: "", scale: -1})
+        if len(sp.sel.outKinds) > 0 { append(mut &sp.sel.outKinds, lexdb_sql.COLL_EXACT) }
+    }
+    if len(sp.sel.ox) > 0 { sp.sel.ox = [] }
+    sp.sel.first = -1
+    sp.sel.order = []
+    sp.sel.sort = false
+    sp.sel.desc = []
+    sp.sel.nullsFirst = []
+    sp.sel.ordKinds = []
+    sp.sel.lp = takeLp(mut &sp.sel)
+    var texts: []str = []
+    var outer: []Expr = []
+    for i in 0..len(hk.inner) {
+        let o = substRefs(&hk.outer[i], base, &sp.sel.q.refs)
+        let it = match hk.inner[i] {
+            Expr.Col(n, _) { n.clone() }
+            else { lexdb_sql.exprText(&hk.inner[i]) }
+        }
+        let r = refOf(&hk.outer[i], base)
+        var on = "an outer expression"
+        if r >= 0 {
+            on = match sp.sel.q.refs[r] {
+                Expr.Col(n, _) { n.clone() }
+                else { "an outer value" }
+            }
+        }
+        append(mut &texts, it + " = " + on)
+        append(mut &outer, o)
+    }
+    sp.hashed = true
+    sp.keyOuter = replace(mut &hk.outer, [])
+    sp.keyText = texts
+    return Some(LateralKeys{outer: outer, dflt: dflt, left: !grouped, on: []})
+}
+
+// Whether a FROM item's ON is "true" (OUTER APPLY's, ON true) or absent.
+pub fn onTrue(on: &Option[Expr]): bool {
+    match on {
+        Some(x) {
+            match x {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Bool(b) { return b }
+                        else { return false }
+                    }
+                }
+                else { return false }
+            }
+        }
+        None { return true }
+    }
+}
+
+// A level's columns (first, n of them; the last ones lk's hidden keys) made
+// lateralGroup's: the keys hidden, each equal to its outer side (its ON's
+// conjuncts, returned); an output whose value over no rows is not NULL read
+// as that value where no group joined (its first key NULL).
+pub fn lateralOn(sp: mut &SubPlan, qcols: mut &[]lexdb_sql.ColDef, first: int, lv: mut &Level, virt: mut &bool) {
+    if sp.lat[0].left { lv.join = lexdb_sql.J_LEFT } else if lv.join == lexdb_sql.J_CROSS { lv.join = lexdb_sql.J_INNER }
+    let n = len(lv.t.cols)
+    let nk = len(sp.lat[0].outer)
+    let k0 = first + n - nk
+    var out: []Expr = []
+    for j in 0..nk {
+        let slot = k0 + j
+        let d = lexdb_bind.dotAt(&qcols[slot].name)
+        let al = if d < 0 { "" } else { qcols[slot].name[0..d].clone() }
+        qcols[slot].name = al + "." + lexdb_catalog.ROWID + "lk" + j.toStr()
+        qcols[slot].using = lexdb_sql.USING_HIDDEN
+        append(mut &out, Expr.Bin("=", Expr.Col(qcols[slot].name.clone(), slot), lexdb_sql.cloneExpr(&sp.lat[0].outer[j])))
+    }
+    for j in 0..len(sp.lat[0].dflt) {
+        match sp.lat[0].dflt[j] {
+            Some(d) {
+                let slot = first + j
+                let own = Expr.Col(qcols[slot].name.clone(), slot)
+                let g = Expr.Call("case else", [Expr.IsNull(Expr.Col(qcols[k0].name.clone(), k0), false), lexdb_sql.cloneExpr(&d), own], false)
+                qcols[slot].genKind = lexdb_sql.GEN_VIRTUAL
+                qcols[slot].gen = Some(g)
+                // (it keeps its name, as a virtual column does)
+                virt = true
+            }
+            None {}
+        }
+    }
+    sp.lat[0].on = out
+}
+
+fn aggCols(n: int): []Expr {
+    var ac: []Expr = []
+    for j in 0..n { append(mut &ac, Expr.Col("#a", j)) }
+    return ac
+}
+
+// groupSafe over every output (a FROM subquery's outputs are all values,
+// each over the aggregates).
+fn groupSafeAll(sp: &SubPlan): bool {
+    let ac = aggCols(len(sp.sel.specs))
+    for x in sp.sel.exprs { if !grpSafe(&aggRepl(&x, &ac)) { return false } }
+    for x in sp.sel.groupBy { if !noFail(&sp.sel.q, &x) { return false } }
+    return specsSafe(sp)
+}
+
 // The select list's and ORDER BY's grouped levels (optimizer 51) of a
 // planned SELECT (bindSel, after selMarks): each correlated scalar
 // aggregate hashed (9.9's, or its plan to be hashed that planFrom chose by
@@ -6477,7 +6720,7 @@ pub fn subsOf(q: &Query): []PSub {
                 if lv.src == i && grouped(lv) { run = RUN_GROUPED }
             }
         } else if sp.hashed {
-            run = RUN_HASHED
+            run = if sp.use == lexdb_sql.SUB_FROM { RUN_GROUPED } else { RUN_HASHED }
         } else if len(sp.sel.q.refs) == 0 {
             run = RUN_ONCE
         }

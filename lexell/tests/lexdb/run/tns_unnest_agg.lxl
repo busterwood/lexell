@@ -1,0 +1,120 @@
+// lexdb over TNS: subquery unnesting, the second half (optimizer 51) through the Oracle door. A correlated scalar
+// aggregate in WHERE, the select list and ORDER BY (count, sum, max, a key with no rows, an empty table, a text key,
+// FETCH FIRST), CROSS APPLY, OUTER APPLY and LATERAL over an aggregate with and without GROUP BY, an error in the expression
+// over the aggregate where a key has no rows (ORA-01476). Its answers are the T-SQL door's, checked against SQL Server in
+// tds_unnest_agg (the text key compared case-sensitively here, through lower). Each query runs with the new levels and with
+// the plans before them (lexdb_plan.setUnnest(7)) in this process: a difference is shown after the answer. The last line:
+// how many queries the pipeline's joins ran with the new levels and with the plans before.
+// expect: setup: 86 statements
+// expect: N = 8
+// expect: ID = 34
+// expect: ID = 1;2;3;4
+// expect: ID = 1;3;7;10;11;15;16;17;21;22;23;24;28;29;30;35;37
+// expect: ID = 1;2;3;5;6;7;8;10;12;13;15;16;17;18;20;21;23;25;26;27;28;30;31;32;35;36;37;38;40
+// expect: ID,N = 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|0;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|0;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|0;40|4
+// expect: ID,S = 1|14;2|12;3|10;4|6;5|23;6|12;7|14;8|12;9|10;10|6;11|23;12|12;13|NULL;14|12;15|10;16|6;17|23;18|12;19|14;20|12;21|10;22|6;23|23;24|12;25|14;26|NULL;27|10;28|6;29|23;30|12;31|14;32|12;33|10;34|6;35|23;36|12;37|14;38|12;39|NULL;40|6
+// expect: ID = 1;2;3;4;5
+// expect: ID,N = 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|0;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|0;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|0;40|4
+// expect: ID,N,S = 1|5|14;2|4|12;3|5|10;4|4|6;5|5|23;6|4|12;7|5|14;8|4|12;9|5|10;10|4|6;11|5|23;12|4|12;13|0|NULL;14|4|12;15|5|10;16|4|6;17|5|23;18|4|12;19|5|14;20|4|12;21|5|10;22|4|6;23|5|23;24|4|12;25|5|14;26|0|NULL;27|5|10;28|4|6;29|5|23;30|4|12;31|5|14;32|4|12;33|5|10;34|4|6;35|5|23;36|4|12;37|5|14;38|4|12;39|0|NULL;40|4|6
+// expect: ID,K,N = 1|1|5;2|2|4;3|3|5;4|4|4;5|5|5;6|0|4;7|1|5;8|2|4;9|3|5;10|4|4;11|5|5;12|0|4;14|2|4;15|3|5;16|4|4;17|5|5;18|0|4;19|1|5;20|2|4;21|3|5;22|4|4;23|5|5;24|0|4;25|1|5;27|3|5;28|4|4;29|5|5;30|0|4;31|1|5;32|2|4;33|3|5;34|4|4;35|5|5;36|0|4;37|1|5;38|2|4;40|4|4
+// expect: ID,N = 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|NULL;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|NULL;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|NULL;40|4
+// expect: ID,N = 1|0;2|0;3|0
+// expect: error 1476
+// expect: piped: 14 new, 0 before
+import "strings"
+import "task"
+import "net"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_pipe"
+
+const SETUP = "create table a (id number primary key, x number, s varchar2(10), c number)\ncreate table b (id number primary key, k number, v number, s varchar2(10))\ncreate table n (id number primary key, k number not null, v number not null)\ncreate table e (id number primary key, k number, v number)\ninsert into a values (1, 1, 'k1', 1)\ninsert into a values (2, 2, 'k2', 2)\ninsert into a values (3, 3, 'k3', 3)\ninsert into a values (4, 4, 'k4', 4)\ninsert into a values (5, 5, 'k0', 5)\ninsert into a values (6, 6, 'k1', 0)\ninsert into a values (7, 0, 'k2', 1)\ninsert into a values (8, 1, 'k3', 2)\ninsert into a values (9, NULL, 'k4', 3)\ninsert into a values (10, 3, 'k0', 4)\ninsert into a values (11, 4, NULL, 5)\ninsert into a values (12, 5, 'k2', 0)\ninsert into a values (13, 6, 'k3', NULL)\ninsert into a values (14, 0, 'k4', 2)\ninsert into a values (15, 1, 'k0', 3)\ninsert into a values (16, 2, 'k1', 4)\ninsert into a values (17, 3, 'k2', 5)\ninsert into a values (18, NULL, 'k3', 0)\ninsert into a values (19, 5, 'k4', 1)\ninsert into a values (20, 6, 'k0', 2)\ninsert into a values (21, 0, 'k1', 3)\ninsert into a values (22, 1, NULL, 4)\ninsert into a values (23, 2, 'k3', 5)\ninsert into a values (24, 3, 'k4', 0)\ninsert into a values (25, 4, 'k0', 1)\ninsert into a values (26, 5, 'k1', NULL)\ninsert into a values (27, NULL, 'k2', 3)\ninsert into a values (28, 0, 'k3', 4)\ninsert into a values (29, 1, 'k4', 5)\ninsert into a values (30, 2, 'k0', 0)\ninsert into a values (31, 3, 'k1', 1)\ninsert into a values (32, 4, 'k2', 2)\ninsert into a values (33, 5, NULL, 3)\ninsert into a values (34, 6, 'k4', 4)\ninsert into a values (35, 0, 'k0', 5)\ninsert into a values (36, NULL, 'k1', 0)\ninsert into a values (37, 2, 'k2', 1)\ninsert into a values (38, 3, 'k3', 2)\ninsert into a values (39, 4, 'k4', NULL)\ninsert into a values (40, 5, 'k0', 4)\ninsert into b values (1, 1, 3, 'K1')\ninsert into b values (2, 2, 6, 'K2')\ninsert into b values (3, 3, 1, 'K3')\ninsert into b values (4, 4, 4, 'K0')\ninsert into b values (5, 5, 7, 'K1')\ninsert into b values (6, 0, 2, 'K2')\ninsert into b values (7, 1, NULL, 'K3')\ninsert into b values (8, 2, 0, 'K0')\ninsert into b values (9, 3, 3, 'K1')\ninsert into b values (10, NULL, 6, 'K2')\ninsert into b values (11, 5, 1, 'K3')\ninsert into b values (12, 0, 4, 'K0')\ninsert into b values (13, 1, 7, 'K1')\ninsert into b values (14, 2, NULL, 'K2')\ninsert into b values (15, 3, 5, 'K3')\ninsert into b values (16, 4, 0, 'K0')\ninsert into b values (17, 5, 3, 'K1')\ninsert into b values (18, 0, 6, 'K2')\ninsert into b values (19, 1, 1, 'K3')\ninsert into b values (20, NULL, 4, 'K0')\ninsert into b values (21, 3, NULL, 'K1')\ninsert into b values (22, 4, 2, 'K2')\ninsert into b values (23, 5, 5, 'K3')\ninsert into b values (24, 0, 0, 'K0')\ninsert into b values (25, 1, 3, 'K1')\ninsert into b values (26, 2, 6, 'K2')\ninsert into b values (27, 3, 1, 'K3')\ninsert into b values (28, 4, NULL, 'K0')\ninsert into b values (29, 5, 7, 'K1')\ninsert into b values (30, NULL, 2, 'K2')\ninsert into n values (1, 1, 1)\ninsert into n values (2, 2, 2)\ninsert into n values (3, 3, 3)\ninsert into n values (4, 4, 4)\ninsert into n values (5, 5, 0)\ninsert into n values (6, 0, 1)\ninsert into n values (7, 1, 2)\ninsert into n values (8, 2, 3)\ninsert into n values (9, 3, 4)\ninsert into n values (10, 4, 0)\ninsert into n values (11, 5, 1)\ninsert into n values (12, 0, 2)"
+const QUERIES = "select count(*) as n from a where x > (select count(*) from b where b.k = a.c)\nselect id from a where x >= (select sum(v) from b where b.k = a.c) order by id\nselect id from a where (select count(*) from e where e.k = a.c) = 0 and id < 5 order by id\nselect id from a where x < (select max(v) from b where b.k = a.c and b.v < 6) order by id\nselect id from a where (select count(*) from b where lower(b.s) = a.s) > 3 order by id\nselect id, (select count(*) from b where b.k = a.c) as n from a order by id\nselect id, (select sum(v) from b where b.k = a.c) as s from a order by id\nselect id from a order by (select count(*) from n where n.k = a.x) desc, id fetch first 5 rows only\nselect a.id, t.n from a cross apply (select count(*) as n from b where b.k = a.c) t order by a.id\nselect a.id, t.n, t.s from a outer apply (select count(*) as n, sum(v) as s from b where b.k = a.c) t order by a.id\nselect a.id, t.k, t.n from a cross apply (select k, count(*) as n from b where b.k = a.c group by k) t order by a.id\nselect a.id, t.n from a outer apply (select k, count(*) as n from b where b.k = a.c group by k) t order by a.id\nselect a.id, t.n from a, lateral (select count(*) as n from e where e.k = a.c) t where a.id < 4 order by a.id\nselect count(*) as n from a where x > (select 10 / count(*) from n where n.k = a.c)"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr()) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            var pipedNew = 0
+            var pipedOld = 0
+            let text: str = QUERIES
+            for q in strings.lines(&text) {
+                lexdb_plan.setUnnest(31)
+                let j0 = lexdb_pipe.joinCounts()[0]
+                let x = qtext(mut &c, &q)
+                let j1 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(7)
+                let y = qtext(mut &c, &q)
+                let j2 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(31)
+                if j1 > j0 { pipedNew += 1 }
+                if j2 > j1 { pipedOld += 1 }
+                println(if x == y { x } else { x + " (the plan before: " + y + ")" })
+            }
+            println("piped: " + pipedNew.toStr() + " new, " + pipedOld.toStr() + " before")
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(46), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

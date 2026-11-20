@@ -16,6 +16,9 @@
 //   after a join, a grouped outer query, LIMIT and ORDER BY outside, errors
 //   in the aggregate's argument (run once already; or stays per row) and in
 //   the expression over it (per outer row, as a run per row).
+// - lateral (5e): a correlated FROM subquery with an aggregate (LATERAL,
+//   CROSS JOIN LATERAL, LEFT JOIN LATERAL ... ON true, with and without
+//   GROUP BY) as a join and a grouping.
 // timeout: 120
 // expect: create table t1 (id int primary key, a int, b text, c int, d numeric) -> CREATE TABLE
 // expect: insert into t1 select g, case when g % 23 = 0 then null else g % 50 end, case when g % 19 = 0 then null else 'b' || (g % 30) end, case when g % 29 = 0 then null else g % 40 end, (g % 7) * 1.5 from generate_series(1, 3000) g -> INSERT 0 3000
@@ -35,6 +38,9 @@
 // expect: plan scalar per row: scan t1: primary key range; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup, index only;   aggregate
 // expect: plan scalar select list: scan t1: primary key range; left join subquery 1: hash on (k) over rows of subquery 1; order: the scan's; subquery 1 (scalar): grouped on t3.k = t1.c, run once;   scan t3: full scan;   aggregate
 // expect: plan scalar argument may fail: scan t1: full scan; aggregate; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup, rows in key order;   aggregate
+// expect: lateral: 22 queries, 22 the same, made yyynnyyyyyyyyyyyynnnnn, piped yyynnyyyyyyyyyyyynnnnn
+// expect: plan lateral count: scan t1: primary key range (estimated 79 rows); left join x: hash on (k) over rows of subquery 1; order: the scan's; subquery 1 (from): grouped on t3.k = t1.c, run once;   scan t3: full scan;   aggregate
+// expect: plan lateral grouped: scan t1: primary key range (estimated 79 rows); left join x: hash on (k) over rows of subquery 1; order: the scan's; subquery 1 (from): grouped on t3.k = t1.c, run once;   scan t3: full scan;   aggregate
 // expect: plan scalar rules: scan t1: full scan; aggregate; subquery 1 (scalar): per row, on t1.c;   scan t2: index t2k lookup;   aggregate
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -83,7 +89,7 @@ type Group = record { name: str; word: str; n: int; same: int; made: str; piped:
 
 fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, made: "", piped: "", seen: []} }
 
-const ALL: int = 15
+const ALL: int = 31
 const BEFORE: int = 7
 
 fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
@@ -200,6 +206,38 @@ fn body(st: lexdb_store.Store): int {
     explain(mut &s, &"scalar per row", &"select id from t1 where id < 6 and a > (select count(*) from t2 where t2.k = t1.c)")
     explain(mut &s, &"scalar select list", &"select id, (select count(*) from t3 where t3.k = t1.c) from t1 where id < 60 order by id")
     explain(mut &s, &"scalar argument may fail", &"select count(*) from t1 where a > (select sum(10 / (v - 3)) from t2 where t2.k = t1.c)")
+    var gl = newGroup(&"lateral", &"(from): grouped on")
+    let ls = [
+        // no GROUP BY: a row for every outer row (count 0, sum NULL where no inner row)
+        "select t1.id, x.n from t1, lateral (select count(*) n from t3 where t3.k = t1.c) x where t1.id < 80 order by t1.id",
+        "select t1.id, x.s, x.m, x.a from t1 cross join lateral (select sum(v) s, max(v) m, avg(v) a from t3 where t3.k = t1.c) x where t1.id < 80 order by t1.id",
+        "select t1.id, x.n, x.s from t1 left join lateral (select count(*) n, sum(v) s from t3 where t3.k = t1.c) x on true where t1.id < 80 order by t1.id",
+        "select count(*), sum(x.n), sum(x.c) from t1, lateral (select count(*) + 1 n, count(v) c from t3 where t3.k = t1.c) x",
+        "select count(*), sum(x.n) from t1, lateral (select coalesce(sum(v), -1) n from t3 where t3.k = t1.c) x",
+        "select t1.id, x.n from t1, lateral (select count(*) n from t3 where t3.k = t1.c) x where x.n = 0 order by t1.id limit 20",
+        "select t1.id, x.n from t1, lateral (select count(*) n from t3 where t3.k = t1.c and t3.v = t1.a) x where t1.id < 200 order by x.n desc, t1.id limit 15",
+        "select count(*), sum(x.n) from t1, lateral (select count(*) n from t3 where t3.s = t1.b) x",
+        "select count(*), sum(x.n), count(x.s) from t1, lateral (select count(*) n, sum(v) s from e where e.k = t1.c) x",
+        "select * from t1, lateral (select count(*) from t3 where t3.k = t1.c) x where t1.id < 6 order by t1.id",
+        "select t1.id, x.n from t1 join nn on nn.id = t1.id, lateral (select count(*) n from t3 where t3.k = nn.k) x order by t1.id limit 30",
+        // GROUP BY: no row where no group (CROSS), NULLs (LEFT)
+        "select t1.id, x.k, x.n from t1, lateral (select k, count(*) n from t3 where t3.k = t1.c group by k) x where t1.id < 80 order by t1.id",
+        "select t1.id, x.n from t1 left join lateral (select k, count(*) n from t3 where t3.k = t1.c group by k) x on true where t1.id < 80 order by t1.id",
+        "select t1.id, x.v, x.n from t1, lateral (select v, count(*) n from t3 where t3.k = t1.c group by v) x where t1.id < 20 order by 1, 2",
+        "select t1.id, x.n from t1, lateral (select k, count(*) n from t3 where t3.k = t1.c group by k having count(*) > 9) x where t1.id < 100 order by t1.id",
+        "select t1.id, x.n from t1 join lateral (select k, count(*) n from t3 where t3.k = t1.c group by k) x on x.n > 9 where t1.id < 100 order by t1.id",
+        "select t1.id, x.n from t1 left join lateral (select k, count(*) n from t3 where t3.k = t1.c group by k) x on x.n > 9 where t1.id < 100 order by t1.id",
+        // stay per row: an index on the key, what may fail, an ON on a row always there, LIMIT inside
+        "select count(*), sum(x.n) from t1, lateral (select count(*) n from t2 where t2.k = t1.c) x",
+        "select count(*), sum(x.n) from t1, lateral (select sum(10 / v) n from t3 where t3.k = t1.c) x",
+        "select count(*), sum(x.n) from t1, lateral (select 100 / count(*) n from t3 where t3.k = t1.c) x",
+        "select t1.id, x.n from t1 join lateral (select count(*) n from t3 where t3.k = t1.c) x on x.n > 9 where t1.id < 100 order by t1.id",
+        "select t1.id, x.v from t1, lateral (select v from t3 where t3.k = t1.c order by v limit 1) x where t1.id < 30 order by t1.id",
+    ]
+    for x in ls { check(mut &s, mut &gl, &x) }
+    report(&gl)
+    explain(mut &s, &"lateral count", &"select t1.id, x.n from t1, lateral (select count(*) n from t3 where t3.k = t1.c) x where t1.id < 80 order by t1.id")
+    explain(mut &s, &"lateral grouped", &"select t1.id, x.n from t1 left join lateral (select k, count(*) n from t3 where t3.k = t1.c group by k) x on true where t1.id < 80 order by t1.id")
     let r = run(mut &s, &"set lexdb_planner = rules")
     explain(mut &s, &"scalar rules", &"select count(*) from t1 where a > (select 0.2 * avg(v) from t2 where t2.k = t1.c)")
     let r2 = run(mut &s, &"set lexdb_planner = cost")

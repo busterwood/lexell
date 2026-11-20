@@ -1,0 +1,138 @@
+// lexdb over TDS: subquery unnesting, the second half (optimizer 51) through the T-SQL door, checked against SQL Server 2022
+// (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's answers: the expect lines). A correlated
+// scalar aggregate in WHERE, the select list and ORDER BY (COUNT, SUM, MAX, a key with no rows, an empty table, a varchar key
+// under the session's case-insensitive collation, TOP), CROSS APPLY and OUTER APPLY over an aggregate with and without GROUP
+// BY, an error in the expression over the aggregate where a key has no rows. Against lexdb each batch runs with the new
+// levels and with the plans before them (lexdb_plan.setUnnest(7)) in this process: a difference is shown after the answer.
+// The last line: how many batches the pipeline's joins ran with the new levels and how many with the plans before.
+// expect: ok
+// expect: (40)
+// expect: ok
+// expect: (30)
+// expect: ok
+// expect: (12)
+// expect: ok
+// expect: n: 8
+// expect: id: 34
+// expect: id: 1;2;3;4
+// expect: id: 1;3;7;10;11;15;16;17;21;22;23;24;28;29;30;35;37
+// expect: id: 1;2;3;5;6;7;8;10;12;13;15;16;17;18;20;21;23;25;26;27;28;30;31;32;35;36;37;38;40
+// expect: id,n: 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|0;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|0;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|0;40|4
+// expect: id,s: 1|14;2|12;3|10;4|6;5|23;6|12;7|14;8|12;9|10;10|6;11|23;12|12;13|NULL;14|12;15|10;16|6;17|23;18|12;19|14;20|12;21|10;22|6;23|23;24|12;25|14;26|NULL;27|10;28|6;29|23;30|12;31|14;32|12;33|10;34|6;35|23;36|12;37|14;38|12;39|NULL;40|6
+// expect: id: 1;2;3;4;5
+// expect: id,n: 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|0;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|0;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|0;40|4
+// expect: id,n,s: 1|5|14;2|4|12;3|5|10;4|4|6;5|5|23;6|4|12;7|5|14;8|4|12;9|5|10;10|4|6;11|5|23;12|4|12;13|0|NULL;14|4|12;15|5|10;16|4|6;17|5|23;18|4|12;19|5|14;20|4|12;21|5|10;22|4|6;23|5|23;24|4|12;25|5|14;26|0|NULL;27|5|10;28|4|6;29|5|23;30|4|12;31|5|14;32|4|12;33|5|10;34|4|6;35|5|23;36|4|12;37|5|14;38|4|12;39|0|NULL;40|4|6
+// expect: id,k,n: 1|1|5;2|2|4;3|3|5;4|4|4;5|5|5;6|0|4;7|1|5;8|2|4;9|3|5;10|4|4;11|5|5;12|0|4;14|2|4;15|3|5;16|4|4;17|5|5;18|0|4;19|1|5;20|2|4;21|3|5;22|4|4;23|5|5;24|0|4;25|1|5;27|3|5;28|4|4;29|5|5;30|0|4;31|1|5;32|2|4;33|3|5;34|4|4;35|5|5;36|0|4;37|1|5;38|2|4;40|4|4
+// expect: id,n: 1|5;2|4;3|5;4|4;5|5;6|4;7|5;8|4;9|5;10|4;11|5;12|4;13|NULL;14|4;15|5;16|4;17|5;18|4;19|5;20|4;21|5;22|4;23|5;24|4;25|5;26|NULL;27|5;28|4;29|5;30|4;31|5;32|4;33|5;34|4;35|5;36|4;37|5;38|4;39|NULL;40|4
+// expect: id,n: 1|0;2|0;3|0
+// expect: error 8134
+// expect: piped: 13 new, 0 before
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_pipe"
+
+const SCRIPT = "CREATE TABLE a (id int PRIMARY KEY, x int NULL, s varchar(10) NULL, c int NULL)\nINSERT INTO a VALUES (1, 1, 'k1', 1), (2, 2, 'k2', 2), (3, 3, 'k3', 3), (4, 4, 'k4', 4), (5, 5, 'k0', 5), (6, 6, 'k1', 0), (7, 0, 'k2', 1), (8, 1, 'k3', 2), (9, NULL, 'k4', 3), (10, 3, 'k0', 4), (11, 4, NULL, 5), (12, 5, 'k2', 0), (13, 6, 'k3', NULL), (14, 0, 'k4', 2), (15, 1, 'k0', 3), (16, 2, 'k1', 4), (17, 3, 'k2', 5), (18, NULL, 'k3', 0), (19, 5, 'k4', 1), (20, 6, 'k0', 2), (21, 0, 'k1', 3), (22, 1, NULL, 4), (23, 2, 'k3', 5), (24, 3, 'k4', 0), (25, 4, 'k0', 1), (26, 5, 'k1', NULL), (27, NULL, 'k2', 3), (28, 0, 'k3', 4), (29, 1, 'k4', 5), (30, 2, 'k0', 0), (31, 3, 'k1', 1), (32, 4, 'k2', 2), (33, 5, NULL, 3), (34, 6, 'k4', 4), (35, 0, 'k0', 5), (36, NULL, 'k1', 0), (37, 2, 'k2', 1), (38, 3, 'k3', 2), (39, 4, 'k4', NULL), (40, 5, 'k0', 4)\nCREATE TABLE b (id int PRIMARY KEY, k int NULL, v int NULL, s varchar(10) NULL)\nINSERT INTO b VALUES (1, 1, 3, 'K1'), (2, 2, 6, 'K2'), (3, 3, 1, 'K3'), (4, 4, 4, 'K0'), (5, 5, 7, 'K1'), (6, 0, 2, 'K2'), (7, 1, NULL, 'K3'), (8, 2, 0, 'K0'), (9, 3, 3, 'K1'), (10, NULL, 6, 'K2'), (11, 5, 1, 'K3'), (12, 0, 4, 'K0'), (13, 1, 7, 'K1'), (14, 2, NULL, 'K2'), (15, 3, 5, 'K3'), (16, 4, 0, 'K0'), (17, 5, 3, 'K1'), (18, 0, 6, 'K2'), (19, 1, 1, 'K3'), (20, NULL, 4, 'K0'), (21, 3, NULL, 'K1'), (22, 4, 2, 'K2'), (23, 5, 5, 'K3'), (24, 0, 0, 'K0'), (25, 1, 3, 'K1'), (26, 2, 6, 'K2'), (27, 3, 1, 'K3'), (28, 4, NULL, 'K0'), (29, 5, 7, 'K1'), (30, NULL, 2, 'K2')\nCREATE TABLE n (id int PRIMARY KEY, k int NOT NULL, v int NOT NULL)\nINSERT INTO n VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 5, 0), (6, 0, 1), (7, 1, 2), (8, 2, 3), (9, 3, 4), (10, 4, 0), (11, 5, 1), (12, 0, 2)\nCREATE TABLE e (id int PRIMARY KEY, k int NULL, v int NULL)\nSELECT COUNT(*) AS n FROM a WHERE x > (SELECT COUNT(*) FROM b WHERE b.k = a.c)\nSELECT id FROM a WHERE x >= (SELECT SUM(v) FROM b WHERE b.k = a.c) ORDER BY id\nSELECT id FROM a WHERE (SELECT COUNT(*) FROM e WHERE e.k = a.c) = 0 AND id < 5 ORDER BY id\nSELECT id FROM a WHERE x < (SELECT MAX(v) FROM b WHERE b.k = a.c AND b.v < 6) ORDER BY id\nSELECT id FROM a WHERE (SELECT COUNT(*) FROM b WHERE b.s = a.s) > 3 ORDER BY id\nSELECT id, (SELECT COUNT(*) FROM b WHERE b.k = a.c) AS n FROM a ORDER BY id\nSELECT id, (SELECT SUM(v) FROM b WHERE b.k = a.c) AS s FROM a ORDER BY id\nSELECT TOP 5 id FROM a ORDER BY (SELECT COUNT(*) FROM n WHERE n.k = a.x) DESC, id\nSELECT a.id, t.n FROM a CROSS APPLY (SELECT COUNT(*) AS n FROM b WHERE b.k = a.c) t ORDER BY a.id\nSELECT a.id, t.n, t.s FROM a OUTER APPLY (SELECT COUNT(*) AS n, SUM(v) AS s FROM b WHERE b.k = a.c) t ORDER BY a.id\nSELECT a.id, t.k, t.n FROM a CROSS APPLY (SELECT k, COUNT(*) AS n FROM b WHERE b.k = a.c GROUP BY k) t ORDER BY a.id\nSELECT a.id, t.n FROM a OUTER APPLY (SELECT k, COUNT(*) AS n FROM b WHERE b.k = a.c GROUP BY k) t ORDER BY a.id\nSELECT a.id, t.n FROM a CROSS APPLY (SELECT COUNT(*) AS n FROM e WHERE e.k = a.c) t WHERE a.id < 4 ORDER BY a.id\nSELECT COUNT(*) AS n FROM a WHERE x > (SELECT 10 / COUNT(*) FROM n WHERE n.k = a.c)"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error number
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// local: lexdb in this process, each batch with the new levels and today's plans
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(a0) {
+            var a = a0
+            var pipedNew = 0
+            var pipedOld = 0
+            let text: str = SCRIPT
+            for q in strings.lines(&text) {
+                if !local {
+                    println(show(mut &a, &q))
+                    continue
+                }
+                lexdb_plan.setUnnest(31)
+                let j0 = lexdb_pipe.joinCounts()[0]
+                let x = show(mut &a, &q)
+                let j1 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(7)
+                let y = show(mut &a, &q)
+                let j2 = lexdb_pipe.joinCounts()[0]
+                lexdb_plan.setUnnest(31)
+                if j1 > j0 { pipedNew += 1 }
+                if j2 > j1 { pipedOld += 1 }
+                println(if x == y || !strings.startsWith(&q, "SELECT") { x } else { x + " (the plan before: " + y + ")" })
+            }
+            if local { println("piped: " + pipedNew.toStr() + " new, " + pipedOld.toStr() + " before") }
+            a.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(45), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
