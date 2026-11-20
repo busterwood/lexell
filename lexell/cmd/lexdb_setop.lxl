@@ -1,0 +1,488 @@
+// lexdb_setop: how a set operation (UNION, INTERSECT, EXCEPT, with and
+// without ALL) combines the rows of its two parts (design/lexdb-batch-gaps.md
+// item 11). Its secret: the rows' keys (rowKeyIn: NULLs alike, 2 = 2.0, under
+// the columns' collations), the held combination of two row lists (combine,
+// distinctRows), and the streamed one, where the rows are given to a sink as
+// the parts make them (runUnsorted: OFFSET and LIMIT counted as they come)
+// or to the pipeline's sort and on at the end (runSorted: ORDER BY, a top-N
+// with a LIMIT). A part is run by the caller through a hook (Part): it knows
+// the plan and the statement; this module knows what the rows are for.
+//
+// The streamed runs and the held one give the same rows in the same order:
+// UNION the left's rows, then the right's that the left did not give, each
+// once; INTERSECT and EXCEPT the left's rows that the right has or lacks,
+// each once; INTERSECT ALL and EXCEPT ALL by the right's counts of a key (a
+// left row is given while the count lasts, or past it), in the left's order.
+// It never imports lexdb_exec; from the store it takes the transaction only.
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_rows"
+import "./lexdb_bind"
+import "./lexdb_pipe"
+import "./lexdb_sort"
+import "./lexdb_store"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+type DbErr = lexdb_base.DbErr
+type OutCol = lexdb_bind.OutCol
+type OutBatch = lexdb_rows.OutBatch
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+fn lostRows(): DbErr { return e("08006", "the connection was lost while rows were sent") }
+
+// ---- keys, and the held combination
+
+// A row's key for UNION and the like: NULLs alike, 2 = 2.0 (keyPart), its
+// columns under their collations' kinds (kinds: lexdb_sql.COLL_*; a column
+// past them exact).
+pub fn rowKeyIn(vs: &[]Val, kinds: &[]int): str {
+    var kb = ""
+    // (an exact collation's value is its own key: no copy made for it)
+    for i in 0..len(vs) {
+        if i < len(kinds) && kinds[i] != lexdb_sql.COLL_EXACT {
+            lexdb_pipe.keyPart(mut &kb, &lexdb_sort.collVal(kinds[i], &vs[i]))
+        } else {
+            lexdb_pipe.keyPart(mut &kb, &vs[i])
+        }
+    }
+    return kb
+}
+
+// rows without those whose key is in seen (and no one twice), their keys
+// added to it.
+pub fn distinctRows(rows: [][]Val, seen: mut &Map[str, int], kinds: &[]int): [][]Val {
+    var all = rows
+    var out: [][]Val = []
+    for i in 0..len(all) {
+        let k = rowKeyIn(&all[i], kinds)
+        if seen.get(&k).isSome() { continue }
+        seen.put(k, 1)
+        append(mut &out, replace(mut &all[i], []))
+    }
+    return out
+}
+
+// The rows of op (lexdb_sql.SET_*) over the rows of its two parts, held.
+pub fn combine(op: int, all: bool, l: [][]Val, r: [][]Val, kinds: &[]int): [][]Val {
+    var la = l
+    var ra = r
+    if op == lexdb_sql.SET_UNION {
+        if all {
+            for i in 0..len(ra) { append(mut &la, replace(mut &ra[i], [])) }
+            return la
+        }
+        var seen: Map[str, int] = newMap()
+        var out = distinctRows(la, mut &seen, kinds)
+        let more = distinctRows(ra, mut &seen, kinds)
+        var mo = more
+        for i in 0..len(mo) { append(mut &out, replace(mut &mo[i], [])) }
+        return out
+    }
+    var cnt: Map[str, int] = newMap()
+    for row in ra {
+        let k = rowKeyIn(&row, kinds)
+        let n = cnt.get(&k).unwrapOr(0)
+        cnt.put(k, n + 1)
+    }
+    var out: [][]Val = []
+    var done: Map[str, int] = newMap()
+    for i in 0..len(la) {
+        let k = rowKeyIn(&la[i], kinds)
+        let n = cnt.get(&k).unwrapOr(0)
+        if op == lexdb_sql.SET_INTERSECT {
+            if n > 0 {
+                append(mut &out, replace(mut &la[i], []))
+                cnt.put(k, if all { n - 1 } else { 0 })
+            }
+        } else if all {
+            if n > 0 { cnt.put(k, n - 1) } else { append(mut &out, replace(mut &la[i], [])) }
+        } else if n == 0 && done.get(&k).isNone() {
+            done.put(k, 1)
+            append(mut &out, replace(mut &la[i], []))
+        }
+    }
+    return out
+}
+
+// ---- the streamed run
+
+// What a streamed run needs to know of the set operation.
+pub type Spec = record {
+    pub setop: int                  // lexdb_sql.SET_UNION, SET_INTERSECT, SET_EXCEPT
+    pub setAll: bool
+    pub limit: int                  // -1 none
+    pub offset: int
+    pub outs: []OutCol
+    pub outKinds: []int             // per output: its collation's kind (the rows' keys)
+    pub order: []Expr               // ORDER BY: output positions or names ([] not sorted)
+    pub desc: []bool
+    pub nullsFirst: []bool
+    pub ordKinds: []int             // per ORDER BY item: its collation's kind
+    pub mem: int                    // max_statement_mem (0 none)
+    pub held: int                   // the bytes the statement holds before this run
+}
+
+// The rows of a streamed run that were not given to the sink, and the rows
+// of the operation (OFFSET and LIMIT counted).
+pub type Out = record { pub rows: [][]Val; pub n: int }
+
+// What a set operation has given so far: rows still allowed by its LIMIT
+// (-1 none), rows given, whether the LIMIT is reached, the rows still to
+// skip (OFFSET). Sorted by ORDER BY: srt takes every row (the LIMIT and
+// OFFSET are its), and a failure of it is kept for the runner: bad (a value
+// it does not sort), err (max_statement_mem).
+type SetGive = record { left: int; total: int; full: bool; skip: int; srt: lexdb_pipe.SortRun; bad: bool; err: []DbErr }
+
+// The give of a set operation not sorted: its LIMIT and OFFSET.
+fn newGive(sp: &Spec): SetGive {
+    return SetGive{left: sp.limit, total: 0, full: sp.limit == 0, skip: max(sp.offset, 0), srt: lexdb_pipe.noSortRun(), bad: false, err: []}
+}
+
+// An error of the sort fed by the parts (they stopped for it), as the
+// caller's.
+fn setFailed(g: mut &SetGive): Result[Unit, DbErr] {
+    if len(g.err) > 0 { return Err(replace(mut &g.err[0], e("XX000", ""))) }
+    if g.bad { return Err(lexdb_pipe.batErr()) }
+    return Ok(Unit{})
+}
+
+// Gives one row, or a batch of them, to the sink, within the OFFSET and
+// LIMIT (to the sort, when the set operation sorts). false: stop (the LIMIT
+// is reached, or the sink refused: g.full tells which; or the sort failed:
+// g.bad, g.err).
+fn giveSet(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol, g: mut &SetGive, row: &[]Val,
+           ob: &OutBatch): bool {
+    if g.full { return false }
+    if g.srt.active() {
+        match g.srt.take(ob, row) {
+            Ok(go) {
+                if !go {
+                    g.bad = true
+                    return false
+                }
+                return true
+            }
+            Err(x) {
+                append(mut &g.err, x)
+                return false
+            }
+        }
+    }
+    let noRow: []Val = []
+    let noB = lexdb_rows.noOutBatch()
+    if ob.n == 0 {
+        if g.skip > 0 {
+            g.skip -= 1
+            return true
+        }
+        if !sink(outs, row, &noB, false) { return false }
+        g.total += 1
+        if g.left >= 0 { g.left -= 1 }
+    } else {
+        var from = 0
+        if g.skip > 0 {
+            if g.skip >= ob.n {
+                g.skip -= ob.n
+                return true
+            }
+            from = g.skip
+            g.skip = 0
+        }
+        let have = ob.n - from
+        if from == 0 && (g.left < 0 || have <= g.left) {
+            if !sink(outs, &noRow, ob, false) { return false }
+            g.total += have
+            if g.left >= 0 { g.left -= have }
+        } else {
+            // the OFFSET ends, or the LIMIT ends, inside the batch: its rows
+            // between, as rows
+            let take = if g.left < 0 || have <= g.left { have } else { g.left }
+            var r: []Val = []
+            for j in from..from + take {
+                lexdb_pipe.obRow(ob, j, mut &r)
+                if !sink(outs, &r, &noB, false) { return false }
+            }
+            g.total += take
+            if g.left >= 0 { g.left -= take }
+        }
+    }
+    if g.left == 0 { g.full = true }
+    return true
+}
+
+// How a part is run: part i of the set operation, from the statement's
+// runs (its CTEs' rows, once) holding `held` bytes, given to sink as a
+// SELECT's rows are (asked first, start true: refused, the rows come back
+// held). The rows it held (it was not asked, or refused).
+// (the transaction is the caller's, lent to each run.)
+
+// A set operation's rows given to a sink as its parts make them: not
+// sorted, its LIMIT and OFFSET counted as they come.
+pub fn runUnsorted(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool,
+                   part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr]): Result[Out, DbErr] {
+    var g = newGive(sp)
+    try setRun(txn, sp, sink, part, mut &g)
+    return Ok(Out{rows: [], n: g.total})
+}
+
+// A set operation's ORDER BY keys as output columns (orderValue's: a
+// position, or the first output of that name); [] when one is not.
+pub fn keyCols(order: &[]Expr, outs: &[]OutCol): []int {
+    var out: []int = []
+    for o in order {
+        var at = -1
+        match o {
+            Expr.Lit(v) { match v { Val.Int(n) { if n >= 1 && n <= len(outs) { at = n - 1 } } else {} } }
+            Expr.Col(n, _) { for i in 0..len(outs) { if at < 0 && outs[i].name == n { at = i } } }
+            else {}
+        }
+        if at < 0 { return [] }
+        append(mut &out, at)
+    }
+    return out
+}
+
+// A set operation with ORDER BY given to a sink: the parts' rows go to the
+// pipeline's sort as they come (a top-N with a LIMIT: the rows kept are
+// LIMIT + OFFSET), and the rows kept, cut by OFFSET and LIMIT, go on at the
+// end as one chunk (as a SELECT's sort gives them; returned held when the
+// sink wants no chunk). batErr: a value the sort does not hold (nothing
+// given: the caller runs the statement held).
+pub fn runSorted(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool,
+                 part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr]): Result[Out, DbErr] {
+    let kc = keyCols(&sp.order, &sp.outs)
+    if len(kc) == 0 || len(kc) != len(sp.order) { return Err(lexdb_pipe.batErr()) }
+    let room = if sp.mem > 0 { sp.mem - sp.held } else { -1 }
+    var g = newGive(sp)
+    g.left = -1
+    g.skip = 0
+    g.full = false
+    g.srt = lexdb_pipe.setSort(len(sp.outs), kc, collections.copyOf(&sp.desc), collections.copyOf(&sp.nullsFirst),
+                               collections.copyOf(&sp.ordKinds), sp.limit, sp.offset, room, sp.mem)
+    try setRun(txn, sp, sink, part, mut &g)
+    var bud = lexdb_pipe.newBudget()
+    bud.held = sp.held
+    bud.maxHeld = sp.mem
+    let noRow: []Val = []
+    let noB = lexdb_rows.noOutBatch()
+    var asked = false
+    var want = false
+    var rows: [][]Val = []
+    var row: []Val = []
+    let n = try g.srt.done(txn, mut &bud, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
+        if !asked {
+            asked = true
+            want = sink(&sp.outs, &noRow, &noB, true)
+        }
+        if want {
+            if !sink(&sp.outs, &noRow, ob, false) { return Err(lostRows()) }
+            return Ok(true)
+        }
+        for j in 0..ob.n {
+            lexdb_pipe.obRow(ob, j, mut &row)
+            append(mut &rows, collections.copyOf(&row))
+        }
+        return Ok(true)
+    })
+    return Ok(Out{rows: rows, n: n})
+}
+
+// The parts of a set operation run, their rows given to g's sink (or sort).
+fn setRun(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool,
+          part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr],
+          g: mut &SetGive): Result[Unit, DbErr] {
+    if sp.setAll && sp.setop == lexdb_sql.SET_UNION { return runSetTo(txn, sp, sink, part, g) }
+    return runSetKeys(txn, sp, sink, part, g)
+}
+
+// A UNION ALL given to a sink: the left part's rows, then the right's, each
+// part run as a SELECT with the statement's parameters that it reads, from
+// what the statement's runs share (its CTEs' rows, run once). A part stops
+// as soon as the LIMIT is reached.
+fn runSetTo(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool,
+            part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr],
+            g: mut &SetGive): Result[Unit, DbErr] {
+    for i in 0..2 {
+        if g.full { break }
+        var asked = false
+        let r = part(txn, i, sp.held + g.srt.held(), fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+            if start {
+                asked = true
+                return true
+            }
+            return giveSet(sink, &sp.outs, mut &g, row, ob) && !g.full
+        })
+        try setFailed(mut &g)
+        match r {
+            Ok(rows) {
+                // a part that held its rows (not streamed): given here
+                if !asked {
+                    let noB = lexdb_rows.noOutBatch()
+                    for row in rows {
+                        if !giveSet(sink, &sp.outs, mut &g, &row, &noB) {
+                            try setFailed(mut &g)
+                            if !g.full { return Err(lostRows()) }
+                            break
+                        }
+                        if g.full { break }
+                    }
+                }
+            }
+            Err(x) {
+                // the LIMIT stopped the part: its refusal is no error
+                if !g.full { return Err(x) }
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// One part of a set operation run for its rows' keys: proc gets each row's
+// key (rowKeyIn's under kinds, the collations of the columns), then the
+// batch ob and the row's place j in it (ob.n > 0), or the row (ob.n 0), in
+// order, and returns false to stop. A batch's keys are made from its
+// columns (lexdb_pipe.obKey), no row made. Ok(true): stopped (by proc, or
+// by the sink's refusal, which the caller tells apart). A part that held
+// its rows is given to proc here. held: what the statement holds meanwhile.
+fn setPart(txn: mut &lexdb_store.Txn, i: int, held: int, kinds: &[]int,
+           part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr],
+           proc: &fn(&str, &OutBatch, int, &[]Val): bool): Result[bool, DbErr] {
+    var asked = false
+    var stopped = false
+    var kb = ""
+    let noRow: []Val = []
+    let noB = lexdb_rows.noOutBatch()
+    let r = part(txn, i, held, fn(cs: &[]OutCol, row: &[]Val, ob: &OutBatch, start: bool): bool {
+        if start {
+            asked = true
+            return true
+        }
+        if stopped { return false }
+        if ob.n == 0 {
+            kb = rowKeyIn(row, kinds)
+            if !proc(&kb, &noB, 0, row) {
+                stopped = true
+                return false
+            }
+            return true
+        }
+        for j in 0..ob.n {
+            lexdb_pipe.obKey(ob, j, kinds, mut &kb)
+            if !proc(&kb, ob, j, &noRow) {
+                stopped = true
+                return false
+            }
+        }
+        return true
+    })
+    match r {
+        Ok(rows) {
+            if !asked {
+                for row in rows {
+                    kb = rowKeyIn(&row, kinds)
+                    if !proc(&kb, &noB, 0, &row) { return Ok(true) }
+                }
+            }
+            return Ok(stopped)
+        }
+        Err(x) {
+            // (a part stopped by proc or the sink: its refusal is no error)
+            if stopped { return Ok(true) }
+            return Err(x)
+        }
+    }
+}
+
+// The row a part gave to setPart's proc (place j of the batch ob, or r),
+// given by giveSet; one holds a batch's row.
+fn giveAt(sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, outs: &[]OutCol, g: mut &SetGive, ob: &OutBatch, j: int,
+          r: &[]Val, one: mut &[]Val): bool {
+    let noB = lexdb_rows.noOutBatch()
+    if ob.n == 0 { return giveSet(sink, outs, g, r, &noB) && !g.full }
+    lexdb_pipe.obRow(ob, j, one)
+    return giveSet(sink, outs, g, one, &noB) && !g.full
+}
+
+// What a distinct set operation keeps of a row's key in its sets, per key
+// (the map's share, charged with the key against max_statement_mem).
+const SET_KEY_BYTES = 48
+
+// UNION, INTERSECT and EXCEPT, with or without ALL, except UNION ALL, given
+// to a sink as their parts make their rows. UNION gives the left part's
+// rows, then the right's that the left did not give (each once). INTERSECT
+// and EXCEPT read the right part's keys first, then give the left's rows the
+// right has (INTERSECT) or lacks (EXCEPT), each once; with ALL the right's
+// keys are counted, and a left row is given while its key's count lasts
+// (INTERSECT ALL, each given row using one) or once it is spent (EXCEPT ALL,
+// each row skipped using one), in the left's order, as combine does. A row's
+// key is rowKeyIn's, as combine's, so the same rows are alike here and in
+// the held path. Keys are charged against sp.mem with what the statement
+// held before (a statement holding more fails as the held path does), and a
+// part runs holding them, as the held path's right part runs holding the
+// left's rows.
+fn runSetKeys(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool,
+              part: &fn(mut &lexdb_store.Txn, int, int, &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[[][]Val, DbErr],
+              g: mut &SetGive): Result[Unit, DbErr] {
+    let kinds: []int = collections.copyOf(&sp.outKinds)
+    let mode = sp.setop
+    let all = sp.setAll
+    var seen: Map[str, int] = newMap()
+    var rset: Map[str, int] = newMap()
+    var bytes = sp.held
+    var over = false
+    if mode != lexdb_sql.SET_UNION && !g.full {
+        // the right part's keys (no rows given), with ALL their counts
+        let rstop = try setPart(txn, 1, bytes, &kinds, part, fn(k: &str, ob: &OutBatch, j: int, r: &[]Val): bool {
+            let n = rset.get(k).unwrapOr(0)
+            if n > 0 {
+                if all { rset.put(k.clone(), n + 1) }
+                return true
+            }
+            bytes += len(k) + SET_KEY_BYTES
+            if sp.mem > 0 && bytes > sp.mem {
+                over = true
+                return false
+            }
+            rset.put(k.clone(), 1)
+            return true
+        })
+        if over { return Err(lexdb_pipe.memErr(sp.mem)) }
+    }
+    var one: []Val = []
+    let sides: []int = if mode == lexdb_sql.SET_UNION { [0, 1] } else { [0] }
+    for i in sides {
+        if g.full { break }
+        let stopped = try setPart(txn, i, bytes + g.srt.held(), &kinds, part, fn(k: &str, ob: &OutBatch, j: int, r: &[]Val): bool {
+            if g.full { return false }
+            if mode != lexdb_sql.SET_UNION {
+                let n = rset.get(k).unwrapOr(0)
+                if all {
+                    if mode == lexdb_sql.SET_INTERSECT {
+                        if n <= 0 { return true }
+                        rset.put(k.clone(), n - 1)
+                    } else if n > 0 {
+                        rset.put(k.clone(), n - 1)
+                        return true
+                    }
+                    return giveAt(sink, &sp.outs, mut &g, ob, j, r, mut &one)
+                }
+                if (mode == lexdb_sql.SET_INTERSECT) != (n > 0) { return true }
+            }
+            if seen.get(k).isSome() { return true }
+            bytes += len(k) + SET_KEY_BYTES
+            if sp.mem > 0 && bytes > sp.mem {
+                over = true
+                return false
+            }
+            seen.put(k.clone(), 1)
+            return giveAt(sink, &sp.outs, mut &g, ob, j, r, mut &one)
+        })
+        if over { return Err(lexdb_pipe.memErr(sp.mem)) }
+        try setFailed(mut &g)
+        if stopped && !g.full { return Err(lostRows()) }
+    }
+    return Ok(Unit{})
+}
