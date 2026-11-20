@@ -91,9 +91,9 @@ levels program (`levelsProg`, `Query.jp`). The pipeline reads a table whose
 | E44 | `agg(x ORDER BY …)`; `STRING_AGG/LISTAGG … WITHIN GROUP (ORDER BY …)` | B + O:HashAgg (sorted per group) or SortAgg | name `" order:"`; `lexdb_agg` `orderedParts`; `PCall.more`/`dirs` (separator and keys per value) | both (`BA_GEN`) | order within group | exec_aggorder, exec_aggpipe, tds_tsql, tns_oracle |
 | E45 | `count(v.*)` (MATCH_RECOGNIZE) | B | `primary` (parse) | row | — | exec_mr |
 | E46 | `GROUPING(a, …)` | B | `setSubst`, `hasGrouping` | both (a constant per grouping set: the groups' views, `Sel.gx`, hold it; the sets run in the pipeline, C4) | — | forms_queries |
-| E47 | window calls `f(…) OVER (PARTITION BY … ORDER BY …)`: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag/lead`, `first/last/nth_value`, aggregates | B (`winPlan`, `mergeWin`) + O:Window | `winValues`, `winPartition`, `winCmp`; input rows by `winBatch` | row (window values); its input rows batch for one table (`winBatch`) or over joins by a levels program (`Query.jp`) | order within partition | exec_window, exec_batchsort |
-| E48 | frames `ROWS/RANGE/GROUPS BETWEEN … PRECEDING/FOLLOWING`, `EXCLUDE CURRENT ROW/GROUP/TIES` | O:Window | `frameBounds`, `frameOff`, `rangeTarget`, `excluded` | row | — | exec_window |
-| E49 | named windows `WINDOW w AS (…)`, `OVER w`, `OVER (w …)` | B | `mergeWin`, `winSpecText` | row | — | exec_window |
+| E47 | window calls `f(…) OVER (PARTITION BY … ORDER BY …)`: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag/lead`, `first/last/nth_value`, aggregates | B (`winPlan`, `mergeWin`) + O:Window | `lexdb_window` (`covers`, `sortRows`, `values`) for the first group; `winValues`, `winPartition` (row) for the rest; input rows by `winBatch` | both for a query whose every call `covers` takes (batch 10a: the rank family, `ntile`, `lag/lead`, `first/last/nth_value` under the default frame or the whole partition's: the order by typed key columns read from the rows, partitions and peers by position, the values by column; the rest of the query as row); row for any other query (aggregates over frames, offsets, EXCLUDE: 10b, 10c); its input rows batch for one table (`winBatch`) or over joins by a levels program (`Query.jp`) | order within partition | exec_window, exec_batchsort, exec_winbatch |
+| E48 | frames `ROWS/RANGE/GROUPS BETWEEN … PRECEDING/FOLLOWING`, `EXCLUDE CURRENT ROW/GROUP/TIES` | O:Window | `winPartition`, and `lexdb_window.frameBounds`, `excluded` (row); 10a takes only `UNBOUNDED PRECEDING` to `CURRENT ROW` or `UNBOUNDED FOLLOWING`, none excluded, for the value functions | row (10a: those two frames for `first/last/nth_value`; the other calls ignore it) | — | exec_window, exec_winbatch |
+| E49 | named windows `WINDOW w AS (…)`, `OVER w`, `OVER (w …)` | B | `mergeWin`, `lexdb_window.winSpecText` | both (merged before the call is planned; a call it merges takes the path its frame and function allow) | — | exec_window, exec_winbatch |
 | E50 | Oracle `ROWNUM` outside WHERE's simple tests | B (parse → `row_number() OVER ()`) + O:Window | `oraPrimary` (parse) | row | scan order | tns_oracle |
 
 ## 2. FROM and joins
@@ -238,7 +238,7 @@ today and left out below, so 119 are supported.
   only in batches.
 
 A construct that is both as a filter and row as an index lookup (E18, E20)
-counts as both; E47 (window values row, input rows batch) counts as row;
+counts as both; E47 (window values: 10a's calls batch, the rest row; input rows batch) counts as row until 10c;
 F10's kin (first level row, later level a hash) count as both.
 
 ## 8. Row-only constructs that need special handling in a chunk pipeline
@@ -297,7 +297,7 @@ derived tables, CTEs, VALUES, function scans and catalog relations as a first
 level (F10–F16, F19), recursive CTEs (F13), SRFs in the select list (F17),
 set operations (D1–D4), grouping sets and GROUPING (C4, E46: done, `AggSets`), aggregates
 other than count/sum/avg/min/max and DISTINCT/ORDER BY aggregates
-(E41, E42, E44), window values (E47–E49), IN-list, `= ANY` and IN-subquery
+(E41, E42, E44), window values (E47–E49: 10a done, `lexdb_window`; aggregates over frames and the other frames left), IN-list, `= ANY` and IN-subquery
 lookups and PK point reads (E18, E20, E35, F1), uncorrelated subqueries
 inside an expression in the row engine (E31, done: `bSubNode`), `#tdiv`/`#tavg`
 (E24, done: `lexdb_lib`) and reg casts (E11, left: they need the session's
