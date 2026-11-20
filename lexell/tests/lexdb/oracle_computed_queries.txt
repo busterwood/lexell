@@ -1,0 +1,84 @@
+# Oracle virtual columns and function-based indexes of design/lexdb-dialect-gaps.md package C, as lexdb over TNS runs them (tests/lexdb/gen_oracle.py computed); the answers are by hand from Oracle's documentation (no Oracle was at hand). q or x, label, statement, answer (tab separated).
+x	table	create table g (id number primary key, a number, b number, v number generated always as (a + b) virtual, w as (a * 2), s varchar2(20), u varchar2(30) generated always as (upper(s)) virtual)	0
+x	insert 1	insert into g (id, a, b, s) values (1, 2, 3, 'x')	1
+x	insert 2 nulls	insert into g (id, a, b, s) values (2, null, 3, null)	1
+x	insert 3	insert into g (id, a, b, s) values (3, 5, 5, 'yz')	1
+x	value for virtual	insert into g values (4, 1, 1, 1, 1, 'y', 'z')	error 54013
+x	too few values	insert into g values (4, 1, 1, 'y')	error 947
+x	insert v	insert into g (id, a, b, v) values (4, 1, 1, 1)	error 54013
+x	insert w	insert into g (id, a, b, w) values (4, 1, 1, 1)	error 54013
+x	insert u	insert into g (id, a, b, u) values (4, 1, 1, 'q')	error 54013
+x	update v	update g set v = 1 where id = 1	error 54017
+x	update u	update g set u = 'q' where id = 1	error 54017
+x	update a	update g set a = 10 where id = 1	1
+x	update b and s	update g set b = b + 1, s = 'new' where id = 2	1
+q	select columns	select id, a, b, v, w, s, u from g order by id	ID,A,B,V,W,S,U = 1|10|3|13|20|'x'|'X';2|NULL|4|NULL|NULL|'new'|'NEW';3|5|5|10|10|'yz'|'YZ'
+q	select star	select * from g order by id	ID,A,B,V,W,S,U = 1|10|3|13|20|'x'|'X';2|NULL|4|NULL|NULL|'new'|'NEW';3|5|5|10|10|'yz'|'YZ'
+q	where virtual	select id from g where v = 13	ID = 1
+q	where either	select id from g where w = 10 or u = 'NEW' order by id	ID = 2;3
+q	group by virtual	select v, count(*) from g group by v order by v	V,COUNT(*) = 10|1;13|1;NULL|1
+q	order by virtual	select id, v from g order by v desc, id	ID,V = 2|NULL;1|13;3|10
+x	index on virtual	create index ix_v on g (v)	0
+x	unique index on virtual	create unique index ux_w on g (w)	0
+x	unique violated	insert into g (id, a, b) values (5, 5, 0)	error 1
+x	insert 5	insert into g (id, a, b) values (5, 4, 0)	1
+q	read by index	select id from g where v = 4	ID = 5
+x	function-based case	create index ix_case on g (case when a > 5 then 1 else 0 end)	0
+x	function-based sum	create index ix_sum on g (a + b)	0
+x	function-based two	create index ix_up on g (upper(s), a * 2 desc)	0
+x	function-based unique	create unique index ux_fn on g (nvl(b, 0) * 100 + id)	0
+x	not pure	create index ix_bad on g (sysdate + a)	error 1743
+x	no column	create index ix_bad2 on g (nope + 1)	error 904
+q	case predicate	select id from g where case when a > 5 then 1 else 0 end = 1	ID = 1
+q	sum predicate	select id from g where a + b = 13	ID = 1
+x	insert 6	insert into g (id, a, b) values (6, 7, 7)	1
+q	case after insert	select id from g where case when a > 5 then 1 else 0 end = 1 order by id	ID = 1;6
+q	sum after insert	select id from g where a + b = 14	ID = 6
+x	update 6	update g set a = 1 where id = 6	1
+q	sum after update	select id from g where a + b = 14	ID = 
+q	sum after update 2	select id from g where a + b = 8	ID = 6
+x	unique function	insert into g (id, a, b) values (7, 2, 0)	1
+x	unique function again	insert into g (id, a, b) values (7, 2, 0)	error 1
+x	delete 6	delete from g where id = 6	1
+q	sum after delete	select id from g where a + b = 8	ID = 
+q	indexes	select index_name, index_type, uniqueness from user_indexes where table_name = 'G' and index_name <> 'G_PKEY' order by index_name	INDEX_NAME,INDEX_TYPE,UNIQUENESS = 'IX_CASE'|'FUNCTION-BASED NORMAL'|'NONUNIQUE';'IX_SUM'|'FUNCTION-BASED NORMAL'|'NONUNIQUE';'IX_UP'|'FUNCTION-BASED NORMAL'|'NONUNIQUE';'IX_V'|'FUNCTION-BASED NORMAL'|'NONUNIQUE';'UX_FN'|'FUNCTION-BASED NORMAL'|'UNIQUE';'UX_W'|'FUNCTION-BASED NORMAL'|'UNIQUE'
+q	index columns	select index_name, column_name, column_position, descend from user_ind_columns where table_name = 'G' and index_name in ('IX_CASE', 'IX_UP', 'IX_V', 'UX_W') order by index_name, column_position	INDEX_NAME,COLUMN_NAME,COLUMN_POSITION,DESCEND = 'IX_CASE'|'SYS_NC00008$'|1|'ASC';'IX_UP'|'SYS_NC00010$'|1|'ASC';'IX_UP'|'SYS_NC00011$'|2|'DESC';'IX_V'|'V'|1|'ASC';'UX_W'|'W'|1|'ASC'
+q	index expressions	select index_name, column_expression, column_position from user_ind_expressions where table_name = 'G' order by index_name, column_position	INDEX_NAME,COLUMN_EXPRESSION,COLUMN_POSITION = 'IX_CASE'|'CASE WHEN "A">5 THEN 1 ELSE 0 END'|1;'IX_SUM'|'"A"+"B"'|1;'IX_UP'|'UPPER("S")'|1;'IX_UP'|'"A"*2'|2;'UX_FN'|'NVL("B",0)*100+"ID"'|1
+x	table c	create table c (a number, b number generated always as (a * 2) virtual, c varchar2(5) as (to_char(a)), d number default 7)	0
+q	tab cols	select column_name, data_type, virtual_column, data_default, hidden_column from user_tab_cols where table_name = 'C' order by column_id	COLUMN_NAME,DATA_TYPE,VIRTUAL_COLUMN,DATA_DEFAULT,HIDDEN_COLUMN = 'A'|'NUMBER'|'NO'|NULL|'NO';'B'|'NUMBER'|'YES'|'"A"*2'|'NO';'C'|'VARCHAR2'|'YES'|'TO_CHAR("A")'|'NO';'D'|'NUMBER'|'NO'|'7'|'NO'
+q	tab columns	select column_name, data_type, data_default from user_tab_columns where table_name = 'C' order by column_id	COLUMN_NAME,DATA_TYPE,DATA_DEFAULT = 'A'|'NUMBER'|NULL;'B'|'NUMBER'|'"A"*2';'C'|'VARCHAR2'|'TO_CHAR("A")';'D'|'NUMBER'|'7'
+x	insert c	insert into c (a) values (12)	1
+q	select c	select * from c	A,B,C,D = 12|24|'12'|7
+x	add short	alter table g add (x as (a + 1))	0
+x	add virtual	alter table g add x2 number generated always as (b + 1) virtual	0
+x	add list	alter table g add (x3 number as (a + 100) virtual)	0
+q	added columns	select id, a, x, x2, x3 from g order by id	ID,A,X,X2,X3 = 1|10|11|4|110;2|NULL|NULL|5|NULL;3|5|6|6|105;5|4|5|1|104;7|2|3|1|102
+x	reads a virtual	alter table g add y as (v + 1)	error 54012
+x	unknown column	alter table g add y number generated always as (nope + 1)	error 904
+x	sysdate	alter table g add y number generated always as (sysdate) virtual	error 54002
+x	subquery	alter table g add y number generated always as ((select 1 from dual))	error 54016
+x	rename a read column	alter table g rename column a to aa	error 54031
+x	rename a virtual column	alter table g rename column w to ww	0
+q	renamed	select column_name from user_tab_cols where table_name = 'G' and column_name in ('A', 'AA', 'W', 'WW') order by column_name	COLUMN_NAME = 'A';'WW'
+x	modify a read column	alter table g modify (a number(5))	error 54033
+x	drop a read column	alter table g drop column a	error 54027
+x	drop a virtual column	alter table g drop column x	0
+q	columns	select column_name from user_tab_cols where table_name = 'G' and column_name not like 'SYS_NC%' order by column_id	COLUMN_NAME = 'ID';'A';'B';'V';'WW';'S';'U';'X2';'X3'
+x	table not null	create table h (a number, b number generated always as (a * 2) virtual not null)	0
+x	not null ok	insert into h (a) values (1)	1
+x	not null violated	insert into h (a) values (null)	error 1400
+x	table check	create table h2 (a number, b number generated always as (a * 2) virtual, constraint ck check (b > 0))	0
+x	check ok	insert into h2 (a) values (1)	1
+x	check violated	insert into h2 (a) values (-1)	error 2290
+x	table key	create table h3 (a number, b number generated always as (a * 2) virtual primary key)	0
+x	key ok	insert into h3 (a) values (1)	1
+x	key violated	insert into h3 (a) values (1)	error 1
+x	table unique	create table h6 (a number, b number generated always as (a * 2) virtual unique)	0
+x	unique ok	insert into h6 (a) values (1)	1
+x	unique violated 2	insert into h6 (a) values (1)	error 1
+x	typeless	create table h4 (a number, b generated always as (a * 2) virtual)	0
+x	typeless insert	insert into h4 (a) values (21)	1
+q	typeless select	select * from h4	A,B = 21|42
+x	table default	create table h7 (a number, b number generated always as (a * 2) virtual default 3)	error 54016
+x	table reads virtual	create table h8 (a number, b number generated always as (a * 2) virtual, c number as (b + 1))	error 54012
+x	table impure	create table h9 (a number, b date generated always as (sysdate) virtual)	error 54002

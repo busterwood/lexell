@@ -187,6 +187,8 @@ const A_VALIDATE = lexdb_sql.A_VALIDATE
 const A_ADD_IDENTITY = lexdb_sql.A_ADD_IDENTITY
 const A_SET_IDENTITY = lexdb_sql.A_SET_IDENTITY
 const A_DROP_IDENTITY = lexdb_sql.A_DROP_IDENTITY
+const A_DROP_EXPR = lexdb_sql.A_DROP_EXPR
+const A_SET_EXPR = lexdb_sql.A_SET_EXPR
 const QSEP = lexdb_sql.QSEP
 const ANON = lexdb_sql.ANON
 const TOP_PERCENT = lexdb_sql.TOP_PERCENT
@@ -1093,9 +1095,17 @@ fn hexDigit(c: byte): int {
 
 fn isHexDigit(c: byte): bool { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') }
 
+// Whether the token is + or - (or T-SQL's t+, as exprText writes it; Oracle's ||).
+fn (p: &P) isAddOp(): bool {
+    let t = &p.toks[p.pos]
+    if t.kind != T_OP { return false }
+    if len(t.text) == 1 { return t.text[0] == '+' || t.text[0] == '-' }
+    return t.text == "t+" || (p.ora && t.text == "||")
+}
+
 fn (p: mut &P) addExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.mulExpr()
-    while p.isKw("+") || p.isKw("-") || (p.ora && p.isKw("||")) {
+    while p.isAddOp() {
         let op = p.next().text
         let r = try p.mulExpr()
         if p.ora {
@@ -2343,6 +2353,7 @@ fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lex
 
 fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_CREATE)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.acceptKw("if") {
         try p.expectKw("not")
         try p.expectKw("exists")
@@ -2375,13 +2386,15 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             var c = lexdb_sql.noCol()
             c.name = n.clone()
             c.spell = p.spelled.clone()
-            try p.colType(mut &c)
+            try p.colTypeOpt(mut &c)
             while true {
                 // CONSTRAINT name names the one after it (a UNIQUE's; the
                 // others' names are not kept)
                 var cn = ""
                 if p.acceptKw("constraint") { cn = try p.name() }
-                if p.acceptKw("not") {
+                if p.ora && c.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
+                    try p.genClause(mut &c, true)
+                } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
                 } else if p.acceptKw("null") {
@@ -2740,7 +2753,11 @@ fn (p: mut &P) identity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_base.D
     }
     if p.ora && c.identity == ID_BY_DEFAULT && p.acceptKw("on") { try p.expectKw("null") }
     try p.expectKw("as")
-    if p.isKw("(") { return Err(lexdb_base.err("0A000", "lexdb: generated columns are not supported")) }
+    if p.isKw("(") {
+        if c.identity != ID_ALWAYS { return Err(lexdb_base.err("42601", "for a generated column, GENERATED ALWAYS must be specified")) }
+        c.identity = ID_NONE
+        return p.genClause(mut &c, true)
+    }
     try p.expectKw("identity")
     c.notNull = true
     // Oracle: NUMBER is the identity's type; lexdb's are integers
@@ -2751,6 +2768,63 @@ fn (p: mut &P) identity(c: mut &ColDef, s: mut &Stmt): Result[Unit, lexdb_base.D
         try p.expectKw(")")
         append(mut &s.idOpts, IdOpts{col: c.name.clone(), opts: o})
     }
+    return Ok(Unit{})
+}
+
+// A generated column's expression and kind (package C), after AS: PostgreSQL's and Oracle's GENERATED ALWAYS AS (expr)
+// [STORED | VIRTUAL], Oracle's AS (expr) [VIRTUAL], T-SQL's AS expr [PERSISTED [NOT NULL]]. The column's type may be missing
+// (T-SQL's and Oracle's): the table takes it from the expression.
+fn (p: mut &P) genClause(c: mut &ColDef, paren: bool): Result[Unit, lexdb_base.DbErr] {
+    let subs = len(p.subs)
+    let params = p.params
+    if paren { try p.expectKw("(") }
+    let x = try p.expr()
+    if paren { try p.expectKw(")") }
+    if len(p.subs) > subs {
+        if p.tsql { return Err(lexdb_base.err("TS1046", "Subqueries are not allowed in this context. Only scalar expressions are allowed.")) }
+        if p.ora { return Err(lexdb_base.err("ORA54016", "invalid column expression was specified")) }
+        return Err(lexdb_base.err("0A000", "cannot use subquery in column generation expression"))
+    }
+    if p.params > params { return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.params.toStr()))) }
+    c.gen = Some(x)
+    c.genKind = lexdb_sql.GEN_VIRTUAL
+    if p.tsql {
+        if p.isKw("persisted") {
+            p.pos += 1
+            c.genKind = lexdb_sql.GEN_STORED
+            if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null" {
+                p.pos += 2
+                c.notNull = true
+            }
+        }
+    } else if p.ora {
+        let v = p.acceptKw("virtual")
+    } else if p.acceptKw("stored") {
+        c.genKind = lexdb_sql.GEN_STORED
+    } else {
+        let v = p.acceptKw("virtual")
+    }
+    return Ok(Unit{})
+}
+
+// Whether a column's definition goes on with no type: T-SQL's name AS expr, Oracle's name AS (expr) and name GENERATED ALWAYS AS.
+fn (p: &P) typeless(): bool {
+    if p.tsql { return p.isKw("as") }
+    if p.ora { return p.isKw("as") || p.isKw("generated") }
+    return false
+}
+
+// A column's type, or none yet where a generated column has none (the table takes it from its expression).
+fn (p: mut &P) colTypeOpt(c: mut &ColDef): Result[Unit, lexdb_base.DbErr] {
+    if p.typeless() {
+        c.typ = TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}
+        if p.tsql {
+            p.pos += 1
+            try p.genClause(mut &c, false)
+        }
+        return Ok(Unit{})
+    }
+    try p.colType(mut &c)
     return Ok(Unit{})
 }
 
@@ -3069,14 +3143,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             }
             a.col.name = try p.name()
             a.col.spell = p.spelled.clone()
-            try p.colType(mut &a.col)
+            try p.colTypeOpt(mut &a.col)
             // its PRIMARY KEY, UNIQUE, CHECK and REFERENCES: added after it,
             // as ADD CONSTRAINT would (9.85)
             var cons: []Constraint = []
             while true {
                 var cn = ""
                 if p.acceptKw("constraint") { cn = try p.name() }
-                if p.acceptKw("not") {
+                if p.ora && a.col.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
+                    try p.genClause(mut &a.col, true)
+                } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
                 } else if p.acceptKw("null") {
@@ -3259,6 +3335,13 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw(")")
                 }
                 append(mut &s.alters, a)
+            } else if p.isKw("set") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "expression" {
+                // SET EXPRESSION AS (expr): a generated column's new expression
+                p.pos += 2
+                try p.expectKw("as")
+                var a = lexdb_sql.alterOf(A_SET_EXPR, &n)
+                try p.genClause(mut &a.col, true)
+                append(mut &s.alters, a)
             } else if p.identityNext() {
                 // SET GENERATED ..., SET sequence options, RESTART [WITH n]
                 var a = lexdb_sql.alterOf(A_SET_IDENTITY, &n)
@@ -3303,6 +3386,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             } else if p.acceptKw("drop") {
                 if p.acceptKw("default") {
                     append(mut &s.alters, lexdb_sql.alterOf(A_DROP_DEFAULT, &n))
+                    if !p.acceptKw(",") { break }
+                    continue
+                }
+                if p.acceptKw("expression") {
+                    var a = lexdb_sql.alterOf(A_DROP_EXPR, &n)
+                    if p.acceptKw("if") {
+                        try p.expectKw("exists")
+                        a.ifFlag = true
+                    }
+                    append(mut &s.alters, a)
                     if !p.acceptKw(",") { break }
                     continue
                 }
@@ -3353,6 +3446,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     // T-SQL: INTO may be left out
     if !(p.tsql && !p.isKw("into")) { try p.expectKw("into") }
     var s = lexdb_sql.newStmt(S_INSERT)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
     if p.isKw("(") && !p.selectNext() {
@@ -5027,6 +5121,7 @@ fn (p: mut &P) mrPrimary(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb
 
 fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_CREATE_INDEX)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.unique = unique
     s.conc = p.acceptKw("concurrently")
     if p.acceptKw("if") {
@@ -5072,12 +5167,21 @@ fn isOpClass(n: &str): bool {
 // LAST] (9.85). The name in names; the rest in pk, as PostgreSQL shows it
 // ("" none). They change nothing: lexdb's text compares bytewise (C, which
 // the pattern operator classes are for), and a B+tree is read either way.
+// Whether an index column is a column's name alone (Oracle's function-based indexes take any expression, not parenthesised).
+fn (p: &P) plainIndexCol(): bool {
+    let t = p.peek()
+    if t.kind != T_IDENT && t.kind != T_QIDENT { return false }
+    let n = p.peekAt(1)
+    if n.kind == T_OP && (n.text == "," || n.text == ")") { return true }
+    return n.kind == T_IDENT && (n.text == "asc" || n.text == "desc" || n.text == "collate")
+}
+
 fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
-    if p.isKw("(") || (p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(") {
+    if p.isKw("(") || (p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(") || (p.ora && !p.plainIndexCol()) {
         // an expression (9.89): (expr), or a function's call
         let subs = len(p.subs)
         let params = p.params
-        let x = try p.unary()
+        let x = if p.ora { try p.expr() } else { try p.unary() }
         if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in index expression")) }
         if p.params > params { return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.params.toStr()))) }
         append(mut &s.names, "")
@@ -5118,6 +5222,7 @@ fn (p: mut &P) indexCol(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 // (FROM and the alias: 9.91). The alias in alias, FROM's items in from.
 fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_UPDATE)
+    s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.tsql && p.acceptKw("top") { try p.top(mut &s, false) }      // T-SQL: UPDATE TOP (n)
     try p.dmlTarget(mut &s)
     try p.expectKw("set")
@@ -5704,7 +5809,8 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
     if !query && !s.copy.from {
         // TO from a table: its query
         var q = lexdb_sql.newStmt(S_SELECT)
-        if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""}) }
+        // (its alias "#copy": the columns a COPY has by default, not the generated ones)
+        if len(s.names) == 0 { append(mut &q.items, SelItem{star: true, qual: "", expr: None, alias: "#copy", spell: ""}) }
         for n in s.names { append(mut &q.items, SelItem{star: false, qual: "", expr: Some(Expr.Col(n.clone(), -1)), alias: "", spell: ""}) }
         append(mut &q.from, FromItem{table: s.table.clone(), alias: lexdb_sql.baseName(&s.table), join: J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
         append(mut &s.inner, q)
@@ -6708,6 +6814,13 @@ pub fn parseExpr(sql: &str): Result[Expr, lexdb_base.DbErr] {
             i += 2
             continue
         }
+        // T-SQL's + (exprText writes it "t+", the operator that joins strings and adds numbers): one token, after an operand
+        if t.kind == T_IDENT && t.text == "t" && i + 1 < len(raw) && raw[i + 1].kind == T_OP && raw[i + 1].text == "+" && raw[i + 1].at == t.at + 1 &&
+           i > 0 && (raw[i - 1].kind != T_OP || raw[i - 1].text == ")") {
+            append(mut &toks, Tok{kind: T_OP, text: "t+", at: t.at, spell: ""})
+            i += 2
+            continue
+        }
         append(mut &toks, t.clone())
         i += 1
     }
@@ -6896,6 +7009,7 @@ pub fn (q: mut &Parser) values(xs: &[]Expr): Stmt {
 pub fn (q: mut &Parser) tableDef(name: &str): Result[Stmt, lexdb_base.DbErr] {
     q.p.fresh()
     var s = lexdb_sql.newStmt(S_CREATE)
+    s.mdialect = MD_TSQL
     s.table = name.toStr()
     var r = try q.p.tableBody(s)
     q.p.finish(mut &r)
