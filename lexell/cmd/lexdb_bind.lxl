@@ -363,6 +363,63 @@ pub fn isTextOid(o: int): bool {
 // second field) when that is the column of that name, else found by the
 // name (a column the planner made, slot -1, or an expression over other
 // columns than those it was resolved over).
+// Oracle's date-time kinds, as lexdb_parse makes them: a DATE is a timestamp of scale 0, a TIMESTAMP one of a scale
+// above it (a TIMESTAMP WITH TIME ZONE its own type). 0 a DATE, 1 a TIMESTAMP, -1 not known from the expression alone.
+fn oraStampOf(t: &lexdb_sql.TypeName): int {
+    if t.oid == lexdb_sql.OID_TSTZ { return 1 }
+    if t.oid == lexdb_sql.OID_DATE { return 0 }
+    if t.oid == lexdb_sql.OID_TS && t.prec >= 1 { return if t.scale == 0 { 0 } else { 1 } }
+    return -1
+}
+
+pub fn oraStamp(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
+    match x {
+        Expr.Cast(_, t) { return oraStampOf(&t) }
+        Expr.Col(n, s) {
+            let i = colSlot(cols, &n, s)
+            return if i >= 0 { oraStampOf(&cols[i].typ) } else { -1 }
+        }
+        Expr.Lit(v) {
+            match v {
+                Val.Tstz(_) { return 1 }
+                Val.Date(_) { return 0 }
+                else { return -1 }
+            }
+        }
+        Expr.Call(f, args, _) {
+            match f.toStr() {
+                "#ora_todate", "#ora_addmonths", "#ora_lastday", "#ora_nextday" { return 0 }
+                "#ora_totimestamp", "#ora_sysutc", "#ora_fromtz", "current_timestamp", "localtimestamp", "now" { return 1 }
+                "#ora_add", "#ora_trunc", "#ora_sub", "coalesce" {
+                    if len(args) == 0 { return -1 }
+                    let a = oraStamp(&args[0], cols)
+                    if a >= 0 || len(args) < 2 || f == "#ora_sub" { return a }
+                    return oraStamp(&args[1], cols)
+                }
+                "date_trunc" {
+                    // SYSDATE: a timestamp cut to the second
+                    if len(args) == 2 && lexdb_sql.litText(&args[0]) == Some("second") { return 0 }
+                    return -1
+                }
+                "case else" { return if len(args) == 3 { oraStamp(&args[2], cols) } else { -1 } }
+                else { return -1 }
+            }
+        }
+        else { return -1 }
+    }
+}
+
+// Whether Oracle's a - b (#ora_sub) is a date-time minus a date-time with a TIMESTAMP in it: an INTERVAL DAY TO SECOND
+// (#ora_tsdiff), not the days between two DATEs, a number.
+pub fn oraSubStamp(args: &[]Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing): bool {
+    if len(args) != 2 { return false }
+    let a = exprOid(&args[0], cols, ptypes, ty)
+    let b = exprOid(&args[1], cols, ptypes, ty)
+    if !(lexdb_sql.timeKind(a) > 0 && a != lexdb_sql.OID_TIME && a != lexdb_sql.OID_IVAL) { return false }
+    if !(lexdb_sql.timeKind(b) > 0 && b != lexdb_sql.OID_TIME && b != lexdb_sql.OID_IVAL) { return false }
+    return oraStamp(&args[0], cols) == 1 || oraStamp(&args[1], cols) == 1
+}
+
 pub fn colSlot(cols: &[]lexdb_sql.ColDef, name: &str, slot: int): int {
     if slot >= 0 && slot < len(cols) && cols[slot].name == name { return slot }
     for i in 0..len(cols) { if cols[i].name == name { return i } }
@@ -473,6 +530,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
         Expr.IsNull(_, _) { return lexdb_sql.OID_BOOL }
         Expr.Cast(_, t) { return t.oid }
         Expr.Call(n, args, _) {
+            if n == "#ora_sub" && oraSubStamp(&args, cols, ptypes, ty) { return lexdb_sql.OID_IVAL }
             if n == "#bptrim" { return lexdb_sql.OID_TEXT }
             if n == "#bppad" { return lexdb_sql.OID_BPCHAR }
             if n == "grouping" { return lexdb_sql.OID_INT4 }
@@ -897,7 +955,10 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, subs:
                 return Some(BX.Agg(i))
             }
             let special = name == "case" || name == "case else" || name == "#try"
-            let fr = if special { FnRef{name: "", way: FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false} } else { ty.fnBind(&name, len(args)) }
+            // Oracle's timestamp minus timestamp is an interval (oraSubStamp)
+            let none: []int = []
+            let callName: str = if name == "#ora_sub" && oraSubStamp(&args, cols, &none, ty) { "#ora_tsdiff" } else { name.clone() }
+            let fr = if special { FnRef{name: "", way: FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false} } else { ty.fnBind(&callName, len(args)) }
             if !special && fr.way == FN_NONE { return None }
             var bs: []BX = []
             for a in args {

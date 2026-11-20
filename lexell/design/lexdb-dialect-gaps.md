@@ -135,9 +135,60 @@ Queue (pairs that touch different files):
 
 | Package | Branch | State |
 |---|---|---|
-| A | | not started |
+| A | `worktree-agent-a904a69d9594c5747` | done, awaiting review; section 5 |
 | B | | not started |
 | C | | not started |
 | D | | not started |
 | E | | not started |
 | F | | not started |
+
+## 5. Package A: what was done
+
+Tests: `tds_funcs` (68 T-SQL batches, answers from SQL Server 2022 through
+gen_mssql.py), `exec_dialect` (63 queries, answers from PostgreSQL 18
+through gen_pg.py), `tns_funcs` (66 queries; no Oracle was at hand, so each
+answer is as Oracle's documentation gives it, in the queries file's fourth
+field; gen_oracle.py takes it when it has no connection). The three
+generators' templates had fallen behind the language and were brought to
+what the committed tests use.
+
+- **S1, PostgreSQL's `SYSTEM_USER`**: a keyword, not called (`SYSTEM_USER()`
+  is error 102 on SQL Server, 42601 on PostgreSQL). T-SQL: the login name as
+  `SUSER_SNAME()`. PostgreSQL: NULL on a trusted connection,
+  `scram-sha-256:name` after SCRAM. Both work in a column DEFAULT; before,
+  CREATE TABLE and ALTER ADD COLUMN refused any session function there
+  (`defaultValue` had no session).
+- **S7 `QUOTENAME`** (`lexdb_tsqlfn`), also bound in batches.
+- **S8 `OBJECT_DEFINITION`**: a view made over TDS keeps its text from CREATE
+  to the end of the batch after its query (`lexdb_sql.DEF_MARK`);
+  `lexdb_syscat.bind` writes a `D` line (object id, escaped text) for every
+  object that has a definition and `sysCall` reads them; sys.sql_modules
+  uses it. Package F adds its procedures' texts to the same `bind` loop.
+  Not done: a view made in another dialect has none (NULL).
+- **S13**: SQL Server has no `sys.sequences.last_value`; its column is
+  `last_used_value` (NULL until used) and `sys.identity_columns.last_value`.
+  Both are filled, `current_value` too (the last given, else the start or
+  restart value). `NEXT VALUE FOR seq` did not parse over TDS: added; two
+  references to one sequence in a row give different values here (SQL
+  Server's give one): not done. `sys.sequences.minimum_value` of an `AS int`
+  sequence is 1, SQL Server's -2147483648: not done.
+  PostgreSQL's `pg_sequences.last_value` filled.
+- **O2, O6, O7 (and `NUMTOYMINTERVAL`, `FROM_TZ`)** in `lexdb_orafn`. An
+  Oracle `TIMESTAMP 'x +02:00'` literal was a timestamp without the zone: now
+  with one. Timestamp minus timestamp is an INTERVAL DAY TO SECOND when
+  either side is a TIMESTAMP (`lexdb_bind.oraSubStamp`: a DATE is a timestamp
+  of scale 0 in the Oracle door; derived tables now keep that scale); DATE
+  minus DATE stays a number. EXTRACT is `#ora_extract`: the fields of an
+  interval by its kind (ORA-30076 for the wrong ones), days past 24 hours
+  normalised, a time with a zone in UTC. Interval literals carry their sign
+  to every part (`'-3 04:05:06' DAY TO SECOND`).
+- **PostgreSQL**: `make_interval` with `name => value`, `quote_ident`
+  quoting PostgreSQL's keyword list (it was the parser's reserved words:
+  `user` was not quoted).
+- Not done: `pg_get_viewdef` gives the view's text, not PostgreSQL's
+  deparsed form (a deparser); `date_part(...)` returns numeric, PostgreSQL's
+  double precision (the cast round-trips badly through stored expressions);
+  interval times a number, `'infinity'` intervals; Oracle's `EXTRACT(HOUR
+  FROM <DATE>)` (ORA-30076) and `TIMEZONE_HOUR` of a literal's own offset
+  (a time with a zone keeps no offset); `DBMS_METADATA.GET_DDL`;
+  `quote_ident(123)` (PostgreSQL has no such function: 42883).

@@ -48,13 +48,17 @@ pub fn resultOid(name: &str, os: &[]int): int {
     match name {
         "#ora_cat", "#ora_substr", "#ora_replace", "#ora_tochar", "#ora_tochar1", "#ora_sessiontz", "#ora_upper", "#ora_lower" { return lexdb_sql.OID_TEXT }
         "#ora_instr" { return lexdb_sql.OID_INT4 }
-        "#ora_todate", "#ora_totimestamp", "#ora_addmonths", "#ora_lastday", "#ora_nextday" { return lexdb_sql.OID_TS }
+        "#ora_todate", "#ora_totimestamp", "#ora_addmonths", "#ora_lastday", "#ora_nextday", "#ora_sysutc" { return lexdb_sql.OID_TS }
+        "#ora_fromtz" { return lexdb_sql.OID_TSTZ }
+        "#ora_numtods", "#ora_numtoym", "#ora_tsdiff" { return lexdb_sql.OID_IVAL }
+        "#ora_extract" { return lexdb_sql.OID_NUMERIC }
         "#ora_tonumber", "#ora_div", "#ora_monthsbetween" { return lexdb_sql.OID_NUMERIC }
         "#ora_trunc" {
             if isTimeOid(a) { return lexdb_sql.OID_TS }
             return if a == lexdb_sql.OID_TEXT || a == 0 { lexdb_sql.OID_NUMERIC } else { a }
         }
         "#ora_add", "#ora_sub" {
+            if a == lexdb_sql.OID_IVAL && b == lexdb_sql.OID_IVAL { return lexdb_sql.OID_IVAL }
             if isTimeOid(a) || isTimeOid(b) {
                 if name == "#ora_sub" && isTimeOid(a) && isTimeOid(b) { return lexdb_sql.OID_NUMERIC }
                 let t = if isTimeOid(a) { a } else { b }
@@ -298,6 +302,16 @@ fn isTimeV(v: &Val): bool {
 // two dates (days between).
 fn plusMinus(a: &Val, b: &Val, neg: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    // two intervals
+    match a {
+        Val.Ival(x) {
+            match b {
+                Val.Ival(y) { return Ok(Val.Ival(lexdb_time.ivalPlus(&x, &(if neg { lexdb_time.ivalNeg(&y) } else { y })))) }
+                else {}
+            }
+        }
+        else {}
+    }
     let ta = isTimeV(a)
     let tb = isTimeV(b)
     if ta && tb {
@@ -376,6 +390,59 @@ fn divide(a: &Val, b: &Val): Result[Val, DbErr] {
     let y = try decOf(b)
     if y.isZero() { return Err(lexdb_base.err("22012", "division by zero")) }
     return Ok(Val.Num(try divDec(x, y)))
+}
+
+// Two date-times' difference as INTERVAL DAY TO SECOND (a TIMESTAMP on either side; DATE minus DATE is a number
+// of days: plusMinus): days and the time of day of one sign. With a zone on either, the instants'; else the local times'.
+fn tsDiff(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var withZone = false
+    match a {
+        Val.Tstz(_) { withZone = true }
+        else {}
+    }
+    match b {
+        Val.Tstz(_) { withZone = true }
+        else {}
+    }
+    var x = try asTs(a, z)
+    var y = try asTs(b, z)
+    if withZone {
+        // asTs reads a Tstz in the session's zone: back to instants
+        x = match a { Val.Tstz(u) { u } else { lexdb_time.tsToTstz(x, z) } }
+        y = match b { Val.Tstz(u) { u } else { lexdb_time.tsToTstz(y, z) } }
+    }
+    let d = x - y
+    return Ok(Val.Ival(lexdb_time.Ival{months: 0, days: d / lexdb_time.DAY_US, us: d % lexdb_time.DAY_US}))
+}
+
+// EXTRACT(field FROM x) as Oracle has it: an interval's fields by its kind (YEAR and MONTH of an INTERVAL YEAR TO
+// MONTH, DAY to SECOND of a DAY TO SECOND one, whose hours past a day are days), a date-time's (a zone's, in UTC).
+fn extractFrom(field: &str, x: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let f = strings.toLowerAscii(field)
+    match x {
+        Val.Ival(iv) {
+            let ym = iv.months != 0 && iv.days == 0 && iv.us == 0
+            let ds = iv.months == 0 && (iv.days != 0 || iv.us != 0)
+            if f == "year" || f == "month" {
+                if ds { return Err(ora(30076, "invalid extract field for extract source")) }
+            } else if f == "day" || f == "hour" || f == "minute" || f == "second" {
+                if ym { return Err(ora(30076, "invalid extract field for extract source")) }
+            } else {
+                return Err(ora(30076, "invalid extract field for extract source"))
+            }
+            // a day is the hours past it
+            var n = iv
+            if !ym { n = lexdb_time.Ival{months: 0, days: iv.days + iv.us / lexdb_time.DAY_US, us: iv.us % lexdb_time.DAY_US} }
+            return Ok(Val.Num(try lexdb_time.extractIval(&f, &n)))
+        }
+        Val.Date(d) {
+            let u = lexdb_time.dateToTs(d)
+            return Ok(Val.Num(try lexdb_time.extractTs(&f, u, u, &"timestamp without time zone", 0)))
+        }
+        Val.Ts(u) { return Ok(Val.Num(try lexdb_time.extractTs(&f, u, u, &"timestamp without time zone", 0))) }
+        Val.Tstz(u) { return Ok(Val.Num(try lexdb_time.extractTs(&f, u, u, &"timestamp with time zone", 0))) }
+        else { return Err(ora(30076, "invalid extract field for extract source")) }
+    }
 }
 
 // x / y to 38 significant digits, as NUMBER's, trailing zeros dropped.
@@ -1057,6 +1124,8 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
         "#ora_trunc" { lo = 1; hi = 2 }
         "#ora_addmonths", "#ora_monthsbetween", "#ora_nextday" { lo = 2; hi = 2 }
         "#ora_lastday" { lo = 1; hi = 1 }
+        "#ora_sysutc" { lo = 1; hi = 1 }
+        "#ora_numtods", "#ora_numtoym", "#ora_fromtz", "#ora_extract", "#ora_tsdiff" { lo = 2; hi = 2 }
         else { }
     }
     if n < lo { return Err(ora(938, "not enough arguments for function")) }
@@ -1066,6 +1135,54 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
         "#ora_add" { return Ok(Some(try plusMinus(&vs[0], &vs[1], false, z))) }
         "#ora_sub" { return Ok(Some(try plusMinus(&vs[0], &vs[1], true, z))) }
         "#ora_div" { return Ok(Some(try divide(&vs[0], &vs[1]))) }
+        "#ora_tsdiff" { return Ok(Some(try tsDiff(&vs[0], &vs[1], z))) }
+        "#ora_extract" { return Ok(Some(try extractFrom(&sv(&vs[0], z), &vs[1], z))) }
+        "#ora_sysutc" {
+            // SYS_EXTRACT_UTC(t): the UTC time of a time with a zone (a time without one is in the session's zone)
+            match vs[0] {
+                Val.Tstz(u) { return Ok(Some(Val.Ts(u))) }
+                Val.Ts(u) { return Ok(Some(Val.Ts(lexdb_time.tsToTstz(u, z)))) }
+                Val.Date(d) { return Ok(Some(Val.Ts(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)))) }
+                Val.Text(s) {
+                    match lexdb_time.parseTstz(&strings.trim(&s), z) {
+                        Ok(u) { return Ok(Some(Val.Ts(u))) }
+                        Err(_) { return Err(ora(1830, "date format picture ends before converting entire input string")) }
+                    }
+                }
+                else { return Err(ora(932, "inconsistent datatypes: expected TIMESTAMP WITH TIME ZONE got NUMBER")) }
+            }
+        }
+        "#ora_fromtz" {
+            // FROM_TZ(ts, zone): the time in a zone, '+05:00' or a region's name
+            let us = match vs[0] {
+                Val.Ts(u) { u }
+                Val.Date(d) { lexdb_time.dateToTs(d) }
+                else { return Err(ora(932, "inconsistent datatypes: expected TIMESTAMP got NUMBER")) }
+            }
+            match lexdb_time.parseTstz(&(lexdb_time.fmtTs(us) + " " + strings.trim(&sv(&vs[1], z))), z) {
+                Ok(u) { return Ok(Some(Val.Tstz(u))) }
+                Err(_) { return Err(ora(1882, "timezone region not found")) }
+            }
+        }
+        "#ora_numtods", "#ora_numtoym" {
+            // NUMTODSINTERVAL(n, 'DAY' | 'HOUR' | 'MINUTE' | 'SECOND'), NUMTOYMINTERVAL(n, 'YEAR' | 'MONTH'): n may be a fraction
+            let nv = try decOf(&vs[0])
+            let unit = strings.toUpperAscii(&strings.trim(&sv(&vs[1], z)))
+            if name == "#ora_numtoym" {
+                let per = if unit == "YEAR" { 12 } else if unit == "MONTH" { 1 } else { 0 }
+                if per == 0 { return Err(ora(1760, "illegal argument for function")) }
+                match nv.mul(Decimal.fromInt(per)).toInt(Rounding.HALF_AWAY) {
+                    Ok(m) { return Ok(Some(Val.Ival(lexdb_time.Ival{months: m, days: 0, us: 0}))) }
+                    Err(_) { return Err(ora(1873, "the leading precision of the interval is too small")) }
+                }
+            }
+            let per = if unit == "DAY" { lexdb_time.DAY_US } else if unit == "HOUR" { 3600 * 1000000 } else if unit == "MINUTE" { 60 * 1000000 } else if unit == "SECOND" { 1000000 } else { 0 }
+            if per == 0 { return Err(ora(1760, "illegal argument for function")) }
+            match nv.mul(Decimal.fromInt(per)).toInt(Rounding.HALF_AWAY) {
+                Ok(us) { return Ok(Some(Val.Ival(lexdb_time.Ival{months: 0, days: us / lexdb_time.DAY_US, us: us % lexdb_time.DAY_US}))) }
+                Err(_) { return Err(ora(1873, "the leading precision of the interval is too small")) }
+            }
+        }
         "#ora_substr" {
             // SUBSTR(s, pos [, len]): pos 0 is 1; negative counts from the end
             let r = runesOf(&sv(&vs[0], z))

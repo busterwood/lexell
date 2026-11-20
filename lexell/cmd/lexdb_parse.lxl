@@ -1725,7 +1725,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                     try p.expectKw("from")
                     let x = try p.expr()
                     try p.expectKw(")")
-                    return Ok(Expr.Call("date_part", [Expr.Lit(Val.Text(strings.toLowerAscii(&f.text))), x], false))
+                    return Ok(Expr.Call(if p.ora { "#ora_extract" } else { "date_part" }, [Expr.Lit(Val.Text(strings.toLowerAscii(&f.text))), x], false))
                 }
             }
             "date", "time", "timestamp", "timestamptz", "interval" {
@@ -1749,8 +1749,9 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                                     if p.acceptKw("to") {
                                         let dash = strings.indexOf(&lit, "-", 1)
                                         let sp = strings.indexOf(&lit, " ", 0)
-                                        if u.text == "year" && dash > 0 { lit = lit[0..dash].toStr() + " year " + lit[dash + 1..len(lit)].toStr() + " month" }
-                                        else if u.text == "day" && sp > 0 { lit = lit[0..sp].toStr() + " day " + lit[sp + 1..len(lit)].toStr() }
+                                        let sg = if strings.startsWith(&lit, "-") { "-" } else { "" }
+                                        if u.text == "year" && dash > 0 { lit = lit[0..dash].toStr() + " year " + sg + lit[dash + 1..len(lit)].toStr() + " month" }
+                                        else if u.text == "day" && sp > 0 { lit = lit[0..sp].toStr() + " day " + sg + lit[sp + 1..len(lit)].toStr() }
                                         p.pos += 1
                                         if p.acceptKw("(") {
                                             let k = try p.intLit()
@@ -1760,6 +1761,12 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                                         lit = lit + " " + u.text
                                     }
                                 }
+                            }
+                            if p.ora && t.text == "timestamp" && ty.oid == OID_TS && oraLitZone(&lit) {
+                                var tz = lexdb_sql.timeType(OID_TSTZ)
+                                tz.prec = 1
+                                tz.scale = ty.scale
+                                return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), tz))
                             }
                             return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), ty))
                         }
@@ -6188,6 +6195,16 @@ fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
     return Err(near(&v))
 }
 
+// Whether an Oracle TIMESTAMP literal's text ends in a time zone: +hh:mm, -hh:mm or a name (Europe/Paris, UTC).
+fn oraLitZone(s: &str): bool {
+    let sp = strings.lastIndexOf(s, " ")
+    if sp < 0 { return false }
+    let tail = strings.trim(&s[sp + 1..len(s)])
+    if len(tail) == 0 { return false }
+    if (tail[0] == '+' || tail[0] == '-') && len(tail) > 1 && tail[1] >= '0' && tail[1] <= '9' { return true }
+    return (tail[0] >= 'A' && tail[0] <= 'Z') || (tail[0] >= 'a' && tail[0] <= 'z')
+}
+
 // The name of a name => value argument, consumed ("" a positional argument).
 fn (p: mut &P) namedArg(): str {
     if (p.peek().kind == T_IDENT) && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "=" && p.peekAt(2).kind == T_OP && p.peekAt(2).text == ">" &&
@@ -6828,6 +6845,10 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
         }
         "trunc" { return Ok(Expr.Call("#ora_trunc", a, false)) }
         "add_months" { return Ok(Expr.Call("#ora_addmonths", a, false)) }
+        "sys_extract_utc" { return Ok(Expr.Call("#ora_sysutc", a, false)) }
+        "numtodsinterval" { return Ok(Expr.Call("#ora_numtods", a, false)) }
+        "numtoyminterval" { return Ok(Expr.Call("#ora_numtoym", a, false)) }
+        "from_tz" { return Ok(Expr.Call("#ora_fromtz", a, false)) }
         "months_between" { return Ok(Expr.Call("#ora_monthsbetween", a, false)) }
         "last_day" { return Ok(Expr.Call("#ora_lastday", a, false)) }
         "next_day" { return Ok(Expr.Call("#ora_nextday", a, false)) }
