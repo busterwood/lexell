@@ -1,0 +1,161 @@
+// lexdb_fkprobe: the parents a statement's foreign keys need, probed for a
+// chunk of rows at once (design/lexdb-batch-gaps.md item 8b).
+//
+// A row written into a table with a foreign key looks its key up in the
+// parent (lexdb_exec.childSide); a key not there is kept for the statement's
+// end, looked up again then (fkFinish), and only a key still missing fails.
+// This module keeps, per foreign key of a statement, the parent keys known to
+// be there, and fills them ahead for a chunk of rows: the keys the rows will
+// have (made from the values given, which only coerce: no default, sequence
+// or expression is run ahead), the ones not known sorted and read together
+// (lexdb_access.hasMany). A row's own check then finds its parent in what is
+// known; any key not known is looked up as before, so a parent written earlier
+// in the same statement or transaction is found as it always was. A key
+// guessed wrong only fills what nothing asks for: what is known is a key that
+// was there, and an INSERT removes none (an ON CONFLICT DO UPDATE may, so it
+// does not use this).
+//
+// Only a foreign key to the parent's primary key is probed (via -1); another
+// is left to the per-row check.
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+import "./lexdb_access"
+import "./lexdb_store"
+import "./lexdb_ops"
+
+type Val = lexdb_sql.Val
+type Table = lexdb_catalog.Table
+type DbErr = lexdb_base.DbErr
+
+// How many parent keys a foreign key remembers; past it they are forgotten
+// (and asked for again as needed).
+const KNOWN_MAX: int = 65536
+
+// One foreign key as a statement checks it.
+pub type FkRef = record {
+    pub cols: []int             // the child's key columns, in the foreign key's order
+    pub refCols: []int          // the parent's, in the same order
+    pub via: int                // the parent's key holding them: -1 its primary key (probed), -2 none, else an index
+    pub parent: int             // the parent's place in the statement's tables
+    pub at: []int               // per key column, its place in the rows given (the statement's targets), -1 none
+    known: Map[str, int]        // the parent's primary keys known to be there
+    prow: []Val                // a row of the parent's width, for making keys
+}
+
+pub type Probes = record { pub fks: []FkRef }
+
+pub fn none(): Probes { return Probes{fks: []} }
+
+pub fn ref(cols: []int, refCols: []int, via: int, parent: int, at: []int, width: int): FkRef {
+    return FkRef{cols: cols, refCols: refCols, via: via, parent: parent, at: at, known: newMap(), prow: array(width, Val.Null)}
+}
+
+pub fn (pr: mut &Probes) add(f: FkRef) { append(mut &pr.fks, f) }
+
+// Whether the statement's foreign key k is checked through its probes.
+pub fn (pr: &Probes) active(k: int): bool { return k < len(pr.fks) && pr.fks[k].via == -1 }
+
+// Whether any foreign key is.
+pub fn (pr: &Probes) any(): bool {
+    for f in pr.fks { if f.via == -1 { return true } }
+    return false
+}
+
+// The key in parent p of the values vals (in the foreign key's order), as a
+// row's check reads it.
+pub fn (pr: mut &Probes) key(k: int, p: &Table, vals: &[]Val): str {
+    for j in 0..len(vals) { pr.fks[k].prow[pr.fks[k].refCols[j]] = vals[j].clone() }
+    return lexdb_access.keyOf(&lexdb_catalog.relOf(p), &pr.fks[k].prow)
+}
+
+// The same from a row of the child: its key columns' values.
+pub fn (pr: mut &Probes) keyOfRow(k: int, p: &Table, row: &[]Val): str {
+    for j in 0..len(pr.fks[k].cols) { pr.fks[k].prow[pr.fks[k].refCols[j]] = row[pr.fks[k].cols[j]].clone() }
+    return lexdb_access.keyOf(&lexdb_catalog.relOf(p), &pr.fks[k].prow)
+}
+
+// Whether the parent key is known to be there.
+pub fn (pr: &Probes) known(k: int, key: &str): bool { return pr.fks[k].known.has(key) }
+
+// The parent key found there.
+pub fn (pr: mut &Probes) found(k: int, key: str) {
+    if pr.fks[k].known.size() >= KNOWN_MAX { pr.fks[k].known.clear() }
+    pr.fks[k].known.put(key, 1)
+}
+
+// What is known forgotten (a new transaction: a batch committed).
+pub fn (pr: mut &Probes) forget() {
+    for k in 0..len(pr.fks) { pr.fks[k].known.clear() }
+}
+
+// The rows' values for the key columns of each foreign key, where the
+// expressions are literals or parameters (a row of them, per target, Null
+// for any other), for ahead: rows[from, to) of a VALUES list.
+pub fn (pr: &Probes) given(rows: &[][]lexdb_sql.Expr, from: int, to: int, nt: int, params: &[]Val): [][]Val {
+    var need: []bool = array(nt, false)
+    for f in pr.fks { for a in f.at { if a >= 0 && a < nt { need[a] = true } } }
+    var out: [][]Val = withCapacity(to - from)
+    for i in from..to {
+        var r: []Val = array(nt, Val.Null)
+        for j in 0..min(nt, len(rows[i])) {
+            if !need[j] { continue }
+            match rows[i][j] {
+                lexdb_sql.Expr.Lit(v) { r[j] = v.clone() }
+                lexdb_sql.Expr.Param(n) { if n >= 1 && n <= len(params) { r[j] = params[n - 1].clone() } }
+                else {}
+            }
+        }
+        append(mut &out, r)
+    }
+    return out
+}
+
+// The parent keys the rows (their values in the statement's targets' order)
+// will look up, for t's foreign keys, probed together: those not known
+// sorted, each once, read at once. A row whose key values do not coerce, or
+// are not all given, asks for none.
+pub fn (pr: mut &Probes) ahead(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table,
+                               rows: &[][]Val): Result[Unit, DbErr] {
+    for k in 0..len(pr.fks) {
+        if pr.fks[k].via != -1 { continue }
+        let p = &fw[pr.fks[k].parent]
+        var keys0: []str = []
+        for r in rows {
+            var vals: []Val = []
+            var whole = true
+            for m in 0..len(pr.fks[k].cols) {
+                let j = pr.fks[k].at[m]
+                if j < 0 || j >= len(r) || lexdb_ops.isNull(&r[j]) {
+                    whole = false
+                    break
+                }
+                match lexdb_ops.coerceZ(r[j].clone(), &t.cols[pr.fks[k].cols[m]].typ, &txn.sql.zone) {
+                    Ok(v) { append(mut &vals, v) }
+                    Err(_) {
+                        whole = false
+                        break
+                    }
+                }
+            }
+            if !whole { continue }
+            for v in vals { if lexdb_ops.isNull(&v) { whole = false } }
+            if !whole { continue }
+            let key = pr.key(k, p, &vals)
+            if !pr.known(k, &key) { append(mut &keys0, key) }
+        }
+        let keys = move(keys0)
+        if len(keys) == 0 { continue }
+        // sorted (a radix sort for integer keys), each once
+        var order: []int = withCapacity(len(keys))
+        for i in 0..len(keys) { append(mut &order, i) }
+        lexdb_access.sortKeysPerm(&keys, mut &order)
+        var uniq: []&str = withCapacity(len(keys))
+        for x in 0..len(order) {
+            if x == 0 || keys[order[x]] != keys[order[x - 1]] { append(mut &uniq, &keys[order[x]]) }
+        }
+        let hit = try lexdb_access.hasMany(st, txn, &lexdb_catalog.relOf(p), &uniq)
+        for x in 0..len(uniq) { if hit[x] { pr.found(k, uniq[x].toStr()) } }
+    }
+    return Ok(Unit{})
+}

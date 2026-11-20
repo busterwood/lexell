@@ -1,0 +1,341 @@
+// lexdb_exec: a foreign key's parents probed for a chunk of rows at once
+// (lexdb_fkprobe, design/lexdb-batch-gaps.md item 8b), against what the row
+// by row check gave: INSERT with many VALUES, INSERT ... SELECT and COPY:
+// - a key missing in row 700 of 2,000 (and another in row 1,500): the first
+//   one's error, and no row left; a miss at the edges of the chunks (32, 96,
+//   224, 480, 992, 2016 rows and the one after);
+// - an error of another kind before the miss (a unique violation, a division
+//   by zero in the query) is the error given, as before: a missing key fails
+//   at the statement's end;
+// - a self-referencing key: the parent earlier in the same statement (and
+//   later: found at the end), a miss, and ON CONFLICT DO UPDATE;
+// - a parent written earlier in the transaction (and deleted since);
+// - a deferred key, a NULL key column, a composite key (a part NULL), one
+//   parent key many times in a chunk, a key to a unique index, a char value
+//   into a text key, a table with a serial column and RETURNING, ON CONFLICT
+//   DO NOTHING, COPY with batch_rows;
+// - the superlinear INSERT ... SELECT (a secondary index and a unique text
+//   index; design/lexdb-batch-gaps.md 8a): 30,000 rows in a few seconds.
+// expect: miss 700 values: 23503 Key (pid)=(9999) is not present in table "p". | rows 0
+// expect: miss 700 select: 23503 Key (pid)=(9999) is not present in table "p". | rows 0
+// expect: miss 700 copy: 23503 Key (pid)=(9999) is not present in table "p". | rows 0
+// expect: edges values: ok
+// expect: edges select: ok
+// expect: edges copy: ok
+// expect: good: INSERT 0 2000, INSERT 0 2000, COPY 2000, rows 6000
+// expect: unique before miss: 23505 23505 23505
+// expect: query error after miss: 22012, unique first: 22012, rows 0
+// expect: self: chain INSERT 0 2000, forward INSERT 0 2000, values INSERT 0 5, miss 23503 Key (up)=(99999) is not present in table "tr". rows 0, upsert INSERT 0 300
+// expect: transaction: INSERT 0 100, INSERT 0 1000, COMMIT, rows 1000, then deleted 23503 Key (pid)=(5001) is not present in table "p". after rollback 0
+// expect: deferred: INSERT 0 2000 before the parent, INSERT 0 1, COMMIT 2000, left out 23503
+// expect: null: INSERT 0 2000 INSERT 0 6 COPY 6 rows 2012 nulls 672
+// expect: composite: INSERT 0 2000, miss 23503 Key (a, b)=(3, k99) is not present in table "pp". null part INSERT 0 3 rows 2003
+// expect: same key: INSERT 0 2000, INSERT 0 2000, count 4000
+// expect: unique index: INSERT 0 700, 23503 Key (code)=(nope) is not present in table "u".
+// expect: char into text: INSERT 0 300, 23503
+// expect: returning: 100 rows, ids 1..100, v 7, 40 rows sum 820
+// expect: do nothing: INSERT 0 1990 count 2000, miss 23503
+// expect: batch rows: COPY 3000, miss 23503 after 1500 rows
+// expect: copy parts:  COPY 2000/2000/23503/0 COPY 2000/2000/23503/0 COPY 2000/2000/23503/0 csv 23503 Key (pid)=(66666) is not present in table "p".  rows 0
+// expect: superlinear: INSERT 0 30000 ok
+import "strings"
+import "time"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_parse"
+
+type Val = lexdb_sql.Val
+
+fn errText(e: &lexdb_base.DbErr): str { return e.state + " " + (if e.detail != "" { e.detail.clone() } else { e.msg.clone() }) }
+
+// the rows (values joined by |, rows by space), or the tag, or the error: its state and detail
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return errText(&e) }
+    }
+}
+
+// the state of an error, else the tag
+fn code(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return rs[len(rs) - 1].tag.clone() }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println(sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn count(s: mut &lexdb_exec.Session, table: &str): str { return q(s, &("select count(*) from " + table)) }
+
+// COPY ... FROM STDIN with data: its tag, or its error
+fn copyIn(s: mut &lexdb_exec.Session, sql: &str, data: &str): str {
+    let stmts = lexdb_parse.parse(sql).unwrap()
+    let none: []Val = []
+    let nt: []int = []
+    match s.run(&stmts[0], &none, &nt) {
+        Ok(r) {
+            if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+            match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                Ok(r2) { return r2.tag.clone() }
+                Err(e) { return errText(&e) }
+            }
+        }
+        Err(e) { return errText(&e) }
+    }
+}
+
+// COPY sql with data in parts of n bytes: its tag, or its error
+fn load(s: mut &lexdb_exec.Session, sql: &str, data: &str, n: int): str {
+    let stmts = lexdb_parse.parse(sql).unwrap()
+    var at = 0
+    let r = s.copyInFrom(&stmts[0], fn(): lexdb_exec.CopyPart {
+        let end = if at + n > len(data) { len(data) } else { at + n }
+        let part = data[at..end].toStr()
+        at = end
+        return lexdb_exec.CopyPart{rows: [], data: part, end: at >= len(data), fail: "", proto: false}
+    })
+    match r {
+        Ok(x) { return x.tag.clone() }
+        Err(e) { return errText(&e) + " " + e.context }
+    }
+}
+
+// the key row i (1..n) has: 1..100, except a miss at row bad (key badKey) and bad2 (88888)
+fn pidAt(i: int, bad: int, badKey: int, bad2: int): int {
+    if i == bad { return badKey }
+    if i == bad2 { return 88888 }
+    return i % 100 + 1
+}
+
+fn valuesSql(table: &str, base: int, n: int, bad: int, badKey: int, bad2: int): str {
+    var b = "insert into " + table + " values "
+    for i in 1..n + 1 {
+        if i > 1 { b += "," }
+        b += "(" + (base + i).toStr() + "," + pidAt(i, bad, badKey, bad2).toStr() + ")"
+    }
+    return b
+}
+
+fn selectSql(table: &str, base: int, n: int, bad: int, badKey: int, bad2: int): str {
+    return "insert into " + table + " select " + base.toStr() + " + i, case when i = " + bad.toStr() + " then " + badKey.toStr() + " when i = " + bad2.toStr() +
+           " then 88888 else i % 100 + 1 end from generate_series(1, " + n.toStr() + ") i"
+}
+
+fn copyData(base: int, n: int, bad: int, badKey: int, bad2: int): str {
+    var b = ""
+    for i in 1..n + 1 { b += (base + i).toStr() + "\t" + pidAt(i, bad, badKey, bad2).toStr() + "\n" }
+    return b
+}
+
+fn missing(key: int): str { return "23503 Key (pid)=(" + key.toStr() + ") is not present in table \"p\"." }
+
+// a block: parents written, some deleted, children inserted: the error, rolled back
+fn blockDeleted(s: mut &lexdb_exec.Session): str {
+    one(s, &"begin")
+    one(s, &"insert into p select i, i from generate_series(5001, 5100) i")
+    one(s, &"delete from p where id between 5001 and 5050")
+    let r = q(s, &"insert into c select 5000 + i, 5000 + i from generate_series(1, 100) i")
+    one(s, &"rollback")
+    return r
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 4 * 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        one(mut &s, &"create table p (id int primary key, w int)")
+        one(mut &s, &"insert into p select i, i from generate_series(1, 100) i")
+        one(mut &s, &"create table c (id int primary key, pid int references p (id))")
+
+        // a miss in row 700 of 2,000 (and another in row 1,500): the first, and nothing left
+        let m1 = q(mut &s, &valuesSql("c", 0, 2000, 700, 9999, 1500))
+        println("miss 700 values: " + m1 + " | rows " + count(mut &s, &"c"))
+        let m2 = q(mut &s, &selectSql("c", 0, 2000, 700, 9999, 1500))
+        println("miss 700 select: " + m2 + " | rows " + count(mut &s, &"c"))
+        let m3 = copyIn(mut &s, &"copy c from stdin", &copyData(0, 2000, 700, 9999, 1500))
+        println("miss 700 copy: " + m3 + " | rows " + count(mut &s, &"c"))
+
+        // a miss at the edges of the chunks: the row's own key is the one reported
+        let edges = [1, 2, 31, 32, 33, 95, 96, 97, 223, 224, 225, 479, 480, 481, 991, 992, 993, 2015, 2016, 2017]
+        var bv = ""
+        var bs = ""
+        var bc = ""
+        for n in edges {
+            let want = missing(90000 + n)
+            let gv = q(mut &s, &valuesSql("c", 0, n, n, 90000 + n, -1))
+            let gs = q(mut &s, &selectSql("c", 0, n, n, 90000 + n, -1))
+            let gc = copyIn(mut &s, &"copy c from stdin", &copyData(0, n, n, 90000 + n, -1))
+            if gv != want { bv += " " + n.toStr() + ": " + gv }
+            if gs != want { bs += " " + n.toStr() + ": " + gs }
+            if gc != want { bc += " " + n.toStr() + ": " + gc }
+        }
+        println("edges values: " + (if bv == "" { "ok" } else { bv }))
+        println("edges select: " + (if bs == "" { "ok" } else { bs }))
+        println("edges copy: " + (if bc == "" { "ok" } else { bc }))
+        let g1 = q(mut &s, &valuesSql("c", 0, 2000, -1, 0, -1))
+        let g2 = q(mut &s, &selectSql("c", 2000, 2000, -1, 0, -1))
+        let g3 = copyIn(mut &s, &"copy c from stdin", &copyData(4000, 2000, -1, 0, -1))
+        println("good: " + g1 + ", " + g2 + ", " + g3 + ", rows " + count(mut &s, &"c"))
+        one(mut &s, &"delete from c")
+
+        // another error first: a unique violation in row 500 (a missing key in row 300), a division by
+        // zero in the query at row 900 (a miss at 700)
+        let d1 = strings.replaceAll(&valuesSql("c", 0, 1000, 300, 9999, -1), "(501,", "(500,")
+        let dc = strings.replaceAll(&copyData(0, 1000, 300, 9999, -1), "501\t", "500\t")
+        let u1 = code(mut &s, &d1)
+        let u2 = code(mut &s, &"insert into c select case when i = 500 then 499 else i end, case when i = 300 then 9999 else i % 100 + 1 end from generate_series(1, 1000) i")
+        let u3 = copyIn(mut &s, &"copy c from stdin", &dc)
+        println("unique before miss: " + u1 + " " + u2 + " " + u3[0..5])
+        let z1 = code(mut &s, &"insert into c select i, case when i = 700 then 9999 else i % 100 + 1 end from generate_series(1, 1000) i where 1 / (i - 900) <> 0")
+        let z2 = code(mut &s, &"insert into c select case when i = 500 then 499 else i end, i % 100 + 1 from generate_series(1, 1000) i where 1 / (i - 900) <> 0")
+        println("query error after miss: " + z1 + ", unique first: " + z2 + ", rows " + count(mut &s, &"c"))
+
+        // a self-referencing key: parents earlier in the statement, later (found at its end), a miss, upsert
+        one(mut &s, &"create table tr (id int primary key, up int references tr (id))")
+        let t1 = q(mut &s, &"insert into tr select i, case when i = 1 then null else i - 1 end from generate_series(1, 2000) i")
+        one(mut &s, &"delete from tr")
+        let t2 = q(mut &s, &"insert into tr select i, case when i = 2000 then null else i + 1 end from generate_series(1, 2000) i")
+        one(mut &s, &"delete from tr")
+        let t3 = q(mut &s, &"insert into tr values (1, null), (2, 1), (3, 3), (4, 5), (5, 1)")
+        one(mut &s, &"delete from tr")
+        let t4 = q(mut &s, &"insert into tr select i, case when i = 1 then null when i = 700 then 99999 else i - 1 end from generate_series(1, 2000) i")
+        let t4n = count(mut &s, &"tr")
+        let t6 = q(mut &s, &"insert into tr select i, case when i = 1 then null else i - 1 end from generate_series(1, 300) i on conflict (id) do update set up = excluded.up")
+        println("self: chain " + t1 + ", forward " + t2 + ", values " + t3 + ", miss " + t4 + " rows " + t4n + ", upsert " + t6)
+
+        // a parent written earlier in the transaction, and one deleted since
+        one(mut &s, &"begin")
+        let x1 = q(mut &s, &"insert into p select i, i from generate_series(1001, 1100) i")
+        let x2 = q(mut &s, &"insert into c select i, 1001 + i % 100 from generate_series(1, 1000) i")
+        let x3 = q(mut &s, &"commit")
+        let x4 = count(mut &s, &"c")
+        let x5 = blockDeleted(mut &s)
+        println("transaction: " + x1 + ", " + x2 + ", " + x3 + ", rows " + x4 + ", then deleted " + x5 + " after rollback " + count(mut &s, &"c where id > 5000"))
+        one(mut &s, &"delete from c")
+
+        // a deferred key
+        one(mut &s, &"create table d (id int primary key, pid int references p (id) deferrable initially deferred)")
+        one(mut &s, &"begin")
+        let f1 = q(mut &s, &"insert into d select i, case when i = 700 then 9999 else i % 100 + 1 end from generate_series(1, 2000) i")
+        let f2 = q(mut &s, &"insert into p values (9999, 0)")
+        let f3 = q(mut &s, &"commit")
+        let f4 = count(mut &s, &"d")
+        one(mut &s, &"begin")
+        let f5 = q(mut &s, &"insert into d select i + 5000, case when i = 700 then 7777 else i % 100 + 1 end from generate_series(1, 2000) i")
+        let f6 = q(mut &s, &"commit")
+        println("deferred: " + f1 + " before the parent, " + f2 + ", " + f3 + " " + f4 + ", left out " + f6[0..5])
+        one(mut &s, &"delete from d")
+
+        // NULL key columns
+        one(mut &s, &"create table n (id int primary key, pid int references p (id))")
+        let n1 = q(mut &s, &"insert into n select i, case when i % 3 = 0 then null else i % 100 + 1 end from generate_series(1, 2000) i")
+        let n2 = q(mut &s, &"insert into n values (5001, null), (5002, 1), (5003, null), (5004, 2), (5005, null), (5006, 3)")
+        let n3 = copyIn(mut &s, &"copy n from stdin", &"6001\t\\N\n6002\t5\n6003\t\\N\n6004\t6\n6005\t\\N\n6006\t7\n")
+        println("null: " + n1 + " " + n2 + " " + n3 + " rows " + count(mut &s, &"n") + " nulls " + count(mut &s, &"n where pid is null"))
+
+        // a composite key, a part NULL
+        one(mut &s, &"create table pp (a int, b text, primary key (a, b))")
+        one(mut &s, &"insert into pp select i % 10, 'k' || (i % 100) from generate_series(1, 100) i")
+        one(mut &s, &"create table cc (id int primary key, a int, b text, foreign key (a, b) references pp (a, b))")
+        let k1 = q(mut &s, &"insert into cc select i, i % 100 % 10, 'k' || (i % 100) from generate_series(1, 2000) i")
+        let k2 = q(mut &s, &"insert into cc select i + 5000, case when i = 700 then 3 else i % 100 % 10 end, case when i = 700 then 'k99' else 'k' || (i % 100) end from generate_series(1, 2000) i")
+        let k3 = q(mut &s, &"insert into cc values (7001, null, 'nope'), (7002, 1, null), (7003, null, null)")
+        println("composite: " + k1 + ", miss " + k2 + " null part " + k3 + " rows " + count(mut &s, &"cc"))
+
+        // one parent key many times in a chunk
+        let y1 = q(mut &s, &"insert into c select i, 5 from generate_series(1, 2000) i")
+        let y2 = q(mut &s, &valuesSql("c", 10000, 2000, -1, 0, -1))
+        println("same key: " + y1 + ", " + y2 + ", count " + count(mut &s, &"c"))
+        one(mut &s, &"delete from c")
+
+        // a key to a unique index (not the primary key)
+        one(mut &s, &"create table u (id int primary key, code text unique)")
+        one(mut &s, &"insert into u select i, 'c' || i from generate_series(1, 101) i")
+        one(mut &s, &"create table uc (id int primary key, code text references u (code))")
+        let w1 = q(mut &s, &"insert into uc select i, 'c' || (i % 100 + 1) from generate_series(1, 700) i")
+        let w2 = q(mut &s, &"insert into uc select i + 1000, case when i = 300 then 'nope' else 'c' || (i % 100 + 1) end from generate_series(1, 700) i")
+        println("unique index: " + w1 + ", " + w2)
+
+        // a char value into a text key (the query's blanks dropped)
+        one(mut &s, &"create table pt (k text primary key)")
+        one(mut &s, &"insert into pt select 'k' || i from generate_series(1, 101) i")
+        one(mut &s, &"create table ct (id int primary key, k text references pt (k))")
+        one(mut &s, &"create table sc (id int, k char(8))")
+        one(mut &s, &"insert into sc select i, 'k' || (i % 100 + 1) from generate_series(1, 300) i")
+        let h1 = q(mut &s, &"insert into ct select id, k from sc")
+        one(mut &s, &"update sc set k = 'zz' where id = 150")
+        one(mut &s, &"delete from ct")
+        let h2 = code(mut &s, &"insert into ct select id, k from sc")
+        println("char into text: " + h1 + ", " + h2)
+
+        // RETURNING, a serial column and a default
+        one(mut &s, &"create table r (id serial primary key, pid int references p (id), v int default 7)")
+        let r1 = q(mut &s, &"insert into r (pid) select i % 100 + 1 from generate_series(1, 100) i returning id")
+        let r1ids = strings.split(&r1, " ")
+        one(mut &s, &"create table r2 (id int primary key, pid int references p (id), v int default 7)")
+        let r2 = q(mut &s, &"insert into r2 (id, pid) select i, i % 100 + 1 from generate_series(1, 40) i returning id + v - 7")
+        var sum = 0
+        let r2l = strings.split(&r2, " ")
+        for x in r2l { sum += strings.parseIntOpt(&x).unwrapOr(0) }
+        println("returning: " + len(r1ids).toStr() + " rows, ids " + r1ids[0] + ".." + r1ids[len(r1ids) - 1] + ", v " + q(mut &s, &"select min(v) from r") +
+                ", " + len(r2l).toStr() + " rows sum " + sum.toStr())
+
+        // ON CONFLICT DO NOTHING: conflicting rows skipped, a miss still fails
+        one(mut &s, &"create table o (id int primary key, pid int references p (id))")
+        one(mut &s, &"insert into o select i, 1 from generate_series(1, 10) i")
+        let o1 = q(mut &s, &"insert into o select i, i % 100 + 1 from generate_series(1, 2000) i on conflict do nothing")
+        let o2 = code(mut &s, &"insert into o select i + 5000, case when i = 700 then 99999 else i % 100 + 1 end from generate_series(1, 2000) i on conflict do nothing")
+        println("do nothing: " + o1 + " count " + count(mut &s, &"o") + ", miss " + o2)
+
+        // COPY with batch_rows: a commit each 500 rows; a miss fails at its batch's end
+        one(mut &s, &"create table b (id int primary key, pid int references p (id))")
+        let b1 = copyIn(mut &s, &"copy b from stdin with (batch_rows 500)", &copyData(0, 3000, -1, 0, -1))
+        one(mut &s, &"delete from b")
+        let b2 = copyIn(mut &s, &"copy b from stdin with (batch_rows 500)", &copyData(0, 3000, 1700, 77777, -1))
+        println("batch rows: " + b1 + ", miss " + b2[0..5] + " after " + count(mut &s, &"b where id <= 1500") + " rows")
+
+        // COPY in parts that cut records, in CSV with a header, with a miss in line 700 (and one past it)
+        one(mut &s, &"create table cs (id int primary key, pid int references p (id))")
+        var sm = ""
+        for n in [37, 100, 4096] {
+            let a = load(mut &s, &"copy cs from stdin", &copyData(0, 2000, -1, 0, -1), n)
+            let rows = count(mut &s, &"cs")
+            one(mut &s, &"delete from cs")
+            let b = load(mut &s, &"copy cs from stdin", &copyData(0, 2000, 700, 9999, 1500), n)
+            sm += " " + a + "/" + rows + "/" + b[0..5] + "/" + count(mut &s, &"cs")
+        }
+        var csv = "id,pid\n"
+        for i in 1..2001 { csv += i.toStr() + "," + pidAt(i, 700, 66666, 1500).toStr() + "\n" }
+        let cv = load(mut &s, &"copy cs from stdin with (format csv, header)", &csv, 250)
+        println("copy parts: " + sm + " csv " + cv + " rows " + count(mut &s, &"cs"))
+
+        // the INSERT ... SELECT into a table with a secondary index and a unique text index (8a)
+        one(mut &s, &"create table big (id int primary key, a int, name text, v int)")
+        one(mut &s, &"create index big_a on big (a)")
+        one(mut &s, &"create unique index big_name on big (name)")
+        let t0 = time.monotonicNs()
+        let sl = q(mut &s, &"insert into big select i, i % 1000, 'name' || i, i from generate_series(1, 30000) i")
+        let ms = (time.monotonicNs() - t0) / 1000000
+        println("superlinear: " + sl + " " + (if ms < 2500 { "ok" } else { "slow: " + ms.toStr() + " ms" }))
+        return 0
+    }).unwrap()
+}

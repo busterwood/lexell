@@ -43,6 +43,7 @@ import "./lexdb_pipe"
 import "./lexdb_agg"
 import "./lexdb_setop"
 import "./lexdb_sort"
+import "./lexdb_fkprobe"
 import "./lexdb_lib"
 import "./lexdb_dialect"
 import "./lexdb_locks"
@@ -9933,10 +9934,30 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                 count += try insertSelRow(st, txn, &t, &targets, &sel.outs, &r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
             }
         } else {
-            try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
-                count += try insertSelRow(st, tx, &t, &targets, &sel.outs, r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
+            // With foreign keys, rows are held up to a chunk (32, doubling to BROWS) and their parents probed
+            // together (fkAhead), then written in order; a query's error comes after the writes of the rows
+            // before it, as when they were written as they came
+            let chunked = len(t.fks) > 0 && up.mode != lexdb_sql.CONFLICT_UPDATE && plainDefaults(&t, &targets, &defs)
+            var held: [][]Val = []
+            var heldBytes = 0
+            var want = 32
+            let ran = eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+                if !chunked {
+                    count += try insertSelRow(st, tx, &t, &targets, &sel.outs, r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
+                    return Ok(true)
+                }
+                append(mut &held, collections.copyOf(r))
+                heldBytes += lexdb_pipe.rowBytes(r)
+                if len(held) >= want || heldBytes >= HELD_BYTES {
+                    count += try insertSelRows(st, tx, &t, &targets, &sel.outs, &held, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
+                    held = []
+                    heldBytes = 0
+                    want = min(want * 2, lexdb_rows.BROWS)
+                }
                 return Ok(true)
             })
+            if len(held) > 0 { count += try insertSelRows(st, txn, &t, &targets, &sel.outs, &held, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept) }
+            try ran
         }
         try fkFinish(st, txn, &fw, mut &later)
     } else {
@@ -9957,6 +9978,20 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
     }
     return Ok(retRes(ret, &("INSERT 0 " + count.toStr())))
+}
+
+// The most an INSERT ... SELECT holds of the rows it reads ahead, in bytes.
+const HELD_BYTES: int = 4 * 1024 * 1024
+
+// A chunk of an INSERT ... SELECT's rows inserted, in order, their parents
+// looked up together first: how many were inserted.
+fn insertSelRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, cols: &[]OutCol, rows: &[][]Val,
+                 defs: &Defs, ovr: int, fw: &[]Table, later: mut &[]FkLater, up: mut &Upsert, env: &Env,
+                 keep: bool, kept: mut &[][]Val): Result[int, DbErr] {
+    try fkAhead(st, txn, t, fw, targets, up, rows)
+    var n = 0
+    for r in rows { n += try insertSelRow(st, txn, t, targets, cols, &r, defs, ovr, fw, later, up, env, keep, kept) }
+    return Ok(n)
 }
 
 // One row of an INSERT ... SELECT's query inserted: 1, or 0 (ON CONFLICT
@@ -10127,7 +10162,21 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
     let fw = try fkTables(st, txn, t, true, up.mode == lexdb_sql.CONFLICT_UPDATE)
     var later: []FkLater = []
     var count = 0
-    for r in rows {
+    var chunkEnd = 0
+    var want = 32
+    for ri in 0..len(rows) {
+        let r = &rows[ri]
+        if ri == chunkEnd && len(rows) > 1 && len(t.fks) > 0 {
+            // a chunk's parents looked up together, from the literals and parameters it gives for the keys
+            let to = min(ri + want, len(rows))
+            if len(up.fk.fks) == 0 && up.mode != lexdb_sql.CONFLICT_UPDATE { up.fk = fkProbes(t, &fw, targets) }
+            if up.fk.any() {
+                let spec = up.fk.given(rows, ri, to, len(targets), env.params)
+                try fkAhead(st, txn, t, &fw, targets, up, &spec)
+            }
+            chunkEnd = to
+            want = min(want * 2, lexdb_rows.BROWS)
+        }
         var vs: []Val = []
         for k in 0..len(r) {
             if k >= len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
@@ -10207,7 +10256,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
             None {}
         }
     }
-    let r = try storeRow(st, txn, t, row, fw, later)
+    let r = try storeRow(st, txn, t, row, fw, later, mut &up.fk)
     if up.mode != lexdb_sql.CONFLICT_NONE { up.touched.put(keyOf(t, &r), 1) }
     return Ok(Some(r))
 }
@@ -10234,13 +10283,17 @@ type Upsert = record {
     ridNext: int
     ridLeft: int
     ridWant: int
+    // the statement's foreign keys' parents probed ahead (lexdb_fkprobe): empty
+    // for a single row, under DO UPDATE (it may change a key a row refers to),
+    // and until the first chunk
+    fk: lexdb_fkprobe.Probes
 }
 
 const ROWID_RUN: int = 1024
 
 fn noUpsert(): Upsert {
     return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
-                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1}
+                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none()}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -10347,7 +10400,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
 
 // A built row stored: its key free, its indexes and foreign keys checked.
 fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: []Val, fw: &[]Table,
-            later: mut &[]FkLater): Result[[]Val, DbErr] {
+            later: mut &[]FkLater, pr: mut &lexdb_fkprobe.Probes): Result[[]Val, DbErr] {
     try checkEnums(st, txn, t, &row)
     // its key free (the hidden key is its sequence's next value, never
     // given: not looked for, 9.119), its index entries added
@@ -10359,7 +10412,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], &row)) }
     if len(t.fks) > 0 {
         let none: []Val = []
-        try childSide(st, txn, t, fw, &row, &none, later)
+        try childSide(st, txn, t, fw, &row, &none, later, pr)
     }
     return Ok(row)
 }
@@ -16745,6 +16798,56 @@ fn fkTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, parent
     return Ok(out)
 }
 
+// The probes of a statement writing rows of t with values for targets
+// (lexdb_fkprobe): one per foreign key, its key's columns found once. A key
+// column the rows give no value for, or an identity column (it may take its
+// default), has no place in them.
+fn fkProbes(t: &Table, fw: &[]Table, targets: &[]int): lexdb_fkprobe.Probes {
+    var pr = lexdb_fkprobe.none()
+    for k in 0..len(t.fks) {
+        let pi = findTab(fw, &t.fks[k].ref)
+        let fc = fkCols(t, &t.fks[k], &fw[pi])
+        var at: []int = []
+        for c in fc.cols {
+            var j = -1
+            for x in 0..len(targets) { if targets[x] == c && t.cols[c].identity == lexdb_sql.ID_NONE { j = x } }
+            append(mut &at, j)
+        }
+        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), fc.via, pi, at, len(fw[pi].cols)))
+    }
+    return pr
+}
+
+// A chunk of rows about to be written, their values in targets' order: the
+// statement's probes made (for two rows or more), and the parents of their
+// keys looked up together. Not under ON CONFLICT DO UPDATE (it may change a
+// key other rows refer to).
+fn fkAhead(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table, targets: &[]int, up: mut &Upsert,
+           rows: &[][]Val): Result[Unit, DbErr] {
+    if len(t.fks) == 0 || up.mode == lexdb_sql.CONFLICT_UPDATE { return Ok(Unit{}) }
+    if len(up.fk.fks) == 0 {
+        if len(rows) < 2 { return Ok(Unit{}) }
+        up.fk = fkProbes(t, fw, targets)
+    }
+    return up.fk.ahead(st, txn, t, fw, rows)
+}
+
+// Whether an INSERT ... SELECT's rows may be read ahead of their writes: no
+// column's value comes from a sequence or a function the query's own calls
+// could interleave with (rows read ahead call theirs first).
+fn plainDefaults(t: &Table, targets: &[]int, defs: &Defs): bool {
+    for i in 0..len(t.cols) {
+        var given = false
+        for c in targets { if c == i { given = true } }
+        if given {
+            if t.cols[i].identity != lexdb_sql.ID_NONE { return false }
+        } else if (len(defs.seqs[i].key) > 0 && t.cols[i].name != lexdb_catalog.ROWID) || defs.exprs[i].isSome() {
+            return false
+        }
+    }
+    return true
+}
+
 fn loadTab(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, out: mut &[]Table, k: &str): Result[int, DbErr] {
     for i in 0..len(out) { if out[i].name == k { return Ok(i) } }
     append(out, try byKey(st, txn, k))
@@ -16769,7 +16872,10 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
                                        fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 1) })
     if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
-    if len(t.fks) > 0 { try childSide(st, txn, t, fw, row, old, later) }
+    if len(t.fks) > 0 {
+        var np = lexdb_fkprobe.none()
+        try childSide(st, txn, t, fw, row, old, later, mut &np)
+    }
     if len(t.refBy) > 0 { try parentSide(st, txn, t, fw, old, row, true, later) }
     return Ok(Unit{})
 }
@@ -16791,10 +16897,26 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
 // Row of table t written (old the row it was, [] for an INSERT): its keys
 // in the tables it references.
 fn childSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &[]Table, row: &[]Val, old: &[]Val,
-             later: mut &[]FkLater): Result[Unit, DbErr] {
+             later: mut &[]FkLater, pr: mut &lexdb_fkprobe.Probes): Result[Unit, DbErr] {
     for k in 0..len(t.fks) {
         let f = &t.fks[k]
         let pi = findTab(fw, &f.ref)
+        if pr.active(k) {
+            // an INSERT's, with the statement's probes: the key's columns worked out once, and a parent known
+            // to be there (looked up before, or by a chunk's probe) not looked up again
+            if hasNullAt(row, &pr.fks[k].cols) { continue }
+            let key = pr.keyOfRow(k, &fw[pi], row)
+            if pr.known(k, &key) { continue }
+            let vals = valsAt(row, &pr.fks[k].cols)
+            let fc = FkCols{cols: collections.copyOf(&pr.fks[k].cols), refCols: collections.copyOf(&pr.fks[k].refCols), via: pr.fks[k].via}
+            if try parentHas(st, txn, &fw[pi], &fc, &vals) {
+                pr.found(k, key)
+            } else {
+                let none: []Val = []
+                append(later, fkLater(FK_MISSING, &t.name, k, vals, 0, none))
+            }
+            continue
+        }
         let fc = fkCols(t, f, &fw[pi])
         if hasNullAt(row, &fc.cols) { continue }
         let vals = valsAt(row, &fc.cols)
@@ -18427,11 +18549,50 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         return CopyPart{rows: [], data: input.data.clone(), end: true, fail: input.fail.clone(), proto: input.proto}
     }
     var header = s.copy.header
+    // With foreign keys, the records after the one being read, those the buffer
+    // holds whole and well formed, are parsed ahead in chunks (32, doubling to
+    // BROWS) and their parents looked up together (fkAhead); the loop then takes
+    // each as it reaches it, with the reader's place after it as it would be
+    // had it parsed the record itself. What is not plain is left to the loop.
+    var pre: [][]Val = []
+    var preAt: []int = []                   // per record: rd.at, rd.line, rd.start after it
+    var preNext = 0
+    var want = 32
     while true {
         let at0 = rd.at
         let line0 = rd.line
-        var res = copyRecord(&buf, &s.copy, mut &rd, mut &vs)
-        if !ended {
+        let start0 = rd.start
+        if preNext * 3 >= len(preAt) && len(t.fks) > 0 && !header {
+            pre = []
+            preAt = []
+            preNext = 0
+            while len(pre) < want {
+                var one: []Val = []
+                let more = match copyRecord(&buf, &s.copy, mut &rd, mut &one) { Ok(m) { m } Err(_) { false } }
+                if !more || len(one) != len(targets) || (!ended && rd.at >= len(buf) && buf[len(buf) - 1] != '\n') { break }
+                append(mut &pre, one)
+                append(mut &preAt, rd.at)
+                append(mut &preAt, rd.line)
+                append(mut &preAt, rd.start)
+            }
+            rd.at = at0
+            rd.line = line0
+            rd.start = start0
+            want = min(want * 2, lexdb_rows.BROWS)
+            if len(pre) > 1 { try fkAhead(st, txn, &t, &fw, &targets, mut &noUp, &pre) }
+        }
+        var taken = false
+        if preNext * 3 < len(preAt) {
+            vs = replace(mut &pre[preNext], [])
+            rd.at = preAt[preNext * 3]
+            rd.line = preAt[preNext * 3 + 1]
+            rd.start = preAt[preNext * 3 + 2]
+            preNext += 1
+            taken = true
+        }
+        var res: Result[bool, DbErr] = Ok(true)
+        if !taken { res = copyRecord(&buf, &s.copy, mut &rd, mut &vs) }
+        if !ended && !taken {
             // ran off the end of what has come: wait for more
             var short = false
             match res {
@@ -18487,6 +18648,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             // rows after it go into a new transaction
             try fkFinish(st, txn, &fw, mut &later)
             later = []
+            noUp.fk.forget()
             let done = replace(txn, freshTxn(txn))
             match st.commit(done) {
                 Ok(_) {}

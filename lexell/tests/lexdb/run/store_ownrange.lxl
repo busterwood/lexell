@@ -1,0 +1,186 @@
+// lexdb_store: a transaction's own writes in a scan (Txn.ownRange, kept in
+// sorted runs, design/lexdb-batch-gaps.md item 8a). Against a model:
+// - a transaction over a committed base puts, deletes and scans ranges in
+//   bursts and one by one (every put followed by a scan, as a unique
+//   index's check follows each row's entry): every scan gives the base and
+//   the transaction's writes, in order, the last write of a key standing;
+// - a savepoint undone, then more writes and scans;
+// - a range delete of the transaction's range, then scans;
+// - time: 20,000 puts each followed by a scan of its key's range cost
+//   about 4 times what 5,000 do, not 16 (every call had merged the whole
+//   key list anew: quadratic).
+// expect: bursts: ok
+// expect: one by one: ok
+// expect: savepoint: ok
+// expect: range delete: ok
+// expect: linear: ok
+import "strings"
+import "collections"
+import "time"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_base"
+
+fn key(i: int): str { return "k" + strings.padLeft(&(i.toStr()), 6, '0') }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 64 * 4096, ckptBytes: 32 * 4096, snapNodes: 100000}
+}
+
+// Scans [from, to) of tree in t against the model's keys in the range;
+// "" when they agree.
+fn check(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, tree: int, model: &Map[str, str], from: &str, to: &str): str {
+    var want: []str = []
+    for i in 0..model.size() {
+        let k: &str = model.keyAt(i)
+        if k >= from && (len(to) == 0 || k < to) { append(mut &want, k.toStr()) }
+    }
+    collections.sortBy(mut &want, fn(a: &str, b: &str): int { return a.cmp(b) })
+    var got: []str = []
+    var bad = ""
+    let r = st.scan(t, tree, from, to, fn(e: &lexdb_store.Entry): bool {
+        append(mut &got, e.key.toStr())
+        match model.get(&e.key) {
+            Some(v) { if v != e.val && bad == "" { bad = "value of " + e.key + ": " + e.val + " want " + v } }
+            None {}
+        }
+        return true
+    })
+    if r.isErr() { return "scan: " + r.unwrapErr().toStr() }
+    if bad != "" { return bad }
+    if len(got) != len(want) { return "[" + from + ", " + to + "): " + len(got).toStr() + " keys, want " + len(want).toStr() }
+    for i in 0..len(got) { if got[i] != want[i] { return "[" + from + ", " + to + "): key " + got[i] + " at " + i.toStr() + ", want " + want[i] }
+    }
+    return ""
+}
+
+fn randRange(rng: mut &lexdb_base.Rng, span: int): str {
+    // [from, to) or [from, end)
+    let a = rng.below(span)
+    return key(a)
+}
+
+fn copyModel(m: &Map[str, str]): Map[str, str] {
+    var c: Map[str, str] = newMap()
+    for i in 0..m.size() { c.put(m.keyAt(i).toStr(), m.valAt(i).toStr()) }
+    return c
+}
+
+// n puts of fresh keys each followed by a scan of its own key's range, in
+// a transaction: the time taken, nanoseconds.
+fn timed(st: &lexdb_store.Store, tree: int, n: int, base: int): int {
+    var t = lexdb_store.begin()
+    let t0 = time.monotonicNs()
+    for i in 0..n {
+        let k = key(base + (i * 7919) % n)
+        t.put(tree, &(k.toStr()), "v").unwrap()
+        var c = 0
+        st.scan(mut &t, tree, &(k.toStr()), &(k + "\x00"), fn(e: &lexdb_store.Entry): bool {
+            c += 1
+            return true
+        }).unwrap()
+    }
+    return time.monotonicNs() - t0
+}
+
+fn main() {
+    var rng = lexdb_base.rng(9)
+    lexdb_store.run(lexdb_disk.sim(21), opts(), fn(st: lexdb_store.Store): int {
+        var model: Map[str, str] = newMap()
+        var w0 = lexdb_store.begin()
+        let tree = st.createTree(mut &w0)
+        for i in 0..2000 {
+            w0.put(tree, &(key(i * 3)), "base").unwrap()
+            model.put(key(i * 3), "base")
+        }
+        st.commit(w0).unwrap()
+        var t = lexdb_store.begin()
+        // bursts of writes, then scans of ranges (some empty, some with no end)
+        var bad = ""
+        for round in 0..40 {
+            let burst = 1 + rng.below(300)
+            for j in 0..burst {
+                let k = key(rng.below(7000))
+                if rng.below(4) == 0 {
+                    t.del(tree, &(k.toStr()))
+                    let gone = model.remove(&k)
+                } else {
+                    let v = "r" + round.toStr() + "." + j.toStr()
+                    t.put(tree, &(k.toStr()), &(v.toStr())).unwrap()
+                    model.put(k, v)
+                }
+            }
+            for s in 0..6 {
+                let from = randRange(mut &rng, 7000)
+                let to = if rng.below(3) == 0 { "" } else { key(rng.below(7000)) }
+                if bad == "" { bad = check(&st, mut &t, tree, &model, &from, &to) }
+            }
+            if bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        }
+        println("bursts: " + (if bad == "" { "ok" } else { bad }))
+        // every put followed by a scan, the scan of its key's neighbourhood
+        bad = ""
+        for i in 0..1500 {
+            let k = key(rng.below(7000))
+            if rng.below(5) == 0 {
+                t.del(tree, &(k.toStr()))
+                let gone = model.remove(&k)
+            } else {
+                t.put(tree, &(k.toStr()), &("o" + i.toStr())).unwrap()
+                model.put(k.clone(), "o" + i.toStr())
+            }
+            if bad == "" { bad = check(&st, mut &t, tree, &model, &k, &(k + "\x00")) }
+            if i % 100 == 0 && bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        }
+        println("one by one: " + (if bad == "" { "ok" } else { bad }))
+        // a savepoint undone: the writes after it forgotten, the runs made again
+        bad = ""
+        let mk = t.mark()
+        let saved = copyModel(&model)
+        for i in 0..300 {
+            let k = key(rng.below(7000))
+            t.put(tree, &(k.toStr()), "sp").unwrap()
+            model.put(k.clone(), "sp")
+            if i % 7 == 0 && bad == "" { bad = check(&st, mut &t, tree, &model, &k, &(k + "\x00")) }
+        }
+        if bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        t.undoTo(mk)
+        model = saved
+        if bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        for i in 0..200 {
+            let k = key(rng.below(7000))
+            t.put(tree, &(k.toStr()), "after").unwrap()
+            model.put(k.clone(), "after")
+            if bad == "" { bad = check(&st, mut &t, tree, &model, &k, &(k + "\x00")) }
+        }
+        if bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        println("savepoint: " + (if bad == "" { "ok" } else { bad }))
+        // a range delete: its own puts in the range become deletes
+        bad = ""
+        let lo = key(2000)
+        let hi = key(4000)
+        t.delRange(tree, &lo, &hi)
+        var keep: Map[str, str] = newMap()
+        for i in 0..model.size() {
+            let k: &str = model.keyAt(i)
+            if !(k >= lo && k < hi) { keep.put(k.toStr(), model.valAt(i).toStr()) }
+        }
+        model = keep
+        for i in 0..100 {
+            let k = key(rng.below(7000))
+            t.put(tree, &(k.toStr()), "post").unwrap()
+            model.put(k.clone(), "post")
+            if bad == "" { bad = check(&st, mut &t, tree, &model, &k, &(k + "\x00")) }
+        }
+        if bad == "" { bad = check(&st, mut &t, tree, &model, "", "") }
+        println("range delete: " + (if bad == "" { "ok" } else { bad }))
+        // time: a quadratic return makes the larger four times slower than linear
+        var t1 = lexdb_store.begin()
+        let tr2 = st.createTree(mut &t1)
+        st.commit(t1).unwrap()
+        let a = timed(&st, tr2, 5000, 0)
+        let b = timed(&st, tr2, 20000, 100000)
+        println("linear: " + (if b < a * 9 + 50000000 { "ok" } else { "no: 5k " + (a / 1000000).toStr() + " ms, 20k " + (b / 1000000).toStr() + " ms" }))
+        return 0
+    }).unwrap()
+}
