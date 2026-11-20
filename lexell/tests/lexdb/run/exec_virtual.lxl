@@ -1,0 +1,203 @@
+// lexdb_exec: virtual generated columns are computed when read, not stored when written (design/lexdb-dialect-gaps.md,
+// package C, section 8: the read-time design). A table of 3,000 rows (three batches of the pipeline and part of a fourth):
+// the same queries over its virtual columns (WHERE, ORDER BY, GROUP BY, DISTINCT, joins, subqueries, windows, aggregates)
+// with SET lexdb_batch = off and on give the same rows, and a division by zero in a virtual column of a row in a later batch
+// the same state, though the INSERT that wrote the row did not fail (the error comes at the read). A virtual column takes no
+// room in a row (the table's size is that of a table without it). ADD COLUMN of one over 20,000 rows rewrites nothing (the
+// rows keep their layout and bytes), where ADD COLUMN of a stored one writes every row again. UPDATE, DELETE, INSERT ... ON
+// CONFLICT, MERGE and RETURNING read it, and a view, a correlated subquery and CREATE TABLE AS see it. The disk crashed and the
+// store opened again reads it, and what was added before. Oracle's index on a virtual column (the entry is computed at the
+// write) is used for the column's expression and kept right by UPDATE and DELETE.
+// expect: created: CREATE TABLE
+// expect: big: 2999 rows, batched equal off: 26 of 26 queries, read in batches: true
+// expect: error at read: INSERT 0 1, 22012 22012 22012, others 3000
+// expect: dml: UPDATE 1499, DELETE 99, INSERT 0 600, then 3500|87520986|0|7
+// expect: returning: 7|0|14007, 7, merge MERGE 0, then 7|14|0|0|14000
+// expect: merge: MERGE 1, then 7|14|0
+// expect: view, ctas, correlated: 6|6|3500|3500
+// expect: add virtual: before 0:20000 of 1 layouts, after 0:20000 of 3 layouts, tree unchanged: true, read 20000|490119985|61
+// expect: add stored: 3:20000 of 4 layouts, tree changed: true
+// expect: size: within 10% of a table without the virtual columns; with them as columns of values: more than 10% bigger
+// expect: reopened: 3500|87527979|6, ADD column read 3500, error still at the read: 22012
+// expect: oracle index: index gv, 9 -> 2, after update 25 -> 2, 9 -> none, after delete none
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+fn show(r: &lexdb_exec.Res): str {
+    if !r.hasRows { return r.tag.clone() }
+    var out: []str = []
+    for row in r.rows {
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+        append(mut &out, strings.join(&vs, "|"))
+    }
+    return strings.join(&out, ";")
+}
+
+// rows (columns joined by |, rows by ;), the tag, or the error's state and text
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return show(&rs[len(rs) - 1]) }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// the same in Oracle's dialect
+fn qo(s: mut &lexdb_exec.Session, sql: &str): str {
+    var last = ""
+    match lexdb_parse.oraParse(sql) {
+        Ok(stmts) {
+            for st in stmts {
+                let none: []lexdb_sql.Val = []
+                let nt: []int = []
+                match s.run(&st, &none, &nt) {
+                    Ok(r) { last = show(&r) }
+                    Err(e) { return e.state + " " + e.msg }
+                }
+            }
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+    return last
+}
+
+fn state(s: mut &lexdb_exec.Session, sql: &str): str { return q(s, sql)[0..5].clone() }
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn first(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    say("created", q(mut &s, &"create table big (id int primary key, a int, b int, v int generated always as (a % 7) virtual, w bigint generated always as (a * 1000 + b) virtual, t text generated always as ('k' || (a % 10)::text) virtual, r int generated always as (100 / (3000 - id)) virtual)"))
+    let f = q(mut &s, &"insert into big (id, a, b) select x, x % 50, x % 13 from generate_series(1, 2999) as x")
+    let queries = ["select count(*), sum(w), sum(v) from big", "select v, count(*) from big group by v order by v",
+                   "select t, count(*), min(w), max(w) from big group by t order by t", "select id, w from big where w = 3005 order by id",
+                   "select id from big where w between 10000 and 10100 order by id", "select count(*) from big where v = 3",
+                   "select count(*) from big where t = 'k4' and v > 2", "select id, w, v, t from big order by w desc, id limit 20",
+                   "select id, v from big where id % 100 = 0 order by id", "select sum(w) from big where id > 1024 and id <= 2049",
+                   "select count(*) from big where w is null", "select count(distinct t) from big", "select avg(v) from big",
+                   "select id from big where v = 6 and id between 1020 and 1030 order by id", "select w from big where id in (1, 1024, 1025, 2048, 2999) order by id",
+                   "select b.id, b.w from big b join big c on c.w = b.w where c.id = 17 order by b.id", "select count(*) from big where w > 2000 and t like 'k%'",
+                   "select min(w), max(w), min(v), max(v) from big", "select distinct v from big order by v",
+                   "select t, sum(v) from big where id <= 1025 group by t order by t", "select count(*) from big where (a * 1000 + b) = w",
+                   "select count(*) from big x join big y using (v) where x.id < 30 and y.id < 30", "select id from big where v in (select v from big where id = 5) and id < 20 order by id",
+                   "select id, (select max(w) from big z where z.v = big.v and z.id < 100) from big where id < 10 order by id",
+                   "select id, sum(w) over (partition by v order by id) from big where id < 15 order by id", "select id from big where w = 3005 or v = 99 order by id"]
+    var same = 0
+    for x in queries {
+        let a = q(mut &s, &"set lexdb_batch = off")
+        let off = q(mut &s, &x)
+        let b = q(mut &s, &"set lexdb_batch = on")
+        let on = q(mut &s, &x)
+        if on == off && !strings.contains(&on, "ERROR") && len(on) > 0 && !strings.contains(&on, " division") { same += 1 } else { println("DIFF " + x + ": " + off + " <> " + on) }
+    }
+    let ex = q(mut &s, &"explain analyze select count(*), sum(w), sum(v) from big where t = 'k4'")
+    say("big", q(mut &s, &"select count(*) from big") + " rows, batched equal off: " + same.toStr() + " of " + len(queries).toStr() + " queries, read in batches: " + strings.contains(&ex, "batches").toStr())
+    // the row whose r divides by zero is written without an error; r fails where it is read, in a later batch, the same either way
+    let ins = q(mut &s, &"insert into big (id, a, b) values (3000, 1, 1)")
+    let a = q(mut &s, &"set lexdb_batch = off")
+    let e1 = state(mut &s, &"select sum(r) from big")
+    let e1b = state(mut &s, &"select id, r from big order by id")
+    let b = q(mut &s, &"set lexdb_batch = on")
+    let e2 = state(mut &s, &"select sum(r) from big")
+    say("error at read", ins + ", " + e1 + " " + e1b + " " + e2 + ", others " + q(mut &s, &"select count(w) from big"))
+    let del = q(mut &s, &"delete from big where id = 3000")
+    let drop = q(mut &s, &"alter table big drop column r")
+    // writes read the columns
+    let up = q(mut &s, &"update big set a = a + 1 where id % 2 = 0 and v >= 0")
+    let dl = q(mut &s, &"delete from big where id > 2900 and w >= 0")
+    let ins2 = q(mut &s, &"insert into big (id, a, b) select id + 10000, a, b from big where id <= 600")
+    let tot = q(mut &s, &"select count(*), sum(w), (select count(*) from big where w <> a * 1000 + b), (select count(distinct v) from big) from big")
+    say("dml", up + ", " + dl + ", " + ins2 + ", then " + tot)
+    let r1 = q(mut &s, &"insert into big (id, a, b) values (7, 4, 4) on conflict (id) do update set a = big.v + excluded.v + 10 returning id, v, w")
+    let r2 = q(mut &s, &"update big set b = v where id = 7 returning id")
+    let r3 = q(mut &s, &"merge into big using (select 7 as id) x on big.id = x.id when matched and big.v > 3 then update set a = a + big.v")
+    say("returning", r1 + ", " + r2 + ", merge " + r3 + ", then " + q(mut &s, &"select id, a, b, v, w from big where id = 7"))
+    let r4 = q(mut &s, &"update big set a = 10 where id = 7")
+    let r5 = q(mut &s, &"merge into big using (select 7 as id) x on big.id = x.id when matched and big.v > 2 then update set a = a + big.v + 1")
+    say("merge", r5 + ", then " + q(mut &s, &"select id, a, v from big where id = 7"))
+    let c1 = q(mut &s, &"create view bv as select id, v as vv, w from big where v > 2")
+    let c2 = q(mut &s, &"create table bt as select id, v, t from big")
+    say("view, ctas, correlated", q(mut &s, &"select max(vv) from bv") + "|" + q(mut &s, &"select max(v) from bt") + "|" + q(mut &s, &"select count(*) from bt where t like 'k%'") +
+        "|" + q(mut &s, &"select count(*) from big x where exists (select 1 from bt where bt.id = x.id and bt.v = x.v)"))
+    return 0
+}
+
+// ADD COLUMN over 20,000 rows, and the room a virtual column takes
+fn addcol(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    let c = q(mut &s, &"create table p (id int primary key, a int, b int)")
+    let f = q(mut &s, &"insert into p select x, x % 50, x % 13 from generate_series(1, 20000) as x")
+    let before = lexdb_exec.rowLayouts(&st, &"p")
+    let dump = lexdb_exec.treeDump(&st, &"p")
+    let ad = q(mut &s, &"alter table p add column v int generated always as (a + b) virtual")
+    let ad2 = q(mut &s, &"alter table p add column w bigint generated always as (a * 1000 + b) virtual")
+    let after = lexdb_exec.rowLayouts(&st, &"p")
+    let dump2 = lexdb_exec.treeDump(&st, &"p")
+    say("add virtual", "before " + before + ", after " + after + ", tree unchanged: " + (dump == dump2).toStr() + ", read " + q(mut &s, &"select count(*) || '|' || sum(w) || '|' || max(v) from p"))
+    let d3 = q(mut &s, &"alter table p add column x int generated always as (a * 2) stored")
+    say("add stored", lexdb_exec.rowLayouts(&st, &"p") + ", tree changed: " + (lexdb_exec.treeDump(&st, &"p") != dump2).toStr())
+    // the same rows in a table with the virtual columns and one without them: the same room
+    let c2 = q(mut &s, &"create table p2 (id int primary key, a int, b int, x int)")
+    let f2 = q(mut &s, &"insert into p2 select x, x % 50, x % 13, (x % 50) * 2 from generate_series(1, 20000) as x")
+    let c3 = q(mut &s, &"create table p3 (id int primary key, a int, b int, v int generated always as (a + b) virtual, w bigint generated always as (a * 1000 + b) virtual, x int)")
+    let f3 = q(mut &s, &"insert into p3 (id, a, b, x) select x, x % 50, x % 13, (x % 50) * 2 from generate_series(1, 20000) as x")
+    let sz = q(mut &s, &"select case when (select pg_relation_size('p3')) < 1.1 * (select pg_relation_size('p2')) then 'within 10%' else 'more' end")
+    let sz4 = q(mut &s, &"create table p4 (id int primary key, a int, b int, v int, w bigint, x int)")
+    let sz5 = q(mut &s, &"insert into p4 select id, a, b, 1, 1, x from p2")
+    say("size", sz + " of a table without the virtual columns; with them as columns of values: " + q(mut &s, &"select case when (select pg_relation_size('p3')) < 0.9 * (select pg_relation_size('p4')) then 'more than 10% bigger' else 'about the same' end"))
+    return 0
+}
+
+fn second(st: lexdb_store.Store): int {
+    var s = lexdb_exec.newSession(st.share())
+    let a = q(mut &s, &"select count(*) || '|' || sum(w) || '|' || max(v) from big")
+    let ad = q(mut &s, &"alter table big add column z int generated always as (a + 1) virtual")
+    let ad2 = q(mut &s, &"alter table big add column r2 int generated always as (100 / (a - 3)) virtual")
+    let rd = q(mut &s, &"select count(z) from big")
+    let e = state(mut &s, &"select sum(r2) from big")
+    say("reopened", a + ", ADD column read " + rd + ", error still at the read: " + e)
+    return 0
+}
+
+fn oracle(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    let c = qo(mut &s, &"create table g (id number primary key, a number, b number, v number generated always as (a + b) virtual)")
+    let i1 = qo(mut &s, &"insert into g (id, a, b) values (1, 2, 3)")
+    let i2 = qo(mut &s, &"insert into g (id, a, b) values (2, 4, 5)")
+    let ix = qo(mut &s, &"create index gv on g (v)")
+    let an = q(mut &s, &"analyze g")
+    let p = q(mut &s, &"explain select id from g where v = 9")
+    let plan = if strings.contains(&p, "index gv") { "index gv" } else { p }
+    let r1 = q(mut &s, &"select id from g where v = 9")
+    let u = qo(mut &s, &"update g set a = 20 where id = 2")
+    let r2 = q(mut &s, &"select id from g where v = 25")
+    let r3 = q(mut &s, &"select count(*) from g where v = 9")
+    let d = qo(mut &s, &"delete from g where id = 2")
+    let r4 = q(mut &s, &"select count(*) from g where v = 25")
+    say("oracle index", plan + ", 9 -> " + r1 + ", after update 25 -> " + r2 + ", 9 -> " + (if r3 == "0" { "none" } else { r3 }) + ", after delete " + (if r4 == "0" { "none" } else { r4 }))
+    return 0
+}
+
+fn main() {
+    var fs = lexdb_disk.sim(11)
+    var crashed = fs.share()
+    let a = lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        let r = first(st)
+        crashed = fs.crash(3)
+        return r
+    }).unwrap()
+    let b = lexdb_store.run(lexdb_disk.sim(13), opts(), addcol).unwrap()
+    let c = lexdb_store.run(crashed.share(), opts(), second).unwrap()
+    let d = lexdb_store.run(lexdb_disk.sim(14), opts(), oracle).unwrap()
+}

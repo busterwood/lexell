@@ -3,8 +3,11 @@
 // at CREATE TABLE and ALTER TABLE ADD, INSERT / UPDATE / MERGE / OUTPUT computing them (271 for a value
 // given, 213 for a list that counts them), the expressions refused (1759, 4936, 1046, 207, 8183), NULLs, indexes
 // and keys on them, sys.columns, sys.computed_columns and COLUMNPROPERTY, and ALTER COLUMN, DROP COLUMN and
-// sp_rename of a column read or computed (5074, 4928, 15336). Each expect line: a batch's result sets and counts,
-// or its error number.
+// sp_rename of a column read or computed (5074, 4928, 15336). A column that is not persisted is computed when it is
+// read: GETDATE, SYSDATETIME and NEWID in one (a new value at each read, 2729 for an index or UNIQUE on one), an
+// error (8134) at the read, not the INSERT, ADD of one over rows. Each expect line: a batch's result sets and counts,
+// or its error number. (The last batches, the nd tables, were answered from SQL Server's documentation, by hand:
+// no SQL Server was at hand when the virtual columns became read-time ones; regenerating checks them.)
 // expect: ok
 // expect: (2)
 // expect: (1)
@@ -107,6 +110,25 @@
 // expect: (3)
 // expect: id,p,v: 101|104|200;102|NULL|NULL;103|2|2
 // expect: ,,: 9|315|608
+// expect: ok
+// expect: (2)
+// expect: id: 1;2
+// expect: : 4
+// expect: (2) / : 2
+// expect: : 2
+// expect: error 2729
+// expect: error 2729
+// expect: error 2729
+// expect: ok
+// expect: (2)
+// expect: a: 0;1
+// expect: error 8134
+// expect: b: 1
+// expect: ok
+// expect: a,c: 0|0;1|10
+// expect: ok
+// expect: ok
+// expect: id: 2
 import "os"
 import "strings"
 import "task"
@@ -118,7 +140,7 @@ import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_wire"
 import "../../../cmd/lexdb_tds"
 
-const QUERIES = "CREATE TABLE g (id int PRIMARY KEY, a int, b int, p AS (a + b) PERSISTED, v AS (a * 2), t AS (CAST(a AS varchar(10)) + 'x'), s varchar(5), u AS (UPPER(s)), z int)\nINSERT INTO g (id, a, b, s) VALUES (1, 2, 3, 'ab'), (2, NULL, 4, NULL)\nINSERT INTO g VALUES (3, 1, 1, 'cd', 7)\nINSERT INTO g VALUES (4, 1, 1, 5, 5, 'x', 'cd', 'x', 7)\nINSERT INTO g VALUES (4, 1, 1, 'cd')\nINSERT INTO g (id, a, b, p) VALUES (4, 1, 1, 5)\nINSERT INTO g (id, a, b, v) VALUES (4, 1, 1, 5)\nINSERT INTO g (id, a, b, v) VALUES (4, 1, 1, DEFAULT)\nUPDATE g SET p = 3 WHERE id = 1\nUPDATE g SET v = 3 WHERE id = 1\nUPDATE g SET p = DEFAULT WHERE id = 1\nSELECT * FROM g ORDER BY id\nSELECT id, p, v, t, u FROM g ORDER BY id\nUPDATE g SET a = 10 WHERE id = 1\nUPDATE g SET b = b + 1, s = 'zz' WHERE id = 2\nSELECT id, a, b, p, v, t, u FROM g ORDER BY id\nUPDATE g SET b = b + 1 OUTPUT inserted.p, deleted.p, inserted.v WHERE id = 1\nINSERT INTO g (id, a, b) OUTPUT inserted.p, inserted.v, inserted.t VALUES (5, 1, 1)\nDELETE FROM g OUTPUT deleted.p, deleted.u WHERE id = 5\nSELECT id, p FROM g WHERE p = 15\nSELECT id FROM g WHERE v = 20\nSELECT p, COUNT(*) FROM g GROUP BY p ORDER BY p\nSELECT id FROM g ORDER BY v DESC, id\nSELECT g.* FROM g WHERE id = 3\nCREATE INDEX ix_p ON g (p)\nCREATE INDEX ix_v ON g (v)\nCREATE INDEX ix_t ON g (t)\nCREATE UNIQUE INDEX ux_f ON g (v) WHERE v IS NOT NULL\nCREATE INDEX ix_u ON g (u)\nINSERT INTO g (id, a, b) VALUES (6, 11, 0)\nINSERT INTO g (id, a, b) VALUES (7, 11, 0)\nINSERT INTO g (id, a, b) VALUES (7, 12, 0)\nSELECT id FROM g WHERE u = 'AB'\nSELECT id FROM g WHERE p = 14\nSELECT id FROM g WHERE v = 24\nSELECT i.name, c.name, ic.key_ordinal FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID('g') AND i.name IN ('ix_p', 'ix_v', 'ix_t', 'ix_u') ORDER BY i.name\nSELECT name, is_computed, system_type_id, max_length, is_nullable FROM sys.columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nSELECT name, definition, is_persisted FROM sys.computed_columns WHERE object_id = OBJECT_ID('g') AND name <> 't' ORDER BY column_id\nSELECT name, is_persisted FROM sys.computed_columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nSELECT COLUMNPROPERTY(OBJECT_ID('g'), 'p', 'IsComputed'), COLUMNPROPERTY(OBJECT_ID('g'), 'v', 'IsComputed'), COLUMNPROPERTY(OBJECT_ID('g'), 'id', 'IsComputed')\nALTER TABLE g ADD w AS (a + 100) PERSISTED\nALTER TABLE g ADD w2 AS (a + 100)\nALTER TABLE g ADD w3 AS (zzz + 100)\nALTER TABLE g ADD w4 AS (p + 100)\nALTER TABLE g ADD w5 AS (a + 1) PERSISTED NOT NULL\nALTER TABLE g ADD w6 AS (a + 1) DEFAULT 5\nALTER TABLE g ADD w7 AS (NEWID()) PERSISTED\nALTER TABLE g ADD w8 AS ((SELECT 1))\nSELECT id, a, w, w2 FROM g ORDER BY id\nALTER TABLE g ALTER COLUMN a bigint\nALTER TABLE g ALTER COLUMN b int NOT NULL\nALTER TABLE g ALTER COLUMN p bigint\nALTER TABLE g ALTER COLUMN v int NOT NULL\nALTER TABLE g DROP COLUMN a\nALTER TABLE g DROP COLUMN w2\nSELECT name FROM sys.columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nEXEC sp_rename 'g.a', 'aa', 'COLUMN'\nEXEC sp_rename 'g.p', 'pp', 'COLUMN'\nEXEC sp_rename 'g.z', 'zz', 'COLUMN'\nSELECT name FROM sys.columns WHERE object_id = OBJECT_ID('g') AND name IN ('z', 'zz', 'a', 'aa') ORDER BY column_id\nCREATE TABLE h1 (a int, b AS (a + 1), c AS (b + 1))\nCREATE TABLE h2 (a int, b AS (NEWID()) PERSISTED)\nCREATE TABLE h3 (a int, b AS (GETDATE()) PERSISTED)\nCREATE TABLE h4 (a int, b AS ((SELECT 1)))\nCREATE TABLE h5 (a int, b AS (a + 1) DEFAULT 1)\nCREATE TABLE h6 (a int, b AS (a + 1) NOT NULL)\nCREATE TABLE h7 (a int, b AS (a + 1) PERSISTED NOT NULL)\nINSERT INTO h7 VALUES (NULL)\nINSERT INTO h7 VALUES (1)\nSELECT * FROM h7\nCREATE TABLE h8 (a int NOT NULL, b AS (a + 1) PERSISTED PRIMARY KEY)\nINSERT INTO h8 VALUES (1)\nINSERT INTO h8 VALUES (1)\nSELECT * FROM h8\nCREATE TABLE h9 (a int, b AS (a + 1) CHECK (b > 0))\nCREATE TABLE h9 (a int, b AS (a + 1) PERSISTED CHECK (b > 0))\nINSERT INTO h9 VALUES (-5)\nINSERT INTO h9 VALUES (5)\nCREATE TABLE h10 (a int, b AS (a + 1) UNIQUE)\nINSERT INTO h10 VALUES (1), (1)\nCREATE TABLE h11 (a int, b AS (a + 1) PERSISTED UNIQUE, c AS (a + 2) PERSISTED)\nINSERT INTO h11 VALUES (1)\nINSERT INTO h11 VALUES (1)\nSELECT * FROM h11\nCREATE TABLE h13 (a int, b AS (a + 1) PERSISTED)\nINSERT INTO h13 VALUES (1), (2), (NULL)\nALTER TABLE h13 ADD CONSTRAINT ck13 CHECK (b > 0)\nCREATE VIEW vg AS SELECT * FROM g\nSELECT * FROM vg WHERE id = 1\nSELECT * INTO g2 FROM g\nSELECT name, is_computed FROM sys.columns WHERE object_id = OBJECT_ID('g2') AND name IN ('p', 'v', 'u') ORDER BY column_id\nMERGE g AS t USING (SELECT 1 AS id, 100 AS a) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a);\nSELECT id, a, p, v FROM g WHERE id = 1\nMERGE g AS t USING (SELECT 8 AS id, 80 AS a) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a WHEN NOT MATCHED THEN INSERT (id, a, b) VALUES (s.id, s.a, 1);\nSELECT id, a, p, v FROM g WHERE id = 8\nMERGE g AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET p = 5;\nMERGE g AS t USING (SELECT 9 AS id) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, 1);\nBEGIN TRANSACTION; INSERT INTO g (id, a, b) VALUES (30, 1, 2); SELECT p, v FROM g WHERE id = 30; ROLLBACK\nSELECT COUNT(*) FROM g WHERE id = 30\nINSERT INTO g (id, a, b) SELECT id + 100, a, b FROM g WHERE id < 4\nSELECT id, p, v FROM g WHERE id > 100 ORDER BY id\nSELECT COUNT(*), SUM(p), SUM(v) FROM g"
+const QUERIES = "CREATE TABLE g (id int PRIMARY KEY, a int, b int, p AS (a + b) PERSISTED, v AS (a * 2), t AS (CAST(a AS varchar(10)) + 'x'), s varchar(5), u AS (UPPER(s)), z int)\nINSERT INTO g (id, a, b, s) VALUES (1, 2, 3, 'ab'), (2, NULL, 4, NULL)\nINSERT INTO g VALUES (3, 1, 1, 'cd', 7)\nINSERT INTO g VALUES (4, 1, 1, 5, 5, 'x', 'cd', 'x', 7)\nINSERT INTO g VALUES (4, 1, 1, 'cd')\nINSERT INTO g (id, a, b, p) VALUES (4, 1, 1, 5)\nINSERT INTO g (id, a, b, v) VALUES (4, 1, 1, 5)\nINSERT INTO g (id, a, b, v) VALUES (4, 1, 1, DEFAULT)\nUPDATE g SET p = 3 WHERE id = 1\nUPDATE g SET v = 3 WHERE id = 1\nUPDATE g SET p = DEFAULT WHERE id = 1\nSELECT * FROM g ORDER BY id\nSELECT id, p, v, t, u FROM g ORDER BY id\nUPDATE g SET a = 10 WHERE id = 1\nUPDATE g SET b = b + 1, s = 'zz' WHERE id = 2\nSELECT id, a, b, p, v, t, u FROM g ORDER BY id\nUPDATE g SET b = b + 1 OUTPUT inserted.p, deleted.p, inserted.v WHERE id = 1\nINSERT INTO g (id, a, b) OUTPUT inserted.p, inserted.v, inserted.t VALUES (5, 1, 1)\nDELETE FROM g OUTPUT deleted.p, deleted.u WHERE id = 5\nSELECT id, p FROM g WHERE p = 15\nSELECT id FROM g WHERE v = 20\nSELECT p, COUNT(*) FROM g GROUP BY p ORDER BY p\nSELECT id FROM g ORDER BY v DESC, id\nSELECT g.* FROM g WHERE id = 3\nCREATE INDEX ix_p ON g (p)\nCREATE INDEX ix_v ON g (v)\nCREATE INDEX ix_t ON g (t)\nCREATE UNIQUE INDEX ux_f ON g (v) WHERE v IS NOT NULL\nCREATE INDEX ix_u ON g (u)\nINSERT INTO g (id, a, b) VALUES (6, 11, 0)\nINSERT INTO g (id, a, b) VALUES (7, 11, 0)\nINSERT INTO g (id, a, b) VALUES (7, 12, 0)\nSELECT id FROM g WHERE u = 'AB'\nSELECT id FROM g WHERE p = 14\nSELECT id FROM g WHERE v = 24\nSELECT i.name, c.name, ic.key_ordinal FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID('g') AND i.name IN ('ix_p', 'ix_v', 'ix_t', 'ix_u') ORDER BY i.name\nSELECT name, is_computed, system_type_id, max_length, is_nullable FROM sys.columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nSELECT name, definition, is_persisted FROM sys.computed_columns WHERE object_id = OBJECT_ID('g') AND name <> 't' ORDER BY column_id\nSELECT name, is_persisted FROM sys.computed_columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nSELECT COLUMNPROPERTY(OBJECT_ID('g'), 'p', 'IsComputed'), COLUMNPROPERTY(OBJECT_ID('g'), 'v', 'IsComputed'), COLUMNPROPERTY(OBJECT_ID('g'), 'id', 'IsComputed')\nALTER TABLE g ADD w AS (a + 100) PERSISTED\nALTER TABLE g ADD w2 AS (a + 100)\nALTER TABLE g ADD w3 AS (zzz + 100)\nALTER TABLE g ADD w4 AS (p + 100)\nALTER TABLE g ADD w5 AS (a + 1) PERSISTED NOT NULL\nALTER TABLE g ADD w6 AS (a + 1) DEFAULT 5\nALTER TABLE g ADD w7 AS (NEWID()) PERSISTED\nALTER TABLE g ADD w8 AS ((SELECT 1))\nSELECT id, a, w, w2 FROM g ORDER BY id\nALTER TABLE g ALTER COLUMN a bigint\nALTER TABLE g ALTER COLUMN b int NOT NULL\nALTER TABLE g ALTER COLUMN p bigint\nALTER TABLE g ALTER COLUMN v int NOT NULL\nALTER TABLE g DROP COLUMN a\nALTER TABLE g DROP COLUMN w2\nSELECT name FROM sys.columns WHERE object_id = OBJECT_ID('g') ORDER BY column_id\nEXEC sp_rename 'g.a', 'aa', 'COLUMN'\nEXEC sp_rename 'g.p', 'pp', 'COLUMN'\nEXEC sp_rename 'g.z', 'zz', 'COLUMN'\nSELECT name FROM sys.columns WHERE object_id = OBJECT_ID('g') AND name IN ('z', 'zz', 'a', 'aa') ORDER BY column_id\nCREATE TABLE h1 (a int, b AS (a + 1), c AS (b + 1))\nCREATE TABLE h2 (a int, b AS (NEWID()) PERSISTED)\nCREATE TABLE h3 (a int, b AS (GETDATE()) PERSISTED)\nCREATE TABLE h4 (a int, b AS ((SELECT 1)))\nCREATE TABLE h5 (a int, b AS (a + 1) DEFAULT 1)\nCREATE TABLE h6 (a int, b AS (a + 1) NOT NULL)\nCREATE TABLE h7 (a int, b AS (a + 1) PERSISTED NOT NULL)\nINSERT INTO h7 VALUES (NULL)\nINSERT INTO h7 VALUES (1)\nSELECT * FROM h7\nCREATE TABLE h8 (a int NOT NULL, b AS (a + 1) PERSISTED PRIMARY KEY)\nINSERT INTO h8 VALUES (1)\nINSERT INTO h8 VALUES (1)\nSELECT * FROM h8\nCREATE TABLE h9 (a int, b AS (a + 1) CHECK (b > 0))\nCREATE TABLE h9 (a int, b AS (a + 1) PERSISTED CHECK (b > 0))\nINSERT INTO h9 VALUES (-5)\nINSERT INTO h9 VALUES (5)\nCREATE TABLE h10 (a int, b AS (a + 1) UNIQUE)\nINSERT INTO h10 VALUES (1), (1)\nCREATE TABLE h11 (a int, b AS (a + 1) PERSISTED UNIQUE, c AS (a + 2) PERSISTED)\nINSERT INTO h11 VALUES (1)\nINSERT INTO h11 VALUES (1)\nSELECT * FROM h11\nCREATE TABLE h13 (a int, b AS (a + 1) PERSISTED)\nINSERT INTO h13 VALUES (1), (2), (NULL)\nALTER TABLE h13 ADD CONSTRAINT ck13 CHECK (b > 0)\nCREATE VIEW vg AS SELECT * FROM g\nSELECT * FROM vg WHERE id = 1\nSELECT * INTO g2 FROM g\nSELECT name, is_computed FROM sys.columns WHERE object_id = OBJECT_ID('g2') AND name IN ('p', 'v', 'u') ORDER BY column_id\nMERGE g AS t USING (SELECT 1 AS id, 100 AS a) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a WHEN NOT MATCHED THEN INSERT (id, a) VALUES (s.id, s.a);\nSELECT id, a, p, v FROM g WHERE id = 1\nMERGE g AS t USING (SELECT 8 AS id, 80 AS a) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a WHEN NOT MATCHED THEN INSERT (id, a, b) VALUES (s.id, s.a, 1);\nSELECT id, a, p, v FROM g WHERE id = 8\nMERGE g AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET p = 5;\nMERGE g AS t USING (SELECT 9 AS id) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, 1);\nBEGIN TRANSACTION; INSERT INTO g (id, a, b) VALUES (30, 1, 2); SELECT p, v FROM g WHERE id = 30; ROLLBACK\nSELECT COUNT(*) FROM g WHERE id = 30\nINSERT INTO g (id, a, b) SELECT id + 100, a, b FROM g WHERE id < 4\nSELECT id, p, v FROM g WHERE id > 100 ORDER BY id\nSELECT COUNT(*), SUM(p), SUM(v) FROM g\nCREATE TABLE nd (id int PRIMARY KEY, born date, age AS DATEDIFF(day, born, GETDATE()), n AS NEWID(), ts AS SYSDATETIME())\nINSERT INTO nd VALUES (1, '2000-01-01'), (2, '2010-06-15')\nSELECT id FROM nd WHERE age > 1000 ORDER BY id\nSELECT COUNT(DISTINCT n) FROM (SELECT n FROM nd UNION ALL SELECT n FROM nd) x\nSELECT id, ts AS ts0 INTO t0 FROM nd; SELECT COUNT(*) FROM nd JOIN t0 ON nd.id = t0.id WHERE nd.ts > t0.ts0\nSELECT COUNT(*) FROM nd WHERE DATEDIFF(day, born, GETDATE()) = age\nCREATE INDEX ix_age ON nd (age)\nCREATE INDEX ix_n ON nd (n)\nCREATE TABLE nd2 (a int, b AS (NEWID()) UNIQUE)\nCREATE TABLE nd4 (a int, b AS (1 / a))\nINSERT INTO nd4 VALUES (1), (0)\nSELECT a FROM nd4 ORDER BY a\nSELECT b FROM nd4\nSELECT b FROM nd4 WHERE a = 1\nALTER TABLE nd4 ADD c AS (a * 10)\nSELECT a, c FROM nd4 ORDER BY a\nALTER TABLE nd ADD m AS (id + 1)\nCREATE INDEX ix_m ON nd (m)\nSELECT id FROM nd WHERE m = 3"
 
 fn rows(r: &sqlserver.Rows): str {
     var names: []str = []
@@ -137,8 +159,9 @@ fn rows(r: &sqlserver.Rows): str {
     return strings.join(&names, ",") + ": " + strings.join(&out, ";")
 }
 
-// a batch's result sets and row counts, in order; or its error
-fn show(c: mut &sqlserver.Conn, q: &str): str {
+// a batch's result sets and row counts, in order; or its error. only: the result sets alone (a catalog procedure's own
+// internal counts are the server's business).
+fn show(c: mut &sqlserver.Conn, q: &str, only: bool): str {
     match c.queryAll(&(q.toStr()), &[]) {
         Ok(r) {
             var parts: []str = []
@@ -147,7 +170,7 @@ fn show(c: mut &sqlserver.Conn, q: &str): str {
                 if n.resultSet >= 0 {
                     append(mut &parts, rows(&r.sets[n.resultSet]))
                     shown += 1
-                } else {
+                } else if !only {
                     append(mut &parts, "(" + n.rows.toStr() + ")")
                 }
             }
@@ -159,12 +182,79 @@ fn show(c: mut &sqlserver.Conn, q: &str): str {
     }
 }
 
-fn batches(dsn: &str) {
+// the connection string of another login (the oracle's logins are made by the batches, with this password; lexdb takes any)
+fn asUser(dsn: &str, u: &str): str {
+    var parts: []str = []
+    for p in strings.split(dsn, ";") {
+        let l = strings.toLowerAscii(&p)
+        if len(p) == 0 || strings.startsWith(&l, "uid=") || strings.startsWith(&l, "pwd=") { continue }
+        append(mut &parts, p.toStr())
+    }
+    append(mut &parts, "UID=" + u)
+    append(mut &parts, "PWD=Lx_Pw0rd_7x")
+    return strings.join(&parts, ";")
+}
+
+// A line may start with markers: "@sets " (result sets only), "@as NAME " (run as that login, a connection of its own), "@oracle "
+// (only on the SQL Server oracle: "ok" on lexdb), "@lexdb " (only on lexdb).
+fn batches(dsn: &str, oracle: bool) {
     match sqlserver.connect(&(dsn.toStr())) {
         Ok(c0) {
             var c = c0
+            var names: []str = []
+            var conns: []sqlserver.Conn = []
             let text: str = QUERIES
-            for q in strings.lines(&text) { println(show(mut &c, &q)) }
+            for line in strings.lines(&text) {
+                var q = line.toStr()
+                var only = false
+                var who = ""
+                var skip = false
+                while strings.startsWith(&q, "@") {
+                    if strings.startsWith(&q, "@sets ") {
+                        only = true
+                        q = q[6..len(q)].toStr()
+                    } else if strings.startsWith(&q, "@oracle ") {
+                        if !oracle { skip = true }
+                        q = q[8..len(q)].toStr()
+                    } else if strings.startsWith(&q, "@lexdb ") {
+                        if oracle { skip = true }
+                        q = q[7..len(q)].toStr()
+                    } else if strings.startsWith(&q, "@as ") {
+                        let rest = q[4..len(q)].toStr()
+                        let sp = strings.indexOf(&rest, " ", 0)
+                        who = rest[0..sp].toStr()
+                        q = rest[sp + 1..len(rest)].toStr()
+                    } else { break }
+                }
+                if skip {
+                    println("ok")
+                    continue
+                }
+                if len(who) == 0 {
+                    println(show(mut &c, &q, only))
+                    continue
+                }
+                var at = -1
+                for i in 0..len(names) { if names[i] == who { at = i } }
+                if at < 0 {
+                    match sqlserver.connect(&asUser(dsn, &who)) {
+                        Ok(cx) {
+                            append(mut &names, who.clone())
+                            append(mut &conns, cx)
+                            at = len(names) - 1
+                        }
+                        Err(e) {
+                            println("connect " + who + ": error " + e.code.toStr())
+                            continue
+                        }
+                    }
+                }
+                println(show(mut &conns[at], &q, only))
+            }
+            while len(conns) > 0 {
+                var cx = pop(mut &conns)
+                cx.close()
+            }
             c.close()
         }
         Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
@@ -178,7 +268,7 @@ fn body(st: lexdb_store.Store): int {
         let addr = ln.localAddr()
         lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
         let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
-        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), false)
         { let stop = f }
     })
     return 0
@@ -187,7 +277,7 @@ fn body(st: lexdb_store.Store): int {
 fn main() {
     // LEXDB_MSSQL: the oracle, for the expect lines (gen_mssql.py)
     match os.env("LEXDB_MSSQL") {
-        Some(dsn) { batches(&dsn) }
+        Some(dsn) { batches(&dsn, true) }
         None {
             lexdb_store.run(lexdb_disk.sim(39), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
                                                                      snapNodes: 50000}, body).unwrap()

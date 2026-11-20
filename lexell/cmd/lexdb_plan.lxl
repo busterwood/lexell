@@ -22,6 +22,7 @@ import "./lexdb_rows"
 import "./lexdb_agg"
 import "./lexdb_window"
 import "./lexdb_match"
+import "./lexdb_gen"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -2698,11 +2699,15 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         for pos in 0..len(cols) {
             let ci = cols[pos]
             let ck = if ci >= 0 { lexdb_access.colCollKind(&lv.t.cols[ci]) } else { lexdb_sql.COLL_EXACT }
-            if ci < 0 || ck != lexdb_sql.COLL_EXACT {
+            let virt = ci >= 0 && lv.t.cols[ci].genKind == lexdb_sql.GEN_VIRTUAL
+            if ci < 0 || ck != lexdb_sql.COLL_EXACT || virt {
                 // an expression's (9.89): the conditions on the same
                 // expression; a column under a collation's keys (L2): the
-                // conditions on its key, #ci(col) or #pad(col)
+                // conditions on its key, #ci(col) or #pad(col); a virtual
+                // column (lexdb_gen): on its expression, which is what a
+                // reference to it means in the query
                 let target = if ci < 0 { qualified(&lv.t.indexes[c].exprs[pos], &lv.alias) }
+                             else if virt { lexdb_bind.colAt(&q.cols, lv.first + ci) }
                              else { lexdb_bind.collKeyOf(ck, Expr.Col(lv.alias + "." + lv.t.cols[ci].name, -1)) }
                 var xb = q.onceBounds(exprBounds(cs, &target, k, q), lv.readOnce)
                 var xeq = -1
@@ -3058,6 +3063,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             if q.levels[k].virt() { continue }
             var need: []bool = []
             for c in q.levels[k].t.cols { append(mut &need, selNames.has(&c.name)) }
+            lexdb_gen.needDeps(&q.levels[k].t.cols, mut &need)
             q.levels[k].need = need
         }
     }
@@ -4017,6 +4023,7 @@ fn narrowSub(sel: mut &Sel) {
         if sel.q.levels[k].virt() { continue }
         var need: []bool = []
         for c in sel.q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
+        lexdb_gen.needDeps(&sel.q.levels[k].t.cols, mut &need)
         sel.q.levels[k].need = need
     }
 }

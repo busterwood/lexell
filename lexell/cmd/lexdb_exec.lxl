@@ -1489,6 +1489,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             lexdb_plan.addCol(q, qc)
         }
         if f.sub < 0 && f.work < 0 && viewSrc < 0 {
+            // a virtual column is not in the row: its expression, resolved in the query's terms, is what a reference to it means
+            for k in 0..len(t.cols) { try lexdb_gen.setQueryGen(&t.cols, k, &f.alias, mut &q.cols, first + k, mut &sc.names) }
             append(mut &items, lexdb_bind.LPlan.Get(t.name.toStr(), f.alias.toStr(), icols))
         } else {
             append(mut &items, lexdb_bind.LPlan.Sub(viewName, if viewSrc >= 0 { viewSrc } else { f.sub }, item, icols))
@@ -1504,6 +1506,11 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 var fc = lexdb_sql.colDef(&q.cols[i].name, q.cols[i].typ, q.cols[i].notNull)
                 fc.spell = q.cols[i].spell.clone()
                 fc.coll = q.cols[i].coll.clone()
+                fc.genKind = q.cols[i].genKind
+                match q.cols[i].gen {
+                    Some(g) { fc.gen = Some(lexdb_sql.cloneExpr(&g)) }
+                    None {}
+                }
                 append(mut &sc.names.frames[me].cols, fc)
                 // a subquery's, a view's, a working table's column is typed
                 // by its first branch (a UNION's int over a numeric): not exact
@@ -3381,14 +3388,46 @@ fn idxName(name: &str): str {
 // (9.89), of the expression's type.
 fn idxVal(t: &Table, ix: &Index, k: int, row: &[]Val): Result[Val, DbErr] {
     let c = ix.cols[k]
-    if c >= 0 { return Ok(lexdb_access.collKeyVal(&t.cols[c], &row[c])) }
+    if c >= 0 {
+        if t.cols[c].genKind != lexdb_sql.GEN_VIRTUAL { return Ok(lexdb_access.collKeyVal(&t.cols[c], &row[c])) }
+        // a virtual column's entry is computed as the row is written (it is not in the row)
+        return Ok(lexdb_access.collKeyVal(&t.cols[c], &(try genVal(t, c, row, lexdb_time.utc()))))
+    }
     let none: []Val = []
     let noSubs: []SubRes = []
     let noSeq: Option[SeqEnv] = None
-    let env = Env{cols: &t.cols, row: row, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: &noSeq}
-    let v = try eval(&ix.exprs[k], &env)
+    var v = Val.Null
+    match try virtualsOf(t, &ix.exprs[k], row) {
+        Some(full) {
+            let env = Env{cols: &t.cols, row: &full, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: &noSeq}
+            v = try eval(&ix.exprs[k], &env)
+        }
+        None {
+            let env = Env{cols: &t.cols, row: row, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: &noSeq}
+            v = try eval(&ix.exprs[k], &env)
+        }
+    }
     if lexdb_ops.isNull(&v) { return Ok(v) }
     return lexdb_ops.coerce(v, &lexdb_plan.exprType(t, &ix.exprs[k]))
+}
+
+// Row with the virtual columns x reads computed (they are not in the row), where it reads any; None where it reads none.
+fn virtualsOf(t: &Table, x: &Expr, row: &[]Val): Result[Option[[]Val], DbErr] {
+    if !lexdb_gen.anyVirtual(&t.cols) { return Ok(None) }
+    var ns: []str = []
+    lexdb_sql.colNames(x, mut &ns)
+    var out: []Val = []
+    var any = false
+    for n in ns {
+        let i = lexdb_bind.colIndex(&t.cols, &n)
+        if i < 0 || t.cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
+        if !any {
+            out = collections.copyOf(row)
+            any = true
+        }
+        out[i] = try genVal(t, i, row, lexdb_time.utc())
+    }
+    return Ok(if any { Some(out) } else { None })
 }
 
 // The error for row's value in unique index ix that another row holds
@@ -3403,7 +3442,7 @@ fn uniqueErr(t: &Table, ix: &Index, row: &[]Val): Result[DbErr, DbErr] {
             append(mut &names, lexdb_pg.exprText(&ix.exprs[k], &none))
         }
         // the value as written, not its key (L2)
-        append(mut &vals, lexdb_sql.text(&(if c >= 0 { row[c].clone() } else { try idxVal(t, ix, k, row) })))
+        append(mut &vals, lexdb_sql.text(&(if c >= 0 && t.cols[c].genKind != lexdb_sql.GEN_VIRTUAL { row[c].clone() } else { try idxVal(t, ix, k, row) })))
     }
     return Ok(lexdb_base.errDetail("23505", &("duplicate key value violates unique constraint \"" + lexdb_sql.baseName(&ix.name) + "\""),
                                     &("Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."), ""))
@@ -3417,6 +3456,13 @@ fn inIndex(t: &Table, ix: &Index, row: &[]Val): Result[bool, DbErr] {
             let noParams: []Val = []
             let noSubs: []SubRes = []
             let noSeq: Option[SeqEnv] = None
+            match try virtualsOf(t, &x, row) {
+                Some(full) {
+                    let env = Env{cols: &t.cols, row: &full, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs, seq: &noSeq}
+                    return Ok(lexdb_ops.truth(&(try bpEval(t, &x, &env))) == Some(true))
+                }
+                None {}
+            }
             let env = Env{cols: &t.cols, row: row, aggs: &noAggs, params: &noParams, subs: &noSubs, cur: &noAggs, seq: &noSeq}
             return Ok(lexdb_ops.truth(&(try bpEval(t, &x, &env))) == Some(true))
         }
@@ -3442,14 +3488,13 @@ fn genSetup(t: mut &Table, i: int, md: int): Result[Unit, DbErr] {
         if md == lexdb_sql.MD_ORA { return Err(e("ORA54016", "invalid column expression was specified")) }
         return Err(e("42601", &("both default and generation expression specified for column \"" + cn + "\" of table \"" + tn + "\"")))
     }
-    if md == lexdb_sql.MD_TSQL && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL && t.cols[i].notNull {
+    if md == lexdb_sql.MD_TSQL && lexdb_sql.isVirtual(&t.cols[i]) && t.cols[i].notNull {
         return Err(e("TS8183", "Only UNIQUE or PRIMARY KEY constraints can be created on computed columns, while CHECK, FOREIGN KEY, and NOT NULL constraints require that computed columns be persisted."))
     }
     let p = lexdb_gen.problem(&x, &t.cols, i)
-    if p.kind == "vol" && md == lexdb_sql.MD_TSQL && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL {
-        return Err(e("0A000", "lexdb: a computed column that is not deterministic is not supported yet (one that is, persisted or not, is)"))
-    }
-    if p.kind != "" { return Err(lexdb_gen.exprErr(md, &p, &tn, &cn)) }
+    // (SQL Server keeps a computed column that is not persisted whatever it is made of: GETDATE, NEWID; computed per read)
+    let anyValue = p.kind == "vol" && md == lexdb_sql.MD_TSQL && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL
+    if p.kind != "" && !anyValue { return Err(lexdb_gen.exprErr(md, &p, &tn, &cn)) }
     if t.cols[i].typ.oid == 0 && md == lexdb_sql.MD_TSQL {
         match lexdb_gen.tsqlType(&x, &t.cols) {
             Some(ty) { t.cols[i].typ = ty }
@@ -3509,10 +3554,12 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     for p in s.pk {
         let i = lexdb_bind.colIndex(&t.cols, &p)
         if i < 0 { return Err(e("42703", &("column \"" + p + "\" named in key does not exist"))) }
-        if s.mdialect == lexdb_sql.MD_PG && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "primary keys on virtual generated columns are not supported")) }
+        if s.mdialect == lexdb_sql.MD_PG && lexdb_sql.isVirtual(&t.cols[i]) { return Err(e("0A000", "primary keys on virtual generated columns are not supported")) }
+        try lexdb_gen.indexable(&t.cols, i, s.mdialect, &lexdb_sql.baseName(&t.name))
         t.cols[i].notNull = true
         append(mut &t.pk, i)
     }
+    lexdb_gen.keepKeyed(&t.cols, &t.pk, &s.cons)
     if len(t.pk) > 1 {
         for a in 0..len(t.pk) {
             for b in a + 1..len(t.pk) {
@@ -3532,8 +3579,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     t.tree = st.createTree(txn)
     try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
     for c in t.cols { try defaultSeqs(st, txn, &c) }
-    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect); try addConstraint(st, txn, mut &t, &c, false) } }
-    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect); try addConstraint(st, txn, mut &t, &c, false) } }
+    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
+    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
@@ -4671,7 +4718,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
     var out = lexdb_access.newBuild(&redo)
     // the defaults of the columns filled (only theirs: making them binds
     // the sequences they name)
-    let defs = if len(rw.fills) > 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: [], gens: lexdb_gen.genCols(&t.cols)} }
+    let defs = if len(rw.fills) > 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: [], gens: lexdb_gen.genCols(&t.cols), fill: lexdb_gen.fillCols(t)} }
     let room = if lim.mem > 0 { lim.mem } else { -1 }
     // a row's checks are those its new values may fail: not a key's change
     let checked = len(changes) > 0 || len(rw.fills) > 0
@@ -4726,7 +4773,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
 fn rwRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &Defs, rw: &Rewrite, n: int, row: mut &[]Val,
          checked: bool): Result[Unit, DbErr] {
     for f in rw.fills { row[f] = try defAt(st, txn, defs, t, f) }
-    if len(defs.gens) > 0 { try genFill(t, &defs.gens, mut &row, &txn.sql.zone) }
+    if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &row, &txn.sql.zone) }
     if rw.rowid >= 0 { row[rw.rowid] = Val.Int(n + 1) }
     for c in rw.nn {
         if lexdb_ops.isNull(&row[c]) {
@@ -4891,12 +4938,15 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for n in skipped { if len(a.name) > 0 && n == a.name { skip = true } }
             if skip { continue }
             let c = &a.cons[0]
+            if lexdb_gen.keyOnVirtual(&t.cols, c) {
+                return Err(e("0A000", "lexdb: a primary key or foreign key over a virtual column is made in CREATE TABLE (the row keeps its value)"))
+            }
             if c.kind == lexdb_sql.C_PRIMARY {
                 try addPrimary(st, txn, mut &t, c, mut &pk)
             } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
                 try uniqueUsing(st, txn, mut &t, c)
             } else {
-                try lexdb_gen.checkConstraint(&t.cols, c, s.mdialect)
+                try lexdb_gen.checkConstraint(&t.cols, c, s.mdialect, &lexdb_sql.baseName(&t.name))
                 try addConstraint(st, txn, mut &t, c, true)
             }
         } else if a.kind == lexdb_sql.A_DROP_CON {
@@ -4932,7 +4982,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             col.identity = a.col.identity
             col.spell = a.col.spell.clone()
             col.coll = a.col.coll.clone()
-            var perRow = a.col.identity != lexdb_sql.ID_NONE || a.col.genKind != lexdb_sql.GEN_NONE
+            // (a virtual column is not in the rows: nothing to write, however many there are)
+            let virt = a.col.genKind == lexdb_sql.GEN_VIRTUAL
+            var perRow = a.col.identity != lexdb_sql.ID_NONE || (a.col.genKind != lexdb_sql.GEN_NONE && !virt)
             match a.col.gen {
                 Some(x) {
                     col.gen = Some(lexdb_sql.cloneExpr(&x))
@@ -4951,9 +5003,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 None {}
             }
             try defaultSeqs(st, txn, &col)
-            let rows = (perRow || (a.col.notNull && lexdb_ops.isNull(&col.missing))) && try anyRow(st, txn, &t, -1)
+            let rows = (perRow || (a.col.notNull && lexdb_ops.isNull(&col.missing) && !virt)) && try anyRow(st, txn, &t, -1)
             if perRow && rows { append(mut &fills, a.col.name.clone()) }
-            if a.col.notNull && lexdb_ops.isNull(&col.missing) && rows && !perRow {
+            if a.col.notNull && lexdb_ops.isNull(&col.missing) && rows && !perRow && !virt {
                 return Err(e("23502", &("column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values")))
             }
             append(mut &t.cols, col)
@@ -5113,7 +5165,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e("55000", &("column \"" + a.name + "\" of relation \"" + rel + "\" is not a generated column")))
                 }
                 if a.kind == lexdb_sql.A_DROP_EXPR {
-                    if t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL {
+                    if lexdb_sql.isVirtual(&t.cols[i]) {
                         return Err(lexdb_base.errDetail("0A000", "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns",
                                                         &("Column \"" + a.name + "\" of relation \"" + rel + "\" is a virtual generated column."), ""))
                     }
@@ -5125,7 +5177,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                         None {}
                     }
                     try genSetup(mut &t, i, s.mdialect)
-                    append(mut &fills, a.name.clone())
+                    // (a virtual column's new expression is read from now on: no row is recomputed)
+                    if t.cols[i].genKind != lexdb_sql.GEN_VIRTUAL { append(mut &fills, a.name.clone()) }
                 }
             } else if a.kind == lexdb_sql.A_ADD_IDENTITY {
                 try addIdentity(st, txn, mut &t, i, a)
@@ -5773,7 +5826,8 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             for cn in ns {
                 let ci = lexdb_bind.colIndex(&t.cols, &cn)
                 if ci < 0 { return Err(e("42703", &("column \"" + cn + "\" does not exist"))) }
-                if s.mdialect == lexdb_sql.MD_PG && t.cols[ci].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
+                if s.mdialect == lexdb_sql.MD_PG && lexdb_sql.isVirtual(&t.cols[ci]) { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
+                try lexdb_gen.indexable(&t.cols, ci, s.mdialect, &lexdb_sql.baseName(&t.name))
             }
             if lexdb_bind.hasAgg(x) { return Err(e("42803", "aggregate functions are not allowed in index expressions")) }
             if !lexdb_bind.immutable(x) {
@@ -5787,7 +5841,8 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         let i = lexdb_bind.colIndex(&t.cols, &n)
         if i < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
-        if s.mdialect == lexdb_sql.MD_PG && t.cols[i].genKind == lexdb_sql.GEN_VIRTUAL { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
+        if s.mdialect == lexdb_sql.MD_PG && lexdb_sql.isVirtual(&t.cols[i]) { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
+        try lexdb_gen.indexable(&t.cols, i, s.mdialect, &lexdb_sql.baseName(&t.name))
         append(mut &cols, i)
         append(mut &exprs, Expr.Lit(Val.Null))
     }
@@ -6566,7 +6621,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
             }
         }
     }
-    if len(defs.gens) > 0 { try genFill(t, &defs.gens, mut &row, &txn.sql.zone) }
+    if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &row, &txn.sql.zone) }
     try checkRow(t, &row)
     try checkChecks(t, &row)
     if up.mode != lexdb_sql.CONFLICT_NONE {
@@ -6666,6 +6721,11 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
     let alias = if s.alias != "" { s.alias.clone() } else { tname.clone() }
     for c in t.cols { append(mut &up.cols, lexdb_sql.colDef(&(alias + "." + c.name), c.typ, false)) }
     for c in t.cols { append(mut &up.cols, lexdb_sql.colDef(&("excluded." + c.name), c.typ, false)) }
+    // a virtual column, there and proposed, is its expression over the row it is of
+    for k in 0..len(t.cols) {
+        try lexdb_gen.setQueryGen(&t.cols, k, &alias, mut &up.cols, k, mut &sc.names)
+        try lexdb_gen.setQueryGen(&t.cols, k, "excluded", mut &up.cols, k + len(t.cols), mut &sc.names)
+    }
     for set in s.sets {
         let i = lexdb_bind.colIndex(&t.cols, &set.col)
         if i < 0 { return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + tname + "\" does not exist"))) }
@@ -6715,7 +6775,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
         if lexdb_sql.isDefault(&up.sets[k]) { next[ci] = try defAt(st, txn, defs, t, ci) }
         else { next[ci] = try lexdb_ops.coerceZ(try eval(&up.sets[k], &uenv), &t.cols[ci].typ, &txn.sql.zone) }
     }
-    if len(defs.gens) > 0 { try genFill(t, &defs.gens, mut &next, &txn.sql.zone) }
+    if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &next, &txn.sql.zone) }
     try updRow(st, txn, t, old, &next, fw, later)
     up.touched.put(keyOf(t, &next), 1)
     return Ok(Some(next))
@@ -6837,7 +6897,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
             else { all[targets[k]] = try lexdb_ops.coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.sql.zone) }
         }
-        if len(defs.gens) > 0 { try genFill(t, &defs.gens, mut &all, &txn.sql.zone) }
+        if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &all, &txn.sql.zone) }
         // (the table's alone, without FROM: the rows as they are, not copied)
         if len(joined) == nt {
             try updRow(st, txn, t, &joined, &all, &fw, mut &later)
@@ -7344,6 +7404,7 @@ fn slowNeed(t: &Table, slow: &[]int): []bool {
     for x in names { used.put(lexdb_bind.colPart(&x), 1) }
     var need: []bool = []
     for c in t.cols { append(mut &need, used.has(&c.name)) }
+    lexdb_gen.needDeps(&t.cols, mut &need)
     return need
 }
 
@@ -7756,9 +7817,9 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         }
         touched.put(key, 1)
         var nw = rowSlice(&all, ns, nt)
-        if len(defs.gens) > 0 {
-            try genFill(&t, &defs.gens, mut &nw, &txn.sql.zone)
-            for g in defs.gens { all[ns + g] = nw[g].clone() }
+        if len(defs.fill) > 0 {
+            try genFill(&t, &defs.fill, mut &nw, &txn.sql.zone)
+            for g in defs.fill { all[ns + g] = nw[g].clone() }
         }
         // Oracle's DELETE WHERE: the row as updated, if it holds, is deleted
         var gone = false
@@ -9166,6 +9227,7 @@ fn narrow(q: mut &Query, s: &lexdb_sql.Stmt) {
         if q.levels[k].virt() { continue }
         var need: []bool = []
         for c in q.levels[k].t.cols { append(mut &need, names.has(&c.name)) }
+        lexdb_gen.needDeps(&q.levels[k].t.cols, mut &need)
         q.levels[k].need = need
     }
 }
@@ -9193,6 +9255,7 @@ fn delNarrow(q: mut &Query, s: &lexdb_sql.Stmt) {
     for x in xs { names.put(lexdb_bind.colPart(&x), 1) }
     var need: []bool = []
     for c in q.levels[0].t.cols { append(mut &need, names.has(&c.name)) }
+    lexdb_gen.needDeps(&q.levels[0].t.cols, mut &need)
     q.levels[0].need = need
 }
 
@@ -12962,7 +13025,7 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
                         else if act == lexdb_sql.FK_SET_NULL { nr[col] = Val.Null }
                         else { nr[col] = try defAt(st, txn, &defs, c, col) }
                     }
-                    if len(defs.gens) > 0 { try genFill(c, &defs.gens, mut &nr, &txn.sql.zone) }
+                    if len(defs.fill) > 0 { try genFill(c, &defs.fill, mut &nr, &txn.sql.zone) }
                     try updRow(st, txn, c, &r, &nr, fw, later)
                 }
             }
@@ -13939,11 +14002,12 @@ type Defs = record {
     vals: []Val             // the defaults that are values
     seqs: []Seq             // a column's own sequence (key "" none)
     exprs: []Option[Expr]   // a default calling a sequence function: evaluated per row
-    gens: []int             // the generated columns (lexdb_gen): computed from the row's others as it is written (genFill)
+    gens: []int             // the generated columns (lexdb_gen): no value may be given for them
+    fill: []int             // those a write computes from the row's others (genFill): not a virtual one that nothing checks
 }
 
 fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Defs, DbErr] {
-    var d = Defs{vals: [], seqs: [], exprs: [], gens: []}
+    var d = Defs{vals: [], seqs: [], exprs: [], gens: [], fill: []}
     var names: []str = []
     for c in t.cols {
         if c.genKind != lexdb_sql.GEN_NONE { append(mut &d.gens, len(d.vals)) }
@@ -13973,6 +14037,7 @@ fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Res
         append(mut &d.exprs, x)
     }
     if len(names) > 0 { try bindSeqs(st, txn, &names) }
+    if len(d.gens) > 0 { d.fill = lexdb_gen.fillCols(t) }
     return Ok(d)
 }
 

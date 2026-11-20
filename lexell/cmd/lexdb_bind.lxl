@@ -1167,10 +1167,22 @@ pub fn resolveName(cols: &[]lexdb_sql.ColDef, n: int, name: &str): Result[int, D
 // Column i (as resolveName gives it) as an expression: the column, or
 // after a FULL JOIN ... USING the COALESCE of the pair's sides (9.93).
 pub fn colExpr(cols: &[]lexdb_sql.ColDef, i: int): Expr {
-    if len(cols[i].using) == 0 || cols[i].using == lexdb_sql.USING_HIDDEN { return Expr.Col(cols[i].name.clone(), i) }
-    var args: []Expr = [Expr.Col(cols[i].name.clone(), i)]
-    for o in strings.split(&cols[i].using, "\x1f") { append(mut &args, Expr.Col(o.clone(), colIndex(cols, &o))) }
+    if len(cols[i].using) == 0 || cols[i].using == lexdb_sql.USING_HIDDEN { return colAt(cols, i) }
+    var args: []Expr = [colAt(cols, i)]
+    for o in strings.split(&cols[i].using, "\x1f") { append(mut &args, colAt(cols, colIndex(cols, &o))) }
     return Expr.Call("coalesce", args, false)
+}
+
+// Query column i as a reference: Col(alias.column, i), or where the column is virtual (lexdb_gen: not in the row) its expression,
+// resolved in the query's terms when the FROM item was bound (ColDef.gen).
+pub fn colAt(cols: &[]lexdb_sql.ColDef, i: int): Expr {
+    if cols[i].genKind == lexdb_sql.GEN_VIRTUAL && dotAt(&cols[i].name) >= 0 {
+        match cols[i].gen {
+            Some(g) { return clone(&g) }
+            None {}
+        }
+    }
+    return Expr.Col(cols[i].name.clone(), i)
 }
 
 // JOIN ... USING's column name among cols[lo..hi] (one side of the join):
@@ -1260,7 +1272,7 @@ pub fn outerRef(nm: mut &Names, name: &str): Result[Option[Expr], DbErr] {
     }
     if found == "" { return Ok(None) }
     // (in the terms of frame f's query: its frame's columns are its own, in order)
-    var x = Expr.Col(found, slot)
+    var x = colAt(&nm.frames[f].cols, slot)
     for g in f + 1..top + 1 {
         let t = lexdb_sql.exprText(&x)
         var at = -1
@@ -1496,7 +1508,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
     match x {
         Expr.Col(name, _) {
             match resolveName(cols, n, &name) {
-                Ok(r) { return Ok(if dotAt(&name) < 0 { colExpr(cols, r) } else { Expr.Col(cols[r].name.clone(), r) }) }
+                Ok(r) { return Ok(if dotAt(&name) < 0 { colExpr(cols, r) } else { colAt(cols, r) }) }
                 Err(err) {
                     var mine = false
                     match resolveName(cols, len(cols), &name) {
@@ -2064,7 +2076,7 @@ pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColD
                 any = true
                 if lexdb_catalog.hiddenName(&c.name) || (c.genKind != lexdb_sql.GEN_NONE && it.alias == "#copy") { continue }
                 append(mut &out, OutCol{name: colPart(&c.name), oid: c.typ.oid, spell: c.spell.clone(), coll: c.coll.clone(), scale: ns.colScale(&c.typ)})
-                append(exprs, Expr.Col(c.name.clone(), i))
+                append(exprs, colAt(cols, i))
             }
             if !any { return Err(e("42P01", &("missing FROM-clause entry for table \"" + it.qual + "\""))) }
             continue
@@ -2072,7 +2084,24 @@ pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColD
         match it.expr {
             Some(x) {
                 let r = try resolve(&x, cols, len(cols), ns)
-                let name = if it.alias != "" { it.alias.clone() } else { exprName(&r) }
+                var name = if it.alias != "" { it.alias.clone() } else { exprName(&r) }
+                // (a virtual column's expression stands for the column: it keeps its name)
+                match x {
+                    Expr.Col(xn, _) {
+                        match r {
+                            Expr.Col(_, _) {}
+                            else {
+                                if it.alias == "" {
+                                    match resolveName(cols, len(cols), &xn) {
+                                        Ok(ci) { if cols[ci].genKind == lexdb_sql.GEN_VIRTUAL { name = colPart(&cols[ci].name) } }
+                                        Err(_) {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else {}
+                }
                 let pt = ptypesOf(ns)
                 // (its scale or SQL Server type as written, where resolving folded a cast away)
                 let rs = ns.outScale(&r, cols)
@@ -2092,7 +2121,7 @@ pub fn resolveOrder(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, ns: mu
     match o {
         Expr.Col(n, _) {
             match resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { Expr.Col(cols[r].name.clone(), r) }) }
+                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { colAt(cols, r) }) }
                 Err(x) {
                     for oc in outs { if oc.name == n { return Ok(Expr.Col(n.clone(), -1)) } }
                     return Err(x)
@@ -2140,7 +2169,7 @@ pub fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs:
         }
         Expr.Col(n, _) {
             match resolveName(cols, len(cols), &n) {
-                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { Expr.Col(cols[r].name.clone(), r) }) }
+                Ok(r) { return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { colAt(cols, r) }) }
                 Err(x) {
                     for i in 0..len(outs) { if outs[i].name == n { return Ok(clone(&exprs[i])) } }
                     return Err(x)
