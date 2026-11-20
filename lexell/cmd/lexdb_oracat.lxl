@@ -24,6 +24,7 @@ import "./lexdb_oradata"
 import "./lexdb_sql"
 
 type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
 type DbErr = lexdb_base.DbErr
 type Role = lexdb_catalog.Role
 type CatSnap = lexdb_catalog.CatSnap
@@ -173,7 +174,7 @@ pub fn family(view: &str): Family {
 // The bases lexdb_exec builds the rows of from its catalog.
 pub fn isBuilt(base: &str): bool {
     match base.toStr() {
-        "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
+        "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
         "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES" { return true }
         else { return false }
     }
@@ -444,6 +445,61 @@ fn oraDefault(c: &lexdb_sql.ColDef): str {
     }
 }
 
+// An expression as Oracle's dictionary shows it: names quoted and upper case, no spaces round an operator, functions in upper
+// case (a generated column's DATA_DEFAULT, a function-based index's COLUMN_EXPRESSION).
+fn oraExprText(x: &Expr): str {
+    match x {
+        Expr.Col(n, _) {
+            let d = strings.indexOf(&n, ".", 0)
+            let base: str = if d >= 0 { n[d + 1..len(n)].toStr() } else { n.toStr() }
+            return "\"" + oraUp(&base) + "\""
+        }
+        Expr.Lit(v) {
+            match v {
+                Val.Null { return "NULL" }
+                Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'" }
+                else { return lexdb_sql.exprText(x) }
+            }
+        }
+        Expr.Unary(op, a) { return (if op == "not" { "NOT " } else { op.toStr() }) + oraExprText(&a) }
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" { return oraExprText(&a) + " " + strings.toUpperAscii(&op) + " " + oraExprText(&b) }
+            return oraExprText(&a) + op + oraExprText(&b)
+        }
+        Expr.IsNull(a, neg) { return oraExprText(&a) + (if neg { " IS NOT NULL" } else { " IS NULL" }) }
+        Expr.Cast(a, t) { return oraExprText(&a) }
+        Expr.Call(f, args, star) {
+            if f == "case" || f == "case else" {
+                var b = "CASE"
+                var i = 0
+                while i + 1 < len(args) {
+                    b += " WHEN " + oraExprText(&args[i]) + " THEN " + oraExprText(&args[i + 1])
+                    i += 2
+                }
+                if f == "case else" && i < len(args) { b += " ELSE " + oraExprText(&args[i]) }
+                return b + " END"
+            }
+            if f == "coalesce" && len(args) == 2 { return "NVL(" + oraExprText(&args[0]) + "," + oraExprText(&args[1]) + ")" }
+            if len(args) == 2 && (f == "#ora_add" || f == "#ora_sub" || f == "#ora_cat") {
+                let o: &str = if f == "#ora_add" { "+" } else if f == "#ora_sub" { "-" } else { "||" }
+                return oraExprText(&args[0]) + o + oraExprText(&args[1])
+            }
+            var n = f.toStr()
+            if strings.startsWith(&n, "#ora_") { n = n[5..len(n)].toStr() }
+            // (lexdb's names for to_char and the like have no underscore)
+            n = match n.toStr() {
+                "tochar" { "to_char" } "todate" { "to_date" } "tonumber" { "to_number" } "totimestamp" { "to_timestamp" }
+                "addmonths" { "add_months" } "lastday" { "last_day" } "nextday" { "next_day" } "monthsbetween" { "months_between" }
+                else { n }
+            }
+            var parts: []str = []
+            for a in args { append(mut &parts, oraExprText(&a)) }
+            return strings.toUpperAscii(&n) + "(" + (if star { "*" } else { strings.join(&parts, ",") }) + ")"
+        }
+        else { return lexdb_sql.exprText(x) }
+    }
+}
+
 fn oraIdxName(ix: &CatIdx): str { return oraUp(&ix.name) }
 
 // Whether an index of a constraint has the name lexdb makes when none is given (Oracle's GENERATED = Y: SYS_Cnnn).
@@ -481,7 +537,10 @@ fn oraColRows(out: mut &[]OraPend, ct: &CatTab, user: &str, view: bool) {
         p.i("INTERNAL_COLUMN_ID", n)
         p.i("SEGMENT_COLUMN_ID", n)
         p.s("QUALIFIED_COL_NAME", &oraColName(c))
-        let d = oraDefault(c)
+        var d = oraDefault(c)
+        // a generated column's DATA_DEFAULT is its expression, and it is a virtual column
+        match c.gen { Some(gx) { d = oraExprText(&gx) } None {} }
+        p.s("VIRTUAL_COLUMN", if c.genKind != lexdb_sql.GEN_NONE { "YES" } else { "NO" })
         p.set("DATA_DEFAULT", if len(d) > 0 { Val.Text(d.clone()) } else { Val.Null })
         p.set("DATA_DEFAULT_VC", if len(d) > 0 { Val.Text(d.clone()) } else { Val.Null })
         p.set("DEFAULT_LENGTH", if len(d) > 0 { Val.Int(len(d)) } else { Val.Null })
@@ -692,11 +751,31 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
         }
         return out
     }
-    if base == "INDEXES" || base == "IND_COLUMNS" {
+    if base == "INDEXES" || base == "IND_COLUMNS" || base == "IND_EXPRESSIONS" {
         for ct in snap.tabs {
             if lexdb_base.isTempSchema(&ct.schema) { continue }
             let owner = oraOwner(&ct.schema, &user)
+            var hidden = len(ct.t.cols)          // the hidden columns of function-based indexes: SYS_NCnnnnn$, numbered after the columns
+            for c in ct.t.cols { if c.name == ROWID { hidden -= 1 } }
             for ix in ct.idxs {
+                var xi = -1
+                for k in 0..len(ct.t.indexes) { if lexdb_sql.baseName(&ct.t.indexes[k].name) == ix.name { xi = k } }
+                if base == "IND_EXPRESSIONS" {
+                    for j in 0..len(ix.cols) {
+                        if ix.cols[j] != 0 { continue }
+                        hidden += 1
+                        if xi < 0 || j >= len(ct.t.indexes[xi].exprs) { continue }
+                        var p = oraPend(&owner, &"")
+                        p.s("INDEX_OWNER", &owner)
+                        p.s("INDEX_NAME", &oraIdxName(&ix))
+                        p.s("TABLE_OWNER", &owner)
+                        p.s("TABLE_NAME", &oraTabName(&ct))
+                        p.s("COLUMN_EXPRESSION", &oraExprText(&ct.t.indexes[xi].exprs[j]))
+                        p.i("COLUMN_POSITION", j + 1)
+                        append(mut &out, p)
+                    }
+                    continue
+                }
                 if base == "INDEXES" {
                     var p = oraPend(&owner, if ix.unique { "UNIQUE" } else { "NONUNIQUE" })
                     p.s("INDEX_NAME", &oraIdxName(&ix))
@@ -704,7 +783,7 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
                     p.s("TABLE_NAME", &oraTabName(&ct))
                     p.s("UNIQUENESS", if ix.unique { "UNIQUE" } else { "NONUNIQUE" })
                     var fn_ = false
-                    for c in ix.cols { if c == 0 { fn_ = true } }
+                    for c in ix.cols { if c == 0 || (c >= 1 && c <= len(ct.t.cols) && ct.t.cols[c - 1].genKind != lexdb_sql.GEN_NONE) { fn_ = true } }
                     p.s("INDEX_TYPE", if fn_ { "FUNCTION-BASED NORMAL" } else { "NORMAL" })
                     p.s("CONSTRAINT_INDEX", if ix.con { "YES" } else { "NO" })
                     p.s("GENERATED", if oraGenIdx(&ct, &ix) { "Y" } else { "N" })
@@ -725,8 +804,9 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
                             let ty = oraTypeOf(&ct.t.cols[cn - 1].typ)
                             len_ = ty.len
                             chars = ty.chars
-                        } else if j < len(ix.exprs) && len(ix.exprs[j]) > 0 {
-                            cname = ix.exprs[j].clone()
+                        } else if cn == 0 {
+                            hidden += 1
+                            cname = "SYS_NC" + strings.padLeft(&hidden.toStr(), 5, '0') + "$"
                         }
                         p.s("COLUMN_NAME", &cname)
                         p.i("COLUMN_POSITION", j + 1)
