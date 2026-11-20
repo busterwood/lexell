@@ -74,18 +74,19 @@ pub const COST_PK_RANGE: float = 1.8f
 pub const COST_DESCENT: float = 12.0f
 pub const COST_KEY_ROW: float = 36.0f
 pub const COST_IX_ROW: float = 49.0f
+// a row of an index range read in key order (optimizer 47.9: 10 to 13 units
+// at 3% to 5% of an orders-wide table, 14 to 16 of a narrow one)
+pub const COST_SORTED_ROW: float = 12.0f
 pub const HASH_PROBE: float = 2.0f
 pub const HASH_BUILD: float = 19.0f
 pub const ROW_COST: float = 2.0f
 pub const EQ_GUESS: float = 0.25f
 pub const HASH_MAX_BYTES: float = 67108864.0f
-// A range over at least this share of the table is read as a scan: the
-// index's entries and rows cost more than reading the table once. The
-// threshold is twice the measured crossover (SWITCH_TIMES), so a sampling
-// error does not put the plan on the wrong path; PostgreSQL would keep a
-// 3% index range and use a bitmap scan, which LexDB does not have yet.
-// The plan decides from ANALYZE's samples; the counted switch (optimizer
-// 38) is the fallback for a range they do not estimate.
+// A range over at least this share of the table was read as a scan, before
+// ranges were read in key order (optimizer 47: scanFirst now decides by
+// COST_SORTED_ROW; this is KO_NEVER's rule). The plan decides from
+// ANALYZE's samples; the counted switch (optimizer 38) is the fallback for
+// a range they do not estimate.
 pub const SCAN_SHARE: int = 32
 // The switch is for tables where reading the index is real work; a small
 // table's index-only range is cheap and keeps its order.
@@ -2775,21 +2776,23 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
         var saved: []Expr = []
         if fdiff { saved = replace(mut &p.eqs, feqs) }
         let f = pathFig(lv, &p, params)
-        // The first table's pure range, if the samples estimate it over
-        // 1/SCAN_SHARE of the table, is read as a scan: skip the candidate.
+        // The first table's pure range, if the samples estimate it as
+        // costing more than a scan (scanFirst: read in key order, optimizer
+        // 47, over about 1/24 of the table), is read as a scan: skip it.
         // (A later table's range is a hash build, read once: q10's orders
         // range of 3.8% is 57k rows to build from and 1.5M to scan.) A
         // range they estimate as narrower is the planner's index (stats: the
         // executor must not count it again). No sample: the counted switch
         // decides at run time; a per-row (correlated) range keeps its index.
-        // The range is read in key order (optimizer 47), so the share where
-        // the scan wins is by that read's cost (scanFirst).
         if !q.pinned && k == 0 && c >= 0 && lv.est.rows >= SCAN_MIN_ROWS &&
            len(p.eqs) == 0 && len(p.rng) > 0 && len(cols) > 0 && cols[0] >= 0 &&
            f.rows >= 0 && !f.bound && lv.est.rows > 0 && !ixCovers(lv, c) {
             if scanFirst(f.rows, lv.est.rows) { continue }
             p.stats = true
         }
+        // the calibration's forced modes: the first table's pure range by
+        // its index whatever its size (no counted switch)
+        if forcedIndex() && k == 0 && c >= 0 && len(p.eqs) == 0 && len(p.rng) > 0 && !ixCovers(lv, c) { p.stats = true }
         // the first equality's value set the figure: a look (optimizer 23)
         var lo = Look{kind: -1, c: Expr.Lit(Val.Null), p: Expr.Lit(Val.Null), out: 0, typ: noType(), cm: lexdb_stats.noCommon()}
         if f.rows >= 0 && len(p.eqs) >= 1 && !hasIn && score < 999 {
@@ -4857,11 +4860,19 @@ var keyOrderMode: int = KO_COST
 pub fn setKeyOrder(mode: int) { keyOrderMode = mode }
 
 // Whether the first table's pure range of n entries (by its samples) of a
-// table of rows is read as a scan rather than by its index (choosePath):
-// over 1/SCAN_SHARE of the table. KO_SORTED and KO_PLAIN: never.
+// table of rows is read as a scan rather than by its index (choosePath).
+// Its rows are read in key order (keyOrdered), so the scan wins where
+// twice that read's cost is over the scan's: 2 * (COST_DESCENT + n *
+// COST_SORTED_ROW) >= rows * COST_SCAN, about 1/24 of the table (the factor
+// 2 leans to the scan, whose cost does not depend on the estimate; the
+// measured crossover is near 1/10, optimizer 47.9). KO_NEVER: the rule
+// before it, over 1/SCAN_SHARE. KO_SORTED and KO_PLAIN: never.
+fn forcedIndex(): bool { return keyOrderMode == KO_SORTED || keyOrderMode == KO_PLAIN }
+
 fn scanFirst(n: int, rows: int): bool {
-    if keyOrderMode == KO_SORTED || keyOrderMode == KO_PLAIN { return false }
-    return n * SCAN_SHARE >= rows
+    if forcedIndex() { return false }
+    if keyOrderMode == KO_NEVER { return n * SCAN_SHARE >= rows }
+    return 2.0f * (COST_DESCENT + float(n) * COST_SORTED_ROW) >= float(rows) * COST_SCAN
 }
 
 // Whether path p is one the cost planner may read in key order: an
