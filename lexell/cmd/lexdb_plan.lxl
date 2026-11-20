@@ -2946,15 +2946,11 @@ pub type FromHints = record {
 pub type FromBound = record {
     pub anyUsing: bool              // a JOIN ... USING or NATURAL JOIN (*'s order in ColDef.pos)
     pub where: bool                 // Query.lp's top is WHERE's Filter
-    // with a FROM item that is a query: WHERE as written (after
-    // pullCommonOr, not resolved), and per view read (its level's src past
-    // the statement's subqueries) what planning it again needs (pushDown)
-    pub whereAst: Option[Expr]
-    pub views: []ViewSrc
 }
 
-// A view's query as bindFrom planned it: the query, its owner (the role
-// its relations are read as; "" the session's) and its renames (Table.rn).
+// A view's query as bindFrom planned it (SubPlan.view, for pushDown): the
+// query, its owner (the role its relations are read as; "" the session's)
+// and its renames (Table.rn).
 pub type ViewSrc = record { pub stmt: lexdb_sql.Stmt; pub owner: str; pub rn: []str }
 
 // The ON conjuncts of q.lp's FROM part, per level (ms[k]: the k-th
@@ -3305,12 +3301,13 @@ fn sameOuts(a: &Sel, b: &Sel): bool {
 // level's columns only (a FROM subquery, a view, a CTE used once), not on
 // an outer join's nullable side, goes into its query as written (each
 // column as the query's expression for it), and the query is planned
-// again as bindFrom planned it; the conjuncts pushed leave cs.
-fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, bf: &FromBound, subs: &[]lexdb_sql.Stmt,
+// again as bindFrom planned it; the conjuncts pushed leave cs. where:
+// WHERE as written (its conjuncts after pullCommonOr, as bindFrom's).
+fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, where: &Option[Expr], subs: &[]lexdb_sql.Stmt,
             params: &[]Val, sc: mut &Scope, cs: mut &[]Expr): Result[Unit, DbErr] {
     var uc: []Expr = []
-    match bf.whereAst {
-        Some(w) { conjuncts(&w, mut &uc) }
+    match where {
+        Some(w0) { conjuncts(&pullCommonOr(w0), mut &uc) }
         None { return Ok(Unit{}) }
     }
     let nl = len(q.levels)
@@ -3325,9 +3322,9 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, bf
         // not an outer join's nullable side
         if (l > 0 && keepsLeft(q.levels[l].join)) || l < lastRight { continue }
         let view = src >= len(subs)
-        let vi = src - len(subs)
-        if view && vi >= len(bf.views) { continue }
-        let s0 = if view { &bf.views[vi].stmt } else { &subs[src] }
+        if view && q.subs[src].view.isNone() { continue }
+        let vs = if view { replace(mut &q.subs[src].view, None).unwrap() } else { ViewSrc{stmt: lexdb_sql.newStmt(0), owner: "", rn: []} }
+        let s0 = if view { &vs.stmt } else { &subs[src] }
         if (s0.cte >= 0 && !s0.cteOnce) || !pushable(s0, &q.subs[src].sel) { continue }
         var s = s0.clone()
         s.cte = -1
@@ -3351,9 +3348,9 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, bf
         let top = len(sc.names.frames) - 1
         let nf = len(sc.names.frames)
         sc.names.frames[top].hidden = true
-        let owner = if view { bf.views[vi].owner.clone() } else { "" }
+        let owner = vs.owner.clone()
         if len(owner) > 0 { append(mut &sc.asRole, owner.clone()) }
-        let outerRn = replace(mut &sc.rn, if view { bf.views[vi].rn.clone() } else { [] })
+        let outerRn = replace(mut &sc.rn, vs.rn.clone())
         let again = up().planSub(st, txn, &s, params, sc, false)
         sc.rn = outerRn
         if len(owner) > 0 { let r = pop(mut &sc.asRole) }
@@ -3384,7 +3381,7 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, bf
 // alternatives, the ON and WHERE conjuncts placed per level (read from
 // q.lp), the implied equalities, the join order, the paths, hashing, the
 // semi-joins.
-pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs: &FromHints, bf: &FromBound,
+pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, hs: &FromHints, bf: &FromBound, where: &Option[Expr],
             params: &[]Val, subs: &[]lexdb_sql.Stmt, selNames: &Map[str, int], star: bool, sc: mut &Scope,
             reorder: bool): Result[Unit, DbErr] {
     let early = hs.early
@@ -3437,7 +3434,10 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     // outer joins whose NULL rows WHERE or a later join rejects: inner (optimizer 48.2)
     if nl >= 2 && !hs.rules && (rewriteMode & RW_OUTER) != 0 && !q.innerOnly() { q.innerJoins(&ms, &cs) }
     // WHERE's conjuncts on a derived table, view or CTE used once: into its query (optimizer 48.3)
-    if bf.whereAst.isSome() && !hs.rules && (rewriteMode & RW_PUSH) != 0 { try pushDown(st, txn, q, bf, subs, params, sc, mut &cs) }
+    if len(q.subs) > 0 {
+        if bf.where && !hs.rules && (rewriteMode & RW_PUSH) != 0 { try pushDown(st, txn, q, where, subs, params, sc, mut &cs) }
+        for i in 0..len(q.subs) { q.subs[i].view = None }
+    }
     // A RIGHT or FULL JOIN can make the columns before it NULL: no WHERE
     // conjunct goes below the last one.
     var lastRight = -1
@@ -3701,6 +3701,10 @@ pub type SubPlan = record {
     pub res: []Expr                 // correlated filters that are not keys (q21's l_suppkey <> outer), run once
     pub resText: []str              // ... their text, the outer values by name (EXPLAIN)
     pub readAs: int                 // IN: the type its values are read as, as = reads a text beside a value of that type; 0 as they are
+    // a view read in FROM: its query, for pushDown to plan it again (planFrom
+    // clears it). Here, not in FromBound, so a query with no subquery pays
+    // nothing for it (a point select: optimizer 48.5).
+    pub view: Option[ViewSrc]
 }
 
 pub type Scope = record {

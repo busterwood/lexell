@@ -1314,7 +1314,7 @@ fn buildQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_
     let hs = FromHints{early: early, locking: locking, ordBy: replace(mut &sc.ordBy, []), ordLim: sc.ordLim, rules: txn.sql.rules, memMax: txn.sql.memMax, semiCand: semiCand, anySemi: anySemi}
     sc.ordLim = -1
     let bf = try bindFrom(st, txn, from, where, params, subs, sc, mut &q)
-    try lexdb_plan.planFrom(st, txn, mut &q, &hs, &bf, params, subs, selNames, star, sc, reorder)
+    try lexdb_plan.planFrom(st, txn, mut &q, &hs, &bf, where, params, subs, selNames, star, sc, reorder)
     return Ok(q)
 }
 
@@ -1337,8 +1337,6 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
     append(mut &sc.names.frames, Frame{cols: [], exact: [], refs: [], refOids: [], subRefs: [], subOids: [], subNames: [], subColls: [], subKinds: [], subReads: [], hidden: false})
     let me = len(sc.names.frames) - 1
     var views: []SubPlan = []              // the views read, planned (9.82)
-    var viewSrcs: []lexdb_plan.ViewSrc = []  // ... their queries (the planner's pushdown, optimizer 48.3)
-    var anySub = false                     // a FROM item is a query (a subquery, a view, a CTE)
     var usingOn: []Option[Expr] = []       // per FROM item, the ON its USING or NATURAL makes (9.93)
     var order: []int = []                  // the columns in *'s order
     var anyUsing = false
@@ -1380,7 +1378,6 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             }
             item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, outBCols(fcols)) } else { spLp }
             append(mut &planned[f.sub], sp)
-            anySub = true
         } else if f.work >= 0 {
             var w = -1
             for i in 0..len(sc.works) { if sc.works[i].id == f.work { w = i } }
@@ -1450,9 +1447,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                     append(mut &vt.cols, col)
                 }
                 viewSrc = len(subs) + len(views)
+                sp.view = Some(lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})  // for the planner's pushdown (optimizer 48.3)
                 append(mut &views, sp)
-                append(mut &viewSrcs, lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})
-                anySub = true
                 t = rc(vt)
             } else if len(f.cols) > 0 {
                 // t AS x(a, b): its first columns named so
@@ -1658,19 +1654,17 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         }
     }
     var hasWhere = false
-    var whereAst: Option[Expr] = None
     match where {
         Some(w0) {
             let w = lexdb_plan.pullCommonOr(w0)
             let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
             lp = lexdb_bind.LPlan.Filter(lp, [r], [])
             hasWhere = true
-            if anySub { whereAst = Some(w) }
         }
         None {}
     }
     q.lp = lp
-    return Ok(FromBound{anyUsing: anyUsing, where: hasWhere, whereAst: whereAst, views: viewSrcs})
+    return Ok(FromBound{anyUsing: anyUsing, where: hasWhere})
 }
 
 fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: mut &Mats, params: &[]Val,
@@ -2571,7 +2565,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.

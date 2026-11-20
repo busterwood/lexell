@@ -6204,8 +6204,9 @@ measured). Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6.
   derived query is planned again through `Up.planSub`. Why not a rewrite
   before binding: the derived query's columns, and which FROM item an
   unqualified name means, are known only after `bindFrom` has planned it;
-  so `bindFrom` (exec, glue only) keeps WHERE as written and each view's
-  query, owner and renames in `FromBound`, and the planner plans the
+  so `bindFrom` (exec, glue only) keeps each view's query, owner and
+  renames on its `SubPlan` (`view`), `planFrom` gets WHERE as written
+  (`buildQuery`'s), and the planner plans the
   derived query a second time when it has something to push (E3 would
   let the binder do this once).
 - Both off under `SET lexdb_planner = rules`; `lexdb_plan.setRewrites`
@@ -6224,6 +6225,16 @@ measured). Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6.
 - Point selects: +0.05% mean over six alternated rounds (-0.01% to
   +0.09%; spread 0.15%); a first version's +0.10% (CTE counts in the
   parser's state) fixed.
+- Point-select cost found and removed (2026-11-20): with `LXL_HASH_SEED`
+  fixed the count is exact (spread ~100 instructions a run), Q5 +0.073%
+  (+118 instructions a select). Bisected, one piece at a time: `FromBound` growing an
+  `Option[Expr]` and a `[]ViewSrc` +74 (no longer a plain record), the
+  `viewSrcs` local in `bindFrom` +31, `markCtes(mut &s)` in `parseIn`'s
+  loop +21, `planFrom`'s tests a few. Now the views' queries ride on their
+  `SubPlan` (`view`), `planFrom` gets `buildQuery`'s WHERE (pushDown
+  applies `pullCommonOr` again), and the CTE marks go on the statement in
+  `out`: +0.009% (+14), six random-seed rounds -0.024% mean (-0.071% to
+  +0.057%).
 - Left: pushing an uncorrelated scalar-subquery comparison into a
   derived query's HAVING (q15's), pushing a LEFT JOIN's own ON conjunct on
   a derived right side into it, pushing past a window on its PARTITION BY

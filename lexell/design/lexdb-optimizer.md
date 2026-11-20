@@ -3275,10 +3275,12 @@ tell which conjuncts read only the derived table without doing the
 binder's work twice, and moving `bindFrom`/`planSub` out of exec is E3
 (the catalog snapshot), not this item. Instead:
 
-1. `bindFrom` (exec, glue only) keeps what a second planning needs: WHERE
-   as written (after `pullCommonOr`, before `resolve`) in
-   `FromBound.whereAst` when some FROM item is a query, and for each view
-   its query, owner and renames (`FromBound.views`).
+1. `bindFrom` (exec, glue only) keeps what a second planning needs: for
+   each view its query, owner and renames (`SubPlan.view`, which
+   `planFrom` clears); `planFrom` gets WHERE as written (`buildQuery`'s,
+   `pullCommonOr` applied again before `resolve`). (First built as
+   `FromBound.whereAst` and `FromBound.views`: a point select +0.07%;
+   see 48.7.)
 2. `planFrom` (`pushDown`, after the outer-to-inner step) takes each WHERE
    conjunct whose resolved form reads the columns of one derived level
    only, writes its unresolved form in the derived query's terms (each
@@ -3444,14 +3446,14 @@ Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6: 58a1a69b
 section before `planFrom`: `innerJoins`, `rejectsNulls`, `nullOn`,
 `rejectedAbove`; `pushDown`, `pushable`, `outAst`, `toOuts`, `fillOuts`,
 `intoQuery`, `unpushable`; `setRewrites`), the CTE count in `lexdb_parse`
-(`markCtes`, `Stmt.cteOnce`), exec's glue in `bindFrom` (WHERE as written
-and the views' queries into `FromBound`): `lexdb_exec` 19,687 -> 19,694
+(`markCtes`, `Stmt.cteOnce`), exec's glue in `bindFrom` (the views'
+queries onto their `SubPlan`s): `lexdb_exec` 19,687 -> 19,694
 lines, `lexdb_plan` 5,496 -> 5,898.
 
 Choices made while building:
 
 - **A conjunct's two forms.** `pushDown` reads WHERE as written
-  (`FromBound.whereAst`, split by `conjuncts` like the resolved one) to
+  (`pullCommonOr` of `buildQuery`'s, split by `conjuncts` like the resolved one) to
   write the pushed filter, and the resolved conjunct to decide (its level
   mask, its volatility); the two lists must have the same length, else
   nothing is pushed. A column is mapped by resolving its name alone
@@ -3533,4 +3535,10 @@ moved to the statement's end in a8c6c5e9. Variants without `bindFrom`'s
 glue and without `Stmt.cteOnce` measured the same as the branch, so what
 remains is in `lexdb_plan` (the larger `FromBound`, two tests in
 `planFrom`, or code placement), not found by these variants.
+Found later (2026-11-20) with `LXL_HASH_SEED=1`, which makes the count
+exact (to ~100 instructions a run; the 0.15% spread is the hash key):
+Q5 +0.073% (+118 instructions a select); measured one piece at a time, the larger `FromBound`
++74, `bindFrom`'s `viewSrcs` local +31, `markCtes(mut &s)` in `parseIn`
++21. With `SubPlan.view`, WHERE passed to `planFrom` and the CTE marks
+made on the statement in `out`: +0.009% (+14).
 
