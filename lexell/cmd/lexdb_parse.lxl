@@ -6100,6 +6100,29 @@ fn (p: mut &P) copyStr(): Result[str, lexdb_base.DbErr] {
     return Ok(t.text.clone())
 }
 
+// Marks the uses of a CTE used once in a statement with n CTEs
+// (Stmt.cteOnce): a filter on it may go into its query (optimizer 48.3).
+// After the statement's subqueries are moved into it (a WITH's check of a
+// body is not kept, so not counted).
+fn markCtes(s: mut &Stmt, n: int) {
+    var uses: []int = []
+    for i in 0..n { append(mut &uses, 0) }
+    cteUses(s, mut &uses)
+    cteOnce(s, &uses)
+}
+
+fn cteUses(s: &Stmt, uses: mut &[]int) {
+    if s.cte >= 0 && s.cte < len(uses) { uses[s.cte] += 1 }
+    for x in s.subs { cteUses(&x, uses) }
+    for x in s.inner { cteUses(&x, uses) }
+}
+
+fn cteOnce(s: mut &Stmt, uses: &[]int) {
+    if s.cte >= 0 { s.cteOnce = s.cte < len(uses) && uses[s.cte] == 1 }
+    for i in 0..len(s.subs) { cteOnce(mut &s.subs[i], uses) }
+    for i in 0..len(s.inner) { cteOnce(mut &s.inner[i], uses) }
+}
+
 fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     let t = p.peek().clone()
     if t.kind == T_EOF || (t.kind == T_OP && t.text == ";") { return Ok(lexdb_sql.newStmt(S_EMPTY)) }
@@ -6940,12 +6963,18 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
         }
         let t = p.peek().clone()
         if t.kind == T_EOF {
+            // CTE uses marked in out, not through mut &s (that cost every
+            // statement about 20 instructions: a point select +0.013%)
             if s.kind != S_EMPTY || len(out) == 0 { append(mut &out, s) }
+            if p.nextCte > 0 { markCtes(mut &out[len(out) - 1], p.nextCte) }
             break
         }
         if t.kind == T_OP && t.text == ";" {
             p.pos += 1
-            if s.kind != S_EMPTY { append(mut &out, s) }
+            if s.kind != S_EMPTY {
+                append(mut &out, s)
+                if p.nextCte > 0 { markCtes(mut &out[len(out) - 1], p.nextCte) }
+            }
             continue
         }
         return Err(near(&t))
@@ -7209,6 +7238,7 @@ fn (p: mut &P) finish(s: mut &Stmt) {
         s.subs = replace(mut &p.subs, [])
         s.wins = replace(mut &p.wins, [])
     }
+    if p.nextCte > 0 { markCtes(mut &s, p.nextCte) }
 }
 
 

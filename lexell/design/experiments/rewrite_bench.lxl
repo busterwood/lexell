@@ -1,0 +1,82 @@
+// The rewrites of lexdb-optimizer.md section 48, measured: a view over a
+// 200,000-row table filtered on its primary key, an aggregate view filtered
+// on its group key (an index on it), and a LEFT JOIN whose WHERE on the
+// right side makes it inner. On settled tables (loaded, ANALYZEd and
+// checkpointed in a first store run, measured in a second); per query the
+// median of 9 runs (after one), in microseconds, and its plan. Built with
+// -O against the tree before section 48 and after it.
+import "../../cmd/lexdb_store"
+import "../../cmd/lexdb_disk"
+import "../../cmd/lexdb_exec"
+import "../../cmd/lexdb_sql"
+import "collections"
+import "strings"
+import "time"
+
+fn exec(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println("error: " + sql + ": " + e.msg) }
+    }
+}
+
+fn med(s: mut &lexdb_exec.Session, sql: &str): int {
+    exec(s, sql)
+    var ts: []int = []
+    for i in 0..9 {
+        let t0 = time.monotonicNs()
+        exec(s, sql)
+        append(mut &ts, time.monotonicNs() - t0)
+    }
+    collections.sort(mut &ts)
+    return ts[4]
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(&("explain " + sql)) {
+        Ok(rs) {
+            var lines: []str = []
+            for row in rs[len(rs) - 1].rows { append(mut &lines, strings.trim(&lexdb_sql.text(&row[0]))) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "error " + e.msg }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    exec(mut &s, &"create table big (id int primary key, k int, g int, pad text)")
+    exec(mut &s, &"insert into big select i, i % 1000 + 1, i % 1000, 'pad ' || (i % 977) from generate_series(1, 200000) i")
+    exec(mut &s, &"create index big_k on big (k)")
+    exec(mut &s, &"create index big_g on big (g)")
+    exec(mut &s, &"create table small (id int primary key, label text)")
+    exec(mut &s, &"insert into small select i, case when i = 7 then 'x' else 'l' || (i % 10) end from generate_series(1, 1000) i")
+    exec(mut &s, &"create index small_label on small (label)")
+    exec(mut &s, &"create view vbig as select id, k, g, pad from big")
+    exec(mut &s, &"create view vagg as select g, count(*) n, sum(k) sk from big group by g")
+    exec(mut &s, &"analyze")
+    exec(mut &s, &"vacuum big")
+    st.checkpointAll().unwrap()
+    return 0
+}
+
+fn measure(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    let qs = ["select * from vbig where id = 12345",
+              "select * from vagg where g = 77",
+              "select count(*), max(b.id) from big b left join small s on s.id = b.k where s.label = 'x'"]
+    for q in qs {
+        let ns = med(mut &s, &q)
+        println(q + ": " + (ns / 1000).toStr() + " us; " + plan(mut &s, &q))
+    }
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(5)
+    let o = lexdb_store.Options{cacheBytes: 512 * 1024 * 1024, segBytes: 64 * 1024 * 1024, ckptBytes: 256 * 1024 * 1024, snapNodes: 1000000}
+    lexdb_store.run(fs.share(), o, body).unwrap()
+    lexdb_store.run(fs, o, measure).unwrap()
+}

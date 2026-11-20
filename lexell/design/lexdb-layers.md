@@ -6186,6 +6186,61 @@ of four alternated); q15's view range now by its index (instructions
 -67%); no query slower. q19's OR of index paths (BitmapOr) is left as the
 next step.
 
+### 6.3.Q5 as built (2026-11-20)
+
+Rewrites that keep results: lexdb-optimizer.md 48 (48.1 where they run,
+48.2 and 48.3 the validity rules, 48.5 as built, 48.6 plans, 48.7
+measured). Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6.
+
+- **Outer to inner** (`lexdb_plan.innerJoins`, in `planFrom` before
+  WHERE's conjuncts are placed): a LEFT JOIN whose NULL rows a conjunct
+  above it rejects (WHERE's, or the ON of a later inner or RIGHT join),
+  RIGHT likewise, FULL to LEFT, RIGHT or inner. The join is then searched
+  and hashed as any inner join.
+- **Pushdown** (`lexdb_plan.pushDown`, in `planFrom` after it): a WHERE
+  conjunct on one derived level (a FROM subquery, a view, a CTE used once)
+  is written in the derived query's terms and ANDed into its WHERE (or
+  HAVING over an aggregate; into every part of a set operation), and the
+  derived query is planned again through `Up.planSub`. Why not a rewrite
+  before binding: the derived query's columns, and which FROM item an
+  unqualified name means, are known only after `bindFrom` has planned it;
+  so `bindFrom` (exec, glue only) keeps each view's query, owner and
+  renames on its `SubPlan` (`view`), `planFrom` gets WHERE as written
+  (`buildQuery`'s), and the planner plans the
+  derived query a second time when it has something to push (E3 would
+  let the binder do this once).
+- Both off under `SET lexdb_planner = rules`; `lexdb_plan.setRewrites`
+  switches each off for tests. `exec_rewrite` runs 110 queries (outer
+  joins of all three kinds, nested, USING, LATERAL; views, derived tables,
+  CTEs, parameters, a view as its owner and after a rename) with the
+  rewrites, without, with batches off and under the rules: the same rows.
+  `tns_ddl`: a view filtered through the Oracle door.
+- `lexdb_exec` 19,687 -> 19,694 lines; `lexdb_plan` 5,496 -> 5,898.
+- Measured (48.7, a 200,000-row table): a view filtered on its key 46 ms
+  -> 0.04 ms, an aggregate view on its group key 5.6 -> 0.18 ms, a LEFT
+  JOIN made inner and reordered 9.9 -> 0.09 ms.
+- TPC-H: no plan changes (q13's filter is in its LEFT JOIN's ON; q15's
+  view conjuncts are a join and a subquery comparison); timings level
+  (totals +0.0% and -0.0% in two alternated rounds), checksums equal.
+- Point selects: +0.05% mean over six alternated rounds (-0.01% to
+  +0.09%; spread 0.15%); a first version's +0.10% (CTE counts in the
+  parser's state) fixed.
+- Point-select cost found and removed (2026-11-20): with `LXL_HASH_SEED`
+  fixed the count is exact (spread ~100 instructions a run), Q5 +0.073%
+  (+118 instructions a select). Bisected, one piece at a time: `FromBound` growing an
+  `Option[Expr]` and a `[]ViewSrc` +74 (no longer a plain record), the
+  `viewSrcs` local in `bindFrom` +31, `markCtes(mut &s)` in `parseIn`'s
+  loop +21, `planFrom`'s tests a few. Now the views' queries ride on their
+  `SubPlan` (`view`), `planFrom` gets `buildQuery`'s WHERE (pushDown
+  applies `pullCommonOr` again), and the CTE marks go on the statement in
+  `out`: +0.009% (+14), six random-seed rounds -0.024% mean (-0.071% to
+  +0.057%).
+- Left: pushing an uncorrelated scalar-subquery comparison into a
+  derived query's HAVING (q15's), pushing a LEFT JOIN's own ON conjunct on
+  a derived right side into it, pushing past a window on its PARTITION BY
+  keys, and planning a derived query once (E3: the binder settles which
+  conjuncts it gets before planning it).
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does

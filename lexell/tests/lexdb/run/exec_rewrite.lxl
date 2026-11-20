@@ -1,0 +1,411 @@
+// lexdb_plan: rewrites that keep results (optimizer 48). Outer joins made
+// inner where WHERE (or a later join's ON) rejects their NULL rows (48.2):
+// LEFT, RIGHT and FULL joins, nested, through later outer joins, with
+// USING, LATERAL and derived tables; what does not reject (IS NULL,
+// COALESCE, CASE, OR with a NULL-keeping arm). WHERE's conjuncts pushed
+// into views, derived tables and CTEs used once (48.3): through renames
+// and expressions, GROUP BY (to WHERE or HAVING), DISTINCT, UNION ALL,
+// UNION and EXCEPT, a join, views over views, nested derived tables, an
+// aggregate without GROUP BY; not past LIMIT, OFFSET, a window, DISTINCT
+// ON, ROLLUP, a converted set operation column, a volatile select list
+// (random, nextval), a set-returning one, a CTE used twice; a subquery or
+// a volatile function in the conjunct stays; a view on an outer join's
+// preserved and nullable sides; parameters (a plan kept and run with other
+// values); a view planned again as its owner (the session's role cannot
+// read its table) and with its column renamed since. Each query runs with
+// the rewrites, without (lexdb_plan.setRewrites(0)), with batches off and
+// under SET lexdb_planner = rules: the same rows (sorted) or the same
+// error. "rewritten": per query, y when its EXPLAIN ANALYZE (the counts of
+// rows read and kept) differs from the one without the rewrites.
+// expect: create table a (id int primary key, x int, y text) -> CREATE TABLE
+// expect: insert into a select g, case when g % 7 = 0 then null else g % 5 end, 'y' || (g % 3) from generate_series(1, 40) g -> INSERT 0 40
+// expect: create table b (id int primary key, aid int, v int, w text) -> CREATE TABLE
+// expect: insert into b select g, case when g % 11 = 0 then null else g % 30 + 1 end, case when g % 4 = 0 then null else g % 9 end, case when g % 5 = 0 then null else 'w' || (g % 4) end from generate_series(1, 60) g -> INSERT 0 60
+// expect: create index b_aid on b (aid) -> CREATE INDEX
+// expect: create table c (id int primary key, bid int, z int) -> CREATE TABLE
+// expect: insert into c select g, g % 70 + 1, case when g % 6 = 0 then null else g % 4 end from generate_series(1, 50) g -> INSERT 0 50
+// expect: analyze -> ANALYZE
+// expect: outer: 37 queries, 37 the same, rewritten ynnnyyynyyyynnnyynyyynyynnyyyyyynyyyn
+// expect: create table t (id int primary key, k int, g int, txt text) -> CREATE TABLE
+// expect: insert into t select i, case when i % 13 = 0 then null else i % 50 end, i % 10, 'x' || (i % 7) from generate_series(1, 3000) i -> INSERT 0 3000
+// expect: create index t_k on t (k) -> CREATE INDEX
+// expect: create table u (id int primary key, w text) -> CREATE TABLE
+// expect: insert into u select i, case when i % 9 = 0 then null else 'w' || (i % 5) end from generate_series(1, 200) i -> INSERT 0 200
+// expect: create sequence sq -> CREATE SEQUENCE
+// expect: create view v1 as select id, k, g * 2 as g2, txt from t -> CREATE VIEW
+// expect: create view v2 as select g, count(*) n, sum(k) sk, max(txt) mt from t group by g -> CREATE VIEW
+// expect: create view v3 as select id, k from t where k < 10 union all select id, 7 from u -> CREATE VIEW
+// expect: create view v4 as select id, k from t order by id limit 100 -> CREATE VIEW
+// expect: create view v5 as select id, k, random() r from t -> CREATE VIEW
+// expect: create view v6 (a, b) as select id, k + 1 from t -> CREATE VIEW
+// expect: create view v7 as select distinct g, k % 3 m from t -> CREATE VIEW
+// expect: create view v8 as select count(*) c, max(k) mk from t -> CREATE VIEW
+// expect: create view v9 as select id, row_number() over (order by id) rn from t -> CREATE VIEW
+// expect: create view v10 as select * from v1 where k > 5 -> CREATE VIEW
+// expect: create view v11 as select t.id, t.k, u.w from t join u on u.id = t.id -> CREATE VIEW
+// expect: create view v12 as select * from t -> CREATE VIEW
+// expect: create view v13 as select id, k from t where k < 5 union select id, k from t where k > 45 except select id, k from t where id % 2 = 0 -> CREATE VIEW
+// expect: create view v14 as select g, sum(k) sk from t group by rollup (g) -> CREATE VIEW
+// expect: create view v15 as select id, k from t union all select id, 2.5 from u -> CREATE VIEW
+// expect: create view v16 as select distinct on (g) g, id from t order by g, id -> CREATE VIEW
+// expect: create view v17 as select id, k, nextval('sq') n from t -> CREATE VIEW
+// expect: create view v18 as select g, count(*) n from t group by g having count(*) > 299 -> CREATE VIEW
+// expect: analyze -> ANALYZE
+// expect: views: 44 queries, 44 the same, rewritten yyyyyyyyyyyynnyyyyynyyyyyynnnnnyynnyynyynyyy
+// expect: derived tables: 14 queries, 14 the same, rewritten yyynnnyyynnnyy
+// expect: ctes: 6 queries, 6 the same, rewritten yynynn
+// expect: create table secret (id int primary key, v int) -> CREATE TABLE
+// expect: insert into secret select i, i * 3 from generate_series(1, 500) i -> INSERT 0 500
+// expect: create view open_v as select id, v from secret -> CREATE VIEW
+// expect: create role reader -> CREATE ROLE
+// expect: grant select on open_v to reader -> GRANT
+// expect: create table rt (id int primary key, a int) -> CREATE TABLE
+// expect: insert into rt select i, i % 4 from generate_series(1, 100) i -> INSERT 0 100
+// expect: create view rv as select id, a from rt -> CREATE VIEW
+// expect: alter table rt rename column a to b -> ALTER TABLE
+// expect: grant select on rv to reader -> GRANT
+// expect: set role reader -> SET
+// expect: select * from secret where id = 2 -> ERROR 42501
+// expect: owners and renames: 2 queries, 2 the same, rewritten yy
+// expect: reset role -> RESET
+// expect: parameters: 7 queries, 7 the same, rewritten -------
+// expect: before: select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3 -> scan b: full scan (rows read 60, kept 60, batches 1); right join a: hash on (id) over full scan (table rows 40 of 40 read, probes 60, rows read 55, joined 55, unmatched rows 10)
+// expect: after: select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3 -> scan b: full scan (rows read 60, kept 24, batches 1); join a: primary key lookup per row (lookups 24, rows read 22, joined 22)
+// expect: before: select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 -> scan a: full scan (rows read 40, kept 40, batches 1); full join b: hash on (aid) over full scan (table rows 60 of 60 read, probes 40, rows read 55, joined 55, null rows 10, unmatched rows 5)
+// expect: after: select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 -> scan a: full scan (rows read 40, kept 14, batches 1); left join b: index b_aid lookup, index only (estimated 2 rows) per row (lookups 14, rows read 18, joined 18, null rows 4)
+// expect: before: select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1 -> scan a: full scan (rows read 40, kept 40, batches 1); left join b: index b_aid lookup, index only (estimated 2 rows) per row (lookups 40, rows read 55, joined 55, null rows 10); left join c: hash on (bid) over full scan (table rows 50 of 50 read, probes 65, rows read 46, joined 46, null rows 19)
+// expect: after: select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1 -> scan c: full scan (rows read 50, kept 21, batches 1); join b: primary key lookup per row (lookups 21, rows read 21, joined 21); join a: primary key lookup per row (lookups 21, rows read 19, joined 19)
+// expect: before: select * from v1 where id = 5 -> scan v1: rows of subquery 1 (rows read 3000, kept 1, batches 3); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 3000, kept 3000, batches 3)
+// expect: after: select * from v1 where id = 5 -> scan v1: rows of subquery 1 (rows read 1, kept 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: primary key lookup (rows read 1, kept 1)
+// expect: before: select * from v2 where g = 3 -> scan v2: rows of subquery 1 (rows read 10, kept 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 3000, kept 3000, batches 3);   aggregate
+// expect: after: select * from v2 where g = 3 -> scan v2: rows of subquery 1 (rows read 1, kept 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 3000, kept 300, batches 3);   aggregate
+// expect: before: select * from v3 where id < 30 -> scan v3: rows of subquery 1 (rows read 755, kept 38, batches 1); subquery 1 (from): run once (runs 1, from cache 0);   union all;     query 1 (runs 1):;       scan t: index t_k range, index only (rows read 610, kept 555, batches 1);     query 2 (runs 1):;       scan u: full scan (rows read 200, kept 200, batches 1)
+// expect: after: select * from v3 where id < 30 -> scan v3: rows of subquery 1 (rows read 38, kept 38); subquery 1 (from): run once (runs 1, from cache 0);   union all;     query 1 (runs 1):;       scan t: primary key range (rows read 30, kept 9, batches 1);     query 2 (runs 1):;       scan u: primary key range (rows read 30, kept 29, batches 1)
+// expect: before: select * from v4 where id = 5 -> scan v4: rows of subquery 1 (rows read 100, kept 1, batches 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 100, kept 100, batches 1);   order: the scan's;   limit: stops the scan
+// expect: after: select * from v4 where id = 5 -> scan v4: rows of subquery 1 (rows read 100, kept 1, batches 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 100, kept 100, batches 1);   order: the scan's;   limit: stops the scan
+// expect: before: select u.id, v1.id from u left join v1 on v1.id = u.id where v1.k > 40 -> scan u: full scan (rows read 200, kept 200, batches 1); left join v1: hash on (id) over rows of subquery 1 (table rows 3000 of 3000 read, probes 200, rows read 200, joined 200, null rows 0); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 3000, kept 3000, batches 3)
+// expect: after: select u.id, v1.id from u left join v1 on v1.id = u.id where v1.k > 40 -> scan u: full scan (rows read 200, kept 200, batches 1); join v1: hash on (id) over rows of subquery 1 (table rows 499 of 499 read, probes 200, rows read 33, joined 33); subquery 1 (from): run once (runs 1, from cache 0);   scan t: index t_k range, rows in key order (rows read 3000, kept 499, batches 3, switched to scan: cheaper than the range, by the measured costs)
+// expect: before: with c as (select id, k from t) select * from c where id = 5 -> scan c: rows of subquery 1 (rows read 3000, kept 1, batches 3); subquery 1 (from): run once (runs 1, from cache 0);   scan t: full scan (rows read 3000, kept 3000, batches 3)
+// expect: after: with c as (select id, k from t) select * from c where id = 5 -> scan c: rows of subquery 1 (rows read 1, kept 1); subquery 1 (from): run once (runs 1, from cache 0);   scan t: primary key lookup (rows read 1, kept 1)
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_base"
+import "collections"
+import "strings"
+
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            collections.sort(mut &lines)
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn show(s: mut &lexdb_exec.Session, sql: str) { println(sql + " -> " + run(s, &sql)) }
+
+// EXPLAIN's lines, in one; analyze: EXPLAIN ANALYZE's, its counts (rows
+// read and kept) but not its time.
+fn planOf(s: mut &lexdb_exec.Session, sql: &str, analyze: bool): str {
+    let head = if analyze { "explain analyze " } else { "explain " }
+    match s.exec(&(head + sql)) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            let n = if analyze { len(r.rows) - 1 } else { len(r.rows) }
+            var lines: []str = []
+            for i in 0..n { append(mut &lines, lexdb_sql.text(&r.rows[i][0])) }
+            return strings.join(&lines, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// EXPLAIN ANALYZE (without its time) without the rewrites and with them.
+fn explain(s: mut &lexdb_exec.Session, sql: str) {
+    lexdb_plan.setRewrites(0)
+    println("before: " + sql + " -> " + planOf(s, &sql, true))
+    lexdb_plan.setRewrites(lexdb_plan.RW_OUTER | lexdb_plan.RW_PUSH)
+    println("after: " + sql + " -> " + planOf(s, &sql, true))
+}
+
+type Group = record { name: str; n: int; same: int; marks: str; seen: []str }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, marks: "", seen: []} }
+
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let all = lexdb_plan.RW_OUTER | lexdb_plan.RW_PUSH
+    lexdb_plan.setRewrites(all)
+    let on = run(s, sql)
+    let pOn = planOf(s, sql, true)
+    lexdb_plan.setRewrites(0)
+    let off = run(s, sql)
+    let pOff = planOf(s, sql, true)
+    lexdb_plan.setRewrites(all)
+    let x = run(s, &"set lexdb_batch = off")
+    let rows = run(s, sql)
+    let y = run(s, &"set lexdb_batch = on")
+    let z = run(s, &"set lexdb_planner = rules")
+    let rules = run(s, sql)
+    let w = run(s, &"reset lexdb_planner")
+    g.n += 1
+    if on == off && on == rows && on == rules {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  on: " + on + "\n  off: " + off + "\n  rows: " + rows + "\n  rules: " + rules)
+    }
+    g.marks += if pOn != pOff { "y" } else { "n" }
+}
+
+// sql with parameters, its plan kept in pc with the rewrites (run with each
+// value in turn), against a one-shot plan without them.
+fn checkP(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, params: &[]lexdb_sql.Val, pc: mut &lexdb_exec.PlanCache) {
+    let stmts = lexdb_parse.parse(sql).unwrap()
+    let nt: []int = []
+    lexdb_plan.setRewrites(0)
+    var po = lexdb_exec.oneShot()
+    let off = rowsOf(s.runCached(&stmts[0], params, &nt, mut &po))
+    lexdb_plan.setRewrites(lexdb_plan.RW_OUTER | lexdb_plan.RW_PUSH)
+    let on = rowsOf(s.runCached(&stmts[0], params, &nt, pc))
+    g.n += 1
+    if on == off { g.same += 1 } else if len(g.seen) < 3 { append(mut &g.seen, "DIFFERENT: " + sql + "\n  on: " + on + "\n  off: " + off) }
+    g.marks += "-"
+}
+
+fn rowsOf(r: Result[lexdb_exec.Res, lexdb_base.DbErr]): str {
+    match r {
+        Ok(res) {
+            var out: []str = []
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            collections.sort(mut &out)
+            return strings.join(&out, "; ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, rewritten " + g.marks)
+    for x in g.seen { println(x) }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    // a: 40 rows; b: 60 rows, aid 1..30 (some NULL), v with NULLs; c: 50 rows over b
+    show(mut &s, "create table a (id int primary key, x int, y text)")
+    show(mut &s, "insert into a select g, case when g % 7 = 0 then null else g % 5 end, 'y' || (g % 3) from generate_series(1, 40) g")
+    show(mut &s, "create table b (id int primary key, aid int, v int, w text)")
+    show(mut &s, "insert into b select g, case when g % 11 = 0 then null else g % 30 + 1 end, case when g % 4 = 0 then null else g % 9 end, case when g % 5 = 0 then null else 'w' || (g % 4) end from generate_series(1, 60) g")
+    show(mut &s, "create index b_aid on b (aid)")
+    show(mut &s, "create table c (id int primary key, bid int, z int)")
+    show(mut &s, "insert into c select g, g % 70 + 1, case when g % 6 = 0 then null else g % 4 end from generate_series(1, 50) g")
+    show(mut &s, "analyze")
+    var g = newGroup(&"outer")
+    let qs = [
+        // LEFT: rejected, kept
+        "select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is null",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v > 3 or b.v is null",
+        "select a.id, b.id from a left join b on b.aid = a.id where coalesce(b.v, 0) = 0",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is not null",
+        "select a.id, b.id from a left join b on b.aid = a.id where not (b.v is null)",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v > 3 or b.w = 'w1'",
+        "select a.id, b.id from a left join b on b.aid = a.id where case when b.v is null then 1 else b.v end > 2",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v in (1, 2, 3)",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.w like 'w1%'",
+        "select a.id, b.id from a left join b on b.aid = a.id where upper(b.w) = 'W2'",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v + a.x > 4",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.w || 'x' = 'w1x'",
+        "select a.id, b.id from a left join b on b.aid = a.id where b.v is distinct from 3",
+        "select a.id, b.id from a left join b on b.aid = a.id and b.v > 3 where a.x > 1",
+        "select a.id, b.id from a left join b on b.aid = a.id where a.x = 2 and b.v < 5",
+        // RIGHT and FULL
+        "select a.id, b.id from a right join b on b.aid = a.id where a.x > 2",
+        "select a.id, b.id from a right join b on b.aid = a.id where b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 and b.v > 2",
+        "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2 or b.v > 2",
+        // nested, and through later joins
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z is null",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id right join c on c.bid = b.id",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id full join c on c.bid = b.id where b.w like 'w%'",
+        "select a.id, b.id, c.id from a left join b on b.aid = a.id full join c on c.bid = b.id where c.z > 0",
+        "select a.id, b.id, c.id from a full join b on b.aid = a.id left join c on c.bid = b.id where c.z = 2",
+        "select a.id, b.id, c.id from a right join b on b.aid = a.id right join c on c.bid = b.id where a.y = 'y1'",
+        // USING, LATERAL, grouping, a derived table on the nullable side
+        "select id, a.x, b.v from a left join b using (id) where b.v > 2",
+        "select id, a.x, b.v from a full join b using (id) where id > 30",
+        "select a.id, l.v from a left join lateral (select b.v from b where b.aid = a.id) l on true where l.v > 4",
+        "select a.x, count(*), sum(b.v) from a left join b on b.aid = a.id where b.w <> 'w3' group by a.x",
+        "select a.id, d.n from a left join (select aid, count(*) n from b group by aid) d on d.aid = a.id where d.n >= 2",
+        "select a.id, d.n from a left join (select aid, count(*) n from b group by aid) d on d.aid = a.id where d.n is null"
+    ]
+    for q in qs { check(mut &s, mut &g, &q) }
+    report(&g)
+    // t: 3,000 rows (k with NULLs, g 0..9, txt), u: 200 rows; views over them
+    show(mut &s, "create table t (id int primary key, k int, g int, txt text)")
+    show(mut &s, "insert into t select i, case when i % 13 = 0 then null else i % 50 end, i % 10, 'x' || (i % 7) from generate_series(1, 3000) i")
+    show(mut &s, "create index t_k on t (k)")
+    show(mut &s, "create table u (id int primary key, w text)")
+    show(mut &s, "insert into u select i, case when i % 9 = 0 then null else 'w' || (i % 5) end from generate_series(1, 200) i")
+    show(mut &s, "create sequence sq")
+    show(mut &s, "create view v1 as select id, k, g * 2 as g2, txt from t")
+    show(mut &s, "create view v2 as select g, count(*) n, sum(k) sk, max(txt) mt from t group by g")
+    show(mut &s, "create view v3 as select id, k from t where k < 10 union all select id, 7 from u")
+    show(mut &s, "create view v4 as select id, k from t order by id limit 100")
+    show(mut &s, "create view v5 as select id, k, random() r from t")
+    show(mut &s, "create view v6 (a, b) as select id, k + 1 from t")
+    show(mut &s, "create view v7 as select distinct g, k % 3 m from t")
+    show(mut &s, "create view v8 as select count(*) c, max(k) mk from t")
+    show(mut &s, "create view v9 as select id, row_number() over (order by id) rn from t")
+    show(mut &s, "create view v10 as select * from v1 where k > 5")
+    show(mut &s, "create view v11 as select t.id, t.k, u.w from t join u on u.id = t.id")
+    show(mut &s, "create view v12 as select * from t")
+    show(mut &s, "create view v13 as select id, k from t where k < 5 union select id, k from t where k > 45 except select id, k from t where id % 2 = 0")
+    show(mut &s, "create view v14 as select g, sum(k) sk from t group by rollup (g)")
+    show(mut &s, "create view v15 as select id, k from t union all select id, 2.5 from u")
+    show(mut &s, "create view v16 as select distinct on (g) g, id from t order by g, id")
+    show(mut &s, "create view v17 as select id, k, nextval('sq') n from t")
+    show(mut &s, "create view v18 as select g, count(*) n from t group by g having count(*) > 299")
+    show(mut &s, "analyze")
+    var vg = newGroup(&"views")
+    let vqs = [
+        "select * from v1 where id = 5",
+        "select * from v1 where g2 > 16 and id < 40",
+        "select * from v1 where txt like 'x1%' and k = 3",
+        "select * from v1 where k is null and id < 100",
+        "select * from v1 where coalesce(k, -1) = -1 and id < 200",
+        "select * from v2 where g = 3",
+        "select * from v2 where n > 299",
+        "select * from v2 where g = 3 and sk > 100",
+        "select * from v2 where g = 3 or n > 300",
+        "select * from v2 where mt = 'x6'",
+        "select * from v3 where id < 30",
+        "select * from v3 where k = 7",
+        "select * from v4 where id = 5",
+        "select id, k from v5 where id = 5",
+        "select * from v6 where a = 5",
+        "select * from v6 where b > 49",
+        "select * from v7 where g = 2",
+        "select * from v8 where c > 0",
+        "select * from v8 where c > 100000",
+        "select * from v9 where id = 5",
+        "select * from v10 where id = 7",
+        "select * from v10 where id = 13",
+        "select * from v11 where id = 3",
+        "select * from v11 where w = 'w1' and id < 50",
+        "select * from v12 where id = 3",
+        "select * from v13 where id < 100",
+        "select * from v14 where g = 3",
+        "select * from v14 where g is null",
+        "select * from v15 where id = 3",
+        "select * from v16 where g = 4",
+        "select id, k from v17 where id = 5",
+        "select * from v18 where g = 1",
+        "select * from v1 where id = 5 and random() >= 0",
+        "select * from v1 where id = (select max(id) from u)",
+        "select * from v1 where 100 / k > 30 and id < 60",
+        // joins: preserved side, nullable side, all three kinds
+        "select v1.id, u.w from v1 join u on u.id = v1.k where v1.id < 10",
+        "select u.id, v1.id from u left join v1 on v1.id = u.id where v1.k > 40",
+        "select u.id, v1.id from u left join v1 on v1.id = u.id where v1.k is null",
+        "select v1.id, u.w from v1 left join u on u.id = v1.id where v1.k > 47",
+        "select v1.id, u.w from v1 right join u on u.id = v1.id where v1.k > 47",
+        "select v1.id, u.w from v1 right join u on u.id = v1.id where u.w = 'w2' and u.id < 30",
+        "select u.id, v1.id from u full join v1 on v1.id = u.id where v1.k = 3",
+        "select u.id, v2.n from u left join v2 on v2.g = u.id where v2.n > 200",
+        "select v1.id, v6.b from v1 join v6 on v6.a = v1.id where v1.id < 20 and v6.b > 10"
+    ]
+    for q in vqs { check(mut &s, mut &vg, &q) }
+    report(&vg)
+    var dg = newGroup(&"derived tables")
+    let dqs = [
+        "select * from (select id, k * 2 k2 from t) x where x.k2 = 10",
+        "select * from (select * from (select id, k from t) x where k > 3) y where id < 20",
+        "select * from (select g, avg(k) a from t group by g) x where g in (1, 2) and a > 0",
+        "select * from (select g, count(*) n from t group by g having count(*) > 1) x where n < 301",
+        "select * from (select id, k from t order by k limit 50) x where id < 1000",
+        "select * from (select id, k from t offset 2990) x where id > 2995",
+        "select * from (select id, k from t where k < 3 union all select id, 0 from u) x where id <= 10",
+        "select * from (select k, count(*) c from t group by k) x where k is null",
+        "select x.id from (select id, txt from t) x join u on u.id = x.id where x.txt = 'x3'",
+        "select x.id, x.r from (select id, random() < 2 r from t) x where x.id = 3",
+        "select * from (select id, generate_series(1, 2) s from t) x where id = 4",
+        "select * from (select 1 as one, 2 as two) x where one = 1",
+        "select * from (select 1 as one) x where one = 2",
+        "select x.n from (select count(*) n from t) x where x.n = 0"
+    ]
+    for q in dqs { check(mut &s, mut &dg, &q) }
+    report(&dg)
+    var cg = newGroup(&"ctes")
+    let cqs = [
+        "with c as (select id, k from t) select * from c where id = 5",
+        "with c as (select g, sum(k) sk from t group by g) select * from c where g = 4",
+        "with c as (select id, k from t) select c1.id, c2.k from c c1 join c c2 on c2.id = c1.id + 1 where c1.id = 5",
+        "with c as (select id, k from t), d as (select * from c where k > 2) select * from d where id < 10",
+        "with c as (select id, k, nextval('sq') n from t) select id, k from c where id = 5",
+        "with c as (select id, k from t) select * from c where id = 5 union all select * from c where id = 6"
+    ]
+    for q in cqs { check(mut &s, mut &cg, &q) }
+    report(&cg)
+    // a view planned again as its owner, its column renamed since (its text's names as written)
+    show(mut &s, "create table secret (id int primary key, v int)")
+    show(mut &s, "insert into secret select i, i * 3 from generate_series(1, 500) i")
+    show(mut &s, "create view open_v as select id, v from secret")
+    show(mut &s, "create role reader")
+    show(mut &s, "grant select on open_v to reader")
+    show(mut &s, "create table rt (id int primary key, a int)")
+    show(mut &s, "insert into rt select i, i % 4 from generate_series(1, 100) i")
+    show(mut &s, "create view rv as select id, a from rt")
+    show(mut &s, "alter table rt rename column a to b")
+    show(mut &s, "grant select on rv to reader")
+    show(mut &s, "set role reader")
+    show(mut &s, "select * from secret where id = 2")
+    var og = newGroup(&"owners and renames")
+    check(mut &s, mut &og, &"select * from open_v where id = 2")
+    check(mut &s, mut &og, &"select count(*) from rv where a = 3 and id < 50")
+    report(&og)
+    show(mut &s, "reset role")
+    var pg = newGroup(&"parameters")
+    var pc = lexdb_exec.newPlanCache()
+    for v in [3, 77, 2999, 5000] { checkP(mut &s, mut &pg, &"select * from v1 where id = $1", &[lexdb_sql.Val.Int(v)], mut &pc) }
+    var pc2 = lexdb_exec.newPlanCache()
+    for v in [1, 9, 12] { checkP(mut &s, mut &pg, &"select * from v2 where g = $1", &[lexdb_sql.Val.Int(v)], mut &pc2) }
+    report(&pg)
+    explain(mut &s, "select a.id, b.id, b.v from a left join b on b.aid = a.id where b.v > 3")
+    explain(mut &s, "select a.id, b.id from a full join b on b.aid = a.id where a.x > 2")
+    explain(mut &s, "select a.id, b.id, c.id from a left join b on b.aid = a.id left join c on c.bid = b.id where c.z > 1")
+    explain(mut &s, "select * from v1 where id = 5")
+    explain(mut &s, "select * from v2 where g = 3")
+    explain(mut &s, "select * from v3 where id < 30")
+    explain(mut &s, "select * from v4 where id = 5")
+    explain(mut &s, "select u.id, v1.id from u left join v1 on v1.id = u.id where v1.k > 40")
+    explain(mut &s, "with c as (select id, k from t) select * from c where id = 5")
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
