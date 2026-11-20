@@ -8,6 +8,8 @@ import "./lexdb_pgcat"
 import "./lexdb_catalog"
 import "./lexdb_routine"
 
+type Routine = lexdb_sql.Routine
+
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
 type Table = lexdb_catalog.Table
@@ -284,6 +286,70 @@ pub fn infoType(t: &lexdb_sql.TypeName): str {
 }
 
 
+
+// ---- a routine as PostgreSQL shows it (pg_get_functiondef and its parts, information_schema.routines and parameters)
+
+fn isTable(r: &Routine): bool { return strings.contains(&(" " + r.attrs + " "), " table ") }
+
+// A default as pg_get_function_arguments writes it: a quoted constant carries its type.
+fn shownDefault(p: &lexdb_sql.RParam): str {
+    let d = strings.trim(&p.dflt)
+    if len(d) >= 2 && d[0] == '\'' && d[len(d) - 1] == '\'' { return d.toStr() + "::" + lexdb_pgcat.formatType(p.typ.oid, -1) }
+    return d.toStr()
+}
+
+// pg_get_function_arguments (identity: pg_get_function_identity_arguments, which leaves the defaults out): the arguments with
+// their modes (a procedure's IN written, a TABLE function's columns left to its result).
+pub fn fnArgs(r: &Routine, identity: bool): str {
+    var parts: []str = []
+    for p in r.params {
+        if p.mode == "out" && isTable(r) { continue }
+        var s = ""
+        if p.mode == "out" { s = "OUT " }
+        else if p.mode == "inout" { s = "INOUT " }
+        else if p.mode == "variadic" { s = "VARIADIC " }
+        else if r.kind == lexdb_sql.RK_PROC { s = "IN " }
+        if len(p.name) > 0 { s = s + quoteIfNeeded(&p.name) + " " }
+        s = s + lexdb_pgcat.formatType(p.typ.oid, -1)
+        if !identity && p.has { s = s + " DEFAULT " + shownDefault(&p) }
+        append(mut &parts, s)
+    }
+    return strings.join(&parts, ", ")
+}
+
+// pg_get_function_result: "" for a procedure (its result is NULL).
+pub fn fnResult(r: &Routine): str {
+    if r.kind == lexdb_sql.RK_PROC { return "" }
+    if isTable(r) {
+        var cols: []str = []
+        for p in r.params { if p.mode == "out" { append(mut &cols, quoteIfNeeded(&p.name) + " " + lexdb_pgcat.formatType(p.typ.oid, -1)) } }
+        return "TABLE(" + strings.join(&cols, ", ") + ")"
+    }
+    return (if r.retSet { "SETOF " } else { "" }) + lexdb_pgcat.formatType(r.ret.oid, -1)
+}
+
+// pg_get_functiondef: the statement that makes the routine, its body as it was written.
+pub fn fnDef(r: &Routine): str {
+    let proc = r.kind == lexdb_sql.RK_PROC
+    var b = "CREATE OR REPLACE " + (if proc { "PROCEDURE " } else { "FUNCTION " }) + quoteIfNeeded(&lexdb_sql.schemaOf(&r.key)) + "." + quoteIfNeeded(&lexdb_sql.baseName(&r.key)) +
+            "(" + fnArgs(r, false) + ")\n"
+    if !proc { b = b + " RETURNS " + fnResult(r) + "\n" }
+    b = b + " LANGUAGE " + r.lang + "\n"
+    var attrs = ""
+    if strings.contains(&r.attrs, "immutable") { attrs = attrs + " IMMUTABLE" }
+    else if strings.contains(&r.attrs, "stable") { attrs = attrs + " STABLE" }
+    if strings.contains(&r.attrs, "strict") { attrs = attrs + " STRICT" }
+    if len(attrs) > 0 { b = b + attrs + "\n" }
+    if r.atomic && strings.contains(&r.attrs, "return") {
+        b = b + "RETURN " + r.body[7..len(r.body)] + "\n"
+    } else if r.atomic {
+        b = b + "BEGIN ATOMIC\n " + strings.trim(&r.body) + ";\nEND\n"
+    } else {
+        let tag = if proc { "$procedure$" } else { "$function$" }
+        b = b + "AS " + tag + r.body + tag + "\n"
+    }
+    return b
+}
 
 pub fn sizePretty(v: int): str {
     let names = ["bytes", "kB", "MB", "GB", "TB", "PB"]
@@ -568,7 +634,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             // the functions and procedures made in this dialect (package F); lexdb has no built-in ones to list
             for r in snap.routines {
                 if r.dialect != lexdb_sql.RD_PG { continue }
-                let ra = aclOf(&snap, &lexdb_catalog.relObj(&r.key))
+                let ra = lexdb_catalog.routineAcl(&snap, &r)
                 var ins: []int = []
                 var all: []str = []
                 var modes: []str = []
@@ -580,7 +646,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                 for p in r.params {
                     if p.mode != "out" { append(mut &ins, p.typ.oid) }
                     append(mut &all, p.typ.oid.toStr())
-                    append(mut &modes, if p.mode == "out" { "o" } else if p.mode == "inout" { "b" } else if p.mode == "variadic" { "v" } else { "i" })
+                    append(mut &modes, if p.mode == "out" { (if isTable(&r) { "t" } else { "o" }) } else if p.mode == "inout" { "b" } else if p.mode == "variadic" { "v" } else { "i" })
                     append(mut &names, p.name.clone())
                     if len(p.name) > 0 { anyName = true }
                     if p.mode == "out" || p.mode == "inout" { anyOut = true }
@@ -596,7 +662,111 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                                    if anyOut { Val.Text("{" + strings.join(&all, ",") + "}") } else { Val.Null },
                                    if anyOut { Val.Text("{" + strings.join(&modes, ",") + "}") } else { Val.Null },
                                    if anyName { Val.Text("{" + strings.join(&names, ",") + "}") } else { Val.Null },
-                                   Val.Null, Val.Null, tv(&(if r.atomic { "" } else { r.body.clone() })), Val.Null, Val.Null, Val.Null, Val.Null])
+                                   Val.Null, Val.Null, tv(&(if r.atomic { "" } else { r.body.clone() })), Val.Null, Val.Null, Val.Null, aclText(&snap, &ra, &"X")])
+            }
+        }
+        "information_schema.routines" {
+            // the functions and procedures made in this dialect, those the session may run (as PostgreSQL's view): one row a routine
+            for r in snap.routines {
+                if r.dialect != lexdb_sql.RD_PG { continue }
+                let a = lexdb_catalog.routineAcl(&snap, &r)
+                let o = ownerName(&snap, &a)
+                var allowed = cq.whoSuper || lexdb_base.hasStr(&cq.who, &o)
+                for g in a.grants { if !allowed && strings.contains(&g.privs, "X") && (len(g.to) == 0 || lexdb_base.hasStr(&cq.who, &g.to)) { allowed = true } }
+                if !allowed { continue }
+                let proc = r.kind == lexdb_sql.RK_PROC
+                let nm = lexdb_sql.baseName(&r.key)
+                let sc = lexdb_sql.schemaOf(&r.key)
+                let tn = match lexdb_pgcat.typeOf(r.ret.oid) {
+                    Some(t) { t.name.clone() }
+                    None { "text" }
+                }
+                let isArr = r.ret.kind == lexdb_sql.K_ARRAY
+                var row: []Val = []
+                append(mut &row, tv(&db))
+                append(mut &row, tv(&sc))
+                append(mut &row, tv(&(nm + "_" + catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r))).toStr())))
+                append(mut &row, tv(&db))
+                append(mut &row, tv(&sc))
+                append(mut &row, tv(&nm))
+                append(mut &row, tv(&(if proc { "PROCEDURE" } else { "FUNCTION" })))
+                for k in 0..6 { append(mut &row, Val.Null) }                      // module_*, udt_*
+                append(mut &row, if proc { Val.Null } else { tv(&infoType(&r.ret)) })        // data_type
+                for k in 0..14 { append(mut &row, Val.Null) }                     // character_*, collation_*, numeric_*, datetime_*, interval_*
+                append(mut &row, if proc { Val.Null } else { tv(&db) })           // type_udt_catalog
+                append(mut &row, if proc { Val.Null } else { tv(&"pg_catalog") })
+                append(mut &row, if proc { Val.Null } else { tv(&(if isArr { "_" + tn } else { tn })) })
+                for k in 0..4 { append(mut &row, Val.Null) }                      // scope_*, maximum_cardinality
+                append(mut &row, if proc { Val.Null } else { tv(&"0") })          // dtd_identifier
+                append(mut &row, tv(&"SQL"))                                      // routine_body
+                append(mut &row, if r.atomic { Val.Null } else { tv(&r.body) })   // routine_definition
+                append(mut &row, Val.Null)                                        // external_name
+                append(mut &row, tv(&"SQL"))
+                append(mut &row, tv(&"GENERAL"))
+                append(mut &row, tv(&(if strings.contains(&r.attrs, "immutable") { "YES" } else { "NO" })))
+                append(mut &row, tv(&"MODIFIES"))
+                append(mut &row, if proc { Val.Null } else { tv(&(if strings.contains(&r.attrs, "strict") { "YES" } else { "NO" })) })
+                append(mut &row, Val.Null)                                        // sql_path
+                append(mut &row, tv(&"YES"))                                      // schema_level_routine
+                append(mut &row, iv(0))                                           // max_dynamic_result_sets
+                append(mut &row, Val.Null)
+                append(mut &row, Val.Null)
+                append(mut &row, tv(&"INVOKER"))
+                for k in 0..3 { append(mut &row, Val.Null) }                      // to_sql_specific_*
+                append(mut &row, tv(&"NO"))                                       // as_locator
+                for k in 0..3 { append(mut &row, Val.Null) }                      // created, last_altered, new_savepoint_level
+                append(mut &row, tv(&"NO"))                                       // is_udt_dependent
+                for k in 0..24 { append(mut &row, Val.Null) }                     // result_cast_*
+                append(mut &rows, row)
+            }
+        }
+        "information_schema.parameters" {
+            for r in snap.routines {
+                if r.dialect != lexdb_sql.RD_PG { continue }
+                let a = lexdb_catalog.routineAcl(&snap, &r)
+                let o = ownerName(&snap, &a)
+                var allowed = cq.whoSuper || lexdb_base.hasStr(&cq.who, &o)
+                for g in a.grants { if !allowed && strings.contains(&g.privs, "X") && (len(g.to) == 0 || lexdb_base.hasStr(&cq.who, &g.to)) { allowed = true } }
+                if !allowed { continue }
+                let nm = lexdb_sql.baseName(&r.key)
+                let sc = lexdb_sql.schemaOf(&r.key)
+                let spec = nm + "_" + catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r))).toStr()
+                for i in 0..len(r.params) {
+                    let p = &r.params[i]
+                    let tn = match lexdb_pgcat.typeOf(p.typ.oid) {
+                        Some(t) { t.name.clone() }
+                        None { "text" }
+                    }
+                    var row: []Val = [tv(&db), tv(&sc), tv(&spec), iv(i + 1),
+                                      tv(&(if p.mode == "out" { "OUT" } else if p.mode == "inout" { "INOUT" } else { "IN" })), tv(&"NO"), tv(&"NO"),
+                                      if len(p.name) > 0 { tv(&p.name) } else { Val.Null }, tv(&infoType(&p.typ))]
+                    for k in 0..14 { append(mut &row, Val.Null) }                 // character_*, collation_*, numeric_*, datetime_*, interval_*
+                    append(mut &row, tv(&db))
+                    append(mut &row, tv(&"pg_catalog"))
+                    append(mut &row, tv(&(if p.typ.kind == lexdb_sql.K_ARRAY { "_" + tn } else { tn })))
+                    for k in 0..4 { append(mut &row, Val.Null) }                  // scope_*, maximum_cardinality
+                    append(mut &row, tv(&(i + 1).toStr()))
+                    append(mut &row, if p.has { tv(&shownDefault(p)) } else { Val.Null })
+                    append(mut &rows, row)
+                }
+            }
+        }
+        "information_schema.routine_privileges", "information_schema.role_routine_grants" {
+            // each routine's grants, its owner's own and PUBLIC's default EXECUTE included, as table_privileges lists a table's
+            let publicToo = rel == "information_schema.routine_privileges"
+            for r in snap.routines {
+                if r.dialect != lexdb_sql.RD_PG { continue }
+                let a = lexdb_catalog.routineAcl(&snap, &r)
+                let o = ownerName(&snap, &a)
+                var gs: []Grant = [Grant{to: o.clone(), privs: "X"}]
+                for g in a.grants { if g.to != o { append(mut &gs, Grant{to: g.to.clone(), privs: g.privs.clone()}) } }
+                let nm = lexdb_sql.baseName(&r.key)
+                for g in gs {
+                    if !lexdb_catalog.privSeen(cq, &o, &g.to, publicToo) { continue }
+                    if !strings.contains(&g.privs, "X") { continue }
+                    append(mut &rows, [tv(&o), tv(if len(g.to) > 0 { &g.to } else { "PUBLIC" }), tv(&db), tv(&lexdb_sql.schemaOf(&r.key)), tv(&(nm + "_" + catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r))).toStr())),
+                                       tv(&db), tv(&lexdb_sql.schemaOf(&r.key)), tv(&nm), tv(&"EXECUTE"), tv(&(if g.to == o { "YES" } else { "NO" }))])
+                }
             }
         }
         "pg_language" {

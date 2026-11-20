@@ -1,0 +1,217 @@
+// lexdb over TNS: EXECUTE on stored procedures and functions (design/lexdb-dialect-gaps.md, package F, slice F3). The owner of a
+// procedure or function grants EXECUTE on it (also ALL) to another user or to PUBLIC; the grantee calls it as Oracle's own
+// owner.name (from a block, from SQL) on that grant alone, and the unit runs with its owner's privileges (it reads and writes a
+// table its caller cannot); without it a call is ORA-06550 (PLS-00201) from a block and ORA-00904 from SQL; REVOKE takes it
+// away; CREATE OR REPLACE keeps the grants, DROP takes them; SELECT on a unit is ORA-00942, EXECUTE on a table ORA-00990, a
+// grant by a user that holds EXECUTE without the right to pass it on ORA-01720 (none ORA-01031); USER_, ALL_ and DBA_TAB_PRIVS
+// list the grants with privilege EXECUTE and the unit's type. No Oracle was at hand: the expectations are by hand, from the
+// documentation (ORA-00942 / ORA-00990 for the wrong privilege and ORA-01031 for a user with no privilege at all are from memory).
+// expect: create function: ok
+// expect: create reader: ok
+// expect: create procedure: ok
+// expect: owner calls: 6|10
+// expect: block denied: error 6550
+// expect: sql denied: error 904
+// expect: table denied: error 942
+// expect: grant execute: 0
+// expect: sql allowed: 6
+// expect: other unit denied: error 904
+// expect: u3 denied: error 904
+// expect: grant reader: 0
+// expect: reader runs as owner: 10
+// expect: table still denied: error 942
+// expect: grant procedure: 0
+// expect: block allowed: ok
+// expect: it wrote: 15
+// expect: call allowed: ok
+// expect: select on a unit: error 942
+// expect: execute on a table: error 990
+// expect: missing unit: error 942
+// expect: missing user: error 1917
+// expect: u2 regrants: error 1720
+// expect: u3 grants: error 1031
+// expect: still denied: error 904
+// expect: user_tab_privs u1: 'U2'|'U1'|'F'|'U1'|'EXECUTE'|'NO'|'FUNCTION';'U2'|'U1'|'PR'|'U1'|'EXECUTE'|'NO'|'PROCEDURE';'U2'|'U1'|'RD'|'U1'|'EXECUTE'|'NO'|'FUNCTION'
+// expect: user_tab_privs u2: 'U2'|'U1'|'F'|'EXECUTE'|'FUNCTION';'U2'|'U1'|'PR'|'EXECUTE'|'PROCEDURE';'U2'|'U1'|'RD'|'EXECUTE'|'FUNCTION'
+// expect: user_tab_privs u3: 0
+// expect: all_tab_privs u2: 'U1'|'U2'|'U1'|'F'|'EXECUTE'|'FUNCTION';'U1'|'U2'|'U1'|'PR'|'EXECUTE'|'PROCEDURE';'U1'|'U2'|'U1'|'RD'|'EXECUTE'|'FUNCTION'
+// expect: dba_tab_privs: 'U2'|'U1'|'F'|'EXECUTE'|'FUNCTION';'U2'|'U1'|'PR'|'EXECUTE'|'PROCEDURE';'U2'|'U1'|'RD'|'EXECUTE'|'FUNCTION'
+// expect: grant public: 0
+// expect: u3 as public: 6
+// expect: dba public: 'PUBLIC'|'F'|'EXECUTE'
+// expect: revoke public: 0
+// expect: u3 revoked: error 904
+// expect: u2 keeps: 8
+// expect: revoke u2: 0
+// expect: u2 revoked: error 904
+// expect: revoke procedure: 0
+// expect: block revoked: error 6550
+// expect: grant all: 0
+// expect: all row: 'EXECUTE'
+// expect: replace: ok
+// expect: u3 after replace: 9
+// expect: drop: ok
+// expect: grants after drop: 'U2'|'RD'|'EXECUTE'
+// expect: recreate: ok
+// expect: recreated not granted: error 904
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a statement's count, or its error's number
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a block or a call: ok, or its error's number
+fn blk(c: mut &oracle.Conn, sql: &str): str {
+    let none: []sqldialect.Value = []
+    match c.call(&(sql.toStr()), &none, &[]) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var sa = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    for u in ["u1", "u2", "u3"] {
+        sa.exec(&("create user " + u + " identified by pw")).unwrap()
+        sa.exec(&("grant create session, create table, create procedure to " + u)).unwrap()
+    }
+    var a = connect(&("User Id=u1;Password=pw;Data Source=" + dsn))
+    var b = connect(&("User Id=u2;Password=pw;Data Source=" + dsn))
+    var c = connect(&("User Id=u3;Password=pw;Data Source=" + dsn))
+    a.exec("create table t (id number primary key, v number)").unwrap()
+    a.exec("insert into t values (1, 10)").unwrap()
+    a.exec("insert into t values (2, 20)").unwrap()
+    a.exec("commit").unwrap()
+    say("create function", blk(mut &a, &"create function f (a number) return number is begin return a * 2; end;"))
+    say("create reader", blk(mut &a, &"create function rd (a number) return number is r number; begin select v into r from t where id = a; return r; end;"))
+    say("create procedure", blk(mut &a, &"create procedure pr (a number) is begin update t set v = v + a where id = 1; end;"))
+    say("owner calls", q1(mut &a, &"select f(3), rd(1) from dual"))
+    // no EXECUTE yet
+    say("block denied", blk(mut &b, &"begin u1.pr(1); end;"))
+    say("sql denied", q1(mut &b, &"select u1.f(3) from dual"))
+    say("table denied", q1(mut &b, &"select v from u1.t"))
+    // GRANT
+    say("grant execute", err(a.run("grant execute on f to u2", &[])))
+    say("sql allowed", q1(mut &b, &"select u1.f(3) from dual"))
+    say("other unit denied", q1(mut &b, &"select u1.rd(1) from dual"))
+    say("u3 denied", q1(mut &c, &"select u1.f(3) from dual"))
+    say("grant reader", err(a.run("grant execute on u1.rd to u2", &[])))
+    say("reader runs as owner", q1(mut &b, &"select u1.rd(1) from dual"))
+    say("table still denied", q1(mut &b, &"select v from u1.t"))
+    say("grant procedure", err(a.run("grant execute on pr to u2", &[])))
+    say("block allowed", blk(mut &b, &"begin u1.pr(5); end;"))
+    b.exec("commit").unwrap()
+    say("it wrote", q1(mut &a, &"select v from t where id = 1"))
+    say("call allowed", blk(mut &b, &"call u1.pr(1)"))
+    b.exec("commit").unwrap()
+    // errors
+    say("select on a unit", err(a.run("grant select on f to u3", &[])))
+    say("execute on a table", err(a.run("grant execute on t to u3", &[])))
+    say("missing unit", err(a.run("grant execute on nothing to u3", &[])))
+    say("missing user", err(a.run("grant execute on f to nobody", &[])))
+    say("u2 regrants", err(b.run("grant execute on u1.f to u3", &[])))
+    say("u3 grants", err(c.run("grant execute on u1.f to u3", &[])))
+    say("still denied", q1(mut &c, &"select u1.f(3) from dual"))
+    // the views
+    say("user_tab_privs u1", q1(mut &a, &"select grantee, owner, table_name, grantor, privilege, grantable, type from user_tab_privs order by table_name"))
+    say("user_tab_privs u2", q1(mut &b, &"select grantee, owner, table_name, privilege, type from user_tab_privs order by table_name"))
+    say("user_tab_privs u3", q1(mut &c, &"select count(*) from user_tab_privs"))
+    say("all_tab_privs u2", q1(mut &b, &"select grantor, grantee, table_schema, table_name, privilege, type from all_tab_privs order by table_name"))
+    say("dba_tab_privs", q1(mut &sa, &"select grantee, owner, table_name, privilege, type from dba_tab_privs where owner = 'U1' order by table_name"))
+    // PUBLIC
+    say("grant public", err(a.run("grant execute on f to public", &[])))
+    say("u3 as public", q1(mut &c, &"select u1.f(3) from dual"))
+    say("dba public", q1(mut &sa, &"select grantee, table_name, privilege from dba_tab_privs where owner = 'U1' and grantee = 'PUBLIC'"))
+    // REVOKE
+    say("revoke public", err(a.run("revoke execute on f from public", &[])))
+    say("u3 revoked", q1(mut &c, &"select u1.f(3) from dual"))
+    say("u2 keeps", q1(mut &b, &"select u1.f(4) from dual"))
+    say("revoke u2", err(a.run("revoke execute on f from u2", &[])))
+    say("u2 revoked", q1(mut &b, &"select u1.f(4) from dual"))
+    say("revoke procedure", err(a.run("revoke execute on pr from u2", &[])))
+    say("block revoked", blk(mut &b, &"begin u1.pr(1); end;"))
+    // ALL, CREATE OR REPLACE, DROP
+    say("grant all", err(a.run("grant all on f to u3", &[])))
+    say("all row", q1(mut &sa, &"select privilege from dba_tab_privs where owner = 'U1' and table_name = 'F' and grantee = 'U3'"))
+    say("replace", blk(mut &a, &"create or replace function f (a number) return number is begin return a * 3; end;"))
+    say("u3 after replace", q1(mut &c, &"select u1.f(3) from dual"))
+    say("drop", blk(mut &a, &"drop function f"))
+    say("grants after drop", q1(mut &sa, &"select grantee, table_name, privilege from dba_tab_privs where owner = 'U1' and table_name in ('F', 'RD', 'PR') order by 1, 2"))
+    say("recreate", blk(mut &a, &"create function f (a number) return number is begin return a * 4; end;"))
+    say("recreated not granted", q1(mut &c, &"select u1.f(3) from dual"))
+    c.logoff()
+    b.logoff()
+    a.logoff()
+    sa.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

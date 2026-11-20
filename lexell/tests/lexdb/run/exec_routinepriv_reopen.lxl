@@ -1,0 +1,132 @@
+// lexdb: privileges on routines across a store's reopen and a crash (design/lexdb-dialect-gaps.md, package F, slice F3). A
+// PostgreSQL function's PUBLIC EXECUTE revoked and granted to one role, a procedure granted to another, a T-SQL procedure
+// granted: the store is closed and opened again, then the disk crashes (what was not committed is gone) and it is opened
+// again: a role without the privilege is refused (42501, 229), one with it runs, the views show the same grants, and a
+// function dropped and made again starts with PostgreSQL's default (PUBLIC may run it) and none of the old grants.
+// expect: before: CREATE FUNCTION CREATE PROCEDURE REVOKE GRANT ok
+// expect: after reopen: 42501 | 2 | 7 | 42501 | 229 | ok
+// expect: views: lx_a f1 | 1 rows | 0
+// expect: after crash: 42501 | 2 | 229 | 7
+// expect: remade: 101 | 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_tsql"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, ","))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return e.state }
+    }
+}
+
+// A batch as the TDS door runs it: the rows of its result sets and its error numbers, as text.
+fn t(s: mut &lexdb_exec.Session, ts: mut &lexdb_tsql.State, sql: &str): str {
+    var f = lexdb_tsql.newFrame()
+    var ev: []lexdb_tsql.Event = []
+    lexdb_tsql.run(s, ts, sql, mut &f, mut &ev)
+    var out: []str = []
+    for e in ev {
+        if e.kind == lexdb_tsql.EV_ROWS {
+            for row in e.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, ","))
+            }
+        } else if e.kind == lexdb_tsql.EV_ERROR {
+            append(mut &out, e.number.toStr())
+        }
+    }
+    if len(out) == 0 { return "ok" }
+    return strings.join(&out, ";")
+}
+
+// What a role is told: as PostgreSQL's session, as the TDS door's (the role's session set up as its login).
+fn asRole(st: &lexdb_store.Store, role: &str, sql: &str): str {
+    var s = lexdb_exec.newSession(st.share())
+    s.setUser(role)
+    let r = q(mut &s, sql)
+    s.close()
+    return r
+}
+
+fn asTsql(st: &lexdb_store.Store, role: &str, sql: &str): str {
+    var s = lexdb_exec.newSession(st.share())
+    s.setUser(role)
+    s.setDoor("tds")
+    var ts = lexdb_tsql.newState(53)
+    let r = t(mut &s, mut &ts, sql)
+    s.close()
+    return r
+}
+
+fn main() {
+    var fs = lexdb_disk.sim(62)
+    var crashed = fs.share()
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        var ts = lexdb_tsql.newState(54)
+        let a = q(mut &s, &"create role lx_a login")
+        let b = q(mut &s, &"create role lx_b login")
+        let f = q(mut &s, &"create function f1(a int) returns int language sql as $$ select a + 1 $$")
+        let p = q(mut &s, &"create procedure p1(a int) language sql as $$ select a $$")
+        let r = q(mut &s, &"revoke execute on function f1(int) from public")
+        let g1 = q(mut &s, &"grant execute on function f1(int) to lx_a")
+        let r2 = q(mut &s, &"revoke execute on procedure p1(int) from public")
+        let g2 = q(mut &s, &"grant execute on procedure p1(int) to lx_b")
+        var s2 = lexdb_exec.newSession(st.share())
+        s2.setDoor("tds")
+        let x1 = t(mut &s2, mut &ts, &"CREATE PROCEDURE t_p AS SELECT 7 AS seven")
+        let x2 = t(mut &s2, mut &ts, &"GRANT EXECUTE ON t_p TO lx_a")
+        println("before: " + f + " " + p + " " + r + " " + g1 + " " + (if g2 == "GRANT" && r2 == "REVOKE" && x1 == "ok" && x2 == "ok" { "ok" } else { g2 + x1 + x2 }))
+        return 0
+    }).unwrap()
+
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        let b1 = asRole(&st, "lx_b", &"select f1(1)")
+        let a1 = asRole(&st, "lx_a", &"select f1(1)")
+        let a2 = asTsql(&st, "lx_a", &"EXEC t_p")
+        let b2 = asRole(&st, "lx_b", &"call p1(3)")
+        let b3 = asTsql(&st, "lx_b", &"EXEC t_p")
+        let a3 = asRole(&st, "lx_a", &"call p1(3)")
+        println("after reopen: " + b1 + " | " + a1 + " | " + a2 + " | " + a3 + " | " + b3 + " | " + (if b2 == "CALL" || b2 == "3" { "ok" } else { b2 }))
+        var s = lexdb_exec.newSession(st.share())
+        println("views: " + q(mut &s, &"select grantee || ' ' || routine_name from information_schema.routine_privileges where grantee = 'lx_a'") + " | " +
+                q(mut &s, &"select count(*) || ' rows' from information_schema.routine_privileges where grantee = 'lx_b'") + " | " +
+                q(mut &s, &"select count(*) from information_schema.routine_privileges where grantee = 'PUBLIC' and routine_name = 'f1'"))
+        s.close()
+        crashed = fs.crash(5)
+        return 0
+    }).unwrap()
+    lexdb_store.run(crashed.share(), opts(), fn(st: lexdb_store.Store): int {
+        let b1 = asRole(&st, "lx_b", &"select f1(1)")
+        let a1 = asRole(&st, "lx_a", &"select f1(1)")
+        let b3 = asTsql(&st, "lx_b", &"EXEC t_p")
+        let a2 = asTsql(&st, "lx_a", &"EXEC t_p")
+        println("after crash: " + b1 + " | " + a1 + " | " + b3 + " | " + a2)
+        var s = lexdb_exec.newSession(st.share())
+        let d = q(mut &s, &"drop function f1(int)")
+        let m = q(mut &s, &"create function f1(a int) returns int language sql as $$ select a + 100 $$")
+        let c = asRole(&st, "lx_a", &"select f1(1)")
+        println("remade: " + c + " | " + q(mut &s, &"select count(*) from information_schema.routine_privileges where grantee = 'lx_a' and routine_name = 'f1'"))
+        s.close()
+        return 0
+    }).unwrap()
+}

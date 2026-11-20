@@ -1,0 +1,90 @@
+# Set-returning SQL functions, compared with PostgreSQL (tests/lexdb/gen_pg.py routinesrf). Run as a superuser.
+drop role if exists lx_alice
+create table t (id int primary key, v int, g text)
+insert into t values (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, 40, 'b')
+create function ids() returns setof int language sql as $$ select id from t order by id $$
+create function big(minv int) returns table (id int, v int) language sql as $$ select id, v from t where v >= minv $$
+create function two(a int) returns table (x int, y text) language sql as $$ select a, 'p' union all select a + 1, 'q' $$
+create function grp(gg text, out total int, out n bigint) returns setof record language sql as $$ select sum(v)::int, count(*) from t where g = gg $$
+create function one(a int) returns table (x int) language sql as $$ select a * 10 $$
+create function lit() returns setof text language sql as $$ values ('x'), ('y') $$
+create function inc(a int default 1, b int default 100) returns table (s int) language sql as $$ select a + b $$
+select * from ids()
+select ids from ids()
+select * from ids() as i
+select * from ids() as i(n)
+select n from ids() as i(n) where n > 2
+select * from big(25)
+select * from big(25) order by id desc
+select id from big(15) where v < 40
+select count(*), sum(v) from big(0)
+select b.id, t.g from big(15) b join t on t.id = b.id order by b.id
+select t.g, count(*) from t join big(15) b on b.id = t.id group by t.g order by t.g
+select * from two(1)
+select * from two(1) as q(a, b)
+select x from two(5) where y = 'q'
+select * from grp('a')
+select total from grp('b')
+select * from one(4)
+select * from lit()
+select lit from lit()
+select * from inc()
+select * from inc(5)
+select * from inc(b => 7)
+select * from ids() where ids = 3
+select * from ids() i join big(0) b on b.id = i.i order by 1
+select * from ids() i, big(0) b where b.id = i order by 1
+select (select count(*) from big(t.v)) from t order by id
+select t.id, b.id from t, big(t.v) b order by t.id, b.id
+select t.id, b.id from t cross join lateral big(t.v) b where b.id < 3 order by t.id, b.id
+select t.id, x.s from t, inc(t.v, 1) x order by t.id
+select * from big(1, 2)
+select * from big()
+select * from nothing()
+select * from big('x')
+select 1 where 3 in (select * from ids())
+select id from t where id in (select id from big(20)) order by id
+select * from (select * from big(15)) q where q.v > 20
+with c as (select * from big(15)) select count(*) from c
+select * from ids() union all select * from ids() order by 1
+create function bad1() returns setof int language sql as $$ select id, v from t $$
+create function bad2() returns table (a int, b int) language sql as $$ select 1 $$
+create function w() returns setof int language sql as $$ select 1 $$
+create or replace function w() returns int language sql as $$ select 1 $$
+select proname, proretset, prorettype::regtype, proargnames, proargmodes from pg_proc where proname in ('ids', 'big', 'two', 'grp', 'one', 'lit', 'inc') order by proname
+select replace(pg_get_functiondef('ids'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('big'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('grp'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('inc'::regproc), chr(10), '~')
+select pg_get_function_arguments('inc'::regproc), pg_get_function_result('inc'::regproc), pg_get_function_identity_arguments('inc'::regproc)
+select pg_get_function_arguments('big'::regproc), pg_get_function_result('big'::regproc), pg_get_function_identity_arguments('big'::regproc)
+select pg_get_function_arguments('grp'::regproc), pg_get_function_result('grp'::regproc), pg_get_function_identity_arguments('grp'::regproc)
+select pg_get_function_result('ids'::regproc), pg_get_function_result('lit'::regproc)
+create function f1(a int, b text default 'x') returns int language sql immutable strict as $$ select a $$
+create function f2(a int) returns int language sql stable as $$ select a $$
+create function f3() returns int language sql return 5
+create procedure p1(a int, inout b int, out c text) language sql as $$ select a + b, 'z' $$
+create procedure p2() language sql as $$ select 1 $$
+select replace(pg_get_functiondef('f1'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('f2'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('f3'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('p1'::regproc), chr(10), '~')
+select replace(pg_get_functiondef('p2'::regproc), chr(10), '~')
+select pg_get_function_arguments('p1'::regproc), pg_get_function_identity_arguments('p1'::regproc)
+select replace(pg_get_functiondef(oid), chr(10), '~') from pg_proc where proname = 'one'
+select replace(pg_get_functiondef(0), chr(10), '~')
+select routine_name, routine_type, data_type, type_udt_name, routine_body, external_language, is_deterministic, is_null_call, security_type, sql_data_access from information_schema.routines where routine_schema = 'public' order by routine_name
+select routine_name, routine_definition from information_schema.routines where routine_schema = 'public' and routine_name in ('ids', 'f1', 'f3') order by routine_name
+select routine_name, specific_schema, routine_catalog = specific_catalog, character_maximum_length, numeric_precision, dtd_identifier from information_schema.routines where routine_schema = 'public' and routine_name in ('f1', 'one') order by routine_name
+select specific_name = routine_name || '_' || (select oid::text from pg_proc where proname = routine_name), routine_name from information_schema.routines where routine_schema = 'public' and routine_name in ('ids', 'f1') order by routine_name
+select r.routine_name, p.ordinal_position, p.parameter_mode, p.is_result, p.parameter_name, p.data_type, p.udt_name, p.parameter_default from information_schema.parameters p join information_schema.routines r on r.specific_name = p.specific_name where r.routine_schema = 'public' order by r.routine_name, p.ordinal_position
+select substr(specific_name, 1, position('_' in specific_name) - 1) as r, parameter_name, ordinal_position, parameter_mode from information_schema.parameters where specific_schema = 'public' and parameter_mode <> 'IN' order by 1, ordinal_position
+create role lx_alice login
+revoke execute on function f1(int, text) from public
+set role lx_alice
+select routine_name from information_schema.routines where routine_schema = 'public' and routine_name in ('f1', 'f2') order by 1
+select count(*) from information_schema.parameters where specific_schema = 'public' and parameter_name = 'a'
+reset role
+drop function ids()
+select count(*) from information_schema.routines where routine_name = 'ids'
+select * from ids()
