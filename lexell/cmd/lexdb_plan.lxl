@@ -2407,7 +2407,6 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     }
     var order: []int = []
     var flags: []bool = []
-    var grps: []int = array(nl, 0)
     var bestCost = 0.0f
     // the rows of a set, as needed (2^n sets past JOIN_EXACT_MAX is too many
     // to list: optimizer 30)
@@ -2417,14 +2416,6 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         var cost: []float = array(full + 1, -1.0f)
         var last: []int = array(full + 1, -1)
         var lastOnce: []bool = array(full + 1, false)
-        // build groups (optimizer 49): per set, its last step's members
-        // (each + 1, 4 bits a member; 0 one table)
-        var gs = GrpSearch{on: false, eqAdj: [], bad: 0, bytes: [], force: bushy == BU_FORCE}
-        if bushy != BU_OFF && !lookups && nl >= 3 {
-            gs = q.grpSearch(&cs, &masks, nl)
-            gs.force = bushy == BU_FORCE
-        }
-        var lastGrp: []int = if gs.on { array(full + 1, 0) } else { [] }
         for k in 0..nl {
             cost[1 << k] = base[k].cost
             last[1 << k] = k
@@ -2446,73 +2437,22 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
                     cost[next] = total
                     last[next] = k
                     lastOnce[next] = o
-                    if gs.on { lastGrp[next] = 0 }
-                }
-            }
-            // a build group at once: a hub linked to the set, one or two
-            // members, each linked to the hub or the member before by an
-            // equality
-            if gs.on && mask != 0 && mask != full {
-                for h in 0..nl {
-                    if (mask & (1 << h)) != 0 || (adj[h] & mask) == 0 || (gs.bad & (1 << h)) != 0 { continue }
-                    for a in 0..nl {
-                        if a == h || ((mask | gs.bad) & (1 << a)) != 0 || (gs.eqAdj[a] & (1 << h)) == 0 { continue }
-                        for b0 in 0..nl + 1 {
-                            // (b0 nl: no second member)
-                            let b = if b0 == nl { -1 } else { b0 }
-                            if b >= 0 && (b == h || b == a || ((mask | gs.bad) & (1 << b)) != 0 || (gs.eqAdj[b] & ((1 << h) | (1 << a))) == 0) { continue }
-                            let g = (1 << h) | (1 << a) | (if b >= 0 { 1 << b } else { 0 })
-                            if ((gs.eqAdj[h] | gs.eqAdj[a] | (if b >= 0 { gs.eqAdj[b] } else { 0 })) & mask) == 0 { continue }
-                            let c = q.grpCost(h, a, b, mask, nl, &base, &cmask, &cdist, mut &memo, cap, &gs.bytes, gs.force)
-                            if c < 0.0f { continue }
-                            let next = mask | g
-                            let total = cost[mask] + (if gs.force { c * 0.000001f } else { c })
-                            if cost[next] < 0.0f || total < cost[next] {
-                                cost[next] = total
-                                last[next] = h
-                                lastOnce[next] = true
-                                lastGrp[next] = (a + 1) | (if b >= 0 { (b + 1) << 4 } else { 0 })
-                            }
-                        }
-                    }
                 }
             }
         }
         bestCost = cost[full]
         var rev: []int = []
         var revOnce: []bool = []
-        var revGrp: []int = []
         var m = full
         while m != 0 {
             let k = last[m]
-            let lg = if gs.on { lastGrp[m] } else { 0 }
-            if lg != 0 {
-                // the members (in reverse), then the hub
-                let a = (lg & 15) - 1
-                let b = (lg >> 4) - 1
-                if b >= 0 {
-                    append(mut &rev, b)
-                    append(mut &revOnce, true)
-                    append(mut &revGrp, 0)
-                }
-                append(mut &rev, a)
-                append(mut &revOnce, true)
-                append(mut &revGrp, 0)
-                append(mut &rev, k)
-                append(mut &revOnce, true)
-                append(mut &revGrp, if b >= 0 { 2 } else { 1 })
-                m = m & ~((1 << k) | (1 << a) | (if b >= 0 { 1 << b } else { 0 }))
-                continue
-            }
             append(mut &rev, k)
             append(mut &revOnce, lastOnce[m] && (m & ~(1 << k)) != 0)
-            append(mut &revGrp, 0)
             m = m & ~(1 << k)
         }
         for i in 0..nl {
             append(mut &order, rev[nl - 1 - i])
             append(mut &flags, revOnce[nl - 1 - i])
-            grps[i] = revGrp[nl - 1 - i]
         }
     } else {
         var starts: []int = []
@@ -2536,6 +2476,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     // full, not the LIMIT's share (a hash of one pinned row is no reason
     // against it).
     var sure = true
+    var ordered = false
     for k in 0..nl { if k != ordT && guessed[k] { sure = false } }
     if ordT >= 0 && sure && !q.constWay(ordT, &cands[ordT], &cs, ordCols) {
         var o2: []int = []
@@ -2549,8 +2490,15 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         if fmax(c2 - builds, 0.0f) * frac + builds < bestCost + sortCost {
             order = o2
             flags = f2
-            grps = array(nl, 0)
+            ordered = true
         }
+    }
+    // build groups (optimizer 49.3): runs of the order made one hash of a join
+    var grps: []int = array(nl, 0)
+    if bushy != BU_OFF && !lookups && !ordered && nl >= 3 {
+        var gs = q.grpSearch(&cs, &masks, nl)
+        gs.force = bushy == BU_FORCE
+        if gs.on { q.grpPass(&order, mut &flags, mut &grps, &gs, nl, &cands, &owns, &base, &cmask, &cdist, mut &memo, cap) }
     }
     var ident = true
     for i in 0..nl {
@@ -2561,6 +2509,86 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     if ident { perm = [] }
     grp = grps
     return true
+}
+
+// Build groups over the order chosen (optimizer 49.3): a run of it, a hub
+// at place i and the one or two tables after it as its members, costed as
+// one hash of their join (grpCost) against the steps the order takes for
+// them (each step depends on the set before it and the table only, so the
+// steps after the run cost the same); the runs that gain most, not
+// overlapping, while the plan with them costs under GRP_GAIN of the
+// order's. Under BU_FORCE every valid run, first come first taken. The
+// members are linked to the hub or the member before by an equality, the
+// group to the tables before by one, no conjunct that may fail reads one
+// of them with another table (GrpSearch.bad).
+fn (q: &Query) grpPass(order: &[]int, flags: mut &[]bool, grps: mut &[]int, gs: &GrpSearch, nl: int, cands: &[][]WayCand, owns: &[][]Expr,
+                       base: &[]Way, cmask: &[]int, cdist: &[]float, memo: mut &Map[int, float], cap: float) {
+    // each place's step (the set before it, the table)
+    var steps: []float = array(nl, 0.0f)
+    var befores: []int = array(nl, 0)
+    var total = base[order[0]].cost
+    var mask = 1 << order[0]
+    for i in 1..nl {
+        let k = order[i]
+        befores[i] = mask
+        var o = false
+        let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
+        let rnext = q.setRows(mask | (1 << k), nl, base, cmask, cdist, memo)
+        steps[i] = q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, false, cap, mut &o)
+        total += steps[i]
+        mask = mask | (1 << k)
+    }
+    // the runs that gain: hub place, members, gain
+    var at: []int = []
+    var ms: []int = []
+    var gains: []float = []
+    for i in 1..nl - 1 {
+        let h = order[i]
+        let pre = befores[i]
+        if (gs.bad & (1 << h)) != 0 { continue }
+        var g = 1 << h
+        var link = gs.eqAdj[h]
+        var removed = steps[i]
+        for m in 1..GRP_MAX + 1 {
+            if i + m >= nl { break }
+            let x = order[i + m]
+            if (gs.bad & (1 << x)) != 0 || (gs.eqAdj[x] & g) == 0 { break }
+            g = g | (1 << x)
+            link = link | gs.eqAdj[x]
+            removed += steps[i + m]
+            if (link & pre) == 0 { continue }
+            let c = q.grpCost(h, order[i + 1], if m == 2 { order[i + 2] } else { -1 }, pre, nl, base, cmask, cdist, memo, cap, &gs.bytes, gs.force)
+            if c < 0.0f || (!gs.force && c >= removed) { continue }
+            append(mut &at, i)
+            append(mut &ms, m)
+            append(mut &gains, removed - c)
+        }
+    }
+    // the largest gains first (BU_FORCE: in order), none overlapping
+    var taken: []bool = array(len(at), false)
+    var used: []bool = array(nl, false)
+    var picked: []int = []
+    var gain = 0.0f
+    while true {
+        var b = -1
+        for x in 0..len(at) {
+            if taken[x] { continue }
+            var free = true
+            for p in at[x]..at[x] + ms[x] + 1 { if used[p] { free = false } }
+            if !free { continue }
+            if b < 0 || (!gs.force && gains[x] > gains[b]) { b = x }
+        }
+        if b < 0 { break }
+        taken[b] = true
+        for p in at[b]..at[b] + ms[b] + 1 { used[p] = true }
+        append(mut &picked, b)
+        gain += gains[b]
+    }
+    if len(picked) == 0 || (!gs.force && !(total - gain < GRP_GAIN * total)) { return }
+    for b in picked {
+        grps[at[b]] = ms[b]
+        for p in at[b]..at[b] + ms[b] + 1 { flags[p] = true }
+    }
 }
 
 // What the exact search needs for build groups (optimizer 49): per level
@@ -2620,11 +2648,11 @@ fn (q: &Query) grpCost(h: int, a: int, b: int, mask: int, nl: int, base: &[]Way,
     let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
     var pre = 1 << h
     var r = q.setRows(pre, nl, base, cmask, cdist, memo)
-    var c = base[h].cost
+    var c = base[h].inner
     var rb = bytes[h]
     // left-deep: the hub hashed (its read as the group's), then each member
     var lr = q.setRows(mask | pre, nl, base, cmask, cdist, memo)
-    var ld = base[h].cost + base[h].rows * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
+    var ld = base[h].inner + base[h].rows * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
     for i in 0..2 {
         let m = if i == 0 { a } else { b }
         if m < 0 { break }
@@ -5785,11 +5813,18 @@ fn joinScan(q: &Query, k: int): PScan {
 
 pub const GRP_MAX: int = 2      // a group's members at most
 
+// A plan with build groups is taken when it costs under this share of the
+// best left-deep plan (optimizer 49.3): a group's rows are a join's
+// estimate and its build reads its hub whole, so a near-tie keeps the
+// left-deep order (q5's and q8's (nation, region) groups gain under 4% in
+// the model, where reduceHashes already narrows the left-deep hashes).
+pub const GRP_GAIN: float = 0.9f
+
 pub const BU_OFF: int = 0       // left-deep orders only
 pub const BU_COST: int = 1      // a build group where it costs less (the default)
 pub const BU_FORCE: int = 2     // a build group wherever one is valid (tests)
 
-var bushyMode: int = BU_OFF
+var bushyMode: int = BU_COST
 
 // The build groups' switch (tests and measuring): BU_*.
 pub fn setBushy(mode: int) { bushyMode = mode }
