@@ -3435,3 +3435,102 @@ compare against). `lexdb_plan.setRewrites(mode)` (bits `RW_OUTER`,
 `RW_PUSH`; both by default) switches each off in process, for the tests
 (each query run with the rewrite and without, the results compared) and
 for measuring.
+
+### 48.5 As built (2026-11-20)
+
+Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6: 58a1a69b
+(this design), 40a2abaa (outer to inner), 44ed7088 (pushdown), a8c6c5e9
+(the CTE count moved to the statement's end). All in `lexdb_plan` (a
+section before `planFrom`: `innerJoins`, `rejectsNulls`, `nullOn`,
+`rejectedAbove`; `pushDown`, `pushable`, `outAst`, `toOuts`, `fillOuts`,
+`intoQuery`, `unpushable`; `setRewrites`), the CTE count in `lexdb_parse`
+(`markCtes`, `Stmt.cteOnce`), exec's glue in `bindFrom` (WHERE as written
+and the views' queries into `FromBound`): `lexdb_exec` 19,687 -> 19,694
+lines, `lexdb_plan` 5,496 -> 5,898.
+
+Choices made while building:
+
+- **A conjunct's two forms.** `pushDown` reads WHERE as written
+  (`FromBound.whereAst`, split by `conjuncts` like the resolved one) to
+  write the pushed filter, and the resolved conjunct to decide (its level
+  mask, its volatility); the two lists must have the same length, else
+  nothing is pushed. A column is mapped by resolving its name alone
+  (`lexdb_bind.resolveName` over the query's columns), so an unqualified
+  name works as in WHERE. Re-resolving the binder's output was not an
+  option: `resolve` adds casts, collation keys and argument-type hints and
+  is not idempotent.
+- **Nested queries** need nothing more: the derived query planned again
+  runs its own `planFrom`, which pushes the filter on into its own derived
+  levels (a view over a view, a CTE read by a CTE, a derived table in a
+  derived table).
+- **The CTE count** is the statement's: `markCtes` walks it once its
+  subqueries are in it, only when it has a CTE; a WITH's own parse of a
+  body (a check) is not kept, so not counted.
+- **exec_held** (the held rows of derived tables cut into batches) turns
+  pushdown off: its filters would otherwise go into the derived queries
+  and its counts and its memory error would test something else.
+
+### 48.6 Plans before and after
+
+`exec_rewrite`'s EXPLAIN ANALYZE (tables of 40, 60 and 50 rows; `t` 3,000
+rows, `u` 200), without the rewrites and with them:
+
+| query | before | after |
+|---|---|---|
+| `a LEFT JOIN b ON b.aid = a.id WHERE b.v > 3` | scan b (60 kept 60); right join a: hash (40 rows read), 10 unmatched rows made | scan b (60 kept 24); join a: primary key lookup per row (24) |
+| `a FULL JOIN b ON b.aid = a.id WHERE a.x > 2` | scan a (40 kept 40); full join b: hash on (aid) over b's 60 rows | scan a (40 kept 14); left join b: index b_aid lookup per row (14) |
+| `a LEFT JOIN b ... LEFT JOIN c ON c.bid = b.id WHERE c.z > 1` | scan a; left join b by index (40 lookups); left join c: hash (50 rows) | scan c (50 kept 21); join b: primary key lookup (21); join a: primary key lookup (21) |
+| `v1 WHERE id = 5` (v1: an expression over t) | t: full scan (3,000 rows held, 1 kept) | t: primary key lookup (1 row) |
+| `v2 WHERE g = 3` (v2: t grouped by g) | t: full scan, 3,000 rows aggregated, 10 groups held, 1 kept | t: full scan, 300 rows kept and aggregated, 1 group held |
+| `v3 WHERE id < 30` (v3: t UNION ALL u) | part 1: index t_k range (610 rows), part 2: u full scan (200); 755 held, 38 kept | part 1: primary key range (30 rows), part 2: primary key range (30); 38 held |
+| `v4 WHERE id = 5` (v4: ORDER BY id LIMIT 100) | 100 rows held, 1 kept | unchanged (LIMIT) |
+| `u LEFT JOIN v1 ON v1.id = u.id WHERE v1.k > 40` | left join v1: hash over 3,000 held rows | join v1: hash over 499 rows (v1's query by index t_k, switched to a scan) |
+| `WITH c AS (SELECT id, k FROM t) SELECT * FROM c WHERE id = 5` | t: full scan, 3,000 held | t: primary key lookup |
+
+### 48.7 Measured
+
+`design/experiments/rewrite_bench.lxl`: `big` 200,000 rows (indexes on
+`k` and `g`), `small` 1,000 rows (index on `label`), settled; in process,
+`-O`, `taskset -c 6`, the median of 9 runs, base (main cbd664a6) and
+branch alternated twice, microseconds:
+
+| query | before | after | plan after |
+|---|---:|---:|---|
+| `SELECT * FROM vbig WHERE id = 12345` (a view of big) | 45,566-47,084 | 40-43 | big by its primary key |
+| `SELECT * FROM vagg WHERE g = 77` (big grouped by g) | 5,568-5,642 | 176-179 | big by `big_g` (200 rows), one group |
+| `SELECT count(*), max(b.id) FROM big b LEFT JOIN small s ON s.id = b.k WHERE s.label = 'x'` | 9,916-9,952 | 93-94 | small by `small_label` (1 row), then big by `big_k` (200 rows): reordered |
+
+The view's 40 microseconds include planning it twice (the first plan is
+thrown away, 48.1).
+
+**TPC-H** (SF1, `-O`, `TPCH_ONLY=lexdb`, base and branch alternated
+twice, `~/tpch-w/q5/logs`): all 22 plans identical (EXPLAIN of each
+query, base against branch), checksums equal, total 12,683 / 12,687 and
+12,601 / 12,598 ms (base / branch per round); no query more than 3.4%
+slower in a round, none slower in both by more than 2.1% (q20, which the
+rewrites do not touch). Neither rewrite applies to TPC-H as written:
+
+- **q13**: its LEFT JOIN's filter (`o_comment NOT LIKE ...`) is in ON, and
+  nothing above the join reads `orders`' columns (the outer query groups
+  the derived table's counts, with no WHERE): the join stays LEFT, as it
+  must (customers without orders count as 0).
+- **q15**: the view `revenue0`'s conjuncts are a join (`s_suppkey =
+  supplier_no`, two levels) and `total_revenue = (SELECT max(...) FROM
+  revenue0)`, which has a subquery: neither is pushed. PostgreSQL does not
+  push a qual with a subquery either. (Into the view's HAVING it would be
+  valid, an uncorrelated scalar being one value; left.)
+- No other query has a derived table with a WHERE on it, or an outer
+  join.
+
+**Point selects** (Q3's gate: 20,000 primary-key selects through
+`Session.exec` in process, `pts.lxl`, `-O`, `perf stat -e instructions:u
+taskset -c 6`, base main cbd664a6 and branch alternated, about 187k
+instructions a statement): branch at a8c6c5e9 against base in six rounds
++0.08%, +0.04%, +0.08%, -0.01%, +0.09%, +0.03% (mean +0.05%, under the
+0.15% spread); slice 1 alone -0.03%, -0.02%. The first build of slice 2
+kept the CTE counts in the parser's state (a per-parse array): +0.10%,
+moved to the statement's end in a8c6c5e9. Variants without `bindFrom`'s
+glue and without `Stmt.cteOnce` measured the same as the branch, so what
+remains is in `lexdb_plan` (the larger `FromBound`, two tests in
+`planFrom`, or code placement), not found by these variants.
+
