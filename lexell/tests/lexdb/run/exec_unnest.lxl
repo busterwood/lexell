@@ -10,6 +10,14 @@
 //   text key, a numeric against integers, after a join, inside another
 //   subquery, under an aggregate, ORDER BY and LIMIT, errors (in a later
 //   batch, in x, inside the subquery, after it: those stay per row).
+// - mark (5b): EXISTS and IN under OR, NOT, CASE and IS NULL in WHERE
+//   (hashed as planned, or planned again by cost; two in one conjunct;
+//   before and after other conjuncts, one that may fail), in the select
+//   list and ORDER BY (with LIMIT, DISTINCT, after a join and a LEFT
+//   JOIN), NULLs, an empty subquery, a text key, under an aggregate;
+//   those that stay as they were: a key that may fail, LIMIT inside, a
+//   select list's subquery looked up by an index, a grouped query's.
+// - EXPLAIN ANALYZE's counts with batches on and off.
 // timeout: 120
 // expect: create table t1 (id int primary key, a int, b text, c int, d numeric) -> CREATE TABLE
 // expect: insert into t1 select g, case when g % 23 = 0 then null else g % 50 end, case when g % 19 = 0 then null else 'b' || (g % 30) end, case when g % 29 = 0 then null else g % 40 end, (g % 7) * 1.5 from generate_series(1, 3000) g -> INSERT 0 3000
@@ -25,7 +33,10 @@
 // expect: notin: 27 queries, 27 the same, made yyyyyyyyyyyynynyyyyyynnnyyy, piped yyyyyyyyyyyynynnynyyynnnyyy
 // expect: notin in a transaction: 23 queries, 23 the same, made yyyynyyyyyyyyyyyynnnynn, piped yyyynyyyyyynynyyynnnynn
 // expect: in over an aggregate: 516|21786, the same: true
+// expect: mark: 34 queries, 34 the same, made yyyyyyyyyynyyyyyyyyyynyyyyynnyyyyy, piped yyyyyyyyyynyyyyyyyyynnyyyyynnyyyyy
 // expect: counts notin: same: true
+// expect: counts mark or: same: true
+// expect: counts mark select list: same: true
 // expect: counts notin uncorrelated: same: true
 // expect: plan notin: scan t1: full scan; anti join (null-aware) t2: hash on (v) over rows of subquery 1; aggregate; subquery 1 (in): anti join (null-aware), run once;   scan t2: full scan
 // expect: plan notin hashed: scan t1: full scan; anti join (null-aware) t3: hash on (k, v) over rows of subquery 1; aggregate; subquery 1 (in): anti join (null-aware) on t3.k = t1.c, run once;   scan t3: full scan
@@ -35,6 +46,13 @@
 // expect: plan notin error after it: scan t1: full scan; aggregate; subquery 1 (in): run once;   scan t3: full scan
 // expect: plan notin error inside: scan t1: full scan; aggregate; subquery 1 (in): per row, on t1.c;   scan t2: index t2k lookup, rows in key order
 // expect: plan notin limit inside: scan t1: full scan; aggregate; subquery 1 (in): per row, on t1.c;   scan t3: full scan;   order: sort
+// expect: plan mark or: scan t1: full scan; mark join t3: hash on (k, v) over rows of subquery 1, filter per row; aggregate; subquery 1 (in): mark join on t3.k = t1.c, run once;   scan t3: full scan
+// expect: plan mark by cost: scan t1: full scan; mark join t2: hash on (k) over rows of subquery 1, filter per row; aggregate; subquery 1 (exists): mark join on t2.k = t1.c, run once;   scan t2: full scan
+// expect: plan mark two: scan t1: full scan; mark join t3: hash on (k) over rows of subquery 1; mark join nn: hash on (k, v) over rows of subquery 2, filter per row; aggregate; subquery 1 (exists): mark join on t3.k = t1.c, run once;   scan t3: full scan; subquery 2 (in): mark join on nn.k = t1.c, run once;   scan nn: full scan
+// expect: plan mark select list: scan t1: primary key range; mark join t3: hash on (k, v) over rows of subquery 1; mark join t3: hash on (k, v) over rows of subquery 2; order: the scan's; subquery 1 (in): mark join on t3.k = t1.c, run once;   scan t3: full scan; subquery 2 (in): mark join on t3.k = t1.c, run once;   scan t3: full scan
+// expect: plan mark order by: scan t1: primary key range; mark join t3: hash on (k) over rows of subquery 1; order: sort; subquery 1 (exists): mark join on t3.k = t1.c, run once;   scan t3: full scan
+// expect: plan mark key may fail: scan t1: full scan; aggregate; subquery 1 (exists): hashed on t3.k = an outer expression;   scan t3: full scan
+// expect: plan mark grouped: scan t1: full scan; aggregate; order: sort; subquery 1 (exists): hashed on t3.k = t1.c;   scan t3: full scan
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -180,7 +198,48 @@ fn body(st: lexdb_store.Store): int {
     let ia = run(mut &s, &"select count(*), sum(a) from t1 where a in (select max(v) from t3 group by k)")
     let ib = run(mut &s, &"select count(*), sum(a) from t1 where a in (select max(v) from t3 group by k) or false")
     println("in over an aggregate: " + ia + ", the same: " + (ia == ib).toStr())
+    var gm = newGroup(&"mark", &"mark join")
+    let ms = [
+        "select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c)",
+        "select count(*), sum(a) from t1 where a = 3 or a in (select v from t3 where t3.k = t1.c)",
+        "select count(*) from t1 where (a in (select v from t3 where t3.k = t1.c)) is null",
+        "select count(*) from t1 where (a in (select v from t3 where t3.k = t1.c)) is not true",
+        "select count(*) from t1 where case when a > 10 then exists (select 1 from t3 where t3.k = t1.c) else b = 'b3' end",
+        "select count(*) from t1 where a = 3 or exists (select 1 from t2 where t2.k = t1.c)",
+        "select count(*) from t1 where a = 3 or a in (select v from t2 where t2.k = t1.c)",
+        "select count(*) from t1 where b = 'b1' or b in (select s from t3 where t3.k = t1.c)",
+        "select count(*) from t1 where exists (select 1 from t3 where t3.k = t1.c and t3.v > 40) or a in (select v from nn where nn.k = t1.c)",
+        "select count(*) from t1 where 1 / (id - 2500) > 0 or exists (select 1 from t3 where t3.k = t1.c)",
+        "select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c / (t1.id - 2500))",
+        "select c, count(*) from t1 where a < 5 or exists (select 1 from t3 where t3.k = t1.c and t3.v < 3) group by c order by c",
+        "select id from t1 where a < 2 or exists (select 1 from t3 where t3.k = t1.c and t3.v = 7) order by id limit 15",
+        "select count(*) from t1 join t3 on t3.id = t1.id where t1.a = 1 or exists (select 1 from nn where nn.k = t3.k and nn.v = t1.a)",
+        "select count(*) from t1 where not (exists (select 1 from t3 where t3.k = t1.c and t3.v > 20) and a > 5)",
+        "select count(*) from t1 where a = 3 or exists (select 1 from e where e.k = t1.c)",
+        "select count(*) from t1 where a = 3 or a in (select v from e where e.k = t1.c)",
+        "select count(*) from t1 where c > 30 and (a = 3 or exists (select 1 from t3 where t3.k = t1.c))",
+        "select count(*) from t1 where (a = 3 or exists (select 1 from t3 where t3.k = t1.c)) and c > 30",
+        "select count(*) from t1 where (a = 3 or exists (select 1 from t3 where t3.k = t1.c)) and 1 / (id - 2900) >= 0",
+        "select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c and t3.v / (t3.k - 5) > 1)",
+        "select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c order by v limit 1)",
+        "select id, exists (select 1 from t3 where t3.k = t1.c) from t1 where id < 100",
+        "select id, a in (select v from t3 where t3.k = t1.c), a not in (select v from t3 where t3.k = t1.c) from t1 where id < 200 order by id",
+        "select id, case when b in (select s from t3 where t3.k = t1.c) then 'y' else 'n' end from t1 order by id limit 50",
+        "select distinct exists (select 1 from t3 where t3.k = t1.c) from t1",
+        "select id from t1 where id < 300 order by exists (select 1 from t3 where t3.k = t1.c and t3.v > 30), id",
+        "select id, exists (select 1 from t2 where t2.k = t1.c) from t1 where id < 50",
+        "select c, count(*), exists (select 1 from t3 where t3.k = t1.c) from t1 group by c order by c",
+        "select id, a in (select v from nn where nn.k = t1.c) from t1 where a = 4 or exists (select 1 from t3 where t3.k = t1.c and t3.v = 1)",
+        "select id, exists (select 1 from t3 where t3.k = t1.c), 10 / (id - 2900) from t1",
+        "select t1.id, t3.id, exists (select 1 from nn where nn.k = t3.k and nn.v = t1.a) from t1 join t3 on t3.id = t1.id + 5 order by t1.id",
+        "select t1.id, (a in (select v from t3 where t3.k = t1.c)) is null from t1 left join nn on nn.id = t1.id where t1.id < 400 order by 1",
+        "select id, exists (select 1 from t3 where t3.k = t1.c) from t1 order by id limit 7",
+    ]
+    for x in ms { check(mut &s, mut &gm, &x) }
+    report(&gm)
     counts(mut &s, &"notin", &"select count(*) from t1 where a not in (select v from t3 where t3.k = t1.c)")
+    counts(mut &s, &"mark or", &"select count(*) from t1 where a = 3 or a in (select v from t3 where t3.k = t1.c)")
+    counts(mut &s, &"mark select list", &"select id, exists (select 1 from t3 where t3.k = t1.c) from t1 where id < 100")
     counts(mut &s, &"notin uncorrelated", &"select id from t1 where a not in (select v from nn) order by id")
     explain(mut &s, &"notin", &"select count(*) from t1 where a not in (select v from t2)")
     explain(mut &s, &"notin hashed", &"select count(*), sum(a) from t1 where a not in (select v from t3 where t3.k = t1.c)")
@@ -190,6 +249,13 @@ fn body(st: lexdb_store.Store): int {
     explain(mut &s, &"notin error after it", &"select count(*) from t1 where a not in (select v from t3) and 1 / (id - 2500) >= 0")
     explain(mut &s, &"notin error inside", &"select count(*) from t1 where a not in (select 10 / (v - 3) from t2 where t2.k = t1.c)")
     explain(mut &s, &"notin limit inside", &"select count(*) from t1 where a not in (select v from t3 where t3.k = t1.c order by v limit 2)")
+    explain(mut &s, &"mark or", &"select count(*), sum(a) from t1 where a = 3 or a in (select v from t3 where t3.k = t1.c)")
+    explain(mut &s, &"mark by cost", &"select count(*) from t1 where a = 3 or exists (select 1 from t2 where t2.k = t1.c)")
+    explain(mut &s, &"mark two", &"select count(*) from t1 where exists (select 1 from t3 where t3.k = t1.c and t3.v > 40) or a in (select v from nn where nn.k = t1.c)")
+    explain(mut &s, &"mark select list", &"select id, a in (select v from t3 where t3.k = t1.c), a not in (select v from t3 where t3.k = t1.c) from t1 where id < 200 order by id")
+    explain(mut &s, &"mark order by", &"select id from t1 where id < 300 order by exists (select 1 from t3 where t3.k = t1.c and t3.v > 30), id")
+    explain(mut &s, &"mark key may fail", &"select count(*) from t1 where a = 3 or exists (select 1 from t3 where t3.k = t1.c / (t1.id - 2500))")
+    explain(mut &s, &"mark grouped", &"select c, count(*), exists (select 1 from t3 where t3.k = t1.c) from t1 group by c order by c")
     return 0
 }
 
