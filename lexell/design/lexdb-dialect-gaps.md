@@ -119,7 +119,10 @@ and lexdb-batch-gaps.md section 2's rules (the same rules apply: results as
 the dialect gives them, tested through the door; never move an expectation
 to hide a regression; new code outside lexdb_exec where it can live
 elsewhere; native builds and tests; timings under the exclusive lock).
-The coordinator reviews each branch, runs the suite on the merged tree and
+Each agent edits, builds and tests only under its own worktree's path
+(the main checkout's compiler binary is the one file it uses from
+outside); an agent's stray edit to the main checkout broke main's build
+once (package E, caught and moved before any commit). The coordinator reviews each branch, runs the suite on the merged tree and
 TPC-H once alternated with the previous main (checksums equal), merges and
 pushes.
 
