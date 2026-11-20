@@ -21,6 +21,15 @@
   plan, the pipeline or exec (what needs the evaluator comes in its Up
   hooks), nor reads a transaction's SQL state (Txn.sql). Only lexdb_plan
   and lexdb_exec import it.
+- The planner lexdb_plan (layer 5, design/lexdb-layers.md 6.3, Q3) sits
+  above the binder, the statistics, the catalog and access, and below the
+  pipeline and exec: what needs the executor comes in its Up hook; from the
+  store it uses the Store and Txn handles only, and it never reads a
+  transaction's SQL state (Txn.sql). Only lexdb_pipe and lexdb_exec import
+  it.
+- The privileges lexdb_priv (roles, owners, grants, the checks) import only
+  the catalog, the store and the vocabulary below them; exec and the
+  protocol modules import them.
 - No cycle.
 
 Run by lexdb.py before the tests; also usable directly.
@@ -38,7 +47,7 @@ CORE = {
     "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
-    "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows", "lexdb_routine",
+    "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
 }
@@ -113,6 +122,28 @@ STATS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lex
                     "lexdb_access"}
 STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 
+# The planner (lexdb_plan, layer 5; design/lexdb-layers.md 6.3, Q3): the
+# plan structures, the physical plan, the path choice, the cost model and
+# the join order. It sits above the binder, the statistics, the catalog and
+# access, and below the pipeline and the executor: what needs the executor
+# (constant evaluation, the dialects' typing, a subquery planned again)
+# comes through its hook (lexdb_plan.Up). From the store it uses the Store
+# and Txn handles only. Only the pipeline and exec import it.
+PLAN = "lexdb_plan"
+PLAN_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_bind", "lexdb_stats", "lexdb_catalog", "lexdb_access", "lexdb_store",
+                   "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match"}
+PLAN_STORE_NAMES = {"Store", "Txn"}
+PLAN_USERS = {"lexdb_pipe", "lexdb_exec"}
+
+# Roles, owners and privileges (lexdb_priv, design/lexdb-layers.md 6.3, Q3):
+# the roles' and ACLs' catalog rows, who a session acts as and the checks.
+# It reads the catalog and the store's memo only; the statements that
+# change privileges and the catalog lookups stay in exec. Exec and the
+# protocol modules (the roles for authentication) import it.
+PRIV = "lexdb_priv"
+PRIV_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_store", "lexdb_catalog"}
+PRIV_USERS = {"lexdb_exec", "lexdb_wire", "lexdb_tds", "lexdb_tns"}
+
 # How rows are put in order (lexdb_sort, design/lexdb-layers.md 6.2.3, slice
 # P3): the sort keys the pipeline's Sort and the row engine share. Values and
 # their encodings only; only the pipeline and exec import it.
@@ -121,10 +152,11 @@ SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
 SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_window", "lexdb_pct"}
 
 # The aggregate accumulators (lexdb_agg, design/lexdb-batch-gaps.md item 3):
-# values and their orders only; the row engine and the pipeline import them.
+# values and their orders only; the row engine and the pipeline import them
+# (and the planner, for the aggregate spec type a plan holds).
 AGG = "lexdb_agg"
 AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct"}
-AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window"}
+AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window", "lexdb_plan"}
 
 # How a set operation combines its parts' rows (lexdb_setop, design/
 # lexdb-batch-gaps.md item 11): their keys and the streamed run, with the
@@ -145,10 +177,11 @@ HELD_USERS = {"lexdb_pipe"}
 # The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item
 # 10): the sort keys and the frame code of the row engine's windows. Values,
 # their orders and the aggregate spec type only (the engine evaluates what
-# needs its scope, through a hook); only exec imports it.
+# needs its scope, through a hook); only exec imports it (and the planner, for
+# the window plan type a Sel holds).
 WINDOW = "lexdb_window"
 WINDOW_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_sort", "lexdb_agg", "lexdb_access"}
-WINDOW_USERS = {"lexdb_exec"}
+WINDOW_USERS = {"lexdb_exec", "lexdb_plan"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).
@@ -215,6 +248,27 @@ def check():
     for m in sorted(mods):
         if STATS in mods[m] and m not in STATS_USERS:
             bad.append(f"{m} -> {STATS}: only {', '.join(sorted(STATS_USERS))} import the statistics")
+    for d in mods.get(PLAN, []):
+        if d not in PLAN_MAY_IMPORT:
+            bad.append(f"{PLAN} -> {d}: the planner imports above or beside its layer")
+    for m in sorted(mods):
+        if PLAN in mods[m] and m not in PLAN_USERS:
+            bad.append(f"{m} -> {PLAN}: only {', '.join(sorted(PLAN_USERS))} import the planner")
+    plan = os.path.join(CMD, PLAN + ".lxl")
+    if os.path.exists(plan):
+        with open(plan, encoding="utf-8") as f:
+            body = f.read()
+        names = set(re.findall(r"\blexdb_store\.([A-Za-z_][A-Za-z0-9_]*)", body)) - PLAN_STORE_NAMES
+        if names:
+            bad.append(f"{PLAN} uses lexdb_store beyond Store and Txn: " + ", ".join(sorted(names)))
+        if re.search(r"\.sql\.", body):
+            bad.append(f"{PLAN} reads a transaction's SQL state (Txn.sql)")
+    for d in mods.get(PRIV, []):
+        if d not in PRIV_MAY_IMPORT:
+            bad.append(f"{PRIV} -> {d}: the privileges import above their layer")
+    for m in sorted(mods):
+        if PRIV in mods[m] and m not in PRIV_USERS:
+            bad.append(f"{m} -> {PRIV}: only {', '.join(sorted(PRIV_USERS))} import the privileges")
     for d in mods.get(SORT, []):
         if d not in SORT_MAY_IMPORT:
             bad.append(f"{SORT} -> {d}: the sort keys import above their layer")

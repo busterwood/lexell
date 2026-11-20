@@ -34,23 +34,6 @@ pub fn anyGen(cols: &[]ColDef): bool {
     return false
 }
 
-// Whether x gives the same value for the same row whenever it is computed: no clock, session, random or sequence function
-// (lexdb_bind.immutableName), and none of the Oracle names that are volatile.
-pub fn immutable(x: &Expr): bool {
-    match x {
-        Expr.Call(n, args, _) {
-            if !lexdb_bind.immutableName(&n) { return false }
-            for a in args { if !immutable(&a) { return false } }
-            return true
-        }
-        Expr.Unary(_, a) { return immutable(&a) }
-        Expr.Bin(_, a, b) { return immutable(&a) && immutable(&b) }
-        Expr.IsNull(a, _) { return immutable(&a) }
-        Expr.Cast(a, _) { return immutable(&a) }
-        else { return true }
-    }
-}
-
 // Whether x holds a subquery's call.
 pub fn hasSub(x: &Expr): bool {
     match x {
@@ -63,21 +46,6 @@ pub fn hasSub(x: &Expr): bool {
         Expr.Bin(_, a, b) { return hasSub(&a) || hasSub(&b) }
         Expr.IsNull(a, _) { return hasSub(&a) }
         Expr.Cast(a, _) { return hasSub(&a) }
-        else { return false }
-    }
-}
-
-pub fn hasAgg(x: &Expr): bool {
-    match x {
-        Expr.Call(name, args, _) {
-            if lexdb_bind.isAgg(&name) { return true }
-            for a in args { if hasAgg(&a) { return true } }
-            return false
-        }
-        Expr.Unary(_, a) { return hasAgg(&a) }
-        Expr.Bin(_, a, b) { return hasAgg(&a) || hasAgg(&b) }
-        Expr.IsNull(a, _) { return hasAgg(&a) }
-        Expr.Cast(a, _) { return hasAgg(&a) }
         else { return false }
     }
 }
@@ -109,7 +77,7 @@ pub type Problem = record { pub kind: str; pub name: str }
 
 pub fn problem(x: &Expr, cols: &[]ColDef, self: int): Problem {
     if hasSub(x) { return Problem{kind: "sub", name: ""} }
-    if hasAgg(x) { return Problem{kind: "agg", name: ""} }
+    if lexdb_bind.hasAgg(x) { return Problem{kind: "agg", name: ""} }
     var ns: []str = []
     lexdb_sql.colNames(x, mut &ns)
     for n in ns {
@@ -118,7 +86,7 @@ pub fn problem(x: &Expr, cols: &[]ColDef, self: int): Problem {
         if at < 0 { return Problem{kind: "col", name: n} }
         if at == self || cols[at].genKind != lexdb_sql.GEN_NONE { return Problem{kind: "gen", name: n} }
     }
-    if !immutable(x) { return Problem{kind: "vol", name: ""} }
+    if !lexdb_bind.immutable(x) { return Problem{kind: "vol", name: ""} }
     return Problem{kind: "", name: ""}
 }
 
@@ -269,4 +237,37 @@ pub fn tsqlType(x: &Expr, cols: &[]ColDef): Option[lexdb_sql.TypeName] {
         }
         else { return None }
     }
+}
+
+// A write's value for generated column i (isDef: the DEFAULT keyword; insert: an INSERT's, else an UPDATE's assignment):
+// refused, as the dialect refuses it (PostgreSQL and Oracle take DEFAULT).
+pub fn checkWrite(cols: &[]ColDef, i: int, isDef: bool, md: int, insert: bool): Result[Unit, DbErr] {
+    if cols[i].genKind == lexdb_sql.GEN_NONE || (isDef && md != lexdb_sql.MD_TSQL) { return Ok(Unit{}) }
+    return Err(writeErr(md, &cols[i].name, insert))
+}
+
+// A constraint on a generated column that is not stored, where the dialect refuses it: SQL Server's CHECK and FOREIGN KEY need
+// the computed column persisted (8183); PostgreSQL's virtual columns take no unique nor foreign key.
+pub fn checkConstraint(cols: &[]ColDef, c: &lexdb_sql.Constraint, md: int): Result[Unit, DbErr] {
+    if md == lexdb_sql.MD_ORA || !anyGen(cols) { return Ok(Unit{}) }
+    var names: []str = []
+    if c.kind == lexdb_sql.C_CHECK {
+        match c.expr { Some(x) { lexdb_sql.colNames(&x, mut &names) } None {} }
+    } else {
+        for n in c.cols { append(mut &names, n.clone()) }
+    }
+    for n in names {
+        let i = lexdb_bind.colIndex(cols, &n)
+        if i < 0 || cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
+        if md == lexdb_sql.MD_TSQL {
+            if c.kind == lexdb_sql.C_CHECK || c.kind == lexdb_sql.C_FOREIGN {
+                return Err(err("TS8183", "Only UNIQUE or PRIMARY KEY constraints can be created on computed columns, while CHECK, FOREIGN KEY, and NOT NULL constraints require that computed columns be persisted."))
+            }
+        } else if c.kind == lexdb_sql.C_UNIQUE {
+            return Err(err("0A000", "unique constraints on virtual generated columns are not supported"))
+        } else if c.kind == lexdb_sql.C_FOREIGN {
+            return Err(err("0A000", "foreign key constraints on virtual generated columns are not supported"))
+        }
+    }
+    return Ok(Unit{})
 }

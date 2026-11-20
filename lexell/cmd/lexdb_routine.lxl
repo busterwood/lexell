@@ -266,7 +266,7 @@ pub fn slots(r: &Routine, nargs: int, names: &[]str): Option[[]int] {
 }
 
 // Whether a value's kind is the kind of a parameter's type (the overload that fits the arguments best).
-pub fn kindFits(v: &Val, t: &TypeName): bool {
+fn kindFits(v: &Val, t: &TypeName): bool {
     match v {
         Val.Int(_) { return t.kind == lexdb_sql.K_INT }
         Val.Text(_) { return t.kind == lexdb_sql.K_TEXT }
@@ -859,4 +859,95 @@ fn tsqlCallsAt(s: &Stmt, fns: &[]Routine, depth: int, qry: &QueryFn): Result[Opt
     }
     if !changed { return Ok(None) }
     return Ok(Some(t))
+}
+
+// ---- for the session (lexdb_exec): routines by name along the search path, CALL's helpers, and the T-SQL functions
+// a statement calls, published for the evaluator
+
+// The routines of a dialect that a name means: qualified, in its schema; else in the first schema of the search path that
+// has one.
+pub fn routinesIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, name: &str): Result[[]Routine, DbErr] {
+    if lexdb_sql.isQual(name) || dialect == lexdb_sql.RD_TSQL { return find(st, txn, dialect, name) }
+    let path: []str = if len(txn.sql.path) == 0 { ["public"] } else { txn.sql.path.clone() }
+    for sc in path {
+        let found = try find(st, txn, dialect, &lexdb_sql.qual(&sc, name))
+        if len(found) > 0 { return Ok(found) }
+    }
+    return Ok([])
+}
+
+// The text PostgreSQL gives an argument's type in "procedure p(integer) does not exist": what the value shows of it.
+fn argTypeName(v: &Val): str {
+    match v {
+        Val.Int(n) { return if n >= -2147483648 && n <= 2147483647 { "integer" } else { "bigint" } }
+        Val.Bool(_) { return "boolean" }
+        Val.Num(_) { return "numeric" }
+        else { return "unknown" }
+    }
+}
+
+// CALL's procedure among cands (its name's routines): the one whose parameters the arguments' values (vals; names:
+// those given by name) fit best; PostgreSQL's errors when none (42809: only a function takes them). base: the name as
+// written.
+pub fn pickProc(cands: &[]Routine, vals: &[]Val, names: &[]str, base: &str): Result[int, DbErr] {
+    var best = -1
+    var bestScore = -1
+    var isFunc = ""
+    for ci in 0..len(cands) {
+        let c = &cands[ci]
+        let sl = slots(c, len(vals), names)
+        if sl.isNone() { continue }
+        if c.kind != lexdb_sql.RK_PROC {
+            isFunc = c.key.clone()
+            continue
+        }
+        var score = 0
+        let sx = sl.unwrap()
+        for i in 0..len(c.params) { if sx[i] >= 0 && kindFits(&vals[sx[i]], &c.params[i].typ) { score += 1 } }
+        if score > bestScore {
+            best = ci
+            bestScore = score
+        }
+    }
+    if best < 0 {
+        var ts: []str = []
+        for v in vals { append(mut &ts, argTypeName(&v)) }
+        if len(isFunc) > 0 { return Err(err("42809", &(base + "(" + strings.join(&ts, ", ") + ") is not a procedure"))) }
+        var d = err("42883", &("procedure " + base + "(" + strings.join(&ts, ", ") + ") does not exist"))
+        d.hint = "No procedure matches the given name and argument types. You might need to add explicit type casts."
+        return Err(d)
+    }
+    return Ok(best)
+}
+
+// The tables a body's statements read or write (their subqueries' too).
+pub fn bodyTables(stmts: &[]lexdb_sql.Stmt, out: mut &[]str) {
+    for st in stmts {
+        if (st.kind == lexdb_sql.S_INSERT || st.kind == lexdb_sql.S_UPDATE || st.kind == lexdb_sql.S_DELETE) && len(st.table) > 0 { append(out, st.table.clone()) }
+        for f in st.from { if f.sub < 0 && len(f.table) > 0 { append(out, f.table.clone()) } }
+        bodyTables(&st.subs, out)
+        bodyTables(&st.inner, out)
+    }
+}
+
+pub fn udfKey(sess: int, key: &str): str { return "\x00udf\x00" + sess.toStr() + "\x00" + key }
+
+// The scalar function key, as session sess's statement being run published it (lexdb_exec's tsqlFunctions).
+pub fn udfFind(st: &lexdb_store.Store, sess: int, key: &str): Option[Routine] {
+    match st.memo.get(&udfKey(sess, key)) {
+        Some(v) { return Some(lexdb_catalog.decRoutine(&v)) }
+        None { return None }
+    }
+}
+
+// The query a function that reads tables is written as: lexdb_tsqlfunc's, set once by lexdb_tds (a dialect module, which
+// core does not import).
+var UDF_QUERY: once []fn(&Routine, &[]Expr, int): Result[lexdb_sql.Stmt, DbErr]
+
+pub fn setUdfQuery(f: fn(&Routine, &[]Expr, int): Result[lexdb_sql.Stmt, DbErr]) { if !UDF_QUERY.isSet() { UDF_QUERY.set([f]) } }
+
+// The query of a function that reads tables (lexdb_tsqlfunc's, through the hook).
+pub fn udfQuery(r: &Routine, args: &[]Expr, tag: int): Result[lexdb_sql.Stmt, DbErr] {
+    if !UDF_QUERY.isSet() { return Err(err("0A000", "lexdb: a function that reads tables needs the SQL Server door")) }
+    return UDF_QUERY.get()[0](r, args, tag)
 }

@@ -1110,7 +1110,7 @@ fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 fn clone(x: &Expr): Expr { return lexdb_sql.cloneExpr(x) }
 
 // The first column named name, -1 none (lexdb_exec's colIndex).
-fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
+pub fn colIndex(cols: &[]lexdb_sql.ColDef, name: &str): int {
     for i in 0..len(cols) { if cols[i].name == name { return i } }
     return -1
 }
@@ -2168,4 +2168,53 @@ pub fn isSeqFn(name: &str): bool { return name == "nextval" || name == "currval"
 
 pub fn isAdvFn(n: &str): bool {
     return strings.startsWith(&n, "pg_advisory_") || strings.startsWith(&n, "pg_try_advisory_")
+}
+
+pub fn hasAgg(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if isAgg(&name) { return true }
+            for a in args { if hasAgg(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return hasAgg(&a) }
+        Expr.Bin(_, a, b) { return hasAgg(&a) || hasAgg(&b) }
+        Expr.IsNull(a, _) { return hasAgg(&a) }
+        Expr.Cast(a, _) { return hasAgg(&a) }
+        else { return false }
+    }
+}
+
+// Whether an index expression's value depends on the row alone: no
+// function whose value changes (time, random, sequences).
+pub fn immutable(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if !immutableName(&n) { return false }
+            for a in args { if !immutable(&a) { return false } }
+            return true
+        }
+        Expr.Unary(_, a) { return immutable(&a) }
+        Expr.Bin(_, a, b) { return immutable(&a) && immutable(&b) }
+        Expr.IsNull(a, _) { return immutable(&a) }
+        Expr.Cast(a, _) { return immutable(&a) }
+        else { return true }
+    }
+}
+
+// x with column from named to, at slot (-1: not known).
+pub fn renameCol(x: &Expr, from: &str, to: &str, slot: int): Expr {
+    match x {
+        Expr.Col(n, s) { return if n == from { Expr.Col(to.clone(), slot) } else { Expr.Col(n.clone(), s) } }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), renameCol(&a, from, to, slot)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), renameCol(&a, from, to, slot), renameCol(&b, from, to, slot)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(renameCol(&a, from, to, slot), neg) }
+        Expr.Call(f, args, star) {
+            var xs: []Expr = []
+            for a in args { append(mut &xs, renameCol(&a, from, to, slot)) }
+            return Expr.Call(f.clone(), xs, star)
+        }
+        Expr.Cast(a, ty) { return Expr.Cast(renameCol(&a, from, to, slot), ty) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
 }
