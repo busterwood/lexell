@@ -3384,6 +3384,24 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
         }
     }
     if p.acceptKw("on") {
+        if p.tsql {
+            // SQL Server's: ON [OBJECT::]name. The privileges of a table are its five; the others (ALTER, CONTROL,
+            // VIEW DEFINITION, ...) are SQL Server's too and not modelled, TRUNCATE and TRIGGER are no word of its.
+            if p.peekAt(1).text == "::" {
+                let cls = p.peek().text.clone()
+                if cls != "object" { return Err(lexdb_base.err("0A000", &("lexdb: GRANT ON " + strings.toUpperAscii(&cls) + "::... is not supported"))) }
+                p.pos += 2
+            }
+            for pn in g.names {
+                if pn == "select" || pn == "insert" || pn == "update" || pn == "delete" || pn == "references" || pn == "all" { continue }
+                if pn == "truncate" || pn == "trigger" || pn == "maintain" || pn == "usage" {
+                    var at = p.pos - 1
+                    for k in 0..p.pos { if p.toks[k].text == pn { at = k } }
+                    return Err(near(&p.toks[at]))
+                }
+                return Err(lexdb_base.err("0A000", &("lexdb: the " + strings.toUpperAscii(&pn) + " permission is not supported")))
+            }
+        }
         if p.acceptKw("all") {
             let w = p.next().text
             if w != "tables" && w != "sequences" { return Err(lexdb_base.err("0A000", &("lexdb: GRANT ON ALL " + strings.toUpperAscii(&w) + " is not supported"))) }
@@ -3414,7 +3432,7 @@ fn (p: mut &P) grantStmt(grant: bool): Result[Stmt, lexdb_base.DbErr] {
         let granted = replace(mut &g.names, [])
         for r in granted { append(mut &g.cols, lexdb_sql.colDef(&r, TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false)) }
     }
-    if grant { try p.expectKw("to") } else { try p.expectKw("from") }
+    if grant { try p.expectKw("to") } else if p.tsql && p.isKw("to") { p.pos += 1 } else { try p.expectKw("from") }
     while true {
         let a = p.acceptKw("group")
         append(mut &g.pk, try p.roleSpec())

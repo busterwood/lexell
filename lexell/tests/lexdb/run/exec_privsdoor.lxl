@@ -1,0 +1,126 @@
+// lexdb_exec: a table owner's grants across schemas, as each door reads them (design/lexdb-dialect-gaps.md, package E),
+// and across a crash. On the PostgreSQL wire a user reads another's table only with USAGE on its schema as well as the
+// grant; SQL Server and Oracle have no schema privilege, so the grant alone is enough through the TDS and TNS doors
+// (the denied ones say 229 / ORA-00942 / ORA-01031 / 42501 each its own way). The grants are catalog rows: they are
+// there after the disk crashes and the store is opened again, and DROP TABLE takes them away.
+// expect: pg select: 42501 permission denied for schema s1
+// expect: tns select: 10
+// expect: tds select: 10
+// expect: pg after usage: 10
+// expect: tns insert: ORA01031 insufficient privileges
+// expect: tds insert: TS229 The INSERT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: pg insert: 42501 permission denied for table t
+// expect: tns none: ORA00942 table or view does not exist
+// expect: tds none: TS229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: grants: u1|DELETE;u1|INSERT;u1|REFERENCES;u1|SELECT;u1|TRIGGER;u1|TRUNCATE;u1|UPDATE;u2|SELECT
+// expect: after crash grants: u1|DELETE;u1|INSERT;u1|REFERENCES;u1|SELECT;u1|TRIGGER;u1|TRUNCATE;u1|UPDATE;u2|SELECT
+// expect: after crash tns: 10
+// expect: after crash tds: 10
+// expect: after crash tns none: ORA00942 table or view does not exist
+// expect: pg privilege: t|f
+// expect: revoked: ORA00942 table or view does not exist
+// expect: grants after revoke: u1|DELETE;u1|INSERT;u1|REFERENCES;u1|SELECT;u1|TRIGGER;u1|TRUNCATE;u1|UPDATE
+// expect: grants after drop: 
+// expect: recreated: ORA00942 table or view does not exist
+// expect: recreated tds: TS229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+// rows (columns joined by |, rows by ;), the tag, or the error's state and text
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+// a session of a door acting as role r
+fn actor(st: &lexdb_store.Store, door: &str, r: &str): lexdb_exec.Session {
+    var s = lexdb_exec.newSession(st.share())
+    if len(door) > 0 { s.setDoor(door) }
+    let x = q(mut &s, &("set role " + r))
+    return s
+}
+
+fn first(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var su = lexdb_exec.newSession(st.share())
+    for sql in ["create role u1 login", "create role u2 login", "create schema s1 authorization u1", "create table s1.t (id int primary key, v int)",
+                "alter table s1.t owner to u1", "insert into s1.t values (1, 10)"] {
+        let x = q(mut &su, &sql)
+    }
+    var own = actor(&st, "", "u1")
+    var pg = actor(&st, "", "u2")
+    var tns = actor(&st, "tns", "u2")
+    var tds = actor(&st, "tds", "u2")
+    let g = q(mut &own, &"grant select on s1.t to u2")
+    say("pg select", q(mut &pg, &"select sum(v) from s1.t"))
+    say("tns select", q(mut &tns, &"select sum(v) from s1.t"))
+    say("tds select", q(mut &tds, &"select sum(v) from s1.t"))
+    let u = q(mut &su, &"grant usage on schema s1 to u2")
+    say("pg after usage", q(mut &pg, &"select sum(v) from s1.t"))
+    say("tns insert", q(mut &tns, &"insert into s1.t values (2, 20)"))
+    say("tds insert", q(mut &tds, &"insert into s1.t values (2, 20)"))
+    say("pg insert", q(mut &pg, &"insert into s1.t values (2, 20)"))
+    var u3 = actor(&st, "tns", "u2")
+    let x = q(mut &su, &"create role u3 login")
+    var n3 = actor(&st, "tns", "u3")
+    var d3 = actor(&st, "tds", "u3")
+    say("tns none", q(mut &n3, &"select sum(v) from s1.t"))
+    say("tds none", q(mut &d3, &"select sum(v) from s1.t"))
+    say("grants", q(mut &su, &"select grantee, privilege_type from information_schema.table_privileges where table_name = 't' and grantee like 'u%' order by 1, 2"))
+    return 0
+}
+
+fn second(st: lexdb_store.Store): int {
+    var su = lexdb_exec.newSession(st.share())
+    say("after crash grants", q(mut &su, &"select grantee, privilege_type from information_schema.table_privileges where table_name = 't' and grantee like 'u%' order by 1, 2"))
+    var tns = actor(&st, "tns", "u2")
+    var tds = actor(&st, "tds", "u2")
+    var n3 = actor(&st, "tns", "u3")
+    say("after crash tns", q(mut &tns, &"select sum(v) from s1.t"))
+    say("after crash tds", q(mut &tds, &"select sum(v) from s1.t"))
+    say("after crash tns none", q(mut &n3, &"select sum(v) from s1.t"))
+    say("pg privilege", q(mut &su, &"select has_table_privilege('u2', 's1.t', 'select'), has_table_privilege('u2', 's1.t', 'insert')"))
+    let r = q(mut &su, &"revoke select on s1.t from u2")
+    say("revoked", q(mut &tns, &"select sum(v) from s1.t"))
+    say("grants after revoke", q(mut &su, &"select grantee, privilege_type from information_schema.table_privileges where table_name = 't' and grantee like 'u%' order by 1, 2"))
+    let g = q(mut &su, &"grant select, update on s1.t to u2, u3")
+    let d = q(mut &su, &"drop table s1.t")
+    say("grants after drop", q(mut &su, &"select grantee, privilege_type from information_schema.table_privileges where table_name = 't' and grantee like 'u%' order by 1, 2"))
+    let c = q(mut &su, &"create table s1.t (id int primary key, v int)")
+    say("recreated", q(mut &tns, &"select sum(v) from s1.t"))
+    var tds2 = actor(&st, "tds", "u3")
+    say("recreated tds", q(mut &tds2, &"select sum(v) from s1.t"))
+    return 0
+}
+
+fn main() {
+    var fs = lexdb_disk.sim(7)
+    var crashed = fs.share()
+    let a = lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        let r = first(st)
+        crashed = fs.crash(3)
+        return r
+    }).unwrap()
+    let b = lexdb_store.run(crashed.share(), opts(), second).unwrap()
+}

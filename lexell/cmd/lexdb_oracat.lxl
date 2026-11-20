@@ -803,8 +803,51 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
     return out
 }
 
+// The object privileges Oracle lists for a letter of lexdb's, "" none (TRUNCATE and TRIGGER are no privilege of its).
+fn oraPrivName(letter: &str, kind: &str): str {
+    if kind == "sequence" { return if letter == "r" { "SELECT" } else { "" } }
+    return match letter { "r" { "SELECT" } "a" { "INSERT" } "w" { "UPDATE" } "d" { "DELETE" } "x" { "REFERENCES" } else { "" } }
+}
+
+// DBA_, ALL_ and USER_TAB_PRIVS: the grants recorded on tables, views and sequences, one row a privilege. USER_ lists those
+// the user holds, owns or granted; ALL_ those and the ones to PUBLIC and to the roles it holds; DBA_ every one. The grantor
+// is the owner (lexdb has no grant option, so no one else grants).
+fn oraTabPrivs(cq: &lexdb_catalog.CatView, view: &str, fam: &Family): [][]Val {
+    let snap = &cq.snap
+    var user = snap.user.clone()
+    for sc in snap.schemas { if sc == strings.toLowerAscii(&snap.user) && sc != "public" { user = "SYS" } }
+    let me = strings.toUpperAscii(&snap.user)
+    let cs = cols(view)
+    var out: [][]Val = []
+    for r in lexdb_catalog.privRows(snap) {
+        let owner = oraOwner(&r.schema, &user)
+        let grantor = strings.toUpperAscii(&r.owner)
+        let grantee = if len(r.to) == 0 { "PUBLIC".toStr() } else { strings.toUpperAscii(&r.to) }
+        let pn = oraPrivName(&r.letter, &r.kind)
+        if len(pn) == 0 { continue }
+        if fam.scope == "USER" && owner != me && grantee != me && grantor != me { continue }
+        if fam.scope == "ALL" && owner != me && grantee != me && grantor != me && grantee != "PUBLIC" && !lexdb_base.hasStr(&cq.who, &r.to) { continue }
+        let tname = if len(r.spell) > 0 { r.spell.clone() } else { oraUp(&r.name) }
+        var vs: []Val = []
+        for c in cs {
+            let n = &c.name
+            var v = "NO".toStr()
+            if n == "GRANTEE" { v = grantee.clone() }
+            else if n == "OWNER" || n == "TABLE_SCHEMA" { v = owner.clone() }
+            else if n == "TABLE_NAME" { v = tname.clone() }
+            else if n == "GRANTOR" { v = grantor.clone() }
+            else if n == "PRIVILEGE" { v = pn.clone() }
+            else if n == "TYPE" { v = strings.toUpperAscii(&r.kind) }
+            append(mut &vs, Val.Text(v))
+        }
+        append(mut &out, vs)
+    }
+    return out
+}
+
 pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] {
     if !isView(view) { return Ok([]) }
+    if strings.endsWith(view, "_TAB_PRIVS") { return Ok(oraTabPrivs(cq, view, &family(view))) }
     let snap = &cq.snap
     let roles = &cq.roles
     let sess = cq.sess

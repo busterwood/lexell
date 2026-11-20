@@ -1,0 +1,199 @@
+// lexdb over TDS: object permissions (design/lexdb-dialect-gaps.md, package E). SQL Server's GRANT and REVOKE of
+// SELECT, INSERT, UPDATE, DELETE, REFERENCES (ALL) ON [OBJECT::]name by the object's owner, to users and PUBLIC, read
+// across schemas on that grant alone (no schema permission), REVOKE ... FROM and TO, sys.database_permissions with its
+// columns (class 1, the object's id, the grantee's and the grantor's principal ids), HAS_PERMS_BY_NAME, and the errors:
+// 229 for a denied access (its text names the permission, object, database and schema), 4613 for a grantor without the
+// right, 15151 for an object or user that is not there, 102 where T-SQL has no such word (TRUNCATE), and an honest
+// refusal of what lexdb does not model (WITH GRANT OPTION, ALTER, CONTROL, SCHEMA::). The expectations are SQL Server's
+// as its documentation gives them (not run against a server here).
+// expect: create role u1 login: ok
+// expect: create role u2 login: ok
+// expect: create role u3 login: ok
+// expect: create role r1: ok
+// expect: create schema s1 authorization u1: ok
+// expect: create: ok
+// expect: insert: (2)
+// expect: before grant: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: has_perms before: 0|0
+// expect: grant select: ok
+// expect: select: 10;20
+// expect: has_perms select: 1|0
+// expect: insert denied: error 229 The INSERT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: update denied: error 229 The UPDATE permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: delete denied: error 229 The DELETE permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: grant object form: ok
+// expect: insert: (1)
+// expect: update: (2)
+// expect: delete denied 2: error 229 The DELETE permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: grant bracketed: ok
+// expect: delete: (1)
+// expect: owner sees: 1|11;2|21
+// expect: u3 before: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: u3 grants: error 4613 Grantor does not have GRANT permission.
+// expect: u2 grants: error 4613 Grantor does not have GRANT permission.
+// expect: missing object: error 15151 Cannot find the object 'nothing', because it does not exist or you do not have permission.
+// expect: missing user: error 15151 Cannot find the user 'nobody', because it does not exist or you do not have permission.
+// expect: truncate: error 102 Incorrect syntax near 'truncate'.
+// expect: alter: error 50000 lexdb: the ALTER permission is not supported
+// expect: grant option: error 50000 lexdb: grant and admin options are not supported
+// expect: schema class: error 50000 lexdb: GRANT ON SCHEMA::... is not supported
+// expect: still not granted: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: perms: 1|'OBJECT_OR_COLUMN'|'u2'|'u1'|'DL  '|'DELETE'|'G'|'GRANT'|0;1|'OBJECT_OR_COLUMN'|'u2'|'u1'|'IN  '|'INSERT'|'G'|'GRANT'|0;1|'OBJECT_OR_COLUMN'|'u2'|'u1'|'SL  '|'SELECT'|'G'|'GRANT'|0;1|'OBJECT_OR_COLUMN'|'u2'|'u1'|'UP  '|'UPDATE'|'G'|'GRANT'|0
+// expect: sp_table_privileges: 'lexdb'|'s1'|'t'|'dbo'|'dbo'|'DELETE'|'YES';'lexdb'|'s1'|'t'|'u1'|'u2'|'DELETE'|'NO';'lexdb'|'s1'|'t'|'dbo'|'dbo'|'INSERT'|'YES';'lexdb'|'s1'|'t'|'u1'|'u2'|'INSERT'|'NO';'lexdb'|'s1'|'t'|'dbo'|'dbo'|'REFERENCES'|'YES';'lexdb'|'s1'|'t'|'dbo'|'dbo'|'SELECT'|'YES';'lexdb'|'s1'|'t'|'u1'|'u2'|'SELECT'|'NO';'lexdb'|'s1'|'t'|'dbo'|'dbo'|'UPDATE'|'YES';'lexdb'|'s1'|'t'|'u1'|'u2'|'UPDATE'|'NO'
+// expect: object: 4
+// expect: grant public: ok
+// expect: u3 as public: 11;21
+// expect: public row: 0|'SELECT'
+// expect: grant role: ok
+// expect: role principal: 'r1'|'R'|'DATABASE_ROLE'
+// expect: revoke select: ok
+// expect: u2 as public: 11;21
+// expect: revoke public: ok
+// expect: u3 revoked: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: revoke to: ok
+// expect: update revoked: error 229 The UPDATE permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: insert still: (1)
+// expect: after revokes: 'r1'|'REFERENCES';'u2'|'DELETE';'u2'|'INSERT'
+// expect: grant all: ok
+// expect: all rows: 'DELETE'|'DL  ';'INSERT'|'IN  ';'REFERENCES'|'RF  ';'SELECT'|'SL  ';'UPDATE'|'UP  '
+// expect: u3 reads: 3
+// expect: revoke all: ok
+// expect: u3 after revoke all: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+// expect: drop: ok
+// expect: perms after drop: 0
+// expect: recreate: ok
+// expect: new table not granted: error 229 The SELECT permission was denied on the object 't', database 'lexdb', schema 's1'.
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn rows(r: &sqlserver.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&out, ";")
+}
+
+// a batch's rows (columns joined by |, rows by ;), its row counts, or its error's number and text
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            for n in r.counts {
+                if n.resultSet >= 0 { append(mut &parts, rows(&r.sets[n.resultSet])) } else { append(mut &parts, "(" + n.rows.toStr() + ")") }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn conn(dsn: &str, u: &str): sqlserver.Conn {
+    return sqlserver.connect(&(dsn + ";UID=" + u + ";PWD=x;Encrypt=no")).unwrap()
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn batches(dsn: &str) {
+    var sa = conn(dsn, "sa")
+    for q in strings.lines(&"create role u1 login\ncreate role u2 login\ncreate role u3 login\ncreate role r1\ncreate schema s1 authorization u1") { say(q, show(mut &sa, &q)) }
+    var a = conn(dsn, "u1")
+    var b = conn(dsn, "u2")
+    var c = conn(dsn, "u3")
+    say("create", show(mut &a, &"create table s1.t (id int primary key, v int)"))
+    say("insert", show(mut &a, &"insert into s1.t values (1, 10), (2, 20)"))
+    say("before grant", show(mut &b, &"select v from s1.t order by id"))
+    say("has_perms before", show(mut &b, &"select has_perms_by_name('s1.t', 'OBJECT', 'SELECT'), has_perms_by_name('[s1].[t]', 'object', 'insert')"))
+    say("grant select", show(mut &a, &"grant select on s1.t to u2"))
+    say("select", show(mut &b, &"select v from s1.t order by id"))
+    say("has_perms select", show(mut &b, &"select has_perms_by_name('s1.t', 'OBJECT', 'SELECT'), has_perms_by_name('s1.t', 'OBJECT', 'INSERT')"))
+    say("insert denied", show(mut &b, &"insert into s1.t values (3, 30)"))
+    say("update denied", show(mut &b, &"update s1.t set v = 0"))
+    say("delete denied", show(mut &b, &"delete from s1.t"))
+    say("grant object form", show(mut &a, &"GRANT INSERT, UPDATE ON OBJECT::s1.t TO u2"))
+    say("insert", show(mut &b, &"insert into s1.t values (3, 30)"))
+    say("update", show(mut &b, &"update s1.t set v = v + 1 where id < 3"))
+    say("delete denied 2", show(mut &b, &"delete from s1.t where id = 3"))
+    say("grant bracketed", show(mut &a, &"grant delete on [s1].[t] to [u2]"))
+    say("delete", show(mut &b, &"delete from s1.t where id = 3"))
+    say("owner sees", show(mut &a, &"select id, v from s1.t order by id"))
+    // errors
+    say("u3 before", show(mut &c, &"select v from s1.t"))
+    say("u3 grants", show(mut &c, &"grant select on s1.t to u3"))
+    say("u2 grants", show(mut &b, &"grant select on s1.t to u3"))
+    say("missing object", show(mut &a, &"grant select on s1.nothing to u2"))
+    say("missing user", show(mut &a, &"grant select on s1.t to nobody"))
+    say("truncate", show(mut &a, &"grant truncate on s1.t to u3"))
+    say("alter", show(mut &a, &"grant alter on s1.t to u3"))
+    say("grant option", show(mut &a, &"grant select on s1.t to u3 with grant option"))
+    say("schema class", show(mut &a, &"grant select on schema::s1 to u3"))
+    say("still not granted", show(mut &c, &"select v from s1.t"))
+    // the catalog
+    say("perms", show(mut &sa, &"select dp.class, dp.class_desc, p.name, g.name, dp.type, dp.permission_name, dp.state, dp.state_desc, dp.minor_id from sys.database_permissions dp join sys.database_principals p on p.principal_id = dp.grantee_principal_id join sys.database_principals g on g.principal_id = dp.grantor_principal_id where dp.major_id = object_id('s1.t') order by dp.permission_name"))
+    say("sp_table_privileges", show(mut &sa, &"exec sp_table_privileges @table_name = 't', @table_owner = 's1'"))
+    say("object", show(mut &sa, &"select count(*) from sys.database_permissions where class = 1 and major_id = object_id('s1.t')"))
+    // PUBLIC, and a role
+    say("grant public", show(mut &a, &"grant select on s1.t to public"))
+    say("u3 as public", show(mut &c, &"select v from s1.t order by id"))
+    say("public row", show(mut &sa, &"select grantee_principal_id, permission_name from sys.database_permissions where class = 1 and major_id = object_id('s1.t') and grantee_principal_id = 0"))
+    say("grant role", show(mut &a, &"grant references on s1.t to r1"))
+    say("role principal", show(mut &sa, &"select p.name, p.type, p.type_desc from sys.database_permissions dp join sys.database_principals p on p.principal_id = dp.grantee_principal_id where dp.permission_name = 'REFERENCES'"))
+    // REVOKE
+    say("revoke select", show(mut &a, &"revoke select on s1.t from u2"))
+    say("u2 as public", show(mut &b, &"select v from s1.t order by id"))
+    say("revoke public", show(mut &a, &"revoke select on s1.t from public"))
+    say("u3 revoked", show(mut &c, &"select v from s1.t"))
+    say("revoke to", show(mut &a, &"revoke update on s1.t to u2"))
+    say("update revoked", show(mut &b, &"update s1.t set v = 0"))
+    say("insert still", show(mut &b, &"insert into s1.t values (4, 40)"))
+    say("after revokes", show(mut &sa, &"select p.name, dp.permission_name from sys.database_permissions dp join sys.database_principals p on p.principal_id = dp.grantee_principal_id where dp.class = 1 and dp.major_id = object_id('s1.t') order by 1, 2"))
+    // ALL is the five; a view
+    say("grant all", show(mut &a, &"grant all on s1.t to u3"))
+    say("all rows", show(mut &sa, &"select permission_name, type from sys.database_permissions where class = 1 and major_id = object_id('s1.t') and grantee_principal_id = (select principal_id from sys.database_principals where name = 'u3') order by 1"))
+    say("u3 reads", show(mut &c, &"select count(*) from s1.t"))
+    say("revoke all", show(mut &a, &"revoke all on s1.t from u3"))
+    say("u3 after revoke all", show(mut &c, &"select count(*) from s1.t"))
+    // DROP TABLE takes the permissions with it
+    say("drop", show(mut &a, &"drop table s1.t"))
+    say("perms after drop", show(mut &sa, &"select count(*) from sys.database_permissions where class = 1"))
+    say("recreate", show(mut &a, &"create table s1.t (id int primary key, v int)"))
+    say("new table not granted", show(mut &b, &"select v from s1.t"))
+    c.close()
+    b.close()
+    a.close()
+    sa.close()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)]))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                            snapNodes: 50000}, body).unwrap()
+}
