@@ -119,7 +119,10 @@ and lexdb-batch-gaps.md section 2's rules (the same rules apply: results as
 the dialect gives them, tested through the door; never move an expectation
 to hide a regression; new code outside lexdb_exec where it can live
 elsewhere; native builds and tests; timings under the exclusive lock).
-The coordinator reviews each branch, runs the suite on the merged tree and
+Each agent edits, builds and tests only under its own worktree's path
+(the main checkout's compiler binary is the one file it uses from
+outside); an agent's stray edit to the main checkout broke main's build
+once (package E, caught and moved before any commit). The coordinator reviews each branch, runs the suite on the merged tree and
 TPC-H once alternated with the previous main (checksums equal), merges and
 pushes.
 
@@ -135,7 +138,7 @@ Queue (pairs that touch different files):
 
 | Package | Branch | State |
 |---|---|---|
-| A | `worktree-agent-a904a69d9594c5747` | done, awaiting review; section 5 |
+| A | `worktree-agent-a904a69d9594c5747` | merged (a1aa79e3; TPC-H 0.998 of 6dc5e38f alternated, checksums equal; with the session's SYSTEM_USER memo entry dropped at close); section 5 |
 | B | | not started |
 | C | | not started |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
