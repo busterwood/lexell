@@ -1,0 +1,316 @@
+// lexdb_pct: PERCENTILE_CONT and PERCENTILE_DISC, the ordered-set aggregates
+// (design/lexdb-dialect-gaps.md, package D), shared by the three dialects:
+// lexdb_agg collects a group's (or a window partition's) values and calls
+// finish; the dialect only changes the result's type, the arithmetic and the
+// errors, as the dialect gives them:
+// - PostgreSQL: percentile_cont of numbers is double precision (lo + (hi -
+//   lo) * fraction), of intervals an interval; percentile_disc keeps the
+//   values' type; a fraction outside 0..1 is 22003;
+// - SQL Server: percentile_cont of any number is float, computed as
+//   (CRN - RN) * lo + (RN - FRN) * hi with RN = 1 + f * (n - 1); the same
+//   expression in the window form only; a fraction outside 0..1 is 8727,
+//   text and dates are refused (402);
+// - Oracle: percentile_cont of numbers is a NUMBER (exact decimal
+//   arithmetic), of datetimes and intervals their own type; ORA-30493 for a
+//   fraction outside 0..1.
+// percentile_disc is the first value (in the call's order) whose cumulative
+// distribution is at least the fraction: the ceil(f * n)'th, the first at 0.
+import "strings"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_sort"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type Expr = lexdb_sql.Expr
+
+pub const DIA_PG = 0
+pub const DIA_TSQL = 1
+pub const DIA_ORA = 2
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// Whether a call name is one of the two (decorated or not).
+pub fn isPct(base: &str): bool { return base == "percentile_cont" || base == "percentile_disc" }
+
+// The dialect a call was written in (the parser's " dia:" mark on its name).
+pub fn dialectOf(name: &str): int {
+    if strings.contains(name, " dia:t") { return DIA_TSQL }
+    if strings.contains(name, " dia:o") { return DIA_ORA }
+    return DIA_PG
+}
+
+// The fraction argument x of a call, checked where it can be before any row: a literal is a number in 0 to 1
+// (a NULL one refused where the dialect refuses it); SQL Server's is a constant.
+pub fn checkArg(dia: int, base: &str, x: &Expr): Result[Unit, DbErr] {
+    match x {
+        Expr.Lit(fv) {
+            if lexdb_ops.isNull(&fv) {
+                match nullFrac(dia) {
+                    Some(err) { return Err(err) }
+                    None { return Ok(Unit{}) }
+                }
+            }
+            return checkFrac(dia, &fv)
+        }
+        else {
+            var cn: []str = []
+            lexdb_sql.colNames(x, mut &cn)
+            if dia == DIA_TSQL && len(cn) > 0 { return Err(e("TS8726", &("Input parameter of " + strings.toUpperAscii(base) + " function must be a constant."))) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// What a window over an ordered-set aggregate may not have: an ORDER BY, a frame (SQL Server 10758 and 10752;
+// Oracle's grammar allows the partition clause alone).
+pub fn windowErr(dia: int, base: &str, hasOrder: bool, hasFrame: bool): Option[DbErr] {
+    let up = strings.toUpperAscii(base)
+    if hasOrder {
+        return Some(if dia == DIA_TSQL { e("TS10758", &("The function '" + up + "' may not have ORDER BY in OVER clause.")) } else { e("ORA30487", "ORDER BY not allowed here") })
+    }
+    if hasFrame {
+        return Some(if dia == DIA_TSQL { e("TS10752", &("The function '" + up + "' may not have a window frame.")) } else { e("ORA00907", "missing right parenthesis") })
+    }
+    return None
+}
+
+// The fraction's out-of-range error, as the dialect words it.
+fn rangeErr(dia: int, f: &Val): DbErr {
+    if dia == DIA_TSQL { return e("TS8727", "Input parameter of percentile function is outside of range [0, 1].") }
+    if dia == DIA_ORA { return e("ORA30493", "The percentile value should be a number between zero and one.") }
+    return e("22003", &("percentile value " + lexdb_sql.text(f) + " is not between 0 and 1"))
+}
+
+// A fraction (not NULL) checked to be a number in 0..1.
+pub fn checkFrac(dia: int, f: &Val): Result[Unit, DbErr] {
+    match lexdb_ops.asFloat(f) {
+        Some(x) { if !(x >= 0.0f && x <= 1.0f) { return Err(rangeErr(dia, f)) } }
+        None { return Err(rangeErr(dia, f)) }
+    }
+    return Ok(Unit{})
+}
+
+// The error for a NULL fraction: SQL Server and Oracle refuse it; PostgreSQL
+// gives NULL (the caller's).
+pub fn nullFrac(dia: int): Option[DbErr] {
+    if dia == DIA_TSQL { return Some(rangeErr(dia, &Val.Null)) }
+    if dia == DIA_ORA { return Some(rangeErr(dia, &Val.Null)) }
+    return None
+}
+
+fn typeName(v: &Val): str {
+    match v {
+        Val.Text(_) { return "varchar" }
+        Val.Date(_) { return "date" }
+        Val.Time(_) { return "time" }
+        Val.Ts(_) { return "datetime2" }
+        Val.Tstz(_) { return "datetimeoffset" }
+        Val.Ival(_) { return "interval" }
+        Val.Bool(_) { return "bit" }
+        Val.Uuid(_) { return "uniqueidentifier" }
+        Val.Bytes(_) { return "varbinary" }
+        else { return "numeric" }
+    }
+}
+
+fn isNumber(v: &Val): bool {
+    match v {
+        Val.Int(_) { return true }
+        Val.Num(_) { return true }
+        Val.Float(_) { return true }
+        Val.Real(_) { return true }
+        else { return false }
+    }
+}
+
+// Whether percentile_cont takes value v in the dialect (checked as it is
+// added, so a refused type fails the first row).
+pub fn checkValue(dia: int, fname: &str, v: &Val): Result[Unit, DbErr] {
+    if fname == "percentile_disc" { return Ok(Unit{}) }
+    if isNumber(v) { return Ok(Unit{}) }
+    if dia == DIA_TSQL {
+        match v {
+            Val.Bool(_) { return Ok(Unit{}) }
+            else {}
+        }
+        return Err(e("TS402", &("The data types numeric and " + typeName(v) + " are incompatible in the percentile_cont operator.")))
+    }
+    if dia == DIA_ORA {
+        match v {
+            Val.Ival(_) { return Ok(Unit{}) }
+            Val.Ts(_) { return Ok(Unit{}) }
+            Val.Tstz(_) { return Ok(Unit{}) }
+            Val.Date(_) { return Ok(Unit{}) }
+            else {}
+        }
+        return Err(e("ORA00932", "inconsistent datatypes: expected NUMBER got CHAR"))
+    }
+    match v {
+        Val.Ival(_) { return Ok(Unit{}) }
+        else {}
+    }
+    return Err(e("42883", &("function percentile_cont(numeric, " + typeName(v) + ") does not exist")))
+}
+
+// The values sorted ascending (under the collation kind), ties as they came;
+// a values' kinds that do not compare are an error.
+fn sorted(vals: &[]Val, kind: int, desc: bool): Result[[]int, DbErr] {
+    var idx: []int = []
+    for i in 0..len(vals) { append(mut &idx, i) }
+    var bad = false
+    collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
+        var c = 0
+        match vals[a] {
+            Val.Int(x) {
+                match vals[b] {
+                    Val.Int(y) { c = x.cmp(&y) }
+                    else {
+                        let r = lexdb_ops.compare(&vals[a], &vals[b])
+                        if r.isErr() { bad = true }
+                        c = r.unwrapOr(0)
+                    }
+                }
+            }
+            else {
+                let r = if kind == lexdb_sql.COLL_EXACT { lexdb_ops.compare(&vals[a], &vals[b]) } else {
+                    lexdb_ops.compare(&lexdb_sort.collVal(kind, &vals[a]), &lexdb_sort.collVal(kind, &vals[b]))
+                }
+                if r.isErr() { bad = true }
+                c = r.unwrapOr(0)
+            }
+        }
+        if c != 0 { return if desc { -c } else { c } }
+        return a - b
+    })
+    if bad { return Err(e("42804", "percentile: its values cannot be compared")) }
+    return Ok(idx)
+}
+
+fn flt(v: &Val): float {
+    match v {
+        Val.Bool(b) { return if b { 1.0f } else { 0.0f } }
+        else { return lexdb_ops.asFloat(v).unwrapOr(0.0f) }
+    }
+}
+
+// Oracle's NUMBER arithmetic on decimals, a value normalized (no trailing zeros).
+fn dec(d: Decimal): Val {
+    match Decimal.parse(&d.canonical()) {
+        Ok(x) { return Val.Num(x) }
+        Err(_) { return Val.Num(d) }
+    }
+}
+
+// The call's value over the values (in vals as they came, none NULL), at
+// fraction f (not NULL). desc: ORDER BY x DESC. kind: the values'
+// collation kind (percentile_disc of texts).
+pub fn finish(fname: &str, dia: int, desc: bool, kind: int, vals: &[]Val, f: &Val): Result[Val, DbErr] {
+    try checkFrac(dia, f)
+    let n = len(vals)
+    if n == 0 { return Ok(Val.Null) }
+    let idx = try sorted(vals, kind, desc)
+    if fname == "percentile_disc" {
+        // the ceil(f * n)'th value: Oracle's decimals exactly, the others' doubles
+        var k = 1
+        if dia == DIA_ORA {
+            let fd = lexdb_ops.asNum(f).unwrapOr(Decimal.fromInt(0))
+            k = fd.mul(Decimal.fromInt(n)).ceil(0).unwrapOr(Decimal.fromInt(1)).toInt(Rounding.CEILING).unwrapOr(1)
+        } else {
+            k = int((lexdb_ops.asFloat(f).unwrapOr(0.0f) * float(n)).ceil())
+        }
+        if k < 1 { k = 1 }
+        if k > n { k = n }
+        return Ok(vals[idx[k - 1]].clone())
+    }
+    var floats = dia == DIA_TSQL
+    if dia == DIA_ORA {
+        // Oracle's BINARY_DOUBLE and BINARY_FLOAT stay floats; a NUMBER is computed exactly (below)
+        match vals[idx[0]] {
+            Val.Float(_) { floats = true }
+            Val.Real(_) { floats = true }
+            else {}
+        }
+    }
+    if floats {
+        // float: (CRN - RN) * lo + (RN - FRN) * hi, RN = 1 + f * (n - 1)
+        let rn = 1.0f + lexdb_ops.asFloat(f).unwrapOr(0.0f) * float(n - 1)
+        let fr = rn.floor()
+        let cr = rn.ceil()
+        let lo = flt(&vals[idx[int(fr) - 1]])
+        if fr == cr { return Ok(Val.Float(lo)) }
+        let hi = flt(&vals[idx[int(cr) - 1]])
+        return Ok(Val.Float((cr - rn) * lo + (rn - fr) * hi))
+    }
+    if dia == DIA_PG {
+        // lo + (rn - lo's place) * (hi - lo), double precision or interval
+        let rn = lexdb_ops.asFloat(f).unwrapOr(0.0f) * float(n - 1)
+        let lp = int(rn.floor())
+        let hp = int(rn.ceil())
+        let lo = &vals[idx[lp]]
+        let hi = &vals[idx[hp]]
+        let prop = rn - float(lp)
+        match lo {
+            Val.Ival(_) {
+                if lp == hp { return Ok(lo.clone()) }
+                let d = try lexdb_ops.arith(lexdb_ops.OP_SUB, hi, lo)
+                let m = try lexdb_ops.arith(lexdb_ops.OP_MUL, &d, &Val.Float(prop))
+                return lexdb_ops.arith(lexdb_ops.OP_ADD, lo, &m)
+            }
+            else {}
+        }
+        let a = flt(lo)
+        if lp == hp { return Ok(Val.Float(a)) }
+        return Ok(Val.Float(a + prop * (flt(hi) - a)))
+    }
+    // Oracle: RN = 1 + f * (n - 1); (CRN - RN) * lo + (RN - FRN) * hi
+    let fd = lexdb_ops.asNum(f).unwrapOr(Decimal.fromInt(0))
+    let rn = Decimal.fromInt(1).add(fd.mul(Decimal.fromInt(n - 1)))
+    let frd = rn.floor(0).unwrapOr(rn)
+    let crd = rn.ceil(0).unwrapOr(rn)
+    let fr = frd.toInt(Rounding.FLOOR).unwrapOr(1)
+    let cr = crd.toInt(Rounding.CEILING).unwrapOr(fr)
+    let lo = &vals[idx[fr - 1]]
+    if fr == cr {
+        match lo {
+            Val.Int(_) { return Ok(dec(lexdb_ops.asNum(lo).unwrapOr(Decimal.fromInt(0)))) }
+            Val.Num(d) { return Ok(dec(d)) }
+            else { return Ok(lo.clone()) }
+        }
+    }
+    let hi = &vals[idx[cr - 1]]
+    let wlo = crd.sub(rn)
+    let whi = rn.sub(frd)
+    match lo {
+        Val.Ts(a) {
+            match hi {
+                Val.Ts(b) { return Ok(Val.Ts(a + int((float(b - a) * whi.toFloat()).round()))) }
+                else {}
+            }
+        }
+        Val.Tstz(a) {
+            match hi {
+                Val.Tstz(b) { return Ok(Val.Tstz(a + int((float(b - a) * whi.toFloat()).round()))) }
+                else {}
+            }
+        }
+        Val.Ival(_) {
+            let d = try lexdb_ops.arith(lexdb_ops.OP_SUB, hi, lo)
+            let m = try lexdb_ops.arith(lexdb_ops.OP_MUL, &d, &Val.Float(whi.toFloat()))
+            return lexdb_ops.arith(lexdb_ops.OP_ADD, lo, &m)
+        }
+        else {}
+    }
+    match lexdb_ops.asNum(lo) {
+        Some(a) {
+            match lexdb_ops.asNum(hi) {
+                Some(b) { return Ok(dec(wlo.mul(a).add(whi.mul(b)))) }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Err(e("ORA00932", "inconsistent datatypes: expected NUMBER got CHAR"))
+}

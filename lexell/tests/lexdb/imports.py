@@ -38,7 +38,7 @@ CORE = {
     "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_held", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
-    "lexdb_page", "lexdb_parse", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
+    "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_repl", "lexdb_rows",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_window",
 }
@@ -118,12 +118,12 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # their encodings only; only the pipeline and exec import it.
 SORT = "lexdb_sort"
 SORT_MAY_IMPORT = {"lexdb_sql", "lexdb_ops", "lexdb_vec", "lexdb_access"}
-SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_window"}
+SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_window", "lexdb_pct"}
 
 # The aggregate accumulators (lexdb_agg, design/lexdb-batch-gaps.md item 3):
 # values and their orders only; the row engine and the pipeline import them.
 AGG = "lexdb_agg"
-AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort"}
+AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct"}
 AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window"}
 
 # How a set operation combines its parts' rows (lexdb_setop, design/
