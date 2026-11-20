@@ -3804,3 +3804,108 @@ bench lock), +0.0006% for the final one (about 1 instruction a select of
 depend on load), every round alike. The join search is not reached by a
 single-table statement; `Level` has one more integer.
 
+## 50. Subquery unnesting: the null-aware anti join, the mark join, lookups widened (2026-11-20)
+
+Item Q7 of lexdb-layers.md 6.3, step 5's slices 5a-5c (lexdb-layers.md
+6.1, "Where unnesting plugs in"). Today's unnesting is physical and
+happens after a subquery is planned (lexdb.md 9.9's `hashSub`, 9.104's
+`semiJoins`, section 42's `noRefKeys` alternative, `semiLook`). These
+slices add kinds of level to the same machinery, each run by the row
+engine (`runLevel`) and by the pipeline's joins (`joinsOver`, `joinFrom`),
+so a query that has one can be the pipeline's (it rejects a query with a
+correlated subquery that stays one: `q.corr`).
+
+### 50.1 The shapes
+
+| slice | shape | today | the level |
+|---|---|---|---|
+| 5a | `x NOT IN (subquery)` (and `x <> ALL`), a top-level WHERE conjunct, uncorrelated or correlated by equalities | uncorrelated: a set run once, probed per row; correlated: hashed (9.9) or per row | a **null-aware anti join**: the subquery's rows hashed on (its keys, its value), with a summary per key |
+| 5b | correlated `EXISTS` and `IN` (subquery) under OR, NOT or CASE in WHERE, and in the select list and ORDER BY of a query without grouping | hashed (9.9) or per row | a **mark join**: the same hash, the level's one visible column a boolean (true, false, or NULL for IN), the expression reading it |
+| 5c | `x IN (subquery)` whose value is the inner table's key; EXISTS whose path has a range after its equalities | IN: a hash; a range: per row | `semiLook` widened: the inner table read per outer row by `x` (or by its range), by cost |
+
+The correlated ones that 9.9 could not hash (an outer value a lookup's
+key) are planned again without outer values as keys (section 42's
+alternative), as semi candidates are, and the level is taken when its hash
+costs less than a run per row (`semiCheaper`).
+
+### 50.2 The NULL rules
+
+Per outer row, with k its correlation keys (none when uncorrelated) and
+S(k) the subquery's values for them, IN is:
+
+- **false** when a key is NULL (`inner = NULL` holds for no row) or S(k)
+  is empty;
+- **NULL** when x is NULL (S(k) not empty);
+- **true** when x is in S(k) (by the IN set's keys: numbers by value,
+  texts by their text under IN's collation);
+- **NULL** when S(k) holds a NULL;
+- **false** otherwise.
+
+That is 9.9's `hashValue`. The level holds the rows hashed by (k, value),
+rows with a NULL key or value left out, and a summary per k: 1 rows, 3
+rows and a NULL value (uncorrelated: one summary). NOT IN keeps the row
+exactly when IN is false. The mark of an IN is IN's value; of an EXISTS,
+whether k's bucket has a row.
+
+### 50.3 When the level is valid
+
+- **What ran once runs once.** An uncorrelated subquery and one 9.9
+  hashed already run once before the query; the level runs them the same
+  way (`runSemi`), so no error and no value moves. A subquery planned
+  again to be hashed runs once in place of per outer row: as section 42's
+  `semiAltOk` (the same outer values, nothing volatile, no subquery of its
+  own), and also **nothing in it that can fail** (`cannotFail` on its
+  outputs, conditions and keys): an error a per-row run would reach only
+  for some outer rows (or none) must not appear.
+- **What the outer row evaluates, it evaluates on the same rows.** The
+  level is placed right after the level whose conditions held the
+  conjunct (not moved by `orderRows`, as 9.104's are), and only when the
+  conjunct is the last of that level's conditions, or every condition
+  after it, and the conjunct's own outer expressions (x and the keys),
+  cannot fail. A mark computes the subquery's value for every row reaching
+  it, where an OR or CASE might not have: its keys and x must not be able
+  to fail (the subquery's own value is computed once either way).
+- **No residual filter** (a correlated condition that is not a key,
+  9.104's `res`): the summary would depend on the outer row.
+- **Types:** the keys and the value as 9.104's semi join compares them
+  (`semiTypes`); a value read as another type (`subReads`) or a char(n)
+  value stays as it was. IN's collation: the row engine keys under any;
+  the pipeline takes an exact one only (else the row engine runs it).
+- **The mark's place:** a WHERE conjunct's mark goes right after its
+  level, the conjunct (reading the mark's column) its condition; the
+  select list's and ORDER BY's after the last level. Not in a query that
+  groups, aggregates, has windows, a set operation, DISTINCT ON, locks,
+  MATCH_RECOGNIZE or a function in FROM; not in an outer join's ON or in
+  the WHERE conjuncts kept after a LEFT JOIN's NULL row; not when the same
+  subquery is called anywhere else.
+- **IN by lookup:** one table, no grouping, aggregate, LIMIT, set
+  operation, window or lock; its output a plain column that leads its
+  primary key or an index; x of IN's exact collation and of the same kind
+  (both integers, or both text or varchar); `col = x` kept as a filter
+  unless both are integers. By cost against the hash, with statistics
+  only. NOT IN is never looked up.
+
+### 50.4 EXPLAIN
+
+```
+anti join (null-aware) t2: hash on (k, v) over rows of subquery 1
+mark join t2: hash on (k) over rows of subquery 2
+semi join t3: primary key lookup per row, filter per row read
+subquery 1 (in): anti join (null-aware) on t2.k = t1.k, run once
+subquery 2 (exists): mark join on t2.k = t1.k, run once
+```
+
+### 50.5 The switch and the tests
+
+`lexdb_plan.setUnnest(mode)`, bits `UN_NOTIN`, `UN_MARK`, `UN_LOOK`
+(default all): 0 gives today's plans, the reference the tests compare
+against. `SET lexdb_planner = rules` makes no cost choice (no alternative
+planned, no lookup by cost), as in section 42.
+
+Tests (`exec_unnest`): each query with the new plan, with `setUnnest(0)`
+and with `SET lexdb_batch = off`, the same rows or the same error; NULLs on
+both sides, an empty subquery, duplicates, text keys, correlated and not,
+under OR and NOT, in the select list and ORDER BY, under an aggregate,
+ORDER BY and LIMIT, an error in a later batch, the plans; the PostgreSQL,
+T-SQL and Oracle doors where they have the syntax.
+
