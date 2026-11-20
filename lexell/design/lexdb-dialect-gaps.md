@@ -94,6 +94,24 @@ query that works.
   find what lexdb_tsql already runs (batches, `INSERT ... EXEC`) and build
   on it. Size L: slice it, report per slice.
 
+## 2a. Every dialect that has the feature
+
+A feature is built once and exposed in each of the three dialects that
+has it natively (PostgreSQL, the default; T-SQL; Oracle), with each
+dialect's own syntax, names, result types and errors, and tested through
+each door. A dialect that lacks the feature does not get another's
+spelling of it. The counterparts to cover, per package (each agent checks
+what already works before building):
+
+| Package | PostgreSQL | SQL Server | Oracle |
+|---|---|---|---|
+| A | `SYSTEM_USER` (PG 16); `pg_sequences.last_value`; `pg_get_viewdef`; `quote_ident`; `EXTRACT(field FROM interval)`; `AT TIME ZONE 'UTC'`; `make_interval` | `SYSTEM_USER`, `QUOTENAME`, `OBJECT_DEFINITION`, `sys.sequences.last_value` | `SYS_EXTRACT_UTC`, `NUMTODSINTERVAL` (and `NUMTOYMINTERVAL`), `EXTRACT(... FROM interval)`, `DBMS_METADATA.GET_DDL` for views if cheap |
+| B | `CREATE OR REPLACE VIEW`; `ALTER TABLE ... RENAME [COLUMN]`; `ALTER COLUMN ... TYPE ... [USING]` | `CREATE OR ALTER`; `ALTER DATABASE ... SET`; `sp_rename`; `ALTER COLUMN col type` | `CREATE OR REPLACE VIEW`; `RENAME t TO u`, `ALTER TABLE ... RENAME COLUMN`; `ALTER TABLE ... MODIFY (col type)` |
+| C | `GENERATED ALWAYS AS (expr) STORED`; expression indexes | `col AS (expr) [PERSISTED]`; indexes on computed columns | `GENERATED ALWAYS AS (expr) VIRTUAL` (and the short form `col AS (expr)`); function-based indexes |
+| D | `percentile_cont/percentile_disc(f) WITHIN GROUP (ORDER BY x)` (aggregate; PostgreSQL has no window form) | `PERCENTILE_CONT/DISC ... WITHIN GROUP ... OVER (...)` | aggregate and `... OVER (PARTITION BY ...)` |
+| E | `GRANT/REVOKE ... ON TABLE` by the owner, `information_schema.table_privileges` / `role_table_grants`, `has_table_privilege` | `GRANT/REVOKE ... ON object`, `sys.database_permissions` | owner's object grants, `dba_/all_/user_tab_privs` |
+| F | `CREATE [OR REPLACE] FUNCTION/PROCEDURE`, `DROP`, `CALL` (SQL-language bodies first; PL/pgSQL only as far as lexdb already runs it) | `CREATE [OR ALTER] PROCEDURE/FUNCTION`, `DROP`, `EXEC`, `OUTPUT ... INTO @tv` | PL/SQL procedures and functions exist (lexdb_plsql): `CREATE OR REPLACE PROCEDURE/FUNCTION`, `DROP` checked, not rebuilt |
+
 ## 3. How it is run
 
 Two Sonnet agents at a time in their own worktrees, briefed from this note
