@@ -142,7 +142,7 @@ Queue (pairs that touch different files):
 | B | | not started |
 | C | | not started |
 | D | worktree-agent-a28c35465652ef944 | merged (6dc5e38f; TPC-H 0.991 of ca529e9d alternated, checksums equal); done, 2026-11-20: `ee73ea26` (aggregate, PostgreSQL and Oracle), `2337277c` (window form, SQL Server and Oracle); suite 211 of 211. Left: PostgreSQL's array fraction `percentile_cont(array[...])`; PostgreSQL's `42803` for an ungrouped column in the fraction (the value of the group's first row is used); SQL Server's 402 for text/dates is raised at the first row, not at compile (an empty set gives NULL); Oracle's messages ORA-30487, ORA-00907 (frame) and ORA-00932 are from memory, no Oracle server was available (expectations in `tns_percentile` are by hand); Oracle DATE interpolation rounds to microseconds, intervals are not testable in Oracle until its interval columns exist (package A) |
-| E | `worktree-agent-a5b25663707eeb5fb` | done, awaiting review; section 6 |
+| E | `worktree-agent-a5b25663707eeb5fb` | merged (f07b6e5d; TPC-H 0.973 of a1aa79e3 alternated, checksums equal; point selects unchanged); done, awaiting review; section 6 |
 | F | | not started |
 
 ## 5. Package A: what was done
@@ -261,3 +261,9 @@ without privilege on the table is the least sure; 23ai's ORA-41900 for DML
 without privilege on a readable table is still 01031 here). A view's text is
 kept unqualified and resolved along the reader's path, so a view made in
 another schema must name its tables with their schema to be read by others.
+
+Open points from review (package E): grant options are not modelled (PostgreSQL and SQL Server
+refuse WITH GRANT OPTION, Oracle accepts and ignores it); column privileges, DENY and schema
+permissions are not done; Oracle object privileges other than SELECT/INSERT/UPDATE/DELETE
+(ALTER, INDEX, ...) are still accepted and ignored; the TNS and TDS expectations (error numbers,
+view columns) are from documentation, not run against real servers.
