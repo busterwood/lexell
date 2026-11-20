@@ -6009,6 +6009,11 @@ pair were not examined here.
 #Q3 merged as 95b9968d (2026-11-20): suite 236; TPC-H 1.003 of 0f96fee9 alternated, both built with
 `-O`, checksums equal; point selects level (the agent's A/B, -0.05% to +0.02%).
 
+Q2 merged as a85d6a02 (2026-11-20): virtual columns computed on read; suite 244; TPC-H 1.023 of bc0c6a21
+alternated, server instructions equal within 0.01% on q20, q13, q3 (placement); point selects +0.07%, INSERT level.
+Open: a column alias list on a table with virtual columns breaks their expressions; its new T-SQL and Oracle
+answers were written by hand (to regenerate from the SQL Server container, which runs under podman).
+
 ### 6.3.Q3 as built (2026-11-20)
 
 Built on `worktree-agent-a6093c872adedcdc3` from main 0f96fee9. No
