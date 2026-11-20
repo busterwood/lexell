@@ -6241,6 +6241,48 @@ measured). Branch `worktree-agent-aac772f0b27ea504a` from main cbd664a6.
   keys, and planning a derived query once (E3: the binder settles which
   conjuncts it gets before planning it).
 
+### 6.3.Q6 as built (2026-11-20)
+
+Bushy joins, one shape: a hash whose build side is a join (a *build
+group*: a hub and one or two member tables hashed inside the build, the
+joined rows hashed and probed as one): lexdb-optimizer.md 49 (49.3 the
+search and the cost, 49.5 the row engine, 49.8 as built and measured).
+Branch `worktree-agent-a0cb1a031d1cae494` from main 1ccb366c.
+
+- **The plan:** the level chain stays left-deep with the group marked
+  (`Level.grp`); `joinsOver` makes the group one arm (`PJoin.how =
+  JH_JOIN`, its build a join plan in `PJoin.sub`). The pipeline runs the
+  build with `joinRows` into a hash builder (`lexdb_pipe.grpSetup`) and
+  probes it as any hash; the row engine runs the same chain left-deep
+  (each table hashed), and where no pipeline program holds the joins the
+  marks are cleared (`flatGroups`, exec's glue), so EXPLAIN shows what
+  runs. Not planned where the pipeline will not run the joins (a
+  correlated subquery that stays one: `grpRuns`).
+- **The choice:** a pass over the order the search chose (`grpPass`): a
+  run of it made one group where the group costs less than the steps it
+  replaces and the plan with groups costs under 0.9 of the order's
+  (`GRP_GAIN`); the hub's read priced as a hashed table's is (a first
+  version priced it as a batched scan and flipped a plan of exec_joincost
+  to one 2.9 times slower; a first version inside the exact DP took a
+  8-table star's planning from 246 to 2,065 us: the pass adds 1-5%).
+  `SET lexdb_planner = rules` makes none; `lexdb_plan.setBushy` (`BU_OFF`,
+  `BU_COST`, `BU_FORCE`) for tests.
+- **TPC-H:** q7 (supplier with nation n1, customer with nation n2: the
+  146k customer lookups now a hash) 934 -> 712 ms (-24%; instructions
+  -15%); q21 (supplier with nation) 1,218 -> 1,096 ms (-10%; instructions
+  -4%); no other plan changed; all 22 -3.1%, no query slower by more than
+  1.9%, checksums equal (two alternated rounds).
+- **Gates:** suite 247 of 247 (new: `exec_bushy`); point selects +0.001%
+  (`LXL_HASH_SEED=1`, three rounds); `lexdb_exec` 19,688 -> 19,700 lines
+  (glue only).
+- **Left:** the hashed read's price for the pipeline (section 45's
+  row-by-row figure overprices every hash the pipeline builds, a group's
+  and a left-deep one's; re-pricing it moves left-deep plans too); groups
+  whose tables are not adjacent in the chosen order; q5's and q8's
+  (region, nation, customer) shape (PostgreSQL's), which the model now
+  prices within 4% of left-deep; q9's supplier lookups (the rows estimated
+  low).
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does
