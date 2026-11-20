@@ -166,6 +166,8 @@ pub type CatView = record {
     pub roles: []Role
     pub sess: int
     pub mems: []str              // role memberships, as pg_auth_members reads them
+    pub used: Map[str, int]      // a sequence's last value given, by its key: those used (pg_sequences, sys.sequences, sys.identity_columns)
+    pub cur: Map[str, int]       // a sequence's current value: that last given, or the next one to give while none is (sys.sequences' current_value)
 }
 
 // A hex digit's value, -1 not one.
@@ -1395,15 +1397,45 @@ pub const OID_PG_CATALOG: int = 11
 pub const OID_INFO_SCHEMA: int = 13000
 pub const OID_OWNER: int = 10
 
+// PostgreSQL 18's keywords that are not unreserved (pg_get_keywords(): catcode R, T and C), sorted: quote_ident quotes them.
+const PG_KEYWORDS: []str = [
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "authorization", "between", "bigint", "binary", "bit",
+    "boolean", "both", "case", "cast", "char", "character", "check", "coalesce", "collate", "collation", "column", "concurrently",
+    "constraint", "create", "cross", "current_catalog", "current_date", "current_role", "current_schema", "current_time",
+    "current_timestamp", "current_user", "dec", "decimal", "default", "deferrable", "desc", "distinct", "do", "else", "end", "except",
+    "exists", "extract", "false", "fetch", "float", "for", "foreign", "freeze", "from", "full", "grant", "greatest", "group", "grouping",
+    "having", "ilike", "in", "initially", "inner", "inout", "int", "integer", "intersect", "interval", "into", "is", "isnull", "join",
+    "json", "json_array", "json_arrayagg", "json_exists", "json_object", "json_objectagg", "json_query", "json_scalar", "json_serialize",
+    "json_table", "json_value", "lateral", "leading", "least", "left", "like", "limit", "localtime", "localtimestamp", "merge_action",
+    "national", "natural", "nchar", "none", "normalize", "not", "notnull", "null", "nullif", "numeric", "offset", "on", "only", "or",
+    "order", "out", "outer", "overlaps", "overlay", "placing", "position", "precision", "primary", "real", "references", "returning",
+    "right", "row", "select", "session_user", "setof", "similar", "smallint", "some", "substring", "symmetric", "system_user", "table",
+    "tablesample", "then", "time", "timestamp", "to", "trailing", "treat", "trim", "true", "union", "unique", "user", "using", "values",
+    "varchar", "variadic", "verbose", "when", "where", "window", "with", "xmlattributes", "xmlconcat", "xmlelement", "xmlexists",
+    "xmlforest", "xmlnamespaces", "xmlparse", "xmlpi", "xmlroot", "xmlserialize", "xmltable"
+]
+
+fn isPgKeyword(n: &str): bool {
+    var lo = 0
+    var hi = len(PG_KEYWORDS)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if PG_KEYWORDS[mid] == n { return true }
+        if PG_KEYWORDS[mid] < n { lo = mid + 1 } else { hi = mid }
+    }
+    return false
+}
+
 // quote_ident: the name as is when it needs no quotes. PostgreSQL's rule:
-// a lower-case letter or _ first, then lower-case letters, digits and _.
+// a lower-case letter or _ first, then lower-case letters, digits and _,
+// and not a keyword that is reserved (in any of PostgreSQL's three senses).
 pub fn quoteIfNeeded(n: &str): str {
     var plain = len(n) > 0 && ((n[0] >= 'a' && n[0] <= 'z') || n[0] == '_')
     for i in 0..len(n) {
         let c = n[i]
         if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') { plain = false }
     }
-    if plain && lexdb_sql.isReservedWord(n) { plain = false }
+    if plain && isPgKeyword(n) { plain = false }
     return if plain { n.toStr() } else { "\"" + strings.replaceAll(&n, "\"", "\"\"") + "\"" }
 }
 

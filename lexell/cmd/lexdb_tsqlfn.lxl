@@ -25,7 +25,7 @@ pub fn isTsqlFn(name: &str): bool {
     match name {
         "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
         "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bitint",
-        "#bitnot" { return true }
+        "#bitnot", "#quotename" { return true }
         else { return false }
     }
 }
@@ -276,6 +276,52 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
             let first = lexdb_time.dateToTs(lexdb_time.tsToDate(us)) - (try datepart(&"day", &Val.Ts(us), z) - 1) * lexdb_time.DAY_US
             let next = try lexdb_time.tsPlus(first, &lexdb_time.Ival{months: add + 1, days: 0, us: 0})
             return Ok(Some(Val.Date(lexdb_time.tsToDate(next) - 1)))
+        }
+        "#quotename" {
+            // QUOTENAME(s [, quote]): s in brackets (or the quote character's pair), the closing one doubled inside;
+            // NULL for a NULL, for more than 128 characters (sysname) and for a quote character it does not know
+            if isNull(&vs[0]) || (n > 1 && isNull(&vs[1])) { return Ok(Some(Val.Null)) }
+            let s: str = match vs[0] {
+                Val.Bytes(b) { b.clone() }
+                else { sv(&vs[0]) }
+            }
+            let r = runes(&s)
+            if len(r) > 128 { return Ok(Some(Val.Null)) }
+            var open = "["
+            var close = "]"
+            if n > 1 {
+                let qr = runes(&sv(&vs[1]))
+                if len(qr) > 0 {
+                    // the quote argument's first character
+                    match fromRunes(&qr, 0, 1) {
+                        "[", "]" {}
+                        "(", ")" {
+                            open = "("
+                            close = ")"
+                        }
+                        "<", ">" {
+                            open = "<"
+                            close = ">"
+                        }
+                        "{", "}" {
+                            open = "{"
+                            close = "}"
+                        }
+                        "\"", "'", "`" {
+                            open = fromRunes(&qr, 0, 1)
+                            close = open.clone()
+                        }
+                        else { return Ok(Some(Val.Null)) }
+                    }
+                }
+            }
+            var sb = open.clone()
+            for i in 0..len(r) {
+                strings.addRune(mut &sb, r[i])
+                if r[i] == int(close[0]) { sb += &close }
+            }
+            sb += &close
+            return Ok(Some(Val.Text(sb)))
         }
         "#reverse" {
             let r = runes(&sv(&vs[0]))
