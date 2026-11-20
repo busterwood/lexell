@@ -4040,3 +4040,152 @@ subqueries.
 - A range lookup whose bounds are outer values runs in the row engine
   only (the pipeline's range join takes constant bounds).
 - EXISTS over more than two tables, or two joined by more than one column.
+
+## 51. Subquery unnesting, the second half: correlated aggregates as grouped levels (2026-11-20)
+
+Item Q7 of lexdb-layers.md 6.3, step 5's slices 5d and 5e (lexdb-layers.md
+6.1), after section 50's 5a-5c. The same machinery: the subquery planned,
+9.9's `hashSub` taking its `inner = outer` equalities out as keys, a level
+of its rows hashed on them; here the rows are groups.
+
+### 51.1 The shapes
+
+| slice | shape | today | the level |
+|---|---|---|---|
+| 5d | `x op (select agg(...) from ... where inner.k = outer.k ...)`, a scalar aggregate with no GROUP BY, HAVING, DISTINCT or LIMIT of its own, in a WHERE conjunct of a level, in the select list or ORDER BY | 9.9 groups it by its keys where no outer value is a path key (run once, probed per row by `hashValue` in the row engine: the query has `q.corr`, so no pipeline); else per row (`runSub`, its memo) | a **grouped level**: the subquery run once, grouped by its keys, its rows LEFT joined by a hash on them (one row a key at most); its call replaced by an expression over the level's columns |
+| 5d | the same with an index on the key | per row | planned again with no outer value as a key (section 42's alternative, so far for semi candidates only), the grouped level taken **by cost** (`groupCheaper`: `semiCheaper`'s terms, the groups' memory as a hash's) |
+| 5e | `FROM t, LATERAL (select aggs from ... where inner.k = t.k ...)`, CROSS JOIN LATERAL, LEFT JOIN LATERAL ... ON true, T-SQL's and Oracle's CROSS APPLY and OUTER APPLY, with or without GROUP BY | per row (`Level.lateral`: run per row, its rows memoized by the outer values) | a join and a grouping: the subquery's keys added to its GROUP BY and, hidden, to its columns, run once, joined on them by hash |
+
+### 51.2 Keys with no rows
+
+A run per row over a key with no inner rows gives one row of the
+aggregates over no rows: `count` 0, the others NULL, and the expression
+over them (`count(*) + 1` is 1, `coalesce(sum(v), 0)` is 0, `100 / count(*)`
+an error). A grouped run has no group for that key, and the LEFT join gives
+NULLs. So:
+
+- 5d: the call becomes `CASE WHEN <first key column> IS NULL THEN <value over
+  no rows> ELSE <the group's value> END` (a matched group's key is never
+  NULL: NULL keys match nothing). The value over no rows is the expression
+  with each aggregate replaced by `lexdb_agg.finish` over no rows, folded
+  at plan time when it has no parameter (an error left as the expression,
+  so it is raised only on a row whose key has no group, as per row). Where
+  it folds to NULL and the expression gives NULL for NULL aggregates (a
+  column, arithmetic, casts), the CASE is left out.
+- 5e without GROUP BY: one row for every outer row; the join is LEFT,
+  whatever it was written as (CROSS JOIN LATERAL keeps every outer row too),
+  and a column whose value over no rows is not NULL is read through the same
+  CASE (the column made virtual in the query's row, `ColDef.gen`, as Q2's
+  virtual columns are read). An ON other than `true` is refused (the row is
+  always there; the ON would filter or NULL it by the values).
+- 5e with GROUP BY: a key with no rows has no group, as a run of it has no
+  row: CROSS and INNER JOIN drop the outer row, LEFT JOIN keeps it with
+  NULLs. The ON stays the join's.
+
+### 51.3 When it is valid (errors)
+
+- **What runs once runs once.** A subquery 9.9 already grouped runs once
+  today; the level runs it the same way. A subquery planned again to be
+  grouped runs once in place of per outer row: its conditions, paths,
+  keys, the aggregates' arguments, FILTERs and ORDER BYs must not be able
+  to fail (`noFail`, 50.3's `altSafe` and the aggregates' `specsSafe`): an
+  error in a row a run per row never reads must not appear.
+- **The expression over the aggregates** (q20's `0.5 * sum(l_quantity)`)
+  may fail (arithmetic). Where it cannot (`grpSafe` with the aggregates as
+  values) or 9.9 evaluates it per group already, it stays in the subquery
+  (one value column); else the level holds the aggregates themselves (count,
+  sum, avg, min and max, typed as the select list types them) and the
+  expression is evaluated per outer row, as a run per row evaluates it.
+- **The same rows evaluate the conjunct.** The level goes right after the
+  level whose conditions held the conjunct (a build group's last member),
+  only where every condition then evaluated before it cannot fail (50.3's
+  `takeOutOk`); the keys' outer values are evaluated for every row reaching
+  the level, so they may not fail (`valsFree`), and with conditions moved
+  before it the conjunct itself may not fail.
+- **Types:** the keys compared as 9.104's semi join compares them
+  (`semiTypes`).
+- 5e: the subquery's outputs and HAVING over the aggregates must not fail
+  (they are evaluated for every key's group); no LIMIT, window, DISTINCT,
+  set operation or ORDER BY that would apply per outer row. By 9.9's rule:
+  where an outer value is a path's key (an index on it) it stays per row.
+
+### 51.4 The magic set and q20
+
+The task asked for a magic-set restriction (the inner side grouped only for
+the outer side's keys) where the outer side is small and the inner has no
+index. Measured first: see 51.7.
+
+### 51.5 EXPLAIN
+
+```
+left join subquery 2: hash on (l_partkey, l_suppkey) over rows of subquery 2
+subquery 2 (scalar): grouped on lineitem.l_partkey = partsupp.ps_partkey, ..., run once
+left join x: hash on (k) over rows of subquery 1
+subquery 1 (from): grouped on t3.k = t1.c, run once
+```
+
+### 51.6 The switch and the tests
+
+`lexdb_plan.setUnnest`: `UN_SCALAR` (5d), `UN_LATERAL` (5e); without them,
+section 50's plans. Under `SET lexdb_planner = rules` no plan is made again
+and nothing is chosen by cost (9.9's grouped subqueries still become
+levels, as 50's do). Tests: `exec_unnest_agg` (each query with the new
+plan, the plan before and batches off), `tds_unnest_agg` and
+`tns_unnest_agg` (the doors).
+
+### 51.7 q20, measured first
+
+q20 (SF1, `-O`, main b519a837, warm, one core): 230 ms, of which the
+outer side (part's 2,127 'forest%' parts, partsupp's 8,508 rows by them)
+is 16 ms and the scalar subquery run per partsupp row (8,508 runs, memo
+hits 0) the rest. EXPLAIN ANALYZE: `scan lineitem: index lineitem_part_supp
+lookup, rows in key order (rows read 63832, kept 9741, batches 8506)`.
+The same outer query with other subqueries in its place (`~/tpch-w/q7b`,
+`v20b.sql`, `v20c.sql`, two runs each):
+
+| the subquery | ms | what it adds |
+|---|---:|---|
+| none (the outer side alone) | 16 | |
+| `min(ps_supplycost)` of partsupp by its primary key (one row a run) | 55 | the per-run machinery: about 4.6 us a run, 39 ms |
+| `count(*)` of lineitem by the index, index only (no row read) | 84 | the index's 63,832 entries: 29 ms |
+| `0.5 * sum(l_quantity)`, no date filter | 179-188 | the 63,832 rows read by primary key: about 100 ms (1.6 us a row) |
+| q20's, the dates `date '1994-01-01' + interval '1 year'` | 205-209 | the filter: about 20 ms, of which 6 ms is the interval constant evaluated per run (a date literal: 200 ms) |
+
+A profile of 10 warm runs (`perf`, `LXL_NATIVE_MAP`) agrees: 44% of the
+samples in `getManyIn` (the rows by primary key, its `fingerTo` 16%:
+seven or eight random keys a run, no locality between runs), 6% the
+index ranges, about 20% the per-run setup (`prepareIn` 4.3%,
+`bCompileD` 4.6% compiling the conditions for each run, `pipeSrcQ`,
+`aggSets`, the interval's parse and casts 3-5%).
+
+What unnesting could do for it:
+
+- **Grouped (hashed) over all of lineitem:** the alternative planned
+  without outer keys scans lineitem's 6M rows and groups the 909,455 of
+  1994 by (l_partkey, l_suppkey): the grouping alone exceeds the
+  statement's memory (256 MB, `max_statement_mem`); a full scan of
+  lineitem costs 400-450 ms (q6). `groupCheaper` refuses it on both
+  counts (8,508 runs at `semiRun`'s index cost against 6M rows to hash;
+  groups over half the memory), so q20's plan is unchanged.
+- **A magic set** (the inner rows grouped only for the outer side's keys):
+  with lineitem_part_supp, restricting by l_partkey in the outer side's
+  2,127 parts reads the same 63,832 entries and rows; the rows by primary
+  key are the cost, not the runs. Measured: the join of partsupp and
+  lineitem by that index in the pipeline (`set lexdb_planner = rules`,
+  the plan a magic set would run) takes 336 ms against 205 for the runs
+  per row; the same with batches off 1,120. With no index on the inner
+  side (the case the magic set is for) the inner would be scanned once in
+  place of per outer row; nothing in TPC-H has that shape, and the outer
+  side's keys exist only once the outer query runs (a build after the
+  probe side), which today's structures (a subquery run before the query,
+  `runSubs`) do not do. Not built: see 51.8.
+- **The per-row path's cost:** about 20% of q20 (setup per run: the
+  conditions compiled per run, the constants evaluated per run). Folding
+  constants at plan time must not fold anything the session can change
+  (a time zone, a cached plan's later `SET`), and compiling a run's
+  conditions once needs the pipeline's programs to take parameters as
+  slots; neither is unnesting. Left (51.8).
+
+So q20 stays per row, PostgreSQL's plan too (a subplan per row over the
+index); its gap to PostgreSQL's 133 ms is the row fetch by primary key
+(1.6 us a row here) and the per-run setup.
