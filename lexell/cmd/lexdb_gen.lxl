@@ -72,39 +72,85 @@ pub fn needDeps(cols: &[]ColDef, need: mut &[]bool) {
         if cols[i].genKind != lexdb_sql.GEN_VIRTUAL || !need[i] { continue }
         match cols[i].gen {
             Some(x) {
-                var ns: []str = []
-                lexdb_sql.colNames(&x, mut &ns)
-                for n in ns {
-                    let j = lexdb_bind.colIndex(cols, &n)
-                    if j >= 0 { need[j] = true }
-                }
+                needReads(cols, &x, need)
             }
             None {}
         }
     }
 }
 
-// x with each column's name qualified by alias.
-fn qualify(x: &Expr, alias: &str): Expr {
+// need[j] for each column j that x reads: by the place it carries where that is a column of that name, else by name.
+fn needReads(cols: &[]ColDef, x: &Expr, need: mut &[]bool) {
     match x {
-        Expr.Col(n, _) { return Expr.Col(alias + "." + n, -1) }
-        Expr.Unary(op, a) { return Expr.Unary(op.clone(), qualify(&a, alias)) }
-        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), qualify(&a, alias), qualify(&b, alias)) }
-        Expr.IsNull(a, neg) { return Expr.IsNull(qualify(&a, alias), neg) }
+        Expr.Col(n, s) {
+            if s >= 0 && s < len(cols) && cols[s].name == n { need[s] = true; return }
+            let j = lexdb_bind.colIndex(cols, &n)
+            if j >= 0 { need[j] = true }
+        }
+        Expr.Unary(_, a) { needReads(cols, &a, need) }
+        Expr.Bin(_, a, b) { needReads(cols, &a, need); needReads(cols, &b, need) }
+        Expr.IsNull(a, _) { needReads(cols, &a, need) }
+        Expr.Call(_, args, _) { for a in args { needReads(cols, &a, need) } }
+        Expr.Cast(a, _) { needReads(cols, &a, need) }
+        else {}
+    }
+}
+
+// x, an expression of a table's columns cols, in the terms of the query's columns qcols, the table's first being qcols[first]
+// and the table alias in it: each column read is the query's (its name alias.column, its slot). A column read at a slot of cols
+// whose name it has (the slot a table's expression carries, and the one a column alias list keeps: see renamedGens) is the
+// query's column at the same place whatever the names are, so a table's own names do not need to be the query's; any other
+// is looked up by name.
+fn termsOf(x: &Expr, cols: &[]ColDef, alias: &str, qcols: &[]ColDef, first: int): Expr {
+    match x {
+        Expr.Col(n, s) {
+            if s >= 0 && s < len(cols) && cols[s].name == n && first + s < len(qcols) { return Expr.Col(qcols[first + s].name.clone(), first + s) }
+            return lexdb_sql.slotted(&Expr.Col(alias + "." + n, -1), qcols)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), termsOf(&a, cols, alias, qcols, first)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), termsOf(&a, cols, alias, qcols, first), termsOf(&b, cols, alias, qcols, first)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(termsOf(&a, cols, alias, qcols, first), neg) }
         Expr.Call(n, args, star) {
             var out: []Expr = []
-            for a in args { append(mut &out, qualify(&a, alias)) }
+            for a in args { append(mut &out, termsOf(&a, cols, alias, qcols, first)) }
             return Expr.Call(n.clone(), out, star)
         }
-        Expr.Cast(a, t) { return Expr.Cast(qualify(&a, alias), t) }
+        Expr.Cast(a, t) { return Expr.Cast(termsOf(&a, cols, alias, qcols, first), t) }
         else { return lexdb_sql.cloneExpr(x) }
     }
 }
 
-// A table column's generation expression x (the table's terms) in the terms of a query's columns qcols, the table being alias in
-// it: names alias.column, the query's slots.
-pub fn inTerms(x: &Expr, alias: &str, qcols: &[]ColDef): Expr {
-    return lexdb_sql.slotted(&qualify(x, alias), qcols)
+// x with the columns it reads named as cols now names them: old is what cols were called (a column alias list, t AS x(a, b),
+// renamed the first of them), each read keeping the place it is of the table.
+fn renamedExpr(x: &Expr, old: &[]str, cols: &[]ColDef): Expr {
+    match x {
+        Expr.Col(n, _) {
+            for i in 0..len(old) { if old[i] == n { return Expr.Col(cols[i].name.clone(), i) } }
+            return lexdb_sql.cloneExpr(x)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), renamedExpr(&a, old, cols)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), renamedExpr(&a, old, cols), renamedExpr(&b, old, cols)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(renamedExpr(&a, old, cols), neg) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, renamedExpr(&a, old, cols)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        Expr.Cast(a, t) { return Expr.Cast(renamedExpr(&a, old, cols), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// The virtual columns of cols (a table a column alias list has just renamed: t AS x(a, b)) read the columns by the names they
+// have now, each keeping its place: the expression is the table's own, its names are not the query's. old: the names before.
+pub fn renamedGens(cols: mut &[]ColDef, old: &[]str) {
+    for i in 0..len(cols) {
+        if cols[i].genKind != lexdb_sql.GEN_VIRTUAL { continue }
+        match cols[i].gen {
+            Some(g) { cols[i].gen = Some(renamedExpr(&g, old, cols)) }
+            None {}
+        }
+    }
 }
 
 // Virtual column k of a table (cols: the table's columns), the table being alias in the query whose columns are qcols: its
@@ -114,7 +160,7 @@ pub fn setQueryGen(cols: &[]ColDef, k: int, alias: &str, qcols: mut &[]ColDef, a
     if cols[k].genKind != lexdb_sql.GEN_VIRTUAL { return Ok(Unit{}) }
     match cols[k].gen {
         Some(g) {
-            let r = try lexdb_bind.resolve(&inTerms(&g, alias, qcols), qcols, len(qcols), ns)
+            let r = try lexdb_bind.resolve(&termsOf(&g, cols, alias, qcols, at - k), qcols, len(qcols), ns)
             let have = lexdb_bind.exprOid(&r, qcols, &lexdb_bind.ptypesOf(ns), &ns.ty)
             ns.virt = true
             qcols[at].genKind = lexdb_sql.GEN_VIRTUAL
