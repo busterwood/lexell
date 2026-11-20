@@ -27,18 +27,28 @@
 //   pair, joins before and after it (hash, LEFT, FULL, RIGHT, a lookup), a
 //   view, VALUES, a derived table and a series, LIMIT, ORDER BY, DISTINCT,
 //   aggregates, errors in a later batch.
+// - MERGE with WHEN NOT MATCHED BY SOURCE (the source's join with the target
+//   is RIGHT, FULL with NOT MATCHED): over 3,000 source rows, in a rolled-back
+//   transaction, the result (tag, RETURNING rows, OUTPUT, the error) and the
+//   tables afterwards compared as text; clause conditions, DO NOTHING, VALUES,
+//   a view and a derived table as the source, NULL and repeated source keys,
+//   a target matched twice, CHECK, FK and expression errors in a later batch,
+//   T-SQL's forms (BY TARGET, TOP, OUTPUT $action); a few source rows and an
+//   ON with no key stay row by row.
 // "batched": statements whose join ran in batches with them on.
 // timeout: 120
 // expect: loaded: 1500|1300|0|800
 // expect: full: 42 statements, 42 the same, 42 batched, 0 batched with batches off, 4 errors or no rows seen
 // expect: multi: 40 statements, 40 the same, 40 batched, 0 batched with batches off, 3 errors or no rows seen
 // expect: cross: 41 statements, 41 the same, 41 batched, 0 batched with batches off, 7 errors or no rows seen
+// expect: merge: 32 statements, 32 the same, 30 batched, 0 batched with batches off, 10 errors or no rows seen
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_pipe"
 import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
 
 fn text(rs: &[lexdb_exec.Res]): str {
     var out: []str = []
@@ -54,6 +64,23 @@ fn text(rs: &[lexdb_exec.Res]): str {
 }
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    // "T: " begins a statement in T-SQL's dialect (MERGE ... WHEN NOT MATCHED BY SOURCE, TOP, OUTPUT)
+    if strings.startsWith(sql, "T: ") {
+        let none: []str = []
+        var p = lexdb_parse.tsqlParser(sql[3..len(sql)], lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &none).unwrap()
+        match p.statement() {
+            Ok(stmt) {
+                var pc = lexdb_exec.oneShot()
+                let noVals: []lexdb_sql.Val = []
+                let noTypes: []int = []
+                match s.runCached(&stmt, &noVals, &noTypes, mut &pc) {
+                    Ok(r) { return text(&[r]) }
+                    Err(e) { return "ERROR " + e.state + " " + e.msg + " [" + e.detail + "]" }
+                }
+            }
+            Err(e) { return "PARSE " + e.state + " " + e.msg }
+        }
+    }
     match s.exec(sql) {
         Ok(rs) { return text(&rs) }
         Err(e) { return "ERROR " + e.state + " " + e.msg }
@@ -94,6 +121,56 @@ fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, batched: bool) {
     }
 }
 
+// The tables a MERGE changes, a digest of every row in key order.
+fn digest(s: mut &lexdb_exec.Session): str {
+    let a = q(s, &"select count(*), md5(string_agg(id || ':' || coalesce(v::text, 'N') || ':' || coalesce(w::text, 'N') || ':' || coalesce(r::text, 'N') || ':' || coalesce(name, 'N'), ',' order by id)) from tg")
+    let b = q(s, &"select count(*), md5(string_agg(id || ':' || tid, ',' order by id)) from kid")
+    return a + " / " + b
+}
+
+// A statement of sql run in a transaction rolled back, with batches off or on: its result and the tables after it.
+fn mtrial(s: mut &lexdb_exec.Session, sql: &str, on: bool, ran: mut &bool): str {
+    let m = q(s, &(if on { "set lexdb_batch = on" } else { "set lexdb_batch = off" }))
+    let b = q(s, &"begin")
+    let j0 = lexdb_pipe.joinCounts()
+    let res = q(s, sql)
+    let j1 = lexdb_pipe.joinCounts()
+    var d = ""
+    if !strings.startsWith(&res, "ERROR") { d = digest(s) }
+    let r = q(s, &"rollback")
+    if len(d) == 0 { d = digest(s) }
+    ran = j1[0] > j0[0]
+    return res + " // " + d
+}
+
+// check for a statement that changes tables: the same result and tables afterwards.
+fn mcheck(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, batched: bool) {
+    var ranOff = false
+    var ranOn = false
+    let off = mtrial(s, sql, false, mut &ranOff)
+    let on = mtrial(s, sql, true, mut &ranOn)
+    g.n += 1
+    if off == on {
+        g.same += 1
+    } else if len(g.seen) < 3 {
+        append(mut &g.seen, "DIFFERENT: " + sql + "\n  off: " + strings.substr(&off, 0, min(len(off), 300)) + "\n  on:  " + strings.substr(&on, 0, min(len(on), 300)))
+    }
+    if strings.startsWith(&on, "PARSE") && len(g.seen) < 3 { append(mut &g.seen, "NOT PARSED: " + sql + " " + on) }
+    if ranOn { g.batched += 1 }
+    if ranOff { g.off += 1 }
+    if strings.startsWith(&off, "ERROR") || strings.startsWith(&off, "MERGE 0") { g.odd += 1 }
+    if batched != ranOn && len(g.seen) < 3 {
+        append(mut &g.seen, "EXPECTED " + (if batched { "batched" } else { "row" }) + ": " + sql)
+    }
+}
+
+// VALUES of n rows (k, v), k from lo.
+fn values(lo: int, n: int): str {
+    var xs: []str = []
+    for i in 0..n { append(mut &xs, "(" + (lo + i).toStr() + ", " + ((lo + i) * 3).toStr() + ")") }
+    return "(values " + strings.join(&xs, ", ") + ") as x(k, v)"
+}
+
 fn report(name: &str, g: &Group) {
     println(name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same, " + g.batched.toStr() + " batched, " + g.off.toStr() +
             " batched with batches off, " + g.odd.toStr() + " errors or no rows seen")
@@ -123,6 +200,23 @@ fn main() {
         let x5 = q(mut &s, &"insert into x1 values (1, 10)")
         let x6 = q(mut &s, &"insert into x3 values (1, 5), (2, 6), (3, null)")
         let x7 = q(mut &s, &"insert into x3k select g, g * 2 from generate_series(1, 3000) g")
+        // MERGE: a target tg (4,000 rows; a CHECK and a foreign key to par), its children kid (cascade),
+        // sources msrc (4,000 rows: k not a multiple of 5, up to 5,000), mdup (a key twice), mnull (NULL
+        // and repeated keys)
+        let m1 = q(mut &s, &"create table par (id int primary key)")
+        let m2 = q(mut &s, &"insert into par select g from generate_series(1, 100) g")
+        let m3 = q(mut &s, &"create table tg (id int primary key, v int, w int check (w >= 0), r int references par (id), name text)")
+        let m4 = q(mut &s, &"insert into tg select g, g, g % 10, g % 100 + 1, case when g % 17 = 0 then null else 'n' || g end from generate_series(1, 4000) g")
+        let m5 = q(mut &s, &"create table kid (id int primary key, tid int references tg (id) on delete cascade)")
+        let m6 = q(mut &s, &"insert into kid select g, g * 2 from generate_series(1, 1900) g")
+        let m7 = q(mut &s, &"create table msrc (k int, v int)")
+        let m8 = q(mut &s, &"insert into msrc select g, g * 5 from generate_series(1, 5000) g where g % 5 <> 0")
+        let m9 = q(mut &s, &"create table mdup (k int, v int)")
+        let ma = q(mut &s, &"insert into mdup select g, g from generate_series(1, 3000) g")
+        let mb = q(mut &s, &"insert into mdup values (2900, 0)")
+        let mc = q(mut &s, &"create table mnull (k int, v int)")
+        let md = q(mut &s, &"insert into mnull select case when g % 9 = 0 then null else g % 1500 end, g from generate_series(1, 2500) g")
+        let me = q(mut &s, &"create view msv as select k, v + 1 as v from msrc where k % 2 = 0")
         let c9 = q(mut &s, &"analyze")
         println("loaded: " + q(mut &s, &"select (select count(*) from fa), (select count(*) from fb), (select count(*) from fe), (select count(*) from fc)"))
 
@@ -281,6 +375,50 @@ fn main() {
         check(mut &s, mut &g, "select a.id, b.id from x3 a join x3k b on 100 / (a.id + b.id - 2800) > 0", true)
         check(mut &s, mut &g, "select a.id, b.id from x3k a join x3k b on a.id = 3 and b.id > 2990 and 100 / (b.id - 2995) > 0", true)
         report("cross", &g)
+
+        // MERGE with WHEN NOT MATCHED BY SOURCE (a RIGHT join of the source and the target, FULL with NOT MATCHED too),
+        // the clauses' rules and the first match per target row as the row engine's
+        g = newGroup()
+        let upd = "when matched then update set v = m.v "
+        let ins = "when not matched then insert (id, v, w, r, name) values (m.k, m.v, 1, 1, 'new') "
+        let bys = "when not matched by source then delete"
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source then update set v = -tg.v", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source and tg.id % 2 = 0 then delete when not matched by source then update set v = 0", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched and m.k > 3000 then delete " + upd + " when not matched by source and tg.id > 3000 then do nothing " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + ins + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + ins + "when not matched by source then update set name = 'gone'", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + ins + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched and m.k % 3 = 0 then update set v = m.v when not matched and m.k < 4500 then insert (id, v, w, r) values (m.k, 1, 1, 1) when not matched by source and tg.id % 7 = 0 then delete", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + ins + "when not matched by source then do nothing", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + bys + " returning merge_action(), tg.id, m.k, tg.v", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k " + upd + ins + bys + " returning merge_action(), tg.id, m.k, tg.v, tg.name", true)
+        // other sources: VALUES (rows the run holds), a view, a derived table, NULL and repeated keys
+        mcheck(mut &s, mut &g, "merge into tg using " + values(3000, 1500) + " on tg.id = x.k when matched then update set v = x.v " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using " + values(3500, 1200) + " on tg.id = x.k when matched then update set v = x.v when not matched then insert (id, v, w, r) values (x.k, x.v, 2, 2) " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msv m on tg.id = m.k when matched then update set v = m.v " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using (select k, v from msrc where k > 2000) m on tg.id = m.k when matched then update set v = m.v when not matched by source then update set v = 1", true)
+        mcheck(mut &s, mut &g, "merge into tg using mnull m on tg.id = m.k when not matched by source then update set v = 2", true)
+        mcheck(mut &s, mut &g, "merge into tg using mnull m on tg.id = m.k " + ins + "when not matched by source and tg.id < 100 then delete", true)
+        mcheck(mut &s, mut &g, "merge into tg using mnull m on tg.id = m.k when matched then update set v = m.v " + bys, true)
+        // errors: a target matched twice (21000), a CHECK, a foreign key, an expression, a unique violation, in a later batch; atomic
+        mcheck(mut &s, mut &g, "merge into tg using mdup m on tg.id = m.k when matched then update set v = m.v " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using mdup m on tg.id = m.k when matched then delete when not matched by source then update set v = 3", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source and tg.id > 3500 then update set w = -1", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source and tg.id > 3900 then update set r = 9999", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source then update set v = 100 / (tg.id - 3990)", true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when matched then update set v = 100 / (m.k - 3990) " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched then insert (id, v, w, r) values (m.k % 100, m.v, 1, 1) " + bys, true)
+        mcheck(mut &s, mut &g, "merge into tg using msrc m on tg.id = m.k when not matched by source and tg.id <= 1900 then delete", true)
+        // T-SQL: WHEN NOT MATCHED BY SOURCE, BY TARGET, TOP and OUTPUT
+        mcheck(mut &s, mut &g, "T: MERGE tg USING msrc m ON tg.id = m.k WHEN MATCHED THEN UPDATE SET v = m.v WHEN NOT MATCHED BY SOURCE THEN DELETE;", true)
+        mcheck(mut &s, mut &g, "T: MERGE tg USING msrc m ON tg.id = m.k WHEN NOT MATCHED BY TARGET THEN INSERT (id, v, w, r) VALUES (m.k, m.v, 1, 1) WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = -1 OUTPUT $action, inserted.id, deleted.id;", true)
+        mcheck(mut &s, mut &g, "T: MERGE TOP (700) tg USING msrc m ON tg.id = m.k WHEN MATCHED THEN UPDATE SET v = 7 WHEN NOT MATCHED BY SOURCE THEN DELETE;", true)
+        mcheck(mut &s, mut &g, "T: MERGE tg USING mdup m ON tg.id = m.k WHEN MATCHED THEN UPDATE SET v = m.v WHEN NOT MATCHED BY SOURCE THEN DELETE;", true)
+        // not batched: a few source rows (held, under a batch), and an ON with no key to hash on
+        mcheck(mut &s, mut &g, "merge into tg using (values (1, 5), (2, 6), (5000, 7)) as x(k, v) on tg.id = x.k when matched then update set v = x.v " + bys, false)
+        mcheck(mut &s, mut &g, "merge into tg using (select k, v from msrc where k < 4) m on tg.id > m.k + 3990 when matched then update set v = m.v " + bys, false)
+        report("merge", &g)
         s.close()
         return 0
     }).unwrap()
