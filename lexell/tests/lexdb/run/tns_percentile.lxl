@@ -1,0 +1,199 @@
+// lexdb over TNS: PERCENTILE_CONT and PERCENTILE_DISC (design/lexdb-dialect-gaps.md, package D), the
+// aggregate and the window form (OVER (PARTITION BY ...)) as Oracle writes them: fractions 0 to 1, even and
+// odd counts, ties, NULLs, DESC, one row and none, groups and partitions of a few and of thousands of rows,
+// the result types (a NUMBER from numbers, the DATE or TIMESTAMP itself from datetimes, the key's own for
+// percentile_disc), beside other analytic calls, and the errors.
+//
+// The expected values are computed by hand from Oracle's definitions (no Oracle server was at hand; SQL
+// Server's and PostgreSQL's answers for the same data are in tds_percentile and exec_pct):
+//   percentile_cont(f): RN = 1 + f * (N - 1); (CRN - RN) * v[FRN] + (RN - FRN) * v[CRN] over the values
+//     sorted by the key (NULLs left out); percentile_disc(f): the ceil(f * N)'th value (the first for f = 0).
+// ORA-30493 (a fraction outside 0 to 1) is the number the Oracle documentation gives; ORA-30487 for an ORDER
+// BY in the OVER clause and ORA-00932 for text under percentile_cont are from memory of Oracle's messages,
+// not checked against a server.
+// Each query (b) runs on the batches' path and on the row engine (set lexdb_batch = off) and must give the
+// same rows (a line DIFFERENT otherwise). Each line: a label, then the columns' names, then the rows (| between
+// columns' values, ; between rows), or error and the ORA- number.
+// expect: create pt: 0
+// expect: insert pt: 12
+// expect: aggregate by group: G,C,D = 1|2.5|2;2|5|5;3|NULL|NULL;4|7|7;5|42|42
+// expect: aggregate desc: C,D = 3.25|4
+// expect: fractions cont: P0,P25,P90,P100 = 1|1.75|3.7|4
+// expect: fractions disc: P0,P25,P26,P75,P100 = 1|1|2|3|4
+// expect: whole table: C,D,N = 6|5|10
+// expect: no rows: C,D = NULL|NULL
+// expect: only nulls: C,D = NULL|NULL
+// expect: one row: C,D,E = 42|42|42
+// expect: ties: C,D,E,F = 7|7.8|7|9
+// expect: numbers and decimals: C,DD,CF,DF = 3|2.5|3|2.5
+// expect: datetimes: C,D,CT,DT2 = '2020-01-03T12:00:00'|'2020-01-03T00:00:00'|'2020-01-03T18:00:00'|'2020-01-04T12:00:00'
+// expect: texts: A,B = 'b'|'c'
+// expect: expression key: C = 6
+// expect: over partition: G,C,D = 1|2.5|2;2|5|5;3|NULL|NULL;4|7|7;5|42|42
+// expect: over each row: ID,X,C,RN = 1|1|2.5|1;2|2|2.5|2;3|3|2.5|3;4|4|2.5|4;5|5|5|1;6|NULL|5|2;7|NULL|NULL|1
+// expect: over desc: ID,C,D = 1|3.25|4;2|3.25|4;3|3.25|4;4|3.25|4
+// expect: over whole table: C,D = 6|5
+// expect: over mixed with other calls: ID,A,B,S,N = 1|2|4|10|1;2|2|4|10|2;3|2|4|10|3;4|2|4|10|4;8|7|4|30|1;9|7|4|30|2;10|7|4|30|3;11|7|4|30|4
+// expect: over datetimes: C = '2020-01-03T12:00:00'
+// expect: over after grouping: G,C = 1|10;2|5;3|NULL;4|30;5|42
+// expect: fraction above one: error 30493
+// expect: fraction below zero: error 30493
+// expect: fraction above one over: error 30493
+// expect: cont of text: error 932
+// expect: over order by: error 30487
+// expect: over frame: error 907
+// expect: create bigp: 0
+// expect: fill 1: 1600
+// expect: fill 2: 1501
+// expect: fill 3: 2000
+// expect: fill 4: 1
+// expect: fill 5: 1
+// expect: big aggregate: G,C,D = 1|800.5|800;2|477|477;3|3000|2997;4|10|10;5|NULL|NULL
+// expect: big aggregate 2: G,C,D,E = 1|160.9|1599|1600;2|95|998|999;3|602.4|5994|5997;4|10|10|10;5|NULL|NULL|NULL
+// expect: big window: G,N,LO,HI = 1|1600|800.5|800.5;2|1501|477|477;3|2000|3000|3000;4|1|10|10;5|1|NULL|NULL
+// expect: big window 2: G,N,M = 1|1600|480;2|1501|287;3|2000|1797;4|1|10;5|1|NULL
+// expect: big whole: C,D,N = 618|618|5103
+// expect: big window whole: N,LO,HI = 5103|618|618
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows.
+fn q(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            println(label + ": " + strings.join(&names, ",") + " = " + strings.join(&rs, ";"))
+        }
+        Err(e) { println(label + ": error " + e.code.toStr()) }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn x(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { println(label + ": " + n.toStr()) }
+        Err(e) { println(label + ": error " + e.code.toStr()) }
+    }
+}
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+
+// A query's names and rows, as a string.
+fn qs(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A query on the row engine and on the batches' path: the same, or DIFFERENT and both.
+fn qb(c: mut &oracle.Conn, label: &str, sql: &str) {
+    let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+    let off = qs(mut &c, sql)
+    let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+    let on = qs(mut &c, sql)
+    if off == on { println(label + ": " + on) } else { println(label + ": DIFFERENT rows: " + off + " batches: " + on) }
+}
+
+fn client(port: &str) {
+    var c = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb"))
+    x(mut &c, "create pt", "create table pt (id number(10) primary key, g number, x number, d number(10,2), f binary_double, s varchar2(10), dt date, ts timestamp)")
+    x(mut &c, "insert pt", "insert into pt select 1, 1, 1, 1.5, 1.5, 'a', date '2020-01-01', timestamp '2020-01-01 00:00:00' from dual union all select 2, 1, 2, 2.5, 2.5, 'b', date '2020-01-03', timestamp '2020-01-03 00:00:00' from dual union all select 3, 1, 3, 3.5, 3.5, 'c', date '2020-01-04', timestamp '2020-01-04 12:00:00' from dual union all select 4, 1, 4, 10, 10, 'd', date '2020-01-10', timestamp '2020-01-10 00:00:00' from dual union all select 5, 2, 5, 7, 7, 'e', date '2020-02-01', timestamp '2020-02-01 00:00:00' from dual union all select 6, 2, null, null, null, null, null, null from dual union all select 7, 3, null, null, null, null, null, null from dual union all select 8, 4, 7, 7, 7, 'x', date '2021-01-01', timestamp '2021-01-01 00:00:00' from dual union all select 9, 4, 7, 7, 7, 'x', date '2021-01-01', timestamp '2021-01-01 00:00:00' from dual union all select 10, 4, 7, 7, 7, 'y', date '2021-01-02', timestamp '2021-01-02 00:00:00' from dual union all select 11, 4, 9, 9, 9, 'z', date '2021-01-03', timestamp '2021-01-03 00:00:00' from dual union all select 12, 5, 42, 42.5, 42.5, 'q', date '2022-02-02', timestamp '2022-02-02 00:00:00' from dual")
+    qb(mut &c, "aggregate by group", "select g, percentile_cont(0.5) within group (order by x) c, percentile_disc(0.5) within group (order by x) d from pt group by g order by g")
+    qb(mut &c, "aggregate desc", "select percentile_cont(0.25) within group (order by x desc) c, percentile_disc(0.25) within group (order by x desc) d from pt where g = 1")
+    qb(mut &c, "fractions cont", "select percentile_cont(0) within group (order by x) p0, percentile_cont(0.25) within group (order by x) p25, percentile_cont(0.9) within group (order by x) p90, percentile_cont(1) within group (order by x) p100 from pt where g = 1")
+    qb(mut &c, "fractions disc", "select percentile_disc(0) within group (order by x) p0, percentile_disc(0.25) within group (order by x) p25, percentile_disc(0.26) within group (order by x) p26, percentile_disc(0.75) within group (order by x) p75, percentile_disc(1) within group (order by x) p100 from pt where g = 1")
+    qb(mut &c, "whole table", "select percentile_cont(0.5) within group (order by x) c, percentile_disc(0.5) within group (order by x) d, count(x) n from pt")
+    qb(mut &c, "no rows", "select percentile_cont(0.5) within group (order by x) c, percentile_disc(0.5) within group (order by x) d from pt where 1 = 0")
+    qb(mut &c, "only nulls", "select percentile_cont(0.5) within group (order by x) c, percentile_disc(0.5) within group (order by x) d from pt where g = 3")
+    qb(mut &c, "one row", "select percentile_cont(0.5) within group (order by x) c, percentile_cont(0.1) within group (order by x desc) d, percentile_disc(0.9) within group (order by x) e from pt where g = 5")
+    qb(mut &c, "ties", "select percentile_cont(0.5) within group (order by x) c, percentile_cont(0.8) within group (order by x) d, percentile_disc(0.75) within group (order by x) e, percentile_disc(0.76) within group (order by x) f from pt where g = 4")
+    qb(mut &c, "numbers and decimals", "select percentile_cont(0.5) within group (order by d) c, percentile_disc(0.5) within group (order by d) dd, percentile_cont(0.5) within group (order by f) cf, percentile_disc(0.5) within group (order by f) df from pt where g = 1")
+    qb(mut &c, "datetimes", "select percentile_cont(0.5) within group (order by dt) c, percentile_disc(0.5) within group (order by dt) d, percentile_cont(0.5) within group (order by ts) ct, percentile_disc(0.5) within group (order by ts desc) dt2 from pt where g = 1")
+    qb(mut &c, "texts", "select percentile_disc(0.5) within group (order by s) a, percentile_disc(0.5) within group (order by s desc) b from pt where g = 1")
+    qb(mut &c, "expression key", "select percentile_cont(0.5) within group (order by x * 2) + 1 c from pt where g = 1")
+    qb(mut &c, "over partition", "select distinct g, percentile_cont(0.5) within group (order by x) over (partition by g) c, percentile_disc(0.5) within group (order by x) over (partition by g) d from pt order by g")
+    qb(mut &c, "over each row", "select id, x, percentile_cont(0.5) within group (order by x) over (partition by g) c, row_number() over (partition by g order by id) rn from pt where id <= 7 order by id")
+    qb(mut &c, "over desc", "select id, percentile_cont(0.25) within group (order by x desc) over (partition by g) c, percentile_disc(0.25) within group (order by x desc) over (partition by g) d from pt where g = 1 order by id")
+    qb(mut &c, "over whole table", "select distinct percentile_cont(0.5) within group (order by x) over () c, percentile_disc(0.5) within group (order by x) over () d from pt")
+    qb(mut &c, "over mixed with other calls", "select id, percentile_disc(0.5) within group (order by x) over (partition by g) a, percentile_disc(0.5) within group (order by x) over () b, sum(x) over (partition by g) s, count(*) over (partition by g order by id) n from pt where g in (1, 4) order by id")
+    qb(mut &c, "over datetimes", "select distinct percentile_cont(0.5) within group (order by dt) over (partition by g) c from pt where g = 1")
+    qb(mut &c, "over after grouping", "select g, percentile_cont(0.5) within group (order by sum(x)) over (partition by g) c from pt group by g order by g")
+    q(mut &c, "fraction above one", "select percentile_cont(1.5) within group (order by x) from pt")
+    q(mut &c, "fraction below zero", "select percentile_disc(-0.1) within group (order by x) from pt")
+    q(mut &c, "fraction above one over", "select percentile_cont(2) within group (order by x) over (partition by g) from pt")
+    q(mut &c, "cont of text", "select percentile_cont(0.5) within group (order by s) from pt")
+    q(mut &c, "over order by", "select percentile_cont(0.5) within group (order by x) over (order by g) from pt")
+    q(mut &c, "over frame", "select percentile_cont(0.5) within group (order by x) over (partition by g rows between 1 preceding and current row) from pt")
+    x(mut &c, "create bigp", "create table bigp (id number(10) primary key, g number, x number)")
+    x(mut &c, "fill 1", "insert into bigp select level, 1, level from dual connect by level <= 1600")
+    x(mut &c, "fill 2", "insert into bigp select 10000 + level, 2, mod(level * 7, 1000) from dual connect by level <= 1501")
+    x(mut &c, "fill 3", "insert into bigp select 20000 + level, 3, case when mod(level, 5) = 0 then null else level * 3 end from dual connect by level <= 2000")
+    x(mut &c, "fill 4", "insert into bigp values (30001, 4, 10)")
+    x(mut &c, "fill 5", "insert into bigp values (30002, 5, null)")
+    qb(mut &c, "big aggregate", "select g, percentile_cont(0.5) within group (order by x) c, percentile_disc(0.5) within group (order by x) d from bigp group by g order by g")
+    qb(mut &c, "big aggregate 2", "select g, percentile_cont(0.9) within group (order by x desc) c, percentile_disc(0.001) within group (order by x desc) d, percentile_disc(1) within group (order by x) e from bigp group by g order by g")
+    qb(mut &c, "big window", "select g, count(*) n, min(c) lo, max(c) hi from (select g, percentile_cont(0.5) within group (order by x) over (partition by g) c from bigp) group by g order by g")
+    qb(mut &c, "big window 2", "select g, count(*) n, max(d) m from (select g, percentile_disc(0.3) within group (order by x) over (partition by g) d from bigp) group by g order by g")
+    qb(mut &c, "big whole", "select percentile_cont(0.37) within group (order by x) c, percentile_disc(0.37) within group (order by x) d, count(*) n from bigp")
+    qb(mut &c, "big window whole", "select count(*) n, min(c) lo, max(c) hi from (select percentile_cont(0.37) within group (order by x) over () c from bigp)")
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(37), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

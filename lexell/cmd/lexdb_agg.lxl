@@ -14,6 +14,7 @@ import "./lexdb_sql"
 import "./lexdb_ops"
 import "./lexdb_access"
 import "./lexdb_sort"
+import "./lexdb_pct"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -33,6 +34,7 @@ pub type AggSpec = record {
     pub text: str               // to share one accumulator between equal calls
     pub kind: int               // its argument's collation kind (L2): min, max and DISTINCT compare its keys
     pub op: int                 // fname as an OP_* (set by spec: what add dispatches on)
+    pub dia: int                // lexdb_pct.DIA_*: the dialect whose types and errors percentile_cont and percentile_disc give
 }
 
 pub const OP_COUNT = 0
@@ -44,6 +46,7 @@ pub const OP_BOOL = 5               // bool_and, every, bool_or
 pub const OP_ARRAY = 6
 pub const OP_STRING = 7
 pub const OP_VAR = 8                // the variances and standard deviations
+pub const OP_PCT = 9                // percentile_cont, percentile_disc
 
 fn opOf(f: &str): int {
     if f == "count" { return OP_COUNT }
@@ -54,13 +57,14 @@ fn opOf(f: &str): int {
     if f == "bool_and" || f == "every" || f == "bool_or" { return OP_BOOL }
     if f == "array_agg" { return OP_ARRAY }
     if f == "string_agg" { return OP_STRING }
+    if lexdb_pct.isPct(f) { return OP_PCT }
     return OP_VAR
 }
 
 // A call's spec.
 pub fn spec(fname: str, args: []Expr, star: bool, distinct: bool, filter: Option[Expr], order: []Expr, dirs: str, text: str, kind: int): AggSpec {
     let op = opOf(&fname)
-    return AggSpec{fname: fname, args: args, star: star, distinct: distinct, filter: filter, order: order, dirs: dirs, text: text, kind: kind, op: op}
+    return AggSpec{fname: fname, args: args, star: star, distinct: distinct, filter: filter, order: order, dirs: dirs, text: text, kind: kind, op: op, dia: lexdb_pct.DIA_PG}
 }
 
 pub type Acc = record {
@@ -90,8 +94,16 @@ pub fn ordered(sp: &AggSpec): bool { return len(sp.dirs) > 0 }
 // How many values besides its argument a call is given with each row: its
 // separator (string_agg), then its ORDER BY keys.
 pub fn extras(sp: &AggSpec): int {
-    return (if sp.fname == "string_agg" { 1 } else { 0 }) + len(sp.dirs)
+    return (if hasSep(sp) { 1 } else { 0 }) + (if sp.op == OP_PCT { 0 } else { len(sp.dirs) })
 }
+
+// Whether a call reads its second argument with each row (as a value besides
+// its first): string_agg's separator, a percentile's fraction. The engines
+// give it to add as more[0].
+pub fn hasSep(sp: &AggSpec): bool { return sp.op == OP_STRING || sp.op == OP_PCT }
+
+// Whether a percentile call's ORDER BY is descending (its dirs: a, A, d, D).
+fn pctDesc(sp: &AggSpec): bool { return len(sp.dirs) > 0 && (sp.dirs[0] == 'd' || sp.dirs[0] == 'D') }
 
 // Whether the value v of a row is accumulated: not a NULL (array_agg keeps
 // them, as elements), and for DISTINCT not one seen in this accumulator
@@ -158,6 +170,11 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
             if acc.n > 0 && !lexdb_ops.isNull(sep) { append(mut &acc.parts, lexdb_sql.text(sep)) }
             append(mut &acc.parts, lexdb_sql.text(&v))
         }
+    } else if op == OP_PCT {
+        // the values; the fraction of the first row (the same for all in a group)
+        try lexdb_pct.checkValue(sp.dia, f, &v)
+        if acc.n == 0 { acc.sum = more[0].clone() }
+        append(mut &acc.seps, v)
     } else if op == OP_VAR {
         // the variances and standard deviations
         let x = try numOf(&v, &f)
@@ -246,6 +263,15 @@ pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let f = &sp.fname
     if f == "count" { return Ok(Val.Int(acc.n)) }
     if acc.n == 0 { return Ok(Val.Null) }
+    if sp.op == OP_PCT {
+        if lexdb_ops.isNull(&acc.sum) {
+            match lexdb_pct.nullFrac(sp.dia) {
+                Some(x) { return Err(x) }
+                None { return Ok(Val.Null) }
+            }
+        }
+        return lexdb_pct.finish(f, sp.dia, pctDesc(sp), sp.kind, &acc.seps, &acc.sum)
+    }
     if f == "sum" { return Ok(acc.sum.clone()) }
     if f == "avg" { return lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&acc.sum, &f)), &Val.Num(Decimal.fromInt(acc.n))) }
     if f == "string_agg" && len(sp.dirs) > 0 { return Ok(Val.Text(try orderedParts(sp, acc))) }

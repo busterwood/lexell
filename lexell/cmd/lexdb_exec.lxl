@@ -41,6 +41,7 @@ import "./lexdb_bind"
 import "./lexdb_ops"
 import "./lexdb_pipe"
 import "./lexdb_agg"
+import "./lexdb_pct"
 import "./lexdb_window"
 import "./lexdb_setop"
 import "./lexdb_sort"
@@ -12501,7 +12502,7 @@ fn pipeAgg(sel: mut &Sel) {
             }
             None {}
         }
-        append(mut &calls, lexdb_plan.PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone()})
+        append(mut &calls, lexdb_plan.PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia})
     }
     let cs = match planConds(sel) {
         Some(x) { x }
@@ -12945,14 +12946,19 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
             var order: []Expr = []
             var dirs = ""
             let oi = strings.indexOf(&name, " order:", 0)
+            // percentile_cont / percentile_disc (lexdb_pct): the call's arguments are the
+            // value (WITHIN GROUP's key) and the fraction; the letter is the key's direction
+            let pct = lexdb_pct.isPct(&base)
             if oi >= 0 {
                 let rest = name[oi + 7..len(name)]
                 let sp = strings.indexOf(&rest, " ", 0)
                 dirs = if sp < 0 { rest.clone() } else { rest[0..sp].clone() }
-                var rev: []Expr = []
-                for k in 0..len(dirs) { append(mut &rev, pop(mut &aargs)) }
-                while len(rev) > 0 { append(mut &order, pop(mut &rev)) }
-                for o in order { if hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+                if !pct {
+                    var rev: []Expr = []
+                    for k in 0..len(dirs) { append(mut &rev, pop(mut &aargs)) }
+                    while len(rev) > 0 { append(mut &order, pop(mut &rev)) }
+                    for o in order { if hasAgg(&o) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
+                }
             }
             for a in aargs { if hasAgg(&a) { return Err(e("42803", "aggregate function calls cannot be nested")) } }
             for a in aargs { if hasWin(&a) { return Err(e("42803", "aggregate function calls cannot contain window function calls")) } }
@@ -12960,14 +12966,19 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                 Some(f) { if hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
                 None {}
             }
-            let want = if base == "string_agg" { 2 } else { 1 }
+            let want = if base == "string_agg" || pct { 2 } else { 1 }
+            let dia = lexdb_pct.dialectOf(&name)
+            // the fraction, checked now where it is a literal, as the dialects do (before any row)
+            if pct && !star && len(aargs) == 2 { try lexdb_pct.checkArg(dia, &base, &aargs[1]) }
             if star && base != "count" { return Err(e("42809", &(base + "(*) is not an aggregate that takes *"))) }
             if !star && len(aargs) != want {
                 return Err(e("42883", &("function " + base + " takes " + want.toStr() + " argument" + (if want > 1 { "s" } else { "" }))))
             }
             let text = lexdb_sql.exprText(x)
             for i in 0..len(specs) { if specs[i].text == text { return Ok(slotRef(i)) } }
-            append(specs, lexdb_agg.spec(base, aargs, star, strings.contains(&name, " distinct"), filter, order, dirs, text, lexdb_sql.COLL_EXACT))
+            var made = lexdb_agg.spec(base, aargs, star, strings.contains(&name, " distinct"), filter, order, dirs, text, lexdb_sql.COLL_EXACT)
+            made.dia = dia
+            append(specs, made)
             return Ok(slotRef(len(specs) - 1))
         }
         Expr.Unary(op, a) { return Ok(Expr.Unary(op.clone(), try collectAggs(&a, specs))) }
@@ -13078,7 +13089,7 @@ fn accumulate(sp: &AggSpec, acc: mut &Acc, env: &Env): Result[Unit, DbErr] {
     let v = try eval(&sp.args[0], env)
     if !lexdb_agg.admit(sp, acc, &v) { return Ok(Unit{}) }
     var more: []Val = []
-    if sp.fname == "string_agg" { append(mut &more, try eval(&sp.args[1], env)) }
+    if lexdb_agg.hasSep(sp) { append(mut &more, try eval(&sp.args[1], env)) }
     for o in sp.order { append(mut &more, try eval(&o, env)) }
     return lexdb_agg.add(sp, acc, v, more)
 }
@@ -19673,6 +19684,14 @@ fn winPlan(d: &lexdb_sql.WinDef): Result[WinPlan, DbErr] {
         append(mut &w.desc, o.desc)
         append(mut &w.nullsFirst, o.nullsFirst)
     }
+    if lexdb_pct.isPct(&base) {
+        // an ordered-set aggregate's window is the partition: no ORDER BY, no frame (SQL Server 10758 and 10752;
+        // Oracle's grammar allows the partition clause alone)
+        match lexdb_pct.windowErr(lexdb_pct.dialectOf(&name), &base, len(w.order) > 0, w.mode != lexdb_sql.FR_NONE) {
+            Some(pe) { return Err(pe) }
+            None {}
+        }
+    }
     if w.mode == lexdb_sql.FR_NONE {
         w.mode = lexdb_sql.FR_RANGE
         w.start = lexdb_sql.B_UNBOUNDED_PRECEDING
@@ -19680,7 +19699,7 @@ fn winPlan(d: &lexdb_sql.WinDef): Result[WinPlan, DbErr] {
     }
     if strings.contains(&name, " distinct") { return Err(e("0A000", "DISTINCT is not implemented for window functions")) }
     if lexdb_bind.isAgg(&name) {
-        if strings.contains(&name, " order:") { return Err(e("0A000", "aggregate ORDER BY is not implemented for window functions")) }
+        if strings.contains(&name, " order:") && !lexdb_pct.isPct(&base) { return Err(e("0A000", "aggregate ORDER BY is not implemented for window functions")) }
         var specs: []AggSpec = []
         let r = try collectAggs(&d.call, mut &specs)
         w.agg = true

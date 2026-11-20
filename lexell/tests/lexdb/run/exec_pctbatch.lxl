@@ -1,0 +1,119 @@
+// lexdb_agg's percentile_cont and percentile_disc (design/lexdb-dialect-gaps.md,
+// package D) on the batches' path (the pipeline's generic aggregate kind) and on the row
+// engine (SET lexdb_batch = off), the same queries compared as text, over tables of
+// 1,023, 1,024, 1,025 and 5,000 rows: grouped and not, over integers, numerics, doubles,
+// texts, dates and intervals, DESC, NULLs, FILTER, HAVING, a fraction per group, a
+// fraction out of range in a later group (the same error), empty inputs. Each line:
+// the query's label, same or DIFFERENT, and b where the pipeline ran it.
+// expect: n=1023: all same, 38 of 38 on the pipeline
+// expect: n=1024: all same, 38 of 38 on the pipeline
+// expect: n=1025: all same, 38 of 38 on the pipeline
+// expect: n=5000: all same, 38 of 38 on the pipeline
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(123), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let sizes = [1023, 1024, 1025, 5000]
+        for n in sizes {
+            let t = "w" + n.toStr()
+            let c = q(mut &s, &("create table " + t + " (id int primary key, g int, v int, f float8, nm numeric(8,2), s text, dt date, iv interval)"))
+            if c != "CREATE TABLE" { println(c) }
+            let ins = q(mut &s, &("insert into " + t + " select i, case when i % 17 = 0 then null else i % 7 end, " +
+                                 "case when i % 6 = 0 then null else (i * 37) % 101 end, " +
+                                 "case when i % 9 = 0 then null else ((i * 7919) % 1009) / 7.0 end, ((i % 50) * 3) * 0.01, " +
+                                 "case when i % 11 = 0 then null else 'k' || ((i * 13) % 29)::text end, " +
+                                 "date '2024-01-01' + ((i * 5) % 90), (i % 40) * interval '1 hour' + (i % 3) * interval '1 day' " +
+                                 "from generate_series(1, " + n.toStr() + ") i"))
+            if ins != "INSERT 0 " + n.toStr() { println(ins) }
+            let qs = ["select percentile_cont(0.5) within group (order by v) from T",
+                      "select percentile_disc(0.5) within group (order by v) from T",
+                      "select percentile_cont(0.25) within group (order by v desc), percentile_disc(0.9) within group (order by v desc) from T",
+                      "select g, percentile_cont(0.5) within group (order by v), percentile_disc(0.5) within group (order by v) from T group by g order by g",
+                      "select g, percentile_cont(0.1) within group (order by f), percentile_disc(0.1) within group (order by f desc) from T group by g order by g",
+                      "select g, percentile_cont(0.75) within group (order by nm), percentile_disc(0.75) within group (order by nm) from T group by g order by g",
+                      "select g, percentile_disc(0.5) within group (order by s), percentile_disc(0.3) within group (order by s desc) from T group by g order by g",
+                      "select g, percentile_disc(0.5) within group (order by dt), percentile_disc(0.01) within group (order by dt desc) from T group by g order by g",
+                      "select g, percentile_cont(0.5) within group (order by iv), percentile_cont(0.33) within group (order by iv desc) from T group by g order by g",
+                      "select percentile_cont(0) within group (order by v), percentile_cont(1) within group (order by v), percentile_disc(0) within group (order by v), percentile_disc(1) within group (order by v) from T",
+                      "select g, percentile_cont(0.5) within group (order by v) filter (where v > 50), count(*) from T group by g order by g",
+                      "select g, percentile_cont(0.5) within group (order by v) from T group by g having percentile_cont(0.5) within group (order by v) > 49 order by g",
+                      "select g, percentile_cont(0.5) within group (order by v) + 1, avg(v), percentile_disc(0.5) within group (order by id) from T group by g order by g",
+                      "select g % 3 as h, percentile_cont(0.5) within group (order by v * 2 + g), count(distinct g) from T group by g % 3 order by h",
+                      "select g, percentile_cont(g / 8.0) within group (order by v), percentile_disc(g / 8.0) within group (order by v) from T group by g order by g",
+                      "select percentile_cont(0.5) within group (order by v) from T where id < 0",
+                      "select g, percentile_cont(0.5) within group (order by v) from T where id < 0 group by g",
+                      "select percentile_cont(0.5) within group (order by v) from T where g = 3",
+                      "select percentile_cont(g / 6.0) within group (order by v) from T group by g order by g",
+                      "select g, percentile_cont(g / 5.0) within group (order by v) from T group by g order by g",
+                      "select percentile_cont(1.2) within group (order by v) from T",
+                      "select percentile_cont(0.5) within group (order by s) from T",
+                      "select percentile_cont(0.5) within group (order by dt) from T",
+                      "select percentile_cont(0.5) within group (order by v), percentile_cont(0.5) within group (order by id), max(v), sum(v) from T",
+                      "select count(*) from (select g, percentile_cont(0.5) within group (order by v) m from T group by g) d where m > 40",
+                      "select g, percentile_cont(0.5) within group (order by v) from T where id % 2 = 0 group by g order by percentile_disc(0.5) within group (order by f), g",
+                      "select percentile_cont(0.37) within group (order by id), percentile_disc(0.37) within group (order by id) from T",
+                      "select g, percentile_cont(0.5) within group (order by f), percentile_cont(0.5) within group (order by v::float8) from T group by g order by g",
+                      "select percentile_cont(0.5) within group (order by v nulls first), percentile_disc(0.5) within group (order by v desc nulls last) from T",
+                      "select g, percentile_disc(0.5) within group (order by id desc) from T group by g order by g",
+                      "select id % 10, percentile_cont(0.5) within group (order by id) from T group by id % 10 order by 1",
+                      "select percentile_cont(0.5) within group (order by f) filter (where g in (1, 2)), percentile_cont(0.5) within group (order by f) filter (where g is null) from T",
+                      "select (select percentile_cont(0.5) within group (order by w.v) from T w where w.g = a.g) from (select distinct g from T) a order by 1",
+                      "select g, percentile_cont(0.5) within group (order by v), min(s) from T group by g order by g",
+                      "select percentile_cont(0.6) within group (order by v) over_ from T",
+                      "select g, percentile_disc(0.5) within group (order by nm), percentile_cont(0.5) within group (order by nm) from T group by g order by g limit 3",
+                      "select g, percentile_cont(0.5) within group (order by v) from T group by rollup (g) order by g",
+                      "select g, percentile_cont(0.5) within group (order by v desc) from T group by g order by g desc"]
+            var same = 0
+            var piped = 0
+            var total = 0
+            for tq in qs {
+                let sql = strings.replaceAll(&tq, "T", &t)
+                let a = q(mut &s, &"set lexdb_batch = off")
+                let off = q(mut &s, &sql)
+                let b = q(mut &s, &"set lexdb_batch = on")
+                let r0 = lexdb_pipe.runCounts()[1]
+                let on = q(mut &s, &sql)
+                let ran = lexdb_pipe.runCounts()[1] > r0
+                total += 1
+                if off == on { same += 1 } else {
+                    println("DIFFERENT: " + sql)
+                    println("  rows:    " + strings.substr(&off, 0, min(len(off), 300)))
+                    println("  batches: " + strings.substr(&on, 0, min(len(on), 300)))
+                }
+                // (a fraction out of range as a literal is refused at planning, before any path)
+                if ran || strings.contains(&sql, "(1.2)") { piped += 1 } else { println("not on the pipeline: " + sql) }
+            }
+            println("n=" + n.toStr() + ": " + (if same == total { "all same" } else { (total - same).toStr() + " differ" }) + ", " + piped.toStr() + " of " + total.toStr() + " on the pipeline")
+        }
+        return 0
+    }).unwrap()
+}

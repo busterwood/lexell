@@ -1828,7 +1828,42 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             }
             try p.expectKw(")")
             if p.ora && fname == "string_agg" && len(args) == 1 { append(mut &args, Expr.Lit(Val.Text(""))) }     // LISTAGG(x): no separator
-            if (p.tsql || p.ora) && p.isKw("within") {
+            if (fname == "percentile_cont" || fname == "percentile_disc") && !star {
+                // percentile_cont(f) WITHIN GROUP (ORDER BY x [DESC]) (lexdb_pct): the call's arguments are x, the
+                // key, then f; the name carries the direction and, for SQL Server and Oracle, the dialect (" dia:")
+                let up = strings.toUpperAscii(&fname)
+                if !p.isKw("within") {
+                    if p.tsql && !p.isKw("over") { return Err(lexdb_base.err("TS10753", &("The function '" + up + "' must have an OVER clause."))) }
+                    if p.tsql { return Err(lexdb_base.err("TS10754", &("The function '" + up + "' must have a WITHIN GROUP clause."))) }
+                    return Err(lexdb_base.err("42883", &("function " + fname + " does not exist")))
+                }
+                if len(args) != 1 {
+                    if p.tsql { return Err(lexdb_base.err("TS174", &("The " + fname + " function requires 1 argument(s)."))) }
+                    return Err(lexdb_base.err("42883", &("function " + fname + " does not exist")))
+                }
+                p.pos += 1
+                try p.expectKw("group")
+                try p.expectKw("(")
+                try p.expectKw("order")
+                try p.expectKw("by")
+                let key = try p.expr()
+                var desc = false
+                if p.acceptKw("desc") { desc = true } else { let asc = p.acceptKw("asc") }
+                if !p.tsql && p.acceptKw("nulls") {
+                    if !p.acceptKw("first") { try p.expectKw("last") }
+                }
+                if p.isKw(",") {
+                    if p.tsql { return Err(lexdb_base.err("TS10751", &("The ORDER BY in WITHIN GROUP clause of '" + up + "' function must have exactly one expression."))) }
+                    return Err(lexdb_base.err("42883", &("function " + fname + " does not exist")))
+                }
+                try p.expectKw(")")
+                let fr = replace(mut &args[0], Expr.Lit(Val.Null))
+                args = [key, fr]
+                fname = fname + " order:" + (if desc { "d" } else { "a" }) + (if p.tsql { " dia:t" } else if p.ora { " dia:o" } else { "" })
+                if p.isKw("over") {
+                    if !p.tsql && !p.ora { return Err(lexdb_base.err("0A000", &("OVER is not supported for ordered-set aggregate " + fname))) }
+                } else if p.tsql { return Err(lexdb_base.err("TS10753", &("The function '" + up + "' must have an OVER clause."))) }
+            } else if (p.tsql || p.ora) && p.isKw("within") {
                 // STRING_AGG(x, sep) WITHIN GROUP (ORDER BY k [ASC | DESC], ...):
                 // the keys after the arguments, as agg(... ORDER BY ...); SQL
                 // Server's NULLs first going up, last going down
