@@ -243,6 +243,10 @@ pub const JH_HASH: int = 0      // once, its rows hashed by its key columns, pro
 pub const JH_LOOK: int = 1      // per outer row, by its whole primary key (the keys: its columns' values)
 pub const JH_RANGE: int = 2     // per outer row, the range of its path's leading equalities (the keys), then its bounds
 pub const JH_ROWS: int = 3      // once, the rows of a subquery (its run's) hashed by its key columns (slice P2b)
+// once, a join's rows hashed by its key columns (optimizer 49, a bushy
+// plan's build group): its scan the hub's, sub its members' joins over it,
+// hcols the query's slots
+pub const JH_JOIN: int = 4
 
 // What a join gives (PJoin.mark): the joined rows, or the outer rows
 // once each that have a match (semi) or none (anti).
@@ -277,6 +281,9 @@ pub type PJoin = record {
     pub rng: []PBound           // JH_RANGE: its bounds on the column after the equalities (constants of the run)
     pub capNulls: bool          // JH_RANGE: an index's range leaves out its next column's NULLs
     pub noNulls: bool           // JH_RANGE: the path's (Path.noNulls), for a range read in pieces
+    // JH_JOIN: its build, a join plan (the members' Join arms, JH_HASH, over
+    // Filter? (Scan) of the hub); scan then names the hub's level only
+    pub sub: []PPlan
 }
 
 // ORDER BY's keys for a Sort the pipeline runs (slice P3). The Project
@@ -357,18 +364,26 @@ pub fn needs(p: PPlan, n: int): PPlan {
     return withNeeds(p, &used)
 }
 
+// The query's columns a join's arm reads (a build group's: its build's too;
+// its key columns are the query's slots).
+fn joinUses(j: &PJoin, used: mut &[]bool) {
+    for x in j.build { uses(&x, used) }
+    for x in j.keys { uses(&x, used) }
+    for x in j.conds { uses(&x, used) }
+    for x in j.post { uses(&x, used) }
+    let at = if j.how == JH_JOIN { 0 } else { j.scan.first }
+    for c in j.hcols { if at + c < len(used) { used[at + c] = true } }
+    for x in j.res { uses(&x, used) }
+    if j.resCol >= 0 && j.scan.first + j.resCol < len(used) { used[j.scan.first + j.resCol] = true }
+    for b in j.sub { planUses(&b, used) }
+}
+
 fn planUses(p: &PPlan, used: mut &[]bool) {
     match p {
         PPlan.Scan(_, _) {}
         PPlan.Join(i, j) {
             planUses(&i, used)
-            for x in j.build { uses(&x, used) }
-            for x in j.keys { uses(&x, used) }
-            for x in j.conds { uses(&x, used) }
-            for x in j.post { uses(&x, used) }
-            for c in j.hcols { if j.scan.first + c < len(used) { used[j.scan.first + c] = true } }
-            for x in j.res { uses(&x, used) }
-            if j.resCol >= 0 && j.scan.first + j.resCol < len(used) { used[j.scan.first + j.resCol] = true }
+            joinUses(&j, used)
         }
         PPlan.Filter(i, cs) {
             planUses(&i, used)
@@ -407,6 +422,7 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Join(i, j) {
             var jj = j
             jj.scan = scanNeed(replace(mut &jj.scan, noScan()), used)
+            for m in 0..len(jj.sub) { jj.sub[m] = withNeeds(replace(mut &jj.sub[m], PPlan.Result([])), used) }
             return PPlan.Join(withNeeds(i, used), jj)
         }
         PPlan.Filter(i, cs) { return PPlan.Filter(withNeeds(i, used), cs) }
@@ -783,6 +799,9 @@ pub type Level = record {
     pub resCol: int             // the filter's inner column in t.cols
     pub resVal: Expr            // ... and its outer value
     pub semiSub: int            // a semi/anti join of a table looked up per row of the tables before it (semiLook): its subquery's number (EXPLAIN); -1
+    // a build group's hub (optimizer 49): the levels after it hashed with
+    // it as one join (its members); 0 none
+    pub grp: int
 }
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
@@ -1385,7 +1404,13 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
         var kc: []int = []          // per equality kept: its class, its earlier level
         var kl: []int = []
         let xs = replace(mut &ms[k], [])
-        for c in xs {
+        // a build group's member (optimizer 49): its equalities with the
+        // group's levels first (its key in the build), then the others
+        let g = if k < len(q.levels) { grpOf(q, k) } else { -1 }
+        var drops: []bool = array(len(xs), false)
+        for pass in 0..(if g >= 0 && g < k { 2 } else { 1 }) {
+        for xi in 0..len(xs) {
+            let c = &xs[xi]
             var drop = false
             match c {
                 Expr.Bin(op, l, r) {
@@ -1396,9 +1421,9 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
                                     Expr.Col(b, _) {
                                         let la = q.levelOf(&a)
                                         let lb = q.levelOf(&b)
-                                        if la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k && q.plainEqCols(&a, &b) {
-                                            let mine = if la == k { &a } else { &b }
-                                            let lo = if la == k { lb } else { la }
+                                        let lo = if la == k { lb } else { la }
+                                        let first = !(g >= 0 && g < k) || (lo >= g) == (pass == 0)
+                                        if first && la >= 0 && lb >= 0 && (la == k) != (lb == k) && la <= k && lb <= k && q.plainEqCols(&a, &b) {
                                             var ci = -1
                                             for x in 0..len(cls) {
                                                 var hasA = false
@@ -1427,8 +1452,10 @@ fn (q: &Query) oneEqPerClass(ms: mut &[][]Expr) {
                 }
                 else {}
             }
-            if !drop { append(mut &keep, lexdb_sql.cloneExpr(&c)) }
+            if drop { drops[xi] = true }
         }
+        }
+        for xi in 0..len(xs) { if !drops[xi] { append(mut &keep, lexdb_sql.cloneExpr(&xs[xi])) } }
         ms[k] = keep
     }
 }
@@ -2310,8 +2337,11 @@ fn (q: &Query) rightCheaper(ms: &[][]Expr, ps: &[][]Expr, cap: float, ro: &[]boo
 // cap: a hash's bytes at most where a lookup is possible. ordT: the level an
 // ORDER BY with a LIMIT can be read in order from (-1 none), ordCols its
 // columns there, lim the rows
-// the LIMIT and OFFSET take (optimizer 32).
-fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, ordCols: &[]int, lim: float, perm: mut &[]int, ro: mut &[]bool): bool {
+// the LIMIT and OFFSET take (optimizer 32). bushy: build groups
+// (BU_*, optimizer 49); grp: per new place, a group's hub's members after
+// it (0 none).
+fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, ordCols: &[]int, lim: float, bushy: int, perm: mut &[]int,
+                         ro: mut &[]bool, grp: mut &[]int): bool {
     let nl = len(q.levels)
     if nl < 2 || nl > JOIN_SEARCH_MAX { return false }
     for lv in q.levels {
@@ -2377,6 +2407,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     }
     var order: []int = []
     var flags: []bool = []
+    var grps: []int = array(nl, 0)
     var bestCost = 0.0f
     // the rows of a set, as needed (2^n sets past JOIN_EXACT_MAX is too many
     // to list: optimizer 30)
@@ -2386,6 +2417,14 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         var cost: []float = array(full + 1, -1.0f)
         var last: []int = array(full + 1, -1)
         var lastOnce: []bool = array(full + 1, false)
+        // build groups (optimizer 49): per set, its last step's members
+        // (each + 1, 4 bits a member; 0 one table)
+        var gs = GrpSearch{on: false, eqAdj: [], bad: 0, bytes: [], force: bushy == BU_FORCE}
+        if bushy != BU_OFF && !lookups && nl >= 3 {
+            gs = q.grpSearch(&cs, &masks, nl)
+            gs.force = bushy == BU_FORCE
+        }
+        var lastGrp: []int = if gs.on { array(full + 1, 0) } else { [] }
         for k in 0..nl {
             cost[1 << k] = base[k].cost
             last[1 << k] = k
@@ -2407,22 +2446,73 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
                     cost[next] = total
                     last[next] = k
                     lastOnce[next] = o
+                    if gs.on { lastGrp[next] = 0 }
+                }
+            }
+            // a build group at once: a hub linked to the set, one or two
+            // members, each linked to the hub or the member before by an
+            // equality
+            if gs.on && mask != 0 && mask != full {
+                for h in 0..nl {
+                    if (mask & (1 << h)) != 0 || (adj[h] & mask) == 0 || (gs.bad & (1 << h)) != 0 { continue }
+                    for a in 0..nl {
+                        if a == h || ((mask | gs.bad) & (1 << a)) != 0 || (gs.eqAdj[a] & (1 << h)) == 0 { continue }
+                        for b0 in 0..nl + 1 {
+                            // (b0 nl: no second member)
+                            let b = if b0 == nl { -1 } else { b0 }
+                            if b >= 0 && (b == h || b == a || ((mask | gs.bad) & (1 << b)) != 0 || (gs.eqAdj[b] & ((1 << h) | (1 << a))) == 0) { continue }
+                            let g = (1 << h) | (1 << a) | (if b >= 0 { 1 << b } else { 0 })
+                            if ((gs.eqAdj[h] | gs.eqAdj[a] | (if b >= 0 { gs.eqAdj[b] } else { 0 })) & mask) == 0 { continue }
+                            let c = q.grpCost(h, a, b, mask, nl, &base, &cmask, &cdist, mut &memo, cap, &gs.bytes, gs.force)
+                            if c < 0.0f { continue }
+                            let next = mask | g
+                            let total = cost[mask] + (if gs.force { c * 0.000001f } else { c })
+                            if cost[next] < 0.0f || total < cost[next] {
+                                cost[next] = total
+                                last[next] = h
+                                lastOnce[next] = true
+                                lastGrp[next] = (a + 1) | (if b >= 0 { (b + 1) << 4 } else { 0 })
+                            }
+                        }
+                    }
                 }
             }
         }
         bestCost = cost[full]
         var rev: []int = []
         var revOnce: []bool = []
+        var revGrp: []int = []
         var m = full
         while m != 0 {
             let k = last[m]
+            let lg = if gs.on { lastGrp[m] } else { 0 }
+            if lg != 0 {
+                // the members (in reverse), then the hub
+                let a = (lg & 15) - 1
+                let b = (lg >> 4) - 1
+                if b >= 0 {
+                    append(mut &rev, b)
+                    append(mut &revOnce, true)
+                    append(mut &revGrp, 0)
+                }
+                append(mut &rev, a)
+                append(mut &revOnce, true)
+                append(mut &revGrp, 0)
+                append(mut &rev, k)
+                append(mut &revOnce, true)
+                append(mut &revGrp, if b >= 0 { 2 } else { 1 })
+                m = m & ~((1 << k) | (1 << a) | (if b >= 0 { 1 << b } else { 0 }))
+                continue
+            }
             append(mut &rev, k)
             append(mut &revOnce, lastOnce[m] && (m & ~(1 << k)) != 0)
+            append(mut &revGrp, 0)
             m = m & ~(1 << k)
         }
         for i in 0..nl {
             append(mut &order, rev[nl - 1 - i])
             append(mut &flags, revOnce[nl - 1 - i])
+            grps[i] = revGrp[nl - 1 - i]
         }
     } else {
         var starts: []int = []
@@ -2459,6 +2549,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         if fmax(c2 - builds, 0.0f) * frac + builds < bestCost + sortCost {
             order = o2
             flags = f2
+            grps = array(nl, 0)
         }
     }
     var ident = true
@@ -2468,7 +2559,90 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         if order[i] != i { ident = false }
     }
     if ident { perm = [] }
+    grp = grps
     return true
+}
+
+// What the exact search needs for build groups (optimizer 49): per level
+// the levels a plain column equality links it to (eqAdj), the levels a
+// conjunct that may fail reads with another (bad: in no group), per level
+// a row's bytes in a hash; on: groups are tried.
+type GrpSearch = record { on: bool; eqAdj: []int; bad: int; bytes: []float; force: bool }
+
+fn (q: &Query) grpSearch(cs: &[]Expr, masks: &[]int, nl: int): GrpSearch {
+    var gs = GrpSearch{on: true, eqAdj: array(nl, 0), bad: 0, bytes: [], force: false}
+    for k in 0..nl { append(mut &gs.bytes, float(estRowBytes(&q.levels[k].t))) }
+    for i in 0..len(cs) {
+        let m = masks[i]
+        if m < 0 {
+            gs.on = false
+            return gs
+        }
+        if (m & (m - 1)) == 0 { continue }          // one table's (or none)
+        if !grpSafe(&cs[i]) { gs.bad = gs.bad | m }
+        match cs[i] {
+            Expr.Bin(op, a, b) {
+                if op == "=" {
+                    match a {
+                        Expr.Col(x, _) {
+                            match b {
+                                Expr.Col(y, _) {
+                                    let la = q.levelOf(&x)
+                                    let lb = q.levelOf(&y)
+                                    if la >= 0 && lb >= 0 && la != lb {
+                                        gs.eqAdj[la] = gs.eqAdj[la] | (1 << lb)
+                                        gs.eqAdj[lb] = gs.eqAdj[lb] | (1 << la)
+                                    }
+                                }
+                                else {}
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    return gs
+}
+
+// The cost of build group (h, a, b) (b -1: none) joined to the set mask
+// (optimizer 49.3): the hub read by its constants as a build's first table,
+// each member hashed and probed by the build's rows so far, the build's
+// rows hashed, then probed by the set's rows; -1 when a hash would pass cap,
+// or when it costs no less than the same tables hashed left-deep with the
+// hub's read priced alike (its gain must be the shape's: fewer probes, a
+// smaller hash; not the batched read's price, which the left-deep hash's
+// read does not get).
+fn (q: &Query) grpCost(h: int, a: int, b: int, mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &[]float, memo: mut &Map[int, float],
+                       cap: float, bytes: &[]float, force: bool): float {
+    let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
+    var pre = 1 << h
+    var r = q.setRows(pre, nl, base, cmask, cdist, memo)
+    var c = base[h].cost
+    var rb = bytes[h]
+    // left-deep: the hub hashed (its read as the group's), then each member
+    var lr = q.setRows(mask | pre, nl, base, cmask, cdist, memo)
+    var ld = base[h].cost + base[h].rows * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
+    for i in 0..2 {
+        let m = if i == 0 { a } else { b }
+        if m < 0 { break }
+        if base[m].rows * bytes[m] > cap { return -1.0f }
+        let nx = pre | (1 << m)
+        let rn = q.setRows(nx, nl, base, cmask, cdist, memo)
+        let build = base[m].inner + base[m].rows * HASH_BUILD
+        c += build + r * HASH_PROBE + rn * ROW_COST
+        let lr2 = q.setRows(mask | nx, nl, base, cmask, cdist, memo)
+        ld += build + lr * HASH_PROBE + lr2 * ROW_COST
+        lr = lr2
+        pre = nx
+        r = rn
+        rb += bytes[m]
+    }
+    if r * rb > cap { return -1.0f }
+    c += r * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
+    return if c < ld || force { c } else { -1.0f }
 }
 
 // Whether a SELECT reads all its rows before giving one: GROUP BY, an
@@ -2904,7 +3078,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1}
+                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0}
 }
 
 // Marks in cand the subqueries of x's top-level conjuncts (conjuncts')
@@ -3498,6 +3672,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         }
         var ro: []bool = []
         var perm: []int = []
+        var grp: []int = []
         // By cost, except in a transaction whose reads are noted: there a
         // whole-table read, a hash's or a first table's scan, would conflict
         // with every write to the table (as the index-to-scan switch,
@@ -3536,7 +3711,8 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             var ident = true
             for i in 0..nl { if po[i] != i { ident = false } }
             if !ident { perm = po }
-        } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(hs.ordLim), mut &perm, mut &ro) {
+        } else if txn.noting() || !q.costOrder(&ms, early, cap, ordT, &ordCols, float(hs.ordLim), if locking || !grpRuns(q, hs) { BU_OFF } else { bushyMode },
+                                               mut &perm, mut &ro, mut &grp) {
             perm = q.joinOrder(&ms)
             // outer joins, in FROM's order: each table hashed or looked up
             // by cost (optimizer 41)
@@ -3599,6 +3775,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             }
         }
         for i in 0..len(ro) { q.levels[i].readOnce = ro[i] }
+        for i in 0..len(grp) { q.levels[i].grp = grp[i] }
         if q.innerOnly() { q.oneEqPerClass(mut &ms) }
     }
     if q.corr {
@@ -4637,6 +4814,10 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
     // 3.8M rows to 150k); not past an outer join. Without estimates, there.
     let est = q.orderRows()
     let nl = len(q.levels)
+    // (not inside a build group, optimizer 49: after its last member)
+    var gEnd: []int = []
+    for k in 0..nl { append(mut &gEnd, k) }
+    for h in 0..nl { for l in h..h + q.levels[h].grp { if l < nl { gEnd[l] = h + q.levels[h].grp } } }
     var olds = replace(mut &q.levels, [])
     var placed: [][]Level = []
     for k in 0..nl { append(mut &placed, []) }
@@ -4666,6 +4847,10 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
                             if est[p] < est[at] { at = p }
                         }
                         outer = est[at]
+                    }
+                    if gEnd[at] != at {
+                        at = gEnd[at]
+                        if len(est) == nl { outer = est[at] }
                     }
                     let got = try semiLevel(st, txn, q, &c, i, fr.subKinds[i], &pt, alts, outer, params, anti, i < len(looks) && looks[i], rules)
                     if got.isSome() {
@@ -5470,8 +5655,18 @@ pub fn filterOver(ps: PScan, cs: []BX, subs: []PSub): PPlan {
 pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
     let l0 = &q.levels[0]
     var p = base
-    for k in 1..len(q.levels) {
+    var k = 1
+    while k < len(q.levels) {
         let lv = &q.levels[k]
+        if lv.grp > 0 {
+            // a build group (optimizer 49): one hash of its levels' join
+            match grpArm(q, k) {
+                Some(j) { p = PPlan.Join(p, j) }
+                None { return Err(p) }
+            }
+            k += lv.grp + 1
+            continue
+        }
         let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
         let rj = keepsRight(lv.join)
         if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 { return Err(p) }
@@ -5485,15 +5680,10 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
         if lv.perRow && !look && !range { return Err(p) }
         let t = &lv.t
-        var kinds: []int = array(len(q.cols), lexdb_rows.BK_NONE)
-        for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
-        var need: []bool = withCapacity(len(t.cols))
-        for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
-        let batch = scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
         var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
-                                 scan: PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, sorted: batch && !lv.perRow && keyOrdered(q, k), held: -1},
+                                 scan: joinScan(q, k),
                                  build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
-                                 rng: [], capNulls: false, noNulls: lv.path.noNulls}
+                                 rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         j.mark = mark
         if !lv.perRow {
             if lv.virt() { j.how = JH_ROWS }
@@ -5568,8 +5758,237 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             }
         }
         p = PPlan.Join(p, j)
+        k += 1
     }
     return Ok(p)
+}
+
+// Level k's table as a join reads it (PScan): its columns' kinds by their
+// slots, those decoded, in batches where its path reads ranges.
+fn joinScan(q: &Query, k: int): PScan {
+    let lv = &q.levels[k]
+    let t = &lv.t
+    var kinds: []int = array(len(q.cols), lexdb_rows.BK_NONE)
+    for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
+    var need: []bool = withCapacity(len(t.cols))
+    for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
+    let batch = scanBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), false, true)
+    return PScan{level: k, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: false, sorted: batch && !lv.perRow && keyOrdered(q, k), held: -1}
+}
+
+// ---- bushy joins: a hash of a join (optimizer 49)
+//
+// A build group is a hub level g and its members, the q.levels[g].grp
+// levels after it: a left-deep chain the row engine runs as it is (each
+// read once and hashed), which the pipeline runs as one hash of their
+// join (JH_JOIN), probed by the rows of the levels before g.
+
+pub const GRP_MAX: int = 2      // a group's members at most
+
+pub const BU_OFF: int = 0       // left-deep orders only
+pub const BU_COST: int = 1      // a build group where it costs less (the default)
+pub const BU_FORCE: int = 2     // a build group wherever one is valid (tests)
+
+var bushyMode: int = BU_OFF
+
+// The build groups' switch (tests and measuring): BU_*.
+pub fn setBushy(mode: int) { bushyMode = mode }
+
+// A key of build group g's level l: "col = val", col a plain column of
+// level l, val of the levels before g (outer: the group's key) or of the
+// group's levels before l (its key in the build). Its column's slot.
+type GKey = record { slot: int; val: Expr }
+
+fn (q: &Query) grpKey(g: int, l: int, x: &Expr, outer: bool): Option[GKey] {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op != "=" { return None }
+            for side in 0..2 {
+                let me = if side == 0 { &a } else { &b }
+                let other = if side == 0 { &b } else { &a }
+                match me {
+                    Expr.Col(n, _) {
+                        if q.levelOf(&n) == l {
+                            let ok = if outer { q.valBefore(other, g) } else { q.maxLevel(other) < l && q.minLevel(other) >= g && !hasCorr(other) }
+                            if ok { return Some(GKey{slot: q.slotOf(&n), val: lexdb_sql.cloneExpr(other)}) }
+                        }
+                    }
+                    else {}
+                }
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// The last level of the build group of hub g.
+fn grpEnd(q: &Query, g: int): int { return g + q.levels[g].grp }
+
+// Whether build group g's levels are ones its arm may be made of: inner
+// joins of tables each read once (hashed), no lock, no WHERE after them,
+// no semi or anti join.
+fn grpPlain(q: &Query, g: int): bool {
+    for l in g..grpEnd(q, g) + 1 {
+        let lv = &q.levels[l]
+        if !(lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS) || lv.lateral || lv.lock != 0 || lv.virt() || lv.perRow { return false }
+        if len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 || lv.resNot { return false }
+    }
+    return true
+}
+
+// Whether the pipeline may run q's joins, so that a build group is worth
+// planning (optimizer 49.5; else exec's glue clears it): no outer values, no
+// correlated subquery that stays one (one in WHERE that is not a semi or
+// anti join's candidate, which semiJoins may make a level).
+fn grpRuns(q: &Query, hs: &FromHints): bool {
+    if len(q.refs) > 0 { return false }
+    for i in 0..len(q.subs) {
+        if len(q.subs[i].sel.q.refs) > 0 && !(i < len(hs.semiCand) && hs.semiCand[i]) { return false }
+    }
+    return true
+}
+
+// The pipeline's arm of build group g (JH_JOIN): the hub's scan and own
+// conditions, each member's hash join over the hub's rows (its keys and
+// conditions those of the group's levels before it), and the group's keys
+// and conditions on the levels before g. None: not one it makes.
+fn grpArm(q: &Query, g: int): Option[PJoin] {
+    if g + q.levels[g].grp >= len(q.levels) || !grpPlain(q, g) { return None }
+    let hub = &q.levels[g]
+    var j = PJoin{how: JH_JOIN, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: noScan(), build: [], hcols: [], keys: [],
+                  ktypes: [], exact: true, conds: [], keq: -1, post: [], index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
+    j.scan.level = g
+    var hb: []BX = []
+    for x in hub.local {
+        match planX(&x, q) {
+            Some(b) { append(mut &hb, b) }
+            None { return None }
+        }
+    }
+    // the build: the hub's scan (its own conditions), then each member
+    var build = filterOver(joinScan(q, g), hb, [])
+    var keyAt = -1
+    for l in g..grpEnd(q, g) + 1 {
+        let lv = &q.levels[l]
+        var m = PJoin{how: JH_HASH, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: joinScan(q, l), build: [], hcols: [], keys: [],
+                      ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
+        var mkey = -1
+        for x in lv.cond {
+            let lo = q.minLevel(&x)
+            if lo >= l { continue }             // its own: applied as its rows are read (Level.local)
+            let outer = lo < g
+            match q.grpKey(g, l, &x, outer) {
+                Some(gk) {
+                    let typ = boundType(&q.cols[gk.slot].typ)
+                    match planX(&gk.val, q) {
+                        Some(b) {
+                            if outer {
+                                append(mut &j.hcols, gk.slot)
+                                append(mut &j.keys, b)
+                                append(mut &j.ktypes, typ)
+                                keyAt = len(j.conds)
+                            } else {
+                                append(mut &m.hcols, gk.slot - lv.first)
+                                append(mut &m.keys, b)
+                                append(mut &m.ktypes, typ)
+                                mkey = len(m.conds)
+                            }
+                        }
+                        None { return None }
+                    }
+                }
+                None {}
+            }
+            match planX(&x, q) {
+                Some(b) { if outer { append(mut &j.conds, b) } else { append(mut &m.conds, b) } }
+                None { return None }
+            }
+        }
+        if l == g { continue }
+        for x in lv.local {
+            match planX(&x, q) {
+                Some(b) { append(mut &m.build, b) }
+                None { return None }
+            }
+        }
+        if len(m.hcols) == 1 { m.keq = mkey }
+        build = PPlan.Join(build, m)
+    }
+    j.sub = [build]
+    if len(j.hcols) == 0 { return None }
+    if len(j.hcols) == 1 { j.keq = keyAt }
+    return Some(j)
+}
+
+// The hub of the build group level k is in (-1 none).
+fn grpOf(q: &Query, k: int): int {
+    var g = -1
+    for h in 0..k + 1 { if q.levels[h].grp > 0 && h + q.levels[h].grp >= k { g = h } }
+    return g
+}
+
+// EXPLAIN's line of level k when it is in a build group (its counts
+// after it), else "": the hub's hash of the join and its keys, a member's
+// own hash in it.
+pub fn grpLine(q: &Query, k: int): str {
+    let g = grpOf(q, k)
+    if g < 0 { return "" }
+    var cs: []str = []
+    for l in g..grpEnd(q, g) + 1 {
+        if k != g && l != k { continue }
+        for x in q.levels[l].cond {
+            let lo = q.minLevel(&x)
+            if lo >= l || (k == g) != (lo < g) { continue }
+            match q.grpKey(g, l, &x, k == g) {
+                Some(gk) { append(mut &cs, colName(q, gk.slot)) }
+                None {}
+            }
+        }
+    }
+    let lv = &q.levels[k]
+    let tn = lexdb_sql.baseName(&lv.t.name)
+    let name = if lv.alias == tn { tn } else { tn + " " + lv.alias }
+    let keys = "(" + strings.join(&cs, ", ") + ")"
+    if k == g { return "join " + name + ": hash of a join on " + keys + " over " + pathTextAt(q, k) }
+    return "  with " + name + ": hash on " + keys + " over " + pathTextAt(q, k)
+}
+
+// A slot's column's name in its table.
+fn colName(q: &Query, slot: int): str {
+    let l = q.levelOf(&q.cols[slot].name)
+    if l < 0 { return q.cols[slot].name.clone() }
+    return q.levels[l].t.cols[slot - q.levels[l].first].name.clone()
+}
+
+// The build groups unmarked (the row engine runs their levels left-deep):
+// where no pipeline program holds the query's joins.
+pub fn flatGroups(q: mut &Query) {
+    for i in 0..len(q.levels) { q.levels[i].grp = 0 }
+}
+
+// Whether a conjunct reading a build group's table and another may be
+// evaluated on other rows than the left-deep order's (optimizer 49.2):
+// cannotFail's, with the wrappers the binder adds for chars and
+// collations (#bptrim, #pad, #ci), which cannot fail either.
+fn grpSafe(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, star) {
+            if !star && (n == "#bptrim" || n == "#pad" || n == "#ci") && len(args) == 1 { return grpSafe(&args[0]) }
+            if star || (n != "in" && n != "like" && n != "ilike") { return cannotFail(x) }
+            for a in args { if !grpSafe(&a) { return false } }
+            return true
+        }
+        Expr.Unary(op, a) { return op == "not" && grpSafe(&a) }
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" || op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+                return grpSafe(&a) && grpSafe(&b)
+            }
+            return false
+        }
+        Expr.IsNull(a, _) { return grpSafe(&a) }
+        else { return cannotFail(x) }
+    }
 }
 
 // Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
