@@ -178,6 +178,7 @@ static int str_eqn(const char* a, const char* b, size_t n) {
 static size_t class_size[NCLASS];
 #define CHUNK ((size_t)2 << 20)          /* a huge page (HUGE) */
 #define LARGE (1 << 16)
+static uint8_t class_tab[(LARGE >> 4) + 1];   /* class_of's table, set by heap_init */
 #define KEEP ((size_t)32 << 20)          /* the largest freed large block kept */
 #define POOL 8                           /* freed large blocks kept per heap */
 #define POOL_MAIN ((size_t)64 << 20)     /* their bytes at most, the main thread's heap */
@@ -340,13 +341,22 @@ static void heap_init(void) {
         s = s < 120 ? s + 16 : s + s / 4;
         s = ((s + 7) & ~(size_t)15) + 8;        /* the next 16k + 8 at or above s */
     }
+    /* a class's range of entries at a time (entry k is 16k + 8 bytes): a few hundred
+       instructions at start, where one entry at a time took about 40,000 */
+    size_t k = 0;
+    for (int c = 0; c < NCLASS && k < sizeof class_tab; c++) {
+        size_t end = (class_size[c] - 8) / 16 + 1;           /* the entries this class covers */
+        if (end > sizeof class_tab) end = sizeof class_tab;
+        if (end > k) { memset(class_tab + k, c, end - k); k = end; }
+    }
 }
-static int class_of(size_t n) {
-    if (n <= 120) return (int)((n + 7) >> 4);       /* classes 0-7: 8, 24, ..., 120 */
-    for (int i = 8; i < NCLASS; i++)
-        if (class_size[i] >= n) return i;
-    return -1;
-}
+/* The class of n bytes (1 to LARGE). Classes 0-7 (8, 24, ..., 120) by arithmetic, with no
+   load: a table load there made bench alloc up to 29% slower at some heap addresses (the
+   blocks' stores and the load collided). Above, by one load: every class size is 16k + 8, so
+   the n in (16(k-1) + 8, 16k + 8] share the smallest class of at least 16k + 8, entry k. A
+   search of the sizes took about 20 instructions a block (gcc vectorized it, and hoisted its
+   set-up above the test for small sizes). */
+static int class_of(size_t n) { return n <= 120 ? (int)((n + 7) >> 4) : class_tab[(n + 7) >> 4]; }
 /* The kept block that best fits a large block of m bytes (mapping size): the smallest of m to
    2m, taken out of the pool; or 0. The pool's code is cold, out of the way of the hot paths
    (where the runtime's code lies moves the allocator's speed: gen_rtx.py). */
