@@ -110,7 +110,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
@@ -177,10 +177,11 @@ HELD_USERS = {"lexdb_pipe"}
 # A set-returning function's rows (lexdb_srf, design/lexdb-layers.md 6.3.Q8
 # R3): made from its arguments' values, and a select list's sets expanded.
 # Values only; the caller counts the rows' bytes and steps (a hook) and
-# serves the catalog's relations; only exec imports it.
+# serves the catalog's relations; exec and the pipeline (its ProjectSet)
+# import it.
 SRF = "lexdb_srf"
 SRF_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_lib", "lexdb_time"}
-SRF_USERS = {"lexdb_exec"}
+SRF_USERS = {"lexdb_exec", "lexdb_pipe"}
 
 # The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item
 # 10): the sort keys and the frame code of the row engine's windows. Values,

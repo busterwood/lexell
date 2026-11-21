@@ -201,6 +201,9 @@ pub type PPlan = closed {
     Window(PPlan)                   // the window calls (over the groups when it aggregates)
     Project(PPlan, []lexdb_bind.BX) // the select list: per output its expression bound over the query's columns (moved
                                     // from Sel.ox; a column as its slot); [] in a view, where the Sel holds them
+    // the select list's set-returning values made rows (Q8 R3, PostgreSQL's
+    // ProjectSet): its outputs' type OIDs
+    ProjectSet(PPlan, []int)
     // true: DISTINCT ON; the outputs' collations' kinds (lexdb_sql.COLL_*), a
     // DISTINCT the pipeline runs (slice P3; [] in a view)
     Distinct(PPlan, bool, []int)
@@ -471,6 +474,7 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Distinct(i, on, ks) { return PPlan.Distinct(withNeeds(i, used), on, ks) }
         PPlan.Match(i) { return PPlan.Match(withNeeds(i, used)) }
         PPlan.Apply(i, pa) { return PPlan.Apply(withNeeds(i, used), pa) }
+        PPlan.ProjectSet(i, o) { return PPlan.ProjectSet(withNeeds(i, used), o) }
         PPlan.Levels(n, subs) { return PPlan.Levels(n, subs) }
         PPlan.Result(subs) { return PPlan.Result(subs) }
         PPlan.Func(n, o, subs, xs) { return PPlan.Func(n, o, subs, xs) }
@@ -558,6 +562,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.Limit(i, _, _, _) { return pSubs(&i) }
         PPlan.Match(i) { return pSubs(&i) }
         PPlan.Apply(i, _) { return pSubs(&i) }
+        PPlan.ProjectSet(i, _) { return pSubs(&i) }
     }
 }
 
@@ -577,6 +582,7 @@ pub fn pLeaf(p: &PPlan): &PPlan {
         PPlan.Limit(i, _, _, _) { return pLeaf(&i) }
         PPlan.Match(i) { return pLeaf(&i) }
         PPlan.Apply(i, _) { return pLeaf(&i) }
+        PPlan.ProjectSet(i, _) { return pLeaf(&i) }
         else { return p }
     }
 }
@@ -8286,6 +8292,7 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         // (a join's expressions were bound for the plan only)
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Apply(i, _) { unplan(sel, i) }
+        PPlan.ProjectSet(i, _) { unplan(sel, i) }
         PPlan.Project(i, xs) {
             if len(xs) == 0 {
                 // a view: the Sel holds its outputs
@@ -8778,3 +8785,32 @@ fn lat0Once(p: PPlan, src: int): PPlan {
 // as its own plan says): not with TOP or WITH TIES (the row path cuts
 // those).
 pub fn setHeld(sel: &Sel): bool { return sel.topMode == 0 && !sel.withTies }
+
+// ---- a set-returning function in the select list, with no FROM (Q8 R3)
+
+// Whether sel is a SELECT with no FROM whose select list calls a
+// set-returning function (unnest, regexp_matches, ...), the pipeline's as a
+// Result under a ProjectSet: its one row's sets made rows in lockstep (the
+// shorter padded with NULL, none if every one is empty), as the row
+// engine's expandSrfs makes them. Not under a LIMIT, OFFSET or DISTINCT
+// (they apply to the rows made), nor where resultShape declines for
+// anything else. (Apart from resultShape: a test there cost every SELECT
+// with no FROM.)
+pub fn srfShape(sel: &Sel): bool {
+    let q = &sel.q
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.mr) > 0 { return false }
+    if sel.sort || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    if q.corr || len(q.levels) != 0 || sel.limit >= 0 || sel.offset > 0 || sel.distinct || !hasSrfCall(&sel.exprs) { return false }
+    return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs)
+}
+
+// srfShape's plan: ProjectSet (Project (Filter? (Result))), the Result's
+// as resultPlan makes it.
+pub fn srfPlan(sel: mut &Sel): Option[PPlan] {
+    var oids: []int = withCapacity(len(sel.outs))
+    for o in sel.outs { append(mut &oids, o.oid) }
+    match resultPlan(sel) {
+        Some(p) { return Some(PPlan.ProjectSet(p, oids)) }
+        None { return None }
+    }
+}
