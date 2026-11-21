@@ -1,0 +1,159 @@
+// lexdb over TDS: window functions run by the pipeline's Window operator (Q8's R7, design/lexdb-layers.md 6.3.Q8 R7)
+// through the T-SQL door, checked against SQL Server 2022 (run with LEXDB_MSSQL set to its connection string, this test
+// prints SQL Server's answers: the expect lines): ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG and LEAD with defaults,
+// FIRST_VALUE and LAST_VALUE, aggregates over ROWS and RANGE frames, partitions by NULLs and by texts equal under the
+// case-insensitive collation; TOP, TOP WITH TIES and OFFSET ... FETCH over the windowed rows; joins, a CTE, a derived
+// table; errors in a later row (8134) and NTILE(0) (4116); window calls over GROUP BY's groups,
+// with HAVING; DISTINCT; an empty input. Against lexdb each batch runs with SET lexdb_batch = off (the row engine) and on:
+// "same" and the answer, or DIFFERENT and both.
+// expect: same: id,rn: 1|1;2|1;3|1;4|1;5|1;6|1;7|1;8|2;9|2;10|2;11|2;12|2;13|2;14|2;15|3;16|3;17|3;18|3;19|3;20|3
+// expect: same: id,x,r,d: 1|37|23|22;2|24|15|14;3|11|8|7;4|48|29|28;5|35|21|20;6|22|13|12;7|9|6|5;8|46|28|27;9|33|20|19;10|20|12|11;11|NULL|1|1;12|44|27|26;13|31|19|18;14|18|11|10;15|5|5|4;16|42|26|25;17|29|18|17;18|16|10|9;19|3|4|3;20|40|25|24;21|27|17|16;22|NULL|1|1;23|1|3|2;24|38|24|23;25|25|16|15;26|12|9|8;27|49|30|29;28|36|22|21;29|23|14|13;30|10|7|6
+// expect: same: id,s,c: 1|37|1;2|61|2;3|72|3;4|83|4;5|94|5;6|105|6;7|66|7;8|77|8;9|88|9;10|99|10;11|53|10;12|64|11;13|75|12;14|93|13;15|54|14
+// expect: same: id,m,lo: 1|14.00|5;2|15.75|1;3|17.50|11;4|19.25|16;5|21.00|3;6|22.75|22;7|24.50|9;8|26.25|5;9|28.00|1;10|17.50|11;11|31.50|16;12|33.25|3;13|35.00|22;14|36.75|9;15|38.50|5;16|40.25|1;17|42.00|11;18|31.50|16;19|33.25|3;20|35.00|22;21|36.75|9;22|38.50|5;23|40.25|1;24|42.00|11
+// expect: same: id,l,ld,l2: 1|-1|'b0'|NULL;2|37|'Ab'|NULL;3|24|'ab'|'ab';4|11|'b3'|'b2';5|48|'Ab'|'Ab';6|35|NULL|'ab';7|22|NULL|'b1';8|9|NULL|'Ab';9|46|NULL|'ab';10|33|NULL|'b0';11|20|NULL|'Ab';12|NULL|NULL|'ab'
+// expect: same: id,f,la: 1|37|5;2|24|42;3|11|20;4|48|NULL;5|35|44;6|22|31;7|9|18;8|37|5;9|24|42;10|11|20;11|48|NULL;12|35|44;13|22|31;14|9|18;15|37|5;16|24|42
+// expect: same: id,q: 1|1;2|1;3|1;4|2;5|2;6|2;7|3;8|3;9|4;10|4
+// expect: same: id,c,s: 1|2|83;2|2|57;3|2|31;4|2|48;5|2|79;6|2|53;7|2|27;8|2|83;9|2|57;10|2|31;11|2|48;12|2|79;13|2|53;14|2|27
+// expect: same: id,s,p: 1|191|191;2|86|86;3|20|20;4|329|329;5|154|154;6|62|62;7|9|9;8|281|281;9|119|119;10|40|40;11|NULL|NULL;12|235|235
+// expect: same: id,rn: 27|1;127|2;177|3;227|4;277|5
+// expect: same: id,x,r: 23|1|1;19|3|2;15|5|3
+// expect: same: id,g,r: 7|0|1;14|0|1
+// expect: same: id,s: 101|9576;102|9414;103|9554;104|9744;105|9345
+// expect: same: id,name,r: 1|'one'|2;2|'two'|3;3|'three'|3;4|'four'|1;5|'five'|2;7|'zero'|2;8|'one'|1;9|'two'|2;10|'three'|2;11|'four'|3;12|'five'|1;14|'zero'|1;15|'one'|3;16|'two'|1;17|'three'|1;18|'four'|2;19|'five'|3
+// expect: same: id,name,c: 1|'one'|2;2|'two'|2;3|'three'|1;4|'four'|1;5|'five'|1;6|NULL|1;7|'zero'|1;8|'one'|2;9|'two'|2
+// expect: same: error 8134
+// expect: same: error 8134
+// expect: same: error 4116
+// expect: same: g,s,r: 0|9345|7;1|9522|5;2|9649|2;3|9576|3;4|9414|6;5|9554|4;6|9744|1
+// expect: same: g,c,total,run: 0|428|3000|428;1|429|3000|857;2|429|3000|1286;3|429|3000|1715;4|429|3000|2144;5|428|3000|2572;6|428|3000|3000
+// expect: same: g,m,pm: 0|49|NULL;1|49|49;2|49|49;3|49|49;4|49|49;5|49|49;6|49|49
+// expect: same: g,c: 0|428;1|429;2|429;3|429;4|429;5|428;6|428
+// expect: same: g,id: 0|427;1|127;2|177;3|227;4|277;5|327;6|27
+// expect: same: id,rn: 
+// expect: same: id,rn: 
+// expect: same: t,c,rn: 'ab'|8|1;'b2'|1|1;'Ab'|8|2;'ab'|8|3;'b1'|1|1;'Ab'|8|4;'ab'|8|5;'b0'|1|1;'Ab'|8|6;'ab'|8|7;'b3'|1|1;'Ab'|8|8
+// expect: same: id,dx,pct: 1|NULL|44;2|-13|42;3|-13|35;4|37|100;5|-13|100;6|-13|100;7|-13|100;8|37|55;9|-13|57;10|-13|64
+// expect: same: id,rn,mg: 1|1|5;2|2|5;3|3|5
+// expect: same: id,d: 1|5;2|4;3|2;4|6;5|5;6|2;7|1;8|6
+// expect: same: n,s: 3000|644358
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nCREATE TABLE wt (id int PRIMARY KEY, g int, x int NULL, t varchar(10) NULL, n decimal(10,2) NULL)\nINSERT INTO wt SELECT n, n % 7, CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 50 END, CASE WHEN n % 13 = 0 THEN NULL WHEN n % 3 = 0 THEN 'Ab' WHEN n % 3 = 1 THEN 'ab' ELSE 'b' + CAST(n % 4 AS varchar(2)) END, CASE WHEN n % 17 = 0 THEN NULL ELSE CAST((n * 7) % 1000 AS decimal(10,2)) / 4 END FROM (SELECT p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r CROSS JOIN dg w) z WHERE n <= 3000\nCREATE TABLE kt (g int PRIMARY KEY, name varchar(10))\nINSERT INTO kt VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')\nCREATE TABLE et (id int PRIMARY KEY, x int)"
+
+const QS = "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM wt WHERE id <= 20 ORDER BY id\nSELECT id, x, RANK() OVER (ORDER BY x) AS r, DENSE_RANK() OVER (ORDER BY x) AS d FROM wt WHERE id <= 30 ORDER BY id\nSELECT id, SUM(x) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s, COUNT(x) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS c FROM wt WHERE id <= 15 ORDER BY id\nSELECT id, MAX(n) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS m, MIN(x) OVER (PARTITION BY g) AS lo FROM wt WHERE id < 25 ORDER BY id\nSELECT id, LAG(x, 1, -1) OVER (ORDER BY id) AS l, LEAD(t) OVER (PARTITION BY g ORDER BY id) AS ld, LAG(t, 2) OVER (ORDER BY id) AS l2 FROM wt WHERE id <= 12 ORDER BY id\nSELECT id, FIRST_VALUE(x) OVER (PARTITION BY g ORDER BY id) AS f, LAST_VALUE(x) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS la FROM wt WHERE id <= 16 ORDER BY id\nSELECT id, NTILE(4) OVER (ORDER BY id) AS q FROM wt WHERE id <= 10 ORDER BY id\nSELECT id, COUNT(*) OVER (PARTITION BY g) AS c, SUM(x) OVER (PARTITION BY g) AS s FROM wt WHERE id <= 14 ORDER BY id\nSELECT id, SUM(x) OVER (ORDER BY x, id RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s, SUM(x) OVER (ORDER BY x RANGE UNBOUNDED PRECEDING) AS p FROM wt WHERE id <= 12 ORDER BY id\nSELECT TOP 5 id, ROW_NUMBER() OVER (ORDER BY x DESC, id) AS rn FROM wt ORDER BY rn\nSELECT TOP 3 WITH TIES id, x, RANK() OVER (ORDER BY x) AS r FROM wt WHERE id <= 30 AND x IS NOT NULL ORDER BY r\nSELECT TOP 2 WITH TIES id, g, DENSE_RANK() OVER (ORDER BY g) AS r FROM wt WHERE id <= 20 ORDER BY r, id\nSELECT id, SUM(x) OVER (PARTITION BY g) AS s FROM wt ORDER BY id OFFSET 100 ROWS FETCH NEXT 5 ROWS ONLY\nSELECT wt.id, kt.name, RANK() OVER (PARTITION BY kt.name ORDER BY wt.x DESC, wt.id) AS r FROM wt JOIN kt ON kt.g = wt.g WHERE wt.id <= 20 ORDER BY wt.id\nSELECT wt.id, kt.name, COUNT(*) OVER (PARTITION BY kt.name) AS c FROM wt LEFT JOIN kt ON kt.g = wt.g WHERE wt.id <= 9 ORDER BY wt.id\nSELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, 10 / (id - 2500) AS q FROM wt\nSELECT id, SUM(10 / (id - 2999)) OVER (ORDER BY id) AS s FROM wt\nSELECT id, NTILE(0) OVER (ORDER BY id) AS q FROM wt\nSELECT g, SUM(x) AS s, RANK() OVER (ORDER BY SUM(x) DESC) AS r FROM wt GROUP BY g ORDER BY g\nSELECT g, COUNT(*) AS c, SUM(COUNT(*)) OVER () AS total, SUM(COUNT(*)) OVER (ORDER BY g) AS run FROM wt GROUP BY g ORDER BY g\nSELECT g, MAX(x) AS m, LAG(MAX(x)) OVER (ORDER BY g) AS pm FROM wt WHERE id > 100 GROUP BY g HAVING COUNT(*) > 400 ORDER BY g\nSELECT DISTINCT g, COUNT(*) OVER (PARTITION BY g) AS c FROM wt ORDER BY g\nSELECT g, id FROM (SELECT g, id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY x DESC, id) AS rn FROM wt) z WHERE rn = 1 ORDER BY g\nSELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM wt WHERE id < 0\nSELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM et\nSELECT t, COUNT(*) OVER (PARTITION BY t) AS c, ROW_NUMBER() OVER (PARTITION BY t ORDER BY id) AS rn FROM wt WHERE id <= 12 ORDER BY id\nSELECT id, x - LAG(x) OVER (ORDER BY id) AS dx, 100 * x / NULLIF(SUM(x) OVER (PARTITION BY g), 0) AS pct FROM wt WHERE id <= 10 ORDER BY id\nSELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, (SELECT MAX(g) FROM kt) AS mg FROM wt WHERE id <= 3 ORDER BY id\nWITH c AS (SELECT id, g, x FROM wt WHERE id <= 40) SELECT id, DENSE_RANK() OVER (PARTITION BY g ORDER BY x) AS d FROM c ORDER BY id OFFSET 0 ROWS FETCH NEXT 8 ROWS ONLY\nSELECT COUNT(*) AS n, SUM(rn) AS s FROM (SELECT ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM wt) z"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                if !local {
+                    println("same: " + answer(mut &c, &q))
+                    continue
+                }
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = answer(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(57), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
