@@ -4305,7 +4305,10 @@ rounds): -0.08 instructions a select; 5d alone (140f687f's tree) -0.14.
 **Left:**
 - q20: the per-row path's cost (51.7): the rows by primary key (1.6 us a
   row) and the per-run setup (the conditions compiled per run, constants
-  evaluated per run: the interval's 3%). Not unnesting.
+  evaluated per run: the interval's 3%). Not unnesting. (Q8 R6,
+  lexdb-layers.md 6.3.Q8 R6: its partsupp query is the pipeline's, an
+  Apply; the interval folded once; server instructions -4.6%, time level;
+  the batched read of a chunk's rows by key measured, not built.)
 - A magic set for an inner side with no index (a build after the probe
   side, or a semi join of the inner on the outer's keys made from the outer
   level's table and conditions). No TPC-H query has the shape.
