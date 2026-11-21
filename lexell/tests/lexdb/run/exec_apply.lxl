@@ -1,0 +1,201 @@
+// lexdb_exec, lexdb_pipe: Apply (Q8's R6, design/lexdb-layers.md 6.3.Q8 R6): a query whose correlated
+// subqueries left per row are all called in one level's WHERE conjuncts is the pipeline's; its joins give
+// their rows after that level to the Apply, whose conjuncts are evaluated per row as the row engine
+// evaluates them (the subqueries run per outer row, their results kept per outer values), and the rows
+// that pass are joined on. Each statement runs with batches on and off (the row engine, the reference):
+// the same rows or the same error. "applied": y when a run with batches on went through an Apply
+// (lexdb_pipe.applyCounts()[0]); "asked": the rows the Apply asked of with batches on.
+// - where (unnesting off, lexdb_plan.setUnnest(0), so the subqueries stay per row): a scalar aggregate,
+//   EXISTS, IN over a text, NOT IN, ALL over an empty table, NULL outer values; the conjunct at the last
+//   level of a join, at the first of three (q2's shape), after a LEFT JOIN (its WHERE); two correlated
+//   conjuncts at one level; a CASE that skips the subquery (it runs all the same, as the row engine's);
+//   an interval constant (folded once, lexdb_pipe.bxFold); an error in a subquery's run in a late batch
+//   (22012) and two rows in a late run (21000); a conjunct whose other side fails; LIMIT with an error
+//   past it (not reached: each row asked alone), ORDER BY with LIMIT; 3,000 outer rows (three batches,
+//   seven distinct outer values: the memo's).
+// - aggregate: a count and sums over the rows that pass, GROUP BY, over a join (q17's shape), HAVING with
+//   a correlated subquery over the groups; the third's subquery is 9.9's hashed (its key u.k % 7), the
+//   row engine's still.
+// - explain: EXPLAIN ANALYZE's counts with batches on as with them off (the rows the Apply drops not
+//   counted as joined at its level; the subquery's runs and cache hits the same).
+// - nested: an EXISTS and an IN subquery whose own query has an Apply (q20's shape), run per outer row.
+// - stays: a correlated subquery in the outputs, conjuncts of two levels: the row engine's.
+// timeout: 120
+// expect: where: 24 queries, 24 the same, applied yyyyyyyyyyyyyyyyyyyyyyyy, asked 32150
+// expect: aggregate: 6 queries, 6 the same, applied yynyyy, asked 10473
+// expect: nested: 3 queries, 3 the same, applied yyy, asked 6999
+// expect: stays: 3 queries, 3 the same, applied nnn, asked 0
+// expect: explain: EXPLAIN: scan t: primary key range (estimated 399 rows) (rows read 400, kept 399, batches 1); join u: primary key lookup per row (lookups 399, rows read 399, joined 120); order: the scan's; subquery 1 (scalar): per row, on u.k (runs 40, from cache 359);   scan u u2: index uk lookup, rows in key order (rows read 500, kept 500, batches 40);   aggregate; result: 120 rows
+// expect: explain counts as the row engine's: yes
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+type Group = record { name: str; n: int; same: int; applied: str; asked: int }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, applied: "", asked: 0} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " queries, " + g.same.toStr() + " the same, applied " + g.applied + ", asked " + g.asked.toStr()) }
+
+// A query with batches on and off.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let a0 = lexdb_pipe.applyCounts()
+    let on = run(s, sql)
+    let a1 = lexdb_pipe.applyCounts()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = run(s, sql)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.applied += if a1[0] > a0[0] { "y" } else { "n" }
+    g.asked += a1[1] - a0[1]
+}
+
+// an EXPLAIN ANALYZE's text without its time
+fn noTime(x: &str): str {
+    let r = strings.indexOf(x, &"result: ", 0)
+    if r < 0 { return x.toStr() }
+    let i = strings.indexOf(x, &" rows in ", r)
+    return if i >= 0 { x[0..i + 5].toStr() } else { x.toStr() }
+}
+
+// x without its ", batches N" counts
+fn noBatches(x: &str): str {
+    var out = ""
+    var i = 0
+    while i < len(x) {
+        if strings.startsWith(&x[i..len(x)], &", batches ") {
+            i += 10
+            while i < len(x) && x[i] >= byte(48) && x[i] <= byte(57) { i += 1 }
+            continue
+        }
+        out.addByte(x[i])
+        i += 1
+    }
+    return out
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(83), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create table u (id int primary key, k int, v int, w text)",
+            "insert into u select i, i % 40, case when i % 9 = 0 then null else (i * 7) % 60 end, 'k' || (i % 25) from generate_series(1, 500) i",
+            "create index uk on u (k)",
+            "create table e (id int primary key, v int)",
+            "create table nn (id int primary key, v int not null)",
+            "insert into nn select i, i % 30 from generate_series(0, 100) i",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+        lexdb_plan.setUnnest(0)
+
+        var gw = newGroup(&"where")
+        let ws = [
+            "select id, x from t where id < 400 and x > (select avg(v) from u where u.k = t.g) order by id",
+            "select count(*) from t where exists (select 1 from u where u.k = t.x and u.v > 30) or t.id < 0",
+            "select id from t where id < 500 and (s in (select w from u where u.k = t.g) or x = 1) order by id",
+            "select id from t where id < 600 and x not in (select v from u where u.k = t.g and v is not null) order by id",
+            "select id from t where id < 100 and x > all (select v from e where e.id = t.g) order by id",
+            "select id from t where id < 300 and x is null and (select count(*) from u where u.k = t.x) = 0 order by id",
+            "select count(*) from t where (select max(v) from u where u.k = t.x) > 40",
+            "select t.id, u.id from t join u on u.id = t.id where t.id < 300 and u.v = (select max(v) from u u2 where u2.k = u.k) order by t.id",
+            "select t.id, u.w, nn.v from t join u on u.id = t.x join nn on nn.id = u.k where t.id < 600 and u.v >= (select max(v) from u u2 where u2.k = t.g) - 5 order by 1, 2, 3",
+            "select t.id, u.v from t left join u on u.id = t.x where t.id < 200 and coalesce(u.v, -1) < (select max(v) from u u2 where u2.k = t.g) order by t.id",
+            "select id from t where id < 300 and x > (select min(v) from u where u.k = t.g) and s in (select w from u where u.v = t.x) order by id",
+            "select count(*) from t where case when t.id > 0 then true else (select v from u where u.id = t.id) > 3 end",
+            "select count(*) from t where case when t.id > 0 then true else (select 1 / 0 from u where u.k = t.g) = 1 end",
+            "select count(*) from t where (select count(*) from u where u.k = t.g and date '2020-01-01' + u.v < date '2020-01-01' + interval '40 days') > 5",
+            "select count(*) from t where x < (select 100 / (2900 - t.id) from u where u.id = 1)",
+            "select count(*) from t where x = (select v from u where u.k = t.g and t.id > 2950)",
+            "select count(*) from t where 10 / (x - 7) > (select min(v) from u where u.k = t.g)",
+            "select id from t where x > (select avg(v) from u where u.k = t.g) limit 5",
+            "select id from t where 1 > (select 1 / (2000 - t.id) from u where u.id = 1) limit 3",
+            "select id, x from t where x < (select min(v) from u where u.k = t.g) + 10 order by x desc, id limit 7",
+            "select count(*), sum(x), min(id), max(id) from t where x >= (select avg(v) from u where u.k = t.g)",
+            "select count(*) from t where s = (select max(w) from u where u.k = t.x)",
+            "select id from t where id < 50 and (select v from u where u.id = t.x) is null order by id",
+            "select id from t where id between 100 and 160 and (exists (select 1 from u where u.id = t.id * 3 and u.w like 'k1%') or x is null) order by id",
+        ]
+        for x in ws { check(mut &s, mut &gw, &x) }
+        report(&gw)
+
+        var ga = newGroup(&"aggregate")
+        let ags = [
+            "select g, count(*), sum(x) from t where x < (select avg(v) from u where u.k = t.g) group by g order by g",
+            "select sum(u.v) from t join u on u.k = t.g where t.id < 100 and u.v < (select avg(v) from u u2 where u2.k = t.g)",
+            "select sum(u.v) / 7.0 from u join t on t.id = u.id where u.v < (select 0.2 * avg(x) from t t2 where t2.g = u.k % 7)",
+            "select g, count(*) from t where x > (select min(v) from u where u.k = t.g) group by g having count(*) > (select count(*) from u where u.k = t.g) order by g",
+            "select count(distinct x) from t where not exists (select 1 from u where u.k = t.g and u.v > t.x) or x = 2",
+            "select max(x) from t where id > 2800 and x < (select 100 / (u.v - 1) from u where u.id = t.id - 2700)",
+        ]
+        for x in ags { check(mut &s, mut &ga, &x) }
+        report(&ga)
+
+        var gn = newGroup(&"nested")
+        let ns = [
+            "select id from u where u.id < 60 and exists (select 1 from t where t.g = u.k % 7 and t.x > (select avg(v) from u u3 where u3.k = t.g)) order by id",
+            "select id from u where id in (select x from t where t.id < 1000 and t.g > (select count(*) % 7 from u u2 where u2.k = t.x)) order by id",
+            "select id, (select count(*) from t where t.g = u.k % 7 and t.x < (select min(v) from u u3 where u3.k = t.g)) from u where id < 20 order by id",
+        ]
+        for x in ns { check(mut &s, mut &gn, &x) }
+        report(&gn)
+
+        var gs = newGroup(&"stays")
+        let ss = [
+            "select id, (select max(v) from u where u.k = t.g) from t where id < 20 order by id",
+            "select t.id from t join u on u.id = t.x where t.id < 100 and t.x > (select min(v) from u u2 where u2.k = t.g) and u.v > (select min(v) from u u3 where u3.k = u.k) order by t.id",
+            "select id from t where id < 30 and x > (select min(v) from u where u.k = t.g) order by (select max(v) from u where u.k = t.x), id",
+        ]
+        for x in ss { check(mut &s, mut &gs, &x) }
+        report(&gs)
+
+        // EXPLAIN ANALYZE's counts as the row engine's (its batches aside)
+        let eq = "explain analyze select t.id, u.id from t join u on u.id = t.id where t.id < 400 and u.v = (select max(v) from u u2 where u2.k = u.k) order by t.id"
+        let eon = noTime(run(mut &s, &eq))
+        let a = run(mut &s, &"set lexdb_batch = off")
+        let eoff = noTime(run(mut &s, &eq))
+        let b = run(mut &s, &"set lexdb_batch = on")
+        println("explain: " + eon)
+        println("explain counts as the row engine's: " + (if noBatches(&eon) == eoff { "yes" } else { "no: " + eoff }))
+        lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+        return 0
+    }).unwrap()
+}
