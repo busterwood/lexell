@@ -486,3 +486,57 @@ fn runSetKeys(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val,
     }
     return Ok(Unit{})
 }
+
+// ---- a set operation's rows held (Q8 R3, design/lexdb-layers.md 6.3.Q8 R3)
+//
+// A set operation a subquery, a CTE or a held statement reads (its parts
+// run and combined by the caller: combine, or a recursive CTE's rounds)
+// has its ORDER BY, OFFSET and LIMIT made here, as the streamed run makes
+// them: by the pipeline's sort (setSort), a top-N with a LIMIT.
+
+// rows past offset (-1 or 0: none skipped), at most limit (-1 all), in
+// their order.
+pub fn cut(rows: [][]Val, limit: int, offset: int): [][]Val {
+    var all = rows
+    if offset <= 0 && (limit < 0 || limit >= len(all)) { return all }
+    var out: [][]Val = []
+    var i = 0
+    for k in 0..len(all) {
+        if i >= offset {
+            if limit >= 0 && len(out) >= limit { break }
+            append(mut &out, replace(mut &all[k], []))
+        }
+        i += 1
+    }
+    return out
+}
+
+// rows sorted by sp's ORDER BY (its keys outputs: keyCols) through the
+// pipeline's sort, then cut by offset and limit (a top-N keeps limit +
+// offset rows). rows stay the caller's (the sort takes copies). batErr: a
+// key not an output, or a value the sort does not hold (the caller's row
+// path then sorts them). Nothing is held against max_statement_mem here:
+// the caller holds what its row path holds.
+pub fn sortHeld(txn: mut &lexdb_store.Txn, sp: &Spec, rows: &[][]Val, limit: int, offset: int): Result[[][]Val, DbErr] {
+    let kc = keyCols(&sp.order, &sp.outs)
+    if len(kc) == 0 || len(kc) != len(sp.order) { return Err(lexdb_pipe.batErr()) }
+    var srt = lexdb_pipe.setSort(len(sp.outs), kc, collections.copyOf(&sp.desc), collections.copyOf(&sp.nullsFirst),
+                                 collections.copyOf(&sp.ordKinds), limit, offset, -1, 0)
+    let noB = lexdb_rows.noOutBatch()
+    for i in 0..len(rows) { if !(try srt.take(&noB, &rows[i])) { return Err(lexdb_pipe.batErr()) } }
+    var bud = lexdb_pipe.newBudget()
+    var out: [][]Val = []
+    var row: []Val = []
+    let n = try srt.done(txn, mut &bud, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
+        if ob.n == 0 {
+            append(mut &out, collections.copyOf(r))
+            return Ok(true)
+        }
+        for j in 0..ob.n {
+            lexdb_pipe.obRow(ob, j, mut &row)
+            append(mut &out, collections.copyOf(&row))
+        }
+        return Ok(true)
+    })
+    return Ok(out)
+}

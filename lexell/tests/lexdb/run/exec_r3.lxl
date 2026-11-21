@@ -11,11 +11,19 @@
 //   one whose argument does not bind (current_setting) stays the row engine's (its outer query piped).
 // - lateral: a LATERAL subquery or function at the first level over outer values only (run once a
 //   run, its rows held): a correlated scalar, EXISTS and IN over a derived table or a function of the
-//   outer row, a join after it, an aggregate over it, an error in it (22012), no rows, NULLs; one after
-//   the first level stays the row engine's.
+//   outer row, a join after it, an aggregate over it, an error in it (22012), no rows, NULLs.
+// - set operations: held (a subquery's, a derived table's, a CTE's, INSERT ... SELECT's, a recursive CTE's, and at the
+//   top where a part's values are coerced: 2 UNION 2.0), their ORDER BY, OFFSET and LIMIT lexdb_setop's: UNION [ALL],
+//   INTERSECT [ALL], EXCEPT [ALL], nested, NULLs, text keys, duplicates, LIMIT 0, a cap (EXISTS, a scalar), an error in a
+//   part (22012).
+// - select list sets: a set-returning function in the select list with no FROM (lockstep, padded with NULL, an empty
+//   set, NULLs, in IN, EXISTS, ALL/ANY and a scalar subquery (21000), an error in an output); under LIMIT or DISTINCT,
+//   or over a table, the row engine's.
 // timeout: 120
 // expect: from: 30 queries, 30 the same, piped yynyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 52
 // expect: lateral: 16 queries, 16 the same, piped yyyyyyyyyyyyyyyy, pipeline runs 538
+// expect: set operations: 28 queries, 28 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 147
+// expect: select list sets: 18 queries, 18 the same, piped nnnnnnnnyyyyyynnny, pipeline runs 9
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -153,6 +161,64 @@ fn main() {
         ]
         for x in ls { check(mut &s, mut &gl, &x) }
         report(&gl)
+
+        var gs = newGroup(&"set operations", &"queries")
+        let ss = [
+            "select count(*) from (select g from t union select k from u) q",
+            "select * from (select g from t union select k from u order by 1 desc limit 3) q",
+            "select * from (select g from t union all select k from u order by 1 limit 4 offset 2) q",
+            "select * from (select x from t where id < 40 intersect select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 40 intersect all select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 100 except select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 100 except all select w % 50 from u order by 1 nulls first limit 5) q",
+            "select count(*) from t where x in (select k from u union select 40)",
+            "select count(*) from t where exists (select 1 from u where u.k = t.g union select 2 where t.g = 3)",
+            "select id, (select max(k) from (select k from u where u.k < t.g union select 1) z) from t where id < 10 order by 1",
+            "with c as (select s from t where id < 30 union select c from u order by 1) select * from c",
+            "select 2 union select 2.0",
+            "select 1 union select 2.5 order by 1 desc",
+            "select * from (select 1 union select 2.5 order by 1 desc) q",
+            "select * from (select s from t where id < 40 union select c from u) q order by 1 nulls first",
+            "select * from (select 10 / (x - 7) from t where id < 40 union select 1) q",
+            "select * from (select x from t union select null order by 1 nulls first limit 2) q",
+            "select * from (select x from t where id < 30 union all select x from t where id < 30 order by x desc nulls last limit 3 offset 1) q",
+            "select count(*) from (select g, s from t union select k, c from u) q",
+            "select * from (select * from (select g from t union select k from u) a except select * from (select 1 union select 2) b) q order by 1",
+            "with recursive r(n) as (select 1 union select n + 1 from r where n < 20) select * from r order by n desc limit 3",
+            "select * from (with recursive r(n) as (select 1 union all select n * 2 from r where n < 1000) select n from r order by 1 desc) q limit 4",
+            "select exists (select g from t union select 99 order by 1 limit 1)",
+            "select (select g from t where id < 3 union select 9 order by 1 desc limit 1)",
+            "select (select g from t union select 9 order by 1 limit 1 offset 5)",
+            "select * from (select s from t union select c from u order by 1 limit 0) q",
+            "select (select g from t where id < 3 union select 9)",
+            "insert into u select 1000 + g, g, g, 'n' from (select g from t union select 50) q;; select count(*), sum(k) from u where id >= 1000;; delete from u where id >= 1000",
+        ]
+        for x in ss { check(mut &s, mut &gs, &x) }
+        report(&gs)
+
+        var gp = newGroup(&"select list sets", &"queries")
+        let ps = [
+            "select unnest(array[1, 2, 3])",
+            "select unnest(array[1, 2, 3]), generate_subscripts(array['a', 'b'], 1)",
+            "select unnest('{}'::int[])",
+            "select unnest(array[null, 'b']), 'k'",
+            "select regexp_matches('abc', '(a)(b)?'), regexp_matches('x', 'y')",
+            "select regexp_matches('foobarbequebaz', 'ba.', 'g')",
+            "select regexp_split_to_table('the quick brown fox', '\\s+')",
+            "select string_to_table('a,b,,c', ',')",
+            "select count(*) from (select unnest(array[1, 2, 3, 4])) s",
+            "select 'abc' like all (select unnest(array['a%', '%c'])), 'abc' like any (select unnest(array['x%', 'b%']))",
+            "select (select unnest(array[7]))",
+            "select (select unnest(array[7, 8]))",
+            "select exists (select unnest('{}'::int[]))",
+            "select id from t where id in (select unnest(array[3, 5, 3])) order by 1",
+            "select unnest(array[1, 2]) / 0",
+            "select unnest(array[1, 2]) limit 1",
+            "select distinct unnest(array[2, 1, 2])",
+            "select n, unnest(array['p', 'q']) from (values (1), (2)) v(n) order by 1, 2",
+        ]
+        for x in ps { check(mut &s, mut &gp, &x) }
+        report(&gp)
         return 0
     }).unwrap()
 }

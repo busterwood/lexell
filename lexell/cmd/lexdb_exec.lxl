@@ -10588,6 +10588,18 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
+        // (its ORDER BY, OFFSET and LIMIT lexdb_setop's, Q8 R3)
+        if rs.batch && lexdb_plan.setHeld(sel) {
+            match try setHeldRes(txn, sel, mut &rows, limit, offset, sorting, rs) {
+                Some(r) {
+                    // census: lexdb_census.note("pipe", "")
+                    return Ok(r)
+                }
+                None {
+                    // census: lexdb_census.note("setop", "a set operation (runSet): a value the sort does not hold")
+                }
+            }
+        }
         let noCols: []lexdb_sql.ColDef = []
         for i in 0..len(rows) {
             let vals = replace(mut &rows[i], [])
@@ -20052,4 +20064,55 @@ fn lat0Memo(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, params: &[
     while len(rs.stats) <= i { append(mut &rs.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
     rs.stats[i].hits -= 1
     return Ok(Unit{})
+}
+
+// A held set operation's rows (runSet's) with its ORDER BY, OFFSET and
+// LIMIT (limit: its LIMIT or the caller's cap; sorting: ORDER BY, not
+// under EXISTS's cap of 1) made by lexdb_setop, the streamed run's way;
+// the bytes held as the row path holds them (its rows' ORDER BY values).
+// None: a value the sort does not hold (rows left for the row path).
+fn setHeldRes(txn: mut &lexdb_store.Txn, sel: &Sel, rows: mut &[][]Val, limit: int, offset: int, sorting: bool,
+              rs: mut &Run): Result[Option[Res], DbErr] {
+    var held = 0
+    var out: [][]Val = []
+    if !sorting || limit == 0 {
+        let none: []Val = []
+        held = len(rows) * lexdb_pipe.rowBytes(&none)
+        if sorting {
+            let kc = lexdb_setop.keyCols(&sel.order, &sel.outs)
+            if len(kc) != len(sel.order) { return Ok(None) }
+            held = setOrdBytes(sel, rows, &kc)
+        }
+        out = lexdb_setop.cut(replace(rows, []), limit, offset)
+    } else {
+        let kc = lexdb_setop.keyCols(&sel.order, &sel.outs)
+        if len(kc) == 0 || len(kc) != len(sel.order) { return Ok(None) }
+        let sp = setopSpec(sel, 0, 0)
+        match lexdb_setop.sortHeld(txn, &sp, rows, limit, offset) {
+            Ok(o) { out = o }
+            Err(x) {
+                if lexdb_pipe.isBat(&x) { return Ok(None) }
+                return Err(x)
+            }
+        }
+        held = setOrdBytes(sel, rows, &kc)
+    }
+    try rs.bud.hold(held)
+    var outs: []OutCol = []
+    for oc in sel.outs { append(mut &outs, oc.clone()) }
+    let tag = "SELECT " + len(out).toStr()
+    return Ok(Some(Res{cols: outs, rows: out, tag: tag, hasRows: true, copy: COPY_NONE}))
+}
+
+// The bytes the row path holds of a set operation's rows sorted: each
+// row's ORDER BY values (outputs kc, by their collations).
+fn setOrdBytes(sel: &Sel, rows: &[][]Val, kc: &[]int): int {
+    var n = 0
+    var ord: []Val = []
+    for r in rows {
+        ord = []
+        for oi in 0..len(kc) { append(mut &ord, ordVal(sel, oi, r[kc[oi]].clone())) }
+        n += lexdb_pipe.rowBytes(&ord)
+    }
+    return n
 }
