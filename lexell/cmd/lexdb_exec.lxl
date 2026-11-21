@@ -8837,6 +8837,20 @@ fn keepSubs(rs: mut &Run, subs: []SubRes) {
     rs.pre = subs
 }
 
+// A recursive CTE's working table (level lv's), the rows the round before
+// added, copied (as prepare copies them), and their number.
+fn workRows(rs: &Run, lv: &Level): Result[[][]Val, DbErr] {
+    let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+    if at < 0 { return Err(e("XX000", "a working table is missing")) }
+    return Ok(copyRows(&rs.cache.rows[at]))
+}
+
+fn workLen(rs: &Run, lv: &Level): Result[int, DbErr] {
+    let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+    if at < 0 { return Err(e("XX000", "a working table is missing")) }
+    return Ok(len(rs.cache.rows[at]))
+}
+
 // Runs sel's pipeline plan: at most cap rows (-1 no cap), given to give
 // (lexdb_pipe.run's: a chunk, or a row read one by one), its subqueries
 // run once first. The scan's counts go to the run's (EXPLAIN ANALYZE).
@@ -8850,13 +8864,13 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
                 let l0 = &sel.q.levels[0]
-                if l0.virt() && heldFew(&pg, &subs[l0.src]) {
+                if (l0.src >= 0 && heldFew(&pg, &subs[l0.src])) || (l0.work >= 0 && lexdb_pipe.heldSmall(try workLen(rs, l0), false, params, 0, false)) {
                     // a few rows held first: joined row by row, as before they were
                     // the pipeline's (a join's set-up costs more than they save)
                     keepSubs(rs, subs)
                     return Err(lexdb_pipe.batErr())
                 }
-                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
+                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
                 let cx = pipeCtx(st, txn, params, mut &subs)
                 var tabs: []&Table = []
                 for k in 0..len(sel.q.levels) { append(mut &tabs, &sel.q.levels[k].t) }
@@ -8885,10 +8899,11 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             // (rows the run holds as the first level: read from the subquery's result)
             let l0 = &sel.q.levels[0]
-            let none: [][]Val = []
-            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
+            // (a recursive CTE's working table: the round before's rows, Q8 R2)
+            let work = if l0.work >= 0 { try workRows(rs, l0) } else { [] }
+            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else { len(work) }, rs)
             let cx = pipeCtx(st, txn, params, mut &subs)
-            let held = if l0.virt() { &subs[l0.src].data } else { &none }
+            let held = if l0.src >= 0 { &subs[l0.src].data } else { &work }
             var cnt: []lexdb_pipe.Counts = []
             let n = try lexdb_pipe.run(st, txn, &pg, &sel.q.cols, &sel.q.levels[0].t, &src, held, &cx, cap, mut &rs.bud, mut &cnt, give)
             scanCounts(rs, &cnt)
@@ -8946,7 +8961,11 @@ fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &l
     let lv = &q.levels[0]
     if lv.virt() {
         // rows the run holds: its caller gives them to the run, a series
-        // (made as it is read) its arguments
+        // (made as it is read) its arguments; a working table's (Q8 R2)
+        if lv.src < 0 {
+            let noVals: []Val = []
+            return lexdb_pipe.srcHeld(pg, held, false, &noVals, 0, false)
+        }
         let sr = &subs[lv.src]
         return lexdb_pipe.srcHeld(pg, held, sr.series, &sr.vals, sr.sOid, sr.sOrdin)
     }

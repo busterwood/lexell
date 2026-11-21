@@ -7304,8 +7304,9 @@ pub fn scanArm(q: &Query, aggs: bool): PScan {
     for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
     var need: []bool = withCapacity(len(t.cols))
     for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
-    // (rows the run holds: always read as batches, or row by row if few)
-    let held = if lv.virt() { lv.src } else { -1 }
+    // (rows the run holds: always read as batches, or row by row if few; a
+    // recursive CTE's working table past the query's subqueries, Q8 R2)
+    let held = if lv.src >= 0 { lv.src } else if lv.work >= 0 { len(q.subs) + lv.work } else { -1 }
     let batch = held >= 0 || firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
     return PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, sorted: batch && keyOrdered(q, 0), held: held}
 }
@@ -7833,12 +7834,14 @@ pub fn tableRead(lv: &Level): bool {
 // Whether lv is rows the run holds that the pipeline reads as q's first
 // table, cut into batches (lexdb_held; item 6 of design/lexdb-batch-gaps.md):
 // a subquery in FROM's (a derived table, view, CTE, VALUES, a function
-// scan, a catalog relation, an integer series made as it is read), not a
-// recursive CTE's working table, not LATERAL, locked, with a WHERE after
-// it, or a semi or anti join's. A series is one of smallint, integer or
-// bigint (its end is the type's range: lexdb_held.seriesOf).
+// scan, a catalog relation, an integer series made as it is read) or a
+// recursive CTE's working table (Q8 R2: the rows of the round before), not
+// LATERAL, locked, with a WHERE after it, or a semi or anti join's. A
+// series is one of smallint, integer or bigint (its end is the type's
+// range: lexdb_held.seriesOf).
 pub fn heldRead(q: &Query, lv: &Level): bool {
-    if lv.src < 0 || lv.work >= 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
+    if lv.work >= 0 { return lv.src < 0 && lv.perRow && !lv.lateral && lv.lock == 0 && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0 }
+    if lv.src < 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
     if lazySeries(q, lv.src) {
         let oid = q.subs[lv.src].sel.outs[0].oid
         return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8
