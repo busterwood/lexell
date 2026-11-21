@@ -7,8 +7,13 @@
 // - recursive: a recursive CTE's working table as rows the run holds (one row a round, a round of
 //   2,000 rows read in batches, a join with it, UNION, a filter, NULLs, an error in a late round
 //   (22012), max_recursion's 54001, an empty first query).
+// - no from: SELECT with no FROM as a Result (one row if its WHERE holds): constants, parameters'
+//   expressions, nextval, a subquery run once in the outputs and the WHERE, EXISTS (select 1 where ...),
+//   a scalar subquery with no FROM per outer row, LIMIT 0, OFFSET, an error in an output and in the
+//   WHERE (22012), DISTINCT, a write's VALUES.
 // timeout: 120
-// expect: recursive: 13 queries, 13 the same, piped yyyyyyyyyyyyy, pipeline runs 1788
+// expect: recursive: 13 queries, 13 the same, piped yyyyyyyyyyyyy, pipeline runs 1798
+// expect: no from: 34 statements, 34 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyynyyyyy, pipeline runs 75
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -127,6 +132,45 @@ fn main() {
         for x in rs { check(mut &s, mut &gr, &x) }
         report(&gr)
 
+        var gn = newGroup(&"no from", &"statements")
+        let ns = [
+            "select 1",
+            "select 1, 'a', null, 2.5, true",
+            "select 1 + 2 * 3, 'a' || 'b', length('abc'), upper(null)",
+            "select 1 where false",
+            "select 1 where 1 < 2",
+            "select 1 where null",
+            "select setval('sq', 10);; select nextval('sq')",
+            "select setval('sq', 20);; select nextval('sq'), nextval('sq')",
+            "select (select max(x) from t), (select count(*) from t where g = 3)",
+            "select 1 where exists (select 1 from t where x = 49)",
+            "select 2 where (select count(*) from t) > 5000",
+            "select 1 limit 0",
+            "select 1 offset 1",
+            "select 1 limit 1 offset 0",
+            "select 1 / 0",
+            "select 1 where 1 / 0 = 1",
+            "select 1 / 0 limit 0",
+            "select distinct 5",
+            "select count(*) from t where exists (select 1 where t.x = 7)",
+            "select id, (select t.x + 1) from t where id < 20 order by id",
+            "select count(*) from t where x in (select 3 union all select 4)",
+            "select id from t where x = (select 1 / (t.g - 3)) and id < 40 order by id",
+            "select (select 1 where t.g = 2) from t where id < 10 order by id",
+            "select cast('12' as int) + 1, '2024-01-02'::date + 1",
+            "select (select v from e where id = 1)",
+            "select 1 / (select count(*) from e)",
+            "select current_setting('TimeZone'), current_user = session_user, pg_backend_pid() > 0",
+            "select setval('sq', 30);; select nextval('sq'), currval('sq'), lastval(), nextval('sq')",
+            "select nextval('nosuch')",
+            "select 1 where nextval('sq') > 0 and currval('sq') = 32",
+            "select set_config('lexdb.k', 'v', false), current_setting('lexdb.k')",
+            "select 'pg_class'::regclass::oid > 0, txid_current() = txid_current()",
+            "select current_schema(), pg_my_temp_schema() = 0",
+        ]
+        for x in ns { check(mut &s, mut &gn, &x) }
+        checkW(mut &s, mut &gn, &"insert into e values (1, (select 7));; insert into e select 2, 8 where true", &"select * from e order by id")
+        report(&gn)
         return 0
     }).unwrap()
 }

@@ -480,7 +480,18 @@ pub type Prog = record {
     // its top is a Sort or Distinct (slice P3): the rows are held, then
     // given as one OutBatch (the run holds their bytes in its budget)
     pub sorts: bool
+    // how a run starts (PR_*), set once by the planner, not tested per run
+    pub run: int
 }
+
+pub const PR_PLAIN: int = 0
+// a point select's (Q8: lexdb_exec.pipeFetch): no subquery, no join, its
+// table read by its whole primary key (pointRead)
+pub const PR_POINT: int = 1
+// a Result's (no FROM) with an output or condition that does not bind (a
+// sequence, session or catalog function's call: lexdb_bind.evalMark), which
+// its run's owner evaluates (Q8 R2)
+pub const PR_EVAL: int = 2
 
 // A subquery of a query: what it is (lexdb_sql.SUB_*), how the executor
 // runs it (RUN_*), NOT EXISTS's (an anti join) for RUN_SEMI and
@@ -7783,6 +7794,71 @@ pub fn pipeShape(sel: &Sel): bool {
     return len(sel.exprs) > 0 && len(sel.ox) == len(sel.exprs) && boundOnce(q)
 }
 
+// Whether sel is a SELECT with no FROM the pipeline may run (Q8 R2: a
+// Result arm, its one row if its WHERE holds, Query.top): its outputs bound
+// for the plan; no ORDER BY (its keys are evaluated, and may fail, on the
+// one row), grouping, window, set operation, lock, TOP, WITH TIES, SELECT
+// @v, MATCH_RECOGNIZE, set-returning function or correlated subquery left
+// in it. An OFFSET or LIMIT it applies itself.
+pub fn resultShape(sel: &Sel): bool { return resultWhy(sel) == "" }
+
+// Why resultShape is false for sel ("" it is not).
+pub fn resultWhy(sel: &Sel): str {
+    let q = &sel.q
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.mr) > 0 { return "grouped, a window, a set, locked" }
+    if sel.sort || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return "ORDER BY, TOP, WITH TIES or SELECT @v" }
+    if q.corr || len(q.levels) != 0 || hasSrfCall(&sel.exprs) { return "a correlated subquery or a set-returning function" }
+    if len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) || len(sel.ox) != len(sel.exprs) { return "outputs and columns differ" }
+    return ""
+}
+
+// sel's Result plan (resultShape): Limit? (Project (Filter? (Result))),
+// its outputs as pipeSel binds them (moved from Sel.ox), its WHERE bound
+// for the plan; one that does not bind (a sequence, session or catalog
+// function's call) marked for eval at the run (lexdb_bind.evalMark); None
+// if such a one holds a subquery (the outputs given back).
+pub fn resultPlan(sel: mut &Sel): Option[PPlan] {
+    var xs: []BX = withCapacity(len(sel.exprs))
+    for i in 0..len(sel.exprs) {
+        match replace(mut &sel.ox[i], None) {
+            Some(b) { append(mut &xs, b) }
+            None {
+                // (with no subquery it bound as bindSel binds it: not; eval's at
+                // the run, but not with a subquery, whose value eval does not see)
+                if !hasSubCall(&sel.exprs[i]) {
+                    append(mut &xs, lexdb_bind.evalMark())
+                    continue
+                }
+                match planX(&sel.exprs[i], &sel.q) {
+                    Some(b) { append(mut &xs, b) }
+                    None {
+                        // census: lexdb_census.no("no FROM: an output does not bind (planX), with a subquery")
+                        oxBack(sel, xs)
+                        return None
+                    }
+                }
+            }
+        }
+    }
+    var cs: []BX = []
+    for i in 0..len(sel.q.top) {
+        let b = planX(&sel.q.top[i], &sel.q)
+        if b.isNone() {
+            if hasSubCall(&sel.q.top[i]) {
+                // census: lexdb_census.no("no FROM: a condition does not bind (planX), with a subquery")
+                oxBack(sel, xs)
+                return None
+            }
+            append(mut &cs, lexdb_bind.evalMark())
+            continue
+        }
+        append(mut &cs, b.unwrap())
+    }
+    let leaf = PPlan.Result(subsOf(&sel.q))
+    let proj = PPlan.Project(if len(cs) > 0 { PPlan.Filter(leaf, cs) } else { leaf }, xs)
+    return Some(if sel.limit >= 0 || sel.offset > 0 { PPlan.Limit(proj, sel.limit >= 0, sel.limit, max(sel.offset, 0)) } else { proj })
+}
+
 // Whether sel's outputs, more than its select list's, are a hashed
 // subquery's keys and value (hashSub).
 fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.sort && !sel.distinct }
@@ -7960,7 +8036,7 @@ pub fn shapeWhy(sel: &Sel): str {
 
 fn queryWhy(sel: &Sel): str {
     let q = &sel.q
-    if len(q.levels) == 0 { return "no FROM" }
+    if len(q.levels) == 0 { return "no FROM: " + resultWhy(sel) }
     if q.corr { return "a correlated subquery left per row (q.corr)" }
     if len(q.top) > 0 { return "conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
@@ -8138,6 +8214,11 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
             unplan(sel, i)
         }
         PPlan.Filter(i, cs) {
+            // (a Result's: its WHERE bound for the plan only)
+            match i {
+                PPlan.Result(_) { return }
+                else {}
+            }
             var v = cs
             var cc: []Option[BX] = []
             for k in 0..len(v) { append(mut &cc, unbound(replace(mut &v[k], BX.Const(Val.Null)), false)) }
@@ -8162,8 +8243,8 @@ pub fn oxBack(sel: mut &Sel, xs: []BX) {
 }
 
 // b as the Sel holds it: None for a column (col) or what only a plan's
-// run evaluates (a subquery's value).
-fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) { None } else { Some(b) } }
+// run evaluates (a subquery's value, eval's mark: lexdb_bind.evalMark).
+fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) || lexdb_bind.isEvalMark(&b) { None } else { Some(b) } }
 
 pub fn copySets(xs: &[][]int): [][]int {
     var out: [][]int = []

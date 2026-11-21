@@ -2057,7 +2057,11 @@ fn heldRun(src: &Src) {
 
 // p's program; Err(p): an operator or an expression the pipeline does
 // not run (the caller keeps its details: the plan is given back).
-pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] { return compileP(p0, cols, false) }
+
+// compile; point: a point select's plan (Prog.point: no subquery, its
+// table read by its whole primary key), unless it joins.
+pub fn compileP(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, point: bool): Result[Prog, lexdb_plan.PPlan] {
     var p = p0
     let n = opsOf(&p, cols)
     if n < 0 {
@@ -2072,7 +2076,8 @@ pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, le
     // (the columns a plan reads of rows the run holds only, as a join's tables')
     if j || heldScan(&p) { p = lexdb_plan.needs(p, len(cols)) }
     let so = !g && sortArm(&p)
-    return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so})
+    let how = if point && !j { lexdb_plan.PR_POINT } else if resultEval(&p) { lexdb_plan.PR_EVAL } else { lexdb_plan.PR_PLAIN }
+    return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so, run: how})
 }
 
 // Whether p's scan reads rows the run holds (PScan.held).
@@ -2114,8 +2119,9 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
     }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
-            // over a Sort or Distinct (slice P3): its count and offset theirs
-            if sortArm(&i) {
+            // over a Sort or Distinct (slice P3), or a Result (Q8 R2): its
+            // count and offset theirs
+            if sortArm(&i) || resultArm(&i) {
                 let k = opsOf(&i, cols)
                 return if k < 0 { -1 } else { k + 1 }
             }
@@ -2166,6 +2172,10 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                             if !scanRuns(&sc, &subs, cols) || !allRead(&cs, &sc) || !allRead(&xs, &sc) { return -1 }
                             return 3
                         }
+                        lexdb_plan.PPlan.Result(subs) {
+                            if !onceAll(&subs) || !allRead(&cs, &lexdb_plan.noScan()) || !allRead(&xs, &lexdb_plan.noScan()) { return -1 }
+                            return 3
+                        }
                         else { return -1 }
                     }
                 }
@@ -2173,11 +2183,58 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                     if !scanRuns(&sc, &subs, cols) || !allRead(&xs, &sc) { return -1 }
                     return 2
                 }
+                lexdb_plan.PPlan.Result(subs) {
+                    if !onceAll(&subs) || !allRead(&xs, &lexdb_plan.noScan()) { return -1 }
+                    return 2
+                }
                 else { return -1 }
             }
         }
         else { return -1 }
     }
+}
+
+// Whether p is a Result's Project (no FROM, Q8 R2).
+fn resultArm(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Project(i, _) {
+            match i {
+                lexdb_plan.PPlan.Result(_) { return true }
+                lexdb_plan.PPlan.Filter(j, _) {
+                    match j {
+                        lexdb_plan.PPlan.Result(_) { return true }
+                        else { return false }
+                    }
+                }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
+// Whether p is a Result (under a Limit or not) one of whose outputs or
+// conditions its run's owner evaluates (lexdb_bind.evalMark).
+fn resultEval(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return resultEval(&i) }
+        lexdb_plan.PPlan.Project(i, xs) {
+            if !resultArm(p) { return false }
+            for x in xs { if lexdb_bind.isEvalMark(&x) { return true } }
+            match i {
+                lexdb_plan.PPlan.Filter(_, cs) { for c in cs { if lexdb_bind.isEvalMark(&c) { return true } } }
+                else {}
+            }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether each of subs is run once, before the plan's run.
+fn onceAll(subs: &[]lexdb_plan.PSub): bool {
+    for s in subs { if s.run != lexdb_plan.RUN_ONCE { return false } }
+    return true
 }
 
 // The census's reason (lexdb_census, design/lexdb-layers.md 6.4) opsOf
@@ -2533,6 +2590,60 @@ fn pointScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.
     var srt = noSortRun()
     try oneRow(txn, mut &rows[0], sc, conds, xs, cx, lim, bud, cnt, mut &srt, give, mut &sr)
     return Ok(sr.n)
+}
+
+// Runs a Result program (no FROM, Q8 R2: resultArm, under a Limit or
+// not): its conditions on no row, in order, then its outputs (an error in
+// either is the statement's, as the row engine raises it), the row given
+// unless the LIMIT, OFFSET or cap leaves it out. The rows given (0 or 1).
+// ev: the value of condition (true) or output i that does not bind (its
+// owner evaluates it: lexdb_bind.evalMark; pg.run PR_EVAL).
+
+pub fn runResult(txn: mut &lexdb_store.Txn, pg: &Prog, cx: &Ctx, cap: int, cnt: mut &[]Counts,
+                 give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    runs += 1
+    resultRuns += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    return resultOp(txn, &pg.plan, cx, cap, 0, pg.run == lexdb_plan.PR_EVAL, cnt, give, ev)
+}
+
+var resultRuns: int = 0
+
+// Result programs run (the tests' look).
+pub fn resultCount(): int { return resultRuns }
+
+fn resultOp(txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cx: &Ctx, lim: int, off: int, ss: bool, cnt: mut &[]Counts,
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    let none: []BX = []
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, n, o) { return resultOp(txn, &i, cx, if lim >= 0 && (n < 0 || lim < n) { lim } else { n }, o, ss, cnt, give, ev) }
+        lexdb_plan.PPlan.Project(j, xs) {
+            match j {
+                lexdb_plan.PPlan.Filter(_, cs) { return resultRow(txn, &cs, &xs, cx, lim, off, ss, cnt, give, ev) }
+                else { return resultRow(txn, &none, &xs, cx, lim, off, ss, cnt, give, ev) }
+            }
+        }
+        else { return Err(e("XX000", "the pipeline was given a plan it does not run")) }
+    }
+}
+
+fn resultRow(txn: mut &lexdb_store.Txn, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, off: int, ss: bool, cnt: mut &[]Counts,
+             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    let noRow: []Val = []
+    let noAggs: []Val = []
+    cnt[0].starts += 1
+    for k in 0..len(conds) {
+        let v = if ss && lexdb_bind.isEvalMark(&conds[k]) { try ev(true, k) } else { try bxEval(&conds[k], &noRow, &noAggs, cx) }
+        if lexdb_ops.truth(&v) != Some(true) { return Ok(0) }
+    }
+    cnt[0].joined += 1
+    var vals: []Val = withCapacity(len(xs))
+    for k in 0..len(xs) { append(mut &vals, if ss && lexdb_bind.isEvalMark(&xs[k]) { try ev(false, k) } else { try bxEval(&xs[k], &noRow, &noAggs, cx) }) }
+    if lim == 0 || off > 0 { return Ok(0) }
+    cnt[len(cnt) - 1].joined += 1
+    let ob = lexdb_rows.noOutBatch()
+    let more = try give(txn, &ob, &vals)
+    return Ok(1)
 }
 
 // A Src that reads nothing (a table looked up per row).
@@ -7491,7 +7602,7 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
     var avail: []bool = array(len(cols), false)
     let n = joinOps(&p, cols, mut &avail)
     if n < 0 { return Err(p) }
-    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false})
+    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
 }
 
 // Runs a levels program (compileLevels): each joined row (the query's
