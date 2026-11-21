@@ -24,6 +24,7 @@ import "./lexdb_agg"
 import "./lexdb_window"
 import "./lexdb_match"
 import "./lexdb_gen"
+import "./lexdb_census"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -7309,6 +7310,11 @@ pub fn filterOver(ps: PScan, cs: []BX, subs: []PSub): PPlan {
     return if len(cs) > 0 { PPlan.Filter(leaf, cs) } else { leaf }
 }
 
+// The census's word for a level joinsOver does not join by its kind.
+fn noJoin(lv: &Level) {
+    if lexdb_census.ON { lexdb_census.no(if lv.lateral { "join: LATERAL" } else if lv.lock != 0 { "join: a locked table" } else if lv.semi || lv.anti { "join: a semi or anti join level" } else { "join: a kind it does not join" }) }
+}
+
 // The tables after sel's first joined over base (its Filter? (Scan)):
 // a Join arm per level (slice P2), its keys, conditions and WHERE
 // conjuncts bound for the plan, its table's arm (lexdb_plan.PJoin): a
@@ -7328,25 +7334,49 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             // a build group (optimizer 49): one hash of its levels' join
             match grpArm(q, k) {
                 Some(j) { p = PPlan.Join(p, j) }
-                None { return Err(p) }
+                None {
+                    // census: lexdb_census.no("join: a build group's arm")
+                    return Err(p)
+                }
             }
             k += lv.grp + 1
             continue
         }
         let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
         let rj = keepsRight(lv.join)
-        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 { return Err(p) }
-        if lv.src >= 0 && lazySeries(q, lv.src) { return Err(p) }
-        if inner && len(lv.post) > 0 { return Err(p) }
-        if q.corr && pathCorr(&lv.path) { return Err(p) }
+        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 {
+            // census: noJoin(lv)
+            return Err(p)
+        }
+        if lv.src >= 0 && lazySeries(q, lv.src) {
+            // census: lexdb_census.no("join: a series made as read, not first")
+            return Err(p)
+        }
+        if inner && len(lv.post) > 0 {
+            // census: lexdb_census.no("join: an inner level with a WHERE after it (post)")
+            return Err(p)
+        }
+        if q.corr && pathCorr(&lv.path) {
+            // census: lexdb_census.no("join: a correlated path")
+            return Err(p)
+        }
         // (a RIGHT or FULL JOIN: hashed, each with its own marks of the rows that joined)
-        if rj && lv.perRow { return Err(p) }
+        if rj && lv.perRow {
+            // census: lexdb_census.no("join: RIGHT or FULL read per row")
+            return Err(p)
+        }
         let mark = if lv.mode == LV_NOTIN { MK_NOTIN } else if lv.mode == LV_MARK { markOf(q, lv) }
                    else if lv.anti { MK_ANTI } else if lv.semi || lv.semiSub >= 0 { MK_SEMI } else { MK_JOIN }
-        if lv.mode != 0 && !(lv.virt() && !lv.perRow) { return Err(p) }
+        if lv.mode != 0 && !(lv.virt() && !lv.perRow) {
+            // census: lexdb_census.no("join: an optimizer-50 level read per row")
+            return Err(p)
+        }
         let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
         let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
-        if lv.perRow && !look && !range { return Err(p) }
+        if lv.perRow && !look && !range {
+            // census: lexdb_census.no(if l0.stops { "join: read per row under a first table that stops early (LIMIT)" } else { "join: read per row, neither a key lookup nor a range" })
+            return Err(p)
+        }
         let t = &lv.t
         var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
                                  scan: joinScan(q, k),
@@ -7359,26 +7389,46 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 j.resCol = lv.resCol
                 match planX(&lv.resVal, q) {
                     Some(b) { append(mut &j.res, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
             // (no key: an inner join of every pair, its conditions per pair)
             if len(lv.hashCols) == 0 {
-                if !inner || mark != MK_JOIN || lv.resNot { return Err(p) }
-            } else if len(lv.hashVals) != len(lv.hashCols) { return Err(p) }
-            for hk in lv.hashKinds { if hk != lexdb_sql.COLL_EXACT { return Err(p) } }
+                if !inner || mark != MK_JOIN || lv.resNot {
+                    // census: lexdb_census.no("join: no hash key, not an inner join")
+                    return Err(p)
+                }
+            } else if len(lv.hashVals) != len(lv.hashCols) {
+                // census: lexdb_census.no("join: hash keys and values differ")
+                return Err(p)
+            }
+            for hk in lv.hashKinds {
+                if hk != lexdb_sql.COLL_EXACT {
+                    // census: lexdb_census.no("join: a collation's hash key")
+                    return Err(p)
+                }
+            }
             for i in 0..len(lv.hashCols) {
                 append(mut &j.hcols, lv.hashCols[i])
                 append(mut &j.ktypes, boundType(&t.cols[lv.hashCols[i]].typ))
                 match planX(&lv.hashVals[i], q) {
                     Some(b) { append(mut &j.keys, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
             for x in lv.local {
                 match planX(&x, q) {
                     Some(b) { append(mut &j.build, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
             // its conditions but those on its own columns (applied as its
@@ -7389,7 +7439,10 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 if len(lv.hashCols) == 1 && isKeyEq(&x, q, lv) { j.keq = len(j.conds) }
                 match planX(&x, q) {
                     Some(b) { append(mut &j.conds, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
         } else {
@@ -7399,7 +7452,10 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 append(mut &j.ktypes, keyType(t, ix, i))
                 match planX(&lv.path.eqs[i], q) {
                     Some(b) { append(mut &j.keys, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
             if range && len(lv.path.rng) > 0 {
@@ -7407,7 +7463,10 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 for b in lv.path.rng {
                     match planX(&b.val, q) {
                         Some(v) { append(mut &j.rng, PBound{op: b.op.toStr(), val: v}) }
-                        None { return Err(p) }
+                        None {
+                            // census: lexdb_census.no("join: an expression does not bind (planX)")
+                            return Err(p)
+                        }
                     }
                 }
             }
@@ -7415,14 +7474,20 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             for x in lv.cond {
                 match planX(&x, q) {
                     Some(b) { append(mut &j.conds, b) }
-                    None { return Err(p) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
                 }
             }
         }
         for x in lv.post {
             match planX(&x, q) {
                 Some(b) { append(mut &j.post, b) }
-                None { return Err(p) }
+                None {
+                    // census: lexdb_census.no("join: an expression does not bind (planX)")
+                    return Err(p)
+                }
             }
         }
         p = PPlan.Join(p, j)
@@ -7742,9 +7807,170 @@ pub fn heldRead(q: &Query, lv: &Level): bool {
     return true
 }
 
+// Whether lv is a table read by its whole primary key (a point select's
+// first level: a scan of one point, read row by row; firstBatches is
+// false for it).
+pub fn pointRead(lv: &Level): bool {
+    let p = &lv.path
+    return !lv.virt() && p.index < 0 && len(p.eqs) > 0 && len(p.eqs) == len(lv.t.pk) && len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0
+}
+
 // Whether lv is a first table the pipeline reads: a table (tableRead) or
 // rows the run holds (heldRead).
 fn firstRead(q: &Query, lv: &Level): bool { return tableRead(lv) || heldRead(q, lv) }
+
+// ---- the census (lexdb_census, design/lexdb-layers.md 6.4): called only
+// in a census copy of the tree (its `// census:` hooks, or behind
+// `if lexdb_census.ON`); shapeWhy and aggWhy name the first condition of
+// pipeShape and aggShape a Sel fails, in their order ("" none)
+
+// A Sel's key for the census: its tables, outputs, columns and kind.
+pub fn censusKey(sel: &Sel): str {
+    var k = ""
+    for lv in sel.q.levels { k = k + lv.t.name + "," }
+    return k + "/" + len(sel.exprs).toStr() + "/" + len(sel.q.cols).toStr() + "/" + (if sel.aggQ { "a" } else { "r" }) +
+           sel.setop.toStr() + "/" + len(sel.q.subs).toStr() + "/" + sel.srf
+}
+
+// After pipeSel's planning of sel (joins: of its levels program, Query.jp):
+// the reason noted kept under sel's key when the pipeline did not take it.
+pub fn censusKeep(sel: &Sel, joins: bool) {
+    let r = lexdb_census.take()
+    if joins {
+        let pj = match sel.pipe {
+            Some(pg) { pg.joins }
+            None { false }
+        }
+        if len(sel.q.levels) > 1 && sel.q.jp.isNone() && !pj {
+            lexdb_census.keep(&("jp:" + censusKey(sel)), &(if len(r) > 0 { r } else { "?" }))
+        }
+        return
+    }
+    if sel.pipe.isNone() { lexdb_census.keep(&censusKey(sel), &(if len(r) > 0 { r } else { "?" })) }
+}
+
+// A run of sel by engine (lexdb_census.note): how, the run's own reason
+// (a give-way, a window ...), else the plan's; with the joins' engine.
+pub fn censusNote(sel: &Sel, engine: &str, how: &str) {
+    let k = censusKey(sel)
+    var r = if len(how) > 0 { how.toStr() } else { lexdb_census.reasonOf(&k) }
+    if engine != "pipe" && len(sel.q.levels) > 1 {
+        if sel.q.jp.isSome() { r = r + " [joins: the pipeline's levels program]" }
+        else { r = r + " [joins: row; " + lexdb_census.reasonOf(&("jp:" + k)) + "]" }
+    }
+    lexdb_census.note(engine, &r)
+}
+
+// A run of sel by execSel that its pipeline rows did not make: batch (SET
+// lexdb_batch), gave (they gave way at the run), noLimit (FOR UPDATE's
+// run). An aggregate the pipeline runs is noted after its run.
+pub fn censusRun(sel: &Sel, batch: bool, gave: bool, noLimit: bool) {
+    let pa = match sel.pipe {
+        Some(pg) { pg.groups }
+        None { false }
+    }
+    if !batch { lexdb_census.note("off", "") }
+    else if gave { censusNote(sel, "row", "gave way at the run (pipeHeld)") }
+    else if noLimit && sel.pipe.isSome() { censusNote(sel, "row", "FOR UPDATE's run (noLimit)") }
+    else if sel.setop != 0 { lexdb_census.note("setop", "a set operation (runSet; its parts run on their own)") }
+    else if sel.aggQ && pa {}
+    else if len(sel.wins) > 0 && !sel.aggQ { censusNote(sel, "row", "a window (winValues)") }
+    else { censusNote(sel, "row", "") }
+}
+
+// A write's rows found by the row engine (runQuery over q): what (UPDATE,
+// DELETE, MERGE, ALTER TABLE), batch (SET lexdb_batch).
+pub fn censusDml(q: &Query, what: &str, batch: bool) {
+    if !batch {
+        lexdb_census.note("off", what)
+        return
+    }
+    var r = what + " finds its rows (runQuery)"
+    if len(q.levels) == 0 { r = r + " [no table]" }
+    else if len(q.levels) == 1 { r = r + " [" + (if q.levels[0].path.index >= 0 { "index" } else if len(q.levels[0].path.eqs) == len(q.levels[0].t.pk) && len(q.levels[0].t.pk) > 0 { "primary key equal" } else { "scan or key range" }) + "]" }
+    else if q.jp.isSome() { r = r + " [joins: the pipeline's levels program]" }
+    else { r = r + " [joins: row]" }
+    lexdb_census.note("dml", &r)
+}
+
+// What else keeps sel's rows from the pipeline ("" nothing): pipeShape's
+// first failing condition, after "; and ".
+pub fn alsoWhy(sel: &Sel): str {
+    if pipeShape(sel) { return "" }
+    let w = shapeWhy(sel)
+    return if len(w) > 0 { "; and " + w } else { "" }
+}
+
+pub fn shapeWhy(sel: &Sel): str {
+    let q = &sel.q
+    if !(streams(sel) || sortShape(sel)) {
+        if sel.setop != 0 { return "a set operation" }
+        if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
+        if len(sel.wins) > 0 { return "a window" }
+        if len(sel.locks) > 0 { return "FOR UPDATE" }
+        if len(sel.feedback) > 0 { return "SELECT @v = (feedback)" }
+        if sel.donKey > 0 { return "DISTINCT ON" }
+        if sel.withTies { return "WITH TIES" }
+        if sel.topMode != 0 { return "TOP PERCENT or WITH TIES" }
+        if hasSrfCall(&sel.exprs) { return "a set-returning function in the select list" }
+        if q.corr { return "a correlated subquery in the outputs or ORDER BY" }
+        if sel.offset > 0 { return "OFFSET" }
+        return "not streamed"
+    }
+    if len(sel.mr) > 0 { return "MATCH_RECOGNIZE" }
+    if len(sel.feedback) > 0 { return "SELECT @v = (feedback)" }
+    if sel.topMode != 0 || sel.withTies { return "TOP PERCENT or WITH TIES" }
+    if sel.first >= 0 { return "MIN or MAX by the scan's order (Sel.first)" }
+    return queryWhy(sel)
+}
+
+fn queryWhy(sel: &Sel): str {
+    let q = &sel.q
+    if len(q.levels) == 0 { return "no FROM" }
+    if len(q.refs) > 0 { return "a correlated subquery's own run (refs)" }
+    if q.corr { return "a correlated subquery left per row (q.corr)" }
+    if len(q.top) > 0 { return "conditions on no table (q.top)" }
+    if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
+    if len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) { return "outputs and columns differ" }
+    if len(sel.ox) != len(sel.exprs) { return "outputs not bound for the plan (ox)" }
+    if !boundOnce(q) { return "conditions not bound once (boundOnce)" }
+    return ""
+}
+
+pub fn aggWhy(sel: &Sel): str {
+    let q = &sel.q
+    if sel.setop != 0 { return "a set operation" }
+    if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
+    if len(sel.wins) > 0 { return "agg: a window over the groups" }
+    if sel.first >= 0 { return "agg: MIN or MAX by the scan's order (Sel.first)" }
+    if len(sel.locks) > 0 { return "FOR UPDATE" }
+    if len(q.levels) == 0 { return "agg: no FROM" }
+    if q.corr { return "agg: a correlated subquery left per row (q.corr)" }
+    if len(q.top) > 0 { return "agg: conditions on no table (q.top)" }
+    if !firstRead(q, &q.levels[0]) { return "agg: first level: " + levelWhy(q, &q.levels[0]) }
+    if !boundOnce(q) { return "agg: conditions not bound once (boundOnce)" }
+    if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return "agg: one table, with columns besides its own" }
+    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key" } }
+    return ""
+}
+
+// Why lv is not a first table the pipeline reads (firstRead).
+pub fn levelWhy(q: &Query, lv: &Level): str {
+    if lv.work >= 0 { return "a recursive CTE's working table" }
+    if !lv.perRow { return "not read per row" }
+    if lv.lateral { return "LATERAL" }
+    if lv.lock != 0 { return "locked" }
+    if len(lv.post) > 0 { return "a WHERE after it (post)" }
+    if lv.semi || lv.anti || lv.semiSub >= 0 { return "a semi or anti join's" }
+    if lv.src >= 0 && lazySeries(q, lv.src) { return "a series not of integers" }
+    return "?"
+}
+
+// pipeAgg's None, the census's reason noted.
+fn noAgg(r: &str): Option[PPlan] {
+    lexdb_census.no(r)
+    return None
+}
 
 // An aggregate's plan for the pipeline (slice P1b; lexdb_exec compiles it, lexdb_pipe.compile):
 // Agg (Filter? (Scan)) under physOf's operators over the groups (views:
@@ -7756,39 +7982,60 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     for x in sel.groupBy {
         match planX(&x, &sel.q) {
             Some(b) { append(mut &keys, b) }
-            None { return None }
+            None {
+                // census: lexdb_census.no("agg: a GROUP BY key does not bind (planX)")
+                return None
+            }
         }
     }
     var calls: []PCall = []
     for sp in sel.specs {
         let f = &sp.fname
         // (the calls it accumulates: lexdb_pipe.compile's)
-        if sp.kind != lexdb_sql.COLL_EXACT { return None }
+        if sp.kind != lexdb_sql.COLL_EXACT {
+            // census: lexdb_census.no("agg: a call by a collation")
+            return None
+        }
         var arg: Option[BX] = None
         // (the values besides the argument: string_agg's separator, the ORDER BY keys)
         var more: []BX = []
         if !sp.star {
-            if len(sp.args) < 1 || len(sp.args) > 2 { return None }
+            if len(sp.args) < 1 || len(sp.args) > 2 {
+                // census: lexdb_census.no("agg: a call of no or more than two arguments")
+                return None
+            }
             arg = planX(&sp.args[0], &sel.q)
-            if arg.isNone() { return None }
+            if arg.isNone() {
+                // census: lexdb_census.no("agg: a call's argument, ORDER BY or FILTER does not bind (planX)")
+                return None
+            }
             for k in 1..len(sp.args) {
                 match planX(&sp.args[k], &sel.q) {
                     Some(b) { append(mut &more, b) }
-                    None { return None }
+                    None {
+                        // census: lexdb_census.no("agg: a call's argument, ORDER BY or FILTER does not bind (planX)")
+                        return None
+                    }
                 }
             }
         }
         for o in sp.order {
             match planX(&o, &sel.q) {
                 Some(b) { append(mut &more, b) }
-                None { return None }
+                None {
+                    // census: lexdb_census.no("agg: a call's argument, ORDER BY or FILTER does not bind (planX)")
+                    return None
+                }
             }
         }
         var filt: Option[BX] = None
         match sp.filter {
             Some(fx) {
                 filt = planX(&fx, &sel.q)
-                if filt.isNone() { return None }
+                if filt.isNone() {
+                    // census: lexdb_census.no("agg: a call's argument, ORDER BY or FILTER does not bind (planX)")
+                    return None
+                }
             }
             None {}
         }
@@ -7796,7 +8043,7 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     }
     let cs = match planConds(sel) {
         Some(x) { x }
-        None { return None }
+        None { return noAgg("agg: a condition does not bind (planX)") }
     }
     var ps = scanArm(&sel.q, true)
     // (over joins every table's columns are the plan's: lexdb_plan.needs)

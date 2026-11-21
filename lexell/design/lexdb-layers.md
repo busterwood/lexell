@@ -6388,6 +6388,332 @@ keys with no rows, 51.3 validity, 51.7 q20 measured, 51.8 as built). Branch
   side with no index; 5d in ON, HAVING, grouped queries and DML; 5e by
   cost where an index serves the key, and outputs that may fail).
 
+### 6.3.Q8 as built (first part, 2026-11-21)
+
+Q8's first part: the census (6.4), Fetch for point selects, the dead
+code, and the deletion plan (6.5). Branch
+`worktree-agent-a7a4819d7382d2516` from main 4fa2acec. The row engine's
+live paths and `SET lexdb_batch = off` are untouched.
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 4fa2acec | | 19,747 | `lexdb_pipe` 7,301, `lexdb_plan` 8,024 |
+| 161b5d55 | stage 1: the census (`lexdb_census` 112 lines, `tools/lexdb_census.py`), its reasons in the planner and the pipeline; 6.4 | 19,785 | `lexdb_plan` +167 (the reasons: `shapeWhy`, `aggWhy`, `censusKey`, ...), `lexdb_pipe` +~90 (`opsWhy`, `scanWhy`) |
+| f0c154c2 | stage 2: Fetch -> Project for point selects (`pipeFetch`, `lexdb_pipe.runPoint`, `lexdb_plan.pointRead`); test `exec_fetch` | 19,818 | `lexdb_pipe` +~55 |
+| 6b512c36 | stage 3: dead code | 19,814 | `lexdb_pipe` 7,432 |
+| 8d38f00b | the census's calls in declined branches made hooks too (the join's +24); 6.3.Q8, 6.5 | 19,825 | `lexdb_pipe` 7,543, `lexdb_plan` 8,271 (the hooks on lines of their own) |
+
+**Stage 2: Fetch for point selects.** The census found every point
+select already the pipeline's (P1a: Scan of one point -> Project, a chunk
+of one read row by row), 2.5% fewer instructions than the row engine's
+(6.4). What Fetch takes away is the generic run's glue around one row:
+
+- `runPipe`, for a plan whose only table is read by its whole primary key
+  (`lexdb_plan.pointRead`: a table, no index, every key column equal, no
+  IN list) with no subquery, no join and no batched write's resume key,
+  calls `pipeFetch`: the one scan from the key's values (`pathScan`, as
+  `pathScans` makes it for such a path), the context with the run's
+  parameters (one session environment, not three: no `runSubs`, no
+  `subVals`, no `firstSwitch`, whose answer for a primary key path is
+  always -1, no `srcOf`).
+- `lexdb_pipe.runPoint` runs `Limit? (Sort of the scan's order)? (Project
+  (Filter? (Scan)))` over that scan: the row read (`lexdb_access.fetch`,
+  one point), then `oneRow` as `runScan`'s row path runs it (the tick, the
+  counts, the conditions in order, the outputs by `bxEval`, given as a row).
+  Any other shape (a Sort or Distinct, a scan that reads batches or held
+  rows, a scan that is not one point) goes to `lexdb_pipe.run` with
+  `srcOf`'s Src, exactly as before.
+- `execSelIn` makes its session environment (`seqEnv`) after the
+  pipeline's rows, for the row path only (every pipeline SELECT paid it).
+- The same rows, errors and EXPLAIN ANALYZE counts as with batches off:
+  `exec_fetch` (30 queries: integer, text and two-column keys; missing,
+  NULL, out-of-range and other-typed keys; outputs and conditions that fail
+  or drop the row; LIMIT 0 and 1; ORDER BY, DISTINCT, FOR UPDATE), 27 of
+  them by the point path (`lexdb_pipe.runCounts()[3]`).
+
+Measured (variants built from the same tree, `LXL_HASH_SEED=1`, in
+process, the 1-select run subtracted from the 20,000-select one,
+instructions a select):
+
+| build | instructions | vs main |
+|---|---:|---:|
+| main 4fa2acec | 132,512 | |
+| the census in (stage 1) | 132,512 | 0 |
+| `pipeFetch` with `lexdb_pipe.run` (its Src made directly) | 131,428 | -1,085 (-0.82%) |
+| ... and `runPoint` | 130,402 | -2,111 (-1.59%) |
+| ... and `execSelIn`'s `seqEnv` after the pipeline (stage 2 as committed) | 130,132 | -2,381 (-1.80%) |
+| stage 3 and 8d38f00b (three and two rounds) | 130,131.6 | -2,381 (-1.80%) |
+
+Over the wire (base 4fa2acec against the branch, both `-O`, alternated):
+`pts.sh` (`points.sql`, 20,000 point
+selects by the simple protocol, server CPU, means of 5-10 runs): 669.5 ->
+657.6 ms (-1.8%) with stage 2's binary, 658.2 -> 643.2 ms (-2.3%) with the
+final one. `simple.sh` (pgbench `-M simple`, 4 clients, 10 s, two rounds,
+the final binary): point select 47,188 -> 52,462 tps (main's first round
+44,813, an outlier; the second 49,562 against 52,305), update 9,311 ->
+9,286 (-0.3%), 3-table join 19,945 -> 19,931 (-0.1%; with stage 2's
+binary it read 20,249 -> 19,608, -3.2%, at +24 instructions a statement:
+the census's calls in the join's declined branches, then made hooks,
+8d38f00b; its instructions are main's now, 426,944.4 a statement in
+process).
+
+So point selects are switched (they were the pipeline's already; Fetch is
+now their path).
+
+**Stage 3: dead code.** The coverage census (6.4's tool: `copy
+--cover=lexdb_exec,lexdb_pipe,lexdb_plan --blocks=lexdb_exec,lexdb_pipe`,
+the suite, TPC-H's 22 and the OLTP runs; then the suite again with `SET
+lexdb_batch = off` ignored, `--force-batch`):
+
+- Functions: 646 of exec's 652 entered, 216 of the pipe's 217, 275 of
+  the plan's 277 (the 2 the census's own). Not entered: `fastCopyFloat`,
+  `ownSeq`, `sysSuper`, `formatTypeFn`, `bxOf`, `seenTables` (COPY of
+  floats, OWNED BY, T-SQL's IS_SRVROLEMEMBER, `format_type` with two
+  arguments, `batchLevel`'s binding of a condition the plan did not bind,
+  VACUUM's tables): untested, not unreachable; and the pipe's `levelsOf`,
+  which nothing calls (dead).
+- Blocks (an if's, a loop's, a match arm's, a closure's; 2,054 in exec,
+  755 in the pipe): 139 and 49 not entered, all error paths and rare
+  values (DDL corners, catalog functions, T-SQL and Oracle forms, a
+  window's order key of mixed kinds, `execSrf`'s unused catalog
+  relations): none of them provably unreachable.
+- With batches forced on, the same 1,130 functions are entered: **no
+  function of exec, the pipe or the plan is there for the tests'
+  reference alone.** Ten blocks are entered only with batches off:
+  `runLevel`'s read of the keys optimizer 19's switch counted (2220-2235)
+  and `winValues`' row path (the window calls by value, 15750-15767). They
+  are the reference's and stay while `SET lexdb_batch = off` does.
+- Every function the pipeline made redundant was deleted in its own slice
+  (P1-P3, the batch gaps, Q3): what is left of the row engine is reached
+  by statements the pipeline declines (6.4), so nothing more of it can go
+  before 6.5's slices.
+- Deleted (dead by name, no caller in the tree or the tests): the pipe's
+  `levelsOf`, `hashCutRows` and its counter `hashCuts` (written per hash
+  reduction, never read); exec's `noLimits` and `tabTypeId`. 4 lines out
+  of exec, 13 out of the pipe. (Other modules have a few more, outside the
+  row engine: `lexdb_time`'s `instantOf` family, `lexdb_bind`'s `lpCols`,
+  `lpLentExprs`, `copyBCols`, `lexdb_catalog`'s `tabTypeObj`,
+  `tabTypeCols`; left.)
+
+**Gates.** Suite: 253 of 253 after stage 1 (and in the census copy), 254
+of 254 after stages 2 and 3 (new: `exec_fetch`). Point selects: stage 1
+level (132,512.3 against 132,512.4), stages 2-3 -2,381 a select.
+TPC-H (base 4fa2acec and the branch, `-O`, alternated twice, `TPCH_REF`
+1744ef99, one run each, `~/tpch-w/q8`), the final binary (8d38f00b): all
+22 1.000 of main (23,820 and 23,820 ms), checksums equal, no plan changed;
+over 1.5%: q15 +2.6% (its first round 629 against 601 ms, the second 605
+against 602), its server instructions main's within 0.01% (`iq.sh`):
+code placement. Stage 3's binary (6b512c36) read 0.990, with q9 +2.1%,
+q13 +3.3%, q17 +2.3% at instructions within 0.03% of main's. Imports: 62 modules (new: `lexdb_census`, which
+`lexdb_plan`, `lexdb_pipe`, `lexdb_exec` and `lexdb_wire` import).
+
+### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
+
+Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
+part: every run of a query (a SELECT's, a subquery's, a set operation's
+part, a write's rows found) noted with the engine that made its rows and,
+for the row engine's, the first reason the pipeline declined it.
+
+**The instrument.** `lexdb_census` (new, imports only lexell's
+libraries) and `lexell/tools/lexdb_census.py`:
+
+- A build-time switch: `lexdb_census.ON` is false in every build. A
+  census is a copy of the tree (`lexdb_census.py copy DIR`) with ON true,
+  the `// census: <call>` hook comments made code, and the suite's runner
+  naming each test (`LEXDB_CENSUS_TEST`); its programs append a line per
+  run to `$LEXDB_CENSUS`: test, top or sub (inside a subquery's run),
+  engine, reason, statement. `lexdb_census.py sum` adds them up.
+- Where the reasons come from: the planner's and the pipeline's give-ups
+  each name themselves (`lexdb_census.no`, first one wins): `pipeSelMain`'s
+  branches, `pipeShape`'s and `aggShape`'s conditions (`shapeWhy`,
+  `aggWhy`: the same tests again, in order), `pipeAgg`, `joinsOver`'s
+  levels, `lexdb_pipe.compile` (`opsWhy`, again `opsOf`'s tests),
+  `aggOps`, `joinOps`, `grpOps`, `levelsProgIn`. A declined Sel's reason
+  is kept under a key of its tables, outputs and kind; the run looks it
+  up. A run's own give-way (`batErr`) is noted where it is caught.
+- What it costs: nothing. A `const` test is not compiled away (`if
+  lexdb_census.ON { ... }` costs about five instructions where it runs,
+  measured on a loop), and a call in a declined branch is paid where a
+  statement declines every time (the OLTP 3-table join: +24 instructions
+  a statement), so a normal build holds no census call at all: every
+  hook is a comment (101 of them), the reasons' functions
+  (`shapeWhy`, `opsWhy`, ...) are called from hooks only, and `opsOf` is
+  untouched (an instruction there had cost a point select: its frame
+  grew). A global array costs about 500 instructions at a program's
+  start: the coverage's is a hook too. Point selects, `LXL_HASH_SEED=1`,
+  in process, the 1-select run subtracted from the 20,000-select one, two
+  rounds: 132,512.4 instructions a select (main) against 132,512.3 (the
+  census in, off); the 3-table join 426,944.4 against 426,944.4.
+- `copy --cover=MOD,...` notes each function's first entry, `copy
+  --blocks=MOD,...` each block's (an if's, a loop's, a match arm's, a
+  closure's); `copy --force-batch` with `LEXDB_CENSUS_FORCE=1` ignores
+  `SET lexdb_batch = off`, so the code only the tests' reference reaches
+  shows (6.3.Q8 as built, 6.5).
+
+**Runs by engine** (the suite, 253 tests; TPC-H's 22 queries at SF1, one
+run; OLTP: 2,000 of `points.sql` through psql, 300 each of pgbench's
+point select, update, 3-table join, insert and a TPC-B-like transaction,
+`-M simple`):
+
+| engine | suite runs | suite tests | TPC-H runs | OLTP runs |
+|---|---:|---:|---:|---:|
+| the pipeline's rows | 37,413 | 184 | 6 | 2,600 (every point select) |
+| the pipeline's groups (exec makes HAVING, the select list, DISTINCT, ORDER BY over them) | 790,244 (9,000 statements) | 188 | 9,484 | 0 |
+| the row engine | 311,366 | 196 | 6 | 303 |
+| a write's rows found (`runQuery`) | 3,003 | 109 | 0 | 600 (every UPDATE) |
+| a set operation (`runSet`, its parts on their own) | 553 | 33 | 0 | 0 |
+| `SET lexdb_batch = off` (the tests' reference) | 737,768 | 58 | 0 | 0 |
+
+207 of the 216 tests that run a query make at least one row-engine, write
+or set-operation run; 9 run nothing but the pipeline. Only 58 tests run
+anything with batches off.
+
+- **TPC-H:** all 22 run their main work in the pipeline. The row engine
+  makes q2's outer query (a correlated scalar subquery left per row:
+  `q.corr`; its 747 runs are the pipeline's aggregates), q17's outer
+  aggregate (`q.corr`; 204 runs), q16's NOT IN subquery's own rows (the
+  supplier scan) and q20's two IN subqueries' own rows (its 8,508 runs of
+  the correlated sum are the pipeline's).
+- **OLTP:** every point select is the pipeline's (Scan of one point ->
+  Project: a chunk of one already, P1a). Every UPDATE finds its row in the
+  row engine (`runQuery` -> `runLevel`'s point read). The 3-table join
+  (`b.aid = a.aid + 1 ... ORDER BY 1 LIMIT 5`) is the row engine's: its
+  lookups are per row under a first table that may stop early. INSERT
+  VALUES runs no query.
+- **Point select, pipeline against row engine** (in process, 20,000,
+  `LXL_HASH_SEED=1`, the same binary, `SET lexdb_batch = off` for the row
+  engine; the 1-select run subtracted): 132,512 instructions a select
+  against 135,953, the pipeline 2.5% fewer.
+
+**The row engine's runs by reason** (the suite, batches on: statements
+are distinct texts, tests those with one; the reasons in the order the
+planner tests them, the first one that held; a run of the census copy, all
+253 passing, and a second for the subqueries' split, where `exec_batchexpr`
+times out under the census's writes, a line a run):
+
+| reason | statements | tests | runs | example | to cover | size |
+|---|---:|---:|---:|---|---|---|
+| a subquery's own rows (IN, EXISTS, a scalar's, a semi, anti or mark level's: `pipeSelIn(sel, false)`), INSERT ... SELECT's rows: 1,980 statements (129 tests) for that alone, 1,633 (32 tests, 138,873 runs) correlated per row as well | 3,360 | 135 | 151,021 | q16's `ps_suppkey not in (select s_suppkey from supplier where ...)`; per row: `exists (select 1 from f where f.xf = tn.k)` | offer their rows (`rows` true): `runChild`'s `execSel` already takes `pipeHeld`; the per-row ones need Apply as well (below) | small (a switch, measured per run: q20's 8,508) |
+| a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
+| no FROM (`runQuery` with no level) | 814 | 116 | 42,808 | `select nextval('s')`, `select 1` | a Result arm: one row, its outputs by `bxEval` | small; a driver's `select 1` is point-select-like: OLTP gate |
+| a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo | large |
+| a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) | medium (`execSrf` 172 lines) |
+| not offered to the pipeline (a write's subqueries: RETURNING, SET, WHERE) | 274 | 21 | 800 | `delete from fp returning id, (select count(*) from fc)` | `pipeSel` for a write's subqueries | small |
+| MIN or MAX by the scan's order (`Sel.first`) | 245 | 17 | 10,661 | `select max(c) from f` (an index on c) | a first-row aggregate over an ordered scan that stops | small |
+| joins the pipeline does not join: per row under a first table that stops early (161), a point first table (44), RIGHT/FULL with no key (14), a collation's key (5), an `= any(array)` lookup (4), an expression (2) | 230 | 28 | 374 | OLTP's 3-table join; `select * from v11 where id = 3` (a view of a join) | lookups under a stopping first table, a chunk of one as a join's input, collated keys | medium |
+| MATCH_RECOGNIZE (`execMatch` over its input's rows) | 196 | 6 | 473 | `select * from mv order by g` | stays a row operator over the input (`lexdb_match`), fed by the pipeline; out of exec | medium |
+| OFFSET (not a stopping LIMIT) | 131 | 11 | 135 | `order by id desc limit 2 offset 1` | Limit with an offset | small |
+| FOR UPDATE (`runLocking`) | 98 | 7 | 199 | `select id from acct where id = 2 for update` | a lock operator (runs again after a wait) | medium |
+| an expression that does not bind for the plan: an output (81), a condition (47), ORDER BY (2) | 130 | 44 | 694 | `select row_number() from emp`, `where count(*) > 1` (errors the row path raises), a session function | the binder raises the errors; the rest case by case | small each |
+| gave way at the run (a value a batch cannot hold: `batErr`), rows (84) and groups (37) | 119 | 38 | 182 | `select distinct sqrt(abs(e.n)) from e` | each operator's own fallback (6.2.3's table: a `BK_VAL` column), no whole-query give-way | medium |
+| a recursive CTE's working table as the first level | 44 | 5 | 50,312 | `with recursive t(n) as (select 1 union all select n + 1 from t where n < 10) ...` | the working table as rows the run holds (`heldRead`) | small |
+| aggregates it does not run: a window over the groups (11), a collation's key or call (13), calls, keys or conditions that do not bind (11) | 35 | 23 | 51 | `select count(distinct c) from w` (c a collated text) | collated keys and calls in `HashAgg` | small-medium |
+| DISTINCT ON (25), WITH TIES and TOP PERCENT (12), a set-returning function in the select list (8), `SELECT @v =` (1) | 46 | 10 | 66 | `values (1), (1), (2) order by 1 fetch first 1 row with ties` | Sort and Distinct variants | small each |
+
+**The writes** (the rows a write changes, found by `runQuery` over its
+query: `runLevel`, with batches its first level by `batchLevel`, its
+joins by the levels program `Query.jp`): UPDATE 1,391 statements, DELETE
+301, MERGE 112, ALTER TABLE's rewrite 29, in 109 tests; OLTP's every
+UPDATE. To cover: a write's source as a pipeline program giving its rows
+to the write operator (layer 7); medium; gated by pgbench's update tps
+and instructions.
+
+**Set operations:** 349 statements in 33 tests combine their parts in
+exec (`runSet`); `lexdb_setop` streams the others already. Medium.
+
+**Over the pipeline's groups:** HAVING, the select list, DISTINCT, ORDER
+BY and LIMIT of every aggregate the pipeline runs (9,000 statements, 188
+tests, TPC-H's 18 grouped queries) are made by exec's row code
+(`execSelIn`'s group loop, `sortOutRows`). They are views over few rows
+(physAbove's), but they are the row engine's code: medium (Having,
+Project and the Sort over the groups as operators).
+
+### 6.5 Q8: the row engine's deletion, in slices (plan, 2026-11-21)
+
+What is left before the row engine (`runQuery`, `runLevel`, `materialize`,
+`batchLevel`, the row aggregates, sort, windows, `execSrf`, `execMatch`'s
+feeding, the subquery runs per row) can be deleted (decision 1), from
+6.4's census and 6.3.Q8's coverage.
+
+**What the coverage says first** (6.3.Q8 as built, stage 3). With `SET
+lexdb_batch = off` ignored (`lexdb_census.py copy --force-batch`), the
+suite enters the same 1,130 functions of exec, the pipe and the plan as
+with it honoured: no function is there for the tests' reference alone;
+every row-engine function is still reached by some statement the
+pipeline declines with batches on. Only ten blocks are the reference's
+alone (`runLevel`'s read of the keys optimizer 19's switch counted,
+`winValues`' row path). So the row engine goes when the last declined
+shape is covered, not before, and slice by slice the census counts what
+is left.
+
+**The slices.** Each merges with 6.3's gates (the suite; TPC-H alternated
+twice against the previous main, checksums equal, no query slower; point
+selects by instructions with `LXL_HASH_SEED=1`, any increase fixed;
+`lexdb_exec`'s lines) plus the census run again: the row engine's runs
+with batches on fall by the slice's rows of 6.4 and by nothing else.
+
+| slice | what the pipeline takes | 6.4 rows | own gate | size |
+|---|---|---|---|---|
+| R1 | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
+| R2 | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
+| R3 | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop` | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
+| R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
+| R5 | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
+| R6 | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
+| R7 | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait) | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
+| R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
+| R9 | the deletion: `runQuery` and below (`runRows`, `runLevel`, `materialize`, `batchLevel`, `bLevelPlan`, `winBatch`, `fillPick`), `execSelIn`'s row branches, `addToGroup`, `sortOutRows`, `eachRowBIn`'s row path, `runSub`/`fillCur`'s per-row machinery, the levels program for the row engine (`Query.jp`, `levelsProg`), `Run`'s row-engine fields; `SET lexdb_batch` | (the census: no row-engine run with batches on, suite, TPC-H, OLTP) | the oracle in place first (below); the suite; TPC-H; OLTP | about 3,000 lines out of exec (the row engine proper: `materialize` to `runRows` 640, the subquery runs 600, `execSelIn`'s row branches 300, windows 260, `batchLevel` and its plan 300, `execSrf` 170, the row aggregates and sort 250, `eachRowBIn`'s and `outRow` 150; some of it moves into operators rather than going) |
+
+R1-R8 are independent; R1 and R2 first (small, many tests), then R5 and
+R4 (the OLTP gate), R6, R7, R8. After R9 `lexdb_pipe` is layer 6 and the
+rest of exec layer 7 (6.2.3).
+
+**The oracle after R9 (proposal).** Today every "three ways" test runs
+its queries with batches on and off and compares; 58 tests do so. Once
+the row engine is gone there is no second engine to compare with. The
+proposal keeps the comparisons, with other references, in this order of
+weight:
+
+1. **The pipeline's own scalar path as the reference for its kernels.**
+   Every operator already has a row-at-a-time path (a chunk of one, every
+   expression by `bxEval`: what runs today when a batch gives way). A
+   test setting (`SET lexdb_vector = off`, test-only like decision 5's)
+   forces it everywhere: the same operators, no vector kernels, no
+   numeric units, no batch narrowing. It keeps the oracle for what the
+   tests compare most (expressions, NULLs, errors and their first failing
+   row, overflow to values), at the cost of not checking the operators'
+   own logic (joins, grouping, sorting), which 2-4 check.
+2. **Plans against plans (metamorphic).** The planner's switches give the
+   same query in other plans that must give the same rows:
+   `SET lexdb_planner = rules`, `lexdb_plan.setUnnest(0)`, `setBushy`,
+   `setRewrites`, `setKeyOrder`, the index paths (`SET
+   enable_indexscan`-like hints, or a query with its index dropped), the
+   hash against the per-row lookup (`semiCheaper`'s choice forced). A test
+   runs its corpus under each and compares, as it compares on and off
+   today. These check joins, semi, anti and mark joins, grouping
+   placement and the rewrites against each other.
+3. **Independent formulations** (SQLancer's ternary-logic partitioning
+   and NoREC, generated from each corpus query): `q` = `q where p` union
+   all `q where not p` union all `q where p is null`; `count(*) ... where
+   p` = `sum(case when p then 1 else 0 end)`; an aggregate as its
+   decomposition (`avg` = `sum/count`); a join as `exists` for a semi
+   join. Cheap to generate, no second engine.
+4. **The real databases' answers.** For the dialect corpora the
+   expected rows come from PostgreSQL, SQL Server 2022 (podman,
+   `lxl-mssql`) and Oracle as `gen_mssql.py` and the `tds_*`/`tns_*`
+   generators do now, stored in the tests; the random corpora of
+   `exec_batch`-style tests get a PostgreSQL run once (the scratch
+   PostgreSQL in `~/Work/lexdb-bench`) and keep its answers.
+5. **The stored answers** the suite has already (`// expect:`), which do
+   not need a second engine.
+
+The decision is the owner's: 1 is the cheapest to build (the operators
+have the path) and closest to today's on/off; 2 and 3 are the ones that
+keep checking the operators; 4 is the strongest per query and the most
+work to keep. Until R9, `SET lexdb_batch = off` stays as it is.
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does

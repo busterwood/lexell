@@ -43,7 +43,7 @@ CMD = os.path.normpath(os.path.join(HERE, "..", "..", "cmd"))
 IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
-    "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
+    "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
@@ -110,7 +110,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
@@ -131,7 +131,7 @@ STATS_USERS = {"lexdb_plan", "lexdb_exec"}
 # and Txn handles only. Only the pipeline and exec import it.
 PLAN = "lexdb_plan"
 PLAN_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_bind", "lexdb_stats", "lexdb_catalog", "lexdb_access", "lexdb_store",
-                   "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match", "lexdb_gen"}
+                   "lexdb_ops", "lexdb_rows", "lexdb_agg", "lexdb_window", "lexdb_match", "lexdb_gen", "lexdb_census"}
 PLAN_STORE_NAMES = {"Store", "Txn"}
 PLAN_USERS = {"lexdb_pipe", "lexdb_exec"}
 
