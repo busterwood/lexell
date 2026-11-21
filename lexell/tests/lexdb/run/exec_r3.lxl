@@ -19,11 +19,15 @@
 // - select list sets: a set-returning function in the select list with no FROM (lockstep, padded with NULL, an empty
 //   set, NULLs, in IN, EXISTS, ALL/ANY and a scalar subquery (21000), an error in an output); under LIMIT or DISTINCT,
 //   or over a table, the row engine's.
+// - match_recognize: its input's rows from the pipeline (a table's, a filtered derived table's, none), the row operator
+//   over them: ONE ROW and ALL ROWS PER MATCH, PARTITION BY a key with NULLs (a text's), NULLs in DEFINE, no match, an
+//   error in the input (22012).
 // timeout: 120
 // expect: from: 30 queries, 30 the same, piped yynyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 52
 // expect: lateral: 16 queries, 16 the same, piped yyyyyyyyyyyyyyyy, pipeline runs 538
 // expect: set operations: 28 queries, 28 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 147
 // expect: select list sets: 18 queries, 18 the same, piped yyyyyyyyyyyyyyynny, pipeline runs 26
+// expect: match_recognize: 8 queries, 8 the same, piped yyyyyyyy, pipeline runs 17
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -219,6 +223,20 @@ fn main() {
         ]
         for x in ps { check(mut &s, mut &gp, &x) }
         report(&gp)
+
+        var gm = newGroup(&"match_recognize", &"queries")
+        let ms = [
+            "select * from t match_recognize (order by id measures first(id) as f, last(id) as l, count(*) as c one row per match pattern (u+ d) define u as x > prev(x), d as x < prev(x)) where f < 200 order by f",
+            "select g, f, c from t match_recognize (partition by g order by id measures first(id) as f, count(*) as c one row per match pattern (n+) define n as x is null) order by g, f limit 8",
+            "select id, x, cl from (select * from t where id < 40) w match_recognize (order by id measures classifier() as cl all rows per match pattern (lo hi+) define lo as x < 10, hi as x >= 10) order by id",
+            "select count(*) from t match_recognize (order by id measures count(*) as c one row per match pattern (z) define z as x > 1000)",
+            "select s, f, c from t match_recognize (partition by s order by id measures first(id) as f, count(*) as c one row per match pattern (a b) define a as x % 2 = 0, b as x % 2 = 1) order by s nulls first, f limit 6",
+            "select f, l from (select id, 100 / (x - 7) as y from t where id < 600) w match_recognize (order by id measures first(id) as f, last(id) as l pattern (p+) define p as y > 0) order by f",
+            "select f, l from (select id, x from t where id < 0) w match_recognize (order by id measures first(id) as f, last(id) as l pattern (p+) define p as x > 0)",
+            "select count(*), sum(c) from t match_recognize (partition by g order by x nulls first, id measures count(*) as c one row per match pattern (a+) define a as x is not distinct from prev(x) or prev(x) is null)",
+        ]
+        for x in ms { check(mut &s, mut &gm, &x) }
+        report(&gm)
         return 0
     }).unwrap()
 }
