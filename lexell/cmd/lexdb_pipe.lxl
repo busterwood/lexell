@@ -2125,8 +2125,10 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                 let k = opsOf(&i, cols)
                 return if k < 0 { -1 } else { k + 1 }
             }
-            // a count, no offset (an OFFSET is not streamed: the row engine's)
-            if !stops || n < 0 || off > 0 { return -1 }
+            // a count that stops the scan; an OFFSET (Q8 R2: its rows skipped,
+            // runOp), with a count or not, not over joins
+            if !(stops && n >= 0) && off <= 0 { return -1 }
+            if off > 0 && hasJoin(&i) { return -1 }
             let k = opsOf(&i, cols)
             return if k < 0 { -1 } else { k + 1 }
         }
@@ -2254,7 +2256,7 @@ fn opsWhy(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef) {
     }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
-            if !sortArm(&i) && (!stops || n < 0 || off > 0) { lexdb_census.no("compile: a LIMIT that does not stop the scan, or OFFSET") }
+            if !sortArm(&i) && !resultArm(&i) && ((!(stops && n >= 0) && off <= 0) || (off > 0 && hasJoin(&i))) { lexdb_census.no("compile: a LIMIT that does not stop the scan, or an OFFSET over joins") }
             opsWhy(&i, cols)
         }
         lexdb_plan.PPlan.Sort(i, sorted, ps) {
@@ -2571,7 +2573,11 @@ fn pointOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPl
            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, off) {
+            // (an OFFSET: run's)
+            if off > 0 { return Ok(None) }
+            return pointOp(st, txn, &i, ops, cols, t, s, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give)
+        }
         // (the scan's order: nothing to do, as runOp)
         lexdb_plan.PPlan.Sort(i, _, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, lim, bud, cnt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
@@ -2783,7 +2789,34 @@ fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan
          give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, srt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, off) {
+            let l2 = if n < 0 || (lim >= 0 && lim < n) { lim } else { n }
+            if off <= 0 { return runOp(st, txn, &i, cols, t, src, hrows, cx, l2, bud, cnt, srt, give) }
+            // an OFFSET (Q8 R2): its first rows read, counted, not given
+            var skip = off
+            var row: []Val = []
+            return runOp(st, txn, &i, cols, t, src, hrows, cx, if l2 >= 0 { l2 + off } else { -1 }, bud, cnt, srt,
+                         fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+                if skip == 0 { return give(tx, ob, r) }
+                if ob.n == 0 {
+                    skip -= 1
+                    return Ok(true)
+                }
+                if ob.n <= skip {
+                    skip -= ob.n
+                    return Ok(true)
+                }
+                // (the chunk's rows past the offset, one by one)
+                let from = skip
+                skip = 0
+                let noOb = lexdb_rows.noOutBatch()
+                for j in from..ob.n {
+                    obRow(ob, j, mut &row)
+                    if !(try give(tx, &noOb, &row)) { return Ok(false) }
+                }
+                return Ok(true)
+            })
+        }
         lexdb_plan.PPlan.Sort(i, _, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, lim, bud, cnt, srt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
             match j {

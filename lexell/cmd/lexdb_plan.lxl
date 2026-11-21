@@ -7779,13 +7779,14 @@ fn grpSafe(x: &Expr): bool {
 
 // Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
 // takes, and what this Sel must give it): streamed (no sort, grouping,
-// DISTINCT, window, set or OFFSET), one table read per row, no correlated
+// DISTINCT, window or set; an OFFSET its Limit skips, Q8 R2), sorted or
+// DISTINCT (P3), one table read per row, no correlated
 // subquery left in it (a correlated subquery's own query is one: its outer
 // values are parameters, Q8 R1), its outputs and conditions bound for the
 // plan.
 pub fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
-    if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
@@ -7857,6 +7858,15 @@ pub fn resultPlan(sel: mut &Sel): Option[PPlan] {
     let leaf = PPlan.Result(subsOf(&sel.q))
     let proj = PPlan.Project(if len(cs) > 0 { PPlan.Filter(leaf, cs) } else { leaf }, xs)
     return Some(if sel.limit >= 0 || sel.offset > 0 { PPlan.Limit(proj, sel.limit >= 0, sel.limit, max(sel.offset, 0)) } else { proj })
+}
+
+// Whether sel is streamed but for its OFFSET (Q8 R2: the pipeline's Limit
+// skips its rows): no sort, grouping, DISTINCT, window, set, lock or
+// set-returning function, no correlated subquery in its outputs.
+fn offsetShape(sel: &Sel): bool {
+    if sel.offset <= 0 || sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || len(sel.locks) > 0 { return false }
+    if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
+    return !hasSrfCall(&sel.exprs)
 }
 
 // Whether sel's outputs, more than its select list's, are a hashed
