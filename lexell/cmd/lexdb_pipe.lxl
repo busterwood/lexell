@@ -7227,6 +7227,12 @@ type SortSt = record {
     maxHeld: int
     bad: bool               // a value not sorted here: the row engine's
     row: []Val              // a row read one by one, as values
+    // (Q8 R2: PSort's) DISTINCT ON's keys (0 none); WITH TIES (lexdb_plan.TS_*);
+    // TOP n PERCENT; TOP's n (-1 none)
+    don: int
+    ties: int
+    pct: bool
+    top: int
 }
 
 // Whether p (under its Limit) is a Sort or Distinct that holds its rows
@@ -7255,7 +7261,7 @@ fn projUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
 fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
     var sr = SortSt{sorting: false, distinct: false, shown: 0, keyCol: [], desc: [], nf: [], coll: [], dcoll: [], kinds: [],
                      limit: -1, offset: 0, topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0}, heap: [], scr: -1,
-                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, bad: false, row: []}
+                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, bad: false, row: [], don: 0, ties: 0, pct: false, top: -1}
     sr.shown = projLen(projUnder(p))
     sortArmOf(p, mut &sr)
     if cap >= 0 && (sr.limit < 0 || cap < sr.limit) { sr.limit = cap }
@@ -7266,7 +7272,9 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
         sr.nf = []
         sr.coll = []
     }
-    sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct { sr.limit + max(sr.offset, 0) } else { -1 }
+    // (DISTINCT ON, WITH TIES, TOP PERCENT: every row held, cut at finish)
+    let whole = sr.don > 0 || sr.ties != 0 || sr.pct || sr.top >= 0
+    sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct && !whole { sr.limit + max(sr.offset, 0) } else { -1 }
     sr.early = !sr.sorting && sr.limit >= 0
     if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: newMap(), nul: false, kb: ""}) }
     return sr
@@ -7286,7 +7294,7 @@ pub fn setSort(ncol: int, keyCol: []int, desc: []bool, nf: []bool, coll: []int, 
                room: int, maxMem: int): SortRun {
     var sr = SortSt{sorting: true, distinct: false, shown: ncol, keyCol: keyCol, desc: desc, nf: nf, coll: coll, dcoll: [], kinds: [],
                      limit: limit, offset: max(offset, 0), topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0},
-                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: []}
+                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: [], don: 0, ties: 0, pct: false, top: -1}
     sr.topK = if limit >= 0 { limit + sr.offset } else { -1 }
     return SortRun{st: [sr]}
 }
@@ -7349,6 +7357,10 @@ fn sortArmOf(p: &lexdb_plan.PPlan, sr: mut &SortSt) {
                         for x in k.nf { append(mut &sr.nf, x) }
                         for x in k.coll { append(mut &sr.coll, x) }
                     }
+                    sr.don = k.don
+                    sr.ties = k.ties
+                    sr.pct = k.pct
+                    sr.top = k.top
                 }
                 None {}
             }
@@ -7682,14 +7694,21 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
         for i in 0..sr.set.n { append(mut &perm, i) }
     }
     try bud.hold(sr.held)
-    let from = min(max(sr.offset, 0), len(perm))
-    var to = len(perm)
-    if sr.limit >= 0 && from + sr.limit < to { to = from + sr.limit }
-    if to <= from { return Ok(0) }
-    // one OutBatch, its places the sorted rows': less work than pieces
-    // (gathered in order, or each its places), measured (9.105)
-    var oidx: []int = withCapacity(to - from)
-    for i in from..to { append(mut &oidx, perm[i]) }
+    var oidx: []int = []
+    if sr.don > 0 || sr.ties != 0 || sr.pct || sr.top >= 0 {
+        oidx = try sr.cutOf(perm)
+    } else {
+        let from = min(max(sr.offset, 0), len(perm))
+        var to = len(perm)
+        if sr.limit >= 0 && from + sr.limit < to { to = from + sr.limit }
+        // one OutBatch, its places the sorted rows': less work than pieces
+        // (gathered in order, or each its places), measured (9.105)
+        oidx = withCapacity(max(to - from, 0))
+        for i in from..to { append(mut &oidx, perm[i]) }
+    }
+    if len(oidx) == 0 { return Ok(0) }
+    let to = len(oidx)
+    let from = 0
     var srcs: []int = []
     var kinds: []int = []
     for o in 0..sr.shown {
@@ -7701,6 +7720,36 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
     let noRow: []Val = []
     let more = try give(txn, &ob, &noRow)
     return Ok(to - from)
+}
+
+// The sorted rows perm cut as the row engine's execSel cuts them (Q8 R2):
+// DISTINCT ON (sorted: the first row of each run of equal leading keys),
+// then OFFSET, and LIMIT, TOP n or TOP n PERCENT of the rows (rounded up),
+// WITH TIES the rows after the last that sort as it does.
+fn (sr: &SortSt) cutOf(perm: []int): Result[[]int, DbErr] {
+    var rows = perm
+    if sr.don > 0 && sr.sorting {
+        var kept: []int = withCapacity(len(rows))
+        for i in 0..len(rows) { if i == 0 || lexdb_sort.skCmp(&sr.set.keys, 0, sr.don, rows[i - 1], rows[i]) != 0 { append(mut &kept, rows[i]) } }
+        rows = kept
+    }
+    var cut = sr.limit
+    if sr.pct {
+        if sr.top < 0 || sr.top > 100 { return Err(e("TS1031", "Percent values must be between 0 and 100.")) }
+        cut = (len(rows) * sr.top + 99) / 100
+    } else if sr.top >= 0 { cut = sr.top }
+    let ties = sr.ties == lexdb_plan.TS_TOP || (sr.ties == lexdb_plan.TS_FETCH && sr.sorting)
+    let nk = len(sr.keyCol)
+    var out: []int = []
+    var lastAt = -1
+    for k in max(sr.offset, 0)..len(rows) {
+        if cut >= 0 && len(out) >= cut {
+            if !ties || lastAt < 0 || lexdb_sort.skCmp(&sr.set.keys, 0, nk, rows[k], rows[lastAt]) != 0 { break }
+        }
+        append(mut &out, rows[k])
+        lastAt = k
+    }
+    return Ok(out)
 }
 
 // ---- the row engine's joined rows (slice P2c)

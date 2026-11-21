@@ -304,7 +304,17 @@ pub type PSort = record {
     pub desc: []bool
     pub nf: []bool
     pub coll: []int
+    // (Q8 R2) DISTINCT ON: its keys, the first don (0 none); WITH TIES:
+    // TS_TOP (TOP n WITH TIES), TS_FETCH (FETCH ... WITH TIES), 0 none; TOP
+    // n PERCENT (pct) or TOP n WITH TIES: its n (top, -1 none)
+    pub don: int
+    pub ties: int
+    pub pct: bool
+    pub top: int
 }
+
+pub const TS_TOP: int = 1
+pub const TS_FETCH: int = 2
 
 // A range's bound: ">", ">=", "<" or "<=" its value.
 pub type PBound = record { pub op: str; pub val: lexdb_bind.BX }
@@ -7786,7 +7796,9 @@ fn grpSafe(x: &Expr): bool {
 // plan.
 pub fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
-    if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.first >= 0 { return false }
+    // (TOP PERCENT and WITH TIES: the Sort's, Q8 R2)
+    if (sel.topMode != 0 || sel.withTies) && !sel.sort { return false }
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
@@ -7875,11 +7887,12 @@ fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.s
 
 // Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
 // (slice P3): rows of one select list, no grouping, window, set
-// operation, lock, DISTINCT ON, WITH TIES, TOP, SELECT @v, or function
-// returning rows in it.
+// operation, lock, SELECT @v, or function returning rows in it; DISTINCT
+// ON, WITH TIES and TOP's PERCENT and WITH TIES sorted (Q8 R2).
 fn sortShape(sel: &Sel): bool {
     if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 { return false }
-    if !(sel.sort || sel.distinct) || sel.donKey > 0 || sel.withTies || sel.topMode != 0 || hasSrfCall(&sel.exprs) { return false }
+    if !(sel.sort || sel.distinct) || hasSrfCall(&sel.exprs) { return false }
+    if (sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct) { return false }
     if sel.q.corr {
         for x in sel.exprs { if hasCorr(&x) { return false } }
         for x in sel.order { if hasCorr(&x) { return false } }
@@ -8039,7 +8052,7 @@ pub fn shapeWhy(sel: &Sel): str {
     }
     if len(sel.mr) > 0 { return "MATCH_RECOGNIZE" }
     if len(sel.feedback) > 0 { return "SELECT @v = (feedback)" }
-    if sel.topMode != 0 || sel.withTies { return "TOP PERCENT or WITH TIES" }
+    if (sel.topMode != 0 || sel.withTies) && !sel.sort { return "TOP PERCENT or WITH TIES, not sorted" }
     if sel.first >= 0 { return "MIN or MAX by the scan's order (Sel.first)" }
     return queryWhy(sel)
 }
