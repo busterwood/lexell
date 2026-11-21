@@ -48,7 +48,7 @@ CORE = {
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
-    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_stats",
+    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
 }
 
@@ -110,7 +110,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
@@ -173,6 +173,15 @@ SETOP_USERS = {"lexdb_exec"}
 HELD = "lexdb_held"
 HELD_MAY_IMPORT = {"lexdb_sql", "lexdb_rows"}
 HELD_USERS = {"lexdb_pipe"}
+
+# A set-returning function's rows (lexdb_srf, design/lexdb-layers.md 6.3.Q8
+# R3): made from its arguments' values, and a select list's sets expanded.
+# Values only; the caller counts the rows' bytes and steps (a hook) and
+# serves the catalog's relations; exec and the pipeline (its ProjectSet)
+# import it.
+SRF = "lexdb_srf"
+SRF_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_lib", "lexdb_time"}
+SRF_USERS = {"lexdb_exec", "lexdb_pipe"}
 
 # The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item
 # 10): the sort keys and the frame code of the row engine's windows. Values,
@@ -308,6 +317,12 @@ def check():
     for m in sorted(mods):
         if HELD in mods[m] and m not in HELD_USERS:
             bad.append(f"{m} -> {HELD}: only {', '.join(sorted(HELD_USERS))} imports the held rows' batches")
+    for d in mods.get(SRF, []):
+        if d not in SRF_MAY_IMPORT:
+            bad.append(f"{SRF} -> {d}: the set-returning functions' rows import above their layer")
+    for m in sorted(mods):
+        if SRF in mods[m] and m not in SRF_USERS:
+            bad.append(f"{m} -> {SRF}: only {', '.join(sorted(SRF_USERS))} imports the set-returning functions' rows")
     stats = os.path.join(CMD, STATS + ".lxl")
     if os.path.exists(stats):
         with open(stats, encoding="utf-8") as f:

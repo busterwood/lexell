@@ -7087,6 +7087,214 @@ ms, means of 15): 715.1 -> 692.7 (-3.1%), wall 773.5 -> 749.7.
 
 **Merged with R2** (main 3b462107): the Apply is not taken under R2's OFFSET, TOP PERCENT or WITH TIES (`applyR2`), nor under MIN/MAX by the scan's order (`aggShape`): each stops early, and the Apply's first-row asks (`Apply.one`) were built for a plain LIMIT; such queries stay the row engine's, as before both.
 
+### 6.3.Q8 R3 as built (2026-11-21)
+
+R3 of 6.5: a function in FROM as the pipeline's source, a set-returning
+function in the select list, set operations finished by `lexdb_setop`,
+MATCH_RECOGNIZE fed by the pipeline. Branch
+`worktree-agent-a3fe187488aaca949` from main 5f30415d. `SET lexdb_batch =
+off` (the row engine, the tests' reference) is untouched: its paths stay
+(`execSrf`'s arguments by `eval`, `expandSrfs`, `runSet`'s row tail,
+`runLevel`'s LATERAL arm), now the reference only for these shapes.
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 5f30415d | | 20,092 | `lexdb_pipe` 8,049, `lexdb_plan` 8,682, `lexdb_setop` 488 |
+| 00922cf8 | (1) a function in FROM as a source, `lexdb_srf` (new, 248: `execSrf`'s rows moved out of exec, `expandSrfs`' expansion); LATERAL at the first level over outer values; test `exec_r3` (from, lateral) | 20,055 | `lexdb_plan` 8,772 |
+| afd7fc39 | (3) a held set operation's ORDER BY, OFFSET and LIMIT by `lexdb_setop`; `exec_r3` (set operations) | 20,118 | `lexdb_plan` 8,780, `lexdb_setop` 542 |
+| 745d53bd | (2) a set-returning function in the select list with no FROM: `PPlan.ProjectSet` over a Result; `exec_r3` (select list sets) | 20,134 | `lexdb_pipe` 8,088, `lexdb_plan` 8,816 |
+| 613c1e9a | (4) MATCH_RECOGNIZE's input from the pipeline; `exec_r3` (match_recognize) | 20,134 | |
+| d53afcf0 | (3b) the held set tail and its bytes into `lexdb_setop.held` | 20,104 | `lexdb_setop` 571 |
+| ca4200dd | (5) planning's instructions (below) | 20,104 | `lexdb_plan` 8,822 |
+| fa33c527 | (6) tests `tds_r3` (SQL Server 2022's answers), `tns_r3` (Oracle Free's, `gen_oracle.py --check`) | 20,104 | |
+| 0601105c | (7) a held set sorted as a SELECT's held rows are (typed keys), not by the pipeline's chunked sort | 20,104 | `lexdb_setop` 594 |
+
+`lexdb_exec` +12: `execSrf`'s rows (-150) moved to `lexdb_srf`; what
+stays needs a `Run` or the session: `pipeFunc`, `srfRows` (the catalog's
+relations and a sequence's state read the store), `lat0Rows`,
+`lat0Refs`, `lat0Memo` (`runChild`, `eval`, the run's memo), `pipeSub`,
+`srfPipe`, `setHeldRes`; `srfRows` beside `execSrf`, the others at the
+module's end.
+
+**What it does.**
+
+- **A function in FROM** (generate_series of integers, numerics and
+  timestamps, unnest, regexp_matches, regexp_split_to_table,
+  string_to_table, VALUES, pg_partition_ancestors, the catalog's
+  relations, a sequence's state) gets a program of its own
+  (`lexdb_plan.funcProg`: `Project (Func)`, the Project's expressions its
+  arguments bound for the plan, `PR_FUNC`), made in `pipeSelMain`'s
+  declined path when every argument binds (a sequence's or a session's
+  call, a catalog cast such as `::regclass` do not: the row engine's).
+  Its run with batches on (`pipeFunc`) runs its subqueries once,
+  evaluates the arguments by `bxEval` and makes the rows; the row
+  engine's `execSrf` evaluates them by `eval` and makes the same rows.
+  The rows are made by a new module, `lexdb_srf` (imports values only:
+  a series' end by its step's sign and its type's range, a zero step,
+  arrays side by side padded with NULL, VALUES' coercions and T-SQL's ''
+  as 0, the bytes and steps counted through its caller's hook); the
+  catalog's relations and a sequence's state stay exec's (`srfRows`).
+  The rows reach the query that reads them as any subquery's (held,
+  `lexdb_held`), in FROM or as a join's level. A series made as it is
+  read (`lazySeries`) never runs its Sel: it is not planned for the
+  pipeline (`pipeSub`; its arguments' subqueries are).
+- **LATERAL at the first level over outer values** (`lexdb_plan.lat0`: a
+  correlated derived table or function a query reads first, nothing
+  else of the query run per row): with no level before it its outer
+  values are the run's, so the pipeline runs it once a run before the
+  query (`lat0Rows`, as `runLevel`'s LATERAL arm runs it for the first
+  row: its outer values evaluated with no row, its rows' bytes held as
+  the memo holds them) and reads its rows as a FROM subquery's
+  (`lat0Read`; the plan's subquery marked run once, `lat0Once`, in
+  `applyOver`, which only a correlated query reaches). A run that gives
+  way to the row engine (a join over fewer than 64 held rows) leaves
+  the rows in the run's memo (`lat0Memo`), so the subquery is not run
+  twice. 6.4's LATERAL row (after R6) was nearly all this shape:
+  `exec_limits`' `select count(*) from big x where (select count(*) from
+  (select s.id from small s, small t where s.id <> x.id) q) > 0`, 20,000
+  runs of its subquery; `select (select count(*) from big(t.v)) from t`
+  ran 4.
+- **A set-returning function in the select list with no FROM** (unnest,
+  generate_subscripts, regexp_matches, regexp_split_to_table,
+  string_to_table, pg_partition_ancestors, which psql's \d asks in an
+  IN): its Result under a new operator, `PPlan.ProjectSet`
+  (`lexdb_plan.srfShape`, `srfPlan`, offered in `pipeSelMain`'s declined
+  path, so a SELECT with no FROM pays no test; `lexdb_pipe.resultSet`):
+  the one row's sets made rows in lockstep, the shorter padded with
+  NULL, none if every one is empty (`lexdb_srf.expand`, PostgreSQL 10's
+  ProjectSet; the row engine's `expandSrfs` uses it too), at most the
+  run's cap (a scalar subquery's second row: 21000). Not under LIMIT,
+  OFFSET or DISTINCT, which apply to the rows made, nor over a table (a
+  scan's outputs are evaluated in batches, where a set's value is not its
+  column's type): those stay the row engine's.
+- **A held set operation** (a subquery's, a derived table's, a CTE's,
+  INSERT ... SELECT's, a recursive CTE's result, and a statement's where
+  `streamsSet` declines: a part's values coerced, `select 2 union select
+  2.0`): its parts run and combine as before (`runSet`, `combine`: the
+  left part, then the right, so the first error is the same); its ORDER
+  BY, OFFSET and LIMIT are `lexdb_setop.held`'s: the rows' ORDER BY
+  values (by their collations) sorted by `lexdb_sort`'s typed keys, as a
+  SELECT's held rows are (a stable comparison sort when a key's values
+  are of mixed kinds), then `cut`; the bytes held as the row tail holds
+  them (those values), no longer `execSelIn`'s row tail. Not with TOP or
+  WITH TIES (`setHeld`). (R3 (3) fed the pipeline's set sort, `setSort`,
+  row by row and read its chunk back: about 1,300 instructions a row
+  more; (7) replaced it.)
+- **MATCH_RECOGNIZE**: its input Sel is offered to the pipeline as any
+  (`pipeShape` no longer declines `Sel.mr`); `execMatch` with
+  `lexdb_match` stays the row operator over the input's rows.
+
+**Left, and why:**
+
+- A LATERAL level after the first (`from t, lateral f(t.v)`, CROSS
+  APPLY: 180 runs): a dependent join, its subquery run per row of the
+  levels before; with R4's joins (the Apply's ask gives a row's pass or
+  fail, not its rows).
+- A set-returning function over a table, or under LIMIT, OFFSET or
+  DISTINCT (1 run in the suite). The row engine applies DISTINCT before
+  it expands (`select distinct unnest(array[2, 1, 2])` gives 2, 1, 2;
+  PostgreSQL 1, 2), and a set inside an expression is not one
+  (`unnest(array[1, 2]) / 0`: 42883): both engines alike, found here, the
+  reference untouched.
+- `select generate_series(1, 3)`: neither engine has generate_series in
+  the select list (42883, batches on and off); PostgreSQL does. Not
+  added: a function, not an engine's path.
+- A function whose argument does not bind (13 runs, all of psql's \d
+  footer query, `pg_partition_ancestors` of a literal OID: its regclass
+  is a catalog lookup), and outputs that do not bind over a catalog
+  relation (psql's \d column query's `format_type`, `pg_get_expr`): R2's
+  "outputs that do not bind".
+- TOP and WITH TIES over a set operation (2 runs).
+
+**Measured.** The census: 6.4's "After R3". The gates:
+
+In process (`LXL_HASH_SEED=1`, the setup's run subtracted from the
+20,000-statement one, 200 for the catalog's and the set operations';
+INSERT and UPDATE in one transaction on the simulated disk; main 5f30415d
+against the branch alternated, two rounds (alike within a tenth of an
+instruction); the set operations' at 0601105c, one round, the others
+at fa33c527, the same code for them):
+
+| statement | main 5f30415d | R3 | |
+|---|---:|---:|---:|
+| point select | 135,388.7 | 135,371.7 | -17 |
+| INSERT VALUES, one row | 98,994.0 | 98,994.0 | 0 |
+| UPDATE ... WHERE id = k | 135,808.4 | 135,808.4 | 0 |
+| `select 1` | 45,001.0 | 44,983.0 | -18 |
+| `select generate_series(1, 3)` (42883 in both) | 81,808.5 | 81,790.5 | -18 |
+| `select * from generate_series(1, 3)` | 111,733.0 | 110,952.0 | -781 |
+| its EXPLAIN (planning) | 99,105.0 | 98,715.0 | -390 |
+| `select unnest(array[1, 2, 3])` | 120,676.0 | 118,192.0 | -2,484 |
+| `select count(*) from pg_class where relkind = 'r'` | 2,020,575.9 | 2,020,168.0 | -408 |
+| `select attname, atttypid from pg_attribute where attrelid = 'p'::regclass and attnum > 0 order by attnum` | 588,109,358.7 | 588,106,292.0 | -3,067 |
+| psql's \d column query (pg_attribute, two subqueries per row) | 595,463,811.6 | 595,449,985.8 | -13,826 |
+| a derived table's UNION, ORDER BY, LIMIT 40 (100 rows) | 836,045 | 789,659 | -5.5% |
+| an IN over a UNION ALL | 1,820,258 | 1,796,068 | -1.3% |
+
+On the way, each found by these counts and fixed before hand-back: a
+fourth field in `PPlan.Func` (the bound arguments) cost every SELECT
+from a function +84 (an empty array made and dropped by every view's
+Func: now a Project over the Func in the program only); planning a lazy
+series' Sel for the pipeline +588 (`pipeSub`: not planned); the lazy
+test itself about +300 a call (`lazySeries` read the type through
+`oidType`, whose search of the array types was the cost: now the OID;
+`heldRead` gains it too, hence the -781); the lateral test in
+`scanRuns` +4 a point select's compile (two callee-saved registers: the
+subquery is marked run once in the plan instead, `lat0Once`); a match
+arm added before an `else` +1 to +2 on `select 1` and the point select
+(`pLeaf`'s fall-through: a Scan and a Result now compared first); the
+pipeline's chunked set sort +127k a 100-row held UNION (the typed keys
+instead). The catalog relations are made whole per statement
+(`catRows`: pg_attribute's every column of every relation, 588M
+instructions a lookup by `attrelid`); R3 does not change that.
+
+TPC-H (SF1, base 5f30415d and the branch, `-O`, alternated twice, one run
+each, `TPCH_REF` 1744ef99, `~/tpch-w/r3`; best of the two, ms): with
+fa33c527, checksums equal on all 22 in all four runs, 11,461 against
+11,465 ms (1.000); over 1.5%: q3 +1.9%, q15 +6.5% (main's own runs 529
+and 568), their server instructions equal (`iq.sh`: q3 4,384.02M ->
+4,384.08M, q15 4,022.84M -> 4,022.98M). With the final binary
+(0601105c, which changes only a held set operation's sort, in none of
+the 22) alternated twice again: checksums equal on all 22 in all four
+runs, 11,808 against 11,606 ms (0.983; the branch's first run slow
+throughout, q1 1,910 ms, a disturbance of the machine: best of two);
+over 1.5%: q1 +1.9%, q12 +2.8%, q22 +2.8%, their server instructions
+equal (q1 25,992.4M -> 25,993.9M, q12 14,280.4M -> 14,284.1M, q22
+1,771.9M -> 1,771.9M): placement. R3's shapes are not in TPC-H's 22.
+
+Over the wire (base 5f30415d against the final binary, fresh copies of
+both, `-O`; `~/tpch-w/r3/logs`): `pts.sh` (20,000 point selects by the
+simple protocol, wall / server CPU ms, means of 5, three rounds
+alternated): main 685.6 / 639.0, 688.2 / 642.4, 683.0 / 635.6; R3 683.0 /
+635.4, 683.4 / 634.6, 679.0 / 631.4 (server CPU -0.6%, -1.2%, -0.7%).
+`icount6.sh` (points.sql three times, the server's counts a statement,
+alternated twice): instructions 186,861 / 186,867 against 186,908 /
+186,902 (+40, within its ~100), cycles 102,720 / 102,933 against 101,655
+/ 102,002 (-1.0%), L1 i-cache misses 429 / 432 against 376 / 377, iTLB
+misses 35 / 35 against 31 / 33, branch misses 418 / 418 against 384 /
+382.
+
+**Tests.** Suite: 268 of 268 at main; the full suite at every commit: 269
+of 269 from 00922cf8 to ca4200dd, 271 of 271 from fa33c527 (new:
+`exec_r3`, `tds_r3`, `tns_r3`). `exec_r3` runs every statement with
+batches on and off (the same rows or error): from 30 (all piped but a
+zero step's error), lateral 16, set operations 28, select list sets 18
+(16 piped: LIMIT and DISTINCT not; over VALUES the VALUES' run piped, its
+expansion the row engine's), match_recognize 8. `tds_r3`: 21 T-SQL
+batches, SQL Server 2022's answers (the `lxl-mssql` container, a database
+of its own, dropped after). `tns_r3`: 22 statements, Oracle Database
+Free's answers (`gen_oracle.py --check tns_r3`: 22 checked, no
+difference). Expectations changed: `exec_subrows` (its per-row ALL
+subqueries over a derived table the pipeline's: 7 more runs). Found on
+the way (both engines alike, dialect gaps): a VALUES text column against
+a table's collated one gives 468 (T-SQL); SQL Server and Oracle do not
+evaluate a derived table's output nothing reads (lexdb raises its
+division by zero); `2 union 2.0` shows 2 where SQL Server shows 2.0; a
+parenthesized set operation in FROM gives 50000 (T-SQL), ORA-03001
+(Oracle), 0A000 (PostgreSQL's door).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -7177,11 +7385,11 @@ times out under the census's writes, a line a run):
 | a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
 | no FROM (`runQuery` with no level) | 814 | 116 | 42,808 | `select nextval('s')`, `select 1` | a Result arm: one row, its outputs by `bxEval` | small; a driver's `select 1` is point-select-like: OLTP gate |
 | a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59; offered by R1, gone) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo. **R6 (6.3.Q8 R6): those in one level's WHERE conjuncts are the pipeline's (the Apply; q2, q17, q20's partsupp query); left: LATERAL (R3), a 9.9 hashed probe, a path's key, two levels** | large |
-| a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) | medium (`execSrf` 172 lines) |
+| a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) **Done, R3 (6.3.Q8 R3): a program of its own, its arguments bound, its rows by `lexdb_srf`; left: 13 runs whose argument does not bind (psql's `::regclass`)** | medium (`execSrf` 172 lines) |
 | not offered to the pipeline (a write's subqueries: RETURNING, SET, WHERE) | 274 | 21 | 800 | `delete from fp returning id, (select count(*) from fc)` | `pipeSel` for a write's subqueries. **Done, R1: 6 runs left (six `exec_unnest` IN subqueries, not traced)** | small |
 | MIN or MAX by the scan's order (`Sel.first`) | 245 | 17 | 10,661 | `select max(c) from f` (an index on c) | a first-row aggregate over an ordered scan that stops | small |
 | joins the pipeline does not join: per row under a first table that stops early (161), a point first table (44), RIGHT/FULL with no key (14), a collation's key (5), an `= any(array)` lookup (4), an expression (2) | 230 | 28 | 374 | OLTP's 3-table join; `select * from v11 where id = 3` (a view of a join) | lookups under a stopping first table, a chunk of one as a join's input, collated keys | medium |
-| MATCH_RECOGNIZE (`execMatch` over its input's rows) | 196 | 6 | 473 | `select * from mv order by g` | stays a row operator over the input (`lexdb_match`), fed by the pipeline; out of exec | medium |
+| MATCH_RECOGNIZE (`execMatch` over its input's rows) | 196 | 6 | 473 | `select * from mv order by g` | stays a row operator over the input (`lexdb_match`), fed by the pipeline; out of exec. **Done, R3: its input the pipeline's; `execMatch` stays in exec** | medium |
 | OFFSET (not a stopping LIMIT) | 131 | 11 | 135 | `order by id desc limit 2 offset 1` | Limit with an offset | small |
 | FOR UPDATE (`runLocking`) | 98 | 7 | 199 | `select id from acct where id = 2 for update` | a lock operator (runs again after a wait) | medium |
 | an expression that does not bind for the plan: an output (81), a condition (47), ORDER BY (2) | 130 | 44 | 694 | `select row_number() from emp`, `where count(*) > 1` (errors the row path raises), a session function | the binder raises the errors; the rest case by case | small each |
@@ -7228,6 +7436,26 @@ function in FROM over outer values: R3), a 9.9 hashed probe 6,157, a
 path's key 157, others 79. "One in the outputs or ORDER BY" (6,331) is
 unchanged. TPC-H's row-engine runs 4 -> 1 (a `select 1`).
 
+**After R3** (6.3.Q8 R3; main 5f30415d's run, 268 tests, against the
+branch's 271, its three new tests' lines left out): the row engine's runs
+with batches on 50,926 -> 27,461, the set operations' (`runSet`'s tail)
+581 -> 2, the pipeline's rows 326,244 -> 326,531, its groups 803,885 ->
+824,090. Gone: a function in FROM (2,283; 13 left whose argument does not
+bind), MATCH_RECOGNIZE (473, and its second note, the match's own, 473),
+a set operation held (579; TOP or WITH TIES 2 left), a set-returning
+function in the select list (21; 1 over a table left), LATERAL (20,422
+with its "agg:" variant: 20,230 at the first level over outer values,
+20,000 of them `exec_limits`' one statement, now the pipeline's groups;
+left, named: a LATERAL level after the first 180, one at the first level
+beside another subquery run per row 12). Nothing else moved but the runs
+of statements bounded by a limit or a clock (`exec_limits`' recursive CTE
+without an end, 34,816 -> 33,152 runs; `exec_autostats`' point selects
+while its analysis runs; `exec_turns`' UPDATEs, by the clock), which is
+why the pipeline's rows grew by less than R3's runs. The rest is R4-R9's:
+windows 6,597, a correlated subquery in the outputs 6,382, a join's first
+table not read in batches 6,085, a 9.9 hashed probe 6,158, outputs and
+conditions that do not bind 721, joins under a stopping first table 329.
+
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
 joins by the levels program `Query.jp`): UPDATE 1,391 statements, DELETE
@@ -7238,6 +7466,9 @@ and instructions.
 
 **Set operations:** 349 statements in 33 tests combine their parts in
 exec (`runSet`); `lexdb_setop` streams the others already. Medium.
+**R3 (6.3.Q8 R3): a held one's ORDER BY, OFFSET and LIMIT are
+`lexdb_setop`'s (`held`); `runSet` still runs its parts and combines
+them; left: TOP and WITH TIES (2 runs).**
 
 **Over the pipeline's groups:** HAVING, the select list, DISTINCT, ORDER
 BY and LIMIT of every aggregate the pipeline runs (9,000 statements, 188
@@ -7274,7 +7505,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 |---|---|---|---|---|
 | R1 (built: 6.3.Q8 R1) | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
 | R2 (built: 6.3.Q8 R2; left: a set-returning function in the select list, a collation's hash join key, the binder's errors and the outputs that do not bind) | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
-| R3 | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop` | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
+| R3 (built: 6.3.Q8 R3) | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop`. **Built: a function's program (`lexdb_srf` makes its rows), LATERAL at the first level over outer values run once a run, a set-returning function in a select list with no FROM (ProjectSet), a held set operation's ORDER BY, OFFSET and LIMIT, MATCH_RECOGNIZE's input; left: LATERAL after the first level (a dependent join: R4), a set-returning function over a table or under LIMIT/DISTINCT, TOP and WITH TIES over a set** | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
 | R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |

@@ -157,6 +157,7 @@ CHECKED = {
     'tns_merge': ('helper',), 'tns_oracle': ('helper',), 'tns_percentile': ('helper',),
     'tns_privs': ('scenario',), 'tns_routinepriv': ('scenario',), 'tns_routine': ('routine',),
     'tns_unnest': ('consts', 'QUERIES'), 'tns_unnest_agg': ('consts', 'QUERIES'), 'tns_subrows': ('consts', 'QS'),
+    'tns_r3': ('consts', 'QS'),
 }
 
 

@@ -1,0 +1,242 @@
+// lexdb_exec, lexdb_srf, lexdb_setop: what the pipeline took from the row engine in Q8's R3
+// (design/lexdb-layers.md 6.3.Q8 R3). Each statement runs with batches on and off (the row engine, the
+// reference): the same rows or the same error. "piped": y when a run with batches on went through the
+// pipeline (lexdb_pipe.runCounts()[0], joinCounts()[0], lexdb_srf.pipedCount()); "pipeline runs": how
+// many such runs the group's statements made with batches on.
+// - from: a function in FROM as the pipeline's source, its arguments bound (generate_series of
+//   integers, numerics and timestamps, unnest of one and two arrays, WITH ORDINALITY, regexp and string
+//   splits, VALUES, pg_partition_ancestors, the catalog's relations: pg_class, pg_attribute,
+//   pg_namespace), a function as a join level, an argument from a subquery, NULL and empty arguments, a
+//   zero step (22023), an error in a later row (22012), LIMIT that stops early, text keys, duplicates;
+//   one whose argument does not bind (current_setting) stays the row engine's (its outer query piped).
+// - lateral: a LATERAL subquery or function at the first level over outer values only (run once a
+//   run, its rows held): a correlated scalar, EXISTS and IN over a derived table or a function of the
+//   outer row, a join after it, an aggregate over it, an error in it (22012), no rows, NULLs.
+// - set operations: held (a subquery's, a derived table's, a CTE's, INSERT ... SELECT's, a recursive CTE's, and at the
+//   top where a part's values are coerced: 2 UNION 2.0), their ORDER BY, OFFSET and LIMIT lexdb_setop's: UNION [ALL],
+//   INTERSECT [ALL], EXCEPT [ALL], nested, NULLs, text keys, duplicates, LIMIT 0, a cap (EXISTS, a scalar), an error in a
+//   part (22012).
+// - select list sets: a set-returning function in the select list with no FROM (lockstep, padded with NULL, an empty
+//   set, NULLs, in IN, EXISTS, ALL/ANY and a scalar subquery (21000), an error in an output); under LIMIT or DISTINCT,
+//   or over a table, the row engine's.
+// - match_recognize: its input's rows from the pipeline (a table's, a filtered derived table's, none), the row operator
+//   over them: ONE ROW and ALL ROWS PER MATCH, PARTITION BY a key with NULLs (a text's), NULLs in DEFINE, no match, an
+//   error in the input (22012).
+// timeout: 120
+// expect: from: 30 queries, 30 the same, piped yynyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 52
+// expect: lateral: 16 queries, 16 the same, piped yyyyyyyyyyyyyyyy, pipeline runs 538
+// expect: set operations: 28 queries, 28 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 147
+// expect: select list sets: 18 queries, 18 the same, piped yyyyyyyyyyyyyyynny, pipeline runs 26
+// expect: match_recognize: 8 queries, 8 the same, piped yyyyyyyy, pipeline runs 17
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_srf"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] + lexdb_srf.pipedCount() }
+
+type Group = record { name: str; word: str; n: int; same: int; piped: str; runs: int }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, piped: "", runs: 0} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " " + g.word + ", " + g.same.toStr() + " the same, piped " + g.piped + ", pipeline runs " + g.runs.toStr()) }
+
+// Statements (separated by ";;") with batches on and off.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let p0 = piped()
+    let on = stmts(s, sql)
+    let p1 = piped()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = stmts(s, sql)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str): str {
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(87), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text, a int[])",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end, case when i % 17 = 0 then null when i % 5 = 0 then '{}'::int[] else array[i, i % 3, null] end from generate_series(1, 3000) i",
+            "create table u (id int primary key, k int, w int, c text)",
+            "insert into u select i, i % 9, (i * 37) % 1000, 'c' || (i % 4) from generate_series(1, 400) i",
+            "create sequence sq",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var gf = newGroup(&"from", &"queries")
+        let fs = [
+            "select * from generate_series(1, 5) g where g > 2",
+            "select * from generate_series(5, 1, -2) g",
+            "select * from generate_series(1, 10, 0) g",
+            "select * from generate_series(1, null) g",
+            "select * from generate_series(1.5, 4.0, 0.5) g",
+            "select * from generate_series('2024-01-01'::timestamp, '2024-01-03 12:00'::timestamp, '12 hours') g",
+            "select * from generate_series(2147483640, 2147483647, 3) g",
+            "select * from unnest(array[1, 2, null, 3], array['a', 'b']) with ordinality as u(x, y, o)",
+            "select * from unnest('{}'::int[]) x",
+            "select * from unnest(null::text[]) x",
+            "select * from unnest(array['b', 'a', 'b', null]) x order by x",
+            "select * from regexp_split_to_table('a,b,,c', ',') with ordinality",
+            "select * from string_to_table('x y z y', ' ') limit 2",
+            "select * from regexp_matches('foobarbequebaz', 'ba.', 'g') m",
+            "select * from (values (1, 'a'), (2, null), (null, 'c'), (2, null)) v(n, c) order by 1, 2",
+            "select n, count(*) from (values (1), (2), (1), (null)) v(n) group by n order by n",
+            "select 100 / (g - 1500) from generate_series(1, 3000) g",
+            "select 100 / (g - 5) from generate_series(1, 10) g limit 3",
+            "select t.id, n from t join generate_series(1, 3) gs(n) on gs.n = t.g where t.id < 30 order by 1, 2",
+            "select t.id, e from t, unnest(array[1, 2]) e where t.id < 4 order by 1, 2",
+            "select count(*), sum(n) from generate_series(1, 5000) gs(n) join t on t.id = gs.n",
+            "select * from generate_series(1, (select max(g) from t)) g",
+            "select * from unnest((select array_agg(id order by id) from t where id < 4)) x",
+            "select count(*) from pg_class where relkind = 'r'",
+            "select attname, atttypid from pg_attribute where attrelid = 't'::regclass and attnum > 0 order by attnum",
+            "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'pg_catalog'",
+            "select c.relname from pg_class c where c.relname in ('t', 'u') order by 1",
+            "select * from pg_partition_ancestors('t'::regclass)",
+            "select c, count(*) from (values ('b'), ('a'), ('b')) v(c) group by c order by c",
+            "select * from generate_series(1, length(current_setting('TimeZone'))) g",
+        ]
+        for x in fs { check(mut &s, mut &gf, &x) }
+        report(&gf)
+
+        var gl = newGroup(&"lateral", &"queries")
+        let ls = [
+            "select id, (select count(*) from generate_series(1, t.g)) from t where id < 40 order by id",
+            "select id, (select sum(v) from unnest(t.a) v) from t where id < 60 order by id",
+            "select id, (select count(*) from (select u.id from u where u.k <> t.g) q) from t where id < 50 order by id",
+            "select id, (select max(w) from (select w from u where u.k = t.g) z) from t where id < 50 order by id",
+            "select id from t where id < 80 and exists (select 1 from (select k from u where u.k = t.g + 3) s) order by 1",
+            "select id from t where id < 80 and t.x in (select w % 50 from (select w from u where u.k = t.g) z) order by 1",
+            "select id, (select string_agg(g::text, ',' order by g) from generate_series(t.g, 3) g) from t where id < 30 order by 1",
+            "select id, (select count(*) from (select u.id from u where u.k = t.g) q join u u2 on u2.id = q.id + 1) from t where id < 40 order by 1",
+            "select id, (select 10 / g from generate_series(t.g - 2, t.g) g limit 1) from t where id < 40 order by 1",
+            "select id, (select count(*) from (select 10 / (u.k - t.g) d from u) q) from t where id < 40 order by 1",
+            "select id, (select count(*) from (select u.id from u where u.k = t.g and t.x is null) q) from t where id < 60 order by 1",
+            "select id, (select min(c) from (select c from u where u.w > t.id * 10) q) from t where id < 60 order by 1",
+            "select id, (select count(distinct c) from (select c from u where u.k = t.g) q) from t where id < 30 order by 1",
+            "select count(*) from t where (select count(*) from (select u.id from u where u.k <> t.g) q) > 300",
+            "select id, (select x from (select u.w as x from u where u.k = t.g) q order by x desc limit 1) from t where id < 30 order by 1",
+            "select id, (select count(*) from unnest(t.a) v where v is null) from t where id < 40 order by 1",
+        ]
+        for x in ls { check(mut &s, mut &gl, &x) }
+        report(&gl)
+
+        var gs = newGroup(&"set operations", &"queries")
+        let ss = [
+            "select count(*) from (select g from t union select k from u) q",
+            "select * from (select g from t union select k from u order by 1 desc limit 3) q",
+            "select * from (select g from t union all select k from u order by 1 limit 4 offset 2) q",
+            "select * from (select x from t where id < 40 intersect select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 40 intersect all select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 100 except select w % 50 from u) q order by 1",
+            "select * from (select x from t where id < 100 except all select w % 50 from u order by 1 nulls first limit 5) q",
+            "select count(*) from t where x in (select k from u union select 40)",
+            "select count(*) from t where exists (select 1 from u where u.k = t.g union select 2 where t.g = 3)",
+            "select id, (select max(k) from (select k from u where u.k < t.g union select 1) z) from t where id < 10 order by 1",
+            "with c as (select s from t where id < 30 union select c from u order by 1) select * from c",
+            "select 2 union select 2.0",
+            "select 1 union select 2.5 order by 1 desc",
+            "select * from (select 1 union select 2.5 order by 1 desc) q",
+            "select * from (select s from t where id < 40 union select c from u) q order by 1 nulls first",
+            "select * from (select 10 / (x - 7) from t where id < 40 union select 1) q",
+            "select * from (select x from t union select null order by 1 nulls first limit 2) q",
+            "select * from (select x from t where id < 30 union all select x from t where id < 30 order by x desc nulls last limit 3 offset 1) q",
+            "select count(*) from (select g, s from t union select k, c from u) q",
+            "select * from (select * from (select g from t union select k from u) a except select * from (select 1 union select 2) b) q order by 1",
+            "with recursive r(n) as (select 1 union select n + 1 from r where n < 20) select * from r order by n desc limit 3",
+            "select * from (with recursive r(n) as (select 1 union all select n * 2 from r where n < 1000) select n from r order by 1 desc) q limit 4",
+            "select exists (select g from t union select 99 order by 1 limit 1)",
+            "select (select g from t where id < 3 union select 9 order by 1 desc limit 1)",
+            "select (select g from t union select 9 order by 1 limit 1 offset 5)",
+            "select * from (select s from t union select c from u order by 1 limit 0) q",
+            "select (select g from t where id < 3 union select 9)",
+            "insert into u select 1000 + g, g, g, 'n' from (select g from t union select 50) q;; select count(*), sum(k) from u where id >= 1000;; delete from u where id >= 1000",
+        ]
+        for x in ss { check(mut &s, mut &gs, &x) }
+        report(&gs)
+
+        var gp = newGroup(&"select list sets", &"queries")
+        let ps = [
+            "select unnest(array[1, 2, 3])",
+            "select unnest(array[1, 2, 3]), generate_subscripts(array['a', 'b'], 1)",
+            "select unnest('{}'::int[])",
+            "select unnest(array[null, 'b']), 'k'",
+            "select regexp_matches('abc', '(a)(b)?'), regexp_matches('x', 'y')",
+            "select regexp_matches('foobarbequebaz', 'ba.', 'g')",
+            "select regexp_split_to_table('the quick brown fox', '\\s+')",
+            "select string_to_table('a,b,,c', ',')",
+            "select count(*) from (select unnest(array[1, 2, 3, 4])) s",
+            "select 'abc' like all (select unnest(array['a%', '%c'])), 'abc' like any (select unnest(array['x%', 'b%']))",
+            "select (select unnest(array[7]))",
+            "select (select unnest(array[7, 8]))",
+            "select exists (select unnest('{}'::int[]))",
+            "select id from t where id in (select unnest(array[3, 5, 3])) order by 1",
+            "select unnest(array[1, 2]), 10 / (select count(*) - 3 from t where id < 4)",
+            "select unnest(array[1, 2]) limit 1",
+            "select distinct unnest(array[2, 1, 2])",
+            "select n, unnest(array['p', 'q']) from (values (1), (2)) v(n) order by 1, 2",
+        ]
+        for x in ps { check(mut &s, mut &gp, &x) }
+        report(&gp)
+
+        var gm = newGroup(&"match_recognize", &"queries")
+        let ms = [
+            "select * from t match_recognize (order by id measures first(id) as f, last(id) as l, count(*) as c one row per match pattern (u+ d) define u as x > prev(x), d as x < prev(x)) where f < 200 order by f",
+            "select g, f, c from t match_recognize (partition by g order by id measures first(id) as f, count(*) as c one row per match pattern (n+) define n as x is null) order by g, f limit 8",
+            "select id, x, cl from (select * from t where id < 40) w match_recognize (order by id measures classifier() as cl all rows per match pattern (lo hi+) define lo as x < 10, hi as x >= 10) order by id",
+            "select count(*) from t match_recognize (order by id measures count(*) as c one row per match pattern (z) define z as x > 1000)",
+            "select s, f, c from t match_recognize (partition by s order by id measures first(id) as f, count(*) as c one row per match pattern (a b) define a as x % 2 = 0, b as x % 2 = 1) order by s nulls first, f limit 6",
+            "select f, l from (select id, 100 / (x - 7) as y from t where id < 600) w match_recognize (order by id measures first(id) as f, last(id) as l pattern (p+) define p as y > 0) order by f",
+            "select f, l from (select id, x from t where id < 0) w match_recognize (order by id measures first(id) as f, last(id) as l pattern (p+) define p as x > 0)",
+            "select count(*), sum(c) from t match_recognize (partition by g order by x nulls first, id measures count(*) as c one row per match pattern (a+) define a as x is not distinct from prev(x) or prev(x) is null)",
+        ]
+        for x in ms { check(mut &s, mut &gm, &x) }
+        report(&gm)
+        return 0
+    }).unwrap()
+}
