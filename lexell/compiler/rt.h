@@ -47,7 +47,7 @@
 #include <sanitizer/lsan_interface.h>
 #endif
 
-typedef struct { char* p; uint32_t cap, len; } lxl_str;
+typedef struct { char* p; uint32_t len, cap; } lxl_str;
 #define RT_SP(s) ((const char*)(s).p)
 typedef struct { void* data; int64_t len, cap; } lxl_arr;
 typedef struct { void* data; int64_t len; } lxl_slice;
@@ -277,13 +277,13 @@ static void rt_finish(void) {
 __attribute__((noreturn)) static void rt_exit(int64_t code) { rt_flush(); rt_ended = true; exit((int)code); }
 
 /* ---- strings
-   A str is {p, cap, len} (16 bytes, so it is passed in registers; design/owned-str.md). It is
+   A str is {p, len, cap} (16 bytes, so it is passed in registers; design/owned-str.md). It is
    owned: one owner, no count.
    - cap == 0: p is static bytes (a literal or constant, or the empty string). They are never
      freed, so a copy of the str can share them.
    - cap > 0: p is a buffer of the heap. The owner frees it when the str is dropped, and a
      copy (rt_str_dup, which clone() is) copies the bytes.
-   A &str view is the header by value ({p + a, cap, len}): it is never dropped. A view of a
+   A &str view is the header by value ({p + a, len, cap}): it is never dropped. A view of a
    static str keeps cap 0, so copying it shares; a view of a heap str keeps a nonzero cap, so
    copying it copies. Every buffer and every static string ends with a NUL, and a view lies
    inside one, so RT_SP(s)[s.len] can always be read. Lengths are 32 bits: a str holds < 4 GiB. */
@@ -295,11 +295,11 @@ static char rt_empty[1] = "";
 /* Every str with new bytes is made here; lengths are computed in 64 bits by the callers. The
    empty string needs no buffer. */
 static lxl_str rt_str_new(int64_t len) {
-    if (len == 0) return (lxl_str){rt_empty, 0, 0};
+    if (len == 0) return (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
     if (len < 0 || len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
     char* p = rt_alloc((size_t)len + 1);
     p[len] = 0;
-    return (lxl_str){p, (uint32_t)len, (uint32_t)len};
+    return (lxl_str){.p = p, .cap = (uint32_t)len, .len = (uint32_t)len};
 }
 static lxl_str rt_str_of(const char* p, int64_t len) {
     lxl_str s = rt_str_new(len);
@@ -313,7 +313,7 @@ static lxl_str rt_str_dup(lxl_str s) { return s.cap == 0 ? s : rt_str_of(RT_SP(s
 static void* volatile rt_statics;
 static lxl_str rt_str_static(lxl_str s) {
     if (s.cap == 0) return s;
-    if (s.len == 0) return (lxl_str){rt_empty, 0, 0};
+    if (s.len == 0) return (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
     void** b = (void**)malloc(sizeof(void*) + (size_t)s.len + 1);
     if (!b) rt_trap(2, "out of memory", "runtime");
     char* p = (char*)(b + 1);
@@ -321,7 +321,7 @@ static lxl_str rt_str_static(lxl_str s) {
     p[s.len] = 0;
     void* h = __atomic_load_n(&rt_statics, __ATOMIC_RELAXED);
     do { *b = h; } while (!__atomic_compare_exchange_n(&rt_statics, &h, (void*)b, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
-    return (lxl_str){p, 0, s.len};
+    return (lxl_str){.p = p, .cap = 0, .len = s.len};
 }
 static void rt_str_drop(lxl_str s) { if (s.cap) rt_free(s.p); }
 static bool rt_str_eq(lxl_str a, lxl_str b) {
@@ -397,11 +397,11 @@ static void rt_str_append_byte(lxl_str* s, uint8_t c) {
         return;
     }
     char b[2] = {(char)c, 0};
-    rt_str_append_to(s, (lxl_str){b, 0, 1});
+    rt_str_append_to(s, (lxl_str){.p = b, .cap = 0, .len = 1});
 }
 static void rt_str_clear(lxl_str* s) {
     if (s->cap) { s->len = 0; s->p[0] = 0; return; }
-    *s = (lxl_str){rt_empty, 0, 0};
+    *s = (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
 }
 /* s.bytes() (design/consistency.md): the string's bytes as a borrowed slice, no copy. */
 static lxl_slice rt_str_bytes(lxl_str s) { return (lxl_slice){s.p, (int64_t)s.len}; }
@@ -412,13 +412,13 @@ static uint8_t rt_str_byte(lxl_str s, int64_t i, const char* w) {
 /* s[a..b] as an owned str: a copy of the bytes (static bytes are shared) */
 static lxl_str rt_str_sub(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    if (s.cap == 0) return (lxl_str){s.p + a, 0, (uint32_t)(b - a)};
+    if (s.cap == 0) return (lxl_str){.p = s.p + a, .cap = 0, .len = (uint32_t)(b - a)};
     return rt_str_of(RT_SP(s) + a, b - a);
 }
 /* &s[a..b]: a view of the bytes of s (a shared &str; design/borrow-types.md), never dropped */
 static lxl_str rt_str_view(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){s.p + a, s.cap, (uint32_t)(b - a)};
+    return (lxl_str){.p = s.p + a, .cap = s.cap, .len = (uint32_t)(b - a)};
 }
 /* Searching (the regex prefilters): the first index >= from in s of the byte c, of any byte of
    set, or of the string n; -1 when there is none (from < 0 counts as 0). With SSE2 the loops
@@ -850,7 +850,7 @@ static lxl_str rt_str_view_bytes(lxl_arr* a) {
         a->data = d; a->cap = nc;
     }
     ((char*)a->data)[a->len] = 0;
-    return (lxl_str){(char*)a->data, 1, (uint32_t)a->len};
+    return (lxl_str){.p = (char*)a->data, .cap = 1, .len = (uint32_t)a->len};
 }
 static lxl_arr rt_str_to_bytes(lxl_str s) {
     lxl_arr a = rt_arr_new(s.len, 1);

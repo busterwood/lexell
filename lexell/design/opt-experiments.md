@@ -253,7 +253,53 @@ call. In leaf functions the levers are caller-saved registers and fewer frame sl
 second is item 3's scalar replacement. The gain is at most 1-2% of instructions for
 cmark, jq and the compiler, and almost nothing for lexdb.
 
-## 7. Next, in order
+## 7. `str` as `{p, len, cap}`: a stall on store-to-load forwarding
+
+**Found in** jq's `json.canonicalLiteral`, at 5.7% of samples. The hot instructions were
+an 8-byte store into a string's slot, then a 4-byte load of `len` from the upper half of
+that same word (`mov %r10,-0x58(%rbp)`; `mov -0x54(%rbp),%eax`).
+
+**Measured on this CPU (Zen 4):** that load cannot take its value from the store. A
+store-then-load chain runs 8 cycles at offset 4 and 1 cycle at offset 0
+(`scratchpad/stlf.c`). Strings are copied 8 bytes at a time, so every read of `len`
+soon after a copy paid the stall: `len` was at offset 12 in `{p, cap, len}`.
+
+**The change.** The layout is now `{p, len, cap}`, putting `len` at offset 8, the start
+of a word. `cap` is read where `len` is too (appends), so those paths stall once, as before.
+What changed:
+
+- `rt.h` and `native/lxlrt.h`;
+- the 16 positional initializers in `rt.c` and `rt.h`, made designated;
+- `emit.lxl`'s two literal initializers;
+- x64gen's view builder, index checks and inline `rt_str_eq`;
+- `loops.lxl`'s three matches of `len` as "member 12, u32" (two of them made the first
+  build lose the string-header hoisting, so tokens ran +7% instructions until they were
+  fixed).
+
+Results against main (`a3`); every timed step ran under the exclusive bench lock:
+
+| measure | instructions | cycles |
+|---|---:|---:|
+| interleaved, 5 rounds: jq / json / maps / the compiler / cmark | -0.23 / -0.19 / -0.34 / -0.14 / -0.20% | -4.8 / -3.6 / -2.4 / -1.1 / -0.7% (medians) |
+| regex / json / jq / cmark / decimal (apps.py) | -0.04 / -0.19 / -0.23 / -0.21 / -0.12% | -6.4 / -3.3 / -4.1 / -1.4 / -1.0% |
+| grep `-o -w`, eza `-T`, eza `-l` | -0.28 / -0.35 / -0.85% | -3.4 / -2.6 / -2.6% |
+| TPC-H, server instructions per query | -0.49% geomean (q8 -1.36, q15 -1.10; worst q1 +0.03%) | results identical, all `ok` |
+| perfsuite compile suite / run suite | -0.21 / -0.19% | -0.66 / -0.82% |
+| lexdb point selects (5 modes) | -0.09% to -0.42% | within noise |
+| compile.py self-build | | 468 to 464 ms |
+| HTTP server, 2 alternated rounds | | level |
+| bench lists | identical | +2-2.7% |
+
+The lists rise is placement: the same instructions and data-cache misses, branch misses
+175K to 348K over 3G instructions. No string is involved; the runtime's string functions
+changed size and everything after them moved.
+
+**Follow-up:** the same stall hits any value record whose 4-byte (or smaller) field sits at
+a non-zero offset within an 8-byte word, read soon after an 8-byte copy. `str` was the
+frequent case. A census of narrow reads at offset 4 within a word of frame slots right
+after copies would size the rest.
+
+## 8. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against

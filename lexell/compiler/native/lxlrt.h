@@ -5,7 +5,7 @@
    is written in the C subset the backend reads: no macros, one declaration per line. The
    integer typedefs (int8_t ... uint64_t, size_t, bool) are built into the backend. */
 
-typedef struct { char* p; uint32_t cap, len; } lxl_str;
+typedef struct { char* p; uint32_t len, cap; } lxl_str;
 typedef struct { void* data; int64_t len, cap; } lxl_arr;
 typedef struct { void* data; int64_t len; } lxl_slice;
 typedef struct { void* fn; void* env; } lxl_clo;

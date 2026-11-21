@@ -1105,11 +1105,11 @@ __attribute__((noreturn)) void exit(int code) { sys_exit(code); }
 #define RT_STR_MAX UINT32_MAX
 static char rt_empty[1] = "";
 lxl_str rt_str_new(int64_t len) {
-    if (len == 0) return (lxl_str){rt_empty, 0, 0};
+    if (len == 0) return (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
     if (len < 0 || len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
     char* p = rt_alloc((size_t)len + 1);
     p[len] = 0;
-    return (lxl_str){p, (uint32_t)len, (uint32_t)len};
+    return (lxl_str){.p = p, .cap = (uint32_t)len, .len = (uint32_t)len};
 }
 lxl_str rt_str_of(const char* p, int64_t len) {
     lxl_str s = rt_str_new(len);
@@ -1202,11 +1202,11 @@ void rt_str_append_byte(lxl_str* s, uint8_t c) {
         return;
     }
     char b[2] = {(char)c, 0};
-    rt_str_append_to(s, (lxl_str){b, 0, 1});
+    rt_str_append_to(s, (lxl_str){.p = b, .cap = 0, .len = 1});
 }
 void rt_str_clear(lxl_str* s) {
     if (s->cap) { s->len = 0; s->p[0] = 0; return; }
-    *s = (lxl_str){rt_empty, 0, 0};
+    *s = (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
 }
 /* s.bytes() (design/consistency.md): the string's bytes as a borrowed slice, no copy. */
 lxl_slice rt_str_bytes(lxl_str s) { return (lxl_slice){s.p, (int64_t)s.len}; }
@@ -1220,12 +1220,12 @@ uint64_t rt_str_word(lxl_str s, int64_t i, const char* w) {
 }
 lxl_str rt_str_sub(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    if (s.cap == 0) return (lxl_str){s.p + a, 0, (uint32_t)(b - a)};
+    if (s.cap == 0) return (lxl_str){.p = s.p + a, .cap = 0, .len = (uint32_t)(b - a)};
     return rt_str_of(RT_SP(s) + a, b - a);
 }
 lxl_str rt_str_view(lxl_str s, int64_t a, int64_t b, const char* w) {
     if (a < 0 || b < a || b > s.len) rt_trap(3, "string slice out of range", w);
-    return (lxl_str){s.p + a, s.cap, (uint32_t)(b - a)};
+    return (lxl_str){.p = s.p + a, .cap = s.cap, .len = (uint32_t)(b - a)};
 }
 /* Searching (the regex prefilters): the first index >= from in s of the byte c, of any byte of
    set, or of the string n; -1 when there is none (from < 0 counts as 0). With SSE2 the loops
@@ -1984,7 +1984,7 @@ lxl_str rt_str_view_bytes(lxl_arr* a) {
         a->data = d; a->cap = nc;
     }
     ((char*)a->data)[a->len] = 0;
-    return (lxl_str){(char*)a->data, 1, (uint32_t)a->len};
+    return (lxl_str){.p = (char*)a->data, .cap = 1, .len = (uint32_t)a->len};
 }
 lxl_arr rt_str_to_bytes(lxl_str s) {
     lxl_arr a = rt_arr_new(s.len, 1);
