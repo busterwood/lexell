@@ -822,7 +822,6 @@ fn statsUp(): lexdb_stats.Up { return lexdb_stats.Up{idxVal: idxVal, inIndex: in
 pub fn autoAnalyzer(st: lexdb_store.Store): int { return lexdb_stats.autoAnalyzer(st, &statsUp()) }
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] { return lexdb_stats.autoAnalyzeStep(st, &statsUp()) }
 
-
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
 // schema (lexdb_sql.qual: schema QSEP name), public's unqualified. A schema
 // is a catalog row of its own (schemaKey). An unqualified name is looked up
@@ -3067,7 +3066,12 @@ fn bindQuery(q: mut &Query) {
     }
     q.cc = cc
     q.cp = cp
-    for i in 0..len(q.subs) { bindSel(mut &q.subs[i].sel) }
+    for i in 0..len(q.subs) {
+        bindSel(mut &q.subs[i].sel)
+        // (a correlated subquery runs per outer row: its conditions'
+        // constants made once, not per run; Q8 R6)
+        if len(q.subs[i].sel.q.refs) > 0 { lexdb_plan.foldConds(mut &q.subs[i].sel.q) }
+    }
 }
 
 // allTrueX, the conditions compiled in ccs (cxsOf) run by cEval.
@@ -8677,6 +8681,8 @@ fn pipeSelMain(sel: mut &Sel) {
             return
         }
     }
+    // (correlated subqueries left per row: an Apply's over the joins, Q8 R6)
+    if sel.q.corr { lexdb_plan.applyJoins(sel, mut &jp) }
     // ORDER BY sorted (slice P3): per key the output it is, else its
     // expression made after the outputs
     var ps: Option[lexdb_plan.PSort] = None
@@ -8804,8 +8810,15 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 if srcs[0].held && !srcs[0].batch { return Err(lexdb_pipe.batErr()) }
                 for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
             }
-            var cx = pipeCtx(st, txn, params, mut &m.subs)
-            let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, mut &rs.bud, mut &cnt,
+            // (an Apply's conjuncts, Q8 R6: as runPipe's, the subqueries' values copied)
+            let ak = lexdb_plan.applyAt(&pg.plan)
+            var cx = if ak >= 0 { applyCtx(st, txn, params, &m.subs) } else { pipeCtx(st, txn, params, mut &m.subs) }
+            var bud = rs.bud
+            let h0 = rs.bud.held
+            let t0 = rs.bud.ticks
+            let mv = &m.vrows
+            let msubs = &m.subs
+            let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, mut &bud, mut &cnt,
                                         fn(first: &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
                 if fuse {
                     while len(vals) > 0 { let gone = pop(mut &vals) }
@@ -8820,8 +8833,12 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 append(mut &accss, replace(mut &ps, []))
                 if set >= 0 { append(mut &sets, set) }
                 return Ok(Unit{})
+            }, fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                return applyTrue(st, tx, q, ak, &env, rs)
             })
-            subsBack(mut &m.subs, replace(mut &cx.subs, []))
+            budBack(rs, &bud, h0, t0)
+            if ak < 0 { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
             let n = try got
             gs.firsts = firsts
             gs.accs = accss
@@ -8899,30 +8916,15 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                     keepSubs(rs, subs)
                     return Err(lexdb_pipe.batErr())
                 }
+                // (an Apply over the joins: Q8 R6)
+                if lexdb_plan.applyAt(&pg.plan) >= 0 { return runApplyJ(st, txn, sel, &pg, params, cap, rs, give, mut &subs) }
                 let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
                 let cx = pipeCtx(st, txn, params, mut &subs)
                 var tabs: []&Table = []
                 for k in 0..len(sel.q.levels) { append(mut &tabs, &sel.q.levels[k].t) }
-                // a subquery's rows a level's (in FROM, a semi join's: cut to its columns)
-                var vrows: [][][]Val = []
-                for k in 0..len(sel.q.levels) {
-                    let lv = &sel.q.levels[k]
-                    if lv.work >= 0 {
-                        // a recursive CTE's working table (as prepare reads it)
-                        let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
-                        if at < 0 { return Err(e("XX000", "a working table is missing")) }
-                        append(mut &vrows, copyRows(&rs.cache.rows[at]))
-                        continue
-                    }
-                    if lv.src < 0 {
-                        append(mut &vrows, [])
-                        continue
-                    }
-                    let rows = replace(mut &subs[lv.src].data, [])
-                    append(mut &vrows, if lv.semi { cutRows(rows, len(lv.t.cols)) } else { rows })
-                }
                 var cnt: []lexdb_pipe.Counts = []
-                let n = try lexdb_pipe.runJ(st, txn, &pg, &sel.q.cols, &tabs, &srcs, &vrows, &cx, cap, mut &rs.bud, mut &cnt, give)
+                let vrows = try levelRows(sel, rs, mut &subs)
+                let n = try lexdb_pipe.runJ(st, txn, &pg, &sel.q.cols, &tabs, &srcs, &vrows, &cx, cap, mut &rs.bud, mut &cnt, give, noAsk)
                 levelCounts(rs, &cnt)
                 return Ok(n)
             }
@@ -8960,6 +8962,30 @@ fn pipeResult(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: 
     return lexdb_pipe.runResult(txn, pg, &cx, cap, mut &cnt, give, fn(cond: bool, i: int): Result[Val, DbErr] {
         return eval(if cond { &sel.q.top[i] } else { &sel.exprs[i] }, &env)
     })
+}
+
+// The rows of a join plan's levels that are a subquery's (in FROM, a semi
+// join's: cut to its columns) or a recursive CTE's working table, moved
+// out of subs; [] a table's.
+fn levelRows(sel: &Sel, rs: &Run, subs: mut &[]SubRes): Result[[][][]Val, DbErr] {
+    var vrows: [][][]Val = []
+    for k in 0..len(sel.q.levels) {
+        let lv = &sel.q.levels[k]
+        if lv.work >= 0 {
+            // a recursive CTE's working table (as prepare reads it)
+            let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+            if at < 0 { return Err(e("XX000", "a working table is missing")) }
+            append(mut &vrows, copyRows(&rs.cache.rows[at]))
+            continue
+        }
+        if lv.src < 0 {
+            append(mut &vrows, [])
+            continue
+        }
+        let rows = replace(mut &subs[lv.src].data, [])
+        append(mut &vrows, if lv.semi { cutRows(rows, len(lv.t.cols)) } else { rows })
+    }
+    return Ok(vrows)
 }
 
 // runPipe for a point select (lexdb_plan.pointRead, no subquery; Q8,
@@ -10373,6 +10399,8 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         // (the joins' tables: lines of the Scan's, as levels)
         lexdb_plan.PPlan.Join(i, _) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Filter(i, _) { opLines(sel, &i, cnt, out) }
+        // (its conjuncts are its level's: that table's line)
+        lexdb_plan.PPlan.Apply(i, _) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Result(_) {
             for l in explainLines(&sel.q, cnt) { append(out, l) }
             append(out, "result")
@@ -15964,8 +15992,6 @@ fn bxOf(x: &Expr, q: &Query): Option[BX] {
     return lexdb_bind.bindExpr(x, &q.cols, &none, false, &typing())
 }
 
-
-
 // Where a batch reads the columns used (lexdb_rows.Projection).
 type BPlan = lexdb_rows.Projection
 
@@ -16096,7 +16122,6 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
     let lazy = lexdb_pipe.lazyOf(&bp, t, &conds, -1)
     return Ok(Some(LPlan{conds: conds, all: all, scans: scans, bp: bp, part: part, qkinds: qkinds, ranges: ranges, rd: rd, lazy: lazy}))
 }
-
 
 // ---- Join paths the pipeline's joins read (slice P2; the batch join driver was deleted with it)
 
@@ -19913,4 +19938,74 @@ fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb
     try s.markDeniedFns(mut &fns, &called)
     let path: []str = if len(s.path) == 0 { ["public"] } else { s.path.clone() }
     return lexdb_routine.inlineCalls(stmt, &fns, &path)
+}
+
+// ---- Apply (Q8 R6; design/lexdb-layers.md 6.3.Q8 R6): an Apply's conjuncts as the row engine evaluates them
+
+// pipeCtx for a plan with an Apply (Q8 R6): the subqueries' values copied,
+// not moved (its conjuncts read them as the row engine's eval does).
+fn applyCtx(st: &lexdb_store.Store, txn: &lexdb_store.Txn, params: &[]Val, subs: &[]SubRes): Ctx {
+    var cx = cenvOf(seqEnv(st, txn))
+    cx.params = collections.copyOf(params)
+    for i in 0..len(subs) { append(mut &cx.subs, lexdb_pipe.copySub(&subs[i].v)) }
+    return cx
+}
+
+// An Apply's conjuncts (Q8 R6: q's level k's WHERE conjuncts that call a
+// correlated subquery, its last) for env's row, in order, as the row
+// engine's allTrueX evaluates them: true if every one holds.
+fn applyTrue(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, env: &Env, rs: mut &Run): Result[bool, DbErr] {
+    let lv = &q.levels[k]
+    for c in lv.cond { if lexdb_plan.hasCorr(&c) && lexdb_ops.truth(&(try evalX(st, txn, q, &c, env, rs))) != Some(true) { return Ok(false) } }
+    for c in lv.post { if lexdb_plan.hasCorr(&c) && lexdb_ops.truth(&(try evalX(st, txn, q, &c, env, rs))) != Some(true) { return Ok(false) } }
+    return Ok(true)
+}
+
+// No Apply's ask (a plan without one never asks).
+fn noAsk(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] { return Err(e("XX000", "an Apply's ask without an Apply")) }
+
+// A pipeline run's budget (bud, from rs's: held h0, ticks t0) back in rs,
+// with what the Apply's subqueries' runs held and ticked in rs meanwhile.
+fn budBack(rs: mut &Run, bud: &lexdb_pipe.Budget, h0: int, t0: int) {
+    let memo = rs.bud.held - h0
+    let ticked = rs.bud.ticks - t0
+    let turn = rs.bud.turnEnd
+    rs.bud = bud
+    rs.bud.held += memo
+    rs.bud.ticks += ticked
+    if turn > rs.bud.turnEnd { rs.bud.turnEnd = turn }
+}
+
+// runPipe's joins for a plan with an Apply (Q8 R6): its rows asked of the
+// Apply's conjuncts, as the row engine evaluates them (applyTrue, evalX:
+// the subqueries per row, their results kept per outer values, its
+// subqueries' values copied into the run's context, not moved); the
+// run's budget the pipeline's, what the subqueries' runs held and
+// ticked in rs added after (budBack).
+fn runApplyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_plan.Prog, params: &[]Val, cap: int, rs: mut &Run,
+             give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr], subs: mut &[]SubRes): Result[int, DbErr] {
+    let q = &sel.q
+    let l0 = &q.levels[0]
+    let ak = lexdb_plan.applyAt(&pg.plan)
+    let srcs = try joinSrcs(st, txn, sel, pg, params, subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
+    let cx = applyCtx(st, txn, params, subs)
+    var tabs: []&Table = []
+    for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
+    let vrows = try levelRows(sel, rs, subs)
+    var cnt: []lexdb_pipe.Counts = []
+    var bud = rs.bud
+    let h0 = rs.bud.held
+    let t0 = rs.bud.ticks
+    let sqe = seqEnv(st, txn)
+    let noAggs: []Val = []
+    let sv = &subs
+    let got = lexdb_pipe.runJ(st, txn, pg, &q.cols, &tabs, &srcs, &vrows, &cx, cap, mut &bud, mut &cnt, give,
+                              fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+        let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: sv, cur: &noAggs, seq: &sqe}
+        return applyTrue(st, tx, q, ak, &env, rs)
+    })
+    budBack(rs, &bud, h0, t0)
+    let n = try got
+    levelCounts(rs, &cnt)
+    return Ok(n)
 }

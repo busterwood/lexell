@@ -2189,6 +2189,13 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                     if !onceAll(&subs) || !allRead(&xs, &lexdb_plan.noScan()) { return -1 }
                     return 2
                 }
+                lexdb_plan.PPlan.Apply(j, pa) {
+                    // (Q8 R6) the joins, the Apply at its level, then the outputs
+                    var avail: []bool = array(len(cols), false)
+                    let k = applyOps(&j, &pa, cols, mut &avail)
+                    if k < 0 || !allIn(&xs, &avail) { return -1 }
+                    return k + 1
+                }
                 else { return -1 }
             }
         }
@@ -2285,6 +2292,11 @@ fn opsWhy(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef) {
                     let k = joinOps(&i, cols, mut &avail)
                     if k >= 0 && !allIn(&xs, &avail) { lexdb_census.no("compile: an output reads a column the joins do not decode") }
                 }
+                lexdb_plan.PPlan.Apply(j, pa) {
+                    var avail: []bool = array(len(cols), false)
+                    let k = applyOps(&j, &pa, cols, mut &avail)
+                    if k >= 0 && !allIn(&xs, &avail) { lexdb_census.no("compile: an output reads a column the joins do not decode") }
+                }
                 lexdb_plan.PPlan.Filter(j, cs) {
                     match j {
                         lexdb_plan.PPlan.Scan(sc, subs) { censusScan(&sc, &subs, cols, false, "a condition or output reads a column the scan does not decode") }
@@ -2335,35 +2347,13 @@ fn aggOps(i: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef):
             // over joins (slice P2): every level's rows, then the groups
             var avail: []bool = array(len(cols), false)
             let k = joinOps(i, cols, mut &avail)
-            if k < 0 || !allIn(&a.keys, &avail) {
-                // census: lexdb_census.no("compile: agg: a key reads a column the joins do not decode")
-                return -1
-            }
-            for c in a.calls {
-                match c.arg {
-                    Some(x) {
-                        if !allIn1(&x, &avail) {
-                            // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
-                            return -1
-                        }
-                    }
-                    None {}
-                }
-                match c.filter {
-                    Some(x) {
-                        if !allIn1(&x, &avail) {
-                            // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
-                            return -1
-                        }
-                    }
-                    None {}
-                }
-                if !allIn(&c.more, &avail) {
-                    // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
-                    return -1
-                }
-            }
-            return k + 1
+            return aggOver(k, a, &avail)
+        }
+        lexdb_plan.PPlan.Apply(j, pa) {
+            // (Q8 R6) over the joins and the Apply
+            var avail: []bool = array(len(cols), false)
+            let k = applyOps(&j, &pa, cols, mut &avail)
+            return aggOver(k, a, &avail)
         }
         lexdb_plan.PPlan.Filter(j, cs) {
             match j {
@@ -2433,7 +2423,8 @@ fn censusScan(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sq
 fn scanWhy(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef, join: bool, other: &str): str {
     for i in 0..len(subs) {
         let s = &subs[i]
-        let ok = s.run == lexdb_plan.RUN_ONCE || (join && (s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_MARK || s.run == lexdb_plan.RUN_LOOKED || s.run == lexdb_plan.RUN_GROUPED))
+        let ok = s.run == lexdb_plan.RUN_ONCE || (join && (s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_MARK || s.run == lexdb_plan.RUN_LOOKED || s.run == lexdb_plan.RUN_GROUPED ||
+                                                          s.run == lexdb_plan.RUN_APPLY))
         if !ok { return "a subquery run " + (if s.run == lexdb_plan.RUN_PER_ROW { "per row" } else { "as kind " + s.run.toStr() }) }
         if !join && s.use == lexdb_sql.SUB_FROM && i != sc.held { return "a FROM subquery not the scan's" }
     }
@@ -2540,6 +2531,7 @@ fn joinSrc(p: &lexdb_plan.PPlan, k: int, t: &lexdb_catalog.Table, scans: []lexdb
         lexdb_plan.PPlan.Having(i) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Distinct(i, _, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         lexdb_plan.PPlan.Match(i) { return joinSrc(&i, k, t, scans, index, desc, covers) }
+        lexdb_plan.PPlan.Apply(i, _) { return joinSrc(&i, k, t, scans, index, desc, covers) }
         else { return Ok(noSrc()) }
     }
 }
@@ -4815,6 +4807,13 @@ type JRun = record {
     wantList: []int
     nq: int
     zone: lexdb_time.Zone
+    // an Apply (Q8 R6): the rows joined up to jls[apAt - 1] asked of the
+    // consumer (askOf) before the next level (-1 none), the columns
+    // gathered for it; one: each first row joined on alone (a LIMIT over
+    // it: no row past it asked)
+    apAt: int
+    apReads: []int
+    one: bool
 }
 
 // The query's columns x reads, in order of first read.
@@ -4861,15 +4860,19 @@ fn joinBottom(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
 // Whether p (under the consumer) has a join.
 pub fn hasJoin(p: &lexdb_plan.PPlan): bool {
     match p {
-        lexdb_plan.PPlan.Join(_, _) { return true }
-        lexdb_plan.PPlan.Filter(i, _) { return hasJoin(&i) }
-        lexdb_plan.PPlan.Agg(i, _, _) { return hasJoin(&i) }
+        // (a point select's plan first: Project (Filter? (Scan)))
+        lexdb_plan.PPlan.Scan(_, _) { return false }
         lexdb_plan.PPlan.Project(i, _) { return hasJoin(&i) }
+        lexdb_plan.PPlan.Filter(i, _) { return hasJoin(&i) }
+        lexdb_plan.PPlan.Join(_, _) { return true }
+        lexdb_plan.PPlan.Agg(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Limit(i, _, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Sort(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Having(i) { return hasJoin(&i) }
         lexdb_plan.PPlan.Distinct(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Match(i) { return hasJoin(&i) }
+        // (an Apply's plan runs as joins, none or more: Q8 R6)
+        lexdb_plan.PPlan.Apply(_, _) { return true }
         else { return false }
     }
 }
@@ -4878,124 +4881,7 @@ pub fn hasJoin(p: &lexdb_plan.PPlan): bool {
 // arm one it reads, each expression reading only the columns decoded by
 // the tables it may read), else -1. avail: per column of the query, made
 // by the tables below (set for p's).
-fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool): int {
-    match p {
-        lexdb_plan.PPlan.Join(i, j) {
-            let k = joinOps(&i, cols, avail)
-            if k < 0 { return -1 }
-            if j.how == lexdb_plan.JH_JOIN {
-                let n = grpOps(&j, cols, avail)
-                return if n < 0 { -1 } else { k + n }
-            }
-            let sc = &j.scan
-            if len(sc.kinds) != len(cols) || sc.first < 0 || sc.first + len(sc.need) > len(cols) {
-                // census: lexdb_census.no("compile: join: a table's columns do not fit the query's")
-                return -1
-            }
-            if j.kind != lexdb_sql.J_INNER && j.kind != lexdb_sql.J_LEFT && j.kind != lexdb_sql.J_RIGHT && j.kind != lexdb_sql.J_FULL {
-                // census: lexdb_census.no("compile: join: a kind it does not join")
-                return -1
-            }
-            let hash = j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS
-            if (j.kind == lexdb_sql.J_RIGHT || j.kind == lexdb_sql.J_FULL) && (!hash || j.mark != lexdb_plan.MK_JOIN) {
-                // census: lexdb_census.no("compile: join: RIGHT or FULL not hashed, or marked")
-                return -1
-            }
-            if j.mark != lexdb_plan.MK_JOIN && j.kind != lexdb_sql.J_INNER {
-                // census: lexdb_census.no("compile: join: a semi, anti or mark join not inner")
-                return -1
-            }
-            // (optimizer 50's levels: a subquery's rows, hashed, no "<>" summary)
-            if j.mark >= lexdb_plan.MK_NOTIN && (j.how != lexdb_plan.JH_ROWS || j.resCol >= 0 || len(j.hcols) == 0) {
-                // census: lexdb_census.no("compile: join: an optimizer-50 level not of rows hashed")
-                return -1
-            }
-            if j.resCol >= 0 && (!hash || len(j.res) != 1 || !allIn(&j.res, avail)) {
-                // census: lexdb_census.no("compile: join: a level's result column")
-                return -1
-            }
-            if hash {
-                // (no key: an inner join of every pair, its conditions per pair)
-                let keyless = len(j.hcols) == 0 && j.kind == lexdb_sql.J_INNER && j.mark == lexdb_plan.MK_JOIN && j.resCol < 0
-                if (len(j.hcols) == 0 && !keyless) || len(j.hcols) != len(j.keys) || len(j.ktypes) != len(j.keys) || !j.exact {
-                    // census: lexdb_census.no("compile: join: hash keys not exact (types)")
-                    return -1
-                }
-                for c in j.hcols {
-                    if c < 0 || c >= len(sc.need) || !sc.need[c] {
-                        // census: lexdb_census.no("compile: join: a hash column not decoded")
-                        return -1
-                    }
-                }
-                // its own conditions read its own columns only
-                var own: []bool = array(len(cols), false)
-                for c in 0..len(sc.need) { own[sc.first + c] = sc.need[c] }
-                if !allIn(&j.build, &own) {
-                    // census: lexdb_census.no("compile: join: a build condition reads other tables")
-                    return -1
-                }
-            } else if j.how == lexdb_plan.JH_LOOK || j.how == lexdb_plan.JH_RANGE {
-                if len(j.keys) == 0 || len(j.ktypes) < len(j.keys) {
-                    // census: lexdb_census.no("compile: join: a lookup with no keys")
-                    return -1
-                }
-                if j.how == lexdb_plan.JH_RANGE && len(j.rng) > 0 && len(j.ktypes) != len(j.keys) + 1 {
-                    // census: lexdb_census.no("compile: join: a range's key types")
-                    return -1
-                }
-                if len(j.build) > 0 {
-                    // census: lexdb_census.no("compile: join: a lookup with build conditions")
-                    return -1
-                }
-            } else {
-                // census: lexdb_census.no("compile: join: an arm it does not join")
-                return -1
-            }
-            if !allIn(&j.keys, avail) {
-                // census: lexdb_census.no("compile: join: a key reads a column not decoded before it")
-                return -1
-            }
-            for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
-            if !allIn(&j.conds, avail) || !allIn(&j.post, avail) {
-                // census: lexdb_census.no("compile: join: a condition reads a column not decoded")
-                return -1
-            }
-            return k + 1
-        }
-        lexdb_plan.PPlan.Filter(i, cs) {
-            match i {
-                lexdb_plan.PPlan.Scan(sc, subs) {
-                    if !joinRuns1(&sc, &subs, cols) || !sc.batch {
-                        // census: censusScan(&sc, &subs, cols, true, "join: the first table not read in batches")
-                        return -1
-                    }
-                    for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
-                    if !allIn(&cs, avail) {
-                        // census: lexdb_census.no("compile: join: a first table's condition reads other columns")
-                        return -1
-                    }
-                    return 1
-                }
-                else {
-                    // census: lexdb_census.no("compile: join: an arm it does not join")
-                    return -1
-                }
-            }
-        }
-        lexdb_plan.PPlan.Scan(sc, subs) {
-            if !joinRuns1(&sc, &subs, cols) || !sc.batch {
-                // census: censusScan(&sc, &subs, cols, true, "join: the first table not read in batches")
-                return -1
-            }
-            for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
-            return 1
-        }
-        else {
-            // census: lexdb_census.no("compile: join: an arm it does not join")
-            return -1
-        }
-    }
-}
+fn joinOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool): int { return joinOpsIn(p, cols, avail, false) }
 
 // The operators of a build group's arm (optimizer 49), one per table, if
 // the pipeline runs it, else -1: its build a join plan it runs over the
@@ -5049,7 +4935,7 @@ fn allIn1(x: &BX, avail: &[]bool): bool {
 fn joinRuns1(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
     for s in subs {
         let ok = s.run == lexdb_plan.RUN_SEMI || s.run == lexdb_plan.RUN_MARK || s.run == lexdb_plan.RUN_LOOKED || s.run == lexdb_plan.RUN_ONCE ||
-                 s.run == lexdb_plan.RUN_GROUPED
+                 s.run == lexdb_plan.RUN_GROUPED || s.run == lexdb_plan.RUN_APPLY
         if !ok { return false }
     }
     return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
@@ -5661,7 +5547,8 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     let maxHeld = bud.maxHeld
     var sub: []Counts = array(len(cnt), noCounts())
     hashBuilds += 1
-    try joinRows(st, txn, build, cols, tabs, srcs, vrows, cx, dec, kinds, owner, collections.copyOf(&want), false, bud, mut &sub,
+    let na = noApply()
+    try joinRows(st, txn, build, cols, tabs, srcs, vrows, cx, dec, kinds, owner, collections.copyOf(&want), false, bud, mut &sub, &na,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
         var all: []int = withCapacity(f.n)
         for r in 0..f.n { append(mut &all, r) }
@@ -6211,6 +6098,10 @@ fn naBucket(jl: &JL, kv: &[]BVec, w: &Batch, r: int, kb: &str): int {
     return jl.gens.getOr(kb, -1)
 }
 
+// An Apply's asks and the rows asked (the tests' look).
+var applyAsks: int = 0
+var applyRows: int = 0
+
 // The rest of a chunk's join from level j: at, per level before it, its
 // rows' places (n rows). At the end the consumer's columns are gathered
 // and the joined rows given to out. false: stop.
@@ -6218,6 +6109,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
             at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
     if n == 0 { return Ok(true) }
+    if j == jr.apAt && !js.applied { return applyFrom(st, txn, jr, js, tabs, j, at, n, cx, bud, cnt, one, out) }
     if j == len(jr.jls) {
         // (a chunk joined again row by row: the rows already given skipped)
         if js.sk.skip >= n {
@@ -6526,7 +6418,7 @@ type Skip = record { skip: int; given: int }
 // A join run's state: per level its rows for the chunk (the scan's batch,
 // a lookup's or range's rows), per level a RIGHT or FULL JOIN's hash rows
 // that joined (each its own marks; [] for the others), the skip.
-type JState = record { cur: []Batch; seen: [][]bool; sk: Skip }
+type JState = record { cur: []Batch; seen: [][]bool; sk: Skip; applied: bool }
 
 // One row's candidates at level j (pj all 0, pi their rows), as the row
 // engine tries them: each one's conditions, then the levels after it for
@@ -6747,13 +6639,20 @@ fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int
 // gathered. dec: numerics as units.
 fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, dec: bool, kinds: []int, owner: []int, want: []bool, exact: bool,
-            bud: mut &Budget, cnt: mut &[]Counts, out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[Unit, DbErr] {
+            bud: mut &Budget, cnt: mut &[]Counts, ap: &Apply, out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[Unit, DbErr] {
     let nq = len(cols)
     var wl: []int = []
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
-    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone()}
+    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone(), apAt: -1, apReads: collections.copyOf(&ap.reads), one: ap.one}
     try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, dec, bud, cnt)
-    reduceHashes(mut &jr)
+    if ap.level >= 0 {
+        // (Q8 R6) its rows asked after its level; no hash cut by a later
+        // level's (a row the Apply asks of must not be dropped before it)
+        for x in 0..len(jr.jls) { if jr.jls[x].level == ap.level { jr.apAt = x + 1 } }
+        if jr.apAt < 0 { return Err(e("XX000", "an Apply's level not among the joins")) }
+    } else {
+        reduceHashes(mut &jr)
+    }
     let bottom = joinBottom(top)
     let none: []BX = []
     let conds = match bottom {
@@ -6782,7 +6681,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     // the first hash join's one integer key, a column of the scan: its
     // rows not in the hash are dropped as the scan reads them
     var pushCol = -1
-    if len(jr.jls) > 1 && (jr.jls[1].how == lexdb_plan.JH_HASH || jr.jls[1].how == lexdb_plan.JH_JOIN) && jr.jls[1].mode == JK_INT && !jr.jls[1].left {
+    if len(jr.jls) > 1 && jr.apAt != 1 && (jr.jls[1].how == lexdb_plan.JH_HASH || jr.jls[1].how == lexdb_plan.JH_JOIN) && jr.jls[1].mode == JK_INT && !jr.jls[1].left {
         match jr.jls[1].key[0] {
             BNode.Col(c) { if jr.owner[c] == 0 { pushCol = c - sc.first } }
             else {}
@@ -6790,7 +6689,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     }
     cnt[sc.level].starts += 1
     heldRun(&srcs[sc.level])
-    var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}}
+    var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}, applied: false}
     for i in 0..len(jr.jls) { append(mut &js.cur, lexdb_rows.noRows()) }
     // a RIGHT or FULL JOIN's rows that joined, per level
     var rights: []int = []
@@ -6876,6 +6775,7 @@ fn joinChunk(st: &lexdb_store.Store, tx: mut &lexdb_store.Txn, jr: &JRun, js: mu
 
         js.sk.skip = 0
         js.sk.given = 0
+        js.applied = false
         if raw {
             // its conditions gave an error on one of its rows: row by row
             for r in 0..js.cur[0].n {
@@ -6891,10 +6791,10 @@ fn joinChunk(st: &lexdb_store.Store, tx: mut &lexdb_store.Txn, jr: &JRun, js: mu
         let n = len(idx)
         var at: [][]int = []
         append(mut &at, collections.copyOf(&idx))
-        if !exact { return joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, false, out) }
+        if !exact { return joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, jr.one, out) }
         let c0 = collections.copyOf(cnt)
         let h0 = bud.held
-        match joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, false, out) {
+        match joinFrom(st, tx, jr, js, tabs, 1, at, n, cx, bud, cnt, jr.one, out) {
             Ok(go) { return Ok(go) }
             Err(x) {
                 if isBat(&x) || x.state == "53200" || x.state == "57014" || isSpill(&x) { return Err(x) }
@@ -6905,6 +6805,7 @@ fn joinChunk(st: &lexdb_store.Store, tx: mut &lexdb_store.Txn, jr: &JRun, js: mu
                 bud.held = h0
                 js.sk.skip = js.sk.given
                 js.sk.given = 0
+                js.applied = false
                 var at2: [][]int = []
                 append(mut &at2, idx)
                 return joinFrom(st, tx, jr, js, tabs, 1, at2, n, cx, bud, cnt, true, out)
@@ -6923,9 +6824,12 @@ fn kindsFor(top: &lexdb_plan.PPlan, tabs: &[]&lexdb_catalog.Table, nq: int, dec:
 // Runs a join program of rows (Limit? (Sort? (Project (joins)))): as run,
 // its tables tabs and where each is read srcs, by level. cnt: per level
 // its counts (EXPLAIN ANALYZE's), then the rows given.
+// ask: an Apply's conjuncts for a row of the query's columns (those it
+// reads set), true if they hold (Q8 R6; never called without an Apply).
 pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
             srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
-            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr],
+            ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     runs += 1
     joinRuns += 1
     batchRuns += 1
@@ -6934,29 +6838,36 @@ pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: 
         // its rows held by the Sort or Distinct, then given (slice P3)
         var sr = sortRun(&pg.plan, cap, bud)
         let got = try runJProj(st, txn, pg, projUnder(&pg.plan), cols, tabs, srcs, vrows, cx, -1, bud, cnt,
-                               fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] { return sr.eat(ob, r) })
+                               fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] { return sr.eat(ob, r) }, ask)
         sortRuns += 1
         return sr.finish(txn, bud, give)
     }
     var lim = cap
     limitOf(&pg.plan, mut &lim)
-    return runJProj(st, txn, pg, projOf2(&pg.plan), cols, tabs, srcs, vrows, cx, lim, bud, cnt, give)
+    return runJProj(st, txn, pg, projOf2(&pg.plan), cols, tabs, srcs, vrows, cx, lim, bud, cnt, give, ask)
 }
 
 // runJ's Project pr over the joins: at most lim rows (-1 no limit).
 fn runJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, pr: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
-            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr],
+            ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     match pr {
-        lexdb_plan.PPlan.Project(top, xs) {
+        lexdb_plan.PPlan.Project(top0, xs) {
             let nq = len(cols)
+            // (an Apply over the joins: Q8 R6; a LIMIT over it asks no row past it)
+            var ap = applyIn(&top0)
+            ap.one = ap.level >= 0 && lim >= 0
+            let top = joinsIn(&top0)
             var kinds: []int = []
             var owner: []int = []
-            kindsFor(&top, tabs, nq, false, mut &kinds, mut &owner)
+            kindsFor(top, tabs, nq, false, mut &kinds, mut &owner)
             var want: []bool = array(nq, false)
             var rd: []int = []
             readsOf(&xs, mut &rd)
             for c in rd { want[c] = true }
+            for c in ap.reads { want[c] = true }
+            let ks = collections.copyOf(&kinds)
             var nodes: []BNode = []
             var okinds: []int = []
             var osrc: []int = []
@@ -6974,8 +6885,12 @@ fn runJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, pr: &l
             var given = 0
             var bad: []DbErr = []
             let no = len(nodes)
-            try joinRows(st, txn, &top, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt,
+            try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt, &ap,
                          fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+                if askOf(f, nq) {
+                    try askRows(tx, f, nq, &ks, &ap.reads, ask)
+                    return Ok(true)
+                }
                 var all: []int = withCapacity(f.n)
                 for r in 0..f.n { append(mut &all, r) }
                 var ex: []BVec = []
@@ -7030,10 +6945,12 @@ fn limitOf(p: &lexdb_plan.PPlan, lim: mut &int) {
 
 // runAgg, or runAggJ for a plan with joins (its tables tabs, where each
 // is read srcs; t and src the first's).
+// ask: runJ's (an Apply's conjuncts for a row).
 pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
                  src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-                 give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
-    if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give) }
+                 give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+                 ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
     let none: [][]Val = []
     return runAgg(st, txn, pg, cols, t, src, if len(vrows) > 0 { &vrows[0] } else { &none }, cx, room, bud, cnt, give)
 }
@@ -7046,7 +6963,8 @@ pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
 // end). A value a batch cannot hold: batErr (nothing given).
 pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
                srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-               give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+               give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+               ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     runs += 1
     joinRuns += 1
     batchRuns += 1
@@ -7054,7 +6972,7 @@ pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, col
     match underViews(&pg.plan) {
         lexdb_plan.PPlan.Agg(i, _, pa) {
             match pa {
-                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, give) }
+                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
                 None {}
             }
         }
@@ -7065,7 +6983,7 @@ pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, col
 
 // The query's columns an aggregate reads: its keys', calls' and FILTERs',
 // and those a group keeps.
-fn aggWant(a: &lexdb_plan.PAgg, nq: int): []bool {
+fn aggWant(a: &lexdb_plan.PAgg, nq: int, ap: &Apply): []bool {
     var want: []bool = array(nq, false)
     var rd: []int = []
     readsOf(&a.keys, mut &rd)
@@ -7082,13 +7000,18 @@ fn aggWant(a: &lexdb_plan.PAgg, nq: int): []bool {
     }
     for c in rd { if c >= 0 && c < nq { want[c] = true } }
     for c in 0..len(a.keep) { if a.keep[c] && c < nq { want[c] = true } }
+    for c in ap.reads { if c >= 0 && c < nq { want[c] = true } }
     return want
 }
 
-fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef,
+fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef,
            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-           give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+           give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+           ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let nq = len(cols)
+    // (an Apply over the joins: Q8 R6)
+    let ap = applyIn(top0)
+    let top = joinsIn(top0)
     let c0 = collections.copyOf(cnt)
     let h0 = bud.held
     let maxHeld = bud.maxHeld
@@ -7101,7 +7024,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
         var kinds: []int = []
         var owner: []int = []
         kindsFor(top, tabs, nq, dec, mut &kinds, mut &owner)
-        let want = aggWant(a, nq)
+        let want = aggWant(a, nq, &ap)
         for c in 0..nq { avail[c] = want[c] && owner[c] >= 0 }
         let got = aggSets(a, cols, &kinds, &avail, cx, dec, room, maxHeld)
         if got.isNone() {
@@ -7113,8 +7036,13 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
         let usedDec = dec && ag.anyDec(&kinds, &avail)
         if dec && !usedDec { continue }
         var gaveWay = false
-        let r = joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt,
+        let ks0 = collections.copyOf(&kinds)
+        let r = joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt, &ap,
                          fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+            if askOf(f, nq) {
+                try askRows(tx, f, nq, &ks0, &ap.reads, ask)
+                return Ok(true)
+            }
             var all: []int = withCapacity(f.n)
             for x in 0..f.n { append(mut &all, x) }
             if !(try ag.eat(f, &all)) {
@@ -7148,13 +7076,17 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     var kinds: []int = []
     var owner: []int = []
     kindsFor(top, tabs, nq, false, mut &kinds, mut &owner)
-    let want = aggWant(a, nq)
+    let want = aggWant(a, nq, &ap)
     var wl: []int = []
     for c in 0..nq { if want[c] { append(mut &wl, c) } }
     var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
     let ks = collections.copyOf(&kinds)
-    try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt,
+    try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt, &ap,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+        if askOf(f, nq) {
+            try askRows(tx, f, nq, &ks, &ap.reads, ask)
+            return Ok(true)
+        }
         for r in 0..f.n {
             for c in wl { rg.row[c] = if f.cols[c].nul[r] { Val.Null } else { bValAt(f, c, ks[c], r) } }
             try groupRow(mut &rg, a, cx, room, maxHeld)
@@ -7814,7 +7746,8 @@ pub fn runLevels(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     let ks = collections.copyOf(&kinds)
     var row: []Val = array(nq, Val.Null)
     var bad: []DbErr = []
-    try joinRows(st, txn, &pg.plan, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt,
+    let na = noApply()
+    try joinRows(st, txn, &pg.plan, cols, tabs, srcs, vrows, cx, false, kinds, owner, want, true, bud, cnt, &na,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
         for r in 0..f.n {
             for c in wl { row[c] = if f.cols[c].nul[r] { Val.Null } else { bValAt(f, c, ks[c], r) } }
@@ -7846,5 +7779,253 @@ fn decoded(p: &lexdb_plan.PPlan, want: mut &[]bool) {
         lexdb_plan.PPlan.Filter(i, _) { decoded(&i, want) }
         lexdb_plan.PPlan.Scan(sc, _) { for c in 0..len(sc.need) { if sc.need[c] { want[sc.first + c] = true } } }
         else {}
+    }
+}
+
+// ---- Apply (Q8 R6; design/lexdb-layers.md 6.3.Q8 R6): an Apply's rows asked of the joins' consumer
+
+// The operators of an aggregate a over k operators of joins (-1: not
+// run), if every key, argument and FILTER reads columns avail holds, else -1.
+fn aggOver(k: int, a: &lexdb_plan.PAgg, avail: &[]bool): int {
+    if k < 0 || !allIn(&a.keys, avail) {
+        // census: lexdb_census.no("compile: agg: a key reads a column the joins do not decode")
+        return -1
+    }
+    for c in a.calls {
+        match c.arg {
+            Some(x) {
+                if !allIn1(&x, avail) {
+                    // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
+                    return -1
+                }
+            }
+            None {}
+        }
+        match c.filter {
+            Some(x) {
+                if !allIn1(&x, avail) {
+                    // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
+                    return -1
+                }
+            }
+            None {}
+        }
+        if !allIn(&c.more, avail) {
+            // census: lexdb_census.no("compile: agg: an argument reads a column the joins do not decode")
+            return -1
+        }
+    }
+    return k + 1
+}
+
+// The operators of an Apply's input j and the Apply (Q8 R6) if the
+// pipeline runs them: its joins (none or more; the first table read in
+// batches or row by row), the columns its conjuncts read decoded; else -1.
+fn applyOps(j: &lexdb_plan.PPlan, pa: &lexdb_plan.PApply, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool): int {
+    let k = joinOpsIn(j, cols, avail, true)
+    if k < 0 { return -1 }
+    for c in pa.reads {
+        if c < 0 || c >= len(avail) || !avail[c] {
+            // census: lexdb_census.no("compile: an Apply reads a column the joins do not decode")
+            return -1
+        }
+    }
+    return k + 1
+}
+
+// joinOps; rows: the first table may be read row by row (an Apply's plan,
+// Q8 R6: its rows are put in batches, readRows).
+fn joinOpsIn(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, avail: mut &[]bool, rows: bool): int {
+    match p {
+        lexdb_plan.PPlan.Join(i, j) {
+            let k = joinOpsIn(&i, cols, avail, rows)
+            if k < 0 { return -1 }
+            if j.how == lexdb_plan.JH_JOIN {
+                let n = grpOps(&j, cols, avail)
+                return if n < 0 { -1 } else { k + n }
+            }
+            let sc = &j.scan
+            if len(sc.kinds) != len(cols) || sc.first < 0 || sc.first + len(sc.need) > len(cols) {
+                // census: lexdb_census.no("compile: join: a table's columns do not fit the query's")
+                return -1
+            }
+            if j.kind != lexdb_sql.J_INNER && j.kind != lexdb_sql.J_LEFT && j.kind != lexdb_sql.J_RIGHT && j.kind != lexdb_sql.J_FULL {
+                // census: lexdb_census.no("compile: join: a kind it does not join")
+                return -1
+            }
+            let hash = j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS
+            if (j.kind == lexdb_sql.J_RIGHT || j.kind == lexdb_sql.J_FULL) && (!hash || j.mark != lexdb_plan.MK_JOIN) {
+                // census: lexdb_census.no("compile: join: RIGHT or FULL not hashed, or marked")
+                return -1
+            }
+            if j.mark != lexdb_plan.MK_JOIN && j.kind != lexdb_sql.J_INNER {
+                // census: lexdb_census.no("compile: join: a semi, anti or mark join not inner")
+                return -1
+            }
+            // (optimizer 50's levels: a subquery's rows, hashed, no "<>" summary)
+            if j.mark >= lexdb_plan.MK_NOTIN && (j.how != lexdb_plan.JH_ROWS || j.resCol >= 0 || len(j.hcols) == 0) {
+                // census: lexdb_census.no("compile: join: an optimizer-50 level not of rows hashed")
+                return -1
+            }
+            if j.resCol >= 0 && (!hash || len(j.res) != 1 || !allIn(&j.res, avail)) {
+                // census: lexdb_census.no("compile: join: a level's result column")
+                return -1
+            }
+            if hash {
+                // (no key: an inner join of every pair, its conditions per pair)
+                let keyless = len(j.hcols) == 0 && j.kind == lexdb_sql.J_INNER && j.mark == lexdb_plan.MK_JOIN && j.resCol < 0
+                if (len(j.hcols) == 0 && !keyless) || len(j.hcols) != len(j.keys) || len(j.ktypes) != len(j.keys) || !j.exact {
+                    // census: lexdb_census.no("compile: join: hash keys not exact (types)")
+                    return -1
+                }
+                for c in j.hcols {
+                    if c < 0 || c >= len(sc.need) || !sc.need[c] {
+                        // census: lexdb_census.no("compile: join: a hash column not decoded")
+                        return -1
+                    }
+                }
+                // its own conditions read its own columns only
+                var own: []bool = array(len(cols), false)
+                for c in 0..len(sc.need) { own[sc.first + c] = sc.need[c] }
+                if !allIn(&j.build, &own) {
+                    // census: lexdb_census.no("compile: join: a build condition reads other tables")
+                    return -1
+                }
+            } else if j.how == lexdb_plan.JH_LOOK || j.how == lexdb_plan.JH_RANGE {
+                if len(j.keys) == 0 || len(j.ktypes) < len(j.keys) {
+                    // census: lexdb_census.no("compile: join: a lookup with no keys")
+                    return -1
+                }
+                if j.how == lexdb_plan.JH_RANGE && len(j.rng) > 0 && len(j.ktypes) != len(j.keys) + 1 {
+                    // census: lexdb_census.no("compile: join: a range's key types")
+                    return -1
+                }
+                if len(j.build) > 0 {
+                    // census: lexdb_census.no("compile: join: a lookup with build conditions")
+                    return -1
+                }
+            } else {
+                // census: lexdb_census.no("compile: join: an arm it does not join")
+                return -1
+            }
+            if !allIn(&j.keys, avail) {
+                // census: lexdb_census.no("compile: join: a key reads a column not decoded before it")
+                return -1
+            }
+            for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
+            if !allIn(&j.conds, avail) || !allIn(&j.post, avail) {
+                // census: lexdb_census.no("compile: join: a condition reads a column not decoded")
+                return -1
+            }
+            return k + 1
+        }
+        lexdb_plan.PPlan.Filter(i, cs) {
+            match i {
+                lexdb_plan.PPlan.Scan(sc, subs) {
+                    if !joinRuns1(&sc, &subs, cols) || (!sc.batch && !rows) {
+                        // census: censusScan(&sc, &subs, cols, true, "join: the first table not read in batches")
+                        return -1
+                    }
+                    for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
+                    if !allIn(&cs, avail) {
+                        // census: lexdb_census.no("compile: join: a first table's condition reads other columns")
+                        return -1
+                    }
+                    return 1
+                }
+                else {
+                    // census: lexdb_census.no("compile: join: an arm it does not join")
+                    return -1
+                }
+            }
+        }
+        lexdb_plan.PPlan.Scan(sc, subs) {
+            if !joinRuns1(&sc, &subs, cols) || (!sc.batch && !rows) {
+                // census: censusScan(&sc, &subs, cols, true, "join: the first table not read in batches")
+                return -1
+            }
+            for c in 0..len(sc.need) { avail[sc.first + c] = sc.need[c] }
+            return 1
+        }
+        else {
+            // census: lexdb_census.no("compile: join: an arm it does not join")
+            return -1
+        }
+    }
+}
+
+// An Apply's step (Q8 R6): the rows joined up to level j - 1 (at, n) asked
+// of the consumer (askOf: an ask batch of the Apply's columns, the rows
+// that pass back in its last column), then those joined on from j; row by
+// row (one) each alone, as the row engine runs a row's levels before the
+// next row's. The rows the Apply drops are not counted as joined at its
+// level, as the row engine counts them.
+fn applyFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+             at: &[][]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, one: bool,
+             out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[bool, DbErr] {
+    if one && n > 1 {
+        for r in 0..n {
+            let one1: []int = [r]
+            if !(try applyFrom(st, txn, jr, js, tabs, j, compose(at, &one1), 1, cx, bud, cnt, one, out)) { return Ok(false) }
+        }
+        return Ok(true)
+    }
+    applyAsks += 1
+    applyRows += n
+    var f = gatherAt(jr, &js.cur, at, n, &jr.apReads)
+    append(mut &f.cols, lexdb_rows.bvec(0))
+    append(mut &f.vals, [])
+    append(mut &f.txt, "")
+    if !(try out(txn, mut &f)) { return Ok(false) }
+    let keep = replace(mut &f.cols[jr.nq].v, [])
+    cnt[jr.jls[j - 1].level].joined -= n - len(keep)
+    if len(keep) == 0 { return Ok(true) }
+    let at2 = compose(at, &keep)
+    js.applied = true
+    let r = joinFrom(st, txn, jr, js, tabs, j, &at2, len(keep), cx, bud, cnt, one, out)
+    js.applied = false
+    return r
+}
+
+pub fn applyCounts(): []int { return [applyAsks, applyRows] }
+
+// Whether f, given to a join's consumer, is an Apply's ask (applyFrom):
+// the query's columns and one more, where the consumer puts the places of
+// the rows that pass.
+pub fn askOf(f: &Batch, nq: int): bool { return len(f.cols) > nq }
+
+// What a join plan's Apply is to its run (joinRows): its level (-1 none),
+// the columns it reads, whether each first row is joined on alone.
+pub type Apply = record { pub level: int; pub reads: []int; pub one: bool }
+
+pub fn noApply(): Apply { return Apply{level: -1, reads: [], one: false} }
+
+// An Apply's step for a join's ask batch f (askOf): each row's columns the
+// Apply reads given to ask, in order; the places of those that pass put
+// in f's last column.
+fn askRows(tx: mut &lexdb_store.Txn, f: mut &Batch, nq: int, kinds: &[]int, reads: &[]int,
+           ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    var row: []Val = array(nq, Val.Null)
+    var keep: []int = withCapacity(f.n)
+    for r in 0..f.n {
+        for c in reads { row[c] = if f.cols[c].nul[r] { Val.Null } else { bValAt(f, c, kinds[c], r) } }
+        if try ask(tx, &row) { append(mut &keep, r) }
+    }
+    f.cols[nq].v = keep
+    return Ok(Unit{})
+}
+
+// p's Apply as its run takes it (noApply: none), and the joins under it.
+fn applyIn(p: &lexdb_plan.PPlan): Apply {
+    match p {
+        lexdb_plan.PPlan.Apply(_, pa) { return Apply{level: pa.level, reads: collections.copyOf(&pa.reads), one: false} }
+        else { return noApply() }
+    }
+}
+
+fn joinsIn(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+    match p {
+        lexdb_plan.PPlan.Apply(i, _) { return &i }
+        else { return p }
     }
 }

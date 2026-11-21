@@ -65,7 +65,6 @@ pub fn hook(f: fn(): Up) { let u = UP.getOrSet(f) }
 
 fn up(): &Up { return UP.get() }
 
-
 pub const IN_LOOKUP_MAX: int = 1000
 pub const JOIN_SEARCH_MAX: int = 24
 pub const JOIN_EXACT_MAX: int = 8
@@ -214,7 +213,20 @@ pub type PPlan = closed {
     // parameter's: its value then)
     Limit(PPlan, bool, int, int)
     Match(PPlan)                    // MATCH_RECOGNIZE over the query's rows
+    // the correlated subqueries left per row (RUN_APPLY), run per row of
+    // the joins below at a level's WHERE conjuncts (Q8 R6): its input, the
+    // level and the columns the conjuncts read
+    Apply(PPlan, PApply)
 }
+
+// An Apply (Q8 R6; design/lexdb-layers.md 6.3.Q8 R6): the conjuncts of
+// query level `level` that call a correlated subquery run per row (the
+// level's last ones, subsLast), evaluated by the caller (lexdb_exec, as
+// the row engine evaluates them: their subqueries run per outer row, the
+// results kept per outer values) for each row the joins give after that
+// level, before the next level's join. reads: the query's columns they
+// read.
+pub type PApply = record { pub level: int; pub reads: []int }
 
 // A table the pipeline reads (lexdb_pipe's scan). Its table and path stay
 // in the query's level (Query.levels: EXPLAIN and the row engine read
@@ -431,6 +443,10 @@ fn planUses(p: &PPlan, used: mut &[]bool) {
         PPlan.Having(i) { planUses(&i, used) }
         PPlan.Distinct(i, _, _) { planUses(&i, used) }
         PPlan.Match(i) { planUses(&i, used) }
+        PPlan.Apply(i, pa) {
+            planUses(&i, used)
+            for c in pa.reads { if c >= 0 && c < len(used) { used[c] = true } }
+        }
         else {}
     }
 }
@@ -453,6 +469,7 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Having(i) { return PPlan.Having(withNeeds(i, used)) }
         PPlan.Distinct(i, on, ks) { return PPlan.Distinct(withNeeds(i, used), on, ks) }
         PPlan.Match(i) { return PPlan.Match(withNeeds(i, used)) }
+        PPlan.Apply(i, pa) { return PPlan.Apply(withNeeds(i, used), pa) }
         PPlan.Levels(n, subs) { return PPlan.Levels(n, subs) }
         PPlan.Result(subs) { return PPlan.Result(subs) }
         PPlan.Func(n, o, subs) { return PPlan.Func(n, o, subs) }
@@ -517,6 +534,7 @@ pub const RUN_SEMI: int = 3         // a semi or anti join's (9.104): once, its 
 pub const RUN_LOOKED: int = 4       // not run: its table is a semi or anti level looked up per row (semiLook)
 pub const RUN_MARK: int = 5         // a mark join's (optimizer 50): once, its rows a level's hash, every outer row marked
 pub const RUN_GROUPED: int = 6      // a grouped level's (optimizer 51): once, grouped by its keys, its rows a level's hash (LEFT joined)
+pub const RUN_APPLY: int = 7        // RUN_PER_ROW in a plan the pipeline runs (Q8 R6): its Apply's (or, over groups, the caller's)
 
 // The subqueries of p's query: its leaf's.
 pub fn pSubs(p: &PPlan): &[]PSub {
@@ -538,6 +556,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.Lock(i) { return pSubs(&i) }
         PPlan.Limit(i, _, _, _) { return pSubs(&i) }
         PPlan.Match(i) { return pSubs(&i) }
+        PPlan.Apply(i, _) { return pSubs(&i) }
     }
 }
 
@@ -556,6 +575,7 @@ pub fn pLeaf(p: &PPlan): &PPlan {
         PPlan.Lock(i) { return pLeaf(&i) }
         PPlan.Limit(i, _, _, _) { return pLeaf(&i) }
         PPlan.Match(i) { return pLeaf(&i) }
+        PPlan.Apply(i, _) { return pLeaf(&i) }
         else { return p }
     }
 }
@@ -7287,6 +7307,7 @@ pub fn planX(x: &Expr, q: &Query): Option[BX] {
 // plan did not bind bound now (planX); None if one does not bind
 // (nothing moved).
 pub fn planConds(sel: mut &Sel): Option[[]BX] {
+    if sel.q.corr { return planCondsA(sel) }
     var more = match condsMore(&sel.q) {
         Some(x) { x }
         None { return None }
@@ -7466,6 +7487,7 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             for x in lv.cond {
                 // (a semi join's and a RIGHT JOIN's: every one, none applied as read)
                 if !rj && !lv.semi && q.minLevel(&x) >= k { continue }
+                if applied(q, &x) { continue }
                 if len(lv.hashCols) == 1 && isKeyEq(&x, q, lv) { j.keq = len(j.conds) }
                 match planX(&x, q) {
                     Some(b) { append(mut &j.conds, b) }
@@ -7502,6 +7524,7 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             }
             j.capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
             for x in lv.cond {
+                if applied(q, &x) { continue }
                 match planX(&x, q) {
                     Some(b) { append(mut &j.conds, b) }
                     None {
@@ -7512,6 +7535,7 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             }
         }
         for x in lv.post {
+            if applied(q, &x) { continue }
             match planX(&x, q) {
                 Some(b) { append(mut &j.post, b) }
                 None {
@@ -7792,15 +7816,16 @@ fn grpSafe(x: &Expr): bool {
 // Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
 // takes, and what this Sel must give it): streamed (no sort, grouping,
 // DISTINCT, window or set; an OFFSET its Limit skips, Q8 R2), sorted or
-// DISTINCT (P3), one table read per row, no correlated
-// subquery left in it (a correlated subquery's own query is one: its outer
-// values are parameters, Q8 R1), its outputs and conditions bound for the
-// plan.
+// DISTINCT (P3), one table read per row, no correlated subquery left in
+// it but in an Apply's conjuncts (applyLevel, Q8 R6; not under an OFFSET,
+// TOP PERCENT or WITH TIES, R2's shapes; a correlated subquery's own query
+// is one: its outer values are parameters, Q8 R1), its outputs and
+// conditions bound for the plan.
 pub fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
     // (TOP PERCENT and WITH TIES: the Sort's, Q8 R2)
     if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || ((sel.topMode != 0 || sel.withTies) && !sel.sort) || sel.first >= 0 { return false }
-    if len(q.levels) == 0 || q.corr || len(q.top) > 0 { return false }
+    if len(q.levels) == 0 || (q.corr && (applyLevel(q) < 0 || !applyR2(sel))) || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
     // keys and value, hashSub's, which runHashed reads; Q8 R1)
@@ -7881,6 +7906,23 @@ fn offsetShape(sel: &Sel): bool {
     if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
     return !hasSrfCall(&sel.exprs)
 }
+
+// Whether an Apply may run under sel's limit (Q8 R6 over R2's shapes): not
+// under an OFFSET, TOP PERCENT or WITH TIES, whose rows past the limit the
+// Apply's first-row asks were not built to count.
+fn applyR2(sel: &Sel): bool { return sel.offset <= 0 && sel.topMode == 0 && !sel.withTies }
+
+// ---- Apply (Q8 R6; design/lexdb-layers.md 6.3.Q8 R6): the correlated
+// subqueries left per row, run per row of the pipeline's joins
+//
+// A query whose correlated subqueries left per row (q.corr) are all called
+// in the WHERE conjuncts of one level is the pipeline's: the joins give
+// their rows after that level to an Apply (PPlan.Apply), whose conjuncts
+// the caller evaluates per row as the row engine does (evalX: the
+// subqueries run for the row's outer values, their results kept per
+// values, MEMO_MAX), and the rows that pass go on to the next level. The
+// conjuncts are the level's last (subsLast), so each row meets the
+// level's other conditions first, as in the row engine.
 
 // Whether sel's outputs, more than its select list's, are a hashed
 // subquery's keys and value (hashSub).
@@ -8061,7 +8103,8 @@ pub fn shapeWhy(sel: &Sel): str {
 fn queryWhy(sel: &Sel): str {
     let q = &sel.q
     if len(q.levels) == 0 { return "no FROM: " + resultWhy(sel) }
-    if q.corr { return "a correlated subquery left per row (q.corr)" }
+    if q.corr && applyLevel(q) < 0 { return "a correlated subquery left per row (q.corr): " + applyWhy(q) }
+    if q.corr && !applyR2(sel) { return "a correlated subquery left per row (q.corr): under an OFFSET, TOP PERCENT or WITH TIES" }
     if len(q.top) > 0 { return "conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
     if len(sel.exprs) == 0 || (len(sel.exprs) != len(sel.outs) && !hashedOuts(sel)) { return "outputs and columns differ" }
@@ -8078,7 +8121,9 @@ pub fn aggWhy(sel: &Sel): str {
     if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
-    if q.corr { return "agg: a correlated subquery left per row (q.corr)" }
+    if q.corr && applyLevel(q) < 0 { return "agg: a correlated subquery left per row (q.corr): " + applyWhy(q) }
+    if q.corr && aggCorr(sel) { return "agg: a correlated subquery in a key or argument" }
+    if q.corr && sel.first >= 0 { return "agg: a correlated subquery left per row under MIN or MAX by the scan's order" }
     if len(q.top) > 0 { return "agg: conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "agg: first level: " + levelWhy(q, &q.levels[0]) }
     if !boundOnce(q) { return "agg: conditions not bound once (boundOnce)" }
@@ -8179,8 +8224,9 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     // NULL; unplan drops the condition)
     if sel.first >= 0 { append(mut &cs, BX.IsNull(BX.Col(sel.first), true)) }
     var ps = scanArm(&sel.q, true)
-    // (over joins every table's columns are the plan's: lexdb_plan.needs)
-    if len(keys) == 0 && len(sel.q.levels) == 1 {
+    // (over joins every table's columns are the plan's: lexdb_plan.needs;
+    // an Apply's plan runs as joins, Q8 R6)
+    if len(keys) == 0 && len(sel.q.levels) == 1 && !sel.q.corr {
         ps.need = callsNeed(len(ps.need), &cs, &calls)
         ps.part = true
     }
@@ -8197,6 +8243,8 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
+    // (correlated subqueries left per row: an Apply's over the joins, Q8 R6)
+    if sel.q.corr { input = applyOver(&sel.q, replace(mut &input, PPlan.Result([]))) }
     let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds)}))
     return Some(physAbove(sel, agg))
 }
@@ -8209,8 +8257,10 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
     if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
-    // (a correlated subquery's own: its outer values are its parameters)
-    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
+    // (a correlated subquery's own: its outer values are its parameters;
+    // one left per row: an Apply's, Q8 R6, not in a key or argument, not
+    // under MIN/MAX by the scan's order, R2's MinMax)
+    if len(q.levels) == 0 || (q.corr && (applyLevel(q) < 0 || aggCorr(sel) || sel.first >= 0)) || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
     if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } } }
@@ -8230,6 +8280,7 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.MinMax(i) { unplan(sel, i) }
         // (a join's expressions were bound for the plan only)
         PPlan.Join(i, _) { unplan(sel, i) }
+        PPlan.Apply(i, _) { unplan(sel, i) }
         PPlan.Project(i, xs) {
             if len(xs) == 0 {
                 // a view: the Sel holds its outputs
@@ -8250,6 +8301,8 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
             if sel.first >= 0 && len(sel.q.levels) > 0 && len(v) > len(sel.q.levels[0].cond) { let gone = pop(mut &v) }
             var cc: []Option[BX] = []
             for k in 0..len(v) { append(mut &cc, unbound(replace(mut &v[k], BX.Const(Val.Null)), false)) }
+            // (an Apply's conjuncts, the level's last: bound by no plan)
+            while len(cc) < len(sel.q.levels[0].cond) { append(mut &cc, None) }
             sel.q.cc[0] = cc
         }
         else {}
@@ -8367,7 +8420,6 @@ fn afterCols(sel: &Sel, q: &Query): []int {
     return out
 }
 
-
 // ---- The row layout (design/lexdb.md 9.48, 9.50)
 //
 // A row: FIXED; its layout's number in its table's (Table.layouts), 2
@@ -8409,5 +8461,219 @@ fn srfIn(x: &Expr): bool {
         Expr.IsNull(a, _) { return srfIn(&a) }
         Expr.Cast(a, _) { return srfIn(&a) }
         else { return false }
+    }
+}
+
+// ---- Apply (Q8 R6; design/lexdb-layers.md 6.3.Q8 R6): the correlated subqueries left per row, run per row of
+// the pipeline's joins (the planner's side: the shape, the arm, the conditions left out of the joins' arms)
+
+// planConds of a query with an Apply (Q8 R6): its conjuncts left out (the
+// Apply's). (A function of its own: the test in planConds' loop cost a
+// point select's planning 42 instructions.)
+pub fn planCondsA(sel: mut &Sel): Option[[]BX] {
+    var more: []Option[BX] = []
+    for i in 0..len(sel.q.cc[0]) {
+        if sel.q.cc[0][i].isSome() || applied(&sel.q, &sel.q.levels[0].cond[i]) { continue }
+        let b = planX(&sel.q.levels[0].cond[i], &sel.q)
+        if b.isNone() { return None }
+        while len(more) < i { append(mut &more, None) }
+        append(mut &more, b)
+    }
+    var cc = replace(mut &sel.q.cc[0], [])
+    var cs: []BX = withCapacity(len(cc))
+    for i in 0..len(cc) {
+        if applied(&sel.q, &sel.q.levels[0].cond[i]) { continue }
+        match replace(mut &cc[i], None) {
+            Some(b) { append(mut &cs, b) }
+            None { append(mut &cs, replace(mut &more[i], None).unwrap()) }
+        }
+    }
+    return Some(cs)
+}
+
+// The level whose WHERE conjuncts hold every correlated subquery left per
+// row in q, or -1 (applyWhy says why).
+pub fn applyLevel(q: &Query): int {
+    if !q.corr || len(q.levels) == 0 || len(q.top) > 0 || hashedProbe(q) { return -1 }
+    var at = -1
+    for k in 0..len(q.levels) {
+        let lv = &q.levels[k]
+        if pathCorr(&lv.path) || lv.lateral || anyCorr(&lv.local) || anyCorr(&lv.hashVals) || (lv.resNot && hasCorr(&lv.resVal)) { return -1 }
+        let c = corrTail(&lv.cond)
+        let p = corrTail(&lv.post)
+        if c < 0 || p < 0 { return -1 }
+        if c == 0 && p == 0 { continue }
+        if at >= 0 || (c > 0 && p > 0) { return -1 }
+        // (not a semi, anti or mark level's, nor an outer join's ON)
+        if lv.semi || lv.anti || lv.mode != 0 || lv.semiSub >= 0 { return -1 }
+        if c > 0 && k > 0 && lv.join != lexdb_sql.J_INNER && lv.join != lexdb_sql.J_CROSS { return -1 }
+        at = k
+    }
+    // (not inside a build group, optimizer 49: its levels are one hash)
+    for k in 0..len(q.levels) { if q.levels[k].grp > 0 && at >= k && at <= k + q.levels[k].grp { return -1 } }
+    return at
+}
+
+pub fn applyWhy(q: &Query): str {
+    if len(q.top) > 0 { return "conditions on no table" }
+    if hashedProbe(q) { return "a hashed subquery's probe (9.9)" }
+    var n = 0
+    for k in 0..len(q.levels) {
+        let lv = &q.levels[k]
+        if pathCorr(&lv.path) { return "a path's key" }
+        if lv.lateral { return "LATERAL" }
+        if anyCorr(&lv.local) || anyCorr(&lv.hashVals) || (lv.resNot && hasCorr(&lv.resVal)) { return "a hash's key or build condition" }
+        if corrTail(&lv.cond) < 0 || corrTail(&lv.post) < 0 { return "not a level's last conjuncts" }
+        if corrTail(&lv.cond) > 0 || corrTail(&lv.post) > 0 {
+            n += 1
+            if lv.semi || lv.anti || lv.mode != 0 || lv.semiSub >= 0 { return "a semi, anti or mark level's" }
+            if corrTail(&lv.cond) > 0 && k > 0 && lv.join != lexdb_sql.J_INNER && lv.join != lexdb_sql.J_CROSS { return "an outer join's ON" }
+        }
+    }
+    if n > 1 { return "conjuncts of two levels" }
+    if n == 0 { return "not in WHERE" }
+    return "a build group's level"
+}
+
+// Whether q probes a correlated subquery run once into a hash (9.9's
+// hashSub, RUN_HASHED as subsOf says: not a semi, anti or mark level's
+// rows, not in FROM): the row engine's (its probe reads the hash).
+fn hashedProbe(q: &Query): bool {
+    for i in 0..len(q.subs) {
+        let sp = &q.subs[i]
+        if sp.hashed && !sp.semi && sp.use != lexdb_sql.SUB_FROM && len(sp.sel.q.refs) > 0 && subRuns(q, i) { return true }
+    }
+    return false
+}
+
+fn anyCorr(xs: &[]Expr): bool {
+    for x in xs { if hasCorr(&x) { return true } }
+    return false
+}
+
+// 0: no conjunct of xs calls a correlated subquery; 1: some do, and every
+// one after the first that does; -1 else.
+fn corrTail(xs: &[]Expr): int {
+    var seen = false
+    for x in xs {
+        if hasCorr(&x) { seen = true } else if seen { return -1 }
+    }
+    return if seen { 1 } else { 0 }
+}
+
+// Whether x is an Apply's conjunct, the plan's arms leave it out (q's
+// shape is an Apply's: pipeShape, aggShape).
+fn applied(q: &Query, x: &Expr): bool { return q.corr && hasCorr(x) }
+
+// Whether an aggregate's keys or calls read a correlated subquery (run
+// per row: the row engine keeps the rows, then groups them).
+fn aggCorr(sel: &Sel): bool {
+    if anyCorr(&sel.groupBy) { return true }
+    for sp in sel.specs {
+        if anyCorr(&sp.args) || anyCorr(&sp.order) { return true }
+        match sp.filter {
+            Some(f) { if hasCorr(&f) { return true } }
+            None {}
+        }
+    }
+    return false
+}
+
+// The Apply of q's correlated conjuncts at level k: the query's columns
+// they read.
+pub fn applyOf(q: &Query, k: int): PApply {
+    var reads: []int = []
+    for x in q.levels[k].cond { if hasCorr(&x) { colsRead(&x, &q.cols, mut &reads) } }
+    for x in q.levels[k].post { if hasCorr(&x) { colsRead(&x, &q.cols, mut &reads) } }
+    return PApply{level: k, reads: reads}
+}
+
+// The columns of cols x reads, as eval finds them (its slot, else by
+// name), added to out once each.
+fn colsRead(x: &Expr, cols: &[]lexdb_sql.ColDef, out: mut &[]int) {
+    match x {
+        Expr.Col(n, sl) {
+            let i = if sl >= 0 && sl < len(cols) && cols[sl].name == n { sl } else { lexdb_bind.colIndex(cols, &n) }
+            if i < 0 { return }
+            for r in out { if r == i { return } }
+            append(out, i)
+        }
+        Expr.Unary(_, a) { colsRead(&a, cols, out) }
+        Expr.Bin(_, a, b) {
+            colsRead(&a, cols, out)
+            colsRead(&b, cols, out)
+        }
+        Expr.IsNull(a, _) { colsRead(&a, cols, out) }
+        Expr.Cast(a, _) { colsRead(&a, cols, out) }
+        Expr.Call(_, args, _) { for c in args { colsRead(&c, cols, out) } }
+        else {}
+    }
+}
+
+// The level of p's Apply (under the views, the Project or the Agg), -1 none.
+pub fn applyAt(p: &PPlan): int {
+    match p {
+        PPlan.Apply(_, pa) { return pa.level }
+        PPlan.Limit(i, _, _, _) { return applyAt(&i) }
+        PPlan.Sort(i, _, _) { return applyAt(&i) }
+        PPlan.Distinct(i, _, _) { return applyAt(&i) }
+        PPlan.Project(i, _) { return applyAt(&i) }
+        PPlan.Having(i) { return applyAt(&i) }
+        PPlan.Match(i) { return applyAt(&i) }
+        PPlan.Agg(i, _, _) { return applyAt(&i) }
+        else { return -1 }
+    }
+}
+
+// input (the joins over Filter? (Scan)) under an Apply of q's correlated
+// conjuncts, if q has them, its scan's subqueries run per row the Apply's
+// (RUN_APPLY).
+pub fn applyOver(q: &Query, input: PPlan): PPlan {
+    let k = applyLevel(q)
+    return if k >= 0 { PPlan.Apply(applySubs(input), applyOf(q, k)) } else { input }
+}
+
+// sel's joins jp under an Apply if its query has one (applyOver).
+pub fn applyJoins(sel: &Sel, jp: mut &PPlan) { jp = applyOver(&sel.q, replace(jp, PPlan.Result([]))) }
+
+fn applySubs(p: PPlan): PPlan {
+    var arm = false
+    match p {
+        PPlan.Join(_, _) { arm = true }
+        PPlan.Filter(_, _) { arm = true }
+        PPlan.Scan(_, _) { arm = true }
+        else {}
+    }
+    if !arm { return p }
+    match move(p) {
+        PPlan.Join(i, j) { return PPlan.Join(applySubs(i), j) }
+        PPlan.Filter(i, cs) { return PPlan.Filter(applySubs(i), cs) }
+        PPlan.Scan(sc, subs) {
+            var out = subs
+            for i in 0..len(out) { if out[i].run == RUN_PER_ROW { out[i].run = RUN_APPLY } }
+            return PPlan.Scan(sc, out)
+        }
+        else { return PPlan.Result([]) }        // (not reached: the arms above)
+    }
+}
+
+// q's conditions bound for the plan with their constant operators made
+// constants (lexdb_bind.bxFold).
+pub fn foldConds(q: mut &Query) {
+    for k in 0..len(q.cc) {
+        for i in 0..len(q.cc[k]) {
+            match replace(mut &q.cc[k][i], None) {
+                Some(b) { q.cc[k][i] = Some(lexdb_bind.bxFold(b)) }
+                None {}
+            }
+        }
+    }
+    for k in 0..len(q.cp) {
+        for i in 0..len(q.cp[k]) {
+            match replace(mut &q.cp[k][i], None) {
+                Some(b) { q.cp[k][i] = Some(lexdb_bind.bxFold(b)) }
+                None {}
+            }
+        }
     }
 }

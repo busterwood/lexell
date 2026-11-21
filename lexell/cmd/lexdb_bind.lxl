@@ -16,6 +16,7 @@ import "./lexdb_sql"
 import "./lexdb_catalog"
 import "./lexdb_dialect"
 import "./lexdb_ops"
+import "./lexdb_time"
 import "./lexdb_lib"
 
 type Expr = lexdb_sql.Expr
@@ -2270,4 +2271,103 @@ pub fn renameCol(x: &Expr, from: &str, to: &str, slot: int): Expr {
         Expr.Cast(a, ty) { return Expr.Cast(renameCol(&a, from, to, slot), ty) }
         else { return lexdb_sql.cloneExpr(x) }
     }
+}
+
+// ---- constants made once (Q8 R6)
+
+// x with its operators of constants made constants where their value is
+// the same in every run and session (Q8 R6): a unary operator, an
+// arithmetic or comparison operator or a cast whose operands are
+// constants and whose evaluation reads no time zone (the zone's closure
+// not called) and gives no error. For a plan run many times (a correlated
+// subquery's: q20's date '1994-01-01' + interval '1 year' made once, not
+// per run by bCompile). A parameter, a column, a call or a subquery's
+// value is left as it is.
+pub fn bxFold(x: BX): BX {
+    var k = false
+    match x {
+        BX.Un(_, _) { k = true }
+        BX.Op(_, _, _) { k = true }
+        BX.Cast(_, _) { k = true }
+        BX.And(_, _) { k = true }
+        BX.Or(_, _) { k = true }
+        BX.IsNull(_, _) { k = true }
+        else {}
+    }
+    if !k { return x }
+    match move(x) {
+        BX.Un(u, a) {
+            let fa = bxFold(a)
+            match fa {
+                BX.Const(v) {
+                    match lexdb_ops.unaryVal(unText(u), &v) {
+                        Ok(r) { return BX.Const(r) }
+                        Err(_) { return BX.Un(u, BX.Const(v.clone())) }
+                    }
+                }
+                else { return BX.Un(u, fa) }
+            }
+        }
+        BX.Op(op, a, b) {
+            let fa = bxFold(a)
+            let fb = bxFold(b)
+            var zoned = false
+            var out: Option[Val] = None
+            match fa {
+                BX.Const(l) {
+                    match fb {
+                        BX.Const(r) {
+                            match lexdb_ops.binOp(op, l.clone(), r.clone(), fn(): lexdb_time.Zone {
+                                zoned = true
+                                return lexdb_time.utc().clone()
+                            }) {
+                                Ok(v) { if !zoned { out = Some(v) } }
+                                Err(_) {}
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            match out {
+                Some(v) { return BX.Const(v) }
+                None { return BX.Op(op, fa, fb) }
+            }
+        }
+        BX.Cast(a, t) {
+            let fa = bxFold(a)
+            var zoned = false
+            var out: Option[Val] = None
+            match fa {
+                BX.Const(v) {
+                    // (a text as an interval or a time: no zone read, coerceTime)
+                    let free = (t.kind == lexdb_sql.K_IVAL || t.kind == lexdb_sql.K_TIME) && lexdb_ops.kindOf(&v) == lexdb_sql.K_TEXT
+                    match lexdb_ops.castTo(v.clone(), &t, fn(): lexdb_time.Zone {
+                        zoned = true
+                        return lexdb_time.utc().clone()
+                    }) {
+                        Ok(r) { if free || !zoned { out = Some(r) } }
+                        Err(_) {}
+                    }
+                }
+                else {}
+            }
+            match out {
+                Some(v) { return BX.Const(v) }
+                None { return BX.Cast(fa, t) }
+            }
+        }
+        BX.And(a, b) { return BX.And(bxFold(a), bxFold(b)) }
+        BX.Or(a, b) { return BX.Or(bxFold(a), bxFold(b)) }
+        BX.IsNull(a, neg) { return BX.IsNull(bxFold(a), neg) }
+        else { return BX.Const(Val.Null) }      // (not reached: the arms above)
+    }
+}
+
+// A unary operator's text (lexdb_ops.UN_*), as unaryVal takes it.
+fn unText(u: int): &str {
+    if u == lexdb_ops.UN_NEG { return "-" }
+    if u == lexdb_ops.UN_BITNOT { return "~" }
+    return "not"
 }

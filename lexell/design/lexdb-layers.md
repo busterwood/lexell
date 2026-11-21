@@ -6903,6 +6903,190 @@ q8 -0.01%, q10 -0.003%, q13 +0.016%, q15 +0.005%: code placement. Faster
 by over 1.5%: q1 -2.1%, q18 -2.5%, q21 -1.5%, q16 -1.5%. R2's arms are
 not in TPC-H's 22 (their statements' plans did not change).
 
+### 6.3.Q8 R6 as built (2026-11-21)
+
+R6 of 6.5: Apply for RUN_PER_ROW. Branch `worktree-agent-ae36805e4cd1b098e`
+from main 757c4cee. `SET lexdb_batch = off` (the row engine, the tests'
+reference) is untouched, and no row-engine code was deleted: the per-row
+subquery runs (`fillCur`, `runSub`, the memo) are what the Apply calls.
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 757c4cee | | 19,838 | `lexdb_pipe` 7,553, `lexdb_plan` 8,301, `lexdb_bind` 2,256 |
+| f5eafcb1 | the Apply; `bxFold`, `foldConds`; `hasJoin`'s arms reordered; tests `exec_apply`, `tds_apply`, `tns_apply`; seven tests' counters | 19,935 | `lexdb_pipe` 7,732, `lexdb_plan` 8,545, `lexdb_bind` 2,354 |
+| 304c898b | a 9.9 hashed probe declined in the plan (`hashedProbe`), not by compile; the new code moved to its modules' ends (the point select's iTLB misses, below) | 19,933 | `lexdb_pipe` 7,734, `lexdb_plan` 8,558, `lexdb_bind` 2,356 |
+
+exec's +95 is the glue that needs a `Run` (`runApplyJ`, `pipeGroups`'
+ask, `applyTrue`, `applyCtx`, `budBack`) and `levelRows`, taken out of
+`runPipe` for both its callers.
+
+**What it does.** A query whose correlated subqueries left per row
+(`q.corr`) are all called in the WHERE conjuncts of one level is the
+pipeline's (`lexdb_plan.applyLevel`: that level's last conjuncts,
+`subsLast`; not in a path's key, a hash's value or build condition, an
+outer join's ON, a semi, anti or mark level, a build group's level,
+conditions on no table, a 9.9 hashed probe; for an aggregate not in a key
+or argument; `applyWhy` names the census's reason otherwise). Its plan is
+its joins (none or more) under a new arm `PPlan.Apply(input,
+PApply{level, reads})`, under the Project or the Agg, its scan's per-row
+subqueries `RUN_APPLY` (EXPLAIN prints them "per row", as before); the
+joins' arms leave the Apply's conjuncts out (`planCondsA`, `applied` in
+`joinsOver`).
+
+- **The pipe** (`lexdb_pipe`) runs every Apply plan as joins (`hasJoin`;
+  `runJ`, `runAggJ`; its first table may be read row by row, `joinOpsIn`).
+  `joinFrom`, entering the level after the Apply's (`JRun.apAt`), gives the
+  rows joined so far to its consumer as an ask (`applyFrom`: a batch of
+  the Apply's columns and one column more, `askOf`); the consumer
+  (`runJProj`'s, `aggJoin`'s) gives each row to `ask` and puts the places
+  of those that pass in that column (`askRows`); those rows are joined on.
+  The pipe never calls exec: `ask` is a closure parameter of `runJ`,
+  `runAggAny` and `runAggJ`, and the ask reaches the consumer through the
+  `out` closure the joins already pass down, so no other signature
+  changed.
+- **Exec**'s `ask` is `applyTrue`: the level's correlated conjuncts in
+  order through `evalX`, as the row engine's `allTrueX` evaluates them
+  (`fillCur`: each subquery of the conjunct run for the row's outer
+  values, eagerly, under a CASE too, the results kept per outer values in
+  the run's memo, MEMO_MAX; then the conjunct). So the same rows, errors,
+  subquery runs and cache hits: EXPLAIN ANALYZE's counts are the row
+  engine's (the rows the Apply drops are taken off its level's joined
+  count; `exec_apply` checks it). `runApplyJ` and `pipeGroups` give the
+  run's context the subqueries' values copied, not moved (`applyCtx`), and
+  the pipeline a copy of the run's budget, adding back what the
+  subqueries' runs held and ticked meanwhile (`budBack`).
+- **Order and errors.** The Apply's conjuncts are their level's last, so a
+  row meets the level's other conditions first, as in the row engine. A
+  chunk's rows are asked in order; an error (a subquery's, its outer
+  values', the conjunct's) goes back through the join, which joins the
+  chunk again row by row (a rows plan, `joinChunk`'s exact mode), each row
+  then asked alone before its later levels. Under a LIMIT that stops the
+  scan (the plan's, or an EXISTS's or a scalar subquery's cap) each first
+  row is joined and asked alone (`Apply.one`): no row past the limit is
+  asked. With an Apply no hash is cut by a later level's (`reduceHashes`),
+  and at the first level the first hash's key does not narrow the scan
+  (`pushCol`): no row the Apply would ask is dropped before it.
+- **Constants once.** A correlated subquery's conditions bound for the plan
+  have their constant operators folded once, at plan time
+  (`lexdb_bind.bxFold` from `lexdb_plan.foldConds`, `bindQuery`): a
+  unary, binary or cast over constants whose evaluation reads no time zone
+  (the zone's closure not called; a text cast to an interval or a time)
+  and gives no error. q20's `date '1994-01-01' + interval '1 year'` was
+  evaluated by `bCompile` per run (`parseIval`, `castTo`: about 3% of q20).
+- **Not taken** (the row engine's as before, under their reasons in 6.4):
+  a correlated subquery in the outputs or ORDER BY (the row engine
+  evaluates those after the scan, from its rows kept: their errors come
+  after the WHERE's), conjuncts of two levels, a hashed probe, LATERAL, a
+  path's key.
+
+**Measured.** Census (6.4's tool, the 257 tests of main, the three new
+ones' lines left out; TPC-H's 22 once through a census build):
+
+| engine | main 757c4cee | R6 |
+|---|---:|---:|
+| the pipeline's rows | 189,344 | 201,032 |
+| the pipeline's groups | 791,049 | 792,082 |
+| the row engine | 159,618 | 151,912 |
+| a write's rows found | 3,019 | 3,033 |
+| TPC-H, the row engine | 4 | 1 (`select 1`) |
+
+- R6's rows of 6.4 ("a correlated subquery left per row", 34,674 runs
+  at main with its "agg:" variant) now name why they stay (`applyWhy`):
+  LATERAL 20,189 (a function in FROM over outer values, nearly all one
+  statement, `select (select count(*) from big(t.v)) from t`: R3's), a
+  9.9 hashed probe 6,157, a path's key 157, a hash's key or build
+  condition 50, not in WHERE 20, conjuncts of two levels 9. The rest are
+  the pipeline's: its rows +11,688 runs, its groups +1,033; a recursive
+  CTE's working table +384 (correlated queries inside one now show that
+  reason first). Nothing else moved by more than 14 runs.
+- "a correlated subquery in the outputs or ORDER BY" (6,331 runs) is
+  unchanged: the row engine evaluates those after the scan (`late`), and
+  an Apply over the rows as they are read would move their errors before
+  the WHERE's of later rows.
+- TPC-H: q2's and q17's outer queries and q20's partsupp subquery are the
+  pipeline's; the row engine's one run left is a `select 1`.
+
+TPC-H (SF1, base 757c4cee and the branch, `-O`, alternated twice, one run
+each, `TPCH_REF` 1744ef99, `~/tpch-w/r6`; best of two, ms): with
+304c898b checksums equal on all 22, 11,929 against 12,030 ms (1.008);
+f5eafcb1 (before the
+code moved and `hashedProbe`) 12,109 against 11,999 (0.991). Over 1.5%
+in the final round: q15 +4.9%, q9 +3.1%, q13 +1.8%, q16 +1.7%, all with
+the server's instructions equal (`iq.sh`: q9 15,679.7M against 15,679.4M,
+q13 4,878.7M / 4,877.4M, q15 4,022.6M / 4,022.6M, q16 2,220.6M /
+2,220.1M) and their slow runs the branch's second round (q15 728 against
+656, q18 764 against 717, q19 112 against 95); in f5eafcb1's rounds q9,
+q15 and q16 were 0.975, 1.006 and 0.991 (q13 1.042, again at equal
+instructions). Warm (`qtq.sh`, a first round) q9 1,504 -> 1,488 ms, q13
+655 -> 647, q16 202 -> 203.
+
+| query | main | R6 | | PostgreSQL, one core | server instructions (`iq.sh`) |
+|---|---:|---:|---:|---:|---|
+| q2 | 48.9 | 41.8 | 0.855 | 167 | 383.98M -> 363.50M (-5.3%) |
+| q17 | 34.7 | 28.5 | 0.821 | 564 | 246.60M -> 154.67M (-37.3%) |
+| q20 | 284.3 | 280.4 | 0.986 | 133 | 1,751.0M -> 1,671.0M (-4.6%) |
+
+Warm medians (`qt.sh`: a warm server, each query 7 times, two alternated
+rounds): q2 39.7 -> 35.0 ms, q17 28.8 -> 24.3, q20 234.0 -> 216.7.
+
+**q20's runs, measured** (a profile of 10 warm runs, `LXL_NATIVE_MAP`):
+the 8,508 runs are 81% of q20; inside them the 63,832 lineitem rows by
+primary key (`getManyIn` 47%, its `fingerTo` 17%) and the index ranges
+(`scanLeaves` 8.5%); the per-run setup about 25% (exec's `runChild`,
+`execSelIn`, `prepareIn` 4%, `pipeSrcQ` and `pathScans` 3%, `bCompileD`
+2.8% after the fold, from 4.9, the aggregate's state 2.6%, allocation
+5%). R6's instructions are 4.7% fewer, its time about level: the rows by
+key, each from a different leaf of lineitem's tree, are the cost. Batching
+them (a chunk's distinct outer values run as one grouped read of the
+index's ranges, their rows read in key order across the chunk) is the
+batched dependent join of 6.1's table; not built: none of today's paths
+reads them so (a lookup list of 2,127 parts plans a full scan, past
+`inMax`; the join by the index, 51.7, is 336 ms against 205 for the runs,
+its rows read per outer row), and with the keys sorted per chunk of
+~1,000 runs (~7,600 rows of 6M) each row is still in its own leaf (about
+790 rows apart), so what it saves is the finger's descent above the
+leaves (part of `fingerTo`'s 17%), not the leaf reads; the per-run setup
+(~25%) it would save too. The gap to PostgreSQL's 133 ms stays the rows'
+reads and the setup.
+
+**Gates.** Suite 260 of 260 (new: `exec_apply` 36 queries with unnesting
+off, each with batches on and off, the same rows or error: 32 through the
+Apply, a hashed probe's and the three that stay the row engine's (outputs,
+two levels, ORDER BY) not; EXPLAIN ANALYZE's counts as the row engine's;
+`tds_apply` 13 T-SQL batches with SQL Server 2022's answers, all 13
+through the Apply;
+`tns_apply` 13 statements with Oracle Database 23ai Free's answers, the
+`lxl-oracle` container, all 13 through the Apply). Expectations changed
+(counters only, the same rows): `exec_sub` (EXPLAIN ANALYZE's
+"batches 1"), `exec_subrows`, `exec_unnest`, `exec_unnest_agg`,
+`exec_narrow`, `exec_semijoin`, `tds_unnest`, `tns_unnest` (more queries
+piped).
+
+Point selects, single-row INSERT, UPDATE by key (in process,
+`LXL_HASH_SEED=1`, the 1-statement run subtracted from the 20,001 one,
+alternated twice): point select 130,370.5 -> 130,366.6
+(-4.0), INSERT VALUES of one row 94,864.0 -> 94,864.0, UPDATE ... WHERE
+id = k 131,207.0 -> 131,207.0. On the way: a test for the Apply in
+`planConds`' loop cost a point select 42 instructions (a function of its
+own, `planCondsA`), the Apply's arm in `opsOf` and `hasJoin` and the
+`q.corr` tests 19 more; `hasJoin`'s arms reordered (Scan, Project and
+Filter first: they are compared in order) paid them back.
+
+Over the wire: f5eafcb1 read `pts.sh` +5.6% server CPU (665.7 -> 702.9
+ms, means of 15) at the same instructions (`icount.sh`: 187,134 / 187,008 against 187,083 / 186,980 a
+statement), cycles +3.5% / +2.6%, with iTLB misses 46 -> 145 a statement
+(L1 i-cache misses 409 -> 320, branch misses 423 -> 409): the new code in
+the middle of the modules spread the point select's path over more pages.
+With it moved to the modules' ends (304c898b): `icount.sh` instructions
+186,971 against 187,077 a statement (within its ~100), cycles 106,650 against 104,639, iTLB misses 105 against
+38 (the base's own vary from 46 to 105 between server starts), i-cache
+misses 360 against 324; `pts.sh` (points.sql, three rounds, server CPU
+ms, means of 15): 715.1 -> 692.7 (-3.1%), wall 773.5 -> 749.7.
+
+**Merged with R2** (main 3b462107): the Apply is not taken under R2's OFFSET, TOP PERCENT or WITH TIES (`applyR2`), nor under MIN/MAX by the scan's order (`aggShape`): each stops early, and the Apply's first-row asks (`Apply.one`) were built for a plain LIMIT; such queries stay the row engine's, as before both.
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -6992,7 +7176,7 @@ times out under the census's writes, a line a run):
 | a subquery's own rows (IN, EXISTS, a scalar's, a semi, anti or mark level's: `pipeSelIn(sel, false)`), INSERT ... SELECT's rows: 1,980 statements (129 tests) for that alone, 1,633 (32 tests, 138,873 runs) correlated per row as well | 3,360 | 135 | 151,021 | q16's `ps_suppkey not in (select s_suppkey from supplier where ...)`; per row: `exists (select 1 from f where f.xf = tn.k)` | offer their rows (`rows` true): `runChild`'s `execSel` already takes `pipeHeld`; the per-row ones need Apply as well (below). **Done, R1 (6.3.Q8 R1): the reason is gone; the per-row ones' own rows are offered too (the pipeline cheaper a run); 13,208 of their runs are the row engine's under their next reason** | small (a switch, measured per run: q20's 8,508) |
 | a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
 | no FROM (`runQuery` with no level) | 814 | 116 | 42,808 | `select nextval('s')`, `select 1` | a Result arm: one row, its outputs by `bxEval` | small; a driver's `select 1` is point-select-like: OLTP gate |
-| a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59; offered by R1, gone) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo | large |
+| a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59; offered by R1, gone) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo. **R6 (6.3.Q8 R6): those in one level's WHERE conjuncts are the pipeline's (the Apply; q2, q17, q20's partsupp query); left: LATERAL (R3), a 9.9 hashed probe, a path's key, two levels** | large |
 | a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) | medium (`execSrf` 172 lines) |
 | not offered to the pipeline (a write's subqueries: RETURNING, SET, WHERE) | 274 | 21 | 800 | `delete from fp returning id, (select count(*) from fc)` | `pipeSel` for a write's subqueries. **Done, R1: 6 runs left (six `exec_unnest` IN subqueries, not traced)** | small |
 | MIN or MAX by the scan's order (`Sel.first`) | 245 | 17 | 10,661 | `select max(c) from f` (an index on c) | a first-row aggregate over an ordered scan that stops | small |
@@ -7033,6 +7217,16 @@ correlated per row (R6) 34,674, windows 6,572, a correlated subquery in
 the outputs 6,331, a join's first table not read in batches 6,085, a
 function in FROM 2,269, outputs and conditions that do not bind 721,
 MATCH_RECOGNIZE 473 (6.3.Q8 R2's "Left").
+
+**After R6** (6.3.Q8 R6; main 757c4cee against the branch, the 257 tests
+of main): the row engine's runs with batches on 159,618 -> 151,912, the
+pipeline's rows 189,344 -> 201,032, its groups 791,049 -> 792,082. "A
+correlated subquery left per row" (34,674 runs with its "agg:" variant)
+is the pipeline's where its subqueries are all in one level's WHERE
+conjuncts (the Apply); what stays names its reason: LATERAL 20,189 (a
+function in FROM over outer values: R3), a 9.9 hashed probe 6,157, a
+path's key 157, others 79. "One in the outputs or ORDER BY" (6,331) is
+unchanged. TPC-H's row-engine runs 4 -> 1 (a `select 1`).
 
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
@@ -7083,7 +7277,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R3 | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop` | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
 | R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
-| R6 | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
+| R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
 | R7 | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait) | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
 | R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
 | R9 | the deletion: `runQuery` and below (`runRows`, `runLevel`, `materialize`, `batchLevel`, `bLevelPlan`, `winBatch`, `fillPick`), `execSelIn`'s row branches, `addToGroup`, `sortOutRows`, `eachRowBIn`'s row path, `runSub`/`fillCur`'s per-row machinery, the levels program for the row engine (`Query.jp`, `levelsProg`), `Run`'s row-engine fields; `SET lexdb_batch` | (the census: no row-engine run with batches on, suite, TPC-H, OLTP) | the oracle in place first (below); the suite; TPC-H; OLTP | about 3,000 lines out of exec (the row engine proper: `materialize` to `runRows` 640, the subquery runs 600, `execSelIn`'s row branches 300, windows 260, `batchLevel` and its plan 300, `execSrf` 170, the row aggregates and sort 250, `eachRowBIn`'s and `outRow` 150; some of it moves into operators rather than going) |
