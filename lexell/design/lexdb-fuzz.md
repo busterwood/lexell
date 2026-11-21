@@ -168,6 +168,33 @@ with 16 decimals where PostgreSQL gives 36 (w0-0428), a 200,000-row cross
 join reported different whose reduction stopped (w0-0697; the same rows
 shown, also on 11c4e049), and a statement timeout like H1 (w0-0981).
 
+**W3, W4 and W5 fixed (2026-11-21, on 18321855; each note below).** These
+are the three wrong results above: W4 was lexdb's (numeric division's
+scale), W3 and W5 the fuzzer's (a nondeterministic query; a comparison of
+truncated results). `repro --pg`: w0-0428, every configuration
+PostgreSQL's 36 places; w0-0697, every configuration and PostgreSQL 205,200
+rows (the first 200,000 kept); w0-0257 as stored still pairs the two
+windows' values differently from PostgreSQL in every configuration, as it
+may (the generator no longer writes it). A 329 s run with the same seed (1
+worker, `--seed 1`, all checks, ~/tpch-w/fuzz/fz2run: 95 seeds, 14,182
+queries, 8,332 TLP and 9,039 NoREC forms) found none of the three again.
+Besides the gaps G1-G5 and H1-like timeouts (w0-0979) it reported, new and
+not chased:
+- w0-1774 (pg, wrong): `case when true then c else cast(null as text) end`
+  over a char(3) `c` is of type character in lexdb, so `''` shows as three
+  blanks; PostgreSQL resolves it to text and drops the padding (main too).
+- w0-1920 (batch, hang): batches give 0 rows; the row engine times out at
+  5 s on a CTE cross-joined with LATERAL and a FULL JOIN (speed, not rows).
+- Errors by evaluation order, integer only: `1 % 0` over an empty table
+  (PostgreSQL folds it and fails, lexdb returns no rows: w0-1465);
+  `1 / (1 % nullif(1, 0))` in a subquery under `case when false` (lexdb
+  fails 22012, PostgreSQL never runs it: w0-1627); bigint overflow in a join
+  or WHERE condition that one plan reaches and another does not (rules,
+  alt, noidx: w0-1483..1485; on, w0-0218 as in the first run).
+- w0-0421 (pg, a-error): `1.5 / nullif(1.5 / nullif(bigint, 0), 0)` failed
+  22003 with W4's first version (19 integer digits at 36 places); W4 now
+  keeps the places that fit (its note), and `repro --pg` agrees.
+
 ### W1. `a, b RIGHT/FULL JOIN c` joins the whole comma list (pg; 17 reduced cases)
 
 ```sql
@@ -311,6 +338,121 @@ keys already matched nothing (`keyVal`). `lexdb_ops.boundInto` now takes a
 bound past the type's range as past every row's: on the rows' side (a lower
 bound below them, an upper one above) it bounds nothing, else the range is
 empty.
+
+### W3. `row_number()` repeats within a partition over a cross join with LATERAL (pg; w0-0257)
+
+```sql
+create table t1 (b0 date, b1 bool);
+create table t2 (c0 bigint primary key, c1 text, c2 int);
+insert into t1 values ('2024-02-29', false), ('2024-01-09', false);
+insert into t2 values (29, 'b', 8), (35, 'a_c', 2);
+select sum(1.5) over (partition by q1.b0, q12.c2 order by q1.b0, q1.b1, l2.x10, l2.x11, q12.c0, q12.c1, q12.c2
+                      rows between 1 preceding and current row) as x13,
+       row_number() over (partition by q12.c0, l2.x10 order by q1.b0, q1.b1, l2.x10, l2.x11, q12.c0, q12.c1, q12.c2) as x14
+from t1 as q1 cross join lateral (select 'a' as x10, 1.5 as x11 from (select 1.5 as x8 from t1 as q4) as d3) as l2, t2 as q12;
+-- lexdb: (1.5,3) (1.5,3) (3.0,4) (3.0,4) (1.5,1) (1.5,1) (3.0,2) (3.0,2); PostgreSQL: x14 1-4 with x13 alternating
+```
+
+**Fixed (e9a9b596): the fuzzer's, not lexdb's.** The repeats are across
+partitions (x14 does not show its partition): lexdb numbers each partition
+1-4, as PostgreSQL does. The two LATERAL rows are equal, so each (q1, q12)
+pair gives two rows that tie in both windows' orders, and the two windows
+pair their values with those rows independently: sum's 1.5 may go with
+row_number's 3 or its 4. Both answers are right. The original query
+(t1 with a duplicate row, a LATERAL of 96 rows showing two of their
+columns) had the same ties; counted by peers (partition and order keys:
+count, min and max of row_number, the sums' multiset) lexdb, batches on and
+off, gives PostgreSQL's answer on main 18321855. The generator ordered the
+order-dependent functions (row_number, ntile, lag, lead, first_value, the
+ROWS sum) by every column in scope but the floats. It now orders them by
+every column, floats included, so rows tied in that order are equal in every
+column the query can show and one such function has one answer; and a select
+list gets at most one of them (a second one is left out). exec_fuzzfix2 has
+the case, counted by peers, and row_number, rank, dense_rank, lag, lead,
+running and ROWS sums, ntile, first_value, min and max over cross joins with
+LATERAL (one that reads the outer row, one with a window inside, a comma
+after it, LEFT JOIN LATERAL with no rows, an empty side, identical rows,
+text keys), against PostgreSQL 18: lexdb agreed before and after.
+
+### W4. Numeric division's result scale (pg; w0-0428)
+
+```sql
+create table t0 (a1 bigint);
+insert into t0 values (9223372036854775807);
+select 1.5 / nullif(a1, 0) from t0;
+-- lexdb: 0.0000000000000000; PostgreSQL: 0.000000000000000000162630325872825665
+```
+
+**Fixed (ae659853).** Cause: lexdb divided numerics at max(16, either
+operand's display scale), rounding half to even. PostgreSQL's
+`select_div_scale` (numeric.c) works in its base-10000 digits: the
+quotient's weight is estimated as weight(a) - weight(b), one less when a's
+first digit is not above b's; the scale is 16 - 4 * that weight, at least
+either display scale, within 0..1000; `div_var` rounds half away from zero.
+So a quotient below 1 gets more places (36 above), one of several digits
+fewer (`99999999999999999999 / 0.01` has 2), and one whose integer part is
+long fits where 16 places overflowed 38 digits
+(`123456789012345678901234567890.5 / 3`). Where PostgreSQL's scale needs
+more than lexdb's 38 digits (`1.5 / (1.5 / 9223372036854775807)`: 19 integer
+digits and 36 places; the run below found it as w0-0421), the quotient has
+as many places as fit, as a product's display scale is capped, not 22003.
+`lexdb_ops.divScale` computes the scale;
+`arith`'s OP_DIV, the one numeric division of both evaluators (eval and the
+batches' bxEval: the typed kernels do not divide numerics), of avg and of the
+variances, uses it with HALF_AWAY. As PostgreSQL's
+`numeric_stddev_internal`, a standard deviation is now the square root at
+the variance's scale (16 places before) and a numerator at or below zero
+gives 0 (`0.00...` before). Checked against PostgreSQL 18: exec_fuzzfix2
+(numeric / bigint, int / numeric, numeric / numeric, int / int, through
+nullif and casts, in expressions, WHERE and ORDER BY; ties; zero dividends;
+long and short quotients; avg, by group, empty; the variances and standard
+deviations; window avg; NULLs, division by zero), batches on and off, and
+a random comparison (40 seeds of 300 rows, 15 division expressions, the
+aggregates and window avg and stddev, batches on and off: equal).
+exec_agg's avg of one value and variance and stddev of numeric(6,2) changed
+to PostgreSQL's text. The doors: T-SQL's typed division and AVG (`#tdiv`,
+`#tavg`, SQL Server's scales) and Oracle's (`#ora_div`) are not this path and
+are unchanged; a T-SQL `/` whose precision lexdb_bind does not know (not a
+literal, column, cast or parameter) and its AVG of such a value still fall
+to this path and now get PostgreSQL's scale (neither is SQL Server's).
+TPC-H (SF1, alternated twice with main 18321855, ~/tpch-w/fz2): the
+text of q1, q8 and q17 changed and now has PostgreSQL's checksum (they were
+the three "different result" queries; all 22 agree now). q1's avg_price
+has 12 places (16 before: a sum of weight 2 over a count of weight 1) and
+avg_disc 20, q8's mkt_share 20, q17's avg_yearly 12 (a sum of weight 1 over
+7.0); q1's avg_qty and q14 and q22 are as they were. No query slower (total
+0.997 of main, and a third run of the final binary 0.996); q13's +2.4% has
+main's instructions (code placement). Point selects, single-row INSERT and
+UPDATE by key, in process with LXL_HASH_SEED=1: main's instructions per
+statement within one instruction.
+
+Not changed, seen while checking: a quotient whose integer part has more
+than 38 digits is out of lexdb's range (22003 where PostgreSQL has a value,
+as before); a product's display scale is capped at 38 minus its integer
+digits (Decimal.mulExact), so `a / b * 2` with a quotient of more than 38
+places shows fewer trailing zeros than PostgreSQL (the same value); and
+`sum` and `avg` of bigint fail "bigint out of range" past 2^63 where
+PostgreSQL sums in numeric.
+
+### W5. A 200,000-row result reported as different (pg; w0-0697)
+
+```sql
+select q1.c5 as x12 from t2 as q1,
+  (select 1 as x11 from (select 1.5 as x7 from t0 as q4, t2 as q5 join t0 as q6 on (q5.c4 = q6.a2)) as d3,
+                        t0 as q8 cross join t1 as q9) as d2;
+-- 205,200 rows in lexdb and in PostgreSQL; reported "wrong"; the reduction did not end
+```
+
+**Fixed (318ee2ec): the fuzzer's.** `Conn.query` keeps the first 200,000
+rows, each server in its own order, and `compare` took the two prefixes of
+an unordered result as multisets: they hold different rows of two equal
+results. The reduction kept every candidate with more than 200,000 rows,
+since all of them "differed". `Res` now has the count the server sent
+(`total`; `truncated()`); `compare` reports different counts, compares an
+ordered result's prefixes, and an unordered truncated one by its count only.
+repro shows "205200 rows (the first 200000 kept)" for every configuration
+and PostgreSQL; grouped by value (`x12, x13, count(*)`), the original
+query's rows are PostgreSQL's.
 
 ### H1. A 5 s statement timeout (on; probably only slow, not checked against PostgreSQL)
 
