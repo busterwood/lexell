@@ -8152,16 +8152,17 @@ pub fn plainSrc(src: &Src): bool { return src.batch && len(src.keys) == 0 && len
 // Join runs by the point path (the tests' look).
 pub fn pointJoinRuns(): int { return pointJRuns }
 
-// Whether p (a plan compileP takes, its first table read by its whole
-// primary key) is a join over a point the point path runs.
-pub fn pointJoins(p: &lexdb_plan.PPlan): bool {
+// Whether p (a plan compileP takes; point: its first table read by its
+// whole primary key, no subquery) is a join the point path runs: over a
+// point, or under a first table that stops early.
+pub fn pointJoins(p: &lexdb_plan.PPlan, point: bool): bool {
     match p {
-        lexdb_plan.PPlan.Limit(i, _, _, off) { return off <= 0 && pointJoins(&i) }
-        lexdb_plan.PPlan.Sort(i, _, _) { return pointJoins(&i) }
-        lexdb_plan.PPlan.Distinct(i, _, _) { return pointJoins(&i) }
+        lexdb_plan.PPlan.Limit(i, _, _, off) { return off <= 0 && pointJoins(&i, point) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return pointJoins(&i, point) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return pointJoins(&i, point) }
         lexdb_plan.PPlan.Project(i, _) {
             match i {
-                lexdb_plan.PPlan.Join(_, _) { return lookJoins(&i) }
+                lexdb_plan.PPlan.Join(_, _) { return lookJoins(&i, point) }
                 else { return false }
             }
         }
@@ -8169,41 +8170,38 @@ pub fn pointJoins(p: &lexdb_plan.PPlan): bool {
     }
 }
 
-fn lookJoins(p: &lexdb_plan.PPlan): bool {
+fn lookJoins(p: &lexdb_plan.PPlan, point: bool): bool {
     match p {
         lexdb_plan.PPlan.Join(i, j) {
             if j.how != lexdb_plan.JH_LOOK || j.mark != lexdb_plan.MK_JOIN || j.resCol >= 0 || len(j.build) > 0 { return false }
             if j.kind != lexdb_sql.J_INNER && j.kind != lexdb_sql.J_LEFT { return false }
-            return lookJoins(&i)
+            return lookJoins(&i, point)
         }
-        lexdb_plan.PPlan.Filter(i, _) { return lookJoins(&i) }
+        lexdb_plan.PPlan.Filter(i, _) { return lookJoins(&i, point) }
         // (read by its whole primary key, or a first table that stops early:
         // lexdb_exec.pipeFetchJ decides which at the run)
-        lexdb_plan.PPlan.Scan(sc, subs) { return sc.held < 0 && (!sc.batch || sc.stops) && sc.level == 0 && len(subs) == 0 }
+        lexdb_plan.PPlan.Scan(sc, subs) { return sc.held < 0 && ((point && !sc.batch) || sc.stops) && sc.level == 0 && len(subs) == 0 }
         else { return false }
     }
 }
 
-// p with its tables' columns read (lexdb_plan.needs); a join over a point
-// (point: its first table read by its whole primary key) as it is: its
+// p with its tables' columns read (lexdb_plan.needs); a join the point
+// path runs (pointJoins: PR_POINTJ; point as compileP's) as it is: its
 // rows read whole, as the row engine reads them.
 fn needsOf(p: lexdb_plan.PPlan, n: int, point: bool, how: mut &int): lexdb_plan.PPlan {
-    if pointJoins(&p) {
-        how = lexdb_plan.PR_POINTJ
+    if pointJoins(&p, point) {
+        how = if point { lexdb_plan.PR_POINTJ } else { lexdb_plan.PR_STOPJ }
         return p
     }
     return lexdb_plan.needs(p, n)
 }
 
 // Runs a join over a point (pointJoins) from its first table's scan s
-// (one point, or none), or (src's scans not empty) a join under a first
-// table that stops early read as srcs' one says (its batches, an index's
-// read alone where it covers the table's columns), each row joined before
-// the next: at most cap rows. None: s is neither a point nor empty.
+// (one point, or none): at most cap rows. None: s is neither.
 pub fn runPointJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
-                 s: &lexdb_access.Scan, srcs: &[]Src, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+                 s: &lexdb_access.Scan, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
                  give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
-    if len(srcs) == 0 && !s.point && !s.empty { return Ok(None) }
+    if !s.point && !s.empty { return Ok(None) }
     runs += 1
     joinRuns += 1
     pointJRuns += 1
@@ -8211,18 +8209,61 @@ pub fn runPointJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     if pg.sorts {
         // its rows held by the Sort or Distinct, then given (slice P3)
         var srt = SortRun{st: [sortRun(&pg.plan, cap, bud)]}
-        let got = try pointJProj(st, txn, projUnder(&pg.plan), pg.ops, cols, tabs, s, srcs, cx, -1, bud, cnt, mut &srt, give)
+        let got = try pointJProj(st, txn, projUnder(&pg.plan), pg.ops, cols, tabs, s, cx, -1, bud, cnt, mut &srt, give)
         sortRuns += 1
         return Ok(Some(try srt.st[0].finish(txn, bud, give)))
     }
     var lim = cap
     limitOf(&pg.plan, mut &lim)
     var none = noSortRun()
-    return Ok(Some(try pointJProj(st, txn, projOf2(&pg.plan), pg.ops, cols, tabs, s, srcs, cx, lim, bud, cnt, mut &none, give)))
+    return Ok(Some(try pointJProj(st, txn, projOf2(&pg.plan), pg.ops, cols, tabs, s, cx, lim, bud, cnt, mut &none, give)))
+}
+
+// Runs a join the point path takes under a first table that stops early
+// (pointJoins; no Sort, no Distinct), the first table read as src says
+// (its batches, an index's read alone where it covers the table's
+// columns), each row joined before the next: at most cap rows.
+pub fn runStopJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
+                src: &Src, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+                give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
+    if pg.sorts { return Ok(None) }
+    runs += 1
+    joinRuns += 1
+    pointJRuns += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    var lim = cap
+    limitOf(&pg.plan, mut &lim)
+    var none = noSortRun()
+    match projOf2(&pg.plan) {
+        lexdb_plan.PPlan.Project(top, xs) {
+            let n = joinDepth(&top)
+            let bottom = joinBottom(&top)
+            let noX: []BX = []
+            let conds = match bottom {
+                lexdb_plan.PPlan.Filter(_, cs) { &cs }
+                else { &noX }
+            }
+            let sc0 = match bottom {
+                lexdb_plan.PPlan.Filter(i, _) {
+                    match i {
+                        lexdb_plan.PPlan.Scan(s1, _) { &s1 }
+                        else { return Err(e("XX000", "a join plan without its scan")) }
+                    }
+                }
+                lexdb_plan.PPlan.Scan(s1, _) { &s1 }
+                else { return Err(e("XX000", "a join plan without its scan")) }
+            }
+            cnt[0].starts += 1
+            if lim == 0 { return Ok(Some(0)) }
+            let rel = lexdb_catalog.relOf(tabs[0])
+            return Ok(Some(try stopRows(st, txn, &top, n, &rel, sc0, conds, src, tabs, &xs, cols, cx, lim, pg.ops, bud, cnt, mut &none, give)))
+        }
+        else { return Err(e("XX000", "the pipeline was given a plan it does not run")) }
+    }
 }
 
 fn pointJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pr: &lexdb_plan.PPlan, ops: int, cols: &[]lexdb_sql.ColDef,
-              tabs: &[]&lexdb_catalog.Table, s: &lexdb_access.Scan, srcs: &[]Src, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+              tabs: &[]&lexdb_catalog.Table, s: &lexdb_access.Scan, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
               srt: mut &SortRun, give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     match pr {
         lexdb_plan.PPlan.Project(top, xs) {
@@ -8246,10 +8287,9 @@ fn pointJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pr: &lexdb_plan
             }
             cnt[0].starts += 1
             if lim == 0 { return Ok(0) }
-            let rel = lexdb_catalog.relOf(tabs[0])
-            if len(srcs) > 0 { return stopRows(st, txn, &top, n, &rel, sc0, conds, &srcs[0], tabs, &xs, cols, cx, lim, ops, bud, cnt, srt, give) }
             if s.empty { return Ok(0) }
             // (its point's row, as fetch reads one)
+            let rel = lexdb_catalog.relOf(tabs[0])
             let all: []bool = []
             var r = match try lexdb_access.getRow(st, txn, &rel, &lexdb_access.rowRead(&rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
                 Some(x) { x }
