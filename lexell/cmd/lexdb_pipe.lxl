@@ -2038,8 +2038,9 @@ var runs: int = 0
 var batchRuns: int = 0
 
 var sortRuns: int = 0
+var pointRuns: int = 0          // of them a point select's (runPoint)
 
-pub fn runCounts(): []int { return [runs, batchRuns, sortRuns] }
+pub fn runCounts(): []int { return [runs, batchRuns, sortRuns, pointRuns] }
 
 // Runs whose first table is rows the run holds (Src.held), and those read
 // in batches (the tests' look).
@@ -2441,6 +2442,66 @@ fn grpHas(p: &lexdb_plan.PPlan, k: int): bool {
         lexdb_plan.PPlan.Scan(sc, _) { return sc.level == k }
         else { return false }
     }
+}
+
+// A point select's run (exec's pipeFetch; lexdb_plan.pointRead), the
+// Fetch -> Project of design/lexdb-layers.md 7: the plan's scan of one key
+// s, as run runs it with srcOf's Src for it (runScan's row path for a
+// point: the row read, its conditions in order and its outputs by the
+// scalar evaluator, counted as run counts them), without run's sources,
+// operators and sort. None: a plan of another shape (a Sort or Distinct,
+// a scan that reads batches or held rows, not one point): run runs it.
+pub fn runPoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                s: &lexdb_access.Scan, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+                give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
+    if pg.sorts || (!s.point && !s.empty) { return Ok(None) }
+    return pointOp(st, txn, &pg.plan, pg.ops, cols, t, s, cx, cap, bud, cnt, give)
+}
+
+fn pointOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, ops: int, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+           s: &lexdb_access.Scan, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+           give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
+    let none: []BX = []
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, n, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give) }
+        // (the scan's order: nothing to do, as runOp)
+        lexdb_plan.PPlan.Sort(i, _, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, lim, bud, cnt, give) }
+        lexdb_plan.PPlan.Project(j, xs) {
+            match j {
+                lexdb_plan.PPlan.Filter(k, cs) {
+                    match k {
+                        lexdb_plan.PPlan.Scan(sc, _) { if sc.held < 0 && !sc.batch { return Ok(Some(try pointScan(st, txn, &sc, &cs, &xs, ops, cols, t, s, cx, lim, bud, cnt, give))) } }
+                        else {}
+                    }
+                }
+                lexdb_plan.PPlan.Scan(sc, _) { if sc.held < 0 && !sc.batch { return Ok(Some(try pointScan(st, txn, &sc, &none, &xs, ops, cols, t, s, cx, lim, bud, cnt, give))) } }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Ok(None)
+}
+
+fn pointScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, xs: &[]BX, ops: int,
+             cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, s: &lexdb_access.Scan, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts,
+             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    runs += 1
+    pointRuns += 1
+    while len(cnt) < ops { append(cnt, noCounts()) }
+    cnt[0].starts += 1
+    if lim == 0 { return Ok(0) }
+    let rel = lexdb_catalog.relOf(t)
+    var need: []bool = []
+    if sc.part { for x in sc.need { append(mut &need, x) } }
+    var rows: [][]Val = []
+    var cur = lexdb_access.newCursor()
+    try lexdb_access.fetch(st, txn, &rel, -1, false, s, &need, mut &cur, mut &rows)
+    if len(rows) == 0 { return Ok(0) }
+    var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
+    var srt = noSortRun()
+    try oneRow(txn, mut &rows[0], sc, conds, xs, cx, lim, bud, cnt, mut &srt, give, mut &sr)
+    return Ok(sr.n)
 }
 
 // A Src that reads nothing (a table looked up per row).

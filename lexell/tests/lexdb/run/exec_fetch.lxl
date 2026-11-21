@@ -1,0 +1,92 @@
+// lexdb_exec, lexdb_pipe: a point select's run (design/lexdb-layers.md
+// 6.3.Q8: pipeFetch, lexdb_pipe.runPoint): a query whose first and only
+// table is read by its whole primary key, no subquery. Each query runs
+// with batches on (the point path) and off (the row engine): the same
+// rows or the same error; "fetched": how many of them the point path ran
+// (lexdb_pipe.runCounts()[3]) with batches on.
+// - keys: an integer, a text, two columns; a key that is missing, NULL,
+//   out of the column's range (no row, not 22003), another type ('3',
+//   3.0, 3.5); a parameter-free expression; a partial two-column key (a
+//   range: not the point path).
+// - over the row: outputs that are columns, expressions, a CASE, an
+//   output that fails (22012), a condition that fails and one that drops
+//   the row, LIMIT 0 and 1, ORDER BY (the scan's order), DISTINCT (a
+//   Sort: run's path), FOR UPDATE, EXPLAIN ANALYZE's counts.
+// expect: keys: 16 queries, 16 the same, fetched 15
+// expect: rows: 14 queries, 14 the same, fetched 12
+// expect: explain: the same: true
+// expect: explain: scan t: primary key lookup (rows read 1, kept 1)
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// Each query with batches on and off: the queries, those the same, those a pipeline run made.
+fn both(s: mut &lexdb_exec.Session, label: &str, qs: &[]str) {
+    var same = 0
+    var ran = 0
+    for x in qs {
+        let r0 = lexdb_pipe.runCounts()[3]
+        let on = q(s, x)
+        if lexdb_pipe.runCounts()[3] > r0 { ran += 1 }
+        let a = q(s, &"set lexdb_batch = off")
+        let off = q(s, x)
+        let b = q(s, &"set lexdb_batch = on")
+        if on == off { same += 1 } else { println("differs: " + x + ": " + on + " / " + off) }
+    }
+    println(label + ": " + len(qs).toStr() + " queries, " + same.toStr() + " the same, fetched " + ran.toStr())
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let a = q(mut &s, &"create table t (id int primary key, x int, w text, d numeric(8, 2))")
+        let b = q(mut &s, &"insert into t select g, g % 4, 'w' || g, g * 1.25 from generate_series(1, 200) g")
+        let c = q(mut &s, &"create table tx (s text primary key, v int)")
+        let d = q(mut &s, &"insert into tx select 'b' || g, g from generate_series(1, 50) g")
+        let e = q(mut &s, &"create table t2 (a int, b int, v text, primary key (a, b))")
+        let f = q(mut &s, &"insert into t2 select g / 10, g % 10, 'v' || g from generate_series(0, 99) g")
+        both(mut &s, "keys", &["select * from t where id = 3", "select x, w from t where id = 200", "select * from t where id = 0",
+                              "select * from t where id = null", "select * from t where id = 99999999999", "select * from t where id = '3'",
+                              "select * from t where id = 3.0", "select * from t where id = 3.5", "select * from t where id = 2 + 5",
+                              "select v from tx where s = 'b7'", "select v from tx where s = 'b70'", "select v from t2 where a = 3 and b = 4",
+                              "select v from t2 where b = 9 and a = 0", "select v from t2 where a = 3 and b = null",
+                              "select v from t2 where a = 3", "select * from t where id = -1"])
+        both(mut &s, "rows", &["select id + 1, w || '!', d * 2 from t where id = 9", "select case when x = 1 then 'one' else w end from t where id = 5",
+                              "select 10 / x from t where id = 8", "select w from t where id = 8 and 10 / x > 0", "select w from t where id = 9 and x = 2",
+                              "select w from t where id = 9 and x = 1", "select w from t where id = 9 limit 0", "select w from t where id = 9 limit 1",
+                              "select w from t where id = 9 order by id", "select distinct x from t where id = 9", "select w from t where id = 10 for update",
+                              "select id, x from t where id = 11 and w like 'w1%'", "select d from t where id = 12 and d > 15.00",
+                              "select upper(w), length(w) from t where id = 13"])
+        let on = q(mut &s, &"explain analyze select w from t where id = 9")
+        let a2 = q(mut &s, &"set lexdb_batch = off")
+        let off = q(mut &s, &"explain analyze select w from t where id = 9")
+        let b2 = q(mut &s, &"set lexdb_batch = on")
+        // (its time left out)
+        let on1 = strings.substr(&on, 0, strings.indexOf(&on, " result:", 0))
+        let off1 = strings.substr(&off, 0, strings.indexOf(&off, " result:", 0))
+        println("explain: the same: " + (if on1 == off1 { "true" } else { "false: " + on1 + " / " + off1 }))
+        println("explain: " + on1)
+        return 0
+    }).unwrap()
+}

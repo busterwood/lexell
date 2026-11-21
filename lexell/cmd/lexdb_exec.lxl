@@ -8825,6 +8825,7 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
            give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     match sel.pipe {
         Some(pg) {
+            if len(sel.q.subs) == 0 && !pg.joins && len(rs.after) == 0 && lexdb_plan.pointRead(&sel.q.levels[0]) { return pipeFetch(st, txn, sel, &pg, params, cap, rs, give) }
             var subs = try runSubs(st, txn, &sel.q, params, rs)
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
@@ -8875,6 +8876,38 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
         None { return Err(e("XX000", "a plan the pipeline does not run")) }
     }
+}
+
+// runPipe for a point select (lexdb_plan.pointRead, no subquery; Q8,
+// design/lexdb-layers.md 6.3.Q8): its one scan made from the key's values
+// (pathScan), its context without subqueries' values, its row read by
+// lexdb_pipe.runPoint; else as runPipe runs it (no switch to a scan: the
+// path is the primary key's, firstSwitch's -1).
+fn pipeFetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_plan.Prog, params: &[]Val, cap: int, rs: mut &Run,
+             give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    let q = &sel.q
+    let lv = &q.levels[0]
+    let noAggs: []Val = []
+    let noSubs: []SubRes = []
+    let nullRow: []Val = array(len(q.cols), Val.Null)
+    let sqe = seqEnv(st, txn)
+    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &sqe}
+    let sc = try pathScan(&lv.t, &lv.path, &env)
+    var cx = cenvOf(&sqe)
+    cx.params = collections.copyOf(params)
+    var cnt: []lexdb_pipe.Counts = []
+    match try lexdb_pipe.runPoint(st, txn, pg, &q.cols, &lv.t, &sc, &cx, cap, mut &rs.bud, mut &cnt, give) {
+        Some(n) {
+            scanCounts(rs, &cnt)
+            return Ok(n)
+        }
+        None {}
+    }
+    let src = try lexdb_pipe.srcOf(pg, &lv.t, [sc], lv.path.index, lv.path.desc, lexdb_plan.ixCovers(lv, lv.path.index), -1, [])
+    let none: [][]Val = []
+    let n = try lexdb_pipe.run(st, txn, pg, &q.cols, &lv.t, &src, &none, &cx, cap, mut &rs.bud, mut &cnt, give)
+    scanCounts(rs, &cnt)
+    return Ok(n)
 }
 
 // Where a run of sel's pipeline plan pg reads its table, for the run's
@@ -10415,7 +10448,6 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 // execSel but MATCH_RECOGNIZE.
 fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
              rs: mut &Run): Result[Res, DbErr] {
-    let sqe = seqEnv(st, txn)
     if len(sel.srf) > 0 {
         // census: lexdb_census.note(if rs.batch { "row" } else { "off" }, "a function in FROM (execSrf)")
         return execSrf(st, txn, sel, params, cap, rs)
@@ -10432,6 +10464,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         }
     }
     // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && !rs.noLimit, rs.noLimit)
+    let sqe = seqEnv(st, txn)
     // (an aggregate the pipeline runs: its conditions are its plan's, not bound per run)
     let pa = rs.batch && pipeAggs(sel)
     var m = try prepareIn(st, txn, &sel.q, params, rs, !pa, !(pa && pipeJoins(sel)))
