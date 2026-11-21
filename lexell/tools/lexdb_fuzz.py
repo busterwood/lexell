@@ -46,13 +46,19 @@ class WireError(Exception):
 class Res:
     """A statement's outcome: rows, error, crash or hang."""
 
-    def __init__(self, kind, cols=None, oids=None, rows=None, code=None, msg=None, tag=None):
+    def __init__(self, kind, cols=None, oids=None, rows=None, code=None, msg=None, tag=None, total=None):
         self.kind, self.cols, self.oids, self.rows = kind, cols or [], oids or [], rows or []
         self.code, self.msg, self.tag = code, msg, tag
+        # the rows the server sent; more than len(rows) when the query kept
+        # only the first maxrows
+        self.total = len(self.rows) if total is None else total
+
+    def truncated(self):
+        return self.kind == 'rows' and self.total > len(self.rows)
 
     def brief(self, n=12):
         if self.kind == 'rows':
-            s = '%d rows' % len(self.rows)
+            s = '%d rows' % self.total + (' (the first %d kept)' % len(self.rows) if self.truncated() else '')
             body = ['|'.join('NULL' if v is None else v for v in r) for r in self.rows[:n]]
             if len(self.rows) > n:
                 body.append('...')
@@ -66,7 +72,7 @@ class Res:
         if self.kind == 'rows':
             d['oids'] = self.oids
             d['rows'] = self.rows[:200]
-            d['nrows'] = len(self.rows)
+            d['nrows'] = self.total
         else:
             d['code'], d['msg'] = self.code, self.msg
         return d
@@ -136,9 +142,11 @@ class Conn:
         b = sql.encode() + b'\0'
         self.s.sendall(b'Q' + struct.pack('!i', len(b) + 4) + b)
         cols, oids, rows, err, tag = [], [], [], None, None
+        total = 0
         while True:
             t, p = self._msg()
             if t == b'D':
+                total += 1
                 if len(rows) >= maxrows:
                     continue
                 n = struct.unpack_from('!h', p, 0)[0]
@@ -171,7 +179,7 @@ class Conn:
                 break
         if err:
             return Res('error', code=err[0], msg=err[1])
-        return Res('rows', cols=cols, oids=oids, rows=rows, tag=tag)
+        return Res('rows', cols=cols, oids=oids, rows=rows, tag=tag, total=total)
 
 
 # ---------------------------------------------------------------- servers
@@ -1301,6 +1309,12 @@ def compare(a, b, ordered, pg=False):
     if a.kind == 'rows' and b.kind == 'rows':
         if len(a.oids) != len(b.oids):
             return 'wrong'
+        if a.total != b.total:
+            return 'wrong'
+        if (a.truncated() or b.truncated()) and not ordered:
+            # only the first maxrows of each were kept, in each server's own
+            # order: not the same rows even when the results are (w0-0697)
+            return None
         kinds = col_kinds(a, b)
         if norm_rows(a, kinds, pg, ordered) != norm_rows(b, kinds, pg, ordered):
             return 'wrong'
@@ -2135,7 +2149,7 @@ def cmd_report(args):
             print('   -- vs ' + c['min_sql2'] + ';')
         for k, v in (c.get('min_results') or c.get('results') or {}).items():
             if v:
-                print('   %s: %s' % (k, Res(v['kind'], rows=[tuple(x) for x in v.get('rows', [])], code=v.get('code'),
+                print('   %s: %s' % (k, Res(v['kind'], rows=[tuple(x) for x in v.get('rows', [])], code=v.get('code'), total=v.get('nrows'),
                                            msg=v.get('msg')).brief(6)))
 
 
