@@ -1,0 +1,114 @@
+// The fuzzer's second round (design/lexdb-fuzz.md, W3, W4), each statement against PostgreSQL 18's answer, with
+// SET lexdb_batch = off and on (in a transaction rolled back each time).
+// - W3 (w0-0257, the fuzzer's: two window functions that number peers pair their values with equal rows either way):
+//   row_number, rank, dense_rank, lag, lead, running and ROWS sums, ntile, first_value, min and max over a cross join
+//   with LATERAL (one that reads the outer row, one with a window inside, a comma after it, LEFT JOIN LATERAL with no
+//   rows, an empty side, identical rows, text keys), each order total or the answer counted by peers.
+// - W4 (w0-0428): numeric division's scale is PostgreSQL's select_div_scale (16 significant digits by the quotient's
+//   weight, at least each operand's display scale), rounded half away: numeric / bigint, int / numeric, numeric /
+//   numeric, through nullif and casts, in expressions, WHERE and ORDER BY; avg, the variances and standard deviations
+//   (the square root at the variance's scale; a zero numerator 0), window avg; NULLs, empty input, division by zero; a
+//   quotient of more than 38 digits at PostgreSQL's scale (as many places as fit; compared rounded).
+// expect: W3 doc, the numbers by partition: 29|2024-01-09|1;29|2024-01-09|2;29|2024-02-29|3;29|2024-02-29|4;35|2024-01-09|1;35|2024-01-09|2;35|2024-02-29|3;35|2024-02-29|4, same: true
+// expect: W3 doc, both windows by peers: 29|2024-01-09|2|1|2|1.5|3.0|4.5;29|2024-02-29|2|3|4|1.5|3.0|4.5;35|2024-01-09|2|1|2|1.5|3.0|4.5;35|2024-02-29|2|3|4|1.5|3.0|4.5, same: true
+// expect: W3 row_number, rank, dense_rank: 1|1|1|1|3;1|2|2|1|3;2|1|3|1|3;2|2|4|1|3;2|3|5|7|2;2|4|6|7|2;2|6|7|7|2;3|1|8|1|3;3|2|9|1|3;3|3|10|7|2;3|4|11|7|2;3|5|12|13|1;3|6|13|7|2;4|1|1|1|3;4|2|2|1|3;4|3|3|3|2;4|4|4|3|2;4|5|5|6|1;4|6|6|3|2, same: true
+// expect: W3 by the outer row: 1|1|1|1|1;1|2|2|2|2;2|1|4|3|1;2|2|5|4|2;2|3|2|1|1;2|4|3|1|1;2|6|1|5|2;3|1|5|3|1;3|2|6|4|2;3|3|3|1|1;3|4|4|1|1;3|5|1|5|3;3|6|2|5|2;4|1|5|3|1;4|2|6|4|2;4|3|3|1|1;4|4|4|1|1;4|5|1|5|3;4|6|2|5|2, same: true
+// expect: W3 lag and lead: 1|1|NULL|20|NULL|y;1|2|10|-1|NULL|x;2|1|NULL|20|10|y;2|2|10|5|20|x;2|3|20|5|10|x;2|4|5|NULL|20|y;2|6|5|-1|5|x;3|1|NULL|20|5|y;3|2|10|5|NULL|x;3|3|20|5|10|x;3|4|5|NULL|20|y;3|5|5|NULL|5|NULL;3|6|NULL|-1|5|x;4|1|NULL|20|NULL|y;4|2|10|5|NULL|NULL;4|3|20|5|10|x;4|4|5|NULL|20|y;4|5|5|NULL|5|NULL;4|6|NULL|-1|5|NULL, same: true
+// expect: W3 running sums: 1|1|10|10|10|30|2|15.0000000000000000;1|2|30|30|30|30|2|15.0000000000000000;2|1|10|10|40|60|11|15.0000000000000000;2|2|30|30|60|60|11|15.0000000000000000;2|3|35|25|65|80|11|5.0000000000000000;2|4|40|10|70|80|11|5.0000000000000000;2|6|40|5|70|80|11|5.0000000000000000;3|1|10|10|80|60|11|15.0000000000000000;3|2|30|30|100|60|11|15.0000000000000000;3|3|35|25|105|80|11|5.0000000000000000;3|4|40|10|110|80|11|5.0000000000000000;3|5|40|5|110|80|11|NULL;3|6|40|NULL|110|80|11|5.0000000000000000;4|1|10|10|120|30|6|15.0000000000000000;4|2|30|30|140|30|6|15.0000000000000000;4|3|35|25|145|40|6|5.0000000000000000;4|4|40|10|150|40|6|5.0000000000000000;4|5|40|5|150|40|6|NULL;4|6|40|NULL|150|40|6|5.0000000000000000, same: true
+// expect: W3 ntile: 1|1|1|1|1;1|2|1|1|2;2|1|1|1|1;2|2|1|1|1;2|3|1|2|2;2|4|1|2|3;2|6|1|3|4;3|1|2|1|1;3|2|2|1|1;3|3|2|2|2;3|4|2|2|2;3|5|2|3|3;3|6|2|3|4;4|1|1|1|1;4|2|1|2|1;4|3|1|2|2;4|4|2|3|2;4|5|2|3|3;4|6|2|3|4, same: true
+// expect: W3 first_value, min, max: 1|1|10|x|10|y;1|2|10|x|10|y;2|1|10|x|10|y;2|2|10|x|10|y;2|3|10|x|5|y;2|4|10|x|5|y;2|6|10|x|5|y;3|1|10|x|10|y;3|2|10|x|10|y;3|3|10|x|5|y;3|4|10|x|5|y;3|5|10|NULL|5|y;3|6|10|x|5|y;4|1|10|x|10|y;4|2|10|x|10|y;4|3|10|x|5|y;4|4|10|x|5|y;4|5|10|NULL|5|y;4|6|10|x|5|y, same: true
+// expect: W3 a comma after the LATERAL: 2|1|16|1|1|9;2|2|16|2|1|9;3|1|16|3|3|9;3|2|16|4|3|9;3|3|16|5|1|9;3|4|16|6|1|9;3|6|16|7|1|9;4|1|16|8|5|9;4|2|16|9|5|9;4|3|16|10|4|9;4|4|16|11|4|9;4|5|16|12|1|9;4|6|16|13|4|9;2|1|29|1|1|9;2|2|29|2|1|9;3|1|29|3|3|9;3|2|29|4|3|9;3|3|29|5|1|9;3|4|29|6|1|9;3|6|29|7|1|9;4|1|29|8|5|9;4|2|29|9|5|9;4|3|29|10|4|9;4|4|29|11|4|9;4|5|29|12|1|9;4|6|29|13|4|9;2|1|35|1|1|9;2|2|35|2|1|9;3|1|35|3|3|9;3|2|35|4|3|9;3|3|35|5|1|9;3|4|35|6|1|9;3|6|35|7|1|9;4|1|35|8|5|9;4|2|35|9|5|9;4|3|35|10|4|9;4|4|35|11|4|9;4|5|35|12|1|9;4|6|35|13|4|9;2|1|39|1|1|9;2|2|39|2|1|9;3|1|39|3|3|9;3|2|39|4|3|9;3|3|39|5|1|9;3|4|39|6|1|9;3|6|39|7|1|9;4|1|39|8|5|9;4|2|39|9|5|9;4|3|39|10|4|9;4|4|39|11|4|9;4|5|39|12|1|9;4|6|39|13|4|9, same: true
+// expect: W3 identical rows: 2024-01-09|5|1;2024-01-09|5|2;2024-01-09|5|3;2024-01-09|5|4;2024-02-29|5|1;2024-02-29|5|2;NULL|5|1;NULL|5|2, same: true
+// expect: W3 identical rows, two windows by peers: 2024-01-09|5|4|1|4|35;2024-02-29|5|2|1|2|20;NULL|5|2|1|2|20, same: true
+// expect: W3 a window inside the LATERAL: 1|10|1|1;1|20|2|1;2|10|1|2;2|20|2|2;2|5|3|1;2|5|4|1;2|NULL|5|1;3|10|1|3;3|20|2|3;3|5|3|2;3|5|4|2;3|NULL|5|2;3|NULL|6|1;4|10|1|4;4|20|2|4;4|5|3|3;4|5|4|3;4|NULL|5|3;4|NULL|6|2, same: true
+// expect: W3 LEFT JOIN LATERAL, no rows: 1|NULL|1|1;2|NULL|2|1;3|NULL|3|1;4|NULL|4|1, same: true
+// expect: W3 empty LATERAL: , same: true
+// expect: W3 empty outer: , same: true
+// expect: W3 text keys: NULL|3|5|1|1;NULL|4|5|2|1;x|1|1|1|2;x|2|1|2|2;x|2|3|3|2;x|2|4|4|2;x|3|1|5|2;x|3|3|6|2;x|3|4|7|2;x|4|1|8|2;x|4|3|9|2;x|4|4|10|2;y|1|2|1|3;y|2|2|2|3;y|2|6|3|3;y|3|2|4|3;y|3|6|5|3;y|4|2|6|3;y|4|6|7|3, same: true
+// expect: W4 doc: NULL;-0.000000000000000000162630325872825665;-0.75000000000000000000;NULL;0.50000000000000000000;0.000000000000000000162630325872825665, same: true
+// expect: W4 numeric / bigint: -9223372036854775807|-0.000000000000000001111307226797642045|-3074457345618258602.3|-1317624576693539401.000|-18446744073709551614.0;-2|-5.1250000000000000|-0.66666666666666666667|-0.28571428571428571429|-4.0000000000000000;0|NULL|0.00000000000000000000|0.00000000000000000000|0.0000000000000000;3|3.4166666666666667|1.00000000000000000000|0.42857142857142857143|6.0000000000000000;9223372036854775807|0.000000000000000001111307226797642045|3074457345618258602.3|1317624576693539401.000|18446744073709551614.0;NULL|NULL|NULL|NULL|NULL, same: true
+// expect: W4 numeric / numeric: 1|0.50000000000000000000|2.0000000000000000;2|-33333.333333333333|-0.000030000000000000000000;3|0.00000000000000000000|NULL;4|-246913578.24600000|-0.0000000040500000328199852660;5|NULL|NULL;6|0.000000029802322387695313|33554432.000000000000;7|1.00000000000000000000|1.00000000000000000000, same: true
+// expect: W4 numeric / int: 1|0.21428571428571428571|4.6666666666666667|0.35714285714285714286|2.8000000000000000;2|3.3333333333333333|0.30000000000000000000|-0.00033333333333333333|-3000.0000000000000000;3|NULL|NULL|NULL|NULL;4|61728394.561500000000|0.000000016200000131279941|0.50000000000000000000|2.0000000000000000;5|NULL|NULL|NULL|NULL;6|0.000000029802322387695313|33554432.000000000000|0.000000000000000000000000|NULL;7|0.25000000000000000000|4.0000000000000000|-0.79166666666666666667|-1.2631578947368421, same: true
+// expect: W4 int / int: 1|3|1;2|-1|1;3|0|NULL;4|1|1;5|NULL|NULL;6|16777216|1;7|4|1, same: true
+// expect: W4 casts: 1|0.21428571428571428571|2.3333333333333333|1.00000000000000000000|0.5000000000;2|3.3333333333333333|-1.00000000000000000000|-0.42857142857142857143|-33333.3333333333;3|NULL|0.00000000000000000000|0.00000000000000000000|0.0000000000;4|61728394.561500000000|0.66666666666666666667|0.28571428571428571429|-246913578.2460000000;5|NULL|NULL|NULL|NULL;6|0.000000029802322387695313|11184810.666666666667|4793490.285714285714|0.0000000298;7|0.25000000000000000000|3.0000000000000000|1.2857142857142857|1.0000000000, same: true
+// expect: W4 nullif: 1|0.60000000000000000000|0.60000000000000000000|1.6666666666666667|NULL;2|-10000.0000000000000000|-10000.0000000000000000|-0.000100000000000000000000|-3000.0000000000000000;3|NULL|NULL|NULL|NULL;4|123456789.123000000000|123456789.123000000000|0.0000000081000000656399705319|2.0000000000000000;5|NULL|NULL|NULL|NULL;6|NULL|NULL|NULL|NULL;7|-0.31578947368421052632|-0.31578947368421052632|-3.1666666666666667|-1.2631578947368421, same: true
+// expect: W4 ties round half away: 0.000000029802322387695313|-0.000000029802322387695313|2.5000000000000000|0.16666666666666666667|0.03125000000000000000, same: true
+// expect: W4 zero dividend: 0.00000000000000000000|0.00000000000000000000|0.0000000000000000|0.000000000000000000000000, same: true
+// expect: W4 big quotients: 41152263004115226300411522630.2|33333333333333333333|70000.000000000000|9999999999999999999900.00, same: true
+// expect: W4 small quotients: 0.00000000000000000000000000000000000000000000000000000000000100000000000000000000|0.000014285714285714285714|0.00010001000100010001|0.99990000000000000000|0.000100000000000000000000|0.0000000100000000000000000000, same: true
+// expect: W4 more than 38 places at PostgreSQL's scale: 3|3.000000|300000000000000000.0;9223372036854775807|9223372036854775813.734774|922337203685477580700000000000000000.0, same: true
+// expect: W4 w0-0421, a quotient of a quotient: 1.5;1.5, same: true
+// expect: W4 in expressions: 1|0.41666666666666666667|50.0000000000000000|0.50|-0.50000000000000000000;2|-15000.000000000000|-3333333.333333333333|-33333.33|33333.333333333333;3|0.07142857142857142857|0.00000000000000000000|0.00|0.00000000000000000000;4|-123456790.123000000000|-24691357824.60000000|-246913578.25|246913578.24600000;5|NULL|NULL|NULL|NULL;6|0.000000029802322387695313|0.000002980232238769531250|0.00|-0.000000029802322387695313;7|0.72222222222222222222|100.0000000000000000|1.00|-1.00000000000000000000, same: true
+// expect: W4 WHERE and ORDER BY: 1;7, same: true
+// expect: W4 avg: 20576130.645500000000|4793492.250042857143|5592407.833333333333|-0.04850000000000000000, same: true
+// expect: W4 avg by group: -1|0.00100000000000000000|-10.0000000000000000|1;0|0.50000000000000000000|41152263.374333333333|3;1|-2.3125000000000000|1.8750000000000000|2;NULL|3.3330000000000000|NULL|1, same: true
+// expect: W4 avg, empty: NULL|NULL|NULL, same: true
+// expect: W4 variance, stddev: 13.8220803000000000|3.7178058448498894|156374959099466.4722|12504997.3650|2540263173303378.788322|12682382.34181670|160842821864024.12994168, same: true
+// expect: W4 variance of equal values: 0|0|0|0, same: true
+// expect: W4 window avg: 1|2.5000000000000000|20576130.645500000000|2.6250000000000000;2|1.25050000000000000000|20576130.645500000000|0.00030000000000000000;3|0.00100000000000000000|20576130.645500000000|11184812.833333333333;4|1.00000000000000000000|20576130.645500000000|11184812.833333333333;5|2.1665000000000000|20576130.645500000000|2.0000000000000000;6|1.6665000000000000|20576130.645500000000|11184812.833333333333;7|-3.5625000000000000|20576130.645500000000|2.6250000000000000, same: true
+// expect: W4 division by zero: ERROR 22012, same: true
+// expect: W4 division by zero, no rows: , same: true
+// expect: W4 a NULL divisor: 1|2.5000000000000000;2|2.5000000000000000;3|2.5000000000000000;4|2.5000000000000000;5|NULL;6|2.5000000000000000;7|2.5000000000000000, same: true
+// expect: W4 floats stay floats: 0.75|1.5|2.9802322387695312e-08, same: true
+// expect: W4 an untyped literal: 0.37500000000000000000|0.33333333333333333333, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// each statement with the row engine and with batches, in a transaction rolled back
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table f1 (b0 date, b1 bool)\ncreate table f2 (c0 bigint primary key, c1 text, c2 int)\ninsert into f1 values ('2024-02-29', false), ('2024-01-09', false)\ninsert into f2 values (29, 'b', 8), (35, 'a_c', 2)\ncreate table wl1 (id int, b0 date, b1 bool)\ninsert into wl1 values (1, '2024-02-29', false), (2, '2024-01-09', false), (3, '2024-01-09', false), (4, null, true)\ncreate table wl2 (c0 bigint primary key, c1 text, c2 int)\ninsert into wl2 values (29, 'b', 8), (35, 'a_c', 2), (16, 'z', -1), (39, 'B', 0)\ncreate table wl3 (id int, k int, v int, t text)\ninsert into wl3 values (1, 1, 10, 'x'), (2, 1, 20, 'y'), (3, 2, 5, 'x'), (4, 2, 5, 'x'), (5, 3, null, null), (6, 2, null, 'y')\ncreate table we (x int)\ncreate table n0 (a1 bigint)\ninsert into n0 values (9223372036854775807), (0), (null), (-2), (3), (-9223372036854775807)\ncreate table n1 (id int, a numeric, b numeric, i int, d numeric(10,3))\ninsert into n1 values (1, 1.5, 3, 7, 2.500), (2, -10, 0.0003, -3, 0.001), (3, 0, 7.00, 0, null), (4, 123456789.123, -0.5, 2, 1.000), (5, null, 2, null, 3.333), (6, 1, 33554432, 33554432, 0.000), (7, 2.25, 2.25, 9, -7.125)\ncreate table ne (a numeric, i int)"
+
+const QS = "W3 doc, the numbers by partition\tselect q12.c0, q1.b0, row_number() over (partition by q12.c0, l2.x10 order by q1.b0, q1.b1, l2.x10, l2.x11, q12.c0, q12.c1, q12.c2) as x14 from f1 as q1 cross join lateral (select 'a' as x10, 1.5 as x11 from (select 1.5 as x8 from f1 as q4) as d3) as l2, f2 as q12 order by 1, 2, 3\nW3 doc, both windows by peers\tselect c0, b0, count(*), min(x14), max(x14), min(x13), max(x13), sum(x13) from (select q12.c0, q1.b0, sum(1.5) over (partition by q1.b0, q12.c2 order by q1.b0, q1.b1, l2.x10, l2.x11, q12.c0, q12.c1, q12.c2 rows between 1 preceding and current row) as x13, row_number() over (partition by q12.c0, l2.x10 order by q1.b0, q1.b1, l2.x10, l2.x11, q12.c0, q12.c1, q12.c2) as x14 from f1 as q1 cross join lateral (select 'a' as x10, 1.5 as x11 from (select 1.5 as x8 from f1 as q4) as d3) as l2, f2 as q12) z group by c0, b0 order by 1, 2\nW3 row_number, rank, dense_rank\tselect q1.id, l.id, row_number() over (partition by q1.b1 order by q1.id, l.id), rank() over (partition by q1.b1 order by l.k), dense_rank() over (partition by q1.b1 order by l.k desc) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 by the outer row\tselect q1.id, l.id, row_number() over (partition by q1.id order by l.v nulls first, l.id), rank() over (partition by q1.id order by l.v), dense_rank() over (partition by q1.b0 order by l.t) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 lag and lead\tselect q1.id, l.id, lag(l.v) over (partition by q1.id order by l.id), lead(l.v, 1, -1) over (partition by q1.id order by l.id), lag(l.v, 2) over (order by q1.id, l.id), lead(l.t) over (partition by l.k order by q1.id, l.id) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 running sums\tselect q1.id, l.id, sum(l.v) over (partition by q1.id order by l.id), sum(l.v) over (partition by q1.id order by l.id rows between 1 preceding and current row), sum(l.v) over (order by q1.id, l.id rows between unbounded preceding and current row), sum(l.v) over (partition by q1.b0 order by l.k), count(*) over (partition by q1.b0), avg(l.v) over (partition by l.k) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 ntile\tselect q1.id, l.id, ntile(2) over (partition by q1.b1 order by q1.id, l.id), ntile(3) over (order by l.id, q1.id), ntile(4) over (partition by q1.id order by l.id) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 first_value, min, max\tselect q1.id, l.id, first_value(l.v) over (partition by q1.id order by l.id), first_value(l.t) over (partition by l.k order by q1.id desc, l.id), min(l.v) over (partition by q1.id order by l.id), max(l.t) over (partition by q1.b0) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1, 2\nW3 a comma after the LATERAL\tselect q1.id, l.id, q12.c0, row_number() over (partition by q12.c0 order by q1.id, l.id), rank() over (partition by q12.c0, l.k order by q1.id), sum(q12.c2) over (partition by q1.id, l.id) from wl1 q1 cross join lateral (select id, k from wl3 where wl3.k < q1.id) l, wl2 q12 order by 3, 1, 2\nW3 identical rows\tselect q1.b0, l.v, row_number() over (partition by q1.b0 order by l.v) from wl1 q1 cross join lateral (select v from wl3 where k = 2 and v is not null) l order by 1, 2, 3\nW3 identical rows, two windows by peers\tselect b0, v, count(*), min(r), max(r), sum(s) from (select q1.b0, l.v, row_number() over (partition by q1.b0 order by l.v) as r, sum(l.v) over (partition by l.v order by q1.b0 rows between 1 preceding and current row) as s from wl1 q1 cross join lateral (select v from wl3 where k = 2 and v is not null) l) z group by b0, v order by 1, 2\nW3 a window inside the LATERAL\tselect q1.id, l.v, l.r, row_number() over (partition by l.r order by q1.id, l.v) from wl1 q1 cross join lateral (select v, row_number() over (order by id) as r from wl3 where k <= q1.id) l order by 1, 3\nW3 LEFT JOIN LATERAL, no rows\tselect q1.id, l.x, row_number() over (partition by l.x order by q1.id), rank() over (order by l.x nulls first) from wl1 q1 left join lateral (select x from we where we.x = q1.id) l on true order by 1\nW3 empty LATERAL\tselect q1.id, row_number() over (order by q1.id) from wl1 q1 cross join lateral (select x from we where we.x = q1.id) l\nW3 empty outer\tselect l.id, row_number() over (order by l.id) from we cross join lateral (select id from wl3 where wl3.k = we.x) l\nW3 text keys\tselect l.t, q1.id, l.id, row_number() over (partition by l.t order by q1.id, l.id), dense_rank() over (order by l.t nulls first) from wl1 q1 cross join lateral (select id, k, v, t from wl3 where wl3.k <= q1.id) l order by 1 nulls first, 2, 3\nW4 doc\tselect (1.5 / nullif(q3.a1, 0)) as x4 from n0 as q3 order by a1 nulls first\nW4 numeric / bigint\tselect a1, 10.25 / nullif(a1, 0), a1 / 3.0, a1 / 7.000, a1 / 0.5 from n0 order by 1\nW4 numeric / numeric\tselect id, a / nullif(b, 0), b / nullif(a, 0) from n1 order by id\nW4 numeric / int\tselect id, a / nullif(i, 0), i / nullif(a, 0), d / nullif(i, 0), i / nullif(d, 0) from n1 order by id\nW4 int / int\tselect id, i / 2, i / nullif(i, 0) from n1 order by id\nW4 casts\tselect id, cast(a as numeric(20,4)) / nullif(cast(i as numeric(12,1)), 0), cast(i as numeric) / 3, i::numeric / 7, cast(a / nullif(b, 0) as numeric(30,10)) from n1 order by id\nW4 nullif\tselect id, a / nullif(d, 0), nullif(a, 0) / nullif(d, 0.000), nullif(d, 0) / nullif(a, 0), nullif(i, 7) / nullif(d, 0) from n1 order by id\nW4 ties round half away\tselect 1 / 33554432.0, -1 / 33554432::numeric, 5 / 2.0, 0.5 / 3, 1 / 32.0\nW4 zero dividend\tselect 0 / 7.00, 0.000 / 3, 0 / -0.5, 0.0 / 33554432\nW4 big quotients\tselect 123456789012345678901234567890.5 / 3, 1e20 / 3, 7 / 0.0001, 99999999999999999999 / 0.01\nW4 small quotients\tselect 1e-30 / 1e30, 0.0001 / 7, 1 / 9999.0, 9999 / 10000.0, 1 / 10000.0, 1 / 100000000.0\nW4 more than 38 places at PostgreSQL's scale\tselect a1, round(1.5 / (1.5 / nullif(a1, 0)), 6), round(a1 / 0.00000000000000001, 1) from n0 where a1 > 1 order by 1\nW4 w0-0421, a quotient of a quotient\tselect 1.5 as x16 from (select 1 as x12 from (select 1 as x9 from n0 as q5 where (1 <= (1.5 / nullif((1.5 / nullif(q5.a1, 0)), 0)))) as d4) as d1\nW4 in expressions\tselect id, (a + 1) / nullif(b * 2, 0), 100.00 * a / nullif(b, 0), round(a / nullif(b, 0), 2), -a / nullif(b, 0) from n1 order by id\nW4 WHERE and ORDER BY\tselect id from n1 where a / nullif(b, 0) > 0.4 order by a / nullif(b, 0), id\nW4 avg\tselect avg(a), avg(b), avg(i), avg(d) from n1\nW4 avg by group\tselect i % 2, avg(d), avg(a), count(*) from n1 group by 1 order by 1\nW4 avg, empty\tselect avg(a), sum(a) / count(*), avg(i) from ne\nW4 variance, stddev\tselect variance(d), stddev(d), var_pop(i), stddev_pop(i), variance(a), stddev(b), var_samp(b) from n1\nW4 variance of equal values\tselect variance(v), stddev(v), variance(cast(v as numeric(6,2))), stddev_pop(cast(v as numeric(6,2))) from wl3 where k = 2 and v is not null\nW4 window avg\tselect id, avg(d) over (order by id rows between 1 preceding and current row), avg(a) over (), avg(b) over (partition by i % 2) from n1 order by id\nW4 division by zero\tselect id, a / i from n1 order by id\nW4 division by zero, no rows\tselect a / (i - i) from n1 where id = 99\nW4 a NULL divisor\tselect id, 2.5 / (case when id = 5 then null else 1 end) from n1 order by id\nW4 floats stay floats\tselect 1.5 / 2::float8, 3 / 2.0::float8, 1 / 33554432::float8\nW4 an untyped literal\tselect 1.5 / '4', '1' / 3.0"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for l in strings.lines(&qs) {
+        let parts = strings.split(&l, "\t")
+        two(mut &s, &parts[0], &parts[1])
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(97), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

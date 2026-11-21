@@ -194,25 +194,41 @@ fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {
     }
 }
 
-// The square root at 16 places (Newton's method at 20).
+// The square root at the variance's scale, as PostgreSQL's stddev takes it
+// (numeric_stddev_internal: sqrt_var at the division's scale), rounded half
+// away: Newton's method 8 places further (fewer where those overflow).
 fn sqrtNum(v: &Val): Result[Val, DbErr] {
     if lexdb_ops.isFloat(v) { return Ok(Val.Float(lexdb_ops.asFloat(v).unwrap().sqrt())) }
     let a = lexdb_ops.asNum(v).unwrap()
     if a.isNeg() { return Err(e("2201F", "cannot take square root of a negative number")) }
     if a.isZero() { return Ok(Val.Num(a)) }
-    var x = if (try lexdb_ops.compare(v, &Val.Int(1))) > 0 { a } else { Decimal.fromInt(1) }
+    let sc = a.scale()
+    for extra in [8, 2, 0] {
+        match newtonSqrt(a, sc + extra, (try lexdb_ops.compare(v, &Val.Int(1))) > 0) {
+            Some(x) {
+                match x.quantize(sc, Rounding.HALF_AWAY) {
+                    Ok(d) { return Ok(Val.Num(d)) }
+                    Err(_) {}
+                }
+            }
+            None {}
+        }
+    }
+    return Err(lexdb_ops.decErr())
+}
+
+// a's square root by Newton's method at scale ws; None: a step overflows.
+fn newtonSqrt(a: Decimal, ws: int, big: bool): Option[Decimal] {
+    var x = if big { a } else { Decimal.fromInt(1) }
     let two = Decimal.fromInt(2)
-    for i in 0..200 {
-        let q = match a.div(x, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
-        let next = match q.addExact(x) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
-        let half = match next.div(two, 20, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return Err(lexdb_ops.decErr()) } }
+    for i in 0..400 {
+        let q = match a.div(x, ws, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return None } }
+        let next = match q.addExact(x) { Ok(d) { d } Err(_) { return None } }
+        let half = match next.div(two, ws, Rounding.HALF_EVEN) { Ok(d) { d } Err(_) { return None } }
         if half.canonical() == x.canonical() { break }
         x = half
     }
-    match x.quantize(16, Rounding.HALF_EVEN) {
-        Ok(d) { return Ok(Val.Num(d)) }
-        Err(_) { return Err(lexdb_ops.decErr()) }
-    }
+    return Some(x)
 }
 
 // string_agg with ORDER BY: its values sorted by their keys (stable: equal
@@ -290,7 +306,13 @@ pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let n = Val.Int(acc.n)
     let num = try lexdb_ops.arith(lexdb_ops.OP_SUB, &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &n, &acc.sumsq)), &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &acc.sum)))
     let den = Val.Int(if pop { acc.n * acc.n } else { acc.n * (acc.n - 1) })
-    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &(try numOf(&num, &f)), &(try numOf(&den, &f)))
+    let nv = try numOf(&num, &f)
+    match nv {
+        // a numeric numerator at or below zero is 0, as PostgreSQL's (no division, no scale)
+        Val.Num(d) { if d.isZero() || d.isNeg() { return Ok(Val.Num(Decimal.zero())) } }
+        else {}
+    }
+    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &nv, &(try numOf(&den, &f)))
     if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
     return sqrtNum(&vr)
 }

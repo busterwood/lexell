@@ -46,13 +46,19 @@ class WireError(Exception):
 class Res:
     """A statement's outcome: rows, error, crash or hang."""
 
-    def __init__(self, kind, cols=None, oids=None, rows=None, code=None, msg=None, tag=None):
+    def __init__(self, kind, cols=None, oids=None, rows=None, code=None, msg=None, tag=None, total=None):
         self.kind, self.cols, self.oids, self.rows = kind, cols or [], oids or [], rows or []
         self.code, self.msg, self.tag = code, msg, tag
+        # the rows the server sent; more than len(rows) when the query kept
+        # only the first maxrows
+        self.total = len(self.rows) if total is None else total
+
+    def truncated(self):
+        return self.kind == 'rows' and self.total > len(self.rows)
 
     def brief(self, n=12):
         if self.kind == 'rows':
-            s = '%d rows' % len(self.rows)
+            s = '%d rows' % self.total + (' (the first %d kept)' % len(self.rows) if self.truncated() else '')
             body = ['|'.join('NULL' if v is None else v for v in r) for r in self.rows[:n]]
             if len(self.rows) > n:
                 body.append('...')
@@ -66,7 +72,7 @@ class Res:
         if self.kind == 'rows':
             d['oids'] = self.oids
             d['rows'] = self.rows[:200]
-            d['nrows'] = len(self.rows)
+            d['nrows'] = self.total
         else:
             d['code'], d['msg'] = self.code, self.msg
         return d
@@ -136,9 +142,11 @@ class Conn:
         b = sql.encode() + b'\0'
         self.s.sendall(b'Q' + struct.pack('!i', len(b) + 4) + b)
         cols, oids, rows, err, tag = [], [], [], None, None
+        total = 0
         while True:
             t, p = self._msg()
             if t == b'D':
+                total += 1
                 if len(rows) >= maxrows:
                     continue
                 n = struct.unpack_from('!h', p, 0)[0]
@@ -171,7 +179,7 @@ class Conn:
                 break
         if err:
             return Res('error', code=err[0], msg=err[1])
-        return Res('rows', cols=cols, oids=oids, rows=rows, tag=tag)
+        return Res('rows', cols=cols, oids=oids, rows=rows, tag=tag, total=total)
 
 
 # ---------------------------------------------------------------- servers
@@ -1002,7 +1010,10 @@ class Gen:
             return None
         part = r.sample(cols, min(len(cols), r.choice([0, 0, 1, 1, 2])))
         ps = ('partition by ' + ', '.join(c[0] for c in part) + ' ') if part else ''
-        allord = 'order by ' + ', '.join(c[0] for c in cols)
+        # every column in scope, floats too: rows equal in this order are equal
+        # in every column the query can show, so one function that depends on
+        # the order among peers (win='peer') still has one answer
+        allord = 'order by ' + ', '.join(c[0] for c in ctx.cols)
         o = r.sample(cols, min(len(cols), r.choice([1, 1, 2])))
         os_ = 'order by ' + ', '.join('%s%s' % (c[0], r.choice(['', ' desc', ' nulls first'])) for c in o)
         wctx = Ctx(ctx.cols, nosub=True)
@@ -1020,11 +1031,11 @@ class Gen:
             if x < 0.45:
                 return E('count(*) over (%s)' % ps.strip(), [], 'int', win=True)
             if x < 0.6:
-                return E('row_number() over (%s%s)' % (ps, allord), [], 'int', win=True)
+                return E('row_number() over (%s%s)' % (ps, allord), [], 'int', win='peer')
             if x < 0.7:
-                return E('ntile(%d) over (%s%s)' % (r.choice([2, 3]), ps, allord), [], 'int', win=True)
+                return E('ntile(%d) over (%s%s)' % (r.choice([2, 3]), ps, allord), [], 'int', win='peer')
             fn = r.choice(['lag', 'lead'])
-            return E('%s({0}) over (%s%s)' % (fn, ps, allord), [arg('int')], 'int', win=True)
+            return E('%s({0}) over (%s%s)' % (fn, ps, allord), [arg('int')], 'int', win='peer')
         if cat in ('num', 'int'):
             pass
         if cat == 'num':
@@ -1035,13 +1046,13 @@ class Gen:
                 return E('avg({0}) over (%s)' % ps.strip(), [self.expr(wctx, r.choice(['int', 'num']), 1)], 'num',
                          win=True)
             return E('sum({0}) over (%s%s rows between 1 preceding and current row)' % (ps, allord),
-                     [arg('num')], 'num', win=True)
+                     [arg('num')], 'num', win='peer')
         if cat in ('text', 'date'):
             x = r.random()
             if x < 0.5:
                 return E('%s({0}) over (%s%s)' % (r.choice(['min', 'max']), ps, os_), [arg(cat)], cat,
                          win=True)
-            return E('first_value({0}) over (%s%s)' % (ps, allord), [arg(cat)], cat, win=True)
+            return E('first_value({0}) over (%s%s)' % (ps, allord), [arg(cat)], cat, win='peer')
         return None
 
     # -- subqueries
@@ -1201,10 +1212,19 @@ class Gen:
         else:
             ictx = Ctx(scope, depth=depth, outer=outer)
             items = []
+            peer = False
             for cat in outcats:
                 e = None
                 if mode in ('top', 'derived', 'cte') and r.random() < 0.08:
                     e = self.window(ictx, cat)
+                    # at most one function whose value depends on the order
+                    # among peers: two (row_number and a ROWS sum over
+                    # different partitions, w0-0257) may pair their values
+                    # with equal rows either way
+                    if e is not None and e.win == 'peer':
+                        if peer:
+                            e = None
+                        peer = True
                 items.append(e or self.expr(ictx, cat, r.choice([0, 1, 1, 2])))
         q.items = [[e, self.alias('x')] for e in items]
         if mode not in ('scalar', 'exists') and not grouped and r.random() < 0.12:
@@ -1289,6 +1309,12 @@ def compare(a, b, ordered, pg=False):
     if a.kind == 'rows' and b.kind == 'rows':
         if len(a.oids) != len(b.oids):
             return 'wrong'
+        if a.total != b.total:
+            return 'wrong'
+        if (a.truncated() or b.truncated()) and not ordered:
+            # only the first maxrows of each were kept, in each server's own
+            # order: not the same rows even when the results are (w0-0697)
+            return None
         kinds = col_kinds(a, b)
         if norm_rows(a, kinds, pg, ordered) != norm_rows(b, kinds, pg, ordered):
             return 'wrong'
@@ -2123,7 +2149,7 @@ def cmd_report(args):
             print('   -- vs ' + c['min_sql2'] + ';')
         for k, v in (c.get('min_results') or c.get('results') or {}).items():
             if v:
-                print('   %s: %s' % (k, Res(v['kind'], rows=[tuple(x) for x in v.get('rows', [])], code=v.get('code'),
+                print('   %s: %s' % (k, Res(v['kind'], rows=[tuple(x) for x in v.get('rows', [])], code=v.get('code'), total=v.get('nrows'),
                                            msg=v.get('msg')).brief(6)))
 
 
