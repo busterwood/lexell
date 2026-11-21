@@ -156,6 +156,7 @@ pub fn bxEval(x: &lexdb_bind.BX, row: &[]Val, aggs: &[]Val, ce: &Ctx): Result[Va
         }
         lexdb_bind.BX.Sub(u, i, xs) {
             if i >= len(ce.subs) { return Err(e("0A000", "a subquery is not supported here")) }
+            if len(ce.subs[i].late) > 0 { return Err(lateOf(&ce.subs[i]).unwrap()) }
             if u == lexdb_sql.SUB_IN { return Ok(inProbe(&ce.subs[i], &(try bxEval(&xs[0], row, aggs, ce)), &ce.zone)) }
             if u == lexdb_sql.SUB_EXISTS { return Ok(Val.Bool(ce.subs[i].rows > 0)) }
             return Ok(ce.subs[i].val.clone())
@@ -4415,21 +4416,35 @@ pub fn obKey(ob: &lexdb_rows.OutBatch, j: int, colls: &[]int, kb: mut &str) {
 // A subquery's value (its caller runs it): its rows, a scalar's value,
 // IN's set (inValKeys' keys; hashed: each after its key's, keyPart), and
 // whether its values are numbers (keyed as numbers) and any is NULL.
+// late: the error its run gave, raised where its value is first read (as
+// PostgreSQL runs an initplan when it is first needed: a CASE branch not
+// taken, a query with no rows, never reads it); "" none (lateOf).
 pub type SubVal = record {
     pub rows: int
     pub val: Val
     pub set: Map[str, int]
     pub numeric: bool
     pub hasNull: bool
+    pub late: str
 }
 
-pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(), numeric: false, hasNull: false} }
+pub fn noSubVal(): SubVal { return SubVal{rows: 0, val: Val.Null, set: newMap(), numeric: false, hasNull: false, late: ""} }
+
+// A subquery's run's error as late keeps it (its state, a NUL, its message).
+pub fn lateText(x: &DbErr): str { return x.state + "\x00" + x.msg }
+
+// The error a subquery's value raises where it is read (late), None none.
+pub fn lateOf(s: &SubVal): Option[DbErr] {
+    if len(s.late) == 0 { return None }
+    let i = strings.indexOf(&s.late, "\x00", 0)
+    return Some(e(&s.late[0..i], &s.late[i + 1..len(s.late)]))
+}
 
 // A copy of subs (a compiled expression's own: BGen's context).
 pub fn copySub(s: &SubVal): SubVal {
     var set: Map[str, int] = newMap()
     for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
-    return SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull}
+    return SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull, late: s.late.clone()}
 }
 
 pub fn copySubs(subs: &[]SubVal): []SubVal {
@@ -4437,7 +4452,7 @@ pub fn copySubs(subs: &[]SubVal): []SubVal {
     for s in subs {
         var set: Map[str, int] = newMap()
         for i in 0..s.set.size() { set.put(s.set.keyAt(i).toStr(), s.set.valAt(i)) }
-        append(mut &out, SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull})
+        append(mut &out, SubVal{rows: s.rows, val: s.val.clone(), set: set, numeric: s.numeric, hasNull: s.hasNull, late: s.late.clone()})
     }
     return out
 }
