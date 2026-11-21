@@ -63,6 +63,7 @@ import "./lexdb_dbopt"
 import "./lexdb_udf"
 import "./lexdb_gen"
 import "./lexdb_priv"
+import "./lexdb_census"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -2866,7 +2867,9 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     rs.bud.ticks = parent.bud.ticks
     rs.bud.turnEnd = parent.bud.turnEnd
     rs.cache = replace(mut &parent.cache, newCache())
+    // census: lexdb_census.enter()
     let r = execSel(st, txn, sel, params, cap, mut &rs)
+    // census: lexdb_census.leave()
     parent.cache = replace(mut &rs.cache, newCache())
     parent.bud.ticks = rs.bud.ticks
     parent.bud.turnEnd = rs.bud.turnEnd
@@ -4718,6 +4721,7 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
         let room = rs.bud.room()
         let max = rs.bud.maxHeld
         var held = 0
+        // census: lexdb_plan.censusDml(&q, "ALTER TABLE", rs.batch)
         try runQuery(st, txn, &q, &m, &noParams, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its new one
             if room >= 0 && held > room { return Err(lexdb_pipe.memErr(max)) }
@@ -6922,6 +6926,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
     for k in targets { for p in t.pk { if p == k { lmode = lexdb_sql.LOCK_UPDATE } } }
     let reads0 = txn.readCount()
+    // census: lexdb_plan.censusDml(&q, "UPDATE", rs.batch)
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
@@ -7021,6 +7026,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var held = 0
     let wn = win.n
     let reads0 = txn.readCount()
+    // census: lexdb_plan.censusDml(&q, "DELETE", rs.batch)
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
@@ -7772,6 +7778,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
     for c in cl { for k in c.targets { for p in t.pk { if p == k && c.act == lexdb_sql.MA_UPDATE { lmode = lexdb_sql.LOCK_UPDATE } } } }
     let reads0 = txn.readCount()
+    // census: lexdb_plan.censusDml(&q, "MERGE", rs.batch)
     while true {
         try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             held += 2 * lexdb_pipe.rowBytes(r)             // the row found, and its write
@@ -8230,7 +8237,10 @@ fn runSelToIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         var outs: []OutCol = []
         for oc in sel.outs { append(mut &outs, oc.clone()) }
         match got {
-            Ok(n) { return Ok(Res{cols: outs, rows: rows, tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE}) }
+            Ok(n) {
+                // census: lexdb_census.note("pipe", "")
+                return Ok(Res{cols: outs, rows: rows, tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE})
+            }
             Err(x) {
                 // (a value it does not sort: the row engine, nothing given)
                 if !lexdb_pipe.isBat(&x) || asked { return Err(x) }
@@ -8383,17 +8393,22 @@ fn eachRowBIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         })
         sh.giveBack(mut &rs)
         match got {
-            Ok(n) { return Ok(n) }
+            Ok(n) {
+                // census: lexdb_census.note("pipe", "")
+                return Ok(n)
+            }
             Err(x) {
                 // (a value a join's batch cannot hold, an expression it does
                 // not compile: the row engine, when nothing was given yet)
                 if !lexdb_pipe.isBat(&x) || given > 0 { return Err(x) }
+                // census: lexdb_plan.censusNote(sel, "row", "gave way at the run (eachRow)")
                 rs = newRun(&sel.q)
                 rs.limit(&lim)
                 rs.takeShare(sh)
             }
         }
     }
+    // census: if !(rs.batch && pipeRows(sel)) { if rs.batch { lexdb_plan.censusNote(sel, "row", "") } else { lexdb_census.note("off", "") } }
     let sqe = seqEnv(st, txn)
     let m = try prepare(st, txn, &sel.q, params, mut &rs)
     let q = &sel.q
@@ -8521,7 +8536,9 @@ fn pipeSel(sel: mut &Sel) { pipeSelIn(sel, true) }
 // run by it for the row engine (Query.jp, slice P2c).
 fn pipeSelIn(sel: mut &Sel, rows: bool) {
     pipeSelMain(sel, rows)
+    // census: lexdb_plan.censusKeep(sel, false)
     if len(sel.q.levels) > 1 && !pipeJoins(sel) { levelsProg(sel) }
+    // census: lexdb_plan.censusKeep(sel, true)
 }
 
 // The joins of sel's query as a program for the row engine (Query.jp):
@@ -8538,13 +8555,14 @@ fn levelsProgQ(q: mut &Query, held: bool) {
 }
 
 fn levelsProgIn(q: mut &Query, held: bool) {
-    if q.corr || len(q.refs) > 0 || len(q.top) > 0 { return }
-    if !(lexdb_plan.tableRead(&q.levels[0]) || (held && lexdb_plan.heldRead(q, &q.levels[0]))) { return }
+    // census: lexdb_census.reset()
+    if q.corr || len(q.refs) > 0 || len(q.top) > 0 { lexdb_census.no("joins: correlated, or conditions on no table"); return }
+    if !(lexdb_plan.tableRead(&q.levels[0]) || (held && lexdb_plan.heldRead(q, &q.levels[0]))) { if lexdb_census.ON { lexdb_census.no("joins: first level: " + lexdb_plan.levelWhy(q, &q.levels[0])) }; return }
     var cs: []BX = []
     for x in q.levels[0].cond {
         match lexdb_plan.planX(&x, q) {
             Some(b) { append(mut &cs, b) }
-            None { return }
+            None { lexdb_census.no("joins: a first table's condition does not bind (planX)"); return }
         }
     }
     let base = lexdb_plan.filterOver(lexdb_plan.scanArm(q, false), cs, lexdb_plan.subsOf(q))
@@ -8564,6 +8582,7 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
     // (a subquery in FROM: its rows too, held for its level, slice P2)
     for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, sel.q.subs[i].use == lexdb_sql.SUB_FROM) }
     for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], true) }
+    // census: lexdb_census.reset()
     if sel.aggQ {
         if lexdb_plan.aggShape(sel) {
             match lexdb_plan.pipeAgg(sel) {
@@ -8575,10 +8594,13 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
                 }
                 None {}
             }
-        }
+        } else if lexdb_census.ON { lexdb_census.no(&lexdb_plan.aggWhy(sel)) }
         return
     }
-    if !rows || !lexdb_plan.pipeShape(sel) { return }
+    if !rows || !lexdb_plan.pipeShape(sel) {
+        if lexdb_census.ON { if !rows { lexdb_census.no(&("a subquery's or statement's own rows (rows false)" + lexdb_plan.alsoWhy(sel))) } else { lexdb_census.no(&lexdb_plan.shapeWhy(sel)) } }
+        return
+    }
     // the outputs: as bindSel bound them (moved), a column by its slot,
     // else bound for the plan; none if one does not bind (those moved
     // given back)
@@ -8597,6 +8619,7 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
         }
         let b = if c >= 0 { Some(BX.Col(c)) } else { lexdb_plan.planX(&sel.exprs[i], &sel.q) }
         if b.isNone() {
+            lexdb_census.no("an output does not bind (planX)")
             lexdb_plan.oxBack(sel, xs)
             return
         }
@@ -8604,6 +8627,7 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
     }
     let got = lexdb_plan.planConds(sel)
     if got.isNone() {
+        lexdb_census.no("a condition does not bind (planX)")
         lexdb_plan.oxBack(sel, xs)
         return
     }
@@ -8628,6 +8652,7 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
             var o = lexdb_bind.orderOut(&sel.order[oi], &sel.q.cols, &sel.outs, len(sel.exprs))
             if o == -2 {
                 // a position not in the list: the row path's error
+                lexdb_census.no("an ORDER BY position not in the list")
                 lexdb_plan.oxBack(sel, xs)
                 lexdb_plan.unplan(sel, jp)
                 return
@@ -8636,6 +8661,7 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
                 match lexdb_plan.planX(&sel.order[oi], &sel.q) {
                     Some(b) { append(mut &xs, b) }
                     None {
+                        lexdb_census.no("an ORDER BY key does not bind (planX)")
                         lexdb_plan.oxBack(sel, xs)
                         lexdb_plan.unplan(sel, jp)
                         return
@@ -10379,6 +10405,7 @@ fn sortOutRows(sel: &Sel, rows: mut &[]OutRow) {
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
     if len(sel.mr) > 0 {
+        // census: lexdb_census.note("row", "MATCH_RECOGNIZE (execMatch)")
         let r = try execSelIn(st, txn, sel, params, -1, rs)
         return execMatch(&sel.mr[0], r, params, rs)
     }
@@ -10389,15 +10416,22 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
              rs: mut &Run): Result[Res, DbErr] {
     let sqe = seqEnv(st, txn)
-    if len(sel.srf) > 0 { return execSrf(st, txn, sel, params, cap, rs) }
+    if len(sel.srf) > 0 {
+        // census: lexdb_census.note(if rs.batch { "row" } else { "off" }, "a function in FROM (execSrf)")
+        return execSrf(st, txn, sel, params, cap, rs)
+    }
     if rs.batch && pipeRows(sel) && !rs.noLimit {
         // (a value a join's batch cannot hold, an expression it does not
         // compile: the row engine, nothing given yet)
         match pipeHeld(st, txn, sel, params, cap, rs) {
-            Ok(r) { return Ok(r) }
+            Ok(r) {
+                // census: lexdb_census.note("pipe", "")
+                return Ok(r)
+            }
             Err(x) { if !lexdb_pipe.isBat(&x) { return Err(x) } }
         }
     }
+    // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && !rs.noLimit, rs.noLimit)
     // (an aggregate the pipeline runs: its conditions are its plan's, not bound per run)
     let pa = rs.batch && pipeAggs(sel)
     var m = try prepareIn(st, txn, &sel.q, params, rs, !pa, !(pa && pipeJoins(sel)))
@@ -10452,9 +10486,11 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         var kept: [][]Val = []
         // over batches of rows when the query allows (9.47), else row by row
         var batched = false
+        // census: if later && rs.batch && pipeAggs(sel) { lexdb_plan.censusNote(sel, "row", "agg: a correlated subquery in a key or argument (groupCorr)") }
         if !later && rs.batch && pipeAggs(sel) {
             match pipeGroups(st, txn, sel, mut &m, params, rs, mut &gs, if room >= 0 { room - held } else { -1 }) {
                 Ok(h) {
+                    // census: lexdb_census.note("pipe-agg", "")
                     held += h
                     batched = true
                 }
@@ -10462,6 +10498,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     // a value a join's batch cannot hold: the row engine
                     // (its hashes built now), nothing given yet
                     if !lexdb_pipe.isBat(&x) { return Err(x) }
+                    // census: lexdb_plan.censusNote(sel, "row", "agg: gave way at the run (pipeGroups)")
                     gs = Groups{index: newMap(), firsts: [], accs: [], sets: []}
                     try materialize(st, txn, q, mut &m, params, rs)
                 }
@@ -12534,6 +12571,7 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
 
 // Parses and runs SQL text with no parameters (for the tests and tools).
 pub fn (s: mut &Session) exec(sql: &str): Result[[]Res, DbErr] {
+    // census: lexdb_census.statement(sql)
     let stmts = try lexdb_parse.parse(sql)
     var out: []Res = []
     let none: []Val = []

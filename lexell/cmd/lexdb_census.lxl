@@ -1,0 +1,112 @@
+// lexdb_census: which runs the row engine still makes, and the first
+// reason the pipeline declined each (design/lexdb-layers.md 6.4, Q8).
+//
+// A build-time switch, off in every build but a census's
+// (lexell/tools/lexdb_census.py makes a census copy of the tree):
+//
+// - Where a statement runs (the pipeline's, the row engine's, a write's
+//   rows found) and where planning goes through, there is no call at all:
+//   the hooks there are comments, `// census: <call>`, which the census
+//   copy turns into code. A `const` test is not compiled away (about five
+//   instructions a test, measured), so it is kept off those paths.
+// - Where planning gives up on the pipeline (its declined branches) the
+//   calls are code: no(reason) returns at once when ON is false, and
+//   what a reason needs computing is behind `if lexdb_census.ON`.
+//
+// The census copy (ON true) appends a line per run to the file named by
+// $LEXDB_CENSUS (none: no output), tab separated:
+//
+//   test  where  engine  reason  statement
+//
+// test: $LEXDB_CENSUS_TEST (the suite's runner sets it per test in the
+// census copy), else "-"; where: top, or sub inside a subquery's run
+// (runChild); engine: pipe (the pipeline's rows), pipe-agg (its groups;
+// exec makes the outputs over them), row (the row engine: runQuery's
+// levels, exec's aggregates, sort, windows ...), dml (a write's rows found
+// by runQuery), off (SET lexdb_batch = off: the tests' oracle); reason:
+// for row, the first reason the plan was not the pipeline's (planning
+// notes it with no, pipeSelMain keeps it per Sel with keep) or the run's
+// give-way; statement: the text being run (Session.exec, the wire's
+// query), its first 200 bytes.
+//
+// Imports only lexell's libraries: the planner and the pipeline note
+// their reasons here.
+import "io"
+import "os"
+import "strings"
+
+pub const ON: bool = false
+
+var why: str = ""           // the first reason the plan being made was declined for
+var stmt: str = ""          // the statement running
+var kept: str = ""          // per Sel declined, "\x01" its key (lexdb_plan.censusKey) "\x02" its reason
+var depth: int = 0          // subquery runs nested (runChild)
+var out: str = ""           // $LEXDB_CENSUS, read once
+var test: str = ""
+var read: bool = false
+
+// The plan being made starts with no reason.
+pub fn reset() { why = "" }
+
+// A reason the plan being made is not the pipeline's: the first is kept.
+pub fn no(r: &str) { if ON && len(why) == 0 { why = r.toStr() } }
+
+// The reason noted since reset ("" none), cleared.
+pub fn take(): str {
+    let r = why.clone()
+    why = ""
+    return r
+}
+
+// The statement the next runs are of.
+pub fn statement(s: &str) {
+    var t = strings.replaceAll(s, "\n", " ")
+    t = strings.replaceAll(&t, "\t", " ")
+    stmt = if len(t) > 200 { strings.substr(&t, 0, 200) } else { t }
+}
+
+// A declined Sel's reason, by its key; the last kept for a key wins.
+pub fn keep(k: &str, r: &str) { kept = kept + "\x01" + k + "\x02" + r }
+
+pub fn reasonOf(k: &str): str {
+    let all = kept.clone()
+    let at = strings.lastIndexOf(&all, &("\x01" + k + "\x02"))
+    if at < 0 { return "not offered to the pipeline (no pipeSel: a write's subquery, ...)" }
+    let from = at + len(k) + 2
+    let end = strings.indexOf(&all, "\x01", from)
+    return strings.substr(&all, from, if end < 0 { len(all) } else { end })
+}
+
+// The coverage census (lexdb_census.py copy --cover, --blocks): function or
+// block i (numbered across the modules covered), named n, entered; its
+// first entry in the process writes a line ("cover", n). Hook comments, so
+// a normal build has no global to make at its start (an array's costs
+// about 500 instructions).
+// census: var seen: []bool = []
+// census: pub fn hit(i: int, n: &str) {
+// census:     if len(seen) == 0 { seen = array(65536, false) }
+// census:     if i >= len(seen) || seen[i] { return }
+// census:     seen[i] = true
+// census:     note("cover", n)
+// census: }
+
+// SET lexdb_batch = off made on (lexdb_census.py copy --force-batch, so
+// $LEXDB_CENSUS_FORCE set): which code only the tests' reference runs.
+pub fn forced(): bool { return ON && os.envOr("LEXDB_CENSUS_FORCE", "") == "1" }
+
+pub fn enter() { depth += 1 }
+pub fn leave() { depth -= 1 }
+
+// One run's line.
+pub fn note(engine: &str, reason: &str) {
+    if !ON { return }
+    if !read {
+        read = true
+        out = os.envOr("LEXDB_CENSUS", "")
+        test = os.envOr("LEXDB_CENSUS_TEST", "-")
+    }
+    if len(out) == 0 { return }
+    let w = if depth > 0 { "sub" } else { "top" }
+    let path = out.clone()
+    let r = io.appendTo(&path, &(test.clone() + "\t" + w + "\t" + engine + "\t" + reason + "\t" + stmt.clone() + "\n"))
+}
