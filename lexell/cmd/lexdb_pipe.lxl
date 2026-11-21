@@ -7786,6 +7786,72 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
     return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
 }
 
+// compileLevels for a write's rows (Q8 R5, design/lexdb-layers.md
+// 6.3.Q8 R5): a join tree (compileLevels), or one table's Filter? (Scan):
+// a point of its whole primary key (point: lexdb_plan.pointRead; run
+// PR_POINT, read by pointRows), else its first arm alone, run by
+// runLevels. Err(p): neither.
+pub fn compileRows(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, point: bool): Result[Prog, lexdb_plan.PPlan] {
+    match p {
+        lexdb_plan.PPlan.Join(_, _) { return compileLevels(p, cols) }
+        else {}
+    }
+    if point {
+        match lexdb_plan.pLeaf(&p) {
+            lexdb_plan.PPlan.Scan(sc, subs) {
+                if !sc.batch && sc.held < 0 && joinRuns1(&sc, &subs, cols) { return Ok(Prog{plan: p, ops: 1, groups: false, joins: false, sorts: false, run: lexdb_plan.PR_POINT}) }
+            }
+            else {}
+        }
+    }
+    var avail: []bool = array(len(cols), false)
+    if joinOps(&p, cols, mut &avail) < 0 {
+        // census: lexdb_census.no("write: its table's rows not read by the pipeline (joinOps)")
+        return Err(p)
+    }
+    return Ok(Prog{plan: p, ops: 2, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
+}
+
+// Runs a write's point program (compileRows, PR_POINT: Filter? (Scan) of
+// one key) over the key's scan s (one point, or none): the row read and
+// its conditions as a join over a point reads its first table's
+// (pointGet), the row (the query's columns) to each; counted as the row
+// engine counts it (runLevel, tryRow).
+pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                 s: &lexdb_access.Scan, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+                 each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    runs += 1
+    writePoints += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    let noX: []BX = []
+    let conds = match pg.plan {
+        lexdb_plan.PPlan.Filter(_, cs) { &cs }
+        else { &noX }
+    }
+    let sc0 = match pg.plan {
+        lexdb_plan.PPlan.Filter(i, _) {
+            match i {
+                lexdb_plan.PPlan.Scan(s1, _) { &s1 }
+                else { return Err(e("XX000", "a write's point program without its scan")) }
+            }
+        }
+        lexdb_plan.PPlan.Scan(s1, _) { &s1 }
+        else { return Err(e("XX000", "a write's point program without its scan")) }
+    }
+    cnt[0].starts += 1
+    if s.empty { return Ok(Unit{}) }
+    let rel = lexdb_catalog.relOf(t)
+    var row: []Val = array(len(cols), Val.Null)
+    if try pointGet(st, txn, &rel, sc0, conds, s, cx, bud, cnt, mut &row) { let more = try each(txn, &row) }
+    return Ok(Unit{})
+}
+
+// Runs of pointRows and of runLevels (the tests' look).
+var writePoints: int = 0
+var levelRuns: int = 0
+
+pub fn rowsRuns(): []int { return [writePoints, levelRuns] }
+
 // Runs a levels program (compileLevels): each joined row (the query's
 // columns its tables decode, the others NULL) to each, in the row
 // engine's order; false from each stops. An error of each is given as is
@@ -7797,6 +7863,7 @@ pub fn runLevels(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     runs += 1
     joinRuns += 1
     batchRuns += 1
+    levelRuns += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     let nq = len(cols)
     var kinds: []int = []
@@ -8288,20 +8355,9 @@ fn pointJProj(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pr: &lexdb_plan
             cnt[0].starts += 1
             if lim == 0 { return Ok(0) }
             if s.empty { return Ok(0) }
-            // (its point's row, as fetch reads one)
             let rel = lexdb_catalog.relOf(tabs[0])
-            let all: []bool = []
-            var r = match try lexdb_access.getRow(st, txn, &rel, &lexdb_access.rowRead(&rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
-                Some(x) { x }
-                None { return Ok(0) }
-            }
             var sr = Scalar{row: array(len(cols), Val.Null), vals: [], none: lexdb_rows.noOutBatch(), n: 0, stop: false}
-            try bud.tick()
-            for i in 0..len(r) { sr.row[sc0.first + i] = replace(mut &r[i], Val.Null) }
-            cnt[0].read += 1
-            let noAggs: []Val = []
-            for c in conds { if lexdb_ops.truth(&(try bxEval(&c, &sr.row, &noAggs, cx))) != Some(true) { return Ok(0) } }
-            cnt[0].joined += 1
+            if !(try pointGet(st, txn, &rel, sc0, conds, s, cx, bud, cnt, mut &sr.row)) { return Ok(0) }
             try pointLevel(st, txn, &top, n, 0, tabs, &xs, cx, lim, bud, cnt, srt, give, mut &sr)
             cnt[ops - 1].joined += sr.n
             return Ok(sr.n)
@@ -8350,13 +8406,34 @@ fn stopRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
 fn pointFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, n: int, r: mut &[]Val, sc0: &lexdb_plan.PScan, conds: &[]BX,
               tabs: &[]&lexdb_catalog.Table, xs: &[]BX, cx: &Ctx, lim: int, bud: mut &Budget, cnt: mut &[]Counts, srt: mut &SortRun,
               give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], sr: mut &Scalar): Result[Unit, DbErr] {
+    if !(try firstKept(r, sc0, conds, cx, bud, cnt, mut &sr.row)) { return Ok(Unit{}) }
+    return pointLevel(st, txn, top, n, 0, tabs, xs, cx, lim, bud, cnt, srt, give, sr)
+}
+
+// The row of the first table's point s (one key, not empty) read as
+// fetch reads one (getRow), into row (firstKept): false if there is none
+// or it fails its conditions. (pointJProj's; a write's point, pointRows.)
+fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, sc0: &lexdb_plan.PScan, conds: &[]BX, s: &lexdb_access.Scan,
+            cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, row: mut &[]Val): Result[bool, DbErr] {
+    let all: []bool = []
+    var r = match try lexdb_access.getRow(st, txn, rel, &lexdb_access.rowRead(rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
+        Some(x) { x }
+        None { return Ok(false) }
+    }
+    return firstKept(mut &r, sc0, conds, cx, bud, cnt, row)
+}
+
+// A row r of the first table (its values moved out into row): counted
+// read, its conditions in order by the scalar evaluator, counted kept;
+// false: a condition not true.
+fn firstKept(r: mut &[]Val, sc0: &lexdb_plan.PScan, conds: &[]BX, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, row: mut &[]Val): Result[bool, DbErr] {
     try bud.tick()
-    for i in 0..len(r) { sr.row[sc0.first + i] = replace(mut &r[i], Val.Null) }
+    for i in 0..len(r) { row[sc0.first + i] = replace(mut &r[i], Val.Null) }
     cnt[0].read += 1
     let noAggs: []Val = []
-    for c in conds { if lexdb_ops.truth(&(try bxEval(&c, &sr.row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
+    for c in conds { if lexdb_ops.truth(&(try bxEval(&c, row, &noAggs, cx))) != Some(true) { return Ok(false) } }
     cnt[0].joined += 1
-    return pointLevel(st, txn, top, n, 0, tabs, xs, cx, lim, bud, cnt, srt, give, sr)
+    return Ok(true)
 }
 
 // The Join arms over p's first table.
