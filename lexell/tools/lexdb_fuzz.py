@@ -1002,7 +1002,10 @@ class Gen:
             return None
         part = r.sample(cols, min(len(cols), r.choice([0, 0, 1, 1, 2])))
         ps = ('partition by ' + ', '.join(c[0] for c in part) + ' ') if part else ''
-        allord = 'order by ' + ', '.join(c[0] for c in cols)
+        # every column in scope, floats too: rows equal in this order are equal
+        # in every column the query can show, so one function that depends on
+        # the order among peers (win='peer') still has one answer
+        allord = 'order by ' + ', '.join(c[0] for c in ctx.cols)
         o = r.sample(cols, min(len(cols), r.choice([1, 1, 2])))
         os_ = 'order by ' + ', '.join('%s%s' % (c[0], r.choice(['', ' desc', ' nulls first'])) for c in o)
         wctx = Ctx(ctx.cols, nosub=True)
@@ -1020,11 +1023,11 @@ class Gen:
             if x < 0.45:
                 return E('count(*) over (%s)' % ps.strip(), [], 'int', win=True)
             if x < 0.6:
-                return E('row_number() over (%s%s)' % (ps, allord), [], 'int', win=True)
+                return E('row_number() over (%s%s)' % (ps, allord), [], 'int', win='peer')
             if x < 0.7:
-                return E('ntile(%d) over (%s%s)' % (r.choice([2, 3]), ps, allord), [], 'int', win=True)
+                return E('ntile(%d) over (%s%s)' % (r.choice([2, 3]), ps, allord), [], 'int', win='peer')
             fn = r.choice(['lag', 'lead'])
-            return E('%s({0}) over (%s%s)' % (fn, ps, allord), [arg('int')], 'int', win=True)
+            return E('%s({0}) over (%s%s)' % (fn, ps, allord), [arg('int')], 'int', win='peer')
         if cat in ('num', 'int'):
             pass
         if cat == 'num':
@@ -1035,13 +1038,13 @@ class Gen:
                 return E('avg({0}) over (%s)' % ps.strip(), [self.expr(wctx, r.choice(['int', 'num']), 1)], 'num',
                          win=True)
             return E('sum({0}) over (%s%s rows between 1 preceding and current row)' % (ps, allord),
-                     [arg('num')], 'num', win=True)
+                     [arg('num')], 'num', win='peer')
         if cat in ('text', 'date'):
             x = r.random()
             if x < 0.5:
                 return E('%s({0}) over (%s%s)' % (r.choice(['min', 'max']), ps, os_), [arg(cat)], cat,
                          win=True)
-            return E('first_value({0}) over (%s%s)' % (ps, allord), [arg(cat)], cat, win=True)
+            return E('first_value({0}) over (%s%s)' % (ps, allord), [arg(cat)], cat, win='peer')
         return None
 
     # -- subqueries
@@ -1201,10 +1204,19 @@ class Gen:
         else:
             ictx = Ctx(scope, depth=depth, outer=outer)
             items = []
+            peer = False
             for cat in outcats:
                 e = None
                 if mode in ('top', 'derived', 'cte') and r.random() < 0.08:
                     e = self.window(ictx, cat)
+                    # at most one function whose value depends on the order
+                    # among peers: two (row_number and a ROWS sum over
+                    # different partitions, w0-0257) may pair their values
+                    # with equal rows either way
+                    if e is not None and e.win == 'peer':
+                        if peer:
+                            e = None
+                        peer = True
                 items.append(e or self.expr(ictx, cat, r.choice([0, 1, 1, 2])))
         q.items = [[e, self.alias('x')] for e in items]
         if mode not in ('scalar', 'exists') and not grouped and r.random() < 0.12:
