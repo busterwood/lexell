@@ -1185,6 +1185,78 @@ fn fetchSorted(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: i
     return Ok(Unit{})
 }
 
+// ---- the OR of index paths (optimizer 52)
+//
+// PostgreSQL's BitmapOr in lexdb's terms: the rows of several index paths
+// (one per branch of an OR), each row once. Each arm's entries' primary
+// keys are collected, sorted and deduplicated, and its rows read by them
+// as primary key points, in key order (as an IN list's on the primary key:
+// the readers' points), the level's conditions checked on each.
+
+// One arm: its index (-1 the primary key) and its ranges (pathScans').
+pub type OrArm = record { pub ix: int; pub scans: []Scan }
+
+// The keys an OR collects at most: past them the table is read whole
+// (the scan's cost is bounded; the planner takes an OR well below it).
+const OR_KEYS = 262144
+
+var orKeysMax: int = OR_KEYS
+
+// The most keys an OR collects (the tests: a small table read whole; 0 OR_KEYS).
+pub fn setOrKeys(n: int) { orKeysMax = if n > 0 { n } else { OR_KEYS } }
+
+// The ORs read by their keys (the tests).
+var orReadN: int = 0
+pub fn orReads(): int { return orReadN }
+
+// The rows of arms' ranges as points of t's primary key, each once, in key
+// order; the whole table (wholeScan) past orKeysMax keys, or when an arm
+// reads it whole.
+pub fn orPoints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, arms: &[]OrArm): Result[[]Scan, DbErr] {
+    var pks: []str = []
+    var over = false
+    for a in arms {
+        let tree = if a.ix < 0 { t.tree } else { t.indexes[a.ix].tree }
+        let byPk = a.ix < 0
+        for sc in a.scans {
+            if over { break }
+            if sc.empty { continue }
+            if sc.whole { return Ok([wholeScan()]) }
+            if sc.point {
+                if len(pks) == orKeysMax {
+                    over = true
+                    break
+                }
+                append(mut &pks, sc.lo.clone())
+                continue
+            }
+            try st.scanLeaves(txn, tree, &sc.lo, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+                var k = i
+                while k < j {
+                    if len(pks) == orKeysMax {
+                        over = true
+                        return false
+                    }
+                    append(mut &pks, if byPk { lexdb_rows.leafKey(leaf, k) } else { lexdb_rows.leafVal(leaf, k) })
+                    k += 1
+                }
+                return true
+            })
+        }
+        if over { break }
+    }
+    if over { return Ok([wholeScan()]) }
+    idxTaken += len(pks)
+    orReadN += 1
+    let ks = sortedKeys(pks)
+    var out: []Scan = withCapacity(len(ks))
+    for i in 0..len(ks) {
+        if i > 0 && ks[i] == ks[i - 1] { continue }
+        append(mut &out, Scan{empty: false, point: true, lo: ks[i].clone(), hi: "", whole: false})
+    }
+    return Ok(out)
+}
+
 // The next batch of an index read alone: up to BROWS entries from the
 // cursor on (the cursor as fetch keeps it: forward, the key to go on
 // from; backward, the end), their keys decoded. Forward from the leaves

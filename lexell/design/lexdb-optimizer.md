@@ -4324,3 +4324,103 @@ rounds): -0.08 instructions a select; 5d alone (140f687f's tree) -0.14.
   / DISTINCT / windows inside.
 - 9.9's own hashed probe (a scalar used anywhere else, a grouped query's)
   still evaluates the value over no rows eagerly.
+
+## 52. The OR of index paths: PostgreSQL's BitmapOr for lexdb (2026-11-21, paused)
+
+Follow-up to 47.8 ("Next"), aimed at TPC-H q19 (lexdb-benchmarks.md 1.6:
+95 ms against PostgreSQL's 45 on one core, the worst ratio, 2.1). **Paused
+by the coordinator on 21 Nov; this is the hand-over.** Branch
+`worktree-agent-acfb0d7e8d09b83fd` from main 757c4cee, one WIP commit.
+
+### 52.1 Measured first (main 757c4cee, `-O`, SF1, `~/tpch-w/q19`, warm)
+
+lexdb EXPLAIN ANALYZE (second run; the first, cold, 414 ms):
+
+```
+scan part: full scan (rows read 200000, kept 485, batches 196)
+join lineitem: index lineitem_part_supp range (estimated 61 rows) per row (lookups 485, rows read 14301, joined 121)
+aggregate
+result: 1 rows in 80.919 ms
+```
+
+PostgreSQL 18 (one core, `max_parallel_workers_per_gather=0`, the bench's
+settings), EXPLAIN ANALYZE warm: **15.1 ms** execution (the bench's 45 ms
+is psql's wall time, planning and connection included). Its plan: Bitmap
+Heap Scan on part over a `BitmapOr` of three `part_brand_container` scans
+(794 + 755 + 773 entries; each `p_brand = X AND p_container = ANY(4)`),
+1,767 heap blocks, the rest filtered to 485 rows in **1.7 ms**; then a
+Nested Loop with an Index Scan on `lineitem_part_supp` per part row (485
+loops, 0.027 ms each, **13 ms**), the OR rechecked as a filter.
+
+So lexdb's 81 ms is part's full scan under the OR (47.7's profile: 48%,
+about 39 ms against PostgreSQL's 1.7) and the 485 lookups into lineitem
+(43%, about 35 ms against PostgreSQL's 13). The BitmapOr closes the first;
+the second (14,301 lineitem rows by primary key through the secondary
+index, 2.4 us a row against PostgreSQL's 0.9) is the next measurement:
+not profiled yet (the perf run was aborted by the pause; the base binary
+with its symbol map is `~/tpch-w/q19/bin/lexdb-q19base-O` + `base.map`,
+byte-identical to `~/tpch-w/bind/os/lexdb-757c4cee-O`).
+
+### 52.2 The design (as written in the WIP)
+
+- **The plan** (`lexdb_plan`): `Level.ors: []Path`, the arms, one per
+  branch of an OR conjunct. `planFrom`, after `choosePath`, for the first
+  table or a table read once, cost planner, a SELECT (`reorder`), no outer
+  join, when the chosen path is a full scan: `orPaths(q, k, cs, params)`.
+  It takes each OR conjunct on the level's columns alone that cannot fail
+  (`cannotFail`, immutable, no subquery, no parameter: `anyParam`), and
+  for each branch runs `choosePath` over the branch's conjuncts plus the
+  non-OR conjuncts beside it; every branch must get an index (or primary
+  key) path, forward, not an IN subquery, of constants only. Cost: per arm
+  `COST_DESCENT` per IN value + `rows * COST_SORTED_ROW` (each row read by
+  key, as 47's); taken where twice the sum is under `rows * COST_SCAN`
+  (scanFirst's lean). Without statistics only when every arm is a unique
+  key (`uniquePath`). The cheapest OR conjunct wins.
+- `orRead(q, k)` (as `keyOrdered`): ors set, the path still a full scan,
+  not `keeps`/`stops`/locked/virtual/semi/anti/per-row. EXPLAIN
+  (`pathTextAt` -> `orText`): `any of index part_brand_container lookup
+  for each of 4 values, ...; rows in key order (estimated N rows)`;
+  `estRows` the arms' figures summed (`orEst`). `orderLookups` leaves an
+  OR level alone.
+- **The reading** (`lexdb_access.orPoints`): `OrArm{ix, scans}`; each
+  arm's ranges read in place (`scanLeaves`; an index's entries give the
+  primary key, `leafVal`; a primary key arm its keys, `leafKey`; a point
+  as is), sorted (`sortedKeys`), deduplicated, returned as primary key
+  **points** in key order. Past `OR_KEYS` (256k, `setOrKeys` for tests)
+  or an arm read whole: `[wholeScan()]`. So every reader (pipeline
+  `runScan`'s point list, `readRows`, the aggregate's, the row engine's
+  `fetch`, the batch driver) reads it as it reads an IN list on the
+  primary key, with no reader changed, and rows come in primary key order
+  with batches on and off (the full scan's order too). The level's
+  conditions keep the whole OR, so each row is rechecked and a row of
+  several arms appears once.
+- **exec glue**: `levelScans(st, txn, q, k, env)` (pathScans, or the arms'
+  pathScans into `orPoints`), at the five first-table / read-once sites
+  (materialize, runLevel, pipeSrcQ, joinSrcsQ, bLevelPlan); the point
+  select's `pipeFetch` is untouched.
+- **Switch**: `lexdb_plan.setOrPaths(OR_COST | OR_NEVER | OR_ALWAYS)`
+  (OR_NEVER: the plans before; OR_ALWAYS: tests on small tables). The
+  rules planner never takes it.
+
+### 52.3 State and next steps
+
+- Done: the code above; the branch **compiles** with `-O`
+  (`~/tpch-w/q19/bin/lexdb-q19-O`). Nothing run on it: no suite, no
+  EXPLAIN of q19, no timing.
+- Next: (1) run q19's EXPLAIN ANALYZE on the branch and check the plan and
+  the 485 rows / checksum; (2) the suite; (3) tests (`exec_orpath`: ORs of
+  ranges on one and several indexes and the primary key, overlapping arms,
+  NULL and empty arms, ORDER BY / LIMIT over it, an error in a later
+  batch, batches on and off, OR_NEVER and the rules planner the same rows,
+  the T-SQL and Oracle doors); (4) whether the point lists are read well
+  enough by `readRows` (row by row, a `get` a point: 2,322 for q19) and
+  by `aggBatches` (one batch a point): if not, read `src.pts` there with
+  `fillPoints`; (5) profile the 485 lineitem lookups (52.1); (6) the
+  gates: point selects / INSERT / UPDATE instructions (Level grew a field;
+  levelScans adds a call at the five sites), TPC-H all 22 (only q19's plan
+  should change: q7's per-table OR has no index, q19's lineitem OR is per
+  row).
+- Open by design: ORs with parameters (a kept plan does not recheck their
+  figures; a counted fallback at run time would allow them), an OR under
+  ORDER BY the primary key (keeps turns it off though the points are in
+  that order), DML targets (planFrom's `reorder` is false for them).
