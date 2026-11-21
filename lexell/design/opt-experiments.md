@@ -61,7 +61,20 @@ Results:
 It passes the second rule of "Judging a pass" (the compile suite gains and the run suite
 is not worse). `gate.sh quick` passes, and the native self-build reaches its fixed point.
 The win is small, because the run suite and the compiler have few long chains. Its natural
-target is lexdb's per-value matches, and a TPC-H run would show that. **Not run yet.**
+target is lexdb's per-value matches, and TPC-H shows it there.
+
+**TPC-H** (SF1, lexdb only; lexdb at main `52fe2606` built `-O` by main's compiler and by
+this one):
+
+- **Order:** runs ABBA, one at a time, each under the exclusive bench lock
+  (`~/tpch-w/opt/ab.sh`).
+- **Results:** identical on all 22 queries in all four runs, all `ok` against PostgreSQL's.
+- **Instructions:** the server's user instructions per query (`iq.sh`) fall on 20 of 22
+  queries. Geomean -0.68%; q6 -3.07%, q7 -2.03%, q22 -1.96%, q1 -1.37%, q12 -1.28%,
+  q19 -1.02%. Up: q5 +0.15%, q17 0.00%.
+- **Time:** CPU total 11,731 to 11,512 ms (-1.86%), geomean -1.84%. Same sign as the
+  instructions, inside the placement noise.
+- **lexdb suite:** 271/271 with the new compiler (`LXL_NOCACHE=1`).
 
 ## 2. Counted, not built
 
@@ -137,8 +150,7 @@ which shows up as branch misses at equal instructions (pts.sh, R1/R6), not as i-
 
 ## 5. Next, in order
 
-1. A TPC-H run of lexdb built by `3a6f4ddf` against main (checksums equal, q1/q6 and the
-   string-heavy queries), to see whether the per-value matches move. If they do, merge.
+1. Done: TPC-H (section 1); merged into main.
 2. A census of drop-then-alloc pairs of one size class (runtime counters), to bound
    Perceus-style reuse.
 3. Scalar replacement of small records (review 1, 1.2) remains the largest structural
