@@ -297,6 +297,9 @@ pub type PJoin = record {
     // range's bounds' column's type after them
     pub ktypes: []lexdb_sql.TypeName
     pub exact: bool             // JH_HASH: its key columns compared under no collation
+    // JH_HASH: per key column the collation it compares under (lexdb_sql.COLL_*;
+    // [] none): both sides' keys made its collated values (Q8 R4)
+    pub colls: []int
     pub conds: []lexdb_bind.BX  // per candidate row: the join's conditions but those its hash applied
     pub keq: int                // JH_HASH: the one key's equality among conds (-1 none): left out where the hash compares by value
     pub post: []lexdb_bind.BX   // a LEFT JOIN's WHERE conjuncts, after its NULL rows are made
@@ -496,8 +499,7 @@ pub fn noScan(): PScan { return PScan{level: -1, first: 0, kinds: [], need: [], 
 // The query's columns x reads, set in used.
 fn uses(x: &lexdb_bind.BX, used: mut &[]bool) {
     var slots: []int = []
-    var par = false
-    let r = lexdb_bind.reslot(x, mut &slots, mut &par)
+    lexdb_bind.colsRead(x, mut &slots)
     for i in slots { if i >= 0 && i < len(used) { used[i] = true } }
 }
 
@@ -525,6 +527,13 @@ pub const PR_POINT: int = 1
 // sequence, session or catalog function's call: lexdb_bind.evalMark), which
 // its run's owner evaluates (Q8 R2)
 pub const PR_EVAL: int = 2
+// a join over a point (Q8 R4: lexdb_exec.pipeFetchJ): no subquery, its
+// first table read by its whole primary key, every table after it looked
+// up by its whole primary key (lexdb_pipe.pointJoins)
+pub const PR_POINTJ: int = 3
+// a join under a first table that stops early, every table after it looked
+// up by its whole primary key, no subquery (Q8 R4: lexdb_exec.pipeStopJ)
+pub const PR_STOPJ: int = 4
 
 // A subquery of a query: what it is (lexdb_sql.SUB_*), how the executor
 // runs it (RUN_*), NOT EXISTS's (an anti join) for RUN_SEMI and
@@ -7384,13 +7393,12 @@ fn noJoin(lv: &Level) {
 // a Join arm per level (slice P2), its keys, conditions and WHERE
 // conjuncts bound for the plan, its table's arm (lexdb_plan.PJoin): a
 // hash (read once) of a table, a lookup per row by its whole primary key,
-// or a range per row (as the batch driver chose them, bJoinPlan: not
-// where the first table's reading may stop early). Err(base): a level the
+// or a range per row (as the batch driver chose them, bJoinPlan; under a
+// first table that may stop early too, Q8 R4). Err(base): a level the
 // pipeline does not join (a subquery's or CTE's rows, LATERAL, a semi or
 // anti join, RIGHT or FULL, a locked table, a per-row path of another
 // kind, a collation's key, an expression that does not bind).
 pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
-    let l0 = &q.levels[0]
     var p = base
     var k = 1
     while k < len(q.levels) {
@@ -7436,16 +7444,18 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
             // census: lexdb_census.no("join: an optimizer-50 level read per row")
             return Err(p)
         }
-        let look = lv.perRow && !l0.stops && lv.semiSub < 0 && lookupPath(q, lv)
-        let range = lv.perRow && !l0.stops && !look && rangePath(q, lv)
+        // (under a first table that stops early too: the pipe joins its
+        // rows in slices that grow, Q8 R4)
+        let look = lv.perRow && lv.semiSub < 0 && lookupPath(q, lv)
+        let range = lv.perRow && !look && rangePath(q, lv)
         if lv.perRow && !look && !range {
-            // census: lexdb_census.no(if l0.stops { "join: read per row under a first table that stops early (LIMIT)" } else { "join: read per row, neither a key lookup nor a range" })
+            // census: lexdb_census.no("join: read per row, neither a key lookup nor a range")
             return Err(p)
         }
         let t = &lv.t
         var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
                                  scan: joinScan(q, k),
-                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index,
+                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: lv.path.index,
                                  rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         j.mark = mark
         if !lv.perRow {
@@ -7460,26 +7470,34 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                     }
                 }
             }
-            // (no key: an inner join of every pair, its conditions per pair)
+            // (no key: a join of every pair, its conditions per pair; a LEFT,
+            // RIGHT or FULL JOIN's unmatched rows as a hash's, Q8 R4)
             if len(lv.hashCols) == 0 {
-                if !inner || mark != MK_JOIN || lv.resNot {
-                    // census: lexdb_census.no("join: no hash key, not an inner join")
+                if mark != MK_JOIN || lv.resNot {
+                    // census: lexdb_census.no("join: no hash key, a semi, anti or mark join")
                     return Err(p)
                 }
             } else if len(lv.hashVals) != len(lv.hashCols) {
                 // census: lexdb_census.no("join: hash keys and values differ")
                 return Err(p)
             }
+            // (a collation's key, Q8 R4: a table's hash of a join, its keys
+            // made their collated values)
             for hk in lv.hashKinds {
                 if hk != lexdb_sql.COLL_EXACT {
-                    // census: lexdb_census.no("join: a collation's hash key")
-                    return Err(p)
+                    if mark != MK_JOIN || lv.virt() {
+                        // census: lexdb_census.no("join: a collation's hash key, not a table's join")
+                        return Err(p)
+                    }
+                    j.colls = collections.copyOf(&lv.hashKinds)
                 }
             }
             for i in 0..len(lv.hashCols) {
                 append(mut &j.hcols, lv.hashCols[i])
                 append(mut &j.ktypes, boundType(&t.cols[lv.hashCols[i]].typ))
-                match planX(&lv.hashVals[i], q) {
+                // (a collation's key: its value without its #ci or #pad, the
+                // hash makes both sides' collated values)
+                match planX(if len(j.colls) > 0 { unColl(&lv.hashVals[i]) } else { &lv.hashVals[i] }, q) {
                     Some(b) { append(mut &j.keys, b) }
                     None {
                         // census: lexdb_census.no("join: an expression does not bind (planX)")
@@ -7562,6 +7580,16 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         k += 1
     }
     return Ok(p)
+}
+
+// x without the #ci or #pad L2 wraps a collated comparison's sides in
+// (lexdb_bind's), else x.
+fn unColl(x: &Expr): &Expr {
+    match x {
+        Expr.Call(f, args, _) { if (f == "#ci" || f == "#pad") && len(args) == 1 { return &args[0] } }
+        else {}
+    }
+    return x
 }
 
 // An optimizer 50 level's correlation keys when it holds IN's summary (a
@@ -7693,7 +7721,7 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
     if g + q.levels[g].grp >= len(q.levels) || !grpPlain(q, g) { return None }
     let hub = &q.levels[g]
     var j = PJoin{how: JH_JOIN, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: noScan(), build: [], hcols: [], keys: [],
-                  ktypes: [], exact: true, conds: [], keq: -1, post: [], index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
+                  ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
     j.scan.level = g
     var hb: []BX = []
     for x in hub.local {
@@ -7708,7 +7736,7 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
     for l in g..grpEnd(q, g) + 1 {
         let lv = &q.levels[l]
         var m = PJoin{how: JH_HASH, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: joinScan(q, l), build: [], hcols: [], keys: [],
-                      ktypes: [], exact: true, conds: [], keq: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
+                      ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         var mkey = -1
         for x in lv.cond {
             let lo = q.minLevel(&x)

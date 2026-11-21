@@ -7295,6 +7295,228 @@ division by zero); `2 union 2.0` shows 2 where SQL Server shows 2.0; a
 parenthesized set operation in FROM gives 50000 (T-SQL), ORA-03001
 (Oracle), 0A000 (PostgreSQL's door).
 
+### 6.3.Q8 R4 as built (2026-11-21)
+
+R4 of 6.5: the joins the row engine still ran. Branch
+`worktree-agent-a0d20a1cfe28cb753` from main 52fe2606, main 8bf070ae merged in (the compiler's jump tables and bit tests; the gates are against it). `SET lexdb_batch =
+off` (the row engine, the tests' reference) is untouched: `runLevel` and
+the levels program stay, now the reference only for these shapes.
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 52fe2606 | | 20,104 | `lexdb_pipe` 8,088, `lexdb_plan` 8,822, `lexdb_bind` 2,531 |
+| 6fbe8d75 | a join over a point (`PR_POINTJ`, `runPointJ`), a point first table in any join, lookups and ranges under a stopping first table (`joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key, `colsRead`/`colsIn`; tests `exec_r4`, `tds_r4`, `tns_r4`; eight tests' counters | 20,133 | `lexdb_pipe` 8,379, `lexdb_plan` 8,847, `lexdb_bind` 2,595 |
+| 24b75e65 | the stopping first table's lookups by the point path (`stopRows`) | 20,142 | `lexdb_pipe` 8,439 |
+| eeb55ab7 | main 8bf070ae merged (the compiler) | 20,142 | |
+| d2d138ad | `PR_STOPJ` (`pipeStopJ`, `runStopJ`): the point join pays no test for it | 20,159 | `lexdb_pipe` 8,479, `lexdb_plan` 8,850 |
+
+`lexdb_exec` +55: `pipeFetchJ` and `pipeStopJ` (their scans need exec's
+`pathScan`, `pipeSrcQ`, `Env`, `seqEnv`) and their dispatch in `runPipe`;
+the paths are the pipe's.
+
+**What it does.**
+
+- **A join over a point** (the OLTP 3-table join, `simple.sh`'s: a first
+  table read by its whole primary key, every table after it looked up by
+  its whole primary key, inner or LEFT, no mark): its own path, as Fetch is
+  a point select's (6.3.Q8 first part). `compileP` marks the program
+  `PR_POINTJ` (`lexdb_pipe.pointJoins`: `Limit? (Sort? | Distinct?
+  (Project (Join (... (Filter? (Scan)), JH_LOOK) ...)))`, the first table
+  not batched); exec's `pipeFetchJ` makes its one scan (`pathScan`, as
+  `pipeFetch`) and `lexdb_pipe.runPointJ` reads the row (`getRow`), then
+  each level by the scalar evaluator: its keys by `bxEval`, made keys as
+  the row engine makes them (`keyOf`: NULL or out of the column's range,
+  no row), its row by `getRow`, its conditions in order, a LEFT JOIN's
+  NULL row, its WHERE conjuncts after it, the outputs given (to the Sort
+  or Distinct if the plan has one). Counted as the joins count a lookup's
+  chunk of one (EXPLAIN ANALYZE as the row engine's); an error is the
+  first failing row's. The general join path (`runJ`) for such a chunk of
+  one cost 567k instructions a statement against the row engine's 459k;
+  `runPointJ` the row engine's (below). Its plan skips `needs` (the rows read whole,
+  as the row engine reads them).
+- **A point first table in any join** (6.4's "a join's first table not read
+  in batches", 6,085 runs, nearly all `exec_unnest`'s nested correlated NOT
+  IN): `joinOps` takes a first table read row by row (its points, an IN
+  list: `readRows` puts them in batches), as R6 had for an Apply's plan
+  only; the `rows` flag is gone. The row engine's levels program
+  (`compileLevels`) takes them too.
+- **Lookups and ranges per row under a first table that stops early** (a
+  LIMIT, an EXISTS's or a scalar subquery's first rows; 329 runs):
+  `joinsOver` no longer declines them. Where every table after the first
+  is a whole-key lookup, the point path runs them too (`pointJoins`: a
+  first table that stops early, `PR_STOPJ`; exec's `pipeStopJ` makes its
+  `Src` as `pipeSrcQ` does, a plain scan's batches only, `plainSrc`, and
+  `lexdb_pipe.runStopJ` joins it): the first
+  table's batches read as the first level's are (an index alone where it
+  covers the table's columns, the first batch small), each row joined by
+  the scalar evaluator before the next (`stopRows`, `pointFirst`), so no
+  row past the LIMIT is joined and EXPLAIN ANALYZE's counts are the row
+  engine's. R1's `(select o2.z from f join o2 ... limit 1)` per outer row
+  cost 43.1k instructions a run in the row engine, 56k through `runJ`,
+  33.6k this way. Other joins under such a table (a range per row, a hash)
+  take `runJ`, whose joins (`JRun.grow`: `PScan.stops`, no Apply) join the
+  first table's chunk in slices that double from one row (`joinGrow`, the
+  width kept across chunks, up to a batch): at most twice the rows the
+  consumer takes are joined, where the chunk was joined whole before (a
+  hash join under LIMIT 10 probed 670 rows, now 15). An error in a slice
+  is the existing exact mode's (the slice joined again row by row), so an
+  error in a row past the LIMIT is not raised, as the row engine does not
+  reach it; the rows of the chunk after the slice that stopped are not
+  counted read or kept.
+- **LEFT, RIGHT and FULL JOINs with no key** (25 runs): a hash with no key
+  as an inner one's (`crossFrom`), its LEFT JOIN's NULL rows from
+  `joinTail`, a RIGHT or FULL JOIN's unmatched rows from the marks as a
+  keyed hash's; a LEFT or FULL JOIN over a hash of more than a batch's rows
+  (an outer row's pairs in several pieces) joins each row alone
+  (`joinFrom`'s one-row path: its candidates in order, its NULL row after
+  them), and over an empty hash gives each row its NULL row.
+- **A collation's hash join key** (9 runs, R2's left-over): `PJoin.colls`
+  (per key, `lexdb_sql.COLL_*`), set for a table's hash of a plain join
+  (`MK_JOIN`, not a subquery's rows); both sides' keys are made their
+  collated values (`lexdb_sort.collVal`, as R2's GROUP BY keys) in the
+  build (`Builder.add`) and the probe (`JK_GEN`), the key's value without
+  L2's `#ci`/`#pad` wrapper (`unColl`); the equality stays a condition per
+  candidate.
+- **Planning a join's plan, cheaper**: the columns an expression reads are
+  found by a walk that makes no tree (`lexdb_bind.colsRead`, `colsIn`),
+  where `readsOf1`, `allIn` and `lexdb_plan.uses` re-slotted a copy of it
+  (`reslot`) and dropped it.
+
+**Left, and why:**
+
+- **LATERAL after the first level** (`from t, lateral f(t.v)`, CROSS and
+  OUTER APPLY; 180 runs): a dependent join, its subquery run per row of the
+  levels before. It does not fit R6's Apply (the ask gives a row's pass or
+  fail, not its rows) nor a nested-loop level of today's arms (their rows
+  are a table's or held rows read once). Plan: a join arm `JH_APPLY` whose
+  rows come per outer row from the consumer through the ask the joins
+  already pass down: `joinFrom` gives the chunk's rows' outer values as an
+  ask batch, exec's `ask` runs the subquery per distinct outer values with
+  the run's memo (as `runLevel`'s LATERAL arm) and puts the rows back held,
+  with each one's outer row (`lexdb_held`), joined on as a hash level's
+  candidates; an error joins the chunk again row by row (exact mode), and
+  under a stopping first table each row alone (`Apply.one`). Medium (about
+  250 lines: plan arm, pipe arm, exec's ask); gated by `exec_r3`'s lateral
+  cases and the T-SQL and Oracle doors' APPLY. Census reason as before
+  ("LATERAL after the first level (a join per row)").
+- **An `= any(array)` lookup** (7 runs): a lookup per element of a row's
+  array (coerced to the key's type, unique, in key order, as `pathScans`
+  makes an IN list's scans), several probes a row in `fetchMany`. Small,
+  not built for 7 runs; its reason stays ("read per row, neither a key
+  lookup nor a range").
+- A collated key whose value is an expression (`a.c = b.t`, a char and a
+  text: the key a cast) gives way at the run (a hash key of values the
+  batch keys do not hold, R8's), as other such keys do.
+- OFFSET over joins (6 runs, 2 more as stopping first tables now reach it).
+
+**Measured.** The census (6.4's tool; main 52fe2606's run of 271 tests,
+`exec_batchexpr`'s and `exec_semilook`'s lines from a second run with
+their timeouts raised, as both timed out under the census's writes,
+against the branch at 6fbe8d75 with the same two raised, its three new
+tests' lines left out; batches on): the row engine's runs 27,495 ->
+21,055, the pipeline's rows 306,529 -> 338,144. Gone: a join's first table
+not read in batches (6,085), joins under a stopping first table (329),
+no hash key not inner (25), a collation's hash key (9; 4 left: a
+subquery's rows or a semi join's, "not a table's join"; one more gives way
+at the run, `a.c = b.t`'s cast). Grown by their next reason: OFFSET over
+joins +2, gave way +2. Nothing else moved. The OLTP runs (`points.sql`,
+pgbench's point select, update and 3-table join through a census build in
+process): the join is the pipeline's, as the point selects; every UPDATE
+still finds its row by `runQuery` (R5). R4's shapes are not in TPC-H's
+22 (their plans did not change).
+
+In process (`LXL_HASH_SEED=1`, the 1-statement run subtracted from the
+N-statement one; INSERT and UPDATE in one transaction on the simulated
+disk; base 8bf070ae against d2d138ad, both built by 8bf070ae's compiler,
+two rounds alternated, alike to a tenth):
+
+| statement | main 8bf070ae | R4 | |
+|---|---:|---:|---:|
+| point select | 119,392.8 | 119,392.8 | 0 |
+| INSERT VALUES, one row | 106,115.4 | 106,115.4 | 0 |
+| UPDATE ... WHERE id = k | 148,249.1 | 148,249.1 | 0 |
+| `simple.sh`'s 3-table join (2,000) | 458,801.9 | 458,783.3 | -19 |
+| `(select o2.z from f join o2 on o2.id = f.id where f.xf = o.k limit 1)` per outer row, a run | 43,115 | 33,565 | -22.2% |
+| `exists (select 1 from f join o2 ... where f.xf = o.k and o2.z > 100)` per outer row | 43,594 | 33,816 | -22.4% |
+| `(select o2.z from o2 join f on f.id = o2.id where o2.id = o.id)` per outer row (a point first table) | 41,146 | 33,595 | -18.4% |
+
+On the way, each found by these counts and fixed before hand-back: the
+3-table join through `runJ` (a chunk of one) 567k against the row engine's
+459k; with `runPointJ` 473.5k, then `needs` skipped for it (-12.6k), the
+columns read without `reslot`'s tree (`colsRead`, `colsIn`: -6k), the first
+row by `getRow` and a lookup's `rowRead` without a copied need (-0.6k):
+main's. Deciding `PR_POINTJ` in `compileP`'s `how` cost a point select +2
+(decided in `needsOf`, which a point select does not reach: 0), the
+dispatch before `runSubs` +1 (in the joins' block: 0); `pointJoins`
+without compileP's `point` +1 (passed down: 0); the stop path's test in
+`pipeFetchJ` and `runPointJ` +130 a join (`PR_STOPJ`, functions of its
+own: 0). The per-row subquery over a join under LIMIT through `runJ` cost
+56k a run (the row engine's 43k), with its rows fetched by `fetch` 64k
+(an index read with its rows, not alone): the first level's batches
+instead (`stopRows`), 33.6k.
+
+Over the wire (base 8bf070ae against d2d138ad, fresh copies of both
+binaries, `-O`; logs in `~/tpch-w/r4/logs`):
+
+- `pts.sh` (20,000 point selects by the simple protocol, wall / server CPU
+  ms, means of 5, three rounds alternated): main 761.0 / 706.2, 744.6 /
+  691.8, 744.0 / 690.8; R4 744.8 / 693.0, 735.6 / 685.4, 728.0 / 678.4
+  (server CPU -1.9%, -0.9%, -1.8%).
+- `icount6.sh` (points.sql three times, the server's counts a statement,
+  four rounds alternated): instructions 186,814 / 186,810 / 186,837 /
+  186,814 against 187,222 / 186,907 / 186,756 / 186,817 (the first +408,
+  the others within the tool's ~100), cycles 106,517 / 106,176 / 104,985 /
+  103,827 against 105,439 / 106,473 / 104,225 / 103,583.
+- `simple.sh`'s workload with the server's CPU (`~/tpch-w/r4/simplecpu.sh`:
+  pgbench `-M simple`, 4 clients, 10 s; tps and server CPU a transaction,
+  four rounds alternated): point select 44,883 / 44,087 / 42,388 / 44,751
+  against 47,262 / 46,806 / 45,559 / 46,554 tps (+4% to +7%); update 9,113 /
+  9,076 / 8,894 / 9,096 against 9,092 / 9,097 / 9,087 / 9,118; **the 3-table
+  join 18,700 / 18,643 / 18,401 / 18,403 against 18,366 / 18,563 / 18,283 /
+  18,360 tps (-1.8%, -0.4%, -0.6%, -0.2%), 50.57 / 50.75 / 51.47 / 51.44
+  against 51.61 / 51.02 / 51.83 / 51.63 us of server CPU a transaction
+  (+2.1%, +0.5%, +0.7%, +0.4%)**.
+- The join's server counters (`~/tpch-w/r4/icj.sh`: one client, 20,000
+  joins, the server under `perf stat` from its start less a run without
+  them, two rounds alternated): instructions 471,678 / 471,591 against
+  471,681 / 471,821 a join (equal), cycles 216,985 / 222,305 against
+  221,189 / 222,698 (+1.9%, +0.2%), L1 i-cache misses 758.6 / 760.2 against
+  652.9 / 669.7 (-13%), iTLB misses 21.9 / 21.7 against 27.9 / 27.2, branch
+  misses 883.6 / 904.5 against 944.4 / 957.3 (+6%). In process the branch's
+  branch misses on the same join are 2.6% fewer than main's (perf record
+  of `branch-misses:u`, by function: the differences are as large in the
+  parser, whose code is the same, as in the join's: placement).
+
+So the join takes the pipeline at main's instructions and reads fewer
+instructions' worth of i-cache, but its cycles over the wire are level to
+0.5% more by the branch predictor's aliasing: the gate "should get
+faster" is not met, "not slower" is met in instructions and within about
+0.5% in CPU; left for the owner's call, as R1's point-select cycles were.
+
+TPC-H (SF1, base 8bf070ae and the branch's final binary, `-O`, alternated
+twice, one run each, `TPCH_REF` 1744ef99, `~/tpch-w/r4`; best of the two,
+ms): checksums equal on all 22 in all four runs; 12,144 against 12,113 ms
+(0.997). Over 1.5%: q8 +2.2% (212.6 against 217.2; the branch's runs 217.2
+and 233.7), its server instructions equal (`iq.sh`, two rounds: 1,164.20M /
+1,164.15M against 1,164.18M / 1,164.17M); q13 +1.5% (851.4 against 864.1),
+4,868.8M / 4,868.6M against 4,868.7M / 4,869.4M: placement. Faster by
+over 1.5%: q15 -3.0%, q20 -2.3%.
+
+**Tests.** Suite 274 of 274 at d2d138ad (new: `exec_r4`, `tds_r4`,
+`tns_r4`; 271 at main). `exec_r4` runs every statement with batches on
+and off (the same rows or error): point joins 32 (66 runs of the point
+path), stopping 20 (46), no key 16, collation 8 (one, a FULL JOIN of
+derived tables, stays the row engine's: its hash is a subquery's rows).
+`tds_r4`: 23 T-SQL batches, SQL Server 2022's answers (the `lxl-mssql`
+container, a database of its own, dropped after). `tns_r4`: 22 statements,
+Oracle Database Free's answers (`gen_oracle.py --check tns_r4`: 22
+checked, no difference). Expectations changed (counters only, the same
+rows): `exec_batchjoin`, `exec_batchsort`, `exec_held`, `exec_joinrange`,
+`exec_subrows` (more runs piped), `exec_joincost`, `exec_joinreview`
+(EXPLAIN ANALYZE of a hash join under LIMIT: fewer probes).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -7456,6 +7678,19 @@ windows 6,597, a correlated subquery in the outputs 6,382, a join's first
 table not read in batches 6,085, a 9.9 hashed probe 6,158, outputs and
 conditions that do not bind 721, joins under a stopping first table 329.
 
+**After R4** (6.3.Q8 R4; main 52fe2606's run, 271 tests, against the
+branch's, its three new tests' lines left out): the row engine's runs with
+batches on 27,495 -> 21,055, the pipeline's rows 306,529 -> 338,144. Gone:
+a join's first table not read in batches (6,085), joins under a stopping
+first table (329), RIGHT/FULL/LEFT with no key (25), a collation's hash key
+(9; 4 left over a subquery's rows or a semi join, "not a table's join").
+OLTP: the 3-table join is the pipeline's (`runPointJ`). Left of the joins:
+a LATERAL level after the first 180 (a plan in 6.3.Q8 R4), an `= any(array)`
+lookup 7, OFFSET over joins 6. The rest is R5-R9's: windows 6,597, a
+correlated subquery in the outputs 6,402, a 9.9 hashed probe 6,158,
+outputs and conditions that do not bind 723, gave way 363 + 52, FOR
+UPDATE 200.
+
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
 joins by the levels program `Query.jp`): UPDATE 1,391 statements, DELETE
@@ -7506,7 +7741,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R1 (built: 6.3.Q8 R1) | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
 | R2 (built: 6.3.Q8 R2; left: a set-returning function in the select list, a collation's hash join key, the binder's errors and the outputs that do not bind) | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
 | R3 (built: 6.3.Q8 R3) | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop`. **Built: a function's program (`lexdb_srf` makes its rows), LATERAL at the first level over outer values run once a run, a set-returning function in a select list with no FROM (ProjectSet), a held set operation's ORDER BY, OFFSET and LIMIT, MATCH_RECOGNIZE's input; left: LATERAL after the first level (a dependent join: R4), a set-returning function over a table or under LIMIT/DISTINCT, TOP and WITH TIES over a set** | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
-| R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
+| R4 (built: 6.3.Q8 R4) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
 | R7 | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait) | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
