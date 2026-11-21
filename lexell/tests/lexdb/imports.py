@@ -110,7 +110,8 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 PIPE = "lexdb_pipe"
 PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
-                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf"}
+                   "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf",
+                   "lexdb_window"}
 PIPE_STORE_NAMES = {"Store", "Txn"}
 PIPE_USERS = {"lexdb_exec", "lexdb_setop"}
 
@@ -186,11 +187,12 @@ SRF_USERS = {"lexdb_exec", "lexdb_pipe"}
 # The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item
 # 10): the sort keys and the frame code of the row engine's windows. Values,
 # their orders and the aggregate spec type only (the engine evaluates what
-# needs its scope, through a hook); only exec imports it (and the planner, for
+# needs its scope, through a hook); exec and the pipeline (its Window
+# operator, Q8 R7) import it (and the planner, for
 # the window plan type a Sel holds).
 WINDOW = "lexdb_window"
 WINDOW_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_sort", "lexdb_agg", "lexdb_access"}
-WINDOW_USERS = {"lexdb_exec", "lexdb_plan"}
+WINDOW_USERS = {"lexdb_exec", "lexdb_plan", "lexdb_pipe"}
 
 # lexdb_dialect is the parser-facing union of the dialects' data: the one
 # core module that reads it directly (the parser needs the names).

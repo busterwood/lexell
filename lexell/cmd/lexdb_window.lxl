@@ -1682,3 +1682,144 @@ pub fn compute(batch: bool, rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: 
     if batch { return values(rows, w, args, srt, okey, so, eo, ev, col) }
     return rowValues(rows, w, srt, &okey.vals, so, eo, ev, col)
 }
+
+// ---- A query's window calls, every one (exec's row engine and the
+// pipeline's Window operator, design/lexdb-layers.md 6.3.Q8 R7)
+
+pub const H_KEY = 0             // the hook's work: key i (PARTITION BY, then ORDER BY) of call w at row r ...
+pub const H_ARG = 1             // ... argument i (argsOf's) of call w at row r ...
+pub const H_OFF = 2             // ... the frame's start (i 0) or end (i 1) offset of call w, once
+
+// The values of the window calls wins for each of the rows: per row, a
+// value per call. batch: by the batches' columns (sortRows, values), else
+// by the row path (sortVals, rowValues: lexdb_batch off, the tests'
+// reference). Windows of one partitioning and order share their sort (as
+// PostgreSQL's). A key or argument that is a column of the rows (slotOf
+// gives its slot, else -1) is read at its place; ev evaluates the others:
+// ev(H_KEY, w, i, r), ev(H_ARG, w, i, r), and a frame's offset, ev(H_OFF,
+// w, 0 or 1, 0), checked here (frameOff). The calls are made in order, and
+// within a call the rows as values and compute reach them, so the first
+// error is the row path's.
+pub fn allValues(batch: bool, rows: &[]WinRow, wins: &[]WinPlan, params: &[]Val, slotOf: &fn(&str, int): int,
+                 ev: &fn(int, int, int, int): Result[Val, DbErr]): Result[[][]Val, DbErr] {
+    let n = len(rows)
+    var cols: [][]Val = []
+    for w in wins { append(mut &cols, array(n, Val.Null)) }
+    var specs: []str = []
+    for w in wins { append(mut &specs, winSpecText(&w)) }
+    var done: []bool = array(len(wins), false)
+    for wi in 0..len(wins) {
+        if done[wi] { continue }
+        let w = &wins[wi]
+        let np = len(w.part)
+        let nob = len(w.order)
+        let nx = np + nob
+        // each row's partition and order values, a column per expression;
+        // an expression that is a column read at its place, found once, not
+        // by its name per row (9.105)
+        var at: []int = []
+        var plain = true
+        for i in 0..nx {
+            var c = -1
+            if i < np {
+                match w.part[i] {
+                    Expr.Col(name, sl) { c = slotOf(&name, sl) }
+                    else {}
+                }
+            } else {
+                match w.order[i - np] {
+                    Expr.Col(name, sl) { c = slotOf(&name, sl) }
+                    else {}
+                }
+            }
+            append(mut &at, c)
+            if c < 0 { plain = false }
+        }
+        var vcols: [][]Val = []
+        var srt = noSorted()
+        var okey = KeyCol{slot: -1, vals: []}
+        var sorted = false
+        if batch {
+            // a column read at its place stays in the rows; the others' values made
+            var kcols: []KeyCol = []
+            for i in 0..nx { append(mut &kcols, KeyCol{slot: at[i], vals: if at[i] >= 0 { [] } else { withCapacity(n) }}) }
+            if !plain {
+                for b in 0..n {
+                    for i in 0..nx { if at[i] < 0 { append(mut &kcols[i].vals, try ev(H_KEY, wi, i, b)) } }
+                }
+            }
+            if sortRows(rows, mut &kcols, np, w, mut &srt) {
+                sorted = true
+                if nob > 0 { okey = KeyCol{slot: kcols[np].slot, vals: replace(mut &kcols[np].vals, [])} }
+            } else {
+                // an order key of mixed kinds: every column's values are made, and sorted by value
+                for i in 0..nx { append(mut &vcols, replace(mut &kcols[i].vals, [])) }
+            }
+        } else {
+            for i in 0..nx { append(mut &vcols, withCapacity(n)) }
+            for b in 0..n {
+                let r = &rows[b].row
+                for i in 0..nx {
+                    if at[i] >= 0 && at[i] < len(r) { append(mut &vcols[i], r[at[i]].clone()) }
+                    else if plain { append(mut &vcols[i], Val.Null) }
+                    else { append(mut &vcols[i], try ev(H_KEY, wi, i, b)) }
+                }
+            }
+        }
+        // the rows in partition order, then the window's (peers keep the
+        // rows' order); where a partition and a peer group start
+        if !sorted {
+            sortVals(&vcols, np, n, w, mut &srt)
+            if nob > 0 { okey = KeyCol{slot: -1, vals: replace(mut &vcols[np], [])} }
+        }
+        for wj in wi..len(wins) {
+            if done[wj] || specs[wj] != specs[wi] { continue }
+            done[wj] = true
+            let wv = &wins[wj]
+            let so = if wv.startOff.isSome() { try frameOff(try ev(H_OFF, wj, 0, 0), wv, true) } else { Val.Int(0) }
+            let eo = if wv.endOff.isSome() { try frameOff(try ev(H_OFF, wj, 1, 0), wv, false) } else { Val.Int(0) }
+            let wargs = argsOf(wv)
+            let srcs = argSrcs(&wargs, params, slotOf)
+            try compute(batch, rows, wv, &srcs, &srt, &okey, &so, &eo, fn(ai: int, r: int): Result[Val, DbErr] { return ev(H_ARG, wj, ai, r) },
+                        mut &cols[wj])
+        }
+    }
+    // the calls' columns, put in the rows' values
+    var out: [][]Val = withCapacity(n)
+    for b in 0..n {
+        var vs: []Val = withCapacity(len(wins))
+        for wj in 0..len(wins) { append(mut &vs, replace(mut &cols[wj][b], Val.Null)) }
+        append(mut &out, vs)
+    }
+    return Ok(out)
+}
+
+// A frame's offset r (start: its start's): not NULL, not negative (ROWS
+// and GROUPS: a whole number).
+pub fn frameOff(r: Val, w: &WinPlan, start: bool): Result[Val, DbErr] {
+    let which = if start { "starting" } else { "ending" }
+    if lexdb_ops.isNull(&r) { return Err(e("22004", &("frame " + which + " offset must not be null"))) }
+    if w.mode != lexdb_sql.FR_RANGE {
+        let t = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+        let n = try lexdb_ops.coerce(r, &t)
+        match n {
+            Val.Int(i) { if i < 0 { return Err(e("22013", &("frame " + which + " offset must not be negative"))) } }
+            else {}
+        }
+        return Ok(n)
+    }
+    // (an interval offset is compared with a zero interval: a date-time key's)
+    var zero = Val.Int(0)
+    match r {
+        Val.Ival(iv) {
+            var z = iv
+            z.months = 0
+            z.days = 0
+            z.us = 0
+            zero = Val.Ival(z)
+        }
+        else {}
+    }
+    if try lexdb_ops.compare(&r, &zero) < 0 { return Err(e("22013", "invalid preceding or following size in window function")) }
+    return Ok(r)
+}
