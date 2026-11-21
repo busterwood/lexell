@@ -328,12 +328,13 @@ pub type PAgg = record {
     pub calls: []PCall
     pub keep: []bool        // per column of the query: kept in a group's first row (read after grouping: outputs, HAVING, ORDER BY)
     pub sets: [][]int       // GROUPING SETS, ROLLUP, CUBE: per set the places of its keys (in keys); a group of each set; [] plain
+    pub kinds: []int        // per key its collation's kind (lexdb_sql.COLL_*; Q8 R2: a collated key groups by its collated value)
 }
 
 // An aggregate call of any function (lexdb_agg's: count (star: count(*)),
 // sum, avg, min, max, string_agg, array_agg, bool_and, the variances ...),
-// DISTINCT or ORDER BY in the call too; compared as its values are (no
-// collation's keys). more: the expressions it reads besides its argument,
+// DISTINCT or ORDER BY in the call too; compared as its values are, or by
+// its argument's collation (kind, Q8 R2). more: the expressions it reads besides its argument,
 // bound like it: string_agg's separator, then its ORDER BY keys (dirs:
 // one letter each, as the parser gives them).
 pub type PCall = record {
@@ -345,6 +346,7 @@ pub type PCall = record {
     pub more: []lexdb_bind.BX
     pub dirs: str
     pub dia: int            // lexdb_pct.DIA_*: percentile_cont and percentile_disc's dialect
+    pub kind: int           // its argument's collation's kind (lexdb_sql.COLL_*: min, max and DISTINCT compare by it)
 }
 
 // The columns (of n, the query's) a key-less aggregate's scan decodes:
@@ -8082,7 +8084,7 @@ pub fn aggWhy(sel: &Sel): str {
     if !firstRead(q, &q.levels[0]) { return "agg: first level: " + levelWhy(q, &q.levels[0]) }
     if !boundOnce(q) { return "agg: conditions not bound once (boundOnce)" }
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return "agg: one table, with columns besides its own" }
-    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key" } }
+    if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key in grouping sets" } } }
     return ""
 }
 
@@ -8123,11 +8125,8 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     var calls: []PCall = []
     for sp in sel.specs {
         let f = &sp.fname
-        // (the calls it accumulates: lexdb_pipe.compile's)
-        if sp.kind != lexdb_sql.COLL_EXACT {
-            // census: lexdb_census.no("agg: a call by a collation")
-            return None
-        }
+        // (the calls it accumulates: lexdb_pipe.compile's; one by a collation
+        // row by row, Q8 R2)
         var arg: Option[BX] = None
         // (the values besides the argument: string_agg's separator, the ORDER BY keys)
         var more: []BX = []
@@ -8171,7 +8170,7 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             }
             None {}
         }
-        append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia})
+        append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia, kind: sp.kind})
     }
     var cs = match planConds(sel) {
         Some(x) { x }
@@ -8199,14 +8198,15 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
-    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
+    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds)}))
     return Some(physAbove(sel, agg))
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
-// row (the query's only columns), GROUP BY (grouping sets too; no
-// collation's keys), no window, no correlated subquery; MIN/MAX by the
-// scan's order over one table (Q8 R2: MinMax).
+// row (the query's only columns), GROUP BY (grouping sets too; a
+// collation's keys row by row, not in grouping sets: Q8 R2), no window, no
+// correlated subquery; MIN/MAX by the scan's order over one table (Q8 R2:
+// MinMax).
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
     if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
@@ -8214,7 +8214,7 @@ pub fn aggShape(sel: &Sel): bool {
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
-    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } } }
     return true
 }
 

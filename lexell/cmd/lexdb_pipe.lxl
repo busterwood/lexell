@@ -3300,7 +3300,8 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
           give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the counts so far: each try counts from the start again
     let c0 = cnt[0]
-    if src.batch {
+    // (a collation's key or call: row by row, Q8 R2)
+    if src.batch && exactAgg(a) {
         batchRuns += 1
         var usedDec = false
         var values = false
@@ -3481,7 +3482,7 @@ type GCall = record {
 
 // The spec lexdb_agg reads of a call (it reads no expression).
 fn callSpec(c: &lexdb_plan.PCall): lexdb_agg.AggSpec {
-    var sp = lexdb_agg.spec(c.fname.clone(), [], c.star, c.distinct, None, [], c.dirs.clone(), "", lexdb_sql.COLL_EXACT)
+    var sp = lexdb_agg.spec(c.fname.clone(), [], c.star, c.distinct, None, [], c.dirs.clone(), "", c.kind)
     sp.dia = c.dia
     return sp
 }
@@ -4204,6 +4205,14 @@ fn giveGroups(rg: mut &RowGroups, ns: int, give: &fn(&[]Val, int, mut &[]Acc): R
     return Ok(Unit{})
 }
 
+// Whether a's keys and calls compare by their values (no collation's):
+// the batches' kernels run it.
+fn exactAgg(a: &lexdb_plan.PAgg): bool {
+    for k in a.kinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    for c in a.calls { if c.kind != lexdb_sql.COLL_EXACT { return false } }
+    return true
+}
+
 // The row (rg.row) into its group, by its keys' values (a new group's
 // bytes counted as the row engine counts them; past room
 // max_statement_mem's error), then each call's state.
@@ -4214,7 +4223,12 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
     var g = 0
     if len(a.keys) > 0 {
         rg.kb.clear()
-        for k in a.keys { lexdb_access.encIdxPart(mut &rg.kb, &(try bxEval(&k, &rg.row, &noAggs, cx))) }
+        for i in 0..len(a.keys) {
+            let v = try bxEval(&a.keys[i], &rg.row, &noAggs, cx)
+            // (a collated key: by its collated value, as the row engine's addToGroup)
+            if i < len(a.kinds) && a.kinds[i] != lexdb_sql.COLL_EXACT { lexdb_access.encIdxPart(mut &rg.kb, &lexdb_sort.collVal(a.kinds[i], &v)) }
+            else { lexdb_access.encIdxPart(mut &rg.kb, &v) }
+        }
         match rg.index.get(&rg.kb) {
             Some(x) { g = x }
             None {
@@ -7081,7 +7095,8 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     let last = len(cnt) - 1
     // a group's first row's columns and the keys' and calls': decoded where kept
     var avail: []bool = array(nq, false)
-    for pass in 0..2 {
+    // (a collation's key or call: row by row, Q8 R2)
+    for pass in 0..(if exactAgg(a) { 2 } else { 0 }) {
         let dec = pass == 0
         var kinds: []int = []
         var owner: []int = []
