@@ -189,8 +189,7 @@ pub type PPlan = closed {
     Join(PPlan, PJoin)              // the rows below joined with one more table (slice P2): its outer input, the join
     Filter(PPlan, []lexdb_bind.BX)  // the conditions a row must meet, bound over the query's columns (moved from Query.cc)
     Result([]PSub)                  // no FROM: one row if the WHERE holds; its subqueries
-    Func(str, bool, []PSub, []lexdb_bind.BX)  // a function or VALUES in FROM: its name (Sel.srf), WITH ORDINALITY; its arguments'
-                                    // subqueries; its arguments bound for the pipeline's run (Q8 R3; [] in a view)
+    Func(str, bool, []PSub)         // a function or VALUES in FROM: its name (Sel.srf), WITH ORDINALITY; its arguments' subqueries
     SetOp(int, bool, int, []PPlan, []PSub)  // lexdb_sql.SET_*, ALL, a recursive CTE's number (-1 none), its parts; the
                                             // set's own subqueries
     MinMax(PPlan)                   // MIN or MAX served by the scan's order: its first value not NULL
@@ -474,14 +473,14 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Distinct(i, on, ks) { return PPlan.Distinct(withNeeds(i, used), on, ks) }
         PPlan.Match(i) { return PPlan.Match(withNeeds(i, used)) }
         PPlan.Apply(i, pa) { return PPlan.Apply(withNeeds(i, used), pa) }
-        PPlan.ProjectSet(i, o) { return PPlan.ProjectSet(withNeeds(i, used), o) }
         PPlan.Levels(n, subs) { return PPlan.Levels(n, subs) }
         PPlan.Result(subs) { return PPlan.Result(subs) }
-        PPlan.Func(n, o, subs, xs) { return PPlan.Func(n, o, subs, xs) }
+        PPlan.Func(n, o, subs) { return PPlan.Func(n, o, subs) }
         PPlan.SetOp(k, all, r, parts, subs) { return PPlan.SetOp(k, all, r, parts, subs) }
         PPlan.MinMax(i) { return PPlan.MinMax(i) }
         PPlan.Window(i) { return PPlan.Window(i) }
         PPlan.Lock(i) { return PPlan.Lock(i) }
+        PPlan.ProjectSet(i, o) { return PPlan.ProjectSet(withNeeds(i, used), o) }
     }
 }
 
@@ -549,7 +548,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.Join(i, _) { return pSubs(&i) }
         PPlan.Filter(i, _) { return pSubs(&i) }
         PPlan.Result(s) { return &s }
-        PPlan.Func(_, _, s, _) { return &s }
+        PPlan.Func(_, _, s) { return &s }
         PPlan.SetOp(_, _, _, _, s) { return &s }
         PPlan.MinMax(i) { return pSubs(&i) }
         PPlan.Agg(i, _, _) { return pSubs(&i) }
@@ -569,6 +568,9 @@ pub fn pSubs(p: &PPlan): &[]PSub {
 // p's leaf: its Levels, Scan, Result, Func or SetOp.
 pub fn pLeaf(p: &PPlan): &PPlan {
     match p {
+        // (the leaves a point select's and a Result's plans reach first: their arms are compared in order)
+        PPlan.Scan(_, _) { return p }
+        PPlan.Result(_) { return p }
         PPlan.Filter(i, _) { return pLeaf(&i) }
         PPlan.Join(i, _) { return pLeaf(&i) }
         PPlan.MinMax(i) { return pLeaf(&i) }
@@ -6823,7 +6825,7 @@ pub fn physOf(sel: &Sel): PPlan {
         let sorted = if len(sel.order) > 0 { PPlan.Sort(set, sel.sort, None) } else { set }
         return if sel.limit >= 0 || sel.offset > 0 { PPlan.Limit(sorted, false, sel.limit, max(sel.offset, 0)) } else { sorted }
     }
-    let leaf = if len(sel.srf) > 0 { PPlan.Func(sel.srf.toStr(), sel.ordin, subs, []) }
+    let leaf = if len(sel.srf) > 0 { PPlan.Func(sel.srf.toStr(), sel.ordin, subs) }
                else if len(sel.q.levels) == 0 { PPlan.Result(subs) }
                else { PPlan.Levels(len(sel.q.levels), subs) }
     let p1 = if sel.first >= 0 { PPlan.MinMax(leaf) } else { leaf }
@@ -7269,7 +7271,9 @@ pub type MrPlan = record {
 pub fn lazySeries(q: &Query, i: int): bool {
     let sp = &q.subs[i]
     if sp.use != lexdb_sql.SUB_FROM || sp.sel.srf != "generate_series" || sp.cte >= 0 || len(sp.sel.q.refs) > 0 || len(sp.sel.outs) == 0 { return false }
-    if lexdb_sql.oidType(sp.sel.outs[0].oid).kind != lexdb_sql.K_INT { return false }
+    // (its type an integer's: oidType's K_INT, without its search of the array types)
+    let oid = sp.sel.outs[0].oid
+    if oid != lexdb_sql.OID_INT2 && oid != lexdb_sql.OID_INT4 && oid != lexdb_sql.OID_INT8 { return false }
     if len(q.levels) == 0 || q.levels[0].src != i || q.levels[0].lateral { return false }
     for k in 1..len(q.levels) { if q.levels[k].src == i { return false } }
     return true
@@ -8700,10 +8704,12 @@ pub fn foldConds(q: mut &Query) {
 pub const PR_FUNC: int = 3
 
 // sel's program when sel is a function in FROM (Sel.srf) whose arguments
-// all bind for the plan: a Func holding them (moved from Sel.ox, else
-// bound with their subqueries' values), so a run evaluates them by
-// lexdb_pipe.bxEval; None, those moved given back, when one does not bind
-// (a sequence's or a session's call: the row engine's eval).
+// all bind for the plan: Project (Func), the Project's expressions its
+// arguments (moved from Sel.ox, else bound with their subqueries' values),
+// so a run evaluates them by lexdb_pipe.bxEval; None, those moved given
+// back, when one does not bind (a sequence's or a session's call: the row
+// engine's eval). (Not a field of Func: one more cost every view's Func,
+// physOf's, an empty array made and dropped.)
 pub fn funcProg(sel: mut &Sel): Option[Prog] {
     var xs: []BX = withCapacity(len(sel.exprs))
     for i in 0..len(sel.exprs) {
@@ -8724,7 +8730,7 @@ pub fn funcProg(sel: mut &Sel): Option[Prog] {
             }
         }
     }
-    return Some(Prog{plan: PPlan.Func(sel.srf.toStr(), sel.ordin, subsOf(&sel.q), xs), ops: 1, groups: false, joins: false, sorts: false, run: PR_FUNC})
+    return Some(Prog{plan: PPlan.Project(PPlan.Func(sel.srf.toStr(), sel.ordin, subsOf(&sel.q)), xs), ops: 1, groups: false, joins: false, sorts: false, run: PR_FUNC})
 }
 
 // ---- LATERAL at the first level, over outer values only (Q8 R3)
