@@ -5,6 +5,9 @@
 //   inside LATERAL and inside a subquery; three items in a tree, two trees, a tree followed by items, a LATERAL after it
 //   that reads it and one in it that reads an item before it; USING and NATURAL in the tree (* and the merged name);
 //   WHERE and GROUP BY over it; a name twice (42712); UPDATE ... FROM and DELETE ... USING with a tree.
+// - W2: char(n) beside varchar and text in subqueries, over a table and a view: IN, NOT IN, EXISTS, a scalar, > ANY,
+//   <= ALL and a join, each pair both ways; ANY over arrays; empty subqueries, duplicates, NULLs.
+// The second pass (unnest off: lexdb_plan.setUnnest(0)) runs the subqueries' statements again, each as written.
 // expect: W1 doc, t1 empty, right join: , same: true
 // expect: W1 doc, full join on false: 8, same: true
 // expect: W1 right join: 1|10|1|1|1|5;1|10|NULL|NULL|4|6;1|10|NULL|NULL|NULL|8;2|20|1|1|1|5;2|20|1|1|1|5;2|20|NULL|NULL|4|6;2|20|NULL|NULL|4|6;2|20|NULL|NULL|NULL|8;2|20|NULL|NULL|NULL|8, same: true
@@ -40,6 +43,170 @@
 // expect: W1 UPDATE FROM: ERROR 42702, same: true
 // expect: W1 DELETE USING: , same: true
 // expect: W1 tree first: 9, same: true
+// expect: W2 doc, >= any: a, same: true
+// expect: W2 doc, >= all: a, same: true
+// expect: W2 doc, exists, view: a, same: true
+// expect: W2 doc, exists, table: a, same: true
+// expect: W2 doc, scalar, view: 1, same: true
+// expect: W2 p c/v in: 3;6, same: true
+// expect: W2 p c/v not in: , same: true
+// expect: W2 p c/v exists: 3;6, same: true
+// expect: W2 p c/v scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 p c/v > any: 1;3;5;6, same: true
+// expect: W2 p c/v <= all: 2, same: true
+// expect: W2 p c/v join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 p v/c in: 3;6, same: true
+// expect: W2 p v/c not in: , same: true
+// expect: W2 p v/c exists: 3;6, same: true
+// expect: W2 p v/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 p v/c > any: 1;3;5;6, same: true
+// expect: W2 p v/c <= all: 2, same: true
+// expect: W2 p v/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 p c/t in: 6, same: true
+// expect: W2 p c/t not in: 2;5, same: true
+// expect: W2 p c/t exists: 6, same: true
+// expect: W2 p c/t scalar: 1|1;2|0;3|1;4|0;5|0;6|1, same: true
+// expect: W2 p c/t > any: 1;3;5;6, same: true
+// expect: W2 p c/t <= all: 2, same: true
+// expect: W2 p c/t join: 1|1;3|3;6|3, same: true
+// expect: W2 p t/c in: 3, same: true
+// expect: W2 p t/c not in: 2;5;6, same: true
+// expect: W2 p t/c exists: 3, same: true
+// expect: W2 p t/c scalar: 1|1;2|0;3|2;4|0;5|0;6|0, same: true
+// expect: W2 p t/c > any: 1;3;5;6, same: true
+// expect: W2 p t/c <= all: , same: true
+// expect: W2 p t/c join: 1|1;3|3;3|6, same: true
+// expect: W2 p c/c in: 3;6, same: true
+// expect: W2 p c/c not in: , same: true
+// expect: W2 p c/c exists: 3;6, same: true
+// expect: W2 p c/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 p c/c > any: 1;3;5;6, same: true
+// expect: W2 p c/c <= all: 2, same: true
+// expect: W2 p c/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 pv c/v in: 3;6, same: true
+// expect: W2 pv c/v not in: , same: true
+// expect: W2 pv c/v exists: 3;6, same: true
+// expect: W2 pv c/v scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 pv c/v > any: 1;3;5;6, same: true
+// expect: W2 pv c/v <= all: 2, same: true
+// expect: W2 pv c/v join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 pv v/c in: 3;6, same: true
+// expect: W2 pv v/c not in: , same: true
+// expect: W2 pv v/c exists: 3;6, same: true
+// expect: W2 pv v/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 pv v/c > any: 1;3;5;6, same: true
+// expect: W2 pv v/c <= all: 2, same: true
+// expect: W2 pv v/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 pv c/t in: 6, same: true
+// expect: W2 pv c/t not in: 2;5, same: true
+// expect: W2 pv c/t exists: 6, same: true
+// expect: W2 pv c/t scalar: 1|1;2|0;3|1;4|0;5|0;6|1, same: true
+// expect: W2 pv c/t > any: 1;3;5;6, same: true
+// expect: W2 pv c/t <= all: 2, same: true
+// expect: W2 pv c/t join: 1|1;3|3;6|3, same: true
+// expect: W2 pv t/c in: 3, same: true
+// expect: W2 pv t/c not in: 2;5;6, same: true
+// expect: W2 pv t/c exists: 3, same: true
+// expect: W2 pv t/c scalar: 1|1;2|0;3|2;4|0;5|0;6|0, same: true
+// expect: W2 pv t/c > any: 1;3;5;6, same: true
+// expect: W2 pv t/c <= all: , same: true
+// expect: W2 pv t/c join: 1|1;3|3;3|6, same: true
+// expect: W2 pv c/c in: 3;6, same: true
+// expect: W2 pv c/c not in: , same: true
+// expect: W2 pv c/c exists: 3;6, same: true
+// expect: W2 pv c/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: W2 pv c/c > any: 1;3;5;6, same: true
+// expect: W2 pv c/c <= all: 2, same: true
+// expect: W2 pv c/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: W2 = any array: 1;2, same: true
+// expect: W2 >= any char array: 3;5;6, same: true
+// expect: W2 char = any of a column: 3;6, same: true
+// expect: W2 >= any, empty: , same: true
+// expect: W2 >= all, empty: 6, same: true
+// expect: W2 a literal in chars: 1;2, same: true
+// expect: W2 duplicates and NULL: 1;2;5, same: true
+// expect: unnest off, W2 doc, >= any: a, same: true
+// expect: unnest off, W2 doc, >= all: a, same: true
+// expect: unnest off, W2 doc, exists, view: a, same: true
+// expect: unnest off, W2 doc, exists, table: a, same: true
+// expect: unnest off, W2 doc, scalar, view: 1, same: true
+// expect: unnest off, W2 p c/v in: 3;6, same: true
+// expect: unnest off, W2 p c/v not in: , same: true
+// expect: unnest off, W2 p c/v exists: 3;6, same: true
+// expect: unnest off, W2 p c/v scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 p c/v > any: 1;3;5;6, same: true
+// expect: unnest off, W2 p c/v <= all: 2, same: true
+// expect: unnest off, W2 p c/v join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 p v/c in: 3;6, same: true
+// expect: unnest off, W2 p v/c not in: , same: true
+// expect: unnest off, W2 p v/c exists: 3;6, same: true
+// expect: unnest off, W2 p v/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 p v/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 p v/c <= all: 2, same: true
+// expect: unnest off, W2 p v/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 p c/t in: 6, same: true
+// expect: unnest off, W2 p c/t not in: 2;5, same: true
+// expect: unnest off, W2 p c/t exists: 6, same: true
+// expect: unnest off, W2 p c/t scalar: 1|1;2|0;3|1;4|0;5|0;6|1, same: true
+// expect: unnest off, W2 p c/t > any: 1;3;5;6, same: true
+// expect: unnest off, W2 p c/t <= all: 2, same: true
+// expect: unnest off, W2 p c/t join: 1|1;3|3;6|3, same: true
+// expect: unnest off, W2 p t/c in: 3, same: true
+// expect: unnest off, W2 p t/c not in: 2;5;6, same: true
+// expect: unnest off, W2 p t/c exists: 3, same: true
+// expect: unnest off, W2 p t/c scalar: 1|1;2|0;3|2;4|0;5|0;6|0, same: true
+// expect: unnest off, W2 p t/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 p t/c <= all: , same: true
+// expect: unnest off, W2 p t/c join: 1|1;3|3;3|6, same: true
+// expect: unnest off, W2 p c/c in: 3;6, same: true
+// expect: unnest off, W2 p c/c not in: , same: true
+// expect: unnest off, W2 p c/c exists: 3;6, same: true
+// expect: unnest off, W2 p c/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 p c/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 p c/c <= all: 2, same: true
+// expect: unnest off, W2 p c/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 pv c/v in: 3;6, same: true
+// expect: unnest off, W2 pv c/v not in: , same: true
+// expect: unnest off, W2 pv c/v exists: 3;6, same: true
+// expect: unnest off, W2 pv c/v scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 pv c/v > any: 1;3;5;6, same: true
+// expect: unnest off, W2 pv c/v <= all: 2, same: true
+// expect: unnest off, W2 pv c/v join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 pv v/c in: 3;6, same: true
+// expect: unnest off, W2 pv v/c not in: , same: true
+// expect: unnest off, W2 pv v/c exists: 3;6, same: true
+// expect: unnest off, W2 pv v/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 pv v/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 pv v/c <= all: 2, same: true
+// expect: unnest off, W2 pv v/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 pv c/t in: 6, same: true
+// expect: unnest off, W2 pv c/t not in: 2;5, same: true
+// expect: unnest off, W2 pv c/t exists: 6, same: true
+// expect: unnest off, W2 pv c/t scalar: 1|1;2|0;3|1;4|0;5|0;6|1, same: true
+// expect: unnest off, W2 pv c/t > any: 1;3;5;6, same: true
+// expect: unnest off, W2 pv c/t <= all: 2, same: true
+// expect: unnest off, W2 pv c/t join: 1|1;3|3;6|3, same: true
+// expect: unnest off, W2 pv t/c in: 3, same: true
+// expect: unnest off, W2 pv t/c not in: 2;5;6, same: true
+// expect: unnest off, W2 pv t/c exists: 3, same: true
+// expect: unnest off, W2 pv t/c scalar: 1|1;2|0;3|2;4|0;5|0;6|0, same: true
+// expect: unnest off, W2 pv t/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 pv t/c <= all: , same: true
+// expect: unnest off, W2 pv t/c join: 1|1;3|3;3|6, same: true
+// expect: unnest off, W2 pv c/c in: 3;6, same: true
+// expect: unnest off, W2 pv c/c not in: , same: true
+// expect: unnest off, W2 pv c/c exists: 3;6, same: true
+// expect: unnest off, W2 pv c/c scalar: 1|1;2|1;3|2;4|0;5|1;6|2, same: true
+// expect: unnest off, W2 pv c/c > any: 1;3;5;6, same: true
+// expect: unnest off, W2 pv c/c <= all: 2, same: true
+// expect: unnest off, W2 pv c/c join: 1|1;2|2;3|3;3|6;5|5;6|3;6|6, same: true
+// expect: unnest off, W2 = any array: 1;2, same: true
+// expect: unnest off, W2 >= any char array: 3;5;6, same: true
+// expect: unnest off, W2 char = any of a column: 3;6, same: true
+// expect: unnest off, W2 >= any, empty: , same: true
+// expect: unnest off, W2 >= all, empty: 6, same: true
+// expect: unnest off, W2 a literal in chars: 1;2, same: true
+// expect: unnest off, W2 duplicates and NULL: 1;2;5, same: true
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -79,7 +246,7 @@ fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
 
 const SETUP = "create table wa (x int, y int)\ncreate table wb (x int, y int)\ncreate table wc (x int, z int)\ncreate table we (x int)\ninsert into wa values (1, 10), (2, 20), (2, 20)\ninsert into wb values (1, 1), (3, 3), (null, 7)\ninsert into wc values (1, 5), (4, 6), (null, 8)\ncreate view wv as select x, y from wb\ncreate table t0 (a1 bigint)\ncreate table t1 (b0 bool)\ninsert into t0 values (9)\ncreate table t2 (a1 int)\ninsert into t2 values (8), (4)\ncreate table p (id int, c char(3), v varchar(4), t text)\ninsert into p values (1, 'a', 'a', 'a'), (2, ' a', ' a ', ' a '), (3, 'ab', 'ab ', 'ab'), (4, null, null, null), (5, 'b', 'b', 'b  '), (6, 'ab', 'ab', 'ab ')\ncreate view pv as select id, c, v, t from p\ncreate table pe (c char(3), v varchar(4), t text)\ncreate table c0 (a0 char(3))\ninsert into c0 values ('c')\ncreate table c1 (a0 varchar(4), a4 char(3))\ninsert into c1 values ('bb', ' a'), (' a', 'a ')\ncreate view c1v as select a4, a0 from c1\ncreate table c2 (a2 text, a4 char(3))\ninsert into c2 values ('ab', 'ab')\ncreate view c2v as select a4, a2 from c2\ncreate table e0 (a3 numeric(6,2), a5 bigint, a4 int, f float8)\ncreate table e1 (b2 int)\ncreate table e3 (d1 int)\ninsert into e1 values (0), (1), (1)\ninsert into e3 values (1), (1), (null)\ncreate table e4 (a3 numeric(6,2), a5 bigint, a4 int, f float8)\ninsert into e4 values (1, 5, 2, 1e10), (2, 5, 3, null), (null, null, null, null)\ncreate table r0 (c0 int, c2 numeric(10,2), f float8)\ninsert into r0 values (1, 1.5, 1.25), (2, null, null), (3, -2.25, -2.5), (4, 1234.56, 0)\ncreate table x0 (a0 numeric(6,2), s smallint, i int, b bigint)\ncreate table x1 (b2 int)\ncreate index x0_a on x0 (a0)\ncreate index x0_s on x0 (s)\ncreate index x0_i on x0 (i)\ncreate index x0_b on x0 (b)\ninsert into x0 values (12.5, 3, 7, 9), (9999.99, 32767, 2147483647, 9223372036854775807), (-9999.99, -32768, -2147483648, -9223372036854775807), (null, null, null, null), (12.5, 3, 7, 9)\ninsert into x1 values (1), (2)\ncreate table x2 (a0 numeric(6,2), s smallint)\ncreate index x2_a on x2 (a0)\ncreate index x2_s on x2 (s)"
 
-const QS = "W1 doc, t1 empty, right join\tselect 1 from t1 as q1, t0 as q2 right join t0 as q3 on true\nW1 doc, full join on false\tselect count(*) from t2 as q1, (select 1 from t2 as q3) as d2 full join t2 as q10 on false\nW1 right join\tselect * from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect * from wa, wb full join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 left join\tselect * from wa, wb left join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 inner join\tselect * from wa, wb join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 empty first\tselect count(*) from we, wb right join wc on wb.x = wc.x\nW1 empty right\tselect count(*) from wa, wb right join we on wb.x = we.x\nW1 empty left of full\tselect count(*), count(we.x), count(wc.x) from wa, we full join wc on we.x = wc.x\nW1 qualified columns\tselect wa.y, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wc.z > 5 order by 1, 2, 3\nW1 a star of the tree\tselect wc.*, wb.* from wa, wb right join wc on wb.x = wc.x where wa.x = 1 order by 1, 2, 3, 4\nW1 unqualified names\tselect y, z from wa, wb w2 right join wc on w2.x = wc.x order by 1, 2\nW1 ambiguous name\tselect x from wa, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*), count(wv.y) from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*), count(d.y) from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*), count(k.y), count(wc.z) from wa, k full join wc on k.x = wc.x\nW1 inside LATERAL\tselect wa.x, l.n from wa, lateral (select count(*) as n from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) l order by 1, 2\nW1 inside a subquery\tselect (select count(*) from wa, wb full join wc on wb.x = wc.x) from we union all select 1 order by 1\nW1 three in the tree\tselect count(*), count(wb.x), count(wc.x), count(w3.x) from wa, wb right join wc on wb.x = wc.x full join wb w3 on w3.x = wc.x\nW1 two trees\tselect count(*), count(a2.x), count(wb.x) from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) from wa, wb right join wc on wb.x = wc.x, we\nW1 a tree then items\tselect count(*) from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a later LATERAL sees the tree\tselect wa.x, wc.x, l.s from wa, wb right join wc on wb.x = wc.x, lateral (select wa.y + wc.z as s) l order by 1, 2, 3\nW1 LATERAL in the tree\tselect wa.x, l.x, wc.z from wa, lateral (select wa.x as x) l right join wc on l.x = wc.x order by 1, 2, 3\nW1 USING in the tree\tselect * from wa, wb full join wc using (x) order by 1, 2, 3, 4, 5\nW1 the USING name\tselect x, d.y from (select y from wa) d, wb full join wc using (x) order by 1, 2\nW1 the USING name, ambiguous\tselect x from wa, wb full join wc using (x)\nW1 NATURAL in the tree\tselect count(*) from wa, wb natural full join wc\nW1 WHERE on the tree\tselect wa.x, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wb.y is null order by 1, 2, 3\nW1 GROUP BY\tselect wc.z, count(*) from wa, wb right join wc on wb.x = wc.x group by wc.z order by 1\nW1 a name twice\tselect 1 from wa, wb right join wa on true\nW1 a name twice, later\tselect 1 from wa a, wb right join wc on true, wc\nW1 UPDATE FROM\tupdate wa set y = y from wb right join wc on wb.x = wc.x where wa.x = 2 and wc.z = 6 returning wa.x, wa.y\nW1 DELETE USING\tdelete from we using wa, wb right join wc on wb.x = wc.x where we.x = wa.x returning we.x\nW1 tree first\tselect count(*) from wb right join wc on wb.x = wc.x, wa"
+const QS = "W1 doc, t1 empty, right join\tselect 1 from t1 as q1, t0 as q2 right join t0 as q3 on true\nW1 doc, full join on false\tselect count(*) from t2 as q1, (select 1 from t2 as q3) as d2 full join t2 as q10 on false\nW1 right join\tselect * from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect * from wa, wb full join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 left join\tselect * from wa, wb left join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 inner join\tselect * from wa, wb join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 empty first\tselect count(*) from we, wb right join wc on wb.x = wc.x\nW1 empty right\tselect count(*) from wa, wb right join we on wb.x = we.x\nW1 empty left of full\tselect count(*), count(we.x), count(wc.x) from wa, we full join wc on we.x = wc.x\nW1 qualified columns\tselect wa.y, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wc.z > 5 order by 1, 2, 3\nW1 a star of the tree\tselect wc.*, wb.* from wa, wb right join wc on wb.x = wc.x where wa.x = 1 order by 1, 2, 3, 4\nW1 unqualified names\tselect y, z from wa, wb w2 right join wc on w2.x = wc.x order by 1, 2\nW1 ambiguous name\tselect x from wa, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*), count(wv.y) from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*), count(d.y) from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*), count(k.y), count(wc.z) from wa, k full join wc on k.x = wc.x\nW1 inside LATERAL\tselect wa.x, l.n from wa, lateral (select count(*) as n from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) l order by 1, 2\nW1 inside a subquery\tselect (select count(*) from wa, wb full join wc on wb.x = wc.x) from we union all select 1 order by 1\nW1 three in the tree\tselect count(*), count(wb.x), count(wc.x), count(w3.x) from wa, wb right join wc on wb.x = wc.x full join wb w3 on w3.x = wc.x\nW1 two trees\tselect count(*), count(a2.x), count(wb.x) from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) from wa, wb right join wc on wb.x = wc.x, we\nW1 a tree then items\tselect count(*) from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a later LATERAL sees the tree\tselect wa.x, wc.x, l.s from wa, wb right join wc on wb.x = wc.x, lateral (select wa.y + wc.z as s) l order by 1, 2, 3\nW1 LATERAL in the tree\tselect wa.x, l.x, wc.z from wa, lateral (select wa.x as x) l right join wc on l.x = wc.x order by 1, 2, 3\nW1 USING in the tree\tselect * from wa, wb full join wc using (x) order by 1, 2, 3, 4, 5\nW1 the USING name\tselect x, d.y from (select y from wa) d, wb full join wc using (x) order by 1, 2\nW1 the USING name, ambiguous\tselect x from wa, wb full join wc using (x)\nW1 NATURAL in the tree\tselect count(*) from wa, wb natural full join wc\nW1 WHERE on the tree\tselect wa.x, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wb.y is null order by 1, 2, 3\nW1 GROUP BY\tselect wc.z, count(*) from wa, wb right join wc on wb.x = wc.x group by wc.z order by 1\nW1 a name twice\tselect 1 from wa, wb right join wa on true\nW1 a name twice, later\tselect 1 from wa a, wb right join wc on true, wc\nW1 UPDATE FROM\tupdate wa set y = y from wb right join wc on wb.x = wc.x where wa.x = 2 and wc.z = 6 returning wa.x, wa.y\nW1 DELETE USING\tdelete from we using wa, wb right join wc on wb.x = wc.x where we.x = wa.x returning we.x\nW1 tree first\tselect count(*) from wb right join wc on wb.x = wc.x, wa\nW2 doc, >= any\tselect 'a' from c0 as q4 where q4.a0 >= any (select q5.a0 from c0 as q5)\nW2 doc, >= all\tselect 'a' from c0 as q4 where q4.a0 >= all (select q5.a0 from c0 as q5)\nW2 doc, exists, view\tselect 'a' from c1v as q1 where exists (select 1 from c1v as q4 where q4.a0 = q1.a4)\nW2 doc, exists, table\tselect 'a' from c1 as q1 where exists (select 1 from c1 as q4 where q4.a0 = q1.a4)\nW2 doc, scalar, view\tselect (select 1 from c2v as q3 where q3.a2 = q2.a4) from c2v as q2\nW2 p c/v in\tselect o.id from p o where o.c in (select i.v from p i where i.id <> o.id) order by 1\nW2 p c/v not in\tselect o.id from p o where o.c not in (select i.v from p i where i.id <> 4) order by 1\nW2 p c/v exists\tselect o.id from p o where exists (select 1 from p i where i.v = o.c and i.id <> o.id) order by 1\nW2 p c/v scalar\tselect o.id, (select count(*) from p i where i.v = o.c) from p o order by 1\nW2 p c/v > any\tselect o.id from p o where o.c > any (select i.v from p i where i.id <> o.id) order by 1\nW2 p c/v <= all\tselect o.id from p o where o.c <= all (select i.v from p i where i.id <> 4) order by 1\nW2 p c/v join\tselect o.id, i.id from p o join p i on o.c = i.v order by 1, 2\nW2 p v/c in\tselect o.id from p o where o.v in (select i.c from p i where i.id <> o.id) order by 1\nW2 p v/c not in\tselect o.id from p o where o.v not in (select i.c from p i where i.id <> 4) order by 1\nW2 p v/c exists\tselect o.id from p o where exists (select 1 from p i where i.c = o.v and i.id <> o.id) order by 1\nW2 p v/c scalar\tselect o.id, (select count(*) from p i where i.c = o.v) from p o order by 1\nW2 p v/c > any\tselect o.id from p o where o.v > any (select i.c from p i where i.id <> o.id) order by 1\nW2 p v/c <= all\tselect o.id from p o where o.v <= all (select i.c from p i where i.id <> 4) order by 1\nW2 p v/c join\tselect o.id, i.id from p o join p i on o.v = i.c order by 1, 2\nW2 p c/t in\tselect o.id from p o where o.c in (select i.t from p i where i.id <> o.id) order by 1\nW2 p c/t not in\tselect o.id from p o where o.c not in (select i.t from p i where i.id <> 4) order by 1\nW2 p c/t exists\tselect o.id from p o where exists (select 1 from p i where i.t = o.c and i.id <> o.id) order by 1\nW2 p c/t scalar\tselect o.id, (select count(*) from p i where i.t = o.c) from p o order by 1\nW2 p c/t > any\tselect o.id from p o where o.c > any (select i.t from p i where i.id <> o.id) order by 1\nW2 p c/t <= all\tselect o.id from p o where o.c <= all (select i.t from p i where i.id <> 4) order by 1\nW2 p c/t join\tselect o.id, i.id from p o join p i on o.c = i.t order by 1, 2\nW2 p t/c in\tselect o.id from p o where o.t in (select i.c from p i where i.id <> o.id) order by 1\nW2 p t/c not in\tselect o.id from p o where o.t not in (select i.c from p i where i.id <> 4) order by 1\nW2 p t/c exists\tselect o.id from p o where exists (select 1 from p i where i.c = o.t and i.id <> o.id) order by 1\nW2 p t/c scalar\tselect o.id, (select count(*) from p i where i.c = o.t) from p o order by 1\nW2 p t/c > any\tselect o.id from p o where o.t > any (select i.c from p i where i.id <> o.id) order by 1\nW2 p t/c <= all\tselect o.id from p o where o.t <= all (select i.c from p i where i.id <> 4) order by 1\nW2 p t/c join\tselect o.id, i.id from p o join p i on o.t = i.c order by 1, 2\nW2 p c/c in\tselect o.id from p o where o.c in (select i.c from p i where i.id <> o.id) order by 1\nW2 p c/c not in\tselect o.id from p o where o.c not in (select i.c from p i where i.id <> 4) order by 1\nW2 p c/c exists\tselect o.id from p o where exists (select 1 from p i where i.c = o.c and i.id <> o.id) order by 1\nW2 p c/c scalar\tselect o.id, (select count(*) from p i where i.c = o.c) from p o order by 1\nW2 p c/c > any\tselect o.id from p o where o.c > any (select i.c from p i where i.id <> o.id) order by 1\nW2 p c/c <= all\tselect o.id from p o where o.c <= all (select i.c from p i where i.id <> 4) order by 1\nW2 p c/c join\tselect o.id, i.id from p o join p i on o.c = i.c order by 1, 2\nW2 pv c/v in\tselect o.id from pv o where o.c in (select i.v from pv i where i.id <> o.id) order by 1\nW2 pv c/v not in\tselect o.id from pv o where o.c not in (select i.v from pv i where i.id <> 4) order by 1\nW2 pv c/v exists\tselect o.id from pv o where exists (select 1 from pv i where i.v = o.c and i.id <> o.id) order by 1\nW2 pv c/v scalar\tselect o.id, (select count(*) from pv i where i.v = o.c) from pv o order by 1\nW2 pv c/v > any\tselect o.id from pv o where o.c > any (select i.v from pv i where i.id <> o.id) order by 1\nW2 pv c/v <= all\tselect o.id from pv o where o.c <= all (select i.v from pv i where i.id <> 4) order by 1\nW2 pv c/v join\tselect o.id, i.id from pv o join pv i on o.c = i.v order by 1, 2\nW2 pv v/c in\tselect o.id from pv o where o.v in (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv v/c not in\tselect o.id from pv o where o.v not in (select i.c from pv i where i.id <> 4) order by 1\nW2 pv v/c exists\tselect o.id from pv o where exists (select 1 from pv i where i.c = o.v and i.id <> o.id) order by 1\nW2 pv v/c scalar\tselect o.id, (select count(*) from pv i where i.c = o.v) from pv o order by 1\nW2 pv v/c > any\tselect o.id from pv o where o.v > any (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv v/c <= all\tselect o.id from pv o where o.v <= all (select i.c from pv i where i.id <> 4) order by 1\nW2 pv v/c join\tselect o.id, i.id from pv o join pv i on o.v = i.c order by 1, 2\nW2 pv c/t in\tselect o.id from pv o where o.c in (select i.t from pv i where i.id <> o.id) order by 1\nW2 pv c/t not in\tselect o.id from pv o where o.c not in (select i.t from pv i where i.id <> 4) order by 1\nW2 pv c/t exists\tselect o.id from pv o where exists (select 1 from pv i where i.t = o.c and i.id <> o.id) order by 1\nW2 pv c/t scalar\tselect o.id, (select count(*) from pv i where i.t = o.c) from pv o order by 1\nW2 pv c/t > any\tselect o.id from pv o where o.c > any (select i.t from pv i where i.id <> o.id) order by 1\nW2 pv c/t <= all\tselect o.id from pv o where o.c <= all (select i.t from pv i where i.id <> 4) order by 1\nW2 pv c/t join\tselect o.id, i.id from pv o join pv i on o.c = i.t order by 1, 2\nW2 pv t/c in\tselect o.id from pv o where o.t in (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv t/c not in\tselect o.id from pv o where o.t not in (select i.c from pv i where i.id <> 4) order by 1\nW2 pv t/c exists\tselect o.id from pv o where exists (select 1 from pv i where i.c = o.t and i.id <> o.id) order by 1\nW2 pv t/c scalar\tselect o.id, (select count(*) from pv i where i.c = o.t) from pv o order by 1\nW2 pv t/c > any\tselect o.id from pv o where o.t > any (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv t/c <= all\tselect o.id from pv o where o.t <= all (select i.c from pv i where i.id <> 4) order by 1\nW2 pv t/c join\tselect o.id, i.id from pv o join pv i on o.t = i.c order by 1, 2\nW2 pv c/c in\tselect o.id from pv o where o.c in (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv c/c not in\tselect o.id from pv o where o.c not in (select i.c from pv i where i.id <> 4) order by 1\nW2 pv c/c exists\tselect o.id from pv o where exists (select 1 from pv i where i.c = o.c and i.id <> o.id) order by 1\nW2 pv c/c scalar\tselect o.id, (select count(*) from pv i where i.c = o.c) from pv o order by 1\nW2 pv c/c > any\tselect o.id from pv o where o.c > any (select i.c from pv i where i.id <> o.id) order by 1\nW2 pv c/c <= all\tselect o.id from pv o where o.c <= all (select i.c from pv i where i.id <> 4) order by 1\nW2 pv c/c join\tselect o.id, i.id from pv o join pv i on o.c = i.c order by 1, 2\nW2 = any array\tselect id from p where c = any (array['a', 'ab ', ' a']) order by 1\nW2 >= any char array\tselect id from p where t >= any (array['ab'::char(3)]) order by 1\nW2 char = any of a column\tselect id from p where 'ab'::char(3) = any (array[v]) order by 1\nW2 >= any, empty\tselect id from p where c >= any (select pe.c from pe) order by 1\nW2 >= all, empty\tselect count(*) from p where c >= all (select pe.v from pe)\nW2 a literal in chars\tselect id from p where 'ab ' in (select c from p) and id < 3 order by 1\nW2 duplicates and NULL\tselect id from p where c <> all (select c from p where id in (3, 6)) order by 1"
 
 fn body(st: lexdb_store.Store): int {
     lexdb_exec.bootstrap(&st).unwrap()

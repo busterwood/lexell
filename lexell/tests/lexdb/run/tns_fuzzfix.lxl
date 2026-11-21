@@ -2,7 +2,9 @@
 // 23ai Free (run with LEXDB_ORACLE set to its connection string, this test prints Oracle's answers: the expect lines;
 // its tables are made and dropped). W1: a JOIN binds tighter than a comma (from a, b right join c is a x (b right join
 // c)): right, full and left join, an empty table, a view, a derived table, a WITH, a tree inside a subquery, two trees,
-// a tree first. Each statement runs with unnesting on, then the subqueries' again with it off
+// a tree first. W2: char(n) beside char(n) in subqueries: any, all, in, exists and a scalar over a view, a join (not
+// char beside varchar2: Oracle compares those without padding, the door as PostgreSQL does, a gap of its own,
+// design/lexdb-fuzz.md W2). Each statement runs with unnesting on, then the subqueries' again with it off
 // (lexdb_plan.setUnnest(0)), each with set lexdb_batch = off (the row engine) and on: the label and the answer, or
 // DIFFERENT and both.
 // expect: setup: 50 statements
@@ -17,6 +19,18 @@
 // expect: W1 two trees: N = 9
 // expect: W1 a tree then a comma: N = 27
 // expect: W1 a tree first: N = 9
+// expect: W2 >= any: ID = 1;3;5;6
+// expect: W2 >= all: ID = 5
+// expect: W2 char in char: ID = 3;6
+// expect: W2 exists, view: ID = 3;6
+// expect: W2 scalar, view: ID,N = 1|1;2|1;3|2;4|0;5|1;6|2
+// expect: W2 join: ID,IID = 1|1;2|2;3|3;3|6;5|5;6|3;6|6
+// expect: unnest off, W2 >= any: ID = 1;3;5;6
+// expect: unnest off, W2 >= all: ID = 5
+// expect: unnest off, W2 char in char: ID = 3;6
+// expect: unnest off, W2 exists, view: ID = 3;6
+// expect: unnest off, W2 scalar, view: ID,N = 1|1;2|1;3|2;4|0;5|1;6|2
+// expect: unnest off, W2 join: ID,IID = 1|1;2|2;3|3;3|6;5|5;6|3;6|6
 import "task"
 import "net"
 import "strings"
@@ -30,7 +44,7 @@ import "../../../cmd/lexdb_plan"
 
 const SETUP = "create table wa (x number(10), y number(10))\ncreate table wb (x number(10), y number(10))\ncreate table wc (x number(10), z number(10))\ncreate table we (x number(10))\ninsert into wa values (1, 10)\ninsert into wa values (2, 20)\ninsert into wa values (2, 20)\ninsert into wb values (1, 1)\ninsert into wb values (3, 3)\ninsert into wb values (null, 7)\ninsert into wc values (1, 5)\ninsert into wc values (4, 6)\ninsert into wc values (null, 8)\ncreate view wv as select x, y from wb\ncreate table p (id number(10) not null, c char(3), v varchar2(4))\ninsert into p values (1, 'a', 'a')\ninsert into p values (2, ' a', ' a ')\ninsert into p values (3, 'ab', 'ab ')\ninsert into p values (4, null, null)\ninsert into p values (5, 'b', 'b')\ninsert into p values (6, 'ab', 'ab')\ncreate view pv as select id, c, v from p\ncreate table e1 (b2 number(10))\ncreate table e3 (d1 number(10))\ncreate table e4 (a5 number(19), a4 number(10))\ninsert into e1 values (0)\ninsert into e1 values (1)\ninsert into e1 values (1)\ninsert into e3 values (1)\ninsert into e3 values (1)\ninsert into e3 values (null)\ninsert into e4 values (5, 2)\ninsert into e4 values (5, 3)\ninsert into e4 values (null, null)\ncreate table r0 (c0 number(10) not null, c2 number(10,2))\ninsert into r0 values (1, 1.5)\ninsert into r0 values (2, null)\ninsert into r0 values (3, -2.25)\ninsert into r0 values (4, 1234.56)\ncreate table x0 (a0 number(6,2), s number(4))\ncreate index x0_a on x0 (a0)\ncreate index x0_s on x0 (s)\ninsert into x0 values (12.5, 3)\ninsert into x0 values (9999.99, 9999)\ninsert into x0 values (-9999.99, -9999)\ninsert into x0 values (null, null)\ninsert into x0 values (12.5, 3)\ncreate table x1 (b2 number(10))\ninsert into x1 values (1)\ninsert into x1 values (2)"
 
-const QS = "W1 right join\tselect wa.x, wa.y, wb.x bx, wb.y by2, wc.x cx, wc.z from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect count(*) n, count(wb.x) b, count(wc.x) c from wa, wb full join wc on wb.x = wc.x\nW1 left join\tselect count(*) n, count(wc.x) c from wa, wb left join wc on wb.x = wc.x\nW1 empty\tselect count(*) n from we, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*) n, count(wv.y) y from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*) n, count(d.y) y from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*) n, count(k.y) y from wa, k full join wc on k.x = wc.x\nW1 inside a subquery\tselect wa.x, (select count(*) from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) n from wa order by 1, 2\nW1 two trees\tselect count(*) n from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) n from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a tree first\tselect count(*) n from wb right join wc on wb.x = wc.x, wa"
+const QS = "W1 right join\tselect wa.x, wa.y, wb.x bx, wb.y by2, wc.x cx, wc.z from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect count(*) n, count(wb.x) b, count(wc.x) c from wa, wb full join wc on wb.x = wc.x\nW1 left join\tselect count(*) n, count(wc.x) c from wa, wb left join wc on wb.x = wc.x\nW1 empty\tselect count(*) n from we, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*) n, count(wv.y) y from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*) n, count(d.y) y from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*) n, count(k.y) y from wa, k full join wc on k.x = wc.x\nW1 inside a subquery\tselect wa.x, (select count(*) from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) n from wa order by 1, 2\nW1 two trees\tselect count(*) n from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) n from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a tree first\tselect count(*) n from wb right join wc on wb.x = wc.x, wa\nW2 >= any\tselect o.id from p o where o.c >= any (select i.c from p i where i.id <> o.id) order by 1\nW2 >= all\tselect o.id from p o where o.c >= all (select i.c from p i where i.id <> 4) order by 1\nW2 char in char\tselect o.id from p o where o.c in (select i.c from p i where i.id <> o.id) order by 1\nW2 exists, view\tselect o.id from pv o where exists (select 1 from pv i where i.c = o.c and i.id <> o.id) order by 1\nW2 scalar, view\tselect o.id, (select count(*) from pv i where i.c = o.c) n from pv o order by 1\nW2 join\tselect o.id, i.id iid from p o join p i on o.c = i.c order by 1, 2"
 
 fn values(rows: &oracle.Rows, row: int): str {
     var out: []str = []

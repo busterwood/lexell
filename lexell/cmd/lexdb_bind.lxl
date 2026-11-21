@@ -533,6 +533,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
         Expr.Call(n, args, _) {
             if n == "#ora_sub" && oraSubStamp(&args, cols, ptypes, ty) { return lexdb_sql.OID_IVAL }
             if n == "#bptrim" { return lexdb_sql.OID_TEXT }
+            if n == "#bptrims" { return lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
             if n == "#bppad" { return lexdb_sql.OID_BPCHAR }
             if n == "grouping" { return lexdb_sql.OID_INT4 }
             if n == "#mrnav" && len(args) == 2 { return exprOid(&args[1], cols, ptypes, ty) }
@@ -1278,6 +1279,11 @@ pub fn outerRef(nm: mut &Names, name: &str): Result[Option[Expr], DbErr] {
                 oid = fc.typ.oid
                 let exact = ci < len(nm.frames[f].exact) && nm.frames[f].exact[ci] && (len(fc.using) == 0 || fc.using == lexdb_sql.USING_HIDDEN)
                 if exact && refTyped(oid) { bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: fc.typ.oid, prec: fc.typ.prec, scale: fc.typ.scale, len: fc.typ.len}) }
+                // a derived table's char, varchar or text: compared as its query compares it still (a char's blanks not
+                // significant, a text's significant beside a char), its n not given (the cast keeps a wider value as it is)
+                if !exact && (oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_TEXT) {
+                    bp = Some(lexdb_sql.TypeName{kind: fc.typ.kind, oid: oid, prec: 0, scale: 0, len: 0})
+                }
                 if fc.typ.kind == lexdb_sql.K_TEXT { coll = fc.coll.clone() }
                 found = fc.name.clone()
                 slot = ci
@@ -1463,11 +1469,16 @@ fn bpKeeps(nm: &str): bool {
     }
 }
 
+// Whether x is an array of chars (char(n)[]).
+fn bpElems(x: &Expr, cols: &[]lexdb_sql.ColDef, ty: &Typing): bool {
+    return lexdb_sql.elemOid(exprOid(x, cols, &[], ty)) == lexdb_sql.OID_BPCHAR
+}
+
 // A call's arguments resolved, with a char among them (9.94).
 pub fn bpCall(nm: &str, args: []Expr, star: bool, cols: &[]lexdb_sql.ColDef, ty: &Typing): Expr {
     var any = false
     for a in args { if isBp(&a, cols, ty) { any = true } }
-    if !any { return Expr.Call(nm.toStr(), args, star) }
+    if !any && !(len(args) == 2 && lexdb_sql.isQuant(nm) && bpElems(&args[1], cols, ty)) { return Expr.Call(nm.toStr(), args, star) }
     var xs = args
     if nm == "in" && len(xs) > 1 && isBp(&xs[0], cols, ty) {
         // x IN (a, b): as x = a OR x = b; padded to x's n when all are values
@@ -1496,7 +1507,15 @@ pub fn bpCall(nm: &str, args: []Expr, star: bool, cols: &[]lexdb_sql.ColDef, ty:
         return Expr.Call("case else", [Expr.Bin("=", a, b), Expr.Lit(Val.Null), clone(&xs[0])], false)
     }
     if lexdb_sql.isQuant(nm) && !strings.endsWith(&nm, "like") && len(xs) == 2 {
-        return Expr.Call(nm.toStr(), [trimmed(clone(&xs[0])), clone(&xs[1])], star)
+        // x op ANY | ALL (array), as x op each element (bpCmp): a char's blanks not significant beside a char, a varchar or
+        // an untyped value, a char given to a text as a text; an array of chars' elements trimmed so (#bptrims)
+        let xb = isBp(&xs[0], cols, ty)
+        let eb = bpElems(&xs[1], cols, ty)
+        let eo = lexdb_sql.elemOid(exprOid(&xs[1], cols, &[], ty))
+        let both = bpSide(&xs[0], cols, ty) && (eo == lexdb_sql.OID_BPCHAR || eo == lexdb_sql.OID_VARCHAR)
+        let x = if xb || both { trimmed(clone(&xs[0])) } else { clone(&xs[0]) }
+        let a = if eb || both { Expr.Call("#bptrims", [clone(&xs[1])], false) } else { clone(&xs[1]) }
+        return Expr.Call(nm.toStr(), [x, a], star)
     }
     if bpKeeps(nm) { return Expr.Call(nm.toStr(), xs, star) }
     var out: []Expr = []
@@ -1639,6 +1658,8 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                     let ro = inReadOid(po, so)
                     if ro != 0 { v = Expr.Cast(replace(mut &v, Expr.Lit(Val.Null)), lexdb_sql.oidType(ro)) }
                     ns.frames[top].subReads[i] = inReadOid(so, po)
+                    // a char IN a subquery of varchars: compared as chars, the set's values without their blanks too (9.94)
+                    if so == lexdb_sql.OID_VARCHAR && isBp(&v, cols, &ty0) { ns.frames[top].subReads[i] = lexdb_sql.OID_BPCHAR }
                     let sn = ns.frames[top].subColls[i].clone()
                     let c2 = if len(sn) > 0 { Coll{name: sn, level: CL_IMPLICIT} } else { Coll{name: ns.coll.clone(), level: CL_DEFAULT} }
                     let c = try cmpColl(exprColl(&v, cols, ns), c2, &"=")
@@ -1651,9 +1672,11 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 append(mut &out, Expr.Lit(Val.Int(f.subOids[i])))
                 append(mut &out, Expr.Lit(Val.Text(f.subNames[i].clone())))
                 if len(xs) > 0 {
-                    // a char IN a subquery of texts: as a text (9.94)
+                    // a char IN a subquery of texts: as a text; a varchar or an untyped value IN a subquery of chars: as a char
+                    // (9.94)
                     let ix = pop(mut &xs)
-                    append(mut &out, if isBp(&ix, cols, &ns.ty) { trimmed(ix) } else { ix })
+                    let bs = f.subOids[i] == lexdb_sql.OID_BPCHAR && bpSide(&ix, cols, &ns.ty)
+                    append(mut &out, if bs || isBp(&ix, cols, &ns.ty) { trimmed(ix) } else { ix })
                 }
                 for r in f.subRefs[i] { append(mut &out, clone(&r)) }
                 return Ok(Expr.Call(nm.clone(), out, star))
