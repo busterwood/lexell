@@ -1,0 +1,155 @@
+// lexdb over TDS: what the pipeline took from the row engine in Q8's R3 (design/lexdb-layers.md 6.3.Q8 R3) through the T-SQL
+// door, checked against SQL Server 2022 (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's
+// answers: the expect lines). A function in FROM: VALUES (NULLs, duplicates, a text's groups, as a join's level), the catalog's views
+// (sys.tables, sys.columns); a correlated derived table at a subquery's first level (its outer values the run's: MAX over
+// it, EXISTS over it); set operations in subqueries, derived tables and CTEs (UNION, UNION ALL, INTERSECT, EXCEPT, nested, TOP
+// over a sorted one, a numeric and an integer part: 2 UNION 2.0, an error in a part: 8134, one in a derived table's WHERE per
+// outer row: 8134). Against lexdb each batch runs with
+// SET lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both. Not here: MATCH_RECOGNIZE and a
+// set-returning function in the select list (SQL Server has neither), CROSS APPLY (a LATERAL level after the first: still the
+// row engine's), STRING_SPLIT and GENERATE_SERIES (the door has neither). Found on the way, both engines alike (dialect gaps):
+// a VALUES text column compared with a table's collated one gives 468, SQL Server does not evaluate a derived table's
+// output nothing reads (lexdb raises its 8134), 2 UNION 2.0 shows 2 where SQL Server shows 2.0, and a parenthesized set
+// operation in FROM gives 50000.
+// expect: same: n,c: 4|3
+// expect: same: x,n: NULL|1;'a'|1;'b'|2
+// expect: same: id,k: 1|1;1|2;2|1;2|2
+// expect: same: id: 3;5;5;53;55;55;103;105;105;153;155;155;203;205;205;253;255;255
+// expect: same: n: 3
+// expect: same: name: 'id';'g';'x';'s'
+// expect: same: id,m: 1|47;2|54;3|41;4|48;5|55;6|42;7|40;8|47;9|54
+// expect: same: id: 1;2;3;4;7;8;9;10;11;14;15;16;17;18;21;22;23;24;25;28;29;30;31;32;35;36;37;38;39;42;43;44;45;46;49;50;51;52;53;56;57;58;59
+// expect: same: id,n: 1|487;2|487;3|487;4|487
+// expect: same: error 8134
+// expect: same: n: 40
+// expect: same: g: 39;38;37
+// expect: same: x: NULL;1;2;3;4;5;6;7;8;9;10;11;12;14;15;16;17;18;19;20;21;22;23;24;25;27;28;29;30;31;32;33;34;35;36;37;38
+// expect: same: x: 
+// expect: same: n: 2271
+// expect: same: n: 1
+// expect: same: n,c: 20|19
+// expect: same: error 8134
+// expect: same: m: 9
+// expect: same: n: 39
+// expect: same: s: 'k1';'k1';'k1';'k10';'k10';'k11';'k12';'k12';'k13';'k14';'k14';'k15';'k15';'k16';'k16';'k17';'k17';'k18';'k18';'k19';'k19'
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nCREATE TABLE a (id int PRIMARY KEY, g int, x int NULL, s varchar(10) NULL)\nINSERT INTO a SELECT n, n % 7, CASE WHEN n % 13 = 0 THEN NULL ELSE n % 50 END, CASE WHEN n % 11 = 0 THEN NULL ELSE 'k' + CAST(n % 20 AS varchar(5)) END FROM (SELECT p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r CROSS JOIN dg w) t WHERE n <= 3000\nCREATE TABLE b (id int PRIMARY KEY, k int, v int NULL, w varchar(10))\nINSERT INTO b SELECT n, n % 40, CASE WHEN n % 9 = 0 THEN NULL ELSE (n * 7) % 60 END, 'k' + CAST(n % 25 AS varchar(5)) FROM (SELECT p.i + q.i * 10 + r.i * 100 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r) t WHERE n <= 500"
+
+const QS = "SELECT COUNT(*) AS n, COUNT(x) AS c FROM (VALUES (1), (2), (2), (NULL)) v(x)\nSELECT x, COUNT(*) AS n FROM (VALUES ('b'), ('a'), ('b'), (NULL)) v(x) GROUP BY x ORDER BY x\nSELECT a.id, v.k FROM a CROSS JOIN (VALUES (1), (2)) v(k) WHERE a.id < 3 ORDER BY a.id, v.k\nSELECT a.id FROM a JOIN (VALUES (3), (5), (5)) v(i) ON v.i = a.x WHERE a.id < 300 ORDER BY a.id\nSELECT COUNT(*) AS n FROM sys.tables WHERE name IN ('a', 'b', 'dg')\nSELECT name FROM sys.columns WHERE object_id = OBJECT_ID('a') ORDER BY column_id\nSELECT id, (SELECT MAX(w) FROM (SELECT b.v AS w FROM b WHERE b.k = a.g) z) AS m FROM a WHERE id < 10 ORDER BY id\nSELECT id FROM a WHERE id < 60 AND EXISTS (SELECT 1 FROM (SELECT k FROM b WHERE b.k = a.g + 35) s) ORDER BY id\nSELECT id, (SELECT COUNT(*) FROM (SELECT b.id FROM b WHERE b.k <> a.g) q) AS n FROM a WHERE id < 5 ORDER BY id\nSELECT id, (SELECT COUNT(*) FROM (SELECT b.id FROM b WHERE 10 / (b.k - a.g) > 0) q) AS n FROM a WHERE id < 5 ORDER BY id\nSELECT COUNT(*) AS n FROM (SELECT g FROM a UNION SELECT k FROM b) q\nSELECT TOP 3 g FROM (SELECT g FROM a UNION SELECT k FROM b) q ORDER BY g DESC\nSELECT x FROM (SELECT x FROM a WHERE id < 40 INTERSECT SELECT v FROM b) q ORDER BY x\nSELECT x FROM (SELECT x FROM a WHERE id < 100 EXCEPT SELECT v FROM b) q ORDER BY x\nSELECT COUNT(*) AS n FROM a WHERE x IN (SELECT k FROM b UNION SELECT 40)\nSELECT COUNT(*) AS n FROM (SELECT 2 AS n UNION SELECT 2.0) q\nWITH c AS (SELECT s FROM a WHERE id < 30 UNION SELECT w FROM b WHERE id < 10) SELECT COUNT(*) AS n, COUNT(s) AS c FROM c\nSELECT COUNT(*) AS n FROM (SELECT 10 / (x - 7) AS y FROM a WHERE id < 40 UNION SELECT 1) q\nSELECT (SELECT MAX(g) FROM (SELECT g FROM a WHERE id < 3 UNION SELECT 9) z) AS m\nSELECT COUNT(*) AS n FROM (SELECT g FROM a UNION SELECT k FROM b EXCEPT SELECT 1) q\nSELECT s FROM (SELECT s FROM a WHERE id < 40 UNION ALL SELECT w FROM b WHERE id < 5) q WHERE s LIKE 'k1%' ORDER BY s"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                if !local {
+                    println("same: " + answer(mut &c, &q))
+                    continue
+                }
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = answer(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(53), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
