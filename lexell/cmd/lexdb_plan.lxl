@@ -7776,8 +7776,15 @@ pub fn pipeShape(sel: &Sel): bool {
     if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
-    return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs) && len(sel.ox) == len(sel.exprs) && boundOnce(q)
+    // (more outputs than its list's: a subquery run once into a hash, its
+    // keys and value, hashSub's, which runHashed reads; Q8 R1)
+    if len(sel.exprs) != len(sel.outs) && !hashedOuts(sel) { return false }
+    return len(sel.exprs) > 0 && len(sel.ox) == len(sel.exprs) && boundOnce(q)
 }
+
+// Whether sel's outputs, more than its select list's, are a hashed
+// subquery's keys and value (hashSub).
+fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.sort && !sel.distinct }
 
 // Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
 // (slice P3): rows of one select list, no grouping, window, set
@@ -7791,6 +7798,23 @@ fn sortShape(sel: &Sel): bool {
         for x in sel.order { if hasCorr(&x) { return false } }
     }
     return true
+}
+
+// An EXISTS's select list, which nothing reads (its * reads no column:
+// exec's stmtNames, PostgreSQL's simplify_EXISTS_query): its columns made
+// NULL, the values the row engine read of them, so the pipeline, which
+// takes no output of a column its scan does not decode, runs its rows (Q8
+// R1). Not where the rows it counts depend on its values (a set operation,
+// grouping, DISTINCT, an aggregate).
+pub fn existsUnread(sel: mut &Sel, s: &lexdb_sql.Stmt) {
+    if s.setop != 0 || len(s.group) > 0 || len(s.gsets) > 0 || s.distinct || len(s.distinctOn) > 0 || sel.aggQ || sel.setop != 0 { return }
+    for i in 0..len(sel.exprs) {
+        let col = match sel.exprs[i] {
+            Expr.Col(_, _) { true }
+            else { false }
+        }
+        if col { sel.exprs[i] = Expr.Lit(Val.Null) }
+    }
 }
 
 // Whether q's subquery i runs its own query: not one a semi or anti level
@@ -7937,7 +7961,7 @@ fn queryWhy(sel: &Sel): str {
     if q.corr { return "a correlated subquery left per row (q.corr)" }
     if len(q.top) > 0 { return "conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
-    if len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) { return "outputs and columns differ" }
+    if len(sel.exprs) == 0 || (len(sel.exprs) != len(sel.outs) && !hashedOuts(sel)) { return "outputs and columns differ" }
     if len(sel.ox) != len(sel.exprs) { return "outputs not bound for the plan (ox)" }
     if !boundOnce(q) { return "conditions not bound once (boundOnce)" }
     return ""
