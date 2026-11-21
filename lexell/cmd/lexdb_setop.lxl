@@ -540,3 +540,32 @@ pub fn sortHeld(txn: mut &lexdb_store.Txn, sp: &Spec, rows: &[][]Val, limit: int
     })
     return Ok(out)
 }
+
+// A held set operation's rows, cut and sorted (held), and the bytes the
+// row path holds of them.
+pub type Held = record { pub rows: [][]Val; pub bytes: int }
+
+// The rows of a held set operation (its parts' combined: rows) with its
+// ORDER BY (sorting: it has one, not under EXISTS's cap of 1), OFFSET and
+// LIMIT (limit: its LIMIT or the caller's cap) made: sortHeld or cut. The
+// bytes are what the row path (lexdb_exec.execSelIn) holds of them: each
+// row's ORDER BY values by their collations, or an empty row each when not
+// sorted. batErr: a key not an output, or a value the sort does not hold
+// (rows as they were: the caller's row path).
+pub fn held(txn: mut &lexdb_store.Txn, sp: &Spec, rows: mut &[][]Val, limit: int, offset: int, sorting: bool): Result[Held, DbErr] {
+    let none: []Val = []
+    var bytes = len(rows) * lexdb_pipe.rowBytes(&none)
+    if !sorting { return Ok(Held{rows: cut(replace(rows, []), limit, offset), bytes: bytes}) }
+    let kc = keyCols(&sp.order, &sp.outs)
+    if len(kc) == 0 || len(kc) != len(sp.order) { return Err(lexdb_pipe.batErr()) }
+    bytes = 0
+    var ord: []Val = []
+    for r in rows {
+        ord = []
+        for oi in 0..len(kc) { append(mut &ord, if oi < len(sp.ordKinds) { lexdb_sort.collVal(sp.ordKinds[oi], &r[kc[oi]]) } else { r[kc[oi]].clone() }) }
+        bytes += lexdb_pipe.rowBytes(&ord)
+    }
+    if limit == 0 { return Ok(Held{rows: [], bytes: bytes}) }
+    let out = try sortHeld(txn, sp, rows, limit, offset)
+    return Ok(Held{rows: out, bytes: bytes})
+}
