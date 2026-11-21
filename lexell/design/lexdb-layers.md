@@ -7534,10 +7534,14 @@ reference, and the writes it still finds (below) reach it.
 | 909f92dc | the paused WIP merged: `writeProg`, `writePrep`, `writePoint`; `compileRows` (a join to `compileLevels`, a point `PR_POINT`, else the first arm alone), `pointRows`; census `pipe-dml`; test `exec_writerows`; `exec_subrows`' counter | 20,215 | `lexdb_pipe` 8,556, `lexdb_plan` 8,856 |
 | e08ae0cf | tests `tds_r5` (SQL Server 2022's answers), `tns_r5` (Oracle Free's; `gen_oracle.py --check` knows it) | 20,215 | |
 | 3b52ca15 | a point by key as a light program (`pointProg`); the point join's path left as main's; `exec_writerows`' batched writes | 20,220 | `lexdb_pipe` 8,577 |
+| 2aa30269 | main 028fd9e9 merged (the runtime's size classes, a new seed; lxlc rebuilt) | 20,220 | |
+| 60a77ffa | the point's conditions bound once, by prepare (`Mats.cc`), not by the plan: the statements after point UPDATEs back to main's instructions (below); a DELETE's narrowed columns in `pointProg`; a point with subqueries the first arm's | 20,229 | `lexdb_pipe` 8,566 |
+| 134ae1d7 | the point's row made only when found, the table's row itself when whole | 20,230 | `lexdb_pipe` 8,572 |
 
-`lexdb_exec` +61: `writePoint` (its scan needs `pathScan`, `Env`,
-`seqEnv`, `Mats`), `writeProg`, `writePrep`, the dispatch in `runQuery`
-and the four writes' calls; the program and its run are the pipe's.
+`lexdb_exec` +71 (20,159 at d75a735c and at 028fd9e9): `writePoint`
+(its scan needs `pathScan`, `Env`, `seqEnv`, `Mats`), `writeProg`,
+`writePrep`, the dispatch in `runQuery` and the four writes' calls; the
+program and its run are the pipe's.
 
 **What it does.**
 
@@ -7546,29 +7550,51 @@ and the four writes' calls; the program and its run are the pipe's.
   `levelsProgQ`, now for one table too). A join tree is the levels program
   as before (`compileLevels`, R4's point first table included); one table
   is its first arm alone (`Filter? (Scan)`, `compileRows`, run by
-  `runLevels`: its batches, or row by row for points and IN lists); a
-  point of the whole primary key (`lexdb_plan.pointRead`) is a program of
-  its own (`Prog.run` `PR_POINT`). DELETE's range path (`rangeDelete`) is
+  `runLevels`: its batches, or row by row for IN lists and a point with
+  subqueries); a point of the whole primary key (`lexdb_plan.pointRead`)
+  of a query without subqueries is a program of its own (`Prog.run`
+  `PR_POINT`, `lexdb_pipe.pointProg`). DELETE's range path (`rangeDelete`) is
   tried first, as before (it finds no rows: one store write).
 - **A point** is run by exec's `writePoint`: the key's scan (`pathScan`;
   a batched write's next batch from the key after the last one's,
   `afterScans`), then `lexdb_pipe.pointRows`: the row read as a join over
-  a point reads its first table (`getRow`, the values moved, not cloned),
+  a point reads its first table (`getRow`; the emitted row made only when
+  one is found, the table's row itself when it is the query's whole row),
   its conditions in order by the scalar evaluator, the row to the write;
   counted as `runLevel` and `tryRow` count it (EXPLAIN ANALYZE as before).
-  With no subqueries it runs in `prepare`'s context (`Mats.ce`: the
-  parameters already copied); with them, their values copied as
-  `runLevelsProg` copies them.
-- **A point's program is light.** For a table read whole by a query without
-  subqueries (the OLTP UPDATE) `levelsProgIn` makes it directly
-  (`lexdb_pipe.pointProg`): its scan without the batch arm's kinds and
-  need, which `pointRows` does not read, no `joinsOver` or `compileRows`.
-  Measured by variants of the branch (in process, UPDATE by key):
-  binding the condition (`planX`, about 1,170 instructions, which
-  `prepare`'s `cxsOf` binding no longer does: `writePrep`), `scanArm`
-  796, `filterOver`/`subsOf` and the plan's drop 475, `joinsOver` and
-  `compileRows` 366: the first form cost +556.6 a statement, this one
-  -310.5.
+- **A point's program is light and its conditions are bound once.**
+  `levelsProgIn` makes it directly (`pointProg`): a Scan without the batch
+  arm's kinds (a DELETE's narrowed columns kept), no Filter, no
+  `joinsOver` or `compileRows`. Its conditions are bound by `prepare` as
+  the row engine's are (`writePrep` binds for a point: `Mats.cc`,
+  evaluated by `pointRows` in `Mats.ce`, as `allTrueC` evaluates them); a
+  condition that does not bind gives the run to the row engine. Measured
+  by variants (in process, UPDATE by key, at d75a735c): the first form
+  (the WIP's `Filter (Scan)` through `levelsProgIn`) cost +556.6 a
+  statement: binding the condition (`planX`) about 1,170, `scanArm` 796,
+  `filterOver`/`subsOf` and the plan's drop 475, `joinsOver` and
+  `compileRows` 366.
+- **The statements after point UPDATEs.** 3b52ca15's form (the conditions
+  bound by the plan, `planX`, held in the program; `prepare`'s binding
+  skipped) left later statements of the process +22 instructions each:
+  the coordinator's harness (`pt2.lxl`: 200 INSERTs and 200 UPDATEs by key,
+  autocommit, then 20,000 point selects or INSERTs) read point selects
+  132,084.7 -> 132,106.7 and INSERTs +21, deterministic, on d75a735c and
+  on 028fd9e9; mine (no UPDATEs before the selects) read them equal. What
+  was measured: without the UPDATE warm-up both 132,113.8 / 132,113.7;
+  after 150, 200 or 250 UPDATEs +22.0 every time, after 400 (a checkpoint
+  in both) equal; a new session after the UPDATEs +22 still; 30,000 small
+  strings made and freed before the selects moved both by -1,755 and kept
+  +22. Of the variants, only binding the conditions in `prepare` and
+  holding them in `Mats.cc` to the statement's end (as the row engine
+  does) gave main's count; binding them and dropping them at once, or
+  freeing `Mats.cc` before the write, or holding a clone of the plan's
+  bound conditions there, or binding by `bindExpr` into the program, did
+  not; the select path's code is unchanged. So the cause is where the
+  UPDATE's allocations land (a state the heap and the store's unflushed
+  nodes keep until a checkpoint), not more work on the select path; the
+  binding is now the row engine's, made where it made it, and the count
+  is main's.
 - **The rows are all held before any is changed**, as before: each found
   row is copied into `found` by the write's emit, then locked
   (`lockFound`), then written; so the Halloween problem cannot come from
@@ -7636,21 +7662,32 @@ UPDATEs by key, then 300 TPC-B-like transactions): all 1,200 UPDATEs are
 the point program's, every point select the pipeline's; no write is
 found by the row engine.
 
-In process (`LXL_HASH_SEED=1`, the 1-statement run subtracted from the
-N-statement one; INSERT and UPDATE in one transaction on the simulated
-disk; main d75a735c against 3b52ca15, two rounds alternated, alike to a
-tenth):
+In process (`LXL_HASH_SEED=1`; main 028fd9e9 against 134ae1d7, both built
+by 028fd9e9's compiler, alternated, alike to a tenth). Mine (`ip.lxl`: the
+1-statement run subtracted from the N-statement one; INSERT, UPDATE and
+DELETE in one transaction on the simulated disk) and the coordinator's
+(`pt2.lxl`: autocommit, after 200 INSERTs and UPDATEs, a mode's run less
+the setup's, over 20,000):
 
-| statement | main d75a735c | R5 | |
+| statement | main 028fd9e9 | R5 | |
 |---|---:|---:|---:|
-| UPDATE ... WHERE id = k | 148,237.1 | 147,926.6 | -310.5 (-0.21%) |
-| point select | 119,392.8 | 119,392.8 | 0 |
-| INSERT VALUES, one row | 106,115.4 | 106,115.4 | 0 |
-| the 3-table join (2,000) | 459,178.3 | 459,178.4 | 0 |
-| a join under a stopping first table (`limit 3`, 2,000) | 611,552.7 | 611,552.7 | 0 |
+| UPDATE ... WHERE id = k (mine) | 144,685.6 | 143,017.6 | -1,668 (-1.15%) |
+| DELETE ... WHERE id = k, missing (mine, 2,000) | 92,917.4 | 92,610.5 | -307 |
+| point select (mine) | 116,192.8 | 116,192.8 | 0 |
+| INSERT VALUES, one row (mine) | 103,754.0 | 103,754.0 | 0 |
+| the 3-table join (mine, 2,000) | 449,327.3 | 449,327.4 | 0 |
+| a join under a stopping first table (`limit 3`, mine, 2,000) | 604,104.7 | 604,104.7 | 0 |
+| point select after UPDATEs (coordinator's) | 132,084.7 | 132,084.7 | 0 (3b52ca15: +22.0) |
+| INSERT after UPDATEs (coordinator's, autocommit) | 55,122,052.8 | 55,122,052.7 | 0 (3b52ca15: +21.0) |
+| UPDATE by key (coordinator's, autocommit) | 55,144,553.9 | 55,143,232.6 | -1,321 |
+
+At d75a735c, before the merge (3b52ca15, mine): UPDATE by key 148,237.1 ->
+147,926.6, point select, INSERT, the 3-table join and a stopping join
+(`limit 3`) equal.
 
 Over the wire (base d75a735c against 3b52ca15, fresh copies of both
-binaries, `-O`; `~/tpch-w/r5/logs`):
+binaries, `-O`; `~/tpch-w/r5/logs`; the select path's code is the same in
+134ae1d7):
 
 - `pts.sh` (20,000 point selects by the simple protocol, wall / server CPU
   ms, means of 5, three rounds alternated): main 701.2 / 652.6, 692.0 /
@@ -7681,11 +7718,11 @@ query over 1.5% slower (the most q12 +1.1%, q16 +1.1%), so no `iq.sh`
 run; faster by over 1.5%: q13 -3.3%, q15 -2.7%, q17 -2.6%, q20 -3.7%. R5's
 writes are not in TPC-H's 22 (no refresh functions).
 
-**Tests.** Suite 277 of 277 at 3b52ca15 (274 at main; new:
+**Tests.** Suite 277 of 277 at 3b52ca15, 60a77ffa and 134ae1d7 (274 at main; new:
 `exec_writerows`, `tds_r5`, `tns_r5`). `exec_writerows` runs each write
 with batches on and off in a transaction rolled back (the same tag, rows
-or error, and the table after it the same): by key 19 (all the point
-program's), ranges and scans 17 (16 a program's; `delete from t2 where a
+or error, and the table after it the same): by key 19 (the point
+program's but a key from a subquery: the first arm's), ranges and scans 17 (16 a program's; `delete from t2 where a
 = 3` is the range delete), joins 5, MERGE 3 (a 5-row source the row
 engine's, `fewSource`), ALTER ... USING 2, batched writes 7 (by key on two
 copies of a table, a next batch after the key: the point program's; a key
@@ -7941,7 +7978,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R2 (built: 6.3.Q8 R2; left: a set-returning function in the select list, a collation's hash join key, the binder's errors and the outputs that do not bind) | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
 | R3 (built: 6.3.Q8 R3) | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop`. **Built: a function's program (`lexdb_srf` makes its rows), LATERAL at the first level over outer values run once a run, a set-returning function in a select list with no FROM (ProjectSet), a held set operation's ORDER BY, OFFSET and LIMIT, MATCH_RECOGNIZE's input; left: LATERAL after the first level (a dependent join: R4), a set-returning function over a table or under LIMIT/DISTINCT, TOP and WITH TIES over a set** | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
 | R4 (built: 6.3.Q8 R4) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
-| R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`); UPDATE by key 310 instructions fewer, TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
+| R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`, its conditions bound by prepare); UPDATE by key 1,668 instructions fewer (-1.15%), TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
 | R7 | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait) | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
 | R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
