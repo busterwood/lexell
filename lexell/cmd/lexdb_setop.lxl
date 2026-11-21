@@ -491,8 +491,12 @@ fn runSetKeys(txn: mut &lexdb_store.Txn, sp: &Spec, sink: &fn(&[]OutCol, &[]Val,
 //
 // A set operation a subquery, a CTE or a held statement reads (its parts
 // run and combined by the caller: combine, or a recursive CTE's rounds)
-// has its ORDER BY, OFFSET and LIMIT made here, as the streamed run makes
-// them: by the pipeline's sort (setSort), a top-N with a LIMIT.
+// has its ORDER BY, OFFSET and LIMIT made here: every row's ORDER BY
+// values, the rows sorted by them (typed keys, lexdb_sort, as a SELECT's
+// held rows are sorted; a comparison sort when a key's values are of
+// mixed kinds), then cut. (The pipeline's sort, setSort, cost a 100-row
+// set about 1,300 instructions a row more: its chunks, made and read
+// again.)
 
 // rows past offset (-1 or 0: none skipped), at most limit (-1 all), in
 // their order.
@@ -511,61 +515,80 @@ pub fn cut(rows: [][]Val, limit: int, offset: int): [][]Val {
     return out
 }
 
-// rows sorted by sp's ORDER BY (its keys outputs: keyCols) through the
-// pipeline's sort, then cut by offset and limit (a top-N keeps limit +
-// offset rows). rows stay the caller's (the sort takes copies). batErr: a
-// key not an output, or a value the sort does not hold (the caller's row
-// path then sorts them). Nothing is held against max_statement_mem here:
-// the caller holds what its row path holds.
-pub fn sortHeld(txn: mut &lexdb_store.Txn, sp: &Spec, rows: &[][]Val, limit: int, offset: int): Result[[][]Val, DbErr] {
-    let kc = keyCols(&sp.order, &sp.outs)
-    if len(kc) == 0 || len(kc) != len(sp.order) { return Err(lexdb_pipe.batErr()) }
-    var srt = lexdb_pipe.setSort(len(sp.outs), kc, collections.copyOf(&sp.desc), collections.copyOf(&sp.nullsFirst),
-                                 collections.copyOf(&sp.ordKinds), limit, offset, -1, 0)
-    let noB = lexdb_rows.noOutBatch()
-    for i in 0..len(rows) { if !(try srt.take(&noB, &rows[i])) { return Err(lexdb_pipe.batErr()) } }
-    var bud = lexdb_pipe.newBudget()
-    var out: [][]Val = []
-    var row: []Val = []
-    let n = try srt.done(txn, mut &bud, fn(tx: mut &lexdb_store.Txn, ob: &OutBatch, r: &[]Val): Result[bool, DbErr] {
-        if ob.n == 0 {
-            append(mut &out, collections.copyOf(r))
-            return Ok(true)
-        }
-        for j in 0..ob.n {
-            lexdb_pipe.obRow(ob, j, mut &row)
-            append(mut &out, collections.copyOf(&row))
-        }
-        return Ok(true)
-    })
-    return Ok(out)
-}
-
 // A held set operation's rows, cut and sorted (held), and the bytes the
 // row path holds of them.
 pub type Held = record { pub rows: [][]Val; pub bytes: int }
 
 // The rows of a held set operation (its parts' combined: rows) with its
 // ORDER BY (sorting: it has one, not under EXISTS's cap of 1), OFFSET and
-// LIMIT (limit: its LIMIT or the caller's cap) made: sortHeld or cut. The
-// bytes are what the row path (lexdb_exec.execSelIn) holds of them: each
-// row's ORDER BY values by their collations, or an empty row each when not
-// sorted. batErr: a key not an output, or a value the sort does not hold
-// (rows as they were: the caller's row path).
-pub fn held(txn: mut &lexdb_store.Txn, sp: &Spec, rows: mut &[][]Val, limit: int, offset: int, sorting: bool): Result[Held, DbErr] {
+// LIMIT (limit: its LIMIT or the caller's cap) made. The bytes are what
+// the row path (lexdb_exec.execSelIn) holds of them: each row's ORDER BY
+// values by their collations, or an empty row each when not sorted.
+// batErr: a key not an output (rows as they were: the caller's row path).
+pub fn held(sp: &Spec, rows: mut &[][]Val, limit: int, offset: int, sorting: bool): Result[Held, DbErr] {
     let none: []Val = []
-    var bytes = len(rows) * lexdb_pipe.rowBytes(&none)
-    if !sorting { return Ok(Held{rows: cut(replace(rows, []), limit, offset), bytes: bytes}) }
+    if !sorting { return Ok(Held{rows: cut(replace(rows, []), limit, offset), bytes: len(rows) * lexdb_pipe.rowBytes(&none)}) }
     let kc = keyCols(&sp.order, &sp.outs)
     if len(kc) == 0 || len(kc) != len(sp.order) { return Err(lexdb_pipe.batErr()) }
-    bytes = 0
-    var ord: []Val = []
+    // the rows' ORDER BY values, by their collations
+    var bytes = 0
+    var ords: [][]Val = withCapacity(len(rows))
     for r in rows {
-        ord = []
+        var ord: []Val = withCapacity(len(kc))
         for oi in 0..len(kc) { append(mut &ord, if oi < len(sp.ordKinds) { lexdb_sort.collVal(sp.ordKinds[oi], &r[kc[oi]]) } else { r[kc[oi]].clone() }) }
         bytes += lexdb_pipe.rowBytes(&ord)
+        append(mut &ords, ord)
     }
-    if limit == 0 { return Ok(Held{rows: [], bytes: bytes}) }
-    let out = try sortHeld(txn, sp, rows, limit, offset)
-    return Ok(Held{rows: out, bytes: bytes})
+    let perm = sortPerm(sp, mut &ords)
+    var all = replace(rows, [])
+    var out: [][]Val = withCapacity(len(perm))
+    for p in perm { append(mut &out, replace(mut &all[p], [])) }
+    return Ok(Held{rows: cut(out, limit, offset), bytes: bytes})
+}
+
+// The rows' order by their ORDER BY values ords (ties in their order):
+// typed keys (lexdb_sort.skSort); when a key's values are of mixed kinds,
+// a stable comparison sort (NULLs by NULLS FIRST or LAST, then
+// lexdb_sort.sortCmp, DESC reversing it).
+fn sortPerm(sp: &Spec, ords: mut &[][]Val): []int {
+    let n = len(ords)
+    var idx: []int = withCapacity(n)
+    for i in 0..n { append(mut &idx, i) }
+    if n < 2 { return idx }
+    var keys: []lexdb_sort.SKey = []
+    var typed = true
+    for k in 0..len(sp.desc) {
+        var vs: []Val = withCapacity(n)
+        for i in 0..n { append(mut &vs, ords[i][k].clone()) }
+        var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, sp.desc[k], sp.nullsFirst[k])
+        if !lexdb_sort.skOfVals(vs, sp.desc[k], sp.nullsFirst[k], mut &key) {
+            typed = false
+            break
+        }
+        append(mut &keys, key)
+    }
+    if typed { return lexdb_sort.skSort(mut &keys, n) }
+    collections.sortBy(mut &idx, fn(a: &int, b: &int): int {
+        for k in 0..len(sp.desc) {
+            let x = &ords[a][k]
+            let y = &ords[b][k]
+            let nx = isNull(x)
+            let ny = isNull(y)
+            if nx && ny { continue }
+            if nx { return if sp.nullsFirst[k] { -1 } else { 1 } }
+            if ny { return if sp.nullsFirst[k] { 1 } else { -1 } }
+            var c = lexdb_sort.sortCmp(x, y)
+            if sp.desc[k] { c = -c }
+            if c != 0 { return c }
+        }
+        return 0
+    })
+    return idx
+}
+
+fn isNull(v: &Val): bool {
+    match v {
+        Val.Null { return true }
+        else { return false }
+    }
 }
