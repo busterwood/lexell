@@ -5,27 +5,31 @@
 // with batches on and off (the row engine, the reference) in a transaction rolled back: the same tag,
 // rows or error, and the same table after it. "found": per statement, p when its rows were a point
 // program's (lexdb_pipe.rowsRuns()[0]), y when a levels program's (rowsRuns()[1]), n neither (the row
-// engine's: a correlated subquery left per row, a condition on no table, a batched write's next batch).
+// engine's: a correlated subquery left per row; a range delete finds none).
 // - by key: integer, text and two-column keys; a key missing, NULL, out of the column's range and of
 //   another type; a condition after the key that drops the row or fails (22012); SET of the key itself
-//   (23505 on a duplicate); RETURNING; a key from a subquery run once; a prepared statement's
-//   parameter; a virtual generated column read and its base set.
+//   (23505 on a duplicate); RETURNING; a key from a subquery run once; a virtual generated column
+//   read and its base set; two statements in one transaction.
 // - ranges and scans: a key range, a scan with a condition, an index's range, an IN list of keys, an
 //   error in the third batch (22012: no row changed), NULLs in the condition, an empty table, rows
 //   changed so the condition would find them again (the Halloween problem: each row once), a key moved
 //   past the scan's end, duplicates made (23505), a CHECK broken by a late row.
 // - joins: UPDATE ... FROM, DELETE ... USING, a FROM row matching twice (one change, as PostgreSQL), and
 //   a self join.
-// - MERGE: matched, not matched, by key and by scan.
+// - MERGE: matched, not matched, by key and by scan; a source of a few rows (fewSource: the row engine's).
 // - ALTER TABLE ... TYPE ... USING (the table's rows by a scan program).
-// - not a program's: a correlated EXISTS left per row (unnesting off), a condition on no table.
+// - batched writes (WITH (batch_rows n)): by key (p: the point program, a next batch from the key after the last), a key
+//   range (the range delete: no rows found), a scan (y).
+// - a correlated EXISTS left per row (unnesting off: the row engine's), and constant conditions (`1 = 2`, `now() is null`: on
+//   the level, the program's).
 // timeout: 120
 // expect: by key: 19 statements, 19 the same, found ppppppppppppppppppp
 // expect: ranges: 17 statements, 17 the same, found yyyyyyyyyyyyyyyyn
 // expect: joins: 5 statements, 5 the same, found yyyyy
 // expect: merge: 3 statements, 3 the same, found yyn
 // expect: alter: 2 statements, 2 the same, found yy
-// expect: not a program's: 3 statements, 3 the same, found nyy
+// expect: batched: 7 statements, 7 the same, found ppppnyy
+// expect: per row and constants: 3 statements, 3 the same, found nyy
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -186,7 +190,30 @@ fn main() {
         checkW(mut &s, mut &ga, &"alter table u alter v type text using coalesce(v, -1) || 'v'", &"select count(*), min(v), max(v) from u")
         report(&ga)
 
-        var gn = newGroup(&"not a program's")
+        // batched writes (WITH (batch_rows n): each batch committed, so not in a transaction rolled back): the same
+        // statements on two copies of a table, one with batches on, one off
+        var gb = newGroup(&"batched")
+        for x in ["create table bon (id int primary key, g int, x int)", "create table boff (id int primary key, g int, x int)",
+                  "insert into bon select i, i % 7, i % 50 from generate_series(1, 400) i", "insert into boff select * from bon"] {
+            let r = run(mut &s, &x)
+        }
+        for w in ["delete from @ where id = 5 with (batch_rows 2)", "delete from @ where id = 6 and x > 100 with (batch_rows 2)",
+                  "update @ set x = x + 1 where id = 7 with (batch_rows 2)", "update @ set x = 0 where id = 99999 with (batch_rows 2)",
+                  "delete from @ where id between 10 and 20 with (batch_rows 3)", "update @ set x = -1 where g = 3 with (batch_rows 25)",
+                  "delete from @ where x = 7 with (batch_rows 2)"] {
+            let r0 = lexdb_pipe.rowsRuns()
+            let on = run(mut &s, &strings.replaceAll(&w, &"@", &"bon")) + " // " + run(mut &s, &"select count(*), sum(id), sum(g), sum(x) from bon")
+            let r1 = lexdb_pipe.rowsRuns()
+            let a = run(mut &s, &"set lexdb_batch = off")
+            let off = run(mut &s, &strings.replaceAll(&w, &"@", &"boff")) + " // " + run(mut &s, &"select count(*), sum(id), sum(g), sum(x) from boff")
+            let b = run(mut &s, &"set lexdb_batch = on")
+            gb.n += 1
+            if on == off { gb.same += 1 } else { println("DIFFERENT: " + w + "\n  on:  " + on + "\n  off: " + off) }
+            gb.found += if r1[0] > r0[0] { "p" } else if r1[1] > r0[1] { "y" } else { "n" }
+        }
+        report(&gb)
+
+        var gn = newGroup(&"per row and constants")
         lexdb_plan.setUnnest(0)
         checkW(mut &s, mut &gn, &"update t set x = 0 where id < 200 and exists (select 1 from u where u.k = t.x)", &afterT)
         lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
