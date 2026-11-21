@@ -31,6 +31,7 @@ import "./lexdb_plan"
 import "./lexdb_access"
 import "./lexdb_store"
 import "./lexdb_census"
+import "./lexdb_window"
 
 type Val = lexdb_sql.Val
 type Prog = lexdb_plan.Prog
@@ -2636,6 +2637,13 @@ pub fn run(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &
     heldRun(src)
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     if pg.sorts {
+        // (a Window's: Q8 R7)
+        if winArm(&pg.plan) {
+            let noTabs: []&lexdb_catalog.Table = []
+            let noSrcs: []Src = []
+            let noV: [][][]Val = []
+            return runWin(st, txn, pg, cols, t, src, hrows, &noTabs, &noSrcs, &noV, cx, cap, bud, cnt, give)
+        }
         // its rows held by the Sort or Distinct, then given (slice P3)
         var sr = SortRun{st: [sortRun(&pg.plan, cap, bud)]}
         let got = try runOp(st, txn, projUnder(&pg.plan), cols, t, src, hrows, cx, -1, bud, cnt, mut &sr, give)
@@ -4623,6 +4631,7 @@ pub fn hasJoin(p: &lexdb_plan.PPlan): bool {
         lexdb_plan.PPlan.Having(i) { return hasJoin(&i) }
         lexdb_plan.PPlan.Distinct(i, _, _) { return hasJoin(&i) }
         lexdb_plan.PPlan.Match(i) { return hasJoin(&i) }
+        lexdb_plan.PPlan.Window(i, _) { return hasJoin(&i) }
         else { return false }
     }
 }
@@ -6684,6 +6693,11 @@ pub fn runJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: 
     batchRuns += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     if pg.sorts {
+        // (a Window's: Q8 R7)
+        if winArm(&pg.plan) {
+            let none: [][]Val = []
+            return runWin(st, txn, pg, cols, tabs[0], &srcs[0], &none, tabs, srcs, vrows, cx, cap, bud, cnt, give)
+        }
         // its rows held by the Sort or Distinct, then given (slice P3)
         var sr = sortRun(&pg.plan, cap, bud)
         let got = try runJProj(st, txn, pg, projUnder(&pg.plan), cols, tabs, srcs, vrows, cx, -1, bud, cnt,
@@ -7550,4 +7564,253 @@ fn decoded(p: &lexdb_plan.PPlan, want: mut &[]bool) {
         lexdb_plan.PPlan.Scan(sc, _) { for c in 0..len(sc.need) { if sc.need[c] { want[sc.first + c] = true } } }
         else {}
     }
+}
+
+// ---- the Window operator (Q8 R7, design/lexdb-layers.md 6.3.Q8 R7)
+//
+// A query of window calls (lexdb_plan.pipeWin's plan: Limit? (Sort?
+// (Distinct? (Project (Window (Project (the input))))))): the input's rows
+// (the scan's or the joins', the columns a row keeps) held as the row
+// engine holds them (a row of the query's columns, counted against
+// max_statement_mem as it counts them); then every call's values by
+// lexdb_window.allValues (the batches' path: partitions and peer groups by
+// lexdb_sort's keys, P3's, frames over the held rows); then per row, in the
+// input's order, its outputs over the row and its values, given to the Sort
+// or Distinct over it, or cut by LIMIT and OFFSET. Every row's outputs are
+// made, as the row engine makes them, so an error in a row past a LIMIT is
+// raised; the bytes held are the row engine's (its rows, then every output
+// row with its ORDER BY values: not only a top-N's).
+
+type WinRow = lexdb_window.WinRow
+
+var winOps0: int = 0
+
+// Window runs (the tests' look).
+pub fn winRuns(): int { return winOps0 }
+
+// Whether p is a Window's plan (compileWin's).
+fn winArm(p: &lexdb_plan.PPlan): bool {
+    match projUnder(p) {
+        lexdb_plan.PPlan.Project(i, _) {
+            match i {
+                lexdb_plan.PPlan.Window(_, _) { return true }
+                else {}
+            }
+        }
+        else {}
+    }
+    return false
+}
+
+// p's program, a Window's (lexdb_plan.pipeWin's plan); Err(p): an
+// operator or an input the pipeline does not run. Its rows are held
+// (sorts: the run holds their bytes in its budget).
+pub fn compileWin(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+    var p = p0
+    let n = winOps(&p, cols)
+    if n < 0 { return Err(p) }
+    let j = hasJoin(&p)
+    if j || heldScan(&p) { p = lexdb_plan.needs(p, len(cols)) }
+    return Ok(Prog{plan: p, ops: n, groups: false, joins: j, sorts: true})
+}
+
+// The operators of a Window's plan p if the pipeline runs it, else -1.
+fn winOps(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) {
+            let k = winOps(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Sort(i, sorted, ps) {
+            if sorted {
+                match ps {
+                    Some(k) {
+                        let w = projLen(projUnder(&i))
+                        for c in k.out { if c < 0 || c >= w { return -1 } }
+                        if k.shown < 1 || k.shown > w { return -1 }
+                    }
+                    None { return -1 }
+                }
+            }
+            let k = winOps(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Distinct(i, on, ks) {
+            if on || len(ks) == 0 { return -1 }
+            let k = winOps(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        lexdb_plan.PPlan.Project(i, xs) {
+            if len(xs) == 0 { return -1 }
+            match i {
+                lexdb_plan.PPlan.Window(j, pw) {
+                    if pw.isNone() { return -1 }
+                    let k = opsOf(&j, cols)
+                    if k < 0 {
+                        // census: opsWhy(&j, cols)
+                        return -1
+                    }
+                    return k + 2
+                }
+                else { return -1 }
+            }
+        }
+        else { return -1 }
+    }
+}
+
+// Runs a Window's program (run's, runJ's: a single table's t and src, or
+// the joins' tabs, srcs and vrows): as run, at most cap rows.
+fn runWin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+          src: &Src, hrows: &[][]Val, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, cap: int,
+          bud: mut &Budget, cnt: mut &[]Counts,
+          give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    match projUnder(&pg.plan) {
+        lexdb_plan.PPlan.Project(wa, xs) {
+            match wa {
+                lexdb_plan.PPlan.Window(input, pwo) {
+                    match pwo {
+                        Some(pw) { return winBody(st, txn, pg, &input, &pw, &xs, cols, t, src, hrows, tabs, srcs, vrows, cx, cap, bud, cnt, give) }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Err(e("XX000", "the pipeline was given a plan it does not run"))
+}
+
+// What the input gave (a chunk ob, or the row r when ob.n is 0) as rows
+// of the query's nq columns, its columns at their slots; their bytes
+// counted in held as the row engine counts them (room: what it may hold,
+// -1 no limit; maxHeld: max_statement_mem, for the error).
+fn winTake(ob: &lexdb_rows.OutBatch, r: &[]Val, slots: &[]int, nq: int, vals: mut &[]Val, rows: mut &[]WinRow, held: mut &int,
+           room: int, maxHeld: int): Result[bool, DbErr] {
+    let ns = len(slots)
+    let m = if ob.n > 0 { ob.n } else { 1 }
+    for j in 0..m {
+        var row: []Val = array(nq, Val.Null)
+        if ob.n > 0 {
+            obRow(ob, j, vals)
+            for k in 0..ns { row[slots[k]] = replace(mut &vals[k], Val.Null) }
+        } else {
+            for k in 0..ns { row[slots[k]] = r[k].clone() }
+        }
+        held += rowBytes(&row)
+        if room >= 0 && held > room { return Err(memErr(maxHeld)) }
+        append(rows, WinRow{row: row, aggs: []})
+    }
+    return Ok(true)
+}
+
+// An output row's bytes as the row engine counts them: its outputs (the
+// first shown of vs), then its ORDER BY values (sorting: the keys keyCol
+// of vs, under their collations coll; else none).
+fn winBytes(vs: &[]Val, shown: int, sorting: bool, keyCol: &[]int, coll: &[]int): int {
+    var n = 64 + 24 * shown
+    for o in 0..shown { n += valExtra(&vs[o]) }
+    if sorting {
+        for k in 0..len(keyCol) {
+            n += 24
+            let v = lexdb_sort.collVal(coll[k], &vs[keyCol[k]])
+            n += valExtra(&v)
+        }
+    }
+    return n
+}
+
+// The LIMIT's count (-1 none) and OFFSET of p, a Window's plan.
+fn winLimit(p: &lexdb_plan.PPlan, lim: mut &int, off: mut &int) {
+    match p {
+        lexdb_plan.PPlan.Limit(_, _, n, o) {
+            lim = n
+            off = o
+        }
+        else {}
+    }
+}
+
+fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: &lexdb_plan.PPlan, pw: &lexdb_plan.PWin, xs: &[]BX,
+           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src,
+           vrows: &[][][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
+           give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    winOps0 += 1
+    let nq = len(cols)
+    let room = bud.room()
+    let maxHeld = bud.maxHeld
+    var rows: []WinRow = []
+    var inHeld = 0
+    var vals: []Val = []
+    // the input's rows, all of them (no LIMIT stops it)
+    if pg.joins {
+        let got = try runJProj(st, txn, pg, input, cols, tabs, srcs, vrows, cx, -1, bud, cnt,
+                               fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+            return winTake(ob, r, &pw.slots, nq, mut &vals, mut &rows, mut &inHeld, room, maxHeld)
+        })
+    } else {
+        var none = noSortRun()
+        let got = try runOp(st, txn, input, cols, t, src, hrows, cx, -1, bud, cnt, mut &none,
+                            fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+            return winTake(ob, r, &pw.slots, nq, mut &vals, mut &rows, mut &inHeld, room, maxHeld)
+        })
+    }
+    // every call's values, per row
+    let noRow: []Val = []
+    let wv = try lexdb_window.allValues(true, &rows, &pw.wins, &cx.params, fn(name: &str, sl: int): int { return lexdb_bind.colSlot(cols, name, sl) },
+                                        fn(what: int, wi: int, i: int, r: int): Result[Val, DbErr] {
+        if what == lexdb_window.H_OFF {
+            match pw.offs[wi][i] {
+                Some(b) { return bxEval(&b, &noRow, &noRow, cx) }
+                None { return Ok(Val.Int(0)) }
+            }
+        }
+        if what == lexdb_window.H_KEY { return bxEval(&pw.keys[wi][i], &rows[r].row, &rows[r].aggs, cx) }
+        return bxEval(&pw.args[wi][i], &rows[r].row, &rows[r].aggs, cx)
+    })
+    let n = len(rows)
+    let noOb = lexdb_rows.noOutBatch()
+    var outHeld = 0
+    if sortArm(&pg.plan) {
+        // the Sort or Distinct over the outputs: it holds them (a DISTINCT
+        // with a LIMIT keeps every distinct row, as the row engine does);
+        // its bytes are counted here, every output row's
+        var sr = sortRun(&pg.plan, cap, bud)
+        sr.room = -1
+        sr.early = false
+        let shown = sr.shown
+        for r in 0..n {
+            var vs: []Val = withCapacity(len(xs))
+            for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
+            let before = sr.set.n
+            let go = try sr.eat(&noOb, &vs)
+            if sr.bad { return Err(batErr()) }
+            if !sr.distinct || sr.set.n > before { outHeld += winBytes(&vs, shown, sr.sorting, &sr.keyCol, &sr.coll) }
+        }
+        sortRuns += 1
+        let held0 = sr.held
+        let k = try sr.finish(txn, bud, give)
+        try bud.hold(inHeld + outHeld - held0)
+        return Ok(k)
+    }
+    // LIMIT and OFFSET over the outputs, every row's made
+    var lim = -1
+    var off = 0
+    winLimit(&pg.plan, mut &lim, mut &off)
+    if cap >= 0 && (lim < 0 || cap < lim) { lim = cap }
+    let noInts: []int = []
+    var kept: [][]Val = []
+    for r in 0..n {
+        var vs: []Val = withCapacity(len(xs))
+        for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
+        outHeld += winBytes(&vs, len(xs), false, &noInts, &noInts)
+        if r >= off && (lim < 0 || len(kept) < lim) { append(mut &kept, vs) }
+    }
+    try bud.hold(inHeld + outHeld)
+    for vs in kept {
+        let go = try give(txn, &noOb, &vs)
+        if !go { break }
+    }
+    return Ok(len(kept))
 }

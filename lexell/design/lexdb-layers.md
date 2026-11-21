@@ -6714,6 +6714,76 @@ point select's cycles over the wire do not, by placement; left for the
 owner's call (6.3.Q8's first part met the same: its stage 3 read q9, q13,
 q17 slower at main's instructions).
 
+### 6.3.Q8 R7 as built (windows): paused, work in progress (2026-11-21)
+
+R7's window part, from main 757c4cee (branch
+`worktree-agent-a5e8fa9b8895ccba4`). **Paused by the coordinator before
+its first full build and test of the operator: the WIP commit is not known
+to compile or pass the suite.** Nothing was timed.
+
+**Census at main 757c4cee** (the suite, 257 tests, batches on; the tool's
+copy, all passing): row engine 157,442 runs, pipeline rows 189,301,
+pipeline groups 791,052, writes 3,029, set operations 553, batches off
+747,634. Windows: "a window (winValues)" 6,572 runs, 5,931 statements, 19
+tests (exec_winframe 2,791, exec_winagg 2,134, exec_winbatch 920,
+exec_batchexpr 279, exec_narrow 201, exec_batchsort 166, exec_window 29,
+tds_percentile 27, and 11 more with 1-10); "agg: a window over the groups"
+11 runs, 11 statements, 8 tests.
+
+**Done (stage 1, compiled and tested):** the window driver moved out of
+exec into `lexdb_window.allValues` (the batches' path and the row path
+as `winValues` ran them, one hook `ev(H_KEY | H_ARG | H_OFF, call, i,
+row)`, the same order of evaluation, so the same first error) and
+`lexdb_window.frameOff` (the offset checks); exec's `winValues` is the
+hook's glue (exec 19,838 -> 19,759 lines with stage 2's `pipeWinSel`). With that alone the four
+`exec_win*` tests passed (a build of 3 s with `LXL_NOCACHE=1`).
+
+**Written, not yet compiled (stage 2):**
+
+- `lexdb_plan`: `PPlan.Window(PPlan, Option[PWin])` (None in a view;
+  `PWin`: the calls, per call its keys, arguments and offsets bound by
+  the new `lexdb_bind.bindSubsAggs`, and the input's columns `slots`);
+  `winShape`/`winWhy` (the shape and its census reasons), `pipeWin` (the
+  plan: Limit? (Sort? (Distinct? (Project (Window (Project of the slots
+  (the conditions, scan, joins as pipeShape's)))))); the Limit's "stops"
+  flag physOf's, so EXPLAIN prints the same), `unplanWin` (conditions
+  back; the outputs were never `ox`); `planUses`/`withNeeds` go through
+  the Window; `censusRun` notes a declined window's planner reason.
+- `lexdb_pipe` (new section at the end, imports `lexdb_window`;
+  `imports.py` allows it): `compileWin`/`winOps` (`sorts: true`, so
+  `pipeHeld` leaves the counting to it and `runPoint` never sees it),
+  `run`'s and `runJ`'s `pg.sorts` branch call `runWin` when `winArm`;
+  `winBody`: the input run whole (runOp or runJProj, no LIMIT), its rows as
+  `WinRow`s of the query's width (`winTake`: bytes by `rowBytes` against
+  the room at the run's start, `memErr` as the row engine's), then
+  `allValues(true, ...)` with `bxEval` hooks, then every row's outputs in
+  input order (all made, as the row engine does, past a LIMIT too), to
+  P3's `SortSt` (its own room off, `early` off) or cut by LIMIT/OFFSET;
+  the bytes held at the end are the row engine's (input rows plus every
+  output row's outputs and ORDER BY values, `winBytes`), held after
+  `finish` (so a `batErr` from the sort holds nothing before the row
+  engine runs it again).
+- exec: `pipeWinSel`, called from `pipeSelMain` only where `pipeShape`
+  already said no (no cost on the point-select planning path).
+
+**Next:** compile and fix; run `exec_win*`, `exec_batchsort`,
+`exec_narrow`, `exec_batchexpr`, `tds_percentile`; then the windows over
+grouped results (`aggShape` without its `wins` refusal, `afterCols` with
+the windows' column names, so the pipeline makes the groups and exec's
+view over them computes the windows, as HAVING is today); a test
+`exec_winpipe` (every statement batches on and off: each function, frames,
+EXCLUDE, FILTER, named windows, several partitionings, DISTINCT/ORDER
+BY/LIMIT/OFFSET over windows, joins and held rows as input, an error in a
+later row and past a LIMIT, `max_statement_mem` just over and under a
+partition, T-SQL and Oracle doors); the census again; point-select,
+INSERT and UPDATE A/B; TPC-H (no windows: unchanged); a window benchmark
+(row_number per partition, running sum, moving average, rank over 1M rows,
+against PostgreSQL 18). Open questions: the row engine's join rows hold
+the columns its levels decode, the Window's the columns read above it, so
+`max_statement_mem` at the edge may differ for joins (one table: the same
+columns, the scan's); a `SortSt` that gives up (`bad`) after the outputs
+were made makes the row engine run the query again (as P3's Sort does).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
