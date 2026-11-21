@@ -3411,8 +3411,8 @@ fn (g: &Gen) caseSet(e: int, x: mut &int, out: mut &[]int): bool {
     return true
 }
 
-// A set of four or more constants of one x within 64 of each other, as one bit test: jumps to l
-// when the truth of e is when, and true; else false and no code.
+// A set of four or more constants of one x within 64 of each other, as one bit test and one
+// branch: jumps to l when the truth of e is when, and true; else false and no code.
 fn (g: mut &Gen) branchBits(e: int, l: int, when: bool): bool {
     var x = -1
     var vs: []int = []
@@ -3433,19 +3433,14 @@ fn (g: mut &Gen) branchBits(e: int, l: int, when: bool): bool {
         if lo != 0 { g.a.aluI(x64.SUB, 8, RAX, lo) }
         r = RAX
     }
-    g.a.aluI(x64.CMP, 8, r, hi - lo)
+    // no branch on the range: a value above it tests an empty mask (a jump on the range is taken
+    // or not by the data, where the compares it replaces were all rarely taken)
     g.a.movRI(RCX, mask)
-    if when {
-        let skip = g.a.newLabel()
-        g.a.jcc(x64.CC_A, skip)
-        g.a.bt(RCX, r)
-        g.a.jcc(x64.CC_B, l)
-        g.a.bind(skip)
-    } else {
-        g.a.jcc(x64.CC_A, l)
-        g.a.bt(RCX, r)
-        g.a.jcc(x64.CC_AE, l)
-    }
+    g.a.alu(x64.XOR, 4, RDX, RDX)
+    g.a.aluI(x64.CMP, 8, r, hi - lo)
+    g.a.cmov(x64.CC_A, RCX, RDX)
+    g.a.bt(RCX, r)
+    g.a.jcc(if when { x64.CC_B } else { x64.CC_AE }, l)
     return true
 }
 
@@ -3475,7 +3470,8 @@ type Link = value record {
 }
 
 // `if (x == a) A else if (x == b || x == c) B ... else D` (if-chains and match on one x, a
-// load that cannot fail), with four or more constants in a dense range and three or more arms,
+// load that cannot fail), with eight or more constants in a dense range and eight or more arms
+// (shorter chains predict better than one indirect jump: json.writeValue, six arms, missed more),
 // as a jump table: true when generated so.
 fn (g: mut &Gen) genChain(cond: int, then: int, els: int): bool {
     if els < 0 { return false }
@@ -3498,7 +3494,7 @@ fn (g: mut &Gen) genChain(cond: int, then: int, els: int): bool {
         append(mut &bodies, g.u.nodes[lk.s].b)
         rest = g.u.nodes[lk.s].c
     }
-    if len(bodies) < 3 || len(vals) < 4 { return false }
+    if len(bodies) < 8 || len(vals) < 8 { return false }
     var lo = vals[0]
     var hi = vals[0]
     for v in vals {

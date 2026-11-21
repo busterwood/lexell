@@ -27,7 +27,7 @@ Others no longer apply: `str` reference counts went away with owned strings
   of one binary differed by up to 9.7% in cycles, so instructions decide and cycles
   only have to agree in sign.
 
-## 1. Kept: jump tables and bit tests (`3a6f4ddf`)
+## 1. Kept: jump tables and bit tests (`3a6f4ddf`, revised in the next commit)
 
 The native backend lowered every `match` on a closed type, every int if-chain and every
 `S_SWITCH` as a linear compare chain. lexdb has 22 matches with 8-15 arms and 2 with
@@ -39,42 +39,67 @@ The change is about 160 lines in `x64gen.lxl` and 20 in `x64.lxl`:
 - **Jump tables.** `genChain` matches `if x == a {..} else if x == b || x == c {..} ...`
   in three shapes: a plain if, an if alone in a block, and the fused
   `bool c = ...; if (c)`. x must be a load that cannot fail (`loadOnly`, the same tree
-  each time). With three or more arms and four or more constants (span <= 4 per
+  each time). With **eight or more arms and eight or more constants** (span <= 4 per
   constant, <= 1024), the chain becomes `sub; cmp; ja default; lea rcx,[rip+T];
   movsxd rax,[rcx+rax*4]; add rax,rcx; jmp rax`, with a table of 32-bit offsets in
   the text. The assembler's fix-ups gained a base label for table entries.
 - **Bit tests.** In `branch`, `branchBits` turns an `||` of four or more `x == c`
-  within 64 of each other into `cmp; ja; mov rcx,mask; bt rcx,x; jc/jnc`.
+  within 64 of each other into `mov rcx,mask; xor edx,edx; cmp x,span; cmova rcx,rdx;
+  bt rcx,x; jc/jnc`. There is one branch, on the answer, and none on the range.
 
-Counts: 62 chains and 51 bit tests in the self-build.
+### The first version regressed cmark, json and jq (found with PERFORMANCE.md's benchmarks)
 
-Results:
+The first version (`3a6f4ddf`, merged as `671520bf`) built tables from three arms, and its
+bit test had a branch on the range (`cmp; ja`). PERFORMANCE.md's application set, run
+interleaved on CPU 4 (`~/tpch-w/opt/perfmd/apps2.sh`, 7 rounds, fresh copies), showed the
+problem; perfsuite's run suite has none of these programs.
 
-| measure | instructions | cycles |
+| | instructions | cycles | branch misses |
+|---|---:|---:|---:|
+| cmark | -3.40% | **+4.33%** | **+54.7%** |
+| json | -0.73% | -0.08% (median +1.51%) | +7.4% |
+| jq | -0.64% | +0.60% | +3.5% |
+
+The branch-miss profiles named two causes:
+
+- **cmark: `markdown.Out.escape`.** `c == '&' || c == '<' || c == '>' || c == '"'` runs
+  on every output byte. The compare chain is four branches that are almost never taken,
+  so they predict perfectly. The bit test's range check (`c > 62`) is taken on letters
+  and not on spaces, digits and punctuation: that is the text, and it mispredicts.
+  The range check is now a `cmov` that empties the mask.
+- **json: `json.writeValue`.** It is a six-arm `match` on `Json`. The chain predicted
+  better than one indirect jump on this data. Tables now start at eight arms; lexdb's
+  per-value matches have 13-15.
+
+The revised version against main, with every timed step under the exclusive bench lock
+(`~/tpch-w/opt/perfmd/all3.sh`):
+
+| PERFORMANCE.md section | instructions | cycles |
 |---|---:|---:|
-| perfsuite compile suite (geomean) | -0.34% | -0.27% |
-| perfsuite run suite (geomean) | +0.01% | +0.00% |
-| `compiler --native` | -0.43% | -0.17% |
-| eza `-T` (the run suite's worst case) | +0.18% | +1.34% (noise band) |
-| lexdb point select / sel1 / gs / insert / update | -0.06 / -0.12 / -0.12 / -0.10 / -0.05% | not decidable on this machine |
+| ten microbenchmarks, `-O` | all identical | within ±0.4% |
+| regex / json / jq / decimal | +0.02 / -0.17 / -0.19 / +0.16% | -0.67 / +0.23 / +0.07 / +0.12% |
+| cmark | -1.86% | **-3.88%** (interleaved: -3.78%, branch misses -5.1%) |
+| json / jq, interleaved | -0.17 / -0.19% | -0.88 / -0.68%, branch misses level |
+| compile.py: hello / nine programs / self-build | | 13.4 to 14.3 / 131.8 to 131.1 / 470.6 to 471.2 ms |
+| grep, sort, tail, eza (interleaved) | all identical | within ±0.3% (tail's 0.3 ms ±3%, eza -l -1.25%) |
+| HTTP server, 1/10/100 clients, 2 alternated rounds | | level (107.6k/177.1k/173.0k against 107.6k/177.5k/172.8k req/s) |
+| perfsuite compile suite / run suite | -0.20 / +0.00% | -0.66 / +0.03% |
+| lexdb point selects (5 modes, fixed seed) | -0.02% to -0.08% | |
+| TPC-H, server instructions per query | **-0.81%** geomean (q6 -3.82, q7 -2.42, q22 -1.93, q12 -1.73, q1 -1.21, q19 -1.16, q21 -1.08; worst q18 +0.04%) | |
 
-It passes the second rule of "Judging a pass" (the compile suite gains and the run suite
-is not worse). `gate.sh quick` passes, and the native self-build reaches its fixed point.
-The win is small, because the run suite and the compiler have few long chains. Its natural
-target is lexdb's per-value matches, and TPC-H shows it there.
+TPC-H results are identical and all 22 are `ok`. `gate.sh quick` passes, and the lexdb
+suite passes 271/271.
 
-**TPC-H** (SF1, lexdb only; lexdb at main `52fe2606` built `-O` by main's compiler and by
-this one):
+### The first version's TPC-H run, kept for the record
 
-- **Order:** runs ABBA, one at a time, each under the exclusive bench lock
+TPC-H (SF1, lexdb only; lexdb at main `52fe2606` built `-O` by main's compiler and by
+the first version):
+
+- **Order:** ABBA, one run at a time, each under the exclusive bench lock
   (`~/tpch-w/opt/ab.sh`).
-- **Results:** identical on all 22 queries in all four runs, all `ok` against PostgreSQL's.
-- **Instructions:** the server's user instructions per query (`iq.sh`) fall on 20 of 22
-  queries. Geomean -0.68%; q6 -3.07%, q7 -2.03%, q22 -1.96%, q1 -1.37%, q12 -1.28%,
-  q19 -1.02%. Up: q5 +0.15%, q17 0.00%.
-- **Time:** CPU total 11,731 to 11,512 ms (-1.86%), geomean -1.84%. Same sign as the
-  instructions, inside the placement noise.
-- **lexdb suite:** 271/271 with the new compiler (`LXL_NOCACHE=1`).
+- **Results:** identical in all four runs.
+- **Instructions:** geomean -0.68%.
+- **Time:** CPU total -1.86%.
 
 ## 2. Counted, not built
 
@@ -150,7 +175,9 @@ which shows up as branch misses at equal instructions (pts.sh, R1/R6), not as i-
 
 ## 5. Next, in order
 
-1. Done: TPC-H (section 1); merged into main.
+1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
+   Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
+   PERFORMANCE.md's applications interleaved, with branch misses, before merging.
 2. A census of drop-then-alloc pairs of one size class (runtime counters), to bound
    Perceus-style reuse.
 3. Scalar replacement of small records (review 1, 1.2) remains the largest structural
