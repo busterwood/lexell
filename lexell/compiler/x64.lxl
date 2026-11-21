@@ -111,6 +111,7 @@ pub fn ripMem(disp: int): Mem { return Mem{base: RIP, index: -1, scale: 1, disp:
 type Fix = value record {
     at: int         // the rel32 field
     label: int
+    base: int       // a jump table's entry: the label the offset is from (else -1: the field's end)
 }
 
 pub type Reloc = value record {
@@ -726,9 +727,24 @@ pub fn (a: mut &Asm) replaceJmp(at: int, l: int, bytes: &[]byte, first: int): bo
 pub fn (a: mut &Asm) jcc(cc: int, l: int) {
     a.b(0x0F)
     a.b(0x80 + cc)
-    append(mut &a.fixes, Fix{at: a.pos(), label: l})
+    append(mut &a.fixes, Fix{at: a.pos(), label: l, base: -1})
     a.d32(0)
 }
+
+// A jump table's entry: the 32-bit offset of label l from label base (bound at the table).
+pub fn (a: mut &Asm) tableEntry(l: int, base: int) {
+    append(mut &a.fixes, Fix{at: a.pos(), label: l, base: base})
+    a.d32(0)
+}
+
+// lea r, [rip + label l].
+pub fn (a: mut &Asm) leaLabel(r: int, l: int) {
+    a.lea(r, ripMem(0))
+    append(mut &a.fixes, Fix{at: a.pos() - 4, label: l, base: -1})
+}
+
+// bt dst, src: the carry flag is bit src of dst.
+pub fn (a: mut &Asm) bt(dst: int, src: int) { a.rr(0, true, 0x0FA3, src, dst, false, false) }
 
 // Whether the code at the current position can be reached (not right after a ret or jmp).
 pub fn (a: &Asm) reachable(): bool { return a.termEnd != a.pos() }
@@ -736,7 +752,7 @@ pub fn (a: &Asm) reachable(): bool { return a.termEnd != a.pos() }
 pub fn (a: mut &Asm) jmp(l: int) {
     if a.peep && !a.reachable() { return }
     a.b(0xE9)
-    append(mut &a.fixes, Fix{at: a.pos(), label: l})
+    append(mut &a.fixes, Fix{at: a.pos(), label: l, base: -1})
     a.d32(0)
     a.jmpEnd = a.pos()
     a.jmpLabel = l
@@ -789,7 +805,7 @@ pub fn (a: mut &Asm) fixLabels() {
         let f = a.fixes[i]
         let t = a.labels[f.label]
         if t < 0 { panic("x64: unbound label") }
-        a.put32(f.at, t - (f.at + 4))
+        a.put32(f.at, if f.base >= 0 { t - a.labels[f.base] } else { t - (f.at + 4) })
     }
     a.fixes = []
 }
