@@ -11,9 +11,13 @@
 //   expressions, nextval, a subquery run once in the outputs and the WHERE, EXISTS (select 1 where ...),
 //   a scalar subquery with no FROM per outer row, LIMIT 0, OFFSET, an error in an output and in the
 //   WHERE (22012), DISTINCT, a write's VALUES.
+// - min/max: MIN and MAX by the scan's order (Sel.first: an index's first value not NULL, forward or
+//   backward), with an index's leading equality, a range, NULLs skipped, all NULL, an empty table, a
+//   text, an error in a row the scan reads before the first value (22012), per outer row.
 // timeout: 120
 // expect: recursive: 13 queries, 13 the same, piped yyyyyyyyyyyyy, pipeline runs 1798
 // expect: no from: 34 statements, 34 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyynyyyyy, pipeline runs 75
+// expect: min/max: 17 queries, 17 the same, piped yyyyyyyyyyyyyynny, pipeline runs 23
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -106,6 +110,13 @@ fn main() {
             "insert into edge select i, i * 2 from generate_series(1, 100) i",
             "create table e (id int primary key, v int)",
             "create sequence sq",
+            "create table m (id int primary key, g int, c int, w text)",
+            "insert into m select i, i % 5, case when i % 4 = 0 or i > 1900 then null else (i * 37) % 1000 end, case when i % 6 = 0 then null else 'w' || (i % 300) end from generate_series(1, 2000) i",
+            "create index mc on m (c)",
+            "create index mgc on m (g, c)",
+            "create index mw on m (w)",
+            "create table m0 (id int primary key, c int)",
+            "create index m0c on m0 (c)",
             "analyze",
         ]
         for x in setup {
@@ -171,6 +182,28 @@ fn main() {
         for x in ns { check(mut &s, mut &gn, &x) }
         checkW(mut &s, mut &gn, &"insert into e values (1, (select 7));; insert into e select 2, 8 where true", &"select * from e order by id")
         report(&gn)
+        var gm = newGroup(&"min/max", &"queries")
+        let ms = [
+            "select max(c) from m",
+            "select min(c) from m",
+            "select min(c), min(c) + 1 from m",
+            "select max(c) from m where g = 3",
+            "select min(c) from m where g = 2 and c > 500",
+            "select max(c) from m where id > 1900",
+            "select max(c) from m0",
+            "select min(c) from m0 where c > 5",
+            "select max(w), max(w) from m",
+            "select min(w) from m where w > 'w2'",
+            "select max(c) from m where 100 / (id - 1000) <> 0",
+            "select max(c) from m where 100 / (c - 999) <> 0",
+            "select id, (select max(c) from m where m.g = t.g) from t where id < 12 order by id",
+            "select count(*) from t where x < (select min(c) from m where m.g = t.g and m.c > 20)",
+            "explain select max(c) from m",
+            "explain select min(c) from m where g = 1",
+            "select max(c) from m having max(c) > 5",
+        ]
+        for x in ms { check(mut &s, mut &gm, &x) }
+        report(&gm)
         return 0
     }).unwrap()
 }

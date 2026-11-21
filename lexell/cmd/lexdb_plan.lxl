@@ -8051,7 +8051,7 @@ pub fn aggWhy(sel: &Sel): str {
     if sel.setop != 0 { return "a set operation" }
     if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
     if len(sel.wins) > 0 { return "agg: a window over the groups" }
-    if sel.first >= 0 { return "agg: MIN or MAX by the scan's order (Sel.first)" }
+    if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
     if q.corr { return "agg: a correlated subquery left per row (q.corr)" }
@@ -8150,10 +8150,13 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
         }
         append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia})
     }
-    let cs = match planConds(sel) {
+    var cs = match planConds(sel) {
         Some(x) { x }
         None { return noAgg("agg: a condition does not bind (planX)") }
     }
+    // (MIN/MAX by the scan's order, Q8 R2: its first row whose value is not
+    // NULL; unplan drops the condition)
+    if sel.first >= 0 { append(mut &cs, BX.IsNull(BX.Col(sel.first), true)) }
     var ps = scanArm(&sel.q, true)
     // (over joins every table's columns are the plan's: lexdb_plan.needs)
     if len(keys) == 0 && len(sel.q.levels) == 1 {
@@ -8173,17 +8176,17 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
-    let agg = PPlan.Agg(input, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
+    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
     return Some(physAbove(sel, agg))
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
 // row (the query's only columns), GROUP BY (grouping sets too; no
-// collation's keys), no window, no correlated subquery, no MIN/MAX by the
-// scan's order.
+// collation's keys), no window, no correlated subquery; MIN/MAX by the
+// scan's order over one table (Q8 R2: MinMax).
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.locks) > 0 { return false }
+    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters)
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
@@ -8202,6 +8205,7 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.Having(i) { unplan(sel, i) }
         // (its keys and calls were bound for the plan only)
         PPlan.Agg(i, _, _) { unplan(sel, i) }
+        PPlan.MinMax(i) { unplan(sel, i) }
         // (a join's expressions were bound for the plan only)
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Project(i, xs) {
@@ -8220,6 +8224,8 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
                 else {}
             }
             var v = cs
+            // (MIN/MAX by the scan's order: its IS NOT NULL, pipeAgg's)
+            if sel.first >= 0 && len(sel.q.levels) > 0 && len(v) > len(sel.q.levels[0].cond) { let gone = pop(mut &v) }
             var cc: []Option[BX] = []
             for k in 0..len(v) { append(mut &cc, unbound(replace(mut &v[k], BX.Const(Val.Null)), false)) }
             sel.q.cc[0] = cc

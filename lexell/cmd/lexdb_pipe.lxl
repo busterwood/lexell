@@ -2301,6 +2301,26 @@ fn opsWhy(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef) {
 // calls ones it accumulates, every key, argument and FILTER reading the
 // table's decoded columns; the table the query's only columns), else -1.
 fn aggOps(i: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef): int {
+    match i {
+        lexdb_plan.PPlan.MinMax(j) {
+            // MIN/MAX by the scan's order (Q8 R2): every call MIN or MAX of one
+            // column, no key, one table read row by row
+            if len(a.keys) > 0 || len(a.sets) > 0 || firstSlot(a) < 0 {
+                // census: lexdb_census.no("compile: agg: MIN/MAX by the scan's order, not of one column")
+                return -1
+            }
+            match j {
+                lexdb_plan.PPlan.Join(_, _) {
+                    // census: lexdb_census.no("compile: agg: MIN/MAX by the scan's order over joins")
+                    return -1
+                }
+                else {}
+            }
+            let k = aggOps(&j, a, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        else {}
+    }
     for c in a.calls {
         let f = &c.fname
         if !lexdb_bind.isAgg(f) || (c.star != c.arg.isNone()) || (c.star && f != "count") {
@@ -3160,6 +3180,18 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                                 else {}
                             }
                         }
+                        lexdb_plan.PPlan.MinMax(j) {
+                            match j {
+                                lexdb_plan.PPlan.Filter(k, cs) {
+                                    match k {
+                                        lexdb_plan.PPlan.Scan(sc, _) { return aggFirst(st, txn, &sc, &cs, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                                        else {}
+                                    }
+                                }
+                                lexdb_plan.PPlan.Scan(sc, _) { return aggFirst(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                                else {}
+                            }
+                        }
                         lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
                         else {}
                     }
@@ -3170,6 +3202,63 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
         else {}
     }
     return Err(e("XX000", "the pipeline was given a plan it does not run"))
+}
+
+// The column every call of a (MIN or MAX) reads, its slot; -1 if not one
+// column's.
+fn firstSlot(a: &lexdb_plan.PAgg): int {
+    var col = -1
+    for c in a.calls {
+        if c.fname != "min" && c.fname != "max" || c.distinct || c.filter.isSome() || len(c.more) > 0 { return -1 }
+        match c.arg {
+            Some(x) {
+                match x {
+                    BX.Col(i) {
+                        if col >= 0 && i != col { return -1 }
+                        col = i
+                    }
+                    else { return -1 }
+                }
+            }
+            None { return -1 }
+        }
+    }
+    return col
+}
+
+// MIN/MAX by the scan's order (MinMax: Sel.first, Q8 R2): the scan's rows
+// in its path's order (row by row, or in batches as the row engine's batch
+// driver reads them: an index read alone), through conds (the last its
+// column's IS NOT NULL: pipeAgg's), the first one only; its calls
+// accumulate that row, as the row engine's (one group, the first row's).
+fn aggFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
+            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+            give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+    if src.batch { batchRuns += 1 }
+    var xs: []BX = []
+    var slots: []int = []
+    for i in 0..len(sc.need) {
+        if sc.need[i] {
+            append(mut &xs, BX.Col(sc.first + i))
+            append(mut &slots, sc.first + i)
+        }
+    }
+    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
+    let maxHeld = bud.maxHeld
+    var vals: []Val = []
+    var noSort = noSortRun()
+    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, hrows, cx, 1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+        if ob.n == 0 {
+            for k in 0..len(slots) { rg.row[slots[k]] = r[k].clone() }
+        } else {
+            obRow(ob, 0, mut &vals)
+            for k in 0..len(slots) { rg.row[slots[k]] = replace(mut &vals[k], Val.Null) }
+        }
+        try groupRow(mut &rg, a, cx, room, maxHeld)
+        return Ok(false)
+    })
+    try giveGroups(mut &rg, len(a.calls), give)
+    return Ok(rg.added)
 }
 
 // The aggregate a over scan sc filtered by conds: units, values, rows.
