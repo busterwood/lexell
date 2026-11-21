@@ -1,0 +1,259 @@
+// lexdb_exec, lexdb_pipe: every SELECT's rows offered to the pipeline (Q8's R1, design/lexdb-layers.md
+// 6.3.Q8 R1): a subquery's own rows (uncorrelated, run once; correlated, run per outer row with its
+// outer values as parameters), a write's subqueries (UPDATE's SET and WHERE, DELETE's WHERE and
+// RETURNING, MERGE's source and conditions, INSERT VALUES' and RETURNING's), and the rows of INSERT ...
+// SELECT, CREATE TABLE AS and COPY (query) TO. Each statement runs with batches on and off (the row
+// engine, the reference): the same rows or the same error, and for a write the same table after it (each
+// write in a transaction rolled back). "piped": y when a run with batches on went through the pipeline's
+// rows or joins (lexdb_pipe.runCounts()[0], joinCounts()[0]); "pipeline runs": how many such runs the
+// group's statements made with batches on, a write's query after it too (main a75aa5d0, before R1: where
+// 752, per row 13, select list 4, from 11, writes 12, insert select 27; the same rows). Per row, the
+// seventh (a join under LIMIT, per outer row) stays the row engine's (R4).
+// - where: IN, NOT IN, EXISTS, a scalar, ANY and ALL over a subquery, nested, NULLs on both sides, an
+//   empty subquery, a subquery over 3,000 rows (three batches) whose third batch gives an error (22012),
+//   a sort, DISTINCT and LIMIT in the subquery, a join in it.
+// - per row: the same with unnesting off (lexdb_plan.setUnnest(0)), so a correlated subquery runs per
+//   outer row: by primary key (the point path), by an index, with a filter, a sort and LIMIT, a join,
+//   an error in a late run, NULL outer values.
+// - select list: scalar subqueries and EXISTS in the outputs, correlated and not; more than one row
+//   (21000); none (NULL).
+// - from: a derived table, a view, a LATERAL subquery, a CTE used twice.
+// - writes: UPDATE with a subquery in SET and WHERE (correlated and not), DELETE with IN and EXISTS and
+//   a subquery in RETURNING, MERGE with a subquery as its source and in a condition, INSERT VALUES with
+//   a scalar subquery, an UPDATE whose subquery fails (22012) and one giving two rows (21000).
+// - insert select: INSERT ... SELECT with a join, an aggregate, NULLs, ORDER BY and LIMIT, a subquery in
+//   it, a target with defaults, a generated column, CHECK, NOT NULL and UNIQUE (their errors: a join's
+//   rows written up to the failing one, not read again row by row: the pipeline's joins), an error
+//   in the third batch (nothing inserted), ON CONFLICT DO NOTHING and DO UPDATE, RETURNING; CREATE TABLE
+//   AS (with and without data) and COPY (query) TO STDOUT.
+// timeout: 120
+// expect: where: 20 queries, 20 the same, piped yyyyyyyyyyyyyyyyyyyy, pipeline runs 767
+// expect: per row: 14 queries, 14 the same, piped yyyyyynyyyyyyy, pipeline runs 3739
+// expect: select list: 8 queries, 8 the same, piped yyyyyyyy, pipeline runs 715
+// expect: from: 5 queries, 5 the same, piped yyyyy, pipeline runs 20
+// expect: writes: 12 statements, 12 the same, piped yyyyyyyyyyyy, pipeline runs 888
+// expect: insert select: 19 statements, 19 the same, piped yyyyyyyyyyyyyyyyyyy, pipeline runs 379
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] }
+
+type Group = record { name: str; word: str; n: int; same: int; piped: str; runs: int }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, piped: "", runs: 0} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " " + g.word + ", " + g.same.toStr() + " the same, piped " + g.piped + ", pipeline runs " + g.runs.toStr()) }
+
+// A query with batches on and off.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let p0 = piped()
+    let on = run(s, sql)
+    let p1 = piped()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = run(s, sql)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+}
+
+// A write (statements separated by ";;") and what it leaves (after: a query), in a transaction rolled
+// back, with batches on and off.
+fn checkW(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, after: &str) {
+    let p0 = piped()
+    let on = write(s, sql, after)
+    let p1 = piped()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = write(s, sql, after)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+}
+
+fn write(s: mut &lexdb_exec.Session, sql: &str, after: &str): str {
+    let a = run(s, &"begin")
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    // (after an error the transaction is aborted: rolled back first, then the table read)
+    if strings.startsWith(&out[len(out) - 1], &"ERROR") {
+        let r = run(s, &"rollback")
+        append(mut &out, run(s, after))
+        return strings.join(&out, " // ")
+    }
+    append(mut &out, run(s, after))
+    let r = run(s, &"rollback")
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(81), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create table u (id int primary key, k int, v int, w text)",
+            "insert into u select i, i % 40, case when i % 9 = 0 then null else (i * 7) % 60 end, 'k' || (i % 25) from generate_series(1, 500) i",
+            "create index uk on u (k)",
+            "create table e (id int primary key, v int)",
+            "create table nn (id int primary key, v int not null)",
+            "insert into nn select i, i % 30 from generate_series(1, 100) i",
+            "create view uv as select id, k, v from u where v > 10",
+            "create table dst (id int primary key, a int default 7, b text not null, c int check (c >= 0), d int generated always as (a * 2) stored, unique (b))",
+            "create table cnt (g int primary key, n int, s int)",
+            "insert into cnt select i, 0, 0 from generate_series(0, 6) i",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var gw = newGroup(&"where", &"queries")
+        let ws = [
+            "select id from t where x in (select v from u where u.k = 3) order by id",
+            "select count(*) from t where x not in (select v from u where u.k < 5)",
+            "select count(*) from t where x not in (select v from nn)",
+            "select id from t where id < 200 and x in (select v from e) order by id",
+            "select count(*) from t where x not in (select v from e)",
+            "select id from t where id < 300 and exists (select 1 from u where u.v = 59) and x = 3 order by id",
+            "select id from t where x = (select max(v) from u) order by id",
+            "select id from t where x = (select v from u where id = 7) order by id",
+            "select id from t where x > any (select v from u where u.k = 1) and id < 100 order by id",
+            "select id from t where x >= all (select v from u where u.k = 2 and v is not null) order by id",
+            "select count(*) from t where x < all (select v from u where u.k = 9)",
+            "select id from t where x in (select v from u where u.k in (select x from t where id < 4)) order by id",
+            "select count(*) from t where x in (select 100 / (id - 2500) from t)",
+            "select count(*) from t where s in (select w from u where u.v is null)",
+            "select id from t where x in (select v from u where u.k = 4 order by v desc limit 3) order by id",
+            "select count(*) from t where x in (select distinct v from u)",
+            "select count(*) from t where x in (select u.v from u join nn on nn.id = u.id where nn.v > 20)",
+            "select id from t where id < 50 and x in (select v + 0 from u where w like 'k1%') order by id",
+            "select count(*) from t where (x, g) in (select v, k % 7 from u)",
+            "select id from t where id < 100 and s = (select w from u where id = 3) order by id",
+        ]
+        for x in ws { check(mut &s, mut &gw, &x) }
+        report(&gw)
+
+        lexdb_plan.setUnnest(0)
+        var gp = newGroup(&"per row", &"queries")
+        let ps = [
+            "select id, x from t where id < 400 and x in (select v from u where u.k = t.g) order by id",
+            "select id from t where id < 400 and exists (select 1 from u where u.k = t.x) order by id",
+            "select id from t where id < 400 and not exists (select 1 from u where u.k = t.x and u.v > 30) order by id",
+            "select id, (select v from u where u.id = t.x) from t where id < 300 order by id",
+            "select id, (select w from u where u.id = t.id) from t where id < 600 order by id",
+            "select id, (select v from u where u.k = t.g and u.v > 5 order by v desc limit 1) from t where id < 300 order by id",
+            "select id, (select nn.v from u join nn on nn.id = u.id where u.k = t.x limit 1) from t where id < 200 order by id",
+            "select id from t where id < 300 and x not in (select v from u where u.k = t.g) order by id",
+            "select id from t where id < 200 and x > all (select v from u where u.k = t.g and u.v is not null) order by id",
+            "select count(*) from t where exists (select 1 from u where u.k = t.x and 100 / (u.id - 499) > 0)",
+            "select id, (select v from u where u.k = t.g) from t where id < 50 order by id",
+            "select id, (select v from u where u.id = t.x and u.v is null) from t where id < 300 order by id",
+            "select sum((select v from u where u.id = t.id)) from t",
+            "select id, (select count(*) from u where u.k = t.g) from t where id < 30 order by id",
+        ]
+        for x in ps { check(mut &s, mut &gp, &x) }
+        report(&gp)
+        lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+
+        var gs = newGroup(&"select list", &"queries")
+        let ss = [
+            "select id, (select max(v) from u), (select w from u where id = 2) from t where id < 5 order by id",
+            "select id, (select v from u where u.id = t.id) from t where id < 600 order by id",
+            "select id, exists (select 1 from u where u.k = t.x) from t where id < 100 order by id",
+            "select id, x in (select v from u where u.k = t.g) from t where id < 100 order by id",
+            "select id, (select v from u where u.k = 1) from t where id < 3",
+            "select id, (select v from u where u.k = 1 and u.v = 1000) from t where id < 3 order by id",
+            "select id, (select w from u where u.v = t.x order by u.id limit 1) from t where id < 200 order by id",
+            "select g, count(*), (select count(*) from u where u.k = t.g) from t group by g order by g",
+        ]
+        for x in ss { check(mut &s, mut &gs, &x) }
+        report(&gs)
+
+        var gf = newGroup(&"from", &"queries")
+        let fs = [
+            "select d.k, count(*) from (select k, v from u where v > 20) d group by d.k order by d.k",
+            "select count(*) from uv where k in (select g from t where id < 10)",
+            "select t.id, l.v from t, lateral (select v from u where u.k = t.g order by v limit 1) l where t.id < 100 order by t.id",
+            "with c as (select k, v from u where v < 30) select count(*) from c a join c b on a.k = b.k",
+            "select count(*) from (select id from t where x in (select v from u)) q",
+        ]
+        for x in fs { check(mut &s, mut &gf, &x) }
+        report(&gf)
+
+        var gw2 = newGroup(&"writes", &"statements")
+        checkW(mut &s, mut &gw2, &"update t set x = (select max(v) from u where u.k = t.g) where id < 300", &"select sum(x), count(x) from t")
+        checkW(mut &s, mut &gw2, &"update t set s = 'z' where x in (select v from u where u.k = 7)", &"select count(*) from t where s = 'z'")
+        checkW(mut &s, mut &gw2, &"update t set g = 99 where exists (select 1 from u where u.k = t.x and u.v > 40) returning id", &"select count(*) from t where g = 99")
+        checkW(mut &s, mut &gw2, &"update t set x = (select v from u where u.id = t.id) where id < 700", &"select sum(x), count(x) from t")
+        checkW(mut &s, mut &gw2, &"delete from t where x not in (select v from u where u.k < 20)", &"select count(*), sum(id) from t")
+        checkW(mut &s, mut &gw2, &"delete from t where id < 100 returning id, (select count(*) from u where u.k = t.g), (select w from u where u.id = t.id)", &"select count(*) from t")
+        checkW(mut &s, mut &gw2, &"delete from u where id in (select x from t where g = 3)", &"select count(*), sum(v) from u")
+        checkW(mut &s, mut &gw2, &"merge into cnt using (select g, count(*) n, sum(x) s from t where x in (select v from u) group by g) src on cnt.g = src.g when matched then update set n = src.n, s = src.s", &"select * from cnt order by g")
+        checkW(mut &s, mut &gw2, &"merge into cnt using (select k % 9 g, max(v) s from u group by k % 9) src on cnt.g = src.g when matched and src.s > (select min(v) from u where u.k = 1) then update set s = src.s when not matched then insert values (src.g, -1, src.s)", &"select * from cnt order by g")
+        checkW(mut &s, mut &gw2, &"insert into e values (1, (select max(v) from u)), (2, (select v from u where id = 9)) returning id, v, (select count(*) from u where u.v = e.v)", &"select * from e order by id")
+        checkW(mut &s, mut &gw2, &"update t set x = 1 where x in (select 100 / (id - 2500) from t)", &"select count(*) from t where x = 1")
+        checkW(mut &s, mut &gw2, &"update t set x = (select v from u where u.k = t.g) where id < 10", &"select count(*) from t where x is null")
+        report(&gw2)
+
+        var gi = newGroup(&"insert select", &"statements")
+        let afterD = "select * from dst order by id"
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b, c) select t.id, u.v, t.s || '-' || t.id, t.g from t join u on u.id = t.id where t.id < 400", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b, c) select t.id, 'k' || (t.id % 50), u.k - 30 from t join u on u.id = t.id where t.id < 300", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) select t.id, 'k' || (t.id % 50) from t join u on u.id = t.id where t.id < 300", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) select g, 'g' || g from t group by g", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b, c) select g, count(x), 'n' || g, sum(x) from t group by g order by g", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b) select id, x, coalesce(s, 'none') || id from t where id < 100 order by id desc limit 10", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b, c) select id, x, 'q' || id, null from t where x in (select v from u where u.k = 2)", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b, c) select id, x, 'q' || id, (select v from u where u.id = t.id) from t where id < 300", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) select id, s from t where id < 30", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b, c) select id, 'c' || id, g - 3 from t where id < 30", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) select id, 'same' from t where id < 3", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b) select id, 100 / (id - 2500), 'e' || id from t", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b, d) select id, 'd' || id, 5 from t where id < 3", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) values (5, 'b5');; insert into dst (id, b) select id, 'x' || id from t where id < 10 on conflict do nothing", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, b) values (5, 'b5');; insert into dst (id, a, b) select id, x, 'y' || id from t where id < 10 on conflict (id) do update set a = excluded.a + 1000", &afterD)
+        checkW(mut &s, mut &gi, &"insert into dst (id, a, b) select id, x, 'r' || id from t where id between 40 and 60 and x is not null returning id, a, d", &afterD)
+        checkW(mut &s, mut &gi, &"create table ct as select t.g, u.w, count(*) n from t join u on u.k = t.x group by t.g, u.w;; select * from ct order by g, w", &"select count(*) from t")
+        checkW(mut &s, mut &gi, &"create table ct2 as select id, x from t where x in (select v from u where k = 5) with no data;; select count(*) from ct2", &"select count(*) from t")
+        checkW(mut &s, mut &gi, &"copy (select id, s, (select v from u where u.id = t.id) from t where id < 40 and x in (select v from u) order by id) to stdout", &"select count(*) from t")
+        report(&gi)
+        return 0
+    }).unwrap()
+}
