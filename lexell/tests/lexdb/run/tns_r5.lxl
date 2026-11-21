@@ -1,0 +1,166 @@
+// lexdb over TNS: a write's rows found by a pipeline program (Q8's R5, design/lexdb-layers.md 6.3.Q8 R5) through the Oracle
+// door, checked against Oracle Database Free (gen_oracle.py --check: the answers below are Oracle's). Each write runs in a
+// transaction rolled back, then a query of what it left: UPDATE and DELETE by key (integer, varchar2 and two-column keys; a key
+// missing and NULL; a condition after the key that drops the row or fails, ORA-01476; an error in SET; a key moved, ORA-00001
+// on a duplicate; a key from a subquery; a CHECK broken, ORA-02290); ranges and scans (rows changed so the condition would find
+// them again: each once; a key moved past the scan's end; an error in a late row; an empty table; an IN list with NULL; IN
+// subqueries); MERGE (matched with DELETE WHERE, NOT MATCHED, a source of more than a batch's rows, an error in a late row).
+// Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 24 statements
+// expect: same: 1 / AID,BAL = 5|186
+// expect: same: 0 / N,S = 2000|999000
+// expect: same: 0 / N,S = 2000|999000
+// expect: same: error 1476 / AID,BAL = 12|444
+// expect: same: 0 / AID,BAL = 13|481
+// expect: same: error 1476 / AID,BAL = 14|518
+// expect: same: error 1 / N = 2000
+// expect: same: 1 / N,M = 2000|5000
+// expect: same: 1 / S = 20101
+// expect: same: 0 / N = 0
+// expect: same: 1 / S,N = -1|1
+// expect: same: 1 / N = 599
+// expect: same: 1 / N = 2999
+// expect: same: 1 / AID,BAL = 30|77
+// expect: same: error 2290 / S = 2001000
+// expect: same: 2401 / N,S = 3000|13605
+// expect: same: 2770 / S,C = 206355|2770
+// expect: same: 10 / M,N = 8000|3000
+// expect: same: error 1476 / S = 67855
+// expect: same: 230 / N = 285
+// expect: same: 0 / N = 0
+// expect: same: 5 / N,M = 2995|2995
+// expect: same: error 2290 / S = 2001000
+// expect: same: 3 / N = 3
+// expect: same: 332 / N = 2668
+// expect: same: 14 / N = 14
+// expect: same: error 1476 / N = 3000
+// expect: same: 30 / N,S = 2982|67471
+// expect: same: 30 / N,S = 30|1395
+// expect: same: 299 / S = 999299
+// expect: same: error 1476 / S = 67855
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg values (0)\ninsert into dg values (1)\ninsert into dg values (2)\ninsert into dg values (3)\ninsert into dg values (4)\ninsert into dg values (5)\ninsert into dg values (6)\ninsert into dg values (7)\ninsert into dg values (8)\ninsert into dg values (9)\ncreate table acct (aid number(10) primary key, bal number(10), r number(10), name varchar2(10))\ninsert into acct select n, mod(n * 37, 1000), case when mod(n, 10) = 0 then null else mod(n, 100) end, 'n' || mod(n, 13) from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 2000\ncreate table sm (id number(10) primary key, g number(10), w number(10))\ninsert into sm select n, mod(n, 5), n * 3 from (select p.i + q.i * 10 + 1 n from dg p cross join dg q) z where n <= 30\ncreate table t (id number(10) primary key, g number(10), x number(10))\ninsert into t select n, mod(n, 7), case when mod(n, 13) = 0 then null else mod(n, 50) end from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000\ncreate table e0 (id number(10) primary key, v number(10))\ncreate table t2 (a number(10), b number(10), v number(10), primary key (a, b))\ninsert into t2 select mod(n, 30), n, n * 3 from (select p.i + q.i * 10 + r.i * 100 + 1 n from dg p cross join dg q cross join dg r) z where n <= 600\ncreate table tk (k varchar2(10) primary key, v number(10))\ninsert into tk select 'k' || n, n from (select p.i + q.i * 10 + r.i * 100 + 1 n from dg p cross join dg q cross join dg r) z where n <= 200\ncreate table ck (id number(10) primary key, v number(10) check (v < 2990))\ninsert into ck select n, n from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 2000"
+
+const QS = "update acct set bal = bal + 1 where aid = 5 ;; select aid, bal from acct where aid = 5\nupdate acct set bal = 0 where aid = 99999 ;; select count(*) n, sum(bal) s from acct\nupdate acct set bal = 0 where aid = null ;; select count(*) n, sum(bal) s from acct\nupdate acct set bal = 1 where aid = 12 and 10 / (bal - bal) > 0 ;; select aid, bal from acct where aid = 12\nupdate acct set bal = 1 where aid = 13 and r > 50 ;; select aid, bal from acct where aid = 13\nupdate acct set bal = 10 / (bal - bal) where aid = 14 ;; select aid, bal from acct where aid = 14\nupdate acct set aid = 1 where aid = 2 ;; select count(*) n from acct\nupdate acct set aid = 5000 where aid = 8 ;; select count(*) n, max(aid) m from acct\nupdate tk set v = v + 1 where k = 'k17' ;; select sum(v) s from tk\nupdate tk set v = 0 where k = 'nope' ;; select count(*) n from tk where v = 0\nupdate t2 set v = -1 where a = 4 and b = 34 ;; select sum(v) s, count(*) n from t2 where v < 0\ndelete from t2 where a = 9 and b = 39 ;; select count(*) n from t2\ndelete from t where id = 30 ;; select count(*) n from t\nupdate acct set bal = 77 where aid = (select max(id) from sm) ;; select aid, bal from acct where aid = 30\nupdate ck set v = 3000 where id = 5 ;; select sum(v) s from ck\nupdate t set x = 0 where id between 100 and 2500 ;; select count(*) n, sum(x) s from t\nupdate t set x = x + 50 where x < 100 ;; select sum(x) s, count(x) c from t\nupdate t set id = id + 5000 where id > 2990 ;; select max(id) m, count(*) n from t\nupdate t set x = 10 / (id - 2500) where id > 2400 ;; select sum(x) s from t\nupdate t set x = 1 where x is null ;; select count(*) n from t where x = 1\nupdate e0 set v = 1 ;; select count(*) n from e0\ndelete from t where id > 2995 ;; select count(*) n, max(id) m from t\nupdate ck set v = v + 990 where id > 10 ;; select sum(v) s from ck\nupdate t set g = 9 where id in (3, 5, 7, 9999, null) ;; select count(*) n from t where g = 9\ndelete from t where x in (select id from sm where g = 1) ;; select count(*) n from t\nupdate t set x = -1 where id in (select id from sm where w > 50) ;; select count(*) n from t where x = -1\ndelete from t where 10 / (id - 2990) > 100 ;; select count(*) n from t\nmerge into t using (select id, g from sm) src on (t.id = src.id) when matched then update set t.x = src.g delete where (src.g < 3) ;; select count(*) n, sum(x) s from t\nmerge into e0 using (select id, w from sm) src on (e0.id = src.id) when not matched then insert (id, v) values (src.id, src.w) ;; select count(*) n, sum(v) s from e0\nmerge into acct using (select aid, bal from acct where aid < 300) src on (acct.aid = src.aid + 1000) when matched then update set acct.bal = src.bal + 1 ;; select sum(bal) s from acct\nmerge into t using (select id from t where id > 2900) src on (t.id = src.id - 100) when matched then update set t.x = 10 / (t.id - 2850) ;; select sum(x) s from t"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(56), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
