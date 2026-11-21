@@ -161,6 +161,13 @@ pub fn whoIs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Res
 
 pub fn whoNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Who, DbErr] { return whoIs(st, txn, &currentRole(st, txn.sql.sess)) }
 
+// Whether w holds any privilege on the object whose ACL is a (its owner does).
+pub fn holdsAny(w: &Who, a: &Acl): bool {
+    if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return true }
+    for g in a.grants { if lexdb_base.hasStr(&w.roles, &g.to) && len(g.privs) > 0 { return true } }
+    return false
+}
+
 pub fn allows(w: &Who, a: &Acl, letter: &str): bool {
     if w.super { return true }
     if len(a.owner) > 0 && lexdb_base.hasStr(&w.roles, &a.owner) { return true }
@@ -205,10 +212,12 @@ pub fn needRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, key: 
     if !(try may(st, txn, w, &lexdb_catalog.relObj(key), letter)) {
         if len(door) == 0 { door = doorOf(st, txn.sql.sess) }
         if door == "tds" { return Err(deniedTsql(letter, key)) }
-        // Oracle: a table the user cannot read is ORA-00942 (it is not there for it), one it can read but not use so is ORA-01031
+        // Oracle (checked against Oracle Free 23ai): a table the user holds no privilege on is ORA-00942 (it is not there for it),
+        // one it holds another on is ORA-41900, naming the missing privilege (READ for a query)
         if door == "tns" {
-            if letter == "r" || !(try may(st, txn, w, &lexdb_catalog.relObj(key), &"r")) { return Err(e("ORA00942", "table or view does not exist")) }
-            return Err(e("ORA01031", "insufficient privileges"))
+            if !holdsAny(w, &(try readAcl(st, txn, &lexdb_catalog.relObj(key)))) { return Err(e("ORA00942", "table or view does not exist")) }
+            return Err(e("ORA41900", &("missing " + (if letter == "r" { "READ" } else { tsqlPriv(letter) }) + " privilege on \"" +
+                                       strings.toUpperAscii(&lexdb_sql.schemaOf(key)) + "\".\"" + strings.toUpperAscii(&lexdb_sql.baseName(key)) + "\"")))
         }
         return Err(denied(kind, key))
     }
@@ -351,8 +360,8 @@ pub fn roleExists(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &str): R
 pub type Target = record { pub obj: str; pub kind: str; pub name: str; pub owner: str }
 
 // Who may GRANT or REVOKE letters on an object: its owner, a role it is a member of, a superuser. The other doors say
-// no as their own systems do: SQL Server's 4613, Oracle's 1720 for a user that holds the privilege without a grant
-// option (lexdb has none), else 1031 (the 42501).
+// no as their own systems do: SQL Server's 4613, Oracle's 1031 for a user that holds a privilege on the object (lexdb
+// has no grant options), 942 for one that holds none.
 pub fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, tg: &Target, letters: &str, door: &str): Result[Unit, DbErr] {
     if w.super { return Ok(Unit{}) }
     let a = try readAcl(st, txn, &tg.obj)
@@ -362,12 +371,11 @@ pub fn needGrantor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, w: &Who, t
     if door == "tds" {
         return Err(e("TS15151", &("Cannot find the object '" + lexdb_sql.baseName(&tg.name) + "', because it does not exist or you do not have permission.")))
     }
+    // Oracle 23ai (checked against Oracle Free): a user that holds a privilege on the object without the right to pass it on is
+    // told ORA-01031 (never 1720), one that holds none ORA-00942 (a function too)
     if door == "tns" && (tg.kind == "table" || tg.kind == "view" || tg.kind == "procedure" || tg.kind == "function") {
-        for k in 0..len(letters) {
-            if allows(w, &a, &letters[k..k + 1]) {
-                return Err(e("ORA01720", &("grant option does not exist for '" + strings.toUpperAscii(&lexdb_sql.schemaOf(&tg.name)) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&tg.name)) + "'")))
-            }
-        }
+        if holdsAny(w, &a) { return Err(e("ORA01031", "insufficient privileges")) }
+        return Err(e("ORA00942", "table or view does not exist"))
     }
     return needOwner(st, txn, w, &tg.obj, &tg.kind, &tg.name)
 }
