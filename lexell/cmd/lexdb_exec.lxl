@@ -6936,10 +6936,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() {
-            var nolk: []Look = []
-            found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
-        }
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -7039,10 +7036,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() {
-            var nolk: []Look = []
-            found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
-        }
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -8535,15 +8529,12 @@ fn outRow(sel: &Sel, m: &Mats, params: &[]Val, sqe: &Option[SeqEnv], oc: &OutC, 
 // with the Sel (Sel.pipe) and run
 
 // Makes sel's plan the pipeline's when it runs it (Sel.pipe); else
-// leaves sel as it was. Its subqueries' and set parts' aggregates too.
-fn pipeSel(sel: mut &Sel) { pipeSelIn(sel, true) }
-
-// pipeSel; rows: a plan of rows too (a SELECT's own; false: a subquery's,
-// a set's part, or a statement's query: only its aggregates, slice P1b).
-// A query with joins whose plan is not then the pipeline's has its joins
-// run by it for the row engine (Query.jp, slice P2c).
-fn pipeSelIn(sel: mut &Sel, rows: bool) {
-    pipeSelMain(sel, rows)
+// leaves sel as it was. Its subqueries' and set parts' too: every SELECT's
+// rows are offered (a subquery's, a statement's query: Q8 R1). A query
+// with joins whose plan is not then the pipeline's has its joins run by it
+// for the row engine (Query.jp, slice P2c).
+fn pipeSel(sel: mut &Sel) {
+    pipeSelMain(sel)
     // census: lexdb_plan.censusKeep(sel, false)
     if len(sel.q.levels) > 1 && !pipeJoins(sel) { levelsProg(sel) }
     // census: lexdb_plan.censusKeep(sel, true)
@@ -8555,15 +8546,8 @@ fn pipeSelIn(sel: mut &Sel, rows: bool) {
 fn pipeSubs(q: mut &Query) {
     for i in 0..len(q.subs) {
         bindSel(mut &q.subs[i].sel)
-        if subRuns(q, i) { pipeSel(mut &q.subs[i].sel) }
+        if lexdb_plan.subRuns(q, i) { pipeSel(mut &q.subs[i].sel) }
     }
-}
-
-// Whether q's subquery i runs its own query: not one a semi or anti level
-// looks up per row (semiLook took its table: it is no longer run).
-fn subRuns(q: &Query, i: int): bool {
-    for lv in q.levels { if lv.semiSub == i { return false } }
-    return true
 }
 
 // The joins of sel's query as a program for the row engine (Query.jp):
@@ -8612,10 +8596,9 @@ fn levelsProgIn(q: mut &Query, held: bool) {
     }
 }
 
-fn pipeSelMain(sel: mut &Sel, rows: bool) {
-    // (a subquery in FROM: its rows too, held for its level, slice P2)
-    for i in 0..len(sel.q.subs) { if subRuns(&sel.q, i) { pipeSelIn(mut &sel.q.subs[i].sel, true) } }
-    for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], true) }
+fn pipeSelMain(sel: mut &Sel) {
+    for i in 0..len(sel.q.subs) { if lexdb_plan.subRuns(&sel.q, i) { pipeSel(mut &sel.q.subs[i].sel) } }
+    for i in 0..len(sel.parts) { pipeSel(mut &sel.parts[i]) }
     // census: lexdb_census.reset()
     if sel.aggQ {
         if lexdb_plan.aggShape(sel) {
@@ -8633,8 +8616,8 @@ fn pipeSelMain(sel: mut &Sel, rows: bool) {
         }
         return
     }
-    if !rows || !lexdb_plan.pipeShape(sel) {
-        // census: if !rows { lexdb_census.no(&("a subquery's or statement's own rows (rows false)" + lexdb_plan.alsoWhy(sel))) } else { lexdb_census.no(&lexdb_plan.shapeWhy(sel)) }
+    if !lexdb_plan.pipeShape(sel) {
+        // census: lexdb_census.no(&lexdb_plan.shapeWhy(sel))
         return
     }
     // the outputs: as bindSel bound them (moved), a column by its slot,
