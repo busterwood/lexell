@@ -3921,7 +3921,7 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     var sc = newScopeIn(st, txn, params, ptypes)
     var sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
     bindSel(mut &sel)
-    pipeSelIn(mut &sel, false)
+    pipeSel(mut &sel)
     if len(s.names) > len(sel.outs) { return Err(e("42601", "too many column names were specified")) }
     var mk = lexdb_sql.newStmt(lexdb_sql.S_CREATE)
     mk.table = s.table.clone()
@@ -6306,11 +6306,15 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, &newMap(), true, mut &sc, false)
     var rows: [][]Expr = []
     let resolved = len(s.subs) > 0 || len(s.items) > 0
-    if resolved && len(s.inner) == 0 {
-        for r in s.rows {
-            var rr: []Expr = []
-            for x in r { append(mut &rr, try lexdb_bind.resolve(&x, &q.cols, 0, mut &sc.names)) }
-            append(mut &rows, rr)
+    if resolved {
+        // (its subqueries planned as a SELECT's: here, so a plain INSERT VALUES pays no test for them)
+        if len(q.subs) > 0 { pipeSubs(mut &q) }
+        if len(s.inner) == 0 {
+            for r in s.rows {
+                var rr: []Expr = []
+                for x in r { append(mut &rr, try lexdb_bind.resolve(&x, &q.cols, 0, mut &sc.names)) }
+                append(mut &rows, rr)
+            }
         }
     }
     var ret = try retOf(s, &q, mut &sc)
@@ -6332,9 +6336,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let noTypes: []int = []
         var ssc = newScopeIn(st, txn, params, &noTypes)
         var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
-        // (its aggregates the pipeline's)
+        // (its rows the pipeline's where it runs them)
         bindSel(mut &sel)
-        pipeSelIn(mut &sel, false)
+        pipeSel(mut &sel)
         // the logical plan (read by nothing yet): the query's plan its source
         let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), collections.copyOf(&targets), lexdb_plan.takeLp(mut &sel), retBCols(&ret))
         let defs = try defaultsOf(st, txn, &t)
@@ -6894,6 +6898,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // the logical plan (read by nothing yet): the FROM and WHERE part its source
     let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), collections.copyOf(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
     if len(s.from) > 0 { levelsProgQ(mut &q, false) }         // its joins in batches (Query.jp)
     if win.n > 0 {
         // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
@@ -6930,9 +6935,11 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             append(mut &found, collections.copyOf(r))
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
-        found = onceEach(t, found, len(s.from) > 0)
-        var nolk: []Look = []
-        found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if len(s.from) > 0 { found = onceEach(t, found, true) }
+        if s.limit.isSome() {
+            var nolk: []Look = []
+            found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        }
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -6994,6 +7001,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // the logical plan (read by nothing yet): the FROM and WHERE part its source
     let lp = lexdb_bind.LPlan.Delete(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
     if len(s.from) > 0 { levelsProgQ(mut &q, false) }         // its joins in batches (Query.jp)
     delNarrow(mut &q, s)
     // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
@@ -7030,9 +7038,11 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             append(mut &found, collections.copyOf(r))
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
-        found = onceEach(t, found, len(s.from) > 0)
-        var nolk: []Look = []
-        found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if len(s.from) > 0 { found = onceEach(t, found, true) }
+        if s.limit.isSome() {
+            var nolk: []Look = []
+            found = firstN(found, try lexdb_plan.evalInt(&s.limit, params, "TOP", mut &nolk))     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        }
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -7760,6 +7770,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     // the logical plan (read by nothing yet): the source joined to the target its source
     let lp = lexdb_bind.LPlan.Merge(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
     // its source join in batches (Query.jp; a BY SOURCE's RIGHT or FULL join too)
     levelsProgQ(mut &q, true)
     var found: [][]Val = []
@@ -7979,6 +7990,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
         var q = if s.kind == lexdb_sql.S_MERGE { try buildQuery(st, txn, &mergeFrom(s), &noOn, params, &s.subs, &newMap(), true, mut &sc, false) }
                 else { try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false) }
         endScope(mut &sc, mut &q)
+        if len(q.subs) > 0 { pipeSubs(mut &q) }
         lines = explainLines(&q, &none)
         let noStats: []SubStat = []
         subLines(&q, &lexdb_plan.subsOf(&q), &noStats, mut &lines)
@@ -8537,6 +8549,16 @@ fn pipeSelIn(sel: mut &Sel, rows: bool) {
     // census: lexdb_plan.censusKeep(sel, true)
 }
 
+// A write's subqueries (its WHERE's, SET's, VALUES', RETURNING's, a
+// derived table's in FROM or USING) planned as a SELECT's are: bound once
+// and their rows offered to the pipeline (Q8 R1).
+fn pipeSubs(q: mut &Query) {
+    for i in 0..len(q.subs) {
+        bindSel(mut &q.subs[i].sel)
+        pipeSel(mut &q.subs[i].sel)
+    }
+}
+
 // The joins of sel's query as a program for the row engine (Query.jp):
 // its first table's conditions and the joins' expressions bound for it
 // (copies: the row engine keeps its own).
@@ -8585,7 +8607,7 @@ fn levelsProgIn(q: mut &Query, held: bool) {
 
 fn pipeSelMain(sel: mut &Sel, rows: bool) {
     // (a subquery in FROM: its rows too, held for its level, slice P2)
-    for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, sel.q.subs[i].use == lexdb_sql.SUB_FROM) }
+    for i in 0..len(sel.q.subs) { pipeSelIn(mut &sel.q.subs[i].sel, true) }
     for i in 0..len(sel.parts) { pipeSelIn(mut &sel.parts[i], true) }
     // census: lexdb_census.reset()
     if sel.aggQ {
@@ -15365,7 +15387,7 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var sc = newScopeIn(st, txn, params, ptypes)
     var sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
     bindSel(mut &sel)
-    pipeSelIn(mut &sel, false)
+    pipeSel(mut &sel)
     let n = len(sel.outs)
     var names: []str = []
     for c in sel.outs { append(mut &names, c.name.clone()) }
