@@ -1,0 +1,160 @@
+// lexdb over TNS: the fuzzer's bugs (design/lexdb-fuzz.md) through the Oracle door, checked against Oracle Database
+// 23ai Free (run with LEXDB_ORACLE set to its connection string, this test prints Oracle's answers: the expect lines;
+// its tables are made and dropped). W1: a JOIN binds tighter than a comma (from a, b right join c is a x (b right join
+// c)): right, full and left join, an empty table, a view, a derived table, a WITH, a tree inside a subquery, two trees,
+// a tree first. W2: char(n) beside char(n) in subqueries: any, all, in, exists and a scalar over a view, a join (not
+// char beside varchar2: Oracle compares those without padding, the door as PostgreSQL does, a gap of its own,
+// design/lexdb-fuzz.md W2). E1: an outer value in a CROSS APPLY inside a correlated EXISTS and IN. E2: ROUND with a
+// NULL. E3: an index range's bound past the column's type (number(6,2), number(4)). Each statement runs with unnesting
+// on, then the subqueries' again with it off (lexdb_plan.setUnnest(0)), each with set lexdb_batch = off (the row
+// engine) and on: the label and the answer, or DIFFERENT and both.
+// expect: setup: 50 statements
+// expect: W1 right join: X,Y,BX,BY2,CX,Z = 1|10|1|1|1|5;1|10|NULL|NULL|4|6;1|10|NULL|NULL|NULL|8;2|20|1|1|1|5;2|20|1|1|1|5;2|20|NULL|NULL|4|6;2|20|NULL|NULL|4|6;2|20|NULL|NULL|NULL|8;2|20|NULL|NULL|NULL|8
+// expect: W1 full join: N,B,C = 15|6|6
+// expect: W1 left join: N,C = 9|3
+// expect: W1 empty: N = 0
+// expect: W1 view: N,Y = 9|3
+// expect: W1 derived table: N,Y = 12|6
+// expect: W1 CTE: N,Y = 15|9
+// expect: W1 inside a subquery: X,N = 1|6;2|9;2|9
+// expect: W1 two trees: N = 9
+// expect: W1 a tree then a comma: N = 27
+// expect: W1 a tree first: N = 9
+// expect: W2 >= any: ID = 1;3;5;6
+// expect: W2 >= all: ID = 5
+// expect: W2 char in char: ID = 3;6
+// expect: W2 exists, view: ID = 3;6
+// expect: W2 scalar, view: ID,N = 1|1;2|1;3|2;4|0;5|1;6|2
+// expect: W2 join: ID,IID = 1|1;2|2;3|3;3|6;5|5;6|3;6|6
+// expect: E1 exists: X6,E = 0|0;1|1;NULL|0
+// expect: E1 in: A4 = 2;3
+// expect: E2 round: R = 1.5;NULL;-2.3;1234.6
+// expect: E2 round of null: R = NULL;NULL;NULL;NULL
+// expect: E2 round, a null scale: R = NULL;NULL;NULL;NULL
+// expect: E3 number >: A0 = 
+// expect: E3 number <: A0 = -9999.99;12.50;12.50;9999.99
+// expect: E3 join: N = 
+// expect: E3 number(4): S = -9999;3;3;9999
+// expect: E3 number(4) >: S = 
+// expect: unnest off, W2 >= any: ID = 1;3;5;6
+// expect: unnest off, W2 >= all: ID = 5
+// expect: unnest off, W2 char in char: ID = 3;6
+// expect: unnest off, W2 exists, view: ID = 3;6
+// expect: unnest off, W2 scalar, view: ID,N = 1|1;2|1;3|2;4|0;5|1;6|2
+// expect: unnest off, W2 join: ID,IID = 1|1;2|2;3|3;3|6;5|5;6|3;6|6
+// expect: unnest off, E1 exists: X6,E = 0|0;1|1;NULL|0
+// expect: unnest off, E1 in: A4 = 2;3
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "os"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_plan"
+
+const SETUP = "create table wa (x number(10), y number(10))\ncreate table wb (x number(10), y number(10))\ncreate table wc (x number(10), z number(10))\ncreate table we (x number(10))\ninsert into wa values (1, 10)\ninsert into wa values (2, 20)\ninsert into wa values (2, 20)\ninsert into wb values (1, 1)\ninsert into wb values (3, 3)\ninsert into wb values (null, 7)\ninsert into wc values (1, 5)\ninsert into wc values (4, 6)\ninsert into wc values (null, 8)\ncreate view wv as select x, y from wb\ncreate table p (id number(10) not null, c char(3), v varchar2(4))\ninsert into p values (1, 'a', 'a')\ninsert into p values (2, ' a', ' a ')\ninsert into p values (3, 'ab', 'ab ')\ninsert into p values (4, null, null)\ninsert into p values (5, 'b', 'b')\ninsert into p values (6, 'ab', 'ab')\ncreate view pv as select id, c, v from p\ncreate table e1 (b2 number(10))\ncreate table e3 (d1 number(10))\ncreate table e4 (a5 number(19), a4 number(10))\ninsert into e1 values (0)\ninsert into e1 values (1)\ninsert into e1 values (1)\ninsert into e3 values (1)\ninsert into e3 values (1)\ninsert into e3 values (null)\ninsert into e4 values (5, 2)\ninsert into e4 values (5, 3)\ninsert into e4 values (null, null)\ncreate table r0 (c0 number(10) not null, c2 number(10,2))\ninsert into r0 values (1, 1.5)\ninsert into r0 values (2, null)\ninsert into r0 values (3, -2.25)\ninsert into r0 values (4, 1234.56)\ncreate table x0 (a0 number(6,2), s number(4))\ncreate index x0_a on x0 (a0)\ncreate index x0_s on x0 (s)\ninsert into x0 values (12.5, 3)\ninsert into x0 values (9999.99, 9999)\ninsert into x0 values (-9999.99, -9999)\ninsert into x0 values (null, null)\ninsert into x0 values (12.5, 3)\ncreate table x1 (b2 number(10))\ninsert into x1 values (1)\ninsert into x1 values (2)"
+
+const QS = "W1 right join\tselect wa.x, wa.y, wb.x bx, wb.y by2, wc.x cx, wc.z from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect count(*) n, count(wb.x) b, count(wc.x) c from wa, wb full join wc on wb.x = wc.x\nW1 left join\tselect count(*) n, count(wc.x) c from wa, wb left join wc on wb.x = wc.x\nW1 empty\tselect count(*) n from we, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*) n, count(wv.y) y from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*) n, count(d.y) y from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*) n, count(k.y) y from wa, k full join wc on k.x = wc.x\nW1 inside a subquery\tselect wa.x, (select count(*) from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) n from wa order by 1, 2\nW1 two trees\tselect count(*) n from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) n from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a tree first\tselect count(*) n from wb right join wc on wb.x = wc.x, wa\nW2 >= any\tselect o.id from p o where o.c >= any (select i.c from p i where i.id <> o.id) order by 1\nW2 >= all\tselect o.id from p o where o.c >= all (select i.c from p i where i.id <> 4) order by 1\nW2 char in char\tselect o.id from p o where o.c in (select i.c from p i where i.id <> o.id) order by 1\nW2 exists, view\tselect o.id from pv o where exists (select 1 from pv i where i.c = o.c and i.id <> o.id) order by 1\nW2 scalar, view\tselect o.id, (select count(*) from pv i where i.c = o.c) n from pv o order by 1\nW2 join\tselect o.id, i.id iid from p o join p i on o.c = i.c order by 1, 2\nE1 exists\tselect d1.x6, case when exists (select 1 from e1 q7 cross apply (select count(*) n from e3 q9 where q9.d1 = d1.x6) l8 where l8.n > 1 and q7.b2 = d1.x6) then 1 else 0 end e from (select a4 - 2 x6 from e4) d1 order by 1\nE1 in\tselect q1.a4 from e4 q1 where q1.a4 in (select l4.x8 from e4 q3 cross apply (select q1.a4 x8 from e4 q5) l4 where q3.a5 = q1.a5) order by 1\nE2 round\tselect round(c2, 1) r from r0 order by c0\nE2 round of null\tselect round(cast(null as number), 0) r from r0\nE2 round, a null scale\tselect round(c2, null) r from r0 order by c0\nE3 number >\tselect a0 from x0 where a0 > 2147483647\nE3 number <\tselect a0 from x0 where a0 < 2147483647 order by 1\nE3 join\tselect 1.5 n from x1 q1 join x0 q2 on q2.a0 > 2147483647\nE3 number(4)\tselect s from x0 where s < 2147483647 order by 1\nE3 number(4) >\tselect s from x0 where s > 40000"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn answer(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// local: lexdb, each statement with the row engine and with batches, unnesting on and then off; else the oracle's answers
+// (its tables dropped after)
+fn client(dsn: &str, local: bool) {
+    match oracle.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            if !local { for t in TABLES { let d = c.run(&((if t == "wv" || t == "pv" { "drop view " } else { "drop table " }) + t), &[]) } }
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for pass in 0..2 {
+                if pass == 1 && local { lexdb_plan.setUnnest(0) }
+                for l in strings.lines(&text) {
+                    let parts = strings.split(&l, "\t")
+                    if pass == 1 && !strings.startsWith(&parts[0], "W2") && !strings.startsWith(&parts[0], "E1") { continue }
+                    let lab = if pass == 1 { "unnest off, " + parts[0] } else { parts[0].toStr() }
+                    let q = parts[1].toStr()
+                    if !local {
+                        println(lab + ": " + answer(mut &c, &q))
+                        continue
+                    }
+                    let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                    let off = answer(mut &c, &q)
+                    let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                    let on = answer(mut &c, &q)
+                    if off == on { println(lab + ": " + on) } else {
+                        println("DIFFERENT " + lab + ": " + q)
+                        println("  rows:    " + off)
+                        println("  batches: " + on)
+                    }
+                }
+            }
+            if !local { for t in TABLES { let d = c.run(&((if t == "wv" || t == "pv" { "drop view " } else { "drop table " }) + t), &[]) } }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+const TABLES: []str = ["wv", "pv", "wa", "wb", "wc", "we", "p", "e1", "e3", "e4", "r0", "x0", "x1"]
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&("User Id=app;Password=app;Data Source=127.0.0.1:" + addr[10..len(addr)] + "/lexdb"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_ORACLE: the oracle, for the expect lines
+    match os.env("LEXDB_ORACLE") {
+        Some(dsn) { client(&dsn, false) }
+        None { lexdb_store.run(lexdb_disk.sim(61), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap() }
+    }
+}

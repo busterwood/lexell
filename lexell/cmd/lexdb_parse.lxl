@@ -4571,16 +4571,17 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 }
 
 // FROM's list (after FROM; UPDATE's FROM and DELETE's USING, 9.91): its
-// first item joined as join, the rest by commas and JOINs.
+// first item joined as join, the rest by commas and JOINs. A JOIN binds
+// tighter than a comma: from the first comma on, fromTrees reads the list
+// (one join tree read alone, treeList's, stops at the comma: J_TREE).
 fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_base.DbErr] {
     var first = try p.fromItem(join)
     first.comma = true
     append(from, first)
     while true {
-        if p.acceptKw(",") {
-            var f = try p.fromItem(J_CROSS)
-            f.comma = true
-            append(from, f)
+        if p.isKw(",") {
+            if join == J_TREE { break }
+            return p.fromTrees(from, &"")
         } else if (p.tsql || p.ora) && (p.isKw("cross") || p.isKw("outer")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "apply" {
             // T-SQL and Oracle 12c: CROSS APPLY x, OUTER APPLY x: a LATERAL join (inner, left)
             let outer = p.acceptKw("outer")
@@ -4630,6 +4631,104 @@ fn (p: mut &P) fromList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_ba
     }
     return Ok(Unit{})
 }
+
+// FROM's list from a comma on (fromList's), or the whole of an UPDATE's
+// FROM or a DELETE's USING (from empty: its first tree joins the target).
+// The levels join left-deep, each to all the tables before it: each join
+// tree after a comma (or that first one) with a RIGHT or FULL JOIN is read
+// again as a subquery of its own (nestTree). target: a T-SQL UPDATE's or
+// DELETE's table, else "".
+fn (p: mut &P) fromTrees(from: mut &[]FromItem, target: &str): Result[Unit, lexdb_base.DbErr] {
+    var nested = false
+    var whole = len(from) == 0
+    while whole || p.acceptKw(",") {
+        whole = false
+        let g = len(from)
+        let at = p.pos
+        let atSubs = len(p.subs)
+        try p.treeList(from, J_CROSS)
+        nested = (try p.nestTree(from, g, at, atSubs, target)) || nested
+    }
+    if nested { try p.treeAliases(from) }
+    return Ok(Unit{})
+}
+
+// An UPDATE's FROM or a DELETE's USING list (fromTrees; T-SQL's target named).
+fn (p: mut &P) dmlFrom(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    let target = if p.tsql { s.table.clone() } else { "" }
+    return p.fromTrees(mut &s.from, &target)
+}
+
+// One join tree (fromList's, up to a comma), its first item joined as join.
+fn (p: mut &P) treeList(from: mut &[]FromItem, join: int): Result[Unit, lexdb_base.DbErr] {
+    let g = len(from)
+    try p.fromList(from, J_TREE)
+    from[g].join = join
+    return Ok(Unit{})
+}
+
+// fromList's join for one join tree read alone (treeList's; its first item's join until treeList sets it).
+const J_TREE = 99
+
+// The names of a FROM list with join trees read as subqueries (nestTree's): FROM's still, each once (42712).
+fn (p: &P) treeAliases(from: &[]FromItem): Result[Unit, lexdb_base.DbErr] {
+    var names: []str = []
+    for f in from {
+        let inner = f.sub >= 0 && isTreeSub(&p.subs[f.sub])
+        let n = if inner { len(p.subs[f.sub].from) } else { 1 }
+        for k in 0..n {
+            let a = if inner { p.subs[f.sub].from[k].alias.clone() } else { f.alias.clone() }
+            if lexdb_base.hasStr(&names, &a) { return Err(lexdb_base.err("42712", &("table name \"" + a + "\" specified more than once"))) }
+            append(mut &names, a)
+        }
+    }
+    return Ok(Unit{})
+}
+
+// The join tree from[g..] (read from token at to here, after atSubs of
+// the subqueries), if it has a RIGHT or FULL JOIN: read again as a
+// subquery of its own, a SELECT of its every column under its own name
+// (TREE_STAR), and a LATERAL item in its place (its items may see the
+// tables before it, as a LATERAL one's; true: so read). A T-SQL UPDATE
+// or DELETE keeps a tree with its target (tsqlDml takes the target out of
+// FROM).
+fn (p: mut &P) nestTree(from: mut &[]FromItem, g: int, at: int, atSubs: int, target: &str): Result[bool, lexdb_base.DbErr] {
+    var keeps = false
+    for k in g + 1..len(from) { if from[k].join == J_RIGHT || from[k].join == J_FULL { keeps = true } }
+    if !keeps { return Ok(false) }
+    if len(target) > 0 {
+        for k in g..len(from) { if from[k].sub < 0 && (from[k].alias == target || from[k].table == target) { return Ok(false) } }
+    }
+    let end = p.pos
+    let join = from[g].join
+    var name = ""
+    for k in g..len(from) { name = name + (if k > g { " " } else { "" }) + from[k].alias }
+    while len(from) > g { let x = pop(from) }
+    // (what reading it noted stays: the sequences named, a recursive CTE's references)
+    let seqs = len(p.seqs)
+    var refs: []int = []
+    for c in p.inCte { append(mut &refs, c.refs) }
+    p.pos = at
+    while len(p.subs) > atSubs { let x = pop(mut &p.subs) }
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    var d = lexdb_sql.newStmt(S_SELECT)
+    try p.treeList(mut &d.from, J_FIRST)
+    d.subs = replace(mut &p.subs, saved)
+    d.wins = replace(mut &p.wins, savedW)
+    d.use = SUB_FROM
+    if p.pos != end { return Err(near(&p.peek())) }
+    while len(p.seqs) > seqs { let x = pop(mut &p.seqs) }
+    for k in 0..len(refs) { p.inCte[k].refs = refs[k] }
+    append(mut &d.items, SelItem{star: true, qual: lexdb_sql.TREE_STAR, expr: None, alias: "", spell: ""})
+    append(mut &p.subs, d)
+    append(from, FromItem{table: "", alias: "(" + name + ")", join: join, on: None, sub: len(p.subs) - 1, cols: [], work: -1, lateral: true, using: [],
+                          natural: false, comma: true})
+    return Ok(true)
+}
+
+// A join tree read as a subquery of its own (nestTree's).
+pub fn isTreeSub(s: &Stmt): bool { return len(s.items) == 1 && s.items[0].star && s.items[0].qual == lexdb_sql.TREE_STAR }
 
 // The functions that may be a FROM item.
 pub fn isFromFn(n: &str): bool {
@@ -5382,7 +5481,7 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     try p.setList(mut &s)
     var out: []SelItem = []
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
-    if p.acceptKw("from") { try p.fromList(mut &s.from, J_CROSS) }
+    if p.acceptKw("from") { try p.dmlFrom(mut &s) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
     try p.batchOpt(mut &s)
@@ -5417,7 +5516,7 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     try p.dmlTarget(mut &s)
     var out: []SelItem = []
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
-    if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.fromList(mut &s.from, J_CROSS) }
+    if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.dmlFrom(mut &s) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
     try p.batchOpt(mut &s)
