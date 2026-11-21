@@ -8758,6 +8758,16 @@ fn winBytes(vs: &[]Val, shown: int, sorting: bool, keyCol: &[]int, coll: &[]int)
     return n
 }
 
+// The outputs xs over row and its calls' values vals into vs (at: winBody's
+// places).
+fn winOuts(xs: &[]BX, at: &[]int, row: &[]Val, vals: &[]Val, cx: &Ctx, vs: mut &[]Val): Result[Unit, DbErr] {
+    for xi in 0..len(xs) {
+        let a = at[xi]
+        if a >= 0 { append(vs, row[a].clone()) } else if a <= -2 { append(vs, vals[-2 - a].clone()) } else { append(vs, try bxEval(&xs[xi], row, vals, cx)) }
+    }
+    return Ok(Unit{})
+}
+
 fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: &lexdb_plan.PPlan, pw: &lexdb_plan.PWin, xs: &[]BX,
            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src,
            vrows: &[][][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
@@ -8806,6 +8816,16 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
     sr.early = false
     let shown = sr.shown
     var outHeld = 0
+    // (an output that is a column or a call's value read at its place, not
+    // evaluated: per output its place, the row's (>= 0) or a call's (-2 - i))
+    var at: []int = withCapacity(len(xs))
+    for x in xs {
+        match x {
+            BX.Col(c) { append(mut &at, c) }
+            BX.Agg(i) { append(mut &at, -2 - i) }
+            else { append(mut &at, -1) }
+        }
+    }
     if !sr.sorting && !sr.distinct && sr.don == 0 && sr.ties == 0 && !sr.pct && sr.top < 0 {
         // none: the rows LIMIT and OFFSET keep, given one by one (as the row
         // engine's; a SortSt's OutBatch costs more than it saves here)
@@ -8813,7 +8833,7 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
         let noInts: []int = []
         for r in 0..n {
             var vs: []Val = withCapacity(len(xs))
-            for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
+            try winOuts(xs, &at, &rows[r].row, &wv[r], cx, mut &vs)
             outHeld += winBytes(&vs, len(xs), false, &noInts, &noInts)
             if r >= sr.offset && (sr.limit < 0 || len(kept) < sr.limit) { append(mut &kept, vs) }
         }
@@ -8824,7 +8844,7 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
     }
     for r in 0..n {
         var vs: []Val = withCapacity(len(xs))
-        for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
+        try winOuts(xs, &at, &rows[r].row, &wv[r], cx, mut &vs)
         let before = sr.set.n
         let go = try sr.eat(&noOb, &vs)
         if sr.bad { return Err(batErr()) }
