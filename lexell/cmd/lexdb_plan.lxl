@@ -7993,12 +7993,13 @@ fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.s
 // Whether sel is a query of window calls the pipeline may run: not an
 // aggregate's (its windows are over the groups: exec's view), one table
 // read per row (or joins), no correlated subquery left in it, no set
-// operation, function in FROM, lock, MATCH_RECOGNIZE, SELECT @v =,
-// DISTINCT ON, WITH TIES, TOP, or set-returning function in the list.
+// operation, function in FROM, lock, MATCH_RECOGNIZE, SELECT @v =, or
+// set-returning function in the list; DISTINCT ON, WITH TIES and TOP (the
+// Sort's, R2's PSort) only sorted and not DISTINCT, as sortShape's.
 pub fn winShape(sel: &Sel): bool {
     let q = &sel.q
     if len(sel.wins) == 0 || sel.aggQ || sel.setop != 0 || len(sel.srf) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 || len(sel.mr) > 0 { return false }
-    if sel.donKey > 0 || sel.withTies || sel.topMode != 0 || sel.first >= 0 || hasSrfCall(&sel.exprs) { return false }
+    if ((sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct)) || sel.first >= 0 || hasSrfCall(&sel.exprs) { return false }
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs)
 }
@@ -8010,8 +8011,7 @@ pub fn winWhy(sel: &Sel): str {
     if len(sel.locks) > 0 { return "a window: FOR UPDATE" }
     if len(sel.feedback) > 0 { return "a window: SELECT @v = (feedback)" }
     if len(sel.mr) > 0 { return "a window: MATCH_RECOGNIZE" }
-    if sel.donKey > 0 { return "a window: DISTINCT ON" }
-    if sel.withTies || sel.topMode != 0 { return "a window: TOP PERCENT or WITH TIES" }
+    if (sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct) { return "a window: DISTINCT ON, TOP or WITH TIES not sorted, or DISTINCT" }
     if sel.first >= 0 { return "a window: MIN or MAX by the scan's order (Sel.first)" }
     if hasSrfCall(&sel.exprs) { return "a window: a set-returning function in the select list" }
     let r = queryWhy(sel)
@@ -8084,7 +8084,9 @@ pub fn pipeWin(sel: mut &Sel): Option[PPlan] {
     // expression made after the outputs
     var ps: Option[PSort] = None
     if sel.sort {
-        var srt = PSort{shown: len(xs), out: [], desc: [], nf: [], coll: [], don: 0, ties: 0, pct: false, top: -1}
+        var srt = PSort{shown: len(xs), out: [], desc: [], nf: [], coll: [], don: sel.donKey,
+                        ties: if sel.topMode & lexdb_sql.TOP_TIES != 0 { TS_TOP } else if sel.withTies { TS_FETCH } else { 0 },
+                        pct: sel.topMode & lexdb_sql.TOP_PERCENT != 0, top: if sel.topMode != 0 { sel.topN } else { -1 }}
         for oi in 0..len(sel.order) {
             var o = lexdb_bind.orderOut(&sel.order[oi], &sel.q.cols, &sel.outs, len(sel.exprs))
             if o == -2 { return noWin("a window: an ORDER BY position not in the list") }

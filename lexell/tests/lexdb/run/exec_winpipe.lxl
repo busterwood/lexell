@@ -16,9 +16,12 @@
 //   text keys (a collation's too), DISTINCT, ORDER BY (outputs, positions,
 //   expressions), LIMIT and OFFSET over the windowed rows, over one table,
 //   a join, a left join, a CTE's and VALUES' held rows, an empty table;
-// - errors in a later row (an output, an argument, a key), before and past
-//   a LIMIT; a frame offset NULL or negative; ntile and nth_value of 0; a
-//   correlated subquery in an output (the row engine: winShape);
+// - fixed: errors in a later row (an output, an argument, a key), before
+//   and past a LIMIT, in a row DISTINCT ON drops; a frame offset NULL or
+//   negative; ntile and nth_value of 0; DISTINCT ON and FETCH ... WITH TIES
+//   (sorted; DISTINCT with WITH TIES: the row engine); a correlated
+//   subquery in an output (the row engine: winShape); a sort key of mixed
+//   kinds (the SortSt gives up: the row engine again, nothing given);
 // - max_statement_mem at each query's edge, the least the row engine runs
 //   it in, and a kB under it (one table, a join whose unread columns are
 //   wide, DISTINCT, ORDER BY with LIMIT; inputs of several sizes);
@@ -28,7 +31,7 @@
 // timeout: 300
 // expect: tables: INSERT 0 3000 INSERT 0 7 INSERT 0 0
 // expect: generated: 500 queries, 500 the same three ways, 500 on the Window
-// expect: fixed: 32 queries, 32 the same three ways, 31 on the Window, errors 13
+// expect: fixed: 39 queries, 39 the same three ways, 37 on the Window, errors 15
 // expect: memory: 48 queries, 48 the same three ways, 48 on the Window, errors 24
 // expect: groups: 13 queries, 13 the same three ways, 12 on the groups
 // expect: first rows: 1|1|1 2|2|1 8|1|2 | 1|3000 2|2999
@@ -275,7 +278,17 @@ fn main() {
             "select w.id, (select max(g) from k) + row_number() over (order by w.id) from w limit 4",
             // a correlated subquery: the row engine (winShape)
             "select w.id, (select max(w.id) from k) + row_number() over (order by w.id) from w limit 4",
-            "select w.id, rank() over (order by w.i - (select min(g) from k)) from w order by 1 limit 4"]
+            "select w.id, rank() over (order by w.i - (select min(g) from k)) from w order by 1 limit 4",
+            // DISTINCT ON, WITH TIES (the Sort's): sorted; an error in a row DISTINCT ON drops
+            "select distinct on (w.g) w.g, w.id, rank() over (partition by w.g order by w.i desc nulls last, w.id) from w order by w.g, w.i desc nulls last, w.id",
+            "select distinct on (w.g) w.g, w.id, 10 / (w.id - 3000), count(*) over () from w order by w.g, w.id",
+            "select w.id, w.i, rank() over (order by w.i) r from w order by r fetch first 3 rows with ties",
+            "select w.id, row_number() over (order by w.id) from w order by w.id desc offset 3 fetch first 2 rows with ties",
+            "select distinct w.g, count(*) over (partition by w.g) from w order by 1 fetch first 1 rows with ties",
+            // a sort key of mixed kinds (a column typed by a UNION's first branch): the SortSt
+            // gives up, the row engine runs it again (nothing given), an error in a later row too
+            "select v.a, row_number() over (order by v.a desc) from (select 1 as a union all select 2.5 union all select i from generate_series(3, 300) i union all select i + 0.5 from generate_series(3, 300) i) v order by v.a limit 5",
+            "select v.a, 10 / (v.a - 300), rank() over (order by v.a) from (select 1 as a union all select 2.5 union all select i from generate_series(3, 300) i union all select i + 0.5 from generate_series(3, 300) i) v order by v.a limit 5"]
         for x in fixed { three(mut &s, &x, mut &tf) }
         println("fixed: " + tf.n.toStr() + " queries, " + tf.same.toStr() + " the same three ways, " + tf.win.toStr() + " on the Window, errors " + tf.errs.toStr())
 
