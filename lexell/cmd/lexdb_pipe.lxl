@@ -7786,6 +7786,98 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
     return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
 }
 
+// compileLevels for a write's rows (Q8 R5, design/lexdb-layers.md
+// 6.3.Q8 R5): a join tree (compileLevels), or one table's Filter? (Scan),
+// its first arm alone, run by runLevels (its batches, or row by row: an
+// IN list, a point the light program does not take). Err(p): neither.
+pub fn compileRows(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+    match p {
+        lexdb_plan.PPlan.Join(_, _) { return compileLevels(p, cols) }
+        else {}
+    }
+    var avail: []bool = array(len(cols), false)
+    if joinOps(&p, cols, mut &avail) < 0 {
+        // census: lexdb_census.no("write: its table's rows not read by the pipeline (joinOps)")
+        return Err(p)
+    }
+    return Ok(Prog{plan: p, ops: 2, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
+}
+
+// A write's point of its whole primary key (lexdb_exec.levelsProgIn:
+// UPDATE or DELETE by key, the OLTP write): a Scan at the query's first
+// column of the table's columns need (none: the row read whole), run
+// PR_POINT by pointRows, without the batch arm's kinds, which pointRows
+// does not read (their planning was a third of a point UPDATE's added
+// instructions). Its conditions are bound once, by the run's prepare (the
+// row engine's binding: lexdb_exec.writePrep), and given to pointRows.
+// Not with subqueries (the row engine's binding does not bind them).
+pub fn pointProg(first: int, need: []bool): Prog {
+    let part = len(need) > 0
+    let sc = lexdb_plan.PScan{level: 0, first: first, kinds: [], need: need, part: part, batch: false, stops: false, sorted: false, held: -1}
+    let none: []lexdb_plan.PSub = []
+    return Prog{plan: lexdb_plan.PPlan.Scan(sc, none), ops: 1, groups: false, joins: false, sorts: false, run: lexdb_plan.PR_POINT}
+}
+
+// Runs a write's point program (pointProg) over the key's scan s (one
+// point, or none), its conditions conds (each bound): the row read and its
+// conditions as a join over a point reads its first table's (pointGet),
+// the row (the query's columns) to each; counted as the row engine counts
+// it (runLevel, tryRow).
+pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, conds: &[]Option[BX], cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                 s: &lexdb_access.Scan, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
+                 each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    runs += 1
+    writePoints += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    let sc0 = match pg.plan {
+        lexdb_plan.PPlan.Scan(s1, _) { &s1 }
+        else { return Err(e("XX000", "a write's point program without its scan")) }
+    }
+    cnt[0].starts += 1
+    if s.empty { return Ok(Unit{}) }
+    let rel = lexdb_catalog.relOf(t)
+    return pointGet(st, txn, &rel, sc0, conds, s, cx, len(cols), bud, cnt, each)
+}
+
+// A write's point's row (pointRows): read as a join over a point reads
+// its first table's (pointJProj: getRow, as fetch reads one), counted
+// read, its values the row's (of nc columns; the table's row itself when
+// it is the query's whole row); its conditions in order by the scalar
+// evaluator, counted kept; then to each.
+fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, sc0: &lexdb_plan.PScan, conds: &[]Option[BX], s: &lexdb_access.Scan,
+            cx: &Ctx, nc: int, bud: mut &Budget, cnt: mut &[]Counts, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    let all: []bool = []
+    var r = match try lexdb_access.getRow(st, txn, rel, &lexdb_access.rowRead(rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
+        Some(x) { x }
+        None { return Ok(Unit{}) }
+    }
+    try bud.tick()
+    var row: []Val = []
+    if sc0.first == 0 && len(r) == nc {
+        row = r
+    } else {
+        row = array(nc, Val.Null)
+        for i in 0..len(r) { row[sc0.first + i] = replace(mut &r[i], Val.Null) }
+    }
+    cnt[0].read += 1
+    let noAggs: []Val = []
+    for c in conds {
+        match c {
+            Some(b) { if lexdb_ops.truth(&(try bxEval(&b, &row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
+            None { return Err(e("XX000", "a write's point condition not bound")) }
+        }
+    }
+    cnt[0].joined += 1
+    let more = try each(txn, &row)
+    return Ok(Unit{})
+}
+
+// Runs of pointRows and of runLevels (the tests' look).
+var writePoints: int = 0
+var levelRuns: int = 0
+
+pub fn rowsRuns(): []int { return [writePoints, levelRuns] }
+
 // Runs a levels program (compileLevels): each joined row (the query's
 // columns its tables decode, the others NULL) to each, in the row
 // engine's order; false from each stops. An error of each is given as is
@@ -7797,6 +7889,7 @@ pub fn runLevels(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     runs += 1
     joinRuns += 1
     batchRuns += 1
+    levelRuns += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     let nq = len(cols)
     var kinds: []int = []

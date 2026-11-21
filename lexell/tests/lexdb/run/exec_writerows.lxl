@@ -1,0 +1,226 @@
+// lexdb_exec, lexdb_pipe: a write's rows found by a pipeline program (Q8's R5, design/lexdb-layers.md
+// 6.3.Q8 R5): UPDATE's, DELETE's, MERGE's and ALTER TABLE ... USING's rows go from a program (its
+// levels program, Query.jp: a table read in batches, its joins, or a point of its whole primary key,
+// lexdb_pipe.pointRows) to the write, which holds them all before it changes any. Each statement runs
+// with batches on and off (the row engine, the reference) in a transaction rolled back: the same tag,
+// rows or error, and the same table after it. "found": per statement, p when its rows were a point
+// program's (lexdb_pipe.rowsRuns()[0]), y when a levels program's (rowsRuns()[1]), n neither (the row
+// engine's: a correlated subquery left per row; a range delete finds none).
+// - by key: integer, text and two-column keys; a key missing, NULL, out of the column's range and of
+//   another type; a condition after the key that drops the row or fails (22012); SET of the key itself
+//   (23505 on a duplicate); RETURNING; a key from a subquery run once (y: the first arm's program, which
+//   binds the subquery); a virtual generated column
+//   read and its base set; two statements in one transaction.
+// - ranges and scans: a key range, a scan with a condition, an index's range, an IN list of keys, an
+//   error in the third batch (22012: no row changed), NULLs in the condition, an empty table, rows
+//   changed so the condition would find them again (the Halloween problem: each row once), a key moved
+//   past the scan's end, duplicates made (23505), a CHECK broken by a late row.
+// - joins: UPDATE ... FROM, DELETE ... USING, a FROM row matching twice (one change, as PostgreSQL), and
+//   a self join.
+// - MERGE: matched, not matched, by key and by scan; a source of a few rows (fewSource: the row engine's).
+// - ALTER TABLE ... TYPE ... USING (the table's rows by a scan program).
+// - batched writes (WITH (batch_rows n)): by key (p: the point program, a next batch from the key after the last), a key
+//   range (the range delete: no rows found), a scan (y).
+// - a correlated EXISTS left per row (unnesting off: the row engine's), and constant conditions (`1 = 2`, `now() is null`: on
+//   the level, the program's).
+// timeout: 120
+// expect: by key: 19 statements, 19 the same, found pppppppppppppppyppp
+// expect: ranges: 17 statements, 17 the same, found yyyyyyyyyyyyyyyyn
+// expect: joins: 5 statements, 5 the same, found yyyyy
+// expect: merge: 3 statements, 3 the same, found yyn
+// expect: alter: 2 statements, 2 the same, found yy
+// expect: batched: 7 statements, 7 the same, found ppppnyy
+// expect: per row and constants: 3 statements, 3 the same, found nyy
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+type Group = record { name: str; n: int; same: int; found: str }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, found: ""} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same, found " + g.found) }
+
+// A write (statements separated by ";;", the last the one counted) and what it leaves (after: a query),
+// in a transaction rolled back, with batches on and off.
+fn checkW(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, after: &str) {
+    let r0 = lexdb_pipe.rowsRuns()
+    let on = write(s, sql, after)
+    let r1 = lexdb_pipe.rowsRuns()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = write(s, sql, after)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.found += if r1[0] > r0[0] { "p" } else if r1[1] > r0[1] { "y" } else { "n" }
+}
+
+fn write(s: mut &lexdb_exec.Session, sql: &str, after: &str): str {
+    let a = run(s, &"begin")
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    // (after an error the transaction is aborted: rolled back first, then the table read)
+    if strings.startsWith(&out[len(out) - 1], &"ERROR") {
+        let r = run(s, &"rollback")
+        append(mut &out, run(s, after))
+        return strings.join(&out, " // ")
+    }
+    append(mut &out, run(s, after))
+    let r = run(s, &"rollback")
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(83), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create index tx on t (x)",
+            "create table tk (k text primary key, v int)",
+            "insert into tk select 'k' || i, i from generate_series(1, 200) i",
+            "create table t2 (a int, b int, v int, primary key (a, b))",
+            "insert into t2 select i % 30, i, i * 3 from generate_series(1, 600) i",
+            "create table u (id int primary key, k int, v int)",
+            "insert into u select i, i % 40, case when i % 9 = 0 then null else (i * 7) % 60 end from generate_series(1, 500) i",
+            "create table gv (id int primary key, a int, d int generated always as (a * 2) virtual)",
+            "insert into gv (id, a) select i, i from generate_series(1, 50) i",
+            "create table ck (id int primary key, v int check (v < 2990))",
+            "insert into ck select i, i from generate_series(1, 2000) i",
+            "create table em (id int primary key, v int)",
+            "create table cnt (g int primary key, n int)",
+            "insert into cnt select i, 0 from generate_series(0, 4) i",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+        let afterT = "select count(*), sum(id), sum(g), sum(x), count(s), sum(length(s)) from t"
+
+        var gk = newGroup(&"by key")
+        checkW(mut &s, mut &gk, &"update t set x = x + 1 where id = 5", &"select * from t where id = 5")
+        checkW(mut &s, mut &gk, &"update t set x = 0 where id = 999999", &afterT)
+        checkW(mut &s, mut &gk, &"update t set x = 0 where id = null", &afterT)
+        checkW(mut &s, mut &gk, &"update t set x = 0 where id = 99999999999", &afterT)
+        checkW(mut &s, mut &gk, &"update t set x = 0 where id = '7'", &"select * from t where id = 7")
+        checkW(mut &s, mut &gk, &"update t set x = 1 where id = 13 and x > 0", &"select * from t where id = 13")
+        checkW(mut &s, mut &gk, &"update t set x = 1 where id = 12 and 10 / (x - 12) > 0", &"select * from t where id = 12")
+        checkW(mut &s, mut &gk, &"update t set s = s || '!' where id = 22 returning id, s, x", &"select * from t where id = 22")
+        checkW(mut &s, mut &gk, &"update t set id = 4000 where id = 8 returning *", &"select count(*), max(id) from t")
+        checkW(mut &s, mut &gk, &"update t set id = 1 where id = 2", &afterT)
+        checkW(mut &s, mut &gk, &"update tk set v = v + 1 where k = 'k17' returning k, v", &"select sum(v) from tk")
+        checkW(mut &s, mut &gk, &"update t2 set v = -1 where a = 4 and b = 34", &"select sum(v), count(*) from t2 where v < 0")
+        checkW(mut &s, mut &gk, &"delete from t where id = 30 returning *", &afterT)
+        checkW(mut &s, mut &gk, &"delete from tk where k = 'nope'", &"select count(*) from tk")
+        checkW(mut &s, mut &gk, &"delete from t2 where a = 9 and b = 39 returning v", &"select count(*) from t2")
+        checkW(mut &s, mut &gk, &"update t set x = 77 where id = (select max(id) from u)", &"select * from t where id = 500")
+        checkW(mut &s, mut &gk, &"update gv set a = a + 100 where id = 3 returning id, a, d", &"select sum(d) from gv")
+        checkW(mut &s, mut &gk, &"update ck set v = 3000 where id = 5", &"select sum(v) from ck")
+        checkW(mut &s, mut &gk, &"update t set x = x + 1 where id = 5;; update t set x = x * 10 where id = 5 returning x", &"select * from t where id = 5")
+        report(&gk)
+
+        var gr = newGroup(&"ranges")
+        checkW(mut &s, mut &gr, &"update t set x = 0 where id between 100 and 2500", &afterT)
+        checkW(mut &s, mut &gr, &"update t set s = upper(s) where g = 3", &afterT)
+        checkW(mut &s, mut &gr, &"update t set x = -x where x = 7", &afterT)
+        checkW(mut &s, mut &gr, &"update t set g = 9 where id in (3, 5, 7, 9999, null)", &afterT)
+        checkW(mut &s, mut &gr, &"update t set x = 1 where 10 / (id - 2500) > -100", &afterT)
+        checkW(mut &s, mut &gr, &"update t set x = 1 where x is null returning id", &afterT)
+        checkW(mut &s, mut &gr, &"update em set v = 1", &"select count(*) from em")
+        checkW(mut &s, mut &gr, &"update t set x = x + 50 where x < 100", &afterT)
+        checkW(mut &s, mut &gr, &"update t set id = id + 1000 where id > 2000", &afterT)
+        checkW(mut &s, mut &gr, &"update t set id = id + 10 where id > 2990", &afterT)
+        checkW(mut &s, mut &gr, &"update t set id = id + 1 where id between 10 and 20", &afterT)
+        checkW(mut &s, mut &gr, &"update ck set v = v + 989 where id > 10", &"select sum(v) from ck")
+        checkW(mut &s, mut &gr, &"delete from t where g = 4 and x > 10", &afterT)
+        checkW(mut &s, mut &gr, &"delete from t where id > 2995 returning id, s", &afterT)
+        checkW(mut &s, mut &gr, &"delete from t where 10 / (id - 2900) <> 0", &afterT)
+        checkW(mut &s, mut &gr, &"delete from tk where k like 'k1%' and v > 15", &"select count(*), sum(v) from tk")
+        checkW(mut &s, mut &gr, &"delete from t2 where a = 3", &"select count(*), sum(v) from t2")
+        report(&gr)
+
+        var gj = newGroup(&"joins")
+        checkW(mut &s, mut &gj, &"update t set x = u.v from u where t.id = u.id and u.k = 3", &afterT)
+        checkW(mut &s, mut &gj, &"update t set g = u.k from u where t.x = u.id and t.id < 400", &afterT)
+        checkW(mut &s, mut &gj, &"delete from t using u where t.id = u.id and u.v > 50 returning t.id", &afterT)
+        checkW(mut &s, mut &gj, &"update tk set v = t.x from t where t.id = tk.v and t.x > 40 returning tk.k, tk.v", &"select sum(v) from tk")
+        checkW(mut &s, mut &gj, &"delete from t using t t2 where t.id = t2.id + 2900", &afterT)
+        report(&gj)
+
+        var gm = newGroup(&"merge")
+        checkW(mut &s, mut &gm, &"merge into t using (select id, k from u where id < 400) src on t.id = src.id when matched and src.k > 20 then update set g = src.k when matched then delete", &afterT)
+        checkW(mut &s, mut &gm, &"merge into em using (select id, v from u) src on em.id = src.id when not matched then insert values (src.id, src.v)", &"select count(*), sum(v) from em")
+        checkW(mut &s, mut &gm, &"merge into cnt using (select g, count(*) n from t group by g) src on cnt.g = src.g when matched then update set n = src.n when not matched then insert values (src.g, src.n)", &"select * from cnt order by g")
+        report(&gm)
+
+        var ga = newGroup(&"alter")
+        checkW(mut &s, mut &ga, &"alter table t2 alter v type bigint using v * 1000000000", &"select sum(v), max(v) from t2")
+        checkW(mut &s, mut &ga, &"alter table u alter v type text using coalesce(v, -1) || 'v'", &"select count(*), min(v), max(v) from u")
+        report(&ga)
+
+        // batched writes (WITH (batch_rows n): each batch committed, so not in a transaction rolled back): the same
+        // statements on two copies of a table, one with batches on, one off
+        var gb = newGroup(&"batched")
+        for x in ["create table bon (id int primary key, g int, x int)", "create table boff (id int primary key, g int, x int)",
+                  "insert into bon select i, i % 7, i % 50 from generate_series(1, 400) i", "insert into boff select * from bon"] {
+            let r = run(mut &s, &x)
+        }
+        for w in ["delete from @ where id = 5 with (batch_rows 2)", "delete from @ where id = 6 and x > 100 with (batch_rows 2)",
+                  "update @ set x = x + 1 where id = 7 with (batch_rows 2)", "update @ set x = 0 where id = 99999 with (batch_rows 2)",
+                  "delete from @ where id between 10 and 20 with (batch_rows 3)", "update @ set x = -1 where g = 3 with (batch_rows 25)",
+                  "delete from @ where x = 7 with (batch_rows 2)"] {
+            let r0 = lexdb_pipe.rowsRuns()
+            let on = run(mut &s, &strings.replaceAll(&w, &"@", &"bon")) + " // " + run(mut &s, &"select count(*), sum(id), sum(g), sum(x) from bon")
+            let r1 = lexdb_pipe.rowsRuns()
+            let a = run(mut &s, &"set lexdb_batch = off")
+            let off = run(mut &s, &strings.replaceAll(&w, &"@", &"boff")) + " // " + run(mut &s, &"select count(*), sum(id), sum(g), sum(x) from boff")
+            let b = run(mut &s, &"set lexdb_batch = on")
+            gb.n += 1
+            if on == off { gb.same += 1 } else { println("DIFFERENT: " + w + "\n  on:  " + on + "\n  off: " + off) }
+            gb.found += if r1[0] > r0[0] { "p" } else if r1[1] > r0[1] { "y" } else { "n" }
+        }
+        report(&gb)
+
+        var gn = newGroup(&"per row and constants")
+        lexdb_plan.setUnnest(0)
+        checkW(mut &s, mut &gn, &"update t set x = 0 where id < 200 and exists (select 1 from u where u.k = t.x)", &afterT)
+        lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+        checkW(mut &s, mut &gn, &"update t set x = 0 where 1 = 2", &afterT)
+        checkW(mut &s, mut &gn, &"delete from t where now() is null", &afterT)
+        report(&gn)
+        return 0
+    }).unwrap()
+}
