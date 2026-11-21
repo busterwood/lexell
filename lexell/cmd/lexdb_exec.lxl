@@ -1377,6 +1377,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 col.coll = fcols[i].coll.clone()
                 append(mut &t.unshare().cols, col)
             }
+            // a join tree's subquery (lexdb_parse's nestTree): its columns keep their names, and what USING made of them
+            if lexdb_parse.isTreeSub(&subs[f.sub]) { lexdb_bind.treeUsing(fcols, &sp.sel.q.cols, mut &t.unshare().cols) }
             item = if subs[f.sub].cte >= 0 { lexdb_bind.LPlan.CteRef(subs[f.sub].cte, false, outBCols(fcols)) } else { spLp }
             append(mut &planned[f.sub], sp)
         } else if f.work >= 0 {
@@ -1494,9 +1496,11 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             append(mut &icols, lexdb_bind.bcolOf(len(q.cols), &qc))
             lexdb_plan.addCol(q, qc)
         }
+        var gone: []int = []                   // its columns not in *'s order (USING's, below; a join tree's here)
         if f.sub < 0 && f.work < 0 && viewSrc < 0 {
             append(mut &items, lexdb_bind.LPlan.Get(t.name.toStr(), f.alias.toStr(), icols))
         } else {
+            if f.sub >= 0 && lexdb_parse.isTreeSub(&subs[f.sub]) { anyUsing = lexdb_bind.treeNames(mut &q.cols, first, &t.cols, mut &icols, mut &gone) || anyUsing }
             append(mut &items, lexdb_bind.LPlan.Sub(viewName, if viewSrc >= 0 { viewSrc } else { f.sub }, item, icols))
         }
         var lv = lexdb_plan.newLevel(t, &f.alias, f.join, first)
@@ -1521,6 +1525,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 fc.spell = q.cols[i].spell.clone()
                 fc.coll = q.cols[i].coll.clone()
                 fc.genKind = q.cols[i].genKind
+                fc.using = q.cols[i].using.clone()
                 match q.cols[i].gen {
                     Some(g) { fc.gen = Some(lexdb_sql.cloneExpr(&g)) }
                     None {}
@@ -1536,7 +1541,6 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         // left's, a RIGHT JOIN's right's, a FULL JOIN's COALESCE of both)
         var uon: Option[Expr] = None
         var merged: []int = []
-        var gone: []int = []
         if f.comma { tree = first }
         if len(q.levels) > 1 && (len(f.using) > 0 || f.natural) {
             anyUsing = true

@@ -2110,6 +2110,10 @@ pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColD
                 if !any { return Err(e("42601", "SELECT * with no columns")) }
                 continue
             }
+            if len(it.qual) > 0 && it.qual == lexdb_sql.TREE_STAR {
+                treeCols(cols, placed, ns, mut &out, exprs)
+                continue
+            }
             for i in 0..len(cols) {
                 let c = &cols[i]
                 if it.qual != "" && c.name[0..dotAt(&c.name)] != it.qual { continue }
@@ -2138,6 +2142,47 @@ pub fn itemCols(items: &[]lexdb_sql.SelItem, from: bool, cols: &[]lexdb_sql.ColD
         }
     }
     return Ok(out)
+}
+
+// A join tree's subquery's columns (TREE_STAR): each under its own name
+// (alias.column), in *'s order, then the ones JOIN ... USING hides.
+fn treeCols(cols: &[]lexdb_sql.ColDef, placed: bool, ns: &Names, out: mut &[]OutCol, exprs: mut &[]Expr) {
+    var at: []int = []
+    if placed {
+        for p in 0..len(cols) { for i in 0..len(cols) { if cols[i].pos == p { append(mut &at, i) } } }
+        for i in 0..len(cols) { if cols[i].pos < 0 { append(mut &at, i) } }
+    } else {
+        for i in 0..len(cols) { append(mut &at, i) }
+    }
+    for i in at {
+        let c = &cols[i]
+        if lexdb_catalog.hiddenName(&c.name) { continue }
+        append(out, OutCol{name: c.name.clone(), oid: c.typ.oid, spell: c.spell.clone(), coll: c.coll.clone(), scale: ns.colScale(&c.typ)})
+        append(exprs, colAt(cols, i))
+    }
+}
+
+// A join tree's subquery's columns (outs, TREE_STAR's over its query's
+// inner): what JOIN ... USING made of each (ColDef.using) on the FROM
+// item's own (tcols), for treeNames.
+pub fn treeUsing(outs: &[]OutCol, inner: &[]lexdb_sql.ColDef, tcols: mut &[]lexdb_sql.ColDef) {
+    for k in 0..len(outs) { tcols[k].using = inner[colIndex(inner, &outs[k].name)].using.clone() }
+}
+
+// The FROM item over a join tree's subquery (lexdb_parse's nestTree): its
+// columns (cols[first..], its own tcols) under the tree's names
+// (alias.column, not the item's), with what USING made of them, those it
+// hid added to gone (not in *'s order); whether USING made any of them.
+pub fn treeNames(cols: mut &[]lexdb_sql.ColDef, first: int, tcols: &[]lexdb_sql.ColDef, icols: mut &[]BCol, gone: mut &[]int): bool {
+    var any = false
+    for k in 0..len(tcols) {
+        cols[first + k].name = tcols[k].name.clone()
+        cols[first + k].using = tcols[k].using.clone()
+        icols[k].name = tcols[k].name.clone()
+        if len(tcols[k].using) > 0 { any = true }
+        if tcols[k].using == lexdb_sql.USING_HIDDEN { append(gone, first + k) }
+    }
+    return any
 }
 
 // ORDER BY: an output column's name, if no input column has it, else an

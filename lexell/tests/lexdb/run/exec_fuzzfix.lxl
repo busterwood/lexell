@@ -1,0 +1,110 @@
+// The fuzzer's bugs (design/lexdb-fuzz.md, "Bugs found (main 757c4cee)"), each statement against PostgreSQL 18's
+// answer, with SET lexdb_batch = off and on (a write in a transaction rolled back each time).
+// - W1: a JOIN binds tighter than a comma: FROM a, b RIGHT JOIN c is a x (b RIGHT JOIN c), not (a x b) RIGHT JOIN c.
+//   RIGHT, FULL, LEFT and inner joins after a comma; an empty table on each side; a view, a derived table, a CTE; a tree
+//   inside LATERAL and inside a subquery; three items in a tree, two trees, a tree followed by items, a LATERAL after it
+//   that reads it and one in it that reads an item before it; USING and NATURAL in the tree (* and the merged name);
+//   WHERE and GROUP BY over it; a name twice (42712); UPDATE ... FROM and DELETE ... USING with a tree.
+// expect: W1 doc, t1 empty, right join: , same: true
+// expect: W1 doc, full join on false: 8, same: true
+// expect: W1 right join: 1|10|1|1|1|5;1|10|NULL|NULL|4|6;1|10|NULL|NULL|NULL|8;2|20|1|1|1|5;2|20|1|1|1|5;2|20|NULL|NULL|4|6;2|20|NULL|NULL|4|6;2|20|NULL|NULL|NULL|8;2|20|NULL|NULL|NULL|8, same: true
+// expect: W1 full join: 1|10|1|1|1|5;1|10|3|3|NULL|NULL;1|10|NULL|7|NULL|NULL;1|10|NULL|NULL|4|6;1|10|NULL|NULL|NULL|8;2|20|1|1|1|5;2|20|1|1|1|5;2|20|3|3|NULL|NULL;2|20|3|3|NULL|NULL;2|20|NULL|7|NULL|NULL;2|20|NULL|7|NULL|NULL;2|20|NULL|NULL|4|6;2|20|NULL|NULL|4|6;2|20|NULL|NULL|NULL|8;2|20|NULL|NULL|NULL|8, same: true
+// expect: W1 left join: 1|10|1|1|1|5;1|10|3|3|NULL|NULL;1|10|NULL|7|NULL|NULL;2|20|1|1|1|5;2|20|1|1|1|5;2|20|3|3|NULL|NULL;2|20|3|3|NULL|NULL;2|20|NULL|7|NULL|NULL;2|20|NULL|7|NULL|NULL, same: true
+// expect: W1 inner join: 1|10|1|1|1|5;2|20|1|1|1|5;2|20|1|1|1|5, same: true
+// expect: W1 empty first: 0, same: true
+// expect: W1 empty right: 0, same: true
+// expect: W1 empty left of full: 9|0|6, same: true
+// expect: W1 qualified columns: 10|NULL|6;10|NULL|8;20|NULL|6;20|NULL|6;20|NULL|8;20|NULL|8, same: true
+// expect: W1 a star of the tree: 1|5|1|1;4|6|NULL|NULL;NULL|8|NULL|NULL, same: true
+// expect: W1 unqualified names: ERROR 42702, same: true
+// expect: W1 ambiguous name: ERROR 42702, same: true
+// expect: W1 view: 9|3, same: true
+// expect: W1 derived table: 12|6, same: true
+// expect: W1 CTE: 15|9|9, same: true
+// expect: W1 inside LATERAL: 1|6;2|9;2|9, same: true
+// expect: W1 inside a subquery: 1, same: true
+// expect: W1 three in the tree: 15|3|6|6, same: true
+// expect: W1 two trees: 9|3|3, same: true
+// expect: W1 a tree then a comma: 0, same: true
+// expect: W1 a tree then items: 27, same: true
+// expect: W1 a later LATERAL sees the tree: 1|1|15;1|4|16;1|NULL|18;2|1|25;2|1|25;2|4|26;2|4|26;2|NULL|28;2|NULL|28, same: true
+// expect: W1 LATERAL in the tree: 1|1|5;1|NULL|6;1|NULL|8;2|NULL|5;2|NULL|5;2|NULL|6;2|NULL|6;2|NULL|8;2|NULL|8, same: true
+// expect: W1 USING in the tree: 1|10|1|1|5;1|10|3|3|NULL;1|10|4|NULL|6;1|10|NULL|7|NULL;1|10|NULL|NULL|8;2|20|1|1|5;2|20|1|1|5;2|20|3|3|NULL;2|20|3|3|NULL;2|20|4|NULL|6;2|20|4|NULL|6;2|20|NULL|7|NULL;2|20|NULL|7|NULL;2|20|NULL|NULL|8;2|20|NULL|NULL|8, same: true
+// expect: W1 the USING name: 1|10;1|20;1|20;3|10;3|20;3|20;4|10;4|20;4|20;NULL|10;NULL|10;NULL|20;NULL|20;NULL|20;NULL|20, same: true
+// expect: W1 the USING name, ambiguous: ERROR 42702, same: true
+// expect: W1 NATURAL in the tree: 15, same: true
+// expect: W1 WHERE on the tree: 1|NULL|6;1|NULL|8;2|NULL|6;2|NULL|6;2|NULL|8;2|NULL|8, same: true
+// expect: W1 GROUP BY: 5|3;6|3;8|3, same: true
+// expect: W1 a name twice: ERROR 42712, same: true
+// expect: W1 a name twice, later: ERROR 42712, same: true
+// expect: W1 UPDATE FROM: ERROR 42702, same: true
+// expect: W1 DELETE USING: , same: true
+// expect: W1 tree first: 9, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// each statement with the row engine and with batches, in a transaction rolled back (a write's rows the same both times)
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table wa (x int, y int)\ncreate table wb (x int, y int)\ncreate table wc (x int, z int)\ncreate table we (x int)\ninsert into wa values (1, 10), (2, 20), (2, 20)\ninsert into wb values (1, 1), (3, 3), (null, 7)\ninsert into wc values (1, 5), (4, 6), (null, 8)\ncreate view wv as select x, y from wb\ncreate table t0 (a1 bigint)\ncreate table t1 (b0 bool)\ninsert into t0 values (9)\ncreate table t2 (a1 int)\ninsert into t2 values (8), (4)\ncreate table p (id int, c char(3), v varchar(4), t text)\ninsert into p values (1, 'a', 'a', 'a'), (2, ' a', ' a ', ' a '), (3, 'ab', 'ab ', 'ab'), (4, null, null, null), (5, 'b', 'b', 'b  '), (6, 'ab', 'ab', 'ab ')\ncreate view pv as select id, c, v, t from p\ncreate table pe (c char(3), v varchar(4), t text)\ncreate table c0 (a0 char(3))\ninsert into c0 values ('c')\ncreate table c1 (a0 varchar(4), a4 char(3))\ninsert into c1 values ('bb', ' a'), (' a', 'a ')\ncreate view c1v as select a4, a0 from c1\ncreate table c2 (a2 text, a4 char(3))\ninsert into c2 values ('ab', 'ab')\ncreate view c2v as select a4, a2 from c2\ncreate table e0 (a3 numeric(6,2), a5 bigint, a4 int, f float8)\ncreate table e1 (b2 int)\ncreate table e3 (d1 int)\ninsert into e1 values (0), (1), (1)\ninsert into e3 values (1), (1), (null)\ncreate table e4 (a3 numeric(6,2), a5 bigint, a4 int, f float8)\ninsert into e4 values (1, 5, 2, 1e10), (2, 5, 3, null), (null, null, null, null)\ncreate table r0 (c0 int, c2 numeric(10,2), f float8)\ninsert into r0 values (1, 1.5, 1.25), (2, null, null), (3, -2.25, -2.5), (4, 1234.56, 0)\ncreate table x0 (a0 numeric(6,2), s smallint, i int, b bigint)\ncreate table x1 (b2 int)\ncreate index x0_a on x0 (a0)\ncreate index x0_s on x0 (s)\ncreate index x0_i on x0 (i)\ncreate index x0_b on x0 (b)\ninsert into x0 values (12.5, 3, 7, 9), (9999.99, 32767, 2147483647, 9223372036854775807), (-9999.99, -32768, -2147483648, -9223372036854775807), (null, null, null, null), (12.5, 3, 7, 9)\ninsert into x1 values (1), (2)\ncreate table x2 (a0 numeric(6,2), s smallint)\ncreate index x2_a on x2 (a0)\ncreate index x2_s on x2 (s)"
+
+const QS = "W1 doc, t1 empty, right join\tselect 1 from t1 as q1, t0 as q2 right join t0 as q3 on true\nW1 doc, full join on false\tselect count(*) from t2 as q1, (select 1 from t2 as q3) as d2 full join t2 as q10 on false\nW1 right join\tselect * from wa, wb right join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 full join\tselect * from wa, wb full join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 left join\tselect * from wa, wb left join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 inner join\tselect * from wa, wb join wc on wb.x = wc.x order by 1, 2, 3, 4, 5, 6\nW1 empty first\tselect count(*) from we, wb right join wc on wb.x = wc.x\nW1 empty right\tselect count(*) from wa, wb right join we on wb.x = we.x\nW1 empty left of full\tselect count(*), count(we.x), count(wc.x) from wa, we full join wc on we.x = wc.x\nW1 qualified columns\tselect wa.y, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wc.z > 5 order by 1, 2, 3\nW1 a star of the tree\tselect wc.*, wb.* from wa, wb right join wc on wb.x = wc.x where wa.x = 1 order by 1, 2, 3, 4\nW1 unqualified names\tselect y, z from wa, wb w2 right join wc on w2.x = wc.x order by 1, 2\nW1 ambiguous name\tselect x from wa, wb right join wc on wb.x = wc.x\nW1 view\tselect count(*), count(wv.y) from wa, wv right join wc on wv.x = wc.x\nW1 derived table\tselect count(*), count(d.y) from wa, (select x, y from wb where y < 5) d full join wc on d.x = wc.x\nW1 CTE\twith k as (select x, y from wb) select count(*), count(k.y), count(wc.z) from wa, k full join wc on k.x = wc.x\nW1 inside LATERAL\tselect wa.x, l.n from wa, lateral (select count(*) as n from wb, wa a2 right join wc on a2.x = wc.x where a2.x is null or a2.x <> wa.x) l order by 1, 2\nW1 inside a subquery\tselect (select count(*) from wa, wb full join wc on wb.x = wc.x) from we union all select 1 order by 1\nW1 three in the tree\tselect count(*), count(wb.x), count(wc.x), count(w3.x) from wa, wb right join wc on wb.x = wc.x full join wb w3 on w3.x = wc.x\nW1 two trees\tselect count(*), count(a2.x), count(wb.x) from wa a2 right join wc on a2.x = wc.x, wb right join wc c2 on wb.x = c2.x\nW1 a tree then a comma\tselect count(*) from wa, wb right join wc on wb.x = wc.x, we\nW1 a tree then items\tselect count(*) from wa, wb right join wc on wb.x = wc.x, wb w4\nW1 a later LATERAL sees the tree\tselect wa.x, wc.x, l.s from wa, wb right join wc on wb.x = wc.x, lateral (select wa.y + wc.z as s) l order by 1, 2, 3\nW1 LATERAL in the tree\tselect wa.x, l.x, wc.z from wa, lateral (select wa.x as x) l right join wc on l.x = wc.x order by 1, 2, 3\nW1 USING in the tree\tselect * from wa, wb full join wc using (x) order by 1, 2, 3, 4, 5\nW1 the USING name\tselect x, d.y from (select y from wa) d, wb full join wc using (x) order by 1, 2\nW1 the USING name, ambiguous\tselect x from wa, wb full join wc using (x)\nW1 NATURAL in the tree\tselect count(*) from wa, wb natural full join wc\nW1 WHERE on the tree\tselect wa.x, wb.y, wc.z from wa, wb right join wc on wb.x = wc.x where wb.y is null order by 1, 2, 3\nW1 GROUP BY\tselect wc.z, count(*) from wa, wb right join wc on wb.x = wc.x group by wc.z order by 1\nW1 a name twice\tselect 1 from wa, wb right join wa on true\nW1 a name twice, later\tselect 1 from wa a, wb right join wc on true, wc\nW1 UPDATE FROM\tupdate wa set y = y from wb right join wc on wb.x = wc.x where wa.x = 2 and wc.z = 6 returning wa.x, wa.y\nW1 DELETE USING\tdelete from we using wa, wb right join wc on wb.x = wc.x where we.x = wa.x returning we.x\nW1 tree first\tselect count(*) from wb right join wc on wb.x = wc.x, wa"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for pass in 0..2 {
+        // the second pass with unnesting off (lexdb_plan.setUnnest(0)): each correlated subquery as written
+        if pass == 1 { lexdb_plan.setUnnest(0) }
+        for l in strings.lines(&qs) {
+            let parts = strings.split(&l, "\t")
+            let lab = if pass == 1 { "unnest off, " + parts[0] } else { parts[0].toStr() }
+            if pass == 1 && !strings.startsWith(&lab, "unnest off, E1") && !strings.startsWith(&lab, "unnest off, W2") { continue }
+            two(mut &s, &lab, &parts[1])
+        }
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(97), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}
