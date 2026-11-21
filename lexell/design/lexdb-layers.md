@@ -6330,6 +6330,64 @@ and measured). Branch `worktree-agent-a7ed8cb9808946f75` from main
   and DML; a null-aware lookup; a numeric or collated key's lookup; outer
   bounds of a range lookup in the pipeline; EXISTS over three tables.
 
+### 6.3.Q7 as built, second half (2026-11-20)
+
+Step 5's slices 5d and 5e (6.1, "The slices"): lexdb-optimizer.md 51 (51.2
+keys with no rows, 51.3 validity, 51.7 q20 measured, 51.8 as built). Branch
+`worktree-agent-a0afd47b5b6049e6d` from main b519a837.
+
+- **5d, a correlated scalar aggregate as a grouped level** (`scalarJoins`,
+  `selScalars`, `groupLevel`, `RUN_GROUPED`): `x op (select agg(...) from
+  ... where inner.k = outer.k ...)` in a WHERE conjunct, the select list or
+  ORDER BY. The subquery run once, grouped by its keys (9.9's form), its
+  rows a level LEFT joined by a hash on them; the call read from the
+  level's columns (the expression per group where it cannot fail, else
+  the aggregates and the expression per outer row), a key with no group
+  given the expression over no rows (count 0) by a CASE on the first key
+  column. 9.9's grouped subqueries become levels (the query then the
+  pipeline's: it was the row engine's, `q.corr`); one with an index on the
+  key is planned again without outer keys (`scalarAlt`, only where a
+  grouping could cost less than the runs) and taken by cost
+  (`groupCheaper`: the groups' rows, a join's later tables a lookup each,
+  the statement's memory); with few outer rows it stays per row.
+- **5e, a correlated FROM subquery with an aggregate as a join and a
+  grouping** (`lateralGroup`, `lateralOn`, `lateralMs`): LATERAL, CROSS JOIN
+  LATERAL, LEFT JOIN LATERAL ... ON true, T-SQL's and Oracle's CROSS and
+  OUTER APPLY. The keys added to its GROUP BY and, hidden, to its columns;
+  run once, hashed on them, the equalities its ON. With a GROUP BY: CROSS
+  drops an outer row with no group, LEFT keeps it with NULLs; without: one
+  row for every outer row (LEFT), count's 0 read through a CASE (the
+  column made virtual, as Q2's). Per row where an index serves the key
+  (9.9's rule), or anything run once could fail where a run per row would
+  not.
+- **The switch:** `setUnnest`'s `UN_SCALAR` and `UN_LATERAL` (default on;
+  `setUnnest(7)` gives the first half's plans). Under `SET lexdb_planner =
+  rules` nothing is planned again or chosen by cost (9.9's grouped
+  subqueries still become levels).
+- **A fix:** 9.9's hashed probe evaluated a scalar's value over no rows
+  once, eagerly: `100 / count(v)` failed (22012) where every key had rows;
+  the level evaluates it only for a row whose key has no group.
+- **Measured (51.9):** per shape 3x to 85x (a WHERE count over 200,000
+  rows 158 -> 36 ms, by cost with an index 156 -> 13, the select list's
+  max 32 -> 10, LATERAL count 1,292 -> 30, LEFT JOIN LATERAL ... GROUP BY
+  1,297 -> 15; per row where it stays: level). TPC-H: no plan changed
+  (q2, q17 and q20 stay per row by cost: their runs cost a fraction of
+  grouping partsupp or lineitem), checksums equal, all 22 1.004 and 1.010
+  of main in two alternated rounds with instructions equal (q22 +0.14%,
+  inlining). q20 analysed (51.7): 230 ms warm, of which the 8,508 runs
+  read 63,832 lineitem rows by primary key (about 100 ms) and pay about
+  4.6 us of setup each (39 ms); the hash would exceed the statement's
+  memory, and a magic set reads the same rows; its gap to PostgreSQL's 133
+  ms is the row fetch and the per-run setup, not the plan.
+- **Gates:** suite 253 of 253 (new: `exec_unnest_agg`, `tds_unnest_agg`
+  with SQL Server 2022's answers, `tns_unnest_agg`); point selects -0.08
+  instructions a select (`LXL_HASH_SEED=1`; a first version's +251 from
+  `bindFrom`'s per-item state removed); `lexdb_exec` 19,737 -> 19,747 lines
+  (glue), `lexdb_plan` 7,204 -> 8,024.
+- **Left:** 51.9's list (q20's per-row cost; a magic set for an inner
+  side with no index; 5d in ON, HAVING, grouped queries and DML; 5e by
+  cost where an index serves the key, and outputs that may fail).
+
 ## 7. Trade-offs and risks
 
 - **Single-row latency.** A pipeline has setup costs that a nested loop does

@@ -492,6 +492,7 @@ pub const RUN_HASHED: int = 2       // correlated, decorrelated (9.9): once, by 
 pub const RUN_SEMI: int = 3         // a semi or anti join's (9.104): once, its rows a level's hash
 pub const RUN_LOOKED: int = 4       // not run: its table is a semi or anti level looked up per row (semiLook)
 pub const RUN_MARK: int = 5         // a mark join's (optimizer 50): once, its rows a level's hash, every outer row marked
+pub const RUN_GROUPED: int = 6      // a grouped level's (optimizer 51): once, grouped by its keys, its rows a level's hash (LEFT joined)
 
 // The subqueries of p's query: its leaf's.
 pub fn pSubs(p: &PPlan): &[]PSub {
@@ -817,6 +818,17 @@ pub type Level = record {
 
 pub const LV_NOTIN: int = 1
 pub const LV_MARK: int = 2
+
+// A grouped level's (optimizer 51): a scalar aggregate's rows by its keys,
+// LEFT joined.
+pub fn grouped(lv: &Level): bool { return lv.src >= 0 && strings.startsWith(&lv.alias, "\x00sg") }
+
+// EXPLAIN's name of level lv: a grouped level's subquery's.
+pub fn levelName(lv: &Level): str {
+    if grouped(lv) { return "subquery " + (lv.src + 1).toStr() }
+    let tn = lexdb_sql.baseName(&lv.t.name)
+    return if lv.alias == tn { tn } else { tn + " " + lv.alias }
+}
 
 // A level of rows held by the run (a subquery's, a working table), not a table's.
 pub fn (lv: &Level) virt(): bool { return lv.src >= 0 || lv.work >= 0 }
@@ -3534,7 +3546,7 @@ fn pushDown(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, wh
     var any = false
     for l in 0..nl {
         let src = q.levels[l].src
-        if src < 0 || src >= len(q.subs) || q.levels[l].lateral || q.levels[l].work >= 0 { continue }
+        if src < 0 || src >= len(q.subs) || q.levels[l].lateral || q.levels[l].work >= 0 || q.subs[src].hashed { continue }
         // not an outer join's nullable side
         if (l > 0 && keepsLeft(q.levels[l].join)) || l < lastRight { continue }
         let view = src >= len(subs)
@@ -3667,11 +3679,12 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     // planning makes none.)
     var semiAlts: []Option[SubPlan] = []
     var semiLooks: []bool = []         // ... may be a lookup per row as a join's level (semiLook)
-    var semis = false
+    var semis = 0                      // 1: semiJoins runs; 2: scalarJoins may
     if len(subs) > 0 {
         for i in 0..len(subs) { append(mut &semiAlts, None) }
         semiLooks = array(len(subs), false)
-        semis = semiAlternatives(st, txn, q, hs, where, params, subs, sc, early, reorder, mut &semiAlts, mut &semiLooks)
+        if semiAlternatives(st, txn, q, hs, where, params, subs, sc, early, reorder, mut &semiAlts, mut &semiLooks) { semis = 1 }
+        if q.corr && (unnestMode & UN_SCALAR) != 0 { semis = semis | 2 }
     }
     let nl = len(q.levels)
     // the columns by name, for levelOf (the planner asks it often: optimizer 30)
@@ -3688,6 +3701,8 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
     if nl >= 2 && !hs.rules && (rewriteMode & RW_OUTER) != 0 && !q.innerOnly() { q.innerJoins(&ms, &cs) }
     // WHERE's conjuncts on a derived table, view or CTE used once: into its query (optimizer 48.3)
     if len(q.subs) > 0 {
+        // a LATERAL subquery made a join: its keys' equalities, its ON (optimizer 51)
+        lateralMs(q, mut &ms)
         if bf.where && !hs.rules && (rewriteMode & RW_PUSH) != 0 { try pushDown(st, txn, q, where, subs, params, sc, mut &cs) }
         for i in 0..len(q.subs) { q.subs[i].view = None }
     }
@@ -3930,7 +3945,11 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         q.levels[k].hashKinds = hkinds
     }
     for i in 0..len(rightLocal) { append(mut &q.levels[1].local, replace(mut &rightLocal[i], Expr.Lit(Val.Null))) }
-    if semis && nl > 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc, hs.rules, (unnestMode & UN_MARK) != 0) }
+    if semis != 0 && nl > 0 {
+        if (semis & 1) != 0 { try semiJoins(st, txn, q, mut &semiAlts, &hs.semiCand, &semiLooks, params, sc, hs.rules, (unnestMode & UN_MARK) != 0) }
+        // correlated scalar aggregates as grouped levels (optimizer 51)
+        if q.corr && (unnestMode & UN_SCALAR) != 0 { try scalarJoins(st, txn, q, params, subs, sc, hs) }
+    }
     return Ok(Unit{})
 }
 
@@ -3961,6 +3980,8 @@ pub type SubPlan = record {
     // clears it). Here, not in FromBound, so a query with no subquery pays
     // nothing for it (a point select: optimizer 48.5).
     pub view: Option[ViewSrc]
+    // a LATERAL subquery made a join and a grouping (optimizer 51, 5e): its keys; [] not
+    pub lat: []LateralKeys
 }
 
 pub type Scope = record {
@@ -4248,8 +4269,10 @@ fn semiParsedNot(x: &Expr): int {
 pub const UN_NOTIN: int = 1     // x NOT IN (subquery) as a null-aware anti join (50.1, 5a)
 pub const UN_MARK: int = 2      // EXISTS / IN under OR, in the select list: a mark join (5b)
 pub const UN_LOOK: int = 4      // semiLook widened: IN by the inner key, a range-keyed path (5c)
+pub const UN_SCALAR: int = 8    // a correlated scalar aggregate as a grouped level, hashed or per row by cost (optimizer 51, 5d)
+pub const UN_LATERAL: int = 16  // a correlated FROM subquery (LATERAL, APPLY) with an aggregate as a join and a grouping (5e)
 
-var unnestMode: int = UN_NOTIN | UN_MARK | UN_LOOK
+var unnestMode: int = UN_NOTIN | UN_MARK | UN_LOOK | UN_SCALAR | UN_LATERAL
 
 pub fn setUnnest(mode: int) { unnestMode = mode }
 
@@ -4745,7 +4768,7 @@ fn twoSet(q: mut &Query, i: int, tk: &TwoKey, lk: mut &Level) {
                   groupKinds: [], ordKinds: [], outKinds: [lexdb_sql.COLL_EXACT], topMode: 0, topN: -1, feedback: [], mr: [], conv: [], ox: [],
                   oxParam: false, lp: lexdb_bind.noPlan(), pipe: None}
     append(mut &q.subs, SubPlan{use: lexdb_sql.SUB_IN, sel: sel, oid: oid, name: "?column?", hashed: false, keyOuter: [], keyText: [], cte: -1,
-                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None})
+                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: []})
     let ax = Expr.Col(lk.alias + "." + lexdb_catalog.ROWID + tk.acol.toStr(), lk.first + tk.acol)
     append(mut &lk.cond, Expr.Call("#in", [Expr.Lit(Val.Int(n)), Expr.Lit(Val.Int(oid)), Expr.Lit(Val.Text("?column?")), ax], false))
     if tk.acol < len(lk.need) { lk.need[tk.acol] = true }
@@ -5604,6 +5627,801 @@ pub fn selMarks(sel: mut &Sel) {
     sel.q.corr = corr
 }
 
+// ---- a correlated scalar aggregate as a grouped level (optimizer 51, 5d):
+// the subquery run once, grouped by its keys "inner = outer" (hashSub's
+// form), its rows a level hashed on the keys and LEFT joined (at most one
+// row a key); the call read from the level's columns, a key with no rows
+// given the aggregates over none (count 0, the others NULL)
+
+// Whether sel (a scalar subquery as planned, or as hashSub hashed it:
+// hashed) is one aggregate row over its tables: no GROUP BY of its own,
+// HAVING, DISTINCT, LIMIT, set operation, window or function in FROM, its
+// one output without a subquery.
+fn scalarShape(sel: &Sel, hashed: bool): bool {
+    if !sel.aggQ || sel.setop != 0 || sel.limit >= 0 || sel.offset > 0 || sel.having.isSome() || sel.distinct || len(sel.wins) > 0 ||
+       len(sel.srf) > 0 || len(sel.mr) > 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 || len(sel.q.levels) == 0 || sel.topMode != 0 ||
+       len(sel.exprs) == 0 { return false }
+    if hashed {
+        if len(sel.groupBy) != len(sel.exprs) - 1 { return false }
+    } else if len(sel.groupBy) > 0 || len(sel.exprs) != 1 {
+        return false
+    }
+    return !hasSubCall(&sel.exprs[len(sel.exprs) - 1])
+}
+
+// Whether subquery i of q may be a grouped level: a correlated scalar
+// aggregate of no CTE, no level's yet.
+fn scalarCand(q: &Query, i: int): bool {
+    if i < 0 || i >= len(q.subs) { return false }
+    let sp = &q.subs[i]
+    return sp.use == lexdb_sql.SUB_SCALAR && len(sp.sel.q.refs) > 0 && sp.cte < 0 && !sp.semi && scalarShape(&sp.sel, sp.hashed)
+}
+
+// Whether a grouped plan's aggregates (alt, planned again to be hashed)
+// cannot fail: their arguments, FILTERs and ORDER BYs (run once over every
+// key's rows, not only those a per-row run reads).
+fn groupSafe(alt: &SubPlan): bool {
+    // (its keys, its tables' conditions and paths: altSafe's; its value's
+    // expression is evaluated per outer row where it can fail, groupLevel)
+    for j in 0..len(alt.sel.exprs) - 1 { if !noFail(&alt.sel.q, &alt.sel.exprs[j]) { return false } }
+    return specsSafe(alt)
+}
+
+// Its tables' conditions and paths, and the aggregates' arguments, FILTERs
+// and ORDER BYs, cannot fail.
+fn specsSafe(alt: &SubPlan): bool {
+    let a = &alt.sel.q
+    for x in a.top { if !noFail(a, &x) { return false } }
+    for lv in a.levels {
+        for x in lv.cond { if !noFail(a, &x) { return false } }
+        for x in lv.post { if !noFail(a, &x) { return false } }
+        for x in lv.local { if !noFail(a, &x) { return false } }
+        for x in lv.path.eqs { if !noFail(a, &x) { return false } }
+        for b in lv.path.rng { if !noFail(a, &b.val) { return false } }
+        for x in lv.hashVals { if !noFail(a, &x) { return false } }
+    }
+    for sp in alt.sel.specs {
+        for x in sp.args { if !noFail(a, &x) { return false } }
+        for x in sp.order { if !noFail(a, &x) { return false } }
+        match sp.filter {
+            Some(f) { if !noFail(a, &f) { return false } }
+            None {}
+        }
+    }
+    return true
+}
+
+// x with each aggregate's slot (#agg(j)) replaced by repl[j].
+fn aggRepl(x: &Expr, repl: &[]Expr): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), aggRepl(&a, repl)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), aggRepl(&a, repl), aggRepl(&b, repl)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(aggRepl(&a, repl), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(aggRepl(&a, repl), t) }
+        Expr.Call(n, args, star) {
+            if n == "#agg" && len(args) == 1 {
+                let j = lexdb_sql.litInt(&args[0])
+                if j >= 0 && j < len(repl) { return lexdb_sql.cloneExpr(&repl[j]) }
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, aggRepl(&a, repl)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// The numbers of x's scalar subquery calls (#sub), each once.
+fn scalarCalls(x: &Expr, out: mut &[]int) {
+    match x {
+        Expr.Unary(_, a) { scalarCalls(&a, out) }
+        Expr.Bin(_, a, b) {
+            scalarCalls(&a, out)
+            scalarCalls(&b, out)
+        }
+        Expr.IsNull(a, _) { scalarCalls(&a, out) }
+        Expr.Cast(a, _) { scalarCalls(&a, out) }
+        Expr.Call(n, args, _) {
+            if n == "#sub" && len(args) > 0 {
+                let i = lexdb_sql.litInt(&args[0])
+                if i >= 0 && !hasIdx(out, i) { append(out, i) }
+            }
+            for a in args { scalarCalls(&a, out) }
+        }
+        else {}
+    }
+}
+
+// A grouped level's rows held, about, per row read (the groups' upper
+// bound: one per inner row), for the statement's memory (a hash may hold
+// at most half of it).
+const GROUP_ROW_BYTES: float = 200.0f
+
+// Subquery i's plan to be hashed (planned again without outer values as
+// keys, section 42's alternative), where taking it may pay: planned only
+// when a hash of the per-row plan's largest table, read whole, could cost
+// less than the runs per row (outer rows reaching it); a planning of its
+// own for each such subquery, so not for q2's, q17's and q20's (their runs
+// cost a fraction of reading the table). None: not planned, or not one to
+// hash (semiAltOk, its shape, groupSafe). Not where reading may stop early,
+// in a transaction whose reads are noted, or in the rules mode.
+fn scalarAlt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, i: int, subs: &[]lexdb_sql.Stmt, params: &[]Val, sc: mut &Scope,
+             hs: &FromHints, outer: float): Result[Option[SubPlan], DbErr] {
+    if hs.early || txn.noting() || hs.rules || outer < 0.0f || i >= len(subs) { return Ok(None) }
+    let sq = &q.subs[i].sel.q
+    var big = -1.0f
+    for lv in sq.levels {
+        if lv.virt() { return Ok(None) }
+        let rows = if lv.est.rows >= 0 { lv.est.rows } else { (try lexdb_stats.loadEst(st, txn, &lv.t, true, hs.rules)).rows }
+        if rows < 0 { return Ok(None) }
+        if float(rows) > big { big = float(rows) }
+    }
+    let run = if len(sq.levels) > 0 { semiRun(&sq.levels[0], big) } else { SEMI_RUN_PK + COST_DESCENT + COST_KEY_ROW }
+    if groupJoin(big, len(sq.levels)) >= outer * run { return Ok(None) }
+    sc.noRefKeys = true
+    let nf = len(sc.names.frames)
+    let again = up().planSub(st, txn, &subs[i], params, sc, false)
+    sc.noRefKeys = false
+    // (a plan that failed may have left its frame: this query's is the top one)
+    while len(sc.names.frames) > nf { let gone = pop(mut &sc.names.frames) }
+    let got = again.ok()
+    if got.isNone() { return Ok(None) }
+    let alt = got.unwrap()
+    if alt.hashed && semiAltOk(&alt, &q.subs[i]) && scalarShape(&alt.sel, true) && groupSafe(&alt) { return Ok(Some(alt)) }
+    return Ok(None)
+}
+
+// A grouped plan's cost over its rows (inner, read once and grouped as a
+// hash is built), its later tables (of n) at least a lookup for each: a
+// join's grouping is not one table's (q2's subquery over partsupp,
+// supplier, nation and region: 800,000 rows, each joined three times).
+fn groupJoin(inner: float, n: int): float { return inner * (COST_SCAN + HASH_BUILD) + inner * COST_KEY_ROW * float(if n > 1 { n - 1 } else { 0 }) }
+
+// Whether subquery i's grouped plan to be hashed (alt) costs less than its
+// run per outer row (outer rows reaching it), and its groups fit: the
+// choice of optimizer 51 (semiCheaper's terms; the groups as the hash).
+fn groupCheaper(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, i: int, alt: mut &SubPlan, outer: float, params: &[]Val,
+                rules: bool, memMax: int): Result[bool, DbErr] {
+    if rules || outer < 0.0f { return Ok(false) }
+    let inner = try semiInner(st, txn, mut &alt.sel.q, params, rules)
+    if inner < 0.0f { return Ok(false) }
+    var cap = HASH_MAX_BYTES
+    if memMax > 0 && float(memMax) / 2.0f < cap { cap = float(memMax) / 2.0f }
+    if inner * GROUP_ROW_BYTES > cap { return Ok(false) }
+    let run = if len(q.subs[i].sel.q.levels) > 0 { semiRun(&q.subs[i].sel.q.levels[0], inner) } else { SEMI_RUN_PK + COST_DESCENT + COST_KEY_ROW }
+    if outer <= 1.0f { return Ok(false) }
+    return Ok(groupJoin(inner, len(alt.sel.q.levels)) + outer * HASH_PROBE < outer * run)
+}
+
+// The grouped level of subquery i of q (hashed: hashSub's form; 9.9's, or
+// its plan to be hashed chosen by cost), and what its call becomes: the
+// level's columns are the keys, then the value (its expression evaluated
+// per group where it cannot fail, or 9.9 evaluated it so already) or the
+// aggregates (the expression then evaluated per outer row, as a per-row run
+// evaluates it). A key with no group: the expression over no rows, also
+// per outer row (so its error, 1/count(*), only where a key has none).
+// None: not one (keys' types a hash would compare otherwise, a key's outer
+// value that may fail, an aggregate whose type is not known here).
+pub type GroupLevel = record { pub lv: Level; pub repl: Expr }
+
+// Whether groupLevel makes subquery i's level (its checks, nothing changed):
+// -1 not; 0 its expression per group; 1 its aggregates, the expression per
+// outer row (split).
+fn groupCheck(q: &Query, i: int, pt: &[]int, safe: bool): int {
+    let sp = &q.subs[i]
+    let nk = len(sp.keyOuter)
+    if !sp.hashed || nk == 0 || len(sp.sel.exprs) != nk + 1 || len(sp.res) > 0 || !scalarShape(&sp.sel, true) { return -1 }
+    let sq = &sp.sel.q
+    var vals: []Expr = []
+    for j in 0..nk {
+        let ov = substRefs(&sp.keyOuter[j], q.base, &sq.refs)
+        let io = exprOid(&sp.sel.exprs[j], &sq.cols, pt)
+        if hasSubCall(&ov) || !semiTypes(io, exprOid(&ov, &q.cols, pt)) { return -1 }
+        append(mut &vals, ov)
+    }
+    if !valsFree(q, &vals) { return -1 }
+    var ac: []Expr = []
+    for j in 0..len(sp.sel.specs) { append(mut &ac, Expr.Col("#a", j)) }
+    let split = !safe && !grpSafe(&aggRepl(&sp.sel.exprs[nk], &ac))
+    for spec in sp.sel.specs {
+        let a = lexdb_agg.newAccs(1)
+        if lexdb_agg.finish(&spec, &a[0]).isErr() { return -1 }
+        // count, sum, avg, min and max: their types as the select list's (exprOid)
+        if split && spec.op != lexdb_agg.OP_COUNT && spec.op != lexdb_agg.OP_SUM && spec.op != lexdb_agg.OP_AVG && spec.op != lexdb_agg.OP_MIN &&
+           spec.op != lexdb_agg.OP_MAX { return -1 }
+    }
+    return if split { 1 } else { 0 }
+}
+
+// (groupCheck's checks passed: it is made)
+fn groupLevel(q: mut &Query, i: int, pt: &[]int, safe: bool): Option[GroupLevel] {
+    let nk = len(q.subs[i].keyOuter)
+    if groupCheck(q, i, pt, safe) < 0 { return None }
+    var vals: []Expr = []
+    var oids: []int = []
+    var names: []str = []
+    {
+        let sp = &q.subs[i]
+        let sq = &sp.sel.q
+        for j in 0..nk {
+            let ov = substRefs(&sp.keyOuter[j], q.base, &sq.refs)
+            let io = exprOid(&sp.sel.exprs[j], &sq.cols, pt)
+            if hasSubCall(&ov) || !semiTypes(io, exprOid(&ov, &q.cols, pt)) { return None }
+            let nm = match sp.sel.exprs[j] {
+                Expr.Col(n, _) { lexdb_bind.colPart(&n) }
+                else { lexdb_sql.exprText(&sp.sel.exprs[j]) }
+            }
+            append(mut &vals, ov)
+            append(mut &oids, io)
+            append(mut &names, nm)
+        }
+    }
+    if !valsFree(q, &vals) { return None }
+    let e = lexdb_sql.cloneExpr(&q.subs[i].sel.exprs[nk])
+    // the expression per group (it cannot fail, or 9.9 runs it so: safe), or
+    // its aggregates, the expression per outer row
+    var ac: []Expr = []
+    for j in 0..len(q.subs[i].sel.specs) { append(mut &ac, Expr.Col("#a", j)) }
+    let split = !safe && !grpSafe(&aggRepl(&e, &ac))
+    var vnames: []str = []
+    var voids: []int = []
+    var empties: []Expr = []
+    {
+        let sp = &q.subs[i]
+        for spec in sp.sel.specs {
+            let a = lexdb_agg.newAccs(1)
+            match lexdb_agg.finish(&spec, &a[0]) {
+                Ok(v) { append(mut &empties, Expr.Lit(v)) }
+                Err(_) { return None }
+            }
+            if split {
+                // count, sum, avg, min and max: their types as the select list's (exprOid)
+                if spec.op != lexdb_agg.OP_COUNT && spec.op != lexdb_agg.OP_SUM && spec.op != lexdb_agg.OP_AVG && spec.op != lexdb_agg.OP_MIN &&
+                   spec.op != lexdb_agg.OP_MAX { return None }
+                append(mut &voids, exprOid(&Expr.Call(spec.fname.toStr(), lexdb_sql.cloneAllExpr(&spec.args), spec.star), &sp.sel.q.cols, pt))
+                append(mut &vnames, spec.fname.toStr())
+            }
+        }
+        if !split {
+            append(mut &voids, sp.oid)
+            append(mut &vnames, sp.name.toStr())
+        }
+    }
+    let alias = "\x00sg" + (i + 1).toStr()
+    var t = noTable()
+    t.name = alias.toStr()
+    let first = len(q.cols)
+    for j in 0..nk {
+        append(mut &t.cols, lexdb_sql.colDef(&names[j], lexdb_sql.oidType(oids[j]), false))
+        var qc = lexdb_sql.colDef(&(alias + "." + lexdb_catalog.ROWID + j.toStr()), lexdb_sql.oidType(oids[j]), false)
+        qc.using = lexdb_sql.USING_HIDDEN
+        addCol(q, qc)
+    }
+    var cols: []Expr = []
+    for j in 0..len(voids) {
+        let pos = nk + j
+        append(mut &t.cols, lexdb_sql.colDef(&vnames[j], lexdb_sql.oidType(voids[j]), false))
+        var qc = lexdb_sql.colDef(&(alias + "." + lexdb_catalog.ROWID + pos.toStr()), lexdb_sql.oidType(voids[j]), false)
+        qc.using = lexdb_sql.USING_HIDDEN
+        addCol(q, qc)
+        append(mut &cols, Expr.Col(q.cols[first + pos].name.clone(), first + pos))
+    }
+    // the value for an outer row: the group's, or over no rows when its key
+    // has none (its first key column NULL: no group matched)
+    let got = if split { aggRepl(&e, &cols) } else { lexdb_sql.cloneExpr(&cols[0]) }
+    let none = aggRepl(&e, &empties)
+    var repl = got
+    var fold = false
+    var folded = Val.Null
+    if !hasParamIn(&none) && lexdb_bind.immutable(&none) {
+        let noVals: []Val = []
+        match up().eval(&none, &noVals) {
+            Ok(v) {
+                fold = true
+                folded = v
+            }
+            Err(_) {}
+        }
+    }
+    // (over no rows NULL: the NULL the LEFT join gives is it, when the
+    // expression gives NULL for NULL aggregates, as one of its columns does)
+    let nullOk = fold && lexdb_ops.isNull(&folded) && (!split || strictOf(&e))
+    if !nullOk {
+        let k0 = Expr.Col(q.cols[first].name.clone(), first)
+        let dflt = if fold { Expr.Lit(folded) } else { none }
+        repl = Expr.Call("case else", [Expr.IsNull(k0, false), dflt, replace(mut &repl, Expr.Lit(Val.Null))], false)
+    }
+    if split {
+        var outs: []Expr = []
+        for j in 0..nk { append(mut &outs, lexdb_sql.cloneExpr(&q.subs[i].sel.exprs[j])) }
+        for j in 0..len(q.subs[i].sel.specs) { append(mut &outs, Expr.Call("#agg", [Expr.Lit(Val.Int(j))], false)) }
+        q.subs[i].sel.exprs = outs
+    }
+    var lv = newLevel(rc(t), &alias, lexdb_sql.J_LEFT, first)
+    lv.src = i
+    lv.perRow = false
+    var hc: []int = []
+    var hk: []int = []
+    for j in 0..nk {
+        append(mut &hc, j)
+        append(mut &hk, lexdb_sql.COLL_EXACT)
+    }
+    lv.hashCols = hc
+    lv.hashVals = vals
+    lv.hashKinds = hk
+    q.subs[i].semi = true
+    narrowSub(mut &q.subs[i].sel)
+    return Some(GroupLevel{lv: lv, repl: repl})
+}
+
+// Whether x has a statement parameter or an outer value.
+fn hasParamIn(x: &Expr): bool {
+    match x {
+        Expr.Param(_) { return true }
+        Expr.Unary(_, a) { return hasParamIn(&a) }
+        Expr.Bin(_, a, b) { return hasParamIn(&a) || hasParamIn(&b) }
+        Expr.IsNull(a, _) { return hasParamIn(&a) }
+        Expr.Cast(a, _) { return hasParamIn(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if hasParamIn(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether x is NULL when any aggregate it reads is (arithmetic, casts and
+// comparisons of them and of constants: the LEFT join's NULLs then give it).
+fn strictOf(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) { return n == "#agg" && len(args) == 1 }
+        Expr.Unary(op, a) { return (op == "-" || op == "not") && strictOf(&a) }
+        Expr.Bin(op, a, b) {
+            if op == "and" || op == "or" || op == "||" { return false }
+            let la = isConstLit(&a)
+            let lb = isConstLit(&b)
+            return (strictOf(&a) && (lb || strictOf(&b))) || (strictOf(&b) && la)
+        }
+        Expr.Cast(a, _) { return strictOf(&a) }
+        else { return false }
+    }
+}
+
+fn isConstLit(x: &Expr): bool {
+    match x {
+        Expr.Lit(v) { return !lexdb_ops.isNull(&v) }
+        Expr.Cast(a, _) { return isConstLit(&a) }
+        else { return false }
+    }
+}
+
+// The grouped levels of q's WHERE (optimizer 51): each conjunct of a
+// level's conditions whose scalar calls may each be one (scalarCand,
+// called nowhere else; 9.9's hashed, or its plan to be hashed where that
+// costs less: groupCheaper) is taken out, its levels placed after its
+// level (a build group's last member), the conjunct with the calls read
+// from them the last one's WHERE conjunct (post). Placed only where no
+// error moves (takeOutOk).
+fn scalarJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, params: &[]Val, subs: &[]lexdb_sql.Stmt, sc: mut &Scope,
+               hs: &FromHints): Result[Unit, DbErr] {
+    let rules = hs.rules
+    let memMax = hs.memMax
+    var alts: []Option[SubPlan] = []
+    for i in 0..len(q.subs) { append(mut &alts, None) }
+    let pt = lexdb_bind.ptypesOf(&sc.names)
+    let nl = len(q.levels)
+    if nl == 0 { return Ok(Unit{}) }
+    var total: []int = []
+    for i in 0..len(q.subs) { append(mut &total, condUses(q, i)) }
+    var cands = false
+    for i in 0..len(q.subs) { if scalarCand(q, i) { cands = true } }
+    if !cands { return Ok(Unit{}) }
+    // the rows reaching a level: the join order's estimates, else (none:
+    // one table's query) its first table's (statistics loaded only then)
+    let est = q.orderRows()
+    var first = -1.0f
+    if len(est) != nl { first = try semiRows(st, txn, mut &q.levels[0], params, rules) }
+    var gEnd: []int = []
+    for k in 0..nl { append(mut &gEnd, k) }
+    for h in 0..nl { for l in h..h + q.levels[h].grp { if l < nl { gEnd[l] = h + q.levels[h].grp } } }
+    var olds = replace(mut &q.levels, [])
+    var placed: [][]Level = []
+    for k in 0..nl { append(mut &placed, []) }
+    var any = false
+    for k in 0..nl {
+        var lv = replace(mut &olds[k], newLevel(rc(noTable()), "", 0, 0))
+        if !isOuter(lv.join) && lv.mode == 0 && len(lv.cond) > 0 {
+            var cs = replace(mut &lv.cond, [])
+            var keep: []Expr = []
+            var taken: []str = []
+            for ci in 0..len(cs) {
+                var nums: []int = []
+                scalarCalls(&cs[ci], mut &nums)
+                var made: []Level = []
+                if len(nums) > 0 {
+                    let c = &cs[ci]
+                    let at = gEnd[k]
+                    let outer = if len(est) == nl { est[at] } else { first }
+                    let ct = lexdb_sql.exprText(c)
+                    var copies = 1
+                    for x in lv.local { if lexdb_sql.exprText(&x) == ct { copies += 1 } }
+                    var exact = false
+                    var ok = takeOutOk(q, &cs, ci, &olds, k, at, mut &exact)
+                    // the conjunct with its calls read as values: nothing per
+                    // row left in it; evaluated on fewer rows (exact), it may
+                    // not fail, nor may an expression then evaluated per row
+                    var stub = lexdb_sql.cloneExpr(c)
+                    for i in nums { stub = markRepl(&stub, i, &Expr.Lit(Val.Null)) }
+                    if hasCorr(&stub) || (exact && !noFail(q, &stub)) { ok = false }
+                    // first which plan each call takes (9.9's hashed, or its
+                    // plan to be hashed where it costs less) and whether its
+                    // level can be made; then the levels
+                    var olds2: []SubPlan = []          // the per-row plans replaced, put back if not taken
+                    var swapped: []int = []
+                    var safes: []bool = []
+                    for i in nums {
+                        if !ok { break }
+                        if !scalarCand(q, i) || total[i] != subUses(c, i) * copies { ok = false; break }
+                        let safe = q.subs[i].hashed
+                        if !safe {
+                            // 9.9 could not hash it (an outer value its path's key)
+                            var took = false
+                            if alts[i].isNone() { alts[i] = try scalarAlt(st, txn, q, i, subs, params, sc, hs, outer) }
+                            if alts[i].isSome() {
+                                var a = replace(mut &alts[i], None).unwrap()
+                                if try groupCheaper(st, txn, q, i, mut &a, outer, params, rules, memMax) {
+                                    append(mut &olds2, replace(mut &q.subs[i], a))
+                                    append(mut &swapped, i)
+                                    took = true
+                                } else {
+                                    alts[i] = Some(a)
+                                }
+                            }
+                            if !took { ok = false; break }
+                        }
+                        let how = groupCheck(q, i, &pt, safe)
+                        if how < 0 || (how == 1 && exact) { ok = false; break }
+                        append(mut &safes, safe)
+                    }
+                    if ok && len(safes) == len(nums) {
+                        var cond = lexdb_sql.cloneExpr(c)
+                        for j in 0..len(nums) {
+                            let GroupLevel{lv: glv, repl: grepl} = groupLevel(q, nums[j], &pt, safes[j]).unwrap()
+                            cond = markRepl(&cond, nums[j], &grepl)
+                            append(mut &made, glv)
+                        }
+                        let n = len(made)
+                        made[n - 1].post = [cond]
+                        for j in 0..n { append(mut &placed[at], replace(mut &made[j], newLevel(rc(noTable()), "", 0, 0))) }
+                        append(mut &taken, ct)
+                        any = true
+                        continue
+                    }
+                    // not taken: the per-row plans back
+                    while len(swapped) > 0 {
+                        let i = pop(mut &swapped)
+                        let back = pop(mut &olds2)
+                        alts[i] = Some(replace(mut &q.subs[i], back))
+                    }
+                }
+                append(mut &keep, replace(mut &cs[ci], Expr.Lit(Val.Null)))
+            }
+            lv.cond = keep
+            if len(taken) > 0 {
+                var ls = replace(mut &lv.local, [])
+                var lkeep: []Expr = []
+                for li in 0..len(ls) {
+                    let lc = replace(mut &ls[li], Expr.Lit(Val.Null))
+                    let lt = lexdb_sql.exprText(&lc)
+                    var drop = false
+                    for g in taken { if g == lt { drop = true } }
+                    if !drop { append(mut &lkeep, lc) }
+                }
+                lv.local = lkeep
+            }
+        }
+        append(mut &q.levels, lv)
+        for j in 0..len(placed[k]) { append(mut &q.levels, replace(mut &placed[k][j], newLevel(rc(noTable()), "", 0, 0))) }
+    }
+    // the select list's (no condition calls them): its plan to be hashed
+    // where it costs less over the query's rows, and only where its value is
+    // made per group without fail (selScalars makes the level; where it
+    // cannot, 9.9's hashed probe reads it, as it would any hashed one)
+    for i in 0..len(q.subs) {
+        if total[i] > 0 || !scalarCand(q, i) || q.subs[i].hashed { continue }
+        let outer = if len(est) == nl { est[nl - 1] } else { first }
+        if alts[i].isNone() { alts[i] = try scalarAlt(st, txn, q, i, subs, params, sc, hs, outer) }
+        if alts[i].isNone() { continue }
+        var a = replace(mut &alts[i], None).unwrap()
+        if try groupCheaper(st, txn, q, i, mut &a, outer, params, rules, memMax) {
+            let back = replace(mut &q.subs[i], a)
+            if groupCheck(q, i, &pt, false) != 0 { alts[i] = Some(replace(mut &q.subs[i], back)) }
+        } else {
+            alts[i] = Some(a)
+        }
+    }
+    if !any { return Ok(Unit{}) }
+    for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } }
+    var corr = false
+    for sp in q.subs { if len(sp.sel.q.refs) > 0 && !sp.semi { corr = true } }
+    q.corr = corr
+    return Ok(Unit{})
+}
+
+// ---- a correlated FROM subquery (LATERAL, CROSS and OUTER APPLY) with an
+// aggregate as a join and a grouping (optimizer 51, 5e): its outer values
+// only in WHERE equalities "inner = outer" (hashSub's keys), the
+// equalities taken out and their inner sides added to its GROUP BY and,
+// hidden, to its columns; run once, its rows joined on them by hash.
+// - With a GROUP BY: a key with no rows has no group, as a run of it has
+//   no row: CROSS or INNER joined, a LEFT JOIN's row kept with NULLs.
+// - Without: one row for every outer row (its aggregates over no rows for a
+//   key with none): LEFT joined, a column whose value over no rows is not
+//   the join's NULL (count's 0) read as that value where the key had no
+//   group (dflt). Only CROSS (APPLY, a comma) or a LEFT or INNER JOIN ON
+//   true: another ON would drop or keep the row by the values.
+// Not where it may stop or order per outer row (LIMIT, a window, a set
+// operation, DISTINCT), nor where anything run once over every key's rows
+// could fail where a run per row would not (its conditions, the
+// aggregates' arguments, its outputs and HAVING over the aggregates).
+// By the rule 9.9 hashes by: not where an outer value is its path's key
+// (an index on it: a run per row reads only its rows).
+pub type LateralKeys = record {
+    pub outer: []Expr               // per key, its outer side in the outer query's terms (the hidden column's equal)
+    pub dflt: []Option[Expr]        // per output column: its value for a key with no group where not NULL
+    pub left: bool                  // LEFT joined (no GROUP BY)
+    pub on: []Expr                  // its keys' equalities, its level's ON conjuncts (lateralOn; planFrom adds them)
+}
+
+// lateralGroup's checks of sel: -1 not; 0 no GROUP BY; 1 GROUP BY.
+fn lateralShape(sel: &Sel, base: int, join: int, onTrue: bool): int {
+    if !sel.aggQ || sel.setop != 0 || sel.limit >= 0 || sel.offset > 0 || sel.distinct || len(sel.wins) > 0 || len(sel.srf) > 0 ||
+       len(sel.mr) > 0 || len(sel.gsets) > 0 || len(sel.locks) > 0 || sel.topMode != 0 || sel.withTies || len(sel.feedback) > 0 ||
+       sel.donKey > 0 || len(sel.q.levels) == 0 || len(sel.exprs) != len(sel.outs) || len(sel.exprs) == 0 { return -1 }
+    let grouped = len(sel.groupBy) > 0
+    let inner = join == lexdb_sql.J_INNER || join == lexdb_sql.J_CROSS
+    if !(inner || join == lexdb_sql.J_LEFT) { return -1 }
+    if !grouped && (sel.having.isSome() || !(join == lexdb_sql.J_CROSS || onTrue)) { return -1 }
+    if !noRefs(&sel.exprs, base) || !noRefs(&sel.order, base) || !noRefs(&sel.groupBy, base) { return -1 }
+    match sel.having {
+        Some(h) { if usesRefs(&h, base) || !grpSafe(&aggRepl(&h, &aggCols(len(sel.specs)))) { return -1 } }
+        None {}
+    }
+    return if grouped { 1 } else { 0 }
+}
+
+// The keys "inner = outer" of sel's conditions, its outer values used in
+// no other way (hashSub's, no residual); None not.
+fn lateralKeys(sel: &Sel, base: int): Option[HashKeys] {
+    var hk = HashKeys{inner: [], outer: [], texts: [], res: []}
+    let q = &sel.q
+    for lv in q.levels {
+        if lv.virt() || lv.lateral { return None }
+        if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return None }
+        if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return None }
+        for b in lv.path.rng { if usesRefs(&b.val, base) { return None } }
+        if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
+        if !keyConjs(&lv.post, base, mut &hk, true, false, &q.cols) { return None }
+        if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
+    }
+    if !keyConjs(&q.top, base, mut &hk, true, false, &q.cols) { return None }
+    if len(hk.inner) == 0 { return None }
+    for x in hk.outer { if hasSubCall(&x) || !lexdb_bind.immutable(&x) { return None } }
+    return Some(hk)
+}
+
+// lateralGroup's, kept on sp (SubPlan.lat): how many hidden key columns
+// it adds after its own; 0 not one.
+pub fn lateralGroup(sp: mut &SubPlan, base: int, join: int, onTrue: bool): int {
+    match lateralGroupOf(sp, base, join, onTrue) {
+        Some(lk) {
+            let n = len(lk.outer)
+            sp.lat = [lk]
+            return n
+        }
+        None { return 0 }
+    }
+}
+
+// Its level's ON conjuncts (lateralOn's) into ms (planFrom: after the ONs
+// are read from the logical plan).
+fn lateralMs(q: &Query, ms: mut &[][]Expr) {
+    for k in 0..len(q.levels) {
+        let src = q.levels[k].src
+        if src < 0 || src >= len(q.subs) || len(q.subs[src].lat) == 0 || k >= len(ms) { continue }
+        for x in q.subs[src].lat[0].on { append(mut &ms[k], lexdb_sql.cloneExpr(&x)) }
+    }
+}
+
+fn lateralGroupOf(sp: mut &SubPlan, base: int, join: int, onTrue: bool): Option[LateralKeys] {
+    if (unnestMode & UN_LATERAL) == 0 || sp.cte >= 0 || len(sp.sel.q.refs) == 0 || sp.hashed { return None }
+    let shape = lateralShape(&sp.sel, base, join, onTrue)
+    if shape < 0 { return None }
+    let grouped = shape == 1
+    // run once over every key's rows: nothing in it may fail
+    if !groupSafeAll(sp) { return None }
+    var hk = match lateralKeys(&sp.sel, base) {
+        Some(h) { h }
+        None { return None }
+    }
+    // the values over no rows: per output, where the LEFT join's NULL is not it
+    var dflt: []Option[Expr] = []
+    if !grouped {
+        var empties: []Expr = []
+        for spec in sp.sel.specs {
+            let a = lexdb_agg.newAccs(1)
+            match lexdb_agg.finish(&spec, &a[0]) {
+                Ok(v) { append(mut &empties, Expr.Lit(v)) }
+                Err(_) { return None }
+            }
+        }
+        for x in sp.sel.exprs {
+            let none = aggRepl(&x, &empties)
+            if hasParamIn(&none) || !lexdb_bind.immutable(&none) { return None }
+            let noVals: []Val = []
+            match up().eval(&none, &noVals) {
+                Ok(v) { append(mut &dflt, if lexdb_ops.isNull(&v) { None } else { Some(Expr.Lit(v)) }) }
+                Err(_) { return None }
+            }
+        }
+    }
+    for k in 0..len(sp.sel.q.levels) {
+        sp.sel.q.levels[k].cond = dropTexts(replace(mut &sp.sel.q.levels[k].cond, []), &hk.texts)
+        sp.sel.q.levels[k].post = dropTexts(replace(mut &sp.sel.q.levels[k].post, []), &hk.texts)
+        sp.sel.q.levels[k].local = dropTexts(replace(mut &sp.sel.q.levels[k].local, []), &hk.texts)
+    }
+    sp.sel.q.top = dropTexts(replace(mut &sp.sel.q.top, []), &hk.texts)
+    var koids: []int = []
+    for x in hk.inner { append(mut &koids, exprOid(&x, &sp.sel.q.cols, &[])) }
+    for xi in 0..len(hk.inner) {
+        let x = &hk.inner[xi]
+        append(mut &sp.sel.groupBy, lexdb_sql.cloneExpr(x))
+        append(mut &sp.sel.groupKinds, lexdb_sql.COLL_EXACT)
+        append(mut &sp.sel.exprs, lexdb_sql.cloneExpr(x))
+        let nm = match x {
+            Expr.Col(n, _) { lexdb_bind.colPart(&n) }
+            else { lexdb_sql.exprText(x) }
+        }
+        append(mut &sp.sel.outs, lexdb_bind.OutCol{name: nm, oid: koids[xi], spell: "", coll: "", scale: -1})
+        if len(sp.sel.outKinds) > 0 { append(mut &sp.sel.outKinds, lexdb_sql.COLL_EXACT) }
+    }
+    if len(sp.sel.ox) > 0 { sp.sel.ox = [] }
+    sp.sel.first = -1
+    sp.sel.order = []
+    sp.sel.sort = false
+    sp.sel.desc = []
+    sp.sel.nullsFirst = []
+    sp.sel.ordKinds = []
+    sp.sel.lp = takeLp(mut &sp.sel)
+    var texts: []str = []
+    var outer: []Expr = []
+    for i in 0..len(hk.inner) {
+        let o = substRefs(&hk.outer[i], base, &sp.sel.q.refs)
+        let it = match hk.inner[i] {
+            Expr.Col(n, _) { n.clone() }
+            else { lexdb_sql.exprText(&hk.inner[i]) }
+        }
+        let r = refOf(&hk.outer[i], base)
+        var on = "an outer expression"
+        if r >= 0 {
+            on = match sp.sel.q.refs[r] {
+                Expr.Col(n, _) { n.clone() }
+                else { "an outer value" }
+            }
+        }
+        append(mut &texts, it + " = " + on)
+        append(mut &outer, o)
+    }
+    sp.hashed = true
+    sp.keyOuter = replace(mut &hk.outer, [])
+    sp.keyText = texts
+    return Some(LateralKeys{outer: outer, dflt: dflt, left: !grouped, on: []})
+}
+
+// Whether a FROM item's ON is "true" (OUTER APPLY's, ON true) or absent.
+pub fn onTrue(on: &Option[Expr]): bool {
+    match on {
+        Some(x) {
+            match x {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Bool(b) { return b }
+                        else { return false }
+                    }
+                }
+                else { return false }
+            }
+        }
+        None { return true }
+    }
+}
+
+// A level's columns (first, n of them; the last ones lk's hidden keys) made
+// lateralGroup's: the keys hidden, each equal to its outer side (its ON's
+// conjuncts, returned); an output whose value over no rows is not NULL read
+// as that value where no group joined (its first key NULL).
+pub fn lateralOn(sp: mut &SubPlan, qcols: mut &[]lexdb_sql.ColDef, first: int, lv: mut &Level, virt: mut &bool) {
+    if sp.lat[0].left { lv.join = lexdb_sql.J_LEFT } else if lv.join == lexdb_sql.J_CROSS { lv.join = lexdb_sql.J_INNER }
+    let n = len(lv.t.cols)
+    let nk = len(sp.lat[0].outer)
+    let k0 = first + n - nk
+    var out: []Expr = []
+    for j in 0..nk {
+        let slot = k0 + j
+        let d = lexdb_bind.dotAt(&qcols[slot].name)
+        let al = if d < 0 { "" } else { qcols[slot].name[0..d].clone() }
+        qcols[slot].name = al + "." + lexdb_catalog.ROWID + "lk" + j.toStr()
+        qcols[slot].using = lexdb_sql.USING_HIDDEN
+        append(mut &out, Expr.Bin("=", Expr.Col(qcols[slot].name.clone(), slot), lexdb_sql.cloneExpr(&sp.lat[0].outer[j])))
+    }
+    for j in 0..len(sp.lat[0].dflt) {
+        match sp.lat[0].dflt[j] {
+            Some(d) {
+                let slot = first + j
+                let own = Expr.Col(qcols[slot].name.clone(), slot)
+                let g = Expr.Call("case else", [Expr.IsNull(Expr.Col(qcols[k0].name.clone(), k0), false), lexdb_sql.cloneExpr(&d), own], false)
+                qcols[slot].genKind = lexdb_sql.GEN_VIRTUAL
+                qcols[slot].gen = Some(g)
+                // (it keeps its name, as a virtual column does)
+                virt = true
+            }
+            None {}
+        }
+    }
+    sp.lat[0].on = out
+}
+
+fn aggCols(n: int): []Expr {
+    var ac: []Expr = []
+    for j in 0..n { append(mut &ac, Expr.Col("#a", j)) }
+    return ac
+}
+
+// groupSafe over every output (a FROM subquery's outputs are all values,
+// each over the aggregates).
+fn groupSafeAll(sp: &SubPlan): bool {
+    let ac = aggCols(len(sp.sel.specs))
+    for x in sp.sel.exprs { if !grpSafe(&aggRepl(&x, &ac)) { return false } }
+    for x in sp.sel.groupBy { if !noFail(&sp.sel.q, &x) { return false } }
+    return specsSafe(sp)
+}
+
+// The select list's and ORDER BY's grouped levels (optimizer 51) of a
+// planned SELECT (bindSel, after selMarks): each correlated scalar
+// aggregate hashed (9.9's, or its plan to be hashed that planFrom chose by
+// cost: scalarJoins) that only they call, a level after the last, its calls
+// read from it. Not in a query that groups or aggregates (its value is then
+// a group's), nor where selMarks' other rules refuse a level.
+pub fn selScalars(sel: mut &Sel) {
+    if (unnestMode & UN_SCALAR) == 0 || len(sel.q.levels) == 0 || sel.aggQ || len(sel.groupBy) > 0 || len(sel.wins) > 0 || sel.setop != 0 ||
+       sel.donKey > 0 || len(sel.locks) > 0 || len(sel.srf) > 0 || len(sel.mr) > 0 || sel.topMode != 0 || sel.withTies ||
+       len(sel.feedback) > 0 || sel.first >= 0 || sel.having.isSome() || len(sel.gsets) > 0 || sel.rec >= 0 { return }
+    var nums: []int = []
+    for x in sel.exprs { scalarCalls(&x, mut &nums) }
+    for x in sel.order { scalarCalls(&x, mut &nums) }
+    if len(nums) == 0 { return }
+    let pt: []int = []
+    var any = false
+    for i in nums {
+        if !scalarCand(&sel.q, i) || !sel.q.subs[i].hashed || condUses(&sel.q, i) > 0 { continue }
+        if groupCheck(&sel.q, i, &pt, true) != 0 { continue }
+        if !any {
+            // (the logical plan keeps the list as resolved)
+            sel.lp = takeLp(sel)
+            any = true
+        }
+        let GroupLevel{lv: glv, repl: grepl} = groupLevel(mut &sel.q, i, &pt, true).unwrap()
+        append(mut &sel.q.levels, glv)
+        for j in 0..len(sel.exprs) { sel.exprs[j] = markRepl(&sel.exprs[j], i, &grepl) }
+        for j in 0..len(sel.order) { sel.order[j] = markRepl(&sel.order[j], i, &grepl) }
+    }
+    if !any { return }
+    for j in 0..len(sel.q.cols) { if !sel.q.colAt.has(&sel.q.cols[j].name) { sel.q.colAt.put(sel.q.cols[j].name.toStr(), j) } }
+    var corr = false
+    for sp in sel.q.subs { if len(sp.sel.q.refs) > 0 && !sp.semi { corr = true } }
+    sel.q.corr = corr
+}
+
 // The semi-joins of q (planned to its last level): each conjunct that is
 // one taken from its level's conditions, its level placed after it.
 // alts: per candidate subquery, its plan to be hashed (buildQuery).
@@ -5927,9 +6745,10 @@ pub fn subsOf(q: &Query): []PSub {
             for lv in q.levels {
                 if lv.semi && lv.src == i && lv.anti { anti = true }
                 if lv.src == i && lv.mode == LV_MARK { run = RUN_MARK }
+                if lv.src == i && grouped(lv) { run = RUN_GROUPED }
             }
         } else if sp.hashed {
-            run = RUN_HASHED
+            run = if sp.use == lexdb_sql.SUB_FROM { RUN_GROUPED } else { RUN_HASHED }
         } else if len(sp.sel.q.refs) == 0 {
             run = RUN_ONCE
         }
@@ -6632,6 +7451,7 @@ pub fn semiWord(lv: &Level): str {
 // RUN_MARK; use its lexdb_sql.SUB_*): NOT IN's anti join is null-aware.
 pub fn runWord(ps: &PSub, use: int): str {
     if ps.run == RUN_MARK { return "mark join" }
+    if ps.run == RUN_GROUPED { return "grouped" }
     if ps.anti && use == lexdb_sql.SUB_IN { return "anti join (null-aware)" }
     return if ps.anti { "anti join" } else { "semi join" }
 }

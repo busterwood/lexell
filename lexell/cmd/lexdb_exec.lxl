@@ -1364,9 +1364,12 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             if lateral && lexdb_plan.keepsRight(f.join) {
                 return Err(e("42P10", "a LATERAL subquery cannot be the right side of a RIGHT or FULL JOIN"))
             }
+            // with an aggregate, a join and a grouping where it may be (optimizer 51, 5e): its keys hidden columns after its own
+            let nHid = if lateral { lexdb_plan.lateralGroup(mut &sp, sc.names.base, f.join, lexdb_plan.onTrue(&f.on)) } else { 0 }
+            if nHid > 0 { lateral = false }
             let fcols = fromCols(&sp.sel)
-            if len(f.cols) > len(fcols) {
-                return Err(e("42P10", &("table \"" + f.alias + "\" has " + len(fcols).toStr() + " columns available but " +
+            if len(f.cols) > len(fcols) - nHid {
+                return Err(e("42P10", &("table \"" + f.alias + "\" has " + (len(fcols) - nHid).toStr() + " columns available but " +
                              len(f.cols).toStr() + " columns specified")))
             }
             for i in 0..len(fcols) {
@@ -1509,6 +1512,11 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             for k in 0..len(tcols) { try lexdb_gen.setQueryGen(&tcols, k, &f.alias, mut &q.cols, first + k, mut &sc.names) }
         }
         if len(subs) > 0 {
+            // a LATERAL subquery made a join (optimizer 51): its keys hidden, equal to their outer sides (planFrom adds them to its ON)
+            if f.sub >= 0 && len(planned[f.sub]) > 0 && len(planned[f.sub][0].lat) > 0 {
+                let at = len(q.levels) - 1
+                lexdb_plan.lateralOn(mut &planned[f.sub][0], mut &q.cols, first, mut &q.levels[at], mut &sc.names.virt)
+            }
             // only its subqueries look here
             for i in first..len(q.cols) {
                 var fc = lexdb_sql.colDef(&q.cols[i].name, q.cols[i].typ, q.cols[i].notNull)
@@ -1602,7 +1610,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         append(mut &sc.names.frames[top].subColls, if len(sp.sel.outs) > 0 && lexdb_bind.isTextOid(sp.sel.outs[0].oid) { sp.sel.outs[0].coll.clone() } else { "" })
         append(mut &sc.names.frames[top].subKinds, lexdb_sql.COLL_EXACT)
         append(mut &sc.names.frames[top].subReads, 0)
-        if len(sp.sel.q.refs) > 0 { q.corr = true }
+        if len(sp.sel.q.refs) > 0 && !(sp.use == lexdb_sql.SUB_FROM && sp.hashed) { q.corr = true }
         append(mut &q.subs, sp)
     }
     // the views' plans, numbered after the statement's subqueries
@@ -2599,7 +2607,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: []}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -3020,7 +3028,10 @@ fn cxsOf(q: &Query, xs: &[]Expr, params: &[]Val): []Option[lexdb_bind.BX] {
 // again per run (a correlated subquery's 8,508 runs in q20).
 fn bindSel(sel: mut &Sel) {
     // the select list's EXISTS and IN as mark joins (optimizer 50)
-    if len(sel.q.subs) > 0 { lexdb_plan.selMarks(sel) }
+    if len(sel.q.subs) > 0 {
+        lexdb_plan.selMarks(sel)
+        lexdb_plan.selScalars(sel)
+    }
     bindQuery(mut &sel.q)
     let none: []Val = []
     var ox: []Option[lexdb_bind.BX] = []
@@ -3262,7 +3273,7 @@ fn subLines(q: &Query, subs: &[]lexdb_plan.PSub, stats: &[]SubStat, out: mut &[]
             append(out, head + (if ps.anti { "anti join" } else { "semi join" }) + ", looked up per row by the join")
             continue
         }
-        let semi = ps.run == lexdb_plan.RUN_SEMI || ps.run == lexdb_plan.RUN_MARK
+        let semi = ps.run == lexdb_plan.RUN_SEMI || ps.run == lexdb_plan.RUN_MARK || ps.run == lexdb_plan.RUN_GROUPED
         if semi {
             head = head + lexdb_plan.runWord(ps, sp.use) + (if sp.hashed { " on " + strings.join(&sp.keyText, ", ") } else { "" })
             if len(sp.resText) > 0 { head = head + ", filter " + strings.join(&sp.resText, " and ") }
@@ -3348,8 +3359,7 @@ fn explainLines(q: &Query, cnt: &[]lexdb_pipe.Counts): []str {
             append(mut &out, gl + tail)
             continue
         }
-        let tn = lexdb_sql.baseName(&lv.t.name)
-        let name = if lv.alias == tn { tn } else { tn + " " + lv.alias }
+        let name = lexdb_plan.levelName(lv)
         if k == 0 {
             append(mut &out, "scan " + name + ": " + lexdb_plan.pathTextAt(q, k) + tail)
             continue
