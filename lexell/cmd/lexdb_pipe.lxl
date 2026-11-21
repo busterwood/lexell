@@ -7787,22 +7787,13 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
 }
 
 // compileLevels for a write's rows (Q8 R5, design/lexdb-layers.md
-// 6.3.Q8 R5): a join tree (compileLevels), or one table's Filter? (Scan):
-// a point of its whole primary key (point: lexdb_plan.pointRead; run
-// PR_POINT, read by pointRows), else its first arm alone, run by
-// runLevels. Err(p): neither.
-pub fn compileRows(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, point: bool): Result[Prog, lexdb_plan.PPlan] {
+// 6.3.Q8 R5): a join tree (compileLevels), or one table's Filter? (Scan),
+// its first arm alone, run by runLevels (its batches, or row by row: an
+// IN list, a point the light program does not take). Err(p): neither.
+pub fn compileRows(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
     match p {
         lexdb_plan.PPlan.Join(_, _) { return compileLevels(p, cols) }
         else {}
-    }
-    if point {
-        match lexdb_plan.pLeaf(&p) {
-            lexdb_plan.PPlan.Scan(sc, subs) {
-                if !sc.batch && sc.held < 0 && joinRuns1(&sc, &subs, cols) { return Ok(Prog{plan: p, ops: 1, groups: false, joins: false, sorts: false, run: lexdb_plan.PR_POINT}) }
-            }
-            else {}
-        }
     }
     var avail: []bool = array(len(cols), false)
     if joinOps(&p, cols, mut &avail) < 0 {
@@ -7812,40 +7803,33 @@ pub fn compileRows(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, point: bool):
     return Ok(Prog{plan: p, ops: 2, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
 }
 
-// compileRows' point for a table read whole by a query without
-// subqueries (lexdb_exec.levelsProgIn: UPDATE or DELETE by key, the OLTP
-// write): Filter? (Scan) of its conditions cs, its scan without the batch
-// arm's kinds and need, which pointRows does not read (their planning was
-// a third of a point UPDATE's added instructions).
-pub fn pointProg(first: int, cs: []BX): Prog {
-    let sc = lexdb_plan.PScan{level: 0, first: first, kinds: [], need: [], part: false, batch: false, stops: false, sorted: false, held: -1}
+// A write's point of its whole primary key (lexdb_exec.levelsProgIn:
+// UPDATE or DELETE by key, the OLTP write): a Scan at the query's first
+// column of the table's columns need (none: the row read whole), run
+// PR_POINT by pointRows, without the batch arm's kinds, which pointRows
+// does not read (their planning was a third of a point UPDATE's added
+// instructions). Its conditions are bound once, by the run's prepare (the
+// row engine's binding: lexdb_exec.writePrep), and given to pointRows.
+// Not with subqueries (the row engine's binding does not bind them).
+pub fn pointProg(first: int, need: []bool): Prog {
+    let part = len(need) > 0
+    let sc = lexdb_plan.PScan{level: 0, first: first, kinds: [], need: need, part: part, batch: false, stops: false, sorted: false, held: -1}
     let none: []lexdb_plan.PSub = []
-    return Prog{plan: lexdb_plan.filterOver(sc, cs, none), ops: 1, groups: false, joins: false, sorts: false, run: lexdb_plan.PR_POINT}
+    return Prog{plan: lexdb_plan.PPlan.Scan(sc, none), ops: 1, groups: false, joins: false, sorts: false, run: lexdb_plan.PR_POINT}
 }
 
-// Runs a write's point program (pointProg or compileRows, PR_POINT:
-// Filter? (Scan) of one key) over the key's scan s (one point, or none):
-// the row read and its conditions as a join over a point reads its first
-// table's (pointGet), the row (the query's columns) to each; counted as
-// the row engine counts it (runLevel, tryRow).
-pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+// Runs a write's point program (pointProg) over the key's scan s (one
+// point, or none), its conditions conds (each bound): the row read and its
+// conditions as a join over a point reads its first table's (pointGet),
+// the row (the query's columns) to each; counted as the row engine counts
+// it (runLevel, tryRow).
+pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, conds: &[]Option[BX], cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
                  s: &lexdb_access.Scan, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts,
                  each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
     runs += 1
     writePoints += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
-    let noX: []BX = []
-    let conds = match pg.plan {
-        lexdb_plan.PPlan.Filter(_, cs) { &cs }
-        else { &noX }
-    }
     let sc0 = match pg.plan {
-        lexdb_plan.PPlan.Filter(i, _) {
-            match i {
-                lexdb_plan.PPlan.Scan(s1, _) { &s1 }
-                else { return Err(e("XX000", "a write's point program without its scan")) }
-            }
-        }
         lexdb_plan.PPlan.Scan(s1, _) { &s1 }
         else { return Err(e("XX000", "a write's point program without its scan")) }
     }
@@ -7861,7 +7845,7 @@ pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
 // its first table's (pointJProj: getRow, as fetch reads one), its values
 // moved into row, counted read; its conditions in order by the scalar
 // evaluator, counted kept. false: no row, or a condition not true.
-fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, sc0: &lexdb_plan.PScan, conds: &[]BX, s: &lexdb_access.Scan,
+fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, sc0: &lexdb_plan.PScan, conds: &[]Option[BX], s: &lexdb_access.Scan,
             cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, row: mut &[]Val): Result[bool, DbErr] {
     let all: []bool = []
     var r = match try lexdb_access.getRow(st, txn, rel, &lexdb_access.rowRead(rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
@@ -7872,7 +7856,12 @@ fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_acces
     for i in 0..len(r) { row[sc0.first + i] = replace(mut &r[i], Val.Null) }
     cnt[0].read += 1
     let noAggs: []Val = []
-    for c in conds { if lexdb_ops.truth(&(try bxEval(&c, row, &noAggs, cx))) != Some(true) { return Ok(false) } }
+    for c in conds {
+        match c {
+            Some(b) { if lexdb_ops.truth(&(try bxEval(&b, row, &noAggs, cx))) != Some(true) { return Ok(false) } }
+            None { return Err(e("XX000", "a write's point condition not bound")) }
+        }
+    }
     cnt[0].joined += 1
     return Ok(true)
 }

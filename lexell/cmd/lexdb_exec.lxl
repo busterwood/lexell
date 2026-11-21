@@ -2207,14 +2207,22 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
 }
 
 // A write's row read by its whole primary key (Q8 R5, design/lexdb-layers.md
-// 6.3.Q8 R5; its program PR_POINT, lexdb_pipe.pointProg or compileRows): the key's
-// scan (pathScan; a batched write's next batch from the key after the
-// last batch's), the row and its conditions by the pipeline
-// (lexdb_pipe.pointRows), in the run's context (prepare's: the
-// parameters; with subqueries their values copied).
+// 6.3.Q8 R5; its program PR_POINT, lexdb_pipe.pointProg): the key's scan
+// (pathScan; a batched write's next batch from the key after the last
+// batch's), the row and its conditions (prepare's binding, Mats.cc, in
+// its context Mats.ce, as the row engine evaluates them) by the pipeline
+// (lexdb_pipe.pointRows); a condition that did not bind: the row engine's.
 fn writePoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, pg: &lexdb_plan.Prog,
               emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
     let lv = &q.levels[0]
+    let cs = &m.cc[0]
+    for c in cs {
+        if c.isNone() {
+            // census: lexdb_census.note("dml", "a write's point: a condition that does not bind")
+            var row: []Val = array(len(q.cols), Val.Null)
+            return runRows(st, txn, q, m, params, mut &row, emit, rs)
+        }
+    }
     let noAggs: []Val = []
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let sqe = seqEnv(st, txn)
@@ -2225,14 +2233,7 @@ fn writePoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         sc = if len(ss) > 0 { pop(mut &ss) } else { lexdb_access.noScan() }
     }
     var cnt: []lexdb_pipe.Counts = []
-    if len(m.subs) == 0 {
-        try lexdb_pipe.pointRows(st, txn, pg, &q.cols, &lv.t, &sc, &m.ce, mut &rs.bud, mut &cnt, emit)
-    } else {
-        var cx = cenvOf(&sqe)
-        cx.params = collections.copyOf(params)
-        for i in 0..len(m.subs) { append(mut &cx.subs, lexdb_pipe.copySub(&m.subs[i].v)) }
-        try lexdb_pipe.pointRows(st, txn, pg, &q.cols, &lv.t, &sc, &cx, mut &rs.bud, mut &cnt, emit)
-    }
+    try lexdb_pipe.pointRows(st, txn, pg, cs, &q.cols, &lv.t, &sc, &m.ce, mut &rs.bud, mut &cnt, emit)
     scanCounts(rs, &cnt)
     return Ok(Unit{})
 }
@@ -8563,6 +8564,13 @@ fn levelsProgIn(q: mut &Query, held: bool) {
         // census: lexdb_census.no("joins: first level: " + lexdb_plan.levelWhy(q, &q.levels[0]))
         return
     }
+    // (a write's point, Q8 R5: no batch arm to plan; its conditions bound by
+    // prepare, writePrep)
+    // (with subqueries: the first arm's program, whose conditions bind them, planX)
+    if len(q.levels) == 1 && len(q.subs) == 0 && lexdb_plan.pointRead(&q.levels[0]) {
+        q.jp = Some(lexdb_pipe.pointProg(q.levels[0].first, collections.copyOf(&q.levels[0].need)))
+        return
+    }
     var cs: []BX = []
     for x in q.levels[0].cond {
         match lexdb_plan.planX(&x, q) {
@@ -8573,17 +8581,12 @@ fn levelsProgIn(q: mut &Query, held: bool) {
             }
         }
     }
-    // (a write's point, Q8 R5: no batch arm to plan)
-    if len(q.levels) == 1 && len(q.subs) == 0 && len(q.levels[0].need) == 0 && lexdb_plan.pointRead(&q.levels[0]) {
-        q.jp = Some(lexdb_pipe.pointProg(q.levels[0].first, cs))
-        return
-    }
     let base = lexdb_plan.filterOver(lexdb_plan.scanArm(q, false), cs, lexdb_plan.subsOf(q))
     let joined = lexdb_plan.joinsOver(q, base)
     match move(joined) {
         Ok(p) {
             // (one table: a write's, Q8 R5)
-            match if len(q.levels) > 1 { lexdb_pipe.compileLevels(p, &q.cols) } else { lexdb_pipe.compileRows(p, &q.cols, lexdb_plan.pointRead(&q.levels[0])) } {
+            match if len(q.levels) > 1 { lexdb_pipe.compileLevels(p, &q.cols) } else { lexdb_pipe.compileRows(p, &q.cols) } {
                 Ok(pg) { q.jp = Some(pg) }
                 Err(_) {}
             }
@@ -8594,8 +8597,8 @@ fn levelsProgIn(q: mut &Query, held: bool) {
 
 // A write's rows found by a pipeline program (Q8 R5, design/lexdb-layers.md
 // 6.3.Q8 R5): its levels program (Query.jp) of its joins, or of its one
-// table (lexdb_pipe.compileRows: read in batches, or a point of its whole
-// primary key, which runQuery reads by writePoint); held: its first level
+// table (lexdb_pipe.compileRows: its first arm; a point of its whole
+// primary key lexdb_pipe.pointProg, which runQuery reads by writePoint); held: its first level
 // may be rows the run holds (MERGE's source). The rows go to the write,
 // which holds them all before it changes any (no row is found again).
 fn writeProg(q: mut &Query, held: bool) {
@@ -8605,10 +8608,16 @@ fn writeProg(q: mut &Query, held: bool) {
 }
 
 // prepare for a write's run: its levels' conditions bound for the row
-// engine only where it finds the rows (a program holds its own; runQuery
-// binds them when the program gives way).
+// engine where it finds the rows, and for a point (pointProg, whose
+// conditions are prepare's, Mats.cc, as the row engine's); a program of
+// a table's arm or joins holds its own (runQuery binds them when it gives
+// way).
 fn writePrep(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val, rs: mut &Run): Result[Mats, DbErr] {
-    return prepareIn(st, txn, q, params, rs, !(rs.batch && q.jp.isSome()), true)
+    let own = match q.jp {
+        Some(pg) { pg.run != lexdb_plan.PR_POINT }
+        None { false }
+    }
+    return prepareIn(st, txn, q, params, rs, !(rs.batch && own), true)
 }
 
 fn pipeSelMain(sel: mut &Sel) {
