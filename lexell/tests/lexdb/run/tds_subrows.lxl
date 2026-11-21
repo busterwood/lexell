@@ -1,0 +1,155 @@
+// lexdb over TDS: every SELECT's rows offered to the pipeline (Q8's R1, design/lexdb-layers.md 6.3.Q8 R1) through the T-SQL
+// door, checked against SQL Server 2022 (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's
+// answers: the expect lines). Subqueries' own rows in WHERE (IN, NOT IN, EXISTS, a scalar, ALL, an error in the third batch
+// of the subquery's 3,000 rows), in the select list (correlated, TOP 1 ... ORDER BY), in FROM; a write's subqueries (UPDATE's
+// SET and WHERE, DELETE's WHERE, MERGE's source); INSERT ... SELECT with a join, an aggregate, NULLs, a target with a default, a
+// computed column, CHECK, NOT NULL and UNIQUE (their errors), an error in a late batch (8134); SELECT ... INTO; INSERT VALUES
+// with a subquery (and a subquery giving two rows: 512). Against lexdb each batch runs with SET lexdb_batch = off (the row engine) and on: "same" and the answer, or
+// DIFFERENT and both. A write ("W write ;; check") runs in a transaction rolled back, its check after it.
+// expect: same: n: 165
+// expect: same: n: 1996
+// expect: same: id: 
+// expect: same: id,w: 1|'k1';2|'k2';3|'k3';4|'k4';5|'k5';6|'k6';7|'k7';8|'k8';9|'k9';10|'k10'
+// expect: same: id: 1;2;3;4;5;6;7;8;9;10;11;12;14;15;16;17;18;19;20;21;22;23;24;25;27;28;29;30;31;32;33;34;35;36;37;38;50;51;53;54;55;56;57;58;59;60;61;62;63;64;66;67;68;69;70;71;72;73;74;75;76;77;79;80;81;82;83;84;85;86;87;88;89;100;101;102;103;105;106;107;108;109;110;111;112;113;114;115;116;118;119;120;121;122;123;124;125;126;127;128;129;131;132;133;134;135;136;137;138;139;150;151;152;153;154;155;157;158;159;160;161;162;163;164;165;166;167;168;170;171;172;173;174;175;176;177;178;179;180;181;183;184;185;186;187;188;189
+// expect: same: error 8134
+// expect: same: id,m: 1|47;2|54;3|41;4|48;5|55;6|42;7|40;8|47;9|54;10|41;11|48;12|55;13|42;14|40;15|47;16|54;17|41;18|48;19|55;20|42;21|40;22|47;23|54;24|41;25|48;26|55;27|42;28|40;29|47
+// expect: same: id: 42;45;48;49
+// expect: same: k,n: 0|4;1|6;2|7;3|8;4|8;5|9;6|7;7|9;8|8;9|8;10|6;11|7;12|8;13|8;14|9;15|7;16|9;17|8;18|8;19|6;20|4;21|7;22|7;23|6;24|7;25|8;26|7;27|8;28|6;29|8;30|7;31|7;32|6;33|7;34|8;35|7;36|8;37|6;38|8;39|7
+// expect: same: error 512
+// expect: same: (299) // s,c: 75072|2793
+// expect: same: (111) // n: 2889
+// expect: same: (2104) // n: 2104
+// expect: same: (7) // g,n: 0|396;1|396;2|396;3|396;4|396;5|395;6|395
+// expect: same: error 515 // n: 0
+// expect: same: (7) // id,a,b,c,d: 0|7|'g0'|NULL|14;1|7|'g1'|NULL|14;2|7|'g2'|NULL|14;3|7|'g3'|NULL|14;4|7|'g4'|NULL|14;5|7|'g5'|NULL|14;6|7|'g6'|NULL|14
+// expect: same: error 8134 // n: 0
+// expect: same: error 2627 // n: 0
+// expect: same: error 547 // n: 0
+// expect: same: (7) // g,n: 0|396;1|396;2|396;3|396;4|396;5|395;6|395
+// expect: same: (2) // id,v: 1|59;2|NULL
+// expect: same: error 512 // n: 0
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nCREATE TABLE a (id int PRIMARY KEY, g int, x int NULL, s varchar(10) NULL)\nINSERT INTO a SELECT n, n % 7, CASE WHEN n % 13 = 0 THEN NULL ELSE n % 50 END, CASE WHEN n % 11 = 0 THEN NULL ELSE 'k' + CAST(n % 20 AS varchar(5)) END FROM (SELECT p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r CROSS JOIN dg w) t WHERE n <= 3000\nCREATE TABLE b (id int PRIMARY KEY, k int, v int NULL, w varchar(10))\nINSERT INTO b SELECT n, n % 40, CASE WHEN n % 9 = 0 THEN NULL ELSE (n * 7) % 60 END, 'k' + CAST(n % 25 AS varchar(5)) FROM (SELECT p.i + q.i * 10 + r.i * 100 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r) t WHERE n <= 500\nCREATE INDEX bk ON b (k)\nCREATE TABLE e (id int PRIMARY KEY, v int NULL)\nCREATE TABLE cnt (g int PRIMARY KEY, n int)\nINSERT INTO cnt VALUES (0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)\nCREATE TABLE dst (id int PRIMARY KEY, a int NULL DEFAULT 7, b varchar(20) NOT NULL UNIQUE, c int NULL CHECK (c >= 0), d AS (a * 2))"
+
+const QS = "SELECT COUNT(*) AS n FROM a WHERE x IN (SELECT v FROM b WHERE b.k = 3)\nSELECT COUNT(*) AS n FROM a WHERE x NOT IN (SELECT v FROM b WHERE b.k < 5 AND v IS NOT NULL)\nSELECT id FROM a WHERE id < 300 AND x = (SELECT MAX(v) FROM b) ORDER BY id\nSELECT TOP 10 id, (SELECT w FROM b WHERE b.id = a.id) AS w FROM a ORDER BY id\nSELECT id FROM a WHERE id < 200 AND EXISTS (SELECT 1 FROM b WHERE b.k = a.x AND b.v > 30) ORDER BY id\nSELECT COUNT(*) AS n FROM a WHERE x IN (SELECT 100 / (id - 2500) FROM a)\nSELECT id, (SELECT TOP 1 v FROM b WHERE b.k = a.g ORDER BY v DESC) AS m FROM a WHERE id < 30 ORDER BY id\nSELECT id FROM a WHERE id < 50 AND x > ALL (SELECT v FROM b WHERE b.k = a.g AND v IS NOT NULL) ORDER BY id\nSELECT d.k, COUNT(*) AS n FROM (SELECT k, v FROM b WHERE v > 20) d GROUP BY d.k ORDER BY d.k\nSELECT id, (SELECT v FROM b WHERE b.k = a.g) AS v FROM a WHERE id < 3 ORDER BY id\nW UPDATE a SET x = (SELECT MAX(v) FROM b WHERE b.k = a.g) WHERE id < 300 ;; SELECT SUM(x) AS s, COUNT(x) AS c FROM a\nW DELETE FROM a WHERE id < 2000 AND x IN (SELECT v FROM b WHERE b.k = 7) ;; SELECT COUNT(*) AS n FROM a\nW UPDATE a SET s = 'z' WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.x AND b.v > 40) ;; SELECT COUNT(*) AS n FROM a WHERE s = 'z'\nW MERGE cnt AS c USING (SELECT g, COUNT(*) AS n FROM a WHERE x IN (SELECT v FROM b) GROUP BY g) AS src ON c.g = src.g WHEN MATCHED THEN UPDATE SET n = src.n; ;; SELECT g, n FROM cnt ORDER BY g\nW INSERT INTO dst (id, a, b, c) SELECT a.id, b.v, a.s + '-' + CAST(a.id AS varchar(10)), a.g FROM a JOIN b ON b.id = a.id WHERE a.id < 400 ;; SELECT COUNT(*) AS n FROM dst\nW INSERT INTO dst (id, b) SELECT g, 'g' + CAST(g AS varchar(5)) FROM a GROUP BY g ;; SELECT id, a, b, c, d FROM dst ORDER BY id\nW INSERT INTO dst (id, a, b) SELECT id, 100 / (id - 2500), 'e' + CAST(id AS varchar(10)) FROM a ;; SELECT COUNT(*) AS n FROM dst\nW INSERT INTO dst (id, b) SELECT a.id, 'k' + CAST(a.id % 50 AS varchar(10)) FROM a JOIN b ON b.id = a.id WHERE a.id < 300 ;; SELECT COUNT(*) AS n FROM dst\nW INSERT INTO dst (id, b, c) SELECT id, 'c' + CAST(id AS varchar(10)), g - 3 FROM a WHERE id < 30 ;; SELECT COUNT(*) AS n FROM dst\nW SELECT g, COUNT(*) AS n INTO ct FROM a WHERE x IN (SELECT v FROM b) GROUP BY g ;; SELECT g, n FROM ct ORDER BY g\nW INSERT INTO e VALUES (1, (SELECT MAX(v) FROM b)), (2, (SELECT v FROM b WHERE id = 9)) ;; SELECT id, v FROM e ORDER BY id\nW INSERT INTO e VALUES (3, (SELECT v FROM b WHERE k = 1)) ;; SELECT COUNT(*) AS n FROM e"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A query, or a write ("W write ;; check") in a transaction rolled back, the check after the write (after the rollback when
+// the write failed).
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+// local: lexdb, each batch with the row engine and with batches
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                if !local {
+                    println("same: " + answer(mut &c, &q))
+                    continue
+                }
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = answer(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(47), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
