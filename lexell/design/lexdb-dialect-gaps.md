@@ -676,3 +676,57 @@ lines of `oracle_computed_queries.txt`) are by hand, from the documentation: no 
 tables of `mssql_computed_queries.txt`) were first written by hand and were regenerated against SQL Server 2022
 (`gen_mssql.py computed`, 2026-11-20): all 121 answers equal the hand-written ones, no difference.
 
+
+## 9. Oracle answers checked against Oracle Free (ora, 2026-11-21; paused, hand-over)
+
+Several `tns_*` tests had answers written by hand from the documentation or from lexdb's own output ("no Oracle was at
+hand"). They are now run against the real server: Oracle Database Free 23.26.3 (`gvenzl/oracle-free:slim`).
+
+**The server.** Podman container `lxl-oracle` (127.0.0.1:1521, service FREEPDB1), left running. After a reboot:
+`lexell/tools/oracle_container.sh start` (it waits for "DATABASE IS READY TO USE"); `create` makes it from scratch (its
+`tls` step needs the `full` image and was not run). The accounts are in `~/.obo-oracle-dsn` (APP) and
+`~/.obo-oracle-dsn.system` (SYSTEM), mode 600; `oracle_container.sh grants` gives APP the V$ and DBA_TABLES reads the
+catalog test uses. python-oracledb (thin mode) is in the venv `~/.venvs/oracle`.
+
+**Running it.** `~/.venvs/oracle/bin/python lexell/tests/lexdb/gen_oracle.py --check [TEST ...]` runs the statements of
+each test on the server (an emptied schema for each) and prints every answer that differs from the test's `// expect:`
+line. It writes nothing. Covered: `tns_catalog, computed, ddl, funcs, merge, oracle, percentile` (the helper calls
+`x/q/qb/t/u`), `tns_unnest, unnest_agg, subrows` (their SETUP and query constants), `tns_privs, routinepriv` (accounts
+u1-u3, created and dropped by the script), `tns_routine`. Differences listed in `oracle_known_diffs.txt` print as `known`
+with their reason; only new ones count (the exit status). Numbers compare by value (lib/oracle shows NUMBER(10,2) with
+its scale, the wire has none; 37 against 40 digits). The queries-file generators (`gen_oracle.py SUITE`, `gen_mr.py`)
+still write the tests; the headers of `computed`, `ddl` and `funcs` now say their answers are checked.
+Also re-run and equal: `gen_mr.py` (all 163 MATCH_RECOGNIZE answers, `tns_mr`; only the generated program text had
+drifted, not reverted into the tests) and `oracledb_o6.py --oracle` against `oracle_o6_expect.json` (55 PL/SQL
+scenarios, `tns_plsql`): no difference.
+
+**Not checked (lexdb-specific or driver-level):** `tns_client, binds, java` (wire and lib/oracle layouts; the
+python-oracledb scripts `oracledb_o2..o6.py` are their check), `tns_nls` (recorded 2026-11-13; its two ORA-41900 lines
+are updated below, the rest not re-run), `tns_review, rangedel, plcolumn` (lexdb's own behaviour; plcolumn compares lexdb
+with itself), `tns_wait` (only partly Oracle: see FOR UPDATE WAIT below).
+
+**Found and fixed (lexdb now equal to Oracle; expectations updated; all 23 `tns_*` tests pass):**
+- A missing DML privilege on a table the user holds another privilege on: ORA-41900 `missing INSERT privilege on
+  "U1"."T"` (READ for a query), not 01031 (`tns_privs`, `tns_nls`); a table it holds none on: 942, also for a GRANT by
+  such a user. A GRANT without the right to pass the privilege on is 01031, never 01720.
+- GRANT SELECT on a function or procedure: 02225; GRANT EXECUTE on a table: 02224; GRANT EXECUTE on a name that is no unit: 04042.
+- Virtual columns: DROP COLUMN, and MODIFY within the datatype, of a column a virtual column reads are 54031 (another
+  datatype 54033); RENAME COLUMN is allowed and the expressions follow it; DEFAULT on a virtual column 02254. Test inputs
+  that Oracle refuses were changed: an index on `a * 2` duplicated a virtual column's expression (Oracle then refuses
+  ADD of virtual columns, 54015), now `a * 3`; `varchar2(5)` for a TO_CHAR column is ORA-12899 at CREATE, now `varchar2(40)`.
+- Argument counts: functions of a fixed number of arguments are ORA-00909, those with optional arguments 938/939;
+  SYS_EXTRACT_UTC of a number 30175; percentile_cont of text 30495, with a frame 30485; `create or alter` 02000;
+  `alter table ... alter column` 01735.
+- CREATE TABLE AS SELECT: the row count is the rows made (175, not 0).
+
+**Open** (with the reason, in `oracle_known_diffs.txt`): an index on an expression a virtual column's index covers is
+accepted (01408); USER_IND_COLUMNS and USER_IND_EXPRESSIONS details of function indexes; system-generated names
+(`SYS_Cnnnnnn`, lexdb `T_PKEY`); RENAME of a missing object 04043 (lexdb 942); MODIFY to an unknown type 22858 (lexdb
+902); CURRVAL in a subquery (02287) is accepted; GRANT with a column list refused (03001, Oracle grants it); USER_TAB_PRIVS
+lacks the PUBLIC INHERIT PRIVILEGES row, ALL_TAB_PRIVS the SYS objects, GRANT ALL the extra privileges, DROP TABLE the
+recycle bin; LATERAL over MATCH_RECOGNIZE is a lexdb extension. Not in the known file, to do: **`SELECT ... FOR UPDATE
+WAIT n`** (valid Oracle, lexdb ORA-00900; it needs a lock timeout, not a simple change), and the error numbers of
+lexdb's own `WAIT n SECONDS` clause on the Oracle door (Oracle says 03049 for the unknown keyword).
+
+**Next:** run `--check` after any Oracle-door change; check `tns_nls` and `tns_wait` the same way (add the `println(`
+form to the scenario parser); ORA-41900 holds for this image (23.26), the 2026-11-13 recording had 01031.

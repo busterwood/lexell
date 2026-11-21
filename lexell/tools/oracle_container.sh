@@ -66,6 +66,13 @@ alter session set container = FREEPDB1;
 grant select on sys.v_$mystat to app;
 grant select on sys.v_$statname to app;
 grant select on sys.v_$open_cursor to app;
+-- tests/lexdb/gen_oracle.py (the catalog test's V$ and DBA_ views)
+grant select on sys.v_$instance to app;
+grant select on sys.v_$database to app;
+grant select on sys.v_$session to app;
+grant select on sys.v_$parameter to app;
+grant select on sys.v_$nls_parameters to app;
+grant select on sys.dba_tables to app;
 exit
 EOF
     echo "granted APP the session views"
