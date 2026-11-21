@@ -815,6 +815,10 @@ pub type Level = record {
     // a subquery's level of optimizer 50 (LV_*): a null-aware anti join or
     // a mark join (its last column the mark); 0 neither
     pub mode: int
+    // the OR of index paths its rows are read by (optimizer 52: one per
+    // branch of an OR conjunct; their rows' primary keys collected,
+    // deduplicated and read in key order) where orRead says so; [] none
+    pub ors: []Path
 }
 
 pub const LV_NOTIN: int = 1
@@ -3133,7 +3137,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0, mode: 0}
+                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0, mode: 0, ors: []}
 }
 
 // Marks in cand the subqueries of x's top-level conjuncts (conjuncts')
@@ -3895,6 +3899,13 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         // the cost planner's index range: read in key order where keyOrdered
         // says it may (optimizer 47)
         if !hs.rules && !q.levels[k].virt() { path.sorted = sortable(&q.levels[k].t, &path) }
+        // a scan of the first table (or of one read once) where an OR's
+        // branches each have an index path: their union by cost (optimizer 52;
+        // not under an outer join: a kept row may fail its conditions)
+        if !hs.rules && reorder && orMode != OR_NEVER && (k == 0 || q.levels[k].readOnce) && !q.levels[k].virt() && lastRight < 0 &&
+           !isOuter(q.levels[k].join) && fullPath(&path) {
+            q.levels[k].ors = orPaths(q, k, &m, params)
+        }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
         if right {
@@ -3937,6 +3948,11 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         let er = pathEst(&q.levels[k], &q.levels[k].path, params)
         q.levels[k].estRows = er.rows
         q.levels[k].estMax = er.bound
+        if len(q.levels[k].ors) > 0 {
+            let oe = orEst(&q.levels[k], params)
+            q.levels[k].estRows = oe.rows
+            q.levels[k].estMax = oe.bound
+        }
         q.levels[k].perRow = perRow
         q.levels[k].cond = m
         q.levels[k].post = replace(mut &ps[k], [])
@@ -6802,7 +6818,10 @@ fn estText(lv: &Level): str {
 pub fn pathText(lv: &Level): str { return pathTextOf(lv, false) }
 
 // Level k's path's text, naming a range read in key order (optimizer 47).
-pub fn pathTextAt(q: &Query, k: int): str { return pathTextOf(&q.levels[k], keyOrdered(q, k)) }
+pub fn pathTextAt(q: &Query, k: int): str {
+    if orRead(q, k) { return orText(&q.levels[k]) }
+    return pathTextOf(&q.levels[k], keyOrdered(q, k))
+}
 
 fn pathTextOf(lv: &Level, keyOrder: bool): str {
     if lv.lateral { return "rows of subquery " + (lv.src + 1).toStr() + ", run" }
@@ -7018,7 +7037,7 @@ pub fn orderLookups(q: mut &Query) {
         let l0 = &q.levels[0]
         let p = &l0.path
         if l0.virt() || !l0.perRow || l0.lateral || l0.keeps || l0.stops || p.index >= 0 || p.desc || len(p.eqs) > 0 || len(p.rng) > 0 ||
-           len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || len(l0.need) == 0 { return }
+           len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || len(l0.need) == 0 || len(l0.ors) > 0 { return }
         for k in 1..len(q.levels) {
             let lv = &q.levels[k]
             if !lv.perRow || !lookupPath(q, lv) { continue }
@@ -7162,6 +7181,166 @@ pub fn keyOrdered(q: &Query, k: int): bool {
     if (k > 0 && lv.perRow) || lv.keeps || lv.stops || lv.lock != 0 || lv.virt() || lv.lateral || lv.semi || lv.anti || lv.semiSub >= 0 ||
        !sortable(&lv.t, p) { return false }
     return !ixCovers(lv, p.index)
+}
+
+// ---- the OR of index paths (optimizer 52)
+//
+// PostgreSQL's BitmapOr over an index-organised table: a table scanned
+// whole whose conditions hold an OR, each branch of it with an index path
+// of its own (q19's part: a brand and four containers, three times), is
+// read by those paths instead: their entries' primary keys collected,
+// sorted, deduplicated, and the rows read by them in key order
+// (lexdb_access.orPoints), the level's conditions (the whole OR among
+// them) checked on each as on a scan's.
+
+// How the cost planner reads an OR of index paths: OR_COST by its cost
+// (the default); OR_NEVER never (the plans before it), OR_ALWAYS wherever
+// every branch has a path, whatever the cost or the statistics (the
+// tests). Process wide.
+pub const OR_COST: int = 0
+pub const OR_NEVER: int = 1
+pub const OR_ALWAYS: int = 2
+
+var orMode: int = OR_COST
+
+pub fn setOrPaths(mode: int) { orMode = mode }
+
+// A path that reads the whole table: no key condition, forward.
+fn fullPath(p: &Path): bool {
+    return p.index < 0 && len(p.eqs) == 0 && len(p.rng) == 0 && len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 && !p.desc
+}
+
+// Whether x holds a parameter (or an outer value, a subquery's): its
+// figure would be the parameter's value's, which a kept plan does not
+// recheck.
+fn anyParam(x: &Expr): bool {
+    match x {
+        Expr.Param(_) { return true }
+        Expr.Lit(_) { return false }
+        Expr.Col(_, _) { return false }
+        Expr.Unary(_, a) { return anyParam(&a) }
+        Expr.Bin(_, a, b) { return anyParam(&a) || anyParam(&b) }
+        Expr.IsNull(a, _) { return anyParam(&a) }
+        Expr.Cast(a, _) { return anyParam(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if anyParam(&a) { return true } }
+            return false
+        }
+    }
+}
+
+// Whether path p of level lv reads at most one row per value: the whole
+// primary key or a unique index, equal (or the last part an IN list).
+fn uniquePath(lv: &Level, p: &Path): bool {
+    if p.inSub >= 0 || len(p.inArr) > 0 || len(p.rng) > 0 { return false }
+    let cols = keyCols(&lv.t, p.index)
+    if !(p.index < 0 || (lv.t.indexes[p.index].unique && lv.t.indexes[p.index].pred.isNone())) { return false }
+    return len(p.eqs) + (if len(p.ins) > 0 { 1 } else { 0 }) == len(cols)
+}
+
+// Level k's OR of index paths among its conjuncts cs, the cheapest, if
+// one is chosen; [] none. An OR conjunct on level k's columns alone (no
+// parameter, subquery or outer value; none of it can fail: its arms'
+// values are evaluated before any row is read) whose every branch, with
+// the conjuncts beside the OR, has an index (or primary key) path:
+// choosePath's for the branch. Its cost, in section 45's units: per arm
+// a descent per value and COST_SORTED_ROW per row of its estimate (each
+// row read by key, as optimizer 47's); taken where twice that is under
+// the scan's (the lean of scanFirst). Without statistics: only arms of
+// unique keys (a row per value at most).
+fn orPaths(q: &Query, k: int, cs: &[]Expr, params: &[]Val): []Path {
+    let lv = &q.levels[k]
+    var best: []Path = []
+    var bestCost = 0.0f
+    for i in 0..len(cs) {
+        let c = &cs[i]
+        if !matchesOr(c) || q.levelMask(c) != (1 << k) || hasCorr(c) || hasSubCall(c) || !cannotFail(c) || anyParam(c) || !lexdb_bind.immutable(c) { continue }
+        var rest: []Expr = []
+        for j in 0..len(cs) { if j != i && !matchesOr(&cs[j]) { append(mut &rest, lexdb_sql.cloneExpr(&cs[j])) } }
+        var branches: []Expr = []
+        orParts(c, mut &branches)
+        if len(branches) < 2 { continue }
+        var arms: []Path = []
+        var cost = 0.0f
+        var ok = true
+        var known = true
+        for b in branches {
+            var parts = lexdb_sql.cloneAllExpr(&rest)
+            andParts(&b, mut &parts)
+            var lk: []Look = []
+            let p = choosePath(q, k, &parts, params, mut &lk)
+            if fullPath(&p) || p.desc || p.inSub >= 0 || q.pathOuter(&p) || pathCorr(&p) {
+                ok = false
+                break
+            }
+            let f = pathFig(lv, &p, params)
+            var rows = f.rows
+            if rows < 0 && uniquePath(lv, &p) { rows = max(1, len(p.ins)) }
+            if rows < 0 { known = false }
+            cost += COST_DESCENT * float(max(1, len(p.ins))) + float(max(rows, 0)) * COST_SORTED_ROW
+            append(mut &arms, p)
+        }
+        if !ok { continue }
+        if orMode != OR_ALWAYS {
+            if !known { continue }
+            // no statistics: arms of unique keys only, read by their keys
+            if lv.est.rows >= 0 && 2.0f * cost >= float(lv.est.rows) * COST_SCAN { continue }
+            if lv.est.rows < 0 {
+                var uniq = true
+                for p in arms { if !uniquePath(lv, &p) { uniq = false } }
+                if !uniq { continue }
+            }
+        }
+        if len(best) == 0 || cost < bestCost {
+            best = arms
+            bestCost = cost
+        }
+    }
+    return best
+}
+
+// The rows an OR of index paths reads by the statistics: its arms'
+// figures summed (rows matching several arms counted in each), a bound
+// when one is; -1 when one has none.
+fn orEst(lv: &Level, params: &[]Val): Fig {
+    var n = 0
+    var bound = false
+    for p in lv.ors {
+        let f = pathFig(lv, &p, params)
+        if f.rows < 0 { return Fig{rows: -1, bound: false} }
+        n += f.rows
+        if f.bound { bound = true }
+    }
+    return Fig{rows: n, bound: bound}
+}
+
+// Whether level k of q is read by its OR of index paths (Level.ors): its
+// path still a full scan (not changed for an order), of the first table
+// or one read once, not where the reading may stop early, not locked (as
+// keyOrdered).
+pub fn orRead(q: &Query, k: int): bool {
+    let lv = &q.levels[k]
+    if len(lv.ors) == 0 || orMode == OR_NEVER { return false }
+    if (k > 0 && lv.perRow) || lv.keeps || lv.stops || lv.lock != 0 || lv.virt() || lv.lateral || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
+    return fullPath(&lv.path)
+}
+
+// EXPLAIN's text of an arm of an OR of index paths.
+fn armText(lv: &Level, p: &Path): str {
+    let cols = keyCols(&lv.t, p.index)
+    let name = if p.index < 0 { "primary key" } else {
+        "index " + lexdb_sql.baseName(&lv.t.indexes[p.index].name) + (if lv.t.indexes[p.index].pred.isSome() { " (filtered)" } else { "" })
+    }
+    if len(p.ins) > 0 { return name + " lookup for each of " + len(p.ins).toStr() + " values" }
+    if len(p.inArr) > 0 { return name + " lookup for each element of the array" }
+    return name + (if len(p.eqs) == len(cols) { " lookup" } else { " range" })
+}
+
+// EXPLAIN's text of a level read by its OR of index paths.
+fn orText(lv: &Level): str {
+    var arms: []str = []
+    for p in lv.ors { append(mut &arms, armText(lv, &p)) }
+    return "any of " + strings.join(&arms, ", ") + "; rows in key order" + estText(lv)
 }
 
 pub const NV_LAST = 1         // MrNav.kind: LAST(x, off), and a plain column
