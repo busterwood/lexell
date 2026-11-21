@@ -8989,8 +8989,9 @@ fn pipeFetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &
 }
 
 // runPipe for a join over a point (PR_POINTJ, Q8 R4): its first table's
-// one scan made from the key's values (pathScan, as pipeFetch), its rows
-// joined by lexdb_pipe.runPointJ; None: runPipe runs it.
+// one scan made from the key's values (pathScan, as pipeFetch), or, for a
+// first table that stops early, where it is read (pipeSrcQ: a plain scan's
+// batches), its rows joined by lexdb_pipe.runPointJ; None: runPipe runs it.
 fn pipeFetchJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_plan.Prog, params: &[]Val, cap: int, rs: mut &Run,
               give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
     let q = &sel.q
@@ -8999,13 +9000,21 @@ fn pipeFetchJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: 
     let nullRow: []Val = array(len(q.cols), Val.Null)
     let sqe = seqEnv(st, txn)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &sqe}
-    let sc = try pathScan(&q.levels[0].t, &q.levels[0].path, &env)
+    let l0 = &q.levels[0]
+    var srcs: []lexdb_pipe.Src = []
+    var sc = lexdb_access.noScan()
+    if lexdb_plan.pointRead(l0) { sc = try pathScan(&l0.t, &l0.path, &env) } else {
+        if !l0.stops { return Ok(None) }
+        let src = try pipeSrcQ(st, txn, q, pg, params, &noSubs, 0, rs)
+        if !lexdb_pipe.plainSrc(&src) { return Ok(None) }
+        append(mut &srcs, src)
+    }
     var cx = cenvOf(&sqe)
     cx.params = collections.copyOf(params)
     var tabs: []&Table = withCapacity(len(q.levels))
     for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
     var cnt: []lexdb_pipe.Counts = []
-    let got = try lexdb_pipe.runPointJ(st, txn, pg, &q.cols, &tabs, &sc, &cx, cap, mut &rs.bud, mut &cnt, give)
+    let got = try lexdb_pipe.runPointJ(st, txn, pg, &q.cols, &tabs, &sc, &srcs, &cx, cap, mut &rs.bud, mut &cnt, give)
     if got.isSome() { levelCounts(rs, &cnt) }
     return Ok(got)
 }
