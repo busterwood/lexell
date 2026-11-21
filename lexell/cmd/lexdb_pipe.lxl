@@ -8712,15 +8712,26 @@ fn runWin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[
 // of the query's nq columns, its columns at their slots; their bytes
 // counted in held as the row engine counts them (room: what it may hold,
 // -1 no limit; maxHeld: max_statement_mem, for the error).
-fn winTake(ob: &lexdb_rows.OutBatch, r: &[]Val, slots: &[]int, nq: int, vals: mut &[]Val, rows: mut &[]WinRow, held: mut &int,
+fn winTake(ob: &lexdb_rows.OutBatch, r: &[]Val, slots: &[]int, nq: int, rows: mut &[]WinRow, held: mut &int,
            room: int, maxHeld: int): Result[bool, DbErr] {
     let ns = len(slots)
     let m = if ob.n > 0 { ob.n } else { 1 }
     for j in 0..m {
         var row: []Val = array(nq, Val.Null)
         if ob.n > 0 {
-            obRow(ob, j, vals)
-            for k in 0..ns { row[slots[k]] = replace(mut &vals[k], Val.Null) }
+            // (obRow's values, each put at its slot)
+            let at = ob.idx[j]
+            for o in 0..ns {
+                let k = ob.kinds[o]
+                let c = ob.src[o]
+                if c < 0 {
+                    let x = &ob.ex[o]
+                    if !x.nul[j] { row[slots[o]] = if k == BK_BOOL { Val.Bool(x.v[j] == 1) } else { Val.Int(x.v[j]) } }
+                } else if !ob.cols[c].nul[at] {
+                    row[slots[o]] = if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[at]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[at] == 1) }
+                                    else if k == lexdb_rows.BK_TEXT { Val.Text(lexdb_rows.obText(ob, o, j).clone()) } else { ob.vals[c][at].clone() }
+                }
+            }
         } else {
             for k in 0..ns { row[slots[k]] = r[k].clone() }
         }
@@ -8758,18 +8769,17 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
     let maxHeld = bud.maxHeld
     var rows: []WinRow = []
     var inHeld = 0
-    var vals: []Val = []
     // the input's rows, all of them (no LIMIT stops it)
     if pg.joins {
         let got = try runJProj(st, txn, pg, input, cols, tabs, srcs, vrows, cx, -1, bud, cnt,
                                fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
-            return winTake(ob, r, &pw.slots, nq, mut &vals, mut &rows, mut &inHeld, room, maxHeld)
+            return winTake(ob, r, &pw.slots, nq, mut &rows, mut &inHeld, room, maxHeld)
         }, ask)
     } else {
         var none = noSortRun()
         let got = try runOp(st, txn, input, cols, t, src, hrows, cx, -1, bud, cnt, mut &none,
                             fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
-            return winTake(ob, r, &pw.slots, nq, mut &vals, mut &rows, mut &inHeld, room, maxHeld)
+            return winTake(ob, r, &pw.slots, nq, mut &rows, mut &inHeld, room, maxHeld)
         })
     }
     // every call's values, per row
@@ -8788,14 +8798,30 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
     let n = len(rows)
     let noOb = lexdb_rows.noOutBatch()
     // the outputs, every row's in the input's order (past a LIMIT too: the
-    // row engine's first error), to the Sort or Distinct over them, else
-    // held to be cut by LIMIT and OFFSET (a SortSt that does not sort); its
-    // own room off, the bytes counted here as the row engine counts them
+    // row engine's first error), to the Sort or Distinct over them (its own
+    // room and early stop off), the bytes counted here as the row engine
+    // counts them
     var sr = sortRun(&pg.plan, cap, bud)
     sr.room = -1
     sr.early = false
     let shown = sr.shown
     var outHeld = 0
+    if !sr.sorting && !sr.distinct && sr.don == 0 && sr.ties == 0 && !sr.pct && sr.top < 0 {
+        // none: the rows LIMIT and OFFSET keep, given one by one (as the row
+        // engine's; a SortSt's OutBatch costs more than it saves here)
+        var kept: [][]Val = []
+        let noInts: []int = []
+        for r in 0..n {
+            var vs: []Val = withCapacity(len(xs))
+            for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
+            outHeld += winBytes(&vs, len(xs), false, &noInts, &noInts)
+            if r >= sr.offset && (sr.limit < 0 || len(kept) < sr.limit) { append(mut &kept, vs) }
+        }
+        if bud.maxHeld > 0 && bud.held + inHeld + outHeld > bud.maxHeld { return Err(memErr(bud.maxHeld)) }
+        bud.held += inHeld + outHeld
+        for vs in kept { if !(try give(txn, &noOb, &vs)) { break } }
+        return Ok(len(kept))
+    }
     for r in 0..n {
         var vs: []Val = withCapacity(len(xs))
         for x in xs { append(mut &vs, try bxEval(&x, &rows[r].row, &wv[r], cx)) }
