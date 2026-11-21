@@ -3554,6 +3554,7 @@ fn genSetup(t: mut &Table, i: int, md: int): Result[Unit, DbErr] {
     let cn = t.cols[i].name.clone()
     if t.cols[i].def.isSome() || t.cols[i].identity != lexdb_sql.ID_NONE {
         if md == lexdb_sql.MD_TSQL { return Err(e("TS8183", "Only UNIQUE or PRIMARY KEY constraints can be created on computed columns, while CHECK, FOREIGN KEY, and NOT NULL constraints require that computed columns be persisted.")) }
+        if md == lexdb_sql.MD_ORA && t.cols[i].def.isSome() { return Err(e("ORA02254", "DEFAULT not allowed here")) }
         if md == lexdb_sql.MD_ORA { return Err(e("ORA54016", "invalid column expression was specified")) }
         return Err(e("42601", &("both default and generation expression specified for column \"" + cn + "\" of table \"" + tn + "\"")))
     }
@@ -5143,11 +5144,11 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let i = lexdb_bind.colIndex(&t.cols, &a.name)
             if i < 0 { return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist"))) }
             if a.kind == lexdb_sql.A_RENAME_COL {
-                // SQL Server and Oracle refuse to rename a column a generated column reads (and SQL Server a computed one);
-                // PostgreSQL's expressions follow the rename
-                if s.mdialect != lexdb_sql.MD_PG {
+                // SQL Server refuses to rename a column a computed column reads (and a computed one); the generated columns'
+                // expressions follow the rename in PostgreSQL and in Oracle (checked against Oracle Free)
+                if s.mdialect == lexdb_sql.MD_TSQL {
                     for g in lexdb_gen.readers(&t.cols, &a.name) { return Err(lexdb_gen.usedErr(s.mdialect, "rename", &t.cols[g].name, &a.name, &rel)) }
-                    if s.mdialect == lexdb_sql.MD_TSQL && t.cols[i].genKind != lexdb_sql.GEN_NONE { return Err(lexdb_gen.computedErr(s.mdialect, &a.name)) }
+                    if t.cols[i].genKind != lexdb_sql.GEN_NONE { return Err(lexdb_gen.computedErr(s.mdialect, &a.name)) }
                 }
                 t.cols[i].spell = a.col.spell.clone()
                 if a.to == a.name && s.mdialect == lexdb_sql.MD_TSQL { continue }
@@ -5286,7 +5287,10 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if s.mdialect == lexdb_sql.MD_TSQL { return Err(lexdb_gen.computedErr(s.mdialect, &a.name)) }
             if a.using.isSome() { return Err(lexdb_base.errDetail("42611", "cannot specify USING when altering type of generated column", &("Column \"" + a.name + "\" is a generated column."), "")) }
         }
-        for g in lexdb_gen.readers(&t.cols, &a.name) { return Err(lexdb_gen.usedErr(s.mdialect, "alter", &t.cols[g].name, &a.name, &lexdb_sql.baseName(&t.name))) }
+        for g in lexdb_gen.readers(&t.cols, &a.name) {
+            let how = if s.mdialect == lexdb_sql.MD_ORA && lexdb_gen.sameFamily(&t.cols[i].typ, &a.col.typ) { "resize" } else { "alter" }
+            return Err(lexdb_gen.usedErr(s.mdialect, how, &t.cols[g].name, &a.name, &lexdb_sql.baseName(&t.name)))
+        }
         if s.mdialect != lexdb_sql.MD_TSQL && (try fkUses(st, txn, &t, &a.name)) {
             return Err(e("0A000", &("lexdb: column \"" + a.name + "\" is in a foreign key, so its type cannot be changed (drop the constraint first)")))
         }
@@ -18244,6 +18248,10 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             if door == "tds" && x.state == "42P01" && len(s.cols) > 0 {
                 return Err(e("TS15151", &("Cannot find the object '" + lexdb_sql.baseName(&s.cols[0].name) + "', because it does not exist or you do not have permission.")))
             }
+            // Oracle: GRANT EXECUTE on a name that is no unit is ORA-04042 (checked against Oracle Free)
+            if door == "tns" && x.state == "42P01" && len(s.names) > 0 && s.names[0] == "execute" {
+                return Err(e("ORA04042", "procedure, function, package, or package body does not exist"))
+            }
             return Err(x)
         }
     }
@@ -18254,10 +18262,12 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             // ALL on a table is the five privileges SQL Server and Oracle have (neither has TRUNCATE or TRIGGER)
             if pn == "all" && len(door) > 0 && (tg.kind == "table" || tg.kind == "view") { l = "arwdx" }
             if len(l) == 0 && pn != "maintain" {
-                // a privilege the object's kind has not: SQL Server's 4606, Oracle's 990 (EXECUTE on a table) and 942 (the others on a unit)
+                // a privilege the object's kind has not: SQL Server's 4606, Oracle's 2224 (EXECUTE on a table) and 2225 (the others on a unit)
                 let isRtn = tg.kind == "function" || tg.kind == "procedure" || tg.kind == "tvf"
                 if door == "tds" { return Err(e("TS4606", "Granted or revoked privilege " + strings.toUpperAscii(&pn) + " is not compatible with object.")) }
-                if door == "tns" { return Err(if isRtn { e("ORA00942", "table or view does not exist") } else { e("ORA00990", "missing or invalid privilege") }) }
+                if door == "tns" {
+                    return Err(if isRtn { e("ORA02225", "You can only grant or revoke EXECUTE and DEBUG object privileges for this object.") } else { e("ORA02224", "invalid privilege on a table") })
+                }
                 return Err(e("0LP01", &("invalid privilege type " + strings.toUpperAscii(&pn) + " for " + tg.kind)))
             }
             letters = lexdb_priv.addLetters(&letters, &l)
