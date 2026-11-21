@@ -1026,6 +1026,62 @@ pub fn compare(a: &Val, b: &Val): Result[int, DbErr] {
 
 pub fn decErr(): DbErr { return e("22003", "numeric value out of range") }
 
+// The decimal digits of d's coefficient (1 for zero).
+fn coefDigits(d: &Decimal): int {
+    let c = d.coefficient()
+    var n = 1
+    var p: u128 = 10
+    while n < 38 && c >= p {
+        p = p * 10
+        n += 1
+    }
+    return n
+}
+
+// PostgreSQL's numeric digits are base 10000 (NBASE): d's weight (the power
+// of 10000 of its first nonzero digit) times 10000, plus that digit (1..9999);
+// 0 for zero. d is coef * 10^exp, its first decimal digit at 10^(n - 1 + exp).
+fn nbaseLead(d: &Decimal): int {
+    let c = d.coefficient()
+    if c == 0 { return 0 }
+    let n = coefDigits(d)
+    let e10 = n - 1 + d.exponent()
+    let w = if e10 >= 0 { e10 / 4 } else { 0 - ((3 - e10) / 4) }
+    // the first base-10000 digit: the leading e10 - 4w + 1 (1..4) decimal digits
+    let k = e10 - 4 * w + 1
+    var f = c
+    var m = n
+    while m > k {
+        f = f / 10
+        m -= 1
+    }
+    while m < k {
+        f = f * 10
+        m += 1
+    }
+    return w * 10000 + int(f)
+}
+
+// The scale of numeric p / q, PostgreSQL's (numeric.c select_div_scale): 16
+// significant digits by the quotient's estimated weight (with equal first
+// digits p is taken as the smaller), at least either operand's display scale,
+// 0..1000.
+pub fn divScale(p: &Decimal, q: &Decimal): int {
+    let a = nbaseLead(p)
+    let b = nbaseLead(q)
+    // weight * 10000 + digit: floor division gives the weight, the rest the digit
+    let w1 = if a >= 0 { a / 10000 } else { 0 - ((9999 - a) / 10000) }
+    let w2 = if b >= 0 { b / 10000 } else { 0 - ((9999 - b) / 10000) }
+    var qw = w1 - w2
+    if a - w1 * 10000 <= b - w2 * 10000 { qw -= 1 }
+    var rs = 16 - qw * 4
+    if p.scale() > rs { rs = p.scale() }
+    if q.scale() > rs { rs = q.scale() }
+    if rs < 0 { rs = 0 }
+    if rs > 1000 { rs = 1000 }
+    return rs
+}
+
 pub fn arith(op: int, a: &Val, b: &Val): Result[Val, DbErr] {
     if isNull(a) || isNull(b) { return Ok(Val.Null) }
     if op == OP_POW { return powOp(a, b) }
@@ -1119,10 +1175,20 @@ pub fn arith(op: int, a: &Val, b: &Val): Result[Val, DbErr] {
         r = p.mulExact(q)
     } else if op == OP_DIV {
         if q.isZero() { return Err(e("22012", "division by zero")) }
-        var sc = 16
-        if p.scale() > sc { sc = p.scale() }
-        if q.scale() > sc { sc = q.scale() }
-        r = p.div(q, sc, Rounding.HALF_EVEN)
+        let sc = divScale(&p, &q)
+        r = p.div(q, sc, Rounding.HALF_AWAY)
+        if r.isErr() && !p.isZero() {
+            // more than 38 digits at PostgreSQL's scale: as many places as
+            // fit, as a product's display scale is capped (Decimal.mulExact).
+            // The quotient's first digit is at 10^lead or 10^(lead - 1); one
+            // place fewer where rounding carries into a 39th digit.
+            let lead = (coefDigits(&p) + p.exponent()) - (coefDigits(&q) + q.exponent())
+            let fit = 37 - lead
+            if fit >= 0 && fit < sc {
+                r = p.div(q, fit, Rounding.HALF_AWAY)
+                if r.isErr() && fit > 0 { r = p.div(q, fit - 1, Rounding.HALF_AWAY) }
+            }
+        }
     } else if op == OP_MOD {
         if q.isZero() { return Err(e("22012", "division by zero")) }
         r = p.remExact(q)
