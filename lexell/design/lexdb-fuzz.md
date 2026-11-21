@@ -156,6 +156,18 @@ reduction is limited to `--reduce-secs`.
 Wrong results come first, then errors on valid queries, then hangs, then gaps
 (lexdb rejects SQL that PostgreSQL accepts).
 
+**W1, W2, E1, E2 and E3 fixed (2026-11-21, on 11c4e049; each note below).**
+`repro --pg` of the 28 reduced cases of the first run (~/tpch-w/fuzz/t1)
+that were these bugs: every configuration agrees with PostgreSQL. A 310 s
+run with the same seed (1 worker, `--seed 1`, all checks: 48 seeds, 7,115
+queries) found none of them again; besides the gaps G1-G5 it reported, as
+new and not chased: a window's `row_number()` repeated within a partition
+over a cross join with LATERAL (w0-0257: lexdb 3,3,4,4,1,1,2,2 where
+PostgreSQL numbers 1-4; the same on 11c4e049), `1.5 / nullif(bigint, 0)`
+with 16 decimals where PostgreSQL gives 36 (w0-0428), a 200,000-row cross
+join reported different whose reduction stopped (w0-0697; the same rows
+shown, also on 11c4e049), and a statement timeout like H1 (w0-0981).
+
 ### W1. `a, b RIGHT/FULL JOIN c` joins the whole comma list (pg; 17 reduced cases)
 
 ```sql
@@ -176,6 +188,19 @@ tables, views, derived tables, CTEs and inside LATERAL. Inner joins are
 unaffected because there the grouping does not matter. Likely cause: the
 FROM-list parser or binder attaches a join's left operand to the item list
 built so far, not to the last comma item. I have not looked at the code.
+
+**Fixed (d5ad2b8a).** Cause: the parser keeps FROM as a flat list, and the
+levels join left-deep, each to all the tables before it, so a RIGHT or FULL
+JOIN after a comma kept the rows of every earlier item, not only its tree's.
+The parser now reads the list from its first comma on with `fromTrees`: a
+join tree after a comma (or an UPDATE's FROM or DELETE's USING first tree,
+after the target) with a RIGHT or FULL JOIN is read again as a subquery of its
+own (`nestTree`: `SELECT` of its every column under its own name,
+`TREE_STAR`) and joined as a LATERAL item, its columns named as the tree's
+(alias.column) and USING's merges kept. The doors share the parser: checked
+against PostgreSQL (exec_fuzzfix), SQL Server 2022 (tds_fuzzfix) and Oracle
+Free (tns_fuzzfix). Left as it was: an ON that names an item before the comma
+(PostgreSQL: 42P01) is accepted.
 
 ### W2. char(n) comparisons with text / varchar / ANY (pg)
 
@@ -200,6 +225,21 @@ compared padded, or the comparison is not resolved as bpchar/text as it is at
 the top level. Look at how the subquery and semi-join key paths type a char
 key (lexdb_plan's semi or hash keys).
 
+**Fixed (b14e49ae).** On 11c4e049 the second and third cases above pass
+over tables; the reduced cases that failed were over a view (w0-0703,
+w0-0706). Three causes, all in lexdb_bind: (1) an outer column of a view or
+derived table was an untyped parameter in a subquery (only a table's is
+typed, so that a UNION's wider values are not cut), so it took the other
+side's type and a char's padding counted; a derived char, varchar or text is
+now cast to its type without a length. (2) `x op ANY | ALL (array)`, and so
+`op ANY | ALL (subquery)` other than `=` and `<>`, trimmed x but not an array
+of chars' elements; now each pair is compared as `bpCmp` compares
+(`#bptrims`). (3) `IN (subquery)` between a char and a varchar (or an untyped
+value) compared one side padded; both now compare as chars (the set's
+varchars trimmed, `readAs` `OID_BPCHAR`). Not done: Oracle compares a CHAR
+beside a VARCHAR2 without padding; the Oracle door compares those as
+PostgreSQL does, at the top level as in subqueries (a dialect gap of its own).
+
 ### E1. `there is no parameter $1` (08P01) on a valid correlated query (alt; also default s0 against pg: 9 cases)
 
 ```sql
@@ -222,6 +262,12 @@ The full text is in the w0 cases with code 08P01. Likely in the correlation
 or parameter numbering of LATERAL under a subquery (lexdb_plan unnesting,
 UN_LATERAL, and the per-row path when unnesting is off).
 
+**Fixed (f657e1a2).** Cause: `hashSub` (lexdb_plan) made a correlated EXISTS,
+IN or scalar subquery run once and hashed on its keys when each outer value
+in its conditions was a key, without looking into its own subqueries; a
+LATERAL or derived table in it that read the outer query's column then ran
+with no parameter. Such a subquery now stays per row.
+
 ### E2. `round(numeric, int)` exists or not depending on the plan (rules, alt, noidx, pg)
 
 ```sql
@@ -235,6 +281,12 @@ Expected: `round(numeric, int)` everywhere, as in PostgreSQL. One evaluator
 not. Whether it fails depends on the plan, which is why alt, noidx and rules
 all report it as error-vs-rows. Likely cause: the function table of the
 batch/pipeline evaluator (lexdb_pipe or bxEval) lacks round with a scale.
+
+**Fixed (3bf78d10).** Cause: not the evaluators (both use lexdb_lib's
+`round2Fn`): it took a NULL value or scale for a call it had no function for,
+so a query failed when a plan reached a row with a NULL (LIMIT 1 stopped
+before row 2). It is strict now. exec_batchexpr's count of failing random
+queries drops by six (its `round(e.n, 1)` over NULLs).
 
 ### E3. An index path casts a constant to the column's numeric(p,s) and overflows (noidx)
 
@@ -250,6 +302,15 @@ Likely cause: the range bound of an index scan is coerced to the column's
 declared type (typmod) instead of being compared as an unconstrained numeric.
 That is in the index range or key building (lexdb_plan's range from
 conjuncts).
+
+**Fixed (f732012a).** Cause: a range bound was coerced to the key column's
+type when the scan ran (the row engine's `pathScan`, the pipeline's range
+join), and a value past the type's range failed; a smallint's or an int's
+too (`2147483647 > c0` over an indexed smallint, also in the run). Equality
+keys already matched nothing (`keyVal`). `lexdb_ops.boundInto` now takes a
+bound past the type's range as past every row's: on the rows' side (a lower
+bound below them, an upper one above) it bounds nothing, else the range is
+empty.
 
 ### H1. A 5 s statement timeout (on; probably only slow, not checked against PostgreSQL)
 
