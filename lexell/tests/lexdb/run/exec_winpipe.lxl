@@ -1,0 +1,329 @@
+// lexdb_pipe's Window operator (Q8 R7, design/lexdb-layers.md 6.3.Q8 R7): a
+// query of window calls run by the pipeline (its input the scan's or the
+// joins' rows, held; every call's values by lexdb_window.allValues; the
+// outputs to a SortSt, sorted, DISTINCT or cut by LIMIT and OFFSET), and the
+// window calls over an aggregate's groups the pipeline makes (exec's view
+// over them). Each statement runs three ways: SET lexdb_batch = off (the row
+// engine: the reference), on, and on through a sink (the rows as one
+// OutBatch); the answers (rows in order, or the error) must be the same.
+// "on the Window": the runs lexdb_pipe.winRuns counts with batches on; "on
+// the groups": pipeline runs of a grouped query (runCounts).
+// - generated: every function (row_number, rank, dense_rank, percent_rank,
+//   cume_dist, ntile, lag, lead, first_value, last_value, nth_value, sum,
+//   avg, count, min, max, string_agg), frames (ROWS, RANGE with offsets,
+//   GROUPS; EXCLUDE CURRENT ROW, GROUP, TIES), FILTER, named windows,
+//   several partitionings in one query, partitions by NULLs, duplicates and
+//   text keys (a collation's too), DISTINCT, ORDER BY (outputs, positions,
+//   expressions), LIMIT and OFFSET over the windowed rows, over one table,
+//   a join, a left join, a CTE's and VALUES' held rows, an empty table;
+// - errors in a later row (an output, an argument, a key), before and past
+//   a LIMIT; a frame offset NULL or negative; ntile and nth_value of 0; a
+//   correlated subquery in an output (the row engine: winShape);
+// - max_statement_mem at each query's edge, the least the row engine runs
+//   it in, and a kB under it (one table, a join whose unread columns are
+//   wide, DISTINCT, ORDER BY with LIMIT; inputs of several sizes);
+// - over the groups: rank over an aggregate, a window aggregate of an
+//   aggregate, HAVING, PARTITION BY a grouped column, a join, LIMIT and
+//   OFFSET, an error in a later group, ROLLUP (0A000 both ways).
+// timeout: 300
+// expect: tables: INSERT 0 3000 INSERT 0 7 INSERT 0 0
+// expect: generated: 500 queries, 500 the same three ways, 500 on the Window
+// expect: fixed: 32 queries, 32 the same three ways, 31 on the Window, errors 13
+// expect: memory: 48 queries, 48 the same three ways, 48 on the Window, errors 24
+// expect: groups: 13 queries, 13 the same three ways, 12 on the groups
+// expect: first rows: 1|1|1 2|2|1 8|1|2 | 1|3000 2|2999
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_pipe"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// The rows as a sink takes them (one OutBatch, or row by row).
+fn viaSink(s: mut &lexdb_exec.Session, sql: &str): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    var pc = lexdb_exec.newPlanCache()
+    let nt: []int = []
+    let none: []lexdb_sql.Val = []
+    var lines: []str = []
+    var starts = 0
+    let r = s.runRows(&stmts[0], &none, &nt, mut &pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
+        if start {
+            starts += 1
+            return true
+        }
+        if ob.n > 0 {
+            var vals: []lexdb_sql.Val = []
+            for j in 0..ob.n {
+                lexdb_pipe.obRow(ob, j, mut &vals)
+                var vs: []str = []
+                for v in vals { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    if starts > 1 { append(mut &lines, "STARTED " + starts.toStr() + " TIMES") }
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+type Tally = record { n: int; same: int; win: int; grp: int; errs: int; states: []str }
+
+fn tally(): Tally { return Tally{n: 0, same: 0, win: 0, grp: 0, errs: 0, states: []} }
+
+// sql the three ways; the tally counts it.
+fn three(s: mut &lexdb_exec.Session, sql: &str, t: mut &Tally) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let w0 = lexdb_pipe.winRuns()
+    let r0 = lexdb_pipe.runCounts()[0]
+    let on = q(s, sql)
+    if lexdb_pipe.winRuns() > w0 { t.win += 1 }
+    if lexdb_pipe.runCounts()[0] > r0 { t.grp += 1 }
+    let sunk = viaSink(s, sql)
+    t.n += 1
+    if strings.startsWith(&off, "ERROR") {
+        t.errs += 1
+        append(mut &t.states, off[6..11].clone())
+    }
+    if off == on && on == sunk {
+        t.same += 1
+        return
+    }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  sink:    " + sunk)
+}
+
+// The least max_statement_mem (kB) the row engine runs sql in.
+fn edge(s: mut &lexdb_exec.Session, sql: &str): int {
+    let a = q(s, &"set lexdb_batch = off")
+    var lo = 1
+    var hi = 16384
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let set = q(s, &("set max_statement_mem = '" + mid.toStr() + "kB'"))
+        if strings.startsWith(&q(s, sql), "ERROR 53200") { lo = mid + 1 } else { hi = mid }
+    }
+    let b = q(s, &"set lexdb_batch = on")
+    return lo
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))].clone() }
+
+// A window call of the generator: a function, its window (partition, order,
+// frame), FILTER on an aggregate.
+fn call(r: mut &lexdb_base.Rng): str {
+    let ranks = ["row_number()", "rank()", "dense_rank()", "percent_rank()", "cume_dist()", "ntile(3)"]
+    let vals = ["lag(w.i)", "lag(w.t, 2, 'none')", "lead(w.n)", "lead(w.i, 1, -1)", "first_value(w.t)", "last_value(w.n)", "nth_value(w.i, 2)"]
+    let aggs = ["sum(w.i)", "avg(w.n)", "count(*)", "count(w.t)", "min(w.t)", "max(w.ts)", "string_agg(w.v, ',')", "sum(w.n * 2)", "max(w.i + w.id)"]
+    let parts = ["", "partition by w.g", "partition by w.t", "partition by w.i % 5", "partition by upper(w.v)", "partition by w.g, w.b",
+                 "partition by w.t collate \"C\""]
+    let ords = ["order by w.id", "order by w.i nulls first, w.id", "order by w.t desc, w.id", "order by w.n", "order by w.ts", "order by w.i",
+                "order by w.g, w.id desc"]
+    let k = r.below(3)
+    var f = ""
+    if k == 0 { f = pick(r, &ranks) } else if k == 1 { f = pick(r, &vals) } else { f = pick(r, &aggs) }
+    let p = pick(r, &parts)
+    var o = if k < 2 || r.below(4) > 0 { pick(r, &ords) } else { "" }
+    var frame = ""
+    if k == 2 && o != "" {
+        let frames = ["", "rows between 2 preceding and 1 following", "rows between unbounded preceding and current row",
+                      "rows between current row and unbounded following", "groups between 1 preceding and 1 following",
+                      "rows between 1 preceding and 1 following exclude current row", "range between unbounded preceding and current row exclude ties",
+                      "groups between unbounded preceding and current row exclude group"]
+        frame = pick(r, &frames)
+        if o == "order by w.n" && r.below(3) == 0 { frame = "range between 5 preceding and 5 following" }
+        if o == "order by w.i" && r.below(3) == 0 { frame = "range between 3 preceding and current row exclude current row" }
+    }
+    if k == 2 && r.below(5) == 0 { f = f + " filter (where w.i > 20)" }
+    var spec = p
+    if o != "" { spec = spec + (if spec == "" { "" } else { " " }) + o }
+    if frame != "" { spec = spec + " " + frame }
+    return f + " over (" + spec + ")"
+}
+
+fn gen(r: mut &lexdb_base.Rng): str {
+    let froms = [" from w", " from w", " from w where w.i > 10", " from w join k on k.g = w.g", " from w left join k on k.g = w.g + 1 where w.id < 2000",
+                 " from (select * from w where w.id % 3 = 0) w", " from w where w.t like 'b%'", " from z w"]
+    var items: []str = ["w.id"]
+    for c in 0..(1 + r.below(3)) { append(mut &items, call(r)) }
+    if r.below(3) == 0 { append(mut &items, pick(r, &["w.t", "w.n + 1", "coalesce(w.v, 'x')", "w.i * 2"])) }
+    if r.below(4) == 0 { append(mut &items, "w.i - lag(w.i) over (order by w.id)") }
+    let from = pick(r, &froms)
+    let fromK = strings.contains(&from, "join k")
+    if fromK { append(mut &items, "k.name") }
+    var sql = "select " + strings.join(&items, ", ") + from
+    let tail = r.below(6)
+    if tail == 0 { sql = sql + " order by 2, 1" }
+    if tail == 1 { sql = sql + " order by 2 desc nulls last, 1 limit 25" }
+    if tail == 2 { sql = sql + " limit 30 offset 7" }
+    if tail == 3 { sql = sql + " order by 1 desc offset 2990" }
+    if tail == 4 && !fromK {
+        // DISTINCT over a call of few values
+        sql = "select distinct w.g, " + pick(r, &["count(*) over (partition by w.g)", "max(w.t) over (partition by w.g)", "rank() over (order by w.g)"]) + from +
+              pick(r, &["", " order by 1", " limit 3"])
+    }
+    return sql
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table w (id int primary key, g int, i int, t text, v varchar(12), n numeric(10,2), b boolean, ts timestamp, pad text)")
+        let c2 = q(mut &s, &"create table k (g int primary key, name text, wide text)")
+        let c3 = q(mut &s, &"create table z (id int primary key, g int, i int, t text, v varchar(12), n numeric(10,2), b boolean, ts timestamp, pad text)")
+        let l1 = q(mut &s, &("insert into w select x, x % 7, case when x % 11 = 0 then null else (x * 37) % 50 end, " +
+                             "case when x % 13 = 0 then null else chr(97 + x % 5) || chr(97 + x % 3) end, " +
+                             "case when x % 17 = 0 then null else 'v' || (x % 9)::text end, " +
+                             "case when x % 19 = 0 then null else ((x * 7) % 1000)::numeric / 10 end, x % 4 = 0, " +
+                             "timestamp '2024-01-01' + (x % 400) * interval '1 hour', repeat('p', x % 31) from generate_series(1, 3000) x"))
+        let l2 = q(mut &s, &"insert into k select g, 'k' || g::text, repeat('q', 200 * g) from generate_series(0, 6) g")
+        let l3 = q(mut &s, &"insert into z select * from w where false")
+        println("tables: " + l1 + " " + l2 + " " + l3)
+
+        var r = lexdb_base.rng(17)
+        var tg = tally()
+        for i in 0..500 { three(mut &s, &gen(mut &r), mut &tg) }
+        println("generated: " + tg.n.toStr() + " queries, " + tg.same.toStr() + " the same three ways, " + tg.win.toStr() + " on the Window")
+
+        var tf = tally()
+        let fixed = [
+            // errors: an output in a later row, before and past a LIMIT; an argument; a key
+            "select w.id, row_number() over (order by w.id), 10 / (w.id - 2500) from w",
+            "select w.id, row_number() over (order by w.id), 10 / (w.id - 2500) from w limit 3",
+            "select w.id, row_number() over (order by w.id), 10 / (w.id - 2500) from w order by w.id desc limit 3",
+            "select w.id, sum(10 / (w.id - 2999)) over (order by w.id) from w limit 1",
+            "select w.id, rank() over (partition by 10 / (w.id - 1500) order by w.id) from w limit 5",
+            "select w.id, lag(w.i, 10 / (w.id - 3000)) over (order by w.id) from w",
+            "select distinct w.g, 10 / (w.id - 2222) + count(*) over () from w limit 1",
+            // frames and arguments refused
+            "select w.id, sum(w.i) over (order by w.id rows between -1 preceding and current row) from w",
+            "select w.id, sum(w.i) over (order by w.id rows between null preceding and current row) from w",
+            "select w.id, sum(w.i) over (order by w.n range between -2 preceding and current row) from w",
+            "select w.id, ntile(0) over (order by w.id) from w",
+            "select w.id, nth_value(w.t, 0) over (order by w.id) from w",
+            "select w.id, ntile(w.i - w.i) over (order by w.id) from w where w.id > 5",
+            // held rows, a join's wide unread columns, an empty input
+            "with c as (select w.id, w.g, w.t from w where w.id < 200) select c.id, row_number() over (partition by c.g order by c.t, c.id) from c",
+            "select v.a, sum(v.b) over (order by v.a rows between 1 preceding and current row) from (values (1, 10), (2, null), (3, 30), (2, 5)) v(a, b)",
+            "select w.id, k.name, count(*) over (partition by k.name) from w join k on k.g = w.g where w.id < 50",
+            "select w.id, row_number() over () from z w",
+            "select count(*) over () from z",
+            "select w.id, row_number() over () from w where false",
+            // named windows, several partitionings, expressions over calls
+            "select w.id, count(*) over a, sum(w.i) over (a rows between unbounded preceding and current row), rank() over b from w window a as (partition by w.g order by w.id), b as (order by w.t nulls first) order by 1 limit 20",
+            "select w.id, w.i - lag(w.i) over (partition by w.g order by w.id), 100 * w.i / nullif(sum(w.i) over (partition by w.g), 0) from w order by 1 limit 12",
+            "select w.id, first_value(w.t) over (partition by w.b order by w.n desc nulls last, w.id), last_value(w.t) over (partition by w.b order by w.n desc nulls last, w.id rows between unbounded preceding and unbounded following) from w order by 1 desc limit 6",
+            // ORDER BY an expression not in the list, a position, a call
+            "select w.id, rank() over (order by w.i) from w order by w.t nulls first, w.id limit 9",
+            "select w.id, rank() over (order by w.i) r from w order by r desc, w.id limit 5 offset 1",
+            "select w.id, sum(w.n) over (partition by w.t) from w order by sum(w.n) over (partition by w.t) desc nulls last, 1 limit 4",
+            // DISTINCT and LIMIT over calls
+            "select distinct w.t, count(*) over (partition by w.t) from w order by 1 nulls first",
+            "select distinct w.b, max(w.i) over (partition by w.b) from w limit 1",
+            // a text key under a collation, numerics and timestamps as keys
+            "select w.id, row_number() over (partition by w.t collate \"C\" order by w.v collate \"C\" desc, w.id) from w where w.id < 40",
+            "select w.id, sum(w.i) over (order by w.ts range between interval '2 hours' preceding and current row) from w order by 1 limit 10",
+            // an uncorrelated subquery in an output and a key
+            "select w.id, (select max(g) from k) + row_number() over (order by w.id) from w limit 4",
+            // a correlated subquery: the row engine (winShape)
+            "select w.id, (select max(w.id) from k) + row_number() over (order by w.id) from w limit 4",
+            "select w.id, rank() over (order by w.i - (select min(g) from k)) from w order by 1 limit 4"]
+        for x in fixed { three(mut &s, &x, mut &tf) }
+        println("fixed: " + tf.n.toStr() + " queries, " + tf.same.toStr() + " the same three ways, " + tf.win.toStr() + " on the Window, errors " + tf.errs.toStr())
+
+        // max_statement_mem at each query's edge: the least (in kB) the row
+        // engine runs it in, found by halving, then the three ways at it and
+        // a kB under it (inputs of several sizes, so the edges fall at other
+        // bytes of a kB)
+        var tm = tally()
+        let mq = ["select w.id, row_number() over (partition by w.g order by w.id) from w where w.id < N",
+                  "select w.id, k.name, rank() over (partition by k.name order by w.n) from w join k on k.g = w.g where w.id < N",
+                  "select distinct w.g, count(*) over (partition by w.g) from w where w.id < N",
+                  "select w.id, sum(w.n) over (order by w.t, w.id), w.pad from w where w.id < N order by 2 desc limit 3"]
+        let ns = [300, 777, 1024, 1026, 1999, 3001]
+        for n in ns {
+            for x0 in mq {
+                let x = strings.replaceAll(&x0, " N", &(" " + n.toStr()))
+                let kb = edge(mut &s, &x)
+                for at in [kb - 1, kb] {
+                    let set = q(mut &s, &("set max_statement_mem = '" + at.toStr() + "kB'"))
+                    three(mut &s, &x, mut &tm)
+                }
+                let reset = q(mut &s, &"set max_statement_mem = 0")
+            }
+        }
+        println("memory: " + tm.n.toStr() + " queries, " + tm.same.toStr() + " the same three ways, " + tm.win.toStr() + " on the Window, errors " + tm.errs.toStr())
+
+        // window calls over the groups the pipeline makes
+        var tgr = tally()
+        let grouped = [
+            "select w.g, sum(w.i), rank() over (order by sum(w.i) desc) from w group by w.g order by 1",
+            "select w.g, count(*), sum(count(*)) over (), sum(sum(w.n)) over (order by w.g) from w group by w.g order by 1",
+            "select w.t, count(*), row_number() over (order by w.t nulls first) from w group by w.t having count(*) > 150",
+            "select w.g, w.b, max(w.i), lag(max(w.i)) over (partition by w.b order by w.g) from w group by w.g, w.b order by 2, 1",
+            "select w.g, avg(w.n), dense_rank() over (partition by w.g % 2 order by avg(w.n)) from w group by w.g order by 1",
+            "select w.g, min(w.t), first_value(min(w.t)) over (order by w.g desc) from w where w.i > 10 group by w.g order by 1",
+            "select k.name, count(*), rank() over (order by count(*), k.name) from w join k on k.g = w.g group by k.name order by 1",
+            "select w.g, sum(w.i), 10 / (rank() over (order by w.g) - 3) from w group by w.g",
+            "select w.g, count(*) filter (where w.b), sum(count(*) filter (where w.b)) over (order by w.g rows between 1 preceding and 1 following) from w group by w.g order by 1",
+            "select count(*), row_number() over () from w",
+            "select w.g, count(*), ntile(2) over (order by w.g) from z w group by w.g",
+            "select w.g, sum(w.i), string_agg(w.g::text, ',') over (order by w.g) from w group by w.g order by 1 limit 3 offset 2",
+            "select w.g, count(*), sum(count(*)) over (order by w.g) from w group by rollup (w.g) order by 1"]
+        for x in grouped { three(mut &s, &x, mut &tgr) }
+        println("groups: " + tgr.n.toStr() + " queries, " + tgr.same.toStr() + " the same three ways, " + tgr.grp.toStr() + " on the groups")
+
+        let f1 = q(mut &s, &"select w.id, w.g, row_number() over (partition by w.g order by w.id) from w where w.g = 1 or w.id < 3 order by 1 limit 3")
+        let f2 = q(mut &s, &"select w.id, row_number() over (order by w.id desc) from w order by 1 limit 2")
+        println("first rows: " + f1 + " | " + f2)
+        return 0
+    }).unwrap()
+}

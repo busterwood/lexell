@@ -8120,6 +8120,9 @@ pub fn pipeWin(sel: mut &Sel): Option[PPlan] {
         append(mut &slots, c)
         append(mut &ins, BX.Col(c))
     }
+    // (no column kept: a Project of one NULL, not a view's empty one; the
+    // rows hold none)
+    if len(ins) == 0 { append(mut &ins, BX.Const(Val.Null)) }
     let got = planConds(sel)
     if got.isNone() { return noWin("a window: a condition does not bind (planX)") }
     let cs = got.unwrap()
@@ -8360,7 +8363,6 @@ pub fn aggWhy(sel: &Sel): str {
     let q = &sel.q
     if sel.setop != 0 { return "a set operation" }
     if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
-    if len(sel.wins) > 0 { return "agg: a window over the groups" }
     if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
@@ -8499,7 +8501,8 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
 // MinMax).
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
+    // (window calls over the groups: exec's view over them, as HAVING, Q8 R7)
+    if sel.setop != 0 || len(sel.srf) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters;
     // one left per row: an Apply's, Q8 R6, not in a key or argument, not
     // under MIN/MAX by the scan's order, R2's MinMax)
@@ -8525,6 +8528,17 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Apply(i, _) { unplan(sel, i) }
         PPlan.ProjectSet(i, _) { unplan(sel, i) }
+        // (a view over the groups; a Window the pipeline runs: unplanWin's)
+        PPlan.Window(i, pw) {
+            if pw.isNone() {
+                unplan(sel, i)
+                return
+            }
+            match move(i) {
+                PPlan.Project(j, _) { unplan(sel, j) }
+                else {}
+            }
+        }
         PPlan.Project(i, xs) {
             if len(xs) == 0 {
                 // a view: the Sel holds its outputs
@@ -8647,7 +8661,8 @@ fn rangePath(q: &Query, lv: &Level): bool {
 //   order, as the row path reads them, so the reads are noted the same.
 
 // The query's columns a grouped select reads after grouping: those its
-// outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.
+// outputs, HAVING, ORDER BY (with DISTINCT ON's keys) and window calls (their
+// PARTITION BY, ORDER BY, arguments and FILTER: Q8 R7) name.
 fn afterCols(sel: &Sel, q: &Query): []int {
     var names: []str = []
     for x in sel.exprs { lexdb_sql.colNames(&x, mut &names) }
@@ -8656,6 +8671,11 @@ fn afterCols(sel: &Sel, q: &Query): []int {
         None {}
     }
     for x in sel.order { lexdb_sql.colNames(&x, mut &names) }
+    for w in sel.wins {
+        for x in w.part { lexdb_sql.colNames(&x, mut &names) }
+        for x in w.order { lexdb_sql.colNames(&x, mut &names) }
+        for x in lexdb_window.argsOf(&w) { lexdb_sql.colNames(&x, mut &names) }
+    }
     var out: []int = []
     for n in names {
         let ci = lexdb_bind.colIndex(&q.cols, &n)
