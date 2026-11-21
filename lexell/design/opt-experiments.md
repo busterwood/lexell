@@ -173,7 +173,87 @@ which shows up as branch misses at equal instructions (pts.sh, R1/R6), not as i-
 | Perceus reuse (2.8) | plausible: allocation is about 5% of the compiler's samples (malloc, rt_free, pools). The ceiling is the share of drop-then-same-size-alloc pairs, which needs a runtime census first |
 | multi-return Result (2.9) | the review itself expects it below the gate |
 
-## 5. Next, in order
+## 5. The allocator's size class (runtime, `native/rt.c`)
+
+Allocation was 4-11% of instructions:
+
+| program | share |
+|---|---:|
+| the compiler | 4.8% |
+| lexdb point selects | 4.1% |
+| cmark | 6.4% |
+| json | 8.9% |
+| jq | 11.4% |
+
+That came to 25-37 instructions per `malloc`. The fast path itself is a free-list pop
+(5 instructions). The rest was `class_of`, a linear scan of the 32 size classes above
+120 bytes:
+
+- gcc vectorized the scan with AVX2, ending in `vzeroupper`.
+- It also hoisted the vector set-up above the test for small sizes, so every allocation
+  paid for it.
+
+The fix:
+
+- **Small sizes** (8-120 bytes) keep their arithmetic, `(n + 7) >> 4`.
+- **Larger sizes** take one load from a 4 KB table. Every class size is 16k + 8, so the
+  sizes in (16(k-1) + 8, 16k + 8] share the smallest class of at least 16k + 8: entry k.
+  The classes are unchanged.
+
+Two lessons came out of it:
+
+- **A table load for the small sizes made bench alloc 29% slower**, at some heap addresses
+  only. It was deterministic with ASLR off: 1,760M against 1,360M cycles, and 1,245-1,762M
+  with ASLR on. The blocks' stores and the load collided. So the small sizes keep their
+  arithmetic, and that version runs at 1,202-1,341M.
+- **Filling the table one entry at a time cost about 40K instructions at start** (`tail -n 5`
+  +14%). It is now filled a class at a time: +1.1K.
+
+Results against main's compiler (`e3`). Every timed step ran under the exclusive bench lock,
+interleaved where it says so:
+
+| measure | instructions | cycles |
+|---|---:|---:|
+| lexdb point select / sel1 / gs / insert / update (fixed seed) | -2.41 / -2.92 / -2.90 / -2.24 / -2.34% | battery round -1% to -19%, later rounds ±9% noise from an unlocked suite on the machine |
+| TPC-H, server instructions per query | **-1.03%** geomean, all 22 down (q2 -2.67, q20 -2.09, q13 -1.55, q9 -1.45, q22 -1.44, q7 -1.42; least q1 -0.17%) | results identical, all `ok` |
+| perfsuite run suite / compile suite | -1.34 / -0.98% | -1.35 / -0.02% |
+| bench alloc / lists / trees / strings / maps (interleaved, 5 rounds) | -8.33 / -3.85 / -3.34 / -3.27 / -0.70% | -4.8 / -3.5 / -6.1 / -1.3 / -0.5% (medians) |
+| cmark / jq / json / the compiler compiling itself (interleaved) | -0.81 / -1.44 / -1.31 / -0.72% | -0.90 / +0.60 / +0.22 / -0.04% (medians) |
+| regex, decimal | -0.08 / -0.48% | +0.78 / -0.38% |
+| fib, loop, array, sieve, tokens | level | level |
+| grep, sort, eza `-T`, eza `-l` | -0.00 to -1.58% | -2.1 to -0.1% |
+| HTTP server, 1/10/100 clients, 2 alternated rounds | | level |
+| startup (`tail` on two lines) | +0.4% (268K to 269K) | |
+
+`gate.sh quick` passes, and the lexdb suite passes 271/271. This passes "Judging a pass" on
+its first rule: the run suite gains at least 1%, and the compile suite costs nothing.
+
+## 6. Frame set-up and tear-down (the ceiling for shrink-wrapping)
+
+**Method.** Instruction samples (`perf record -e instructions:u`) landing on the program
+functions' pushes of callee-saved registers, `mov rbp,rsp`, the entry `sub rsp`, `leave` and
+`ret`. The epilogue's restores are loads and are not counted, so this is a lower bound.
+
+| program | frame share | in leaf functions | elsewhere |
+|---|---:|---:|---:|
+| the compiler (built without `-O`) | 6.10% | 1.46% | 4.64% |
+| cmark | 4.38% | 1.04% | 3.34% |
+| jq | 4.59% | 1.64% | 2.96% |
+| lexdb point select | 0.99% | 0.13% | 0.86% |
+
+A leaf function here makes no call but the traps. The hottest one is jq's
+`json.Decoder.skipSpace`, at 1.25% of samples:
+
+- It is a leaf, yet keeps `d` in `rbx` (a callee-saved register it must save).
+- It copies the string header to two frame slots and reads them back.
+- So it needs a full frame; about 8 of its roughly 25 instructions a call are frame work.
+
+**Reading.** Shrink-wrapping proper only helps the non-leaf share on paths that make no
+call. In leaf functions the levers are caller-saved registers and fewer frame slots: the
+second is item 3's scalar replacement. The gain is at most 1-2% of instructions for
+cmark, jq and the compiler, and almost nothing for lexdb.
+
+## 7. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
