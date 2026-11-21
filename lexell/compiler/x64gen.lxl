@@ -2797,6 +2797,8 @@ fn (g: mut &Gen) stmt1(s: int) {
     } else if k == ir.S_IF && n.c < 0 && g.incIf(if g.u.nk(n.a) == ir.E_LNOT { g.u.nodes[n.a].a } else { n.a },
         g.u.nk(n.a) == ir.E_LNOT, n.b) {
         // done: a count without a branch
+    } else if k == ir.S_IF && g.u.nk(n.a) != ir.E_LNOT && g.genChain(n.a, n.b, n.c) {
+        // done: a jump table
     } else if k == ir.S_IF {
         let elseL = g.a.newLabel()
         g.branch(n.a, elseL, false)
@@ -3191,6 +3193,7 @@ fn (g: mut &Gen) fusedIf(d: int, s: int): bool {
         g.branch(dn.b, jl, !neg)
         return true
     }
+    if !neg && g.genChain(dn.b, sn.b, sn.c) { return true }
     let elseL = g.a.newLabel()
     g.branch(dn.b, elseL, neg)
     let before = g.frame
@@ -3383,6 +3386,157 @@ fn (g: mut &Gen) loadEightbytes(cls: &[]int, s: int) {
             ni += 1
         }
     }
+}
+
+// ---------------------------------------------------------------- dispatch
+
+// Whether e is `x == c` or an || of such (c a 32-bit constant), all of one x that is a load
+// that cannot fail (loadOnly): x is set to the first one's tree, the constants appended to out.
+fn (g: &Gen) caseSet(e: int, x: mut &int, out: mut &[]int): bool {
+    let n = g.u.nodes[e]
+    if n.k == ir.E_LOR { return g.caseSet(n.a, x, out) && g.caseSet(n.b, x, out) }
+    if n.k == ir.E_CAST && g.tk(n.ty) == ir.TY_BOOL { return g.caseSet(n.a, x, out) }
+    if n.k != ir.E_BIN || n.v != ir.OP_EQ { return false }
+    let c = n.c
+    if g.isF(c) || g.is128(c) || g.isAggr(c) { return false }
+    let bn = g.u.nodes[n.b]
+    if bn.k != ir.E_INT || !x64.fits32(bn.v) { return false }
+    if g.u.nodes[n.a].ty != c || !g.loadOnly(n.a) { return false }
+    if x < 0 {
+        x = n.a
+    } else if !g.sameTree(x, n.a) {
+        return false
+    }
+    append(out, bn.v)
+    return true
+}
+
+// A set of four or more constants of one x within 64 of each other, as one bit test and one
+// branch: jumps to l when the truth of e is when, and true; else false and no code.
+fn (g: mut &Gen) branchBits(e: int, l: int, when: bool): bool {
+    var x = -1
+    var vs: []int = []
+    if !g.caseSet(e, mut &x, mut &vs) || len(vs) < 4 { return false }
+    var lo = vs[0]
+    var hi = vs[0]
+    for v in vs {
+        if v < lo { lo = v }
+        if v > hi { hi = v }
+    }
+    if hi - lo > 63 { return false }
+    if lo > 0 && hi <= 63 { lo = 0 }
+    var mask = 0
+    for v in vs { mask = mask | (1 << (v - lo)) }
+    var r = g.regOf(x)
+    if r < 0 || lo != 0 {
+        g.gen(x)
+        if lo != 0 { g.a.aluI(x64.SUB, 8, RAX, lo) }
+        r = RAX
+    }
+    // no branch on the range: a value above it tests an empty mask (a jump on the range is taken
+    // or not by the data, where the compares it replaces were all rarely taken)
+    g.a.movRI(RCX, mask)
+    g.a.alu(x64.XOR, 4, RDX, RDX)
+    g.a.aluI(x64.CMP, 8, r, hi - lo)
+    g.a.cmov(x64.CC_A, RCX, RDX)
+    g.a.bt(RCX, r)
+    g.a.jcc(if when { x64.CC_B } else { x64.CC_AE }, l)
+    return true
+}
+
+// The next link of an if-chain in the else part s: its if (an if, alone in a block or after the
+// declaration of the bool it tests, fused), and the condition tested; -1 when s is no link.
+fn (g: &Gen) chainLink(s: int): Link {
+    let none = Link{s: -1, cond: -1}
+    if g.spillsHere(s) { return none }
+    let n = g.u.nodes[s]
+    if n.k == ir.S_IF {
+        if g.u.nk(n.a) == ir.E_LNOT || g.jumpOnly(n.b) >= 0 { return none }
+        return Link{s: s, cond: n.a}
+    }
+    if n.k != ir.S_BLOCK || n.v == 1 { return none }
+    let cnt = g.u.listLen(n.a)
+    if cnt == 1 { return g.chainLink(g.u.listAt(n.a, 0)) }
+    if cnt != 2 { return none }
+    let d = g.u.listAt(n.a, 0)
+    let f = g.u.listAt(n.a, 1)
+    if !g.fusesIf(d, f) || g.spillsHere(d) || g.spillsHere(f) || g.u.nk(g.u.nodes[f].a) == ir.E_LNOT { return none }
+    return Link{s: f, cond: g.u.nodes[d].b}
+}
+
+type Link = value record {
+    s: int          // the if
+    cond: int       // the condition it tests
+}
+
+// `if (x == a) A else if (x == b || x == c) B ... else D` (if-chains and match on one x, a
+// load that cannot fail), with eight or more constants in a dense range and eight or more arms
+// (shorter chains predict better than one indirect jump: json.writeValue, six arms, missed more),
+// as a jump table: true when generated so.
+fn (g: mut &Gen) genChain(cond: int, then: int, els: int): bool {
+    if els < 0 { return false }
+    var x = -1
+    var vals: []int = []
+    var arms: []int = []            // for each constant, the arm it goes to
+    var bodies: []int = [then]
+    if !g.caseSet(cond, mut &x, mut &vals) { return false }
+    for v in vals { append(mut &arms, 0) }
+    var rest = els
+    while rest >= 0 {
+        let lk = g.chainLink(rest)
+        if lk.s < 0 { break }
+        let n0 = len(vals)
+        if !g.caseSet(lk.cond, mut &x, mut &vals) {
+            while len(vals) > n0 { pop(mut &vals) }
+            break
+        }
+        for j in n0..len(vals) { append(mut &arms, len(bodies)) }
+        append(mut &bodies, g.u.nodes[lk.s].b)
+        rest = g.u.nodes[lk.s].c
+    }
+    if len(bodies) < 8 || len(vals) < 8 { return false }
+    var lo = vals[0]
+    var hi = vals[0]
+    for v in vals {
+        if v < lo { lo = v }
+        if v > hi { hi = v }
+    }
+    let span = hi - lo + 1
+    if span > 4 * len(vals) || span > 1024 { return false }
+    var lbs: []int = []
+    for b in bodies { append(mut &lbs, g.a.newLabel()) }
+    let dl = g.a.newLabel()
+    // the arm of each value of the range (the first test of a constant wins)
+    var slot = array(span, -1)
+    for j in 0..len(vals) {
+        if slot[vals[j] - lo] < 0 { slot[vals[j] - lo] = arms[j] }
+    }
+    g.gen(x)
+    if lo != 0 { g.a.aluI(x64.SUB, 8, RAX, lo) }
+    g.a.aluI(x64.CMP, 8, RAX, hi - lo)
+    g.a.jcc(x64.CC_A, dl)
+    let tbl = g.a.newLabel()
+    g.a.leaLabel(RCX, tbl)
+    g.a.loadSX(4, RAX, x64.memx(RCX, RAX, 4, 0))
+    g.a.alu(x64.ADD, 8, RAX, RCX)
+    g.a.jmpR(RAX)
+    g.a.bind(tbl)
+    for i in 0..span { g.a.tableEntry(if slot[i] < 0 { dl } else { lbs[slot[i]] }, tbl) }
+    let end = g.a.newLabel()
+    let before = g.frame
+    for i in 0..len(bodies) {
+        g.a.bind(lbs[i])
+        g.stmt(bodies[i])
+        g.frame = before
+        g.a.jmp(end)
+    }
+    g.a.bind(dl)
+    if rest >= 0 {
+        g.stmt(rest)
+        g.frame = before
+    }
+    g.a.bind(end)
+    return true
 }
 
 fn (g: mut &Gen) genSwitch(s: int) {
@@ -6021,6 +6175,8 @@ fn (g: mut &Gen) branch(e: int, l: int, when: bool) {
         if (n.v != 0) == when { g.a.jmp(l) }
     } else if k == ir.E_LNOT {
         g.branch(n.a, l, !when)
+    } else if k == ir.E_LOR && g.branchBits(e, l, when) {
+        // done: one bit test
     } else if k == ir.E_LAND || k == ir.E_LOR {
         // a && b jumps when false if either is false; when true only if both are
         let isAnd = k == ir.E_LAND
