@@ -1720,6 +1720,21 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 return Ok(Expr.Call(nm.clone(), out, star))
             }
             for a in args { append(mut &out, try resolve(&a, cols, n, ns)) }
+            if nm == "#win" && len(out) == 2 {
+                // a window's sum of bigints: the window's value made the sum's type (wideSum), its call left as it is
+                match wideInner(&out[1]) {
+                    Some(c) {
+                        out[1] = c
+                        return Ok(Expr.Cast(Expr.Call(nm.clone(), out, star), wideType(ns)))
+                    }
+                    None {}
+                }
+            }
+            if !star && len(out) >= 1 && isAgg(&nm) && lexdb_sql.aggBase(&nm) == "sum" {
+                // sum of bigints: PostgreSQL's numeric (its total exact past 2^63: lexdb_agg.sumAdd)
+                let pt = ptypesOf(ns)
+                if exprOid(&out[0], cols, &pt, &ns.ty) == lexdb_sql.OID_INT8 { return Ok(Expr.Cast(Expr.Call(nm.clone(), out, star), wideType(ns))) }
+            }
             if nm == "in" && !star {
                 // x IN (a, b) beside a date or time column x: as x = a OR x = b
                 for i in 1..len(out) {
@@ -1803,6 +1818,27 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
         }
         else { return Ok(clone(x)) }
     }
+}
+
+// The type of a sum of bigints (resolve casts the call to it): PostgreSQL's
+// numeric; at the T-SQL door SQL Server's bigint, past 2^63 an error (the
+// cast's) as before.
+fn wideType(ns: &Names): lexdb_sql.TypeName {
+    return lexdb_sql.oidType(if pgRules(ns) { lexdb_sql.OID_NUMERIC } else { lexdb_sql.OID_INT8 })
+}
+
+// The sum call x casts to wideType, if it is one (a window's function).
+pub fn wideInner(x: &Expr): Option[Expr] {
+    match x {
+        Expr.Cast(a, _) {
+            match a {
+                Expr.Call(f, _, _) { if isAgg(&f) && lexdb_sql.aggBase(&f) == "sum" { return Some(clone(&a)) } }
+                else {}
+            }
+        }
+        else {}
+    }
+    return None
 }
 
 // A call's values (valueArgs) made of their common type: each

@@ -1698,7 +1698,7 @@ pub fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int
         if lexdb_ops.isNull(&av[g]) {
             av[g] = b.vals[c][r].clone()
         } else if summing {
-            av[g] = try lexdb_ops.arith(lexdb_ops.OP_ADD, &av[g], &b.vals[c][r])
+            av[g] = try lexdb_agg.sumAdd(&av[g], &b.vals[c][r])
         } else {
             let x = try lexdb_ops.compare(&b.vals[c][r], &av[g])
             if (mx && x >= 0) || (!mx && x <= 0) { av[g] = b.vals[c][r].clone() }
@@ -1721,7 +1721,8 @@ pub fn bAccDec(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn:
 
 // Adds the rows (gids: their groups) of a batch to an aggregate's counts,
 // sums and minima or maxima per group; one: a single group (its values
-// kept in registers through the loop).
+// kept in registers through the loop). A sum past 2^63 is batErr: the
+// batches give way (AggSt.eat) to the row path's exact one.
 pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: mut &[]int, su: mut &[]int,
           mm: mut &[]int): Result[Unit, DbErr] {
     let k = len(rows)
@@ -1751,7 +1752,7 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
                 if a.nul[j] { continue }
                 match s.checkedAdd(a.v[j]) {
                     Some(w) { s = w }
-                    None { return Err(e("22003", "bigint out of range")) }
+                    None { return Err(batErr()) }       // past 2^63: the row path's numeric (eat gives way)
                 }
                 c += 1
             }
@@ -1763,7 +1764,7 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
                 let g = gids[j]
                 match su[g].checkedAdd(a.v[j]) {
                     Some(w) { su[g] = w }
-                    None { return Err(e("22003", "bigint out of range")) }
+                    None { return Err(batErr()) }
                 }
                 cn[g] += 1
             }
@@ -3890,7 +3891,14 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
     }
     let got = ag.accum(&specs, b, idx, &gid, one)
     ag.specs = specs
-    try got
+    match got {
+        Ok(_) {}
+        Err(x) {
+            // an integer sum past 2^63 (bAccum): the batches give way to the row path, whose sum is a numeric
+            if isBat(&x) { return Ok(false) }
+            return Err(x)
+        }
+    }
     return Ok(true)
 }
 
