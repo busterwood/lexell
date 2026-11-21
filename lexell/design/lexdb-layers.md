@@ -7739,6 +7739,183 @@ ranges, IN subqueries, MERGE with DELETE WHERE), Oracle Database Free's
 answers (`gen_oracle.py --check tns_r5`: 31 checked, no difference).
 Expectations changed: `exec_subrows` (its writes' own runs: pipeline runs
 888 -> 896).
+### 6.3.Q8 R7 as built (windows) (2026-11-21)
+
+R7's window part of 6.5. Branch `worktree-agent-ae4dbd05871d1984b` from
+main 3aabcade, with the paused first attempt (56aa2201, from main
+757c4cee: stage 1, the window driver moved into `lexdb_window`; stage 2,
+the Window operator, written but never compiled) merged in and brought up
+to R2-R6. `SET lexdb_batch = off` (the row engine, the tests' reference)
+is untouched; no row-engine code was deleted (`winValues` is the row
+engine's glue to `lexdb_window.allValues` now, `winBatch` stays). R7's
+other parts, the views over the groups as operators and FOR UPDATE's lock
+operator, are **not built** (left below).
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 3aabcade | | 20,230 | `lexdb_pipe` 8,572, `lexdb_plan` 8,838, `lexdb_window` 1,684 |
+| e91fcacb | 56aa2201 merged (both sides kept: R2's Result, R3's ProjectSet and function in FROM, R6's Apply); built on today's main (`Prog.run`, R2's `PSort` fields, R6's `ask` through the Window); the outputs always through a `SortSt` (one OutBatch, as a Sort gives its rows); `max_statement_mem` checked as the row engine checks it before any row is given | 20,152 | `lexdb_pipe` 8,816, `lexdb_window` 1,825 |
+| 7da894c7 | windows over an aggregate's groups the pipeline makes; a Window whose input keeps no column; test `exec_winpipe` | 20,152 | `lexdb_plan` 9,065 |
+| 036e7cc2 | tests `tds_winpipe` (SQL Server 2022's answers), `tns_winpipe` (Oracle Free's; `gen_oracle.py --check` knows it); T-SQL's NTILE(0) error 4116 (was 50000) | 20,152 | `lexdb_tsql` +1 |
+| 2b9585b3 | the Window under DISTINCT ON, TOP, TOP PERCENT and WITH TIES when sorted | 20,152 | `lexdb_plan` 9,073 |
+| 9a7fed1a | the input's chunk values put at their slots (no `obRow` and copy); unsorted rows given one by one (runSel's sorted path takes rows too) | 20,154 | `lexdb_pipe` 8,842 |
+| 7fec138f | outputs that are a column or a call's value read at their place | 20,154 | `lexdb_pipe` 8,862 |
+
+`lexdb_exec` -76: the window driver (`winValues`' 100 lines of partition
+and order keys, the shared sort, `frameOff`) is `lexdb_window.allValues`
+and `frameOff`; exec keeps the hook (`ev(H_KEY | H_ARG | H_OFF, call, i,
+row)`: a key or argument by `evalX`, an aggregate's argument and FILTER
+plainly, a frame's offset once) and `pipeWinSel` (14 lines, reached only
+where `pipeShape` said no: no cost on the point-select planning path);
++2 in `runSel`'s sorted path (a row given alone, not in an OutBatch).
+
+**What it does.**
+
+- **A query of window calls over rows** (`lexdb_plan.winShape`: not
+  grouped, one table or joins, no correlated subquery left, no set
+  operation, function in FROM, lock, MATCH_RECOGNIZE, `SELECT @v =` or
+  set-returning function in the list; DISTINCT ON, TOP and WITH TIES when
+  sorted and not DISTINCT, as `sortShape`) is planned by `pipeWin`:
+  `Limit? (Sort? (Distinct? (Project (Window (Project (the input))))))`,
+  the input the conditions, scan and joins as `pipeShape`'s plan has them;
+  `PPlan.Window(PPlan, Option[PWin])` (None: a view, `physAbove`'s), its
+  `PWin` the calls, per call its keys, arguments (`argsOf`) and frame
+  offsets bound by `lexdb_bind.bindSubsAggs` (subqueries run once, `#agg
+  i` the calls' values), and the query's columns a row keeps (`slots`:
+  those read above it, and a single table's decoded ones, so a row holds
+  what the row engine's row holds; none: a Project of one NULL). EXPLAIN
+  prints `physOf`'s plan as before.
+- **The operator** (`lexdb_pipe.compileWin`, `runWin`, `winBody`; `run`'s
+  and `runJ`'s `sorts` branch): the input run whole (`runOp`, or
+  `runJProj` with R6's `ask`), its rows held as `WinRow`s of the query's
+  width, counted against `max_statement_mem` row by row as the row engine
+  counts them (`winTake`: `rowBytes`, the room at the run's start); every
+  call's values by `lexdb_window.allValues(true, ...)` (the batches' path
+  the row engine takes: partitions and peer groups sorted by
+  `lexdb_window.sortRows`, windows of one specification sharing the sort,
+  frames over the held rows), hooks by `bxEval`; then every row's outputs
+  in the input's order (a column or a call's value read at its place, the
+  rest by `bxEval`) to a `SortSt` (P3's: sorted, DISTINCT, DISTINCT ON,
+  TOP, TOP PERCENT, WITH TIES), its own room and early stop off, which
+  gives one OutBatch; with none of those, the rows LIMIT and OFFSET keep,
+  given one by one as the row engine gives them (a `SortSt`'s OutBatch
+  cost the 1M-row rank +8.7% server samples against main; now -17.8%).
+  Every row's outputs are made, past a LIMIT too, so the first error is
+  the row engine's. The bytes held are the row engine's (its rows, then
+  every output row with its ORDER BY values: `winBytes`), checked before
+  any row is given (a `SortSt`'s own count set aside).
+- **Windows over an aggregate's groups**: `aggShape` no longer refuses
+  them; the pipeline makes the groups (`pipeGroups`) and exec's view over
+  them computes the windows, as HAVING (`afterCols` keeps the columns the
+  calls' PARTITION BY, ORDER BY, arguments and FILTER name; `underViews`
+  and `unplan` go through `Window(_, None)`). ROLLUP, CUBE and grouping
+  sets with windows stay 0A000 both ways.
+- **Give-ups.** A `SortSt` that cannot hold a value (`bad`: a sort key of
+  mixed kinds, while eating or at `finish`) returns `batErr` before any
+  row is given and before anything is held; the row engine runs the query
+  again (as P3's Sort; the outputs it made are made again: no volatile
+  call binds, `bindSubsAggs` refuses them). A key, argument, offset,
+  output or ORDER BY key that does not bind gives the Sel back
+  (`unplanWin`: its conditions; the outputs were never `ox`).
+- **The open questions of the paused note.** `max_statement_mem` at a
+  partition's edge for joins: the same; `exec_winpipe` finds each query's
+  edge (the least kB the row engine runs it in, by halving) over six input
+  sizes and runs it there and a kB under, a join with wide columns it does
+  not read included: 48 the same. A `SortSt` that gives up after the
+  outputs were made: the row engine again, nothing given (tested with a
+  column of mixed kinds, an error in a later row too).
+- **Counters** for the tests: `lexdb_pipe.winRuns()`.
+
+**Tests.** `exec_winpipe` (new; each statement batches off, on, and
+through a sink): 500 generated window queries (every function, ROWS,
+RANGE with offsets, GROUPS, EXCLUDE, FILTER, several partitionings,
+NULLs, duplicates and text keys, a collation's, DISTINCT, ORDER BY,
+LIMIT/OFFSET, joins, left joins, held rows, an empty table: all on the
+Window), 39 fixed (errors in a later row before and past a LIMIT and in a
+row DISTINCT ON drops, frame offsets NULL and negative, ntile and
+nth_value of 0, DISTINCT ON, WITH TIES, mixed kinds, a correlated
+subquery: the row engine), 48 at the memory edges, 13 grouped.
+`tds_winpipe` (30 T-SQL batches, SQL Server 2022's answers, the same both
+ways; TOP, TOP PERCENT, TOP WITH TIES and OFFSET ... FETCH among them) and
+`tns_winpipe` (30 statements, `gen_oracle.py --check`: 0 differences;
+NTH_VALUE, GROUPS, EXCLUDE, FETCH ... WITH TIES among them). Expectations
+moved: `exec_batchexpr`'s and `exec_batchsort`'s OutBatch counts (327 ->
+360 of 600, 200 -> 215 of 400: the sorted windows), `exec_held`'s held window, `exec_narrow`'s
+grouped window over batches. Suite: 280 tests pass. Found, not fixed (not
+windows): over the Oracle door `sum(10 / (id - 3001))` of 3,000 rows is
+ORA-01426 (numeric overflow) in lexdb, both engines; Oracle sums it.
+
+**Census** (the suite at main 3aabcade, 277 tests, against the branch,
+its three new tests' lines left out): the row engine's runs with batches
+on 21,066 -> 14,476; the pipeline's rows 337,788 -> 344,685. Gone: "a
+window (winValues)" 6,597 runs (5,952 statements, 21 tests) and "agg: a
+window over the groups" 11. Left, named: a window over a LATERAL level
+after the first (12 runs, one statement each: R4's dependent join), a
+frame offset that is a subquery (1: does not bind).
+
+**Gates.**
+
+All at 7fec138f against main 3aabcade.
+
+- Point select, INSERT and UPDATE by key, in process (the coordinator's
+  `pt2.lxl`, `LXL_HASH_SEED=1`, two rounds alternated, main's binary its
+  `r5f`; per statement = (mode - setup) / 20,000): point select 132,084.7
+  -> 132,084.7, INSERT 55,122,052.74 -> 55,122,052.75, UPDATE
+  55,143,232.59 -> 55,143,232.59: equal (the rounds' spread is about 200
+  instructions of a run, 0.01 a statement).
+- Over the wire: `pts.sh` (3 rounds, 15 runs each) server CPU 642.9 ->
+  633.7 ms, wall 692.0 -> 679.2 ms; `icount6.sh` on fresh copies, per
+  statement instructions 182,191 / 182,100 -> 182,037 / 182,062, cycles
+  103,748 / 104,295 -> 103,519 / 102,299, branch misses 419.6 / 422.7 ->
+  438.5 / 428.9 (L1i and iTLB misses a little up, 357 / 338 -> 377 / 394
+  and 32 / 31 -> 37 / 38, by placement; the cycles did not follow).
+- TPC-H SF1 (no windows; `~/tpch-w/r7`, base and branch alternated twice,
+  best of two): 22 checksums equal, total 11,426 -> 11,397 ms (0.997).
+  Over 1.5%: q22 163.6 -> 166.6 ms (1.018), its server instructions
+  1,708,293,388 / 1,708,712,814 -> 1,708,287,904 / 1,708,266,369: equal,
+  placement (q14 1.014 the same, 1,321.4M both). An earlier round (at
+  2b9585b3) read q15 1.032 at equal instructions (3,980.7M-3,980.9M both).
+- Window benchmark (`~/tpch-w/r7/wbench.sh`; `wb(id int primary key, g
+  int, v int)`, 1M rows, g = id % 1000; the server on CPUs 0-3, psql on
+  4-7,12-15; best of six runs for lexdb (three in each of two alternated
+  rounds), of three for PostgreSQL 18.6, `work_mem` 256MB, at most leader
+  + 3 workers; ms):
+
+  | query | main | branch | branch / main | PostgreSQL 18 |
+  |---|---:|---:|---:|---:|
+  | row_number per partition (`partition by g order by id`), summed | 317 | 268 | 0.845 | 317 |
+  | running sum (`sum(v) over (order by id)`), its max | 371 | 286 | 0.771 | 267 |
+  | moving average (`avg(v)`, 10 rows), its max | 518 | 443 | 0.855 | 369 |
+  | rank (`rank() over (order by v)`), its max | 329 | 299 | 0.909 | 267 |
+  | row_number per partition, 1M rows to the client | 425 | 438 | 1.031 | 430 |
+  | running sum, rows to the client | 455 | 399 | 0.877 | 393 |
+  | moving average, rows to the client | 595 | 514 | 0.864 | 514 |
+  | rank, rows to the client | 424 | 367 | 0.866 | 445 |
+
+  The first four wrap the window in a derived table under an aggregate
+  (one row out). The partitioned row_number to the client is +3% (server
+  samples +5%: `winTake`'s rows and the per-row `give` against
+  `winBatch`'s rows and the held result's; `lexdb_window.keyOf` reads
+  the same rows slower here, by their place in memory).
+
+**Left, and why.**
+
+- R7's other parts: the views over the pipeline's groups (HAVING, the
+  select list, DISTINCT, ORDER BY, LIMIT; and now the windows over the
+  groups) as operators, and FOR UPDATE's lock operator (200 runs): not
+  this agent's scope.
+- A window with a correlated subquery left per row (q.corr; the suite's
+  only one is a LATERAL level after the first, 12 runs): R6's Apply under
+  the Window is the way (`runJProj` already carries `ask`); `winShape`
+  refuses it.
+- DISTINCT with WITH TIES or TOP over windows (as `sortShape`), windows
+  with grouping sets (0A000 anyway), a frame offset that does not bind.
+- The operator is row by row past the scan (a `WinRow` per input row,
+  `bxEval` per evaluated output); the input's chunks kept as columns and
+  chunked outputs (which the partitioned row_number to the client needs
+  to beat main) are R9's or later.
 
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
@@ -7827,7 +8004,7 @@ times out under the census's writes, a line a run):
 | reason | statements | tests | runs | example | to cover | size |
 |---|---:|---:|---:|---|---|---|
 | a subquery's own rows (IN, EXISTS, a scalar's, a semi, anti or mark level's: `pipeSelIn(sel, false)`), INSERT ... SELECT's rows: 1,980 statements (129 tests) for that alone, 1,633 (32 tests, 138,873 runs) correlated per row as well | 3,360 | 135 | 151,021 | q16's `ps_suppkey not in (select s_suppkey from supplier where ...)`; per row: `exists (select 1 from f where f.xf = tn.k)` | offer their rows (`rows` true): `runChild`'s `execSel` already takes `pipeHeld`; the per-row ones need Apply as well (below). **Done, R1 (6.3.Q8 R1): the reason is gone; the per-row ones' own rows are offered too (the pipeline cheaper a run); 13,208 of their runs are the row engine's under their next reason** | small (a switch, measured per run: q20's 8,508) |
-| a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
+| a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators. **Done, R7 (6.3.Q8 R7): the Window operator; left 13 runs (a LATERAL level after the first, a frame offset that is a subquery)** | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
 | no FROM (`runQuery` with no level) | 814 | 116 | 42,808 | `select nextval('s')`, `select 1` | a Result arm: one row, its outputs by `bxEval` | small; a driver's `select 1` is point-select-like: OLTP gate |
 | a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59; offered by R1, gone) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo. **R6 (6.3.Q8 R6): those in one level's WHERE conjuncts are the pipeline's (the Apply; q2, q17, q20's partsupp query); left: LATERAL (R3), a 9.9 hashed probe, a path's key, two levels** | large |
 | a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) **Done, R3 (6.3.Q8 R3): a program of its own, its arguments bound, its rows by `lexdb_srf`; left: 13 runs whose argument does not bind (psql's `::regclass`)** | medium (`execSrf` 172 lines) |
@@ -7840,7 +8017,7 @@ times out under the census's writes, a line a run):
 | an expression that does not bind for the plan: an output (81), a condition (47), ORDER BY (2) | 130 | 44 | 694 | `select row_number() from emp`, `where count(*) > 1` (errors the row path raises), a session function | the binder raises the errors; the rest case by case | small each |
 | gave way at the run (a value a batch cannot hold: `batErr`), rows (84) and groups (37) | 119 | 38 | 182 | `select distinct sqrt(abs(e.n)) from e` | each operator's own fallback (6.2.3's table: a `BK_VAL` column), no whole-query give-way | medium |
 | a recursive CTE's working table as the first level | 44 | 5 | 50,312 | `with recursive t(n) as (select 1 union all select n + 1 from t where n < 10) ...` | the working table as rows the run holds (`heldRead`) | small |
-| aggregates it does not run: a window over the groups (11), a collation's key or call (13), calls, keys or conditions that do not bind (11) | 35 | 23 | 51 | `select count(distinct c) from w` (c a collated text) | collated keys and calls in `HashAgg` | small-medium |
+| aggregates it does not run: a window over the groups (11; **R7: the pipeline's groups, exec's view computes the windows**), a collation's key or call (13), calls, keys or conditions that do not bind (11) | 35 | 23 | 51 | `select count(distinct c) from w` (c a collated text) | collated keys and calls in `HashAgg` | small-medium |
 | DISTINCT ON (25), WITH TIES and TOP PERCENT (12), a set-returning function in the select list (8), `SELECT @v =` (1) | 46 | 10 | 66 | `values (1), (1), (2) order by 1 fetch first 1 row with ties` | Sort and Distinct variants | small each |
 
 **After R1** (6.3.Q8 R1, the same 254 tests): the row engine's runs with
@@ -7926,6 +8103,17 @@ held rows 120 (`fewSource`, kept: the pipeline costs a one-row upsert
 a condition that does not bind 1. The rest of the row engine's runs are
 as after R4 (21,066).
 
+**After R7** (6.3.Q8 R7, windows; main 3aabcade's run, 277 tests,
+against the branch's, its three new tests' lines left out): the row
+engine's runs with batches on 21,066 -> 14,476, the pipeline's rows
+337,788 -> 344,685. Gone: "a window (winValues)" 6,597 runs (5,952
+statements, 21 tests), "agg: a window over the groups" 11. Left of the
+windows: one over a LATERAL level after the first 12 (R4's dependent
+join), a frame offset that is a subquery 1. The rest is R7's other parts
+and R8-R9's: a correlated subquery in the outputs or ORDER BY 6,411, a
+9.9 hashed probe 6,158, outputs and conditions that do not bind 723, gave
+way 368 + 52, FOR UPDATE 200.
+
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
 joins by the levels program `Query.jp`): UPDATE 1,391 statements, DELETE
@@ -7980,7 +8168,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R4 (built: 6.3.Q8 R4) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`, its conditions bound by prepare); UPDATE by key 1,668 instructions fewer (-1.15%), TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
-| R7 | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait) | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
+| R7 (windows built: 6.3.Q8 R7) | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait). **Built: the Window operator over a query's rows (one table or joins; sorted, DISTINCT, DISTINCT ON, TOP, WITH TIES, LIMIT/OFFSET over it), windows over the pipeline's groups (exec's view); left: the views over the groups as operators, FOR UPDATE's lock operator, a window with a correlated subquery left per row (R6's Apply under the Window)** | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
 | R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
 | R9 | the deletion: `runQuery` and below (`runRows`, `runLevel`, `materialize`, `batchLevel`, `bLevelPlan`, `winBatch`, `fillPick`), `execSelIn`'s row branches, `addToGroup`, `sortOutRows`, `eachRowBIn`'s row path, `runSub`/`fillCur`'s per-row machinery, the levels program for the row engine (`Query.jp`, `levelsProg`), `Run`'s row-engine fields; `SET lexdb_batch` | (the census: no row-engine run with batches on, suite, TPC-H, OLTP) | the oracle in place first (below); the suite; TPC-H; OLTP | about 3,000 lines out of exec (the row engine proper: `materialize` to `runRows` 640, the subquery runs 600, `execSelIn`'s row branches 300, windows 260, `batchLevel` and its plan 300, `execSrf` 170, the row aggregates and sort 250, `eachRowBIn`'s and `outRow` 150; some of it moves into operators rather than going) |
 

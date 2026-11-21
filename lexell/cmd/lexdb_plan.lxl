@@ -197,7 +197,9 @@ pub type PPlan = closed {
     // bound, moved out of the Sel (None in a view, where the Sel holds them)
     Agg(PPlan, bool, Option[PAgg])
     Having(PPlan)
-    Window(PPlan)                   // the window calls (over the groups when it aggregates)
+    // the window calls (over the groups when it aggregates); their details
+    // for a Window the pipeline runs (Q8 R7; None in a view)
+    Window(PPlan, Option[PWin])
     Project(PPlan, []lexdb_bind.BX) // the select list: per output its expression bound over the query's columns (moved
                                     // from Sel.ox; a column as its slot); [] in a view, where the Sel holds them
     // the select list's set-returning values made rows (Q8 R3, PostgreSQL's
@@ -334,6 +336,20 @@ pub type PSort = record {
 pub const TS_TOP: int = 1
 pub const TS_FETCH: int = 2
 
+// A Window the pipeline runs (Q8 R7): the calls (the Sel's, copied; the
+// Project over it reads call i's value as #agg i), each one's PARTITION BY
+// then ORDER BY expressions, its arguments (lexdb_window.argsOf: an
+// aggregate's, then its FILTER) and its frame's start and end offsets,
+// bound over the query's columns; and per column of the Project under it
+// (its input) the query's column it is.
+pub type PWin = record {
+    pub wins: []WinPlan
+    pub keys: [][]BX
+    pub args: [][]BX
+    pub offs: [][]Option[BX]
+    pub slots: []int
+}
+
 // A range's bound: ">", ">=", "<" or "<=" its value.
 pub type PBound = record { pub op: str; pub val: lexdb_bind.BX }
 
@@ -453,6 +469,7 @@ fn planUses(p: &PPlan, used: mut &[]bool) {
             planUses(&i, used)
             for c in pa.reads { if c >= 0 && c < len(used) { used[c] = true } }
         }
+        PPlan.Window(i, _) { planUses(&i, used) }
         else {}
     }
 }
@@ -481,7 +498,7 @@ fn withNeeds(p: PPlan, used: &[]bool): PPlan {
         PPlan.Func(n, o, subs) { return PPlan.Func(n, o, subs) }
         PPlan.SetOp(k, all, r, parts, subs) { return PPlan.SetOp(k, all, r, parts, subs) }
         PPlan.MinMax(i) { return PPlan.MinMax(i) }
-        PPlan.Window(i) { return PPlan.Window(i) }
+        PPlan.Window(i, pw) { return PPlan.Window(withNeeds(i, used), pw) }
         PPlan.Lock(i) { return PPlan.Lock(i) }
         PPlan.ProjectSet(i, o) { return PPlan.ProjectSet(withNeeds(i, used), o) }
     }
@@ -562,7 +579,7 @@ pub fn pSubs(p: &PPlan): &[]PSub {
         PPlan.MinMax(i) { return pSubs(&i) }
         PPlan.Agg(i, _, _) { return pSubs(&i) }
         PPlan.Having(i) { return pSubs(&i) }
-        PPlan.Window(i) { return pSubs(&i) }
+        PPlan.Window(i, _) { return pSubs(&i) }
         PPlan.Project(i, _) { return pSubs(&i) }
         PPlan.Distinct(i, _, _) { return pSubs(&i) }
         PPlan.Sort(i, _, _) { return pSubs(&i) }
@@ -585,7 +602,7 @@ pub fn pLeaf(p: &PPlan): &PPlan {
         PPlan.MinMax(i) { return pLeaf(&i) }
         PPlan.Agg(i, _, _) { return pLeaf(&i) }
         PPlan.Having(i) { return pLeaf(&i) }
-        PPlan.Window(i) { return pLeaf(&i) }
+        PPlan.Window(i, _) { return pLeaf(&i) }
         PPlan.Project(i, _) { return pLeaf(&i) }
         PPlan.Distinct(i, _, _) { return pLeaf(&i) }
         PPlan.Sort(i, _, _) { return pLeaf(&i) }
@@ -6847,7 +6864,7 @@ pub fn physOf(sel: &Sel): PPlan {
 // MATCH_RECOGNIZE, as views over p2.
 fn physAbove(sel: &Sel, p2: PPlan): PPlan {
     let p3 = if sel.having.isSome() { PPlan.Having(p2) } else { p2 }
-    let p4 = if len(sel.wins) > 0 { PPlan.Window(p3) } else { p3 }
+    let p4 = if len(sel.wins) > 0 { PPlan.Window(p3, None) } else { p3 }
     // a function's select list is its arguments
     let p5 = if len(sel.srf) == 0 { PPlan.Project(p4, []) } else { p4 }
     let p6 = if sel.distinct { PPlan.Distinct(p5, sel.donKey > 0, []) } else { p5 }
@@ -7971,6 +7988,188 @@ fn applyR2(sel: &Sel): bool { return sel.offset <= 0 && sel.topMode == 0 && !sel
 // subquery's keys and value (hashSub).
 fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.sort && !sel.distinct }
 
+// ---- window calls in the pipeline (Q8 R7, design/lexdb-layers.md 6.3.Q8 R7)
+
+// Whether sel is a query of window calls the pipeline may run: not an
+// aggregate's (its windows are over the groups: exec's view), one table
+// read per row (or joins), no correlated subquery left in it, no set
+// operation, function in FROM, lock, MATCH_RECOGNIZE, SELECT @v =, or
+// set-returning function in the list; DISTINCT ON, WITH TIES and TOP (the
+// Sort's, R2's PSort) only sorted and not DISTINCT, as sortShape's.
+pub fn winShape(sel: &Sel): bool {
+    let q = &sel.q
+    if len(sel.wins) == 0 || sel.aggQ || sel.setop != 0 || len(sel.srf) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 || len(sel.mr) > 0 { return false }
+    if ((sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct)) || sel.first >= 0 || hasSrfCall(&sel.exprs) { return false }
+    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
+    return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs)
+}
+
+// The census's reason winShape declines sel (its tests again, in order).
+pub fn winWhy(sel: &Sel): str {
+    if sel.setop != 0 { return "a window: a set operation" }
+    if len(sel.srf) > 0 { return "a window: a function in FROM (execSrf)" }
+    if len(sel.locks) > 0 { return "a window: FOR UPDATE" }
+    if len(sel.feedback) > 0 { return "a window: SELECT @v = (feedback)" }
+    if len(sel.mr) > 0 { return "a window: MATCH_RECOGNIZE" }
+    if (sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct) { return "a window: DISTINCT ON, TOP or WITH TIES not sorted, or DISTINCT" }
+    if sel.first >= 0 { return "a window: MIN or MAX by the scan's order (Sel.first)" }
+    if hasSrfCall(&sel.exprs) { return "a window: a set-returning function in the select list" }
+    let r = queryWhy(sel)
+    return if len(r) > 0 { "a window: " + r } else { "a window: ?" }
+}
+
+// x bound for a Window's plan: over the query's columns, its subqueries
+// run once and the window calls' values (#agg i).
+fn winX(x: &Expr, q: &Query): Option[BX] {
+    let none: []Val = []
+    return lexdb_bind.bindSubsAggs(x, &q.cols, &none, &up().typing)
+}
+
+// sel's plan for the pipeline (winShape): Limit? (Sort? (Distinct? (Project
+// (Window (Project (the input)))))), the input the conditions, the scan
+// and the joins as pipeShape's plan has them, its Project the query's
+// columns the Window keeps per row (a single table's: those its scan
+// decodes, as the row engine's rows hold them); the outputs and ORDER BY
+// keys over a row and its calls' values. None: a key, argument, offset,
+// output or ORDER BY key that does not bind, or joins the pipeline does not
+// join (what was moved given back).
+pub fn pipeWin(sel: mut &Sel): Option[PPlan] {
+    var keys: [][]BX = []
+    var args: [][]BX = []
+    var offs: [][]Option[BX] = []
+    for w in sel.wins {
+        var ks: []BX = []
+        for x in w.part {
+            match winX(&x, &sel.q) {
+                Some(b) { append(mut &ks, b) }
+                None { return noWin("a window: a PARTITION BY or ORDER BY key does not bind") }
+            }
+        }
+        for x in w.order {
+            match winX(&x, &sel.q) {
+                Some(b) { append(mut &ks, b) }
+                None { return noWin("a window: a PARTITION BY or ORDER BY key does not bind") }
+            }
+        }
+        var avs: []BX = []
+        for x in lexdb_window.argsOf(&w) {
+            match winX(&x, &sel.q) {
+                Some(b) { append(mut &avs, b) }
+                None { return noWin("a window: an argument or FILTER does not bind") }
+            }
+        }
+        var os: []Option[BX] = []
+        for ox in [w.startOff.clone(), w.endOff.clone()] {
+            match ox {
+                Some(x) {
+                    let b = winX(&x, &sel.q)
+                    if b.isNone() { return noWin("a window: a frame offset does not bind") }
+                    append(mut &os, b)
+                }
+                None { append(mut &os, None) }
+            }
+        }
+        append(mut &keys, ks)
+        append(mut &args, avs)
+        append(mut &offs, os)
+    }
+    var xs: []BX = withCapacity(len(sel.exprs))
+    for x in sel.exprs {
+        match winX(&x, &sel.q) {
+            Some(b) { append(mut &xs, b) }
+            None { return noWin("a window: an output does not bind") }
+        }
+    }
+    // ORDER BY sorted (slice P3): per key the output it is, else its
+    // expression made after the outputs
+    var ps: Option[PSort] = None
+    if sel.sort {
+        var srt = PSort{shown: len(xs), out: [], desc: [], nf: [], coll: [], don: sel.donKey,
+                        ties: if sel.topMode & lexdb_sql.TOP_TIES != 0 { TS_TOP } else if sel.withTies { TS_FETCH } else { 0 },
+                        pct: sel.topMode & lexdb_sql.TOP_PERCENT != 0, top: if sel.topMode != 0 { sel.topN } else { -1 }}
+        for oi in 0..len(sel.order) {
+            var o = lexdb_bind.orderOut(&sel.order[oi], &sel.q.cols, &sel.outs, len(sel.exprs))
+            if o == -2 { return noWin("a window: an ORDER BY position not in the list") }
+            if o < 0 {
+                match winX(&sel.order[oi], &sel.q) {
+                    Some(b) { append(mut &xs, b) }
+                    None { return noWin("a window: an ORDER BY key does not bind") }
+                }
+                o = len(xs) - 1
+            }
+            append(mut &srt.out, o)
+            append(mut &srt.desc, sel.desc[oi])
+            append(mut &srt.nf, sel.nullsFirst[oi])
+            append(mut &srt.coll, if oi < len(sel.ordKinds) { sel.ordKinds[oi] } else { lexdb_sql.COLL_EXACT })
+        }
+        ps = Some(srt)
+    }
+    // the columns a row keeps: those read above it, and a single table's
+    // decoded ones
+    let nq = len(sel.q.cols)
+    var used: []bool = array(nq, false)
+    for ks in keys { for b in ks { uses(&b, mut &used) } }
+    for avs in args { for b in avs { uses(&b, mut &used) } }
+    for b in xs { uses(&b, mut &used) }
+    if len(sel.q.levels) == 1 {
+        let lv = &sel.q.levels[0]
+        for i in 0..len(lv.t.cols) { if len(lv.need) == 0 || lv.need[i] { used[lv.first + i] = true } }
+    }
+    var slots: []int = []
+    var ins: []BX = []
+    for c in 0..nq {
+        if !used[c] { continue }
+        append(mut &slots, c)
+        append(mut &ins, BX.Col(c))
+    }
+    // (no column kept: a Project of one NULL, not a view's empty one; the
+    // rows hold none)
+    if len(ins) == 0 { append(mut &ins, BX.Const(Val.Null)) }
+    let got = planConds(sel)
+    if got.isNone() { return noWin("a window: a condition does not bind (planX)") }
+    let cs = got.unwrap()
+    let base = filterOver(scanArm(&sel.q, false), cs, subsOf(&sel.q))
+    let joined = if len(sel.q.levels) > 1 { joinsOver(&sel.q, base) } else { Ok(base) }
+    var jp = PPlan.Result([])
+    match move(joined) {
+        Ok(x) { jp = x }
+        Err(b) {
+            unplan(sel, b)
+            return None
+        }
+    }
+    let pw = PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: slots}
+    let proj = PPlan.Project(PPlan.Window(PPlan.Project(jp, ins), Some(pw)), xs)
+    // the operators over it as physAbove makes them (EXPLAIN prints them)
+    let dist = if sel.distinct { PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
+    let ordered = if len(sel.order) > 0 { PPlan.Sort(dist, sel.sort, ps) } else { dist }
+    return Some(if sel.limit >= 0 || sel.offset > 0 { PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) } else { ordered })
+}
+
+// pipeWin's None, the census's reason noted.
+fn noWin(r: &str): Option[PPlan] {
+    lexdb_census.no(r)
+    return None
+}
+
+// A Window plan the pipeline did not take (pipeWin's): its conditions back
+// to sel (its outputs were never the Sel's ox).
+pub fn unplanWin(sel: mut &Sel, p: PPlan) {
+    match move(p) {
+        PPlan.Limit(i, _, _, _) { unplanWin(sel, i) }
+        PPlan.Sort(i, _, _) { unplanWin(sel, i) }
+        PPlan.Distinct(i, _, _) { unplanWin(sel, i) }
+        PPlan.Project(i, _) { unplanWin(sel, i) }
+        PPlan.Window(i, _) {
+            match move(i) {
+                PPlan.Project(j, _) { unplan(sel, j) }
+                else {}
+            }
+        }
+        else {}
+    }
+}
+
 // Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
 // (slice P3): rows of one select list, no grouping, window, set
 // operation, lock, SELECT @v, or function returning rows in it; DISTINCT
@@ -8102,7 +8301,7 @@ pub fn censusRun(sel: &Sel, batch: bool, gave: bool, noLimit: bool) {
     else if noLimit && sel.pipe.isSome() { censusNote(sel, "row", "FOR UPDATE's run (noLimit)") }
     else if sel.setop != 0 { if !setHeld(sel) { lexdb_census.note("setop", "a set operation (runSet): TOP or WITH TIES") } }
     else if sel.aggQ && pa {}
-    else if len(sel.wins) > 0 && !sel.aggQ { censusNote(sel, "row", "a window (winValues)") }
+    else if len(sel.wins) > 0 && !sel.aggQ { censusNote(sel, "row", "") }
     else { censusNote(sel, "row", "") }
 }
 
@@ -8166,7 +8365,6 @@ pub fn aggWhy(sel: &Sel): str {
     let q = &sel.q
     if sel.setop != 0 { return "a set operation" }
     if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
-    if len(sel.wins) > 0 { return "agg: a window over the groups" }
     if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
@@ -8305,7 +8503,8 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
 // MinMax).
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
+    // (window calls over the groups: exec's view over them, as HAVING, Q8 R7)
+    if sel.setop != 0 || len(sel.srf) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters;
     // one left per row: an Apply's, Q8 R6, not in a key or argument, not
     // under MIN/MAX by the scan's order, R2's MinMax)
@@ -8331,6 +8530,17 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Apply(i, _) { unplan(sel, i) }
         PPlan.ProjectSet(i, _) { unplan(sel, i) }
+        // (a view over the groups; a Window the pipeline runs: unplanWin's)
+        PPlan.Window(i, pw) {
+            if pw.isNone() {
+                unplan(sel, i)
+                return
+            }
+            match move(i) {
+                PPlan.Project(j, _) { unplan(sel, j) }
+                else {}
+            }
+        }
         PPlan.Project(i, xs) {
             if len(xs) == 0 {
                 // a view: the Sel holds its outputs
@@ -8453,7 +8663,8 @@ fn rangePath(q: &Query, lv: &Level): bool {
 //   order, as the row path reads them, so the reads are noted the same.
 
 // The query's columns a grouped select reads after grouping: those its
-// outputs, HAVING and ORDER BY (with DISTINCT ON's keys) name.
+// outputs, HAVING, ORDER BY (with DISTINCT ON's keys) and window calls (their
+// PARTITION BY, ORDER BY, arguments and FILTER: Q8 R7) name.
 fn afterCols(sel: &Sel, q: &Query): []int {
     var names: []str = []
     for x in sel.exprs { lexdb_sql.colNames(&x, mut &names) }
@@ -8462,6 +8673,11 @@ fn afterCols(sel: &Sel, q: &Query): []int {
         None {}
     }
     for x in sel.order { lexdb_sql.colNames(&x, mut &names) }
+    for w in sel.wins {
+        for x in w.part { lexdb_sql.colNames(&x, mut &names) }
+        for x in w.order { lexdb_sql.colNames(&x, mut &names) }
+        for x in lexdb_window.argsOf(&w) { lexdb_sql.colNames(&x, mut &names) }
+    }
     var out: []int = []
     for n in names {
         let ci = lexdb_bind.colIndex(&q.cols, &n)
@@ -8671,6 +8887,7 @@ pub fn applyAt(p: &PPlan): int {
         PPlan.Project(i, _) { return applyAt(&i) }
         PPlan.Having(i) { return applyAt(&i) }
         PPlan.Match(i) { return applyAt(&i) }
+        PPlan.Window(i, _) { return applyAt(&i) }
         PPlan.Agg(i, _, _) { return applyAt(&i) }
         else { return -1 }
     }

@@ -160,6 +160,7 @@ CHECKED = {
     'tns_r3': ('consts', 'QS'),
     'tns_r4': ('consts', 'QS'),
     'tns_r5': ('consts', 'QS'),
+    'tns_winpipe': ('consts', 'QS'),
 }
 
 
