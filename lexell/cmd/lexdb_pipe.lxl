@@ -7836,34 +7836,40 @@ pub fn pointRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     cnt[0].starts += 1
     if s.empty { return Ok(Unit{}) }
     let rel = lexdb_catalog.relOf(t)
-    var row: []Val = array(len(cols), Val.Null)
-    if try pointGet(st, txn, &rel, sc0, conds, s, cx, bud, cnt, mut &row) { let more = try each(txn, &row) }
-    return Ok(Unit{})
+    return pointGet(st, txn, &rel, sc0, conds, s, cx, len(cols), bud, cnt, each)
 }
 
 // A write's point's row (pointRows): read as a join over a point reads
-// its first table's (pointJProj: getRow, as fetch reads one), its values
-// moved into row, counted read; its conditions in order by the scalar
-// evaluator, counted kept. false: no row, or a condition not true.
+// its first table's (pointJProj: getRow, as fetch reads one), counted
+// read, its values the row's (of nc columns; the table's row itself when
+// it is the query's whole row); its conditions in order by the scalar
+// evaluator, counted kept; then to each.
 fn pointGet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel, sc0: &lexdb_plan.PScan, conds: &[]Option[BX], s: &lexdb_access.Scan,
-            cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, row: mut &[]Val): Result[bool, DbErr] {
+            cx: &Ctx, nc: int, bud: mut &Budget, cnt: mut &[]Counts, each: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
     let all: []bool = []
     var r = match try lexdb_access.getRow(st, txn, rel, &lexdb_access.rowRead(rel, if sc0.part { &sc0.need } else { &all }), &s.lowKey()) {
         Some(x) { x }
-        None { return Ok(false) }
+        None { return Ok(Unit{}) }
     }
     try bud.tick()
-    for i in 0..len(r) { row[sc0.first + i] = replace(mut &r[i], Val.Null) }
+    var row: []Val = []
+    if sc0.first == 0 && len(r) == nc {
+        row = r
+    } else {
+        row = array(nc, Val.Null)
+        for i in 0..len(r) { row[sc0.first + i] = replace(mut &r[i], Val.Null) }
+    }
     cnt[0].read += 1
     let noAggs: []Val = []
     for c in conds {
         match c {
-            Some(b) { if lexdb_ops.truth(&(try bxEval(&b, row, &noAggs, cx))) != Some(true) { return Ok(false) } }
+            Some(b) { if lexdb_ops.truth(&(try bxEval(&b, &row, &noAggs, cx))) != Some(true) { return Ok(Unit{}) } }
             None { return Err(e("XX000", "a write's point condition not bound")) }
         }
     }
     cnt[0].joined += 1
-    return Ok(true)
+    let more = try each(txn, &row)
+    return Ok(Unit{})
 }
 
 // Runs of pointRows and of runLevels (the tests' look).
