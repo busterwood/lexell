@@ -1,0 +1,158 @@
+// lexdb over TNS: the joins the pipeline took from the row engine in Q8's R4 (design/lexdb-layers.md 6.3.Q8 R4) through the
+// Oracle door, checked against Oracle Database Free (gen_oracle.py --check: the answers below are Oracle's). A join over a
+// point (the OLTP 3-table join and FETCH FIRST over it, LEFT JOIN with a missing row and a failing ON condition, WHERE
+// conjuncts after it, a NULL key, an error in an output and in a condition: ORA-01476, DISTINCT, four tables, per outer row
+// in a scalar subquery); joins under a first table that stops early (FETCH FIRST over lookups, EXISTS and NOT EXISTS over a
+// join per outer row, FETCH FIRST 1 in a scalar subquery); LEFT, RIGHT and FULL JOINs with no key (an empty side, a hash of
+// more rows than a batch); a hash join by a varchar2 key. Each statement runs with set lexdb_batch = off (the row engine) and
+// on: "same" and the answer, or DIFFERENT and both. Not here: CROSS APPLY and LATERAL after the first level (still the row
+// engine's).
+// expect: setup: 18 statements
+// expect: same: A,B,C = 185|222|259
+// expect: same: A,B,C = 
+// expect: same: AID,B,BAL = 3|NULL|NULL
+// expect: same: AID,B = 3|NULL
+// expect: same: AID,B = 3|NULL
+// expect: same: AID,B,NAME = 10|NULL|NULL
+// expect: same: error 1476
+// expect: same: error 1476
+// expect: same: NAME = 'n3'
+// expect: same: AID,B,C,D = 11|12|13|NULL
+// expect: same: ID,B = 1|74;2|111;3|148;4|185;5|222;6|259;7|296;8|333;9|370;10|407;11|444
+// expect: same: ID,W = 1|3;2|6;3|9
+// expect: same: ID,W = 3|9;10|30;17|51;24|72
+// expect: same: N = 110
+// expect: same: ID,W = 1|6;2|9;3|12;4|15;5|3;6|6;7|9;8|12;9|15
+// expect: same: ID = 1;2;5;6;7;10;11;12;13;15;16;17;20;21;22;25;26;27;30;31;32;33;34;35;36;37;38;39;40;41;42;43;44;45;46;47;48;49;50;51;52;55;56;57
+// expect: same: ID,B = 1|NULL;2|1;3|1;3|2;4|1;4|2;4|3;5|NULL;6|NULL;7|1
+// expect: same: ID,B = NULL|1;1|2;1|3;2|3;1|4;2|4;3|4;NULL|5;NULL|6;1|7;1|8;2|8;1|9;2|9;3|9;NULL|10;NULL|11;1|12;1|13;2|13;1|14;2|14;3|14;NULL|15;NULL|16;1|17;1|18;2|18;1|19;2|19;3|19;NULL|20;NULL|21;1|22;1|23;2|23;1|24;2|24;3|24;NULL|25;NULL|26;1|27;1|28;2|28;1|29;2|29;3|29;NULL|30
+// expect: same: N,A,B = 60|33|33
+// expect: same: ID,B = 1|NULL;2|NULL;3|NULL
+// expect: same: N,B = 1165|1165
+// expect: same: N = 7540
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg values (0)\ninsert into dg values (1)\ninsert into dg values (2)\ninsert into dg values (3)\ninsert into dg values (4)\ninsert into dg values (5)\ninsert into dg values (6)\ninsert into dg values (7)\ninsert into dg values (8)\ninsert into dg values (9)\ncreate table acct (aid number(10) primary key, bal number(10), r number(10), name varchar2(10))\ninsert into acct select n, mod(n * 37, 1000), case when mod(n, 10) = 0 then null else mod(n, 100) end, 'n' || mod(n, 13) from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 2000\ncreate table sm (id number(10) primary key, g number(10), w number(10))\ninsert into sm select n, mod(n, 5), n * 3 from (select p.i + q.i * 10 + 1 n from dg p cross join dg q) z where n <= 30\ncreate table t (id number(10) primary key, g number(10), x number(10))\ninsert into t select n, mod(n, 7), case when mod(n, 13) = 0 then null else mod(n, 50) end from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000\ncreate table e0 (id number(10) primary key, v number(10))"
+
+const QS = "select a.bal a, b.bal b, c.bal c from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 where a.aid = 5 order by 1 fetch first 5 rows only\nselect a.bal a, b.bal b, c.bal c from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 where a.aid = 1999 order by 1\nselect a.aid, b.aid b, b.bal from acct a left join acct b on b.aid = a.aid + 5000 where a.aid = 3\nselect a.aid, b.aid b from acct a left join acct b on b.aid = a.aid + 1 and b.bal > 990 where a.aid = 3\nselect a.aid, b.aid b from acct a left join acct b on b.aid = a.aid + 5000 where a.aid = 3 and b.aid is null\nselect a.aid, b.aid b, b.name from acct a left join acct b on b.aid = a.r where a.aid = 10\nselect a.bal, 10 / (b.bal - b.bal) q from acct a join acct b on b.aid = a.aid + 1 where a.aid = 5\nselect a.bal, b.bal b from acct a join acct b on b.aid = a.aid + 1 and 10 / (b.bal - b.bal) > 0 where a.aid = 5\nselect distinct b.name from acct a join acct b on b.aid = a.aid * 2 where a.aid = 8\nselect a.aid, b.aid b, c.aid c, d.aid d from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 left join acct d on d.aid = c.aid + 3000 where a.aid = 11\nselect t.id, (select b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = t.id) b from t where t.id < 12 order by t.id\nselect t.id, sm.w from t join sm on sm.id = t.x order by t.id fetch first 3 rows only\nselect t.id, sm.w from t join sm on sm.id = t.x where t.g = 3 order by t.id fetch first 4 rows only\nselect count(*) n from t where t.id < 200 and exists (select 1 from sm join sm s2 on s2.id = sm.g + 1 where sm.id = t.x)\nselect t.id, (select s2.w from sm join sm s2 on s2.id = sm.g + 1 where sm.id = t.x order by sm.id fetch first 1 rows only) w from t where t.id < 10 order by t.id\nselect t.id from t where t.id < 60 and not exists (select 1 from sm join sm s2 on s2.id = sm.g + 1 where sm.id = t.x and s2.w > 9) order by t.id\nselect a.id, b.id b from sm a left join sm b on b.w < a.g * 3 where a.id < 8 order by 1, 2\nselect a.id, b.id b from sm a right join sm b on a.w < b.g * 3 and a.id < 9 order by 2, 1\nselect count(*) n, count(a.id) a, count(b.id) b from sm a full join sm b on a.id > b.id + 26\nselect a.id, b.id b from sm a left join e0 b on 1 = 1 where a.id < 4 order by 1\nselect count(*) n, count(b.id) b from sm a left join t b on b.x > a.id + 40 where a.id < 4\nselect count(*) n from acct a join acct b on b.name = a.name where a.aid < 50"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(54), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
