@@ -1,0 +1,227 @@
+// lexdb_exec, lexdb_pipe, lexdb_plan: the joins the pipeline took from the row engine in Q8's R4 (design/lexdb-layers.md
+// 6.3.Q8 R4). Each statement runs with batches on and off (the row engine, the reference): the same rows or the same error.
+// "piped": y when a run with batches on went through the pipeline (lexdb_pipe.runCounts()[0], joinCounts()[0]); "pipeline
+// runs": how many such runs the group's statements made with batches on; "point": how many of them a join over a point
+// (lexdb_pipe.pointJoinRuns()).
+// - point joins: a first table read by its whole primary key, the tables after it looked up by theirs (the OLTP 3-table
+//   join; inner and LEFT, an ON condition that fails, WHERE conjuncts after a LEFT JOIN, a NULL key, a key its column
+//   cannot hold, a missing row at each level, text and two-column keys, a real ORDER BY, DISTINCT, LIMIT 0 and 1, an error
+//   in an output, a condition and a key (22012, 22003), in a scalar subquery per outer row (21000), EXISTS, a view of a
+//   join); a hash after a point first table, and a range per row after one (the pipeline's general joins).
+// - stopping: lookups and ranges per row under a first table that stops early (LIMIT, an EXISTS, a scalar subquery, per
+//   outer row with unnesting off), an error in a row past the LIMIT (not raised, as the row engine does not reach it) and
+//   one before it (22012), LEFT JOIN, a hash join under LIMIT, NULLs.
+// - no key: LEFT, RIGHT and FULL JOINs with no equality (ON true, a non-equal condition, an empty side, NULLs, a hash of
+//   more rows than a batch: each row joined alone), their WHERE conjuncts, an error in the ON condition (22012).
+// - collation: a hash join's keys under a collation (case-insensitive, blank-padded; char and text, NULLs): the keys made
+//   their collated values on both sides; inner, LEFT, RIGHT, FULL, under an aggregate.
+// timeout: 120
+// expect: point joins: 32 queries, 32 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy, pipeline runs 144, point 66
+// expect: stopping: 20 queries, 20 the same, piped yyyyyyyyyyyyyyyyyyyy, pipeline runs 113, point 28
+// expect: no key: 16 queries, 16 the same, piped yyyyyyyyyyyyyyyy, pipeline runs 36, point 0
+// expect: collation: 8 queries, 8 the same, piped yyyyyyyy, pipeline runs 16, point 0
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] }
+
+type Group = record { name: str; word: str; n: int; same: int; piped: str; runs: int; point: int }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, piped: "", runs: 0, point: 0} }
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " " + g.word + ", " + g.same.toStr() + " the same, piped " + g.piped + ", pipeline runs " + g.runs.toStr() + ", point " + g.point.toStr())
+}
+
+// Statements (separated by ";;") with batches on and off.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let p0 = piped()
+    let q0 = lexdb_pipe.pointJoinRuns()
+    let on = stmts(s, sql)
+    let p1 = piped()
+    let q1 = lexdb_pipe.pointJoinRuns()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = stmts(s, sql)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+    g.point += q1 - q0
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str): str {
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(91), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table acct (aid int primary key, bal int, r int, name text)",
+            "insert into acct select i, (i * 37) % 1000, case when i % 10 = 0 then null else i % 100 end, 'n' || (i % 13) from generate_series(1, 2000) i",
+            "create table big8 (id bigint primary key, v int)",
+            "insert into big8 values (1, 10), (5000000000, 20), (7, null)",
+            "create table tx (k text primary key, v text, n int)",
+            "insert into tx values ('a', 'b', 1), ('b', 'c', 2), ('c', null, 3), ('d', 'zz', 0)",
+            "create table tk (a int, b int, v text, primary key (a, b))",
+            "insert into tk select i, j, 'v' || i || '-' || j from generate_series(1, 20) i, generate_series(1, 20) j",
+            "create table sm (id int primary key, g int, w int)",
+            "insert into sm select i, i % 5, i * 3 from generate_series(1, 30) i",
+            "create index sm_g on sm (g)",
+            "create view vj as select a.aid, b.bal, c.name from acct a join acct b on b.aid = a.aid + 1 left join acct c on c.aid = b.r",
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create table u (id int primary key, k int, w int, c text)",
+            "insert into u select i, i % 9, (i * 37) % 1000, 'c' || (i % 4) from generate_series(1, 400) i",
+            "create index u_k on u (k)",
+            "create table e0 (id int primary key, v int)",
+            "create table cw (id int primary key, c char(5) collate \"SQL_Latin1_General_CP1_CI_AS\", t text collate \"SQL_Latin1_General_CP1_CI_AS\", p char(4))",
+            "insert into cw select g, case when g % 3 = 0 then 'AB' when g % 3 = 1 then 'ab  ' else null end, case when g % 4 = 0 then 'Ab' when g % 4 = 1 then 'aB ' when g % 4 = 2 then 'ab' else 'x' || (g % 5) end, case when g % 2 = 0 then 'ab' else 'ab  ' end from generate_series(1, 200) g",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var gp = newGroup(&"point joins", &"queries")
+        let ps = [
+            "select a.bal, b.bal, c.bal from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 where a.aid = 5 order by 1 limit 5",
+            "select a.bal, b.bal, c.bal from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 where a.aid = 1999 order by 1 limit 5",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = 4000",
+            "select a.aid, b.aid, b.bal from acct a left join acct b on b.aid = a.aid + 5000 where a.aid = 3",
+            "select a.aid, b.aid from acct a left join acct b on b.aid = a.aid + 1 and b.bal > 990 where a.aid = 3",
+            "select a.aid, b.aid from acct a left join acct b on b.aid = a.aid + 5000 where a.aid = 3 and b.aid is null",
+            "select a.aid, b.aid from acct a left join acct b on b.aid = a.aid + 1 where a.aid = 3 and b.bal > 990",
+            "select a.aid, b.aid, b.name from acct a left join acct b on b.aid = a.r where a.aid = 10",
+            "select a.aid, b.aid, b.name from acct a join acct b on b.aid = a.r where a.aid = 10",
+            "select x.id, a.aid from big8 x join acct a on a.aid = x.id where x.id = 5000000000",
+            "select x.id, a.aid from big8 x left join acct a on a.aid = x.id where x.id = 5000000000",
+            "select x.id, a.aid from big8 x left join acct a on a.aid = x.v where x.id = 7",
+            "select x.v, y.v, z.n from tx x join tx y on y.k = x.v join tx z on z.k = y.v where x.k = 'a'",
+            "select x.v, y.v, z.n from tx x join tx y on y.k = x.v left join tx z on z.k = y.v where x.k = 'b'",
+            "select p.v, q.v from tk p join tk q on q.a = p.b and q.b = p.a where p.a = 3 and p.b = 7",
+            "select p.v, q.v from tk p left join tk q on q.a = p.b + 20 and q.b = p.a where p.a = 3 and p.b = 7",
+            "select b.name, a.aid from acct a join acct b on b.aid = a.aid + 1 where a.aid = 8 order by b.name desc, a.aid",
+            "select distinct b.name from acct a join acct b on b.aid = a.aid * 2 where a.aid = 8",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = 5 limit 0",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = 5 limit 1",
+            "select a.bal, 10 / (b.bal - b.bal) from acct a join acct b on b.aid = a.aid + 1 where a.aid = 5",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 1 and 10 / (b.bal - b.bal) > 0 where a.aid = 5",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 2147483647 where a.aid = 5",
+            "select a.bal, b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = 5 and a.bal < 0",
+            "select a.aid, b.aid, c.aid, d.aid from acct a join acct b on b.aid = a.aid + 1 join acct c on c.aid = b.aid + 1 left join acct d on d.aid = c.aid + 3000 where a.aid = 11",
+            "select t.id, (select b.bal from acct a join acct b on b.aid = a.aid + 1 where a.aid = t.id) from t where t.id < 40 order by t.id",
+            "select t.id, (select b.bal from acct a join acct b on b.aid = a.aid + 1 or b.aid = a.aid + 2 where a.aid = t.id) from t where t.id < 4 order by t.id",
+            "select count(*) from t where exists (select 1 from acct a join acct b on b.aid = a.aid + 1 where a.aid = t.x and b.bal > 500)",
+            "select * from vj where aid = 3",
+            "select * from vj where aid = 9",
+            "select a.aid, s.id, s.w from acct a join sm s on s.g = a.r % 5 where a.aid = 12 order by s.id",
+            "select a.aid, u.id from acct a join u on u.k = a.r % 9 and u.id < 40 where a.aid = 12 order by u.id",
+        ]
+        for x in ps { check(mut &s, mut &gp, &x) }
+        report(&gp)
+
+        var gs = newGroup(&"stopping", &"queries")
+        let ss = [
+            "select t.id, u.w from t join u on u.id = t.x limit 3",
+            "select t.id, u.w from t join u on u.id = t.x where t.s > 'k5' limit 4",
+            "select t.id, 10 / (u.id - 7) from t join u on u.id = t.x where t.id < 20 order by t.id limit 3",
+            "select t.id, 10 / (u.id - 7) from t join u on u.id = t.x where t.id < 20 order by t.id limit 10",
+            "select t.id, u.id from t join u on u.id = t.x and 10 / (u.id - 7) > 0 where t.id < 20 order by t.id limit 3",
+            "select t.id, u.id from t join u on u.k = t.g where t.id > 2990 limit 5",
+            "select t.id, u.id, u.w from t left join u on u.id = t.x + 395 where t.id < 30 order by t.id limit 6",
+            "select t.id, u.id from t join u on u.k = t.g limit 5",
+            "select t.id, 10 / (u.k - 3) from t join u on u.k = t.g where t.id < 3 limit 2",
+            "select count(*) from t where t.id < 200 and exists (select 1 from u join sm on sm.id = u.k where u.id = t.x)",
+            "select t.id, (select u2.w from u join u u2 on u2.id = u.k + 1 where u.id = t.x limit 1) from t where t.id < 30 order by t.id",
+            "select t.id, (select sm.w from u join sm on sm.id = u.id where u.k = t.g limit 1) from t where t.id < 30 order by t.id",
+            "select t.id, (select sm.w from u join sm on sm.id = u.id where u.k = t.g) from t where t.id < 5 order by t.id",
+            "select t.id from t where t.id < 100 and exists (select 1 from u join t t2 on t2.id = u.id where u.k = t.g and t2.x is null) order by t.id",
+            "select t.id from t where t.id < 60 and not exists (select 1 from u join u u2 on u2.id = u.k where u.id = t.x and u2.w > 500) order by t.id",
+            "select * from (select t.id, u.w from t join u on u.id = t.x where t.g = 3 limit 4) q order by 1",
+            "select t.id, u.w from t join u on u.id = t.x where t.x is null limit 3",
+            "select t.id, u.w from t join u on u.id = t.x order by t.id desc limit 3",
+            "select t.id, e0.v from t join e0 on e0.id = t.x limit 3",
+            "select t.id, u.w, sm.w from t join u on u.id = t.x join sm on sm.id = u.k + 20 limit 4",
+        ]
+        // (per outer row: unnesting off, so the subqueries stay per row)
+        lexdb_plan.setUnnest(0)
+        for x in ss { check(mut &s, mut &gs, &x) }
+        lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+        report(&gs)
+
+        var gk = newGroup(&"no key", &"queries")
+        let ks = [
+            "select a.id, b.id from sm a left join (select * from sm where id < 3) b on true where a.id < 4 order by 1, 2",
+            "select a.id, b.id from sm a right join (select * from sm where id < 3) b on a.id < 3 order by 1, 2",
+            "select a.id, b.id from sm a full join (select * from sm where id < 6) b on a.id > b.id + 26 order by 1, 2",
+            "select a.id, b.id from sm a left join sm b on b.w < a.g * 3 where a.id < 8 order by 1, 2",
+            "select a.id, b.id from sm a right join sm b on a.w < b.g * 3 and a.id < 9 order by 1, 2",
+            "select a.id, b.id from sm a left join e0 b on true where a.id < 4 order by 1",
+            "select a.id, b.id from sm a right join e0 b on true order by 2",
+            "select count(*), count(b.id) from sm a full join e0 b on true",
+            "select count(*), count(a.id) from e0 a full join sm b on true",
+            "select a.id, b.id from sm a left join sm b on a.w > b.w + 60 where a.id < 25 and (b.id is null or b.id > 2) order by 1, 2",
+            "select a.id, b.id from sm a left join sm b on 10 / (b.id - 3) > a.id where a.id < 5 order by 1, 2",
+            "select count(*), count(b.id) from sm a left join t b on b.g > a.id + 100 where a.id < 4",
+            "select count(*), count(b.id), min(b.id) from sm a left join t b on b.x > a.id + 40 where a.id < 4",
+            "select count(*), count(a.id) from sm a right join t b on a.id > b.g + 25",
+            "select a.id, b.id, b.x from sm a left join t b on b.x > a.id + 40 where a.id < 3 order by 1, 2 limit 5",
+            "select a.id, b.id from sm a left join (select * from sm where id < 3) b on a.w > 1000 where a.id < 4 order by 1, 2",
+        ]
+        for x in ks { check(mut &s, mut &gk, &x) }
+        report(&gk)
+
+        var gc = newGroup(&"collation", &"queries")
+        let cs = [
+            "select count(*) from cw a join cw b on a.c = b.t where a.id < 50",
+            "select count(*) from cw a join cw b on a.t = b.t where a.id < 50",
+            "select a.id, b.id from cw a join cw b on b.t = a.c where a.id < 7 and b.id < 12 order by 1, 2",
+            "select count(*), count(b.id) from cw a left join cw b on b.c = a.t where a.id < 50",
+            "select count(*), count(a.id) from cw a right join cw b on b.c = a.t and a.id < 5",
+            "select count(*), count(a.id), count(b.id) from (select * from cw where id < 9) a full join (select * from cw where id < 13) b on b.t = a.t",
+            "select a.t, count(*) from cw a join cw b on a.t = b.t where a.id < 30 group by a.t order by 1",
+            "select count(*) from cw a join cw b on b.p = a.p where a.id < 50",
+        ]
+        for x in cs { check(mut &s, mut &gc, &x) }
+        report(&gc)
+        return 0
+    }).unwrap()
+}

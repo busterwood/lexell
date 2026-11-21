@@ -158,6 +158,7 @@ CHECKED = {
     'tns_privs': ('scenario',), 'tns_routinepriv': ('scenario',), 'tns_routine': ('routine',),
     'tns_unnest': ('consts', 'QUERIES'), 'tns_unnest_agg': ('consts', 'QUERIES'), 'tns_subrows': ('consts', 'QS'),
     'tns_r3': ('consts', 'QS'),
+    'tns_r4': ('consts', 'QS'),
 }
 
 
