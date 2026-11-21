@@ -57,6 +57,7 @@ import "./lexdb_orafn"
 import "./lexdb_syscat"
 import "./lexdb_oracat"
 import "./lexdb_match"
+import "./lexdb_srf"
 import "./lexdb_parse"
 import "./lexdb_routine"
 import "./lexdb_dbopt"
@@ -276,7 +277,8 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     return Ok(out)
 }
 
-// A function in FROM, run: its arguments, then its rows.
+// A function in FROM, run by the row engine: its arguments by eval, then
+// its rows (srfRows).
 fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
     let sqe = seqEnv(st, txn)
@@ -285,150 +287,36 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow, seq: &sqe}
     var args: []Val = []
     for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
+    return srfRows(st, txn, sel, args, cap, rs)
+}
+
+// A function's rows from its arguments' values: a catalog relation's or a
+// sequence's read here, the others made by lexdb_srf.
+fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: []Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
     var rows: [][]Val = []
-    let room = rs.bud.room()
-    var bytes = 0
-    if sel.srf == "pg_available_extensions" {
-        // none
-    } else if sel.srf == "pg_partition_ancestors" {
-        // no partitions in lexdb: a relation is its only ancestor
-        if len(args) == 1 && !lexdb_ops.isNull(&args[0]) {
-            let o = lexdb_ops.oidArg(&args[0]).unwrapOr(0)
-            var row: []Val = [Val.Reg(o, o.toStr())]
-            if sel.ordin { append(mut &row, Val.Int(1)) }
-            append(mut &rows, row)
-        }
-    } else if strings.startsWith(&sel.srf, "#values:") {
-        let k = len(sel.outs)
-        var i = 0
-        // T-SQL: '' in a column of numbers is 0 (design/lexdb-tds.md, section 13)
-        let tsql = len(sessColl(st, txn.sql.sess)) > 0
-        while i + k <= len(args) {
-            var row: []Val = []
-            for c in 0..k {
-                let ty = lexdb_sql.oidType(sel.outs[c].oid)
-                let blank = tsql && (ty.kind == lexdb_sql.K_INT || ty.kind == lexdb_sql.K_FLOAT) && lexdb_ops.kindOf(&args[i + c]) == lexdb_sql.K_TEXT &&
-                            len(strings.trim(&lexdb_sql.text(&args[i + c]))) == 0
-                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { replace(mut &args[i + c], Val.Null) } else if blank { try lexdb_ops.coerceZ(Val.Int(0), &ty, &txn.sql.zone) } else { try lexdb_ops.coerceZ(replace(mut &args[i + c], Val.Null), &ty, &txn.sql.zone) })
-            }
-            append(mut &rows, row)
-            i += k
-        }
+    if lexdb_srf.ours(&sel.srf) {
+        var oids: []int = withCapacity(len(sel.outs))
+        for o in sel.outs { append(mut &oids, o.oid) }
+        let f = lexdb_srf.Fn{name: sel.srf.clone(), oids: oids, ordin: sel.ordin, cap: cap,
+                             tsql: strings.startsWith(&sel.srf, "#values:") && len(sessColl(st, txn.sql.sess)) > 0}
+        // (the rows' bytes against the run's room, as they are made; a step a row)
+        let room = rs.bud.room()
+        let mh = rs.bud.maxHeld
+        var bytes = 0
+        rows = try lexdb_srf.rows(&f, args, &txn.sql.zone, fn(r: &[]Val, tick: bool): Result[Unit, DbErr] {
+            bytes += lexdb_pipe.rowBytes(r)
+            if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(mh)) }
+            if tick { try rs.bud.tick() }
+            return Ok(Unit{})
+        }, fn(n: &str, vs: &[]Val): Result[Val, DbErr] { return call(n, vs) })
     } else if strings.startsWith(&sel.srf, &("#" + SEQ_REL)) {
         let k = sel.srf[1 + len(SEQ_REL)..len(sel.srf)]
         match try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.seqRow(&k))) {
             Some(v) { append(mut &rows, try seqState(st, &lexdb_catalog.decSeq(&v))) }
             None {}
         }
-    } else if strings.startsWith(&sel.srf, "#") {
-        rows = try catRows(st, txn, &sel.srf[1..len(sel.srf)])
-    } else if sel.srf == "regexp_matches" || sel.srf == "regexp_split_to_table" || sel.srf == "string_to_table" {
-        let v = try call(&sel.srf, &args)
-        match srfParts(&v) {
-            Some(ps) {
-                for i in 0..len(ps) {
-                    if cap >= 0 && len(rows) >= cap { break }
-                    var row: []Val = [match ps[i] { Some(t) { Val.Text(t.clone()) } None { Val.Null } }]
-                    if sel.ordin { append(mut &row, Val.Int(i + 1)) }
-                    bytes += lexdb_pipe.rowBytes(&row)
-                    if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
-                    append(mut &rows, row)
-                }
-            }
-            None {}
-        }
-    } else if sel.srf == "generate_series" {
-        for a in args { if lexdb_ops.isNull(&a) { return Ok(Res{cols: [], rows: [], tag: "", hasRows: true, copy: COPY_NONE}) } }
-        let ty = lexdb_sql.oidType(sel.outs[0].oid)
-        if ty.kind == lexdb_sql.K_TS || ty.kind == lexdb_sql.K_TSTZ {
-            // timestamps stepped by an interval; a timestamptz's days and months in the session's zone (9.95)
-            let zone = &txn.sql.zone
-            var v = try lexdb_ops.coerceZ(replace(mut &args[0], Val.Null), &ty, zone)
-            let stop = try lexdb_ops.coerceZ(replace(mut &args[1], Val.Null), &ty, zone)
-            let step = try lexdb_ops.coerceZ(replace(mut &args[2], Val.Null), &lexdb_sql.oidType(lexdb_sql.OID_IVAL), zone)
-            let dir = match step { Val.Ival(iv) { lexdb_time.ivalCmp(&iv, &lexdb_time.Ival{months: 0, days: 0, us: 0}) } else { 0 } }
-            if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
-            var n = 0
-            while true {
-                let c = try lexdb_ops.compare(&v, &stop)
-                if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
-                if cap >= 0 && len(rows) >= cap { break }
-                n += 1
-                var row: []Val = [v.clone()]
-                if sel.ordin { append(mut &row, Val.Int(n)) }
-                bytes += lexdb_pipe.rowBytes(&row)
-                if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
-                append(mut &rows, row)
-                try rs.bud.tick()
-                match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &zone) {
-                    Ok(x) { v = x }
-                    Err(_) { break }
-                }
-            }
-            return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
-        }
-        let start = try lexdb_ops.coerceZ(replace(mut &args[0], Val.Null), &ty, &txn.sql.zone)
-        let stop = try lexdb_ops.coerceZ(replace(mut &args[1], Val.Null), &ty, &txn.sql.zone)
-        let step = if len(args) > 2 { try lexdb_ops.coerceZ(replace(mut &args[2], Val.Null), &ty, &txn.sql.zone) } else { try lexdb_ops.coerce(Val.Int(1), &ty) }
-        let zero = try lexdb_ops.coerce(Val.Int(0), &ty)
-        let dir = try lexdb_ops.compare(&step, &zero)
-        if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
-        var v = start
-        var n = 0
-        while true {
-            let c = try lexdb_ops.compare(&v, &stop)
-            if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
-            if cap >= 0 && len(rows) >= cap { break }
-            n += 1
-            var row: []Val = [v.clone()]
-            if sel.ordin { append(mut &row, Val.Int(n)) }
-            bytes += lexdb_pipe.rowBytes(&row)
-            if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
-            append(mut &rows, row)
-            try rs.bud.tick()
-            // the next value; past the type's range: the end
-            match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, &txn.sql.zone) {
-                Ok(x) { v = x }
-                Err(_) { break }
-            }
-            if ty.kind == lexdb_sql.K_INT {
-                match lexdb_ops.coerce(v.clone(), &ty) {
-                    Ok(x) { v = x }
-                    Err(_) { break }
-                }
-            }
-        }
     } else {
-        // unnest: the arrays side by side, the shorter padded with NULLs
-        var cols: [][]Val = []
-        var most = 0
-        for k in 0..len(args) {
-            var vals: []Val = []
-            match args[k] {
-                Val.Text(x) {
-                    let et = lexdb_sql.oidType(sel.outs[k].oid)
-                    for part in try lexdb_ops.arrayParts(&x) {
-                        match part {
-                            Some(p) { append(mut &vals, try lexdb_ops.coerce(Val.Text(p), &et)) }
-                            None { append(mut &vals, Val.Null) }
-                        }
-                    }
-                }
-                else {}
-            }
-            if len(vals) > most { most = len(vals) }
-            append(mut &cols, vals)
-        }
-        for i in 0..most {
-            if cap >= 0 && len(rows) >= cap { break }
-            var row: []Val = []
-            for k in 0..len(cols) { append(mut &row, if i < len(cols[k]) { replace(mut &cols[k][i], Val.Null) } else { Val.Null }) }
-            if sel.ordin { append(mut &row, Val.Int(i + 1)) }
-            bytes += lexdb_pipe.rowBytes(&row)
-            if room >= 0 && bytes > room { return Err(lexdb_pipe.memErr(rs.bud.maxHeld)) }
-            append(mut &rows, row)
-            try rs.bud.tick()
-        }
+        rows = try catRows(st, txn, &sel.srf[1..len(sel.srf)])
     }
     return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
 }
@@ -8663,7 +8551,12 @@ fn levelsProgIn(q: mut &Query, held: bool) {
 }
 
 fn pipeSelMain(sel: mut &Sel) {
-    for i in 0..len(sel.q.subs) { if lexdb_plan.subRuns(&sel.q, i) { pipeSel(mut &sel.q.subs[i].sel) } }
+    for i in 0..len(sel.q.subs) {
+        if lexdb_plan.subRuns(&sel.q, i) {
+            let lazy = lexdb_plan.lazySeries(&sel.q, i)
+            pipeSub(mut &sel.q.subs[i].sel, lazy)
+        }
+    }
     for i in 0..len(sel.parts) { pipeSel(mut &sel.parts[i]) }
     // census: lexdb_census.reset()
     if sel.aggQ {
@@ -8689,6 +8582,16 @@ fn pipeSelMain(sel: mut &Sel) {
                 Some(p) { pipeTake(sel, p) }
                 None {}
             }
+            return
+        }
+        // (a function in FROM: its arguments bound, its rows made at the run, Q8 R3)
+        if len(sel.srf) > 0 {
+            funcPipe(sel)
+            return
+        }
+        // (no FROM, a set-returning function in the select list: a ProjectSet, Q8 R3)
+        if len(sel.q.levels) == 0 && lexdb_plan.srfShape(sel) {
+            srfPipe(sel)
             return
         }
         // census: lexdb_census.no(&lexdb_plan.shapeWhy(sel))
@@ -8962,12 +8865,15 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             if pg.run == lexdb_plan.PR_POINT && len(rs.after) == 0 { return pipeFetch(st, txn, sel, &pg, params, cap, rs, give) }
             if len(sel.q.levels) == 0 { return pipeResult(st, txn, sel, &pg, params, cap, rs, give) }
             var subs = try runSubs(st, txn, &sel.q, params, rs)
+            // (a LATERAL first level over outer values: its rows, Q8 R3)
+            if sel.q.levels[0].lateral { try lat0Rows(st, txn, &sel.q, params, mut &subs, rs) }
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
                 let l0 = &sel.q.levels[0]
                 if (l0.src >= 0 && heldFew(&pg, &subs[l0.src])) || (l0.work >= 0 && lexdb_pipe.heldSmall(try workLen(rs, l0), false, params, 0, false)) {
                     // a few rows held first: joined row by row, as before they were
                     // the pipeline's (a join's set-up costs more than they save)
+                    if l0.lateral { try lat0Memo(st, txn, &sel.q, params, mut &subs, rs) }
                     keepSubs(rs, subs)
                     return Err(lexdb_pipe.batErr())
                 }
@@ -10482,6 +10388,8 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         lexdb_plan.PPlan.Filter(i, _) { opLines(sel, &i, cnt, out) }
         // (its conjuncts are its level's: that table's line)
         lexdb_plan.PPlan.Apply(i, _) { opLines(sel, &i, cnt, out) }
+        // (its line the Result's: the sets made rows, Q8 R3, as physOf's view has none)
+        lexdb_plan.PPlan.ProjectSet(i, _) { opLines(sel, &i, cnt, out) }
         lexdb_plan.PPlan.Result(_) {
             for l in explainLines(&sel.q, cnt) { append(out, l) }
             append(out, "result")
@@ -10639,7 +10547,7 @@ fn sortOutRows(sel: &Sel, rows: mut &[]OutRow) {
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
     if len(sel.mr) > 0 {
-        // census: lexdb_census.note("row", "MATCH_RECOGNIZE (execMatch)")
+        // (its input's rows: the pipeline's when it runs the Sel, Q8 R3; their run noted by execSelIn)
         let r = try execSelIn(st, txn, sel, params, -1, rs)
         return execMatch(&sel.mr[0], r, params, rs)
     }
@@ -10649,10 +10557,7 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 // execSel but MATCH_RECOGNIZE.
 fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
              rs: mut &Run): Result[Res, DbErr] {
-    if len(sel.srf) > 0 {
-        // census: lexdb_census.note(if rs.batch { "row" } else { "off" }, "a function in FROM (execSrf)")
-        return execSrf(st, txn, sel, params, cap, rs)
-    }
+    if len(sel.srf) > 0 { return srfRun(st, txn, sel, params, cap, rs) }
     if rs.batch && pipeRows(sel) && !rs.noLimit {
         // (a value a join's batch cannot hold, an expression it does not
         // compile: the row engine, nothing given yet)
@@ -10690,6 +10595,18 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     var held = 0
     if sel.setop != 0 {
         var rows = try runSet(st, txn, sel, params, rs)
+        // (its ORDER BY, OFFSET and LIMIT lexdb_setop's, Q8 R3)
+        if rs.batch && lexdb_plan.setHeld(sel) {
+            match try setHeldRes(txn, sel, mut &rows, limit, offset, sorting, rs) {
+                Some(r) {
+                    // census: lexdb_census.note("pipe", "")
+                    return Ok(r)
+                }
+                None {
+                    // census: lexdb_census.note("setop", "a set operation (runSet): a value the sort does not hold")
+                }
+            }
+        }
         let noCols: []lexdb_sql.ColDef = []
         for i in 0..len(rows) {
             let vals = replace(mut &rows[i], [])
@@ -10722,6 +10639,11 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         var batched = false
         // census: if later && rs.batch && pipeAggs(sel) { lexdb_plan.censusNote(sel, "row", "agg: a correlated subquery in a key or argument (groupCorr)") }
         if !later && rs.batch && pipeAggs(sel) {
+            // (a LATERAL first level over outer values: its rows, Q8 R3)
+            if q.levels[0].lateral {
+                try lat0Rows(st, txn, q, params, mut &m.subs, rs)
+                m.vrows[0] = replace(mut &m.subs[q.levels[0].src].data, [])
+            }
             match pipeGroups(st, txn, sel, mut &m, params, rs, mut &gs, if room >= 0 { room - held } else { -1 }) {
                 Ok(h) {
                     // census: lexdb_census.note("pipe-agg", "")
@@ -10733,6 +10655,10 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     // (its hashes built now), nothing given yet
                     if !lexdb_pipe.isBat(&x) { return Err(x) }
                     // census: lexdb_plan.censusNote(sel, "row", "agg: gave way at the run (pipeGroups)")
+                    if q.levels[0].lateral {
+                        m.subs[q.levels[0].src].data = replace(mut &m.vrows[0], [])
+                        try lat0Memo(st, txn, q, params, mut &m.subs, rs)
+                    }
                     gs = Groups{index: newMap(), firsts: [], accs: [], sets: []}
                     try materialize(st, txn, q, mut &m, params, rs)
                 }
@@ -16769,66 +16695,21 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
     return Ok(Val.Reg(o, relShown(&q, o).unwrapOr(name.toStr())))
 }
 
-fn srfParts(v: &Val): Option[[]Option[str]] {
-    match v {
-        Val.Text(s) {
-            if strings.startsWith(&s, lexdb_lib.SRF_MARK) {
-                match lexdb_ops.arrayParts(&s[len(lexdb_lib.SRF_MARK)..len(s)]) {
-                    Ok(p) { return Some(p) }
-                    Err(_) {}
-                }
-            }
-        }
-        else {}
-    }
-    return None
-}
-
 // Each row with set-returning values made into as many rows as the longest
 // has values (the others NULL past their end), as PostgreSQL 10 on does;
-// none if every one is empty.
+// none if every one is empty (lexdb_srf.expand).
 fn expandSrfs(rows: mut &[]OutRow, outs: &[]OutCol): Result[Unit, DbErr] {
     var any = false
-    for r in rows { for v in r.vals { if srfParts(&v).isSome() { any = true } } }
+    for r in rows { for v in r.vals { if lexdb_srf.parts(&v).isSome() { any = true } } }
     if !any { return Ok(Unit{}) }
+    var oids: []int = []
+    for o in outs { append(mut &oids, o.oid) }
     var out: []OutRow = []
     for ri in 0..len(rows) {
         let r = replace(mut &rows[ri], OutRow{vals: [], ord: []})
-        var parts: []Option[[]Option[str]] = []
-        var n = -1
-        for v in r.vals {
-            let p = srfParts(&v)
-            match p {
-                Some(ps) { if len(ps) > n { n = len(ps) } }
-                None {}
-            }
-            append(mut &parts, p)
-        }
-        if n < 0 {
-            append(mut &out, r)
-            continue
-        }
-        for k in 0..n {
-            var vals: []Val = []
-            for c in 0..len(r.vals) {
-                match parts[c] {
-                    Some(ps) {
-                        if k < len(ps) {
-                            match ps[k] {
-                                Some(t) {
-                                    let ty = lexdb_sql.oidType(if c < len(outs) { outs[c].oid } else { lexdb_sql.OID_TEXT })
-                                    append(mut &vals, if ty.kind == lexdb_sql.K_REG { Val.Reg(strings.parseIntOpt(&t).unwrapOr(0), t.clone()) } else { try lexdb_ops.coerce(Val.Text(t.clone()), &ty) })
-                                }
-                                None { append(mut &vals, Val.Null) }
-                            }
-                        } else {
-                            append(mut &vals, Val.Null)
-                        }
-                    }
-                    None { append(mut &vals, r.vals[c].clone()) }
-                }
-            }
-            append(mut &out, OutRow{vals: vals, ord: collections.copyOf(&r.ord)})
+        match try lexdb_srf.expand(&r.vals, &oids) {
+            Some(xs) { for x in xs { append(mut &out, OutRow{vals: x, ord: collections.copyOf(&r.ord)}) } }
+            None { append(mut &out, r) }
         }
     }
     let gone = replace(rows, out)
@@ -20089,4 +19970,135 @@ fn runApplyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &
     let n = try got
     levelCounts(rs, &cnt)
     return Ok(n)
+}
+
+// ---- Q8 R3 (design/lexdb-layers.md 6.3.Q8 R3): a function in FROM, set operations and MATCH_RECOGNIZE
+// fed by the pipeline
+
+// A function in FROM's program (lexdb_plan.funcProg), if its arguments bind.
+fn funcPipe(sel: mut &Sel) { sel.pipe = lexdb_plan.funcProg(sel) }
+
+// A SELECT with no FROM and a set-returning function in its select list:
+// its Result under a ProjectSet (lexdb_plan.srfPlan).
+fn srfPipe(sel: mut &Sel) {
+    match lexdb_plan.srfPlan(sel) {
+        Some(p) { pipeTake(sel, p) }
+        None {}
+    }
+}
+
+// pipeSel of a subquery's sel, but a series made as it is read (lazy:
+// lexdb_plan.lazySeries): its Sel is not run, so it is not planned for the
+// pipeline; its arguments' subqueries are (the series' run, seriesRes,
+// runs them).
+fn pipeSub(sel: mut &Sel, lazy: bool) {
+    if !lazy {
+        pipeSel(sel)
+        return
+    }
+    for j in 0..len(sel.q.subs) { if lexdb_plan.subRuns(&sel.q, j) { pipeSel(mut &sel.q.subs[j].sel) } }
+}
+
+// A function in FROM run: by its program with batches on, else (or when
+// its arguments did not bind) by the row engine (execSrf).
+fn srfRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
+    if rs.batch && sel.pipe.isSome() {
+        // census: lexdb_census.note("pipe", "")
+        return pipeFunc(st, txn, sel, params, cap, rs)
+    }
+    // census: lexdb_census.note(if rs.batch { "row" } else { "off" }, "a function in FROM: an argument does not bind (planX)")
+    return execSrf(st, txn, sel, params, cap, rs)
+}
+
+// A function in FROM, run by its pipeline program (Q8 R3): its subqueries
+// run once, its arguments by their bound expressions, then its rows.
+fn pipeFunc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
+    match sel.pipe {
+        Some(pg) {
+            match pg.plan {
+                lexdb_plan.PPlan.Project(_, xs) {
+                    var subs = if len(sel.q.subs) > 0 { try runSubs(st, txn, &sel.q, params, rs) } else { [] }
+                    let cx = pipeCtx(st, txn, params, mut &subs)
+                    let none: []Val = []
+                    var args: []Val = withCapacity(len(xs))
+                    for x in xs { append(mut &args, try lexdb_pipe.bxEval(&x, &none, &none, &cx)) }
+                    lexdb_srf.pipedRun()
+                    return srfRows(st, txn, sel, args, cap, rs)
+                }
+                else {}
+            }
+        }
+        None {}
+    }
+    return Err(e("XX000", "a plan the pipeline does not run"))
+}
+
+// The rows of q's first level when it is LATERAL over outer values only
+// (lexdb_plan.lat0, Q8 R3), into subs: its subquery run once for the run's
+// outer values, as runLevel's LATERAL arm runs it for the first row (its
+// outer values evaluated with no row; the bytes held as its memo holds
+// them).
+fn lat0Rows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val, subs: mut &[]SubRes, rs: mut &Run): Result[Unit, DbErr] {
+    let i = q.levels[0].src
+    var refVals = try lat0Refs(st, txn, q, params, subs)
+    let key = valsKey(&refVals)
+    var ps: []Val = []
+    for j in 0..q.base { append(mut &ps, params[j].clone()) }
+    for v in move(refVals) { append(mut &ps, v) }
+    var res = try runChild(st, txn, &q.subs[i].sel, &ps, -1, rs, i)
+    let rows = replace(mut &res.rows, [])
+    try rs.bud.hold(lexdb_pipe.rowsBytes(&rows) + len(key) + 48)
+    subs[i].data = rows
+    return Ok(Unit{})
+}
+
+// The outer values a LATERAL first level's subquery reads (lat0Rows'),
+// evaluated with no row, as runLevel evaluates them for the first row.
+fn lat0Refs(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, params: &[]Val, subs: &[]SubRes): Result[[]Val, DbErr] {
+    var refVals: []Val = []
+    let sqe = seqEnv(st, txn)
+    let row: []Val = array(len(q.cols), Val.Null)
+    let noAggs: []Val = []
+    let env = Env{cols: &q.cols, row: &row, aggs: &noAggs, params: params, subs: subs, cur: &noAggs, seq: &sqe}
+    for x in q.subs[q.levels[0].src].sel.q.refs { append(mut &refVals, try eval(&x, &env)) }
+    return Ok(refVals)
+}
+
+// A run with a LATERAL first level given way to the row engine: its rows
+// (lat0Rows', moved out of subs) put in the run's memo under their outer
+// values, so runLevel's LATERAL arm takes them rather than running the
+// subquery again (a volatile call in it made once); the hit it counts is
+// not one (EXPLAIN ANALYZE's counts as the row engine's alone).
+fn lat0Memo(st: &lexdb_store.Store, txn: &lexdb_store.Txn, q: &Query, params: &[]Val, subs: mut &[]SubRes, rs: mut &Run): Result[Unit, DbErr] {
+    let i = q.levels[0].src
+    if len(rs.memoRes[i]) >= MEMO_MAX { return Ok(Unit{}) }
+    let key = valsKey(&(try lat0Refs(st, txn, q, params, subs)))
+    rs.memo[i].put(key, len(rs.memoRes[i]))
+    var r = emptyRes()
+    r.data = replace(mut &subs[i].data, [])
+    append(mut &rs.memoRes[i], r)
+    while len(rs.stats) <= i { append(mut &rs.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
+    rs.stats[i].hits -= 1
+    return Ok(Unit{})
+}
+
+// A held set operation's rows (runSet's) with its ORDER BY, OFFSET and
+// LIMIT made by lexdb_setop (lexdb_setop.held), their bytes held as the
+// row path holds them. None: the row path's (a key not an output; rows
+// left as they were).
+fn setHeldRes(txn: mut &lexdb_store.Txn, sel: &Sel, rows: mut &[][]Val, limit: int, offset: int, sorting: bool,
+              rs: mut &Run): Result[Option[Res], DbErr] {
+    match lexdb_setop.held(&setopSpec(sel, 0, 0), rows, limit, offset, sorting) {
+        Ok(h) {
+            try rs.bud.hold(h.bytes)
+            var outs: []OutCol = []
+            for oc in sel.outs { append(mut &outs, oc.clone()) }
+            let tag = "SELECT " + len(h.rows).toStr()
+            return Ok(Some(Res{cols: outs, rows: h.rows, tag: tag, hasRows: true, copy: COPY_NONE}))
+        }
+        Err(x) {
+            if lexdb_pipe.isBat(&x) { return Ok(None) }
+            return Err(x)
+        }
+    }
 }

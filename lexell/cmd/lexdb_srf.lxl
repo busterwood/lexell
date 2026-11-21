@@ -1,0 +1,248 @@
+// lexdb_srf: the rows of a set-returning function (design/lexdb-layers.md
+// 6.3.Q8 R3): a function in FROM (generate_series of integers, numerics
+// and timestamps, unnest of arrays side by side, regexp_matches,
+// regexp_split_to_table, string_to_table, VALUES' rows, pg_partition_ancestors,
+// pg_available_extensions) made from its arguments' values, and a select
+// list's set-returning values (a call's marked value, lexdb_lib.srfMark)
+// expanded into rows, as PostgreSQL 10 on does (ProjectSet).
+//
+// Its secret: how each function's rows follow from its arguments: a
+// series' end (past the stop by the step's sign, or past its type's
+// range), a step of zero, an array's parts, VALUES' coercions (T-SQL's ''
+// as 0 in a column of numbers), the bytes the rows hold against the run's
+// budget. Its caller evaluates the arguments (the row engine by eval, the
+// pipeline by the bound expressions) and serves the catalog's relations
+// (they read the store); both get the same rows here.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_lib"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// What a function's rows are made with: its columns' types (Sel.outs'
+// OIDs), WITH ORDINALITY, at most cap rows (-1 no cap), the session's
+// zone, whether the session speaks T-SQL (VALUES' '' as 0).
+pub type Fn = record {
+    pub name: str
+    pub oids: []int
+    pub ordin: bool
+    pub cap: int
+    pub tsql: bool
+}
+
+// Whether name is a function this module makes the rows of (else the
+// caller's: a catalog relation, a sequence's).
+pub fn ours(name: &str): bool { return !strings.startsWith(name, "#") || strings.startsWith(name, "#values:") }
+
+// The rows of f over its arguments' values. Each row made of a series, an
+// array or a match is given to held first (its bytes counted against the
+// run's budget; tick: a step of the run's, the series' and arrays' rows);
+// call: a library function's value (regexp_matches and the like).
+pub fn rows(f: &Fn, args: []Val, zone: &lexdb_time.Zone, held: &fn(&[]Val, bool): Result[Unit, DbErr],
+            call: &fn(&str, &[]Val): Result[Val, DbErr]): Result[[][]Val, DbErr] {
+    var av = args
+    var rows: [][]Val = []
+    let cap = f.cap
+    if f.name == "pg_available_extensions" {
+        // none
+    } else if f.name == "pg_partition_ancestors" {
+        // no partitions in lexdb: a relation is its only ancestor
+        if len(av) == 1 && !lexdb_ops.isNull(&av[0]) {
+            let o = lexdb_ops.oidArg(&av[0]).unwrapOr(0)
+            var row: []Val = [Val.Reg(o, o.toStr())]
+            if f.ordin { append(mut &row, Val.Int(1)) }
+            append(mut &rows, row)
+        }
+    } else if strings.startsWith(&f.name, "#values:") {
+        let k = len(f.oids)
+        var i = 0
+        // T-SQL: '' in a column of numbers is 0 (design/lexdb-tds.md, section 13)
+        while i + k <= len(av) {
+            var row: []Val = []
+            for c in 0..k {
+                let ty = lexdb_sql.oidType(f.oids[c])
+                let blank = f.tsql && (ty.kind == lexdb_sql.K_INT || ty.kind == lexdb_sql.K_FLOAT) && lexdb_ops.kindOf(&av[i + c]) == lexdb_sql.K_TEXT &&
+                            len(strings.trim(&lexdb_sql.text(&av[i + c]))) == 0
+                append(mut &row, if ty.kind == lexdb_sql.K_TEXT { replace(mut &av[i + c], Val.Null) } else if blank { try lexdb_ops.coerceZ(Val.Int(0), &ty, zone) } else { try lexdb_ops.coerceZ(replace(mut &av[i + c], Val.Null), &ty, zone) })
+            }
+            append(mut &rows, row)
+            i += k
+        }
+    } else if f.name == "regexp_matches" || f.name == "regexp_split_to_table" || f.name == "string_to_table" {
+        let v = try call(&f.name, &av)
+        match parts(&v) {
+            Some(ps) {
+                for i in 0..len(ps) {
+                    if cap >= 0 && len(rows) >= cap { break }
+                    var row: []Val = [match ps[i] { Some(t) { Val.Text(t.clone()) } None { Val.Null } }]
+                    if f.ordin { append(mut &row, Val.Int(i + 1)) }
+                    try held(&row, false)
+                    append(mut &rows, row)
+                }
+            }
+            None {}
+        }
+    } else if f.name == "generate_series" {
+        for a in av { if lexdb_ops.isNull(&a) { return Ok([]) } }
+        let ty = lexdb_sql.oidType(f.oids[0])
+        if ty.kind == lexdb_sql.K_TS || ty.kind == lexdb_sql.K_TSTZ {
+            // timestamps stepped by an interval; a timestamptz's days and months in the session's zone (9.95)
+            var v = try lexdb_ops.coerceZ(replace(mut &av[0], Val.Null), &ty, zone)
+            let stop = try lexdb_ops.coerceZ(replace(mut &av[1], Val.Null), &ty, zone)
+            let step = try lexdb_ops.coerceZ(replace(mut &av[2], Val.Null), &lexdb_sql.oidType(lexdb_sql.OID_IVAL), zone)
+            let dir = match step { Val.Ival(iv) { lexdb_time.ivalCmp(&iv, &lexdb_time.Ival{months: 0, days: 0, us: 0}) } else { 0 } }
+            if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
+            var n = 0
+            while true {
+                let c = try lexdb_ops.compare(&v, &stop)
+                if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+                if cap >= 0 && len(rows) >= cap { break }
+                n += 1
+                var row: []Val = [v.clone()]
+                if f.ordin { append(mut &row, Val.Int(n)) }
+                try held(&row, true)
+                append(mut &rows, row)
+                match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, zone) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+            return Ok(rows)
+        }
+        let start = try lexdb_ops.coerceZ(replace(mut &av[0], Val.Null), &ty, zone)
+        let stop = try lexdb_ops.coerceZ(replace(mut &av[1], Val.Null), &ty, zone)
+        let step = if len(av) > 2 { try lexdb_ops.coerceZ(replace(mut &av[2], Val.Null), &ty, zone) } else { try lexdb_ops.coerce(Val.Int(1), &ty) }
+        let zero = try lexdb_ops.coerce(Val.Int(0), &ty)
+        let dir = try lexdb_ops.compare(&step, &zero)
+        if dir == 0 { return Err(e("22023", "step size cannot equal zero")) }
+        var v = start
+        var n = 0
+        while true {
+            let c = try lexdb_ops.compare(&v, &stop)
+            if (dir > 0 && c > 0) || (dir < 0 && c < 0) { break }
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var row: []Val = [v.clone()]
+            if f.ordin { append(mut &row, Val.Int(n)) }
+            try held(&row, true)
+            append(mut &rows, row)
+            // the next value; past the type's range: the end
+            match lexdb_ops.arithZ(lexdb_ops.OP_ADD, &v, &step, zone) {
+                Ok(x) { v = x }
+                Err(_) { break }
+            }
+            if ty.kind == lexdb_sql.K_INT {
+                match lexdb_ops.coerce(v.clone(), &ty) {
+                    Ok(x) { v = x }
+                    Err(_) { break }
+                }
+            }
+        }
+    } else {
+        // unnest: the arrays side by side, the shorter padded with NULLs
+        var cols: [][]Val = []
+        var most = 0
+        for k in 0..len(av) {
+            var vals: []Val = []
+            match av[k] {
+                Val.Text(x) {
+                    let et = lexdb_sql.oidType(f.oids[k])
+                    for part in try lexdb_ops.arrayParts(&x) {
+                        match part {
+                            Some(p) { append(mut &vals, try lexdb_ops.coerce(Val.Text(p), &et)) }
+                            None { append(mut &vals, Val.Null) }
+                        }
+                    }
+                }
+                else {}
+            }
+            if len(vals) > most { most = len(vals) }
+            append(mut &cols, vals)
+        }
+        for i in 0..most {
+            if cap >= 0 && len(rows) >= cap { break }
+            var row: []Val = []
+            for k in 0..len(cols) { append(mut &row, if i < len(cols[k]) { replace(mut &cols[k][i], Val.Null) } else { Val.Null }) }
+            if f.ordin { append(mut &row, Val.Int(i + 1)) }
+            try held(&row, true)
+            append(mut &rows, row)
+        }
+    }
+    return Ok(rows)
+}
+
+// The function runs made by the pipeline's programs (lexdb_exec.pipeFunc;
+// the tests' look).
+var piped: int = 0
+
+pub fn pipedRun() { piped += 1 }
+
+pub fn pipedCount(): int { return piped }
+
+// ---- a select list's set-returning values (ProjectSet)
+
+// A set-returning call's value (lexdb_lib.srfMark): its rows' values, as
+// an array's parts; None for any other value.
+pub fn parts(v: &Val): Option[[]Option[str]] {
+    match v {
+        Val.Text(s) {
+            if strings.startsWith(&s, lexdb_lib.SRF_MARK) {
+                match lexdb_ops.arrayParts(&s[len(lexdb_lib.SRF_MARK)..len(s)]) {
+                    Ok(p) { return Some(p) }
+                    Err(_) {}
+                }
+            }
+        }
+        else {}
+    }
+    return None
+}
+
+// A row of a select list with set-returning values made into as many rows
+// as the longest has values (the others NULL past their end; a column of
+// another value repeated), each value of its output's type (oids; text
+// past them); none if every one is empty. None: no value of the row is a
+// set's (the row as it is).
+pub fn expand(vals: &[]Val, oids: &[]int): Result[Option[[][]Val], DbErr] {
+    var ps: []Option[[]Option[str]] = []
+    var n = -1
+    for v in vals {
+        let p = parts(v)
+        match p {
+            Some(x) { if len(x) > n { n = len(x) } }
+            None {}
+        }
+        append(mut &ps, p)
+    }
+    if n < 0 { return Ok(None) }
+    var out: [][]Val = []
+    for k in 0..n {
+        var row: []Val = []
+        for c in 0..len(vals) {
+            match ps[c] {
+                Some(xs) {
+                    if k < len(xs) {
+                        match xs[k] {
+                            Some(t) {
+                                let ty = lexdb_sql.oidType(if c < len(oids) { oids[c] } else { lexdb_sql.OID_TEXT })
+                                append(mut &row, if ty.kind == lexdb_sql.K_REG { Val.Reg(strings.parseIntOpt(&t).unwrapOr(0), t.clone()) } else { try lexdb_ops.coerce(Val.Text(t.clone()), &ty) })
+                            }
+                            None { append(mut &row, Val.Null) }
+                        }
+                    } else {
+                        append(mut &row, Val.Null)
+                    }
+                }
+                None { append(mut &row, vals[c].clone()) }
+            }
+        }
+        append(mut &out, row)
+    }
+    return Ok(Some(out))
+}

@@ -22,6 +22,7 @@ import "./lexdb_lib"
 import "./lexdb_like"
 import "./lexdb_rows"
 import "./lexdb_held"
+import "./lexdb_srf"
 import "./lexdb_vec"
 import "./lexdb_sort"
 import "./lexdb_agg"
@@ -2201,6 +2202,12 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                 else { return -1 }
             }
         }
+        lexdb_plan.PPlan.ProjectSet(i, _) {
+            // (Q8 R3) over a Result: its row's sets made rows
+            if !resultArm(&i) { return -1 }
+            let k = opsOf(&i, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
         else { return -1 }
     }
 }
@@ -2238,6 +2245,7 @@ fn resultEval(p: &lexdb_plan.PPlan): bool {
             }
             return false
         }
+        lexdb_plan.PPlan.ProjectSet(i, _) { return resultEval(&i) }
         else { return false }
     }
 }
@@ -2643,6 +2651,7 @@ fn resultOp(txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cx: &Ctx, lim: int,
                 else { return resultRow(txn, &none, &xs, cx, lim, off, ss, cnt, give, ev) }
             }
         }
+        lexdb_plan.PPlan.ProjectSet(i, oids) { return resultSet(txn, &i, &oids, cx, lim, ss, cnt, give, ev) }
         else { return Err(e("XX000", "the pipeline was given a plan it does not run")) }
     }
 }
@@ -8046,4 +8055,34 @@ fn joinsIn(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
         lexdb_plan.PPlan.Apply(i, _) { return &i }
         else { return p }
     }
+}
+
+// ---- a set-returning function in the select list over a Result (Q8 R3)
+
+// A Result's row under a ProjectSet (lexdb_plan.srfPlan): its
+// set-returning values made rows (lexdb_srf.expand: in lockstep, the
+// shorter padded with NULL, of the outputs' types oids; none if every one
+// is empty), at most lim of them given (a run's cap). The rows given.
+fn resultSet(txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, oids: &[]int, cx: &Ctx, lim: int, ss: bool, cnt: mut &[]Counts,
+             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    var n = 0
+    let noOb = lexdb_rows.noOutBatch()
+    let got = try resultOp(txn, p, cx, -1, 0, ss, cnt, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+        match try lexdb_srf.expand(r, oids) {
+            Some(rows) {
+                for row in rows {
+                    if lim >= 0 && n >= lim { return Ok(false) }
+                    n += 1
+                    if !(try give(tx, &noOb, &row)) { return Ok(false) }
+                }
+                return Ok(true)
+            }
+            None {
+                if lim >= 0 && n >= lim { return Ok(false) }
+                n += 1
+                return give(tx, ob, r)
+            }
+        }
+    }, ev)
+    return Ok(n)
 }
