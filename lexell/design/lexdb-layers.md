@@ -6714,6 +6714,195 @@ point select's cycles over the wire do not, by placement; left for the
 owner's call (6.3.Q8's first part met the same: its stage 3 read q9, q13,
 q17 slower at main's instructions).
 
+### 6.3.Q8 R2 as built (2026-11-21)
+
+R2 of 6.5: the small arms. Branch `worktree-agent-abb792d96b0d125de` from
+main 757c4cee. `SET lexdb_batch = off` (the row engine, the tests'
+reference) is untouched, and no row-engine code was deleted: all of it is
+still reached (6.4 after R2).
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 757c4cee | | 19,838 | `lexdb_pipe` 7,553, `lexdb_plan` 8,301, `lexdb_bind` 2,256 |
+| 9a41dfee | a recursive CTE's working table as held rows; test `exec_arms` | 19,857 | `lexdb_plan` 8,304 |
+| 4524ea6e | no FROM: a Result arm (`runResult`), `lexdb_bind.evalMark`, `Prog.run` | 19,899 | `lexdb_pipe` 7,664, `lexdb_plan` 8,385, `lexdb_bind` 2,273 |
+| d5e0cc71 | MIN/MAX by the scan's order (`MinMax`, `aggFirst`) | 19,903 | `lexdb_pipe` 7,753, `lexdb_plan` 8,391 |
+| 9aaf659d | OFFSET on streamed rows (the Limit skips) | 19,903 | `lexdb_pipe` 7,786, `lexdb_plan` 8,401 |
+| 0866529f | DISTINCT ON, WITH TIES, TOP n PERCENT and WITH TIES in the Sort (`SortSt.cutOf`) | 19,905 | `lexdb_pipe` 7,835, `lexdb_plan` 8,414 |
+| 6c770081 | tests `tds_arms` (SQL Server 2022's answers), `tns_arms` | 19,905 | |
+| 93707dc9 | a collation's GROUP BY keys and calls, row by row | 19,905 | `lexdb_pipe` 7,850 |
+| 9d521027 | a point select's planning back to main's instructions (pipeShape's TOP test; no Limit arm for TOP) | 19,906 | `lexdb_plan` 8,413 |
+
+`lexdb_exec` +68: `pipeResult` (eval's outputs need exec's `eval`, `Env`
+and `runSubs`), `workRows`/`workLen` (the run's cache), `pipeTake`,
+`PSort`'s new fields, EXPLAIN's MinMax line; the arms are the pipeline's
+and the plan's.
+
+**The arms, in the order of the census runs they cover** (6.4's runs at
+main 757c4cee: the suite, batches on):
+
+- **A recursive CTE's working table** (47,240 runs, 44 statements): the
+  recursive part's first level is rows the run holds (`heldRead`; its
+  `PScan.held` past the query's subqueries; the rows the round before
+  added copied from the run's cache, as `prepare` copies them:
+  `workRows`), row by row under 64 rows, in batches from 64. A join over
+  a few of them is the row engine's, as a join over a few held rows of a
+  subquery is (`heldSmall`): those runs now show as "gave way at the
+  run".
+- **No FROM** (42,883 runs, 842 statements): a Result arm, `Limit?
+  (Project (Filter? (Result)))` (`lexdb_plan.resultShape`, `resultPlan`;
+  `lexdb_pipe.runResult`): its WHERE (`Query.top`) bound for the plan,
+  then its outputs evaluated (an error in one is the statement's, as the
+  row engine raises it, under LIMIT 0 too), its one row given unless the
+  LIMIT, OFFSET or the run's cap leaves it out; its subqueries run once
+  first. Not with ORDER BY (its keys are evaluated on the one row and may
+  fail), grouping, a window, a set, a lock, TOP, WITH TIES, SELECT @v, a
+  set-returning function or a correlated subquery left in it. An output
+  or condition that does not bind (a sequence, session or catalog
+  function's call: `nextval`, `current_setting`, `pg_backend_pid`,
+  `current_schema`, ...) is marked (`lexdb_bind.evalMark`, way `FN_EVAL`)
+  and evaluated by `eval` in the session at the run (`pipeResult`'s hook;
+  `Prog.run` `PR_EVAL`); not with a subquery in it (eval would not see
+  the subquery's value: the row engine's then). Tried first: binding
+  those calls for the scalar evaluator, with the session in the
+  evaluator's context (`Ctx`): an `Option` of a store handle there cost
+  every point select 18 instructions (its drop; an `int` field cost 1, an
+  array 62), and a registry of sessions by token cost `nextval` 1,600; the
+  mark costs neither. Binding an output bindSel did not bind cost
+  `nextval` as much again (bindIn's failed call binding): an output
+  without a subquery that bindSel did not bind is marked without trying.
+  `Prog.run` (`PR_*`, set once by the planner) also holds the point
+  select's test (no subquery, no join, `pointRead`), made per run before.
+- **MIN or MAX by the scan's order** (`Sel.first`; 10,689 runs, 273
+  statements): `Agg (MinMax (Filter (Scan)))` over one table
+  (`aggFirst`): the scan in its path's order through the conditions and
+  the column's `IS NOT NULL` (added by `pipeAgg`, dropped by `unplan`),
+  the first row only (LIMIT 1), the calls accumulating it, as the row
+  engine's one group. Its scan is an aggregate's (`scanArm(q, true)`): an
+  index's IN list is read in batches, which the row engine's batch driver
+  read row by row (`exec_batchindex`'s look: alone 79 -> 82, with rows
+  113 -> 114), and EXPLAIN ANALYZE's counts are the batch driver's
+  ("rows read 1, kept 1, batches 1"). EXPLAIN as the view's (no
+  "aggregate" line). Over joins: the row engine's (2 runs).
+- **OFFSET** on streamed rows (135 runs; `offsetShape`): the pipeline's
+  Limit reads limit + offset rows and gives those after the offset (a
+  chunk the offset cuts given row by row; a point select's offset goes to
+  `run`); not over joins (3 runs). The skipped rows' outputs are
+  evaluated, as the row engine's and PostgreSQL's (SQL Server's are not:
+  `tds_arms` leaves that case out).
+- **DISTINCT ON, FETCH ... WITH TIES, TOP n PERCENT, TOP n WITH TIES**
+  (36 + 12 + 2 runs): the pipeline's Sort when sorted (`PSort`'s `don`,
+  `ties`, `pct`, `top`): every row held (no top-N), then cut as
+  `execSelIn` cuts them (`SortSt.cutOf`): DISTINCT ON's first row of each
+  run of equal leading keys, the OFFSET, then LIMIT, TOP n or n PERCENT
+  rounded up (TS1031 outside 0..100), WITH TIES the rows that sort as the
+  last given. Under a run's cap of 1 (EXISTS) nothing is sorted and, as
+  the row engine's, every row ties.
+- **A collation's GROUP BY keys and calls** (10 + 7 runs): `PAgg.kinds`,
+  `PCall.kind`: a collated key groups by its collated value
+  (`lexdb_sort.collVal`, as `addToGroup`), a collated call (count(DISTINCT
+  c), min, max) compares by its collation (`lexdb_agg`'s spec kind); such
+  an aggregate runs row by row (`exactAgg`: not the batch kernels), over
+  one table or joins; not in grouping sets (3 runs).
+
+**Left, and why:**
+
+- A set-returning function in the select list (22 runs): its expansion is
+  exec's (`expandSrfs`) after the rows, before ORDER BY and LIMIT; taking
+  it means a ProjectSet operator in the pipeline, or a test in
+  `pipeHeld` every point select would pay. With R3 (a function's rows).
+- A collation's hash join key (6 runs): the join's hash (`bKeyEnc`, the
+  probe's keys) is built from batch columns by value; a collated key
+  needs its collated value on both sides in the kernels. With R4.
+- The binder raising the row path's errors (`select row_number() from
+  emp`, `where count(*) > 1`: 2 runs): raised at bind time they would be
+  raised for an empty table too, where the row engine (the reference)
+  raises nothing; a behaviour change for both engines, the owner's call.
+- Outputs and conditions that do not bind over a table (721 runs: catalog
+  and session functions, `::regclass`, `nextval(x)` per row, ...): a
+  table's rows are evaluated by the scalar evaluator or in batches, which
+  the evalMark hook does not reach (the order of `nextval` across a
+  batch's outputs is not the row engine's); case by case, with R3's
+  catalog relations.
+- Found on the way, dialect gaps (both engines alike): the T-SQL door does
+  not run a recursive CTE in T-SQL's form (`WITH r(n) AS (... UNION ALL
+  ... FROM r)`: 208), nor the Oracle door Oracle's (ORA-00942); the Oracle
+  door has no `FETCH FIRST n PERCENT ROWS` (ORA-00900).
+
+**The census again** (6.4's tool, the final tree; main 757c4cee's run of
+257 tests against the branch's 260, the three new tests' lines left out;
+batches on):
+
+| engine | main 757c4cee | R2 |
+|---|---:|---:|
+| the pipeline's rows | 195,747 | 280,987 |
+| the pipeline's groups | 791,046 | 801,752 |
+| the row engine | 159,490 | 58,603 |
+| a write's rows found | 3,027 | 3,033 |
+| a set operation | 553 | 553 |
+| batches off | 747,634 | 747,634 |
+
+- R2's rows of 6.4 fell by 101,006 runs: those above, less the 8 left
+  (MIN/MAX over joins 2, OFFSET over joins 3, a collated key in grouping
+  sets 3).
+- Grown, by R2's statements showing their next reason: "gave way at the
+  run" +115 (`exec_index_diff`'s and `exec_with`'s recursive CTEs joining
+  a working table of a few rows: the row engine joins them, as before),
+  a join under a stopping first table +2, a set-returning function in the
+  select list +2. Nothing else moved; the writes' +6 are `exec_turns`',
+  whose run counts depend on the clock (its turns).
+
+**Tests.** 257 of 257 at main, 260 of 260 at every commit (new:
+`exec_arms`, `tds_arms`, `tns_arms`). `exec_arms` runs every statement
+with batches on and off (the same rows or error; a write's table after it
+the same): recursive 13, no FROM 34, MIN/MAX 17, OFFSET 15, sort variants
+16, collations 9 (all the same, and the pipeline's but EXPLAIN's two and
+one IN subquery unnested). `tds_arms`' answers are SQL Server 2022's (the
+`lxl-mssql` container, a database of its own, dropped after); `tns_arms`'
+are lexdb's (no Oracle at hand). Expectations changed: `exec_held`
+(refused: 5 held, 4 batched), `exec_subbatch` (DISTINCT ON and WITH TIES
+not the batch driver's: no `s`), `exec_batchindex` (alone 82, with rows
+114).
+
+**Gates.** In process (`LXL_HASH_SEED=1`, the 1-statement run subtracted
+from the 20,000 one, instructions a statement; the table loaded with
+batches off in both builds; INSERT and UPDATE in one transaction on the
+simulated disk; two rounds alternated, main 757c4cee against the branch):
+
+| statement | main 757c4cee | R2 | |
+|---|---:|---:|---:|
+| point select | 119,543.8 | 119,541.8 | -2 (0866529f read 119,545.8: +4, its TOP test in planning; fixed, 9d521027) |
+| INSERT VALUES, one row | 106,271.9 / 106,272.0 | 106,271.7 / 106,271.8 | -0.2 |
+| UPDATE ... WHERE id = k | 148,293.3 / 148,293.3 | 148,293.3 / 148,293.3 | 0 |
+| `select 1` | 46,333.0 / 46,333.0 | 45,418.0 / 45,418.0 | -915 (-2.0%) |
+| `select nextval('s')` | 132,425.9 / 132,186.9 | 132,017.6 / 132,047.1 | -270 (the sequence's writes spread its counts by about 250 a run) |
+
+By commit (point selects, the same harness): 9a41dfee and before main's,
+4524ea6e to 9aaf659d 119,541.8, 0866529f 119,545.8, 9d521027 119,541.8.
+On the way the Result arm's first forms cost what 6.3.Q8 R2's "No FROM"
+says (a session in `Ctx` +18 a point select, a registry +1,600 a
+`nextval`, binding again what bindSel had not bound +1,600 a `nextval`):
+none of them is in the branch.
+
+Over the wire (`pts.sh`, 20,000 point selects by the simple protocol,
+wall / server CPU ms, means of 5, three rounds alternated, both `-O`;
+`~/tpch-w/r2/logs`): main 749.6 / 695.2, 789.6 / 730.4, 760.8 / 702.0;
+R2 742.8 / 684.6, 752.6 / 695.4, 750.6 / 693.0: server CPU -1.5%, -4.8%,
+-1.3% (R1's +1.7% of placement did not come back here; instructions are
+level).
+
+TPC-H (base 757c4cee and the branch's final binary, `-O`, alternated
+twice, one run each, `TPCH_REF` 1744ef99, `~/tpch-w/r2`; best of the
+two): checksums equal on all 22 in all four runs; 12,203 against 12,227
+ms (1.002). Over 1.5%: q5 +2.6%, q8 +2.8%, q10 +2.1%, q13 +2.1%, q15
++4.2% (its rounds 639 / 675 against 666 / 690 ms); their server
+instructions (`iq.sh` over `~/tpch-w/r2`'s copy of the data): q5 -0.05%,
+q8 -0.01%, q10 -0.003%, q13 +0.016%, q15 +0.005%: code placement. Faster
+by over 1.5%: q1 -2.1%, q18 -2.5%, q21 -1.5%, q16 -1.5%. R2's arms are
+not in TPC-H's 22 (their statements' plans did not change).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -6828,6 +7017,23 @@ working table 49,672 -> 50,056, MIN/MAX by the scan's order 10,661 ->
 10,689, no FROM 42,808 -> 42,881, smaller ones by tens. TPC-H's
 row-engine runs 6 -> 4 (q16's and one of q20's subqueries).
 
+**After R2** (6.3.Q8 R2; main 757c4cee's run, 257 tests, against the
+branch's, the same tests, its three new ones left out): the row engine's
+runs with batches on 159,490 -> 58,603, the pipeline's rows 195,747 ->
+280,987, its groups 791,046 -> 801,752. Gone: a recursive CTE's working
+table (47,240), no FROM (42,883), MIN/MAX by the scan's order (10,689;
+2 over joins left), OFFSET (135; 3 over joins left), DISTINCT ON (36),
+WITH TIES (12), TOP PERCENT (2), a collation's GROUP BY key (10; 3 in
+grouping sets left), a call by a collation (7). Grown by their next
+reason: "gave way at the run" 174 -> 289 (a recursive CTE's working
+table of a few rows joined: the row engine's, as a few held rows of a
+subquery joined are), two each of a join under a stopping first table
+and a set-returning function in the select list. The rest is R3-R9's:
+correlated per row (R6) 34,674, windows 6,572, a correlated subquery in
+the outputs 6,331, a join's first table not read in batches 6,085, a
+function in FROM 2,269, outputs and conditions that do not bind 721,
+MATCH_RECOGNIZE 473 (6.3.Q8 R2's "Left").
+
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
 joins by the levels program `Query.jp`): UPDATE 1,391 statements, DELETE
@@ -6873,7 +7079,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | slice | what the pipeline takes | 6.4 rows | own gate | size |
 |---|---|---|---|---|
 | R1 (built: 6.3.Q8 R1) | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
-| R2 | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
+| R2 (built: 6.3.Q8 R2; left: a set-returning function in the select list, a collation's hash join key, the binder's errors and the outputs that do not bind) | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
 | R3 | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop` | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
 | R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
