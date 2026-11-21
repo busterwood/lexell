@@ -6509,6 +6509,211 @@ code placement. Stage 3's binary (6b512c36) read 0.990, with q9 +2.1%,
 q13 +3.3%, q17 +2.3% at instructions within 0.03% of main's. Imports: 62 modules (new: `lexdb_census`, which
 `lexdb_plan`, `lexdb_pipe`, `lexdb_exec` and `lexdb_wire` import).
 
+### 6.3.Q8 R1 as built (2026-11-21)
+
+R1 of 6.5: every SELECT's rows offered to the pipeline. Branch
+`worktree-agent-a5a46464f3e4a17f4` from main a75aa5d0. `SET lexdb_batch
+= off` (the row engine, the tests' reference) is untouched, and no
+row-engine code was deleted: all of it is still reached (6.4 after R1,
+below).
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main a75aa5d0 | | 19,825 | `lexdb_pipe` 7,543, `lexdb_plan` 8,271 |
+| baed363a | stage 1: a subquery's own rows (`pipeSelMain` offers every subquery's rows, not only its aggregates), INSERT ... SELECT's, CREATE TABLE AS's and COPY (query)'s query (`pipeSel`), a write's subqueries (`pipeSubs`: UPDATE, DELETE, MERGE, INSERT VALUES and RETURNING, EXPLAIN of a write); UPDATE and DELETE call `onceEach` and `firstN` only with FROM or TOP | 19,847 | |
+| cb5a4329 | stage 2: a correlated subquery's own rows (its outer values are parameters: `pipeShape` no longer declines `q.refs`); a subquery a semi or anti level looks up per row not planned (`subRuns`: `semiLook` took its table); `lexdb_pipe.runJProj` returns a consumer's error rather than joining the chunk again row by row; T-SQL 512 and ORA-01427 for 21000; tests `exec_subrows`, `tds_subrows`, `tns_subrows` | 19,854 | `lexdb_pipe` 7,553, `lexdb_plan` 8,272, `lexdb_tsql` +1, `lexdb_oratext` +1 |
+| 106b8455 | stage 3: `pipeSelIn`'s `rows` flag gone (always true): one `pipeSel`; `subRuns` and `evalTop` in `lexdb_plan` | 19,837 | `lexdb_plan` 8,277 |
+| c50f681b | stage 4: an EXISTS's unread select list made NULL (`lexdb_plan.existsUnread`), a hashed subquery's key outputs let through (`hashedOuts`) | 19,838 | `lexdb_plan` 8,301 |
+
+**What is offered now.** Every Sel `pipeSel` sees, at every depth: the
+statement's own, its subqueries' (IN, NOT IN, EXISTS, a scalar's, ANY and
+ALL, a semi, anti or mark level's set, a FROM subquery's, a CTE's), a set
+operation's parts, and the queries of INSERT ... SELECT, CREATE TABLE AS
+and COPY (query) TO; a write's subqueries are bound once and planned the
+same way. Which of them the pipeline then runs is `pipeShape`'s and
+`compile`'s answer, as for a top-level SELECT; the rest run as before.
+
+- **A correlated subquery's own rows** (EXISTS, IN, a scalar subquery
+  run per outer row) are the pipeline's: its outer values are the run's
+  parameters, as a correlated aggregate's already were (q17, q20), so
+  `pipeShape` no longer declines `q.refs`. A subquery read by its whole
+  primary key per row takes `pipeFetch`'s point path. The per-run cost,
+  measured before deciding (below), is lower than the row engine's for
+  every shape, so there is no plan-time choice between the two.
+- **A subquery a semi or anti level looks up per row** (`semiLook`, which
+  moved its table into the level: it is no longer run) is not planned
+  (`lexdb_plan.subRuns`); planning it crashed on its emptied level.
+- **An EXISTS's select list**: its `*` reads no column (`stmtNames`, q21's
+  narrowing), so its scan decodes none and the pipeline refused outputs
+  of undecoded columns. `existsUnread` (in `planSubIn`) makes each column
+  output NULL, the value the row engine read of it, unless the rows it
+  counts depend on their values (a set operation, grouping, DISTINCT, an
+  aggregate). PostgreSQL drops an EXISTS's select list the same way.
+- **A hashed subquery** (correlated, run once into a hash: `hashSub`)
+  outputs its keys and its value, more columns than its select list.
+  `pipeShape` takes more outputs than the list when the Sel neither sorts
+  nor is DISTINCT (`hashedOuts`; `hashSub` is the only maker of such a
+  Sel; `runHashed` reads the rows by position, not `outs`). The test is a
+  statement of its own: written into `pipeShape`'s return it cost a point
+  select 12 instructions.
+- **Writes** (`pipeSubs`, after `endScope`): UPDATE's SET and WHERE,
+  DELETE's WHERE and RETURNING, MERGE's source and conditions, INSERT
+  VALUES' and RETURNING's subqueries; INSERT plans them inside its test
+  for subqueries (`resolved`), so INSERT VALUES pays nothing. The rows a
+  write changes are still found by `runQuery` (R5).
+- **A bug the switch exposed**, in the pipeline's joins: `joinChunk`
+  joins a chunk again row by row when an expression of the joins fails
+  (to give the row engine's first failing row), and took a failure of the
+  rows' consumer for one: an INSERT ... SELECT over a join whose row 11
+  broke NOT NULL wrote rows 1-10 again and failed with 23505.
+  `runJProj` now keeps a consumer's error and stops, as `runLevels` did.
+- **The doors**: 21000 (a scalar subquery with two rows) was T-SQL's
+  50000 and Oracle's ORA-20000; now 512 and ORA-01427, their own.
+
+**Still not offered, and why:** every planner path to a run goes
+through `pipeSel` now; the census still notes six runs as "not offered"
+(no reason kept under the Sel's key), one each of six `exec_unnest` look
+queries' IN subqueries (`select id, c from t1 where id < 20 and c in
+(select id from t3 where t3.v > 20)` and five like it), not traced
+further: a Sel planned outside `pipeSel`, or a census key another Sel
+of the statement holds. What the pipeline still declines among the
+subqueries R1 offered shows under their next reason in 6.4 (after R1):
+a correlated subquery left per row inside them (R6), a correlated
+subquery in their outputs (R6/R7), a function in FROM (R3), no FROM
+(R2), and a few of the small ones.
+
+**The per-run cost, measured first** (in process, `LXL_HASH_SEED=1`, the
+tables loaded by the row engine in both builds so their layout is the
+same; 1,000 outer rows, unnesting off so the subquery runs per outer row;
+instructions a query of 1,000 runs, the 1-query run subtracted from the
+21-query one; main a75aa5d0 against the branch's final tree):
+
+| subquery, per outer row | main (row engine) | R1 (pipeline) | |
+|---|---:|---:|---:|
+| `(select v from f where f.id = o.k)` (the point path) | 29,697,213 | 24,877,093 | -16.2% |
+| `... where f.id = o.k and f.v > 0` | 30,526,657 | 25,681,865 | -15.9% |
+| `o.id in (select xf from f where f.xf = o.k)` (an index, index only) | 51,730,448 | 49,131,694 | -5.0% |
+| `exists (select 1 from f where f.xf = o.k)` in the select list | 44,880,315 | 42,937,397 | -4.3% |
+| `(select v from f where f.xf = o.k limit 1)` | 47,633,495 | 45,566,442 | -4.3% |
+| `(... order by v desc limit 1)` | 54,291,562 | 51,064,111 | -5.9% |
+| `(select o2.z from f join o2 ... limit 1)` (a join under LIMIT: still the row engine's, R4) | 50,534,633 | 50,519,634 | -0.03% |
+| `o.k in (select distinct xf from f where f.id = o.id)` (hashed, run once) | 59,298,344 | 53,243,153 | -10.2% |
+
+So the pipeline's setup a run (`runSubs`, `pipeSrc`, `pipeCtx`, the
+program's run) costs less than the row engine's (`prepareIn`,
+`runQuery`, `outRow`), and there is nothing to choose at plan time.
+q20's 8,508 runs (51.7) are a correlated aggregate's, the pipeline's
+before R1 and after: unchanged (its instructions below).
+
+**The census again** (6.4's tool on the final tree, the same 254 tests as
+6.4's run at main: the three new tests' lines left out; batches on):
+
+| engine | main a75aa5d0 | R1 |
+|---|---:|---:|
+| the pipeline's rows | 38,940 | 188,801 |
+| the pipeline's groups | 790,243 | 790,602 |
+| the row engine | 310,731 | 162,204 |
+| a write's rows found | 3,001 | 3,003 |
+| a set operation | 553 | 553 |
+| batches off | 737,799 | 737,799 |
+
+- R1's rows of 6.4: "a subquery's own rows (rows false)" (151,024 runs
+  at main, with its "; and ..." variants) is gone; "not offered" fell
+  from 800 runs (274 statements) to 6 (above).
+- Run by run (the census lines of a test in order, in the 244 tests whose
+  run counts are the same): of 104,534 runs of R1's reasons, 91,325 are
+  the pipeline's now and 13,208 the row engine's under their next reason
+  (a correlated subquery left per row 6,849; one in the outputs 6,024;
+  a function in FROM 121; no FROM 77; an output that does not bind 48;
+  MIN/MAX by the scan's order 30; 59 in eight small ones). Of 70,972
+  runs of the other reasons none moved. The ten tests whose run counts
+  changed (plans changed: `exec_autostats`, `exec_unnest`,
+  `exec_semijoin`, ...) held 47,290 runs of R1's reasons and hold 6.
+- Beyond R1's rows: "a correlated subquery's own run (refs)" (22,198
+  runs, 59 statements), which 6.4 counted with R6's "correlated per row",
+  is gone too: those are correlated subqueries' own rows, now offered.
+  The R6 row keeps its other three parts (a correlated subquery left per
+  row in a query: those queries are still the row engine's).
+- TPC-H (the 22 once through a census build): the row engine's runs fall
+  from 6 to 4: q16's NOT IN subquery (the supplier scan) and q20's inner
+  IN subquery (part by name) are the pipeline's. q20's outer IN subquery
+  (partsupp, with the correlated sum in its WHERE) is now the row
+  engine's for that sum (`q.corr`: R6), as are q2's and q17's outer
+  queries; the fourth is a `select 1`.
+
+**Gates.** Suite: 254 of 254 at stage 1, 257 of 257 after (new:
+`exec_subrows`, `tds_subrows`, `tns_subrows`). Each new test runs every
+statement with batches on and off (the same rows or error, a write's
+table after it the same); `tds_subrows`' answers are SQL Server 2022's
+(the `lxl-mssql` container, through its own program with `LEXDB_MSSQL`
+set), `tns_subrows`' are lexdb's (no Oracle at hand; Oracle's forms,
+NULLs first under DESC, `||` reading NULL as ''). `exec_subrows`' groups
+and their pipeline runs (main / R1, the same rows on both): where 752 /
+767, per row 13 / 3,740, select list 4 / 715, from 11 / 20, writes 12 /
+888, INSERT ... SELECT 27 / 379. Expectations changed: `exec_subbatch`
+(its nested subquery's condition is the pipeline's, no `s`),
+`exec_unnest` (one more look query through the pipeline's joins).
+
+Point selects, single-row INSERT, UPDATE by key (in process,
+`LXL_HASH_SEED=1`, the 1-statement run subtracted from the 20,000 one,
+the simulated disk; INSERT and UPDATE in one transaction, so the
+simulated disk's commit, which copies its files, is not in the count;
+their table loaded by the row engine in both, as R1 changes how INSERT
+... SELECT lays a table out, which moves later statements' counts):
+
+| statement | main a75aa5d0 | R1 (c50f681b) | |
+|---|---:|---:|---:|
+| point select | 119,396.8 | 119,382.8 | -14 (the table loaded by the pipeline in R1's build: 119,525.8 against 119,516.8, -9, with the same layout) |
+| INSERT VALUES, one row | 106,288.9 | 106,271.9 | -17 |
+| UPDATE ... WHERE id = k | 148,487.3 | 148,293.2 | -194 |
+
+On the way: `if len(q.subs) > 0 { pipeSubs }` after INSERT's `endScope`
+cost INSERT 4 instructions (moved into its `resolved` test: -17), the
+same test cost UPDATE 4 (paid back by skipping `onceEach` and `firstN`'s
+calls without FROM or TOP: -194), and `hashedOuts` written into
+`pipeShape`'s return 12 a point select (a statement of its own: 0).
+Instruction counts on a real directory vary by about ±80 a write (the
+log's group commits); the simulated disk is exact.
+
+TPC-H (base a75aa5d0 and the branch, `-O`, alternated twice, one run
+each, `TPCH_REF` 1744ef99, `~/tpch-w/r1`; best of the two): with the
+final binary (c50f681b) checksums equal on all 22, 11,898 against 11,814
+ms (0.993), none over 1.5% slower (the most q5 +1.1%, q13 +0.8%); q16
+-2.3%, q17 -1.7%, q20 -1.6%. Stage 3's binary (106b8455): 0.994, q20
++1.8% (278.5 against 283.6 ms) at 0.19% fewer server instructions than
+main (`iq.sh`: 1,755,126,930 against 1,751,834,444), q16 -0.04%, q17
+-0.03%: placement. The final binary's server instructions against main's
+(`iq.sh` over `~/tpch-w/r1`'s copy of the data): q20 -0.19%, q16 +0.06%,
+q5 +0.04%.
+
+OLTP over the wire (base a75aa5d0 against c50f681b, `-O`, alternated,
+two rounds; logs in `~/tpch-w/r1/logs`):
+
+- `icount.sh` (points.sql, the server's instructions and cycles a
+  statement): instructions 186,982 / 187,035 / 187,030 against 186,967 /
+  186,990 / 186,916 (equal, R1 15-115 fewer); cycles 103,092 / 103,189 /
+  102,721 against 104,674 / 105,443 / 105,129 (+1.5% to +2.3%). Stage 3's
+  binary (106b8455): the same instructions, cycles 107,539 and 107,439
+  (+4.6%); stages 1 and 2 104.0k and 103.8k. Instructions equal and
+  cycles swinging by 3.6% between two stages a few lines apart (stage 3
+  to 4 lowered the instructions) is code placement: with the final
+  binary L1 i-cache misses fell (387 -> 268 a statement), iTLB misses
+  too (125 -> 54), branch misses rose by 22.
+- `pts.sh` (20,000 point selects by the simple protocol, wall / server
+  CPU ms, means of 5): round 1 690.8 / 642.2 against 705.0 / 654.6, round
+  2 694.4 / 646.0 against 709.6 / 660.8 (+2.0% to +2.3%): the cycles above.
+- `simple.sh` (pgbench `-M simple`, 4 clients, 10 s): point select
+  50,821 and 51,270 tps against 49,992 and 50,017 (-1.6%, -2.4%); update
+  9,222 and 9,239 against 9,269 and 9,320 (+0.5%, +0.9%); the 3-table
+  join 19,695 and 19,765 against 20,042 and 20,071 (+1.8%, +1.5%).
+
+The instruction gates pass (point select, INSERT and UPDATE fewer); the
+point select's cycles over the wire do not, by placement; left for the
+owner's call (6.3.Q8's first part met the same: its stage 3 read q9, q13,
+q17 slower at main's instructions).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -6595,12 +6800,12 @@ times out under the census's writes, a line a run):
 
 | reason | statements | tests | runs | example | to cover | size |
 |---|---:|---:|---:|---|---|---|
-| a subquery's own rows (IN, EXISTS, a scalar's, a semi, anti or mark level's: `pipeSelIn(sel, false)`), INSERT ... SELECT's rows: 1,980 statements (129 tests) for that alone, 1,633 (32 tests, 138,873 runs) correlated per row as well | 3,360 | 135 | 151,021 | q16's `ps_suppkey not in (select s_suppkey from supplier where ...)`; per row: `exists (select 1 from f where f.xf = tn.k)` | offer their rows (`rows` true): `runChild`'s `execSel` already takes `pipeHeld`; the per-row ones need Apply as well (below) | small (a switch, measured per run: q20's 8,508) |
+| a subquery's own rows (IN, EXISTS, a scalar's, a semi, anti or mark level's: `pipeSelIn(sel, false)`), INSERT ... SELECT's rows: 1,980 statements (129 tests) for that alone, 1,633 (32 tests, 138,873 runs) correlated per row as well | 3,360 | 135 | 151,021 | q16's `ps_suppkey not in (select s_suppkey from supplier where ...)`; per row: `exists (select 1 from f where f.xf = tn.k)` | offer their rows (`rows` true): `runChild`'s `execSel` already takes `pipeHeld`; the per-row ones need Apply as well (below). **Done, R1 (6.3.Q8 R1): the reason is gone; the per-row ones' own rows are offered too (the pipeline cheaper a run); 13,208 of their runs are the row engine's under their next reason** | small (a switch, measured per run: q20's 8,508) |
 | a window (`winValues`) | 5,931 | 19 | 6,572 | `select id, sum(v) over (partition by g order by id) from t` | a Window operator: partitions sorted (P3's Sort), frames over chunks, `lexdb_window`'s evaluators | large (exec's window code: `winValues`, `winBatch`, `winPlan`, 260 lines) |
 | no FROM (`runQuery` with no level) | 814 | 116 | 42,808 | `select nextval('s')`, `select 1` | a Result arm: one row, its outputs by `bxEval` | small; a driver's `select 1` is point-select-like: OLTP gate |
-| a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo | large |
+| a correlated subquery left per row: in an aggregate's query (392), in a plain query (303), in the outputs or ORDER BY (238), a correlated subquery's own run (59; offered by R1, gone) | 903 | 47 | 44,277 | q2, q17; `select (select count(*) from big(t.v)) from t` | Apply (6.2.3's "Apply for RUN_PER_ROW"): the per-row call of the subquery's program from an arm, its memo | large |
 | a function in FROM as the query (`execSrf`: generate_series, unnest, the catalog's relations) | 429 | 77 | 2,268 | `select count(*) from pg_class where relkind = 'r'` | a function-scan source (`lexdb_held` reads its rows already) | medium (`execSrf` 172 lines) |
-| not offered to the pipeline (a write's subqueries: RETURNING, SET, WHERE) | 274 | 21 | 800 | `delete from fp returning id, (select count(*) from fc)` | `pipeSel` for a write's subqueries | small |
+| not offered to the pipeline (a write's subqueries: RETURNING, SET, WHERE) | 274 | 21 | 800 | `delete from fp returning id, (select count(*) from fc)` | `pipeSel` for a write's subqueries. **Done, R1: 6 runs left (six `exec_unnest` IN subqueries, not traced)** | small |
 | MIN or MAX by the scan's order (`Sel.first`) | 245 | 17 | 10,661 | `select max(c) from f` (an index on c) | a first-row aggregate over an ordered scan that stops | small |
 | joins the pipeline does not join: per row under a first table that stops early (161), a point first table (44), RIGHT/FULL with no key (14), a collation's key (5), an `= any(array)` lookup (4), an expression (2) | 230 | 28 | 374 | OLTP's 3-table join; `select * from v11 where id = 3` (a view of a join) | lookups under a stopping first table, a chunk of one as a join's input, collated keys | medium |
 | MATCH_RECOGNIZE (`execMatch` over its input's rows) | 196 | 6 | 473 | `select * from mv order by g` | stays a row operator over the input (`lexdb_match`), fed by the pipeline; out of exec | medium |
@@ -6611,6 +6816,17 @@ times out under the census's writes, a line a run):
 | a recursive CTE's working table as the first level | 44 | 5 | 50,312 | `with recursive t(n) as (select 1 union all select n + 1 from t where n < 10) ...` | the working table as rows the run holds (`heldRead`) | small |
 | aggregates it does not run: a window over the groups (11), a collation's key or call (13), calls, keys or conditions that do not bind (11) | 35 | 23 | 51 | `select count(distinct c) from w` (c a collated text) | collated keys and calls in `HashAgg` | small-medium |
 | DISTINCT ON (25), WITH TIES and TOP PERCENT (12), a set-returning function in the select list (8), `SELECT @v =` (1) | 46 | 10 | 66 | `values (1), (1), (2) order by 1 fetch first 1 row with ties` | Sort and Distinct variants | small each |
+
+**After R1** (6.3.Q8 R1, the same 254 tests): the row engine's runs with
+batches on 310,731 -> 162,204, the pipeline's rows 38,940 -> 188,801.
+Gone: R1's two rows and "a correlated subquery's own run" (22,198 runs).
+Grown, by R1's statements now showing their next reason: a correlated
+subquery left per row 390 -> 13,244 runs (R6), one in the outputs or
+ORDER BY 288 -> 6,312, a join's first table not read in batches 70 ->
+6,085 (`exec_unnest`'s nested correlated NOT IN), a recursive CTE's
+working table 49,672 -> 50,056, MIN/MAX by the scan's order 10,661 ->
+10,689, no FROM 42,808 -> 42,881, smaller ones by tens. TPC-H's
+row-engine runs 6 -> 4 (q16's and one of q20's subqueries).
 
 **The writes** (the rows a write changes, found by `runQuery` over its
 query: `runLevel`, with batches its first level by `batchLevel`, its
@@ -6656,7 +6872,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 
 | slice | what the pipeline takes | 6.4 rows | own gate | size |
 |---|---|---|---|---|
-| R1 | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
+| R1 (built: 6.3.Q8 R1) | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
 | R2 | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
 | R3 | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop` | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
 | R4 | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
