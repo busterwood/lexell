@@ -8012,7 +8012,9 @@ fn typing(): lexdb_bind.Typing { return lexdb_bind.Typing{rules: lexdb_dialect.R
 
 // What the planner needs of the executor (lexdb_plan.Up), set when a
 // session is made.
-fn planUp(): lexdb_plan.Up { return lexdb_plan.Up{eval: constEval, typing: typing(), planSub: planSub} }
+fn planUp(): lexdb_plan.Up {
+    return lexdb_plan.Up{eval: constEval, typing: typing(), planSub: planSub}
+}
 
 // An expression with no columns evaluated: the planner's constant folding.
 fn constEval(x: &Expr, params: &[]Val): Result[Val, DbErr] {
@@ -8622,6 +8624,14 @@ fn pipeSelMain(sel: mut &Sel) {
         return
     }
     if !lexdb_plan.pipeShape(sel) {
+        // (no FROM: a Result, Q8 R2)
+        if len(sel.q.levels) == 0 && lexdb_plan.resultShape(sel) {
+            match lexdb_plan.resultPlan(sel) {
+                Some(p) { pipeTake(sel, p) }
+                None {}
+            }
+            return
+        }
         // census: lexdb_census.no(&lexdb_plan.shapeWhy(sel))
         return
     }
@@ -8671,7 +8681,9 @@ fn pipeSelMain(sel: mut &Sel) {
     // expression made after the outputs
     var ps: Option[lexdb_plan.PSort] = None
     if sel.sort {
-        var srt = lexdb_plan.PSort{shown: len(xs), out: [], desc: [], nf: [], coll: []}
+        var srt = lexdb_plan.PSort{shown: len(xs), out: [], desc: [], nf: [], coll: [], don: sel.donKey,
+                                   ties: if sel.topMode & lexdb_sql.TOP_TIES != 0 { lexdb_plan.TS_TOP } else if sel.withTies { lexdb_plan.TS_FETCH } else { 0 },
+                                   pct: sel.topMode & lexdb_sql.TOP_PERCENT != 0, top: if sel.topMode != 0 { sel.topN } else { -1 }}
         for oi in 0..len(sel.order) {
             var o = lexdb_bind.orderOut(&sel.order[oi], &sel.q.cols, &sel.outs, len(sel.exprs))
             if o == -2 {
@@ -8704,10 +8716,22 @@ fn pipeSelMain(sel: mut &Sel) {
     // the operators over it as physAbove makes them (EXPLAIN prints them)
     let dist = if sel.distinct { lexdb_plan.PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
     let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(dist, sel.sort, ps) } else { dist }
+    // (TOP's count: the Sort's, PSort.top)
     let plan = if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) } else { ordered }
-    match lexdb_pipe.compile(plan, &sel.q.cols) {
+    match lexdb_pipe.compileP(plan, &sel.q.cols, len(sel.q.subs) == 0 && lexdb_plan.pointRead(&sel.q.levels[0])) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { lexdb_plan.unplan(sel, back) }
+    }
+}
+
+// sel's plan p the pipeline's if it compiles, else given back.
+fn pipeTake(sel: mut &Sel, p: lexdb_plan.PPlan) {
+    match lexdb_pipe.compile(p, &sel.q.cols) {
+        Ok(pg) { sel.pipe = Some(pg) }
+        Err(back) {
+            // census: lexdb_census.no("no FROM: compile")
+            lexdb_plan.unplan(sel, back)
+        }
     }
 }
 
@@ -8841,6 +8865,20 @@ fn keepSubs(rs: mut &Run, subs: []SubRes) {
     rs.pre = subs
 }
 
+// A recursive CTE's working table (level lv's), the rows the round before
+// added, copied (as prepare copies them), and their number.
+fn workRows(rs: &Run, lv: &Level): Result[[][]Val, DbErr] {
+    let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+    if at < 0 { return Err(e("XX000", "a working table is missing")) }
+    return Ok(copyRows(&rs.cache.rows[at]))
+}
+
+fn workLen(rs: &Run, lv: &Level): Result[int, DbErr] {
+    let at = cacheAt(&rs.cache, &("w" + lv.work.toStr()))
+    if at < 0 { return Err(e("XX000", "a working table is missing")) }
+    return Ok(len(rs.cache.rows[at]))
+}
+
 // Runs sel's pipeline plan: at most cap rows (-1 no cap), given to give
 // (lexdb_pipe.run's: a chunk, or a row read one by one), its subqueries
 // run once first. The scan's counts go to the run's (EXPLAIN ANALYZE).
@@ -8849,18 +8887,19 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
            give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     match sel.pipe {
         Some(pg) {
-            if len(sel.q.subs) == 0 && !pg.joins && len(rs.after) == 0 && lexdb_plan.pointRead(&sel.q.levels[0]) { return pipeFetch(st, txn, sel, &pg, params, cap, rs, give) }
+            if pg.run == lexdb_plan.PR_POINT && len(rs.after) == 0 { return pipeFetch(st, txn, sel, &pg, params, cap, rs, give) }
+            if len(sel.q.levels) == 0 { return pipeResult(st, txn, sel, &pg, params, cap, rs, give) }
             var subs = try runSubs(st, txn, &sel.q, params, rs)
             if pg.joins {
                 // (slice P2) every table's arm: its table and where it is read
                 let l0 = &sel.q.levels[0]
-                if l0.virt() && heldFew(&pg, &subs[l0.src]) {
+                if (l0.src >= 0 && heldFew(&pg, &subs[l0.src])) || (l0.work >= 0 && lexdb_pipe.heldSmall(try workLen(rs, l0), false, params, 0, false)) {
                     // a few rows held first: joined row by row, as before they were
                     // the pipeline's (a join's set-up costs more than they save)
                     keepSubs(rs, subs)
                     return Err(lexdb_pipe.batErr())
                 }
-                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
+                let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
                 let cx = pipeCtx(st, txn, params, mut &subs)
                 var tabs: []&Table = []
                 for k in 0..len(sel.q.levels) { append(mut &tabs, &sel.q.levels[k].t) }
@@ -8889,10 +8928,11 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
             }
             // (rows the run holds as the first level: read from the subquery's result)
             let l0 = &sel.q.levels[0]
-            let none: [][]Val = []
-            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, if l0.virt() { len(subs[l0.src].data) } else { 0 }, rs)
+            // (a recursive CTE's working table: the round before's rows, Q8 R2)
+            let work = if l0.work >= 0 { try workRows(rs, l0) } else { [] }
+            let src = try pipeSrc(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else { len(work) }, rs)
             let cx = pipeCtx(st, txn, params, mut &subs)
-            let held = if l0.virt() { &subs[l0.src].data } else { &none }
+            let held = if l0.src >= 0 { &subs[l0.src].data } else { &work }
             var cnt: []lexdb_pipe.Counts = []
             let n = try lexdb_pipe.run(st, txn, &pg, &sel.q.cols, &sel.q.levels[0].t, &src, held, &cx, cap, mut &rs.bud, mut &cnt, give)
             scanCounts(rs, &cnt)
@@ -8900,6 +8940,26 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
         }
         None { return Err(e("XX000", "a plan the pipeline does not run")) }
     }
+}
+
+// runPipe for a SELECT with no FROM (a Result program, Q8 R2): its
+// subqueries run first, if any; its one row by lexdb_pipe.runResult. An
+// output or condition that does not bind (a sequence, session or catalog
+// function's call: lexdb_bind.evalMark) is eval's, in the session (its
+// Expr: the select list's, Query.top's).
+fn pipeResult(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &lexdb_plan.Prog, params: &[]Val, cap: int, rs: mut &Run,
+              give: &fn(mut &lexdb_store.Txn, &OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    var subs = if len(sel.q.subs) > 0 { try runSubs(st, txn, &sel.q, params, rs) } else { [] }
+    let cx = pipeCtx(st, txn, params, mut &subs)
+    let seq = if pg.run == lexdb_plan.PR_EVAL { seqEnv(st, txn) } else { None }
+    let noCols: []lexdb_sql.ColDef = []
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: &seq}
+    var cnt: []lexdb_pipe.Counts = []
+    return lexdb_pipe.runResult(txn, pg, &cx, cap, mut &cnt, give, fn(cond: bool, i: int): Result[Val, DbErr] {
+        return eval(if cond { &sel.q.top[i] } else { &sel.exprs[i] }, &env)
+    })
 }
 
 // runPipe for a point select (lexdb_plan.pointRead, no subquery; Q8,
@@ -8950,7 +9010,11 @@ fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &l
     let lv = &q.levels[0]
     if lv.virt() {
         // rows the run holds: its caller gives them to the run, a series
-        // (made as it is read) its arguments
+        // (made as it is read) its arguments; a working table's (Q8 R2)
+        if lv.src < 0 {
+            let noVals: []Val = []
+            return lexdb_pipe.srcHeld(pg, held, false, &noVals, 0, false)
+        }
         let sr = &subs[lv.src]
         return lexdb_pipe.srcHeld(pg, held, sr.series, &sr.vals, sr.sOid, sr.sOrdin)
     }
@@ -10324,7 +10388,11 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         }
         lexdb_plan.PPlan.Agg(i, _, _) {
             opLines(sel, &i, cnt, out)
-            append(out, "aggregate")
+            // (MIN/MAX by the scan's order: its line the aggregate's, as physOf's view)
+            match i {
+                lexdb_plan.PPlan.MinMax(_) {}
+                else { append(out, "aggregate") }
+            }
         }
         lexdb_plan.PPlan.Having(i) {
             opLines(sel, &i, cnt, out)

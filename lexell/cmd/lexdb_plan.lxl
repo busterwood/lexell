@@ -304,7 +304,17 @@ pub type PSort = record {
     pub desc: []bool
     pub nf: []bool
     pub coll: []int
+    // (Q8 R2) DISTINCT ON: its keys, the first don (0 none); WITH TIES:
+    // TS_TOP (TOP n WITH TIES), TS_FETCH (FETCH ... WITH TIES), 0 none; TOP
+    // n PERCENT (pct) or TOP n WITH TIES: its n (top, -1 none)
+    pub don: int
+    pub ties: int
+    pub pct: bool
+    pub top: int
 }
+
+pub const TS_TOP: int = 1
+pub const TS_FETCH: int = 2
 
 // A range's bound: ">", ">=", "<" or "<=" its value.
 pub type PBound = record { pub op: str; pub val: lexdb_bind.BX }
@@ -318,12 +328,13 @@ pub type PAgg = record {
     pub calls: []PCall
     pub keep: []bool        // per column of the query: kept in a group's first row (read after grouping: outputs, HAVING, ORDER BY)
     pub sets: [][]int       // GROUPING SETS, ROLLUP, CUBE: per set the places of its keys (in keys); a group of each set; [] plain
+    pub kinds: []int        // per key its collation's kind (lexdb_sql.COLL_*; Q8 R2: a collated key groups by its collated value)
 }
 
 // An aggregate call of any function (lexdb_agg's: count (star: count(*)),
 // sum, avg, min, max, string_agg, array_agg, bool_and, the variances ...),
-// DISTINCT or ORDER BY in the call too; compared as its values are (no
-// collation's keys). more: the expressions it reads besides its argument,
+// DISTINCT or ORDER BY in the call too; compared as its values are, or by
+// its argument's collation (kind, Q8 R2). more: the expressions it reads besides its argument,
 // bound like it: string_agg's separator, then its ORDER BY keys (dirs:
 // one letter each, as the parser gives them).
 pub type PCall = record {
@@ -335,6 +346,7 @@ pub type PCall = record {
     pub more: []lexdb_bind.BX
     pub dirs: str
     pub dia: int            // lexdb_pct.DIA_*: percentile_cont and percentile_disc's dialect
+    pub kind: int           // its argument's collation's kind (lexdb_sql.COLL_*: min, max and DISTINCT compare by it)
 }
 
 // The columns (of n, the query's) a key-less aggregate's scan decodes:
@@ -480,7 +492,18 @@ pub type Prog = record {
     // its top is a Sort or Distinct (slice P3): the rows are held, then
     // given as one OutBatch (the run holds their bytes in its budget)
     pub sorts: bool
+    // how a run starts (PR_*), set once by the planner, not tested per run
+    pub run: int
 }
+
+pub const PR_PLAIN: int = 0
+// a point select's (Q8: lexdb_exec.pipeFetch): no subquery, no join, its
+// table read by its whole primary key (pointRead)
+pub const PR_POINT: int = 1
+// a Result's (no FROM) with an output or condition that does not bind (a
+// sequence, session or catalog function's call: lexdb_bind.evalMark), which
+// its run's owner evaluates (Q8 R2)
+pub const PR_EVAL: int = 2
 
 // A subquery of a query: what it is (lexdb_sql.SUB_*), how the executor
 // runs it (RUN_*), NOT EXISTS's (an anti join) for RUN_SEMI and
@@ -7304,8 +7327,9 @@ pub fn scanArm(q: &Query, aggs: bool): PScan {
     for i in 0..len(t.cols) { kinds[lv.first + i] = lexdb_rows.pipeKind(&t.cols[i], false) }
     var need: []bool = withCapacity(len(t.cols))
     for i in 0..len(t.cols) { append(mut &need, len(lv.need) == 0 || lv.need[i]) }
-    // (rows the run holds: always read as batches, or row by row if few)
-    let held = if lv.virt() { lv.src } else { -1 }
+    // (rows the run holds: always read as batches, or row by row if few; a
+    // recursive CTE's working table past the query's subqueries, Q8 R2)
+    let held = if lv.src >= 0 { lv.src } else if lv.work >= 0 { len(q.subs) + lv.work } else { -1 }
     let batch = held >= 0 || firstBatches(&lv.path, len(t.pk), ixCovers(lv, lv.path.index), lv.stops, aggs)
     return PScan{level: 0, first: lv.first, kinds: kinds, need: need, part: len(lv.need) > 0, batch: batch, stops: lv.stops, sorted: batch && keyOrdered(q, 0), held: held}
 }
@@ -7767,13 +7791,15 @@ fn grpSafe(x: &Expr): bool {
 
 // Whether sel is a SELECT the pipeline may run (what lexdb_pipe.compile
 // takes, and what this Sel must give it): streamed (no sort, grouping,
-// DISTINCT, window, set or OFFSET), one table read per row, no correlated
+// DISTINCT, window or set; an OFFSET its Limit skips, Q8 R2), sorted or
+// DISTINCT (P3), one table read per row, no correlated
 // subquery left in it (a correlated subquery's own query is one: its outer
 // values are parameters, Q8 R1), its outputs and conditions bound for the
 // plan.
 pub fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
-    if !(streams(sel) || sortShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return false }
+    // (TOP PERCENT and WITH TIES: the Sort's, Q8 R2)
+    if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.mr) > 0 || len(sel.feedback) > 0 || ((sel.topMode != 0 || sel.withTies) && !sel.sort) || sel.first >= 0 { return false }
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
@@ -7782,17 +7808,92 @@ pub fn pipeShape(sel: &Sel): bool {
     return len(sel.exprs) > 0 && len(sel.ox) == len(sel.exprs) && boundOnce(q)
 }
 
+// Whether sel is a SELECT with no FROM the pipeline may run (Q8 R2: a
+// Result arm, its one row if its WHERE holds, Query.top): its outputs bound
+// for the plan; no ORDER BY (its keys are evaluated, and may fail, on the
+// one row), grouping, window, set operation, lock, TOP, WITH TIES, SELECT
+// @v, MATCH_RECOGNIZE, set-returning function or correlated subquery left
+// in it. An OFFSET or LIMIT it applies itself.
+pub fn resultShape(sel: &Sel): bool { return resultWhy(sel) == "" }
+
+// Why resultShape is false for sel ("" it is not).
+pub fn resultWhy(sel: &Sel): str {
+    let q = &sel.q
+    if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.mr) > 0 { return "grouped, a window, a set, locked" }
+    if sel.sort || len(sel.feedback) > 0 || sel.topMode != 0 || sel.withTies || sel.first >= 0 { return "ORDER BY, TOP, WITH TIES or SELECT @v" }
+    if q.corr || len(q.levels) != 0 || hasSrfCall(&sel.exprs) { return "a correlated subquery or a set-returning function" }
+    if len(sel.exprs) == 0 || len(sel.exprs) != len(sel.outs) || len(sel.ox) != len(sel.exprs) { return "outputs and columns differ" }
+    return ""
+}
+
+// sel's Result plan (resultShape): Limit? (Project (Filter? (Result))),
+// its outputs as pipeSel binds them (moved from Sel.ox), its WHERE bound
+// for the plan; one that does not bind (a sequence, session or catalog
+// function's call) marked for eval at the run (lexdb_bind.evalMark); None
+// if such a one holds a subquery (the outputs given back).
+pub fn resultPlan(sel: mut &Sel): Option[PPlan] {
+    var xs: []BX = withCapacity(len(sel.exprs))
+    for i in 0..len(sel.exprs) {
+        match replace(mut &sel.ox[i], None) {
+            Some(b) { append(mut &xs, b) }
+            None {
+                // (with no subquery it bound as bindSel binds it: not; eval's at
+                // the run, but not with a subquery, whose value eval does not see)
+                if !hasSubCall(&sel.exprs[i]) {
+                    append(mut &xs, lexdb_bind.evalMark())
+                    continue
+                }
+                match planX(&sel.exprs[i], &sel.q) {
+                    Some(b) { append(mut &xs, b) }
+                    None {
+                        // census: lexdb_census.no("no FROM: an output does not bind (planX), with a subquery")
+                        oxBack(sel, xs)
+                        return None
+                    }
+                }
+            }
+        }
+    }
+    var cs: []BX = []
+    for i in 0..len(sel.q.top) {
+        let b = planX(&sel.q.top[i], &sel.q)
+        if b.isNone() {
+            if hasSubCall(&sel.q.top[i]) {
+                // census: lexdb_census.no("no FROM: a condition does not bind (planX), with a subquery")
+                oxBack(sel, xs)
+                return None
+            }
+            append(mut &cs, lexdb_bind.evalMark())
+            continue
+        }
+        append(mut &cs, b.unwrap())
+    }
+    let leaf = PPlan.Result(subsOf(&sel.q))
+    let proj = PPlan.Project(if len(cs) > 0 { PPlan.Filter(leaf, cs) } else { leaf }, xs)
+    return Some(if sel.limit >= 0 || sel.offset > 0 { PPlan.Limit(proj, sel.limit >= 0, sel.limit, max(sel.offset, 0)) } else { proj })
+}
+
+// Whether sel is streamed but for its OFFSET (Q8 R2: the pipeline's Limit
+// skips its rows): no sort, grouping, DISTINCT, window, set, lock or
+// set-returning function, no correlated subquery in its outputs.
+fn offsetShape(sel: &Sel): bool {
+    if sel.offset <= 0 || sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || sel.sort || len(sel.wins) > 0 || sel.distinct || len(sel.locks) > 0 { return false }
+    if sel.q.corr { for x in sel.exprs { if hasCorr(&x) { return false } } }
+    return !hasSrfCall(&sel.exprs)
+}
+
 // Whether sel's outputs, more than its select list's, are a hashed
 // subquery's keys and value (hashSub).
 fn hashedOuts(sel: &Sel): bool { return len(sel.exprs) > len(sel.outs) && !sel.sort && !sel.distinct }
 
 // Whether sel sorts or is DISTINCT and the pipeline's Sort may run it
 // (slice P3): rows of one select list, no grouping, window, set
-// operation, lock, DISTINCT ON, WITH TIES, TOP, SELECT @v, or function
-// returning rows in it.
+// operation, lock, SELECT @v, or function returning rows in it; DISTINCT
+// ON, WITH TIES and TOP's PERCENT and WITH TIES sorted (Q8 R2).
 fn sortShape(sel: &Sel): bool {
     if sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 { return false }
-    if !(sel.sort || sel.distinct) || sel.donKey > 0 || sel.withTies || sel.topMode != 0 || hasSrfCall(&sel.exprs) { return false }
+    if !(sel.sort || sel.distinct) || hasSrfCall(&sel.exprs) { return false }
+    if (sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct) { return false }
     if sel.q.corr {
         for x in sel.exprs { if hasCorr(&x) { return false } }
         for x in sel.order { if hasCorr(&x) { return false } }
@@ -7833,12 +7934,14 @@ pub fn tableRead(lv: &Level): bool {
 // Whether lv is rows the run holds that the pipeline reads as q's first
 // table, cut into batches (lexdb_held; item 6 of design/lexdb-batch-gaps.md):
 // a subquery in FROM's (a derived table, view, CTE, VALUES, a function
-// scan, a catalog relation, an integer series made as it is read), not a
-// recursive CTE's working table, not LATERAL, locked, with a WHERE after
-// it, or a semi or anti join's. A series is one of smallint, integer or
-// bigint (its end is the type's range: lexdb_held.seriesOf).
+// scan, a catalog relation, an integer series made as it is read) or a
+// recursive CTE's working table (Q8 R2: the rows of the round before), not
+// LATERAL, locked, with a WHERE after it, or a semi or anti join's. A
+// series is one of smallint, integer or bigint (its end is the type's
+// range: lexdb_held.seriesOf).
 pub fn heldRead(q: &Query, lv: &Level): bool {
-    if lv.src < 0 || lv.work >= 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
+    if lv.work >= 0 { return lv.src < 0 && lv.perRow && !lv.lateral && lv.lock == 0 && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0 }
+    if lv.src < 0 || !lv.perRow || lv.lateral || lv.lock != 0 || len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
     if lazySeries(q, lv.src) {
         let oid = q.subs[lv.src].sel.outs[0].oid
         return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8
@@ -7950,14 +8053,14 @@ pub fn shapeWhy(sel: &Sel): str {
     }
     if len(sel.mr) > 0 { return "MATCH_RECOGNIZE" }
     if len(sel.feedback) > 0 { return "SELECT @v = (feedback)" }
-    if sel.topMode != 0 || sel.withTies { return "TOP PERCENT or WITH TIES" }
+    if (sel.topMode != 0 || sel.withTies) && !sel.sort { return "TOP PERCENT or WITH TIES, not sorted" }
     if sel.first >= 0 { return "MIN or MAX by the scan's order (Sel.first)" }
     return queryWhy(sel)
 }
 
 fn queryWhy(sel: &Sel): str {
     let q = &sel.q
-    if len(q.levels) == 0 { return "no FROM" }
+    if len(q.levels) == 0 { return "no FROM: " + resultWhy(sel) }
     if q.corr { return "a correlated subquery left per row (q.corr)" }
     if len(q.top) > 0 { return "conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
@@ -7972,7 +8075,7 @@ pub fn aggWhy(sel: &Sel): str {
     if sel.setop != 0 { return "a set operation" }
     if len(sel.srf) > 0 { return "a function in FROM (execSrf)" }
     if len(sel.wins) > 0 { return "agg: a window over the groups" }
-    if sel.first >= 0 { return "agg: MIN or MAX by the scan's order (Sel.first)" }
+    if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
     if q.corr { return "agg: a correlated subquery left per row (q.corr)" }
@@ -7980,7 +8083,7 @@ pub fn aggWhy(sel: &Sel): str {
     if !firstRead(q, &q.levels[0]) { return "agg: first level: " + levelWhy(q, &q.levels[0]) }
     if !boundOnce(q) { return "agg: conditions not bound once (boundOnce)" }
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return "agg: one table, with columns besides its own" }
-    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key" } }
+    if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key in grouping sets" } } }
     return ""
 }
 
@@ -8021,11 +8124,8 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     var calls: []PCall = []
     for sp in sel.specs {
         let f = &sp.fname
-        // (the calls it accumulates: lexdb_pipe.compile's)
-        if sp.kind != lexdb_sql.COLL_EXACT {
-            // census: lexdb_census.no("agg: a call by a collation")
-            return None
-        }
+        // (the calls it accumulates: lexdb_pipe.compile's; one by a collation
+        // row by row, Q8 R2)
         var arg: Option[BX] = None
         // (the values besides the argument: string_agg's separator, the ORDER BY keys)
         var more: []BX = []
@@ -8069,12 +8169,15 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             }
             None {}
         }
-        append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia})
+        append(mut &calls, PCall{fname: f.toStr(), star: sp.star, arg: arg, filter: filt, distinct: sp.distinct, more: more, dirs: sp.dirs.clone(), dia: sp.dia, kind: sp.kind})
     }
-    let cs = match planConds(sel) {
+    var cs = match planConds(sel) {
         Some(x) { x }
         None { return noAgg("agg: a condition does not bind (planX)") }
     }
+    // (MIN/MAX by the scan's order, Q8 R2: its first row whose value is not
+    // NULL; unplan drops the condition)
+    if sel.first >= 0 { append(mut &cs, BX.IsNull(BX.Col(sel.first), true)) }
     var ps = scanArm(&sel.q, true)
     // (over joins every table's columns are the plan's: lexdb_plan.needs)
     if len(keys) == 0 && len(sel.q.levels) == 1 {
@@ -8094,22 +8197,23 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
-    let agg = PPlan.Agg(input, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets)}))
+    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds)}))
     return Some(physAbove(sel, agg))
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
-// row (the query's only columns), GROUP BY (grouping sets too; no
-// collation's keys), no window, no correlated subquery, no MIN/MAX by the
-// scan's order.
+// row (the query's only columns), GROUP BY (grouping sets too; a
+// collation's keys row by row, not in grouping sets: Q8 R2), no window, no
+// correlated subquery; MIN/MAX by the scan's order over one table (Q8 R2:
+// MinMax).
 pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
-    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || sel.first >= 0 || len(sel.locks) > 0 { return false }
+    if sel.setop != 0 || len(sel.srf) > 0 || len(sel.wins) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
     // (a correlated subquery's own: its outer values are its parameters)
     if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
-    for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } } }
     return true
 }
 
@@ -8123,6 +8227,7 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.Having(i) { unplan(sel, i) }
         // (its keys and calls were bound for the plan only)
         PPlan.Agg(i, _, _) { unplan(sel, i) }
+        PPlan.MinMax(i) { unplan(sel, i) }
         // (a join's expressions were bound for the plan only)
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Project(i, xs) {
@@ -8135,7 +8240,14 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
             unplan(sel, i)
         }
         PPlan.Filter(i, cs) {
+            // (a Result's: its WHERE bound for the plan only)
+            match i {
+                PPlan.Result(_) { return }
+                else {}
+            }
             var v = cs
+            // (MIN/MAX by the scan's order: its IS NOT NULL, pipeAgg's)
+            if sel.first >= 0 && len(sel.q.levels) > 0 && len(v) > len(sel.q.levels[0].cond) { let gone = pop(mut &v) }
             var cc: []Option[BX] = []
             for k in 0..len(v) { append(mut &cc, unbound(replace(mut &v[k], BX.Const(Val.Null)), false)) }
             sel.q.cc[0] = cc
@@ -8159,8 +8271,8 @@ pub fn oxBack(sel: mut &Sel, xs: []BX) {
 }
 
 // b as the Sel holds it: None for a column (col) or what only a plan's
-// run evaluates (a subquery's value).
-fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) { None } else { Some(b) } }
+// run evaluates (a subquery's value, eval's mark: lexdb_bind.evalMark).
+fn unbound(b: BX, col: bool): Option[BX] { return if col || lexdb_bind.hasSub(&b) || lexdb_bind.isEvalMark(&b) { None } else { Some(b) } }
 
 pub fn copySets(xs: &[][]int): [][]int {
     var out: [][]int = []

@@ -2057,7 +2057,11 @@ fn heldRun(src: &Src) {
 
 // p's program; Err(p): an operator or an expression the pipeline does
 // not run (the caller keeps its details: the plan is given back).
-pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] { return compileP(p0, cols, false) }
+
+// compile; point: a point select's plan (Prog.point: no subquery, its
+// table read by its whole primary key), unless it joins.
+pub fn compileP(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef, point: bool): Result[Prog, lexdb_plan.PPlan] {
     var p = p0
     let n = opsOf(&p, cols)
     if n < 0 {
@@ -2072,7 +2076,8 @@ pub fn compile(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, le
     // (the columns a plan reads of rows the run holds only, as a join's tables')
     if j || heldScan(&p) { p = lexdb_plan.needs(p, len(cols)) }
     let so = !g && sortArm(&p)
-    return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so})
+    let how = if point && !j { lexdb_plan.PR_POINT } else if resultEval(&p) { lexdb_plan.PR_EVAL } else { lexdb_plan.PR_PLAIN }
+    return Ok(Prog{plan: p, ops: n, groups: g, joins: j, sorts: so, run: how})
 }
 
 // Whether p's scan reads rows the run holds (PScan.held).
@@ -2114,13 +2119,16 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
     }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
-            // over a Sort or Distinct (slice P3): its count and offset theirs
-            if sortArm(&i) {
+            // over a Sort or Distinct (slice P3), or a Result (Q8 R2): its
+            // count and offset theirs
+            if sortArm(&i) || resultArm(&i) {
                 let k = opsOf(&i, cols)
                 return if k < 0 { -1 } else { k + 1 }
             }
-            // a count, no offset (an OFFSET is not streamed: the row engine's)
-            if !stops || n < 0 || off > 0 { return -1 }
+            // a count that stops the scan; an OFFSET (Q8 R2: its rows skipped,
+            // runOp), with a count or not, not over joins
+            if !(stops && n >= 0) && off <= 0 { return -1 }
+            if off > 0 && hasJoin(&i) { return -1 }
             let k = opsOf(&i, cols)
             return if k < 0 { -1 } else { k + 1 }
         }
@@ -2166,6 +2174,10 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                             if !scanRuns(&sc, &subs, cols) || !allRead(&cs, &sc) || !allRead(&xs, &sc) { return -1 }
                             return 3
                         }
+                        lexdb_plan.PPlan.Result(subs) {
+                            if !onceAll(&subs) || !allRead(&cs, &lexdb_plan.noScan()) || !allRead(&xs, &lexdb_plan.noScan()) { return -1 }
+                            return 3
+                        }
                         else { return -1 }
                     }
                 }
@@ -2173,11 +2185,58 @@ fn opsOf(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): int {
                     if !scanRuns(&sc, &subs, cols) || !allRead(&xs, &sc) { return -1 }
                     return 2
                 }
+                lexdb_plan.PPlan.Result(subs) {
+                    if !onceAll(&subs) || !allRead(&xs, &lexdb_plan.noScan()) { return -1 }
+                    return 2
+                }
                 else { return -1 }
             }
         }
         else { return -1 }
     }
+}
+
+// Whether p is a Result's Project (no FROM, Q8 R2).
+fn resultArm(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Project(i, _) {
+            match i {
+                lexdb_plan.PPlan.Result(_) { return true }
+                lexdb_plan.PPlan.Filter(j, _) {
+                    match j {
+                        lexdb_plan.PPlan.Result(_) { return true }
+                        else { return false }
+                    }
+                }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
+// Whether p is a Result (under a Limit or not) one of whose outputs or
+// conditions its run's owner evaluates (lexdb_bind.evalMark).
+fn resultEval(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return resultEval(&i) }
+        lexdb_plan.PPlan.Project(i, xs) {
+            if !resultArm(p) { return false }
+            for x in xs { if lexdb_bind.isEvalMark(&x) { return true } }
+            match i {
+                lexdb_plan.PPlan.Filter(_, cs) { for c in cs { if lexdb_bind.isEvalMark(&c) { return true } } }
+                else {}
+            }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether each of subs is run once, before the plan's run.
+fn onceAll(subs: &[]lexdb_plan.PSub): bool {
+    for s in subs { if s.run != lexdb_plan.RUN_ONCE { return false } }
+    return true
 }
 
 // The census's reason (lexdb_census, design/lexdb-layers.md 6.4) opsOf
@@ -2197,7 +2256,7 @@ fn opsWhy(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef) {
     }
     match p {
         lexdb_plan.PPlan.Limit(i, stops, n, off) {
-            if !sortArm(&i) && (!stops || n < 0 || off > 0) { lexdb_census.no("compile: a LIMIT that does not stop the scan, or OFFSET") }
+            if !sortArm(&i) && !resultArm(&i) && ((!(stops && n >= 0) && off <= 0) || (off > 0 && hasJoin(&i))) { lexdb_census.no("compile: a LIMIT that does not stop the scan, or an OFFSET over joins") }
             opsWhy(&i, cols)
         }
         lexdb_plan.PPlan.Sort(i, sorted, ps) {
@@ -2244,6 +2303,26 @@ fn opsWhy(p: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef) {
 // calls ones it accumulates, every key, argument and FILTER reading the
 // table's decoded columns; the table the query's only columns), else -1.
 fn aggOps(i: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef): int {
+    match i {
+        lexdb_plan.PPlan.MinMax(j) {
+            // MIN/MAX by the scan's order (Q8 R2): every call MIN or MAX of one
+            // column, no key, one table read row by row
+            if len(a.keys) > 0 || len(a.sets) > 0 || firstSlot(a) < 0 {
+                // census: lexdb_census.no("compile: agg: MIN/MAX by the scan's order, not of one column")
+                return -1
+            }
+            match j {
+                lexdb_plan.PPlan.Join(_, _) {
+                    // census: lexdb_census.no("compile: agg: MIN/MAX by the scan's order over joins")
+                    return -1
+                }
+                else {}
+            }
+            let k = aggOps(&j, a, cols)
+            return if k < 0 { -1 } else { k + 1 }
+        }
+        else {}
+    }
     for c in a.calls {
         let f = &c.fname
         if !lexdb_bind.isAgg(f) || (c.star != c.arg.isNone()) || (c.star && f != "count") {
@@ -2494,7 +2573,11 @@ fn pointOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPl
            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[Option[int], DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, off) {
+            // (an OFFSET: run's)
+            if off > 0 { return Ok(None) }
+            return pointOp(st, txn, &i, ops, cols, t, s, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, give)
+        }
         // (the scan's order: nothing to do, as runOp)
         lexdb_plan.PPlan.Sort(i, _, _) { return pointOp(st, txn, &i, ops, cols, t, s, cx, lim, bud, cnt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
@@ -2533,6 +2616,60 @@ fn pointScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.
     var srt = noSortRun()
     try oneRow(txn, mut &rows[0], sc, conds, xs, cx, lim, bud, cnt, mut &srt, give, mut &sr)
     return Ok(sr.n)
+}
+
+// Runs a Result program (no FROM, Q8 R2: resultArm, under a Limit or
+// not): its conditions on no row, in order, then its outputs (an error in
+// either is the statement's, as the row engine raises it), the row given
+// unless the LIMIT, OFFSET or cap leaves it out. The rows given (0 or 1).
+// ev: the value of condition (true) or output i that does not bind (its
+// owner evaluates it: lexdb_bind.evalMark; pg.run PR_EVAL).
+
+pub fn runResult(txn: mut &lexdb_store.Txn, pg: &Prog, cx: &Ctx, cap: int, cnt: mut &[]Counts,
+                 give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    runs += 1
+    resultRuns += 1
+    while len(cnt) < pg.ops { append(cnt, noCounts()) }
+    return resultOp(txn, &pg.plan, cx, cap, 0, pg.run == lexdb_plan.PR_EVAL, cnt, give, ev)
+}
+
+var resultRuns: int = 0
+
+// Result programs run (the tests' look).
+pub fn resultCount(): int { return resultRuns }
+
+fn resultOp(txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan, cx: &Ctx, lim: int, off: int, ss: bool, cnt: mut &[]Counts,
+            give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    let none: []BX = []
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, n, o) { return resultOp(txn, &i, cx, if lim >= 0 && (n < 0 || lim < n) { lim } else { n }, o, ss, cnt, give, ev) }
+        lexdb_plan.PPlan.Project(j, xs) {
+            match j {
+                lexdb_plan.PPlan.Filter(_, cs) { return resultRow(txn, &cs, &xs, cx, lim, off, ss, cnt, give, ev) }
+                else { return resultRow(txn, &none, &xs, cx, lim, off, ss, cnt, give, ev) }
+            }
+        }
+        else { return Err(e("XX000", "the pipeline was given a plan it does not run")) }
+    }
+}
+
+fn resultRow(txn: mut &lexdb_store.Txn, conds: &[]BX, xs: &[]BX, cx: &Ctx, lim: int, off: int, ss: bool, cnt: mut &[]Counts,
+             give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr], ev: &fn(bool, int): Result[Val, DbErr]): Result[int, DbErr] {
+    let noRow: []Val = []
+    let noAggs: []Val = []
+    cnt[0].starts += 1
+    for k in 0..len(conds) {
+        let v = if ss && lexdb_bind.isEvalMark(&conds[k]) { try ev(true, k) } else { try bxEval(&conds[k], &noRow, &noAggs, cx) }
+        if lexdb_ops.truth(&v) != Some(true) { return Ok(0) }
+    }
+    cnt[0].joined += 1
+    var vals: []Val = withCapacity(len(xs))
+    for k in 0..len(xs) { append(mut &vals, if ss && lexdb_bind.isEvalMark(&xs[k]) { try ev(false, k) } else { try bxEval(&xs[k], &noRow, &noAggs, cx) }) }
+    if lim == 0 || off > 0 { return Ok(0) }
+    cnt[len(cnt) - 1].joined += 1
+    let ob = lexdb_rows.noOutBatch()
+    let more = try give(txn, &ob, &vals)
+    return Ok(1)
 }
 
 // A Src that reads nothing (a table looked up per row).
@@ -2652,7 +2789,34 @@ fn runOp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.PPlan
          give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let none: []BX = []
     match p {
-        lexdb_plan.PPlan.Limit(i, _, n, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, if lim >= 0 && lim < n { lim } else { n }, bud, cnt, srt, give) }
+        lexdb_plan.PPlan.Limit(i, _, n, off) {
+            let l2 = if n < 0 || (lim >= 0 && lim < n) { lim } else { n }
+            if off <= 0 { return runOp(st, txn, &i, cols, t, src, hrows, cx, l2, bud, cnt, srt, give) }
+            // an OFFSET (Q8 R2): its first rows read, counted, not given
+            var skip = off
+            var row: []Val = []
+            return runOp(st, txn, &i, cols, t, src, hrows, cx, if l2 >= 0 { l2 + off } else { -1 }, bud, cnt, srt,
+                         fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+                if skip == 0 { return give(tx, ob, r) }
+                if ob.n == 0 {
+                    skip -= 1
+                    return Ok(true)
+                }
+                if ob.n <= skip {
+                    skip -= ob.n
+                    return Ok(true)
+                }
+                // (the chunk's rows past the offset, one by one)
+                let from = skip
+                skip = 0
+                let noOb = lexdb_rows.noOutBatch()
+                for j in from..ob.n {
+                    obRow(ob, j, mut &row)
+                    if !(try give(tx, &noOb, &row)) { return Ok(false) }
+                }
+                return Ok(true)
+            })
+        }
         lexdb_plan.PPlan.Sort(i, _, _) { return runOp(st, txn, &i, cols, t, src, hrows, cx, lim, bud, cnt, srt, give) }
         lexdb_plan.PPlan.Project(j, xs) {
             match j {
@@ -3049,6 +3213,18 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                                 else {}
                             }
                         }
+                        lexdb_plan.PPlan.MinMax(j) {
+                            match j {
+                                lexdb_plan.PPlan.Filter(k, cs) {
+                                    match k {
+                                        lexdb_plan.PPlan.Scan(sc, _) { return aggFirst(st, txn, &sc, &cs, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                                        else {}
+                                    }
+                                }
+                                lexdb_plan.PPlan.Scan(sc, _) { return aggFirst(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                                else {}
+                            }
+                        }
                         lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
                         else {}
                     }
@@ -3061,13 +3237,71 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
     return Err(e("XX000", "the pipeline was given a plan it does not run"))
 }
 
+// The column every call of a (MIN or MAX) reads, its slot; -1 if not one
+// column's.
+fn firstSlot(a: &lexdb_plan.PAgg): int {
+    var col = -1
+    for c in a.calls {
+        if c.fname != "min" && c.fname != "max" || c.distinct || c.filter.isSome() || len(c.more) > 0 { return -1 }
+        match c.arg {
+            Some(x) {
+                match x {
+                    BX.Col(i) {
+                        if col >= 0 && i != col { return -1 }
+                        col = i
+                    }
+                    else { return -1 }
+                }
+            }
+            None { return -1 }
+        }
+    }
+    return col
+}
+
+// MIN/MAX by the scan's order (MinMax: Sel.first, Q8 R2): the scan's rows
+// in its path's order (row by row, or in batches as the row engine's batch
+// driver reads them: an index read alone), through conds (the last its
+// column's IS NOT NULL: pipeAgg's), the first one only; its calls
+// accumulate that row, as the row engine's (one group, the first row's).
+fn aggFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
+            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+            give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+    if src.batch { batchRuns += 1 }
+    var xs: []BX = []
+    var slots: []int = []
+    for i in 0..len(sc.need) {
+        if sc.need[i] {
+            append(mut &xs, BX.Col(sc.first + i))
+            append(mut &slots, sc.first + i)
+        }
+    }
+    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
+    let maxHeld = bud.maxHeld
+    var vals: []Val = []
+    var noSort = noSortRun()
+    let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, hrows, cx, 1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
+        if ob.n == 0 {
+            for k in 0..len(slots) { rg.row[slots[k]] = r[k].clone() }
+        } else {
+            obRow(ob, 0, mut &vals)
+            for k in 0..len(slots) { rg.row[slots[k]] = replace(mut &vals[k], Val.Null) }
+        }
+        try groupRow(mut &rg, a, cx, room, maxHeld)
+        return Ok(false)
+    })
+    try giveGroups(mut &rg, len(a.calls), give)
+    return Ok(rg.added)
+}
+
 // The aggregate a over scan sc filtered by conds: units, values, rows.
 fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
           give: &fn(&[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the counts so far: each try counts from the start again
     let c0 = cnt[0]
-    if src.batch {
+    // (a collation's key or call: row by row, Q8 R2)
+    if src.batch && exactAgg(a) {
         batchRuns += 1
         var usedDec = false
         var values = false
@@ -3248,7 +3482,7 @@ type GCall = record {
 
 // The spec lexdb_agg reads of a call (it reads no expression).
 fn callSpec(c: &lexdb_plan.PCall): lexdb_agg.AggSpec {
-    var sp = lexdb_agg.spec(c.fname.clone(), [], c.star, c.distinct, None, [], c.dirs.clone(), "", lexdb_sql.COLL_EXACT)
+    var sp = lexdb_agg.spec(c.fname.clone(), [], c.star, c.distinct, None, [], c.dirs.clone(), "", c.kind)
     sp.dia = c.dia
     return sp
 }
@@ -3971,6 +4205,14 @@ fn giveGroups(rg: mut &RowGroups, ns: int, give: &fn(&[]Val, int, mut &[]Acc): R
     return Ok(Unit{})
 }
 
+// Whether a's keys and calls compare by their values (no collation's):
+// the batches' kernels run it.
+fn exactAgg(a: &lexdb_plan.PAgg): bool {
+    for k in a.kinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    for c in a.calls { if c.kind != lexdb_sql.COLL_EXACT { return false } }
+    return true
+}
+
 // The row (rg.row) into its group, by its keys' values (a new group's
 // bytes counted as the row engine counts them; past room
 // max_statement_mem's error), then each call's state.
@@ -3981,7 +4223,12 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
     var g = 0
     if len(a.keys) > 0 {
         rg.kb.clear()
-        for k in a.keys { lexdb_access.encIdxPart(mut &rg.kb, &(try bxEval(&k, &rg.row, &noAggs, cx))) }
+        for i in 0..len(a.keys) {
+            let v = try bxEval(&a.keys[i], &rg.row, &noAggs, cx)
+            // (a collated key: by its collated value, as the row engine's addToGroup)
+            if i < len(a.kinds) && a.kinds[i] != lexdb_sql.COLL_EXACT { lexdb_access.encIdxPart(mut &rg.kb, &lexdb_sort.collVal(a.kinds[i], &v)) }
+            else { lexdb_access.encIdxPart(mut &rg.kb, &v) }
+        }
         match rg.index.get(&rg.kb) {
             Some(x) { g = x }
             None {
@@ -6848,7 +7095,8 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.P
     let last = len(cnt) - 1
     // a group's first row's columns and the keys' and calls': decoded where kept
     var avail: []bool = array(nq, false)
-    for pass in 0..2 {
+    // (a collation's key or call: row by row, Q8 R2)
+    for pass in 0..(if exactAgg(a) { 2 } else { 0 }) {
         let dec = pass == 0
         var kinds: []int = []
         var owner: []int = []
@@ -6994,6 +7242,12 @@ type SortSt = record {
     maxHeld: int
     bad: bool               // a value not sorted here: the row engine's
     row: []Val              // a row read one by one, as values
+    // (Q8 R2: PSort's) DISTINCT ON's keys (0 none); WITH TIES (lexdb_plan.TS_*);
+    // TOP n PERCENT; TOP's n (-1 none)
+    don: int
+    ties: int
+    pct: bool
+    top: int
 }
 
 // Whether p (under its Limit) is a Sort or Distinct that holds its rows
@@ -7022,7 +7276,7 @@ fn projUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
 fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
     var sr = SortSt{sorting: false, distinct: false, shown: 0, keyCol: [], desc: [], nf: [], coll: [], dcoll: [], kinds: [],
                      limit: -1, offset: 0, topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0}, heap: [], scr: -1,
-                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, bad: false, row: []}
+                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, bad: false, row: [], don: 0, ties: 0, pct: false, top: -1}
     sr.shown = projLen(projUnder(p))
     sortArmOf(p, mut &sr)
     if cap >= 0 && (sr.limit < 0 || cap < sr.limit) { sr.limit = cap }
@@ -7033,7 +7287,9 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
         sr.nf = []
         sr.coll = []
     }
-    sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct { sr.limit + max(sr.offset, 0) } else { -1 }
+    // (DISTINCT ON, WITH TIES, TOP PERCENT: every row held, cut at finish)
+    let whole = sr.don > 0 || sr.ties != 0 || sr.pct || sr.top >= 0
+    sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct && !whole { sr.limit + max(sr.offset, 0) } else { -1 }
     sr.early = !sr.sorting && sr.limit >= 0
     if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: newMap(), nul: false, kb: ""}) }
     return sr
@@ -7053,7 +7309,7 @@ pub fn setSort(ncol: int, keyCol: []int, desc: []bool, nf: []bool, coll: []int, 
                room: int, maxMem: int): SortRun {
     var sr = SortSt{sorting: true, distinct: false, shown: ncol, keyCol: keyCol, desc: desc, nf: nf, coll: coll, dcoll: [], kinds: [],
                      limit: limit, offset: max(offset, 0), topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0},
-                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: []}
+                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, bad: false, row: [], don: 0, ties: 0, pct: false, top: -1}
     sr.topK = if limit >= 0 { limit + sr.offset } else { -1 }
     return SortRun{st: [sr]}
 }
@@ -7116,6 +7372,10 @@ fn sortArmOf(p: &lexdb_plan.PPlan, sr: mut &SortSt) {
                         for x in k.nf { append(mut &sr.nf, x) }
                         for x in k.coll { append(mut &sr.coll, x) }
                     }
+                    sr.don = k.don
+                    sr.ties = k.ties
+                    sr.pct = k.pct
+                    sr.top = k.top
                 }
                 None {}
             }
@@ -7449,14 +7709,21 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
         for i in 0..sr.set.n { append(mut &perm, i) }
     }
     try bud.hold(sr.held)
-    let from = min(max(sr.offset, 0), len(perm))
-    var to = len(perm)
-    if sr.limit >= 0 && from + sr.limit < to { to = from + sr.limit }
-    if to <= from { return Ok(0) }
-    // one OutBatch, its places the sorted rows': less work than pieces
-    // (gathered in order, or each its places), measured (9.105)
-    var oidx: []int = withCapacity(to - from)
-    for i in from..to { append(mut &oidx, perm[i]) }
+    var oidx: []int = []
+    if sr.don > 0 || sr.ties != 0 || sr.pct || sr.top >= 0 {
+        oidx = try sr.cutOf(perm)
+    } else {
+        let from = min(max(sr.offset, 0), len(perm))
+        var to = len(perm)
+        if sr.limit >= 0 && from + sr.limit < to { to = from + sr.limit }
+        // one OutBatch, its places the sorted rows': less work than pieces
+        // (gathered in order, or each its places), measured (9.105)
+        oidx = withCapacity(max(to - from, 0))
+        for i in from..to { append(mut &oidx, perm[i]) }
+    }
+    if len(oidx) == 0 { return Ok(0) }
+    let to = len(oidx)
+    let from = 0
     var srcs: []int = []
     var kinds: []int = []
     for o in 0..sr.shown {
@@ -7468,6 +7735,36 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
     let noRow: []Val = []
     let more = try give(txn, &ob, &noRow)
     return Ok(to - from)
+}
+
+// The sorted rows perm cut as the row engine's execSel cuts them (Q8 R2):
+// DISTINCT ON (sorted: the first row of each run of equal leading keys),
+// then OFFSET, and LIMIT, TOP n or TOP n PERCENT of the rows (rounded up),
+// WITH TIES the rows after the last that sort as it does.
+fn (sr: &SortSt) cutOf(perm: []int): Result[[]int, DbErr] {
+    var rows = perm
+    if sr.don > 0 && sr.sorting {
+        var kept: []int = withCapacity(len(rows))
+        for i in 0..len(rows) { if i == 0 || lexdb_sort.skCmp(&sr.set.keys, 0, sr.don, rows[i - 1], rows[i]) != 0 { append(mut &kept, rows[i]) } }
+        rows = kept
+    }
+    var cut = sr.limit
+    if sr.pct {
+        if sr.top < 0 || sr.top > 100 { return Err(e("TS1031", "Percent values must be between 0 and 100.")) }
+        cut = (len(rows) * sr.top + 99) / 100
+    } else if sr.top >= 0 { cut = sr.top }
+    let ties = sr.ties == lexdb_plan.TS_TOP || (sr.ties == lexdb_plan.TS_FETCH && sr.sorting)
+    let nk = len(sr.keyCol)
+    var out: []int = []
+    var lastAt = -1
+    for k in max(sr.offset, 0)..len(rows) {
+        if cut >= 0 && len(out) >= cut {
+            if !ties || lastAt < 0 || lexdb_sort.skCmp(&sr.set.keys, 0, nk, rows[k], rows[lastAt]) != 0 { break }
+        }
+        append(mut &out, rows[k])
+        lastAt = k
+    }
+    return Ok(out)
 }
 
 // ---- the row engine's joined rows (slice P2c)
@@ -7491,7 +7788,7 @@ pub fn compileLevels(p: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Pro
     var avail: []bool = array(len(cols), false)
     let n = joinOps(&p, cols, mut &avail)
     if n < 0 { return Err(p) }
-    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false})
+    return Ok(Prog{plan: p, ops: n + 1, groups: false, joins: true, sorts: false, run: lexdb_plan.PR_PLAIN})
 }
 
 // Runs a levels program (compileLevels): each joined row (the query's

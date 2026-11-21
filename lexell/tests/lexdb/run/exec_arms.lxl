@@ -1,0 +1,278 @@
+// lexdb_exec, lexdb_pipe: the small arms the pipeline took from the row engine (Q8's R2,
+// design/lexdb-layers.md 6.3.Q8 R2). Each statement runs with batches on and off (the row engine, the
+// reference): the same rows or the same error, and for a write the same table after it (each write in
+// a transaction rolled back). "piped": y when a run with batches on went through the pipeline
+// (lexdb_pipe.runCounts()[0], joinCounts()[0]); "pipeline runs": how many such runs the group's
+// statements made with batches on.
+// - recursive: a recursive CTE's working table as rows the run holds (one row a round, a round of
+//   2,000 rows read in batches, a join with it, UNION, a filter, NULLs, an error in a late round
+//   (22012), max_recursion's 54001, an empty first query).
+// - no from: SELECT with no FROM as a Result (one row if its WHERE holds): constants, parameters'
+//   expressions, nextval, a subquery run once in the outputs and the WHERE, EXISTS (select 1 where ...),
+//   a scalar subquery with no FROM per outer row, LIMIT 0, OFFSET, an error in an output and in the
+//   WHERE (22012), DISTINCT, a write's VALUES.
+// - min/max: MIN and MAX by the scan's order (Sel.first: an index's first value not NULL, forward or
+//   backward), with an index's leading equality, a range, NULLs skipped, all NULL, an empty table, a
+//   text, an error in a row the scan reads before the first value (22012), per outer row.
+// - offset: OFFSET with and without LIMIT on a scan's rows (not sorted: the scan's order, forward or
+//   backward), past the end, 0, LIMIT 0, over a point, a chunk cut by the offset, an error in a
+//   skipped row and in a given one (22012), in a derived table, with a subquery.
+// - sort variants: DISTINCT ON (one and two keys, NULLs, LIMIT and OFFSET, an error in an output,
+//   no rows, per outer row), FETCH ... WITH TIES (ties across the cut, OFFSET, 0 rows, VALUES, a
+//   collated text's key; in EXISTS, where nothing is sorted, and a scalar giving 21000); TOP PERCENT
+//   and TOP WITH TIES through the T-SQL door (tds_arms).
+// - collations: a collated text's GROUP BY key and calls (count(DISTINCT), min, max) by its collation,
+//   row by row (a group's first row's value shown), with NULLs, over a join, no rows.
+// timeout: 120
+// expect: recursive: 13 queries, 13 the same, piped yyyyyyyyyyyyy, pipeline runs 1798
+// expect: no from: 34 statements, 34 the same, piped yyyyyyyyyyyyyyyyyyyyyyyyyyyynyyyyy, pipeline runs 75
+// expect: min/max: 17 queries, 17 the same, piped yyyyyyyyyyyyyynny, pipeline runs 23
+// expect: offset: 15 queries, 15 the same, piped yyyyyyyyyyyyyyy, pipeline runs 18
+// expect: sort variants: 16 queries, 16 the same, piped yyyyyyyyyyyyyyyy, pipeline runs 72
+// expect: collations: 9 queries, 9 the same, piped yyyyyyyyy, pipeline runs 11
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] }
+
+type Group = record { name: str; word: str; n: int; same: int; piped: str; runs: int }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, piped: "", runs: 0} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " " + g.word + ", " + g.same.toStr() + " the same, piped " + g.piped + ", pipeline runs " + g.runs.toStr()) }
+
+// Statements (separated by ";;") with batches on and off; a write's (write true) in a transaction
+// rolled back, after: a query of what it left ("" none).
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) { checkW(s, g, sql, &"") }
+
+fn checkW(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, after: &str) {
+    let p0 = piped()
+    let on = stmts(s, sql, after)
+    let p1 = piped()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = stmts(s, sql, after)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str, after: &str): str {
+    if len(after) == 0 {
+        var out: []str = []
+        for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+        return strings.join(&out, " // ")
+    }
+    let a = run(s, &"begin")
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    // (after an error the transaction is aborted: rolled back first, then the table read)
+    if strings.startsWith(&out[len(out) - 1], &"ERROR") {
+        let r = run(s, &"rollback")
+        append(mut &out, run(s, after))
+        return strings.join(&out, " // ")
+    }
+    append(mut &out, run(s, after))
+    let r = run(s, &"rollback")
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(83), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create table edge (a int, b int)",
+            "insert into edge select i, i + 1 from generate_series(1, 200) i",
+            "insert into edge select i, i * 2 from generate_series(1, 100) i",
+            "create table e (id int primary key, v int)",
+            "create sequence sq",
+            "create table m (id int primary key, g int, c int, w text)",
+            "insert into m select i, i % 5, case when i % 4 = 0 or i > 1900 then null else (i * 37) % 1000 end, case when i % 6 = 0 then null else 'w' || (i % 300) end from generate_series(1, 2000) i",
+            "create index mc on m (c)",
+            "create index mgc on m (g, c)",
+            "create index mw on m (w)",
+            "create table m0 (id int primary key, c int)",
+            "create table w (id int primary key, g int, c text collate \"Latin1_General_CI_AS\", t text)",
+            "insert into w select i, i % 4, case when i % 9 = 0 then null when i % 2 = 0 then 'Ab' || (i % 5) else 'aB' || (i % 5) end, 'x' || (i % 3) from generate_series(1, 400) i",
+            "create index m0c on m0 (c)",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var gr = newGroup(&"recursive", &"queries")
+        let rs = [
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 100) select count(*), sum(n) from r",
+            "with recursive r(n, sq) as (select 1, 1 union all select n + 1, (n + 1) * (n + 1) from r where n < 30) select n, sq from r order by n",
+            "with recursive r(n) as (select 1 union select e.b from edge e join r on e.a = r.n where e.b < 150) select count(*), max(n) from r",
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 20) select n from r where n % 3 = 0 order by n",
+            "with recursive r(n, v) as (select 1, null::int union all select n + 1, case when n % 2 = 0 then n end from r where n < 12) select n, v from r order by n",
+            "with recursive r(n) as (select 1 union all select 10 / (5 - n) from r where n < 8) select count(*) from r",
+            "with recursive r(n) as (select 1 union all select n + 1 from r) select count(*) from r",
+            "with recursive r(n) as (select id from t where id < 0 union all select n + 1 from r where n < 10) select count(*) from r",
+            "with recursive r(n, k) as (select id, 0 from t where id <= 2000 union all select n, k + 1 from r where k < 2) select count(*), sum(n), max(k) from r",
+            "with recursive r(id, d) as (select id, 0 from t where id = 1 union all select t.id, r.d + 1 from t join r on t.id = r.id * 2 where r.d < 10) select id, d from r order by id",
+            "with recursive r(n, s) as (select 1, 'a'::text union all select n + 1, s || 'b' from r where n < 5) select n, s from r order by n",
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 50) select n from r order by n desc limit 3",
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 500) select count(*) from r a join t on t.id = a.n",
+        ]
+        for x in rs { check(mut &s, mut &gr, &x) }
+        report(&gr)
+
+        var gn = newGroup(&"no from", &"statements")
+        let ns = [
+            "select 1",
+            "select 1, 'a', null, 2.5, true",
+            "select 1 + 2 * 3, 'a' || 'b', length('abc'), upper(null)",
+            "select 1 where false",
+            "select 1 where 1 < 2",
+            "select 1 where null",
+            "select setval('sq', 10);; select nextval('sq')",
+            "select setval('sq', 20);; select nextval('sq'), nextval('sq')",
+            "select (select max(x) from t), (select count(*) from t where g = 3)",
+            "select 1 where exists (select 1 from t where x = 49)",
+            "select 2 where (select count(*) from t) > 5000",
+            "select 1 limit 0",
+            "select 1 offset 1",
+            "select 1 limit 1 offset 0",
+            "select 1 / 0",
+            "select 1 where 1 / 0 = 1",
+            "select 1 / 0 limit 0",
+            "select distinct 5",
+            "select count(*) from t where exists (select 1 where t.x = 7)",
+            "select id, (select t.x + 1) from t where id < 20 order by id",
+            "select count(*) from t where x in (select 3 union all select 4)",
+            "select id from t where x = (select 1 / (t.g - 3)) and id < 40 order by id",
+            "select (select 1 where t.g = 2) from t where id < 10 order by id",
+            "select cast('12' as int) + 1, '2024-01-02'::date + 1",
+            "select (select v from e where id = 1)",
+            "select 1 / (select count(*) from e)",
+            "select current_setting('TimeZone'), current_user = session_user, pg_backend_pid() > 0",
+            "select setval('sq', 30);; select nextval('sq'), currval('sq'), lastval(), nextval('sq')",
+            "select nextval('nosuch')",
+            "select 1 where nextval('sq') > 0 and currval('sq') = 32",
+            "select set_config('lexdb.k', 'v', false), current_setting('lexdb.k')",
+            "select 'pg_class'::regclass::oid > 0, txid_current() = txid_current()",
+            "select current_schema(), pg_my_temp_schema() = 0",
+        ]
+        for x in ns { check(mut &s, mut &gn, &x) }
+        checkW(mut &s, mut &gn, &"insert into e values (1, (select 7));; insert into e select 2, 8 where true", &"select * from e order by id")
+        report(&gn)
+        var gm = newGroup(&"min/max", &"queries")
+        let ms = [
+            "select max(c) from m",
+            "select min(c) from m",
+            "select min(c), min(c) + 1 from m",
+            "select max(c) from m where g = 3",
+            "select min(c) from m where g = 2 and c > 500",
+            "select max(c) from m where id > 1900",
+            "select max(c) from m0",
+            "select min(c) from m0 where c > 5",
+            "select max(w), max(w) from m",
+            "select min(w) from m where w > 'w2'",
+            "select max(c) from m where 100 / (id - 1000) <> 0",
+            "select max(c) from m where 100 / (c - 999) <> 0",
+            "select id, (select max(c) from m where m.g = t.g) from t where id < 12 order by id",
+            "select count(*) from t where x < (select min(c) from m where m.g = t.g and m.c > 20)",
+            "explain select max(c) from m",
+            "explain select min(c) from m where g = 1",
+            "select max(c) from m having max(c) > 5",
+        ]
+        for x in ms { check(mut &s, mut &gm, &x) }
+        report(&gm)
+        var go = newGroup(&"offset", &"queries")
+        let os = [
+            "select id from t limit 5 offset 3",
+            "select id, x from t where g = 2 offset 420",
+            "select id, x from t order by id desc limit 3 offset 2",
+            "select id from t where x is null limit 2 offset 1",
+            "select id, 100 / (id - 20) from t limit 5 offset 15",
+            "select id, 100 / (id - 3) from t limit 2 offset 10",
+            "select id from t offset 5000",
+            "select id from t limit 3 offset 0",
+            "select id from t limit 0 offset 3",
+            "select id, s from t where id = 5 offset 1",
+            "select id, s from t where id = 5 offset 0",
+            "select count(*) from (select id from t offset 2990) q",
+            "select id, s, x * 2 from t where id > 100 limit 600 offset 1500",
+            "select id, s from t where id > 100 and s is not null offset 2700",
+            "select id from t where x in (select x from t where id < 4) offset 20",
+        ]
+        for x in os { check(mut &s, mut &go, &x) }
+        report(&go)
+        var gv = newGroup(&"sort variants", &"queries")
+        let vs = [
+            "select distinct on (g) g, id, x from t order by g, id desc",
+            "select distinct on (x) x, id from t where id < 200 order by x nulls first, id",
+            "select distinct on (g) g, id from t order by g, id limit 3 offset 1",
+            "select distinct on (g, x) g, x, id from t where id < 300 order by g, x desc, id",
+            "select distinct on (s) s, id from t order by s, id desc limit 5",
+            "select distinct on (g) g, 10 / (id - 5) from t order by g, id",
+            "select distinct on (g) g from t where id < 0 order by g",
+            "select id, g from t order by g fetch first 2 rows with ties",
+            "select id, x from t where id < 50 order by x desc nulls last fetch first 3 rows with ties",
+            "select id, x from t where id < 80 order by x offset 5 rows fetch next 1 row with ties",
+            "select id, x from t where id < 80 order by x fetch first 0 rows with ties",
+            "values (1), (1), (2) order by 1 fetch first 1 row with ties",
+            "select id from t where id < 60 order by s fetch first 4 rows with ties",
+            "select id, (select distinct on (u.g) u.x from t u where u.g = t.g order by u.g, u.x desc) from t where id < 9 order by id",
+            "select count(*) from t where exists (select id from t u where u.x = t.x order by u.g fetch first 1 row with ties)",
+            "select id, (select u.id from t u where u.x = t.x order by u.g fetch first 1 row with ties) from t where id < 5 order by id",
+        ]
+        for x in vs { check(mut &s, mut &gv, &x) }
+        report(&gv)
+        var gc = newGroup(&"collations", &"queries")
+        let cs = [
+            "select upper(c), count(*) from w group by c order by 1",
+            "select count(distinct c) from w",
+            "select min(c), max(c) from w",
+            "select g, count(distinct c), min(c) from w group by g order by g",
+            "select c, count(*) from w group by c having count(*) > 30 order by upper(c)",
+            "select count(distinct a.c) from w a join w b on b.id = a.id + 1",
+            "select upper(c), t, count(*) from w group by c, t order by 1, 2",
+            "select count(*) from (select c from w group by c) q",
+            "select upper(c), sum(id) from w where id > 1000 group by c",
+        ]
+        for x in cs { check(mut &s, mut &gc, &x) }
+        report(&gc)
+        return 0
+    }).unwrap()
+}
