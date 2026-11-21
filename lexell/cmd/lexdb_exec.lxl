@@ -2278,6 +2278,8 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     if rs.batch {
         match q.jp {
             Some(pg) {
+                // a write's point (Q8 R5; not a batched write's next batch)
+                if !pg.joins && len(rs.after) == 0 { return writePoint(st, txn, q, m, params, &pg, emit, rs) }
                 var emitted = 0
                 let got = runLevelsProg(st, txn, q, m, params, &pg, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
                     emitted += 1
@@ -2288,6 +2290,7 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                     Err(x) { if !lexdb_pipe.isBat(&x) || emitted > 0 { return Err(x) } }
                 }
                 // (prepare built no hash for it: the row engine's, with them)
+                // census: if rs.writes { lexdb_census.note("dml", "a write's program gave way at the run (batErr)") }
                 rs.batch = false
                 let m2 = try prepareIn(st, txn, q, params, rs, true, true)
                 rs.batch = true
@@ -2299,6 +2302,26 @@ fn runQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
     }
     var row: []Val = array(len(q.cols), Val.Null)
     return runRows(st, txn, q, m, params, mut &row, emit, rs)
+}
+
+// A write's row read by its whole primary key (Q8 R5; its program of no
+// joins, lexdb_pipe.compileRows): the key's scan (pathScan), the row and
+// its conditions by the pipeline (lexdb_pipe.pointRows).
+fn writePoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, params: &[]Val, pg: &lexdb_plan.Prog,
+              emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[Unit, DbErr] {
+    let lv = &q.levels[0]
+    let noAggs: []Val = []
+    let nullRow: []Val = array(len(q.cols), Val.Null)
+    let sqe = seqEnv(st, txn)
+    let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+    let sc = try pathScan(&lv.t, &lv.path, &env)
+    var cx = cenvOf(&sqe)
+    cx.params = collections.copyOf(params)
+    for i in 0..len(m.subs) { append(mut &cx.subs, lexdb_pipe.copySub(&m.subs[i].v)) }
+    var cnt: []lexdb_pipe.Counts = []
+    try lexdb_pipe.pointRows(st, txn, pg, &q.cols, &lv.t, &sc, &cx, mut &rs.bud, mut &cnt, emit)
+    scanCounts(rs, &cnt)
+    return Ok(Unit{})
 }
 
 // runQuery's row engine: the levels from the first, then a RIGHT or FULL
@@ -4711,10 +4734,11 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cha
             append(mut &xs, try lexdb_bind.resolve(&x, &q.cols, len(q.cols), mut &sc.names))
         }
         endScope(mut &sc, mut &q)
+        writeProg(mut &q, false)        // its rows by a pipeline program (Query.jp)
         var rs = newRun(&q)
         rs.limit(&lim)
         rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
-        let m = try prepare(st, txn, &q, &noParams, mut &rs)
+        let m = try writePrep(st, txn, &q, &noParams, mut &rs)
         let room = rs.bud.room()
         let max = rs.bud.maxHeld
         var held = 0
@@ -6900,7 +6924,6 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), collections.copyOf(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
     if len(q.subs) > 0 { pipeSubs(mut &q) }
-    if len(s.from) > 0 { levelsProgQ(mut &q, false) }         // its joins in batches (Query.jp)
     if win.n > 0 {
         // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
         // always reads by the key, so that a row it changed is not found again (the Halloween problem across
@@ -6913,13 +6936,14 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Err(e("0A000", "lexdb: UPDATE with batch_rows cannot assign a primary key column"))
         } } }
     }
+    writeProg(mut &q, false)                // its rows by a pipeline program (Query.jp)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     rs.after = win.after.clone()
-    var m = try prepare(st, txn, &q, params, mut &rs)
+    var m = try writePrep(st, txn, &q, params, mut &rs)
     let room = rs.bud.room()
     let max = rs.bud.maxHeld
     var held = 0
@@ -6946,7 +6970,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         rs = newRun(&q)
         rs.limit(&lim)
         rs.after = win.after.clone()
-        m = try prepare(st, txn, &q, params, mut &rs)
+        m = try writePrep(st, txn, &q, params, mut &rs)
     }
     if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let noAggs: []Val = []
@@ -7000,7 +7024,6 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let lp = lexdb_bind.LPlan.Delete(replace(mut &q.lp, lexdb_bind.noPlan()), retBCols(&ret))
     endScope(mut &sc, mut &q)
     if len(q.subs) > 0 { pipeSubs(mut &q) }
-    if len(s.from) > 0 { levelsProgQ(mut &q, false) }         // its joins in batches (Query.jp)
     delNarrow(mut &q, s)
     // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
     // atomic; not with entries of other indexes to delete one by one, which are writes too
@@ -7016,13 +7039,14 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // a batch of a DELETE read by the primary key goes on after the last key done; one read by an index runs
     // again (the entries of the rows deleted are gone), and finds its next rows first
     win.keyed = win.n > 0 && !q.levels[0].virt() && q.levels[0].path.index < 0 && !q.levels[0].path.desc
+    writeProg(mut &q, false)                // its rows by a pipeline program (Query.jp)
     let t = &q.levels[0].t
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     if win.keyed { rs.after = win.after.clone() }
-    var m = try prepare(st, txn, &q, params, mut &rs)
+    var m = try writePrep(st, txn, &q, params, mut &rs)
     let room = rs.bud.room()
     let max = rs.bud.maxHeld
     var held = 0
@@ -7045,7 +7069,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         rs = newRun(&q)
         rs.limit(&lim)
         if win.keyed { rs.after = win.after.clone() }
-        m = try prepare(st, txn, &q, params, mut &rs)
+        m = try writePrep(st, txn, &q, params, mut &rs)
     }
     if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let fw = try fkTables(st, txn, t, false, true)
@@ -7767,11 +7791,12 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     endScope(mut &sc, mut &q)
     if len(q.subs) > 0 { pipeSubs(mut &q) }
     // its source join in batches (Query.jp; a BY SOURCE's RIGHT or FULL join too)
-    levelsProgQ(mut &q, true)
+    writeProg(mut &q, true)
     var found: [][]Val = []
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+    // (bound for the row engine too: fewSource may give a few rows to it)
     var m = try prepare(st, txn, &q, params, mut &rs)
     try fewSource(st, txn, mut &q, mut &m, params, mut &rs)
     let room = rs.bud.room()
@@ -8588,13 +8613,33 @@ fn levelsProgIn(q: mut &Query, held: bool) {
     let joined = lexdb_plan.joinsOver(q, base)
     match move(joined) {
         Ok(p) {
-            match lexdb_pipe.compileLevels(p, &q.cols) {
+            // (one table: a write's, Q8 R5)
+            match if len(q.levels) > 1 { lexdb_pipe.compileLevels(p, &q.cols) } else { lexdb_pipe.compileRows(p, &q.cols) } {
                 Ok(pg) { q.jp = Some(pg) }
                 Err(_) {}
             }
         }
         Err(_) {}
     }
+}
+
+// A write's rows found by a pipeline program (Q8 R5, design/lexdb-layers.md
+// 6.3.Q8 R5): its levels program (Query.jp) of its joins, or of its one
+// table (lexdb_pipe.compileRows: read in batches, or a point of its whole
+// primary key, which runQuery reads by writePoint); held: its first level
+// may be rows the run holds (MERGE's source). The rows go to the write,
+// which holds them all before it changes any (no row is found again).
+fn writeProg(q: mut &Query, held: bool) {
+    if len(q.levels) == 0 { return }
+    levelsProgQ(q, held)
+    // census: lexdb_census.keep("dml", &lexdb_census.take())
+}
+
+// prepare for a write's run: its levels' conditions bound for the row
+// engine only where it finds the rows (a program holds its own; runQuery
+// binds them when the program gives way).
+fn writePrep(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params: &[]Val, rs: mut &Run): Result[Mats, DbErr] {
+    return prepareIn(st, txn, q, params, rs, !(rs.batch && q.jp.isSome()), true)
 }
 
 fn pipeSelMain(sel: mut &Sel) {

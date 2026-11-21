@@ -6714,6 +6714,72 @@ point select's cycles over the wire do not, by placement; left for the
 owner's call (6.3.Q8's first part met the same: its stage 3 read q9, q13,
 q17 slower at main's instructions).
 
+### 6.3.Q8 R5 (paused, work in progress, 2026-11-21)
+
+R5 of 6.5: a write's rows found by a pipeline program. Branch
+`worktree-agent-a87910cfeeede3b34` from main 757c4cee. Paused by the
+coordinator before any gate ran; this is the hand-over.
+
+**Done (in the WIP commit, compiled with `-O`, suite not run):**
+
+- Every UPDATE, DELETE and ALTER TABLE ... USING builds a program for its
+  rows (`writeProg` in exec, after `pipeSubs`; DELETE's after `delNarrow`
+  and `rangeDelete`, UPDATE's after a batched write's path change): the
+  levels program (`Query.jp`, `levelsProgIn`) now takes one table too,
+  through `lexdb_pipe.compileRows`: a Filter? (Scan) read in batches is a
+  levels program of its first arm alone (`runLevels`, ops 2); a point of
+  the whole primary key (a scan of no batches) is a program of no joins
+  (`Prog.joins` false). MERGE keeps its levels program (it had one).
+- `runQuery`: a program of no joins, not a batched write's next batch
+  (`rs.after`), runs by `writePoint` (exec, ~20 lines): `pathScan` of the
+  key, the subqueries' values copied into the context, then
+  `lexdb_pipe.pointRows` (the row fetched, its conditions in order by
+  `bxEval`, the whole row to emit, counted as `runLevel`/`tryRow` count).
+- `writePrep`: a write with a program skips `prepare`'s binding of the
+  levels' conditions for the row engine (`cxsOf`); the give-way path in
+  `runQuery` binds them itself. MERGE still binds (fewSource may hand a
+  few source rows to the row engine).
+- The rows are all held before the write changes any (as before): the
+  Halloween problem cannot arise from the program.
+- Census: `censusDml` notes `pipe-dml` with the shape for a write with a
+  program, else `dml` with the reason levelsProgIn gave (kept under the
+  key "dml" by a hook in `writeProg`); a program that gives way at the
+  run is noted again as `dml` (hook in runQuery).
+- Counters for tests: `lexdb_pipe.rowsRuns()` (pointRows runs, runLevels
+  runs).
+- Test `exec_writerows` (new): 49 writes with batches on and off in a
+  rolled-back transaction (by key: integer, text, two-column keys,
+  missing, NULL, out of range, other-typed, a failing condition, key
+  changes, RETURNING, a key from a subquery, a virtual column, CHECK;
+  ranges, IN lists, errors in a late batch, Halloween-shaped updates,
+  23505 cases; FROM/USING joins; MERGE; ALTER ... USING). A first run had
+  all of them the same on and off; the point and levels paths were taken
+  as expected except `delete from t2 where a = 3` (`rangeDelete`, no rows
+  found), MERGE with a 7-row source (fewSource: the row engine), and
+  `where 1 = 2` / `where now() is null` (on the level: the program's).
+  After that run the expectations were edited to those results, a
+  PREPARE case dropped (lexdb has no `PREPARE name(types) AS UPDATE`:
+  42601) and two Halloween cases changed to non-conflicting key moves:
+  **this edited version has not been run.**
+
+**Not done:** the suite; the census after (before is main's, identical
+code to R1's final census: `census-r1c.sum` in the coordinator's
+scratchpad, dml 3,003 runs, of which 196 already the levels program's);
+the in-process A/B of UPDATE by key (`IPMODE=upd IPTXN=1`, the harness
+built: `scratchpad/r5/ip/ip-base` from main and `ip-r5a` from the
+branch, `ic.sh 20000 ...`), INSERT and point selects; `pts.sh`,
+`simple.sh` (update tps) and a TPC-B-like pgbench script over the wire;
+TPC-H; T-SQL (`UPDATE TOP`, `UPDATE ... FROM`, `DELETE TOP`) and Oracle
+door tests (`tds_writerows` against SQL Server, `tns_writerows`); 6.4's
+counts and 6.5's mark.
+
+**Next:** run `exec_writerows` and the suite; fix what breaks (tests
+that count `lexdb_pipe.runCounts()[0]` around a write now see the
+write's own run); measure UPDATE by key in process against main (if the
+point path costs more, look at `writePoint`'s `seqEnv`/`cenvOf` and the
+plan-time `planX` against `cxsOf`'s binding saved); then the wire gates.
+exec's lines: 19,838 at main, about 19,880 now.
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
