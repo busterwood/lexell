@@ -134,7 +134,7 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
         let w = if op == OP_AVG && lexdb_ops.isReal(&v) { Val.Float(lexdb_ops.asFloat(&v).unwrap()) } else { v }
         // and squares them, so overflows where PostgreSQL's float8_accum does
         if op == OP_AVG && lexdb_ops.isFloat(&w) { let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &w, &w) }
-        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &acc.sum, &w) }
+        acc.sum = if lexdb_ops.isNull(&acc.sum) { w } else { try sumAdd(&acc.sum, &w) }
     } else if op == OP_MIN {
         // of equal values the last, as PostgreSQL's numeric_smaller gives
         // (0.5 and 0.500: 0.500 if it comes after)
@@ -184,6 +184,32 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
     }
     acc.n += 1
     return Ok(Unit{})
+}
+
+// A sum's or an average's total plus a value: integers as integers while
+// they fit, past 2^63 a numeric's (exact, as PostgreSQL sums a bigint in
+// numeric); any other as arith adds them.
+pub fn sumAdd(a: &Val, b: &Val): Result[Val, DbErr] {
+    match a {
+        Val.Int(x) {
+            match b {
+                Val.Int(y) {
+                    match x.checkedAdd(y) {
+                        Some(s) { return Ok(Val.Int(s)) }
+                        None {
+                            match Decimal.fromInt(x).addExact(Decimal.fromInt(y)) {
+                                Ok(d) { return Ok(Val.Num(d)) }
+                                Err(_) { return Err(lexdb_ops.decErr()) }
+                            }
+                        }
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return lexdb_ops.arith(lexdb_ops.OP_ADD, a, b)
 }
 
 fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {

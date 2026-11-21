@@ -314,6 +314,36 @@ pub fn converts(ty: &Typing, from: int, to: int): bool {
     return (plainNum(from) && plainNum(to)) || (plainTime(from) && plainTime(to))
 }
 
+// Whether a char's value made one of the common type to loses its blanks:
+// PostgreSQL's bpchar to text or varchar (rtrim), as a cast does. The
+// callers ask where pgRules holds: the T-SQL door keeps a char's blanks in
+// a common type.
+pub fn bpToText(from: int, to: int): bool {
+    return from == lexdb_sql.OID_BPCHAR && (to == lexdb_sql.OID_TEXT || to == lexdb_sql.OID_VARCHAR)
+}
+
+// The type of NULLIF(a, b) of types lo and ro: a's as a = b compares it
+// (PostgreSQL's operator for =, checked against PostgreSQL 18): a char
+// beside a text is a text; a varchar a text, but a char beside a char; a
+// number beside a numeric a numeric, beside a float a double precision
+// (integers of other widths, and a real, keep theirs); 0 another pair (a's
+// own type).
+pub fn nullifOid(lo: int, ro: int): int {
+    let T = lexdb_sql.OID_TEXT
+    let B = lexdb_sql.OID_BPCHAR
+    let V = lexdb_sql.OID_VARCHAR
+    let rs = isUnknownOid(ro) || ro == T || ro == V || ro == B
+    if lo == B { return if !rs { 0 } else if ro == T { T } else { B } }
+    if lo == V { return if !rs { 0 } else if ro == B { B } else { T } }
+    if !plainNum(lo) || !plainNum(ro) { return 0 }
+    let F4 = lexdb_sql.OID_FLOAT4
+    let F8 = lexdb_sql.OID_FLOAT8
+    if lo == F4 || lo == F8 { return lo }
+    if ro == F4 || ro == F8 { return F8 }
+    if lo == lexdb_sql.OID_NUMERIC || ro == lexdb_sql.OID_NUMERIC { return lexdb_sql.OID_NUMERIC }
+    return lo
+}
+
 // An expression's type for a common type: 705 for an untyped literal
 // ('x', NULL) or parameter, else exprOid's.
 pub fn argOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing): int {
@@ -331,15 +361,17 @@ pub fn argOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing):
     return exprOid(x, cols, ptypes, ty)
 }
 
-// The places of a call's arguments that are its values, made of one type:
-// CASE's THENs and ELSE ("case else": the last), COALESCE's, GREATEST's and
-// LEAST's arguments; [] another call.
+// The places of a call's arguments that are its values, made of one type,
+// in the order their common type is chosen: CASE's ELSE ("case else": the
+// last argument) and then its THENs (PostgreSQL's transformCaseExpr puts
+// the ELSE first, so CASE WHEN .. THEN a char ELSE a text END is a text),
+// COALESCE's, GREATEST's and LEAST's arguments; [] another call.
 pub fn valueArgs(name: &str, n: int): []int {
     var out: []int = []
     if name == "case" || name == "case else" {
         let pairs = if name == "case else" { (n - 1) / 2 } else { n / 2 }
-        for k in 0..pairs { append(mut &out, 2 * k + 1) }
         if name == "case else" && n > 0 { append(mut &out, n - 1) }
+        for k in 0..pairs { append(mut &out, 2 * k + 1) }
     } else if name == "coalesce" || name == "greatest" || name == "least" {
         for i in 0..n { append(mut &out, i) }
     }
@@ -1248,6 +1280,12 @@ pub type Names = record {
     pub virt: bool                  // a query's table has a virtual column (lexdb_gen.setQueryGen)
 }
 
+// Whether PostgreSQL's own conversions apply (a char's blanks dropped in a
+// common type, NULLIF's type): not under a session collation, which only the
+// T-SQL door's sessions have (Names.coll; the Oracle door's casts drop a
+// CHAR's blanks as PostgreSQL's do, and so do these).
+pub fn pgRules(ns: &Names): bool { return len(ns.coll) == 0 }
+
 pub fn isIntOid(o: int): bool { return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 }
 
 // The parameter types of the query being planned: the statement's, then
@@ -1682,6 +1720,21 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 return Ok(Expr.Call(nm.clone(), out, star))
             }
             for a in args { append(mut &out, try resolve(&a, cols, n, ns)) }
+            if nm == "#win" && len(out) == 2 {
+                // a window's sum of bigints: the window's value made the sum's type (wideSum), its call left as it is
+                match wideInner(&out[1]) {
+                    Some(c) {
+                        out[1] = c
+                        return Ok(Expr.Cast(Expr.Call(nm.clone(), out, star), wideType(ns)))
+                    }
+                    None {}
+                }
+            }
+            if !star && len(out) >= 1 && isAgg(&nm) && lexdb_sql.aggBase(&nm) == "sum" {
+                // sum of bigints: PostgreSQL's numeric (its total exact past 2^63: lexdb_agg.sumAdd)
+                let pt = ptypesOf(ns)
+                if exprOid(&out[0], cols, &pt, &ns.ty) == lexdb_sql.OID_INT8 { return Ok(Expr.Cast(Expr.Call(nm.clone(), out, star), wideType(ns))) }
+            }
             if nm == "in" && !star {
                 // x IN (a, b) beside a date or time column x: as x = a OR x = b
                 for i in 1..len(out) {
@@ -1734,6 +1787,18 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 let c = try cmpColl(exprColl(&out[0], cols, ns), exprColl(&out[1], cols, ns), &"replace")
                 if c.level != CL_NONE && lexdb_sql.collKind(&c.name) == lexdb_sql.COLL_CI { return Ok(Expr.Call("#replaceci", out, star)) }
             }
+            if nm == "nullif" && len(out) == 2 && !star && pgRules(ns) {
+                // NULLIF(a, b) is a of the type a = b compares as (PostgreSQL's make_op): a converted to it
+                let pt = ptypesOf(ns)
+                let lo = argOid(&out[0], cols, &pt, &ns.ty)
+                let ro = argOid(&out[1], cols, &pt, &ns.ty)
+                // (an untyped a: b's type, as = reads it)
+                let r = if isUnknownOid(lo) && !isUnknownOid(ro) { if nullifOid(ro, ro) != 0 { nullifOid(ro, ro) } else { ro } } else { nullifOid(lo, ro) }
+                if r != 0 && r != lo {
+                    let a = replace(mut &out[0], Expr.Lit(Val.Null))
+                    out[0] = if bpToText(lo, r) { trimmed(a) } else { Expr.Cast(a, lexdb_sql.oidType(r)) }
+                }
+            }
             if nm == "nullif" && len(out) == 2 && !star {
                 // NULLIF(a, b) under a collation's keys (L2): CASE WHEN a = b THEN NULL ELSE a END
                 let k = try cmpKind(&"=", &out[0], &out[1], cols, ns)
@@ -1755,6 +1820,27 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
     }
 }
 
+// The type of a sum of bigints (resolve casts the call to it): PostgreSQL's
+// numeric; at the T-SQL door SQL Server's bigint, past 2^63 an error (the
+// cast's) as before.
+fn wideType(ns: &Names): lexdb_sql.TypeName {
+    return lexdb_sql.oidType(if pgRules(ns) { lexdb_sql.OID_NUMERIC } else { lexdb_sql.OID_INT8 })
+}
+
+// The sum call x casts to wideType, if it is one (a window's function).
+pub fn wideInner(x: &Expr): Option[Expr] {
+    match x {
+        Expr.Cast(a, _) {
+            match a {
+                Expr.Call(f, _, _) { if isAgg(&f) && lexdb_sql.aggBase(&f) == "sum" { return Some(clone(&a)) } }
+                else {}
+            }
+        }
+        else {}
+    }
+    return None
+}
+
 // A call's values (valueArgs) made of their common type: each
 // one of another type cast to it, a constant converted now (but for a
 // timestamptz, whose value is the session's zone's). Of different
@@ -1773,6 +1859,10 @@ fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): []Ex
         // (T-SQL: '' as a number is 0)
         if len(ns.coll) > 0 && ns.blank(&xs[i]) && (isIntOid(o) || isFloatOid(o) || o == lexdb_sql.OID_BOOL) {
             xs[i] = Expr.Cast(Expr.Lit(Val.Int(0)), lexdb_sql.oidType(o))
+            continue
+        }
+        if pgRules(ns) && bpToText(os[k], o) {
+            xs[i] = trimmed(replace(mut &xs[i], Expr.Lit(Val.Null)))
             continue
         }
         if !converts(&ty, os[k], o) { continue }

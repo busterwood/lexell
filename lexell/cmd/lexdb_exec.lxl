@@ -513,10 +513,23 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
             if lexdb_sql.isSubCall(&name) {
                 let i = lexdb_sql.litInt(&args[0])
                 if len(args) > lexdb_bind.subFixed(&name) {
-                    if i < len(env.cur) { return Ok(env.cur[i].clone()) }
+                    if i < len(env.cur) {
+                        match env.cur[i] {
+                            Val.Reg(o, t) {
+                                if o == LATE_OID {
+                                    var sv = lexdb_pipe.noSubVal()
+                                    sv.late = t.clone()
+                                    return Err(lexdb_pipe.lateOf(&sv).unwrap())
+                                }
+                            }
+                            else {}
+                        }
+                        return Ok(env.cur[i].clone())
+                    }
                     return Err(e("0A000", "a correlated subquery is not supported here"))
                 }
                 if len(args) < lexdb_bind.subFixed(&name) || i >= len(env.subs) { return Err(e("0A000", "a subquery is not supported here")) }
+                if len(env.subs[i].v.late) > 0 { return Err(lexdb_pipe.lateOf(&env.subs[i].v).unwrap()) }
                 let xv = if name == "#in" { try eval(&args[3], env) } else { Val.Null }
                 return Ok(lexdb_pipe.subValue(&name, &env.subs[i].v, &xv, envZone(env)))
             }
@@ -2597,7 +2610,15 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             let noCols: []lexdb_sql.ColDef = []
             for i in 0..len(sel.outs) { if lexdb_bind.argOid(&sel.exprs[i], &noCols, &pt, &ty) == lexdb_sql.OID_UNKNOWN { sel.outs[i].oid = lexdb_sql.OID_UNKNOWN } }
         }
+        var argOids: []int = []
+        if lexdb_bind.pgRules(&sc.names) && strings.startsWith(&s.srf, "#values:") { for o in sel.outs { append(mut &argOids, o.oid) } }
         sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
+        // a char's value in a text or varchar column of VALUES loses its blanks (PostgreSQL's door)
+        for i in 0..len(argOids) {
+            if len(sel.outs) > 0 && i < len(sel.exprs) && lexdb_bind.bpToText(argOids[i], sel.outs[i % len(sel.outs)].oid) {
+                sel.exprs[i] = lexdb_bind.trimmed(replace(mut &sel.exprs[i], Expr.Lit(Val.Null)))
+            }
+        }
         // the logical plan: the function or VALUES, its arguments the select list's
         let args = lexdb_sql.cloneAllExpr(&sel.exprs)
         sel.lp = if strings.startsWith(&s.srf, "#values:") { lexdb_bind.LPlan.Values(strings.parseIntOpt(&s.srf[8..len(s.srf)]).unwrapOr(1), args, outBCols(&sel.outs)) }
@@ -2976,7 +2997,7 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
                 var kv: []Val = []
                 for ko in q.subs[i].keyOuter { append(mut &kv, try eval(&ko, &kenv)) }
                 rs.stats[i].hits += 1
-                cur[i] = hashValue(&n, &env.subs[i], &kv, &xv, envZone(env))
+                cur[i] = if len(env.subs[i].v.late) > 0 { lateVal(&env.subs[i]) } else { hashValue(&n, &env.subs[i], &kv, &xv, envZone(env)) }
                 return Ok(Unit{})
             }
             let key = valsKey(&refVals)
@@ -2987,14 +3008,19 @@ fn fillCur(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, x: &Exp
             }
             if at >= 0 {
                 rs.stats[i].hits += 1
-                cur[i] = lexdb_pipe.subValue(&n, &rs.memoRes[i][at].v, &xv, envZone(env))
+                let mr = &rs.memoRes[i][at]
+                cur[i] = if len(mr.v.late) > 0 { lateVal(mr) } else { lexdb_pipe.subValue(&n, &mr.v, &xv, envZone(env)) }
                 return Ok(Unit{})
             }
             var ps: []Val = []
             for j in 0..q.base { append(mut &ps, env.params[j].clone()) }
             for v in move(refVals) { append(mut &ps, v) }
-            let r = try runSub(st, txn, &q.subs[i], &ps, rs, i)
-            cur[i] = lexdb_pipe.subValue(&n, &r.v, &xv, envZone(env))
+            // (a data error raised where eval reads the value: a CASE branch not taken does not)
+            let r = match runSub(st, txn, &q.subs[i], &ps, rs, i) {
+                Ok(got) { got }
+                Err(fx) { if lateErr(&fx) { lateRes(&fx) } else { return Err(fx) } }
+            }
+            cur[i] = if len(r.v.late) > 0 { lateVal(&r) } else { lexdb_pipe.subValue(&n, &r.v, &xv, envZone(env)) }
             if len(rs.memoRes[i]) < MEMO_MAX {
                 try rs.bud.hold(resBytes(&r) + len(key) + 48)
                 rs.memo[i].put(key, len(rs.memoRes[i]))
@@ -3204,15 +3230,40 @@ fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
             append(mut &subs, try runFrom(st, txn, sp, &ps, rs, i))
         } else if sp.semi {
             append(mut &subs, try runSemi(st, txn, sp, &ps, rs, i))
-        } else if sp.hashed {
-            append(mut &subs, try runHashed(st, txn, sp, &ps, rs, i))
         } else {
-            append(mut &subs, try runSub(st, txn, sp, &ps, rs, i))
+            match if sp.hashed { runHashed(st, txn, sp, &ps, rs, i) } else { runSub(st, txn, sp, &ps, rs, i) } {
+                Ok(r) { append(mut &subs, r) }
+                Err(x) {
+                    // a data error: raised where the value is first read (SubVal.late), not if no row reads it
+                    if !lateErr(&x) { return Err(x) }
+                    append(mut &subs, lateRes(&x))
+                }
+            }
         }
         try rs.bud.hold(resBytes(&subs[len(subs) - 1]))
     }
     return Ok(subs)
 }
+
+// Whether a subquery's run's error waits for its value to be read (E5): a
+// data error or a scalar's second row, as PostgreSQL raises them only from
+// a subquery it runs (an initplan when first needed, a CASE branch taken).
+fn lateErr(x: &DbErr): bool { return strings.startsWith(&x.state, "22") || x.state == "21000" }
+
+// A subquery's result that raises x where it is read (SubVal.late; an IN
+// path reads the table whole, so its condition raises it).
+fn lateRes(x: &DbErr): SubRes {
+    var r = emptyRes()
+    r.cls = -1
+    r.v.late = lexdb_pipe.lateText(x)
+    return r
+}
+
+// A correlated subquery's value for a row (Env.cur) that raises its run's
+// error where eval reads it (lateRes's, per row).
+const LATE_OID = -2147483000
+
+fn lateVal(r: &SubRes): Val { return Val.Reg(LATE_OID, r.v.late.clone()) }
 
 // The numbers of the subqueries x calls (a #sub, #exists or #in call's first argument).
 fn subCalls(x: &Expr, out: mut &[]int) {
@@ -9719,6 +9770,11 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let d = try mergeWin(&w, &s.windows, 0)
             var r = lexdb_sql.WinDef{call: try lexdb_bind.resolve(&d.call, &q.cols, len(q.cols), mut &sc.names), ref: "", bare: false, part: [], order: [],
                                      frame: cloneFrame(&d.frame)}
+            // (a sum of bigints: its call; the #win in the select list is cast to its type)
+            match lexdb_bind.wideInner(&r.call) {
+                Some(c) { r.call = c }
+                None {}
+            }
             // partitions and the window's order under their collations (L2): by keys
             for x in d.part {
                 let rx = try lexdb_bind.resolve(&x, &q.cols, len(q.cols), mut &sc.names)
@@ -10133,6 +10189,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                 }
                 if lexdb_bind.converts(&ty, lo, o) { bits = bits | 1 }
                 if lexdb_bind.converts(&ty, ro, o) { bits = bits | 2 }
+                // a char's values in a text or varchar column lose their blanks (PostgreSQL's door)
+                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(lo, o) { bits = bits | 4 }
+                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(ro, o) { bits = bits | 8 }
             }
             append(mut &conv, bits)
         }
@@ -10172,7 +10231,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
-                  groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs),
+                  groupKinds: [], ordKinds: ordKinds, outKinds: setKindsOf(&outs, lexdb_bind.pgRules(&sc.names)),
                   topMode: 0, topN: -1, feedback: [], mr: [], conv: conv, ox: [], oxParam: false, lp: lp, pipe: None})
 }
 
@@ -10194,9 +10253,17 @@ fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
 }
 
 // A set operation's side's rows with the values of the columns whose
-// conv has bit converted to the operation's types.
+// conv has bit converted to the operation's types (bit * 4: a char's
+// values made texts without their blanks).
 fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Result[Unit, DbErr] {
     for c in 0..len(sel.conv) {
+        if (sel.conv[c] & (bit * 4)) != 0 {
+            for i in 0..len(rows) {
+                if lexdb_ops.isNull(&rows[i][c]) { continue }
+                var buf = ""
+                rows[i][c] = Val.Text(lexdb_ops.bpTrim(lexdb_sql.textIn(&rows[i][c], mut &buf)))
+            }
+        }
         if (sel.conv[c] & bit) == 0 { continue }
         let t = lexdb_sql.oidType(sel.outs[c].oid)
         for i in 0..len(rows) { rows[i][c] = try lexdb_ops.coerceZ(replace(mut &rows[i][c], Val.Null), &t, z) }
@@ -10245,6 +10312,16 @@ fn outKindsOf(outs: &[]OutCol): []int {
     var out: []int = []
     for o in outs { append(mut &out, if lexdb_bind.isTextOid(o.oid) { lexdb_sql.collKind(&o.coll) } else { lexdb_sql.COLL_EXACT }) }
     return out
+}
+
+// A set operation's columns' kinds (outKindsOf): where pgRules holds a
+// char's rows match without their trailing blanks, as bpchar's = does (a
+// text side made a char, or chars of other lengths: 'a' and 'a  ' are one).
+fn setKindsOf(outs: &[]OutCol, pg: bool): []int {
+    var ks = outKindsOf(outs)
+    if !pg { return ks }
+    for i in 0..len(ks) { if ks[i] == lexdb_sql.COLL_EXACT && outs[i].oid == lexdb_sql.OID_BPCHAR { ks[i] = lexdb_sql.COLL_PAD } }
+    return ks
 }
 
 // ORDER BY's item as an output column (a number, a name): its kind.
@@ -16167,7 +16244,7 @@ fn bSubNode(q: &Query, m: &Mats, x: &Expr, post: bool, k: int, kinds: &[]int, ba
     var used: []int = []
     subCalls(x, mut &used)
     if len(used) == 0 { return None }
-    for u in used { if !subOnce(q, u) || u >= len(m.ce.subs) { return None } }
+    for u in used { if !subOnce(q, u) || u >= len(m.ce.subs) || len(m.ce.subs[u].late) > 0 { return None } }
     let none: []Val = []
     match lexdb_bind.bindSubs(x, &q.cols, &none, &typing()) {
         Some(b) {

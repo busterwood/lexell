@@ -195,6 +195,28 @@ not chased:
   22003 with W4's first version (19 integer digits at 36 places); W4 now
   keeps the places that fit (its note), and `repro --pg` agrees.
 
+**W6, E4 and E5 fixed (2026-11-21, on b14475f1; each note below).** W6 is
+w0-1774 (CASE's common type and a char's blanks), E4 the sum and avg of
+bigints past 2^63 (W4's note), E5 the errors by evaluation order (w0-1627
+fixed; w0-1465, w0-1483..1485 and w0-0218 decided and explained there).
+`repro --pg`: w0-1774 and w0-1627 (reduced and original) give PostgreSQL's
+rows in every configuration; w0-1465, w0-1483..1485 and w0-0218 are as
+before, by the decisions in E5. A 314 s run with the same seed
+(~/tpch-w/fuzz/fz3run: 1 worker, `--seed 1`, all checks, 95 seeds, 14,182
+queries) reports the fz2run's failures less these two (no pg:wrong left)
+and nothing new: the gaps G1-G5, H1-like timeouts (w0-0978, w0-1917), the
+E5 order differences, and `round(round(0), 1)`, which lexdb answers and
+PostgreSQL rejects (round(double precision, integer); as before).
+TPC-H (SF1, ~/tpch-w/fz3, alternated twice with main b14475f1): all 22
+checksums equal and PostgreSQL's; the queries over 1.5% in that pair
+(q11, q13-q17, q19, q20) have main's instructions within 0.15% (iq.sh) and,
+timed twice more (best of 3), are at 0.92 to 1.03 of main (q20's +3% at
++0.05% instructions: placement). Point selects, single-row INSERT and
+UPDATE by key, in process with LXL_HASH_SEED=1: main's instructions per
+statement exactly (a first version that carried the door into each
+statement's Names cost 21 instructions; `pgRules` reads the session
+collation the statement already has).
+
 ### W1. `a, b RIGHT/FULL JOIN c` joins the whole comma list (pg; 17 reduced cases)
 
 ```sql
@@ -453,6 +475,159 @@ ordered result's prefixes, and an unordered truncated one by its count only.
 repro shows "205200 rows (the first 200000 kept)" for every configuration
 and PostgreSQL; grouped by value (`x12, x13, count(*)`), the original
 query's rows are PostgreSQL's.
+
+### W6. A CASE of a char and a text is a char (pg; w0-1774)
+
+```sql
+create table t0 (a0 char(3));
+insert into t0 values ('');
+select case when true then a0 else cast(null as text) end from t0;
+-- lexdb: '   ' (character); PostgreSQL: '' (text)
+```
+
+**Fixed (4e7a5ded).** Cause: lexdb_bind's common type (`commonOid`,
+PostgreSQL's select_common_type) took CASE's values THENs first, but
+PostgreSQL's transformCaseExpr puts the ELSE first; in the string category,
+where text, varchar and char cast to each other implicitly, the first known
+type wins (text only because it is preferred), so `THEN char ELSE text` is a
+text and `THEN varchar ELSE char` a char. And a char's value made a text or a
+varchar by a common type kept its blanks (`converts`: "texts are the same
+values"), where PostgreSQL's bpchar to text drops them: in CASE, COALESCE,
+GREATEST and LEAST (`unifyVals` now wraps it in `#bptrim`), in a UNION,
+INTERSECT or EXCEPT column (`convRows`, conv bits 4 and 8) and a VALUES
+column (`planSubIn`). Seen while checking: NULLIF(a, b) had a's type, but
+PostgreSQL's is the type its `a = b` operator reads a as (`nullifOid`): a
+char beside a text a text, a varchar a text but beside a char a char, an
+integer beside a numeric a numeric and beside a float a double precision,
+an untyped a b's type; a is converted to it. And a set operation's char
+column (a text or a char of another length on the other side) compared with
+its blanks, where bpchar's = does not (UNION gave 'a' and 'a  ' twice,
+INTERSECT lost them): `setKindsOf` gives such a column COLL_PAD. The numeric
+category already agreed (its implicit casts go one way only). Applies where no session collation is set (`lexdb_bind.pgRules`,
+`Names.coll`): the T-SQL door, whose sessions have one, keeps a char's
+blanks and NULLIF's type as before; the Oracle door gets PostgreSQL's, as
+its casts already drop a CHAR's blanks (Oracle keeps them: a gap of that
+door's, as W2's). CASE's order is the binder's for every door (only the
+declared type of a CASE mixing char, varchar and text changes there). exec_fuzzfix3 has the cases (each statement batches on and off,
+against PostgreSQL 18): CASE in every order of char, varchar and text, no
+ELSE, a NULL ELSE, literals, simple and nested CASE, chars of two lengths,
+in GROUP BY and WHERE; COALESCE, GREATEST, LEAST; NULLIF of chars and of
+every pair of number types, in expressions and aggregates; UNION [ALL],
+INTERSECT [ALL], EXCEPT of chars beside texts, varchars and chars of other
+lengths, with an empty side; VALUES; the number types of CASE, COALESCE,
+GREATEST, UNION; an empty table. A random comparison (2,400 expressions of
+nested CASE, COALESCE, NULLIF, GREATEST and LEAST over chars, varchars,
+texts and every number type, set operations and VALUES, batches on and off,
+against PostgreSQL 18) leaves only the gaps below.
+
+Not changed, seen while checking: chars of different lengths in one value
+column (a CASE or COALESCE of a char(3) and a char(5), a varchar made a
+char) still compare with their blanks in GREATEST and LEAST (PostgreSQL:
+bpchar's comparison; which of two equal values it returns differs), and in
+DISTINCT and GROUP BY over such a column; lexdb accepts a CASE, COALESCE or
+GREATEST of a number and a text expression that PostgreSQL rejects (42804);
+`pg_typeof` names varchar `varchar` and char(n)[] `bpchar[]` (PostgreSQL:
+`character varying`, `character[]`); ARRAY[...] takes the widest type, not
+the first (ARRAY[t, a] of a text and a char is a char array, PostgreSQL's
+text[]); smallint +
+smallint is an integer (PostgreSQL: smallint).
+
+### E4. sum and avg of bigints fail "bigint out of range" past 2^63 (pg)
+
+```sql
+create table t0 (b bigint);
+insert into t0 values (9223372036854775807), (9223372036854775807);
+select sum(b), avg(b) from t0;
+-- lexdb: ERROR 22003 bigint out of range; PostgreSQL: 18446744073709551614 | 9223372036854775807
+```
+
+**Fixed (0850a8bd).** Cause: every engine summed integers in an int64 and
+failed on overflow (lexdb_agg.add's arith, the batches' bAccum and
+bAccVal, the window's fastAdd), and sum of a bigint was a bigint, where
+PostgreSQL's sum(int8) is a numeric (int128 inside) and avg of any integer
+a numeric. Now `lexdb_agg.sumAdd` adds integers as integers while they
+fit and past 2^63 as a numeric (the row engine, the batches' value
+aggregates, the window's rows added again); the batches' int64 sums
+(`bAccum`) give batErr on overflow and `AggSt.eat` gives way to the row
+path, so a sum that fits costs what it did; the window's fastAdd leaves
+such a value to lexdb_agg.add (its moving totals and EXCLUDE prefixes
+already fell back past 2^62 / frame size). lexdb_bind casts sum of a
+bigint to numeric (`wideType`; a window's sum the same, its call kept plain:
+`wideInner`); at the T-SQL door to bigint, so SQL Server's type and its
+overflow error stay. sum of int and smallint is still a bigint
+(PostgreSQL's), avg's type is unchanged (numeric). pg_typeof and the
+wire's OID of sum(bigint) are now numeric (1700), as PostgreSQL's.
+exec_fuzzfix3 checks against PostgreSQL 18, batches on and off: grouped and
+not, FILTER, DISTINCT, HAVING, ORDER BY, a join, a cross join, UNION ALL,
+an empty input, 6,000 rows through the batches, a total back in range,
+window sums and averages (running, moving, EXCLUDE, whole partition, named
+window). exec_aggpipe, exec_batch, exec_winagg and exec_winframe expected
+the old 22003 for their overflow cases; they now give PostgreSQL's numerics
+(spot-checked against PostgreSQL 18 by md5 of every row). Not changed: a
+sum of int past 2^63 (2^32 rows) is a numeric value where PostgreSQL
+fails; variance and stddev of bigints still compute in lexdb's 38 digits.
+
+### E5. A subquery's error raised where PostgreSQL never runs it (pg; w0-1627, w0-1465, w0-1483..1485, w0-0218)
+
+```sql
+create table t0 (a5 text);
+create table t1 (b5 text);
+insert into t0 values ('');
+select case when false then (select 0.5 from t0 where 1 <> any (select 1 / (1 % nullif(1, 0)) from t0)) end from t1;
+-- lexdb: ERROR 22012; PostgreSQL: 0 rows
+```
+
+What PostgreSQL does. It folds constants at plan time (eval_const_expressions:
+an immutable call of constants is evaluated, an error included), simplifying
+as it goes: CASE WHEN false drops its branch and COALESCE stops after a
+non-NULL constant before they are folded, but every branch of a CASE with a
+non-constant condition is folded (so `case when k > 5 then 1/0 else 1 end`
+fails at plan time; PostgreSQL's documentation warns of it). A sublink is
+planned only after that, so a dropped branch's subquery is never planned. At
+run time an uncorrelated subquery is an initplan run when its value is first
+needed, a correlated one per evaluation, and CASE evaluates only the branch
+it takes.
+
+**Fixed (1376301c): the CASE case.** Cause: not folding; lexdb ran every
+uncorrelated scalar, EXISTS and IN subquery before the query (`runSubs`) and a
+correlated one before each row's expression (`fillCur`), so a branch not
+taken, or a query with no rows, raised its error. Now a subquery's data error
+(SQLSTATE class 22, and 21000) is kept with its value (`SubVal.late`; per row
+`lateVal`, memoized) and raised where eval, bxEval or a batch condition reads
+it (`bSubNode` leaves such a condition to the row path; an IN path reads the
+table whole, so its condition raises it). exec_fuzzfix3's 29 E5 cases (the reduced
+and the original w0-1627; CASE false, a branch not taken and taken, run once
+and per row, two rows (21000), no rows, an empty table, WHERE, an aggregate's
+argument, a later row and a later batch, IN, EXISTS, under a false EXISTS)
+agree with PostgreSQL 18, batches on and off; tds_fuzzfix's ten E5 batches
+agree with SQL Server 2022 (it runs them lazily too). Oracle's door shares
+the executor (not checked against Oracle Free: python-oracledb is not
+installed). exec_apply's `case when t.id > 0 then true else (select 1 / 0
+...) = 1 end` now counts its rows (it failed 22012 before).
+
+Decided, not changed:
+- Constant folding over an empty table (w0-1465, `select 1 % 0 from t0`):
+  PostgreSQL fails at plan time, lexdb returns no rows (it evaluates a select
+  list only for rows; a constant's error is left to the row that reaches it). Matching would mean
+  evaluating, at plan time, every constant subexpression of every statement,
+  including CASE branches lexdb never takes (`case when k > 5 then 1 / 0 else
+  1 end`, which lexdb answers and PostgreSQL rejects), to fail queries that
+  would never compute them: per-statement work for no correct answer gained.
+- COALESCE evaluates all its arguments in lexdb (`coalesce(1, 1 / 0)` fails,
+  PostgreSQL gives 1; `coalesce(k, (select 1 / 0 ...))` too): not changed
+  (lazy COALESCE in both evaluators would be a change of its own).
+- A semi-join's subquery still runs before the query (`k > 5 and k in (select
+  1 / 0 ...)` fails where PostgreSQL's plan never probes it).
+- Plan-dependent bigint overflow is an order difference, not a wrong result:
+  w0-1483..1485, `t0 left join t1 on a0 = b1 where b1 = a1 * 6` with t1
+  empty: the cost planner makes the LEFT JOIN inner (the WHERE is strict on
+  t1) and evaluates the conjunct at the join, so with no t1 row a1 * 6 is never
+  computed (as PostgreSQL); the rules planner and the alt and noidx variants
+  keep the LEFT JOIN and evaluate the WHERE on the NULL-extended row, and
+  a1 * 6 overflows. w0-0218, `(select ... where 1 = b4 + 1) d join t1 on
+  false`: lexdb runs the derived table (b4 + 1 overflows) before the join;
+  PostgreSQL plans a join ON false as empty and never scans. Both orders are
+  SQL's; lexdb gives the same rows wherever it does not fail.
 
 ### H1. A 5 s statement timeout (on; probably only slow, not checked against PostgreSQL)
 
