@@ -1,0 +1,105 @@
+// The fuzzer's third round (design/lexdb-fuzz.md, W6, W7, E4), each statement against PostgreSQL 18's answer, with
+// SET lexdb_batch = off and on (in a transaction rolled back each time).
+// - W6 (w0-1774): the common type of CASE (its ELSE first, as PostgreSQL's transformCaseExpr), COALESCE, GREATEST,
+//   LEAST, UNION / INTERSECT / EXCEPT and VALUES, and NULLIF's type (a = b's operator): a char made a text or a
+//   varchar loses its blanks; a set operation's char column matches without them; numbers of every width and kind;
+//   NULLs, empty inputs, duplicates.
+// expect: W6 doc: ;ab;ab;NULL; a;ab, same: true
+// expect: W6 w0-1774: z,z,z,z,z,z|c|1;ba,ba,ba,ba,ba,ba|c|1.5;a_c,a_c,a_c,a_c,a_c,a_c|c|3.333;,,,,,|c|-1, same: true
+// expect: W6 CASE then char else text: 1|[]|0|f|text;2|[ab ]|3|f|text;3|[ab]|2|t|text;4|NULL|NULL|NULL|text;5|[ a]|2|f|text;6|[ab]|2|t|text, same: true
+// expect: W6 CASE then text else char: 1|[]|3|f|character;2|[ab]|3|t|character;3|[ab]|2|t|character;4|NULL|NULL|NULL|character;5|[y]|1|f|character;6|[ab]|3|t|character, same: true
+// expect: W6 CASE then char else varchar: 1|[]|0|f;2|[ab ]|3|f;3|[ab]|2|t;4|NULL|NULL|NULL;5|[ a]|2|f;6|[ab]|2|t, same: true
+// expect: W6 CASE then varchar else char: 1|[]|3|f|character;2|[ab]|3|t|character;3|[ab]|2|t|character;4|NULL|NULL|NULL|character;5|[x]|1|f|character;6|[ab]|3|t|character, same: true
+// expect: W6 CASE then text else varchar, then varchar else text: 1|0|0|text;2|3|3|text;3|2|2|text;4|NULL|NULL|text;5|1|1|text;6|3|3|text, same: true
+// expect: W6 CASE no ELSE, NULL ELSE, a literal: 1|[]|[]|[q]|3|character;2|NULL|NULL|[q]|3|character;3|[ab]|[ab]|[ab]|1|character;4|NULL|NULL|NULL|1|character;5|[ a]|[y]|[ a]|1|character;6|[ab]|[ab ]|[ab]|1|character, same: true
+// expect: W6 simple CASE, nested: 1|[]|text|[];2|[ab ]|text|[ab];3|[ab]|text|[a];4|NULL|text|NULL;5|[z]|text|[ a];6|[ab ]|text|[ab], same: true
+// expect: W6 CASE chars of two lengths: 1|[]|5;2|[ab]|5;3|[ab]|3;4|NULL|NULL;5|[ a]|3;6|[ab]|3, same: true
+// expect: W6 CASE in aggregates and GROUP BY: |1|; a|1| a;ab|2|ab;ab |1|ab;NULL|1|NULL, same: true
+// expect: W6 CASE in WHERE: 3;6, same: true
+// expect: W6 COALESCE: 1|[]|[]|[]|3|[]|3|text|character;2|[ab ]|[ab ]|[ab]|3|[ab]|3|text|character;3|[ab]|[ab]|[ab]|3|[ab]|3|text|character;4|NULL|NULL|NULL|NULL|NULL|1|text|character;5|[y]|[x]|[ a]|3|[ a]|3|text|character;6|[ab ]|[ab ]|[ab]|3|[ab]|3|text|character, same: true
+// expect: W6 COALESCE of a NULL text: 1|[]|0;2|[ab]|2;3|[ab]|2;4|NULL|NULL;5|[ a]|2;6|[ab]|2, same: true
+// expect: W6 GREATEST, LEAST: 1|[]|[]|0|text|character;2|[ab ]|[ab]|3|text|character;3|[ab]|[ab]|2|text|character;4|NULL|NULL|NULL|text|character;5|[y]|[ a]|1|text|character;6|[ab ]|[ab]|3|text|character, same: true
+// expect: W6 NULLIF of chars: 1|NULL|NULL|NULL|NULL|NULL|text|character|character|text|character;2|[ab]|NULL|NULL|NULL|[ab ]|text|character|character|text|character;3|NULL|NULL|NULL|NULL|NULL|text|character|character|text|character;4|NULL|NULL|NULL|NULL|NULL|text|character|character|text|character;5|[ a]|[x]|[ a]|[x]|[y]|text|character|character|text|character;6|[ab]|NULL|NULL|NULL|[ab ]|text|character|character|text|character, same: true
+// expect: W6 NULLIF of numbers' types: integer|bigint|smallint|numeric|numeric|double precision|double precision|double precision|numeric|double precision|real|bigint|bigint|integer, same: true
+// expect: W6 NULLIF of numbers: 1|NULL|NULL|NULL|NULL|1|1|NULL|NULL|1;2|2|2.5|2|9223372036854775807|2|NULL|2|NULL|9223372036854775807;3|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL;4|NULL|NULL|NULL|-3|0|0|-1|NULL|-3;5|NULL|NULL|NULL|NULL|2|NULL|NULL|NULL|2, same: true
+// expect: W6 NULLIF in expressions: 1|NULL|2|2|10.0000000000000000;2|3|18446744073709551614|2|5.0000000000000000;3|NULL|NULL|2|NULL;4|NULL|-6|2|NULL;5|NULL|NULL|2|5.0000000000000000, same: true
+// expect: W6 NULLIF aggregated: 12|4.611686018427388e+18|ab|5, same: true
+// expect: W6 UNION ALL char and text: []|0;[]|0;[ab ]|3;[ab ]|3;[ab]|2;[ab]|2;[q]|1;[y]|1;NULL|NULL;NULL|NULL, same: true
+// expect: W6 UNION char and varchar: |[];ab|[ab];ab |[ab ];q|[q];x|[x];NULL|NULL, same: true
+// expect: W6 UNION char and text: one row per char value: [ a]|1;[]|1;[a]|1;[ab]|1;[q]|1;NULL|1, same: true
+// expect: W6 UNION chars of two lengths: 6, same: true
+// expect: W6 INTERSECT char and text: ab;NULL, same: true
+// expect: W6 INTERSECT ALL char and varchar: ;ab;ab;ab;NULL, same: true
+// expect: W6 EXCEPT char and varchar: ;NULL, same: true
+// expect: W6 EXCEPT text and char: [ab ];[y], same: true
+// expect: W6 UNION with an empty side: [];[ab];[q];NULL, same: true
+// expect: W6 UNION of empty sides: , same: true
+// expect: W6 UNION char and char:    |3; a |3;ab |3;q  |3;NULL|NULL, same: true
+// expect: W6 VALUES: [a]|1;[b]|1;NULL|NULL, same: true
+// expect: W6 VALUES varchar and char: [a]|1;[b]|2;NULL|3;[c]|4, same: true
+// expect: W6 VALUES of chars: [b]|3;[c]|4, same: true
+// expect: W6 numbers: CASE, COALESCE, GREATEST types: bigint|numeric|double precision|integer|bigint|numeric|real|bigint|double precision, same: true
+// expect: W6 numbers: CASE and COALESCE values: 1|1|1|1|1|1;2|2.5|2|2|2.5|2.5;3|NULL|NULL|NULL|NULL|NULL;4|0|0|-1|0|0;5|2.00|2|2|2|2, same: true
+// expect: W6 numbers: UNION: 0;1;2;2.5;NULL, same: true
+// expect: W6 an empty table: , same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// each statement with the row engine and with batches, in a transaction rolled back
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table s1 (id int, a char(3), a5 char(5), v varchar(4), t text)\ninsert into s1 values (1, '', '', '', ''), (2, 'ab', 'ab', 'ab ', 'ab '), (3, 'ab', 'a', 'ab', 'ab'), (4, null, null, null, null), (5, ' a', 'z', 'x', 'y'), (6, 'ab', 'ab', 'ab ', 'ab ')\ncreate table s2 (id int, a char(3), v varchar(4), t text)\ninsert into s2 values (1, 'ab', 'ab', 'ab'), (2, '', ' a', 'a'), (3, null, 'ab ', null), (4, 'q', 'q', 'q ')\ncreate table se (a char(3), v varchar(4), t text)\ncreate table nn (id int, i int, b bigint, s smallint, n numeric, f float8, r real)\ninsert into nn values (1, 1, 1, 1, 1.0, 1, 1), (2, 2, 9223372036854775807, 2, 2.5, 0.5, 2.5), (3, null, null, null, null, null, null), (4, 0, -3, -1, 0, 0, 0), (5, 2, 2, 2, 2.00, 2, 2)\ncreate table t0 (a0 char(3), a1 int)\ninsert into t0 values (null, null), ('a ', 7), (null, -2), ('c', 4), ('a', 10), ('', null)\ncreate table t2 (c1 text, c3 text, c4 numeric)\ninsert into t2 values ('a', 'ba', 1.5), ('b', 'a_c', 3.333), (null, '', -1), ('ab ', 'z', 1)"
+
+const QS = "W6 doc\tselect case when true then a else cast(null as text) end as x4 from s1 order by id\nW6 w0-1774\tselect string_agg(q1.c3, ',' order by q1.c3) as x3, max(case when true then q2.a0 else q1.c1 end) as x4, min(q1.c4) as x5 from t2 as q1 cross join t0 as q2 where (('a_c' || 'ab') like '%a%') group by q1.c4 order by 1 desc, 2, 3 asc nulls first limit 10\nW6 CASE then char else text\tselect id, '[' || (case when id > 2 then a else t end) || ']', octet_length(case when id > 2 then a else t end), (case when id > 2 then a else t end) = 'ab', pg_typeof(case when id > 2 then a else t end) from s1 order by id\nW6 CASE then text else char\tselect id, '[' || (case when id > 2 then t else a end) || ']', octet_length(case when id > 2 then t else a end), (case when id > 2 then t else a end) = 'ab', pg_typeof(case when id > 2 then t else a end) from s1 order by id\nW6 CASE then char else varchar\tselect id, '[' || (case when id > 2 then a else v end) || ']', octet_length(case when id > 2 then a else v end), (case when id > 2 then a else v end) = 'ab' from s1 order by id\nW6 CASE then varchar else char\tselect id, '[' || (case when id > 2 then v else a end) || ']', octet_length(case when id > 2 then v else a end), (case when id > 2 then v else a end) = 'ab', pg_typeof(case when id > 2 then v else a end) from s1 order by id\nW6 CASE then text else varchar, then varchar else text\tselect id, octet_length(case when id > 2 then t else v end), octet_length(case when id > 2 then v else t end), pg_typeof(case when id > 2 then v else t end) from s1 order by id\nW6 CASE no ELSE, NULL ELSE, a literal\tselect id, '[' || (case when id > 2 then a when id = 1 then t end) || ']', '[' || (case when id > 2 then t when id = 1 then a else null end) || ']', '[' || (case when id > 2 then a else 'q' end) || ']', octet_length(case when id > 2 then 'q' else a end), pg_typeof(case when id > 2 then a when id = 1 then t end) from s1 order by id\nW6 simple CASE, nested\tselect id, '[' || (case id when 3 then a when 5 then a5 else t end) || ']', pg_typeof(case id when 3 then a else t end), '[' || (case when id > 1 then case when id > 3 then a else a5 end else t end) || ']' from s1 order by id\nW6 CASE chars of two lengths\tselect id, '[' || (case when id > 2 then a else a5 end) || ']', octet_length(case when id > 2 then a else a5 end) from s1 order by id\nW6 CASE in aggregates and GROUP BY\tselect case when id > 2 then a else t end as k, count(*), max(case when true then a else t end) from s1 group by 1 order by 1\nW6 CASE in WHERE\tselect id from s1 where (case when id > 2 then a else t end) = 'ab' order by id\nW6 COALESCE\tselect id, '[' || coalesce(t, a) || ']', '[' || coalesce(v, a) || ']', '[' || coalesce(a, t) || ']', octet_length(coalesce(a, t)), '[' || coalesce(null, a) || ']', octet_length(coalesce(a, 'z')), pg_typeof(coalesce(t, a)), pg_typeof(coalesce(a, t)) from s1 order by id\nW6 COALESCE of a NULL text\tselect id, '[' || coalesce(cast(null as text), a) || ']', octet_length(coalesce(cast(null as varchar), a, t)) from s1 order by id\nW6 GREATEST, LEAST\tselect id, '[' || greatest(t, a) || ']', '[' || least(v, a) || ']', octet_length(greatest(v, a)), pg_typeof(greatest(t, a)), pg_typeof(least(a, t)) from s1 order by id\nW6 NULLIF of chars\tselect id, '[' || nullif(a, t) || ']', '[' || nullif(v, a) || ']', '[' || nullif(a, v) || ']', '[' || nullif(v, t) || ']', '[' || nullif(t, a) || ']', pg_typeof(nullif(a, t)), pg_typeof(nullif(a, v)), pg_typeof(nullif(v, a)), pg_typeof(nullif(t, v)), pg_typeof(nullif(a, 'x')) from s1 order by id\nW6 NULLIF of numbers' types\tselect pg_typeof(nullif(i, b)), pg_typeof(nullif(b, i)), pg_typeof(nullif(s, i)), pg_typeof(nullif(i, n)), pg_typeof(nullif(n, i)), pg_typeof(nullif(i, f)), pg_typeof(nullif(f, n)), pg_typeof(nullif(n, f)), pg_typeof(nullif(i, 1.5)), pg_typeof(nullif(s, r)), pg_typeof(nullif(r, f)), pg_typeof(nullif(b, '3')), pg_typeof(nullif(null, b)), pg_typeof(nullif(1, i)) from nn where id = 1\nW6 NULLIF of numbers\tselect id, nullif(i, n), nullif(n, i), nullif(i, f), nullif(b, n), nullif(i, 2.5), nullif(i, 2.0), nullif(s, r), nullif(null, b), nullif(b, 1.5) from nn order by id\nW6 NULLIF in expressions\tselect id, nullif(i, n) + 1, nullif(b, 2.0) * 2, sum(nullif(i, n)) over (), 10 / nullif(i, 0.0) from nn order by id\nW6 NULLIF aggregated\tselect sum(nullif(i, n)), avg(nullif(b, f)), max(nullif(a, t)), count(nullif(v, a)) from nn, s1\nW6 UNION ALL char and text\tselect '[' || x || ']', octet_length(x) from (select t as x from s1 union all select a from s2) d order by 1\nW6 UNION char and varchar\tselect x, '[' || x || ']' from (select v as x from s1 union select a from s2) d order by 1\nW6 UNION char and text: one row per char value\tselect '[' || x::text || ']', count(*) from (select a as x from s1 union select t from s2) d group by 1 order by 1\nW6 UNION chars of two lengths\tselect count(*) from (select a as x from s1 union select a5 from s1) d\nW6 INTERSECT char and text\tselect x::text from (select a as x from s1 intersect select t from s2) d order by 1\nW6 INTERSECT ALL char and varchar\tselect x::text from (select a as x from s1 intersect all select v from s1) d order by 1\nW6 EXCEPT char and varchar\tselect x::text from (select a as x from s1 except select v from s2) d order by 1\nW6 EXCEPT text and char\tselect '[' || x || ']' from (select t as x from s1 except select a from s2) d order by 1\nW6 UNION with an empty side\tselect '[' || x || ']' from (select t as x from se union select a from s2) d order by 1\nW6 UNION of empty sides\tselect x from (select a as x from se union select t from se) d\nW6 UNION char and char\tselect x, octet_length(x) from (select a as x from s1 union select a from s2) d order by 1\nW6 VALUES\tselect '[' || column1 || ']', octet_length(column1) from (values ('a'::text), ('b '::char(3)), (null)) d order by 1\nW6 VALUES varchar and char\tselect '[' || column1 || ']', column2 from (values ('a'::varchar, 1), ('b '::char(3), 2), (null, 3), ('c'::char(4), 4)) d order by 2\nW6 VALUES of chars\tselect '[' || column1 || ']', octet_length(column1) from (values ('b '::char(3)), ('c'::char(4))) d order by 1\nW6 numbers: CASE, COALESCE, GREATEST types\tselect pg_typeof(case when id = 1 then i else b end), pg_typeof(case when id = 1 then n else i end), pg_typeof(case when id = 1 then f else n end), pg_typeof(case when id = 1 then s else 1 end), pg_typeof(case when id = 1 then b else '7' end), pg_typeof(coalesce(i, n)), pg_typeof(coalesce(s, r)), pg_typeof(greatest(i, b)), pg_typeof(least(n, f, i)) from nn where id = 1\nW6 numbers: CASE and COALESCE values\tselect id, case when id = 1 then i else n end, coalesce(i, n), case when id > 1 then s else b end, greatest(s, n), coalesce(n, f) from nn order by id\nW6 numbers: UNION\tselect x from (select i as x from nn union select n from nn) d order by 1\nW6 an empty table\tselect case when true then a else t end, coalesce(t, a), nullif(a, t) from se"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for l in strings.lines(&qs) {
+        let parts = strings.split(&l, "\t")
+        two(mut &s, &parts[0], &parts[1])
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(98), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

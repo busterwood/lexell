@@ -2597,7 +2597,15 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             let noCols: []lexdb_sql.ColDef = []
             for i in 0..len(sel.outs) { if lexdb_bind.argOid(&sel.exprs[i], &noCols, &pt, &ty) == lexdb_sql.OID_UNKNOWN { sel.outs[i].oid = lexdb_sql.OID_UNKNOWN } }
         }
+        var argOids: []int = []
+        if lexdb_bind.pgRules(&sc.names) && strings.startsWith(&s.srf, "#values:") { for o in sel.outs { append(mut &argOids, o.oid) } }
         sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
+        // a char's value in a text or varchar column of VALUES loses its blanks (PostgreSQL's door)
+        for i in 0..len(argOids) {
+            if len(sel.outs) > 0 && i < len(sel.exprs) && lexdb_bind.bpToText(argOids[i], sel.outs[i % len(sel.outs)].oid) {
+                sel.exprs[i] = lexdb_bind.trimmed(replace(mut &sel.exprs[i], Expr.Lit(Val.Null)))
+            }
+        }
         // the logical plan: the function or VALUES, its arguments the select list's
         let args = lexdb_sql.cloneAllExpr(&sel.exprs)
         sel.lp = if strings.startsWith(&s.srf, "#values:") { lexdb_bind.LPlan.Values(strings.parseIntOpt(&s.srf[8..len(s.srf)]).unwrapOr(1), args, outBCols(&sel.outs)) }
@@ -10133,6 +10141,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                 }
                 if lexdb_bind.converts(&ty, lo, o) { bits = bits | 1 }
                 if lexdb_bind.converts(&ty, ro, o) { bits = bits | 2 }
+                // a char's values in a text or varchar column lose their blanks (PostgreSQL's door)
+                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(lo, o) { bits = bits | 4 }
+                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(ro, o) { bits = bits | 8 }
             }
             append(mut &conv, bits)
         }
@@ -10172,7 +10183,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
-                  groupKinds: [], ordKinds: ordKinds, outKinds: outKindsOf(&outs),
+                  groupKinds: [], ordKinds: ordKinds, outKinds: setKindsOf(&outs, lexdb_bind.pgRules(&sc.names)),
                   topMode: 0, topN: -1, feedback: [], mr: [], conv: conv, ox: [], oxParam: false, lp: lp, pipe: None})
 }
 
@@ -10194,9 +10205,17 @@ fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
 }
 
 // A set operation's side's rows with the values of the columns whose
-// conv has bit converted to the operation's types.
+// conv has bit converted to the operation's types (bit * 4: a char's
+// values made texts without their blanks).
 fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Result[Unit, DbErr] {
     for c in 0..len(sel.conv) {
+        if (sel.conv[c] & (bit * 4)) != 0 {
+            for i in 0..len(rows) {
+                if lexdb_ops.isNull(&rows[i][c]) { continue }
+                var buf = ""
+                rows[i][c] = Val.Text(lexdb_ops.bpTrim(lexdb_sql.textIn(&rows[i][c], mut &buf)))
+            }
+        }
         if (sel.conv[c] & bit) == 0 { continue }
         let t = lexdb_sql.oidType(sel.outs[c].oid)
         for i in 0..len(rows) { rows[i][c] = try lexdb_ops.coerceZ(replace(mut &rows[i][c], Val.Null), &t, z) }
@@ -10245,6 +10264,16 @@ fn outKindsOf(outs: &[]OutCol): []int {
     var out: []int = []
     for o in outs { append(mut &out, if lexdb_bind.isTextOid(o.oid) { lexdb_sql.collKind(&o.coll) } else { lexdb_sql.COLL_EXACT }) }
     return out
+}
+
+// A set operation's columns' kinds (outKindsOf): where pgRules holds a
+// char's rows match without their trailing blanks, as bpchar's = does (a
+// text side made a char, or chars of other lengths: 'a' and 'a  ' are one).
+fn setKindsOf(outs: &[]OutCol, pg: bool): []int {
+    var ks = outKindsOf(outs)
+    if !pg { return ks }
+    for i in 0..len(ks) { if ks[i] == lexdb_sql.COLL_EXACT && outs[i].oid == lexdb_sql.OID_BPCHAR { ks[i] = lexdb_sql.COLL_PAD } }
+    return ks
 }
 
 // ORDER BY's item as an output column (a number, a name): its kind.
