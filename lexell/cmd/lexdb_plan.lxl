@@ -1068,6 +1068,15 @@ fn qualified(x: &Expr, alias: &str): Expr {
 // Whether two expressions are the same.
 fn sameExpr(a: &Expr, b: &Expr): bool { return lexdb_sql.exprText(a) == lexdb_sql.exprText(b) }
 
+// sameExpr of a resolved expression and one as written, an index's expression or predicate: without the casts of
+// integer arithmetic (lexdb_bind.unchecked).
+fn sameWritten(a: &Expr, b: &Expr): bool {
+    let ta = lexdb_sql.exprText(a)
+    let tb = lexdb_sql.exprText(b)
+    if ta == tb { return true }
+    return lexdb_sql.exprText(&lexdb_bind.unchecked(a)) == lexdb_sql.exprText(&lexdb_bind.unchecked(b))
+}
+
 // bounds for an index expression (9.89): conjuncts comparing target with a
 // value known before level k.
 fn exprBounds(cs: &[]Expr, target: &Expr, k: int, q: &Query): []Bound {
@@ -1076,9 +1085,9 @@ fn exprBounds(cs: &[]Expr, target: &Expr, k: int, q: &Query): []Bound {
         match c {
             Expr.Bin(op, a, b) {
                 if op == "=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
-                    if sameExpr(&a, target) && q.keyBefore(&b, k) {
+                    if sameWritten(&a, target) && q.keyBefore(&b, k) {
                         append(mut &out, Bound{op: op.clone(), val: lexdb_sql.cloneExpr(&b)})
-                    } else if sameExpr(&b, target) && q.keyBefore(&a, k) {
+                    } else if sameWritten(&b, target) && q.keyBefore(&a, k) {
                         let flip = match op { "<" { ">" } "<=" { ">=" } ">" { "<" } ">=" { "<=" } else { "=" } }
                         append(mut &out, Bound{op: flip, val: lexdb_sql.cloneExpr(&a)})
                     }
@@ -1199,7 +1208,7 @@ pub fn looksHold(ls: &[]Look, params: &[]Val): bool {
 }
 
 fn impliesRaw(c: &Expr, p: &Expr, params: &[]Val): bool {
-    if lexdb_sql.exprText(c) == lexdb_sql.exprText(p) { return true }
+    if sameWritten(c, p) { return true }
     match p {
         Expr.IsNull(a, neg) {
             if !neg { return false }
@@ -4015,6 +4024,10 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
                             // col = x, or a collation's #ci(col) = #ci(x) (L2): hashed on the key
                             let ka = keyedCol(&a)
                             let kb = keyedCol(&b)
+                            // a FROM subquery's rows are hashed by their values as they are (keyPart), not made the
+                            // column's type as a table's probe is: only kinds whose keys match where = holds (a float
+                            // beside an integer, a date beside a timestamp: a condition per row)
+                            if q.levels[k].virt() && !hashKeyTypes(&a, &b, &q.cols) { continue }
                             if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
                                 append(mut &hcols, lexdb_bind.colIndex(&q.cols, &ka.name) - q.levels[k].first)
                                 append(mut &hvals, lexdb_sql.cloneExpr(&b))
@@ -4288,7 +4301,8 @@ pub fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
         if len(hk.inner) == 0 { return }
         // a subquery of its own (in FROM, a LATERAL one's, in an expression) that reads an outer value: run once, it would
         // have none (08P01)
-        for s in q.subs { if !noRefs(&s.sel.q.refs, base) { return } }
+        // (and a LATERAL over its own FROM, which reads the subquery's columns: run once, it gave no rows)
+        for s in q.subs { if !noRefs(&s.sel.q.refs, base) || (s.use == lexdb_sql.SUB_FROM && len(s.sel.q.refs) > 0) { return } }
     }
     for k in 0..len(sp.sel.q.levels) {
         sp.sel.q.levels[k].cond = dropTexts(replace(mut &sp.sel.q.levels[k].cond, []), &hk.texts)
@@ -4918,8 +4932,9 @@ fn inLook(q: &Query, i: int, c: &Expr, kind: int, pt: &[]int): Option[InLook] {
     if len(t.pk) > 0 && t.pk[0] == col { ix = -1 }
     if ix == -2 {
         for k in 0..len(t.indexes) {
+            // (not a filtered index: its predicate holds for no row the IN looks up as such)
             let kc = keyCols(t, k)
-            if len(kc) > 0 && kc[0] == col && ix == -2 { ix = k }
+            if len(kc) > 0 && kc[0] == col && ix == -2 && t.indexes[k].pred.isNone() { ix = k }
         }
     }
     if ix == -2 { return None }
@@ -5190,11 +5205,33 @@ fn narrowSub(sel: mut &Sel) {
 
 // The semi-join level of conjunct c (subquery i) of q, or None: c stays.
 // kind: IN's collation kind (resolve's); outer: about the rows reaching it.
+// Whether a conjunct is x [NOT] IN (subquery) with an x of no column.
+fn constIn(c: &Expr): bool {
+    match c {
+        Expr.Call(n, args, _) {
+            if n == "#in" && len(args) >= 4 {
+                var ns: []str = []
+                lexdb_sql.colNames(&args[3], mut &ns)
+                return len(ns) == 0
+            }
+        }
+        Expr.Unary(op, a) { if op == "not" { return constIn(&a) } }
+        else {}
+    }
+    return false
+}
+
 fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c: &Expr, i: int, kind: int, pt: &[]int,
              alts: mut &[]Option[SubPlan], outer: float, params: &[]Val, anti: bool, lookOk: bool, rules: bool,
              exact: bool): Result[Option[Level], DbErr] {
     var keys = SemiKeys{vals: [], oids: [], names: [], res: []}
     var ok = false
+    // a subquery with a LATERAL over its own FROM (a correlated FROM subquery of its own): its semi join's rows came
+    // out empty (W14); it stays a subquery (IN's set run once, EXISTS per row)
+    for s in q.subs[i].sel.q.subs { if s.use == lexdb_sql.SUB_FROM && len(s.sel.q.refs) > 0 { return Ok(None) } }
+    // a constant IN ('a' IN (subquery)): no semi join (its condition is also the query's once, which runs the
+    // subquery whose table a looked-up level took: C2)
+    if constIn(c) { return Ok(None) }
     // NOT IN: a null-aware anti join (optimizer 50), no residual filter
     let na = anti && q.subs[i].use == lexdb_sql.SUB_IN
     // a lookup per row as a join's level (semiLook), in place of the
@@ -5347,9 +5384,11 @@ fn keyLevel(q: mut &Query, i: int, keys0: SemiKeys, kind: int, anti: bool, na: b
         var qc = lexdb_sql.colDef(&(alias + "." + lexdb_catalog.ROWID + pos.toStr()), resTypes[j], false)
         qc.using = lexdb_sql.USING_HIDDEN
         addCol(q, qc)
+        // (after the keys: a residual's column that is a key too, q3.a = q1.a AND q3.a <= q2.b, is output again at
+        // its place here, which the level reads it from)
         var have = false
         let want = lexdb_sql.exprText(&Expr.Col(n.toStr(), -1))
-        for e in q.subs[i].sel.exprs { if lexdb_sql.exprText(&e) == want { have = true } }
+        for k in w..len(q.subs[i].sel.exprs) { if lexdb_sql.exprText(&q.subs[i].sel.exprs[k]) == want { have = true } }
         if !have { append(mut &q.subs[i].sel.exprs, Expr.Col(n.toStr(), -1)) }
         append(mut &resFrom, n.toStr())
         append(mut &resTo, alias + "." + lexdb_catalog.ROWID + pos.toStr())
@@ -7157,6 +7196,19 @@ pub fn orderedScan(q: &Query, cols: &[]int, params: &[]Val, lk: mut &[]Look): Op
 }
 
 // The column of the first table every output is MIN (0) or MAX (1) of, else -1.
+// ORDER BY's item o as an output of sel: a position, an output's name (not a column's), the expression of one; -1
+// another (for a set-returning function's rows, sorted after they are made).
+pub fn orderOutAt(sel: &Sel, o: &Expr, cols: &[]lexdb_sql.ColDef): int {
+    match o {
+        Expr.Lit(v) { match v { Val.Int(n) { return if n >= 1 && n <= len(sel.exprs) { n - 1 } else { -1 } } else {} } }
+        Expr.Col(n, sl) { if lexdb_bind.colSlot(cols, &n, sl) < 0 { for i in 0..len(sel.outs) { if sel.outs[i].name == n { return i } } } }
+        else {}
+    }
+    let t = lexdb_sql.exprText(o)
+    for i in 0..len(sel.exprs) { if lexdb_sql.exprText(&sel.exprs[i]) == t { return i } }
+    return -1
+}
+
 pub fn minMax(q: &Query, exprs: &[]Expr, dir: mut &int): int {
     var col = -1
     var fname = ""

@@ -1256,6 +1256,7 @@ class Gen:
 INT_OIDS = {20, 21, 23}
 NUM_OIDS = {1700}
 FLOAT_OIDS = {700, 701}
+BPCHAR_OID = 1042
 
 
 def col_kinds(a, b):
@@ -1270,6 +1271,8 @@ def col_kinds(a, b):
             out.append('f')
         elif s & NUM_OIDS:
             out.append('n')
+        elif s == {BPCHAR_OID}:
+            out.append('c')
         else:
             out.append(None)
     return out
@@ -1278,6 +1281,10 @@ def col_kinds(a, b):
 def norm_val(v, kind, pg):
     if v is None or kind is None:
         return v
+    if kind == 'c':
+        # a char column on both sides: values equal without their trailing blanks are one value, and which of them a
+        # DISTINCT, UNION, GROUP BY, GREATEST or LEAST shows depends on the order rows come in ('a' or 'a  ')
+        return v.rstrip(' ')
     try:
         d = Decimal(v)
     except InvalidOperation:
@@ -1299,6 +1306,12 @@ def norm_rows(res, kinds, pg, ordered):
     return rows
 
 
+def ordered_key(res, kinds, pg):
+    """The rows in order, texts without trailing blanks: char(n) values that differ only there are peers in ORDER
+    BY ('a' and 'a  ', in either order); the rows themselves are compared as multisets too."""
+    return [tuple(v.rstrip(' ') if isinstance(v, str) else v for v in row) for row in norm_rows(res, kinds, pg, True)]
+
+
 def compare(a, b, ordered, pg=False):
     """None when a and b agree, else a class: wrong, errcode, a-error, b-error,
     crash, hang (a crash or hang of b; the caller checks a's)."""
@@ -1316,7 +1329,9 @@ def compare(a, b, ordered, pg=False):
             # order: not the same rows even when the results are (w0-0697)
             return None
         kinds = col_kinds(a, b)
-        if norm_rows(a, kinds, pg, ordered) != norm_rows(b, kinds, pg, ordered):
+        if ordered and ordered_key(a, kinds, pg) != ordered_key(b, kinds, pg):
+            return 'wrong'
+        if not (a.truncated() or b.truncated()) and norm_rows(a, kinds, pg, False) != norm_rows(b, kinds, pg, False):
             return 'wrong'
         return None
     if a.kind == 'error' and b.kind == 'error':
@@ -1545,6 +1560,16 @@ class Worker:
             return None
         return r
 
+    def pg_slow(self, sql, setup):
+        """Whether PostgreSQL too takes the statement timeout: then a hang of lexdb's is not reported."""
+        if self.pg is None:
+            return False
+        r = self.run_pg(sql, setup)
+        if r is None or (r.kind == 'error' and r.code == '57014'):
+            self.stats['hang_pg_slow'] = self.stats.get('hang_pg_slow', 0) + 1
+            return True
+        return False
+
     # -- one query, every check
     def check_query(self, q, setup, r):
         sql = q.sql()
@@ -1552,7 +1577,8 @@ class Worker:
         res = {'on': self.run_cfg('on', sql, setup)}
         fails = []
         if res['on'].kind in ('crash', 'hang'):
-            fails.append(('on', res['on'].kind, sql, None, res))
+            if res['on'].kind == 'crash' or not self.pg_slow(sql, setup):
+                fails.append(('on', res['on'].kind, sql, None, res))
             return fails
         if res['on'].kind == 'error':
             self.stats['lexdb_errors'] += 1
@@ -1561,6 +1587,8 @@ class Worker:
                 continue
             res[cfg] = self.run_cfg(cfg, sql, setup)
             c = compare(res['on'], res[cfg], ordered)
+            if c == 'hang' and self.pg_slow(sql, setup):
+                continue
             if c:
                 fails.append((chk, c, sql, None, {'on': res['on'], cfg: res[cfg]}))
         if self.pg is not None:
@@ -1577,7 +1605,8 @@ class Worker:
                 a = self.run_cfg('on', whole, setup)
                 b = self.run_cfg('on', parts, setup)
                 if b.kind in ('crash', 'hang'):
-                    fails.append((kind, b.kind, parts, None, {'whole': a, 'parts': b}))
+                    if b.kind == 'crash' or not self.pg_slow(parts, setup):
+                        fails.append((kind, b.kind, parts, None, {'whole': a, 'parts': b}))
                 elif a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False):
                     fails.append((kind, 'wrong', whole, parts, {'whole': a, 'parts': b}))
         if 'norec' in self.checks:
@@ -1588,7 +1617,8 @@ class Worker:
                 b = self.run_cfg('on', nv[1], setup)
                 for x, s in ((a, nv[0]), (b, nv[1])):
                     if x.kind in ('crash', 'hang'):
-                        fails.append(('norec', x.kind, s, None, {'opt': a, 'unopt': b}))
+                        if x.kind == 'crash' or not self.pg_slow(s, setup):
+                            fails.append(('norec', x.kind, s, None, {'opt': a, 'unopt': b}))
                         break
                 else:
                     if a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False):
@@ -1603,13 +1633,15 @@ class Worker:
                 return False
             if chk == 'on':
                 x = self.run_cfg('on', sql, setup)
-                return x.kind == cls
+                return x.kind == cls and not (cls == 'hang' and self.pg_slow(sql, setup))
             if chk in CHECK_CFG:
                 a = self.run_cfg('on', sql, setup)
                 if a.kind in ('crash', 'hang'):
                     return False
                 b = self.run_cfg(CHECK_CFG[chk], sql, setup)
                 c = compare(a, b, case['ordered'])
+                if c == 'hang' and cls == 'hang' and self.pg_slow(sql, setup):
+                    return False
                 return c == cls and self.same_codes(case, a, b)
             if chk == 'pg':
                 a = self.run_cfg('on', sql, setup)
@@ -1621,7 +1653,7 @@ class Worker:
                 return compare(a, b, case['ordered'], pg=True) == cls and self.same_codes(case, a, b)
             if chk.startswith('tlp') or chk == 'norec':
                 if cls in ('crash', 'hang'):
-                    return self.run_cfg('on', sql, setup).kind == cls
+                    return self.run_cfg('on', sql, setup).kind == cls and not (cls == 'hang' and self.pg_slow(sql, setup))
                 a = self.run_cfg('on', sql, setup)
                 b = self.run_cfg('on', sql2, setup)
                 return a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False) == 'wrong'
@@ -1860,21 +1892,24 @@ def reduce_case(w, case, q, setup, sql, sql2, deadline):
         case['ordered'] = qq.ordered()
         return w.still_fails(case, setup, qq.sql(), None)
 
-    if not (tlp or norec) and case['check'] != 'setup' and sql == q.sql():
+    # the query's tree is reduced when the failing statement is the query (not a TLP or NoREC form of it, which a
+    # crash or hang of one is)
+    tree = not (tlp or norec) and case['check'] != 'setup' and sql == q.sql()
+    if tree:
         reduce_tree(holder, test_q, t_end)
         sql = holder[0].sql()
 
     def test_setup(st):
-        if not (tlp or norec):
+        if tree:
             case['ordered'] = holder[0].ordered()
         return w.still_fails(case, st, sql, sql2)
 
     setup = reduce_setup(setup, test_setup, t_end, [sql, sql2 or ''])
-    if not (tlp or norec) and case['check'] != 'setup' and time.time() < t_end:
+    if tree and time.time() < t_end:
         reduce_tree(holder, test_q, t_end)
         sql = holder[0].sql()
         setup = reduce_setup(setup, test_setup, t_end, [sql])
-    if not (tlp or norec):
+    if tree:
         case['ordered'] = holder[0].ordered()
     return holder[0], setup, sql, sql2
 
@@ -2117,7 +2152,8 @@ def cmd_report(args):
             stats.append(json.load(f))
     tot = {}
     for s in stats:
-        for k in ('queries', 'stmts', 'seeds', 'reduced', 'skipped', 'tlp', 'norec', 'lexdb_errors', 'pg_errors'):
+        for k in ('queries', 'stmts', 'seeds', 'reduced', 'skipped', 'tlp', 'norec', 'lexdb_errors', 'pg_errors',
+                  'hang_pg_slow'):
             tot[k] = tot.get(k, 0) + s.get(k, 0)
         for k, v in s.get('fails', {}).items():
             tot.setdefault('fails', {})[k] = tot.setdefault('fails', {}).get(k, 0) + v
@@ -2125,8 +2161,9 @@ def cmd_report(args):
     print('run %s: %d workers, %.0f s, %d seeds, %d queries, %d statements, %d TLP and %d NoREC forms' % (
         args.dir, len(stats), el, tot.get('seeds', 0), tot.get('queries', 0), tot.get('stmts', 0),
         tot.get('tlp', 0), tot.get('norec', 0)))
-    print('lexdb errors (on): %d, PostgreSQL errors: %d; failures by check:class: %s' % (
-        tot.get('lexdb_errors', 0), tot.get('pg_errors', 0), json.dumps(tot.get('fails', {}), sort_keys=True)))
+    print('lexdb errors (on): %d, PostgreSQL errors: %d, timeouts not reported (PostgreSQL slow too): %d; '
+          'failures by check:class: %s' % (tot.get('lexdb_errors', 0), tot.get('pg_errors', 0), tot.get('hang_pg_slow', 0),
+                                          json.dumps(tot.get('fails', {}), sort_keys=True)))
     cases = load_cases(args.dir)
     groups = {}
     for c in cases:
@@ -2187,6 +2224,44 @@ def cmd_repro(args):
         w.stop()
         if pg:
             pg.stop()
+
+
+def cmd_recheck(args):
+    """Each reduced case of the runs (one per signature, every one of a wrong result, crash or hang) checked again
+    with --bin: whether its check still fails with its class. Prints the counts and the ones that still fail."""
+    cases = []
+    for d in args.dirs:
+        for c in load_cases(d):
+            if 'min_sql' in c:
+                c['_from'] = os.path.basename(os.path.normpath(d))
+                cases.append(c)
+    seen, todo = set(), []
+    for c in sorted(cases, key=lambda c: (SEVERITY.get(c['cls'], 5), c['id'])):
+        sig = c.get('signature', c['check'])
+        if c['cls'] in ('wrong', 'crash', 'hang') or sig not in seen:
+            todo.append(c)
+        seen.add(sig)
+    a = argparse.Namespace(bin=os.path.realpath(args.bin), port=args.port, cpus=args.cpus, checks=CHECKS_ALL,
+                           variants=args.variants, pg_port=args.pg_port, reduce_wrong=0, reduce_err=0, reduce_secs=0)
+    pg = Postgres(args.work, args.pg_port, args.cpus)
+    pg.start()
+    pg.ensure_db('fz9')
+    w = Worker(9, a, os.path.join(args.work, 'recheck'))
+    still = []
+    try:
+        for c in todo:
+            setup = Setup.from_js(c['min_setup'])
+            try:
+                f = w.still_fails(c, setup, c['min_sql'], c.get('min_sql2'))
+            except Exception as e:      # a setup the binary refuses now
+                f = 'error: %s' % e
+            if f:
+                still.append(c)
+            print('%s %s/%s %s' % ('STILL' if f else 'gone ', c['_from'], c['id'], c.get('signature', '')[:150]), flush=True)
+    finally:
+        w.stop()
+        pg.stop()
+    print('rechecked %d cases (%d signatures): %d still fail' % (len(todo), len(seen), len(still)))
 
 
 VARIANT_CODE = '''
@@ -2272,11 +2347,19 @@ def main():
             p.add_argument('case')
             p.add_argument('--work', default=os.path.expanduser('~/tpch-w/fuzz/repro'))
             p.add_argument('--pg', action='store_true', help='also run it on a PostgreSQL started in --work')
+    rc = sub.add_parser('recheck', help='check the reduced cases of runs again with another binary')
+    rc.add_argument('dirs', nargs='+')
+    rc.add_argument('--bin', required=True)
+    rc.add_argument('--port', type=int, default=55700)
+    rc.add_argument('--pg-port', type=int, default=55690)
+    rc.add_argument('--cpus', default='8-11')
+    rc.add_argument('--no-variants', dest='variants', action='store_false')
+    rc.add_argument('--work', default=os.path.expanduser('~/tpch-w/fuzz/recheck'))
     r = sub.add_parser('report')
     r.add_argument('dir')
     r.add_argument('--full', action='store_true')
     args = ap.parse_args()
-    {'build': cmd_build, 'run': cmd_run, 'report': cmd_report, 'repro': cmd_repro}[args.cmd](args)
+    {'build': cmd_build, 'run': cmd_run, 'report': cmd_report, 'repro': cmd_repro, 'recheck': cmd_recheck}[args.cmd](args)
 
 
 if __name__ == '__main__':

@@ -885,12 +885,12 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
             p.pos += 2
             if isRow(&e) {
                 // (a, b) = ANY (subquery) is IN, <> ALL NOT IN (9.94)
-                if (p.isKw("select") || p.isKw("with")) && ((op == "=" && !all) || (op == "<>" && all)) {
+                if (p.isKw("select") || p.isKw("with") || p.parenQuery()) && ((op == "=" && !all) || (op == "<>" && all)) {
                     return Ok(negate(all, try p.rowSub(&"in", &e)))
                 }
                 return Err(lexdb_base.err("0A000", "lexdb: a row before ANY or ALL is supported with = ANY (subquery) and <> ALL (subquery) only"))
             }
-            if p.isKw("select") || p.isKw("with") {
+            if p.isKw("select") || p.isKw("with") || p.parenQuery() {
                 if (op == "=" && !all) || (op == "<>" && all) {
                     let i = try p.subquery(SUB_IN)
                     return Ok(negate(all, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
@@ -951,7 +951,7 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
             let all = q.text == "all"
             p.pos += 2
             var arr = Expr.Lit(Val.Null)
-            if p.isKw("select") || p.isKw("with") {
+            if p.isKw("select") || p.isKw("with") || p.parenQuery() {
                 arr = try p.arrayOfSub()
             } else {
                 arr = try p.expr()
@@ -977,13 +977,13 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
         try p.expectKw("(")
         if isRow(&e) {
             // (a, b) IN ((1, 2), (3, 4)): row equalities ORed; IN (subquery) (9.94)
-            if p.isKw("select") || p.isKw("with") { return Ok(negate(neg, try p.rowSub(&"in", &e))) }
+            if p.isKw("select") || p.isKw("with") || p.parenQuery() { return Ok(negate(neg, try p.rowSub(&"in", &e))) }
             var any = try rowCmp(&"=", &e, &(try p.expr()))
             while p.acceptKw(",") { any = Expr.Bin("or", any, try rowCmp(&"=", &e, &(try p.expr()))) }
             try p.expectKw(")")
             return Ok(negate(neg, any))
         }
-        if p.isKw("select") || p.isKw("with") {
+        if p.isKw("select") || p.isKw("with") || p.parenQuery() {
             let i = try p.subquery(SUB_IN)
             return Ok(negate(neg, Expr.Call("#in", [Expr.Lit(Val.Int(i)), e], false)))
         }
@@ -1272,8 +1272,11 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     let savedW = replace(mut &p.wins, [])
     var pushed = 0
     if p.acceptKw("with") { pushed = try p.withList() }
-    try p.expectKw("select")
-    var sq = try p.select()
+    var sq = lexdb_sql.newStmt(S_SELECT)
+    if p.isKw("(") { sq = try p.parenSelect() } else {
+        try p.expectKw("select")
+        sq = try p.select()
+    }
     p.popCtes(pushed)
     sq.subs = replace(mut &p.subs, saved)
     sq.wins = replace(mut &p.wins, savedW)
@@ -1453,6 +1456,13 @@ fn cmpOf(op: &str, l: &Expr, r: &Expr): Result[Expr, lexdb_base.DbErr] {
 // "#2", ...: (SELECT row op (#1, #2) FROM (subquery) AS "#row"("#1", ...)),
 // NULL for no rows and an error for two; for IN, of its rows' answers the
 // best: true, else NULL, else false (none).
+// A query's number of columns, -1 with a *: a set operation's its first query's.
+fn width(s: &Stmt): int {
+    if s.setop != 0 && len(s.inner) > 0 { return width(&s.inner[0]) }
+    for it in s.items { if it.star { return -1 } }
+    return len(s.items)
+}
+
 fn (p: mut &P) rowSub(op: &str, row: &Expr): Result[Expr, lexdb_base.DbErr] {
     let xs = try rowItems(row)
     for x in xs {
@@ -1461,9 +1471,8 @@ fn (p: mut &P) rowSub(op: &str, row: &Expr): Result[Expr, lexdb_base.DbErr] {
     p.depth += 1
     let saved = replace(mut &p.subs, [])
     let inner = try p.subquery(SUB_FROM)
-    var star = false
-    for it in p.subs[inner].items { if it.star { star = true } }
-    let k = len(p.subs[inner].items)
+    let k = width(&p.subs[inner])
+    let star = k < 0
     if !star && k > len(xs) { return Err(lexdb_base.err("42601", "subquery has too many columns")) }
     if !star && k < len(xs) { return Err(lexdb_base.err("42601", "subquery has too few columns")) }
     var w = lexdb_sql.newStmt(S_SELECT)
@@ -1663,7 +1672,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         append(mut &p.seqs, CAT_MARK)
         return Ok(Expr.Call(if t.text == "user" || t.text == "current_role" { "current_user" } else { t.text.clone() }, [], false))
     }
-    if t.kind == T_IDENT && t.text == "array" && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
+    if t.kind == T_IDENT && t.text == "array" && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with" || p.parenAt(1)) {
         p.pos += 1
         return p.arrayOfSub()
     }
@@ -1724,7 +1733,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Param(n))
     }
     if t.kind == T_OP && t.text == "(" {
-        if p.isKw("select") || p.isKw("with") { return Ok(subRef("#sub", try p.subquery(SUB_SCALAR))) }
+        if p.isKw("select") || p.isKw("with") || p.parenQuery() { return Ok(subRef("#sub", try p.subquery(SUB_SCALAR))) }
         let e = try p.expr()
         if p.isKw(",") {
             // (a, b, ...): a row (9.94), for comparisons
@@ -2538,11 +2547,14 @@ fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
 // VALUES or WITH ... SELECT, in parentheses or not, with its own
 // subqueries, window calls and parameters.
 fn (p: mut &P) query(): Result[Stmt, lexdb_base.DbErr] {
-    let paren = p.acceptKw("(")
+    let pq = p.isKw("(") && p.parenQueryStart()
+    let paren = !pq && p.acceptKw("(")
     var n = 0
-    if p.acceptKw("with") { n = try p.withList() }
+    if !pq && p.acceptKw("with") { n = try p.withList() }
     var q = lexdb_sql.newStmt(S_SELECT)
-    if p.acceptKw("select") {
+    if pq {
+        q = try p.parenSelect()
+    } else if p.acceptKw("select") {
         q = try p.select()
     } else if p.acceptKw("values") {
         q = try p.valuesQuery()
@@ -3489,7 +3501,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
-    if p.isKw("(") && !p.selectNext() {
+    if p.isKw("(") && !p.parenQueryStart() {
         p.pos += 1
         append(mut &s.names, try p.name())
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
@@ -3509,12 +3521,13 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("value")
     }
     // INSERT ... SELECT: the query in inner[0], with its own subqueries
-    let paren = p.isKw("(") && p.selectNext()
+    let paren = p.isKw("(") && p.parenQueryStart()
     if paren || p.isKw("select") {
-        if paren { p.pos += 1 }
-        try p.expectKw("select")
-        var q = try p.select()
-        if paren { try p.expectKw(")") }
+        var q = lexdb_sql.newStmt(S_SELECT)
+        if paren { q = try p.parenSelect() } else {
+            p.pos += 1
+            q = try p.select()
+        }
         q.subs = replace(mut &p.subs, [])
         q.wins = replace(mut &p.wins, [])
         q.params = p.params
@@ -3651,6 +3664,78 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
         lhs = setOf(SET_INTERSECT, all, lhs, rhs)
     }
     return Ok(lhs)
+}
+
+// A query whose first operand is in parentheses, at its "(": (SELECT ...) UNION ..., or one query in parentheses
+// (PostgreSQL's select_with_parens), then ORDER BY and LIMIT of the whole. One query alone leaves its subqueries in
+// p.subs, as select() does, and takes an ORDER BY, LIMIT or OFFSET after it as its own (PostgreSQL's
+// insertSelectOptions: one of each).
+fn (p: mut &P) parenSelect(): Result[Stmt, lexdb_base.DbErr] {
+    var first = try p.setBranch()
+    if p.isKw("union") || p.isKw("intersect") || p.isKw("except") {
+        var lhs = try p.intersects(first)
+        while p.isKw("union") || p.isKw("except") {
+            var op = SET_EXCEPT
+            if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
+            let all = p.setAll()
+            let rhs = try p.intersects(try p.setBranch())
+            lhs = setOf(op, all, lhs, rhs)
+        }
+        try p.orderLimit(mut &lhs)
+        return Ok(lhs)
+    }
+    p.subs = replace(mut &first.subs, [])
+    p.wins = replace(mut &first.wins, [])
+    let o0 = replace(mut &first.order, [])
+    let l0 = replace(mut &first.limit, None)
+    let f0 = replace(mut &first.offset, None)
+    try p.orderLimit(mut &first)
+    if len(o0) > 0 {
+        if len(first.order) > 0 { return Err(lexdb_base.err("42601", "multiple ORDER BY clauses not allowed")) }
+        first.order = o0
+    }
+    if l0.isSome() {
+        if first.limit.isSome() { return Err(lexdb_base.err("42601", "multiple LIMIT clauses not allowed")) }
+        first.limit = l0
+    }
+    if f0.isSome() {
+        if first.offset.isSome() { return Err(lexdb_base.err("42601", "multiple OFFSET clauses not allowed")) }
+        first.offset = f0
+    }
+    return Ok(first)
+}
+
+// At "(": "("s, then SELECT or WITH.
+fn (p: &P) parenQueryStart(): bool {
+    var k = p.pos
+    while k < len(p.toks) && p.toks[k].kind == T_OP && p.toks[k].text == "(" { k += 1 }
+    return k > p.pos && k < len(p.toks) && p.toks[k].kind == T_IDENT && (p.toks[k].text == "select" || p.toks[k].text == "with")
+}
+
+// At "(" in an expression or FROM: a query in parentheses that is a whole subquery, or its first operand: after its
+// ")" comes ")", a set operation, ORDER BY or LIMIT. (((SELECT 1) + 1) is an expression, ((SELECT 1), 2) a list.)
+fn (p: &P) parenQuery(): bool { return p.parenAt(0) }
+
+// parenQuery at the token d after this one.
+fn (p: &P) parenAt(d: int): bool {
+    var k = p.pos + d
+    while k < len(p.toks) && p.toks[k].kind == T_OP && p.toks[k].text == "(" { k += 1 }
+    if k == p.pos + d || k >= len(p.toks) || p.toks[k].kind != T_IDENT || (p.toks[k].text != "select" && p.toks[k].text != "with") { return false }
+    var depth = 0
+    k = p.pos + d
+    while k < len(p.toks) {
+        if p.toks[k].kind == T_OP && p.toks[k].text == "(" { depth += 1 }
+        if p.toks[k].kind == T_OP && p.toks[k].text == ")" {
+            depth -= 1
+            if depth == 0 { break }
+        }
+        k += 1
+    }
+    if k + 1 >= len(p.toks) { return false }
+    let n = &p.toks[k + 1]
+    if n.kind == T_OP { return n.text == ")" }
+    return n.kind == T_IDENT && (n.text == "union" || n.text == "intersect" || n.text == "except" || n.text == "order" ||
+                                 n.text == "limit" || n.text == "offset" || n.text == "fetch")
 }
 
 // A role as GRANT and the like name it: a name, PUBLIC (""), CURRENT_USER
@@ -3818,9 +3903,12 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: view options (WITH (...)) are not supported")) }
     try p.expectKw("as")
     let start = p.peek().at
-    let t = p.next()
+    let pq = p.isKw("(") && p.parenQueryStart()
+    let t = if pq { p.peek().clone() } else { p.next() }
     var q = lexdb_sql.newStmt(S_SELECT)
-    if t.kind == T_IDENT && t.text == "select" {
+    if pq {
+        q = try p.parenSelect()
+    } else if t.kind == T_IDENT && t.text == "select" {
         q = try p.select()
     } else if t.kind == T_IDENT && t.text == "values" {
         q = try p.valuesQuery()
@@ -3951,8 +4039,11 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("values") {
         b = try p.valuesQuery()
     } else if p.acceptKw("(") {
-        try p.expectKw("select")
-        b = try p.select()
+        var n = 0
+        if p.acceptKw("with") { n = try p.withList() }
+        let r = if p.isKw("(") { p.parenSelect() } else if p.acceptKw("select") { p.select() } else { Err(near(&p.peek())) }
+        p.popCtes(n)
+        b = try r
         try p.expectKw(")")
     } else {
         try p.expectKw("select")
@@ -4776,7 +4867,7 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     if p.acceptKw("(") {
         // a subquery in FROM
-        if !p.isKw("select") && !p.isKw("with") { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
+        if !p.isKw("select") && !p.isKw("with") && !p.parenQuery() { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
         let i = try p.subquery(SUB_FROM)
         var alias = "unnamed_subquery"
         var cols: []str = []
@@ -5915,6 +6006,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         query = true
         var q: Stmt = lexdb_sql.newStmt(S_SELECT)
         if p.acceptKw("select") { q = try p.select() }
+        else if p.isKw("(") && p.parenQueryStart() { q = try p.parenSelect() }
         else if p.acceptKw("with") {
             let n = try p.withList()
             try p.expectKw("select")
@@ -6225,7 +6317,10 @@ fn cteOnce(s: mut &Stmt, uses: &[]int) {
 fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
     let t = p.peek().clone()
     if t.kind == T_EOF || (t.kind == T_OP && t.text == ";") { return Ok(lexdb_sql.newStmt(S_EMPTY)) }
-    if t.kind != T_IDENT { return Err(near(&t)) }
+    if t.kind != T_IDENT {
+        if t.kind == T_OP && t.text == "(" && p.parenQueryStart() { return p.parenSelect() }
+        return Err(near(&t))
+    }
     p.pos += 1
     match t.text {
         "select" {
@@ -6254,6 +6349,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             let n = try p.withList()
             var r: Result[Stmt, lexdb_base.DbErr] = Err(lexdb_base.err("42601", "WITH must be followed by SELECT, INSERT, UPDATE or DELETE"))
             if p.acceptKw("select") { r = p.select() }
+            else if p.isKw("(") && p.parenQueryStart() { r = p.parenSelect() }
             else if p.acceptKw("insert") { r = p.insert() }
             else if p.acceptKw("update") { r = p.update() }
             else if p.acceptKw("delete") { r = p.delete() }

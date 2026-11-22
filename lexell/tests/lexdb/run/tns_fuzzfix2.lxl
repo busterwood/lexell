@@ -1,0 +1,138 @@
+// lexdb over TNS: the fuzzer's long run (design/lexdb-fuzz.md) through the Oracle door, checked against Oracle Database
+// 23ai Free (run with LEXDB_ORACLE set to its connection string, this test prints Oracle's answers: the expect lines;
+// its tables are made and dropped). G1: a query in parentheses as a set operation's first operand, in FROM and IN. O:
+// NUMBER arithmetic past 2^31 is no error at this door (lexdb's integer checks are PostgreSQL's and SQL Server's
+// int): literals, a column, unary minus, ABS. L: COALESCE stops at the first value not NULL. Q: an integer = ALL /
+// < ANY of decimals. W7: a correlated EXISTS and IN with a filter on the key's column and an outer value. W8: MIN with a
+// HAVING. Each statement runs with unnesting on, then
+// W7's again with it off (lexdb_plan.setUnnest(0)), each with set lexdb_batch = off (the row engine) and on: the label
+// and the answer, or DIFFERENT and both.
+// expect: setup: 7 statements
+// expect: G1 a parenthesised first operand: A = 1;2
+// expect: G1 in FROM: N = 7
+// expect: G1 in IN: ID = 1;6
+// expect: O literals: V,W = 2147483648|8589934588
+// expect: O a column: V,W = 17005923000593|2147483648
+// expect: O unary minus, ABS: V,W = 2147483648|2147483648
+// expect: L COALESCE: V = 1
+// expect: L COALESCE, a NULL first: error 1476
+// expect: Q = ALL, < ANY: A,B = 0|1
+// expect: W7 EXISTS: N = 2
+// expect: W7 IN: N = 2
+// expect: W8 HAVING: M = 
+// expect: unnest off, W7 EXISTS: N = 2
+// expect: unnest off, W7 IN: N = 2
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "os"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_plan"
+
+const SETUP = "create table fo (id number(10) primary key, x number(10), b number(10))\ninsert into fo values (1, 1000, 1)\ninsert into fo values (2, 1000000, 2)\ninsert into fo values (3, 2147483647, 3)\ninsert into fo values (4, -2147483648, 1)\ninsert into fo values (5, NULL, NULL)\ninsert into fo values (6, 7, 2)"
+
+const QS = "G1 a parenthesised first operand	(select 1 a from dual) union (select 2 from dual) order by 1\nG1 in FROM	select count(*) n from ((select x from fo) union (select 5 from dual)) d\nG1 in IN	select id from fo where x in ((select 1000 from dual) union (select 7 from dual)) order by id\nO literals	select 2147483647 + 1 v, 2147483647 * 2 * 2 w from dual\nO a column	select x * 7919 v, x + 1 w from fo where id = 3\nO unary minus, ABS	select -x v, abs(x) w from fo where id = 4\nL COALESCE	select coalesce(id, 1 / (id - id)) v from fo where id = 1\nL COALESCE, a NULL first	select coalesce(x, 1 / (id - id)) v from fo where id = 5\nQ = ALL, < ANY	select case when 1 = all (select 1.5 from dual) then 1 else 0 end a, case when 1 < any (select 1.5 from dual) then 1 else 0 end b from dual\nW7 EXISTS	select count(*) n from fo q1 where exists (select 1 from fo q3 where q3.b = q1.b and q3.b <= q1.id - 2)\nW7 IN	select count(*) n from fo q1 where q1.b in (select q3.b from fo q3 where q3.b = q1.b and q3.b < q1.id)\nW8 HAVING	select min(id) m from fo having count(*) > 50"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn answer(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// local: lexdb, each statement with the row engine and with batches, unnesting on and then off; else the oracle's answers
+// (its tables dropped after)
+fn client(dsn: &str, local: bool) {
+    match oracle.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            if !local { for t in TABLES { let d = c.run(&((if strings.startsWith(&t, "v") { "drop view " } else { "drop table " }) + t), &[]) } }
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for pass in 0..2 {
+                if pass == 1 && local { lexdb_plan.setUnnest(0) }
+                for l in strings.lines(&text) {
+                    let parts = strings.split(&l, "\t")
+                    if pass == 1 && !strings.startsWith(&parts[0], "W7") { continue }
+                    let lab = if pass == 1 { "unnest off, " + parts[0] } else { parts[0].toStr() }
+                    let q = parts[1].toStr()
+                    if !local {
+                        println(lab + ": " + answer(mut &c, &q))
+                        continue
+                    }
+                    let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                    let off = answer(mut &c, &q)
+                    let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                    let on = answer(mut &c, &q)
+                    if off == on { println(lab + ": " + on) } else {
+                        println("DIFFERENT " + lab + ": " + q)
+                        println("  rows:    " + off)
+                        println("  batches: " + on)
+                    }
+                }
+            }
+            if !local { for t in TABLES { let d = c.run(&((if strings.startsWith(&t, "v") { "drop view " } else { "drop table " }) + t), &[]) } }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+const TABLES: []str = ["fo"]
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&("User Id=app;Password=app;Data Source=127.0.0.1:" + addr[10..len(addr)] + "/lexdb"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_ORACLE: the oracle, for the expect lines
+    match os.env("LEXDB_ORACLE") {
+        Some(dsn) { client(&dsn, false) }
+        None { lexdb_store.run(lexdb_disk.sim(61), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap() }
+    }
+}

@@ -452,6 +452,14 @@ pub fn eval(x: &Expr, env: &Env): Result[Val, DbErr] {
                 if name == "case else" { return eval(&args[len(args) - 1], env) }
                 return Ok(Val.Null)
             }
+            if name == "coalesce" {
+                // its arguments up to the first not NULL, the rest not evaluated (PostgreSQL's)
+                for a in args {
+                    let v = try eval(&a, env)
+                    if !lexdb_ops.isNull(&v) { return Ok(v) }
+                }
+                return Ok(Val.Null)
+            }
             if name == "#try" && len(args) == 1 {
                 // T-SQL's TRY_CAST and TRY_CONVERT: NULL for a value that does not convert
                 match eval(&args[0], env) {
@@ -568,9 +576,9 @@ fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
        lexdb_bind.isSeqFn(name) || isSessFn(name) || lexdb_bind.isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
         return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}
     }
-    var way = lexdb_bind.FN_GEN
+    var way = if name == "coalesce" { lexdb_bind.FN_LAZY } else { lexdb_bind.FN_GEN }
     var f1: lexdb_lib.Lib1 = lexdb_lib.no1
-    if n == 1 {
+    if n == 1 && way == lexdb_bind.FN_GEN {
         match lexdb_lib.entry1Of(name) {
             Some(f) {
                 f1 = f
@@ -1282,6 +1290,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             for i in 0..len(fcols) {
                 let name = if i < len(f.cols) { f.cols[i].clone() } else { fcols[i].name.clone() }
                 var col = lexdb_sql.colDef(&name, outType(&fcols[i]), false)
+                // a char(n) column read as it is: of length n (W10's GROUP BY and DISTINCT compare it exactly)
+                if col.typ.oid == lexdb_sql.OID_BPCHAR && sp.sel.setop == 0 && i < len(sp.sel.exprs) { col.typ.len = lexdb_bind.bpLen(&sp.sel.exprs[i], &sp.sel.q.cols) }
                 if i >= len(f.cols) || (f.cols[i] == "dummy" && sp.sel.srf == "#values:01") { col.spell = if i >= len(f.cols) { fcols[i].spell.clone() } else { "DUMMY" } }
                 col.coll = fcols[i].coll.clone()
                 append(mut &t.unshare().cols, col)
@@ -1354,6 +1364,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i].clone() } else if i < len(t.cols) { t.cols[i].name.clone() } else { sp.sel.outs[i].name.clone() }
                     var col = lexdb_sql.colDef(&name, outType(&sp.sel.outs[i]), false)
+                    if col.typ.oid == lexdb_sql.OID_BPCHAR && sp.sel.setop == 0 && i < len(sp.sel.exprs) { col.typ.len = lexdb_bind.bpLen(&sp.sel.exprs[i], &sp.sel.q.cols) }
                     col.spell = if i < len(f.cols) { (if f.cols[i] == "dummy" && sp.sel.srf == "#values:01" { "DUMMY" } else { "" }) } else if i < len(t.cols) { t.cols[i].spell.clone() } else { sp.sel.outs[i].spell.clone() }
                     col.coll = sp.sel.outs[i].coll.clone()
                     append(mut &vt.cols, col)
@@ -6805,7 +6816,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
         }
         try lexdb_gen.checkWrite(&t.cols, i, lexdb_sql.isDefault(&set.expr), s.mdialect, false)
         append(mut &up.targets, i)
-        append(mut &up.sets, lexdb_bind.bpAssign(try lexdb_bind.resolve(&set.expr, &up.cols, len(up.cols), mut &sc.names), &t.cols[i].typ, &up.cols, &typing()))
+        append(mut &up.sets, try lexdb_bind.resolveAssign(&set.expr, &t.cols[i].typ, &up.cols, len(up.cols), mut &sc.names))
     }
     match s.where {
         Some(w) { up.cond = Some(try lexdb_bind.resolve(&w, &up.cols, len(up.cols), mut &sc.names)) }
@@ -6891,7 +6902,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + lexdb_sql.baseName(&q.levels[0].t.name) + "\" does not exist")))
         }
         append(mut &targets, i)
-        append(mut &sets, lexdb_bind.bpAssign(try lexdb_bind.resolve(&set.expr, &q.cols, len(q.cols), mut &sc.names), &q.levels[0].t.cols[i].typ, &q.cols, &typing()))
+        append(mut &sets, try lexdb_bind.resolveAssign(&set.expr, &q.levels[0].t.cols[i].typ, &q.cols, len(q.cols), mut &sc.names))
     }
     var ret = try retOf(s, &q, mut &sc)
     // the logical plan (read by nothing yet): the FROM and WHERE part its source
@@ -9732,7 +9743,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for g in s.group {
         let r = try lexdb_bind.resolveGroup(&g, &q.cols, &outs, &exprs, mut &sc.names)
         if lexdb_bind.hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
-        append(mut &groupKinds, lexdb_bind.exprKind(&r, &q.cols, &sc.names))
+        append(mut &groupKinds, lexdb_bind.groupKind(&r, &q.cols, &sc.names))
         append(mut &groupBy, r)
     }
     // GROUP BY as resolved: the plan's Agg's keys (bg), moved there when the
@@ -9745,11 +9756,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         // an enum's order is its labels' (9.90)
         let r = try lexdb_bind.resolveOrder(&o.expr, &q.cols, &outs, mut &sc.names)
         // its collation's (L2): an output column's, or the expression's
+        // (a char of no one length, a COALESCE of a char(3) and 'z': without its trailing blanks, lexdb_bind.groupKind)
         var ok = outRefKind(&r, &outs)
         match r {
-            Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) >= 0 { ok = lexdb_bind.exprKind(&r, &q.cols, &sc.names) } }
-            Expr.Lit(_) {}
-            else { ok = lexdb_bind.exprKind(&r, &q.cols, &sc.names) }
+            Expr.Col(n, sl) {
+                if lexdb_bind.colSlot(&q.cols, &n, sl) >= 0 { ok = lexdb_bind.groupKind(&r, &q.cols, &sc.names) }
+                else if ok == lexdb_sql.COLL_EXACT { for i in 0..len(outs) { if outs[i].name == n && i < len(exprs) { ok = lexdb_bind.groupKind(&exprs[i], &q.cols, &sc.names) } } }
+            }
+            Expr.Lit(v) { match v { Val.Int(n) { if ok == lexdb_sql.COLL_EXACT && n >= 1 && n <= len(exprs) { ok = lexdb_bind.groupKind(&exprs[n - 1], &q.cols, &sc.names) } } else {} } }
+            else { ok = lexdb_bind.groupKind(&r, &q.cols, &sc.names) }
         }
         append(mut &ordKinds, ok)
         match try enumOf(st, txn, &r, &q.cols) {
@@ -9910,7 +9925,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         var mm = -1
         if !aggQ {
             dir = lexdb_plan.orderCols(&q, &order, &s.order, &exprs, &outs, mut &cols)
-        } else if len(groupBy) == 0 {
+        } else if len(groupBy) == 0 && s.having.isNone() {
+            // (a HAVING's aggregates are over every row: count(*), bool_and)
             var d = 0
             mm = lexdb_plan.minMax(&q, &exprs, mut &d)
             if mm >= 0 {
@@ -9976,7 +9992,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for x in exprs { append(mut &rx, try collectAggs(&x, mut &specs)) }
         rewriteList(mut &exprs, rx, mut &bx, mut &xRewritten)
         // min, max and DISTINCT compare under their argument's collation (L2)
-        for i in 0..len(specs) { if len(specs[i].args) > 0 { specs[i].kind = lexdb_bind.exprKind(&specs[i].args[0], &q.cols, &sc.names) } }
+        for i in 0..len(specs) { if len(specs[i].args) > 0 { specs[i].kind = lexdb_bind.groupKind(&specs[i].args[0], &q.cols, &sc.names) } }
         var ro: []Expr = []
         for x in order { append(mut &ro, try collectAggs(&x, mut &specs)) }
         rewriteList(mut &order, ro, mut &bo, mut &oRewritten)
@@ -10159,7 +10175,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   first: first, limit: limit, offset: offset, having: having, specs: specs, distinct: s.distinct, desc: desc, nullsFirst: nullsFirst,
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf.clone(), ordin: s.ordin, wins: wins, nAggs: nAggs,
                   locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: lexdb_plan.copySets(&s.gsets), gx: gx, gord: gord, gh: gh,
-                  groupKinds: groupKinds, ordKinds: ordKinds, outKinds: outKindsOf(&outs),
+                  groupKinds: groupKinds, ordKinds: ordKinds, outKinds: lexdb_bind.distKinds(&outs),
                   topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: [], ox: [], oxParam: false, lp: lp, pipe: None})
 }
 
@@ -10306,7 +10322,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
 // 705 for an untyped literal ('x', NULL) in a plain select list, else its
 // planned type.
 fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
-    if s.setop == 0 && i < len(s.items) {
+    // (an untyped value of a side with DISTINCT or GROUP BY is a text there, as PostgreSQL resolves it to sort or
+    // compare it: (SELECT DISTINCT 'a') UNION ALL (SELECT c) of a char c is a text)
+    if s.setop == 0 && !s.distinct && len(s.distinctOn) == 0 && len(s.group) == 0 && i < len(s.items) {
         var star = false
         for it in s.items { if it.star { star = true } }
         if !star {
@@ -10375,6 +10393,7 @@ fn valsKeyIn(vs: &[]Val, kinds: &[]int): str {
 }
 
 // The collation kinds of a query's output columns.
+
 fn outKindsOf(outs: &[]OutCol): []int {
     var out: []int = []
     for o in outs { append(mut &out, if lexdb_bind.isTextOid(o.oid) { lexdb_sql.collKind(&o.coll) } else { lexdb_sql.COLL_EXACT }) }
@@ -10782,7 +10801,10 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         }
     }
     let rs0max = rs.bud.maxHeld
-    let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct) && !windowed
+    // a set-returning function in the select list makes its rows before DISTINCT, ORDER BY and LIMIT see them
+    // (PostgreSQL's ProjectSet): those wait for expandSrfs
+    let srf = lexdb_plan.hasSrfCall(&sel.exprs)
+    let early = !sel.aggQ && !sorting && limit >= 0 && !(late && sel.distinct) && !windowed && !srf
     let stopAt = if offset > 0 { limit + offset } else { limit }
     let noAggs: []Val = []
     var seen: Map[str, int] = newMap()      // SELECT DISTINCT
@@ -10884,7 +10906,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 }
                 var out: []Val = []
                 for x in sel.gx[si] { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
-                if sel.distinct {
+                if sel.distinct && !srf {
                     let k = valsKey(&out)
                     if seen.get(&k).isSome() { continue }
                     seen.put(k, 1)
@@ -10905,7 +10927,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
             var out: []Val = []
             for x in sel.exprs { append(mut &out, try evalX(st, txn, q, &x, &env, rs)) }
-            if sel.distinct {
+            if sel.distinct && !srf {
                 let k = valsKeyIn(&out, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
@@ -10973,7 +10995,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     None { append(mut &vals, try evalX(st, txn, q, &sel.exprs[xi], &env, rs)) }
                 }
             }
-            if sel.distinct {
+            if sel.distinct && !srf {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
@@ -10986,7 +11008,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
     } else {
         // ORDER BY with LIMIT: only the first limit + offset rows are kept
         // (top-N); a row that sorts after the last of them is dropped
-        let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies { limit + max(offset, 0) } else { -1 }
+        let topK = if sorting && limit >= 0 && !sel.distinct && sel.donKey == 0 && !sel.withTies && !srf { limit + max(offset, 0) } else { -1 }
         var bar: []Val = []                 // the last kept row's sort values, once cut
         var barSet = false
         let oc = outC(sel, params, seqEnv(st, txn))
@@ -11004,7 +11026,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     None { append(mut &vals, try eval(&sel.exprs[xi], &env)) }
                 }
             }
-            if sel.distinct {
+            if sel.distinct && !srf {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { return Ok(true) }
                 seen.put(k, 1)
@@ -11058,7 +11080,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                     }
                 }
             }
-            if sel.distinct {
+            if sel.distinct && !srf {
                 let k = valsKeyIn(&vals, &sel.outKinds)
                 if seen.get(&k).isSome() { continue }
                 seen.put(k, 1)
@@ -11070,7 +11092,25 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         }
     }
     try rs.bud.hold(held)
-    if lexdb_plan.hasSrfCall(&sel.exprs) { try expandSrfs(mut &outRows, &sel.outs) }
+    if srf {
+        try expandSrfs(mut &outRows, &sel.outs)
+        // ORDER BY an output (a position, a name, the same expression) by the value made; DISTINCT over the rows made
+        if sorting {
+            var at: []int = []
+            for o in sel.order { append(mut &at, lexdb_plan.orderOutAt(sel, o, &q.cols)) }
+            for r in 0..len(outRows) { for oi in 0..len(at) { if at[oi] >= 0 && oi < len(outRows[r].ord) { outRows[r].ord[oi] = ordVal(sel, oi, outRows[r].vals[at[oi]].clone()) } } }
+        }
+        if sel.distinct {
+            var kept: []OutRow = []
+            for r in 0..len(outRows) {
+                let k = valsKeyIn(&outRows[r].vals, &sel.outKinds)
+                if seen.get(&k).isSome() { continue }
+                seen.put(k, 1)
+                append(mut &kept, replace(mut &outRows[r], OutRow{vals: [], ord: []}))
+            }
+            outRows = kept
+        }
+    }
     // (rows assigned in their order are in it already)
     if sorting && len(sel.feedback) == 0 { sortOutRows(sel, mut &outRows) }
     if sorting && sel.donKey > 0 {
@@ -16754,6 +16794,7 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
     }
     return Ok(Val.Reg(o, relShown(&q, o).unwrapOr(name.toStr())))
 }
+
 
 // Each row with set-returning values made into as many rows as the longest
 // has values (the others NULL past their end), as PostgreSQL 10 on does;
