@@ -1,0 +1,106 @@
+// Recursion in the doors (design/lexdb-dialect-gaps.md, "Recursion in the doors"), through the PostgreSQL door, each
+// statement against PostgreSQL 18's answer (lexell/tests/lexdb/check_pg.py checks them: no difference), with
+// SET lexdb_batch = off and on (in a transaction rolled back each time): WITH RECURSIVE over a tree (several anchors,
+// UNION's dedup, an empty anchor, NULL keys, a graph), a recursive reference in a derived table (taken, as PostgreSQL)
+// and in a subquery or twice (42P19), deep recursion; SEARCH DEPTH FIRST and BREADTH FIRST BY ... SET (the ordering
+// column a record[] or record, as PostgreSQL writes them, ordered as PostgreSQL orders them; one and two columns, text
+// that needs quotes), CYCLE ... SET ... [TO ... DEFAULT ...] USING (a boolean mark by default, integers and texts, the
+// path column, NULLs never equal, a row its own child, SELECT *, WHERE NOT c, with SEARCH), their errors (42702, 42601,
+// 42701, 22P02, not recursive), recursion under a join, an aggregate and ORDER BY.
+// expect: basic tree: 1|ann|0;2|bob|1;3|cid|1;4|dan|2;5|eve|2;6|fay|2;7|gus|0;8|hal|1;9|ivy|3;10|jon|4;12|lou|0, same: true
+// expect: two anchors: 2|0;3|0;4|1;5|1;6|1;9|2;10|3, same: true
+// expect: union dedup: 1;2;3, same: true
+// expect: empty anchor: , same: true
+// expect: null keys: NULL|1|0;1|2|1;2|3|2;3|1|3;3|4|3;1|2|4;4|NULL|4;2|3|5;3|1|6;3|4|6, same: true
+// expect: derived table: 1;2;3, same: true
+// expect: subquery ref: ERROR 42P19, same: true
+// expect: two refs: ERROR 42P19, same: true
+// expect: deep: 1000|1000, same: true
+// expect: search depth: 1|0|{(1)};2|1|{(1),(2)};4|2|{(1),(2),(4)};9|3|{(1),(2),(4),(9)};10|4|{(1),(2),(4),(9),(10)};6|2|{(1),(2),(6)};3|1|{(1),(3)};5|2|{(1),(3),(5)};7|0|{(7)};8|1|{(7),(8)};12|0|{(12)}, same: true
+// expect: search breadth: 1|0|(0,1);7|0|(0,7);12|0|(0,12);2|1|(1,2);3|1|(1,3);8|1|(1,8);4|2|(2,4);5|2|(2,5);6|2|(2,6);9|3|(3,9);10|4|(4,10), same: true
+// expect: search two columns: 1|{"(ann,1)"};2|{"(ann,1)","(bob,2)"};4|{"(ann,1)","(bob,2)","(dan,4)"};9|{"(ann,1)","(bob,2)","(dan,4)","(ivy,9)"};10|{"(ann,1)","(bob,2)","(dan,4)","(ivy,9)","(jon,10)"};6|{"(ann,1)","(bob,2)","(fay,6)"};3|{"(ann,1)","(cid,3)"};5|{"(ann,1)","(cid,3)","(eve,5)"};7|{"(gus,7)"};8|{"(gus,7)","(hal,8)"};12|{"(lou,12)"}, same: true
+// expect: search text: 1|{(ann)};2|{(ann),"(\"bob x\")"};4|{(ann),"(\"bob x\")","(\"dan x\")"};9|{(ann),"(\"bob x\")","(\"dan x\")","(\"ivy x\")"};10|{(ann),"(\"bob x\")","(\"dan x\")","(\"ivy x\")","(\"jon x\")"};6|{(ann),"(\"bob x\")","(\"fay x\")"};3|{(ann),"(\"cid x\")"};5|{(ann),"(\"cid x\")","(\"eve x\")"}, same: true
+// expect: search order desc: 12;8;7;5;3;6;10;9;4;2;1, same: true
+// expect: search type: record[], same: true
+// expect: breadth type: record, same: true
+// expect: cycle: 1|2|f|{(1)};2|3|f|{(1),(2)};3|1|f|{(1),(2),(3)};3|4|f|{(1),(2),(3)};1|2|t|{(1),(2),(3),(1)};4|NULL|f|{(1),(2),(3),(4)}, same: true
+// expect: cycle two columns: 1|2|N|{"(1,2)"};2|3|N|{"(1,2)","(2,3)"};3|1|N|{"(1,2)","(2,3)","(3,1)"};1|2|Y|{"(1,2)","(2,3)","(3,1)","(1,2)"};3|4|N|{"(1,2)","(2,3)","(3,4)"};4|NULL|N|{"(1,2)","(2,3)","(3,4)","(4,)"}, same: true
+// expect: cycle integers: 1|2|0;2|3|0;3|1|0;3|4|0;1|2|1;4|NULL|0, same: true
+// expect: cycle null: NULL|1|f|{()};1|2|f|{(),(1)};2|3|f|{(),(1),(2)};3|1|f|{(),(1),(2),(3)};3|4|f|{(),(1),(2),(3)};1|2|t|{(),(1),(2),(3),(1)};4|NULL|f|{(),(1),(2),(3),(4)}, same: true
+// expect: cycle self: 5|5|f|{(5)};5|5|t|{(5),(5)}, same: true
+// expect: cycle filter: 1|2;2|3;3|1;3|4;4|NULL, same: true
+// expect: cycle star: 1|2|f|{(2)};2|3|f|{(2),(3)};3|1|f|{(2),(3),(1)};1|2|t|{(2),(3),(1),(2)};3|4|f|{(2),(3),(4)};4|NULL|f|{(2),(3),(4),()}, same: true
+// expect: search and cycle: 1|2|(0,1)|f|{(1)};2|3|(1,2)|f|{(1),(2)};3|1|(2,3)|f|{(1),(2),(3)};3|4|(2,3)|f|{(1),(2),(3)};1|2|(3,1)|t|{(1),(2),(3),(1)};4|NULL|(3,4)|f|{(1),(2),(3),(4)}, same: true
+// expect: no column list: 1|2|f;2|3|f;3|1|f;3|4|f;1|2|t;4|NULL|f, same: true
+// expect: search set taken: ERROR 42702, same: true
+// expect: search unknown column: ERROR 42601, same: true
+// expect: search twice: ERROR 42701, same: true
+// expect: same mark: ERROR 42601, same: true
+// expect: same path: ERROR 42601, same: true
+// expect: not recursive: ERROR 42601, same: true
+// expect: mark types: ERROR 22P02, same: true
+// expect: no using: ERROR 42601, same: true
+// expect: big search: 2|0;6|1;18|2;54|3;162|4;486|5;1458|6;1459|6;1460|6;487|5;1461|6;1462|6, same: true
+// expect: big count: 1907|7|3007369, same: true
+// expect: under join: dan|2;eve|2;fay|2;ivy|3;jon|4, same: true
+// expect: aggregate: 0|3;1|3;2|3;3|1;4|1, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table emp (id int primary key, boss int, name text)\ninsert into emp values (1, null, 'ann'), (2, 1, 'bob'), (3, 1, 'cid'), (4, 2, 'dan'), (5, 3, 'eve'), (6, 2, 'fay'), (7, null, 'gus'), (8, 7, 'hal'), (9, 4, 'ivy'), (10, 9, 'jon'), (11, 99, 'kim'), (12, null, 'lou')\ncreate table g (a int, b int)\ninsert into g values (1, 2), (2, 3), (3, 1), (3, 4), (null, 1), (4, null), (5, 5)\ncreate table big (id int primary key, p int)\ninsert into big select n, case when n = 1 then null else n / 3 end from generate_series(1, 3000) n"
+
+const QS = "basic tree	with recursive r as (select id, name, 0 as lvl from emp where boss is null union all select e.id, e.name, r.lvl + 1 from emp e join r on e.boss = r.id) select id, name, lvl from r order by id\ntwo anchors	with recursive r(id, lvl) as (select id, 0 from emp where id = 2 union all select id, 0 from emp where id = 3 union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r order by id\nunion dedup	with recursive r(n) as (select 1 union select n % 3 + 1 from r) select n from r order by n\nempty anchor	with recursive r as (select id, 0 as lvl from emp where id > 100 union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r\nnull keys	with recursive r(a, b, d) as (select a, b, 0 from g where a is null union all select g.a, g.b, r.d + 1 from g join r on g.a = r.b where r.d < 6) select a, b, d from r order by d, a\nderived table	with recursive r(n) as (select 1 union all select n + 1 from (select n from r) d where n < 3) select n from r order by n\nsubquery ref	with recursive r(n) as (select 1 union all select n + 1 from r where n < 3 and n in (select n from r)) select n from r\ntwo refs	with recursive r(n) as (select 1 union all select a.n + 1 from r a join r b on a.n = b.n where a.n < 3) select n from r\ndeep	with recursive r(n) as (select 1 union all select n + 1 from r where n < 1000) select count(*), max(n) from r\nsearch depth	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id set o select id, lvl, o from r order by o\nsearch breadth	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search breadth first by id set o select id, lvl, o from r order by o\nsearch two columns	with recursive r(id, name) as (select id, name from emp where boss is null union all select e.id, e.name from emp e join r on e.boss = r.id) search depth first by name, id set o select id, o from r order by o\nsearch text	with recursive r(id, name) as (select id, name from emp where id = 1 union all select e.id, e.name || ' x' from emp e join r on e.boss = r.id) search depth first by name set o select id, o from r order by o\nsearch order desc	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id set o select id from r order by o desc\nsearch type	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id set o select pg_typeof(o) from r limit 1\nbreadth type	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search breadth first by id set o select pg_typeof(o) from r limit 1\ncycle	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c using pth select a, b, c, pth from r order by pth\ncycle two columns	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a, b set c to 'Y' default 'N' using pth select a, b, c, pth from r order by pth\ncycle integers	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 1 default 0 using pth select a, b, c from r order by pth\ncycle null	with recursive r(a, b) as (select a, b from g where a is null union all select g.a, g.b from g join r on g.a = r.b) cycle a set c using pth select a, b, c, pth from r order by pth\ncycle self	with recursive r(a, b) as (select a, b from g where a = 5 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c using pth select a, b, c, pth from r order by pth\ncycle filter	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c using pth select a, b from r where not c order by a, b\ncycle star	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle b set c using p select * from r order by p\nsearch and cycle	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) search breadth first by a set o cycle a set c using p select * from r order by o\nno column list	with recursive r as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c using p select a, b, c from r order by p\nsearch set taken	with recursive r(id, l) as (select id, 0 from emp where boss is null union all select e.id, r.l + 1 from emp e join r on e.boss = r.id) search depth first by id set id select * from r\nsearch unknown column	with recursive r(id, l) as (select id, 0 from emp where boss is null union all select e.id, r.l + 1 from emp e join r on e.boss = r.id) search depth first by x set o select * from r\nsearch twice	with recursive r(id, l) as (select id, 0 from emp where boss is null union all select e.id, r.l + 1 from emp e join r on e.boss = r.id) search depth first by id, id set o select * from r\nsame mark	with recursive r(id, l) as (select id, 0 from emp where boss is null union all select e.id, r.l + 1 from emp e join r on e.boss = r.id) search depth first by id set o cycle id set o using p select * from r\nsame path	with recursive r(id, l) as (select id, 0 from emp where boss is null union all select e.id, r.l + 1 from emp e join r on e.boss = r.id) search depth first by id set o cycle id set c using o select * from r\nnot recursive	with r(id, l) as (select id, 0 from emp) search depth first by id set o select * from r\nmark types	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 1 default 'N' using pth select * from r\nno using	with recursive r(a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c select * from r\nbig search	with recursive r(id, lvl) as (select id, 0 from big where id = 2 union all select big.id, r.lvl + 1 from big join r on big.p = r.id) search depth first by id set o select id, lvl from r order by o limit 12\nbig count	with recursive r(id, lvl) as (select id, 0 from big where p is null union all select big.id, r.lvl + 1 from big join r on big.p = r.id) select count(*), max(lvl), sum(id) from r\nunder join	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select e.name, r.lvl from r join emp e on e.id = r.id where r.lvl >= 2 order by e.name\naggregate	with recursive r(id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select lvl, count(*) from r group by lvl order by lvl"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for l in strings.lines(&qs) {
+        let parts = strings.split(&l, "\t")
+        two(mut &s, &parts[0], &parts[1])
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(61), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

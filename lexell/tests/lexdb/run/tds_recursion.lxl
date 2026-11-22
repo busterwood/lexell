@@ -1,0 +1,257 @@
+// lexdb over TDS: recursion in the T-SQL door (design/lexdb-dialect-gaps.md, "Recursion in the doors"), checked against
+// SQL Server 2022 (run with LEXDB_MSSQL set to a connection string of an empty database, this test prints SQL Server's
+// answers: the expect lines): a CTE that names itself is recursive, its anchors (several, with UNION and EXCEPT among
+// them) then UNION ALL and its recursive members (several), the rows in SQL Server's order (its stack spool: the last row
+// made is expanded next) where no ORDER BY gives one; an empty anchor, NULL keys, a graph with cycles; MAXRECURSION (100
+// by default, OPTION (MAXRECURSION n), 0 none, 32767 at most: 310, 1042, 102) and 530 with the rows SQL Server sends
+// before it ("@stream ": the rows as a client streams them, then the error; with ORDER BY or an aggregate none, the columns
+// only; TOP n stops first); the other OPTION hints read; the errors 246, 247, 252, 253, 460, 461, 462, 465, 467, 240,
+// 8158, 8159, 239; recursion under a join, GROUP BY, a CTE read twice, UNION ALL after; a recursive reference in a
+// derived table; INSERT, UPDATE, DELETE and MERGE fed by a recursive CTE ("W ": in a transaction rolled back, then
+// the check), and an INSERT stopped by 530. Against lexdb each batch runs with SET lexdb_batch = off and on: "same" and
+// the answer, or DIFFERENT and both.
+// expect: same: id,name,lvl: 1|'ann'|0;2|'bob'|1;3|'cid'|1;4|'dan'|2;5|'eve'|2;6|'fay'|2;7|'gus'|0;8|'hal'|1;9|'ivy'|3;10|'jon'|4;12|'lou'|0
+// expect: same: id,lvl: 1|0;7|0;12|0;8|1;2|1;3|1;5|2;4|2;6|2;9|3;10|4
+// expect: same: id,lvl: 1|0;7|0;12|0;8|1;2|1;3|1;5|2;4|2;6|2;9|3;10|4
+// expect: same: id,lvl: 2|0;3|0;5|1;4|1;6|1;9|2;10|3
+// expect: same: n: 1;2;3;2;3
+// expect: same: n: 1;2;3
+// expect: same: n,k: 1|'a';2|'b';11|'c';3|'b';12|'c'
+// expect: same: n,k: 1|'a';2|'b';3|'b';11|'c';12|'c'
+// expect: same: id,lvl: 
+// expect: same: id,boss: 11|99
+// expect: same: id,boss: 10|9;9|4;4|2;2|1;1|NULL
+// expect: same: a,b,d: NULL|1|0;1|2|1;2|3|2;3|1|3;3|4|3;1|2|4;4|NULL|4;2|3|5;3|1|6;3|4|6
+// expect: same: error 530
+// expect: same: rows: 1|2|0;2|3|1;3|1|2;3|4|2;4|NULL|3;1|2|3;2|3|4;3|1|5;3|4|5;error 530
+// expect: same: rows: 1|0;2|1;3|2;1|3;2|4;3|5;error 530
+// expect: same: rows: error 530
+// expect: same: rows: error 530
+// expect: same: rows: 1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26;27;28;29;30;31;32;33;34;35;36;37;38;39;40;41;42;43;44;45;46;47;48;49;50;51;52;53;54;55;56;57;58;59;60;61;62;63;64;65;66;67;68;69;70;71;72;73;74;75;76;77;78;79;80;81;82;83;84;85;86;87;88;89;90;91;92;93;94;95;96;97;98;99;100;101;error 530
+// expect: same: m: 101
+// expect: same: error 530
+// expect: same: c,m: 3000|3000
+// expect: same: c,m: 32768|32768
+// expect: same: rows: error 530
+// expect: same: n: 1;2;3;4;5
+// expect: same: rows: 1;2;3;error 530
+// expect: same: error 310
+// expect: same: error 1042
+// expect: same: error 102
+// expect: same: error 102
+// expect: same: n: 1;2;3
+// expect: same: id: 1;2
+// expect: same: error 252
+// expect: same: error 252
+// expect: same: error 246
+// expect: same: error 247
+// expect: same: error 253
+// expect: same: error 460
+// expect: same: error 461
+// expect: same: error 462
+// expect: same: error 462
+// expect: same: error 467
+// expect: same: error 467
+// expect: same: error 467
+// expect: same: error 465
+// expect: same: n: 1;2;3
+// expect: same: n: 1;2;3
+// expect: same: error 240
+// expect: same: n: 1;2;3
+// expect: same: n,s: 1|'a';2|'aa';3|'aaa'
+// expect: same: error 240
+// expect: same: n,s: 1|'a';2|'ab';3|'abb'
+// expect: same: n,s: 1|NULL;2|1;3|2
+// expect: same: error 8159
+// expect: same: error 8158
+// expect: same: error 239
+// expect: same: id,path: 1|'ann';2|'ann/bob';4|'ann/bob/dan';9|'ann/bob/dan/ivy';10|'ann/bob/dan/ivy/jon';6|'ann/bob/fay';3|'ann/cid';5|'ann/cid/eve';7|'gus';8|'gus/hal';12|'lou'
+// expect: same: lvl,n: 0|3;1|3;2|3;3|1;4|1
+// expect: same: name,lvl: 'dan'|2;'eve'|2;'fay'|2;'ivy'|3;'jon'|4
+// expect: same: x,y: 1|1;1|2;1|3;2|1;2|2;2|3;3|1;3|2;3|3
+// expect: same: n: 1;2;3;99
+// expect: same: id,lvl: 1|0;2|1;4|2;6|2;7|0;8|1;9|3;10|4;12|0
+// expect: same: n,d,s: 1907|7|3007369
+// expect: same: id,lvl: 2|0;6|1;7|1;8|1;24|2;25|2;26|2;78|3;79|3;80|3;240|4;241|4
+// expect: same: id,lvl: 2999|0
+// expect: same: n: 1;2;3
+// expect: same: n,k: 1|'x';2|'x';3|'x'
+// expect: same: (11) // n,s: 11|16
+// expect: same: (5) // id,name: 2|'xbob';4|'xdan';6|'xfay';9|'xivy';10|'xjon'
+// expect: same: (2) // n: 10
+// expect: same: (11) // n,s: 11|160
+// expect: same: error 530 // n: 0
+// expect: same: (200) // n: 200
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE emp (id int PRIMARY KEY, boss int NULL, name varchar(10))\nINSERT INTO emp VALUES (1, NULL, 'ann'), (2, 1, 'bob'), (3, 1, 'cid'), (4, 2, 'dan'), (5, 3, 'eve'), (6, 2, 'fay'), (7, NULL, 'gus'), (8, 7, 'hal'), (9, 4, 'ivy'), (10, 9, 'jon'), (11, 99, 'kim'), (12, NULL, 'lou')\nCREATE TABLE g (a int NULL, b int NULL)\nINSERT INTO g VALUES (1, 2), (2, 3), (3, 1), (3, 4), (NULL, 1), (4, NULL), (5, 5)\nCREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nCREATE TABLE big (id int PRIMARY KEY, p int NULL)\nINSERT INTO big SELECT n, CASE WHEN n = 1 THEN NULL ELSE n / 3 END FROM (SELECT p.i + q.i * 10 + r.i * 100 + s.i * 1000 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r CROSS JOIN dg s) z WHERE n <= 3000\nCREATE TABLE tgt (id int PRIMARY KEY, lvl int)"
+
+const QS = "WITH r AS (SELECT id, name, 0 AS lvl FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, e.name, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT id, name, lvl FROM r ORDER BY id\nWITH r AS (SELECT id, 0 AS lvl FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT id, lvl FROM r\nWITH r AS (SELECT id, 0 AS lvl FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM r JOIN emp e ON e.boss = r.id) SELECT id, lvl FROM r\nWITH r (id, lvl) AS (SELECT id, 0 FROM emp WHERE id = 2 UNION ALL SELECT id, 0 FROM emp WHERE id = 3 UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT id, lvl FROM r\nWITH r (n) AS (SELECT 1 UNION SELECT 2 UNION SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 EXCEPT SELECT 2 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n, k) AS (SELECT 1, 'a' UNION ALL SELECT n + 1, 'b' FROM r WHERE n < 3 UNION ALL SELECT n + 10, 'c' FROM r WHERE n < 3) SELECT n, k FROM r\nWITH r (n, k) AS (SELECT 1, 'a' UNION ALL SELECT n + 1, 'b' FROM r WHERE n < 3 UNION ALL SELECT n + 10, 'c' FROM r WHERE n < 3) SELECT n, k FROM r ORDER BY n\nWITH r AS (SELECT id, 0 AS lvl FROM emp WHERE id > 100 UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT id, lvl FROM r\nWITH r AS (SELECT id, boss FROM emp WHERE id = 11 UNION ALL SELECT e.id, e.boss FROM emp e JOIN r ON e.id = r.boss) SELECT id, boss FROM r\nWITH r AS (SELECT id, boss FROM emp WHERE id = 10 UNION ALL SELECT e.id, e.boss FROM emp e JOIN r ON e.id = r.boss) SELECT id, boss FROM r\nWITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a IS NULL UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b WHERE r.d < 6) SELECT a, b, d FROM r ORDER BY d, a\nWITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b) SELECT a, b, d FROM r OPTION (MAXRECURSION 5)\n@stream WITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b) SELECT a, b, d FROM r OPTION (MAXRECURSION 5)\n@stream WITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b) SELECT a, d FROM r WHERE b <> 1 OPTION (MAXRECURSION 5)\n@stream WITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b) SELECT a, b, d FROM r ORDER BY d OPTION (MAXRECURSION 5)\n@stream WITH r (a, b, d) AS (SELECT a, b, 0 FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b, r.d + 1 FROM g JOIN r ON g.a = r.b) SELECT COUNT(*) AS n FROM r OPTION (MAXRECURSION 5)\n@stream WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 200) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 101) SELECT MAX(n) AS m FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 102) SELECT MAX(n) AS m FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3000) SELECT COUNT(*) AS c, MAX(n) AS m FROM r OPTION (MAXRECURSION 0)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 32768) SELECT COUNT(*) AS c, MAX(n) AS m FROM r OPTION (MAXRECURSION 32767)\n@stream WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 32769) SELECT COUNT(*) AS c FROM r OPTION (MAXRECURSION 32767)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT TOP 5 n FROM r\n@stream WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT TOP 5 n FROM r OPTION (MAXRECURSION 2)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r OPTION (MAXRECURSION 32768)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r OPTION (MAXRECURSION 5, MAXRECURSION 6)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r OPTION (MAXRECURSION -1)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r OPTION (FOO)\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r OPTION (MAXDOP 1, RECOMPILE, HASH JOIN, OPTIMIZE FOR UNKNOWN, MAXRECURSION 10)\nSELECT id FROM emp WHERE id < 3 ORDER BY id OPTION (MAXRECURSION 2, LOOP JOIN)\nWITH r (n) AS (SELECT 1 UNION SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT n FROM r) SELECT n FROM r\nWITH r (n) AS (SELECT n + 1 FROM r WHERE n < 3 UNION ALL SELECT 1) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 UNION ALL SELECT 7) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT a.n + 1 FROM r a JOIN r b ON a.n = b.n WHERE a.n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT DISTINCT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT TOP 1 n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT r.n + 1 FROM r LEFT JOIN emp ON emp.id = r.n WHERE r.n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT r.n + 1 FROM emp RIGHT JOIN r ON emp.id = r.n WHERE r.n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT MAX(n) + 1 FROM r) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 GROUP BY n) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT (SELECT MAX(id) FROM emp) + n FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT 5 FROM emp WHERE emp.id IN (SELECT n FROM r)) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 AND EXISTS (SELECT 1 FROM emp WHERE emp.id = r.n)) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM r) d WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT CAST(1 AS smallint) UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT CAST(1 AS bigint) UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n, s) AS (SELECT 1, CAST('a' AS varchar(10)) UNION ALL SELECT n + 1, CAST(s + 'a' AS varchar(10)) FROM r WHERE n < 3) SELECT n, s FROM r\nWITH r (n, s) AS (SELECT 1, CAST('a' AS varchar(10)) UNION ALL SELECT n + 1, CAST(s + 'a' AS varchar(11)) FROM r WHERE n < 3) SELECT n, s FROM r\nWITH r (n, s) AS (SELECT 1, CAST('a' AS varchar(max)) UNION ALL SELECT n + 1, s + 'b' FROM r WHERE n < 3) SELECT n, s FROM r\nWITH r (n, s) AS (SELECT 1, NULL UNION ALL SELECT n + 1, n FROM r WHERE n < 3) SELECT n, s FROM r\nWITH r (n, x) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1, 2 UNION ALL SELECT n + 1, 2 FROM r WHERE n < 3) SELECT n FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3), r (m) AS (SELECT 1) SELECT n FROM r\nWITH r (id, path) AS (SELECT id, CAST(name AS varchar(max)) FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.path + '/' + e.name FROM emp e JOIN r ON e.boss = r.id) SELECT id, path FROM r ORDER BY path\nWITH r (id, lvl) AS (SELECT id, 0 FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT lvl, COUNT(*) AS n FROM r GROUP BY lvl ORDER BY lvl\nWITH r (id, lvl) AS (SELECT id, 0 FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) SELECT e.name, r.lvl FROM r JOIN emp e ON e.id = r.id WHERE r.lvl >= 2 ORDER BY e.name\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT a.n AS x, b.n AS y FROM r a CROSS JOIN r b ORDER BY 1, 2\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r UNION ALL SELECT 99\nWITH b2 AS (SELECT id, boss FROM emp WHERE id <> 3), r (id, lvl) AS (SELECT id, 0 FROM b2 WHERE boss IS NULL UNION ALL SELECT b2.id, r.lvl + 1 FROM b2 JOIN r ON b2.boss = r.id) SELECT id, lvl FROM r ORDER BY id\nWITH r (id, lvl) AS (SELECT id, 0 FROM big WHERE p IS NULL UNION ALL SELECT big.id, r.lvl + 1 FROM big JOIN r ON big.p = r.id) SELECT COUNT(*) AS n, MAX(lvl) AS d, SUM(id) AS s FROM r\nWITH r (id, lvl) AS (SELECT id, 0 FROM big WHERE id = 2 UNION ALL SELECT big.id, r.lvl + 1 FROM big JOIN r ON big.p = r.id) SELECT TOP 12 id, lvl FROM r\nWITH r (id, lvl) AS (SELECT id, 0 FROM big WHERE id = 2999 UNION ALL SELECT big.id, r.lvl + 1 FROM big JOIN r ON big.id = r.lvl WHERE r.lvl < 4) SELECT id, lvl FROM r\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r\nWITH r AS (SELECT 1 AS n, 'x' AS k UNION ALL SELECT n + 1, k FROM r WHERE n < 3) SELECT * FROM r\nW WITH r (id, lvl) AS (SELECT id, 0 FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) INSERT INTO tgt SELECT id, lvl FROM r ;; SELECT COUNT(*) AS n, SUM(lvl) AS s FROM tgt\nW WITH r (id) AS (SELECT 2 UNION ALL SELECT e.id FROM emp e JOIN r ON e.boss = r.id) UPDATE emp SET name = 'x' + name WHERE id IN (SELECT id FROM r) ;; SELECT id, name FROM emp WHERE name LIKE 'x%' ORDER BY id\nW WITH r (id) AS (SELECT 7 UNION ALL SELECT e.id FROM emp e JOIN r ON e.boss = r.id) DELETE FROM emp WHERE id IN (SELECT id FROM r) ;; SELECT COUNT(*) AS n FROM emp\nW WITH r (id, lvl) AS (SELECT id, 0 FROM emp WHERE boss IS NULL UNION ALL SELECT e.id, r.lvl + 1 FROM emp e JOIN r ON e.boss = r.id) MERGE INTO tgt USING r ON tgt.id = r.id WHEN NOT MATCHED THEN INSERT (id, lvl) VALUES (r.id, r.lvl * 10); ;; SELECT COUNT(*) AS n, SUM(lvl) AS s FROM tgt\nW WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 200) INSERT INTO tgt SELECT n, 0 FROM r ;; SELECT COUNT(*) AS n FROM tgt\nW WITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 200) INSERT INTO tgt SELECT n, 0 FROM r OPTION (MAXRECURSION 300) ;; SELECT COUNT(*) AS n FROM tgt"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn bindAll(c: &sqlserver.Columns): Result[int, sqlserver.Error] { return Ok(c.count()) }
+
+fn readAll(n: &int, r: &sqlserver.RowView): Result[str, sqlserver.Error] {
+    var cells: []str = []
+    for j in 0..n {
+        match r.intOrNull(j) {
+            Ok(o) {
+                match o {
+                    Some(t) { append(mut &cells, t.toStr()) }
+                    None { append(mut &cells, "NULL") }
+                }
+            }
+            Err(e) {
+                match try r.textOrNull(j) {
+                    Some(t) { append(mut &cells, "'" + t + "'") }
+                    None { append(mut &cells, "NULL") }
+                }
+            }
+        }
+    }
+    return Ok(strings.join(&cells, "|"))
+}
+
+// The first result set's rows as a client streams them, then the error after them (SQL Server's 530 comes after the
+// rows its plan gave before it).
+fn streamed(c: mut &sqlserver.Conn, q: &str): str {
+    match c.stream(&(q.toStr()), [], bindAll, readAll) {
+        Ok(s0) {
+            var s = s0
+            var out: []str = []
+            while true {
+                match s.next() {
+                    Ok(o) {
+                        match o {
+                            Some(t) { append(mut &out, t) }
+                            None { break }
+                        }
+                    }
+                    Err(e) {
+                        append(mut &out, "error " + e.code.toStr())
+                        break
+                    }
+                }
+            }
+            return "rows: " + strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A batch; "@stream " its rows streamed; "W a ;; b": a in a transaction, then b, rolled back.
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if strings.startsWith(q, "@stream ") { return streamed(c, &q[8..len(q)]) }
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"IF @@TRANCOUNT > 0 ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                if !local {
+                    println("same: " + answer(mut &c, &q))
+                    continue
+                }
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = answer(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(62), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

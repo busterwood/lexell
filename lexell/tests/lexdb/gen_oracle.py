@@ -173,6 +173,7 @@ CHECKED = {
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
     'tns_leftovers': ('consts', 'QS'),
+    'tns_recursion': ('consts', 'QS'),
 }
 
 
