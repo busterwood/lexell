@@ -7684,7 +7684,7 @@ pub fn filterOver(ps: PScan, cs: []BX, subs: []PSub): PPlan {
 
 // The census's word for a level joinsOver does not join by its kind.
 fn noJoin(lv: &Level) {
-    if lexdb_census.ON { lexdb_census.no(if lv.lateral { "join: LATERAL" } else if lv.lock != 0 { "join: a locked table" } else if lv.semi || lv.anti { "join: a semi or anti join level" } else { "join: a kind it does not join" }) }
+    if lexdb_census.ON { lexdb_census.no(if lv.lateral { "join: LATERAL" } else if lv.semi || lv.anti { "join: a semi or anti join level" } else { "join: a kind it does not join" }) }
 }
 
 // The tables after sel's first joined over base (its Filter? (Scan)):
@@ -7715,7 +7715,8 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         }
         let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
         let rj = keepsRight(lv.join)
-        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral || lv.lock != 0 {
+        // (a locked table too: its rows locked after they are made, Q8 R7)
+        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral {
             // census: noJoin(lv)
             return Err(p)
         }
@@ -8165,13 +8166,33 @@ pub fn pipeShape(sel: &Sel): bool {
     let q = &sel.q
     // (TOP PERCENT and WITH TIES: the Sort's, Q8 R2)
     // (MATCH_RECOGNIZE: its input's rows, Q8 R3; lexdb_exec.execMatch runs over them)
-    if !(streams(sel) || sortShape(sel) || offsetShape(sel)) || len(sel.feedback) > 0 || ((sel.topMode != 0 || sel.withTies) && !sel.sort) || sel.first >= 0 { return false }
+    // (FOR UPDATE: its rows made without LIMIT and OFFSET, which the lock
+    // operator applies, Q8 R7: lockShape)
+    if !(streams(sel) || sortShape(sel) || offsetShape(sel) || lockShape(sel)) || len(sel.feedback) > 0 || ((sel.topMode != 0 || sel.withTies) && !sel.sort) || sel.first >= 0 { return false }
     if len(q.levels) == 0 || (q.corr && !lat0(q) && (applyLevel(q) < 0 || !applyR2(sel))) || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
     // keys and value, hashSub's, which runHashed reads; Q8 R1)
-    if len(sel.exprs) != len(sel.outs) && !hashedOuts(sel) { return false }
+    // (a lock's: each locked table's key after the outputs, Sel.locks)
+    if len(sel.exprs) != len(sel.outs) && !hashedOuts(sel) && len(sel.locks) == 0 { return false }
     return len(sel.exprs) > 0 && len(sel.ox) == len(sel.exprs) && boundOnce(q)
+}
+
+// Whether sel locks the rows it gives (FOR UPDATE and the like, 9.86) and
+// the pipeline may make them (Q8 R7): rows of one select list (the planner
+// refuses a lock with grouping, a window, a set operation, DISTINCT and
+// WITH TIES), no function in FROM, MATCH_RECOGNIZE, TOP or set-returning
+// function in the list, no correlated subquery in its outputs or ORDER BY.
+// Its plan has no LIMIT or OFFSET: the lock operator applies them as it
+// locks the rows (lexdb_pipe.lockRows).
+pub fn lockShape(sel: &Sel): bool {
+    if len(sel.locks) == 0 || sel.setop != 0 || len(sel.srf) > 0 || sel.aggQ || len(sel.wins) > 0 || sel.distinct || len(sel.mr) > 0 { return false }
+    if sel.donKey > 0 || sel.withTies || sel.topMode != 0 || len(sel.feedback) > 0 || hasSrfCall(&sel.exprs) { return false }
+    if sel.q.corr {
+        for x in sel.exprs { if hasCorr(&x) { return false } }
+        for x in sel.order { if hasCorr(&x) { return false } }
+    }
+    return true
 }
 
 // Whether sel is a SELECT with no FROM the pipeline may run (Q8 R2: a
@@ -8491,9 +8512,10 @@ pub fn subRuns(q: &Query, i: int): bool {
 }
 
 // Whether lv is a table read per row: not a subquery's or CTE's rows, not
-// LATERAL, not locked, no WHERE after it, not a semi or anti join's.
+// LATERAL, no WHERE after it, not a semi or anti join's.
 pub fn tableRead(lv: &Level): bool {
-    return lv.perRow && !lv.lateral && !lv.virt() && lv.lock == 0 && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0
+    // (a locked one too: its rows locked after they are made, Q8 R7)
+    return lv.perRow && !lv.lateral && !lv.virt() && len(lv.post) == 0 && !lv.semi && !lv.anti && lv.semiSub < 0
 }
 
 // Whether lv is rows the run holds that the pipeline reads as q's first
@@ -8649,7 +8671,7 @@ pub fn aggWhy(sel: &Sel): str {
     if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
-    if q.corr && !lat0(q) && applyLevel(q) < 0 { return "agg: a correlated subquery left per row (q.corr): " + applyWhy(q) }
+    if q.corr && !lat0(q) && applyLevel(q) < 0 && !viewsCorr(q) { return "agg: a correlated subquery left per row (q.corr): " + applyWhy(q) }
     if q.corr && !lat0(q) && aggCorr(sel) { return "agg: a correlated subquery in a key or argument" }
     if q.corr && !lat0(q) && sel.first >= 0 { return "agg: a correlated subquery left per row under MIN or MAX by the scan's order" }
     if len(q.top) > 0 { return "agg: conditions on no table (q.top)" }
@@ -8666,7 +8688,6 @@ pub fn levelWhy(q: &Query, lv: &Level): str {
     if lv.work >= 0 { return "a recursive CTE's working table" }
     if !lv.perRow { return "not read per row" }
     if lv.lateral { return "LATERAL" }
-    if lv.lock != 0 { return "locked" }
     if len(lv.post) > 0 { return "a WHERE after it (post)" }
     if lv.semi || lv.anti || lv.semiSub >= 0 { return "a semi or anti join's" }
     if lv.src >= 0 && lazySeries(q, lv.src) { return "a series not of integers" }
@@ -8773,8 +8794,10 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
-    // (correlated subqueries left per row: an Apply's over the joins, Q8 R6)
+    // (correlated subqueries left per row: an Apply's over the joins, Q8 R6;
+    // those called above the groups only the caller's, Q8 R7)
     if sel.q.corr { input = applyOver(&sel.q, replace(mut &input, PPlan.Result([]))) }
+    if viewsCorr(&sel.q) { input = applySubs(replace(mut &input, PPlan.Result([]))) }
     let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds),
                                                                                                    fuse: fuseOf(sel)}))
     return Some(grpViews(sel, agg))
@@ -8792,7 +8815,9 @@ pub fn aggShape(sel: &Sel): bool {
     // (a correlated subquery's own: its outer values are its parameters;
     // one left per row: an Apply's, Q8 R6, not in a key or argument, not
     // under MIN/MAX by the scan's order, R2's MinMax)
-    if len(q.levels) == 0 || (q.corr && !lat0(q) && (applyLevel(q) < 0 || aggCorr(sel) || sel.first >= 0)) || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
+    // (one called above the groups only: the caller's, Q8 R7, viewsCorr)
+    if len(q.levels) == 0 || (q.corr && !lat0(q) && ((applyLevel(q) < 0 && !viewsCorr(q)) || aggCorr(sel) || sel.first >= 0)) || len(q.top) > 0 ||
+       !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
     if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } } }
@@ -9282,6 +9307,18 @@ pub fn applyWhy(q: &Query): str {
     if n > 1 { return "conjuncts of two levels" }
     if n == 0 { return "not in WHERE" }
     return "a build group's level"
+}
+
+// Whether q's correlated subqueries left per row are called above its
+// groups only (HAVING, the outputs, ORDER BY, the window calls: evaluated by
+// the caller as the row engine evaluates them, Q8 R7), none in its levels.
+fn viewsCorr(q: &Query): bool {
+    if !q.corr || len(q.levels) == 0 || len(q.top) > 0 || hashedProbe(q) { return false }
+    for lv in q.levels {
+        if pathCorr(&lv.path) || lv.lateral || anyCorr(&lv.local) || anyCorr(&lv.hashVals) || (lv.resNot && hasCorr(&lv.resVal)) || anyCorr(&lv.cond) ||
+           anyCorr(&lv.post) { return false }
+    }
+    return true
 }
 
 // Whether q probes a correlated subquery run once into a hash (9.9's

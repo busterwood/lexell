@@ -1,0 +1,159 @@
+// lexdb over TDS: the operators over an aggregate's groups (HAVING, the select list, DISTINCT, ORDER BY, TOP and OFFSET ...
+// FETCH: Q8's R7, design/lexdb-layers.md 6.3.Q8 R7 as built (group views, FOR UPDATE)) through the T-SQL door, checked
+// against SQL Server 2022 (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's answers: the
+// expect lines): GROUP BY with TOP, TOP WITH TIES, TOP PERCENT (and its error 1031), OFFSET ... FETCH; HAVING (a
+// subquery run once in it); DISTINCT; texts grouped under the case-insensitive collation; ROLLUP, GROUPING SETS with
+// HAVING; joins, a CTE; errors in a later group (8134, 8115), in HAVING, and none in a group HAVING drops; correlated
+// subqueries in an output and ORDER BY; window calls over the groups; an empty input.
+// (T-SQL has no FOR UPDATE: its UPDLOCK and READPAST hints are read and not used, as lexdb's other table hints.) Against
+// lexdb each batch runs with SET lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: same: g,c,s,lo: 0|428|9345|'ab';1|429|9522|'ab';2|429|9649|'Ab';3|429|9576|'Ab';4|429|9414|'ab';5|428|9554|'Ab';6|428|9744|'Ab'
+// expect: same: g,s: 6|9744;2|9649;3|9576
+// expect: same: t,c: 'ab'|1847;'b0'|231;'b1'|231;'b3'|231
+// expect: same: g,m: 0|49;1|49;2|49;3|49
+// expect: same: error 1031
+// expect: same: g,s: 1|50430.50;2|50918.75;3|50171.00;4|50439.00
+// expect: same: c: 428;429
+// expect: same: g,c: 2|429;3|429;4|429
+// expect: same: name,c,m: 'five'|428|49;'four'|429|49;'one'|429|49;'three'|429|49;'two'|429|49;'zero'|428|49
+// expect: same: error 8134
+// expect: same: error 8134
+// expect: same: g,q: 0|-3;1|-5;2|-10;4|10;5|5;6|3
+// expect: same: g,r,c: NULL|NULL|30;0|0|4;0|NULL|4;1|NULL|1;1|1|2;1|2|2;1|NULL|5;2|0|3;2|1|2;2|NULL|5;3|2|4;3|NULL|4;4|NULL|1;4|0|1;4|1|2;4|NULL|4;5|0|2;5|2|2;5|NULL|4;6|1|4;6|NULL|4
+// expect: same: g,c,gg: 1|429|0;2|429|0;3|429|0;4|429|0;NULL|3000|1
+// expect: same: c,s: 0|NULL
+// expect: same: x,c: 
+// expect: same: g,name,c: 0|'zero'|428;1|'one'|429;2|'two'|429;3|'three'|429;4|'four'|429;5|'five'|428;6|NULL|428
+// expect: same: g,c: 6|428;5|428;4|429;1|429;3|429;2|429;0|428
+// expect: same: t,c: NULL|230;'ab'|1847;'b0'|231;'b1'|231;'b2'|230;'b3'|231
+// expect: same: g,c,r: 0|428|5;1|429|1;2|429|2;3|429|3;4|429|4;5|428|6;6|428|7
+// expect: same: m,lo: 3000|1
+// expect: same: p,c: 0|1714
+// expect: same: g,d: 0|5;1|5;2|5;3|5;4|5;5|5;6|5
+// expect: same: g,s: 3|281;0|296;1|323;2|327;4|328;5|338;6|342
+// expect: same: g,s: 4|1373;1|1363;5|1314;6|1253
+// expect: same: g,c: 6|428;5|428
+// expect: same: error 8115
+// expect: same: g,c: 
+// expect: same: g,c: 0|428;5|428;6|428
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE dg (i int)\nINSERT INTO dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nCREATE TABLE wt (id int PRIMARY KEY, g int, x int NULL, t varchar(10) NULL, n decimal(10,2) NULL)\nINSERT INTO wt SELECT n, n % 7, CASE WHEN n % 11 = 0 THEN NULL ELSE (n * 37) % 50 END, CASE WHEN n % 13 = 0 THEN NULL WHEN n % 3 = 0 THEN 'Ab' WHEN n % 3 = 1 THEN 'ab' ELSE 'b' + CAST(n % 4 AS varchar(2)) END, CASE WHEN n % 17 = 0 THEN NULL ELSE CAST((n * 7) % 1000 AS decimal(10,2)) / 4 END FROM (SELECT p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 AS n FROM dg p CROSS JOIN dg q CROSS JOIN dg r CROSS JOIN dg w) z WHERE n <= 3000\nCREATE TABLE kt (g int PRIMARY KEY, name varchar(10))\nINSERT INTO kt VALUES (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five')\nCREATE TABLE et (id int PRIMARY KEY, x int)"
+
+const QS = "SELECT g, COUNT(*) AS c, SUM(x) AS s, MIN(t) AS lo FROM wt GROUP BY g ORDER BY g\nSELECT TOP 3 g, SUM(x) AS s FROM wt GROUP BY g ORDER BY s DESC\nSELECT * FROM (SELECT TOP 2 WITH TIES t, COUNT(*) AS c FROM wt WHERE t IS NOT NULL GROUP BY t ORDER BY c DESC) z ORDER BY t\nSELECT TOP 50 PERCENT g, MAX(x) AS m FROM wt GROUP BY g ORDER BY g\nSELECT TOP (150) PERCENT g FROM wt GROUP BY g ORDER BY g\nSELECT g, SUM(n) AS s FROM wt GROUP BY g HAVING COUNT(*) > 428 ORDER BY g\nSELECT DISTINCT COUNT(*) AS c FROM wt GROUP BY g ORDER BY c\nSELECT g, COUNT(*) AS c FROM wt GROUP BY g ORDER BY g OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY\nSELECT kt.name, COUNT(*) AS c, MAX(wt.x) AS m FROM wt JOIN kt ON kt.g = wt.g GROUP BY kt.name HAVING MAX(wt.x) > 40 ORDER BY kt.name\nSELECT g, 10 / (g - 3) AS q FROM wt GROUP BY g ORDER BY g\nSELECT g, COUNT(*) AS c FROM wt GROUP BY g HAVING 10 / (g - 4) > 0\nSELECT g, 10 / (g - 3) AS q FROM wt GROUP BY g HAVING g <> 3 ORDER BY g\nSELECT g, x % 3 AS r, COUNT(*) AS c FROM wt WHERE id <= 30 GROUP BY ROLLUP (g, x % 3) ORDER BY g, GROUPING(x % 3), r\nSELECT g, COUNT(*) AS c, GROUPING(g) AS gg FROM wt GROUP BY GROUPING SETS ((g), ()) HAVING COUNT(*) > 428 ORDER BY gg, g\nSELECT COUNT(*) AS c, SUM(x) AS s FROM et\nSELECT x, COUNT(*) AS c FROM et GROUP BY x\nSELECT g, (SELECT name FROM kt WHERE kt.g = wt.g) AS name, COUNT(*) AS c FROM wt GROUP BY g ORDER BY g\nSELECT g, COUNT(*) AS c FROM wt GROUP BY g ORDER BY (SELECT name FROM kt WHERE kt.g = wt.g), g\nSELECT t, COUNT(*) AS c FROM wt GROUP BY t ORDER BY t\nSELECT g, COUNT(*) AS c, RANK() OVER (ORDER BY COUNT(*) DESC, g) AS r FROM wt GROUP BY g ORDER BY g\nSELECT MAX(id) AS m, MIN(id) AS lo FROM wt\nSELECT TOP 1 WITH TIES g % 2 AS p, COUNT(*) AS c FROM wt GROUP BY g % 2 ORDER BY c DESC\nSELECT g, COUNT(DISTINCT t) AS d FROM wt GROUP BY g ORDER BY d DESC, g\nSELECT g, SUM(x) AS s FROM wt WHERE id <= 100 GROUP BY g HAVING SUM(x) > (SELECT COUNT(*) * 30 FROM kt) ORDER BY s\nWITH c AS (SELECT g, x FROM wt WHERE id <= 400) SELECT g, SUM(x) AS s FROM c GROUP BY g ORDER BY s DESC OFFSET 0 ROWS FETCH NEXT 4 ROWS ONLY\nSELECT TOP 2 g, COUNT(*) AS c FROM wt GROUP BY g ORDER BY g DESC\nSELECT g, CAST(SUM(x) AS int) * 1000000 AS big FROM wt GROUP BY g ORDER BY g\nSELECT TOP 3 g, COUNT(*) AS c FROM wt WHERE id < 0 GROUP BY g ORDER BY g\nSELECT * FROM (SELECT TOP 10 PERCENT WITH TIES g, COUNT(*) AS c FROM wt GROUP BY g ORDER BY c) z ORDER BY g"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for q in strings.lines(&text) {
+                if !local {
+                    println("same: " + answer(mut &c, &q))
+                    continue
+                }
+                let a = show(mut &c, &"SET lexdb_batch = off")
+                let off = answer(mut &c, &q)
+                let b = show(mut &c, &"SET lexdb_batch = on")
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(57), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

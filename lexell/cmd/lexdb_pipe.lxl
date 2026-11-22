@@ -2674,7 +2674,8 @@ fn aggRead(a: &lexdb_plan.PAgg, sc: &lexdb_plan.PScan): bool {
 fn scanRuns(sc: &lexdb_plan.PScan, subs: &[]lexdb_plan.PSub, cols: &[]lexdb_sql.ColDef): bool {
     for i in 0..len(subs) {
         let s = &subs[i]
-        if s.run != lexdb_plan.RUN_ONCE { return false }
+        // (RUN_APPLY over one table: called above an aggregate's groups only, the caller's, Q8 R7)
+        if s.run != lexdb_plan.RUN_ONCE && s.run != lexdb_plan.RUN_APPLY { return false }
         if s.use == lexdb_sql.SUB_FROM && i != sc.held { return false }
     }
     return len(sc.kinds) == len(cols) && sc.first >= 0 && sc.first + len(sc.need) <= len(cols)
@@ -9566,4 +9567,55 @@ pub fn groupsCut(go: mut &GOut): Result[[][]Val, DbErr] {
         lastAt = k
     }
     return Ok(out)
+}
+
+// ---- FOR UPDATE's lock operator (Q8 R7; design/lexdb.md 9.86)
+//
+// A locking SELECT's rows are made whole, without its LIMIT and OFFSET (by
+// the pipeline, lexdb_plan.lockShape; or by the row engine), then locked in
+// their order here, as PostgreSQL's LockRows below its Limit: a row SKIP
+// LOCKED leaves out does not count towards the LIMIT, one OFFSET passes
+// over is locked too. Made whole first, as the row engine makes them: the
+// first error of a row past the LIMIT is raised before any lock is taken.
+
+pub const LK_TAKEN: int = 0     // a lock's outcome (lockRows' lock): taken (or held already) ...
+pub const LK_SKIPPED: int = 1   // ... the row left out (SKIP LOCKED) ...
+pub const LK_WAITED: int = 2    // ... taken after a wait for another's
+
+var lockRuns0: int = 0
+
+// Lock operator runs (the tests' look).
+pub fn lockRuns(): int { return lockRuns0 }
+
+// The rows (each its nOut outputs, then the locked tables' keys) locked in
+// order, at most limit of them kept (-1 all) after offset; lock(i, row):
+// row's lock i taken (LK_*). The rows kept, cut to their outputs; None: a
+// lock was waited for (the rows may have changed: the caller runs the
+// query again, holding the locks it has).
+pub fn lockRows(rows: mut &[][]Val, nLocks: int, limit: int, offset: int, nOut: int,
+                lock: &fn(int, &[]Val): Result[int, DbErr]): Result[Option[[][]Val], DbErr] {
+    lockRuns0 += 1
+    var out: [][]Val = []
+    var passed = 0
+    for i in 0..len(rows) {
+        if limit >= 0 && len(out) >= limit { break }
+        var skip = false
+        for li in 0..nLocks {
+            let got = try lock(li, &rows[i])
+            if got == LK_WAITED { return Ok(None) }
+            if got == LK_SKIPPED {
+                skip = true
+                break
+            }
+        }
+        if skip { continue }
+        if passed < offset {
+            passed += 1
+            continue
+        }
+        var r = replace(mut &rows[i], [])
+        while len(r) > nOut { let x = pop(mut &r) }
+        append(mut &out, r)
+    }
+    return Ok(Some(out))
 }

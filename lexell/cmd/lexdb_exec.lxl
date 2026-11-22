@@ -8224,7 +8224,8 @@ fn runSelToIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
         // to the sink as one OutBatch if it wants them so (it is asked once,
         // only then); else they are held, as runSel holds them
-        if !pipeSorts(sel) { return runSelIn(st, txn, sel, params, lim, sh) }
+        // (FOR UPDATE: the lock operator over the rows, runLocking's)
+        if !pipeSorts(sel) || len(sel.locks) > 0 { return runSelIn(st, txn, sel, params, lim, sh) }
         var rs = newRun(&sel.q)
         rs.limit(&lim)
         if !rs.batch || rs.noLimit { return runSelIn(st, txn, sel, params, lim, sh) }
@@ -8305,10 +8306,10 @@ fn runSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 }
 
 // A SELECT ... FOR UPDATE (9.86). Its rows are made without LIMIT and
-// OFFSET, then locked in their order, as PostgreSQL's LockRows below its
-// Limit: a row SKIP LOCKED leaves out does not count towards the LIMIT,
-// one OFFSET passes over is locked too. A lock waited for means the rows
-// may have changed: the query runs again, holding the locks it has.
+// OFFSET (by the pipeline when it runs the query: lexdb_plan.lockShape),
+// then locked in their order by the lock operator (lexdb_pipe.lockRows),
+// which applies them. A lock waited for means the rows may have changed:
+// the query runs again, holding the locks it has.
 fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     while true {
         var rs = newRun(&sel.q)
@@ -8320,35 +8321,22 @@ fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         let ran = execSel(st, txn, sel, params, -1, mut &rs)
         txn.quiet = quiet
         var res = try ran
-        var out: [][]Val = []
-        var passed = 0
-        var waited = false
-        for i in 0..len(res.rows) {
-            if sel.limit >= 0 && len(out) >= sel.limit { break }
-            var skip = false
-            for lk in sel.locks {
-                var b = ""
-                let lt = &sel.q.levels[lk.level].t
-                for j in 0..lk.n { lexdb_access.encKeyPart(mut &b, &lexdb_access.collKeyVal(&lt.cols[lt.pk[j]], &res.rows[i][lk.at + j])) }
-                let got = try lockOf(st, txn, &sel.q.levels[lk.level].t, &b, lk.mode, lk.wait, true)
-                if got == lexdb_locks.LOCK_SKIPPED { skip = true }
-                if got == lexdb_locks.LOCKED_AFTER_WAIT { waited = true }
-                if skip || waited { break }
+        let got = try lexdb_pipe.lockRows(mut &res.rows, len(sel.locks), sel.limit, sel.offset, sel.nOut, fn(li: int, r: &[]Val): Result[int, DbErr] {
+            let lk = &sel.locks[li]
+            let lt = &sel.q.levels[lk.level].t
+            var b = ""
+            for j in 0..lk.n { lexdb_access.encKeyPart(mut &b, &lexdb_access.collKeyVal(&lt.cols[lt.pk[j]], &r[lk.at + j])) }
+            let g = try lockOf(st, txn, lt, &b, lk.mode, lk.wait, true)
+            return Ok(if g == lexdb_locks.LOCK_SKIPPED { lexdb_pipe.LK_SKIPPED } else if g == lexdb_locks.LOCKED_AFTER_WAIT { lexdb_pipe.LK_WAITED } else { lexdb_pipe.LK_TAKEN })
+        })
+        match got {
+            Some(out) {
+                res.tag = "SELECT " + len(out).toStr()
+                res.rows = out
+                return Ok(res)
             }
-            if waited { break }
-            if skip { continue }
-            if passed < sel.offset {
-                passed += 1
-                continue
-            }
-            var r = replace(mut &res.rows[i], [])
-            while len(r) > sel.nOut { let x = pop(mut &r) }
-            append(mut &out, r)
+            None {}
         }
-        if waited { continue }
-        res.tag = "SELECT " + len(out).toStr()
-        res.rows = out
-        return Ok(res)
     }
     return Err(e("XX000", "unreachable"))
 }
@@ -8779,8 +8767,10 @@ fn pipeSelMain(sel: mut &Sel) {
     // the operators over it as physAbove makes them (EXPLAIN prints them)
     let dist = if sel.distinct { lexdb_plan.PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
     let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(dist, sel.sort, ps) } else { dist }
-    // (TOP's count: the Sort's, PSort.top)
-    let plan = if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) } else { ordered }
+    // (TOP's count: the Sort's, PSort.top; FOR UPDATE's LIMIT and OFFSET the
+    // lock operator's, Q8 R7)
+    let plan = if (sel.limit >= 0 || sel.offset > 0) && len(sel.locks) == 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) }
+               else { ordered }
     match lexdb_pipe.compileP(plan, &sel.q.cols, len(sel.q.subs) == 0 && lexdb_plan.pointRead(&sel.q.levels[0])) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { lexdb_plan.unplan(sel, back) }
@@ -10541,9 +10531,10 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
 // EXPLAIN's lines for a planned Sel: its operators (physOf), then its
 // subqueries'; with counts (EXPLAIN ANALYZE), what each table did.
 fn selLines(sel: &Sel, cnt: &[]lexdb_pipe.Counts, stats: &[]SubStat): []str {
-    // the pipeline's plan, kept with the Sel; else a view of the Sel's
+    // the pipeline's plan, kept with the Sel; else a view of the Sel's (a
+    // lock's: its LIMIT the lock operator's, Q8 R7, shown as the view shows it)
     match sel.pipe {
-        Some(pg) { return planLines(sel, &pg.plan, cnt, stats) }
+        Some(pg) { if len(sel.locks) == 0 { return planLines(sel, &pg.plan, cnt, stats) } }
         None {}
     }
     let p = lexdb_plan.physOf(sel)
@@ -10746,7 +10737,8 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
              rs: mut &Run): Result[Res, DbErr] {
     if len(sel.srf) > 0 { return srfRun(st, txn, sel, params, cap, rs) }
-    if rs.batch && pipeRows(sel) && !rs.noLimit {
+    // (FOR UPDATE's run, noLimit: its plan has no LIMIT, Q8 R7)
+    if rs.batch && pipeRows(sel) && (!rs.noLimit || len(sel.locks) > 0) {
         // (a value a join's batch cannot hold, an expression it does not
         // compile: the row engine, nothing given yet)
         match pipeHeld(st, txn, sel, params, cap, rs) {
@@ -10757,7 +10749,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             Err(x) { if !lexdb_pipe.isBat(&x) { return Err(x) } }
         }
     }
-    // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && !rs.noLimit, rs.noLimit)
+    // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && (!rs.noLimit || len(sel.locks) > 0), rs.noLimit)
     let sqe = seqEnv(st, txn)
     // (an aggregate the pipeline runs: its conditions are its plan's, not bound per run)
     let pa = rs.batch && pipeAggs(sel)

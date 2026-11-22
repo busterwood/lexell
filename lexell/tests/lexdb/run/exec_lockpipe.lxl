@@ -1,0 +1,301 @@
+// lexdb_exec: SELECT ... FOR UPDATE and the like with its rows made by the
+// pipeline (Q8 R7, design/lexdb-layers.md 6.3.Q8 R7 as built (group views,
+// FOR UPDATE): lexdb_plan.lockShape; its LIMIT and OFFSET the lock
+// operator's, lexdb_pipe.lockRows), against the row engine (SET
+// lexdb_batch = off). Every scenario runs once each way, from the same
+// tables, and must give the same answers.
+// - one session: a point by key, ranges, ORDER BY (DESC, with LIMIT and
+//   OFFSET), a join FOR UPDATE OF one table, a left join, FOR SHARE, FOR NO
+//   KEY UPDATE, FOR KEY SHARE, text and two-column keys, NULLs, an empty
+//   result, a subquery run once and a correlated one in WHERE, IN lists, an
+//   error in a row past the LIMIT (raised before any lock: no lock held
+//   after), the locks each statement holds;
+// - two sessions: a lock waited for, then the rows run again (a row
+//   changed while waiting and checked again: one no longer matching, one
+//   with a new value, one deleted); NOWAIT (55P03); SKIP LOCKED with LIMIT
+//   and with OFFSET (a row OFFSET passes over locked too); a deadlock
+//   (40P01) and the other then getting its lock.
+// expect: one session: 27 statements, 27 the same both ways, 27 by the pipeline, 1 errors
+// expect: wait: same: begin: BEGIN / 1|105;4|400 / locks 2 | other: 1|105
+// expect: nowait: same: 55P03 / 3|300 / locks 1
+// expect: skip locked: same: 3;4 / 5 / locks 3
+// expect: skip offset: same: 4;5 / locks 4
+// expect: deadlock: same: 40P01, the other then: 2
+// expect: changed: same: 4|41;2|20 / locks 2
+// expect: lock operator runs: on 26, off 26
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_pipe"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, lexdb_sql.text(&v)) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+// A session's statements, run in a task: their results joined by " / ".
+type Job = record { s: lexdb_exec.Session; sqls: []str }
+type Done = record { s: lexdb_exec.Session; out: str }
+
+fn runJob(j: Job): Done {
+    let Job{s: s0, sqls: sqls} = move(j)
+    var s = s0
+    var outs: []str = []
+    for q in sqls { append(mut &outs, one(mut &s, q.toStr())) }
+    return Done{s: s, out: strings.join(&outs, " / ")}
+}
+
+fn pause() { let z = task.sleep(30) }
+
+// A session with lexdb_batch set (way: "on" or "off").
+fn session(st: &lexdb_store.Store, way: &str): lexdb_exec.Session {
+    var s = lexdb_exec.newSession(st.share())
+    let b = one(mut &s, "set lexdb_batch = " + way)
+    return s
+}
+
+// The tables every scenario starts from.
+fn fresh(s: mut &lexdb_exec.Session) {
+    let d = one(s, "drop table if exists acct, tk, t2, own, sub")
+    let c1 = one(s, "create table acct (id int primary key, bal int, note text)")
+    let i1 = one(s, "insert into acct select g, g * 100, case when g % 3 = 0 then null else 'n' || g::text end from generate_series(1, 60) g")
+    let c2 = one(s, "create table tk (k text primary key, v int)")
+    let i2 = one(s, "insert into tk values ('a', 1), ('B', 2), ('b', 3), ('c', null), ('d', 4)")
+    let c3 = one(s, "create table t2 (a int, b int, v int, primary key (a, b))")
+    let i3 = one(s, "insert into t2 select g % 4, g, g * 10 from generate_series(1, 12) g")
+    let c4 = one(s, "create table own (id int primary key, acct int, w int)")
+    let i4 = one(s, "insert into own select g, g % 10 + 1, g from generate_series(1, 30) g")
+    let c5 = one(s, "create table sub (id int primary key, x int)")
+    let i5 = one(s, "insert into sub values (1, 5), (2, 7)")
+}
+
+// One session's statements, each in a block, with the locks it holds then.
+fn singles(st: &lexdb_store.Store, way: &str, out: mut &[]str, piped: mut &int, errs: mut &int) {
+    var s = session(st, way)
+    fresh(mut &s)
+    let qs = ["select id, bal from acct where id = 7 for update",
+              "select id, bal from acct where id = 70 for update",
+              "select id from acct where id between 10 and 14 for update",
+              "select id, note from acct where id < 8 order by id desc for update",
+              "select id from acct where id > 20 order by bal desc limit 3 for update",
+              "select id from acct order by id limit 2 offset 3 for update",
+              "select id from acct where note is null and id < 20 for update",
+              "select id from acct where id < 30 limit 4 for update",
+              "select id from acct where id > 55 offset 2 for update",
+              "select acct.id, own.id from acct join own on own.acct = acct.id where acct.id <= 2 order by 2 for update of acct",
+              "select acct.id, own.w from acct join own on own.acct = acct.id where own.w < 5 order by 2 for update of own",
+              "select acct.id, own.id from acct left join own on own.acct = acct.id where acct.id in (3, 59) order by 1, 2 for update of acct",
+              "select id from acct where id in (1, 9, 60, 61) for share",
+              "select id from acct where id between 40 and 42 for no key update",
+              "select id from acct where id < 4 for key share",
+              "select k, v from tk where k >= 'B' order by k for update",
+              "select k from tk where v is null for update",
+              "select a, b, v from t2 where a = 1 order by b for update",
+              "select a, b from t2 where a = 2 and b = 6 for update",
+              "select id from acct where false for update",
+              "select id from acct where bal > (select max(x) * 1000 from sub) order by id limit 2 for update",
+              "select id from acct a where exists (select 1 from own o where o.acct = a.id and o.w = a.id + 10) order by id for update",
+              "select id from acct where id <= 5 and bal > (select count(*) from own o where o.acct = acct.id) * 30 order by id for update",
+              "select id, 10 / (id - 50) from acct order by id limit 1 for update",
+              "select id, 10 / (id - 50) from acct where id < 50 order by id limit 1 for update",
+              "select id from acct where id < 3 for update nowait",
+              "select id from acct where id < 3 for update skip locked"]
+    for q in qs {
+        let b = one(mut &s, "begin")
+        let r0 = lexdb_pipe.runCounts()[0]
+        let r = one(mut &s, q.toStr())
+        if lexdb_pipe.runCounts()[0] > r0 { piped += 1 }
+        if strings.startsWith(&r, "22") || strings.startsWith(&r, "42") || strings.startsWith(&r, "55") { errs += 1 }
+        append(out, r + " / locks " + st.locks.count().toStr())
+        let e = one(mut &s, "rollback")
+    }
+    s.close()
+}
+
+// a holds row 1 and changes it, row 2 so it no longer matches, deletes
+// row 2's neighbour 5; b waits, then runs again.
+fn waitCase(st: &lexdb_store.Store, way: &str): str {
+    var a = session(st, way)
+    fresh(mut &a)
+    var out = ""
+    task.scope(fn(sc: mut &task.Scope) {
+        let x1 = one(mut &a, "begin")
+        let x2 = one(mut &a, "select id from acct where id = 1 for update")
+        let fb = sc.start(runJob, Job{s: session(st, way), sqls: ["begin", "select id, bal from acct where id <= 5 and bal <> 200 and note is not null order by id for update"]})
+        pause()
+        let x3 = one(mut &a, "update acct set bal = bal + 5 where id = 1")
+        let x4 = one(mut &a, "update acct set note = null where id = 2")
+        let x5 = one(mut &a, "delete from acct where id = 5")
+        let x6 = one(mut &a, "commit")
+        let Done{s: bs0, out: bout} = fb.wait().unwrap()
+        var bs = bs0
+        let held = st.locks.count()
+        let c = one(mut &bs, "commit")
+        bs.close()
+        out = "begin: " + bout + " / locks " + held.toStr() + " | other: " + one(mut &a, "select id, bal from acct where id = 1")
+    })
+    a.close()
+    return out
+}
+
+fn nowaitCase(st: &lexdb_store.Store, way: &str): str {
+    var a = session(st, way)
+    fresh(mut &a)
+    var b = session(st, way)
+    let x1 = one(mut &a, "begin")
+    let x2 = one(mut &a, "select id from acct where id = 2 for update")
+    let b1 = one(mut &b, "begin")
+    let r1 = one(mut &b, "select id from acct where id between 1 and 3 order by id for update nowait")
+    let b2 = one(mut &b, "rollback")
+    let b3 = one(mut &b, "begin")
+    let r2 = one(mut &b, "select id, bal from acct where id = 3 for update nowait")
+    let held = st.locks.count()
+    let b4 = one(mut &b, "rollback")
+    let x3 = one(mut &a, "rollback")
+    a.close()
+    b.close()
+    return r1 + " / " + r2 + " / locks " + (held - 1).toStr()
+}
+
+fn skipCase(st: &lexdb_store.Store, way: &str): str {
+    var a = session(st, way)
+    fresh(mut &a)
+    var b = session(st, way)
+    let x1 = one(mut &a, "begin")
+    let x2 = one(mut &a, "select id from acct where id in (1, 2) for update")
+    let b1 = one(mut &b, "begin")
+    let r1 = one(mut &b, "select id from acct order by id limit 2 for update skip locked")
+    let r2 = one(mut &b, "select id from acct where id <= 5 order by id desc limit 1 for update skip locked")
+    let held = st.locks.count()
+    let b2 = one(mut &b, "rollback")
+    let x3 = one(mut &a, "rollback")
+    a.close()
+    b.close()
+    return r1 + " / " + r2 + " / locks " + (held - 2).toStr()
+}
+
+fn skipOffsetCase(st: &lexdb_store.Store, way: &str): str {
+    var a = session(st, way)
+    fresh(mut &a)
+    var b = session(st, way)
+    let x1 = one(mut &a, "begin")
+    let x2 = one(mut &a, "select id from acct where id = 2 for update")
+    let b1 = one(mut &b, "begin")
+    let r1 = one(mut &b, "select id from acct where id < 10 order by id offset 2 limit 2 for update skip locked")
+    let held = st.locks.count()
+    let b2 = one(mut &b, "rollback")
+    let x3 = one(mut &a, "rollback")
+    a.close()
+    b.close()
+    return r1 + " / locks " + (held - 1).toStr()
+}
+
+fn deadlockCase(st: &lexdb_store.Store, way: &str): str {
+    var cs = session(st, way)
+    fresh(mut &cs)
+    var out = ""
+    task.scope(fn(sc: mut &task.Scope) {
+        var da = session(st, way)
+        let d1 = one(mut &da, "begin")
+        let d2 = one(mut &cs, "begin")
+        let d3 = one(mut &da, "select id from acct where id = 1 for update")
+        let d4 = one(mut &cs, "select id from acct where id = 2 for update")
+        let fa = sc.start(runJob, Job{s: da, sqls: ["select id from acct where id between 2 and 2 for update", "rollback"]})
+        pause()
+        let dl = one(mut &cs, "select id from acct where id <= 1 order by id for update")
+        let d5 = one(mut &cs, "rollback")
+        let Done{s: aa0, out: aout} = fa.wait().unwrap()
+        var aa = aa0
+        aa.close()
+        out = dl + ", the other then: " + strings.split(&aout, " / ")[0]
+    })
+    cs.close()
+    return out
+}
+
+// b waits for a, which raises row 4's value past b's bound and row 2's
+// into it: b's rows checked again.
+fn changedCase(st: &lexdb_store.Store, way: &str): str {
+    var a = session(st, way)
+    fresh(mut &a)
+    var out = ""
+    task.scope(fn(sc: mut &task.Scope) {
+        let x0 = one(mut &a, "update acct set bal = id * 10 where id <= 6")
+        let x1 = one(mut &a, "begin")
+        let x2 = one(mut &a, "select id from acct where id = 4 for update")
+        let fb = sc.start(runJob, Job{s: session(st, way), sqls: ["begin", "select id, bal from acct where id <= 6 and bal between 20 and 45 order by bal desc limit 2 for update"]})
+        pause()
+        let x3 = one(mut &a, "update acct set bal = 41 where id = 4")
+        let x4 = one(mut &a, "update acct set bal = 46 where id = 3")
+        let x5 = one(mut &a, "commit")
+        let Done{s: bs0, out: bout} = fb.wait().unwrap()
+        var bs = bs0
+        let held = st.locks.count()
+        let c = one(mut &bs, "commit")
+        bs.close()
+        out = strings.split(&bout, " / ")[1] + " / locks " + held.toStr()
+    })
+    a.close()
+    return out
+}
+
+fn both(name: &str, off: &str, on: &str) {
+    if off == on { println(name + ": same: " + on) } else {
+        println(name + ": DIFFERENT")
+        println("  rows:    " + off)
+        println("  batches: " + on)
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(31), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var offs: []str = []
+        var ons: []str = []
+        var poff = 0
+        var pon = 0
+        var eoff = 0
+        var eon = 0
+        let l0 = lexdb_pipe.lockRuns()
+        singles(&st, &"off", mut &offs, mut &poff, mut &eoff)
+        let l1 = lexdb_pipe.lockRuns()
+        singles(&st, &"on", mut &ons, mut &pon, mut &eon)
+        let l2 = lexdb_pipe.lockRuns()
+        var same = 0
+        for i in 0..len(offs) {
+            if offs[i] == ons[i] { same += 1 } else {
+                println("DIFFERENT: statement " + (i + 1).toStr())
+                println("  rows:    " + offs[i])
+                println("  batches: " + ons[i])
+            }
+        }
+        println("one session: " + len(ons).toStr() + " statements, " + same.toStr() + " the same both ways, " + pon.toStr() + " by the pipeline, " +
+                eon.toStr() + " errors")
+        both(&"wait", &waitCase(&st, &"off"), &waitCase(&st, &"on"))
+        both(&"nowait", &nowaitCase(&st, &"off"), &nowaitCase(&st, &"on"))
+        both(&"skip locked", &skipCase(&st, &"off"), &skipCase(&st, &"on"))
+        both(&"skip offset", &skipOffsetCase(&st, &"off"), &skipOffsetCase(&st, &"on"))
+        both(&"deadlock", &deadlockCase(&st, &"off"), &deadlockCase(&st, &"on"))
+        let l3 = lexdb_pipe.lockRuns()
+        both(&"changed", &changedCase(&st, &"off"), &changedCase(&st, &"on"))
+        println("lock operator runs: on " + (l2 - l1).toStr() + ", off " + (l1 - l0).toStr())
+        return 0
+    }).unwrap()
+}
