@@ -12524,3 +12524,131 @@ counters, column/cut counts, hooks, frame/cut/read-drop limits, upgrade
 budget, audit, segment and chunk names) are private functions behind
 `Store.testHooks()`. Store's public functions went 126 → 91, lines per
 export 55.9 → 72.1; suite 168, replica 12 rounds, A/B 1.010 CPU.
+
+### 9.137 Replicas in every door
+
+The user's feature (2026-11-22): read replicas (9.72, 9.73) serve the SQL Server and Oracle doors too. Each door
+answers as its own product's read-only secondary does, and each routes read-only clients to them its own way.
+Replicas on other machines stay parked.
+
+**Flags.**
+- `lexdb --replica DATADIR [ADDR ...] [--tds HOST:PORT ...] [--tns HOST:PORT ...] [--tcps HOST:PORT ...]`: the
+  replica's own listeners, as the master's flags. They are opt-in per door: without them a replica serves pgwire only,
+  as before.
+- `lexdb DATADIR ... --replicas N [--replica-addr ADDR ...] [--replica-tds HOST:PORT ...] [--replica-tns HOST:PORT ...]
+  [--replica-tcps HOST:PORT ...]`: the replicas' addresses for each door. By default they are each of the master's
+  addresses for that door with the port one higher; a door the master does not serve, the replicas do not serve
+  either. Every replica listens on the one port with `SO_REUSEPORT`, as `--replica-addr` does for pgwire.
+- `--tns-ro-service NAME`: the Oracle read-only service the master redirects (below). By default it is `lexdb_ro` and
+  `freepdb1_ro`, the two service names with `_ro`.
+
+**A replica's doors answer as the product's read-only secondary.** Checked on the containers on 2026-11-22:
+- PostgreSQL 19.0 (`lxl-pg19`, a streaming standby made in the container with `pg_basebackup -R`):
+  - writes and DDL give 25006 "cannot execute INSERT in a read-only transaction", and so does CREATE TEMP TABLE;
+  - `pg_is_in_recovery()` is true, `in_hot_standby` on, `transaction_read_only` on;
+  - `default_transaction_read_only` is **off** (recovery does not change the GUC);
+  - `BEGIN; SET TRANSACTION READ WRITE` gives 0A000 "cannot set transaction read-write mode during recovery";
+  - `pg_current_wal_lsn()` gives 55000 "recovery is in progress";
+  - `pg_last_wal_replay_lsn()` is the replayed position, NULL on a primary.
+
+  lexdb's replica reports `default_transaction_read_only = on`. That is the user's decision, and a standby set up
+  with it in postgresql.conf says the same. With it, libpq's `target_session_attrs=read-only` and `standby` both
+  know a replica from ParameterStatus, without a query. The master now reports `in_hot_standby` and
+  `default_transaction_read_only` (off) too, as PostgreSQL 14 and later do.
+- SQL Server 2022 (`lxl-mssql`; one container cannot hold a readable secondary, so a database set with
+  `ALTER DATABASE ... SET READ_ONLY` was the nearest check):
+  - INSERT, UPDATE, DELETE, CREATE TABLE, TRUNCATE, CREATE INDEX, SELECT INTO a table and CREATE SEQUENCE all give
+    3906, level 16, state 1, "Failed to update database "rodb" because the database is read-only.";
+  - `DATABASEPROPERTYEX(db, 'Updateability')` is READ_ONLY;
+  - `sys.databases.is_read_only` is 1 for that database, and 0 for master and tempdb;
+  - `#temp` tables, `SELECT ... INTO #x` and table variables work: they live in tempdb.
+- Oracle 23.26.3 (`lxl-oracle`; FREEPDB1 opened READ ONLY, then READ WRITE again):
+  - DML, DDL, CREATE SEQUENCE and SELECT FOR UPDATE give ORA-16000 "Attempting to modify database or pluggable
+    database that is open for read-only access." This is 23.26's text; older releases say "database or pluggable
+    database open for read-only access". LOCK TABLE is accepted.
+  - `v$database` says READ ONLY / PRIMARY there. No standby was built. Oracle's documentation gives a physical
+    standby under Active Data Guard OPEN_MODE `READ ONLY WITH APPLY` and DATABASE_ROLE `PHYSICAL STANDBY`, and that
+    is what lexdb's replica gives.
+  - A read-only PDB refuses DML on a global temporary table (ORA-16000). An Active Data Guard standby allows it
+    (temporary undo, 12c), and that is what the replica's Oracle door is meant to do (temporary storage, below).
+
+**Routing read-only clients**, each door its own way:
+- **A replica announces its doors** to its master on the replication link once it listens: a line `A door addr` for
+  each listener (`tds`, `tns`, `tcps`). The master keeps the addresses in the store's memo while the link lasts.
+  So routing never sends a client to a replica that is not serving, and it works for `--replica` by hand as for
+  `--replicas N`. A replica on a wildcard host (0.0.0.0) is given with the host the client reached the master on.
+- **SQL Server:** a LOGIN7 to the master with the read-only intent (TypeFlags 0x20, `ApplicationIntent=ReadOnly`) is
+  logged in as usual. Its answer then carries ENVCHANGE 20 (routing: protocol 0, the port, the host) after LOGINACK
+  and before DONE (MS-TDS 2.2.7.9), and the client connects there.
+  - With no replica announced, the master serves the session itself, as SQL Server's read-only routing falls back to
+    the primary.
+  - A replica serves every login, read-only intent or not, like an availability group's `ALLOW_CONNECTIONS = ALL`.
+- **Oracle:** a CONNECT to the master that names the read-only service is answered with a REDIRECT packet (type 5),
+  as a listener does for a service a standby runs (Data Guard's role-based services).
+  - The packet holds the replica's `(ADDRESS=(PROTOCOL=tcp)(HOST=h)(PORT=p))`, a NUL, and the client's descriptor,
+    which the client sends again there (python-oracledb thin: `connection.pyx`).
+  - With no replica announced, the master answers REFUSE with ERR=12514, as for a role-based service that runs
+    nowhere.
+  - A replica's listener serves both the plain and the read-only names.
+- **PostgreSQL:** the protocol has no redirect. ParameterStatus (`in_hot_standby`, `default_transaction_read_only`)
+  and `SHOW transaction_read_only` are the mechanism: libpq with a host list and `target_session_attrs`, and pgjdbc
+  with `targetServerType=secondary`, pick a replica.
+
+**Temporary objects on a replica.**
+- PostgreSQL door: refused (25006), as on a standby.
+- SQL Server door: `#temp` tables and table variables allowed.
+- Oracle door: DML allowed on a global temporary table whose definition came from the master; creating one refused
+  (ORA-16000).
+
+The last two need a session's temporary rows on the replica to live outside the store's log, because the replica
+has no writable tree. That is phase 5 below.
+
+**WAIT FOR LSN** (PostgreSQL 19, lexdb-new-features.md P4). PostgreSQL 19.0's grammar and errors, checked on
+`lxl-pg19` on a primary and on the standby:
+- The grammar is `WAIT FOR LSN 'lsn' [WITH (option [, ...])]`. The options:
+  - `MODE`: `standby_replay` (the default), `standby_write`, `standby_flush` or `primary_flush`, quoted or not, in
+    any case;
+  - `TIMEOUT`: milliseconds as a number, or a text with a unit (`'10ms'`, `'1s'`). 0, or no TIMEOUT, waits for ever;
+  - `NO_THROW`: a boolean, true when given alone.
+- The errors in the options:
+  - a negative timeout: 22023 "timeout cannot be negative";
+  - `'abc'` as a timeout: 22023 `invalid timeout value: "abc"`;
+  - a NO_THROW that is not a boolean: 42601 "no_throw requires a Boolean value";
+  - an option twice: 42601 "conflicting or redundant options";
+  - an unknown option: 42601 `option "foo" not recognized`;
+  - a bad mode: 22023 `unrecognized value for WAIT option "mode": "bogus"`;
+  - a bad LSN: 22P02.
+- It gives one row with one text column, `status`:
+  - `success`;
+  - `timeout` under NO_THROW. Without it, 57014 "timed out while waiting for target LSN FFFF/00000000 to be
+    replayed; current standby_replay LSN 0/050177C8";
+  - `not in recovery`, under NO_THROW on a primary in a standby mode. Without it, 55000 "recovery is not in
+    progress", HINT "Waiting for the standby_replay LSN can only be executed during recovery."
+- `primary_flush` on a standby gives 55000 "recovery is in progress", HINT "Waiting for primary_flush can only be
+  done on a primary server. Use standby_flush mode on a standby server." On a primary it waits for the flush.
+- In a transaction that holds a snapshot (REPEATABLE READ and up) it gives 55000 "WAIT cannot be executed while the
+  current transaction holds a snapshot". Every lexdb block is SERIALIZABLE.
+- It is refused in a function or DO block (0A000), and it cannot be prepared (42601 at `wait`).
+
+**lexdb's LSN** is the batch number, written as PostgreSQL 19 writes an LSN (`%X/%08X`). A batch is a group commit's,
+the unit of the log that a replica applies whole.
+- `pg_current_wal_lsn()` on the master is its durable batch.
+- `pg_last_wal_replay_lsn()` and `pg_last_wal_receive_lsn()` on a replica are the batch it has applied.
+- The three standby modes are one on a replica: a batch arrives durable, and is applied when it is received.
+- So `pg_wal_lsn_diff` counts batches, not bytes.
+- The values are text, as lexdb has no pg_lsn type.
+
+**The other doors have no native equivalent**, and nothing is added to them:
+- SQL Server has no statement a client calls to wait for an availability group secondary's redo. Its `WAITFOR` is a
+  delay or a Service Broker receive.
+- Oracle has none in SQL either. Active Data Guard's session setting `STANDBY_MAX_DATA_DELAY` makes queries wait or
+  fail; it is not a statement.
+
+**Phases**, in the brief's order:
+1. this design;
+2. listeners on replicas, the read-only errors, the role in each catalog, ParameterStatus and SHOW;
+3. WAIT FOR LSN and the LSN functions;
+4. routing;
+5. temporary objects.
+
+What was built is below.
