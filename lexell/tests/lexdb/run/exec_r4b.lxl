@@ -1,7 +1,8 @@
 // lexdb_exec, lexdb_pipe, lexdb_plan: what the pipeline took from the row engine in Q8's R4b (design/lexdb-layers.md
 // 6.3.Q8 R4b): LATERAL after the first level (a dependent join, JH_APPLY) and a lookup per element of an array (= any).
 // Each statement runs with batches on and off (the row engine, the reference): the same rows or the same error. "piped":
-// "a" when a run with batches on asked for a LATERAL level's rows (the joins' JH_APPLY), else y when one went through
+// "a" when a run with batches on asked for a LATERAL level's rows (the joins' JH_APPLY), "e" when it looked a row up per
+// element of an array (JH_ANY, lexdb_pipe.anyCounts()), else y when one went through
 // the pipeline (lexdb_pipe.runCounts()[0], joinCounts()[0]); "pipeline runs":
 // how many such runs the group's statements made with batches on; "asks": the LATERAL asks the joins made
 // (lexdb_pipe.latCounts()[0]).
@@ -12,12 +13,15 @@
 //   past it not raised), EXISTS and a scalar subquery over a LATERAL join per outer row, nested LATERAL, LATERAL
 //   reading two earlier levels, after a join, two LATERAL levels, under an aggregate, a window, DISTINCT and ORDER BY,
 //   more rows than a batch; EXPLAIN ANALYZE's counts as the row engine's.
-// - any: a join by = any(array) of the row before (an integer key, a text key, NULLs and duplicates in the array, an
-//   empty or NULL array, values the key's type cannot hold), inner and LEFT.
+// - any: a join by = any(array) of the row before, by the primary key (JH_ANY: an integer key, a text key, NULLs and
+//   duplicates in the array, an empty or NULL array, values the key's type cannot hold, a condition besides it), inner
+//   and LEFT, an error in a later row, LIMIT, under an aggregate; an array that is an expression (the row engine's: its
+//   key is not a column, the run gives way). Inner joins the planner reorders (the table first) are not lookups.
 // timeout: 120
 // expect: lateral: 43 queries, 43 the same, piped aaaaaaaaaaaayaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, pipeline runs 1473, asks 198
 // expect: explain: EXPLAIN: scan t: primary key range (estimated 299 rows) (rows read 300, kept 299, batches 1); left join l: rows of subquery 1, run per row (lookups 299, rows read 98, joined 54, null rows 250); order: sort; subquery 1 (from): per row, on t.x (runs 51, from cache 248);   scan u: index u_k lookup (rows read 18, kept 18, batches 9);   order: the scan's;   limit: stops the scan; result: 304 rows
 // expect: explain counts as the row engine's: yes
+// expect: any: 18 queries, 18 the same, piped yyyeyeyeyeeyeyeyye, pipeline runs 36, asks 0
 import "strings"
 import "collections"
 import "../../../cmd/lexdb_store"
@@ -67,15 +71,17 @@ fn report(g: &Group) {
 fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
     let p0 = piped()
     let a0 = lexdb_pipe.latCounts()[0]
+    let e0 = lexdb_pipe.anyCounts()
     let on = stmts(s, sql)
     let p1 = piped()
     let a1 = lexdb_pipe.latCounts()[0]
+    let e1 = lexdb_pipe.anyCounts()
     let a = run(s, &"set lexdb_batch = off")
     let off = stmts(s, sql)
     let b = run(s, &"set lexdb_batch = on")
     g.n += 1
     if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
-    g.piped += if a1 > a0 { "a" } else if p1 > p0 { "y" } else { "n" }
+    g.piped += if a1 > a0 { "a" } else if e1 > e0 { "e" } else if p1 > p0 { "y" } else { "n" }
     g.runs += p1 - p0
     g.asks += a1 - a0
 }
@@ -123,8 +129,10 @@ fn main() {
             "create table tx (k text primary key, v text, n int)",
             "insert into tx values ('a', 'b', 1), ('b', 'c', 2), ('c', null, 3), ('d', 'zz', 0), ('e', 'a', 5)",
             "create table e0 (id int primary key, v int)",
-            "create table p (id int primary key, ids int[], ks text[])",
-            "insert into p values (1, array[3, 1, 3], array['a', 'c']), (2, array[]::int[], array['zz', 'b', 'b']), (3, null, null), (4, array[null, 5, 2147483647], array[null, 'e']), (5, array[400, 401, 7], array['d'])",
+            "create table p (id int primary key, ids int[], ks text[], bs bigint[])",
+            "insert into p values (1, array[3, 1, 3], array['a', 'c'], array[5000000000, 2]), (2, array[]::int[], array['zz', 'b', 'b'], null), (3, null, null, array[-5000000000]), (4, array[null, 5, 2147483647], array[null, 'e'], array[9, null, 9]), (5, array[400, 401, 7], array['d'], array[]::bigint[])",
+            "create table pb (id int primary key, ids int[], ks text[])",
+            "insert into pb select i, array[i % 50, i % 7, (i * 13) % 3000], array['k' || (i % 5), 'a'] from generate_series(1, 1500) i",
             "analyze",
         ]
         for x in setup {
@@ -192,6 +200,30 @@ fn main() {
         println("explain: " + eon)
         println("explain counts as the row engine's: " + (if noBatches(&eon) == eoff { "yes" } else { "no: " + eoff }))
         lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+
+        var ga = newGroup(&"any", &"queries")
+        let aq = [
+            "select p.id, t.id from p join t on t.id = any(p.ids) order by 1, 2",
+            "select p.id, t.id, t.x from p join t on t.id = any(p.ids) where p.id = 1 order by 1, 2",
+            "select p.id, t.id, t.x from p join t on t.id = any(p.ids) where p.id in (1, 4, 5) order by 1, 2",
+            "select p.id, t.id, t.g from p left join t on t.id = any(p.ids) order by 1, 2",
+            "select p.id, x.k, x.n from p join tx x on x.k = any(p.ks) order by 1, 2",
+            "select p.id, x.k from p left join tx x on x.k = any(p.ks) and x.n > 1 order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.bs) order by 1, 2",
+            "select p.id, t.id from p left join t on t.id = any(p.bs) order by 1, 2",
+            "select count(*), sum(t.g), count(distinct t.id) from pb left join t on t.id = any(pb.ids) where t.g > 2",
+            "select count(*), count(t.id) from pb left join t on t.id = any(pb.ids)",
+            "select count(*), count(x.k), min(x.n) from pb left join tx x on x.k = any(pb.ks)",
+            "select p.id, t.id, 10 / (t.id - 7) from p join t on t.id = any(p.ids) order by 1",
+            "select pb.id, t.id, 10 / (t.id - 7) from pb left join t on t.id = any(pb.ids) where pb.id < 900 order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.ids) limit 2",
+            "select pb.id, t.id from pb left join t on t.id = any(pb.ids) limit 4",
+            "select p.id, t.id from p join t on t.id = any(array[p.id, p.id + 1]) order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.ids) and t.x > 10 order by 1, 2",
+            "select x.k, count(*) from pb left join tx x on x.k = any(pb.ks) group by x.k order by 1",
+        ]
+        for x in aq { check(mut &s, mut &ga, &x) }
+        report(&ga)
         return 0
     }).unwrap()
 }

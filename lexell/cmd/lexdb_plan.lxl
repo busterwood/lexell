@@ -269,6 +269,11 @@ pub const JH_JOIN: int = 4
 // row asked of the consumer (the run's memo per outer values), joined on as
 // a hash's candidates; hcols the query's slots its outer values read
 pub const JH_APPLY: int = 5
+// per outer row, by its whole primary key, its last column's values an
+// array's elements (= ANY, Q8 R4b): a lookup per element, coerced to the
+// column's type, unique, in key order (the keys: the equalities, then the
+// array)
+pub const JH_ANY: int = 6
 
 // What a join gives (PJoin.mark): the joined rows, or the outer rows
 // once each that have a match (semi) or none (anti).
@@ -7766,7 +7771,9 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         // rows in slices that grow, Q8 R4)
         let look = lv.perRow && lv.semiSub < 0 && lookupPath(q, lv)
         let range = lv.perRow && !look && rangePath(q, lv)
-        if lv.perRow && !look && !range {
+        // (a primary key's lookup per element of an array, = ANY: Q8 R4b)
+        let arr = lv.perRow && !look && !range && lv.semiSub < 0 && anyLook(q, lv)
+        if lv.perRow && !look && !range && !arr {
             // census: lexdb_census.no("join: read per row, neither a key lookup nor a range")
             return Err(p)
         }
@@ -7848,11 +7855,21 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 }
             }
         } else {
-            j.how = if look { JH_LOOK } else { JH_RANGE }
-            let ix = if look { -1 } else { lv.path.index }
+            j.how = if look { JH_LOOK } else if arr { JH_ANY } else { JH_RANGE }
+            let ix = if look || arr { -1 } else { lv.path.index }
             for i in 0..len(lv.path.eqs) {
                 append(mut &j.ktypes, keyType(t, ix, i))
                 match planX(&lv.path.eqs[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
+                }
+            }
+            if arr {
+                append(mut &j.ktypes, keyType(t, -1, len(lv.path.eqs)))
+                match planX(&lv.path.inArr[0], q) {
                     Some(b) { append(mut &j.keys, b) }
                     None {
                         // census: lexdb_census.no("join: an expression does not bind (planX)")
@@ -9695,4 +9712,14 @@ fn latArm(q: &Query, k: int): Option[PJoin] {
         }
     }
     return Some(j)
+}
+
+// Whether level lv is read per row by its whole primary key, its last
+// column's values the elements of an array (x = ANY (array), Path.inArr):
+// a lookup per element (JH_ANY, Q8 R4b), as pathScans makes them.
+fn anyLook(q: &Query, lv: &Level): bool {
+    let p = &lv.path
+    if lv.virt() || lv.lateral || p.index >= 0 || p.desc || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) != 1 { return false }
+    if q.corr && pathCorr(p) { return false }
+    return len(p.eqs) + 1 == len(keyCols(&lv.t, -1))
 }
