@@ -549,7 +549,47 @@ second run had -0.22%.
 What remains in tokens is frame traffic (the token list's header and the slice staged through the
 frame), scalar replacement's ground.
 
-## 15. Next, in order
+## 15. Decimal mul, div and cmp fast paths (library, as built)
+
+Against Java BigDecimal and .NET System.Decimal, mul (6 by 6 digits), div (12 by 6, scale 2) and
+cmp (19 digits) were behind. The profile showed instructions, not stalls (4.7 per cycle): 383 a
+mul, 574 a div, 68 a cmp. Each did the general work for the common small case:
+
+- **mul** went through U256, makeDecCore and digits for every product. Now, with both coefficients
+  within 63 bits (18 digits or fewer), the signed i128 product is the result coefficient with its
+  sign (below 2^126 < 10^38). Trailing zeros go by the inverse of 5 in 64 bits (stripTens), and the
+  digit count only where the display-scale cap can bind. mulExact has the same path written out:
+  as a shared function (an out parameter, or a returned Decimal with 0 as "fall back") mul was a
+  third slower.
+- **div**'s 64-bit path now rounds (HALF_EVEN and HALF_AWAY inline, the other modes through
+  roundIncrement), strips and builds the result itself. Its entry test no longer divides
+  M64 / 10^t in 128 bits (a runtime call).
+- **cmp** is the equal-exponent test alone, under the inliner's 25 nodes, with the rest in
+  cmpApart. Reading both coefficients into locals first was a fifth faster than comparing the
+  members twice.
+
+lib/tests/run/decimal_fast_edges.lxl checks 36 by 36 values (around 2^63, trailing zeros, the
+exponent limits, the scale cap, every rounding mode at five scales) against the old library's
+output, on both backends.
+
+| measure | old | new | |
+|---|---:|---:|---:|
+| decbench mul, 6 by 6 | 17.0 ns | 8.9 ns | -48% |
+| decbench div, 12 by 6 | 23.1 ns | 14.1 ns | -39% |
+| decbench cmp | 2.72 ns | 2.17 ns | -20% |
+| decbench-big mul, 19 digits | 18.8 ns | 13.4 ns | -29% |
+| add, parse, format | | | level |
+| apps decimal | | | -1.1% cycles |
+| TPC-H server instructions per query | | | +0.03% |
+| point selects | | | level |
+
+TPC-H does not move: lexdb computes numerics in batches as scaled integers (lexdb_vec.arith) and
+uses Decimal only on the row path and where a batch result does not fit.
+
+What remains of mul and cmp is the call and the 32-byte copies in and out: the inliner's 25-node
+limit keeps mul out of line. A per-function inline mark would let it in.
+
+## 16. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against

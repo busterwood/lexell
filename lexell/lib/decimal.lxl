@@ -383,6 +383,52 @@ pub fn (a: Decimal) add(b: Decimal): Decimal {
 }
 pub fn (a: Decimal) sub(b: Decimal): Decimal { return a.add(b.neg()) }
 pub fn (a: Decimal) mul(b: Decimal): Decimal {
+    // Both coefficients within 63 bits (18 digits or fewer, nearly every value): the signed
+    // product is exact in i128 (below 2^126 < 10^38, so it fits a coefficient) and carries its
+    // sign, and only trailing zeros and the exponent's range remain to check. Written out here
+    // and in mulExact: through a shared function it was a third slower (the call and the copy
+    // of its result).
+    let l63: i128 = 9223372036854775807
+    if a.v <= l63 && a.v >= 0 - l63 && b.v <= l63 && b.v >= 0 - l63 && a.v != 0 && b.v != 0 {
+        let p = a.v *% b.v
+        var e = a.exp + b.exp
+        let m = stripTens(mag(p), mut &e)
+        if e >= EXP_MIN && e <= EXP_MAX {
+            let ds = a.dscale + b.dscale
+            // the display scale is capped so that integer digits plus fraction digits stay within
+            // 38: below 2^64 there are at most 20 digits, so with ds + 20 + e <= 38 the cap is ds
+            if m <= M64 && ds + max(0, 20 + e) <= 38 { return (Decimal{v: signed(m, p < 0), exp: e, dscale: ds}) }
+            let intd = max(0, digits(m) + e)
+            return (Decimal{v: signed(m, p < 0), exp: e, dscale: min(min(ds, DSCALE_MAX), max(0, 38 - intd))})
+        }
+    }
+    return a.mulWide(b)
+}
+
+// m without its trailing zero digits (m != 0), e raised by their count. Divisibility by 10 is
+// tested with the inverse of 5 (see INV5), in 64 bits while m fits them.
+fn stripTens(m0: u128, e: mut &int): u128 {
+    var m = m0
+    if m <= M64 {
+        var y = u64(m)
+        while true {
+            let q = (y >> 1) *% 0xcccccccccccccccd
+            if (q | (y << 63)) > 0x3333333333333333 { return u128(y) }
+            y = q
+            e += 1
+        }
+    }
+    while true {
+        let q = (m >> 1) *% INV5
+        if (q | (m << 127)) > DIV5_MAX { return m }
+        m = q
+        e += 1
+    }
+    return m
+}
+
+// mul for coefficients of more than 63 bits, or a product whose exponent is out of range.
+fn (a: Decimal) mulWide(b: Decimal): Decimal {
     // mulExact's body, returning the Decimal directly (see add).
     var r = zeroDec(0)
     if a.v != 0 && b.v != 0 {
@@ -442,6 +488,21 @@ pub fn (a: Decimal) addExact(b: Decimal): Result[Decimal, DecError] {
 // Exact product. Display scale: the sum of the two, capped at 38 minus the
 // result's integer digits (the value is never rounded).
 pub fn (a: Decimal) mulExact(b: Decimal): Result[Decimal, DecError] {
+    // mul's 63-bit path, written out again (see mul)
+    let l63: i128 = 9223372036854775807
+    if a.v <= l63 && a.v >= 0 - l63 && b.v <= l63 && b.v >= 0 - l63 && a.v != 0 && b.v != 0 {
+        let p = a.v *% b.v
+        var e = a.exp + b.exp
+        let m = stripTens(mag(p), mut &e)
+        if e >= EXP_MIN && e <= EXP_MAX {
+            let ds = a.dscale + b.dscale
+            // the display scale is capped so that integer digits plus fraction digits stay within
+            // 38: below 2^64 there are at most 20 digits, so with ds + 20 + e <= 38 the cap is ds
+            if m <= M64 && ds + max(0, 20 + e) <= 38 { return Ok(Decimal{v: signed(m, p < 0), exp: e, dscale: ds}) }
+            let intd = max(0, digits(m) + e)
+            return Ok(Decimal{v: signed(m, p < 0), exp: e, dscale: min(min(ds, DSCALE_MAX), max(0, 38 - intd))})
+        }
+    }
     var r = zeroDec(0)
     if a.v != 0 && b.v != 0 {
         r = try makeDec((a.v ^ b.v) < 0, mul128(mag(a.v), mag(b.v)), a.exp + b.exp, 0)
@@ -500,14 +561,32 @@ pub fn (a: Decimal) div(b: Decimal, scale: int, mode: Rounding): Result[Decimal,
     var q = u256(0)
     var r = n
     var half = -1
-    if t >= 0 && t <= 19 && ac <= M64 / pow10(t) && bc <= M64 {
-        // the scaled numerator and the divisor fit in 64 bits: one 64-bit divide
-        let nn = u64(ac * pow10(t))
+    if t >= 0 && t <= 19 && ac <= M64 && bc <= M64 && ac *% pow10(t) <= M64 {
+        // the scaled numerator and the divisor fit in 64 bits (ac * 10^t < 2^128 cannot wrap):
+        // one 64-bit divide, rounded and built here. The quotient has at most 20 digits and the
+        // exponent is -scale or above (at most 20 more), within range: makeDec's checks hold.
+        let nn = u64(ac *% pow10(t))
         let dd = u64(bc)
-        q = u256(u128(nn / dd))
-        r = u256(u128(nn % dd))
-        let r2 = u128(nn % dd) * 2
-        half = decCmpOf(r2 < u128(dd), r2 > u128(dd))
+        var qq = nn / dd
+        let rr = nn - qq *% dd
+        if rr != 0 {
+            // 2 * rr against dd, as rr against dd - rr (2 * rr can pass 2^64)
+            let hf = decB2i(rr > dd - rr) - decB2i(rr < dd - rr)
+            var inc = 0
+            match mode {
+                Rounding.HALF_EVEN { inc = decB2i(hf > 0 || hf == 0 && qq % 2 == 1) }
+                Rounding.HALF_AWAY { inc = decB2i(hf >= 0) }
+                else {
+                    inc = roundIncrement(mode, neg, hf, true, qq % 2 == 1)
+                    if inc < 0 { return Err(DecError.Inexact) }
+                }
+            }
+            qq += u64(inc)      // qq < nn here (dd > 1): no overflow
+        }
+        if qq == 0 { return Ok(zeroDec(scale)) }
+        var e = 0 - scale
+        let m = stripTens(u128(qq), mut &e)
+        return Ok(Decimal{v: signed(m, neg), exp: e, dscale: scale})
     } else if t >= 0 {
         n = try mulPow10(n, t, DecError.Overflow)
         let qr = divModU(n, d)
@@ -611,10 +690,20 @@ fn roundIncrement(mode: Rounding, neg: bool, half: int, dropped: bool, odd: bool
 // ---- comparison
 
 pub fn (a: Decimal) cmp(b: &Decimal): int {
+    // the same exponent: the signed coefficients order the values. Kept this small so that the
+    // inliner takes it into the caller (no call, no copy of a).
+    if a.exp != b.exp { return cmpApart(&a, b) }
+    let x = a.v
+    let y = b.v
+    return decB2i(x > y) - decB2i(x < y)
+}
+
+// cmp of values with different exponents.
+fn cmpApart(a: &Decimal, b: &Decimal): int {
     let av = a.v
     let bv = b.v
-    // the same exponent, a zero or different signs: the signed coefficients order the values
-    if a.exp == b.exp || (av ^ bv) < 0 || av == 0 || bv == 0 { return decCmpOf(av < bv, av > bv) }
+    // a zero or different signs: the signed coefficients order the values
+    if (av ^ bv) < 0 || av == 0 || bv == 0 { return decCmpOf(av < bv, av > bv) }
     let ac = mag(av)
     let bc = mag(bv)
     let da = digits(ac)
