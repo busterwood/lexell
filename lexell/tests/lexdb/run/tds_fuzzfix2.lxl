@@ -1,0 +1,172 @@
+// lexdb over TDS: the fuzzer's long run (design/lexdb-fuzz.md) through the T-SQL door, checked against SQL Server 2022
+// (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's answers: the expect lines). G1: a
+// query in parentheses as a set operation's first operand, in FROM and IN. O: integer arithmetic past int's range
+// (8115): +, -, *, /, unary minus, ABS, smallint + smallint, UPDATE. L: COALESCE and ISNULL stop at the first value not
+// NULL. Q: an integer = ALL / < ANY of decimals. W7: a correlated EXISTS and IN with a filter on the key's column and an
+// outer value. W8: MIN with a HAVING. Each batch runs with unnesting on, then W7's again with it off
+// (lexdb_plan.setUnnest(0)), each with SET lexdb_batch = off (the row engine) and on: the label and the answer, or
+// DIFFERENT and both.
+// expect: G1 a parenthesised first operand: a: 1;2
+// expect: G1 in FROM: n: 7
+// expect: G1 in IN: id: 1;6
+// expect: O +: error 8115
+// expect: O -: error 8115
+// expect: O *: error 8115
+// expect: O * fits: v: 7919000
+// expect: O unary minus: error 8115
+// expect: O ABS: error 8115
+// expect: O / -1: error 8115
+// expect: O smallint + smallint: error 8115
+// expect: O smallint * 2: v: 65534
+// expect: O bigint: v,w: 4|1000002
+// expect: O UPDATE: error 8115 // x: 2147483647
+// expect: O UPDATE fits: (1) // x: 1001
+// expect: L COALESCE: v: 1
+// expect: L ISNULL: v: 1
+// expect: L COALESCE, a NULL first: error 8134
+// expect: Q = ALL, < ANY: a,b: 0|1
+// expect: W7 EXISTS: n: 2
+// expect: W7 IN: n: 2
+// expect: W7 NOT EXISTS: n: 3
+// expect: W8 HAVING: m: 
+// expect: W8 HAVING true: m: 6
+// expect: unnest off, W7 EXISTS: n: 2
+// expect: unnest off, W7 IN: n: 2
+// expect: unnest off, W7 NOT EXISTS: n: 3
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+import "../../../cmd/lexdb_plan"
+
+const SETUP = "CREATE TABLE fo (id int NOT NULL PRIMARY KEY, x int NULL, s smallint NULL, b bigint NULL)\nINSERT INTO fo VALUES (1, 1000, 1, 1), (2, 1000000, 2, 2), (3, 2147483647, 32767, 3), (4, -2147483648, -32768, 1), (5, NULL, NULL, NULL), (6, 7, 5, 2)"
+
+const QS = "G1 a parenthesised first operand	(SELECT 1 AS a) UNION (SELECT 2) ORDER BY a\nG1 in FROM	SELECT COUNT(*) AS n FROM ((SELECT x FROM fo) UNION (SELECT 5)) AS d\nG1 in IN	SELECT id FROM fo WHERE x IN ((SELECT 1000) UNION (SELECT 7)) ORDER BY id\nO +	SELECT x + 1 AS v FROM fo WHERE id = 3\nO -	SELECT x - 1 AS v FROM fo WHERE id = 4\nO *	SELECT x * 7919 AS v FROM fo WHERE id = 2\nO * fits	SELECT x * 7919 AS v FROM fo WHERE id = 1\nO unary minus	SELECT -x AS v FROM fo WHERE id = 4\nO ABS	SELECT ABS(x) AS v FROM fo WHERE id = 4\nO / -1	SELECT x / -1 AS v FROM fo WHERE id = 4\nO smallint + smallint	SELECT s + s AS v FROM fo WHERE id = 3\nO smallint * 2	SELECT s * 2 AS v FROM fo WHERE id = 3\nO bigint	SELECT b * 2 AS v, b + x AS w FROM fo WHERE id = 2\nO UPDATE	W UPDATE fo SET x = x + 1 WHERE id = 3 ;; SELECT x FROM fo WHERE id = 3\nO UPDATE fits	W UPDATE fo SET x = x + 1 WHERE id = 1 ;; SELECT x FROM fo WHERE id = 1\nL COALESCE	SELECT COALESCE(id, 1 / (id - id)) AS v FROM fo WHERE id = 1\nL ISNULL	SELECT ISNULL(id, 1 / (id - id)) AS v FROM fo WHERE id = 1\nL COALESCE, a NULL first	SELECT COALESCE(x, 1 / (id - id)) AS v FROM fo WHERE id = 5\nQ = ALL, < ANY	SELECT CASE WHEN 1 = ALL (SELECT 1.5) THEN 1 ELSE 0 END AS a, CASE WHEN 1 < ANY (SELECT 1.5) THEN 1 ELSE 0 END AS b\nW7 EXISTS	SELECT COUNT(*) AS n FROM fo AS q1 WHERE EXISTS (SELECT 1 FROM fo AS q3 WHERE q3.b = q1.b AND q3.b <= q1.id - 2)\nW7 IN	SELECT COUNT(*) AS n FROM fo AS q1 WHERE q1.b IN (SELECT q3.b FROM fo AS q3 WHERE q3.b = q1.b AND q3.b < q1.id)\nW7 NOT EXISTS	SELECT COUNT(*) AS n FROM fo AS q1 WHERE NOT EXISTS (SELECT 1 FROM fo AS q3 WHERE q3.b = q1.b AND q3.b * 2 > q1.id)\nW8 HAVING	SELECT MIN(id) AS m FROM fo HAVING COUNT(*) > 50\nW8 HAVING true	SELECT MAX(id) AS m FROM fo HAVING COUNT(*) > 5"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A query, or a write ("W write ;; check") in a transaction rolled back, the check after the write
+fn answer(c: mut &sqlserver.Conn, q: &str): str {
+    if !strings.startsWith(q, "W ") { return show(c, q) }
+    let parts = strings.split(&q[2..len(q)], " ;; ")
+    let b = show(c, &"BEGIN TRANSACTION")
+    let w = show(c, &parts[0])
+    if strings.startsWith(&w, "error") {
+        let r = show(c, &"ROLLBACK")
+        return w + " // " + show(c, &parts[1])
+    }
+    let k = show(c, &parts[1])
+    let r = show(c, &"ROLLBACK")
+    return w + " // " + k
+}
+
+// local: lexdb, each batch with the row engine and with batches, unnesting on and then off
+fn batches(dsn: &str, local: bool) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for q in strings.lines(&setup) {
+                let r = show(mut &c, &q)
+                if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+            }
+            let text: str = QS
+            for pass in 0..2 {
+                if pass == 1 && local { lexdb_plan.setUnnest(0) }
+                for l in strings.lines(&text) {
+                    let parts = strings.split(&l, "\t")
+                    if pass == 1 && !strings.startsWith(&parts[0], "W7") { continue }
+                    let lab = if pass == 1 { "unnest off, " + parts[0] } else { parts[0].toStr() }
+                    let q = parts[1].toStr()
+                    if !local {
+                        println(lab + ": " + answer(mut &c, &q))
+                        continue
+                    }
+                    let a = show(mut &c, &"SET lexdb_batch = off")
+                    let off = answer(mut &c, &q)
+                    let b = show(mut &c, &"SET lexdb_batch = on")
+                    let on = answer(mut &c, &q)
+                    if off == on { println(lab + ": " + on) } else {
+                        println("DIFFERENT " + lab + ": " + q)
+                        println("  rows:    " + off)
+                        println("  batches: " + on)
+                    }
+                }
+            }
+            if !local {
+                for t in ["fo"] {
+                    let d = show(mut &c, &((if strings.startsWith(&t, "v") { "DROP VIEW " } else { "DROP TABLE " }) + t))
+                }
+            }
+            c.close()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { batches(&dsn, false) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(59), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
