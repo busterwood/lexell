@@ -265,6 +265,15 @@ pub const JH_ROWS: int = 3      // once, the rows of a subquery (its run's) hash
 // plan's build group): its scan the hub's, sub its members' joins over it,
 // hcols the query's slots
 pub const JH_JOIN: int = 4
+// per chunk, a LATERAL subquery's rows (Q8 R4b): its rows for each outer
+// row asked of the consumer (the run's memo per outer values), joined on as
+// a hash's candidates; hcols the query's slots its outer values read
+pub const JH_APPLY: int = 5
+// per outer row, by its whole primary key, its last column's values an
+// array's elements (= ANY, Q8 R4b): a lookup per element, coerced to the
+// column's type, unique, in key order (the keys: the equalities, then the
+// array)
+pub const JH_ANY: int = 6
 
 // What a join gives (PJoin.mark): the joined rows, or the outer rows
 // once each that have a match (semi) or none (anti).
@@ -429,7 +438,7 @@ fn joinUses(j: &PJoin, used: mut &[]bool) {
     for x in j.keys { uses(&x, used) }
     for x in j.conds { uses(&x, used) }
     for x in j.post { uses(&x, used) }
-    let at = if j.how == JH_JOIN { 0 } else { j.scan.first }
+    let at = if j.how == JH_JOIN || j.how == JH_APPLY { 0 } else { j.scan.first }
     for c in j.hcols { if at + c < len(used) { used[at + c] = true } }
     for x in j.res { uses(&x, used) }
     if j.resCol >= 0 && j.scan.first + j.resCol < len(used) { used[j.scan.first + j.resCol] = true }
@@ -7722,9 +7731,18 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
         let rj = keepsRight(lv.join)
         // (a locked table too: its rows locked after they are made, Q8 R7)
-        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || lv.lateral {
+        if !(inner || rj || lv.join == lexdb_sql.J_LEFT) || (lv.lateral && !latJoins(q)) {
             // census: noJoin(lv)
             return Err(p)
+        }
+        if lv.lateral {
+            // (a LATERAL subquery's rows per outer row, Q8 R4b)
+            match latArm(q, k) {
+                Some(j) { p = PPlan.Join(p, j) }
+                None { return Err(p) }
+            }
+            k += 1
+            continue
         }
         if lv.src >= 0 && lazySeries(q, lv.src) {
             // census: lexdb_census.no("join: a series made as read, not first")
@@ -7753,7 +7771,9 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         // rows in slices that grow, Q8 R4)
         let look = lv.perRow && lv.semiSub < 0 && lookupPath(q, lv)
         let range = lv.perRow && !look && rangePath(q, lv)
-        if lv.perRow && !look && !range {
+        // (a primary key's lookup per element of an array, = ANY: Q8 R4b)
+        let arr = lv.perRow && !look && !range && lv.semiSub < 0 && anyLook(q, lv)
+        if lv.perRow && !look && !range && !arr {
             // census: lexdb_census.no("join: read per row, neither a key lookup nor a range")
             return Err(p)
         }
@@ -7835,11 +7855,21 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 }
             }
         } else {
-            j.how = if look { JH_LOOK } else { JH_RANGE }
-            let ix = if look { -1 } else { lv.path.index }
+            j.how = if look { JH_LOOK } else if arr { JH_ANY } else { JH_RANGE }
+            let ix = if look || arr { -1 } else { lv.path.index }
             for i in 0..len(lv.path.eqs) {
                 append(mut &j.ktypes, keyType(t, ix, i))
                 match planX(&lv.path.eqs[i], q) {
+                    Some(b) { append(mut &j.keys, b) }
+                    None {
+                        // census: lexdb_census.no("join: an expression does not bind (planX)")
+                        return Err(p)
+                    }
+                }
+            }
+            if arr {
+                append(mut &j.ktypes, keyType(t, -1, len(lv.path.eqs)))
+                match planX(&lv.path.inArr[0], q) {
                     Some(b) { append(mut &j.keys, b) }
                     None {
                         // census: lexdb_census.no("join: an expression does not bind (planX)")
@@ -8175,7 +8205,8 @@ pub fn pipeShape(sel: &Sel): bool {
     // (FOR UPDATE: its rows made without LIMIT and OFFSET, which the lock
     // operator applies, Q8 R7: lockShape)
     if !(streams(sel) || sortShape(sel) || offsetShape(sel) || lockShape(sel)) || len(sel.feedback) > 0 || ((sel.topMode != 0 || sel.withTies) && !sel.sort) || sel.first >= 0 { return false }
-    if len(q.levels) == 0 || (q.corr && !lat0(q) && (applyLevel(q) < 0 || !applyR2(sel))) || len(q.top) > 0 { return false }
+    // (LATERAL levels after the first: the joins', Q8 R4b, latJoins)
+    if len(q.levels) == 0 || (q.corr && !lat0(q) && ((applyLevel(q) < 0 && !latJoins(q)) || !applyR2(sel))) || len(q.top) > 0 { return false }
     if !firstRead(q, &q.levels[0]) { return false }
     // (more outputs than its list's: a subquery run once into a hash, its
     // keys and value, hashSub's, which runHashed reads; Q8 R1)
@@ -8308,7 +8339,8 @@ pub fn winShape(sel: &Sel): bool {
     let q = &sel.q
     if len(sel.wins) == 0 || sel.aggQ || sel.setop != 0 || len(sel.srf) > 0 || len(sel.locks) > 0 || len(sel.feedback) > 0 || len(sel.mr) > 0 { return false }
     if ((sel.donKey > 0 || sel.withTies || sel.topMode != 0) && (!sel.sort || sel.distinct)) || sel.first >= 0 || hasSrfCall(&sel.exprs) { return false }
-    if len(q.levels) == 0 || q.corr || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
+    // (LATERAL levels after the first: the joins', Q8 R4b)
+    if len(q.levels) == 0 || (q.corr && !latJoins(q)) || len(q.top) > 0 || !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     return len(sel.exprs) > 0 && len(sel.exprs) == len(sel.outs)
 }
 
@@ -8446,6 +8478,8 @@ pub fn pipeWin(sel: mut &Sel): Option[PPlan] {
             return None
         }
     }
+    // (LATERAL levels after the first: their subqueries run per row by the joins' asks, Q8 R4b)
+    if sel.q.corr { jp = applySubs(replace(mut &jp, PPlan.Result([]))) }
     let pw = PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: slots}
     let proj = PPlan.Project(PPlan.Window(PPlan.Project(jp, ins), Some(pw)), xs)
     // the operators over it as physAbove makes them (EXPLAIN prints them)
@@ -8660,7 +8694,7 @@ pub fn shapeWhy(sel: &Sel): str {
 fn queryWhy(sel: &Sel): str {
     let q = &sel.q
     if len(q.levels) == 0 { return "no FROM: " + resultWhy(sel) }
-    if q.corr && !lat0(q) && applyLevel(q) < 0 { return "a correlated subquery left per row (q.corr): " + applyWhy(q) }
+    if q.corr && !lat0(q) && applyLevel(q) < 0 && !latJoins(q) { return "a correlated subquery left per row (q.corr): " + applyWhy(q) }
     if q.corr && !lat0(q) && !applyR2(sel) { return "a correlated subquery left per row (q.corr): under an OFFSET, TOP PERCENT or WITH TIES" }
     if len(q.top) > 0 { return "conditions on no table (q.top)" }
     if !firstRead(q, &q.levels[0]) { return "first level: " + levelWhy(q, &q.levels[0]) }
@@ -8677,7 +8711,7 @@ pub fn aggWhy(sel: &Sel): str {
     if sel.first >= 0 && len(q.levels) != 1 { return "agg: MIN or MAX by the scan's order (Sel.first), over joins" }
     if len(sel.locks) > 0 { return "FOR UPDATE" }
     if len(q.levels) == 0 { return "agg: no FROM" }
-    if q.corr && !lat0(q) && applyLevel(q) < 0 && !viewsCorr(q) { return "agg: a correlated subquery left per row (q.corr): " + applyWhy(q) }
+    if q.corr && !lat0(q) && applyLevel(q) < 0 && !viewsCorr(q) && !latJoins(q) { return "agg: a correlated subquery left per row (q.corr): " + applyWhy(q) }
     if q.corr && !lat0(q) && aggCorr(sel) { return "agg: a correlated subquery in a key or argument" }
     if q.corr && !lat0(q) && sel.first >= 0 { return "agg: a correlated subquery left per row under MIN or MAX by the scan's order" }
     if len(q.top) > 0 { return "agg: conditions on no table (q.top)" }
@@ -8822,7 +8856,7 @@ pub fn aggShape(sel: &Sel): bool {
     // one left per row: an Apply's, Q8 R6, not in a key or argument, not
     // under MIN/MAX by the scan's order, R2's MinMax)
     // (one called above the groups only: the caller's, Q8 R7, viewsCorr)
-    if len(q.levels) == 0 || (q.corr && !lat0(q) && ((applyLevel(q) < 0 && !viewsCorr(q)) || aggCorr(sel) || sel.first >= 0)) || len(q.top) > 0 ||
+    if len(q.levels) == 0 || (q.corr && !lat0(q) && ((applyLevel(q) < 0 && !viewsCorr(q) && !latJoins(q)) || aggCorr(sel) || sel.first >= 0)) || len(q.top) > 0 ||
        !firstRead(q, &q.levels[0]) || !boundOnce(q) { return false }
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
@@ -9301,7 +9335,7 @@ pub fn applyWhy(q: &Query): str {
         let lv = &q.levels[k]
         if pathCorr(&lv.path) { return "a path's key" }
         // (at the first level over outer values only: the pipeline's, lat0, Q8 R3)
-        if lv.lateral { return if k == 0 { "LATERAL at the first level, with another subquery per row" } else { "LATERAL after the first level (a join per row)" } }
+        if lv.lateral { return if k == 0 { "LATERAL at the first level, with another subquery per row" } else { "LATERAL after the first level, with another subquery per row" } }
         if anyCorr(&lv.local) || anyCorr(&lv.hashVals) || (lv.resNot && hasCorr(&lv.resVal)) { return "a hash's key or build condition" }
         if corrTail(&lv.cond) < 0 || corrTail(&lv.post) < 0 { return "not a level's last conjuncts" }
         if corrTail(&lv.cond) > 0 || corrTail(&lv.post) > 0 {
@@ -9426,7 +9460,9 @@ pub fn applyAt(p: &PPlan): int {
 pub fn applyOver(q: &Query, input: PPlan): PPlan {
     let k = applyLevel(q)
     // (no Apply: a LATERAL first level over outer values, run once a run, Q8 R3)
-    return if k >= 0 { PPlan.Apply(applySubs(input), applyOf(q, k)) } else if lat0(q) { lat0Once(input, q.levels[0].src) } else { input }
+    // (LATERAL levels after the first: their subqueries run per row by the joins' asks, Q8 R4b)
+    return if k >= 0 { PPlan.Apply(applySubs(input), applyOf(q, k)) } else if lat0(q) { lat0Once(input, q.levels[0].src) } else if latJoins(q) { applySubs(input) }
+           else { input }
 }
 
 // sel's joins jp under an Apply if its query has one (applyOver).
@@ -9597,4 +9633,98 @@ pub fn srfPlan(sel: mut &Sel): Option[PPlan] {
         Some(p) { return Some(PPlan.ProjectSet(p, oids)) }
         None { return None }
     }
+}
+
+// ---- LATERAL after the first level: a dependent join (Q8 R4b;
+// design/lexdb-layers.md 6.3.Q8 R4b as built)
+//
+// A LATERAL subquery or function in FROM after the first level (CROSS and
+// OUTER APPLY too) is a join arm of its own (JH_APPLY): the joins give a
+// chunk's rows' outer values to their consumer as an ask
+// (lexdb_pipe.latFrom), whose caller runs the subquery per row with the
+// run's memo of rows per outer values (lexdb_exec.latAsk, as runLevel's
+// LATERAL arm), and joins its rows on as a hash level's candidates: its
+// conditions, a LEFT one's NULL row, its WHERE conjuncts after it.
+
+// Whether q's correlated subqueries left per row are all LATERAL levels
+// after the first (none at the first level), each a FROM subquery of its
+// own: the joins run them (JH_APPLY).
+pub fn latJoins(q: &Query): bool {
+    if !q.corr || len(q.levels) < 2 || q.levels[0].lateral { return false }
+    var any = false
+    for i in 0..len(q.subs) {
+        let sp = &q.subs[i]
+        if len(sp.sel.q.refs) == 0 || (sp.use == lexdb_sql.SUB_FROM && sp.hashed) { continue }
+        if sp.use != lexdb_sql.SUB_FROM { return false }
+        var at = -1
+        for k in 1..len(q.levels) { if q.levels[k].lateral && q.levels[k].src == i { at = k } }
+        if at < 0 { return false }
+        any = true
+    }
+    return any
+}
+
+// Whether a level after q's first is LATERAL (latJoins' plans: their
+// run's ask, lexdb_exec).
+pub fn latLater(q: &Query): bool {
+    for k in 1..len(q.levels) { if q.levels[k].lateral { return true } }
+    return false
+}
+
+// Whether a join plan p of q asks its caller per row: an Apply's
+// (applyAt), or LATERAL levels after the first (latLater; one call for
+// runPipe, whose code a point select runs).
+pub fn asksJoin(p: &PPlan, q: &Query): bool { return applyAt(p) >= 0 || (q.corr && latLater(q)) }
+
+// Level k's arm, a LATERAL subquery's rows per outer row (JH_APPLY; q
+// latJoins'): inner or LEFT, its outer values' columns (hcols, the query's
+// slots), every condition of the level (none applied as read: its rows
+// are made per row) and a LEFT one's WHERE conjuncts after it, bound for
+// the plan. None: a semi, anti or mark level's, a locked one, an inner
+// one with a WHERE after it, an expression that does not bind.
+fn latArm(q: &Query, k: int): Option[PJoin] {
+    let lv = &q.levels[k]
+    let inner = lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS
+    if lv.src < 0 || !lv.perRow || lv.semi || lv.anti || lv.mode != 0 || lv.semiSub >= 0 || lv.lock != 0 || lv.grp != 0 ||
+       !(inner || lv.join == lexdb_sql.J_LEFT) {
+        // census: lexdb_census.no("join: LATERAL, a kind it does not join")
+        return None
+    }
+    if inner && len(lv.post) > 0 {
+        // census: lexdb_census.no("join: an inner level with a WHERE after it (post)")
+        return None
+    }
+    var j = PJoin{how: JH_APPLY, kind: if inner { lexdb_sql.J_INNER } else { lexdb_sql.J_LEFT }, mark: MK_JOIN, resCol: -1, res: [],
+                  scan: joinScan(q, k), build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [],
+                  index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
+    for x in q.subs[lv.src].sel.q.refs { colsRead(&x, &q.cols, mut &j.hcols) }
+    for x in lv.cond {
+        match planX(&x, q) {
+            Some(b) { append(mut &j.conds, b) }
+            None {
+                // census: lexdb_census.no("join: an expression does not bind (planX)")
+                return None
+            }
+        }
+    }
+    for x in lv.post {
+        match planX(&x, q) {
+            Some(b) { append(mut &j.post, b) }
+            None {
+                // census: lexdb_census.no("join: an expression does not bind (planX)")
+                return None
+            }
+        }
+    }
+    return Some(j)
+}
+
+// Whether level lv is read per row by its whole primary key, its last
+// column's values the elements of an array (x = ANY (array), Path.inArr):
+// a lookup per element (JH_ANY, Q8 R4b), as pathScans makes them.
+fn anyLook(q: &Query, lv: &Level): bool {
+    let p = &lv.path
+    if lv.virt() || lv.lateral || p.index >= 0 || p.desc || len(p.rng) > 0 || len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) != 1 { return false }
+    if q.corr && pathCorr(p) { return false }
+    return len(p.eqs) + 1 == len(keyCols(&lv.t, -1))
 }

@@ -1,0 +1,229 @@
+// lexdb_exec, lexdb_pipe, lexdb_plan: what the pipeline took from the row engine in Q8's R4b (design/lexdb-layers.md
+// 6.3.Q8 R4b): LATERAL after the first level (a dependent join, JH_APPLY) and a lookup per element of an array (= any).
+// Each statement runs with batches on and off (the row engine, the reference): the same rows or the same error. "piped":
+// "a" when a run with batches on asked for a LATERAL level's rows (the joins' JH_APPLY), "e" when it looked a row up per
+// element of an array (JH_ANY, lexdb_pipe.anyCounts()), else y when one went through
+// the pipeline (lexdb_pipe.runCounts()[0], joinCounts()[0]); "pipeline runs":
+// how many such runs the group's statements made with batches on; "asks": the LATERAL asks the joins made
+// (lexdb_pipe.latCounts()[0]).
+// - lateral: a LATERAL subquery or function after the first level, inner and LEFT (ON true, an ON condition that fails,
+//   WHERE conjuncts after it), its subquery with an ORDER BY and LIMIT, a function in FROM over the row (generate_series,
+//   unnest with NULLs), NULL outer values, no rows for a row, repeated outer values (the memo), text keys, an empty first
+//   table, an error in a later row (22012) in the subquery, in its ON condition and in an output, LIMIT over it (the error
+//   past it not raised), EXISTS and a scalar subquery over a LATERAL join per outer row, nested LATERAL, LATERAL
+//   reading two earlier levels, after a join, two LATERAL levels, under an aggregate, a window, DISTINCT and ORDER BY,
+//   more rows than a batch; EXPLAIN ANALYZE's counts as the row engine's.
+// - any: a join by = any(array) of the row before, by the primary key (JH_ANY: an integer key, a text key, NULLs and
+//   duplicates in the array, an empty or NULL array, values the key's type cannot hold, a condition besides it), inner
+//   and LEFT, an error in a later row, LIMIT, under an aggregate; an array that is an expression (the row engine's: its
+//   key is not a column, the run gives way). Inner joins the planner reorders (the table first) are not lookups.
+// timeout: 120
+// expect: lateral: 43 queries, 43 the same, piped aaaaaaaaaaaayaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, pipeline runs 1473, asks 198
+// expect: explain: EXPLAIN: scan t: primary key range (estimated 299 rows) (rows read 300, kept 299, batches 1); left join l: rows of subquery 1, run per row (lookups 299, rows read 98, joined 54, null rows 250); order: sort; subquery 1 (from): per row, on t.x (runs 51, from cache 248);   scan u: index u_k lookup (rows read 18, kept 18, batches 9);   order: the scan's;   limit: stops the scan; result: 304 rows
+// expect: explain counts as the row engine's: yes
+// expect: any: 18 queries, 18 the same, piped yyyeyeyeyeeyeyeyye, pipeline runs 36, asks 0
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] }
+
+type Group = record { name: str; word: str; n: int; same: int; piped: str; runs: int; asks: int }
+
+fn newGroup(name: &str, word: &str): Group { return Group{name: name.clone(), word: word.clone(), n: 0, same: 0, piped: "", runs: 0, asks: 0} }
+
+fn report(g: &Group) {
+    println(g.name + ": " + g.n.toStr() + " " + g.word + ", " + g.same.toStr() + " the same, piped " + g.piped + ", pipeline runs " + g.runs.toStr() + ", asks " + g.asks.toStr())
+}
+
+// Statements (separated by ";;") with batches on and off.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let p0 = piped()
+    let a0 = lexdb_pipe.latCounts()[0]
+    let e0 = lexdb_pipe.anyCounts()
+    let on = stmts(s, sql)
+    let p1 = piped()
+    let a1 = lexdb_pipe.latCounts()[0]
+    let e1 = lexdb_pipe.anyCounts()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = stmts(s, sql)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if a1 > a0 { "a" } else if e1 > e0 { "e" } else if p1 > p0 { "y" } else { "n" }
+    g.runs += p1 - p0
+    g.asks += a1 - a0
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str): str {
+    var out: []str = []
+    for w in strings.split(sql, &";;") { append(mut &out, run(s, &w)) }
+    return strings.join(&out, " // ")
+}
+
+// x without its timing
+fn noTime(x: &str): str {
+    let r = strings.indexOf(x, &"result: ", 0)
+    if r < 0 { return x.toStr() }
+    let i = strings.indexOf(x, &" rows in ", r)
+    return if i >= 0 { x[0..i + 5].toStr() } else { x.toStr() }
+}
+
+// x without its ", batches N" counts
+fn noBatches(x: &str): str {
+    var out = ""
+    var i = 0
+    while i < len(x) {
+        if strings.startsWith(&x[i..len(x)], &", batches ") {
+            i += 10
+            while i < len(x) && x[i] >= byte(48) && x[i] <= byte(57) { i += 1 }
+            continue
+        }
+        out.addByte(x[i])
+        i += 1
+    }
+    return out
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(91), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let setup = [
+            "create table t (id int primary key, g int, x int, s text)",
+            "insert into t select i, i % 7, case when i % 13 = 0 then null else i % 50 end, case when i % 11 = 0 then null else 'k' || (i % 20) end from generate_series(1, 3000) i",
+            "create table u (id int primary key, k int, w int, c text)",
+            "insert into u select i, i % 9, (i * 37) % 1000, 'c' || (i % 4) from generate_series(1, 400) i",
+            "create index u_k on u (k)",
+            "create table tx (k text primary key, v text, n int)",
+            "insert into tx values ('a', 'b', 1), ('b', 'c', 2), ('c', null, 3), ('d', 'zz', 0), ('e', 'a', 5)",
+            "create table e0 (id int primary key, v int)",
+            "create table p (id int primary key, ids int[], ks text[], bs bigint[])",
+            "insert into p values (1, array[3, 1, 3], array['a', 'c'], array[5000000000, 2]), (2, array[]::int[], array['zz', 'b', 'b'], null), (3, null, null, array[-5000000000]), (4, array[null, 5, 2147483647], array[null, 'e'], array[9, null, 9]), (5, array[400, 401, 7], array['d'], array[]::bigint[])",
+            "create table pb (id int primary key, ids int[], ks text[])",
+            "insert into pb select i, array[i % 50, i % 7, (i * 13) % 3000], array['k' || (i % 5), 'a'] from generate_series(1, 1500) i",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var gl = newGroup(&"lateral", &"queries")
+        let ls = [
+            "select t.id, l.w from t, lateral (select u.w from u where u.k = t.g order by u.id limit 2) l where t.id < 30 order by t.id, l.w",
+            "select t.id, l.w from t cross join lateral (select u.w from u where u.k = t.g order by u.w desc limit 3) l where t.id < 20",
+            "select t.id, z.v from t, lateral generate_series(1, t.g) z(v) where t.id < 20 order by 1, 2",
+            "select t.id, z.v from t, unnest(array[t.g, t.x, t.g]) z(v) where t.id < 30 order by 1, 2",
+            "select t.id, l.w from t left join lateral (select u.w from u where u.k = t.g + 100) l on true where t.id < 10 order by 1",
+            "select t.id, l.w from t left join lateral (select u.w from u where u.k = t.g order by u.id limit 2) l on l.w > 500 where t.id < 25 order by 1, 2",
+            "select t.id, l.w from t left join lateral (select u.w from u where u.k = t.g + 5 order by u.id limit 1) l on true where t.id < 30 and (l.w is null or l.w > 500) order by 1",
+            "select t.id, l.id from t, lateral (select u.id from u where u.id = t.x) l where t.id < 60 order by 1",
+            "select t.id, l.id from t left join lateral (select u.id from u where u.id = t.x) l on true where t.id < 60 order by 1",
+            "select count(*), count(l.id), sum(l.w) from t left join lateral (select u.id, u.w from u where u.k = t.x) l on true",
+            "select x.k, l.v, l.n from tx x, lateral (select y.v, y.n from tx y where y.k = x.v) l order by 1",
+            "select x.k, l.v from tx x left join lateral (select y.v from tx y where y.k = x.v or y.v = x.k) l on true order by 1, 2",
+            "select * from e0, lateral (select e0.v + 1 z) l",
+            "select e0.id, l.z from u left join e0 on e0.id = u.id left join lateral (select e0.v + u.w z) l on true where u.id < 4 order by 1, 2",
+            "select t.id, l.q from t, lateral (select 10 / (t.id - 25) q) l where t.id < 40 order by 1",
+            "select t.id, l.w from t join lateral (select u.w from u where u.k = t.g limit 1) l on 10 / (t.id - 17) > 0 where t.id < 30 order by 1",
+            "select t.id, 10 / (l.w - 777) from t, lateral (select u.w from u where u.id = t.id) l where t.id < 400 order by 1",
+            "select t.id, l.q from t, lateral (select 10 / (t.id - 5) q) l limit 3",
+            "select t.id, l.w from t cross join lateral (select u.w from u where u.k = t.g order by u.id limit 2) l limit 5",
+            "select t.id, l.w from t, lateral (select u.w from u where u.k = t.g order by u.id) l where t.id > 10 limit 4",
+            "select u.id from u where u.id < 30 and exists (select 1 from t, lateral (select t.x + u.k z) l where t.id = u.id and l.z > 20) order by 1",
+            "select u.id, (select l.z from t, lateral (select t.x * 2 + u.k z) l where t.id = u.id + 1) from u where u.id < 20 order by 1",
+            "select t.id, a.w, b.z from t, lateral (select u.w, u.id from u where u.k = t.g order by u.id limit 2) a, lateral (select a.w + t.id z) b where t.id < 10 order by 1, 2, 3",
+            "select t.id, l.id, l.z from t, lateral (select u.id, m.z from u, lateral (select u.w + t.id z) m where u.k = t.g order by u.id limit 2) l where t.id < 8 order by 1, 2",
+            "select t.id, u.id, l.z from t join u on u.id = t.x, lateral (select t.g + u.k z) l where t.id < 20 order by 1",
+            "select t.id, a.w, b.c from t, lateral (select u.w from u where u.k = t.g order by u.id limit 1) a left join lateral (select u.c from u where u.w between a.w and a.w + 30 order by u.id) b on true where t.id < 15 order by 1",
+            "select count(*), sum(l.w), min(l.c) from t, lateral (select u.w, u.c from u where u.k = t.g order by u.id limit 3) l",
+            "select t.g, count(*), max(l.w) from t, lateral (select u.w from u where u.k = t.g and u.w > t.id % 500) l where t.id < 300 group by t.g order by 1",
+            "select l.id, t.id, row_number() over (order by l.id, t.id) from t cross join lateral (select u.id from u where u.k = t.x order by u.id limit 1) l where t.id < 20 order by 3",
+            "select distinct l.c from t, lateral (select u.c from u where u.k = t.g) l where t.id < 50 order by 1",
+            "select t.id, l.w from t, lateral (select u.w from u where u.k = t.g) l where t.id < 100 order by l.w desc, t.id limit 7",
+            "select count(*), count(distinct l.id) from t, lateral (select u.id from u where u.k = t.g) l",
+            "select t.id, l.n from t, lateral (select count(*) n from u where u.k = t.x) l where t.id < 40 order by 1",
+            "select t.id, l.s from t, lateral (select t.s || u.c s from u where u.id = t.g) l where t.id < 25 order by 1",
+            "select t.id from t, lateral (select 1 z where t.x is null) l order by 1",
+            "select t.id, l.a, l.b from t, lateral (select t.x a, t.g b) l where t.id < 10 order by 1",
+            "select t.id, l.w from t, lateral (select u.w from u where u.k = t.g order by u.id limit 1) l where l.w > 900 order by 1",
+            "select t.id, z.v from t left join lateral unnest(case when t.g = 0 then array[]::int[] else array[t.g] end) z(v) on true where t.id < 16 order by 1",
+            "select count(*) from t, lateral (select u.id from u where u.k = t.g) l where l.id > 390",
+            "select t.id, l.z from t, lateral (select t.g / (t.id % 9) z) l where t.id between 1 and 20 order by 1",
+            "select t.id, (t.g * 1000000000)::int4, l.q from t, lateral (select 10 / (t.id - 30) q) l where t.id < 40 order by 1",
+            "select t.id, (t.g * 1000000000)::int4, l.q from t, lateral (select 10 / (t.id - 2) q) l where t.id < 40 order by 1",
+            "select t.id, l.q from t, lateral (select 10 / (t.id - 30) q) l where t.id < 40 and (t.g * 1000000000)::int4 > 0",
+        ]
+        // (per outer row: unnesting off, so a LATERAL aggregate stays a LATERAL level)
+        lexdb_plan.setUnnest(0)
+        for x in ls { check(mut &s, mut &gl, &x) }
+        report(&gl)
+
+        // EXPLAIN ANALYZE's counts as the row engine's (its batches aside)
+        let eq = "explain analyze select t.id, l.w from t left join lateral (select u.w from u where u.k = t.x order by u.id limit 2) l on l.w > 300 where t.id < 300 order by t.id, l.w"
+        let eon = noTime(run(mut &s, &eq))
+        let a = run(mut &s, &"set lexdb_batch = off")
+        let eoff = noTime(run(mut &s, &eq))
+        let b = run(mut &s, &"set lexdb_batch = on")
+        println("explain: " + eon)
+        println("explain counts as the row engine's: " + (if noBatches(&eon) == eoff { "yes" } else { "no: " + eoff }))
+        lexdb_plan.setUnnest(lexdb_plan.UN_NOTIN | lexdb_plan.UN_MARK | lexdb_plan.UN_LOOK | lexdb_plan.UN_SCALAR | lexdb_plan.UN_LATERAL)
+
+        var ga = newGroup(&"any", &"queries")
+        let aq = [
+            "select p.id, t.id from p join t on t.id = any(p.ids) order by 1, 2",
+            "select p.id, t.id, t.x from p join t on t.id = any(p.ids) where p.id = 1 order by 1, 2",
+            "select p.id, t.id, t.x from p join t on t.id = any(p.ids) where p.id in (1, 4, 5) order by 1, 2",
+            "select p.id, t.id, t.g from p left join t on t.id = any(p.ids) order by 1, 2",
+            "select p.id, x.k, x.n from p join tx x on x.k = any(p.ks) order by 1, 2",
+            "select p.id, x.k from p left join tx x on x.k = any(p.ks) and x.n > 1 order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.bs) order by 1, 2",
+            "select p.id, t.id from p left join t on t.id = any(p.bs) order by 1, 2",
+            "select count(*), sum(t.g), count(distinct t.id) from pb left join t on t.id = any(pb.ids) where t.g > 2",
+            "select count(*), count(t.id) from pb left join t on t.id = any(pb.ids)",
+            "select count(*), count(x.k), min(x.n) from pb left join tx x on x.k = any(pb.ks)",
+            "select p.id, t.id, 10 / (t.id - 7) from p join t on t.id = any(p.ids) order by 1",
+            "select pb.id, t.id, 10 / (t.id - 7) from pb left join t on t.id = any(pb.ids) where pb.id < 900 order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.ids) limit 2",
+            "select pb.id, t.id from pb left join t on t.id = any(pb.ids) limit 4",
+            "select p.id, t.id from p join t on t.id = any(array[p.id, p.id + 1]) order by 1, 2",
+            "select p.id, t.id from p join t on t.id = any(p.ids) and t.x > 10 order by 1, 2",
+            "select x.k, count(*) from pb left join tx x on x.k = any(pb.ks) group by x.k order by 1",
+        ]
+        for x in aq { check(mut &s, mut &ga, &x) }
+        report(&ga)
+        return 0
+    }).unwrap()
+}

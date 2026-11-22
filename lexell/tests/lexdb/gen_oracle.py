@@ -167,6 +167,7 @@ CHECKED = {
     'tns_unnest': ('consts', 'QUERIES'), 'tns_unnest_agg': ('consts', 'QUERIES'), 'tns_subrows': ('consts', 'QS'),
     'tns_r3': ('consts', 'QS'),
     'tns_r4': ('consts', 'QS'),
+    'tns_r4b': ('consts', 'QS'),
     'tns_r5': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
