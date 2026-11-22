@@ -363,6 +363,10 @@ pub type PAgg = record {
     pub keep: []bool        // per column of the query: kept in a group's first row (read after grouping: outputs, HAVING, ORDER BY)
     pub sets: [][]int       // GROUPING SETS, ROLLUP, CUBE: per set the places of its keys (in keys); a group of each set; [] plain
     pub kinds: []int        // per key its collation's kind (lexdb_sql.COLL_*; Q8 R2: a collated key groups by its collated value)
+    // (Q8 R7) the HAVING over its groups (the Filter above) may be checked
+    // as each group is given, a group it drops not kept: GROUP BY keys, no
+    // grouping sets, no subquery, an immutable condition bound for the plan
+    pub fuse: bool
 }
 
 // An aggregate call of any function (lexdb_agg's: count (star: count(*)),
@@ -8653,6 +8657,7 @@ pub fn aggWhy(sel: &Sel): str {
     if !boundOnce(q) { return "agg: conditions not bound once (boundOnce)" }
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return "agg: one table, with columns besides its own" }
     if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return "agg: a collation's GROUP BY key in grouping sets" } } }
+    if hasSrfCall(&sel.exprs) { return "agg: a set-returning function in the select list" }
     return ""
 }
 
@@ -8675,10 +8680,11 @@ fn noAgg(r: &str): Option[PPlan] {
 }
 
 // An aggregate's plan for the pipeline (slice P1b; lexdb_exec compiles it, lexdb_pipe.compile):
-// Agg (Filter? (Scan)) under physOf's operators over the groups (views:
-// HAVING, the outputs, DISTINCT, ORDER BY and LIMIT stay execSel's, over
-// the groups the pipeline gives). The keys and calls bound for the plan,
-// and the table's conditions (Query.cc) moved, into the arms. None: no plan (what was moved is given back).
+// Agg (Filter? (Scan)) under the operators over its groups (grpViews, Q8
+// R7: HAVING, the window calls, the outputs, DISTINCT, ORDER BY and LIMIT,
+// lexdb_pipe.runGroups'). The keys and calls bound for the plan, and the
+// table's conditions (Query.cc) moved, into the arms. None: no plan (what
+// was moved is given back).
 pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     var keys: []BX = []
     for x in sel.groupBy {
@@ -8769,8 +8775,9 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     }
     // (correlated subqueries left per row: an Apply's over the joins, Q8 R6)
     if sel.q.corr { input = applyOver(&sel.q, replace(mut &input, PPlan.Result([]))) }
-    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds)}))
-    return Some(physAbove(sel, agg))
+    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds),
+                                                                                                   fuse: fuseOf(sel)}))
+    return Some(grpViews(sel, agg))
 }
 
 // Whether sel is an aggregate the pipeline may run: one table read per
@@ -8789,7 +8796,200 @@ pub fn aggShape(sel: &Sel): bool {
     // (one table: the query's only columns; joins: each level's, joinsOver)
     if len(q.levels) == 1 && (q.levels[0].first != 0 || len(q.cols) != len(q.levels[0].t.cols)) { return false }
     if len(sel.gsets) > 0 { for k in sel.groupKinds { if k != lexdb_sql.COLL_EXACT { return false } } }
-    return true
+    // (a set-returning function in the select list over the groups: the row engine's)
+    return !hasSrfCall(&sel.exprs)
+}
+
+// ---- the views over an aggregate's groups as operators (Q8 R7,
+// design/lexdb-layers.md 6.3.Q8 R7 as built (group views, FOR UPDATE))
+//
+// An aggregate the pipeline runs has its HAVING, window calls, select
+// list, DISTINCT, ORDER BY and LIMIT as operators over its groups' rows,
+// run by lexdb_pipe.runGroups: Match? (Limit? (Sort? (Distinct? (Project
+// (Window? (Filter? (Agg))))))). A group's row is its first row (the
+// query's columns it keeps) and its calls' values (#agg i; then, under a
+// Window, its window calls' values). Each expression is bound over that
+// row (grpX), or marked (lexdb_bind.evalMark) for the caller, which
+// evaluates it as the row engine does (a correlated subquery, a session's
+// or volatile call). The Filter holds HAVING (with grouping sets one
+// condition a set, true where a set has none); the Project the outputs,
+// then the ORDER BY keys that are not outputs (with grouping sets a stride
+// of them a set, each set's as it sees them, Sel.gx and Sel.gord); the
+// Sort's PSort the keys, DISTINCT ON, TOP and WITH TIES (a Sort is there
+// for TOP alone too).
+
+// x bound over a group's row, else marked for the caller.
+fn grpX(x: &Expr, q: &Query): BX {
+    match winX(x, q) {
+        Some(b) { return b }
+        None { return lexdb_bind.evalMark() }
+    }
+}
+
+// Whether p is an aggregate's groups: an Agg, or a Filter or Window over
+// one (grpViews').
+pub fn onGroups(p: &PPlan): bool {
+    match p {
+        PPlan.Agg(_, _, _) { return true }
+        PPlan.Filter(i, _) { return onGroups(&i) }
+        PPlan.Window(i, _) { return onGroups(&i) }
+        else { return false }
+    }
+}
+
+// Whether the operators over p's groups (grpViews') mark an expression for
+// the caller.
+pub fn grpMarks(p: &PPlan): bool {
+    match p {
+        PPlan.Match(i) { return grpMarks(&i) }
+        PPlan.Limit(i, _, _, _) { return grpMarks(&i) }
+        PPlan.Sort(i, _, _) { return grpMarks(&i) }
+        PPlan.Distinct(i, _, _) { return grpMarks(&i) }
+        PPlan.Project(i, xs) {
+            for x in xs { if lexdb_bind.isEvalMark(&x) { return true } }
+            return grpMarks(&i)
+        }
+        PPlan.Window(i, pw) {
+            match pw {
+                Some(w) {
+                    for ks in w.keys { for x in ks { if lexdb_bind.isEvalMark(&x) { return true } } }
+                    for avs in w.args { for x in avs { if lexdb_bind.isEvalMark(&x) { return true } } }
+                    for os in w.offs {
+                        for o in os {
+                            match o {
+                                Some(x) { if lexdb_bind.isEvalMark(&x) { return true } }
+                                None {}
+                            }
+                        }
+                    }
+                }
+                None {}
+            }
+            return grpMarks(&i)
+        }
+        PPlan.Filter(i, cs) {
+            if !onGroups(&i) { return false }
+            for x in cs { if lexdb_bind.isEvalMark(&x) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Whether sel's HAVING may be checked as each group is given (PAgg.fuse).
+fn fuseOf(sel: &Sel): bool {
+    match sel.having {
+        Some(h) {
+            return len(sel.groupBy) > 0 && len(sel.gsets) == 0 && len(sel.q.subs) == 0 && lexdb_bind.immutable(&h) && !hasSubCall(&h) &&
+                   !lexdb_bind.isEvalMark(&grpX(&h, &sel.q))
+        }
+        None { return false }
+    }
+}
+
+// The operators over agg's groups (see above).
+fn grpViews(sel: &Sel, agg: PPlan): PPlan {
+    let q = &sel.q
+    let sets = len(sel.gsets) > 0
+    let ns = if sets { len(sel.gsets) } else { 1 }
+    let nOut = len(sel.exprs)
+    // HAVING
+    var p = agg
+    if sets {
+        var hs: []BX = []
+        var any = false
+        for si in 0..ns {
+            match sel.gh[si] {
+                Some(h) {
+                    append(mut &hs, grpX(&h, q))
+                    any = true
+                }
+                None { append(mut &hs, BX.Const(Val.Bool(true))) }
+            }
+        }
+        if any { p = PPlan.Filter(p, hs) }
+    } else {
+        match sel.having {
+            Some(h) { p = PPlan.Filter(p, [grpX(&h, q)]) }
+            None {}
+        }
+    }
+    // the window calls over the groups
+    if len(sel.wins) > 0 {
+        var keys: [][]BX = []
+        var args: [][]BX = []
+        var offs: [][]Option[BX] = []
+        for w in sel.wins {
+            var ks: []BX = []
+            for x in w.part { append(mut &ks, grpX(&x, q)) }
+            for x in w.order { append(mut &ks, grpX(&x, q)) }
+            var avs: []BX = []
+            for x in lexdb_window.argsOf(&w) { append(mut &avs, grpX(&x, q)) }
+            var os: []Option[BX] = []
+            for ox in [w.startOff.clone(), w.endOff.clone()] {
+                match ox {
+                    Some(x) { append(mut &os, Some(grpX(&x, q))) }
+                    None { append(mut &os, None) }
+                }
+            }
+            append(mut &keys, ks)
+            append(mut &args, avs)
+            append(mut &offs, os)
+        }
+        p = PPlan.Window(p, Some(PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: []}))
+    }
+    // the outputs, then the ORDER BY keys that are not outputs (per set)
+    let nk = len(sel.order)
+    var out: []int = array(nk, -1)
+    var extra: []bool = array(nk, false)
+    var ne = 0
+    if sel.sort {
+        for k in 0..nk {
+            var at = -3
+            for si in 0..ns {
+                let o = lexdb_bind.orderOut(if sets { &sel.gord[si][k] } else { &sel.order[k] }, &q.cols, &sel.outs, nOut)
+                if at == -3 { at = o } else if at != o { at = -1 }
+            }
+            if at >= 0 { out[k] = at } else {
+                extra[k] = true
+                out[k] = nOut + ne
+                ne += 1
+            }
+        }
+    }
+    var xs: []BX = []
+    for si in 0..ns {
+        for i in 0..nOut { append(mut &xs, grpX(if sets { &sel.gx[si][i] } else { &sel.exprs[i] }, q)) }
+        for k in 0..nk {
+            if !extra[k] { continue }
+            let o = if sets { &sel.gord[si][k] } else { &sel.order[k] }
+            // (a position not in the list, or an output in one set and not
+            // another: the caller's orderX, as the row engine's)
+            append(mut &xs, if lexdb_bind.orderOut(o, &q.cols, &sel.outs, nOut) == -1 { grpX(o, q) } else { lexdb_bind.evalMark() })
+        }
+    }
+    let proj = PPlan.Project(p, xs)
+    // (grouping sets: DISTINCT and ORDER BY by the values themselves, as the row engine's)
+    var dk: []int = []
+    for i in 0..nOut { append(mut &dk, if !sets && i < len(sel.outKinds) { sel.outKinds[i] } else { lexdb_sql.COLL_EXACT }) }
+    let dist = if sel.distinct { PPlan.Distinct(proj, false, dk) } else { proj }
+    var ordered = dist
+    if nk > 0 || sel.topMode != 0 || sel.withTies {
+        var srt = PSort{shown: nOut, out: [], desc: [], nf: [], coll: [], don: sel.donKey,
+                        ties: if sel.topMode & lexdb_sql.TOP_TIES != 0 { TS_TOP } else if sel.withTies { TS_FETCH } else { 0 },
+                        pct: sel.topMode & lexdb_sql.TOP_PERCENT != 0, top: if sel.topMode != 0 { sel.topN } else { -1 }}
+        if sel.sort {
+            for k in 0..nk {
+                append(mut &srt.out, out[k])
+                append(mut &srt.desc, sel.desc[k])
+                append(mut &srt.nf, sel.nullsFirst[k])
+                append(mut &srt.coll, if !sets && k < len(sel.ordKinds) { sel.ordKinds[k] } else { lexdb_sql.COLL_EXACT })
+            }
+        }
+        ordered = PPlan.Sort(replace(mut &ordered, PPlan.Result([])), sel.sort, Some(srt))
+    }
+    let lim = if sel.limit >= 0 || sel.offset > 0 || sel.topMode != 0 { PPlan.Limit(ordered, false, sel.limit, max(sel.offset, 0)) } else { ordered }
+    return if len(sel.mr) > 0 { PPlan.Match(lim) } else { lim }
 }
 
 // A plan the pipeline did not take: its outputs and conditions back to
@@ -8807,9 +9007,9 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
         PPlan.Join(i, _) { unplan(sel, i) }
         PPlan.Apply(i, _) { unplan(sel, i) }
         PPlan.ProjectSet(i, _) { unplan(sel, i) }
-        // (a view over the groups; a Window the pipeline runs: unplanWin's)
+        // (a view over the groups, or the groups' operator; a Window the pipeline runs: unplanWin's)
         PPlan.Window(i, pw) {
-            if pw.isNone() {
+            if pw.isNone() || onGroups(&i) {
                 unplan(sel, i)
                 return
             }
@@ -8819,8 +9019,8 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
             }
         }
         PPlan.Project(i, xs) {
-            if len(xs) == 0 {
-                // a view: the Sel holds its outputs
+            if len(xs) == 0 || onGroups(&i) {
+                // a view: the Sel holds its outputs (over the groups: bound for the plan only, Q8 R7)
                 unplan(sel, i)
                 return
             }
@@ -8828,6 +9028,11 @@ pub fn unplan(sel: mut &Sel, p: PPlan) {
             unplan(sel, i)
         }
         PPlan.Filter(i, cs) {
+            // (HAVING over the groups, Q8 R7: bound for the plan only)
+            if onGroups(&i) {
+                unplan(sel, i)
+                return
+            }
             // (a Result's: its WHERE bound for the plan only)
             match i {
                 PPlan.Result(_) { return }
@@ -9163,6 +9368,8 @@ pub fn applyAt(p: &PPlan): int {
         PPlan.Distinct(i, _, _) { return applyAt(&i) }
         PPlan.Project(i, _) { return applyAt(&i) }
         PPlan.Having(i) { return applyAt(&i) }
+        // (HAVING over the groups, Q8 R7; a Filter over the joins holds no Apply)
+        PPlan.Filter(i, _) { return applyAt(&i) }
         PPlan.Match(i) { return applyAt(&i) }
         PPlan.Window(i, _) { return applyAt(&i) }
         PPlan.Agg(i, _, _) { return applyAt(&i) }
