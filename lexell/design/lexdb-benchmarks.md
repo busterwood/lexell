@@ -159,6 +159,18 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
+**Since, lexdb alone (2026-11-22, main `f1623851`), against the
+PostgreSQL figures of the `01b0250c` run below (PostgreSQL not re-run):**
+lexdb summed **9,481 ms** (mean of two runs alternated with main
+`1a561b87`'s 11,113), against PostgreSQL's 14,960 on one core and 9,300
+with four processes. Since `01b0250c`: Q8 R1-R7 (the pipeline runs nearly
+every query), the OR of index paths (q19 86.9 to 41.8 ms, PostgreSQL 45;
+lexdb-optimizer.md 52) and conditions on a column leaf's bytes
+(lexdb-tpch-perf.md 4.6: q6 176, q12 442, q7 405, q21 722, q22 115 ms).
+Worst against one core now: q20 262 / 133 (1.97), q11 95 / 63 (1.52),
+q22 115 / 88 (1.30), q10 503 / 402 (1.25), q3 649 / 564 (1.15). Logs:
+`~/tpch-w/perf2`, `~/tpch-w/q19b`.
+
 **Now, main `01b0250c` (2026-11-20, after optimizer Q4-Q6), the same
 setup, lexdb and PostgreSQL in the same run (one run each, lexdb `-O`):**
 summed 12,239 ms against PostgreSQL's 14,960 on one core; **geometric mean
@@ -340,6 +352,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-22 | f1623851 | TPC-H derived, SF1, lexdb alone against the recorded PG figures of `01b0250c` | summed 9,481 ms (was 12,239 at `01b0250c`) against PG one core 14,960 and PG four processes 9,300; q19 41.8 ms (PG 45); worst q20 1.97, q11 1.52, q22 1.30 | this page, 1.6 |
 | 2026-11-21 | 7fec138f (branch, Q8 R7) | windows, 1M rows (row_number per partition, running sum, 10-row moving average, rank; under an aggregate and to the client), lexdb `-O` main 3aabcade vs branch, PG 18 (leader + 3 workers, `work_mem` 256MB), server on CPUs 0-3 | the pipeline's Window operator 0.77-0.91 of main's row engine, 1.03 for the partitioned row_number to the client; lexdb / PG 0.82-1.20 (time; under an aggregate: row_number per partition 0.85, running sum 1.07, moving average 1.20, rank 1.12; to the client 1.02, 1.02, 1.00, 0.82); raw: ~/Work/lexdb-bench/saved/results/2026-11-21-window-r7 | lexdb-layers.md 6.3.Q8 R7 |
 | 2026-11-20 | 01b0250c | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | after optimizer Q4-Q6: lexdb / PG one core 0.94 (geometric mean, wall; 0.85 server CPU), 11 of 22 level or ahead; summed 12.24 s against PG's 14.96 s; against PG four processes 1.47; worst q19 2.1, q20 2.1, q11 1.9, q22 1.9, q15 1.8 | this page, 1.6 |
 | 2026-11-20 | 0f96fee9 | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | lexdb / PG one core 1.03 (geometric mean, wall; 0.94 server CPU), 9 of 22 level or ahead; summed 13.44 s against PG's 15.23 s; against PG four processes 1.58; worst q15 2.5, q20 2.2, q11 2.1, q19 2.1 | this page, 1.6 |
