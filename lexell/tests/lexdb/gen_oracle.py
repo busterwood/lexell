@@ -172,6 +172,7 @@ CHECKED = {
     'tns_r8': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
+    'tns_leftovers': ('consts', 'QS'),
 }
 
 
