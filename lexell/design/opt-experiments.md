@@ -353,6 +353,12 @@ more instructions and 5% more cycles over dbench, because the backend rebuilds t
 The remaining cost is the magnitude: a branch, a negation and the checked i128-to-u128
 conversion (there is no unchecked one: SPEC 7.2), where the bool was one byte compare.
 
+**Also built, dropped: epilogues that pop.** fib's stall hits are pushes in the prologue
+reloaded through rbp in the epilogue. Restoring with `lea -8k(%rbp), %rsp; pop ...; pop rbp`
+(as gcc does) cut fib's count by 58% at identical cycles (3,986M), with 4.5% more
+instructions; trees took 6% more cycles. Those stalls were hidden behind other work: the
+counter locates conflicts, and only cycles say whether they cost anything.
+
 ## 9. Integer to text written straight into the string (runtime)
 
 `rt_i128_to_str` and `rt_u128_to_str` wrote the digits backwards into a stack buffer one byte at
