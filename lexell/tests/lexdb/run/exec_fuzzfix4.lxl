@@ -1,0 +1,99 @@
+// The fuzzer's fourth round (design/lexdb-fuzz.md, its long run), each statement against PostgreSQL 18's answer, with
+// SET lexdb_batch = off and on (in a transaction rolled back each time).
+// - G1, G2, G3: a query in parentheses (PostgreSQL's select_with_parens) as the first operand of a set operation, at
+//   the top, after WITH, in FROM, a CTE's body, IN, ANY / ALL, a row IN, EXISTS, a scalar, ARRAY, LIKE ANY, INSERT,
+//   CREATE VIEW, CREATE TABLE AS; nested, with INTERSECT's precedence, an ORDER BY and LIMIT of its own and of the
+//   whole (one of each, as PostgreSQL's insertSelectOptions); a recursive CTE; expressions and lists that start with
+//   a parenthesised subquery are still expressions and lists.
+// expect: G1 union, order by: 1;2;3;NULL, same: true
+// expect: G1 a plain second operand: 1;1;2;2;2;3;NULL;NULL;NULL, same: true
+// expect: G1 INTERSECT first: 1;2;3;NULL, same: true
+// expect: G1 nested: 2;3;9;NULL, same: true
+// expect: G1 an operand's ORDER BY and LIMIT: 0;2;3, same: true
+// expect: G1 alone, ORDER BY and LIMIT after: 3;2, same: true
+// expect: G1 alone, its LIMIT and an OFFSET after: 2;3;4, same: true
+// expect: G1 alone, its LIMIT and an ORDER BY after: 6;5;4, same: true
+// expect: G1 two ORDER BYs: ERROR 42601, same: true
+// expect: G1 two LIMITs: ERROR 42601, same: true
+// expect: G1 many rows: 5999|4510484, same: true
+// expect: G2 a derived table: 9|121, same: true
+// expect: G2 double parentheses: 1|x, same: true
+// expect: G3 WITH: 2, same: true
+// expect: G3 a CTE's body: 2999, same: true
+// expect: G3 recursive: 10, same: true
+// expect: G1 IN: 1;2;4;8;9, same: true
+// expect: G1 NOT IN with a NULL: , same: true
+// expect: G1 NOT IN: 2139, same: true
+// expect: G1 scalar: 6, same: true
+// expect: G1 ALL: 2;4;5;9, same: true
+// expect: G1 ANY of texts: 2;4;6, same: true
+// expect: G1 a row IN: 1;2, same: true
+// expect: G1 a row IN a set operation: 1;2, same: true
+// expect: G1 EXISTS, correlated: 1;3;4;8;9, same: true
+// expect: G1 ARRAY: {0,1,2,3,4,5,6,7}, same: true
+// expect: G1 LIKE ANY: 1;4;5, same: true
+// expect: G1 expressions and lists: 2|2|t|t, same: true
+// expect: G1 INSERT: 9000|1;9001|2, same: true
+// expect: G1 INSERT, double parentheses: 9002, same: true
+// expect: G1 CREATE VIEW: , same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// each statement with the row engine and with batches, in a transaction rolled back
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table g0 (id int primary key, a int, t text, c char(3), b bigint)\ninsert into g0 values (1, 1, 'x', 'a', -9223372036854775807), (2, 2, 'y', 'a  ', 9223372036854775807), (3, NULL, NULL, NULL, NULL), (4, 2, 'zz', 'b', 5), (5, 3, 'x', 'ab', -5), (6, NULL, 'y', ' a', NULL)\ninsert into g0 select i, i % 7, 'r' || (i % 5), 'c', case when i % 3 = 0 then NULL else -9223372036854775807 + i end from generate_series(7, 3000) i"
+
+const QS = "G1 union, order by	(select a from g0 where id < 7) union (select 2) order by 1\nG1 a plain second operand	(select a from g0 where id < 7) union all select a from g0 where id < 4 order by 1\nG1 INTERSECT first	(select a from g0 where id < 7) union (select 1) intersect (select 2) order by 1\nG1 nested	((select a from g0 where id < 7) except (select 1)) union (select 9) order by 1\nG1 an operand's ORDER BY and LIMIT	(select a from g0 where id < 7 order by a desc nulls last limit 2) union all (select 0) order by 1\nG1 alone, ORDER BY and LIMIT after	(select a from g0 where a is not null and id < 7) order by a desc limit 2\nG1 alone, its LIMIT and an OFFSET after	(select id from g0 order by id limit 3) offset 1\nG1 alone, its LIMIT and an ORDER BY after	(select id from g0 where id < 7 limit 3) order by id desc\nG1 two ORDER BYs	(select a from g0 order by a) order by 1\nG1 two LIMITs	(select a from g0 limit 2) limit 1\nG1 many rows	select count(*), sum(x) from ((select a as x from g0) union all (select id from g0) except all (select 1)) as d\nG2 a derived table	select count(*), sum(x) from ((select a as x from g0) union (select 100)) as d\nG2 double parentheses	select * from ((select a, t from g0 where id = 1)) as d\nG3 WITH	with c as (select a from g0) (select a from c) intersect (select 2) order by 1\nG3 a CTE's body	with c as ((select a from g0) except all (select 1)) select count(*) from c\nG3 recursive	with recursive r(n) as ((select 1) union all (select n + 1 from r where n < 4)) select sum(n) from r\nG1 IN	select id from g0 where id < 10 and a in ((select 1) union (select 2)) order by 1\nG1 NOT IN with a NULL	select id from g0 where id < 10 and a not in ((select 1) union (select null::int)) order by 1\nG1 NOT IN	select count(*) from g0 where a not in ((select 1) union (select 2))\nG1 scalar	select ((select max(a) from g0) union (select -1) order by 1 desc limit 1)\nG1 ALL	select id from g0 where id < 10 and a >= all ((select 1) union (select 2)) order by 1\nG1 ANY of texts	select id from g0 where id < 10 and t > any ((select 'x') union all (select 'y')) order by 1\nG1 a row IN	select id from g0 where id < 10 and (a, t) in ((select 1, 'x') union (select 2, 'y')) order by 1\nG1 a row IN a set operation	select id from g0 where id < 10 and (a, t) in (select 1, 'x' union select 2, 'y') order by 1\nG1 EXISTS, correlated	select id from g0 where id < 10 and exists ((select 1 where false) union all (select a from g0 as g2 where g2.id = g0.id + 1 and g2.a > 1)) order by 1\nG1 ARRAY	select array((select a from g0 where a is not null) union (select 7) order by 1)\nG1 LIKE ANY	select id from g0 where id < 10 and t like any ((select 'x%') union (select 'z%')) order by 1\nG1 expressions and lists	select ((select 1) + 1), ((select 2)), (select 3) in ((select 3), 4), 2 in ((select 1), 2)\nG1 INSERT	insert into g0 (id, a) (select 9000, 1) union (select 9001, 2) returning id, a\nG1 INSERT, double parentheses	insert into g0 ((select 9002, 1)) returning id\nG1 CREATE VIEW	create view gv as (select a from g0 where id < 4) union (select 7)"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for l in strings.lines(&qs) {
+        let parts = strings.split(&l, "\t")
+        two(mut &s, &parts[0], &parts[1])
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(98), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}
