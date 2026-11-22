@@ -1,7 +1,7 @@
 # Lexell performance
 
-Measured on 22 November 2026 on `main`: the microbenchmarks at commit 2f7f2246, the JSON
-and decimal sections at d08f41f5, the compile-time and regex sections at 236c8513, the others
+Measured on 22 November 2026 on `main`: the microbenchmarks at commit 2f7f2246, the decimal
+section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
@@ -25,7 +25,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
 | JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
-| Decimal | Java, .NET | Mixed |
+| Decimal | Java, .NET | Faster than .NET on all but 19-digit add; slower than Java on division and comparison |
 | HTTP server | Go net/http | Faster at 1, 10 and 100 clients, about 1.5 times |
 | Command-line tools | GNU grep, sort, tail, eza | Faster on grep and eza, slower on sort, level on tail |
 
@@ -167,16 +167,16 @@ to net10.0. The .NET harness has no 37- and 38-digit cases.
 
 | operation | Lexell | .NET System.Decimal | Java BigDecimal | Lexell / .NET | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| add, 19 digits | 11.7 ns | 10.9 ns | 13.9 ns | 1.08 | 0.84 |
-| mul, 6 by 6 digits | 16.7 ns | 11.1 ns | 9.7 ns | 1.51 | 1.71 |
-| div, 12 by 6, scale 2 | 22.7 ns | 63.1 ns | 11.4 ns | 0.36 | 1.99 |
-| parse, 20 digits | 32.4 ns | 88.4 ns | 105.8 ns | 0.37 | 0.31 |
-| format, 19 digits | 45.6 ns | 82.9 ns | 45.8 ns | 0.55 | 1.00 |
-| cmp, 19 digits | 2.7 ns | 3.7 ns | 1.6 ns | 0.74 | 1.73 |
-| add, 37 digits | 11.7 ns | not in harness | 16.0 ns | | 0.73 |
-| mul, 19 digits | 18.6 ns | not in harness | 19.8 ns | | 0.94 |
-| parse, 38 digits | 46.5 ns | not in harness | 216.0 ns | | 0.22 |
-| format, 38 digits | 72.8 ns | not in harness | 239.9 ns | | 0.30 |
+| add, 19 digits | 11.8 ns | 11.0 ns | 13.5 ns | 1.07 | 0.88 |
+| mul, 6 by 6 digits | 9.0 ns | 11.2 ns | 9.9 ns | 0.81 | 0.91 |
+| div, 12 by 6, scale 2 | 14.3 ns | 63.5 ns | 12.0 ns | 0.23 | 1.19 |
+| parse, 20 digits | 33.3 ns | 89.3 ns | 114.0 ns | 0.37 | 0.29 |
+| format, 19 digits | 44.6 ns | 75.2 ns | 46.1 ns | 0.59 | 0.97 |
+| cmp, 19 digits | 2.2 ns | 3.6 ns | 1.6 ns | 0.61 | 1.39 |
+| add, 37 digits | 11.8 ns | not in harness | 15.9 ns | | 0.74 |
+| mul, 19 digits | 13.5 ns | not in harness | 19.9 ns | | 0.68 |
+| parse, 38 digits | 47.5 ns | not in harness | 217.3 ns | | 0.22 |
+| format, 38 digits | 74.1 ns | not in harness | 243.8 ns | | 0.30 |
 
 The outputs are not verified against each other. The harnesses print different
 checksums for most cases, so those cases cannot be compared. The format cases print
