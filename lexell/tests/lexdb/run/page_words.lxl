@@ -1,0 +1,210 @@
+// lexdb_page: the key searches by words (Node.pfx, keyWord) give what
+// comparing the keys as strings gives. Leaves read from their pages (lazy)
+// and internal nodes, read and changed (reword), of keys of every shape:
+// 8-byte integers (one word a key), two integers sharing the first (two
+// words a key), keys shorter than 8 bytes and of 0 bytes, keys with zero
+// bytes and 0xff bytes, of 8, 9, 15, 16, 17 bytes sharing their first 8 or
+// 16, an index's entries, two integers whose first differ (one word,
+// probes sharing it); an empty leaf, one key, two. Probed with every
+// key, each made one less and one more in its last byte, its prefixes, it
+// with a 0 or 0xff byte after, "", and other keys of its shape: lower,
+// lowerW, child, keyLe and keyLt for every key, against the strings'
+// order.
+// expect: int8 n 280 words 1 ok true
+// expect: int2 n 160 words 2 ok true
+// expect: short n 90 words 1 ok true
+// expect: zeros n 120 words 2 ok true
+// expect: mixed n 91 words 2 ok true
+// expect: index n 120 words 2 ok true
+// expect: dist16 n 150 words 1 ok true
+// expect: empty n 0 ok true
+// expect: one n 1 ok true
+// expect: two n 2 ok true
+// expect: internal int8 true int2 true short true zeros true mixed true index true dist16 true
+// expect: changed true
+import "binary"
+import "collections"
+import "../../../cmd/lexdb_page"
+
+fn be8(x: int): str {
+    var b = ""
+    binary.addU64BE(mut &b, x)
+    return b
+}
+
+// A pseudo-random number generator (an LCG): the next of s, below n.
+fn next(s: mut &int, n: int): int {
+    s = s *% 6364136223846793005 +% 1442695040888963407
+    let x = (s >> 33) & 0x7fffffff
+    return x % n
+}
+
+fn bytesOf(s: mut &int, n: int, alpha: &str): str {
+    var b = ""
+    for i in 0..n { b.addByte(alpha[next(s, len(alpha))]) }
+    return b
+}
+
+// A key of a shape.
+fn keyOf(shape: &str, s: mut &int): str {
+    if shape == "int8" { return be8(next(s, 100000) ^ (-9223372036854775807 - 1)) }
+    if shape == "int2" { return be8(next(s, 40) ^ (-9223372036854775807 - 1)) + be8(next(s, 7) ^ (-9223372036854775807 - 1)) }
+    if shape == "dist16" { return be8(next(s, 1000000)) + bytesOf(s, 8, &"\x00\x07a\xff") }
+    if shape == "short" { return bytesOf(s, next(s, 8), &"\x00\x01ab\xff") }
+    if shape == "zeros" { return bytesOf(s, next(s, 20), &"\x00\x00\x00\x01\xff") }
+    if shape == "mixed" {
+        let base = "abcdefgh" + "ijklmnop" + "qrst"
+        let cut = [7, 8, 9, 15, 16, 17, 20]
+        var k = base[0..cut[next(s, len(cut))]].clone()
+        if next(s, 2) == 0 { k += &bytesOf(s, next(s, 3), &"\x00a\xff") }
+        return k
+    }
+    // index: 1, a value of 8 bytes, 1, a second, the primary key
+    return "\x01" + be8(next(s, 30) ^ (-9223372036854775807 - 1)) + "\x01" + be8(next(s, 5)) + be8(next(s, 1000))
+}
+
+// n distinct keys of a shape, sorted, that fit a leaf with 1-byte values.
+fn keysOf(shape: &str, n: int, seed: int): []str {
+    var s = seed
+    var set: collections.Map[str, bool] = collections.newMap()
+    var tries = 0
+    while set.size() < n && tries < 100000 {
+        set.put(keyOf(shape, mut &s), true)
+        tries += 1
+    }
+    var ks: []str = []
+    for i in 0..set.size() { append(mut &ks, set.keyAt(i).clone()) }
+    collections.sortBy(mut &ks, fn(a, b) { return if a < b { -1 } else if a > b { 1 } else { 0 } })
+    return ks
+}
+
+fn leafOf(ks: &[]str): lexdb_page.Node {
+    var n = lexdb_page.newLeaf()
+    for k in ks {
+        append(n.keys.unshare(), k.clone())
+        append(mut &n.vals, rc("v"))
+    }
+    n.size = lexdb_page.leafSize(&n)
+    return n
+}
+
+// The probes for keys ks.
+fn probesOf(shape: &str, ks: &[]str): []str {
+    var ps: []str = ["", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", "\x00", "\x01"]
+    for k in ks {
+        append(mut &ps, k.clone())
+        let l = len(k)
+        if l > 0 {
+            let last = int(k[l - 1])
+            if last > 0 {
+                var a = k[0..l - 1].clone()
+                a.addByte(byte(last - 1))
+                append(mut &ps, a)
+            }
+            if last < 255 {
+                var b = k[0..l - 1].clone()
+                b.addByte(byte(last + 1))
+                append(mut &ps, b)
+            }
+        }
+        for c in 0..l { append(mut &ps, k[0..c].clone()) }
+        append(mut &ps, k + "\x00")
+        append(mut &ps, k + "\xff")
+    }
+    var s = 77
+    for i in 0..200 { append(mut &ps, keyOf(shape, mut &s)) }
+    return ps
+}
+
+// Whether n's searches give the strings' answers for keys ks.
+fn checks(n: &lexdb_page.Node, ks: &[]str, ps: &[]str): bool {
+    for p in ps {
+        var lo = 0
+        while lo < len(ks) && ks[lo] < p { lo += 1 }
+        var le = 0
+        while le < len(ks) && ks[le] <= p { le += 1 }
+        let w = lexdb_page.keyWord(p)
+        if n.lower(p) != lo || n.lowerW(p, w) != lo { return false }
+        if !n.leaf && n.child(p) != le { return false }
+        for i in 0..len(ks) {
+            if n.keyLe(i, p, w) != (ks[i] <= p) || n.keyLt(i, p, w) != (ks[i] < p) { return false }
+        }
+    }
+    return true
+}
+
+fn wordsPer(n: &lexdb_page.Node): int { return if n.count() == 0 { 0 } else { len(n.pfx) / n.count() } }
+
+fn leafCase(name: &str, shape: &str, want: int, seed: int) {
+    var ks = keysOf(shape, want, seed)
+    // as many as fit a page
+    while len(ks) > 0 && lexdb_page.leafSize(&leafOf(&ks)) > lexdb_page.NODE_ROOM { let x = pop(mut &ks) }
+    let none: []int = []
+    let pg = lexdb_page.encodeNode(&leafOf(&ks), &none, 40)
+    let d = lexdb_page.decodeNode(&pg)
+    let ok = d.lazy && checks(&d, &ks, &probesOf(shape, &ks))
+    if want <= 2 {
+        println(name + " n " + d.count().toStr() + " ok " + ok.toStr())
+    } else {
+        println(name + " n " + d.count().toStr() + " words " + wordsPer(&d).toStr() + " ok " + ok.toStr())
+    }
+}
+
+// An internal node of keys ks, as read from its page.
+fn internalOf(ks: &[]str): lexdb_page.Node {
+    var i = lexdb_page.newNode(false)
+    i.keys = rc(ks.clone())
+    var kids: []int = []
+    var pages: []int = []
+    for x in 0..len(ks) + 1 {
+        append(mut &kids, x)
+        append(mut &pages, 100 + x)
+    }
+    i.kids = kids
+    let ib = lexdb_page.encodeNode(&i, &pages, 41)
+    return lexdb_page.decodeNode(&ib)
+}
+
+fn main() {
+    leafCase("int8", "int8", 280, 1)
+    leafCase("int2", "int2", 160, 2)
+    leafCase("short", "short", 90, 3)
+    leafCase("zeros", "zeros", 120, 4)
+    leafCase("mixed", "mixed", 140, 5)
+    leafCase("index", "index", 120, 6)
+    leafCase("dist16", "dist16", 150, 13)
+    leafCase("empty", "int8", 0, 7)
+    leafCase("one", "int2", 1, 8)
+    leafCase("two", "mixed", 2, 9)
+    var line = "internal"
+    for shape in ["int8", "int2", "short", "zeros", "mixed", "index", "dist16"] {
+        var ks = keysOf(&shape, 60, 11)
+        let d = internalOf(&ks)
+        line += &(" " + shape + " " + checks(&d, &ks, &probesOf(&shape, &ks)).toStr())
+    }
+    println(line)
+    // an internal node changed in place (a split's separator added, one
+    // removed, as the store changes them) and its words made again
+    var ks = keysOf(&"int2", 50, 12)
+    var d = internalOf(&ks)
+    var ok = true
+    var s = 5
+    for r in 0..40 {
+        let k = keyOf(&"mixed", mut &s)
+        var at = 0
+        while at < len(ks) && ks[at] < k { at += 1 }
+        if at < len(ks) && ks[at] == k { continue }
+        collections.insert(mut &ks, at, k.clone())
+        collections.insert(d.keys.unshare(), at, k.clone())
+        append(mut &d.kids, 0)
+        d.reword()
+        if r % 3 == 0 && len(ks) > 1 {
+            let gone = collections.removeAt(mut &ks, 0)
+            let g2 = collections.removeAt(d.keys.unshare(), 0)
+            let g3 = pop(mut &d.kids)
+            d.reword()
+        }
+        if !checks(&d, &ks, &probesOf(&"mixed", &ks)) { ok = false }
+    }
+    println("changed " + ok.toStr())
+}

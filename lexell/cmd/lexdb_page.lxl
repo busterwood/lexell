@@ -97,6 +97,16 @@ pub type Node = record {
     // Empty otherwise.
     pub cols: str
     pub cdir: []int
+    // The words of its keys (keyWord), one per key, for the key searches
+    // (lower, child, keyLe, keyLt): an internal node's and a lazy leaf's,
+    // made when its keys are set (reword); empty for a leaf whose keys are
+    // arrays (loosened: they change in place). In memory only. A search
+    // whose node has none, or not one per key, compares strings. kmin and
+    // kmax: its keys' least and greatest lengths, with pfx (a tie of words
+    // decided by length mostly needs no key's).
+    pub pfx: []u64
+    pub kmin: int
+    pub kmax: int
 }
 
 // An empty key array (rc).
@@ -105,7 +115,7 @@ pub fn noKeys(): rc []str {
     return rc(e)
 }
 
-pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: noKeys(), vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []} }
+pub fn newNode(leaf: bool): Node { return Node{leaf: leaf, keys: noKeys(), vals: [], kids: [], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: [], pfx: [], kmin: 0, kmax: 0} }
 
 // Whether n is a column leaf (its rows by column: cols, cdir).
 pub fn (n: &Node) isCols(): bool { return len(n.cdir) > 0 }
@@ -166,13 +176,222 @@ pub fn (n: &Node) valView(i: int): &str {
 // Where a lazy leaf's value i starts in its body.
 pub fn valStart(n: &Node, i: int): int { return lexdb_rows.vStart(n.ents[i]) }
 
+// ---- key words: the key searches' first compare
+//
+// A key's word is its first 8 bytes as a big-endian number, zero padded
+// (keyWord). Keys are in byte order (memcmp's, a prefix before what it
+// starts), and two keys' words are in their order or equal: the first byte
+// that differs within 8 decides both. Equal words decide by length when
+// either key is at most 8 bytes long: the shorter is then a prefix of the
+// longer (its padding equals the longer's bytes there). Only words equal
+// with both keys over 8 bytes compare the keys. A primary key of integers
+// has its first column as its word (lexdb_access.encKeyPart), so a search
+// of one compares strings only among the keys that share it.
+
+// The word of key k.
+pub fn keyWord(k: &str): u64 { return wordAt(k, 0, len(k)) }
+
+// The word of the n bytes of s from at.
+fn wordAt(s: &str, at: int, n: int): u64 {
+    if n >= 8 {
+        var x = strWord(s, at)
+        x = ((x & 0x00ff00ff00ff00ff) << 8) | ((x >> 8) & 0x00ff00ff00ff00ff)
+        x = ((x & 0x0000ffff0000ffff) << 16) | ((x >> 16) & 0x0000ffff0000ffff)
+        return (x << 32) | (x >> 32)
+    }
+    var x: u64 = 0
+    for i in 0..n { x = x | (u64(s[at + i]) << (56 - 8 * i)) }
+    return x
+}
+
+// Makes n's words its keys' (after its keys are set or changed): none
+// for a leaf whose keys are arrays. Two words a key (its first 16 bytes,
+// zero padded) when two keys next to each other over 8 bytes long share
+// their first word (a primary key of two integers, an index's entries):
+// the key's word, then the word of its bytes from 8.
+pub fn (n: mut &Node) reword() {
+    n.kmin = 0
+    n.kmax = 0
+    if n.leaf && !n.lazy {
+        n.pfx = []
+        return
+    }
+    let c = n.count()
+    var ws: []u64 = array(c, u64(0))
+    var lo = 1 << 30
+    var hi = 0
+    var wide = false
+    var last = -1                       // the length of the key before
+    for i in 0..c {
+        let kv = n.keyView(i)
+        let kl = len(kv)
+        ws[i] = wordAt(kv, 0, kl)
+        if kl < lo { lo = kl }
+        if kl > hi { hi = kl }
+        if i > 0 && kl > 8 && last > 8 && ws[i] == ws[i - 1] { wide = true }
+        last = kl
+    }
+    n.kmin = lo
+    n.kmax = hi
+    if !wide {
+        n.pfx = ws
+        return
+    }
+    var w2: []u64 = array(2 * c, u64(0))
+    for i in 0..c {
+        let kv = n.keyView(i)
+        let kl = len(kv)
+        w2[2 * i] = ws[i]
+        if kl > 8 { w2[2 * i + 1] = wordAt(kv, 8, if kl < 16 { kl - 8 } else { 8 }) }
+    }
+    n.pfx = w2
+}
+
+// How many words n has a key: 1 or 2, 0 none (not one per key).
+fn (n: &Node) wordsPer(): int {
+    let c = n.count()
+    let np = len(n.pfx)
+    if np == c { return 1 }
+    if np == 2 * c { return 2 }
+    return 0
+}
+
+// The second word of k (its bytes from 8, as wordAt: 0 when k has 8 or
+// fewer).
+fn word2(k: &str): u64 {
+    let l = len(k)
+    if l <= 8 { return 0 }
+    return wordAt(k, 8, if l < 16 { l - 8 } else { 8 })
+}
+
+// The length of key i.
+fn (n: &Node) keyLen(i: int): int { return if n.lazy { (n.ents[i] >> 20) & 0xfff } else { len(n.keys[i]) } }
+
+// Whether key i < k, their first b bytes (8 or 16, the words compared)
+// the same: by length when either is at most b bytes long (the node's
+// kmin and kmax mostly decide it), else as strings.
+fn (n: &Node) tieLt(i: int, k: &str, b: int): bool {
+    let l = len(k)
+    if l <= b {
+        if n.kmin >= l { return false }
+        if n.kmax < l { return true }
+        return n.keyLen(i) < l
+    }
+    if n.kmax <= b || n.keyLen(i) <= b { return true }
+    return n.keyView(i) < k
+}
+
+// Whether key i <= k (tieLt's way).
+fn (n: &Node) tieLe(i: int, k: &str, b: int): bool {
+    let l = len(k)
+    if l <= b {
+        if n.kmin > l { return false }
+        if n.kmax <= l { return true }
+        return n.keyLen(i) <= l
+    }
+    if n.kmax <= b || n.keyLen(i) <= b { return true }
+    return n.keyView(i) <= k
+}
+
+// Whether key i < k; w is keyWord(k).
+pub fn (n: &Node) keyLt(i: int, k: &str, w: u64): bool {
+    let wp = n.wordsPer()
+    if wp == 0 { return n.keyView(i) < k }
+    let p = n.pfx[wp * i]
+    return p < w || (p == w && n.tieLt(i, k, 8))
+}
+
+// Whether key i <= k; w is keyWord(k).
+pub fn (n: &Node) keyLe(i: int, k: &str, w: u64): bool {
+    let wp = n.wordsPer()
+    if wp == 0 { return n.keyView(i) <= k }
+    let p = n.pfx[wp * i]
+    return p < w || (p == w && n.tieLe(i, k, 8))
+}
+
 // The first i whose key is >= k (count() when none).
 pub fn (n: &Node) lower(k: &str): int {
+    if len(n.pfx) > 0 { return n.lowerW(k, keyWord(k)) }
+    return n.lowerStr(k)
+}
+
+// lower, with w keyWord(k).
+pub fn (n: &Node) lowerW(k: &str, w: u64): int {
+    let c = n.count()
+    let np = len(n.pfx)
+    if c == 0 { return 0 }
+    var lo = 0
+    var hi = c
+    if np == c {
+        // a scan going on into the next leaf asks for its first key
+        if n.pfx[0] > w { return 0 }
+        while lo < hi {
+            let m = (lo + hi) >> 1
+            let p = n.pfx[m]
+            if p < w || (p == w && n.tieLt(m, k, 8)) { lo = m + 1 } else { hi = m }
+        }
+        return lo
+    }
+    if np != 2 * c { return n.lowerStr(k) }
+    if n.pfx[0] > w { return 0 }
+    let v = word2(k)
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        let p = n.pfx[2 * m]
+        var lt = p < w
+        if p == w {
+            let q = n.pfx[2 * m + 1]
+            lt = q < v || (q == v && n.tieLt(m, k, 16))
+        }
+        if lt { lo = m + 1 } else { hi = m }
+    }
+    return lo
+}
+
+// An internal node's child to follow for k: the number of keys <= k.
+pub fn (n: &Node) child(k: &str): int { return n.childW(k, keyWord(k)) }
+
+// child, with w keyWord(k).
+pub fn (n: &Node) childW(k: &str, w: u64): int {
+    var lo = 0
+    var hi = len(n.keys)
+    let np = len(n.pfx)
+    if np == hi {
+        while lo < hi {
+            let m = (lo + hi) >> 1
+            let p = n.pfx[m]
+            if p < w || (p == w && n.tieLe(m, k, 8)) { lo = m + 1 } else { hi = m }
+        }
+        return lo
+    }
+    if np == 2 * hi {
+        let v = word2(k)
+        while lo < hi {
+            let m = (lo + hi) >> 1
+            let p = n.pfx[2 * m]
+            var le = p < w
+            if p == w {
+                let q = n.pfx[2 * m + 1]
+                le = q < v || (q == v && n.tieLe(m, k, 16))
+            }
+            if le { lo = m + 1 } else { hi = m }
+        }
+        return lo
+    }
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if n.keys[m] <= k { lo = m + 1 } else { hi = m }
+    }
+    return lo
+}
+
+// lower by comparing keys as strings (a node without words).
+fn (n: &Node) lowerStr(k: &str): int {
     var lo = 0
     if !n.lazy {
         var hi = len(n.keys)
         while lo < hi {
-            let m = (lo + hi) / 2
+            let m = (lo + hi) >> 1
             if n.keys[m] < k { lo = m + 1 } else { hi = m }
         }
         return lo
@@ -185,7 +404,7 @@ pub fn (n: &Node) lower(k: &str): int {
         if k0 >= k { return 0 }
     }
     while lo < hi {
-        let m = (lo + hi) / 2
+        let m = (lo + hi) >> 1
         let e = n.ents[m]
         let km = &n.body[lexdb_rows.kStart(e)..lexdb_rows.kEnd(e)]
         if km < k { lo = m + 1 } else { hi = m }
@@ -216,6 +435,7 @@ pub fn (n: mut &Node) loosen() {
     n.packed = true
     n.body = ""
     n.ents = []
+    n.pfx = []
     if n.size < 0 { n.size = leafSize(n) }
 }
 
@@ -236,6 +456,7 @@ fn (n: mut &Node) loosenCols() {
     n.packed = false
     n.body = ""
     n.ents = []
+    n.pfx = []
     n.cols = ""
     n.cdir = []
     n.size = leafSize(n)
@@ -263,7 +484,9 @@ fn lazyLeaf(body: &str, cnt: int): Node {
             at += 4 + kl + vl
         }
     }
-    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: 0, packed: true, lazy: true, body: body.clone(), ents: ents, cols: "", cdir: []}
+    var n = Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: 0, packed: true, lazy: true, body: body.clone(), ents: ents, cols: "", cdir: [], pfx: [], kmin: 0, kmax: 0}
+    n.reword()
+    return n
 }
 
 // The bytes of an entry whole: what bounds an entry (MAX_ENTRY), and
@@ -442,7 +665,9 @@ fn frontLeaf(b: &[]byte, cnt: int): Node {
         at = h.at + n
         prev = ks
     }
-    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents, cols: "", cdir: []}
+    var nd = Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: size, packed: true, lazy: true, body: strFromBytes(&out), ents: ents, cols: "", cdir: [], pfx: [], kmin: 0, kmax: 0}
+    nd.reword()
+    return nd
 }
 
 // Leaf n's page, numbered pageNo, front coded (T_FLEAF). A leaf whose
@@ -489,7 +714,9 @@ fn colNode(body: str, cnt: int): Node {
         Some(d) { d }
         None { panic("a column leaf's columns") }
     }
-    return Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir}
+    var n = Node{leaf: true, keys: noKeys(), vals: [], kids: [], size: CB + len(body), packed: true, lazy: true, body: body, ents: ents, cols: cols, cdir: dir, pfx: [], kmin: 0, kmax: 0}
+    n.reword()
+    return n
 }
 
 // Leaf n as a column leaf's body (lexdb_rows.colBody), its rows encoded
@@ -719,7 +946,7 @@ pub fn decodeNode(b: &[]byte): Node {
     for i in 0..n {
         end += 2 + binary.readU16LE(b, end) + 8
     }
-    var node = Node{leaf: false, keys: rc(array(n, "")), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: [], cols: "", cdir: []}
+    var node = Node{leaf: false, keys: rc(array(n, "")), vals: [], kids: array(n + 1, 0), size: end - 18, packed: true, lazy: false, body: "", ents: [], cols: "", cdir: [], pfx: [], kmin: 0, kmax: 0}
     unpack(mut &node, &getStr(b, 18, end - 18), true)
     return node
 }
@@ -798,6 +1025,9 @@ pub fn adopt(n: mut &Node, var l: Node) {
     n.keys = noKeys()
     n.vals = []
     n.ents = replace(mut &l.ents, [])
+    n.pfx = replace(mut &l.pfx, [])
+    n.kmin = l.kmin
+    n.kmax = l.kmax
     n.cdir = replace(mut &l.cdir, [])
     n.cols = replace(mut &l.cols, "")
     n.body = replace(mut &l.body, "")
@@ -833,6 +1063,7 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
     }
     n.keys = rc(ks)
     n.packed = true
+    n.reword()
 }
 
 // About the memory a node in the cache takes (measured, design/lexdb.md
@@ -843,9 +1074,9 @@ fn unpack(n: mut &Node, body: &str, kids: bool) {
 // keeps for it, loaded or not: its SlotMeta and history list, about 120
 // bytes (measured, 9.17; a slot not in memory holds no node).
 pub fn nodeCost(n: &Node): int {
-    if n.lazy { return 160 + len(n.body) + 8 * len(n.ents) + 8 * len(n.cdir) }
+    if n.lazy { return 160 + len(n.body) + 8 * len(n.ents) + 8 * len(n.cdir) + 8 * len(n.pfx) }
     let keys = n.size + (if n.packed { 64 } else { 144 }) * len(n.keys)
-    return 160 + keys + 120 * len(n.kids)
+    return 160 + keys + 120 * len(n.kids) + 8 * len(n.pfx)
 }
 
 // ---- meta pages

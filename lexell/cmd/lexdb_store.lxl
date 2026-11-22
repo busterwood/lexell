@@ -781,12 +781,18 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
         c.packed = true
         c.body = n.body.clone()
         for e in n.ents { append(mut &c.ents, e) }
+        c.pfx = collections.copyOf(&n.pfx)
+        c.kmin = n.kmin
+        c.kmax = n.kmax
         c.cols = n.cols.clone()
         for x in n.cdir { append(mut &c.cdir, x) }
         return c
     }
     for v in n.vals { append(mut &c.vals, v.clone()) }
     for k in n.kids { append(mut &c.kids, k) }
+    c.pfx = collections.copyOf(&n.pfx)
+    c.kmin = n.kmin
+    c.kmax = n.kmax
     return c
 }
 
@@ -1126,7 +1132,7 @@ fn childIndex(keys: &[]str, k: &str): int {
     var lo = 0
     var hi = len(keys)
     while lo < hi {
-        let mid = (lo + hi) / 2
+        let mid = (lo + hi) >> 1
         if keys[mid] <= k { lo = mid + 1 } else { hi = mid }
     }
     return lo
@@ -1137,7 +1143,7 @@ fn lowerIndex(keys: &[]str, k: &str): int {
     var lo = 0
     var hi = len(keys)
     while lo < hi {
-        let mid = (lo + hi) / 2
+        let mid = (lo + hi) >> 1
         if keys[mid] < k { lo = mid + 1 } else { hi = mid }
     }
     return lo
@@ -1194,6 +1200,7 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
         s = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
         if s < 0 { return d }
     }
+    let w = lexdb_page.keyWord(k)
     while true {
         if !db.meta[s].loaded {
             d.need = s
@@ -1209,7 +1216,7 @@ fn (db: mut &Db) descend(tree: int, k: &str): Descent {
             db.lastLeaf = LastLeaf{tree: tree, shape: db.shape, path: collections.copyOf(&d.path), lo: los, hasLo: hasLos, hi: his, hasHi: hasHis}
             return d
         }
-        let i = childIndex(&db.pool[db.meta[s].frame].keys, k)
+        let i = db.pool[db.meta[s].frame].childW(k, w)
         if i < db.pool[db.meta[s].frame].count() {
             d.upper = db.pool[db.meta[s].frame].key(i)
             d.hasUpper = true
@@ -1330,6 +1337,8 @@ fn (db: mut &Db) split(s: int, atEnd: bool, at: int): Descent {
     }
     db.pool[db.meta[s].frame].size = nodeSize(&db.pool[db.meta[s].frame])
     right.size = nodeSize(&right)
+    db.pool[db.meta[s].frame].reword()
+    right.reword()
     db.meta[s].version += 1
     db.pool[db.meta[s].frame].packed = false
     db.recost(s)
@@ -1362,9 +1371,10 @@ fn (db: mut &Db) hang(tree: int, path: &[]int, j: int, sp: &Descent, atEnd: bool
     let s = path[j]
     let r = sp.path[0]
     if j == 0 {
-        let root = lexdb_page.Node{leaf: false, keys: rc([sp.upper.clone()]), vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: []}
+        let root = lexdb_page.Node{leaf: false, keys: rc([sp.upper.clone()]), vals: [], kids: [s, r], size: 0, packed: false, lazy: false, body: "", ents: [], cols: "", cdir: [], pfx: [], kmin: 0, kmax: 0}
         var rn = root
         rn.size = nodeSize(&rn)
+        rn.reword()
         let ns = db.newNode(rn)
         db.meta[s].root = false
         db.meta[ns].root = true
@@ -1378,6 +1388,7 @@ fn (db: mut &Db) hang(tree: int, path: &[]int, j: int, sp: &Descent, atEnd: bool
     while db.pool[db.meta[p].frame].kids[at] != s { at += 1 }
     db.shape += 1
     insertStr(db.pool[db.meta[p].frame].keys.unshare(), at, &sp.upper)
+    db.pool[db.meta[p].frame].reword()
     collections.insert(mut &db.pool[db.meta[p].frame].kids, at + 1, r)
     let end = atEnd && at + 2 == len(db.pool[db.meta[p].frame].kids)     // the new child is the parent's last
     db.pool[db.meta[p].frame].size += lexdb_page.kidEntry(&sp.upper)
@@ -1658,6 +1669,7 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
             let ki = if at == 0 { 0 } else { at - 1 }
             let sk = removeStr(db.pool[db.meta[p].frame].keys.unshare(), ki)
         }
+        db.pool[db.meta[p].frame].reword()
         db.pool[db.meta[p].frame].size = nodeSize(&db.pool[db.meta[p].frame])
         db.meta[p].version += 1
         db.pool[db.meta[p].frame].packed = false
@@ -1840,6 +1852,7 @@ fn (db: mut &Db) cutKids(s: int, kf: int, kt: int, sf: int, st: int, h: int) {
     }
     db.pool[f].kids = kids
     db.pool[f].keys = rc(keys)
+    db.pool[f].reword()
     db.pool[f].size = nodeSize(&db.pool[f])
     db.pool[f].packed = false
     db.meta[s].version += 1
@@ -2842,11 +2855,12 @@ fn newFinger(): Finger { return Finger{slots: [], vers: [], los: [], his: []} }
 // The key at b (b.s >= 0).
 fn (db: &Db) boundKey(b: Bound): &str { return db.snapNode(b.s, b.v).keyView(b.i) }
 
-// Whether depth d of f holds k: [lo, hi), each end bounded or not.
-fn (db: &Db) fHolds(f: &Finger, d: int, k: &str): bool {
+// Whether depth d of f holds k: [lo, hi), each end bounded or not; w is
+// k's word (lexdb_page.keyWord).
+fn (db: &Db) fHolds(f: &Finger, d: int, k: &str, w: u64): bool {
     let lo = f.los[d]
     let hi = f.his[d]
-    return (lo.s < 0 || db.boundKey(lo) <= k) && (hi.s < 0 || k < db.boundKey(hi))
+    return (lo.s < 0 || db.snapNode(lo.s, lo.v).keyLe(lo.i, k, w)) && (hi.s < 0 || !db.snapNode(hi.s, hi.v).keyLe(hi.i, k, w))
 }
 
 fn (f: mut &Finger) push(s: int, v: int, lo: Bound, hi: Bound) {
@@ -2872,9 +2886,10 @@ fn (db: &Db) fingerVer(s: int, snap: bool, q: int): int {
 
 // The leaf holding k, reached from the finger: up its path to the lowest
 // node whose range holds k, then down. Its depth in f; -1 with need set: a
-// node to load first; -2 a snapshot's version missing.
-fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str, need: mut &int): int {
-    while len(f.slots) > 0 && !db.fHolds(f, len(f.slots) - 1, k) { f.pop() }
+// node to load first; -2 a snapshot's version missing. w is k's word
+// (lexdb_page.keyWord).
+fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str, w: u64, need: mut &int): int {
+    while len(f.slots) > 0 && !db.fHolds(f, len(f.slots) - 1, k, w) { f.pop() }
     if len(f.slots) == 0 {
         let v = db.fingerVer(root, snap, q)
         if v == -2 {
@@ -2893,7 +2908,7 @@ fn (db: mut &Db) fingerTo(f: mut &Finger, root: int, snap: bool, q: int, k: &str
         {
             let n = db.snapNode(f.slots[d], f.vers[d])
             if n.leaf { return d }
-            let i = childIndex(&n.keys, k)
+            let i = n.childW(k, w)
             c = n.kids[i]
             if i > 0 { lo = Bound{s: f.slots[d], v: f.vers[d], i: i - 1} }
             if i < n.count() { hi = Bound{s: f.slots[d], v: f.vers[d], i: i} }
@@ -3034,8 +3049,9 @@ pub fn (st: &Store) getManyIn(t: mut &Txn, tree: int, keys: &[]&str, part: bool,
                     continue
                 }
                 var d = -1
+                let w = lexdb_page.keyWord(keys[i])
                 if root >= 0 {
-                    d = db.fingerTo(mut &fg, root, snap, q, keys[i], mut &need)
+                    d = db.fingerTo(mut &fg, root, snap, q, keys[i], w, mut &need)
                     if d == -1 {
                         ahead = db.lookupAhead(root, snap, q, keys, i, need)
                         break
@@ -3050,7 +3066,7 @@ pub fn (st: &Store) getManyIn(t: mut &Txn, tree: int, keys: &[]&str, part: bool,
                     let ls = fg.slots[d]
                     let lv = fg.vers[d]
                     let lf = db.snapNode(ls, lv)
-                    let li = lf.lower(keys[i])
+                    let li = lf.lowerW(keys[i], w)
                     if li < lf.count() && lf.keyView(li) == keys[i] {
                         if (ls != gs || lv != gv) && len(es) > 0 {
                             let gl = lexdb_page.leafView(db.snapNode(gs, gv))
@@ -3095,7 +3111,7 @@ fn (db: mut &Db) lookupAhead(root: int, snap: bool, q: int, keys: &[]&str, i: in
     var j = i + 1
     while j < len(keys) && len(out) < most && j - last <= LOOKUP_GAP {
         var nd = -1
-        let d = db.fingerTo(mut &f, root, snap, q, &keys[j], mut &nd)
+        let d = db.fingerTo(mut &f, root, snap, q, &keys[j], lexdb_page.keyWord(&keys[j]), mut &nd)
         if d == -2 { break }
         if d == -1 {
             var seen = false
@@ -3138,7 +3154,7 @@ pub fn (st: &Store) warm(t: &Txn, tree: int, keys: &[]&str): Result[Unit, lexdb_
             var f = newFinger()
             while i < n {
                 var need = -1
-                let d = db.fingerTo(mut &f, root, snap, q, &keys[i], mut &need)
+                let d = db.fingerTo(mut &f, root, snap, q, &keys[i], lexdb_page.keyWord(&keys[i]), mut &need)
                 if d == -2 {
                     i = n
                     return
@@ -3737,7 +3753,8 @@ pub fn (st: &Store) scanRanges(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
             var fg = newFinger()
             while x < nr {
                 if slow[x] { return }
-                let d = db.fingerTo(mut &fg, root, snap, q, &los[x], mut &need)
+                let wl = lexdb_page.keyWord(&los[x])
+                let d = db.fingerTo(mut &fg, root, snap, q, &los[x], wl, mut &need)
                 if d == -1 {
                     ahead = db.lookupAhead(root, snap, q, &starts, x, need)
                     return
@@ -3747,13 +3764,14 @@ pub fn (st: &Store) scanRanges(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
                     return
                 }
                 if fg.vers[d] == -1 { db.noteLeaf(tree, fg.slots[d]) }
-                if fg.his[d].s >= 0 && (len(his[x]) == 0 || his[x] > db.boundKey(fg.his[d])) {
+                let wh = if len(his[x]) == 0 { u64(0) } else { lexdb_page.keyWord(&his[x]) }
+                if fg.his[d].s >= 0 && (len(his[x]) == 0 || db.snapNode(fg.his[d].s, fg.his[d].v).keyLt(fg.his[d].i, &his[x], wh)) {
                     cross = true
                     return
                 }
                 let n = db.snapNode(fg.slots[d], fg.vers[d])
-                let i = n.lower(&los[x])
-                let j = if len(his[x]) == 0 { n.count() } else { n.lower(&his[x]) }
+                let i = n.lowerW(&los[x], wl)
+                let j = if len(his[x]) == 0 { n.count() } else { n.lowerW(&his[x], wh) }
                 x += 1
                 if j > i {
                     let lv = lexdb_page.leafView(&n)
@@ -4492,7 +4510,7 @@ fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapL
             r.at = j
             s = n.kids[j]
         } else {
-            let i = childIndex(&n.keys, cursor)
+            let i = n.child(cursor)
             if i < n.count() { fb = Bound{s: s, v: v, i: i} }
             r.par = s
             r.pver = v
