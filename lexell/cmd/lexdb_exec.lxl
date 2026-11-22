@@ -9396,7 +9396,8 @@ type Groups = record {
     firsts: [][]Val
     accs: [][]Acc
     sets: []int                 // grouping sets (9.94): each group's set
-    keep: []bool                // per column, kept in a group's first row (firstRow)
+    keep: []bool                // per column, kept in a group's first row (firstOf: made at the first group)
+    keepMade: bool
 }
 
 // Adds a row to its group (env: the row, and its correlated subqueries'
@@ -9422,7 +9423,7 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
                 Some(i) { g = i }
                 None {
                     g = len(gs.firsts)
-                    let fr = firstRow(r, &gs.keep)
+                    let fr = firstOf(sel, gs, r, room)
                     held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1) + len(k)
                     if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     gs.index.put(k, g)
@@ -9447,7 +9448,7 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
             Some(i) { g = i }
             None {
                 g = len(gs.firsts)
-                let fr = firstRow(r, &gs.keep)
+                let fr = firstOf(sel, gs, r, room)
                 held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1) + len(k)
                 if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 gs.index.put(k, g)
@@ -9456,7 +9457,7 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
             }
         }
     } else if len(gs.firsts) == 0 {
-        let fr = firstRow(r, &gs.keep)
+        let fr = firstOf(sel, gs, r, room)
         held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1)
         if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
         append(mut &gs.firsts, fr)
@@ -9471,7 +9472,19 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
 // what the pipeline's aggregate counts for a group's first values
 // (lexdb_pipe.bFirstVals), so max_statement_mem's edge is the same in both
 // engines (an aggregate's argument is not kept: a text or numeric one
-// counted no bytes in the pipeline and its whole row here before).
+// counted no bytes in the pipeline and its whole row here before). Under no
+// max_statement_mem (room < 0) the row is kept as it is: nothing is
+// counted, and a correlated subquery's run does not find its columns again
+// (TPC-H q17's).
+fn firstOf(sel: &Sel, gs: mut &Groups, r: &[]Val, room: int): []Val {
+    if room < 0 { return collections.copyOf(r) }
+    if !gs.keepMade {
+        gs.keep = lexdb_plan.firstKeep(sel)
+        gs.keepMade = true
+    }
+    return firstRow(r, &gs.keep)
+}
+
 fn firstRow(r: &[]Val, keep: &[]bool): []Val {
     var out: []Val = array(len(r), Val.Null)
     for i in 0..len(r) { if i < len(keep) && keep[i] { out[i] = r[i].clone() } }
@@ -10931,7 +10944,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         // done above
     } else if sel.aggQ {
         // per group: its first row (for grouped columns) and its accumulators
-        var gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: lexdb_plan.firstKeep(sel)}
+        var gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: [], keepMade: false}
         // A correlated subquery in a GROUP BY key or an aggregate's argument
         // runs per row, which it cannot while the rows are read (runQuery
         // holds the run): the rows are kept, then grouped (9.24).
@@ -10959,7 +10972,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                         m.subs[q.levels[0].src].data = replace(mut &m.vrows[0], [])
                         try lat0Memo(st, txn, q, params, mut &m.subs, rs)
                     }
-                    gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: lexdb_plan.firstKeep(sel)}
+                    gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: [], keepMade: false}
                     try materialize(st, txn, q, mut &m, params, rs)
                 }
             }
