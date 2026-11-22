@@ -5205,6 +5205,22 @@ fn narrowSub(sel: mut &Sel) {
 
 // The semi-join level of conjunct c (subquery i) of q, or None: c stays.
 // kind: IN's collation kind (resolve's); outer: about the rows reaching it.
+// Whether a conjunct is x [NOT] IN (subquery) with an x of no column.
+fn constIn(c: &Expr): bool {
+    match c {
+        Expr.Call(n, args, _) {
+            if n == "#in" && len(args) >= 4 {
+                var ns: []str = []
+                lexdb_sql.colNames(&args[3], mut &ns)
+                return len(ns) == 0
+            }
+        }
+        Expr.Unary(op, a) { if op == "not" { return constIn(&a) } }
+        else {}
+    }
+    return false
+}
+
 fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c: &Expr, i: int, kind: int, pt: &[]int,
              alts: mut &[]Option[SubPlan], outer: float, params: &[]Val, anti: bool, lookOk: bool, rules: bool,
              exact: bool): Result[Option[Level], DbErr] {
@@ -5213,6 +5229,9 @@ fn semiLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, c
     // a subquery with a LATERAL over its own FROM (a correlated FROM subquery of its own): its semi join's rows came
     // out empty (W14); it stays a subquery (IN's set run once, EXISTS per row)
     for s in q.subs[i].sel.q.subs { if s.use == lexdb_sql.SUB_FROM && len(s.sel.q.refs) > 0 { return Ok(None) } }
+    // a constant IN ('a' IN (subquery)): no semi join (its condition is also the query's once, which runs the
+    // subquery whose table a looked-up level took: C2)
+    if constIn(c) { return Ok(None) }
     // NOT IN: a null-aware anti join (optimizer 50), no residual filter
     let na = anti && q.subs[i].use == lexdb_sql.SUB_IN
     // a lookup per row as a join's level (semiLook), in place of the
