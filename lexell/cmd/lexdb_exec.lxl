@@ -65,6 +65,8 @@ import "./lexdb_udf"
 import "./lexdb_gen"
 import "./lexdb_priv"
 import "./lexdb_census"
+import "./lexdb_recur"
+import "./lexdb_recrun"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -2439,6 +2441,8 @@ pub fn declB(scale: int): int { return if scale <= -3 { ((-2 - scale) >> 24) & 0
 // in FROM, a catalog relation, a view): its type, with SQL Server's type
 // where it carries one (typScale).
 fn outType(o: &OutCol): lexdb_sql.TypeName {
+    // (SEARCH's and CYCLE's record and record[]: Reg values, their order their place, lexdb_recrun)
+    if o.oid == lexdb_recrun.OID_RECORD || o.oid == lexdb_recrun.OID_RECORDS { return lexdb_sql.TypeName{kind: lexdb_sql.K_REG, oid: o.oid, prec: 0, scale: 0, len: 0} }
     var t = lexdb_sql.oidType(o.oid)
     let code = lexdb_syscat.hintCode(o.scale)
     if code > 0 && (t.kind == lexdb_sql.K_TEXT || t.kind == lexdb_sql.K_INT || t.kind == lexdb_sql.K_BYTEA) {
@@ -10320,6 +10324,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     var outs: []OutCol = []
     for o in l.outs { append(mut &outs, o.clone()) }
     for i in 0..len(outs) { if len(outs[i].coll) == 0 { outs[i].coll = r.outs[i].coll.clone() } }
+    // a recursive CTE of T-SQL's or Oracle's, or with SEARCH or CYCLE: its types' rules, the columns it adds and hides
+    if s.rec && lexdb_recur.isSpec(&s.index) { outs = try lexdb_recrun.outsOf(&s.index, &outs, &r.outs, &s.inner[0]) }
     // each column of the type of both sides' values (lexdb_bind.commonOid),
     // the side of another type converted (runSet); of different categories,
     // or in a recursive CTE, the first side's as before
@@ -10382,7 +10388,9 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
               else { lexdb_bind.LPlan.SetOp(s.setop, s.setAll, lpl, lpr, outBCols(&outs)) }
     // the Sort lends its keys (Sel.order, lexdb_bind.lpLentOrder)
     let lp = topPlan(set, s, [], collections.copyOf(&desc), collections.copyOf(&nullsFirst))
-    return Ok(Sel{q: q, exprs: [], outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
+    // (a door's recursive CTE: its lexdb_recur.Spec, the set operation's Sel's one expression, which runRecursiveAs reads)
+    let spec = if s.rec && lexdb_recur.isSpec(&s.index) { [Expr.Lit(Val.Text(s.index.clone()))] } else { [] }
+    return Ok(Sel{q: q, exprs: spec, outs: outs, groupBy: [], order: order, aggQ: false, sort: len(order) > 0, first: -1,
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
@@ -10634,6 +10642,7 @@ fn setRes(sel: &Sel, rows: [][]Val, n: int): Res {
 // none; with UNION (not ALL), rows seen before are not added.
 fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp: &[]Val, rp: &[]Val,
                 rs: mut &Run): Result[[][]Val, DbErr] {
+    if len(sel.exprs) == 1 { return runRecursiveAs(st, txn, sel, lp, rp, rs) }
     let key = "w" + sel.rec.toStr()
     var seen: Map[str, int] = newMap()
     var lres = try runChild(st, txn, &sel.parts[0], lp, -1, rs, 0)
@@ -10657,6 +10666,30 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
         }
     }
     return Ok(out)
+}
+
+// runRecursive as a door has it (lexdb_recrun: SQL Server's order and MAXRECURSION, Oracle's cycles, SEARCH and CYCLE):
+// the same rounds, each one's rows handed to the run, which gives the next working table and, at the end, the rows.
+fn runRecursiveAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp: &[]Val, rp: &[]Val, rs: mut &Run): Result[[][]Val, DbErr] {
+    let key = "w" + sel.rec.toStr()
+    let spec = match sel.exprs[0] { Expr.Lit(v) { lexdb_sql.text(&v) } else { "" } }
+    var run = try lexdb_recrun.start(&spec, &sel.outs, rs.maxRounds)
+    var lres = try runChild(st, txn, &sel.parts[0], lp, -1, rs, 0)
+    // (UNION's rows seen before left out here, by lexdb_setop's keys, as runRecursive does)
+    var seen: Map[str, int] = newMap()
+    var made = replace(mut &lres.rows, [])
+    if !sel.setAll { made = lexdb_setop.distinctRows(made, mut &seen, &sel.outKinds) }
+    var work = try run.anchor(made)
+    while len(work) > 0 {
+        try rs.bud.tick()
+        try rs.bud.hold(lexdb_pipe.rowsBytes(&work) * 2)
+        cachePut(mut &rs.cache, key.clone(), work)
+        var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
+        var next = replace(mut &rres.rows, [])
+        if !sel.setAll { next = lexdb_setop.distinctRows(next, mut &seen, &sel.outKinds) }
+        work = try run.round(next)
+    }
+    return Ok(run.finish())
 }
 
 // EXPLAIN's lines for a planned SELECT.
@@ -18394,6 +18427,11 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 
 // The session's door (lexdb_tds, lexdb_tns).
 pub fn (s: &Session) setDoor(d: &str) { s.st.memo.put(&lexdb_priv.doorKey(s.id), d) }
+
+// A recursive CTE's rounds at most (SET max_recursion; the T-SQL door's MAXRECURSION: 100 by default, OPTION's for a
+// statement); 0 no limit.
+pub fn (s: &Session) recursionLimit(): int { return s.maxRecursion }
+pub fn (s: mut &Session) setRecursionLimit(n: int) { s.maxRecursion = n }
 
 // The routines a GRANT or REVOKE of PostgreSQL's names (FUNCTION, PROCEDURE, ROUTINE with its argument types or without, or ALL
 // FUNCTIONS | PROCEDURES | ROUTINES IN SCHEMA): the objects whose privileges it changes.

@@ -33,6 +33,8 @@ import "./lexdb_catalog"
 import "./lexdb_ops"
 import "./lexdb_syscat"
 import "./lexdb_parse"
+import "./lexdb_recur"
+import "./lexdb_recrun"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -489,8 +491,19 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     let oids = f.oids()
     var r = if bulk { sess.copyInFrom(s, pull) } else { sess.run(s, &f.vals, &oids) }
     if len(s.outInto) > 0 && r.isOk() { r = outputInto(sess, s, r.unwrap()) }
+    var before: []lexdb_exec.Res = []
+    var past = false
+    match r { Err(x) { past = x.state == "TS530" } Ok(_) {} }
+    if past { recursionRows(sess, s, f, &oids, mut &r, mut &before) }
     if r.isErr() {
         let e = r.unwrapErr()
+        // (SQL Server's rows before its 530)
+        if len(before) > 0 {
+            var x = ev0(EV_ROWS)
+            x.cols = replace(mut &before[0].cols, [])
+            x.rows = replace(mut &before[0].rows, [])
+            append(ev, x)
+        }
         if ownTx {
             // (the transaction is not the batch's: its error ends the statement, not it)
             let rb = simple(sess, &"ROLLBACK")
@@ -573,6 +586,37 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     return true
 }
 
+// SQL Server's MAXRECURSION by default: a recursive CTE's levels below its anchors.
+pub const MAXRECURSION = 100
+
+// A SELECT that failed with 530 (a recursive CTE past its MAXRECURSION): SQL Server sends the rows its plan gave before
+// the error when they stream from the CTE (lexdb_recur.streams); the statement is run again, read only, stopped at the
+// limit (lexdb_recrun.TRUNCATE): those rows (before), the error kept; with TOP n and n rows, they are the answer and
+// there is no error (SQL Server stops there).
+fn recursionRows(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: &Frame, oids: &[]int, r: mut &Result[lexdb_exec.Res, DbErr],
+                 before: mut &[]lexdb_exec.Res) {
+    if s.kind != lexdb_sql.S_SELECT || len(s.assign) > 0 || len(s.into) > 0 { return }
+    let top = lexdb_recur.streams(s)
+    let keep = sess.recursionLimit()
+    if keep <= 0 { return }
+    sess.setRecursionLimit(keep + lexdb_recrun.TRUNCATE)
+    let again = sess.run(s, &f.vals, oids)
+    sess.setRecursionLimit(keep)
+    match again {
+        Ok(res0) {
+            var res = res0
+            if top > 0 && len(res.rows) >= top {
+                r = Ok(res)
+                return
+            }
+            // (a query that does not stream them: its columns, no rows, as SQL Server's COLMETADATA before the error)
+            if top < 0 { res.rows = [] }
+            append(before, res)
+        }
+        Err(_) {}
+    }
+}
+
 // OUTPUT ... INTO target [(columns)]: the rows the statement output (res, its RETURNING's) inserted into the target, a table
 // variable, a #temporary or a table; the statement then returns no rows, only its count. The target's own errors are the
 // INSERT's (an unconvertible value 245, a duplicate key 2627, a value too long 2628); the lists' lengths are 120, 121 and
@@ -640,7 +684,15 @@ fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), 
 
 // One statement of the batch; false when the batch ends.
 fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): bool {
-    if t.kind == lexdb_tsqlparse.TS_SQL { return st.sqlStmt(sess, &t.stmt[0], f, ev, false) }
+    if t.kind == lexdb_tsqlparse.TS_SQL {
+        if len(t.flags) == 0 { return st.sqlStmt(sess, &t.stmt[0], f, ev, false) }
+        // OPTION (MAXRECURSION n): the statement's limit
+        let keep = sess.recursionLimit()
+        sess.setRecursionLimit(t.flags[0])
+        let go = st.sqlStmt(sess, &t.stmt[0], f, ev, false)
+        sess.setRecursionLimit(keep)
+        return go
+    }
     if t.kind == lexdb_tsqlparse.TS_INSERTBULK {
         // the table must be there (208); its columns are looked at when the rows come
         match sess.tableDecl(&t.names[0]) {

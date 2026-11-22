@@ -263,6 +263,51 @@ fn execStmt(q: mut &Parser): Result[TStmt, DbErr] {
     return Ok(ts)
 }
 
+// The hints SQL Server's OPTION (...) takes, by their first word (a word lexdb does not know is SQL Server's 102).
+const HINTS: []str = ["maxrecursion", "maxdop", "recompile", "hash", "order", "merge", "concat", "loop", "fast", "force", "keep", "keepfixed",
+    "optimize", "use", "querytraceon", "no_performance_spool", "robust", "expand", "ignore_nonclustered_columnstore_index",
+    "max_grant_percent", "min_grant_percent", "label", "parameterization", "table", "disable_optimized_plan_forcing", "for"]
+
+// OPTION ( hint, ... ) after a statement, at OPTION: MAXRECURSION n (0 to 32767: 310 past it, 1042 given twice), the
+// rest read and taken as they do not change a statement's rows. The MAXRECURSION given, -1 none.
+fn optionClause(q: mut &Parser): Result[int, DbErr] {
+    q.skip(2)
+    var maxrec = -1
+    while true {
+        let t = q.peek().clone()
+        if t.kind != lexdb_parse.T_IDENT { return Err(q.unexpected()) }
+        var known = false
+        for h in HINTS { if h == t.text { known = true } }
+        if !known { return Err(lexdb_base.err("TS102", &("Incorrect syntax near '" + (if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }) + "'."))) }
+        q.skip(1)
+        if t.text == "maxrecursion" {
+            let n = q.peek().clone()
+            if n.kind != lexdb_parse.T_NUM { return Err(q.unexpected()) }
+            q.skip(1)
+            let v = strings.parseIntOpt(&n.text).unwrapOr(-1)
+            if v < 0 { return Err(lexdb_base.err("TS102", &("Incorrect syntax near '" + n.text + "'."))) }
+            if v > 32767 { return Err(lexdb_base.err("TS310", &("The value " + n.text + " specified for the MAXRECURSION option exceeds the allowed maximum of 32767."))) }
+            if maxrec >= 0 { return Err(lexdb_base.err("TS1042", "Conflicting maxrecursion optimizer hints specified.")) }
+            maxrec = v
+        } else {
+            // the rest of the hint: words, numbers, = value, (...) lists, up to "," or ")"
+            var depth = 0
+            while true {
+                let x = q.peek().clone()
+                if x.kind == lexdb_parse.T_EOF { return Err(q.unexpected()) }
+                if depth == 0 && x.kind == lexdb_parse.T_OP && (x.text == "," || x.text == ")") { break }
+                if x.kind == lexdb_parse.T_OP && x.text == "(" { depth += 1 }
+                if x.kind == lexdb_parse.T_OP && x.text == ")" { depth -= 1 }
+                q.skip(1)
+            }
+        }
+        if q.acceptKw(",") { continue }
+        try q.expectKw(")")
+        break
+    }
+    return Ok(maxrec)
+}
+
 // Whether INSERT [INTO] name [(columns)] EXEC follows.
 fn insertExec(q: &Parser): bool {
     var k = 1
@@ -557,6 +602,11 @@ fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     }
     var ts = tstmt(TS_SQL)
     let one = try q.statement()
+    // OPTION (query hints): MAXRECURSION n kept (TS_SQL's flags: [n]); the others read and left to the planner
+    if q.isKw("option") && q.peekAt(1).kind == lexdb_parse.T_OP && q.peekAt(1).text == "(" {
+        let m = try optionClause(q)
+        if m >= 0 { append(mut &ts.flags, m) }
+    }
     // a function of the user's in what is kept as text and read again by the other parser (a default, a CHECK, a view): later
     if one.udf && (one.kind == lexdb_sql.S_CREATE || one.kind == lexdb_sql.S_ALTER || one.kind == lexdb_sql.S_CREATE_VIEW || one.kind == lexdb_sql.S_CREATE_INDEX) {
         return Err(lexdb_base.err("0A000", "lexdb: a function of the user's in a column default, a CHECK constraint, a computed column, an index or a view is not supported yet"))

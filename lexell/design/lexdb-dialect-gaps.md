@@ -730,3 +730,124 @@ lexdb's own `WAIT n SECONDS` clause on the Oracle door (Oracle says 03049 for th
 
 **Next:** run `--check` after any Oracle-door change; check `tns_nls` and `tns_wait` the same way (add the `println(`
 form to the scenario parser); ORA-41900 holds for this image (23.26), the 2026-11-13 recording had 01031.
+
+## 10. Recursion in the doors (rec, 2026-11-22)
+
+Before: lexdb's recursive CTE was PostgreSQL's `WITH RECURSIVE` only (rounds over a working table, `SET max_recursion`,
+lexdb-layers.md 6.3.Q8 R2). The T-SQL door refused a CTE that names itself (208), the Oracle door Oracle's recursive
+WITH (ORA-00942), and the Oracle door's CONNECT BY was the `dual connect by level <= n` generator alone. Each product's
+behaviour below was checked on the real server (SQL Server 2022 in `lxl-mssql`, Oracle Free 23.26 in `lxl-oracle`,
+the scratch PostgreSQL 18.6), and the tests' answers are theirs.
+
+**What the products do.**
+
+- *SQL Server.* A CTE that names itself is recursive (no RECURSIVE). Anchor members (several, combined by UNION ALL,
+  UNION, EXCEPT, INTERSECT), then UNION ALL and the recursive members (several, UNION ALL only); errors 246 (no anchor),
+  247 (an anchor after a recursive member), 252 (no top-level UNION ALL: UNION, EXCEPT, a lone member), 253 (two
+  references in a member), 460 DISTINCT, 461 TOP/OFFSET, 462 any outer join, 465 a reference in a subquery of an
+  expression (one in a derived table is taken), 467 GROUP BY, HAVING or an aggregate (in a scalar subquery of the member
+  too), 240 a column's type (and length) not the same in both parts (a NULL anchor takes the recursive part's), 8158 /
+  8159 the column list's length, 239 a CTE named twice. MAXRECURSION: 100 by default, `OPTION (MAXRECURSION n)` 0 (no
+  limit) to 32767 (310 past it, 1042 given twice, 102 for a negative or a variable); a row at level n + 1 is 530 ("The
+  statement terminated. The maximum recursion %d has been exhausted before statement completion."), the statement
+  rolled back. The rows come from a stack spool: the anchors as made, then the last row made is expanded next, its
+  children after it, so without ORDER BY the order is depth first from the last sibling; a client streaming a plain
+  SELECT of the CTE gets the rows made before the 530 and then the error (with ORDER BY or an aggregate: the columns and
+  the error; `TOP n` stops the spool, no error when n rows come first). WITH ... INSERT / UPDATE / DELETE / MERGE.
+- *Oracle.* Recursive subquery factoring needs the column alias list (ORA-32039); exactly two branches joined by UNION
+  ALL (32040 for UNION or one branch, 32041 for three), the recursive one may come first; 32486 (aggregate, DISTINCT,
+  GROUP BY in the recursive branch), 32487 (the CTE on an outer join's NULL side; `r LEFT JOIN t` is taken), 32490
+  (referenced twice), 32042 (in any subquery, derived tables too), 01790 (different datatypes; lengths do not matter,
+  `s || 'a'` grows), 32038 (the list's length). Rows come iteration by iteration (each round's rows in their parents'
+  order). A row equal in every column to an ancestor is ORA-32044 (a cycle), and so is a recursive branch without any
+  predicate (`WHERE 1 = 1` included), at once, before a row. `SEARCH DEPTH|BREADTH FIRST BY c [ASC|DESC] [NULLS
+  FIRST|LAST], ... SET o` numbers the rows 1.. in that order and gives them in it; `CYCLE c, ... SET m TO 'Y' DEFAULT
+  'N'` marks a row whose columns are an ancestor's, gives it and does not expand it (the values one-character strings or
+  digits: 32047; 32048, 32046, 32482, 32489 for the names). Hierarchical queries: `START WITH` (none: every row a root),
+  `CONNECT BY [NOCYCLE]` with `PRIOR` on either side and LEVEL, the WHERE applied after the hierarchy, depth first with
+  siblings by `ORDER SIBLINGS BY` (the roots too, when START WITH gives them); a loop is a row whose PRIOR operands'
+  values are an ancestor's (`prior sys_guid() is not null` is the known trick): ORA-01436, or with NOCYCLE the row left
+  out and its parent's CONNECT_BY_ISCYCLE 1; CONNECT_BY_ISLEAF, CONNECT_BY_ROOT, SYS_CONNECT_BY_PATH, PRIOR in the select
+  list; PRIOR without CONNECT BY ORA-01788, ORDER SIBLINGS BY without it ORA-30929; without PRIOR (`connect by level <=
+  n`) no loop check.
+- *PostgreSQL 14+.* `SEARCH DEPTH|BREADTH FIRST BY c, ... SET o` (no ASC/DESC/NULLS) adds o, a `record[]` path (depth
+  first) or a `record` (depth, columns) (breadth first); the rows are not reordered (ORDER BY o does it). `CYCLE c, ...
+  SET m [TO v DEFAULT d] USING p` adds the mark (boolean by default; integers, texts) and the path p (`record[]`); a row
+  whose columns are in its path is marked and not expanded; a NULL is never equal. Errors 42702, 42601 (column not in the
+  list, mark or path name taken or the same, not recursive, no USING), 42701 (a search column twice), 22P02 (1 and 'N').
+  A recursive reference in a derived table is taken; in a subquery of an expression 42P19.
+
+**What was built.** Parsing in lexdb_parse (the T-SQL door's parser is the same with `tsql`), the rules and the shape in
+a new module, `lexdb_recur` (statements only), the run's dialect parts in another, `lexdb_recrun`; lexdb_exec's
+`runRecursive` runs the rounds as before and hands them over (`runRecursiveAs`); the pipeline's held working table is
+unchanged.
+
+- `withList`: in T-SQL and Oracle every CTE is in scope in its own body; one that reads itself is recursive.
+  `lexdb_recur.check` gives each dialect's errors when the WITH is read; `lexdb_recur.shape`, where the CTE is used,
+  makes the body the executor runs: the anchors as written, UNION ALL, the recursive members as one UNION ALL query
+  (Oracle's branches swapped when the recursive one is first), and the *lineage*: a hidden last column
+  (`\x00rowid:rid`, hidden as a keyless table's rowid is, so `*` never shows it) that is 0 in the anchors and the working
+  table's row number in the recursive members, so the run knows each row's parent. Its `Spec` (dialect, SEARCH, CYCLE,
+  CONNECT BY's flags, the CTE's name and columns) rides in the set operation's `Stmt.index` and the Sel's one expression
+  (set operations have no other use for them; no new field on Stmt or Sel).
+- `lexdb_recrun`: the CTE's columns (lineage hidden; SEARCH's, CYCLE's added; T-SQL's 240 by type and hinted length,
+  Oracle's 01790 by datatype family), and the run: each round's rows numbered with their parent and level, UNION's dedup
+  kept, the loop check (CYCLE's columns, CONNECT BY's PRIOR values, Oracle's whole row; by a hash of the keys seen, the
+  ancestors walked only on a hit), the limit (T-SQL 530, Oracle's lexdb limit as 32044, PostgreSQL's 54001), and at the
+  end the rows in the dialect's order: SQL Server's stack, Oracle's iterations or its SEARCH order, PostgreSQL's rounds;
+  SEARCH's ordering column (Oracle: the place; PostgreSQL: `Reg(place, text)` typed `record[]` / `record`, so it sorts as
+  PostgreSQL's path does and prints as record_out and array_out write it; `_record`, 2287, added to pg_type), CYCLE's mark
+  and path.
+- T-SQL door: `OPTION (...)` read after a statement (lexdb_tsqlparse: MAXRECURSION kept in the TS_SQL statement's flags,
+  the other hints read and ignored, an unknown one 102); the session's limit 100 (lexdb_tds sets it at login and reset;
+  `OPTION` sets it for the statement); a SELECT that fails with 530 is run again stopped at the limit
+  (`lexdb_recrun.TRUNCATE`, read only) and its rows (or, when it does not stream from the CTE, its columns alone) are sent
+  before the error, as SQL Server sends them; with TOP n and n rows the answer is those rows.
+- Oracle door: `START WITH` / `CONNECT BY` after WHERE (`hierTail`, reached from selectCore's existing Oracle branch, so the
+  other doors pay nothing), `PRIOR` and `CONNECT_BY_ROOT` as operators (oraPrimary), `ORDER SIBLINGS BY`; the query is
+  rewritten (`lexdb_recur.hierQuery`) into a recursive CTE over its FROM item: the item's columns and hidden columns for
+  LEVEL, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE and per PRIOR / CONNECT_BY_ROOT / SYS_CONNECT_BY_PATH use, per PRIOR
+  operand of CONNECT BY (the loop check) and per sibling key; the anchor the item's rows under START WITH, the recursive
+  member the item joined to the working table ON the CONNECT BY condition (PRIOR's operands the parent's, an unqualified
+  column the child's, LEVEL the parent's + 1); the run depth first by the sibling keys, a loop row left out (NOCYCLE) or
+  ORA-01436; the query reads the CTE under the item's alias, its WHERE after the hierarchy. The `dual connect by level`
+  generator is kept as it was (a token rewrite to generate_series, before any of this).
+- PostgreSQL door: SEARCH and CYCLE as above; a recursive reference in a derived table now taken (lexdb said 42P19).
+
+**Tests.** `tds_recursion` (72 batches; SQL Server 2022's answers, generated with LEXDB_MSSQL against an empty
+database), `tns_recursion` (81 statements; registered in gen_oracle.py; `--check` against Oracle Free: 81 answers, no
+difference), `exec_recursion` (37 statements; PostgreSQL 18.6's answers; `tests/lexdb/check_pg.py` checks the test's
+lines against a PostgreSQL server: no difference), each statement with batches off and on. Suite 308 of 308.
+
+**Gates** (branch a2e15762 against main ed51b718, both built `-O` alike). Point statements in process (`LXL_HASH_SEED=1`,
+the 1-statement run subtracted from the 20,000-statement one, two rounds, identical within 0.2 instructions): select by
+key 124,628.6 against 124,631.6 instructions, INSERT -48, UPDATE by key -6. Over the wire (`icount6.sh BIN 3`, three
+alternated pairs): 173,364 / 173,357 / 173,372 against main's 173,600 / 173,349 / 173,364 instructions a statement (main's
+own spread 250; cycles and L1 i-cache misses lower or level). TPC-H SF1 (`~/tpch-w/rec`, alternated twice): totals
+9,091 and 8,920 ms against main's 9,776 and 9,244 (best of each: 8,913 against 9,098, 0.98), checksums equal on all 22
+and the reference's; no query slower beyond its runs' spread.
+
+**Left.**
+- CONNECT BY over more than one FROM item (a join, or comma-joined tables with the join in WHERE) is 0A000: Oracle joins
+  first, then builds the hierarchy, then applies the rest of the WHERE. Plan: build the CTE's base as a derived table of
+  the join (the parenthesised-tree subquery, TREE_STAR, keeps the columns' qualifiers), split the WHERE's conjuncts into
+  the join's (those naming two FROM items, as Oracle does) and the rest, and qualify the CONNECT BY condition's columns
+  against that tree; the rest is as built.
+- Without START WITH, Oracle's roots come in an order of its own (not ORDER SIBLINGS BY's); lexdb gives them in the
+  FROM item's order, then siblings as asked.
+- SQL Server's row order without ORDER BY follows its plan; lexdb's is the stack order over the rows as its join makes
+  them (each parent's children in the join's order), which is SQL Server's for the plans checked. Where a recursive member
+  reads the working table only inside a derived table there is no lineage and the rows come round by round.
+- T-SQL types: lexdb does not know an expression's length or a numeric's precision, so 240 is given for a different type
+  or a hinted length (CAST(... AS varchar(10)) against varchar(11)), not for `'a'` against `s + 'a'` or numeric(5,0)
+  against numeric(6,0) (SQL Server: 240).
+- Oracle: lexdb's own round limit (max_recursion, 1000 by default) is ORA-32044 with lexdb's note; Oracle has no limit
+  and runs on. The ORA-32044 of a branch without a predicate is lexdb's reading of what Oracle does (WHERE 1 = 1 and a
+  join ON 1 = 1 are it, `WHERE n > 0` is not).
+- Rows before an error other than 530 (8134 in a later row, ...) are not sent: the T-SQL door sends an error alone, as
+  before. `TOP n` over a CTE that never ends, with `MAXRECURSION 0`, runs until lexdb's statement memory
+  (max_statement_mem) ends it: SQL Server stops the spool after n rows; lexdb runs a CTE's rounds before its reader.
+- Found, not fixed (not recursion's): a non-recursive CTE's column list names its columns in lower case in the T-SQL and
+  Oracle doors (`WITH r (X) AS (SELECT 1) SELECT * FROM r` shows `x`; SQL Server `X`, Oracle `X`): the FROM item's
+  column list carries folded names (lexdb_exec's FROM binding). The recursive ones name theirs as written
+  (`lexdb_recur.Spec.spells`).

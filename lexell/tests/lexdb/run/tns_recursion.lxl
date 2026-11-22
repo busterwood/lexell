@@ -1,0 +1,221 @@
+// lexdb over TNS: recursion in the Oracle door (design/lexdb-dialect-gaps.md, "Recursion in the doors"), checked against
+// Oracle Database Free (gen_oracle.py --check: the answers below are Oracle's): recursive subquery factoring (the column
+// list required, ORA-32039; one anchor and one recursive branch, in either order; ORA-32040, 32041, 32486, 32487,
+// 32490, 32042, 01790, 32038), Oracle's iteration order where no ORDER BY gives one, its cycle check (ORA-32044: a row
+// that is an ancestor's again, a recursive branch without a predicate), SEARCH DEPTH FIRST and BREADTH FIRST BY ...
+// [ASC | DESC] [NULLS FIRST | LAST] SET (the ordering column, the rows in its order), CYCLE ... SET ... TO ... DEFAULT
+// (the marks, cycle rows not expanded, NULLs; ORA-32047, 32048, 32046, 32482, 32489), recursion under a join, GROUP BY,
+// FETCH FIRST, an INSERT and an UPDATE fed by one; hierarchical queries: START WITH, CONNECT BY [NOCYCLE] with PRIOR
+// either side and LEVEL, LEVEL, CONNECT_BY_ROOT, SYS_CONNECT_BY_PATH, CONNECT_BY_ISLEAF, CONNECT_BY_ISCYCLE, PRIOR in the
+// select list, ORDER SIBLINGS BY (ASC, DESC, a text), WHERE after the hierarchy, GROUP BY LEVEL, LEVEL in CONNECT BY,
+// upward (id = PRIOR boss), a derived table, ORA-01436, 01788, 30929; the dual row generator (CONNECT BY LEVEL <= n, <
+// n, 10,000 rows). Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or
+// DIFFERENT and both.
+// expect: setup: 9 statements
+// expect: same: ID,NAME,LVL = 1|'ann'|0;2|'bob'|1;3|'cid'|1;4|'dan'|2;5|'eve'|2;6|'fay'|2;7|'gus'|0;8|'hal'|1;9|'ivy'|3;10|'jon'|4;12|'lou'|0
+// expect: same: ID,LVL = 1|0;7|0;12|0;2|1;3|1;8|1;4|2;6|2;5|2;9|3;10|4
+// expect: same: ID,LVL = 1|0;7|0;12|0;2|1;3|1;8|1;4|2;6|2;5|2;9|3;10|4
+// expect: same: ID,LVL = 1|0;7|0;12|0;2|1;3|1;8|1;4|2;5|2;6|2;9|3;10|4
+// expect: same: error 32039
+// expect: same: error 32040
+// expect: same: error 32041
+// expect: same: error 32041
+// expect: same: error 32486
+// expect: same: error 32486
+// expect: same: error 32486
+// expect: same: N = 1;2;3
+// expect: same: error 32487
+// expect: same: error 32490
+// expect: same: error 32042
+// expect: same: error 32042
+// expect: same: N,S = 1|'a';2|'aa';3|'aaa'
+// expect: same: error 1790
+// expect: same: N = 1;2.5;4
+// expect: same: error 32038
+// expect: same: ID,LVL = 
+// expect: same: ID,BOSS = 11|99
+// expect: same: ID,BOSS = 10|9;9|4;4|2;2|1;1|NULL
+// expect: same: error 32044
+// expect: same: error 32044
+// expect: same: error 32044
+// expect: same: C,M = 50|50
+// expect: same: C,M = 3000|3000
+// expect: same: error 32044
+// expect: same: A,B,C = 1|2|'N';2|3|'N';3|1|'N';3|4|'N';1|2|'Y';4|NULL|'N'
+// expect: same: A,B,C = 1|2|'N';2|3|'N';3|1|'N';3|4|'N';1|2|'Y';4|NULL|'N'
+// expect: same: A,B,O,C = 1|2|1|'0';2|3|2|'0';3|1|3|'0';1|2|4|'1';3|4|5|'0';4|NULL|6|'0'
+// expect: same: A,B,C = NULL|1|'N';1|2|'N';2|3|'N';3|1|'N';3|4|'N';1|2|'Y';4|NULL|'N'
+// expect: same: A,B,C = 3|1|'N';NULL|1|'N';2|3|'N';1|2|'N';3|1|'Y';NULL|1|'N'
+// expect: same: A,B,C = 5|5|'N';5|5|'Y'
+// expect: same: error 32047
+// expect: same: error 32048
+// expect: same: error 32046
+// expect: same: error 32482
+// expect: same: error 32489
+// expect: same: A,B,C = 1|2|'N';2|3|'N';3|1|'N';3|4|'N';1|2|'Y';4|NULL|'N'
+// expect: same: A,B,C = 1|2|'N';2|3|'N';3|1|'N';3|4|'N';4|NULL|'N'
+// expect: same: A,B,C = 1|2|'N';2|3|'N';3|1|'N';3|4|'N';1|2|'1';4|NULL|'N'
+// expect: same: ID,LVL,O = 1|0|1;2|1|2;4|2|3;9|3|4;10|4|5;6|2|6;3|1|7;5|2|8;7|0|9;8|1|10;12|0|11
+// expect: same: ID,LVL,O = 1|0|1;7|0|2;12|0|3;2|1|4;3|1|5;8|1|6;4|2|7;5|2|8;6|2|9;9|3|10;10|4|11
+// expect: same: ID,LVL,O = 12|0|1;7|0|2;8|1|3;1|0|4;3|1|5;5|2|6;2|1|7;6|2|8;4|2|9;9|3|10;10|4|11
+// expect: same: ID,LVL,O = 1|0|1;2|1|2;3|1|7;4|2|3;5|2|8;6|2|6;7|0|9;8|1|10;9|3|4;10|4|5;12|0|11
+// expect: same: ID,O = 1|1;7|2;12|3;2|4;3|5;8|6;4|7;5|8;6|9;9|10;10|11
+// expect: same: A,B,O,C = 3|1|1|'N';1|2|2|'N';2|3|3|'N';3|1|4|'Y';3|4|5|'Y';3|4|6|'N';4|NULL|7|'N'
+// expect: same: ID,PATH = 1|'ann';2|'ann/bob';4|'ann/bob/dan';9|'ann/bob/dan/ivy';10|'ann/bob/dan/ivy/jon';6|'ann/bob/fay';3|'ann/cid';5|'ann/cid/eve';7|'gus';8|'gus/hal';12|'lou'
+// expect: same: LVL,N = 0|3;1|3;2|3;3|1;4|1
+// expect: same: NAME,LVL = 'dan'|2;'eve'|2;'fay'|2;'ivy'|3;'jon'|4
+// expect: same: X,Y = 1|1;1|2;1|3;2|1;2|2;2|3;3|1;3|2;3|3
+// expect: same: N,D,S = 1907|7|3007369
+// expect: same: ID,LVL,O = 2|0|1;6|1|2;18|2|3;54|3|4;162|4|5;486|5|6;1458|6|7;1459|6|8;1460|6|9;487|5|10;1461|6|11;1462|6|12
+// expect: same: 11 / N,S = 11|16
+// expect: same: 5 / ID,NAME = 2|'xbob';4|'xdan';6|'xfay';9|'xivy';10|'xjon'
+// expect: same: ID,BOSS,NAME,LEVEL,IL,PTH,RT,PN = 1|NULL|'ann'|1|0|'/ann'|'ann'|NULL;2|1|'bob'|2|0|'/ann/bob'|'ann'|'ann';4|2|'dan'|3|0|'/ann/bob/dan'|'ann'|'bob';9|4|'ivy'|4|0|'/ann/bob/dan/ivy'|'ann'|'dan';10|9|'jon'|5|1|'/ann/bob/dan/ivy/jon'|'ann'|'ivy';6|2|'fay'|3|1|'/ann/bob/fay'|'ann'|'bob';3|1|'cid'|2|0|'/ann/cid'|'ann'|'ann';5|3|'eve'|3|1|'/ann/cid/eve'|'ann'|'cid';7|NULL|'gus'|1|0|'/gus'|'gus'|NULL;8|7|'hal'|2|1|'/gus/hal'|'gus'|'gus';12|NULL|'lou'|1|1|'/lou'|'lou'|NULL
+// expect: same: ID,LEVEL = 12|1;7|1;8|2;1|1;3|2;5|3;2|2;6|3;4|3;9|4;10|5
+// expect: same: ID,LEVEL = 1|1;2|2;4|3;9|4;10|5;6|3;3|2;5|3;7|1;8|2;12|1
+// expect: same: A,B,LEVEL,IC,IL = 1|2|1|0|0;2|3|2|0|0;3|1|3|1|1;3|4|3|0|0;4|NULL|4|0|1
+// expect: same: error 1436
+// expect: same: A,B,LEVEL,IC,IL = 3|1|1|0|0;1|2|2|0|0;2|3|3|1|0;3|4|4|0|0;4|NULL|5|0|1;3|4|1|0|0;4|NULL|2|0|1
+// expect: same: ID,LEVEL = 2|2;4|3;9|4;10|5;6|3;3|2;5|3;8|2
+// expect: same: LEVEL,N = 1|3;2|3;3|3;4|1;5|1
+// expect: same: ID,LEVEL = 1|1;2|2;3|2
+// expect: same: LEVEL,P = 1|',10';2|',10,9';3|',10,9,4';4|',10,9,4,2';5|',10,9,4,2,1'
+// expect: same: ID,LEVEL = 1|1;2|2;3|2;5|3;7|1;8|2;12|1
+// expect: same: T = 'ann';'  bob';'    dan';'      ivy';'        jon';'    fay';'  cid';'    eve';'gus';'  hal';'lou'
+// expect: same: ID,BOSS,NAME = 1|NULL|'ann';2|1|'bob'
+// expect: same: ID = 2;4;9;10;6
+// expect: same: C = 156
+// expect: same: error 1436
+// expect: same: L = 1;2;3;4;5
+// expect: same: L = 1;2;3
+// expect: same: C,S = 10000|50005000
+// expect: same: error 1788
+// expect: same: error 30929
+// expect: same: ID,LEVEL = 1|1;2|2;4|3;9|4;10|5;6|3;7|1;8|2;12|1
+// expect: same: ID,LEVEL,R = 2|1|2;6|2|2;18|3|2;54|4|2;55|4|2;56|4|2;19|3|2;57|4|2;58|4|2;59|4|2;20|3|2;60|4|2;61|4|2;62|4|2;7|2|2
+// expect: same: N,D = 1907|8
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table emp (id number(10) primary key, boss number(10), name varchar2(10))\ninsert into emp select 1, null, 'ann' from dual union all select 2, 1, 'bob' from dual union all select 3, 1, 'cid' from dual union all select 4, 2, 'dan' from dual union all select 5, 3, 'eve' from dual union all select 6, 2, 'fay' from dual union all select 7, null, 'gus' from dual union all select 8, 7, 'hal' from dual union all select 9, 4, 'ivy' from dual union all select 10, 9, 'jon' from dual union all select 11, 99, 'kim' from dual union all select 12, null, 'lou' from dual\ncreate table g (a number(10), b number(10))\ninsert into g select 1, 2 from dual union all select 2, 3 from dual union all select 3, 1 from dual union all select 3, 4 from dual union all select null, 1 from dual union all select 4, null from dual union all select 5, 5 from dual\ncreate table dg (i number(10))\ninsert into dg select level - 1 from dual connect by level <= 10\ncreate table big (id number(10) primary key, p number(10))\ninsert into big select n, case when n = 1 then null else trunc(n / 3) end from (select p.i + q.i * 10 + r.i * 100 + s.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg s) z where n <= 3000\ncreate table tgt (id number(10) primary key, lvl number(10))"
+
+const QS = "with r (id, name, lvl) as (select id, name, 0 from emp where boss is null union all select e.id, e.name, r.lvl + 1 from emp e join r on e.boss = r.id) select id, name, lvl from r order by id\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from r join emp e on e.boss = r.id) select id, lvl from r\nwith r (id, lvl) as (select e.id, r.lvl + 1 from emp e join r on e.boss = r.id union all select id, 0 from emp where boss is null) select id, lvl from r order by lvl, id\nwith r as (select id, 0 lvl from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r\nwith r (n) as (select 1 from dual union select n + 1 from r where n < 3) select n from r\nwith r (n) as (select 1 from dual union all select 2 from dual union all select n + 1 from r where n < 3) select n from r\nwith r (n) as (select 1 from dual union all select n + 1 from r where n < 3 union all select n + 10 from r where n < 3) select n from r\nwith r (n) as (select 1 from dual union all select count(*) from r) select n from r\nwith r (n) as (select 1 from dual union all select distinct n + 1 from r where n < 3) select n from r\nwith r (n) as (select 1 from dual union all select n + 1 from r where n < 3 group by n) select n from r\nwith r (n) as (select 1 from dual union all select r.n + 1 from r left join emp on emp.id = r.n where r.n < 3) select n from r\nwith r (n) as (select 1 from dual union all select r.n + 1 from emp left join r on emp.id = r.n where r.n < 3) select n from r\nwith r (n) as (select 1 from dual union all select a.n + 1 from r a join r b on a.n = b.n where a.n < 3) select n from r\nwith r (n) as (select 1 from dual union all select n + 1 from r where n < 3 and n in (select n from r)) select n from r\nwith r (n) as (select 1 from dual union all select n + 1 from (select n from r) d where n < 3) select n from r\nwith r (n, s) as (select 1, 'a' from dual union all select n + 1, s || 'a' from r where n < 3) select n, s from r\nwith r (n, s) as (select 1, 1 from dual union all select n + 1, 'x' from r where n < 3) select n, s from r\nwith r (n) as (select 1 from dual union all select n + 1.5 from r where n < 3) select n from r\nwith r (n, x) as (select 1 from dual union all select n + 1 from r where n < 3) select n from r\nwith r (id, lvl) as (select id, 0 from emp where id > 100 union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r\nwith r (id, boss) as (select id, boss from emp where id = 11 union all select e.id, e.boss from emp e join r on e.id = r.boss) select id, boss from r\nwith r (id, boss) as (select id, boss from emp where id = 10 union all select e.id, e.boss from emp e join r on e.id = r.boss) select id, boss from r\nwith r (n) as (select 1 from dual union all select n + 1 from r) select count(*) c from r\nwith r (n) as (select 1 from dual union all select n + 1 from r where 1 = 1) select count(*) c from r\nwith r (n) as (select 1 from dual union all select mod(n, 3) + 1 from r where n > 0) select count(*) c from r\nwith r (n, m) as (select 1, 1 from dual union all select mod(n, 3) + 1, m + 1 from r where m < 50) select count(*) c, max(m) m from r\nwith r (n) as (select 1 from dual union all select n + 1 from r where n < 3000) select count(*) c, max(n) m from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) select count(*) c from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'Y' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a, b set c to 'Y' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) search depth first by a set o cycle a set c to 1 default 0 select a, b, o, c from r\nwith r (a, b) as (select a, b from g where a is null union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'Y' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where b = 1 union all select g.a, g.b from g join r on g.b = r.a) cycle a set c to 'Y' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where a = 5 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'Y' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'YES' default 'N' select a, b, c from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set a to 'Y' default 'N' select a, b from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) search depth first by a set a select a, b from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) search depth first by a set o cycle a set o to 'Y' default 'N' select a, b from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) search depth first by x set o select a, b from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'Y' default 'N' select * from r\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 'Y' default 'N' select a, b, c from r where c = 'N'\nwith r (a, b) as (select a, b from g where a = 1 union all select g.a, g.b from g join r on g.a = r.b) cycle a set c to 1 default 'N' select a, b, c from r\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id set o select id, lvl, o from r\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search breadth first by id set o select id, lvl, o from r\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id desc set o select id, lvl, o from r\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search depth first by id set o select id, lvl, o from r order by id\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) search breadth first by lvl desc, id set o select id, o from r\nwith r (a, b) as (select a, b from g where a = 3 union all select g.a, g.b from g join r on g.a = r.b) search depth first by b nulls first set o cycle a set c to 'Y' default 'N' select a, b, o, c from r\nwith r (id, path) as (select id, cast(name as varchar2(100)) from emp where boss is null union all select e.id, r.path || '/' || e.name from emp e join r on e.boss = r.id) select id, path from r order by path\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select lvl, count(*) n from r group by lvl order by lvl\nwith r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select e.name, r.lvl from r join emp e on e.id = r.id where r.lvl >= 2 order by e.name\nwith r (n) as (select 1 from dual union all select n + 1 from r where n < 3) select a.n x, b.n y from r a cross join r b order by 1, 2\nwith r (id, lvl) as (select id, 0 from big where p is null union all select big.id, r.lvl + 1 from big join r on big.p = r.id) select count(*) n, max(lvl) d, sum(id) s from r\nwith r (id, lvl) as (select id, 0 from big where id = 2 union all select big.id, r.lvl + 1 from big join r on big.p = r.id) search depth first by id set o select id, lvl, o from r order by o fetch first 12 rows only\ninsert into tgt with r (id, lvl) as (select id, 0 from emp where boss is null union all select e.id, r.lvl + 1 from emp e join r on e.boss = r.id) select id, lvl from r ;; select count(*) n, sum(lvl) s from tgt\nupdate emp set name = 'x' || name where id in (with r (id) as (select 2 from dual union all select e.id from emp e join r on e.boss = r.id) select id from r) ;; select id, name from emp where name like 'x%' order by id\nselect id, boss, name, level, connect_by_isleaf il, sys_connect_by_path(name, '/') pth, connect_by_root name rt, prior name pn from emp start with boss is null connect by prior id = boss order siblings by id\nselect id, level from emp start with boss is null connect by prior id = boss order siblings by id desc\nselect id, level from emp start with boss is null connect by prior id = boss order siblings by name\nselect a, b, level, connect_by_iscycle ic, connect_by_isleaf il from g start with a = 1 connect by nocycle prior b = a\nselect a, b, level from g start with a = 1 connect by prior b = a\nselect a, b, level, connect_by_iscycle ic, connect_by_isleaf il from g start with a = 3 connect by nocycle prior b = a order siblings by b\nselect id, level from emp where level > 1 start with boss is null connect by prior id = boss order siblings by id\nselect level, count(*) n from emp start with boss is null connect by prior id = boss group by level order by level\nselect id, level from emp start with id = 1 connect by prior id = boss and level <= 2 order siblings by id\nselect level, sys_connect_by_path(id, ',') p from emp start with id = 10 connect by id = prior boss\nselect id, level from emp start with boss is null connect by prior id = boss and prior name <> 'bob' order siblings by id\nselect lpad(' ', 2 * (level - 1)) || name t from emp start with boss is null connect by prior id = boss order siblings by name\nselect * from emp where id < 3 start with id = 1 connect by prior id = boss\nselect id from emp connect by prior id = boss start with id = 2 order siblings by id\nselect count(*) c from emp connect by level <= 2\nselect level l, dummy from dual connect by prior dummy = dummy and level <= 3\nselect level l from dual connect by level <= 5\nselect level l from dual connect by level < 4\nselect count(*) c, sum(level) s from dual connect by level <= 10000\nselect prior id from emp\nselect id from emp order siblings by id\nselect e.id, level from (select id, boss from emp where id <> 3) e start with e.boss is null connect by prior e.id = e.boss order siblings by e.id\nselect id, level, connect_by_root id r from big start with id = 2 connect by prior id = p and level <= 4 order siblings by id fetch first 15 rows only\nselect count(*) n, max(level) d from big start with p is null connect by prior id = p"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(63), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
