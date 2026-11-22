@@ -436,7 +436,24 @@ build few strings that way. It would need a marker part (the integer in the poin
 `cap` no string has) or per-shape runtime functions, and a type test of the receiver before
 it is checked.
 
-## 11. Next, in order
+## 11. Followed up, nothing kept (2026-11-22)
+
+- **Code alignment.** Already done and measured (microarch.md 3.1-3.3): generated functions at
+  64 bytes, loop tops at 16 with the 64-byte inner-loop rule, the runtime at
+  `-falign-functions=64 -falign-loops=32`. Today's "placement" swings (lists, grep -n, cmark,
+  point selects) come with equal instructions and misses after code moved, which alignment does
+  not address (predictor and cache-set aliasing between moved functions, presumably).
+- **No inlining of never-returning functions.** Skipping `u.stops` in `inlinable`: the -O
+  compiler the same size, lexdb -O 37 KB larger (+0.27%). The inlined stop bodies were paying
+  for themselves (presumably by showing that the code after the call is unreachable). Dropped.
+- **Sign facts for i128 magnitudes.** In `if v < 0 { u128(0 -% v) }` the check of the
+  conversion cannot go: for i128's minimum `0 -% v` is still negative, and only the library
+  knows a coefficient never is. What could go is the else branch's test and jump, 2 of about 8
+  instructions per magnitude: not worth a rule.
+- **Load reuse.** cse.lxl already reuses loads and checked element addresses across statements
+  of a straight-line run. What it leaves out by design: reuse within one statement (the native
+  backend's evaluation order is its own) and across writes or program calls. Not attempted.
+## 12. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
