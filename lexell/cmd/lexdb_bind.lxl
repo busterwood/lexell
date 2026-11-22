@@ -556,6 +556,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 if isFloatOid(l) || isFloatOid(r) { return lexdb_sql.OID_FLOAT8 }
                 if l == lexdb_sql.OID_NUMERIC || r == lexdb_sql.OID_NUMERIC { return lexdb_sql.OID_NUMERIC }
                 if l == lexdb_sql.OID_INT8 || r == lexdb_sql.OID_INT8 { return lexdb_sql.OID_INT8 }
+                // two smallints: a smallint (PostgreSQL's int2pl and the like)
+                if l == lexdb_sql.OID_INT2 && r == lexdb_sql.OID_INT2 { return lexdb_sql.OID_INT2 }
                 return lexdb_sql.OID_INT4
             }
             return lexdb_sql.OID_BOOL
@@ -1565,6 +1567,23 @@ pub fn bpCall(nm: &str, args: []Expr, star: bool, cols: &[]lexdb_sql.ColDef, ty:
     return Expr.Call(nm.toStr(), out, star)
 }
 
+// A value for a column of type t, resolved (bpAssign): + - * of integers given to a smallint or integer column not
+// cast to their type (intArith), the column's own check of the value standing for that one.
+pub fn resolveAssign(x: &Expr, t: &lexdb_sql.TypeName, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Result[Expr, DbErr] {
+    if t.oid == lexdb_sql.OID_INT4 || t.oid == lexdb_sql.OID_INT2 {
+        match x {
+            Expr.Bin(op, a, b) {
+                if op == "+" || op == "-" || op == "*" {
+                    let l = try resolve(&a, cols, n, ns)
+                    return Ok(Expr.Bin(op.clone(), l, try resolve(&b, cols, n, ns)))
+                }
+            }
+            else {}
+        }
+    }
+    return Ok(bpAssign(try resolve(x, cols, n, ns), t, cols, &ns.ty))
+}
+
 // A value for a column of type t: a char given to a text one without its
 // blanks, as PostgreSQL's assignment cast.
 pub fn bpAssign(x: Expr, t: &lexdb_sql.TypeName, cols: &[]lexdb_sql.ColDef, ty: &Typing): Expr {
@@ -1605,7 +1624,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 }
             }
         }
-        Expr.Unary(op, a) { return Ok(Expr.Unary(op.clone(), try resolve(&a, cols, n, ns))) }
+        Expr.Unary(op, a) { return Ok(intChecked(Expr.Unary(op.clone(), try resolve(&a, cols, n, ns)), cols, ns)) }
         Expr.Bin(op, a, b) {
             let l = try resolve(&a, cols, n, ns)
             let r = try resolve(&b, cols, n, ns)
@@ -1659,7 +1678,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                     else { return Err(e("XX000", "a comparison resolved to no comparison")) }
                 }
             }
-            return Ok(Expr.Bin(op.clone(), l, r))
+            return Ok(intChecked(Expr.Bin(op.clone(), l, r), cols, ns))
         }
         Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try resolve(&a, cols, n, ns), neg)) }
         Expr.Cast(a, t) {
@@ -1812,6 +1831,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                     return Ok(Expr.Call("case else", [eq, Expr.Lit(Val.Null), a0], false))
                 }
             }
+            if nm == "abs" && len(out) == 1 && !star { return Ok(intChecked(Expr.Call(nm.clone(), out, false), cols, ns)) }
             if nm == "pg_typeof" && len(out) == 1 && !star {
                 // its argument's type, known now: a text (PostgreSQL's regtype, shown by name)
                 let o = exprOid(&out[0], cols, &[], &ns.ty)
@@ -1821,6 +1841,105 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             return Ok(bpCall(&nm, out, star, cols, &ns.ty))
         }
         else { return Ok(clone(x)) }
+    }
+}
+
+// PostgreSQL's arithmetic of smallints and integers (+ - * /, unary minus, abs): of the wider type (two smallints a
+// smallint), an error past its range ("integer out of range", 22003). lexdb computes integers in 64 bits, so resolve
+// casts such a value to its type (exprOid's); 0: not such operands (a bigint, a number, a type not known).
+pub fn intArith(l: int, r: int): int {
+    if l == lexdb_sql.OID_INT2 && r == lexdb_sql.OID_INT2 { return lexdb_sql.OID_INT2 }
+    if (l == lexdb_sql.OID_INT4 || l == lexdb_sql.OID_INT2) && (r == lexdb_sql.OID_INT4 || r == lexdb_sql.OID_INT2) { return lexdb_sql.OID_INT4 }
+    return 0
+}
+
+// x, resolved: + - * / of smallints and integers, unary minus, abs of one cast to their type (intArith); anything else
+// as it is. Arithmetic of literals alone is not checked (constX).
+fn intChecked(x: Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Expr {
+    var w = 0
+    match x {
+        Expr.Bin(op, l, r) {
+            if (op == "+" || op == "-" || op == "*" || op == "/" || op == "t+") && !(constX(&l) && constX(&r)) {
+                w = intArith(arithOid(&l, cols, ns), arithOid(&r, cols, ns))
+            }
+        }
+        Expr.Unary(op, a) {
+            if op == "-" && !isLitX(&a) {
+                let o = arithOid(&a, cols, ns)
+                w = intArith(o, o)
+            }
+        }
+        Expr.Call(_, args, _) {
+            let o = arithOid(&args[0], cols, ns)
+            w = intArith(o, o)
+        }
+        else {}
+    }
+    if w == 0 { return x }
+    return Expr.Cast(x, lexdb_sql.oidType(w))
+}
+
+// An operand's type for intArith: a parameter's as given (the statement's, then the outer values'), else exprOid's.
+fn arithOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): int {
+    match x {
+        Expr.Param(k) {
+            if k >= 1 && k <= len(ns.ptypes) { return ns.ptypes[k - 1] }
+            let j = k - 1 - len(ns.ptypes)
+            if len(ns.frames) > 0 && j >= 0 && j < len(ns.frames[len(ns.frames) - 1].refOids) { return ns.frames[len(ns.frames) - 1].refOids[j] }
+            return 0
+        }
+        Expr.Lit(_) { return exprOid(x, cols, &[], &ns.ty) }
+        Expr.Col(_, _) { return exprOid(x, cols, &[], &ns.ty) }
+        Expr.Cast(_, t) { return t.oid }
+        else { return exprOid(x, cols, &[], &ns.ty) }
+    }
+}
+
+// x without the casts resolve puts on smallint and integer arithmetic (intArith), to compare a resolved expression
+// with one as written: an index's expression or predicate.
+pub fn unchecked(x: &Expr): Expr {
+    match x {
+        Expr.Cast(a, t) {
+            if (t.oid == lexdb_sql.OID_INT2 || t.oid == lexdb_sql.OID_INT4) && intOp(&a) { return unchecked(&a) }
+            return Expr.Cast(unchecked(&a), t)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), unchecked(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), unchecked(&a), unchecked(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(unchecked(&a), neg) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, unchecked(&a)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return clone(x) }
+    }
+}
+
+fn intOp(x: &Expr): bool {
+    match x {
+        Expr.Unary(op, _) { return op == "-" }
+        Expr.Bin(op, _, _) { return op == "+" || op == "-" || op == "*" || op == "/" || op == "t+" }
+        Expr.Call(n, args, star) { return n == "abs" && len(args) == 1 && !star }
+        else { return false }
+    }
+}
+
+// Whether x is of literals alone: such arithmetic is not checked (intArith). Oracle's NUMBER literals are lexdb's
+// integers there, its door sharing the binder; PostgreSQL folds them when it plans (and raises then).
+fn constX(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Cast(a, _) { return constX(&a) }
+        Expr.Unary(_, a) { return constX(&a) }
+        Expr.Bin(_, a, b) { return constX(&a) && constX(&b) }
+        else { return false }
+    }
+}
+
+fn isLitX(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        else { return false }
     }
 }
 

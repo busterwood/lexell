@@ -374,6 +374,7 @@ pub type BNode = closed {
     Col(int)
     Arith(int, BNode, BNode)
     Neg(BNode)
+    Fit(BNode, int)         // an integer cast to smallint (16) or integer (32): past its range an error (22003)
     Cmp(int, BNode, BNode)
     And(BNode, BNode)
     Or(BNode, BNode)
@@ -574,6 +575,16 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
         }
         BX.And(a, b) { return bAndOr(true, &a, &b, cols, kinds, ce, base, dec) }
         BX.Or(a, b) { return bAndOr(false, &a, &b, cols, kinds, ce, base, dec) }
+        BX.Cast(a, t) {
+            // an integer made a smallint or an integer (lexdb_bind.intArith's check of their arithmetic): the integer
+            // kernels' value, then its range
+            if t.oid != lexdb_sql.OID_INT4 && t.oid != lexdb_sql.OID_INT2 { return None }
+            let ca = bCompileD(&a, cols, kinds, ce, base, dec)
+            if ca.isNone() { return None }
+            let c = ca.unwrap()
+            if !intLike(c.typ) { return None }
+            return Some(BComp{n: BNode.Fit(takeN(c), if t.oid == lexdb_sql.OID_INT2 { 16 } else { 32 }), typ: BT_INT})
+        }
         BX.Op(code, a, b) {
             let cc = cmpOf(code)
             if cc >= 0 {
@@ -895,6 +906,14 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     Some(r) { a.v[j] = r }
                     None { return Err(e("22003", "bigint out of range")) }
                 }
+            }
+            return Ok(a)
+        }
+        BNode.Fit(x, bits) {
+            let a = try bEval(&x, b, idx)
+            let hi = if bits == 16 { 32767 } else { 2147483647 }
+            for j in 0..m {
+                if !a.nul[j] && (a.v[j] > hi || a.v[j] < -hi - 1) { return Err(e("22003", if bits == 16 { "smallint out of range" } else { "integer out of range" })) }
             }
             return Ok(a)
         }
@@ -1819,6 +1838,7 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
             bColsOf(&b, used)
         }
         BNode.Neg(a) { bColsOf(&a, used) }
+        BNode.Fit(a, _) { bColsOf(&a, used) }
         BNode.Cmp(_, a, b) {
             bColsOf(&a, used)
             bColsOf(&b, used)
