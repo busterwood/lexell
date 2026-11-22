@@ -1299,6 +1299,12 @@ def norm_rows(res, kinds, pg, ordered):
     return rows
 
 
+def ordered_key(res, kinds, pg):
+    """The rows in order, texts without trailing blanks: char(n) values that differ only there are peers in ORDER
+    BY ('a' and 'a  ', in either order); the rows themselves are compared as multisets too."""
+    return [tuple(v.rstrip(' ') if isinstance(v, str) else v for v in row) for row in norm_rows(res, kinds, pg, True)]
+
+
 def compare(a, b, ordered, pg=False):
     """None when a and b agree, else a class: wrong, errcode, a-error, b-error,
     crash, hang (a crash or hang of b; the caller checks a's)."""
@@ -1316,7 +1322,9 @@ def compare(a, b, ordered, pg=False):
             # order: not the same rows even when the results are (w0-0697)
             return None
         kinds = col_kinds(a, b)
-        if norm_rows(a, kinds, pg, ordered) != norm_rows(b, kinds, pg, ordered):
+        if ordered and ordered_key(a, kinds, pg) != ordered_key(b, kinds, pg):
+            return 'wrong'
+        if not (a.truncated() or b.truncated()) and norm_rows(a, kinds, pg, False) != norm_rows(b, kinds, pg, False):
             return 'wrong'
         return None
     if a.kind == 'error' and b.kind == 'error':
@@ -1860,21 +1868,24 @@ def reduce_case(w, case, q, setup, sql, sql2, deadline):
         case['ordered'] = qq.ordered()
         return w.still_fails(case, setup, qq.sql(), None)
 
-    if not (tlp or norec) and case['check'] != 'setup' and sql == q.sql():
+    # the query's tree is reduced when the failing statement is the query (not a TLP or NoREC form of it, which a
+    # crash or hang of one is)
+    tree = not (tlp or norec) and case['check'] != 'setup' and sql == q.sql()
+    if tree:
         reduce_tree(holder, test_q, t_end)
         sql = holder[0].sql()
 
     def test_setup(st):
-        if not (tlp or norec):
+        if tree:
             case['ordered'] = holder[0].ordered()
         return w.still_fails(case, st, sql, sql2)
 
     setup = reduce_setup(setup, test_setup, t_end, [sql, sql2 or ''])
-    if not (tlp or norec) and case['check'] != 'setup' and time.time() < t_end:
+    if tree and time.time() < t_end:
         reduce_tree(holder, test_q, t_end)
         sql = holder[0].sql()
         setup = reduce_setup(setup, test_setup, t_end, [sql])
-    if not (tlp or norec):
+    if tree:
         case['ordered'] = holder[0].ordered()
     return holder[0], setup, sql, sql2
 
