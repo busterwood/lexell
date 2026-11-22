@@ -4024,6 +4024,10 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
                             // col = x, or a collation's #ci(col) = #ci(x) (L2): hashed on the key
                             let ka = keyedCol(&a)
                             let kb = keyedCol(&b)
+                            // a FROM subquery's rows are hashed by their values as they are (keyPart), not made the
+                            // column's type as a table's probe is: only kinds whose keys match where = holds (a float
+                            // beside an integer, a date beside a timestamp: a condition per row)
+                            if q.levels[k].virt() && !hashKeyTypes(&a, &b, &q.cols) { continue }
                             if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
                                 append(mut &hcols, lexdb_bind.colIndex(&q.cols, &ka.name) - q.levels[k].first)
                                 append(mut &hvals, lexdb_sql.cloneExpr(&b))
@@ -4297,7 +4301,8 @@ pub fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
         if len(hk.inner) == 0 { return }
         // a subquery of its own (in FROM, a LATERAL one's, in an expression) that reads an outer value: run once, it would
         // have none (08P01)
-        for s in q.subs { if !noRefs(&s.sel.q.refs, base) { return } }
+        // (and a LATERAL over its own FROM, which reads the subquery's columns: run once, it gave no rows)
+        for s in q.subs { if !noRefs(&s.sel.q.refs, base) || (s.use == lexdb_sql.SUB_FROM && len(s.sel.q.refs) > 0) { return } }
     }
     for k in 0..len(sp.sel.q.levels) {
         sp.sel.q.levels[k].cond = dropTexts(replace(mut &sp.sel.q.levels[k].cond, []), &hk.texts)
@@ -4927,8 +4932,9 @@ fn inLook(q: &Query, i: int, c: &Expr, kind: int, pt: &[]int): Option[InLook] {
     if len(t.pk) > 0 && t.pk[0] == col { ix = -1 }
     if ix == -2 {
         for k in 0..len(t.indexes) {
+            // (not a filtered index: its predicate holds for no row the IN looks up as such)
             let kc = keyCols(t, k)
-            if len(kc) > 0 && kc[0] == col && ix == -2 { ix = k }
+            if len(kc) > 0 && kc[0] == col && ix == -2 && t.indexes[k].pred.isNone() { ix = k }
         }
     }
     if ix == -2 { return None }
