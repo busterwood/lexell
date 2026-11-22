@@ -1390,8 +1390,11 @@ fn fillIdxRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rd: &
 
 // order (places in ks) sorted by their keys, stably (equal keys keep
 // their order); nothing done when they are in order already. Keys of 8
-// bytes each spanning less than 2^62 as integers (an integer primary
-// key's) are sorted by radixPerm; others by comparison.
+// bytes or more are compared by their first 8 as an integer (an integer
+// primary key's, or a composite key's first column), the rest only between
+// keys of one prefix: a few (SORT_FEW) by insertion, more by radixPerm
+// when they span less than 2^62 (then each run of one prefix by
+// insertion); others by comparison.
 pub fn sortKeysPerm(ks: &[]str, order: mut &[]int) {
     let n = len(order)
     var sorted = true
@@ -1406,16 +1409,36 @@ pub fn sortKeysPerm(ks: &[]str, order: mut &[]int) {
     var lo = 0
     var hi = 0
     var ok = true
+    var exact = true
     for i in 0..n {
         let k = &ks[order[i]]
-        if len(k) != 8 {
+        if len(k) < 8 {
             ok = false
             break
         }
+        if len(k) != 8 { exact = false }
         let x = binary.readI64BEStr(k, 0) ^ (-9223372036854775807 - 1)
         if i == 0 || x < lo { lo = x }
         if i == 0 || x > hi { hi = x }
         append(mut &pre, x)
+    }
+    if ok && n <= SORT_FEW {
+        // insertion by the prefixes (pre in order's places), the whole key on a tie
+        var o: []int = withCapacity(n)
+        for i in 0..n { append(mut &o, i) }
+        for i in 1..n {
+            let v = o[i]
+            var j = i
+            while j > 0 && keyAfter(ks, order, &pre, exact, o[j - 1], v) {
+                o[j] = o[j - 1]
+                j -= 1
+            }
+            o[j] = v
+        }
+        var out: []int = withCapacity(n)
+        for j in o { append(mut &out, order[j]) }
+        order = out
+        return
     }
     var span = -1
     if ok {
@@ -1431,10 +1454,38 @@ pub fn sortKeysPerm(ks: &[]str, order: mut &[]int) {
     var bits = 0
     while bits < 62 && (span >> bits) > 0 { bits += 1 }
     for i in 0..n { pre[i] = pre[i] - lo }
-    let perm = lexdb_vec.radixPerm(&pre, bits)
+    var perm = lexdb_vec.radixPerm(&pre, bits)
+    if !exact {
+        // (stable: each run of one prefix in its first order) the runs by the whole key
+        var a = 0
+        while a < n {
+            var z = a + 1
+            while z < n && pre[perm[z]] == pre[perm[a]] { z += 1 }
+            for i in a + 1..z {
+                let v = perm[i]
+                var j = i
+                while j > a && ks[order[perm[j - 1]]] > ks[order[v]] {
+                    perm[j] = perm[j - 1]
+                    j -= 1
+                }
+                perm[j] = v
+            }
+            a = z
+        }
+    }
     var out: []int = withCapacity(n)
     for j in perm { append(mut &out, order[j]) }
     order = out
+}
+
+// The keys sortKeysPerm sorts by insertion, at most.
+const SORT_FEW = 32
+
+// Whether order's place a sorts after its place b (sortKeysPerm): by their
+// prefixes (pre), then by the whole keys unless they are 8 bytes (exact).
+fn keyAfter(ks: &[]str, order: &[]int, pre: &[]int, exact: bool, a: int, b: int): bool {
+    if pre[a] != pre[b] { return pre[a] > pre[b] }
+    return !exact && ks[order[a]] > ks[order[b]]
 }
 
 // A top-N's bar (sortBatches): a row whose first key (an integer column,
