@@ -1553,6 +1553,16 @@ class Worker:
             return None
         return r
 
+    def pg_slow(self, sql, setup):
+        """Whether PostgreSQL too takes the statement timeout: then a hang of lexdb's is not reported."""
+        if self.pg is None:
+            return False
+        r = self.run_pg(sql, setup)
+        if r is None or (r.kind == 'error' and r.code == '57014'):
+            self.stats['hang_pg_slow'] = self.stats.get('hang_pg_slow', 0) + 1
+            return True
+        return False
+
     # -- one query, every check
     def check_query(self, q, setup, r):
         sql = q.sql()
@@ -1560,7 +1570,8 @@ class Worker:
         res = {'on': self.run_cfg('on', sql, setup)}
         fails = []
         if res['on'].kind in ('crash', 'hang'):
-            fails.append(('on', res['on'].kind, sql, None, res))
+            if res['on'].kind == 'crash' or not self.pg_slow(sql, setup):
+                fails.append(('on', res['on'].kind, sql, None, res))
             return fails
         if res['on'].kind == 'error':
             self.stats['lexdb_errors'] += 1
@@ -1569,6 +1580,8 @@ class Worker:
                 continue
             res[cfg] = self.run_cfg(cfg, sql, setup)
             c = compare(res['on'], res[cfg], ordered)
+            if c == 'hang' and self.pg_slow(sql, setup):
+                continue
             if c:
                 fails.append((chk, c, sql, None, {'on': res['on'], cfg: res[cfg]}))
         if self.pg is not None:
@@ -1585,7 +1598,8 @@ class Worker:
                 a = self.run_cfg('on', whole, setup)
                 b = self.run_cfg('on', parts, setup)
                 if b.kind in ('crash', 'hang'):
-                    fails.append((kind, b.kind, parts, None, {'whole': a, 'parts': b}))
+                    if b.kind == 'crash' or not self.pg_slow(parts, setup):
+                        fails.append((kind, b.kind, parts, None, {'whole': a, 'parts': b}))
                 elif a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False):
                     fails.append((kind, 'wrong', whole, parts, {'whole': a, 'parts': b}))
         if 'norec' in self.checks:
@@ -1596,7 +1610,8 @@ class Worker:
                 b = self.run_cfg('on', nv[1], setup)
                 for x, s in ((a, nv[0]), (b, nv[1])):
                     if x.kind in ('crash', 'hang'):
-                        fails.append(('norec', x.kind, s, None, {'opt': a, 'unopt': b}))
+                        if x.kind == 'crash' or not self.pg_slow(s, setup):
+                            fails.append(('norec', x.kind, s, None, {'opt': a, 'unopt': b}))
                         break
                 else:
                     if a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False):
@@ -1611,13 +1626,15 @@ class Worker:
                 return False
             if chk == 'on':
                 x = self.run_cfg('on', sql, setup)
-                return x.kind == cls
+                return x.kind == cls and not (cls == 'hang' and self.pg_slow(sql, setup))
             if chk in CHECK_CFG:
                 a = self.run_cfg('on', sql, setup)
                 if a.kind in ('crash', 'hang'):
                     return False
                 b = self.run_cfg(CHECK_CFG[chk], sql, setup)
                 c = compare(a, b, case['ordered'])
+                if c == 'hang' and cls == 'hang' and self.pg_slow(sql, setup):
+                    return False
                 return c == cls and self.same_codes(case, a, b)
             if chk == 'pg':
                 a = self.run_cfg('on', sql, setup)
@@ -1629,7 +1646,7 @@ class Worker:
                 return compare(a, b, case['ordered'], pg=True) == cls and self.same_codes(case, a, b)
             if chk.startswith('tlp') or chk == 'norec':
                 if cls in ('crash', 'hang'):
-                    return self.run_cfg('on', sql, setup).kind == cls
+                    return self.run_cfg('on', sql, setup).kind == cls and not (cls == 'hang' and self.pg_slow(sql, setup))
                 a = self.run_cfg('on', sql, setup)
                 b = self.run_cfg('on', sql2, setup)
                 return a.kind == 'rows' and b.kind == 'rows' and compare(a, b, False) == 'wrong'
@@ -2128,7 +2145,8 @@ def cmd_report(args):
             stats.append(json.load(f))
     tot = {}
     for s in stats:
-        for k in ('queries', 'stmts', 'seeds', 'reduced', 'skipped', 'tlp', 'norec', 'lexdb_errors', 'pg_errors'):
+        for k in ('queries', 'stmts', 'seeds', 'reduced', 'skipped', 'tlp', 'norec', 'lexdb_errors', 'pg_errors',
+                  'hang_pg_slow'):
             tot[k] = tot.get(k, 0) + s.get(k, 0)
         for k, v in s.get('fails', {}).items():
             tot.setdefault('fails', {})[k] = tot.setdefault('fails', {}).get(k, 0) + v
@@ -2136,8 +2154,9 @@ def cmd_report(args):
     print('run %s: %d workers, %.0f s, %d seeds, %d queries, %d statements, %d TLP and %d NoREC forms' % (
         args.dir, len(stats), el, tot.get('seeds', 0), tot.get('queries', 0), tot.get('stmts', 0),
         tot.get('tlp', 0), tot.get('norec', 0)))
-    print('lexdb errors (on): %d, PostgreSQL errors: %d; failures by check:class: %s' % (
-        tot.get('lexdb_errors', 0), tot.get('pg_errors', 0), json.dumps(tot.get('fails', {}), sort_keys=True)))
+    print('lexdb errors (on): %d, PostgreSQL errors: %d, timeouts not reported (PostgreSQL slow too): %d; '
+          'failures by check:class: %s' % (tot.get('lexdb_errors', 0), tot.get('pg_errors', 0), tot.get('hang_pg_slow', 0),
+                                          json.dumps(tot.get('fails', {}), sort_keys=True)))
     cases = load_cases(args.dir)
     groups = {}
     for c in cases:
