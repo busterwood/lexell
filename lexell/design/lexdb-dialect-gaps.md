@@ -850,4 +850,4 @@ and the reference's; no query slower beyond its runs' spread.
 - Found, not fixed (not recursion's): a non-recursive CTE's column list names its columns in lower case in the T-SQL and
   Oracle doors (`WITH r (X) AS (SELECT 1) SELECT * FROM r` shows `x`; SQL Server `X`, Oracle `X`): the FROM item's
   column list carries folded names (lexdb_exec's FROM binding). The recursive ones name theirs as written
-  (`lexdb_recur.Spec.spells`).
+  (`lexdb_recur.Spec.spells`); fixed since, with derived tables' and VALUES' lists (lexdb-new-features.md 7.1, 91781b58).
