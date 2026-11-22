@@ -147,7 +147,7 @@ def write(cases):
            '// quantize cases with results from Python\'s exact decimal module.',
            '// expect: %d cases ok' % len(cases), '',
            'var bad: int = 0', '',
-           'fn d(s: str): Decimal { return Decimal.parse(s).unwrap() }', '',
+           'fn d(s: str): Decimal { return Decimal.parse(&s).unwrap() }', '',
            'fn txt(r: Result[Decimal, DecError]): str {',
            '    match r {',
            '        Ok(v) { return v.toStr() }',
