@@ -12,6 +12,11 @@ form), the server stops C1 and C2, the errors E6-E8, the gaps G1-G3. `recheck`
 of every reduced case with the last binary leaves the kinds in "Left, ranked"
 (W18 first).
 
+**After (2026-11-22, on main 236c8513).** W18 (72f60d9c) and the set
+operation's ORDER BY over chars of two lengths, V (970c0932, with the Oracle
+door's set operation chars), are fixed; E9 is planned, not built (its section).
+Tests exec_fuzzfix6, tds_fuzzfix3, tns_fuzzfix3.
+
 Commits (on 45981146): 5313647f, bf99c8a8, 97746bac, 7b177a5f (the tool);
 ba930de4 (G1-G3), 9899f603 (C1), 325e775e (E6), fd6aa85a (E7, E8), 9be8e932
 (W7, W8), 9901d72c (W9, W10), 7d620fe7 (W12, W14, W15), 831983e3 (W14's IN),
@@ -476,6 +481,112 @@ per outer row by the subquery's column) took the first index whose first column
 is that column, also a filtered one whose predicate the query does not imply.
 Not a filtered one now (as every other path choice: `pred.isSome() { continue }`).
 
+### W18. A correlated scalar subquery hashed on a numeric key against a float outer value (noidx, pg; chunk 9 w1-0263)
+
+```sql
+create table t1 (b2 numeric(6,2));
+insert into t1 values (1);
+select (select sum(1.5) from t1 as q10 where q10.b2 = d2.x9) from (select ceil(1) as x9 from t1) as d2;
+-- lexdb without an index on b2: NULL; PostgreSQL, and lexdb with one: 1.5
+```
+
+**Fixed (72f60d9c).** hashSub (a correlated scalar subquery, EXISTS, NOT EXISTS
+or IN run once and hashed on its key) took any outer value that is a bare
+parameter as of the key's kind (hashKeyTypes), and a derived table's column is
+one: outerRef types only a table's columns and chars. The hash compares values
+as they are (W12's mismatch), so the float 1 found no numeric 1.00. The
+parameters' types are known where the subquery is planned: its refs, in the
+terms of the query around it, typed there (lexdb_bind.refTypesOf), and
+hashKeyTypes takes a typed parameter's kind as a column's (semiTypes: integers
+with numerics, one float type with itself). A float beside a numeric or an
+integer, or a numeric beside a float, is no hash key now: the subquery runs per
+row ("per row, on d.x"); an integer or numeric beside a numeric is still hashed.
+A parameter of no known type keys as before.
+
+A matrix over int, bigint, smallint, numeric, numeric(6,2), real and float8 (each
+against each, with and without an index on the key; a scalar subquery and EXISTS,
+NOT EXISTS, IN, NOT IN over a derived table's column and a table's; a hash join
+on a derived table; a LATERAL with an aggregate, plain and grouped; the values
+0, -0, 0.1, 1, 1.5, 2.25, NULL) against PostgreSQL 18, batches on and off and the
+rules planner: 1,372 queries, 180 differences at main (60 queries, all W18's
+shape: a scalar subquery, EXISTS or NOT EXISTS without an index, a float beside
+a numeric or integer key either way), none after. The semi joins (semiKeys, which
+substitutes the outer values and types them), FROM subquery hash joins (W12) and
+lateralKeys gave none at main.
+
+### V. ORDER BY a set operation's char column whose values have two lengths (pg; chunk 2 w1-0284, chunk 7 w1-0085, chunk 8 w1-0281, w1-0406)
+
+```sql
+create table t0 (a2 char(3));
+insert into t0 values ('z');
+(select true as x3, q1.a2 as x4 from t0 as q1) union (select false, reverse(q5.a2) from t0 as q5) order by 2 desc, 1 nulls first;
+-- lexdb: t|z  ; f|z    PostgreSQL: f|z; t|z  (bpchar's order: 'z' and 'z  ' tie, the next key decides)
+```
+
+**Fixed (970c0932).** planSet's ORDER BY kinds were the outputs' exact kinds
+(outRefKind); a set operation's char column (a char(n) beside a text, a literal,
+a char of another length: PostgreSQL's common type is bpchar, its values keep
+their own lengths) sorts now under setKindsOf's kinds, which its DISTINCT
+already used: without trailing blanks where PostgreSQL's rules hold. Sel.ordKinds
+carries them to every sort of a set operation: runSorted, lexdb_setop.held (the
+held path) and its top-N. A FROM subquery over a set operation was already right
+(its char column has no length there, groupKind). Not changed: T-SQL (its
+collations already compare without trailing blanks).
+
+The Oracle door: a set operation's column of CHARs of two lengths, or of a CHAR
+and a VARCHAR2, is a VARCHAR2 in Oracle (its blanks significant: 'a' < 'a  ',
+and UNION keeps both), and a CHAR's value in it keeps its blanks. lexdb took
+PostgreSQL's rules there (pgRules holds in the Oracle door): its UNION made 'a  '
+and 'a    ' one row, and a CHAR's value in a VARCHAR2 column lost its blanks. A
+set operation's statement carries its dialect now (lexdb_parse.setOf:
+Stmt.mdialect), and in the Oracle door its kinds are exact and its chars keep
+their blanks.
+
+Found, not fixed (T-SQL door, display only): a set operation of a char(3) and a
+varchar(10) shows its values as the first side's char(3) (lexdb pads the
+varchar's 'a' to 'a  '), and of a varchar first, the char's values without their
+blanks; SQL Server's column is a varchar(10) with each value as it is (a char's
+padded). Of a char(3) and a char(5), SQL Server pads to 5. Ordering and equality
+agree (T-SQL's collations ignore trailing blanks). lexdb's T-SQL char(n) is a
+varchar(n) padded where it is sent (Ty prec TS_CHAR), so the fix is the TDS
+column's type of a set operation's output.
+
+### E9. An unused derived-table column is computed: the plan (not built)
+
+`select 1 from (select 1 % b0 as x from t1) d` over b0 = 0 fails 22012;
+PostgreSQL never computes x (a pulled-up subquery's unused targets are never
+evaluated; remove_unused_subquery_outputs makes the others NULL constants).
+Not built in this round: the place where it is cheap to do lacks what it needs.
+
+- What is known where. planSelect collects every column name the statement
+  and its nested subqueries use (stmtNames: needNames, needStar) before
+  buildQuery, which passes them to planFrom for narrow's table columns; but
+  bindFrom plans each FROM subquery (planSub) without them, and the subquery's
+  Sel, its logical plan (takeLp, the outer item's plan) and its pipeline
+  (pipeSelMain) are all made from its select list inside that planSelect. A
+  rewrite after planSub would have to change three copies.
+- The change. Prune syntactically, before planSub: in bindFrom's `f.sub >= 0`
+  branch, plan a copy of subs[f.sub] whose select items no name of the
+  statement reads replaced by a NULL under the item's own output name. An item's
+  name: f.cols[i] where the FROM item renames its columns, else its alias or
+  derived name. Kept whole: needStar (`*`, `d.*` read, NATURAL), the derived
+  table's alias read as a name (a whole-row value), a CTE's use, a view. Not
+  pruned in a subquery with a set operation, DISTINCT or DISTINCT ON, GROUP BY,
+  grouping sets, HAVING or ORDER BY (positions and aliases name the items), a
+  set-returning function in its list, or for an item with an aggregate, a window
+  function, a volatile function or a subquery. A LATERAL subquery is pruned the
+  same way (E9's "a LATERAL's unused column"). The names are conservative (any
+  use of the name anywhere keeps it), which is what makes the rule safe.
+- The cost. bindFrom needs selNames and star: two more arguments on every
+  statement's call (a point select's too, ~2 instructions), or the rewrite in
+  planSelect behind `len(s.subs) > 0` (one test per statement). Either has to be
+  measured against the point-select gate (must be equal or lower); the pruned
+  copy itself costs only statements with a FROM subquery.
+- Tests: E9's four shapes (22012, 22003 of bigint, numeric(p,s) overflow, a
+  LATERAL), each kept-whole rule above with the error still raised, a renamed
+  column list, batches on and off; TPC-H (q7, q8, q9, q13, q22 have FROM
+  subqueries: their unused columns, if any, are not computed after).
+
 ### Gates
 
 - Suite at every commit (288 tests at the last).
@@ -506,28 +617,49 @@ Not a filtered one now (as every other path choice: `pred.isSome() { continue }`
   eval, ORDER BY's kinds, a FROM subquery's char length, a set operation's
   untyped sides; the helpers in lexdb_bind and lexdb_plan).
 
+Of W18 and V (on main 236c8513):
+- Suite at both commits (291 tests).
+- In process, LXL_HASH_SEED=1, per statement against main 236c8513 (the
+  coordinator's bin/fz2: 131,136.67, 55,121,322.77, 55,142,141.18 in the same
+  runs): point select 131,136.67 at both commits (equal), INSERT 55,121,322.72
+  (4 rounds; 2 rounds gave 322.86 and 323.18 with main's own rounds 9,000
+  instructions apart: noise), UPDATE by key 55,142,141.05 and 55,142,140.84.
+  Neither change is on these statements' path (hashSub's call and a set
+  operation's planning only). Wire (pts.sh) not run.
+- TPC-H SF1 (~/tpch-w/w18, alternated twice against main 236c8513's
+  lexdb-fz2-O, lexdb only): 22 checksums equal in every run; best of two, total
+  9,432 ms against 9,524 (0.990). Over 1.5%: q17 +2.4% (24.5 against 25.1
+  ms) and q11 +1.9% (94.4 against 96.2) with main's instructions (iq.sh, two
+  runs each: q17 139.00M and 138.99M against 139.02M and 138.99M; q11 574.72M
+  and 574.72M against 574.72M and 574.76M): placement; q16 +1.5% (2,170.9M and
+  2,169.7M against 2,170.6M and 2,170.5M). Round 1's base ran right after the
+  load (q6 317 ms against 181 after). The data copy is deleted.
+- recheck of every reduced case of the long run with 970c0932
+  (~/tpch-w/fuzz/long/recheck-w18.txt): 882 cases (817 signatures; one per
+  signature, every wrong result, crash and hang), 509 still fail: wrong 250, 2
+  still (the two PostgreSQL bugs below; W18's and the four ORDER BY cases
+  gone); crashes 9, none; hangs 84, 41 still; errors 539, 466 still.
+- lexdb_exec: 20,205 lines at 236c8513, 20,211 after (refKindIn, the set
+  operation's kinds; refTypesOf is in lexdb_bind, the keys in lexdb_plan).
+
 ### Left, ranked
 
 Wrong rows first, then crashes, then wrong errors, then gaps and speed. None of
 these is fixed; each has a reduced case in the run's directories (`recheck`'s
 STILL lines, ~/tpch-w/fuzz/long/recheck-all.txt).
 
-1. **W18. A correlated scalar subquery hashed on a numeric key against a
-   float outer value** (pg and noidx wrong; chunk 9 w1-0263): `select (select
-   sum(1.5) from t1 q10 where q10.b2 = d2.x9) from (select ceil(1) as x9 from
-   t1) d2` over a numeric(6,2) b2 = 1 is NULL in lexdb without an index on b2
-   ("subquery 1 (scalar): hashed on q10.b2 = d2.x9"), 1.5 in PostgreSQL and in
-   lexdb with one. hashSub's hashKeyTypes takes any outer parameter as of the
-   right kind, and a FROM subquery's column (here a float, ceil(int)) is an
-   untyped parameter in its subqueries (W2: only a table's or a char's is
-   typed), so a float is probed into a hash of numerics (W12's kind of
-   mismatch). The parameter would need its column's type at hashSub.
-2. **ORDER BY of a set operation's char column whose values have two lengths**
-   (pg wrong; chunks 2, 7, 8: w1-0284, w1-0085, w1-0281, w1-0406): lexdb sorts
-   by the blanks, PostgreSQL has 'a' and 'a  ' tie (W16 did not change a set
-   operation's ORDER BY: outRefKind over its outputs, outKindsOf's exact
-   kinds).
-3. **E9. An unused output of a derived table is computed** (pg a-error; the
+W18 and the set operation's ORDER BY over chars of two lengths (1 and 2 of
+this list before) are fixed (W18 and V above); after them the run leaves no
+wrong row of lexdb's own but those PostgreSQL's two bugs give (below).
+
+1. **The T-SQL door's type of a set operation's char and varchar column**
+   (display only; found by tds_fuzzfix3, not the fuzzer): `SELECT a FROM q0
+   UNION ALL SELECT b FROM q1` of a char(3) and a varchar(10) is sent as the
+   first side's char(3) (a varchar's 'a' shown 'a  '), with the varchar first
+   the char's values lose their blanks, and a char(3) beside a char(5) is not
+   padded to 5; SQL Server's column is a varchar(10) (a char(5)), each value as
+   its side has it. Order and equality agree. See V.
+2. **E9. An unused output of a derived table is computed** (pg a-error; the
    most frequent remaining error kind). `select 1 from (select 1 % b0 as x
    from t1) d` fails 22012 over b0 = 0; PostgreSQL never computes x (a pulled-up
    subquery's unused targets; remove_unused_subquery_outputs for the others).
@@ -535,8 +667,9 @@ STILL lines, ~/tpch-w/fuzz/long/recheck-all.txt).
    cast past numeric(p,s) (22003 numeric field overflow). Fixing it means
    pruning a FROM subquery's outputs the outer query does not read (not under
    DISTINCT, a set operation, a set-returning or volatile function): a planner
-   change of its own, which would also save work. Not built.
-4. **Evaluation PostgreSQL skips by its plan** (pg a-error and errcode, a few
+   change of its own, which would also save work. Not built: the plan is under
+   E9 above.
+3. **Evaluation PostgreSQL skips by its plan** (pg a-error and errcode, a few
    per chunk): HAVING false over an aggregate whose argument fails (PostgreSQL
    plans a One-Time Filter and never reads the input: w0-0174), LIMIT 0 (the
    executor never pulls a row: w0-0083), E5's semi join run before its query,
@@ -545,17 +678,19 @@ STILL lines, ~/tpch-w/fuzz/long/recheck-all.txt).
    rows agree wherever neither fails. Arithmetic of literals alone (E6's
    exemption: `(2147483647 + 1) < 1` over an empty table, 22003 in
    PostgreSQL at plan time) is the excluded constant folding.
-5. **Timeouts PostgreSQL does not have** (on and batch hangs, PostgreSQL under
+4. **Timeouts PostgreSQL does not have** (on and batch hangs, PostgreSQL under
    5 s; 6 to 15 per chunk, half of them gone on a recheck, so near the
    limit): products of CTEs and LATERAL that PostgreSQL's plan avoids or
    cuts (`... order by <constant> limit 2` over a 10^9-row product: PostgreSQL
    drops the constant sort key and stops after 2 rows; w0-0098), big
    lateral and semi join trees (w2-0199, w1-0108). Speed, not rows.
-6. Oracle door: NVL stops at its first value (E7); SUM of quotients of 37
+5. Oracle door: NVL stops at its first value (E7); SUM of quotients of 37
    places fails ORA-01426 where Oracle keeps 40 significant digits (`sum(10 /
    (id - 3001))` over 3,000 rows: Oracle -85.83749889959187114343792091258973719962;
-   lexdb's numerics hold 38 digits, so its answer could not be Oracle's anyway).
-7. Gaps left from before: G5 (int::bool, num_nonnulls, scale, min_scale,
+   lexdb's numerics hold 38 digits, so its answer could not be Oracle's anyway); a
+   number(6,2) read through a derived table is shown without its scale (0 where
+   Oracle shows 0.00; tns_fuzzfix3 multiplies it by 1 instead).
+6. Gaps left from before: G5 (int::bool, num_nonnulls, scale, min_scale,
    trim_scale), generate_series in the select list, `round(round(0), 1)`
    accepted where PostgreSQL has no round(double precision, integer),
    parenthesised joins (`from ((select 1) d cross join t)`: 0A000), 53200 for a

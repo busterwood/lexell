@@ -4027,7 +4027,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
                             // a FROM subquery's rows are hashed by their values as they are (keyPart), not made the
                             // column's type as a table's probe is: only kinds whose keys match where = holds (a float
                             // beside an integer, a date beside a timestamp: a condition per row)
-                            if q.levels[k].virt() && !hashKeyTypes(&a, &b, &q.cols) { continue }
+                            if q.levels[k].virt() && !hashKeyTypes(&a, &b, &q.cols, &[]) { continue }
                             if len(ka.name) > 0 && q.levelOf(&ka.name) == k && q.valBefore(&b, k) {
                                 append(mut &hcols, lexdb_bind.colIndex(&q.cols, &ka.name) - q.levels[k].first)
                                 append(mut &hvals, lexdb_sql.cloneExpr(&b))
@@ -4188,15 +4188,21 @@ pub fn hasSubCall(x: &Expr): bool {
 
 // Whether a hashed subquery's key inner = outer compares as = does:
 // semiTypes's kinds; one type on both sides, a float's or a char(n)'s
-// of one n (padded alike); or an outer value of no known type (a derived
-// table's column: an untyped parameter, keyed as before).
-fn hashKeyTypes(inner: &Expr, outer: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+// of one n (padded alike); or an outer value of no known type (an untyped
+// parameter, keyed as before). pt: the subquery's parameter types where
+// known (lexdb_bind.refTypesOf): a derived table's column is an untyped
+// parameter of its column's type there (a float beside a numeric key is
+// no key: fuzz W18).
+fn hashKeyTypes(inner: &Expr, outer: &Expr, cols: &[]lexdb_sql.ColDef, pt: &[]int): bool {
+    var oo = 0
     match outer {
-        Expr.Param(_) { return true }
-        else {}
+        Expr.Param(k) {
+            if k < 1 || k > len(pt) || pt[k - 1] == 0 { return true }
+            oo = pt[k - 1]
+        }
+        else { oo = exprOid(outer, cols, &[]) }
     }
     let io = exprOid(inner, cols, &[])
-    let oo = exprOid(outer, cols, &[])
     if semiTypes(io, oo) { return true }
     if io == oo && (io == lexdb_sql.OID_FLOAT4 || io == lexdb_sql.OID_FLOAT8) { return true }
     if io == oo && io == lexdb_sql.OID_BPCHAR {
@@ -4208,7 +4214,7 @@ fn hashKeyTypes(inner: &Expr, outer: &Expr, cols: &[]lexdb_sql.ColDef): bool {
 
 // A conjunct "inner = outer" (either way round), into hk; false: it uses an
 // outer value otherwise.
-fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): bool {
+fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef, pt: &[]int): bool {
     let t = lexdb_sql.exprText(c)
     for x in hk.texts { if x == t { return true } }
     match c {
@@ -4226,7 +4232,7 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): b
             // date, a text with an integer, a float with a numeric compare
             // equal as = converts them, and not as keys. The outer value's
             // type: its column's (outerRef types it)
-            if !hashKeyTypes(&inner, &outer, cols) { return false }
+            if !hashKeyTypes(&inner, &outer, cols, pt) { return false }
             append(mut &hk.inner, inner)
             append(mut &hk.outer, outer)
             append(mut &hk.texts, t)
@@ -4236,11 +4242,11 @@ fn keyConj(c: &Expr, base: int, hk: mut &HashKeys, cols: &[]lexdb_sql.ColDef): b
     }
 }
 
-fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool, cols: &[]lexdb_sql.ColDef): bool {
+fn keyConjs(cs: &[]Expr, base: int, hk: mut &HashKeys, movable: bool, res: bool, cols: &[]lexdb_sql.ColDef, pt: &[]int): bool {
     for c in cs {
         if !usesRefs(&c, base) { continue }
         if !movable { return false }
-        if !keyConj(&c, base, hk, cols) {
+        if !keyConj(&c, base, hk, cols, pt) {
             if !res { return false }
             // not inner = outer: a filter the once-run subquery cannot keep
             // (the outer value is a parameter now), checked per candidate
@@ -4271,7 +4277,7 @@ fn dropTexts(cs: []Expr, texts: &[]str): []Expr {
     return out
 }
 
-pub fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
+pub fn hashSub(sp: mut &SubPlan, base: int, res: bool, pt: &[]int) {
     var hk = HashKeys{inner: [], outer: [], texts: [], res: []}
     // a scalar subquery: one aggregate row, no GROUP BY, its key's groups
     // then its value per group (9.26)
@@ -4293,11 +4299,11 @@ pub fn hashSub(sp: mut &SubPlan, base: int, res: bool) {
             if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return }
             for b in lv.path.rng { if usesRefs(&b.val, base) { return } }
             // an outer join's ON conjuncts are not WHERE filters: they stay
-            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
-            if !keyConjs(&lv.post, base, mut &hk, true, res, &q.cols) { return }
-            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res, &q.cols) { return }
+            if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), res, &q.cols, pt) { return }
+            if !keyConjs(&lv.post, base, mut &hk, true, res, &q.cols, pt) { return }
+            if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), res, &q.cols, pt) { return }
         }
-        if !keyConjs(&q.top, base, mut &hk, true, res, &q.cols) { return }
+        if !keyConjs(&q.top, base, mut &hk, true, res, &q.cols, pt) { return }
         if len(hk.inner) == 0 { return }
         // a subquery of its own (in FROM, a LATERAL one's, in an expression) that reads an outer value: run once, it would
         // have none (08P01)
@@ -6340,11 +6346,11 @@ fn lateralKeys(sel: &Sel, base: int): Option[HashKeys] {
         if !noRefs(&lv.path.eqs, base) || !noRefs(&lv.path.ins, base) || !noRefs(&lv.hashVals, base) { return None }
         if lv.semi && (!noRefs(&lv.cond, base) || usesRefs(&lv.resVal, base)) { return None }
         for b in lv.path.rng { if usesRefs(&b.val, base) { return None } }
-        if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
-        if !keyConjs(&lv.post, base, mut &hk, true, false, &q.cols) { return None }
-        if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), false, &q.cols) { return None }
+        if !keyConjs(&lv.cond, base, mut &hk, !isOuter(lv.join), false, &q.cols, &[]) { return None }
+        if !keyConjs(&lv.post, base, mut &hk, true, false, &q.cols, &[]) { return None }
+        if !keyConjs(&lv.local, base, mut &hk, !isOuter(lv.join), false, &q.cols, &[]) { return None }
     }
-    if !keyConjs(&q.top, base, mut &hk, true, false, &q.cols) { return None }
+    if !keyConjs(&q.top, base, mut &hk, true, false, &q.cols, &[]) { return None }
     if len(hk.inner) == 0 { return None }
     for x in hk.outer { if hasSubCall(&x) || !lexdb_bind.immutable(&x) { return None } }
     return Some(hk)
