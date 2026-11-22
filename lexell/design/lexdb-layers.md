@@ -7928,7 +7928,23 @@ batch path's hand-over of the pipeline's groups to that code.
 
 **Commits and line counts:**
 
-COMMITS
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main d5ccb61a | | 20,211 | `lexdb_pipe` 9,171, `lexdb_plan` 9,350 |
+| 78b0ef46 | the views over an aggregate's groups as operators (`grpViews`; the run in `lexdb_pipe`; exec's `pipeGroups` gives the Res, `grpEval` the marked) | 20,220 | `lexdb_pipe` 9,569, `lexdb_plan` 9,557 |
+| 4af82035 | FOR UPDATE's rows by the pipeline (`lockShape`), the lock operator (`lockRows`); correlated subqueries above the groups (`viewsCorr`); tests `exec_grpview`, `exec_lockpipe`, `tds_grpview`, `tns_grpview` | 20,212 | `lexdb_pipe` 9,621, `lexdb_plan` 9,594 |
+| 754ae90a | `pipeGroups`' and `pipeHeld`'s Res by `setRes` | 20,208 | |
+| 48981f39 | an aggregate's program by `compileAgg` (its Agg found by `aggUnder`); `underViews` and `pipeHeld` as on main (they had cost a point select 26 and 24 instructions) | 20,210 | `lexdb_pipe` 9,658 |
+| 39ca1f28 | the groups and their operators in two calls (`groupsMake`, `groupsView`); a plain aggregate's one row (`PR_AGG1`, `groupsOne`); marked expressions `PR_EVAL` | 20,238 | `lexdb_pipe` 9,758, `lexdb_plan` 9,600 |
+
+`lexdb_exec` +27: `pipeGroups`' collection of the groups and its fused
+HAVING (60 lines) are `lexdb_pipe`'s, and the lock loop (27); exec gained
+the hook for marked expressions (`grpEval`, 18), R7's window hook as a
+function both engines' window calls use (`winEval`, +11), `pipeGroups`'
+two calls and its `PR_AGG1` branch (a correlated scalar aggregate run per
+row: its own call is 1,137 instructions a run fewer than main, a branch
+of the common path's records and walks 1,300 more). The row engine's
+views over the groups and its locking are the reference and stay (R9).
 
 **What it does.**
 
@@ -7949,8 +7965,13 @@ COMMITS
   correlated subquery, a sequence's, session's or volatile call, an ORDER
   BY position not in the list (its 42P10 per row, as the row engine's).
   EXPLAIN prints the Filter over an Agg as `having`, the rest as before.
-- **The run** (`lexdb_pipe.runGroups`, `groupsBody`, `groupOut`,
-  `groupsCut`): the groups made (`runAggAny`), each kept as its first row
+- **The run** (`lexdb_pipe.groupsMake`, then `groupsView`, `groupOut`,
+  `groupsCut`; two calls, so the Apply's `ask` and the marked
+  expressions' hook are each the run's own closure; a plain aggregate's
+  plan of `Project (Agg)` is `PR_AGG1`, its one row made by `groupsOne`
+  without the operators' records and walks; one with marked expressions
+  `PR_EVAL`, which copies the run's subqueries' values): the groups made
+  (`runAggAny`, the Sel's specs finishing them), each kept as its first row
   and accumulators; a HAVING the plan fuses (`PAgg.fuse`: GROUP BY keys, no
   grouping sets, no subquery, immutable, bound; main's `fuse`, q18's
   subquery keeps 57 of 1.5M groups) checked as each is given, a group it
@@ -8048,9 +8069,73 @@ row engine by the whole row, so max_statement_mem's edge differs for an
 aggregate over a text or numeric argument it does not keep (main too;
 `exec_grpview`'s edges avoid them).
 
-CENSUS
+**Census** (the suite at main d5ccb61a, 291 tests, against the branch's,
+its four new tests' lines left out): the row engine's runs with batches
+on 14,535 -> 14,336. Gone: "FOR UPDATE" 201 -> 2 (left: a locking query
+whose correlated subquery is a 9.9 hashed probe, and the same statement
+with EXPLAIN ANALYZE; `shapeWhy`, which does not test `lockShape`, still
+names them "FOR UPDATE"). "agg: a correlated
+subquery left per row: not in WHERE" (21) shows its next reason, "agg: a
+correlated subquery in a key or argument" (21: the suite's are inside a
+call, `sum((select ...))`; the views-only ones are `exec_grpview`'s). The
+pipeline's groups 833,923 -> 833,877: a run whose operators over the groups
+fail is not noted now (the error comes before `pipeGroups` returns; on
+main it came after the note: `exec_fuzzfix3`'s 17, `exec_pct`'s 3, ...).
+The pipeline's rows 358,360 -> 354,484: `exec_limits`' and
+`exec_autostats`' statements bounded by a limit or a clock (-4,069), the
+FOR UPDATE ones now the pipeline's (+193: `exec_locks` 105, `exec_subbatch`
+64, `exec_migrate` 10, `exec_rangedel` 4, ...).
 
-GATES
+**Gates.** All against main d5ccb61a, both built `-O`
+(`~/tpch-w/bind/os/lexdb-d5ccb61a-O`, `lexdb-r7b-O`).
+
+- Point select, INSERT and UPDATE by key in process (the coordinator's
+  `pt2.lxl`, `LXL_HASH_SEED=1`, rounds alternated; per statement = (mode -
+  setup) / 20,000). At 48981f39 (two rounds; INSERT four): point select
+  131,136.7 -> 131,132.7 (-3.9), INSERT 55,121,322.81 -> 55,121,322.82
+  (+0.01, the rounds' spread 0.2), UPDATE 55,142,141.0 -> 55,142,137.0
+  (-4.0). At 39ca1f28 (two rounds): point select 131,136.7 -> 130,497.1
+  (-640), INSERT 55,121,322.8 -> 55,120,701.1 (-622), UPDATE 55,142,140.9
+  -> 55,140,841.4 (-1,300), its setup 1.36M lower: 39ca1f28 changes no
+  code these statements run (`lexdb_pipe.viewRuns` counts no aggregate over
+  1,000 of each), so the drop is the run's state before them (the setup's
+  aggregates, `PR_AGG1`, leave the heap otherwise), not the paths; the paths
+  are 48981f39's, equal or lower. On the way, a test of `underViews`'
+  Project for the groups (it passes there twice a planning) had cost a point
+  select +26 instructions, `setRes` in `pipeHeld` +24 (48981f39 put them
+  back).
+- Over the wire: `pts.sh` (3 rounds of 5, server CPU, the 48981f39 binary,
+  whose point path the final one keeps) 657.5 -> 653.0 ms, wall 720.3 ->
+  717.7; `icount6.sh` on fresh copies, the final binary, two each: per
+  statement instructions 180,549 / 180,501 -> 180,485 / 180,494, cycles
+  100,581 / 102,763 -> 103,876 / 99,148 (means 101,672 -> 101,512), branch
+  misses 391.8 / 398.7 -> 386.2 / 382.0 (iTLB 36.7 / 37.4 -> 126.8 / 39.9:
+  THP). SELECT ... FOR UPDATE by key (`points.sql` with FOR UPDATE, 3
+  rounds of 5): server CPU 706.0 -> 692.3 ms (-1.9%), wall 760.2 -> 742.3
+  (the Fetch path; was the row engine's).
+- TPC-H SF1 (`~/tpch-w/r7b`, base and branch alternated twice, best of
+  two): 22 checksums equal; total 9,608 -> 9,670 ms (1.007). Over 1.5%:
+  q2 39.7 -> 40.8, q3 653 -> 670, q6 178 -> 181, q7 403 -> 419, q12 450 ->
+  460, q13 729 -> 741, q16 237 -> 242, q19 42.9 -> 44.2, q20 276 -> 287, q21
+  722 -> 743, q22 117 -> 119 ms; their server instructions (`iq.sh`, the
+  final binaries): q2 345.4M -> 345.0M (-0.10%), q3 -0.36%, q6 +0.01%, q7
+  -0.13%, q12 +0.04%, q13 -0.48%, q16 -1.28%, q19 +0.04%, q20 -0.35%, q21
+  -0.05%, q22 1,168.4M -> 1,172.5M (+0.35%; q22's base itself read
+  1,168.4M and 1,174.4M in two runs): equal or lower, the times placement
+  and the machine (another session's jobs ran between the sections; the
+  branch's second round read 2-11% over its first on most queries). The
+  grouped queries in ms (best of two, base -> branch): q1 1,638 -> 1,662, q3
+  653 -> 670, q4 169 -> 169, q5 188 -> 189, q7 403 -> 419, q8 193 -> 194, q9
+  1,705 -> 1,701, q10 515 -> 510, q11 97.3 -> 96.4, q12 450 -> 460, q13 729
+  -> 741, q15 393 -> 391, q16 237 -> 242, q18 690 -> 639, q20 276 -> 287,
+  q21 722 -> 743, q22 117 -> 119 (q18 -7.4%: its subquery's fused HAVING).
+  Instructions at 48981f39, all 22: q10 -2.0%, q11 -2.8%, q16 -1.2%, q13
+  -0.6%, q9 -0.4%; q2 +0.96%, q17 +1.97%, q20 +1.96%: the correlated
+  scalar aggregate run per row (q2, q17, q20's 8,508) cost 2,250
+  instructions a run more in the operators' records and walks; 39ca1f28's
+  `PR_AGG1` makes that row 1,137 instructions a run fewer than main (25,000
+  runs of `select (select sum(l_quantity) from lineitem where l_orderkey =
+  o_orderkey) ...`: 2,009.1M -> 1,980.7M).
 
 **Left, and why.**
 
@@ -8280,7 +8365,23 @@ BY and LIMIT of every aggregate the pipeline runs (9,000 statements, 188
 tests, TPC-H's 18 grouped queries) are made by exec's row code
 (`execSelIn`'s group loop, `sortOutRows`). They are views over few rows
 (physAbove's), but they are the row engine's code: medium (Having,
-Project and the Sort over the groups as operators).
+Project and the Sort over the groups as operators). **Done, R7 (6.3.Q8 R7
+as built (group views, FOR UPDATE)): operators over the groups
+(`grpViews`, `groupsMake`, `groupsView`); exec's view code is the row
+engine's alone now.**
+
+**After R7** (6.3.Q8 R7, group views and FOR UPDATE; main d5ccb61a's run,
+291 tests, against the branch's, its four new tests' lines left out): the
+row engine's runs with batches on 14,535 -> 14,336. Gone: FOR UPDATE (201
+-> 2: a locking query whose correlated subquery is a 9.9 hashed probe);
+every aggregate the pipeline runs has its views as operators (no row
+counts moved: they were the pipeline's groups' already). Left of the
+aggregates: a set-returning function in the select list over the groups
+(none in the suite), a correlated subquery in a key or argument (21), the
+give-ways (50). The rest is R8-R9's: a correlated subquery in the outputs
+or ORDER BY 6,435, a 9.9 hashed probe 6,037 + 122, outputs and conditions
+that do not bind 723, gave way 378 + 50, LATERAL after the first level 178
++ 17 + 12.
 
 ### 6.5 Q8: the row engine's deletion, in slices (plan, 2026-11-21)
 
@@ -8314,7 +8415,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R4 (built: 6.3.Q8 R4) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`, its conditions bound by prepare); UPDATE by key 1,668 instructions fewer (-1.15%), TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
-| R7 (windows built: 6.3.Q8 R7) | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait). **Built: the Window operator over a query's rows (one table or joins; sorted, DISTINCT, DISTINCT ON, TOP, WITH TIES, LIMIT/OFFSET over it), windows over the pipeline's groups (exec's view); left: the views over the groups as operators, FOR UPDATE's lock operator, a window with a correlated subquery left per row (R6's Apply under the Window)** | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
+| R7 (windows built: 6.3.Q8 R7) | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait). **Built: the Window operator over a query's rows (one table or joins; sorted, DISTINCT, DISTINCT ON, TOP, WITH TIES, LIMIT/OFFSET over it), windows over the pipeline's groups; the views over the groups as operators (HAVING a Filter, the window calls a Window, the select list a Project, DISTINCT, the Sort, the Limit: 6.3.Q8 R7 as built (group views, FOR UPDATE)), FOR UPDATE's rows by the pipeline and its lock operator (`lockRows`, both engines); left: a set-returning function in the list over the groups, a window with a correlated subquery left per row (R6's Apply under the Window), DISTINCT with WITH TIES or TOP over windows** | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
 | R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
 | R9 | the deletion: `runQuery` and below (`runRows`, `runLevel`, `materialize`, `batchLevel`, `bLevelPlan`, `winBatch`, `fillPick`), `execSelIn`'s row branches, `addToGroup`, `sortOutRows`, `eachRowBIn`'s row path, `runSub`/`fillCur`'s per-row machinery, the levels program for the row engine (`Query.jp`, `levelsProg`), `Run`'s row-engine fields; `SET lexdb_batch` | (the census: no row-engine run with batches on, suite, TPC-H, OLTP) | the oracle in place first (below); the suite; TPC-H; OLTP | about 3,000 lines out of exec (the row engine proper: `materialize` to `runRows` 640, the subquery runs 600, `execSelIn`'s row branches 300, windows 260, `batchLevel` and its plan 300, `execSrf` 170, the row aggregates and sort 250, `eachRowBIn`'s and `outRow` 150; some of it moves into operators rather than going) |
 
