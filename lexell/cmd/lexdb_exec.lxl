@@ -8839,7 +8839,7 @@ fn pipeAggs(sel: &Sel): bool {
 
 // Runs sel's aggregate by its pipeline plan (Q8 R7): its groups, and the
 // operators over them (HAVING, the window calls, the outputs, DISTINCT,
-// ORDER BY and LIMIT) by lexdb_pipe.runGroups, at most cap rows wanted;
+// ORDER BY and LIMIT) by lexdb_pipe.groupsMake and groupsView, at most cap rows wanted;
 // what the plan marks for the caller evaluated here as the row engine's
 // execSel evaluates it (grpEval), and the bytes held as it holds them. m:
 // the run's, its subqueries run (their values lent to the plan's run, or
@@ -8864,20 +8864,49 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             }
             // (an Apply's conjuncts, Q8 R6, and the marked: as runPipe's, the subqueries' values copied)
             let ak = lexdb_plan.applyAt(&pg.plan)
-            let lend = ak < 0 && !lexdb_plan.grpMarks(&pg.plan)
+            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL
             var cx = if lend { pipeCtx(st, txn, params, mut &m.subs) } else { applyCtx(st, txn, params, &m.subs) }
             var bud = rs.bud
             let h0 = rs.bud.held
             let t0 = rs.bud.ticks
             let sqe = seqEnv(st, txn)
+            if pg.run == lexdb_plan.PR_AGG1 {
+                // (a plain aggregate's one row)
+                var held = 0
+                let one = lexdb_pipe.groupsOne(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &held,
+                                               fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                    let noAggs: []Val = []
+                    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+                    return applyTrue(st, tx, q, ak, &env, rs)
+                })
+                budBack(rs, &bud, h0, t0)
+                if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
+                let row = try one
+                if pg.joins { levelCounts(rs, &cnt) } else { scanCounts(rs, &cnt) }
+                try rs.bud.hold(held)
+                return Ok(setRes(sel, [row], 1))
+            }
             let mv = &m.vrows
             let msubs = &m.subs
-            let got = lexdb_pipe.runGroups(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, cap, mut &bud, mut &cnt,
-                                           fn(tx: mut &lexdb_store.Txn, what: int, s: int, i: int, row: &[]Val, aggs: &[]Val, outs: &[]Val): Result[Val, DbErr] {
+            // (the groups, then the operators over them: two calls, each closure the run's)
+            var gm = lexdb_pipe.noGroups()
+            let made = lexdb_pipe.groupsMake(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &gm,
+                                             fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
                 let noAggs: []Val = []
-                let env = Env{cols: &q.cols, row: row, aggs: aggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
-                return grpEval(st, tx, sel, ak, what, s, i, outs, &env, rs)
+                let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                return applyTrue(st, tx, q, ak, &env, rs)
             })
+            let got = match made {
+                Ok(_) {
+                    lexdb_pipe.groupsView(txn, &pg, &q.cols, &cx, cap, &sel.specs, mut &gm,
+                                          fn(tx: mut &lexdb_store.Txn, what: int, s: int, i: int, row: &[]Val, aggs: &[]Val, outs: &[]Val): Result[Val, DbErr] {
+                        let noAggs: []Val = []
+                        let env = Env{cols: &q.cols, row: row, aggs: aggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                        return grpEval(st, tx, sel, what, s, i, outs, &env, rs)
+                    })
+                }
+                Err(x) { Err(x) }
+            }
             budBack(rs, &bud, h0, t0)
             if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
             var go = try got
@@ -8892,13 +8921,12 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
 }
 
 // An expression of a grouped query the pipeline's plan marks for its
-// caller (lexdb_pipe.GV_*), in env (a group's first row and values; an
-// Apply's joined row), as the row engine's execSel evaluates it: of
+// caller (lexdb_pipe.GV_*), in env (a group's first row and values), as
+// the row engine's execSel evaluates it: of
 // grouping set s (-1 none), window call s; outs: the outputs made.
-fn grpEval(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, ak: int, what: int, s: int, i: int, outs: &[]Val, env: &Env,
+fn grpEval(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, what: int, s: int, i: int, outs: &[]Val, env: &Env,
            rs: mut &Run): Result[Val, DbErr] {
     let q = &sel.q
-    if what == lexdb_pipe.GV_ASK { return Ok(Val.Bool(try applyTrue(st, txn, q, ak, env, rs))) }
     if what == lexdb_pipe.GV_HAVING {
         match if s >= 0 { &sel.gh[s] } else { &sel.having } {
             Some(h) { return evalX(st, txn, q, &h, env, rs) }

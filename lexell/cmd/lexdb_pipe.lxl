@@ -2398,7 +2398,62 @@ pub fn compileAgg(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog,
     let j = hasJoin(&p)
     var how = lexdb_plan.PR_PLAIN
     if j || heldScan(&p) { p = needsOf(p, len(cols), false, mut &how) }
+    if how == lexdb_plan.PR_PLAIN { how = if lexdb_plan.grpMarks(&p) { lexdb_plan.PR_EVAL } else if aggOne(&p) { lexdb_plan.PR_AGG1 } else { how } }
     return Ok(Prog{plan: p, ops: n, groups: true, joins: j, sorts: false, run: how})
+}
+
+// Whether p is Project (Agg) of no key or grouping set (PR_AGG1).
+fn aggOne(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Project(i, _) {
+            match i {
+                lexdb_plan.PPlan.Agg(_, _, pa) {
+                    match pa {
+                        Some(a) { return len(a.keys) == 0 && len(a.sets) == 0 }
+                        None {}
+                    }
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return false
+}
+
+// A plain aggregate's one row (pg.run PR_AGG1), as groupsMake, groupsView
+// and groupsCut make it for that shape, without their walks: its group (an
+// empty one for no rows), its calls' values, its outputs over them; the
+// bytes held (its group's, the row's) in held.
+pub fn groupsOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, specs: &[]lexdb_agg.AggSpec,
+                 bud: mut &Budget, cnt: mut &[]Counts, held: mut &int,
+                 ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[[]Val, DbErr] {
+    grpRuns0 += 1
+    var first: []Val = []
+    var accs: []Acc = []
+    var got = false
+    let n = try runAggAny(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt,
+                          fn(f: &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
+        first = collections.copyOf(f)
+        accs = replace(ps, [])
+        got = true
+        return Ok(Unit{})
+    }, ask)
+    if !got {
+        first = array(len(cols), Val.Null)
+        accs = lexdb_agg.newAccs(len(specs))
+    }
+    var vals: []Val = withCapacity(len(specs))
+    for k in 0..len(specs) { append(mut &vals, try lexdb_agg.finish(&specs[k], &accs[k])) }
+    var out: []Val = []
+    match pg.plan {
+        lexdb_plan.PPlan.Project(_, xs) { for x in xs { append(mut &out, try bxEval(&x, &first, &vals, cx)) } }
+        else {}
+    }
+    let noOrd: []Val = []
+    held = n + rowBytes(&out) + rowBytes(&noOrd)
+    return Ok(out)
 }
 
 // The operators of p if the pipeline runs it, else -1.
@@ -9234,12 +9289,11 @@ pub const GV_ORD: int = 2       // ORDER BY key i (of set s), over the outputs m
 pub const GV_WKEY: int = 3      // window call s's key i (PARTITION BY, then ORDER BY), over the group's row
 pub const GV_WARG: int = 4      // ... its argument i (lexdb_window.argsOf's)
 pub const GV_WOFF: int = 5      // ... its frame's offset i (0 start, 1 end), over no row
-pub const GV_ASK: int = 6       // an Apply's conjuncts for a joined row (runJ's ask): true or false
 
 // An output row of the groups' and its ORDER BY values.
 type GRow = record { vals: []Val; ord: []Val }
 
-// What runGroups made, for groupsCut: the rows, the bytes they and the
+// What groupsView made, for groupsCut: the rows, the bytes they and the
 // groups hold, and the Sort's and Limit's details.
 pub type GOut = record {
     rows: []GRow
@@ -9300,95 +9354,55 @@ fn groupsCutOf(p: &lexdb_plan.PPlan, cap: int, go: mut &GOut, srt: mut &lexdb_pl
     }
 }
 
-// Runs an aggregate's program and the operators over its groups (pg.groups,
-// lexdb_plan.grpViews' plan), as runAggAny runs the aggregate, at most cap
-// rows wanted (-1 no cap); the rows made, not yet sorted or cut (groupsCut).
-pub fn runGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, cap: int,
-                 bud: mut &Budget, cnt: mut &[]Counts,
-                 ev: &fn(mut &lexdb_store.Txn, int, int, int, &[]Val, &[]Val, &[]Val): Result[Val, DbErr]): Result[GOut, DbErr] {
-    grpRuns0 += 1
-    let top = underMatch(&pg.plan)
-    var go = GOut{rows: [], held: 0, sorting: false, desc: [], nf: [], don: 0, ties: 0, pct: false, top: -1, limit: -1, offset: 0}
-    var srt = lexdb_plan.PSort{shown: -1, out: [], desc: [], nf: [], coll: [], don: 0, ties: 0, pct: false, top: -1}
-    groupsCutOf(top, cap, mut &go, mut &srt)
-    for x in srt.desc { append(mut &go.desc, x) }
-    for x in srt.nf { append(mut &go.nf, x) }
-    if cap >= 0 && (go.limit < 0 || cap < go.limit) { go.limit = cap }
-    let noWin = lexdb_plan.PWin{wins: [], keys: [], args: [], offs: [], slots: []}
-    let noHs: []BX = []
-    match projUnder(top) {
-        lexdb_plan.PPlan.Project(i, xs) {
-            var dk: []int = []
-            var dist = false
-            match distUnder(top) {
-                lexdb_plan.PPlan.Distinct(_, _, ks) {
-                    dist = true
-                    for k in ks { append(mut &dk, k) }
-                }
-                else {}
-            }
-            match i {
-                lexdb_plan.PPlan.Window(j, pwo) {
-                    match pwo {
-                        Some(pw) {
-                            match j {
-                                lexdb_plan.PPlan.Filter(_, hs) {
-                                    try groupsBody(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, ev, &hs, &pw, true, &xs, dist, &dk, &srt, mut &go)
-                                }
-                                else {
-                                    try groupsBody(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, ev, &noHs, &pw, true, &xs, dist, &dk, &srt, mut &go)
-                                }
-                            }
-                            return Ok(go)
-                        }
-                        None {}
-                    }
-                }
-                lexdb_plan.PPlan.Filter(_, hs) {
-                    try groupsBody(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, ev, &hs, &noWin, false, &xs, dist, &dk, &srt, mut &go)
-                    return Ok(go)
-                }
-                else {}
-            }
-            try groupsBody(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, ev, &noHs, &noWin, false, &xs, dist, &dk, &srt, mut &go)
-            return Ok(go)
-        }
-        else {}
-    }
-    return Err(e("XX000", "the pipeline was given a plan it does not run"))
-}
+// What groupsMake made, for groupsView: each group's first row and its
+// calls' accumulators (and grouping set), the bytes they hold.
+pub type GMade = record { firsts: [][]Val; accss: [][]Acc; gsets: []int; pub held: int }
 
-// The Distinct under p's Limit and Sort, or p.
-fn distUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+pub fn noGroups(): GMade { return GMade{firsts: [], accss: [], gsets: [], held: 0} }
+
+// The Filter over p's Agg (HAVING), or p.
+fn havingUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
     match p {
-        lexdb_plan.PPlan.Limit(i, _, _, _) { return distUnder(&i) }
-        lexdb_plan.PPlan.Sort(i, _, _) { return distUnder(&i) }
+        lexdb_plan.PPlan.Match(i) { return havingUnder(&i) }
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return havingUnder(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return havingUnder(&i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return havingUnder(&i) }
+        lexdb_plan.PPlan.Project(i, _) { return havingUnder(&i) }
+        lexdb_plan.PPlan.Window(i, _) { return havingUnder(&i) }
         else { return p }
     }
 }
 
-fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
-              src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int,
-              bud: mut &Budget, cnt: mut &[]Counts,
-              ev: &fn(mut &lexdb_store.Txn, int, int, int, &[]Val, &[]Val, &[]Val): Result[Val, DbErr],
-              hs: &[]BX, pw: &lexdb_plan.PWin, windowed: bool, xs: &[]BX, dist: bool, dk: &[]int, srt: &lexdb_plan.PSort,
-              go: mut &GOut): Result[Unit, DbErr] {
-    // the aggregate's: its calls (their finish), a fused HAVING, no GROUP
-    // BY (one group for no rows), its grouping sets
-    var specs: []lexdb_agg.AggSpec = []
+// An aggregate's groups by its program (pg.groups, lexdb_plan.grpViews'
+// plan), as runAggAny makes them (ask: its Apply's), into gm; specs: its
+// calls' (the Sel's, which finish them). Then groupsView.
+pub fn groupsMake(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                  src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, specs: &[]lexdb_agg.AggSpec,
+                  bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade,
+                  ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    grpRuns0 += 1
+    let noHs: []BX = []
+    match havingUnder(&pg.plan) {
+        lexdb_plan.PPlan.Filter(_, hs) { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &hs, ask) }
+        else { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &noHs, ask) }
+    }
+}
+
+fn groupsCollect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, specs: &[]lexdb_agg.AggSpec,
+                 bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade, hs: &[]BX,
+                 ask: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
+    // the aggregate's: a fused HAVING, no GROUP BY (one group for no rows),
+    // its grouping sets
     var fuse = false
     var plain = false
-    var nsets = 0
     var esets: []int = []
     match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(_, _, pa) {
             match pa {
                 Some(a) {
-                    specs = callSpecs(&a)
                     fuse = a.fuse && len(hs) == 1
                     plain = len(a.keys) == 0 && len(a.sets) == 0
-                    nsets = len(a.sets)
                     for si in 0..len(a.sets) { if len(a.sets[si]) == 0 { append(mut &esets, si) } }
                 }
                 None {}
@@ -9397,11 +9411,6 @@ fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
         else {}
     }
     let ns = len(specs)
-    let sets = nsets > 0
-    let stride = if sets { len(xs) / nsets } else { len(xs) }
-    let nOut = if srt.shown >= 0 { srt.shown } else { stride }
-    let noVals: []Val = []
-    // the groups, as the row engine leaves them
     var firsts: [][]Val = []
     var accss: [][]Acc = []
     var gsets: []int = []
@@ -9425,17 +9434,15 @@ fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                     Err(_) { bad = true }
                 }
             }
-            // (raised in its turn: this group and the rest kept, checked below)
+            // (raised in its turn: this group and the rest kept, checked by groupsView)
             if bad { fusing = false }
         }
         append(mut &firsts, collections.copyOf(first))
         append(mut &accss, replace(mut &ps, []))
         if set >= 0 { append(mut &gsets, set) }
         return Ok(Unit{})
-    }, fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
-        return Ok(lexdb_ops.truth(&(try ev(tx, GV_ASK, -1, 0, row, &noVals, &noVals))) == Some(true))
-    })
-    go.held = try got
+    }, ask)
+    gm.held = try got
     if len(firsts) == 0 {
         // no rows: one group, empty (no GROUP BY), or one for each empty grouping set (9.94)
         if plain {
@@ -9448,8 +9455,101 @@ fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
             append(mut &gsets, si)
         }
     }
-    let nullRow: []Val = array(len(cols), Val.Null)
-    var seen: Map[str, int] = newMap()
+    gm.firsts = firsts
+    gm.accss = accss
+    gm.gsets = gsets
+    return Ok(Unit{})
+}
+
+// The operators over the groups groupsMake made (gm, taken), at most cap
+// rows wanted (-1 no cap); the rows made, not yet sorted or cut
+// (groupsCut).
+pub fn groupsView(txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, cx: &Ctx, cap: int, specs: &[]lexdb_agg.AggSpec, gm: mut &GMade,
+                  ev: &fn(mut &lexdb_store.Txn, int, int, int, &[]Val, &[]Val, &[]Val): Result[Val, DbErr]): Result[GOut, DbErr] {
+    let top = underMatch(&pg.plan)
+    var go = GOut{rows: [], held: gm.held, sorting: false, desc: [], nf: [], don: 0, ties: 0, pct: false, top: -1, limit: -1, offset: 0}
+    var srt = lexdb_plan.PSort{shown: -1, out: [], desc: [], nf: [], coll: [], don: 0, ties: 0, pct: false, top: -1}
+    groupsCutOf(top, cap, mut &go, mut &srt)
+    for x in srt.desc { append(mut &go.desc, x) }
+    for x in srt.nf { append(mut &go.nf, x) }
+    if cap >= 0 && (go.limit < 0 || cap < go.limit) { go.limit = cap }
+    let noWin = lexdb_plan.PWin{wins: [], keys: [], args: [], offs: [], slots: []}
+    let noHs: []BX = []
+    match projUnder(top) {
+        lexdb_plan.PPlan.Project(i, xs) {
+            var dk: []int = []
+            var dist = false
+            match distUnder(top) {
+                lexdb_plan.PPlan.Distinct(_, _, ks) {
+                    dist = true
+                    for k in ks { append(mut &dk, k) }
+                }
+                else {}
+            }
+            match i {
+                lexdb_plan.PPlan.Window(j, pwo) {
+                    match pwo {
+                        Some(pw) {
+                            match j {
+                                lexdb_plan.PPlan.Filter(_, hs) { try groupsBody(txn, pg, cols, cx, specs, gm, ev, &hs, &pw, true, &xs, dist, &dk, &srt, mut &go) }
+                                else { try groupsBody(txn, pg, cols, cx, specs, gm, ev, &noHs, &pw, true, &xs, dist, &dk, &srt, mut &go) }
+                            }
+                            return Ok(go)
+                        }
+                        None {}
+                    }
+                }
+                lexdb_plan.PPlan.Filter(_, hs) {
+                    try groupsBody(txn, pg, cols, cx, specs, gm, ev, &hs, &noWin, false, &xs, dist, &dk, &srt, mut &go)
+                    return Ok(go)
+                }
+                else {}
+            }
+            try groupsBody(txn, pg, cols, cx, specs, gm, ev, &noHs, &noWin, false, &xs, dist, &dk, &srt, mut &go)
+            return Ok(go)
+        }
+        else {}
+    }
+    return Err(e("XX000", "the pipeline was given a plan it does not run"))
+}
+
+// The Distinct under p's Limit and Sort, or p.
+fn distUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return distUnder(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return distUnder(&i) }
+        else { return p }
+    }
+}
+
+fn groupsBody(txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, cx: &Ctx, specs: &[]lexdb_agg.AggSpec, gm: mut &GMade,
+              ev: &fn(mut &lexdb_store.Txn, int, int, int, &[]Val, &[]Val, &[]Val): Result[Val, DbErr],
+              hs: &[]BX, pw: &lexdb_plan.PWin, windowed: bool, xs: &[]BX, dist: bool, dk: &[]int, srt: &lexdb_plan.PSort,
+              go: mut &GOut): Result[Unit, DbErr] {
+    var nsets = 0
+    match aggUnder(&pg.plan) {
+        lexdb_plan.PPlan.Agg(_, _, pa) {
+            match pa {
+                Some(a) { nsets = len(a.sets) }
+                None {}
+            }
+        }
+        else {}
+    }
+    let ns = len(specs)
+    let sets = nsets > 0
+    let stride = if sets { len(xs) / nsets } else { len(xs) }
+    let nOut = if srt.shown >= 0 { srt.shown } else { stride }
+    let noVals: []Val = []
+    var firsts = replace(mut &gm.firsts, [])
+    let accss = replace(mut &gm.accss, [])
+    let gsets = replace(mut &gm.gsets, [])
+    // (an empty group's row, for the bound expressions: no rows)
+    var nullRow: []Val = []
+    if len(firsts) > 0 && len(firsts[0]) == 0 { nullRow = array(len(cols), Val.Null) }
+    // (DISTINCT's outputs seen: one map, none else)
+    var seen: []Map[str, int] = []
+    if dist { append(mut &seen, newMap()) }
     var bases: []WinRow = []
     for gi in 0..len(firsts) {
         let si = if sets { gsets[gi] } else { -1 }
@@ -9496,7 +9596,7 @@ fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
 // when sorted; its bytes counted as the row engine counts them.
 fn groupOut(txn: mut &lexdb_store.Txn, ev: &fn(mut &lexdb_store.Txn, int, int, int, &[]Val, &[]Val, &[]Val): Result[Val, DbErr],
             xs: &[]BX, b: int, nOut: int, si: int, row: &[]Val, first: &[]Val, aggs: &[]Val, cx: &Ctx, dist: bool, dk: &[]int,
-            srt: &lexdb_plan.PSort, seen: mut &Map[str, int], go: mut &GOut): Result[Unit, DbErr] {
+            srt: &lexdb_plan.PSort, seen: mut &[]Map[str, int], go: mut &GOut): Result[Unit, DbErr] {
     let noVals: []Val = []
     var out: []Val = withCapacity(nOut)
     for o in 0..nOut {
@@ -9506,8 +9606,8 @@ fn groupOut(txn: mut &lexdb_store.Txn, ev: &fn(mut &lexdb_store.Txn, int, int, i
     if dist {
         var kb = ""
         for i in 0..nOut { lexdb_access.encIdxPart(mut &kb, &(if i < len(dk) { lexdb_sort.collVal(dk[i], &out[i]) } else { out[i].clone() })) }
-        if seen.get(&kb).isSome() { return Ok(Unit{}) }
-        seen.put(kb, 1)
+        if seen[0].get(&kb).isSome() { return Ok(Unit{}) }
+        seen[0].put(kb, 1)
     }
     var ord: []Val = []
     if go.sorting {
@@ -9542,7 +9642,7 @@ pub fn ordCmpOf(desc: &[]bool, nf: &[]bool, a: &[]Val, b: &[]Val): int {
     return 0
 }
 
-// The rows runGroups made (held by the caller), sorted, cut as the row
+// The rows groupsView made (held by the caller), sorted, cut as the row
 // engine's execSel cuts them: DISTINCT ON (sorted: the first row of each
 // run of equal leading keys), then OFFSET, and LIMIT, TOP n or TOP n
 // PERCENT of the rows (rounded up), WITH TIES the rows after the last that
