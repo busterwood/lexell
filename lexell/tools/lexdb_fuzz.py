@@ -2226,6 +2226,44 @@ def cmd_repro(args):
             pg.stop()
 
 
+def cmd_recheck(args):
+    """Each reduced case of the runs (one per signature, every one of a wrong result, crash or hang) checked again
+    with --bin: whether its check still fails with its class. Prints the counts and the ones that still fail."""
+    cases = []
+    for d in args.dirs:
+        for c in load_cases(d):
+            if 'min_sql' in c:
+                c['_from'] = os.path.basename(os.path.normpath(d))
+                cases.append(c)
+    seen, todo = set(), []
+    for c in sorted(cases, key=lambda c: (SEVERITY.get(c['cls'], 5), c['id'])):
+        sig = c.get('signature', c['check'])
+        if c['cls'] in ('wrong', 'crash', 'hang') or sig not in seen:
+            todo.append(c)
+        seen.add(sig)
+    a = argparse.Namespace(bin=os.path.realpath(args.bin), port=args.port, cpus=args.cpus, checks=CHECKS_ALL,
+                           variants=args.variants, pg_port=args.pg_port, reduce_wrong=0, reduce_err=0, reduce_secs=0)
+    pg = Postgres(args.work, args.pg_port, args.cpus)
+    pg.start()
+    pg.ensure_db('fz9')
+    w = Worker(9, a, os.path.join(args.work, 'recheck'))
+    still = []
+    try:
+        for c in todo:
+            setup = Setup.from_js(c['min_setup'])
+            try:
+                f = w.still_fails(c, setup, c['min_sql'], c.get('min_sql2'))
+            except Exception as e:      # a setup the binary refuses now
+                f = 'error: %s' % e
+            if f:
+                still.append(c)
+            print('%s %s/%s %s' % ('STILL' if f else 'gone ', c['_from'], c['id'], c.get('signature', '')[:150]), flush=True)
+    finally:
+        w.stop()
+        pg.stop()
+    print('rechecked %d cases (%d signatures): %d still fail' % (len(todo), len(seen), len(still)))
+
+
 VARIANT_CODE = '''
 // lexdb_fuzz.py's build: the planner's test switches from the environment
 // (LEXDB_FUZZ_UNNEST, _REWRITES, _BUSHY, _KEYORDER; unset: the defaults).
@@ -2309,11 +2347,19 @@ def main():
             p.add_argument('case')
             p.add_argument('--work', default=os.path.expanduser('~/tpch-w/fuzz/repro'))
             p.add_argument('--pg', action='store_true', help='also run it on a PostgreSQL started in --work')
+    rc = sub.add_parser('recheck', help='check the reduced cases of runs again with another binary')
+    rc.add_argument('dirs', nargs='+')
+    rc.add_argument('--bin', required=True)
+    rc.add_argument('--port', type=int, default=55700)
+    rc.add_argument('--pg-port', type=int, default=55690)
+    rc.add_argument('--cpus', default='8-11')
+    rc.add_argument('--no-variants', dest='variants', action='store_false')
+    rc.add_argument('--work', default=os.path.expanduser('~/tpch-w/fuzz/recheck'))
     r = sub.add_parser('report')
     r.add_argument('dir')
     r.add_argument('--full', action='store_true')
     args = ap.parse_args()
-    {'build': cmd_build, 'run': cmd_run, 'report': cmd_report, 'repro': cmd_repro}[args.cmd](args)
+    {'build': cmd_build, 'run': cmd_run, 'report': cmd_report, 'repro': cmd_repro, 'recheck': cmd_recheck}[args.cmd](args)
 
 
 if __name__ == '__main__':
