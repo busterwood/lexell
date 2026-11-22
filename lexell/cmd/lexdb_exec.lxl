@@ -8864,7 +8864,8 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             }
             // (an Apply's conjuncts, Q8 R6, and the marked: as runPipe's, the subqueries' values copied)
             let ak = lexdb_plan.applyAt(&pg.plan)
-            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL
+            // (a LATERAL level's asks, Q8 R4b, read them too: copied for a correlated query)
+            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL && !q.corr
             var cx = if lend { pipeCtx(st, txn, params, mut &m.subs) } else { applyCtx(st, txn, params, &m.subs) }
             var bud = rs.bud
             let h0 = rs.bud.held
@@ -8874,10 +8875,10 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 // (a plain aggregate's one row)
                 var held = 0
                 let one = lexdb_pipe.groupsOne(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &held,
-                                               fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                                               fn(tx: mut &lexdb_store.Txn, row: &[]Val, rows: mut &[][]Val): Result[bool, DbErr] {
                     let noAggs: []Val = []
                     let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                    return applyTrue(st, tx, q, ak, &env, rs)
+                    return applyAsk(st, tx, q, ak, &env, rows, rs)
                 })
                 budBack(rs, &bud, h0, t0)
                 if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
@@ -8891,10 +8892,10 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             // (the groups, then the operators over them: two calls, each closure the run's)
             var gm = lexdb_pipe.noGroups()
             let made = lexdb_pipe.groupsMake(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &gm,
-                                             fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                                             fn(tx: mut &lexdb_store.Txn, row: &[]Val, rows: mut &[][]Val): Result[bool, DbErr] {
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
-                return applyTrue(st, tx, q, ak, &env, rs)
+                return applyAsk(st, tx, q, ak, &env, rows, rs)
             })
             let got = match made {
                 Ok(_) {
@@ -9020,8 +9021,8 @@ fn runPipe(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
                     keepSubs(rs, subs)
                     return Err(lexdb_pipe.batErr())
                 }
-                // (an Apply over the joins: Q8 R6)
-                if lexdb_plan.applyAt(&pg.plan) >= 0 { return runApplyJ(st, txn, sel, &pg, params, cap, rs, give, mut &subs) }
+                // (an Apply over the joins: Q8 R6; LATERAL levels after the first, Q8 R4b)
+                if lexdb_plan.applyAt(&pg.plan) >= 0 || (sel.q.corr && lexdb_plan.latLater(&sel.q)) { return runApplyJ(st, txn, sel, &pg, params, cap, rs, give, mut &subs) }
                 let srcs = try joinSrcs(st, txn, sel, &pg, params, &subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
                 let cx = pipeCtx(st, txn, params, mut &subs)
                 var tabs: []&Table = []
@@ -20058,7 +20059,7 @@ fn applyTrue(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: in
 }
 
 // No Apply's ask (a plan without one never asks).
-fn noAsk(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] { return Err(e("XX000", "an Apply's ask without an Apply")) }
+fn noAsk(tx: mut &lexdb_store.Txn, row: &[]Val, rows: mut &[][]Val): Result[bool, DbErr] { return Err(e("XX000", "an Apply's ask without an Apply")) }
 
 // A pipeline run's budget (bud, from rs's: held h0, ticks t0) back in rs,
 // with what the Apply's subqueries' runs held and ticked in rs meanwhile.
@@ -20096,9 +20097,9 @@ fn runApplyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &
     let noAggs: []Val = []
     let sv = &subs
     let got = lexdb_pipe.runJ(st, txn, pg, &q.cols, &tabs, &srcs, &vrows, &cx, cap, mut &bud, mut &cnt, give,
-                              fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                              fn(tx: mut &lexdb_store.Txn, row: &[]Val, rows: mut &[][]Val): Result[bool, DbErr] {
         let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: sv, cur: &noAggs, seq: &sqe}
-        return applyTrue(st, tx, q, ak, &env, rs)
+        return applyAsk(st, tx, q, ak, &env, rows, rs)
     })
     budBack(rs, &bud, h0, t0)
     let n = try got
@@ -20235,4 +20236,52 @@ fn setHeldRes(txn: mut &lexdb_store.Txn, sel: &Sel, rows: mut &[][]Val, limit: i
             return Err(x)
         }
     }
+}
+
+// ---- LATERAL after the first level (Q8 R4b; design/lexdb-layers.md 6.3.Q8 R4b as built)
+
+// A join plan's ask for env's row (runApplyJ's, pipeGroups'): a LATERAL
+// level's (the row one longer than the query's columns, its level last:
+// latAsk), else the Apply's conjuncts at level ak (applyTrue).
+fn applyAsk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, ak: int, env: &Env, rows: mut &[][]Val, rs: mut &Run): Result[bool, DbErr] {
+    if len(env.row) > len(q.cols) { return latAsk(st, txn, q, env, rows, rs) }
+    return applyTrue(st, txn, q, ak, env, rs)
+}
+
+// A LATERAL level's rows for env's row (its level at env.row's end), as
+// runLevel's LATERAL arm makes them: its subquery's outer values by eval,
+// its rows from the run's memo under them (a hit counted), else its run
+// with them after the run's parameters (runChild), kept in the memo while
+// it holds under MEMO_MAX results (their bytes held).
+fn latAsk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, env: &Env, rows: mut &[][]Val, rs: mut &Run): Result[bool, DbErr] {
+    let k = match env.row[len(q.cols)] {
+        Val.Int(x) { x }
+        else { -1 }
+    }
+    if k < 1 || k >= len(q.levels) || !q.levels[k].lateral { return Err(e("XX000", "a LATERAL ask of a level that is not")) }
+    let i = q.levels[k].src
+    var refVals: []Val = []
+    for x in q.subs[i].sel.q.refs { append(mut &refVals, try eval(&x, env)) }
+    let key = valsKey(&refVals)
+    match rs.memo[i].get(&key) {
+        Some(at) {
+            rs.stats[i].hits += 1
+            rows = copyRows(&rs.memoRes[i][at].data)
+            return Ok(true)
+        }
+        None {}
+    }
+    var ps: []Val = []
+    for j in 0..q.base { append(mut &ps, env.params[j].clone()) }
+    for v in move(refVals) { append(mut &ps, v) }
+    var res = try runChild(st, txn, &q.subs[i].sel, &ps, -1, rs, i)
+    rows = replace(mut &res.rows, [])
+    if len(rs.memoRes[i]) < MEMO_MAX {
+        try rs.bud.hold(lexdb_pipe.rowsBytes(rows) + len(key) + 48)
+        rs.memo[i].put(key, len(rs.memoRes[i]))
+        var r = emptyRes()
+        r.data = copyRows(rows)
+        append(mut &rs.memoRes[i], r)
+    }
+    return Ok(true)
 }
