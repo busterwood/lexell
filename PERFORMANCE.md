@@ -1,8 +1,9 @@
 # Lexell performance
 
-Measured on 19 November 2026 on `main` at commit dbee498f. Every number here is from that build and
-compares Lexell only with external tools or databases. Lexell's own C backend
-and earlier builds are not compared.
+Measured on 19 November 2026 on `main` at commit dbee498f, except the compile-time,
+microbenchmark and regex sections, which were measured again on 22 November 2026 at
+commit 236c8513. Every number compares Lexell only with external tools or databases.
+Lexell's own C backend and earlier builds are not compared.
 
 Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
 Versions: rustc and cargo 1.99.1, Go 1.27.3, Java 21.0.13, .NET SDK 10.0.113, Python 3.14.8,
@@ -19,7 +20,7 @@ Method: wall times are best of N; instruction counts are user-mode
 |---|---|---|
 | Compile time | Rust | Much faster: about 3 times for hello world, about 23 times for nine programs |
 | Microbenchmarks | Rust | Level or faster on nine of ten |
-| Regex | Go, Rust | Faster than Go on all; slower than Rust on most |
+| Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
 | JSON | Python, jq | Faster to parse, slower to query; 6 to 10 percent slower than jq |
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Mixed |
@@ -35,12 +36,12 @@ step fails on a broken system symlink.
 
 | case | Lexell | Rust |
 |---|---:|---:|
-| hello world, compile | 13.9 ms | 44.7 ms |
+| hello world, compile | 14.2 ms | 46.2 ms |
 | hello world, binary | 20 KB | 330 KB |
-| nine benchmark programs, clean compile | 128.5 ms | 3,000 ms |
-| nine benchmark programs, binaries | 200 KB | 457 KB |
+| nine benchmark programs, clean compile | 131.3 ms | 3,050 ms |
+| nine benchmark programs, binaries | 192 KB | 457 KB |
 
-The compiler's own self-build takes 468 ms (no external reference).
+The compiler's own self-build takes 483 ms (no external reference).
 
 ## Microbenchmarks
 
@@ -53,20 +54,25 @@ same operations and keys, not the same data structure. Both print the same check
 
 | program | Lexell | Rust | Lexell / Rust |
 |---|---:|---:|---:|
-| fib | 820 ms | 818 ms | 1.00 |
-| loop | 416 ms | 416 ms | 1.00 |
-| array | 340 ms | 345 ms | 0.99 |
-| sieve | 301 ms | 448 ms | 0.67 |
-| alloc | 289 ms | 342 ms | 0.85 |
-| strings | 213 ms | 276 ms | 0.77 |
-| lists | 189 ms | 446 ms | 0.42 |
-| trees | 137 ms | 333 ms | 0.41 |
-| tokens | 124 ms | 100 ms | 1.25 |
-| maps | 362 ms | 647 ms | 0.56 |
+| fib | 856 ms | 868 ms | 0.99 |
+| loop | 422 ms | 424 ms | 0.99 |
+| array | 346 ms | 354 ms | 0.98 |
+| sieve | 301 ms | 452 ms | 0.67 |
+| alloc | 263 ms | 348 ms | 0.76 |
+| strings | 216 ms | 276 ms | 0.78 |
+| lists | 189 ms | 481 ms | 0.39 |
+| trees | 131 ms | 343 ms | 0.38 |
+| tokens | 126 ms | 103 ms | 1.22 |
+| maps | 357 ms | 651 ms | 0.55 |
+
+A second run of the same build, straight after, gave every ratio within 0.01 of these.
+The clock ran lower than on 19 November: Lexell's `fib` takes the same cycles
+(3,986 M) as then and about 4 percent more wall time, and the Rust times rose by 0 to
+8 percent, so compare the ratios rather than the times across the two dates.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
 table holds them), in both languages, with the same output. The same source
-compiled through the C backend takes 105 ms, level with Rust (100 ms); over the
+compiled through the C backend takes 105 ms, level with Rust (103 ms); over the
 whole program the native backend executes about 1.2 times the instructions of the
 C build. That gap is the native code generator's, not the program's; the native
 backend's code for the scanning loop is the cause, and the work on it is tracked in
@@ -86,17 +92,19 @@ with the same target flags as the other Rust ports (`opt-level = 3`,
 
 | pattern | Lexell | Go regexp | Rust regex | Lexell / Go | Lexell / Rust |
 |---|---:|---:|---:|---:|---:|
-| literal `Sherlock Holmes` | 0.20 ms | 0.41 ms | 0.07 ms | 0.49 | 2.86 |
-| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.59 ms | 131.7 ms | 0.40 ms | 0.004 | 1.47 |
-| `\w+` | 19.6 ms | 120.5 ms | 15.7 ms | 0.16 | 1.25 |
-| `(?i)sherlock` | 0.54 ms | 69.4 ms | 0.43 ms | 0.008 | 1.26 |
-| email | 0.09 ms | 74.3 ms | 0.08 ms | 0.001 | 1.12 |
-| `(?m)^ERROR .*timeout$` | 0.38 ms | 29.9 ms | 0.57 ms | 0.013 | 0.67 |
-| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.41 ms | 67.4 ms | 1.25 ms | 0.036 | 1.93 |
-| `(a*)*b` on 100 KB | below timer resolution | 3.21 ms | below timer resolution | | |
+| literal `Sherlock Holmes` | 0.20 ms | 0.42 ms | 0.07 ms | 0.48 | 2.86 |
+| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.60 ms | 133.6 ms | 0.42 ms | 0.004 | 1.43 |
+| `\w+` | 19.8 ms | 122.0 ms | 16.1 ms | 0.16 | 1.23 |
+| `(?i)sherlock` | 0.55 ms | 70.2 ms | 0.43 ms | 0.008 | 1.28 |
+| email | 0.09 ms | 76.5 ms | 0.09 ms | 0.001 | 1.00 |
+| `(?m)^ERROR .*timeout$` | 0.38 ms | 30.4 ms | 0.58 ms | 0.012 | 0.66 |
+| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.47 ms | 69.8 ms | 1.25 ms | 0.035 | 1.98 |
+| `(a*)*b` on 100 KB | below timer resolution | 3.31 ms | below timer resolution | | |
 
-Against Rust, the regex crate is faster on six patterns and Lexell is faster on
-`errors`; `(a*)*b` is below timer resolution for both.
+Against Rust, the regex crate is faster on five patterns, email is level at the
+script's 0.01 ms resolution, and Lexell is faster on `errors`; `(a*)*b` is below
+timer resolution for both. A second run gave the same ratios within 0.05, except the
+literal (3.0), whose Rust time of 0.07 ms is near the script's resolution.
 
 Against Rust, the gap on `literal`, alternation and `(?i)sherlock` is probably on
 the library side: the `regex` crate searches literals with SIMD `memchr` and
