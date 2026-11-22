@@ -8148,6 +8148,174 @@ FOR UPDATE ones now the pipeline's (+193: `exec_locks` 105, `exec_subbatch`
 - A window with a correlated subquery left per row (R6's Apply under the
   Window), DISTINCT with WITH TIES or TOP over windows: not built (part 3).
 
+### 6.3.Q8 R4b as built (2026-11-22)
+
+R4's two left-overs (6.3.Q8 R4, "Left, and why"). Branch
+`worktree-agent-a223a76775ecd8885` from main 089fc690. `SET lexdb_batch =
+off` (the row engine, the tests' reference) is untouched: `runLevel`'s
+LATERAL arm and `pathScans`' array elements stay, now the reference only
+for these shapes.
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 089fc690 | | 20,238 | `lexdb_pipe` 9,758, `lexdb_plan` 9,600 |
+| ee775478 | LATERAL after the first level as a join arm (`JH_APPLY`); test `exec_r4b` (lateral); four tests' counters | 20,287 | `lexdb_pipe` 9,918, `lexdb_plan` 9,698 |
+| 27453ab2 | tests `tds_r4b` (SQL Server 2022's answers), `tns_r4b` (Oracle Free's) | 20,287 | |
+| 659d95bb | a primary key's `= any(array)` lookup (`JH_ANY`); `exec_r4b` (any) | 20,287 | `lexdb_pipe` 9,989, `lexdb_plan` 9,725 |
+| 29269afc | runPipe's test for an asking join plan one call (`lexdb_plan.asksJoin`): the point select's wire cycles (below); this section | 20,287 | `lexdb_plan` 9,730 |
+
+`lexdb_exec` +49: `latAsk` (the subquery's run per row with the run's
+memo: `runChild`, `eval`, `Run.memo` are exec's), `applyAsk`, and the
+three ask closures' new parameter. The new code is at the modules' ends.
+
+**What it does.**
+
+- **LATERAL after the first level** (`from t, lateral (select ...)`, a
+  function in FROM over the row, T-SQL's and Oracle's CROSS and OUTER
+  APPLY): when every correlated subquery a query leaves per row is such a
+  level (`lexdb_plan.latJoins`; none at the first level), the level is a
+  join arm of its own, `PJoin.how` `JH_APPLY` (`latArm`: inner or LEFT,
+  every condition of the level, a LEFT one's WHERE conjuncts after it;
+  `hcols` the query's columns its outer values read; its subquery's
+  `PSub` `RUN_APPLY`, as the Apply's). The doc's plan, as planned: the
+  joins pass the ask down the `out` closure they already have.
+  `lexdb_pipe.latFrom`, at that level, gives the chunk's rows to the
+  consumer as an ask batch (the columns the outer values read and one
+  column more, whose values name the level, its width and those columns);
+  the consumer's `askRows` hands it to `latRows`, which gives each row to
+  the ask with the level after the query's columns, and puts the rows
+  back (per row how many, their values row by row). The ask closure's type
+  gained the rows it gives back (`fn(txn, row, rows)`: an Apply's ask
+  ignores them), so no other signature changed and every consumer of
+  joins (rows, sorted, aggregates and their groups, windows) takes a
+  LATERAL level. Exec's ask (`applyAsk` -> `latAsk`) evaluates the
+  subquery's outer values by `eval`, takes its rows from the run's memo
+  under them (a hit counted), else runs it (`runChild`) and keeps them
+  while under MEMO_MAX, holding their bytes: what `runLevel`'s LATERAL arm
+  does, so the runs, hits and rows are the row engine's (EXPLAIN
+  ANALYZE's counts too; `exec_r4b` checks one). The rows become the
+  level's batch and are joined on as a hash level's candidates
+  (`joinTail`: its conditions, a LEFT one's NULL row, its WHERE
+  conjuncts). Per row, not per distinct values as the doc had it: the memo
+  already makes a repeated row's run a hit, and asking per row keeps the
+  hits' count and the order of the runs the row engine's.
+- **Order and errors.** An error (the subquery's, its outer values', a
+  condition's, an output's) joins the chunk again row by row
+  (`joinChunk`'s exact mode), each row's subquery then run before the next
+  row's joins, so the first error is the row engine's (`exec_r4b` has an
+  output's 22003 before a subquery's 22012 and the other way round). Under
+  a LIMIT, an EXISTS's or a scalar subquery's cap, each first row is joined
+  alone (`Apply.one`, now also for a LATERAL level: `latIn`), so no
+  subquery runs for a row past it.
+- **A primary key's `= any(array)` lookup** (`t.id = any(p.ids)`):
+  `lexdb_plan.anyLook` (the whole primary key, its last column's values
+  the array's, `Path.inArr`), `PJoin.how` `JH_ANY`, its keys the
+  equalities then the array; `lexdb_pipe.anyProbes` makes a row's probes
+  as `pathScans` makes an IN list's scans: the equalities made keys
+  (`keyOf`), each element coerced to the column's type (one that is not
+  left to the condition, which stays), unique, in key order; several
+  probes a row in `fetchMany`, joined on as a lookup's. An array that is
+  an expression, not a column (`any(array[p.id, p.id + 1])`), gives way at
+  the run (a key not a column), as before.
+
+**Left, and why:**
+
+- A LATERAL level beside another correlated subquery run per row, or with
+  LATERAL at the first level too (`latJoins` declines: the Apply's asks
+  and the LATERAL's would both be needed; census "LATERAL after the first
+  level, with another subquery per row").
+- `= any(array)` through an index (a range per element: `rangeMany` takes
+  several probes a row as `fetchMany` does, but its one-row fallback,
+  `rangeOne`, reads one range; none in the suite). The census reason "read
+  per row, neither a key lookup nor a range" had one `= any` statement
+  among its 7 runs; the other 6 (and 9 of a write's) are ranges per row
+  whose bounds read the row (`q2.s < q1.b2 + 40000`, `h.hz > f.id`,
+  `g.id between u.s and u.s + 2`): `rangePath` takes constant bounds only.
+  Plan: `JH_RANGE`'s bounds as keys of the row (`PJoin.rng` bound per row,
+  `jl.los`/`his` per probe in `rangeMany`'s tail), small-medium.
+- Per-row subquery runs are not batched (a chunk's distinct outer values
+  run as one grouped read: 6.3.Q8 R6's q20 note); the run's setup is the
+  cost, as for the Apply.
+
+**Measured.** The census (6.4's tool; main 089fc690's run of 296 tests,
+`exec_batchexpr`'s lines from a second run with its timeout raised,
+against the branch's with it raised, its three new tests' lines left out;
+batches on): the row engine's runs 14,338 -> 14,144. Gone: "LATERAL after
+the first level (a join per row)" 178 runs, its window variant 12, its
+aggregate variant 17 (207 in all); "read per row, neither a key lookup
+nor a range" 7 -> 6 (the `= any` one; the 6 left are ranges whose bounds
+read the row, above). Grown by their next reason: "gave way at the run"
++11 and +2 (eachRow): LATERAL levels after a first level of a few held
+rows (`select ... from (select distinct g from t) d, lateral (...)
+match_recognize (...)`), which `runPipe` gives the row engine on purpose
+(`heldFew`: a join's set-up costs more than a few rows save). Nothing
+else moved but the clock-bounded tests' runs (`exec_autostats`,
+`exec_limits`, and `pointsel`, which the base's census run failed).
+
+In process (`LXL_HASH_SEED=1`, the 1-statement run subtracted from the
+20,001 one; INSERT and UPDATE in one transaction on the simulated disk;
+1,000 rows; main 089fc690 against 659d95bb, both `-O` by the same
+compiler, two rounds, identical):
+
+| statement | main 089fc690 | R4b | |
+|---|---:|---:|---:|
+| point select | 126,357.4 | 126,357.4 | 0 |
+| INSERT VALUES, one row | 90,928.0 | 90,928.0 | 0 |
+| UPDATE ... WHERE id = k | 124,832.5 | 124,832.5 | 0 |
+| `select count(*), sum(l.w) from t, lateral (select u.w from u where u.k = t.id % 50 order by u.id limit 2) l` (1,000 outer rows, 1,000 runs of 40 rows) | 147.8M | 142.9M | -3.3% |
+| the same, `u.k = t.id % 1000` (1,000 runs, 950 of them empty) | 45.9M | 42.5M | -7.4% |
+
+(main's outer query is the row engine's, its subquery's runs the
+pipeline's already, R1; with batches off the first is 249.6M, the second
+40.2M: the row engine's runs of the subquery cost less than the
+pipeline's for an empty index lookup, R1's per-run setup.)
+
+Over the wire (base 089fc690 against the branch, fresh copies, `-O`;
+logs in `~/tpch-w/r4b/logs`): `icount6.sh` (points.sql three times, the
+server's counts a statement, two rounds alternated): at 659d95bb
+instructions 179,755 / 179,466 against 179,499 / 179,364 (equal), cycles
+109,805 / 110,427 against 110,281 / 111,354 (+0.4%, +0.8%), L1 i-cache
+misses 288.6 / 284.9 against 434.6 / 434.3, iTLB misses 114 / 114 against
+121 / 122, branch misses 436 / 438 against 406 / 414; `pts.sh` server CPU
+720.6 / 713.8 / 714.8 against 746.2 / 719.4 / 723.0 ms (+3.6%, +0.8%,
++1.1%). The point select's code is unchanged; `runPipe` (which it enters)
+had grown by the new test. With that test one call (`asksJoin`):
+instructions 179,784 / 180,124 against 179,712 / 179,784, cycles 110,575 /
+116,406 against 106,787 / 108,438 (-3.4%, -6.8%), iTLB misses 116 / 120
+against 36 / 36, i-cache misses 288 / 287 against 396 / 389; `pts.sh`
+server CPU 810.8 / 747.8 / 707.8 against 771.8 / 720.6 / 755.0 ms (-4.8%,
+-3.6%, +6.7%: the machine shared with other jobs, the spread larger than
+the difference). Level in instructions, placement in the rest.
+
+TPC-H (SF1, base 089fc690 and 659d95bb, `-O`, alternated twice, one run
+each, `TPCH_REF` 1744ef99, `~/tpch-w/r4b`; best of the two, ms):
+checksums equal on all 22 in all four runs; 9,927 against 9,358 (0.943),
+no query slower (the base's first round was slow throughout: another
+job's on the machine). The largest moves, q8 -18.5%, q3 -13.9%, q2
+-10.9%, q13 -5.2%, are the machine: their server instructions (`iq.sh`)
+are equal, q2 342.84M -> 343.02M, q3 4,076.3M -> 4,076.9M, q8 1,026.84M ->
+1,026.99M, q13 4,712.6M -> 4,713.1M (all within 0.05%). R4b's shapes are
+not in TPC-H's 22. The last commit changes only `runPipe`'s test (the
+same condition, one call).
+
+**Tests.** Suite 298 of 298 (new: `exec_r4b`, `tds_r4b`, `tns_r4b`; 295
+at main), the full suite at every commit. `exec_r4b` runs every statement
+with batches on and off (the same rows or error): lateral 43 (42 through
+`JH_APPLY`; the empty first table asks nothing), EXPLAIN ANALYZE's counts
+as the row engine's, any 18 (9 through `JH_ANY`; the inner joins the
+planner reorders, table first, are not lookups, and an array that is an
+expression gives way). `tds_r4b`: 23 T-SQL batches of CROSS and OUTER
+APPLY, SQL Server 2022's answers (the `lxl-mssql` container, a database
+of its own, dropped after). `tns_r4b`: 22 statements of LATERAL, CROSS and
+OUTER APPLY, Oracle Database Free's answers (`gen_oracle.py --check
+tns_r4b`: 22 checked, no difference). `= any(array)` has no T-SQL or
+Oracle form (no arrays). `exec_r3`'s lateral cases unchanged.
+Expectations changed (counters only, the same rows): `exec_subrows`,
+`exec_unnest_agg`, `tds_unnest_agg`, `tns_unnest_agg` (more runs
+piped).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -8383,6 +8551,15 @@ or ORDER BY 6,435, a 9.9 hashed probe 6,037 + 122, outputs and conditions
 that do not bind 723, gave way 378 + 50, LATERAL after the first level 178
 + 17 + 12.
 
+**After R4b** (6.3.Q8 R4b; main 089fc690's run against the branch's, its
+three new tests' lines left out): the row engine's runs with batches on
+14,338 -> 14,144. Gone: LATERAL after the first level (207 runs with its
+window and aggregate variants; 13 of them now "gave way", a first level
+of a few held rows), the `= any(array)` lookup (1 run). Left of the joins:
+a range per row whose bounds read the row 6 (+ 9 of a write's), LATERAL
+at the first level beside another subquery per row 12, OFFSET over joins
+6.
+
 ### 6.5 Q8: the row engine's deletion, in slices (plan, 2026-11-21)
 
 What is left before the row engine (`runQuery`, `runLevel`, `materialize`,
@@ -8412,7 +8589,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R1 (built: 6.3.Q8 R1) | every SELECT's rows offered: a subquery's own rows (`pipeSelIn(sel, true)`), a write's subqueries, INSERT ... SELECT's rows | subquery own rows, not offered | q16, q20 (the subqueries' rows; 8,508 per-row runs must not cost more: the per-run setup is 51.7's 4.6 us); `exec_unnest*` | small |
 | R2 (built: 6.3.Q8 R2; left: a set-returning function in the select list, a collation's hash join key, the binder's errors and the outputs that do not bind) | the small arms: a Result arm (no FROM), Limit with an offset, the recursive CTE's working table as held rows, a first-row aggregate (`Sel.first`), DISTINCT ON, WITH TIES, TOP PERCENT, a set-returning function in the select list, collated keys in HashAgg and the hash join, the binder raising the errors the row path raises | no FROM, OFFSET, recursive CTE, MIN/MAX, variants, aggregates not run, does not bind | `select 1` and `select nextval()` by instructions (a driver's ping is point-select-like) | small each, ~600 lines in all |
 | R3 (built: 6.3.Q8 R3) | a function in FROM as a source (`execSrf`'s rows as `lexdb_held` reads them), MATCH_RECOGNIZE fed by the pipeline (`lexdb_match` stays a row operator over its input), set operations all through `lexdb_setop`. **Built: a function's program (`lexdb_srf` makes its rows), LATERAL at the first level over outer values run once a run, a set-returning function in a select list with no FROM (ProjectSet), a held set operation's ORDER BY, OFFSET and LIMIT, MATCH_RECOGNIZE's input; left: LATERAL after the first level (a dependent join: R4), a set-returning function over a table or under LIMIT/DISTINCT, TOP and WITH TIES over a set** | function in FROM, MATCH_RECOGNIZE, set operations | the catalog queries' (`pg_class`, `pg_attribute`) instructions | medium |
-| R4 (built: 6.3.Q8 R4) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
+| R4 (built: 6.3.Q8 R4, R4b) | the joins left: lookups per row under a first table that stops early, a point first table as a join's input (a chunk of one), RIGHT/FULL with no key, an `= any(array)` lookup. **Built: a join over a point (`runPointJ`, the OLTP join), a point first table in any join, lookups and ranges under a stopping first table (slices that double, `joinGrow`), LEFT/RIGHT/FULL with no key, a collation's hash key; left: LATERAL after the first level (a dependent join: a plan in 6.3.Q8 R4), an `= any(array)` lookup (7 runs)**. **R4b (6.3.Q8 R4b as built): LATERAL after the first level (CROSS and OUTER APPLY) as a join arm (`JH_APPLY`, the joins' ask), a primary key's `= any(array)` lookup (`JH_ANY`); left: a LATERAL level beside another subquery per row or at the first level with a later one, an index's `= any`, a range per row whose bounds read the row (the reason's other 6 runs)** | joins | `simple.sh`'s 3-table join tps (today the row engine's) | medium |
 | R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`, its conditions bound by prepare); UPDATE by key 1,668 instructions fewer (-1.15%), TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
 | R7 (windows built: 6.3.Q8 R7) | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait). **Built: the Window operator over a query's rows (one table or joins; sorted, DISTINCT, DISTINCT ON, TOP, WITH TIES, LIMIT/OFFSET over it), windows over the pipeline's groups; the views over the groups as operators (HAVING a Filter, the window calls a Window, the select list a Project, DISTINCT, the Sort, the Limit: 6.3.Q8 R7 as built (group views, FOR UPDATE)), FOR UPDATE's rows by the pipeline and its lock operator (`lockRows`, both engines); left: a set-returning function in the list over the groups, a window with a correlated subquery left per row (R6's Apply under the Window), DISTINCT with WITH TIES or TOP over windows** | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
