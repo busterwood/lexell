@@ -169,6 +169,7 @@ CHECKED = {
     'tns_r4': ('consts', 'QS'),
     'tns_r4b': ('consts', 'QS'),
     'tns_r5': ('consts', 'QS'),
+    'tns_r8': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
 }
