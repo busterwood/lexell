@@ -1,6 +1,6 @@
 # Lexell performance
 
-Measured on 22 November 2026 on `main`: the microbenchmarks at commit cbc38895, the JSON
+Measured on 22 November 2026 on `main`: the microbenchmarks at commit 45492503, the JSON
 and decimal sections at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
@@ -56,23 +56,23 @@ same operations and keys, not the same data structure. Both print the same check
 
 | program | Lexell | Rust | Lexell / Rust |
 |---|---:|---:|---:|
-| fib | 828 ms | 829 ms | 1.00 |
-| loop | 416 ms | 416 ms | 1.00 |
-| array | 343 ms | 349 ms | 0.98 |
-| sieve | 300 ms | 450 ms | 0.67 |
-| alloc | 263 ms | 343 ms | 0.77 |
-| strings | 200 ms | 276 ms | 0.73 |
-| lists | 183 ms | 472 ms | 0.39 |
-| trees | 132 ms | 336 ms | 0.39 |
-| tokens | 126 ms | 101 ms | 1.24 |
-| maps | 355 ms | 644 ms | 0.55 |
+| fib | 830 ms | 830 ms | 1.00 |
+| loop | 416 ms | 417 ms | 1.00 |
+| array | 345 ms | 350 ms | 0.99 |
+| sieve | 316 ms | 473 ms | 0.67 |
+| alloc | 264 ms | 345 ms | 0.76 |
+| strings | 156 ms | 279 ms | 0.56 |
+| lists | 184 ms | 458 ms | 0.40 |
+| trees | 132 ms | 340 ms | 0.39 |
+| tokens | 121 ms | 101 ms | 1.20 |
+| maps | 358 ms | 665 ms | 0.54 |
 
 A second run of the same build gave every ratio within 0.02 of these.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
 table holds them), in both languages, with the same output. The same source
-compiled through the C backend takes 105 ms, level with Rust (101 ms); over the
-whole program the native backend executes about 1.2 times the instructions of the
+compiled through the C backend takes 106 ms, about level with Rust (101 ms); over the
+whole program the native backend executes about 1.16 times the instructions of the
 C build. That gap is the native code generator's, not the program's; the native
 backend's code for the scanning loop is the cause, and the work on it is tracked in
 `lexell/design/codegen-audit.md`.
