@@ -1256,6 +1256,7 @@ class Gen:
 INT_OIDS = {20, 21, 23}
 NUM_OIDS = {1700}
 FLOAT_OIDS = {700, 701}
+BPCHAR_OID = 1042
 
 
 def col_kinds(a, b):
@@ -1270,6 +1271,8 @@ def col_kinds(a, b):
             out.append('f')
         elif s & NUM_OIDS:
             out.append('n')
+        elif s == {BPCHAR_OID}:
+            out.append('c')
         else:
             out.append(None)
     return out
@@ -1278,6 +1281,10 @@ def col_kinds(a, b):
 def norm_val(v, kind, pg):
     if v is None or kind is None:
         return v
+    if kind == 'c':
+        # a char column on both sides: values equal without their trailing blanks are one value, and which of them a
+        # DISTINCT, UNION, GROUP BY, GREATEST or LEAST shows depends on the order rows come in ('a' or 'a  ')
+        return v.rstrip(' ')
     try:
         d = Decimal(v)
     except InvalidOperation:
