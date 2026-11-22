@@ -8316,6 +8316,151 @@ Expectations changed (counters only, the same rows): `exec_subrows`,
 `exec_unnest_agg`, `tds_unnest_agg`, `tns_unnest_agg` (more runs
 piped).
 
+### 6.3.Q8 R8 as built (2026-11-22)
+
+R8 of 6.5: the give-ways. Branch `worktree-agent-a96b5f85d12ecf003` from
+main 0bd96528. Before, an operator that met a case it did not run in
+batches returned `lexdb_pipe.batErr()` at the run and the statement ran
+again in the row engine; now each operator handles its case, and with
+batches on no run of the suite gives way. `SET lexdb_batch = off` is
+untouched.
+
+**Where the give-ways came from.** A census copy whose `batErr()` calls
+name their line (a scratch patch: `batErrAt("file:line")`, the line put
+in the census's "gave way" reason) over main's suite, 298 tests: 491
+runs (442 the row engine's, 49 a write's):
+
+| site | runs | what | example |
+|---|---:|---|---|
+| exec `runPipe` (`heldFew`), `pipeGroups` | 302 + 26 | a join whose first level is under 64 held rows: given to the row engine on purpose | psql's `\d` (a catalog's rows), `with recursive r(v) as (... union select a.x from r join a on a.x = r.v + 1)`, `(values (1), (2)) v(a) join t on t.id = v.a` |
+| pipe `SortSt.finish` (`bad`), `winBody` | 56 + 5 | a DISTINCT of one output of values that is not a text; a column whose kind changes after the first chunk; a key of mixed kinds | `select distinct f.dt from f`, `select distinct sqrt(abs(e.n)) from e`, a UNION typed by its first part |
+| pipe `readRows` (a write's, a join's first table) | 45 + 4 | `fillPickIn` gave up: a column leaf whose layout is not the table's (after ALTER TABLE) holding a value stored apart (`rowsInto`'s decodeRow 2 taken as a failure) | `update u set v = null where id between 543 and 799` (exec_updrand), `delete from m where id % 17 = 0` (exec_cols) |
+| pipe `joinSetup`, `grpSetup` (a hash key) | 27 + 19 + 4 | a key of values (BT_OTHER) that is not a column | `p o join p i on o.c = i.t` (a char against a text: a cast), `i.t = o.t \|\| 'x'` |
+| pipe `hashBuild` of held rows, `Builder.add` | 3 | a held column whose values its kind does not hold | a catalog's text-typed oids (`pg_class.oid`), `(select 1 as x union all select 2.5)` |
+
+**Commits and line counts:**
+
+| commit | what | `lexdb_exec` | other |
+|---|---|---:|---|
+| main 0bd96528 | | 20,287 | `lexdb_pipe` 9,989, `lexdb_access` 3,227, `lexdb_rows` 1,919 |
+| b4fb0615 | the give-ways handled by their operators; test `exec_r8`; four tests' counters | 20,294 | `lexdb_pipe` 10,216, `lexdb_access` 3,249, `lexdb_rows` 1,927 |
+| 8fbab2e1 | tests `tds_r8` (SQL Server 2022's answers), `tns_r8` (Oracle Free's) | 20,294 | |
+
+`lexdb_exec` +7: `pipeHeldJ` (its rows are a `SubRes`'s or the working
+table's) and `runPipeJ` (runPipe's join branch moved out, so the point
+select's `runPipe` is smaller), less the `heldFew` give-way and the
+`Run.pre`/`Share.pre` plumbing that kept a given-up run's subquery
+results for the row engine (dead now).
+
+**What each operator does now.**
+
+- **Sort and Distinct** (`SortSt`): a column's kind is still the first
+  chunk's, but a later value that kind does not hold makes the column
+  values from then on (`widen`: the rows held so far converted, outputs
+  and keys, the key's value kind noted; a DISTINCT of one integer output
+  re-keyed by the outputs' encoding, `encodeSeen`). A DISTINCT of one
+  output of values that is not a text (a date, a numeric, a float) takes
+  the outputs' encoding (`dmode` 3: the row engine's `valsKeyIn`); a key
+  whose values are of mixed kinds sets `mixed`, and `finish` sorts the rows
+  by `collections.sortBy` with `skCmp` (per key ORDER BY's `sortCmp`), the
+  row engine's `sortOutRows` fallback, in the same input order. The
+  heap of a top-N compares mixed values by the same `skCmp`.
+- **Hash join keys** (`joinKey`): a key the kernels do not compile, or one
+  of values that is not a column, is compiled as a generic step (`Gen`,
+  `BT_OTHER`); `keyVecs` adds its values to the rows gathered for the
+  level, at a column after the query's (`keyCol`), so `keyAt` and the
+  probes read it as a column of values (JK_GEN, a collation's key too).
+  JK_TEXT is kept for text columns read as texts (`textVals`).
+- **Column leaves with a value stored apart** (`lexdb_rows.rowsInto`, used
+  for a column leaf whose layout's kinds are not the table's): the rows
+  before it are decoded in the batch and the row itself is read from the
+  store, as a row leaf's decodeRow 2 is (`APART` when it is the first:
+  `fillBatch`, `fillPickIn` and `rangeMany`'s take read it by its key).
+- **Held rows' kinds** (`kindsFor` -> `heldKinds`): a held level's column
+  with a value its kind does not hold (`heldFits`: a UNION's column typed
+  by its first part, a catalog's numbers in a text column) is read as
+  values (BK_VAL) for the run.
+- **A few held rows first in a join** (the `heldFew` give-way, a cost
+  choice of R2/R4b): measured, the pipeline was cheaper for every shape but
+  tiny joins by primary key (in process, instructions a statement, a
+  census copy each, 200 runs; base the row engine):
+
+  | statement | row engine | pipeline (runJ) | point path (runHeldJ) |
+  |---|---:|---:|---:|
+  | recursive CTE, `r join a on a.x = r.v + 1` (index), 28 rounds | 19.49M | 9.02M | (runJ) 9.05M |
+  | recursive CTE, `up join t on t.id = up.id + 1`, 36 rounds | 7.32M | 3.07M | 1.45M |
+  | 5 VALUES rows `join t on t.v = v.a * 7` (a hash) | 5.81M | 2.03M | (runJ) |
+  | `(select distinct v % 20 ...) d join a on a.x = d.g group by` | 8.95M | 3.15M | (groups) |
+  | 5 VALUES rows `join t on t.id = v.a` (a key) | 398.4k | 404.2k (+1.4%) | 387.2k (-2.8%) |
+  | 1 VALUES row `join t on t.id = v.a` | 286.1k | 313.8k (+9.7%) | 276.1k (-3.5%) |
+
+  So the give-way is gone, and where every later table is looked up by its
+  whole primary key (inner or LEFT; `lexdb_pipe.heldJoins`) the held rows
+  are joined one at a time by R4's point path (`runHeldJ`: `pointFirst`,
+  `pointLevel`; sorted, DISTINCT, LIMIT as `runPointJ`); other shapes take
+  `runJ`. A few held rows read row by row count no batch in EXPLAIN
+  ANALYZE (as the row engine).
+- **MERGE's few-row source** (`fewSource`, R5's cost choice): measured with
+  the same point path for the levels program (in one transaction, 1,000
+  statements): a one-row VALUES upsert 272,501 instructions (row engine)
+  against 273,986 (+0.5%), a 21-row source 1,152,739 against 1,138,385
+  (-1.2%). The one-row upsert is the common one, so fewSource is kept and
+  the variant was not committed.
+
+**Left, and why:** the other `batErr` sites stay (none ran in the suite
+or TPC-H): `bAccum`'s 2^63 overflow and the units' retries (caught inside
+the aggregate), the batch fills' "a value its column's batch does not
+hold" for a table's own rows (decodeRow 1: a value of another type than
+its column's, which writes do not make), a join condition or output the
+batches do not compile (`condNodeD`, `outNode` None: the planner's
+`opsWhy` declines those first), `rangeMany`'s room, `lexdb_setop`'s keys
+not in the outputs. Each still gives way, counted
+(`lexdb_pipe.batErrs()`, the tests' look).
+
+**Measured.** In process (`LXL_HASH_SEED=1`, 20,000 statements less 1,
+two rounds, identical; base 0bd96528 and the branch, both `-O` by the
+same compiler): point select 126,200.4 -> 125,949.4 (-251), INSERT VALUES
+90,541.7 -> 90,507.9 (-34), UPDATE by key 124,544.4 -> 124,518.5 (-26):
+`Run` lost its `pre` field and `runSubs` its test. Over the wire
+(`icount6.sh`, points.sql three times, two rounds alternated):
+instructions 179,745 / 179,690 against 178,819 / 178,491 (-0.6%), cycles
+111,331 / 109,980 against 108,003 / 105,870 (-3.0%, -3.7%), L1 i-cache
+misses 353.6 / 353.2 against 327.6 / 327.7, iTLB misses 132 / 130 against
+107 / 106, branch misses 445 / 432 against 420 / 410 (`runPipe` without
+its join branch is smaller).
+
+TPC-H (SF1, base 0bd96528 and 8fbab2e1, `-O`, alternated twice, one run
+each, `TPCH_REF` 1744ef99, `~/tpch-w/r8`; best of the two, ms): checksums
+equal on all 22 in all four runs; 9,465 against 9,365 (0.989). Over 1.5%:
+q16 +2.3% (230.1 against 235.5), its server instructions equal (`iq.sh`,
+two rounds: 2,097.2M / 2,099.6M against 2,096.9M / 2,097.6M): placement.
+R8's cases are not in TPC-H's 22 (since R6 its only row-engine run is a
+`select 1`: 6.4), so no query changed path.
+
+**Tests.** Suite 301 of 301 (new: `exec_r8`, `tds_r8`, `tns_r8`; 298 at
+main). `exec_r8` runs every statement with batches on and off (the same
+rows or error) and marks whether a run gave way (`batErrs`), took the
+held point path (`heldJoinRuns`) or the pipeline: sort 24 (dates,
+numerics with NULLs first and last, a CASE's numeric, timestamps, floats,
+DISTINCT ON, an empty input, an error in a later row, mixed kinds from a
+UNION, DISTINCT over a join and a window), keys 17 (char against text,
+`||`, upper(), a CASE, coalesce, LEFT, EXISTS, a scalar subquery per row,
+NULL keys, an error in a later row's key, a collation's key), held 27
+(VALUES, derived tables, recursive CTEs, catalogs, UNION-typed columns,
+NULLs, empty, an error in a later row, LIMIT, ORDER BY, DISTINCT), apart
+9 (SELECT, UPDATE, DELETE, RETURNING over column leaves after ALTER TABLE
+with values stored apart), merge 9 (few-row sources: the row engine's
+still). Against main 57 of the 77 statements of sort, keys, held and apart
+gave way. `tds_r8`: 25 T-SQL batches, SQL Server 2022's answers
+(`lxl-mssql`, a database of its own, dropped after). `tns_r8`: 26
+statements, Oracle Database Free's answers (`gen_oracle.py --check
+tns_r8`: 26 checked, no difference). Recursive CTEs are left out of both
+doors: lexdb's T-SQL and Oracle doors do not take a recursive WITH without
+RECURSIVE (error 208, ORA-00942), a dialect gap of its own. Expectations
+changed (counters only, the same rows): `exec_batchexpr`, `exec_batchsort`
+(more OutBatches), `exec_held` (more runs held), `exec_r3` (more pipeline
+runs).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first
@@ -8560,6 +8705,23 @@ a range per row whose bounds read the row 6 (+ 9 of a write's), LATERAL
 at the first level beside another subquery per row 12, OFFSET over joins
 6.
 
+**After R8** (6.3.Q8 R8; main 0bd96528's run of 298 tests, every `batErr`
+site naming itself, against the branch's, its three new tests' lines left
+out; batches on): "gave way at the run" 491 runs -> 0 (the row engine's
+442: a few held rows first in a join 328, a Sort's value kinds 61, a hash
+key of values 46, a held column's kinds 3, a column leaf's value stored
+apart 4; a write's 49: a column leaf's value stored apart 45, a hash key 4). The row engine's runs 14,145 ->
+13,703, the writes' rows found by it 406 -> 357; nothing else moved. Left
+(runs, statements): a correlated subquery in the outputs or ORDER BY
+6,436 (326), a 9.9 hashed probe per row 6,037 (14) + 122 (108) under an
+aggregate, an output that does not bind 551 (83), a condition that does
+not bind 173 (50) + 10, a path's key from a correlated subquery 156 + 1, a
+correlated subquery in an aggregate's key or argument 21, outputs and
+columns that differ 21, an ORDER BY position not in the list 20, the rest
+under 15 each; the writes: a correlated subquery or conditions on no
+table 221, MERGE's few-row sources 126 (`fewSource`, kept), a range per
+row 9.
+
 ### 6.5 Q8: the row engine's deletion, in slices (plan, 2026-11-21)
 
 What is left before the row engine (`runQuery`, `runLevel`, `materialize`,
@@ -8593,7 +8755,7 @@ with batches on fall by the slice's rows of 6.4 and by nothing else.
 | R5 (built: 6.3.Q8 R5) | a write's rows found by a pipeline program (UPDATE, DELETE, MERGE, ALTER TABLE's rewrite): the program's rows to the write operator (layer 7), `batchLevel`'s work then the program's. **Built: every write's program (`writeProg`: a table's first arm, its joins, a point by key as `pointProg` run by `pointRows`, its conditions bound by prepare); UPDATE by key 1,668 instructions fewer (-1.15%), TPC-B +3% to +6% tps; left: a correlated subquery per row (an Apply over a write's program), MERGE's few-row sources (`fewSource`, kept for cost), the give-ways (R8)** | writes | pgbench update and TPC-B tps; instructions per UPDATE by key A/B (today `runLevel`'s point read) | medium |
 | R6 (built: 6.3.Q8 R6) | Apply for RUN_PER_ROW: a correlated subquery left per row called from an arm (its program's run per outer row, its memo of results by outer values, MEMO_MAX); the outer query is then the pipeline's. **Built for one level's WHERE conjuncts (the joins ask the consumer, exec evaluates them as the row engine does); left: the outputs and ORDER BY (evaluated after the scan), conjuncts of two levels, a 9.9 hashed probe, a path's key; a chunk's runs batched (q20's rows by key)** | correlated per row | TPC-H q2, q17 (outer queries the row engine's today), q20; `exec_sub`, `exec_unnest*` per-row shapes | large |
 | R7 (windows built: 6.3.Q8 R7) | windows as an operator (partitions by P3's Sort, frames over chunks, `lexdb_window`'s evaluators); the views over the pipeline's groups (HAVING, the select list, DISTINCT, ORDER BY, LIMIT) as operators; FOR UPDATE's lock operator (a run again after a wait). **Built: the Window operator over a query's rows (one table or joins; sorted, DISTINCT, DISTINCT ON, TOP, WITH TIES, LIMIT/OFFSET over it), windows over the pipeline's groups; the views over the groups as operators (HAVING a Filter, the window calls a Window, the select list a Project, DISTINCT, the Sort, the Limit: 6.3.Q8 R7 as built (group views, FOR UPDATE)), FOR UPDATE's rows by the pipeline and its lock operator (`lockRows`, both engines); left: a set-returning function in the list over the groups, a window with a correlated subquery left per row (R6's Apply under the Window), DISTINCT with WITH TIES or TOP over windows** | window, over the groups, FOR UPDATE | TPC-H's 18 grouped queries (their views move); `exec_win*` | large |
-| R8 | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine | gave way | the suite's "batched" counts; no query slower | medium |
+| R8 (built: 6.3.Q8 R8) | the give-ways: every operator's own fallback (6.2.3's table: a `BK_VAL` chunk column, a numeric past its units), no `batErr` to the row engine. **Built: a Sort's column made values when a later value does not fit its kind, mixed kinds sorted as the row engine sorts them; a hash key of values compiled (Gen); a column leaf's value stored apart read within the batch; a held column read as values when its values do not fit; a few held rows first in a join the pipeline's (measured), by the point path when every later table is a lookup by key (`runHeldJ`); census "gave way" 491 -> 0; left: `batErr` sites the suite does not reach (a table's value of another type, an expression the batches do not compile), MERGE's `fewSource` (kept: +0.5% a one-row upsert)** | gave way | the suite's "batched" counts; no query slower | medium |
 | R9 | the deletion: `runQuery` and below (`runRows`, `runLevel`, `materialize`, `batchLevel`, `bLevelPlan`, `winBatch`, `fillPick`), `execSelIn`'s row branches, `addToGroup`, `sortOutRows`, `eachRowBIn`'s row path, `runSub`/`fillCur`'s per-row machinery, the levels program for the row engine (`Query.jp`, `levelsProg`), `Run`'s row-engine fields; `SET lexdb_batch` | (the census: no row-engine run with batches on, suite, TPC-H, OLTP) | the oracle in place first (below); the suite; TPC-H; OLTP | about 3,000 lines out of exec (the row engine proper: `materialize` to `runRows` 640, the subquery runs 600, `execSelIn`'s row branches 300, windows 260, `batchLevel` and its plan 300, `execSrf` 170, the row aggregates and sort 250, `eachRowBIn`'s and `outRow` 150; some of it moves into operators rather than going) |
 
 R1-R8 are independent; R1 and R2 first (small, many tests), then R5 and
