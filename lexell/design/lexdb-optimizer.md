@@ -4324,3 +4324,177 @@ rounds): -0.08 instructions a select; 5d alone (140f687f's tree) -0.14.
   / DISTINCT / windows inside.
 - 9.9's own hashed probe (a scalar used anywhere else, a grouped query's)
   still evaluates the value over no rows eagerly.
+
+## 52. The OR of index paths: PostgreSQL's BitmapOr for lexdb (2026-11-21, as built 2026-11-22)
+
+Follow-up to 47.8 ("Next"), aimed at TPC-H q19 (lexdb-benchmarks.md 1.6:
+95 ms against PostgreSQL's 45 on one core, the worst ratio, 2.1). Paused
+on 21 Nov as one WIP commit (5e2977fd, from main 757c4cee); merged onto
+main f8f4c88b and finished on 22 Nov (52.2-52.6).
+
+### 52.1 Measured first (main 757c4cee, `-O`, SF1, `~/tpch-w/q19`, warm)
+
+lexdb EXPLAIN ANALYZE (second run; the first, cold, 414 ms):
+
+```
+scan part: full scan (rows read 200000, kept 485, batches 196)
+join lineitem: index lineitem_part_supp range (estimated 61 rows) per row (lookups 485, rows read 14301, joined 121)
+aggregate
+result: 1 rows in 80.919 ms
+```
+
+PostgreSQL 18 (one core, `max_parallel_workers_per_gather=0`, the bench's
+settings), EXPLAIN ANALYZE warm: **15.1 ms** execution (the bench's 45 ms
+is psql's wall time, planning and connection included). Its plan: Bitmap
+Heap Scan on part over a `BitmapOr` of three `part_brand_container` scans
+(794 + 755 + 773 entries; each `p_brand = X AND p_container = ANY(4)`),
+1,767 heap blocks, the rest filtered to 485 rows in **1.7 ms**; then a
+Nested Loop with an Index Scan on `lineitem_part_supp` per part row (485
+loops, 0.027 ms each, **13 ms**), the OR rechecked as a filter.
+
+So lexdb's 81 ms is part's full scan under the OR (47.7's profile: 48%,
+about 39 ms against PostgreSQL's 1.7) and the 485 lookups into lineitem
+(43%, about 35 ms against PostgreSQL's 13). The BitmapOr closes the first;
+the second (14,301 lineitem rows by primary key through the secondary
+index, 2.4 us a row against PostgreSQL's 0.9) is profiled in 52.3.
+
+### 52.2 As built
+
+- **The plan** (`lexdb_plan`). `Level.ors: Option[rc []Path]`, the arms,
+  one per branch of an OR conjunct (an Option: an empty array field cost a
+  point select 44 instructions in a Level's copies and drops). `planFrom`
+  asks `orLevel` only where `choosePath` gave a full scan (the test sits in
+  the branch where an index path asks `sortable`, which a point select's
+  primary key path no longer calls), for the first table or one read once,
+  the cost planner, a SELECT (`reorder`), no RIGHT or FULL join, not an
+  outer join's inner side. `orLevel` loads the table's statistics when it
+  has none and an OR is among its conjuncts (as a join's are; not in a
+  transaction whose reads are noted), then `orPaths`: per OR conjunct on
+  the level's columns alone that cannot fail (`cannotFail`, which now takes
+  a collation's key `#ci`/`#pad`: an OR of a case-insensitive text's
+  equalities is read by its index), immutable, without a parameter, a
+  subquery or an outer value, `choosePath` per branch over the branch's
+  conjuncts and the non-OR conjuncts beside it; every branch must get a
+  forward index or primary key path of constants. Cost: per arm
+  `COST_DESCENT` per value and `COST_SORTED_ROW` per row of its estimate;
+  taken where twice the sum is under `rows * COST_SCAN`; without
+  statistics only arms of unique keys. The cheapest OR conjunct wins.
+  `pathEst` gives a scan read by its arms their estimates summed (no
+  per-level check), and takes its key's length instead of `keyCols`'
+  allocated copy (a point select's planning: -189 instructions).
+- `orRead(q, k)`: ors set, the path still a full scan, not `keeps`,
+  `stops`, locked, virtual, lateral, semi, anti or per row. EXPLAIN:
+  `scan part: any of index part_brand_container lookup for each of 4
+  values, ...; rows in key order (estimated 2400 rows)`.
+- **The reading** (`lexdb_access.orPoints`, as 52's WIP): the arms' ranges
+  read in place (`scanLeaves`, which sees the transaction's own writes and
+  notes the ranges read), their primary keys sorted and deduplicated, given
+  as primary key points; past `OR_KEYS` (256k) or an arm read whole, the
+  table whole. Every reader reads the points as it reads an IN list's on
+  the primary key, in key order with batches on and off; the level's
+  conditions keep the whole OR, so each row is checked again and a row of
+  several arms comes once.
+- **exec glue** (`levelScans`) at the five first-table / read-once sites:
+  `materialize`, `runLevel`, `pipeSrcQ` (the pipeline's first table, every
+  program kind that reads a scan: PR_POINT/PR_POINTJ read a key point and
+  never get an OR), `joinSrcsQ` (a hash's table read once), `bLevelPlan`.
+  lexdb_exec 20,154 -> 20,164 lines.
+- **The readers' points**: `lexdb_pipe.readRows` (a join's first table)
+  now reads a point list of several keys in batches by `fillPoints`, as
+  `runScan` does, not row by row (one point stays on the row path: a
+  pinned row's join); this also batches the primary key lookups of an IN
+  subquery (exec_semijoin's count of runs over batches 196 -> 300).
+- **Switch**: `lexdb_plan.setOrPaths(OR_COST | OR_NEVER | OR_ALWAYS)`;
+  `lexdb_access.setOrKeys`, `orReads` (tests). The rules planner never
+  takes it.
+
+### 52.3 The per-row lookups into lineitem (profiled)
+
+q19's 485 lookups read 14,301 lineitem rows by primary key through
+`lineitem_part_supp` (121 joined). Profiled on the branch with the OR read
+(`perf`, the native symbol map, 20 runs), three things were cheap:
+
+- `sortKeysPerm` sorted each lookup's ~30 primary keys (orderkey,
+  linenumber: 16 bytes) by comparison (`collections.sortBy`, 6.9% of q19).
+  Keys of 8 bytes or more are now sorted by their first 8 as an integer:
+  up to `SORT_FEW` (32) by insertion, more by `radixPerm` and each run of
+  one prefix by insertion (0.7% now). This is also q15's 28% fewer
+  instructions (its lineitem range read in key order sorts 16-byte keys).
+- `colsPick` made a dictionary text's whole dictionary into pooled values
+  (`dictVals`: a map lookup per entry) for one row of a leaf when the
+  dictionary has 4 entries or fewer (`l_shipinstruct`): a lookup's rows now
+  take their entries alone whenever fewer rows are picked than the
+  dictionary has entries (it was a quarter).
+- part's 2,322 points were read row by row (`fetch`, 11%): `fillPoints`.
+
+q19's server instructions 875M -> 190M (the OR read and these). What is
+left, per row of lineitem about 2.0 us against PostgreSQL's 0.9 (EXPLAIN
+ANALYZE 33.7 ms: the lookups 86%, part's points 8%):
+
+- **The second descent** (about 39%: `rt_str_cmp` 16.6%, `Node_lower`
+  7.7%, `fingerTo` 6.2%, `childIndex` 5.0%). An index entry gives the
+  primary key, and each row is found by a descent of the primary key's
+  tree (an index-organised table, as InnoDB's); PostgreSQL's index gives
+  the heap tuple's place. The 30 keys of one lookup land in 30 leaves of
+  lineitem's tree, so `getMany`'s finger does not help. Not cheap: either
+  a key search over fixed-width integer prefixes in `Node.lower` and the
+  inner nodes (the storage layer, parked with its dedup, 2026-11-15) or an
+  index entry carrying a row's leaf (a format change).
+- **The decoding** (26%: `colsPick`, `bits1`, `entryAt`, `intAt`): six
+  columns of every row, though the join's conditions keep 0.8% of them.
+  A lazy pick (the conditions' columns first, `l_extendedprice` and
+  `l_discount` only for kept rows) needs the conditions evaluated inside
+  `getManyIn`'s callback, under the store's lock, or a second visit of the
+  leaves; about a third of the decoding.
+- **Allocations** (14%: `malloc`, `rt_free`, `dup`): the lookup's batch
+  per part row, `keyView`'s slices, `bGather`'s copies.
+
+### 52.4 Tests
+
+`exec_orpath` (30 statements, each seven ways: OR_ALWAYS and OR_COST with
+batches on and off, OR_NEVER, the rules planner, a copy of the tables
+without indexes; which ones read by the arms checked): arms on two indexes,
+IN lists, overlapping arms, primary key points and ranges, a composite
+index's equality and range, `= NULL` and `IS NULL` (no index path:
+never), empty arms, a case-insensitive text key, a text primary key, ORDER
+BY, LIMIT (never), aggregates, GROUP BY, DISTINCT, a join looked up per
+row (q19's), a hash's table read once, the preserved side of a LEFT JOIN,
+a subquery's table; never: an OR in a LEFT JOIN's ON on its inner side, a
+correlated EXISTS, a branch without an index path, an IN list on a
+collated text (no index path). Also a division by zero in a later row,
+parameters of a kept plan (never), a writing block's own and deleted rows,
+FOR UPDATE (never), an UPDATE under an OR, past OR_KEYS, and EXPLAIN.
+`tds_orpath` (gen_mssql.py, SQL Server 2022: 36 batches; unique keys'
+arms without statistics, the rest after `ANALYZE`, a transaction's own
+rows, variables, error 8134) and `tns_orpath` (gen_oracle.py, Oracle
+Free, checked with `--check`: 32 answers, ORA-01476). lexdb's TNS door has
+no `ANALYZE TABLE ... COMPUTE STATISTICS` (ORA-00900) and the in-process
+test runs no automatic analyzer, so there only unique keys' arms are read
+by their keys.
+
+### 52.5 Measured (branch against main f8f4c88b, both `-O`)
+
+- **TPC-H SF1** (`~/tpch-w/q19b`, one run each, alternated twice): all 22
+  checksums equal; only q19's plan changed. q19 **86.9 -> 41.8 ms** (wall,
+  as run.sh measures it) against PostgreSQL's recorded 45 ms on one core
+  (1.6): 0.93, from 2.1. Also q15 554 -> 388 (-30%), q11 -11%, q14 -8%,
+  q8 -5% (the key sort). No query over 1.5% slower but q22 (+1.9%, 162.0
+  -> 165.0), whose server instructions are equal (1,700.67M against
+  1,700.63M: placement).
+- **Point selects** (in process, 20,000 a mode, `LXL_HASH_SEED=1`):
+  select 131,593.7 -> 131,404.7 instructions, INSERT 55,121,322.8 ->
+  55,121,322.8, UPDATE by key 55,142,556.0 -> 55,142,366.9. Over the wire
+  (`pts.sh`, 3 rounds): server CPU 635.8 against 636.0 ms (medians 636
+  both); `icount6.sh`: cycles a statement 105.9-106.8k against
+  104.3-105.6k, branch misses 431-433 against 435.
+
+### 52.6 What is left
+
+- 52.3's three: the second descent, the lazy pick, the allocations.
+- ORs with parameters (a kept plan does not recheck the arms' figures; a
+  counted fallback at run time would allow them), an OR under ORDER BY
+  the primary key with a LIMIT (`keeps`/`stops`: the points are in that
+  order, a sort-free read could stop early), DML targets (`reorder` is
+  false for them), FOR UPDATE.
+- The arms' figures are summed (rows of several arms counted in each).
+- The Oracle door's `ANALYZE TABLE ... COMPUTE STATISTICS`.

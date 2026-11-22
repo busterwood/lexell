@@ -1147,6 +1147,16 @@ fn pathScans(t: &Table, p: &Path, env: &Env): Result[[]Scan, DbErr] {
     return Ok(lexdb_access.inScans(&lexdb_catalog.relOf(t), p.index, &eqs, &vs, p.desc))
 }
 
+// The scans of level k's path (pathScans); a level read by its OR of index
+// paths (optimizer 52): its rows' primary keys, points in key order.
+fn levelScans(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, k: int, env: &Env): Result[[]Scan, DbErr] {
+    let lv = &q.levels[k]
+    if lv.ors.isNone() || !lexdb_plan.orRead(q, k) { return pathScans(&lv.t, &lv.path, env) }
+    var arms: []lexdb_access.OrArm = []
+    for p in lexdb_plan.orArms(q, k) { append(mut &arms, lexdb_access.OrArm{ix: p.index, scans: try pathScans(&lv.t, &p, env)}) }
+    return lexdb_access.orPoints(st, txn, &lexdb_catalog.relOf(&lv.t), &arms)
+}
+
 // A key's value v as the column's type (for its bounds: keyType, boundType):
 // None when it is out of the type's range (22003), as a bigint past an
 // int's: it equals no value of the column, so it matches no row rather than
@@ -1597,7 +1607,7 @@ fn materialize(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: 
             } else {
                 let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: &full, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-                let scans = try pathScans(&lv.t, &lv.path, &env)
+                let scans = try levelScans(st, txn, q, k, &env)
                 let srt = lexdb_plan.keyOrdered(q, k) && !txn.noting()     // (optimizer 47)
                 for sc in scans {
                     var cur = lexdb_access.newCursor()
@@ -2095,7 +2105,7 @@ fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Ma
                 let env2 = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &cur, seq: &sqe}
                 scans = try pathScans(&lv.t, &lv.path, &env2)
             } else {
-                scans = try pathScans(&lv.t, &lv.path, &env)
+                scans = try levelScans(st, txn, q, k, &env)
             }
         }
         // optimizer 19: the first table's index range may be run as a scan, decided by
@@ -9162,7 +9172,7 @@ fn pipeSrcQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &l
     // (its session: the time zone its scans' bounds are read in, 9.95)
     let sqe1 = seqEnv(st, txn)
     let env = Env{cols: &q.cols, row: &nullRow, aggs: &noAggs, params: params, subs: subs, cur: &noAggs, seq: &sqe1}
-    var scans = try pathScans(&lv.t, p, &env)
+    var scans = try levelScans(st, txn, q, 0, &env)
     if len(rs.after) > 0 && p.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
     var keys: []str = []
     let how = try firstSwitch(st, txn, q, &scans, rs, mut &keys)
@@ -9191,7 +9201,7 @@ fn joinSrcsQ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, pg: &
             append(mut &out, lexdb_pipe.noSrc())
             continue
         }
-        let scans = try pathScans(&lv.t, &lv.path, &env)
+        let scans = try levelScans(st, txn, q, k, &env)
         append(mut &out, try lexdb_pipe.srcAt(pg, k, &lv.t, scans, lv.path.index, lv.path.desc, lexdb_plan.ixCovers(lv, lv.path.index)))
     }
     return Ok(out)
@@ -16142,7 +16152,7 @@ fn bLevelPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &
         for i in 0..len(conds) { if !vol[i] { append(mut &kept, replace(mut &conds[i], BNode.Const(0, false))) } }
         conds = kept
     }
-    var scans = try pathScans(t, p, &env)
+    var scans = try levelScans(st, txn, q, 0, &env)
     // a batched DELETE or UPDATE's next batch (stage 8): the primary key scan goes on after the last key done
     if len(rs.after) > 0 && p.index < 0 { scans = lexdb_access.afterScans(&scans, &rs.after) }
     var rd = lexdb_access.noIxRead()

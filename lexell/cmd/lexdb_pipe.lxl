@@ -5066,8 +5066,27 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
     }
     var ranges = false
     for s in src.scans { if !s.point && !s.empty { ranges = true } }
+    if src.batch && len(src.pts) > 1 {
+        // a primary key's points (an IN list's, an OR of index paths', optimizer
+        // 52): read together in batches (fillPoints), as runScan reads them
+        // (one point: by the row path below, as a pinned row is read)
+        var cur = lexdb_access.newCursor()
+        while !cur.done {
+            match try lexdb_access.fillPoints(st, txn, &rel, &src.pts, sc.part, mut &cur, bp) {
+                Some(pk0) {
+                    var pk = pk0
+                    var b = replace(mut &pk.b, lexdb_rows.noRows())
+                    if b.n == 0 { continue }
+                    rc.batches += 1
+                    if try eachChunk(txn, mut &b, conds, pushCol, ph, rawOnErr, rc, each) { return Ok(true) }
+                }
+                None { return Err(batErr()) }
+            }
+        }
+        return Ok(false)
+    }
     if !src.batch || !ranges {
-        // row by row (points, a range's keys read, IN lists): a batch of them at a time
+        // row by row (a range's keys read, IN lists): a batch of them at a time
         var need: []bool = []
         if sc.part { for x in sc.need { append(mut &need, x) } }
         var rows: [][]Val = []
