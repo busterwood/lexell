@@ -1159,3 +1159,98 @@ index read in batches, or a join whose first table is read in key order
 early HAVING could skip making the whole first row for dropped groups
 entirely when HAVING reads only aggregates.
 
+### 4.5 `perf`: the queries furthest behind, first look (2026-11-21, paused)
+
+Branch `worktree-agent-a43af5bfaa59ebc1c` from main `757c4cee`. The
+coordinator paused this work at the plan comparison. No profile was
+taken and no fix was measured. Plans: EXPLAIN ANALYZE on lexdb `757c4cee
+-O` (the main binary, rebuilt byte-identical with an `LXL_NATIVE_MAP`
+map) and EXPLAIN (ANALYZE, BUFFERS) on PostgreSQL 18.6 on one core
+(`max_parallel_workers_per_gather=0`, run.sh's settings). Each ran after one
+warm run, under the exclusive bench lock. Files:
+`~/tpch-w/perf/logs/ex-base.txt` (lexdb) and `pgex.txt` (PostgreSQL).
+The scripts are in `~/tpch-w/perf` (`ex.sh`, `pgex.sh`, `iq.sh`,
+`prof.sh`). `iq.sh` and `prof.sh` have not been run yet.
+
+| query | lexdb plan | lexdb ms | PostgreSQL plan | PG ms |
+|---|---|---:|---|---:|
+| q6 | lineitem full scan, 6.0M read, 114k kept, aggregate | 402 | Bitmap Heap Scan on `lineitem_shipdate` (909k rows, 795k removed by the filter) + Aggregate | 283 |
+| q11 | nation; supplier by `supplier_nation` index only (396); partsupp by `partsupp_supp` per supplier (31,680); aggregate. HAVING's subquery runs the same joins once | 94 | the same joins (nested loops, index scans) twice: InitPlan 19 ms, the main HashAggregate 55-62 ms | 64 |
+| q15 | the view twice: `lineitem_shipdate` range read in key order (228k read, 226k kept), grouped by `l_suppkey`; supplier hashed against it | 579 | the view twice: Bitmap Heap Scan (226k) + HashAggregate, 165 ms and 210 ms; Merge Join to supplier | 396 |
+| q22 | customer full scan twice (150k each; 38k and 19k kept); anti join by `orders_cust_date` index only, 19,000 lookups | 147 | the same shape: two Seq Scans (30 ms and 23 ms) and a Nested Loop Anti Join, 19,000 index-only scans (25 ms) | 82 |
+| q10 | customer full scan; hash of orders by `orders_date` in key order (57k); nation hashed; lineitem by primary key range per order (57k lookups, 229k read) | 517 | orders by bitmap (57k); lineitem by `lineitem_pkey` per order; hash join to customer (seq scan, 150k); Memoize on nation | 419 |
+| q3 | customer full scan (30k kept); orders by `orders_cust_date` per customer (30k lookups, 147k rows); lineitem by primary key per order (147k lookups, 589k read) | 725 | orders by bitmap (727k); hash join to customer (30k); lineitem by `lineitem_pkey` per order (147k) | 608 |
+| q12 | lineitem full scan (6.0M read, 31k kept); orders by primary key per row (31k) | 978 | Seq Scan of lineitem (764 ms, 31k kept); orders by `orders_pkey` per row | 849 |
+
+**What the plans say.** In all seven queries lexdb already uses
+PostgreSQL's plan shape or an equivalent one. q6 is a full scan where
+PostgreSQL does a bitmap read of 15% of the table. In q3 lexdb looks up
+orders per customer where PostgreSQL reads a bitmap and builds a hash. So
+the gap is execution speed per row, not the plan:
+
+- **q6** (402 vs 283 ms). lexdb decodes and filters 6.0M rows in 5,861
+  batches, about 67 ns a row. In each batch the filter evaluates each of
+  the four conditions over the rows still kept (`aggBatches` -> `bTrue`
+  -> `bEval`). Every condition gathers a vector and then builds a new
+  index list, so it allocates and copies twice. The scan decodes every
+  needed column for every row before the first condition runs. Not
+  measured yet: how the 402 ms splits between decoding (`colsInto` ->
+  `unpack`) and the filter. Candidates:
+  1. The FOR/units bit unpacking (`lexdb_cols.unpack`, `bits1`) reads one
+     byte at a time, with a bounds check on each byte.
+  2. Decode only the first condition's column, filter, then decode the
+     other columns for the kept rows only. `colsPick` already takes a row
+     list. `lazyOf` does this today, but only for a LIKE.
+  3. Run the conditions on one column (`l_shipdate >= a and < b`,
+     `l_discount between`) as one range kernel.
+
+  Skipping leaves by date range does not help here. lineitem is stored in
+  `l_orderkey` order and the ship dates are spread over every leaf: 6.0M
+  of 6.0M rows were read, and only one leaf was skipped.
+- **q11** (94 vs 64 ms). Same plan, and both engines run the join
+  twice. Each run looks up 31,680 partsupp rows by `partsupp_supp` and
+  fetches them by primary key, supplier by supplier. That is about 1.5 us
+  a row against PostgreSQL's 0.5-0.7 us. The per-row lookup and fetch is
+  the first thing to measure. It is also q20's cost (lexdb-optimizer.md
+  51.7); q20 belongs to another agent.
+- **q15** (579 vs 396 ms). Same plan shape. Each run of the view takes
+  about 290 ms against PostgreSQL's 165-210. The likely cost is the
+  key-ordered index read (`fillSorted`: 228k primary keys collected and
+  sorted, then read by `rowsOfKeys`), where PostgreSQL's bitmap heap
+  scan reads a page at a time. Not measured. There is also a plan-side
+  win: both engines compute the view twice. Two ways to compute it once:
+  (1) materialize an identical derived query once and share it, as a CTE
+  is; (2) push `total_revenue = (select max ...)` into the view's HAVING
+  (Q5's open item). PostgreSQL does neither.
+- **q22** (147 vs 82 ms). Same plan. Both customer scans filter on
+  `substring(c_phone from 1 for 2) in (...)` through the generic per-row
+  step (`inGenOf`): `bGenVals` makes a `Val` for each row, then a binary
+  search runs `compareZ`. A kernel for `substring(col from 1 for n) IN
+  (texts)` that compares the column's first bytes would remove those
+  per-row values. The rest is the anti join's 19,000 index-only lookups
+  (25 ms in PostgreSQL).
+- **q10, q3** (517 vs 419, 725 vs 608 ms). On both engines most of the
+  time goes to the lineitem primary-key range lookups, one per order
+  (57k and 147k). lexdb reads all of an order's lines and then filters
+  (q3: 589k read for 31k kept), as PostgreSQL does. The next measurement
+  is the cost of one primary-key range lookup.
+- **q12** (978 vs 849 ms). Full scan with five conditions. Three of them
+  compare one date column against another (`VCmp`, evaluated per row
+  through `bCmpCols`). This is the same filter-kernel work as q6.
+
+**Built, not measured or committed as a fix:** a word-at-a-time bit
+unpack in `lexdb_cols` (`unpack`, `bits1`). For every value whose 8 bytes
+lie inside the page it does one 8-byte `strWord` load, then a shift and a
+mask; the byte loop stays for the last few values. It touches every scan
+and every point read of a column leaf. The codec tests (`cols_codec`,
+`page_codec`) pass with it. Before it can be kept it still needs the full
+suite, TPC-H and the point-select gate. It is a WIP commit on the branch.
+
+**Next steps, in order:**
+1. Profile q6 and q12 natively (`prof.sh`) to split decoding from
+   filtering, then measure the WIP unpack against main with `iq.sh`.
+2. Decode the other columns only after the first condition has filtered.
+3. The `substring ... IN` kernel for q22.
+4. Profile the per-row index fetch (q11) and the key-ordered read (q15).
+5. Measure the cost of one primary-key range lookup (q3, q10).
+
