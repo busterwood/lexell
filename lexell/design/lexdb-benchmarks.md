@@ -159,6 +159,45 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
 
+**Since, lexdb alone (2026-11-22, main `647ce4d5`, after Q8 R8 and the
+descents slice), against the PostgreSQL figures of the `01b0250c` run
+below (PostgreSQL not re-run):** lexdb summed **8,910 ms** (mean of two runs
+alternated with main `7ff69abe`'s 9,325, its second q15 outlier left out),
+against PostgreSQL's 14,960 on one core and **9,300 with four processes:
+lexdb on one core is now below PostgreSQL on four**. Level or ahead of one
+core on 17 of 22; geometric mean 0.64. The key searches compare 8-byte
+words of the keys before the strings, and a range read's batch is sized per
+range (lexdb-tpch-perf.md 4.7): q3 644 to 528, q8 198 to 157, q10 483 to
+449, q20 272 to 246, q4 164 to 140, q17 28 to 22. Worst against one core:
+q20 246 / 133 (1.85), q11 91 / 63 (1.44), q22 103 / 88 (1.18), q10 449 /
+402 (1.12), q15 373 / 349 (1.07). Logs: `~/tpch-w/ds/logs`.
+
+| ms | lexdb `647ce4d5` | PG one core | PG four processes |
+|---|---:|---:|---:|
+| q1 | 1,573 | 3,277 | 881 |
+| q2 | 39 | 167 | 144 |
+| q3 | 528 | 564 | 386 |
+| q4 | 140 | 194 | 111 |
+| q5 | 162 | 334 | 188 |
+| q6 | 182 | 282 | 220 |
+| q7 | 405 | 597 | 309 |
+| q8 | 157 | 236 | 162 |
+| q9 | 1,594 | 1,805 | 785 |
+| q10 | 449 | 402 | 183 |
+| q11 | 91 | 63 | 69 |
+| q12 | 438 | 873 | 264 |
+| q13 | 697 | 892 | 918 |
+| q14 | 140 | 153 | 101 |
+| q15 | 373 | 349 | 351 |
+| q16 | 227 | 261 | 103 |
+| q17 | 22 | 564 | 566 |
+| q18 | 600 | 2,844 | 3,053 |
+| q19 | 37 | 45 | 43 |
+| q20 | 246 | 133 | 137 |
+| q21 | 707 | 837 | 273 |
+| q22 | 103 | 88 | 50 |
+| all 22, summed | 8,910 | 14,960 | 9,300 |
+
 **Since, lexdb alone (2026-11-22, main `f1623851`), against the
 PostgreSQL figures of the `01b0250c` run below (PostgreSQL not re-run):**
 lexdb summed **9,481 ms** (mean of two runs alternated with main
@@ -352,6 +391,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-22 | 647ce4d5 | TPC-H derived, SF1, lexdb alone against the recorded PG figures of `01b0250c` | summed 8,910 ms (was 9,325 at `7ff69abe`) against PG one core 14,960 and PG four processes 9,300: below four processes for the first time; 17 of 22 level or ahead of one core; q3 528 (PG 564); worst q20 1.85, q11 1.44, q22 1.18 | this page, 1.6; lexdb-tpch-perf.md 4.7 |
 | 2026-11-22 | f1623851 | TPC-H derived, SF1, lexdb alone against the recorded PG figures of `01b0250c` | summed 9,481 ms (was 12,239 at `01b0250c`) against PG one core 14,960 and PG four processes 9,300; q19 41.8 ms (PG 45); worst q20 1.97, q11 1.52, q22 1.30 | this page, 1.6 |
 | 2026-11-21 | 7fec138f (branch, Q8 R7) | windows, 1M rows (row_number per partition, running sum, 10-row moving average, rank; under an aggregate and to the client), lexdb `-O` main 3aabcade vs branch, PG 18 (leader + 3 workers, `work_mem` 256MB), server on CPUs 0-3 | the pipeline's Window operator 0.77-0.91 of main's row engine, 1.03 for the partitioned row_number to the client; lexdb / PG 0.82-1.20 (time; under an aggregate: row_number per partition 0.85, running sum 1.07, moving average 1.20, rank 1.12; to the client 1.02, 1.02, 1.00, 0.82); raw: ~/Work/lexdb-bench/saved/results/2026-11-21-window-r7 | lexdb-layers.md 6.3.Q8 R7 |
 | 2026-11-20 | 01b0250c | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, one run each | after optimizer Q4-Q6: lexdb / PG one core 0.94 (geometric mean, wall; 0.85 server CPU), 11 of 22 level or ahead; summed 12.24 s against PG's 14.96 s; against PG four processes 1.47; worst q19 2.1, q20 2.1, q11 1.9, q22 1.9, q15 1.8 | this page, 1.6 |
