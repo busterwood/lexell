@@ -7917,6 +7917,152 @@ All at 7fec138f against main 3aabcade.
   chunked outputs (which the partitioned row_number to the client needs
   to beat main) are R9's or later.
 
+### 6.3.Q8 R7 as built (group views, FOR UPDATE) (2026-11-22)
+
+R7's other two parts of 6.5. Branch `worktree-agent-a259d7ddf757bb4fe` from
+main d5ccb61a. `SET lexdb_batch = off` (the row engine, the tests'
+reference) is untouched: its views over the groups (`execSelIn`'s group
+loop, `sortOutRows`) and its locking (`runLocking`'s run with `noLimit`)
+stay as they were, so no row-engine code was deleted; what goes is the
+batch path's hand-over of the pipeline's groups to that code.
+
+**Commits and line counts:**
+
+COMMITS
+
+**What it does.**
+
+- **The views over an aggregate's groups as operators** (`lexdb_plan.grpViews`,
+  called by `pipeAgg` where `physAbove` made views): `Match? (Limit?
+  (Sort? (Distinct? (Project (Window? (Filter? (Agg)))))))`. A group's row
+  is its first row (the columns `afterCols` keeps) and its calls' values
+  (`#agg i`, then under a Window its window calls' values). HAVING is a
+  Filter over the Agg (with grouping sets one condition a set, `true` where
+  a set has none); the Project holds the outputs, then the ORDER BY keys
+  that are not outputs (with grouping sets a stride of them a set, each
+  set's `Sel.gx` and `Sel.gord`); the Sort's PSort the keys, DISTINCT ON,
+  TOP, TOP PERCENT and WITH TIES (a Sort for TOP alone too); the Window
+  (R7's `PWin`) the calls over the groups. Every expression is bound over
+  the group's row (`grpX`: `bindSubsAggs`, subqueries run once as values),
+  or marked (`lexdb_bind.evalMark`) for exec, which evaluates it as the row
+  engine does (`grpEval`: `evalX`, `orderX`, R7's window hook `winEval`): a
+  correlated subquery, a sequence's, session's or volatile call, an ORDER
+  BY position not in the list (its 42P10 per row, as the row engine's).
+  EXPLAIN prints the Filter over an Agg as `having`, the rest as before.
+- **The run** (`lexdb_pipe.runGroups`, `groupsBody`, `groupOut`,
+  `groupsCut`): the groups made (`runAggAny`), each kept as its first row
+  and accumulators; a HAVING the plan fuses (`PAgg.fuse`: GROUP BY keys, no
+  grouping sets, no subquery, immutable, bound; main's `fuse`, q18's
+  subquery keeps 57 of 1.5M groups) checked as each is given, a group it
+  drops not kept. Then over the groups in order, as `execSelIn`'s loop: the
+  calls' values (`lexdb_agg.finish`), HAVING, the outputs, DISTINCT (the
+  outputs' encoding under their collations), the ORDER BY keys when sorted
+  (under the items' collations); with window calls every group's values and
+  HAVING first, then `lexdb_window.allValues`, then the outputs; no rows
+  and no GROUP BY one empty group, no rows and grouping sets one per empty
+  set. The bytes (the groups', every output row's with its keys, as the
+  row engine counts them) are held by exec before the rows are sorted (typed
+  keys, `skOfVals`; mixed kinds by `sortCmp`, as `sortOutRows`), cut by
+  DISTINCT ON, OFFSET, LIMIT, TOP, TOP PERCENT (TS1031) and WITH TIES.
+  Every group's outputs are made, past a LIMIT too: the row engine's first
+  error. An error in a fused HAVING (main raised it at once, before an
+  earlier group's failing output: the row engine's order was not kept)
+  stops the fusing: that group and the rest are kept and the error comes
+  in its turn.
+- **Correlated subqueries called above the groups only** (`viewsCorr`:
+  none in the levels, keys or calls): the aggregate is the pipeline's
+  (`aggShape`), those subqueries the caller's (`RUN_APPLY` in the scan's
+  subqueries, `scanRuns` takes them), run per group by `grpEval` with the
+  run's subqueries' values copied (`applyCtx`), not lent. Was "agg: a
+  correlated subquery left per row: not in WHERE" (21 runs).
+- **exec**: `pipeGroups` gives the Res (was: the groups into `Groups` for
+  the row engine's loop); `execSelIn`'s `batched` flag and the second
+  evaluation of a fused HAVING went.
+- **FOR UPDATE** (`lexdb_plan.lockShape`, `pipeShape`): a locking query
+  of rows (the planner refuses a lock with grouping, a window, DISTINCT,
+  a set operation and WITH TIES; not with a function in FROM, TOP,
+  MATCH_RECOGNIZE, a set-returning function in the list or a correlated
+  subquery in the outputs or ORDER BY) is planned as any other, its
+  outputs then each locked table's key (`Sel.locks`), without its LIMIT
+  and OFFSET; a locked table is a table the pipeline reads (`tableRead`,
+  `joinsOver` no longer refuse it: the planner already reads it as the row
+  engine does, no index-only read, no key order). `runLocking` runs it with
+  `noLimit` as before and `execSelIn` takes the pipeline's rows then; the
+  lock loop is the lock operator, `lexdb_pipe.lockRows` (exec gives it
+  `lockOf`), for both engines: the rows locked in order, SKIP LOCKED's not
+  counted towards the LIMIT, OFFSET's locked too, a lock waited for and the
+  query runs again (the rows may have changed). The rows are made whole
+  before any lock, as the row engine makes them: an error in a row past
+  the LIMIT is raised before a lock is taken (a lock taken as each row is
+  given, PostgreSQL's way, would hold locks the reference does not). A
+  point by key is the Fetch path (`pipeFetch`). A sorted one goes through
+  `runLocking` from `runSelTo` too (it took the sorted pipeline's sink
+  path). EXPLAIN shows a locking query's view (`physOf`), as before.
+- **Counters** for the tests: `lexdb_pipe.viewRuns()`, `lockRuns()`.
+
+**Tests.** `exec_grpview` (new; batches off, on, and through a sink):
+500 generated grouped queries (one or two keys of NULLs, duplicates,
+texts, a collation's; no GROUP BY; HAVING on calls, keys and a subquery
+run once; DISTINCT; ORDER BY outputs, positions, calls and expressions not
+in the list, NULLS FIRST; LIMIT, OFFSET, WITH TIES; one table, joins, held
+rows, an empty table), 54 fixed (errors in a later group: an output, HAVING,
+an ORDER BY key, before and past a LIMIT; none in a group HAVING drops; a
+fused HAVING failing after an earlier group's output; an ORDER BY position
+not in the list with and without groups; a sort key of mixed kinds;
+DISTINCT ON; ROLLUP, CUBE and grouping sets with HAVING, ORDER BY,
+DISTINCT, their empty sets; windows over groups; correlated subqueries in
+HAVING, an output and ORDER BY; `current_setting`; MIN/MAX by the scan's
+order; a grouped subquery's EXISTS, IN and scalar runs; MATCH_RECOGNIZE
+over groups; a set-returning function in the list: the row engine), 40 at
+max_statement_mem's edges, `nextval` once a group in order.
+`exec_lockpipe` (new): 27 locking statements of one session both ways
+(point, ranges, ORDER BY, LIMIT and OFFSET, FOR UPDATE OF one table of a
+join, a left join, FOR SHARE, NO KEY UPDATE, KEY SHARE, text and
+two-column keys, NULLs, none, subqueries in WHERE run once and correlated
+(an Apply), an error past the LIMIT, NOWAIT and SKIP LOCKED uncontended,
+the locks held after each), and two sessions: a lock waited for and the
+rows run again (a row changed, one no longer matching, one deleted), NOWAIT
+(55P03), SKIP LOCKED with LIMIT and with OFFSET, a deadlock (40P01), a row
+whose value moves in and out of the range while waited for. `tds_grpview`
+(29 batches, SQL Server 2022's answers: TOP, TOP WITH TIES, TOP PERCENT and
+1031, OFFSET ... FETCH, texts under the case-insensitive collation, ROLLUP
+and GROUPING SETS, errors 8134 and 8115) and `tns_grpview` (33 statements,
+`gen_oracle.py --check`: 0 differences, every tns_ test 0; FETCH FIRST
+ONLY and WITH TIES, ROLLUP, CUBE, GROUPING SETS, FOR UPDATE, NOWAIT, SKIP
+LOCKED, in a transaction, an error past the rows). T-SQL has no FOR
+UPDATE (its UPDLOCK and READPAST hints are read and not used); Oracle's
+FOR UPDATE WAIT n is not lexdb's (a syntax error, `tns_wait`). Expectations
+moved: `exec_fetch` (FOR UPDATE by key now fetched: 12 -> 13 of 14),
+`exec_subbatch` (its FOR UPDATE queries were there to reach the row
+engine's batch conditions; they are the pipeline's now, read in batches, no
+`subConds`; its correlated outputs keep them).
+
+Found, not fixed (not this slice): grouping sets over a text key under the
+T-SQL door's case-insensitive collation group 'Ab' and 'ab' apart (both
+engines: "a collation's GROUP BY key in grouping sets" is the row
+engine's, which groups by the exact value); SQL Server says 108 for an
+ORDER BY position not in the list, lexdb's T-SQL door 50000 (42P10 is not
+mapped; lexdb raises it per row, SQL Server when it compiles); the
+pipeline's aggregate counts a group's bytes by the columns it keeps, the
+row engine by the whole row, so max_statement_mem's edge differs for an
+aggregate over a text or numeric argument it does not keep (main too;
+`exec_grpview`'s edges avoid them).
+
+CENSUS
+
+GATES
+
+**Left, and why.**
+
+- A set-returning function in the select list over the groups: the row
+  engine's (`aggShape`; none in the suite): its rows made after the
+  outputs (`expandSrfs`), ORDER BY replaced by the outputs' values, would
+  need a ProjectSet over the groups.
+- The row engine's views over the groups and its locking stay until R9 (the
+  reference): exec shrinks by this slice's glue only.
+- A window with a correlated subquery left per row (R6's Apply under the
+  Window), DISTINCT with WITH TIES or TOP over windows: not built (part 3).
+
 ### 6.4 Q8: what the row engine still runs (the census, 2026-11-21)
 
 Measured at main 4fa2acec (Q4-Q7 merged) with the census of Q8's first

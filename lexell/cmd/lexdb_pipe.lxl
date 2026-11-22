@@ -2353,15 +2353,52 @@ fn underViews(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
         lexdb_plan.PPlan.Limit(i, stops, _, _) { if !stops { return underViews(&i) } }
         lexdb_plan.PPlan.Sort(i, _, _) { return underViews(&i) }
         lexdb_plan.PPlan.Distinct(i, _, _) { return underViews(&i) }
-        // (the operators over an aggregate's groups, Q8 R7: runGroups')
-        lexdb_plan.PPlan.Project(i, xs) { if len(xs) == 0 || lexdb_plan.onGroups(&i) { return underViews(&i) } }
+        lexdb_plan.PPlan.Project(i, xs) { if len(xs) == 0 { return underViews(&i) } }
         lexdb_plan.PPlan.Having(i) { return underViews(&i) }
         lexdb_plan.PPlan.Match(i) { return underViews(&i) }
-        lexdb_plan.PPlan.Window(i, pw) { if pw.isNone() || lexdb_plan.onGroups(&i) { return underViews(&i) } }
-        lexdb_plan.PPlan.Filter(i, _) { if lexdb_plan.onGroups(&i) { return underViews(&i) } }
+        // (window calls over the groups: the caller's, Q8 R7)
+        lexdb_plan.PPlan.Window(i, pw) { if pw.isNone() { return underViews(&i) } }
         else {}
     }
     return p
+}
+
+// An aggregate's plan's Agg (lexdb_plan.grpViews': under the operators
+// over its groups, Q8 R7), or p. (Not underViews, which a point select's
+// plan passes: a test of its Project costs it.)
+fn aggUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
+    match p {
+        lexdb_plan.PPlan.Limit(i, _, _, _) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Sort(i, _, _) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Distinct(i, _, _) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Project(i, _) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Match(i) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Window(i, _) { return aggUnder(&i) }
+        lexdb_plan.PPlan.Filter(i, _) { return aggUnder(&i) }
+        else {}
+    }
+    return p
+}
+
+// An aggregate's program (lexdb_plan.pipeAgg's plan: pg.groups); Err(p): a
+// call, key or arm the pipeline does not run.
+pub fn compileAgg(p0: lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef): Result[Prog, lexdb_plan.PPlan] {
+    var p = p0
+    var n = -1
+    match aggUnder(&p) {
+        lexdb_plan.PPlan.Agg(i, _, pa) {
+            match pa {
+                Some(a) { n = aggOps(&i, &a, cols) }
+                None {}
+            }
+        }
+        else {}
+    }
+    if n < 0 { return Err(p) }
+    let j = hasJoin(&p)
+    var how = lexdb_plan.PR_PLAIN
+    if j || heldScan(&p) { p = needsOf(p, len(cols), false, mut &how) }
+    return Ok(Prog{plan: p, ops: n, groups: true, joins: j, sorts: false, run: how})
 }
 
 // The operators of p if the pipeline runs it, else -1.
@@ -3471,7 +3508,7 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
     heldRun(src)
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
     let none: []BX = []
-    match underViews(&pg.plan) {
+    match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(i, _, pa) {
             match pa {
                 Some(a) {
@@ -7360,7 +7397,7 @@ pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, col
     joinRuns += 1
     batchRuns += 1
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
-    match underViews(&pg.plan) {
+    match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(i, _, pa) {
             match pa {
                 Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
@@ -9344,7 +9381,7 @@ fn groupsBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
     var plain = false
     var nsets = 0
     var esets: []int = []
-    match underViews(&pg.plan) {
+    match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(_, _, pa) {
             match pa {
                 Some(a) {
