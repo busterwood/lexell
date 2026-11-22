@@ -23,6 +23,7 @@ import "./lexdb_time"
 import "./lexdb_sqlcoll"
 import "./lexdb_like"
 import "./lexdb_vec"
+import "./lexdb_leafk"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1519,6 +1520,16 @@ pub type Lazy = record {
     // placeCol, stopAt), then those of rest for the rows kept (br's)
     pub bf: BPlan
     pub br: BPlan
+    // conditions run on a column leaf's bytes (lexdb_leafk), the first of
+    // the conditions in order that can be: run before anything is decoded
+    // (cRunLazy); then firstK's places for the rows they keep, the other
+    // conditions (skipK: the raw ones and these left out), restK's places
+    // for the rows kept. A leaf whose places the kernels do not read is
+    // read as first, skip and rest say.
+    pub kern: []lexdb_leafk.LeafK
+    pub firstK: []int
+    pub restK: []int
+    pub skipK: []bool
 }
 
 // A batch decoded and its rows chosen: the rows the conditions chose and
@@ -1713,10 +1724,32 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         if got1.isNone() { return Ok(-2) }
         rs = got1.unwrap()
     }
-    var qs0: []int = withCapacity(len(rs))
-    for r in rs { append(mut &qs0, r - r0) }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(rs) == n, r0, &lz.first, b, bp)) { return Ok(-1) }
-    let got = narrow(&lz.skip, b, rs)
+    // the kernels on the leaf's bytes
+    var kerned = false
+    if len(lz.kern) > 0 {
+        var cur = collections.copyOf(&rs)
+        kerned = true
+        for k in lz.kern {
+            if len(cur) == 0 { break }
+            match lexdb_leafk.rowsOf(leaf, from, &cur, r0, n, &k) {
+                Some(x) { cur = x }
+                None {
+                    kerned = false
+                    break
+                }
+            }
+        }
+        if kerned {
+            rs = cur
+            lexdb_leafk.noteRun()
+        }
+    }
+    // (after the kernels, half the run or more kept: all of it decoded, together)
+    let wide0 = kerned && 2 * len(rs) >= n
+    var qs0: []int = withCapacity(if wide0 { n } else { len(rs) })
+    if wide0 { for q in 0..n { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
+    if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(qs0) == n, r0, if kerned { &lz.firstK } else { &lz.first }, b, bp)) { return Ok(-1) }
+    let got = narrow(if kerned { &lz.skipK } else { &lz.skip }, b, rs)
     if got.isNone() { return Ok(-2) }
     var ch = got.unwrap()
     kept += len(ch)
@@ -1726,9 +1759,10 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
         ch = ok
     }
-    var qs: []int = withCapacity(len(ch))
-    for r in ch { append(mut &qs, r - r0) }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs, len(ch) == n, r0, &lz.rest, b, bp)) { return Ok(-1) }
+    let wide = kerned && 2 * len(ch) >= n
+    var qs: []int = withCapacity(if wide { n } else { len(ch) })
+    if wide { for q in 0..n { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
+    if !(try lexdb_rows.colsInto(leaf, from, &qs, len(qs) == n, r0, if kerned { &lz.restK } else { &lz.rest }, b, bp)) { return Ok(-1) }
     for r in ch { append(idx, r) }
     return Ok(n)
 }

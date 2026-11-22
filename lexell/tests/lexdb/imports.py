@@ -44,7 +44,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
-    "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_lib", "lexdb_like",
+    "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
@@ -87,10 +87,10 @@ BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", 
 # row codecs and below the catalog, the planner and the executor: what it may
 # import, and the modules below it, which may not import it.
 ACCESS = "lexdb_access"
-ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_vec"}
+ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_vec", "lexdb_leafk"}
 BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_disk", "lexdb_locks", "lexdb_memo",
                 "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect",
-                "lexdb_vec"}
+                "lexdb_vec", "lexdb_leafk"}
 
 # The value operations (lexdb_ops, design/lexdb-layers.md 4.4.1) sit below
 # the binder and the executor: values, types and the time and number
@@ -108,7 +108,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 # (and lexell's own libraries), the store names it may use, and who may
 # import it. Session state reaches it in its context (lexdb_pipe.Ctx).
 PIPE = "lexdb_pipe"
-PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like",
+PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like", "lexdb_leafk",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
                    "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf",
                    "lexdb_window"}

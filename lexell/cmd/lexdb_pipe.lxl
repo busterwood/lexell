@@ -30,6 +30,7 @@ import "./lexdb_catalog"
 import "./lexdb_bind"
 import "./lexdb_plan"
 import "./lexdb_access"
+import "./lexdb_leafk"
 import "./lexdb_store"
 import "./lexdb_census"
 import "./lexdb_window"
@@ -916,13 +917,25 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 }
                 return Ok(out)
             }
+            // a date against a date: their days, as compare orders them
+            let kd = match k {
+                Val.Date(d) { Some(d) }
+                else { None }
+            }
             for j in 0..m {
                 let r = idx[j]
                 if kn || b.cols[c].nul[r] {
                     out.nul[j] = true
                     continue
                 }
-                let x = if left { try lexdb_ops.compare(&k, &b.vals[c][r]) } else { try lexdb_ops.compare(&b.vals[c][r], &k) }
+                let dd = match kd {
+                    Some(d) { match b.vals[c][r] { Val.Date(y) { Some(if left { d.cmp(&y) } else { y.cmp(&d) }) } else { None } } }
+                    None { None }
+                }
+                let x = match dd {
+                    Some(z) { z }
+                    None { if left { try lexdb_ops.compare(&k, &b.vals[c][r]) } else { try lexdb_ops.compare(&b.vals[c][r], &k) } }
+                }
                 let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
                         else if op == 4 { x > 0 } else { x >= 0 }
                 out.v[j] = if t { 1 } else { 0 }
@@ -1345,8 +1358,213 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     bf.stopAt = 0
     for pl in 0..len(bf.placeCol) { if bf.placeCol[pl] >= 0 { bf.stopAt = pl + 1 } }
     let br = placesOnly(bp, &rest)
-    return Lazy{on: (len(first) > 0 || len(raw) > 0) && len(rest) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl, pieces: pieces, skip: skip,
-                bf: bf, br: br}
+    // the first conditions in order (the raw ones aside) that run on a
+    // column leaf's bytes, and the places the others read
+    var kern: []lexdb_leafk.LeafK = []
+    var skipK = collections.copyOf(&skip)
+    for ci in 0..len(conds) {
+        if skip[ci] { continue }
+        match leafKOf(&conds[ci], bp, t) {
+            Some(k) {
+                append(mut &kern, k)
+                skipK[ci] = true
+            }
+            None { break }
+        }
+    }
+    var usedK: []bool = array(nc, false)
+    for ci in 0..len(conds) { if !skipK[ci] { bColsOf(&conds[ci], mut &usedK) } }
+    if extra >= 0 { usedK[extra] = true }
+    var firstK: []int = []
+    var restK: []int = []
+    for pl in bp.usedP {
+        if usedK[bp.placeCol[pl]] { append(mut &firstK, pl) } else { append(mut &restK, pl) }
+    }
+    return Lazy{on: ((len(first) > 0 || len(raw) > 0) && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
+                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), firstK: firstK, restK: restK, skipK: skipK}
+}
+
+// A date place's days d against timestamp u as compare orders them (d's
+// midnight, d * DAY_US, against u): a range of days. None: an infinite u.
+fn dateVsTs(op: int, pl: int, u: int): Option[lexdb_leafk.LeafK] {
+    if u == lexdb_time.INF || u == lexdb_time.NINF { return None }
+    let dd = lexdb_time.DAY_US
+    var q = u / dd
+    if q * dd > u { q -= 1 }
+    let exact = q * dd == u
+    let lo = lexdb_leafk.MIN_W
+    let hi = lexdb_leafk.MAX_W
+    let pk = lexdb_rows.PK_DATE
+    if op == 0 { return Some(if exact { lexdb_leafk.LeafK.Range(pl, pk, -1, q, q) } else { lexdb_leafk.LeafK.Range(pl, pk, -1, 0, -1) }) }
+    if op == 1 { return Some(if exact { lexdb_leafk.LeafK.Ne(pl, pk, -1, q) } else { lexdb_leafk.LeafK.Range(pl, pk, -1, lo, hi) }) }
+    if op == 2 { return Some(lexdb_leafk.LeafK.Range(pl, pk, -1, lo, if exact { q - 1 } else { q })) }
+    if op == 3 { return Some(lexdb_leafk.LeafK.Range(pl, pk, -1, lo, q)) }
+    if op == 4 { return Some(lexdb_leafk.LeafK.Range(pl, pk, -1, q + 1, hi)) }
+    return Some(lexdb_leafk.LeafK.Range(pl, pk, -1, if exact { q } else { q + 1 }, hi))
+}
+
+// A comparison's operator with its sides swapped (= <> < <= > >= as 0 to 5).
+fn flipOp(op: int): int { return if op == 2 { 4 } else if op == 3 { 5 } else if op == 4 { 2 } else if op == 5 { 3 } else { op } }
+
+// Condition n as a kernel on a column leaf's bytes (lexdb_leafk), when it
+// is one: a column of integers, units or dates and times against a
+// constant or another such column, a column of texts against constant
+// texts (ValCmp, InVals), or an AND or OR of them. A constant NULL is not.
+fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.LeafK] {
+    let plOf = fn(c: int): int { return if len(t.slots) == 0 { c } else { t.slots[c] } }
+    match n {
+        BNode.Cmp(op, x, y) {
+            match x {
+                BNode.Col(a) {
+                    if bp.kinds[a] != BK_INT { return None }
+                    match y {
+                        BNode.Const(k, kn) { if !kn { return Some(lexdb_leafk.words(op, plOf(a), lexdb_rows.PK_INT, -1, k)) } }
+                        BNode.Col(b) { if bp.kinds[b] == BK_INT { return Some(lexdb_leafk.LeafK.Cols(op, plOf(a), plOf(b), lexdb_rows.PK_INT)) } }
+                        else {}
+                    }
+                }
+                BNode.Const(k, kn) {
+                    match y {
+                        BNode.Col(b) { if !kn && bp.kinds[b] == BK_INT { return Some(lexdb_leafk.words(flipOp(op), plOf(b), lexdb_rows.PK_INT, -1, k)) } }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            return None
+        }
+        BNode.DCmp(op, x, sa, y, sb) {
+            // a units column against a constant at a scale not above its own
+            var c = -1
+            var k = 0
+            var o = op
+            var sc = sa
+            var sk = sb
+            match x {
+                BNode.Col(a) { match y { BNode.Const(v, kn) { if !kn { c = a; k = v } } else {} } }
+                BNode.Const(v, kn) {
+                    match y {
+                        BNode.Col(b) {
+                            if !kn {
+                                c = b
+                                k = v
+                                o = flipOp(op)
+                                sc = sb
+                                sk = sa
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            if c < 0 || !lexdb_rows.isDecKind(bp.kinds[c]) || lexdb_rows.decScale(bp.kinds[c]) != sc || sk > sc { return None }
+            match k.checkedMul(lexdb_rows.pow10i(sc - sk)) {
+                Some(u) { return Some(lexdb_leafk.words(o, plOf(c), lexdb_rows.PK_NUM, sc, u)) }
+                None { return None }
+            }
+        }
+        BNode.ValCmp(op0, c, k, left, _) {
+            let op = if left { flipOp(op0) } else { op0 }
+            let pl = plOf(c)
+            // (of the column's own kind: compare's order is its words')
+            let ck = lexdb_rows.placeKind(&t.cols[c])
+            match k {
+                Val.Date(d) { if ck == lexdb_rows.PK_DATE { return Some(lexdb_leafk.words(op, pl, ck, -1, d)) } }
+                Val.Ts(u) {
+                    if ck == lexdb_rows.PK_TS { return Some(lexdb_leafk.words(op, pl, ck, -1, u)) }
+                    // a date against a timestamp (q6's date + interval): the
+                    // date's midnight against it, as a range of days
+                    if ck == lexdb_rows.PK_DATE { return dateVsTs(op, pl, u) }
+                }
+                Val.Tstz(u) { if ck == lexdb_rows.PK_TSTZ { return Some(lexdb_leafk.words(op, pl, ck, -1, u)) } }
+                Val.Time(u) { if ck == lexdb_rows.PK_TIME { return Some(lexdb_leafk.words(op, pl, ck, -1, u)) } }
+                Val.Text(x) { if ck == lexdb_rows.PK_TEXT { return Some(lexdb_leafk.LeafK.Texts(op, pl, [x.clone()])) } }
+                else {}
+            }
+            return None
+        }
+        BNode.InVals(c, vs, _, _) {
+            if lexdb_rows.placeKind(&t.cols[c]) != lexdb_rows.PK_TEXT { return None }
+            var ks: []str = []
+            for v in vs {
+                match v {
+                    Val.Text(x) { append(mut &ks, x.clone()) }
+                    else { return None }
+                }
+            }
+            return Some(lexdb_leafk.LeafK.Texts(6, plOf(c), ks))
+        }
+        BNode.InGen(g, vs, _, _, kc) {
+            // substring(col from 1 for m) IN (texts), PostgreSQL's (q22)
+            if kc != lexdb_sql.K_TEXT { return None }
+            var ks: []str = []
+            for v in vs {
+                match v {
+                    Val.Text(x) { append(mut &ks, x.clone()) }
+                    else { return None }
+                }
+            }
+            match g.cx {
+                BX.Call(fr, args) {
+                    if fr.name != "substring" || fr.dialect || len(args) != 3 { return None }
+                    let m = match args[2] {
+                        BX.Const(v) { match v { Val.Int(x) { x } else { -1 } } }
+                        else { -1 }
+                    }
+                    let one = match args[1] {
+                        BX.Const(v) { match v { Val.Int(x) { x == 1 } else { false } } }
+                        else { false }
+                    }
+                    if m < 0 || !one { return None }
+                    var p = -1
+                    var trim = false
+                    match args[0] {
+                        BX.Col(i) { p = i }
+                        BX.Call(f2, a2) {
+                            if f2.name == "#bptrim" && len(a2) == 1 {
+                                match a2[0] {
+                                    BX.Col(i) {
+                                        p = i
+                                        trim = true
+                                    }
+                                    else {}
+                                }
+                            }
+                        }
+                        else {}
+                    }
+                    if p < 0 || p >= len(g.cols) { return None }
+                    let c = g.cols[p]
+                    if lexdb_rows.placeKind(&t.cols[c]) != lexdb_rows.PK_TEXT { return None }
+                    return Some(lexdb_leafk.LeafK.Prefix(plOf(c), m, trim, ks))
+                }
+                else { return None }
+            }
+        }
+        BNode.VCmp(op, a, b, ka, kb) {
+            if ka != BK_VAL || kb != BK_VAL { return None }
+            let pk = lexdb_rows.placeKind(&t.cols[a])
+            if pk != lexdb_rows.placeKind(&t.cols[b]) { return None }
+            if pk != lexdb_rows.PK_DATE && pk != lexdb_rows.PK_TIME && pk != lexdb_rows.PK_TS && pk != lexdb_rows.PK_TSTZ { return None }
+            return Some(lexdb_leafk.LeafK.Cols(op, plOf(a), plOf(b), pk))
+        }
+        BNode.And(x, y) {
+            let a = leafKOf(&x, bp, t)
+            if a.isNone() { return None }
+            let b = leafKOf(&y, bp, t)
+            if b.isNone() { return None }
+            return Some(lexdb_leafk.LeafK.All(lexdb_leafk.merged([a.unwrap(), b.unwrap()])))
+        }
+        BNode.Or(x, y) {
+            let a = leafKOf(&x, bp, t)
+            if a.isNone() { return None }
+            let b = leafKOf(&y, bp, t)
+            if b.isNone() { return None }
+            return Some(lexdb_leafk.LeafK.Any([a.unwrap(), b.unwrap()]))
+        }
+        else { return None }
+    }
 }
 
 // bp reading places ps only, as a tagged row is read (decodeRow): its
@@ -1645,7 +1863,14 @@ fn bCmpCols(b: &Batch, ca: int, ka: int, cb: int, kb: int, r: int): Result[int, 
     if ka == BK_VAL && kb == BK_TEXT { return Ok(-(try textCmp(lexdb_rows.textAt(b, cb, r), &b.vals[ca][r]))) }
     let va = ka == BK_VAL
     let vb = kb == BK_VAL
-    if va && vb { return lexdb_ops.compare(&b.vals[ca][r], &b.vals[cb][r]) }
+    if va && vb {
+        // two dates: their days, as compare orders them
+        match b.vals[ca][r] {
+            Val.Date(x) { match b.vals[cb][r] { Val.Date(y) { return Ok(x.cmp(&y)) } else {} } }
+            else {}
+        }
+        return lexdb_ops.compare(&b.vals[ca][r], &b.vals[cb][r])
+    }
     if va { return lexdb_ops.compare(&b.vals[ca][r], &bValAt(b, cb, kb, r)) }
     if vb { return lexdb_ops.compare(&bValAt(b, ca, ka, r), &b.vals[cb][r]) }
     return lexdb_ops.compare(&bValAt(b, ca, ka, r), &bValAt(b, cb, kb, r))
@@ -3396,31 +3621,68 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     var nBatches = 0
     // (rows the run holds: one pass over them, in place of the scans)
     let held = src.held
+    // (a table's scan decoded in two steps: lazyOf)
+    let lazy = lazyOf(&bp, t, &bconds, -1)
     for sj in 0..(if held { 1 } else { len(src.scans) }) {
         var cur = lexdb_access.newCursor()
         var hpos = lexdb_held.newPos()
         var spare = lexdb_rows.noRows()            // the last batch read, used again (lexdb_rows.reuse)
         while !(if held { hpos.done } else { cur.done }) {
-            let got = if held { lexdb_held.fill(hrows, &src.ser, mut &hpos, &bp, mut &spare) } else {
-                try lexdb_access.fillLevel(st, txn, &rel, &src.rd, &src.scans[sj], sc.part, mut &cur, &bp, mut &spare)
+            var idx: []int = []
+            var bad: []DbErr = []
+            var b = lexdb_rows.noRows()
+            if held {
+                let got = lexdb_held.fill(hrows, &src.ser, mut &hpos, &bp, mut &spare)
+                if got.isNone() { return Ok(None) }
+                b = got.unwrap()
+                idx = withCapacity(b.n)
+                for r in 0..b.n { append(mut &idx, r) }
+                // WHERE: the rows chosen, narrowed condition by condition
+                for c in bconds {
+                    if len(idx) == 0 { break }
+                    let pos = try bTrue(&c, &b, &idx)
+                    var next: []int = []
+                    for j in pos { append(mut &next, idx[j]) }
+                    idx = next
+                }
+            } else {
+                // (the conditions narrow as they do above; an error is the statement's)
+                let got = try lexdb_access.fillPickIn(st, txn, &rel, &src.scans[sj], sc.part, mut &cur, &bp, &src.rd, &lazy,
+                                                      fn(skip: &[]bool, b2: &Batch, idx0: []int): Option[[]int] {
+                    var cur2 = idx0
+                    for ci in 0..len(bconds) {
+                        if len(cur2) == 0 { break }
+                        if ci < len(skip) && skip[ci] { continue }
+                        match bTrue(&bconds[ci], b2, &cur2) {
+                            Ok(pos) {
+                                var nx: []int = withCapacity(len(pos))
+                                for j in pos { append(mut &nx, cur2[j]) }
+                                cur2 = nx
+                            }
+                            Err(x) {
+                                append(mut &bad, x)
+                                return None
+                            }
+                        }
+                    }
+                    return Some(cur2)
+                }, &lexdb_access.noBar(), mut &spare)
+                if got.isNone() {
+                    if len(bad) > 0 { return Err(replace(mut &bad[0], lexdb_base.err("XX000", ""))) }
+                    return Ok(None)
+                }
+                var pk = got.unwrap()
+                b = replace(mut &pk.b, lexdb_rows.noRows())
+                idx = replace(mut &pk.idx, [])
             }
-            if got.isNone() { return Ok(None) }
-            var b = got.unwrap()
             let nr = b.n
-            if nr == 0 { continue }
+            if nr == 0 {
+                spare = b
+                continue
+            }
             try bud.tickN(nr)
             nRead += nr
             nBatches += 1
-            // WHERE: the rows chosen, narrowed condition by condition
-            var idx: []int = withCapacity(nr)
-            for r in 0..nr { append(mut &idx, r) }
-            for c in bconds {
-                if len(idx) == 0 { break }
-                let pos = try bTrue(&c, &b, &idx)
-                var next: []int = []
-                for j in pos { append(mut &next, idx[j]) }
-                idx = next
-            }
             nJoined += len(idx)
             if len(idx) == 0 {
                 spare = b
