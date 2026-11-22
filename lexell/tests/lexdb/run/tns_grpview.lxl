@@ -1,0 +1,164 @@
+// lexdb over TNS: the operators over an aggregate's groups (HAVING, the select list, DISTINCT, ORDER BY, FETCH FIRST and
+// OFFSET: Q8's R7, design/lexdb-layers.md 6.3.Q8 R7 as built (group views, FOR UPDATE)) and FOR UPDATE's lock operator
+// through the Oracle door, checked against Oracle Database Free (gen_oracle.py --check: the answers below are Oracle's):
+// GROUP BY with FETCH FIRST (ONLY, WITH TIES) and OFFSET; HAVING (a subquery run once in it); DISTINCT; ROLLUP, CUBE and
+// GROUPING SETS with HAVING; joins, a CTE; errors in a later group (ORA-01476), in HAVING, and none in a group HAVING
+// drops; correlated subqueries in an output and ORDER BY; window calls over the groups; an empty input; FOR UPDATE, NOWAIT
+// and SKIP LOCKED (one session: every row locked, none skipped), over a join, in a transaction, an error in a later row.
+// Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 21 statements
+// expect: same: G,C,S,LO = 0|428|9345|'Ab';1|429|9522|'Ab';2|429|9649|'Ab';3|429|9576|'Ab';4|429|9414|'Ab';5|428|9554|'Ab';6|428|9744|'Ab'
+// expect: same: G,S = 6|9744;2|9649;3|9576
+// expect: same: T,C = 'Ab'|924;'ab'|923
+// expect: same: G,S = 1|50430.5;2|50918.75;3|50171;4|50439
+// expect: same: C = 428;429
+// expect: same: G,C = 2|429;3|429;4|429
+// expect: same: NAME,C,M = 'five'|428|49;'four'|429|49;'one'|429|49;'three'|429|49;'two'|429|49;'zero'|428|49
+// expect: same: error 1476
+// expect: same: error 1476
+// expect: same: G,Q = 0|-3.3333;1|-5;2|-10;4|10;5|5;6|3.3333
+// expect: same: G,T,C = NULL|NULL|30;0|'Ab'|1;0|'ab'|2;0|'b2'|1;0|NULL|4;1|'Ab'|1;1|'ab'|2;1|'b0'|1;1|'b1'|1;1|NULL|5;2|'Ab'|2;2|'ab'|1;2|'b2'|1;2|'b3'|1;2|NULL|5;3|'Ab'|2;3|'ab'|1;3|'b1'|1;3|NULL|4;4|'Ab'|1;4|'ab'|2;4|'b3'|1;4|NULL|4;5|NULL|1;5|'Ab'|1;5|'ab'|1;5|'b1'|1;5|NULL|4;6|NULL|1;6|'Ab'|2;6|'b0'|1;6|NULL|4
+// expect: same: G,C,GG = 1|429|0;2|429|0;3|429|0;4|429|0;NULL|3000|1
+// expect: same: G,P,C = NULL|NULL|20;NULL|0|10;NULL|1|10;0|NULL|2;0|0|1;0|1|1;1|NULL|3;1|0|1;1|1|2;2|NULL|3;2|0|2;2|1|1;3|NULL|3;3|0|1;3|1|2;4|NULL|3;4|0|2;4|1|1;5|NULL|3;5|0|1;5|1|2;6|NULL|3;6|0|2;6|1|1
+// expect: same: C,S = 0|NULL
+// expect: same: X,C = 
+// expect: same: G,NAME,C = 0|'zero'|428;1|'one'|429;2|'two'|429;3|'three'|429;4|'four'|429;5|'five'|428;6|NULL|428
+// expect: same: G,C = 6|428;5|428;4|429;1|429;3|429;2|429;0|428
+// expect: same: T,C = NULL|230;'Ab'|924;'ab'|923;'b0'|231;'b1'|231;'b2'|230;'b3'|231
+// expect: same: G,C,R = 0|428|5;1|429|1;2|429|2;3|429|3;4|429|4;5|428|6;6|428|7
+// expect: same: M,LO = 3000|1
+// expect: same: P,C = 0|1714
+// expect: same: G,D = 0|6;1|6;2|6;3|6;4|6;5|6;6|6
+// expect: same: G,S = 3|281;0|296;1|323;2|327;4|328;5|338;6|342
+// expect: same: G,S = 4|1373;1|1363;5|1314;6|1253
+// expect: same: G,C = 
+// expect: same: G,C = 2|429;3|429;4|429
+// expect: same: ID,X = 1|37;2|24;3|11;4|48;5|35
+// expect: same: ID = 14;13;12;11;10
+// expect: same: ID = 1;2;4;5;6
+// expect: same: ID,NAME = 1|'one';2|'two';3|'three';4|'four'
+// expect: same: ID,X = 1|37;2|24;3|11 / N = 3
+// expect: same: ID = 7;8
+// expect: same: error 1476
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg values (0)\ninsert into dg values (1)\ninsert into dg values (2)\ninsert into dg values (3)\ninsert into dg values (4)\ninsert into dg values (5)\ninsert into dg values (6)\ninsert into dg values (7)\ninsert into dg values (8)\ninsert into dg values (9)\ncreate table wt (id number(10) primary key, g number(10), x number(10), t varchar2(10), n number(10,2))\ninsert into wt select n, mod(n, 7), case when mod(n, 11) = 0 then null else mod(n * 37, 50) end, case when mod(n, 13) = 0 then null when mod(n, 3) = 0 then 'Ab' when mod(n, 3) = 1 then 'ab' else 'b' || mod(n, 4) end, case when mod(n, 17) = 0 then null else mod(n * 7, 1000) / 4 end from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000\ncreate table kt (g number(10) primary key, name varchar2(10))\ninsert into kt values (0, 'zero')\ninsert into kt values (1, 'one')\ninsert into kt values (2, 'two')\ninsert into kt values (3, 'three')\ninsert into kt values (4, 'four')\ninsert into kt values (5, 'five')\ncreate table et (id number(10) primary key, x number(10))"
+
+const QS = "select g, count(*) c, sum(x) s, min(t) lo from wt group by g order by g\nselect g, sum(x) s from wt group by g order by s desc fetch first 3 rows only\nselect t, count(*) c from wt where t is not null group by t order by c desc fetch first 2 rows with ties\nselect g, sum(n) s from wt group by g having count(*) > 428 order by g\nselect distinct count(*) c from wt group by g order by c\nselect g, count(*) c from wt group by g order by g offset 2 rows fetch next 3 rows only\nselect kt.name, count(*) c, max(wt.x) m from wt join kt on kt.g = wt.g group by kt.name having max(wt.x) > 40 order by kt.name\nselect g, 10 / (g - 3) q from wt group by g order by g\nselect g, count(*) c from wt group by g having 10 / (g - 4) > 0\nselect g, trunc(10 / (g - 3), 4) q from wt group by g having g <> 3 order by g\nselect g, t, count(*) c from wt where id <= 30 group by rollup (g, t) order by g nulls first, grouping(t), t nulls first\nselect g, count(*) c, grouping(g) gg from wt group by grouping sets ((g), ()) having count(*) > 428 order by gg, g\nselect g, mod(id, 2) p, count(*) c from wt where id <= 20 group by cube (g, mod(id, 2)) order by g nulls first, p nulls first\nselect count(*) c, sum(x) s from et\nselect x, count(*) c from et group by x\nselect g, (select name from kt where kt.g = wt.g) name, count(*) c from wt group by g order by g\nselect g, count(*) c from wt group by g order by (select name from kt where kt.g = wt.g) nulls first, g\nselect t, count(*) c from wt group by t order by t nulls first\nselect g, count(*) c, rank() over (order by count(*) desc, g) r from wt group by g order by g\nselect max(id) m, min(id) lo from wt\nselect mod(g, 2) p, count(*) c from wt group by mod(g, 2) order by c desc fetch first 1 rows with ties\nselect g, count(distinct t) d from wt group by g order by d desc, g\nselect g, sum(x) s from wt where id <= 100 group by g having sum(x) > (select count(*) * 30 from kt) order by s\nwith c as (select g, x from wt where id <= 400) select g, sum(x) s from c group by g order by s desc fetch first 4 rows only\nselect g, count(*) c from wt where id < 0 group by g order by g\nselect g, count(*) c from wt group by g having count(*) > 428 order by c desc, g offset 1 rows\nselect id, x from wt where id <= 5 order by id for update\nselect id from wt where id between 10 and 14 order by id desc for update nowait\nselect id from wt where id <= 6 and x > 20 order by id for update skip locked\nselect wt.id, kt.name from wt join kt on kt.g = wt.g where wt.id <= 4 order by wt.id for update\nselect id, x from wt where id <= 3 order by id for update ;; select count(*) n from wt where id <= 3\nselect id from wt where id in (7, 8, 3001) order by id for update\nselect id, 10 / (id - 2999) q from wt order by id for update"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(58), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

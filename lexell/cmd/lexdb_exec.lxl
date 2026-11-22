@@ -8224,7 +8224,8 @@ fn runSelToIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         // sorted or DISTINCT by the pipeline (slice P3; 9.105): its rows go
         // to the sink as one OutBatch if it wants them so (it is asked once,
         // only then); else they are held, as runSel holds them
-        if !pipeSorts(sel) { return runSelIn(st, txn, sel, params, lim, sh) }
+        // (FOR UPDATE: the lock operator over the rows, runLocking's)
+        if !pipeSorts(sel) || len(sel.locks) > 0 { return runSelIn(st, txn, sel, params, lim, sh) }
         var rs = newRun(&sel.q)
         rs.limit(&lim)
         if !rs.batch || rs.noLimit { return runSelIn(st, txn, sel, params, lim, sh) }
@@ -8305,10 +8306,10 @@ fn runSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 }
 
 // A SELECT ... FOR UPDATE (9.86). Its rows are made without LIMIT and
-// OFFSET, then locked in their order, as PostgreSQL's LockRows below its
-// Limit: a row SKIP LOCKED leaves out does not count towards the LIMIT,
-// one OFFSET passes over is locked too. A lock waited for means the rows
-// may have changed: the query runs again, holding the locks it has.
+// OFFSET (by the pipeline when it runs the query: lexdb_plan.lockShape),
+// then locked in their order by the lock operator (lexdb_pipe.lockRows),
+// which applies them. A lock waited for means the rows may have changed:
+// the query runs again, holding the locks it has.
 fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits): Result[Res, DbErr] {
     while true {
         var rs = newRun(&sel.q)
@@ -8320,35 +8321,22 @@ fn runLocking(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
         let ran = execSel(st, txn, sel, params, -1, mut &rs)
         txn.quiet = quiet
         var res = try ran
-        var out: [][]Val = []
-        var passed = 0
-        var waited = false
-        for i in 0..len(res.rows) {
-            if sel.limit >= 0 && len(out) >= sel.limit { break }
-            var skip = false
-            for lk in sel.locks {
-                var b = ""
-                let lt = &sel.q.levels[lk.level].t
-                for j in 0..lk.n { lexdb_access.encKeyPart(mut &b, &lexdb_access.collKeyVal(&lt.cols[lt.pk[j]], &res.rows[i][lk.at + j])) }
-                let got = try lockOf(st, txn, &sel.q.levels[lk.level].t, &b, lk.mode, lk.wait, true)
-                if got == lexdb_locks.LOCK_SKIPPED { skip = true }
-                if got == lexdb_locks.LOCKED_AFTER_WAIT { waited = true }
-                if skip || waited { break }
+        let got = try lexdb_pipe.lockRows(mut &res.rows, len(sel.locks), sel.limit, sel.offset, sel.nOut, fn(li: int, r: &[]Val): Result[int, DbErr] {
+            let lk = &sel.locks[li]
+            let lt = &sel.q.levels[lk.level].t
+            var b = ""
+            for j in 0..lk.n { lexdb_access.encKeyPart(mut &b, &lexdb_access.collKeyVal(&lt.cols[lt.pk[j]], &r[lk.at + j])) }
+            let g = try lockOf(st, txn, lt, &b, lk.mode, lk.wait, true)
+            return Ok(if g == lexdb_locks.LOCK_SKIPPED { lexdb_pipe.LK_SKIPPED } else if g == lexdb_locks.LOCKED_AFTER_WAIT { lexdb_pipe.LK_WAITED } else { lexdb_pipe.LK_TAKEN })
+        })
+        match got {
+            Some(out) {
+                res.tag = "SELECT " + len(out).toStr()
+                res.rows = out
+                return Ok(res)
             }
-            if waited { break }
-            if skip { continue }
-            if passed < sel.offset {
-                passed += 1
-                continue
-            }
-            var r = replace(mut &res.rows[i], [])
-            while len(r) > sel.nOut { let x = pop(mut &r) }
-            append(mut &out, r)
+            None {}
         }
-        if waited { continue }
-        res.tag = "SELECT " + len(out).toStr()
-        res.rows = out
-        return Ok(res)
     }
     return Err(e("XX000", "unreachable"))
 }
@@ -8657,7 +8645,7 @@ fn pipeSelMain(sel: mut &Sel) {
         if lexdb_plan.aggShape(sel) {
             match lexdb_plan.pipeAgg(sel) {
                 Some(p) {
-                    match lexdb_pipe.compile(p, &sel.q.cols) {
+                    match lexdb_pipe.compileAgg(p, &sel.q.cols) {
                         Ok(pg) { sel.pipe = Some(pg) }
                         Err(back) { lexdb_plan.unplan(sel, back) }
                     }
@@ -8779,8 +8767,10 @@ fn pipeSelMain(sel: mut &Sel) {
     // the operators over it as physAbove makes them (EXPLAIN prints them)
     let dist = if sel.distinct { lexdb_plan.PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
     let ordered = if len(sel.order) > 0 { lexdb_plan.PPlan.Sort(dist, sel.sort, ps) } else { dist }
-    // (TOP's count: the Sort's, PSort.top)
-    let plan = if sel.limit >= 0 || sel.offset > 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) } else { ordered }
+    // (TOP's count: the Sort's, PSort.top; FOR UPDATE's LIMIT and OFFSET the
+    // lock operator's, Q8 R7)
+    let plan = if (sel.limit >= 0 || sel.offset > 0) && len(sel.locks) == 0 { lexdb_plan.PPlan.Limit(ordered, sel.limit >= 0 && !sel.sort, sel.limit, max(sel.offset, 0)) }
+               else { ordered }
     match lexdb_pipe.compileP(plan, &sel.q.cols, len(sel.q.subs) == 0 && lexdb_plan.pointRead(&sel.q.levels[0])) {
         Ok(pg) { sel.pipe = Some(pg) }
         Err(back) { lexdb_plan.unplan(sel, back) }
@@ -8847,34 +8837,21 @@ fn pipeAggs(sel: &Sel): bool {
     }
 }
 
-// Runs sel's aggregate by its pipeline plan: its groups into gs, as the
-// row engine leaves them (each group's first row and accumulators). A
-// HAVING of no volatile function or subquery is checked here first: a
-// group it drops is not kept (q18's subquery keeps 57 of 1.5M), and the
-// select checks the others again. m: the run's, its subqueries run
-// (their values lent to the plan's run). room: the bytes the groups may
-// hold (-1 no limit). The bytes they hold.
-fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: mut &Mats, params: &[]Val, rs: mut &Run,
-              gs: mut &Groups, room: int): Result[int, DbErr] {
+// Runs sel's aggregate by its pipeline plan (Q8 R7): its groups, and the
+// operators over them (HAVING, the window calls, the outputs, DISTINCT,
+// ORDER BY and LIMIT) by lexdb_pipe.groupsMake and groupsView, at most cap rows wanted;
+// what the plan marks for the caller evaluated here as the row engine's
+// execSel evaluates it (grpEval), and the bytes held as it holds them. m:
+// the run's, its subqueries run (their values lent to the plan's run, or
+// copied when the plan asks for evaluations: their results are read
+// then). room: the bytes the groups may hold (-1 no limit).
+fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: mut &Mats, params: &[]Val, cap: int, rs: mut &Run,
+              room: int): Result[Res, DbErr] {
     let q = &sel.q
     match sel.pipe {
         Some(pg) {
             let src = if pg.joins { lexdb_pipe.noSrc() } else { try pipeSrc(st, txn, sel, &pg, params, &m.subs, len(m.vrows[0]), rs) }
-            // (not without GROUP BY: there the one group stays even when
-            // HAVING drops it, as the select's empty group)
-            var fuse = false
-            match sel.having {
-                Some(h) { fuse = len(sel.groupBy) > 0 && len(sel.gsets) == 0 && lexdb_bind.immutable(&h) && !lexdb_plan.hasSubCall(&h) && len(q.subs) == 0 }
-                None {}
-            }
-            let sqe = seqEnv(st, txn)
-            let noAggs: []Val = []
-            let noSubs: []SubRes = []
-            var firsts: [][]Val = []
-            var accss: [][]Acc = []
-            var sets: []int = []
             var cnt: []lexdb_pipe.Counts = []
-            var vals: []Val = []
             var srcs: []lexdb_pipe.Src = []
             var tabs: []&Table = []
             if pg.joins {
@@ -8885,44 +8862,81 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 if srcs[0].held && !srcs[0].batch { return Err(lexdb_pipe.batErr()) }
                 for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
             }
-            // (an Apply's conjuncts, Q8 R6: as runPipe's, the subqueries' values copied)
+            // (an Apply's conjuncts, Q8 R6, and the marked: as runPipe's, the subqueries' values copied)
             let ak = lexdb_plan.applyAt(&pg.plan)
-            var cx = if ak >= 0 { applyCtx(st, txn, params, &m.subs) } else { pipeCtx(st, txn, params, mut &m.subs) }
+            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL
+            var cx = if lend { pipeCtx(st, txn, params, mut &m.subs) } else { applyCtx(st, txn, params, &m.subs) }
             var bud = rs.bud
             let h0 = rs.bud.held
             let t0 = rs.bud.ticks
+            let sqe = seqEnv(st, txn)
+            if pg.run == lexdb_plan.PR_AGG1 {
+                // (a plain aggregate's one row)
+                var held = 0
+                let one = lexdb_pipe.groupsOne(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, &m.vrows, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &held,
+                                               fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                    let noAggs: []Val = []
+                    let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+                    return applyTrue(st, tx, q, ak, &env, rs)
+                })
+                budBack(rs, &bud, h0, t0)
+                if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
+                let row = try one
+                if pg.joins { levelCounts(rs, &cnt) } else { scanCounts(rs, &cnt) }
+                try rs.bud.hold(held)
+                return Ok(setRes(sel, [row], 1))
+            }
             let mv = &m.vrows
             let msubs = &m.subs
-            let got = lexdb_pipe.runAggAny(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, mut &bud, mut &cnt,
-                                        fn(first: &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
-                if fuse {
-                    while len(vals) > 0 { let gone = pop(mut &vals) }
-                    for i in 0..len(ps) { append(mut &vals, try lexdb_agg.finish(&sel.specs[i], &ps[i])) }
-                    let henv = Env{cols: &q.cols, row: first, aggs: &vals, params: params, subs: &noSubs, cur: &noAggs, seq: &sqe}
-                    match sel.having {
-                        Some(h) { if lexdb_ops.truth(&(try eval(&h, &henv))) != Some(true) { return Ok(Unit{}) } }
-                        None {}
-                    }
-                }
-                append(mut &firsts, collections.copyOf(first))
-                append(mut &accss, replace(mut &ps, []))
-                if set >= 0 { append(mut &sets, set) }
-                return Ok(Unit{})
-            }, fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+            // (the groups, then the operators over them: two calls, each closure the run's)
+            var gm = lexdb_pipe.noGroups()
+            let made = lexdb_pipe.groupsMake(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &gm,
+                                             fn(tx: mut &lexdb_store.Txn, row: &[]Val): Result[bool, DbErr] {
+                let noAggs: []Val = []
                 let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
                 return applyTrue(st, tx, q, ak, &env, rs)
             })
+            let got = match made {
+                Ok(_) {
+                    lexdb_pipe.groupsView(txn, &pg, &q.cols, &cx, cap, &sel.specs, mut &gm,
+                                          fn(tx: mut &lexdb_store.Txn, what: int, s: int, i: int, row: &[]Val, aggs: &[]Val, outs: &[]Val): Result[Val, DbErr] {
+                        let noAggs: []Val = []
+                        let env = Env{cols: &q.cols, row: row, aggs: aggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                        return grpEval(st, tx, sel, what, s, i, outs, &env, rs)
+                    })
+                }
+                Err(x) { Err(x) }
+            }
             budBack(rs, &bud, h0, t0)
-            if ak < 0 { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
-            let n = try got
-            gs.firsts = firsts
-            gs.accs = accss
-            gs.sets = sets
+            if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
+            var go = try got
             if pg.joins { levelCounts(rs, &cnt) } else { scanCounts(rs, &cnt) }
-            return Ok(n)
+            try rs.bud.hold(go.held)
+            let rows = try lexdb_pipe.groupsCut(mut &go)
+            let n = len(rows)
+            return Ok(setRes(sel, rows, n))
         }
         None { return Err(e("XX000", "a plan the pipeline does not run")) }
     }
+}
+
+// An expression of a grouped query the pipeline's plan marks for its
+// caller (lexdb_pipe.GV_*), in env (a group's first row and values), as
+// the row engine's execSel evaluates it: of
+// grouping set s (-1 none), window call s; outs: the outputs made.
+fn grpEval(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, what: int, s: int, i: int, outs: &[]Val, env: &Env,
+           rs: mut &Run): Result[Val, DbErr] {
+    let q = &sel.q
+    if what == lexdb_pipe.GV_HAVING {
+        match if s >= 0 { &sel.gh[s] } else { &sel.having } {
+            Some(h) { return evalX(st, txn, q, &h, env, rs) }
+            None { return Ok(Val.Bool(true)) }
+        }
+    }
+    if what == lexdb_pipe.GV_OUT { return evalX(st, txn, q, if s >= 0 { &sel.gx[s][i] } else { &sel.exprs[i] }, env, rs) }
+    if what == lexdb_pipe.GV_ORD { return orderX(st, txn, q, if s >= 0 { &sel.gord[s][i] } else { &sel.order[i] }, &sel.outs, outs, env, rs) }
+    let hw = if what == lexdb_pipe.GV_WKEY { lexdb_window.H_KEY } else if what == lexdb_pipe.GV_WARG { lexdb_window.H_ARG } else { lexdb_window.H_OFF }
+    return winEval(st, txn, sel, hw, s, i, env, rs)
 }
 
 // The context a run of a pipeline plan is evaluated in: the session's, the
@@ -10502,7 +10516,7 @@ fn setPartRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, para
     }
 }
 
-// The result of a streamed set operation: the rows lexdb_setop did not give, n rows in all.
+// A SELECT's result: rows, n rows in all (a streamed set operation's: those lexdb_setop did not give).
 fn setRes(sel: &Sel, rows: [][]Val, n: int): Res {
     var outs: []OutCol = []
     for oc in sel.outs { append(mut &outs, oc.clone()) }
@@ -10543,9 +10557,10 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
 // EXPLAIN's lines for a planned Sel: its operators (physOf), then its
 // subqueries'; with counts (EXPLAIN ANALYZE), what each table did.
 fn selLines(sel: &Sel, cnt: &[]lexdb_pipe.Counts, stats: &[]SubStat): []str {
-    // the pipeline's plan, kept with the Sel; else a view of the Sel's
+    // the pipeline's plan, kept with the Sel; else a view of the Sel's (a
+    // lock's: its LIMIT the lock operator's, Q8 R7, shown as the view shows it)
     match sel.pipe {
-        Some(pg) { return planLines(sel, &pg.plan, cnt, stats) }
+        Some(pg) { if len(sel.locks) == 0 { return planLines(sel, &pg.plan, cnt, stats) } }
         None {}
     }
     let p = lexdb_plan.physOf(sel)
@@ -10571,7 +10586,11 @@ fn opLines(sel: &Sel, p: &lexdb_plan.PPlan, cnt: &[]lexdb_pipe.Counts, out: mut 
         lexdb_plan.PPlan.Scan(_, _) { for l in explainLines(&sel.q, cnt) { append(out, l) } }
         // (the joins' tables: lines of the Scan's, as levels)
         lexdb_plan.PPlan.Join(i, _) { opLines(sel, &i, cnt, out) }
-        lexdb_plan.PPlan.Filter(i, _) { opLines(sel, &i, cnt, out) }
+        lexdb_plan.PPlan.Filter(i, _) {
+            opLines(sel, &i, cnt, out)
+            // (HAVING over the groups, Q8 R7)
+            if lexdb_plan.onGroups(&i) { append(out, "having") }
+        }
         // (its conjuncts are its level's: that table's line)
         lexdb_plan.PPlan.Apply(i, _) { opLines(sel, &i, cnt, out) }
         // (its line the Result's: the sets made rows, Q8 R3, as physOf's view has none)
@@ -10744,7 +10763,8 @@ fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
 fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
              rs: mut &Run): Result[Res, DbErr] {
     if len(sel.srf) > 0 { return srfRun(st, txn, sel, params, cap, rs) }
-    if rs.batch && pipeRows(sel) && !rs.noLimit {
+    // (FOR UPDATE's run, noLimit: its plan has no LIMIT, Q8 R7)
+    if rs.batch && pipeRows(sel) && (!rs.noLimit || len(sel.locks) > 0) {
         // (a value a join's batch cannot hold, an expression it does not
         // compile: the row engine, nothing given yet)
         match pipeHeld(st, txn, sel, params, cap, rs) {
@@ -10755,7 +10775,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             Err(x) { if !lexdb_pipe.isBat(&x) { return Err(x) } }
         }
     }
-    // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && !rs.noLimit, rs.noLimit)
+    // census: lexdb_plan.censusRun(sel, rs.batch, rs.batch && pipeRows(sel) && (!rs.noLimit || len(sel.locks) > 0), rs.noLimit)
     let sqe = seqEnv(st, txn)
     // (an aggregate the pipeline runs: its conditions are its plan's, not bound per run)
     let pa = rs.batch && pipeAggs(sel)
@@ -10824,8 +10844,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         // holds the run): the rows are kept, then grouped (9.24).
         let later = q.corr && groupCorr(sel)
         var kept: [][]Val = []
-        // over batches of rows when the query allows (9.47), else row by row
-        var batched = false
+        // the pipeline's when its plan is (Q8 R7: the operators over the groups too), else row by row
         // census: if later && rs.batch && pipeAggs(sel) { lexdb_plan.censusNote(sel, "row", "agg: a correlated subquery in a key or argument (groupCorr)") }
         if !later && rs.batch && pipeAggs(sel) {
             // (a LATERAL first level over outer values: its rows, Q8 R3)
@@ -10833,11 +10852,10 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 try lat0Rows(st, txn, q, params, mut &m.subs, rs)
                 m.vrows[0] = replace(mut &m.subs[q.levels[0].src].data, [])
             }
-            match pipeGroups(st, txn, sel, mut &m, params, rs, mut &gs, if room >= 0 { room - held } else { -1 }) {
-                Ok(h) {
+            match pipeGroups(st, txn, sel, mut &m, params, cap, rs, if room >= 0 { room - held } else { -1 }) {
+                Ok(r) {
                     // census: lexdb_census.note("pipe-agg", "")
-                    held += h
-                    batched = true
+                    return Ok(r)
                 }
                 Err(x) {
                     // a value a join's batch cannot hold: the row engine
@@ -10854,7 +10872,6 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             }
         }
 
-        if !batched {
         try runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
             if sel.first >= 0 && lexdb_ops.isNull(&r[sel.first]) { return Ok(true) }
             if later {
@@ -10867,7 +10884,6 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             try addToGroup(sel, mut &gs, r, &env, mut &held, room, rs0max)
             return Ok(sel.first < 0)        // MIN/MAX in order: its first value is the answer
         }, rs)
-        }
         for r in kept {
             let env = Env{cols: &q.cols, row: &r, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
             var cur: []Val = array(len(q.subs), Val.Null)
@@ -16034,30 +16050,41 @@ fn winValues(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, rows:
     let noAggs: []Val = []
     return lexdb_window.allValues(rs.batch, rows, &sel.wins, params, fn(name: &str, sl: int): int { return lexdb_bind.colSlot(&q.cols, name, sl) },
                                   fn(what: int, wi: int, i: int, r: int): Result[Val, DbErr] {
-        let w = &sel.wins[wi]
-        if what == lexdb_window.H_OFF {
-            let noCols: []lexdb_sql.ColDef = []
-            let noSubs: []SubRes = []
-            let noSeq: Option[SeqEnv] = None
-            let env0 = Env{cols: &noCols, row: &noAggs, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
-            match if i == 0 { &w.startOff } else { &w.endOff } {
-                Some(x) { return eval(&x, &env0) }
-                None { return Ok(Val.Int(0)) }
-            }
-        }
-        let env = Env{cols: &q.cols, row: &rows[r].row, aggs: &rows[r].aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-        if what == lexdb_window.H_KEY {
-            let np = len(w.part)
-            if i < np { return evalX(st, txn, q, &w.part[i], &env, rs) }
-            return evalX(st, txn, q, &w.order[i - np], &env, rs)
-        }
-        if !w.agg { return evalX(st, txn, q, &w.args[i], &env, rs) }
-        if i < len(w.spec.args) { return eval(&w.spec.args[i], &env) }
-        match w.spec.filter {
-            Some(f) { return eval(&f, &env) }
-            None { return Ok(Val.Null) }
-        }
+        // (a frame's offset: over no row)
+        let off = what == lexdb_window.H_OFF
+        let env = Env{cols: &q.cols, row: if off { &noAggs } else { &rows[r].row }, aggs: if off { &noAggs } else { &rows[r].aggs }, params: params,
+                      subs: &m.subs, cur: &noAggs, seq: &sqe}
+        return winEval(st, txn, sel, what, wi, i, &env, rs)
     })
+}
+
+// A window call's (wi's) key, argument or frame's offset i (what: a
+// lexdb_window.H_*) for env's row, as the row engine evaluates it.
+fn winEval(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, what: int, wi: int, i: int, env: &Env, rs: mut &Run): Result[Val, DbErr] {
+    let q = &sel.q
+    let w = &sel.wins[wi]
+    if what == lexdb_window.H_OFF {
+        let noAggs: []Val = []
+        let noCols: []lexdb_sql.ColDef = []
+        let noSubs: []SubRes = []
+        let noSeq: Option[SeqEnv] = None
+        let env0 = Env{cols: &noCols, row: &noAggs, aggs: &noAggs, params: env.params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
+        match if i == 0 { &w.startOff } else { &w.endOff } {
+            Some(x) { return eval(&x, &env0) }
+            None { return Ok(Val.Int(0)) }
+        }
+    }
+    if what == lexdb_window.H_KEY {
+        let np = len(w.part)
+        if i < np { return evalX(st, txn, q, &w.part[i], env, rs) }
+        return evalX(st, txn, q, &w.order[i - np], env, rs)
+    }
+    if !w.agg { return evalX(st, txn, q, &w.args[i], env, rs) }
+    if i < len(w.spec.args) { return eval(&w.spec.args[i], env) }
+    match w.spec.filter {
+        Some(f) { return eval(&f, env) }
+        None { return Ok(Val.Null) }
+    }
 }
 
 // ---- Batches (design/lexdb.md 9.47, a prototype; the kernels are lexdb_pipe's)

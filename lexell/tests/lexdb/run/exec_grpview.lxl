@@ -1,0 +1,326 @@
+// lexdb_pipe's operators over an aggregate's groups (Q8 R7, design/lexdb-layers.md
+// 6.3.Q8 R7 as built (group views, FOR UPDATE)): HAVING (a Filter), the
+// window calls (a Window), the select list (a Project), DISTINCT, ORDER BY
+// and LIMIT over the groups the pipeline makes, lexdb_pipe.groupsView's; what
+// does not bind (a correlated subquery, a sequence's or session's call)
+// evaluated by exec as the row engine does. Each statement runs three ways:
+// SET lexdb_batch = off (the row engine: the reference), on, and on through
+// a sink; the answers (rows in order, or the error) must be the same. "on
+// the operators": the runs lexdb_pipe.viewRuns counts with batches on.
+// - generated: GROUP BY one or two keys (NULLs, duplicates, texts, a
+//   collation's), no GROUP BY, HAVING (on an aggregate, a key, a subquery
+//   run once), outputs (calls, keys, expressions over both, constants),
+//   DISTINCT, ORDER BY (outputs, positions, names, expressions and calls
+//   not in the list, DESC, NULLS FIRST, a collated text), LIMIT and
+//   OFFSET, FETCH ... WITH TIES, over one table, a join, a left join, held
+//   rows, an empty table;
+// - fixed: errors in a later group (an output, HAVING, an ORDER BY key, a
+//   call's value), before and past a LIMIT, in a group HAVING drops, HAVING
+//   failing after an output failed in an earlier group (a fused HAVING); an
+//   ORDER BY position not in the list (with and without groups); a sort
+//   key of mixed kinds; DISTINCT ON; grouping sets, ROLLUP and CUBE with
+//   HAVING, ORDER BY, DISTINCT and their empty sets; window calls over the
+//   groups; correlated subqueries in HAVING, an output and ORDER BY;
+//   nextval and current_setting in an output; MIN and MAX by the scan's
+//   order; a grouped subquery's run (EXISTS, IN, a scalar's two rows);
+//   MATCH_RECOGNIZE over groups; a set-returning function in the list (the
+//   row engine);
+// - max_statement_mem at each query's edge, the least the row engine runs
+//   it in, and a kB under it.
+// timeout: 300
+// expect: tables: INSERT 0 3000 INSERT 0 7 INSERT 0 0
+// expect: generated: 500 queries, 500 the same three ways, 500 on the operators
+// expect: fixed: 54 queries, 54 the same three ways, 53 on the operators, errors 12
+// expect: memory: 40 queries, 40 the same three ways, 40 on the operators, errors 20
+// expect: nextval: 1|7 2|8 3|9 | 1|12 2|13 3|14
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_rows"
+import "../../../cmd/lexdb_bind"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_pipe"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+// The rows as a sink takes them (one OutBatch, or row by row).
+fn viaSink(s: mut &lexdb_exec.Session, sql: &str): str {
+    let stmts = match lexdb_parse.parse(sql) {
+        Ok(x) { x }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+    var pc = lexdb_exec.newPlanCache()
+    let nt: []int = []
+    let none: []lexdb_sql.Val = []
+    var lines: []str = []
+    var starts = 0
+    let r = s.runRows(&stmts[0], &none, &nt, mut &pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]lexdb_sql.Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
+        if start {
+            starts += 1
+            return true
+        }
+        if ob.n > 0 {
+            var vals: []lexdb_sql.Val = []
+            for j in 0..ob.n {
+                lexdb_pipe.obRow(ob, j, mut &vals)
+                var vs: []str = []
+                for v in vals { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return true
+        }
+        var vs: []str = []
+        for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+        append(mut &lines, strings.join(&vs, "|"))
+        return true
+    })
+    if starts > 1 { append(mut &lines, "STARTED " + starts.toStr() + " TIMES") }
+    match r {
+        Ok(res) {
+            for row in res.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &lines, strings.join(&vs, "|"))
+            }
+            return strings.join(&lines, " ")
+        }
+        Err(e) { return "ERROR " + e.state + " " + e.msg }
+    }
+}
+
+type Tally = record { n: int; same: int; ops: int; errs: int }
+
+fn tally(): Tally { return Tally{n: 0, same: 0, ops: 0, errs: 0} }
+
+// sql the three ways; the tally counts it.
+fn three(s: mut &lexdb_exec.Session, sql: &str, t: mut &Tally) {
+    let a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let b = q(s, &"set lexdb_batch = on")
+    let v0 = lexdb_pipe.viewRuns()
+    let on = q(s, sql)
+    if lexdb_pipe.viewRuns() > v0 { t.ops += 1 }
+    let sunk = viaSink(s, sql)
+    t.n += 1
+    if strings.startsWith(&off, "ERROR") { t.errs += 1 }
+    if off == on && on == sunk {
+        t.same += 1
+        return
+    }
+    println("DIFFERENT: " + sql)
+    println("  rows:    " + off)
+    println("  batches: " + on)
+    println("  sink:    " + sunk)
+}
+
+// The least max_statement_mem (kB) the row engine runs sql in.
+fn edge(s: mut &lexdb_exec.Session, sql: &str): int {
+    let a = q(s, &"set lexdb_batch = off")
+    var lo = 1
+    var hi = 16384
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let set = q(s, &("set max_statement_mem = '" + mid.toStr() + "kB'"))
+        if strings.startsWith(&q(s, sql), "ERROR 53200") { lo = mid + 1 } else { hi = mid }
+    }
+    let b = q(s, &"set lexdb_batch = on")
+    return lo
+}
+
+fn pick(r: mut &lexdb_base.Rng, xs: &[]str): str { return xs[r.below(len(xs))].clone() }
+
+// A grouped query of the generator: its FROM, keys, outputs, HAVING,
+// DISTINCT, ORDER BY and LIMIT.
+fn gen(r: mut &lexdb_base.Rng): str {
+    let froms = [" from w", " from w", " from w where w.i > 10", " from w join k on k.g = w.g", " from w left join k on k.g = w.g + 1 where w.id < 2000",
+                 " from (select * from w where w.id % 3 = 0) w", " from w where w.t like 'b%'", " from z w"]
+    let keys = ["w.g", "w.t", "w.b", "w.i % 5", "upper(w.v)", "w.t collate \"C\"", "w.n"]
+    let calls = ["count(*)", "sum(w.i)", "avg(w.n)", "min(w.t)", "max(w.v)", "count(distinct w.i)", "sum(w.n * 2)", "string_agg(w.v, ',' order by w.id)",
+                 "max(w.i + w.id)", "count(w.t)", "bool_and(w.b)", "min(w.ts)"]
+    let from = pick(r, &froms)
+    let fromK = strings.contains(&from, "join k")
+    let nk = r.below(4)
+    var ks: []str = []
+    if nk >= 1 { append(mut &ks, pick(r, &keys)) }
+    if nk >= 2 {
+        let k2 = pick(r, &keys)
+        if k2 != ks[0] { append(mut &ks, k2) }
+    }
+    if fromK && r.below(2) == 0 { append(mut &ks, "k.name") }
+    var items: []str = []
+    for k in ks { append(mut &items, k.clone()) }
+    for c in 0..(1 + r.below(3)) { append(mut &items, pick(r, &calls)) }
+    if r.below(3) == 0 { append(mut &items, pick(r, &["count(*) * 2 + 1", "sum(w.i) / nullif(count(*), 0)", "coalesce(max(w.t), 'x')", "42", "'c'"])) }
+    if len(ks) > 0 && r.below(4) == 0 { append(mut &items, ks[0] + " is null") }
+    let distinct = r.below(6) == 0
+    var sql = "select " + (if distinct { "distinct " } else { "" }) + strings.join(&items, ", ") + from
+    if len(ks) > 0 { sql = sql + " group by " + strings.join(&ks, ", ") }
+    let h = r.below(5)
+    if h == 0 { sql = sql + " having count(*) > 40" }
+    if h == 1 { sql = sql + " having sum(w.i) is not null and min(w.id) < 2500" }
+    if h == 2 { sql = sql + " having count(*) > (select count(*) from k)" }
+    let n = len(items)
+    let tail = r.below(8)
+    if tail == 0 { sql = sql + " order by 1" }
+    if tail == 1 { sql = sql + " order by " + n.toStr() + " desc nulls last, 1 limit 4" }
+    if tail == 2 { sql = sql + " order by 1 nulls first limit 5 offset 2" }
+    if tail == 3 && !distinct { sql = sql + " order by count(*) desc, 1 nulls first" }
+    if tail == 4 { sql = sql + " limit 3" }
+    if tail == 5 && !distinct { sql = sql + " order by max(w.id) fetch first 2 rows with ties" }
+    if tail == 6 && len(ks) > 0 && !distinct { sql = sql + " order by " + ks[0] + " desc offset 1" }
+    return sql
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 4 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(73), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table w (id int primary key, g int, i int, t text, v varchar(12), n numeric(10,2), b boolean, ts timestamp, pad text)")
+        let c2 = q(mut &s, &"create table k (g int primary key, name text, wide text)")
+        let c3 = q(mut &s, &"create table z (id int primary key, g int, i int, t text, v varchar(12), n numeric(10,2), b boolean, ts timestamp, pad text)")
+        let c4 = q(mut &s, &"create sequence sq")
+        let l1 = q(mut &s, &("insert into w select x, case when x % 23 = 0 then null else x % 7 end, case when x % 11 = 0 then null else (x * 37) % 50 end, " +
+                             "case when x % 13 = 0 then null else chr(97 + x % 5) || chr(97 + x % 3) end, " +
+                             "case when x % 17 = 0 then null when x % 2 = 0 then 'V' || (x % 9)::text else 'v' || (x % 9)::text end, " +
+                             "case when x % 19 = 0 then null else ((x * 7) % 1000)::numeric / 10 end, x % 4 = 0, " +
+                             "timestamp '2024-01-01' + (x % 400) * interval '1 hour', repeat('p', x % 31) from generate_series(1, 3000) x"))
+        let l2 = q(mut &s, &"insert into k select g, 'k' || g::text, repeat('q', 200 * g) from generate_series(0, 6) g")
+        let l3 = q(mut &s, &"insert into z select * from w where false")
+        println("tables: " + l1 + " " + l2 + " " + l3)
+
+        var r = lexdb_base.rng(29)
+        var tg = tally()
+        for i in 0..500 { three(mut &s, &gen(mut &r), mut &tg) }
+        println("generated: " + tg.n.toStr() + " queries, " + tg.same.toStr() + " the same three ways, " + tg.ops.toStr() + " on the operators")
+
+        var tf = tally()
+        let fixed = [
+            // errors in a later group: an output, before and past a LIMIT; HAVING; an ORDER BY key; a call's value
+            "select w.g, count(*), 10 / (w.g - 5) from w group by w.g order by 1",
+            "select w.g, count(*), 10 / (w.g - 5) from w group by w.g order by 1 limit 2",
+            "select w.g, count(*), 10 / (w.g - 5) from w group by w.g limit 1",
+            "select w.g, count(*) from w group by w.g having 10 / (w.g - 4) > 0",
+            "select w.g, count(*) from w group by w.g order by 10 / (w.g - 3)",
+            "select w.g, sum(w.i)::int2 * 1000 from w group by w.g",
+            "select w.g, avg(w.i) from w group by w.g having avg(w.i) / (min(w.g) - 2) > 0 order by 1",
+            // an error in a group HAVING drops: none
+            "select w.g, 10 / (w.g - 5) from w group by w.g having w.g <> 5 order by 1",
+            "select w.g, count(*), 10 / (count(*) - 428) from w group by w.g having count(*) <> 428 order by 1",
+            // HAVING fails in a later group after an output failed in an earlier one (a fused HAVING)
+            "select w.g, 10 / (w.g - 1) from w group by w.g having 10 / (w.g - 6) > -100",
+            "select w.g, 10 / (w.g - 6) from w group by w.g having 10 / (w.g - 1) > -100",
+            // an ORDER BY position not in the list: with groups, and with none
+            "select w.g, count(*) from w group by w.g order by 3",
+            "select w.g, count(*) from z w group by w.g order by 3",
+            "select count(*) from w order by 2",
+            // a sort key of mixed kinds (a column typed by a UNION's first branch)
+            "select v.a, count(*) from (select 1 as a union all select 2.5 union all select i from generate_series(3, 300) i union all select i + 0.5 from generate_series(3, 300) i) v group by v.a order by v.a desc limit 5",
+            "select v.a, count(*) from (select 1 as a union all select 2.5 union all select i % 7 from generate_series(3, 300) i) v group by v.a having count(*) > 0 order by 1",
+            // DISTINCT ON over the groups
+            "select distinct on (w.b) w.b, w.g, count(*) from w group by w.b, w.g order by w.b, count(*) desc, w.g",
+            "select distinct on (w.g % 2) w.g % 2, w.g, sum(w.i) from w group by w.g order by w.g % 2, sum(w.i) desc nulls last",
+            // grouping sets, ROLLUP and CUBE: HAVING, ORDER BY, DISTINCT, the empty set
+            "select w.g, w.b, count(*) from w group by rollup (w.g, w.b) order by 1 nulls first, 2 nulls first",
+            "select w.g, w.b, count(*), grouping(w.g, w.b) from w group by cube (w.g, w.b) having count(*) > 300 order by 4, 1, 2",
+            "select distinct count(*) from w group by grouping sets ((w.g), (w.b), ()) order by 1",
+            "select w.g, sum(w.i) from w group by grouping sets ((w.g), ()) order by sum(w.i) desc nulls first limit 3",
+            "select w.g, count(*) from z w group by grouping sets ((w.g), ())",
+            "select w.g, count(*) from z w group by rollup (w.g) having count(*) > 0",
+            "select w.b, count(*) from w group by grouping sets ((w.b), ()) order by 2 offset 1",
+            // window calls over the groups
+            "select w.g, sum(w.i), rank() over (order by sum(w.i) desc nulls last) from w group by w.g order by 1",
+            "select w.g, count(*), sum(count(*)) over (order by w.g) from w group by w.g having count(*) > 420 order by 3 desc",
+            "select w.t, count(*), row_number() over (partition by w.t is null order by count(*), w.t) from w group by w.t order by 1 nulls first limit 6",
+            "select distinct count(*), rank() over (order by count(*)) from w group by w.g order by 1",
+            // correlated subqueries (the caller's): HAVING, an output, ORDER BY
+            "select w.g, count(*) from w group by w.g having count(*) > (select count(*) * 60 from k where k.g < w.g) order by 1",
+            "select w.g, (select k.name from k where k.g = w.g), count(*) from w group by w.g order by 1",
+            "select w.g, count(*) from w group by w.g order by (select k.name from k where k.g = 6 - w.g) nulls first",
+            "select w.g, sum(w.i) from w group by w.g order by (select count(*) from k where k.g < w.g) desc, 1 limit 3",
+            // sessions' calls (the caller's)
+            "select w.b, count(*), current_setting('timezone') from w group by w.b order by 1",
+            // no GROUP BY: one group, empty too; HAVING over it
+            "select count(*), sum(w.i), max(w.t) from z w",
+            "select count(*) from z w having count(*) > 0",
+            "select count(*), 1 from w having min(w.id) = 1",
+            // MIN and MAX by the scan's order
+            "select max(w.id) from w",
+            "select min(w.id) + 1 from w where w.id > 2990",
+            // a grouped subquery's run: EXISTS, IN, a scalar's (two rows: its error)
+            "select k.g from k where exists (select w.g from w where w.g = k.g group by w.g having count(*) > 420 order by 1) order by 1",
+            "select k.g from k where k.g in (select w.g from w group by w.g having count(*) < 425) order by 1",
+            "select (select count(*) from w group by w.g order by 1 limit 1) from k where k.g = 1",
+            "select (select count(*) from w group by w.g) from k where k.g = 1",
+            // LIMIT, OFFSET, WITH TIES; a text key under a collation; DESC NULLS FIRST
+            "select w.t, count(*) from w group by w.t order by count(*) desc fetch first 3 rows with ties",
+            "select w.v collate \"C\", count(*) from w group by w.v collate \"C\" order by 1 desc nulls first offset 3 limit 4",
+            "select upper(w.v), count(*) from w group by upper(w.v) order by 1 nulls first",
+            "select w.n, count(*) from w group by w.n order by 2 desc, 1 limit 2 offset 1",
+            // joins, held rows
+            "select k.name, count(*), max(w.i) from w join k on k.g = w.g group by k.name having max(w.i) > 40 order by 2 desc, 1",
+            "with c as (select w.g, w.i from w where w.id < 400) select c.g, sum(c.i) from c group by c.g order by 2",
+            "select v.a, count(*), sum(v.b) from (values (1, 10), (2, null), (1, 30), (null, 5)) v(a, b) group by v.a order by 1 nulls first",
+            // MATCH_RECOGNIZE over groups
+            "select * from (select w.g, count(*) as c from w group by w.g) x match_recognize (order by g measures first(g) as f, last(g) as l pattern (a b+) define b as c >= prev(c)) order by 1",
+            // a set-returning function in the list over the groups (the row engine)
+            "select w.g, unnest(array[count(*), min(w.id)]) from w group by w.g order by 1, 2",
+            "select generate_series(1, count(*) % 3 + 1), w.g from w group by w.g order by 2, 1",
+            // an empty table: no groups
+            "select w.g, count(*) from z w group by w.g order by 1"]
+        for x in fixed { three(mut &s, &x, mut &tf) }
+        println("fixed: " + tf.n.toStr() + " queries, " + tf.same.toStr() + " the same three ways, " + tf.ops.toStr() + " on the operators, errors " + tf.errs.toStr())
+
+        // max_statement_mem at each query's edge
+        var tm = tally()
+        // (the groups' bytes are the aggregate's, the same both ways where every
+        // text or numeric column read is kept in a group's first row)
+        let mq = ["select w.id % N, count(*) from w group by w.id % N",
+                  "select w.id % N, w.t, max(w.i) from w group by w.id % N, w.t order by 3 desc nulls last, 1, 2 nulls first",
+                  "select distinct w.id % N % 50, count(*) from w group by w.id % N",
+                  "select k.name, w.id % N, sum(w.i) from w join k on k.g = w.g group by k.name, w.id % N order by 3 desc nulls last limit 3"]
+        let ns = [100, 777, 1500, 2999, 3000]
+        for n in ns {
+            for x0 in mq {
+                let x = strings.replaceAll(&x0, " N", &(" " + n.toStr()))
+                let kb = edge(mut &s, &x)
+                for at in [kb - 1, kb] {
+                    let set = q(mut &s, &("set max_statement_mem = '" + at.toStr() + "kB'"))
+                    three(mut &s, &x, mut &tm)
+                }
+                let reset = q(mut &s, &"set max_statement_mem = 0")
+            }
+        }
+        println("memory: " + tm.n.toStr() + " queries, " + tm.same.toStr() + " the same three ways, " + tm.ops.toStr() + " on the operators, errors " + tm.errs.toStr())
+
+        // nextval in an output: once per group, in the groups' order, both ways
+        let a = q(mut &s, &"set lexdb_batch = off")
+        let n1 = q(mut &s, &"select w.g, nextval('sq') + 6 from w where w.g between 1 and 3 group by w.g order by 1")
+        let b = q(mut &s, &"set lexdb_batch = on")
+        let n2 = q(mut &s, &"select w.g, nextval('sq') + 8 from w where w.g between 1 and 3 group by w.g order by 1")
+        println("nextval: " + n1 + " | " + n2)
+        return 0
+    }).unwrap()
+}
