@@ -1495,6 +1495,53 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
             }
             return Some(lexdb_leafk.LeafK.Texts(6, plOf(c), ks))
         }
+        BNode.InGen(g, vs, _, _, kc) {
+            // substring(col from 1 for m) IN (texts), PostgreSQL's (q22)
+            if kc != lexdb_sql.K_TEXT { return None }
+            var ks: []str = []
+            for v in vs {
+                match v {
+                    Val.Text(x) { append(mut &ks, x.clone()) }
+                    else { return None }
+                }
+            }
+            match g.cx {
+                BX.Call(fr, args) {
+                    if fr.name != "substring" || fr.dialect || len(args) != 3 { return None }
+                    let m = match args[2] {
+                        BX.Const(v) { match v { Val.Int(x) { x } else { -1 } } }
+                        else { -1 }
+                    }
+                    let one = match args[1] {
+                        BX.Const(v) { match v { Val.Int(x) { x == 1 } else { false } } }
+                        else { false }
+                    }
+                    if m < 0 || !one { return None }
+                    var p = -1
+                    var trim = false
+                    match args[0] {
+                        BX.Col(i) { p = i }
+                        BX.Call(f2, a2) {
+                            if f2.name == "#bptrim" && len(a2) == 1 {
+                                match a2[0] {
+                                    BX.Col(i) {
+                                        p = i
+                                        trim = true
+                                    }
+                                    else {}
+                                }
+                            }
+                        }
+                        else {}
+                    }
+                    if p < 0 || p >= len(g.cols) { return None }
+                    let c = g.cols[p]
+                    if lexdb_rows.placeKind(&t.cols[c]) != lexdb_rows.PK_TEXT { return None }
+                    return Some(lexdb_leafk.LeafK.Prefix(plOf(c), m, trim, ks))
+                }
+                else { return None }
+            }
+        }
         BNode.VCmp(op, a, b, ka, kb) {
             if ka != BK_VAL || kb != BK_VAL { return None }
             let pk = lexdb_rows.placeKind(&t.cols[a])

@@ -17,6 +17,7 @@
 
 import "./lexdb_rows"
 import "collections"
+import "strings"
 import "./lexdb_cols"
 
 type LeafView = lexdb_rows.LeafView
@@ -34,6 +35,10 @@ pub type LeafK = closed {
     // place pl's texts compared with ks[0] by their bytes, = <> < <= > >=
     // as 0 to 5; 6: one of ks (op, pl, ks)
     Texts(int, int, []str)
+    // place pl's texts' first m characters one of ks, its trailing blanks
+    // removed first when trim (a char(n)'s): substring(x from 1 for m) IN
+    // (...) (pl, m, trim, ks; q22's)
+    Prefix(int, int, bool, []str)
     // every one holds; one at least holds
     All([]LeafK)
     Any([]LeafK)
@@ -135,6 +140,67 @@ fn textHolds(op: int, t: &str, ks: &[]str): bool {
     return holds(op, t.cmp(&ks[0]))
 }
 
+// The first m characters of t (its trailing blanks removed first: trim)
+// one of ks, as substring(t from 1 for m) (lexdb_lib.substr) gives them.
+fn prefixIn(t: &str, m: int, trim: bool, ks: &[]str): bool {
+    var e = len(t)
+    if trim { while e > 0 && t[e - 1] == ' ' { e -= 1 } }
+    var ascii = true
+    for i in 0..e {
+        if t[i] >= 128 {
+            ascii = false
+            break
+        }
+    }
+    if ascii {
+        let p = &t[0..min(m, e)]
+        for k in ks { if p == k { return true } }
+        return false
+    }
+    let rs = strings.runes(&t[0..e])
+    var out: []int = []
+    for i in 0..min(m, len(rs)) { append(mut &out, rs[i]) }
+    let p = strings.fromRunes(&out)
+    for k in ks { if p == k { return true } }
+    return false
+}
+
+// The rows of rs (as rowsOf) whose text at place pl test holds for (a
+// dictionary's entries tested once); None: pl is not a text place.
+fn textRows(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int, test: &fn(&str): bool): Option[[]int] {
+    let s = leaf.cols
+    let dir = leaf.dir
+    let n = len(rs)
+    if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+    let codec = lexdb_cols.codecOf(dir, pl)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    var out: []int = []
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            hit[j] = test(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)])
+        }
+        let codes = codesOf(leaf, from, rs, r0, cnt, pl)
+        for x in 0..n {
+            if hit[codes[x]] {
+                if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                append(mut &out, rs[x])
+            }
+        }
+        return Some(out)
+    }
+    if codec != lexdb_cols.C_TEXT { return None }
+    for x in 0..n {
+        let i = from + rs[x] - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        if test(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { append(mut &out, rs[x]) }
+    }
+    return Some(out)
+}
+
 // The rows of rs (batch rows of a run of cnt rows, leaf row from at batch
 // row r0) k holds for, in order. None: a place of the leaf is not of the
 // kind k reads.
@@ -189,37 +255,8 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             }
             return Some(out)
         }
-        LeafK.Texts(op, pl, ks) {
-            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
-            let codec = lexdb_cols.codecOf(dir, pl)
-            let nulls = lexdb_cols.hasNulls(dir, pl)
-            var out: []int = []
-            if codec == lexdb_cols.C_DICT {
-                // each entry once
-                let nd = lexdb_cols.dictSize(dir, pl)
-                var hit: []bool = array(nd, false)
-                for j in 0..nd {
-                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
-                    hit[j] = textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks)
-                }
-                let codes = codesOf(leaf, from, rs, r0, cnt, pl)
-                for x in 0..n {
-                    if hit[codes[x]] {
-                        if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
-                        append(mut &out, rs[x])
-                    }
-                }
-                return Some(out)
-            }
-            if codec != lexdb_cols.C_TEXT { return None }
-            for x in 0..n {
-                let i = from + rs[x] - r0
-                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
-                let sp = lexdb_cols.varAt(s, dir, pl, i)
-                if textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks) { append(mut &out, rs[x]) }
-            }
-            return Some(out)
-        }
+        LeafK.Texts(op, pl, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return textHolds(op, t, &ks) }) }
+        LeafK.Prefix(pl, m, trim, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return prefixIn(t, m, trim, &ks) }) }
         LeafK.All(ks) {
             var cur = collections.copyOf(rs)
             for k2 in ks {
