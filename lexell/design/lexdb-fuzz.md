@@ -14,8 +14,9 @@ of every reduced case with the last binary leaves the kinds in "Left, ranked"
 
 **After (2026-11-22, on main 236c8513).** W18 (72f60d9c) and the set
 operation's ORDER BY over chars of two lengths, V (970c0932, with the Oracle
-door's set operation chars), are fixed; E9 is planned, not built (its section).
-Tests exec_fuzzfix6, tds_fuzzfix3, tns_fuzzfix3.
+door's set operation chars), are fixed; E9 is planned (its section) and built with the other dialect
+leftovers (section "The dialect leftovers"). Tests exec_fuzzfix6, tds_fuzzfix3,
+tns_fuzzfix3; the leftovers' exec_leftovers, tds_leftovers, tns_leftovers.
 
 Commits (on 45981146): 5313647f, bf99c8a8, 97746bac, 7b177a5f (the tool);
 ba930de4 (G1-G3), 9899f603 (C1), 325e775e (E6), fd6aa85a (E7, E8), 9be8e932
@@ -551,7 +552,7 @@ agree (T-SQL's collations ignore trailing blanks). lexdb's T-SQL char(n) is a
 varchar(n) padded where it is sent (Ty prec TS_CHAR), so the fix is the TDS
 column's type of a set operation's output.
 
-### E9. An unused derived-table column is computed: the plan (not built)
+### E9. An unused derived-table column is computed: the plan (built: "The dialect leftovers" below)
 
 `select 1 from (select 1 % b0 as x from t1) d` over b0 = 0 fails 22012;
 PostgreSQL never computes x (a pulled-up subquery's unused targets are never
@@ -586,6 +587,152 @@ Not built in this round: the place where it is cheap to do lacks what it needs.
   LATERAL), each kept-whole rule above with the error still raised, a renamed
   column list, batches on and off; TPC-H (q7, q8, q9, q13, q22 have FROM
   subqueries: their unused columns, if any, are not computed after).
+
+### The dialect leftovers (2026-11-22, on main 4c643113)
+
+The wrong rows, wrong errors and small gaps the earlier slices found and wrote
+up (here, under "Left, ranked", and design/lexdb-layers.md 6.3.Q8's "Found, not
+fixed"), each checked against the product first (SQL Server 2022 in lxl-mssql,
+Oracle Free 26ai in lxl-oracle, the scratch PostgreSQL 18.6) and fixed in every
+door that has the feature. Tests: exec_leftovers (PostgreSQL's answers, batches
+off and on), tds_leftovers (SQL Server's, generated with LEXDB_MSSQL, off and
+on), tns_leftovers (gen_oracle.py --check: 28 answers, 0 differences; every
+tns_ test 0), and exec_grpview's memory edges.
+
+1. **Grouping sets over a case-insensitive text key** (T-SQL). SQL Server groups
+   'Ab', 'ab' and 'AB' as one under ROLLUP, CUBE and GROUPING SETS, as under
+   GROUP BY; lexdb's row engine keyed a grouping set's group by the exact value
+   (the pipeline gives way to it for a collation's key: "agg: a collation's
+   GROUP BY key in grouping sets"), so both engines split them. addToGroup's
+   grouping-set keys are the collation's now (lexdb_sort.collVal, as GROUP
+   BY's). The pipeline still gives way there.
+2. **An ORDER BY position not in the select list.** SQL Server: 108 "The ORDER
+   BY position number N is out of range of the number of items in the select
+   list." when the batch is compiled (an empty table too; ORDER BY 0 and -1; a
+   set operation, TOP, a subquery; the batch's earlier statements do not run;
+   TRY does not catch it); Oracle ORA-01785 (an empty table too; -1 is a
+   constant there); PostgreSQL 42P10 "ORDER BY position N is not in select list"
+   (-1 too). lexdb raised 42P10 per row (an empty table gave rows; the T-SQL
+   door's number 50000) and a set operation's "invalid UNION ORDER BY clause"
+   (the Oracle door's ORA-20000). lexdb_bind.orderPos raises it when the
+   statement is planned (planSelect, planSet): TS108 with SQL Server's text in
+   the T-SQL door (lexdb_tsql: 108 ends the batch and is not caught, as 207),
+   42P10 elsewhere (lexdb_oratext maps it to 1785). A negative position is a
+   literal for PostgreSQL and T-SQL (lexdb_parse.negPos), not Oracle.
+3. **E9, a derived table's unused output** (all three doors). Built as planned
+   above, syntactically before buildQuery (lexdb_bind.prunedSubs, behind
+   `len(s.subs) > 0` in planSelect): an output no name of the statement reads
+   is a NULL (an aggregate's item a count(*), the query still grouped). Wider
+   than the plan where the products are: a GROUP BY (not by position), a UNION
+   ALL (each side), an item of count/sum/avg/min/max (not in the Oracle door:
+   Oracle computes it; its FROM subqueries are MD_ORA); the dialect parsers'
+   operator calls (#bitint, #ora_add, ...) and a few scalar functions
+   (QUIET_FNS) are quiet. Kept: a read name (the list, WHERE, ON, ORDER BY, a
+   subquery's), *, d.*, the alias as a name, DISTINCT, ORDER BY, HAVING,
+   grouping sets, a window, a set-returning, volatile or unknown function, a
+   subquery, a CTE's use, a view. Left: a scalar subquery item PostgreSQL does
+   not compute (`select 1 from (select (select 1 / t.b0) as x from t) d`:
+   lexdb 22012), a CTE PostgreSQL inlines. The second stmtNames of a statement
+   (narrow's) is gone: narrow takes planSelect's names.
+4. **max_statement_mem's edge for an aggregate over a text or numeric argument
+   it does not keep.** The pipeline's aggregate counts a group's first row by
+   the columns it keeps (PAgg.keep: those read after grouping), the row engine
+   by the whole row, which it kept whole. The pipeline's is right (it is what a
+   group needs); the row engine keeps only those columns now (lexdb_exec.
+   firstRow over lexdb_plan.firstKeep, the pipeline's own list), NULL for the
+   others, and counts that row, so the two count the same bytes (also for the
+   one group of no GROUP BY, which the row engine did not count). Under no
+   max_statement_mem (0, TPC-H's sessions) the row is kept whole as before:
+   nothing is counted against a limit, and a correlated subquery's runs do not
+   find the kept columns again each (q17: +0.09% instructions under the
+   default limit, iq.sh; firstOf makes the list at a run's first group). exec_grpview's
+   edges take such aggregates now (`max(w.t), sum(w.n)`, `min(w.pad),
+   avg(w.n)`: 60 queries, 60 the same three ways; on main 20 of the 20 new
+   ones differ: the row engine 53200 where batches run).
+5. **Oracle: a NUMBER(6,2) through a derived table.** Oracle keeps the column's
+   precision and scale through a derived table, a set operation in one and an
+   alias (python-oracledb's description: 6, 2; lib/oracle shows 0.00); lexdb
+   gave the column no type modifier (0 shown 0). lexdb_exec.outType keeps a
+   declared numeric(p, s) (OutCol.scale's ORA_NUMBER tag), so the reading
+   query's column has it. tns_fuzzfix3's `* 1` is no longer needed (left).
+6. **Parenthesised joins** (all three doors: PostgreSQL, SQL Server and Oracle
+   take them). `FROM (a JOIN b ON ...)`, `FROM ((SELECT 1) d CROSS JOIN t)`,
+   `a JOIN (b JOIN c ON ...) ON ...`, three deep, LEFT and RIGHT inside, a join
+   after: lexdb_parse.parenTree reads the tree as a subquery of its own, as
+   nestTree does, its columns under their own names (TREE_STAR); with an alias
+   (PostgreSQL's `(a JOIN b USING (id)) AS j(x)`) a subquery of its columns
+   under the alias. 0A000 is gone.
+7. **G5 (PostgreSQL).** int::bool and CAST(int AS boolean) (0 false, else
+   true; a smallint, bigint, numeric or float 42846 "cannot cast type bigint to
+   boolean", when planned: lexdb_bind.boolCast); the Oracle door's CAST(n AS
+   BOOLEAN) of any number (Oracle 23ai's) too; num_nonnulls, num_nulls, scale,
+   min_scale, trim_scale (lexdb_lib). round(x) of an integer is round(double
+   precision), PostgreSQL's choice, and round(double precision, integer) does
+   not exist: `round(round(0), 1)` and `round(1.5::float8, 1)` are 42883
+   "function round(double precision, integer) does not exist", as scale of a
+   float (lexdb_bind.numCall). T-SQL's ROUND was #round already; Oracle's ROUND
+   is #ora_round now (lexdb_parse.oraCall), as before (ROUND(binary_double, n)
+   taken).
+8. **Re-check: T-SQL char and varchar in a set operation** (still open; fixed).
+   SQL Server: char(3) UNION ALL varchar(10) is a varchar(10), each value as its
+   side has it ('a  ', 'b'); two chars a char of the longer (padded to it);
+   varchar(max) a varchar(max). lexdb gave the first side's type (char(3): the
+   varchar's 'b' padded; a varchar first: the char's 'a' without its blanks).
+   lexdb_exec.tsqlSetTexts types the column so, and a char side's values are
+   padded to their length where the column is not a char (convRows: the
+   length in Sel.conv's CONV_PADL and CONV_PADR bits; such a set operation is
+   not streamed). A char beside a text of no SQL Server type (a literal: SQL
+   Server's varchar(4)) is lexdb's nvarchar, its values padded.
+
+Not done: none of the eight. Left as found: a T-SQL literal's type in a set
+operation (lexdb's nvarchar(8000), SQL Server's varchar(n)); SUM of an int is a
+bigint in the T-SQL door (SQL Server's int); a cast's column is named by its
+type's long name (PostgreSQL: `1::bool` is "bool", lexdb "boolean").
+
+Expectations moved: exec_with (the parenthesised join's 0A000 now its row),
+exec_grpview ("fixed": the three ORDER BY positions fail when planned, so 50
+of 54 run on the operators, not 53, and the empty table's errors too: 13; the
+memory edges 40 -> 60 queries), exec_r3 (lateral: pipeline runs 552 -> 554, a
+LATERAL's unused output no longer computed per row).
+
+Gates (against main 4c643113, both built the same way):
+- Suite: 305 tests (302 + the three new), all pass; gen_oracle.py --check: every
+  tns_ test 0 new differences.
+- In process (the coordinator's pt2.lxl, LXL_HASH_SEED=1, (mode - setup) /
+  20,000, rounds alternated), at d77fd24f and at 8af4a4ad: point select
+  127,986.63 -> 124,264.56, 127,986.64 -> 124,264.64, and twice 127,986.64
+  -> 124,264.64 (-3,722: narrow no longer walks the statement a second
+  time); INSERT -0.04, -0.10, +0.02, -0.01; UPDATE by key 55,138,810.96 ->
+  811.05, 811.06 -> 811.09, 811.19 -> 811.24, 811.22 -> 811.27 (+0.09,
+  +0.02, +0.05, +0.06: a cost per statement shows as a multiple of 1.0
+  here, 20,000 statements; this is one run's ~1,000 instructions, none of
+  the changed code on its path; main's own rounds move by 0.03 to 0.10).
+  The branch's new planSelect test is `len(s.subs) > 0`.
+- Wire (icount6.sh, points.sql x 3, base and branch alternated; at
+  d77fd24f four rounds, at 8af4a4ad two): instructions 175,562 -> 173,436,
+  175,505 -> 174,131, 175,575 -> 173,450, 175,451 -> 173,456; 175,465 ->
+  173,411, 175,530 -> 173,456 (-1.2%); cycles 95,974 -> 98,535, 97,137 ->
+  106,977, 103,361 -> 97,391, 100,442 -> 99,899 (a loaded machine, load
+  average near 3); 95,849 -> 94,888, 95,736 -> 94,663 (-1.0%, quiet); L1
+  i-cache misses 326 -> 334, 325 -> 333 (the quiet rounds; 333 -> 315, 368
+  -> 338, 354 -> 336, 306 -> 368 before).
+- TPC-H SF1 (~/tpch-w/lo, lexdb only, base and branch alternated; logs kept,
+  the data copy deleted): 22 checksums equal in every run. At d77fd24f two
+  rounds, best of two: 8,855 ms against 8,886 (1.004; base round 1 ran right
+  after its load: q6 798 ms, q7 2,549); over 2%: q15 +4.9% (362.2 against
+  380.0; base's second 374.7), q7 +3.1%, q19, q17, q18 and q21 +2.0 to 2.6%.
+  Their instructions (iq.sh, two runs each, default max_statement_mem): q15
+  2,640.29M and 2,640.38M against 2,640.31M and 2,640.34M, q7 3,514.8M and
+  3,516.2M against 3,514.9M and 3,519.8M, q21 6,975.1M and 6,965.2M against
+  6,974.7M and 6,966.0M, q19 179.66M against 179.62M: equal; q17 130.37M
+  against 130.48M (+0.09%: the row engine's group finding its kept columns in
+  each correlated run; firstOf does it only under a limit now, and TPC-H's
+  sessions have none). At 8af4a4ad one more round: 8,917 against 8,927
+  (1.001), q15 -1.6%, the rest within q13's -3.9% and q14's +3.6%. All three
+  rounds, best of three: 8,840 against 8,854 (1.002).
+- lexdb_exec: 20,294 lines at 4c643113, 20,392 after (tsqlSetTexts and
+  convRows' padding, firstOf and firstRow, the planner's calls; the rest in
+  lexdb_bind, lexdb_parse, lexdb_lib and lexdb_plan).
 
 ### Gates
 
@@ -658,7 +805,8 @@ wrong row of lexdb's own but those PostgreSQL's two bugs give (below).
    first side's char(3) (a varchar's 'a' shown 'a  '), with the varchar first
    the char's values lose their blanks, and a char(3) beside a char(5) is not
    padded to 5; SQL Server's column is a varchar(10) (a char(5)), each value as
-   its side has it. Order and equality agree. See V.
+   its side has it. Order and equality agree. See V. **Fixed** ("The dialect
+   leftovers", 8).
 2. **E9. An unused output of a derived table is computed** (pg a-error; the
    most frequent remaining error kind). `select 1 from (select 1 % b0 as x
    from t1) d` fails 22012 over b0 = 0; PostgreSQL never computes x (a pulled-up
@@ -667,8 +815,8 @@ wrong row of lexdb's own but those PostgreSQL's two bugs give (below).
    cast past numeric(p,s) (22003 numeric field overflow). Fixing it means
    pruning a FROM subquery's outputs the outer query does not read (not under
    DISTINCT, a set operation, a set-returning or volatile function): a planner
-   change of its own, which would also save work. Not built: the plan is under
-   E9 above.
+   change of its own, which would also save work. **Built** ("The dialect
+   leftovers", 3; the plan under E9 above).
 3. **Evaluation PostgreSQL skips by its plan** (pg a-error and errcode, a few
    per chunk): HAVING false over an aggregate whose argument fails (PostgreSQL
    plans a One-Time Filter and never reads the input: w0-0174), LIMIT 0 (the
@@ -689,12 +837,14 @@ wrong row of lexdb's own but those PostgreSQL's two bugs give (below).
    (id - 3001))` over 3,000 rows: Oracle -85.83749889959187114343792091258973719962;
    lexdb's numerics hold 38 digits, so its answer could not be Oracle's anyway); a
    number(6,2) read through a derived table is shown without its scale (0 where
-   Oracle shows 0.00; tns_fuzzfix3 multiplies it by 1 instead).
+   Oracle shows 0.00; tns_fuzzfix3 multiplies it by 1 instead): **fixed** ("The
+   dialect leftovers", 5).
 6. Gaps left from before: G5 (int::bool, num_nonnulls, scale, min_scale,
    trim_scale), generate_series in the select list, `round(round(0), 1)`
    accepted where PostgreSQL has no round(double precision, integer),
    parenthesised joins (`from ((select 1) d cross join t)`: 0A000), 53200 for a
-   5,000,000-row product PostgreSQL returns (max_statement_mem).
+   5,000,000-row product PostgreSQL returns (max_statement_mem). G5, round and
+   the parenthesised joins are **fixed** ("The dialect leftovers", 6 and 7).
 
 Two PostgreSQL 18.6 bugs, found by the pg check (neither reported):
 - chunk 2 w2-0235: `select 'a' from lateral (select q3.b0 as x9, cast(null as
@@ -1223,7 +1373,8 @@ too, so this is not a bug until timed against it.
   (9 cases), probably from evaluation order. Not triaged.
 - **G5** (manual probes): `int::bool` is not supported (lexdb: "column is of
   type boolean but the expression is of another type"). `num_nonnulls`,
-  `scale`, `min_scale` and `trim_scale` do not exist.
+  `scale`, `min_scale` and `trim_scale` do not exist. **Fixed** ("The dialect
+  leftovers", 7).
 
 ### Excluded
 

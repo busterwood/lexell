@@ -8067,7 +8067,11 @@ mapped; lexdb raises it per row, SQL Server when it compiles); the
 pipeline's aggregate counts a group's bytes by the columns it keeps, the
 row engine by the whole row, so max_statement_mem's edge differs for an
 aggregate over a text or numeric argument it does not keep (main too;
-`exec_grpview`'s edges avoid them).
+`exec_grpview`'s edges avoid them). **All three fixed since**
+(design/lexdb-fuzz.md, "The dialect leftovers", 1, 2 and 4: grouping sets
+keyed by the collation, 108 / 42P10 / ORA-01785 when the statement is
+planned, the row engine's group keeping and counting the pipeline's
+columns; `exec_grpview`'s edges take such aggregates now).
 
 **Census** (the suite at main d5ccb61a, 291 tests, against the branch's,
 its four new tests' lines left out): the row engine's runs with batches
