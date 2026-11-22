@@ -1,0 +1,260 @@
+// lexdb_exec, lexdb_pipe, lexdb_access: what the pipeline took from the row engine in Q8's R8 (design/lexdb-layers.md
+// 6.3.Q8 R8): the give-ways. Before, an operator that met a case it did not run in batches gave the statement up at the
+// run (lexdb_pipe.batErr) and the row engine ran it again; now each handles its case. Each statement runs with batches on
+// and off (the row engine, the reference): the same rows or the same error. "piped": per statement with batches on, "g"
+// when a run gave way (lexdb_pipe.batErrs()), "h" when a join over a few held rows ran by the point path
+// (lexdb_pipe.heldJoinRuns()), "y" when the pipeline ran it (lexdb_pipe.runCounts()[0], joinCounts()[0]), else "n".
+// - sort: DISTINCT and ORDER BY over a column whose kind changes after the first chunk (a date, a numeric, a timestamp,
+//   a float, a CASE's numeric with NULLs: the Sort's column made values, SortSt.widen) and over a column of values of
+//   mixed kinds (a UNION typed by its first part: integers and numerics, integers and texts; sorted as the row engine
+//   sorts them), LIMIT and OFFSET, a top-N, DISTINCT ON, NULLs first and last, empty input, an error in a later row,
+//   DISTINCT over a join and over a window.
+// - keys: a hash join's key that is an expression of values (a char against a text, ||, upper(), a CASE, coalesce), inner,
+//   LEFT, a semi join (EXISTS), a scalar subquery per row, under an aggregate, NULL keys, no match, an error in a later
+//   row's key, a collation's key.
+// - held: a join whose first level is a few rows the run holds (VALUES, a derived table, a recursive CTE's working table,
+//   a catalog relation, a UNION typed by its first part): by primary key lookups (the point path), by an index's, by a
+//   hash, LEFT, LIMIT, ORDER BY, DISTINCT, an aggregate over it, NULLs, an empty source, an error in a later row; the
+//   catalog's text-typed numbers and a UNION's numerics in an integer column (the column read as values, heldKinds).
+// - merge: MERGE with a source of a few held rows (still the row engine's: fewSource, a cost choice kept), the target by its
+//   primary key, NULL and absent keys, inserts, deletes, a second match of a row (21000), an error in a later row, by another
+//   key, an empty source, RETURNING.
+// - apart: UPDATE, DELETE and SELECT over column leaves whose layout is not the table's (after ALTER TABLE) holding a value
+//   stored apart (read by the row path within the batch, lexdb_rows.APART).
+// timeout: 120
+// expect: sort: 24 statements, 24 the same, piped yyyyyyyyyyyyyyyyyyyyyyyy
+// expect: keys: 17 statements, 17 the same, piped yyyyyyyyyyyyyynny
+// expect: held: 27 statements, 27 the same, piped hhhyhhhhhhyyyyhyhyyhyyyyyyy
+// expect: apart: 9 statements, 9 the same, piped yyyyyyyyy
+// expect: merge: 9 statements, 9 the same, piped yyyynnyyn
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_pipe"
+import "../../../cmd/lexdb_sql"
+
+// A statement's rows (sorted unless it orders them), or its tag, or its error's state.
+fn run(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var parts: []str = []
+            for r in rs {
+                if !r.hasRows && len(r.rows) == 0 {
+                    append(mut &parts, r.tag.clone())
+                    continue
+                }
+                var lines: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &lines, strings.join(&cells, "|"))
+                }
+                if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+                append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+            }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn piped(): int { return lexdb_pipe.runCounts()[0] + lexdb_pipe.joinCounts()[0] }
+
+type Group = record { name: str; n: int; same: int; piped: str }
+
+fn newGroup(name: &str): Group { return Group{name: name.clone(), n: 0, same: 0, piped: ""} }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same, piped " + g.piped) }
+
+// Statements (separated by ";;") with batches on and off; a write's in a block rolled back each way.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str) {
+    let w = strings.startsWith(sql, &"W ")
+    let body = if w { sql[2..len(sql)].toStr() } else { sql.toStr() }
+    let p0 = piped()
+    let b0 = lexdb_pipe.batErrs()
+    let h0 = lexdb_pipe.heldJoinRuns()
+    let on = stmts(s, &body, w)
+    let p1 = piped()
+    let b1 = lexdb_pipe.batErrs()
+    let h1 = lexdb_pipe.heldJoinRuns()
+    let a = run(s, &"set lexdb_batch = off")
+    let off = stmts(s, &body, w)
+    let b = run(s, &"set lexdb_batch = on")
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    g.piped += if b1 > b0 { "g" } else if h1 > h0 { "h" } else if p1 > p0 { "y" } else { "n" }
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str, w: bool): str {
+    var out: []str = []
+    if w { let b = run(s, &"begin") }
+    for x in strings.split(sql, &";;") { append(mut &out, run(s, &x)) }
+    if w { let r = run(s, &"rollback") }
+    return strings.join(&out, " // ")
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(91), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        let setup = [
+            "create table f (id int primary key, x int, nu numeric(10,2), dt date, ts timestamptz, fl double precision, tx text, z int)",
+            "insert into f select i, case when i % 17 = 0 then null else i % 37 end, case when i % 19 = 0 then null else (i % 30) + 0.5 end, " +
+                "date '2024-01-01' + (i % 20), timestamptz '2024-01-01 00:00:00+00' + i * interval '1 hour', (i % 9) / 4.0, " +
+                "case when i % 23 = 0 then null else 'k' || (i % 40) end, i % 5 from generate_series(1, 3000) i",
+            "create table e0 (id int primary key, v int, dt date)",
+            "create table p (id int primary key, c char(4), t text, vc varchar(8), tc text collate \"Latin1_General_CI_AS\")",
+            "insert into p select i, 'k' || (i % 50), case when i % 31 = 0 then null else 'k' || (i % 50) end, 'k' || (i % 30), case when i % 2 = 0 then 'K' || (i % 25) else 'k' || (i % 25) end from generate_series(1, 2000) i",
+            "insert into p values (3001, null, null, null, null), (3002, 'zz', 'zz ', 'zz', 'ZZ')",
+            "create table t (id int primary key, v int, w text)",
+            "insert into t select i, i * 7, 'w' || i from generate_series(1, 1000) i",
+            "create table a (id int primary key, x int, y text)",
+            "create index a_x on a (x)",
+            "insert into a select i, i % 40, 'y' || (i % 7) from generate_series(1, 3000) i",
+            "create table emp (id int primary key, boss int, name text)",
+            "insert into emp values (1, null, 'a'), (2, 1, 'b'), (3, 1, 'c'), (4, 2, 'd'), (5, 4, 'e'), (6, 5, 'f')",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+
+        var g = newGroup(&"sort")
+        let sorts = [
+            "select distinct f.dt from f where f.x > 17 and f.id < 446 order by 1",
+            "select distinct f.dt from f where f.id < 2000",
+            "select distinct f.nu from f where f.id < 2000 order by 1 limit 7 offset 3",
+            "select distinct f.nu from f order by 1 nulls first",
+            "select distinct f.nu from f order by 1 desc nulls last",
+            "select distinct case when f.z = 1 then f.nu end from f where f.id < 1500 order by 1",
+            "select distinct f.ts at time zone 'UTC' from f where f.tx like 'k1%' order by 1 limit 5",
+            "select distinct f.fl from f order by 1",
+            "select distinct sqrt(f.x) from f where f.x is not null order by 1 limit 5",
+            "select distinct f.nu::numeric(6,3) from f where f.id < 900",
+            "select distinct f.dt, f.z from f where f.id < 700 order by 2, 1",
+            "select distinct on (f.z) f.z, f.dt from f order by f.z, f.dt desc",
+            "select distinct f.dt from f where f.id < 0",
+            "select distinct f.dt from e0 join f on f.id = e0.id",
+            "select distinct 10 / (f.id - 1500) from f",
+            "select distinct 10 / (f.id - 1500) from f where f.id < 1400 order by 1 limit 3",
+            "select distinct a from (select i as a from generate_series(1, 2400) i union all select 2.5 union all select i + 0.5 from generate_series(2402, 3000) i) v where a > 2990 order by a",
+            "select a from (select i as a from generate_series(1, 2400) i union all select 5.5 union all select i from generate_series(2402, 3000) i) v order by 1 desc limit 5",
+            "select a from (select i as a from generate_series(1, 2000) i union all select 7.25 union all select null) v order by 1 nulls first limit 4",
+            "select distinct a from (select i::text as a from generate_series(1, 1500) i union all select 'zz' union all select null) v order by 1 limit 6",
+            "select distinct b from (select i % 3 = 0 as b from generate_series(1, 1500) i union all select null) v order by 1",
+            "select distinct f.dt from f join t on t.id = f.x where f.id < 800 order by 1",
+            "select distinct sum(f.x) over (partition by f.z) from f order by 1",
+            "select f.dt, count(*) from f group by f.dt order by 1 limit 3",
+        ]
+        for x in sorts { check(mut &s, mut &g, &x) }
+        report(&g)
+
+        g = newGroup(&"keys")
+        let keys = [
+            "select count(*), sum(o.id) from p o join p i on o.c = i.t",
+            "select o.id, i.id from p o join p i on o.c = i.t where o.id < 5 order by 1, 2",
+            "select count(*) from p o join p i on i.t = o.t || 'x'",
+            "select count(*) from p o join p i on i.t = 'k' || (o.id % 50)::text",
+            "select count(*) from p o join p i on i.t = upper(o.t)",
+            "select count(*) from p o join p i on i.vc = lower(o.c)",
+            "select count(*) from p o left join p i on i.vc = o.c where o.id < 100",
+            "select o.id, i.id from p o left join p i on i.t = case when o.id % 2 = 0 then o.c end where o.id < 6 order by 1, 2",
+            "select count(*) from p o join p i on i.t = coalesce(o.t, 'k1')",
+            "select count(*) from p o where exists (select 1 from p i where i.t = o.c and i.id < 10)",
+            "select o.id, (select count(*) from p i where i.t = o.c) from p o where o.id < 4 order by 1",
+            "select o.c, count(*) from p o join p i on o.c = i.t group by o.c order by 1 limit 4",
+            "select count(*) from p o join p i on i.t = o.c where o.id < 0",
+            "select count(*) from p o join p i on i.t = case when o.id = 1500 then (o.id / 0)::text else o.t end",
+            "select count(*) from p o join p i on i.tc = o.c",
+            "select o.id, i.id from p o join p i on i.tc = o.t || '' where o.id < 4 order by 1, 2",
+            "select count(*) from f join p on p.t = f.tx",
+        ]
+        for x in keys { check(mut &s, mut &g, &x) }
+        report(&g)
+
+        g = newGroup(&"held")
+        let held = [
+            "select v.a, t.w from (values (1), (2), (3), (4), (5)) v(a) join t on t.id = v.a order by 1",
+            "select v.a, t.w from (values (3)) v(a) join t on t.id = v.a",
+            "select v.a, t.w from (values (3), (null), (2000), (3)) v(a) left join t on t.id = v.a order by 1, 2",
+            "select v.a, t.w from (values (1), (2), (3), (4), (5)) v(a) join t on t.v = v.a * 7 order by 1",
+            "select v.a, t.w from (values (1), (2), (3)) v(a) join t on t.id = v.a join t t2 on t2.id = t.id + 1 order by 1",
+            "select distinct t.w from (values (1), (2), (1)) v(a) join t on t.id = v.a",
+            "select v.a, t.w from (values (5), (4), (3), (2)) v(a) join t on t.id = v.a limit 2",
+            "select v.a, t.w from (values (5), (4), (3), (2)) v(a) join t on t.id = v.a order by 1 limit 2",
+            "select v.a, t.w from (values (1), (2), (0), (4)) v(a) join t on t.id = 10 / v.a order by 1",
+            "select v.a, t.w from (values (1)) v(a) join t on t.id = v.a where v.a > 5",
+            "select count(*) from (select distinct v % 10 as g from t) d join t on t.id = d.g",
+            "select d.g, count(*) from (select distinct v % 20 as g from t) d join a on a.x = d.g group by d.g order by 1",
+            "select v.a, a.id from (values (3), (4)) v(a) join a on a.x = v.a where a.id < 100 order by 1, 2",
+            "with recursive r(v) as (select min(x) from a where x between 12 and 29 union select a.x from r join a on a.x = r.v + 1) select v from r where v is not null order by v",
+            "with recursive up(id, b) as (select id, boss from emp where id = 6 union all select e.id, e.boss from up join emp e on e.id = up.b) select id from up",
+            "with recursive up(n) as (select 1 union all select n + 1 from up where n < 30) select count(*) from up join t on t.id = up.n",
+            "with recursive up(id, b) as (select id, v from t where id = 5 union all select t.id, t.v from up join t on t.id = up.id + 1 where up.id < 40) select count(*), sum(b) from up",
+            "select count(*) from (select 1 as x union all select 2.5) o where exists (select 1 where o.x = 2.5)",
+            "select count(*) from (select 1 as x union all select 2.5) o where (select o.x) = 2.5",
+            "select o.x, t.w from (select 1 as x union all select 2.5 union all select 3) o join t on t.id = o.x order by 1",
+            "select o.x, t.w from (select 1 as x union all select 2.5 union all select 3) o join t on t.v = o.x * 7 order by 1",
+            "select count(*) from (select 'w1' as s union all select 'w2' union all select null) o join t on t.w = o.s",
+            "select count(*) from (select a from (values (1)) v(a) where a > 1) o join t on t.id = o.a",
+            "select c.relname, c.relkind from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by 1",
+            "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'pg_catalog'",
+            "select c.relname, count(*) from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname in ('f', 'p') group by c.relname order by 1",
+            "select g, t.w from generate_series(1, 5) g join t on t.id = g order by 1",
+        ]
+        for x in held { check(mut &s, mut &g, &x) }
+        report(&g)
+
+        // column leaves (written at a checkpoint) whose layout is not the table's after ALTER TABLE, values stored apart
+        let cs = [
+            "create table m (id int primary key, a int, n numeric(10,2), t text, big text)",
+            "insert into m select g, g % 100, (g % 1000) / 10.0, 't' || (g % 97), case when g between 1000 and 1040 then repeat('long ', 60) || g when g % 3 = 0 then 'b' || g else null end from generate_series(1, 3000) g",
+            "update m set big = repeat('x', 3000) where id in (1010, 1011, 2500)",
+        ]
+        for x in cs {
+            let r = run(mut &s, &x)
+            if strings.startsWith(&r, &"ERROR") { println("setup: " + x + ": " + r) }
+        }
+        st.checkpointAll().unwrap()
+        let cs2 = ["alter table m add column e int default 7", "alter table m alter column a type bigint"]
+        for x in cs2 { let r = run(mut &s, &x) }
+        st.checkpointAll().unwrap()
+        g = newGroup(&"apart")
+        let apart = [
+            "select count(*), sum(length(big)), sum(e) from m",
+            "select id, length(big) from m where id between 1005 and 1015 order by 1",
+            "select id, length(big) from m where big like 'xxx%' order by 1",
+            "W delete from m where id % 17 = 0 and id < 2000;; select count(*), sum(n), sum(e) from m",
+            "W update m set e = e + 1 where id % 5 = 0;; select sum(e) from m",
+            "W update m set big = null where id between 1000 and 1020;; select count(big) from m",
+            "W update m set t = 'u' || id where length(big) > 1000 returning id",
+            "W delete from m where id in (1010, 2500) returning id, length(big)",
+            "W update m set a = a / (id - 2990) where id > 2000;; select count(*) from m",
+        ]
+        for x in apart { check(mut &s, mut &g, &x) }
+        report(&g)
+
+        // MERGE with a source of a few held rows (the row engine's still, fewSource: measured, the cost choice kept)
+        let ms = ["create table kl (a int primary key, b int, c text)", "insert into kl select i, i * 10, 'c' || i from generate_series(1, 1000) i"]
+        for x in ms { let r = run(mut &s, &x) }
+        g = newGroup(&"merge")
+        let merges = [
+            "W merge into kl using (values (2, 5)) as v(a, b) on kl.a = v.a when matched then update set b = v.b when not matched then insert values (v.a, v.b, 'new');; select * from kl where a in (2, 2002)",
+            "W merge into kl using (values (2002, 5)) as v(a, b) on kl.a = v.a when matched then update set b = v.b when not matched then insert values (v.a, v.b, 'new');; select * from kl where a in (2, 2002)",
+            "W merge into kl using (values (3), (null), (4), (5000)) as v(a) on kl.a = v.a when matched then delete when not matched then insert values (coalesce(v.a, 0), 1, 'n');; select count(*), sum(b) from kl",
+            "W merge into kl using (values (7), (8)) as v(a) on kl.a = v.a when matched and kl.b > 75 then delete when matched then update set c = 'u';; select * from kl where a in (7, 8)",
+            "W merge into kl using (values (10), (0)) as v(a) on kl.a = 100 / v.a when matched then update set b = 1",
+            "W merge into kl using (values (9), (9)) as v(a) on kl.a = v.a when matched then update set b = 1",
+            "W merge into kl using (values (11), (12)) as v(a) on kl.b = v.a * 10 when matched then update set c = 'h';; select * from kl where a in (11, 12)",
+            "W merge into kl using (select 1 as a where false) as v on kl.a = v.a when not matched then insert values (v.a, 1, 'x');; select count(*) from kl",
+            "W merge into kl using (values (6)) as v(a) on kl.a = v.a when matched then update set b = b + 1 returning kl.*",
+        ]
+        for x in merges { check(mut &s, mut &g, &x) }
+        report(&g)
+        return 0
+    }).unwrap()
+}
