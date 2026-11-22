@@ -4123,8 +4123,106 @@ fn (c: mut &Checker) xBin(e: int, exp: int): Val {
         return c.binop(op, lv.clone(), Arg{isVal: true, n: -1, v: r}, n.line, exp, false, lv)
     }
     let hint = if !cmp && exp >= 0 && c.pg.tk(exp) == sema.TK_PRIM { exp } else { -1 }
+    if op == "+" && c.kind(n.a) == sx.N_BIN && c.nd(n.a).s == "+" { return c.xChain(e, exp, hint) }
     let lv = c.before1(c.rd(c.expr(n.a, hint)), n.b)
     return c.binop(op, lv.clone(), Arg{isVal: false, n: n.b, v: lv.clone()}, n.line, exp, false, lv)
+}
+
+// a + b + c ...: three or more operands of a left-nested chain of +. On str the chain is one call
+// that sizes the result once and copies each part once (rt_str_concat3 to 8), not a new string
+// per +. The parts are read later than the nested form reads them, so a part stays in the group
+// only if nothing after it can change it (pureIn); else the group is joined first, where the
+// nested form would join it. Other types: the nested form, operator by operator.
+fn (c: mut &Checker) xChain(e: int, exp: int, hint: int): Val {
+    var bins: []int = []        // the + nodes, outermost first
+    var x = e
+    while c.kind(x) == sx.N_BIN && c.nd(x).s == "+" {
+        append(mut &bins, x)
+        x = c.nd(x).a
+    }
+    let k = len(bins) + 1
+    var leaves: []int = [x]
+    for i in 1..k { append(mut &leaves, c.nd(bins[k - 1 - i]).b) }
+    if c.kind(x) == sx.N_FRAC || isLitNode(c.kind(x)) {
+        // the literal cases of xBin, for the innermost +
+        var v = c.xBin(bins[k - 2], hint)
+        for i in 2..k { v = c.chainStep(v, bins[k - 1 - i], if i == k - 1 { exp } else { hint }) }
+        return v
+    }
+    let lv = c.before1(c.rd(c.expr(x, hint)), leaves[1])
+    if lv.t != sema.T_STR {
+        var v = c.binop("+", lv.clone(), Arg{isVal: false, n: leaves[1], v: lv.clone()}, c.line(bins[k - 2]), hint, false, lv)
+        for i in 2..k { v = c.chainStep(v, bins[k - 1 - i], if i == k - 1 { exp } else { hint }) }
+        return v
+    }
+    var parts: []Val = [lv.clone()]
+    // whether every part so far reads the same after the operands still to come (the first is
+    // held while the second runs, as binop holds its left operand)
+    var pure = c.pureIn(&lv, x, leaves[1] + 1, &leaves, 2, e)
+    for i in 1..k {
+        let line = c.line(bins[k - 1 - i])
+        if i >= 2 && (!pure || len(parts) == 8) {
+            let t = c.concatOf(&parts)      // where the nested form joins them
+            parts = [t]
+            pure = true
+        }
+        // binop's operand order and holds: the left operand is held while the right one runs
+        let mark = len(c.cx.pending)
+        if i == 1 && lv.cat == CAT_PLACE { c.hold(&lv, HM_SHARED, c.newCid(), line) }
+        let r = c.rcRead(c.expr(leaves[i], sema.T_STR))
+        c.cutPending(mark)
+        if r.t != sema.T_STR {
+            c.err(line, "operator + needs operands of the same type, not " + c.tstr(sema.T_STR) + " and " + c.tstr(r.t))
+        }
+        if i + 1 < k && pure { pure = c.pureIn(&r, leaves[i], leaves[i] + 1, &leaves, i + 1, e) }
+        append(mut &parts, r)
+    }
+    return c.concatOf(&parts)
+}
+
+// One + of the nested form: v (the operators before) + the right operand of b.
+fn (c: mut &Checker) chainStep(v: Val, b: int, exp: int): Val {
+    let n = c.nd(b).b
+    let lv = c.before1(c.rd(v), n)
+    return c.binop("+", lv.clone(), Arg{isVal: false, n: n, v: lv.clone()}, c.line(b), exp, false, lv)
+}
+
+// The parts joined into a new string, held as a temporary.
+fn (c: mut &Checker) concatOf(ps: &[]Val): Val {
+    var cs: []int = []
+    for p in ps { append(mut &cs, p.c) }
+    let n = len(cs)
+    let f = if n == 2 { "rt_str_concat" } else { "rt_str_concat" + intToStr(n) }
+    return c.holdtmp(c.x.call(&f, cs), sema.T_STR)
+}
+
+// Whether part p (of operand node src) reads the same if it is read after the operands from i on:
+// a temporary, a literal, or a local's place (a field chain of it) whose name no node from node
+// from to e has, except later operands that only read it.
+fn (c: &Checker) pureIn(p: &Val, src: int, from: int, leaves: &[]int, i: int, e: int): bool {
+    if p.cat == CAT_TMP || c.kind(src) == sx.N_STR { return true }
+    if p.cat != CAT_PLACE || p.gk >= 0 || p.root < 0 || c.checks(p.c) { return false }
+    let v = &c.vars[p.root]
+    if (v.kind != VK_PARAM && v.kind != VK_LOCAL) || v.cap >= 0 || v.jn >= 0 { return false }
+    let base = c.fieldBase(src)
+    if base < 0 || c.nd(base).s != v.name { return false }
+    var reads: []int = []       // later operands that only read a name: their name nodes
+    for j in i..len(leaves) {
+        let b = c.fieldBase(leaves[j])
+        if b >= 0 { append(mut &reads, b) }
+    }
+    let ast = &c.pg.mods[c.cx.mod].ast
+    for m in from..e + 1 {
+        if ast.nodes[m].kind == sx.N_NAME && ast.nodes[m].s == v.name && !hasInt(&reads, m) { return false }
+    }
+    return true
+}
+
+// The name node a field chain (x, x.f, x.f.g) starts from, or -1.
+fn (c: &Checker) fieldBase(e0: int): int {
+    var e = e0
+    while c.kind(e) == sx.N_FIELDX { e = c.nd(e).a }
+    return if c.kind(e) == sx.N_NAME { e } else { -1 }
 }
 
 // The type of e: e is checked, then its code and its effects on the checker are undone.

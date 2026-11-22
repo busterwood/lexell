@@ -355,6 +355,48 @@ static lxl_str rt_str_concat(lxl_str a, lxl_str b) {
     memcpy(s.p + a.len, RT_SP(b), (size_t)b.len);
     return s;
 }
+/* a + b + c ... (3 to 8 parts, check.lxl xChain): the result sized once, each part copied once.
+   As the nested rt_str_concat: a lone non-empty part is duplicated (a static one shared). */
+static inline lxl_str rt_str_catv(const lxl_str* ps, int n) {
+    int64_t len = 0;
+    int nz = 0, last = 0;
+    for (int i = 0; i < n; i++) {
+        len += ps[i].len;
+        if (ps[i].len) { nz++; last = i; }
+    }
+    if (nz <= 1) return rt_str_dup(ps[last]);
+    lxl_str s = rt_str_new(len);
+    char* q = s.p;
+    for (int i = 0; i < n; i++) {
+        memcpy(q, RT_SP(ps[i]), (size_t)ps[i].len);
+        q += ps[i].len;
+    }
+    return s;
+}
+static lxl_str rt_str_concat3(lxl_str a, lxl_str b, lxl_str c) {
+    lxl_str ps[3] = {a, b, c};
+    return rt_str_catv(ps, 3);
+}
+static lxl_str rt_str_concat4(lxl_str a, lxl_str b, lxl_str c, lxl_str d) {
+    lxl_str ps[4] = {a, b, c, d};
+    return rt_str_catv(ps, 4);
+}
+static lxl_str rt_str_concat5(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e) {
+    lxl_str ps[5] = {a, b, c, d, e};
+    return rt_str_catv(ps, 5);
+}
+static lxl_str rt_str_concat6(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f) {
+    lxl_str ps[6] = {a, b, c, d, e, f};
+    return rt_str_catv(ps, 6);
+}
+static lxl_str rt_str_concat7(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g) {
+    lxl_str ps[7] = {a, b, c, d, e, f, g};
+    return rt_str_catv(ps, 7);
+}
+static lxl_str rt_str_concat8(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g, lxl_str h) {
+    lxl_str ps[8] = {a, b, c, d, e, f, g, h};
+    return rt_str_catv(ps, 8);
+}
 /* s += b on an owned string (design/consistency.md): appended in place when the buffer has room,
    else into a new buffer of at least twice the capacity, so n appends cost O(total length). A b
    inside s's own buffer is copied first through a new string. */
