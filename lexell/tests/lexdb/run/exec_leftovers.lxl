@@ -1,0 +1,115 @@
+// The dialect leftovers (design/lexdb-fuzz.md, "The dialect leftovers"), through the PostgreSQL door, each statement
+// against PostgreSQL 18's answer, with SET lexdb_batch = off and on (in a transaction rolled back each time):
+// - O: an ORDER BY position not in the select list is 42P10 when the statement is planned (an empty table, 0, -1, a set
+//   operation, a scalar subquery, a derived table, with groups), not per row.
+// - G5: integer::boolean (0 false, any other true; a smallint, bigint or numeric 42846), num_nonnulls and num_nulls,
+//   scale, min_scale and trim_scale (of a float 42883), round(x) of an integer a double precision and round(double
+//   precision, integer) 42883 (round(round(0), 1)), round(numeric, n) as before.
+// - J: parenthesised joins: a derived table in a join tree, nested trees with ON, an alias with column names, LEFT and RIGHT
+//   inside, a join after the tree, three deep, a tree's tables named outside it.
+// - E9: a derived table's output nothing reads is not computed (22012, 22003, numeric field overflow, a LATERAL's, a column
+//   list's name not read; under GROUP BY, an aggregate, made count(*), and UNION ALL); it is where it is read (the list,
+//   WHERE, *, d.*) and under DISTINCT and ORDER BY, as PostgreSQL. (A scalar subquery's is computed: PostgreSQL's is not.)
+// expect: O empty table: ERROR 42P10, same: true
+// expect: O zero: ERROR 42P10, same: true
+// expect: O negative: ERROR 42P10, same: true
+// expect: O in range: 6;5, same: true
+// expect: O union: ERROR 42P10, same: true
+// expect: O scalar subquery: ERROR 42P10, same: true
+// expect: O derived table: ERROR 42P10, same: true
+// expect: O with groups: ERROR 42P10, same: true
+// expect: G5 integer to boolean: t|f|t|t|f, same: true
+// expect: G5 a column: 1|t;2|f;3|t;4|f;5|t;6|f, same: true
+// expect: G5 bigint to boolean: ERROR 42846, same: true
+// expect: G5 smallint to boolean: ERROR 42846, same: true
+// expect: G5 numeric to boolean: ERROR 42846, same: true
+// expect: G5 num_nonnulls, num_nulls: 2|2|1|1, same: true
+// expect: G5 scale, min_scale, trim_scale: 3|0|2|1.23|NULL|0|0|2|1|1.5, same: true
+// expect: G5 scale of a float: ERROR 42883, same: true
+// expect: G5 round of a round: ERROR 42883, same: true
+// expect: G5 round of a float to places: ERROR 42883, same: true
+// expect: G5 round's types: double precision|numeric|5|3|3|-1|2|4|3, same: true
+// expect: G5 round of an integer column to places: 4.0|1.33, same: true
+// expect: J a derived table in a join tree: 1|1|Ab|1;1|2|ab|2, same: true
+// expect: J a nested tree with ON: 1|1;2|2;3|3, same: true
+// expect: J an alias and columns: 1|Ab|1|Ab|1;2|ab|2|ab|2, same: true
+// expect: J LEFT inside: 1|NULL;2|Ab;3|ab;4|AB;5|x;6|NULL, same: true
+// expect: J joined after: 36, same: true
+// expect: J RIGHT inside: , same: true
+// expect: J three deep: 4;5;6, same: true
+// expect: J outer names: , same: true
+// expect: E9 22012: 1, same: true
+// expect: E9 22003: 1, same: true
+// expect: E9 numeric overflow: 1, same: true
+// expect: E9 LATERAL: 1, same: true
+// expect: E9 renamed columns: 0, same: true
+// expect: E9 another column read: 1, same: true
+// expect: E9 read: ERROR 22012, same: true
+// expect: E9 read in WHERE: ERROR 22012, same: true
+// expect: E9 star: ERROR 22012, same: true
+// expect: E9 qualified star: ERROR 22012, same: true
+// expect: E9 DISTINCT: ERROR 22012, same: true
+// expect: E9 GROUP BY: 1, same: true
+// expect: E9 an aggregate: 1, same: true
+// expect: E9 ORDER BY: ERROR 22012, same: true
+// expect: E9 UNION: 1;1, same: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for k in 0..len(row) { append(mut &vs, if lexdb_ops.isNull(&row[k]) { "NULL" } else { s.text(&row[k], if k < len(r.cols) { r.cols[k].oid } else { 0 }) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn two(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x = q(s, &"set lexdb_batch = off")
+    let b0 = q(s, &"begin")
+    let off = q(s, sql)
+    let r0 = q(s, &"rollback")
+    let y = q(s, &"set lexdb_batch = on")
+    let b1 = q(s, &"begin")
+    let on = q(s, sql)
+    let r1 = q(s, &"rollback")
+    println(label + ": " + on + ", same: " + (off == on).toStr())
+}
+
+const SETUP = "create table g (id int primary key, k varchar(10), n int)\ninsert into g values (1, 'Ab', 1), (2, 'ab', 2), (3, 'AB', 3), (4, 'x', 4), (5, NULL, 5), (6, 'X', 6)\ncreate table e (id int primary key, v int)\ncreate table t1 (b0 int, a1 bigint)\ninsert into t1 values (0, 9223372036854775807)\ncreate table nm (id int primary key, a numeric(6,2), v varchar(8))\ninsert into nm values (1, 0, 'x'), (2, 1.5, 'y'), (3, NULL, NULL)"
+
+const QS = "O empty table\tselect id from e order by 2\nO zero\tselect id from g order by 0\nO negative\tselect id from g order by -1\nO in range\tselect id from g order by 1 desc limit 2\nO union\tselect id from g union select n from g order by 2\nO scalar subquery\tselect id, (select v from e order by 2 limit 1) from g\nO derived table\tselect * from (select id from e order by 2) d\nO with groups\tselect n % 2, count(*) from g group by 1 order by 3\nG5 integer to boolean\tselect 1::bool, 0::bool, 5::bool, (-1)::boolean, cast(n - 1 as boolean) from g where id = 1\nG5 a column\tselect id, (n % 2)::bool from g order by id\nG5 bigint to boolean\tselect 3::bigint::bool\nG5 smallint to boolean\tselect 1::smallint::bool\nG5 numeric to boolean\tselect 1.5::bool\nG5 num_nonnulls, num_nulls\tselect num_nonnulls(1, null, 'a'::text), num_nulls(1, null, null), num_nulls(k, n), num_nonnulls(k, n) from g where id = 5\nG5 scale, min_scale, trim_scale\tselect scale(1.230), scale(1::numeric), min_scale(1.2300), trim_scale(1.2300), scale(null::numeric), min_scale(0.000), trim_scale(0.000), scale(a), min_scale(a), trim_scale(a) from nm where id = 2\nG5 scale of a float\tselect scale(1.5::float8)\nG5 round of a round\tselect round(round(0), 1)\nG5 round of a float to places\tselect round(1.5::float8, 1)\nG5 round's types\tselect pg_typeof(round(0)), pg_typeof(round(0.5)), round(5), round(2.5), round(2.5, 0), round(-0.5), round(2.5::float8), round(3.5::float8), round(n) from g where id = 3\nG5 round of an integer column to places\tselect round(n, 1), round(n / 3.0, 2) from g where id = 4\nJ a derived table in a join tree\tselect * from ((select 1) d cross join g) where g.id < 3 order by 2\nJ a nested tree with ON\tselect a.id, c.n from g a join (g b join g c on b.id = c.id) on a.id = b.id where a.id < 4 order by 1\nJ an alias and columns\tselect * from (g a join g b using (id)) as j(x) order by 1 limit 2\nJ LEFT inside\tselect a.id, b.k from (g a left join g b on a.id = b.id + 1) order by 1\nJ joined after\tselect count(*) from (g a cross join g b) join g c on c.id = a.id\nJ RIGHT inside\tselect a.id, b.id from (g a right join e b on a.id = b.id)\nJ three deep\tselect a.id from g a join ((g b join g c on b.id = c.id) join g d2 on c.id = d2.id) on a.id = d2.id where a.n > 3 order by 1\nJ outer names\tselect g.id, a.k from g join (g a cross join e b) on a.id = g.id\nE9 22012\tselect 1 from (select 1 % b0 as x from t1) d\nE9 22003\tselect 1 from (select a1 + a1 as x from t1) d\nE9 numeric overflow\tselect 1 from (select cast(a1 as numeric(3,1)) as x from t1) d\nE9 LATERAL\tselect 1 from t1, lateral (select 1 % t1.b0 as x) d\nE9 renamed columns\tselect d.y from (select 1 / b0, b0 from t1) d(x, y)\nE9 another column read\tselect count(*) from (select 1 / b0 as x, b0 from t1) d where b0 = 0\nE9 read\tselect x from (select 1 / b0 as x from t1) d\nE9 read in WHERE\tselect 1 from (select 1 / b0 as x from t1) d where d.x > 0\nE9 star\tselect * from (select 1 / b0 as x from t1) d\nE9 qualified star\tselect d.* from (select 1 / b0 as x from t1) d\nE9 DISTINCT\tselect 1 from (select distinct 1 / b0 as x from t1) d\nE9 GROUP BY\tselect 1 from (select 1 / b0 as x from t1 group by b0) d\nE9 an aggregate\tselect 1 from (select sum(1 / b0) as x from t1) d\nE9 ORDER BY\tselect 1 from (select 1 / b0 as x from t1 order by 1) d\nE9 UNION\tselect 1 from (select 1 / b0 as x from t1 union all select 1) d"
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    let setup: str = SETUP
+    for l in strings.lines(&setup) {
+        let o = q(mut &s, &l)
+        if strings.startsWith(&o, "ERROR") { println(l + ": " + o) }
+    }
+    let qs: str = QS
+    for l in strings.lines(&qs) {
+        let parts = strings.split(&l, "\t")
+        two(mut &s, &parts[0], &parts[1])
+    }
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(57), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024,
+                                                           snapNodes: 100000}, body).unwrap()
+}

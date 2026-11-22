@@ -2455,6 +2455,11 @@ fn outType(o: &OutCol): lexdb_sql.TypeName {
         t.prec = code
         t.scale = if code == lexdb_syscat.TS_DATETIME { 3 } else { 0 }
     }
+    // a declared numeric(p, s) (Oracle's NUMBER(p, s), oraDecl): the reading query's column is one too (its scale shown)
+    if declTag(o.scale) == ORA_NUMBER && t.kind == lexdb_sql.K_NUM {
+        t.prec = declA(o.scale)
+        t.scale = declB(o.scale)
+    }
     return t
 }
 
@@ -9391,15 +9396,21 @@ type Groups = record {
     firsts: [][]Val
     accs: [][]Acc
     sets: []int                 // grouping sets (9.94): each group's set
+    keep: []bool                // per column, kept in a group's first row (firstRow)
 }
 
 // Adds a row to its group (env: the row, and its correlated subqueries'
 // values if any).
 fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, room: int, rs0max: int): Result[Unit, DbErr] {
     if len(sel.gsets) > 0 {
-        // grouping sets (9.94): the row joins a group of each set
+        // grouping sets (9.94): the row joins a group of each set, keyed
+        // as GROUP BY's under its collation ('Ab' and 'ab' one group under
+        // T-SQL's case-insensitive one: lexdb_sort.collVal)
         var vals: []Val = []
-        for x in sel.groupBy { append(mut &vals, try eval(&x, env)) }
+        for gi in 0..len(sel.groupBy) {
+            let v = try eval(&sel.groupBy[gi], env)
+            append(mut &vals, if gi < len(sel.groupKinds) { lexdb_sort.collVal(sel.groupKinds[gi], &v) } else { v })
+        }
         for si in 0..len(sel.gsets) {
             var kb = ""
             kb += &si.toStr()
@@ -9411,10 +9422,11 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
                 Some(i) { g = i }
                 None {
                     g = len(gs.firsts)
-                    held += lexdb_pipe.rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                    let fr = firstRow(r, &gs.keep)
+                    held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1) + len(k)
                     if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                     gs.index.put(k, g)
-                    append(mut &gs.firsts, collections.copyOf(r))
+                    append(mut &gs.firsts, fr)
                     append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
                     append(mut &gs.sets, si)
                 }
@@ -9435,19 +9447,35 @@ fn addToGroup(sel: &Sel, gs: mut &Groups, r: &[]Val, env: &Env, held: mut &int, 
             Some(i) { g = i }
             None {
                 g = len(gs.firsts)
-                held += lexdb_pipe.rowBytes(r) + 64 * (len(sel.specs) + 1) + len(k)
+                let fr = firstRow(r, &gs.keep)
+                held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1) + len(k)
                 if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
                 gs.index.put(k, g)
-                append(mut &gs.firsts, collections.copyOf(r))
+                append(mut &gs.firsts, fr)
                 append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
             }
         }
     } else if len(gs.firsts) == 0 {
-        append(mut &gs.firsts, collections.copyOf(r))
+        let fr = firstRow(r, &gs.keep)
+        held += lexdb_pipe.rowBytes(&fr) + 64 * (len(sel.specs) + 1)
+        if room >= 0 && held > room { return Err(lexdb_pipe.memErr(rs0max)) }
+        append(mut &gs.firsts, fr)
         append(mut &gs.accs, lexdb_agg.newAccs(len(sel.specs)))
     }
     for i in 0..len(sel.specs) { try accumulate(&sel.specs[i], mut &gs.accs[g][i], env) }
     return Ok(Unit{})
+}
+
+// A group's first row as it is kept: the columns read after grouping
+// (keep: lexdb_plan.firstKeep), the others NULL. Its bytes (rowBytes) are
+// what the pipeline's aggregate counts for a group's first values
+// (lexdb_pipe.bFirstVals), so max_statement_mem's edge is the same in both
+// engines (an aggregate's argument is not kept: a text or numeric one
+// counted no bytes in the pipeline and its whole row here before).
+fn firstRow(r: &[]Val, keep: &[]bool): []Val {
+    var out: []Val = array(len(r), Val.Null)
+    for i in 0..len(r) { if i < len(keep) && keep[i] { out[i] = r[i].clone() } }
+    return out
 }
 
 // A correlated subquery in a GROUP BY key or an aggregate's argument or
@@ -9619,10 +9647,8 @@ fn stmtNames(s: &lexdb_sql.Stmt, names: mut &Map[str, int], star: mut &bool) {
 // A SELECT reads of its tables only the columns it names (9.31): its
 // results depend on nothing else. (UPDATE and DELETE write rows back
 // whole; they are not planned here.)
-fn narrow(q: mut &Query, s: &lexdb_sql.Stmt) {
-    var names: Map[str, int] = newMap()
-    var star = false
-    stmtNames(s, mut &names, mut &star)
+// (names and star: stmtNames's of the statement, planSelect's)
+fn narrow(q: mut &Query, names: &Map[str, int], star: bool) {
     if star { return }
     for k in 0..len(q.levels) {
         if q.levels[k].virt() { continue }
@@ -9747,8 +9773,11 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var needStar = false
     stmtNames(s, mut &needNames, mut &needStar)
     sc.locking = s.lockMode > 0
-    var q = try buildQuery(st, txn, &s.from, &s.where, params, &s.subs, &needNames, needStar, sc, true)
-    if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, s) }
+    // E9: the outputs of its FROM subqueries nothing reads not computed (lexdb_bind.prunedSubs)
+    var pruned: []lexdb_sql.Stmt = []
+    if len(s.subs) > 0 && !needStar { pruned = lexdb_bind.prunedSubs(s, &needNames) }
+    var q = try buildQuery(st, txn, &s.from, &s.where, params, if len(pruned) > 0 { &pruned } else { &s.subs }, &needNames, needStar, sc, true)
+    if s.kind == lexdb_sql.S_SELECT { narrow(mut &q, &needNames, needStar) }
     if s.lockMode > 0 { try applyLocks(mut &q, s) }
     // The select list as resolved: the plan's Project's. The planner reads it
     // in place; its first rewrite (winMarks, collectAggs, winSlots: rewriteList)
@@ -9775,6 +9804,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var order: []Expr = []
     var ordKinds: []int = []
     for o in s.order {
+        // a position not in the list: when the statement is planned
+        try lexdb_bind.orderPos(&o.expr, len(exprs), len(sc.names.coll) > 0)
         // an enum's order is its labels' (9.90)
         let r = try lexdb_bind.resolveOrder(&o.expr, &q.cols, &outs, mut &sc.names)
         // its collation's (L2): an output column's, or the expression's
@@ -10302,12 +10333,14 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             }
             append(mut &conv, bits)
         }
+        if s.mdialect == lexdb_sql.MD_TSQL { tsqlSetTexts(mut &outs, &l.outs, &r.outs, mut &conv) }
     }
     var order: []Expr = []
     var ordKinds: []int = []
     // a char column sorted without its trailing blanks, as bpchar's order has 'a' and 'a  ' tie (W16's, fuzz)
     let setKinds = setKindsOf(&outs, pg)
     for o in s.order {
+        try lexdb_bind.orderPos(&o.expr, len(outs), len(sc.names.coll) > 0)
         append(mut &ordKinds, refKindIn(&o.expr, &outs, &setKinds))
         var ok = false
         match o.expr {
@@ -10363,11 +10396,63 @@ fn branchOid(s: &lexdb_sql.Stmt, sel: &Sel, i: int): int {
     return sel.outs[i].oid
 }
 
+// SQL Server's type of a set operation's column of chars and varchars
+// (design/lexdb-fuzz.md, "Left" 1): two chars a char of the longer length,
+// else a varchar of the longer (max if either is), each value as its side
+// has it: a char(n)'s padded to n there (conv: n << CONV_PADL for the
+// first side, << CONV_PADR for the second; convRows). lexdb's T-SQL char is
+// a text padded where it is sent (its hint, lexdb_syscat.hint), so the
+// hint is the column's type.
+const CONV_PADL = 4
+const CONV_PADR = 18
+const CONV_PADMASK = 0x3fff
+
+fn tsqlSetTexts(outs: mut &[]OutCol, lo: &[]OutCol, ro: &[]OutCol, conv: mut &[]int) {
+    for i in 0..len(outs) {
+        if !lexdb_bind.isTextOid(outs[i].oid) || i >= len(conv) { continue }
+        let cl = lexdb_syscat.hintCode(lo[i].scale)
+        let cr = lexdb_syscat.hintCode(ro[i].scale)
+        let lc = cl == lexdb_syscat.TS_CHAR
+        let rc = cr == lexdb_syscat.TS_CHAR
+        if !lc && !rc { continue }
+        let nl = lexdb_syscat.hintLen(lo[i].scale)
+        let nr = lexdb_syscat.hintLen(ro[i].scale)
+        if lc && rc {
+            outs[i].scale = lexdb_syscat.hint(lexdb_syscat.TS_CHAR, max(nl, nr))
+            continue
+        }
+        if (lc || cl == lexdb_syscat.TS_VARCHAR) && (rc || cr == lexdb_syscat.TS_VARCHAR) {
+            let toMax = (cl == lexdb_syscat.TS_VARCHAR && nl == 0) || (cr == lexdb_syscat.TS_VARCHAR && nr == 0)
+            outs[i].scale = lexdb_syscat.hint(lexdb_syscat.TS_VARCHAR, if toMax { 0 } else { max(nl, nr) })
+        } else {
+            // a char beside another text (an nvarchar, a literal): lexdb's text, not the char's type
+            outs[i].scale = -1
+        }
+        if lc && nl > 0 { conv[i] = conv[i] | (min(nl, CONV_PADMASK) << CONV_PADL) }
+        if rc && nr > 0 { conv[i] = conv[i] | (min(nr, CONV_PADMASK) << CONV_PADR) }
+    }
+}
+
 // A set operation's side's rows with the values of the columns whose
 // conv has bit converted to the operation's types (bit * 4: a char's
-// values made texts without their blanks).
+// values made texts without their blanks; a T-SQL char's padded to its
+// length, tsqlSetTexts).
 fn convRows(rows: mut &[][]Val, sel: &Sel, bit: int, z: &lexdb_time.Zone): Result[Unit, DbErr] {
     for c in 0..len(sel.conv) {
+        let pad = (sel.conv[c] >> (if bit == 1 { CONV_PADL } else { CONV_PADR })) & CONV_PADMASK
+        if pad > 0 {
+            for i in 0..len(rows) {
+                if lexdb_ops.isNull(&rows[i][c]) { continue }
+                var x = lexdb_sql.text(&rows[i][c])
+                var n = strings.runeCount(&x)
+                if n >= pad { continue }
+                while n < pad {
+                    x.addByte(' ')
+                    n += 1
+                }
+                rows[i][c] = Val.Text(x)
+            }
+        }
         if (sel.conv[c] & (bit * 4)) != 0 {
             for i in 0..len(rows) {
                 if lexdb_ops.isNull(&rows[i][c]) { continue }
@@ -10846,7 +10931,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
         // done above
     } else if sel.aggQ {
         // per group: its first row (for grouped columns) and its accumulators
-        var gs = Groups{index: newMap(), firsts: [], accs: [], sets: []}
+        var gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: lexdb_plan.firstKeep(sel)}
         // A correlated subquery in a GROUP BY key or an aggregate's argument
         // runs per row, which it cannot while the rows are read (runQuery
         // holds the run): the rows are kept, then grouped (9.24).
@@ -10874,7 +10959,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                         m.subs[q.levels[0].src].data = replace(mut &m.vrows[0], [])
                         try lat0Memo(st, txn, q, params, mut &m.subs, rs)
                     }
-                    gs = Groups{index: newMap(), firsts: [], accs: [], sets: []}
+                    gs = Groups{index: newMap(), firsts: [], accs: [], sets: [], keep: lexdb_plan.firstKeep(sel)}
                     try materialize(st, txn, q, mut &m, params, rs)
                 }
             }

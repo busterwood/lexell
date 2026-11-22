@@ -1757,6 +1757,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 let ty = try p.typeName()
                 try p.expectKw(")")
                 if p.tsql { return Ok(tsqlCast(e, ty, None)) }
+                // Oracle's CAST(x AS BOOLEAN): any number not 0 true, as T-SQL's bit (lexdb_ops.coerce)
+                if p.ora && ty.kind == K_BOOL { return Ok(Expr.Cast(e, TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }
                 return Ok(Expr.Cast(e, ty))
             }
             // the date and time keywords that are not called (9.76)
@@ -4608,11 +4610,39 @@ fn (p: mut &P) waitSuffix(q: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// -n of an integer literal n: the literal -n; None for anything else.
+fn negPos(x: &Expr): Option[Expr] {
+    match x {
+        Expr.Unary(op, a) {
+            if op == "-" {
+                match a {
+                    Expr.Lit(v) {
+                        match v {
+                            Val.Int(k) { return Some(Expr.Lit(Val.Int(0 - k))) }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return None
+}
+
 fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
         try p.expectKw("by")
         while true {
-            let e = try p.expr()
+            var e = try p.expr()
+            // -n: a position (not in the list) in PostgreSQL and SQL Server, a constant in Oracle (lexdb_bind.orderPos)
+            if !p.ora {
+                match negPos(&e) {
+                    Some(l) { e = l }
+                    None {}
+                }
+            }
             var desc = false
             if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
             var nf = if p.tsql { !desc } else { desc }      // SQL Server's NULLs are the least
@@ -4826,6 +4856,32 @@ fn (p: mut &P) nestTree(from: mut &[]FromItem, g: int, at: int, atSubs: int, tar
 // A join tree read as a subquery of its own (nestTree's).
 pub fn isTreeSub(s: &Stmt): bool { return len(s.items) == 1 && s.items[0].star && s.items[0].qual == lexdb_sql.TREE_STAR }
 
+// A join tree in parentheses, after its "(" (FROM (a JOIN b ON ...), FROM ((SELECT 1) d CROSS JOIN t), nested trees, in
+// every door: PostgreSQL's, SQL Server's and Oracle's): read as a subquery of its own, as nestTree reads one, its
+// columns under their own names (TREE_STAR: a.x, b.y as before); with an alias (PostgreSQL's (a JOIN b ...) AS j
+// [(columns)]) a subquery of its every column under that alias, the names inside hidden.
+fn (p: mut &P) parenTree(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    var d = lexdb_sql.newStmt(S_SELECT)
+    let read = p.treeList(mut &d.from, J_FIRST)
+    d.subs = replace(mut &p.subs, saved)
+    d.wins = replace(mut &p.wins, savedW)
+    let ok = try read
+    d.use = SUB_FROM
+    try p.expectKw(")")
+    var name = ""
+    for k in 0..len(d.from) { name = name + (if k > 0 { " " } else { "" }) + d.from[k].alias }
+    var alias = ""
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols)
+    let tree = len(alias) == 0
+    append(mut &d.items, SelItem{star: true, qual: if tree { lexdb_sql.TREE_STAR } else { "" }, expr: None, alias: "", spell: ""})
+    append(mut &p.subs, d)
+    return Ok(FromItem{table: "", alias: if tree { "(" + name + ")" } else { alias }, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1,
+                       lateral: false, using: [], natural: false, comma: false})
+}
+
 // The functions that may be a FROM item.
 pub fn isFromFn(n: &str): bool {
     return n == "generate_series" || n == "unnest" || n == "pg_partition_ancestors" || n == "pg_available_extensions" || n == "regexp_matches" ||
@@ -4872,8 +4928,10 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     if p.acceptKw("(") {
         // a subquery in FROM
-        if !p.isKw("select") && !p.isKw("with") && !p.parenQuery() { return Err(lexdb_base.err("0A000", "parenthesized joins are not supported")) }
+        if !p.isKw("select") && !p.isKw("with") && !p.parenQuery() { return p.parenTree(join) }
         let i = try p.subquery(SUB_FROM)
+        // (Oracle computes a derived table's aggregate nothing reads: lexdb_bind.prunedSubs)
+        if p.ora { p.subs[i].mdialect = MD_ORA }
         var alias = "unnamed_subquery"
         var cols: []str = []
         try p.aliasOf(mut &alias, mut &cols)
@@ -7668,6 +7726,7 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
             return Ok(Expr.Call("#ora_tonumber", a, false))
         }
         "trunc" { return Ok(Expr.Call("#ora_trunc", a, false)) }
+        "round" { return Ok(Expr.Call("#ora_round", a, false)) }     // (PostgreSQL's round is typed by its arguments: lexdb_bind.numCall)
         "add_months" { return Ok(Expr.Call("#ora_addmonths", a, false)) }
         "sys_extract_utc" { return Ok(Expr.Call("#ora_sysutc", a, false)) }
         "numtodsinterval" { return Ok(Expr.Call("#ora_numtods", a, false)) }

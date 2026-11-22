@@ -741,6 +741,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                     return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT }
                 }
                 "length", "char_length", "octet_length" { return lexdb_sql.OID_INT4 }
+                "num_nonnulls", "num_nulls", "scale", "min_scale" { return lexdb_sql.OID_INT4 }
+                "trim_scale" { return lexdb_sql.OID_NUMERIC }
                 "gen_random_uuid" { return lexdb_sql.OID_UUID }
                 "encode" { return lexdb_sql.OID_TEXT }
                 "decode" { return lexdb_sql.OID_BYTEA }
@@ -792,7 +794,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                     let o = if len(args) > 2 { exprOid(&args[2], cols, ptypes, ty) } else { 0 }
                     return if o == lexdb_sql.OID_DATE || o == lexdb_sql.OID_TS || o == lexdb_sql.OID_TSTZ { o } else { lexdb_sql.OID_TS }
                 }
-                "round" {
+                "round", "#ora_round" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_NUMERIC }
                     return if isFloatOid(a) && len(args) == 1 { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
                 }
@@ -1721,6 +1723,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             }
             // a char cast to a text: without its blanks (9.94)
             if t.kind == lexdb_sql.K_TEXT && t.oid != lexdb_sql.OID_BPCHAR && isBp(&cx, cols, &ns.ty) { return Ok(Expr.Cast(trimmed(cx), t)) }
+            if t.kind == lexdb_sql.K_BOOL && t.len == 0 && pgRules(ns) { return boolCast(cx, cols, ns) }
             return Ok(Expr.Cast(cx, t))
         }
         Expr.Call(nm, args, star) {
@@ -1864,6 +1867,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 }
             }
             if nm == "abs" && len(out) == 1 && !star { return Ok(intChecked(Expr.Call(nm.clone(), out, false), cols, ns)) }
+            if (nm == "round" || nm == "scale" || nm == "min_scale" || nm == "trim_scale") && !star && len(out) > 0 { return numCall(&nm, out, cols, ns) }
             if nm == "pg_typeof" && len(out) == 1 && !star {
                 // its argument's type, known now: a text (PostgreSQL's regtype, shown by name)
                 let o = exprOid(&out[0], cols, &[], &ns.ty)
@@ -1874,6 +1878,36 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
         }
         else { return Ok(clone(x)) }
     }
+}
+
+// PostgreSQL's x::boolean (CAST(x AS boolean)) of a number: an integer's 0 false, any other true (the cast as T-SQL's
+// bit's, lexdb_ops.coerce); a smallint, bigint, numeric or float has no cast to boolean (42846, when the statement is
+// planned). (The Oracle door's CAST of any number is the bit's: lexdb_parse.)
+fn boolCast(x: Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Expr, DbErr] {
+    let bit = lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 1}
+    let o = exprOid(&x, cols, &ptypesOf(ns), &ns.ty)
+    if o == lexdb_sql.OID_INT4 { return Ok(Expr.Cast(x, bit)) }
+    if o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_NUMERIC || isFloatOid(o) {
+        return Err(e("42846", &("cannot cast type " + lexdb_sql.typeText(&lexdb_sql.oidType(o)) + " to boolean")))
+    }
+    return Ok(Expr.Cast(x, lexdb_sql.oidType(lexdb_sql.OID_BOOL)))
+}
+
+// PostgreSQL's round, scale, min_scale and trim_scale by their arguments' types (G5, design/lexdb-fuzz.md): round(x)
+// of an integer is round(double precision) (a number's preferred type), and there is no round(double precision,
+// integer) nor scale of a float (42883 when the statement is planned, as PostgreSQL's). T-SQL's ROUND is #round,
+// Oracle's #ora_round.
+fn numCall(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Expr, DbErr] {
+    var xs = out
+    let pt = ptypesOf(ns)
+    let o = exprOid(&xs[0], cols, &pt, &ns.ty)
+    if isFloatOid(o) && (nm != "round" || len(xs) == 2) {
+        var ts: []str = []
+        for x in xs { append(mut &ts, lexdb_sql.typeText(&lexdb_sql.oidType(exprOid(&x, cols, &pt, &ns.ty)))) }
+        return Err(e("42883", &("function " + nm + "(" + strings.join(&ts, ", ") + ") does not exist")))
+    }
+    if nm == "round" && len(xs) == 1 && isIntOid(o) { xs[0] = Expr.Cast(replace(mut &xs[0], Expr.Lit(Val.Null)), lexdb_sql.oidType(lexdb_sql.OID_FLOAT8)) }
+    return Ok(Expr.Call(nm.toStr(), xs, false))
 }
 
 // PostgreSQL's arithmetic of smallints and integers (+ - * /, unary minus, abs): of the wider type (two smallints a
@@ -2510,6 +2544,161 @@ pub fn orderOut(o: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, n: int): i
         else {}
     }
     return -1
+}
+
+// ---- E9: a FROM subquery's outputs nothing reads are not computed (design/lexdb-fuzz.md E9)
+
+// The statement's subqueries with the select items of its FROM subqueries
+// that no name of the statement reads (names: lexdb_exec.stmtNames's, with
+// its subqueries' and the FROM subquery's own) made NULL under their names,
+// as PostgreSQL never computes a pulled-up subquery's unused targets (and
+// SQL Server and Oracle do not either): `select 1 from (select 1 % b0 as x
+// from t) d` raises nothing over b0 = 0. [] when nothing is pruned (the
+// statement's own subqueries are planned). Pruned only: an item with an
+// alias (or one the FROM item's column list names) whose expression is
+// arithmetic, a comparison, a cast, a CASE or a QUIET_FNS call of columns,
+// literals and parameters (the T-SQL parser's #bitint and the Oracle
+// parser's + - / || calls are its operators; an item of plain count, sum,
+// avg, min and max of such is made count(*), the query still grouped (not
+// in the Oracle door: Oracle computes it); no
+// other aggregate, no window, subquery, set-returning or volatile
+// function); of a subquery that is a
+// SELECT with no DISTINCT, DISTINCT ON, grouping sets, HAVING, ORDER BY,
+// window, function or VALUES in FROM, FOR UPDATE, nor a GROUP BY by
+// position, or a UNION ALL of such SELECTs (each side's item pruned where
+// it is quiet); not a CTE's use; not when the statement reads a *
+// (needStar: the caller's) or the derived table's alias as a name (a
+// whole-row value). The names are compared without case and anywhere in
+// the statement: a use anywhere keeps the item.
+pub fn prunedSubs(s: &lexdb_sql.Stmt, names: &Map[str, int]): []lexdb_sql.Stmt {
+    var out: []lexdb_sql.Stmt = []
+    var low: Map[str, int] = newMap()
+    var lowMade = false
+    for f in s.from {
+        if f.sub < 0 || f.sub >= len(s.subs) || f.natural { continue }
+        if !prunableSub(&s.subs[f.sub]) { continue }
+        if !lowMade {
+            for k in names.keys() { low.put(strings.toLowerAscii(&k), 1) }
+            lowMade = true
+        }
+        if low.has(&strings.toLowerAscii(&f.alias)) { continue }
+        let d = firstLeaf(&s.subs[f.sub])
+        for i in 0..len(d.items) {
+            let name = if i < len(f.cols) { f.cols[i].clone() } else { d.items[i].alias.clone() }
+            if len(name) == 0 || low.has(&strings.toLowerAscii(&name)) { continue }
+            if len(out) == 0 { for b in s.subs { append(mut &out, b.clone()) } }
+            cutItem(mut &out[f.sub], i, s.subs[f.sub].mdialect != lexdb_sql.MD_ORA)
+        }
+    }
+    return out
+}
+
+// A set operation's first SELECT (its output's names); d itself if none.
+fn firstLeaf(d: &lexdb_sql.Stmt): &lexdb_sql.Stmt {
+    if d.setop != 0 && len(d.inner) == 2 { return firstLeaf(&d.inner[0]) }
+    return d
+}
+
+fn prunableSub(d: &lexdb_sql.Stmt): bool {
+    if d.kind != lexdb_sql.S_SELECT || d.distinct || len(d.distinctOn) > 0 || len(d.gsets) > 0 || d.having.isSome() || len(d.order) > 0 ||
+       len(d.wins) > 0 || d.cte >= 0 || len(d.srf) > 0 || d.lockMode != 0 || len(d.into) > 0 || len(d.assign) > 0 || len(d.mr) > 0 || d.rec {
+        return false
+    }
+    if d.setop != 0 { return d.setop == lexdb_sql.SET_UNION && d.setAll && len(d.inner) == 2 && prunableSub(&d.inner[0]) && prunableSub(&d.inner[1]) }
+    for g in d.group { if lexdb_sql.litInt(&g) >= 0 { return false } }
+    for it in d.items { if it.star { return false } }
+    return true
+}
+
+// Item i of d (each side's, of a UNION ALL) made NULL where it is quiet; one with an aggregate (sum(1 / x), max(a) / min(b))
+// count(*), which keeps the query an aggregate and never fails (not where aggs is false: the Oracle door's, as Oracle
+// computes it; lexdb_parse marks its FROM subqueries MD_ORA).
+fn cutItem(d: mut &lexdb_sql.Stmt, i: int, aggs: bool) {
+    if d.setop != 0 {
+        cutItem(mut &d.inner[0], i, aggs)
+        cutItem(mut &d.inner[1], i, aggs)
+        return
+    }
+    if i >= len(d.items) { return }
+    var cut = false
+    var agg = false
+    match d.items[i].expr {
+        Some(x) {
+            agg = hasAgg(&x)
+            cut = if agg { aggs && quietIn(&x, true) } else { computes(&x) && quietExpr(&x) }
+        }
+        None {}
+    }
+    if cut { d.items[i].expr = Some(if agg { Expr.Call("count", [], true) } else { Expr.Lit(Val.Null) }) }
+}
+
+// Whether x computes anything (not a column, a literal or a parameter alone).
+fn computes(x: &Expr): bool {
+    match x {
+        Expr.Col(_, _) { return false }
+        Expr.Lit(_) { return false }
+        Expr.Param(_) { return false }
+        else { return true }
+    }
+}
+
+// The calls quietExpr takes: CASE and its kin, the dialect parsers' operators, and scalar functions of one value each
+// (none set-returning, volatile or an aggregate).
+const QUIET_FNS: []str = ["case", "case else", "coalesce", "nullif", "#bitint", "#ora_add", "#ora_sub", "#ora_div", "#ora_cat", "mod", "abs",
+                          "sign", "floor", "ceil", "ceiling", "round", "#round", "#ora_round", "trunc", "#ora_trunc", "power", "#power",
+                          "sqrt", "exp", "ln", "upper", "lower", "#ora_upper", "#ora_lower", "length", "substr", "#ora_substr", "#tdiv"]
+
+// Whether x is of columns, literals and parameters under operators, casts, CASE and QUIET_FNS only (quietIn: and of
+// aggregates of them, plain count, sum, avg, min and max, where aggs).
+fn quietExpr(x: &Expr): bool { return quietIn(x, false) }
+
+fn quietIn(x: &Expr, aggs: bool): bool {
+    match x {
+        Expr.Unary(_, a) { return quietIn(&a, aggs) }
+        Expr.Bin(_, a, b) { return quietIn(&a, aggs) && quietIn(&b, aggs) }
+        Expr.IsNull(a, _) { return quietIn(&a, aggs) }
+        Expr.Cast(a, _) { return quietIn(&a, aggs) }
+        Expr.Call(n, args, star) {
+            if aggs && (n == "count" || n == "sum" || n == "avg" || n == "min" || n == "max") {
+                if star { return true }
+                for a in args { if !quietIn(&a, false) { return false } }
+                return true
+            }
+            if star { return false }
+            var known = false
+            for q in QUIET_FNS { if q == n { known = true } }
+            if !known { return false }
+            for a in args { if !quietIn(&a, aggs) { return false } }
+            return true
+        }
+        Expr.Col(_, _) { return true }
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        else { return false }
+    }
+}
+
+// An ORDER BY item that is a position not among the n items of the select
+// list: the error each product gives when it compiles the statement (an
+// empty table too, not per row): PostgreSQL's 42P10 (the Oracle door's
+// ORA-01785, lexdb_oratext), SQL Server's 108 (tsql: the T-SQL door). (A
+// negative position is a literal here, lexdb_parse.orderLimit: a position
+// in PostgreSQL and SQL Server; Oracle sorts by -1 as a constant.)
+pub fn orderPos(o: &Expr, n: int, tsql: bool): Result[Unit, DbErr] {
+    match o {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(i) {
+                    if i >= 1 && i <= n { return Ok(Unit{}) }
+                    if tsql { return Err(e("TS108", &("The ORDER BY position number " + i.toStr() + " is out of range of the number of items in the select list."))) }
+                    return Err(e("42P10", &("ORDER BY position " + i.toStr() + " is not in select list")))
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Ok(Unit{})
 }
 
 // GROUP BY: an input column or expression; else an output column's
