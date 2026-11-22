@@ -380,9 +380,63 @@ division), and the digits go straight into the new string. Same in rt.h for the 
 grep -n's rise has the same L1 misses, branch misses and stall counts as before; its runtime
 functions (rt_find1, rt_str_find) moved, so it reads as placement. The larger fix for chains
 (`"word" + i.toStr() + "-" + ...`) is a single concatenation that sizes the result and formats
-the integers in place, with no intermediate strings: not built.
+the integers in place, with no intermediate strings: section 10 builds the first half.
 
-## 10. Next, in order
+## 10. A chain of `+` on `str` built once (check.lxl `xChain`, as built)
+
+`a + b + c` was `rt_str_concat(rt_str_concat(a, b), c)`: each intermediate string allocated,
+both sides copied in, read straight back by the next `+` (wide loads of bytes just stored:
+section 8) and freed. Now a left-nested chain of three or more `+` whose first operand is a
+`str` is one call, `rt_str_concat3` to `rt_str_concat8` (`native/rt.c` and `rt.h`), that sums
+the lengths, allocates once and copies each part once. As the nested form, a lone non-empty
+part is duplicated (a static one shared) and a result of 4 GiB traps.
+
+**Semantics.** The parts are read later than the nested form reads them, so a part stays in
+the group only if nothing after it can change it: a temporary, a string literal, or a field
+chain of a local or parameter (no run-time check in its C) whose name no later operand has,
+except later operands that are themselves such a read (`s + "," + s`). Anything else (a
+global, a borrow a call returns, `xs[i]`, a local named inside a later call) makes the group
+join before the next operand, where the nested form would have joined it, so evaluation
+order, the hold on the left operand while the second runs, trap order and drops are the
+nested form's: `s + "" + grab(mut &s)` still compiles and reads the old `s`. Chains longer
+than 8 are joined 8 at a time. Non-`str` chains (int, float, operator methods) go through
+the nested form operator by operator. `s += a + b + c` builds `a + b + c` once, then appends.
+
+**Chain lengths** (stage-2 C of the compiler / lexdb, parts per chain): 3: 140 / 486,
+4: 61 / 112, 5-8: 140 / 394, 9 or more: 36 / 157.
+
+**Arity choice.** Eight register-and-stack functions against one `rt_str_concatn(parts, n)` over
+a stack array (`declArr`) for 4 or more parts: the array made the compiler's code 10.5 KB and
+lexdb's 15 KB larger, so the fixed arities stayed. Capping groups at 4 parts instead of 8:
+lexdb 25 KB larger.
+
+Matched stage-2 compilers without `-O` (main `cbc38895` against this branch); every timed step
+under the exclusive bench lock, pinned:
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| bench strings (-O), 5 interleaved rounds | 4,293M to 3,441M, -19.8% | 934M to 709M, -24.1% (median) |
+| a loop of `"word" + i.toStr() + "-" + r.toStr()` and longer chains (-O) | 8,331M to 5,666M, -32.0% | 1,697M to 1,177M, -30.7% |
+| perfsuite compile suite / run suite (`--frozen 5f30415d`) | -0.62% / -1.48% | -0.66% / -1.78% |
+| perfsuite: compiler `--emit-c`, eza -T | -1.63%, -1.89% | -1.18%, -0.95% |
+| apps: regex / json / jq / cmark / decimal (2 rounds) | 0.00 / 0.00 / 0.00 / -0.01 / -1.75% | +0.03 / -0.4 / +0.2 / **+1.2** / -1.6% |
+| lexdb point select / insert / update (pt.lxl, instructions per statement) | -0.37 / -0.73 / -0.24% | noise (±20% between rounds) |
+| HTTP server, 1 / 10 / 100 clients, 2 alternated rounds | | level (±0.5%); idle RSS level |
+| code size: compiler / lexdb / httpd | -0.14% / -1.07% / -1.8% | |
+| seed/lxlc.c | 6,520,404 to 6,517,294 bytes | |
+
+cmark's +1.2% is placement: instructions -0.01%, forwarding stalls level, branch misses
+2.04M to 2.20M; its only changed hot function is `Doc.html` (128 bytes smaller), and the
+three new runtime functions move everything after the string functions by 1,152 bytes.
+
+**Not built: integers formatted in place.** A part `x.toStr()` of an integer still makes its
+own string. The ceiling, bench strings with the integers' text made beforehand: 3,441M to
+2,507M instructions (-27%), of which the digits themselves stay; the applications above
+build few strings that way. It would need a marker part (the integer in the pointer word, a
+`cap` no string has) or per-shape runtime functions, and a type test of the receiver before
+it is checked.
+
+## 11. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
