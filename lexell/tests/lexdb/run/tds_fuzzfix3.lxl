@@ -1,8 +1,10 @@
 // lexdb over TDS: what the fuzzer's long run left (design/lexdb-fuzz.md), through the T-SQL door, checked against SQL
 // Server 2022 (run with LEXDB_MSSQL set to its connection string, this test prints SQL Server's answers: the expect
 // lines). W18: a correlated scalar subquery, EXISTS and NOT EXISTS on a key of another numeric kind than the derived
-// table's outer value (a float beside a decimal or an int, a decimal beside a float), with and without an index. Each
-// batch with SET lexdb_batch = off (the row engine) and on: the label and the answer, or DIFFERENT and both.
+// table's outer value (a float beside a decimal or an int, a decimal beside a float), with and without an index. V:
+// ORDER BY a set operation's column of varchars that differ in trailing blanks ('a' and 'a  '): they do not count, so
+// the next key decides; OFFSET ... FETCH, UNION, EXCEPT, INTERSECT, and chars. Each batch with SET lexdb_batch = off
+// (the row engine) and on: the label and the answer, or DIFFERENT and both.
 // expect: W18 a float = a decimal: x,s: NULL|NULL;0|6;0|6;1|6;2.5|NULL
 // expect: W18 a real = a decimal: x,s: NULL|NULL;0|6;1|6;2.5|NULL;3|NULL
 // expect: W18 a decimal = a float: x,s: NULL|NULL;0.00|9;1.00|1;1.00|1;1.50|NULL;2.00|NULL
@@ -11,6 +13,14 @@
 // expect: W18 with an index: x,s: NULL|NULL;0|6;0|6;1|6;2.5|NULL
 // expect: W18 EXISTS: x: 0;0;1
 // expect: W18 NOT EXISTS: x: NULL;2.5
+// expect: V UNION ALL varchars: b,n: NULL|11;''|9;'   '|10;' '|16;'a'|6;'a '|7;'a  '|13;'a'|17;'ab'|12;'ab '|15;'b  '|8;'b'|14
+// expect: V DESC: b,n: 'b'|14;'b  '|8;'ab '|15;'ab'|12;'a'|17;'a  '|13;'a '|7;'a'|6;' '|16;'   '|10;''|9;NULL|11
+// expect: V by name: x,n: NULL|11;''|9;'   '|10;' '|16;'a'|6;'a '|7;'a  '|13;'a'|17;'ab'|12;'ab '|15;'b  '|8;'b'|14
+// expect: V UNION: b,n: NULL|11;' '|6;''|9;'   '|10;'a  '|3;'a'|6;'a '|7;'ab '|5;'ab'|12;'b'|4;'b  '|8
+// expect: V OFFSET FETCH: b,n: '   '|10;' '|16;'a'|6
+// expect: V EXCEPT: b,n: NULL|11;''|9;'   '|10;'a'|6;'ab'|12;'b  '|8
+// expect: V INTERSECT: b,n: 'a '|7
+// expect: V chars: a,n: 'b  '|2;'ab '|5;'ab '|7;'a  '|0;'a  '|1;'a  '|6;'   '|3;NULL|4;NULL|8
 import "os"
 import "strings"
 import "task"
@@ -25,7 +35,7 @@ import "../../../cmd/lexdb_plan"
 
 const SETUP = "CREATE TABLE w1 (b2 decimal(6,2) NULL, p int NULL)\nINSERT INTO w1 VALUES (1, 1), (1.5, 2), (2, 3), (NULL, 4), (1, 5), (0, 6)\nCREATE TABLE w2 (k int NULL, f float NULL, r real NULL, g bigint NULL, p int NULL)\nINSERT INTO w2 VALUES (1, 1, 1, 1, 1), (2, 2.5, 2.5, 2, 2), (NULL, NULL, NULL, NULL, 3), (2, 0, 0, 2, 4), (3, 0, 3, 3, 5)\nCREATE TABLE w3 (b2 decimal(6,2) NULL, p int NULL)\nINSERT INTO w3 SELECT b2, p FROM w1\nCREATE INDEX w3_i ON w3 (b2)\nCREATE TABLE q0 (a char(3) NULL, n int NULL)\nINSERT INTO q0 VALUES ('a', 1), ('b', 2), ('', 3), (NULL, 4), ('ab', 5), ('a', 6)\nCREATE TABLE q1 (b varchar(10) NULL, n int NULL)\nINSERT INTO q1 VALUES ('a', 6), ('a ', 7), ('b  ', 8), ('', 9), ('   ', 10), (NULL, 11), ('ab', 12)\nCREATE TABLE q2 (a varchar(5) NULL, n int NULL)\nINSERT INTO q2 VALUES ('a  ', 13), ('b', 14), ('ab ', 15), (' ', 16), ('a', 17)\nCREATE TABLE q3 (a char(3) NULL, n int NULL)\nINSERT INTO q3 VALUES ('a', 0), ('ab', 7), (NULL, 8)"
 
-const QS = "W18 a float = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 a real = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT r AS x FROM w2) AS d ORDER BY 1, 2\nW18 a decimal = a float	SELECT d.x, (SELECT SUM(p) FROM w2 WHERE w2.f = d.x) AS s FROM (SELECT b2 AS x FROM w1) AS d ORDER BY 1, 2\nW18 a float = an int	SELECT d.x, (SELECT SUM(p) FROM w2 WHERE w2.k = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 an int = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT k AS x FROM w2) AS d ORDER BY 1, 2\nW18 with an index	SELECT d.x, (SELECT SUM(p) FROM w3 WHERE w3.b2 = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 EXISTS	SELECT d.x FROM (SELECT f AS x FROM w2) AS d WHERE EXISTS (SELECT 1 FROM w1 WHERE w1.b2 = d.x) ORDER BY 1\nW18 NOT EXISTS	SELECT d.x FROM (SELECT f AS x FROM w2) AS d WHERE NOT EXISTS (SELECT 1 FROM w1 WHERE w1.b2 = d.x) ORDER BY 1"
+const QS = "W18 a float = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 a real = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT r AS x FROM w2) AS d ORDER BY 1, 2\nW18 a decimal = a float	SELECT d.x, (SELECT SUM(p) FROM w2 WHERE w2.f = d.x) AS s FROM (SELECT b2 AS x FROM w1) AS d ORDER BY 1, 2\nW18 a float = an int	SELECT d.x, (SELECT SUM(p) FROM w2 WHERE w2.k = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 an int = a decimal	SELECT d.x, (SELECT SUM(p) FROM w1 WHERE w1.b2 = d.x) AS s FROM (SELECT k AS x FROM w2) AS d ORDER BY 1, 2\nW18 with an index	SELECT d.x, (SELECT SUM(p) FROM w3 WHERE w3.b2 = d.x) AS s FROM (SELECT f AS x FROM w2) AS d ORDER BY 1, 2\nW18 EXISTS	SELECT d.x FROM (SELECT f AS x FROM w2) AS d WHERE EXISTS (SELECT 1 FROM w1 WHERE w1.b2 = d.x) ORDER BY 1\nW18 NOT EXISTS	SELECT d.x FROM (SELECT f AS x FROM w2) AS d WHERE NOT EXISTS (SELECT 1 FROM w1 WHERE w1.b2 = d.x) ORDER BY 1\nV UNION ALL varchars	SELECT b, n FROM q1 UNION ALL SELECT a, n FROM q2 ORDER BY 1, 2\nV DESC	SELECT b, n FROM q1 UNION ALL SELECT a, n FROM q2 ORDER BY 1 DESC, 2 DESC\nV by name	SELECT b AS x, n FROM q1 UNION ALL SELECT a, n FROM q2 ORDER BY x, n\nV UNION	SELECT b, n FROM q1 UNION SELECT a, n - 10 FROM q2 ORDER BY 1, 2\nV OFFSET FETCH	SELECT b, n FROM q1 UNION ALL SELECT a, n FROM q2 ORDER BY 1, 2 OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY\nV EXCEPT	SELECT b, n FROM q1 EXCEPT SELECT a, n - 10 FROM q2 ORDER BY 1, 2\nV INTERSECT	SELECT b, n FROM q1 INTERSECT SELECT a, n - 10 FROM q2 ORDER BY 1, 2\nV chars	SELECT a, n FROM q0 UNION ALL SELECT a, n FROM q3 ORDER BY 1 DESC, 2"
 
 fn rows(r: &sqlserver.Rows): str {
     var names: []str = []

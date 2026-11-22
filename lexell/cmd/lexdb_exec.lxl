@@ -10258,6 +10258,8 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // the side of another type converted (runSet); of different categories,
     // or in a recursive CTE, the first side's as before
     var conv: []int = []
+    // PostgreSQL's chars (the Oracle door's: chars of two lengths are a VARCHAR2, its blanks significant)
+    let pg = lexdb_bind.pgRules(&sc.names) && s.mdialect != lexdb_sql.MD_ORA
     if !s.rec {
         let ty = typing()
         for i in 0..len(outs) {
@@ -10272,17 +10274,19 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                 }
                 if lexdb_bind.converts(&ty, lo, o) { bits = bits | 1 }
                 if lexdb_bind.converts(&ty, ro, o) { bits = bits | 2 }
-                // a char's values in a text or varchar column lose their blanks (PostgreSQL's door)
-                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(lo, o) { bits = bits | 4 }
-                if lexdb_bind.pgRules(&sc.names) && lexdb_bind.bpToText(ro, o) { bits = bits | 8 }
+                // a char's values in a text or varchar column lose their blanks (PostgreSQL's door; Oracle's VARCHAR2 keeps them)
+                if pg && lexdb_bind.bpToText(lo, o) { bits = bits | 4 }
+                if pg && lexdb_bind.bpToText(ro, o) { bits = bits | 8 }
             }
             append(mut &conv, bits)
         }
     }
     var order: []Expr = []
     var ordKinds: []int = []
+    // a char column sorted without its trailing blanks, as bpchar's order has 'a' and 'a  ' tie (W16's, fuzz)
+    let setKinds = setKindsOf(&outs, pg)
     for o in s.order {
-        append(mut &ordKinds, outRefKind(&o.expr, &outs))
+        append(mut &ordKinds, refKindIn(&o.expr, &outs, &setKinds))
         var ok = false
         match o.expr {
             Expr.Lit(v) { match v { Val.Int(n) { ok = n >= 1 && n <= len(outs) } else {} } }
@@ -10314,7 +10318,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   limit: limit, offset: offset, having: None, specs: [], distinct: false, desc: desc, nullsFirst: nullsFirst, parts: [l, r],
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
-                  groupKinds: [], ordKinds: ordKinds, outKinds: setKindsOf(&outs, lexdb_bind.pgRules(&sc.names)),
+                  groupKinds: [], ordKinds: ordKinds, outKinds: setKinds,
                   topMode: 0, topN: -1, feedback: [], mr: [], conv: conv, ox: [], oxParam: false, lp: lp, pipe: None})
 }
 
@@ -10411,8 +10415,10 @@ fn setKindsOf(outs: &[]OutCol, pg: bool): []int {
 }
 
 // ORDER BY's item as an output column (a number, a name): its kind.
-fn outRefKind(x: &Expr, outs: &[]OutCol): int {
-    let ks = outKindsOf(outs)
+fn outRefKind(x: &Expr, outs: &[]OutCol): int { return refKindIn(x, outs, &outKindsOf(outs)) }
+
+// ... under the kinds ks (a set operation's: setKindsOf).
+fn refKindIn(x: &Expr, outs: &[]OutCol, ks: &[]int): int {
     match x {
         Expr.Lit(v) { match v { Val.Int(n) { if n >= 1 && n <= len(ks) { return ks[n - 1] } } else {} } }
         Expr.Col(n, _) { for i in 0..len(outs) { if outs[i].name == n { return ks[i] } } }
