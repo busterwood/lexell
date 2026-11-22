@@ -1,0 +1,330 @@
+// lexdb_exec: the OR of index paths (lexdb-optimizer.md 52: PostgreSQL's
+// BitmapOr for lexdb). A table scanned whole under an OR whose every
+// branch has an index (or primary key) path is read by those paths: their
+// entries' primary keys collected, sorted, deduplicated, and the rows read
+// by them in key order, the whole condition checked on each.
+// Each statement runs seven ways, which must give the same rows (sorted
+// where the statement leaves their order open) or the same error: the OR
+// read wherever it can be (lexdb_plan.OR_ALWAYS) with batches on and off,
+// by cost (OR_COST) on and off, never (OR_NEVER), the rules planner, and
+// the same statement over a copy of the table without its indexes.
+// "or": y when the OR_ALWAYS runs read by the arms' keys both with batches
+// on and off (lexdb_access.orReads), n when neither did.
+// - Arms on two indexes, IN lists, overlapping arms (a row of several arms
+//   once), primary key points and ranges, a composite index's equality and
+//   range, NULLs (an arm = NULL reads nothing; IS NULL), an empty arm, a
+//   text key under a case-insensitive collation, a text primary key, ORDER
+//   BY, LIMIT (never: it may stop), aggregates, GROUP BY, DISTINCT, a join
+//   looked up per row (q19's shape), a hash join's table read once, the
+//   preserved side of a LEFT JOIN; not: an OR in a LEFT JOIN's ON on its
+//   inner side, a correlated subquery, a branch without an index path.
+// - A division by zero in a later row: the same error every way.
+// - Parameters (a kept plan, its values not looked at): never read by the
+//   arms, the same rows for each value (NULL too).
+// - In a block that writes: its own rows seen, the deleted row not; FOR
+//   UPDATE never; an UPDATE under an OR the same rows changed.
+// - Past OR_KEYS keys (setOrKeys): the table read whole.
+// expect: explain: scan t: any of index t_a lookup, index t_bc range; rows in key order (estimated 70 rows)
+// expect: explain in: scan t: any of index t_a lookup for each of 3 values, index t_bc range, primary key range; rows in key order (estimated 269 rows)
+// expect: explain wide: scan t: full scan
+// expect: explain left join: scan p: primary key range (estimated 300 rows); left join t: primary key lookup per row
+// expect: explain rules: scan t: full scan
+// expect: explain never: scan t: full scan
+// expect: explain join: scan t: any of index t_a lookup, index t_bc range; rows in key order (estimated 70 rows); join p: primary key lookup per row
+// expect: statements 30, the same every way 30, or yyyyyynyyyyyyyyynnnnnnyyyyyyny
+// expect: error: ERROR 22012 division by zero, or y
+// expect: parameters: 4 the same, or n
+// expect: block: the same true, own rows 4, the deleted row seen false, or y
+// expect: for update: the same true, or n
+// expect: update: the same true
+// expect: keys: the same true, or n
+// timeout: 120
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_plan"
+import "../../../cmd/lexdb_access"
+import "../../../cmd/lexdb_parse"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): []str {
+    var out: []str = []
+    match s.exec(sql) {
+        Ok(rs) {
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+        }
+        Err(e) { append(mut &out, "ERROR " + e.state + " " + e.msg) }
+    }
+    return out
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str): str { return strings.join(&q(s, sql), "; ") }
+
+fn sorted(xs: []str): []str {
+    var ys = xs
+    collections.sortBy(mut &ys, fn(a: &str, b: &str): int { return a.cmp(b) })
+    return ys
+}
+
+fn same(a: &[]str, b: &[]str): bool {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) { if a[i] != b[i] { return false } }
+    return true
+}
+
+// sql's table names t, u (as " t ", " t.", "t." and so on: the statements
+// name them so) for their copies without indexes, tn and un.
+fn plain(sql: &str): str {
+    var x = strings.replaceAll(sql, " t ", " tn t ")
+    x = strings.replaceAll(&x, " t)", " tn t)")
+    x = strings.replaceAll(&x, " t\n", " tn t\n")
+    x = strings.replaceAll(&x, " u ", " un u ")
+    if strings.endsWith(&x, " t") { x = x + "n t" }
+    if strings.endsWith(&x, " u") { x = x + "n u" }
+    return x
+}
+
+// sql run the seven ways; whether all agree, and in ored whether the
+// OR_ALWAYS runs read by the arms (y both, n neither, ? one of them).
+fn sevenWays(s: mut &lexdb_exec.Session, sql: &str, ordered: bool, ored: mut &str): bool {
+    var outs: [][]str = []
+    lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+    let c0 = lexdb_access.orReads()
+    append(mut &outs, q(s, sql))
+    let c1 = lexdb_access.orReads()
+    let x = q(s, &"set lexdb_batch = off")
+    append(mut &outs, q(s, sql))
+    let c2 = lexdb_access.orReads()
+    let y = q(s, &"set lexdb_batch = on")
+    ored = if c1 > c0 && c2 > c1 { "y" } else if c1 == c0 && c2 == c1 { "n" } else { "?" }
+    lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+    append(mut &outs, q(s, sql))
+    let x2 = q(s, &"set lexdb_batch = off")
+    append(mut &outs, q(s, sql))
+    let y2 = q(s, &"set lexdb_batch = on")
+    lexdb_plan.setOrPaths(lexdb_plan.OR_NEVER)
+    append(mut &outs, q(s, sql))
+    lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+    let r1 = q(s, &"set lexdb_planner = rules")
+    append(mut &outs, q(s, sql))
+    let r2 = q(s, &"set lexdb_planner = cost")
+    append(mut &outs, q(s, &plain(sql)))
+    let want = if ordered { outs[len(outs) - 1].clone() } else { sorted(outs[len(outs) - 1].clone()) }
+    for i in 0..len(outs) {
+        let got = if ordered { outs[i].clone() } else { sorted(outs[i].clone()) }
+        if !same(&got, &want) {
+            println("differs (way " + i.toStr() + "): " + sql + "\n  got " + strings.join(&got, " ") + "\n  want " + strings.join(&want, " "))
+            return false
+        }
+    }
+    return true
+}
+
+fn plan(s: mut &lexdb_exec.Session, sql: &str): str { return one(s, &("explain " + sql)) }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st)
+    for x in [
+        // a: NULL every 97th row; b: 0..999; c: 'c0'..'c9'; v: 0 at every 1009th
+        // id; w: a text under a case-insensitive collation, its case mixed
+        "create table t (id int primary key, a int, b int, c text, v int, w text collate \"Latin1_General_CI_AS\")",
+        "insert into t select g, case when g % 97 = 0 then null else g % 400 end, (g * 13) % 1000, 'c' || (g % 10), (g * 31) % 1009, " +
+            "case when g % 2 = 0 then 'W' else 'w' end || (g % 300) from generate_series(1, 20000) g",
+        "create index t_a on t (a)",
+        "create index t_bc on t (b, c)",
+        "create index t_w on t (w)",
+        "create table u (k text primary key, g int, h int)",
+        "insert into u select 'k' || g, g % 500, g % 7 from generate_series(1, 5000) g",
+        "create index u_g on u (g)",
+        "create table p (id int primary key, g int, tag text)",
+        "insert into p select g, g % 1000, 't' || (g % 7) from generate_series(0, 2999) g",
+        "create table tn as select * from t",
+        "create table un as select * from u",
+        "analyze",
+    ] { let r = q(mut &s, &x) }
+    println("explain: " + plan(mut &s, &"select id from t where a = 5 or b = 7"))
+    println("explain in: " + plan(mut &s, &"select id from t where a in (1, 2, 3) or b = 4 or id < 100"))
+    println("explain wide: " + plan(mut &s, &"select id from t where a > 10 or b = 7"))
+    println("explain left join: " + plan(mut &s, &"select p.id, t.id from p left join t on t.id = p.g and (t.a = 5 or t.b = 7) where p.id < 300"))
+    let r1 = q(mut &s, &"set lexdb_planner = rules")
+    println("explain rules: " + plan(mut &s, &"select id from t where a = 5 or b = 7"))
+    let r2 = q(mut &s, &"set lexdb_planner = cost")
+    lexdb_plan.setOrPaths(lexdb_plan.OR_NEVER)
+    println("explain never: " + plan(mut &s, &"select id from t where a = 5 or b = 7"))
+    lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+    println("explain join: " + plan(mut &s, &"select t.id, p.tag from t join p on p.id = t.b where t.a = 5 or t.b = 7"))
+    // (statement, whether its order is set)
+    let cases: [][]str = [
+        ["select id, a, b from t where a = 5 or b = 7", "n"],
+        ["select id, a, b from t where a in (1, 2, 3) or b in (4, 5)", "n"],
+        // overlapping arms: each row once
+        ["select id, a, b from t where a = 5 or (a = 5 and b < 500) or a between 4 and 6", "n"],
+        ["select id, a from t where id < 40 or a = 9 or id between 1000 and 1010 or id = 17", "n"],
+        ["select id, b, c from t where (b = 3 and c > 'c5') or (b = 4 and c = 'c1') or a = 77", "n"],
+        // NULLs: an arm = NULL reads nothing; IS NULL (no index path: never)
+        ["select id, a from t where a = null or b = 3", "n"],
+        ["select id, a from t where a is null or b = 3", "n"],
+        // an empty arm
+        ["select id from t where a = -5 or b = 9", "n"],
+        ["select id from t where a = -5 or a = -6", "n"],
+        // a text key under a case-insensitive collation: both cases
+        ["select id, w from t where w = 'W17' or w = 'w23' or a = 3", "n"],
+        // a text primary key's points and range, beside an index
+        ["select k, g from u where k = 'k10' or k between 'k20' and 'k25' or g = 3", "n"],
+        ["select id, a from t where a = 5 or b = 7 order by a, id", "y"],
+        ["select count(*), sum(v), min(id), max(c) from t where a = 5 or b = 7", "y"],
+        ["select a, count(*), sum(b) from t where a in (5, 6) or b = 7 group by a", "n"],
+        ["select distinct a from t where a = 5 or b = 7", "n"],
+        // a join looked up per row (q19's), a hash's table read once
+        ["select t.id, p.tag from t join p on p.id = t.b where t.a = 5 or t.b = 7", "n"],
+        // never: a LIMIT (the read may stop), an OR in a LEFT JOIN's ON on its
+        // inner side, a correlated subquery, a branch without an index path,
+        // an OR beside the table's own key equality
+        ["select id from t where a = 5 or b = 7 order by id limit 5", "y"],
+        ["select p.id, t.id from p left join t on t.id = p.g and (t.a = 5 or t.b = 7) where p.id < 300", "n"],
+        ["select p.id from p where exists (select 1 from t where t.a = p.g or t.b = p.g) and p.id < 50", "n"],
+        ["select id from t where a = 5 or v = 3", "n"],
+        ["select id from t where a = 5 or b + 0 = 7", "n"],
+        ["select id from t where id = 5 and (a = 5 or b = 7)", "n"],
+        // the preserved side of a LEFT JOIN; a subquery's own table
+        ["select t.id, p.tag from t left join p on p.id = t.b where t.a = 5 or t.b = 7", "n"],
+        ["select count(*) from p where p.g in (select t.b from t where t.a = 5 or t.b = 7)", "y"],
+        ["select count(*) from p join t on t.b = p.g where t.a = 5 or t.b = 7", "y"],
+        // the arms of several OR conjuncts: the cheapest; an OR of ANDs
+        ["select id from t where (a = 5 or b = 7) and (a = 6 or b = 7 or b = 8)", "n"],
+        ["select id, v from t where (a = 5 and v > 500) or (b = 7 and v < 500)", "n"],
+        // a row appearing in all three arms
+        ["select id from t where id = 1 or a = 1 or b = 13", "n"],
+        // (an IN list on a collated text has no index path: never)
+        ["select id, w from t where w in ('w5', 'W6') or id < 3", "n"],
+        ["select id, a from t where a < 2 or b > 997", "n"],
+    ]
+    var n = 0
+    var good = 0
+    var ors = ""
+    for c in cases {
+        n += 1
+        var o = ""
+        if sevenWays(mut &s, &c[0], c[1] == "y", mut &o) { good += 1 }
+        ors = ors + o
+    }
+    println("statements " + n.toStr() + ", the same every way " + good.toStr() + ", or " + ors)
+    // a division by zero in a later row (v = 0 at id 1009 and its multiples)
+    var eo = ""
+    let dz = "select id from t where (a = 9 or b = 7 or id = 1009) and 10 / v > 0"
+    var errs: []str = []
+    lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+    let e0 = lexdb_access.orReads()
+    append(mut &errs, one(mut &s, &dz))
+    let e1 = q(mut &s, &"set lexdb_batch = off")
+    append(mut &errs, one(mut &s, &dz))
+    let e2 = q(mut &s, &"set lexdb_batch = on")
+    eo = if lexdb_access.orReads() - e0 == 2 { "y" } else { "n" }
+    lexdb_plan.setOrPaths(lexdb_plan.OR_NEVER)
+    append(mut &errs, one(mut &s, &dz))
+    lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+    append(mut &errs, one(mut &s, &plain(&dz)))
+    var allSame = true
+    for e in errs { if e != errs[0] { allSame = false } }
+    println("error: " + (if allSame { errs[0].clone() } else { strings.join(&errs, " / ") }) + ", or " + eo)
+    // parameters: a kept plan's values are not looked at; never by the arms
+    {
+        let ps = lexdb_parse.parse(&"select id from t where a = $1 or b = $2").unwrap()
+        let pt = s.paramTypes(&ps[0], &[])
+        var pc = lexdb_exec.newPlanCache()
+        lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+        let p0 = lexdb_access.orReads()
+        var sameN = 0
+        for vs in [[Some("5"), Some("7")], [None, Some("7")], [Some("6"), None], [Some("-1"), Some("998")]] {
+            let pv = lexdb_exec.paramVals(&vs, &pt).unwrap()
+            var got: []str = []
+            for r in s.runCached(&ps[0], &pv, &pt, mut &pc).unwrap().rows { append(mut &got, lexdb_sql.text(&r[0])) }
+            let a = match &vs[0] { Some(x) { x.clone() } None { "null" } }
+            let b = match &vs[1] { Some(x) { x.clone() } None { "null" } }
+            let want = q(mut &s, &("select id from tn where a = " + a + " or b = " + b))
+            if same(&sorted(got), &sorted(want)) { sameN += 1 }
+        }
+        let po = if lexdb_access.orReads() > p0 { "y" } else { "n" }
+        lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+        println("parameters: " + sameN.toStr() + " the same, or " + po)
+    }
+    // in a block that writes: its own rows seen (by an arm's index), the row it deleted not
+    {
+        lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+        let bq = "select id, a, b from t where a = 5 or b = 7"
+        let b1 = q(mut &s, &"begin")
+        let b2 = q(mut &s, &"insert into t values (30001, 5, 1, 'c1', 1, 'x'), (30002, 1, 7, 'c1', 1, 'y'), (30003, 5, 7, 'c2', 1, 'z')")
+        let b3 = q(mut &s, &"delete from t where id = 5")
+        let b4 = q(mut &s, &"update t set b = 7 where id = 6")
+        let k0 = lexdb_access.orReads()
+        let got = q(mut &s, &bq)
+        let ko = if lexdb_access.orReads() > k0 { "y" } else { "n" }
+        lexdb_plan.setOrPaths(lexdb_plan.OR_NEVER)
+        let want = q(mut &s, &bq)
+        var own = 0
+        var gone = false
+        for r in got {
+            for p in ["30001|", "30002|", "30003|", "6|"] { if strings.startsWith(&r, &p) { own += 1 } }
+            if strings.startsWith(&r, &"5|") { gone = true }
+        }
+        let b5 = q(mut &s, &"rollback")
+        lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+        println("block: the same " + same(&sorted(got), &sorted(want)).toStr() + ", own rows " + own.toStr() + ", the deleted row seen " + gone.toStr() + ", or " + ko)
+    }
+    // FOR UPDATE: never by the arms (the rows locked as the scan locks them)
+    {
+        lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+        let f1 = q(mut &s, &"begin")
+        let k0 = lexdb_access.orReads()
+        let got = q(mut &s, &"select id from t where a = 5 or b = 7 for update")
+        let fo = if lexdb_access.orReads() > k0 { "y" } else { "n" }
+        let f2 = q(mut &s, &"rollback")
+        lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+        let want = q(mut &s, &"select id from tn where a = 5 or b = 7")
+        println("for update: the same " + same(&sorted(got), &sorted(want)).toStr() + ", or " + fo)
+    }
+    // an UPDATE under an OR: the same rows changed
+    {
+        lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+        let u1 = q(mut &s, &"begin")
+        let ua = q(mut &s, &"update t set v = v + 1000 where a = 5 or b = 7")
+        let got = q(mut &s, &"select id, v from t where v >= 1000")
+        let u2 = q(mut &s, &"rollback")
+        let u3 = q(mut &s, &"begin")
+        let ub = q(mut &s, &"update tn set v = v + 1000 where a = 5 or b = 7")
+        let want = q(mut &s, &"select id, v from tn where v >= 1000")
+        let u4 = q(mut &s, &"rollback")
+        lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+        let sameRows = same(&sorted(got), &sorted(want))
+        println("update: the same " + (same(&ua, &ub) && sameRows).toStr())
+    }
+    // past OR_KEYS keys: the table read whole
+    {
+        lexdb_access.setOrKeys(10)
+        lexdb_plan.setOrPaths(lexdb_plan.OR_ALWAYS)
+        let k0 = lexdb_access.orReads()
+        let got = q(mut &s, &"select id from t where a = 5 or b = 7")
+        let ko = if lexdb_access.orReads() > k0 { "y" } else { "n" }
+        lexdb_plan.setOrPaths(lexdb_plan.OR_COST)
+        lexdb_access.setOrKeys(0)
+        let want = q(mut &s, &"select id from tn where a = 5 or b = 7")
+        println("keys: the same " + same(&sorted(got), &sorted(want)).toStr() + ", or " + ko)
+    }
+    return 0
+}
+
+fn main() {
+    let o = lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 100000}
+    lexdb_store.run(lexdb_disk.sim(52), o, body).unwrap()
+}

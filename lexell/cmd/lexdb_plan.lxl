@@ -3989,8 +3989,7 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             if path.index >= 0 {
                 path.sorted = sortable(&q.levels[k].t, &path)
             } else if len(path.eqs) == 0 && reorder && lastRight < 0 && (k == 0 || q.levels[k].readOnce) && !isOuter(q.levels[k].join) && fullPath(&path) {
-                let arms = orPaths(q, k, &m, params)
-                if len(arms) > 0 { q.levels[k].ors = Some(rc(arms)) }
+                try orLevel(st, txn, q, k, &m, params)
             }
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
@@ -6744,7 +6743,8 @@ fn cannotFail(x: &Expr): bool {
         }
         Expr.IsNull(a, _) { return cannotFail(&a) }
         Expr.Call(n, args, star) {
-            if star || (n != "in" && n != "like" && n != "ilike") { return false }
+            // (a collation's key of a text, #ci and #pad, L2: it cannot fail either)
+            if star || (n != "in" && n != "like" && n != "ilike" && n != "#ci" && n != "#pad") { return false }
             for a in args { if !cannotFail(&a) { return false } }
             return true
         }
@@ -7323,6 +7323,20 @@ fn uniquePath(lv: &Level, p: &Path): bool {
     return len(p.eqs) + (if len(p.ins) > 0 { 1 } else { 0 }) == len(cols)
 }
 
+// Level k's OR of index paths (Level.ors), where orPaths chooses one among
+// its conjuncts cs; a table without statistics loaded has them loaded for
+// it (as a join's are) when an OR is among them.
+fn orLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, k: int, cs: &[]Expr, params: &[]Val): Result[Unit, DbErr] {
+    if orMode == OR_NEVER { return Ok(Unit{}) }
+    var any = false
+    for c in cs { if matchesOr(&c) { any = true } }
+    if !any { return Ok(Unit{}) }
+    if q.levels[k].est.rows < 0 && !txn.noting() { q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, true, false) }
+    let arms = orPaths(q, k, cs, params)
+    if len(arms) > 0 { q.levels[k].ors = Some(rc(arms)) }
+    return Ok(Unit{})
+}
+
 // Level k's OR of index paths among its conjuncts cs, the cheapest, if
 // one is chosen; [] none. An OR conjunct on level k's columns alone (no
 // parameter, subquery or outer value; none of it can fail: its arms'
@@ -7334,7 +7348,6 @@ fn uniquePath(lv: &Level, p: &Path): bool {
 // the scan's (the lean of scanFirst). Without statistics: only arms of
 // unique keys (a row per value at most).
 fn orPaths(q: &Query, k: int, cs: &[]Expr, params: &[]Val): []Path {
-    if orMode == OR_NEVER { return [] }
     let lv = &q.levels[k]
     var best: []Path = []
     var bestCost = 0.0f
