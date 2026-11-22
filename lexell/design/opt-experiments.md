@@ -353,7 +353,30 @@ more instructions and 5% more cycles over dbench, because the backend rebuilds t
 The remaining cost is the magnitude: a branch, a negation and the checked i128-to-u128
 conversion (there is no unchecked one: SPEC 7.2), where the bool was one byte compare.
 
-## 9. Next, in order
+## 9. Integer to text written straight into the string (runtime)
+
+`rt_i128_to_str` and `rt_u128_to_str` wrote the digits backwards into a stack buffer one byte at
+a time and `rt_str_of` then copied it with memcpy, whose 8-byte loads of a 9- to 20-digit number
+span byte stores just made (the forwarding rule of section 8). Below 2^64 the digit count now
+comes first (the bit length times 1233/4096, then one compare with a power of ten: no loop, no
+division), and the digits go straight into the new string. Same in rt.h for the C backend.
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| a loop of `n.toStr()` and `"row " + i.toStr() + ": " + ...` | -5.6% | -9.7% |
+| bench strings | -2.2% | -6.5 to -7.9% |
+| perfsuite compile / run suite | -0.02% / -0.23% | +0.27% / -0.49% |
+| grep -n omega (560K line numbers) | -0.78% | +2.3% (8 alternated rounds) |
+| apps (regex, json, jq, cmark, decimal) | 0.00% (decimal -0.4%) | level |
+| TPC-H server instructions, point selects | level | level (point selects ±4% between rounds) |
+| HTTP server, 2 alternated rounds | | level to +2% at 100 clients |
+
+grep -n's rise has the same L1 misses, branch misses and stall counts as before; its runtime
+functions (rt_find1, rt_str_find) moved, so it reads as placement. The larger fix for chains
+(`"word" + i.toStr() + "-" + ...`) is a single concatenation that sizes the result and formats
+the integers in place, with no intermediate strings: not built.
+
+## 10. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against

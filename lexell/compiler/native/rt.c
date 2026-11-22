@@ -1447,15 +1447,35 @@ static char* rt_digits(char* end, u128 v) {
     }
     return end;
 }
-lxl_str rt_u128_to_str(u128 v) {
-    char buf[48], *p = rt_digits(buf + 48, v);
-    return rt_str_of(p, buf + 48 - p);
+/* The number of decimal digits of w (1 for 0): its bit length times log10(2) (1233 / 4096) is
+   the number of digits or one less, and one compare with a power of ten settles which. */
+static int rt_ndig64(uint64_t w) {
+    static const uint64_t p10[20] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL,
+        10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
+        1000000000000ULL, 10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
+        10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
+        10000000000000000000ULL};
+    int t = ((64 - __builtin_clzll(w | 1)) * 1233) >> 12;
+    int n = t + (w >= p10[t]);
+    return n ? n : 1;
 }
-lxl_str rt_i128_to_str(i128 v) {
-    char buf[48], *p = rt_digits(buf + 48, v < 0 ? (u128)0 - (u128)v : (u128)v);
-    if (v < 0) *--p = '-';
-    return rt_str_of(p, buf + 48 - p);
+/* The text of v (with neg, a leading '-'): below 2^64 its digits are written straight into the
+   new string, sized first, instead of into a stack buffer that a memcpy then reads back (a
+   wide load of bytes just stored one by one cannot be store-forwarded). */
+static lxl_str rt_mag_to_str(u128 v, bool neg) {
+    if (v > UINT64_MAX) {
+        char buf[48], *p = rt_digits(buf + 48, v);
+        if (neg) *--p = '-';
+        return rt_str_of(p, buf + 48 - p);
+    }
+    int n = rt_ndig64((uint64_t)v) + neg;
+    lxl_str s = rt_str_new(n);
+    rt_digits(s.p + n, v);
+    if (neg) s.p[0] = '-';
+    return s;
 }
+lxl_str rt_u128_to_str(u128 v) { return rt_mag_to_str(v, false); }
+lxl_str rt_i128_to_str(i128 v) { return rt_mag_to_str(v < 0 ? (u128)0 - (u128)v : (u128)v, v < 0); }
 lxl_str rt_int_to_str(int64_t v) { return rt_i128_to_str(v); }
 lxl_str rt_u64_to_str(uint64_t v) { return rt_u128_to_str(v); }
 

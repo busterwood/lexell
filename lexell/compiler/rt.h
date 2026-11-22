@@ -652,15 +652,33 @@ static char* rt_digits(char* end, u128 v) {
     }
     return end;
 }
-static lxl_str rt_u128_to_str(u128 v) {
-    char buf[48], *p = rt_digits(buf + 48, v);
-    return rt_str_of(p, buf + 48 - p);
+/* The number of decimal digits of w (1 for 0), as native/rt.c's. */
+static int rt_ndig64(uint64_t w) {
+    static const uint64_t p10[20] = {1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL,
+        10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL, 100000000000ULL,
+        1000000000000ULL, 10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
+        10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
+        10000000000000000000ULL};
+    int t = ((64 - __builtin_clzll(w | 1)) * 1233) >> 12;
+    int n = t + (w >= p10[t]);
+    return n ? n : 1;
 }
-static lxl_str rt_i128_to_str(i128 v) {
-    char buf[48], *p = rt_digits(buf + 48, v < 0 ? (u128)0 - (u128)v : (u128)v);
-    if (v < 0) *--p = '-';
-    return rt_str_of(p, buf + 48 - p);
+/* The text of v (with neg, a leading '-'), written straight into the new string below 2^64
+   (native/rt.c's rt_mag_to_str: no stack buffer read back by a memcpy). */
+static lxl_str rt_mag_to_str(u128 v, bool neg) {
+    if (v > UINT64_MAX) {
+        char buf[48], *p = rt_digits(buf + 48, v);
+        if (neg) *--p = '-';
+        return rt_str_of(p, buf + 48 - p);
+    }
+    int n = rt_ndig64((uint64_t)v) + neg;
+    lxl_str s = rt_str_new(n);
+    rt_digits(s.p + n, v);
+    if (neg) s.p[0] = '-';
+    return s;
 }
+static lxl_str rt_u128_to_str(u128 v) { return rt_mag_to_str(v, false); }
+static lxl_str rt_i128_to_str(i128 v) { return rt_mag_to_str(v < 0 ? (u128)0 - (u128)v : (u128)v, v < 0); }
 static lxl_str rt_int_to_str(int64_t v) { return rt_i128_to_str(v); }
 static lxl_str rt_u64_to_str(uint64_t v) { return rt_u128_to_str(v); }
 static lxl_str rt_float_to_str(double d) {
