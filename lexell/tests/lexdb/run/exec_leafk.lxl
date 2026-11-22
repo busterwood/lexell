@@ -1,0 +1,279 @@
+// lexdb_exec: conditions run on a column leaf's bytes (lexdb_leafk,
+// lexdb-tpch-perf 4.6). Store A writes column leaves, store B rows only;
+// both get the same table of 3,000 rows (three batches) with NULLs in
+// every column: dates, a timestamp and a timestamptz, numeric(10,2) units,
+// int and bigint, a text of few values (a dictionary), a char(6), a
+// case-insensitive varchar. Each query runs on A and B with batches off
+// and on: the four results must be the same, and on A with batches on the
+// kernels must have run (k) where the conditions are theirs.
+// - a date against a date and against date + interval (a timestamp, whole
+//   days or not), BETWEEN, =, <>, a constant on the left, NULL constants;
+//   date against date, int against int; q6's and q12's shapes
+// - numerics against constants of their scale, below it, above it (not a
+//   kernel), an integer; ints and bigints
+// - a text = and IN (the OR chain and the sorted list), char(n), a
+//   case-insensitive collation (not a kernel: its comparison is the
+//   collation's), ORs across columns
+// - empty results, an empty table, an error in the third batch past a
+//   kernel and before one, a kernel that removes the erring row
+// - a join's scan, an index-ordered read, rows changed after the
+//   checkpoint, a column added later (older leaves without its place)
+// - T-SQL's collation and Oracle's parser on the same table
+// expect: values: 24|-18.37|1994-01-11|1994-12-20 / MAIL|3|-16 SHIP|1|-47 / 62 / 379 / 1449 / 264
+// expect: q6 shape: same k
+// expect: q12 shape: same k
+// expect: date range: same k
+// expect: date + interval: same k
+// expect: date + 12 hours: same k
+// expect: date = + 12 hours: same k
+// expect: date <> + 12 hours: same k
+// expect: date between: same k
+// expect: date =: same k
+// expect: date <>: same k
+// expect: constant left: same k
+// expect: date null: same
+// expect: date vs date: same k
+// expect: int vs int: same k
+// expect: timestamp: same k
+// expect: timestamptz: same k
+// expect: numeric scale: same k
+// expect: numeric int: same k
+// expect: numeric above scale: same
+// expect: numeric <>: same k
+// expect: int range: same k
+// expect: bigint: same k
+// expect: bigint numeric: same k
+// expect: text =: same k
+// expect: text in chain: same k
+// expect: text in list: same k
+// expect: text <: same k
+// expect: text null: same
+// expect: char: same k
+// expect: char in: same k
+// expect: collation ci: same
+// expect: or across columns: same k
+// expect: or of dates: same k
+// expect: and or: same k
+// expect: empty: same
+// expect: empty table: same
+// expect: error third batch: same ERROR 22012 k
+// expect: error before kernel: same ERROR 22012
+// expect: kernel drops the error: same k
+// expect: join: same k
+// expect: rows: same k
+// expect: group: same k
+// expect: changed q6: same
+// expect: changed q12: same
+// expect: changed rows: same
+// expect: few changed q6: same k
+// expect: few changed q12: same k
+// expect: added column: same
+// expect: added column old: same k
+// expect: after checkpoint added: same k
+// expect: index order: same
+// expect: q6 values: 46|-13.17|1994-01-11|1994-12-20
+// expect: tsql q6: same k
+// expect: tsql text: same
+// expect: oracle: same
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_leafk"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+// sql on A and B, batches off and on: whether all four are the same, and
+// whether A's kernels ran (k).
+fn four(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let x1 = q(a, &"set lexdb_batch = off")
+    let aoff = q(a, sql)
+    let x2 = q(a, &"set lexdb_batch = on")
+    let k0 = lexdb_leafk.kernRuns()
+    let aon = q(a, sql)
+    let ran = lexdb_leafk.kernRuns() > k0
+    let x3 = q(b, &"set lexdb_batch = off")
+    let boff = q(b, sql)
+    let x4 = q(b, &"set lexdb_batch = on")
+    let bon = q(b, sql)
+    let same = aoff == boff && aon == boff && bon == boff
+    var out = label + ": " + (if same { "same" } else { "DIFFERENT" })
+    if strings.startsWith(&boff, &"ERROR") { out = out + " " + boff }
+    if ran { out = out + " k" }
+    println(out)
+    if !same {
+        let cut = fn(t: &str): str { return strings.substr(t, 0, min(len(t), 300)) }
+        println("  B off: " + cut(&boff) + "\n  B on: " + cut(&bon) + "\n  A off: " + cut(&aoff) + "\n  A on: " + cut(&aon))
+    }
+}
+
+fn both(a: mut &lexdb_exec.Session, b: mut &lexdb_exec.Session, sql: &str) {
+    let ra = q(a, sql)
+    let rb = q(b, sql)
+    if ra != rb { println("DIFFERENT: " + sql + "\n  A: " + ra + "\n  B: " + rb) }
+}
+
+// An Oracle statement's rows on s with batches mode.
+fn ora(s: mut &lexdb_exec.Session, mode: &str, st: &lexdb_sql.Stmt): str {
+    let x = q(s, &("set lexdb_batch = " + mode))
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    match s.run(st, &none, &nt) {
+        Ok(r) {
+            var vs: []str = []
+            for row in r.rows { for v in row { append(mut &vs, lexdb_sql.text(&v)) } }
+            return strings.join(&vs, "|")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn rows(from: int, to: int): str {
+    let words = ["Paris", "Rome", "Oslo", "Lima", "", "Tokyo", "MAIL", "SHIP"]
+    let vw = ["paris", "Paris", "PARIS", "oslo", "Oslo", "rome"]
+    var out: []str = []
+    for id in from..to {
+        let d = if id % 7 == 0 { "null" } else { "date '1992-01-01' + " + ((id * 37) % 2500).toStr() }
+        let d2 = if id % 11 == 0 { "null" } else { "date '1992-01-01' + " + ((id * 37) % 2500 + id % 61 - 30).toStr() }
+        let ts = if id % 13 == 0 { "null" } else { "timestamp '1993-01-01 00:00' + interval '" + ((id * 7919) % 100000).toStr() + " minutes'" }
+        let tz = if id % 17 == 0 { "null" } else { "timestamptz '1993-01-01 00:00+00' + interval '" + ((id * 104729) % 1000000).toStr() + " seconds'" }
+        let n = if id % 5 == 0 { "null" } else { (((id * 13) % 2000) - 1000).toStr() + " / 100.0" }
+        let i = if id % 9 == 0 { "null" } else { ((id * 7) % 100 - 50).toStr() }
+        let bg = if id % 19 == 0 { "null" } else { ((id * 1000003) % 9000000000 - 4500000000).toStr() }
+        let t = if id % 23 == 0 { "null" } else { "'" + words[(id * 3) % len(words)] + "'" }
+        let c = if id % 29 == 0 { "null" } else { "'" + ["ab", "cd", "ab c", "zz"][id % 4] + "'" }
+        let v = if id % 31 == 0 { "null" } else { "'" + vw[id % len(vw)] + "'" }
+        append(mut &out, "(" + id.toStr() + ", " + d + ", " + d2 + ", " + ts + ", " + tz + ", " + n + ", " + i + ", " + bg + ", " + t + ", " + c + ", " + v + ")")
+    }
+    return "insert into k values " + strings.join(&out, ", ")
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), opts(), fn(sa: lexdb_store.Store): int {
+        let res = lexdb_store.run(lexdb_disk.sim(42), opts(), fn(sb: lexdb_store.Store): int {
+            lexdb_store.testHooks().setColumns(sb, false)
+            lexdb_exec.bootstrap(&sa).unwrap()
+            lexdb_exec.bootstrap(&sb).unwrap()
+            var a = lexdb_exec.newSession(sa.share())
+            var b = lexdb_exec.newSession(sb.share())
+            both(mut &a, mut &b, &"create table k (id int primary key, d date, d2 date, ts timestamp, tz timestamptz, n numeric(10,2), i int, bg bigint, t text, c char(6), v varchar(10) collate \"SQL_Latin1_General_CP1_CI_AS\")")
+            both(mut &a, mut &b, &"create table e (id int primary key, d date, n numeric(10,2), t text)")
+            for k in 0..3 { both(mut &a, mut &b, &rows(1 + k * 1000, 1001 + k * 1000)) }
+            both(mut &a, mut &b, &"analyze")
+            sa.checkpointAll().unwrap()
+            sb.checkpointAll().unwrap()
+            let q6 = "select count(*), sum(n), min(d), max(d) from k where d >= date '1994-01-01' and d < date '1994-01-01' + interval '1 year' and n between -2 and 0.5 and i < 24"
+            let q12 = "select t, count(*), sum(i) from k where t in ('MAIL', 'SHIP') and d < d2 and ts < tz and d2 >= date '1994-01-01' and d2 < date '1995-01-01' group by t order by t"
+            println("values: " + q(mut &b, &q6) + " / " + q(mut &b, &q12) + " / " +
+                    q(mut &b, &"select count(*) from k where d > date '1994-01-01' + interval '12 hours' and d < date '1994-03-01' + interval '1 hour'") + " / " +
+                    q(mut &b, &"select count(*) from k where bg > -2000000000 and bg <= -1600000000") + " / " +
+                    q(mut &b, &"select count(*) from k where c in ('ab', 'zz')") + " / " + q(mut &b, &"select count(*) from k where n >= 1.25 and n < 3.5"))
+            four(mut &a, mut &b, &"q6 shape", &q6)
+            four(mut &a, mut &b, &"q12 shape", &q12)
+            four(mut &a, mut &b, &"date range", &"select count(*), sum(i) from k where d >= date '1994-01-01' and d < date '1995-01-01'")
+            four(mut &a, mut &b, &"date + interval", &"select count(*), max(id) from k where d <= date '1998-12-01' - interval '90 days'")
+            four(mut &a, mut &b, &"date + 12 hours", &"select count(*), min(d), max(d) from k where d > date '1994-01-01' + interval '12 hours' and d < date '1994-03-01' + interval '1 hour'")
+            four(mut &a, mut &b, &"date = + 12 hours", &"select count(*) from k where d = date '1994-01-01' + interval '12 hours'")
+            four(mut &a, mut &b, &"date <> + 12 hours", &"select count(*) from k where d <> date '1994-01-01' + interval '12 hours'")
+            four(mut &a, mut &b, &"date between", &"select count(*), min(id) from k where d between date '1993-02-01' and date '1993-03-01'")
+            four(mut &a, mut &b, &"date =", &"select id from k where d = date '1993-02-14' order by id")
+            four(mut &a, mut &b, &"date <>", &"select count(*) from k where d <> date '1993-02-14'")
+            four(mut &a, mut &b, &"constant left", &"select count(*) from k where date '1995-01-01' > d and 0 < i")
+            four(mut &a, mut &b, &"date null", &"select count(*) from k where d >= null")
+            four(mut &a, mut &b, &"date vs date", &"select count(*), sum(id) from k where d2 > d")
+            four(mut &a, mut &b, &"int vs int", &"select count(*) from k where i < id and i >= -10")
+            four(mut &a, mut &b, &"timestamp", &"select count(*), min(ts) from k where ts >= timestamp '1993-02-01 12:30' and ts < timestamp '1993-02-20'")
+            four(mut &a, mut &b, &"timestamptz", &"select count(*) from k where tz < timestamptz '1993-01-05 00:00+00'")
+            four(mut &a, mut &b, &"numeric scale", &"select count(*), sum(n) from k where n >= 1.25 and n < 3.5")
+            four(mut &a, mut &b, &"numeric int", &"select count(*) from k where n > 2 and n <= 7")
+            four(mut &a, mut &b, &"numeric above scale", &"select count(*) from k where n > 1.255")
+            four(mut &a, mut &b, &"numeric <>", &"select count(*) from k where n <> 0")
+            four(mut &a, mut &b, &"int range", &"select count(*), sum(i) from k where i between -5 and 5")
+            four(mut &a, mut &b, &"bigint", &"select count(*) from k where bg > -2000000000 and bg <= -1600000000")
+            four(mut &a, mut &b, &"bigint numeric", &"select count(*) from k where bg > -4000000000 and bg <= -2000000000")
+            four(mut &a, mut &b, &"text =", &"select count(*), sum(id) from k where t = 'Oslo'")
+            four(mut &a, mut &b, &"text in chain", &"select t, count(*) from k where t in ('Paris', 'Lima', '') group by t order by t")
+            four(mut &a, mut &b, &"text in list", &"select count(*) from k where t in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'Rome', 'Tokyo')")
+            four(mut &a, mut &b, &"text <", &"select count(*) from k where t < 'N'")
+            four(mut &a, mut &b, &"text null", &"select count(*) from k where t = null")
+            four(mut &a, mut &b, &"char", &"select count(*) from k where c = 'ab'")
+            four(mut &a, mut &b, &"char in", &"select count(*) from k where c in ('ab', 'zz')")
+            four(mut &a, mut &b, &"collation ci", &"select count(*) from k where v = 'paris'")
+            four(mut &a, mut &b, &"or across columns", &"select count(*) from k where t = 'Paris' or i > 40")
+            four(mut &a, mut &b, &"or of dates", &"select count(*) from k where d < date '1992-03-01' or d >= date '1998-06-01'")
+            four(mut &a, mut &b, &"and or", &"select count(*) from k where (t = 'Rome' and d > date '1995-01-01') or (n < -9 and i <> 3)")
+            four(mut &a, mut &b, &"empty", &"select count(*), sum(n), min(d) from k where d > date '2100-01-01'")
+            four(mut &a, mut &b, &"empty table", &"select count(*), sum(n) from e where d >= date '1994-01-01' and t = 'x'")
+            four(mut &a, mut &b, &"error third batch", &"select count(*) from k where d >= date '1992-01-01' and 100 / (id - 2600) > 0")
+            four(mut &a, mut &b, &"error before kernel", &"select count(*) from k where 100 / (id - 2600) > 0 and d >= date '1992-01-01'")
+            four(mut &a, mut &b, &"kernel drops the error", &"select count(*) from k where id <> 2600 and 100 / (id - 2600) > 0")
+            four(mut &a, mut &b, &"join", &"select count(*), sum(x.i) from k x join k y on x.id = y.id + 1 where x.d >= date '1995-01-01' and x.t in ('Paris', 'Rome')")
+            four(mut &a, mut &b, &"rows", &"select id, d, n, t from k where d >= date '1994-01-01' and d < date '1994-02-01' and t <> 'Lima' order by id")
+            four(mut &a, mut &b, &"group", &"select t, count(*), min(d), max(n) from k where d2 >= date '1996-01-01' group by t order by t")
+            // changes after the checkpoint: rows of the memory beside the leaves
+            both(mut &a, mut &b, &"update k set d = null, t = 'MAIL' where id % 100 = 3")
+            both(mut &a, mut &b, &"update k set n = 0.25, d = date '1994-05-05' where id between 1500 and 1530")
+            both(mut &a, mut &b, &"delete from k where id % 97 = 1")
+            both(mut &a, mut &b, &rows(3001, 3101))
+            four(mut &a, mut &b, &"changed q6", &q6)
+            four(mut &a, mut &b, &"changed q12", &q12)
+            four(mut &a, mut &b, &"changed rows", &"select id, d, n from k where d = date '1994-05-05' and n < 1 order by id")
+            sa.checkpointAll().unwrap()
+            sb.checkpointAll().unwrap()
+            // a few rows changed: their leaves read with the memory's rows, the others' by the kernels
+            both(mut &a, mut &b, &"update k set n = 0.1, d = date '1994-07-07' where id = 1700 or id = 2950")
+            both(mut &a, mut &b, &"insert into k (id, d, n, i, t) values (5000, date '1994-08-08', 0.2, 1, 'MAIL'), (5001, null, null, null, null)")
+            four(mut &a, mut &b, &"few changed q6", &q6)
+            four(mut &a, mut &b, &"few changed q12", &"select count(*), sum(id) from k where t in ('MAIL', 'SHIP') and d >= date '1994-01-01' and d < date '1995-01-01'")
+            // a column added: the older leaves have no place for it
+            both(mut &a, mut &b, &"alter table k add column e date")
+            both(mut &a, mut &b, &"update k set e = d2 where id < 200")
+            four(mut &a, mut &b, &"added column", &"select count(*) from k where e >= date '1993-01-01'")
+            four(mut &a, mut &b, &"added column old", &"select count(*) from k where d >= date '1993-01-01' and e is null")
+            sa.checkpointAll().unwrap()
+            sb.checkpointAll().unwrap()
+            four(mut &a, mut &b, &"after checkpoint added", &"select count(*) from k where d >= date '1993-01-01' and i > 0 and e is null")
+            both(mut &a, mut &b, &"create index k_d on k (d)")
+            both(mut &a, mut &b, &"analyze")
+            four(mut &a, mut &b, &"index order", &"select id, d from k where d >= date '1997-01-01' and d < date '1997-01-20' order by d, id")
+            println("q6 values: " + q(mut &b, &"select count(*), sum(n), min(d), max(d) from k where d >= date '1994-01-01' and d < date '1994-01-01' + interval '1 year' and n between -2 and 0.5 and i < 24 and id < 3000"))
+            // T-SQL's collation: texts compare case-insensitively
+            a.setCollation(&lexdb_sql.TSQL_COLLATION)
+            b.setCollation(&lexdb_sql.TSQL_COLLATION)
+            four(mut &a, mut &b, &"tsql q6", &q6)
+            four(mut &a, mut &b, &"tsql text", &"select count(*) from k where t = 'oslo' or v = 'ROME'")
+            // Oracle's parser
+            let os = lexdb_parse.oraParse(&"select count(*) from k where d >= date '1994-01-01' and n > 0 and t in ('Paris', 'Oslo')").unwrap()
+            var outs: []str = []
+            for mode in ["off", "on"] {
+                append(mut &outs, ora(mut &a, &mode, &os[0]))
+                append(mut &outs, ora(mut &b, &mode, &os[0]))
+            }
+            println("oracle: " + (if outs[0] == outs[1] && outs[1] == outs[2] && outs[2] == outs[3] { "same" } else { "DIFFERENT " + strings.join(&outs, " / ") }))
+            return 0
+        })
+        return 0
+    }).unwrap()
+}

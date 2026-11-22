@@ -1,0 +1,261 @@
+// lexdb: conditions run on a column leaf's bytes (lexdb-tpch-perf 4.6).
+//
+// A batch scan decodes a column leaf's places into a batch and then runs
+// its conditions over the batch's rows. A condition that compares one
+// place's words (an integer's, a date's or time's, a numeric's units) with
+// a constant or with another place's words, or one place's texts with
+// constant texts, holds or not by those bytes alone: it is run on the leaf
+// before anything is decoded (cRunLazy), and the batch decodes the other
+// places for the rows it keeps only. A date read into a batch is a value
+// (Val.Date) per row; read here it is its word.
+//
+// Each kernel gives a row what its condition's batch node (lexdb_pipe's
+// Cmp, DCmp, ValCmp, VCmp, InVals and their OR) gives it: kept when the
+// condition is true, dropped when it is false or NULL. A leaf whose place
+// is not of the kind the kernel expects (an older leaf of a retyped
+// column) gives None: the caller decodes and runs the conditions instead.
+
+import "./lexdb_rows"
+import "collections"
+import "./lexdb_cols"
+
+type LeafView = lexdb_rows.LeafView
+
+// One condition on a leaf's bytes.
+pub type LeafK = closed {
+    // place pl's words in lo..hi (inclusive): its kind pk (PK_INT: any
+    // integer kind), sc a units place's scale (-1 a word place)
+    Range(int, byte, int, int, int)
+    // place pl's words not k (pl, pk, sc, k)
+    Ne(int, byte, int, int)
+    // places a and b's words compared, = <> < <= > >= as 0 to 5 (op, a, b,
+    // their kind)
+    Cols(int, int, int, byte)
+    // place pl's texts compared with ks[0] by their bytes, = <> < <= > >=
+    // as 0 to 5; 6: one of ks (op, pl, ks)
+    Texts(int, int, []str)
+    // every one holds; one at least holds
+    All([]LeafK)
+    Any([]LeafK)
+}
+
+pub const MIN_W: int = -9223372036854775807 - 1
+pub const MAX_W: int = 9223372036854775807
+
+// The kernel of place pl's words op k (= <> < <= > >= as 0 to 5).
+pub fn words(op: int, pl: int, pk: byte, sc: int, k: int): LeafK {
+    if op == 1 { return LeafK.Ne(pl, pk, sc, k) }
+    if op == 0 { return LeafK.Range(pl, pk, sc, k, k) }
+    if op == 2 { return if k == MIN_W { LeafK.Range(pl, pk, sc, 0, -1) } else { LeafK.Range(pl, pk, sc, MIN_W, k - 1) } }
+    if op == 3 { return LeafK.Range(pl, pk, sc, MIN_W, k) }
+    if op == 4 { return if k == MAX_W { LeafK.Range(pl, pk, sc, 0, -1) } else { LeafK.Range(pl, pk, sc, k + 1, MAX_W) } }
+    return LeafK.Range(pl, pk, sc, k, MAX_W)
+}
+
+// ks with each run of ranges on one place (q6's l_shipdate >= a and < b)
+// made one.
+pub fn merged(ks: []LeafK): []LeafK {
+    var out: []LeafK = []
+    for k in move(ks) {
+        var done = false
+        if len(out) > 0 {
+            match k {
+                LeafK.Range(pl, pk, sc, lo, hi) {
+                    let n = len(out) - 1
+                    match out[n] {
+                        LeafK.Range(pl2, pk2, sc2, lo2, hi2) {
+                            if pl == pl2 && pk == pk2 && sc == sc2 {
+                                out[n] = LeafK.Range(pl, pk, sc, max(lo, lo2), min(hi, hi2))
+                                done = true
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+        }
+        if !done { append(mut &out, k) }
+    }
+    return out
+}
+
+// Whether place pl of the leaf holds words of kind pk (PK_INT: any
+// integer kind) at scale sc (-1: not a units place) as intAt reads them.
+fn wordsOk(leaf: &LeafView, pl: int, pk: byte, sc: int): bool {
+    if pl >= lexdb_cols.places(leaf.dir) { return false }
+    let k = lexdb_cols.kindOf(leaf.cols, pl)
+    let c = lexdb_cols.codecOf(leaf.dir, pl)
+    if sc >= 0 { return k == lexdb_rows.PK_NUM && c == lexdb_cols.C_UNITS && lexdb_cols.scaleOf(leaf.dir, pl) == sc }
+    if pk == lexdb_rows.PK_INT { if !lexdb_rows.isIntKind(k) { return false } } else if k != pk { return false }
+    return c == lexdb_cols.C_FOR || c == lexdb_cols.C_RAW
+}
+
+
+// Place pl's words of rows rs (leaf row from + r - r0), in rs's order, of a
+// run of cnt rows: unpacked together when rs holds half the run or more,
+// else row by row.
+fn wordsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
+    let n = len(rs)
+    var w: []int = array(n, 0)
+    if n == cnt { lexdb_cols.intsInto(leaf.cols, leaf.dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
+        var all: []int = array(cnt, 0)
+        lexdb_cols.intsInto(leaf.cols, leaf.dir, pl, from, cnt, mut &all, 0)
+        for x in 0..n { w[x] = all[rs[x] - r0] }
+    } else {
+        for x in 0..n { w[x] = lexdb_cols.intAt(leaf.cols, leaf.dir, pl, from + rs[x] - r0) }
+    }
+    return w
+}
+
+// A dictionary place's codes of rows rs, as wordsOf.
+fn codesOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
+    let n = len(rs)
+    var w: []int = array(n, 0)
+    if n == cnt { lexdb_cols.codesInto(leaf.cols, leaf.dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
+        var all: []int = array(cnt, 0)
+        lexdb_cols.codesInto(leaf.cols, leaf.dir, pl, from, cnt, mut &all, 0)
+        for x in 0..n { w[x] = all[rs[x] - r0] }
+    } else {
+        for x in 0..n { w[x] = lexdb_cols.codeAt(leaf.cols, leaf.dir, pl, from + rs[x] - r0) }
+    }
+    return w
+}
+
+fn holds(op: int, c: int): bool {
+    return if op == 0 { c == 0 } else if op == 1 { c != 0 } else if op == 2 { c < 0 } else if op == 3 { c <= 0 } else if op == 4 { c > 0 } else { c >= 0 }
+}
+
+// Whether text t passes op against ks (as Texts).
+fn textHolds(op: int, t: &str, ks: &[]str): bool {
+    if op == 6 {
+        for k in ks { if t == k { return true } }
+        return false
+    }
+    return holds(op, t.cmp(&ks[0]))
+}
+
+// The rows of rs (batch rows of a run of cnt rows, leaf row from at batch
+// row r0) k holds for, in order. None: a place of the leaf is not of the
+// kind k reads.
+pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &LeafK): Option[[]int] {
+    let s = leaf.cols
+    let dir = leaf.dir
+    let n = len(rs)
+    match k {
+        LeafK.Range(pl, pk, sc, lo, hi) {
+            if !wordsOk(leaf, pl, pk, sc) { return None }
+            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            var out: []int = withCapacity(n)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            for x in 0..n {
+                let v = w[x]
+                if v >= lo && v <= hi {
+                    if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                    append(mut &out, rs[x])
+                }
+            }
+            return Some(out)
+        }
+        LeafK.Ne(pl, pk, sc, kv) {
+            if !wordsOk(leaf, pl, pk, sc) { return None }
+            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            var out: []int = withCapacity(n)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            for x in 0..n {
+                if w[x] != kv {
+                    if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                    append(mut &out, rs[x])
+                }
+            }
+            return Some(out)
+        }
+        LeafK.Cols(op, pa, pb, pk) {
+            if !wordsOk(leaf, pa, pk, -1) || !wordsOk(leaf, pb, pk, -1) { return None }
+            let wa = wordsOf(leaf, from, rs, r0, cnt, pa)
+            let wb = wordsOf(leaf, from, rs, r0, cnt, pb)
+            var out: []int = withCapacity(n)
+            let nulls = lexdb_cols.hasNulls(dir, pa) || lexdb_cols.hasNulls(dir, pb)
+            for x in 0..n {
+                let a = wa[x]
+                let b = wb[x]
+                if holds(op, if a < b { -1 } else if a > b { 1 } else { 0 }) {
+                    if nulls {
+                        let i = from + rs[x] - r0
+                        if lexdb_cols.isNull(s, dir, pa, i) || lexdb_cols.isNull(s, dir, pb, i) { continue }
+                    }
+                    append(mut &out, rs[x])
+                }
+            }
+            return Some(out)
+        }
+        LeafK.Texts(op, pl, ks) {
+            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            var out: []int = []
+            if codec == lexdb_cols.C_DICT {
+                // each entry once
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var hit: []bool = array(nd, false)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    hit[j] = textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks)
+                }
+                let codes = codesOf(leaf, from, rs, r0, cnt, pl)
+                for x in 0..n {
+                    if hit[codes[x]] {
+                        if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                        append(mut &out, rs[x])
+                    }
+                }
+                return Some(out)
+            }
+            if codec != lexdb_cols.C_TEXT { return None }
+            for x in 0..n {
+                let i = from + rs[x] - r0
+                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+                let sp = lexdb_cols.varAt(s, dir, pl, i)
+                if textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks) { append(mut &out, rs[x]) }
+            }
+            return Some(out)
+        }
+        LeafK.All(ks) {
+            var cur = collections.copyOf(rs)
+            for k2 in ks {
+                if len(cur) == 0 { break }
+                match rowsOf(leaf, from, &cur, r0, cnt, &k2) {
+                    Some(x) { cur = x }
+                    None { return None }
+                }
+            }
+            return Some(cur)
+        }
+        LeafK.Any(ks) {
+            var hit: []bool = array(n, false)
+            for k2 in ks {
+                match rowsOf(leaf, from, rs, r0, cnt, &k2) {
+                    Some(x) {
+                        // (x is rs's rows in order)
+                        var j = 0
+                        for r in x {
+                            while rs[j] != r { j += 1 }
+                            hit[j] = true
+                        }
+                    }
+                    None { return None }
+                }
+            }
+            var out: []int = []
+            for x in 0..n { if hit[x] { append(mut &out, rs[x]) } }
+            return Some(out)
+        }
+    }
+}
+
+// Runs of column leaf rows the kernels chose (cRunLazy), for the tests.
+var runs: int = 0
+
+pub fn noteRun() { runs += 1 }
+
+pub fn kernRuns(): int { return runs }
