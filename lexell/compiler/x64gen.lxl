@@ -3453,6 +3453,112 @@ fn (g: mut &Gen) branchBits(e: int, l: int, when: bool): bool {
     return true
 }
 
+// A range test of one x: x in [lo, hi] (inside) or outside it. ok false when e is no range test.
+type Rng = value record {
+    ok: bool
+    x: int          // the tree tested (a load that cannot fail)
+    c: int          // the type the compares are made in
+    lo: int
+    hi: int
+    inside: bool    // e is true inside the range (an &&), else outside it (an ||)
+}
+
+// One bound of a range: `x op k` (op <, <=, >, >=; k a 32-bit constant, x a load that cannot
+// fail, of an integer type of 64 bits at most). lower: the compare is true at and above v (x >= v),
+// else at and below v (x <= v). ok false when e is no such compare.
+type Bnd = value record {
+    ok: bool
+    x: int
+    c: int
+    v: int
+    lower: bool
+}
+
+fn (g: &Gen) bound(e: int): Bnd {
+    let none = Bnd{ok: false, x: -1, c: 0, v: 0, lower: false}
+    let n = g.u.nodes[e]
+    if n.k == ir.E_CAST && g.tk(n.ty) == ir.TY_BOOL { return g.bound(n.a) }
+    if n.k != ir.E_BIN || n.v < ir.OP_LT || n.v > ir.OP_GE { return none }
+    if !g.selCmp(n.c) || g.u.nodes[n.a].ty != n.c || !g.loadOnly(n.a) { return none }
+    let bn = g.u.nodes[n.b]
+    if bn.k != ir.E_INT || !x64.fits32(bn.v) || bn.v <= -2147483647 || bn.v >= 2147483647 { return none }
+    if !g.u.isSigned(n.c) && bn.v < 0 { return none }
+    let op = n.v
+    if op == ir.OP_GE { return Bnd{ok: true, x: n.a, c: n.c, v: bn.v, lower: true} }
+    if op == ir.OP_GT { return Bnd{ok: true, x: n.a, c: n.c, v: bn.v + 1, lower: true} }
+    if op == ir.OP_LE { return Bnd{ok: true, x: n.a, c: n.c, v: bn.v, lower: false} }
+    if op == ir.OP_LT { return Bnd{ok: true, x: n.a, c: n.c, v: bn.v - 1, lower: false} }
+    return none
+}
+
+// `x >= lo && x <= hi` (inside) or `x < lo || x > hi` (outside), the two compares in either
+// order and either strict or not.
+fn (g: &Gen) rangeOf(e: int): Rng {
+    let none = Rng{ok: false, x: -1, c: 0, lo: 0, hi: 0, inside: false}
+    let n = g.u.nodes[e]
+    if n.k == ir.E_CAST && g.tk(n.ty) == ir.TY_BOOL { return g.rangeOf(n.a) }
+    if n.k != ir.E_LAND && n.k != ir.E_LOR { return none }
+    let a = g.bound(n.a)
+    let b = g.bound(n.b)
+    if !a.ok || !b.ok || a.lower == b.lower || a.c != b.c || !g.sameTree(a.x, b.x) { return none }
+    let inside = n.k == ir.E_LAND
+    // inside: the lower bound is lo, the upper hi; outside: x <= lo - 1 or x >= hi + 1
+    let lb = if a.lower { a } else { b }
+    let ub = if a.lower { b } else { a }
+    let lo = if inside { lb.v } else { ub.v + 1 }
+    let hi = if inside { ub.v } else { lb.v - 1 }
+    if lo > hi || !x64.fits32(hi - lo) { return none }
+    return Rng{ok: true, x: a.x, c: a.c, lo: lo, hi: hi, inside: inside}
+}
+
+// Two inside ranges of one x that are one range with a bit set: [lo, hi] and [lo + m, hi + m], m
+// a power of two that no value of the first has and every value of the second has ('A'..'Z' and
+// 'a'..'z', m 0x20). Then x is in either exactly when x | m is in the second. m, or 0.
+fn caseBit(r1: Rng, r2: Rng): int {
+    let lo = if r1.lo < r2.lo { r1 } else { r2 }
+    let up = if r1.lo < r2.lo { r2 } else { r1 }
+    let m = up.lo - lo.lo
+    if lo.lo < 0 || m <= 0 || (m & (m - 1)) != 0 || up.hi - lo.hi != m { return 0 }
+    if (lo.lo & m) != 0 || (lo.hi & m) != 0 || (lo.lo >> pow2Exp(m)) != (lo.hi >> pow2Exp(m)) { return 0 }
+    return m
+}
+
+// A range test as one compare: x - lo against hi - lo, unsigned (below lo, x - lo wraps to above
+// any hi - lo of 32 bits). Jumps to l when the truth of e is when, and true; else false and no code.
+// `isLetter(c) || isDigit(c)` of a lexer is three such tests where it was five compares.
+fn (g: mut &Gen) branchRange(e: int, l: int, when: bool): bool {
+    var r = g.rangeOf(e)
+    var m = 0
+    if !r.ok {
+        let n = g.u.nodes[e]
+        if n.k != ir.E_LOR { return false }
+        let r1 = g.rangeOf(n.a)
+        let r2 = g.rangeOf(n.b)
+        if !r1.ok || !r2.ok || !r1.inside || !r2.inside || r1.c != r2.c || !g.sameTree(r1.x, r2.x) { return false }
+        m = caseBit(r1, r2)
+        if m == 0 { return false }
+        r = if r1.lo > r2.lo { r1 } else { r2 }
+    }
+    var reg = g.regOf(r.x)
+    if m != 0 {
+        if reg >= 0 { g.a.movRR(8, RAX, reg) } else { g.gen(r.x) }
+        g.a.aluI(x64.OR, 8, RAX, m)
+        if r.lo != 0 { g.a.aluI(x64.SUB, 8, RAX, r.lo) }
+        reg = RAX
+    } else if reg >= 0 && r.lo != 0 {
+        g.a.lea(RAX, x64.mem(reg, 0 - r.lo))
+        reg = RAX
+    } else if reg < 0 {
+        g.gen(r.x)
+        if r.lo != 0 { g.a.aluI(x64.SUB, 8, RAX, r.lo) }
+        reg = RAX
+    }
+    g.a.aluI(x64.CMP, 8, reg, r.hi - r.lo)
+    let jin = when == r.inside               // jump when x is inside
+    g.a.jcc(if jin { x64.CC_BE } else { x64.CC_A }, l)
+    return true
+}
+
 // The next link of an if-chain in the else part s: its if (an if, alone in a block or after the
 // declaration of the bool it tests, fused), and the condition tested; -1 when s is no link.
 fn (g: &Gen) chainLink(s: int): Link {
@@ -5447,10 +5553,29 @@ fn (g: mut &Gen) leaMul(dst: int, r: int, k: int): bool {
         g.a.lea(dst, x64.memx(-1, r, 8, 0))
     } else if k == 9 {
         g.a.lea(dst, x64.memx(r, r, 8, 0))
+    } else if k >= 16 && k <= 1073741824 && (k & (k - 1)) == 0 {
+        g.a.movRR(8, dst, r)
+        g.a.shiftI(x64.SHL, 8, dst, pow2Exp(k))
+    } else if k >= 17 && k <= 1073741825 && ((k - 1) & (k - 2)) == 0 || k >= 7 && k <= 1073741823 && ((k + 1) & k) == 0 {
+        // 2^j + 1 and 2^j - 1 as a shift and an add or a subtract: two cycles on the value's path
+        // where imul takes three (hash loops: `h * 33`). rcx is free here (a scratch register).
+        let plus = ((k - 1) & (k - 2)) == 0
+        let t = if dst == r { RCX } else { dst }
+        g.a.movRR(8, t, r)
+        g.a.shiftI(x64.SHL, 8, t, pow2Exp(if plus { k - 1 } else { k + 1 }))
+        g.a.alu(if plus { x64.ADD } else { x64.SUB }, 8, t, r)
+        if t != dst { g.a.movRR(8, dst, t) }
     } else {
         return false
     }
     return true
+}
+
+// The exponent of the power of two k.
+fn pow2Exp(k: int): int {
+    var j = 0
+    while (1 << j) < k { j += 1 }
+    return j
 }
 
 fn (g: mut &Gen) genBin(e: int) {
@@ -6240,6 +6365,8 @@ fn (g: mut &Gen) branch(e: int, l: int, when: bool) {
         g.branch(n.a, l, !when)
     } else if k == ir.E_LOR && g.branchBits(e, l, when) {
         // done: one bit test
+    } else if (k == ir.E_LAND || k == ir.E_LOR) && g.branchRange(e, l, when) {
+        // done: one compare
     } else if k == ir.E_LAND || k == ir.E_LOR {
         // a && b jumps when false if either is false; when true only if both are
         let isAnd = k == ir.E_LAND

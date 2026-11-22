@@ -509,7 +509,47 @@ tests/run/s04_str_eq_lengths.lxl checks every length 0 to 40 with a difference a
 | TPC-H server instructions per query | -0.22% geomean | |
 | apps, HTTP | level | level |
 
-## 14. Next, in order
+## 14. Range tests, bfold before loops, multiplies as shifts (as built)
+
+A profile of bench tokens against Rust after section 13: Lexell 1.09 times Rust's instructions and
+about 1.18 times its cycles. Three code-shape gaps in the byte loops, each general:
+
+- **A range test as one compare** (x64gen `branchRange`). In a branch, `x >= lo && x <= hi`
+  (either compare strict, either order, x a load that cannot fail, constants of 32 bits) is
+  `x - lo` against `hi - lo` unsigned, and `x < lo || x > hi` the jump the other way. Two ranges
+  of one x a bit m apart, the first without m and the second with it in every value
+  (`'A'..'Z' || 'a'..'z'`, m 0x20), are one compare of `x | m`. `isLetter(c) || isDigit(c)` was
+  five compare-and-branch pairs a byte; it is two compares and the `== '_'`.
+- **bfold before loops** (main.lxl). loops.lxl saw `while i < n && p(s[i])` as `bool b = i < n;
+  if (b) { S; b = V; } if (!b) break;`, which states no fact, so the `i += 1` in the body kept its
+  overflow check. After bfold it is `if (!(i < n)) break; S; if (!V) break;`. Proofs: compiler
+  +22 bounds and +28 overflow checks, lexdb +55 and +183; lexdb -8 KB of code.
+- **Wrapping multiplies by 2^j, 2^j + 1, 2^j - 1** (x64gen `leaMul`) as a move, a shift and an add
+  or a subtract: two cycles on the value's path where imul takes three (`h * 33` in a hash loop).
+  More instructions (three for one), fewer cycles.
+
+tests/run/native_range_fold.lxl (every kind, both orders, strict and not, the merged ranges, the
+extremes) and native_mul_shift.lxl (every constant form, kind and extreme) check them against the
+C build.
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| bench tokens (-O), 5 interleaved rounds | +3.0% | -5.2% |
+| perfsuite compile / run suite, two runs | -0.06% / +0.05% | +0.82, -0.22% / -0.41, -0.31% |
+| perfsuite tokens / strings / eza -T | +1.95 / 0.00 / -0.94% | -3.2, -2.8 / -1.0, -1.7 / -0.8, -1.0% |
+| apps json / jq / cmark | -1.26 / -1.92 / -0.62% | -1.31 / -2.11 / -1.99% |
+| apps regex / decimal | 0.00 / -0.19% | level |
+| TPC-H server instructions per query | +0.02% geomean (-0.09% to +0.38%) | |
+| point selects | within 0.01% | level |
+| HTTP server, 2 alternated rounds | | level (noise) |
+
+The first perfsuite run's compile suite (+0.82% cycles at -0.06% instructions) was placement: the
+second run had -0.22%.
+
+What remains in tokens is frame traffic (the token list's header and the slice staged through the
+frame), scalar replacement's ground.
+
+## 15. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
