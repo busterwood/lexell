@@ -256,7 +256,7 @@ pub fn entryOf(name: &str, n: int): LibFn {
         "localtimestamp" { return localTsFn }
         "current_date" { return currentDateFn }
         "current_time", "localtime" { return currentTimeFn }
-        "date_part" { return datePartFn }
+        "date_part", "extract" { return datePartFn }
         "date_trunc" { return dateTruncFn }
         "age" { return ageFn }
         "make_date" { return makeDateFn }
@@ -375,8 +375,16 @@ pub fn entryOf(name: &str, n: int): LibFn {
         else {}
     }
     if lexdb_sql.isQuant(name) { return quantEntry(name) }
+    // none: counted, for lexdb_bind.knownCall (an unknown function is refused when bound; the calls found pay nothing)
+    LIB_MISSES += 1
     return restFn
 }
+
+// How many lookups entryOf did not find (knownCall compares it before and after one).
+var LIB_MISSES: int = 0
+
+pub fn misses(): int { return LIB_MISSES }
+
 
 // ---- dates, times, timestamps and intervals (9.76; lexdb_time)
 
@@ -831,6 +839,19 @@ fn initcapFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val,
 
 fn reverseFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if anyNull(vs) { return Ok(Val.Null) }
+    match vs[0] {
+        // PostgreSQL 18's reverse(bytea): the bytes in the other order
+        Val.Bytes(b) {
+            var out = ""
+            var i = len(b) - 1
+            while i >= 0 {
+                out.addByte(b[i])
+                i -= 1
+            }
+            return Ok(Val.Bytes(out))
+        }
+        else {}
+    }
     return Ok(Val.Text(lexdb_func.reverse(&lexdb_sql.text(&vs[0]))))
 }
 
@@ -894,6 +915,23 @@ fn posArg(v: &Val, what: &str, min: int): Result[int, DbErr] {
     return Ok(k)
 }
 
+// posArg, in the T-SQL door (fl.tsql) with SQL Server's 19301 naming the argument as it does and the function (f).
+fn posArgIn(v: &Val, what: &str, min: int, fl: &lexdb_func.ReFlags, f: &str): Result[int, DbErr] {
+    if !fl.tsql { return posArg(v, what, min) }
+    let k = try intArg(v.clone(), &"regexp")
+    if k < min {
+        let w = match what.toStr() { "start" { "START" } "n" { "OCCURRENCE" } "endoption" { "RETURN_OPTION" } "subexpr" { "GROUP" } else { strings.toUpperAscii(what) } }
+        return Err(e("TS19301", &("'" + w + "' value should be greater than or equal to " + min.toStr() + " but '" + k.toStr() + "' is provided in '" + f + "' function.")))
+    }
+    return Ok(k)
+}
+
+// The flags of a call whose flags are at k, read before its other arguments (the T-SQL door's errors name them).
+fn reFlagsFirst(vs: &[]Val, k: int): Result[lexdb_func.ReFlags, DbErr] {
+    if k < len(vs) && lexdb_ops.isNull(&vs[k]) { return lexdb_func.reFlags(&"") }
+    return reFlagsAt(vs, k, len(vs))
+}
+
 // regexp_replace(s, p, r [, flags]) or (s, p, r, start [, N [, flags]])
 fn reReplaceFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let n = len(vs)
@@ -902,12 +940,10 @@ fn reReplaceFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Va
     var nth = -1
     var fk = 3
     if n >= 4 && lexdb_ops.kindOf(&vs[3]) != lexdb_sql.K_TEXT {
-        start = try posArg(&vs[3], &"start", 1)
-        fk = 4
-        if n >= 5 {
-            nth = try posArg(&vs[4], &"n", 0)
-            fk = 5
-        }
+        fk = if n >= 5 { 5 } else { 4 }
+        let fl0 = try reFlagsFirst(vs, fk)
+        start = try posArgIn(&vs[3], &"start", 1, &fl0, &"REGEXP_REPLACE")
+        if n >= 5 { nth = try posArgIn(&vs[4], &"n", 0, &fl0, &"REGEXP_REPLACE") }
     } else if n > 4 {
         return rest(name, vs)
     }
@@ -962,8 +998,8 @@ fn reSplitArrayFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result
 fn reCountFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let n = len(vs)
     if anyNull(vs) { return Ok(Val.Null) }
-    let start = if n >= 3 { try posArg(&vs[2], &"start", 1) } else { 1 }
     let fl = try reFlagsAt(vs, 3, n)
+    let start = if n >= 3 { try posArgIn(&vs[2], &"start", 1, &fl, &"REGEXP_COUNT") } else { 1 }
     let re = try lexdb_func.reCompile(&lexdb_sql.text(&vs[1]), &fl)
     let s = lexdb_sql.text(&vs[0])
     return Ok(Val.Int(len(lexdb_func.reMatches(&re, &s, start - 1, true, false))))
@@ -974,17 +1010,18 @@ fn reCountFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val,
 fn reFindOf(vs: &[]Val, inst: bool): Result[Val, DbErr] {
     let n = len(vs)
     if anyNull(vs) { return Ok(Val.Null) }
-    let start = if n >= 3 { try posArg(&vs[2], &"start", 1) } else { 1 }
-    let nth = if n >= 4 { try posArg(&vs[3], &"n", 1) } else { 1 }
-    var endOpt = 0
-    var fk = 4
-    if inst {
-        if n >= 5 { endOpt = try posArg(&vs[4], &"endoption", 0) }
-        if endOpt > 1 { return Err(e("22023", &("invalid value for parameter \"endoption\": " + endOpt.toStr()))) }
-        fk = 5
-    }
+    let fk = if inst { 5 } else { 4 }
     let fl = try reFlagsAt(vs, fk, n)
-    let sub = if n > fk + 1 { try posArg(&vs[fk + 1], &"subexpr", 0) } else { 0 }
+    let what = if inst { "REGEXP_INSTR" } else { "REGEXP_SUBSTR" }
+    let start = if n >= 3 { try posArgIn(&vs[2], &"start", 1, &fl, &what) } else { 1 }
+    let nth = if n >= 4 { try posArgIn(&vs[3], &"n", 1, &fl, &what) } else { 1 }
+    var endOpt = 0
+    if inst {
+        if n >= 5 { endOpt = try posArgIn(&vs[4], &"endoption", 0, &fl, &what) }
+        if endOpt > 1 && fl.tsql { return Err(e("TS19301", &("'RETURN_OPTION' value should be greater than or equal to 0 but '" + endOpt.toStr() + "' is provided in 'REGEXP_INSTR' function."))) }
+        if endOpt > 1 { return Err(e("22023", &("invalid value for parameter \"endoption\": " + endOpt.toStr()))) }
+    }
+    let sub = if n > fk + 1 { try posArgIn(&vs[fk + 1], &"subexpr", 0, &fl, &what) } else { 0 }
     let re = try lexdb_func.reCompile(&lexdb_sql.text(&vs[1]), &fl)
     let s = lexdb_sql.text(&vs[0])
     let ms = lexdb_func.reMatches(&re, &s, start - 1, true, false)
@@ -999,6 +1036,81 @@ fn reFindOf(vs: &[]Val, inst: bool): Result[Val, DbErr] {
 }
 
 fn reInstrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reFindOf(vs, true) }
+
+// SQL Server 2025's REGEXP_MATCHES(s, p [, flags]) (lexdb_srf, the T-SQL door: flags with lexdb_sql.RE_TSQL before them):
+// a row per match: match_id, start_position, end_position (characters, from 1; an empty match's both its place, at most
+// the text's length), match_value, substring_matches (JSON text: each group's value, start and length; the match's when
+// it has none; a group not taking part null).
+pub fn tsqlMatchRows(vs: &[]Val): Result[[][]Val, DbErr] {
+    var out: [][]Val = []
+    let fl = try reFlagsAt(vs, 2, len(vs))
+    if anyNull(vs) { return Ok(out) }
+    let s = lexdb_sql.text(&vs[0])
+    let re = try lexdb_func.reCompile(&lexdb_sql.text(&vs[1]), &fl)
+    let nch = strings.runeCount(&s)
+    var id = 0
+    for m in lexdb_func.reMatches(&re, &s, 0, true, false) {
+        id += 1
+        let a = lexdb_func.charPos(&s, m[0])
+        let len0 = strings.runeCount(&(s[m[0]..m[1]].toStr()))
+        let start = if len0 == 0 && a > nch && nch > 0 { nch } else { a }
+        let end = if len0 == 0 { start } else { start + len0 - 1 }
+        var js = "["
+        let ng = len(m) / 2 - 1
+        for g in (if ng == 0 { 0 } else { 1 })..ng + 1 {
+            if len(js) > 1 { js += "," }
+            if m[2 * g] < 0 {
+                js += "{\"value\":null,\"start\":null,\"length\":null}"
+            } else {
+                let v = s[m[2 * g]..m[2 * g + 1]].toStr()
+                let gl = strings.runeCount(&v)
+                let gs0 = lexdb_func.charPos(&s, m[2 * g])
+                let gs = if gl == 0 && gs0 > nch && nch > 0 { nch } else { gs0 }
+                js += "{\"value\":" + jsonStr(&v) + ",\"start\":" + gs.toStr() + ",\"length\":" + gl.toStr() + "}"
+            }
+        }
+        js += "]"
+        append(mut &out, [Val.Int(id), Val.Int(start), Val.Int(end), Val.Text(s[m[0]..m[1]].toStr()), Val.Text(js)])
+    }
+    return Ok(out)
+}
+
+// SQL Server 2025's REGEXP_SPLIT_TO_TABLE(s, p [, flags]): value, ordinal.
+pub fn tsqlSplitRows(vs: &[]Val): Result[[][]Val, DbErr] {
+    var out: [][]Val = []
+    let fl = try reFlagsAt(vs, 2, len(vs))
+    if anyNull(vs) { return Ok(out) }
+    let re = try lexdb_func.reCompile(&lexdb_sql.text(&vs[1]), &fl)
+    var k = 0
+    for p in lexdb_func.reSplit(&re, &lexdb_sql.text(&vs[0])) {
+        k += 1
+        append(mut &out, [Val.Text(p), Val.Int(k)])
+    }
+    return Ok(out)
+}
+
+// A JSON string of s: " and \ escaped, control characters as \n, \t, ... or \u00XX.
+fn jsonStr(s: &str): str {
+    var b = "\""
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '"' { b += "\\\"" }
+        else if c == '\\' { b += "\\\\" }
+        else if c == '\n' { b += "\\n" }
+        else if c == '\r' { b += "\\r" }
+        else if c == '\t' { b += "\\t" }
+        else if c == 8 { b += "\\b" }
+        else if c == 12 { b += "\\f" }
+        else if c < 32 {
+            b += "\\u00"
+            b.addByte(if c < 16 { '0' } else { '1' })
+            let d = c % 16
+            b.addByte(if d < 10 { '0' + d } else { 'a' + d - 10 })
+        }
+        else { b.addByte(c) }
+    }
+    return b + "\""
+}
 fn reSubstrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return reFindOf(vs, false) }
 
 // -- arrays (9.27)

@@ -1,0 +1,400 @@
+// lexdb_tsqlfmt: T-SQL's FORMAT(value, format [, culture]) (design/lexdb-new-features.md, S21), the .NET format strings
+// SQL Server hands its values to: for numbers the standard ones (N, F, D, X, P, C, E, G, each with a precision) and the
+// custom ones (0, #, the group separator, a decimal point, %, literals); for dates and times the standard ones (d, D,
+// t, T, f, F, g, G, M, Y, s, u) and the custom ones (yyyy, MM, dd, HH, mm, ss, fff, tt, ...). The culture en-US
+// (SQL Server's default under us_english); de-DE swaps the separators of the numbers. A format .NET refuses gives NULL,
+// as SQL Server's. Checked against SQL Server 2025 (tests/lexdb/run/tds_newfix.lxl).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// A culture's separators.
+type Cul = value record { grp: str; dec: str; de: bool }
+
+fn culOf(name: &str): Cul {
+    let l = strings.toLowerAscii(name)
+    if l == "de-de" || l == "de" { return Cul{grp: ".", dec: ",", de: true} }
+    return Cul{grp: ",", dec: ".", de: false}
+}
+
+// FORMAT's value: vs the value, the format and the culture ('' en-US).
+pub fn format(vs: &[]Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 2 { return Ok(Val.Null) }
+    for v in vs {
+        match v {
+            Val.Null { return Ok(Val.Null) }
+            else {}
+        }
+    }
+    let f = lexdb_sql.text(&vs[1])
+    let cul = culOf(&(if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "" }))
+    match vs[0] {
+        Val.Int(n) { return numFormat(&Decimal.fromInt(n), true, &f, &cul, n) }
+        Val.Num(d) { return numFormat(&d, false, &f, &cul, 0) }
+        Val.Float(x) { return floatFormat(x, &f, &cul) }
+        Val.Real(x) { return floatFormat(x, &f, &cul) }
+        Val.Date(d) { return dateFormat(d * lexdb_time.DAY_US, &f) }
+        Val.Ts(us) { return dateFormat(us, &f) }
+        Val.Tstz(us) { return dateFormat(lexdb_time.tstzToTs(us, z), &f) }
+        Val.Text(_) { return Err(e("TS8116", "Argument data type varchar is invalid for argument 1 of format function.")) }
+        else { return Ok(Val.Null) }
+    }
+}
+
+fn floatFormat(x: float, f: &str, cul: &Cul): Result[Val, DbErr] {
+    match Decimal.parse(&(x.toStr())) {
+        Ok(d) { return numFormat(&d, false, f, cul, 0) }
+        Err(_) { return Ok(Val.Null) }
+    }
+}
+
+// ---- numbers
+
+fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+fn numFormat(d: &Decimal, isInt: bool, f: &str, cul: &Cul, n: int): Result[Val, DbErr] {
+    if len(f) == 0 { return Ok(Val.Text(plainText(d))) }
+    // a letter and at most two digits: a standard format
+    var std = (f[0] >= 'a' && f[0] <= 'z') || (f[0] >= 'A' && f[0] <= 'Z')
+    for i in 1..len(f) { if !isDigit(f[i]) { std = false } }
+    if std && len(f) > 3 { std = false }
+    if !std { return Ok(Val.Text(custom(d, f, cul))) }
+    let hasP = len(f) > 1
+    let p = if hasP { strings.parseIntOpt(&(f[1..len(f)].toStr())).unwrapOr(0) } else { -1 }
+    let k = f[0]
+    if k == 'N' || k == 'n' { return Ok(Val.Text(fixed(d, if hasP { p } else { 2 }, true, cul))) }
+    if k == 'F' || k == 'f' { return Ok(Val.Text(fixed(d, if hasP { p } else { 2 }, false, cul))) }
+    if k == 'D' || k == 'd' {
+        if !isInt { return Ok(Val.Null) }
+        let s = d.abs().toStr()
+        return Ok(Val.Text((if d.isNeg() { "-" } else { "" }) + strings.padLeft(&s, if hasP { p } else { 0 }, '0')))
+    }
+    if k == 'X' || k == 'x' {
+        if !isInt { return Ok(Val.Null) }
+        // a negative value's two's complement, of an int's 32 bits or a bigint's 64
+        var u = n
+        var digits = 16
+        if n >= -2147483648 && n <= 2147483647 {
+            digits = 8
+            if n < 0 { u = n + 4294967296 }
+        }
+        var h = ""
+        if u == 0 { h = "0" }
+        var c = 0
+        while u != 0 && c < digits {
+            let q = u & 15
+            h = (if q < 10 { (q).toStr() } else { (if k == 'X' { ["A", "B", "C", "D", "E", "F"] } else { ["a", "b", "c", "d", "e", "f"] })[q - 10].toStr() }) + h
+            u = (u >> 4) & 0x0fffffffffffffff
+            c += 1
+        }
+        return Ok(Val.Text(strings.padLeft(&h, if hasP { p } else { 0 }, '0')))
+    }
+    if k == 'P' || k == 'p' {
+        let x = d.mul(Decimal.fromInt(100))
+        return Ok(Val.Text(fixed(&x, if hasP { p } else { 2 }, true, cul) + (if cul.de { " %" } else { "%" })))
+    }
+    if k == 'C' || k == 'c' {
+        let t = fixed(&d.abs(), if hasP { p } else { 2 }, true, cul)
+        let neg = d.isNeg() && t != fixed(&Decimal.zero(), if hasP { p } else { 2 }, true, cul)
+        if cul.de { return Ok(Val.Text((if neg { "-" } else { "" }) + t + " €")) }
+        return Ok(Val.Text(if neg { "($" + t + ")" } else { "$" + t }))
+    }
+    if k == 'E' || k == 'e' { return Ok(Val.Text(sci(d, if hasP { p } else { 6 }, k == 'E', 3, false, cul))) }
+    if k == 'G' || k == 'g' {
+        if !hasP || p == 0 { return Ok(Val.Text(plainText(d))) }
+        return Ok(Val.Text(general(d, p, k == 'G', cul)))
+    }
+    return Ok(Val.Null)
+}
+
+// A decimal's own text (its scale kept), as .NET's G of a decimal.
+fn plainText(d: &Decimal): str { return d.toStr() }
+
+// The digits of |d| rounded to scale p, half away from zero: the integer part and the fraction's p digits.
+fn parts(d: &Decimal, p: int): []str {
+    let q = d.abs().quantize(p, Rounding.HALF_AWAY).unwrapOr(d.abs())
+    let s = q.toStr()
+    let dot = strings.indexOf(&s, ".", 0)
+    if dot < 0 { return [s, strings.repeat("0", p)] }
+    return [s[0..dot].toStr(), strings.padRight(&(s[dot + 1..len(s)].toStr()), p, '0')]
+}
+
+fn grouped(ip: &str, grp: &str): str {
+    var out = ""
+    let n = len(ip)
+    for i in 0..n {
+        if i > 0 && (n - i) % 3 == 0 { out += grp }
+        out.addByte(ip[i])
+    }
+    return out
+}
+
+// N (group) and F: p decimals, the sign only when what shows is not zero.
+fn fixed(d: &Decimal, p: int, group: bool, cul: &Cul): str {
+    let ps = parts(d, p)
+    let ip = if group { grouped(&ps[0], &cul.grp) } else { ps[0].clone() }
+    let body = ip + (if p > 0 { cul.dec + ps[1] } else { "" })
+    var zero = true
+    for i in 0..len(ps[0]) { if ps[0][i] != '0' { zero = false } }
+    for i in 0..len(ps[1]) { if ps[1][i] != '0' { zero = false } }
+    return (if d.isNeg() && !zero { "-" } else { "" }) + body
+}
+
+// Digits and a number with them: sigDigits' exponent, roundTo's carry (1 or 0).
+type Ds = record { ds: str; k: int }
+
+// |d|'s significant digits and the exponent of the first: "12345", 3 for 1234.5.
+fn sigDigits(d: &Decimal): Ds {
+    let s = d.abs().toStr()
+    let dot = strings.indexOf(&s, ".", 0)
+    let ip = if dot < 0 { s.clone() } else { s[0..dot].toStr() }
+    let fp = if dot < 0 { "" } else { s[dot + 1..len(s)].toStr() }
+    var all = ip + fp
+    var lead = 0
+    while lead < len(all) && all[lead] == '0' { lead += 1 }
+    if lead == len(all) { return Ds{ds: "0", k: 0} }
+    let ex = len(ip) - 1 - lead
+    var t = all[lead..len(all)].toStr()
+    while len(t) > 1 && t[len(t) - 1] == '0' { t = t[0..len(t) - 1].toStr() }
+    return Ds{ds: t, k: ex}
+}
+
+// digits rounded to k (half away), and whether it carried into a new digit (999 to 1000).
+fn roundTo(ds: &str, k: int): Ds {
+    if len(ds) <= k { return Ds{ds: strings.padRight(ds, k, '0'), k: 0} }
+    var b: []int = []
+    for i in 0..k { append(mut &b, int(ds[i] - '0')) }
+    if ds[k] >= '5' {
+        var i = k - 1
+        var carry = true
+        while carry && i >= 0 {
+            b[i] += 1
+            if b[i] == 10 { b[i] = 0 } else { carry = false }
+            i -= 1
+        }
+        if carry {
+            var out = "1"
+            for x in b { out += x.toStr() }
+            return Ds{ds: out[0..k].toStr(), k: 1}
+        }
+    }
+    var out = ""
+    for x in b { out += x.toStr() }
+    return Ds{ds: out, k: 0}
+}
+
+// d.ddd...E+xxx: p decimals, the exponent of at least w digits.
+fn sci(d: &Decimal, p: int, up: bool, w: int, trim: bool, cul: &Cul): str {
+    let sd = sigDigits(d)
+    var ex = sd.k
+    let r = roundTo(&sd.ds, p + 1)
+    ex += r.k
+    if d.isZero() { ex = 0 }
+    var frac = r.ds[1..len(r.ds)].toStr()
+    if trim { while len(frac) > 0 && frac[len(frac) - 1] == '0' { frac = frac[0..len(frac) - 1].toStr() } }
+    let sign = if d.isNeg() && !d.isZero() { "-" } else { "" }
+    let es = (if ex < 0 { "-" } else { "+" }) + strings.padLeft(&((if ex < 0 { 0 - ex } else { ex }).toStr()), w, '0')
+    return sign + r.ds[0..1].toStr() + (if len(frac) > 0 { cul.dec + frac } else { "" }) + (if up { "E" } else { "e" }) + es
+}
+
+// G with p significant digits: fixed if the exponent is from -5 to p - 1, else scientific (E+xx); no trailing zeros.
+fn general(d: &Decimal, p: int, up: bool, cul: &Cul): str {
+    let sd = sigDigits(d)
+    var ex = sd.k
+    let r = roundTo(&sd.ds, p)
+    ex += r.k
+    if ex >= p || ex < -5 { return sci(d, p - 1, up, 2, true, cul) }
+    let sc = max(p - 1 - ex, 0)
+    var t = fixed(d, sc, false, cul)
+    if strings.contains(&t, &cul.dec) {
+        while strings.endsWith(&t, "0") { t = t[0..len(t) - 1].toStr() }
+        if strings.endsWith(&t, &cul.dec) { t = t[0..len(t) - len(cul.dec)].toStr() }
+    }
+    return t
+}
+
+// A custom numeric format (its first section): 0 a digit always shown, # one shown where it is significant, the group
+// separator between the integer part's placeholders, a decimal point, % (the value a hundred times), and the rest
+// (quoted or escaped text too) as written before and after the number.
+fn custom(d0: &Decimal, f0: &str, cul: &Cul): str {
+    var f = f0.toStr()
+    let semi = strings.indexOf(&f, ";", 0)
+    if semi >= 0 { f = f[0..semi].toStr() }
+    var pre = ""
+    var post = ""
+    var intZeros = 0
+    var fracZeros = 0
+    var fracAll = 0
+    var group = false
+    var pct = false
+    var seenPh = false
+    var inFrac = false
+    var i = 0
+    let n = len(f)
+    while i < n {
+        let c = f[i]
+        if c == '\'' || c == '"' {
+            var j = i + 1
+            var lit = ""
+            while j < n && f[j] != c {
+                lit.addByte(f[j])
+                j += 1
+            }
+            if seenPh { post += lit } else { pre += lit }
+            i = j + 1
+            continue
+        }
+        if c == '\\' && i + 1 < n {
+            if seenPh { post.addByte(f[i + 1]) } else { pre.addByte(f[i + 1]) }
+            i += 2
+            continue
+        }
+        if c == '0' || c == '#' {
+            seenPh = true
+            if len(post) > 0 { post = "" }
+            if inFrac {
+                fracAll += 1
+                if c == '0' { fracZeros = fracAll }
+            } else if c == '0' { intZeros += 1 }
+        } else if c == '.' {
+            inFrac = true
+            seenPh = true
+        } else if c == ',' {
+            if seenPh && !inFrac { group = true }
+        } else if c == '%' {
+            pct = true
+            if seenPh { post += "%" } else { pre += "%" }
+        } else {
+            if seenPh { post.addByte(c) } else { pre.addByte(c) }
+        }
+        i += 1
+    }
+    let d = if pct { d0.mul(Decimal.fromInt(100)) } else { d0.clone() }
+    let ps = parts(&d, fracAll)
+    var ip = ps[0].clone()
+    if ip == "0" && intZeros == 0 { ip = "" }
+    ip = strings.padLeft(&ip, intZeros, '0')
+    if group { ip = grouped(&ip, &cul.grp) }
+    var fp = ps[1].clone()
+    while len(fp) > fracZeros && fp[len(fp) - 1] == '0' { fp = fp[0..len(fp) - 1].toStr() }
+    var zero = true
+    for k in 0..len(ps[0]) { if ps[0][k] != '0' { zero = false } }
+    for k in 0..len(ps[1]) { if ps[1][k] != '0' { zero = false } }
+    let body = ip + (if len(fp) > 0 { cul.dec + fp } else { "" })
+    return (if d.isNeg() && !zero { "-" } else { "" }) + pre + body + post
+}
+
+// ---- dates and times (en-US)
+
+const MONTHS: []str = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+const DAYS: []str = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn dateFormat(us: int, f: &str): Result[Val, DbErr] {
+    if len(f) == 0 { return dateFormat(us, &"G") }
+    if len(f) == 1 {
+        // the standard ones
+        let pat = match f.toStr() {
+            "d" { "M/d/yyyy" }
+            "D" { "dddd, MMMM d, yyyy" }
+            "t" { "h:mm tt" }
+            "T" { "h:mm:ss tt" }
+            "f" { "dddd, MMMM d, yyyy h:mm tt" }
+            "F" { "dddd, MMMM d, yyyy h:mm:ss tt" }
+            "g" { "M/d/yyyy h:mm tt" }
+            "G" { "M/d/yyyy h:mm:ss tt" }
+            "M", "m" { "MMMM d" }
+            "Y", "y" { "MMMM yyyy" }
+            "s" { "yyyy'-'MM'-'dd'T'HH':'mm':'ss" }
+            "u" { "yyyy'-'MM'-'dd HH':'mm':'ss'Z'" }
+            else { "" }
+        }
+        if len(pat) == 0 { return Ok(Val.Null) }
+        return Ok(Val.Text(customDate(us, &pat)))
+    }
+    return Ok(Val.Text(customDate(us, f)))
+}
+
+fn customDate(us: int, f: &str): str {
+    let days = floorDiv(us, lexdb_time.DAY_US)
+    let tod = us - days * lexdb_time.DAY_US
+    let dt = lexdb_time.dateOf(days)
+    let wd = ((days + 6) % 7 + 7) % 7
+    let h = tod / 3600000000
+    let mi = tod / 60000000 % 60
+    let se = tod / 1000000 % 60
+    let frac = tod % 1000000
+    var out = ""
+    var i = 0
+    let n = len(f)
+    while i < n {
+        let c = f[i]
+        var k = 1
+        while i + k < n && f[i + k] == c { k += 1 }
+        if c == '\'' || c == '"' {
+            var j = i + 1
+            while j < n && f[j] != c {
+                out.addByte(f[j])
+                j += 1
+            }
+            i = j + 1
+            continue
+        }
+        if c == '\\' && i + 1 < n {
+            out.addByte(f[i + 1])
+            i += 2
+            continue
+        }
+        if c == '%' && i + 1 < n {
+            i += 1
+            continue
+        }
+        if c == 'y' {
+            if k == 1 { out += (dt.year % 100).toStr() }
+            else if k == 2 { out += strings.padLeft(&((dt.year % 100).toStr()), 2, '0') }
+            else { out += strings.padLeft(&(dt.year.toStr()), k, '0') }
+        } else if c == 'M' {
+            if k == 1 { out += dt.month.toStr() }
+            else if k == 2 { out += strings.padLeft(&(dt.month.toStr()), 2, '0') }
+            else if k == 3 { out += MONTHS[dt.month - 1][0..3] }
+            else { out += &MONTHS[dt.month - 1] }
+        } else if c == 'd' {
+            if k == 1 { out += dt.day.toStr() }
+            else if k == 2 { out += strings.padLeft(&(dt.day.toStr()), 2, '0') }
+            else if k == 3 { out += DAYS[wd][0..3] }
+            else { out += &DAYS[wd] }
+        } else if c == 'H' {
+            out += if k == 1 { h.toStr() } else { strings.padLeft(&(h.toStr()), 2, '0') }
+        } else if c == 'h' {
+            let h12 = if h % 12 == 0 { 12 } else { h % 12 }
+            out += if k == 1 { h12.toStr() } else { strings.padLeft(&(h12.toStr()), 2, '0') }
+        } else if c == 'm' {
+            out += if k == 1 { mi.toStr() } else { strings.padLeft(&(mi.toStr()), 2, '0') }
+        } else if c == 's' {
+            out += if k == 1 { se.toStr() } else { strings.padLeft(&(se.toStr()), 2, '0') }
+        } else if c == 'f' || c == 'F' {
+            // the fraction's first k digits of seven (lexdb keeps six)
+            var fs = strings.padLeft(&(frac.toStr()), 6, '0') + "0"
+            fs = fs[0..min(k, 7)].toStr()
+            if c == 'F' { while len(fs) > 0 && fs[len(fs) - 1] == '0' { fs = fs[0..len(fs) - 1].toStr() } }
+            out += fs
+        } else if c == 't' {
+            let am = if h < 12 { "AM" } else { "PM" }
+            out += if k == 1 { am[0..1].toStr() } else { am }
+        } else {
+            for x in 0..k { out.addByte(c) }
+        }
+        i += k
+    }
+    return out
+}

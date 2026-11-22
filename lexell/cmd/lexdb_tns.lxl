@@ -1682,7 +1682,7 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
     let sk = tns.statementKind(&text)
     if sk == tns.S_QUERY || sk == tns.S_DML {
         // calls of stored functions with constant arguments are made now (and again at each execute)
-        let nf = c.nlsFormats()
+        let nf = c.parseOpts()
         lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
         let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess)
         let ex = try lexdb_plsql.expandCalls(&c.prog, mut &c.pl, mut &c.sess, &text)
@@ -1698,7 +1698,7 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
     } else if isAdminSql(&text) {
         c.cursors[i].special = SP_ADMIN
     } else {
-        match lexdb_parse.oraParseNls(&text, c.nlsFormats()) {
+        match lexdb_parse.oraParseNls(&text, c.parseOpts()) {
             Ok(x) { stmts = x }
             Err(e) { return Err(syntaxRefined(&text, &e)) }
         }
@@ -2315,7 +2315,7 @@ fn (c: mut &Conn) runPlsql(i: int, rq: &Req) {
     let runs = max(len(rq.vals), 1)
     var res = lexdb_plsql.BlockRes{err: None, outs: [], curs: [], implicit: [], rows: 0}
     if c.nls.redo { c.reapply() }
-    let nf = c.nlsFormats()
+    let nf = c.parseOpts()
     lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
     match lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) {
         Ok(_) {}
@@ -2419,7 +2419,7 @@ fn (c: mut &Conn) unitDdl(ud: int, sql: &str, id: int) {
         }
     }
     if c.nls.redo { c.reapply() }
-    let nf = c.nlsFormats()
+    let nf = c.parseOpts()
     lexdb_plsql.setNls(mut &c.pl, nf, &c.user)
     var r: Result[bool, DbErr] = Ok(false)
     match lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) {
@@ -2580,6 +2580,14 @@ fn (c: &Conn) nlsFormats(): []str {
     return [dd, tt, zz]
 }
 
+// What the parser takes from the session: the NLS formats, and lexdb_parse.GB_POS after them when GROUP BY positions
+// are enabled.
+fn (c: &Conn) parseOpts(): []str {
+    var f = c.nlsFormats()
+    if len(c.nls.vals) > 0 && c.nls.get("GROUP_BY_POSITION_ENABLED") == "TRUE" { append(mut &f, lexdb_parse.GB_POS) }
+    return f
+}
+
 // Every cursor's statement is read again (the NLS formats it was made under changed).
 fn (c: mut &Conn) forgetParsed() {
     for i in 0..len(c.cursors) {
@@ -2646,6 +2654,14 @@ fn (c: mut &Conn) setParam(name: &str, v: &str, quoted: bool): Result[Unit, DbEr
         }
         c.forgetParsed()
         c.reapply()
+        return Ok(Unit{})
+    }
+    if name == "GROUP_BY_POSITION_ENABLED" {
+        // a GROUP BY number is a position of the select list (TRUE) or a constant (FALSE, the default): lexdb_parse.GB_POS
+        let u = strings.toUpperAscii(v)
+        if u != "TRUE" && u != "FALSE" { return Err(oraE(922, "missing or invalid option")) }
+        c.nls.put(name, if u == "TRUE" { "TRUE" } else { "" })
+        c.forgetParsed()
         return Ok(Unit{})
     }
     if lexdb_oraadm.isIgnored(name) || quoted && strings.startsWith(name, "_") { return Ok(Unit{}) }

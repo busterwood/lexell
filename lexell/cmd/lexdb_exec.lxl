@@ -232,6 +232,18 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         for c in lexdb_pgcat.relCols(&name[1..len(name)]) { append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
+    if name == "tsql_regexp_matches" {
+        // SQL Server 2025's (lexdb_srf)
+        let names: []str = ["match_id", "start_position", "end_position", "match_value", "substring_matches"]
+        let oids: []int = [lexdb_sql.OID_INT8, lexdb_sql.OID_INT4, lexdb_sql.OID_INT4, lexdb_sql.OID_TEXT, lexdb_sql.OID_TEXT]
+        for i in 0..len(names) { append(mut &out, OutCol{name: names[i].clone(), oid: oids[i], spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "tsql_regexp_split_to_table" {
+        append(mut &out, OutCol{name: "value", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "ordinal", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1})
+        return Ok(out)
+    }
     if name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" {
         // (9.92) their values made by the call, as in a select list
         append(mut &out, OutCol{name: name.clone(), oid: if name == "regexp_matches" { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) } else { lexdb_sql.OID_TEXT }, spell: "", coll: "", scale: -1})
@@ -1292,6 +1304,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 // a char(n) column read as it is: of length n (W10's GROUP BY and DISTINCT compare it exactly)
                 if col.typ.oid == lexdb_sql.OID_BPCHAR && sp.sel.setop == 0 && i < len(sp.sel.exprs) { col.typ.len = lexdb_bind.bpLen(&sp.sel.exprs[i], &sp.sel.q.cols) }
                 if i >= len(f.cols) || (f.cols[i] == "dummy" && sp.sel.srf == "#values:01") { col.spell = if i >= len(f.cols) { fcols[i].spell.clone() } else { "DUMMY" } }
+                else if i < len(subs[f.sub].spells) { col.spell = subs[f.sub].spells[i].clone() }     // T-SQL's and Oracle's names as written
                 col.coll = fcols[i].coll.clone()
                 append(mut &t.unshare().cols, col)
             }
@@ -2479,6 +2492,7 @@ fn exprScale(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
             // Oracle's DATE: a time to the second
             if f == "#ora_todate" || f == "#ora_addmonths" || f == "#ora_lastday" || f == "#ora_nextday" { return 0 }
             if (f == "#ora_add" || f == "#ora_sub" || f == "#ora_trunc") && len(args) > 0 && exprScale(&args[0], cols) == 0 { return 0 }
+            if f == "#ora_trunc" && len(args) > 0 && lexdb_bind.oraStamp(&args[0], cols) >= 0 { return 0 }       // TRUNC(timestamp): a DATE
             if f == "date_trunc" && len(args) == 2 {
                 match args[0] {
                     Expr.Lit(v) {
@@ -2491,6 +2505,8 @@ fn exprScale(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
                 }
             }
             if f == "case else" && len(args) == 3 { return exprScale(&args[2], cols) }
+            // T-SQL's DATEADD: its date's type (datetime, smalldatetime, datetime2(n); a string's is datetime: lexdb_parse.tsqlCall)
+            if f == "#dateadd" && len(args) == 3 { return exprScale(&args[2], cols) }
             return -1
         }
         Expr.Col(n, _) {
@@ -9809,7 +9825,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var groupBy: []Expr = []
     var groupKinds: []int = []
     for g in s.group {
-        let r = try lexdb_bind.resolveGroup(&g, &q.cols, &outs, &exprs, mut &sc.names)
+        let r = try lexdb_bind.resolveGroupIn(&g, &q.cols, &outs, &exprs, mut &sc.names, s.mdialect)
         if lexdb_bind.hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
         append(mut &groupKinds, lexdb_bind.groupKind(&r, &q.cols, &sc.names))
         append(mut &groupBy, r)
@@ -9901,7 +9917,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var oRewritten = false
     var having: Option[Expr] = None
     match s.having {
-        Some(h) { having = Some(try lexdb_bind.resolve(&h, &q.cols, len(q.cols), mut &sc.names)) }
+        Some(h) { having = Some(try lexdb_bind.resolveHaving(&h, &q.cols, &outs, &exprs, mut &sc.names, s.mdialect)) }
         None {}
     }
     // HAVING as resolved: the plan's Filter's (bh), moved there by the
@@ -10112,10 +10128,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             append(mut &okLevels, all && len(groupBy) > 0 && len(lv.t.pk) > 0 && len(s.gsets) == 0)
         }
-        for x in exprs { try checkGrouped(&x, &gtexts, &okLevels, &q) }
-        for x in order { try checkGrouped(&x, &gtexts, &okLevels, &q) }
+        for x in exprs { try lexdb_bind.groupedIn(checkGrouped(&x, &gtexts, &okLevels, &q), s) }
+        for x in order { try lexdb_bind.groupedIn(checkGrouped(&x, &gtexts, &okLevels, &q), s) }
         match having {
-            Some(h) { try checkGrouped(&h, &gtexts, &okLevels, &q) }
+            Some(h) { try lexdb_bind.groupedIn(checkGrouped(&h, &gtexts, &okLevels, &q), s) }
             None {}
         }
         for d in wdefs {

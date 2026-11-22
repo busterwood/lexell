@@ -1,0 +1,177 @@
+// lexdb over TNS: the audit's wrong answers and wrong errors in the Oracle door (design/lexdb-new-features.md: O5 a table value
+// constructor's column names as written and ORA-00931 / ORA-63814 without them, a CTE's column list's names; O8 GROUP BY's
+// position (a constant, ORA-03162, unless ALTER SESSION SET group_by_position_enabled = TRUE) and HAVING's select alias; O15
+// TRUNC of a TIMESTAMP is a DATE (the CREATE TABLE ... AS's column); O16 SUM and AVG of intervals; O28 UTL_ENCODE.BASE64_ENCODE and
+// BASE64_DECODE (RAW in, RAW out) with UTL_RAW.CAST_TO_RAW and CAST_TO_VARCHAR2; a number running into _ (ORA-00911); an unknown
+// function refused when bound, an empty input too (ORA-00904)), checked against Oracle Database Free 23.26 (gen_oracle.py --check:
+// the answers below are Oracle's). Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the
+// answer, or DIFFERENT and both.
+// expect: setup: 19 statements
+// expect: same: error 931
+// expect: same: error 63814
+// expect: same: P,q = 1|'a';2|'bb'
+// expect: same: P,q = 2|'bb'
+// expect: same: P,q = 1|2
+// expect: same: N,S = 5|65
+// expect: same: error 3162
+// expect: same: error 3162
+// expect: same: N = 5
+// expect: same: K,N = 1|2;2|1;3|1;NULL|1
+// expect: same: K,N = 1|2
+// expect: same: K,N = 2|1;3|1
+// expect: same: A,B2,N = 1|20|1;2|30|1
+// expect: same: KK,N = 
+// expect: same: KK,N = 'k0'|16;'k1'|16;'k2'|16;'k3'|17;'k4'|16;'k5'|16;NULL|2
+// expect: same: 0
+// expect: same: A,C = 1|2;2|1;3|1;NULL|1
+// expect: same: A,B,C = 1|10|1;1|20|1;2|30|1;3|NULL|1;NULL|5|1
+// expect: same: K2,C = 'k0'|487;'k1'|486;'k2'|486;'k3'|486;'k4'|487;'k5'|487;NULL|81
+// expect: same: 0
+// expect: same: error 3162
+// expect: same: error 922
+// expect: same: D1,D2,A = 4|0.25|'2024-03-01T00:00:00'
+// expect: same: ID,D = 1|1;25|1;3000|1
+// expect: same: D,N = '2024-01-01T00:00:00'|23;'2024-01-02T00:00:00'|7
+// expect: same: S,A,N = '+000000001 05:00:00.000000000'|'+000000000 14:30:00.000000000'|3
+// expect: same: S = '+000000002-01'
+// expect: same: S,A = NULL|NULL
+// expect: same: K2,S,N = 'k0'|'+000000008 11:08:18.000000000'|487;'k1'|'+000000008 10:18:00.000000000'|486;'k2'|'+000000008 10:17:42.000000000'|486;'k3'|'+000000008 10:17:24.000000000'|486;'k4'|'+000000008 11:07:40.000000000'|487;'k5'|'+000000008 11:07:59.000000000'|487;NULL|'+000000001 10:07:57.000000000'|81
+// expect: same: S,A = '+000000000 00:00:10.000000000'|'+000000000 00:00:02.500000000'
+// expect: same: M,A = 0|'+000000000 00:00:45.000000000';1|'+000000000 00:00:33.000000000';2|'+000000000 00:00:39.000000000'
+// expect: same: E = '61476B3D'
+// expect: same: E = 'aGk='
+// expect: same: D = 'hi'
+// expect: same: E,D = '41514C2F'|'0102FF'
+// expect: same: R,V = NULL|NULL
+// expect: same: error 29261
+// expect: same: ID,E = 1|'dzE=';2|'dzI=';3|'dzM='
+// expect: same: error 911
+// expect: same: X1F = 0
+// expect: same: error 904
+// expect: same: error 904
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg values (0)\ninsert into dg values (1)\ninsert into dg values (2)\ninsert into dg values (3)\ninsert into dg values (4)\ninsert into dg values (5)\ninsert into dg values (6)\ninsert into dg values (7)\ninsert into dg values (8)\ninsert into dg values (9)\ncreate table gt (a number, b number)\ninsert into gt values (1, 10)\ninsert into gt values (1, 20)\ninsert into gt values (2, 30)\ninsert into gt values (3, null)\ninsert into gt values (null, 5)\ncreate table big (id number(10) primary key, k2 varchar2(5), ts timestamp, w varchar2(10))\ninsert into big select n, case when mod(n, 37) = 0 then null else 'k' || mod(n, 6) end, timestamp '2024-01-01 00:00:00' + numtodsinterval(n, 'HOUR'), 'w' || n from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000"
+
+const QS = "select * from (values (1, 'a'), (2, 'b'))\nselect * from (values (1, 'a'), (2, 'b')) v\nselect * from (values (1, 'a'), (2, 'bb')) v (p, \"q\")\nselect v.p, v.\"q\" from (values (1, 'a'), (2, 'bb')) v (p, \"q\") where v.p > 1\nwith w (p, \"q\") as (select 1, 2 from dual) select * from w\nwith w (p, q) as (select a, b from gt) select count(*) n, sum(q) s from w\nselect a, count(*) from gt group by 1 order by 1\nselect a + 1, count(*) from gt group by 1 order by 1\nselect count(*) n from gt group by 1\nselect a as k, count(*) n from gt group by k order by 1\nselect a as k, count(*) as n from gt group by a having n > 1 order by 1\nselect a as k, count(*) as n from gt group by k having k > 1 order by 1\nselect a, b as b2, count(*) n from gt group by a, b having b2 > 10 order by 1, 2\nselect k2 as kk, count(*) as n from big group by k2 having n > 490 order by 1\nselect k2 as kk, count(*) as n from big where id < 100 group by kk having kk is null or n > 15 order by 1\nalter session set group_by_position_enabled = true\nselect a, count(*) c from gt group by 1 order by 1\nselect a, b, count(*) c from gt group by 1, 2 order by 1, 2\nselect k2, count(*) c from big group by 1 order by 1\nalter session set group_by_position_enabled = false\nselect a, count(*) cc from gt group by 1 order by 1\nalter session set group_by_position_enabled = maybe\nselect trunc(timestamp '2024-03-05 10:17:23') - date '2024-03-01' d1, trunc(timestamp '2024-03-05 10:17:23', 'HH') - trunc(timestamp '2024-03-05 04:00:00', 'HH') d2, trunc(timestamp '2024-03-05 10:17:23', 'MM') a from dual\nselect id, trunc(ts, 'DD') - trunc(ts - 1, 'DD') d from big where id in (1, 25, 3000) order by id\nselect trunc(ts, 'DD') d, count(*) n from big where id <= 30 group by trunc(ts, 'DD') order by 1\nselect sum(x) s, avg(x) a, count(*) n from (select interval '3' hour x from dual union all select interval '1 02:00:00' day to second from dual union all select null from dual)\nselect sum(x) s from (select interval '1-2' year to month x from dual union all select interval '0-11' year to month from dual)\nselect sum(x) s, avg(x) a from (select interval '3' hour x from dual) where 1 = 0\nselect k2, sum(numtodsinterval(id, 'SECOND')) s, count(*) n from big group by k2 order by 1\nselect sum(numtodsinterval(id, 'SECOND')) s, avg(numtodsinterval(id, 'SECOND')) a from big where id <= 4\nselect mod(id, 3) m, avg(numtodsinterval(id * 6, 'SECOND')) a from big where id <= 12 group by mod(id, 3) order by 1\nselect rawtohex(utl_encode.base64_encode(utl_raw.cast_to_raw('hi'))) e from dual\nselect utl_raw.cast_to_varchar2(utl_encode.base64_encode(utl_raw.cast_to_raw('hi'))) e from dual\nselect utl_raw.cast_to_varchar2(utl_encode.base64_decode(utl_raw.cast_to_raw('aGk='))) d from dual\nselect rawtohex(utl_encode.base64_encode(hextoraw('0102ff'))) e, rawtohex(utl_encode.base64_decode(utl_raw.cast_to_raw('AQL/'))) d from dual\nselect utl_raw.cast_to_raw(null) r, utl_raw.cast_to_varchar2(null) v from dual\nselect utl_encode.base64_encode(null) e from dual\nselect id, utl_raw.cast_to_varchar2(utl_encode.base64_encode(utl_raw.cast_to_raw(w))) e from big where id <= 3 order by id\nselect 1_000 from dual\nselect 0x1F from dual\nselect nosuchfn(a) from gt where 1 = 0\nselect a from gt where nosuchfn(a) = 1 and 1 = 0"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(55), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

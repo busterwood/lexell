@@ -170,6 +170,7 @@ CHECKED = {
     'tns_r4b': ('consts', 'QS'),
     'tns_r5': ('consts', 'QS'),
     'tns_r8': ('consts', 'QS'),
+    'tns_newfix': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
     'tns_leftovers': ('consts', 'QS'),
@@ -473,7 +474,8 @@ def check_test(conn, name, spec):
             print('%s: expectations do not start with setup' % name)
         qexp = [e[len('same: '):] if e.startswith('same: ') else e for e in exp[1:]]
         for q, e in zip(queries, qexp):
-            cases.append((q[:70], 't' if ' ;; ' in q else 'q', q, e))
+            # (a statement that is not a query, ALTER SESSION: its row count)
+            cases.append((q[:70], 't' if ' ;; ' in q else ('q' if q.lower().startswith(('select', 'with')) else 'x'), q, e))
         if name == 'tns_subrows':
             for flag, e in zip(['off', 'on'], exp[1 + len(queries):]):
                 pass
