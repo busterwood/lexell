@@ -2067,7 +2067,8 @@ fn (g: &Gen) loud89Node(x: int): bool {
     return true
 }
 
-// Whether the call e of a runtime function on u128 values is generated inline by inlineU128
+// Whether the call e of a runtime function on u128 or i128 values is generated inline by inlineU128
+// or inlineI128
 // (with no call; r8 to r11 changed).
 fn (g: &Gen) inline128(e: int): bool {
     if !g.is128(g.u.nodes[e].ty) { return false }     // all of them give 128-bit values
@@ -2076,6 +2077,13 @@ fn (g: &Gen) inline128(e: int): bool {
     let nargs = g.u.listLen(n.b)
     if (name == "rt_cvs_u128" || name == "rt_cvu_i128") && !g.isExternCall(e) {
         return nargs == 2 && g.isWhere(g.u.listAt(n.b, 1))
+    }
+    if strings.endsWith(&name, "_i128") && strings.startsWith(&name, "rt_") && !g.isExternCall(e) {
+        // inlineI128's
+        let iop = name[3..len(name) - 5]
+        if (iop == "wadd" || iop == "wsub" || iop == "wmul") && nargs == 2 { return true }
+        if iop == "neg" { return nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) }
+        return (iop == "add" || iop == "sub") && nargs == 3 && g.isWhere(g.u.listAt(n.b, 2))
     }
     if !strings.endsWith(&name, "_u128") || !strings.startsWith(&name, "rt_") || g.isExternCall(e) { return false }
     let op = name[3..len(name) - 5]
@@ -4712,6 +4720,12 @@ fn (g: mut &Gen) op128Into(o: Op128, lo: int, hi: int) {
 // 128-bit local that is already in its two registers is compared where it is, without the copy
 // to rax:rdx. SBB writes its destination, so the high word's subtraction goes through r10.
 fn (g: mut &Gen) cmp128Reg(lo: int, hi: int, o: Op128) {
+    if o.k == 1 && o.lo == 0 && x64.fits32(o.hi) {
+        // the low words leave no borrow, so the flags are those of the high words' CMP
+        // (`v < 0` and `v >= 0` are a sign test of the high word)
+        g.a.aluI(x64.CMP, 8, hi, o.hi)
+        return
+    }
     if o.k == 1 {
         if x64.fits32(o.lo) {
             g.a.aluI(x64.CMP, 8, lo, o.lo)
@@ -4739,6 +4753,10 @@ fn (g: mut &Gen) cmp128Reg(lo: int, hi: int, o: Op128) {
 
 // [m] (two words) compared with the constant o, leaving the memory as it is.
 fn (g: mut &Gen) cmp128Mem(m: x64.Mem, o: Op128) {
+    if o.lo == 0 && x64.fits32(o.hi) {
+        g.a.aluMI(x64.CMP, 8, at(m, 8), o.hi)   // as in cmp128Reg
+        return
+    }
     if x64.fits32(o.lo) {
         g.a.aluMI(x64.CMP, 8, m, o.lo)
     } else {
@@ -5741,6 +5759,47 @@ fn (g: mut &Gen) inlineU128(e: int, op: &str, nargs: int): bool {
     return false
 }
 
+// The i128 runtime arithmetic op (rt_OP_i128) of call e inline, when it is one of: the wrapping
+// + - * (the same bits as u128's: inlineU128), checked + and - (the overflow flag of the high
+// words' ADC or SBB is that of the whole operation), and checked negation (0 - a, which
+// overflows only for i128's minimum). False: nothing emitted.
+fn (g: mut &Gen) inlineI128(e: int, op: &str, nargs: int): bool {
+    let n = g.u.nodes[e]
+    let a = g.u.listAt(n.b, 0)
+    if (op == "wadd" || op == "wsub" || op == "wmul") && nargs == 2 { return g.inlineU128(e, op, nargs) }
+    if op == "neg" && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) {
+        g.gen(a)
+        g.a.movRR(8, R8, RAX)
+        g.a.movRR(8, R9, RDX)
+        g.a.alu(x64.XOR, 4, RAX, RAX)
+        g.a.alu(x64.XOR, 4, RDX, RDX)
+        g.a.alu(x64.SUB, 8, RAX, R8)
+        g.a.alu(x64.SBB, 8, RDX, R9)
+        g.a.jcc(x64.CC_O, g.stub(10, "integer overflow", g.u.listAt(n.b, 1)))
+        return true
+    }
+    if (op == "add" || op == "sub") && nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) {
+        let w = g.u.listAt(n.b, 2)
+        let o = g.op128(g.u.listAt(n.b, 1), a)
+        if o.k > 0 {
+            g.gen(a)
+            g.alu128Op(if op == "add" { ir.OP_ADD } else { ir.OP_SUB }, o)
+        } else {
+            g.pair128(a, g.u.listAt(n.b, 1))
+            if op == "add" {
+                g.a.alu(x64.ADD, 8, RAX, R8)
+                g.a.alu(x64.ADC, 8, RDX, R9)
+            } else {
+                g.a.alu(x64.SUB, 8, RAX, R8)
+                g.a.alu(x64.SBB, 8, RDX, R9)
+            }
+        }
+        g.a.jcc(x64.CC_O, g.stub(10, "integer overflow", w))
+        return true
+    }
+    return false
+}
+
 // Whether the 128-bit value of e is below 2^64 by its form: an unsigned value of 64 bits or
 // fewer widened, a constant, an AND with such a value, or a shift right by 64 or more.
 fn (g: &Gen) below64(e: int): bool {
@@ -6077,6 +6136,9 @@ fn (g: mut &Gen) genCmp(e: int): int {
                 g.cmp128Reg(g.preg[l], g.preg2[l], o)
             } else if o.k == 1 && g.op128(n.a, n.b).k == 3 {
                 g.cmp128Mem(g.op128(n.a, n.b).m, o)
+            } else if o.k == 1 && o.lo == 0 && x64.fits32(o.hi) {
+                g.gen(n.a)
+                g.a.aluI(x64.CMP, 8, RDX, o.hi)   // as in cmp128Reg
             } else {
                 g.gen(n.a)
                 g.alu128(x64.CMP, x64.SBB, o)
@@ -7245,6 +7307,7 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         return true
     }
     if strings.endsWith(&name, "_u128") && g.inlineU128(e, name[3..len(name) - 5], nargs) { return true }
+    if strings.endsWith(&name, "_i128") && g.inlineI128(e, name[3..len(name) - 5], nargs) { return true }
     if name == "rt_cvu_u64" && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) &&
         g.is128(g.u.nodes[g.u.listAt(n.b, 0)].ty) {
         // u128 to u64: the high word must be zero

@@ -703,7 +703,11 @@ Then:
   u128 `/` and `%` by a divisor below 2^64 is one `div` (two when the high
   word is not below it), by a power of two a shift or a mask, above 2^64 the
   runtime's; `q = a / b; r = a % b;` of the same operands is one division
-  (`fusedDivMod`). `rt_cvs_u128` and `rt_cvu_i128` are a sign test;
+  (`fusedDivMod`). `rt_cvs_u128` and `rt_cvu_i128` are a sign test. i128's
+  wrapping `+% -% *%`, checked `+ -` (`jo`, not `jb`) and checked negation
+  (`0 - a`, `jo`) are inline too (`inlineI128`, 2026-11-22); before, every
+  i128 operation called the runtime. A compare with a constant whose low word
+  is 0 is the high words' CMP alone, so `v < 0` and `v >= 0` are a sign test;
 - selects (2026-11-06): opt.lxl's `select` makes a function whose last
   statement is an if/else returning on both sides return one conditional
   (`return c ? a : b`), and `lazyCmp` passes a compare of values read from

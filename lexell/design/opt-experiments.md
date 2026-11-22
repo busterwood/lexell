@@ -299,7 +299,61 @@ a non-zero offset within an 8-byte word, read soon after an 8-byte copy. `str` w
 frequent case. A census of narrow reads at offset 4 within a word of frame slots right
 after copies would size the rest.
 
-## 8. Next, in order
+## 8. Forwarding stalls by counter, and `Decimal` as `{v: i128, exp, dscale}`
+
+**The counter.** Zen 4's `ls_bad_status2.stli_other` counts loads that cannot complete
+because an older store cannot forward to them. A census on main (f51abd4a), per million
+user instructions: loop, array and sieve near 0; fib 2,900 (pushes reloaded through rbp);
+lists 610; the compiler 10,400; jq, json, regex 6,400-6,900; strings 7,300; Decimal
+13,000-53,000. The event counts retries, so its totals overstate the cycles lost. Its
+samples skid a few instructions, and IBS on this CPU has no forwarding-failure bit.
+
+A microbenchmark (two loads and stores in a dependent chain, ticks per round trip) gives
+the rule: a load forwards from one older store that contains it at the same start (0.8; a
+16-byte SSE store also at +8, 8.5); a load wider than the store (8-byte store, 16-byte load:
+18.5), or spanning stores (two 8-byte stores, one 16-byte load: 18.5; two 4-byte stores,
+one 8-byte load: 14.6) does not. copyMem's 8-byte copies and the literal stores of a lone
+narrow field as its whole word (native.md) already follow it; no other frame-slot pair in
+one function breaks it. Decimal's stalls are its by-value copies across calls
+(record-abi.md); `strings`' are in the runtime's string building (not attributed yet).
+
+**`Decimal`.** It was `{coef: u128, exp: int, dscale: int, neg: bool}`: 33 bytes used,
+48 with the u128's 16-byte alignment. A coefficient is below 10^38 < 2^127, so the sign fits
+in a two's-complement i128: `{v: i128, exp: int, dscale: int}`, 32 bytes with no padding.
+The magnitude algorithms are unchanged (`mag(v)`, `signed(m, neg)`); add at equal
+exponents adds the signed values when the signs differ (same signs: the u128 magnitudes,
+whose sum may pass 2^127), and compare at equal exponents, with a zero or with different
+signs is one signed compare. toBin, hash and every output are unchanged.
+
+It needed two native backend changes, because main's Decimal used only u128 arithmetic:
+
+- i128 arithmetic was always a runtime call. Now inline: wrapping + - * (the bits of u128's),
+  checked + and - (the overflow flag of the high words' ADC or SBB, not the carry), and
+  checked negation (0 - a; i128's minimum traps as the runtime does).
+- a 128-bit compare with a constant whose low word is 0 is the high words' CMP: `v < 0` and
+  `v >= 0` are a sign test (the low words' CMP leaves no borrow, so SBB's flags are CMP's).
+
+Also measured, dropped: the sign in bit 127 of a u128 (`c & MAG` for the magnitude): 10%
+more instructions and 5% more cycles over dbench, because the backend rebuilds the
+128-bit mask at each use.
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| dbench, 40 cases (geomean) | +0.9% | -1.5% |
+| add at equal exponents (M2, M4) | -7 to -12% | -6 to -14% |
+| compare, equal exponents (M10:same) | -20% | -25% |
+| compare, different exponents (M1) | +10 to +16% | +5 to +18% |
+| quantize (M6) | +8% | +2 to +5% |
+| TPC-H server instructions per query | -1.56% geomean, all 22 down (q4 -3.5, q22 -3.3) | results identical |
+| json (apps) | 0.00% | -2.0% |
+| lexdb point selects | -0.32 to -0.48% | within noise (±15% between rounds) |
+| perfsuite compile / run suite | +0.01% / 0.00% | +0.10% / +0.02% |
+| lexdb binary | 13,746,808 to 13,599,352 bytes (-1.1%) | |
+
+The remaining cost is the magnitude: a branch, a negation and the checked i128-to-u128
+conversion (there is no unchecked one: SPEC 7.2), where the bool was one byte compare.
+
+## 9. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against

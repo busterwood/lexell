@@ -14,9 +14,10 @@ fn decBitsOf(a: int): u64 { return u64(a & 9223372036854775807) | u64(decB2i(a <
 
 // ---------------------------------------------------------------- Decimal
 //
-// An exact decimal number: sign, a coefficient of at most 38 digits
-// (0..10^38-1), a power-of-ten exponent and a display scale, as in obo
-// (design/decimal-language-design.md). The value is coef * 10^exp; the
+// An exact decimal number: a signed coefficient of at most 38 digits
+// (-(10^38-1)..10^38-1, two's complement in v), a power-of-ten exponent and a
+// display scale, as in obo (design/decimal-language-design.md). The value is
+// v * 10^exp; the
 // display scale (0..65535) is how many fraction digits toStr shows and does
 // not take part in comparison: 1.0 == 1.00. Only finite values exist.
 //
@@ -32,7 +33,16 @@ fn decBitsOf(a: int): u64 { return u64(a & 9223372036854775807) | u64(decB2i(a <
 // + - and % take the larger scale, * the sum (capped so that integer digits
 // plus fraction digits stay within 38), div and quantize the requested scale.
 
-pub type Decimal = value record { coef: u128; exp: int; dscale: int; neg: bool }
+// 32 bytes with no padding: the sign lives in v rather than in a bool field of its own (which
+// made the record 48 bytes and its copies wider), and the arithmetic works on the magnitude
+// mag(v), rebuilt with signed(m, neg).
+pub type Decimal = value record { v: i128; exp: int; dscale: int }
+
+// The magnitude of a coefficient. |v| <= 10^38-1, so negating cannot overflow: the wrapping
+// 0 -% v, which the native backend makes inline (a checked i128 negation is a runtime call).
+fn mag(v: i128): u128 { return if v < 0 { u128(0 -% v) } else { u128(v) } }
+// The coefficient of magnitude m (at most 10^38-1) and sign neg.
+fn signed(m: u128, neg: bool): i128 { return if neg { 0 -% i128(m) } else { i128(m) } }
 
 // The rounding modes of div, quantize and toInt.
 pub type Rounding = value closed {
@@ -114,7 +124,7 @@ fn orStop(r: Result[Decimal, DecError]): Decimal {
     }
 }
 
-fn zeroDec(dscale: int): Decimal { return Decimal{coef: 0, exp: 0, dscale: dscale, neg: false} }
+fn zeroDec(dscale: int): Decimal { return Decimal{v: 0, exp: 0, dscale: dscale} }
 
 // The fromFraction lang item (SPEC 7.3): the literal 12.50 is fromFraction(1250, 2),
 // 1.5e3 is fromFraction(15, -2) and 2e-7 is fromFraction(2, 7). The value is
@@ -137,14 +147,13 @@ pub fn (Decimal) fromUnits(units: int, scale: int): Decimal {
     // in 64 bits (a column's value read as units: no 256-bit path, no Result)
     if scale <= 38 && units != -9223372036854775807 - 1 {
         if units == 0 { return zeroDec(scale) }
-        let neg = units < 0
-        var m = if neg { -units } else { units }
+        var m = units
         var e = -scale
         while m % 10 == 0 {
             m = m / 10
             e += 1
         }
-        return Decimal{coef: u128(m), exp: e, dscale: scale, neg: neg}
+        return Decimal{v: i128(m), exp: e, dscale: scale}
     }
     return fromFraction(i128(units), scale)
 }
@@ -190,7 +199,7 @@ fn makeDec(neg: bool, c: U256, exp: int, dscale: int): Result[Decimal, DecError]
     // digits(x) <= 38 here, so the upper bound only needs the count when the
     // exponent itself is already above EXP_MAX; otherwise no digits() call.
     if e < EXP_MIN || e > EXP_MAX && e + digits(x) > EXP_MAX + 38 { return Err(DecError.Overflow) }
-    return Ok(Decimal{coef: x, exp: e, dscale: dscale, neg: neg})
+    return Ok(Decimal{v: signed(x, neg), exp: e, dscale: dscale})
 }
 
 // makeDec's body for the operator hot paths: the Decimal directly, with the
@@ -220,7 +229,7 @@ fn makeDecCore(neg: bool, c: U256, exp: int, dscale: int, err: mut &int): Decima
     // digits(x) <= 38 here, so the upper bound only needs the count when the
     // exponent itself is already above EXP_MAX; otherwise no digits() call.
     if e < EXP_MIN || e > EXP_MAX && e + digits(x) > EXP_MAX + 38 { err = 1; return zeroDec(dscale) }
-    return Decimal{coef: x, exp: e, dscale: dscale, neg: neg}
+    return Decimal{v: signed(x, neg), exp: e, dscale: dscale}
 }
 
 // makeDecCore only raises Inexact (3) and Overflow (1).
@@ -322,32 +331,26 @@ pub fn (d: Decimal) scale(): int { return d.dscale }
 // The exponent of the canonical form (the coefficient has no trailing zero).
 pub fn (d: Decimal) exponent(): int { return d.exp }
 // The canonical coefficient's magnitude.
-pub fn (d: Decimal) coefficient(): u128 { return d.coef }
-pub fn (d: Decimal) isZero(): bool { return d.coef == 0 }
-pub fn (d: Decimal) isNeg(): bool { return d.neg }
+pub fn (d: Decimal) coefficient(): u128 { return mag(d.v) }
+pub fn (d: Decimal) isZero(): bool { return d.v == 0 }
+pub fn (d: Decimal) isNeg(): bool { return d.v < 0 }
 // -1, 0 or 1.
-pub fn (d: Decimal) sign(): int {
-    if d.coef == 0 { return 0 }
-    if d.neg { return -1 }
-    return 1
-}
+pub fn (d: Decimal) sign(): int { return decCmpOf(d.v < 0, d.v > 0) }
 
 // The same value with display scale s; DecError.Inexact if it has more fraction
 // digits than s (use quantize to round), DecError.Range if s is outside 0..65535.
 pub fn (d: Decimal) withScale(s: int): Result[Decimal, DecError] {
     if s < 0 || s > DSCALE_MAX { return Err(DecError.Range) }
-    if d.coef != 0 && d.exp + s < 0 { return Err(DecError.Inexact) }
-    return Ok(Decimal{coef: d.coef, exp: d.exp, dscale: s, neg: d.neg})
+    if d.v != 0 && d.exp + s < 0 { return Err(DecError.Inexact) }
+    return Ok(Decimal{v: d.v, exp: d.exp, dscale: s})
 }
 
 // ---- arithmetic
 
-pub fn (a: Decimal) neg(): Decimal {
-    return Decimal{coef: a.coef, exp: a.exp, dscale: a.dscale, neg: a.coef != 0 && !a.neg}
-}
+pub fn (a: Decimal) neg(): Decimal { return Decimal{v: 0 -% a.v, exp: a.exp, dscale: a.dscale} }
 
 pub fn (a: Decimal) abs(): Decimal {
-    return Decimal{coef: a.coef, exp: a.exp, dscale: a.dscale, neg: false}
+    return Decimal{v: if a.v < 0 { 0 -% a.v } else { a.v }, exp: a.exp, dscale: a.dscale}
 }
 
 pub fn (a: Decimal) add(b: Decimal): Decimal {
@@ -356,20 +359,23 @@ pub fn (a: Decimal) add(b: Decimal): Decimal {
     // directly instead of building a Result and copying it out. Anything else
     // falls back to the exact operator.
     let ds = max(a.dscale, b.dscale)
-    if a.coef == 0 { return Decimal{coef: b.coef, exp: b.exp, dscale: ds, neg: b.neg} }
-    if b.coef == 0 { return Decimal{coef: a.coef, exp: a.exp, dscale: ds, neg: a.neg} }
+    if a.v == 0 { return Decimal{v: b.v, exp: b.exp, dscale: ds} }
+    if b.v == 0 { return Decimal{v: a.v, exp: a.exp, dscale: ds} }
     if a.exp == b.exp {
-        var err = 0
-        var d = zeroDec(ds)
-        if a.neg == b.neg {
-            d = makeDecCore(a.neg, u256(a.coef + b.coef), a.exp, ds, mut &err)
-        } else if a.coef == b.coef {
-            return zeroDec(ds)
-        } else if a.coef > b.coef {
-            d = makeDecCore(a.neg, u256(a.coef - b.coef), a.exp, ds, mut &err)
+        // same signs: the magnitudes' sum (below 2 * 10^38 < 2^128, though not always below
+        // 2^127); different signs: the signed sum, which cannot overflow
+        var m: u128 = 0
+        var neg = a.v < 0
+        if (a.v ^ b.v) >= 0 {
+            m = mag(a.v) + mag(b.v)
         } else {
-            d = makeDecCore(b.neg, u256(b.coef - a.coef), a.exp, ds, mut &err)
+            let t = a.v + b.v
+            if t == 0 { return zeroDec(ds) }
+            m = mag(t)
+            neg = t < 0
         }
+        var err = 0
+        let d = makeDecCore(neg, u256(m), a.exp, ds, mut &err)
         if err != 0 { decStop(decErrOf(err)) }
         return d
     }
@@ -379,13 +385,13 @@ pub fn (a: Decimal) sub(b: Decimal): Decimal { return a.add(b.neg()) }
 pub fn (a: Decimal) mul(b: Decimal): Decimal {
     // mulExact's body, returning the Decimal directly (see add).
     var r = zeroDec(0)
-    if a.coef != 0 && b.coef != 0 {
+    if a.v != 0 && b.v != 0 {
         var err = 0
-        r = makeDecCore(a.neg != b.neg, mul128(a.coef, b.coef), a.exp + b.exp, 0, mut &err)
+        r = makeDecCore((a.v ^ b.v) < 0, mul128(mag(a.v), mag(b.v)), a.exp + b.exp, 0, mut &err)
         if err != 0 { decStop(decErrOf(err)) }
     }
     var intd = 0
-    if r.coef != 0 { intd = max(0, digits(r.coef) + r.exp) }
+    if r.v != 0 { intd = max(0, digits(mag(r.v)) + r.exp) }
     r.dscale = min(min(a.dscale + b.dscale, DSCALE_MAX), max(0, 38 - intd))
     return r
 }
@@ -394,8 +400,19 @@ pub fn (a: Decimal) mul(b: Decimal): Decimal {
 // exponent is out of range. Display scale: the larger of the two.
 pub fn (a: Decimal) addExact(b: Decimal): Result[Decimal, DecError] {
     let ds = max(a.dscale, b.dscale)
-    if a.coef == 0 { return Ok(Decimal{coef: b.coef, exp: b.exp, dscale: ds, neg: b.neg}) }
-    if b.coef == 0 { return Ok(Decimal{coef: a.coef, exp: a.exp, dscale: ds, neg: a.neg}) }
+    if a.v == 0 { return Ok(Decimal{v: b.v, exp: b.exp, dscale: ds}) }
+    if b.v == 0 { return Ok(Decimal{v: a.v, exp: a.exp, dscale: ds}) }
+    if a.exp == b.exp {
+        // the common case, as in add
+        if (a.v ^ b.v) >= 0 { return makeDec(a.v < 0, u256(mag(a.v) + mag(b.v)), a.exp, ds) }
+        let t = a.v + b.v
+        if t == 0 { return Ok(zeroDec(ds)) }
+        return makeDec(t < 0, u256(mag(t)), a.exp, ds)
+    }
+    let ac = mag(a.v)
+    let bc = mag(b.v)
+    let an = a.v < 0
+    let bn = b.v < 0
     let e = min(a.exp, b.exp)
     let sa = a.exp - e
     let sb = b.exp - e
@@ -404,33 +421,33 @@ pub fn (a: Decimal) addExact(b: Decimal): Result[Decimal, DecError] {
     if sa > 76 || sb > 76 { return Err(DecError.Inexact) }
     // Equal exponents (the common case) fit by the type invariant
     // digits(coef) <= 38, so skip both digit counts.
-    if sa == 0 && sb == 0 || sa + digits(a.coef) <= 38 && sb + digits(b.coef) <= 38 {
+    if sa + digits(ac) <= 38 && sb + digits(bc) <= 38 {
         // both aligned coefficients are below 10^38, so u128 holds the sum
-        let x = a.coef * pow10(sa)
-        let y = b.coef * pow10(sb)
-        if a.neg == b.neg { return makeDec(a.neg, u256(x + y), e, ds) }
+        let x = ac * pow10(sa)
+        let y = bc * pow10(sb)
+        if an == bn { return makeDec(an, u256(x + y), e, ds) }
         if x == y { return Ok(zeroDec(ds)) }
-        if x > y { return makeDec(a.neg, u256(x - y), e, ds) }
-        return makeDec(b.neg, u256(y - x), e, ds)
+        if x > y { return makeDec(an, u256(x - y), e, ds) }
+        return makeDec(bn, u256(y - x), e, ds)
     }
-    let x = try mulPow10(u256(a.coef), sa, DecError.Inexact)
-    let y = try mulPow10(u256(b.coef), sb, DecError.Inexact)
-    if a.neg == b.neg { return makeDec(a.neg, try addU(x, y, DecError.Inexact), e, ds) }
+    let x = try mulPow10(u256(ac), sa, DecError.Inexact)
+    let y = try mulPow10(u256(bc), sb, DecError.Inexact)
+    if an == bn { return makeDec(an, try addU(x, y, DecError.Inexact), e, ds) }
     let c = cmpU(x, y)
     if c == 0 { return Ok(zeroDec(ds)) }
-    if c > 0 { return makeDec(a.neg, subU(x, y), e, ds) }
-    return makeDec(b.neg, subU(y, x), e, ds)
+    if c > 0 { return makeDec(an, subU(x, y), e, ds) }
+    return makeDec(bn, subU(y, x), e, ds)
 }
 
 // Exact product. Display scale: the sum of the two, capped at 38 minus the
 // result's integer digits (the value is never rounded).
 pub fn (a: Decimal) mulExact(b: Decimal): Result[Decimal, DecError] {
     var r = zeroDec(0)
-    if a.coef != 0 && b.coef != 0 {
-        r = try makeDec(a.neg != b.neg, mul128(a.coef, b.coef), a.exp + b.exp, 0)
+    if a.v != 0 && b.v != 0 {
+        r = try makeDec((a.v ^ b.v) < 0, mul128(mag(a.v), mag(b.v)), a.exp + b.exp, 0)
     }
     var intd = 0
-    if r.coef != 0 { intd = max(0, digits(r.coef) + r.exp) }
+    if r.v != 0 { intd = max(0, digits(mag(r.v)) + r.exp) }
     r.dscale = min(min(a.dscale + b.dscale, DSCALE_MAX), max(0, 38 - intd))
     return Ok(r)
 }
@@ -440,28 +457,30 @@ pub fn (a: Decimal) subExact(b: Decimal): Result[Decimal, DecError] { return a.a
 
 // a % b; DecError.DivZero where `%` would stop on a zero divisor.
 pub fn (a: Decimal) remExact(b: Decimal): Result[Decimal, DecError] {
-    if b.coef == 0 { return Err(DecError.DivZero) }
+    if b.v == 0 { return Err(DecError.DivZero) }
     return Ok(a.rem(b))
 }
 
 // The truncating remainder: a - trunc(a / b) * b, with the sign of a. Stops
 // the program when b is zero. Display scale: the larger of the two.
 pub fn (a: Decimal) rem(b: Decimal): Decimal {
-    if b.coef == 0 { decStop(DecError.DivZero) }
+    if b.v == 0 { decStop(DecError.DivZero) }
     let ds = max(a.dscale, b.dscale)
-    if a.coef == 0 { return zeroDec(ds) }
+    if a.v == 0 { return zeroDec(ds) }
+    let ac = mag(a.v)
+    let bc = mag(b.v)
     let d = a.exp - b.exp
-    var r: u128 = a.coef
+    var r: u128 = ac
     var exp = a.exp
     if d >= 0 {
-        // a.coef * 10^d mod b.coef
-        r = mulMod(a.coef % b.coef, powMod10(d, b.coef), b.coef)
+        // ac * 10^d mod bc
+        r = mulMod(ac % bc, powMod10(d, bc), bc)
         exp = b.exp
     } else if -d < 38 {
-        let bb = mul128(b.coef, pow10(-d))
-        if bb.hi == 0 && a.coef >= bb.lo { r = a.coef % bb.lo }
+        let bb = mul128(bc, pow10(-d))
+        if bb.hi == 0 && ac >= bb.lo { r = ac % bb.lo }
     }
-    return orStop(makeDec(a.neg, u256(r), exp, ds))
+    return orStop(makeDec(a.v < 0, u256(r), exp, ds))
 }
 
 // a / b rounded with mode to `scale` fraction digits (0..32768), which is also
@@ -469,20 +488,22 @@ pub fn (a: Decimal) rem(b: Decimal): Decimal {
 // quotient needs more than 38 digits, DecError.Inexact for UNNECESSARY.
 pub fn (a: Decimal) div(b: Decimal, scale: int, mode: Rounding): Result[Decimal, DecError] {
     if scale < 0 || scale > SCALE_MAX { return Err(DecError.Range) }
-    if b.coef == 0 { return Err(DecError.DivZero) }
-    if a.coef == 0 { return Ok(zeroDec(scale)) }
-    let neg = a.neg != b.neg
-    // q = a.coef * 10^t / b.coef, t = a.exp - b.exp + scale
+    if b.v == 0 { return Err(DecError.DivZero) }
+    if a.v == 0 { return Ok(zeroDec(scale)) }
+    let neg = (a.v ^ b.v) < 0
+    let ac = mag(a.v)
+    let bc = mag(b.v)
+    // q = ac * 10^t / bc, t = a.exp - b.exp + scale
     let t = a.exp - b.exp + scale
-    var n = u256(a.coef)
-    var d = u256(b.coef)
+    var n = u256(ac)
+    var d = u256(bc)
     var q = u256(0)
     var r = n
     var half = -1
-    if t >= 0 && t <= 19 && a.coef <= M64 / pow10(t) && b.coef <= M64 {
+    if t >= 0 && t <= 19 && ac <= M64 / pow10(t) && bc <= M64 {
         // the scaled numerator and the divisor fit in 64 bits: one 64-bit divide
-        let nn = u64(a.coef * pow10(t))
-        let dd = u64(b.coef)
+        let nn = u64(ac * pow10(t))
+        let dd = u64(bc)
         q = u256(u128(nn / dd))
         r = u256(u128(nn % dd))
         let r2 = u128(nn % dd) * 2
@@ -519,26 +540,27 @@ pub fn (a: Decimal) div(b: Decimal, scale: int, mode: Rounding): Result[Decimal,
 // also the display scale. DecError.Overflow if that needs more than 38 digits.
 pub fn (a: Decimal) quantize(scale: int, mode: Rounding): Result[Decimal, DecError] {
     if scale < 0 || scale > SCALE_MAX { return Err(DecError.Range) }
-    if a.coef == 0 { return Ok(zeroDec(scale)) }
+    if a.v == 0 { return Ok(zeroDec(scale)) }
+    let ac = mag(a.v)
     let shift = a.exp + scale
     if shift >= 0 {
-        if digits(a.coef) + shift > 38 { return Err(DecError.Overflow) }
-        return Ok(Decimal{coef: a.coef, exp: a.exp, dscale: scale, neg: a.neg})
+        if digits(ac) + shift > 38 { return Err(DecError.Overflow) }
+        return Ok(Decimal{v: a.v, exp: a.exp, dscale: scale})
     }
     let k = -shift
     var q: u128 = 0
-    var r = a.coef
+    var r = ac
     var half = -1   // when k > 38, the coefficient is below a tenth of 10^k
     if k <= 38 {
         let p = pow10(k)
-        q = a.coef / p
-        r = a.coef % p
+        q = ac / p
+        r = ac % p
         half = decCmpOf(r * 2 < p, r * 2 > p)
     }
-    let inc = roundIncrement(mode, a.neg, half, r != 0, q % 2 == 1)
+    let inc = roundIncrement(mode, a.v < 0, half, r != 0, q % 2 == 1)
     if inc < 0 { return Err(DecError.Inexact) }
     if inc > 0 { q += 1 }
-    return makeDec(a.neg, u256(q), -scale, scale)
+    return makeDec(a.v < 0, u256(q), -scale, scale)
 }
 
 // Rounding at `scale` fraction digits: round is HALF_EVEN (2.5 -> 2,
@@ -553,10 +575,9 @@ pub fn (a: Decimal) trunc(scale: int): Result[Decimal, DecError] { return a.quan
 // The value rounded with mode to an int; DecError.Overflow outside int's range.
 pub fn (a: Decimal) toInt(mode: Rounding): Result[int, DecError] {
     let q = try a.quantize(0, mode)
-    if q.coef == 0 { return Ok(0) }
-    if q.exp + digits(q.coef) > 19 { return Err(DecError.Overflow) }
-    var v = i128(q.coef) * i128(pow10(q.exp))
-    if q.neg { v = -v }
+    if q.v == 0 { return Ok(0) }
+    if q.exp + digits(mag(q.v)) > 19 { return Err(DecError.Overflow) }
+    let v = q.v * i128(pow10(q.exp))
     if v < -9223372036854775808 || v > 9223372036854775807 { return Err(DecError.Overflow) }
     return Ok(int(v))
 }
@@ -590,40 +611,39 @@ fn roundIncrement(mode: Rounding, neg: bool, half: int, dropped: bool, odd: bool
 // ---- comparison
 
 pub fn (a: Decimal) cmp(b: &Decimal): int {
-    if a.coef == 0 || b.coef == 0 || a.neg != b.neg {
-        return decCmpOf(a.sign() < b.sign(), a.sign() > b.sign())
-    }
-    if a.exp == b.exp {
-        // same exponent: the coefficients order the values
-        let m = decCmpOf(a.coef < b.coef, a.coef > b.coef)
-        return if a.neg { -m } else { m }
-    }
-    let da = digits(a.coef)
-    let db = digits(b.coef)
+    let av = a.v
+    let bv = b.v
+    // the same exponent, a zero or different signs: the signed coefficients order the values
+    if a.exp == b.exp || (av ^ bv) < 0 || av == 0 || bv == 0 { return decCmpOf(av < bv, av > bv) }
+    let ac = mag(av)
+    let bc = mag(bv)
+    let da = digits(ac)
+    let db = digits(bc)
     let ea = a.exp + da
     let eb = b.exp + db
-    var mag = 0
+    var m = 0
     if ea != eb {
-        mag = decCmpOf(ea < eb, ea > eb)
+        m = decCmpOf(ea < eb, ea > eb)
     } else {
         // same leading digit position: pad the shorter coefficient to the same length
-        var x = a.coef
-        var y = b.coef
+        var x = ac
+        var y = bc
         if da < db { x = x * pow10(db - da) } else { y = y * pow10(da - db) }
-        mag = decCmpOf(x < y, x > y)
+        m = decCmpOf(x < y, x > y)
     }
-    if a.neg { return -mag }
-    return mag
+    if av < 0 { return -m }
+    return m
 }
 
 // Equal values are equal whatever their display scales (the form is canonical).
 pub fn (a: Decimal) eq(b: &Decimal): bool {
-    return a.coef == b.coef && a.exp == b.exp && a.neg == b.neg
+    return a.v == b.v && a.exp == b.exp
 }
 
 // SipHash of the canonical form (coef < 10^38 leaves the top bit free for the sign).
 pub fn (a: Decimal) hash(): u64 {
-    return hash.sipWords(u64(a.coef & M64), u64(a.coef >> 64) | u64(decB2i(a.neg)) << 63, decBitsOf(a.exp))
+    let c = mag(a.v)
+    return hash.sipWords(u64(c & M64), u64(c >> 64) | u64(decB2i(a.v < 0)) << 63, decBitsOf(a.exp))
 }
 
 // ---- binary form
@@ -637,7 +657,7 @@ pub fn (a: Decimal) hash(): u64 {
 pub fn (d: Decimal) toBin(): str {
     var out: []byte = []
     var flags = 0
-    if d.neg { flags += 1 }
+    if d.v < 0 { flags += 1 }
     if d.dscale > 255 { flags += 2 }
     if d.exp != 0 {
         flags += 4
@@ -651,7 +671,7 @@ pub fn (d: Decimal) toBin(): str {
         append(mut &out, byte(e & 255))
         if flags & 8 != 0 { append(mut &out, byte(e >> 8)) }
     }
-    var c = d.coef
+    var c = mag(d.v)
     while c != 0 {
         append(mut &out, byte(c & 255))
         c = c >> 8
@@ -707,7 +727,7 @@ pub fn (Decimal) fromBin(s: &str, at: int, n: int): Result[Decimal, DecError] {
     } else if coef % 10 == 0 {
         return Err(DecError.Invalid)
     }
-    return Ok(Decimal{coef: coef, exp: exp, dscale: dscale, neg: neg})
+    return Ok(Decimal{v: signed(coef, neg), exp: exp, dscale: dscale})
 }
 
 // ---- text
@@ -726,19 +746,19 @@ pub fn (d: Decimal) toStr(): str {
 // DecError.Inexact if that would drop a nonzero digit.
 pub fn (d: Decimal) format(): Result[str, DecError] {
     let ds = d.dscale
-    if d.coef != 0 && d.exp + ds < 0 { return Err(DecError.Inexact) }
-    let digs = u128ToStr(d.coef)
+    if d.v != 0 && d.exp + ds < 0 { return Err(DecError.Inexact) }
+    let digs = u128ToStr(mag(d.v))
     var n = len(digs)
-    if d.coef == 0 { n = 0 }
+    if d.v == 0 { n = 0 }
     let pos = n + d.exp   // digits before the point
     var intd = 1
     if pos > 0 { intd = pos }
     var size = intd
     if ds > 0 { size += 1 + ds }
-    if d.neg { size += 1 }
+    if d.v < 0 { size += 1 }
     var out = array(size, byte('0'))
     var at = 0
-    if d.neg {
+    if d.v < 0 {
         out[0] = '-'
         at = 1
     }
@@ -762,12 +782,12 @@ pub fn (d: Decimal) format(): Result[str, DecError] {
 // The shortest exact text: no trailing fraction zeros, plain notation unless
 // that is longer than 128 characters, then d.ddde[-]n. For keys and storage.
 pub fn (d: Decimal) canonical(): str {
-    if d.coef == 0 { return "0" }
-    let digs = u128ToStr(d.coef)
+    if d.v == 0 { return "0" }
+    let digs = u128ToStr(mag(d.v))
     let n = len(digs)
     let pos = n + d.exp
     var sign = ""
-    if d.neg { sign = "-" }
+    if d.v < 0 { sign = "-" }
     var plain = 0
     if pos <= 0 { plain = 2 - pos + n } else if pos >= n { plain = pos } else { plain = n + 1 }
     if plain > 128 {
@@ -840,7 +860,7 @@ pub fn (Decimal) parse(s: &str): Result[Decimal, DecError] {
     }
     let e = exp - frac + stripped + acc.zeros
     if e < EXP_MIN || e + digits(coef) > EXP_MAX + 38 { return Err(DecError.Exponent) }
-    return Ok(Decimal{coef: coef, exp: e, dscale: ds, neg: neg})
+    return Ok(Decimal{v: signed(coef, neg), exp: e, dscale: ds})
 }
 
 // The end of the run of ASCII digits in s that starts at i: eight bytes at a time
