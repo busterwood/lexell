@@ -1521,6 +1521,17 @@ fn (o: &Loops) symOf(e: int): Sym {
         return o.symOf(a)
     }
     if k == ir.E_CALL && o.nargs(e) == 3 && o.rtcOf(e) == RC_IDX { return o.symOf(o.arg(e, 0)) }
+    if k == ir.E_CALL && o.nargs(e) == 2 {
+        // rt_cvs_N / rt_cvu_N of a narrower integer widened to 128 bits (`int(b)` of a byte):
+        // a widening cannot fail, so the value is the operand's
+        let f = o.rtFn(e)
+        let x = o.arg(e, 0)
+        if f >= 0 && (strings.startsWith(&o.u.funcs[f].name, "rt_cvs_") || strings.startsWith(&o.u.funcs[f].name, "rt_cvu_")) &&
+            o.u.nk(x) == ir.E_CAST {
+            let y = o.u.nodes[x].a
+            if widens(o.u.tk(o.u.nodes[y].ty), o.u.tk(o.u.nodes[e].ty)) { return o.symOf(y) }
+        }
+    }
     if k == ir.E_MEMBER && o.u.nodes[e].v == 8 && o.u.nk(a) == ir.E_LOCAL && o.u.nodes[e].ty == ir.TY_I64 {
         // `a.len` of an array local followed: its pseudo local
         let q = o.lenOf[o.u.nodes[a].a]
@@ -1569,6 +1580,12 @@ fn inKind(s: Sym, k: int): bool { return s.l != -1 || s.c >= kmin(k) && s.c <= k
 // (hi false) or the greatest.
 fn (o: &Loops) direct(l: int, k: int, hi: bool): int {
     var v = if hi { kmax(k) } else { kmin(k) }
+    // a local of a narrower kind holds only that kind's values (a byte is 0 to 255)
+    let kl = o.u.tk(o.u.locals[l].ty)
+    if kl != k && widens(kl, k) {
+        if hi && kmax(kl) < v { v = kmax(kl) }
+        if !hi && kmin(kl) > v { v = kmin(kl) }
+    }
     for f in o.facts {
         if f.a == l && f.k == F_HI && hi && f.v < v { v = f.v }
         if f.a == l && f.k == F_LO && !hi && f.v > v { v = f.v }
@@ -2197,8 +2214,33 @@ fn (o: mut &Loops) loop(s: int) {
             append(mut &los, lo0)
         }
     }
+    // the masked locals: every write in the loop `l = x & c`, c a non-negative constant, and l in
+    // [0, h] at the entry: l stays in [0, max(c, h)] throughout (a hash `h = (h * 33 + b) & m`)
+    var mls: []int = []
+    var mhs: []int = []
+    for l in written {
+        let k = o.u.tk(o.u.locals[l].ty)
+        if !o.trackable(l) || !ranged(k) { continue }
+        let sl = Sym{l: o.canon(l), c: 0}
+        if o.lo(sl, k) < 0 { continue }
+        let h0 = o.hi(sl, k)
+        if h0 >= kmax(k) { continue }
+        var mw = 0
+        for x in [a, b, c, d] {
+            let m = o.maskWrites(x, l)
+            if m < 0 || mw < 0 { mw = -1 } else if m > mw { mw = m }
+        }
+        if mw > 0 {
+            append(mut &mls, l)
+            append(mut &mhs, if mw > h0 { mw } else { h0 })
+        }
+    }
     for l in written { o.kill(l) }
     if mem { o.killStores() }
+    for j in 0..len(mls) {
+        o.add(Fact{k: F_LO, a: mls[j], b: -1, c: 0, d: -1, v: 0})
+        o.add(Fact{k: F_HI, a: mls[j], b: -1, c: 0, d: -1, v: mhs[j]})
+    }
     for j in 0..len(ind) { o.add(Fact{k: F_LO, a: ind[j], b: -1, c: 0, d: -1, v: los[j]}) }
     for j in 0..len(cnt) { o.add(Fact{k: F_HI, a: cnt[j], b: -1, c: 0, d: -1, v: his[j]}) }
     let base = copyFacts(&o.facts)
@@ -2215,6 +2257,59 @@ fn (o: mut &Loops) loop(s: int) {
         o.stmt(b)
     }
     o.facts = base
+}
+
+// The largest mask c of the writes of local l in the tree x when each is `l = y & c` (c a
+// non-negative constant; 0 when x writes l nowhere), else -1: an increment, a declaration or a
+// write of another shape.
+fn (o: &Loops) maskWrites(x: int, l: int): int {
+    if x < 0 { return 0 }
+    let n = o.u.nodes[x]
+    let k = n.k
+    var m = 0
+    if (k == ir.E_ASSIGN || k == ir.E_POSTINC) && o.u.nk(n.a) == ir.E_LOCAL && o.u.nodes[n.a].a == l {
+        if k == ir.E_POSTINC { return -1 }
+        let v = n.b
+        if o.u.nk(v) != ir.E_BIN || o.u.nodes[v].v != ir.OP_AND { return -1 }
+        let va = o.u.nodes[v].a
+        let vb = o.u.nodes[v].b
+        if o.u.nk(vb) == ir.E_INT && o.u.nodes[vb].v >= 0 {
+            m = o.u.nodes[vb].v
+        } else if o.u.nk(va) == ir.E_INT && o.u.nodes[va].v >= 0 {
+            m = o.u.nodes[va].v
+        } else {
+            return -1
+        }
+    }
+    if k == ir.S_DECL && n.a == l { return -1 }
+    let kc = ir.KIDS[k]
+    if kc <= ir.K_NONE { return m }
+    var kids: []int = []
+    if kc == ir.K_A {
+        kids = [n.a]
+    } else if kc == ir.K_AB {
+        kids = [n.a, n.b]
+    } else if kc == ir.K_ABC {
+        kids = [n.a, n.b, n.c]
+    } else if kc == ir.K_CALL {
+        kids = [n.a]
+        if n.b >= 0 { for j in 0..o.u.listLen(n.b) { append(mut &kids, o.u.listAt(n.b, j)) } }
+    } else if kc == ir.K_BLOCK {
+        if n.a >= 0 { for j in 0..o.u.listLen(n.a) { append(mut &kids, o.u.listAt(n.a, j)) } }
+    } else if kc == ir.K_DECL {
+        kids = [n.b]
+        if n.c >= 0 { for j in 0..o.u.listLen(n.c) { append(mut &kids, o.u.listAt(n.c, j)) } }
+    } else if kc == ir.K_CLIT {
+        if n.b >= 0 { for j in 0..o.u.listLen(n.b) { append(mut &kids, o.u.listAt(n.b, j)) } }
+    } else {
+        kids = [n.a, n.b, n.c, n.d]
+    }
+    for y in kids {
+        let my = o.maskWrites(y, l)
+        if my < 0 { return -1 }
+        if my > m { m = my }
+    }
+    return m
 }
 
 // The counters of the for s (`for (i = ..; i < x; i++)`, i written only by its step, x a constant

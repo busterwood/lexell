@@ -2126,6 +2126,7 @@ fn (g: &Gen) quietRt(e: int): bool {
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
     if name == "rt_arr_push" { return g.pushInline(e) }
     if name == "rt_str_view" { return g.viewInline(e) }
+    if name == "rt_as_slice" { return nargs == 1 }
     return false     // rt_str_dup copies (design/owned-str.md): a call of the runtime
 }
 
@@ -6363,6 +6364,10 @@ fn (g: mut &Gen) genCall(e: int) {
             g.destUsed = g.genView(e, dest)
             return
         }
+        if rtName == "rt_as_slice" && g.u.listLen(n.b) == 1 {
+            g.destUsed = g.genAsSlice(e, dest)
+            return
+        }
         if g.inlineRt(e, &rtName) {
             g.destUsed = false
             return
@@ -7137,6 +7142,23 @@ fn (g: mut &Gen) genView(e: int, dest: x64.Mem): bool {
     return used
 }
 
+// rt_as_slice(&a) inline: the slice {a.data, a.len} of the array a (native/rt.c), in dest when
+// the caller gave a place in the frame (whether it did), else in a temporary whose address is
+// left in rax. Both words are read before either is written; only rax and rcx change (quietRt).
+// The call cost a call, its return and the result's two stores and loads through the frame on
+// every `for x in a[i]` (bench tokens' bucket loop).
+fn (g: mut &Gen) genAsSlice(e: int, dest: x64.Mem): bool {
+    g.gen(g.u.listAt(g.u.nodes[e].b, 0))           // the array's address
+    let used = dest.base == RBP
+    let d = if used { dest } else { rbp(g.tempFor(g.u.nodes[e].ty)) }
+    g.a.load(8, RCX, x64.mem(RAX, 0))               // data
+    g.a.load(8, RAX, x64.mem(RAX, 8))               // len
+    g.a.store(8, d, RCX)
+    g.a.store(8, at(d, 8), RAX)
+    if !used { g.a.lea(RAX, d) }
+    return used
+}
+
 // The integer kind and operation of a checked or wrapping runtime arithmetic function
 // (rt_add_int, rt_wmul_u32, ...): kind -1 when name is not one.
 type ArOp = value record {
@@ -7614,9 +7636,28 @@ fn (g: mut &Gen) inlineDiv(dv: ArOp, e: int) {
     }
     let constB = bn.k == ir.E_INT && bn.v != 0 && bn.v != -1
     g.srcRCX(g.pairSrc(a, b))
+    var done = -1
     if !constB {
         g.a.test(8, RCX, RCX)
         g.a.jcc(x64.CC_E, g.stub(10, "division by zero", w))
+        if dv.op == ir.OP_REM {
+            // a divisor that is a power of two and a dividend >= 0 (a hash's bucket, `h %
+            // len(table)`): the remainder is the low bits, without the divide (some 15 cycles).
+            // 0 and -1 are never taken here; a signed minimum is, and x & (min - 1) is x, the
+            // remainder of every x >= 0 by it.
+            let slow = g.a.newLabel()
+            done = g.a.newLabel()
+            g.a.lea(RDX, x64.mem(RCX, -1))
+            g.a.test(sz, RDX, RCX)
+            g.a.jcc(x64.CC_NE, slow)
+            if sgn {
+                g.a.test(sz, RAX, RAX)
+                g.a.jcc(x64.CC_S, slow)
+            }
+            g.a.alu(x64.AND, sz, RAX, RDX)
+            g.a.jmp(done)
+            g.a.bind(slow)
+        }
         if sgn {
             let ok = g.a.newLabel()
             g.a.aluI(x64.CMP, 8, RCX, -1)
@@ -7639,6 +7680,7 @@ fn (g: mut &Gen) inlineDiv(dv: ArOp, e: int) {
         g.a.unary(x64.DIV, sz, RCX)
     }
     if dv.op == ir.OP_REM { g.a.movRR(8, RAX, RDX) }
+    if done >= 0 { g.a.bind(done) }
     g.normR(k, RAX)
 }
 

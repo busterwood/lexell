@@ -453,7 +453,45 @@ it is checked.
 - **Load reuse.** cse.lxl already reuses loads and checked element addresses across statements
   of a straight-line run. What it leaves out by design: reuse within one statement (the native
   backend's evaluation order is its own) and across writes or program calls. Not attempted.
-## 12. Next, in order
+## 12. bench tokens against Rust: four small changes (as built)
+
+`tokens` was the one microbenchmark behind Rust (1.24) and 1.22 times its C build's cycles. A
+profile against the C build found the gap in the bucket loop of `main`, not in the byte scan
+(the native identifier loop is 9 instructions a byte, gcc's 11):
+
+- **`rt_as_slice` inline** (x64gen `genAsSlice`, quiet): `for x in a[i]` called the runtime for
+  `{a.data, a.len}` and passed the result through the frame.
+- **An aggregate argument that is a place of more than a local is copied into a local when the
+  inlined body loops** (opt.lxl, `W_LOOPS`). `hash(t.text)` was bound as the expression
+  `t.text`, which loops.lxl cannot follow: the hash loop kept a bounds check a byte. With
+  `let tx = t.text` or `LXL_INLINE=0` the check was proved, so the binding was the cause.
+- **Masked loop-carried locals** (loops.lxl `maskWrites`): a local whose every write in the
+  loop is `x & c` (c >= 0) and that is in [0, h] at the entry stays in [0, max(c, h)], so
+  `h = (h * 33 + b) & 0xFFFFFF` proves its multiply. With **a local's own kind bounding its
+  range** (a byte is 0 to 255) and **a widening conversion having its operand's value**
+  (`int(b)` is `rt_cvs_int((i128)b)` in the IR), the add is proved too: the hash loop has no
+  check left.
+- **`%` by a power of two** (x64gen `inlineDiv`): after the zero check, `lea rdx, [rcx-1]; test
+  rdx, rcx`, and with a dividend >= 0 the remainder is `x & (n - 1)`; else the divide as
+  before. `hash % len(table)` was an `idiv` per lookup; gcc removed it only by proving the
+  table's length is 1024. The test costs a predictable branch where the divisor is not a power
+  of two. tests/run/native_rem_pow2.lxl checks every kind, sign and extreme against the C
+  build.
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| bench tokens (-O), 5 interleaved rounds | -3.96% | -3.77% |
+| perfsuite compile / run suite | -0.23% / +0.01% | -0.16% / -0.58% |
+| apps (regex, json, jq, cmark, decimal) | 0.00% | level |
+| TPC-H server instructions per query | -0.12% geomean (all within ±0.21%) | |
+| point selects select / insert / update | -0.36 / -0.11 / -0.22% | noise |
+| HTTP server, 2 alternated rounds | | level |
+| lexdb -O binary | -20 KB (-0.15%) | |
+
+tokens is now 1.16 times its C build's cycles. What remains: the bucket loop's `str` compare
+(`rt_str_eq` and memcmp, 7% of the instructions) and frame traffic.
+
+## 13. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against
