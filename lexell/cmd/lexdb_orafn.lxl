@@ -12,6 +12,7 @@
 // was available (design/lexdb-oracle.md, section 14).
 
 import "strings"
+import "base64"
 import "unicode"
 import "time"
 import "./lexdb_base"
@@ -35,6 +36,19 @@ fn isNull(v: &Val): bool {
 
 fn nz(s: &str): Val { return if len(s) == 0 { Val.Null } else { Val.Text(s.clone()) } }
 
+// A RAW's bytes (a text's: its UTF-8 bytes); and a RAW of them.
+fn rawBytes(v: &Val, z: &lexdb_time.Zone): str {
+    match v {
+        Val.Bytes(b) { return b.clone() }
+        else { return sv(v, z) }
+    }
+}
+
+fn rawOf(v: &Val, z: &lexdb_time.Zone): Val {
+    let b = rawBytes(v, z)
+    return if len(b) == 0 { Val.Null } else { Val.Bytes(b) }
+}
+
 // ---- result types (lexdb_exec.exprOid asks)
 
 fn isTimeOid(o: int): bool { return lexdb_sql.timeKind(o) > 0 && o != lexdb_sql.OID_TIME && o != lexdb_sql.OID_IVAL }
@@ -50,6 +64,7 @@ pub fn resultOid(name: &str, os: &[]int): int {
         "#ora_instr" { return lexdb_sql.OID_INT4 }
         "#ora_todate", "#ora_totimestamp", "#ora_addmonths", "#ora_lastday", "#ora_nextday", "#ora_sysutc" { return lexdb_sql.OID_TS }
         "#ora_fromtz" { return lexdb_sql.OID_TSTZ }
+        "#ora_rawof", "#ora_b64enc", "#ora_b64dec" { return lexdb_sql.OID_BYTEA }
         "#ora_numtods", "#ora_numtoym", "#ora_tsdiff" { return lexdb_sql.OID_IVAL }
         "#ora_extract" { return lexdb_sql.OID_NUMERIC }
         "#ora_tonumber", "#ora_div", "#ora_monthsbetween" { return lexdb_sql.OID_NUMERIC }
@@ -1124,6 +1139,7 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
         "#ora_trunc" { lo = 1; hi = 2 }
         "#ora_addmonths", "#ora_monthsbetween", "#ora_nextday" { lo = 2; hi = 2 }
         "#ora_lastday" { lo = 1; hi = 1 }
+        "#ora_rawof", "#ora_rawtext", "#ora_b64enc", "#ora_b64dec" { lo = 1; hi = 1 }
         "#ora_sysutc" { lo = 1; hi = 1 }
         "#ora_numtods", "#ora_numtoym", "#ora_fromtz", "#ora_extract", "#ora_tsdiff" { lo = 2; hi = 2 }
         else { }
@@ -1132,12 +1148,42 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
     if (n < lo || n > hi) && lo == hi { return Err(ora(909, "invalid number of arguments")) }
     if n < lo { return Err(ora(938, "not enough arguments for function")) }
     if n > hi { return Err(ora(939, "too many arguments for function")) }
+    // (UTL_ENCODE's BASE64_ENCODE and BASE64_DECODE of a NULL: ORA-29261, as Oracle's)
+    if (name == "#ora_b64enc" || name == "#ora_b64dec") && n == 1 && isNull(&vs[0]) { return Err(ora(29261, "bad argument")) }
     for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
     match name {
         "#ora_add" { return Ok(Some(try plusMinus(&vs[0], &vs[1], false, z))) }
         "#ora_sub" { return Ok(Some(try plusMinus(&vs[0], &vs[1], true, z))) }
         "#ora_div" { return Ok(Some(try divide(&vs[0], &vs[1]))) }
         "#ora_tsdiff" { return Ok(Some(try tsDiff(&vs[0], &vs[1], z))) }
+        // UTL_RAW.CAST_TO_RAW, CAST_TO_VARCHAR2: a text's bytes and back
+        "#ora_rawof" { return Ok(Some(rawOf(&vs[0], z))) }
+        "#ora_rawtext" {
+            let b = rawBytes(&vs[0], z)
+            return Ok(Some(nz(&b)))
+        }
+        // UTL_ENCODE.BASE64_ENCODE: the base64 text's bytes, in lines of 64 ended by CR LF, as Oracle's; BASE64_DECODE back
+        "#ora_b64enc" {
+            let x = base64.encode(&rawBytes(&vs[0], z))
+            var out = ""
+            var i = 0
+            while i < len(x) {
+                if i > 0 { out += "\r\n" }
+                let end = if i + 64 < len(x) { i + 64 } else { len(x) }
+                out += x[i..end]
+                i = end
+            }
+            return Ok(Some(if len(out) == 0 { Val.Null } else { Val.Bytes(out) }))
+        }
+        "#ora_b64dec" {
+            var clean = ""
+            let raw = rawBytes(&vs[0], z)
+            for i in 0..len(raw) { if raw[i] != '\r' && raw[i] != '\n' { clean.addByte(raw[i]) } }
+            match base64.decodeStrict(&clean) {
+                Some(b) { return Ok(Some(if len(b) == 0 { Val.Null } else { Val.Bytes(b) })) }
+                None { return Err(ora(29261, "bad argument")) }
+            }
+        }
         "#ora_extract" { return Ok(Some(try extractFrom(&sv(&vs[0], z), &vs[1], z))) }
         "#ora_sysutc" {
             // SYS_EXTRACT_UTC(t): the UTC time of a time with a zone (a time without one is in the session's zone)

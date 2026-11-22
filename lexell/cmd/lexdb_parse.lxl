@@ -271,6 +271,129 @@ fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
 
 fn lex(s: &str): Result[[]Tok, lexdb_base.DbErr] { return lexIn(s, pgDialect()) }
 
+// PostgreSQL 16's numeric literals at s[start] (scan.l): a decimal integer is digits with single _ between them; 0x, 0o
+// and 0b integers (_ before any digit); a decimal and an exponent of such integers. Its text as the parser reads a
+// number (decimal, no _) in text, where it ends in at; a name right after it is "trailing junk" (42601).
+fn pgNumber(s: &str, start: int): Result[Tok, lexdb_base.DbErr] {
+    let n = len(s)
+    var i = start
+    var b = ""
+    if s[i] == '0' && i + 1 < n && (s[i + 1] == 'x' || s[i + 1] == 'X' || s[i + 1] == 'o' || s[i + 1] == 'O' || s[i + 1] == 'b' || s[i + 1] == 'B') {
+        let x = s[i + 1]
+        let base = if x == 'x' || x == 'X' { 16 } else if x == 'o' || x == 'O' { 8 } else { 2 }
+        i += 2
+        var ds: []int = []
+        while i < n {
+            var j = i
+            if s[j] == '_' { j += 1 }
+            if j >= n || !isHexDigit(s[j]) || hexDigit(s[j]) >= base { break }
+            append(mut &ds, hexDigit(s[j]))
+            i = j + 1
+        }
+        let what = if base == 16 { "hexadecimal" } else if base == 8 { "octal" } else { "binary" }
+        if len(ds) == 0 { return Err(syntax(&("invalid " + what + " integer at or near \"" + s[start..min(i, n)] + "\""))) }
+        if i < n && isIdentChar(s[i]) { return Err(syntax(&("trailing junk after numeric literal at or near \"" + s[start..i + 1] + "\""))) }
+        return Ok(Tok{kind: T_NUM, text: digitsIn(&ds, base), at: i, spell: ""})
+    }
+    i = pgDigits(s, i, mut &b)
+    if i < n && s[i] == '.' {
+        b.addByte('.')
+        i = pgDigits(s, i + 1, mut &b)
+    }
+    if i < n && (s[i] == 'e' || s[i] == 'E') {
+        var j = i + 1
+        var sign = ""
+        if j < n && (s[j] == '+' || s[j] == '-') {
+            sign = s[j..j + 1].toStr()
+            j += 1
+        }
+        if j < n && isDigit(s[j]) {
+            b += "e" + sign
+            i = pgDigits(s, j, mut &b)
+        }
+    }
+    if i < n && isIdentChar(s[i]) { return Err(syntax(&("trailing junk after numeric literal at or near \"" + s[start..i + 1] + "\""))) }
+    return Ok(Tok{kind: T_NUM, text: b, at: i, spell: ""})
+}
+
+// Digits from s[i] with single _ between them, added to b (without the _); where they end.
+fn pgDigits(s: &str, i0: int, b: mut &str): int {
+    let n = len(s)
+    var i = i0
+    while i < n && isDigit(s[i]) {
+        b.addByte(s[i])
+        i += 1
+        if i + 1 < n && s[i] == '_' && isDigit(s[i + 1]) { i += 1 }
+    }
+    return i
+}
+
+// Digits of a base (most significant first) as a decimal number's text, of any length.
+fn digitsIn(ds: &[]int, base: int): str {
+    var dec: []int = [0]          // least significant first
+    for d in ds {
+        var carry = d
+        for k in 0..len(dec) {
+            let v = dec[k] * base + carry
+            dec[k] = v % 10
+            carry = v / 10
+        }
+        while carry > 0 {
+            append(mut &dec, carry % 10)
+            carry = carry / 10
+        }
+    }
+    var out = ""
+    var k = len(dec) - 1
+    while k > 0 && dec[k] == 0 { k -= 1 }
+    while k >= 0 {
+        out.addByte(byte(48 + dec[k]))
+        k -= 1
+    }
+    return out
+}
+
+// PostgreSQL 16's integer input (and numeric's) takes what its literals take: a text cast of one written as such is read
+// so (' 0x1F '::int, '1_000'::bigint); None for any other.
+fn pgIntText(s: &str): Option[str] {
+    let t = strings.trim(s)
+    if !strings.contains(&t, "_") && !(len(t) > 1 && (t[1] == 'x' || t[1] == 'X' || t[1] == 'o' || t[1] == 'O' || t[1] == 'b' || t[1] == 'B')) &&
+       !(len(t) > 2 && (t[0] == '-' || t[0] == '+') && (t[2] == 'x' || t[2] == 'X' || t[2] == 'o' || t[2] == 'O' || t[2] == 'b' || t[2] == 'B')) { return None }
+    var sign = ""
+    var body = t.toStr()
+    if len(body) > 0 && (body[0] == '-' || body[0] == '+') {
+        sign = if body[0] == '-' { "-" } else { "" }
+        body = body[1..len(body)].toStr()
+    }
+    if len(body) == 0 || !isDigit(body[0]) { return None }
+    match pgNumber(&body, 0) {
+        Ok(tok) { if tok.at == len(body) { return Some(sign + tok.text) } }
+        Err(_) {}
+    }
+    return None
+}
+
+// PostgreSQL's cast of a text constant to an integer or numeric type: its 16's forms read (pgIntText).
+fn pgCast(e: Expr, t: TypeName): Expr {
+    if t.kind == K_INT || t.kind == K_NUM {
+        match e {
+            Expr.Lit(v) {
+                match v {
+                    Val.Text(s) {
+                        match pgIntText(&s) {
+                            Some(d) { return Expr.Cast(Expr.Lit(Val.Text(d)), t) }
+                            None {}
+                        }
+                    }
+                    else {}
+                }
+            }
+            else {}
+        }
+    }
+    return Expr.Cast(e, t)
+}
+
 // A quoted string or name, s[i] its opening quote, closed by q (doubled
 // inside: itself); the index after it.
 fn quoted(s: &str, i: int, q: byte, b: mut &str): Result[int, lexdb_base.DbErr] {
@@ -475,7 +598,25 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
             if i < n && (s[i] == 'e' || s[i] == 'E') {
                 i += 1
                 if i < n && (s[i] == '+' || s[i] == '-') { i += 1 }
+                if !(i < n && isDigit(s[i])) && !dialect.tsql && !ora {
+                    // an e with no digits after it: PostgreSQL's trailing junk (pgNumber)
+                    let t = try pgNumber(s, start)
+                    append(mut &out, Tok{kind: T_NUM, text: t.text.clone(), at: start, spell: ""})
+                    i = t.at
+                    continue
+                }
                 while i < n && isDigit(s[i]) { i += 1 }
+            }
+            if i < n && isIdentStart(s[i]) && !dialect.tsql {
+                // a number running into a letter or _: PostgreSQL 16's 0x1F, 0o17, 0b101 and 1_000 (pgNumber), else an
+                // error ("trailing junk"); Oracle's _ there is ORA-00911 (its 1abc is 1 and an alias, as before)
+                if !ora {
+                    let t = try pgNumber(s, start)
+                    append(mut &out, Tok{kind: T_NUM, text: t.text.clone(), at: start, spell: ""})
+                    i = t.at
+                    continue
+                }
+                if s[i] == '_' { return Err(lexdb_base.err("ORA00911", "_: invalid character after <number>")) }
             }
             append(mut &out, Tok{kind: T_NUM, text: s[start..i].clone(), at: start, spell: ""})
             continue
@@ -560,6 +701,13 @@ type P = record {
     mr: int             // inside a MATCH_RECOGNIZE clause (how deep): PREV, FIRST, RUNNING, CLASSIFIER, ... are read
     udf: bool           // T-SQL: a schema-qualified function call or a function in FROM was read (Stmt.udf)
 }
+
+// (No field of P for what one of its functions hands to another only in a rare form: a field costs every statement's
+// parse its making, two empty arrays a point select's 120 instructions. T-SQL's GROUP BY ALL's WHERE goes from
+// selectCore to select in the SELECT's sets, GALL_SET; a column list's spellings back from aliasOf after SPELL_MARK.)
+const GALL_SET = "\x00gall"
+const SPELL_MARK = "\x00spell"
+
 
 // A CTE: kept as its text (where its tokens start), parsed again as a
 // subquery in FROM wherever it is used, seeing the CTEs before it (and a
@@ -1184,7 +1332,7 @@ fn (p: mut &P) unary(): Result[Expr, lexdb_base.DbErr] {
     while true {
         if p.acceptKw("::") {
             let t = try p.typeName()
-            e = Expr.Cast(e, t)
+            e = pgCast(e, t)
         } else if p.acceptKw("[") {
             // x[i]: an array's element (9.80)
             let i = try p.expr()
@@ -1733,13 +1881,22 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         p.pos += 2
         p.toks[p.pos].text = "dbms_lob_" + p.toks[p.pos].text
     }
-    // UTL_RAW.CAST_TO_NUMBER, CAST_TO_VARCHAR2, ...: read the column statistics' raw LOW_VALUE and HIGH_VALUE, which lexdb has none of
-    if p.ora && p.peek().kind == T_IDENT && (p.peek().text == "utl_raw" || (p.peek().text == "sys" && p.peekAt(2).text == "utl_raw")) {
-        let k = if p.peek().text == "utl_raw" { 0 } else { 2 }
-        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "." && p.peekAt(k + 2).kind == T_IDENT && strings.startsWith(&p.peekAt(k + 2).text, "cast_to_") &&
-           p.peekAt(k + 3).kind == T_OP && p.peekAt(k + 3).text == "(" {
-            p.pos += k + 2
-            p.toks[p.pos].text = "utl_raw_cast"
+    // UTL_RAW.CAST_TO_NUMBER, CAST_TO_BINARY_*, ...: read the column statistics' raw LOW_VALUE and HIGH_VALUE, which lexdb has
+    // none of (NULL); CAST_TO_RAW and CAST_TO_VARCHAR2 are the text's bytes and back. UTL_ENCODE.BASE64_ENCODE and
+    // BASE64_DECODE: a RAW in, a RAW out (lexdb_orafn).
+    if p.ora && p.peek().kind == T_IDENT && (p.peek().text == "utl_raw" || p.peek().text == "utl_encode" ||
+                                             (p.peek().text == "sys" && (p.peekAt(2).text == "utl_raw" || p.peekAt(2).text == "utl_encode"))) {
+        let k = if p.peek().text == "sys" { 2 } else { 0 }
+        let pkg = p.peekAt(k).text.clone()
+        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "." && p.peekAt(k + 2).kind == T_IDENT && p.peekAt(k + 3).kind == T_OP && p.peekAt(k + 3).text == "(" {
+            let f = p.peekAt(k + 2).text.clone()
+            if pkg == "utl_raw" && strings.startsWith(&f, "cast_to_") {
+                p.pos += k + 2
+                p.toks[p.pos].text = if f == "cast_to_raw" || f == "cast_to_varchar2" { "utl_raw_" + f } else { "utl_raw_cast" }
+            } else if pkg == "utl_encode" && (f == "base64_encode" || f == "base64_decode") {
+                p.pos += k + 2
+                p.toks[p.pos].text = "utl_encode_" + f
+            }
         }
     }
     // T-SQL: db.schema.f(...): f (design/lexdb-tds.md, section 13); schema.f(...) is a function of the user's (package F):
@@ -1950,7 +2107,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 if p.tsql { return Ok(tsqlCast(e, ty, None)) }
                 // Oracle's CAST(x AS BOOLEAN): any number not 0 true, as T-SQL's bit (lexdb_ops.coerce)
                 if p.ora && ty.kind == K_BOOL { return Ok(Expr.Cast(e, TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }
-                return Ok(Expr.Cast(e, ty))
+                if p.ora { return Ok(Expr.Cast(e, ty)) }
+                return Ok(pgCast(e, ty))
             }
             // the date and time keywords that are not called (9.76)
             "current_date", "current_timestamp", "localtimestamp", "current_time", "localtime" {
@@ -1964,14 +2122,14 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             }
             "extract" {
                 if p.isKw("(") {
-                    // EXTRACT(field FROM x): date_part('field', x)
+                    // EXTRACT(field FROM x): date_part('field', x), named extract (PostgreSQL 14's column name)
                     p.pos += 1
                     let f = p.next()
                     if f.kind != T_IDENT && f.kind != T_STR && f.kind != T_QIDENT { return Err(near(&f)) }
                     try p.expectKw("from")
                     let x = try p.expr()
                     try p.expectKw(")")
-                    return Ok(Expr.Call(if p.ora { "#ora_extract" } else { "date_part" }, [Expr.Lit(Val.Text(strings.toLowerAscii(&f.text))), x], false))
+                    return Ok(Expr.Call(if p.ora { "#ora_extract" } else { "extract" }, [Expr.Lit(Val.Text(strings.toLowerAscii(&f.text))), x], false))
                 }
             }
             "date", "time", "timestamp", "timestamptz", "interval" {
@@ -2405,6 +2563,32 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
         return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
     }
+    // SQL Server 2025's REGEXP_ functions: lexdb's, their omitted arguments SQL Server's defaults (REGEXP_REPLACE's
+    // occurrence 0: every match), their flags read as SQL Server's (lexdb_sql.RE_TSQL)
+    if strings.startsWith(name, "regexp_") {
+        // the place of the flags, and the defaults of the arguments before it
+        var defs: []Expr = []
+        var fk = -1
+        match name.toStr() {
+            "regexp_like" { fk = 2 }
+            "regexp_replace" { fk = 5; defs = [Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(0))] }
+            "regexp_substr" { fk = 4; defs = [Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(1))] }
+            "regexp_instr" { fk = 5; defs = [Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(0))] }
+            "regexp_count" { fk = 3; defs = [Expr.Lit(Val.Int(1))] }
+            else {}
+        }
+        if fk >= 0 && n >= 2 && n <= fk + 2 {
+            let first = fk - len(defs)
+            while len(a) < fk { append(mut &a, cloneE(&defs[len(a) - first])) }
+            if len(a) == fk { append(mut &a, Expr.Lit(Val.Text(""))) }
+            a[fk] = tsReFlags(replace(mut &a[fk], Expr.Lit(Val.Null)))
+            return Ok(Expr.Call(name.toStr(), a, false))
+        }
+    }
+    // a NULL constant where SQL Server wants a string (a typed NULL, CAST(NULL AS varchar), is one)
+    if (name == "substring" || name == "format") && n >= 1 && isNullLit(&a[0]) {
+        return Err(lexdb_base.err("TS8116", &("Argument data type NULL is invalid for argument 1 of " + name + " function.")))
+    }
     match name.toStr() {
         "len" { return Ok(Expr.Call("#len", a, false)) }
         "datalength" { return Ok(Expr.Call("#datalength", a, false)) }
@@ -2418,6 +2602,23 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         // T-SQL's own, not lexdb's: a bit shown as 1 (lexdb_tsqlfn)
         "concat_ws" { return Ok(Expr.Call("#concat_ws", a, false)) }
         "reverse" { return Ok(Expr.Call("#reverse", a, false)) }
+        "format" {
+            if n == 2 || n == 3 {
+                // (a NULL format is refused when compiled; a NULL culture is one SQL Server does not support)
+                if isNullLit(&a[1]) { return Err(lexdb_base.err("TS8116", "Argument data type NULL is invalid for argument 2 of format function.")) }
+                if n == 3 && isNullLit(&a[2]) { return Err(lexdb_base.err("TS9818", "The culture parameter 'NULL' provided in the function call is not supported.")) }
+                if isTextLit(&a[0]) { return Err(lexdb_base.err("TS8116", "Argument data type varchar is invalid for argument 1 of format function.")) }
+                return Ok(Expr.Call("#format", a, false))
+            }
+        }
+        // CHAR(n): the character of code n (0 to 255; NULL else), NCHAR(n) of code point n (needed by the REGEXP_ tests' newlines)
+        "char", "nchar" {
+            if n == 1 {
+                let hi = if name == "char" { 255 } else { 1114111 }
+                let ok = Expr.Bin("and", Expr.Bin(">=", cloneE(&a[0]), Expr.Lit(Val.Int(1))), Expr.Bin("<=", cloneE(&a[0]), Expr.Lit(Val.Int(hi))))
+                return Ok(Expr.Call("case", [ok, Expr.Call("chr", [replace(mut &a[0], Expr.Lit(Val.Null))], false)], false))
+            }
+        }
         "isnull" { return Ok(Expr.Call("coalesce", a, false)) }
         "iif" { if n == 3 { return Ok(Expr.Call("case else", a, false)) } }
         "choose" {
@@ -2439,6 +2640,13 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
                     None { return Err(lexdb_base.err("TS155", &("'" + lexdb_sql.exprText(&a[0]) + "' is not a recognized " + name + " option."))) }
                 }
                 let f = if name == "datediff_big" { "#datediff" } else { "#" + name }
+                // a string constant is read as a datetime (SQL Server's DATEADD of one gives a datetime)
+                if name == "dateadd" && n == 3 && isTextLit(&a[2]) {
+                    var dt = lexdb_sql.timeType(OID_TS)
+                    dt.prec = lexdb_dialect.TS_DATETIME
+                    dt.scale = 3
+                    a[2] = Expr.Cast(replace(mut &a[2], Expr.Lit(Val.Null)), dt)
+                }
                 return Ok(Expr.Call(f, a, false))
             }
         }
@@ -3835,6 +4043,16 @@ fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
     var first = try p.selectCore()
     let rn = replace(mut &p.rnLimit, -1)
+    if len(first.sets) > 0 {
+        // T-SQL's GROUP BY ALL: ORDER BY's aggregates too (groupAll)
+        let gi = pop(mut &first.sets)
+        let w = gi.expr
+        if !p.isKw("union") && !p.isKw("intersect") && !p.isKw("except") {
+            try p.orderLimit(mut &first)
+            for i in 0..len(first.order) { first.order[i].expr = allAgg(&first.order[i].expr, &w) }
+            return Ok(first)
+        }
+    }
     if !p.isKw("union") && !p.isKw("intersect") && !p.isKw("except") {
         try p.orderLimit(mut &first)
         if rn >= 0 { first = p.oraLimit(first, rn) }
@@ -4268,6 +4486,7 @@ fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("select")
         b = try p.selectCore()
         let rn = replace(mut &p.rnLimit, -1)
+        if len(b.sets) > 0 { b.sets = [] }
         if rn >= 0 { b.limit = Some(Expr.Lit(Val.Int(rn))) }
     }
     b.subs = replace(mut &p.subs, [])
@@ -4356,6 +4575,7 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
         }
         if !p.acceptKw(",") { break }
     }
+    if p.tsql { for it in items { match it.expr { Some(x) { try tsqlNotPredicate(&x) } None {} } } }
     return Ok(Unit{})
 }
 
@@ -4425,8 +4645,16 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("group") {
         try p.expectKw("by")
         try p.groupBy(mut &s)
+        if len(s.sets) > 0 {
+            // T-SQL's GROUP BY ALL (marked by groupBy): HAVING's aggregates too
+            if p.acceptKw("having") { s.having = Some(try p.expr()) }
+            p.groupAll(mut &s)
+        }
     }
-    if p.acceptKw("having") { s.having = Some(try p.expr()) }
+    if p.acceptKw("having") {
+        s.mdialect = p.md()
+        s.having = Some(try p.expr())
+    }
     if p.acceptKw("window") {
         // WINDOW name AS (spec), ...
         while true {
@@ -4640,9 +4868,125 @@ fn oraAllAliases(x: &Expr, out: mut &[]str) {
 // DISTINCT): its expressions, each once, in group; with any of those, the
 // grouping sets as places in group (gsets), the items' sets crossed. A row
 // (a, b) is its fields.
+// T-SQL's GROUP BY ALL: the groups of every row, WHERE's or not, each aggregate over the rows WHERE keeps (a group of
+// none has the aggregates of no rows: COUNT 0, the others NULL). As SQL Server's plan does it: WHERE moves into each
+// aggregate's argument (CASE WHEN w THEN x END; COUNT(*) counts CASE WHEN w THEN 1 END) and is dropped. The select list
+// and HAVING here, ORDER BY's in select (gallW).
+fn (p: mut &P) groupAll(s: mut &Stmt) {
+    s.sets = []
+    match replace(mut &s.where, None) {
+        Some(w) {
+            for i in 0..len(s.items) {
+                match s.items[i].expr {
+                    Some(x) { s.items[i].expr = Some(allAgg(&x, &w)) }
+                    None {}
+                }
+            }
+            match s.having {
+                Some(h) { s.having = Some(allAgg(&h, &w)) }
+                None {}
+            }
+            append(mut &s.sets, SetItem{col: GALL_SET, expr: w})
+        }
+        None {}
+    }
+}
+
+fn allAgg(x: &Expr, w: &Expr): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), allAgg(&a, w)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), allAgg(&a, w), allAgg(&b, w)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(allAgg(&a, w), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(allAgg(&a, w), t) }
+        Expr.Call(n, args, star) {
+            if lexdb_sql.isAgg(&n) {
+                if star { return Expr.Call(n.clone(), [Expr.Call("case", [cloneE(w), Expr.Lit(Val.Int(1))], false)], false) }
+                var out: []Expr = []
+                for i in 0..len(args) {
+                    // the value aggregated (STRING_AGG's separator as it is)
+                    append(mut &out, if i == 0 { Expr.Call("case", [cloneE(w), cloneE(&args[i])], false) } else { cloneE(&args[i]) })
+                }
+                return Expr.Call(n.clone(), out, false)
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, allAgg(&a, w)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return cloneE(x) }
+    }
+}
+
+// T-SQL: a predicate is not a value (SELECT REGEXP_LIKE(...), SELECT a IS DISTINCT FROM b: 156; in CASE WHEN, IIF and
+// WHERE it is one).
+fn tsqlNotPredicate(e: &Expr): Result[Unit, lexdb_base.DbErr] {
+    var x = e
+    match e {
+        Expr.Unary(op, a) { if op == "not" { x = &a } }
+        else {}
+    }
+    match x {
+        Expr.Call(n, _, _) {
+            if n == "regexp_like" { return Err(lexdb_base.err("TS156", "Incorrect syntax near the keyword 'regexp_like'.")) }
+            if n == "distinct from" { return Err(lexdb_base.err("TS156", "Incorrect syntax near the keyword 'IS'.")) }
+        }
+        else {}
+    }
+    return Ok(Unit{})
+}
+
+// A T-SQL REGEXP_ call's flags, marked as SQL Server's (lexdb_sql.RE_TSQL; a NULL stays NULL).
+fn tsReFlags(f: Expr): Expr {
+    match f {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(t) { return Expr.Lit(Val.Text(lexdb_sql.RE_TSQL + t)) }
+                Val.Null { return Expr.Lit(Val.Null) }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Expr.Bin("||", Expr.Lit(Val.Text(lexdb_sql.RE_TSQL)), f)
+}
+
+fn isNullLit(x: &Expr): bool {
+    match x {
+        Expr.Lit(v) { match v { Val.Null { return true } else { return false } } }
+        else { return false }
+    }
+}
+
+fn isTextLit(x: &Expr): bool {
+    match x {
+        Expr.Lit(v) { match v { Val.Text(_) { return true } else { return false } } }
+        else { return false }
+    }
+}
+
+// Oracle: the session has ALTER SESSION SET group_by_position_enabled = TRUE (GB_POS after the formats in nls).
+fn (p: &P) gbPos(): bool { return len(p.nls) > 0 && p.nls[len(p.nls) - 1] == GB_POS }
+
+// Whether x calls a subquery.
+fn hasSubRef(x: &Expr): bool {
+    match x {
+        Expr.Unary(_, a) { return hasSubRef(&a) }
+        Expr.Bin(_, a, b) { return hasSubRef(&a) || hasSubRef(&b) }
+        Expr.IsNull(a, _) { return hasSubRef(&a) }
+        Expr.Cast(a, _) { return hasSubRef(&a) }
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) { return true }
+            for a in args { if hasSubRef(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// GROUP BY's list; T-SQL's GROUP BY ALL (groupAll), which keeps the groups WHERE removed, marked in s.sets (GALL_SET).
 fn (p: mut &P) groupBy(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     var distinct = false
-    if p.acceptKw("distinct") { distinct = true } else { let al = p.acceptKw("all") }
+    if p.acceptKw("distinct") { distinct = true } else if p.acceptKw("all") { if p.tsql { append(mut &s.sets, SetItem{col: GALL_SET.toStr(), expr: Expr.Lit(Val.Null)}) } }
+    s.mdialect = p.md()             // its dialect's rules for names and positions (lexdb_bind.resolveGroupIn)
     var sets: [][]Expr = [[]]          // the cross product so far
     var special = false
     while true {
@@ -4659,6 +5003,8 @@ fn (p: mut &P) groupBy(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         sets = next
         if !p.acceptKw(",") { break }
     }
+    // (T-SQL's GROUP BY ALL takes no WITH ROLLUP or CUBE)
+    if len(s.sets) > 0 && p.isKw("with") { return Err(lexdb_base.err("TS1028", "The CUBE() and ROLLUP() grouping constructs are not allowed in a GROUP BY clause with the keyword ALL.")) }
     var texts: []str = []
     for st in sets {
         for x in st {
@@ -4669,6 +5015,19 @@ fn (p: mut &P) groupBy(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
                 append(mut &texts, t)
                 append(mut &s.group, cloneE(&x))
             }
+        }
+    }
+    for i in 0..len(s.group) {
+        if p.tsql {
+            // SQL Server groups by expressions of columns: a constant (a position too) or a variable is 164
+            var names: []str = []
+            lexdb_sql.colNames(&s.group[i], mut &names)
+            if len(names) == 0 && !hasSubRef(&s.group[i]) {
+                return Err(lexdb_base.err("TS164", "Each GROUP BY expression must contain at least one column that is not an outer reference."))
+            }
+        } else if p.ora && !p.gbPos() && lexdb_sql.litInt(&s.group[i]) >= 0 {
+            // Oracle: a number is a constant, not a position, unless the session enables them (lexdb_sql.gbConst)
+            s.group[i] = lexdb_sql.gbConst(lexdb_sql.litInt(&s.group[i]))
         }
     }
     if !special { return Ok(Unit{}) }
@@ -5131,7 +5490,7 @@ fn (p: mut &P) parenTree(join: int): Result[FromItem, lexdb_base.DbErr] {
     for k in 0..len(d.from) { name = name + (if k > 0 { " " } else { "" }) + d.from[k].alias }
     var alias = ""
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
     let tree = len(alias) == 0
     append(mut &d.items, SelItem{star: true, qual: if tree { lexdb_sql.TREE_STAR } else { "" }, expr: None, alias: "", spell: ""})
     append(mut &p.subs, d)
@@ -5180,7 +5539,12 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         try p.expectKw(")")
         var valias = "*VALUES*"
         var vcols: []str = []
-        try p.aliasOf(mut &valias, mut &vcols)
+        try p.aliasOf(mut &valias, mut &vcols, true)
+        var vspells = spellsOff(mut &vcols)
+        if p.ora && valias == "*VALUES*" { return Err(oraErr(931, "missing identifier")) }
+        if p.ora && len(vcols) == 0 { return Err(oraErr(63814, "Column names must be specified in the alias for Table Value Constructor.")) }
+        if !p.tsql && !p.ora { vspells = [] }
+        p.subs[vi].spells = vspells         // (the names as written: lexdb_exec's FROM binding)
         return Ok(FromItem{table: "", alias: valias, join: join, on: None, sub: vi, cols: vcols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     if p.acceptKw("(") {
@@ -5191,7 +5555,9 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         if p.ora { p.subs[i].mdialect = MD_ORA }
         var alias = "unnamed_subquery"
         var cols: []str = []
-        try p.aliasOf(mut &alias, mut &cols)
+        try p.aliasOf(mut &alias, mut &cols, true)
+        let spells = spellsOff(mut &cols)
+        if p.tsql || p.ora { p.subs[i].spells = spells }
         return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: lateral, using: [], natural: false, comma: false})
     }
     let at0 = p.pos
@@ -5203,7 +5569,7 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     var alias = lexdb_sql.baseName(&table)
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
     try p.tableHints()
     if p.ora && lexdb_sql.baseName(&table) == "dual" && !p.cteNamed(&"dual") {
         // Oracle's DUAL: one row, one column DUMMY = 'X'
@@ -5250,6 +5616,12 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         // (T-SQL's and Oracle's recursive CTE names its columns itself, as written: lexdb_recrun.outsOf)
         if !given && p.ctes[ci].rec && (p.tsql || p.ora) { cols = [] }
         let i = try p.cteRef(ci)
+        // a CTE's column list names its columns as written (T-SQL, Oracle: lexdb_exec's FROM binding)
+        if !given && !p.ctes[ci].rec && (p.tsql || p.ora) && len(cols) > 0 {
+            var sp: []str = []
+            for c in p.ctes[ci].spells { append(mut &sp, c.clone()) }
+            p.subs[i].spells = sp
+        }
         return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
@@ -5277,6 +5649,15 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
         }
     }
     try p.expectKw(")")
+    // SQL Server 2025's REGEXP_MATCHES and REGEXP_SPLIT_TO_TABLE: their own columns (lexdb_srf), SQL Server's flags
+    if p.tsql && (name == "regexp_matches" || name == "regexp_split_to_table") && (len(s.items) == 2 || len(s.items) == 3) {
+        s.srf = "tsql_" + name
+        if len(s.items) == 2 { append(mut &s.items, SelItem{star: false, qual: "", expr: Some(Expr.Lit(Val.Text(""))), alias: "", spell: ""}) }
+        match replace(mut &s.items[2].expr, None) {
+            Some(f) { s.items[2].expr = Some(tsReFlags(f)) }
+            None {}
+        }
+    }
     s.subs = replace(mut &p.subs, saved)
     s.wins = replace(mut &p.wins, savedW)
     p.depth -= 1
@@ -5288,10 +5669,27 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
     let i = len(p.subs) - 1
     var alias = name.clone()
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
+    // SQL Server 2022's GENERATE_SERIES: its column is value; without a step, 1 up to the stop or -1 down to it
+    if p.tsql && name == "generate_series" && len(cols) == 0 { append(mut &cols, "value") }
+    if p.tsql && name == "generate_series" && len(p.subs[i].items) == 2 {
+        match p.subs[i].items[0].expr {
+            Some(a) {
+                match p.subs[i].items[1].expr {
+                    Some(b) {
+                        let up = Expr.Bin("<=", cloneE(&a), cloneE(&b))
+                        append(mut &p.subs[i].items, SelItem{star: false, qual: "", expr: Some(Expr.Call("case else", [up, Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(-1))], false)), alias: "", spell: ""})
+                    }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
     // one column, an alias and no column names: the column is the alias
-    let single = name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
-                 len(p.subs[i].items) == 1
+    let single = !strings.startsWith(&p.subs[i].srf, "tsql_") &&
+                 (name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
+                  len(p.subs[i].items) == 1)
     if single && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
@@ -5339,7 +5737,7 @@ fn (p: mut &P) pgFunctionFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
     let i = len(p.subs) - 1
     var alias = lexdb_sql.baseName(&key)
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
     p.udf = true
     return Ok(FromItem{table: key, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
@@ -5372,7 +5770,7 @@ fn (p: mut &P) udfFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
     let i = len(p.subs) - 1
     var alias = lexdb_sql.baseName(&key)
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
     p.udf = true
     if len(cols) > 0 { return Err(lexdb_base.err("TS317", &("Table-valued function '" + lexdb_sql.baseName(&key) + "' cannot have a column alias."))) }
     return Ok(FromItem{table: key, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
@@ -5399,7 +5797,9 @@ fn (p: mut &P) tableHints(): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
-fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_base.DbErr] {
+// spelled: after a column list, SPELL_MARK and its names' spellings (p.spelled's: the T-SQL and Oracle doors' names as
+// written), for the caller to take off (spellsOff).
+fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str, spelled: bool): Result[Unit, lexdb_base.DbErr] {
     var got = false
     if p.acceptKw("as") {
         let old = replace(alias, try p.name())
@@ -5422,11 +5822,37 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
         }
     }
     if got && p.acceptKw("(") {
+        var spells: []str = []
         append(cols, try p.name())
-        while p.acceptKw(",") { append(cols, try p.name()) }
+        append(mut &spells, p.spelled.clone())
+        while p.acceptKw(",") {
+            append(cols, try p.name())
+            append(mut &spells, p.spelled.clone())
+        }
         try p.expectKw(")")
+        if spelled {
+            append(cols, SPELL_MARK.toStr())
+            for x in spells { append(cols, x) }
+        }
     }
     return Ok(Unit{})
+}
+
+// A column list read with its spellings (aliasOf's spelled): the spellings, taken off the list.
+fn spellsOff(cols: mut &[]str): []str {
+    var at = -1
+    for i in 0..len(cols) { if cols[i] == SPELL_MARK { at = i } }
+    if at < 0 { return [] }
+    var sp: []str = []
+    while len(cols) > at + 1 { append(mut &sp, pop(cols)) }
+    let m = pop(cols)
+    var out: []str = []
+    var k = len(sp) - 1
+    while k >= 0 {
+        append(mut &out, sp[k].clone())
+        k -= 1
+    }
+    return out
 }
 
 // ---- MATCH_RECOGNIZE (design/lexdb-match-recognize.md 5): after a FROM item, in all three doors.
@@ -5488,7 +5914,7 @@ fn (p: mut &P) matchRecognize(f0: FromItem): Result[FromItem, lexdb_base.DbErr] 
     append(mut &p.subs, w)
     var alias = "unnamed_subquery"
     var cols: []str = []
-    try p.aliasOf(mut &alias, mut &cols)
+    try p.aliasOf(mut &alias, mut &cols, false)
     p.subs[len(p.subs) - 1].mr[0].alias = alias.clone()
     return Ok(FromItem{table: "", alias: alias, join: outerJoin, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: outerLateral,
                        using: [], natural: false, comma: false})
@@ -5969,7 +6395,7 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.rname()
     var cols: []str = []
     try p.tableHints()
-    try p.aliasOf(mut &s.alias, mut &cols)
+    try p.aliasOf(mut &s.alias, mut &cols, false)
     try p.tableHints()
     if len(cols) > 0 { return Err(lexdb_base.err("42601", "syntax error at or near \"(\"")) }
     try p.expectKw("using")
@@ -6178,7 +6604,7 @@ fn (p: mut &P) dmlTarget(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     s.table = try p.rname()
     let star = p.acceptKw("*")
     var cols: []str = []
-    try p.aliasOf(mut &s.alias, mut &cols)
+    try p.aliasOf(mut &s.alias, mut &cols, false)
     try p.tableHints()
     if len(cols) > 0 { return Err(lexdb_base.err("42601", "syntax error at or near \"(\"")) }
     return Ok(Unit{})
@@ -7416,6 +7842,11 @@ pub fn oraParse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] { return parseIn(sq
 // TO_CHAR, TO_DATE and TO_TIMESTAMP with no format follow them.
 pub fn oraParseNls(sql: &str, nls: []str): Result[[]Stmt, lexdb_base.DbErr] { return parseIn(sql, true, nls) }
 
+// The last of oraParseNls's nls when the session has ALTER SESSION SET group_by_position_enabled = TRUE: a GROUP BY
+// position is the select list's item (by default it is a constant, and ORA-03162 if the list needs a grouping).
+pub const GB_POS = "#gbpos"
+
+
 // Oracle's row generator, FROM dual CONNECT BY LEVEL <= n (or < n), as the table function
 // generate_series(1, n) with the column LEVEL; any other CONNECT BY is left to fail as unsupported.
 fn connectLevel(sql: &str, toks: &[]Tok): Option[str] {
@@ -7466,14 +7897,8 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
     var p = P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: ora, rnLimit: -1, nls: nls, mr: 0, udf: false}
     var out: []Stmt = []
     while true {
-        p.params = 0
-        p.subs = []
-        p.ctes = []
-        p.nextCte = 0
-        p.inCte = []
-        p.depth = 0
-        p.seqs = []
-        p.wins = []
+        // (the parser's per-statement state is as P was made: reset after a ";", below, for the next; resetting it here
+        // too remade five empty arrays for every statement, a point select's parse about 50 instructions)
         var s = try p.statement()
         s.params = p.params
         s.seqNames = replace(mut &p.seqs, [])
@@ -7497,6 +7922,14 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
                 append(mut &out, s)
                 if p.nextCte > 0 { markCtes(mut &out[len(out) - 1], p.nextCte) }
             }
+            p.params = 0
+            p.subs = []
+            p.ctes = []
+            p.nextCte = 0
+            p.inCte = []
+            p.depth = 0
+            p.seqs = []
+            p.wins = []
             continue
         }
         return Err(near(&t))
@@ -7920,6 +8353,12 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
         }
         "ora_database_name" { return Ok(Expr.Lit(Val.Text("LEXDB"))) }
         "utl_raw_cast" { return Ok(Expr.Lit(Val.Null)) }
+        "utl_raw_cast_to_raw", "utl_raw_cast_to_varchar2", "utl_encode_base64_encode", "utl_encode_base64_decode" {
+            if n != 1 { return Err(orArgs(name)) }
+            let f = match name.toStr() { "utl_raw_cast_to_raw" { "#ora_rawof" } "utl_raw_cast_to_varchar2" { "#ora_rawtext" }
+                                         "utl_encode_base64_encode" { "#ora_b64enc" } else { "#ora_b64dec" } }
+            return Ok(Expr.Call(f, a, false))
+        }
         "dbms_lob_getlength" {
             if n != 1 { return Err(orArgs(name)) }
             return Ok(Expr.Call("length", a, false))
@@ -7977,17 +8416,17 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
         "to_char", "to_nchar" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
             // no format: a date follows the session's NLS formats
-            if n == 1 && len(p.nls) == 3 { return Ok(Expr.Call("#ora_tochar1", [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone())), Expr.Lit(Val.Text(p.nls[1].clone())), Expr.Lit(Val.Text(p.nls[2].clone()))], false)) }
+            if n == 1 && len(p.nls) >= 3 { return Ok(Expr.Call("#ora_tochar1", [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone())), Expr.Lit(Val.Text(p.nls[1].clone())), Expr.Lit(Val.Text(p.nls[2].clone()))], false)) }
             return Ok(Expr.Call("#ora_tochar", a, false))
         }
         "to_date" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
-            if n == 1 && len(p.nls) == 3 && len(p.nls[0]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone()))] }
+            if n == 1 && len(p.nls) >= 3 && len(p.nls[0]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[0].clone()))] }
             return Ok(Expr.Call("#ora_todate", a, false))
         }
         "to_timestamp" {
             if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
-            if n == 1 && len(p.nls) == 3 && len(p.nls[1]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[1].clone()))] }
+            if n == 1 && len(p.nls) >= 3 && len(p.nls[1]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[1].clone()))] }
             return Ok(Expr.Call("#ora_totimestamp", a, false))
         }
         "to_number" {

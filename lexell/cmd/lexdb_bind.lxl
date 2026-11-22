@@ -426,6 +426,8 @@ pub fn oraStamp(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
                 "#ora_add", "#ora_trunc", "#ora_sub", "coalesce" {
                     if len(args) == 0 { return -1 }
                     let a = oraStamp(&args[0], cols)
+                    // TRUNC of a DATE or a TIMESTAMP is a DATE
+                    if f == "#ora_trunc" { return if a >= 0 { 0 } else { -1 } }
                     if a >= 0 || len(args) < 2 || f == "#ora_sub" { return a }
                     return oraStamp(&args[1], cols)
                 }
@@ -633,11 +635,12 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 }
                 "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop", "avg" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_INT8 }
+                    if a == lexdb_sql.OID_IVAL && n == "avg" { return a }
                     return if isFloatOid(a) { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
                 }
                 "sum" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_INT8 }
-                    return if a == lexdb_sql.OID_NUMERIC || isFloatOid(a) { a } else { lexdb_sql.OID_INT8 }
+                    return if a == lexdb_sql.OID_NUMERIC || isFloatOid(a) || a == lexdb_sql.OID_IVAL { a } else { lexdb_sql.OID_INT8 }
                 }
                 "floor", "ceil", "ceiling", "trunc" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_FLOAT8 }
@@ -746,6 +749,10 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 "gen_random_uuid" { return lexdb_sql.OID_UUID }
                 "encode" { return lexdb_sql.OID_TEXT }
                 "decode" { return lexdb_sql.OID_BYTEA }
+                "reverse" {
+                    let a = if len(args) == 1 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT }
+                    return if a == lexdb_sql.OID_BYTEA { a } else { lexdb_sql.OID_TEXT }
+                }
                 "now", "current_timestamp", "transaction_timestamp", "statement_timestamp", "clock_timestamp", "to_timestamp" {
                     return lexdb_sql.OID_TSTZ
                 }
@@ -758,7 +765,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 }
                 "current_date", "make_date" { return lexdb_sql.OID_DATE }
                 "current_time", "localtime" { return lexdb_sql.OID_TIME }
-                "date_part" { return lexdb_sql.OID_NUMERIC }
+                "date_part", "extract" { return lexdb_sql.OID_NUMERIC }
                 "age", "make_interval" { return lexdb_sql.OID_IVAL }
                 "isfinite" { return lexdb_sql.OID_BOOL }
                 "date_trunc" {
@@ -1663,6 +1670,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 // with an array: array_cat, array_append or array_prepend (9.92)
                 let f = arrayConcat(&l, &r, cols, &[], &ns.ty)
                 if len(f) > 0 { return Ok(Expr.Call(f, [l, r], false)) }
+                try catTypes(&l, &r, cols, ns)
                 // a char as a text (9.94)
                 let lt = if isBp(&l, cols, &ns.ty) { trimmed(l) } else { l }
                 let rt = if isBp(&r, cols, &ns.ty) { trimmed(r) } else { r }
@@ -1775,6 +1783,9 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 return Ok(Expr.Call(nm.clone(), out, star))
             }
             for a in args { append(mut &out, try resolve(&a, cols, n, ns)) }
+            // a function no evaluator has: refused when the statement is bound, as each product does (42883: SQL Server's 195,
+            // Oracle's ORA-00904), not when a row first calls it (an empty input gave no error)
+            if !knownCall(&nm, len(args)) { return Err(e("42883", &("function " + nm + " with " + len(args).toStr() + " arguments does not exist"))) }
             if nm == "#win" && len(out) == 2 {
                 // a window's sum of bigints: the window's value made the sum's type (wideSum), its call left as it is
                 match wideInner(&out[1]) {
@@ -1868,10 +1879,12 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             if nm == "pg_typeof" && len(out) == 1 && !star {
                 // its argument's type, known now: a text (PostgreSQL's regtype, shown by name)
                 let o = exprOid(&out[0], cols, &[], &ns.ty)
-                if o == lexdb_sql.OID_BPCHAR { return Ok(Expr.Lit(Val.Text("character"))) }
+                // (a text, cast so that the column is named pg_typeof: castName)
+                let named = lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: TYPEOF_LEN}
+                if o == lexdb_sql.OID_BPCHAR { return Ok(Expr.Cast(Expr.Lit(Val.Text("character")), named)) }
                 // (SEARCH's and CYCLE's record and record[]: lexdb_recrun)
-                if o == 2249 || o == 2287 { return Ok(Expr.Lit(Val.Text(if o == 2249 { "record" } else { "record[]" }))) }
-                return Ok(Expr.Lit(Val.Text(lexdb_sql.typeText(&lexdb_sql.oidType(o)))))
+                if o == 2249 || o == 2287 { return Ok(Expr.Cast(Expr.Lit(Val.Text(if o == 2249 { "record" } else { "record[]" })), named)) }
+                return Ok(Expr.Cast(Expr.Lit(Val.Text(lexdb_sql.typeText(&lexdb_sql.oidType(o)))), named))
             }
             return Ok(bpCall(&nm, out, star, cols, &ns.ty))
         }
@@ -2390,15 +2403,35 @@ fn exprName(x: &Expr): str {
             if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
             if n == "#old" && len(args) == 1 { return exprName(&args[0]) }
             if n == "#acat" || n == "#aappend" || n == "#aprepend" || n == "@>" || n == "<@" || n == "&&" || n == "~" ||
-               n == "!~" || n == "~*" || n == "!~*" { return "?column?" }
+               n == "!~" || n == "~*" || n == "!~*" || n == "distinct from" { return "?column?" }
             return lexdb_sql.aggBase(&n)
         }
         Expr.Cast(a, t) {
             let inner = exprName(&a)
-            return if inner == "?column?" { lexdb_ops.kindName(&t) } else { inner }
+            return if inner == "?column?" { castName(&t) } else { inner }
         }
         else { return "?column?" }
     }
+}
+
+// A cast's column name, as PostgreSQL's FigureColname gives it: the type's own name (int4, not integer).
+// pg_typeof's value: a text cast to text of this length, which no statement writes (its column's name pg_typeof).
+const TYPEOF_LEN = -41
+
+fn castName(t: &lexdb_sql.TypeName): str {
+    if t.len == TYPEOF_LEN { return "pg_typeof" }
+    let o = t.oid
+    if o == lexdb_sql.OID_INT2 { return "int2" }
+    if o == lexdb_sql.OID_INT4 { return "int4" }
+    if o == lexdb_sql.OID_INT8 { return "int8" }
+    if o == lexdb_sql.OID_FLOAT4 { return "float4" }
+    if o == lexdb_sql.OID_FLOAT8 { return "float8" }
+    if o == lexdb_sql.OID_BOOL { return "bool" }
+    if o == lexdb_sql.OID_VARCHAR { return "varchar" }
+    if o == lexdb_sql.OID_BPCHAR { return "bpchar" }
+    if o == lexdb_sql.OID_TSTZ { return "timestamptz" }
+    if o == lexdb_sql.OID_TS { return "timestamp" }
+    return lexdb_ops.kindName(t)
 }
 
 // The output columns of a SELECT: (name, OID), and the expressions behind
@@ -2725,6 +2758,123 @@ pub fn resolveGroup(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs:
         else {}
     }
     return resolve(g, cols, len(cols), ns)
+}
+
+// || of two values neither of which is a string (PostgreSQL's and SQL Server's ||; Oracle's is #ora_cat, which takes
+// numbers): PostgreSQL has no such operator (42883), SQL Server refuses it (402).
+fn catTypes(l: &Expr, r: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Unit, DbErr] {
+    let pt = ptypesOf(ns)
+    let lo = exprOid(l, cols, &pt, &ns.ty)
+    if !notString(lo) { return Ok(Unit{}) }
+    let ro = exprOid(r, cols, &pt, &ns.ty)
+    if !notString(ro) { return Ok(Unit{}) }
+    if len(ns.coll) > 0 {
+        return Err(e("TS402", &("The data types " + oidWord(lo, true) + " and " + oidWord(ro, true) + " are incompatible in the concat operator.")))
+    }
+    return Err(e("42883", &("operator does not exist: " + oidWord(lo, false) + " || " + oidWord(ro, false))))
+}
+
+fn oidWord(o: int, tsql: bool): str {
+    if o == lexdb_sql.OID_INT2 { return "smallint" }
+    if o == lexdb_sql.OID_INT4 { return if tsql { "int" } else { "integer" } }
+    if o == lexdb_sql.OID_INT8 { return "bigint" }
+    if o == lexdb_sql.OID_NUMERIC { return if tsql { "numeric" } else { "numeric" } }
+    if o == lexdb_sql.OID_FLOAT4 { return "real" }
+    if o == lexdb_sql.OID_FLOAT8 { return if tsql { "float" } else { "double precision" } }
+    if o == lexdb_sql.OID_BOOL { return if tsql { "bit" } else { "boolean" } }
+    if o == lexdb_sql.OID_DATE { return "date" }
+    if o == lexdb_sql.OID_UUID { return if tsql { "uniqueidentifier" } else { "uuid" } }
+    return if tsql { "datetime2" } else { "timestamp without time zone" }
+}
+
+fn notString(o: int): bool {
+    return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_NUMERIC || o == lexdb_sql.OID_FLOAT4 ||
+           o == lexdb_sql.OID_FLOAT8 || o == lexdb_sql.OID_BOOL || o == lexdb_sql.OID_DATE || o == lexdb_sql.OID_TIME || o == lexdb_sql.OID_TS ||
+           o == lexdb_sql.OID_TSTZ || o == lexdb_sql.OID_IVAL || o == lexdb_sql.OID_UUID
+}
+
+// Whether a call of name with n arguments is one some evaluator has: the parser's own (#..., and names with modifiers or
+// a schema), the aggregates and window functions, the library's (lexdb_lib.entryOpt, entry1Of), the sequence, lock and
+// catalog functions, and those the executor evaluates itself (lexdb_exec's isSessFn, catEntry, eval's CASE and
+// COALESCE, MATCH_RECOGNIZE's navigation), as lexdb_exec.fnRefOf and eval find them.
+pub fn knownCall(name: &str, n: int): bool {
+    if len(name) == 0 || name[0] == '#' || strings.contains(name, " ") || strings.contains(name, ".") { return true }
+    if lexdb_lib.entryOpt(name, n).isSome() { return true }
+    if n == 1 && lexdb_lib.entry1Of(name).isSome() { return true }
+    if isAgg(name) || isWinFn(name) || isSeqFn(name) || isAdvFn(name) || lexdb_sql.isCatFn(name) { return true }
+    match name {
+        "case", "coalesce", "row", "grouping", "pg_typeof", "current_schema", "format_type", "pg_size_pretty", "current_setting", "set_config",
+        "pg_backend_pid", "txid_current", "pg_current_xact_id", "pg_my_temp_schema", "pg_is_other_temp_schema", "charindex", "patindex",
+        "prev", "next", "first", "last", "classifier", "match_number" { return true }
+        else { return false }
+    }
+}
+
+// A GROUP BY item by its dialect's rules (md: lexdb_sql.MD_*, the statement's): T-SQL takes no select alias (207, as
+// an unknown column; its constants are refused when parsed, 164); Oracle takes an alias, and a position only when the
+// session enables them (lexdb_sql.gbConst: a constant else); PostgreSQL both.
+pub fn resolveGroupIn(g: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr, ns: mut &Names, md: int): Result[Expr, DbErr] {
+    if md == lexdb_sql.MD_TSQL {
+        match g {
+            Expr.Col(n, _) {
+                let r = try resolveName(cols, len(cols), &n)
+                return Ok(if dotAt(&n) < 0 { colExpr(cols, r) } else { colAt(cols, r) })
+            }
+            else {}
+        }
+    }
+    return resolveGroup(g, cols, outs, exprs, ns)
+}
+
+// HAVING, resolved; Oracle's may name a select alias (23ai) where no column has the name.
+pub fn resolveHaving(h: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr, ns: mut &Names, md: int): Result[Expr, DbErr] {
+    if md == lexdb_sql.MD_ORA { return resolve(&aliasRefs(h, cols, outs, exprs), cols, len(cols), ns) }
+    return resolve(h, cols, len(cols), ns)
+}
+
+fn aliasRefs(x: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Expr): Expr {
+    match x {
+        Expr.Col(n, _) {
+            if dotAt(&n) < 0 && resolveName(cols, len(cols), &n).isErr() {
+                for i in 0..len(outs) { if outs[i].name == n && i < len(exprs) { return clone(&exprs[i]) } }
+            }
+            return clone(x)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), aliasRefs(&a, cols, outs, exprs)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), aliasRefs(&a, cols, outs, exprs), aliasRefs(&b, cols, outs, exprs)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(aliasRefs(&a, cols, outs, exprs), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(aliasRefs(&a, cols, outs, exprs), t) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, aliasRefs(&a, cols, outs, exprs)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return clone(x) }
+    }
+}
+
+// A grouped query's check of its output (r): in Oracle, with a GROUP BY number that is a constant (lexdb_sql.gbConst),
+// a column not grouped is ORA-03162, not ORA-00979.
+pub fn groupedIn(r: Result[Unit, DbErr], s: &lexdb_sql.Stmt): Result[Unit, DbErr] {
+    match r {
+        Ok(u) { return Ok(u) }
+        Err(x) {
+            if x.state == "42803" && s.mdialect == lexdb_sql.MD_ORA {
+                for g in s.group {
+                    if lexdb_sql.isGbConst(&g) {
+                        // column "t.a" must appear ...: "A"
+                        let q = strings.indexOf(&x.msg, "\"", 0)
+                        let q2 = if q >= 0 { strings.indexOf(&x.msg, "\"", q + 1) } else { -1 }
+                        var c = if q2 > q { x.msg[q + 1..q2].toStr() } else { "" }
+                        let d = dotAt(&c)
+                        if d >= 0 { c = c[d + 1..len(c)].toStr() }
+                        return Err(e("ORA03162", &("\"" + strings.toUpperAscii(&c) + "\": must appear in the GROUP BY clause or be used in an aggregate function as 'group_by_position_enabled' is FALSE")))
+                    }
+                }
+            }
+            return Err(x)
+        }
+    }
 }
 
 // ---- function names by what a call may do (the binder binds none of the sequence

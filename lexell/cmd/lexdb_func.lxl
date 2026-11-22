@@ -721,10 +721,12 @@ pub type ReFlags = value record {
     pub expanded: bool      // x: white space and # comments in the pattern ignored
     pub nlAnchor: bool      // w: ^ and $ at lines, . matching a newline
     pub nlStop: bool        // p: . not matching a newline, ^ and $ at the ends
+    pub tsql: bool          // SQL Server 2025's (tsReFlags): the pattern as RE2 reads it, the first match of the leftmost
 }
 
 pub fn reFlags(f: &str): Result[ReFlags, DbErr] {
-    var r = ReFlags{glob: false, icase: false, newline: false, quote: false, expanded: false, nlAnchor: false, nlStop: false}
+    var r = ReFlags{glob: false, icase: false, newline: false, quote: false, expanded: false, nlAnchor: false, nlStop: false, tsql: false}
+    if len(f) > 0 && f[0] == 1 { return tsReFlags(&f[1..len(f)], r) }
     for i in 0..len(f) {
         let c = f[i]
         if c == 'g' { r.glob = true }
@@ -741,6 +743,56 @@ pub fn reFlags(f: &str): Result[ReFlags, DbErr] {
         else { return Err(e("22023", &("invalid regular expression option: \"" + f[i..i + 1] + "\""))) }
     }
     return Ok(r)
+}
+
+// SQL Server 2025's flags (its engine is RE2's): c and i the case (the last wins), s a . matching a newline, m ^ and $
+// at lines; none: case-sensitive, . not matching a newline, ^ and $ at the ends. Any other is 19303.
+fn tsReFlags(f: &str, r0: ReFlags): Result[ReFlags, DbErr] {
+    var r = r0
+    r.tsql = true
+    var dot = false
+    var lines = false
+    var bad = ""
+    for i in 0..len(f) {
+        let c = f[i]
+        if c == 'c' { r.icase = false }
+        else if c == 'i' { r.icase = true }
+        else if c == 's' { dot = true }
+        else if c == 'm' { lines = true }
+        else { bad.addByte(c) }
+    }
+    if len(bad) > 0 { return Err(e("TS19303", &("Invalid flag provided. '" + bad + "' are not valid flags. Only {c,i,s,m} flags are valid."))) }
+    // (as reCompileFor reads the fields: none "", s "s", m "m", both "ms")
+    r.nlStop = !dot && !lines
+    r.newline = lines && !dot
+    r.nlAnchor = lines && dot
+    return Ok(r)
+}
+
+// SQL Server's error for a pattern RE2 does not take (19300 with RE2's words; 19307, 19308, 19309 for the ones it names).
+fn tsReErr(pat: &str, msg: &str): DbErr {
+    if strings.contains(msg, "missing closing )") { return e("TS19308", &("Missing ')' in the Pattern " + pat + ".")) }
+    if strings.contains(msg, "missing closing ]") { return e("TS19308", &("Missing ']' in the Pattern " + pat + ".")) }
+    if strings.contains(msg, "unexpected )") { return e("TS19307", &("Encountered an unexpected ')' in the Pattern " + pat + ".")) }
+    if strings.contains(msg, "trailing backslash") { return e("TS19309", &("Invalid trailing backslash (\\) provided at the end of the Pattern " + pat + ".")) }
+    // lib/regex's words for it as RE2's
+    var why = msg.toStr()
+    let at = strings.indexOf(&why, "error parsing regexp: ", 0)
+    if at >= 0 { why = why[at + 22..len(why)].toStr() }
+    let tick = strings.indexOf(&why, ": `", 0)
+    var what = ""
+    if tick >= 0 {
+        what = why[tick + 3..len(why)].toStr()
+        if strings.endsWith(&what, "`") { what = what[0..len(what) - 1].toStr() }
+        let paren = strings.indexOf(&what, "` (", 0)
+        if paren >= 0 { what = what[0..paren].toStr() }
+        why = why[0..tick].toStr()
+    }
+    if why == "invalid repeat count" { why = "invalid repetition size" }
+    else if why == "missing argument to repetition operator" { why = "no argument for repetition operator" }
+    else if why == "invalid or unsupported Perl syntax" { why = "invalid perl operator" }
+    let full = if len(what) > 0 { why + ": " + what } else { why }
+    return e("TS19300", &("An invalid Pattern '" + pat + "' was provided. Error '" + full + "' occurred during evaluation of the Pattern."))
 }
 
 // PostgreSQL's ARE escapes RE2 spells otherwise: \y \m \M (word
@@ -817,6 +869,14 @@ pub fn reCompile(pat: &str, fl: &ReFlags): Result[regex.Regex, DbErr] { return r
 pub fn reCompileTest(pat: &str, fl: &ReFlags): Result[regex.Regex, DbErr] { return reCompileFor(pat, fl, false) }
 
 fn reCompileFor(pat: &str, fl: &ReFlags, which: bool): Result[regex.Regex, DbErr] {
+    if fl.tsql {
+        // SQL Server's: RE2's syntax as it is, Perl's leftmost-first match
+        let opts = (if fl.icase { "i" } else { "" }) + (if fl.newline { "m" } else if fl.nlAnchor { "ms" } else if !fl.nlStop { "s" } else { "" })
+        match regex.compile(&((if len(opts) > 0 { "(?" + opts + ")" } else { "" }) + pat)) {
+            Ok(re) { return Ok(re) }
+            Err(x) { return Err(tsReErr(pat, &x.toStr())) }
+        }
+    }
     var body = if fl.quote { regex.quote(pat) } else { arePattern(pat, fl.expanded) }
     var opts = ""
     if fl.icase { opts = opts + "i" }
@@ -1807,6 +1867,38 @@ fn numProcess(d: mut &NumDesc, numstr: &str, sign: byte, outPre: int): str {
 
 // to_number(text, format): the digits, sign and point read where the
 // format has them.
+// A Roman numeral at s[i0] (blanks before it), written as one is (MCMXCIV; not IIII, IC or VV), as to_number's RN reads it.
+fn romanIn(s: &str, i0: int): Result[Decimal, DbErr] {
+    let n = len(s)
+    var i = i0
+    while i < n && s[i] == ' ' { i += 1 }
+    var u = ""
+    while i < n && strings.indexOf(&"IVXLCDMivxlcdm", &(s[i..i + 1].toStr()), 0) >= 0 {
+        u.addByte(if s[i] >= 'a' { s[i] - 32 } else { s[i] })
+        i += 1
+    }
+    let bad = e("22P02", &("invalid input syntax for type numeric: \"" + s + "\""))
+    if len(u) == 0 { return Err(bad) }
+    // thousands, hundreds, tens and units, each written one way
+    var v = 0
+    var at = 0
+    let places: [][]str = [["", "M", "MM", "MMM"], ["", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"],
+                           ["", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"], ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"]]
+    let scale: []int = [1000, 100, 10, 1]
+    for p in 0..4 {
+        // the longest spelling that is there
+        var best = 0
+        for d in 1..len(places[p]) {
+            let w = &places[p][d]
+            if at + len(w) <= len(u) && u[at..at + len(w)] == w && len(w) > len(places[p][best]) { best = d }
+        }
+        v += best * scale[p]
+        at += len(places[p][best])
+    }
+    if at != len(u) || v == 0 { return Err(bad) }
+    return Ok(Decimal.fromInt(v))
+}
+
 pub fn toNumber(s: &str, f: &str): Result[Decimal, DbErr] {
     let d = try numDesc(f)
     var digits = ""
@@ -1821,6 +1913,8 @@ pub fn toNumber(s: &str, f: &str): Result[Decimal, DbErr] {
             if i < n { i += strings.decodeAt(s, i).size }
             continue
         }
+        // PostgreSQL 18: a Roman numeral (1 to 3999, either case, blanks before it), the value; the rest is not read
+        if k == "RN" { return romanIn(s, i) }
         if k == "9" || k == "0" {
             // a digit place: skip blanks and a sign before the first digit
             while i < n && (s[i] == ' ' || ((s[i] == '-' || s[i] == '+' || s[i] == '<') && len(digits) == 0 && !seenDot)) {

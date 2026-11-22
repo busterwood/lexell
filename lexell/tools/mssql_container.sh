@@ -22,7 +22,9 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -w "${XDG_RUNTIME_DIR:-}" ]; then
   export XDG_RUNTIME_DIR=/tmp/lxl-podman-$(id -u)
   mkdir -p -m 700 "$XDG_RUNTIME_DIR"
 fi
-NAME=lxl-mssql
+# (LXL_MSSQL_NAME: another container of the same password, for `sql`: lxl-mssql25, SQL Server 2025 on 127.0.0.1:14331,
+# run as root, design/lexdb-new-features.md)
+NAME=${LXL_MSSQL_NAME:-lxl-mssql}
 IMAGE=mcr.microsoft.com/mssql/server:2022-latest
 PORT=14330
 DSN_FILE=$HOME/.obo-mssql-dsn
