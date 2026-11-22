@@ -1341,3 +1341,144 @@ it are the per-row reads by key. Profiled on the branch:
   semi join's first candidate); not done.
 - Kernels for fixed-layout and tagged rows (`bRunLazy`, `bTagLazy`), and
   for `InInts`; a DCmp against a constant of a finer scale.
+
+
+### 4.7 `ds`: the per-row reads by key (2026-11-22, as built)
+
+Branch from main `7ff69abe` (after R8). Measured in `~/tpch-w/ds`
+(`ab.sh`, `cmp.py`, `tab.py`; `tools/iq.sh` server instructions and
+cycles per query, `tools/prof.sh` with the `LXL_NATIVE_MAP` map,
+`tools/up.py` caller chains, `tools/ips.py` samples per instruction; logs
+in `logs/`). Binaries `lexdb-ds-base-O` (main) and `lexdb-ds-O`, built the
+same way.
+
+**Profiled first (main).** The key searches were 35-40% of q3, q15 and
+q11: `rt_str_cmp` (q3 18.7%, q15 13.8%), `Node.lower` (10%),
+`childIndex` (5.4%), `fingerTo` (8.3%), from `scanRanges` (q3's lineitem
+ranges per order) and `getManyIn` (rows by primary key). Per
+instruction, two things stood out: every binary search's midpoint
+`(lo + hi) / 2` was an `idiv`, and the rest sat on loads of nodes not in
+the CPU's caches (the leaf's record in `fingerTo`, its entries).
+
+**Built.**
+1. `6d10e987`, key words (lexdb_page): a node read from its page (an
+   internal node, a lazy leaf) keeps per key its first 8 bytes as a
+   big-endian u64, zero padded (`Node.pfx`, made by `reword`): words are
+   in the keys' order or equal. Equal words decide by length when either
+   key is no longer than 8 bytes (the shorter is then a prefix of the
+   other); the node's shortest and longest key lengths (`kmin`, `kmax`)
+   mostly decide that without reading the key. Only equal words of two
+   longer keys compare the strings. When keys next to each other over 8
+   bytes share their first word (a primary key of two integers: lineitem,
+   partsupp; an index's entries), the node keeps two words a key, its
+   first 16 bytes, and the same rules hold at 16. A primary key of
+   integers has its first column as its first word. `lower`, `child`,
+   `keyLe` and `keyLt` use them; `descend`, `snapDescend` and `fingerTo`
+   (with `fHolds`, `getManyIn`, `scanRanges`, `lookupAhead`, `warm`) take
+   the probe's word once per key. A loosened leaf (keys as arrays, changed
+   in place) has none and compares strings as before; every change of an
+   internal node's keys (`split`, `hang`, `applyDel`, `cutKids`) makes its
+   words again; `nodeCost` counts them. In memory only: the page format is
+   unchanged. The midpoints are shifts. Of the seven descents, `descend`,
+   `snapDescend` and `fingerTo` were changed; `descendBack`, the
+   follower's and the count's keep `childIndex`/`lowerIndex` (shifts
+   now), their leaves' `lower` using the words. Test `page_words`: leaves
+   and internal nodes of every shape of key (8-byte integers, two
+   integers, keys under 8 bytes and of 0, zero and 0xff bytes, 8/9/15/16/17
+   bytes sharing 8 or 16, index entries, an empty leaf, one key, two),
+   read from their pages and changed in place, probed with every key, its
+   neighbours, its prefixes and extensions: `lower`, `lowerW`, `child`,
+   `keyLe`, `keyLt` against the strings' order.
+2. `c1d4bcee`: `rangeManyIn`'s batch starts at about 4 rows a range (1 for
+   a first-row read; 64 to 8,192), not at 64 doubled by copying (`bRoom`,
+   6% of q3), and is not made for an index's entries whose rows are read
+   after.
+3. `08d34e21`: `Node.keyIs`: when every key of a leaf is as long as the
+   probe and its words hold it whole, `getManyIn` knows the key it found
+   by the words, without reading the leaf's entries and body. `copyNode`
+   (versions kept for snapshots, a checkpoint's leaf jobs) makes no words.
+4. `5f135aa6`: `keyWord` loads a key of 8 bytes or more inline (it called
+   `wordAt`): wire point selects' cycles from +1.6..2.0% to -0.2..-0.3%.
+
+Tried and dropped: comparing tied keys word by word from byte 8 in Lexell
+(`cmpTail`): more instructions than `rt_str_cmp`'s `memcmp` (q15 +5.7%,
+q3 +2.3%); two words a key replaced it. Not done: q20's correlated
+subquery prepared once per statement (its 8,508 runs' set-up is about 30%
+of q20 outside the reads, spread over `execSelIn`, `pipeSrcQ`,
+`bCompileD`, `lazyOf`, the aggregate's state and allocation; a run's
+pipeline made reusable is an exec change of its own); a search inside a
+leaf from the last key's place (q15's sorted probes land about 27 rows
+apart: one step of eight saved).
+
+**Server instructions and cycles** (`iq.sh`, one warm-up and two runs,
+millions; base and branch alternated twice, the rounds within 0.3%):
+
+| query | main instr | branch instr | change | main cycles | branch cycles | change |
+|---|---:|---:|---:|---:|---:|---:|
+| q3 | 4,062 | 3,554 | -12.5% | 2,607 | 2,105 | -19.3% |
+| q10 | 3,078 | 2,910 | -5.5% | 1,943 | 1,784 | -8.2% |
+| q11 | 546 | 532 | -2.7% | 356 | 316 | -11.0% |
+| q15 | 2,746 | 2,643 | -3.8% | 1,621 | 1,543 | -4.9% |
+| q20 | 1,675 | 1,640 | -2.1% | 1,066 | 962 | -9.8% |
+| q6 | 1,583 | 1,583 | 0.0% | 758 | 749 | -1.2% |
+
+By step (instructions in millions, one session each; cycles move a few
+percent between sessions): the words with one word a key, q3 4,062 ->
+3,868, q10 3,075 -> 2,982, q20 1,675 -> 1,655, q15 2,746 -> 2,733; the
+shifts and `kmin`/`kmax`, q3 -> 3,838 (cycles 2,260 -> 2,183); two words
+a key, q15 -> 2,614, q11 543 -> 528, q20 -> 1,636; the batch's size (2),
+q3 -> 3,559, q10 -> 2,908 (q4 1,336 -> 1,167, q5 1,468 -> 1,361);
+`keyIs` (3), cycles q15 -3%, q20 -2.5%, q11 -5% at 0.3-1.2% more
+instructions.
+
+**Point gate.** In process (`pt`, 20,000 a mode, `LXL_HASH_SEED=1`, two
+rounds, base and branch built the same way), instructions a statement:
+select 128,046.9 -> 127,986.7 (-0.05%), INSERT 55,118,788.6 ->
+55,118,526.8, UPDATE by key 55,138,729.5 -> 55,138,811.2 (+82, +0.00015%:
+the checkpoints' words for the leaves they repack). Wire
+(`icount6.sh BIN 3`, base and branch alternated twice): instructions
+176,543 / 176,407 -> 175,512 / 175,740 (-0.5%), cycles 98,966 / 98,218 ->
+98,791 / 97,879 (-0.2..-0.3%), L1 i-cache misses 375 / 377 -> 394 / 405,
+iTLB misses 37 / 39 -> 102 / 102, branch misses 390 / 384 -> 352 / 341
+(the hot path's code is placed differently; before `5f135aa6` the same
+counts gave cycles +1.6..2.0%).
+
+**TPC-H** (`-O`, SF1, one run each, base and branch alternated twice;
+ms; PostgreSQL one core from 1.6's `01b0250c`). All 22 checksums equal.
+The second base run's q15 (868.7) is an outlier: without it q15 is 385.6
+-> 373.0 (-3.3%) and the total -4.5%.
+
+| query | main 1 | main 2 | branch 1 | branch 2 | change | checksums | branch / PG |
+|---|---:|---:|---:|---:|---:|---|---:|
+| q1 | 1,575.3 | 1,563.9 | 1,576.5 | 1,569.7 | +0.2% | equal | |
+| q2 | 39.7 | 39.2 | 39.5 | 38.6 | -1.0% | equal | |
+| q3 | 649.7 | 638.4 | 529.7 | 525.3 | -18.1% | equal | 0.94 |
+| q4 | 165.4 | 163.4 | 140.3 | 140.2 | -14.7% | equal | |
+| q5 | 185.4 | 183.7 | 163.9 | 160.1 | -12.2% | equal | |
+| q6 | 180.7 | 179.1 | 182.6 | 181.1 | +1.1% | equal | |
+| q7 | 419.0 | 419.3 | 406.9 | 404.0 | -3.3% | equal | |
+| q8 | 206.2 | 189.5 | 157.9 | 155.3 | -20.8% | equal | |
+| q9 | 1,651.8 | 1,628.1 | 1,592.5 | 1,595.0 | -2.8% | equal | |
+| q10 | 485.0 | 481.7 | 451.1 | 446.0 | -7.2% | equal | 1.12 |
+| q11 | 95.1 | 96.3 | 94.0 | 87.9 | -5.0% | equal | 1.44 |
+| q12 | 450.8 | 452.0 | 438.4 | 436.6 | -3.1% | equal | |
+| q13 | 701.5 | 701.0 | 706.6 | 688.3 | -0.5% | equal | |
+| q14 | 144.6 | 144.5 | 140.5 | 139.7 | -3.1% | equal | |
+| q15 | 385.6 | 868.7 | 375.1 | 371.0 | -3.3% (outlier out) | equal | 1.07 |
+| q16 | 236.0 | 249.1 | 229.1 | 225.8 | -6.2% | equal | |
+| q17 | 26.8 | 29.2 | 22.0 | 21.8 | -21.8% | equal | |
+| q18 | 597.8 | 603.9 | 597.0 | 602.4 | -0.2% | equal | |
+| q19 | 42.3 | 41.8 | 37.3 | 37.3 | -11.3% | equal | |
+| q20 | 273.1 | 269.9 | 246.8 | 245.8 | -9.3% | equal | 1.85 |
+| q21 | 734.8 | 735.6 | 705.9 | 707.4 | -3.9% | equal | |
+| q22 | 104.3 | 104.1 | 104.6 | 102.3 | -0.7% | equal | |
+| all 22 | 9,351 | 9,782 | 8,938 | 8,882 | -4.5% (outlier out) | | 0.60 |
+
+q6 is level in the server's instructions and cycles (above); its +1.1%
+is the run's noise. Gates: suite 302 of 302 (`page_words` new).
+
+**What is left.** q3 is now under PostgreSQL's one core (0.94). In q20,
+q15 and q3's lookups the time left in the descents is the loads of
+nodes not in the CPU's caches (a leaf's record, its words, its entries:
+`fingerTo` and `lowerW` per instruction), not the compares; q20's
+per-run set-up (above) is its largest piece outside the reads.
