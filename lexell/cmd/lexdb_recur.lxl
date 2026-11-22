@@ -1,0 +1,784 @@
+// lexdb_recur: recursion in the doors (design/lexdb-dialect-gaps.md, "Recursion in the doors"). A recursive CTE as each
+// product writes it: PostgreSQL's WITH RECURSIVE, SQL Server's CTE that names itself (anchor members, then UNION ALL
+// recursive members), Oracle's recursive subquery factoring (one anchor, UNION ALL, one recursive branch, the column list
+// required), and the SEARCH and CYCLE clauses of PostgreSQL and Oracle. Its secrets: each dialect's rules and errors for the
+// shape of a recursive CTE (check), the shape the executor runs (shape: the anchors, UNION ALL, the recursive members as one
+// query), the lineage column that tells each row's parent (a hidden last column, LINEAGE: the anchors' 0, the recursive
+// members' the working table's row number), and what the lineage gives: SQL Server's order (its stack spool: the last row
+// made is the next one expanded), Oracle's and PostgreSQL's SEARCH orders and CYCLE marks, Oracle's cycle check. The
+// executor (lexdb_exec.runRecursive) runs the rounds as before and asks this module what to do with their rows; this
+// module knows statements and values only, never the store or the executor.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type Stmt = lexdb_sql.Stmt
+type Expr = lexdb_sql.Expr
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+// The hidden last column of a recursive CTE run with its lineage: a row's number in the run (the anchors' rows 0..,
+// then each round's); in the recursive members, the working table's row's (the parent's).
+pub const LINEAGE = "\x00rowid:rid"
+
+// What a recursive CTE needs of the executor beyond PostgreSQL's rounds, kept in its set operation's Stmt.index (a field a
+// SELECT has no other use for) and the Sel's srf: encode, decode.
+pub type Spec = record {
+    pub md: int                 // lexdb_sql.MD_*: whose order and errors
+    pub name: str               // the CTE's name as written (its errors')
+    pub cols: []str             // its column list ([] none: its anchor's names)
+    pub spells: []str           // ... as written (the names a client sees)
+    pub lineage: bool           // its last column is LINEAGE
+    pub noPred: bool            // Oracle: the recursive branch has no predicate: ORA-32044 when it runs, as Oracle's
+    pub search: int             // SEARCH_*
+    pub sCols: []str            // SEARCH ... BY these columns
+    pub sDesc: []bool
+    pub sNulls: []int           // 0 the default (NULLs last going up, first going down), 1 NULLS FIRST, 2 NULLS LAST
+    pub sSet: str               // ... SET this column
+    pub cCols: []str            // CYCLE these columns
+    pub cSet: str               // ... SET this column
+    pub cTo: Val                // ... TO this value DEFAULT that one
+    pub cDefault: Val
+    pub cPath: str              // PostgreSQL: ... USING this path column
+    pub cb: bool                // Oracle's CONNECT BY (hierQuery): its loops by the PRIOR values (cCols), ORA-01436
+    pub nocycle: bool           // ... NOCYCLE: a row that closes a loop is left out, its parent's CONNECT_BY_ISCYCLE 1
+}
+
+pub const SEARCH_NONE = 0
+pub const SEARCH_DEPTH = 1
+pub const SEARCH_BREADTH = 2
+
+pub fn newSpec(md: int): Spec {
+    return Spec{md: md, name: "", cols: [], spells: [], lineage: false, noPred: false, search: SEARCH_NONE, sCols: [], sDesc: [], sNulls: [], sSet: "", cCols: [], cSet: "",
+                cTo: Val.Null, cDefault: Val.Null, cPath: "", cb: false, nocycle: false}
+}
+
+fn valCode(v: &Val): str {
+    match v {
+        Val.Bool(b) { return if b { "bt" } else { "bf" } }
+        Val.Int(n) { return "i" + n.toStr() }
+        Val.Text(t) { return "s" + t }
+        else { return "n" }
+    }
+}
+
+fn valOf(s: &str): Val {
+    if len(s) == 0 { return Val.Null }
+    let rest = s[1..len(s)].toStr()
+    if s[0] == 'b' { return Val.Bool(rest == "t") }
+    if s[0] == 'i' { return Val.Int(strings.parseIntOpt(&rest).unwrapOr(0)) }
+    if s[0] == 's' { return Val.Text(rest) }
+    return Val.Null
+}
+
+pub fn encode(s: &Spec): str {
+    var d: []str = []
+    for b in s.sDesc { append(mut &d, if b { "1" } else { "0" }) }
+    var nl: []str = []
+    for n in s.sNulls { append(mut &nl, n.toStr()) }
+    let f = [s.md.toStr(), if s.lineage { "1" } else { "0" }, if s.noPred { "1" } else { "0" }, s.search.toStr(), strings.join(&s.sCols, "\x1e"),
+             strings.join(&d, "\x1e"), strings.join(&nl, "\x1e"), s.sSet.clone(), strings.join(&s.cCols, "\x1e"), s.cSet.clone(), valCode(&s.cTo),
+             valCode(&s.cDefault), s.cPath.clone(), s.name.clone(), if s.cb { "1" } else { "0" }, if s.nocycle { "1" } else { "0" },
+             strings.join(&s.cols, "\x1e"), strings.join(&s.spells, "\x1e")]
+    return "R" + strings.join(&f, "\x1f")
+}
+
+fn list(s: &str): []str {
+    if len(s) == 0 { return [] }
+    var out: []str = []
+    for x in strings.split(s, "\x1e") { append(mut &out, x.toStr()) }
+    return out
+}
+
+// The Spec of a set operation's index (or a Sel's srf); a PostgreSQL one with nothing more when it has none.
+pub fn decode(t: &str): Spec {
+    if len(t) == 0 || t[0] != 'R' { return newSpec(lexdb_sql.MD_PG) }
+    let f = strings.split(&t[1..len(t)], "\x1f")
+    var s = newSpec(strings.parseIntOpt(&f[0]).unwrapOr(0))
+    s.lineage = f[1] == "1"
+    s.noPred = f[2] == "1"
+    s.search = strings.parseIntOpt(&f[3]).unwrapOr(0)
+    s.sCols = list(&f[4])
+    for x in list(&f[5]) { append(mut &s.sDesc, x == "1") }
+    for x in list(&f[6]) { append(mut &s.sNulls, strings.parseIntOpt(&x).unwrapOr(0)) }
+    s.sSet = f[7].toStr()
+    s.cCols = list(&f[8])
+    s.cSet = f[9].toStr()
+    s.cTo = valOf(&f[10])
+    s.cDefault = valOf(&f[11])
+    s.cPath = f[12].toStr()
+    s.name = f[13].toStr()
+    s.cb = f[14] == "1"
+    s.nocycle = f[15] == "1"
+    s.cols = list(&f[16])
+    s.spells = list(&f[17])
+    return s
+}
+
+// Whether a Sel's srf (a set operation's) is a recursive CTE's Spec.
+pub fn isSpec(t: &str): bool { return len(t) > 0 && t[0] == 'R' }
+
+// ---- errors
+
+fn ts(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+fn ora(n: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(n.toStr()), 5, '0')), msg) }
+fn up(name: &str): str { return strings.toUpperAscii(name) }
+
+// A recursive reference inside a subquery of an expression (and, in Oracle, any subquery).
+pub fn inSubquery(name: &str, md: int): DbErr {
+    if md == lexdb_sql.MD_TSQL { return ts(465, "Recursive references are not allowed in subqueries.") }
+    if md == lexdb_sql.MD_ORA { return ora(32042, &("recursive WITH clause element " + up(name) + " must reference itself directly in one of the UNION ALL branches")) }
+    return lexdb_base.err("42P19", &("recursive reference to query \"" + name + "\" must not appear within a subquery"))
+}
+
+// Oracle: a recursive WITH element without its column list.
+pub fn noColumnList(name: &str): DbErr { return ora(32039, &("missing column alias list in recursive WITH clause element " + up(name))) }
+
+// ---- the shape
+
+// The references to CTE id's working table in s: its FROM items', its subqueries' (derived tables), its parts'.
+pub fn workRefs(s: &Stmt, id: int): int {
+    var n = 0
+    for f in s.from { if f.work == id { n += 1 } }
+    for x in s.inner { n += workRefs(&x, id) }
+    for x in s.subs { n += workRefs(&x, id) }
+    return n
+}
+
+// A set operation's operands along its left side (UNION, EXCEPT and INTERSECT as written, left to right), with the
+// operator before each one but the first.
+fn flatten(s: Stmt, ms: mut &[]Stmt, ops: mut &[]int, alls: mut &[]bool) {
+    var x = s
+    if x.setop != 0 && len(x.inner) == 2 && len(x.order) == 0 && x.limit.isNone() && x.offset.isNone() {
+        let r = pop(mut &x.inner)
+        let l = pop(mut &x.inner)
+        flatten(l, ms, ops, alls)
+        append(ops, x.setop)
+        append(alls, x.setAll)
+        append(ms, r)
+        return
+    }
+    append(ms, x)
+}
+
+fn setOf(op: int, all: bool, l: Stmt, r: Stmt, md: int): Stmt {
+    var s = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    s.setop = op
+    s.setAll = all
+    s.mdialect = md
+    append(mut &s.inner, l)
+    append(mut &s.inner, r)
+    return s
+}
+
+fn exprHasAgg(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if lexdb_sql.isAgg(&name) { return true }
+            for a in args { if exprHasAgg(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return exprHasAgg(&a) }
+        Expr.Bin(_, a, b) { return exprHasAgg(&a) || exprHasAgg(&b) }
+        Expr.IsNull(a, _) { return exprHasAgg(&a) }
+        Expr.Cast(a, _) { return exprHasAgg(&a) }
+        else { return false }
+    }
+}
+
+// GROUP BY, HAVING or an aggregate in s (deep: its scalar subqueries' too).
+fn groups(s: &Stmt, deep: bool): bool {
+    if len(s.group) > 0 || len(s.gsets) > 0 || s.having.isSome() { return true }
+    for it in s.items { match it.expr { Some(x) { if exprHasAgg(&x) { return true } } None {} } }
+    if deep { for x in s.subs { if groups(&x, true) { return true } } }
+    return false
+}
+
+fn hasCol(x: &Expr): bool {
+    match x {
+        Expr.Col(_, _) { return true }
+        Expr.Param(_) { return true }
+        Expr.Unary(_, a) { return hasCol(&a) }
+        Expr.Bin(_, a, b) { return hasCol(&a) || hasCol(&b) }
+        Expr.IsNull(a, _) { return hasCol(&a) }
+        Expr.Cast(a, _) { return hasCol(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if hasCol(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+// Oracle: whether the recursive branch filters at all (a WHERE or an ON that reads a column); one that does not is
+// ORA-32044 when it runs, as Oracle's (WHERE 1 = 1 too).
+fn filters(s: &Stmt): bool {
+    match s.where { Some(w) { if hasCol(&w) { return true } } None {} }
+    for f in s.from { match f.on { Some(o) { if hasCol(&o) { return true } } None {} } }
+    return false
+}
+
+fn starred(s: &Stmt): bool {
+    if s.setop != 0 {
+        for x in s.inner { if starred(&x) { return true } }
+        return false
+    }
+    if len(s.srf) > 0 || len(s.rows) > 0 { return true }
+    // (a * is fine: the lineage, a hidden column, is not in one)
+    return false
+}
+
+// The select list's length of a query's first operand (-1: a * in it).
+fn width(s: &Stmt): int {
+    if s.setop != 0 && len(s.inner) > 0 { return width(&s.inner[0]) }
+    for it in s.items { if it.star { return -1 } }
+    if len(s.srf) > 0 || len(s.rows) > 0 { return -1 }
+    return len(s.items)
+}
+
+// The dialect's rules for a recursive CTE's body (name as written, its number id, the column list's length cols, 0 none),
+// before it is run: SQL Server's 246, 247, 252, 253, 460, 461, 462, 467, 8158 and 8159; Oracle's ORA-32038, 32040,
+// 32041, 32486, 32487 and 32490. PostgreSQL's are the executor's (lexdb_exec.planSelect).
+pub fn check(body: &Stmt, name: &str, id: int, cols: int, md: int): Result[Unit, DbErr] {
+    var ms: []Stmt = []
+    var ops: []int = []
+    var alls: []bool = []
+    flatten(body.clone(), mut &ms, mut &ops, mut &alls)
+    if md == lexdb_sql.MD_PG {
+        // (PostgreSQL's recursive term reads the CTE once)
+        if len(ms) > 1 && workRefs(&ms[len(ms) - 1], id) > 1 {
+            return Err(lexdb_base.err("42P19", &("recursive reference to query \"" + name + "\" must not appear more than once")))
+        }
+        return Ok(Unit{})
+    }
+    var refs: []int = []
+    for m in ms { append(mut &refs, workRefs(&m, id)) }
+    let w = width(body)
+    if md == lexdb_sql.MD_ORA {
+        if len(ms) < 2 || ops[len(ops) - 1] != lexdb_sql.SET_UNION || !alls[len(alls) - 1] {
+            return Err(ora(32040, &("missing UNION ALL in recursive WITH clause element " + up(name))))
+        }
+        if len(ms) > 2 { return Err(ora(32041, &("UNION ALL operation in recursive WITH clause element " + up(name) + " must have only two branches."))) }
+        let k = if refs[1] > 0 { 1 } else { 0 }
+        let rm = &ms[k]
+        if refs[k] > 1 { return Err(ora(32490, &("recursive query name referenced more than once in recursive branch of recursive WITH clause element " + up(name)))) }
+        if groups(rm, false) || rm.distinct || len(rm.distinctOn) > 0 { return Err(ora(32486, "unsupported operation in recursive branch of recursive WITH clause")) }
+        var at = -1
+        for j in 0..len(rm.from) { if rm.from[j].work == id { at = j } }
+        for j in 0..len(rm.from) {
+            let jn = rm.from[j].join
+            if (jn == lexdb_sql.J_LEFT && j == at) || (jn == lexdb_sql.J_RIGHT && at >= 0 && at < j) || (jn == lexdb_sql.J_FULL && at >= 0 && at <= j) {
+                return Err(ora(32487, "unsupported join in recursive WITH query"))
+            }
+        }
+        if w >= 0 && cols > 0 && w != cols { return Err(ora(32038, "number of WITH clause column names does not match number of elements in select list")) }
+        return Ok(Unit{})
+    }
+    // SQL Server
+    var k = -1
+    for i in 0..len(ms) { if k < 0 && refs[i] > 0 { k = i } }
+    if len(ms) < 2 || k < 0 { return Err(ts(252, &("Recursive common table expression '" + name + "' does not contain a top-level UNION ALL operator."))) }
+    if k == 0 { return Err(ts(246, &("No anchor member was specified for recursive query \"" + name + "\"."))) }
+    for i in k..len(ms) {
+        if refs[i] == 0 { return Err(ts(247, &("An anchor member was found in the recursive part of recursive query \"" + name + "\"."))) }
+        if ops[i - 1] != lexdb_sql.SET_UNION || !alls[i - 1] {
+            return Err(ts(252, &("Recursive common table expression '" + name + "' does not contain a top-level UNION ALL operator.")))
+        }
+    }
+    let tail = " is not allowed in the recursive part of a recursive common table expression '" + name + "'."
+    for i in k..len(ms) {
+        let m = &ms[i]
+        if refs[i] > 1 { return Err(ts(253, &("Recursive member of a common table expression '" + name + "' has multiple recursive references."))) }
+        if m.distinct || len(m.distinctOn) > 0 { return Err(ts(460, &("DISTINCT operator" + tail))) }
+        if m.limit.isSome() || m.offset.isSome() { return Err(ts(461, &("The TOP or OFFSET operator" + tail))) }
+        for f in m.from {
+            if f.join == lexdb_sql.J_LEFT || f.join == lexdb_sql.J_RIGHT || f.join == lexdb_sql.J_FULL { return Err(ts(462, &("Outer join" + tail))) }
+        }
+        if groups(m, true) {
+            return Err(ts(467, &("GROUP BY, HAVING, or aggregate functions are not allowed in the recursive part of a recursive common table expression '" + name + "'.")))
+        }
+    }
+    if w >= 0 && cols > 0 && w > cols { return Err(ts(8158, &("'" + name + "' has more columns than were specified in the column list."))) }
+    if w >= 0 && cols > 0 && w < cols { return Err(ts(8159, &("'" + name + "' has fewer columns than were specified in the column list."))) }
+    return Ok(Unit{})
+}
+
+fn lineageType(): lexdb_sql.TypeName { return lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0} }
+
+fn addAnchorLineage(s: mut &Stmt) {
+    if s.setop != 0 {
+        for i in 0..len(s.inner) { addAnchorLineage(mut &s.inner[i]) }
+        return
+    }
+    append(mut &s.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Cast(Expr.Lit(Val.Int(0)), lineageType())), alias: LINEAGE, spell: LINEAGE})
+}
+
+// A recursive member's LINEAGE: its working table's (a FROM item of its own); false when it reads it otherwise (in a
+// derived table), and then no member has one.
+fn addMemberLineage(s: mut &Stmt, id: int): bool {
+    for f in s.from {
+        if f.work == id {
+            append(mut &s.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Col(f.alias + "." + LINEAGE, -1)), alias: LINEAGE, spell: LINEAGE})
+            return true
+        }
+    }
+    return false
+}
+
+// SQL Server's rows before its 530: whether a SELECT gives its rows as a recursive CTE it reads makes them (its stack
+// spool feeding the client: the CTE first in FROM, no sort, grouping, DISTINCT, window or set operation over it): -1 not,
+// 0 so, n so with TOP n (it stops after n rows: no error when they come first).
+pub fn streams(s: &Stmt): int {
+    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || len(s.assign) > 0 || len(s.into) > 0 || len(s.order) > 0 || len(s.wins) > 0 ||
+       s.distinct || len(s.distinctOn) > 0 || groups(s, false) || s.offset.isSome() || len(s.from) == 0 { return -1 }
+    let f = &s.from[0]
+    if f.sub < 0 || f.sub >= len(s.subs) || s.subs[f.sub].cte < 0 { return -1 }
+    match s.limit {
+        Some(x) {
+            let n = lexdb_sql.litInt(&x)
+            return if n > 0 && s.topMode == 0 { n } else { -1 }
+        }
+        None { return 0 }
+    }
+}
+
+fn readsWork(s: &Stmt, id: int): bool {
+    if s.setop != 0 { return false }
+    for f in s.from { if f.work == id { return true } }
+    return false
+}
+
+fn take(ms: mut &[]Stmt, i: int): Stmt { return replace(mut &ms[i], lexdb_sql.newStmt(lexdb_sql.S_SELECT)) }
+
+// A recursive CTE's body (check passed) as the executor runs it: its anchors as written, then UNION ALL and its
+// recursive members as one query (SQL Server's several, one UNION ALL; Oracle's two branches in either order, the
+// anchor first); its lineage where every recursive member reads the working table in its own FROM and nothing has a *
+// (else no lineage: the rounds' own order); the Spec (sp: its SEARCH and CYCLE) in the set operation's index. A
+// PostgreSQL one without SEARCH or CYCLE is left as it is. (The set operation is body's own Stmt, its parts replaced: what
+// the reader set on it stays.)
+pub fn shape(body: Stmt, id: int, md: int, sp: Spec): Stmt {
+    if md == lexdb_sql.MD_PG && sp.search == SEARCH_NONE && len(sp.cCols) == 0 { return body }
+    if body.setop == 0 || len(body.inner) != 2 { return body }
+    var spec = sp
+    spec.md = md
+    var top = body
+    let r0 = pop(mut &top.inner)
+    let l0 = pop(mut &top.inner)
+    var ms: []Stmt = []
+    var ops: []int = []
+    var alls: []bool = []
+    flatten(setOf(top.setop, top.setAll, l0, r0, md), mut &ms, mut &ops, mut &alls)
+    var k = -1
+    for i in 0..len(ms) { if k < 0 && workRefs(&ms[i], id) > 0 { k = i } }
+    // (Oracle: the recursive branch may come first)
+    if md == lexdb_sql.MD_ORA && k == 0 && len(ms) == 2 {
+        let r = take(mut &ms, 0)
+        ms[0] = take(mut &ms, 1)
+        ms[1] = r
+        k = 1
+    }
+    if k < 1 {
+        // (not a shape the rules let through: as written)
+        var a = take(mut &ms, 0)
+        for i in 1..len(ms) - 1 { a = setOf(ops[i - 1], alls[i - 1], a, take(mut &ms, i), md) }
+        top.setop = ops[len(ops) - 1]
+        top.setAll = alls[len(alls) - 1]
+        append(mut &top.inner, a)
+        append(mut &top.inner, take(mut &ms, len(ms) - 1))
+        return top
+    }
+    if md == lexdb_sql.MD_ORA && !filters(&ms[k]) { spec.noPred = true }
+    var lin = true
+    for i in 0..len(ms) {
+        if starred(&ms[i]) { lin = false }
+        if i >= k && !readsWork(&ms[i], id) { lin = false }
+    }
+    if lin { for i in k..len(ms) { let x = addMemberLineage(mut &ms[i], id) } }
+    var a = take(mut &ms, 0)
+    for i in 1..k { a = setOf(ops[i - 1], alls[i - 1], a, take(mut &ms, i), md) }
+    if lin { addAnchorLineage(mut &a) }
+    var r = take(mut &ms, k)
+    for i in k + 1..len(ms) { r = setOf(lexdb_sql.SET_UNION, true, r, take(mut &ms, i), md) }
+    spec.lineage = lin
+    top.setop = lexdb_sql.SET_UNION
+    top.setAll = alls[k - 1]
+    append(mut &top.inner, a)
+    append(mut &top.inner, r)
+    top.index = encode(&spec)
+    return top
+}
+
+// ---- Oracle's hierarchical queries (CONNECT BY), as a recursive CTE
+
+// The columns a hierarchical query adds to its rows, hidden (not in a *; lexdb_catalog.hiddenName): LEVEL, CONNECT_BY_ISLEAF,
+// CONNECT_BY_ISCYCLE (the run fills them: lexdb_recrun), and per use of PRIOR, CONNECT_BY_ROOT, SYS_CONNECT_BY_PATH, per
+// PRIOR operand of CONNECT BY (the loop check's values) and per ORDER SIBLINGS BY key a column of its own.
+pub const H_LEVEL = "\x00rowid:level"
+pub const H_LEAF = "\x00rowid:isleaf"
+pub const H_CYCLE = "\x00rowid:iscycle"
+const H_WORK = "\x00hier"               // the working table's alias in the recursive member
+
+// The marker a SELECT with START WITH / CONNECT BY carries in Stmt.exprs until its ORDER BY is read (hierMark).
+pub const HIER = "#hier"
+
+// START WITH s CONNECT BY [NOCYCLE] c, kept in the SELECT (exprs) until ORDER [SIBLINGS] BY is read.
+pub fn hierMark(start: Option[Expr], conn: Expr, nocycle: bool): Expr {
+    let s = match start { Some(x) { x } None { Expr.Lit(Val.Null) } }
+    return Expr.Call(HIER, [s, conn, Expr.Lit(Val.Bool(nocycle)), Expr.Lit(Val.Bool(false))], false)
+}
+
+// Whether s is a SELECT with CONNECT BY (its marker).
+pub fn isHier(s: &Stmt): bool {
+    if len(s.exprs) != 1 { return false }
+    match s.exprs[0] {
+        Expr.Call(n, _, _) { return n == HIER }
+        else { return false }
+    }
+}
+
+// Its ORDER BY was ORDER SIBLINGS BY.
+pub fn markSiblings(s: mut &Stmt) {
+    match s.exprs[0] {
+        Expr.Call(n, args, star) {
+            var a = lexdb_sql.cloneAllExpr(&args)
+            a[3] = Expr.Lit(Val.Bool(true))
+            s.exprs[0] = Expr.Call(n.clone(), a, star)
+        }
+        else {}
+    }
+}
+
+type Slot = record { name: str; kind: int; e: Expr; sep: Expr }
+
+const SL_PRIOR = 1
+const SL_ROOT = 2
+const SL_PATH = 3
+const SL_KEY = 4        // a PRIOR operand of CONNECT BY: the loop check's
+const SL_SIB = 5        // an ORDER SIBLINGS BY key
+
+fn slotName(n: int): str { return "\x00rowid:c" + n.toStr() }
+
+fn isLevel(n: &str): bool { return n == "level" }
+
+// x in the hierarchical query's outer terms: its pseudocolumns and operators as the CTE's columns (new slots in sl).
+fn outer(x: &Expr, sl: mut &[]Slot): Expr {
+    match x {
+        Expr.Col(n, i) {
+            if n == "level" { return Expr.Col(H_LEVEL.clone(), -1) }
+            if n == "connect_by_isleaf" { return Expr.Col(H_LEAF.clone(), -1) }
+            if n == "connect_by_iscycle" { return Expr.Col(H_CYCLE.clone(), -1) }
+            return lexdb_sql.cloneExpr(x)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), outer(&a, sl)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), outer(&a, sl), outer(&b, sl)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(outer(&a, sl), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(outer(&a, sl), t) }
+        Expr.Call(n, args, star) {
+            if (n == "#prior" || n == "#cbroot") && len(args) == 1 {
+                let nm = slotName(len(sl))
+                append(sl, Slot{name: nm.clone(), kind: if n == "#prior" { SL_PRIOR } else { SL_ROOT }, e: lexdb_sql.cloneExpr(&args[0]), sep: Expr.Lit(Val.Null)})
+                return Expr.Col(nm, -1)
+            }
+            if n == "sys_connect_by_path" && len(args) == 2 {
+                let nm = slotName(len(sl))
+                append(sl, Slot{name: nm.clone(), kind: SL_PATH, e: lexdb_sql.cloneExpr(&args[0]), sep: lexdb_sql.cloneExpr(&args[1])})
+                return Expr.Col(nm, -1)
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, outer(&a, sl)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+fn bare(n: &str): str {
+    var at = -1
+    for i in 0..len(n) { if n[i] == '.' { at = i } }
+    return if at < 0 { n.clone() } else { n[at + 1..len(n)].toStr() }
+}
+
+// x read in the recursive member: side 1 the child's row (an unqualified column qualified by the FROM item's alias),
+// side 2 the parent's (the working table's), PRIOR's operands always the parent's; LEVEL the child's (the parent's + 1)
+// or the parent's.
+fn sided(x: &Expr, alias: &str, side: int): Expr {
+    match x {
+        Expr.Col(n, i) {
+            if n == "level" {
+                let pl = Expr.Col(H_WORK + "." + H_LEVEL, -1)
+                return if side == 2 { pl } else { Expr.Bin("+", pl, Expr.Lit(Val.Int(1))) }
+            }
+            if side == 2 { return Expr.Col(H_WORK + "." + bare(&n), -1) }
+            if strings.indexOf(&n, ".", 0) < 0 && n != "rownum" && n != "sysdate" && n != "user" { return Expr.Col(alias + "." + n, -1) }
+            return lexdb_sql.cloneExpr(x)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), sided(&a, alias, side)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), sided(&a, alias, side), sided(&b, alias, side)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(sided(&a, alias, side), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(sided(&a, alias, side), t) }
+        Expr.Call(n, args, star) {
+            if n == "#prior" && len(args) == 1 { return sided(&args[0], alias, 2) }
+            var out: []Expr = []
+            for a in args { append(mut &out, sided(&a, alias, side)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// x in the anchor: LEVEL is 1.
+fn anchored(x: &Expr): Expr {
+    match x {
+        Expr.Col(n, i) { return if n == "level" { Expr.Lit(Val.Int(1)) } else { lexdb_sql.cloneExpr(x) } }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), anchored(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), anchored(&a), anchored(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(anchored(&a), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(anchored(&a), t) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, anchored(&a)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// The operands of PRIOR in x (the loop check compares them).
+fn priors(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Unary(_, a) { priors(&a, out) }
+        Expr.Bin(_, a, b) {
+            priors(&a, out)
+            priors(&b, out)
+        }
+        Expr.IsNull(a, _) { priors(&a, out) }
+        Expr.Cast(a, _) { priors(&a, out) }
+        Expr.Call(n, args, _) {
+            if n == "#prior" && len(args) == 1 {
+                append(out, lexdb_sql.cloneExpr(&args[0]))
+                return
+            }
+            for a in args { priors(&a, out) }
+        }
+        else {}
+    }
+}
+
+// The subqueries x names (#sub, #exists, #in: their numbers).
+fn subsOf(x: &Expr, out: mut &[]int) {
+    match x {
+        Expr.Unary(_, a) { subsOf(&a, out) }
+        Expr.Bin(_, a, b) {
+            subsOf(&a, out)
+            subsOf(&b, out)
+        }
+        Expr.IsNull(a, _) { subsOf(&a, out) }
+        Expr.Cast(a, _) { subsOf(&a, out) }
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) && len(args) > 0 {
+                let k = lexdb_sql.litInt(&args[0])
+                if k >= 0 { append(out, k) }
+            }
+            for a in args { subsOf(&a, out) }
+        }
+        else {}
+    }
+}
+
+fn remap(x: &Expr, m: &[]int): Expr {
+    match x {
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), remap(&a, m)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), remap(&a, m), remap(&b, m)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(remap(&a, m), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(remap(&a, m), t) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for i in 0..len(args) {
+                if i == 0 && lexdb_sql.isSubCall(&n) {
+                    let k = lexdb_sql.litInt(&args[0])
+                    if k >= 0 && k < len(m) && m[k] >= 0 {
+                        append(mut &out, Expr.Lit(Val.Int(m[k])))
+                        continue
+                    }
+                }
+                append(mut &out, remap(&args[i], m))
+            }
+            return Expr.Call(n.clone(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+fn item(x: Expr, name: &str): lexdb_sql.SelItem { return lexdb_sql.SelItem{star: false, qual: "", expr: Some(x), alias: name.clone(), spell: name.clone()} }
+
+fn i8(x: Expr): Expr { return Expr.Cast(x, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}) }
+
+// A member of the CTE: its items (base.* and the slots), its FROM (base, and for the recursive one the working table
+// joined ON on), WHERE where, its own copies of the subqueries they name (subs: the query's), renumbered.
+fn member(items: []lexdb_sql.SelItem, base: &lexdb_sql.FromItem, work: Option[lexdb_sql.FromItem], where: Option[Expr], subs: &[]Stmt): Stmt {
+    var used: []int = []
+    if base.sub >= 0 { append(mut &used, base.sub) }
+    for it in items { match it.expr { Some(x) { subsOf(&x, mut &used) } None {} } }
+    match where { Some(w) { subsOf(&w, mut &used) } None {} }
+    match work { Some(f) { match f.on { Some(o) { subsOf(&o, mut &used) } None {} } } None {} }
+    var m: []int = []
+    for i in 0..len(subs) { append(mut &m, -1) }
+    var s = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    s.mdialect = lexdb_sql.MD_ORA
+    for k in used {
+        if k < len(subs) && m[k] < 0 {
+            m[k] = len(s.subs)
+            append(mut &s.subs, subs[k].clone())
+        }
+    }
+    for it in items {
+        var c = it.clone()
+        match it.expr { Some(x) { c.expr = Some(remap(&x, &m)) } None {} }
+        append(mut &s.items, c)
+    }
+    var b = base.clone()
+    if b.sub >= 0 { b.sub = m[b.sub] }
+    append(mut &s.from, b)
+    match work {
+        Some(f) {
+            var w = f.clone()
+            match f.on { Some(o) { w.on = Some(remap(&o, &m)) } None {} }
+            append(mut &s.from, w)
+        }
+        None {}
+    }
+    match where { Some(w) { s.where = Some(remap(&w, &m)) } None {} }
+    s.table = base.table.clone()
+    return s
+}
+
+// A SELECT with START WITH and CONNECT BY (its marker in exprs; its ORDER BY read: ORDER SIBLINGS BY or the query's) as
+// a recursive CTE over its one FROM item, numbered id, put in subs (the statement's subqueries): the CTE's rows are the
+// item's columns and the hidden columns the query reads (LEVEL, PRIOR, CONNECT_BY_ROOT, SYS_CONNECT_BY_PATH, ...),
+// its anchor the rows of START WITH (every row without it), its recursive member the rows CONNECT BY joins to the rows
+// before (PRIOR's operands the parent's), run depth first, siblings in ORDER SIBLINGS BY's order (lexdb_recrun); the
+// query reads it in its FROM item's place, under its alias, and its WHERE is applied after the hierarchy, as Oracle's.
+pub fn hierQuery(s: mut &Stmt, subs: mut &[]Stmt, id: int): Result[Unit, DbErr] {
+    var start: Option[Expr] = None
+    var conn = Expr.Lit(Val.Null)
+    var nocycle = false
+    var siblings = false
+    match s.exprs[0] {
+        Expr.Call(_, args, _) {
+            match args[0] {
+                Expr.Lit(v) { start = None }
+                else { start = Some(lexdb_sql.cloneExpr(&args[0])) }
+            }
+            conn = lexdb_sql.cloneExpr(&args[1])
+            nocycle = match args[2] { Expr.Lit(v) { match v { Val.Bool(b) { b } else { false } } } else { false } }
+            siblings = match args[3] { Expr.Lit(v) { match v { Val.Bool(b) { b } else { false } } } else { false } }
+        }
+        else {}
+    }
+    s.exprs = []
+    if len(s.from) != 1 {
+        return Err(lexdb_base.err("0A000", "lexdb: CONNECT BY over more than one FROM item is not supported yet: write the join as a derived table"))
+    }
+    let base = s.from[0].clone()
+    let alias = base.alias.clone()
+    var sl: []Slot = []
+    // the query's own terms
+    for i in 0..len(s.items) {
+        match s.items[i].expr {
+            Some(x) {
+                let y = outer(&x, mut &sl)
+                // (an item's name: as Oracle names LEVEL, PRIOR x, ...)
+                if len(s.items[i].alias) == 0 { s.items[i].alias = hierName(&x) }
+                s.items[i].expr = Some(y)
+            }
+            None {}
+        }
+    }
+    let w0 = replace(mut &s.where, None)
+    match w0 { Some(w) { s.where = Some(outer(&w, mut &sl)) } None {} }
+    var g: []Expr = []
+    for x in s.group { append(mut &g, outer(&x, mut &sl)) }
+    s.group = g
+    let h0 = replace(mut &s.having, None)
+    match h0 { Some(h) { s.having = Some(outer(&h, mut &sl)) } None {} }
+    var sibs: []lexdb_sql.OrderItem = []
+    if siblings {
+        sibs = replace(mut &s.order, [])
+    } else {
+        for i in 0..len(s.order) { s.order[i].expr = outer(&s.order[i].expr, mut &sl) }
+    }
+    // CONNECT BY's PRIOR operands (the loop check) and ORDER SIBLINGS BY's keys
+    var keys: []Expr = []
+    priors(&conn, mut &keys)
+    var kNames: []str = []
+    for k in keys {
+        let nm = slotName(len(sl))
+        append(mut &kNames, nm.clone())
+        append(mut &sl, Slot{name: nm, kind: SL_KEY, e: lexdb_sql.cloneExpr(&k), sep: Expr.Lit(Val.Null)})
+    }
+    var spec = newSpec(lexdb_sql.MD_ORA)
+    spec.cb = true
+    spec.nocycle = nocycle
+    spec.search = SEARCH_DEPTH
+    spec.cCols = kNames
+    for o in sibs {
+        let nm = slotName(len(sl))
+        append(mut &spec.sCols, nm.clone())
+        append(mut &spec.sDesc, o.desc)
+        append(mut &spec.sNulls, if o.nullsFirst { 1 } else { 2 })
+        append(mut &sl, Slot{name: nm, kind: SL_SIB, e: lexdb_sql.cloneExpr(&o.expr), sep: Expr.Lit(Val.Null)})
+    }
+    // the members' items: the FROM item's columns, then the hidden ones
+    let star = lexdb_sql.SelItem{star: true, qual: alias.clone(), expr: None, alias: "", spell: ""}
+    var ai: []lexdb_sql.SelItem = [star.clone()]
+    var ri: []lexdb_sql.SelItem = [star]
+    let pl = Expr.Col(H_WORK + "." + H_LEVEL, -1)
+    append(mut &ai, item(i8(Expr.Lit(Val.Int(1))), &H_LEVEL))
+    append(mut &ri, item(i8(Expr.Bin("+", pl, Expr.Lit(Val.Int(1)))), &H_LEVEL))
+    append(mut &ai, item(i8(Expr.Lit(Val.Int(0))), &H_LEAF))
+    append(mut &ri, item(i8(Expr.Lit(Val.Int(0))), &H_LEAF))
+    append(mut &ai, item(i8(Expr.Lit(Val.Int(0))), &H_CYCLE))
+    append(mut &ri, item(i8(Expr.Lit(Val.Int(0))), &H_CYCLE))
+    for x in sl {
+        let mine = sided(&x.e, &alias, 1)
+        let up = Expr.Col(H_WORK + "." + x.name, -1)
+        if x.kind == SL_PRIOR {
+            // (a NULL of the operand's type in the anchor: CASE WHEN FALSE THEN x END)
+            append(mut &ai, item(Expr.Call("case", [Expr.Lit(Val.Bool(false)), anchored(&x.e)], false), &x.name))
+            append(mut &ri, item(sided(&x.e, &alias, 2), &x.name))
+        } else if x.kind == SL_ROOT {
+            append(mut &ai, item(anchored(&x.e), &x.name))
+            append(mut &ri, item(up, &x.name))
+        } else if x.kind == SL_PATH {
+            append(mut &ai, item(Expr.Bin("||", lexdb_sql.cloneExpr(&x.sep), anchored(&x.e)), &x.name))
+            append(mut &ri, item(Expr.Bin("||", Expr.Bin("||", up, lexdb_sql.cloneExpr(&x.sep)), mine), &x.name))
+        } else {
+            append(mut &ai, item(anchored(&x.e), &x.name))
+            append(mut &ri, item(mine, &x.name))
+        }
+    }
+    let startW = match start { Some(x) { Some(anchored(&x)) } None { None } }
+    var anchor = member(ai, &base, None, startW, subs)
+    let work = lexdb_sql.FromItem{table: H_WORK.clone(), alias: H_WORK.clone(), join: lexdb_sql.J_INNER, on: Some(sided(&conn, &alias, 1)), sub: -1, cols: [],
+                                  work: id, lateral: false, using: [], natural: false, comma: false}
+    var rec = member(ri, &base, Some(work), None, subs)
+    var h = setOf(lexdb_sql.SET_UNION, true, anchor, rec, lexdb_sql.MD_ORA)
+    h.use = lexdb_sql.SUB_FROM
+    h.mdialect = lexdb_sql.MD_ORA
+    h = shape(h, id, lexdb_sql.MD_ORA, spec)
+    h.cte = id
+    h.rec = true
+    append(subs, h)
+    s.from[0] = lexdb_sql.FromItem{table: alias.clone(), alias: alias.clone(), join: lexdb_sql.J_FIRST, on: None, sub: len(subs) - 1, cols: [], work: -1,
+                                   lateral: false, using: [], natural: false, comma: true}
+    return Ok(Unit{})
+}
+
+// The name Oracle gives a select item of a hierarchical query without an alias: LEVEL, CONNECT_BY_ISLEAF, ...; "" as any other.
+fn hierName(x: &Expr): str {
+    match x {
+        Expr.Col(n, _) { if n == "level" || n == "connect_by_isleaf" || n == "connect_by_iscycle" { return n.clone() } }
+        else {}
+    }
+    return ""
+}

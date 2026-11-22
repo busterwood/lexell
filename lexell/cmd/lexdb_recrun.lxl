@@ -1,0 +1,586 @@
+// lexdb_recrun: a recursive CTE's run as each door has it (design/lexdb-dialect-gaps.md, "Recursion in the doors";
+// lexdb_recur reads and shapes it). lexdb_exec.runRecursive runs the rounds (the anchors, then the recursive members
+// over the working table until a round adds no row) and hands each round's rows here; this module keeps them with their
+// lineage (each row's parent, its level), checks what the dialect checks as the rows come (SQL Server's MAXRECURSION:
+// 530; Oracle's cycles: ORA-32044; CYCLE's marks, the cycle rows not expanded), and at the end gives the rows in the
+// dialect's order with the columns SEARCH and CYCLE add: SQL Server's stack spool (the anchors, then the last row made is
+// the next expanded: its children after it), Oracle's iterations (each round's rows by their parents' order), SEARCH
+// DEPTH FIRST (each row's children after it, siblings by the BY columns) and BREADTH FIRST (by level, then the BY
+// columns), the ordering column their place. It knows values and output columns, not the store or the plan.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_bind"
+import "./lexdb_ops"
+import "./lexdb_recur"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type OutCol = lexdb_bind.OutCol
+type Spec = lexdb_recur.Spec
+
+fn ts(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+fn ora(n: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(n.toStr()), 5, '0')), msg) }
+
+// A run's rounds at most, in Run.maxRounds, with TRUNCATE added: stop there and give the rows made before the error, as
+// SQL Server sends them before its 530 (the T-SQL door runs the statement again so: lexdb_tsql).
+pub const TRUNCATE = 1 << 40
+
+// The family of a type for a recursive CTE's anchor and recursive part: Oracle's datatypes (ORA-01790 between them).
+fn family(oid: int): int {
+    if oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_NUMERIC ||
+       oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 { return 1 }
+    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_NAME || oid == lexdb_sql.OID_CHAR { return 2 }
+    if oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ { return 3 }
+    return oid
+}
+
+// The CTE's output columns (the anchor's l, the recursive part's r, the anchor's statement): without its lineage, with
+// SEARCH's and CYCLE's; SQL Server's 240 when a column's type is not the same in both (as far as lexdb knows a T-SQL
+// type: its own type, and the length a hint carries), Oracle's ORA-01790 when they are of different datatypes.
+pub fn outsOf(spec: &str, l: &[]OutCol, r: &[]OutCol, anchor: &lexdb_sql.Stmt): Result[[]OutCol, DbErr] {
+    let sp = lexdb_recur.decode(spec)
+    let n = if sp.lineage { len(l) - 1 } else { len(l) }
+    var out: []OutCol = []
+    for i in 0..n {
+        let a = &l[i]
+        let b = &r[i]
+        let nul = isNullLit(anchor, i)
+        if sp.md == lexdb_sql.MD_TSQL && !nul {
+            let hinted = a.scale >= 34 && b.scale >= 34
+            if a.oid != b.oid || (hinted && a.scale != b.scale) {
+                return Err(ts(240, &("Types don't match between the anchor and the recursive part in column \"" + (if i < len(sp.cols) { sp.cols[i].clone() } else { a.label() }) + "\" of recursive query \"" + sp.name + "\".")))
+            }
+        }
+        if sp.md == lexdb_sql.MD_ORA && !nul && b.oid != lexdb_sql.OID_UNKNOWN && family(a.oid) != family(b.oid) {
+            return Err(ora(1790, "expression must have same datatype as corresponding expression"))
+        }
+        var o = a.clone()
+        // (the CTE's column list names them: SEARCH and CYCLE name its columns)
+        if i < len(sp.cols) {
+            o.name = sp.cols[i].clone()
+            if i < len(sp.spells) { o.spell = sp.spells[i].clone() }
+        }
+        append(mut &out, o)
+    }
+    let pg = sp.md == lexdb_sql.MD_PG
+    if len(sp.sSet) > 0 {
+        try colIndexes(&sp.sCols, &out)
+        // (PostgreSQL's: a record, the depth and the columns; depth first an array of them, the path)
+        let oid = if !pg { lexdb_sql.OID_INT8 } else if sp.search == lexdb_recur.SEARCH_DEPTH { OID_RECORDS } else { OID_RECORD }
+        append(mut &out, OutCol{name: sp.sSet.clone(), oid: oid, spell: if pg { sp.sSet.clone() } else { strings.toUpperAscii(&sp.sSet) }, coll: "", scale: -1})
+    }
+    if len(sp.cSet) > 0 {
+        try colIndexes(&sp.cCols, &out)
+        let oid = markOid(&sp)
+        append(mut &out, OutCol{name: sp.cSet.clone(), oid: oid, spell: if pg { sp.cSet.clone() } else { strings.toUpperAscii(&sp.cSet) }, coll: "", scale: -1})
+    }
+    if len(sp.cPath) > 0 { append(mut &out, OutCol{name: sp.cPath.clone(), oid: OID_RECORDS, spell: sp.cPath.clone(), coll: "", scale: -1}) }
+    return Ok(out)
+}
+
+// (the anchor's i-th value is a NULL: SQL Server and Oracle type it from the recursive part)
+fn isNullLit(s: &lexdb_sql.Stmt, i: int): bool {
+    if s.setop != 0 { return len(s.inner) > 0 && isNullLit(&s.inner[0], i) }
+    if i >= len(s.items) { return false }
+    match s.items[i].expr {
+        Some(x) {
+            match x {
+                lexdb_sql.Expr.Lit(v) { return lexdb_ops.isNull(&v) }
+                else { return false }
+            }
+        }
+        None { return false }
+    }
+}
+
+// PostgreSQL's record and record[] (SEARCH's ordering column, CYCLE's path): values Reg(place, text) (their order the
+// place in the search's order, the path's; their text as PostgreSQL's record_out and array_out write it).
+pub const OID_RECORD = 2249
+pub const OID_RECORDS = 2287
+
+fn markOid(sp: &Spec): int {
+    let txt = if sp.md == lexdb_sql.MD_PG { lexdb_sql.OID_TEXT } else { lexdb_sql.OID_VARCHAR }
+    match sp.cTo {
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        // (Oracle's marks are VARCHAR2s, digits too)
+        Val.Int(_) { match sp.cDefault { Val.Int(_) { return if sp.md == lexdb_sql.MD_ORA { txt } else { lexdb_sql.OID_INT4 } } else { return txt } } }
+        else { return txt }
+    }
+}
+
+fn markVal(sp: &Spec, v: &Val): Val {
+    if markOid(sp) != lexdb_sql.OID_VARCHAR { return v.clone() }
+    match v {
+        Val.Int(n) { return Val.Text(n.toStr()) }
+        else { return v.clone() }
+    }
+}
+
+fn colIndexes(names: &[]str, outs: &[]OutCol): Result[[]int, DbErr] {
+    var out: []int = []
+    for c in names {
+        var at = -1
+        for i in 0..len(outs) { if outs[i].name == c { at = i } }
+        if at < 0 { return Err(lexdb_base.err("42601", &("column \"" + c + "\" not in WITH query column list"))) }
+        append(mut &out, at)
+    }
+    return Ok(out)
+}
+
+// A run: its rows as made (each with its lineage last), each one's parent (-1 an anchor's) and level, and what the
+// dialect needs.
+pub type Rec = record {
+    sp: Spec
+    vis: int                    // the visible columns (without the lineage)
+    rows: [][]Val
+    parent: []int
+    level: []int
+    cyc: []bool                 // CYCLE: the row is a cycle (its mark TO; not expanded)
+    cseen: Map[str, int]        // the loop check's keys of the rows so far
+    max: int                    // rounds at most; 0 no limit
+    trunc: bool                 // TRUNCATE: stop at the limit, no error
+    stopped: bool               // ... stopped there
+    rounds: int
+    cIdx: []int
+    sIdx: []int
+    out: []OutCol
+}
+
+// A run of the recursive CTE whose Sel has spec (its lexdb_recur.Spec) and outs, rounds at most (TRUNCATE added: stop
+// there).
+pub fn start(spec: &str, outs: &[]OutCol, rounds: int): Result[Rec, DbErr] {
+    let sp = lexdb_recur.decode(spec)
+    if sp.noPred { return Err(ora(32044, "cycle detected while executing recursive WITH query")) }
+    var vis = len(outs)
+    if len(sp.sSet) > 0 { vis -= 1 }
+    if len(sp.cSet) > 0 { vis -= 1 }
+    if len(sp.cPath) > 0 { vis -= 1 }
+    var base: []OutCol = []
+    for i in 0..vis { append(mut &base, outs[i].clone()) }
+    let cIdx = try colIndexes(&sp.cCols, &base)
+    let sIdx = try colIndexes(&sp.sCols, &base)
+    let trunc = rounds >= TRUNCATE
+    var o: []OutCol = []
+    for x in outs { append(mut &o, x.clone()) }
+    return Ok(Rec{sp: sp, vis: vis, rows: [], parent: [], level: [], cyc: [], cseen: newMap(),
+                  max: if trunc { rounds - TRUNCATE } else { rounds }, trunc: trunc, stopped: false, rounds: 0, cIdx: cIdx, sIdx: sIdx, out: o})
+}
+
+fn visKey(r: &Rec, row: &[]Val, cols: &[]int): str {
+    var vs: []Val = []
+    if len(cols) == 0 { for i in 0..r.vis { append(mut &vs, row[i].clone()) } } else { for c in cols { append(mut &vs, row[c].clone()) } }
+    return lexdb_ops.keyOfVals(&vs, 0)
+}
+
+// (any of the columns NULL: PostgreSQL's ROW(...) = ANY (path) is not true then)
+fn anyNull(row: &[]Val, cols: &[]int): bool {
+    for c in cols { if lexdb_ops.isNull(&row[c]) { return true } }
+    return false
+}
+
+// Whether row i's columns cols (all visible ones: []) are those of one of its ancestors.
+fn closes(r: &Rec, i: int, cols: &[]int): bool {
+    let k = visKey(r, &r.rows[i], cols)
+    var a = r.parent[i]
+    while a >= 0 {
+        if visKey(r, &r.rows[a], cols) == k { return true }
+        a = r.parent[a]
+    }
+    return false
+}
+
+// Rows made by a round (the anchors' first, parent -1; UNION's taken out by the caller: lexdb_setop's keys): kept,
+// numbered, checked; the next working table.
+fn add(r: mut &Rec, made: [][]Val, first: bool): Result[[][]Val, DbErr] {
+    var rows = made
+    if !first && len(rows) > 0 {
+        r.rounds += 1
+        if r.max > 0 && r.rounds > r.max {
+            if r.trunc {
+                r.stopped = true
+            } else if r.sp.md == lexdb_sql.MD_TSQL {
+                return Err(ts(530, &("The statement terminated. The maximum recursion " + r.max.toStr() + " has been exhausted before statement completion.")))
+            } else if r.sp.md == lexdb_sql.MD_ORA {
+                return Err(ora(32044, &("cycle detected while executing recursive WITH query (lexdb: still adding rows after " + r.max.toStr() +
+                                       " rounds, max_recursion; SET max_recursion = n to allow more, 0 for no limit)")))
+            } else {
+                return Err(lexdb_base.err("54001", &("recursive query still adding rows after " + r.max.toStr() +
+                                                     " rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit")))
+            }
+        }
+    }
+    let lin = r.sp.lineage
+    // Oracle's iterations: a round's rows in their parents' order (its nested loop over the working table)
+    if lin && !first && r.sp.md == lexdb_sql.MD_ORA { rows = byParent(rows, r.vis) }
+    var next: [][]Val = []
+    let lvl = if first { 0 } else { r.rounds }
+    for i in 0..len(rows) {
+        let at = len(r.rows)
+        var row = replace(mut &rows[i], [])
+        var par = -1
+        if lin {
+            let last = len(row) - 1
+            if !first {
+                match row[last] {
+                    Val.Int(n) { par = n }
+                    else {}
+                }
+            }
+            row[last] = Val.Int(at)
+        }
+        append(mut &r.rows, row)
+        append(mut &r.parent, par)
+        append(mut &r.level, lvl)
+        // a loop: the row's columns (CYCLE's; CONNECT BY's PRIOR values; Oracle's whole row without CYCLE) those of an
+        // ancestor (looked for only when a row had them before); PostgreSQL's NULL is not equal
+        var cycle = false
+        let check = len(r.cIdx) > 0 || (r.sp.md == lexdb_sql.MD_ORA && !r.sp.cb)
+        if lin && check && !(r.sp.md == lexdb_sql.MD_PG && anyNull(&r.rows[at], &r.cIdx)) {
+            let k = visKey(r, &r.rows[at], &r.cIdx)
+            if par >= 0 && r.cseen.get(&k).isSome() && closes(r, at, &r.cIdx) { cycle = true }
+            r.cseen.put(k, 1)
+        }
+        if cycle && r.sp.cb && !r.sp.nocycle { return Err(ora(1436, "CONNECT BY loop in user data")) }
+        if cycle && r.sp.md == lexdb_sql.MD_ORA && !r.sp.cb && len(r.cIdx) == 0 { return Err(ora(32044, "cycle detected while executing recursive WITH query")) }
+        append(mut &r.cyc, cycle)
+        if !cycle && !r.stopped { append(mut &next, collectionsCopy(&r.rows[at])) }
+    }
+    if r.stopped { return Ok([]) }
+    return Ok(next)
+}
+
+fn collectionsCopy(r: &[]Val): []Val {
+    var out: []Val = []
+    for v in r { append(mut &out, v.clone()) }
+    return out
+}
+
+// A round's rows by their parents' numbers (the lineage, last), stable.
+fn byParent(rows: [][]Val, vis: int): [][]Val {
+    var all = rows
+    var keys: []int = []
+    for r in all {
+        match r[len(r) - 1] {
+            Val.Int(n) { append(mut &keys, n) }
+            else { append(mut &keys, -1) }
+        }
+    }
+    let ord = stableOrder(&keys)
+    var out: [][]Val = []
+    for i in ord { append(mut &out, replace(mut &all[i], [])) }
+    return out
+}
+
+// The places 0..n in the order of keys, ties in place (a merge sort).
+fn stableOrder(keys: &[]int): []int {
+    var idx: []int = []
+    for i in 0..len(keys) { append(mut &idx, i) }
+    return mergeBy(idx, fn(a: int, b: int): bool { return keys[a] <= keys[b] })
+}
+
+fn mergeBy(xs: []int, le: &fn(int, int): bool): []int {
+    let n = len(xs)
+    if n <= 1 { return xs }
+    var a: []int = []
+    var b: []int = []
+    for i in 0..n { if i < n / 2 { append(mut &a, xs[i]) } else { append(mut &b, xs[i]) } }
+    let sa = mergeBy(a, le)
+    let sb = mergeBy(b, le)
+    var out: []int = []
+    var i = 0
+    var j = 0
+    while i < len(sa) && j < len(sb) {
+        if le(sa[i], sb[j]) {
+            append(mut &out, sa[i])
+            i += 1
+        } else {
+            append(mut &out, sb[j])
+            j += 1
+        }
+    }
+    while i < len(sa) {
+        append(mut &out, sa[i])
+        i += 1
+    }
+    while j < len(sb) {
+        append(mut &out, sb[j])
+        j += 1
+    }
+    return out
+}
+
+// The anchors' rows: the first working table.
+pub fn (r: mut &Rec) anchor(rows: [][]Val): Result[[][]Val, DbErr] { return add(r, rows, true) }
+
+// A round's rows: the next working table ([] the end).
+pub fn (r: mut &Rec) round(rows: [][]Val): Result[[][]Val, DbErr] { return add(r, rows, false) }
+
+// SEARCH's order of rows a and b (the BY columns, each ASC or DESC, NULLS FIRST or LAST); 0 a tie.
+fn searchCmp(r: &Rec, a: int, b: int): int {
+    for k in 0..len(r.sIdx) {
+        let c = r.sIdx[k]
+        let x = &r.rows[a][c]
+        let y = &r.rows[b][c]
+        let desc = r.sp.sDesc[k]
+        let nf = if r.sp.sNulls[k] == 0 { desc } else { r.sp.sNulls[k] == 1 }
+        let xn = lexdb_ops.isNull(x)
+        let yn = lexdb_ops.isNull(y)
+        if xn || yn {
+            if xn && yn { continue }
+            return if xn == nf { -1 } else { 1 }
+        }
+        var d = lexdb_ops.compare(x, y).unwrapOr(0)
+        if desc { d = -d }
+        if d != 0 { return d }
+    }
+    return 0
+}
+
+// The rows' order as the dialect gives it (the places in r.rows).
+fn order(r: &Rec): []int {
+    // (PostgreSQL gives the rows as the rounds made them: SEARCH only sets the ordering column)
+    if r.sp.md == lexdb_sql.MD_PG {
+        var out: []int = []
+        for i in 0..len(r.rows) { append(mut &out, i) }
+        return out
+    }
+    return searchOrder(r)
+}
+
+// The rows in the search's order (SEARCH's; SQL Server's stack; else as made).
+fn searchOrder(r: &Rec): []int {
+    let n = len(r.rows)
+    var kids: [][]int = []
+    for i in 0..n { append(mut &kids, []) }
+    var roots: []int = []
+    for i in 0..n { if r.parent[i] >= 0 { append(mut &kids[r.parent[i]], i) } else { append(mut &roots, i) } }
+    if r.sp.search == lexdb_recur.SEARCH_BREADTH {
+        var idx: []int = []
+        for i in 0..n { append(mut &idx, i) }
+        return mergeBy(idx, fn(a: int, b: int): bool {
+            if r.level[a] != r.level[b] { return r.level[a] < r.level[b] }
+            return searchCmp(r, a, b) <= 0
+        })
+    }
+    if r.sp.search == lexdb_recur.SEARCH_DEPTH {
+        // each row, then its children's trees, siblings by the BY columns
+        let le = fn(a: int, b: int): bool { return searchCmp(r, a, b) <= 0 }
+        var out: []int = []
+        var stack: []int = []
+        let rs = mergeBy(roots, le)
+        var k = len(rs)
+        while k > 0 {
+            k -= 1
+            append(mut &stack, rs[k])
+        }
+        while len(stack) > 0 {
+            let x = pop(mut &stack)
+            append(mut &out, x)
+            let ks = mergeBy(collectionsInts(&kids[x]), le)
+            var j = len(ks)
+            while j > 0 {
+                j -= 1
+                append(mut &stack, ks[j])
+            }
+        }
+        return out
+    }
+    if r.sp.md == lexdb_sql.MD_TSQL && r.sp.lineage {
+        // SQL Server's stack spool: the anchors, then the last row made is expanded: its children after it
+        var out: []int = []
+        var stack: []int = []
+        for x in roots {
+            append(mut &out, x)
+            append(mut &stack, x)
+        }
+        while len(stack) > 0 {
+            let x = pop(mut &stack)
+            for c in kids[x] {
+                append(mut &out, c)
+                append(mut &stack, c)
+            }
+        }
+        return out
+    }
+    var out: []int = []
+    for i in 0..n { append(mut &out, i) }
+    return out
+}
+
+fn collectionsInts(xs: &[]int): []int {
+    var out: []int = []
+    for x in xs { append(mut &out, x) }
+    return out
+}
+
+// The run's rows, in the dialect's order, as the CTE's columns: the visible ones, then SEARCH's ordering column and
+// CYCLE's mark. Stopped at the limit (TRUNCATE): the rows SQL Server sends before its 530, those before the first row
+// past the limit in its order.
+pub fn (r: mut &Rec) finish(): [][]Val {
+    let ord = order(r)
+    var out: [][]Val = []
+    var pos = 0
+    // CONNECT BY: a row that closes a loop is left out (NOCYCLE), its parent's CONNECT_BY_ISCYCLE is 1; CONNECT_BY_ISLEAF 1
+    // for a row without children
+    var leafAt = -1
+    var cycAt = -1
+    var kids: []int = []
+    var loops: []bool = []
+    if r.sp.cb {
+        for j in 0..r.vis {
+            if r.out[j].name == lexdb_recur.H_LEAF { leafAt = j }
+            if r.out[j].name == lexdb_recur.H_CYCLE { cycAt = j }
+        }
+        for i in 0..len(r.rows) {
+            append(mut &kids, 0)
+            append(mut &loops, false)
+        }
+        for i in 0..len(r.rows) {
+            let pa = r.parent[i]
+            if pa < 0 { continue }
+            if r.cyc[i] { loops[pa] = true } else { kids[pa] += 1 }
+        }
+    }
+    // PostgreSQL: SEARCH's and CYCLE's columns ordered as PostgreSQL orders its record and record[] (their places)
+    let pg = r.sp.md == lexdb_sql.MD_PG
+    var rank: []int = []
+    var prank: []int = []
+    if pg && len(r.sp.sSet) > 0 { rank = ranks(r, &r.sIdx, r.sp.search == lexdb_recur.SEARCH_BREADTH) }
+    if pg && len(r.sp.cPath) > 0 { prank = ranks(r, &r.cIdx, false) }
+    for i in ord {
+        if r.stopped && r.level[i] > r.max { break }
+        if r.sp.cb && r.cyc[i] { continue }
+        pos += 1
+        var row: []Val = []
+        for j in 0..r.vis { append(mut &row, r.rows[i][j].clone()) }
+        if leafAt >= 0 { row[leafAt] = Val.Int(if kids[i] == 0 { 1 } else { 0 }) }
+        if cycAt >= 0 { row[cycAt] = Val.Int(if loops[i] { 1 } else { 0 }) }
+        if len(r.sp.sSet) > 0 { append(mut &row, if pg { Val.Reg(rank[i], searchText(r, i)) } else { Val.Int(pos) }) }
+        if len(r.sp.cSet) > 0 { append(mut &row, markVal(&r.sp, if r.cyc[i] { &r.sp.cTo } else { &r.sp.cDefault })) }
+        if len(r.sp.cPath) > 0 { append(mut &row, Val.Reg(prank[i], pathText(r, i, &r.cIdx))) }
+        append(mut &out, row)
+    }
+    return out
+}
+
+// A field of PostgreSQL's record compared: NULL after every value.
+fn fieldCmp(x: &Val, y: &Val): int {
+    let xn = lexdb_ops.isNull(x)
+    let yn = lexdb_ops.isNull(y)
+    if xn || yn { return if xn && yn { 0 } else if xn { 1 } else { -1 } }
+    return lexdb_ops.compare(x, y).unwrapOr(0)
+}
+
+fn chainOf(r: &Rec, i: int): []int {
+    var c: []int = []
+    var a = i
+    while a >= 0 {
+        append(mut &c, a)
+        a = r.parent[a]
+    }
+    var out: []int = []
+    var k = len(c)
+    while k > 0 {
+        k -= 1
+        append(mut &out, c[k])
+    }
+    return out
+}
+
+// The rows' places (1..) in the order of their record[] paths of cols (breadth: of the records (level, cols)), as
+// PostgreSQL compares arrays and records: element by element, a shorter path first.
+fn ranks(r: &Rec, cols: &[]int, breadth: bool): []int {
+    var chains: [][]int = []
+    for i in 0..len(r.rows) { append(mut &chains, if breadth { [i] } else { chainOf(r, i) }) }
+    var idx: []int = []
+    for i in 0..len(r.rows) { append(mut &idx, i) }
+    let ord = mergeBy(idx, fn(a: int, b: int): bool {
+        if breadth && r.level[a] != r.level[b] { return r.level[a] < r.level[b] }
+        let ca = &chains[a]
+        let cb = &chains[b]
+        var k = 0
+        while k < len(ca) && k < len(cb) {
+            for c in cols {
+                let d = fieldCmp(&r.rows[ca[k]][c], &r.rows[cb[k]][c])
+                if d != 0 { return d < 0 }
+            }
+            k += 1
+        }
+        return len(ca) <= len(cb)
+    })
+    var out: []int = []
+    for i in 0..len(r.rows) { append(mut &out, 0) }
+    for k in 0..len(ord) { out[ord[k]] = k + 1 }
+    return out
+}
+
+// ---- PostgreSQL's record and record[] text
+
+fn needsQuote(t: &str, arr: bool): bool {
+    if len(t) == 0 { return true }
+    if arr && strings.toLowerAscii(t) == "null" { return true }
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == '"' || c == '\\' || c == ',' || c == ' ' || c == '\t' || c == '\n' { return true }
+        if !arr && (c == '(' || c == ')') { return true }
+        if arr && (c == '{' || c == '}') { return true }
+    }
+    return false
+}
+
+fn quoted(t: &str, arr: bool): str {
+    if !needsQuote(t, arr) { return t.clone() }
+    var out = "\""
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == '"' || c == '\\' { if arr { out.addByte('\\') } else { out.addByte(c) } }
+        out.addByte(c)
+    }
+    out.addByte('"')
+    return out
+}
+
+// A record's text: (a,b), a NULL nothing, a field quoted where record_out quotes it.
+fn recordText(vs: &[]Val): str {
+    var out = "("
+    for k in 0..len(vs) {
+        if k > 0 { out.addByte(',') }
+        if !lexdb_ops.isNull(&vs[k]) { out += &quoted(&lexdb_sql.text(&vs[k]), false) }
+    }
+    out.addByte(')')
+    return out
+}
+
+fn colsOf(r: &Rec, i: int, cols: &[]int): []Val {
+    var vs: []Val = []
+    for c in cols { append(mut &vs, r.rows[i][c].clone()) }
+    return vs
+}
+
+// The path to row i (its ancestors' cols, then its own) as an array of records: {(1),(2)}, {"(1,2)","(2,3)"}.
+fn pathText(r: &Rec, i: int, cols: &[]int): str {
+    var chain: []int = []
+    var a = i
+    while a >= 0 {
+        append(mut &chain, a)
+        a = r.parent[a]
+    }
+    var out = "{"
+    var k = len(chain)
+    while k > 0 {
+        k -= 1
+        out += &quoted(&recordText(&colsOf(r, chain[k], cols)), true)
+        if k > 0 { out.addByte(',') }
+    }
+    out.addByte('}')
+    return out
+}
+
+// SEARCH's ordering column of row i: depth first the path of the BY columns, breadth first (depth, the BY columns).
+fn searchText(r: &Rec, i: int): str {
+    if r.sp.search == lexdb_recur.SEARCH_DEPTH { return pathText(r, i, &r.sIdx) }
+    var vs: []Val = [Val.Int(r.level[i])]
+    for c in r.sIdx { append(mut &vs, r.rows[i][c].clone()) }
+    return recordText(&vs)
+}

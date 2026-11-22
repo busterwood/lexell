@@ -11,6 +11,7 @@ import "./lexdb_sql"
 import "./lexdb_dialect"
 import "./lexdb_dbopt"
 import "./lexdb_match"
+import "./lexdb_recur"
 
 // The language model, by name (the parser reads and builds it).
 type TypeName = lexdb_sql.TypeName
@@ -563,9 +564,12 @@ type P = record {
 // A CTE: kept as its text (where its tokens start), parsed again as a
 // subquery in FROM wherever it is used, seeing the CTEs before it (and a
 // recursive one itself).
-type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool }
+type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool; spell: str; spec: str; spells: []str }
 
-type InCte = record { id: int; depth: int; refs: int }
+// A recursive CTE whose body is being read: its number, how deep its body is, its references read so far, and how many
+// subqueries of an expression (not FROM's) are open around where the reader is: a reference there is refused (one in a
+// derived table is taken, as PostgreSQL and SQL Server take it; Oracle refuses both).
+type InCte = record { id: int; depth: int; refs: int; sub: int }
 
 fn (p: &P) peek(): &Tok { return &p.toks[p.pos] }
 fn (p: &P) peekAt(k: int): &Tok {
@@ -1267,6 +1271,8 @@ fn (p: mut &P) caseExpr(): Result[Expr, lexdb_base.DbErr] {
 // statement it is in gets it, numbered.
 fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     p.depth += 1
+    let blk = len(p.inCte) > 0 && use != SUB_FROM
+    if blk { for k in 0..len(p.inCte) { p.inCte[k].sub += 1 } }
     let start = p.pos
     let saved = replace(mut &p.subs, [])
     let savedW = replace(mut &p.wins, [])
@@ -1282,6 +1288,7 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     sq.wins = replace(mut &p.wins, savedW)
     sq.use = use
     p.depth -= 1
+    if blk { for k in 0..len(p.inCte) { p.inCte[k].sub -= 1 } }
     // a scalar subquery written again in the same query is the same one:
     // GROUP BY (subquery) then matches it in the select list, and it runs
     // once per row
@@ -1310,13 +1317,21 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
 // Each is parsed now to check it, and again where it is used.
 fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
     let rec = p.acceptKw("recursive")
+    // T-SQL and Oracle: a CTE that names itself is recursive, without RECURSIVE (lexdb_recur)
+    let selfRec = p.tsql || p.ora
     var n = 0
     while true {
         let name = try p.name()
+        let spell = if len(p.spelled) > 0 { p.spelled.clone() } else { name.clone() }
         var cols: []str = []
+        var spells: []str = []
         if p.acceptKw("(") {
             append(mut &cols, try p.name())
-            while p.acceptKw(",") { append(mut &cols, try p.name()) }
+            append(mut &spells, if len(p.spelled) > 0 { p.spelled.clone() } else { cols[len(cols) - 1].clone() })
+            while p.acceptKw(",") {
+                append(mut &cols, try p.name())
+                append(mut &spells, if len(p.spelled) > 0 { p.spelled.clone() } else { cols[len(cols) - 1].clone() })
+            }
             try p.expectKw(")")
         }
         try p.expectKw("as")
@@ -1324,6 +1339,7 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         try p.expectKw("(")
         for k in len(p.ctes) - n..len(p.ctes) {
             if p.ctes[k].name == name {
+                if p.tsql { return Err(lexdb_base.err("TS239", &("Duplicate common table expression name '" + spell + "' was specified."))) }
                 return Err(lexdb_base.err("42712", &("WITH query name \"" + name + "\" specified more than once")))
             }
         }
@@ -1331,24 +1347,177 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         p.nextCte += 1
         let start = p.pos
         // a recursive one is in scope in its own body
-        if rec {
+        let r = rec || selfRec
+        if r {
             var cs: []str = []
             for c in cols { append(mut &cs, c.clone()) }
-            append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: true})
+            append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: true, spell: spell.clone(), spec: "", spells: spells.clone()})
         }
         let keep = len(p.subs)
-        if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0}) }
+        if r { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0, sub: 0}) }
         let i = try p.subquery(SUB_FROM)
-        if rec { let x = pop(mut &p.inCte) }
+        var refs = 0
+        if r { refs = pop(mut &p.inCte).refs }
+        if (selfRec || rec) && refs > 0 {
+            if p.ora && len(cols) == 0 { return Err(lexdb_recur.noColumnList(&name)) }
+            try lexdb_recur.check(&p.subs[i], &spell, id, len(cols), p.md())
+        }
         while len(p.subs) > keep { let x = pop(mut &p.subs) }
-        if !rec { append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false}) }
+        // SEARCH and CYCLE (PostgreSQL's and Oracle's): the columns they add are the CTE's
+        var spec = ""
+        if p.isKw("search") || p.isKw("cycle") {
+            let sp = try p.searchCycle(&name, &spell, mut &cols, refs > 0)
+            spec = lexdb_recur.encode(&sp)
+        }
+        if r {
+            let at = len(p.ctes) - 1
+            p.ctes[at].rec = rec || refs > 0
+            p.ctes[at].cols = cols
+            p.ctes[at].spec = spec
+        } else {
+            append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false, spell: spell, spec: spec, spells: spells})
+        }
         n += 1
         if !p.acceptKw(",") { break }
     }
     return Ok(n)
 }
 
+// SEARCH { DEPTH | BREADTH } FIRST BY col [ASC | DESC] [NULLS FIRST | LAST], ... SET ordcol and CYCLE col, ... SET
+// markcol [TO v DEFAULT d] [USING pathcol] after a recursive CTE's body (name, spell: its name): PostgreSQL's (no ASC,
+// DESC or NULLS; TO and DEFAULT optional, booleans by default; USING required) and Oracle's (TO and DEFAULT required,
+// one-character values; no USING); the columns they add go after the CTE's (cols), and the errors each gives.
+fn (p: mut &P) searchCycle(name: &str, spell: &str, cols: mut &[]str, rec: bool): Result[lexdb_recur.Spec, lexdb_base.DbErr] {
+    var sp = lexdb_recur.newSpec(p.md())
+    let pg = !p.ora && !p.tsql
+    if p.tsql { return Err(near(&p.peek())) }
+    if !rec {
+        if pg { return Err(lexdb_base.err("42601", "WITH query is not recursive")) }
+        return Err(near(&p.peek()))
+    }
+    let base = len(cols)
+    if p.acceptKw("search") {
+        if p.acceptKw("depth") { sp.search = lexdb_recur.SEARCH_DEPTH } else {
+            try p.expectKw("breadth")
+            sp.search = lexdb_recur.SEARCH_BREADTH
+        }
+        try p.expectKw("first")
+        try p.expectKw("by")
+        while true {
+            let c = try p.name()
+            var found = false
+            for x in cols { if x == c { found = true } }
+            if !found && (len(cols) > 0 || !pg) {
+                if pg { return Err(lexdb_base.err("42601", &("search column \"" + c + "\" not in WITH query column list"))) }
+                return Err(oraErr(32489, "element in sort specification list of SEARCH clause did not appear in the column alias list of the WITH clause element"))
+            }
+            for x in sp.sCols { if x == c && pg { return Err(lexdb_base.err("42701", &("search column \"" + c + "\" specified more than once"))) } }
+            var desc = false
+            var nulls = 0
+            if !pg {
+                if p.acceptKw("desc") { desc = true } else { let a = p.acceptKw("asc") }
+                if p.acceptKw("nulls") {
+                    if p.acceptKw("first") { nulls = 1 } else {
+                        try p.expectKw("last")
+                        nulls = 2
+                    }
+                }
+            }
+            append(mut &sp.sCols, c)
+            append(mut &sp.sDesc, desc)
+            append(mut &sp.sNulls, nulls)
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw("set")
+        sp.sSet = try p.name()
+        for x in cols {
+            if x == sp.sSet {
+                if pg { return Err(lexdb_base.err("42702", &("column reference \"" + x + "\" is ambiguous"))) }
+                return Err(oraErr(32046, "sequence column name for SEARCH clause must not be part of the column alias list"))
+            }
+        }
+    }
+    if p.acceptKw("cycle") {
+        while true {
+            let c = try p.name()
+            var found = false
+            for j in 0..base { if cols[j] == c { found = true } }
+            if !found && (base > 0 || !pg) {
+                if pg { return Err(lexdb_base.err("42601", &("cycle column \"" + c + "\" not in WITH query column list"))) }
+                return Err(oraErr(32489, "element in cycle column list of CYCLE clause did not appear in the column alias list of the WITH clause element"))
+            }
+            append(mut &sp.cCols, c)
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw("set")
+        sp.cSet = try p.name()
+        for j in 0..base {
+            if cols[j] == sp.cSet {
+                if pg { return Err(lexdb_base.err("42601", &("cycle mark column name \"" + sp.cSet + "\" already used in WITH query column list"))) }
+                return Err(oraErr(32048, "cycle mark column name for CYCLE clause must not be part of the column alias list"))
+            }
+        }
+        if sp.cSet == sp.sSet {
+            if pg { return Err(lexdb_base.err("42601", "search sequence column name and cycle mark column name are the same")) }
+            return Err(oraErr(32482, "sequence column for SEARCH clause must be different from the cycle mark column for CYCLE clause"))
+        }
+        sp.cTo = Val.Bool(true)
+        sp.cDefault = Val.Bool(false)
+        if p.isKw("to") || !pg {
+            try p.expectKw("to")
+            sp.cTo = try p.markValue()
+            try p.expectKw("default")
+            sp.cDefault = try p.markValue()
+            if !pg {
+                var ok = true
+                for v in [sp.cTo.clone(), sp.cDefault.clone()] {
+                    match v {
+                        Val.Text(t) { if len(t) != 1 { ok = false } }
+                        Val.Int(k) { if k < 0 || k > 9 { ok = false } }
+                        Val.Bool(_) {}
+                        else { ok = false }
+                    }
+                }
+                if !ok { return Err(oraErr(32047, "cycle mark value and non-cycle mark value must be one byte character string values or boolean constants")) }
+            } else {
+                // (PostgreSQL: the two values' common type: an integer and a text that is not one is 22P02)
+                let ti = match sp.cTo { Val.Int(_) { true } else { false } }
+                let di = match sp.cDefault { Val.Int(_) { true } else { false } }
+                let tt = match sp.cTo { Val.Text(_) { true } else { false } }
+                let dt = match sp.cDefault { Val.Text(_) { true } else { false } }
+                if (ti && dt) || (tt && di) {
+                    let t = match sp.cTo { Val.Text(x) { x.clone() } else { match sp.cDefault { Val.Text(x) { x.clone() } else { "" } } } }
+                    if strings.parseIntOpt(&t).isNone() { return Err(lexdb_base.err("22P02", &("invalid input syntax for type integer: \"" + t + "\""))) }
+                }
+            }
+        }
+        if pg {
+            try p.expectKw("using")
+            sp.cPath = try p.name()
+            if sp.cPath == sp.cSet { return Err(lexdb_base.err("42601", "cycle mark column name and cycle path column name are the same")) }
+            if sp.cPath == sp.sSet { return Err(lexdb_base.err("42601", "search sequence column name and cycle path column name are the same")) }
+            for j in 0..base { if cols[j] == sp.cPath { return Err(lexdb_base.err("42601", &("cycle path column name \"" + sp.cPath + "\" already used in WITH query column list"))) } }
+        }
+    }
+    return Ok(sp)
+}
+
+// A CYCLE clause's TO or DEFAULT value: a literal (a string, a number, TRUE or FALSE).
+fn (p: mut &P) markValue(): Result[Val, lexdb_base.DbErr] {
+    let t = p.next()
+    if t.kind == T_STR { return Ok(Val.Text(t.text.clone())) }
+    if t.kind == T_NUM { return Ok(Val.Int(strings.parseIntOpt(&t.text).unwrapOr(0))) }
+    if t.kind == T_IDENT && (t.text == "true" || t.text == "false") { return Ok(Val.Bool(t.text == "true")) }
+    return Err(near(&t))
+}
+
 fn (p: mut &P) popCtes(n: int) { for i in 0..n { let c = pop(mut &p.ctes) } }
+
+// Whether a CTE of this name is in scope.
+fn (p: &P) cteNamed(n: &str): bool {
+    for c in p.ctes { if c.name == n { return true } }
+    return false
+}
 
 // A use of CTE ci: its text parsed again, here, with the CTEs before it in
 // scope.
@@ -1360,20 +1529,42 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
     for i in 0..upto {
         var cols: []str = []
         for c in saved[i].cols { append(mut &cols, c.clone()) }
-        append(mut &p.ctes, Cte{name: saved[i].name.clone(), cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec})
+        append(mut &p.ctes, Cte{name: saved[i].name.clone(), cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec,
+                                spell: saved[i].spell.clone(), spec: saved[i].spec.clone(), spells: saved[i].spells.clone()})
     }
     let pos = p.pos
     p.pos = saved[ci].start
-    if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0}) }
+    if rec { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0, sub: 0}) }
     let r = p.subquery(SUB_FROM)
     var selfRefs = 0
     if rec { selfRefs = pop(mut &p.inCte).refs }
     p.pos = pos
     p.ctes = saved
     let i = try r
+    // T-SQL's and Oracle's shapes, SEARCH and CYCLE: as the executor runs them (lexdb_recur.shape)
+    if selfRefs > 0 && (p.tsql || p.ora || len(p.ctes[ci].spec) > 0) {
+        let body = replace(mut &p.subs[i], lexdb_sql.newStmt(S_SELECT))
+        var sp = lexdb_recur.decode(&p.ctes[ci].spec)
+        sp.name = p.ctes[ci].spell.clone()
+        for c in p.ctes[ci].cols { append(mut &sp.cols, c.clone()) }
+        for c in p.ctes[ci].spells { append(mut &sp.spells, c.clone()) }
+        p.subs[i] = lexdb_recur.shape(body, id, p.md(), sp)
+    }
     p.subs[i].cte = id
     p.subs[i].rec = selfRefs > 0
     return Ok(i)
+}
+
+// A CTE's columns where it is used: its column list, then the columns its SEARCH and CYCLE add.
+fn cteCols(c: &Cte): []str {
+    var out: []str = []
+    for x in c.cols { append(mut &out, x.clone()) }
+    if len(c.spec) == 0 || len(out) == 0 { return out }
+    let sp = lexdb_recur.decode(&c.spec)
+    if len(sp.sSet) > 0 { append(mut &out, sp.sSet.clone()) }
+    if len(sp.cSet) > 0 { append(mut &out, sp.cSet.clone()) }
+    if len(sp.cPath) > 0 { append(mut &out, sp.cPath.clone()) }
+    return out
 }
 
 fn subRef(name: &str, i: int): Expr { return Expr.Call(name.clone(), [Expr.Lit(Val.Int(i))], false) }
@@ -3546,7 +3737,11 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         try p.returning(mut &s)
         return Ok(s)
     }
-    try p.expectKw("values")
+    if !p.acceptKw("values") {
+        // INSERT INTO t WITH ... SELECT (Oracle's and PostgreSQL's: a recursive CTE feeding an INSERT)
+        if !p.tsql && p.isKw("with") { return p.insertWith(s) }
+        return Err(near(&p.peek()))
+    }
     while true {
         try p.expectKw("(")
         var row: []Expr = []
@@ -3556,6 +3751,23 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         append(mut &s.rows, row)
         if !p.acceptKw(",") { break }
     }
+    try p.onConflict(mut &s)
+    try p.returning(mut &s)
+    return Ok(s)
+}
+
+// INSERT's query that starts WITH, at WITH: the query in inner[0], its CTEs in scope.
+fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    p.pos += 1
+    let n = try p.withList()
+    try p.expectKw("select")
+    var q = try p.select()
+    p.popCtes(n)
+    q.subs = replace(mut &p.subs, [])
+    q.wins = replace(mut &p.wins, [])
+    q.params = p.params
+    append(mut &s.inner, q)
     try p.onConflict(mut &s)
     try p.returning(mut &s)
     return Ok(s)
@@ -4203,7 +4415,13 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         if p.ora { rn = p.oraRownum(mut &emptied) }
         if !emptied { s.where = Some(try p.expr()) }
     }
-    if p.ora { try oraOuterJoins(mut &s) }
+    if p.ora {
+        try oraOuterJoins(mut &s)
+        // START WITH, CONNECT BY: a hierarchical query (hierTail)
+        if (p.isKw("start") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "with") || (p.isKw("connect") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "by") {
+            return p.hierTail(s, rn)
+        }
+    }
     if p.acceptKw("group") {
         try p.expectKw("by")
         try p.groupBy(mut &s)
@@ -4222,6 +4440,40 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
         }
     }
     p.rnLimit = rn
+    return Ok(s)
+}
+
+// The rest of an Oracle query block at START WITH or CONNECT BY (in either order; a hierarchical query, lexdb_recur.hierQuery):
+// its GROUP BY, HAVING and WINDOW as selectCore reads them, its ORDER [SIBLINGS] BY and FETCH, then the query as a recursive CTE.
+fn (p: mut &P) hierTail(s0: Stmt, rn: int): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    var start: Option[Expr] = None
+    var conn: Option[Expr] = None
+    var nocycle = false
+    for k in 0..2 {
+        if start.isNone() && p.isKw("start") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "with" {
+            p.pos += 2
+            start = Some(try p.expr())
+        } else if conn.isNone() && p.isKw("connect") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "by" {
+            p.pos += 2
+            nocycle = p.acceptKw("nocycle")
+            conn = Some(try p.expr())
+        }
+    }
+    match conn {
+        Some(c) { s.exprs = [lexdb_recur.hierMark(start, c, nocycle)] }
+        None { return Err(oraErr(1788, "CONNECT BY clause required in this query block")) }
+    }
+    if p.acceptKw("group") {
+        try p.expectKw("by")
+        try p.groupBy(mut &s)
+    }
+    if p.acceptKw("having") { s.having = Some(try p.expr()) }
+    p.rnLimit = rn
+    try p.orderLimit(mut &s)
+    let id = p.nextCte
+    p.nextCte += 1
+    try lexdb_recur.hierQuery(mut &s, mut &p.subs, id)
     return Ok(s)
 }
 
@@ -4633,6 +4885,11 @@ fn negPos(x: &Expr): Option[Expr] {
 
 fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.acceptKw("order") {
+        // Oracle: ORDER SIBLINGS BY, a hierarchical query's
+        if p.ora && p.acceptKw("siblings") {
+            if !lexdb_recur.isHier(s) { return Err(oraErr(30929, "ORDER SIBLINGS BY clause not allowed here")) }
+            lexdb_recur.markSiblings(s)
+        }
         try p.expectKw("by")
         while true {
             var e = try p.expr()
@@ -4948,7 +5205,7 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols)
     try p.tableHints()
-    if p.ora && lexdb_sql.baseName(&table) == "dual" && len(p.ctes) == 0 {
+    if p.ora && lexdb_sql.baseName(&table) == "dual" && !p.cteNamed(&"dual") {
         // Oracle's DUAL: one row, one column DUMMY = 'X'
         var d = lexdb_sql.newStmt(S_SELECT)
         d.srf = "#values:01"           // (a marker of its own, for the label DUMMY: still a one column VALUES)
@@ -4978,17 +5235,20 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         return Ok(FromItem{table: rel, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
     if ci >= 0 {
-        if len(cols) == 0 { for c in p.ctes[ci].cols { append(mut &cols, c.clone()) } }
+        let given = len(cols) > 0
+        if !given { for c in p.ctes[ci].cols { append(mut &cols, c.clone()) } }
         // in its own body: its working table
         for k in 0..len(p.inCte) {
             if p.inCte[k].id == p.ctes[ci].id {
-                if p.inCte[k].depth != p.depth {
-                    return Err(lexdb_base.err("42P19", &("recursive reference to query \"" + table + "\" must not appear within a subquery")))
-                }
+                if p.inCte[k].depth != p.depth && (p.inCte[k].sub > 0 || p.ora) { return Err(lexdb_recur.inSubquery(&table, p.md())) }
                 p.inCte[k].refs += 1
                 return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id, lateral: false, using: [], natural: false, comma: false})
             }
         }
+        // (with the columns its SEARCH and CYCLE add)
+        if !given && len(p.ctes[ci].spec) > 0 { cols = cteCols(&p.ctes[ci]) }
+        // (T-SQL's and Oracle's recursive CTE names its columns itself, as written: lexdb_recrun.outsOf)
+        if !given && p.ctes[ci].rec && (p.tsql || p.ora) { cols = [] }
         let i = try p.cteRef(ci)
         return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
     }
@@ -5152,9 +5412,13 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str): Result[Unit, lexdb_ba
         // (FETCH FIRST ... after a table: a clause, as OFFSET)
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
         if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))) {
-            let old = replace(alias, t.text.clone())
-            p.pos += 1
-            got = true
+            // (Oracle: START WITH and CONNECT BY after a table are a hierarchical query's clauses)
+            if !(p.ora && t.kind == T_IDENT && p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
+                                                                              (t.text == "connect" && p.peekAt(1).text == "by"))) {
+                let old = replace(alias, t.text.clone())
+                p.pos += 1
+                got = true
+            }
         }
     }
     if got && p.acceptKw("(") {
@@ -7534,6 +7798,11 @@ fn sysdateExpr(): Expr {
 // SYSTIMESTAMP, ROWNUM, USER, seq.NEXTVAL; None for the rest.
 fn (p: mut &P) oraPrimary(t: &Tok): Result[Option[Expr], lexdb_base.DbErr] {
     if t.kind != T_IDENT && t.kind != T_QIDENT { return Ok(None) }
+    // the hierarchical operators (lexdb_recur.hierQuery): PRIOR x, CONNECT_BY_ROOT x
+    if t.kind == T_IDENT && (t.text == "prior" || t.text == "connect_by_root") && (p.peek().kind != T_OP || p.isKw("(") || p.isKw("-")) {
+        let e = try p.unary()
+        return Ok(Some(Expr.Call(if t.text == "prior" { "#prior" } else { "#cbroot" }, [e], false)))
+    }
     // seq.nextval, schema.seq.nextval
     if p.isKw(".") {
         let a = p.peekAt(1).clone()
