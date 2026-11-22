@@ -833,10 +833,15 @@ fn sampOnly(lv: &Level, e: int, col: int, ops: &[]str, vals: &[]Expr): float {
 // rules) or a path with no condition.
 pub fn pathEst(lv: &Level, p: &Path, params: &[]Val): Fig {
     let none = Fig{rows: -1, bound: false}
-    let cols = keyCols(&lv.t, p.index)
+    // (its key's length, not keyCols': a point select allocates nothing here)
+    let ncols = if p.index < 0 { len(lv.t.pk) } else { len(lv.t.indexes[p.index].cols) }
     let unique = p.index < 0 || lv.t.indexes[p.index].unique
-    if len(p.eqs) == len(cols) && unique { return none }
-    if len(p.eqs) == 0 && len(p.rng) == 0 && len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 { return none }
+    if len(p.eqs) == ncols && unique { return none }
+    if len(p.eqs) == 0 && len(p.rng) == 0 && len(p.ins) == 0 && p.inSub < 0 && len(p.inArr) == 0 {
+        // a scan read by an OR of index paths: its arms' (optimizer 52)
+        if lv.ors.isSome() { return orEst(lv, params) }
+        return none
+    }
     return pathFig(lv, p, params)
 }
 
@@ -895,8 +900,9 @@ pub type Level = record {
     pub mode: int
     // the OR of index paths its rows are read by (optimizer 52: one per
     // branch of an OR conjunct; their rows' primary keys collected,
-    // deduplicated and read in key order) where orRead says so; [] none
-    pub ors: []Path
+    // deduplicated and read in key order) where orRead says so; None none
+    // (an Option: a Level's copies and drops cost a point select nothing)
+    pub ors: Option[rc []Path]
 }
 
 pub const LV_NOTIN: int = 1
@@ -3215,7 +3221,7 @@ pub fn boundType(t: &lexdb_sql.TypeName): lexdb_sql.TypeName {
 pub fn newLevel(t: rc Table, alias: &str, join: int, first: int): Level {
     return Level{t: t, alias: alias.clone(), join: join, first: first, path: Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}, cond: [],
                  post: [], local: [], perRow: true, hashCols: [], hashVals: [], hashKinds: [], hashInt: false, src: -1, work: -1, lateral: false, gen: lexdb_gen.anyVirtual(&t.cols), need: [],
-                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0, mode: 0, ors: []}
+                 lock: 0, lockWait: 0, keeps: false, est: lexdb_stats.noEst(), stops: false, estRows: -1, estMax: false, readOnce: false, semi: false, anti: false, resNot: false, resCol: -1, resVal: Expr.Lit(Val.Null), semiSub: -1, grp: 0, mode: 0, ors: None}
 }
 
 // Marks in cand the subqueries of x's top-level conjuncts (conjuncts')
@@ -3975,14 +3981,17 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
             choosePath(q, k, &m, params, mut &sc.looks)
         }
         // the cost planner's index range: read in key order where keyOrdered
-        // says it may (optimizer 47)
-        if !hs.rules && !q.levels[k].virt() { path.sorted = sortable(&q.levels[k].t, &path) }
-        // a scan of the first table (or of one read once) where an OR's
-        // branches each have an index path: their union by cost (optimizer 52;
-        // not under an outer join: a kept row may fail its conditions)
-        if !hs.rules && reorder && orMode != OR_NEVER && (k == 0 || q.levels[k].readOnce) && !q.levels[k].virt() && lastRight < 0 &&
-           !isOuter(q.levels[k].join) && fullPath(&path) {
-            q.levels[k].ors = orPaths(q, k, &m, params)
+        // says it may (optimizer 47); a scan of the first table (or of one
+        // read once) where an OR's branches each have an index path: their
+        // union by cost (optimizer 52; not under an outer join: a kept row
+        // may fail its conditions)
+        if !hs.rules && !q.levels[k].virt() {
+            if path.index >= 0 {
+                path.sorted = sortable(&q.levels[k].t, &path)
+            } else if len(path.eqs) == 0 && reorder && lastRight < 0 && (k == 0 || q.levels[k].readOnce) && !isOuter(q.levels[k].join) && fullPath(&path) {
+                let arms = orPaths(q, k, &m, params)
+                if len(arms) > 0 { q.levels[k].ors = Some(rc(arms)) }
+            }
         }
         var perRow = k == 0 || q.pathOuter(&path) || q.levels[k].lateral
         let right = keepsRight(q.levels[k].join)
@@ -4026,11 +4035,6 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         let er = pathEst(&q.levels[k], &q.levels[k].path, params)
         q.levels[k].estRows = er.rows
         q.levels[k].estMax = er.bound
-        if len(q.levels[k].ors) > 0 {
-            let oe = orEst(&q.levels[k], params)
-            q.levels[k].estRows = oe.rows
-            q.levels[k].estMax = oe.bound
-        }
         q.levels[k].perRow = perRow
         q.levels[k].cond = m
         q.levels[k].post = replace(mut &ps[k], [])
@@ -7118,7 +7122,7 @@ pub fn orderLookups(q: mut &Query) {
         let l0 = &q.levels[0]
         let p = &l0.path
         if l0.virt() || !l0.perRow || l0.lateral || l0.keeps || l0.stops || p.index >= 0 || p.desc || len(p.eqs) > 0 || len(p.rng) > 0 ||
-           len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || len(l0.need) == 0 || len(l0.ors) > 0 { return }
+           len(p.ins) > 0 || p.inSub >= 0 || len(p.inArr) > 0 || len(l0.need) == 0 || l0.ors.isSome() { return }
         for k in 1..len(q.levels) {
             let lv = &q.levels[k]
             if !lv.perRow || !lookupPath(q, lv) { continue }
@@ -7330,6 +7334,7 @@ fn uniquePath(lv: &Level, p: &Path): bool {
 // the scan's (the lean of scanFirst). Without statistics: only arms of
 // unique keys (a row per value at most).
 fn orPaths(q: &Query, k: int, cs: &[]Expr, params: &[]Val): []Path {
+    if orMode == OR_NEVER { return [] }
     let lv = &q.levels[k]
     var best: []Path = []
     var bestCost = 0.0f
@@ -7386,13 +7391,32 @@ fn orPaths(q: &Query, k: int, cs: &[]Expr, params: &[]Val): []Path {
 fn orEst(lv: &Level, params: &[]Val): Fig {
     var n = 0
     var bound = false
-    for p in lv.ors {
-        let f = pathFig(lv, &p, params)
-        if f.rows < 0 { return Fig{rows: -1, bound: false} }
-        n += f.rows
-        if f.bound { bound = true }
+    match &lv.ors {
+        Some(arms) {
+            for p in arms {
+                let f = pathFig(lv, &p, params)
+                if f.rows < 0 { return Fig{rows: -1, bound: false} }
+                n += f.rows
+                if f.bound { bound = true }
+            }
+        }
+        None {}
     }
     return Fig{rows: n, bound: bound}
+}
+
+// Level k's OR of index paths' arms (Level.ors), where orRead says it is
+// read by them; [] none.
+pub fn orArms(q: &Query, k: int): []Path {
+    if !orRead(q, k) { return [] }
+    match &q.levels[k].ors {
+        Some(arms) {
+            var out: []Path = withCapacity(len(arms))
+            for p in arms { append(mut &out, p.clone()) }
+            return out
+        }
+        None { return [] }
+    }
 }
 
 // Whether level k of q is read by its OR of index paths (Level.ors): its
@@ -7401,7 +7425,7 @@ fn orEst(lv: &Level, params: &[]Val): Fig {
 // keyOrdered).
 pub fn orRead(q: &Query, k: int): bool {
     let lv = &q.levels[k]
-    if len(lv.ors) == 0 || orMode == OR_NEVER { return false }
+    if lv.ors.isNone() || orMode == OR_NEVER { return false }
     if (k > 0 && lv.perRow) || lv.keeps || lv.stops || lv.lock != 0 || lv.virt() || lv.lateral || lv.semi || lv.anti || lv.semiSub >= 0 { return false }
     return fullPath(&lv.path)
 }
@@ -7420,7 +7444,10 @@ fn armText(lv: &Level, p: &Path): str {
 // EXPLAIN's text of a level read by its OR of index paths.
 fn orText(lv: &Level): str {
     var arms: []str = []
-    for p in lv.ors { append(mut &arms, armText(lv, &p)) }
+    match &lv.ors {
+        Some(ps) { for p in ps { append(mut &arms, armText(lv, &p)) } }
+        None {}
+    }
     return "any of " + strings.join(&arms, ", ") + "; rows in key order" + estText(lv)
 }
 
