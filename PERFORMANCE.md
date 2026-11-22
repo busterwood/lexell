@@ -1,8 +1,8 @@
 # Lexell performance
 
-Measured on 19 November 2026 on `main` at commit dbee498f, except the compile-time,
-microbenchmark and regex sections, which were measured again on 22 November 2026 at
-commit 236c8513. Every number compares Lexell only with external tools or databases.
+The compile-time, microbenchmark and regex sections were measured on 22 November 2026
+on `main` at commit 236c8513; the other sections on 19 November 2026 at commit dbee498f.
+Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
 Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
@@ -65,10 +65,7 @@ same operations and keys, not the same data structure. Both print the same check
 | tokens | 126 ms | 103 ms | 1.22 |
 | maps | 357 ms | 651 ms | 0.55 |
 
-A second run of the same build, straight after, gave every ratio within 0.01 of these.
-The clock ran lower than on 19 November: Lexell's `fib` takes the same cycles
-(3,986 M) as then and about 4 percent more wall time, and the Rust times rose by 0 to
-8 percent, so compare the ratios rather than the times across the two dates.
+A second run of the same build gave every ratio within 0.01 of these.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
 table holds them), in both languages, with the same output. The same source
