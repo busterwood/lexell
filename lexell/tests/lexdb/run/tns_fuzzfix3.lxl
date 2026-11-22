@@ -1,0 +1,127 @@
+// lexdb over TNS: what the fuzzer's long run left (design/lexdb-fuzz.md), through the Oracle door, checked against Oracle
+// Database 23ai Free (run with LEXDB_ORACLE set to its connection string, this test prints Oracle's answers: the expect
+// lines; its tables are made and dropped). W18: a correlated scalar subquery, EXISTS and NOT EXISTS on a NUMBER key
+// against a derived table's BINARY_DOUBLE or BINARY_FLOAT (and the other way), with and without an index. Each
+// statement with set lexdb_batch = off (the row engine) and on: the label and the answer, or DIFFERENT and both.
+// expect: setup: 35 statements
+// expect: W18 a binary_double = a number: X,S = 0|6;0|6;1|6;2.5|NULL;NULL|NULL
+// expect: W18 a binary_float = a number: X,S = 0|6;1|6;2.5|NULL;3|NULL;NULL|NULL
+// expect: W18 a number = a binary_double: X,S = 0|9;1|1;1|1;1.5|NULL;2|NULL;NULL|NULL
+// expect: W18 an integer = a number: X,S = 1|6;2|3;2|3;3|NULL;NULL|NULL
+// expect: W18 with an index: X,S = 0|6;0|6;1|6;2.5|NULL;NULL|NULL
+// expect: W18 EXISTS: X = 0;0;1
+// expect: W18 NOT EXISTS: X = 2.5;NULL
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "os"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_plan"
+
+const SETUP = "create table w1 (b2 number(6,2), p number(10))\ninsert into w1 values (1, 1)\ninsert into w1 values (1.5, 2)\ninsert into w1 values (2, 3)\ninsert into w1 values (NULL, 4)\ninsert into w1 values (1, 5)\ninsert into w1 values (0, 6)\ncreate table w2 (k number(10), f binary_double, r binary_float, g number(19), p number(10))\ninsert into w2 values (1, 1, 1, 1, 1)\ninsert into w2 values (2, 2.5, 2.5, 2, 2)\ninsert into w2 values (NULL, NULL, NULL, NULL, 3)\ninsert into w2 values (2, 0, 0, 2, 4)\ninsert into w2 values (3, 0, 3, 3, 5)\ncreate table w3 (b2 number(6,2), p number(10))\ninsert into w3 select b2, p from w1\ncreate index w3_i on w3 (b2)\ncreate table q0 (a char(3), n number(10))\ninsert into q0 values ('a', 1)\ninsert into q0 values ('b', 2)\ninsert into q0 values (' ', 3)\ninsert into q0 values (NULL, 4)\ninsert into q0 values ('ab', 5)\ninsert into q0 values ('a', 6)\ncreate table q1 (b varchar2(10), n number(10))\ninsert into q1 values ('a', 6)\ninsert into q1 values ('a ', 7)\ninsert into q1 values ('b  ', 8)\ninsert into q1 values (' ', 9)\ninsert into q1 values ('   ', 10)\ninsert into q1 values (NULL, 11)\ninsert into q1 values ('ab', 12)\ncreate table q2 (a char(5), n number(10))\ninsert into q2 values ('a', 13)\ninsert into q2 values ('b', 14)\ninsert into q2 values ('ab', 15)"
+
+const QS = "W18 a binary_double = a number	select d.x, (select sum(p) from w1 where w1.b2 = d.x) s from (select f x from w2) d order by 1, 2\nW18 a binary_float = a number	select d.x, (select sum(p) from w1 where w1.b2 = d.x) s from (select r x from w2) d order by 1, 2\nW18 a number = a binary_double	select d.x * 1 x, (select sum(p) from w2 where w2.f = d.x) s from (select b2 x from w1) d order by 1, 2\nW18 an integer = a number	select d.x, (select sum(p) from w1 where w1.b2 = d.x) s from (select k x from w2) d order by 1, 2\nW18 with an index	select d.x, (select sum(p) from w3 where w3.b2 = d.x) s from (select f x from w2) d order by 1, 2\nW18 EXISTS	select d.x from (select f x from w2) d where exists (select 1 from w1 where w1.b2 = d.x) order by 1\nW18 NOT EXISTS	select d.x from (select f x from w2) d where not exists (select 1 from w1 where w1.b2 = d.x) order by 1"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn answer(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// local: lexdb, each statement with the row engine and with batches, unnesting on and then off; else the oracle's answers
+// (its tables dropped after)
+fn client(dsn: &str, local: bool) {
+    match oracle.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            if !local { for t in TABLES { let d = c.run(&((if strings.startsWith(&t, "v") { "drop view " } else { "drop table " }) + t), &[]) } }
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for pass in 0..2 {
+                if pass == 1 && local { lexdb_plan.setUnnest(0) }
+                for l in strings.lines(&text) {
+                    let parts = strings.split(&l, "\t")
+                    if pass == 1 && !strings.startsWith(&parts[0], "W7") { continue }
+                    let lab = if pass == 1 { "unnest off, " + parts[0] } else { parts[0].toStr() }
+                    let q = parts[1].toStr()
+                    if !local {
+                        println(lab + ": " + answer(mut &c, &q))
+                        continue
+                    }
+                    let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                    let off = answer(mut &c, &q)
+                    let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                    let on = answer(mut &c, &q)
+                    if off == on { println(lab + ": " + on) } else {
+                        println("DIFFERENT " + lab + ": " + q)
+                        println("  rows:    " + off)
+                        println("  batches: " + on)
+                    }
+                }
+            }
+            if !local { for t in TABLES { let d = c.run(&((if strings.startsWith(&t, "v") { "drop view " } else { "drop table " }) + t), &[]) } }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+const TABLES: []str = ["w1", "w2", "w3", "q0", "q1", "q2"]
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&("User Id=app;Password=app;Data Source=127.0.0.1:" + addr[10..len(addr)] + "/lexdb"), true)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_ORACLE: the oracle, for the expect lines
+    match os.env("LEXDB_ORACLE") {
+        Some(dsn) { client(&dsn, false) }
+        None { lexdb_store.run(lexdb_disk.sim(62), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap() }
+    }
+}
