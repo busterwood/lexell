@@ -491,7 +491,25 @@ profile against the C build found the gap in the bucket loop of `main`, not in t
 tokens is now 1.16 times its C build's cycles. What remains: the bucket loop's `str` compare
 (`rt_str_eq` and memcmp, 7% of the instructions) and frame traffic.
 
-## 13. Next, in order
+## 13. `str ==` without memcmp for up to 16 bytes (runtime)
+
+`rt_str_eq` (the native code compares the lengths inline first) called memcmp for every equal
+length; in bench tokens' bucket loop that was 7% of the instructions. Now up to 16 bytes are two
+overlapping words of the widest size that fits (8 or 4 bytes), 1 to 3 bytes the first, middle
+and last byte, and longer strings memcmp; native/rt.c and rt.h alike.
+tests/run/s04_str_eq_lengths.lxl checks every length 0 to 40 with a difference at each position.
+
+| measure | new/old instructions | cycles |
+|---|---:|---:|
+| bench tokens (-O), 5 interleaved rounds | -4.8% | -3.9% |
+| perfsuite compile / run suite | -0.64% / -0.39% | -0.54% / +0.04% |
+| perfsuite tokens / maps / grep -cE | -3.4 / -1.0 / -1.2% | -3.5 / 0.0 / -1.0% |
+| perfsuite strings / grep -n | 0.00 / -0.6% | +2.1 / +3.3% (placement: the runtime moved) |
+| lexdb point selects select / insert / update | -0.96 / -0.83 / -0.83% | level |
+| TPC-H server instructions per query | -0.22% geomean | |
+| apps, HTTP | level | level |
+
+## 14. Next, in order
 
 1. Done: TPC-H and the PERFORMANCE.md set (section 1); merged into main, with the revision.
    Lesson: perfsuite's run suite has no cmark, json or jq. Check a code-shape change against

@@ -324,8 +324,34 @@ static lxl_str rt_str_static(lxl_str s) {
     return (lxl_str){.p = p, .cap = 0, .len = s.len};
 }
 static void rt_str_drop(lxl_str s) { if (s.cap) rt_free(s.p); }
+/* Equal lengths and bytes. Up to 16 bytes as two overlapping words of the widest size that fits,
+   no memcmp call (identifiers and keys are mostly short); 1 to 3 bytes by the first, middle and
+   last, which are all of them; longer by memcmp. */
 static bool rt_str_eq(lxl_str a, lxl_str b) {
-    return a.len == b.len && (RT_SP(a) == RT_SP(b) || memcmp(RT_SP(a), RT_SP(b), (size_t)a.len) == 0);
+    if (a.len != b.len) return false;
+    const unsigned char *p = (const unsigned char*)RT_SP(a), *q = (const unsigned char*)RT_SP(b);
+    size_t n = a.len;
+    if (p == q) return true;
+    if (n <= 16) {
+        if (n >= 8) {
+            uint64_t x0, y0, x1, y1;
+            __builtin_memcpy(&x0, p, 8);
+            __builtin_memcpy(&y0, q, 8);
+            __builtin_memcpy(&x1, p + n - 8, 8);
+            __builtin_memcpy(&y1, q + n - 8, 8);
+            return ((x0 ^ y0) | (x1 ^ y1)) == 0;
+        }
+        if (n >= 4) {
+            uint32_t x0, y0, x1, y1;
+            __builtin_memcpy(&x0, p, 4);
+            __builtin_memcpy(&y0, q, 4);
+            __builtin_memcpy(&x1, p + n - 4, 4);
+            __builtin_memcpy(&y1, q + n - 4, 4);
+            return ((x0 ^ y0) | (x1 ^ y1)) == 0;
+        }
+        return n == 0 || (p[0] == q[0] && p[n / 2] == q[n / 2] && p[n - 1] == q[n - 1]);
+    }
+    return memcmp(p, q, n) == 0;
 }
 /* Short strings (a database's keys: 8 to 16 bytes mostly) compared 8 bytes at a time as
    big-endian integers, with no call to memcmp; longer ones by memcmp. */
