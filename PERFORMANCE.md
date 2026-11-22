@@ -1,7 +1,8 @@
 # Lexell performance
 
 Measured on 22 November 2026 on `main`: the compile-time, microbenchmark and regex
-sections at commit 236c8513, the others at 86e20e87, which adds only documentation to it.
+sections at commit 236c8513, the JSON and decimal sections at d08f41f5, the others at
+86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
@@ -120,19 +121,19 @@ driver's output is identical (sha256 checked).
 
 | step | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| parse | 395 ms | Python json 848 ms | 0.47 |
-| compact output | 417 ms | Python json 606 ms | 0.69 |
-| pretty output | 467 ms | Python json 639 ms | 0.73 |
-| query (sum of qty) | 156 ms | Python json 46 ms | 3.4 |
-| visit (eachItem) | 155 ms | Python json 46 ms | 3.4 |
-| jq `.` | 1,050 ms | jq 1.7.1 2,310 ms | 0.45 |
-| jq `-c .` | 970 ms | jq 1.7.1 2,030 ms | 0.48 |
-| jq `length` | 650 ms | jq 1.7.1 1,050 ms | 0.62 |
-| jq `[.[].items[].qty] \| add` | 790 ms | jq 1.7.1 1,300 ms | 0.61 |
-| jq `map(select(...))` | 820 ms | jq 1.7.1 1,280 ms | 0.64 |
-| jq `group_by(.address.city)` | 1,110 ms | jq 1.7.1 1,530 ms | 0.73 |
+| parse | 381 ms | Python json 815 ms | 0.47 |
+| compact output | 405 ms | Python json 587 ms | 0.69 |
+| pretty output | 448 ms | Python json 617 ms | 0.73 |
+| query (sum of qty) | 152 ms | Python json 45 ms | 3.4 |
+| visit (eachItem) | 152 ms | Python json 45 ms | 3.4 |
+| jq `.` | 1,010 ms | jq 1.7.1 2,220 ms | 0.45 |
+| jq `-c .` | 930 ms | jq 1.7.1 1,970 ms | 0.47 |
+| jq `length` | 630 ms | jq 1.7.1 990 ms | 0.64 |
+| jq `[.[].items[].qty] \| add` | 770 ms | jq 1.7.1 1,240 ms | 0.62 |
+| jq `map(select(...))` | 790 ms | jq 1.7.1 1,230 ms | 0.64 |
+| jq `group_by(.address.city)` | 1,070 ms | jq 1.7.1 1,480 ms | 0.72 |
 
-The jq times are rounded to 10 ms by the script. Lexell's jq takes 0.45 to 0.73
+The jq times are rounded to 10 ms by the script. Lexell's jq takes 0.45 to 0.72
 times jq 1.7.1's time, with identical output on every filter. jq 1.8.2, the system's
 jq, is slower than 1.7.1 here: in a separate best-of-3 run of the same six filters
 on the same data it took 1.08 to 1.17 times 1.7.1's time, also with identical output. The query and visit steps read values
@@ -163,16 +164,16 @@ to net10.0. The .NET harness has no 37- and 38-digit cases.
 
 | operation | Lexell | .NET System.Decimal | Java BigDecimal | Lexell / .NET | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| add, 19 digits | 12.7 ns | 10.9 ns | 13.4 ns | 1.17 | 0.95 |
-| mul, 6 by 6 digits | 16.5 ns | 11.0 ns | 9.9 ns | 1.50 | 1.67 |
-| div, 12 by 6, scale 2 | 23.1 ns | 64.7 ns | 11.4 ns | 0.36 | 2.03 |
-| parse, 20 digits | 32.8 ns | 90.2 ns | 106.9 ns | 0.36 | 0.31 |
-| format, 19 digits | 45.5 ns | 75.7 ns | 46.1 ns | 0.60 | 0.99 |
-| cmp, 19 digits | 3.5 ns | 3.6 ns | 1.6 ns | 0.99 | 2.27 |
-| add, 37 digits | 13.2 ns | not in harness | 15.4 ns | | 0.85 |
-| mul, 19 digits | 18.6 ns | not in harness | 19.6 ns | | 0.95 |
-| parse, 38 digits | 47.0 ns | not in harness | 176.4 ns | | 0.27 |
-| format, 38 digits | 73.7 ns | not in harness | 240.0 ns | | 0.31 |
+| add, 19 digits | 11.7 ns | 10.9 ns | 13.9 ns | 1.08 | 0.84 |
+| mul, 6 by 6 digits | 16.7 ns | 11.1 ns | 9.7 ns | 1.51 | 1.71 |
+| div, 12 by 6, scale 2 | 22.7 ns | 63.1 ns | 11.4 ns | 0.36 | 1.99 |
+| parse, 20 digits | 32.4 ns | 88.4 ns | 105.8 ns | 0.37 | 0.31 |
+| format, 19 digits | 45.6 ns | 82.9 ns | 45.8 ns | 0.55 | 1.00 |
+| cmp, 19 digits | 2.7 ns | 3.7 ns | 1.6 ns | 0.74 | 1.73 |
+| add, 37 digits | 11.7 ns | not in harness | 16.0 ns | | 0.73 |
+| mul, 19 digits | 18.6 ns | not in harness | 19.8 ns | | 0.94 |
+| parse, 38 digits | 46.5 ns | not in harness | 216.0 ns | | 0.22 |
+| format, 38 digits | 72.8 ns | not in harness | 239.9 ns | | 0.30 |
 
 The outputs are not verified against each other. The harnesses print different
 checksums for most cases, so those cases cannot be compared. The format cases print
