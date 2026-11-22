@@ -1254,3 +1254,90 @@ suite, TPC-H and the point-select gate. It is a WIP commit on the branch.
 4. Profile the per-row index fetch (q11) and the key-ordered read (q15).
 5. Measure the cost of one primary-key range lookup (q3, q10).
 
+
+### 4.6 `perf2`: conditions on a column leaf's bytes (2026-11-22, as built)
+
+Branch `worktree-agent-a559e7d320a7f6977` from main `1a561b87`, with 4.5's
+branch merged. Measured in `~/tpch-w/perf2` (scripts in `tools/`, logs in
+`logs/`): `iq.sh` (server instructions per query), `prof.sh` and
+`tools/top.py` (perf with the `LXL_NATIVE_MAP` map).
+
+**Profiled first (main `1a561b87`).** q6: decoding 56% (`colsPick` 17%,
+`unpack` 13%, the leaves' descents 6%), the filter 38% (`bEval`, `bTrue`,
+`compare`, `kindOf`, `timeCmpLocal`). A date in a batch is a `Val.Date` of
+64 bytes per row: made by `wordVal`, the slot's old value dropped, then
+compared through `lexdb_ops.compare`. q12 the same, through `cRunLazy`:
+four condition columns (three dates, `l_shipmode`) decoded as values for
+all 6.0M rows, `colsPick` 25% self. `aggBatches` (q1, q6) decoded every
+needed column of every row before the first condition.
+
+**Built.**
+1. `d654ec77`: `ValCmp` against a date and `VCmp` of two dates compare the
+   days inline (q6 -8% instructions alone).
+2. `f0022099`, `lexdb_leafk` (a new module below access): a kernel per
+   condition that holds or not by one place's words (integers, numeric
+   units at the column's scale, dates, times, timestamps) against a
+   constant or another place's words, or by a text place's bytes against
+   constant texts (`=`, `<`, `IN`; a dictionary's entries once), and their
+   ANDs and ORs. `lazyOf` makes the first conditions in order that are
+   kernels the Lazy's `kern` (a prefix: no later condition's error is
+   hidden); `cRunLazy` runs them on the leaf before decoding, then the
+   places the other conditions read for the rows kept, then the rest for
+   the rows chosen (the whole run together when half or more is kept, as
+   `intsInto`'s unpack beats per-row `intAt`). A date against date +
+   interval (a timestamp) is a range of days. A leaf whose places are not
+   of the kernels' kinds is read as before. `aggBatches` reads through
+   `fillPickIn` with `lazyOf`.
+3. `22884564`: `substring(col from 1 for m) IN (texts)` (q22), a char(n)'s
+   `#bptrim` included, ASCII by bytes and UTF-8 by runes as `substr`.
+4. `8ee133dc`: 4.5's word-at-a-time unpack taken out. On top of the
+   kernels it gave q6 -2% instructions but +1% cycles, q12 +1.6% both, and
+   +0.6 instructions per INSERT in the point gate.
+
+Test `exec_leafk`: a column-leaf store against a rows-only one, batches off
+and on, every kernel form, NULLs, empty input and an empty table, an error
+in the third batch (past a kernel and before one), changes after a
+checkpoint (all leaves and a few), an added column, a case-insensitive
+collation (no kernel), T-SQL's collation and Oracle's parser.
+
+**Measured** (`-O`, SF1, one run each, base and branch alternated twice,
+ms the mean of the two; PostgreSQL one core from 1.6's `01b0250c` run).
+All 22 checksums equal; no query over 1.5% slower (q20 +1.2%).
+
+| query | main `1a561b87` | branch | change | PG 1 core | branch / PG |
+|---|---:|---:|---:|---:|---:|
+| q1 | 1,666 | 1,650 | -1.0% | 3,277 | 0.50 |
+| q3 | 658 | 649 | -1.5% | 564 | 1.15 |
+| q6 | 438 | 176 | -59.8% | 282 | 0.62 |
+| q7 | 678 | 405 | -40.3% | 597 | 0.68 |
+| q10 | 504 | 503 | -0.2% | 402 | 1.25 |
+| q11 | 95 | 95 | -0.3% | 63 | 1.52 |
+| q12 | 1,092 | 442 | -59.5% | 873 | 0.51 |
+| q15 | 387 | 384 | -0.6% | 349 | 1.10 |
+| q20 | 259 | 262 | +1.2% | 133 | 1.97 |
+| q21 | 1,043 | 722 | -30.8% | 837 | 0.86 |
+| q22 | 166 | 115 | -31.1% | 88 | 1.30 |
+| all 22 | 11,113 | 9,481 | -14.7% | 14,960 | 0.63 |
+
+Server instructions (`iq.sh`): q6 6.32G -> 1.55G, q12 13.87G -> 4.21G, q22
+1.70G -> 1.17G, q1 25.59G -> 24.75G. Point gate (in process, 20,000 a
+mode): select 131,404.7 both, UPDATE by key 55,142,366.9 both, INSERT
+55,121,322.7 -> 322.8 (main's own two sessions: 322.6 and 322.7).
+
+**What is left.** The plans still match PostgreSQL's; the queries behind
+it are the per-row reads by key. Profiled on the branch:
+- q3 (1.15), q10 (1.25), q15 (1.10), q11 (1.52), q20 (1.97): the B-tree
+  descents are 30-42% (`rt_str_cmp`, `Node.lower`, `fingerTo`,
+  `childIndex`): q3's lineitem ranges per order (`scanRanges`, 52% incl.)
+  and its orders fetched by primary key after `orders_cust_date`
+  (`rowsOfKeys`, 27%); q15's key-ordered read; q11's and q20's partsupp
+  fetches. That is 52.3's second descent: a key search over integer
+  prefixes in `Node.lower` is the storage layer's, parked.
+- q3: `bRoom` (a range's batch grown by copying, from 64 rows) 6%.
+- The kernels on a lookup's rows (52.3's lazy pick: q19, q3's
+  `l_shipdate`, q10's `l_returnflag`): a lookup level's conditions are its
+  join's pair conditions (`jl.conds`), and dropping rows inside
+  `rangeMany` changes the counts EXPLAIN ANALYZE gives (rows read, the
+  semi join's first candidate); not done.
+- Kernels for fixed-layout and tagged rows (`bRunLazy`, `bTagLazy`), and
+  for `InInts`; a DCmp against a constant of a finer scale.
