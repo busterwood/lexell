@@ -1,53 +1,60 @@
 # lexdb-fuzz: a differential and metamorphic SQL fuzzer for lexdb
 
-## Hand-over note (2026-11-21, paused by the coordinator)
+## Hand-over note (2026-11-22, after the long run)
 
-**State.** `lexell/tools/lexdb_fuzz.py` works end to end: it generates data, runs
-every check, reduces failures and writes a report. It has had **one short
-run**: 1 worker, 158 s, 217 seeds, 12,969 queries, 133,362 statements, plus
-7,617 TLP and 8,295 NoREC forms, against main 757c4cee. The several-hour run
-across seeds has **not** been done yet. The bugs below come from that short
-run and from a few manual probes. I did not fix any of them in lexdb.
+**State.** The long run is done: 9 chunks of 1,200 s, 3 workers, against
+9899f603 (main 45981146 with G1-G3 and C1 fixed): 10,958 s, 13,807 seeds,
+2,068,887 queries, 19,885,108 statements, 1,230,791 TLP and 1,337,454 NoREC
+forms ("The long run" below). Fixed on this branch (each with exec_fuzzfix4
+or exec_fuzzfix5, batches on and off, against PostgreSQL 18; the doors' in
+tds_fuzzfix2 and tns_fuzzfix2): wrong rows W7-W17 (but W18 and one ORDER BY
+form), the server stops C1 and C2, the errors E6-E8, the gaps G1-G3. `recheck`
+of every reduced case with the last binary leaves the kinds in "Left, ranked"
+(W18 first).
+
+Commits (on 45981146): 5313647f, bf99c8a8, 97746bac, 7b177a5f (the tool);
+ba930de4 (G1-G3), 9899f603 (C1), 325e775e (E6), fd6aa85a (E7, E8), 9be8e932
+(W7, W8), 9901d72c (W9, W10), 7d620fe7 (W12, W14, W15), 831983e3 (W14's IN),
+35fc6e6d (W16), b2414cee (TPC-H q9 after W10), f8b9633d (W17), 7ccfe97b (C2),
+9336f004 (W13), 48e5d608 (W11).
 
 **How to resume.**
 
-1. Build the switch-aware binary (about 5 s; takes the shared bench lock;
-   needs `lexell/compiler/out/lxlc`, which `lexell/compiler/build.sh` builds):
-   `python3 lexell/tools/lexdb_fuzz.py build --out ~/tpch-w/fuzz/lexdb-fuzz-<rev>-O`
-2. Run it at low priority. Every server is pinned to CPUs 8-11 at nice 15:
-   `nice python3 lexell/tools/lexdb_fuzz.py run --bin ~/tpch-w/fuzz/lexdb-fuzz-<rev>-O --out ~/tpch-w/fuzz/run1 --workers 3 --duration 10800 --seed 1000`
-   Give a later run a new `--seed` and a new `--out`.
-3. `python3 lexell/tools/lexdb_fuzz.py report ~/tpch-w/fuzz/run1` prints the
-   distinct failures. Each one comes with its reduced setup, query and results.
-   The case files are in `run1/w*/cases/*.json`.
-4. `python3 lexell/tools/lexdb_fuzz.py repro CASE.json --bin BIN [--pg]`
-   reruns one case under every configuration.
+1. Build the switch-aware binary (needs `lexell/compiler/out/lxlc`, which
+   `lexell/compiler/build.sh` builds): `python3 lexell/tools/lexdb_fuzz.py
+   build --out ~/tpch-w/fuzz/lexdb-fuzz-<rev>-O`.
+2. Run it in chunks under the shared bench lock, so timings can get in
+   between (the long run's `~/tpch-w/fuzz/long/run.sh`):
+   `flock -s ~/tpch/.bench.lock nice python3 lexell/tools/lexdb_fuzz.py run
+   --bin BIN --out DIR --workers 3 --duration 1200 --seed S`, a new seed and
+   out per chunk. Every server is pinned to CPUs 8-11 at nice 15.
+3. `report DIR` prints a run's distinct failures with their reduced cases;
+   `recheck DIR... --bin BIN` checks each reduced case again with another
+   binary (after a fix: gone or STILL); `repro CASE.json --bin BIN --pg`
+   reruns one case under every configuration. A `--work` (or `--out`) path
+   must be short: PostgreSQL's socket path has 107 bytes at most.
 
-**Which checks work.** All of these ran in the short run: batch, rules, alt,
-force, noidx, tlp (where, group, having, agg), norec and pg. In the short run
-batch, tlp and norec found nothing. Everything below was found by pg, alt,
-noidx or rules.
+**The tool's changes in this round.**
+- reduce_case: the `ordered` fix checked (25 reductions of ordered queries,
+  532 candidates without ORDER BY, none compared in order); its second pass
+  reduced the base query also for a TLP or NoREC form's crash (the min_sql was
+  the base query): the tree is reduced only when the failing statement is the
+  query.
+- G1 no longer floods the pg check: lexdb reads the syntax now (G1-G3 below);
+  the generator is unchanged.
+- A hang is not reported when PostgreSQL also takes the 5 s statement timeout
+  (counted as `hang_pg_slow`); a hang's reduction keeps candidates PostgreSQL
+  finishes.
+- Ordered results are compared in order with trailing blanks dropped, and as
+  multisets exactly (char(n) peers 'a' and 'a  ' in ORDER BY); a column both
+  sides give as bpchar is compared without trailing blanks (which of two
+  equal chars DISTINCT, UNION, GROUP BY, GREATEST or LEAST shows depends on
+  the order rows come in).
+- `recheck`.
 
-**Unfinished (do these first when resuming).**
-- The fix for a reduction false positive is applied but has not been run.
-  Reduction can remove ORDER BY, and the reduced case was still compared in
-  order. It now takes `ordered` from the candidate in `reduce_case`. Two
-  reports from the short run were this artefact and are left out below.
-- Gap G1 floods the pg check: 1,074 of 13k queries. While lexdb does not
-  accept a parenthesised first operand of a set operation, the generator
-  should write `select ... union select ...` without parentheses when neither
-  side has ORDER BY or LIMIT, or it should make the parentheses optional. G2
-  and G3 are similar. Until then, these gaps hide the pg check on every query
-  with a set operation.
-- Hangs: a statement timeout on lexdb is reported as a hang. The check should
-  run the query on PostgreSQL and drop the report when PostgreSQL is slow too
-  (H1 is probably just slow).
-- Reductions per check:class are capped (`--reduce-wrong 25`,
-  `--reduce-err 2` per worker), so a long run reduces each family only a few
-  times. `report` groups by signature: check, class, error messages and the
-  SQL features of the reduced query.
-- Not done: comparison against SQL Server (gen_mssql.py), and the T-SQL and
-  Oracle doors. All queries are PostgreSQL dialect.
+Not done, still: comparison against SQL Server (gen_mssql.py) and the T-SQL
+and Oracle doors in the fuzzer itself; all queries are PostgreSQL dialect (the
+fixes were checked in the doors by tds_fuzzfix2 and tns_fuzzfix2).
 
 ## The tool
 
@@ -150,6 +157,422 @@ It then works on the data: statements after the load, unused tables, rows
 (ddmin per table), unused columns and NOT NULL. It keeps a change only if the
 same check still fails with the same class (and the same SQLSTATEs). One
 reduction is limited to `--reduce-secs`.
+
+## The long run (2026-11-22)
+
+Nine chunks of 1,200 s, 3 workers each, every check, under the shared bench
+lock (`~/tpch-w/fuzz/long/run.sh`: `flock -s ~/tpch/.bench.lock nice python3
+lexdb_fuzz.py run --bin ~/tpch-w/fuzz/lexdb-fuzz-9899f603-O --workers 3
+--duration 1200 --seed N*100000 --out ~/tpch-w/fuzz/long/cN`, a pinned copy
+of the tool, 20 s between chunks so that timings got in), against 9899f603:
+main 45981146 with G1-G3 and C1 fixed. A chunk's s is its workers' longest
+elapsed; its cases are the failures recorded (each reduced, up to the caps),
+by class; the last column counts timeouts not reported because PostgreSQL
+timed out too.
+
+| chunk | seed | s | seeds | queries | statements | TLP | NoREC | failures (wrong/crash/hang/error) | timeouts PG too |
+|---|---|---|---|---|---|---|---|---|---|
+| c1 | 100000 | 1211 | 931 | 139316 | 1342690 | 82618 | 89949 | 22/1/15/895 | 10 |
+| c2 | 200000 | 1201 | 1599 | 239613 | 2302139 | 142606 | 154638 | 28/2/8/1671 | 10 |
+| c3 | 300000 | 1234 | 1566 | 234651 | 2258208 | 139934 | 151680 | 31/0/6/1558 | 8 |
+| c4 | 400000 | 1220 | 1910 | 286247 | 2752488 | 170007 | 184968 | 47/2/7/1942 | 13 |
+| c5 | 500000 | 1219 | 1738 | 260381 | 2497871 | 155040 | 168665 | 24/0/9/1756 | 23 |
+| c6 | 600000 | 1239 | 1349 | 202077 | 1936621 | 119754 | 130460 | 16/2/9/1317 | 20 |
+| c7 | 700000 | 1222 | 1032 | 154724 | 1495115 | 92114 | 99950 | 21/0/15/1034 | 25 |
+| c8 | 800000 | 1207 | 1816 | 272119 | 2612761 | 161866 | 176188 | 32/2/8/1826 | 21 |
+| c9 | 900000 | 1204 | 1866 | 279759 | 2687215 | 166852 | 180956 | 29/0/8/1783 | 18 |
+| total | | 10958 | 13807 | 2068887 | 19885108 | 1230791 | 1337454 | 250/9/85/13782 | 148 |
+
+Every reduced case (one per signature, and every wrong result, crash and
+hang) was checked again with the branch's last binary (`recheck`,
+~/tpch-w/fuzz/long/recheck-*.txt): 1,000 cases (951 signatures). Wrong
+results: 250, 7 still (four of one kind: a set operation's ORDER BY over chars
+of two lengths; the two PostgreSQL bugs; W18). Server stops: 9, none. Hangs:
+84, 42 still (timing: half of those first reported finish under 5 s the
+second time). Errors (a-error, b-error, errcode): 651 cases, 560 still, by
+far the most E9 (an unused derived column computed), the literal-only integer
+overflow E6 leaves (22003 at PostgreSQL's planning), evaluation order (rules
+and alt against on: bigint out of range, division by zero, where one plan
+computes a value another does not), round(double precision, integer) that
+lexdb accepts, and 53200 (max_statement_mem). The rechecks of the first five
+chunks were run again after the last fix.
+
+What the run found, wrong rows first:
+- Wrong rows, all fixed but two: W7 (a semi join's residual on its key column;
+  by far the most frequent: EXISTS, IN and NOT EXISTS, through pg, rules,
+  alt, noidx, norec and tlp-where), W11 (an untyped value of a DISTINCT side
+  of a set operation), W13 (a char IN a list of texts), W12 (a FROM
+  subquery's hash on a float or date key), W14 (a subquery with a LATERAL over
+  its own FROM), W15 (IN by a filtered index), W8 (MIN/MAX's first row with a
+  HAVING), W16 (ORDER BY chars of two lengths), W17 (-2147483648's type); the
+  known W9 and W10. Left: W18 (a hashed scalar subquery's float outer value)
+  and a set operation's ORDER BY over chars of two lengths.
+- Server stops, all fixed: W7's anti join (w0-0227), C2 (a constant IN as a
+  semi join over empty tables; 4 cases), and C1 before the run.
+- Errors: E6 (integer overflow: the most frequent difference of all, pg
+  b-error, thousands of queries), E8 (= ANY / ALL of numerics), E7 (COALESCE),
+  fixed; the kinds left are under "Left, ranked".
+- Two PostgreSQL 18.6 bugs (at the end of the ranked list).
+- The tool's own false positives: char peers in ORDER BY and DISTINCT (fixed in
+  the tool).
+
+### The fixes, as built
+
+### G1-G3. A query in parentheses as a set operation's first operand (fixed before the run)
+
+**Fixed (ba930de4; off the statement path in 325e775e).** lexdb_parse's
+parenSelect reads `(SELECT ...)` as a first operand as setBranch reads the
+others (nested, with WITH inside), then the set operations (INTERSECT first),
+then ORDER BY and LIMIT of the whole; a query alone in parentheses takes them
+as its own, one of each (PostgreSQL's insertSelectOptions: "multiple ORDER BY
+clauses not allowed"). At the top, after WITH, in FROM (G2), a CTE's body
+(G3), IN, ANY / ALL, LIKE ANY, a row IN, EXISTS, a scalar, ARRAY(...), INSERT,
+CREATE VIEW, CREATE TABLE AS and COPY; in an expression or FROM a "(" starts
+one when after its ")" comes ")", a set operation, ORDER BY or LIMIT
+(parenQuery: `((select 1) + 1)` stays an expression, `((select 1), 2)` a
+list). A row IN a set operation counted none of its columns (its first
+query's now). SQL Server 2022 and Oracle 23ai agree through the doors
+(tds_fuzzfix2, tns_fuzzfix2). A smoke run of fz3run's seed had none of the
+1,838 pg a-errors G1-G3 gave it. Not supported still: a parenthesised join
+(`from ((select 1) d cross join t)`: 0A000).
+
+### W7. A semi join's filter on its key's column read as NULL (pg, rules, alt, noidx, norec, tlp; the run's most frequent wrong result)
+
+```sql
+create table t0 (a1 text);
+insert into t0 values (NULL), ('a%b');
+analyze;
+select 'a' from t0 as q1 cross join t0 as q2
+where exists (select 1 from t0 as q3 where q3.a1 = q1.a1 and q3.a1 <= q2.a1);
+-- lexdb: 0 rows; PostgreSQL: 1
+```
+
+**Fixed (9be8e932).** Cause: hashSub (lexdb_plan) runs such a correlated
+EXISTS, IN or NOT EXISTS once, hashed on its key (`q3.a1 = q1.a1`), and checks
+the other conjunct per candidate row (a residual, `q3.a1 <= q2.a1`). keyLevel
+outputs the residual's inner columns after the keys, but skipped a column
+already in the subquery's list: the key itself. The level still read it from
+the place after the keys, a NULL there, so the residual was never true: EXISTS
+matched nothing, NOT EXISTS everything, and an anti join whose one filter is
+`inner <> outer` (q21's form) indexed past the row and stopped the server
+(w0-0227, "index out of range at lexdb_exec.lxl:1673"). The column is output
+after the keys unless it is there already. Found 12 times in the run's first
+chunk alone (EXISTS, IN, NOT EXISTS, through norec and tlp-where too:
+w0-0173, w2-0191, w0-0223, w2-0183).
+
+### W8. MIN/MAX read as an index's first row with a HAVING (pg; w2-0176)
+
+```sql
+create table t1 (b0 int primary key);
+insert into t1 values (-1), (37);
+select min(b0) from t1 having count(*) > 5;
+-- lexdb: -1; PostgreSQL: no row
+```
+
+**Fixed (9be8e932).** minMax made a query whose list is MIN (or MAX) of one
+column read the first row of an index's order, also with a HAVING, whose
+aggregates are every row's (count(*) counted 1, bool_and saw one value). Not
+with a HAVING now.
+
+### W9. A set-returning function in the select list made its rows after DISTINCT and ORDER BY (known)
+
+```sql
+select distinct unnest(array[2, 1, 2]);       -- lexdb: 2, 1, 2; PostgreSQL: 1, 2
+select unnest(array[3, 1, 2]) order by 1 desc; -- lexdb: 3, 1, 2; PostgreSQL: 3, 2, 1
+```
+
+**Fixed (9901d72c).** The row path deduplicated and took ORDER BY's
+values per row of the query, then expandSrfs made each row into the function's
+rows (which kept their row's sort values), and a top-N or an early stop cut
+before it. As PostgreSQL's ProjectSet below Sort and Unique: with such a
+function, no DISTINCT, top-N or early stop per row; after expandSrfs, ORDER
+BY's items that are outputs (a position, a name, the same expression:
+lexdb_plan.orderOutAt) are read from the rows made, and DISTINCT goes over
+them. An ORDER BY on an expression that is no output keeps its row's value.
+Not changed: generate_series in the select list is not supported (42883:
+"function generate_series with 2 arguments does not exist").
+
+### W10. Chars of two lengths were two values in GROUP BY and DISTINCT (known; W6's note)
+
+```sql
+select x, count(*) from (select 'a'::char(3) as x union all select 'a'::char(5)) d group by x;
+-- lexdb: two groups; PostgreSQL: one ('a  ', 2)
+```
+
+**Fixed (9901d72c).** A GROUP BY key that is a char of no one length (a
+CASE or union of chars of two lengths, a cast with none: lexdb_bind.groupKind;
+a char(n) column's values all have n, and stay exact) and every char output of
+a DISTINCT (lexdb_bind.distKinds) are compared without trailing blanks
+(COLL_PAD), where PostgreSQL's rules hold (pgRules); which of the equal values
+is shown is the first read, as PostgreSQL's; an aggregate's argument of that
+kind too (count(DISTINCT x) counted 'a  ' and 'a    ' as two). A FROM
+subquery's or view's char(n) column now keeps its length (bpLen of its
+expression, not for a set operation's column): without it q9's nation
+(n_name char(25) through a derived table) was grouped by its padKey, +4.5%
+instructions (iq.sh), main's again after (b2414cee). Not changed: GREATEST and LEAST of chars of two
+lengths (which of two equal values they give; the fuzzer now compares char
+columns without trailing blanks, see "The tool's changes").
+
+### E6. Integer arithmetic past int4 and int2 (G4; known: x * 7919, smallint + smallint)
+
+```sql
+select x * 7919 from t;          -- x int up to 1M; lexdb: 7919000000; PostgreSQL: 22003 integer out of range
+select pg_typeof(s + s) from t;  -- s smallint; lexdb: integer; PostgreSQL: smallint
+```
+
+**Fixed (325e775e).** lexdb computes integers in 64 bits. resolve now casts
++ - * / of smallints and integers, unary minus and abs of one, to their type
+(lexdb_bind.intChecked: the wider of the two, two smallints a smallint, as
+exprOid now says too), and the cast is the range check, in eval, bxEval and the
+batches (BNode.Fit after the integer kernels: a batch condition keeps them).
+Not checked, by design: arithmetic of literals alone (`2147483647 + 1`):
+Oracle's NUMBER literals are lexdb integers at its door, which shares the
+binder; PostgreSQL folds and raises such a constant when it plans (as the
+excluded `1 % 0`). UPDATE ... SET col = col + 1 into a smallint or integer
+column is not cast (resolveAssign): the column's own check stands for it, and
+binding it is cheaper than before (UPDATE by key -223 instructions). An index
+on an expression and a partial index's predicate are matched without the casts
+(lexdb_plan.sameWritten). T-SQL: 22003 is SQL Server's 8115, and SQL Server
+2022 agrees on +, -, *, /, unary minus, ABS and smallint + smallint (a
+smallint there too; tds_fuzzfix2). Not changed: << of integers is computed in
+64 bits (PostgreSQL's int4shl wraps: `1 << 31` is -2147483648 there); an index
+on (x + 1) stores x + 1 of a row without the check (PostgreSQL fails the INSERT
+or CREATE INDEX).
+
+### E7. COALESCE evaluated every argument (known; E5's decision reversed)
+
+```sql
+select coalesce(id, 1 / (id - id)) from t;   -- lexdb: 22012; PostgreSQL: id
+```
+
+**Fixed (fd6aa85a).** eval and bxEval evaluate COALESCE's arguments in
+order up to the first not NULL (fnRefOf binds it as FN_LAZY; the batches'
+compiled expressions run bxEval). `coalesce(1, 1 / 0)` too, as PostgreSQL's
+planner stops folding there. T-SQL's COALESCE and ISNULL agree with SQL
+Server 2022. Changed beyond PostgreSQL: Oracle's NVL, which the door reads as
+COALESCE, stops at its first value too; Oracle evaluates both (NVL(id, 1 / (id
+- id)) is ORA-01476 in Oracle 23ai, a value in lexdb). A door gap, left (an NVL
+of its own would need COALESCE's typing again).
+
+### E8. An integer = ANY / ALL of numerics failed 22P02 (pg; w0-0190, w0-0071)
+
+```sql
+select 1 = all (select 1.5);   -- lexdb: 22P02 invalid input syntax for type bigint: "1.5"; PostgreSQL: f
+```
+
+**Fixed (fd6aa85a).** quantOf read each element of the array (a
+subquery's values made one) as x's type, a bigint for an integer x. An element
+that is no integer is read as a numeric now (int = numeric). SQL Server and
+Oracle agree (tds_fuzzfix2, tns_fuzzfix2).
+
+### W11. An untyped value of a set operation's DISTINCT side (pg; chunks 2-5, 8 cases: w1-0107, w0-0233, w0-0384, w1-0583 ...)
+
+```sql
+create table t1 (b1 char(3));
+insert into t1 values ('B');
+(select distinct 'a' from t3) union all (select b1 from t1);
+-- lexdb: a char column ('B  '); PostgreSQL: a text ('B')
+```
+
+**Fixed (48e5d608).** A side that sorts or compares its untyped value
+(DISTINCT, GROUP BY) resolves it to text in PostgreSQL, and text then comes
+first in the operation's common type; lexdb's branchOid took every untyped
+value as unknown, so the column was the other side's char. Without DISTINCT or
+GROUP BY the column is still a char, as PostgreSQL's.
+
+### W13. A char IN a list with texts compared as texts (pg; chunks 2-5, 7 cases: w1-0247, w2-0145, w1-0418 ...)
+
+`c in ('a ', cast(null as text), '', 'z')` over a char(3) 'a  ' is true in
+PostgreSQL: its IN takes the common type of x and the list's values that are no
+column, x first, a char, so the text 'a ' is the char 'a'; a column in the
+list is compared as = compares it (a char beside a text column as texts).
+**Fixed (9336f004):** bpCall trims a list's value of a text type that is no
+column too (it trimmed one only when every value was a char, a varchar or
+untyped).
+
+### W17. -2147483648 was a bigint (pg; chunk 3 w0-0505, chunk 5 w0-0199)
+
+`1 / nullif(sum(-2147483648), 0)` is a bigint 0 in PostgreSQL (its lexer reads
+a negative literal whole: an int4, its sum a bigint) and was a numeric in
+lexdb (the negation of the bigint 2147483648; sum of a bigint is a numeric,
+E4). **Fixed (f8b9633d):** exprOid types that negation as an integer.
+
+### C2. A constant IN as a semi join stopped the server (on crash; chunks 2 and 4: w0-0345, w1-0324, w1-0162, w2-0304)
+
+```sql
+create table t0 (a0 text, a1 text, a4 bigint);
+create index t0_i1 on t0 (a4, a0);
+create index t0_i2 on t0 (a1);
+analyze;
+select 1 from t0 as q1 where 'a' in (select q2.a1 from t0 as q2 where q2.a4 = 1);
+-- lexdb: "index out of range at lexdb_access.lxl:753" (keyType's, lexdb_plan.lxl:6961, batches off)
+```
+
+**Fixed (7ccfe97b).** Over empty tables (after ANALYZE) semiLevel made the
+IN a level looked up per row (inLook; with rows a hash was cheaper), whose
+table semiLookAdd takes from the subquery's level; a condition of no column is
+also checked once, so the subquery then ran over the level it no longer had
+(noTable, no indexes). An IN whose value has no column is no semi join now (it
+is the subquery's set, run once).
+
+### C1. NOT over a batch's NULLs stopped the server (tlp-group; smoke run)
+
+`select count(*) from t where not (b >= cast(null as int))` over a bigint b
+holding -9223372036854775807: BNode.Not computed 1 - v also for a NULL, whose v
+is the column's value, and Lexell's checked arithmetic stopped the server.
+**Fixed (9899f603):** 0 maps to 1, anything else to 0.
+
+### W12. A FROM subquery hashed on a float key against an integer (pg; chunk 2 w0-0130)
+
+```sql
+create table t1 (b0 int primary key, b4 numeric(6,2));
+insert into t1 values (0, 0);
+select 1 from t1 as q1, (select cast(b4 as float8) as x4 from t1) as d2 where d2.x4 = q1.b0;
+-- lexdb: 0 rows; PostgreSQL: 1
+```
+
+**Fixed (7d620fe7).** A join's level that is a FROM subquery (a view, a
+CTE) is hashed on its rows' values as they are (keyPart), and its probe was
+not made the column's type as a table's is (keyVal): a float 0 and an integer
+0, a date and a timestamp, are different keys. Such a conjunct is no hash key
+of a FROM subquery now unless its kinds hash alike (hashKeyTypes, as a
+semi join's: integers and numerics by value, texts and varchars, one type
+each); it stays the level's condition.
+
+### W14. A hashed correlated subquery with a LATERAL over its own tables found nothing (pg; chunk 2 w1-0186, w2-0208)
+
+```sql
+create table t0 (a0 text, a5 int);
+insert into t0 values ('a', 1);
+select exists (select 1 from t0 as q2 join lateral (select 1 from t0 as q4 where q4.a5 = q2.a5) as l3 on true
+               where q2.a0 = q1.a0) from t0 as q1;
+-- lexdb: f; PostgreSQL: t
+```
+
+**Fixed (7d620fe7).** E1 kept per row a subquery whose own subquery reads
+an outer value; one whose LATERAL reads the subquery's own columns (q2.a5) was
+still run once and hashed on its key (a mark, semi or scalar join), and the
+LATERAL then gave no rows. Such a subquery is run per row now (hashSub: a correlated
+FROM subquery of its own; one in an expression, q20's shape, still hashes:
+exec_apply). The same subquery not correlated, IN's set as a semi join (chunk
+2 w0-0348), lost the LATERAL's rows too: semiLevel leaves such a subquery to
+the subquery paths (IN's set run once, EXISTS per row; 831983e3). Not
+chased: why a run once loses the LATERAL's rows (its parameter's place,
+presumably, as E1's; or semiJoins' alternative plan).
+
+### W15. IN looked up per row through a filtered index (pg, rules, alt, noidx; chunk 1 w2-0188..0191)
+
+```sql
+create table t0 (a0 text, a1 text, a2 int);
+insert into t0 values ('bb', 'bb', NULL);
+create index t0_i0 on t0 (a1, a2) where a2 > 2;
+create index t0_i1 on t0 (a1, a0);
+select 1 from t0 as q1, t0 as q2 where q2.a0 in (select q3.a1 from t0 as q3 where q3.a1 = q1.a0);
+-- lexdb: 0 rows; PostgreSQL: 1
+```
+
+**Fixed (7d620fe7).** inLook (optimizer 50, 5c: x IN (subquery) read
+per outer row by the subquery's column) took the first index whose first column
+is that column, also a filtered one whose predicate the query does not imply.
+Not a filtered one now (as every other path choice: `pred.isSome() { continue }`).
+
+### Gates
+
+- Suite at every commit (288 tests at the last).
+- In process, LXL_HASH_SEED=1, per statement against main (the coordinator's
+  bin/pf2: 131,404.7, 55,121,322.8, 55,142,366.9): point select 131,136.7 (-268.0), INSERT 55,121,322.8
+  (equal: rounds within 0.05), UPDATE by key 55,142,140.9 (-226.0), at the
+  last code commit (48e5d608; 7d620fe7 gave -272.0, equal, -226.0). The UPDATE's
+  saving is resolveAssign (no `typing()` per SET, none of resolve's checks
+  for `v + 1`), the select's distKinds (no collKind of a text output that has
+  no collation). An earlier version that put intArith's check inside resolve's
+  Bin arm cost the select +33 (resolve's frame); the check is a helper
+  (intChecked) now. Wire (pts.sh) not run.
+- TPC-H SF1 (~/tpch-w/fuzzfix2, alternated twice against main f1623851,
+  lexdb only): 22 checksums equal and right in every run. Rounds 1 and 2 (the branch at
+  the W9/W10 commit): q9 +5.4%, its instructions +4.5% (iq.sh: 15.96G against
+  15.26G): W10's GROUP BY kind grouped q9's nation (n_name char(25) through
+  the derived table profit) by its padKey; fixed (a FROM subquery's char(n)
+  column keeps its length: 15,263.2M against 15,262.3M); q15 +2.7% and q16
+  +1.8% with main's instructions (2,788.8M against 2,789.0M; 2,169.9M against
+  2,166.6M, +0.15%): placement. Rounds 3 and 4 (the branch at b2414cee): best
+  of two each, total 9,429 ms against main's 9,424 (1.000), no query over 1.5%
+  (q20 +1.5%: 265.7 against 261.8; q17 +1.2%, q13, q19 +1.0%, q21 -2.0%). The
+  commits after b2414cee (W17, C2, W13, W11) change no TPC-H plan or
+  expression (a negative literal's type, a constant IN, a char IN a list of
+  texts, a set operation's untyped value). The data copy is deleted.
+- lexdb_exec: 20,164 lines at 45981146, 20,205 after (the select list's
+  set-returning rows sorted and made distinct after expandSrfs, COALESCE's lazy
+  eval, ORDER BY's kinds, a FROM subquery's char length, a set operation's
+  untyped sides; the helpers in lexdb_bind and lexdb_plan).
+
+### Left, ranked
+
+Wrong rows first, then crashes, then wrong errors, then gaps and speed. None of
+these is fixed; each has a reduced case in the run's directories (`recheck`'s
+STILL lines, ~/tpch-w/fuzz/long/recheck-all.txt).
+
+1. **W18. A correlated scalar subquery hashed on a numeric key against a
+   float outer value** (pg and noidx wrong; chunk 9 w1-0263): `select (select
+   sum(1.5) from t1 q10 where q10.b2 = d2.x9) from (select ceil(1) as x9 from
+   t1) d2` over a numeric(6,2) b2 = 1 is NULL in lexdb without an index on b2
+   ("subquery 1 (scalar): hashed on q10.b2 = d2.x9"), 1.5 in PostgreSQL and in
+   lexdb with one. hashSub's hashKeyTypes takes any outer parameter as of the
+   right kind, and a FROM subquery's column (here a float, ceil(int)) is an
+   untyped parameter in its subqueries (W2: only a table's or a char's is
+   typed), so a float is probed into a hash of numerics (W12's kind of
+   mismatch). The parameter would need its column's type at hashSub.
+2. **ORDER BY of a set operation's char column whose values have two lengths**
+   (pg wrong; chunks 2, 7, 8: w1-0284, w1-0085, w1-0281, w1-0406): lexdb sorts
+   by the blanks, PostgreSQL has 'a' and 'a  ' tie (W16 did not change a set
+   operation's ORDER BY: outRefKind over its outputs, outKindsOf's exact
+   kinds).
+3. **E9. An unused output of a derived table is computed** (pg a-error; the
+   most frequent remaining error kind). `select 1 from (select 1 % b0 as x
+   from t1) d` fails 22012 over b0 = 0; PostgreSQL never computes x (a pulled-up
+   subquery's unused targets; remove_unused_subquery_outputs for the others).
+   The same with `a1 + a1` past 2^63 (22003), a LATERAL's unused column, a
+   cast past numeric(p,s) (22003 numeric field overflow). Fixing it means
+   pruning a FROM subquery's outputs the outer query does not read (not under
+   DISTINCT, a set operation, a set-returning or volatile function): a planner
+   change of its own, which would also save work. Not built.
+4. **Evaluation PostgreSQL skips by its plan** (pg a-error and errcode, a few
+   per chunk): HAVING false over an aggregate whose argument fails (PostgreSQL
+   plans a One-Time Filter and never reads the input: w0-0174), LIMIT 0 (the
+   executor never pulls a row: w0-0083), E5's semi join run before its query,
+   and which of two errors comes first (22012 in lexdb, 22003 in PostgreSQL:
+   chunk 3 w2-0337). Each is lexdb computing a value PostgreSQL does not; the
+   rows agree wherever neither fails. Arithmetic of literals alone (E6's
+   exemption: `(2147483647 + 1) < 1` over an empty table, 22003 in
+   PostgreSQL at plan time) is the excluded constant folding.
+5. **Timeouts PostgreSQL does not have** (on and batch hangs, PostgreSQL under
+   5 s; 6 to 15 per chunk, half of them gone on a recheck, so near the
+   limit): products of CTEs and LATERAL that PostgreSQL's plan avoids or
+   cuts (`... order by <constant> limit 2` over a 10^9-row product: PostgreSQL
+   drops the constant sort key and stops after 2 rows; w0-0098), big
+   lateral and semi join trees (w2-0199, w1-0108). Speed, not rows.
+6. Oracle door: NVL stops at its first value (E7); SUM of quotients of 37
+   places fails ORA-01426 where Oracle keeps 40 significant digits (`sum(10 /
+   (id - 3001))` over 3,000 rows: Oracle -85.83749889959187114343792091258973719962;
+   lexdb's numerics hold 38 digits, so its answer could not be Oracle's anyway).
+7. Gaps left from before: G5 (int::bool, num_nonnulls, scale, min_scale,
+   trim_scale), generate_series in the select list, `round(round(0), 1)`
+   accepted where PostgreSQL has no round(double precision, integer),
+   parenthesised joins (`from ((select 1) d cross join t)`: 0A000), 53200 for a
+   5,000,000-row product PostgreSQL returns (max_statement_mem).
+
+Two PostgreSQL 18.6 bugs, found by the pg check (neither reported):
+- chunk 2 w2-0235: `select 'a' from lateral (select q3.b0 as x9, cast(null as
+  text) as x10 from t1 as q3 left join (select b5 as x8 from t1 group by b5)
+  as d4 on q3.b3 = d4.x8) as l2 full join t0 as q11 on true where l2.x9 =
+  l2.x10`, t0 empty, gives a row: its plan (a Nested Loop Left Join) has
+  dropped the WHERE, whose `x9 = NULL` is never true. lexdb gives none.
+- chunk 3 w2-0223: `create table t0 (a0 int primary key, a1 numeric(6,2));
+  insert into t0 values (32, 3.333); select 1 from t0 as q1 join t0 as q2 on
+  q1.a1 = q2.a1 and q1.a0 = q2.a0 join t0 as q3 on q1.a0 = q3.a0 and q1.a1 =
+  q3.a0` gives a row (3.33 = 32 is false): the plan is one `Seq Scan ...
+  Filter: (a1 IS NOT NULL)`, PostgreSQL 18's self-join elimination having
+  dropped `q1.a1 = q3.a0`. lexdb gives none.
 
 ## Bugs found (main 757c4cee), ranked
 
@@ -645,6 +1068,7 @@ too, so this is not a bug until timed against it.
 
 ### Gaps: lexdb errors where PostgreSQL returns rows (pg)
 
+- (G1-G3 are fixed: see "The fixes, as built"; G4 is E6, fixed but for arithmetic of literals alone.)
 - **G1** (1,074 of the 12,969 queries): a set operation whose first operand is
   parenthesised, `(select ...) union (select ...)`, fails with 42601 syntax
   error at or near "(". Inside an expression,
