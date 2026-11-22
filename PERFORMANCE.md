@@ -1,13 +1,14 @@
 # Lexell performance
 
-The compile-time, microbenchmark and regex sections were measured on 22 November 2026
-on `main` at commit 236c8513; the other sections on 19 November 2026 at commit dbee498f.
+Measured on 22 November 2026 on `main`: the compile-time, microbenchmark and regex
+sections at commit 236c8513, the others at 86e20e87, which adds only documentation to it.
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
 Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
 Versions: rustc and cargo 1.99.1, Go 1.27.3, Java 21.0.13, .NET SDK 10.0.113, Python 3.14.8,
-cmark 0.31.2, jq 1.7.1 (the 1.7.1 binary, built from its tarball), GNU grep and sort from the system.
+cmark 0.31.2, jq 1.7.1 (built from its tarball with `-O2`) and jq 1.8.2 from the system,
+GNU grep, sort and tail, and eza 0.23.5 from the system.
 
 Method: wall times are best of N; instruction counts are user-mode
 `perf stat` instructions, the stable figure. Benchmark processes are pinned
@@ -21,7 +22,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Compile time | Rust | Much faster: about 3 times for hello world, about 23 times for nine programs |
 | Microbenchmarks | Rust | Level or faster on nine of ten |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
-| JSON | Python, jq | Faster to parse, slower to query; 6 to 10 percent slower than jq |
+| JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Mixed |
 | HTTP server | Go net/http | Faster at 1, 10 and 100 clients, about 1.5 times |
@@ -113,26 +114,28 @@ profiled yet, so this split is a reading of the source, not a measurement.
 
 Python's `json` module and jq 1.7.1 are the common tools for parsing and filtering JSON.
 
-`bench/json/bench.py --jq jq`, an 80.2 MB generated document. Library times are
+`bench/json/bench.py --jq <jq 1.7.1>`, an 80.2 MB generated document. Library times are
 best of 3, in-process; jq times are whole-process wall time, best of 3. Each
 driver's output is identical (sha256 checked).
 
 | step | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| parse | 406 ms | Python json 811 ms | 0.50 |
-| compact output | 417 ms | Python json 573 ms | 0.73 |
-| pretty output | 461 ms | Python json 606 ms | 0.76 |
-| query (sum of qty) | 162 ms | Python json 45 ms | 3.6 |
-| visit (eachItem) | 162 ms | Python json 45 ms | 3.6 |
-| jq `.` | 1,050 ms | jq 1.7.1 970 ms | 1.08 |
-| jq `-c .` | 980 ms | jq 1.7.1 890 ms | 1.10 |
-| jq `length` | 660 ms | jq 1.7.1 620 ms | 1.06 |
-| jq `[.[].items[].qty] \| add` | 810 ms | jq 1.7.1 750 ms | 1.08 |
-| jq `map(select(...))` | 830 ms | jq 1.7.1 770 ms | 1.08 |
-| jq `group_by(.address.city)` | 1,120 ms | jq 1.7.1 1,050 ms | 1.07 |
+| parse | 395 ms | Python json 848 ms | 0.47 |
+| compact output | 417 ms | Python json 606 ms | 0.69 |
+| pretty output | 467 ms | Python json 639 ms | 0.73 |
+| query (sum of qty) | 156 ms | Python json 46 ms | 3.4 |
+| visit (eachItem) | 155 ms | Python json 46 ms | 3.4 |
+| jq `.` | 1,050 ms | jq 1.7.1 2,310 ms | 0.45 |
+| jq `-c .` | 970 ms | jq 1.7.1 2,030 ms | 0.48 |
+| jq `length` | 650 ms | jq 1.7.1 1,050 ms | 0.62 |
+| jq `[.[].items[].qty] \| add` | 790 ms | jq 1.7.1 1,300 ms | 0.61 |
+| jq `map(select(...))` | 820 ms | jq 1.7.1 1,280 ms | 0.64 |
+| jq `group_by(.address.city)` | 1,110 ms | jq 1.7.1 1,530 ms | 0.73 |
 
-The jq times are rounded to 10 ms by the script. The Lexell jq times are 6 to 10
-percent slower than jq 1.7.1 on every filter. The query and visit steps read values
+The jq times are rounded to 10 ms by the script. Lexell's jq takes 0.45 to 0.73
+times jq 1.7.1's time, with identical output on every filter. jq 1.8.2, the system's
+jq, is slower than 1.7.1 here: in a separate best-of-3 run of the same six filters
+on the same data it took 1.08 to 1.17 times 1.7.1's time, also with identical output. The query and visit steps read values
 through `get()` and `eachItem`, which borrow, so they copy nothing.
 
 ### Markdown
@@ -144,9 +147,9 @@ The perf mode checks no output.
 
 | input | Lexell | cmark | Lexell / cmark |
 |---|---:|---:|---:|
-| spec text, 49 times (10.0 MB) | 119 ms | 94 ms | 1.27 |
-| repository Markdown, 3 times (12.4 MB) | 161 ms | 137 ms | 1.18 |
-| spec examples, 643 times (10.0 MB) | 354 ms | 335 ms | 1.06 |
+| spec text, 49 times (10.0 MB) | 118 ms | 97 ms | 1.22 |
+| repository Markdown, 3 times (13.9 MB) | 167 ms | 148 ms | 1.13 |
+| spec examples, 643 times (10.0 MB) | 341 ms | 328 ms | 1.04 |
 
 ### Decimal
 
@@ -160,16 +163,16 @@ to net10.0. The .NET harness has no 37- and 38-digit cases.
 
 | operation | Lexell | .NET System.Decimal | Java BigDecimal | Lexell / .NET | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| add, 19 digits | 12.5 ns | 10.8 ns | 13.0 ns | 1.16 | 0.97 |
-| mul, 6 by 6 digits | 15.7 ns | 11.0 ns | 9.7 ns | 1.43 | 1.62 |
-| div, 12 by 6, scale 2 | 21.7 ns | 62.3 ns | 11.3 ns | 0.35 | 1.92 |
-| parse, 20 digits | 35.7 ns | 85.3 ns | 108.2 ns | 0.42 | 0.33 |
-| format, 19 digits | 46.2 ns | 73.5 ns | 45.4 ns | 0.63 | 1.02 |
-| cmp, 19 digits | 3.5 ns | 3.5 ns | 1.6 ns | 0.99 | 2.26 |
-| add, 37 digits | 12.9 ns | not in harness | 15.1 ns | | 0.86 |
-| mul, 19 digits | 18.3 ns | not in harness | 19.4 ns | | 0.94 |
-| parse, 38 digits | 48.6 ns | not in harness | 200.6 ns | | 0.24 |
-| format, 38 digits | 74.0 ns | not in harness | 239.0 ns | | 0.31 |
+| add, 19 digits | 12.7 ns | 10.9 ns | 13.4 ns | 1.17 | 0.95 |
+| mul, 6 by 6 digits | 16.5 ns | 11.0 ns | 9.9 ns | 1.50 | 1.67 |
+| div, 12 by 6, scale 2 | 23.1 ns | 64.7 ns | 11.4 ns | 0.36 | 2.03 |
+| parse, 20 digits | 32.8 ns | 90.2 ns | 106.9 ns | 0.36 | 0.31 |
+| format, 19 digits | 45.5 ns | 75.7 ns | 46.1 ns | 0.60 | 0.99 |
+| cmp, 19 digits | 3.5 ns | 3.6 ns | 1.6 ns | 0.99 | 2.27 |
+| add, 37 digits | 13.2 ns | not in harness | 15.4 ns | | 0.85 |
+| mul, 19 digits | 18.6 ns | not in harness | 19.6 ns | | 0.95 |
+| parse, 38 digits | 47.0 ns | not in harness | 176.4 ns | | 0.27 |
+| format, 38 digits | 73.7 ns | not in harness | 240.0 ns | | 0.31 |
 
 The outputs are not verified against each other. The harnesses print different
 checksums for most cases, so those cases cannot be compared. The format cases print
@@ -187,38 +190,40 @@ CPU 0 and the load client on CPU 1, the gate's pinning, not the CPU ranges above
 
 | clients | Lexell native, req/s | Go, req/s | Lexell / Go |
 |---:|---:|---:|---:|
-| 1 | 107,816 | 73,193 | 1.47 |
-| 10 | 178,595 | 119,365 | 1.50 |
-| 100 | 174,413 | 116,490 | 1.50 |
+| 1 | 107,516 | 72,305 | 1.49 |
+| 10 | 177,822 | 118,543 | 1.50 |
+| 100 | 173,043 | 116,162 | 1.49 |
 
-At 100 clients the p50 latency is 553 µs for Lexell and 804 µs for Go, and the
-p99 is 578 µs and 2,893 µs. The memory per idle connection is 19.6 KB for Lexell
+At 100 clients the p50 latency is 557 µs for Lexell and 806 µs for Go, and the
+p99 is 585 µs and 3,024 µs. The memory per idle connection is 19.6 KB for Lexell
 and 20.4 KB for Go. After the load, the server's RSS is 199 MB for Lexell and
-343 MB for Go.
+341 MB for Go.
 
 ## Commands
 
 GNU grep, sort and tail, and eza are the common tools for the same jobs.
 
-The programs in `lexell/cmd`, built with the native backend, against the
+The programs in `lexell/cmd`, built with the native backend (without `-O`), against the
 system tools. Wall time is measured around each process, best of 5 rounds,
 interleaved, with `LC_ALL=C` and the benchmark CPUs (4-7 and 12-15). Instruction
 counts are user-mode. GNU sort runs several threads. The driver does not compare
-outputs; the sort outputs and the grep counts were checked by hand and agree.
+outputs; they were compared separately. Every output is identical to the system tool's
+except `eza -l`, which differs on one of 4,140 lines: eza 0.23.5 marks a file with
+extended attributes with `@`, and Lexell's eza does not.
 
 | case | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| grep `-c omega`, 100 MB, wall | 61 ms | GNU grep 92 ms | 0.66 |
-| grep `-c omega`, instructions | 795 M | GNU grep 375 M | 2.1 |
-| grep `-o -w eta`, 100 MB, wall | 270 ms | GNU grep 354 ms | 0.76 |
-| grep `-o -w eta`, instructions | 3,887 M | GNU grep 4,063 M | 0.96 |
-| sort, 100 MB, wall | 606 ms | GNU sort 257 ms | 2.4 |
-| sort, instructions | 5,989 M | GNU sort 2,683 M | 2.2 |
-| tail `-n 5`, 100 MB file, wall | 8 ms | GNU tail 8 ms | level |
-| eza `-T /usr/share`, wall | 202 ms | eza 0.23.5 634 ms | 0.32 |
-| eza `-T /usr/share`, instructions | 1,362 M | eza 0.23.5 2,897 M | 0.47 |
+| grep `-c omega`, 100 MB, wall | 58 ms | GNU grep 88 ms | 0.66 |
+| grep `-c omega`, instructions | 791 M | GNU grep 375 M | 2.1 |
+| grep `-o -w eta`, 100 MB, wall | 253 ms | GNU grep 354 ms | 0.71 |
+| grep `-o -w eta`, instructions | 3,861 M | GNU grep 4,063 M | 0.95 |
+| sort, 100 MB, wall | 565 ms | GNU sort 249 ms | 2.3 |
+| sort, instructions | 5,986 M | GNU sort 2,683 M | 2.2 |
+| tail `-n 5`, 100 MB file, wall | 7 ms | GNU tail 8 ms | level (1 ms resolution) |
+| eza `-T /usr/share`, wall | 201 ms | eza 0.23.5 664 ms | 0.30 |
+| eza `-T /usr/share`, instructions | 1,404 M | eza 0.23.5 3,041 M | 0.46 |
 | eza `-l /usr/lib`, wall | 25 ms | eza 0.23.5 35 ms | 0.71 |
-| eza `-l /usr/lib`, instructions | 122 M | eza 0.23.5 187 M | 0.65 |
+| eza `-l /usr/lib`, instructions | 121 M | eza 0.23.5 187 M | 0.64 |
 
 ## Not measured
 
