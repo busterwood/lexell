@@ -11,7 +11,7 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 ## Performance
 
 - **Compile time.** Hello world compiles in about 14 ms and produces a 20 KB native executable; the nine benchmark programs compile in about 131 ms, against 3.05 s for Rust.
-- **Generated code.** With `-O`, Lexell is level with or ahead of Rust on nine of the ten microbenchmarks. It is slower on the token scanner (1.2 times Rust's time with native code; the same source through the C backend is level with Rust).
+- **Generated code.** With `-O`, Lexell is level with or ahead of Rust on nine of the ten microbenchmarks. It is slower on the token scanner (1.13 times Rust's time).
 - **Other programs.** Against the external tools, Lexell is faster than Go's regexp on all eight regex patterns, on JSON parsing and output (against Python), on every jq filter (0.45 to 0.72 times jq 1.7.1's time) and on eza's tree listing (about three times faster). It is slower on Markdown (1.04 to 1.22 times cmark's time), on JSON queries (about 3.4 times Python's time), on five regex patterns against Rust's regex crate (1.2 to 2.9 times its time) and on `sort` (2.3 times GNU sort's wall time). The [performance report](PERFORMANCE.md) gives every number, its method and what was not measured.
 - **Decimal.** Against Java `BigDecimal` and .NET `System.Decimal`, the results are mixed. Lexell parses 38-digit values about four and a half times faster than Java and formats them about three times faster, but division is 2.0 times Java's time and comparison is 1.7 times. Across the operations, Lexell ranges from 0.36 to 1.5 times .NET's time.
 

@@ -1,6 +1,6 @@
 # Lexell performance
 
-Measured on 22 November 2026 on `main`: the microbenchmarks at commit 45492503, the JSON
+Measured on 22 November 2026 on `main`: the microbenchmarks at commit 2f7f2246, the JSON
 and decimal sections at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
@@ -56,26 +56,29 @@ same operations and keys, not the same data structure. Both print the same check
 
 | program | Lexell | Rust | Lexell / Rust |
 |---|---:|---:|---:|
-| fib | 830 ms | 830 ms | 1.00 |
-| loop | 416 ms | 417 ms | 1.00 |
-| array | 345 ms | 350 ms | 0.99 |
-| sieve | 316 ms | 473 ms | 0.67 |
-| alloc | 264 ms | 345 ms | 0.76 |
-| strings | 156 ms | 279 ms | 0.56 |
-| lists | 184 ms | 458 ms | 0.40 |
-| trees | 132 ms | 340 ms | 0.39 |
-| tokens | 121 ms | 101 ms | 1.20 |
-| maps | 358 ms | 665 ms | 0.54 |
+| fib | 867 ms | 870 ms | 1.00 |
+| loop | 436 ms | 439 ms | 0.99 |
+| array | 360 ms | 367 ms | 0.98 |
+| sieve | 317 ms | 476 ms | 0.67 |
+| alloc | 270 ms | 362 ms | 0.75 |
+| strings | 161 ms | 292 ms | 0.55 |
+| lists | 193 ms | 487 ms | 0.40 |
+| trees | 136 ms | 349 ms | 0.39 |
+| tokens | 108 ms | 96 ms | 1.13 |
+| maps | 368 ms | 671 ms | 0.55 |
 
-A second run of the same build gave every ratio within 0.02 of these.
+A second run of the same build gave every ratio within 0.02 of these, except `tokens`.
+At about 100 ms, its best-of-5 ratio moved between 1.05 and 1.12 from run to run, so its
+row is the best of 15 rounds, alternating with Rust and pinned to one core. Cycles agree:
+505M against Rust's 445M, 1.13.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
 table holds them), in both languages, with the same output. The same source
-compiled through the C backend takes 106 ms, about level with Rust (101 ms); over the
-whole program the native backend executes about 1.16 times the instructions of the
-C build. That gap is the native code generator's, not the program's; the native
-backend's code for the scanning loop is the cause, and the work on it is tracked in
-`lexell/design/codegen-audit.md`.
+compiled through the C backend takes 110 ms in the same table; the native build takes
+1.08 times its cycles and 1.15 times its instructions. That gap is the native code
+generator's, not the program's: the token list's header and the identifier slices go
+through the stack frame where Rust keeps them in registers (`lexell/design/opt-experiments.md`,
+section 14).
 
 ## Applications
 
