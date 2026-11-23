@@ -56,8 +56,8 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| DECLARE | Variables and table variables (`DECLARE @t TABLE (...)`). |
-| SET @variable, SELECT @variable = | Assignment, compound assignment. |
+| [DECLARE](declare-local-variable.md) | Variables and table variables (`DECLARE @t TABLE (...)`). |
+| [SET @variable](set-local-variable.md), [SELECT @variable =](select-local-variable.md) | Assignment, compound assignment. |
 | IF ... ELSE, WHILE, BREAK, CONTINUE, BEGIN ... END, RETURN | |
 | TRY ... CATCH | With `ERROR_NUMBER()`, `ERROR_MESSAGE()` and the other error functions, `XACT_STATE()`. |
 | THROW, RAISERROR, PRINT | |
@@ -68,9 +68,9 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| BEGIN TRANSACTION, COMMIT, ROLLBACK, SAVE TRANSACTION | Named transactions and savepoints; `@@TRANCOUNT`. |
-| SET TRANSACTION ISOLATION LEVEL | Accepted; every read-write transaction is serializable. |
-| SET IMPLICIT_TRANSACTIONS, SET XACT_ABORT | |
+| [BEGIN TRANSACTION](begin-transaction.md), [COMMIT](commit-transaction.md), [ROLLBACK](rollback-transaction.md), [SAVE TRANSACTION](save-transaction.md) | Named transactions and savepoints; `@@TRANCOUNT`. |
+| [SET TRANSACTION ISOLATION LEVEL](set-transaction-isolation-level.md) | Accepted; every read-write transaction is serializable. |
+| [SET IMPLICIT_TRANSACTIONS](set-implicit-transactions.md), [SET XACT_ABORT](set-xact-abort.md) | |
 
 ### Session
 
