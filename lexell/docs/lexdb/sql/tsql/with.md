@@ -189,7 +189,7 @@ GO
 ```text
 Msg 208, Level 16, State 1, Line 1
 Invalid object name 'low'.
-Msg 310, Level 16, State 1, Line 1
+Msg 310, Level 16, State 1, Line 2
 The value 40000 specified for the MAXRECURSION option exceeds the allowed maximum of 32767.
 ```
 
