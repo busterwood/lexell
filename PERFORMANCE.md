@@ -1,7 +1,7 @@
 # Lexell performance
 
 Measured on 22 and 23 November 2026 on `main`: the HTTP server section on 23 November at
-5284326a, the microbenchmarks on 23 November with the compiler of fe29b218 (five programs added since), the LexDB section on 23 November at 4506a2e8, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
+5284326a, the microbenchmarks on 23 November at 22c30d63, the LexDB section on 23 November at 4506a2e8, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
@@ -21,7 +21,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Area | Against | Result |
 |---|---|---|
 | Compile time | Rust | Much faster: about 3 times for hello world, about 23 times for nine programs |
-| Microbenchmarks | Rust, Java, Go | Faster than Rust on seven of fourteen, level on two; faster than warmed-up Java on seven of fifteen; task switching about twice Go's speed; at most a twelfth of the JVM's memory |
+| Microbenchmarks | Rust, Java, Go | Faster than Rust on seven of fourteen, level on two; faster than warmed-up Java on seven of fifteen; task switching about twice Go's speed; at most an eleventh of the JVM's memory |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
 | JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
@@ -67,49 +67,49 @@ the same operations and keys, not the same data structure. Every port prints the
 
 | program | Lexell | Rust | Lexell / Rust | Java (warm) | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| fib | 508 ms | 809 ms | 0.63 | 615 ms | 0.83 |
-| loop | 407 ms | 407 ms | 1.00 | 516 ms | 0.79 |
-| array | 331 ms | 335 ms | 0.99 | 271 ms | 1.22 |
-| sieve | 290 ms | 394 ms | 0.74 | 508 ms | 0.57 |
-| alloc | 33 ms | 346 ms | 0.10 | 27 ms | 1.23 |
-| strings | 89 ms | 269 ms | 0.33 | 45 ms | 1.99 |
-| lists | 109 ms | 462 ms | 0.24 | 58 ms | 1.89 |
-| trees | 94 ms | 321 ms | 0.29 | 40 ms | 2.34 |
-| tokens | 102 ms | 92 ms | 1.10 | 166 ms | 0.61 |
-| maps | 334 ms | 622 ms | 0.54 | 260 ms | 1.28 |
-| nbody | 364 ms | 158 ms | 2.30 | 241 ms | 1.51 |
-| interp | 236 ms | 212 ms | 1.11 | 326 ms | 0.72 |
-| closures | 136 ms | 61 ms | 2.23 | 146 ms | 0.93 |
-| matmul | 209 ms | 103 ms | 2.02 | 29 ms | 7.20 |
-| pingpong | 182 ms | - | - | 1,140 ms | 0.16 |
+| fib | 509 ms | 813 ms | 0.63 | 620 ms | 0.82 |
+| loop | 407 ms | 407 ms | 1.00 | 458 ms | 0.89 |
+| array | 332 ms | 338 ms | 0.98 | 273 ms | 1.22 |
+| sieve | 290 ms | 384 ms | 0.76 | 510 ms | 0.57 |
+| alloc | 34 ms | 347 ms | 0.10 | 27 ms | 1.25 |
+| strings | 91 ms | 269 ms | 0.34 | 44 ms | 2.07 |
+| lists | 110 ms | 456 ms | 0.24 | 58 ms | 1.90 |
+| trees | 94 ms | 323 ms | 0.29 | 40 ms | 2.35 |
+| tokens | 102 ms | 93 ms | 1.10 | 166 ms | 0.61 |
+| maps | 333 ms | 629 ms | 0.53 | 262 ms | 1.27 |
+| nbody | 250 ms | 159 ms | 1.57 | 242 ms | 1.03 |
+| interp | 238 ms | 215 ms | 1.10 | 329 ms | 0.72 |
+| closures | 104 ms | 62 ms | 1.68 | 153 ms | 0.68 |
+| matmul | 157 ms | 104 ms | 1.51 | 29 ms | 5.42 |
+| pingpong | 183 ms | - | - | 1,261 ms | 0.15 |
 
-Go runs `pingpong` in 350 ms (Lexell / Go 0.52), with its default threads or with one.
+Go runs `pingpong` in 353 ms (Lexell / Go 0.52), with its default threads or with one.
 
-A second run of the same build gave every ratio within 0.03 of these, except Java's `trees`
-(2.28), Rust's `interp` (1.17) and Java's `pingpong` (1,566 ms: 0.12). `alloc` runs about 33 ms:
-its records never escape, so neither Lexell nor the JVM allocates them
-(`lexell/design/opt-experiments.md`, section 18), while Rust's `Box` does.
+A second run of the same build gave every ratio within 0.03 of these, except Java's `strings`
+(2.02), `trees` (2.28), `matmul` (5.24) and `pingpong` (1,381 ms: 0.13), and Rust's `interp`
+(1.16). `alloc` runs about 33 ms: its records never escape, so neither Lexell nor the JVM
+allocates them (`lexell/design/opt-experiments.md`, section 18), while Rust's `Box` does.
 
 Peak resident memory of the same runs (the Java figure is the JVM's over its warm-up and timed
 runs, with its default heap, which may grow to a quarter of RAM):
 
 | program | Lexell | Rust | Java |
 |---|---:|---:|---:|
-| fib | 2.0 MB | 2.3 MB | 51 MB |
-| loop | 2.0 MB | 2.3 MB | 51 MB |
-| array | 9.5 MB | 9.8 MB | 206 MB |
+| fib | 2.0 MB | 2.2 MB | 51 MB |
+| loop | 2.0 MB | 2.2 MB | 51 MB |
+| array | 9.5 MB | 9.9 MB | 206 MB |
 | sieve | 12.0 MB | 11.7 MB | 327 MB |
-| alloc | 2.0 MB | 2.3 MB | 69 MB |
-| strings | 2.0 MB | 2.7 MB | 554 MB |
-| lists | 2.4 MB | 2.4 MB | 699 MB |
+| alloc | 2.0 MB | 2.4 MB | 69 MB |
+| strings | 2.0 MB | 2.6 MB | 549 MB |
+| lists | 2.4 MB | 2.5 MB | 699 MB |
 | trees | 8.0 MB | 7.1 MB | 1,364 MB |
-| tokens | 3.8 MB | 3.3 MB | 548 MB |
-| maps | 180 MB | 208 MB | 2,370 MB |
-| nbody | 2.0 MB | 2.2 MB | 51 MB |
+| tokens | 3.8 MB | 3.4 MB | 547 MB |
+| maps | 180 MB | 208 MB | 2,372 MB |
+| nbody | 2.0 MB | 2.4 MB | 53 MB |
 | interp | 2.0 MB | 2.3 MB | 54 MB |
-| closures | 13.5 MB | 21.4 MB | 164 MB |
+| closures | 13.7 MB | 21.9 MB | 162 MB |
 | matmul | 4.0 MB | 5.7 MB | 93 MB |
-| pingpong | 2.0 MB | - | 551 MB |
+| pingpong | 2.0 MB | - | 545 MB |
 
 Java's speed here does not depend on that memory. With its heap capped at 64 MB (`-Xmx64m`),
 `lists`, `strings` and `trees` run in 60, 46 and 42 ms at a peak of 86 to 105 MB; at 16 MB they
@@ -121,13 +121,16 @@ many that die young cost nothing to free; Lexell frees each one when its owner i
 `fib` is ahead of both because a recursive function is inlined into itself one level, as C2 does
 (section 18).
 
-The added programs find the generated code's weak cases. Lexell does not vectorise loops: Java's
-JIT runs `matmul`'s inner loop with vector instructions (29 ms), and both Rust and Java are ahead
-on `nbody`'s floating point. Rust's `sort_by` is faster than Lexell's `sortBy` (an index merge
-sort, then a permutation) in `closures`, while Lexell is ahead of Java's `List.sort` there. The
-interpreter loop is 11 to 17% behind Rust's over the two runs and ahead of Java's pattern
-`switch`. A task switch is Lexell's own: a round trip of two hand-overs takes 91 ns, against
-Go's 175 ns over channels and 570 to 780 ns for Java's virtual threads.
+The added programs found the generated code's weak cases, and the first fixes are in
+(`lexell/design/opt-experiments.md`, sections 20 and 21: doubles computed in their registers,
+elements as SSE operands, element addresses kept across stores; one string comparison in
+`str.cmp`, a faster `sortBy`). `nbody` is within 4% of Java's time and 1.57 times Rust's: what
+remains is copies between the compiler's temporaries. Lexell does not vectorise loops: Java's
+JIT runs `matmul`'s inner loop with vector instructions (29 ms). Rust's `sort_by` is still ahead
+of `sortBy` in `closures`, which is ahead of Java's `List.sort`. The interpreter loop is 10 to
+16% behind Rust's over the two runs (a temporary of each arithmetic case kept in the frame) and
+ahead of Java's pattern `switch`. A task switch is Lexell's own: a round trip of two hand-overs
+takes 92 ns, against Go's 177 ns over channels and 630 to 690 ns for Java's virtual threads.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
 table holds them), in all three languages, with the same output. The gap to Rust is in the
