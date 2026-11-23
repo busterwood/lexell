@@ -134,6 +134,24 @@ smaller differences of its statement.
     exist.
   - `GRANT MAINTAIN` is accepted and not kept. Column privileges, `WITH GRANT OPTION`, `WITH ADMIN OPTION` and
     privileges on types are 0A000.
+- **SQL functions and procedures** (found writing the routine pages):
+  - **Wrong arithmetic in a procedure body:** in a `LANGUAGE sql` procedure, `1 + p / 100` with a numeric parameter
+    `p = 10` gives 1, as if the division were of integers, so `SET salary = salary * (1 + p / 100)` changes nothing.
+    The same expression in a function body or a query gives 1.1; `p / 100` alone is right.
+  - Overloads: with `add(int, int)` and `add(numeric, numeric)`, `SELECT add(2, 3)` calls the numeric one
+    (PostgreSQL: the integer one).
+  - A call's result column is named after its type or expression (`numeric`, `int4`, `?column?`), not after the
+    function.
+  - 0A000 or 42883 in a query: a function whose body reads tables given a column or subquery as an argument; a
+    function with several OUT parameters; a function whose body writes; a set-returning function in the select
+    list; named arguments (`CALL` takes them); calling a VARIADIC function.
+  - `ALTER FUNCTION` and `ALTER PROCEDURE` are 0A000 ("only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are
+    supported"); `SECURITY DEFINER` is accepted and ignored.
+- **Maintenance and statistics:** `pg_stats` does not exist (42P01) and `pg_class.reltuples` stays -1 after `ANALYZE`
+  (`pg_stat_user_tables.n_live_tup` is right). `REINDEX` and `CLUSTER` are checked and do nothing; `VACUUM` (and
+  `VACUUM FULL`) rewrites row-form leaves as column leaves and gives no space back.
+- **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
+  no answer for 120 s (not narrowed down).
 
 
 ## SQL Server door
