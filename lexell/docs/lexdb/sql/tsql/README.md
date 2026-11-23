@@ -40,17 +40,17 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| CREATE TABLE | `IDENTITY(s, i)`, computed columns, constraints, `#temp` tables. |
-| ALTER TABLE, DROP TABLE | |
-| CREATE INDEX, DROP INDEX | Unique, filtered, `INCLUDE`. |
-| CREATE VIEW, ALTER VIEW, CREATE OR ALTER VIEW, DROP VIEW | |
+| [CREATE TABLE](create-table.md) | `IDENTITY(s, i)`, computed columns, constraints, `#temp` tables. |
+| [ALTER TABLE](alter-table.md), [DROP TABLE](drop-table.md) | |
+| [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique, filtered, `INCLUDE`. |
+| [CREATE VIEW](create-view.md) (and `CREATE OR ALTER VIEW`), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | |
 | CREATE PROCEDURE, ALTER PROCEDURE, CREATE OR ALTER PROCEDURE, DROP PROCEDURE | Procedures with parameters, `OUTPUT` parameters and return codes. |
 | CREATE FUNCTION, ALTER FUNCTION, DROP FUNCTION | Scalar functions, inline and multi-statement table-valued functions. |
 | CREATE TYPE | Table types (for table-valued parameters). |
-| CREATE SEQUENCE, DROP SEQUENCE | `NEXT VALUE FOR`. |
+| [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXT VALUE FOR`. |
 | CREATE SCHEMA, DROP SCHEMA | |
 | ALTER DATABASE | `SET` options (most read and kept; `READ_ONLY`, `SINGLE_USER`, `OFFLINE` refused). |
-| sp_rename | Renames a table, column or index. |
+| [sp_rename](sp-rename.md) | Renames a table, column or index. |
 
 ### Batches and control of flow
 
