@@ -12,6 +12,12 @@ smaller differences of its statement.
   - Oracle door: `CREATE GLOBAL TEMPORARY TABLE` on a replica is ORA-16000, as on a standby, and DML on a global
     temporary table is not available there: Active Data Guard allows it for a table the primary defined, but in
     lexdb no such definition reaches a replica's session (see the Oracle door's entry below).
+- **Wrong arithmetic: an integer plus a decimal quotient of a variable gives an integer.** In the SQL Server door,
+  `DECLARE @p decimal(5,2) = 10; SELECT 1 + @p / 100` gives 1 (`@p / 100` alone gives 0.1000...), so `UPDATE t SET
+  salary = salary * (1 + @p / 100)` reports its rows and changes nothing. In the PostgreSQL door the same happens in
+  a `LANGUAGE sql` procedure body with a numeric parameter (`1 + p / 100` gives 1), while a function body or a query
+  gives 1.1. The two look like one bug in how a parameter's or variable's quotient is typed under `+`.
+
 
 ## PostgreSQL door
 
@@ -351,6 +357,20 @@ smaller differences of its statement.
   - `EXECUTE AS USER = 'dbo'` is 2812 (`Could not find stored procedure 'as'`); `EXEC ('...') AT linked` is 102;
     `GOTO` and `WAITFOR` are 102.
   - `GETDATE() - GETDATE()` is an interval (`00:00:00`); SQL Server gives a datetime (1900-01-01).
+- **Procedures, functions, types and schemas** (found writing those T-SQL pages):
+  - Multi-statement table-valued functions are made but cannot be read: `SELECT * FROM dbo.squares(4)` is 50000
+    ("not supported yet (an inline one is)").
+  - A table-valued parameter passed from a T-SQL batch fails: `DECLARE @l dbo.id_list; ... EXEC dbo.take_ids @ids =
+    @l` is 207 `Invalid column name '#tv_l'` (over RPC it works).
+  - A table type a procedure uses can be dropped (SQL Server: 3732); an index in a table type is 102.
+  - `CREATE PROCEDURE` takes a parameter of a type that does not exist; `WITH EXECUTE AS OWNER` is 102; `WITH
+    ENCRYPTION` is accepted.
+  - `EXEC @r = dbo.scalar_function` is 2812 (SQL Server allows it).
+  - `CREATE SCHEMA hr CREATE TABLE staff ...` makes `dbo.staff`, not `hr.staff`; `AUTHORIZATION dbo` is 50000;
+    `CREATE SCHEMA dbo` is accepted (SQL Server: 2714); an existing schema is 50000 (2714); `CREATE SCHEMA` need not
+    be first in its batch (111).
+  - `ALTER SCHEMA hr TRANSFER dbo.t` is 50000: an object cannot move to another schema.
+  - `DROP SCHEMA` of a schema with objects is 50000 (SQL Server: 3729), of a missing one 50000 (3701).
 
 
 ## Oracle door
