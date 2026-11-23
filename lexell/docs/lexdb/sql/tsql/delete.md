@@ -61,7 +61,7 @@ DELETE
 - A common table expression or a view cannot be the target: a CTE gives error 208, a view error 50000 ("cannot
   delete from view ... (lexdb's views are read-only)").
 - `WHERE CURRENT OF` is error 102: lexdb has no cursors. There are no triggers.
-- The text of many error messages is lexdb's (PostgreSQL's wording), with SQL Server's number and severity.
+- Most error messages are SQL Server's; those with number 50000 carry lexdb's text.
 
 ## Examples
 
@@ -235,7 +235,7 @@ GO
 
 ```text
 Msg 547, Level 16, State 1, Line 1
-update or delete on table "dept" violates foreign key constraint "emp_dept_id_fkey" on table "emp"
+The DELETE statement conflicted with the REFERENCE constraint "emp_dept_id_fkey". The conflict occurred in database "lexdb", table "dbo.emp", column 'dept_id'.
 the batch went on
 Msg 208, Level 16, State 1, Line 1
 Invalid object name 'percent'.
