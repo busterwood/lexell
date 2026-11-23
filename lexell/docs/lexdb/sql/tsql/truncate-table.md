@@ -27,7 +27,7 @@ TRUNCATE TABLE { database_name.schema_name.table_name | schema_name.table_name |
 
 - **The `IDENTITY` column is not reset to its seed.** The next row gets the next value after the last one made
   before the truncation (example B); SQL Server starts again at the seed.
-- A table a foreign key refers to gives error 50000 with lexdb's text (PostgreSQL's); SQL Server gives 4712.
+- A table a foreign key refers to gives error 50000 with lexdb's text; SQL Server gives 4712.
 - `WITH (PARTITIONS (...))` is error 102: lexdb has no partitions.
 - Several tables separated by commas are taken (PostgreSQL's form); SQL Server takes one.
 
@@ -122,7 +122,7 @@ GO
 ```
 
 ```text
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 3
 cannot truncate a table referenced in a foreign key constraint: Table "child" references "parent". Truncate table "child" at the same time, or use TRUNCATE ... CASCADE.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near '('.
