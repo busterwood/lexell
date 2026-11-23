@@ -283,7 +283,7 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'loop'.
+Incorrect syntax near 'LOOP'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'unpivot'.
 ```
