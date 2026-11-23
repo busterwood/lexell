@@ -25,9 +25,7 @@ PRINT msg_str | @local_variable | string_expr
 
 ## Differences from SQL Server
 
-- A message sent right after a `SET` or `DECLARE` statement, with no result or row count in between, does not reach
-  JDBC programs (mssql-jdbc): lexdb sends a `DONE` token for the `SET` or `DECLARE`, which SQL Server does not, and
-  the driver then misses the message. A `PRINT` that ends a batch after an error is missed the same way.
+- None known.
 
 ## Examples
 
@@ -70,6 +68,27 @@ n
 Hello, Ann
 
 after the empty line
+```
+
+### C. A message right after SET and DECLARE
+
+<!-- example: tsql -->
+```sql
+SET NOCOUNT ON;
+PRINT 'after SET';
+DECLARE @x int = 1;
+PRINT 'after DECLARE';
+SELECT @x AS x;
+```
+
+```text
+after SET
+after DECLARE
+x
+-
+1
+
+(1 row affected)
 ```
 
 ## See also
