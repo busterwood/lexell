@@ -116,9 +116,9 @@ GO
 ```text
 Msg 50000, Level 16, State 1, Line 1
 START value (1000) cannot be greater than MAXVALUE (100)
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 2
 START value (1000) cannot be greater than MAXVALUE (100)
-Msg 208, Level 16, State 1, Line 1
+Msg 208, Level 16, State 1, Line 3
 Invalid object name 'nothere'.
 ```
 
