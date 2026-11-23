@@ -179,8 +179,8 @@ GO
 ```text
 Msg 50000, Level 16, State 1, Line 1
 cannot update view "v_well_paid" (lexdb's views are read-only)
-Msg 2714, Level 16, State 1, Line 1
-relation "v_dept" already exists
+Msg 2714, Level 16, State 1, Line 2
+There is already an object named 'v_dept' in the database.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 Msg 50000, Level 16, State 1, Line 1
