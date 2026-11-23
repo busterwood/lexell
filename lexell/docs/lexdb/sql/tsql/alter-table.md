@@ -155,7 +155,7 @@ WHERE c.object_id = OBJECT_ID('dbo.emp') AND c.name IN ('name', 'salary');
 ```
 
 ```text
-Msg 5074, Level 16, State 1, Line 1
+Msg 5074, Level 16, State 1, Line 2
 The column 'yearly' is dependent on column 'salary'.
 name   type     max_length precision is_nullable
 ------ -------- ---------- --------- -----------
@@ -199,9 +199,9 @@ GO
 ```text
 Msg 5074, Level 16, State 1, Line 1
 The object 'fk_emp_dept' is dependent on column 'dept_id'.
-Msg 515, Level 16, State 1, Line 1
+Msg 515, Level 16, State 1, Line 2
 column "extra" of relation "emp" contains null values
-Msg 4902, Level 16, State 1, Line 1
+Msg 4902, Level 16, State 1, Line 3
 Cannot find the object "nothere" because it does not exist or you do not have permissions.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
@@ -221,7 +221,7 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'default'.
+Incorrect syntax near 'DEFAULT'.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA
 Msg 50000, Level 16, State 1, Line 1
