@@ -457,6 +457,12 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
                 append(mut &out, Tok{kind: T_VAR, text: strings.toLowerAscii(s[start..i]), at: start, spell: ""})
                 continue
             }
+            // ^: XOR, lexdb's # (PostgreSQL's ^ is a power)
+            if c == '^' {
+                i += 1
+                append(mut &out, Tok{kind: T_OP, text: "#", at: start, spell: "^"})
+                continue
+            }
             // $action: MERGE ... OUTPUT's
             if c == '$' && i + 7 <= n && strings.toLowerAscii(s[i + 1..i + 7]) == "action" && (i + 7 == n || !isIdentChar(s[i + 7])) {
                 i += 7
@@ -1216,11 +1222,11 @@ fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
     while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") || p.isKw("@>") ||
-          p.isKw("<@") || p.isKw("&&") || (p.tsql && p.isKw("^")) {
+          p.isKw("<@") || p.isKw("&&") {
         let op = p.next().text
         let r = try p.addExpr()
-        // the array operators (9.92) are calls
-        if p.tsql && (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+        // the array operators (9.92) are calls; T-SQL's ^ is # (XOR: its lexer)
+        if p.tsql && (op == "&" || op == "|" || op == "#" || op == "<<" || op == ">>") {
             e = tsqlBitOp(&op, e, r)
         } else {
             e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
@@ -1229,12 +1235,12 @@ fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     return Ok(e)
 }
 
-// T-SQL's & | ^ (XOR: lexdb's #) of two values, and << >> (SQL Server 2022: LEFT_SHIFT, RIGHT_SHIFT, as wide as the
-// value's type: #tbit_shl, lexdb_tsqlfn).
+// T-SQL's & | ^ (XOR, lexed as lexdb's #) of two values, and << >> (SQL Server 2022: LEFT_SHIFT, RIGHT_SHIFT, as wide as
+// the value's type: #tbit_shl, lexdb_tsqlfn).
 fn tsqlBitOp(op: &str, l: Expr, r: Expr): Expr {
     if op == "<<" { return Expr.Call("#tbit_shl", [l, r], false) }
     if op == ">>" { return Expr.Call("#tbit_shr", [l, r], false) }
-    return Expr.Bin(if op == "^" { "#" } else { op.toStr() }, bitInt(l), bitInt(r))
+    return Expr.Bin(op.toStr(), bitInt(l), bitInt(r))
 }
 
 // T-SQL's compound assignment, at its operator: +=, -=, *=, /=, %=, &=, |=, ^= and SQL Server 2025's ||= (S9); the
@@ -1243,7 +1249,7 @@ pub fn (p: mut &P) tsqlCompound(): str {
     let o = p.peek().clone()
     if o.kind != T_OP || p.peekAt(1).kind != T_OP || p.peekAt(1).text != "=" { return "" }
     if o.text == "+" || o.text == "-" || o.text == "*" || o.text == "/" || o.text == "%" || o.text == "&" || o.text == "|" ||
-       o.text == "^" || o.text == "||" {
+       o.text == "#" || o.text == "||" {
         p.pos += 2
         return o.text.clone()
     }
@@ -1253,7 +1259,7 @@ pub fn (p: mut &P) tsqlCompound(): str {
 // target op= e as target = target op e.
 pub fn tsqlAssign(op: &str, target: Expr, e: Expr): Expr {
     if op == "+" { return Expr.Bin("t+", target, e) }
-    if op == "&" || op == "|" || op == "^" { return tsqlBitOp(op, target, e) }
+    if op == "&" || op == "|" || op == "#" { return tsqlBitOp(op, target, e) }
     return Expr.Bin(op.toStr(), target, e)
 }
 
@@ -1318,7 +1324,7 @@ fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
 // x ^ y (9.92): above * and /, below a sign, left to right, as PostgreSQL's.
 fn (p: mut &P) powExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.atExpr()
-    while !p.tsql && p.isKw("^") {
+    while p.isKw("^") {
         p.pos += 1
         let r = try p.atExpr()
         e = Expr.Bin("^", e, r)
@@ -4039,26 +4045,100 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
-    // Oracle 26ai: INSERT INTO t SET c = v, (c, d) = (v, w), ...
-    if p.ora && p.isKw("set") { return p.oraInsertSet(s) }
     if p.isKw("(") && !p.parenQueryStart() {
         p.pos += 1
         append(mut &s.names, try p.name())
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
         try p.expectKw(")")
     }
-    // Oracle 26ai: INSERT INTO t [(cols)] BY NAME | BY POSITION query
-    if p.ora && p.isKw("by") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "name" || p.peekAt(1).text == "position") {
-        let byName = p.peekAt(1).text == "name"
-        p.pos += 2
-        if p.isKw("values") {
-            return Err(oraErr(63878, "BY NAME or POSITION are semantic modifiers of the subquery only and are not compatible with the VALUES clause."))
-        }
-        var r = try p.insert2(s)
-        if byName { try oraByName(mut &r) }
-        return Ok(r)
+    // Oracle 26ai: INSERT INTO t SET c = v, (c, d) = (v, w), ...; INSERT INTO t [(cols)] BY NAME | BY POSITION query
+    if p.ora && (p.isKw("set") || p.isKw("by")) {
+        if p.isKw("by") { return p.oraInsertBy(s) }
+        if len(s.names) > 0 { return Err(near(&p.peek())) }
+        return p.oraInsertSet(s)
     }
-    return p.insert2(s)
+    if p.tsql && p.acceptKw("output") {
+        // T-SQL: OUTPUT INSERTED.col, ... [INTO target [(columns)]]: RETURNING
+        var out: []SelItem = []
+        try p.outputList(mut &s, mut &out)
+        try tsqlDml(mut &s, out)
+    }
+    if p.acceptKw("overriding") {
+        if p.acceptKw("system") { s.overriding = OVR_SYSTEM } else {
+            try p.expectKw("user")
+            s.overriding = OVR_USER
+        }
+        try p.expectKw("value")
+    }
+    // INSERT ... SELECT: the query in inner[0], with its own subqueries
+    let paren = p.isKw("(") && p.parenQueryStart()
+    if paren || p.isKw("select") {
+        var q = lexdb_sql.newStmt(S_SELECT)
+        if paren { q = try p.parenSelect() } else {
+            p.pos += 1
+            q = try p.select()
+        }
+        q.subs = replace(mut &p.subs, [])
+        q.wins = replace(mut &p.wins, [])
+        q.params = p.params
+        append(mut &s.inner, q)
+        try p.onConflict(mut &s)
+        try p.oraNoReturning()
+        try p.returning(mut &s)
+        return Ok(s)
+    }
+    if p.acceptKw("default") {
+        // DEFAULT VALUES: one row, every column its default
+        try p.expectKw("values")
+        append(mut &s.rows, [])
+        try p.onConflict(mut &s)
+        try p.returning(mut &s)
+        return Ok(s)
+    }
+    if !p.acceptKw("values") {
+        // INSERT INTO t WITH ... SELECT (Oracle's and PostgreSQL's: a recursive CTE feeding an INSERT)
+        if !p.tsql && p.isKw("with") { return p.insertWith(s) }
+        return Err(near(&p.peek()))
+    }
+    while true {
+        try p.expectKw("(")
+        var row: []Expr = []
+        append(mut &row, try p.valueOrDefault())
+        while p.acceptKw(",") { append(mut &row, try p.valueOrDefault()) }
+        try p.expectKw(")")
+        append(mut &s.rows, row)
+        if !p.acceptKw(",") { break }
+    }
+    try p.onConflict(mut &s)
+    try p.returning(mut &s)
+    return Ok(s)
+}
+
+// Oracle 26ai's INSERT INTO t [(cols)] BY NAME | BY POSITION query, at BY.
+fn (p: mut &P) oraInsertBy(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    if !(p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "name" || p.peekAt(1).text == "position")) { return Err(near(&p.peek())) }
+    let byName = p.peekAt(1).text == "name"
+    p.pos += 2
+    if p.isKw("values") {
+        return Err(oraErr(63878, "BY NAME or POSITION are semantic modifiers of the subquery only and are not compatible with the VALUES clause."))
+    }
+    if p.isKw("with") {
+        s = try p.insertWith(s)
+    } else {
+        var q2 = lexdb_sql.newStmt(S_SELECT)
+        if p.isKw("(") { q2 = try p.parenSelect() } else {
+            try p.expectKw("select")
+            q2 = try p.select()
+        }
+        q2.subs = replace(mut &p.subs, [])
+        q2.wins = replace(mut &p.wins, [])
+        q2.params = p.params
+        append(mut &s.inner, q2)
+        try p.oraNoReturning()
+    }
+    if byName { try oraByName(mut &s) }
+    return Ok(s)
 }
 
 // Oracle 26ai's INSERT ... BY NAME: the query's column names (its first SELECT's) are the columns written, in its order;
@@ -4152,65 +4232,6 @@ fn (p: mut &P) oraInsertSet(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     return Ok(s)
 }
 
-// INSERT after its table and columns: OVERRIDING, then the query, DEFAULT VALUES or VALUES, ON CONFLICT, RETURNING.
-fn (p: mut &P) insert2(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
-    var s = s0
-    if p.tsql && p.acceptKw("output") {
-        // T-SQL: OUTPUT INSERTED.col, ... [INTO target [(columns)]]: RETURNING
-        var out: []SelItem = []
-        try p.outputList(mut &s, mut &out)
-        try tsqlDml(mut &s, out)
-    }
-    if p.acceptKw("overriding") {
-        if p.acceptKw("system") { s.overriding = OVR_SYSTEM } else {
-            try p.expectKw("user")
-            s.overriding = OVR_USER
-        }
-        try p.expectKw("value")
-    }
-    // INSERT ... SELECT: the query in inner[0], with its own subqueries
-    let paren = p.isKw("(") && p.parenQueryStart()
-    if paren || p.isKw("select") {
-        var q = lexdb_sql.newStmt(S_SELECT)
-        if paren { q = try p.parenSelect() } else {
-            p.pos += 1
-            q = try p.select()
-        }
-        q.subs = replace(mut &p.subs, [])
-        q.wins = replace(mut &p.wins, [])
-        q.params = p.params
-        append(mut &s.inner, q)
-        try p.onConflict(mut &s)
-        try p.oraNoReturning()
-        try p.returning(mut &s)
-        return Ok(s)
-    }
-    if p.acceptKw("default") {
-        // DEFAULT VALUES: one row, every column its default
-        try p.expectKw("values")
-        append(mut &s.rows, [])
-        try p.onConflict(mut &s)
-        try p.returning(mut &s)
-        return Ok(s)
-    }
-    if !p.acceptKw("values") {
-        // INSERT INTO t WITH ... SELECT (Oracle's and PostgreSQL's: a recursive CTE feeding an INSERT)
-        if !p.tsql && p.isKw("with") { return p.insertWith(s) }
-        return Err(near(&p.peek()))
-    }
-    while true {
-        try p.expectKw("(")
-        var row: []Expr = []
-        append(mut &row, try p.valueOrDefault())
-        while p.acceptKw(",") { append(mut &row, try p.valueOrDefault()) }
-        try p.expectKw(")")
-        append(mut &s.rows, row)
-        if !p.acceptKw(",") { break }
-    }
-    try p.onConflict(mut &s)
-    try p.returning(mut &s)
-    return Ok(s)
-}
 
 // INSERT's query that starts WITH, at WITH: the query in inner[0], its CTEs in scope.
 fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
@@ -4285,9 +4306,10 @@ fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         } else {
             var c = try p.name()
             if (p.tsql || p.ora) && p.acceptKw(".") { c = try p.name() }      // T-SQL, Oracle: SET t.col = (the target's)
-            let op = if p.tsql { p.tsqlCompound() } else { "" }
-            if len(op) > 0 {
+            if p.tsql && !p.isKw("=") {
                 // T-SQL: SET c += e and the like
+                let op = p.tsqlCompound()
+                if len(op) == 0 { return Err(near(&p.peek())) }
                 let v = try p.expr()
                 append(mut &s.sets, SetItem{col: c.clone(), expr: tsqlAssign(&op, Expr.Col(c.clone(), -1), v)})
             } else {
@@ -4848,7 +4870,12 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
 // RETURNING items, after INSERT, UPDATE, DELETE or MERGE (9.44); the old and new rows (lexdb_oldnew): PostgreSQL 18's
 // [WITH (OLD AS o, NEW AS n)] old.c, new.*, Oracle 23ai's OLD c, NEW c.
 fn (p: mut &P) returning(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
-    if !p.acceptKw("returning") { return Ok(Unit{}) }
+    if p.acceptKw("returning") { try p.returningList(s) }
+    return Ok(Unit{})
+}
+
+// RETURNING's list, after RETURNING.
+fn (p: mut &P) returningList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     if p.tsql { return p.itemList(mut &s.items) }
     // the name the target's columns are bound by (an INSERT's alias too: lexdb_exec.insFrom)
     let q = if len(s.alias) > 0 { s.alias.toStr() } else { lexdb_sql.baseName(&s.table) }

@@ -6364,7 +6364,6 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var ret = try retOf(s, &q, mut &sc)
     var up = try upsertOf(s, &t, mut &sc)
     up.idBump = ovr == lexdb_sql.OVR_TSQL
-    if up.mode == lexdb_sql.CONFLICT_UPDATE && ret.on { for x in ret.exprs { if lexdb_oldnew.has(&x) { up.retOld = true } } }
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
@@ -6433,20 +6432,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
                 else { try insertRows(st, txn, &t, &targets, &s.rows, &env, ovr, ret.on, mut &kept, mut &up) }
     }
-    if up.retOld {
-        // RETURNING old.c under DO UPDATE: a row updated kept with the row it was (upsertOld), one inserted with NULLs
-        let n = len(t.cols)
-        let nulls: []Val = array(n, Val.Null)
-        for row in kept {
-            if len(row) > n {
-                var was: []Val = []
-                for k in n..len(row) { append(mut &was, row[k].clone()) }
-                try retAddOld(st, txn, &q, &m, params, mut &ret, &rowPrefix(&row, n), &was, mut &rs)
-            } else { try retAddOld(st, txn, &q, &m, params, mut &ret, &row, &nulls, mut &rs) }
-        }
-    } else {
-        for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
-    }
+    if len(kept) > 0 { try keptRet(st, txn, s, &q, &m, params, mut &ret, &kept, len(t.cols), mut &rs) }
     // IDENTITY_INSERT: an identity given a value past its own goes on from there
     for j in 0..len(up.idCols) {
         let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
@@ -6455,6 +6441,25 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
     }
     return Ok(retRes(ret, &("INSERT 0 " + count.toStr())))
+}
+
+// An INSERT's RETURNING rows, of the rows it kept: under ON CONFLICT DO UPDATE a row updated is kept followed by the row
+// it was (upsertOld), its old row (RETURNING old.c), one inserted has NULLs there.
+fn keptRet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, m: &Mats, params: &[]Val, ret: mut &Ret,
+           kept: &[][]Val, n: int, rs: mut &Run): Result[Unit, DbErr] {
+    if s.conflict != lexdb_sql.CONFLICT_UPDATE {
+        for row in kept { try retAdd(st, txn, q, m, params, ret, &row, rs) }
+        return Ok(Unit{})
+    }
+    let nulls: []Val = array(n, Val.Null)
+    for row in kept {
+        if len(row) > n {
+            var was: []Val = []
+            for k in n..len(row) { append(mut &was, row[k].clone()) }
+            try retAddOld(st, txn, q, m, params, ret, &rowPrefix(&row, n), &was, rs)
+        } else { try retAddOld(st, txn, q, m, params, ret, &row, &nulls, rs) }
+    }
+    return Ok(Unit{})
 }
 
 // The most an INSERT ... SELECT holds of the rows it reads ahead, in bytes.
@@ -6808,14 +6813,13 @@ type Upsert = record {
     // and until the first chunk
     fk: lexdb_fkprobe.Probes
     md: int                     // the statement's dialect (lexdb_sql.MD_*), for the errors of a generated column given a value
-    retOld: bool                // RETURNING reads the old row (old.c): a row updated is kept followed by the row it was
 }
 
 const ROWID_RUN: int = 1024
 
 fn noUpsert(): Upsert {
     return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
-                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG, retOld: false}
+                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -6925,7 +6929,8 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &next, &txn.sql.zone) }
     try updRow(st, txn, t, old, &next, fw, later)
     up.touched.put(keyOf(t, &next), 1)
-    if up.retOld { for v in old { append(mut &next, v.clone()) } }
+    // (followed by the row it was, for RETURNING old.c: keptRet; the row written is next's first columns)
+    for v in old { append(mut &next, v.clone()) }
     return Ok(Some(next))
 }
 
