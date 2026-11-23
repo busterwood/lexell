@@ -72,8 +72,8 @@ The connection pages say how each door logs in and which clients are known to wo
 | `--require-tls` | off | Refuse TCP logins that do not use TLS (Unix socket logins are not affected). |
 
 Under `trust` there are no passwords: keep TCP listeners on loopback, and the socket directory readable only by its
-users. A role's password is set with `CREATE ROLE ... PASSWORD` (PostgreSQL door), `CREATE LOGIN` / `CREATE USER`
-(SQL Server door) or `CREATE USER ... IDENTIFIED BY` (Oracle door). See [security](security.md).
+users. A role's password is set with `CREATE ROLE ... PASSWORD` (PostgreSQL door), `CREATE ROLE ... LOGIN PASSWORD`
+(SQL Server door, which has no `CREATE LOGIN`) or `CREATE USER ... IDENTIFIED BY` (Oracle door). See [security](security.md).
 
 ## Replicas
 
