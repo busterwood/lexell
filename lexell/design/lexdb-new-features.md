@@ -132,7 +132,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | missing | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
-| O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | wrong error | S: refuse it when `p.ora` in `lexdb_parse.isTail`; but users may rely on the extension: the user's call | PostgreSQL, T-SQL 2022 | lexdb_parse |
+| O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
 | O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | PostgreSQL's values; ORA-01428 for an offset or n below 1 | as Oracle, both spellings; ORA-30484, 01428 (was ORA-00900); not NTH_VALUE's FROM FIRST / FROM LAST (10.4) | works (4e1cf747) | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
 | O26 | `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [NO]VALIDATE` | | ORA-00900 | missing | (P6) | PostgreSQL NOT ENFORCED, T-SQL NOCHECK | |
 | O27 | `UNISTR('\00e9')` | NVARCHAR2 | as Oracle (ORA-30186) (was ORA-00904) | works (f8c07339) | (S16) | PostgreSQL, T-SQL 2025 (works) | lexdb_newfn |
@@ -151,7 +151,7 @@ the rows.
 |---|---|---|---|---|---|
 | PostgreSQL 19/18 (and older met on the way) | 18 (P1, P2, P4, P5, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 9 (P3, P6, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
 | SQL Server 2025/2022 | 22 (S1-S9, S12-S21, S23-S25) | 0 | 0 | 4 (S10, S11, S20's STRING_SPLIT, S22) | 26 / 25, and S26 (note) |
-| Oracle 26ai/23ai | 21 (O2-O10, O12-O20 but O17's CHECKSUM, O25, O27, O28) | 1 (O5's literal type) | 1 (O24) | 9 (O1, O11, O17's CHECKSUM, O21-O23, O26, O29, O30) | 32 / 30 |
+| Oracle 26ai/23ai | 22 (O2-O10, O12-O20 but O17's CHECKSUM, O24 as an extension, O25, O27, O28) | 1 (O5's literal type) | 0 | 9 (O1, O11, O17's CHECKSUM, O21-O23, O26, O29, O30) | 32 / 30 |
 
 Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26. After
 section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26. After section 8,
@@ -177,7 +177,10 @@ Left out of the test because lexdb answers otherwise (recorded here, not fixed: 
   (`WHERE a = 'x'` is 195 in lexdb; `WHERE a = dt`, int against date, gives no rows and no error): the door's
   comparison of mixed types, not this predicate.
 
-The Oracle door has no test: Oracle 26ai has no IS DISTINCT FROM (O24).
+Oracle 26ai has no IS DISTINCT FROM (O24), but the user decided (2026-11-23) that the Oracle door keeps it as lexdb's
+extension. Its test, tns_distinct, pairs each query with its Oracle equivalent through DECODE (two NULLs equal), with
+Oracle's '' as NULL, over numbers, texts and dates, in WHERE, CASE, NOT, a join and an UPDATE; it is not in
+gen_oracle.py's CHECKED, as Oracle refuses the first of each pair.
 
 ## 6. A proposed order
 
@@ -274,8 +277,7 @@ containers above), batches on and off.
 
 ### 6.4 Not to do without the user
 
-O24 (refusing IS DISTINCT FROM in the Oracle door, which lexdb accepts today) changes what existing users of the door
-may run; the rule says refuse, the user decides.
+O24 is decided (2026-11-23): the user wants IS DISTINCT FROM in the Oracle door too, so it stays, as lexdb's extension.
 
 ## 7. The wrong answers and wrong errors fixed (as built)
 
@@ -373,7 +375,7 @@ fields of the parser (two empty arrays there cost 122 instructions a parse).
 - Met while testing, not changed: PostgreSQL's select-list `generate_series(...)` is 42883 in lexdb (now when bound);
   T-SQL `0x1F` in a select list is an int (31) where SQL Server's is a varbinary (lexdb's reading for arithmetic,
   lexdb-tds.md 13); T-SQL CHAR(0) gives NULL (SQL Server a NUL character).
-- O24 (refusing IS DISTINCT FROM in the Oracle door) stays the user's call.
+- O24: decided later (2026-11-23): kept in the Oracle door as an extension (6.4).
 
 ## 8. The cheap missing statement forms (as built)
 
