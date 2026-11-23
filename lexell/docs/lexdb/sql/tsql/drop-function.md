@@ -58,7 +58,7 @@ DROP FUNCTION dbo.nothere;
 ```
 
 ```text
-Msg 3701, Level 16, State 1, Line 1
+Msg 3701, Level 11, State 1, Line 1
 Cannot drop the function 'dbo.nothere', because it does not exist or you do not have permission.
 ```
 
