@@ -139,7 +139,7 @@ GO
 
 ```text
 Msg 2714, Level 16, State 1, Line 1
-relation "yearly" already exists
+There is already an object named 'yearly' in the database.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'int'.
 ```
