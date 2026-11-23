@@ -24,6 +24,34 @@ smaller differences of its statement.
 - **`inet_server_port()`** and the other `inet_*` functions do not exist (42883).
 - **No PL/pgSQL and no `DO`.** Functions and procedures are `LANGUAGE sql` only; another language is 42704
   (`language "plpgsql" does not exist`), and `DO` is a syntax error.
+- **Queries** (found writing the SELECT pages):
+  - `FROM ONLY t` is `relation "only" does not exist`, and `MERGE INTO ONLY t` a syntax error (`UPDATE ONLY` and
+    `DELETE FROM ONLY` work).
+  - In a `FULL JOIN ... USING (k)`, a select-list `k` is named `coalesce` (PostgreSQL: `k`; `SELECT *` is right).
+  - `ON` after a comma join is not scoped: `FROM a, b JOIN c ON c.x = a.k` is accepted (PostgreSQL: 42P01).
+  - Syntax errors (42601) where PostgreSQL has a feature: `ORDER BY x USING >`, `TABLESAMPLE`, `TABLE t`,
+    `SELECT;` and `SELECT FROM t`, `ROWS FROM (...)`, column definition lists (`AS g(a int)`),
+    `mode() WITHIN GROUP (...)`, PostgreSQL 19's `GROUP BY ALL` without elements.
+  - A subquery in `LIMIT` is 0A000.
+  - `FOR UPDATE` with `FETCH ... WITH TIES` is 0A000.
+  - `json_agg`, `corr`, `regr_slope`, `covar_pop` and the other statistics aggregates do not exist (42883).
+  - `VALUES (1), (true)` gives 42804 with a vaguer message than PostgreSQL's (`VALUES types integer and boolean
+    cannot be matched`).
+- **WITH:**
+  - `LIMIT` does not stop a recursive query: `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r)
+    SELECT * FROM r LIMIT 3` runs to 54001 after `max_recursion` rounds (PostgreSQL returns 3 rows).
+  - The recursive term's checks are missing: an aggregate, a window function, `ORDER BY`, or the CTE on the nullable
+    side of an outer join is not refused (PostgreSQL: 42P19 or 0A000), and the query runs to 54001.
+  - Under `RECURSIVE` a CTE cannot name a later one (`relation "a2" does not exist`).
+  - Data-modifying CTEs (`WITH d AS (DELETE ... RETURNING *) ...`) are a syntax error (lexdb-gaps.md 2.2).
+  - `WITH ... VALUES` is refused; the message (`WITH must be followed by SELECT, INSERT, UPDATE or DELETE`) also
+    leaves out MERGE, which works.
+- **UPDATE:** `SET (a, b) = (SELECT ...)` is a syntax error.
+- **SELECT ... WAIT:** the refusals still say `lexdb: WAITFOR ...` (the clause is `WAIT n SECONDS`), and the clause
+  is taken only by a statement that starts with `SELECT`, not after `WITH`.
+- **TRUNCATE:** the foreign key refusal carries its DETAIL and HINT in the message text, and `TRUNCATE ... CASCADE`
+  gives no NOTICE naming the tables it adds.
+
 
 ## SQL Server door
 
