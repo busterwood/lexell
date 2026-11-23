@@ -6,7 +6,7 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 **In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
 
-[Performance](#performance) · [Quick start](#quick-start) · [Why I built Lexell](#why-i-built-lexell) · [Documentation](#documentation)
+[Performance](#performance) · [Quick start](#quick-start) · [LexDB](#lexdb) · [Why I built Lexell](#why-i-built-lexell) · [Documentation](#documentation)
 
 ## Performance
 
@@ -47,6 +47,12 @@ printf '%s\n' '{"order":{"total":24.49}}' | ./lexell-jq '.order.total'
 
 This also prints `24.49`. The repository includes [other command-line tools, a Redis CLI and an HTTP server](lexell/cmd/README.md).
 
+## LexDB
+
+LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It keeps its data on disk and speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
+
+For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
+
 ## Why I built Lexell
 
 I’ve been writing software professionally since the 1990s. I remember how fast Turbo Pascal felt. I followed Niklaus Wirth’s work from Pascal to Oberon because I admired his insistence on simplicity. Years later, Rust got me interested in checked ownership, though on my laptop the toolchain felt larger and slower than I wanted. Then I came across [group borrowing](https://verdagon.dev/blog/valen-group-borrowing) on Hacker News. I wondered whether I could get that quick edit–compile–run loop back in a language with braces, a small compiler and borrow checking without lifetime annotations.
@@ -79,6 +85,7 @@ See the [database streaming design](lexell/design/db-streaming.md) for an exampl
 | [Programs and examples](lexell/cmd/README.md) | How to build and run the programs, with supported behaviour and test instructions. |
 | [Database streaming](lexell/design/db-streaming.md) | How typed row mapping and bounded batches work. |
 | [Concurrency](lexell/design/concurrency.md) | Tasks, the event loop and worker processes. |
+| [LexDB](lexell/cmd/README.md#lexdb) and [its design](lexell/design/lexdb.md) | Running the database server, and how it works. |
 | [Performance](PERFORMANCE.md) and [native versus C](lexell/design/native-vs-c.md) | Measurements, caveats and the two backends. |
 | [Repository guide](lexell/README.md) and [project history](HISTORY.md) | The source tree, test suites and how the project evolved. |
 
