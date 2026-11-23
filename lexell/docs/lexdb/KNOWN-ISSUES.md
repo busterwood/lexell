@@ -333,6 +333,24 @@ smaller differences of its statement.
   - `BEGIN TRANSACTION ... WITH MARK` and `BEGIN DISTRIBUTED TRANSACTION` are 102; cursors (`DECLARE @c CURSOR`,
     `DECLARE c CURSOR FOR`) are 50000 and 102.
   - With `XACT_ABORT ON`, a failed `UPDATE` inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
+- **Control of flow** (found writing those T-SQL pages):
+  - **`RAISERROR('fatal', 20, 1)` hangs the session**: it never answers again. SQL Server ends the connection (and
+    wants `WITH LOG` above severity 18). lexdb treats severities up to 19 as 16.
+  - **A stale `CATCH` after a rethrow:** after a batch whose inner `CATCH` prints `ERROR_MESSAGE()` and rethrows with
+    `THROW`, a later batch's `BEGIN TRY SELECT * FROM dbo.nothere; END TRY BEGIN CATCH ... END CATCH` gives Msg 208
+    and then runs its `CATCH` with the old error (50000, 'inner failure'). Without the earlier batch, 208 ends the
+    batch and the `CATCH` does not run (try-catch.md, example G).
+  - A failed statement inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
+  - A `PRINT` that ends a batch right after a `RAISERROR` or `THROW` error is not seen by JDBC programs (with a
+    `SELECT` after it, it is).
+  - `BREAK` or `CONTINUE` outside a loop is accepted (SQL Server: 135).
+  - `RAISERROR` reads and ignores a placeholder's width, precision and flags (`%5d`, `%-6s`); `%o` prints decimal;
+    `RAISERROR(50005, 16, 1)` gives Msg 50000 with the text "50005" (no `sys.messages`); `WITH LOG`, `NOWAIT` and
+    `SETERROR` do nothing.
+  - `THROW 49999, 'too low', 1` is accepted (SQL Server: 35100).
+  - `EXECUTE AS USER = 'dbo'` is 2812 (`Could not find stored procedure 'as'`); `EXEC ('...') AT linked` is 102;
+    `GOTO` and `WAITFOR` are 102.
+  - `GETDATE() - GETDATE()` is an interval (`00:00:00`); SQL Server gives a datetime (1900-01-01).
 
 
 ## Oracle door
