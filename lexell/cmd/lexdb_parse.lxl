@@ -8145,7 +8145,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
 // TRY ... CATCH, procedures). Every other statement, and every expression
 // and type name, is lexdb's grammar here, read in T-SQL mode.
 
-pub type Parser = record { p: P }
+pub type Parser = record { p: P; lnAt: int; lnN: int }   // lnAt, lnN: lineOf's place so far, and the line there
 
 // A parser over sql read as T-SQL; vars: the variables in scope at its
 // start ($1, $2, ... in that order).
@@ -8155,7 +8155,7 @@ pub fn tsqlParser(sql: &str, d: Dialect, vars: &[]str): Result[Parser, lexdb_bas
     let toks = try lexIn(sql, dt)
     var given: []str = []
     for v in vars { append(mut &given, v.clone()) }
-    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0, udf: false}})
+    return Ok(Parser{p: P{toks: toks, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: true, vars: given, spelled: "", ora: false, rnLimit: -1, nls: [], mr: 0, udf: false}, lnAt: 0, lnN: 1})
 }
 
 pub fn (q: &Parser) peek(): &Tok { return q.p.peek() }
@@ -8174,6 +8174,43 @@ pub fn (q: &Parser) unexpected(): lexdb_base.DbErr { return near(&q.p.peek()) }
 // Starts a statement: the state gathered per statement (parameters,
 // subqueries, ...) cleared.
 pub fn (q: mut &Parser) fresh() { q.p.fresh() }
+
+// The line (from 1) of the text at byte at: the newlines before it, counted on from the last place asked (a batch's
+// statements are asked in order), SQL Server's line of an error (design/lexdb-tds.md, "As built: error texts and lines").
+pub fn (q: mut &Parser) lineOf(at: int): int {
+    if at < q.lnAt {
+        q.lnAt = 0
+        q.lnN = 1
+    }
+    let end = min(at, len(q.p.src))
+    var n = q.lnN
+    for i in q.lnAt..end { if q.p.src[i] == '\n' { n += 1 } }
+    q.lnAt = end
+    q.lnN = n
+    return n
+}
+
+// The last token before the end of the text (SQL Server's 102 at the end of a statement names it, at its line): its
+// text as written ("" none), and where it is.
+pub fn (q: &Parser) lastText(): str {
+    let n = len(q.p.toks)
+    if n < 2 { return "" }
+    return q.spelled(&q.p.toks[n - 2])
+}
+
+pub fn (q: &Parser) lastAt(): int {
+    let n = len(q.p.toks)
+    return if n < 2 { 0 } else { q.p.toks[n - 2].at }
+}
+
+// A token's text as the source has it (a keyword's or name's case kept).
+pub fn (q: &Parser) spelled(t: &Tok): str {
+    if len(t.spell) > 0 { return t.spell.clone() }
+    let end = min(len(q.p.src), t.at + max(len(t.text), 1))
+    if t.at < 0 || t.at >= end { return t.text.clone() }
+    let w = q.p.src[t.at..end].toStr()
+    return if strings.toLowerAscii(&w) == t.text { w } else { t.text.clone() }
+}
 
 pub fn (q: mut &Parser) expr(): Result[Expr, lexdb_base.DbErr] { return q.p.expr() }
 pub fn (q: mut &Parser) compound(): str { return q.p.tsqlCompound() }

@@ -1,0 +1,216 @@
+// lexdb: SQL Server's texts for the errors lexdb finds in the T-SQL door
+// (design/lexdb-tds.md, "As built: error texts and lines"). lexdb's errors
+// carry PostgreSQL's words; the door gives the common ones as SQL Server
+// says them, checked on SQL Server 2022: 2714, 2627 and 2601, 515, 547
+// (CHECK, FOREIGN KEY, REFERENCE), 3701, 195, 245, 241, 512. What they name
+// (the table, the key's kind, the columns) is read from the failing
+// statement and the catalog. Only the error path comes here.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_exec"
+import "./lexdb_catalog"
+
+type DbErr = lexdb_base.DbErr
+
+// The database SQL Server's texts name.
+const DB = "lexdb"
+
+fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+
+// The text between the k-th pair of double quotes of msg ("" none).
+fn quoted(msg: &str, k: int): str {
+    var at = 0
+    var i = 0
+    while true {
+        let a = strings.indexOf(msg, "\"", at)
+        if a < 0 { return "" }
+        let b = strings.indexOf(msg, "\"", a + 1)
+        if b < 0 { return "" }
+        if i == k { return msg[a + 1..b].toStr() }
+        at = b + 1
+        i += 1
+    }
+    return ""
+}
+
+// A table as SQL Server's texts name it: its schema (dbo for public) and name.
+fn objName(key: &str): str {
+    let sc = lexdb_sql.schemaOf(key)
+    return (if len(sc) == 0 || sc == "public" { "dbo" } else { sc.toStr() }) + "." + lexdb_sql.baseName(key)
+}
+
+// The values of a key in a DETAIL ("Key (a, b)=(1, 2) already exists."): "1, 2".
+fn keyValues(detail: &str): str {
+    let eq = strings.indexOf(detail, ")=(", 0)
+    if eq < 0 { return "" }
+    let close = strings.lastIndexOf(detail, ")")
+    if close <= eq + 3 { return "" }
+    return detail[eq + 3..close].toStr()
+}
+
+fn stmtWord(kind: int): str {
+    if kind == lexdb_sql.S_UPDATE { return "UPDATE" }
+    if kind == lexdb_sql.S_DELETE { return "DELETE" }
+    if kind == lexdb_sql.S_MERGE { return "MERGE" }
+    return "INSERT"
+}
+
+// SQL Server's error for e, an error statement s gave in the T-SQL door, where its text differs: a T-SQL error ("TS"
+// state, the number SQL Server gives); else e.
+pub fn translate(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, e: &DbErr): DbErr {
+    let st = &e.state
+    let m = &e.msg
+    if (st == "42P07" || st == "42710") && strings.endsWith(m, "already exists") && len(quoted(m, 0)) > 0 {
+        return tsErr(2714, &("There is already an object named '" + quoted(m, 0) + "' in the database."))
+    }
+    if st == "23505" && strings.startsWith(m, "duplicate key value violates unique constraint \"") { return dupKey(sess, s, e) }
+    if st == "23502" && strings.startsWith(m, "null value in column \"") {
+        // (SQL Server's MERGE says UPDATE fails, whichever action it was)
+        let verb = if s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_MERGE { "UPDATE" } else { "INSERT" }
+        return tsErr(515, &("Cannot insert the value NULL into column '" + quoted(m, 0) + "', table '" + DB + "." + objName(&tableKey(sess, &quoted(m, 1))) +
+                            "'; column does not allow nulls. " + verb + " fails."))
+    }
+    if st == "23514" && strings.startsWith(m, "new row for relation \"") { return checkErr(sess, s, e) }
+    if st == "23503" { return fkErr(sess, s, e) }
+    if st == "42P01" && (s.kind == lexdb_sql.S_DROP || s.kind == lexdb_sql.S_DROP_VIEW) && (strings.startsWith(m, "table \"") || strings.startsWith(m, "view \"")) {
+        let what = if strings.startsWith(m, "view") { "view" } else { "table" }
+        return tsErr(3701, &("Cannot drop the " + what + " '" + quoted(m, 0) + "', because it does not exist or you do not have permission."))
+    }
+    if st == "42883" && strings.startsWith(m, "function ") && strings.contains(m, " does not exist") && !strings.contains(m, ".") {
+        let rest = m[9..len(m)]
+        let sp = strings.indexOf(&rest, " ", 0)
+        let name = if sp > 0 { rest[0..sp].toStr() } else { rest.toStr() }
+        return tsErr(195, &("'" + name + "' is not a recognized built-in function name."))
+    }
+    if st == "22P02" && strings.startsWith(m, "invalid input syntax for type ") { return convErr(e) }
+    if (st == "22007" || st == "22008") && strings.startsWith(m, "invalid input syntax for type ") {
+        return tsErr(241, "Conversion failed when converting date and/or time from character string.")
+    }
+    if st == "21000" && strings.startsWith(m, "more than one row returned by a subquery") {
+        return tsErr(512, "Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.")
+    }
+    return e.clone()
+}
+
+// A text that does not read as the type (22P02): 245 for int, smallint and bit (the value named), 8114 for bigint, the
+// numerics and floats, 8169 for uniqueidentifier, as SQL Server's; another type as it was.
+fn convErr(e: &DbErr): DbErr {
+    let m = &e.msg
+    let rest = m[30..len(m)]
+    let colon = strings.indexOf(&rest, ":", 0)
+    if colon < 0 { return e.clone() }
+    let ty = rest[0..colon].toStr()
+    let v = quoted(m, 0)
+    if ty == "integer" || ty == "smallint" || ty == "boolean" {
+        let name = if ty == "integer" { "int" } else if ty == "boolean" { "bit" } else { "smallint" }
+        return tsErr(245, &("Conversion failed when converting the varchar value '" + v + "' to data type " + name + "."))
+    }
+    if ty == "bigint" || ty == "numeric" || ty == "double precision" || ty == "real" {
+        return tsErr(8114, &("Error converting data type varchar to " + (if ty == "double precision" { "float" } else { ty.clone() }) + "."))
+    }
+    if ty == "uuid" { return tsErr(8169, "Conversion failed when converting from a character string to uniqueidentifier.") }
+    return e.clone()
+}
+
+// The catalog key of the table named base: the statement's target when it is that table, else as the path finds it.
+fn tableKey(sess: mut &lexdb_exec.Session, base: &str): str {
+    match sess.tableInfo(base) {
+        Ok(t) { return t.name.clone() }
+        Err(_) { return base.toStr() }
+    }
+}
+
+// 2627 (a PRIMARY KEY or UNIQUE constraint's) or 2601 (a unique index's): the statement's table, the duplicate values.
+fn dupKey(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, e: &DbErr): DbErr {
+    let con = quoted(&e.msg, 0)
+    let vals = keyValues(&e.detail)
+    let dup = if len(e.detail) > 0 { " The duplicate key value is (" + vals + ")." } else { "" }
+    var kind = if strings.endsWith(&con, "_pkey") { "PRIMARY KEY" } else { "UNIQUE KEY" }
+    var obj = lexdb_sql.baseName(&s.table).toStr()
+    if len(s.table) > 0 {
+        match sess.tableInfo(&s.table) {
+            Ok(t) {
+                obj = objName(&t.name)
+                if lexdb_catalog.pkConName(&t) == con { kind = "PRIMARY KEY" } else {
+                    for ix in t.indexes {
+                        if lexdb_sql.baseName(&ix.name) == con {
+                            if !ix.con {
+                                return tsErr(2601, &("Cannot insert duplicate key row in object '" + obj + "' with unique index '" + con + "'." + dup))
+                            }
+                            kind = "UNIQUE KEY"
+                        }
+                    }
+                }
+            }
+            Err(_) { obj = "dbo." + obj }
+        }
+    }
+    return tsErr(2627, &("Violation of " + kind + " constraint '" + con + "'. Cannot insert duplicate key in object '" + obj + "'." + dup))
+}
+
+// 547 for a CHECK constraint: the table, and its column when the check reads one.
+fn checkErr(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, e: &DbErr): DbErr {
+    let rel = quoted(&e.msg, 0)
+    let con = quoted(&e.msg, 1)
+    var obj = "dbo." + rel
+    var col = ""
+    match sess.tableInfo(&rel) {
+        Ok(t) {
+            obj = objName(&t.name)
+            for c in t.checks {
+                if c.name == con {
+                    var names: []str = []
+                    lexdb_sql.colNames(&c.expr, mut &names)
+                    var one = len(names) > 0
+                    for n in names { if n != names[0] { one = false } }
+                    if one { col = ", column '" + names[0] + "'" }
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return tsErr(547, &("The " + stmtWord(s.kind) + " statement conflicted with the CHECK constraint \"" + con + "\". The conflict occurred in database \"" +
+                        DB + "\", table \"" + obj + "\"" + col + "."))
+}
+
+// 547 for a FOREIGN KEY: a row whose key is not there (the referenced table and column), or a row still referenced (the
+// REFERENCE constraint: the referencing table and column).
+fn fkErr(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, e: &DbErr): DbErr {
+    let m = &e.msg
+    let verb = stmtWord(s.kind)
+    if strings.startsWith(m, "insert or update on table \"") {
+        let child = quoted(m, 0)
+        let con = quoted(m, 1)
+        match sess.tableInfo(&child) {
+            Ok(t) {
+                for f in t.fks {
+                    if f.name == con {
+                        let col = if len(f.refCols) == 1 { ", column '" + f.refCols[0] + "'" } else { "" }
+                        return tsErr(547, &("The " + verb + " statement conflicted with the FOREIGN KEY constraint \"" + con + "\". The conflict occurred in database \"" +
+                                            DB + "\", table \"" + objName(&f.ref) + "\"" + col + "."))
+                    }
+                }
+            }
+            Err(_) {}
+        }
+        return e.clone()
+    }
+    if strings.startsWith(m, "update or delete on table \"") {
+        let con = quoted(m, 1)
+        let child = quoted(m, 2)
+        match sess.tableInfo(&child) {
+            Ok(t) {
+                for f in t.fks {
+                    if f.name == con {
+                        let col = if len(f.cols) == 1 { ", column '" + f.cols[0] + "'" } else { "" }
+                        return tsErr(547, &("The " + verb + " statement conflicted with the REFERENCE constraint \"" + con + "\". The conflict occurred in database \"" +
+                                            DB + "\", table \"" + objName(&t.name) + "\"" + col + "."))
+                    }
+                }
+            }
+            Err(_) {}
+        }
+    }
+    return e.clone()
+}
