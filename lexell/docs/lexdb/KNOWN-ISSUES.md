@@ -189,6 +189,31 @@ smaller differences of its statement.
   - `concat_ws(',')` alone is 42883 (PostgreSQL: an empty string); `format('%*s', 5, 'a')` has no `*` width.
   - Messages: `date_trunc('fortnight', ...)` says `for type timestamp` (PostgreSQL: `timestamp without time zone`);
     `to_date('2026-13-01', ...)` quotes the value re-formatted (`"2026-13-1"`).
+- **Aggregate, set-returning and other functions:**
+  - `pg_typeof(sum(x))` (and `pg_typeof(count(*))`) is computed for each row: two rows for a two-row input
+    (PostgreSQL: one).
+  - `generate_series` works only in `FROM` (`SELECT generate_series(1, 3)` is 42883), and has no time-zone form;
+    `generate_subscripts` works only in the select list.
+  - `array_append(ARRAY[1, 2], 'x')` gives `{1,2,x}` (PostgreSQL: 22P02); `array_fill`, `array_to_json` and
+    `array_sort` do not exist.
+  - `current_catalog`, `current_schemas`, `pg_client_encoding`, `pg_postmaster_start_time`, `current_query` and
+    `pg_my_temp_schema` do not exist (42883).
+  - `current_schema` names a schema of `search_path` that does not exist (PostgreSQL skips it).
+  - `pg_typeof` says text for `current_user` (PostgreSQL: name), `'x'` and `NULL` (unknown), and
+    `pg_advisory_lock(...)` (void). `SELECT current_role` and `SELECT user` name their column `current_user`.
+  - `pg_locks` does not exist, so advisory locks cannot be listed.
+  - `pg_wal_lsn_diff`, `pg_last_xact_replay_timestamp` and `pg_stat_replication` do not exist; there is no `pg_lsn`
+    type, and LSNs are text with eight hex digits after the slash (`0/00000004`; PostgreSQL: `0/4`).
+  - `has_column_privilege`, `pg_has_role`, `pg_column_size` and `to_regproc` do not exist.
+  - Only `json_build_object` and `jsonb_build_object` exist; the second returns the same text as the first, with
+    its keys neither sorted nor de-duplicated.
+- **Operators and expressions:**
+  - Reserved words are not taken as column aliases after `AS` (`SELECT 1 AS cast` is 42601).
+  - `NOTNULL` and `ISNULL` are read as aliases, not operators.
+  - `2 BETWEEN 1 AND 3 = true` is a syntax error (PostgreSQL reads `(2 BETWEEN 1 AND 3) = true`).
+  - Bitwise operators take numeric (`1.5 & 1` gives 0; PostgreSQL: 42883).
+  - `OPERATOR(pg_catalog.+)` is not taken; `@`, `|/`, `||/` and `!` do not exist.
+  - `SELECT 'a' || 'b' LIKE 'a%'` names its column `like` (PostgreSQL: `?column?`).
 
 
 ## SQL Server door
