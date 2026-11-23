@@ -91,7 +91,7 @@ expr COLLATE collation
 - `||` joins strings (`'a' || 'b'` is `ab`), as in PostgreSQL and Oracle: SQL Server does not take it. A
   comparison or `NOT` expression in a select list (`SELECT 1 = 1`, `SELECT NOT 1 = 2`) is taken and gives 1 or 0,
   where SQL Server gives error 102.
-- `'n=' + 5` is error 245 as in SQL Server, but the message names `bigint` rather than `int`.
+- `'n=' + 5` is error 8114 (`Error converting data type varchar to bigint`); SQL Server gives 245 and names `int`.
 - `date + 1`, `date - date` and `datetime - datetime` behave differently from SQL Server's: see
   [date and time types](data-types-datetime.md).
 - `**`, `<=>`, `*=` and `=*` (the old outer join operators) are error 102.
@@ -329,8 +329,8 @@ ab     n=5         NULL      x               ab
 
 (1 row affected)
 
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type bigint: "n="
+Msg 8114, Level 16, State 1, Line 1
+Error converting data type varchar to bigint.
 ```
 
 ### J. Operators SQL Server has and lexdb lacks
