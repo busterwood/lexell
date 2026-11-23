@@ -1,0 +1,51 @@
+# lexdb documentation
+
+lexdb is a SQL database server on disk, written in Lexell, that serves the same data through three doors: the
+PostgreSQL protocol with PostgreSQL's SQL, SQL Server's TDS with T-SQL, and Oracle's TNS with Oracle SQL and PL/SQL.
+
+These pages are for people who run lexdb and write programs against it. The design and its measurements are in
+[design/lexdb.md](../../design/lexdb.md) and the other `design/lexdb-*.md` notes.
+
+## Guide
+
+| Page | What it covers |
+|---|---|
+| [Overview](overview.md) | The idea: one engine, three doors; the store; transactions; replicas; what lexdb is not. |
+| [Quick start](quickstart.md) | Build, start with all three doors, use one table from each. |
+| [Server options](server-options.md) | Every command-line option and environment variable, with defaults. |
+| [Read replicas](replicas.md) | Replicas, routing per door, read-your-writes with `WAIT FOR LSN`. |
+| [Bulk loading](bulk-load.md) | `COPY`, SQL Server bulk copy (bcp, `SqlBulkCopy`), Oracle array DML. |
+| [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
+
+Still to be written: architecture (the files, checkpoints and recovery), transactions and isolation, security
+(logins, roles and privileges per door), monitoring (catalog views, statistics). Links to them from other pages lead
+nowhere until then.
+
+## Connecting
+
+| Door | Page | Programs |
+|---|---|---|
+| PostgreSQL | [connect/postgresql.md](connect/postgresql.md) | [PgHello.java](connect/examples/java/PgHello.java), [PgCopy.java](connect/examples/java/PgCopy.java), [pg_hello.lxl](connect/examples/lexell/pg_hello.lxl) |
+| SQL Server | [connect/sqlserver.md](connect/sqlserver.md) | [TdsHello.java](connect/examples/java/TdsHello.java), [TdsBulk.java](connect/examples/java/TdsBulk.java), [tds_hello.lxl](connect/examples/lexell/tds_hello.lxl) |
+| Oracle | [connect/oracle.md](connect/oracle.md) | [OraHello.java](connect/examples/java/OraHello.java), [tns_hello.lxl](connect/examples/lexell/tns_hello.lxl) |
+
+[connect/examples/README.md](connect/examples/README.md) says how to build and run the programs.
+
+## SQL reference
+
+One reference per door, each in its product's terms: syntax, types, functions, errors and catalog.
+
+| Door | Reference | Follows |
+|---|---|---|
+| PostgreSQL | [sql/postgresql/](sql/postgresql/README.md) | PostgreSQL 18 and 19 |
+| SQL Server | [sql/tsql/](sql/tsql/README.md) | SQL Server 2022 and 2025 |
+| Oracle | [sql/oracle/](sql/oracle/README.md) | Oracle 23ai and 26ai |
+
+Every reference page has the same parts: a short description, the syntax, the arguments, remarks, the differences
+from the product, and examples with lexdb's output.
+
+## The examples are checked
+
+Every SQL example marked in these pages was run against a lexdb through its door, and the output shown is lexdb's.
+[tools/check_examples.py](tools/check_examples.py) runs them again; [tools/README.md](tools/README.md) explains the
+marking and how to run it.
