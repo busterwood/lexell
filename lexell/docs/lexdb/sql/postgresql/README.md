@@ -12,9 +12,9 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| SELECT | Queries: joins, `LATERAL`, grouping, `GROUPING SETS`, windows, `DISTINCT ON`, `LIMIT`/`OFFSET`/`FETCH`, `FOR UPDATE`, set operations, `MATCH_RECOGNIZE`. `SELECT ... INTO` makes a table. lexdb's `WAIT n SECONDS` suffix waits for rows. |
-| VALUES | A table of literal rows. |
-| WITH | Common table expressions, `WITH RECURSIVE`, before `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `MERGE`. |
+| [SELECT](select.md) | Queries: [joins](select-join.md), `LATERAL`, [grouping and `GROUPING SETS`](select-group-by.md), [windows](over.md), `DISTINCT ON`, `LIMIT`/`OFFSET`/`FETCH`, `FOR UPDATE`, set operations, [`MATCH_RECOGNIZE`](match-recognize.md). `SELECT ... INTO` makes a table. lexdb's [`WAIT n SECONDS`](select-wait.md) suffix waits for rows. |
+| [VALUES](values.md) | A table of literal rows. |
+| [WITH](with.md) | Common table expressions, `WITH RECURSIVE`, before `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `MERGE`. |
 | EXPLAIN | The plan of a `SELECT`, `UPDATE`, `DELETE` or `MERGE`; `EXPLAIN ANALYZE` of a `SELECT`. |
 
 ### Changing data
@@ -22,10 +22,10 @@ This index lists everything the door takes today. Pages not written yet are list
 | Statement | What it does |
 |---|---|
 | [INSERT](insert.md) | Adds rows; `ON CONFLICT`, `RETURNING`. |
-| UPDATE | Changes rows; `FROM`, `RETURNING`, lexdb's `WITH (batch_rows n)`. |
-| DELETE | Removes rows; `USING`, `RETURNING`, `WITH (batch_rows n)`. |
-| MERGE | Inserts, updates or deletes by a join. |
-| TRUNCATE | Empties tables; `RESTART IDENTITY`, `CASCADE`. |
+| [UPDATE](update.md) | Changes rows; `FROM`, `RETURNING`, lexdb's `WITH (batch_rows n)`. |
+| [DELETE](delete.md) | Removes rows; `USING`, `RETURNING`, `WITH (batch_rows n)`. |
+| [MERGE](merge.md) | Inserts, updates or deletes by a join. |
+| [TRUNCATE](truncate.md) | Empties tables; `RESTART IDENTITY`, `CASCADE`. |
 | COPY | Bulk load and unload, text and CSV: see also [bulk loading](../../bulk-load.md#postgresql-copy). |
 
 ### Tables, indexes and other objects
