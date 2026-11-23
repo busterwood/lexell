@@ -66,6 +66,7 @@ import "./lexdb_gen"
 import "./lexdb_priv"
 import "./lexdb_census"
 import "./lexdb_recur"
+import "./lexdb_oldnew"
 import "./lexdb_recrun"
 import "./lexdb_standby"
 
@@ -6271,6 +6272,20 @@ fn checkRow(t: &Table, row: &[]Val): Result[Unit, DbErr] {
     return Ok(Unit{})
 }
 
+// A row NOT NULL refused (x): Oracle's DEFAULT ON NULL columns (lexdb_sql.ON_NULL; on an UPDATE, at: 2, those FOR INSERT
+// AND UPDATE) that are NULL given their defaults, then checked again (x, or the error of another column).
+fn onNullFill(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &Defs, row: mut &[]Val, x: DbErr, at: int): Result[Unit, DbErr] {
+    var any = false
+    for i in 0..len(t.cols) {
+        if lexdb_ops.isNull(&row[i]) && lexdb_sql.onNullOf(&t.cols[i].def) >= at {
+            row[i] = try lexdb_ops.coerceZ(try defAt(st, txn, defs, t, i), &t.cols[i].typ, &txn.sql.zone)
+            any = true
+        }
+    }
+    if !any { return Err(x) }
+    return checkRow(t, row)
+}
+
 // PostgreSQL's DETAIL for a row refused: its values, NULL as null (the
 // hidden key's left out, 9.117).
 fn failingRow(t: &Table, row: &[]Val): str {
@@ -6331,7 +6346,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var sc = newScopeIn(st, txn, params, &[])
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
-    let from = if len(s.items) > 0 { oneTable(&s.table) } else { noFrom }
+    let from = if len(s.items) > 0 { insFrom(s) } else { noFrom }
     var q = try buildQuery(st, txn, &from, &noWhere, params, &s.subs, &newMap(), true, mut &sc, false)
     var rows: [][]Expr = []
     let resolved = len(s.subs) > 0 || len(s.items) > 0
@@ -6349,6 +6364,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var ret = try retOf(s, &q, mut &sc)
     var up = try upsertOf(s, &t, mut &sc)
     up.idBump = ovr == lexdb_sql.OVR_TSQL
+    if up.mode == lexdb_sql.CONFLICT_UPDATE && ret.on { for x in ret.exprs { if lexdb_oldnew.has(&x) { up.retOld = true } } }
     endScope(mut &sc, mut &q)
     var rs = newRun(&q)
     rs.limit(&lim)
@@ -6417,7 +6433,20 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
                 else { try insertRows(st, txn, &t, &targets, &s.rows, &env, ovr, ret.on, mut &kept, mut &up) }
     }
-    for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
+    if up.retOld {
+        // RETURNING old.c under DO UPDATE: a row updated kept with the row it was (upsertOld), one inserted with NULLs
+        let n = len(t.cols)
+        let nulls: []Val = array(n, Val.Null)
+        for row in kept {
+            if len(row) > n {
+                var was: []Val = []
+                for k in n..len(row) { append(mut &was, row[k].clone()) }
+                try retAddOld(st, txn, &q, &m, params, mut &ret, &rowPrefix(&row, n), &was, mut &rs)
+            } else { try retAddOld(st, txn, &q, &m, params, mut &ret, &row, &nulls, mut &rs) }
+        }
+    } else {
+        for row in kept { try retAdd(st, txn, &q, &m, params, mut &ret, &row, mut &rs) }
+    }
     // IDENTITY_INSERT: an identity given a value past its own goes on from there
     for j in 0..len(up.idCols) {
         let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
@@ -6523,11 +6552,25 @@ type Ret = record {
 fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
     var r = Ret{on: len(s.items) > 0, outs: [], exprs: [], rows: []}
     if !r.on { return Ok(r) }
-    r.outs = try lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &r.exprs)
-    for x in r.exprs {
-        if lexdb_bind.hasAgg(&x) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
+    if lexdb_oldnew.hasStars(&s.items) {
+        let items = lexdb_oldnew.items(&s.items, &q.levels[0].t.cols, lexdb_catalog.ROWID, &q.levels[0].alias)
+        r.outs = try lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &r.exprs)
+    } else {
+        r.outs = try lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &r.exprs)
+    }
+    for i in 0..len(r.exprs) {
+        if lexdb_bind.hasAgg(&r.exprs[i]) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
+        // the old and new rows: what the statement decides, here (RETURNING old.c, new.c)
+        if lexdb_oldnew.has(&r.exprs[i]) { r.exprs[i] = lexdb_oldnew.settle(&r.exprs[i], s.kind, s.conflict == lexdb_sql.CONFLICT_UPDATE) }
     }
     return Ok(r)
+}
+
+// An INSERT's table as RETURNING sees it: under its alias (INSERT INTO t AS a).
+fn insFrom(s: &lexdb_sql.Stmt): []lexdb_sql.FromItem {
+    var f = oneTable(&s.table)
+    if len(s.alias) > 0 { f[0].alias = s.alias.clone() }
+    return f
 }
 
 // RETURNING's columns as a DML operator's (LPlan.Insert and the like): [] none.
@@ -6722,7 +6765,10 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
         }
     }
     if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &row, &txn.sql.zone) }
-    try checkRow(t, &row)
+    match checkRow(t, &row) {
+        Ok(_) {}
+        Err(x) { try onNullFill(st, txn, t, defs, mut &row, x, 1) }
+    }
     try checkChecks(t, &row)
     if up.mode != lexdb_sql.CONFLICT_NONE {
         match try conflictOf(st, txn, t, up, &row) {
@@ -6762,13 +6808,14 @@ type Upsert = record {
     // and until the first chunk
     fk: lexdb_fkprobe.Probes
     md: int                     // the statement's dialect (lexdb_sql.MD_*), for the errors of a generated column given a value
+    retOld: bool                // RETURNING reads the old row (old.c): a row updated is kept followed by the row it was
 }
 
 const ROWID_RUN: int = 1024
 
 fn noUpsert(): Upsert {
     return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
-                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG}
+                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG, retOld: false}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -6878,6 +6925,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &next, &txn.sql.zone) }
     try updRow(st, txn, t, old, &next, fw, later)
     up.touched.put(keyOf(t, &next), 1)
+    if up.retOld { for v in old { append(mut &next, v.clone()) } }
     return Ok(Some(next))
 }
 
@@ -7598,34 +7646,19 @@ type MClause = record {
     delWhere: Option[Expr]
 }
 
-// MERGE's RETURNING or OUTPUT items: as written, but DELETED.* (the
-// qualifier "\x01deleted") the old row's columns.
+// MERGE's RETURNING or OUTPUT items: as written, but DELETED.*, old.* and
+// new.* the old or new row's columns (lexdb_oldnew.items).
 fn mergeItems(s: &lexdb_sql.Stmt, t: &Table, alias: &str): []lexdb_sql.SelItem {
-    var out: []lexdb_sql.SelItem = []
-    for it in s.items {
-        if it.star && it.qual == "\x01deleted" {
-            for c in t.cols {
-                if c.name == lexdb_catalog.ROWID { continue }
-                out = append1(out, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call("#old", [Expr.Col(alias + "." + c.name, -1)], false)), alias: c.name.clone(), spell: c.spell.clone()})
-            }
-        } else {
-            out = append1(out, lexdb_sql.SelItem{star: it.star, qual: it.qual.clone(), expr: match &it.expr { Some(x) { Some(lexdb_sql.cloneExpr(x)) } None { None } }, alias: it.alias.clone(), spell: it.spell.clone()})
-        }
-    }
-    return out
+    return lexdb_oldnew.items(&s.items, &t.cols, lexdb_catalog.ROWID, alias)
 }
 
-fn append1(xs: []lexdb_sql.SelItem, x: lexdb_sql.SelItem): []lexdb_sql.SelItem {
-    var out = xs
-    append(mut &out, x)
-    return out
-}
-
-// An expression with each merge_action() ($action) its action's name.
+// An expression with each merge_action() ($action) its action's name, and
+// each #new(c) (RETURNING new.c) c, NULL for a row deleted.
 fn actionRefs(x: &Expr, action: &str): Expr {
     match x {
         Expr.Call(f, args, star) {
             if f == "#maction" { return Expr.Lit(Val.Text(action.toStr())) }
+            if f == "#new" && len(args) == 1 { return if action == "DELETE" { Expr.Lit(Val.Null) } else { actionRefs(&args[0], action) } }
             var out: []Expr = []
             for a in args { append(mut &out, actionRefs(&a, action)) }
             return Expr.Call(f.clone(), out, star)
@@ -9772,6 +9805,25 @@ fn lockFound(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, found
     return Ok(waited)
 }
 
+// GROUP BY's keys resolved over q (outs, exprs: the select list), each with its collation's kind; Oracle's GROUP BY ALL
+// the select items without an aggregate or a window call (lexdb_bind.gbAllKeys).
+fn groupKeys(s: &lexdb_sql.Stmt, q: &Query, outs: &[]OutCol, exprs: &[]Expr, sc: mut &Scope, groupBy: mut &[]Expr, groupKinds: mut &[]int): Result[Unit, DbErr] {
+    if len(s.group) == 1 && lexdb_sql.isGbAll(&s.group[0]) {
+        for r in lexdb_bind.gbAllKeys(exprs) {
+            append(groupKinds, lexdb_bind.groupKind(&r, &q.cols, &sc.names))
+            append(groupBy, r)
+        }
+        return Ok(Unit{})
+    }
+    for g in s.group {
+        let r = try lexdb_bind.resolveGroupIn(&g, &q.cols, outs, exprs, mut &sc.names, s.mdialect)
+        if lexdb_bind.hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
+        append(groupKinds, lexdb_bind.groupKind(&r, &q.cols, &sc.names))
+        append(groupBy, r)
+    }
+    return Ok(Unit{})
+}
+
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
     if s.rec && s.setop != lexdb_sql.SET_UNION {
@@ -9825,12 +9877,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     var xRewritten = false
     var groupBy: []Expr = []
     var groupKinds: []int = []
-    for g in s.group {
-        let r = try lexdb_bind.resolveGroupIn(&g, &q.cols, &outs, &exprs, mut &sc.names, s.mdialect)
-        if lexdb_bind.hasAgg(&r) { return Err(e("42803", "aggregate functions are not allowed in GROUP BY")) }
-        append(mut &groupKinds, lexdb_bind.groupKind(&r, &q.cols, &sc.names))
-        append(mut &groupBy, r)
-    }
+    if len(s.group) > 0 { try groupKeys(s, &q, &outs, &exprs, sc, mut &groupBy, mut &groupKinds) }
     // GROUP BY as resolved: the plan's Agg's keys (bg), moved there when the
     // planner has built its own list from it (the redundant keys dropped:
     // gb), copied where the Sel keeps it as resolved (grouping sets)
@@ -11608,11 +11655,15 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
         let none: Option[Expr] = None
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScopeIn(st, &txn, &np, ptypes)
-        let from = if s.kind == lexdb_sql.S_INSERT { oneTable(&s.table) } else if s.kind == lexdb_sql.S_MERGE { mergeFrom(s) } else { try dmlFrom(s) }
+        let from = if s.kind == lexdb_sql.S_INSERT { insFrom(s) } else if s.kind == lexdb_sql.S_MERGE { mergeFrom(s) } else { try dmlFrom(s) }
         let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
         var exprs: []Expr = []
         if s.kind == lexdb_sql.S_MERGE {
             let items = mergeItems(s, &q.levels[len(q.levels) - 1].t, &(if len(s.alias) > 0 { s.alias.clone() } else { lexdb_sql.baseName(&s.table) }))
+            return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
+        }
+        if lexdb_oldnew.hasStars(&s.items) {
+            let items = lexdb_oldnew.items(&s.items, &q.levels[0].t.cols, lexdb_catalog.ROWID, &q.levels[0].alias)
             return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
         }
         return lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &exprs)
@@ -13423,7 +13474,16 @@ fn findTab(fw: &[]Table, k: &str): int {
 // its foreign keys either way.
 fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]Val, row: &[]Val, fw: &[]Table,
           later: mut &[]FkLater): Result[Unit, DbErr] {
-    try checkRow(t, row)
+    match checkRow(t, row) {
+        Ok(_) {}
+        Err(x) {
+            // Oracle's DEFAULT ON NULL FOR INSERT AND UPDATE: the row with its default, written instead
+            var fixed = collections.copyOf(row)
+            let defs = try defaultsOf(st, txn, t)
+            try onNullFill(st, txn, t, &defs, mut &fixed, x, 2)
+            return updRow(st, txn, t, old, &fixed, fw, later)
+        }
+    }
     try checkChecks(t, row)
     try checkEnums(st, txn, t, row)
     let c = try lexdb_access.updateRow(st, txn, &lexdb_catalog.relOf(t), old, row,

@@ -12,6 +12,7 @@ import "./lexdb_dialect"
 import "./lexdb_dbopt"
 import "./lexdb_match"
 import "./lexdb_recur"
+import "./lexdb_oldnew"
 
 // The language model, by name (the parser reads and builds it).
 type TypeName = lexdb_sql.TypeName
@@ -1215,17 +1216,45 @@ fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
     while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") || p.isKw("@>") ||
-          p.isKw("<@") || p.isKw("&&") {
+          p.isKw("<@") || p.isKw("&&") || (p.tsql && p.isKw("^")) {
         let op = p.next().text
         let r = try p.addExpr()
         // the array operators (9.92) are calls
-        if p.tsql && (op == "&" || op == "|") {
-            e = Expr.Bin(op, bitInt(e), bitInt(r))
+        if p.tsql && (op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>") {
+            e = tsqlBitOp(&op, e, r)
         } else {
             e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
         }
     }
     return Ok(e)
+}
+
+// T-SQL's & | ^ (XOR: lexdb's #) of two values, and << >> (SQL Server 2022: LEFT_SHIFT, RIGHT_SHIFT, as wide as the
+// value's type: #tbit_shl, lexdb_tsqlfn).
+fn tsqlBitOp(op: &str, l: Expr, r: Expr): Expr {
+    if op == "<<" { return Expr.Call("#tbit_shl", [l, r], false) }
+    if op == ">>" { return Expr.Call("#tbit_shr", [l, r], false) }
+    return Expr.Bin(if op == "^" { "#" } else { op.toStr() }, bitInt(l), bitInt(r))
+}
+
+// T-SQL's compound assignment, at its operator: +=, -=, *=, /=, %=, &=, |=, ^= and SQL Server 2025's ||= (S9); the
+// operator, read with its =, or "" (none there).
+pub fn (p: mut &P) tsqlCompound(): str {
+    let o = p.peek().clone()
+    if o.kind != T_OP || p.peekAt(1).kind != T_OP || p.peekAt(1).text != "=" { return "" }
+    if o.text == "+" || o.text == "-" || o.text == "*" || o.text == "/" || o.text == "%" || o.text == "&" || o.text == "|" ||
+       o.text == "^" || o.text == "||" {
+        p.pos += 2
+        return o.text.clone()
+    }
+    return ""
+}
+
+// target op= e as target = target op e.
+pub fn tsqlAssign(op: &str, target: Expr, e: Expr): Expr {
+    if op == "+" { return Expr.Bin("t+", target, e) }
+    if op == "&" || op == "|" || op == "^" { return tsqlBitOp(op, target, e) }
+    return Expr.Bin(op.toStr(), target, e)
 }
 
 // T-SQL: a bit in arithmetic is a number. A column's or a variable's value
@@ -1289,7 +1318,7 @@ fn (p: mut &P) mulExpr(): Result[Expr, lexdb_base.DbErr] {
 // x ^ y (9.92): above * and /, below a sign, left to right, as PostgreSQL's.
 fn (p: mut &P) powExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.atExpr()
-    while p.isKw("^") {
+    while !p.tsql && p.isKw("^") {
         p.pos += 1
         let r = try p.atExpr()
         e = Expr.Bin("^", e, r)
@@ -1427,7 +1456,12 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
     var pushed = 0
     if p.acceptKw("with") { pushed = try p.withList() }
     var sq = lexdb_sql.newStmt(S_SELECT)
-    if p.isKw("(") { sq = try p.parenSelect() } else {
+    if p.isKw("(") { sq = try p.parenSelect() } else if !p.tsql && use == SUB_FROM && p.isKw("values") {
+        // a CTE's body (and PostgreSQL's FROM (VALUES ...) in parentheses again): VALUES as a query (P23, O5)
+        p.pos += 1
+        sq = try p.valuesQuery()
+        if !p.ora { try p.orderLimit(mut &sq) }
+    } else {
         try p.expectKw("select")
         sq = try p.select()
     }
@@ -1503,7 +1537,16 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         }
         let keep = len(p.subs)
         if r { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0, sub: 0}) }
+        let vals = p.ora && p.isKw("values")
+        if vals && len(cols) == 0 { return Err(oraErr(63803, "columns must be specified with With Clause")) }
         let i = try p.subquery(SUB_FROM)
+        if vals && len(p.subs[i].from) == 1 && p.subs[i].from[0].sub >= 0 {
+            // Oracle: VALUES as the body, its width the column list's (ORA-63815)
+            let w = p.subs[i].subs[p.subs[i].from[0].sub].srf.clone()
+            if w != "#values:" + len(cols).toStr() {
+                return Err(oraErr(63815, "The number of column names must match the number of values in the Table Value Constructor."))
+            }
+        }
         var refs = 0
         if r { refs = pop(mut &p.inCte).refs }
         if (selfRec || rec) && refs > 0 {
@@ -2262,7 +2305,27 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             try p.expectKw(")")
             if len(argNames) > 0 || len(paramsOf(&fname)) > len(args) { args = try namedArgs(&fname, args, &argNames) }
             if p.ora && fname == "string_agg" && len(args) == 1 { append(mut &args, Expr.Lit(Val.Text(""))) }     // LISTAGG(x): no separator
-            if (fname == "percentile_cont" || fname == "percentile_disc") && !star {
+            if p.tsql && (fname == "approx_percentile_cont" || fname == "approx_percentile_disc") && !star {
+                // SQL Server 2022's APPROX_PERCENTILE_CONT / _DISC (S21): PostgreSQL's ordered-set aggregates (exact; SQL
+                // Server's estimate is exact on these sizes), no OVER (4113)
+                if !p.isKw("within") { return Err(lexdb_base.err("TS10754", &("The function '" + fname + "' must have a WITHIN GROUP clause."))) }
+                if len(args) != 1 { return Err(lexdb_base.err("TS174", &("The " + fname + " function requires 1 argument(s)."))) }
+                p.pos += 1
+                try p.expectKw("group")
+                try p.expectKw("(")
+                try p.expectKw("order")
+                try p.expectKw("by")
+                let key = try p.expr()
+                var desc = false
+                if p.acceptKw("desc") { desc = true } else { let asc = p.acceptKw("asc") }
+                try p.expectKw(")")
+                if p.isKw("over") {
+                    return Err(lexdb_base.err("TS4113", &("The function '" + fname + "' is not a valid windowing function, and cannot be used with the OVER clause.")))
+                }
+                let fr = replace(mut &args[0], Expr.Lit(Val.Null))
+                args = [key, fr]
+                fname = fname[7..len(fname)] + " order:" + (if desc { "d" } else { "a" }) + " dia:t"
+            } else if (fname == "percentile_cont" || fname == "percentile_disc") && !star {
                 // percentile_cont(f) WITHIN GROUP (ORDER BY x [DESC]) (lexdb_pct): the call's arguments are x, the
                 // key, then f; the name carries the direction and, for SQL Server and Oracle, the dialect (" dia:")
                 let up = strings.toUpperAscii(&fname)
@@ -2544,6 +2607,16 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
     var a = args
     let float8 = TypeName{kind: K_FLOAT, oid: OID_FLOAT8, prec: 0, scale: 0, len: 0}
     if strings.startsWith(name, "count_big") { return Ok(Expr.Call("count" + name[9..len(name)], a, star)) }
+    // SQL Server 2022's bit functions (S21; lexdb_tsqlfn, the value's width from its type: lexdb_bind's hint)
+    if (name == "bit_count" && n == 1) || ((name == "left_shift" || name == "right_shift" || name == "get_bit") && n == 2) ||
+       (name == "set_bit" && (n == 2 || n == 3)) {
+        let f = if name == "bit_count" { "#tbit_count" } else if name == "left_shift" { "#tbit_shl" } else if name == "right_shift" { "#tbit_shr" }
+                else if name == "get_bit" { "#tbit_get" } else { "#tbit_set" }
+        return Ok(Expr.Call(f.toStr(), a, false))
+    }
+    if name == "bit_count" || name == "left_shift" || name == "right_shift" || name == "get_bit" || name == "set_bit" {
+        return Err(lexdb_base.err("TS174", &("The " + name + " function requires " + (if name == "bit_count" { "1" } else if name == "set_bit" { "2 to 3" } else { "2" }) + " argument(s).")))
+    }
     if n == 0 && (name == "error_number" || name == "error_message" || name == "error_severity" || name == "error_state" ||
                   name == "error_line" || name == "error_procedure" || name == "xact_state") {
         // the batch's values for the error a CATCH block handles (lexdb_tsql)
@@ -2815,14 +2888,42 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     return p.tableBody(s)
 }
 
+// PostgreSQL 18's NOT NULL table constraints (nns: "column\x00name", "" no name) on s's columns: NOT NULL; 42703 for a column
+// not there, 42601 for two names of one column. (Their names are not kept: lexdb's catalogs list no NOT NULL constraints,
+// design/lexdb-new-features.md P7.)
+fn nnCons(s: mut &Stmt, nns: &[]str): Result[Unit, lexdb_base.DbErr] {
+    for k in 0..len(nns) {
+        let z = strings.indexOf(&nns[k], "\x00", 0)
+        let c = nns[k][0..z].toStr()
+        let n = nns[k][z + 1..len(nns[k])].toStr()
+        for j in 0..k {
+            let z2 = strings.indexOf(&nns[j], "\x00", 0)
+            let n2 = nns[j][z2 + 1..len(nns[j])].toStr()
+            if nns[j][0..z2] == c && len(n) > 0 && len(n2) > 0 && n != n2 {
+                return Err(syntax(&("conflicting not-null constraint names \"" + n2 + "\" and \"" + n + "\"")))
+            }
+        }
+        var found = false
+        for i in 0..len(s.cols) { if s.cols[i].name == c { s.cols[i].notNull = true; found = true } }
+        if !found {
+            return Err(lexdb_base.err("42703", &("column \"" + c + "\" of relation \"" + lexdb_sql.baseName(&s.table) + "\" does not exist")))
+        }
+    }
+    return Ok(Unit{})
+}
+
 // A table's definition, ( ... ), after its name.
 fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     var s = s0
     try p.expectKw("(")
+    var nns: []str = []             // PostgreSQL 18's table constraint [CONSTRAINT n] NOT NULL c: "c\x00n"
     while true {
         var cname = ""
         if p.acceptKw("constraint") { cname = try p.name() }
-        if p.acceptKw("primary") {
+        if !p.tsql && !p.ora && p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null" {
+            p.pos += 2
+            append(mut &nns, (try p.name()) + "\x00" + cname)
+        } else if p.acceptKw("primary") {
             try p.expectKw("key")
             s.pkName = cname
             try p.expectKw("(")
@@ -2854,7 +2955,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     s.pkName = cn
                     c.notNull = true
                 } else if p.acceptKw("default") {
-                    c.def = Some(try p.defaultExpr())
+                    c.def = Some(try p.oraDefault())
+                    if lexdb_sql.onNullOf(&c.def) > 0 { c.notNull = true }
                 } else if p.acceptKw("generated") {
                     try p.identity(mut &c, mut &s)
                 } else if p.tsql && p.acceptKw("identity") {
@@ -2886,6 +2988,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw(",") { break }
     }
     try p.expectKw(")")
+    if len(nns) > 0 { try nnCons(mut &s, &nns) }
     try p.onCommit(mut &s)
     return Ok(s)
 }
@@ -3402,6 +3505,28 @@ fn (p: mut &P) defaultExpr(): Result[Expr, lexdb_base.DbErr] {
     return Ok(x)
 }
 
+// A column's DEFAULT, after DEFAULT; Oracle's ON NULL [FOR INSERT ONLY | FOR INSERT AND UPDATE] first (lexdb_sql.ON_NULL),
+// and ORA-02000 (FOR UPDATE), ORA-00936 (no expression), ORA-30665 (NULL after it) as Oracle.
+fn (p: mut &P) oraDefault(): Result[Expr, lexdb_base.DbErr] {
+    if !(p.ora && p.isKw("on") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null") { return p.defaultExpr() }
+    p.pos += 2
+    var f = lexdb_sql.ON_NULL
+    if p.acceptKw("for") {
+        if !p.acceptKw("insert") { return Err(oraErr(2000, "missing INSERT keyword")) }
+        if p.acceptKw("and") {
+            try p.expectKw("update")
+            f = lexdb_sql.ON_NULL_UPD
+        } else {
+            try p.expectKw("only")
+        }
+    }
+    let t = p.peek().clone()
+    if t.kind == T_EOF || (t.kind == T_OP && (t.text == "," || t.text == ")")) { return Err(oraErr(936, "missing expression")) }
+    let x = try p.defaultExpr()
+    if p.isKw("null") { return Err(oraErr(30665, "invalid NOT NULL constraint specified on a DEFAULT ON NULL column")) }
+    return Ok(Expr.Call(f.toStr(), [x], false))
+}
+
 // A value, or DEFAULT (INSERT's VALUES, UPDATE's SET).
 fn (p: mut &P) valueOrDefault(): Result[Expr, lexdb_base.DbErr] {
     if p.acceptKw("default") { return Ok(Expr.Call(DEFAULT_MARK, [], false)) }
@@ -3578,6 +3703,15 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 p.pos += 1
                 addList = true
             }
+            if !p.tsql && !p.ora && ((p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null") ||
+                                     (p.isKw("constraint") && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "not" && p.peekAt(3).kind == T_IDENT && p.peekAt(3).text == "null")) {
+                // PostgreSQL 18: ADD [CONSTRAINT n] NOT NULL c, SET NOT NULL's (its name not kept: nnCons)
+                if p.acceptKw("constraint") { let cn = try p.name() }
+                p.pos += 2
+                append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &(try p.name())))
+                if !p.acceptKw(",") { break }
+                continue
+            }
             if p.isKw("constraint") || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") || p.isKw("primary") {
                 var cname = ""
                 if p.acceptKw("constraint") { cname = try p.name() }
@@ -3619,7 +3753,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &pk.cols, a.col.name.clone())
                     append(mut &cons, pk)
                 } else if p.acceptKw("default") {
-                    a.col.def = Some(try p.defaultExpr())
+                    a.col.def = Some(try p.oraDefault())
+                    if lexdb_sql.onNullOf(&a.col.def) > 0 { a.col.notNull = true }
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
@@ -3681,8 +3816,10 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 if p.acceptKw("default") {
                     var a = lexdb_sql.alterOf(A_SET_DEFAULT, &n)
-                    a.col.def = Some(try p.defaultExpr())
+                    a.col.def = Some(try p.oraDefault())
+                    let on = lexdb_sql.onNullOf(&a.col.def) > 0
                     append(mut &s.alters, a)
+                    if on { append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &n)) }
                 }
                 if !(paren && p.acceptKw(",")) { break }
             }
@@ -3902,12 +4039,122 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.table = try p.rname()
     if p.acceptKw("as") { s.alias = try p.name() }
+    // Oracle 26ai: INSERT INTO t SET c = v, (c, d) = (v, w), ...
+    if p.ora && p.isKw("set") { return p.oraInsertSet(s) }
     if p.isKw("(") && !p.parenQueryStart() {
         p.pos += 1
         append(mut &s.names, try p.name())
         while p.acceptKw(",") { append(mut &s.names, try p.name()) }
         try p.expectKw(")")
     }
+    // Oracle 26ai: INSERT INTO t [(cols)] BY NAME | BY POSITION query
+    if p.ora && p.isKw("by") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "name" || p.peekAt(1).text == "position") {
+        let byName = p.peekAt(1).text == "name"
+        p.pos += 2
+        if p.isKw("values") {
+            return Err(oraErr(63878, "BY NAME or POSITION are semantic modifiers of the subquery only and are not compatible with the VALUES clause."))
+        }
+        var r = try p.insert2(s)
+        if byName { try oraByName(mut &r) }
+        return Ok(r)
+    }
+    return p.insert2(s)
+}
+
+// Oracle 26ai's INSERT ... BY NAME: the query's column names (its first SELECT's) are the columns written, in its order;
+// with a column list, exactly the list's (ORA-63877). Each item has a name: an alias or a column (ORA-63875), once
+// (ORA-63876). lexdb: a * there is not supported.
+fn oraByName(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if len(s.inner) != 1 { return Ok(Unit{}) }
+    var branches: [][]str = []
+    try byNames(&s.inner[0], mut &branches)
+    let names = branches[0].clone()
+    for b in branches {
+        // (a later branch's names are the columns too: one the first has not, Oracle's ORA-00904 for it)
+        for n in b { if !lexdb_base.hasStr(&names, &n) { return Err(oraErr(904, &("\"" + strings.toUpperAscii(&n) + "\": invalid identifier"))) } }
+    }
+    if len(s.names) > 0 {
+        var same = len(s.names) == len(names)
+        for n in names { if !lexdb_base.hasStr(&s.names, &n) { same = false } }
+        if !same { return Err(oraErr(63877, "The explicit column list does not exactly match the exposed column names.")) }
+    }
+    s.names = names
+    return Ok(Unit{})
+}
+
+// The names of each SELECT of q (its branches, left to right), for BY NAME.
+fn byNames(q: &Stmt, out: mut &[][]str): Result[Unit, lexdb_base.DbErr] {
+    if q.setop != 0 && len(q.inner) == 2 {
+        try byNames(&q.inner[0], out)
+        return byNames(&q.inner[1], out)
+    }
+    var names: []str = []
+    for it in q.items {
+        if it.star { return Err(lexdb_base.err("0A000", "lexdb: INSERT ... BY NAME of a query with * is not supported")) }
+        var n = it.alias.clone()
+        if len(n) == 0 {
+            match &it.expr {
+                Some(x) {
+                    match x {
+                        Expr.Col(c, _) { n = colOf(&c) }
+                        else {}
+                    }
+                }
+                None {}
+            }
+        }
+        if len(n) == 0 { return Err(oraErr(63875, "Non-aliased expressions or constants are not allowed in a BY NAME clause.")) }
+        for m in names { if m == n { return Err(oraErr(63876, "No duplicated exposed column names are allowed in the BY NAME clause.")) } }
+        append(mut &names, n)
+    }
+    append(out, names)
+    return Ok(Unit{})
+}
+
+// Oracle 26ai's INSERT INTO t SET c = v | DEFAULT, (c, d) = (v, w), ... at SET: one row of VALUES with the columns named
+// (ORA-00957 for a column twice, ORA-00947 / ORA-00913 for a list of other length); then RETURNING. lexdb: a list set
+// from a subquery, (c, d) = (SELECT ...), is not supported.
+fn (p: mut &P) oraInsertSet(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    p.pos += 1
+    var row: []Expr = []
+    while true {
+        var cols: []str = []
+        if p.acceptKw("(") {
+            append(mut &cols, try p.name())
+            while p.acceptKw(",") { append(mut &cols, try p.name()) }
+            try p.expectKw(")")
+        } else {
+            append(mut &cols, try p.name())
+        }
+        try p.expectKw("=")
+        var vals: []Expr = []
+        if len(cols) > 1 {
+            if p.isKw("(") && p.parenQueryStart() { return Err(lexdb_base.err("0A000", "lexdb: INSERT ... SET (columns) = (subquery) is not supported")) }
+            try p.expectKw("(")
+            append(mut &vals, try p.valueOrDefault())
+            while p.acceptKw(",") { append(mut &vals, try p.valueOrDefault()) }
+            try p.expectKw(")")
+            if len(vals) < len(cols) { return Err(oraErr(947, "not enough values")) }
+            if len(vals) > len(cols) { return Err(oraErr(913, "too many values")) }
+        } else {
+            append(mut &vals, try p.valueOrDefault())
+        }
+        for c in cols {
+            if lexdb_base.hasStr(&s.names, &c) { return Err(oraErr(957, "duplicate column name")) }
+            append(mut &s.names, c)
+        }
+        for v in vals { append(mut &row, v) }
+        if !p.acceptKw(",") { break }
+    }
+    append(mut &s.rows, row)
+    try p.returning(mut &s)
+    return Ok(s)
+}
+
+// INSERT after its table and columns: OVERRIDING, then the query, DEFAULT VALUES or VALUES, ON CONFLICT, RETURNING.
+fn (p: mut &P) insert2(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
     if p.tsql && p.acceptKw("output") {
         // T-SQL: OUTPUT INSERTED.col, ... [INTO target [(columns)]]: RETURNING
         var out: []SelItem = []
@@ -3934,6 +4181,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         q.params = p.params
         append(mut &s.inner, q)
         try p.onConflict(mut &s)
+        try p.oraNoReturning()
         try p.returning(mut &s)
         return Ok(s)
     }
@@ -3977,8 +4225,16 @@ fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     q.params = p.params
     append(mut &s.inner, q)
     try p.onConflict(mut &s)
+    try p.oraNoReturning()
     try p.returning(mut &s)
     return Ok(s)
+}
+
+// Oracle: an INSERT ... SELECT has no RETURNING (ORA-03049 at its first item).
+fn (p: mut &P) oraNoReturning(): Result[Unit, lexdb_base.DbErr] {
+    if !(p.ora && p.isKw("returning")) { return Ok(Unit{}) }
+    let w = p.peekAt(1).text.clone()
+    return Err(lexdb_base.err("ORA03049", &("SQL keyword '" + strings.toUpperAscii(&w) + "' is not syntactically valid following '... returning '")))
 }
 
 // ON CONFLICT [(col, ...) [WHERE pred] | ON CONSTRAINT name]
@@ -4029,8 +4285,15 @@ fn (p: mut &P) setList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         } else {
             var c = try p.name()
             if (p.tsql || p.ora) && p.acceptKw(".") { c = try p.name() }      // T-SQL, Oracle: SET t.col = (the target's)
-            try p.expectKw("=")
-            append(mut &s.sets, SetItem{col: c, expr: try p.valueOrDefault()})
+            let op = if p.tsql { p.tsqlCompound() } else { "" }
+            if len(op) > 0 {
+                // T-SQL: SET c += e and the like
+                let v = try p.expr()
+                append(mut &s.sets, SetItem{col: c.clone(), expr: tsqlAssign(&op, Expr.Col(c.clone(), -1), v)})
+            } else {
+                try p.expectKw("=")
+                append(mut &s.sets, SetItem{col: c, expr: try p.valueOrDefault()})
+            }
         }
         if !p.acceptKw(",") { break }
     }
@@ -4449,7 +4712,10 @@ fn (p: mut &P) valuesSub(): Result[int, lexdb_base.DbErr] {
             if !p.acceptKw(",") { break }
         }
         try p.expectKw(")")
-        if k < 0 { k = n } else if k != n { return Err(lexdb_base.err("42601", "VALUES lists must all be the same length")) }
+        if k < 0 { k = n } else if k != n {
+            if p.ora { return Err(oraErr(63801, "each tuple should have same number of elements in a Table Value Constructor")) }
+            return Err(lexdb_base.err("42601", "VALUES lists must all be the same length"))
+        }
         if !p.acceptKw(",") { break }
     }
     s.srf = "#values:" + k.toStr()
@@ -4579,11 +4845,101 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
     return Ok(Unit{})
 }
 
-// RETURNING items, after INSERT, UPDATE or DELETE (9.44).
+// RETURNING items, after INSERT, UPDATE, DELETE or MERGE (9.44); the old and new rows (lexdb_oldnew): PostgreSQL 18's
+// [WITH (OLD AS o, NEW AS n)] old.c, new.*, Oracle 23ai's OLD c, NEW c.
 fn (p: mut &P) returning(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
-    if p.acceptKw("returning") { try p.itemList(mut &s.items) }
-    return Ok(Unit{})
+    if !p.acceptKw("returning") { return Ok(Unit{}) }
+    if p.tsql { return p.itemList(mut &s.items) }
+    // the name the target's columns are bound by (an INSERT's alias too: lexdb_exec.insFrom)
+    let q = if len(s.alias) > 0 { s.alias.toStr() } else { lexdb_sql.baseName(&s.table) }
+    if p.ora {
+        let marked = try p.oraOldNew()
+        try p.itemList(mut &s.items)
+        if marked { lexdb_oldnew.oraRefs(mut &s.items, &q) }
+        return Ok(Unit{})
+    }
+    var ns = lexdb_oldnew.defaults()
+    if p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+        p.pos += 2
+        while true {
+            let w = p.peek().clone()
+            if !(w.kind == T_IDENT && (w.text == "old" || w.text == "new")) { return Err(near(&w)) }
+            p.pos += 1
+            try p.expectKw("as")
+            let n = try p.name()
+            if w.text == "old" {
+                if ns.oldGiven { return Err(syntax("OLD cannot be specified multiple times")) }
+                ns.old = n
+                ns.oldGiven = true
+            } else {
+                if ns.newGiven { return Err(syntax("NEW cannot be specified multiple times")) }
+                ns.new = n
+                ns.newGiven = true
+            }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+        if ns.oldGiven && ns.newGiven && ns.old == ns.new {
+            return Err(lexdb_base.err("42712", &("table name \"" + ns.new + "\" specified more than once")))
+        }
+    }
+    try p.itemList(mut &s.items)
+    return lexdb_oldnew.refs(mut &s.items, &ns, &q, &s.from)
 }
+
+// Oracle's RETURNING OLD c and NEW c (23ai), at RETURNING's first item: the word and its column (c or t.c) made the
+// column lexdb_oldnew.ORA_OLD.c (ORA_NEW.c), in the tokens up to the end of the statement (or INTO); true if there was one.
+// As Oracle: the word always is OLD or NEW there, ORA-03050 when no column follows, ORA-00904 for a function.
+fn (p: mut &P) oraOldNew(): Result[bool, lexdb_base.DbErr] {
+    var at = -1
+    var k = p.pos
+    while k < len(p.toks) && p.toks[k].kind != T_EOF && !(p.toks[k].kind == T_IDENT && p.toks[k].text == "into") &&
+          !(p.toks[k].kind == T_OP && p.toks[k].text == ";") {
+        if at < 0 && p.toks[k].kind == T_IDENT && (p.toks[k].text == "old" || p.toks[k].text == "new") { at = k }
+        k += 1
+    }
+    if at < 0 { return Ok(false) }
+    let end = k
+    var out: []Tok = []
+    for i in 0..p.pos { append(mut &out, p.toks[i].clone()) }
+    var i = p.pos
+    while i < end {
+        let t = p.toks[i].clone()
+        if !(t.kind == T_IDENT && (t.text == "old" || t.text == "new")) {
+            append(mut &out, t)
+            i += 1
+            continue
+        }
+        let c = p.peekTok(i + 1)
+        if c.kind == T_OP && c.text == "." {
+            // old.c: a table old's column
+            let n = p.peekTok(i + 2)
+            return Err(lexdb_base.err("ORA00904", &("\"" + strings.toUpperAscii(&t.text) + "\".\"" + strings.toUpperAscii(&n.text) + "\": invalid identifier")))
+        }
+        if c.kind == T_OP && c.text == "*" { return Err(lexdb_base.err("ORA01747", "invalid column specification: \"*\"")) }
+        if !(c.kind == T_IDENT || c.kind == T_QIDENT) || (c.kind == T_IDENT && c.text == "into") {
+            let w = if c.kind == T_EOF { "INTO" } else { strings.toUpperAscii(&c.text) }
+            return Err(lexdb_base.err("ORA03050", &("invalid identifier: \"" + w + "\" is a reserved word")))
+        }
+        var col = i + 1
+        let n1 = p.peekTok(i + 2)
+        if n1.kind == T_OP && n1.text == "(" {
+            return Err(lexdb_base.err("ORA00904", &("\"" + strings.toUpperAscii(&c.text) + "\": invalid identifier")))
+        }
+        // OLD t.c: t is the target (the only table RETURNING sees)
+        if n1.kind == T_OP && n1.text == "." && (p.peekTok(i + 3).kind == T_IDENT || p.peekTok(i + 3).kind == T_QIDENT) { col = i + 3 }
+        let q = if t.text == "old" { lexdb_oldnew.ORA_OLD } else { lexdb_oldnew.ORA_NEW }
+        append(mut &out, Tok{kind: T_IDENT, text: q.toStr(), at: t.at, spell: q.toStr()})
+        append(mut &out, Tok{kind: T_OP, text: ".", at: t.at, spell: "."})
+        append(mut &out, p.toks[col].clone())
+        i = col + 1
+    }
+    for j in end..len(p.toks) { append(mut &out, p.toks[j].clone()) }
+    p.toks = out
+    return Ok(true)
+}
+
+fn (p: &P) peekTok(i: int): Tok { return if i < len(p.toks) { p.toks[i].clone() } else { p.toks[len(p.toks) - 1].clone() } }
 
 // A query: the select list to HAVING.
 fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
@@ -4982,9 +5338,31 @@ fn hasSubRef(x: &Expr): bool {
     }
 }
 
+// Oracle 26ai's GROUP BY ALL, at ALL: every select item without an aggregate or a window call (lexdb_sql.GB_ALL); alone,
+// as Oracle has it (ORA-03048 for a comma or another ALL after it, ORA-03049 for ROLLUP, CUBE, GROUPING SETS or an
+// expression).
+fn (p: mut &P) oraGroupAll(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    p.pos += 1
+    s.mdialect = p.md()
+    let t = p.peek().clone()
+    let ends = t.kind == T_EOF || (t.kind == T_OP && (t.text == ")" || t.text == ";")) ||
+               (t.kind == T_IDENT && (t.text == "having" || t.text == "order" || t.text == "union" || t.text == "intersect" || t.text == "minus" ||
+                                      t.text == "except" || t.text == "fetch" || t.text == "offset" || t.text == "for" || t.text == "window" ||
+                                      t.text == "qualify"))
+    if !ends {
+        if (t.kind == T_OP && t.text == ",") || (t.kind == T_IDENT && t.text == "all") {
+            return Err(lexdb_base.err("ORA03048", &("SQL reserved word '" + strings.toUpperAscii(&t.text) + "' is not syntactically valid following '...group by all'")))
+        }
+        return Err(lexdb_base.err("ORA03049", &("SQL keyword '" + strings.toUpperAscii(&t.text) + "' is not syntactically valid following '...group by all '")))
+    }
+    append(mut &s.group, Expr.Call(lexdb_sql.GB_ALL.toStr(), [], false))
+    return Ok(Unit{})
+}
+
 // GROUP BY's list; T-SQL's GROUP BY ALL (groupAll), which keeps the groups WHERE removed, marked in s.sets (GALL_SET).
 fn (p: mut &P) groupBy(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     var distinct = false
+    if p.ora && p.isKw("all") { return p.oraGroupAll(s) }
     if p.acceptKw("distinct") { distinct = true } else if p.acceptKw("all") { if p.tsql { append(mut &s.sets, SetItem{col: GALL_SET.toStr(), expr: Expr.Lit(Val.Null)}) } }
     s.mdialect = p.md()             // its dialect's rules for names and positions (lexdb_bind.resolveGroupIn)
     var sets: [][]Expr = [[]]          // the cross product so far
@@ -6360,7 +6738,8 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     try p.dmlTarget(mut &s)
     var out: []SelItem = []
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
-    if p.acceptKw("using") || (p.tsql && p.acceptKw("from")) { try p.dmlFrom(mut &s) }
+    // (Oracle 23ai's direct join: DELETE [FROM] t [alias] FROM list, as PostgreSQL's USING)
+    if p.acceptKw("using") || ((p.tsql || p.ora) && p.acceptKw("from")) { try p.dmlFrom(mut &s) }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     try p.returning(mut &s)
     try p.batchOpt(mut &s)
@@ -6411,6 +6790,8 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     var out: []SelItem = []
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     if !p.tsql { try p.returning(mut &s) }
+    // Oracle: no RETURNING with DELETE WHERE (ORA-03001)
+    if p.ora && len(s.items) > 0 { for c in s.merges { if c.delWhere.isSome() { return Err(lexdb_base.err("ORA03001", "unimplemented feature")) } } }
     for i in 0..len(s.items) {
         match replace(mut &s.items[i].expr, None) {
             Some(x) {
@@ -8134,6 +8515,7 @@ pub fn (q: &Parser) unexpected(): lexdb_base.DbErr { return near(&q.p.peek()) }
 pub fn (q: mut &Parser) fresh() { q.p.fresh() }
 
 pub fn (q: mut &Parser) expr(): Result[Expr, lexdb_base.DbErr] { return q.p.expr() }
+pub fn (q: mut &Parser) compound(): str { return q.p.tsqlCompound() }
 pub fn (q: mut &Parser) typeName(): Result[TypeName, lexdb_base.DbErr] { return q.p.typeName() }
 
 // A parameter's type (sp_executesql's @params): a type lexdb knows (key ""),
@@ -9196,4 +9578,11 @@ pub fn substParams(body: &str, fname: &str, names: &[]str, nums: &[]int): Result
     }
     out += body[last..len(body)]
     return Ok(out)
+}
+
+// A column reference's column: c of t.c.
+fn colOf(n: &str): str {
+    var d = -1
+    for k in 0..len(n) { if n[k] == '.' { d = k } }
+    return if d < 0 { n.clone() } else { n[d + 1..len(n)].toStr() }
 }

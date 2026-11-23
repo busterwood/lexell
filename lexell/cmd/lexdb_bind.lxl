@@ -795,7 +795,9 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 }
                 // x COLLATE c: x's type (a char(n) keeps its padding rules, L2)
                 "#collate", "#coll" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_TEXT } }
-                "#old", "#round", "#power", "#try", "#tint", "#bitnot" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_NUMERIC } }
+                "#tbit_count" { return lexdb_sql.OID_INT8 }
+                "#tbit_get" { return lexdb_sql.OID_BOOL }
+                "#tbit_shl", "#tbit_shr", "#tbit_set", "#old", "#new", "#ora_onnull", "#ora_onnullu", "#round", "#power", "#try", "#tint", "#bitnot" { return if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_NUMERIC } }
                 "#bitint" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_INT4 }
                     return if a == lexdb_sql.OID_BOOL { lexdb_sql.OID_INT4 } else { a }
@@ -2319,7 +2321,8 @@ const TYPED_FNS: []str = ["to_hex", "array_remove", "array_replace", "array_posi
 
 fn isTypedFn(n: &str): bool {
     for f in TYPED_FNS { if f == n { return true } }
-    return false
+    // (T-SQL's bit functions: the value's width, lexdb_tsqlfn)
+    return len(n) > 5 && n[1] == 't' && strings.startsWith(n, "#tbit_")
 }
 
 fn isHint(x: &Expr): bool {
@@ -2404,13 +2407,15 @@ fn exprName(x: &Expr): str {
                 match args[2] { Expr.Lit(v) { return lexdb_sql.text(&v) } else {} }
             }
             if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
-            if n == "#old" && len(args) == 1 { return exprName(&args[0]) }
+            if (n == "#old" || n == "#new") && len(args) == 1 { return exprName(&args[0]) }
             if n == "#acat" || n == "#aappend" || n == "#aprepend" || n == "@>" || n == "<@" || n == "&&" || n == "~" ||
                n == "!~" || n == "~*" || n == "!~*" || n == "distinct from" { return "?column?" }
             return lexdb_sql.aggBase(&n)
         }
         Expr.Cast(a, t) {
             let inner = exprName(&a)
+            // (not the cast resolve puts on integer arithmetic, intArith: a + 1 is ?column?, not int4)
+            if (t.oid == lexdb_sql.OID_INT2 || t.oid == lexdb_sql.OID_INT4) && intOp(&a) { return inner }
             return if inner == "?column?" { castName(&t) } else { inner }
         }
         else { return "?column?" }
@@ -2856,6 +2861,38 @@ fn aliasRefs(x: &Expr, cols: &[]lexdb_sql.ColDef, outs: &[]OutCol, exprs: &[]Exp
             return Expr.Call(n.clone(), out, star)
         }
         else { return clone(x) }
+    }
+}
+
+// Oracle's GROUP BY ALL (lexdb_sql.GB_ALL): the resolved select list's items (its stars expanded) that have no aggregate
+// (GROUPING among them) and no window call, each once.
+pub fn gbAllKeys(exprs: &[]Expr): []Expr {
+    var out: []Expr = []
+    var texts: []str = []
+    for x in exprs {
+        if hasAgg(x) || callsAny(x, &["#win", "grouping", "grouping_id"]) { continue }
+        let t = lexdb_sql.exprText(x)
+        var seen = false
+        for y in texts { if y == t { seen = true } }
+        if seen { continue }
+        append(mut &texts, t)
+        append(mut &out, clone(x))
+    }
+    return out
+}
+
+fn callsAny(x: &Expr, names: &[]str): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            for m in names { if n == m { return true } }
+            for a in args { if callsAny(&a, names) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return callsAny(&a, names) }
+        Expr.Bin(_, a, b) { return callsAny(&a, names) || callsAny(&b, names) }
+        Expr.IsNull(a, _) { return callsAny(&a, names) }
+        Expr.Cast(a, _) { return callsAny(&a, names) }
+        else { return false }
     }
 }
 

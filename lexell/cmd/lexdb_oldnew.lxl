@@ -1,0 +1,179 @@
+// lexdb_oldnew: RETURNING's old and new rows (design/lexdb-new-features.md P2, O19), on the machinery T-SQL's OUTPUT
+// DELETED.c / INSERTED.c has (lexdb_parse.outputRefs): a reference to the row as it was is #old(t.c), one to the row as it
+// is after the statement #new(t.c), each over the target's columns (t its alias, or its table's name).
+// - PostgreSQL 18: `old.c`, `new.c`, `old.*`, `new.*`, and `RETURNING WITH (OLD AS o, NEW AS n)` naming them otherwise. A
+//   default name that the target or a FROM item already has is theirs (the reference is the table's); a name given in WITH
+//   that one of them has is 42712. The parser (lexdb_parse.returning) reads WITH and calls refs.
+// - Oracle 23ai: `RETURNING OLD c, NEW c INTO ...`: the word before a column (lexdb_parse.oraOldNew writes it as the
+//   qualifier ORA_OLD / ORA_NEW), anywhere in RETURNING's expressions.
+// What each is depends on the statement, as in both products: an INSERT's old row is NULLs (but under ON CONFLICT DO UPDATE
+// the row there, for the rows it updated), a DELETE's new row NULLs; MERGE's by the action (INSERT: old NULLs; DELETE: new
+// NULLs). A bare column is the new row's (a DELETE's, and MERGE's DELETE's, the old one's), as before. The executor settles
+// what the statement decides once (settle) and the rest per row (lexdb_exec.oldRefs, actionRefs).
+// Not here: a whole row (`RETURNING old`, PostgreSQL's composite value), and old/new inside a subquery of RETURNING.
+
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type Expr = lexdb_sql.Expr
+type SelItem = lexdb_sql.SelItem
+type DbErr = lexdb_base.DbErr
+
+// The qualifiers the Oracle door's OLD c and NEW c are read as (no name of the user's has the byte).
+pub const ORA_OLD = "\x01old"
+pub const ORA_NEW = "\x01new"
+
+// A star's qualifier for old.* and new.*, expanded by items over the target's columns.
+pub const STAR_OLD = "\x01old"
+pub const STAR_NEW = "\x01new"
+const STAR_DELETED = "\x01deleted"
+
+// The names old and new go by in a statement's RETURNING: given in WITH (gave: true), else old and new.
+pub type Names = record { pub old: str; pub new: str; pub oldGiven: bool; pub newGiven: bool }
+
+pub fn defaults(): Names { return Names{old: "old", new: "new", oldGiven: false, newGiven: false} }
+
+// RETURNING's items with old.c, new.c, old.* and new.* written as #old, #new over the target (q: its name): for target the
+// target's name (alias, or its table's) and from the names of the statement's FROM (UPDATE ... FROM, DELETE ... USING,
+// MERGE's source).
+pub fn refs(items: mut &[]SelItem, ns: &Names, q: &str, from: &[]lexdb_sql.FromItem): Result[Unit, DbErr] {
+    var old = ns.old.clone()
+    var new = ns.new.clone()
+    // a name a table of the statement has: an error when given, the table's when the default
+    if taken(&old, q, from) {
+        if ns.oldGiven { return Err(lexdb_base.err("42712", &("table name \"" + old + "\" specified more than once"))) }
+        old = ""
+    }
+    if taken(&new, q, from) {
+        if ns.newGiven { return Err(lexdb_base.err("42712", &("table name \"" + new + "\" specified more than once"))) }
+        new = ""
+    }
+    // a default name given to the other (WITH (OLD AS new)) is the other's
+    if !ns.oldGiven && ns.newGiven && old == new { old = "" }
+    if !ns.newGiven && ns.oldGiven && old == new { new = "" }
+    if len(old) == 0 && len(new) == 0 { return Ok(Unit{}) }
+    for i in 0..len(items) {
+        if items[i].star {
+            if len(old) > 0 && items[i].qual == old { items[i].qual = STAR_OLD.toStr() }
+            else if len(new) > 0 && items[i].qual == new { items[i].qual = STAR_NEW.toStr() }
+            continue
+        }
+        match replace(mut &items[i].expr, None) {
+            Some(x) { items[i].expr = Some(rewrite(&x, &old, &new, q)) }
+            None {}
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn taken(n: &str, q: &str, from: &[]lexdb_sql.FromItem): bool {
+    if len(n) == 0 { return false }
+    if n == q { return true }
+    for f in from { if f.alias == n { return true } }
+    return false
+}
+
+// Oracle's OLD c and NEW c (ORA_OLD.c, ORA_NEW.c) as #old, #new over the target q.
+pub fn oraRefs(items: mut &[]SelItem, q: &str) {
+    for i in 0..len(items) {
+        match replace(mut &items[i].expr, None) {
+            Some(x) { items[i].expr = Some(rewrite(&x, ORA_OLD, ORA_NEW, q)) }
+            None {}
+        }
+    }
+}
+
+fn rewrite(x: &Expr, old: &str, new: &str, q: &str): Expr {
+    match x {
+        Expr.Col(n, sl) {
+            var d = -1
+            for k in 0..len(n) { if d < 0 && n[k] == '.' { d = k } }
+            if d < 0 { return Expr.Col(n.toStr(), sl) }
+            let t = n[0..d].toStr()
+            let c = n[d + 1..len(n)].toStr()
+            if len(old) > 0 && t == old { return Expr.Call("#old", [Expr.Col(q + "." + c, -1)], false) }
+            if len(new) > 0 && t == new { return Expr.Call("#new", [Expr.Col(q + "." + c, -1)], false) }
+            return Expr.Col(n.toStr(), sl)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.toStr(), rewrite(&a, old, new, q)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.toStr(), rewrite(&a, old, new, q), rewrite(&b, old, new, q)) }
+        Expr.Cast(a, t) { return Expr.Cast(rewrite(&a, old, new, q), t) }
+        Expr.IsNull(a, n) { return Expr.IsNull(rewrite(&a, old, new, q), n) }
+        Expr.Call(f, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, rewrite(&a, old, new, q)) }
+            return Expr.Call(f.toStr(), out, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// Whether items have a star to expand here (old.*, new.*, T-SQL MERGE's DELETED.*).
+pub fn hasStars(items: &[]SelItem): bool {
+    for it in items { if it.star && len(it.qual) > 0 && it.qual[0] == '\x01' { return true } }
+    return false
+}
+
+// RETURNING's (or OUTPUT's) items as written, but old.*, new.* and DELETED.* each column of the target (t, its name alias)
+// as #old(alias.c), #new(alias.c) (cols: the target's columns; hidden its hidden key's name, left out).
+pub fn items(xs: &[]SelItem, cols: &[]lexdb_sql.ColDef, hidden: &str, alias: &str): []SelItem {
+    var out: []SelItem = []
+    for it in xs {
+        if it.star && (it.qual == STAR_OLD || it.qual == STAR_NEW || it.qual == STAR_DELETED) {
+            let f = if it.qual == STAR_NEW { "#new" } else { "#old" }
+            for c in cols {
+                if c.name == hidden { continue }
+                append(mut &out, SelItem{star: false, qual: "", expr: Some(Expr.Call(f.toStr(), [Expr.Col(alias + "." + c.name, -1)], false)),
+                                         alias: c.name.clone(), spell: c.spell.clone()})
+            }
+        } else {
+            append(mut &out, SelItem{star: it.star, qual: it.qual.clone(), expr: match &it.expr { Some(x) { Some(lexdb_sql.cloneExpr(x)) } None { None } },
+                                     alias: it.alias.clone(), spell: it.spell.clone()})
+        }
+    }
+    return out
+}
+
+// Whether x refers to the old or new row.
+pub fn has(x: &Expr): bool {
+    match x {
+        Expr.Call(f, args, _) {
+            if f == "#old" || f == "#new" { return true }
+            for a in args { if has(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return has(&a) }
+        Expr.Bin(_, a, b) { return has(&a) || has(&b) }
+        Expr.Cast(a, _) { return has(&a) }
+        Expr.IsNull(a, _) { return has(&a) }
+        else { return false }
+    }
+}
+
+// A resolved RETURNING expression with what the statement decides settled: an INSERT's #old NULL (but kept under ON
+// CONFLICT DO UPDATE: upd) and its #new the row; an UPDATE's #new the row (its #old per row); a DELETE's #old the row and
+// its #new NULL. MERGE's are per row (by the action).
+pub fn settle(x: &Expr, kind: int, upd: bool): Expr {
+    match x {
+        Expr.Call(f, args, star) {
+            if (f == "#old" || f == "#new") && len(args) == 1 {
+                let isOld = f == "#old"
+                if kind == lexdb_sql.S_INSERT {
+                    if !isOld { return lexdb_sql.cloneExpr(&args[0]) }
+                    if !upd { return Expr.Lit(lexdb_sql.Val.Null) }
+                }
+                if kind == lexdb_sql.S_UPDATE && !isOld { return lexdb_sql.cloneExpr(&args[0]) }
+                if kind == lexdb_sql.S_DELETE { return if isOld { lexdb_sql.cloneExpr(&args[0]) } else { Expr.Lit(lexdb_sql.Val.Null) } }
+                return lexdb_sql.cloneExpr(x)
+            }
+            var out: []Expr = []
+            for a in args { append(mut &out, settle(&a, kind, upd)) }
+            return Expr.Call(f.toStr(), out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.toStr(), settle(&a, kind, upd)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.toStr(), settle(&a, kind, upd), settle(&b, kind, upd)) }
+        Expr.Cast(a, t) { return Expr.Cast(settle(&a, kind, upd), t) }
+        Expr.IsNull(a, n) { return Expr.IsNull(settle(&a, kind, upd), n) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}

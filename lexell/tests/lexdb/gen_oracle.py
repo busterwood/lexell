@@ -115,7 +115,28 @@ def render(v):
     return "'" + str(v).replace("'", "''") + "'"
 
 
+def call_answer(cur, n, sql):
+    """a statement with n out binds (`@n sql` in a consts test: RETURNING ... INTO :1, ..., or a block setting :1 ...), in a
+    transaction rolled back: its row count, then each row of the binds' values (VARCHAR2): "2 = 'a'|'b';NULL|'c'" (tns_retold)"""
+    vs = [cur.var(oracledb.DB_TYPE_VARCHAR, 4000, arraysize=100) for _ in range(n)]
+    try:
+        cur.execute(sql, vs)
+        cols = []
+        for v in vs:
+            x = v.getvalue()
+            cols.append(x if isinstance(x, list) else [x])
+        rows = list(zip(*cols)) if cols else []
+        r = str(max(cur.rowcount, 0)) + ' = ' + ';'.join('|'.join(render(x) for x in row) for row in rows)
+    except oracledb.DatabaseError as e:
+        m = re.match(r'ORA-(\d+)', str(e))
+        r = 'error ' + str(int(m.group(1))) if m else 'error ' + str(e)
+    cur.connection.rollback()
+    return r
+
+
 def answer(cur, kind, sql, tx=False):
+    if kind.startswith('@'):
+        return call_answer(cur, int(kind[1:]), sql)
     if kind in ('t', 'u'):
         # statements and queries in one transaction, rolled back (t) or committed (u)
         parts = [answer(cur, 'q' if p.lower().startswith('select') else 'x', p, True) for p in sql.split(' ;; ')]
@@ -171,6 +192,8 @@ CHECKED = {
     'tns_r5': ('consts', 'QS'),
     'tns_r8': ('consts', 'QS'),
     'tns_newfix': ('consts', 'QS'),
+    'tns_retold': ('consts', 'QS'),
+    'tns_stmtforms': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
     'tns_leftovers': ('consts', 'QS'),
@@ -474,7 +497,11 @@ def check_test(conn, name, spec):
             print('%s: expectations do not start with setup' % name)
         qexp = [e[len('same: '):] if e.startswith('same: ') else e for e in exp[1:]]
         for q, e in zip(queries, qexp):
-            # (a statement that is not a query, ALTER SESSION: its row count)
+            # (a statement that is not a query, ALTER SESSION: its row count; "@n sql": a call with n out binds, call_answer)
+            m = re.match(r'@(\d+) (.*)$', q, re.S)
+            if m:
+                cases.append((m.group(2)[:70], '@' + m.group(1), m.group(2), e))
+                continue
             cases.append((q[:70], 't' if ' ;; ' in q else ('q' if q.lower().startswith(('select', 'with')) else 'x'), q, e))
         if name == 'tns_subrows':
             for flag, e in zip(['off', 'on'], exp[1 + len(queries):]):
