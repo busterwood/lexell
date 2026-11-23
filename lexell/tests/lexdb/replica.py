@@ -11,15 +11,22 @@ by many checkpoints. Through psql:
   a table added now and then, and range deletes of table r, which has no
   index: one write that drops subtrees, design/lexdb-bulkdelete.md); the replica must then give the master's
   answers to a set of queries (it follows: it is waited for, up to 10 s);
-- the replica refuses writes (25006) and goes on;
+- the replica refuses writes (25006) and goes on; it serves the SQL Server and Oracle
+  doors too (--tds, --tns; design/lexdb.md 9.137), where every round a write is refused
+  with 3906 and ORA-16000 and t's rows are the master's (through doorsql.lxl, Lexell's
+  own clients);
 - the replica is killed (SIGKILL) during a round's writes every third round
   and started again: the master goes on, and the new replica catches up;
 - the master is killed (SIGKILL) at round R/2: the replica must stop by
   itself (exit 1) within 10 s; both start again, the master recovering;
 - at the end the master stops (SIGTERM) and the replica must stop too.
 
-Then the supervised form, lexdb DATADIR ADDR --replicas 2: both replicas
-answer on the replicas' port; the master (a worker) killed with SIGKILL is
+Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
+answer on the replicas' port, and on the TDS and TNS ports one above the master's
+(3906, ORA-16000, v$database's role); libpq with a host list picks the master or a
+replica by target_session_attrs; the master routes ApplicationIntent=ReadOnly logins
+and CONNECTs to the read-only service (lexdb_ro, freepdb1_ro) to a replica; the
+master (a worker) killed with SIGKILL is
 started again by the supervisor, and the replicas with it, the data
 intact; a replica killed is started again on its own; SIGTERM to the
 supervisor stops them all (exit 0).
@@ -75,12 +82,15 @@ class Proc:
         out.close()
 
     def ready(self, timeout=60):
+        # every port it serves (pgwire's, and a replica's other doors, 9.137)
         end = time.time() + timeout
+        ports = self.port if isinstance(self.port, list) else [self.port]
         while time.time() < end:
             if self.p.poll() is not None:
                 return False
             try:
-                socket.create_connection(('127.0.0.1', self.port), 0.2).close()
+                for p in ports:
+                    socket.create_connection(('127.0.0.1', p), 0.2).close()
                 return True
             except OSError:
                 time.sleep(0.02)
@@ -108,6 +118,28 @@ def psql(port, sql, check=True):
     if check and r.returncode != 0:
         raise RuntimeError('psql on %d: %s: %s' % (port, sql[:80], r.stderr.strip()))
     return r
+
+
+DOORSQL = None      # the SQL Server and Oracle client (doorsql.lxl), built in main
+
+
+def door(kind, port, sql, extra=''):
+    """One statement through the TDS or TNS door on port (doorsql): its rows,
+    'ok N', or 'error N: message'."""
+    if kind == 'tds':
+        cs = 'Server=127.0.0.1,%d;UID=sa;PWD=sa;Encrypt=no;%s' % (port, extra)
+    else:
+        cs = 'User Id=sa;Password=sa;Data Source=127.0.0.1:%d/%s' % (port, extra or 'lexdb')
+    r = subprocess.run([DOORSQL, kind, cs, sql], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()
+
+
+def libpq(ports, attrs, sql):
+    """psql with a host list of ports and target_session_attrs: the answer, or the error."""
+    hosts = ','.join('127.0.0.1' for _ in ports)
+    r = subprocess.run(['psql', '-X', '-At', 'host=%s port=%s user=test dbname=test target_session_attrs=%s'
+                        % (hosts, ','.join(str(p) for p in ports), attrs), '-c', sql], capture_output=True, text=True, timeout=60)
+    return r.stdout.strip() if r.returncode == 0 else 'error: ' + r.stderr.strip()
 
 
 def answers(port):
@@ -174,6 +206,15 @@ def holds_lock(pid, data):
     return False
 
 
+def ports_open(ports):
+    try:
+        for p in ports:
+            socket.create_connection(('127.0.0.1', p), 0.2).close()
+        return True
+    except OSError:
+        return False
+
+
 def wait_for(cond, timeout):
     end = time.time() + timeout
     while time.time() < end:
@@ -183,12 +224,56 @@ def wait_for(cond, timeout):
     return False
 
 
+def doors_checked(mport, rport, tport, oport, want, fail):
+    """Every door of the replicas answers as its product's read-only secondary (9.137), and libpq's host lists pick by
+    target_session_attrs. want: the master's count(*), sum(v) of s."""
+    count = want.split('|')[0].strip()
+    for attrs, rec in (('read-write', 'f'), ('primary', 'f'), ('standby', 't'), ('read-only', 't'), ('prefer-standby', 't')):
+        for ports in ([mport, rport], [rport, mport]):
+            got = libpq(ports, attrs, 'select pg_is_in_recovery()')
+            if got != rec:
+                fail('supervised: libpq target_session_attrs=%s over %s picked %s, not %s' % (attrs, ports, got, rec))
+    got = door('tds', tport + 1, 'select count(*) from s')
+    if got != count:
+        fail('supervised: the replicas\' TDS door gives %s, not %s' % (got, count))
+    got = door('tds', tport + 1, 'insert into s values (-1, -1)')
+    if not got.startswith('error 3906: Failed to update database "lexdb" because the database is read-only.'):
+        fail('supervised: a write through a replica\'s TDS door: %s' % got)
+    got = door('tns', oport + 1, 'select count(*) from s')
+    if got != count:
+        fail('supervised: the replicas\' TNS door gives %s, not %s' % (got, count))
+    got = door('tns', oport + 1, 'insert into s values (-1, -1)')
+    if not got.startswith('error 16000: ORA-16000'):
+        fail('supervised: a write through a replica\'s TNS door: %s' % got)
+    got = door('tns', oport + 1, 'select open_mode, database_role from v$database')
+    if got != "'READ ONLY WITH APPLY'|'PHYSICAL STANDBY'":
+        fail('supervised: v$database on a replica: %s' % got)
+    got = door('tns', oport, 'select open_mode, database_role from v$database')
+    if got != "'READ WRITE'|'PRIMARY'":
+        fail('supervised: v$database on the master: %s' % got)
+    # routing: the master sends read-only clients to a replica (ENVCHANGE 20, REDIRECT), which announced its doors
+    ro = 'select cast(is_read_only as int) from sys.databases where name = db_name()'
+    for intent, want_ro in (('ReadOnly', '1'), ('ReadWrite', '0')):
+        got = door('tds', tport, ro, 'ApplicationIntent=' + intent)
+        if got != want_ro:
+            fail('supervised: ApplicationIntent=%s on the master reached is_read_only %s' % (intent, got))
+    for svc, role in (('lexdb_ro', "'PHYSICAL STANDBY'"), ('freepdb1_ro', "'PHYSICAL STANDBY'"), ('lexdb', "'PRIMARY'")):
+        got = door('tns', oport, 'select database_role from v$database', svc)
+        if got != role:
+            fail('supervised: service %s on the master reached %s' % (svc, got))
+
+
 def supervised(exe, work, env, fail):
     data = os.path.join(work, 'sdata')
     mport = free_port()
     rport = free_port()
+    # the other doors (9.137): the replicas' on the master's ports + 1 (the default)
+    tport, oport = free_port(), free_port()
+    while tport + 1 in (mport, rport, oport) or oport + 1 in (mport, rport, tport):
+        tport, oport = free_port(), free_port()
     log = os.path.join(work, 'supervised.log')
-    sup = Proc([exe, data, '127.0.0.1:%d' % mport, '--replicas', '2', '--replica-addr', '127.0.0.1:%d' % rport],
+    sup = Proc([exe, data, '127.0.0.1:%d' % mport, '--replicas', '2', '--replica-addr', '127.0.0.1:%d' % rport,
+                '--tds', '127.0.0.1:%d' % tport, '--tns', '127.0.0.1:%d' % oport],
                mport, log, env)
     sup.start()
     if not sup.ready():
@@ -196,6 +281,8 @@ def supervised(exe, work, env, fail):
     replica_up = lambda: psql(rport, 'select 1', check=False).returncode == 0
     if not wait_for(replica_up, 60):
         fail('supervised: the replicas did not start')
+    if not wait_for(lambda: ports_open([tport, oport, tport + 1, oport + 1]), 30):
+        fail('supervised: the TDS and TNS doors did not open')
     psql(mport, 'create table s (id int primary key, v int not null)')
     psql(mport, 'insert into s select i, i from generate_series(1, 5000) i')
     want = psql(mport, 'select count(*), sum(v) from s').stdout
@@ -203,6 +290,7 @@ def supervised(exe, work, env, fail):
     # every replica: enough connections that both answer
     if not wait_for(lambda: all(same() for _ in range(8)), 10):
         fail('supervised: the replicas did not catch up')
+    doors_checked(mport, rport, tport, oport, want, fail)
     kids = children(sup.p.pid)
     if len(kids) != 3:
         fail('supervised: %d workers, not 3' % len(kids))
@@ -224,6 +312,9 @@ def supervised(exe, work, env, fail):
         fail('supervised: the replica was not started again')
     if not wait_for(lambda: all(same() for _ in range(8)), 60):
         fail('supervised: the replica did not come back')
+    if not wait_for(lambda: ports_open([tport + 1, oport + 1]), 30):
+        fail('supervised: the replicas\' TDS and TNS doors did not come back')
+    doors_checked(mport, rport, tport, oport, want, fail)
     w = psql(rport, 'delete from s', check=False)
     if '25006' not in w.stderr and 'read-only' not in w.stderr:
         fail('supervised: a write on a replica was not refused')
@@ -250,11 +341,18 @@ def main():
     r = subprocess.run([LXLC, os.path.join(ROOT, 'cmd', 'lexdb.lxl'), '-o', exe], capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit('replica.py: building lexdb failed:\n' + r.stdout + r.stderr)
+    global DOORSQL
+    DOORSQL = os.path.join(work, 'doorsql')
+    r = subprocess.run([LXLC, os.path.join(HERE, 'doorsql.lxl'), '-o', DOORSQL], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit('replica.py: building doorsql failed:\n' + r.stdout + r.stderr)
     data = os.path.join(work, 'data')
-    mport, rport = free_port(), free_port()
+    mport, rport, rtds, rtns = free_port(), free_port(), free_port(), free_port()
     env = dict(os.environ, LEXDB_CACHE_MB='4', LEXDB_SEG_KB='1024', LEXDB_CKPT_KB='512')
     master = Proc([exe, data, '127.0.0.1:%d' % mport], mport, os.path.join(work, 'master.log'), env)
-    replica = Proc([exe, '--replica', data, '127.0.0.1:%d' % rport], rport, os.path.join(work, 'replica.log'), env)
+    # the replica serves the SQL Server and Oracle doors too (9.137)
+    replica = Proc([exe, '--replica', data, '127.0.0.1:%d' % rport, '--tds', '127.0.0.1:%d' % rtds, '--tns', '127.0.0.1:%d' % rtns],
+                   [rport, rtds, rtns], os.path.join(work, 'replica.log'), env)
     print('replica test: seed %d, %d rounds, work %s' % (seed, a.rounds, work), flush=True)
 
     def fail(why):
@@ -325,6 +423,14 @@ def main():
             refused += 1
         else:
             fail('round %d: a write on the replica was not refused: %s %s' % (rnd, w.stdout, w.stderr))
+        for kind, p, num in (('tds', rtds, 'error 3906:'), ('tns', rtns, 'error 16000:')):
+            w = door(kind, p, "insert into u values (999999, 'no')")
+            if not w.startswith(num):
+                fail('round %d: a write through the replica\'s %s door: %s' % (rnd, kind, w))
+            got = door(kind, p, 'select count(*) from t')
+            want = psql(mport, 'select count(*) from t').stdout.strip()
+            if got != want:
+                fail('round %d: the replica\'s %s door gives %s rows of t, the master %s' % (rnd, kind, got, want))
         if rnd == a.rounds // 2:
             master.kill()
             try:

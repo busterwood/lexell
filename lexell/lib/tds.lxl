@@ -489,7 +489,11 @@ fn units(s: &str, what: &str): Result[[]byte, Error] {
 
 // The LOGIN7 payload (TDS 7.4, SQL authentication). E_INPUT for a text that
 // is not UTF-8 or is too long (the message names the field, never its value).
-pub fn login7(l: &Login): Result[str, Error] {
+pub fn login7(l: &Login): Result[str, Error] { return login7Intent(l, false) }
+
+// login7 with TypeFlags' fReadOnlyIntent (0x20) set when readOnly
+// (ApplicationIntent=ReadOnly: MS-TDS 2.2.6.4).
+pub fn login7Intent(l: &Login, readOnly: bool): Result[str, Error] {
     let host = try units(&l.hostName, "the host name")
     let user = try units(&l.userName, "the user name")
     let pw = scramble(&try units(&l.password, "the password"))
@@ -508,7 +512,7 @@ pub fn login7(l: &Login): Result[str, Error] {
     set32(mut &h, 16, l.clientPid)
     h[24] = byte(0xE0)                          // fUseDB, fDatabase (fatal), fSetLang
     h[25] = byte(0x03)                          // fLanguage (fatal), fODBC
-    h[26] = byte(0)                             // TypeFlags: fSQLType default, read-write
+    h[26] = byte(if readOnly { 0x20 } else { 0 })   // TypeFlags: fSQLType default; fReadOnlyIntent
     h[27] = byte(if l.utf8 { 0x18 } else { 0x08 })   // fUnknownCollationHandling, fExtension
     set32(mut &h, 32, 0x0409)                   // ClientLCID
     var data: []byte = []
@@ -3079,6 +3083,7 @@ pub type Config = value record {
     pub trustServerCertificate: bool    // tls's insecureSkipVerify
     pub hostNameInCertificate: str      // "" : host
     pub packetSize: int
+    pub readOnlyIntent: bool            // ApplicationIntent=ReadOnly: LOGIN7's fReadOnlyIntent; a routing answer is followed once
 }
 
 // The encryption a session got.
@@ -3144,6 +3149,43 @@ pub fn serverError(m: &Message): Error {
 // the task. The server's login error (18456 "Login failed for user ...")
 // comes back with its number as the code.
 pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
+    match try openOnce(cfg, w) {
+        Opened.Session(s) { return Ok(s) }
+        Opened.Routed(host, port) {
+            // routing (ENVCHANGE 20, an availability group's read-only routing): the login again at the server named,
+            // once (a second routing answer is an error, as in Microsoft's drivers)
+            var to = cfg.clone()
+            to.host = host
+            to.port = port
+            match try openOnce(&to, w) {
+                Opened.Session(s) { return Ok(s) }
+                Opened.Routed(h2, p2) { return Err(proto("the server routed the connection twice")) }
+            }
+        }
+    }
+    return Err(proto("unreachable"))
+}
+
+// A login's end: a session, or the server's routing answer (its host and port).
+type Opened = closed {
+    Session(Session)
+    Routed(str, int)
+}
+
+// The routing ENVCHANGE's value (MS-TDS 2.2.7.9): its length, protocol 0
+// (TCP), the port, the host as US_VARCHAR.
+fn routingOf(v: &str): Option[Opened] {
+    if len(v) < 7 || int(v[2]) != 0 { return None }
+    let port = int(v[3]) | (int(v[4]) << 8)
+    let n = int(v[5]) | (int(v[6]) << 8)
+    if len(v) < 7 + 2 * n || port == 0 { return None }
+    match fromUtf16(&(v[7..7 + 2 * n].toStr())) {
+        Ok(h) { return Some(Opened.Routed(h, port)) }
+        Err(_) { return None }
+    }
+}
+
+fn openOnce(cfg: &Config, w: Where): Result[Opened, Error] {
     if cfg.encrypt == Encrypt.Strict {
         return Err(sqldialect.inputError("Encrypt=strict (TDS 8.0) is not supported yet"))
     }
@@ -3177,7 +3219,7 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
     let login = Login{hostName: hostName(), userName: cfg.user.clone(), password: cfg.password.clone(), appName: cfg.appName.clone(),
                       serverName: cfg.host.clone(), library: "lxl tds", language: "", database: cfg.database.clone(),
                       packetSize: cfg.packetSize, clientPid: 0, utf8: true}
-    try t.send(PT_LOGIN7, &(try login7(&login)), w)
+    try t.send(PT_LOGIN7, &(try login7Intent(&login, cfg.readOnlyIntent)), w)
     if enc == Encryption.LoginOnly { try t.stopTls() }
     let a = try t.receive(MAX_REPLY, w)
     if a.ptype != PT_REPLY { return Err(proto(&("a login answer in a packet of type " + a.ptype.toStr()))) }
@@ -3190,6 +3232,15 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
     if ack.tdsVersion < 0x72090002 {
         return Err(proto(&("the server speaks TDS version 0x" + strings.hex(ack.tdsVersion) + ", older than 7.2")))
     }
+    // a routing answer: this connection ends (dropped), the caller logs in where it says
+    for e in r.envs {
+        if e.kind == ENV_ROUTING {
+            match routingOf(&e.newValue) {
+                Some(to) { return Ok(to) }
+                None { return Err(proto("a routing ENVCHANGE that is not TCP, or is cut short")) }
+            }
+        }
+    }
     var s = Session{t: t, encryption: enc, tdsVersion: ack.tdsVersion, serverName: ack.progName.clone(),
                     serverVersion: ack.version.clone(), preloginVersion: pre.version.clone(), database: "", collation: noCollation(),
                     utf8: false, maxReply: MAX_REPLY, broken: false, resetNext: false, txn: noTransaction(), infos: replace(mut &r.infos, []),
@@ -3199,13 +3250,10 @@ pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
     for f in r.features {
         if f.id == FEATURE_UTF8 && len(f.data) >= 1 && f.data[0] != 0 { s.utf8 = true }
     }
-    for e in r.envs {
-        if e.kind == ENV_ROUTING { return Err(ioErr("the server redirects the connection elsewhere (routing), which is not supported yet")) }
-    }
     try s.apply(&r.envs)
     s.login = Restored{database: s.database.clone(), language: s.language.clone(), collation: s.collation}
 
-    return Ok(s)
+    return Ok(Opened.Session(s))
 }
 
 // The TLS handshake through PRELOGIN packets (MS-TDS 2.2.6.5), then the
@@ -3256,7 +3304,7 @@ fn hostName(): str {
 // rollback, enlist and defect, transaction ended) are applied; the
 // character set, Unicode sort locale and flags, the mirroring partner, the
 // user instance and RESETCONNECTION's acknowledgement are kept. Routing (20)
-// at login is refused by open; promotion (15) and the DTC manager's address
+// at login is followed by open, once; promotion (15) and the DTC manager's address
 // (16) are distributed transactions, which this client does not ask for.
 fn (s: mut &Session) apply(envs: &[]EnvChange): Result[Unit, Error] {
     for e in envs {

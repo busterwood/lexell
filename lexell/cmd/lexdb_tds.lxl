@@ -69,6 +69,8 @@ import "./lexdb_tsqlparse"
 import "./lexdb_tsqlfunc"
 import "./lexdb_time"
 import "./lexdb_parse"
+import "./lexdb_standby"
+import "./lexdb_repl"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -165,6 +167,10 @@ fn (o: mut &Out) message(token: int, number: int, state: int, class: int, text: 
 
 fn (o: mut &Out) error(e: &DbErr) {
     let n = lexdb_tsql.sqlNumber(&e.state)
+    if n == 3906 && e.state == "25006" {        // (a replica's write found at its commit, 9.137)
+        o.message(tds.TK_ERROR, n, 1, 16, &(lexdb_standby.tsqlReadOnly()))
+        return
+    }
     o.message(tds.TK_ERROR, n, 1, lexdb_tsql.sqlClass(n), &e.msg)
 }
 
@@ -786,6 +792,8 @@ type Conn = record {
     user: str
     txn: int                    // the transaction descriptor's number, 0 none
     preps: []Prep               // by handle - 1
+    id: int                     // the listener's count of its connections (routing's round robin)
+    local: str                  // the address the client reached (routing's host for a wildcard one)
 }
 
 fn (c: mut &Conn) send(): Result[Unit, tds.Error] {
@@ -1881,6 +1889,7 @@ type Login = record {
     database: str
     packetSize: int
     integrated: bool
+    readOnly: bool              // TypeFlags' fReadOnlyIntent (ApplicationIntent=ReadOnly)
 }
 
 // A text field of LOGIN7: its offset and length (UTF-16 units) at at.
@@ -1911,7 +1920,8 @@ fn parseLogin(d: &str): Result[Login, DbErr] {
         Err(m) { return Err(lexdb_base.err("08P01", &("LOGIN7: the password: " + m))) }
     }
     return Ok(Login{user: try loginField(d, 40), password: password, app: try loginField(d, 48),
-                    database: try loginField(d, 68), packetSize: binary.readU32LEStr(d, 8), integrated: integrated})
+                    database: try loginField(d, 68), packetSize: binary.readU32LEStr(d, 8), integrated: integrated,
+                    readOnly: (int(d[26]) & 0x20) != 0})
 }
 
 // Whether the login may in: its role's password under scram-sha-256, any
@@ -1943,7 +1953,7 @@ fn (c: mut &Conn) authorized(l: &Login, encrypted: bool): Result[Unit, str] {
 
 // The login's answer: the database, collation and language, LOGINACK, the
 // packet size, then DONE.
-fn (c: mut &Conn) welcome(packetSize: int) {
+fn (c: mut &Conn) welcome(packetSize: int, route: &Option[str]) {
     c.o.envchange(tds.ENV_DATABASE, &DB_NAME, &"master")
     c.o.message(tds.TK_INFO, 5701, 2, 0, &("Changed database context to '" + DB_NAME + "'."))
     // ENVCHANGE 7: the collation's 5 bytes, then none for the old value
@@ -1965,7 +1975,35 @@ fn (c: mut &Conn) welcome(packetSize: int) {
     c.o.u8(VERSION_BUILD & 0xff)
     c.o.end(la)
     c.o.envchange(tds.ENV_PACKETSIZE, &packetSize.toStr(), &packetSize.toStr())
+    match route {
+        Some(addr) { c.routing(addr) }
+        None {}
+    }
     c.o.done(0, 0, 0)
+}
+
+// ENVCHANGE 20 (MS-TDS 2.2.7.9), after LOGINACK: the client is to connect to
+// the replica at addr (HOST:PORT; a wildcard host is the one the client
+// reached this server on) instead (lexdb.md 9.137).
+fn (c: mut &Conn) routing(addr: &str) {
+    let colon = strings.lastIndexOf(addr, ":")
+    var host = addr[0..colon].toStr()
+    let port = strings.parseIntOpt(addr[colon + 1..len(addr)]).unwrapOr(0)
+    if host == "0.0.0.0" || host == "[::]" || host == "::" || host == "" {
+        let lc = strings.lastIndexOf(&c.local, ":")
+        host = if lc > 0 { c.local[0..lc].toStr() } else { "localhost" }
+    }
+    if strings.startsWith(&host, "[") && strings.endsWith(&host, "]") { host = host[1..len(host) - 1].toStr() }
+    let u = units(&host, 65535)
+    let at = c.o.start(tds.TK_ENVCHANGE)
+    c.o.u8(tds.ENV_ROUTING)
+    c.o.u16(5 + len(u))                     // RoutingDataValueLength: protocol, port, the host's US_VARCHAR
+    c.o.u8(0)                               // TCP
+    c.o.u16(port)
+    c.o.u16(len(u) / 2)
+    for x in u { append(mut &c.o.b, x) }
+    c.o.u16(0)                              // the old value: none
+    c.o.end(at)
 }
 
 // The TLS handshake carried in PRELOGIN packets, then TLS on the socket.
@@ -2052,10 +2090,14 @@ fn (c: mut &Conn) login(ctx: &[]tls.Context): Result[bool, tds.Error] {
     c.sess.setUser(&l.user)
     c.user = l.user.clone()
     let ps = if l.packetSize == 0 { tds.DEFAULT_PACKET } else { min(max(l.packetSize, tds.MIN_PACKET), MAX_PACKET_SIZE) }
-    c.welcome(ps)
+    // the read-only intent (ApplicationIntent=ReadOnly) on the master: routed to a replica serving TDS, if one is up
+    // (lexdb.md 9.137); else served here, as SQL Server's read-only routing falls back to the primary
+    var route: Option[str] = None
+    if l.readOnly && !lexdb_standby.isReplica(&c.st) { route = lexdb_repl.routeOf(&c.st, "tds", c.id) }
+    c.welcome(ps, &route)
     try c.send()
     c.t.packetSize = ps
-    return Ok(true)
+    return Ok(route.isNone())
 }
 
 pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int; ctx: []tls.Context }
@@ -2067,8 +2109,9 @@ pub fn serve(a: ConnArg): int {
     // @@SPID: the session's own number, as sys.dm_exec_sessions shows it
     let sess = lexdb_exec.newSession(st.share())
     let spid = sess.number()
+    let local = sock.localAddr()
     var c = Conn{t: tds.transport(sock), sess: sess, st: st, o: newOut(), ts: lexdb_tsql.newState(spid),
-                 user: "", txn: 0, preps: []}
+                 user: "", txn: 0, preps: [], id: id, local: local}
     // SQL Server's default collation, a literal's and a variable's (L2)
     c.sess.setCollation(&lexdb_sql.TSQL_COLLATION)
     c.sess.setDoor(&"tds")

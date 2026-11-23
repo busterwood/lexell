@@ -56,6 +56,8 @@ import "./lexdb_oratext"
 import "./lexdb_plsql"
 import "./lexdb_plcall"
 import "./lexdb_parse"
+import "./lexdb_standby"
+import "./lexdb_repl"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -76,6 +78,7 @@ const SHORT = "\x00short"               // parseRequest: the message goes on in 
 const PT_CONNECT = 1
 const PT_ACCEPT = 2
 const PT_REFUSE = 4
+const PT_REDIRECT = 5
 const PT_DATA = 6
 const PT_MARKER = 12
 const PT_CONTROL = 14
@@ -1083,6 +1086,8 @@ type Conn = record {
     lobBytes: int           // the bytes the lobs hold
     pl: lexdb_plsql.Ip      // PL/SQL: DBMS_OUTPUT, the statements parsed, ...
     prog: lexdb_plsql.Prog  // the stored procedures and functions, compiled
+    connId: int             // the listener's count of its connections (a redirect's round robin)
+    local: str              // the address the client reached (a redirect's host for a wildcard one)
 }
 
 // The session's state ALTER SESSION sets (O5).
@@ -1174,6 +1179,8 @@ fn (c: mut &Conn) endCall(num: int, text: &str, cursor: int, rows: int) {
 
 // oraOf with what the connection knows: a table the user cannot see at all is ORA-00942, one it can read but not change ORA-01031.
 fn (c: mut &Conn) oraErr(e: &DbErr): OraErr {
+    // a write a replica finds at its commit (a sequence's): its database is read-only (9.137)
+    if e.state == lexdb_base.S_READ_ONLY && lexdb_standby.isReplica(&c.st) { return OraErr{num: 16000, text: lexdb_standby.ORA_READ_ONLY} }
     if e.state == "42501" && strings.startsWith(&e.msg, "permission denied for table ") {
         let t = e.msg[28..len(e.msg)].toStr()
         match c.rowsOf("select has_table_privilege(current_user, " + lexdb_oraadm.qlit(&t) + ", 'select')") {
@@ -3295,6 +3302,17 @@ fn (c: mut &Conn) requests(): Result[Unit, str] {
 
 type Connect = record { version: int; sdu: int; service: str }
 
+// The read-only service (--tns-ro-service, lexdb.md 9.137), lower case: a CONNECT to the master naming it is redirected
+// to a replica; "" for the default ones, the service names with _ro.
+var RO_SERVICE: str = ""
+
+pub fn setReadOnlyService(name: &str) { RO_SERVICE = strings.toLowerAscii(name) }
+
+fn readOnlyService(svc: &str): bool {
+    if RO_SERVICE != "" { return svc == RO_SERVICE }
+    return svc == SERVICE + "_ro" || svc == SERVICE2 + "_ro"
+}
+
 // The service named in a connect descriptor: SERVICE_NAME= or SID=, lower case; "" none.
 fn serviceOf(desc: &str): str {
     let low = strings.toLowerAscii(&desc)
@@ -3336,7 +3354,20 @@ fn (c: mut &Conn) connect(): Result[bool, str] {
         desc = q.data[2..len(q.data)].clone()
     }
     let svc = serviceOf(&desc)
-    if len(svc) > 0 && svc != SERVICE && svc != SERVICE2 {
+    // the read-only service (lexdb.md 9.137): on the master, a REDIRECT to a replica serving this door, as a listener
+    // does for a service a Data Guard standby runs; none up: REFUSE 12514, as for a role-based service running nowhere.
+    // A replica serves it itself.
+    let ro = len(svc) > 0 && readOnlyService(&svc)
+    if ro && !lexdb_standby.isReplica(&c.st) {
+        match lexdb_repl.routeOf(&c.st, if c.secure { "tcps" } else { "tns" }, c.connId) {
+            Some(addr) {
+                try c.redirect(&addr, &desc)
+                return Ok(false)
+            }
+            None {}
+        }
+    }
+    if len(svc) > 0 && ((svc != SERVICE && svc != SERVICE2 && !ro) || (ro && !lexdb_standby.isReplica(&c.st))) {
         let text = "(DESCRIPTION=(ERR=12514)(VSNNUM=386465792)(ERROR_STACK=(ERROR=(CODE=12514)(EMFI=4))))"
         var b: []byte = []
         append(mut &b, byte(0))
@@ -3370,6 +3401,32 @@ fn (c: mut &Conn) connect(): Result[bool, str] {
     return Ok(true)
 }
 
+// REDIRECT (packet type 5): the replica's address (HOST:PORT; a wildcard host is the one the client reached this
+// listener on), a NUL, and the client's descriptor, which the client sends again there.
+fn (c: mut &Conn) redirect(addr: &str, desc: &str): Result[Unit, str] {
+    let colon = strings.lastIndexOf(addr, ":")
+    var host = addr[0..colon].toStr()
+    let port = addr[colon + 1..len(addr)].toStr()
+    if host == "0.0.0.0" || host == "[::]" || host == "::" || host == "" {
+        let lc = strings.lastIndexOf(&c.local, ":")
+        host = if lc > 0 { c.local[0..lc].toStr() } else { "localhost" }
+    }
+    if strings.startsWith(&host, "[") && strings.endsWith(&host, "]") { host = host[1..len(host) - 1].toStr() }
+    let data = "(ADDRESS=(PROTOCOL=" + (if c.secure { "tcps" } else { "tcp" }) + ")(HOST=" + host + ")(PORT=" + port + "))\x00" + desc
+    // the REDIRECT packet holds the data's length; the data follow in a DATA packet (data flags 0), as a listener sends
+    // them (python-oracledb's ConnectMessage reads the length, then waits for the next packet)
+    var b: []byte = []
+    append(mut &b, byte((len(data) >> 8) & 0xff))
+    append(mut &b, byte(len(data) & 0xff))
+    try c.w.sendPacket(PT_REDIRECT, &(strFromBytes(&b)))
+    var d: []byte = []
+    append(mut &d, byte(0))
+    append(mut &d, byte(0))
+    appendStr(mut &d, &data)
+    try c.w.sendPacket(PT_DATA, &(strFromBytes(&d)))
+    return Ok(Unit{})
+}
+
 pub type ConnArg = record { pub conn: net.Conn; pub st: lexdb_store.Store; pub id: int; secret: str; ctx: []tls.Context }
 
 // Serves one client until it goes away.
@@ -3378,7 +3435,8 @@ pub fn serve(a: ConnArg): int {
     let nd = sock.setNoDelay(true)
     let sess = lexdb_exec.newSession(st.share())
     sess.setDoor(&"tns")
-    var c = Conn{w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",
+    let local = sock.localAddr()
+    var c = Conn{connId: id, local: local, w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",
                  auth: Auth{have: false, role: "", salt: "", count: 0, hash: "", partA: "", csk: "", noLogin: false}, cursors: [],
                  nextCursor: 0, loggedIn: false, batch: [], secure: false, nls: newNls(), localZone: "UTC", lobs: [], nextLob: 0, lobBytes: 0, pl: lexdb_plsql.newIp(st.share()), prog: lexdb_plsql.newProg()}
     // Oracle has no limit on a recursive WITH's iterations (its cycle check ends the common runaway; lexdb's statement

@@ -2783,23 +2783,67 @@ fn tlsOver(sock: net.Conn, cfg: &Config, w: Where): Result[Stream, Error] {
 // Every step parks only the task. A wrong password is the server's
 // ORA-01017.
 pub fn open(cfg: &Config, w: Where): Result[Session, Error] {
-    let sock = match net.dial(&(addrOf(&cfg.host, cfg.port)), w) {
-        Ok(c) { c }
-        Err(e) { return Err(ioFail(e)) }
+    var at = cfg.clone()
+    var desc = descriptor(cfg)
+    var hops = 0
+    while true {
+        let sock = match net.dial(&(addrOf(&at.host, at.port)), w) {
+            Ok(c) { c }
+            Err(e) { return Err(ioFail(e)) }
+        }
+        let nd = sock.setNoDelay(true)
+        let st = if at.tls { try tlsOver(sock, &at, w) } else { Stream.Plain(sock) }
+        var s = Session{t: transport(st), fieldVersion: FV_MAX, seq: 0, broken: false, maxString: 4000, charset: 0,
+                        ncharset: 0, banner: "", version: "", sessionId: 0, serial: 0, inTransaction: false, warnings: [],
+                        maxReply: 1 << 30, toClose: [], streamCursor: 0, eor: false, fastAuth: false,
+                        requests: 0, pending: false, pendingCols: []}
+        match try s.connect(&at, &desc, w) {
+            Some(r) {
+                // a listener's REDIRECT (a service another instance serves: Data Guard's role-based services): the
+                // descriptor it gives, CONNECT again at the address it names; a few hops at most
+                hops += 1
+                if hops > 3 { return Err(proto("tns: redirected more than three times")) }
+                at.host = r.host.clone()
+                at.port = r.port
+                at.tls = r.tls
+                desc = r.desc.clone()
+            }
+            None {
+                try s.login(cfg, w)
+                return Ok(s)
+            }
+        }
     }
-    let nd = sock.setNoDelay(true)
-    let st = if cfg.tls { try tlsOver(sock, cfg, w) } else { Stream.Plain(sock) }
-    var s = Session{t: transport(st), fieldVersion: FV_MAX, seq: 0, broken: false, maxString: 4000, charset: 0,
-                    ncharset: 0, banner: "", version: "", sessionId: 0, serial: 0, inTransaction: false, warnings: [],
-                    maxReply: 1 << 30, toClose: [], streamCursor: 0, eor: false, fastAuth: false,
-                    requests: 0, pending: false, pendingCols: []}
-    try s.connect(cfg, w)
-    try s.login(cfg, w)
-    return Ok(s)
+    return Err(proto("unreachable"))
 }
 
-fn (s: mut &Session) connect(cfg: &Config, w: Where): Result[Unit, Error] {
-    let desc = descriptor(cfg)
+// Where a listener's REDIRECT sends the client, and the descriptor to send there.
+type Redirect = record { host: str; port: int; tls: bool; desc: str }
+
+// A REDIRECT's data: (ADDRESS=(PROTOCOL=p)(HOST=h)(PORT=n)), a NUL, the descriptor.
+fn redirectOf(data: &str, cfg: &Config): Result[Redirect, Error] {
+    let nul = strings.indexOf(data, "\x00", 0)
+    if nul < 0 { return Err(proto(&("tns: a REDIRECT without its descriptor: " + data))) }
+    let addr = strings.toLowerAscii(data[0..nul])
+    let host = valueIn(&data[0..nul].toStr(), &addr, "(host=")
+    let port = strings.parseIntOpt(&(valueIn(&data[0..nul].toStr(), &addr, "(port="))).unwrapOr(0)
+    if host == "" || port <= 0 { return Err(proto(&("tns: a REDIRECT to no address: " + data[0..nul]))) }
+    return Ok(Redirect{host: host, port: port, tls: valueIn(&addr, &addr, "(protocol=") == "tcps", desc: data[nul + 1..len(data)].toStr()})
+}
+
+// The value after key (lower case, in low, the lower-case text) up to the next ")", from text.
+fn valueIn(text: &str, low: &str, key: &str): str {
+    let at = strings.indexOf(low, key, 0)
+    if at < 0 { return "" }
+    let from = at + len(key)
+    var to = from
+    while to < len(text) && text[to] != ')' { to += 1 }
+    return strings.trim(text[from..to]).toStr()
+}
+
+// CONNECT with the descriptor desc: None once ACCEPTed, the redirect when the
+// listener sends the client elsewhere.
+fn (s: mut &Session) connect(cfg: &Config, desc: &str, w: Where): Result[Option[Redirect], Error] {
     var tries = 0
     while true {
         try s.t.sendPacket(PT_CONNECT, 0, &(connectBody(&desc)), w)
@@ -2816,11 +2860,21 @@ fn (s: mut &Session) connect(cfg: &Config, w: Where): Result[Unit, Error] {
             s.t.sdu = max(512, min(a.sdu, 2097152))
             s.eor = a.version >= VERSION_MIN_END_OF_RESPONSE && (a.flags2 & ACCEPT_HAS_END_OF_RESPONSE) != 0
             s.fastAuth = (a.flags2 & ACCEPT_FAST_AUTH) != 0
-            return Ok(Unit{})
+            return Ok(None)
         }
         if p.ptype == PT_REFUSE { return Err(refuseError(&p.data, cfg)) }
         if p.ptype == PT_REDIRECT {
-            return Err(sqldialect.dbError(sqldialect.E_PROTOCOL, "tns: the listener redirects the connection; redirects are not supported yet"))
+            // its data's length, the data after it or in the next (DATA) packet, after that one's flags
+            if len(p.data) < 2 { return Err(proto("tns: a REDIRECT without its length")) }
+            let n = (int(p.data[0]) << 8) | int(p.data[1])
+            var data = p.data[2..len(p.data)].toStr()
+            if len(data) < n {
+                let q = try s.t.receive(w)
+                if q.ptype != PT_DATA || len(q.data) < 2 { return Err(proto("tns: a REDIRECT's data missing")) }
+                data = data + q.data[2..len(q.data)]
+            }
+            if len(data) > n { data = data[0..n].toStr() }
+            return Ok(Some(try redirectOf(&data, cfg)))
         }
         if p.ptype != PT_RESEND || tries > 3 { return Err(proto(&("a packet of type " + p.ptype.toStr() + " for CONNECT"))) }
         tries += 1
