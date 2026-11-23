@@ -95,7 +95,7 @@ UPDATE
 - Setting an identity column gives error 544, with lexdb's text; SQL Server gives 8102 ("Cannot update identity
   column").
 - `WHERE CURRENT OF` is not supported: lexdb has no cursors. There are no triggers.
-- The text of many error messages is lexdb's (PostgreSQL's wording), with SQL Server's number and severity.
+- Most error messages are SQL Server's; those with number 50000 carry lexdb's text.
 
 ## Examples
 
@@ -279,14 +279,14 @@ PRINT 'the batch went on';
 
 ```text
 Msg 547, Level 16, State 1, Line 1
-new row for relation "emp" violates check constraint "emp_salary_check"
-Msg 547, Level 16, State 1, Line 1
-insert or update on table "emp" violates foreign key constraint "emp_dept_id_fkey"
-Msg 515, Level 16, State 1, Line 1
-null value in column "name" of relation "emp" violates not-null constraint
-Msg 544, Level 16, State 1, Line 1
+The UPDATE statement conflicted with the CHECK constraint "emp_salary_check". The conflict occurred in database "lexdb", table "dbo.emp", column 'salary'.
+Msg 547, Level 16, State 1, Line 2
+The UPDATE statement conflicted with the FOREIGN KEY constraint "emp_dept_id_fkey". The conflict occurred in database "lexdb", table "dbo.dept", column 'id'.
+Msg 515, Level 16, State 1, Line 3
+Cannot insert the value NULL into column 'name', table 'lexdb.dbo.emp'; column does not allow nulls. UPDATE fails.
+Msg 544, Level 16, State 1, Line 4
 column "id" can only be updated to DEFAULT
-Msg 2628, Level 16, State 1, Line 1
+Msg 2628, Level 16, State 1, Line 5
 value too long for type character varying(30)
 the batch went on
 ```
@@ -304,7 +304,7 @@ ROLLBACK;
 ```text
 (4 rows affected)
 
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 3
 lexdb: UPDATE with batch_rows cannot run inside a transaction block
 ```
 
@@ -322,7 +322,7 @@ GO
 ```text
 Msg 208, Level 16, State 1, Line 1
 Invalid object name 's'.
-Msg 102, Level 15, State 1, Line 1
+Msg 102, Level 15, State 1, Line 2
 Incorrect syntax near '@total'.
 ```
 
