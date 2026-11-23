@@ -149,7 +149,7 @@ GO
 ```text
 Msg 15151, Level 16, State 1, Line 1
 Cannot find the object 'nothere', because it does not exist or you do not have permission.
-Msg 15151, Level 16, State 1, Line 1
+Msg 15151, Level 16, State 1, Line 2
 Cannot find the user 'nobody', because it does not exist or you do not have permission.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: column privileges are not supported
