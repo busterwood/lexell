@@ -56,7 +56,6 @@ lexdb behaves as SQL Server does with its usual settings (`ANSI_NULLS ON`, `CONC
 - `QUOTED_IDENTIFIER` takes effect at the next batch, not at the next statement of the same batch.
 - A word that is not an option (`SET BOGUS ON`) is taken without an error.
 - `@@OPTIONS` is not available (error 195).
-- A `PRINT` right after a `SET` statement does not reach JDBC programs (see [PRINT](print.md)).
 
 ## Examples
 
