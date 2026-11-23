@@ -19,6 +19,7 @@
 // engine's hook (ArgSrc), so a value the engine would evaluate is evaluated
 // at the same row, in the same order, as its row path does.
 import "collections"
+import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_ops"
@@ -52,6 +53,7 @@ pub type WinPlan = record {
     pub end: int
     pub endOff: Option[Expr]
     pub exclude: int            // EX_*
+    pub nulls: int              // lag ... nth_value: NULLS_RESPECT, NULLS_IGNORE, NULLS_TSQL (IGNORE NULLS, nullsValues)
 }
 
 // Windows that went through values (the tests' look: that the batches' path ran).
@@ -1679,6 +1681,7 @@ fn rowPart(w: &WinPlan, idx: &[]int, lo: int, hi: int, peerBreak: &[]bool, ocol:
 // Call w's values by the batches' columns (batch) or by the row path.
 pub fn compute(batch: bool, rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: &Sorted, okey: &KeyCol, so: &Val, eo: &Val,
                ev: &fn(int, int): Result[Val, DbErr], col: mut &[]Val): Result[Unit, DbErr] {
+    if w.nulls != NULLS_RESPECT { return nullsValues(rows, w, args, srt, okey, so, eo, ev, col) }
     if batch { return values(rows, w, args, srt, okey, so, eo, ev, col) }
     return rowValues(rows, w, srt, &okey.vals, so, eo, ev, col)
 }
@@ -1822,4 +1825,175 @@ pub fn frameOff(r: Val, w: &WinPlan, start: bool): Result[Val, DbErr] {
     }
     if try lexdb_ops.compare(&r, &zero) < 0 { return Err(e("22013", "invalid preceding or following size in window function")) }
     return Ok(r)
+}
+
+// ---- IGNORE NULLS (design/lexdb-new-features.md P5, S15, O25)
+//
+// lag, lead, first_value, last_value and nth_value with IGNORE NULLS: one walk, for the row path and the batches' alike
+// (compute sends the call here either way). Per partition, the argument's values in the window's order and where the
+// ones not NULL are (before[k]: how many of them come before position k). lag and lead: the off'th value not NULL before
+// or after the row (PostgreSQL's and Oracle's; an offset of 0 the row's own, a negative one the other direction), the
+// default when there is none; in SQL Server (NULLS_TSQL) the row off rows away and, when its value is NULL, the nearest
+// one not NULL beyond it in the same direction within the partition (NULL when none; the default only when the row off
+// away is outside the partition). first_value, last_value and nth_value: the first, last or nth value not NULL of the
+// row's frame (frameBounds), EXCLUDE's positions left out.
+
+pub const NULLS_RESPECT = 0
+pub const NULLS_IGNORE = 1
+pub const NULLS_TSQL = 2
+pub const NULLS_ORA = 3            // NULLS_IGNORE's values, Oracle's errors (ORA-01428 for an offset or n below 1)
+
+// The null treatment a window call's name carries (the parser's " nulls:i", " nulls:t").
+pub fn nullsOf(name: &str): int {
+    if strings.contains(name, " nulls:t") { return NULLS_TSQL }
+    if strings.contains(name, " nulls:o") { return NULLS_ORA }
+    if strings.contains(name, " nulls:i") { return NULLS_IGNORE }
+    return NULLS_RESPECT
+}
+
+fn nullsValues(rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: &Sorted, okey: &KeyCol, so: &Val, eo: &Val,
+               ev: &fn(int, int): Result[Val, DbErr], col: mut &[]Val): Result[Unit, DbErr] {
+    let n = len(rows)
+    var lo = 0
+    while lo < n {
+        var hi = lo + 1
+        while hi < n && !srt.partBreak[hi] { hi += 1 }
+        try nullsPart(rows, w, args, srt, okey, so, eo, ev, lo, hi, col)
+        lo = hi
+    }
+    return Ok(Unit{})
+}
+
+fn nullsPart(rows: &[]WinRow, w: &WinPlan, args: &[]ArgSrc, srt: &Sorted, okey: &KeyCol, so: &Val, eo: &Val,
+             ev: &fn(int, int): Result[Val, DbErr], lo: int, hi: int, col: mut &[]Val): Result[Unit, DbErr] {
+    let m = hi - lo
+    let idx = &srt.idx
+    var vals: []Val = withCapacity(m)
+    var nn: []int = []
+    var before: []int = withCapacity(m + 1)
+    for k in 0..m {
+        append(mut &before, len(nn))
+        let v = try getArg(rows, &args[0], 0, idx[lo + k], ev)
+        if !lexdb_ops.isNull(&v) { append(mut &nn, k) }
+        append(mut &vals, v)
+    }
+    append(mut &before, len(nn))
+    let f = funcOf(&w.fname)
+    if f == F_LAG || f == F_LEAD {
+        for k in 0..m {
+            let r = idx[lo + k]
+            var off = 1
+            if len(args) > 1 {
+                let ov = try getArg(rows, &args[1], 1, r, ev)
+                if lexdb_ops.isNull(&ov) { continue }
+                off = try toInt(ov)
+            }
+            if w.nulls == NULLS_ORA && off < 1 { return Err(e("ORA01428", &("Argument " + off.toStr() + " is out of range."))) }
+            if w.nulls == NULLS_TSQL && off < 0 { return Err(e("TS8730", "Offset parameter for Lag and Lead functions cannot be a negative value.")) }
+            let back = f == F_LAG
+            var at = -2                         // the position of the value; -2: the default's; -1: NULL
+            if w.nulls == NULLS_TSQL {
+                let t = if back { k - off } else { k + off }
+                if t >= 0 && t < m {
+                    at = t
+                    if back { while at >= 0 && lexdb_ops.isNull(&vals[at]) { at -= 1 } }
+                    else {
+                        while at < m && lexdb_ops.isNull(&vals[at]) { at += 1 }
+                        if at >= m { at = -1 }
+                    }
+                }
+            } else {
+                let o = if back { off } else { -off }   // a lag of o: o > 0 before, o < 0 after
+                if o == 0 { at = k }
+                else if o > 0 {
+                    let j = before[k] - o
+                    if j >= 0 { at = nn[j] }
+                } else {
+                    let j = before[k + 1] - o - 1
+                    if j < len(nn) { at = nn[j] }
+                }
+            }
+            if at >= 0 { col[r] = vals[at].clone() }
+            else if at == -2 && len(args) > 2 { col[r] = try getArg(rows, &args[2], 2, r, ev) }
+        }
+        return Ok(Unit{})
+    }
+    // first_value, last_value, nth_value: the frames as the row path finds them
+    let pbk = &srt.peerBreak
+    var grp: []int = []
+    var gStart: []int = []
+    var gEnd: []int = []
+    for k in 0..m {
+        if k == 0 || pbk[lo + k] {
+            if k > 0 { append(mut &gEnd, k) }
+            append(mut &gStart, k)
+        }
+        append(mut &grp, len(gStart) - 1)
+    }
+    append(mut &gEnd, m)
+    var keyAt: []Val = []
+    if w.mode == lexdb_sql.FR_RANGE && len(w.order) == 1 {
+        for k in 0..m {
+            let r = idx[lo + k]
+            if okey.slot >= 0 && okey.slot < len(rows[r].row) { append(mut &keyAt, rows[r].row[okey.slot].clone()) }
+            else if r < len(okey.vals) { append(mut &keyAt, okey.vals[r].clone()) }
+            else { append(mut &keyAt, Val.Null) }
+        }
+    }
+    for k in 0..m {
+        let r = idx[lo + k]
+        var nth = 1
+        if f == F_NTH {
+            let nv = try getArg(rows, &args[1], 1, r, ev)
+            if lexdb_ops.isNull(&nv) { continue }
+            nth = try toInt(nv)
+            if nth <= 0 && w.nulls == NULLS_ORA { return Err(e("ORA01428", &("Argument " + nth.toStr() + " is out of range."))) }
+            if nth <= 0 { return Err(e("22016", "argument of nth_value must be greater than zero")) }
+        }
+        var a = 0
+        var b = 0
+        try frameBounds(w, k, m, &grp, &gStart, &gEnd, &keyAt, so, eo, mut &a, mut &b)
+        if b < a { continue }
+        var x1 = 0
+        var y1 = 0
+        var x2 = 0
+        var y2 = 0
+        let g = grp[k]
+        exclOf(w.exclude, k, gStart[g], gEnd[g], mut &x1, mut &y1, mut &x2, mut &y2)
+        // the frame less the excluded intervals: up to three pieces, in order
+        var ps: []int = []
+        var c = a
+        for i in 0..2 {
+            let x = if i == 0 { x1 } else { x2 }
+            let y = if i == 0 { y1 } else { y2 }
+            if x > y { continue }
+            if c <= min(b, x - 1) {
+                append(mut &ps, c)
+                append(mut &ps, min(b, x - 1))
+            }
+            c = max(c, y + 1)
+        }
+        if c <= b {
+            append(mut &ps, c)
+            append(mut &ps, b)
+        }
+        var at = -1
+        if f == F_LAST {
+            var i = len(ps) - 2
+            while i >= 0 && at < 0 {
+                if before[ps[i + 1] + 1] > before[ps[i]] { at = nn[before[ps[i + 1] + 1] - 1] }
+                i -= 2
+            }
+        } else {
+            var rem = nth
+            var i = 0
+            while i < len(ps) && at < 0 {
+                let cnt = before[ps[i + 1] + 1] - before[ps[i]]
+                if cnt >= rem { at = nn[before[ps[i]] + rem - 1] } else { rem -= cnt }
+                i += 2
+            }
+        }
+        if at >= 0 { col[r] = vals[at].clone() }
+    }
+    return Ok(Unit{})
 }

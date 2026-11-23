@@ -1,0 +1,158 @@
+// lexdb over TNS: IGNORE NULLS and RESPECT NULLS of LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE (design/lexdb-new-features.md
+// O25), after the call (f(x) IGNORE NULLS OVER) and inside it (f(x IGNORE NULLS) OVER): offsets, defaults, NULL offsets,
+// partitions, ROWS, RANGE and GROUPS frames with offsets and EXCLUDE, text values, a named window, NULLS FIRST orders, 3,000
+// rows grouped, no rows, every value NULL, an error in a later row (ORA-01476, ORA-01428); ORA-01428 for an offset or n below 1,
+// ORA-30484 for another function, two treatments and no OVER. Checked against Oracle Database Free 23.26 (gen_oracle.py --check
+// tns_winnulls: the answers below are Oracle's). Each statement runs with set lexdb_batch = off (the row engine) and on: "same"
+// and the answer, or DIFFERENT and both.
+// expect: setup: 7 statements
+// expect: same: ID,A,B,C,E = 1|NULL|10|NULL|10;2|NULL|20|NULL|20;3|10|20|NULL|20;4|10|30|NULL|-1;5|20|30|10|-1;6|20|30|10|30;7|20|30|10|30;8|20|NULL|10|-1;9|30|NULL|20|-1
+// expect: same: ID,A,B,C,D,E = 1|NULL|20|NULL|NULL|99;2|NULL|30|10|10|99;3|10|30|10|10|10;4|10|NULL|10|20|10;5|20|NULL|10|20|20;6|20|NULL|10|20|99;7|20|NULL|10|20|99;8|20|NULL|10|30|99;9|30|NULL|10|30|30
+// expect: same: ID,A,B,C,D = 1|-5|-5|NULL|NULL;2|NULL|NULL|NULL|NULL;3|10|10|NULL|NULL;4|NULL|NULL|NULL|NULL;5|20|20|NULL|NULL;6|NULL|NULL|NULL|NULL;7|NULL|NULL|NULL|NULL;8|NULL|NULL|NULL|NULL;9|30|30|NULL|NULL
+// expect: same: ID,A,B,C,D,E = 1|NULL|NULL|20|NULL|10;2|10|10|20|NULL|10;3|10|10|20|NULL|20;4|10|20|20|NULL|20;5|10|20|20|NULL|20;6|10|20|20|NULL|NULL;7|10|20|20|NULL|30;8|10|30|20|NULL|30;9|10|30|20|NULL|30
+// expect: same: ID,A,B,C = 1|10|NULL|20;2|20|10|20;3|20|10|30;4|NULL|20|30;5|30|20|30;6|30|NULL|20;7|30|NULL|20;8|NULL|30|NULL;9|NULL|30|NULL
+// expect: same: ID,A,B,C,D = 1|'p'|'s'|'none'|NULL;2|'p'|'s'|'none'|NULL;3|'r'|'s'|'p'|NULL;4|'r'|'s'|'p'|NULL;5|'r'|'s'|'q'|'r';6|NULL|'s'|'r'|'r';7|NULL|'s'|'r'|'r';8|'s'|'s'|'r'|'r';9|'s'|'s'|'r'|'r'
+// expect: same: ID,A,B = 1|10|10;2|10|10;3|20|20;4|20|20;5|20|NULL;6|20|30;7|30|30;8|30|30;9|30|NULL
+// expect: same: ID,A,B = 1|NULL|NULL;2|NULL|10;3|10|10;4|10|10;5|20|10;6|NULL|NULL;7|NULL|NULL;8|NULL|30;9|30|30
+// expect: same: K,X,A,B = 'a'|NULL|NULL|NULL;'a'|10|10|30;'b'|NULL|NULL|NULL;'b'|20|20|30;'b'|NULL|NULL|NULL;'a'|NULL|NULL|NULL;'a'|NULL|NULL|NULL;'c'|30|30|30;'c'|NULL|NULL|NULL
+// expect: same: G,N,SA,SB,SC,SD,CE,SF = 0|428|10534|9842|10522|10502|424|6885;1|429|10469|10606|10509|10440|425|7007;2|429|10583|11335|10395|10622|424|7109;3|429|10568|10153|10474|10601|425|6932;4|429|10492|9928|10531|10377|423|6879;5|428|10587|11102|10359|10514|424|7082;6|428|10550|10761|10351|10585|423|7003
+// expect: same: ID,K,A,B = 5|NULL|NULL|NULL;10|NULL|5|NULL;11|'k2'|NULL|NULL;12|'k0'|NULL|NULL;1500|NULL|10|5;2995|NULL|10|10;2996|'k2'|11|NULL;3000|NULL|45|10
+// expect: same: ID,A,B = 
+// expect: same: ID,A,B = 1|NULL|NULL;3|NULL|NULL;5|NULL|NULL;6|NULL|NULL;7|NULL|NULL;9|NULL|NULL
+// expect: same: error 1476
+// expect: same: error 1428
+// expect: same: error 1428
+// expect: same: error 1428
+// expect: same: error 1428
+// expect: same: error 30484
+// expect: same: error 30484
+// expect: same: error 30484
+// expect: same: error 30484
+// expect: same: error 30484
+// expect: same: error 30484
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg select level - 1 from dual connect by level <= 10\ncreate table wn (id number primary key, g number, k varchar2(5), x number, s varchar2(5))\ninsert into wn select 1, 1, 'a', null, null from dual union all select 2, 1, 'a', 10, 'p' from dual union all select 3, 1, 'b', null, null from dual union all select 4, 1, 'b', 20, 'q' from dual union all select 5, 1, 'b', null, 'r' from dual union all select 6, 2, 'a', null, null from dual union all select 7, 2, 'a', null, null from dual union all select 8, 2, 'c', 30, null from dual union all select 9, 2, 'c', null, 's' from dual\ncreate table wb (id number primary key, g number, k varchar2(5), x number)\ninsert into wb select n, mod(n, 7), case when mod(n, 5) = 0 then null else 'k' || mod(n, 3) end, case when mod(n, 4) = 0 or mod(n, 9) = 0 then null else mod(n, 50) end from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000\ncreate table we (id number primary key, x number)"
+
+const QS = "select id, lag(x) ignore nulls over (order by id) a, lead(x) ignore nulls over (order by id) b, lag(x, 2) ignore nulls over (order by id) c, lead(x, 1, -1) ignore nulls over (partition by g order by id) e from wn order by id\nselect id, lag(x ignore nulls) over (order by id) a, lead(x ignore nulls, 2) over (order by id) b, first_value(x ignore nulls) over (order by id) c, last_value(x ignore nulls) over (order by id) d, lag(x ignore nulls, 1, 99) over (partition by g order by id) e from wn order by id\nselect id, lag(x respect nulls, 1, -5) over (order by id) a, lag(x, 1, -5) respect nulls over (order by id) b, lag(x, null) ignore nulls over (order by id) c, first_value(x respect nulls) over (order by id) d from wn order by id\nselect id, first_value(x) ignore nulls over (order by id) a, last_value(x) ignore nulls over (order by id) b, nth_value(x, 2) ignore nulls over (order by id rows between unbounded preceding and unbounded following) c, first_value(x) respect nulls over (order by id) d, last_value(x) ignore nulls over (order by id rows between 1 preceding and 1 following) e from wn order by id\nselect id, first_value(x) ignore nulls over (order by id rows between 1 following and 3 following exclude current row) a, last_value(x) ignore nulls over (partition by g order by id groups between 1 preceding and current row exclude ties) b, nth_value(x, 1) ignore nulls over (order by k range between current row and unbounded following exclude group) c from wn order by id\nselect id, first_value(s) ignore nulls over (partition by k order by id desc) a, last_value(s) ignore nulls over (order by k, id range between unbounded preceding and unbounded following) b, lag(s, 1, 'none') ignore nulls over (order by id) c, nth_value(s, 3) ignore nulls over (order by id) d from wn order by id\nselect id, last_value(x) ignore nulls over (order by id range between 2 preceding and 1 following) a, first_value(x) ignore nulls over (order by id groups between current row and 2 following) b from wn order by id\nselect id, lag(x) ignore nulls over w1 a, first_value(x) ignore nulls over w1 b from wn window w1 as (partition by g order by id) order by id\nselect k, x, last_value(x) ignore nulls over (partition by k order by x nulls first) a, first_value(x) ignore nulls over (order by x desc nulls first, id) b from wn order by id\nselect g, count(*) n, sum(a) sa, sum(b) sb, sum(c) sc, sum(d) sd, count(e) ce, sum(f) sf from (select g, lag(x) ignore nulls over (partition by g order by id) a, lead(x, 3, 0) ignore nulls over (partition by g order by id) b, first_value(x) ignore nulls over (partition by g order by id rows between 5 preceding and 5 following) c, last_value(x ignore nulls) over (partition by k order by id) d, nth_value(x, 4) ignore nulls over (partition by g order by id) e, lag(x, 2, -1) respect nulls over (partition by g order by id) f from wb) t group by g order by g\nselect id, k, lag(x) ignore nulls over (partition by k order by id) a, last_value(x) ignore nulls over (partition by k order by id rows between 10 preceding and 2 preceding) b from wb where id in (5, 10, 11, 12, 1500, 2995, 2996, 3000) order by id\nselect id, lag(x) ignore nulls over (order by id) a, first_value(x) ignore nulls over () b from we\nselect id, lag(x) ignore nulls over (order by id) a, nth_value(x, 2) ignore nulls over (order by id) b from wn where x is null order by id\nselect count(a) n from (select lag(x, 3000 / (3000 - id)) ignore nulls over (order by id) a from wb) t\nselect id, lag(x, 0) ignore nulls over (order by id) a from wn\nselect id, lead(x ignore nulls, 0) over (order by id) a from wn\nselect count(a) n from (select lag(x, 1 - floor(id / 3000)) ignore nulls over (order by id) a from wb) t\nselect id, nth_value(x, 0) ignore nulls over (order by id) a from wn\nselect row_number() ignore nulls over (order by id) from wn\nselect rank() respect nulls over (order by id) from wn\nselect ntile(2) ignore nulls over (order by id) from wn\nselect id, lag(x ignore nulls) ignore nulls over (order by id) a from wn order by id\nselect first_value(x) ignore nulls from wn\nselect lag(x ignore nulls) a from wn"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(62), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

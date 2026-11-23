@@ -200,6 +200,7 @@ CHECKED = {
     'tns_leftovers': ('consts', 'QS'),
     'tns_recursion': ('consts', 'QS'),
     'tns_decfit': ('consts', 'QS'),
+    'tns_winnulls': ('consts', 'QS'),
 }
 
 

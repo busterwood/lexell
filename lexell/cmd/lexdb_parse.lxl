@@ -2263,6 +2263,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 if p.acceptKw("distinct") { fname = fname + " distinct" } else { let al = p.acceptKw("all") }
                 append(mut &argNames, p.namedArg())
                 append(mut &args, try p.callArg(len(qual) > 0))
+                if p.ora && (p.isKw("ignore") || p.isKw("respect")) && p.peekAt(1).text == "nulls" { fname = try p.nullsTreat(&fname, true) }
                 while p.acceptKw(",") {
                     if p.ora && (p.isKw("end") || p.isKw("start")) && fname == "time_bucket" {
                         // Oracle's TIME_BUCKET(..., START | END): 0 or 1
@@ -2384,6 +2385,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 try p.expectKw(")")
                 fname = fname + " filter"
             }
+            if (p.isKw("ignore") || p.isKw("respect")) && p.peekAt(1).text == "nulls" { fname = try p.nullsTreat(&fname, false) }
             if lexdb_sql.isCatFn(&fname) { append(mut &p.seqs, CAT_MARK) }
             if fname == "current_setting" || fname == "set_config" { append(mut &p.seqs, SET_MARK) }
             if (fname == "nextval" || fname == "currval" || fname == "setval") && len(args) > 0 {
@@ -2411,7 +2413,10 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             }
             if len(qual) > 0 { return Ok(Expr.Call(fname, args, star)) }
             if p.tsql && !p.isKw("over") { return p.tsqlCall(&fname, args, star) }
-            if p.ora && !p.isKw("over") { return p.oraCall(&fname, args, star) }
+            if p.ora && !p.isKw("over") {
+                if strings.contains(&fname, " nulls:") { return Err(lexdb_base.err("ORA30484", "missing OVER clause, or invalid identifier found for window function")) }
+                return p.oraCall(&fname, args, star)
+            }
             if p.acceptKw("over") {
                 // a window call (9.46): kept in the query, named here by number
                 var d = try p.over()
@@ -9795,4 +9800,39 @@ fn oraDateAdd(name: &str, args: []Expr): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Call("#dateadd", a, false))
     }
     return Ok(Expr.Call("#datediff", a, false))
+}
+
+// IGNORE NULLS / RESPECT NULLS of a window call (design/lexdb-new-features.md P5, S15, O25), at p: after the call's
+// parentheses (PostgreSQL 19, SQL Server 2022, Oracle) or, in Oracle, after its first argument (inside). lag, lead,
+// first_value, last_value and nth_value (not SQL Server's, which has no nth_value) take it: IGNORE NULLS marks the name
+// " nulls:i" (" nulls:t" in the T-SQL door: SQL Server's lag and lead walk otherwise; " nulls:o" in Oracle's: its errors),
+// RESPECT NULLS is the default and marks nothing. Another function, a second treatment (Oracle's inside and after) or no
+// OVER after it: each product's error (PostgreSQL 0A000, 42809 for an aggregate or without OVER; SQL Server 16208, 195,
+// 156; Oracle ORA-30484; an Oracle aggregate's is not read: "ignore" its alias, as Oracle reads it).
+fn (p: mut &P) nullsTreat(fname: &str, inside: bool): Result[str, lexdb_base.DbErr] {
+    let base = lexdb_sql.aggBase(fname)
+    if p.ora && lexdb_sql.isAgg(fname) { return Ok(fname.clone()) }
+    let ignore = p.isKw("ignore")
+    p.pos += 2
+    let what = if ignore { "IGNORE NULLS" } else { "RESPECT NULLS" }
+    let ok = base == "lag" || base == "lead" || base == "first_value" || base == "last_value" || (base == "nth_value" && !p.tsql)
+    let twice = strings.contains(fname, " nulls:")
+    if p.ora {
+        if !ok || twice || (!inside && !p.isKw("over")) {
+            return Err(lexdb_base.err("ORA30484", "missing OVER clause, or invalid identifier found for window function"))
+        }
+    } else if p.tsql {
+        if base == "nth_value" { return Err(lexdb_base.err("TS195", "'nth_value' is not a recognized built-in function name.")) }
+        if !ok { return Err(lexdb_base.err("TS16208", &("The function '" + base + "' does not support " + what + "."))) }
+        if !p.isKw("over") { return Err(near(&p.peek())) }
+    } else {
+        if lexdb_sql.isAgg(fname) { return Err(lexdb_base.err("42809", "aggregate functions do not accept RESPECT/IGNORE NULLS")) }
+        if !p.isKw("over") {
+            if ok { return Err(lexdb_base.err("42809", &("window function " + base + " requires an OVER clause"))) }
+            return Err(near(&p.peek()))
+        }
+        if !ok { return Err(lexdb_base.err("0A000", &("function " + base + " does not allow RESPECT/IGNORE NULLS"))) }
+    }
+    if !ignore { return Ok(fname.clone()) }
+    return Ok(fname + (if p.tsql { " nulls:t" } else if p.ora { " nulls:o" } else { " nulls:i" }))
 }
