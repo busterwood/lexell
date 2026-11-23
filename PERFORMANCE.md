@@ -27,7 +27,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Faster than .NET on all but 19-digit add; slower than Java on division and comparison |
 | HTTP server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: about 1.5 times Go's requests a second, 1.2 to 1.3 times Node's |
-| LexDB | PostgreSQL 18 | Faster on one core than PostgreSQL on one core in TPC-H (level with its four processes in total), point selects through replicas, updates, analytic queries; slower on point selects from one process at 8 and 32 clients, and on bulk loads into tables with secondary indexes or no key |
+| LexDB | PostgreSQL 18 | Faster on one core than PostgreSQL on one core in TPC-H (level with its four processes in total), point selects through replicas, updates, analytic queries; slower on point selects from one process at 8 and 32 clients, and on bulk loads into tables with secondary indexes |
 | Command-line tools | GNU grep, sort, tail, eza | Faster on grep and eza, slower on sort, level on tail |
 
 ## Compile time
@@ -313,9 +313,10 @@ Analytic queries (35 queries over 1M-row tables: scans, joins, groups, windows; 
 LexDB's CPU is 0.54 of PostgreSQL's on one core (geometric mean), and its wall time 1.04 of
 PostgreSQL's on four processes; 33 of 35 are level with or ahead of PostgreSQL on one core.
 
-Bulk loads (`\copy`, median of 3, not pinned): LexDB is faster on narrow rows (1M: 0.46 against
-0.59 s; 10M: 4.85 against 5.72 s) and wide rows (1.44 against 1.81 s), slower with two secondary
-indexes (6.31 against 4.74 s) and with no primary key (2.98 against 1.52 s).
+Bulk loads (`\copy`, median of 3, not pinned; LexDB measured after this section's run, with
+COPY's fast path for tables without a primary key): LexDB is faster on narrow rows (1M: 0.49
+against 0.59 s; 10M: 4.90 against 5.72 s) and wide rows (1.45 against 1.81 s), level with no
+primary key (1.50 against 1.52 s), and slower with two secondary indexes (5.82 against 4.74 s).
 
 ## Commands
 
