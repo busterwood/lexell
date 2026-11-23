@@ -47,12 +47,13 @@ TCP only. There is no separate listener process and no `listener.ora`: lexdb is 
 ## TCPS (TLS)
 
 `--tcps HOST:PORT` serves TNS inside TLS with the certificate of `--tls-cert`. `--require-tls` refuses plain `--tns`
-logins. With a self-signed certificate, give the client a trust store:
+logins. With a self-signed certificate, give the client a trust store, and connect by a host name the certificate
+names (ojdbc checks it: ORA-17965 otherwise):
 
 ```sh
 keytool -importcert -alias lexdb -file server.pem -keystore ts.jks -storepass changeit -noprompt
 java -Djavax.net.ssl.trustStore=ts.jks -Djavax.net.ssl.trustStorePassword=changeit ... \
-  'jdbc:oracle:thin:@tcps://127.0.0.1:2484/lexdb'
+  'jdbc:oracle:thin:@tcps://localhost:2484/lexdb'
 ```
 
 ## Connection strings

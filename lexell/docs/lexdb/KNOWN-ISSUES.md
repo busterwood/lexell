@@ -47,3 +47,4 @@ smaller differences of its statement.
   Unexpected char or LITERAL " " before or at ( DESCRIPTION ...`: ojdbc 23.26 cannot parse the REDIRECT packet's data.
   python-oracledb and Lexell's `oracle` module follow it (design/lexdb.md 9.137). Connecting to a replica's own
   listener works with ojdbc.
+- **`SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL')` says `tcp` on a TCPS connection**, where Oracle says `tcps`.
