@@ -210,7 +210,7 @@ GO
 Msg 102, Level 15, State 1, Line 1
 each UNION query must have the same number of columns
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "a"
+Conversion failed when converting the varchar value 'a' to data type int.
 ```
 
 ## See also
