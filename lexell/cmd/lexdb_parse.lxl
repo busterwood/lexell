@@ -1888,7 +1888,9 @@ fn (p: mut &P) callArg(udf: bool): Result[Expr, lexdb_base.DbErr] {
         p.pos += 1
         return Ok(Expr.Call("#default", [], false))
     }
-    return p.expr()
+    let x = try p.expr()
+    if p.ora && (p.isKw("ignore") || p.isKw("respect")) { return p.oraNullsIn(x) }
+    return Ok(x)
 }
 
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
@@ -2384,6 +2386,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 try p.expectKw(")")
                 fname = fname + " filter"
             }
+            try p.nullsMark(mut &fname, mut &args)
             if lexdb_sql.isCatFn(&fname) { append(mut &p.seqs, CAT_MARK) }
             if fname == "current_setting" || fname == "set_config" { append(mut &p.seqs, SET_MARK) }
             if (fname == "nextval" || fname == "currval" || fname == "setval") && len(args) > 0 {
@@ -4106,6 +4109,7 @@ fn (p: mut &P) onConflict(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         s.conflict = CONFLICT_NOTHING
         return Ok(Unit{})
     }
+    if p.isKw("select") { return p.conflictSelect(s) }
     try p.expectKw("update")
     try p.expectKw("set")
     s.conflict = CONFLICT_UPDATE
@@ -9795,4 +9799,105 @@ fn oraDateAdd(name: &str, args: []Expr): Result[Expr, lexdb_base.DbErr] {
         return Ok(Expr.Call("#dateadd", a, false))
     }
     return Ok(Expr.Call("#datediff", a, false))
+}
+
+// IGNORE NULLS / RESPECT NULLS of a window call (design/lexdb-new-features.md P5, S15, O25), at p: after the call's
+// parentheses (PostgreSQL 19, SQL Server 2022, Oracle) or, in Oracle, after its first argument (inside). lag, lead,
+// first_value, last_value and nth_value (not SQL Server's, which has no nth_value) take it: IGNORE NULLS marks the name
+// " nulls:i" (" nulls:t" in the T-SQL door: SQL Server's lag and lead walk otherwise; " nulls:o" in Oracle's: its errors),
+// RESPECT NULLS is the default and marks nothing. Another function, a second treatment (Oracle's inside and after) or no
+// OVER after it: each product's error (PostgreSQL 0A000, 42809 for an aggregate or without OVER; SQL Server 16208, 195,
+// 156; Oracle ORA-30484; an Oracle aggregate's is not read: "ignore" its alias, as Oracle reads it).
+// (after a call's parentheses: one call in the call's parse, kept small) Oracle's treatment inside them came from callArg
+// as a #nulls:i / #nulls:r wrapper of the first argument; then the one after them.
+fn (p: mut &P) nullsMark(fname: mut &str, args: mut &[]Expr): Result[Unit, lexdb_base.DbErr] {
+    if p.ora && len(args) > 0 {
+        let w = nullsWrap(&args[0])
+        if w > 0 {
+            args[0] = nullsInner(&args[0])
+            fname = try p.nullsTreat(fname, w == 1)
+        }
+    }
+    if !(p.isKw("ignore") || p.isKw("respect")) || p.peekAt(1).text != "nulls" { return Ok(Unit{}) }
+    if p.ora && lexdb_sql.isAgg(fname) { return Ok(Unit{}) }     // (Oracle reads "ignore" as the aggregate's alias)
+    let ig = p.isKw("ignore")
+    p.pos += 2
+    fname = try p.nullsTreat(fname, ig)
+    return Ok(Unit{})
+}
+
+// Oracle's f(x IGNORE NULLS): the first argument wrapped (callArg's oraNullsIn).
+fn (p: mut &P) oraNullsIn(x: Expr): Result[Expr, lexdb_base.DbErr] {
+    if p.peekAt(1).text != "nulls" { return Ok(x) }
+    let ig = p.isKw("ignore")
+    p.pos += 2
+    return Ok(Expr.Call(if ig { "#nulls:i" } else { "#nulls:r" }, [x], false))
+}
+
+fn nullsWrap(x: &Expr): int {
+    match x {
+        Expr.Call(n, _, _) {
+            if n == "#nulls:i" { return 1 }
+            if n == "#nulls:r" { return 2 }
+        }
+        else {}
+    }
+    return 0
+}
+
+fn nullsInner(x: &Expr): Expr {
+    match x {
+        Expr.Call(_, xs, _) { if len(xs) == 1 { return cloneE(&xs[0]) } }
+        else {}
+    }
+    return cloneE(x)
+}
+
+fn (p: mut &P) nullsTreat(fname: &str, ignore: bool): Result[str, lexdb_base.DbErr] {
+    let base = lexdb_sql.aggBase(fname)
+    let what = if ignore { "IGNORE NULLS" } else { "RESPECT NULLS" }
+    let ok = base == "lag" || base == "lead" || base == "first_value" || base == "last_value" || (base == "nth_value" && !p.tsql)
+    let twice = strings.contains(fname, " nulls:")
+    if p.ora {
+        if !ok || twice || !p.isKw("over") {
+            return Err(lexdb_base.err("ORA30484", "missing OVER clause, or invalid identifier found for window function"))
+        }
+    } else if p.tsql {
+        if base == "nth_value" { return Err(lexdb_base.err("TS195", "'nth_value' is not a recognized built-in function name.")) }
+        if !ok { return Err(lexdb_base.err("TS16208", &("The function '" + base + "' does not support " + what + "."))) }
+        if !p.isKw("over") { return Err(near(&p.peek())) }
+    } else {
+        if lexdb_sql.isAgg(fname) { return Err(lexdb_base.err("42809", "aggregate functions do not accept RESPECT/IGNORE NULLS")) }
+        if !p.isKw("over") {
+            if ok { return Err(lexdb_base.err("42809", &("window function " + base + " requires an OVER clause"))) }
+            return Err(near(&p.peek()))
+        }
+        if !ok { return Err(lexdb_base.err("0A000", &("function " + base + " does not allow RESPECT/IGNORE NULLS"))) }
+    }
+    if !ignore { return Ok(fname.clone()) }
+    return Ok(fname + (if p.tsql { " nulls:t" } else if p.ora { " nulls:o" } else { " nulls:i" }))
+}
+
+// ON CONFLICT ... DO SELECT [FOR UPDATE | FOR NO KEY UPDATE | FOR SHARE | FOR KEY SHARE] [WHERE cond] (PostgreSQL 19,
+// design/lexdb-new-features.md P1), at SELECT: the third action, its lock strength in s.conflict (CONFLICT_SELECT +
+// LOCK_*), its WHERE in s.where; RETURNING and a conflict target are required (lexdb_exec.upsertOf's 42601).
+fn (p: mut &P) conflictSelect(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    p.pos += 1
+    var lock = 0
+    if p.acceptKw("for") {
+        if p.acceptKw("update") { lock = lexdb_sql.LOCK_UPDATE }
+        else if p.acceptKw("share") { lock = lexdb_sql.LOCK_SHARE }
+        else if p.acceptKw("no") {
+            try p.expectKw("key")
+            try p.expectKw("update")
+            lock = lexdb_sql.LOCK_NO_KEY_UPDATE
+        } else {
+            try p.expectKw("key")
+            try p.expectKw("share")
+            lock = lexdb_sql.LOCK_KEY_SHARE
+        }
+    }
+    s.conflict = lexdb_sql.CONFLICT_SELECT + lock
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(Unit{})
 }

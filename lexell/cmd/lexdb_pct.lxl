@@ -21,6 +21,7 @@ import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_ops"
 import "./lexdb_sort"
+import "./lexdb_decfit"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -217,7 +218,7 @@ pub fn finish(fname: &str, dia: int, desc: bool, kind: int, vals: &[]Val, f: &Va
         var k = 1
         if dia == DIA_ORA {
             let fd = lexdb_ops.asNum(f).unwrapOr(Decimal.fromInt(0))
-            k = fd.mul(Decimal.fromInt(n)).ceil(0).unwrapOr(Decimal.fromInt(1)).toInt(Rounding.CEILING).unwrapOr(1)
+            k = (try pctFit(lexdb_decfit.mulCeil(&fd, &Decimal.fromInt(n)))).ceil(0).unwrapOr(Decimal.fromInt(1)).toInt(Rounding.CEILING).unwrapOr(1)
         } else {
             k = int((lexdb_ops.asFloat(f).unwrapOr(0.0f) * float(n)).ceil())
         }
@@ -267,7 +268,7 @@ pub fn finish(fname: &str, dia: int, desc: bool, kind: int, vals: &[]Val, f: &Va
     }
     // Oracle: RN = 1 + f * (n - 1); (CRN - RN) * lo + (RN - FRN) * hi
     let fd = lexdb_ops.asNum(f).unwrapOr(Decimal.fromInt(0))
-    let rn = Decimal.fromInt(1).add(fd.mul(Decimal.fromInt(n - 1)))
+    let rn = try pctRow(&fd, n)
     let frd = rn.floor(0).unwrapOr(rn)
     let crd = rn.ceil(0).unwrapOr(rn)
     let fr = frd.toInt(Rounding.FLOOR).unwrapOr(1)
@@ -306,11 +307,30 @@ pub fn finish(fname: &str, dia: int, desc: bool, kind: int, vals: &[]Val, f: &Va
     match lexdb_ops.asNum(lo) {
         Some(a) {
             match lexdb_ops.asNum(hi) {
-                Some(b) { return Ok(dec(wlo.mul(a).add(whi.mul(b)))) }
+                Some(b) { return Ok(dec(try pctMix(&wlo, &a, &whi, &b))) }
                 None {}
             }
         }
         None {}
     }
     return Err(e("ORA30495", "the ORDER BY expression must evaluate to a numeric or datetime data type"))
+}
+
+// Oracle's RN = 1 + f * (n - 1), and (CRN - RN) * lo + (RN - FRN) * hi: exact, or rounded to 38 digits where the exact
+// value has more (a fraction of 38 digits times n - 1, or times a value of 38: Decimal's operators stopped the server)
+fn pctRow(f: &Decimal, n: int): Result[Decimal, DbErr] {
+    return pctFit(lexdb_decfit.addFit(&Decimal.fromInt(1), &(try pctFit(lexdb_decfit.mulFit(f, &Decimal.fromInt(n - 1))))))
+}
+
+fn pctMix(wlo: &Decimal, lo: &Decimal, whi: &Decimal, hi: &Decimal): Result[Decimal, DbErr] {
+    let x = try pctFit(lexdb_decfit.mulFit(wlo, lo))
+    let y = try pctFit(lexdb_decfit.mulFit(whi, hi))
+    return pctFit(lexdb_decfit.addFit(&x, &y))
+}
+
+fn pctFit(r: Result[Decimal, DecError]): Result[Decimal, DbErr] {
+    match r {
+        Ok(d) { return Ok(d) }
+        Err(_) { return Err(e("22003", "numeric value out of range")) }
+    }
 }

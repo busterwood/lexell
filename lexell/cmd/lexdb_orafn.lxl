@@ -18,6 +18,7 @@ import "time"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_time"
+import "./lexdb_decfit"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -348,18 +349,12 @@ fn plusMinus(a: &Val, b: &Val, neg: bool, z: &lexdb_time.Zone): Result[Val, DbEr
             }
             else {}
         }
-        let n = try decOf(&ov)
-        let whole = match n.trunc(0) { Ok(w) { w } Err(_) { n } }
-        let dn = try intOf(&Val.Num(whole))
-        if dn > 4000000 || dn < -4000000 { return Err(ora(1841, "(full) year must be between -4712 and +9999, and not be 0")) }
-        let frac = n.sub(whole).mul(Decimal.fromInt(lexdb_time.DAY_US))
-        let fus = match frac.toInt(Rounding.HALF_AWAY) { Ok(f) { f } Err(_) { 0 } }
-        let sign = if neg { -1 } else { 1 }
+        let delta = try daysDelta(&(try decOf(&ov)), neg)
         match tv {
-            Val.Tstz(u) { return Ok(Val.Tstz(try tsAdd(u, sign * (dn * lexdb_time.DAY_US + fus)))) }
+            Val.Tstz(u) { return Ok(Val.Tstz(try tsAdd(toSecond(u), delta))) }
             else {
                 let us = try asTs(&tv, z)
-                return Ok(Val.Ts(try tsAdd(us, sign * (dn * lexdb_time.DAY_US + fus))))
+                return Ok(Val.Ts(try tsAdd(toSecond(us), delta)))
             }
         }
     }
@@ -391,6 +386,41 @@ fn plusMinus(a: &Val, b: &Val, neg: bool, z: &lexdb_time.Zone): Result[Val, DbEr
         Ok(r) { return Ok(Val.Num(r)) }
         Err(_) { return Err(ora(1426, "numeric overflow")) }
     }
+}
+
+// n days (date + n, date - n) in microseconds, as Oracle's DATE arithmetic: whole seconds, n's fraction of a day rounded
+// half away from zero (DATE '2024-03-05' + 1 / 97 is 00:14:51); ORA-01841 past Oracle's years. The fraction times 86,400
+// is exact or rounded to 38 digits (n / 97 has 38: Decimal's operator, which needs the exact product, stopped the server).
+fn daysDelta(n: &Decimal, neg: bool): Result[int, DbErr] {
+    let far = ora(1841, "(full) year must be between -4712 and +9999, and not be 0")
+    let whole = match n.trunc(0) { Ok(w) { w } Err(_) { n.clone() } }
+    // (past an integer: ORA-01841, but ORA-01426 past what a NUMBER holds, 1e126)
+    let dn = match whole.toInt(Rounding.TOWARD_ZERO) {
+        Ok(w) { w }
+        Err(_) { return Err(if n.abs().cmp(&Decimal.parse("1e126").unwrap()) >= 0 { ora(1426, "numeric overflow") } else { far }) }
+    }
+    if dn > 4000000 || dn < -4000000 { return Err(far) }
+    // (the seconds to 30 places first: 0.5 / 86400 is half a second, as in Oracle's 40 digits, not the 38 digits' 0.49...97)
+    let frac = match n.subExact(&whole) { Ok(f) { f } Err(_) { Decimal.zero() } }
+    let secs = match lexdb_decfit.mulFit(&frac, &Decimal.fromInt(86400)) {
+        Ok(f) { f.round(30).unwrapOr(f).toInt(Rounding.HALF_AWAY).unwrapOr(0) }
+        Err(_) { 0 }
+    }
+    let d = dn * lexdb_time.DAY_US + secs * 1000000
+    return Ok(if neg { -d } else { d })
+}
+
+// a date-time made a DATE: its fraction of a second dropped (Oracle's TIMESTAMP + n is a DATE)
+fn toSecond(us: int): int {
+    let r = us % 1000000
+    return if r < 0 { us - r - 1000000 } else { us - r }
+}
+
+// n units of per each (NUMTODSINTERVAL's microseconds, NUMTOYMINTERVAL's months), rounded half away from zero; the product
+// rounded to 38 digits first where it has more (n / 97 times 3,600,000,000)
+fn unitsOf(n: &Decimal, per: int): Result[int, DecError] {
+    let p = try lexdb_decfit.mulFit(n, &Decimal.fromInt(per))
+    return p.toInt(Rounding.HALF_AWAY)
 }
 
 fn divide(a: &Val, b: &Val): Result[Val, DbErr] {
@@ -1052,7 +1082,10 @@ fn monthsBetween(a: int, b: int): Result[Decimal, DbErr] {
     let da = (p.d - 1) * lexdb_time.DAY_US + ((p.hh * 60 + p.mi) * 60 + p.ss) * 1000000 + p.us
     let db = (q.d - 1) * lexdb_time.DAY_US + ((q.hh * 60 + q.mi) * 60 + q.ss) * 1000000 + q.us
     let frac = try divDec(Decimal.fromInt(da - db), Decimal.fromInt(31 * lexdb_time.DAY_US))
-    return Ok(norm(Decimal.fromInt(months).add(frac)))
+    match lexdb_decfit.addFit(&Decimal.fromInt(months), &frac) {
+        Ok(m) { return Ok(norm(m)) }
+        Err(_) { return Err(ora(1426, "numeric overflow")) }
+    }
 }
 
 fn truncDate(us: int, fmt: &str): Result[int, DbErr] {
@@ -1219,14 +1252,14 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
             if name == "#ora_numtoym" {
                 let per = if unit == "YEAR" { 12 } else if unit == "MONTH" { 1 } else { 0 }
                 if per == 0 { return Err(ora(1760, "illegal argument for function")) }
-                match nv.mul(Decimal.fromInt(per)).toInt(Rounding.HALF_AWAY) {
+                match unitsOf(&nv, per) {
                     Ok(m) { return Ok(Some(Val.Ival(lexdb_time.Ival{months: m, days: 0, us: 0}))) }
                     Err(_) { return Err(ora(1873, "the leading precision of the interval is too small")) }
                 }
             }
             let per = if unit == "DAY" { lexdb_time.DAY_US } else if unit == "HOUR" { 3600 * 1000000 } else if unit == "MINUTE" { 60 * 1000000 } else if unit == "SECOND" { 1000000 } else { 0 }
             if per == 0 { return Err(ora(1760, "illegal argument for function")) }
-            match nv.mul(Decimal.fromInt(per)).toInt(Rounding.HALF_AWAY) {
+            match unitsOf(&nv, per) {
                 Ok(us) { return Ok(Some(Val.Ival(lexdb_time.Ival{months: 0, days: us / lexdb_time.DAY_US, us: us % lexdb_time.DAY_US}))) }
                 Err(_) { return Err(ora(1873, "the leading precision of the interval is too small")) }
             }
