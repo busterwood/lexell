@@ -250,6 +250,37 @@ smaller differences of its statement.
   error 156. Table hints in `FROM` are read and ignored.
 - **No `CREATE LOGIN`.** `CREATE USER name WITH PASSWORD = '...'` is error 102; `CREATE ROLE name LOGIN PASSWORD
   '...'` (PostgreSQL's form) works in this door.
+- **Queries and DML** (found writing the T-SQL query pages):
+  - `AVG(x) OVER (...)` is error 50000 (`column ... must appear in the GROUP BY clause`); `SUM`, `MIN`, `MAX` and
+    `COUNT` with `OVER` work. `COUNT_BIG(*) OVER (...)` is 195.
+  - A `VALUES` derived table's strings conflict on collation when joined to a column: 468 "Cannot resolve the
+    collation conflict between "SQL_Latin1_General_CP1_CI_AS" and "default"" (`COLLATE DATABASE_DEFAULT` avoids it).
+  - `TRUNCATE TABLE` does not reset the `IDENTITY` (the next id goes on; SQL Server starts again at the seed).
+  - Views are read-only (50000), and a CTE cannot be the target of `UPDATE`, `DELETE` or `MERGE` (208).
+  - `SELECT INTO` loses column attributes: `nvarchar(30)` becomes `nvarchar(max)`, a decimal gets wider, `NOT NULL`
+    and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207.
+  - Error 102 for `PIVOT`, `UNPIVOT`, `FOR XML`, `FOR JSON`, `TABLESAMPLE`, `$IDENTITY`, join hints (`INNER LOOP
+    JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE`; `GROUPING_ID` is 195.
+  - `TOP (subquery)` is 156; `UPDATE TOP (n) PERCENT` 102; `DELETE TOP (n) PERCENT` 208; `MERGE TOP ... PERCENT`
+    50000.
+  - `UPDATE t SET @v = @v + col` and `SET @v = col = expr` are 102.
+  - `OUTPUT ... INTO t` followed by an `OUTPUT` that returns rows is 50000.
+  - `SET IDENTITY_INSERT` checks nothing: a missing table (208), a table without an identity (8106), a second table
+    ON (8107) are taken; with it ON, an `INSERT` that leaves out the identity column gets the next value (545), and one
+    without a column list is taken (8101).
+  - Taken where SQL Server refuses: `TOP ... WITH TIES` without `ORDER BY` (1062), `TOP 2.5` (1060), `TOP` with
+    `OFFSET` (10741), `OFFSET` without `ORDER BY`, `FETCH` without `OFFSET`, `FETCH` 0 rows (10744), `ORDER BY` in a
+    derived table without `TOP` (1033), `ROW_NUMBER() OVER ()` (4112), `RANGE` with a numeric offset (4194), a column
+    set twice in one `UPDATE` (264), `DELETED` in an `INSERT`'s `OUTPUT` (4104), `NATURAL JOIN`, `USING`, `LATERAL`,
+    a standalone `VALUES`, `WITH RECURSIVE`, `TRUNCATE TABLE a, b`, a `VALUES` derived table without column names
+    (8155).
+  - A `UNION` of an int column and an nvarchar column gives mixed text rows (SQL Server: 245).
+  - Error 50000 with lexdb's text where SQL Server has a number: ambiguous column (209), ungrouped column (8120),
+    window function in `WHERE` (4108), `DISTINCT` with `ORDER BY` of a column not selected (145), negative `OFFSET`
+    (10742), `TOP (-1)` (1014), `TRUNCATE` of a table a foreign key refers to (4712). A `UNION` column-count
+    mismatch is 102 (SQL Server: 205); updating an identity column is 544 (SQL Server: 8102).
+  - `DATALENGTH` of a `char(7)` value is 14 (SQL Server: 7).
+
 
 ## Oracle door
 
