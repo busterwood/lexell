@@ -31,7 +31,7 @@ Compile in a scratch directory, with the drivers on the class path for the progr
 ```sh
 JARS=postgresql-42.7.14.jar:mssql-jdbc-13.6.2.jre11.jar:ojdbc11-23.26.4.0.0.jar
 javac -cp $JARS -d out lexell/docs/lexdb/connect/examples/java/*.java
-java -cp out:$JARS PgHello 'jdbc:postgresql://127.0.0.1:5433/lexdb?binaryTransfer=false' postgres x
+java -cp out:$JARS PgHello 'jdbc:postgresql://127.0.0.1:5433/lexdb' postgres x
 java -cp out:$JARS TdsHello 'jdbc:sqlserver://127.0.0.1:1433;databaseName=lexdb;encrypt=false;user=sa;password=x'
 java -cp out:$JARS OraHello jdbc:oracle:thin:@//127.0.0.1:1521/lexdb sa SA
 ```

@@ -30,8 +30,8 @@ name).
   `datetime2(6)`, `datetimeoffset(6)`. A table's declared types are given where drivers ask for them (`SET FMTONLY
   ON`, `sp_describe_first_result_set`).
 - **Errors** are ERROR tokens with SQL Server's error number and severity for the same failure (208 for a missing
-  table, 2627 for a duplicate key, 547 for a constraint), else 50000. The message text is often lexdb's own, not
-  SQL Server's (see [known issues](../KNOWN-ISSUES.md)).
+  table, 2627 for a duplicate key, 547 for a constraint), else 50000, with the line of the batch it happened on.
+  Many messages are SQL Server's text; some are still lexdb's own (see [known issues](../KNOWN-ISSUES.md)).
 
 ## Logins
 

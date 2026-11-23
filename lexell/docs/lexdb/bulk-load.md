@@ -148,7 +148,7 @@ loads [cities.csv](connect/examples/java/cities.csv), then 10,000 rows made by t
 
 ```sh
 javac -cp postgresql-42.7.14.jar -d out docs/lexdb/connect/examples/java/PgCopy.java
-java -cp out:postgresql-42.7.14.jar PgCopy 'jdbc:postgresql://127.0.0.1:5433/lexdb?binaryTransfer=false' postgres x cities.csv
+java -cp out:postgresql-42.7.14.jar PgCopy 'jdbc:postgresql://127.0.0.1:5433/lexdb' postgres x cities.csv
 ```
 
 ```
@@ -206,8 +206,7 @@ bcp "SELECT * FROM dbo.city" queryout out.tsv -S 127.0.0.1,1433 -U sa -P x -d le
 
 [TdsBulk.java](connect/examples/java/TdsBulk.java) loads [cities.csv](connect/examples/java/cities.csv) with
 `SQLServerBulkCopy`, then sends a JDBC batch of 5,000 rows as bulk copy (`useBulkCopyForBatchInsert=true`). It counts
-the rows on a new connection: on the connection that ran the bulk copy, lexdb leaves `SET FMTONLY ON` in effect, so
-later queries there give no rows until `SET FMTONLY OFF` ([known issues](KNOWN-ISSUES.md)):
+the rows afterwards:
 
 ```sh
 javac -cp mssql-jdbc-13.6.2.jre11.jar -d out docs/lexdb/connect/examples/java/TdsBulk.java

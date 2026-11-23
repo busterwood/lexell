@@ -28,8 +28,9 @@ lexdb ./data 127.0.0.1:5432 /run/lexdb      # TCP, and a Unix socket /run/lexdb/
 - **ParameterStatus** at startup: `server_version` (16.0), `server_encoding` and `client_encoding` (UTF8),
   `DateStyle` (ISO, MDY), `integer_datetimes`, `standard_conforming_strings`, `TimeZone`, `application_name`,
   `default_transaction_read_only` and `in_hot_standby` (off on the master, on on a replica).
-- **Not supported:** cancel requests (a CancelRequest is accepted and ignored, so psql's Ctrl-C does not stop a
-  statement: use `statement_timeout`); GSSAPI encryption (answered "no", as PostgreSQL does without it); the
+- **Cancel requests** (psql's Ctrl-C, JDBC's `Statement.cancel()`, libpq's `PQcancel`) stop a running statement with
+  SQLSTATE 57014; `statement_timeout` does the same.
+- **Not supported:** GSSAPI encryption (answered "no", as PostgreSQL does without it); the
   replication protocol; `LISTEN`/`NOTIFY`.
 
 ## Logins
@@ -66,7 +67,7 @@ without TLS.
 | Client | Example |
 |---|---|
 | libpq, psql, psycopg | `host=127.0.0.1 port=5433 user=app dbname=lexdb` or `postgresql://app@127.0.0.1:5433/lexdb` |
-| pgjdbc | `jdbc:postgresql://127.0.0.1:5433/lexdb?binaryTransfer=false` |
+| pgjdbc | `jdbc:postgresql://127.0.0.1:5433/lexdb` |
 | Lexell `postgres` | `host=127.0.0.1 port=5433 user=app dbname=lexdb` (libpq's syntax) |
 | a Unix socket | `host=/run/lexdb port=5432` |
 
@@ -77,7 +78,7 @@ For a master and its replicas, list both and let the client choose by role: see 
 Checked for this documentation (2026-11-23), against a lexdb built from the same tree:
 
 - **psql 18.6**, including `\d`, `\dt`, `\d+`, `\l`, `\copy`.
-- **pgjdbc 42.7.14** with `binaryTransfer=false` (below).
+- **pgjdbc 42.7.14**, with its default settings (below).
 - **Lexell's `postgres` module** (lib/postgres).
 
 Checked while lexdb was developed (design/lexdb.md 9.75, 9.80, 9.137): psycopg 3 in text mode, node-postgres 8,
@@ -121,7 +122,7 @@ back, and shows a transaction rolled back by a CHECK constraint.
 
 ```sh
 javac -d out docs/lexdb/connect/examples/java/PgHello.java
-java -cp out:postgresql-42.7.14.jar PgHello 'jdbc:postgresql://127.0.0.1:5433/lexdb?binaryTransfer=false' postgres x
+java -cp out:postgresql-42.7.14.jar PgHello 'jdbc:postgresql://127.0.0.1:5433/lexdb' postgres x
 ```
 
 ```
@@ -136,15 +137,7 @@ transaction: rolled back, SQLSTATE 23514
 The driver is on Maven Central as `org.postgresql:postgresql`
 (`https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.14/postgresql-42.7.14.jar`).
 
-**`binaryTransfer=false` is needed.** By default pgjdbc:
-
-- sends `BigDecimal`, `UUID` and `byte[]` parameters in binary, which lexdb refuses ("a binary parameter of type 1700
-  is not supported");
-- switches a statement to binary results after it has run five times (`prepareThreshold`), and the sixth run fails
-  with "results in binary are not supported".
-
-With `binaryTransfer=false` every type but `byte[]` works. `setBytes` is always sent in binary; pass bytes as hex text
-instead, for example `decode(?, 'hex')`. See [known issues](../KNOWN-ISSUES.md).
+lexdb takes pgjdbc's binary parameters (`BigDecimal`, `UUID`, `byte[]`) and its binary results (after a statement has run five times, `prepareThreshold`), so no connection setting is needed.
 
 ## Lexell: lib/postgres
 

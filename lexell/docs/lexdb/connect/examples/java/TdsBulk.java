@@ -31,8 +31,7 @@ public class TdsBulk {
                 bulk.writeToServer(csv);
             }
         }
-        // a new connection: on the one that ran SQLServerBulkCopy, SET FMTONLY ON stays in effect and later
-        // queries give no rows (docs/lexdb/KNOWN-ISSUES.md); SET FMTONLY OFF there would do as well
+        // count the rows on a connection of their own
         try (Connection c = DriverManager.getConnection(url); Statement s = c.createStatement();
              ResultSet r = s.executeQuery("SELECT count(*), sum(pop) FROM bulk_city")) {
             r.next();

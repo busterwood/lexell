@@ -99,7 +99,7 @@ and `target_session_attrs`; pgjdbc takes `targetServerType`:
 
 ```
 host=127.0.0.1,127.0.0.1 port=5432,5433 dbname=lexdb target_session_attrs=standby
-jdbc:postgresql://127.0.0.1:5432,127.0.0.1:5433/lexdb?targetServerType=secondary&binaryTransfer=false
+jdbc:postgresql://127.0.0.1:5432,127.0.0.1:5433/lexdb?targetServerType=secondary
 ```
 
 Both were checked: libpq (psql 18.6) and pgjdbc 42.7.14 each picked the replica for `standby` / `secondary` and the
@@ -292,9 +292,7 @@ replica's own listener takes the plain and the read-only names.
 User Id=sa;Password=sa;Data Source=127.0.0.1:1521/lexdb_ro          (Lexell, python-oracledb: 127.0.0.1:1521/lexdb_ro)
 ```
 
-**ojdbc does not follow the redirect yet**: a JDBC thin connection to the master with `lexdb_ro` fails in the driver
-with TNS-04605 ([known issues](KNOWN-ISSUES.md)). Point JDBC clients at a replica's own listener
-(`jdbc:oracle:thin:@//127.0.0.1:1522/lexdb`) until then.
+ojdbc follows the redirect too: a JDBC thin connection to the master with `lexdb_ro` ends on a replica.
 
 ```
 $ # Lexell's oracle module (tests/lexdb/doorsql.lxl) to the master's port, service lexdb_ro: redirected to a replica

@@ -7,7 +7,7 @@ import org.postgresql.copy.CopyManager;
 /** COPY into and out of lexdb's PostgreSQL door with pgjdbc's CopyManager.
  *
  *  javac -cp postgresql-42.7.14.jar -d out PgCopy.java
- *  java -cp out:postgresql-42.7.14.jar PgCopy "jdbc:postgresql://127.0.0.1:5433/lexdb?binaryTransfer=false" postgres x cities.csv */
+ *  java -cp out:postgresql-42.7.14.jar PgCopy "jdbc:postgresql://127.0.0.1:5433/lexdb" postgres x cities.csv */
 public class PgCopy {
     public static void main(String[] a) throws Exception {
         try (Connection c = DriverManager.getConnection(a[0], a[1], a[2]); Statement s = c.createStatement()) {
