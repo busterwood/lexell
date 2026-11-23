@@ -32,19 +32,18 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| CREATE TABLE | Tables: temporary and unlogged, constraints, identity, serial and generated columns. |
-| CREATE TABLE AS | A table from a query. |
-| ALTER TABLE | Columns, constraints, types, defaults, identity, renames, `SET SCHEMA`, `OWNER TO`. |
-| DROP TABLE | |
-| CREATE INDEX | B-tree indexes, unique, on expressions, partial, `CONCURRENTLY`. |
-| ALTER INDEX, DROP INDEX | Rename; drop. |
-| CREATE VIEW, ALTER VIEW, DROP VIEW | Views (read-only). |
-| CREATE SEQUENCE, ALTER SEQUENCE, DROP SEQUENCE | Sequences. |
+| [CREATE TABLE](create-table.md) | Tables: temporary and unlogged, constraints, identity, serial and generated columns. |
+| [CREATE TABLE AS](create-table-as.md) | A table from a query. |
+| [ALTER TABLE](alter-table.md) | Columns, constraints, types, defaults, identity, renames, `SET SCHEMA`, `OWNER TO`. |
+| [DROP TABLE](drop-table.md) | |
+| [CREATE INDEX](create-index.md) | B-tree indexes, unique, on expressions, partial, `CONCURRENTLY`. |
+| [ALTER INDEX](alter-index.md), [DROP INDEX](drop-index.md) | Rename; drop. |
+| [CREATE VIEW](create-view.md), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | Views (read-only). |
+| [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
 | CREATE SCHEMA, ALTER SCHEMA, DROP SCHEMA | Schemas. |
 | CREATE TYPE, ALTER TYPE, DROP TYPE | Enum types. |
 | CREATE FUNCTION, CREATE PROCEDURE, DROP FUNCTION, DROP PROCEDURE | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
 | CALL | Calls a procedure. |
-| COMMENT ON | Accepted; comments are not kept. |
 
 ### Roles and privileges
 
@@ -77,9 +76,9 @@ This index lists everything the door takes today. Pages not written yet are list
 
 ### Not in this door
 
-`DO`, PL/pgSQL (functions in any language but `sql`: 42704), triggers, `LOCK TABLE`, SQL-level `PREPARE` and
-`EXECUTE` (the protocol's prepared statements work), cursors (`DECLARE`, `FETCH`), `LISTEN`/`NOTIFY`, materialized
-views, domains, extensions, `CREATE DATABASE`.
+`COMMENT ON` (a syntax error; `obj_description` gives nothing), `DO`, PL/pgSQL (functions in any language but `sql`:
+42704), triggers, `LOCK TABLE`, SQL-level `PREPARE` and `EXECUTE` (the protocol's prepared statements work), cursors
+(`DECLARE`, `FETCH`), `LISTEN`/`NOTIFY`, materialized views, domains, extensions, `CREATE DATABASE`.
 
 ## Data types
 
