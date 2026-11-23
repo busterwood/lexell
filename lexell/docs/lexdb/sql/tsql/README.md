@@ -49,7 +49,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE TYPE](create-type.md) (and `DROP TYPE`) | Table types (for table-valued parameters). |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXT VALUE FOR`. |
 | [CREATE SCHEMA](create-schema.md), [DROP SCHEMA](drop-schema.md) | |
-| ALTER DATABASE | `SET` options (most read and kept; `READ_ONLY`, `SINGLE_USER`, `OFFLINE` refused). |
+| [ALTER DATABASE](alter-database.md) | `SET` options (most read and kept; `READ_ONLY`, `SINGLE_USER`, `OFFLINE` refused). |
 | [sp_rename](sp-rename.md) | Renames a table, column or index. |
 
 ### Batches and control of flow
@@ -76,17 +76,19 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| SET options | `NOCOUNT`, `XACT_ABORT`, `IMPLICIT_TRANSACTIONS`, `IDENTITY_INSERT`, `ROWCOUNT`, `QUOTED_IDENTIFIER`, `FMTONLY`, and the `ANSI_*` and other options drivers send (accepted). |
-| SET LEXDB_DIALECT | lexdb's own: `POSTGRES` makes the rest of the session take PostgreSQL's SQL. |
+| [SET options](set-statements.md) | `NOCOUNT`, `XACT_ABORT`, `IMPLICIT_TRANSACTIONS`, `IDENTITY_INSERT`, `ROWCOUNT`, `QUOTED_IDENTIFIER`, `FMTONLY`, and the `ANSI_*` and other options drivers send (accepted). |
+| [SET LEXDB_DIALECT](set-lexdb-dialect.md) | lexdb's own: `POSTGRES` makes the rest of the session take PostgreSQL's SQL. |
 
 ### Security
 
 | Statement | What it does |
 |---|---|
-| CREATE USER, CREATE ROLE, DROP USER, DROP ROLE | |
-| GRANT, REVOKE | Object permissions (`ON [OBJECT::]name`). |
+| [CREATE USER](create-user.md), [CREATE ROLE](create-role.md), [DROP USER](drop-user.md), [DROP ROLE](drop-role.md) | Membership by `GRANT role TO user`. |
+| [GRANT](grant.md), [REVOKE](revoke.md) | Object permissions (`ON [OBJECT::]name`). |
 
 ### System procedures
+
+See [System stored procedures](system-procedures.md) and [sp_rename](sp-rename.md).
 
 `sp_executesql`, `sp_prepare`, `sp_execute`, `sp_prepexec`, `sp_unprepare`, `sp_describe_first_result_set`,
 `sp_rename`, `sp_tables`, `sp_columns`, `sp_pkeys`, `sp_fkeys`, `sp_statistics`, `sp_special_columns`,
