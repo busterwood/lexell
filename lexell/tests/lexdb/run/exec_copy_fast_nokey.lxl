@@ -1,0 +1,88 @@
+// lexdb_exec: COPY's serial fast path for a table without a primary key (9.88: its hidden
+// ROWID, the last column, numbered from its sequence a run at a time): a load into an empty
+// table, NULLs and escapes, an append (the generic path), rows changed after the load, extra
+// and missing fields, a larger load, and two keyless tables whose keys stay their own.
+// expect: load: COPY 3; 1|a\tb|NULL;2|NULL|-2;3|c|1.5
+// expect: append: COPY 1; 4|10
+// expect: after: INSERT 0 1 UPDATE 1 DELETE 1; 2|B;3|c;4|d;5|e
+// expect: extra: 22P04 COPY k2, line 1: "1	a	z"
+// expect: missing: 22P04 COPY k2, line 1: "1"
+// expect: many: COPY 3000; 3000|4498500|7|0|2999
+// expect: two tables: COPY 2; 7;8;9; 3000
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+
+fn err(e: &lexdb_base.DbErr): str {
+    return e.state + (if e.context != "" { " " + e.context } else { "" })
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+// COPY ... FROM STDIN with data: its tag, or its error.
+fn copyIn(s: mut &lexdb_exec.Session, sql: str, data: &str): str {
+    let stmts = lexdb_parse.parse(&sql).unwrap()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    match s.run(&stmts[0], &none, &nt) {
+        Ok(r) {
+            if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+            match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                Ok(r2) { return r2.tag.clone() }
+                Err(e) { return err(&e) }
+            }
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(37), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let m = q(mut &s, "create table k (a int, v text, f float8)")
+        let c = copyIn(mut &s, "copy k from stdin", &"3\tc\t1.5\n1\ta\\tb\t\\N\n2\t\\N\t-2\n")
+        println("load: " + c + "; " + strings.replaceAll(&q(mut &s, "select a, v, f from k order by a"), "\t", "\\t"))
+        let c2 = copyIn(mut &s, "copy k from stdin", &"4\td\t4\n")
+        println("append: " + c2 + "; " + q(mut &s, "select count(*), sum(a) from k"))
+        let i = q(mut &s, "insert into k values (5, 'e', 5)")
+        let u = q(mut &s, "update k set v = 'B' where a = 2")
+        let dl = q(mut &s, "delete from k where a = 1")
+        println("after: " + i + " " + u + " " + dl + "; " + q(mut &s, "select a, v from k order by a"))
+        let m2 = q(mut &s, "create table k2 (x int, y text)")
+        println("extra: " + copyIn(mut &s, "copy k2 from stdin", &"1\ta\tz\n"))
+        println("missing: " + copyIn(mut &s, "copy k2 from stdin", &"1\n"))
+        var big = ""
+        for j in 0..3000 { big = big + j.toStr() + "\tr" + (j % 7).toStr() + "\n" }
+        let c3 = copyIn(mut &s, "copy k2 from stdin", &big)
+        println("many: " + c3 + "; " + q(mut &s, "select count(*), sum(x), count(distinct y), min(x), max(x) from k2"))
+        let m3 = q(mut &s, "create table k3 (x int)")
+        let c4 = copyIn(mut &s, "copy k3 from stdin", &"7\n8\n")
+        let i3 = q(mut &s, "insert into k3 values (9)")
+        println("two tables: " + c4 + "; " + q(mut &s, "select x from k3 order by x") + "; " + q(mut &s, "select count(*) from k2"))
+        return 0
+    })
+}

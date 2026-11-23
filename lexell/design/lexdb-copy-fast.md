@@ -91,6 +91,30 @@ chunk's parse. It is not the first fix for COPY.
    than one `noteChg` call per row.
 4. Then consider `par.map` over chunks, if the serial path is not enough.
 
+## Tables without a primary key (2026-11-23)
+
+A table without a primary key (lexdb.md 9.88) is keyed by its hidden ROWID, the last column,
+numbered by its identity sequence; the fast path refused it (`len(targets) != len(t.cols)`,
+the ROWID's sequence), so its loads took the generic path, a Val row and `insertOne` a row:
+2.98 s for the 1M wide rows against PostgreSQL's 1.52. Now `fastCopyPlan` takes it when the
+ROWID is the last column (`rid`, and `nIn` fields a record): `fastCopyRun` draws its keys from
+the sequence a run at a time, as `insertOne` does (`nextRun`, the run doubled up to
+ROWID_RUN), and `fastCopyRow` writes each into the row and loads it under that key, ascending.
+A record's shape errors (extra or missing data, 22P04) now give its text as the generic path
+does (`COPY t, line 3: "..."`), for keyed tables too.
+
+| 1M wide rows, `\copy`, median of 3 | before | now | PostgreSQL 18 |
+|---|---:|---:|---:|
+| no primary key | 2.98 s | 1.50 s | 1.52 s |
+| a primary key | 1.44 s | 1.45 s | 1.81 s |
+| a primary key and two secondary indexes (the generic path) | 6.31 s | 5.82 s | 4.74 s |
+
+(PostgreSQL's from the same day's refresh, `saved/results/2026-11-23-refresh`.) The indexed
+load is a little faster because `commitOrder` compares two writes' keys once (`str.cmp`), not
+twice; it still takes the generic path, whose profile is half the commit (sorting the 3M writes:
+`commitOrder` 25%) and 41% `insertOne`. A fast path that also builds the index entries is what
+is left. Test: `tests/lexdb/run/exec_copy_fast_nokey`.
+
 ## Reproduction
 
 ```sh

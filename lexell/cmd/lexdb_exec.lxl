@@ -15220,7 +15220,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             // may read the load; otherwise the generic path checks every key
             // and serves reads.
             if !txn.inBlock() && (try lexdb_access.rowCount(st, txn, &lexdb_catalog.relOf(&t))) == 0 {
-                return fastCopyRun(st, txn, &t, s, &plan, &input, pull)
+                return fastCopyRun(st, txn, &t, s, &plan, &defs, &input, pull)
             }
         }
         None {}
@@ -15379,6 +15379,8 @@ type FastCopyPlan = record {
     lay: int
     n: int
     pk: int
+    rid: int        // a table without a primary key: its hidden ROWID column (the last), numbered by its sequence; else -1
+    nIn: int        // the fields of a record (n, or n - 1 without the ROWID)
 }
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
@@ -15388,7 +15390,11 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
     if len(t.view) > 0 || len(t.slots) != 0 || len(t.indexes) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
     if len(t.pk) != 1 { return None }
-    if len(targets) != len(t.cols) { return None }
+    // a table without a primary key (9.88): its ROWID the last column, given by its sequence
+    let rid = if t.cols[t.pk[0]].name == lexdb_catalog.ROWID { t.pk[0] } else { -1 }
+    if rid >= 0 && rid != len(t.cols) - 1 { return None }
+    let nIn = if rid >= 0 { len(t.cols) - 1 } else { len(t.cols) }
+    if len(targets) != nIn { return None }
     for i in 0..len(targets) { if targets[i] != i { return None } }
     let nl = len(t.layouts)
     if nl == 0 || nl > 65536 { return None }
@@ -15396,11 +15402,12 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     if len(kinds0) != len(t.cols) || len(kinds0) > 255 { return None }
     if !kindsFit(t, kinds0) { return None }
     let pk = t.pk[0]
-    if t.cols[pk].name == lexdb_catalog.ROWID { return None }
     let pkk = kinds0[pk]
     if pkk != lexdb_rows.PK_INT && pkk != lexdb_rows.PK_INT4 && pkk != lexdb_rows.PK_INT2 { return None }
+    if rid >= 0 && pkk != lexdb_rows.PK_INT { return None }
     for i in 0..len(t.cols) {
         let c = &t.cols[i]
+        if i == rid { continue }
         if c.def.isSome() || c.identity != lexdb_sql.ID_NONE || len(c.seq) > 0 || len(c.coll) > 0 { return None }
         let k = kinds0[i]
         if k == lexdb_rows.PK_INT { if c.typ.oid != lexdb_sql.OID_INT8 { return None } }
@@ -15432,7 +15439,7 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     }
     var ks: []byte = withCapacity(len(t.cols))
     for k in kinds0 { append(mut &ks, k) }
-    return Some(FastCopyPlan{kinds: ks, off: off, v0: fixed, lay: nl - 1, n: len(t.cols), pk: pk})
+    return Some(FastCopyPlan{kinds: ks, off: off, v0: fixed, lay: nl - 1, n: len(t.cols), pk: pk, rid: rid, nIn: nIn})
 }
 
 // A 4-byte little-endian fixed value.
@@ -15450,6 +15457,15 @@ fn fastCopyBad(t: &Table, p: int, s: &str): DbErr {
 fn fastCopyAt(x: DbErr, where: &str, line: int): DbErr {
     var y = x
     y.context = where + line.toStr() + (if len(y.context) > 0 { ", " + y.context } else { "" })
+    return y
+}
+
+// fastCopyAt, with the record's text after a record's shape is wrong (extra or missing data), as
+// the generic path gives it: `COPY t, line 3: "..."`.
+fn fastCopyAtRec(x: DbErr, where: &str, line: int, text: &str): DbErr {
+    if x.state != "22P04" { return fastCopyAt(x, where, line) }
+    var y = x
+    y.context = where + line.toStr() + ": " + quoted(text)
     return y
 }
 
@@ -15630,7 +15646,7 @@ fn fastCopyOne(t: &Table, txn: &lexdb_store.Txn, plan: &FastCopyPlan, p: int, ra
 
 // One record: fields to the stored row, the key, and putRowLoad.
 fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel: &lexdb_access.Rel, plan: &FastCopyPlan, line: &str,
-               state: mut &lexdb_access.Load): Result[Unit, DbErr] {
+               rowid: int, state: mut &lexdb_access.Load): Result[Unit, DbErr] {
     var b: []byte = withCapacity(plan.v0 + len(line))
     for i in 0..plan.v0 { append(mut &b, 0) }
     b[0] = lexdb_rows.FIXED
@@ -15643,7 +15659,7 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
     while true {
         let i = strings.indexOfByte(line, '\t', start)
         let end = if i < 0 { len(line) } else { i }
-        if p >= plan.n { return Err(e("22P04", "extra data after last expected column")) }
+        if p >= plan.nIn { return Err(e("22P04", "extra data after last expected column")) }
         let raw = line[start..end]
         let v = try fastCopyOne(t, txn, plan, p, &raw, anyEsc, mut &b)
         if p == plan.pk { id = v; haveId = true }
@@ -15651,8 +15667,13 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
         if i < 0 { break }
         start = i + 1
     }
-    if p < plan.n {
+    if p < plan.nIn {
         return Err(e("22P04", &("missing data for column \"" + t.cols[p].name + "\"")))
+    }
+    if plan.rid >= 0 {
+        binary.setU64LE(mut &b, plan.off[plan.rid], rowid)
+        id = rowid
+        haveId = true
     }
     if !haveId { return Err(e("XX000", "lexdb: COPY fast path: no primary key value")) }
     let row = strFromBytes(&b)
@@ -15664,7 +15685,12 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
 }
 
 fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: &lexdb_sql.Stmt,
-               plan: &FastCopyPlan, input: &CopyInput, pull: &fn(): CopyPart): Result[Res, DbErr] {
+               plan: &FastCopyPlan, defs: &Defs, input: &CopyInput, pull: &fn(): CopyPart): Result[Res, DbErr] {
+    // a table without a primary key: its hidden keys from its sequence a run at a time (insertOne's
+    // ridNext: doubled up to ROWID_RUN), ascending, so the load takes the fastest route
+    var ridNext = 0
+    var ridLeft = 0
+    var ridWant = 1
     var buf = ""
     var given = false
     var ended = false
@@ -15694,9 +15720,21 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
             if len(line) > 0 && line[len(line) - 1] == '\r' { line = line[0..len(line) - 1] }
             if line == "\\." { ended = true; start = nl + 1; break }
             lineNo += 1
-            match fastCopyRow(st, txn, t, &rel, plan, &line, mut &state) {
+            var rowid = 0
+            if plan.rid >= 0 {
+                if ridLeft == 0 {
+                    let r = try nextRun(st, &defs.seqs[plan.rid], ridWant)
+                    ridNext = r.first
+                    ridLeft = r.count
+                    if ridWant < ROWID_RUN { ridWant = ridWant * 2 }
+                }
+                rowid = ridNext
+                ridNext += defs.seqs[plan.rid].inc
+                ridLeft -= 1
+            }
+            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state) {
                 Ok(_) {}
-                Err(x) { return Err(fastCopyAt(x, &where, lineNo)) }
+                Err(x) { return Err(fastCopyAtRec(x, &where, lineNo, &line)) }
             }
             count += 1
             start = nl + 1
@@ -15710,9 +15748,21 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
         if len(line) > 0 && line[len(line) - 1] == '\r' { line = line[0..len(line) - 1].clone() }
         if line != "\\." {
             lineNo += 1
-            match fastCopyRow(st, txn, t, &rel, plan, &line, mut &state) {
+            var rowid = 0
+            if plan.rid >= 0 {
+                if ridLeft == 0 {
+                    let r = try nextRun(st, &defs.seqs[plan.rid], ridWant)
+                    ridNext = r.first
+                    ridLeft = r.count
+                    if ridWant < ROWID_RUN { ridWant = ridWant * 2 }
+                }
+                rowid = ridNext
+                ridNext += defs.seqs[plan.rid].inc
+                ridLeft -= 1
+            }
+            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state) {
                 Ok(_) {}
-                Err(x) { return Err(fastCopyAt(x, &where, lineNo)) }
+                Err(x) { return Err(fastCopyAtRec(x, &where, lineNo, &line)) }
             }
             count += 1
         }
