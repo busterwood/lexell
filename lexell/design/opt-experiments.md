@@ -980,3 +980,38 @@ local could take r10 or r11 (TPC-H -0.27%, decimal -0.24%) and the compile suite
 Test: tests/run/native_scratch_regs (many integers live at once across stores through computed
 addresses and to a global, records copied and built, post-increments of elements, selections
 between large constants, a fill by rep stos, a return from a branch, 128-bit arithmetic).
+
+## 26. Drops of trees in a stack of their own; an exhaustive match's last arm untested (as built)
+
+After section 24 a census of `lists` and `trees` (profiles, LXL_NATIVE_MAP) showed where Java's
+lead now is. `lists` frees in 1.5% of its time: 96% is the recursive walk `sum`. `trees` drops
+in a third of its: its drop action (23%), `rt_dpush` (5%) and `rt_drun`'s loop with an indirect
+call per pushed node (6%).
+
+- **Drop actions** (emit `selfLoop`): a recursive type's action already followed one child in a
+  loop and pushed the others onto the worklist (`rt_dpush`, run by `rt_drun` through a call per
+  entry). When no drop method is reachable from the type (`noUserDrop`: nothing can see the order
+  of its parts' drops), its own children wait in a stack of the action's own (`void* ls[32]`,
+  `DSTACK`) and go to the worklist only beyond it: a tree's drop makes no call but `rt_free`'s
+  (inline). A type with a drop method keeps the worklist alone, and its order.
+- **An exhaustive match's last arm** (check): when the arms before it name every other variant,
+  the last is the `else` of the tests before (no load and test of the tag again). In `sum` this
+  ended the re-test of `None` and the register it kept live across the call.
+
+| measure (main f1b607aa against this) | instructions | cycles |
+|---|---:|---:|
+| perfsuite trees / lists | -13.2 / -2.9% | -18.6 / -3.5% |
+| perfsuite run suite / compile suite | -1.06 / -0.22% | -1.33 / -0.44% |
+| apps regex / json / jq / cmark / decimal | 0.00 / -0.03 / -0.02 / 0.00 / -0.20% | -0.1 / -0.2 / +0.7 / -0.3 / -0.1% |
+| TPC-H SF1, server instructions per query (22) | -0.14% geomean (q5 -0.6%) | |
+| lexdb point select (icount6, 2 alternated rounds) | -0.16% (171,760 against 172,030-172,060) | -3.3 / -3.1% |
+
+What remains in `lists` is the walk: `sum` (inlined into itself once) saves and restores four
+callee-saved registers a call. Two of them hold values that are only read as the call's
+arguments or only written from its result, which the allocator's positions (a statement each)
+count as live across the call.
+
+Test: tests/run/drop_local_stack (balanced trees, a left spine of 1,000 nodes, far deeper than
+the stack, nodes with strings and arrays, a match whose last arm is untested, a type with a
+drop method whose drops keep their order), the same on --c, --native and -O, no leak under
+LXL_CHECK=1.

@@ -913,7 +913,10 @@ fn (e: mut &Emitter) rest(t: int): []int {
 //                 if (nx) { rt_dpush(self, nx); nx = 0; } rt_dpush(other, Y);  ...
 //                 if (!nx) break; p = nx; }
 // Only when every push is a statement of the body itself (not inside a loop of it).
-fn (e: mut &Emitter) selfLoop(n: &str, body: []int): []int {
+// With local (no drop method reachable from the type: the order of its parts' drops shows
+// nothing), the values of its own type wait in a stack of the action's own, up to DSTACK, before
+// the worklist: a tree's drop then makes no call but rt_free's.
+fn (e: mut &Emitter) selfLoop(n: &str, body: []int, local: bool): []int {
     var selfs = 0
     var nested = false
     for ln in body {
@@ -924,10 +927,28 @@ fn (e: mut &Emitter) selfLoop(n: &str, body: []int): []int {
     if selfs == 0 || nested { return body }
     let nx = e.nm("nx")
     let flush = e.c.x.if1(nx, e.callS("rt_dpush", [e.nm(n), e.nm("nx")]))
-    var out: []int = [e.c.x.swhile(e.c.x.lit(1)), e.c.x.decl(e.ct("void*"), "nx", e.c.x.lit(0))]
+    var out: []int = []
+    if local {
+        append(mut &out, e.c.x.declArr(e.ct("void*"), "ls", DSTACK, -1))
+        append(mut &out, e.c.x.decl(e.ct("int64_t"), "lt", e.c.x.lit(0)))
+    }
+    append(mut &out, e.c.x.swhile(e.c.x.lit(1)))
+    append(mut &out, e.c.x.decl(e.ct("void*"), "nx", e.c.x.lit(0)))
     for ln in body {
         let k = e.pushOf(ln, n)
-        if k == 1 {
+        if k == 1 && local {
+            // if (nx) { if (lt < DSTACK) ls[lt++] = nx; else rt_dpush(self, nx); }
+            append(mut &out, e.c.x.sif(e.nm("nx")))
+            append(mut &out, e.c.x.sif(e.c.x.bin("<", e.nm("lt"), e.c.x.lit(DSTACK))))
+            append(mut &out, e.c.x.sx(e.c.x.asg(e.c.x.idx(e.nm("ls"), e.nm("lt")), e.nm("nx"))))
+            append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("lt"), e.c.x.bin("+", e.nm("lt"), e.c.x.lit(1)))))
+            append(mut &out, e.c.x.selse())
+            append(mut &out, e.callS("rt_dpush", [e.nm(n), e.nm("nx")]))
+            append(mut &out, e.c.x.send())
+            append(mut &out, e.c.x.send())
+            let arg = e.c.x.listAt(e.c.x.nodes[e.c.x.nodes[ln].a].l, 1)
+            append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("nx"), arg)))
+        } else if k == 1 {
             append(mut &out, flush)
             let arg = e.c.x.listAt(e.c.x.nodes[e.c.x.nodes[ln].a].l, 1)
             append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("nx"), arg)))
@@ -941,10 +962,33 @@ fn (e: mut &Emitter) selfLoop(n: &str, body: []int): []int {
             append(mut &out, ln)
         }
     }
-    append(mut &out, e.c.x.if1(e.c.x.pre("!", e.nm("nx")), e.c.x.sbreak()))
+    if local {
+        // if (!nx) { if (lt == 0) break; nx = ls[--lt]; }
+        append(mut &out, e.c.x.sif(e.c.x.pre("!", e.nm("nx"))))
+        append(mut &out, e.c.x.if1(e.c.x.bin("==", e.nm("lt"), e.c.x.lit(0)), e.c.x.sbreak()))
+        append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("lt"), e.c.x.bin("-", e.nm("lt"), e.c.x.lit(1)))))
+        append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("nx"), e.c.x.idx(e.nm("ls"), e.nm("lt")))))
+        append(mut &out, e.c.x.send())
+    } else {
+        append(mut &out, e.c.x.if1(e.c.x.pre("!", e.nm("nx")), e.c.x.sbreak()))
+    }
     append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("p"), e.nm("nx"))))
     append(mut &out, e.c.x.send())
     return out
+}
+
+// The values a drop action keeps in its own stack before the worklist (selfLoop).
+const DSTACK = 32
+
+// Whether no type reachable from t (t too) has a drop method: the order of its parts' drops is
+// not seen.
+fn (e: mut &Emitter) noUserDrop(t: int): bool {
+    if e.hasDrop(t) { return false }
+    let r = e.reach(t)
+    for x in e.reachSets[r] {
+        if x != DEEP && e.hasDrop(x) { return false }
+    }
+    return true
 }
 
 // Whether line ln is `rt_dpush(f, x);`: 1 when f is self, 2 another, else 0.
@@ -1065,7 +1109,7 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         if kind == G_DROP {
             e.define(&n, "void", [ct], ["v"], body, -1)
         } else {
-            if kind == G_ACT { body = e.selfLoop(&n, body) }
+            if kind == G_ACT { body = e.selfLoop(&n, body, e.noUserDrop(t)) }
             e.define(&n, "void", ["void*"], ["p"], body, -1)
         }
         return
