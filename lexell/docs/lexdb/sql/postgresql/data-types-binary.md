@@ -15,7 +15,8 @@ bytea
 - A `bytea` constant is written in hex, `'\x6869'`, or as text, whose UTF-8 bytes it takes (`'hi'::bytea`).
 - Output is always hex (`\x6869`), as with PostgreSQL's default `bytea_output = 'hex'`.
 - `||` joins two values; `length` and `octet_length` count bytes; `encode` and `decode` convert to and from
-  `hex`, `base64` and `escape` text; `md5` takes `bytea` as well as text.
+  `hex`, `base64` and `escape` text; `md5` takes `bytea` as well as text; `bit_count`, `crc32` and `crc32c` take
+  `bytea`.
 - A `uuid` casts to `bytea`, its 16 bytes (PostgreSQL 18).
 - Bad hex is 22P02 (`invalid hexadecimal digit`).
 
@@ -24,8 +25,8 @@ bytea
 - `SET bytea_output = 'escape'` is accepted and ignored: output stays hex.
 - `substring` and `position` on `bytea` work on the hex text, not the bytes: `substring('\x01020304'::bytea from 2
   for 2)` gives `x0`, and `position('\x03'::bytea in '\x01020304'::bytea)` gives 0.
-- `get_byte`, `set_byte`, `get_bit`, `set_bit`, `convert_to`, `convert_from`, `sha224` ... `sha512` and
-  `bit_count(bytea)` do not exist (42883).
+- `get_byte`, `set_byte`, `get_bit`, `set_bit`, `convert_to`, `convert_from` and `sha224` ... `sha512` do not
+  exist (42883).
 
 ## Examples
 
