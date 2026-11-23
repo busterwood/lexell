@@ -158,9 +158,8 @@ Java `BigDecimal` and .NET `System.Decimal` are the standard decimal types in th
 
 `bench/decimal/compare`: the Lexell benchmarks (`decbench.lxl`, `decbench-big.lxl`),
 the Java harness, and the .NET harness, nanoseconds per operation, all from one run.
-The .NET SDK is 10.0.113. The repo's `DecBench.csproj` targets net8.0 and only the
-.NET 10 runtime is installed, so the .NET program was built from a copy retargeted
-to net10.0. The .NET harness has no 37- and 38-digit cases.
+Java is OpenJDK 21.0.13; .NET is SDK 10.0.113 (runtime 10.0.13), targeting net10.0.
+The .NET harness has no 37- and 38-digit cases.
 
 | operation | Lexell | .NET System.Decimal | Java BigDecimal | Lexell / .NET | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
