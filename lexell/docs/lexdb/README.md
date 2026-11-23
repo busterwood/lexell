@@ -14,12 +14,13 @@ These pages are for people who run lexdb and write programs against it. The desi
 | [Quick start](quickstart.md) | Build, start with all three doors, use one table from each. |
 | [Server options](server-options.md) | Every command-line option and environment variable, with defaults. |
 | [Read replicas](replicas.md) | Replicas, routing per door, read-your-writes with `WAIT FOR LSN`. |
+| [Architecture](architecture.md) | The files, commits, checkpoints and recovery, from a user's point of view. |
+| [Transactions](transactions.md) | Isolation, how a transaction starts and ends in each door, retries. |
+| [Security](security.md) | Logins, roles and privileges per door. |
 | [Bulk loading](bulk-load.md) | `COPY`, SQL Server bulk copy (bcp, `SqlBulkCopy`), Oracle array DML. |
 | [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
 
-Still to be written: architecture (the files, checkpoints and recovery), transactions and isolation, security
-(logins, roles and privileges per door), monitoring (catalog views, statistics). Links to them from other pages lead
-nowhere until then.
+Still to be written: monitoring (catalog views, statistics).
 
 ## Connecting
 
