@@ -26,7 +26,7 @@ pub fn isTsqlFn(name: &str): bool {
     match name {
         "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
         "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bitint",
-        "#bitnot", "#quotename", "#format" { return true }
+        "#bitnot", "#quotename", "#format", "#tbit_count", "#tbit_shl", "#tbit_shr", "#tbit_get", "#tbit_set" { return true }
         else { return false }
     }
 }
@@ -73,6 +73,134 @@ fn intOf(v: &Val, what: &str): Result[int, DbErr] {
     }
 }
 
+// ---- SQL Server 2022's bit functions (design/lexdb-new-features.md S21): BIT_COUNT, LEFT_SHIFT (<<), RIGHT_SHIFT (>>),
+// GET_BIT, SET_BIT of an integer as wide as its type (smallint 16 bits, int 32, bigint 64; lexdb's tinyint is a smallint)
+// or of a varbinary's bytes (bit 0 the last byte's lowest), as SQL Server: shifts logical, a negative count the other
+// way, a count past the width 0; BIT_COUNT a bigint, GET_BIT a bit, the others the value's type; NULL for any NULL; 8116
+// for a value of another type, 9838 for a bit past the width, 9839 for a SET_BIT value not 0 or 1. The arguments' types
+// come last (the binder's hint, lexdb_lib.HINT).
+
+const TBIT_HINT = "\x00types:"
+
+fn tbitName(f: &str): str {
+    if f == "#tbit_count" { return "bit_count" }
+    if f == "#tbit_shl" { return "left_shift" }
+    if f == "#tbit_shr" { return "right_shift" }
+    if f == "#tbit_get" { return "get_bit" }
+    return "set_bit"
+}
+
+fn tbitType(o: int): str {
+    if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_BPCHAR { return "varchar" }
+    if o == lexdb_sql.OID_NUMERIC { return "numeric" }
+    if o == lexdb_sql.OID_BOOL { return "bit" }
+    if o == lexdb_sql.OID_FLOAT8 || o == lexdb_sql.OID_FLOAT4 { return "float" }
+    if o == lexdb_sql.OID_DATE { return "date" }
+    if o == lexdb_sql.OID_TS { return "datetime" }
+    return "sql_variant"
+}
+
+fn tbitWidth(o: int): int {
+    if o == lexdb_sql.OID_INT2 { return 16 }
+    if o == lexdb_sql.OID_INT4 { return 32 }
+    if o == lexdb_sql.OID_INT8 { return 64 }
+    return 0
+}
+
+// The value's bit i (0 the lowest).
+fn bitAt(v: &Val, w: int, i: int): bool {
+    if i < 0 || i >= w { return false }
+    match v {
+        Val.Int(x) { return ((x >> i) & 1) == 1 }
+        Val.Bytes(b) { return ((int(b[len(b) - 1 - i / 8]) >> (i % 8)) & 1) == 1 }
+        else { return false }
+    }
+}
+
+// A value of v's kind and width w whose bit i is f(i).
+fn bitsOf(v: &Val, w: int, f: &fn(int): bool): Val {
+    match v {
+        Val.Bytes(b) {
+            var out: []byte = []
+            for k in 0..len(b) {
+                var x = 0
+                for j in 0..8 { if f((len(b) - 1 - k) * 8 + j) { x = x | (1 << j) } }
+                append(mut &out, byte(x))
+            }
+            return Val.Bytes(strFromBytes(&out))
+        }
+        else {
+            var x = 0
+            for i in 0..w { if f(i) { x = x | (1 << i) } }
+            // as a signed value of w bits
+            if w < 64 && ((x >> (w - 1)) & 1) == 1 { x = x - (1 << w) }
+            return Val.Int(x)
+        }
+    }
+}
+
+fn tbit(f: &str, vs0: &[]Val): Result[Option[Val], DbErr] {
+    var os: []int = []
+    var n = len(vs0)
+    match vs0[n - 1] {
+        Val.Text(s) {
+            if strings.startsWith(&s, TBIT_HINT) {
+                for p in strings.split(&s[len(TBIT_HINT)..len(s)], ",") { append(mut &os, strings.parseIntOpt(&(p.toStr())).unwrapOr(0)) }
+                n -= 1
+            }
+        }
+        else {}
+    }
+    let fname = tbitName(f)
+    // each argument's type (by its value: a variable's type is not in the hint): the value an integer or a varbinary, the
+    // counts integers
+    for k in 0..n {
+        let o = if k < len(os) { os[k] } else { 0 }
+        var bad = ""
+        match vs0[k] {
+            Val.Int(_) {}
+            Val.Null {}
+            Val.Bytes(_) { if k > 0 { bad = "varbinary" } }
+            Val.Text(_) { bad = "varchar" }
+            Val.Num(_) { bad = "numeric" }
+            Val.Bool(_) { bad = "bit" }
+            Val.Float(_) { bad = "float" }
+            else { bad = tbitType(o) }
+        }
+        if len(bad) > 0 { return Err(e("TS8116", &("Argument data type " + bad + " is invalid for argument " + (k + 1).toStr() + " of " + fname + " function."))) }
+    }
+    for k in 0..n { if isNull(&vs0[k]) { return Ok(Some(Val.Null)) } }
+    let v = &vs0[0]
+    var w = 0
+    match v {
+        Val.Bytes(b) { w = 8 * len(b) }
+        Val.Int(x) {
+            w = if len(os) > 0 && tbitWidth(os[0]) > 0 { tbitWidth(os[0]) } else if x >= -2147483648 && x <= 2147483647 { 32 } else { 64 }
+        }
+        else {}
+    }
+    if f == "#tbit_count" {
+        var c = 0
+        for i in 0..w { if bitAt(v, w, i) { c += 1 } }
+        return Ok(Some(Val.Int(c)))
+    }
+    let k = try intOf(&vs0[1], &fname)
+    if f == "#tbit_shl" || f == "#tbit_shr" {
+        // a negative count the other way
+        let by = if f == "#tbit_shl" { k } else { -k }
+        return Ok(Some(bitsOf(v, w, fn(i: int): bool { return bitAt(v, w, i - by) })))
+    }
+    if k < 0 || k >= w { return Err(e("TS9838", &("Parameter 2 in function '" + fname + "' is out of range 0 to " + (w - 1).toStr() + "."))) }
+    if f == "#tbit_get" { return Ok(Some(Val.Bool(bitAt(v, w, k)))) }
+    var to = 1
+    if n > 2 {
+        to = try intOf(&vs0[2], &fname)
+        if to != 0 && to != 1 { return Err(e("TS9839", "Parameter 3 in function 'set_bit' must be 0 or 1.")) }
+    }
+    let on = to == 1
+    return Ok(Some(bitsOf(v, w, fn(i: int): bool { return if i == k { on } else { bitAt(v, w, i) } })))
+}
+
 fn runes(s: &str): []int {
     var out: []int = []
     var i = 0
@@ -108,6 +236,7 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
             else { return Err(e("TS8117", "Operand data type is invalid for ~ operator.")) }
         }
     }
+    if n > 0 && name[1] == 't' && strings.startsWith(name, "#tbit_") { return tbit(name, vs) }
     if name == "#utcnow" { return Ok(Some(Val.Ts(lexdb_time.nowTstz()))) }
     // FORMAT(value, format [, culture]): .NET's format strings (lexdb_tsqlfmt)
     if name == "#format" { return Ok(Some(try lexdb_tsqlfmt.format(vs, z))) }

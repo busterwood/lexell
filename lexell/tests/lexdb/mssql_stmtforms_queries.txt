@@ -1,0 +1,49 @@
+# The audit's cheap T-SQL odds (design/lexdb-new-features.md S9, S21): SQL Server 2025's ||=, the compound assignments in
+# SET @v and UPDATE ... SET, ^ as XOR, 2022's BIT_COUNT, LEFT_SHIFT, RIGHT_SHIFT (<< >>), GET_BIT, SET_BIT and
+# APPROX_PERCENTILE_CONT / _DISC, against SQL Server 2025 (gen_mssql.py --port 14331 --container lxl-mssql25 stmtforms).
+# Each batch runs with lexdb_batch off and on (BOTH); writes in a transaction rolled back.
+@once create table u (id int primary key, a int, s varchar(10), g bigint, h smallint)
+@once insert into u values (1, 1, 'p', 9223372036854775807, -2), (2, NULL, NULL, -9223372036854775807 - 1, 0), (3, 6, 'x', 5, 7)
+@once create table pb (id int primary key, k varchar(10), v int, f float)
+@once with n as (select 1 as i union all select i + 1 from n where i < 3000) insert into pb select i, case when i % 41 = 0 then NULL else 'k' + cast(i % 7 as varchar(5)) end, case when i % 13 = 0 then NULL else i % 101 end, i * 0.5 from n option (maxrecursion 3000)
+declare @s varchar(20) = 'a'; set @s ||= 'b'; set @s ||= 'c'; select @s as s
+declare @s varchar(20) = null; set @s ||= 'b'; select @s as s
+declare @s varchar(20) = 'a'; set @s ||= null; select @s as s
+declare @s nvarchar(20) = N'x'; set @s ||= 1; select @s as s
+declare @i int = 1; set @i ||= 2; select @i as i
+declare @i int = 6; set @i &= 3; select @i as i
+declare @i int = 6; set @i |= 9; select @i as i
+declare @i int = 6; set @i ^= 3; select @i as i
+declare @i int = 7; set @i %= 4; set @i *= 10; set @i -= 1; set @i /= 2; select @i as i
+declare @i int = 7; set @i += 1; select @i as i
+select 6 ^ 3 as x, 6 & 3 as y, 6 | 3 as z, 2 + 6 ^ 3 as w, 5 ^ 5 as v
+begin tran; update u set a += 5, s ||= 'q' where id <= 2; select id, a, s from u order by id; rollback
+begin tran; update u set a *= 2, s ||= s where id = 3; update u set a %= 5 where id = 3; select a, s from u where id = 3; rollback
+begin tran; update u set a ^= 1, h |= 8 where id = 3; select a, h from u where id = 3; rollback
+begin tran; update u set a ||= 1 where id = 1; rollback
+begin tran; update pb set k ||= '!' where id <= 3 or k is null; select count(*) as n, sum(case when k like '%!' then 1 else 0 end) as b from pb; rollback
+select bit_count(7) as a, bit_count(cast(-1 as int)) as b, bit_count(cast(-1 as bigint)) as c, bit_count(cast(-1 as smallint)) as g, bit_count(0) as z
+select left_shift(1, 3) as a, right_shift(16, 2) as b, 1 << 4 as c, 256 >> 4 as d, left_shift(1, 31) as f, left_shift(1, 32) as g, right_shift(-16, 2) as h, left_shift(1, -1) as i
+select get_bit(5, 0) as a, get_bit(5, 1) as b, set_bit(5, 1) as d, set_bit(5, 0, 0) as e, set_bit(cast(0 as bigint), 40) as f, get_bit(cast(-1 as bigint), 63) as g, set_bit(cast(0 as int), 31) as h
+select left_shift(5, 0) as a, right_shift(cast(-1 as bigint), 60) as b, right_shift(cast(-1 as smallint), 4) as c, left_shift(cast(-1 as smallint), 4) as d, right_shift(1, 33) as e, left_shift(3, 30) as f
+select 1 << 33 as a, cast(1 as bigint) << 33 as b, 5 >> -1 as c, left_shift(cast(1 as bigint), 63) as d, left_shift(cast(3 as smallint), 15) as e
+declare @n int = null; select bit_count(@n) as a, left_shift(@n, 1) as b, left_shift(1, @n) as c, get_bit(@n, 1) as d, set_bit(@n, 1) as e, set_bit(1, @n) as f, get_bit(1, @n) as g, set_bit(1, 1, @n) as h
+select id, bit_count(a) as ba, bit_count(g) as bg, bit_count(h) as bh, a << 1 as l, g >> 62 as r, get_bit(g, 63) as gb, set_bit(h, 3) as sh, right_shift(h, 1) as rh from u order by id
+select bit_count(v) as b, count(*) as n from pb group by bit_count(v) order by 1
+select sum(bit_count(id)) as s, max(left_shift(v, 3)) as m, sum(cast(get_bit(id, 0) as int)) as odd from pb
+select get_bit(5, 32)
+select get_bit(5, -1)
+select set_bit(5, 32)
+select set_bit(5, 1, 2) as a
+select left_shift('a', 1)
+select bit_count(1.5)
+select bit_count(cast(1 as bit)) as a
+select bit_count(1, 2)
+select get_bit(1)
+select id, get_bit(a, 40) as x from u where id = 3
+select approx_percentile_cont(0.5) within group (order by v) as m, approx_percentile_disc(0.5) within group (order by v) as d from (values (1), (2), (3), (4)) x(v)
+select k, approx_percentile_cont(0.5) within group (order by v) as c, approx_percentile_disc(0.5) within group (order by v) as d, approx_percentile_cont(0.25) within group (order by v desc) as cd, approx_percentile_disc(0) within group (order by f) as df from pb where id <= 200 group by k order by k
+select approx_percentile_cont(0.5) within group (order by v) as c from pb where 1 = 0
+select approx_percentile_cont(1.5) within group (order by v) from (values (1)) x(v)
+select approx_percentile_cont(0.5) within group (order by v) over () from (values (1)) x(v)
+select approx_percentile_cont(0.5) from (values (1)) x(v)

@@ -3,7 +3,8 @@
 Status: audit, 2026-11-22, on main `30a02b82` (after recursion in the doors, lexdb-dialect-gaps.md section 10). No
 lexdb code was changed; the branch adds this note and one test (`tds_distinct`, section 5). The order at the end
 (section 6) is a proposal; the choices in it are the user's. Section 7 (later, commit 91781b58): the rows classed wrong
-answer and wrong error fixed, marked *works* with the commit.
+answer and wrong error fixed, marked *works* with the commit. Section 8 (later, commit ec3c5c17): the cheap missing statement
+forms of 6.1 (items 1, 2's Oracle GROUP BY ALL, 4 and 5), marked *works* with the commit.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -45,12 +46,12 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | # | Feature | PostgreSQL's behaviour | lexdb (PostgreSQL door) | Class | Size | Other doors natively | Modules |
 |---|---|---|---|---|---|---|---|
 | P1 | `INSERT ... ON CONFLICT (target) DO SELECT [FOR UPDATE\|NO KEY UPDATE\|SHARE\|KEY SHARE] [WHERE cond] RETURNING ...` (P19) | the conflicting row is returned as it is (optionally locked), a new row as inserted; WHERE filters the conflicting ones out of RETURNING (`INSERT 0 0`); RETURNING required (42601 "requires a RETURNING clause"), so is a conflict target (42601 "requires inference specification"); `old.*`/`new.*` both the existing row | 42601 syntax error at `select` | missing | M: a third conflict action beside NOTHING/UPDATE; the row lock and WHERE reuse ON CONFLICT DO UPDATE's (`upsertOf`, `conflictOf`, in lexdb_exec: new code in its own module) | none (T-SQL and Oracle have MERGE only) | lexdb_parse `onConflict`, the upsert path |
-| P2 | `RETURNING old.x, new.x, old.*, new.*` and `RETURNING WITH (OLD AS o, NEW AS n)` for INSERT, UPDATE, DELETE, ON CONFLICT DO UPDATE, MERGE (P18) | INSERT's old NULL, DELETE's new NULL; MERGE RETURNING with `merge_action()` and old/new | 42P01 `missing FROM-clause entry for table "old"` | missing | S: the T-SQL door's `OUTPUT deleted.`/`inserted.` rewrite (`lexdb_parse.outputRefs` onto `#old`) is the same thing; add the qualifiers, stars and aliases | Oracle 23ai `RETURNING OLD c, NEW c INTO` (O19); T-SQL has OUTPUT (works) | lexdb_parse, RETURNING of upsert/MERGE |
+| P2 | `RETURNING old.x, new.x, old.*, new.*` and `RETURNING WITH (OLD AS o, NEW AS n)` for INSERT, UPDATE, DELETE, ON CONFLICT DO UPDATE, MERGE (P18) | INSERT's old NULL, DELETE's new NULL; MERGE RETURNING with `merge_action()` and old/new | as PostgreSQL 18: `old.c`, `new.c`, `old.*`, `new.*`, `WITH (OLD AS o, NEW AS n)` in INSERT, ON CONFLICT DO UPDATE (old the row there), UPDATE (... FROM), DELETE (... USING), MERGE per action; a default name a table has is the table's, one given in WITH 42712; OLD/NEW twice 42601 (was 42P01). Not: the whole row (`RETURNING old`, a composite), old/new in a subquery of RETURNING (8.3) | works (ec3c5c17) | S | Oracle 23ai `RETURNING OLD c, NEW c INTO` (O19, works); T-SQL has OUTPUT (works) | new lexdb_oldnew, lexdb_parse `returning`, lexdb_exec `retOf` |
 | P3 | `PRIMARY KEY / UNIQUE (k, r WITHOUT OVERLAPS)`, `FOREIGN KEY (k, PERIOD r) REFERENCES t (k, PERIOD r)` (P18) | needs a range column (and btree_gist for scalar parts); 23P01 for an overlap, 23503 for a range the referenced rows do not cover | 42601 at `without`; range types do not exist (`daterange`: 42704) | missing | L: range types first, then the constraint (section 6.3) | none (Oracle's PERIOD FOR has no such key; SQL Server's temporal tables are system-versioned) | new lexdb_range, catalog, write path |
 | P4 | `WAIT FOR LSN 'lsn' [WITH (MODE 'standby_replay\|standby_write\|standby_flush\|primary_flush', TIMEOUT '...', NO_THROW)]` (P19) | on a primary: `recovery is not in progress` (55000) for the standby modes | as PostgreSQL 19 (lexdb.md 9.137): the options, statuses and errors, checked against a 19.0 primary and standby; lexdb's LSN is the batch number; `pg_current_wal_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn`, `pg_is_in_recovery` added (was 42601 at `wait`) | works (replica branch) | M, with the replica work (the user's order) | none (SQL Server and Oracle have no statement for it) | lexdb_standby, lexdb_parse, lexdb_store (Follower.waitApplied) |
 | P5 | `lag/lead/first_value/last_value/nth_value(...) IGNORE NULLS \| RESPECT NULLS OVER (...)` (P19) | NULLs skipped in the frame (lag/lead: in the offset) | 42601 at `nulls` | missing | M: the frame walk in both the row path and the pipeline window (lexdb_window) | SQL Server 2022 (FIRST_VALUE, LAST_VALUE, LAG, LEAD: S15), Oracle (`f(x IGNORE NULLS)` and `f(x) IGNORE NULLS`: O25) | lexdb_parse, lexdb_window |
 | P6 | `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` (P18); `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` for CHECK (P19) | rows not checked while not enforced; ENFORCED rechecks (23514 "is violated by some row") | 42601 at `not`; ALTER CONSTRAINT: lexdb's ALTER COLUMN message | missing | M: a flag on the constraint, the write path skipping it, ALTER rechecking | Oracle `CHECK (...) DISABLE`, `ENABLE NOVALIDATE` (O26); SQL Server `WITH NOCHECK`, `NOCHECK CONSTRAINT` (S22) | lexdb_parse `checkTail`, lexdb_catalog, the write path |
-| P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL | 42601 at `not` | missing | S | none | lexdb_parse |
+| P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL, kept in pg_constraint (contype `n`, every NOT NULL there, `t_c_not_null` by default), information_schema's CHECK rows, DROP / RENAME CONSTRAINT | the syntax as PostgreSQL 18 (`[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD, 42703, 42601 for two names of a column); the name is not kept, the catalogs list no NOT NULL constraints, DROP CONSTRAINT n 42704 | works (syntax, ec3c5c17) / missing (the catalogs: plan in 8.4) | S (syntax) / M (catalogs) | none | lexdb_parse `nnCons`; lexdb_catalog, lexdb_pgcat |
 | P8 | `uuidv7([shift interval])`, `uuidv4()` (P18); `uuid_extract_version`, `uuid_extract_timestamp` (P17) | | 42883 | missing | S | Oracle `UUID()`, `IS_UUID()` (O14); T-SQL NEWID (works) | lexdb_lib |
 | P9 | `casefold`, `array_sort`, `array_reverse`, `crc32`, `crc32c`, `gamma`, `lgamma` (P18) | | 42883 (`array_sort`: lexdb-gaps.md 2.1) | missing | S (together) | none | lexdb_lib, lexdb_func |
 | P10 | `reverse(bytea)` (P18) | `\x0102` gives `\x0201` | as PostgreSQL (was `2010x\`, the bytea's text reversed) | works (91781b58) | S | none | lexdb_lib |
@@ -66,7 +67,7 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | P20 | `EXTRACT(WEEK FROM ...)` (P18 lists it) | column named `extract` (since P14) | as PostgreSQL (was `date_part`); also a cast's column is the type's own name (`int4`, not `integer`) and `pg_typeof`'s is `pg_typeof` (was `?column?`) | works (91781b58) | S | | lexdb_parse, lexdb_bind `exprName` |
 | P21 | `x IS DISTINCT FROM y` in a select list | column named `?column?` | as PostgreSQL (was `distinct`) | works (91781b58) | S | | lexdb_bind `exprName` |
 | P22 | `0x1F`, `0o17`, `0b101`, `1_000` (P16) | 31, 15, 5, 1000 | as PostgreSQL 16: the literals (of any length: past int8 a numeric), `_` between digits, a number running into a name 42601 ("trailing junk"), a text constant cast to an integer or numeric (`'0x1F'::int`, `'1_000'::bigint`; not a text column's value: below) | works (91781b58) | S | T-SQL `0x..` stays T-SQL's; Oracle has neither: `1_000` is ORA-00911 there now (was `1` aliased `_000`), `0x1F` is 0 aliased X1F as Oracle's | lexdb_parse lexer |
-| P23 | met on the way, older: `CREATE DOMAIN` (lexdb-gaps.md 2.2), `WITH v (x) AS (VALUES ...)`, `bit_and`/`bit_or` aggregates, `any_value` (P16), `date_bin` (P14), `unistr` (P14), `date_add`/`date_subtract` (P16), `trim_array` (P14), `array_shuffle`/`array_sample` (P16), `bit_count` (P14), `erf`/`erfc` (P16), `pg_input_is_valid`/`pg_input_error_info` (P16), `to_bin`/`to_oct` (P17) | | 42883, 42601 (`values`), 0A000 (CREATE DOMAIN) | missing | S each but CREATE DOMAIN (L, with O11) | `unistr`: S6/O27; `date_bin`: S13/O12; `any_value`: O18; `bit_and`: O17; domains: O11 | lexdb_lib, lexdb_agg, lexdb_parse |
+| P23 | met on the way, older: `CREATE DOMAIN` (lexdb-gaps.md 2.2), `WITH v (x) AS (VALUES ...)`, `bit_and`/`bit_or` aggregates, `any_value` (P16), `date_bin` (P14), `unistr` (P14), `date_add`/`date_subtract` (P16), `trim_array` (P14), `array_shuffle`/`array_sample` (P16), `bit_count` (P14), `erf`/`erfc` (P16), `pg_input_is_valid`/`pg_input_error_info` (P16), `to_bin`/`to_oct` (P17) | | 42883, 0A000 (CREATE DOMAIN); `WITH v (x) AS (VALUES ...)` as PostgreSQL (ec3c5c17: was 42601 at `values`) | works (VALUES in WITH) / missing | S each but CREATE DOMAIN (L, with O11) | `unistr`: S6/O27; `date_bin`: S13/O12; `any_value`: O18; `bit_and`: O17; domains: O11 | lexdb_lib, lexdb_agg, lexdb_parse |
 
 ## 2. SQL Server 2025 (compatibility level 170) and 2022
 
@@ -82,7 +83,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | S6 | the flags' meaning | RE2's (SQL Server's engine): `.` does not match a newline unless `s`; `^`/`$` at lines only with `m` | as SQL Server; the pattern as RE2 reads it (no PostgreSQL ARE escapes: `\m` is 19300) | works (91781b58) | (S1) | | lexdb_func `tsReFlags`, `reCompileFor` |
 | S7 | `BASE64_ENCODE(varbinary [, url_safe])`, `BASE64_DECODE(varchar)` | `AQL/`, `AQL_`; 9803 for bad input | 195 | missing | S | PostgreSQL `encode(.., 'base64')` and 19's base64url (P15) | lexdb_tsqlfn |
 | S8 | `||` string concatenation | `'a' \|\| 1` = `'a1'`, NULL propagates; `1 \|\| 2` 402 | as SQL Server (402 when neither side is a string; the PostgreSQL door's `1 \|\| 2` is 42883 now, as PostgreSQL's; Oracle's `\|\|` takes numbers, unchanged) | works (91781b58) | S | PostgreSQL, Oracle (works) | lexdb_bind `catTypes` |
-| S9 | `||=` compound assignment | `SET @s \|\|= 'b'` | 102 | missing | S | none | lexdb_tsqlparse |
+| S9 | `||=` compound assignment (2025) | `SET @s \|\|= 'b'`, `UPDATE t SET c \|\|= 'b'`; NULL stays NULL; int \|\|= int 402 | as SQL Server 2025 (ec3c5c17: was 102); with it the compound assignments UPDATE ... SET lacked (`+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `\|=`, `^=`: 102 before) and `^=` of SET @v; and `^` is XOR in the door (it was PostgreSQL's power: `6 ^ 3` 216, SQL Server's 5) | works (ec3c5c17) | S | none | lexdb_tsqlparse, lexdb_parse `tsqlCompound`, `setList` |
 | S10 | `json` type, `JSON_ARRAYAGG`, `JSON_OBJECTAGG(k : v)`, `JSON_CONTAINS`, `@j.modify(path, v)`; 2022's `JSON_OBJECT`, `JSON_ARRAY`, `JSON_PATH_EXISTS`, `ISJSON(x, type)`; 2016's `ISJSON`, `JSON_VALUE`, `JSON_QUERY`, `JSON_MODIFY`, `OPENJSON`, `FOR JSON` | `JSON_CONTAINS` takes the json type only (8116 for varchar); empty `JSON_ARRAYAGG` NULL | 195 / 2715 / 102 / 208 for every one | missing | L (section 6.3) | PostgreSQL (P17), Oracle (O29) | new lexdb_json, lexdb_tds (2025's json TDS type) |
 | S11 | `vector(n [, float16])`, `VECTOR_DISTANCE('cosine'\|'euclidean'\|'dot', a, b)`, `VECTOR_NORM`, `VECTOR_NORMALIZE`, `VECTORPROPERTY`; `VECTOR_SEARCH` and vector indexes (PREVIEW_FEATURES) | shown as a JSON array `[1.0000000e+000,...]` | 102 | missing | L, note only (section 6.3) | Oracle `VECTOR` (O30); PostgreSQL only through pgvector (not native) | |
 | S12 | `PRODUCT(x)` aggregate, also `DISTINCT` and `OVER (...)` | 24; 8115 for an int overflow; NULL for no rows | 195 (and no row at all for an empty input: S23) | missing | S: an accumulator in lexdb_agg (row path and pipeline share it), the window form | none | lexdb_agg, lexdb_bind |
@@ -94,7 +95,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | S18 | `CURRENT_DATE`; `SUBSTRING(s, start)` without length; `DATEADD` with a bigint | | as SQL Server (`SUBSTRING(NULL, 1)` 8116 now) | works (91781b58) | | | |
 | S19 | `GREATEST`, `LEAST`, `TRIM/LTRIM/RTRIM(s, chars)`, `WINDOW` clause, `IS [NOT] DISTINCT FROM` (2022) | | as SQL Server (IS DISTINCT FROM: section 5) | works | | | |
 | S20 | `GENERATE_SERIES` (2022), `STRING_SPLIT(s, sep, 1)` with the ordinal (2022) | columns `value` and `value, ordinal` | GENERATE_SERIES as SQL Server (`value`; without a step -1 when start > stop, as SQL Server: was no rows) (91781b58); STRING_SPLIT 208 (missing in any form) | works / missing | S | | lexdb_srf, lexdb_parse |
-| S21 | 2022's `APPROX_PERCENTILE_CONT/DISC`, `BIT_COUNT`, `LEFT_SHIFT`, `RIGHT_SHIFT`, `GET_BIT`, `SET_BIT`; and older ones met on the way: `CHAR()`, `NCHAR()`, `FORMAT(n, 'N2')` | `FORMAT(1234.5, 'N2')` = `1,234.50` | FORMAT as SQL Server: .NET's standard and custom number and date formats, en-US and de-DE (new module lexdb_tsqlfmt); CHAR and NCHAR (the REGEXP tests' newlines needed them) (91781b58); the 2022 functions 195 | works (FORMAT, CHAR, NCHAR) / missing | S each | PostgreSQL `bit_count` (P23), `chr` | lexdb_tsqlfmt, lexdb_parse `tsqlCall` |
+| S21 | 2022's `APPROX_PERCENTILE_CONT/DISC`, `BIT_COUNT`, `LEFT_SHIFT`, `RIGHT_SHIFT`, `GET_BIT`, `SET_BIT`; and older ones met on the way: `CHAR()`, `NCHAR()`, `FORMAT(n, 'N2')` | `FORMAT(1234.5, 'N2')` = `1,234.50` | FORMAT as SQL Server: .NET's standard and custom number and date formats, en-US and de-DE (new module lexdb_tsqlfmt); CHAR and NCHAR (the REGEXP tests' newlines needed them) (91781b58); the 2022 functions as SQL Server (ec3c5c17): BIT_COUNT, LEFT_SHIFT / RIGHT_SHIFT and `<<` / `>>` (as wide as the type: `1 << 33` is 0, logical, a negative count the other way), GET_BIT, SET_BIT, their errors (8116, 9838, 9839, 174), APPROX_PERCENTILE_CONT / _DISC (exact: lexdb_pct's T-SQL percentiles, no OVER: 4113); a varbinary's bits only where lexdb has a varbinary value (a `0x..` literal is an int in the door, lexdb-tds.md 13) | works | S each | PostgreSQL `bit_count` (P23), `chr` | lexdb_tsqlfmt, lexdb_parse `tsqlCall` |
 | S22 | constraint checking off: `WITH NOCHECK`, `ALTER TABLE t NOCHECK CONSTRAINT c\|ALL` | | 50000 (ALTER TABLE takes ...) | missing | (P6) | PostgreSQL NOT ENFORCED (P6), Oracle DISABLE (O26) | |
 | S23 | GROUP BY rules (old T-SQL): `GROUP BY ALL a` keeps the groups WHERE removed (count 0); a select alias or a position in GROUP BY is 207 / 164 | `1\|1;2\|0` | as SQL Server: GROUP BY ALL's groups of every row, each aggregate over WHERE's rows (in the select list, HAVING and ORDER BY), 1028 with ROLLUP; 207 for an alias; 164 for a constant, a position or a variable (91781b58) | works | S | Oracle 26ai `GROUP BY ALL` means another thing (O7): not parsed in that door | lexdb_parse `groupAll`, lexdb_bind `resolveGroupIn` |
 | S24 | an unknown function over no rows | 195 when the batch is compiled | 42883 / 195 / ORA-00904 when the statement is bound, over no rows too (91781b58) | works | S | all doors | lexdb_bind `knownCall`, lexdb_lib `entryOf`'s misses |
@@ -109,12 +110,12 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O2 | aggregate and window `FILTER (WHERE ...)` (23.26.1) | | as Oracle | works | | PostgreSQL (works) | |
 | O3 | `SELECT` without `FROM` | | as Oracle | works | | PostgreSQL, T-SQL | |
 | O4 | `BOOLEAN` columns, `TRUE`/`FALSE`, boolean expressions in the select list and WHERE | | as Oracle (types BOOLEAN on the wire); `TO_BOOLEAN`, `BOOLEAN_AND_AGG`, `BOOLEAN_OR_AGG`: ORA-00904 | works / missing (the three functions) | S | PostgreSQL `bool_and`/`bool_or` (work) | lexdb_orafn, lexdb_agg |
-| O5 | table value constructor `VALUES (...), (...)` in FROM, INSERT, MERGE USING, WITH | | the column names as written (`X, Y`, a quoted one as quoted; a CTE's column list's too, and a derived table's in T-SQL: lexdb-dialect-gaps.md 10 "Left"), ORA-00931 / ORA-63814 without an alias or its column list (91781b58); a string literal is a VARCHAR2 where Oracle's is a CHAR (every literal of the door, not VALUES': not changed, see 7.3); in WITH ORA-00900 | works (names) / wrong answer (literal type) / missing | S | PostgreSQL (WITH form missing too), T-SQL (FROM only, works) | lexdb_parse `aliasOf`, lexdb_exec FROM binding |
+| O5 | table value constructor `VALUES (...), (...)` in FROM, INSERT, MERGE USING, WITH | | the column names as written (`X, Y`, a quoted one as quoted; a CTE's column list's too, and a derived table's in T-SQL: lexdb-dialect-gaps.md 10 "Left"), ORA-00931 / ORA-63814 without an alias or its column list (91781b58); a string literal is a VARCHAR2 where Oracle's is a CHAR (every literal of the door, not VALUES': not changed, see 7.3); in WITH as Oracle (ec3c5c17) | works (names; WITH: as Oracle, ec3c5c17, with ORA-63803 without a column list, 63815, 63801) / wrong answer (literal type) | S | PostgreSQL (WITH: works, ec3c5c17), T-SQL (FROM only, works) | lexdb_parse `aliasOf`, lexdb_exec FROM binding |
 | O6 | `CREATE ... IF NOT EXISTS`, `DROP ... IF EXISTS` | | as Oracle | works | | PostgreSQL, T-SQL DROP | |
-| O7 | `GROUP BY ALL` (26ai) | groups by every select item that is not an aggregate | ORA-00900 | missing | S | none (T-SQL's `GROUP BY ALL` is another feature: S23) | lexdb_parse, lexdb_bind |
+| O7 | `GROUP BY ALL` (26ai) | groups by every select item that is not an aggregate | as Oracle (ec3c5c17): every select item without an aggregate (GROUPING too) or a window call, `*` and `t.*` expanded; ORA-03048 for a comma or ALL after it, ORA-03049 for ROLLUP; not T-SQL's (S23) | works (ec3c5c17) | S | none (T-SQL's `GROUP BY ALL` is another feature: S23) | lexdb_parse, lexdb_bind |
 | O8 | `GROUP BY` alias and position; `HAVING` alias (23ai) | alias works; a position is ORA-03162 unless `ALTER SESSION SET group_by_position_enabled = TRUE` | as Oracle: a number a constant (ORA-03162 when the list needs a grouping), a position after the ALTER SESSION (TRUE/FALSE, ORA-00922 else), HAVING's alias where no column has the name (91781b58) | works | S | PostgreSQL (alias and position, works; no HAVING alias) | lexdb_parse `groupBy`, lexdb_bind `groupedIn`, `resolveHaving`, lexdb_tns `parseOpts` |
-| O9 | direct joins: `UPDATE t SET ... FROM t2 WHERE ...`, `DELETE t FROM t2 WHERE ...` | | UPDATE right; DELETE ORA-00900 | works / missing (DELETE) | S | T-SQL `DELETE t FROM ...` (works), PostgreSQL `DELETE ... USING` (works) | lexdb_parse |
-| O10 | `INSERT INTO t SET c = v, ...`, `INSERT INTO t BY NAME SELECT ...` (26ai) | | ORA-00900 | missing | S: a rewrite to a column list | none | lexdb_parse |
+| O9 | direct joins: `UPDATE t SET ... FROM t2 WHERE ...`, `DELETE t FROM t2 WHERE ...` | | UPDATE right; DELETE `[FROM] t [alias] FROM list` as Oracle (ec3c5c17: was ORA-00900) | works | S | T-SQL `DELETE t FROM ...` (works), PostgreSQL `DELETE ... USING` (works) | lexdb_parse |
+| O10 | `INSERT INTO t SET c = v, ...`, `INSERT INTO t BY NAME SELECT ...` (26ai) | both in 23.26.3: SET's `(c, d) = (v, w)` too, BY POSITION; ORA-00957, 00947, 00913, 63875-63878 | as Oracle (ec3c5c17): rewritten to a column list; not `SET (c, d) = (subquery)` (0A000) nor BY NAME of `*` (0A000) | works (ec3c5c17) | S | none | lexdb_parse `oraInsertSet`, `oraByName` |
 | O11 | SQL domains: `CREATE DOMAIN d AS type CONSTRAINT .. CHECK (d > 0)`, domain columns, `DOMAIN_NAME()`, `DOMAIN_DISPLAY()` | ORA-11534 for a violation | ORA-03001 (0A000) | missing | L: a catalog object, its constraints on every write, its display/order expressions, the catalogs | PostgreSQL `CREATE DOMAIN` (P23; lexdb-gaps.md 2.2) | lexdb_catalog, lexdb_parse, the write path |
 | O12 | `TIME_BUCKET(d, interval, origin)` (23ai) | `2024-03-05 10:15` for 15 minutes | ORA-00904 | missing | (S13) | T-SQL DATE_BUCKET (S13), PostgreSQL date_bin (P23) | lexdb_orafn |
 | O13 | `DATEADD(part, n, d)`, `DATEDIFF(part, a, b)` / `TIMESTAMPDIFF` (26ai) | DATE result; 30 days | ORA-00904 `"DAY"` | missing | S: the T-SQL door's `#dateadd`/`#datediff` with Oracle's types | T-SQL (works) | lexdb_parse `oraCall` |
@@ -123,8 +124,8 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O16 | `SUM`/`AVG` of INTERVAL (23ai) | INTERVAL DAY TO SECOND | SUM an interval (DAY TO SECOND, YEAR TO MONTH), AVG of DAY TO SECOND (91781b58; the PostgreSQL door's `avg(interval)` was 42883 too: works now, PostgreSQL's interval_avg); AVG of YEAR TO MONTH: Oracle truncates to months (`+000000001-00`), lexdb spills into days as PostgreSQL (`1 year 15 days`, a VARCHAR2): left (7.3) | works / wrong answer (AVG of YM) | S | PostgreSQL (works) | lexdb_agg, lexdb_bind |
 | O17 | `BIT_AND_AGG`, `BIT_OR_AGG`, `BIT_XOR_AGG`, `CHECKSUM`, `KURTOSIS_POP/SAMP`, `SKEWNESS_POP/SAMP` (21c/23ai) | | ORA-00904 | missing | S | PostgreSQL `bit_and`/`bit_or`/`bit_xor` (P23) | lexdb_agg |
 | O18 | `ANY_VALUE` (21c) | | ORA-00979 | missing | S | PostgreSQL 16 (P23) | lexdb_agg |
-| O19 | `RETURNING OLD c, NEW c INTO :a, :b` for INSERT, UPDATE, DELETE, MERGE (23ai) | INSERT's OLD NULL, DELETE's NEW NULL | ORA-00904 `"OLD"`; plain RETURNING INTO works | missing | (P2) | PostgreSQL 18 (P2), T-SQL OUTPUT (works) | lexdb_parse |
-| O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default | ORA-00900 (12c's plain form too) | missing | S | none | lexdb_parse, the write path |
+| O19 | `RETURNING OLD c, NEW c INTO :a, :b` for INSERT, UPDATE, DELETE, MERGE (23ai) | INSERT's OLD NULL, DELETE's NEW NULL; OLD/NEW before any column of an expression; ORA-00904 for `old.c` and `OLD f(x)`, ORA-01747 for `OLD *`, ORA-03050 without a column; MERGE with DELETE WHERE ORA-03001; INSERT ... SELECT has no RETURNING (ORA-03049) | as Oracle (ec3c5c17), through the door's RETURNING INTO and in PL/SQL; the two errors of other RETURNINGs (03001, 03049) too (they were accepted) | works (ec3c5c17) | (P2) | PostgreSQL 18 (P2), T-SQL OUTPUT (works) | lexdb_parse |
+| O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default, the column NOT NULL; an UPDATE to NULL ORA-01407 unless FOR INSERT AND UPDATE; USER_TAB_COLUMNS' DEFAULT_ON_NULL, DEFAULT_ON_NULL_UPD | as Oracle (ec3c5c17): INSERT, INSERT ... SELECT, UPDATE, MERGE, ALTER TABLE ADD / MODIFY, the views, ORA-02000, 00936, 30665 | works (ec3c5c17) | S | none | lexdb_parse `oraDefault`, lexdb_exec `onNullFill`, lexdb_oracat |
 | O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | missing | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
@@ -145,11 +146,12 @@ parts add up to more than the rows.
 
 | Product | works | wrong answer | wrong error | missing | parts / rows |
 |---|---|---|---|---|---|
-| PostgreSQL 19/18 (and older met on the way) | 7 (P10, P12, P18-P22) | 0 | 0 | 16 (P1-P9, P11, P13-P17, P23) | 23 / 23 |
-| SQL Server 2025/2022 | 14 (S1-S6, S8, S18-S21, S23-S25) | 0 | 0 | 13 (S7, S9-S17, S20, S21, S22) | 27 / 25, and S26 (note) |
-| Oracle 26ai/23ai | 10 (O2-O6, O8, O9, O15, O16, O28) | 2 (O5's literal type, O16's AVG of YEAR TO MONTH) | 1 (O24) | 26 (O1, O4, O5, O7-O23, O25-O30) | 39 / 30 |
+| PostgreSQL 19/18 (and older met on the way) | 11 (P2, P4, P7's syntax, P10, P12, P18-P22, P23's VALUES in WITH) | 0 | 0 | 14 (P1, P3, P5, P6, P7's catalogs, P8, P9, P11, P13-P17, P23) | 25 / 23 |
+| SQL Server 2025/2022 | 15 (S1-S6, S8, S9, S18-S21, S23-S25) | 0 | 0 | 11 (S7, S10-S17, S20, S22) | 26 / 25, and S26 (note) |
+| Oracle 26ai/23ai | 14 (O2-O10, O15, O16, O19, O20, O28) | 2 (O5's literal type, O16's AVG of YEAR TO MONTH) | 1 (O24) | 18 (O1, O4, O11-O15, O17, O18, O21-O23, O25-O30) | 35 / 30 |
 
-Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26.
+Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26. After
+section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26.
 
 ## 5. IS [NOT] DISTINCT FROM in the T-SQL door: the test
 
@@ -367,3 +369,108 @@ fields of the parser (two empty arrays there cost 122 instructions a parse).
   T-SQL `0x1F` in a select list is an int (31) where SQL Server's is a varbinary (lexdb's reading for arithmetic,
   lexdb-tds.md 13); T-SQL CHAR(0) gives NULL (SQL Server a NUL character).
 - O24 (refusing IS DISTINCT FROM in the Oracle door) stays the user's call.
+
+## 8. The cheap missing statement forms (as built)
+
+Branch from main `a89a203e`, commit `ec3c5c17` (and d39d41c8, c14f9b06, b12fa897: the cost, 8.2): section 6.1's items 1 (RETURNING old/new), 2's Oracle GROUP BY ALL, 4
+(statement forms) and 5 (T-SQL odds), each checked again against the product first (the containers of the header,
+PostgreSQL's answers from the scratch PostgreSQL 18) and built in every door that has it. Rows above say *works
+(ec3c5c17)*.
+
+### 8.1 What changed, where
+
+- **RETURNING old and new** (P2, O19). New module `lexdb_oldnew`, on the machinery T-SQL's OUTPUT DELETED.c has: a
+  reference to the row as it was is `#old(t.c)`, to the row after the statement `#new(t.c)`. PostgreSQL's `old.c`,
+  `new.c`, `old.*`, `new.*` and `RETURNING WITH (OLD AS o, NEW AS n)` are read in `lexdb_parse.returning` (a default name
+  a table of the statement has is the table's; a name given in WITH that one has is 42712; OLD or NEW twice 42601);
+  Oracle's `OLD c` / `NEW c` (before a column, anywhere in RETURNING's expressions, `OLD t.c` too) are written as the
+  column of a qualifier no name has (`oraOldNew`, a pass over RETURNING's tokens), with Oracle's errors (ORA-00904 for
+  `old.c` and `OLD f(x)`, ORA-01747 for `OLD *`, ORA-03050 without a column). The executor settles what the statement
+  decides once (`lexdb_oldnew.settle` in `retOf`: an INSERT's old row NULLs, a DELETE's new row NULLs, an UPDATE's new row
+  the row) and the rest per row: an UPDATE's old row as T-SQL's (`oldRefs`), ON CONFLICT DO UPDATE's the row there (an
+  updated row is kept followed by the row it was, `upsertOld`; `keptRet` reads it), MERGE's by the action (`actionRefs`: DELETE's new NULL).
+  `old.*` and `new.*` are expanded over the target's columns, as T-SQL MERGE's DELETED.* (`lexdb_oldnew.items`, shared
+  now). Oracle's other RETURNING errors met on the way: MERGE with DELETE WHERE and RETURNING is ORA-03001, INSERT ...
+  SELECT has no RETURNING (ORA-03049); both were accepted.
+- **Oracle 26ai's GROUP BY ALL** (O7). Its own parse (`lexdb_parse.oraGroupAll`, the Oracle door only; T-SQL's GROUP BY
+  ALL stays `groupAll`'s rewrite): GROUP BY's one item `lexdb_sql.GB_ALL`, which the planner makes the resolved select
+  items without an aggregate (GROUPING too) or a window call, `*` and `t.*` expanded (`lexdb_bind.gbAllKeys`, called from
+  `lexdb_exec.groupKeys`: GROUP BY's resolution moved out of `planSelect` into it). ORA-03048 for a comma or ALL after
+  it, ORA-03049 for ROLLUP and the like; a window over an ungrouped column ORA-00979 as Oracle.
+- **Statement forms** (O9, O10, O5's WITH, P23, P7, O20). Oracle's `DELETE [FROM] t [alias] FROM list` (23ai's direct
+  join) is PostgreSQL's USING. 26ai's `INSERT INTO t SET c = v, (c, d) = (v, w)` (`oraInsertSet`) and `INSERT INTO t
+  [(cols)] BY NAME | BY POSITION query` (`oraByName`: the query's names its columns) are rewritten to a column list, with
+  ORA-00957, 00947, 00913, 00904, 63875-63878. VALUES is a CTE's body in PostgreSQL and Oracle (`lexdb_parse.subquery`;
+  Oracle's ORA-63803 without a column list, 63815 for a list of another width, 63801 for rows of different widths, also
+  in FROM). PostgreSQL 18's NOT NULL table constraint `[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD
+  (`nnCons`; 42703, 42601 for two names): the column is NOT NULL, the name is not kept (8.4). Oracle's `DEFAULT ON NULL
+  [FOR INSERT ONLY | FOR INSERT AND UPDATE] v` (`oraDefault`): the default kept as `lexdb_sql.ON_NULL(v)` /
+  `ON_NULL_UPD(v)` (lexdb_orafn gives v's value; the catalog text round-trips), the column NOT NULL; a row refused for a
+  NULL there (the cold path of `checkRow`, in `insertOne` and `updRow`: `onNullFill`) gets the default, on an UPDATE only
+  FOR INSERT AND UPDATE (else ORA-01407, as before); USER_TAB_COLUMNS' DEFAULT_ON_NULL and DEFAULT_ON_NULL_UPD (YES / NO,
+  as Oracle; they were NULL), DATA_DEFAULT without the mark; ORA-02000, 00936, 30665.
+- **T-SQL odds** (S9, S21). `||=` (2025) and the compound assignments UPDATE ... SET lacked (`lexdb_parse.tsqlCompound`,
+  `tsqlAssign`, in `setList` and lexdb_tsqlparse's SET @v); `^` is XOR in the door (it was PostgreSQL's power). 2022's
+  BIT_COUNT, LEFT_SHIFT, RIGHT_SHIFT, `<<`, `>>`, GET_BIT, SET_BIT in lexdb_tsqlfn (`tbit`: as wide as the value's type,
+  from the binder's hint of the arguments' types, `isTypedFn`), with 8116, 9838, 9839, 174. APPROX_PERCENTILE_CONT /
+  _DISC are lexdb_pct's T-SQL percentiles as aggregates (exact; SQL Server's estimate is exact on the sizes tried), 4113
+  with OVER, 10754 without WITHIN GROUP.
+- **Met on the way** (a regression of 91781b58): a select item of integer arithmetic was named after the overflow cast
+  resolve puts on it (`a + a` was `int4` in the PostgreSQL door, `?column?` in PostgreSQL): `lexdb_bind.exprName` skips
+  that cast.
+
+Tests, each statement with batches off and on: `tns_retold` (37 calls with out binds, a new `@n` kind of
+`gen_oracle.py`'s consts tests: 0 differences against Oracle Free 23.26.3) and `tns_stmtforms` (78 statements,
+`gen_oracle.py --check`: 0 differences); `exec_retold` (50 statements) and `exec_stmtforms` (21), PostgreSQL 18
+(`gen_pg.py`'s NAMED suites, with a new `@tx` line: in a transaction rolled back each time); `tds_stmtforms` (41
+batches, SQL Server 2025, `gen_mssql.py --port 14331 --container lxl-mssql25 stmtforms`). Suite 319 of 319.
+
+### 8.2 Cost
+
+Measured on the branch's last commit (b12fa897) against main `a89a203e`, both `-O`.
+
+- In process (`LXL_HASH_SEED=1`, 20,000 statements less the setup, two rounds alternated, equal in both): point select
+  123,983.3 -> 123,966.3 instructions, INSERT 55,118,190.6 -> 55,118,174.7, UPDATE by key 55,138,484.2 -> 55,138,480.2.
+  The first build was above main (select +15, INSERT +72, UPDATE +44): T-SQL's `^` tested in PostgreSQL's operator
+  loops (now lexed as `#` in the T-SQL door), INSERT's parse split in two functions (a Stmt handed by value), RETURNING's
+  list in `returning` itself, an Upsert field; d39d41c8 took them out.
+- Over the wire (`icount6.sh`, 3 x points.sql, base and branch alternated twice), per statement: instructions 173,092 /
+  173,085 -> 173,056 / 173,075; cycles 95,662 / 95,643 -> 94,893 / 94,707; L1 i-cache misses 309 / 310 -> 360 / 358;
+  branch misses 379 / 386 -> 366 / 364. Before b12fa897 the instructions were as equal and the cycles 4-5% up (branch
+  misses +15%, spread over unrelated functions): placement, found by building subsets of the change (lexdb_orafn's two
+  additions at the head of `call` and `resultOid`); 160 KB of padding put into main's parser moved nothing.
+- TPC-H SF1 (`run.sh`, lexdb only, base and branch alternated twice, the best of each side): checksums equal on all 22;
+  total 8,834 -> 8,836 ms. Above 1.5%: q15 357.2 -> 371.1 (base's runs 357.2 / 378.7), q20 243.0 -> 250.6, q21 690.7 ->
+  704.2; their server instructions equal (q15 2,638.6M -> 2,638.3M, q20 1,640.20M -> 1,640.22M, q21 6,961.2M ->
+  6,953.9M): noise and placement.
+- lexdb_exec: 20,464 -> 20,529 lines (RETURNING's settling and stars, `keptRet`, `groupKeys`, `onNullFill`); the rest in
+  the new lexdb_oldnew (179 lines), lexdb_parse, lexdb_bind and lexdb_tsqlfn.
+
+### 8.3 Left
+
+- PostgreSQL's whole-row `RETURNING old` / `new` (a composite: lexdb has no row values as columns) and old/new inside a
+  subquery of RETURNING (`(SELECT old.a)`: the rewrite does not enter subqueries; 42P01).
+- The new value of a DEFAULT ON NULL FOR INSERT AND UPDATE column set to NULL by an UPDATE is the default in the row
+  written but NULL in that UPDATE's RETURNING (the default is given where the row is checked, after RETURNING's row is
+  made).
+- Oracle's `INSERT ... SET (c, d) = (subquery)` and BY NAME of a query with `*` (0A000); a later UNION branch of BY NAME
+  is checked only for names the first has; `NOT NULL DEFAULT ON NULL` (ORA-03076) and `WHERE x IN (VALUES ...)`
+  (ORA-63813) are accepted or refused otherwise.
+- SQL Server's varchar(n) variable truncated on assignment (`SET @s ||= 'efgh'` of a varchar(5) is `abcde`): lexdb
+  refuses the value (2628) for `=` too; the bit functions of a `0x..` literal (an int in lexdb's door, lexdb-tds.md 13);
+  tinyint's width (lexdb's smallint: `LEFT_SHIFT(CAST(1 AS tinyint), 9)` is 512, SQL Server's 0).
+- Met while testing: lexdb's Oracle door finds a quoted lower-case name's upper-case column (`"a"` finds A; Oracle
+  ORA-00904), and has no aggregate RETURNING (`RETURNING SUM(OLD a) INTO`, ORA-00979; Oracle's single-set aggregate).
+
+### 8.4 Plan: PostgreSQL 18's NOT NULL constraints in the catalogs (P7, about a day)
+
+PostgreSQL 18 keeps every NOT NULL as a constraint: pg_constraint has a row of contype `n` for each NOT NULL column (its
+name the one given, else `table_column_not_null`, conkey the column), information_schema.table_constraints and
+check_constraints list them (as CHECK, `c IS NOT NULL`), psql's `\d+` shows them, and ALTER TABLE ... DROP CONSTRAINT n /
+RENAME CONSTRAINT act on them (DROP is DROP NOT NULL). What it takes: (a) the names given kept per table (a new
+`Table.nnNames` of "column\x00name" for the names that are not the default, encoded in the catalog after the checks;
+CREATE TABLE, ADD, column-level `CONSTRAINT n NOT NULL`, RENAME COLUMN and RENAME TABLE keeping them, DROP NOT NULL and
+DROP COLUMN dropping them); (b) the `n` rows in lexdb_pgcat's pg_constraint with their oids (after the others', so
+existing oids do not move), pg_get_constraintdef's `NOT NULL c`, the information_schema rows; (c) DROP / RENAME
+CONSTRAINT finding them; (d) the tests that read pg_constraint without a contype filter (exec_catalog, exec_keyless and
+tds_vscode's) checked again against PostgreSQL 18. No row path is touched: NOT NULL is checked as now.

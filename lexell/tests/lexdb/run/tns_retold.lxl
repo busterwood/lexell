@@ -1,0 +1,156 @@
+// lexdb over TNS: Oracle 23ai's RETURNING OLD c, NEW c INTO (design/lexdb-new-features.md O19): an INSERT's OLD NULL, a
+// DELETE's NEW NULL, an UPDATE's both, a bare column the new row's (a DELETE's the old one's), OLD and NEW before a column
+// anywhere in an expression (a qualified one too), MERGE's per action, a PL/SQL block's DML; the errors Oracle gives (old.c
+// ORA-00904, OLD * ORA-01747, OLD f(x) ORA-00904, OLD without a column ORA-03050, INSERT ... SELECT ... RETURNING ORA-03049,
+// MERGE's DELETE WHERE with RETURNING ORA-03001, an error in a later row). Checked against Oracle Database Free 23.26
+// (gen_oracle.py --check tns_retold: the answers below are Oracle's). A line "@n sql" is a call with n out binds
+// (VARCHAR2), in a transaction rolled back: its row count, then each row of the binds' values. Each runs with set
+// lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 18 statements
+// expect: same: 1 = NULL|'30'
+// expect: same: 1 = NULL|'5'|'none'
+// expect: same: 1 = '10'|'11'|'11'
+// expect: same: 2 = '10'|'11';'20'|'21'
+// expect: same: 1 = '20'|NULL|'20'
+// expect: same: 1 = NULL|NULL
+// expect: same: 1 = 'X'|'21'|'10'
+// expect: same: 1 = '10'|'-1'
+// expect: same: 1 = 'n'|NULL
+// expect: same: 1 = 'xq'|'1'
+// expect: same: 1 = '11'|'20'
+// expect: same: 1 = '10'
+// expect: same: 1 = '21'
+// expect: same: 1 = '10'|'x'
+// expect: same: 0 = 
+// expect: same: 0 = 
+// expect: same: 1 = '10'|'0'
+// expect: same: 1 = NULL|'70'
+// expect: same: 1 = 'y'|'u'|'u'
+// expect: same: error 3001
+// expect: same: error 904
+// expect: same: error 904
+// expect: same: error 1747
+// expect: same: error 904
+// expect: same: error 904
+// expect: same: error 3050
+// expect: same: error 3050
+// expect: same: error 3050
+// expect: same: error 3049
+// expect: same: 4 = 'w1'|'w1x';'w2'|'w2x';'w3'|'w3x';'w4'|'w4x'
+// expect: same: 3 = NULL|'n';NULL|'n';'k3'|'n'
+// expect: same: 2 = '37'|NULL;'74'|NULL
+// expect: same: 4 = NULL|NULL;'k4'|'k4';'k5'|'k5';'k0'|'k0'
+// expect: same: error 1476
+// expect: same: 6 = 'w1'|'v';'w7'|'v';'w13'|'v';'w19'|'v';'w25'|'v';'w31'|'v'
+// expect: same: 0 = '20'|'60'
+// expect: same: 0 = 'y'|'none'
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table dg (i number(10))\ninsert into dg values (0)\ninsert into dg values (1)\ninsert into dg values (2)\ninsert into dg values (3)\ninsert into dg values (4)\ninsert into dg values (5)\ninsert into dg values (6)\ninsert into dg values (7)\ninsert into dg values (8)\ninsert into dg values (9)\ncreate table rt (id number primary key, a number, b varchar2(10))\ninsert into rt values (1, 10, 'x')\ninsert into rt values (2, 20, 'y')\ninsert into rt values (4, null, null)\ncreate table big (id number(10) primary key, k2 varchar2(5), w varchar2(10))\ninsert into big select n, case when mod(n, 37) = 0 then null else 'k' || mod(n, 6) end, 'w' || n from (select p.i + q.i * 10 + r.i * 100 + w.i * 1000 + 1 n from dg p cross join dg q cross join dg r cross join dg w) z where n <= 3000\ncreate table et (id number primary key, a number)"
+
+const QS = "@2 insert into rt values (3, 30, 'z') returning old a, new a into :1, :2\n@3 insert into rt (id) values (5) returning old id, new id, nvl(new b, 'none') into :1, :2, :3\n@3 update rt set a = a + 1 where id = 1 returning old a, new a, a into :1, :2, :3\n@2 update rt set a = a + 1 where id <= 2 returning old a, new a into :1, :2\n@3 delete from rt where id = 2 returning old a, new a, a into :1, :2, :3\n@2 delete from rt where id = 4 returning old a, new id into :1, :2\n@3 update rt set a = a + 1 where id = 1 returning upper(old b), old a + a, nvl(old a, -1) into :1, :2, :3\n@2 update rt set a = null where id = 1 returning nvl(old a, -1), nvl(new a, -1) into :1, :2\n@2 update rt set a = 3 where id = 4 returning case when old a is null then 'n' else 'v' end, new b into :1, :2\n@2 update rt set a = a + 1, b = 'q' where id = 1 returning old b || new b, new a - old a into :1, :2\n@2 update rt set a = a + 1 where id = 1 returning old a + 1, old a * 2 into :1, :2\n@1 update rt o set a = a + 1 where id = 1 returning old o.a into :1\n@1 update rt set a = a + 1 where id = 1 returning old rt.a + new rt.a into :1\n@2 update rt set a = a + 1 where id = 1 returning OLD A, New B into :1, :2\n@1 update rt set a = a + 1 where id = 99 returning old a into :1\n@1 delete from et returning old a into :1\n@2 merge into rt using (select 1 k from dual) s on (rt.id = s.k) when matched then update set a = 0 returning old a, new a into :1, :2\n@2 merge into rt using (select 7 k from dual) s on (rt.id = s.k) when not matched then insert values (7, 70, 'm') returning old a, new a into :1, :2\n@3 merge into rt using (select 2 k from dual) s on (rt.id = s.k) when matched then update set b = 'u' when not matched then insert values (s.k, 1, 'n') returning old b, new b, b into :1, :2, :3\n@2 merge into rt using (select 1 k from dual) s on (rt.id = s.k) when matched then update set a = 2 delete where a = 2 returning old a, new a into :1, :2\n@1 update rt set a = a + 1 where id = 1 returning old.a into :1\n@1 update rt set a = a + 1 where id = 1 returning new.b into :1\n@1 update rt set a = a + 1 where id = 1 returning old * into :1\n@1 update rt set a = a + 1 where id = 1 returning old upper(b) into :1\n@1 update rt set a = a + 1 where id = 1 returning old nosuch into :1\n@1 update rt set a = 5 where id = 1 returning old into :1\n@2 update rt set a = 5 where id = 1 returning old, new into :1, :2\n@1 update rt set a = 6 where id = 1 returning old (select max(a) from rt) into :1\n@1 insert into rt (id, a) select 77, 1 from dual returning new a into :1\n@2 update big set w = w || 'x' where id <= 4 returning old w, new w into :1, :2\n@2 update big set k2 = 'n' where id in (37, 74, 75) returning old k2, new k2 into :1, :2\n@2 delete from big where k2 is null and id < 80 returning old id, new k2 into :1, :2\n@2 update big set k2 = k2 where id > 2996 returning old k2, new k2 into :1, :2\n@1 update big set w = to_char(trunc(100 / (id - 50))) where id <= 100 returning old w into :1\n@2 update big set w = 'v' where k2 = 'k1' and id < 40 returning old w, new w into :1, :2\n@2 declare o number; n number; begin update rt set a = a * 3 where id = 2 returning old a, new a into o, n; :1 := o; :2 := n; end;\n@2 declare o varchar2(10); n varchar2(10); begin delete from rt where id = 2 returning old b, new b into o, n; :1 := o; :2 := nvl(n, 'none'); end;"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A statement with n out binds, in a transaction rolled back: its row count, then the binds' rows; or error and the number.
+fn ctext(c: mut &oracle.Conn, n: int, sql: &str): str {
+    var outs: []oracle.Out = []
+    for k in 0..n { append(mut &outs, oracle.out(&((k + 1).toStr()), "VARCHAR2(4000)")) }
+    var res = ""
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        match c2.call(&(sql.toStr()), &[], &outs) {
+            Ok(rr) {
+                var rows: []str = []
+                for i in 0..rr.outputs.rowCount() { append(mut &rows, values(&rr.outputs, i)) }
+                res = rr.affected.toStr() + " = " + strings.join(&rows, ";")
+            }
+            Err(e) { res = "error " + e.code.toStr() }
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    return res
+}
+
+// "@n sql": a call (ctext), else a statement's row count.
+fn answer(c: mut &oracle.Conn, line: &str): str {
+    if strings.startsWith(line, "@") {
+        let sp = strings.indexOf(line, " ", 0)
+        let n = strings.parseIntOpt(&(line[1..sp].toStr())).unwrapOr(0)
+        return ctext(c, n, &(line[sp + 1..len(line)].toStr()))
+    }
+    match c.run(&(line.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(55), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
