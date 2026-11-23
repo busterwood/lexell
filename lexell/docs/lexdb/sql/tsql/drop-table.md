@@ -32,7 +32,6 @@ DROP TABLE [ IF EXISTS ] { database_name.schema_name.table_name | schema_name.ta
 - **A table that a view reads cannot be dropped** (error 50000, "cannot drop table emp because other objects depend
   on it"). SQL Server drops it, and the view fails when it is next used. Drop the view first.
 - A table that a foreign key refers to gives error 50000 with lexdb's text (SQL Server: 3726).
-- A table that does not exist gives error 208, `table "t3" does not exist` (SQL Server: 3701).
 
 ## Examples
 
@@ -84,7 +83,7 @@ SELECT COUNT(*) AS left_over FROM sys.tables WHERE name IN ('parent', 'child');
 ```
 
 ```text
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 3
 cannot drop table parent because other objects depend on it (with CASCADE the foreign keys on it are dropped)
 left_over
 ---------
@@ -128,8 +127,8 @@ DROP TABLE dbo.nothere;
 ```text
 Msg 50000, Level 16, State 1, Line 1
 cannot drop table keep because other objects depend on it
-Msg 208, Level 16, State 1, Line 1
-table "nothere" does not exist
+Msg 3701, Level 11, State 1, Line 2
+Cannot drop the table 'nothere', because it does not exist or you do not have permission.
 ```
 
 ## See also
