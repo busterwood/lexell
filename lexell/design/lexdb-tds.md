@@ -1086,3 +1086,16 @@ and a bulk-copied `executeBatch`, then `SELECT count(*)` on the same connection:
   index takes two NULLs (SQL Server: 2601 `(<NULL>)`); an N'' literal is named varchar in 245 (SQL Server: nvarchar);
   money's 235. The error states are 1 (SQL Server's vary: 2714 state 6 for a table and 3 for a view, 515 2, 547 0).
   A procedure's lines count from its body as lexdb keeps it.
+
+### As built: a PRINT's DONE
+
+With mssql-jdbc a PRINT's message never reached the program after a SET or DECLARE in the same batch (found by the
+documentation's JDBC probe). SQL Server sends a DONE after each PRINT's INFO (no count, CurCmd 0xF7); lexdb sent the
+INFO alone, so in `SET NOCOUNT ON; PRINT 'x'` the reply's last DONE, the one without DONE_MORE, was the SET's, before
+the INFO, and the driver stopped reading there. Each PRINT now has its DONE (`CMD_PRINT`), and the replies' DONE
+tokens are SQL Server's, statement for statement. Tests: `tds_print.lxl` (lib/tds's session: each batch's DONE
+statuses in order and its INFO texts; with `LEXDB_MSSQL` the same program gives the same output against SQL Server
+2022); `tests/lexdb/java/MssqlJdbc.java` checks the message through the driver after SET, DECLARE and both, beside a
+2627 text, an error's line and FMTONLY after `sp_executesql`. That program's stored procedure part fails before and
+after this pass with mssql-jdbc 13 (`{? = call p(?, ?, ?)}`: "The TDS protocol stream is not valid", the driver's
+`skipOutParameters` index -2); not looked into here.
