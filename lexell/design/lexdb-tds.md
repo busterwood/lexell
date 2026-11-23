@@ -1040,3 +1040,62 @@ checked against SQL Server 2022 (RTM-CU27, a throwaway container of its own, rem
   IMPLICIT_TRANSACTIONS the drop of a TVP's table is rolled back with the transaction, so the table stays until the next
   call that names the parameter (which drops it first) or the session's end. TVP_ORDER_UNIQUE is not checked: uniqueness
   is the type's own constraints'.
+
+## 17. Driver pass: SET options of a scope; error texts and lines (2026-11-23)
+
+Found writing the user documentation (docs/lexdb/KNOWN-ISSUES.md).
+
+### As built: SET options of a scope
+
+mssql-jdbc's `SQLServerBulkCopy` (and `executeBatch` with `useBulkCopyForBatchInsert=true`) reads the target's columns
+with `sp_executesql N'SET FMTONLY ON SELECT * FROM [t] '`, and no OFF: SQL Server gives a SET back when the dynamic SQL,
+EXEC of a string or procedure it ran in ends. lexdb kept it, so every later query on the connection gave columns and no
+rows. Now `nested()` (EXEC of a string, sp_executesql) and a procedure's call save the options and put them back when
+they end (`State.opts` / `restoreOpts`): FMTONLY, NOCOUNT, XACT_ABORT, IMPLICIT_TRANSACTIONS, QUOTED_IDENTIFIER,
+ROWCOUNT and IDENTITY_INSERT (`Session.identityInsert`, new), each checked on SQL Server 2022 (a procedure restored
+NOCOUNT, XACT_ABORT and ROWCOUNT before). Test: `tds_setscope.lxl` (gen_mssql.py `setscope`; the driver's batch as it
+sends it, each option in dynamic SQL and in a procedure). By hand: mssql-jdbc 13 `SQLServerBulkCopy` from a ResultSet
+and a bulk-copied `executeBatch`, then `SELECT count(*)` on the same connection: rows, as on SQL Server.
+
+### As built: error texts and lines
+
+- **Texts** (`lexdb_tsqlerr.translate`, called where a statement's error is taken, `sqlStmtWith`). The errors whose
+  texts were PostgreSQL's are given as SQL Server says them, what they name read from the failing statement and the
+  catalog (`Session.tableInfo`, new: the table with its keys, indexes, checks and foreign keys): 2714; 2627 for a
+  PRIMARY KEY or UNIQUE constraint and 2601 for a unique index (the index's `con` flag), the object `dbo.t` (a schema
+  other than public by its name) and the duplicate values; 515 with `INSERT fails.` or `UPDATE fails.` (MERGE says
+  UPDATE, as SQL Server's); 547 for a CHECK (its column when the check reads one column, none for a table-level one),
+  a FOREIGN KEY (the referenced table, its column when there is one) and a REFERENCE (the referencing table and
+  column), with the statement's verb; 3701 for DROP TABLE and DROP VIEW of a name that is not there (it was 208;
+  severity 11, and the batch goes on); 195 (severity 15); a text that does not read as the type: 245 for int,
+  smallint and bit, 8114 for bigint, numeric and float, 8169 for uniqueidentifier, 241 for dates; 512. The database
+  they name is `lexdb`.
+- **Lines.** A T-SQL statement keeps the line of the batch it starts on (`TStmt.line`, from its first token:
+  `Parser.lineOf`, the newlines counted on from the last statement's). The state's `line` is the running statement's
+  (`one()`), each ERROR token carries it (`Out.messageAt`), and ERROR_LINE() in a CATCH block is the caught error's
+  (`pendingLine`, `caughtLine`, beside `pendingProc`). A batch run inside another (sp_executesql, EXEC of a string)
+  counts its own lines, as SQL Server's. A parse error is at the line of the token it was found at
+  (`lexdb_tsqlparse.errLine`); at the end of the batch it is 102 "Incorrect syntax near 'x'" with the last token as
+  written, on that token's line (it was "syntax error at end of input"); a keyword in 156 is as written.
+- Test: `tds_errtext.lxl` (gen_mssql.py `errtext`, which shows an error's number, line and text: the new `MSGS` suites;
+  `@lines` writes a batch of several lines): every error above, with named constraints (SQL Server names an unnamed
+  one `PK__t__hex`), and lines in multi-line statements, IF blocks, TRY ... CATCH with ERROR_LINE(), sp_executesql,
+  blank lines first; 50 batches, the same as SQL Server 2022.
+- **Not done.** 2628's text names no table, column or value (lexdb's error does not carry them); a value lexdb
+  reads as smallint for a tinyint column is 8115 "smallint out of range" (SQL Server: 220 for tinyint); a unique
+  index takes two NULLs (SQL Server: 2601 `(<NULL>)`); an N'' literal is named varchar in 245 (SQL Server: nvarchar);
+  money's 235. The error states are 1 (SQL Server's vary: 2714 state 6 for a table and 3 for a view, 515 2, 547 0).
+  A procedure's lines count from its body as lexdb keeps it.
+
+### As built: a PRINT's DONE
+
+With mssql-jdbc a PRINT's message never reached the program after a SET or DECLARE in the same batch (found by the
+documentation's JDBC probe). SQL Server sends a DONE after each PRINT's INFO (no count, CurCmd 0xF7); lexdb sent the
+INFO alone, so in `SET NOCOUNT ON; PRINT 'x'` the reply's last DONE, the one without DONE_MORE, was the SET's, before
+the INFO, and the driver stopped reading there. Each PRINT now has its DONE (`CMD_PRINT`), and the replies' DONE
+tokens are SQL Server's, statement for statement. Tests: `tds_print.lxl` (lib/tds's session: each batch's DONE
+statuses in order and its INFO texts; with `LEXDB_MSSQL` the same program gives the same output against SQL Server
+2022); `tests/lexdb/java/MssqlJdbc.java` checks the message through the driver after SET, DECLARE and both, beside a
+2627 text, an error's line and FMTONLY after `sp_executesql`. That program's stored procedure part fails before and
+after this pass with mssql-jdbc 13 (`{? = call p(?, ?, ?)}`: "The TDS protocol stream is not valid", the driver's
+`skipOutParameters` index -2); not looked into here.

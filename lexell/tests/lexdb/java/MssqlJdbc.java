@@ -282,6 +282,29 @@ public class MssqlJdbc {
             Check.yes("message", e.getMessage().contains("Invalid object name"));
             Check.eq("sqlstate", e.getSQLState(), "S0002");
         }
+        try { try (Statement s = c.createStatement()) { s.execute("insert into jt_merge values (2, 'dup')"); } } catch (SQLException e) {
+            Check.yes("2627 text", e.getMessage().startsWith("Violation of PRIMARY KEY constraint"));
+        }
+        try { try (Statement s = c.createStatement()) { s.execute("select 1 as a\n\nselect * from no_such_table"); } } catch (SQLException e) {
+            Check.eq("error line", ((com.microsoft.sqlserver.jdbc.SQLServerException) e).getSQLServerError().getLineNumber(), 3);
+        }
+        // PRINT after a SET or DECLARE in the same batch: its message reaches the program (design/lexdb-tds.md 17)
+        for (String b : new String[]{"SET NOCOUNT ON; PRINT 'p1'", "DECLARE @x int = 1; PRINT 'p1'", "SET NOCOUNT ON; DECLARE @x int = 1; PRINT 'p1'; SELECT @x"}) {
+            try (Statement s = c.createStatement()) {
+                boolean rs = s.execute(b);
+                String seen = "";
+                while (true) {
+                    for (SQLWarning w = s.getWarnings(); w != null; w = w.getNextWarning()) seen += w.getMessage();
+                    s.clearWarnings();
+                    if (rs) { try (ResultSet r = s.getResultSet()) { while (r.next()) {} } } else if (s.getUpdateCount() == -1) break;
+                    rs = s.getMoreResults();
+                }
+                Check.eq("print: " + b, seen, "p1");
+            }
+        }
+        // a SET in sp_executesql ends with it (SQLServerBulkCopy's FMTONLY ON)
+        try (Statement s = c.createStatement()) { s.execute("exec sp_executesql N'SET FMTONLY ON SELECT * FROM jt_merge '"); }
+        Check.eq("fmtonly ends with sp_executesql", rows("select count(*) from jt_merge where id = 2"), List.of("1"));
         Check.eq("after errors", rows("select 1"), List.of("1"));
         try (Statement s = c.createStatement()) { s.setMaxRows(2); try (ResultSet r = s.executeQuery("select id from jt_all union all select id from jt_all union all select 5")) { int n = 0; while (r.next()) n++; Check.eq("maxrows", n, 2); } }
         try (Statement s = c.createStatement()) { s.setQueryTimeout(30); Check.eq("with timeout", s.executeQuery("select 1").next(), true); }

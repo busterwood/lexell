@@ -1075,3 +1075,46 @@ three catalog items above. The same script on both was diffed.
 - A foreign key between an `INT` column and a `NUMBER(p)` one is ORA-00932 (lexdb's bigint and numeric; Oracle has one NUMBER).
 - `Statement.cancel()` is read after the statement ends (design 13): it works, late, for a long query; constraint names are
   `T_PKEY`, not `SYS_Cnnn`.
+
+## 22. Driver pass (2026-11-23)
+
+Found writing the user documentation (docs/lexdb/KNOWN-ISSUES.md).
+
+**ojdbc follows the read-only REDIRECT.** ojdbc 23.26 read the master's REDIRECT (lexdb.md 9.137) as one address and
+failed: `ORA-18951 ... TNS-04605: Invalid syntax error: Unexpected char or LITERAL " " before or at ( DESCRIPTION`.
+Its `NSProtocolNIO.redirectConnection` splits the data at the NUL into the address and the connect data only when
+the REDIRECT packet's header flags have bit 2 set, as a listener sends them; lexdb's had 0. The REDIRECT is now sent
+with flags 2 (`REDIRECT_FLAGS`), the data as before (the length in the REDIRECT, the address, a NUL and the client's
+descriptor in a DATA packet after it). python-oracledb 3 and lib/oracle split at the NUL whatever the flags, and
+still follow it. Checked by hand with ojdbc 23.26 against `lexdb --replicas 1 --tns ... --replica-tns ...`: lexdb_ro
+and freepdb1_ro on the master reach the replica (PHYSICAL STANDBY, READ ONLY WITH APPLY), lexdb stays on the
+master; the replica's own listener serves both; python-oracledb the same. Test: `replica_doors.lxl` sends a raw
+CONNECT for lexdb_ro and reads the REDIRECT's type, flags and data.
+
+**NETWORK_PROTOCOL.** `SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL')` was the literal `tcp`. It is now a call
+(`#netproto`, a catalog function) of the session: `tcps` when its connection came in on a TCPS listener
+(`Session.setTcps`, the memo's `\0tcps\0n`), else `tcp`. Test: `tns_tcps.lxl` (lib/oracle over TCPS and TCP: in a
+query, a WHERE and PL/SQL).
+
+**A bare name and PostgreSQL's `public` (not done: the plan).** With a table `city` made in the PostgreSQL door,
+`CREATE TABLE city` in the Oracle door as SA is ORA-00955 and `SELECT * FROM city` reads `public.city`. The cause is
+section 8's mapping as built in O1: a login with no schema of its name (SA, a trust login) works in `public`, its
+search path `public` alone, so public's tables are its own objects. A login with a schema of its name (`CREATE
+USER`) already has Oracle's order: its path is its schema, then `public`; CREATE puts a bare name in its schema, and
+a table of public's name does not stop it. Oracle's rule is a user's own schema first, then PUBLIC synonyms, and a
+public synonym never stops a CREATE; section 8 meant public to be seen from Oracle as PUBLIC's objects.
+What it takes, and why it is not done in this pass:
+1. Every Oracle login gets a schema of its name: made when the login first connects through the Oracle door (or
+   when the role is made), owned by it; SA's is `sa`.
+2. The Oracle door's path is that schema, then `public` (public then plays the PUBLIC synonyms' part: found after
+   the user's own, never in the way of a CREATE); `ALTER SESSION SET CURRENT_SCHEMA` as now.
+3. Where the objects of a login without a schema went before (`public`): the catalog views (USER_ = the login's
+   schema; OWNER; ALL_SYNONYMS could list public's tables as PUBLIC synonyms), DESCRIBE, DBMS_METADATA, the
+   privileges on the new schema (the owner's; other users through GRANT, as Oracle's), sequences and PL/SQL
+   units made without a schema (`lexdb_plsql` keys them by schema), and what the other doors see: a table SA makes
+   in the Oracle door is then `sa.t` in the PostgreSQL and SQL Server doors, no longer `public.t` / `dbo.t`.
+4. Every `tns_*` suite and gen_oracle.py's expect lines that show owners, the PL/SQL keys and the cross-door tests
+   (`doorsql`, `replica.py`, the docs' examples) are checked again.
+The change touches name resolution at login and the catalog's owners, and moves where existing data is found for a
+login without a schema (its old tables stay in public and are still found second): more than a day, so it is planned
+here for the user to decide.

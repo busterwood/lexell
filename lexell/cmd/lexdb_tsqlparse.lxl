@@ -68,6 +68,7 @@ pub type TStmt = record {
     pub key: str            // TS_EXEC: the procedure's catalog key
     pub ret: str            // TS_EXEC: the variable of EXEC @r = ...
     pub flags: []int        // TS_EXEC: the arguments that are DEFAULT
+    pub line: int           // the line of the batch (from 1) it starts on, SQL Server's line of its errors; 0 not known
 }
 
 // A parsed batch: its statements, and its variables (those given, then
@@ -91,7 +92,7 @@ fn isSetOption(w: &str): bool {
     return false
 }
 
-fn tstmt(kind: int): TStmt { return TStmt{kind: kind, stmt: [], names: [], types: [], value: "", body: [], els: [], key: "", ret: "", flags: []} }
+fn tstmt(kind: int): TStmt { return TStmt{kind: kind, stmt: [], names: [], types: [], value: "", body: [], els: [], key: "", ret: "", flags: [], line: 0} }
 
 // Statements to the END that closes their block (not read).
 fn block(q: mut &Parser, types: mut &[]TypeName): Result[[]TStmt, DbErr] {
@@ -395,7 +396,15 @@ fn insertBulk(q: mut &Parser): Result[TStmt, DbErr] {
 }
 
 // One of the batch's statements, at a statement's start.
+// A statement, with the line it starts on.
 fn tsqlStmt(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
+    let line = q.lineOf(q.peek().at)
+    var t = try tsqlStmt0(q, types)
+    t.line = line
+    return Ok(t)
+}
+
+fn tsqlStmt0(q: mut &Parser, types: mut &[]TypeName): Result[TStmt, DbErr] {
     q.fresh()
     let t = q.peek().clone()
     if t.kind == lexdb_parse.T_IDENT {
@@ -848,7 +857,30 @@ fn replaceDeclare(text: &str, nm: &str): str {
 // A batch of T-SQL. vars: the variables it starts with ($1, $2, ... in that order). A batch that is CREATE [OR ALTER] PROCEDURE
 // or ALTER PROCEDURE is that statement alone: its header is read here, the rest of the batch is the procedure's body (read
 // as a batch of its own, to check it, and kept as its text).
+// The line of the last batch's error that parseBatch found (SQL Server's line of a compile error); 1 not known.
+var ERR_LINE: int = 1
+
+pub fn errLine(): int { return ERR_LINE }
+
+// A parse error at the parser's place: its line kept (errLine); "at end of input" as SQL Server says it, near the last
+// token (102).
+fn atLine(q: mut &Parser, e: DbErr): DbErr {
+    if e.state == "42601" && e.msg == "syntax error at end of input" && len(q.lastText()) > 0 {
+        ERR_LINE = q.lineOf(q.lastAt())
+        return tsErr(102, &("Incorrect syntax near '" + q.lastText() + "'."))
+    }
+    ERR_LINE = q.lineOf(q.peek().at)
+    // the token as written (SQL Server's "near the keyword 'FROM'")
+    if e.state == "42601" && strings.startsWith(&e.msg, "syntax error at or near \"") && e.msg == "syntax error at or near \"" + q.peek().text + "\"" {
+        var x = e
+        x.msg = "syntax error at or near \"" + q.spelled(q.peek()) + "\""
+        return x
+    }
+    return e
+}
+
 pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBatch, DbErr] {
+    ERR_LINE = 1
     match try procBatch(sql0, d, vars) {
         Some(b) { return Ok(b) }
         None {}
@@ -1244,13 +1276,22 @@ fn parseStmts(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBatch, 
                     q.reset(m)
                     match execStmt(mut &q) {
                         Ok(t) { append(mut &out, t) }
-                        Err(_) { return Err(e) }
+                        Err(_) {
+                            q.reset(m)
+                            match tsqlStmt(mut &q, mut &types) {
+                                Ok(t) { append(mut &out, t) }
+                                Err(e2) { return Err(atLine(mut &q, e2)) }
+                            }
+                        }
                     }
                 }
             }
             continue
         }
-        append(mut &out, try tsqlStmt(mut &q, mut &types))
+        match tsqlStmt(mut &q, mut &types) {
+            Ok(t) { append(mut &out, t) }
+            Err(e) { return Err(atLine(mut &q, e)) }
+        }
     }
     return Ok(TBatch{stmts: out, vars: q.takeVars(), types: types})
 }

@@ -70,6 +70,26 @@ def free_port():
     return p
 
 
+def free_port_pair(taken):
+    """A free port whose next is free too, neither in taken: the master's door whose replicas take the port
+    one up (--replica-tds and --replica-tns by default, 9.137). Both are bound to check, then let go."""
+    while True:
+        a = socket.socket()
+        a.bind(('127.0.0.1', 0))
+        p = a.getsockname()[1]
+        b = socket.socket()
+        try:
+            b.bind(('127.0.0.1', p + 1))
+        except OSError:
+            a.close()
+            b.close()
+            continue
+        a.close()
+        b.close()
+        if p not in taken and p + 1 not in taken:
+            return p
+
+
 class Proc:
     def __init__(self, args, port, log, env):
         self.args, self.port, self.log, self.env = args, port, log, env
@@ -280,10 +300,10 @@ def supervised(exe, work, env, fail):
     data = os.path.join(work, 'sdata')
     mport = free_port()
     rport = free_port()
-    # the other doors (9.137): the replicas' on the master's ports + 1 (the default)
-    tport, oport = free_port(), free_port()
-    while tport + 1 in (mport, rport, oport) or oport + 1 in (mport, rport, tport):
-        tport, oport = free_port(), free_port()
+    # the other doors (9.137): the replicas' on the master's ports + 1 (the default), so a port whose next is free
+    # (another process on it made the replicas fail, "Address already in use", and the supervisor stop)
+    tport = free_port_pair({mport, rport})
+    oport = free_port_pair({mport, rport, tport, tport + 1})
     log = os.path.join(work, 'supervised.log')
     sup = Proc([exe, data, '127.0.0.1:%d' % mport, '--replicas', '2', '--replica-addr', '127.0.0.1:%d' % rport,
                 '--tds', '127.0.0.1:%d' % tport, '--tns', '127.0.0.1:%d' % oport],

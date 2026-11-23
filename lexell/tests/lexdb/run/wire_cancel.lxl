@@ -1,0 +1,242 @@
+// lexdb_wire: PostgreSQL's CancelRequest (design/lexdb.md 9.138), as psql's
+// Ctrl-C, libpq's PQcancel and pgjdbc's Statement.cancel() send it: on a new
+// connection, the process id and secret key the session's BackendKeyData
+// gave. The running statement stops with 57014 "canceling statement due
+// to user request", as statement_timeout stops one, and the session goes
+// on. A raw client: the BackendKeyData's process id is pg_backend_pid();
+// a long query cancelled (batches on, then off, then through the extended
+// protocol); a cancel with a wrong secret stops nothing (the query runs
+// until the right one comes); a cancel while the session is idle, or for
+// another session, does not stop the next query.
+// expect: pid is pg_backend_pid: true
+// expect: cancelled: E 57014 canceling statement due to user request
+// expect: then: D 1 | C SELECT 1
+// expect: wrong secret ignored: true, then E 57014 canceling statement due to user request
+// expect: batches off, cancelled: E 57014 canceling statement due to user request
+// expect: extended, cancelled: E 57014 canceling statement due to user request
+// expect: idle cancel dropped: D 333333 | C SELECT 1
+// expect: another session's key: D 333333 | C SELECT 1
+import "task"
+import "net"
+import "time"
+import "pgwire"
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+const LONG = "select count(*) from generate_series(1, 100000) a, generate_series(1, 100000) b"
+const MEDIUM = "select count(*) from generate_series(1, 1000000) g where g % 3 = 0"
+
+type Rx = record { buf: []byte }
+
+// The messages to ReadyForQuery: a DataRow's values (text, in hex), a CommandComplete's tag, an ErrorResponse's code
+// and message; the BackendKeyData's process id and secret in key.
+fn readUntilReady(c: &net.Conn, rx: mut &Rx, key: mut &[]int): str {
+    var out: []str = []
+    var chunk = array(65536, byte(0))
+    while true {
+        while len(rx.buf) < 5 || len(rx.buf) < 1 + binary.readI32BE(&rx.buf, 1) {
+            let n = c.read(mut &chunk).unwrap()
+            if n == 0 { return strings.join(&out, " | ") }
+            for i in 0..n { append(mut &rx.buf, chunk[i]) }
+        }
+        let typ = rx.buf[0]
+        let size = binary.readI32BE(&rx.buf, 1)
+        var body: []byte = []
+        for i in 5..1 + size { append(mut &body, rx.buf[i]) }
+        var rest: []byte = []
+        for i in 1 + size..len(rx.buf) { append(mut &rest, rx.buf[i]) }
+        rx.buf = rest
+        if typ == 'K' {
+            append(key, binary.readI32BE(&body, 0))
+            append(key, binary.readU32BE(&body, 4))
+        } else if typ == 'D' {
+            var vals: []str = ["D"]
+            let n = binary.readU16BE(&body, 0)
+            var at = 2
+            for k in 0..n {
+                let l = binary.readI32BE(&body, at)
+                at += 4
+                if l < 0 { append(mut &vals, "NULL") } else {
+                    append(mut &vals, strFromBytes(&body[at..at + l]))
+                    at += l
+                }
+            }
+            append(mut &out, strings.join(&vals, " "))
+        } else if typ == 'C' {
+            append(mut &out, "C " + strFromBytes(&body[0..len(body) - 1]))
+        } else if typ == 'E' {
+            var code = ""
+            var msg = ""
+            var at = 0
+            while at < len(body) && body[at] != 0 {
+                let f = body[at]
+                let s = at + 1
+                while body[at] != 0 { at += 1 }
+                if f == 'C' { code = strFromBytes(&body[s..at]) }
+                if f == 'M' { msg = strFromBytes(&body[s..at]) }
+                at += 1
+            }
+            append(mut &out, "E " + code + " " + msg)
+        } else if typ == 'Z' {
+            return strings.join(&out, " | ")
+        }
+    }
+    return strings.join(&out, " | ")
+}
+
+fn msg(o: mut &str, typ: byte, body: &str) {
+    o.addByte(typ)
+    binary.addU32BE(o, len(body) + 4)
+    o += body
+}
+
+fn queryMsg(sql: &str): str {
+    var b = sql.clone()
+    b.addByte(0)
+    var o = ""
+    msg(mut &o, 'Q', &b)
+    return o
+}
+
+// Parse, Bind, Execute and Sync of sql (no parameters).
+fn extendedMsgs(sql: &str): str {
+    var o = ""
+    var p = ""
+    p.addByte(0)
+    p += sql
+    p.addByte(0)
+    binary.addU16BE(mut &p, 0)
+    msg(mut &o, 'P', &p)
+    var b = ""
+    b.addByte(0)
+    b.addByte(0)
+    binary.addU16BE(mut &b, 0)
+    binary.addU16BE(mut &b, 0)
+    binary.addU16BE(mut &b, 0)
+    msg(mut &o, 'B', &b)
+    var e = ""
+    e.addByte(0)
+    binary.addU32BE(mut &e, 0)
+    msg(mut &o, 'E', &e)
+    msg(mut &o, 'S', "")
+    return o
+}
+
+type Session = record { c: net.Conn; pid: int; secret: int }
+
+fn open(addr: &str): Session {
+    let c = net.connect(addr).unwrap()
+    var o = pgwire.newOut()
+    let settings: []pgwire.Setting = []
+    pgwire.putStartup(mut &o, "test", "test", &settings)
+    c.write(o.bytes()).unwrap()
+    var rx = Rx{buf: []}
+    var key: []int = []
+    let hello = readUntilReady(&c, mut &rx, mut &key)
+    return Session{c: c, pid: key[0], secret: key[1]}
+}
+
+fn roundTrip(c: &net.Conn, m: &str): str {
+    c.write(m.bytes()).unwrap()
+    var rx = Rx{buf: []}
+    var key: []int = []
+    return readUntilReady(c, mut &rx, mut &key)
+}
+
+// A CancelRequest on a new connection; the server closes it.
+fn cancel(addr: &str, pid: int, secret: int) {
+    let c = net.connect(addr).unwrap()
+    var o = ""
+    binary.addU32BE(mut &o, 16)
+    binary.addU32BE(mut &o, 80877102)
+    binary.addU32BE(mut &o, pid)
+    binary.addU32BE(mut &o, secret)
+    c.write(o.bytes()).unwrap()
+    var b = array(16, byte(0))
+    let n = c.read(mut &b).unwrap()
+}
+
+type Run = record { c: net.Conn; m: str }
+type Ran = record { c: net.Conn; out: str; ms: int }
+
+fn runIt(a: Run): Ran {
+    let Run{c: c, m: m} = move(a)
+    let t0 = time.monotonicNs()
+    let out = roundTrip(&c, &m)
+    return Ran{c: c, out: out, ms: (time.monotonicNs() - t0) / 1000000}
+}
+
+// Runs m on the connection held (taken out and put back) while cancel requests are sent: plan is (wait ms, pid,
+// secret) triples. Its result and time.
+fn cancelled(addr: &str, held: mut &[]net.Conn, m: &str, plan: &[]int): str {
+    var arg = [Run{c: pop(held), m: m.clone()}]
+    var res: []Ran = []
+    task.scope(fn(sc: mut &task.Scope) {
+        let f = sc.start(runIt, pop(mut &arg))
+        var i = 0
+        while i + 2 < len(plan) {
+            let w = task.sleep(plan[i])
+            cancel(addr, plan[i + 1], plan[i + 2])
+            i += 3
+        }
+        append(mut &res, f.wait().unwrap())
+    })
+    let Ran{c: c, out: out, ms: ms} = pop(mut &res)
+    append(held, c)
+    return out + "\x00" + ms.toStr()
+}
+
+fn outOf(r: &str): str { return r[0..strings.indexOf(r, "\x00", 0)].toStr() }
+
+fn msOf(r: &str): int { return strings.parseIntOpt(&r[strings.indexOf(r, "\x00", 0) + 1..len(r)]).unwrapOr(0) }
+
+fn client(addr: str) {
+    let a = open(&addr)
+    let b = open(&addr)
+    let Session{c: ac, pid: pid, secret: secret} = move(a)
+    var held = [ac]
+    let pidRow = roundTrip(&held[0], &queryMsg("select pg_backend_pid()"))
+    println("pid is pg_backend_pid: " + (pidRow == "D " + pid.toStr() + " | C SELECT 1").toStr())
+
+    let r1 = cancelled(&addr, mut &held, &queryMsg(LONG), &[150, pid, secret])
+    println("cancelled: " + outOf(&r1))
+    println("then: " + roundTrip(&held[0], &queryMsg("select 1")))
+
+    let r2 = cancelled(&addr, mut &held, &queryMsg(LONG), &[100, pid, (secret + 1) & 0xFFFFFFFF, 300, pid, secret])
+    println("wrong secret ignored: " + (msOf(&r2) >= 400).toStr() + ", then " + outOf(&r2))
+
+    let off = roundTrip(&held[0], &queryMsg("set lexdb_batch = off"))
+    let r3 = cancelled(&addr, mut &held, &queryMsg(LONG), &[150, pid, secret])
+    println("batches off, cancelled: " + outOf(&r3))
+    let on = roundTrip(&held[0], &queryMsg("set lexdb_batch = on"))
+
+    let r4 = cancelled(&addr, mut &held, &extendedMsgs(LONG), &[150, pid, secret])
+    println("extended, cancelled: " + outOf(&r4))
+
+    cancel(&addr, pid, secret)
+    let w = task.sleep(50)
+    println("idle cancel dropped: " + roundTrip(&held[0], &queryMsg(MEDIUM)))
+
+    let r5 = cancelled(&addr, mut &held, &queryMsg(MEDIUM), &[1, b.pid, b.secret])
+    println("another session's key: " + outOf(&r5))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st.share()})
+        client(addr)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

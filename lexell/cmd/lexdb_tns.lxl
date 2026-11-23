@@ -79,6 +79,7 @@ const PT_CONNECT = 1
 const PT_ACCEPT = 2
 const PT_REFUSE = 4
 const PT_REDIRECT = 5
+const REDIRECT_FLAGS = 2          // a REDIRECT's header flags: its data carry the connect data after the address
 const PT_DATA = 6
 const PT_MARKER = 12
 const PT_CONTROL = 14
@@ -3414,11 +3415,13 @@ fn (c: mut &Conn) redirect(addr: &str, desc: &str): Result[Unit, str] {
     if strings.startsWith(&host, "[") && strings.endsWith(&host, "]") { host = host[1..len(host) - 1].toStr() }
     let data = "(ADDRESS=(PROTOCOL=" + (if c.secure { "tcps" } else { "tcp" }) + ")(HOST=" + host + ")(PORT=" + port + "))\x00" + desc
     // the REDIRECT packet holds the data's length; the data follow in a DATA packet (data flags 0), as a listener sends
-    // them (python-oracledb's ConnectMessage reads the length, then waits for the next packet)
+    // them (python-oracledb's ConnectMessage reads the length, then waits for the next packet). Its header's flags are
+    // 2, as a listener's: the data are an address, a NUL and the descriptor (ojdbc splits them only then, else it reads
+    // it all as the address: TNS-04605)
     var b: []byte = []
     append(mut &b, byte((len(data) >> 8) & 0xff))
     append(mut &b, byte(len(data) & 0xff))
-    try c.w.sendPacket(PT_REDIRECT, &(strFromBytes(&b)))
+    try c.w.put(&tns.packet(PT_REDIRECT, REDIRECT_FLAGS, &(strFromBytes(&b)), c.w.large))
     var d: []byte = []
     append(mut &d, byte(0))
     append(mut &d, byte(0))
@@ -3450,6 +3453,7 @@ pub fn serve(a: ConnArg): int {
             Ok(t) {
                 append(mut &c.w.secure, t)
                 c.secure = true
+                c.sess.setTcps()
             }
             Err(_) { go = false }
         }

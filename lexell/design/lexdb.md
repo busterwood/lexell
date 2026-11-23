@@ -12880,3 +12880,67 @@ feature beside the store: nothing in the store's layout, the follower or the log
     (`iq.sh`, two runs each: q15 2,639.29M / 2,639.24M against 2,639.19M / 2,639.03M; q6 1,581.3M and q14
     1,092.1M both): placement.
   - The suite: 329 tests pass; `replica.py` (12 rounds and the supervised form) passes.
+
+### 9.138 Drivers with their defaults: pgjdbc's binary formats, cancel requests
+
+The documentation work found pgjdbc failing with its default settings, and cancel requests ignored
+(docs/lexdb/KNOWN-ISSUES.md, 2026-11-23). Both are on the wire path; the text path is unchanged.
+
+**Binary formats** (`lexdb_pgbin`, a protocol module beside `lexdb_wire`). PostgreSQL's send and recv formats:
+bool one byte; int2, int4, int8, oid and the reg types big-endian; float4 and float8 their IEEE bits; numeric its
+base-10000 digits (ndigits, weight, sign, dscale, digits; NaN, Infinity); date the days and time, timestamp and
+timestamptz the microseconds from 2000-01-01, as lexdb holds them (a date's infinity the int32 limits); interval
+microseconds, days, months; uuid its 16 bytes; bytea its bytes; a one-dimensional array its header (dimensions,
+null flag, element type, size, lower bound: 0 for int2vector and oidvector) and its elements; text, varchar,
+char(n), name, "char", unknown and the types lexdb shows as text their bytes.
+- Parameters: a binary one is read into its text form (`lexdb_pgbin.param`, which took `binParam` and `binArray`
+  out of `lexdb_wire`), and `Session.paramVals` reads it as it reads a text one. pgjdbc 42.7 sends int2/4/8,
+  float4/8, numeric, uuid, bytea and int/text arrays in binary; dates and times it sends as text with no type
+  (`'10:01:30+01'` for a `time`: lexdb's time input now reads and ignores a zone after the time, as PostgreSQL's).
+- Results: Bind's result format codes are kept on the portal only when one is 1 (`Portal.fmts`; `[]` otherwise,
+  so a text portal is as before). Describe of such a portal gives its RowDescription with the codes
+  (`lexdb_pgbin.rowDesc`, PostgreSQL's type lengths); Execute sends its rows through `runStreamedBin` (a copy of
+  `runStreamed` whose closure calls `lexdb_pgbin.dataRow` / `dataBatch`) or `lexdb_pgbin.dataRows` for rows not
+  streamed (INSERT ... RETURNING). The only test on the text path is one per Execute (`len(po.fmts) > 0`) and one
+  per Bind's result codes (the loop that refused a 1 now notes it). A value not held as its column's type (a text
+  in an int column) is coerced to it, then sent. A code other than 0 and 1 is 22023, as PostgreSQL's.
+- pgjdbc after `prepareThreshold` (5 runs) Binds with every column it can read in binary as 1 (int, numeric, uuid,
+  bytea, date, time, timestamp(tz), float, int/text arrays; interval and numeric[] stay text).
+- Its `getObject` of a type outside its own table (interval, numeric[]) asks `TypeInfoCache`'s queries: they
+  needed `current_schemas(bool)` (new: the search path, `pg_catalog` first when asked, as `name[]`) and
+  `'pg_catalog.array_in'::regproc` (pg_type.typinput is now a regproc value: `array_in` 750 for an array, its
+  name and 0 for another type).
+
+**Cancel requests.** A StartupMessage is answered with BackendKeyData carrying the session's number (the
+`pg_backend_pid()` it already had) and a random 32-bit secret, kept in the store's memo (`\0pgcancel\0n`, dropped
+when the connection ends). A CancelRequest whose secret matches marks the session (`lexdb_base.askCancel`: a
+process-wide list, SQL runs on one thread) and the connection is closed, whether it matched or not, as
+PostgreSQL's. The running statement sees the mark where statement_timeout is seen, in `Budget.checkTime`, right
+after the yield that let the request in (the only place it can have come in): 57014 "canceling statement due to
+user request". The Budget knows its session through its deadline word (`Limits.deadline`, `Budget.deadline`,
+`lexdb_pipe.deadlineWord`): the low 20 bits of the session's number always, and with statement_timeout the bit
+`DL_SET` and the ms to stop at above them; without a timeout the word is the session's number as it is. A field of
+its own cost the point select 42 instructions (`Limits.sid` 19, `Budget.sid` 23: a Budget is in every Run); the word
+costs 1 (the session's number loaded where 0 was), which `Session.dword` takes back: the word without a timeout,
+kept in the session (`setTimeout`), and -1 with one, so `limits()` is one load and a sign test (4 instructions where
+main's was 5): point select, INSERT and UPDATE by key each 1.0 instruction fewer than main. Requests are kept and matched by those 20 bits: two sessions a
+multiple of 2^20 apart, both running, could take each other's. A mark left when the session was idle (the statement
+ended first) is dropped at its next Query or Execute, so it does not stop the next statement (PostgreSQL ignores a
+cancel while it reads a command).
+- What it stops: a statement that takes turns (rows looked at in the pipeline, batches); a WAIT, a commit or a
+  page read in progress run on to their own end first.
+- The SQL Server door's ATTENTION and the Oracle door's break are unchanged: they are read when the request ends
+  (lexdb-tds.md; lexdb-oracle.md 13). Stopping a statement there needs the connection read while it runs (another
+  task per connection); the mark above is what such a task would set.
+
+**Tests.** `wire_binary.lxl`: a raw client binds every type in binary (the bytes PostgreSQL 19's `numeric_send`,
+`uuid_send`, ... give), NULLs and text parameters, then reads the rows with every column binary (Describe portal
+shows 1), with batches on and off, with the formats mixed, an INSERT ... RETURNING in binary, the same row in text
+(a New York session: the timestamptz's text in it, its binary UTC), and a format code 2; run with `LEXDB_PG_PORT`
+against PostgreSQL 19 the output is the same, byte for byte. `wire_cancel.lxl`: the key is `pg_backend_pid()`; a
+long query cancelled with batches on and off and through the extended protocol, then the session goes on; a wrong
+secret stops nothing (the query runs until the right one); a cancel while idle and another session's key do not
+stop the next query. By hand: pgjdbc 42.7.14 with no URL options (a prepared INSERT and SELECT run 10 times with
+BigDecimal, UUID, byte[], dates, times, timestamps, timestamptz, intervals, floats, arrays and NULLs; getters by
+type after the threshold) gives the same output as against PostgreSQL 19; psql's Ctrl-C, JDBC `Statement.cancel()`
+and `setQueryTimeout` stop a long query with 57014 as PostgreSQL 19 does.

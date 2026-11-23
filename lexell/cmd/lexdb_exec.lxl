@@ -727,7 +727,7 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             if len(t.view) == 0 { append(mut &tabs, t) }
         }
     }
-    try lexdb_stats.analyze(st, txn, &tabs, lim.deadline, &statsUp())
+    try lexdb_stats.analyze(st, txn, &tabs, lexdb_pipe.deadlineNs(lim.deadline), &statsUp())
     // a temporary table's statistics are its session's alone: its kept
     // plans are made again (tmpBump), no other session's (optimizer 40)
     var perm = false
@@ -1053,7 +1053,7 @@ pub type Limits = value record {
     pub rounds: int             // a recursive CTE's rounds; 0 no limit
     pub steps: int              // MATCH_RECOGNIZE's steps per start row; 0 no limit
     pub mem: int                // bytes of rows held; 0 no limit
-    pub deadline: int           // time.monotonicNs() to stop at; 0 none
+    pub deadline: int           // statement_timeout's deadline and the session's number (lexdb_pipe.deadlineWord); 0 none
     pub batch: bool             // SET lexdb_batch: vector scans and batch operators (9.47); compiled expressions and typed sorts are always on
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
     pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
@@ -11745,6 +11745,7 @@ pub type Session = record {
     maxRecursion: int           // SET max_recursion: a recursive CTE's rounds at most; 0 no limit
     maxSteps: int               // SET max_match_steps: MATCH_RECOGNIZE's steps per start row at most; 0 no limit
     timeoutMs: int              // SET statement_timeout: a statement's time at most; 0 no limit
+    dword: int                  // its statements' deadline word without a timeout: the session's number; -1 with one (setTimeout; limits)
     maxMem: int                 // SET max_statement_mem: the bytes of rows a statement holds at most; 0 no limit
     saved: []Limits             // in a transaction block: the settings at its BEGIN (a ROLLBACK restores them)
     readOnly: bool              // the block is BEGIN READ ONLY
@@ -12020,7 +12021,7 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         let v = try settingValue(&k, &Val.Text(value.toStr()))
         if k == "max_recursion" { s.maxRecursion = v }
         if k == "max_match_steps" { s.maxSteps = v }
-        if k == "statement_timeout" { s.timeoutMs = v }
+        if k == "statement_timeout" { s.setTimeout(v) }
         if k == "max_statement_mem" { s.maxMem = if v == 0 { MAX_STATEMENT_MEM } else { v } }
         return Ok(Unit{})
     }
@@ -12078,7 +12079,7 @@ fn (s: &Session) waitLsn(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
 // A Session holding a Wire's place while its own is out (a COPY TO's run,
 // lexdb_wire): no id of its own, never run.
 pub fn parkedSession(st: lexdb_store.Store): Session {
-    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
+    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
 }
@@ -12087,7 +12088,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     lexdb_plan.hook(planUp)
     let id = lexdb_base.num(&st.memo.get(&"sessions").unwrapOr("0")) + 1
     st.memo.put(&"sessions", &id.toStr())
-    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, maxMem: MAX_STATEMENT_MEM,
+    return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: id, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
                    custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
 }
@@ -12117,7 +12118,7 @@ fn (s: mut &Session) restore() {
     s.maxRecursion = l.rounds
     s.maxSteps = l.steps
     s.maxMem = l.mem
-    s.timeoutMs = l.deadline                // saved there: the timeout in ms
+    s.setTimeout(l.deadline)                // saved there: the timeout in ms
     s.batch = l.batch
     s.rules = l.rules
     s.auto = l.auto
@@ -12126,7 +12127,9 @@ fn (s: mut &Session) restore() {
 
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
-    let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
+    // (without a timeout the word is the session's number as it is, kept in dword: lexdb_pipe.deadlineWord)
+    var dl = s.dword
+    if dl < 0 { dl = s.timedWord() }
     return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}
 }
 
@@ -12186,6 +12189,7 @@ pub fn (s: mut &Session) close() {
     s.st.memo.del(&noticeKey(s.id))
     s.st.memo.del(&lexdb_priv.doorKey(s.id))
     s.st.memo.del(&sysUserKey(s.id))
+    s.st.memo.del(&netKey(s.id))
 }
 
 // ---- notices (9.117): what a statement tells the client besides its
@@ -12301,7 +12305,7 @@ fn (s: mut &Session) resetAll() {
     if len(s.path) > 0 { s.setPath(&["public"]) }
     s.maxRecursion = MAX_RECURSION
     s.maxSteps = MAX_MATCH_STEPS
-    s.timeoutMs = 0
+    s.setTimeout(0)
     s.maxMem = MAX_STATEMENT_MEM
     if len(s.txn) > 0 { s.txn[0].sql.memMax = s.maxMem }
     s.batch = true
@@ -12745,7 +12749,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 }
                 if stmt.table == "max_recursion" { s.maxRecursion = if v < 0 { MAX_RECURSION } else { v } }
                 if stmt.table == "max_match_steps" { s.maxSteps = if v < 0 { MAX_MATCH_STEPS } else { v } }
-                if stmt.table == "statement_timeout" { s.timeoutMs = if v < 0 { 0 } else { v } }
+                if stmt.table == "statement_timeout" { s.setTimeout(if v < 0 { 0 } else { v }) }
                 if stmt.table == "max_statement_mem" {
                     s.maxMem = if v < 0 { MAX_STATEMENT_MEM } else { v }
                     if len(s.txn) > 0 { s.txn[0].sql.memMax = s.maxMem }
@@ -13169,7 +13173,8 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
     var tries = 0
     while true {
         let now = time.monotonicNs()
-        if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        let ldl = lexdb_pipe.deadlineNs(lim.deadline)
+        if ldl != 0 && now > ldl { return Err(e("57014", "canceling statement due to statement timeout")) }
         if now >= until { last = true }
         var seq = 0
         if inBlock {
@@ -13211,7 +13216,8 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
             s.st.abort(t)
         }
         // no rows: wait for a flush past what it read, to its time's end
-        let end = if lim.deadline != 0 && lim.deadline < until { lim.deadline } else { until }
+        let ldl2 = lexdb_pipe.deadlineNs(lim.deadline)
+        let end = if ldl2 != 0 && ldl2 < until { ldl2 } else { until }
         let left = (end - time.monotonicNs() + 999999) / 1000000
         if left > 0 {
             if inBlock { s.st.releaseSnapshot(mut &s.txn[0]) }
@@ -17238,6 +17244,8 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
         }
         if many == 1 { return Ok(Val.Reg(strings.parseIntOpt(&hit).unwrapOr(0), shown)) }
         if many > 1 { return Err(e("42725", &("more than one function named \"" + name + "\""))) }
+        // the arrays' input function, as pg_type.typinput shows it (pgjdbc's TypeInfoCache asks typinput = 'pg_catalog.array_in'::regproc)
+        if nm == "array_in" || nm == "pg_catalog.array_in" { return Ok(Val.Reg(750, "array_in")) }
     }
     match num {
         Some(n) { return Ok(Val.Reg(n, relShown(&q, n).unwrapOr(n.toStr()))) }
@@ -17396,6 +17404,8 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
         }
     }
     if name == "current_user" { return Ok(Some(Val.Text(catUser(se)))) }
+    // the Oracle door's SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL'): tcps on a TLS connection
+    if name == "#netproto" { return Ok(Some(Val.Text(if se.st.memo.get(&netKey(se.sess)).isSome() { "tcps" } else { "tcp" }))) }
     // PostgreSQL's SYSTEM_USER: "method:identity" of an authenticated login, NULL of a trusted one
     if name == "system_user" {
         match se.st.memo.get(&sysUserKey(se.sess)) {
@@ -17410,6 +17420,15 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     if name == "current_schema" && n == 0 {
         for l in catLines(se, &"p") { return Ok(Some(Val.Text(l[0].clone()))) }
         return Ok(Some(Val.Text("public")))
+    }
+    // current_schemas(include_implicit): the search path, pg_catalog first if asked (pgjdbc's TypeInfoCache reads it)
+    if name == "current_schemas" && n == 1 {
+        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        var names: []Val = []
+        if lexdb_sql.text(&vs[0]) == "t" { append(mut &names, Val.Text("pg_catalog")) }
+        for l in catLines(se, &"p") { if l[0] != "pg_catalog" { append(mut &names, Val.Text(l[0].clone())) } }
+        if len(names) == 0 || (len(names) == 1 && lexdb_sql.text(&vs[0]) == "t") { append(mut &names, Val.Text("public")) }
+        return Ok(Some(Val.Text(lexdb_ops.arrayText(&names))))
     }
     if name == "pg_get_userbyid" && n == 1 {
         if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
@@ -20714,3 +20733,24 @@ fn latAsk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, env: &En
     }
     return Ok(true)
 }
+
+// ---- for the doors: driver compatibility (design/lexdb.md 9.138, lexdb-tds.md 17, lexdb-oracle.md 22)
+
+// The table SET IDENTITY_INSERT is on for, "" none.
+pub fn (s: &Session) identityInsert(): str { return s.st.memo.get(&identKey(s.id)).unwrapOr("") }
+
+// A table by its name along the session's path (the T-SQL door's error texts read its keys, checks and foreign keys).
+pub fn (s: mut &Session) tableInfo(name: &str): Result[Table, DbErr] { return s.tableNamed(name) }
+
+fn netKey(sess: int): str { return "\x00tcps\x00" + sess.toStr() }
+
+// The session's connection is TLS (the Oracle door's TCPS): SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL') says tcps.
+pub fn (s: &Session) setTcps() { s.st.memo.put(&netKey(s.id), "1") }
+
+// A statement's deadline word with statement_timeout (lexdb_pipe.deadlineWord): now plus the timeout, and the session.
+fn (s: mut &Session) setTimeout(ms: int) {
+    s.timeoutMs = ms
+    s.dword = if ms > 0 { -1 } else { s.id }
+}
+
+fn (s: &Session) timedWord(): int { return lexdb_pipe.deadlineWord((time.monotonicNs() + 999999) / 1000000 + s.timeoutMs, s.id) }

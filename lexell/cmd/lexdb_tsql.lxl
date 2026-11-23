@@ -35,6 +35,7 @@ import "./lexdb_syscat"
 import "./lexdb_parse"
 import "./lexdb_recur"
 import "./lexdb_recrun"
+import "./lexdb_tsqlerr"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -66,6 +67,7 @@ pub type Event = record {
     // EV_ROWS of metadata only (SET FMTONLY ON, sp_prepare's): the columns as
     // SQL Server describes them, no rows (cols and rows empty)
     pub decl: []lexdb_exec.DeclCol
+    pub line: int           // EV_ERROR: the batch's line the statement starts on (SQL Server's Line); 0 not known
 }
 
 // An event to put in an emptied place (a DONE without a count).
@@ -73,7 +75,7 @@ pub fn doneEvent(): Event { return ev0(EV_DONE) }
 
 fn ev0(kind: int): Event {
     return Event{kind: kind, cols: [], rows: [], count: -1, cmd: 0, error: false, err: lexdb_base.err("", ""), tran: 0, number: 0, sev: 0, state: 0,
-                 decl: []}
+                 decl: [], line: 0}
 }
 
 // An error as SQL Server tells it: its number, text, severity and state
@@ -131,6 +133,7 @@ pub const CMD_UPDATE = 0xC5
 pub const CMD_MERGE = 0x117       // (SQL Server's MERGE; its DONE carries the rows merged)
 pub const CMD_BULK = 0xF0       // a bulk load's rows (SQL Server's BULK INSERT)
 pub const CMD_SETOPT = 0xFD     // what SQL Server's DONE gives INSERT BULK
+pub const CMD_PRINT = 0xF7      // a PRINT's DONE
 
 fn cmdOf(kind: int): int {
     if kind == lexdb_sql.S_SELECT { return CMD_SELECT }
@@ -209,6 +212,8 @@ pub fn sqlNumber(state: &str): int {
 // The severity SQL Server gives error n: 14 for a key's violation and a
 // failed login, 15 for a syntax error, else 16.
 pub fn sqlClass(n: int): int {
+    if n == 3701 { return 11 }
+    if n == 195 { return 15 }
     if n == 2627 || n == 2601 || n == 18456 || n == 229 { return 14 }
     if n == 102 || n == 156 || n == 105 || n == 10713 || n == 10710 || n == 10711 || n == 10714 || n == 109 || n == 110 { return 15 }
     return 16
@@ -263,6 +268,9 @@ pub type State = record {
     uncatchable: bool           // the error just given is one a TRY block does not catch
     pendingProc: str            // the procedure the error that leaves a TRY block happened in
     caughtProc: []str           // ... and those of the errors the CATCH blocks handle, parallel to caught
+    line: int                   // the line of the batch the statement running starts on (TStmt.line): its errors' Line
+    pendingLine: int            // ... the error's that leaves a TRY block, and those the CATCH blocks handle (ERROR_LINE)
+    caughtLine: []int
 }
 
 // An INSERT BULK accepted (design/lexdb-tds.md, section 14): the table, the
@@ -275,7 +283,8 @@ pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
                  rowcount: 0, rowLimit: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
                  pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
-                 fmtOnly: false, bulk: [], roTables: [], roParams: [], nest: 0, procId: 0, procs: [], retVal: 0, scopeEnd: false, tryNest: 0, uncatchable: false, pendingProc: "", caughtProc: []}
+                 fmtOnly: false, bulk: [], roTables: [], roParams: [], nest: 0, procId: 0, procs: [], retVal: 0, scopeEnd: false, tryNest: 0, uncatchable: false, pendingProc: "", caughtProc: [],
+                 line: 1, pendingLine: 1, caughtLine: []}
 }
 
 // An error: to the client, or (in a TRY block) to its CATCH block.
@@ -293,10 +302,12 @@ fn (st: mut &State) failAs(ev: mut &[]Event, c: Caught, cmd: int, counted: bool)
         if counted && !compiling && c.number != 2812 { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
         st.pending = c
         st.pendingProc = if len(st.procs) > 0 { st.procs[len(st.procs) - 1].clone() } else { "" }
+        st.pendingLine = st.line
         st.jump = true
         return
     }
     caughtEv(ev, &c, EV_ERROR)
+    ev[len(ev) - 1].line = st.line
     doneEv(ev, -1, cmd, true)
 }
 
@@ -361,7 +372,7 @@ fn (st: &State) refresh(sess: &lexdb_exec.Session, f: mut &Frame) {
         f.vals[9] = Val.Text(c.message.clone())
         f.vals[10] = Val.Int(c.severity)
         f.vals[11] = Val.Int(c.state)
-        f.vals[12] = Val.Int(1)
+        f.vals[12] = Val.Int(if k <= len(st.caughtLine) { st.caughtLine[k - 1] } else { 1 })
         f.vals[13] = if k <= len(st.caughtProc) && len(st.caughtProc[k - 1]) > 0 { Val.Text(st.caughtProc[k - 1].clone()) } else { Val.Null }
     } else {
         for i in 8..14 { f.vals[i] = Val.Null }
@@ -498,7 +509,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     match r { Err(x) { past = x.state == "TS530" } Ok(_) {} }
     if past { recursionRows(sess, s, f, &oids, mut &r, mut &before) }
     if r.isErr() {
-        let e = r.unwrapErr()
+        let e = lexdb_tsqlerr.translate(sess, s, &r.unwrapErr())
         // (SQL Server's rows before its 530)
         if len(before) > 0 {
             var x = ev0(EV_ROWS)
@@ -842,9 +853,11 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
     }
     let text = withTableTypes(sess, sql)
     let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
+    st.line = 1
     if parsed.isErr() {
         let e = parsed.unwrapErr()
         errorEv(ev, &e)
+        ev[len(ev) - 1].line = lexdb_tsqlparse.errLine()
         doneEv(ev, -1, 0, true)
         st.error = sqlNumber(&e.state)
         return
@@ -1263,6 +1276,7 @@ fn raiseText(fmt: &str, args: &[]Val): str {
 
 // One statement of a batch or block, and how it ended.
 fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, f: mut &Frame, ev: mut &[]Event): int {
+    if t.line > 0 { st.line = t.line }
     st.refresh(sess, f)
     let k = t.kind
     if k == lexdb_tsqlparse.TS_BLOCK { return st.block(sess, &t.body, f, ev) }
@@ -1311,9 +1325,11 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
         let pc = Caught{number: st.pending.number, message: st.pending.message.clone(), severity: st.pending.severity, state: st.pending.state}
         append(mut &st.caught, pc)
         append(mut &st.caughtProc, st.pendingProc.clone())
+        append(mut &st.caughtLine, st.pendingLine)
         let r2 = st.block(sess, &t.els, f, ev)
         let x = pop(mut &st.caught)
         let y = pop(mut &st.caughtProc)
+        let z = pop(mut &st.caughtLine)
         return r2
     }
     if k == lexdb_tsqlparse.TS_PRINT {
@@ -1321,6 +1337,8 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
             Some(vs) {
                 let msg = if len(vs) == 0 || lexdb_ops.isNull(&vs[0]) { "" } else { lexdb_sql.text(&vs[0]) }
                 caughtEv(ev, &Caught{number: 0, message: msg, severity: 0, state: 1}, EV_INFO)
+                // its own DONE after the INFO, as SQL Server's (no count; CurCmd 0xF7)
+                doneEv(ev, -1, CMD_PRINT, false)
                 return F_NEXT
             }
             None { return st.flowAfterError() }
@@ -1822,9 +1840,7 @@ fn (st: mut &State) callProc(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.
     // the scope: its depth, its name, the temporary tables and table variables it makes are its own
     let tempMark = len(st.temps)
     let tvMark = len(st.tableVars)
-    let nocount0 = st.nocount
-    let abort0 = st.xactAbort
-    let rows0 = st.rowLimit
+    let o = st.opts(sess)
     let savedId = st.procId
     st.nest += 1
     st.procId = lexdb_sql.nameOid(&"R", &rt.key)
@@ -1836,9 +1852,7 @@ fn (st: mut &State) callProc(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.
     if len(rt.owner) > 0 { sess.backTo(&callerRole) }
     let rc = if r == F_RETURN { st.retVal } else { 0 }
     let px = pop(mut &st.procs)
-    st.nocount = nocount0
-    st.xactAbort = abort0
-    st.rowLimit = rows0
+    st.restoreOpts(sess, &o)
     st.nest -= 1
     st.procId = savedId
     while len(st.temps) > tempMark {
@@ -2169,13 +2183,36 @@ fn litOf(v: &Val): str {
     }
 }
 
+// The SET options a procedure or a batch run inside another (EXEC (string),
+// sp_executesql) gives back when it ends, as SQL Server's: a SET in it
+// lasts to its end (mssql-jdbc's "sp_executesql N'SET FMTONLY ON SELECT
+// ...'" before a bulk copy leaves FMTONLY off).
+type Opts = record { nocount: bool; xactAbort: bool; implicitTx: bool; quotedIdent: bool; rowLimit: int; fmtOnly: bool; ident: str }
+
+fn (st: &State) opts(sess: &lexdb_exec.Session): Opts {
+    return Opts{nocount: st.nocount, xactAbort: st.xactAbort, implicitTx: st.implicitTx, quotedIdent: st.quotedIdent, rowLimit: st.rowLimit,
+                fmtOnly: st.fmtOnly, ident: sess.identityInsert()}
+}
+
+fn (st: mut &State) restoreOpts(sess: mut &lexdb_exec.Session, o: &Opts) {
+    st.nocount = o.nocount
+    st.xactAbort = o.xactAbort
+    st.implicitTx = o.implicitTx
+    st.quotedIdent = o.quotedIdent
+    st.rowLimit = o.rowLimit
+    st.fmtOnly = o.fmtOnly
+    if sess.identityInsert() != o.ident { sess.setIdentityInsert(&o.ident) }
+}
+
 // A batch run inside this one (EXEC (string), sp_executesql), with its own
-// variables fr; its errors end it, not the batch that ran it.
+// variables fr; its errors end it, not the batch that ran it. Its SET
+// options end with it (Opts).
 fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Frame, ev: mut &[]Event): int {
     let text = withTableTypes(sess, sql)
     let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
     if parsed.isErr() {
         let e = parsed.unwrapErr()
+        st.line = lexdb_tsqlparse.errLine()
         st.failErr(ev, &e, 0)
         return F_NEXT
     }
@@ -2186,9 +2223,11 @@ fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Fr
         st.fail(ev, Caught{number: 178, message: "A RETURN statement with a return value cannot be used in this context.", severity: 15, state: 1}, 0)
         return F_NEXT
     }
+    let o = st.opts(sess)
     st.nest += 1
     let r = st.block(sess, &b.stmts, fr, ev)
     st.nest -= 1
+    st.restoreOpts(sess, &o)
     return if r == F_ERROR { F_ERROR } else { F_NEXT }
 }
 

@@ -25,7 +25,8 @@
 // ApplicationIntent=ReadOnly to the master is routed (ENVCHANGE 20) to the
 // replica, ReadWrite not, and none up: served by the master; a CONNECT naming
 // the read-only service (lexdb_ro, freepdb1_ro) is redirected (REDIRECT), none
-// up: ORA-12514; a wildcard replica address is answered with the master's host;
+// up: ORA-12514 (the REDIRECT's header flags 2, as a listener's: ojdbc reads the address and
+// the connect data apart only then); a wildcard replica address is answered with the master's host;
 // the replica serves both itself. Lexell's own clients follow both.
 // expect: pg master: in_hot_standby off, default_transaction_read_only off, recovery f
 // expect: pg replica: in_hot_standby on, default_transaction_read_only on, show on, recovery t
@@ -53,6 +54,7 @@
 // expect: wait on the master: 55000 recovery is not in progress / not in recovery / success / timeout
 // expect: route, no replica: tds ReadOnly read_only 0, tns lexdb_ro error 12514
 // expect: route: tds ReadOnly read_only 1, ReadWrite read_only 0; tns lexdb_ro 'PHYSICAL STANDBY', freepdb1_ro 'PHYSICAL STANDBY', lexdb 'PRIMARY'
+// expect: route, the REDIRECT packet: type 5 flags 2, data (ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=RPORT)) then the descriptor
 // expect: route, wildcard: tds ReadOnly read_only 1, tns lexdb_ro 'PHYSICAL STANDBY'
 // expect: route, at the replica: tds ReadOnly read_only 1, tns lexdb_ro 'PHYSICAL STANDBY'
 // expect: route, gone: tds ReadOnly read_only 0, tns lexdb_ro error 12514
@@ -62,6 +64,8 @@ import "strings"
 import "postgres"
 import "sqlserver"
 import "oracle"
+import "tns"
+import "binary"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
@@ -190,12 +194,34 @@ fn routedTns(p: &str, svc: &str): str {
     }
 }
 
+// A CONNECT to the read-only service, raw: the reply's packet type and header flags, and the REDIRECT's data (in the
+// DATA packet after it) up to the NUL, then whether the descriptor sent follows.
+fn rawRedirect(p: &str, rport: &str): str {
+    let c = net.connect(&("127.0.0.1:" + p)).unwrap()
+    let desc = "(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=lexdb_ro))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=" + p + ")))"
+    c.write(&tns.packet(1, 0, &tns.connectBody(&desc), false)).unwrap()
+    var got: []byte = []
+    var chunk = array(4096, byte(0))
+    // the REDIRECT (8 + 2 bytes) and the DATA packet with the data
+    while len(got) < 10 || len(got) < 10 + 8 + 2 + binary.readU16BE(&got, 8) {
+        let n = c.read(mut &chunk).unwrap()
+        if n == 0 { break }
+        for i in 0..n { append(mut &got, chunk[i]) }
+    }
+    let data = strFromBytes(&got[20..len(got)])
+    let nul = strings.indexOf(&data, "\x00", 0)
+    let addr = if nul >= 0 { strings.replaceAll(&data[0..nul], rport, "RPORT") } else { "no NUL: " + data }
+    let then = if nul >= 0 && data[nul + 1..len(data)] == desc { "the descriptor" } else { "something else" }
+    return "type " + int(got[4]).toStr() + " flags " + int(got[5]).toStr() + ", data " + addr + " then " + then
+}
+
 fn routeChecks(st: &lexdb_store.Store, mtds: &str, rtds: &str, mtns: &str, rtns: &str) {
     let none: []str = []
     println("route, no replica: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(mtns, "lexdb_ro"))
     lexdb_repl.setRoutes(st, 1, &["tds 127.0.0.1:" + rtds, "tns 127.0.0.1:" + rtns])
     println("route: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", ReadWrite " + routedTds(mtds, "ReadWrite") +
             "; tns lexdb_ro " + routedTns(mtns, "lexdb_ro") + ", freepdb1_ro " + routedTns(mtns, "FREEPDB1_RO") + ", lexdb " + routedTns(mtns, "lexdb"))
+    println("route, the REDIRECT packet: " + rawRedirect(mtns, rtns))
     // a replica on a wildcard address: the host the client reached the master on
     lexdb_repl.setRoutes(st, 1, &["tds 0.0.0.0:" + rtds, "tns 0.0.0.0:" + rtns])
     println("route, wildcard: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(mtns, "lexdb_ro"))

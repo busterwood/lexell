@@ -1,0 +1,78 @@
+// lexdb_tds: a PRINT's INFO after a SET's or DECLARE's DONE reaches the
+// client (design/lexdb-tds.md 17). The reply's last DONE is the only one
+// without DONE_MORE, and it comes after the INFO: a PRINT has a DONE of its
+// own after its INFO, as SQL Server sends (mssql-jdbc
+// stops reading at a DONE without DONE_MORE, and lost the message). Each
+// batch's DONE statuses in order (MORE, COUNT, final) and its INFO texts,
+// through lib/tds's own session; run with LEXDB_MSSQL set to a connection
+// string, the program asks that SQL Server instead: the same output.
+// expect: PRINT 'alone': dones final; infos alone
+// expect: SET NOCOUNT ON; PRINT 'after set': dones more final; infos after set
+// expect: DECLARE @x int = 1; PRINT 'after declare': dones more+count final; infos after declare
+// expect: SET NOCOUNT ON; DECLARE @x int = 1; PRINT 'hi'; SELECT @x AS x: dones more more more final; infos hi
+// expect: SELECT 1 AS a; PRINT 'between'; SELECT 2 AS b: dones more+count more final+count; infos between
+// expect: SET NOCOUNT ON; SET XACT_ABORT ON: dones more final; infos 
+import "os"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const BATCHES: []str = ["PRINT 'alone'", "SET NOCOUNT ON; PRINT 'after set'", "DECLARE @x int = 1; PRINT 'after declare'",
+                        "SET NOCOUNT ON; DECLARE @x int = 1; PRINT 'hi'; SELECT @x AS x", "SELECT 1 AS a; PRINT 'between'; SELECT 2 AS b",
+                        "SET NOCOUNT ON; SET XACT_ABORT ON"]
+
+fn shown(r: &tds.Reply): str {
+    var ds: []str = []
+    for d in r.dones {
+        if d.token != tds.TK_DONE { continue }
+        var w = if d.status & tds.DONE_MORE != 0 { "more" } else { "final" }
+        if d.status & tds.DONE_COUNT != 0 { w = w + "+count" }
+        append(mut &ds, w)
+    }
+    var is: []str = []
+    for m in r.infos { append(mut &is, m.text.clone()) }
+    return "dones " + strings.join(&ds, " ") + "; infos " + strings.join(&is, " ")
+}
+
+fn client(dsn: &str) {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var s = tds.open(&st.config).unwrap()
+    // (each batch on a connection of its own state: SET NOCOUNT ON undone between them)
+    for b in BATCHES {
+        match s.batch(&b) {
+            Ok(r) { println(b + ": " + shown(&r)) }
+            Err(e) { println(b + ": failed " + e.msg) }
+        }
+        let reset = s.batch("SET NOCOUNT OFF; SET XACT_ABORT OFF")
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { client(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                   snapNodes: 50000}, body).unwrap()
+        }
+    }
+}
