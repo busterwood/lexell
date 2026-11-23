@@ -4081,7 +4081,10 @@ pub fn (st: &Store) liveStale(t: &Txn): bool {
 // writes and waits until the log holds them. A transaction that only read
 // is checked too, and waits until what it saw is durable (4.4).
 pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.repEnd(&t0) }
+    if st.fo.isSome() {
+        if len(t0.tmp) > 0 { return st.tmpEnd(&t0) }
+        return st.repEnd(&t0)
+    }
     var t = t0
     let id = t.snap
     let lid = t.lockId
@@ -4102,7 +4105,10 @@ pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
 // is (a sequence's block, 9.43: no transaction using its values can be
 // durable before it). A crash before then loses it.
 pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() { return st.repEnd(&t0) }
+    if st.fo.isSome() {
+        if len(t0.tmp) > 0 { return st.tmpEnd(&t0) }
+        return st.repEnd(&t0)
+    }
     var t = t0
     let id = t.snap
     let lid = t.lockId
@@ -6879,13 +6885,20 @@ type Fol = record {
     watchedWrites: int
     metaDue: bool           // a newer checkpoint may be on disk (checkpointed); a local link's always
     wakes: []task.Promise[Unit]     // woken after batches are applied (waitApplied: WAIT FOR LSN, lexdb.md 9.137)
+    tmp: lexdb_tmpstore.Tmps        // its replica sessions' temporary objects (lexdb_tmpstore; lexdb.md 9.137, phase 5)
 }
 
-// tmp: its replica's sessions' temporary objects (lexdb_tmpstore; design/lexdb.md 9.137, phase 5).
-pub type Follower = value record { sh: task.Shared[Fol]; tmp: lexdb_tmpstore.Tmps }
+pub type Follower = value record { sh: task.Shared[Fol] }
 
 // Another handle to the same follower (a handle: clone, a copy, does not apply).
-pub fn (f: &Follower) share(): Follower { return Follower{sh: f.sh.share(), tmp: f.tmp.share()} }
+pub fn (f: &Follower) share(): Follower { return Follower{sh: f.sh.share()} }
+
+// Its replica sessions' temporary storage (a handle).
+fn (f: &Follower) tmps(): lexdb_tmpstore.Tmps {
+    var out: []lexdb_tmpstore.Tmps = []
+    f.sh.with(fn(s: mut &Fol) { append(mut &out, s.tmp.share()) })
+    return out[0].share()
+}
 
 // A snapshot: the store as of batch, read through checkpoint ckpt.
 pub type FSnap = value record { pub id: int; pub batch: int; pub ckpt: int }
@@ -6943,8 +6956,9 @@ fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, cacheByt
     let fol = Fol{link: link, data: data, fs: logFs, bases: [], next: [b], pool: [], pageOf: [], refd: [], at: newMap(),
                   used: 0, budget: cacheBytes, hand: 0, eps: [newEpoch(0)], life: newMap(), applied: m.replayBatch - 1,
                   seg: m.replaySeg, off: m.replayOff, segF: [], segNo: -1, snaps: [], nextSnap: 0,
-                  loads: 0, evictions: 0, batches: 0, pushes: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false, wakes: []}
-    let fo = Follower{sh: task.shared(fol), tmp: lexdb_tmpstore.newTmps()}
+                  loads: 0, evictions: 0, batches: 0, pushes: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false, wakes: [],
+                  tmp: lexdb_tmpstore.newTmps()}
+    let fo = Follower{sh: task.shared(fol)}
     fo.adopt()
     return Ok(fo)
 }
@@ -8054,16 +8068,11 @@ fn readOnly(what: &str): lexdb_base.DbErr {
     return lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))
 }
 
-// A replica transaction's end: its snapshot ends and its row locks go; one
-// with writes fails, unless they are all to its session's temporary
-// objects (tmpCommit).
+// A replica transaction's end: its snapshot ends; one with writes fails.
+// (One whose session has a temporary schema ends in tmpEnd.)
 fn (st: &Store) repEnd(t: &Txn): Result[Unit, lexdb_base.DbErr] {
     st.endSnapshot(t)
-    st.locks.release(t.lockId, &t.held)
-    if len(t.writes) > 0 {
-        if len(t.tmp) > 0 { return st.tmpCommit(t) }
-        return Err(readOnly(&"a write on a replica"))
-    }
+    if len(t.writes) > 0 { return Err(readOnly(&"a write on a replica")) }
     return Ok(Unit{})
 }
 
@@ -8086,9 +8095,20 @@ const CAT_TREE = 1              // lexdb_catalog.CATALOG
 // Whether catalog key k is a row of temporary schema sc.
 fn tmpKey(sc: &str, k: &str): bool { return lexdb_tmpstore.schemaOfKey(k) == sc }
 
+// A replica's commit of a transaction whose session has a temporary
+// schema: its snapshot ends and its row locks go (a block's UPDATE and
+// DELETE of its #temp rows take them); its writes, if any, applied to the
+// temporary storage, or refused (tmpCommit).
+fn (st: &Store) tmpEnd(t: &Txn): Result[Unit, lexdb_base.DbErr] {
+    st.endSnapshot(t)
+    st.locks.release(t.lockId, &t.held)
+    if len(t.writes) > 0 { return st.tmpCommit(t) }
+    return Ok(Unit{})
+}
+
 // A new local tree, made when the transaction commits.
 fn (st: &Store) tmpTree(t: mut &Txn): int {
-    let id = st.follower().unwrap().tmp.newId()
+    let id = st.follower().unwrap().tmps().newId()
     append(mut &t.writes, TxWrite{op: OP_CREATE, tree: id, key: "", val: "", head: 0})
     append(mut &t.created, id)
     return id
@@ -8097,7 +8117,7 @@ fn (st: &Store) tmpTree(t: mut &Txn): int {
 // getBaseIn on a replica, for a transaction with a temporary schema.
 fn (st: &Store) tmpGet(t: mut &Txn, tree: int, key: &str): Result[Option[str], lexdb_base.DbErr] {
     let fo = st.follower().unwrap()
-    if lexdb_tmpstore.isLocal(tree) || (tree == CAT_TREE && tmpKey(&t.tmp, key)) { return Ok(fo.tmp.get(tree, &t.tmp, key)) }
+    if lexdb_tmpstore.isLocal(tree) || (tree == CAT_TREE && tmpKey(&t.tmp, key)) { return Ok(fo.tmps().get(tree, &t.tmp, key)) }
     let s = try repSnap(&fo, t)
     return fo.get(&s, tree, key)
 }
@@ -8201,7 +8221,7 @@ fn (st: &Store) tmpScan(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(&En
     if back { collections.reverse(mut &own) }
     var cuts: []TCut = []
     for c in t.cuts { if c.tree == tree { append(mut &cuts, c.clone()) } }
-    var m = TmpMerge{tm: fo.tmp.share(), tree: tree, sc: t.tmp.clone(), from: from.toStr(), to: to.toStr(), back: back, own: own, oi: 0, cuts: cuts,
+    var m = TmpMerge{tm: fo.tmps(), tree: tree, sc: t.tmp.clone(), from: from.toStr(), to: to.toStr(), back: back, own: own, oi: 0, cuts: cuts,
                      lk: [], lv: [], li: 0, more: local || tree == CAT_TREE, cursor: if back { to.toStr() } else { from.toStr() }, going: true}
     if !local {
         let s = try repSnap(&fo, t)
@@ -8228,7 +8248,7 @@ fn (st: &Store) tmpCommit(t: &Txn): Result[Unit, lexdb_base.DbErr] {
         if w.tree == CAT_TREE && (w.op == OP_PUT || w.op == OP_DEL) && tmpKey(&t.tmp, &w.key) { continue }
         return Err(readOnly(&"a write on a replica"))
     }
-    let tm = st.follower().unwrap().tmp.share()
+    let tm = st.follower().unwrap().tmps()
     for w in t.writes {
         if w.op == OP_PUT { tm.write(w.tree, &t.tmp, &w.key, &w.val, false) }
         else if w.op == OP_DEL { tm.write(w.tree, &t.tmp, &w.key, "", true) }
@@ -8243,7 +8263,7 @@ fn (st: &Store) tmpCommit(t: &Txn): Result[Unit, lexdb_base.DbErr] {
 // and trees.
 pub fn (st: &Store) dropTmp(sc: &str) {
     match st.fo {
-        Some(fo) { fo.tmp.dropSchema(sc) }
+        Some(fo) { fo.tmps().dropSchema(sc) }
         None {}
     }
 }
@@ -8252,7 +8272,7 @@ pub fn (st: &Store) dropTmp(sc: &str) {
 // (for the tests); [] on the master.
 pub fn (st: &Store) tmpCounts(): []int {
     match st.fo {
-        Some(fo) { return fo.tmp.counts() }
+        Some(fo) { return fo.tmps().counts() }
         None { return [] }
     }
 }
