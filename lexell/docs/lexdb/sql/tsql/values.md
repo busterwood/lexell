@@ -149,7 +149,7 @@ GO
 
 ```text
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "x"
+Conversion failed when converting the varchar value 'x' to data type int.
 Msg 468, Level 16, State 1, Line 1
 Cannot resolve the collation conflict between "SQL_Latin1_General_CP1_CI_AS" and "default" in the equal to operation.
 ```
