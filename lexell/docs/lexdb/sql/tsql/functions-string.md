@@ -386,14 +386,14 @@ SELECT SOUNDEX('Smith') AS sound;
 ```
 
 ```text
-Msg 195, Level 16, State 1, Line 1
-function unicode with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function str with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function isnumeric with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function soundex with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'unicode' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'str' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'isnumeric' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'soundex' is not a recognized built-in function name.
 ```
 
 ### N. Wrong argument types and bad data
