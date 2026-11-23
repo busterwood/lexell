@@ -104,6 +104,34 @@ smaller differences of its statement.
   - A schema that holds a view, or that a view reads from, cannot be renamed (2BP01, "lexdb keeps a view's text").
   - `search_path` defaults to `public` (PostgreSQL: `"$user", public`).
   - `DROP SCHEMA`'s refusal has no DETAIL or HINT, and `CASCADE` gives no NOTICE.
+- **Settings** (found writing the SET, SHOW and DISCARD pages):
+  - `pg_settings` has no rows; `SHOW ALL` gives lexdb's own settings only, without `TimeZone`.
+  - `SET LOCAL` of lexdb's settings (`statement_timeout` ...) and `SET LOCAL ROLE` do nothing (`SET LOCAL TIME
+    ZONE` and custom `a.b` settings work).
+  - `is_superuser` is always `on`, also after `SET ROLE` to a plain role.
+  - After `RESET myapp.mode`, `SHOW myapp.mode` is 42704 (PostgreSQL shows an empty value).
+  - `SET` of a name lexdb does not have (`work_mem`, `application_name`) is accepted and ignored; `SHOW work_mem` is
+    then 42704.
+  - `DISCARD SEQUENCES` and `DISCARD PLANS` do nothing (`currval` still answers); `DISCARD ALL` does not reset `SET
+    ROLE` or `SET SESSION AUTHORIZATION`; `DEALLOCATE` does nothing and its command tag is `SET`.
+- **Enum types:**
+  - An enum value comes out typed as text: `pg_typeof('ok'::mood)` is `text`, and the column is named `text`.
+  - `'mood'::regtype` is 42704 `type "mood" does not exist`; `enum_range` does not exist (42883).
+  - `ALTER TYPE` takes only `ADD VALUE` (`RENAME VALUE`, `RENAME TO`, `OWNER TO` are 0A000); composite and range
+    types are 0A000; `DROP TYPE ... CASCADE` and arrays of enums are 0A000.
+- **Roles and privileges:**
+  - `CREATE ROLE ... IN ROLE / ROLE / ADMIN` make no membership, and `CREATEDB`, `CREATEROLE` and the other
+    non-login options are read and not kept.
+  - `CREATE ROLE "public"` succeeds (PostgreSQL reserves the name).
+  - The bootstrap role `postgres` cannot be named: `DROP ROLE postgres` and `OWNER TO postgres` say it does not
+    exist, though `pg_roles` lists it.
+  - `DROP ROLE` drops a role that holds privileges, and the grants go with it (PostgreSQL refuses until they are
+    revoked); a role that owns objects is refused (2BP01).
+  - `REASSIGN OWNED` and `DROP OWNED` are syntax errors; `ALTER DEFAULT PRIVILEGES` is 0A000 with a misleading
+    message ("only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are supported"); `pg_has_role` and `pg_authid` do not
+    exist.
+  - `GRANT MAINTAIN` is accepted and not kept. Column privileges, `WITH GRANT OPTION`, `WITH ADMIN OPTION` and
+    privileges on types are 0A000.
 
 
 ## SQL Server door
