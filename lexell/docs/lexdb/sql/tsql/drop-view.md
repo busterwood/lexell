@@ -81,8 +81,8 @@ GO
 ```text
 Msg 50000, Level 16, State 1, Line 1
 cannot drop view v_c because other objects depend on it
-Msg 208, Level 16, State 1, Line 1
-view "v_nothere" does not exist
+Msg 3701, Level 11, State 1, Line 1
+Cannot drop the view 'v_nothere', because it does not exist or you do not have permission.
 ```
 
 ## See also
