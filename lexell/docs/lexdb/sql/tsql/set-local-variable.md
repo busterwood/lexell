@@ -128,9 +128,9 @@ GO
 ```
 
 ```text
-Msg 512, Level 16, State 1, Line 1
-more than one row returned by a subquery used as an expression
-Msg 8115, Level 16, State 1, Line 1
+Msg 512, Level 16, State 1, Line 2
+Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.
+Msg 8115, Level 16, State 1, Line 3
 integer out of range
 m    i
 ---- ----------
