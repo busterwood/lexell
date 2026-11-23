@@ -111,19 +111,21 @@ Casts, typed constants and the common type of mixed values: [type conversion](ty
 | [Date and time](functions-datetime.md) | `now`, `current_date`, `current_time`, `current_timestamp`, `localtime`, `localtimestamp`, `transaction_timestamp`, `statement_timestamp`, `clock_timestamp`, `date_part`, `EXTRACT`, `date_trunc`, `date_bin`, `age`, `make_date`, `make_interval`, `make_timestamp`, `make_timestamptz`, `to_timestamp`, `isfinite`, `date_add`, `date_subtract`, `AT TIME ZONE` |
 | [Formatting](functions-formatting.md) | `to_char`, `to_number`, `to_date`, `to_timestamp` |
 | [Conditional](functions-conditional.md) | `CASE`, `coalesce`, `nullif`, `greatest`, `least`, `error_on_null` |
-| Arrays | `array_append`, `array_prepend`, `array_cat`, `array_remove`, `array_replace`, `array_position`, `array_positions`, `array_to_string`, `array_length`, `array_lower`, `array_upper`, `array_ndims`, `array_dims`, `cardinality`, `trim_array`, `array_reverse`, `array_shuffle`, `array_sample`, `unnest`, `generate_subscripts` |
-| UUID | `gen_random_uuid`, `uuidv4`, `uuidv7`, `uuid_extract_version`, `uuid_extract_timestamp` |
-| JSON | `json_build_object`, `jsonb_build_object` (text results; there is no JSON type) |
-| Aggregate | `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg`, `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`, `any_value`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop`, `percentile_cont`, `percentile_disc` |
-| Window | `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` (with `IGNORE NULLS`), and every aggregate with `OVER` |
-| Set-returning | `generate_series`, `unnest [WITH ORDINALITY]`, `regexp_matches`, `regexp_split_to_table`, `string_to_table` |
-| Sequences | `nextval`, `currval`, `setval`, `lastval` |
-| Session | `current_user`, `session_user`, `current_role`, `current_schema`, `current_catalog`, `current_database`, `version`, `current_setting`, `set_config`, `pg_backend_pid`, `txid_current`, `pg_current_xact_id`, `pg_typeof` |
-| Replication | `pg_is_in_recovery`, `pg_current_wal_lsn`, `pg_current_wal_insert_lsn`, `pg_current_wal_flush_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn` |
-| Advisory locks | `pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_xact_lock`, `pg_try_advisory_xact_lock`, `pg_advisory_unlock`, `pg_advisory_unlock_all`, and their `_shared` forms |
-| Catalog | `pg_get_userbyid`, `pg_table_is_visible`, `pg_type_is_visible`, `pg_function_is_visible`, `pg_get_expr`, `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_viewdef`, `pg_get_functiondef`, `pg_get_function_arguments`, `pg_get_function_result`, `pg_get_serial_sequence`, `to_regclass`, `to_regtype`, `to_regnamespace`, `obj_description`, `col_description`, `has_table_privilege`, `has_schema_privilege`, `has_database_privilege`, `has_sequence_privilege`, `has_function_privilege`, `has_any_column_privilege`, `pg_relation_size`, `pg_total_relation_size`, `pg_table_size`, `pg_indexes_size`, `pg_database_size`, `pg_size_pretty`, `format_type`, `pg_encoding_to_char` |
+| [Arrays](functions-array.md) | `array_append`, `array_prepend`, `array_cat`, `array_remove`, `array_replace`, `array_position`, `array_positions`, `array_to_string`, `array_length`, `array_lower`, `array_upper`, `array_ndims`, `array_dims`, `cardinality`, `trim_array`, `array_reverse`, `array_shuffle`, `array_sample`, `unnest`, `generate_subscripts` |
+| [UUID](functions-uuid.md) | `gen_random_uuid`, `uuidv4`, `uuidv7`, `uuid_extract_version`, `uuid_extract_timestamp` |
+| [JSON](functions-json.md) | `json_build_object`, `jsonb_build_object` (text results; there is no JSON type) |
+| [Aggregate](functions-aggregate.md) | `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg`, `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`, `any_value`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop`, `percentile_cont`, `percentile_disc` |
+| [Window](functions-window.md) | `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` (with `IGNORE NULLS`), and every aggregate with `OVER` |
+| [Set-returning](functions-srf.md) | `generate_series`, `unnest [WITH ORDINALITY]`, `regexp_matches`, `regexp_split_to_table`, `string_to_table` |
+| [Sequences](functions-sequence.md) | `nextval`, `currval`, `setval`, `lastval` |
+| [Session](functions-session.md) | `current_user`, `session_user`, `current_role`, `current_schema`, `current_database`, `version`, `current_setting`, `set_config`, `pg_backend_pid`, `txid_current`, `pg_current_xact_id`, `pg_typeof` |
+| [Replication](functions-replication.md) | `pg_is_in_recovery`, `pg_current_wal_lsn`, `pg_current_wal_insert_lsn`, `pg_current_wal_flush_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn` |
+| [Advisory locks](functions-advisory-lock.md) | `pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_xact_lock`, `pg_try_advisory_xact_lock`, `pg_advisory_unlock`, `pg_advisory_unlock_all`, and their `_shared` forms |
+| [Catalog](functions-catalog.md) | `pg_get_userbyid`, `pg_table_is_visible`, `pg_type_is_visible`, `pg_function_is_visible`, `pg_get_expr`, `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_viewdef`, `pg_get_functiondef`, `pg_get_function_arguments`, `pg_get_function_result`, `pg_get_serial_sequence`, `to_regclass`, `to_regtype`, `to_regnamespace`, `obj_description`, `col_description`, `has_table_privilege`, `has_schema_privilege`, `has_database_privilege`, `has_sequence_privilege`, `has_function_privilege`, `has_any_column_privilege`, `pg_relation_size`, `pg_total_relation_size`, `pg_table_size`, `pg_indexes_size`, `pg_database_size`, `pg_size_pretty`, `format_type`, `pg_encoding_to_char` |
 
 ## Operators
+
+See [operators](operators.md).
 
 Comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`), `BETWEEN [SYMMETRIC]`, `IN`, `ANY`/`SOME`/`ALL`, `EXISTS`,
 `IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM`; arithmetic (`+ - * / % ^`, unary `-` `+`); bitwise
