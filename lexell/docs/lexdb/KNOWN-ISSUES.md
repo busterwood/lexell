@@ -21,14 +21,6 @@ smaller differences of its statement.
 
 ## PostgreSQL door
 
-- **pgjdbc fails with its default settings.** lexdb takes binary parameters only for `int2`, `int4`, `int8`,
-  `bool`, `float4`, `float8` and text types, and sends no binary results. pgjdbc 42.7 sends `BigDecimal`, `UUID` and
-  `byte[]` parameters in binary ("a binary parameter of type 1700 is not supported"), and after a prepared statement
-  has run five times (`prepareThreshold`) it asks for binary results, so the sixth run fails ("results in binary are
-  not supported"). `binaryTransfer=false` in the URL avoids both, except for `setBytes`, which is always binary.
-  ([connect/postgresql.md](connect/postgresql.md#java-pgjdbc))
-- **Cancel requests are ignored.** psql's Ctrl-C, JDBC's `Statement.cancel()` and libpq's `PQcancel` do not stop a
-  running statement. `statement_timeout` does.
 - **`inet_server_port()`** and the other `inet_*` functions do not exist (42883).
 - **No PL/pgSQL and no `DO`.** Functions and procedures are `LANGUAGE sql` only; another language is 42704
   (`language "plpgsql" does not exist`), and `DO` is a syntax error.
@@ -239,16 +231,6 @@ smaller differences of its statement.
 
 ## SQL Server door
 
-- **Error text.** Many errors carry SQL Server's number and severity with lexdb's (PostgreSQL's) text, for example
-  2714 `relation "t1" already exists` where SQL Server says `There is already an object named 't1' in the database.`,
-  and 2627 `duplicate key value violates unique constraint "t1_pkey"`.
-- **`SET FMTONLY ON` stays on after mssql-jdbc's `SQLServerBulkCopy`.** After `writeToServer`, every later query on
-  that connection returns its columns and no rows, until the program runs `SET FMTONLY OFF` (checked with mssql-jdbc
-  13.6.2; the rows are loaded). The same happens after an `executeBatch` sent as bulk copy
-  (`useBulkCopyForBatchInsert=true`). The driver's metadata batch (`SET FMTONLY ON ... SET FMTONLY OFF`) leaves the
-  option on in lexdb. bcp and SqlBulkCopy were not affected when checked during development (design/lexdb-tds.md
-  section 14). ([bulk loading](bulk-load.md#from-java-sqlserverbulkcopy))
-- **Error line numbers** are always 1 (`Msg 2627, Level 14, State 1, Line 1`), whatever line of the batch failed.
 - **`UPDATE STATISTICS`** is a syntax error (102), on the master and on a replica.
 - **Missing functions:** `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP` and `ATN2` give error 195 ("function ... does
   not exist"). An error 195 ends the batch, as SQL Server's compile errors do.
@@ -320,11 +302,6 @@ smaller differences of its statement.
   - Other error numbers: `DROP TABLE`, `VIEW` or `SEQUENCE` of a missing object is 208 (SQL Server: 3701), `DROP
     INDEX` of a missing index 50000 (3701), adding a column that exists 50000 (2705), dropping an unknown column 207
     (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901).
-- **Messages after `SET` or `DECLARE` are lost to JDBC programs.** Through mssql-jdbc 13.6, `SET NOCOUNT ON; PRINT
-  'x'` or `DECLARE @x int = 1; PRINT 'x'` gives the program no message (no `SQLWarning`, whatever `getMoreResults`
-  says); `PRINT 'x'` alone, or a `SELECT` after the `SET`, is seen. lexdb sends a DONE token for the `SET` or
-  `DECLARE`, where SQL Server sends none, and the driver seems to stop there (lexdb_tds.lxl, the EV_DONE arm). The
-  pages avoid a `PRINT` straight after a `SET`.
 - **Transactions and variables** (found writing those T-SQL pages):
   - A string too long for a variable is error 2628 and leaves it NULL: `DECLARE @s varchar(3) = 'abcdef'` (SQL
     Server cuts it to 'abc').
@@ -347,8 +324,6 @@ smaller differences of its statement.
     and then runs its `CATCH` with the old error (50000, 'inner failure'). Without the earlier batch, 208 ends the
     batch and the `CATCH` does not run (try-catch.md, example G).
   - A failed statement inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
-  - A `PRINT` that ends a batch right after a `RAISERROR` or `THROW` error is not seen by JDBC programs (with a
-    `SELECT` after it, it is).
   - `BREAK` or `CONTINUE` outside a loop is accepted (SQL Server: 135).
   - `RAISERROR` reads and ignores a placeholder's width, precision and flags (`%5d`, `%-6s`); `%o` prints decimal;
     `RAISERROR(50005, 16, 1)` gives Msg 50000 with the text "50005" (no `sys.messages`); `WITH LOG`, `NOWAIT` and
@@ -423,8 +398,7 @@ smaller differences of its statement.
   - **`FORMAT`:** with `de-DE` a date format is still English (`d` gives `3/5/2026`); a custom format with sections
     stops at the first `;` (`FORMAT(-5, '0;(0)')` is -5); literals between digit placeholders are dropped
     (`FORMAT(123456789, '###-##-####')`); `FORMAT(CAST('14:07:09' AS time), 'hh\:mm')` is NULL.
-  - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245); 245 is used
-    where SQL Server gives 8114.
+  - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245).
   - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
     joins strings.
   - **System functions:** `IDENT_CURRENT`, `NEWSEQUENTIALID`, `ROWCOUNT_BIG`, `TRIGGER_NESTLEVEL`,
@@ -451,9 +425,3 @@ smaller differences of its statement.
   With a table `city` made in the PostgreSQL door, `CREATE TABLE city (...)` in the Oracle door (user `SA`) fails with
   ORA-00955 "name is already used by an existing object", and `SELECT * FROM city` reads `public.city`. In Oracle a
   public synonym does not stop a user from making an object of the same name in its own schema.
-- **ojdbc does not follow the read-only redirect.** A JDBC thin connection to the master with the read-only service
-  (`lexdb_ro`) fails in the driver with `ORA-18951: NL exception was generated: TNS-04605: Invalid syntax error:
-  Unexpected char or LITERAL " " before or at ( DESCRIPTION ...`: ojdbc 23.26 cannot parse the REDIRECT packet's data.
-  python-oracledb and Lexell's `oracle` module follow it (design/lexdb.md 9.137). Connecting to a replica's own
-  listener works with ojdbc.
-- **`SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL')` says `tcp` on a TCPS connection**, where Oracle says `tcps`.
