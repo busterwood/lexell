@@ -121,7 +121,7 @@ Msg 5011, Level 16, State 1, Line 1
 User does not have permission to alter database 'nothere', the database does not exist, or the database is not in a state that allows access checks.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'foobar'.
-Msg 226, Level 16, State 1, Line 1
+Msg 226, Level 16, State 1, Line 2
 ALTER DATABASE statement not allowed within multi-statement transaction.
 still_open
 ----------
