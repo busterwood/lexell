@@ -14,7 +14,8 @@ once with `cargo build --release` and timed as the "Rust" column ("-" for
 given). Their output must equal the lxl output. The Java ports in java/ (Bench.java, compiled
 once with javac) are the "Java" column: one JVM per program, the best of RUNS runs inside it
 after a warm-up run (the JIT has compiled the hot code; JVM startup is not counted). Their
-checksum must equal the lxl output too; --no-java skips them.
+checksum must equal the lxl output too; --no-java skips them. pingpong (tasks) has no Rust port
+but a Go one in go/ (goroutines and channels), the Go column, when go is installed.
 
     python3 lexell/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
                               [--no-rust] [--no-java] [--hash-seed N | --random-hash]
@@ -46,13 +47,20 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 LXLC = os.environ.get('LXLC') or os.path.join(ROOT, 'lexell', 'compiler', 'out', 'lxlc')
 OBO = os.path.join(ROOT, 'archive', 'obo')
 OBO_SRC = os.path.join(OBO, 'bench')
-NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps']
+NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps',
+         'nbody', 'interp', 'closures', 'matmul', 'pingpong']
 TOKENS_INPUT = os.path.join(ROOT, 'lexell', 'compiler', 'sema.lxl')   # any text file; same for both
 RUST_DIR = os.path.join(HERE, 'rust')
 # maps: the Rust port uses std HashMap (same operations and keys, same checksum),
 # not Lexell's Map layout: Lexell's Map is insertion-ordered with u32 index slots,
 # HashMap is not. So the comparison is of the operations, not the data structure.
-RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps'}
+RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps',
+              'nbody', 'interp', 'closures', 'matmul'}
+# pingpong has no Rust port (Rust's lightweight tasks are an async runtime crate; the ports use
+# none) but a Go one (goroutines and channels), the Go column.
+GO_DIR = os.path.join(HERE, 'go')
+GO_NAMES = {'pingpong'}
+GO_EXE = {}          # name: the built Go port
 HASH_SEED = None     # set from the command line; see base_env
 RUST_EXE = None      # the one dbench binary, once built
 JAVA_DIR = os.path.join(HERE, 'java')
@@ -166,6 +174,19 @@ def build_java(tmp):
     return out
 
 
+def build_go(tmp):
+    """The Go ports, once; {} without go."""
+    if not shutil.which('go'):
+        return {}
+    out = {}
+    for name in sorted(GO_NAMES):
+        exe = os.path.join(tmp, name + '_go')
+        r = subprocess.run(['go', 'build', '-o', exe, name + '.go'], cwd=GO_DIR)
+        if r.returncode == 0:
+            out[name] = exe
+    return out
+
+
 def build_peak(tmp):
     """peak.c, static; None without gcc."""
     if not shutil.which('gcc'):
@@ -232,7 +253,7 @@ def main():
     ap.add_argument('--random-hash', action='store_true',
                     help='run with the production per-process random hash key')
     a = ap.parse_args()
-    global HASH_SEED, RUST_EXE, JAVA_CP, PEAK
+    global HASH_SEED, RUST_EXE, JAVA_CP, PEAK, GO_EXE
     HASH_SEED = None if a.random_hash else str(a.hash_seed)
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='lxlbench')
@@ -242,6 +263,7 @@ def main():
         if RUST_EXE is None and shutil.which('cargo') is None:
             print('note: cargo not found; Rust column skipped', file=sys.stderr)
     PEAK = build_peak(tmp)
+    GO_EXE = {} if a.obo else build_go(tmp)
     if not a.no_java and not a.obo:
         JAVA_CP = build_java(tmp)
         if JAVA_CP is None and not shutil.which('javac'):
@@ -284,12 +306,15 @@ def main():
         t_rust, out_rust, i_rust, c_rust = timed(rust)
         if rust and out_rust != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Rust {out_rust!r}")
+        t_go, out_go, _, _ = timed(GO_EXE.get(name))
+        if name in GO_EXE and out_go != out_lxl:
+            raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Go {out_go!r}")
         t_java = m_java = None
         if JAVA_CP:
             t_java, out_java, m_java = java_run(name, a.n)
             if out_java != out_lxl:
                 raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Java {out_java!r}")
-        rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust, java=t_java,
+        rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust, java=t_java, go=t_go,
                          mn=peak_run(lxlo or lxln, name), mr=peak_run(rust, name), mj=m_java,
                          out=out_lxl,
                          ci=i_lxl, ni=i_lxln, oi=i_lxlo, pi=i_plain, ri=i_rust,
@@ -307,8 +332,8 @@ def main():
         return
     if a.opt:
         print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | Rust | -O/Rust | "
-              "Java (warm) | -O/Java | output |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+              "Java (warm) | -O/Java | Go | -O/Go | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             pc = fmt(r['plain']) if r['plain'] is not None else "-"
             opc = f"{r['o'] / r['plain']:.2f}" if r['plain'] else "-"
@@ -316,8 +341,10 @@ def main():
             ors = f"{r['o'] / r['rust']:.2f}" if r['rust'] else "-"
             js = fmt(r['java']) if r['java'] is not None else "-"
             ojs = f"{r['o'] / r['java']:.2f}" if r['java'] else "-"
+            gs = fmt(r['go']) if r['go'] is not None else "-"
+            ogs = f"{r['o'] / r['go']:.2f}" if r['go'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {fmt(r['o'])} | "
-                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {rs} | {ors} | {js} | {ojs} | {r['out']} |")
+                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {rs} | {ors} | {js} | {ojs} | {gs} | {ogs} | {r['out']} |")
     else:
         print("| benchmark | via C | native | native/C | plain C | native/plain C | Rust | native/Rust | "
               "Java (warm) | native/Java | output |")

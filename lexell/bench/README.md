@@ -1,7 +1,17 @@
 # Lexell benchmarks
 
-Ten small programs, each built with the default native backend and, with
-`--c`, through C. Each also has a hand-written Rust port and a Java port:
+Fifteen small programs, each built with the default native backend and, with
+`--c`, through C. Each has a Java port, and all but `pingpong` a hand-written Rust
+port (`pingpong` has a Go one instead: Rust's lightweight tasks are an async runtime
+crate, and the ports use none):
+
+- `fib` (calls), `loop` (integer arithmetic), `array` (indexing), `sieve`, `alloc`
+  (a record per iteration), `lists` and `trees` (owned boxed nodes), `strings`
+  (building strings), `tokens` (scanning with views), `maps` (std Map);
+- `nbody` (floating point), `interp` (a stack machine: an enum with payloads run
+  by a match), `closures` (stable sorts with comparator closures, calls through an
+  array of functions), `matmul` (a 400 x 400 product over arrays of rows) and
+  `pingpong` (two tasks handing a counter back and forth through promises).
 
     python3 lexell/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
                               [--no-rust] [--no-java]
@@ -43,7 +53,7 @@ There are three different questions, and they must not be mixed:
    comparison: the Rust code is an independent, idiomatic implementation of
    each program, not the same IR lowered by another backend.
 4. **The same algorithm in Java, on a warmed-up JVM.** `lexell/bench/java/Bench.java` holds the
-   ten ports (OpenJDK 21, default tiered C1/C2), compiled once with `javac`; the table's
+   ports (OpenJDK 21, default tiered C1/C2; `pingpong` on virtual threads), compiled once with `javac`; the table's
    `Java (warm)` column is one JVM per program, the best of RUNS runs inside it after a warm-up
    run, so the JIT has compiled the hot code and JVM startup is not counted. Arithmetic that
    Lexell checks uses `Math.addExact` and `multiplyExact`; the checksum must match. This is the

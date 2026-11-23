@@ -424,6 +424,210 @@ fn bench_maps() {
 
 // ---------------------------------------------------------------- main
 
+// ---------------------------------------------------------------- nbody
+
+#[derive(Clone, Copy)]
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+
+const SOLAR: f64 = 39.47841760435743;
+const DPY: f64 = 365.24;
+
+fn nbody_bodies() -> Vec<Body> {
+    let mut bs = vec![
+        Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: SOLAR },
+        Body { x: 4.84143144246472090e+00, y: -1.16032004402742839e+00, z: -1.03622044471123109e-01,
+            vx: 1.66007664274403694e-03 * DPY, vy: 7.69901118419740425e-03 * DPY, vz: -6.90460016972063023e-05 * DPY,
+            mass: 9.54791938424326609e-04 * SOLAR },
+        Body { x: 8.34336671824457987e+00, y: 4.12479856412430479e+00, z: -4.03523417114321381e-01,
+            vx: -2.76742510726862411e-03 * DPY, vy: 4.99852801234917238e-03 * DPY, vz: 2.30417297573763929e-05 * DPY,
+            mass: 2.85885980666130812e-04 * SOLAR },
+        Body { x: 1.28943695621391310e+01, y: -1.51111514016986312e+01, z: -2.23307578892655734e-01,
+            vx: 2.96460137564761618e-03 * DPY, vy: 2.37847173959480950e-03 * DPY, vz: -2.96589568540237556e-05 * DPY,
+            mass: 4.36624404335156298e-05 * SOLAR },
+        Body { x: 1.53796971148509165e+01, y: -2.59193146099879641e+01, z: 1.79258772950371181e-01,
+            vx: 2.68067772490389322e-03 * DPY, vy: 1.62824170038242295e-03 * DPY, vz: -9.51592254519715870e-05 * DPY,
+            mass: 5.15138902046611451e-05 * SOLAR },
+    ];
+    let (mut px, mut py, mut pz) = (0.0, 0.0, 0.0);
+    for b in &bs {
+        px += b.vx * b.mass;
+        py += b.vy * b.mass;
+        pz += b.vz * b.mass;
+    }
+    bs[0].vx = -px / SOLAR;
+    bs[0].vy = -py / SOLAR;
+    bs[0].vz = -pz / SOLAR;
+    bs
+}
+
+fn nbody_advance(bs: &mut [Body], dt: f64) {
+    let n = bs.len();
+    for i in 0..n {
+        for j in i + 1..n {
+            let dx = bs[i].x - bs[j].x;
+            let dy = bs[i].y - bs[j].y;
+            let dz = bs[i].z - bs[j].z;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let mag = dt / (d2 * d2.sqrt());
+            let mj = bs[j].mass * mag;
+            bs[i].vx -= dx * mj;
+            bs[i].vy -= dy * mj;
+            bs[i].vz -= dz * mj;
+            let mi = bs[i].mass * mag;
+            bs[j].vx += dx * mi;
+            bs[j].vy += dy * mi;
+            bs[j].vz += dz * mi;
+        }
+    }
+    for b in bs.iter_mut() {
+        b.x += dt * b.vx;
+        b.y += dt * b.vy;
+        b.z += dt * b.vz;
+    }
+}
+
+fn nbody_energy(bs: &[Body]) -> f64 {
+    let mut e = 0.0;
+    let n = bs.len();
+    for i in 0..n {
+        let b = bs[i];
+        e += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz);
+        for j in i + 1..n {
+            let dx = b.x - bs[j].x;
+            let dy = b.y - bs[j].y;
+            let dz = b.z - bs[j].z;
+            e -= b.mass * bs[j].mass / (dx * dx + dy * dy + dz * dz).sqrt();
+        }
+    }
+    e
+}
+
+fn bench_nbody() {
+    let mut bs = nbody_bodies();
+    let before = (nbody_energy(&bs) * 1e9) as i64;
+    let steps = black_box(5_000_000);
+    for _ in 0..steps { nbody_advance(&mut bs, 0.01); }
+    println!("{} {}", before, (nbody_energy(&bs) * 1e9) as i64);
+}
+
+// ---------------------------------------------------------------- interp
+
+#[derive(Clone, Copy)]
+enum Op { Push(i64), Load(usize), Store(usize), Add, Mul, Mod, Lt, Jz(usize), Jmp(usize), Halt }
+
+fn interp_run(code: &[Op], n: i64) -> i64 {
+    let mut stack = [0i64; 16];
+    let mut sp = 0usize;
+    let mut locals = [0i64, 0, n];
+    let mut pc = 0usize;
+    loop {
+        match code[pc] {
+            Op::Push(v) => { stack[sp] = v; sp += 1; pc += 1; }
+            Op::Load(k) => { stack[sp] = locals[k]; sp += 1; pc += 1; }
+            Op::Store(k) => { sp -= 1; locals[k] = stack[sp]; pc += 1; }
+            Op::Add => { sp -= 1; stack[sp - 1] = stack[sp - 1] + stack[sp]; pc += 1; }
+            Op::Mul => { sp -= 1; stack[sp - 1] = stack[sp - 1] * stack[sp]; pc += 1; }
+            Op::Mod => { sp -= 1; stack[sp - 1] = stack[sp - 1] % stack[sp]; pc += 1; }
+            Op::Lt => { sp -= 1; stack[sp - 1] = if stack[sp - 1] < stack[sp] { 1 } else { 0 }; pc += 1; }
+            Op::Jz(t) => { sp -= 1; pc = if stack[sp] == 0 { t } else { pc + 1 }; }
+            Op::Jmp(t) => { pc = t; }
+            Op::Halt => return locals[1],
+        }
+    }
+}
+
+fn bench_interp() {
+    use Op::*;
+    let code = vec![
+        Load(0), Load(2), Lt, Jz(17),
+        Load(1), Load(0), Load(0), Mul, Push(7), Mod,
+        Add, Store(1),
+        Load(0), Push(1), Add, Store(0),
+        Jmp(0),
+        Halt,
+    ];
+    println!("{}", interp_run(black_box(&code), black_box(10_000_000)));
+}
+
+// ---------------------------------------------------------------- closures
+
+#[derive(Clone)]
+struct Rec { key: i64, name: String }
+
+fn closures_digest(rs: &[Rec]) -> i64 {
+    let mut h = 0i64;
+    for r in rs { h = (h * 31 + r.key) % 1_000_000_007; }
+    h
+}
+
+fn inc(v: i64) -> i64 { v + 1 }
+fn triple(v: i64) -> i64 { v * 3 }
+fn low(v: i64) -> i64 { v % 1000 }
+fn seventh(v: i64) -> i64 { v / 7 }
+
+fn bench_closures() {
+    let n = black_box(200_000usize);
+    let mut rs: Vec<Rec> = Vec::new();
+    let mut x: i64 = 12345;
+    for _ in 0..n {
+        x = (x * 1103515245 + 12345) % 2147483648;
+        rs.push(Rec { key: x % 1_000_000, name: format!("n{}", x / 1000 % 50000) });
+    }
+    rs.sort_by(|a, b| a.key.cmp(&b.key));
+    let h1 = closures_digest(&rs);
+    rs.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key)));
+    let h2 = closures_digest(&rs);
+    let dir = black_box(-1i64);
+    rs.sort_by(|a, b| {
+        let c = a.key.cmp(&b.key) as i64 * dir;
+        c.cmp(&0)
+    });
+    let h3 = closures_digest(&rs);
+    let fs: [fn(i64) -> i64; 4] = [inc, triple, low, seventh];
+    let fs = black_box(fs);
+    let mut t = 0i64;
+    for round in 0..20 {
+        for i in 0..n { t += fs[(i + round) % 4](rs[i].key); }
+    }
+    println!("{} {} {} {}", h1, h2, h3, t);
+}
+
+// ---------------------------------------------------------------- matmul
+
+fn matmul_matrix(n: usize, seed: usize) -> Vec<Vec<f64>> {
+    (0..n).map(|i| (0..n).map(|j| ((i * seed + j * 7) % 11) as f64 - 5.0).collect()).collect()
+}
+
+fn matmul_mul(a: &[Vec<f64>], b: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
+    let mut c = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row = vec![0.0f64; n];
+        for k in 0..n {
+            let aik = a[i][k];
+            let bk = &b[k];
+            for j in 0..n { row[j] += aik * bk[j]; }
+        }
+        c.push(row);
+    }
+    c
+}
+
+fn bench_matmul() {
+    let n = black_box(400usize);
+    let a = matmul_matrix(n, 3);
+    let b = matmul_matrix(n, 5);
+    let mut total = 0i64;
+    for r in 0..5 {
+        let c = matmul_mul(&a, &b, n);
+        let mut s = 0.0f64;
+        for i in 0..n {
+            for j in 0..n { s += c[i][j] * (((i * n + j) % 13 + r) as f64); }
+        }
+        total += s as i64;
+    }
+    println!("{}", total);
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     let bench = args.next().unwrap_or_else(|| {
@@ -452,6 +656,10 @@ fn main() {
         }
         "sieve" => bench_sieve(),
         "maps" => bench_maps(),
+        "nbody" => bench_nbody(),
+        "interp" => bench_interp(),
+        "closures" => bench_closures(),
+        "matmul" => bench_matmul(),
         other => {
             eprintln!("dbench: unknown benchmark {other}");
             std::process::exit(2);

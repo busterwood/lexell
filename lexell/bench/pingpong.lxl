@@ -1,0 +1,44 @@
+// Tasks: two tasks pass a counter back and forth 2,000,000 times, each message carrying the
+// promise its answer completes (lib/task has no channel: a promise is a one-shot hand-over), so a
+// round trip is two hand-overs and two task switches. The ports use their own lightweight
+// threads: goroutines and channels, Java's virtual threads and a SynchronousQueue.
+import "task"
+
+type Msg = record { n: int; reply: task.Promise[Msg] }
+
+fn pong(first: task.Future[Msg]): int {
+    var f = first
+    var count = 0
+    while true {
+        let m = f.wait().unwrap()
+        if m.n < 0 { return count }
+        let next = m.n + 1
+        let task.Handoff{promise: pr, future: fu} = task.promise[Msg]()
+        f = fu
+        m.reply.complete(Msg{n: next, reply: pr})
+        count += 1
+    }
+    return count
+}
+
+fn main() {
+    let n = 2000000
+    var total = 0
+    var count = 0
+    task.scope(fn(s: mut &task.Scope) {
+        let task.Handoff{promise: p0, future: f0} = task.promise[Msg]()
+        let other = s.start(pong, f0)
+        var p = p0
+        for i in 0..n {
+            let task.Handoff{promise: bp, future: bf} = task.promise[Msg]()
+            p.complete(Msg{n: i * 2, reply: bp})
+            let m = bf.wait().unwrap()
+            total += m.n
+            p = m.reply
+        }
+        let task.Handoff{promise: lp, future: lf} = task.promise[Msg]()
+        p.complete(Msg{n: -1, reply: lp})
+        count = other.wait().unwrap()
+    })
+    println(total.toStr() + " " + count.toStr())
+}
