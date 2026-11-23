@@ -85,6 +85,25 @@ smaller differences of its statement.
   - `pg_indexes.indexdef` shows an expression index on `(n + 1)` as `(((n + 1)))` (PostgreSQL: `((n + 1))`).
   - `INCLUDE (...)`, `WITH (...)`, `NULLS NOT DISTINCT` and `TABLESPACE` are syntax errors; methods other than
     btree are 0A000; `CONCURRENTLY` is accepted and changes nothing.
+- **Transactions** (found writing the transaction pages):
+  - `SHOW transaction_read_only` says `off` inside `BEGIN READ ONLY`, which refuses writes (25006).
+  - `BEGIN` ignores words it does not know: `BEGIN nonsense words here` starts a block (PostgreSQL: 42601).
+  - `SET TRANSACTION READ ONLY` and `SET SESSION CHARACTERISTICS AS TRANSACTION ...` are accepted and do nothing.
+  - No WARNINGs for `BEGIN` inside a block, `COMMIT` or `ROLLBACK` outside one, or `SET CONSTRAINTS` outside one;
+    outside a block `SET CONSTRAINTS nosuch DEFERRED` succeeds.
+  - `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN` and `PREPARE TRANSACTION` are syntax errors.
+- **EXPLAIN:** no options (`EXPLAIN (ANALYZE)`, `(FORMAT JSON)`, `VERBOSE` are syntax errors); `EXPLAIN INSERT`
+  and `EXPLAIN ANALYZE` of anything but a `SELECT` are 0A000; the plan is lexdb's own text, not PostgreSQL's node
+  tree, so tools that parse PostgreSQL plans cannot read it.
+- **Schemas:**
+  - `information_schema.schemata.schema_owner` says `postgres` for a schema made `AUTHORIZATION alice`
+    (`pg_namespace.nspowner` is right).
+  - `CREATE SCHEMA s CREATE TABLE ...` (schema elements) and `DROP SCHEMA a, b` are syntax errors.
+  - `DROP SCHEMA public` and `ALTER SCHEMA public RENAME` are 0A000; `DROP SCHEMA pg_catalog` says it does not
+    exist.
+  - A schema that holds a view, or that a view reads from, cannot be renamed (2BP01, "lexdb keeps a view's text").
+  - `search_path` defaults to `public` (PostgreSQL: `"$user", public`).
+  - `DROP SCHEMA`'s refusal has no DETAIL or HINT, and `CASCADE` gives no NOTICE.
 
 
 ## SQL Server door
