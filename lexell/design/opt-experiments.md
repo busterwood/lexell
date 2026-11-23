@@ -866,7 +866,8 @@ length (`rt_part_len`) and again when writing it (`rt_cat_slow`): `rt_ipart_len`
 Only the concat functions changed size (the runtime's other sections are as they were).
 
 **Next, from this:** a null-pointer `None` for `Option` of a boxed record (the representation:
-check, emit, lower, the drop glue, both backends), measured first on `lists` and `trees`.
+check, emit, lower, the drop glue, both backends), measured first on `lists` and `trees`. Built:
+section 24.
 
 ## 23. Doubles: temporaries coalesced, stores from a dying temporary, addresses that set a local (as built)
 
@@ -908,3 +909,40 @@ bookkeeping per local. The point select's cycles: one function of lexdb changed 
 Test: tests/run/native_float_coalesce (nbody's pair loop, a temporary read again on the right,
 a temporary live around a loop whose body's last declaration reads it, a temporary read by two
 stores, compound assignments of elements).
+
+## 24. An Option of a box is a pointer (as built)
+
+Section 22 found Java's walks over `lists` and `trees` 1.6 times faster, its nodes 24 bytes
+against Lexell's 32 and 48: `Option[Node]` was a tag and a pointer. Now a value closed type of
+two variants, one without fields and one whose single field is a boxed type (a record or closed
+type that is not a value type, not `rc` or `Shared`), is that box's pointer alone, the null
+pointer its other variant (sema `niche`). A box is never null, so nothing else changes meaning.
+`Option[Node]` is 8 bytes; a `lists` node is 16 bytes with its 8-byte header (the 24-byte class,
+from 32), a `trees` node 24 (from 48).
+
+- **Layout** (emit `layout`): `struct { union { struct { Node* f_0 } V_Some } u }`, no tag; the
+  payload is where it was, so every `u.V_Some.f_0` reads it as before.
+- **Tests** (check `tagIs`): a match arm, `for ... in`'s end and `try` test the pointer
+  (`!!p`, `!p`) instead of the tag; the glue's switches on the tag (clone, eq, hash, toStr) switch
+  on `p ? some : none` (emit `tagX`); a drop is `if (p) { the box's drop }` (emit `cases`).
+- **Construction** (`nicheInit`): `Some(x)` is `{.u.V_Some = {x}}`, `None` a null pointer of the
+  field's type; constants alike.
+- **Generic bodies**: in `fn (o: &Option[T]) isSome()` whether T is a box is known per instance,
+  so the test and the initializer are holes (`H_TAGIS`, `H_VINIT`) that emit fills per instance.
+
+| measure (main 21aade84 against this) | instructions | cycles |
+|---|---:|---:|
+| perfsuite lists / trees | -8.4 / -4.3% | -18.2 / -19.3% |
+| perfsuite run suite / compile suite | -0.81 / +0.06% | -2.75 / -0.06% |
+| apps regex / json / jq / cmark / decimal | 0.00% each | +0.2 / +0.1 / -0.1 / -0.1 / 0.0% |
+| TPC-H SF1, server instructions per query (22) | -0.04% geomean (q22 -0.6%) | |
+| lexdb point select (icount6, 2 alternated rounds) | -0.18% (172,008-172,023 against 172,320) | +1.9 / +0.7% |
+
+lexdb's `Option[Expr]`, `Option[Prog]` and the like are now pointers too: the point select's
+instructions fall a little; its cycles rose with more branch misses (463 against 420-432 a
+statement), which the instruction counts do not explain: flagged, not traced.
+
+Test: tests/run/option_niche (lists and trees built, walked, cloned and dropped; ==, hash,
+toStr; arrays and maps of them; a user type with the empty variant first; an Option of an
+Option of a box, which keeps its tag; an iterator whose next returns one; a closed type whose
+Ok holds a box; replace; a boxed closed type in an Option), the same on --c, --native and -O.

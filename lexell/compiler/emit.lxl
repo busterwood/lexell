@@ -246,7 +246,8 @@ fn (e: mut &Emitter) irFields(u: mut &lw.Lower, cts: &[]str, names: &[]str): []i
 }
 
 // The layout of t: struct S { fields } for a record, else
-// struct S { int64_t tag; union { struct { fields } V_x; ... char _e; } u; }.
+// struct S { int64_t tag; union { struct { fields } V_x; ... char _e; } u; }; for a niche type
+// (sema niche: Option of a box) struct S { union { struct { T* f } V_Some; } u; }, no tag.
 fn (e: mut &Emitter) layout(u: mut &lw.Lower, t: int) {
     let d = e.c.pg.ta(t)
     let env = e.c.pg.declEnv(t)
@@ -268,6 +269,16 @@ fn (e: mut &Emitter) layout(u: mut &lw.Lower, t: int) {
         e.fields(t, v, &env, mut &vcts, mut &vnames)
         u.layout(vt, e.irFields(u, &vcts, &vnames))
         append(mut &ufs, ir.Field{name: "V_" + e.c.pg.variants[v].name, ty: vt, off: 0})
+    }
+    let nv = e.c.pg.niche(t)
+    if nv >= 0 {
+        // a niche type (sema niche): the box's pointer alone, null the other variant; no tag
+        let keep = "V_" + e.c.pg.variants[nv].name
+        var only: []ir.Field = []
+        for f in ufs { if f.name == keep { append(mut &only, f.clone()) } }
+        u.layout(un, only)
+        u.layout(ty, [ir.Field{name: "u", ty: un, off: 0}])
+        return
     }
     append(mut &ufs, ir.Field{name: "_e", ty: ir.TY_I8, off: 0})
     u.layout(un, ufs)
@@ -352,8 +363,7 @@ fn (e: mut &Emitter) cloneBody(t: int, ct: &str): []int {
             append(mut &body, e.cloneField(ft, dst, src))
         }
     } else {
-        let tagOf = if boxed { e.c.x.arrow(e.nm("v"), "tag") } else { e.c.x.dot(e.nm("v"), "tag") }
-        append(mut &body, e.c.x.sswitch(tagOf))
+        append(mut &body, e.c.x.sswitch(e.tagX(t, e.nm("v"), if boxed { "->" } else { "." })))
         let vs = copyInts(&e.c.pg.types[d].variants)
         for v in vs {
             append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
@@ -470,9 +480,22 @@ fn (e: mut &Emitter) derivedTypes(t: int, d: int, v: int): []int {
     return out
 }
 
-fn (e: mut &Emitter) tagC(boxed: bool, p: int): int {
+fn (e: mut &Emitter) tagC(t: int, boxed: bool, p: int): int {
     let base = e.c.x.par(e.c.x.pre("*", p))
-    return if boxed { e.c.x.arrow(base, "tag") } else { e.c.x.dot(base, "tag") }
+    return e.tagX(t, base, if boxed { "->" } else { "." })
+}
+
+// The tag of the closed value base (sep "." or "->") of type t; for a niche type (sema niche: its
+// box's pointer, null the other variant) the index of the variant its pointer is (it has no tag).
+fn (e: mut &Emitter) tagX(t: int, base: int, sep: &str): int {
+    let nv = e.c.pg.niche(t)
+    if nv < 0 { return e.c.x.member(base, sep, "tag") }
+    let d = e.c.pg.ta(t)
+    var other = -1
+    for v in e.c.pg.types[d].variants { if v != nv { other = e.c.pg.variants[v].index } }
+    let f = e.c.pg.variants[nv].fields[0].name.clone()
+    let p = e.c.x.dot(e.c.x.dot(e.c.x.member(base, sep, "u"), &("V_" + e.c.pg.variants[nv].name)), &("f_" + f))
+    return e.c.x.par(e.c.x.cond(e.c.x.pre("!", p), e.c.x.lit(other), e.c.x.lit(e.c.pg.variants[nv].index)))
 }
 
 // h = (h ^ x) * the FNV prime
@@ -499,8 +522,8 @@ fn (e: mut &Emitter) deriveGlue(kind: int, t: int, n: &str) {
             let fts = e.derivedTypes(t, d, -1)
             for i in 0..len(fts) { append(mut &body, e.c.x.if1(e.c.x.pre("!", e.c.x.par(e.eqC(fts[i], fa[i], fb[i]))), no)) }
         } else {
-            append(mut &body, e.c.x.if1(e.c.x.bin("!=", e.tagC(boxed, a), e.tagC(boxed, b)), no))
-            append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+            append(mut &body, e.c.x.if1(e.c.x.bin("!=", e.tagC(t, boxed, a), e.tagC(t, boxed, b)), no))
+            append(mut &body, e.c.x.sswitch(e.tagC(t, boxed, a)))
             let vs = copyInts(&e.c.pg.types[d].variants)
             for v in vs {
                 append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
@@ -525,8 +548,8 @@ fn (e: mut &Emitter) deriveGlue(kind: int, t: int, n: &str) {
             let fts = e.derivedTypes(t, d, -1)
             for i in 0..len(fts) { append(mut &body, e.mixC(e.methodC(fts[i], "hash", fa[i], -1))) }
         } else {
-            append(mut &body, e.mixC(e.c.x.cast(e.ct("uint64_t"), e.tagC(boxed, a))))
-            append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+            append(mut &body, e.mixC(e.c.x.cast(e.ct("uint64_t"), e.tagC(t, boxed, a))))
+            append(mut &body, e.c.x.sswitch(e.tagC(t, boxed, a)))
             let vs = copyInts(&e.c.pg.types[d].variants)
             for v in vs {
                 append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
@@ -548,7 +571,7 @@ fn (e: mut &Emitter) deriveGlue(kind: int, t: int, n: &str) {
     if isRec {
         e.showParts(&tn, t, d, -1, a, mut &body, mut &k)
     } else {
-        append(mut &body, e.c.x.sswitch(e.tagC(boxed, a)))
+        append(mut &body, e.c.x.sswitch(e.tagC(t, boxed, a)))
         let vs = copyInts(&e.c.pg.types[d].variants)
         for v in vs {
             append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
@@ -722,7 +745,21 @@ fn (e: mut &Emitter) cases(t: int, base: int, sep: &str, mode: int, boxed: bool)
         e.us(t, -1, base, sep, mut &fts, mut &locs)
         return e.caseBody(mode, &fts, &locs, boxed)
     }
-    var out: []int = [e.c.x.sswitch(e.c.x.member(base, sep, "tag"))]
+    let nv = e.c.pg.niche(t)
+    if nv >= 0 {
+        // a niche type (sema niche): the box variant's fields when its pointer is not null
+        var fts: []int = []
+        var locs: []int = []
+        e.us(t, nv, base, sep, mut &fts, mut &locs)
+        let r = e.caseBody(mode, &fts, &locs, boxed)
+        let f = e.c.pg.variants[nv].fields[0].name.clone()
+        let p = e.c.x.dot(e.c.x.dot(e.c.x.member(base, sep, "u"), &("V_" + e.c.pg.variants[nv].name)), &("f_" + f))
+        var out: []int = [e.c.x.sif(p)]
+        for x in r.ls { append(mut &out, x) }
+        append(mut &out, e.c.x.send())
+        return Lines{ls: out, refs: r.refs}
+    }
+    var out: []int = [e.c.x.sswitch(e.tagX(t, base, sep))]
     var refs = false
     let vs = copyInts(&e.c.pg.types[d].variants)
     for v in vs {
@@ -1051,7 +1088,7 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
             append(mut &body, e.dupField(ft, loc))
         }
     } else {
-        append(mut &body, e.c.x.sswitch(e.c.x.dot(e.nm("v"), "tag")))
+        append(mut &body, e.c.x.sswitch(e.tagX(t, e.nm("v"), ".")))
         let vs = copyInts(&e.c.pg.types[d].variants)
         for v in vs {
             append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
@@ -1144,6 +1181,34 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         let t = e.c.pg.subst(h.t, env)
         let g = e.glueFn(deriveKind(&h.s), t)
         return e.nm(&g)
+    }
+    if k == ck.H_TAGIS {
+        let t = e.c.pg.subst(h.t, env)
+        e.fill(h.x, holes, env, name, res)
+        let nv = e.c.pg.niche(t)
+        if nv < 0 { return e.c.x.bin(if h.r == 1 { "==" } else { "!=" }, e.c.x.member(h.x, &h.s, "tag"), e.c.x.lit(h.f)) }
+        let f = e.c.pg.variants[nv].fields[0].name.clone()
+        let p = e.c.x.dot(e.c.x.dot(e.c.x.member(h.x, &h.s, "u"), &("V_" + e.c.pg.variants[nv].name)), &("f_" + f))
+        let some = e.c.pg.variants[nv].index == h.f
+        return if some == (h.r == 1) { e.c.x.pre("!", e.c.x.pre("!", p)) } else { e.c.x.pre("!", p) }
+    }
+    if k == ck.H_VINIT {
+        let t = e.c.pg.subst(h.t, env)
+        for a in h.args { e.fill(a, holes, env, name, res) }
+        let vr = h.f
+        let nv = e.c.pg.niche(t)
+        let u = "V_" + e.c.pg.variants[if nv >= 0 { nv } else { vr }].name
+        if nv < 0 {
+            let tag = e.c.x.desig(".tag", e.c.x.lit(e.c.pg.variants[vr].index))
+            return e.c.x.init([tag, e.c.x.desig(&("." + "u." + u), e.c.x.init(&h.args))])
+        }
+        if vr == nv { return e.c.x.init([e.c.x.desig(&(".u." + u), e.c.x.init(&h.args))]) }
+        let fd = e.c.pg.variants[nv].fields[0].clone()
+        let fenv = e.c.pg.declEnv(t)
+        let ft = e.c.pg.subst(fd.ty, &fenv)
+        let cty = e.ctype(ft)
+        let z = e.c.x.desig(&(".f_" + fd.name), e.c.x.cast(e.ct(&cty), e.c.x.lit(0)))
+        return e.c.x.init([e.c.x.desig(&(".u." + u), e.c.x.init(&[z]))])
     }
     if k == ck.H_STR || k == ck.H_GSTR { return e.strlit(h.s, k == ck.H_GSTR) }
     if k == ck.H_ADDR || k == ck.H_DEREF || k == ck.H_SHARE {

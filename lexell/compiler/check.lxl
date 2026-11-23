@@ -84,6 +84,12 @@ pub const H_DEREF = 12
 pub const H_SHARE = 13
 pub const H_CLONE = 14     // a deep copy (design/owned-str.md, issue 4): the type t and the value x
 pub const H_DERIVE = 15    // a derived method (eq, hash, toStr; design/consistency.md): t and the name s
+// H_TAGIS, H_VINIT: a closed type t whose box variant's field is a type parameter, so whether it
+// is a niche (sema niche) is decided per instance. H_TAGIS: the test that the value x (s: "." or
+// "->") is (r 1) or is not (r 0) the variant of index f; H_VINIT: the initializer of variant f
+// (a variant id) with the field initializers args.
+pub const H_TAGIS = 16
+pub const H_VINIT = 17
 
 pub type Hole = value record {
     pub k: int
@@ -2898,7 +2904,7 @@ fn (c: mut &Checker) forIter(s: int, v0: Val) {
     c.dropFrame(&fr)
     let sep = if c.pg.types[c.pg.ta(ot)].value { "." } else { "->" }
     let acc = c.nm(&on)
-    c.emit(c.x.if1(c.x.bin("!=", c.x.member(acc, &sep, "tag"), c.lit(c.pg.variants[some].index)), c.x.sbreak()))
+    c.emit(c.x.if1(c.tagIs(acc, &sep, ot, c.pg.variants[some].index, false), c.x.sbreak()))
     c.loopStart(entry, false)
     let env = c.pg.declEnv(ot)
     let f = c.pg.variants[some].fields[0].clone()
@@ -3097,7 +3103,7 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
                 if seen[idx] { c.err(an.line, c.pg.variants[ivr].name + " is matched twice") }
                 seen[idx] = true
                 nseen += 1
-                let cmp = c.x.bin("==", c.x.member(acc, &sep, "tag"), c.lit(idx))
+                let cmp = c.tagIs(acc, &sep, base, idx, true)
                 conds = if k > 0 { c.x.bin("||", conds, cmp) } else { cmp }
                 k += 1
             }
@@ -3111,7 +3117,7 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
             if seen[idx] { c.err(an.line, an.s + " is matched twice") }
             seen[idx] = true
             nseen += 1
-            let cmp = c.x.bin("==", c.x.member(acc, &sep, "tag"), c.lit(idx))
+            let cmp = c.tagIs(acc, &sep, base, idx, true)
             c.emit(if first { c.x.sif(cmp) } else { c.x.selif(cmp) })
         }
         first = false
@@ -4504,6 +4510,52 @@ fn (c: mut &Checker) binop(op: &str, lv0: Val, r: &Arg, line: int, exp: int, has
     c.err(line, "operator " + op + " is not defined for " + c.tstr(lt))
 }
 
+// The test that the closed value acc (sep "." or "->") of type t is the variant of index idx (eq)
+// or is not: its tag compared, or for a niche type (sema niche: a box's pointer, null the other
+// variant) whether its pointer is null.
+fn (c: mut &Checker) tagIs(acc: int, sep: &str, t: int, idx: int, eq: bool): int {
+    if c.nicheOpen(t) {
+        return c.hole(Hole{k: H_TAGIS, t: t, f: idx, s: sep.clone(), x: acc, r: if eq { 1 } else { 0 }, args: []})
+    }
+    let nv = c.pg.niche(t)
+    if nv >= 0 {
+        let f = c.pg.variants[nv].fields[0].name.clone()
+        let p = c.x.dot(c.x.dot(c.x.member(acc, sep, "u"), &("V_" + c.pg.variants[nv].name)), &("f_" + f))
+        let some = c.pg.variants[nv].index == idx
+        return if some == eq { c.x.pre("!", c.x.pre("!", p)) } else { c.x.pre("!", p) }
+    }
+    return c.x.bin(if eq { "==" } else { "!=" }, c.x.member(acc, sep, "tag"), c.lit(idx))
+}
+
+// Whether t has a niche's shape (sema niche) but its box variant's field is a type parameter:
+// whether it is a niche depends on the instance (H_TAGIS, H_VINIT).
+fn (c: mut &Checker) nicheOpen(t: int): bool {
+    if c.pg.tk(t) != sema.TK_INST { return false }
+    let d = c.pg.ta(t)
+    if !c.pg.types[d].value || c.pg.types[d].form != sx.F_CLOSED || len(c.pg.types[d].variants) != 2 { return false }
+    var some = -1
+    var empty = 0
+    for v in c.pg.types[d].variants {
+        let n = len(c.pg.variants[v].fields)
+        if n == 1 { some = v } else if n == 0 { empty += 1 }
+    }
+    if some < 0 || empty != 1 { return false }
+    let env = c.pg.declEnv(t)
+    let ft = c.pg.subst(c.pg.variants[some].fields[0].ty, &env)
+    return c.pg.tk(ft) == sema.TK_TP
+}
+
+// The initializer of variant vr of the niche type t (sema niche, its box's variant nv) with the
+// field initializers its: the pointer, or a null one for the other variant. No tag.
+fn (c: mut &Checker) nicheInit(t: int, nv: int, vr: int, its: []int): int {
+    if vr == nv { return c.x.init([c.x.desig(&(".u.V_" + c.pg.variants[nv].name), c.x.init(its))]) }
+    let f = c.pg.variants[nv].fields[0].clone()
+    let env = c.pg.declEnv(t)
+    let ft = c.pg.subst(f.ty, &env)
+    let z = c.x.desig(&(".f_" + f.name), c.x.cast(c.T(ft), c.lit(0)))
+    return c.x.init([c.x.desig(&(".u.V_" + c.pg.variants[nv].name), c.x.init([z]))])
+}
+
 // Whether == and != on t compare tags: t is a closed type all of whose variants have no
 // fields, and it declares no eq method (an eq method wins).
 fn (c: mut &Checker) tagEq(t: int): bool {
@@ -4956,7 +5008,7 @@ fn (c: mut &Checker) xTry(e: int, exp: int): Val {
     let cv = c.consumeAs("try", v, n.line)
     c.emit(c.x.decl(ct, &sn, cv))
     let snn = c.nm(&sn)
-    c.emit(c.x.sif(c.x.bin("==", c.x.member(snn, &sep, "tag"), c.lit(c.pg.variants[a.er].index))))
+    c.emit(c.x.sif(c.tagIs(snn, &sep, t, c.pg.variants[a.er].index, true)))
     c.cx.ind += 1
     let en = c.fresh("e")
     let et = c.T(a.erT)
@@ -4999,6 +5051,11 @@ fn (c: mut &Checker) build(t: int, vr: int, cs: &[]int): int {
         for i in 0..m { append(mut &its, c.x.desig(&(".f_" + names[i]), cs[i])) }
         let ct = c.T(t)
         if vr >= 0 {
+            if c.nicheOpen(t) {
+                return c.x.par(c.x.clit(ct, c.hole(Hole{k: H_VINIT, t: t, f: vr, s: "", x: -1, r: -1, args: its})))
+            }
+            let nv = c.pg.niche(t)
+            if nv >= 0 { return c.x.par(c.x.clit(ct, c.nicheInit(t, nv, vr, its))) }
             let tag = c.x.desig(".tag", c.lit(c.pg.variants[vr].index))
             let u = c.x.desig(&(".u.V_" + c.pg.variants[vr].name), c.x.init(its))
             return c.x.par(c.x.clit(ct, c.x.init([tag, u])))
@@ -6785,6 +6842,8 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
                 let cc = c.constInit(args[i], ft)
                 append(mut &its, c.x.desig(&(".f_" + names[i]), cc))
             }
+            let nv = c.pg.niche(t)
+            if nv >= 0 { return c.nicheInit(t, nv, vr, its) }
             let tag = c.x.desig(".tag", c.lit(c.pg.variants[vr].index))
             return c.x.init([tag, c.x.desig(&(".u.V_" + c.pg.variants[vr].name), c.x.init(its))])
         }
