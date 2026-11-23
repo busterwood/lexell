@@ -149,27 +149,25 @@ If one is added, it will be a separate, opt-in accessor.
 
 `lexell/bench/dbstream/run.py`: 1,000,000 rows of (bigint, int, text,
 decimal(12,2)), every value decoded into an `Order` and folded into a
-checksum, a buffer of 1,024 rows, peak RSS of the process (VmHWM), the least
-of 5 interleaved runs pinned to one CPU, the servers on the same machine.
+checksum, a buffer of 1,024 rows, built with the native backend. Peak RSS of
+the process (VmHWM), the least of 5 interleaved runs pinned to one CPU, the
+servers on the same machine.
 Last measured on 2026-11-07 at `b6777cf4`. The checksums were equal for
-every client, backend and mode.
+every client and mode.
 
-| client | backend | streamed 100,000 | streamed 1,000,000 | buffered 1,000,000 |
-|---|---|---:|---:|---:|
-| SQL Server | native | 107 ms, 12.1 MB | 417 ms, 12.0 MB | 1,068 ms, 365.8 MB |
-| SQL Server | C | 114 ms, 11.5 MB | 479 ms, 11.5 MB | 1,279 ms, 364.9 MB |
-| PostgreSQL | native | 43 ms, 9.2 MB | 388 ms, 9.4 MB | 763 ms, 91.0 MB |
-| PostgreSQL | C | 51 ms, 8.2 MB | 453 ms, 8.3 MB | 901 ms, 88.7 MB |
-| Oracle | native | 84 ms, 13.6 MB | 473 ms, 13.6 MB | 630 ms, 111.6 MB |
-| Oracle | C | 84 ms, 13.7 MB | 451 ms, 14.0 MB | 671 ms, 110.9 MB |
+| client | streamed 100,000 | streamed 1,000,000 | buffered 1,000,000 |
+|---|---:|---:|---:|
+| SQL Server | 107 ms, 12.1 MB | 417 ms, 12.0 MB | 1,068 ms, 365.8 MB |
+| PostgreSQL | 43 ms, 9.2 MB | 388 ms, 9.4 MB | 763 ms, 91.0 MB |
+| Oracle | 84 ms, 13.6 MB | 473 ms, 13.6 MB | 630 ms, 111.6 MB |
 
-- **Memory stays flat while streaming**: 8 to 14 MB at both 100,000 and
+- **Memory stays flat while streaming**: 9 to 14 MB at both 100,000 and
   1,000,000 rows, which is the program, its buffer and the client's current
   batch. A buffered query grows with the result: 91 MB for PostgreSQL (the
   whole reply), 111 MB for Oracle (each value's bytes) and 365 MB for SQL
   Server (a decoded cell per value).
-- **Streaming is faster everywhere**: 2.6 to 2.7 times for SQL Server, 2.0
-  times for PostgreSQL and 1.3 to 1.5 times for Oracle.
+- **Streaming is faster everywhere**: 2.6 times for SQL Server, 2.0 times
+  for PostgreSQL and 1.3 times for Oracle.
 
 **Round trips.** Latency matters most to a stream that needs many round
 trips, so each client keeps them few:
