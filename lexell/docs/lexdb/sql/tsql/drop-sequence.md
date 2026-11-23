@@ -62,7 +62,7 @@ SELECT * FROM dbo.t;
 ```
 
 ```text
-Msg 208, Level 16, State 1, Line 1
+Msg 208, Level 16, State 1, Line 4
 Invalid object name 'ticket'.
 ```
 
