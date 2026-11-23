@@ -83,14 +83,14 @@ slices go through the stack frame where Rust keeps them in registers
 
 Go's `regexp` is the reference because Lexell's regex library is a port of it (`lib/regex.lxl`), with the same algorithms and semantics. Rust's `regex` crate is the other mature engine, and the one ripgrep uses.
 
-Lexell's regex is deliberately much smaller than Rust's. Counting lines of code (no
-comments, blank lines or generated Unicode tables), `regex.lxl`, `regex_syntax.lxl` and
-`regex_dfa.lxl` are 5,800 lines. The Rust `regex` crate with `regex-syntax` and
-`regex-automata` is 50,500 (its inline unit tests included), and its default
-`perf-literal` feature adds `aho-corasick` and `memchr`, another 20,800. Rust spends
-the extra code on SIMD literal search and more engines. Lexell keeps Go's machines (the
-Pike VM, the one-pass matcher and the bounded backtracker) and adds a lazy DFA and
-literal prefilters after RE2's, in about a twelfth of the size.
+Lexell's regex is deliberately much smaller than Rust's. Lines of code, without
+comments, blank lines or generated Unicode tables:
+
+| implementation | lines of code |
+|---|---:|
+| Lexell (`regex.lxl`, `regex_syntax.lxl`, `regex_dfa.lxl`) | 5,783 |
+| Rust `regex` 1.12.3, `regex-syntax` 0.8.10, `regex-automata` 0.4.14 (inline unit tests included) | 50,536 |
+| `aho-corasick` and `memchr`, used by `regex` by default for literal search | 20,770 |
 
 `bench/regex/bench.py`, a 3.2 MB corpus; match counts agree across Lexell,
 Go, Rust and ripgrep. Times are as the script prints them, best of 5 runs of 5
