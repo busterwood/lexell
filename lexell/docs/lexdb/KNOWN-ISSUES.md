@@ -371,6 +371,28 @@ smaller differences of its statement.
     be first in its batch (111).
   - `ALTER SCHEMA hr TRANSFER dbo.t` is 50000: an object cannot move to another schema.
   - `DROP SCHEMA` of a schema with objects is 50000 (SQL Server: 3729), of a missing one 50000 (3701).
+- **Security, ALTER DATABASE, SET and system procedures** (found writing those T-SQL pages):
+  - Role membership: `ALTER ROLE r ADD MEMBER u` is 102, `sp_addrolemember` 2812, `sys.database_role_members` 208
+    (PostgreSQL's `GRANT r TO u` works). The fixed database roles do not exist: `IS_MEMBER('db_owner')` is 0 for sa.
+  - `CREATE USER u WITHOUT LOGIN` / `FOR LOGIN l`, `CREATE ROLE r AUTHORIZATION dbo`, `ALTER USER u WITH
+    DEFAULT_SCHEMA = ...` and `ALTER ROLE r WITH NAME = ...` are 102. A user made by `CREATE USER` is listed as a
+    `SQL_USER` and as a `SQL_LOGIN`.
+  - `DROP USER` / `DROP ROLE` of a missing name is 50000 (SQL Server: 15151); a role with members can be dropped
+    (15144).
+  - Refused, with the whole batch: column privileges, `WITH GRANT OPTION`, `REVOKE GRANT OPTION FOR`, `ON SCHEMA::`
+    (50000), `GRANT CREATE TABLE` (156), `DENY` (102). `EXECUTE AS USER` is 2812 and `SETUSER` 102.
+  - `ALTER DATABASE` inside a transaction is 226, which ends the batch and leaves the transaction open. After `SET
+    RECOVERY SIMPLE`, `DATABASEPROPERTYEX(..., 'Recovery')` still says FULL (`sys.databases` says SIMPLE). `MODIFY
+    NAME`, `COLLATE` and `CREATE DATABASE` are 50000; `DROP DATABASE` is 102.
+  - SET options: `SET STATISTICS IO ON` (and `TIME`, `XML`) is 156; `SET BOGUS ON` is accepted; `NOEXEC`,
+    `PARSEONLY` and the `SHOWPLAN` options still run the statements; `SET DATEFIRST` and `SET LOCK_TIMEOUT` change
+    neither `@@DATEFIRST` nor `@@LOCK_TIMEOUT`; `ANSI_NULLS OFF` and `CONCAT_NULL_YIELDS_NULL OFF` have no effect;
+    `SET ROWCOUNT` limits `SELECT` only; `SET QUOTED_IDENTIFIER OFF` applies from the next batch; `@@OPTIONS` is 195;
+    `CONTEXT_INFO()` stays NULL after `SET CONTEXT_INFO`; `SET DATEFORMAT dmy` does not make `'01/02/2026'` readable
+    (241).
+  - `sp_help`, `sp_helpdb`, `sp_who`, `sp_spaceused`, `sp_configure` and `sp_server_info` are 2812; in a batch,
+    `EXEC sp_prepare` and its family are 2812 (they work over RPC); `sp_datatype_info 4` returns every row;
+    `xp_msver` shows the real machine's processor count and memory.
 
 
 ## Oracle door
