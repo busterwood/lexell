@@ -1,12 +1,12 @@
 # Lexell
 
-Lexell is a small, straightforward language for command-line tools and database-backed services. It writes Linux executables directly, checks ownership and borrowing at compile time, and has a built-in decimal type.
+Lexell is a small, straightforward language for command-line tools and database-backed services. It writes Linux executables directly, checks ownership and borrowing at compile time, and has a built-in decimal type. Servers handle thousands of connections as cooperative tasks, written as plain sequential code, with no threads, locks or `async`.
 
 I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The compiler is about 3 MB and rebuilds itself in about 0.48 seconds. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
 
 **In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
 
-[Performance](#performance) · [Quick start](#quick-start) · [LexDB](#lexdb) · [Why I built Lexell](#why-i-built-lexell) · [Documentation](#documentation)
+[Performance](#performance) · [Concurrency](#concurrency-without-threads-or-locks) · [Quick start](#quick-start) · [LexDB](#lexdb) · [Why I built Lexell](#why-i-built-lexell) · [Documentation](#documentation)
 
 ## Performance
 
@@ -16,6 +16,61 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 - **Decimal.** Against Java `BigDecimal`, Lexell parses 38-digit values 4.6 times faster and formats them 3.3 times faster, multiplies 19-digit values 1.5 times faster, and adds 1.1 to 1.35 times faster. Against .NET `System.Decimal`, it divides 4.4 times faster, parses 2.7 times faster, formats 1.7 times faster, compares 1.6 times faster and multiplies 1.2 times faster. Java is ahead on division and comparison, and .NET slightly ahead on 19-digit addition.
 
 The [performance report](PERFORMANCE.md) gives the full results, workload definitions and reproduction commands. These measurements come from one AMD Ryzen 7 8745HS machine running Linux 7.2 (not WSL2), on 22 November 2026.
+
+## Concurrency without threads or locks
+
+A Lexell server runs each connection as a lightweight task on one thread, and you write the handler as plain sequential code. When a task waits for a socket, a database reply or a timer, it parks, and the event loop runs another task until the reply arrives. There is no `async` or `await` to write, and a function that waits looks like any other function.
+
+Only one task runs at a time, and a task can only be switched out where it waits. Code between two waits cannot be interrupted, so there are no data races and nothing to lock: no mutexes, no atomics, no lock ordering. To use more cores, run several worker processes, as nginx does. Each has its own event loop, memory and connections, and they share nothing, so there is still nothing to lock. `task.workers` starts them, restarts any that crash and stops them together.
+
+```lexell
+import "httpserver" as http
+import "net"
+import "postgres"
+import "task"
+
+type App = value record { db: postgres.Pool }
+
+// Reads as blocking code. Waiting for a pooled connection or for the reply
+// parks this request's task; the event loop serves other requests meanwhile.
+fn count(db: &postgres.Pool): Result[int, postgres.Error] {
+    var c = try db.acquire()
+    let rows = try c.conn().query("SELECT count(*) FROM orders", &[])
+    return rows.int(0, 0)
+}
+
+fn orders(app: &App, rq: mut &http.Request, w: mut &http.Response): Result[Unit, http.Error] {
+    match count(&app.db) {
+        Ok(n) { return w.text(&("orders: " + n.toStr() + "\n")) }
+        Err(e) {
+            w.status(503)
+            return w.text(&(e.toStr() + "\n"))
+        }
+    }
+}
+
+fn main() {
+    // Four processes, one per core, each with its own event loop, listener and
+    // connection pool. They share nothing, so nothing needs a lock.
+    let ends = task.workers(4, fn(i: int) {
+        let ln = net.listenReusePort("127.0.0.1:8080").unwrap()
+        let db = postgres.newPool("host=/tmp port=5433 dbname=lexdb", 8).unwrap()
+        var r = http.router[App]()
+        r.handle("GET /orders", orders)
+        http.serve(ln, App{db: db}, r, http.defaults()).unwrap()
+    })
+}
+```
+
+The same design runs through the library and LexDB:
+
+- **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` on one core, with a p99 latency of 0.59 ms against Go's 3.0 ms at 100 clients.
+- **Database clients.** The PostgreSQL, SQL Server, Oracle and Redis clients speak their wire protocols on the event loop, so a query parks only the task that sent it, and their connection pools hand out connections the same way. SQLite has only a blocking C API, so its calls run on a helper thread, which runs only C code, while the task waits.
+- **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. Read-only replicas are separate processes that follow the master's log, the same way LexDB uses more cores.
+
+The event loop uses io_uring for sockets and files by default, where the kernel allows it. On older kernels, and in containers that block io_uring, it falls back to epoll and a pool of helper threads for file I/O, with no change to your code and little loss: in LexDB's measurements the fallback kept about seven-eighths of io_uring's select rate and matched it on updates.
+
+The [concurrency design](lexell/design/concurrency.md) explains the choices, what they cost and what is given up.
 
 ## Quick start
 
@@ -49,7 +104,7 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 ## LexDB
 
-LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It keeps its data on disk and speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
+LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
 
 For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
 
