@@ -1,0 +1,84 @@
+// lexdb_tns: SYS_CONTEXT('USERENV', 'NETWORK_PROTOCOL') says the protocol of the
+// connect string's ADDRESS, as Oracle's does: tcps on a TLS connection (the
+// TCPS listener, --tcps), tcp on a plain one (design/lexdb-oracle.md
+// 22). Lexell's Oracle client over both, the test certificate
+// trusted; in a query, in a WHERE, through PL/SQL.
+// expect: tcps: 'tcps'
+// expect: tcps where: 1
+// expect: tcps PL/SQL: 'tcps'
+// expect: tcp: 'tcp'
+// expect: tcp after tcps: 'tcp'
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../lib/tests/support/tlstest"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tns"
+
+fn first(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(r) {
+            if r.rowCount() == 0 { return "no rows" }
+            match r.value(0, 0) {
+                Ok(v) { return v.toStr() }
+                Err(e) { return "error " + e.code.toStr() }
+            }
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            return oracle.connect(&(s.toStr())).unwrap()
+        }
+    }
+}
+
+fn client(tcps: &str, tcp: &str) {
+    var s = connect(&("User Id=sa;Password=sa;Data Source=tcps://127.0.0.1:" + tcps + "/lexdb;TrustServerCertificate=yes"))
+    println("tcps: " + first(mut &s, "select sys_context('USERENV', 'NETWORK_PROTOCOL') from dual"))
+    println("tcps where: " + first(mut &s, "select count(*) from dual where sys_context('userenv', 'network_protocol') = 'tcps'"))
+    s.exec("create table np (p varchar2(10))").unwrap()
+    s.exec("begin insert into np values (sys_context('USERENV', 'NETWORK_PROTOCOL')); end;").unwrap()
+    println("tcps PL/SQL: " + first(mut &s, "select p from np"))
+    var p = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + tcp + "/lexdb"))
+    println("tcp: " + first(mut &p, "select sys_context('USERENV', 'NETWORK_PROTOCOL') from dual"))
+    s.logoff()
+    var p2 = connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + tcp + "/lexdb"))
+    println("tcp after tcps: " + first(mut &p2, "select sys_context('USERENV', 'NETWORK_PROTOCOL') from dual"))
+    p.logoff()
+    p2.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln1 = net.listen("127.0.0.1:0").unwrap()
+        let a1 = ln1.localAddr()
+        let ln2 = net.listen("127.0.0.1:0").unwrap()
+        let a2 = ln2.localAddr()
+        var conf = lexdb_wire.noAuth()
+        conf.cert = tlstest.path("srv.pem")
+        conf.key = tlstest.path("srv.key")
+        lexdb_wire.configure(&st, &conf).unwrap()
+        let f1 = s.start(lexdb_tns.acceptAllTls, lexdb_tns.ListenArg{lns: [ln1], st: st.share()})
+        let f2 = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln2, st: st.share()})
+        client(&a1[10..len(a1)], &a2[10..len(a2)])
+        { let stop = f1 }
+        { let stop = f2 }
+    })
+    return 0
+}
+
+fn main() {
+    tlstest.pki()
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
