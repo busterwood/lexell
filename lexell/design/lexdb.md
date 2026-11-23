@@ -8003,7 +8003,9 @@ through the log, checkpoints and the cache like any.
   master's drops. A replica refuses to make temporary objects, as it
   refuses any write (25006): its sessions have none, so none of the
   master's is on their path, `pg_temp_N.t` is 0A000 there, and catalog
-  scans leave them out. DISCARD TEMP there drops nothing.
+  scans leave them out. DISCARD TEMP there drops nothing. (Since 9.137
+  phase 5 the SQL Server door's #temporary tables and table variables are
+  allowed on a replica, kept in its memory, never logged.)
 
 **Catalog contention: temporary DDL does not disturb other sessions.**
 DDL bumps the catalog's version, one row (`CAT_VERSION`). Statements read
@@ -12601,7 +12603,8 @@ Replicas on other machines stay parked.
   (ORA-16000).
 
 The last two need a session's temporary rows on the replica to live outside the store's log, because the replica
-has no writable tree. That is phase 5 below.
+has no writable tree. That is phase 5 below. Built for the SQL Server door; lexdb has no global temporary table
+whose definition the master shares, so the Oracle door's part is the refusal alone (phase 5 as built, at the end).
 
 **WAIT FOR LSN** (PostgreSQL 19, lexdb-new-features.md P4). PostgreSQL 19.0's grammar and errors, checked on
 `lxl-pg19` on a primary and on the standby:
@@ -12725,7 +12728,7 @@ What was built is below.
   - A replica's sessions see READ_ONLY from DATABASEPROPERTYEX by the process flag; an in-process test with a
     master and a replica therefore sees READ_ONLY on both, and `replica_doors` checks `sys.databases` for routing.
 
-**Phase 5, not built: temporary objects on a replica.** Temporary tables are catalog rows and trees in the store,
+**Phase 5, the plan (built: "As built (phase 5)" below): temporary objects on a replica.** Temporary tables are catalog rows and trees in the store,
 logged like any (9.96), and a replica's store has no writable tree. So the T-SQL door's `#temp` tables and table
 variables, and Oracle DML on a global temporary table, need storage on the replica that never reaches the log. The
 plan:
@@ -12743,7 +12746,8 @@ plan:
    PostgreSQL refusal), and replica.py's supervised doors.
 
 Size: about two days. It is a storage-layer change, near the store work the user parked (2026-11-15), so it is left
-for the user to schedule.
+for the user to schedule. (The user scheduled it on 2026-11-23, as a feature beside the store, not the parked
+rewrite.)
 
 **Measured** (base 282d828c and the branch, both `-O`, the base built from its own `lib`):
 - **Point statements in process**: `LXL_HASH_SEED=1`, 20,000 prepared statements, instructions per statement, two
@@ -12758,3 +12762,113 @@ for the user to schedule.
   (0.997), and the checksums are equal on all 22. q5, q14, q15 and q20 were 2.2 to 3.2% slower in time, but their
   server instructions are equal to 0.01% (`iq.sh`: q15 2,632.7M against 2,632.8M), so that is code placement.
 - **lexdb_exec** grew from 20,446 to 20,464 lines.
+
+**As built (phase 5, temporary objects on a replica; branch from main 558f39f4).** The user's decisions
+(2026-11-23): the PostgreSQL door refuses temporary tables (25006, as a standby); the SQL Server door allows
+`#temp` tables, `SELECT ... INTO #x` and table variables, as a readable secondary does; the Oracle door allows DML
+on a global temporary table the master defined and refuses `CREATE GLOBAL TEMPORARY TABLE` (ORA-16000). It is a
+feature beside the store: nothing in the store's layout, the follower or the log changed.
+- **The products** (2026-11-23):
+  - SQL Server 2022 (`lxl-mssql`) and 2025 (`lxl-mssql25`): in a database set `READ_ONLY` (the nearest a container
+    comes to a readable secondary), `replica_temp`'s 59 batches (two sessions') of `#temp` tables with indexes,
+    identity and text keys, joins with the read-only tables, `SELECT ... INTO #x`, table variables, MERGE, TRUNCATE, ALTER, DROP, a
+    rollback, a savepoint and the errors (2627, 8134, 208; 3906 for the read-only tables) give the answers lexdb's
+    replica gives, on both versions. One difference was in the batch, not the replica: `ALTER TABLE #b ADD c` and
+    an INSERT naming `c` in one batch is 207 on SQL Server (the batch is compiled before the ALTER runs) and runs
+    on lexdb, on a master too; the test has them in two batches.
+  - Oracle 23.26.3 (`lxl-oracle`), FREEPDB1 opened READ ONLY: INSERT into a global temporary table, ON COMMIT
+    DELETE ROWS or PRESERVE ROWS, is ORA-16000, and so is `CREATE GLOBAL TEMPORARY TABLE`; a SELECT of one works.
+    That is a read-only PDB, not a standby. From Oracle's documentation (Data Guard Concepts and Administration,
+    "DML Operations on Temporary Tables on Oracle Active Data Guard Instances"): from 12c an Active Data Guard
+    standby allows DML on global temporary tables, its undo kept in the temporary tablespace
+    (`TEMP_UNDO_ENABLED`, on for a standby), while DDL, a GTT's creation among it, is ORA-16000 there as on a
+    read-only database.
+- **The store** (new core module `lexdb_tmpstore`, 295 lines; a section of `lexdb_store`, about 200 lines, which
+  needs the store's own `Txn`, `TxWrite` and `Entry`):
+  - `lexdb_tmpstore.Tmps`, kept in the follower's state (`Fol.tmp`; so the master has none): local trees, numbered from
+    `LOCAL_BASE` (2^30; the catalog keeps a tree's id in 32 bits, and the master's trees count up from 1), and per
+    temporary schema its catalog rows (the keys `lexdb_base.tempCatKey` gives as that schema's). Each is a sorted
+    map in runs of at most 512 keys (a binary search over the runs and one in the run; a put moves at most a run).
+    Values are kept whole, as a transaction's own writes are: no chunks for large values. One lock for all
+    sessions.
+  - Reads: the Repl arms of `getBaseIn`, `scanIn` and `scanBackIn` (every replica read reaches one of the three:
+    `getMany`, `countRange`, `scanLeaves` and `scanRanges` go through them on a replica) test `len(t.tmp) > 0`, the
+    session having a temporary schema, and only then call `tmpGet` / `tmpScan`. A session with none costs that
+    test. `tmpScan` merges, in key order either way, the transaction's own writes and range deletes, the
+    storage's entries (a chunk of 256 at a time, so f may use the store), and the follower's (none for a local
+    tree; for the catalog without the schema's rows). Other trees go to the follower as before.
+  - **The master's session of the same number.** Session numbers are per store, and the replica's catalog is the
+    master's: the master's session 3's `pg_temp_3` rows are in it. So a replica session's own schema's catalog rows
+    come from its storage alone (a get of one does not read the follower, a scan leaves the follower's out), and
+    before the session has a temporary schema a `#name` is looked up in `pg_temp_0`, which no session has
+    (`lexdb_exec.tempSess`). Before this a replica's T-SQL session could read the master's same-numbered session's
+    `#temp` table.
+  - Writes: `createTree` is unchanged: a replica's Db, whose trees are otherwise unused, counts its tree ids
+    from `LOCAL_BASE` (`openReplicaIn`). A replica transaction ends in `repEnd`, which after its snapshot tests
+    `len(t.tmp) > 0`: a session with a temporary schema goes to `tmpFinish`, which releases its row locks (a
+    block's UPDATE and DELETE of a `#temp` table take them) and applies its writes to the storage when every one
+    is to a local tree or a put or delete of a catalog row of the session's schema (`tmpCommit`): nothing logged,
+    nothing checked (no other session reads them). Any other write fails as before (25006, which the doors give
+    as 3906 and ORA-16000).
+  - The hot functions (`getBaseIn`, `scanIn`, `scanBackIn`) have one line each in their Repl arm; `commit`,
+    `commitAhead` and `createTree` are as on main. A first version tested `t.tmp` in `commit`'s replica branch and
+    in `createTree`: equal instructions over the wire, 2% more cycles and 10% more branch misses (placement).
+  - Savepoints, ROLLBACK and a statement's own writes are the transaction's (`Txn.writes`), as on the master.
+- **Exec** (`lexdb_exec` 20,567 to 20,586 lines; `lexdb_standby` +31):
+  - `execStmt`'s replica refusal lets through, in the SQL Server door, CREATE TABLE (and SELECT INTO), DROP,
+    INSERT, UPDATE, DELETE, MERGE, TRUNCATE, ALTER TABLE and CREATE INDEX whose tables are all `#name`s (table
+    variables are `#tv_name`: `lexdb_standby.mayWrite`). A write they make to anything else fails at the commit.
+  - A temporary sequence (an identity column of a `#temp` table) on a replica keeps its values in the memo only
+    (`tmpSeqOnReplica`): the sequences' tree is the master's.
+  - `Session.close` on a replica drops the session's storage whole (`Store.dropTmp`), after the TDS door's own
+    drops; RESETCONNECTION's new session starts with none.
+  - The PostgreSQL door: CREATE TEMP TABLE, `SELECT INTO TEMP`, CREATE TEMP TABLE AS, `pg_temp.t`, CREATE TEMP
+    SEQUENCE, in a block or not: 25006, as before.
+  - The Oracle door: **no global temporary table comes from the master**, so nothing is allowed. lexdb's CREATE
+    GLOBAL TEMPORARY TABLE makes a session's own temporary table, as PostgreSQL's does (9.96), gone at its
+    session's end; no other session sees its definition, on the master or on a replica. DML on an Oracle-style
+    GTT needs that GTT first: a definition in the master's catalog that every session sees, with each session's
+    rows its own (ON COMMIT DELETE or PRESERVE ROWS), on the master as on a replica. That is a feature of the
+    master's Oracle door (its catalog row, the lookup of a GTT's trees per session, ALL_TABLES' TEMPORARY and
+    DURATION, the DDL rules such as ORA-14452), not of the replica, and is not built. Once it is, a replica
+    session's rows of one would be local trees here, made at its first write. `CREATE GLOBAL TEMPORARY TABLE` on a
+    replica is ORA-16000, as before.
+- **Tests**:
+  - `replica_temp` (new): session A's batches run in two replica sessions at once, one with `lexdb_batch` off and
+    one on, compared ("same"); the expect lines are SQL Server 2022's (`LEXDB_MSSQL`; 2025 gives the same). A
+    second session does not see A's `#a` and makes its own; the master's session of A's number has a `#m` that A
+    does not see; the master commits while the sessions hold temporary rows and the replica, polled, joins the new
+    row with A's kept rows; the storage empties as the sessions end. The batches cover 1,500 rows (several runs
+    and scan chunks), a 100,000-character value, range deletes, backward scans and the transaction's own writes
+    over the storage.
+  - `replica_doors`: the PostgreSQL door's refusals of each temporary form; the TDS door's `#x`, a table variable
+    and `SELECT INTO #y` joined with the replicated `t` (and an INSERT from `#x` into `t` still 3906); the TNS
+    door's CREATE GLOBAL TEMPORARY TABLE ORA-16000 both ways, and the master's session's GTT not there (942).
+  - `replica.py`: every round a `#temporary` copy of t joined back to it through the hand replica's TDS door; the
+    supervised replicas' TDS door makes a `#temp` table with an index, a table variable and `SELECT INTO #y`, and
+    their TNS door refuses CREATE GLOBAL TEMPORARY TABLE.
+- **Not done**:
+  - Oracle global temporary tables whose definition the master shares (above).
+  - UPDATE STATISTICS on a `#temp` table on a replica is 3906 (S_ANALYZE is not let through).
+  - A table variable whose batch ended in an error stays until its name is declared again, as on the master
+    (`lexdb_tsqlparse.tableVariables`); on a replica its tree is in the storage until then or the session's end.
+- **Measured** (base 558f39f4 and the branch, both `-O`):
+  - In process, `LXL_HASH_SEED=1`, 20,000 statements, instructions per statement, two rounds alternated: the
+    master's point select 123,966.2 against 123,966.2 (both rounds), INSERT 55,118,174.6 against 55,118,174.5 and
+    .6, UPDATE by key 55,138,480.1-.2 against 55,138,480.1-.2: equal. A replica's point select (a master and a
+    replica store in one process, the replica's session with no temporary objects): 130,443.1 against 130,469.1
+    and 130,469.2, +26 (0.02%): the `len(t.tmp) > 0` test in the three Repl arms (+20; without them +6) and in
+    `repEnd` (+4 to +6, whichever shape it took).
+  - On the way: a second field in `Follower` (the storage's handle beside the follower's) made every
+    `st.follower()` dearer: the master's select +12, INSERT and UPDATE +34, a replica's select +200. The handle
+    is in the follower's state now.
+  - Over the wire (`icount6.sh`, points.sql 3 times, base and branch alternated twice): with `LXL_HASH_SEED=1`
+    on the server, instructions 173,183 / 173,185 against 173,189 / 173,211, cycles 101,839 / 102,019 against
+    100,497 / 99,998; without, 173,126 / 173,186 against 173,308 / 173,096 (the spread of an unseeded run),
+    cycles 104,322 / 102,900 against 102,932 / 99,875. Branch misses 377-385 against 395-399 a statement, L1
+    i-cache 349-357 against 359-362, iTLB 112-114 against 139-142: placement; the cycles are lower.
+  - TPC-H SF1 (`~/tpch-w/tp`, base and branch alternated twice, best of each): 8,965 ms against 8,903 (0.993),
+    the checksums equal on all 22. q6, q14 and q15 were 1.6 to 3.2% slower in time at equal server instructions
+    (`iq.sh`, two runs each: q15 2,639.29M / 2,639.24M against 2,639.19M / 2,639.03M; q6 1,581.3M and q14
+    1,092.1M both): placement.
+  - The suite: 329 tests pass; `replica.py` (12 rounds and the supervised form) passes.

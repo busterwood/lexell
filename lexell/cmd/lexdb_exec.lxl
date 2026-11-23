@@ -781,13 +781,22 @@ fn isTempName(n: &str): bool { return len(n) > 1 && n[0] == '#' && n[1] != '#' }
 
 fn tempKey(sess: int, n: &str): str { return lexdb_sql.qual(&lexdb_catalog.tmpName(sess), n) }
 
+// The session number #name is looked up under: the session's; on a replica
+// before the session has a temporary schema, 0, which none has: the
+// replica's catalog is the master's, whose session of the same number is
+// another (9.137 phase 5).
+fn tempSess(st: &lexdb_store.Store, txn: &lexdb_store.Txn): int {
+    if len(txn.tmp) == 0 && st.follower().isSome() { return 0 }
+    return txn.sql.sess
+}
+
 // The catalog key of a table (idx false) or an index named n: n if it is
 // qualified or the path is public's; else the first schema on the path
 // holding it, or none: the schema new names would go in (it is not there).
 // pg_temp is the session's temporary schema; another session's is refused
 // (9.96).
 fn catKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, idx: bool): Result[str, DbErr] {
-    if isTempName(n) { return Ok(tempKey(txn.sql.sess, n)) }
+    if isTempName(n) { return Ok(tempKey(tempSess(st, txn), n)) }
     let q = lexdb_sql.isQual(n)
     if q && n[0] == 'p' { return tmpQual(st, txn, n) }
     if len(txn.sql.path) == 0 || q { return Ok(n.clone()) }
@@ -12166,8 +12175,11 @@ pub fn (s: mut &Session) close() {
     }
     lexdb_stats.chgEnd(&s.st, s.id, false)
     s.failed = false
-    // its temporary objects (9.96); should this fail, the next start drops them
-    if len(s.tmp) > 0 { let r = s.dropTemps() }
+    // its temporary objects (9.96); should this fail, the next start drops them. A
+    // replica's are in its temporary storage, dropped whole (9.137 phase 5)
+    if len(s.tmp) > 0 {
+        if s.st.follower().isSome() { s.st.dropTmp(&s.tmp) } else { let r = s.dropTemps() }
+    }
     advRelease(&s.st, s.id, true)
     s.st.memo.del(&collKey(s.id))
     s.st.memo.del(&identKey(s.id))
@@ -12415,7 +12427,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     if st.follower().isSome() {
         match writesOn(s) {
-            Some(what) { return Err(lexdb_standby.readOnlyErr(&st.memo.get(&lexdb_priv.doorKey(txn.sql.sess)).unwrapOr(""), &what)) }
+            Some(what) { try lexdb_standby.mayWrite(&st.memo.get(&lexdb_priv.doorKey(txn.sql.sess)).unwrapOr(""), s, &what) }
             None {}
         }
     }
@@ -14272,6 +14284,7 @@ fn seqLock(st: &lexdb_store.Store, d: &Seq) {
 // Writes v as sequence d's last durable value, in a transaction of its own,
 // not waiting for the disk: a commit using its values waits for it too.
 fn seqWrite(st: &lexdb_store.Store, d: &Seq, v: int): Result[Unit, DbErr] {
+    if tmpSeqOnReplica(st, d) { return Ok(Unit{}) }
     var t = lexdb_store.begin()
     let tree = try seqTree(st, mut &t)
     try t.put(tree, &d.id, &(v.toStr()))
@@ -14993,9 +15006,15 @@ fn seqText(k: &str): str {
 fn dropSeqRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq): Result[Unit, DbErr] {
     txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.seqRow(&d.key)))
     lexdb_priv.dropAcl(txn, &lexdb_catalog.relObj(&d.key))
-    txn.del(try seqTree(st, txn), &d.id)
+    if !tmpSeqOnReplica(st, d) { txn.del(try seqTree(st, txn), &d.id) }
     return Ok(Unit{})
 }
+
+// A temporary sequence (its id "t" and its session's number) on a replica
+// (a #temporary table's identity column, 9.137 phase 5): its values are in
+// the memo alone, never written (a replica writes no tree, and the sequence
+// goes with its session).
+fn tmpSeqOnReplica(st: &lexdb_store.Store, d: &Seq): bool { return len(d.id) > 0 && d.id[0] == 't' && st.follower().isSome() }
 
 // DROP SEQUENCE: refused while it is a column's (its default), unless
 // CASCADE, which takes the column's default away.

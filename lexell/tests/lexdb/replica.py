@@ -14,7 +14,7 @@ by many checkpoints. Through psql:
 - the replica refuses writes (25006) and goes on; it serves the SQL Server and Oracle
   doors too (--tds, --tns; design/lexdb.md 9.137), where every round a write is refused
   with 3906 and ORA-16000 and t's rows are the master's (through doorsql.lxl, Lexell's
-  own clients);
+  own clients), and a #temporary table of t's rows joins back to all of them;
 - the replica is killed (SIGKILL) during a round's writes every third round
   and started again: the master goes on, and the new replica catches up;
 - the master is killed (SIGKILL) at round R/2: the replica must stop by
@@ -23,7 +23,8 @@ by many checkpoints. Through psql:
 
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
-(3906, ORA-16000, v$database's role); libpq with a host list picks the master or a
+(3906, ORA-16000, v$database's role), #temporary tables, SELECT INTO #y and table
+variables work there and CREATE GLOBAL TEMPORARY TABLE is ORA-16000; libpq with a host list picks the master or a
 replica by target_session_attrs; the master routes ApplicationIntent=ReadOnly logins
 and CONNECTs to the read-only service (lexdb_ro, freepdb1_ro) to a replica; the
 master (a worker) killed with SIGKILL is
@@ -239,9 +240,21 @@ def doors_checked(mport, rport, tport, oport, want, fail):
     got = door('tds', tport + 1, 'insert into s values (-1, -1)')
     if not got.startswith('error 3906: Failed to update database "lexdb" because the database is read-only.'):
         fail('supervised: a write through a replica\'s TDS door: %s' % got)
+    # temporary tables and table variables on a replica, as a readable secondary's tempdb (9.137 phase 5)
+    got = door('tds', tport + 1, 'create table #x (id int primary key, v int); create index xv on #x (v); '
+               'insert into #x select id, v from s where id <= 100; select count(*), sum(x.v) from #x x join s on s.id = x.id where x.v > 0')
+    if got != '100|5050':
+        fail('supervised: a #temporary table on a replica: %s' % got)
+    got = door('tds', tport + 1, 'declare @t table (a int primary key); insert into @t select id from s where id <= 10; '
+               'select id into #y from s where id > 4990; select (select count(*) from @t), (select count(*) from #y)')
+    if got != '10|%d' % (int(count) - 4990):
+        fail('supervised: a table variable and SELECT INTO #y on a replica: %s' % got)
     got = door('tns', oport + 1, 'select count(*) from s')
     if got != count:
         fail('supervised: the replicas\' TNS door gives %s, not %s' % (got, count))
+    got = door('tns', oport + 1, 'create global temporary table g (a number) on commit delete rows')
+    if not got.startswith('error 16000: ORA-16000'):
+        fail('supervised: CREATE GLOBAL TEMPORARY TABLE on a replica: %s' % got)
     got = door('tns', oport + 1, 'insert into s values (-1, -1)')
     if not got.startswith('error 16000: ORA-16000'):
         fail('supervised: a write through a replica\'s TNS door: %s' % got)
@@ -431,6 +444,11 @@ def main():
             want = psql(mport, 'select count(*) from t').stdout.strip()
             if got != want:
                 fail('round %d: the replica\'s %s door gives %s rows of t, the master %s' % (rnd, kind, got, want))
+            if kind == 'tds':
+                # a #temporary table of t's rows, joined back (9.137 phase 5)
+                got = door(kind, p, 'select id into #r from t; select count(*) from #r r join t on t.id = r.id')
+                if got != want:
+                    fail('round %d: a #temporary table on the replica gives %s rows, t has %s' % (rnd, got, want))
         if rnd == a.rounds // 2:
             master.kill()
             try:

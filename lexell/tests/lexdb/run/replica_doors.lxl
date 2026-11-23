@@ -6,12 +6,14 @@
 // - PostgreSQL: ParameterStatus in_hot_standby and
 //   default_transaction_read_only on (off on the master), SHOW
 //   transaction_read_only on, pg_is_in_recovery() true, writes and CREATE
-//   TEMP TABLE 25006;
+//   TEMP TABLE 25006, and every other temporary form (9.137 phase 5);
 // - SQL Server: writes and DDL 3906 "Failed to update database ... because
 //   the database is read-only.", DATABASEPROPERTYEX Updateability
-//   READ_ONLY, sys.databases.is_read_only 1;
+//   READ_ONLY, sys.databases.is_read_only 1; #temp tables, table variables
+//   and SELECT INTO #y work, joined with the replicated rows (phase 5);
 // - Oracle: DML, DDL, sequences ORA-16000, v$database READ ONLY WITH APPLY /
-//   PHYSICAL STANDBY (READ WRITE / PRIMARY on the master);
+//   PHYSICAL STANDBY (READ WRITE / PRIMARY on the master); CREATE GLOBAL
+//   TEMPORARY TABLE ORA-16000, the master session's own one not there (942);
 // and the rows read are the master's. Then WAIT FOR LSN (PostgreSQL 19): the
 // master's pg_current_wal_lsn() is the replica's pg_last_wal_replay_lsn()
 // once applied; a wait for a later LSN ends when a commit on the master is
@@ -29,20 +31,23 @@
 // expect: pg replica: in_hot_standby on, default_transaction_read_only on, show on, recovery t
 // expect: pg replica rows: 3
 // expect: pg replica writes: insert 25006, update 25006, create table 25006, temp table 25006, nextval 25006
+// expect: pg replica temporary: select into 25006, as 25006, pg_temp 25006, sequence 25006, in a block 25006
 // expect: pg replica after errors: 3
 // expect: tds replica rows: 3
 // expect: tds replica writes: insert 3906, update 3906, delete 3906, create table 3906, truncate 3906, create index 3906, select into 3906
 // expect: tds replica message: Failed to update database "lexdb" because the database is read-only.
 // expect: tds replica role: 'READ_ONLY' 1
+// expect: tds replica temporary:   1 NULL,2 'b',3 'c' 7 3, then t 3906
 // expect: tns master role: 'READ WRITE' 'PRIMARY'
 // expect: tns replica rows: 3
 // expect: tns replica writes: insert error 16000, update error 16000, delete error 16000, create table error 16000, create sequence error 16000, for update error 16000
 // expect: tns replica message: ORA-16000: Attempting to modify database or pluggable database that is open for read-only access.
 // expect: tns replica role: 'READ ONLY WITH APPLY' 'PHYSICAL STANDBY'
-// expect: lsn: master 0/00000005 replica 0/00000005, master's replay NULL, replica's current 55000
+// expect: tns replica gtt: create error 16000, preserve error 16000, the master's error 942
+// expect: lsn: master 0/00000007 replica 0/00000007, master's replay NULL, replica's current 55000
 // expect: wait applied: success, then rows 4
 // expect: wait reached: success success
-// expect: wait timeout: 57014 timed out while waiting for target LSN FFFF/00000000 to be replayed; current standby_replay LSN 0/00000006 / timeout / timeout
+// expect: wait timeout: 57014 timed out while waiting for target LSN FFFF/00000000 to be replayed; current standby_replay LSN 0/00000008 / timeout / timeout
 // expect: wait errors: 55000 22023 22023 22023 22P02 42601 42601 42601 42601 42601
 // expect: wait in a block: 55000
 // expect: wait on the master: 55000 recovery is not in progress / not in recovery / success / timeout
@@ -99,6 +104,12 @@ fn pgChecks(master: &str, replica: &str) {
     println("pg replica writes: insert " + pg1(mut &r, "insert into t values (9, 'no')") + ", update " + pg1(mut &r, "update t set name = 'x'") +
             ", create table " + pg1(mut &r, "create table z (a int)") + ", temp table " + pg1(mut &r, "create temp table tt (a int)") +
             ", nextval " + pg1(mut &r, "select nextval('q')"))
+    let b = pg1(mut &r, "begin")
+    let inBlock = pg1(mut &r, "create temp table tx (a int)")
+    let rb = pg1(mut &r, "rollback")
+    println("pg replica temporary: select into " + pg1(mut &r, "select 1 as a into temp tx") + ", as " + pg1(mut &r, "create temp table tx as select 1 as a") +
+            ", pg_temp " + pg1(mut &r, "create table pg_temp.tx (a int)") + ", sequence " + pg1(mut &r, "create temp sequence sx") +
+            ", in a block " + inBlock)
     println("pg replica after errors: " + pg1(mut &r, "select count(*) from t"))
 }
 
@@ -231,6 +242,12 @@ fn tdsChecks(replica: &str) {
     println("tds replica message: " + msMsg(mut &r, "insert into t values (9, 'no')"))
     println("tds replica role: " + ms1(mut &r, "select cast(databasepropertyex('lexdb', 'Updateability') as nvarchar(20)), " +
                                         "(select cast(is_read_only as int) from sys.databases where name = db_name())"))
+    // temporary tables and table variables are allowed, as a readable secondary's tempdb (9.137 phase 5; replica_temp has the rest)
+    println("tds replica temporary: " + ms1(mut &r, "create table #x (id int primary key, name nvarchar(10))") + " " +
+            ms1(mut &r, "insert into #x select id, name from t where id > 1") + " " +
+            ms1(mut &r, "select t.id, x.name from t left join #x x on x.id = t.id order by t.id") + " " +
+            ms1(mut &r, "declare @v table (a int); insert into @v values (7); select a from @v") + " " +
+            ms1(mut &r, "select id into #y from t; select count(*) from #y") + ", then t " + ms1(mut &r, "insert into t select * from #x"))
 }
 
 // ---- Oracle
@@ -278,6 +295,10 @@ fn tnsChecks(master: &str, replica: &str) {
             ", create sequence " + orRun(mut &r, "create sequence sq2") + ", for update " + or1(mut &r, "select id from t for update"))
     println("tns replica message: " + orMsg(mut &r, "insert into t values (9, 'no')"))
     println("tns replica role: " + or1(mut &r, "select open_mode, database_role from v$database"))
+    // a global temporary table: making one is DDL (ORA-16000); the master's (main's, of its session m) is that session's own
+    // (lexdb's CREATE GLOBAL TEMPORARY TABLE makes a session's temporary table, as PostgreSQL's): a replica has none
+    println("tns replica gtt: create " + orRun(mut &r, "create global temporary table g2 (a number) on commit delete rows") + ", preserve " +
+            orRun(mut &r, "create global temporary table g3 (a number) on commit preserve rows") + ", the master's " + or1(mut &r, "select count(*) from g"))
 }
 
 fn main() {
@@ -287,7 +308,8 @@ fn main() {
         lexdb_exec.bootstrap(&st).unwrap()
         lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
         var m = lexdb_exec.newSession(st.share())
-        for q in ["create table t (id int primary key, name text)", "insert into t values (1, 'a'), (2, 'b'), (3, 'c')", "create sequence q"] {
+        for q in ["create table t (id int primary key, name text)", "insert into t values (1, 'a'), (2, 'b'), (3, 'c')", "create sequence q",
+                  "create global temporary table g (a int) on commit preserve rows", "insert into g values (1)"] {
             let r = m.exec(&q).unwrap()
         }
         st.checkpoint().unwrap()
