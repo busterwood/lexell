@@ -26,7 +26,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [DELETE](delete.md) | Removes rows; `USING`, `RETURNING`, `WITH (batch_rows n)`. |
 | [MERGE](merge.md) | Inserts, updates or deletes by a join. |
 | [TRUNCATE](truncate.md) | Empties tables; `RESTART IDENTITY`, `CASCADE`. |
-| COPY | Bulk load and unload, text and CSV: see also [bulk loading](../../bulk-load.md#postgresql-copy). |
+| [COPY](copy.md) | Bulk load and unload, text and CSV: see also [bulk loading](../../bulk-load.md#postgresql-copy). |
 
 ### Tables, indexes and other objects
 
@@ -42,8 +42,8 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
 | [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
 | [CREATE TYPE](create-type.md), [ALTER TYPE](alter-type.md), [DROP TYPE](drop-type.md) | Enum types. |
-| CREATE FUNCTION, CREATE PROCEDURE, DROP FUNCTION, DROP PROCEDURE | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
-| CALL | Calls a procedure. |
+| [CREATE FUNCTION](create-function.md), [CREATE PROCEDURE](create-procedure.md), [DROP FUNCTION, DROP PROCEDURE](drop-function.md) | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
+| [CALL](call.md) | Calls a procedure. |
 
 ### Roles and privileges
 
@@ -51,7 +51,7 @@ This index lists everything the door takes today. Pages not written yet are list
 |---|---|
 | [CREATE ROLE, CREATE USER](create-role.md) | Roles, with `LOGIN`, `SUPERUSER`, `PASSWORD`. |
 | [ALTER ROLE, ALTER USER](alter-role.md), [DROP ROLE, DROP USER](drop-role.md) | |
-| [GRANT](grant.md), [REVOKE](revoke.md) | Table, view, sequence, schema, function and database privileges; role membership. |
+| [GRANT](grant.md), [REVOKE](revoke.md) | Table, view, sequence, schema, function and database privileges, `ON ALL TABLES IN SCHEMA`; role membership. |
 | [SET ROLE, SET SESSION AUTHORIZATION](set-role.md) | |
 
 ### Transactions
@@ -70,9 +70,9 @@ This index lists everything the door takes today. Pages not written yet are list
 |---|---|
 | [SET](set.md), [RESET](reset.md), [SHOW](show.md) | Settings; `SET TIME ZONE`, `SET search_path`. |
 | [DISCARD, DEALLOCATE](discard.md) | |
-| WAIT FOR LSN | Waits on a replica for a commit (PostgreSQL 19). See [replicas](../../replicas.md). |
-| ANALYZE | Gathers the planner's statistics. |
-| VACUUM, CHECKPOINT, REINDEX, CLUSTER | `CHECKPOINT` writes one; the others are accepted. |
+| [WAIT FOR LSN](wait-for-lsn.md) | Waits on a replica for a commit (PostgreSQL 19). See [replicas](../../replicas.md). |
+| [ANALYZE](analyze.md) | Gathers the planner's statistics. |
+| [VACUUM](vacuum.md), [CHECKPOINT](checkpoint.md), [REINDEX](reindex.md), [CLUSTER](cluster.md) | `CHECKPOINT` writes one; `VACUUM` rewrites row leaves as column leaves; `REINDEX` and `CLUSTER` are checked and do nothing. |
 
 ### Not in this door
 
@@ -133,7 +133,7 @@ Comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`), `BETWEEN [SYMMETRIC]`, `IN`,
 - **pg_catalog**: `pg_namespace`, `pg_class`, `pg_attribute`, `pg_attrdef`, `pg_type`, `pg_index`,
   `pg_constraint`, `pg_description`, `pg_sequence`, `pg_sequences`, `pg_enum`, `pg_collation`, `pg_am`,
   `pg_opclass`, `pg_database`, `pg_proc`, `pg_roles`, `pg_user`, `pg_auth_members`, `pg_inherits`, `pg_depend`,
-  `pg_tables`, `pg_views`, `pg_indexes`, `pg_matviews`, `pg_settings`, `pg_stat_user_tables`, `pg_language`,
+  `pg_tables`, `pg_views`, `pg_indexes`, `pg_matviews`, `pg_settings` (empty), `pg_stat_user_tables`, `pg_language`,
   `pg_extension`, `pg_tablespace`, `pg_trigger`, `pg_rewrite`, `pg_policy`, `pg_publication` and others psql reads
   (empty where lexdb has no such object).
 - **information_schema**: `schemata`, `tables`, `columns`, `views`, `table_constraints`, `key_column_usage`,
