@@ -2779,7 +2779,9 @@ fn (g: mut &Gen) stmt1(s: int) {
         let t = g.u.locals[l].ty
         if g.freg[l] >= 0 {
             g.declMark = g.frame
-            if n.b >= 0 {
+            if n.b >= 0 && g.fIntoLocal(n.b, g.freg[l], l) {
+                // computed in the local's register
+            } else if n.b >= 0 {
                 g.gen(n.b)
                 g.a.sse66(MOVAPD, g.freg[l], 0)
             }
@@ -5031,6 +5033,12 @@ fn (g: mut &Gen) pair128(a: int, b: int) {
 
 // a into xmm0, b into xmm1.
 fn (g: mut &Gen) pairF(a: int, b: int) {
+    if !g.fSrc(b) && g.fInto1(b) {
+        // b computed in xmm1 alone, after a (as the general case evaluates them)
+        g.gen(a)
+        g.genFR(b, 1)
+        return
+    }
     if g.fregOf(a) >= 0 && !g.fSrc(b) && !g.assignsLocal(b, g.u.nodes[a].a) {
         // a after b: b leaves it as it is
         g.gen(b)
@@ -5047,12 +5055,163 @@ fn (g: mut &Gen) pairF(a: int, b: int) {
     g.a.movsdLoad(0, rbp(s))
 }
 
-// The double b into xmm1 when that needs no code but a load (fSrc), leaving xmm0 as it is; else
-// false, nothing generated.
+// The double b into xmm1 leaving xmm0 as it is, when b needs no float register but xmm1
+// (fInto1: a load, or arithmetic of loads); else false, nothing generated.
 fn (g: mut &Gen) genF1(b: int): bool {
-    if !g.fSrc(b) { return false }
-    g.sseSrc(MOVSD, 1, b)
+    if !g.fInto1(b) { return false }
+    g.genFR(b, 1)
     return true
+}
+
+// Whether the double b is a load from memory (an element of an array, a member through a
+// pointer) whose address takes integer code only: pure (no call but the inline checks) and
+// nothing of a float type below it. So it can be the memory operand of an SSE op after the
+// other operand is in xmm0: the address computation (place) uses the integer registers alone.
+fn (g: &Gen) fMem(b: int): bool {
+    let n = g.u.nodes[b]
+    if g.tk(n.ty) != ir.TY_F64 || (n.k != ir.E_MEMBER && n.k != ir.E_DEREF) || g.fregOf(b) >= 0 { return false }
+    return g.pure(b) && g.noFloatIn(n.a)
+}
+
+// Whether no node of the tree x has a float type.
+fn (g: &Gen) noFloatIn(x: int): bool {
+    if x < 0 { return true }
+    let n = g.u.nodes[x]
+    if g.isF(n.ty) { return false }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE || kc < 0 { return true }
+    if kc == ir.K_CALL || kc == ir.K_CLIT {
+        if kc == ir.K_CALL && !g.noFloatIn(n.a) { return false }
+        for j in 0..g.u.listLen(n.b) {
+            if !g.noFloatIn(g.u.listAt(n.b, j)) { return false }
+        }
+        return true
+    }
+    if kc == ir.K_BLOCK || kc == ir.K_DECL || kc == ir.K_FOR { return false }
+    if !g.noFloatIn(n.a) { return false }
+    if (kc == ir.K_AB || kc == ir.K_ABC) && !g.noFloatIn(n.b) { return false }
+    if kc == ir.K_ABC && !g.noFloatIn(n.c) { return false }
+    return true
+}
+
+// Whether the double e can be generated into a float register other than xmm0 with no other
+// float register (fT with no scratch register).
+fn (g: &Gen) fInto1(e: int): bool { return g.fT(e, 0, 8) }
+
+// Whether the double e is a load (fSrc, fMem): an operand an SSE op takes as it is.
+fn (g: &Gen) fLeaf(e: int): bool { return g.fSrc(e) || g.fMem(e) }
+
+// The argument of e when e is sqrt(x) of a double (inlineMath's sqrtsd), else -1.
+fn (g: &Gen) sqrtArg(e: int): int {
+    let n = g.u.nodes[e]
+    if n.k != ir.E_CALL || g.u.listLen(n.b) != 1 || g.tk(n.ty) != ir.TY_F64 { return -1 }
+    let c = n.a
+    if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return -1 }
+    let f = g.u.nodes[g.u.nodes[c].a].a
+    if g.u.funcs[f].body >= 0 || g.u.funcs[f].asmName != "sqrt" { return -1 }
+    let x = g.u.listAt(n.b, 0)
+    return if g.tk(g.u.nodes[x].ty) == ir.TY_F64 { x } else { -1 }
+}
+
+// Whether the double e can be computed into one float register with nfree scratch registers
+// more (genFT): a load, sqrt of such an e, or + - * / of such an e and a load (or, with a
+// scratch register, of two such e), at most d deep.
+fn (g: &Gen) fT(e: int, nfree: int, d: int): bool {
+    if g.fLeaf(e) { return true }
+    if d == 0 { return false }
+    let q = g.sqrtArg(e)
+    if q >= 0 { return g.fT(q, nfree, d - 1) }
+    let n = g.u.nodes[e]
+    if n.k != ir.E_BIN || g.tk(n.c) != ir.TY_F64 || n.v > ir.OP_DIV || isCmp(n.v) { return false }
+    if !g.fT(n.a, nfree, d - 1) { return false }
+    return g.fLeaf(n.b) || (nfree > 0 && g.fT(n.b, nfree - 1, d - 1))
+}
+
+// Whether local l is read by e anywhere but as its first operand (what genFT moves into the
+// target register before it reads anything else): genFT into l's register writes it first.
+fn (g: &Gen) fLaterReads(e: int, l: int): bool {
+    let q = g.sqrtArg(e)
+    if q >= 0 { return g.fLaterReads(q, l) }
+    let n = g.u.nodes[e]
+    if n.k != ir.E_BIN { return false }
+    return g.namesLocalX(n.b, l) || g.fLaterReads(n.a, l)
+}
+
+// Whether the tree x reads local l.
+fn (g: &Gen) namesLocalX(x: int, l: int): bool {
+    if x < 0 { return false }
+    let n = g.u.nodes[x]
+    if n.k == ir.E_LOCAL { return n.a == l }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE || kc < 0 { return false }
+    if kc == ir.K_CALL || kc == ir.K_CLIT {
+        if kc == ir.K_CALL && g.namesLocalX(n.a, l) { return true }
+        for j in 0..g.u.listLen(n.b) {
+            if g.namesLocalX(g.u.listAt(n.b, j), l) { return true }
+        }
+        return false
+    }
+    if g.namesLocalX(n.a, l) { return true }
+    if (kc == ir.K_AB || kc == ir.K_ABC) && g.namesLocalX(n.b, l) { return true }
+    return kc == ir.K_ABC && g.namesLocalX(n.c, l)
+}
+
+// The double e (fInto1) into xmm r.
+fn (g: mut &Gen) genFR(e: int, r: int) {
+    let none: []int = []
+    g.genFT(e, r, &none)
+}
+
+// The double e (fT with len(free) scratch registers) into xmm r, using only r and free.
+fn (g: mut &Gen) genFT(e: int, r: int, free: &[int]) {
+    if g.fregOf(e) == r { return }
+    if g.fSrc(e) {
+        g.sseSrc(MOVSD, r, e)
+        return
+    }
+    if g.fMem(e) {
+        g.a.sseM(MOVSD, r, g.place(e))
+        return
+    }
+    let q = g.sqrtArg(e)
+    if q >= 0 {
+        if g.fLeaf(q) {
+            g.fOperand(x64.SQRTSD, r, q)
+        } else {
+            g.genFT(q, r, free)
+            g.a.sse(x64.SQRTSD, r, r)
+        }
+        return
+    }
+    let n = g.u.nodes[e]
+    let ops: []int = [x64.ADDSD, x64.SUBSD, x64.MULSD, x64.DIVSD]
+    g.genFT(n.a, r, free)
+    if g.fLeaf(n.b) {
+        g.fOperand(ops[n.v], r, n.b)
+    } else {
+        let sr = free[0]
+        let rest = free[1..len(free)]
+        g.genFT(n.b, sr, rest)
+        g.a.sse(ops[n.v], r, sr)
+    }
+}
+
+// A double computed into the register r of local l at a statement (a declaration or an
+// assignment): xmm0 and xmm1 are free there. Whether it was.
+fn (g: mut &Gen) fIntoLocal(e: int, r: int, l: int): bool {
+    if r < 8 || !g.fT(e, 2, 8) || g.fLaterReads(e, l) { return false }
+    let free: []int = [0, 1]
+    g.genFT(e, r, &free)
+    return true
+}
+
+// op xr, b for a load b (fSrc or fMem).
+fn (g: mut &Gen) fOperand(op: int, r: int, b: int) {
+    if g.fSrc(b) {
+        g.sseSrc(op, r, b)
+    } else {
+        g.a.sseM(op, r, g.place(b))
+    }
 }
 
 // Whether the double b is an operand that needs no code: a constant (in rodata), a local in a
@@ -5375,6 +5534,11 @@ fn (g: mut &Gen) genAssign(e: int) {
             if !unused { g.a.sse66(MOVAPD, 0, r) }
             return
         }
+        if g.fIntoLocal(n.b, r, g.u.nodes[lhs].a) {
+            // computed in the local's register
+            if !unused { g.a.sse66(MOVAPD, 0, r) }
+            return
+        }
         g.gen(n.b)
         g.a.sse66(MOVAPD, r, 0)
         return
@@ -5671,10 +5835,10 @@ fn (g: mut &Gen) genBin(e: int) {
     if ck == ir.TY_F64 {
         let ops: []int = [x64.ADDSD, x64.SUBSD, x64.MULSD, x64.DIVSD]
         if op > ir.OP_DIV { g.fail(e, "operator on double") }
-        if g.fSrc(n.b) {
+        if g.fSrc(n.b) || g.fMem(n.b) {
             // the right operand where it is (read after the left one, as before)
             g.gen(n.a)
-            g.sseSrc(ops[op], 0, n.b)
+            g.fOperand(ops[op], 0, n.b)
             return
         }
         g.pairF(n.a, n.b)

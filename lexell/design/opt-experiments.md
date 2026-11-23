@@ -761,3 +761,43 @@ predictor history as malloc's one branch did.
 
 Test: tests/run/native_inline_alloc (lists across several chunks, three size classes, boxes
 kept, and the same after a par.map has started its pool), with LXL_CHECK on and off.
+
+## 20. Floating point: memory operands, doubles in their registers, addresses across stores (as built)
+
+The five programs added to the microbenchmarks on 2026-11-23 found the generated code's weak
+cases. `nbody` ran 8.78G instructions against Rust's 1.89G: every double went through xmm0 (a
+load into xmm0, then into its register; an operand moved back into xmm0 and the other into
+xmm1), and `bs[i].x`, `bs[i].y`, ... each multiplied i by the element size again.
+
+- **Elements as SSE operands** (x64gen `fMem`): a double loaded through `place` whose address is
+  integer code alone (pure, nothing of a float type below it) is the memory operand of
+  addsd/subsd/mulsd/divsd after the left operand is in xmm0; the address uses only the integer
+  registers.
+- **Doubles in their destination** (`fT`, `genFT`): a double assigned to (or declared as) a local
+  in a float register is computed in that register when it is a load, sqrt of such an expression,
+  or + - * / of one and a load; at a statement xmm0 and xmm1 are free, so a right operand that is
+  itself such an expression is computed in one of them. The destination may be read only as the
+  first operand (the one moved into the register first: `fLaterReads`). `pairF` computes such a
+  right operand in xmm1 rather than parking the left one.
+- **Element addresses across stores** (cse `addrOnly`, `killMem`): an address that is arithmetic
+  on locals alone (no load, no local whose address is taken) reads no memory, so a store or a call
+  does not change it, only an assignment of one of its locals. It stays available across them,
+  and a store's own place and value are visited; it is worth a local when the element size is not
+  one an addressing mode scales by (1, 2, 4, 8).
+
+| measure (main fe29b218 against this) | instructions | cycles |
+|---|---:|---:|
+| bench nbody / matmul (5 interleaved rounds) | -44 / -25% | -31 / -27% |
+| bench interp / closures | level | level |
+| perfsuite run suite / compile suite | 0.00 / +0.09% | +0.28 / +0.61% |
+| apps regex / json / jq / cmark / decimal | -0.10 / -0.09 / -0.10 / -0.05 / 0.00% | -0.7 / +0.1 / -1.4 / -0.3 / +0.1% |
+| TPC-H SF1, server instructions per query (22) | -0.13% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | level (172,348 both) | +0.3% |
+
+The compile suite's +0.09% is the new analysis. What remains in `nbody` (4.92G instructions,
+1.23G cycles, against Rust's 1.89G and 0.78G) is mostly copies between the IR's temporaries
+(`t = dx * dx` into one register, then copied into the next temporary): register coalescing.
+
+Test: tests/run/native_float_targets (a destination read on the right, nested sqrt and
+quotients, stores to an element then reads through an equal index, an index reassigned between
+uses, a float converted to an index).

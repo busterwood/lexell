@@ -19,6 +19,13 @@
 // writes memory or calls the program end the run (what is inside starts runs of its own).
 // Within one statement nothing is reused (the native backend's order of evaluation is its
 // own). LXL_CSE=0 turns the pass off; LXL_CSE=v prints the count.
+//
+// An element address that is arithmetic on locals alone (addrOnly: `d + i * 56`, the data
+// pointer a local, no load, every local's address never taken) reads no memory, so a statement
+// that writes memory or calls the program does not change it, only an assignment of one of its
+// locals: it stays available across stores (killMem), and a store's own place and value are
+// visited. It is worth a local when its element size is not one an addressing mode scales by
+// (1, 2, 4, 8: the native backend multiplies for the others, at every use).
 
 import "strings"
 
@@ -46,6 +53,7 @@ type Avail = value record {
     dead: bool      // something it reads may have changed
     mask: int       // a bit per local it names (by canon, mod 62)
     held: bool      // made by held (not counted against MAX_AVAIL's candidates)
+    addr: bool      // pure address arithmetic (addrOnly): reads no memory, so stores leave it
 }
 
 type Cse = record {
@@ -178,6 +186,14 @@ fn (o: mut &Cse) killAll() {
     for i in 0..len(o.avail) { o.avail[i].dead = true }
 }
 
+// Memory written (a store, a call): what reads memory is no longer known; pure address
+// arithmetic of locals stays.
+fn (o: mut &Cse) killMem() {
+    for i in 0..len(o.avail) {
+        if !o.avail[i].addr { o.avail[i].dead = true }
+    }
+}
+
 fn (o: mut &Cse) resetCanon() {
     let cs = replace(mut &o.copies, [])
     for l in cs { o.canon[l] = -1 }
@@ -235,7 +251,7 @@ fn (o: mut &Cse) stmt(s: int, bi: int, i: int) {
     let k = n.k
     if k == ir.S_DECL {
         if n.c >= 0 || (n.b >= 0 && !o.calm(n.b)) {
-            o.killAll()
+            o.killMem()
             o.killAssigned(n.b)
             o.killAssignedList(n.c)
             o.killLocal(n.a)
@@ -257,8 +273,13 @@ fn (o: mut &Cse) stmt(s: int, bi: int, i: int) {
             o.killLocal(o.u.nodes[o.u.nodes[e].a].a)
         } else if o.calm(e) {
             o.visit(e, false, false)
+        } else if o.u.nk(e) == ir.E_ASSIGN && o.calm(o.u.nodes[e].b) && o.calm(o.u.nodes[e].a) {
+            // a store: its value, then its place's address, read before memory changes
+            o.visit(o.u.nodes[e].b, false, false)
+            o.visit(o.u.nodes[e].a, false, true)
+            o.killMem()
         } else {
-            o.killAll()
+            o.killMem()
             o.killAssigned(e)
         }
     } else if k == ir.S_RETURN {
@@ -420,7 +441,8 @@ fn (o: mut &Cse) visit(x: int, cond: bool, lv: bool) {
             }
         }
         if cd && !cond && len(o.avail) - o.nHeld < MAX_AVAIL {
-            append(mut &o.avail, Avail{x: x, h: h, t: -1, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: false})
+            append(mut &o.avail, Avail{x: x, h: h, t: -1, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: false,
+                addr: o.u.nk(x) == ir.E_PADD && o.addrOnly(x)})
         }
     }
     if cd { o.inCand += 1 }
@@ -456,7 +478,8 @@ fn (o: mut &Cse) kidsOf(x: int, k: int, cond: bool) {
 fn (o: mut &Cse) held(t: int, x: int) {
     if x < 0 || o.taken[t] || o.nHeld >= MAX_AVAIL || !o.oneLoad(x) { return }
     if o.u.nodes[x].ty != o.u.locals[t].ty || o.names(x, t) { return }
-    append(mut &o.avail, Avail{x: x, h: o.hash(x), t: t, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: true})
+    append(mut &o.avail, Avail{x: x, h: o.hash(x), t: t, blk: o.cb, at: o.cp, sid: o.sid, dead: false, mask: o.maskOf(x), held: true,
+        addr: false})
     o.nHeld += 1
 }
 
@@ -481,7 +504,30 @@ fn (o: &Cse) cand(x: int): bool {
     var loads = 0
     var idx = false
     if !o.plain(x, mut &loads, mut &idx) { return false }
-    return loads >= 2 || idx
+    if loads >= 2 || idx { return true }
+    let sc = o.u.nodes[x].v
+    return k == ir.E_PADD && sc != 1 && sc != 2 && sc != 4 && sc != 8 && o.addrOnly(x)
+}
+
+// Whether x is address arithmetic on locals alone (no load, no call but the pure runtime
+// functions, every local's address never taken): no store or call changes its value.
+fn (o: &Cse) addrOnly(x: int): bool {
+    if x < 0 { return true }
+    let n = &o.u.nodes[x]
+    let k = n.k
+    if k == ir.E_INT { return true }
+    if k == ir.E_LOCAL { return !o.taken[n.a] }
+    if k == ir.E_CALL {
+        let f = o.rtFn(x)
+        if f < 0 || !o.pureFn[f] { return false }
+        for j in 0..o.u.listLen(n.b) {
+            if !o.where(n.b, j) && !o.addrOnly(o.u.listAt(n.b, j)) { return false }
+        }
+        return true
+    }
+    if k == ir.E_CAST || k == ir.E_NEG { return o.addrOnly(n.a) }
+    if k == ir.E_BIN || k == ir.E_PADD { return o.addrOnly(n.a) && o.addrOnly(n.b) }
+    return false
 }
 
 // Whether x is made of locals, globals, constants, members, loads, casts, arithmetic and the
