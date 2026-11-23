@@ -256,7 +256,7 @@ EXEC sp_prepare @h OUTPUT, N'@i int', N'SELECT name FROM dbo.emp WHERE id = @i';
 ```text
 Msg 2812, Level 16, State 62, Line 1
 Could not find stored procedure 'sp_help'.
-Msg 2812, Level 16, State 62, Line 1
+Msg 2812, Level 16, State 62, Line 3
 Could not find stored procedure 'sp_prepare'.
 ```
 
