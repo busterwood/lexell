@@ -113,7 +113,6 @@ select_list ::=
 - PostgreSQL's forms are taken too: `NATURAL JOIN`, `JOIN ... USING (...)`, `LATERAL`, `VALUES` on its own as a
   statement, and `WITH RECURSIVE`. SQL Server refuses them.
 - `XMLNAMESPACES` in `WITH` is not supported.
-- The line number in an error message is that of the batch's first line.
 
 ## Examples
 
@@ -334,7 +333,7 @@ GO
 
 ```text
 Msg 512, Level 16, State 1, Line 1
-more than one row returned by a subquery used as an expression
+Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.
 Msg 50000, Level 16, State 1, Line 1
 column reference "name" is ambiguous
 Msg 207, Level 16, State 1, Line 1
@@ -355,10 +354,10 @@ GO
 ```
 
 ```text
-Msg 102, Level 15, State 1, Line 1
+Msg 102, Level 15, State 1, Line 2
 Incorrect syntax near 'pivot'.
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'json'.
+Incorrect syntax near 'JSON'.
 ```
 
 ## See also
