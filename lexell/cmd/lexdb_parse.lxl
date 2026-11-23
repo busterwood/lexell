@@ -4111,6 +4111,7 @@ fn (p: mut &P) onConflict(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
         s.conflict = CONFLICT_NOTHING
         return Ok(Unit{})
     }
+    if p.isKw("select") { return p.conflictSelect(s) }
     try p.expectKw("update")
     try p.expectKw("set")
     s.conflict = CONFLICT_UPDATE
@@ -9835,4 +9836,28 @@ fn (p: mut &P) nullsTreat(fname: &str, inside: bool): Result[str, lexdb_base.DbE
     }
     if !ignore { return Ok(fname.clone()) }
     return Ok(fname + (if p.tsql { " nulls:t" } else if p.ora { " nulls:o" } else { " nulls:i" }))
+}
+
+// ON CONFLICT ... DO SELECT [FOR UPDATE | FOR NO KEY UPDATE | FOR SHARE | FOR KEY SHARE] [WHERE cond] (PostgreSQL 19,
+// design/lexdb-new-features.md P1), at SELECT: the third action, its lock strength in s.conflict (CONFLICT_SELECT +
+// LOCK_*), its WHERE in s.where; RETURNING and a conflict target are required (lexdb_exec.upsertOf's 42601).
+fn (p: mut &P) conflictSelect(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    p.pos += 1
+    var lock = 0
+    if p.acceptKw("for") {
+        if p.acceptKw("update") { lock = lexdb_sql.LOCK_UPDATE }
+        else if p.acceptKw("share") { lock = lexdb_sql.LOCK_SHARE }
+        else if p.acceptKw("no") {
+            try p.expectKw("key")
+            try p.expectKw("update")
+            lock = lexdb_sql.LOCK_NO_KEY_UPDATE
+        } else {
+            try p.expectKw("key")
+            try p.expectKw("share")
+            lock = lexdb_sql.LOCK_KEY_SHARE
+        }
+    }
+    s.conflict = lexdb_sql.CONFLICT_SELECT + lock
+    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    return Ok(Unit{})
 }

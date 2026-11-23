@@ -6458,7 +6458,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 // it was (upsertOld), its old row (RETURNING old.c), one inserted has NULLs there.
 fn keptRet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, m: &Mats, params: &[]Val, ret: mut &Ret,
            kept: &[][]Val, n: int, rs: mut &Run): Result[Unit, DbErr] {
-    if s.conflict != lexdb_sql.CONFLICT_UPDATE {
+    if s.conflict != lexdb_sql.CONFLICT_UPDATE && s.conflict < lexdb_sql.CONFLICT_SELECT {
         for row in kept { try retAdd(st, txn, q, m, params, ret, &row, rs) }
         return Ok(Unit{})
     }
@@ -6577,7 +6577,7 @@ fn retOf(s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Ret, DbErr] {
     for i in 0..len(r.exprs) {
         if lexdb_bind.hasAgg(&r.exprs[i]) { return Err(e("42803", "aggregate functions are not allowed in RETURNING")) }
         // the old and new rows: what the statement decides, here (RETURNING old.c, new.c)
-        if lexdb_oldnew.has(&r.exprs[i]) { r.exprs[i] = lexdb_oldnew.settle(&r.exprs[i], s.kind, s.conflict == lexdb_sql.CONFLICT_UPDATE) }
+        if lexdb_oldnew.has(&r.exprs[i]) { r.exprs[i] = lexdb_oldnew.settle(&r.exprs[i], s.kind, s.conflict == lexdb_sql.CONFLICT_UPDATE || s.conflict >= lexdb_sql.CONFLICT_SELECT) }
     }
     return Ok(r)
 }
@@ -6853,6 +6853,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
     up.mode = s.conflict
     up.md = s.mdialect
     if s.conflict == lexdb_sql.CONFLICT_NONE { return Ok(up) }
+    if s.conflict >= lexdb_sql.CONFLICT_SELECT && len(s.items) == 0 { return Err(e("42601", "ON CONFLICT DO SELECT requires a RETURNING clause")) }
     let tname = lexdb_sql.baseName(&t.name)
     if len(s.conflictCols) > 0 {
         var cs: []int = []
@@ -6876,6 +6877,7 @@ fn upsertOf(s: &lexdb_sql.Stmt, t: &Table, sc: mut &Scope): Result[Upsert, DbErr
         if s.conflict == lexdb_sql.CONFLICT_UPDATE {
             return Err(e("42601", "ON CONFLICT DO UPDATE requires inference specification or constraint name"))
         }
+        if s.conflict >= lexdb_sql.CONFLICT_SELECT { return Err(e("42601", "ON CONFLICT DO SELECT requires inference specification or constraint name")) }
         append(mut &up.arb, -1)
         for i in 0..len(t.indexes) { if t.indexes[i].unique { append(mut &up.arb, i) } }
     }
@@ -6920,6 +6922,7 @@ fn conflictOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: 
 fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs: &Defs, fw: &[]Table, later: mut &[]FkLater,
              up: mut &Upsert, env: &Env, old: &[]Val, row: &[]Val): Result[Option[[]Val], DbErr] {
     if up.mode == lexdb_sql.CONFLICT_NOTHING { return Ok(None) }
+    if up.mode >= lexdb_sql.CONFLICT_SELECT { return upsertSelect(st, txn, t, up, env, old, row) }
     let oldKey = keyOf(t, old)
     if up.touched.has(&oldKey) {
         return Err(e("21000", "ON CONFLICT DO UPDATE command cannot affect row a second time"))
@@ -6943,6 +6946,30 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     // (followed by the row it was, for RETURNING old.c: keptRet; the row written is next's first columns)
     for v in old { append(mut &next, v.clone()) }
     return Ok(Some(next))
+}
+
+// ON CONFLICT DO SELECT (P1): the row there, unless DO SELECT's WHERE is not true, locked as asked (FOR UPDATE ...:
+// lockFound's, held to the end of a block), returned as it is: kept followed by itself (RETURNING old.c and new.c are both
+// the row there). A row the statement inserted or met already is returned again (no 21000, as PostgreSQL 19).
+fn upsertSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, up: &Upsert, env: &Env, old: &[]Val,
+                row: &[]Val): Result[Option[[]Val], DbErr] {
+    match up.cond {
+        Some(c) {
+            var both: []Val = collections.copyOf(old)
+            for v in row { append(mut &both, v.clone()) }
+            let uenv = Env{cols: &up.cols, row: &both, aggs: env.aggs, params: env.params, subs: env.subs, cur: env.cur, seq: env.seq}
+            if lexdb_ops.truth(&(try eval(&c, &uenv))) != Some(true) { return Ok(None) }
+        }
+        None {}
+    }
+    let lock = up.mode - lexdb_sql.CONFLICT_SELECT
+    if lock > 0 {
+        let held: [][]Val = [collections.copyOf(old)]
+        let waited = try lockFound(st, txn, t, &held, lock)
+    }
+    var out: []Val = collections.copyOf(old)
+    for v in old { append(mut &out, v.clone()) }
+    return Ok(Some(out))
 }
 
 // A built row stored: its key free, its indexes and foreign keys checked.
