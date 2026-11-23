@@ -63,7 +63,7 @@ WINDOW window_name AS ( window_spec ) [ ,...n ]
   used in an aggregate function" (example H). Use `SUM(x) OVER (...) / COUNT(x) OVER (...)`, with a cast where the
   type matters.
 - `COUNT_BIG` with `OVER` is error 195 ("function count_big with 0 arguments does not exist"); use `COUNT`.
-- `STDEV`, `STDEVP`, `VAR`, `VARP` and `NTH_VALUE` are not available (error 195).
+- `STDEV`, `STDEVP`, `VAR` and `VARP` are not available (error 195). `NTH_VALUE` works (SQL Server has none).
 - `ROW_NUMBER`, `RANK` and the other ranking functions are taken without `ORDER BY` (`OVER ()`); SQL Server
   refuses that (4112).
 - `RANGE` with an offset (`RANGE BETWEEN 2 PRECEDING AND CURRENT ROW`) is taken; SQL Server allows only
