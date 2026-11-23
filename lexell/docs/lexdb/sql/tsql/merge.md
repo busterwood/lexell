@@ -210,11 +210,11 @@ GO
 ```text
 (2 rows affected)
 
-Msg 8672, Level 16, State 1, Line 1
+Msg 8672, Level 16, State 1, Line 3
 The MERGE statement attempted to UPDATE or DELETE the same row more than once. This happens when a target row matches more than one source row. A MERGE statement cannot UPDATE/DELETE the same row of the target table multiple times. Refine the ON clause to ensure a target row matches at most one source row, or use the GROUP BY clause to group the source rows.
-Msg 10713, Level 15, State 1, Line 1
+Msg 10713, Level 15, State 1, Line 2
 A MERGE statement must be terminated by a semi-colon (;).
-Msg 5324, Level 16, State 1, Line 1
+Msg 5324, Level 16, State 1, Line 2
 In a MERGE statement, a 'WHEN MATCHED' clause with a search condition cannot appear after a 'WHEN MATCHED' clause with no search condition.
 ```
 
