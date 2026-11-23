@@ -235,8 +235,8 @@ GO
 ```text
 Msg 313, Level 16, State 1, Line 1
 An insufficient number of arguments were supplied for the procedure or function dbo.tax.
-Msg 195, Level 16, State 1, Line 1
-function tax with 2 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'tax' is not a recognized built-in function name.
 Msg 443, Level 16, State 1, Line 1
 Invalid use of a side-effecting operator 'UPDATE' within a function.
 Msg 50000, Level 16, State 1, Line 1
