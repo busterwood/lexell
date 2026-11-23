@@ -480,3 +480,31 @@ smaller differences of its statement.
   - A `SELECT` that calls a stored function which raises an exception makes ojdbc throw a `NullPointerException`
     (`this.accessors is null`).
   - `ALTER PROCEDURE nothere COMPILE` and `COMMENT ON TABLE nothere` succeed.
+- **Functions** (found writing the Oracle function pages):
+  - **Regular expressions:** `REGEXP_SUBSTR` uses only its first two arguments (`REGEXP_SUBSTR('abc123def456',
+    '[0-9]+', 1, 2)` is `123`; Oracle `456`; position, occurrence, match parameter and subexpression are ignored);
+    `REGEXP_REPLACE` with two arguments is ORA-00904; the period matches a line feed by default and the `n` flag has the
+    opposite effect; an unknown match parameter or position 0 is ORA-01722; an invalid pattern is ORA-20000.
+  - **Character:** `LENGTHB` and `SUBSTRB` count characters (`LENGTHB('€')` is 1); `LENGTH(DATE ...)` is 19;
+    `TRIM('xy' FROM 'xyabc')` returns `abc` (Oracle ORA-30001); `SYS_GUID()` is text of 64 hex digits, not `RAW(16)`;
+    `HEXTORAW('abc')` is ORA-01722; `REVERSE`, `REPEAT`, `COT` and `CBRT` are accepted under their PostgreSQL names.
+  - **Package functions:** `UTL_MATCH.EDIT_DISTANCE` of NULL or `''` is -1; `UTL_RAW.CAST_TO_VARCHAR2('414243')` is
+    `414243`; `DBMS_LOB.SUBSTR` of a `RAW` works on its hex text; `UTL_ENCODE.BASE64_ENCODE` takes a string;
+    `UTL_RAW.LENGTH`, `UTL_RAW.CONCAT`, `DBMS_LOB.INSTR`, `DBMS_RANDOM` and `UTL_I18N` do not exist.
+  - **Numeric:** `MOD(5, 0)` is ORA-01476 (Oracle 5); `CEIL(5)` and `FLOOR(5)` of a literal are `5.0`; `SIN(0)` prints
+    `0.0`; `ABS('-3')` and `ROUND(5.5, 1.9)` are ORA-00904; `LOG(10)` is accepted; the literal `.5` is ORA-01426; a
+    38-digit result prints in exponent form (`1.41666...E00`); `REMAINDER`, `NANVL`, `PI` and `BIN_TO_NUM` are
+    ORA-00904.
+  - **Date and time:** a `TIMESTAMP WITH TIME ZONE` keeps no offset (stored as UTC; `EXTRACT(TIMEZONE_HOUR ...)` is
+    0); `FROM_TZ` converts to UTC instead of attaching the zone; `SESSIONTIMEZONE` after `SET TIME_ZONE='+02:00'` is
+    `+02`; `EXTRACT(HOUR FROM DATE ...)` is 0 (Oracle ORA-30076) and `QUARTER` and `DOW` are accepted; `TIME_BUCKET`
+    needs its origin argument; `CAST(timestamp AS DATE)` rounds; `TIMESTAMPADD`, `NEW_TIME`, `TZ_OFFSET` and
+    `TO_TIMESTAMP_TZ` do not exist.
+  - **Conversion:** `TO_CHAR` number elements `EEEE`, `RN`, `XXXX`, `TM`, `B`, `V`, `C` are ORA-01481 and date elements
+    `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS`, `TZH`, `TZM`, `TZR`, `TZD` are ORA-01821; `TO_CHAR(0, '999')`
+    is blanks and `TO_CHAR(0, 'FM999')` is empty (Oracle `0`); the third argument of `TO_CHAR` and `TO_NUMBER`
+    (NLS parameters) is ignored; `DDSP` gives `03`; `TO_CHAR` of an interval is NULL; `TO_BOOLEAN(NULL)` is false;
+    a string inserted into a `DATE` column is read as `YYYY-MM-DD`, not by `NLS_DATE_FORMAT`; `CAST(... AS INTERVAL ...)`,
+    `VALIDATE_CONVERSION` and `DEFAULT ... ON CONVERSION ERROR` are ORA-00900.
+  - `ORA_DATABASE_NAME`, `RATIO_TO_REPORT`, `MEDIAN`, `STATS_MODE`, `CORR`, `COVAR_*`, `REGR_*`, `LNNVL`, `NANVL`,
+    `GROUPING_ID` and `GROUP_ID` do not exist (ORA-00904); `LISTAGG ... OVER` is ORA-03001.
