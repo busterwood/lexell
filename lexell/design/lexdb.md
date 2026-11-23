@@ -12913,7 +12913,9 @@ user request". The Budget knows its session through its deadline word (`Limits.d
 `lexdb_pipe.deadlineWord`): the low 20 bits of the session's number always, and with statement_timeout the bit
 `DL_SET` and the ms to stop at above them; without a timeout the word is the session's number as it is. A field of
 its own cost the point select 42 instructions (`Limits.sid` 19, `Budget.sid` 23: a Budget is in every Run); the word
-costs 1 (the session's number loaded where 0 was). Requests are kept and matched by those 20 bits: two sessions a
+costs 1 (the session's number loaded where 0 was), which `Session.dword` takes back: the word without a timeout,
+kept in the session (`setTimeout`), and -1 with one, so `limits()` is one load and a sign test (4 instructions where
+main's was 5): point select, INSERT and UPDATE by key each 1.0 instruction fewer than main. Requests are kept and matched by those 20 bits: two sessions a
 multiple of 2^20 apart, both running, could take each other's. A mark left when the session was idle (the statement
 ended first) is dropped at its next Query or Execute, so it does not stop the next statement (PostgreSQL ignores a
 cancel while it reads a command).
