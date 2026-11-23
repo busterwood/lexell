@@ -46,7 +46,7 @@ CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
     "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun",
-    "lexdb_memo", "lexdb_oldnew", "lexdb_ops", "lexdb_vec",
+    "lexdb_memo", "lexdb_newfn", "lexdb_oldnew", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
@@ -81,7 +81,7 @@ KNOWN_CORE_DIALECT = {
 # model, the catalog and the dialect facts, and below the planner and the
 # executor: it imports only these (and lexell's own libraries).
 BIND = "lexdb_bind"
-BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_lib"}
+BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_lib", "lexdb_newfn"}
 
 # The access layer (design/lexdb-layers.md 4.2) sits above the store and the
 # row codecs and below the catalog, the planner and the executor: what it may
@@ -102,7 +102,7 @@ OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb
 # item 3) sits beside the value operations, below the binder and the
 # executor: what it may import.
 LIB = "lexdb_lib"
-LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access"}
+LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access", "lexdb_newfn"}
 
 # The pipeline module (design/lexdb-layers.md 6.2.3): what it may import
 # (and lexell's own libraries), the store names it may use, and who may

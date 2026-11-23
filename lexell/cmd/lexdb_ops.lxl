@@ -284,13 +284,13 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         match v {
             Val.Uuid(u) { return Ok(v) }
             Val.Text(x) { return Ok(Val.Uuid(try parseUuid(&x))) }
-            else { return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to uuid"))) }
+            else { return castMore(&v, t) }
         }
     } else if t.kind == lexdb_sql.K_BYTEA {
         match v {
             Val.Bytes(x) { return Ok(v) }
             Val.Text(x) { return Ok(Val.Bytes(try parseBytea(&x))) }
-            else { return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to bytea"))) }
+            else { return castMore(&v, t) }
         }
     } else if t.kind == lexdb_sql.K_ARRAY {
         match v {
@@ -528,7 +528,32 @@ pub fn coerceTime(v: &Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[
         }
         else {}
     }
-    return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to " + lexdb_sql.typeText(t))))
+    return castMore(&v, t)
+}
+
+// The casts PostgreSQL 19 added (lexdb-new-features.md P11), else coerce's 42846: a bytea of 16 bytes as a uuid (22P03
+// else), a uuid as its bytes. (An integer's bytes and a bytea as an integer are lexdb_newfn's #n_intbytes and #n_bytes2, 4, 8:
+// the binder's byteaCast, intCast.)
+fn castMore(v: &Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    match v {
+        Val.Bytes(b) {
+            if t.kind == lexdb_sql.K_UUID {
+                if len(b) != 16 { return Err(e("22P03", &("invalid input length for type uuid: " + len(b).toStr()))) }
+                let h = lexdb_sql.bytesHex(&b)
+                return Ok(Val.Uuid(h[2..10] + "-" + h[10..14] + "-" + h[14..18] + "-" + h[18..22] + "-" + h[22..34]))
+            }
+        }
+        Val.Uuid(u) {
+            if t.kind == lexdb_sql.K_BYTEA {
+                // (its 36-character text's 32 hex digits)
+                var hex = "\\x"
+                for i in 0..len(u) { if u[i] != '-' { hex.addByte(u[i]) } }
+                return Ok(Val.Bytes(try parseBytea(&hex)))
+            }
+        }
+        else {}
+    }
+    return Err(e("42846", &("cannot cast type " + kindName(&lexdb_sql.oidType(kindOid(&v))) + " to " + (if t.kind == lexdb_sql.K_UUID { "uuid" } else if t.kind == lexdb_sql.K_BYTEA { "bytea" } else { lexdb_sql.typeText(t) }))))
 }
 
 pub fn floorModInt(a: int, b: int): int {

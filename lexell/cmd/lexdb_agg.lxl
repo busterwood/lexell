@@ -47,6 +47,10 @@ pub const OP_ARRAY = 6
 pub const OP_STRING = 7
 pub const OP_VAR = 8                // the variances and standard deviations
 pub const OP_PCT = 9                // percentile_cont, percentile_disc
+pub const OP_PRODUCT = 10           // T-SQL's PRODUCT
+pub const OP_BITS = 11              // bit_and, bit_or, bit_xor (Oracle's BIT_AND_AGG, ...)
+pub const OP_ANY = 12               // any_value
+pub const OP_MOMENT = 13            // Oracle's KURTOSIS_POP / _SAMP, SKEWNESS_POP / _SAMP
 
 fn opOf(f: &str): int {
     if f == "count" { return OP_COUNT }
@@ -58,6 +62,10 @@ fn opOf(f: &str): int {
     if f == "array_agg" { return OP_ARRAY }
     if f == "string_agg" { return OP_STRING }
     if lexdb_pct.isPct(f) { return OP_PCT }
+    if strings.startsWith(f, "#product") { return OP_PRODUCT }
+    if f == "bit_and" || f == "bit_or" || f == "bit_xor" { return OP_BITS }
+    if f == "any_value" { return OP_ANY }
+    if strings.startsWith(f, "#kurtosis") || strings.startsWith(f, "#skewness") { return OP_MOMENT }
     return OP_VAR
 }
 
@@ -175,6 +183,9 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
         try lexdb_pct.checkValue(sp.dia, f, &v)
         if acc.n == 0 { acc.sum = more[0].clone() }
         append(mut &acc.seps, v)
+    } else if op >= OP_PRODUCT {
+        try addNew(sp, acc, v)
+        return Ok(Unit{})
     } else if op == OP_VAR {
         // the variances and standard deviations
         let x = try numOf(&v, &f)
@@ -304,6 +315,7 @@ fn orderIdx(sp: &AggSpec, acc: &Acc): Result[[]int, DbErr] {
 pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let f = &sp.fname
     if f == "count" { return Ok(Val.Int(acc.n)) }
+    if sp.op >= OP_PRODUCT { return finishNew(sp, acc) }
     if acc.n == 0 { return Ok(Val.Null) }
     if sp.op == OP_PCT {
         if lexdb_ops.isNull(&acc.sum) {
@@ -316,9 +328,17 @@ pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     }
     if f == "sum" { return Ok(acc.sum.clone()) }
     if f == "avg" {
-        // of intervals: their sum over the count, as PostgreSQL's interval_avg (and Oracle 23ai's AVG of an INTERVAL)
+        // of intervals: their sum over the count, as PostgreSQL's interval_avg (and Oracle 23ai's AVG of an INTERVAL; of a
+        // YEAR TO MONTH Oracle's whole months, cut toward zero)
         match acc.sum {
-            Val.Ival(_) { return lexdb_ops.arith(lexdb_ops.OP_DIV, &acc.sum, &Val.Num(Decimal.fromInt(acc.n))) }
+            Val.Ival(iv) {
+                if sp.dia == lexdb_pct.DIA_ORA && iv.days == 0 && iv.us == 0 {
+                    var m = iv
+                    m.months = iv.months / acc.n
+                    return Ok(Val.Ival(m))
+                }
+                return lexdb_ops.arith(lexdb_ops.OP_DIV, &acc.sum, &Val.Num(Decimal.fromInt(acc.n)))
+            }
             else {}
         }
     }
@@ -348,4 +368,132 @@ pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &nv, &(try numOf(&den, &f)))
     if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
     return sqrtNum(&vr)
+}
+
+// ---- the newest releases' aggregates (design/lexdb-new-features.md 6.1 item 7)
+
+// Adds an admitted value of the newer aggregates (op OP_PRODUCT and after).
+fn addNew(sp: &AggSpec, acc: mut &Acc, v: Val): Result[Unit, DbErr] {
+    let op = sp.op
+    if op == OP_PRODUCT {
+        // SQL Server's PRODUCT: integers multiplied as integers (past 2^63 an error, 8115 in the door), decimals exactly,
+        // floats as floats; a bit as its 0 or 1; a string 8117
+        let w = match v {
+            Val.Bool(b) { Val.Int(if b { 1 } else { 0 }) }
+            Val.Text(_) { return Err(e("TS8117", "Operand data type varchar is invalid for product operator.")) }
+            else { v }
+        }
+        if acc.n == 0 { acc.sum = w } else {
+            match acc.sum {
+                Val.Int(x) {
+                    match w {
+                        Val.Int(y) {
+                            match x.checkedMul(y) {
+                                Some(p) { acc.sum = Val.Int(p) }
+                                None { return Err(e("22003", "Arithmetic overflow error converting expression to data type bigint.")) }
+                            }
+                        }
+                        else { acc.sum = try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &w) }
+                    }
+                }
+                else { acc.sum = try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &w) }
+            }
+        }
+        // an int's within 2^31; a decimal's at six places (SQL Server's decimal(38, 6), each product rounded)
+        if sp.fname == "#product4" {
+            match acc.sum {
+                Val.Int(x) { if x > 2147483647 || x < -2147483648 { return Err(e("22003", "Arithmetic overflow error converting expression to data type int.")) } }
+                else {}
+            }
+        } else if sp.fname == "#product6" {
+            match acc.sum {
+                Val.Num(d) {
+                    match d.quantize(6, Rounding.HALF_AWAY) {
+                        Ok(q) { acc.sum = Val.Num(q) }
+                        Err(_) { return Err(e("22003", "Arithmetic overflow error converting expression to data type numeric.")) }
+                    }
+                }
+                Val.Int(x) { acc.sum = Val.Num(Decimal.fromInt(x).quantize(6, Rounding.HALF_AWAY).unwrapOr(Decimal.fromInt(x))) }
+                else {}
+            }
+        }
+    } else if op == OP_BITS {
+        // integers; Oracle's NUMBER cut toward zero
+        let x = match v {
+            Val.Int(i) { i }
+            Val.Bool(b) { if b { 1 } else { 0 } }
+            else {
+                match lexdb_ops.asNum(&v) {
+                    Some(d) {
+                        match d.toInt(Rounding.TOWARD_ZERO) {
+                            Ok(i) { i }
+                            Err(_) { return Err(e("22003", "bigint out of range")) }
+                        }
+                    }
+                    None { return Err(e("42883", &("function " + sp.fname + " needs an integer"))) }
+                }
+            }
+        }
+        if acc.n == 0 { acc.val = Val.Int(x) } else {
+            let y = match acc.val { Val.Int(i) { i } else { 0 } }
+            acc.val = Val.Int(if sp.fname == "bit_and" { x & y } else if sp.fname == "bit_or" { x | y } else { x ^ y })
+        }
+    } else if op == OP_ANY {
+        if acc.n == 0 { acc.val = v }
+    } else if op == OP_MOMENT {
+        match lexdb_ops.asFloat(&v) {
+            Some(x) { append(mut &acc.seps, Val.Float(x)) }
+            None { return Err(e("ORA00932", "inconsistent datatypes: expected NUMBER")) }
+        }
+    }
+    acc.n += 1
+    return Ok(Unit{})
+}
+
+// The newer aggregates' results: NULL over no rows (Oracle's bit aggregates 0).
+fn finishNew(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
+    let op = sp.op
+    if acc.n == 0 { return Ok(if op == OP_BITS && sp.dia == lexdb_pct.DIA_ORA { Val.Num(Decimal.zero()) } else { Val.Null }) }
+    if op == OP_PRODUCT { return Ok(acc.sum.clone()) }
+    if op == OP_BITS {
+        if sp.dia == lexdb_pct.DIA_ORA {
+            match acc.val { Val.Int(i) { return Ok(Val.Num(Decimal.fromInt(i))) } else {} }
+        }
+        return Ok(acc.val.clone())
+    }
+    if op == OP_ANY { return Ok(acc.val.clone()) }
+    // the moments of the values about their mean: the skewness m3 / m2^1.5, the kurtosis m4 / m2^2 - 3 (Oracle's: 0 below
+    // 3 values for the skewness, 4 for the kurtosis, and for values all equal); _SAMP the sample's adjustments
+    let n = len(acc.seps)
+    var mean = 0.0f
+    for v in acc.seps { mean += lexdb_ops.asFloat(&v).unwrapOr(0.0f) }
+    mean = mean / float(n)
+    var m2 = 0.0f
+    var m3 = 0.0f
+    var m4 = 0.0f
+    for v in acc.seps {
+        let d = lexdb_ops.asFloat(&v).unwrapOr(0.0f) - mean
+        m2 += d * d
+        m3 += d * d * d
+        m4 += d * d * d * d
+    }
+    let fn0 = float(n)
+    m2 = m2 / fn0
+    m3 = m3 / fn0
+    m4 = m4 / fn0
+    let kurt = strings.startsWith(&sp.fname, "#kurtosis")
+    let samp = strings.endsWith(&sp.fname, "_samp")
+    if m2 == 0.0f || (kurt && n < 4) || (!kurt && n < 3) { return Ok(Val.Num(Decimal.zero())) }
+    var r = 0.0f
+    if kurt {
+        let g2 = m4 / (m2 * m2) - 3.0f
+        r = if samp { ((fn0 + 1.0f) * g2 + 6.0f) * (fn0 - 1.0f) / ((fn0 - 2.0f) * (fn0 - 3.0f)) } else { g2 }
+    } else {
+        let g1 = m3 / (m2 * m2.sqrt())
+        r = if samp { g1 * (fn0 * (fn0 - 1.0f)).sqrt() / (fn0 - 2.0f) } else { g1 }
+    }
+    match Decimal.parse(&(r.toStr())) {
+        Ok(d) { return Ok(Val.Num(d)) }
+        Err(_) { return Ok(Val.Float(r)) }
+    }
 }
