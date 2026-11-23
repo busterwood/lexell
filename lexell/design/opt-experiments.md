@@ -946,3 +946,37 @@ Test: tests/run/option_niche (lists and trees built, walked, cloned and dropped;
 toStr; arrays and maps of them; a user type with the empty variant first; an Option of an
 Option of a box, which keeps its tag; an iterator whose next returns one; a closed type whose
 Ok holds a box; replace; a boxed closed type in an Option), the same on --c, --native and -O.
+
+## 25. r10 and r11 for locals (as built)
+
+`interp` kept a temporary of each arithmetic case in its frame (a store and a load a step):
+every register a local could have was taken (rbx and r12-r15 saved, rsi, rdi, r8 and r9 where
+nothing calls), while r10 and r11 held nothing between statements: they are the code
+generator's scratch registers. Now an integer local used in a loop (raw weight 128) may have one
+where no position of its range runs code that uses them (`SCRATCH_REGS`, `loud1011`):
+
+- calls and 128-bit code (loud and loud89 positions, as for the other registers);
+- `clobbers1011`: an aggregate copied or built (`copyMem`, `initAt`, `fillEntries`), a store
+  through an address it computes or to a global (`genAssign` holds the address in r11), a
+  post-increment of a place in memory, a selection (`genConstSel`), a declaration of an
+  aggregate, a return;
+- an array filled by `rep stos` (rdi kept in r11), at all of the loop's positions;
+- the entry (no argument arrives in either).
+
+The stubs of the inline growth and allocation paths save r8-r11 already. Neither register is
+saved or restored: the range has no call.
+
+| measure (main 928ada8b against this) | instructions | cycles |
+|---|---:|---:|
+| bench interp (7 interleaved rounds) | -1.6% | -2.2% (1,147-1,163M; main 1,180-1,191M, or 1,320-1,340M in 3 of 7) |
+| perfsuite run suite / compile suite | -0.03 / +0.29% | -0.22 / +0.15% |
+| apps regex / json / jq / cmark / decimal | 0.00 / -0.03 / 0.00 / +0.05 / -0.03% | +1.1 / -0.5 / -0.6 / +0.4 / -0.1% |
+| TPC-H SF1, server instructions per query (22) | -0.15% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | level (172,022-172,025 against 172,020-172,021) | -3.7 / -2.2% |
+
+The compile suite's +0.29% is the new marks of the scan; without the loop's threshold every
+local could take r10 or r11 (TPC-H -0.27%, decimal -0.24%) and the compile suite paid +0.52%.
+
+Test: tests/run/native_scratch_regs (many integers live at once across stores through computed
+addresses and to a global, records copied and built, post-increments of elements, selections
+between large constants, a fill by rep stos, a return from a branch, 128-bit arithmetic).

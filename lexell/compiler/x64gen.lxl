@@ -41,6 +41,7 @@ const LOCAL_REGS: []int = [3, 12, 13, 14, 15]     // rbx r12-r15 (callee-saved):
 // Caller-saved registers that the code generator uses only for calls and for the operations
 // that make a statement loud (scan): locals whose live range has no loud statement.
 const QUIET_REGS: []int = [6, 7, 8, 9]            // rsi rdi r8 r9
+const SCRATCH_REGS: []int = [10, 11]               // r10 r11: locals where no code uses them (clobbers1011)
 // What the out-of-line growth of an inline rt_arr_push saves around its call (genStubs): an even
 // count, so that rsp stays 16-byte aligned.
 const GROW_SAVE: []int = [6, 7, 8, 9, 10, 11]      // rsi rdi r8 r9 r10 r11
@@ -169,6 +170,7 @@ type Gen = record {
     scanExpr: int               // > 0: the scan is in the body of a call generated in place (one position)
     loud: []bool                // per position: its code may change rsi, rdi, r8 or r9 (calls, ...)
     loud89: []bool              // ... may change r8 or r9 but not rsi and rdi (128-bit arithmetic)
+    loud1011: []bool            // ... may change r10 or r11 (clobbers1011), besides loud and loud89 ones
     any89: bool                 // ... some position is
     fpLoud: []bool              // ... may change xmm8-xmm14 (calls but of native/math.c, ...)
     fpKeep: Map[str, bool]      // the runtime functions that leave xmm8-xmm15 alone (rtx.FP_KEEP)
@@ -278,7 +280,7 @@ fn newGen(u: ir.Ir): Gen {
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
         caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
-        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], any89: false, regions: [], openLoops: [],
+        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud1011: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
@@ -1022,6 +1024,7 @@ fn (g: mut &Gen) allocRegs(f: int) {
     g.pos = 0
     g.loud = [true]                     // position 0: the entry, where the arguments arrive
     g.loud89 = [false]
+    g.loud1011 = [true]                 // (the entry: no argument arrives in r10 or r11)
     g.any89 = false
     g.fpLoud = [false]                  // ... in xmm0-xmm7 (the prologue moves doubles from there)
     g.sites = []
@@ -1082,6 +1085,9 @@ fn (g: mut &Gen) allocRegs(f: int) {
             append(mut &l89Before, l89Before[i] + (if g.loud[i] || g.loud89[i] { 1 } else { 0 }))
         }
     }
+    // ... and of the positions that may change r10 and r11 (loud89's do too: 128-bit code), made
+    // when a local first asks for one
+    var l1011Before: []int = []
     // the data pointer and the length of a str that loops hoisted (they save two loads and one a
     // use): half the weight, and a sixteenth of the raw weight: a register of their own to save
     // only for a use in a loop in a loop (a loop over a short str runs a few times a call; a
@@ -1152,6 +1158,22 @@ fn (g: mut &Gen) allocRegs(f: int) {
         }
         for i in 0..nSaved {
             if r < 0 && g.regFree(&given, LOCAL_REGS[i], l) { r = LOCAL_REGS[i] }
+        }
+        // r10 or r11 where no position of the range changes them (clobbers1011): nothing to save;
+        // for a local used in a loop (raw weight 128: two uses there), which is where it pays (and
+        // the registers' lists of locals stay short: regFree compares a range with each)
+        if r < 0 && !g.inner[l] && g.rawW[l] >= 128 {
+            var q = -1
+            for x in SCRATCH_REGS {
+                if q < 0 && g.regFree(&given, x, l) { q = x }
+            }
+            if q >= 0 && len(l1011Before) == 0 {
+                append(mut &l1011Before, 0)
+                for i in 0..len(g.loud) {
+                    append(mut &l1011Before, l1011Before[i] + (if g.loud[i] || g.loud89[i] || g.loud1011[i] { 1 } else { 0 }))
+                }
+            }
+            if q >= 0 && g.quietLive(l, &l1011Before) { r = q }
         }
         // a new one: for a value kept across a call even when named only twice (a slot's
         // store before the call and load after it cost more than the save and restore)
@@ -2032,6 +2054,7 @@ fn (g: mut &Gen) step() {
     g.pos += 1
     append(mut &g.loud, false)
     append(mut &g.loud89, false)
+    append(mut &g.loud1011, false)
     append(mut &g.fpLoud, false)
     append(mut &g.tailEnd, -1)
     append(mut &g.posW, g.useWeight(g.loopDepth))
@@ -2113,6 +2136,31 @@ fn (g: &Gen) loudNode(x: int): bool {
     if n.k == ir.E_CAST {
         let st = g.u.nodes[n.a].ty
         return (g.isF(t) && g.tk(st) == ir.TY_U64) || (g.isF(st) && g.tk(t) == ir.TY_U64)
+    }
+    return false
+}
+
+// Whether the code of x (a node at its position, not its operands) may change r10 or r11, which the
+// code generator uses as scratch registers: an aggregate copied or built (copyMem, initAt,
+// fillEntries), a store through an address it computes or to a global (genAssign holds the address
+// in r11), a post-increment of a place in memory, a selection between constants (genConstSel), an
+// array filled by rep stos (rdi kept in r11), a return (an aggregate's copy). Calls and 128-bit
+// code are loud already (loud, loud89).
+fn (g: &Gen) clobbers1011(x: int): bool {
+    let n = g.u.nodes[x]
+    let k = n.k
+    if k == ir.S_RETURN { return true }
+    if k == ir.S_DECL { return n.b >= 0 && g.isAggr(g.u.locals[n.a].ty) }
+    if k >= ir.S_DECL { return false }
+    if k == ir.E_CLIT || k == ir.E_COND { return true }
+    if k == ir.E_CALL { return g.isAggr(n.ty) }
+    if k == ir.E_POSTINC { return g.u.nk(n.a) != ir.E_LOCAL }
+    if k == ir.E_ASSIGN {
+        let t = n.ty
+        if g.isAggr(t) || g.is128(t) || g.isF(t) { return g.u.nk(n.a) != ir.E_LOCAL || g.isAggr(t) }
+        let lk = g.u.nk(n.a)
+        if lk == ir.E_LOCAL { return false }
+        return !((lk == ir.E_DEREF || lk == ir.E_MEMBER) && g.simple(n.b))
     }
     return false
 }
@@ -2313,6 +2361,10 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
             g.posOf[x] = -1
         }
     }
+    if !g.counting && (k == ir.E_ASSIGN || k == ir.E_CLIT || k == ir.E_COND || k == ir.E_CALL || k == ir.E_POSTINC) &&
+        g.clobbers1011(x) {
+        g.loud1011[g.pos] = true
+    }
     if !g.counting && x != g.noCopy && g.loudNode(x) {
         if g.loud89Node(x) {
             g.loud89[g.pos] = true
@@ -2407,6 +2459,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         }
     } else if k == ir.S_EXPR || k == ir.S_RETURN {
         g.step()
+        if !g.counting && g.clobbers1011(x) { g.loud1011[g.pos] = true }
         g.scan(n.a, depth)
     } else if k == ir.S_SWITCH {
         g.step()
@@ -2462,6 +2515,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         }
     } else if k == ir.S_DECL {
         g.step()
+        if !g.counting && g.clobbers1011(x) { g.loud1011[g.pos] = true }
         let l = n.a
         g.occur(l)
         g.declLoop[l] = if len(g.openLoops) > 0 { g.openLoops[len(g.openLoops) - 1] } else { -1 }
@@ -2503,6 +2557,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         g.exitLoop()
     } else if k == ir.S_FOR {
         g.scan(n.a, depth)
+        let p0 = g.pos
         g.enterLoop()
         g.scan(n.b, depth + 1)
         g.scan(n.c, depth + 1)
@@ -2511,6 +2566,10 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         if fill { g.noSites += 1 }
         g.scan(n.d, depth + 1)
         if fill { g.noSites -= 1 }
+        if fill && g.scanExpr == 0 {
+            // rep stos keeps rdi in r11 (stmt1), at the loop's positions
+            for p in p0..g.pos + 1 { g.loud1011[p] = true }
+        }
         g.exitLoop()
     }
 }
