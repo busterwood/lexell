@@ -153,8 +153,8 @@ SELECT * FROM dbo.acct;
 ```text
 (1 row affected)
 
-Msg 547, Level 16, State 1, Line 1
-new row for relation "acct" violates check constraint "acct_bal_check"
+Msg 547, Level 16, State 1, Line 3
+The UPDATE statement conflicted with the CHECK constraint "acct_bal_check". The conflict occurred in database "lexdb", table "dbo.acct", column 'bal'.
 trancount state
 --------- -----
 1         1
