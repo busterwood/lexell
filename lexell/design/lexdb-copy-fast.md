@@ -21,8 +21,10 @@ non-empty table, or a transaction block leaves the generic path unchanged.
 - The COPY names every column, in table order.
 - Text format, default delimiter (`\t`) and NULL (`\N`); no CSV, header,
   FORCE options, `batch_rows`, or INSERT BULK.
-- One integer primary key; no dropped columns, secondary indexes, checks,
-  foreign keys, defaults, identities, sequences, or collations.
+- One integer primary key, or none (the hidden ROWID); no dropped columns,
+  unique, filtered or expression indexes, checks, foreign keys, defaults,
+  identities, sequences, or collations. Plain secondary indexes are built
+  (below).
 - Scalar columns only: int2/int4/int8, bool, numeric, float4/float8, date,
   time, timestamp, timestamptz, text/varchar, uuid. No bytea, char(n),
   enum, array, interval, or other tagged forms.
@@ -114,6 +116,43 @@ load is a little faster because `commitOrder` compares two writes' keys once (`s
 twice; it still takes the generic path, whose profile is half the commit (sorting the 3M writes:
 `commitOrder` 25%) and 41% `insertOne`. A fast path that also builds the index entries is what
 is left. Test: `tests/lexdb/run/exec_copy_fast_nokey`.
+
+## Tables with secondary indexes (2026-11-23)
+
+The fast path refused a table with any index, so the indexed load took the generic path: a
+`Val` row and `insertOne` a row, and an own-writes map entry per index entry, then a commit that
+sorted the 3M writes (`commitOrder` 25% of the load). Now `fastCopyPlan` takes plain indexes
+(columns only: not unique, not filtered, no expressions), as `FastCopyPlan.ixs`:
+
+- `fastCopyEntries` makes each row's entries from the fixed row it built (`fixedVal` of each
+  part, `encIdxPart`, then the row's key: `insertRow`'s form) and keeps them per index. An entry
+  too large for the store is the row's error (`lexdb_store.keyFits`: 54000, as the generic path).
+- `fastCopyIndexes`, after the last row, sorts each index's entries and writes them in key order
+  (`lexdb_access.loadEntry`: no own-writes entry unless an out-of-order key made the load keep
+  them). The commit finds each tree's writes in order and does not sort them.
+- The sort, `lexdb_access.sortKeysMoved`, is a radix sort (`lexdb_vec.radixPerm`) of the 8 bytes
+  after the prefix every entry shares (the part's tag, and often a text's first letters: `cust`),
+  then each run of one such word by the whole key. With a comparison sort (`sortBy`) the sorting
+  was a quarter of the load (0.85 of 3.40 s); sorting and writing the entries is now 11% (0.3 s).
+
+A unique index stays with the generic path: its clash must be the error of its row, before any
+later row's. A text of `lexdb_rows.LONG` bytes or more does not fit the fixed row; the fast path
+used to fail the load with 0A000 for it (any table, indexed or not). Now such a row's values are
+kept aside (`FastLong`) and the row is stored in the tagged form (`encRow`, with its `rowHead`),
+as the generic path stores it.
+
+| 1M wide rows, `\copy`, median of 3 | before | now | PostgreSQL 18 |
+|---|---:|---:|---:|
+| a primary key and two secondary indexes (`cust` text, `ts` timestamptz) | 5.81 s | 2.71 s | 4.88 s |
+| a primary key | 1.45 s | 1.46 s | 1.81 s |
+
+(PostgreSQL's indexed load in the same session: runs 5.45, 4.88, 4.55 s; 4.74 in the day's
+refresh. Its unindexed one from the refresh.)
+
+The load's profile now: parsing the fields 38%, the commit's B-tree writes 36%, the index
+entries made and sorted 16%. Test: `tests/lexdb/run/exec_copy_fast_index` (the same rows
+loaded through the generic path, a table with a check, answer the indexes' queries alike, before
+and after rows change; errors; long texts; a table without a primary key).
 
 ## Reproduction
 

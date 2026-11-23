@@ -1,0 +1,137 @@
+// lexdb_exec: COPY's serial fast path for a table with secondary indexes (plain, not unique):
+// each row's entries made as it is loaded, each index's sorted and written after the rows. The
+// same rows loaded through the generic path (a table with a check) answer the indexes' queries
+// alike, before and after rows change; a duplicate key, a bad value and an entry too large undo
+// the load (the generic path's errors); values too long for the fixed row; a table without a
+// primary key.
+// expect: load: COPY 2000 COPY 2000
+// expect: same: yes; 52
+// expect: after: UPDATE 20 DELETE 178; same: yes; 18
+// expect: dup: 23505 COPY e, line 3; 0
+// expect: bad: 22P02 COPY e, line 2, column id: "x"
+// expect: long: 54000 COPY e, line 2; 0
+// expect: long values: COPY 3; 1|5|3|3;2|300|5|3;3|70000|NULL|4; 1
+// expect: keyless: COPY 3; 2;3
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+
+fn err(e: &lexdb_base.DbErr): str {
+    return e.state + (if e.context != "" { " " + e.context } else { "" })
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+// COPY ... FROM STDIN with data: its tag, or its error.
+fn copyIn(s: mut &lexdb_exec.Session, sql: str, data: &str): str {
+    let stmts = lexdb_parse.parse(&sql).unwrap()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    match s.run(&stmts[0], &none, &nt) {
+        Ok(r) {
+            if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+            match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                Ok(r2) { return r2.tag.clone() }
+                Err(e) { return err(&e) }
+            }
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        // the same rows into t (the fast path) and g (a check: the generic path)
+        let m1 = q(mut &s, "create table t (id bigint primary key, cust text, ts timestamptz, n int, f float8)")
+        let m2 = q(mut &s, "create index t_cust on t (cust)")
+        let m3 = q(mut &s, "create index t_ts on t (ts desc)")
+        let m4 = q(mut &s, "create index t_nc on t (n, cust)")
+        let m5 = q(mut &s, "create table g (id bigint primary key, cust text, ts timestamptz, n int, f float8, check (id > -1000000))")
+        let m6 = q(mut &s, "create index g_cust on g (cust)")
+        let m7 = q(mut &s, "create index g_ts on g (ts desc)")
+        let m8 = q(mut &s, "create index g_nc on g (n, cust)")
+        var data = ""
+        for j in 0..2000 {
+            let id = (j * 7919) % 2000            // out of order after the first rows
+            let cust = if j % 50 == 0 { "\\N" } else if j % 61 == 0 { "a\\tb" + (j % 3).toStr() } else { "c" + (id % 37).toStr() }
+            let ts = if j % 43 == 0 { "\\N" } else { "2026-0" + (1 + id % 9).toStr() + "-1" + (id % 10).toStr() + " 0" + (id % 10).toStr() + ":30:00+00" }
+            let n = if j % 29 == 0 { "\\N" } else { (id % 11 - 5).toStr() }
+            data = data + id.toStr() + "\t" + cust + "\t" + ts + "\t" + n + "\t" + (id / 3).toStr() + ".5\n"
+        }
+        let c1 = copyIn(mut &s, "copy t from stdin", &data)
+        let c2 = copyIn(mut &s, "copy g from stdin", &data)
+        println("load: " + c1 + " " + c2)
+        let qs = ["select id from # where cust = 'c5' order by id",
+                  "select id from # where cust is null order by id",
+                  "select count(*) from # where cust = 'a\tb1'",
+                  "select id, ts from # where ts >= '2026-03-12' and ts < '2026-03-14' order by ts desc, id",
+                  "select count(*) from # where ts is null",
+                  "select id from # where n = -2 and cust = 'c9' order by id",
+                  "select count(*) from # where n is null",
+                  "select cust, count(*) from # where cust > 'c3' group by cust order by cust"]
+        var same = true
+        for x in qs {
+            let a = q(mut &s, strings.replaceAll(&x, "#", "t"))
+            let b = q(mut &s, strings.replaceAll(&x, "#", "g"))
+            if a != b { println("differ: " + x + "\n  " + a + "\n  " + b); same = false }
+        }
+        println("same: " + (if same { "yes" } else { "no" }) + "; " + q(mut &s, "select count(*) from t where cust = 'c5'"))
+        // changed after the load: the entries the load made are the ones taken away
+        let u1 = q(mut &s, "update t set cust = 'zz' where id % 100 = 5")
+        let d1 = q(mut &s, "delete from t where n = 0")
+        let u2 = q(mut &s, "update g set cust = 'zz' where id % 100 = 5")
+        let d2 = q(mut &s, "delete from g where n = 0")
+        var same2 = true
+        for x in qs {
+            if q(mut &s, strings.replaceAll(&x, "#", "t")) != q(mut &s, strings.replaceAll(&x, "#", "g")) { same2 = false }
+        }
+        println("after: " + u1 + " " + d1 + "; same: " + (if same2 { "yes" } else { "no" }) + "; " + q(mut &s, "select count(*) from t where cust = 'zz'"))
+        // a duplicate key, a bad value, a key too large for the index: the load is undone
+        let m9 = q(mut &s, "create table e (id bigint primary key, v text)")
+        let m10 = q(mut &s, "create index e_v on e (v)")
+        println("dup: " + copyIn(mut &s, "copy e from stdin", &"2\tb\n1\ta\n2\tc\n") + "; " + q(mut &s, "select count(*) from e"))
+        println("bad: " + copyIn(mut &s, "copy e from stdin", &"1\tb\nx\ta\n"))
+        var long = ""
+        for j in 0..3000 { long = long + "x" }
+        println("long: " + copyIn(mut &s, "copy e from stdin", &("1\ta\n2\t" + long + "\n")) + "; " + q(mut &s, "select count(*) from e"))
+        // texts too long for the fixed row: their rows stored in the tagged form
+        let m15 = q(mut &s, "create table w (id bigint primary key, v text, d numeric, n int)")
+        let m16 = q(mut &s, "create index w_n on w (n)")
+        var big = ""
+        for j in 0..70000 { big = big + (j % 10).toStr() }
+        let c4 = copyIn(mut &s, "copy w from stdin", &("1\tshort\t1.5\t3\n2\t" + big[0..300] + "\t-2.25\t3\n3\t" + big + "\t\\N\t4\n"))
+        println("long values: " + c4 + "; " + q(mut &s, "select id, length(v), length(d::text), n from w where n >= 3 order by id") + "; " +
+                q(mut &s, "select count(*) from w where v = '" + big + "'"))
+        // a table without a primary key, indexed
+        let m11 = q(mut &s, "create table k (a int, v text)")
+        let m12 = q(mut &s, "create index k_v on k (v)")
+        let c3 = copyIn(mut &s, "copy k from stdin", &"3\tc\n1\ta\n2\tc\n")
+        println("keyless: " + c3 + "; " + q(mut &s, "select a from k where v = 'c' order by a"))
+        return 0
+    })
+}

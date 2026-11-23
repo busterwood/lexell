@@ -15381,6 +15381,10 @@ type FastCopyPlan = record {
     pk: int
     rid: int        // a table without a primary key: its hidden ROWID column (the last), numbered by its sequence; else -1
     nIn: int        // the fields of a record (n, or n - 1 without the ROWID)
+    // the table's secondary indexes (each plain: columns only, not unique, not filtered): their
+    // entries made row by row, sorted, and written after the rows in key order (fastCopyIndexes)
+    ixs: []int
+    fl: FixedLay
 }
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
@@ -15388,7 +15392,15 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 { return None }
     if s.copy.delim != "\t" || s.copy.null != "\\N" { return None }
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
-    if len(t.view) > 0 || len(t.slots) != 0 || len(t.indexes) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
+    if len(t.view) > 0 || len(t.slots) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
+    // (a unique index's clash is an error at its row, before a later row's: the generic path)
+    var ixs: []int = []
+    for i in 0..len(t.indexes) {
+        let x = &t.indexes[i]
+        if x.unique || x.pred.isSome() || len(x.exprs) > 0 { return None }
+        for c in x.cols { if c < 0 { return None } }
+        append(mut &ixs, i)
+    }
     if len(t.pk) != 1 { return None }
     // a table without a primary key (9.88): its ROWID the last column, given by its sequence
     let rid = if t.cols[t.pk[0]].name == lexdb_catalog.ROWID { t.pk[0] } else { -1 }
@@ -15439,7 +15451,8 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     }
     var ks: []byte = withCapacity(len(t.cols))
     for k in kinds0 { append(mut &ks, k) }
-    return Some(FastCopyPlan{kinds: ks, off: off, v0: fixed, lay: nl - 1, n: len(t.cols), pk: pk, rid: rid, nIn: nIn})
+    let fl = lexdb_rows.layOfKinds(&ks)
+    return Some(FastCopyPlan{kinds: ks, off: off, v0: fixed, lay: nl - 1, n: len(t.cols), pk: pk, rid: rid, nIn: nIn, ixs: ixs, fl: fl})
 }
 
 // A 4-byte little-endian fixed value.
@@ -15562,9 +15575,14 @@ fn fastCopyNum(t: &Table, p: int, s: &str): Result[Decimal, DbErr] {
     return Ok(d)
 }
 
-// One non-NULL field into the stored row; the word of an integer key, else 0.
+// A value too long for the fixed row (a text or numeric of lexdb_rows.LONG bytes or more): its
+// row is stored in the tagged form instead (fastCopyRow).
+type FastLong = record { p: int; v: Val }
+
+// One non-NULL field into the stored row; the word of an integer key, else 0. A value too long
+// for the fixed row goes to longs, its place left empty.
 fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int, s: &str,
-                 b: mut &[]byte): Result[int, DbErr] {
+                 b: mut &[]byte, longs: mut &[]FastLong): Result[int, DbErr] {
     let k = plan.kinds[p]
     if lexdb_rows.isWordKind(k) {
         var v = 0
@@ -15600,16 +15618,24 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
         let spaces = len(s) > 0 && (strings.isSpace(s[0]) || strings.isSpace(s[len(s) - 1]))
         let d = if spaces { try fastCopyNum(t, p, &(strings.trim(s))) } else { try fastCopyNum(t, p, s) }
         let x = d.toBin()
-        if len(x) >= lexdb_rows.LONG { return Err(e("0A000", "lexdb: COPY fast path: numeric too long")) }
+        if len(x) >= lexdb_rows.LONG {
+            append(mut &longs, FastLong{p: p, v: Val.Num(d)})
+            binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
+            return Ok(0)
+        }
         appendStr(mut &b, x)
         binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
         return Ok(0)
     }
     if k == lexdb_rows.PK_TEXT {
-        if len(s) >= lexdb_rows.LONG { return Err(e("0A000", "lexdb: COPY fast path: text too long")) }
         if t.cols[p].typ.oid == lexdb_sql.OID_VARCHAR && t.cols[p].typ.len > 0 && len(s) > t.cols[p].typ.len &&
            strings.runeCount(s) > t.cols[p].typ.len {
             return Err(e("22001", &("value too long for type character varying(" + t.cols[p].typ.len.toStr() + ")")))
+        }
+        if len(s) >= lexdb_rows.LONG {
+            append(mut &longs, FastLong{p: p, v: Val.Text(s.clone())})
+            binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
+            return Ok(0)
         }
         appendStr(mut &b, s)
         binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
@@ -15627,7 +15653,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
 
 // One field: NULL, an escaped value, or plain.
 fn fastCopyOne(t: &Table, txn: &lexdb_store.Txn, plan: &FastCopyPlan, p: int, raw: &str, anyEsc: bool,
-               b: mut &[]byte): Result[int, DbErr] {
+               b: mut &[]byte, longs: mut &[]FastLong): Result[int, DbErr] {
     let k = plan.kinds[p]
     if raw == "\\N" {
         if t.cols[p].notNull {
@@ -15639,20 +15665,21 @@ fn fastCopyOne(t: &Table, txn: &lexdb_store.Txn, plan: &FastCopyPlan, p: int, ra
     }
     if anyEsc && strings.indexOfByte(raw, '\\', 0) >= 0 {
         let un = fastCopyUnescape(raw)
-        return fastCopyField(t, &txn.sql.zone, plan, p, &un, mut &b)
+        return fastCopyField(t, &txn.sql.zone, plan, p, &un, mut &b, mut &longs)
     }
-    return fastCopyField(t, &txn.sql.zone, plan, p, raw, mut &b)
+    return fastCopyField(t, &txn.sql.zone, plan, p, raw, mut &b, mut &longs)
 }
 
 // One record: fields to the stored row, the key, and putRowLoad.
 fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel: &lexdb_access.Rel, plan: &FastCopyPlan, line: &str,
-               rowid: int, state: mut &lexdb_access.Load): Result[Unit, DbErr] {
+               rowid: int, state: mut &lexdb_access.Load, ents: mut &[][]str): Result[Unit, DbErr] {
     var b: []byte = withCapacity(plan.v0 + len(line))
     for i in 0..plan.v0 { append(mut &b, 0) }
     b[0] = lexdb_rows.FIXED
     binary.setU16LE(mut &b, 1, plan.lay)
     var id = 0
     var haveId = false
+    var longs: []FastLong = []
     let anyEsc = strings.indexOfByte(line, '\\', 0) >= 0
     var p = 0
     var start = 0
@@ -15661,7 +15688,7 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
         let end = if i < 0 { len(line) } else { i }
         if p >= plan.nIn { return Err(e("22P04", "extra data after last expected column")) }
         let raw = line[start..end]
-        let v = try fastCopyOne(t, txn, plan, p, &raw, anyEsc, mut &b)
+        let v = try fastCopyOne(t, txn, plan, p, &raw, anyEsc, mut &b, mut &longs)
         if p == plan.pk { id = v; haveId = true }
         p += 1
         if i < 0 { break }
@@ -15676,11 +15703,61 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
         haveId = true
     }
     if !haveId { return Err(e("XX000", "lexdb: COPY fast path: no primary key value")) }
-    let row = strFromBytes(&b)
-    if !(try lexdb_access.loadRow(st, txn, rel, id, &row, state)) {
+    let fixed = strFromBytes(&b)
+    // a value too long for the fixed row: the row's values, stored in the tagged form (encRow's)
+    var vals: []Val = []
+    if len(longs) > 0 {
+        for q in 0..plan.n { append(mut &vals, try fastCopyVal(plan, &fixed, q)) }
+        for l in longs { vals[l.p] = l.v.clone() }
+    }
+    if len(plan.ixs) > 0 { try fastCopyEntries(t, plan, &fixed, &vals, id, ents) }
+    let row = if len(longs) > 0 { lexdb_access.encRow(rel, &vals) } else { fixed }
+    let head = if len(longs) > 0 { lexdb_rows.rowHead(&row) } else { 0 }
+    if !(try lexdb_access.loadRow(st, txn, rel, id, &row, head, state)) {
         return Err(e("23505", "duplicate key value violates unique constraint"))
     }
     lexdb_stats.noteChg(st, txn.sql.sess, t, 0)
+    return Ok(Unit{})
+}
+
+// Place q of a fixed row the load made: its value, or NULL.
+fn fastCopyVal(plan: &FastCopyPlan, row: &str, q: int): Result[Val, DbErr] {
+    if (row[3 + q / 8] & byte(1 << (q % 8))) != 0 { return Ok(Val.Null) }
+    return lexdb_rows.fixedVal(row, q, plan.kinds[q], &plan.fl)
+}
+
+// Row's entries in the plan's indexes (its parts, then its key: insertRow's), kept to be written
+// after the load (fastCopyIndexes). The parts from the fixed row, or from vals (a row with a
+// value too long for it). A key too large is the row's error, as insertRow's.
+fn fastCopyEntries(t: &Table, plan: &FastCopyPlan, row: &str, vals: &[]Val, id: int, ents: mut &[][]str): Result[Unit, DbErr] {
+    for j in 0..len(plan.ixs) {
+        let x = &t.indexes[plan.ixs[j]]
+        var k = ""
+        for c in x.cols {
+            let v = if len(vals) > 0 { vals[c].clone() } else { try fastCopyVal(plan, row, c) }
+            lexdb_access.encIdxPart(mut &k, &v)
+        }
+        binary.addU64BE(mut &k, id ^ (-9223372036854775807 - 1))
+        try lexdb_store.keyFits(&k)
+        append(mut &ents[j], k)
+    }
+    return Ok(Unit{})
+}
+
+// The load's index entries, each index's sorted, written in key order: no own-writes entry while
+// the load kept none (lexdb_access.Load), and none of the commit's sorting (commitOrder). An
+// entry's value is its row's key, its last 8 bytes.
+fn fastCopyIndexes(txn: mut &lexdb_store.Txn, t: &Table, plan: &FastCopyPlan, state: &lexdb_access.Load,
+                   ents: mut &[][]str): Result[Unit, DbErr] {
+    for j in 0..len(plan.ixs) {
+        let tree = t.indexes[plan.ixs[j]].tree
+        var es = replace(mut &ents[j], [])
+        lexdb_access.sortKeysMoved(mut &es)
+        for k in es {
+            let pk = k[len(k) - 8..len(k)]
+            try lexdb_access.loadEntry(txn, tree, &k, &pk, state)
+        }
+    }
     return Ok(Unit{})
 }
 
@@ -15697,6 +15774,8 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
     var count = 0
     var lineNo = 0
     var state = lexdb_access.newLoad()
+    var ents: [][]str = []
+    for j in 0..len(plan.ixs) { append(mut &ents, []) }
     let rel = lexdb_catalog.relOf(t)
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
     let next = fn(): CopyPart {
@@ -15732,7 +15811,7 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
                 ridNext += defs.seqs[plan.rid].inc
                 ridLeft -= 1
             }
-            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state) {
+            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state, mut &ents) {
                 Ok(_) {}
                 Err(x) { return Err(fastCopyAtRec(x, &where, lineNo, &line)) }
             }
@@ -15760,13 +15839,14 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
                 ridNext += defs.seqs[plan.rid].inc
                 ridLeft -= 1
             }
-            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state) {
+            match fastCopyRow(st, txn, t, &rel, plan, &line, rowid, mut &state, mut &ents) {
                 Ok(_) {}
                 Err(x) { return Err(fastCopyAtRec(x, &where, lineNo, &line)) }
             }
             count += 1
         }
     }
+    try fastCopyIndexes(txn, t, plan, &state, mut &ents)
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
 

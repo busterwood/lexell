@@ -1487,6 +1487,89 @@ pub fn sortKeysPerm(ks: &[]str, order: mut &[]int) {
 // The keys sortKeysPerm sorts by insertion, at most.
 const SORT_FEW = 32
 
+// Keys (distinct) in order, moved: by the 8 bytes after the prefix every key shares, a radix sort
+// (lexdb_vec.radixPerm), then each run of one such word by the whole key. A load's index entries
+// (COPY's fast path) share their parts' leading bytes, a text's tag and often its first letters.
+pub fn sortKeysMoved(ks: mut &[]str) {
+    let n = len(ks)
+    var sorted = true
+    for i in 1..n {
+        if ks[i] < ks[i - 1] {
+            sorted = false
+            break
+        }
+    }
+    if sorted { return }
+    var lcp = len(ks[0])
+    let k0 = &ks[0]
+    for i in 1..n {
+        let k = &ks[i]
+        if len(k) < lcp { lcp = len(k) }
+        var c = 0
+        while c < lcp && k[c] == k0[c] { c += 1 }
+        lcp = c
+    }
+    var pre: []int = withCapacity(n)
+    var lo = 0
+    var hi = 0
+    for i in 0..n {
+        let k = &ks[i]
+        var x = 0
+        if len(k) >= lcp + 8 {
+            x = binary.readI64BEStr(k, lcp)
+        } else {
+            for j in 0..8 { x = (x << 8) | (if lcp + j < len(k) { int(k[lcp + j]) } else { 0 }) }
+        }
+        x = x ^ (-9223372036854775807 - 1)
+        if i == 0 || x < lo { lo = x }
+        if i == 0 || x > hi { hi = x }
+        append(mut &pre, x)
+    }
+    var span = -1
+    match hi.checkedSub(lo) {
+        Some(d) { if d < (1 << 62) { span = d } }
+        None {}
+    }
+    if span < 0 {
+        collections.sortBy(ks, fn(a: &str, b: &str): int { return a.cmp(b) })
+        return
+    }
+    var bits = 0
+    while bits < 62 && (span >> bits) > 0 { bits += 1 }
+    for i in 0..n { pre[i] = pre[i] - lo }
+    var perm = lexdb_vec.radixPerm(&pre, bits)
+    var out: []str = withCapacity(n)
+    for j in perm { append(mut &out, replace(mut &ks[j], "")) }
+    // each run of one word by the whole key
+    var a = 0
+    while a < n {
+        var z = a + 1
+        while z < n && pre[perm[z]] == pre[perm[a]] { z += 1 }
+        if z - a > SORT_FEW {
+            var run: []str = withCapacity(z - a)
+            for i in a..z { append(mut &run, replace(mut &out[i], "")) }
+            collections.sortBy(mut &run, fn(x: &str, y: &str): int { return x.cmp(y) })
+            var i = a
+            for r in run {
+                out[i] = r
+                i += 1
+            }
+        } else {
+            for i in a + 1..z {
+                let v = replace(mut &out[i], "")
+                var j = i
+                while j > a && out[j - 1] > v {
+                    out[j] = replace(mut &out[j - 1], "")
+                    j -= 1
+                }
+                out[j] = v
+            }
+        }
+        a = z
+    }
+    ks = out
+}
+
 // Whether order's place a sorts after its place b (sortKeysPerm): by their
 // prefixes (pre), then by the whole keys unless they are 8 bytes (exact).
 fn keyAfter(ks: &[]str, order: &[]int, pre: &[]int, exact: bool, a: int, b: int): bool {
@@ -3201,10 +3284,10 @@ pub fn newLoad(): Load { return Load{lastId: 0, haveLast: false, indexed: false}
 
 // Row bytes row (t's stored form) of the primary key id (one integer
 // column) loaded into t: in key order straight to the tree's end
-// (putRowLoad: no own-writes entry); once a key comes out of order, the
+// (putRowLoad: no own-writes entry; head: rowHead's, for a row in the tagged form); once a key comes out of order, the
 // rows so far enter the own-writes map and from there each key is looked
 // for before it is written. False: that key is there already.
-pub fn loadRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, id: int, row: &str, ld: mut &Load): Result[bool, DbErr] {
+pub fn loadRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, id: int, row: &str, head: int, ld: mut &Load): Result[bool, DbErr] {
     let outOfOrder = ld.haveLast && id <= ld.lastId
     ld.lastId = id
     ld.haveLast = true
@@ -3220,11 +3303,18 @@ pub fn loadRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, id: i
             Some(_) { return Ok(false) }
             None {}
         }
-        try txn.putRow(t.tree, &key, row, 0)
+        try txn.putRow(t.tree, &key, row, head)
     } else {
-        try txn.putRowLoad(t.tree, &key, row, 0)
+        try txn.putRowLoad(t.tree, &key, row, head)
     }
     return Ok(true)
+}
+
+// An index entry of a load, written after its rows in the index's key order: as loadRow's,
+// without an own-writes entry while the load has none.
+pub fn loadEntry(txn: mut &lexdb_store.Txn, tree: int, key: &str, val: &str, ld: &Load): Result[Unit, DbErr] {
+    if ld.indexed { return txn.put(tree, key, val) }
+    return txn.putRowLoad(tree, key, val, 0)
 }
 
 // ---- column leaves
