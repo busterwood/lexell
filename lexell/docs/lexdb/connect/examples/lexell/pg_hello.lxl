@@ -1,0 +1,57 @@
+// lexdb through its PostgreSQL door, with Lexell's own client (lib/postgres).
+// It makes a table, inserts rows with parameters, reads them back, and shows
+// a transaction rolled back by an error.
+//
+//     lxlc docs/lexdb/connect/examples/lexell/pg_hello.lxl -o pg_hello
+//     ./pg_hello "host=127.0.0.1 port=5433 user=postgres dbname=lexdb"
+
+import "postgres"
+import "os"
+
+type V = postgres.Value
+type Error = postgres.Error
+
+fn run(dsn: str): Result[Unit, Error] {
+    var conn = try postgres.connect(dsn)
+    let c = mut &conn
+    let ver = try c.query("SELECT version()", &[])
+    println("server: " + try ver.text(0, 0))
+
+    try c.exec("DROP TABLE IF EXISTS pg_fruit; " +
+        "CREATE TABLE pg_fruit (id int PRIMARY KEY, name text NOT NULL, price numeric(10,2) CHECK (price > 0))")
+    // $1, $2, ... are the parameters; the values are never put in the SQL text
+    let names = ["apple", "pear", "plum"]
+    let prices = [1.20m, 0.85m, 2.40m]
+    for i in 0..len(names) {
+        try c.query("INSERT INTO pg_fruit VALUES ($1, $2, $3)", &[V.Int(i + 1), V.Text(names[i].clone()), V.Dec(prices[i])])
+    }
+
+    // a transaction: the second INSERT breaks the CHECK, so neither row stays
+    let tx = c.transaction(fn(k: mut &postgres.Conn): Result[Unit, Error] {
+        try k.query("INSERT INTO pg_fruit VALUES (4, 'fig', 3.10)", &[])
+        try k.query("INSERT INTO pg_fruit VALUES (5, 'kiwi', -1)", &[])
+        return Ok(Unit{})
+    })
+    match tx {
+        Ok(_) { println("transaction: committed") }
+        Err(e) { println("transaction: rolled back, SQLSTATE " + e.state) }
+    }
+
+    let rows = try c.query("SELECT id, name, price FROM pg_fruit WHERE price < $1 ORDER BY id", &[V.Dec(5.00m)])
+    for r in 0..rows.rowCount() {
+        println((try rows.int(r, 0)).toStr() + " " + try rows.text(r, 1) + " " + (try rows.decimal(r, 2)).toStr())
+    }
+    return Ok(Unit{})
+}
+
+fn main() {
+    let argv = os.arguments()
+    let dsn = if len(argv) > 0 { argv[0].clone() } else { "host=127.0.0.1 port=5433 user=postgres dbname=lexdb" }
+    match run(dsn) {
+        Ok(_) {}
+        Err(e) {
+            eprintln("pg_hello: " + e.toStr())
+            exit(1)
+        }
+    }
+}

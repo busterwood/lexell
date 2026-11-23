@@ -1,0 +1,60 @@
+// lexdb through its SQL Server door (TDS), with Lexell's own client
+// (lib/sqlserver). It makes a table, inserts rows with parameters, loads more
+// by bulk copy, reads them back, and shows a transaction rolled back by an
+// error.
+//
+//     lxlc docs/lexdb/connect/examples/lexell/tds_hello.lxl -o tds_hello
+//     ./tds_hello "Server=127.0.0.1,1433;Database=lexdb;UID=sa;PWD=x;Encrypt=no"
+
+import "sqlserver"
+import "os"
+
+type V = sqlserver.Value
+type Error = sqlserver.Error
+
+fn run(cs: str): Result[Unit, Error] {
+    var conn = try sqlserver.connect(cs)
+    let c = mut &conn
+    let ver = try c.query("SELECT @@VERSION", &[])
+    println("server: " + try ver.text(0, 0))
+
+    try c.exec("DROP TABLE IF EXISTS tds_fruit; " +
+        "CREATE TABLE tds_fruit (id int PRIMARY KEY, name nvarchar(40) NOT NULL, price decimal(10,2) CHECK (price > 0))")
+    // @p1, @p2, ... are the parameters (sent with sp_executesql)
+    try c.run("INSERT INTO tds_fruit VALUES (@p1, @p2, @p3)", &[V.Int(1), V.Text("apple"), V.Dec(1.20m)])
+    try c.run("INSERT INTO tds_fruit VALUES (@p1, @p2, @p3)", &[V.Int(2), V.Text("pear"), V.Dec(0.85m)])
+
+    // bulk copy (INSERT BULK, what bcp and SqlBulkCopy send)
+    let more: [][]V = [[V.Int(3), V.Text("plum"), V.Dec(2.40m)], [V.Int(4), V.Text("quince"), V.Dec(3.00m)]]
+    let n = try c.bulkInsert("dbo.tds_fruit", &["id", "name", "price"], &more, &sqlserver.bulkOptions())
+    println("bulk copy: " + n.toStr() + " rows")
+
+    // a transaction: the second INSERT breaks the CHECK, so neither row stays
+    let tx = c.transaction(fn(k: mut &sqlserver.Conn): Result[Unit, Error] {
+        try k.run("INSERT INTO tds_fruit VALUES (5, N'fig', 3.10)", &[])
+        try k.run("INSERT INTO tds_fruit VALUES (6, N'kiwi', -1)", &[])
+        return Ok(Unit{})
+    })
+    match tx {
+        Ok(_) { println("transaction: committed") }
+        Err(e) { println("transaction: rolled back, error " + e.code.toStr()) }
+    }
+
+    let rows = try c.query("SELECT TOP (10) id, name, price FROM tds_fruit WHERE price < @p1 ORDER BY id", &[V.Dec(5.00m)])
+    for r in 0..rows.rowCount() {
+        println((try rows.int(r, 0)).toStr() + " " + try rows.text(r, 1) + " " + (try rows.decimal(r, 2)).toStr())
+    }
+    return Ok(Unit{})
+}
+
+fn main() {
+    let argv = os.arguments()
+    let cs = if len(argv) > 0 { argv[0].clone() } else { "Server=127.0.0.1,1433;Database=lexdb;UID=sa;PWD=x;Encrypt=no" }
+    match run(cs) {
+        Ok(_) {}
+        Err(e) {
+            eprintln("tds_hello: " + e.toStr())
+            exit(1)
+        }
+    }
+}

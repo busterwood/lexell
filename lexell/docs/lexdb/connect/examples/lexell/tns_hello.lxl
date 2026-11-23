@@ -1,0 +1,60 @@
+// lexdb through its Oracle door (TNS), with Lexell's own client (lib/oracle).
+// It makes a table, inserts rows with binds, reads them back, runs a PL/SQL
+// block, and shows a transaction rolled back by an error.
+//
+//     lxlc docs/lexdb/connect/examples/lexell/tns_hello.lxl -o tns_hello
+//     ./tns_hello "User Id=sa;Password=sa;Data Source=127.0.0.1:1521/lexdb"
+
+import "oracle"
+import "os"
+
+type V = oracle.Value
+type Error = oracle.Error
+
+fn run(cs: str): Result[Unit, Error] {
+    var conn = try oracle.connect(cs)
+    let c = mut &conn
+    let ver = try c.query("SELECT banner FROM v$version", &[])
+    println("server: " + try ver.text(0, 0))
+
+    try c.exec("DROP TABLE IF EXISTS ora_fruit")
+    try c.exec("CREATE TABLE ora_fruit (id NUMBER(9) PRIMARY KEY, name VARCHAR2(40) NOT NULL, price NUMBER(10,2) CHECK (price > 0))")
+    // :1, :2, ... are the binds; outside transaction() each statement commits
+    let names = ["apple", "pear", "plum"]
+    let prices = [1.20m, 0.85m, 2.40m]
+    for i in 0..len(names) {
+        try c.run("INSERT INTO ora_fruit VALUES (:1, :2, :3)", &[V.Int(i + 1), V.Text(names[i].clone()), V.Dec(prices[i])])
+    }
+
+    // a PL/SQL block
+    try c.exec("BEGIN UPDATE ora_fruit SET price = price * 2 WHERE name = 'pear'; END;")
+
+    // a transaction: the second INSERT breaks the CHECK, so neither row stays
+    let tx = c.transaction(fn(k: mut &oracle.Conn): Result[Unit, Error] {
+        try k.run("INSERT INTO ora_fruit VALUES (4, 'fig', 3.10)", &[])
+        try k.run("INSERT INTO ora_fruit VALUES (5, 'kiwi', -1)", &[])
+        return Ok(Unit{})
+    })
+    match tx {
+        Ok(_) { println("transaction: committed") }
+        Err(e) { println("transaction: rolled back, ORA-" + e.code.toStr()) }
+    }
+
+    let rows = try c.query("SELECT id, name, price FROM ora_fruit WHERE price < :1 ORDER BY id", &[V.Dec(5.00m)])
+    for r in 0..rows.rowCount() {
+        println((try rows.int(r, 0)).toStr() + " " + try rows.text(r, 1) + " " + (try rows.decimal(r, 2)).toStr())
+    }
+    return Ok(Unit{})
+}
+
+fn main() {
+    let argv = os.arguments()
+    let cs = if len(argv) > 0 { argv[0].clone() } else { "User Id=sa;Password=sa;Data Source=127.0.0.1:1521/lexdb" }
+    match run(cs) {
+        Ok(_) {}
+        Err(e) {
+            eprintln("tns_hello: " + e.toStr())
+            exit(1)
+        }
+    }
+}
