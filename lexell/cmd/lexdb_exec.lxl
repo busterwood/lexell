@@ -727,7 +727,7 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             if len(t.view) == 0 { append(mut &tabs, t) }
         }
     }
-    try lexdb_stats.analyze(st, txn, &tabs, lim.deadline, &statsUp())
+    try lexdb_stats.analyze(st, txn, &tabs, lexdb_pipe.deadlineNs(lim.deadline), &statsUp())
     // a temporary table's statistics are its session's alone: its kept
     // plans are made again (tmpBump), no other session's (optimizer 40)
     var perm = false
@@ -1053,12 +1053,11 @@ pub type Limits = value record {
     pub rounds: int             // a recursive CTE's rounds; 0 no limit
     pub steps: int              // MATCH_RECOGNIZE's steps per start row; 0 no limit
     pub mem: int                // bytes of rows held; 0 no limit
-    pub deadline: int           // time.monotonicNs() to stop at; 0 none
+    pub deadline: int           // statement_timeout's deadline and the session's number (lexdb_pipe.deadlineWord); 0 none
     pub batch: bool             // SET lexdb_batch: vector scans and batch operators (9.47); compiled expressions and typed sorts are always on
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
     pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
     pub rdel: bool              // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
-    pub sid: int                // the session's number: its cancel requests (lexdb_base.askCancel, 9.138)
 }
 
 fn (rs: mut &Run) limit(l: &Limits) {
@@ -1066,7 +1065,6 @@ fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxSteps = l.steps
     rs.bud.maxHeld = l.mem
     rs.bud.deadline = l.deadline
-    rs.bud.sid = l.sid
     rs.batch = l.batch
 }
 
@@ -2876,7 +2874,6 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     rs.maxSteps = parent.maxSteps
     rs.bud.maxHeld = parent.bud.maxHeld
     rs.bud.deadline = parent.bud.deadline
-    rs.bud.sid = parent.bud.sid
     rs.batch = parent.batch
     rs.writes = parent.writes
     rs.bud.held = parent.bud.held
@@ -12130,10 +12127,15 @@ fn (s: mut &Session) restore() {
     s.rdel = l.rdel
 }
 
+// A statement's deadline word with statement_timeout (lexdb_pipe.deadlineWord): now plus the timeout, and the session.
+fn (s: &Session) timedWord(): int { return lexdb_pipe.deadlineWord((time.monotonicNs() + 999999) / 1000000 + s.timeoutMs, s.id) }
+
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
-    let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
-    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel, sid: s.id}
+    // (without a timeout the word is the session's number as it is: lexdb_pipe.deadlineWord)
+    var dl = s.id
+    if s.timeoutMs > 0 { dl = s.timedWord() }
+    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}
 }
 
 // A setting's value: a number (statement_timeout in ms, max_statement_mem
@@ -12772,7 +12774,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.failed = false
                 s.fresh = true
                 s.saves = []
-                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel, sid: s.id}]
+                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n.clone()) }
                 s.savedPath = [p]
@@ -13176,7 +13178,8 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
     var tries = 0
     while true {
         let now = time.monotonicNs()
-        if lim.deadline != 0 && now > lim.deadline { return Err(e("57014", "canceling statement due to statement timeout")) }
+        let ldl = lexdb_pipe.deadlineNs(lim.deadline)
+        if ldl != 0 && now > ldl { return Err(e("57014", "canceling statement due to statement timeout")) }
         if now >= until { last = true }
         var seq = 0
         if inBlock {
@@ -13218,7 +13221,8 @@ fn (s: mut &Session) waitForRun(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &
             s.st.abort(t)
         }
         // no rows: wait for a flush past what it read, to its time's end
-        let end = if lim.deadline != 0 && lim.deadline < until { lim.deadline } else { until }
+        let ldl2 = lexdb_pipe.deadlineNs(lim.deadline)
+        let end = if ldl2 != 0 && ldl2 < until { ldl2 } else { until }
         let left = (end - time.monotonicNs() + 999999) / 1000000
         if left > 0 {
             if inBlock { s.st.releaseSnapshot(mut &s.txn[0]) }

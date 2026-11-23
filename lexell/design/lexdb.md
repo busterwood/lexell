@@ -12909,9 +12909,14 @@ when the connection ends). A CancelRequest whose secret matches marks the sessio
 process-wide list, SQL runs on one thread) and the connection is closed, whether it matched or not, as
 PostgreSQL's. The running statement sees the mark where statement_timeout is seen, in `Budget.checkTime`, right
 after the yield that let the request in (the only place it can have come in): 57014 "canceling statement due to
-user request". The Budget knows its session by `sid` (from `Limits.sid`, copied to a subquery's run as the
-deadline is). A mark left when the session was idle (the statement ended first) is dropped at its next Query or
-Execute, so it does not stop the next statement (PostgreSQL ignores a cancel while it reads a command).
+user request". The Budget knows its session through its deadline word (`Limits.deadline`, `Budget.deadline`,
+`lexdb_pipe.deadlineWord`): the low 20 bits of the session's number always, and with statement_timeout the bit
+`DL_SET` and the ms to stop at above them; without a timeout the word is the session's number as it is. A field of
+its own cost the point select 42 instructions (`Limits.sid` 19, `Budget.sid` 23: a Budget is in every Run); the word
+costs 1 (the session's number loaded where 0 was). Requests are kept and matched by those 20 bits: two sessions a
+multiple of 2^20 apart, both running, could take each other's. A mark left when the session was idle (the statement
+ended first) is dropped at its next Query or Execute, so it does not stop the next statement (PostgreSQL ignores a
+cancel while it reads a command).
 - What it stops: a statement that takes turns (rows looked at in the pipeline, batches); a WAIT, a commit or a
   page read in progress run on to their own end first.
 - The SQL Server door's ATTENTION and the Oracle door's break are unchanged: they are read when the request ends
