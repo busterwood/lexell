@@ -52,7 +52,6 @@ type_name                  -- a table type made by CREATE TYPE ... AS TABLE
   `SQL_VARIANT_PROPERTY` does not exist (error 195).
 - `uniqueidentifier` text comes out in upper case when a value is selected and in lower case after
   `CAST(... AS varchar)`. SQL Server gives upper case in both.
-- A string that is not a GUID is error 245 where SQL Server gives 8169.
 - `hierarchyid`, `geography`, `geometry`, `cursor` and CLR types do not exist (error 2715).
 
 ## Examples
@@ -138,7 +137,7 @@ as_case as_bit
 
 (1 row affected)
 
-Msg 195, Level 16, State 1, Line 1
+Msg 195, Level 15, State 1, Line 1
 operator does not exist: t + t
 ```
 
@@ -172,8 +171,8 @@ different 36
 
 (1 row affected)
 
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type uuid: "not-a-guid"
+Msg 8169, Level 16, State 1, Line 1
+Conversion failed when converting from a character string to uniqueidentifier.
 ```
 
 ### E. Writing a GUID
@@ -229,8 +228,8 @@ SELECT SQL_VARIANT_PROPERTY(1, 'BaseType') AS base_type;
 ```text
 Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type geography.
-Msg 195, Level 16, State 1, Line 1
-function sql_variant_property with 2 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'sql_variant_property' is not a recognized built-in function name.
 ```
 
 ## See also
