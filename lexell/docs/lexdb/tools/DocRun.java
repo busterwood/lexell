@@ -63,7 +63,9 @@ public class DocRun {
             while (true) {
                 warnings(s, o);
                 if (rs) {
+                    // an error while the rows are read (8134, 512 ...) is printed and the batch goes on, as sqlcmd does
                     try (ResultSet r = s.getResultSet()) { table(r, o); }
+                    catch (SQLException e) { msg(e, o); }
                 } else {
                     int n = s.getUpdateCount();
                     if (n == -1) break;
