@@ -312,8 +312,8 @@ Msg 9838, Level 16, State 1, Line 1
 Parameter 2 in function 'get_bit' is out of range 0 to 31.
 Msg 9839, Level 16, State 1, Line 1
 Parameter 3 in function 'set_bit' must be 0 or 1.
-Msg 195, Level 16, State 1, Line 1
-function atn2 with 2 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'atn2' is not a recognized built-in function name.
 ```
 
 ## See also
