@@ -41,7 +41,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE VIEW](create-view.md), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | Views (read-only). |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
 | [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
-| CREATE TYPE, ALTER TYPE, DROP TYPE | Enum types. |
+| [CREATE TYPE](create-type.md), [ALTER TYPE](alter-type.md), [DROP TYPE](drop-type.md) | Enum types. |
 | CREATE FUNCTION, CREATE PROCEDURE, DROP FUNCTION, DROP PROCEDURE | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
 | CALL | Calls a procedure. |
 
@@ -49,10 +49,10 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| CREATE ROLE, CREATE USER | Roles, with `LOGIN`, `SUPERUSER`, `PASSWORD`. |
-| ALTER ROLE, ALTER USER, DROP ROLE, DROP USER | |
-| GRANT, REVOKE | Table, view, sequence, schema, function and database privileges; role membership. |
-| SET ROLE, SET SESSION AUTHORIZATION | |
+| [CREATE ROLE, CREATE USER](create-role.md) | Roles, with `LOGIN`, `SUPERUSER`, `PASSWORD`. |
+| [ALTER ROLE, ALTER USER](alter-role.md), [DROP ROLE, DROP USER](drop-role.md) | |
+| [GRANT](grant.md), [REVOKE](revoke.md) | Table, view, sequence, schema, function and database privileges; role membership. |
+| [SET ROLE, SET SESSION AUTHORIZATION](set-role.md) | |
 
 ### Transactions
 
@@ -68,8 +68,8 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| SET, RESET, SHOW | Settings; `SET TIME ZONE`, `SET search_path`. |
-| DISCARD, DEALLOCATE | |
+| [SET](set.md), [RESET](reset.md), [SHOW](show.md) | Settings; `SET TIME ZONE`, `SET search_path`. |
+| [DISCARD, DEALLOCATE](discard.md) | |
 | WAIT FOR LSN | Waits on a replica for a commit (PostgreSQL 19). See [replicas](../../replicas.md). |
 | ANALYZE | Gathers the planner's statistics. |
 | VACUUM, CHECKPOINT, REINDEX, CLUSTER | `CHECKPOINT` writes one; the others are accepted. |
