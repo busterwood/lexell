@@ -28,6 +28,9 @@ import "os"
 // it is inlined in), and the most nodes inlining may add to one function.
 pub const INLINE_LIMIT = 25
 const GROWTH = 20000
+// The most nodes a recursive function may have to be inlined into itself, one level (visit): one
+// copy of its body, against a call at every level, as C2's hot band lets a recursive call in.
+const RECUR_LIMIT = 60
 // A call that hands a record parameter a place (`f(p_result)`, a match's scrutinee or a
 // method's receiver) trades the record's copy into the outgoing-argument area and a call for
 // an inlined body, so a body up to this many nodes more is inlined there: on these paths
@@ -80,13 +83,35 @@ type Opt = record {
     sCand: []int            // ... the candidate it stands for
     cands: []Cand
     adj: int
+    selfOnce: bool      // the pass that inlines a recursive function into itself, one level (visit)
+    fpOf: []int         // per function: its form's parameters in fpList (a renamed copy, visit), or -1
+    fpList: [][]int
+    ren: Map[int, int]  // deep's renaming of locals
+    allocF: int         // rt_alloc and rt_free (unbox)
+    freeF: int
+    ub: []Ub            // unbox's facts per local (grown with the locals; reset after each function)
+    ubSeen: []int       // the locals whose facts the function at hand set
+    wf: int             // the function whose body the W_CALLEES walk is in
+    recur: []bool       // per function: it calls itself (the W_CALLEES walk)
+    allocs: []bool      // per function: it calls rt_alloc, or a body inlined in it does
+}
+
+// What unbox knows of a local of the function at hand.
+type Ub = value record {
+    uses: int           // E_LOCAL nodes naming it
+    ok: int             // of them, a dereference, the initializer of a local, or rt_free's argument
+    decls: int          // its declarations
+    alloc: bool         // declared to a new record: (T*)rt_alloc(sizeof T)
+    bad: bool           // assigned, or its address taken
+    from: int           // the local it is declared to, or -1
+    seen: bool          // listed in ubSeen
 }
 
 // The program p with small functions inlined at their calls.
 pub fn optimize(p: ir.Ir): ir.Ir {
     var o = Opt{u: p, state: [], form: [], size: [], rets: [], ro: [], refs: [], aTaken: [], mk: [], mv: [], bound: [], budget: 0, cur: -1,
         grown: 0, limit: 0, dest: D_NONE, dl: -1, lv: -1, aty: -1, single: false, nrvo: -1,
-        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], adj: -1}
+        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: []}
     o.limit = INLINE_LIMIT
     let ev = os.envOr("LXL_INLINE", "")
     if ev != "" { o.limit = strings.parseIntOpt(&ev).unwrapOr(INLINE_LIMIT) }
@@ -97,10 +122,15 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         append(mut &o.rets, 0)
         append(mut &o.refs, 0)
         append(mut &o.ro, 0)
+        append(mut &o.fpOf, -1)
+        append(mut &o.recur, false)
+        append(mut &o.allocs, false)
     }
     for f in 0..o.u.nRtFuncs {
         if o.u.funcs[f].name == "rt_str_dup" { o.dupF = f }
         if o.u.funcs[f].name == "rt_str_drop" { o.dropF = f }
+        if o.u.funcs[f].name == "rt_alloc" { o.allocF = f }
+        if o.u.funcs[f].name == "rt_free" { o.freeF = f }
     }
     for l in 0..len(o.u.locals) {
         append(mut &o.sStamp, 0)
@@ -568,6 +598,10 @@ fn (o: mut &Opt) walk(x: int, op: int, l: int): int {
         if op == W_EFFECTS { hit += 1 }
         if op == W_CALLEES {
             let f = o.callee(x)
+            if f >= 0 && o.wf >= 0 {
+                if f == o.wf { o.recur[f] = true }
+                if f == o.allocF { o.allocs[o.wf] = true }
+            }
             if f >= 0 && o.u.funcs[f].body >= 0 { o.visit(f) }
         }
     } else if k == ir.S_RETURN {
@@ -711,10 +745,14 @@ fn (o: &Opt) nop(s: int): bool {
 fn (o: mut &Opt) visit(f: int) {
     if o.state[f] != 0 { return }
     o.state[f] = 1
+    let wf = o.wf
+    o.wf = f
     o.walk(o.u.funcs[f].body, W_CALLEES, -1)
+    o.wf = wf
     o.cur = f
     o.grown = 0
     o.stmtIn(o.u.funcs[f].body)
+    o.unbox(f)
     o.scalars(f)
     o.form[f] = o.shape(f)
     let form = o.form[f]
@@ -726,6 +764,295 @@ fn (o: mut &Opt) visit(f: int) {
         }
     }
     o.state[f] = 2
+    if form >= 0 && o.limit > 0 && o.size[f] <= RECUR_LIMIT * o.limit / INLINE_LIMIT && o.recur[f] {
+        // One level of recursion (C2's MaxRecursiveInlineLevel = 1): its calls of itself become its
+        // body once, whose own calls of itself stay calls, so the real calls of a recursion that
+        // branches (fib, a tree's walk) are about halved and a list's walk does two nodes a call.
+        // The form shares f's statements, which this pass changes, and f's locals, which the calls'
+        // arguments name: it inlines a copy with locals of its own (callers later inline it too).
+        o.ren = newMap()
+        o.form[f] = o.deep(form)
+        var ps: []int = []
+        for p in o.u.funcs[f].params.clone() { append(mut &ps, o.renamed(p)) }
+        o.fpOf[f] = len(o.fpList)
+        append(mut &o.fpList, ps)
+        o.grown = 0
+        o.selfOnce = true
+        o.stmtIn(o.u.funcs[f].body)
+        o.selfOnce = false
+    }
+}
+
+// ---------------------------------------------------------------- records that never escape
+//
+// A record that f allocates (`T* p = (T*)rt_alloc(sizeof T);`, a literal of a boxed record type)
+// whose pointer is only copied into locals declared to it (`T* q = p;`), dereferenced (p->f, *p)
+// and freed (`rt_free(p);`, its drop with no field to drop, once the glue is inlined): nothing
+// else can reach it, so it lives in a local of f instead, and its allocation and frees go (what
+// the JVM's escape analysis does to the alloc benchmark's Cell). The locals must not be assigned
+// or have their address taken. Run after inlining (a constructor's literal is then the caller's)
+// and before the form is taken (the form shares f's statements).
+fn (o: mut &Opt) unbox(f: int) {
+    let body = o.u.funcs[f].body
+    if o.allocF < 0 || o.freeF < 0 || !o.allocs[f] { return }
+    while len(o.ub) < len(o.u.locals) { append(mut &o.ub, ubNone()) }
+    var any = false
+    o.ubScan(body, false, mut &any)
+    var map: Map[int, int] = newMap()          // each local of a good group: its record local
+    if any {
+        // the groups: each local's root (the allocated one it is copied from); a root is good
+        // when it and every local of its group are clean
+        var good: Map[int, bool] = newMap()
+        for l in o.ubSeen.clone() {
+            if o.ub[l].alloc { good.put(l, o.ub[l].decls == 1) }
+        }
+        var roots: []int = []
+        for l in o.ubSeen.clone() {
+            let r = o.ubRoot(l)
+            append(mut &roots, r)
+            if r < 0 { continue }
+            let u = o.ub[l]
+            if u.bad || o.aTaken[l] || u.uses != u.ok || u.decls != 1 { good.put(r, false) }
+        }
+        var keep: Map[int, int] = newMap()
+        let seen = o.ubSeen.clone()
+        for i in 0..len(seen) {
+            let l = seen[i]
+            let r = roots[i]
+            if r < 0 || !good.getOr(&r, false) { continue }
+            if !keep.has(&r) {
+                keep.put(r, o.local(&("ub_" + o.u.locals[r].name), o.u.tys[o.u.locals[r].ty].base, false))
+            }
+            map.put(l, keep.getOr(&r, -1))
+        }
+    }
+    if map.size() > 0 { o.ubRewrite(body, &map) }
+    for l in o.ubSeen.clone() { o.ub[l] = ubNone() }
+    o.ubSeen = []
+}
+
+fn ubNone(): Ub { return Ub{uses: 0, ok: 0, decls: 0, alloc: false, bad: false, from: -1, seen: false} }
+
+// The facts of local l, to be set: listed in ubSeen.
+fn (o: mut &Opt) ubAt(l: int) {
+    while len(o.ub) <= l { append(mut &o.ub, ubNone()) }
+    if !o.ub[l].seen {
+        o.ub[l].seen = true
+        append(mut &o.ubSeen, l)
+    }
+}
+
+// The allocated local l is copied from (through its copies), or -1.
+fn (o: &Opt) ubRoot(l: int): int {
+    var r = l
+    var steps = 0
+    while r >= 0 && !o.ub[r].alloc && steps < 64 {
+        r = o.ub[r].from
+        steps += 1
+    }
+    return if r >= 0 && o.ub[r].alloc { r } else { -1 }
+}
+
+// Whether x is (T*)rt_alloc(sizeof T) for the pointer type pt.
+fn (o: &Opt) allocOf(x: int, pt: int): bool {
+    if o.u.tk(pt) != ir.TY_PTR || o.u.tk(o.u.tys[pt].base) != ir.TY_STRUCT { return false }
+    var c = x
+    while o.u.nk(c) == ir.E_CAST { c = o.u.nodes[c].a }
+    if o.u.nk(c) != ir.E_CALL || o.callee(c) != o.allocF || o.u.listLen(o.u.nodes[c].b) != 1 { return false }
+    let n = o.u.listAt(o.u.nodes[c].b, 0)
+    return o.u.nk(n) == ir.E_INT && o.u.nodes[n].v == o.u.sizeOf(o.u.tys[pt].base)
+}
+
+// The local x names (through casts between pointer types), or -1.
+fn (o: &Opt) ptrLocal(x: int): int {
+    var c = x
+    while o.u.nk(c) == ir.E_CAST && o.u.tk(o.u.nodes[c].ty) == ir.TY_PTR { c = o.u.nodes[c].a }
+    return if o.u.nk(c) == ir.E_LOCAL { o.u.nodes[c].a } else { -1 }
+}
+
+// Whether s is the statement rt_free(p) of a local p (through casts); the local, or -1.
+fn (o: &Opt) freeOf(s: int): int {
+    if o.u.nk(s) != ir.S_EXPR { return -1 }
+    let c = o.u.nodes[s].a
+    if o.u.nk(c) != ir.E_CALL || o.callee(c) != o.freeF || o.u.listLen(o.u.nodes[c].b) != 1 { return -1 }
+    return o.ptrLocal(o.u.listAt(o.u.nodes[c].b, 0))
+}
+
+// unbox's facts of the tree x; ok: x is in a place that does not let its local escape.
+fn (o: mut &Opt) ubScan(x: int, ok: bool, any: mut &bool) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    if n.k == ir.E_LOCAL {
+        o.ubAt(n.a)
+        o.ub[n.a].uses += 1
+        if ok { o.ub[n.a].ok += 1 }
+        return
+    }
+    if n.k == ir.S_DECL {
+        o.ubAt(n.a)
+        o.ub[n.a].decls += 1
+        if n.b >= 0 && n.c < 0 && o.allocOf(n.b, o.u.locals[n.a].ty) {
+            o.ub[n.a].alloc = true
+            any = true
+            return
+        }
+        let src = if n.b >= 0 && o.u.tk(o.u.locals[n.a].ty) == ir.TY_PTR { o.ptrLocal(n.b) } else { -1 }
+        if src >= 0 && o.u.nodes[o.u.locals[src].ty].k >= 0 && o.u.locals[src].ty == o.u.locals[n.a].ty {
+            o.ub[n.a].from = src
+            o.ubScan(n.b, true, mut &any)
+            return
+        }
+        o.ubScan(n.b, false, mut &any)
+        o.ubList(n.c, mut &any)
+        return
+    }
+    if n.k == ir.S_EXPR && o.freeOf(x) >= 0 {
+        let l = o.freeOf(x)
+        o.ubAt(l)
+        o.ub[l].uses += 1
+        o.ub[l].ok += 1
+        return
+    }
+    if n.k == ir.E_DEREF {
+        o.ubScan(n.a, o.u.nk(n.a) == ir.E_LOCAL, mut &any)
+        return
+    }
+    if n.k == ir.E_ASSIGN || n.k == ir.E_POSTINC {
+        if o.u.nk(n.a) == ir.E_LOCAL {
+            o.ubAt(o.u.nodes[n.a].a)
+            o.ub[o.u.nodes[n.a].a].bad = true
+        }
+    }
+    if n.k == ir.E_ADDR && o.u.nk(n.a) == ir.E_LOCAL {
+        o.ubAt(o.u.nodes[n.a].a)
+        o.ub[o.u.nodes[n.a].a].bad = true
+    }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE || kc < 0 { return }
+    if kc == ir.K_BLOCK {
+        o.ubList(n.a, mut &any)
+    } else if kc == ir.K_CLIT {
+        o.ubList(n.b, mut &any)
+    } else if kc == ir.K_DECL {
+        o.ubScan(n.b, false, mut &any)
+        o.ubList(n.c, mut &any)
+    } else if kc == ir.K_CALL {
+        o.ubScan(n.a, false, mut &any)
+        o.ubList(n.b, mut &any)
+    } else {
+        o.ubScan(n.a, false, mut &any)
+        if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { o.ubScan(n.b, false, mut &any) }
+        if kc == ir.K_ABC || kc == ir.K_FOR { o.ubScan(n.c, false, mut &any) }
+        if kc == ir.K_FOR { o.ubScan(n.d, false, mut &any) }
+    }
+}
+
+fn (o: mut &Opt) ubList(l: int, any: mut &bool) {
+    if l < 0 { return }
+    for j in 0..o.u.listLen(l) { o.ubScan(o.u.listAt(l, j), false, mut &any) }
+}
+
+// The rewrite: the root's declaration declares its record local, the copies' go, *p and p->f
+// name the record local, the frees go.
+fn (o: mut &Opt) ubRewrite(x: int, map: &Map[int, int]) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    if n.k == ir.S_DECL && map.has(&n.a) {
+        if o.ub[n.a].alloc {
+            o.u.nodes[x].a = map.getOr(&n.a, -1)
+            o.u.nodes[x].b = -1
+        } else {
+            o.u.nodes[x].k = ir.S_EMPTY
+            o.u.nodes[x].b = -1
+        }
+        return
+    }
+    if n.k == ir.S_EXPR {
+        let l = o.freeOf(x)
+        if l >= 0 && map.has(&l) {
+            o.u.nodes[x].k = ir.S_EMPTY
+            o.u.nodes[x].a = -1
+            return
+        }
+    }
+    if n.k == ir.E_DEREF && o.u.nk(n.a) == ir.E_LOCAL && map.has(&o.u.nodes[n.a].a) {
+        o.u.nodes[x].k = ir.E_LOCAL
+        o.u.nodes[x].a = map.getOr(&o.u.nodes[n.a].a, -1)
+        return
+    }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE || kc < 0 { return }
+    if kc == ir.K_BLOCK {
+        o.ubRewList(n.a, map)
+    } else if kc == ir.K_CLIT {
+        o.ubRewList(n.b, map)
+    } else if kc == ir.K_DECL {
+        o.ubRewrite(n.b, map)
+        o.ubRewList(n.c, map)
+    } else if kc == ir.K_CALL {
+        o.ubRewrite(n.a, map)
+        o.ubRewList(n.b, map)
+    } else {
+        o.ubRewrite(n.a, map)
+        if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { o.ubRewrite(n.b, map) }
+        if kc == ir.K_ABC || kc == ir.K_FOR { o.ubRewrite(n.c, map) }
+        if kc == ir.K_FOR { o.ubRewrite(n.d, map) }
+    }
+}
+
+fn (o: mut &Opt) ubRewList(l: int, map: &Map[int, int]) {
+    if l < 0 { return }
+    for j in 0..o.u.listLen(l) { o.ubRewrite(o.u.listAt(l, j), map) }
+}
+
+// A copy of the tree x, node for node, each local renamed to a new one (o.ren).
+fn (o: mut &Opt) deep(x: int): int {
+    if x < 0 { return -1 }
+    append(mut &o.u.nodes, o.u.nodes[x])
+    let y = len(o.u.nodes) - 1
+    let n = o.u.nodes[x]
+    if n.k == ir.E_LOCAL || n.k == ir.S_DECL { o.u.nodes[y].a = o.renamed(n.a) }
+    let kc = ir.KIDS[n.k]
+    if kc == ir.K_NONE || kc < 0 { return y }
+    if kc == ir.K_BLOCK {
+        o.u.nodes[y].a = o.deepList(n.a)
+    } else if kc == ir.K_CLIT {
+        o.u.nodes[y].b = o.deepList(n.b)
+    } else if kc == ir.K_DECL {
+        o.u.nodes[y].b = o.deep(n.b)
+        o.u.nodes[y].c = o.deepList(n.c)
+    } else if kc == ir.K_CALL {
+        o.u.nodes[y].a = o.deep(n.a)
+        o.u.nodes[y].b = o.deepList(n.b)
+    } else {
+        o.u.nodes[y].a = o.deep(n.a)
+        if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { o.u.nodes[y].b = o.deep(n.b) }
+        if kc == ir.K_ABC || kc == ir.K_FOR { o.u.nodes[y].c = o.deep(n.c) }
+        if kc == ir.K_FOR { o.u.nodes[y].d = o.deep(n.d) }
+    }
+    return y
+}
+
+fn (o: mut &Opt) renamed(l: int): int {
+    let have = o.ren.getOr(&l, -1)
+    if have >= 0 { return have }
+    let nl = o.local(&o.u.locals[l].name.clone(), o.u.locals[l].ty, o.aTaken[l])
+    o.ren.put(l, nl)
+    return nl
+}
+
+// Parameter j of the function g as its form names it, and how many it has.
+fn (o: &Opt) par(g: int, j: int): int {
+    return if o.fpOf[g] < 0 { o.u.funcs[g].params[j] } else { o.fpList[o.fpOf[g]][j] }
+}
+
+fn (o: &Opt) npar(g: int): int { return len(o.u.funcs[g].params) }
+
+fn (o: mut &Opt) deepList(l: int): int {
+    if l < 0 { return -1 }
+    var xs: []int = []
+    for j in 0..o.u.listLen(l) { append(mut &xs, o.deep(o.u.listAt(l, j))) }
+    return o.u.list(&xs)
 }
 
 // The body of f in the form it is inlined in, or -1 when it is not inlined: a function of the
@@ -1375,8 +1702,9 @@ fn (o: mut &Opt) site(x: int, out: mut &[]int) {
 // The function the call c calls if it is inlined there, else -1.
 fn (o: &Opt) target(c: int): int {
     let g = o.callee(c)
-    if g < 0 || g == o.cur || o.state[g] != 2 || o.form[g] < 0 { return -1 }
-    let lim = if o.copyArg(c, g) { o.limit + COPY_SLACK } else { o.limit }
+    if o.selfOnce != (g == o.cur) { return -1 }      // the second pass inlines f into itself only
+    if g < 0 || o.state[g] != 2 || o.form[g] < 0 { return -1 }
+    let lim = if o.selfOnce { RECUR_LIMIT * o.limit / INLINE_LIMIT } else if o.copyArg(c, g) { o.limit + COPY_SLACK } else { o.limit }
     if o.size[g] > lim { return -1 }
     if o.grown + o.size[g] > GROWTH { return -1 }
     return g
@@ -1386,8 +1714,8 @@ fn (o: &Opt) target(c: int): int {
 // lets the place stand for the parameter instead of copying the record to a local.
 fn (o: &Opt) copyArg(c: int, g: int): bool {
     let args = o.u.nodes[c].b
-    for j in 0..len(o.u.funcs[g].params) {
-        let t = o.u.locals[o.u.funcs[g].params[j]].ty
+    for j in 0..o.npar(g) {
+        let t = o.u.locals[o.par(g, j)].ty
         if o.u.tk(t) != ir.TY_STRUCT || o.u.sizeOf(t) <= 16 || j >= o.u.listLen(args) { continue }
         let x = o.u.listAt(args, j)
         if o.u.nodes[x].ty == t && o.lvalue(x) { return true }
@@ -1446,6 +1774,7 @@ fn (o: &Opt) dropGlue(f: int): bool {
 
 // The call c of g inlined into out (with o.dest and its place set).
 fn (o: mut &Opt) expand(c: int, g: int, out: mut &[]int) {
+    if o.allocs[g] { o.allocs[o.cur] = true }
     let form = o.form[g]
     let fl = o.u.nodes[form].a
     let n = o.u.listLen(fl)
@@ -1458,8 +1787,8 @@ fn (o: mut &Opt) expand(c: int, g: int, out: mut &[]int) {
         if r >= 0 && o.u.nk(r) == ir.E_LOCAL {
             let q = o.u.nodes[r].a
             var top = false
-            for i in 0..len(o.u.funcs[g].params) {
-                if o.u.funcs[g].params[i] == q { top = true }
+            for i in 0..o.npar(g) {
+                if o.par(g, i) == q { top = true }
             }
             for j in 0..n {
                 let s = o.u.listAt(fl, j)
@@ -1475,9 +1804,9 @@ fn (o: mut &Opt) expand(c: int, g: int, out: mut &[]int) {
         if r >= 0 && o.u.nk(r) == ir.E_LOCAL && root >= 0 && !o.aTaken[root] {
             let q = o.u.nodes[r].a
             let args = o.u.nodes[c].b
-            let ps = len(o.u.funcs[g].params)
+            let ps = o.npar(g)
             for i in 0..ps {
-                if o.u.funcs[g].params[i] == q && !o.aTaken[q] && o.u.locals[q].ty == o.aty &&
+                if o.par(g, i) == q && !o.aTaken[q] && o.u.locals[q].ty == o.aty &&
                     o.samePlace(o.lv, o.u.listAt(args, i)) {
                     var alone = true
                     for m in 0..ps {
@@ -1493,9 +1822,9 @@ fn (o: mut &Opt) expand(c: int, g: int, out: mut &[]int) {
     }
     // the parameters
     let args = o.u.nodes[c].b
-    let np = len(o.u.funcs[g].params)
+    let np = o.npar(g)
     for j in 0..np {
-        let p = o.u.funcs[g].params[j]
+        let p = o.par(g, j)
         let t = o.u.locals[p].ty
         let x = o.u.listAt(args, j)
         append(mut &o.bound, p)

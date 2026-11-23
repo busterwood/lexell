@@ -676,3 +676,49 @@ native_packed_literal, their expectations from main's compiler.
 
 **Next** (being built): one level of recursive inlining (fib, trees, lists; C2's
 MaxRecursiveInlineLevel = 1), and boxed records that never escape kept in a local (alloc).
+
+## 18. Recursion inlined once, records that never escape (as built)
+
+The second half of section 17's plan, both in opt.lxl.
+
+- **One level of recursion** (`visit`, the `selfOnce` pass; C2's `MaxRecursiveInlineLevel = 1`).
+  After f is optimized and its form taken, a function that calls itself (the `W_CALLEES` walk
+  notes it) and whose form is at most `RECUR_LIMIT` (60) nodes is inlined into its own calls
+  once; the copy's calls of f stay calls. fib's real calls are about halved; a tree's walk and
+  build do two levels a call, a list's sum two nodes. The limit is above the usual 25 because the
+  growth is one copy, as C2 lets a recursive call in from its hot band (`lists.sum` is about 40
+  nodes, `trees.build` and `check` up to 60).
+  The form shares f's statements, which the pass changes, and f's locals, which the calls'
+  arguments name: inlining f into itself with f's own locals bound the caller's `d` in `d - 1`
+  (bench trees crashed). So the pass inlines `deep`'s copy of the form, every local renamed, with
+  its parameters in `fpList` (`par`, `npar` in `expand` and `copyArg`); callers of f later inline
+  the same copy.
+- **Boxed records that never escape** (`unbox`, after inlining and before the form is taken).
+  `T* p = (T*)rt_alloc(sizeof T)` whose pointer is only copied into locals declared to it,
+  dereferenced and freed (`rt_free(p)`: the drop of a record with no field to drop, once the glue
+  is inlined) becomes a local `T` of f: the dereferences name it, the allocation and the frees go.
+  Locals that are assigned or whose address is taken disqualify their group; anything else that
+  names the pointer (a call argument, a store, a comparison, `Some(p)`) is an escape. A
+  constructor's literal counts once inlined (`allocs[g]` passes to the caller in `expand`). This
+  is the JVM's escape analysis on the alloc benchmark, where Java ran 9 times faster.
+
+**Compile cost.** The first version sized `unbox`'s facts to every local of the program for each
+function, and found recursion and allocation with two more walks of each body: compiling the
+compiler +50% instructions. Now the facts are kept for the locals a function names (`ubSeen`,
+reset after it), and the existing `W_CALLEES` walk sets `recur` and `allocs`: level.
+
+| measure (section 17's build against this) | instructions | cycles |
+|---|---:|---:|
+| bench fib / alloc / lists / trees (perfsuite, best of 5) | -11.5 / -79.1 / -2.1 / -1.1% | -34.4 / -86.7 / -6.4 / -1.8% |
+| the other bench programs, grep, sort, wc, eza | level | level (sort +1.5% at equal instructions) |
+| perfsuite run suite / compile suite | -10.19 / -0.23% | -14.48 / -0.20% |
+| apps regex / json / jq / cmark / decimal (5 interleaved rounds) | 0.00% each | -0.1 / -0.2 / +0.1 / +0.3 / -0.1% |
+| TPC-H SF1, server instructions per query (22) | -0.05% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | +10 a statement (+0.006%) | -1.6% |
+| code size: lexdb -O | +8 KB | |
+
+Tests: tests/run/inline_recursive_once (branching recursion, a borrow through a match, a `mut &`
+accumulator, records by value, strings, a 100,000-node list), unbox_local_record (unboxed:
+loops, copies, string fields, an inlined constructor; kept: passed, returned, stored, moved into
+an Option, a drop method). The quick gate, an `-O` self-build fixed point, the lexdb suite,
+vrgen and loopgen (200 each) and the native red-team corpus pass.
