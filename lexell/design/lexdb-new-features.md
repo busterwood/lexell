@@ -5,7 +5,9 @@ lexdb code was changed; the branch adds this note and one test (`tds_distinct`, 
 (section 6) is a proposal; the choices in it are the user's. Section 7 (later, commit 91781b58): the rows classed wrong
 answer and wrong error fixed, marked *works* with the commit. Section 8 (later, commit ec3c5c17): the cheap missing statement
 forms of 6.1 (items 1, 2's Oracle GROUP BY ALL, 4 and 5), marked *works* with the commit. Section 9 (later, commits f8c07339
-and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates, marked *works* with the commit.
+and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates, marked *works* with the commit. Section 10
+(later, commits 96be5d41, 4e1cf747, 269cfa25): a panic that ended the server, and 6.2's items 3 (IGNORE NULLS) and 5 (ON
+CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -46,11 +48,11 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 
 | # | Feature | PostgreSQL's behaviour | lexdb (PostgreSQL door) | Class | Size | Other doors natively | Modules |
 |---|---|---|---|---|---|---|---|
-| P1 | `INSERT ... ON CONFLICT (target) DO SELECT [FOR UPDATE\|NO KEY UPDATE\|SHARE\|KEY SHARE] [WHERE cond] RETURNING ...` (P19) | the conflicting row is returned as it is (optionally locked), a new row as inserted; WHERE filters the conflicting ones out of RETURNING (`INSERT 0 0`); RETURNING required (42601 "requires a RETURNING clause"), so is a conflict target (42601 "requires inference specification"); `old.*`/`new.*` both the existing row | 42601 syntax error at `select` | missing | M: a third conflict action beside NOTHING/UPDATE; the row lock and WHERE reuse ON CONFLICT DO UPDATE's (`upsertOf`, `conflictOf`, in lexdb_exec: new code in its own module) | none (T-SQL and Oracle have MERGE only) | lexdb_parse `onConflict`, the upsert path |
+| P1 | `INSERT ... ON CONFLICT (target) DO SELECT [FOR UPDATE\|NO KEY UPDATE\|SHARE\|KEY SHARE] [WHERE cond] RETURNING ...` (P19) | the conflicting row is returned as it is (optionally locked), a new row as inserted; WHERE filters the conflicting ones out of RETURNING (`INSERT 0 0`); RETURNING required (42601 "requires a RETURNING clause"), so is a conflict target (42601 "requires inference specification"); `old.*`/`new.*` both the existing row | as PostgreSQL 19: the row there returned as it is, a new one as inserted, WHERE over the row there and EXCLUDED, the four lock strengths (held to the end of a block), RETURNING old/new (both the row there), a row met twice returned twice; 42601 without RETURNING or a target, 42P01 for EXCLUDED in RETURNING (was 42601 at `select`) | works (269cfa25) | M | none (T-SQL and Oracle have MERGE only) | lexdb_parse `conflictSelect`, lexdb_exec `upsertSelect` |
 | P2 | `RETURNING old.x, new.x, old.*, new.*` and `RETURNING WITH (OLD AS o, NEW AS n)` for INSERT, UPDATE, DELETE, ON CONFLICT DO UPDATE, MERGE (P18) | INSERT's old NULL, DELETE's new NULL; MERGE RETURNING with `merge_action()` and old/new | as PostgreSQL 18: `old.c`, `new.c`, `old.*`, `new.*`, `WITH (OLD AS o, NEW AS n)` in INSERT, ON CONFLICT DO UPDATE (old the row there), UPDATE (... FROM), DELETE (... USING), MERGE per action; a default name a table has is the table's, one given in WITH 42712; OLD/NEW twice 42601 (was 42P01). Not: the whole row (`RETURNING old`, a composite), old/new in a subquery of RETURNING (8.3) | works (ec3c5c17) | S | Oracle 23ai `RETURNING OLD c, NEW c INTO` (O19, works); T-SQL has OUTPUT (works) | new lexdb_oldnew, lexdb_parse `returning`, lexdb_exec `retOf` |
 | P3 | `PRIMARY KEY / UNIQUE (k, r WITHOUT OVERLAPS)`, `FOREIGN KEY (k, PERIOD r) REFERENCES t (k, PERIOD r)` (P18) | needs a range column (and btree_gist for scalar parts); 23P01 for an overlap, 23503 for a range the referenced rows do not cover | 42601 at `without`; range types do not exist (`daterange`: 42704) | missing | L: range types first, then the constraint (section 6.3) | none (Oracle's PERIOD FOR has no such key; SQL Server's temporal tables are system-versioned) | new lexdb_range, catalog, write path |
 | P4 | `WAIT FOR LSN 'lsn' [WITH (MODE 'standby_replay\|standby_write\|standby_flush\|primary_flush', TIMEOUT '...', NO_THROW)]` (P19) | on a primary: `recovery is not in progress` (55000) for the standby modes | as PostgreSQL 19 (lexdb.md 9.137): the options, statuses and errors, checked against a 19.0 primary and standby; lexdb's LSN is the batch number; `pg_current_wal_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn`, `pg_is_in_recovery` added (was 42601 at `wait`) | works (replica branch) | M, with the replica work (the user's order) | none (SQL Server and Oracle have no statement for it) | lexdb_standby, lexdb_parse, lexdb_store (Follower.waitApplied) |
-| P5 | `lag/lead/first_value/last_value/nth_value(...) IGNORE NULLS \| RESPECT NULLS OVER (...)` (P19) | NULLs skipped in the frame (lag/lead: in the offset) | 42601 at `nulls` | missing | M: the frame walk in both the row path and the pipeline window (lexdb_window) | SQL Server 2022 (FIRST_VALUE, LAST_VALUE, LAG, LEAD: S15), Oracle (`f(x IGNORE NULLS)` and `f(x) IGNORE NULLS`: O25) | lexdb_parse, lexdb_window |
+| P5 | `lag/lead/first_value/last_value/nth_value(...) IGNORE NULLS \| RESPECT NULLS OVER (...)` (P19) | NULLs skipped in the frame (lag/lead: in the offset) | as PostgreSQL 19: lag and lead the off'th value not NULL (0 the row's own, a negative offset the other way), first_value, last_value, nth_value over any frame and EXCLUDE; 0A000, 42809 (was 42601 at `nulls`) | works (4e1cf747) | M | SQL Server 2022 (FIRST_VALUE, LAST_VALUE, LAG, LEAD: S15), Oracle (`f(x IGNORE NULLS)` and `f(x) IGNORE NULLS`: O25) | lexdb_parse, lexdb_window |
 | P6 | `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` (P18); `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` for CHECK (P19) | rows not checked while not enforced; ENFORCED rechecks (23514 "is violated by some row") | 42601 at `not`; ALTER CONSTRAINT: lexdb's ALTER COLUMN message | missing | M: a flag on the constraint, the write path skipping it, ALTER rechecking | Oracle `CHECK (...) DISABLE`, `ENABLE NOVALIDATE` (O26); SQL Server `WITH NOCHECK`, `NOCHECK CONSTRAINT` (S22) | lexdb_parse `checkTail`, lexdb_catalog, the write path |
 | P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL, kept in pg_constraint (contype `n`, every NOT NULL there, `t_c_not_null` by default), information_schema's CHECK rows, DROP / RENAME CONSTRAINT | the syntax as PostgreSQL 18 (`[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD, 42703, 42601 for two names of a column); the name is not kept, the catalogs list no NOT NULL constraints, DROP CONSTRAINT n 42704 | works (syntax, ec3c5c17) / missing (the catalogs: plan in 8.4) | S (syntax) / M (catalogs) | none | lexdb_parse `nnCons`; lexdb_catalog, lexdb_pgcat |
 | P8 | `uuidv7([shift interval])`, `uuidv4()` (P18); `uuid_extract_version`, `uuid_extract_timestamp` (P17) | | as PostgreSQL: version 7 with 12 bits of the sub-millisecond, rising within the process; the version and time of versions 1, 4, 7 (NULL for another variant) (was 42883) | works (f8c07339) | S | Oracle `UUID()`, `IS_UUID()` (O14, works); T-SQL NEWID (works) | lexdb_newfn |
@@ -90,7 +92,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | S12 | `PRODUCT(x)` aggregate, also `DISTINCT` and `OVER (...)` | 24; 8115 for an int overflow; NULL for no rows | as SQL Server: an int's an int (8115), bigint, float, decimal(38, 6), DISTINCT, OVER, NULL for no rows, 8117 for a varchar (was 195) | works (f8c07339) | S | none | lexdb_agg, lexdb_bind `productName` |
 | S13 | `DATE_BUCKET(part, n, d [, origin])` (2022) | `2020-01-06` for week 1 of `2020-01-08` | as SQL Server: each part and type, an origin, months from its day, 8116, 9810, 9834, 155 (a datetimeoffset's offset: 9.3) (was 207) | works (f8c07339) | S: one kernel, three spellings | PostgreSQL `date_bin` (P23, works), Oracle `TIME_BUCKET` (O12, works) | lexdb_newfn `bucketOf`, lexdb_parse `tsqlNewCall` |
 | S14 | `DATETRUNC(part, d)` (2022) | | as SQL Server: each part, week (DATEFIRST 7) and iso_week, the type and its precision (9810), a string as datetime2(7) (was 207) | works (f8c07339) | S | PostgreSQL `date_trunc`, Oracle `TRUNC(d, fmt)` (both work) | lexdb_newfn, lexdb_exec `newScale` |
-| S15 | `FIRST_VALUE/LAST_VALUE/LAG/LEAD(x) IGNORE NULLS OVER (...)` (2022) | | 102 at `nulls` | missing | (P5) | PostgreSQL 19 (P5), Oracle (O25) | lexdb_window |
+| S15 | `FIRST_VALUE/LAST_VALUE/LAG/LEAD(x) IGNORE NULLS OVER (...)` (2022) | LAG/LEAD: the row the offset names, then the nearest value not NULL beyond it (the default only past the partition) | as SQL Server 2022; 16208, 195 (NTH_VALUE), 8730 (was 102 at `nulls`) | works (4e1cf747) | (P5) | PostgreSQL 19 (P5), Oracle (O25) | lexdb_window |
 | S16 | `UNISTR(s [, escape])` | `\00e9`, `\+01F600`, another escape character; a varchar input needs a UTF-8 collation (9844) | as SQL Server: the escapes, another escape character, 9841-9843; 9844 not for a literal (9.3) (was 195) | works (f8c07339) | S: one function, three spellings | PostgreSQL `unistr` (P23, works), Oracle `UNISTR` (O27, works) | lexdb_newfn `unistr` |
 | S17 | `EDIT_DISTANCE(a, b [, max])`, `EDIT_DISTANCE_SIMILARITY`, `JARO_WINKLER_DISTANCE`, `JARO_WINKLER_SIMILARITY` | 3, 57, 0.0388..., 96 for kitten/sitting and martha/marhta; **9847 under a SQL_ collation**, which is the default (and lexdb's TDS collation, SQL_Latin1_General_CP1_CI_AS): a Windows collation must be named | as SQL Server 2025: the optimal string alignment distance (martha/marhta 1), its maximum, 9847 under an SQL_ collation, a CI one's case folded, 8116, 174, 189 (was 195) | works (f8c07339) | S (with the 9847 rule) | Oracle `UTL_MATCH` (O28, works); PostgreSQL only in the fuzzystrmatch extension | lexdb_newfn, lexdb_bind `newCall` |
 | S18 | `CURRENT_DATE`; `SUBSTRING(s, start)` without length; `DATEADD` with a bigint | | as SQL Server (`SUBSTRING(NULL, 1)` 8116 now) | works (91781b58) | | | |
@@ -131,7 +133,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | wrong error | S: refuse it when `p.ora` in `lexdb_parse.isTail`; but users may rely on the extension: the user's call | PostgreSQL, T-SQL 2022 | lexdb_parse |
-| O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | | ORA-00900 | missing | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
+| O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | PostgreSQL's values; ORA-01428 for an offset or n below 1 | as Oracle, both spellings; ORA-30484, 01428 (was ORA-00900); not NTH_VALUE's FROM FIRST / FROM LAST (10.4) | works (4e1cf747) | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
 | O26 | `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [NO]VALIDATE` | | ORA-00900 | missing | (P6) | PostgreSQL NOT ENFORCED, T-SQL NOCHECK | |
 | O27 | `UNISTR('\00e9')` | NVARCHAR2 | as Oracle (ORA-30186) (was ORA-00904) | works (f8c07339) | (S16) | PostgreSQL, T-SQL 2025 (works) | lexdb_newfn |
 | O28 | `UTL_MATCH.EDIT_DISTANCE`, `.JARO_WINKLER`; `UTL_ENCODE.BASE64_ENCODE` | 3; `aGk=` | UTL_ENCODE.BASE64_ENCODE and BASE64_DECODE as Oracle (RAW in, RAW out; ORA-29261 for NULL), with UTL_RAW.CAST_TO_RAW and CAST_TO_VARCHAR2 (they were NULL) (91781b58); UTL_MATCH's EDIT_DISTANCE, EDIT_DISTANCE_SIMILARITY, JARO_WINKLER, JARO_WINKLER_SIMILARITY as Oracle (f8c07339) | works | S | T-SQL 2025 (S17, S7, works) | lexdb_orafn, lexdb_newfn, lexdb_parse |
@@ -147,13 +149,14 @@ the rows.
 
 | Product | works | wrong answer | wrong error | missing | parts / rows |
 |---|---|---|---|---|---|
-| PostgreSQL 19/18 (and older met on the way) | 16 (P2, P4, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 11 (P1, P3, P5, P6, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
-| SQL Server 2025/2022 | 21 (S1-S9, S12-S14, S16-S21, S23-S25) | 0 | 0 | 5 (S10, S11, S15, S20's STRING_SPLIT, S22) | 26 / 25, and S26 (note) |
-| Oracle 26ai/23ai | 20 (O2-O10, O12-O20 but O17's CHECKSUM, O27, O28) | 1 (O5's literal type) | 1 (O24) | 10 (O1, O11, O17's CHECKSUM, O21-O23, O25, O26, O29, O30) | 32 / 30 |
+| PostgreSQL 19/18 (and older met on the way) | 18 (P1, P2, P4, P5, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 9 (P3, P6, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
+| SQL Server 2025/2022 | 22 (S1-S9, S12-S21, S23-S25) | 0 | 0 | 4 (S10, S11, S20's STRING_SPLIT, S22) | 26 / 25, and S26 (note) |
+| Oracle 26ai/23ai | 21 (O2-O10, O12-O20 but O17's CHECKSUM, O25, O27, O28) | 1 (O5's literal type) | 1 (O24) | 9 (O1, O11, O17's CHECKSUM, O21-O23, O26, O29, O30) | 32 / 30 |
 
 Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26. After
 section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26. After section 8,
-before section 9: PostgreSQL 11 / 0 / 0 / 14; SQL Server 15 / 0 / 0 / 11; Oracle 14 / 2 / 1 / 18.
+before section 9: PostgreSQL 11 / 0 / 0 / 14; SQL Server 15 / 0 / 0 / 11; Oracle 14 / 2 / 1 / 18. After section 9, before
+section 10: PostgreSQL 16 / 0 / 0 / 11; SQL Server 21 / 0 / 0 / 5; Oracle 20 / 1 / 1 / 10.
 
 ## 5. IS [NOT] DISTINCT FROM in the T-SQL door: the test
 
@@ -597,6 +600,219 @@ Measured on the branch's last code commit (ed4b68b2) against main `c50e071d`, bo
 - Met while testing, not changed: Oracle's LENGTH of a RAW is its hex digits' (32 for a UUID), lexdb's its bytes' (16);
   lexdb's Oracle AVG of a NUMBER has a double's digits where Oracle's has 38; in the Oracle door `insert into t (id, d) select n, date
   '2024-03-05' + n / 97 from ...` (a DATE column) ends the process ("decimal result is not exactly representable": a panic,
-  not an error; the same expression in a SELECT works); PostgreSQL's `pg_typeof(agg(x))` is
+  not an error; the same expression in a SELECT works: fixed in section 10.1, the SELECT ended it too); PostgreSQL's `pg_typeof(agg(x))` is
   evaluated as a constant per row (no aggregation); T-SQL's CAST(varbinary AS varchar) gives the hex text, not the bytes;
   T-SQL LEN of an emoji is 2 in SQL Server (UTF-16 units), 1 in lexdb.
+
+## 10. A server-ending panic, and 6.2's medium items (as built)
+
+Branch from main `be7461cc`, commits `96be5d41` (the panic), `4e1cf747` (IGNORE NULLS), `269cfa25` (ON CONFLICT DO SELECT),
+`06e4fbb5` and `7053aba0` (the cost, 10.6).
+Each item checked against the product first (the containers of the header: PostgreSQL 19.0 `lxl-pg19`, SQL Server 2022
+`lxl-mssql`, Oracle Free 23.26.3 `lxl-oracle`) and built in every door that has it. Rows above say *works* with the commit.
+QUALIFY (O1) and the unenforced constraints (P6, S22, O26) are not built: plans in 10.4 and 10.5.
+
+### 10.1 No Decimal operator ends the server
+
+lib/decimal's operators and its `add`, `sub`, `mul`, `rem` methods (and `fromFraction`, `fromUnits` past their scales) stop
+the program ("Lexell: decimal result is not exactly representable", exit 10) when a result needs more than 38 digits; the
+exact forms (`addExact`, `mulExact`, `div`) give an error instead. lexdb's SQL arithmetic uses the exact forms, but internal
+computations used the operators. The sweep: every call of a trapping function from lexdb's code, found in the native
+binary's call graph (the callers of `decStop`'s callers, through `LXL_NATIVE_MAP`) and in the source, each tried through
+the three doors with 38-digit quotients (`n / 97`), huge and tiny literals (`1e125`, `1e-30000`) and their products. What
+ended the server, now the product's answer:
+
+- **Oracle's date + number** (`lexdb_orafn.plusMinus`; also INSERT ... SELECT into a DATE column, UPDATE, TRUNC, ROUND,
+  TIME_BUCKET of one): the fraction of a day times 86,400,000,000. Now `daysDelta`: Oracle's DATE arithmetic, whole seconds,
+  the fraction rounded half away from zero (to 30 places first, so `0.5 / 86400` is half a second as in Oracle's 40 digits:
+  `DATE '2024-03-05' + 1 / 97` is 00:14:51, lexdb gave 00:14:50), a TIMESTAMP's fraction dropped (Oracle's TIMESTAMP + n is a
+  DATE: `TIMESTAMP '... 10:00:00.5' + 1` is 10:00:00, lexdb kept .5), ORA-01841 past Oracle's years, ORA-01426 past a NUMBER
+  (1e126).
+- **NUMTODSINTERVAL, NUMTOYMINTERVAL** (`lexdb_orafn` `unitsOf`), **an interval times a number** (`lexdb_time.ivalTimes`: Oracle
+  and PostgreSQL), **interval text** with such a number of minutes, hours, days, weeks, months, years (`addUnit`, PostgreSQL),
+  **SET TIME ZONE** of such hours (`settingZone`), **MONTHS_BETWEEN**'s fraction plus the months, **width_bucket** of 38-digit
+  bounds (both doors), **div()** of 38-digit values (`a - a % b` needed 39 digits; now the quotient truncated), Oracle's
+  **PERCENTILE_CONT** and **PERCENTILE_DISC** of a 38-digit fraction or over 38-digit values (`lexdb_pct`; the other doors'
+  are doubles).
+- **random(min, max) of numerics** (P14) past an integer's span: an integer division by zero ("division by zero at
+  lexdb_newfn.lxl", the same exit). Now 128 random bits below the span (up to 10^38 units, no bias); 22003 ("value overflows
+  numeric format", PostgreSQL's) past 38 digits (`random(1e-30000, 1e30000)`; PostgreSQL's numeric holds that one).
+
+New module `lexdb_decfit` (core, imports nothing of lexdb's): `mulFit` (the exact product when it fits, else the exact
+256-bit product rounded half away from zero to 38 digits), `mulCeil` (rounded up: percentile_disc's `ceil(f * n)` stays the
+exact one's), `addFit`, `subFit` (both operands rounded to the larger one's 38th digit). Each site calls them where it called
+the operator; nothing on a hot path (each was a trap before). Met on the way and fixed with it: PostgreSQL's fractional
+years, decades, centuries are whole months rounded half to even, nothing spilled (`'1.01 years'` is 1 year, lexdb gave 1 year 3
+days 14:24; `'1.2345 years'` 1 year 3 mons).
+
+Judged unreachable, not changed: the multiplications by powers of ten (`secondsUs`, `makeTs`, `makeInterval`,
+`fromEpochSeconds`, to_char's `V`, T-SQL FORMAT's `P` and `%`: a coefficient times 10^k only moves the exponent, and the
+exponents reachable from SQL are far inside Decimal's 32,767; `1e32767` probed in each); `extractTs`'s julian day (an integer
+plus a 20-digit fraction), `extractIval`'s epoch (microseconds and whole seconds of int ranges, below 30 digits);
+`lnDweight`'s `d - 1` (only for d within 0.9 to 1.1: never more digits than d); Oracle's integer + integer overflow (two
+19-digit integers); `rem` (every caller tests the zero divisor first: lexdb_ops.arith, lexdb_lib's mod, gcd, lcm); the TDS
+and TNS decimal decoders (their magnitudes checked against 10^38 - 1 first, scales below 39); `fromUnits` callers (constant
+scales, or a column's, 0 to 38). No T-SQL statement reached a trapping call: the door has no interval type, `datetime +
+number` is 195 in lexdb (SQL Server adds days: a wrong error, 10.6), and its percentiles are doubles.
+
+Tests, batches off and on: `tns_decfit` (28 statements: the brief's INSERT ... SELECT into a DATE column of 3,000 rows, the
+date arithmetic, NUMTODSINTERVAL, intervals, MONTHS_BETWEEN, WIDTH_BUCKET, the percentiles grouped and over windows;
+`gen_oracle.py --check tns_decfit`: 0 differences; lexdb's numbers have 38 digits where Oracle's have 40, equal to 30),
+`exec_decfit` (PostgreSQL 19, 21 statements: an interval times a 38-digit numeric in a select list, INSERT ... SELECT of
+3,000 rows, UPDATE ... RETURNING, sum and avg; interval text; SET TIME ZONE; width_bucket; div; random). No `tds_` test: no
+statement of that door ended the server.
+
+### 10.2 IGNORE NULLS / RESPECT NULLS (P5, S15, O25)
+
+What the products do (each checked on the same nine rows with NULLs, two partitions, and the errors):
+
+- PostgreSQL 19: `f(x) IGNORE NULLS OVER` for lag, lead, first_value, last_value, nth_value; lag and lead take the off'th
+  value not NULL before or after the row (an offset of 0 the row's own value, NULL or not; a negative one the other way), the
+  default when there is none; the others the first, last or nth value not NULL of the frame (EXCLUDE honoured). 0A000
+  "function row_number does not allow RESPECT/IGNORE NULLS" (rank, ntile ...), 42809 for an aggregate and for no OVER, 42601
+  inside the parentheses.
+- SQL Server 2022: FIRST_VALUE, LAST_VALUE, LAG, LEAD (no NTH_VALUE: 195), after the parentheses only (102 inside, 156
+  without OVER). LAG and LEAD are another rule: the row the offset names and, when its value is NULL, the nearest value not
+  NULL beyond it in the same direction within the partition; NULL when there is none, the default only when the row named is
+  past the partition (`LAG(x, 2) IGNORE NULLS` over NULL, 10, NULL, 20 gives 10 at the fourth row, PostgreSQL NULL). 16208
+  "The function 'row_number' does not support IGNORE NULLS." (RESPECT NULLS too), 8730 for a negative offset.
+- Oracle 23.26: PostgreSQL's values, both after the call and inside it (`LAG(x IGNORE NULLS, 1, 99) OVER`); ORA-01428
+  "Argument 0 is out of range." for an IGNORE NULLS offset below 1 and any NTH_VALUE n below 1; ORA-30484 for another function,
+  both spellings at once, and no OVER; an aggregate's `IGNORE NULLS` is an alias (ORA-00923).
+
+What lexdb did: 42601 / 102 / ORA-00900 at `nulls`. Now: the parser reads the treatment after the call (`lexdb_parse.
+nullsMark`, one call after FILTER: two inline checks in `P.primary`, the parse of every expression, cost the point select 11%
+more branch misses over the wire, 10.6) and in the Oracle door after the first argument (`callArg` wraps it for nullsMark),
+and marks the call's name (" nulls:i", " nulls:o" for Oracle's errors, " nulls:t" for SQL Server's lag and lead; RESPECT NULLS is the
+default and marks nothing), with each product's errors. The planner's `winPlan` puts it in `WinPlan.nulls`
+(`lexdb_window.nullsOf`), and `lexdb_window.compute` sends such a call to `nullsValues` (at the end of lexdb_window) for the
+row path and the batches' alike: per partition the argument's values in the window's order, the positions of the ones not
+NULL and how many come before each position; lag and lead index those (or SQL Server's walk), first_value, last_value and
+nth_value find each row's frame by `frameBounds` (the row path's) and pick from its pieces outside EXCLUDE's intervals. One
+walk for both engines, so the batches-on and -off answers are one code's.
+
+Tests, each statement with batches off and on: `exec_winnulls` (PostgreSQL 19, 21 statements), `tns_winnulls` (Oracle Free,
+24, both spellings; `gen_oracle.py --check`: 0 differences), `tds_winnulls` (SQL Server 2022, 19 batches): offsets, defaults,
+NULL offsets, partitions, ROWS, RANGE and GROUPS frames with offsets and EXCLUDE (PostgreSQL, Oracle), text values, a named
+window, NULLS FIRST orders, 3,000 rows grouped on a text key with NULLs, no rows, every value NULL, an error in a later row
+(22012 / 8134 / ORA-01476, 22016, ORA-01428), and the errors above.
+
+### 10.3 ON CONFLICT DO SELECT (P1)
+
+PostgreSQL 19 (checked on `lxl-pg19`): `INSERT ... ON CONFLICT (target) DO SELECT [FOR UPDATE | FOR NO KEY UPDATE | FOR SHARE
+| FOR KEY SHARE] [WHERE cond] RETURNING ...`: a conflicting row is returned as it is (locked when asked), a new row as
+inserted; WHERE (over the row there and EXCLUDED; an unqualified column 42702) drops a conflicting row from RETURNING and
+from the count (`INSERT 0 0`); `old.*` and `new.*` are both the row there; a row met twice in one statement is returned twice,
+one the statement inserted is returned again (no 21000, which DO UPDATE gives); 42601 without RETURNING ("ON CONFLICT DO
+SELECT requires a RETURNING clause") or a conflict target ("requires inference specification or constraint name"), 42P01
+for EXCLUDED in RETURNING; NOWAIT, SKIP LOCKED and OF are syntax errors.
+
+What lexdb did: 42601 at `select`. Now the parser's `conflictSelect` (called from `onConflict`, at the end of lexdb_parse)
+keeps the lock strength in the statement's conflict mode (`lexdb_sql.CONFLICT_SELECT + LOCK_*`: no new field in the
+statement or the executor's `Upsert`, which INSERT pays for: 8.2), and WHERE in the statement's WHERE as DO UPDATE's;
+`upsertOf` resolves it over the row there and EXCLUDED, and `upsertOld` hands a conflict to `upsertSelect` (lexdb_exec,
+beside storeRow): WHERE tested, the row locked as SELECT ... FOR UPDATE locks it (`lockFound`, held to the end of a
+transaction block), kept followed by itself so that `keptRet` gives RETURNING old.c and new.c the row there. The lock is
+checked from a second session (FOR UPDATE blocks FOR KEY SHARE, NOWAIT 55P03). T-SQL and Oracle have no such action (MERGE
+only). Test: `exec_upsel` (PostgreSQL 19, 32 statements, each with batches off and on; the writes in a transaction rolled
+back each time). Not in lexdb, and not DO SELECT's: a data-modifying statement in WITH (`WITH t AS (INSERT ... RETURNING
+v) SELECT ...`) is a syntax error in lexdb whatever the conflict action. Suite 328 of 328 (the six new tests: tns_decfit, exec_decfit,
+exec_winnulls, tns_winnulls, tds_winnulls, exec_upsel; 322 before).
+
+### 10.4 Plan: QUALIFY (O1, about a day)
+
+Oracle 23.26.3 (checked): `QUALIFY cond` after WHERE, GROUP BY, HAVING and WINDOW, before ORDER BY and FETCH (ORA-03048
+for HAVING after it, ORA-03049 for a second QUALIFY); it filters the rows after the window step and before DISTINCT, ORDER BY
+and FETCH; cond may name a select alias (`qualify rn = 1`, a quoted one as quoted), hold window calls of its own (`qualify
+row_number() over (...) = 1`), aggregates of a grouped query (`qualify rank() over (order by count(*) desc) = 1`), and plain
+columns with no window at all (`qualify id > 10`); an alias that is also another item's column is ORA-00960; in a UNION it
+belongs to the last branch (ORA-00904 for the first branch's alias); in a derived table it is that query's.
+
+The way: (a) the Oracle door's select core reads `QUALIFY cond` after WINDOW (lexdb_parse, its own function at the end of the
+file) and keeps it as a last select item named `#qualify` (no new Stmt field: a field costs every statement's parse, 8.2);
+its window calls are the query's like the select list's, numbered in `p.wins`; (b) the planner takes the item off the list
+(`lexdb_bind`, its own function beside `resolveHaving`): resolved over the select outputs first (an alias stands for its
+item's expression; ORA-00960 when an alias is also a column of another item), then the columns, aggregates and `#win`
+slots as a select item is; (c) the row engine's windowed loop (lexdb_exec, where `winValues`' columns are put in the rows,
+before DISTINCT) skips a row whose qualify value is not true, and the pipeline's Window operator gets a filter step after it
+(lexdb_pipe: a Filter over the window's output columns, the same compiled expression), so batches on and off agree; a query
+without a window call filters at the same place. No point-select cost: the select core tests `p.ora` and the keyword only
+after WINDOW, and the planner's new function runs only for a query with the item. Test `tns_qualify` against Oracle Free
+(aliases, window calls in the condition, grouped queries, DISTINCT, ORDER BY and FETCH after it, a derived table, UNION, the
+errors), batches off and on. PostgreSQL and SQL Server have no QUALIFY.
+
+### 10.5 Plan: unenforced constraints (P6, S22, O26, two to three days)
+
+What the products do (checked): PostgreSQL 18/19 `CHECK (...) NOT ENFORCED` and `REFERENCES ... NOT ENFORCED` (42601
+"misplaced NOT ENFORCED clause" on a primary key, UNIQUE or NOT NULL), `ALTER TABLE t ALTER CONSTRAINT c [NOT] ENFORCED`
+(ENFORCED rechecks the rows: 23514 "check constraint "ck" of relation "c" is violated by some row", 23503 for a foreign key;
+NOT ENFORCED leaves it not valid), VALIDATE CONSTRAINT of one not enforced 55000, `pg_constraint.conenforced` /
+`convalidated` f / f, `information_schema.table_constraints.enforced` NO. SQL Server: `ALTER TABLE t WITH NOCHECK ADD
+CONSTRAINT ...` (enforced from now on, the rows not checked: `is_not_trusted` 1), `NOCHECK CONSTRAINT c | ALL` (`is_disabled`
+1), `[WITH CHECK] CHECK CONSTRAINT c | ALL` (enabled; WITH CHECK rechecks, 547, and makes it trusted), in sys.check_constraints
+and sys.foreign_keys. Oracle 23.26.3: `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [VALIDATE | NOVALIDATE]`, `ALTER TABLE t
+MODIFY CONSTRAINT c ...`, `ENABLE / DISABLE CONSTRAINT c` (ENABLE VALIDATE rechecks: ORA-02293, 02298 for a foreign key;
+ENABLE NOVALIDATE checks new rows only: ORA-02290 then), USER_CONSTRAINTS `STATUS` ENABLED / DISABLED and `VALIDATED`
+VALIDATED / NOT VALIDATED; 23.26.3 has no NOT ENFORCED (ORA-03075).
+
+One model for the three: two flags of a CHECK or foreign key, *enforced* (new rows checked) and lexdb's *valid* (9.117: the
+rows there known to obey it). PostgreSQL's NOT ENFORCED is not enforced and not valid; SQL Server's NOCHECK CONSTRAINT not
+enforced, not trusted; WITH NOCHECK ADD enforced, not trusted; Oracle's DISABLE not enforced, not validated; ENABLE NOVALIDATE
+enforced, not validated. The way: (a) the catalog keeps the names of a table's constraints not enforced (`Table.offCons`,
+encoded after its NOT VALID names, so a table without any reads and writes as now), RENAME and DROP CONSTRAINT keeping it;
+(b) the write path skips them: `checkChecks` and the foreign-key child checks (lexdb_exec, lexdb_fkprobe) test the list's
+length once per statement (an INSERT's cost: measured, and if it shows, the flag moves into the per-table check list the
+statement already builds); parent-side checks (a referenced row deleted) skip a foreign key not enforced as well; (c) the
+spellings: PostgreSQL's `checkTail` and the foreign key's tail, ALTER CONSTRAINT; T-SQL's WITH [NO]CHECK and [NO]CHECK
+CONSTRAINT in lexdb_tsqlparse's ALTER TABLE; Oracle's DISABLE / ENABLE [NO]VALIDATE in column and table constraints and
+MODIFY / ENABLE / DISABLE CONSTRAINT; (d) enforcing again with a recheck runs the existing VALIDATE CONSTRAINT scan (9.117)
+with each product's error; (e) the catalogs: lexdb_pgcat's conenforced and convalidated, pg_get_constraintdef's ` NOT
+ENFORCED`, information_schema's enforced; lexdb_syscat's is_disabled and is_not_trusted; lexdb_oracat's STATUS and VALIDATED;
+(f) the planner may use a constraint only when enforced and valid (any join elimination or CHECK-based pruning checks
+both). Tests per door against each product (exec_, tds_, tns_unenforced), the write path with batches off and on, the
+catalogs as each product's tools read them. Left for its own slice: it is more than a day (three ALTER grammars, three
+catalogs, the recheck errors).
+
+### 10.6 Cost
+
+Measured on the branch's last code commit (7053aba0) against main `be7461cc`, both `-O`.
+
+- In process (`LXL_HASH_SEED=1`, 20,000 statements less the setup, two rounds alternated): point select 123,966.4 / 123,966.3
+  -> 123,966.3 / 123,966.3 instructions, INSERT 55,118,174.6 / 174.5 -> 174.6 / 174.6, UPDATE by key 55,138,480.2 / 480.2 ->
+  480.2 / 480.3. On the way the DO SELECT commit was INSERT +1.0 (its RETURNING check at the head of `upsertOf`, which an
+  INSERT without ON CONFLICT leaves at its first test: placement of the plain path's code); 06e4fbb5 moved it after the
+  conflict target's.
+- Over the wire (`icount6.sh`, 3 x points.sql, base and branch alternated twice, fresh copies of each binary), per statement:
+  instructions 173,091 / 173,362 -> 173,057 / 173,185; cycles 97,679 / 98,639 -> 99,114 / 97,445; L1 i-cache misses 296 /
+  314 -> 301 / 407; branch misses 359 / 356 -> 372 / 373. Before 7053aba0 the instructions were as equal and branch misses
+  400 to 405 against 357 to 368 (cycles +2.5% over five runs): placement, found by building the branch's commits and then
+  each changed file of the IGNORE NULLS commit alone (its window code +32 branch misses, its parse +45, both +77; the panic's
+  commit alone 343), and a perf record of branch-misses:u showing the change spread over unrelated functions (P.fromItem0,
+  plan.choosePath, cols.putRow, pipe.bxEval). The two inline checks in `P.primary` (3 KB of it) are one call now; the rest
+  (+4% branch misses, cycles within the runs' spread) is where the new code puts the functions after it.
+- TPC-H SF1 (`run.sh`, lexdb only, base and branch alternated twice, the best of each side): checksums equal on all 22;
+  total 8,838 -> 8,876 ms. Above 1.5%: q3 520.2 -> 533.8 (base's runs 557.6 / 520.2), q12 431.5 -> 440.9, q16 223.0 ->
+  227.6, q18 614.3 -> 639.4 (base's 892.5 / 614.3), q20 246.0 -> 250.0; their server instructions are equal (`iq.sh`, two
+  runs each: q3 3,552.8M / 3,553.0M against 3,553.0M / 3,553.1M, q12 4,097.9M / 4,097.8M against 4,097.8M / 4,097.8M, q16
+  2,041.6M / 2,040.4M against 2,039.9M / 2,039.0M, q18 6,904.6M / 6,904.5M against 6,904.5M / 6,904.5M, q20 1,639.2M /
+  1,639.0M against 1,639.0M / 1,638.9M): noise and placement.
+- lexdb_exec: 20,540 -> 20,567 lines (DO SELECT's `upsertSelect` and its checks, WinPlan's field); the rest in the new
+  lexdb_decfit (119 lines), lexdb_window (`nullsValues`, at its end), lexdb_parse (`nullsMark`, `nullsTreat`,
+  `conflictSelect`, at its end), lexdb_time, lexdb_orafn, lexdb_pct, lexdb_lib and lexdb_newfn.
+
+### 10.7 Left
+
+- Not built: QUALIFY (O1) and the unenforced constraints (P6, S22, O26): the plans in 10.4 and 10.5.
+- Oracle's `NTH_VALUE(x, n) FROM FIRST | FROM LAST` (with either treatment): ORA-00900 in lexdb, as before.
+- Met while testing, not changed (each as before this slice): Oracle's `LAG(x, -1)` without IGNORE NULLS is ORA-01428 there and a
+  lead in lexdb, and `NTH_VALUE(x, 0)` ORA-01428 there, ORA-20000 (22016) in lexdb; SQL Server's `LAG(x, -1)` without IGNORE
+  NULLS is 8730 there, a lead in lexdb; Oracle's `SUM(x) IGNORE NULLS OVER` ORA-00923 there, lexdb's syntax error ORA-00900;
+  Oracle's NUMTOYMINTERVAL of a fraction of a month (0.12 months is 1 month and 1.1 months 1 there: neither rounding nor a
+  ceiling; lexdb rounds half away), an INTERVAL DAY TO SECOND divided by a number (Oracle's interval, lexdb ORA-01722) and an
+  INTERVAL YEAR TO MONTH times a fraction (ORA-01876 there, days in lexdb); Oracle's NUMBER rounds a sum or product past 38
+  digits to 40 (`12345678901234567890123456789012345678 + 2 / 97`) where lexdb's 38-digit numeric is ORA-01426; T-SQL's
+  `datetime + number` adds days in SQL Server, 195 in lexdb; PostgreSQL's interval text out of range is 22015, lexdb's 22008;
+  a data-modifying statement in WITH is a syntax error in lexdb.
+- random(min, max) of numerics whose units span more than 38 digits is 22003 in lexdb (PostgreSQL's numeric draws one).
+- DO SELECT FOR UPDATE that waited for another transaction returns the row as it found it (PostgreSQL re-reads it); the lock
+  is lexdb_store's row lock, as SELECT ... FOR UPDATE's.
