@@ -722,3 +722,42 @@ accumulator, records by value, strings, a 100,000-node list), unbox_local_record
 loops, copies, string fields, an inlined constructor; kept: passed, returned, stored, moved into
 an Option, a drop method). The quick gate, an `-O` self-build fixed point, the lexdb suite,
 vrgen and loopgen (200 each) and the native red-team corpus pass.
+
+## 19. Small allocations and frees inline (as built)
+
+After sections 17 and 18, allocation and freeing were 46% of `lists`' instructions and 28% of
+`trees`': about 56 instructions a node for a call to `rt_alloc` (which called `malloc`) and one
+to `rt_free`, around fast paths of about 15. Java allocates with a bump of about ten inline
+instructions and frees nothing per object; with its heap capped at 16 MB it is still about
+twice as fast on `lists`, so its lead is the cost per object, not memory.
+
+- **Generated code** (x64gen `memInline`): `rt_alloc(n)` of a constant n of at most 120 bytes
+  pops the free list of n's class from the main heap (`rt_mheap.cur_free`, cur_live counted);
+  `rt_free(p)` pushes p back when p is in the current chunk and its header is a bare class.
+  Anything else (an empty list, another chunk, a large or tagged block) calls `rt_alloc_miss`
+  or `rt_free` out of line, the registers they change saved (genStubs, as rt_arr_push's growth).
+  Not in kernel functions or dynamically linked programs.
+- **The runtime** (native/rt.c): `rt_mheap.inline_ok` is set once the heap is up, and cleared
+  under LXL_CHECK (which counts every block) and when a par pool starts (malloc then goes
+  through the pool's hooks); static asserts hold the offsets x64gen uses. `rt_alloc_miss` is
+  rt_alloc with malloc's paths inline, for the inline code's misses only.
+- **Tried and dropped:** the same fast path in the runtime's own `rt_alloc` (strings -3.7%), and
+  malloc inlined into `rt_alloc`. Both changed how gcc compiled the allocator around them: json
+  +0.5 to 1.6% instructions, jq +2% cycles at fewer instructions (`malloc` and `realloc` slower
+  per call). `rt_alloc`, `malloc` and `realloc` are left exactly as they were.
+
+| measure (section 18's build against this) | instructions | cycles |
+|---|---:|---:|
+| bench lists / trees (5 interleaved rounds) | -20.1 / -14.2% | -14.4 / -13.9% |
+| bench strings / maps | level | level |
+| apps regex / json / jq / cmark / decimal (5 interleaved rounds) | -0.05 / +0.33 / 0.00 / 0.00 / 0.00% | -0.3 / +0.1 / +0.4 / -0.9 / 0.0% |
+| perfsuite compile suite | level | level |
+| TPC-H SF1, server instructions per query (22) | 0.00% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | level (172,317 to 172,330) | +1.4% (-0.8% in an earlier pair of rounds of the same generated code); branch misses +17 a statement |
+
+json's +0.33% is the inline check before each miss: it allocates mostly fresh blocks. The point
+selects' extra branch misses come with the allocation sites' own branches, which share no
+predictor history as malloc's one branch did.
+
+Test: tests/run/native_inline_alloc (lists across several chunks, three size classes, boxes
+kept, and the same after a par.map has started its pool), with LXL_CHECK on and off.

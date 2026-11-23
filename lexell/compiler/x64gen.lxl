@@ -44,6 +44,15 @@ const QUIET_REGS: []int = [6, 7, 8, 9]            // rsi rdi r8 r9
 // What the out-of-line growth of an inline rt_arr_push saves around its call (genStubs): an even
 // count, so that rsp stays 16-byte aligned.
 const GROW_SAVE: []int = [6, 7, 8, 9, 10, 11]      // rsi rdi r8 r9 r10 r11
+// The main thread's heap as inline allocation sees it (native/rt.c rt_mheap, whose static asserts
+// hold these): inline_ok, the current chunk, its live count and its free lists by class; the
+// classes, and the chunk size as a power of two.
+const RT_HP_OK = 0
+const RT_HP_CUR = 8
+const RT_HP_LIVE = 16
+const RT_HP_FREE = 24
+const RT_NCLASS = 40
+const RT_CHUNK_BITS = 21
 // The xmm registers of doubles (locals whose live range has no position fpLoud: the SysV ABI has
 // no callee-saved xmm registers, but native/math.c leaves these alone). The generated code uses
 // xmm0-xmm7 for values and arguments and xmm15 for copies.
@@ -250,6 +259,7 @@ type Grow = value record {
     label: int
     back: int
     size: int
+    mem: int        // 0: an rt_arr_push growth; 1: an inline rt_alloc's miss; 2: an inline rt_free's
 }
 
 type Stub = value record {
@@ -2125,6 +2135,7 @@ fn (g: &Gen) quietRt(e: int): bool {
     if dv.k >= 0 { return nargs == (if dv.op == ir.OP_SUB { 2 } else { 3 }) && g.isWhere(g.u.listAt(n.b, nargs - 1)) }
     if name == "rt_idx" || name == "rt_sidx" || name == "rt_str_byte" || name == "rt_str_word" { return nargs == 3 && g.isWhere(g.u.listAt(n.b, 2)) }
     if name == "rt_arr_push" { return g.pushInline(e) }
+    if name == "rt_alloc" || name == "rt_free" { return g.memInline(e) > 0 }
     if name == "rt_str_view" { return g.viewInline(e) }
     if name == "rt_as_slice" { return nargs == 1 }
     return false     // rt_str_dup copies (design/owned-str.md): a call of the runtime
@@ -2169,6 +2180,21 @@ fn (g: &Gen) pushInline(e: int): bool {
     if g.u.listLen(n.b) != 2 { return false }
     let sz = g.u.listAt(n.b, 1)
     return g.u.nk(sz) == ir.E_INT && x64.fits32(g.u.nodes[sz].v)
+}
+
+// Whether the call e is one that inlineRt allocates or frees with inline: 1 for rt_alloc(n) of a
+// constant n of at most 120 bytes (one of the small classes, (n + 7) >> 4), 2 for rt_free(p), else
+// 0. Not in a dynamically linked program or a kernel function (a par worker has its own heap).
+fn (g: &Gen) memInline(e: int): int {
+    if g.dyn || g.kern() { return 0 }
+    let name = g.rtName(e)
+    let n = g.u.nodes[e]
+    if g.u.listLen(n.b) != 1 { return 0 }
+    if name == "rt_free" { return 2 }
+    if name != "rt_alloc" { return 0 }
+    let a = g.u.listAt(n.b, 0)
+    let k = g.intConst(a, g.u.nodes[a].ty)
+    return if k.c == 0 && k.v >= 0 && k.v <= 120 { 1 } else { 0 }
 }
 
 // A kernel function (kernel.lxl) may run on a par pool thread: its str counts are changed by the
@@ -2309,8 +2335,8 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         } else if !g.counting && !g.quietRt(x) {
             g.loud[g.pos] = true
             if !g.fpKeepCall(x) { g.fpLoud[g.pos] = true }
-        } else if !g.counting && g.pushInline(x) {
-            g.fpLoud[g.pos] = true          // its growth saves no xmm register
+        } else if !g.counting && (g.pushInline(x) || g.memInline(x) > 0) {
+            g.fpLoud[g.pos] = true          // its growth (or rt_alloc, rt_free) saves no xmm register
         }
     } else if k < ir.S_DECL {
         // the other expressions (ir numbers them below the statements): their operands in order,
@@ -7257,9 +7283,17 @@ fn (g: mut &Gen) genStubs() {
     for gr in gs {
         g.a.bind(gr.label)
         for r in GROW_SAVE { g.a.push(r) }
-        g.a.movRR(8, RDI, RAX)
-        g.a.movRI(RSI, gr.size)
-        g.callRt("rt_arr_push")
+        if gr.mem == 1 {
+            g.a.movRI(RDI, gr.size)
+            g.callRt("rt_alloc_miss")
+        } else if gr.mem == 2 {
+            g.a.movRR(8, RDI, RAX)
+            g.callRt("rt_free")
+        } else {
+            g.a.movRR(8, RDI, RAX)
+            g.a.movRI(RSI, gr.size)
+            g.callRt("rt_arr_push")
+        }
         var i = len(GROW_SAVE) - 1
         while i >= 0 {
             g.a.pop(GROW_SAVE[i])
@@ -7662,6 +7696,60 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 0)) }
         return true
     }
+    let mk = g.memInline(e)
+    if mk == 1 {
+        // rt_alloc(n), n small and constant (native/rt.c rt_mheap): when inline_ok and the current
+        // chunk has a free block of n's class, that block, popped, and cur_live counted (malloc_h's
+        // first path); else rt_alloc_miss out of line (genStubs, the registers it changes saved)
+        let a = g.u.listAt(n.b, 0)
+        var sz = g.intConst(a, g.u.nodes[a].ty).v
+        if sz == 0 { sz = 1 }
+        let at = RT_HP_FREE + 8 * ((sz + 7) >> 4)
+        let slow = g.a.newLabel()
+        let done = g.a.newLabel()
+        append(mut &g.grows, Grow{label: slow, back: done, size: sz, mem: 1})
+        g.a.movRSym(RDX, g.symRt("rt_mheap"), 0)
+        g.a.load(8, RAX, x64.mem(RDX, RT_HP_OK))
+        g.a.test(8, RAX, RAX)
+        g.a.jcc(x64.CC_E, slow)
+        g.a.load(8, RAX, x64.mem(RDX, at))
+        g.a.test(8, RAX, RAX)
+        g.a.jcc(x64.CC_E, slow)
+        g.a.load(8, RCX, x64.mem(RAX, 0))
+        g.a.store(8, x64.mem(RDX, at), RCX)
+        g.a.aluMI(x64.ADD, 8, x64.mem(RDX, RT_HP_LIVE), 1)
+        g.a.bind(done)
+        return true
+    }
+    if mk == 2 {
+        // rt_free(p): nothing for null; when inline_ok, p in the current chunk and its header a
+        // bare class (the main thread's, not large), p pushed on that class's free list and
+        // cur_live counted (free_h's first path); else rt_free out of line
+        g.gen(g.u.listAt(n.b, 0))
+        let slow = g.a.newLabel()
+        let done = g.a.newLabel()
+        append(mut &g.grows, Grow{label: slow, back: done, size: 0, mem: 2})
+        g.a.test(8, RAX, RAX)
+        g.a.jcc(x64.CC_E, done)
+        g.a.movRSym(RDX, g.symRt("rt_mheap"), 0)
+        g.a.load(8, RCX, x64.mem(RDX, RT_HP_OK))
+        g.a.test(8, RCX, RCX)
+        g.a.jcc(x64.CC_E, slow)
+        g.a.load(8, RCX, x64.mem(RDX, RT_HP_CUR))
+        g.a.alu(x64.XOR, 8, RCX, RAX)
+        g.a.shiftI(x64.SHR, 8, RCX, RT_CHUNK_BITS)
+        g.a.jcc(x64.CC_NE, slow)
+        g.a.load(8, RCX, x64.mem(RAX, -8))
+        g.a.aluI(x64.CMP, 8, RCX, RT_NCLASS)
+        g.a.jcc(x64.CC_AE, slow)
+        g.a.aluMI(x64.SUB, 8, x64.mem(RDX, RT_HP_LIVE), 1)
+        g.a.lea(RCX, x64.memx(RDX, RCX, 8, RT_HP_FREE))
+        g.a.load(8, RDX, x64.mem(RCX, 0))
+        g.a.store(8, x64.mem(RAX, 0), RDX)
+        g.a.store(8, x64.mem(RCX, 0), RAX)
+        g.a.bind(done)
+        return true
+    }
     if g.pushInline(e) {
         // if (a->len == a->cap) the runtime grows it, out of line (genStubs: the registers the
         // call would change saved around it, so that the push is quiet); then data + len++ * size
@@ -7669,7 +7757,7 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         g.gen(g.u.listAt(n.b, 0))
         let slow = g.a.newLabel()
         let done = g.a.newLabel()
-        append(mut &g.grows, Grow{label: slow, back: done, size: size})
+        append(mut &g.grows, Grow{label: slow, back: done, size: size, mem: 0})
         g.a.load(8, RCX, x64.mem(RAX, 8))
         g.a.aluRM(x64.CMP, 8, RCX, x64.mem(RAX, 16))
         g.a.jcc(x64.CC_E, slow)

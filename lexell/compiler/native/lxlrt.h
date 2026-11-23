@@ -24,6 +24,7 @@ void rt_flush(void);
 
 /* memory and drop actions */
 void* rt_alloc(size_t n);
+void* rt_alloc_miss(size_t n);
 void rt_free(void* p);
 int64_t lxllib_heaptrim(void);
 void rt_dpush(rt_dfn f, void* p);

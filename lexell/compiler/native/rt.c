@@ -190,6 +190,7 @@ static uint8_t class_tab[(LARGE >> 4) + 1];   /* class_of's table, set by heap_i
    it frees them onto its own lists (their stale tags match no worker's again). */
 typedef struct rt_chunk rt_chunk;
 typedef struct rt_hp {
+    uint64_t inline_ok;             /* rt_mheap only: generated code may use the inline paths */
     rt_chunk* cur;                  /* the chunk being carved, or 0 */
     uint64_t cur_live;              /* the current chunk's live blocks (its header's live is stale) */
     void* cur_free[NCLASS];         /* the current chunk's free blocks, off the class lists */
@@ -214,7 +215,19 @@ struct rt_chunk {
     struct rt_hp* owner;
 };
 #define CHUNK_HDR ((sizeof(rt_chunk) + 15) & ~(size_t)15)
-static rt_hp rt_mheap;
+/* The main thread's heap. Generated code allocates and frees small blocks of it inline
+   (x64gen memInline): when inline_ok, a block of class c is popped from or pushed onto
+   cur_free[c] (a freed block only when its chunk is cur and its header is a bare class) and
+   cur_live counts it, as malloc_h's and free_h's first paths do; anything else calls rt_alloc
+   or rt_free. inline_ok is 0 until the heap is set up, under LXL_CHECK (which counts every
+   block) and once a par pool has started (malloc then goes through the pool's hooks). x64gen
+   has these offsets and constants as RT_HP_*: */
+rt_hp rt_mheap;
+_Static_assert(__builtin_offsetof(rt_hp, inline_ok) == 0, "x64gen RT_HP_OK");
+_Static_assert(__builtin_offsetof(rt_hp, cur) == 8, "x64gen RT_HP_CUR");
+_Static_assert(__builtin_offsetof(rt_hp, cur_live) == 16, "x64gen RT_HP_LIVE");
+_Static_assert(__builtin_offsetof(rt_hp, cur_free) == 24, "x64gen RT_HP_FREE");
+_Static_assert(NCLASS == 40 && CHUNK == ((size_t)1 << 21), "x64gen RT_NCLASS, RT_CHUNK_BITS");
 static rt_chunk* hp_freelist;             /* whole chunks returned, for reuse */
 /* A par worker's context, at the top of its stack slot (design/parallel.md 2.1). rt_wme() is the
    calling thread's, or 0 on the main thread: a stack-range test, no TLS. */
@@ -479,11 +492,13 @@ static inline __attribute__((always_inline)) void* malloc_h(rt_hp* h, size_t n, 
 /* malloc's one test, as before there were workers: rt_heap_slow is set until the heap is set up,
    and again once a par pool has started (then a worker's malloc is its own heap's). */
 static bool rt_heap_slow = true;
+static bool rt_check;               /* LXL_CHECK=1 (below) */
 void* malloc(size_t n);
 __attribute__((noinline)) static void* malloc_slow(size_t n) {
     if (rt_par_span) return RT_HOOK(malloc)(n);       /* the pool's (worker or main thread) */
     heap_init();                                      /* the first malloc, before any pool */
     rt_heap_slow = false;
+    rt_mheap.inline_ok = !rt_check;
     return malloc(n);
 }
 void* malloc(size_t n) {
@@ -650,6 +665,16 @@ __attribute__((noinline, cold)) static void rt_live_add(int64_t d) {
 }
 void* rt_alloc(size_t n) {
     void* p = malloc(n ? n : 1);
+    if (!p) rt_trap(2, "out of memory", "runtime");
+    if (rt_check) rt_live_add(1);
+    return p;
+}
+/* Generated code's inline rt_alloc when the free list is empty (x64gen memInline): rt_alloc with
+   malloc's paths inline, one call for a fresh block. rt_alloc itself stays as it was: inlining
+   malloc into it changed how gcc laid out the allocator (jq +2% cycles at fewer instructions). */
+__attribute__((noinline)) void* rt_alloc_miss(size_t n) {
+    size_t need = n ? n : 1;
+    void* p = __builtin_expect(rt_heap_slow, 0) ? malloc_slow(need) : malloc_h(&rt_mheap, need, false);
     if (!p) rt_trap(2, "out of memory", "runtime");
     if (rt_check) rt_live_add(1);
     return p;
@@ -1056,6 +1081,7 @@ void rt_init(int argc, char** argv) {
     struct k_sigaction sa = {0};
     const char* c = getenv("LXL_CHECK");
     rt_check = c && c[0] == '1';
+    if (!rt_heap_slow) rt_mheap.inline_ok = !rt_check;
     const char* t = getenv("LXL_THP");
     if (t && t[0] == '0') rt_thp_adv = 15;          /* MADV_NOHUGEPAGE */
     rt_argc = argc; rt_argv = argv;
@@ -4548,6 +4574,7 @@ static void rt_par_start(void) {
     rt_par_base = base;
     __atomic_store_n(&rt_par_span, (size_t)n * PAR_SLOT, __ATOMIC_RELEASE);
     rt_heap_slow = true;
+    rt_mheap.inline_ok = 0;
     unsigned long all = ~0UL, old = 0;
     SYS4(S_RT_SIGPROCMASK, 2, &all, &old, 8);                    /* SIG_SETMASK: workers start with all blocked */
     int k = 0;
