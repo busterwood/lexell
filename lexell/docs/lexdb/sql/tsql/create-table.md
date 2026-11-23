@@ -294,13 +294,13 @@ GO
 
 ```text
 Msg 547, Level 16, State 1, Line 1
-new row for relation "emp" violates check constraint "emp_name_check"
-Msg 547, Level 16, State 1, Line 1
-new row for relation "emp" violates check constraint "ck_emp_salary"
-Msg 271, Level 16, State 1, Line 1
+The INSERT statement conflicted with the CHECK constraint "emp_name_check". The conflict occurred in database "lexdb", table "dbo.emp", column 'name'.
+Msg 547, Level 16, State 1, Line 2
+The INSERT statement conflicted with the CHECK constraint "ck_emp_salary". The conflict occurred in database "lexdb", table "dbo.emp", column 'salary'.
+Msg 271, Level 16, State 1, Line 3
 The column "total" cannot be modified because it is either a computed column or is the result of a UNION operator.
 Msg 2714, Level 16, State 1, Line 1
-relation "dept" already exists
+There is already an object named 'dept' in the database.
 Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type geography.
 ```
@@ -319,11 +319,11 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'clustered'.
+Incorrect syntax near 'CLUSTERED'.
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'primary'.
+Incorrect syntax near the keyword 'PRIMARY'.
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'foreign'.
+Incorrect syntax near 'FOREIGN'.
 ```
 
 ## See also
