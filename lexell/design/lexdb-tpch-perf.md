@@ -1482,3 +1482,35 @@ q15 and q3's lookups the time left in the descents is the loads of
 nodes not in the CPU's caches (a leaf's record, its words, its entries:
 `fingerTo` and `lowerW` per instruction), not the compares; q20's
 per-run set-up (above) is its largest piece outside the reads.
+
+## q20 and q11 against PostgreSQL (2026-11-23, main 53dcb65f)
+
+At the fixed clock (boost off) q20 takes 245 ms against PostgreSQL's 124 on one core, q11 91
+against 61. The plans are the shapes PostgreSQL's are: q20's correlated aggregate runs per
+partsupp row (8,508 runs, each a `lineitem_part_supp` lookup of about 7.5 rows, 63,832 rows
+read), and q11 computes its join twice (the scalar subquery's threshold), each time 396
+`partsupp_supp` lookups of 80 rows. Profiles (perf with call graphs over 15 and 40 runs, boost
+on, server on CPUs 0-3):
+
+| | q20 | q11 |
+|---|---:|---:|
+| rows by key after the secondary index (`getManyIn`: descents of the table's tree) | 41-57% | 45% |
+| of which the descents' node loads (`lowerW`, `fingerTo`, `childW`) | about 30% | about 17% |
+| a correlated run's set-up (`execSelIn` to `pipeGroups`, `pipeSrcQ`, `bCompileD`, `lazyOf`, allocation) | 15-20% | - |
+| grouping and aggregation | about 10% | about 20% |
+
+**Reading.** A secondary index's entry names the row's primary key, and the row is found by a
+descent of the table's tree: an index-organized table. PostgreSQL's index names the row's
+place in its heap (a TID), read with no descent. With the keys sorted (`fillSorted`) and
+each descent starting from the last one's place (`fingerTo`), what remains is the loads of
+nodes not in the CPU's caches: 64,000 fetches over 6M lineitem rows land on different leaves.
+
+**Levers, largest first:**
+1. **Overlapping the descents' cache misses**: the sorted keys of a batch descended a few at a
+   time, interleaved (each step of one descent issued while the others' loads are in flight),
+   or with a prefetch of the next keys' nodes. Needs a prefetch intrinsic (compiler and runtime)
+   or an interleaved `getManyIn`. Would help every index lookup, q3, q15 and q20 alike.
+2. **A correlated run's set-up made once per statement** (the pipeline reused across runs, as
+   noted in this file before): 15-20% of q20.
+3. **A row's place in the secondary index's entry** (a locator, as PostgreSQL's TID): no
+   descent, but a storage-format change, and rows move when leaves split.
