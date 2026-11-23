@@ -214,6 +214,21 @@ smaller differences of its statement.
   - Bitwise operators take numeric (`1.5 & 1` gives 0; PostgreSQL: 42883).
   - `OPERATOR(pg_catalog.+)` is not taken; `@`, `|/`, `||/` and `!` do not exist.
   - `SELECT 'a' || 'b' LIKE 'a%'` names its column `like` (PostgreSQL: `?column?`).
+- **Catalog** (found writing the catalog pages):
+  - NOT NULL constraints have no rows in `pg_constraint` or `information_schema.table_constraints` (PostgreSQL 18:
+    contype `n`).
+  - `pg_rewrite` is empty, though a view's `pg_class.relhasrules` is t; `pg_depend` holds only column-to-sequence
+    rows; `pg_opclass` is empty; `pg_am` lists `hash`, which `CREATE INDEX` refuses.
+  - Identity sequences are in `pg_sequences` but not in `information_schema.sequences`.
+  - `ALTER TYPE ... ADD VALUE ... BEFORE` renumbers `pg_enum.enumsortorder` (1, 2, 3; PostgreSQL: 1, 1.5, 2).
+  - `0::regclass` shows `0` (PostgreSQL: `-`); `pg_type.oid` and other `oid` and `regtype` columns are sent as text,
+    so psql aligns them left.
+  - Missing (42P01): `pg_stat_activity` (monitoring tools need it), `pg_stats`, `pg_locks`, `pg_operator`,
+    `pg_cast`, `pg_authid`, `pg_timezone_names`, `pg_stat_all_tables`, `pg_statio_user_tables`, and
+    `information_schema` `triggers`, `domains`, `column_privileges`, `enabled_roles`, `applicable_roles`,
+    `element_types`.
+- **Errors:** `SELECT $1` in a simple query is 08P01 `there is no parameter $1` (PostgreSQL: 42P02). A
+  `max_statement_mem` of 1 kB did not stop a top-N sort over 100,000 rows (not narrowed down).
 
 
 ## SQL Server door
