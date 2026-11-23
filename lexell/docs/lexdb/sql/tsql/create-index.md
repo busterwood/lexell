@@ -100,8 +100,8 @@ INSERT dbo.emp (id, name, email) VALUES (5, N'Eve', 'ann@example.com');
 ```text
 (1 row affected)
 
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "ux_emp_email"
+Msg 2601, Level 14, State 1, Line 3
+Cannot insert duplicate key row in object 'dbo.emp' with unique index 'ux_emp_email'. The duplicate key value is (ann@example.com).
 ```
 
 ### C. A filtered unique index
@@ -119,8 +119,8 @@ SELECT name, has_filter, filter_definition FROM sys.indexes WHERE name = 'ux_emp
 ```text
 (1 row affected)
 
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "ux_emp_name_high"
+Msg 2601, Level 14, State 1, Line 3
+Cannot insert duplicate key row in object 'dbo.emp' with unique index 'ux_emp_name_high'. The duplicate key value is (Ann).
 name             has_filter filter_definition
 ---------------- ---------- -------------------
 ux_emp_name_high 1          (([salary]>(5000)))
@@ -166,8 +166,8 @@ GO
 ```text
 Msg 2627, Level 14, State 1, Line 1
 could not create unique index "ux_emp_dept"
-Msg 2714, Level 16, State 1, Line 1
-relation "ix_emp_dept" already exists
+Msg 2714, Level 16, State 1, Line 2
+There is already an object named 'ix_emp_dept' in the database.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 ```
@@ -186,7 +186,7 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'nonclustered'.
+Incorrect syntax near 'NONCLUSTERED'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near '('.
 Msg 50000, Level 16, State 1, Line 1
