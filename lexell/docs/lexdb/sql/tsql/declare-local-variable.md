@@ -186,7 +186,7 @@ GO
 ```text
 Msg 245, Level 16, State 1, Line 1
 invalid input syntax for type integer: "abc"
-Msg 2628, Level 16, State 1, Line 1
+Msg 2628, Level 16, State 1, Line 2
 value too long for type character varying(3)
 s
 ----
@@ -194,7 +194,7 @@ NULL
 
 (1 row affected)
 
-Msg 134, Level 16, State 1, Line 1
+Msg 134, Level 16, State 1, Line 2
 The variable name '@j' has already been declared. Variable names must be unique within a query batch or stored procedure.
 Msg 50000, Level 16, State 1, Line 1
 DECLARE of a table or cursor variable is not supported yet
