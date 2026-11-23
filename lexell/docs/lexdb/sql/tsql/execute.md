@@ -226,11 +226,11 @@ GO
 ```text
 Msg 201, Level 16, State 4, Line 1
 Procedure or function 'by_dept' expects parameter '@dept', which was not supplied.
-Msg 8145, Level 16, State 2, Line 1
+Msg 8145, Level 16, State 2, Line 2
 @extra is not a parameter for procedure by_dept.
-Msg 8114, Level 16, State 1, Line 1
+Msg 8114, Level 16, State 1, Line 3
 Error converting data type varchar to int.
-Msg 2812, Level 16, State 62, Line 1
+Msg 2812, Level 16, State 62, Line 4
 Could not find stored procedure 'nothere'.
 Msg 179, Level 16, State 1, Line 1
 Cannot use the OUTPUT option when passing a constant to a stored procedure.
