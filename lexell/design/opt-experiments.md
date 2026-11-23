@@ -828,3 +828,42 @@ permutation's swaps 7%.
 Test: lib/tests/run/collections_sortby_stable (320 cases: sizes around the run and merge widths,
 few and many distinct keys, ascending, descending and equal inputs, owned strings; stable, a
 permutation, sorted, leak-free).
+
+## 22. Where Java leads on lists, trees and strings (profiles), and a concat fix
+
+**Method.** `perf record -e cycles:u` of the JVM (OpenJDK 21.0.13, default G1) with
+`-XX:+UnlockDiagnosticVMOptions -XX:+DumpPerfMapAtExit` for the JIT's symbols and
+`-Xlog:gc` for the collections, 40 timed runs in one JVM; Lexell's profiles at main 0846b6de
+(LXL_NATIVE_MAP). Milliseconds per run, from each profile's shares:
+
+| | Lexell | Java |
+|---|---:|---:|
+| lists: the walk (`sum`) / building / freeing | 53 / 36 / 20 | 33 / 25 / 0.5 (collection) |
+| trees: `build` / `check` / freeing (drop actions, push, pop) | 32 / 24 / 33 | 19 / 15 / 0.5 |
+| strings: the concatenation and digits / the rest | 54 / 37 | 35 in `stringsMain`, everything inlined / 10 |
+
+**Reading.** Collection is about 1% of Java's time: 22 ms of pauses over 42 runs, at most 2.3 ms
+each, the young generation holding almost nothing live. Its lead is in three parts:
+
+- **Freeing costs it nothing per object**: 18% of Lexell's `lists` and 35% of `trees`.
+- **Its walks and building are 1.6 times faster.** Its nodes are 24 bytes (compressed
+  references: a 12-byte header and the fields); Lexell's are 32 (`lists`: value and
+  `Option[Node]`, a tag and a pointer, then the 8-byte block header) and 48 (`trees`: two
+  options, rounded up to the 40-byte class). A null-pointer `None` for boxed records (section 2's
+  deferred niche) would make a tree node 24 bytes with its header and turn each `Some` test into a
+  pointer test, in the walks and in the drop actions alike.
+- **strings**: C2 inlines the whole concatenation into the method (section 17's notes).
+
+**Fix (native/rt.c).** The concat functions counted an int part's digits twice, for the total
+length (`rt_part_len`) and again when writing it (`rt_cat_slow`): `rt_ipart_len` was 18% of
+`strings`. The lengths are now counted once and passed to the writes.
+
+| measure (main 0846b6de against this) | instructions | cycles |
+|---|---:|---:|
+| bench strings (5 interleaved rounds) | -7.1% | -7.9% |
+| apps regex / json / jq / cmark / decimal | 0.00 / 0.00 / 0.00 / 0.00 / +0.05% | +0.3 / +0.4 / -0.8 / -0.3 / 0.0% |
+
+Only the concat functions changed size (the runtime's other sections are as they were).
+
+**Next, from this:** a null-pointer `None` for `Option` of a boxed record (the representation:
+check, emit, lower, the drop glue, both backends), measured first on `lists` and `trees`.

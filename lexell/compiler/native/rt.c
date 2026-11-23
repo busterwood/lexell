@@ -1238,9 +1238,8 @@ static inline __attribute__((always_inline)) int64_t rt_part_len(lxl_str x) {
 }
 /* A part that is not a string of at most 16 bytes, written at q: an int part's text, or a
    longer string by memcpy; returns the end. */
-static __attribute__((noinline)) char* rt_cat_slow(char* q, lxl_str x) {
+static __attribute__((noinline)) char* rt_cat_slow(char* q, lxl_str x, int64_t n) {
     if (rt_ipart(x)) {
-        int64_t n = rt_ipart_len(x);
         rt_digits64(q + n, rt_ipart_mag(x));
         if ((intptr_t)x.p < 0) q[0] = '-';
         return q + n;
@@ -1248,11 +1247,11 @@ static __attribute__((noinline)) char* rt_cat_slow(char* q, lxl_str x) {
     memcpy(q, RT_SP(x), x.len);
     return q + x.len;
 }
-/* Part x written at q; returns the end. A string of at most 16 bytes inline: two overlapping
-   8-byte (or 4-byte) copies, or up to 3 single bytes. */
-static inline __attribute__((always_inline)) char* rt_cat_put(char* q, lxl_str x) {
+/* Part x, of length len (rt_part_len, counted once), written at q; returns the end. A string of
+   at most 16 bytes inline: two overlapping 8-byte (or 4-byte) copies, or up to 3 single bytes. */
+static inline __attribute__((always_inline)) char* rt_cat_put(char* q, lxl_str x, int64_t len) {
     uint32_t n = x.len;
-    if (__builtin_expect(n > 16 || rt_ipart(x), 0)) return rt_cat_slow(q, x);
+    if (__builtin_expect(n > 16 || rt_ipart(x), 0)) return rt_cat_slow(q, x, len);
     const char* p = RT_SP(x);
     if (n >= 8) {
         uint64_t u, v;
@@ -1281,77 +1280,84 @@ static __attribute__((noinline, cold)) lxl_str rt_cat_lone(lxl_str x) {
 lxl_str rt_str_concat(lxl_str a, lxl_str b) {
     if (b.len == 0) return rt_cat_lone(a);
     if (a.len == 0) return rt_cat_lone(b);
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b));
-    rt_cat_put(rt_cat_put(s.p, a), b);
+    int64_t la = rt_part_len(a), lb = rt_part_len(b);
+    lxl_str s = rt_str_new(la + lb);
+    rt_cat_put(rt_cat_put(s.p, a, la), b, lb);
     return s;
 }
 lxl_str rt_str_concat3(lxl_str a, lxl_str b, lxl_str c) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); return rt_cat_lone(c); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c);
+    lxl_str s = rt_str_new(la + lb + lc);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
     return s;
 }
 lxl_str rt_str_concat4(lxl_str a, lxl_str b, lxl_str c, lxl_str d) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); return rt_cat_lone(d); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c), ld = rt_part_len(d);
+    lxl_str s = rt_str_new(la + lb + lc + ld);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
-    q = rt_cat_put(q, d);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
+    q = rt_cat_put(q, d, ld);
     return s;
 }
 lxl_str rt_str_concat5(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); return rt_cat_lone(e); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c), ld = rt_part_len(d), le = rt_part_len(e);
+    lxl_str s = rt_str_new(la + lb + lc + ld + le);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
-    q = rt_cat_put(q, d);
-    q = rt_cat_put(q, e);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
+    q = rt_cat_put(q, d, ld);
+    q = rt_cat_put(q, e, le);
     return s;
 }
 lxl_str rt_str_concat6(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); return rt_cat_lone(f); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c), ld = rt_part_len(d), le = rt_part_len(e), lf = rt_part_len(f);
+    lxl_str s = rt_str_new(la + lb + lc + ld + le + lf);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
-    q = rt_cat_put(q, d);
-    q = rt_cat_put(q, e);
-    q = rt_cat_put(q, f);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
+    q = rt_cat_put(q, d, ld);
+    q = rt_cat_put(q, e, le);
+    q = rt_cat_put(q, f, lf);
     return s;
 }
 lxl_str rt_str_concat7(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) + (g.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); if (f.len) return rt_cat_lone(f); return rt_cat_lone(g); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f) + rt_part_len(g));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c), ld = rt_part_len(d), le = rt_part_len(e), lf = rt_part_len(f), lg = rt_part_len(g);
+    lxl_str s = rt_str_new(la + lb + lc + ld + le + lf + lg);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
-    q = rt_cat_put(q, d);
-    q = rt_cat_put(q, e);
-    q = rt_cat_put(q, f);
-    q = rt_cat_put(q, g);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
+    q = rt_cat_put(q, d, ld);
+    q = rt_cat_put(q, e, le);
+    q = rt_cat_put(q, f, lf);
+    q = rt_cat_put(q, g, lg);
     return s;
 }
 lxl_str rt_str_concat8(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g, lxl_str h) {
     if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) + (g.len != 0) + (h.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); if (f.len) return rt_cat_lone(f); if (g.len) return rt_cat_lone(g); return rt_cat_lone(h); }
-    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f) + rt_part_len(g) + rt_part_len(h));
+    int64_t la = rt_part_len(a), lb = rt_part_len(b), lc = rt_part_len(c), ld = rt_part_len(d), le = rt_part_len(e), lf = rt_part_len(f), lg = rt_part_len(g), lh = rt_part_len(h);
+    lxl_str s = rt_str_new(la + lb + lc + ld + le + lf + lg + lh);
     char* q = s.p;
-    q = rt_cat_put(q, a);
-    q = rt_cat_put(q, b);
-    q = rt_cat_put(q, c);
-    q = rt_cat_put(q, d);
-    q = rt_cat_put(q, e);
-    q = rt_cat_put(q, f);
-    q = rt_cat_put(q, g);
-    q = rt_cat_put(q, h);
+    q = rt_cat_put(q, a, la);
+    q = rt_cat_put(q, b, lb);
+    q = rt_cat_put(q, c, lc);
+    q = rt_cat_put(q, d, ld);
+    q = rt_cat_put(q, e, le);
+    q = rt_cat_put(q, f, lf);
+    q = rt_cat_put(q, g, lg);
+    q = rt_cat_put(q, h, lh);
     return s;
 }
 /* s += b on an owned string (design/consistency.md): appended in place when the buffer has room,

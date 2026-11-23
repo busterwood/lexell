@@ -116,8 +116,10 @@ Java's speed here does not depend on that memory. With its heap capped at 64 MB 
 run 10 to 45% slower. Where Java leads on the original ten, the work is per object: `lists`,
 `trees` and `strings` allocate and free a node or string at a time. The JVM allocates by bumping
 a pointer and its young-generation collector spends its time on the objects still live, so the
-many that die young cost nothing to free; Lexell frees each one when its owner is dropped
-(inline, section 19). `array` uses 4-byte `int` elements in Java against Lexell's 8-byte `int`.
+many that die young cost nothing to free: collection is about 1% of its time here, while freeing
+each node when its owner is dropped is 18% of Lexell's `lists` and 35% of `trees`. Java's walks
+over the nodes are also faster: its nodes are 24 bytes against Lexell's 32 and 48, where an
+`Option` of a node is a tag and a pointer (section 22). `array` uses 4-byte `int` elements in Java against Lexell's 8-byte `int`.
 `fib` is ahead of both because a recursive function is inlined into itself one level, as C2 does
 (section 18).
 
