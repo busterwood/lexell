@@ -47,7 +47,7 @@ END CATCH
 - After a batch in which an inner `CATCH` block printed a message and re-raised the error with `THROW` to an outer
   `CATCH` block, the session's next `TRY` block goes wrong: an unknown table (208) in it is reported, and then its
   `CATCH` block runs too, with the old error's `ERROR_NUMBER()` and `ERROR_MESSAGE()`.
-- Many `ERROR_MESSAGE()` texts are lexdb's (PostgreSQL's wording), with SQL Server's numbers.
+- `ERROR_MESSAGE()` is SQL Server's text, except for errors numbered 50000, which carry lexdb's.
 
 ## Examples
 
@@ -101,7 +101,7 @@ SELECT ERROR_NUMBER() AS outside_catch;
 ```text
 (0 rows affected)
 
-caught 547: new row for relation "acct" violates check constraint "acct_bal_check"
+caught 547: The UPDATE statement conflicted with the CHECK constraint "acct_bal_check". The conflict occurred in database "lexdb", table "dbo.acct", column 'bal'.
 outside_catch
 -------------
 NULL
@@ -129,7 +129,7 @@ END CATCH;
 ```
 
 ```text
-Msg 208, Level 16, State 1, Line 1
+Msg 208, Level 16, State 1, Line 2
 Invalid object name 'nothere'.
 number message
 ------ ------------------------------
@@ -230,7 +230,7 @@ END CATCH;
 ```
 
 ```text
-Msg 208, Level 16, State 1, Line 1
+Msg 208, Level 16, State 1, Line 2
 Invalid object name 'nothere'.
 number message
 ------ -------------
