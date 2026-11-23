@@ -1,7 +1,7 @@
 # Lexell performance
 
 Measured on 22 and 23 November 2026 on `main`: the HTTP server section on 23 November at
-5284326a, the microbenchmarks on 23 November at fe29b218, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
+5284326a, the microbenchmarks on 23 November at fe29b218, the LexDB section on 23 November at 4506a2e8, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
@@ -27,6 +27,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Faster than .NET on all but 19-digit add; slower than Java on division and comparison |
 | HTTP server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: about 1.5 times Go's requests a second, 1.2 to 1.3 times Node's |
+| LexDB | PostgreSQL 18 | Faster on one core than PostgreSQL on one core in TPC-H (level with its four processes in total), point selects through replicas, updates, analytic queries; slower on point selects from one process at 8 and 32 clients, and on bulk loads into tables with secondary indexes or no key |
 | Command-line tools | GNU grep, sort, tail, eza | Faster on grep and eza, slower on sort, level on tail |
 
 ## Compile time
@@ -244,6 +245,44 @@ repeat.
 | server RSS before the idle connections | 7 MB | 10 MB | 52 MB |
 | server RSS after the load | 199 MB | 343 MB | 224 MB |
 
+## LexDB
+
+PostgreSQL 18.6 is the reference: the same machine, data, disk and transport, both servers on
+the same four physical cores (their SMT siblings idle) with the clients on the other four, and
+PostgreSQL's parallel queries capped at four processes, LexDB's shape (a main process and three
+replicas). Both are durable by default (PostgreSQL with `fsync` and `synchronous_commit` on).
+The full record, the rules and the commands are in `lexell/design/lexdb-benchmarks.md`.
+
+TPC-H derived (22 queries, SF1, warm, median of 3, at a fixed clock with boost off; every result
+checked against PostgreSQL's):
+
+| | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
+|---|---:|---:|---:|
+| all 22 queries, summed | 8,943 ms | 14,610 ms | 8,818 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | 0.67 | 1.08 |
+| queries level or ahead (within 10%) | | 17 of 22 | |
+
+OLTP (pgbench, prepared statements over Unix sockets, 1M rows, median of three 10 s rounds):
+
+| | LexDB | PostgreSQL | LexDB / PostgreSQL |
+|---|---:|---:|---:|
+| point selects, 1 client | 92,300/s | 82,100/s | 1.12 |
+| point selects, 8 / 32 clients, one process | 164,800 / 160,100/s | 448,500 / 408,400/s | 0.37 / 0.39 |
+| point selects, 32 clients, three read replicas | 434,000-439,000/s | 408,400/s | 1.07 |
+| updates, 1 / 8 / 32 clients (a durable commit each) | 3,654 / 16,400 / 42,300/s | 1,644 / 6,735 / 26,260/s | 2.22 / 2.43 / 1.61 |
+
+LexDB runs every session on one thread; it scales reads with replica processes, which follow the
+master with a lag of 0.24-0.26 ms at the median and 0.49-0.55 ms at p99 under a mixed load. Its
+commit latency with 8 clients is 0.44 ms at the median and 1.35-1.40 ms at p99.
+
+Analytic queries (35 queries over 1M-row tables: scans, joins, groups, windows; median of 5):
+LexDB's CPU is 0.54 of PostgreSQL's on one core (geometric mean), and its wall time 1.04 of
+PostgreSQL's on four processes; 33 of 35 are level with or ahead of PostgreSQL on one core.
+
+Bulk loads (`\copy`, median of 3, not pinned): LexDB is faster on narrow rows (1M: 0.46 against
+0.59 s; 10M: 4.85 against 5.72 s) and wide rows (1.44 against 1.81 s), slower with two secondary
+indexes (6.31 against 4.74 s) and with no primary key (2.98 against 1.52 s).
+
 ## Commands
 
 GNU grep, sort and tail, and eza are the common tools for the same jobs.
@@ -276,7 +315,7 @@ extended attributes with `@`, and Lexell's eza does not.
   broken system symlink.
 - **Plain C references** for the microbenchmarks are in the run's log but not in the table above.
 - **ripgrep** in the command programs: not included.
-- **HTTP client, TLS, tasks, database streaming, and LexDB.** Each
-  needs its own references and runs; LexDB has its own document,
-  `lexell/design/lexdb-benchmarks.md`, which is to be redone.
+- **HTTP client, TLS, tasks and database streaming.** Each needs its own
+  references and runs.
+- **SQL Server** against LexDB: its container was not running for this run.
 - **Oracle** comparison: dropped for now, to be added back later.

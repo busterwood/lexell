@@ -106,6 +106,8 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
 
+On TPC-H at scale factor 1, LexDB on one core takes about the same total time as PostgreSQL on four processes and two-thirds of PostgreSQL's on one core (geometric mean). It commits 1.6 to 2.4 times as many durable updates a second, and with three read replicas serves more point selects than PostgreSQL on the same four cores. PostgreSQL is ahead on point selects from a single process at 8 or more clients, and on bulk loads into tables with secondary indexes or no key ([details](PERFORMANCE.md#lexdb)).
+
 For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
 
 ## Why I built Lexell

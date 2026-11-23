@@ -6,7 +6,54 @@ run, newest first. Each run's detail (plans, profiles, what changed) stays
 in the design note it came from, linked from its row. When a suite is run
 again, add its row to section 4 and update section 1.
 
-## 1. Now (2026-11-18)
+## 1. Now (2026-11-23)
+
+**Refresh at `4506a2e8` (main, after the compiler work of opt-experiments.md
+17-19: integers written into string chains, drop loops, recursion inlined
+once, records that never escape kept in a local, small allocations inline),
+pinned (section 2), boost on except for TPC-H (run.sh's fixed clock);
+PostgreSQL re-run on every suite; results in
+`~/Work/lexdb-bench/saved/results/2026-11-23-refresh/` (`run_all.sh`).**
+
+| | 2026-11-18 | 2026-11-23 | PostgreSQL today |
+|---|---:|---:|---:|
+| point selects, 1 / 8 / 32 clients (1 process) | 88,000 / 151,000 / 145,000/s | **92,300 / 164,800 / 160,100/s** | 82,100 / 448,500 / 408,400/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients | 87,000 / 334,000-340,000 / 401,000/s | 91,000 / 363,000-368,000 / **434,000-439,000/s** | (4 cores: above) |
+| updates, 1 / 8 / 32 clients | 3,691 / 16,687 / 38,711/s | 3,654 / 16,400 / 42,300/s | 1,644 / 6,735 / 26,260/s |
+| mixed: replica selects / master updates | 321,000-324,000 / 15,000-15,400/s | 347,600-349,600 / 15,100-15,300/s | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.42 / 1.38-1.40 / 4.2-4.3 / 9.2-9.6 ms | 0.44 / 1.35-1.40 / 3.84-3.86 / 8.4-9.9 ms | |
+| replica lag under the mixed load, p50 / p99 | 0.26-0.29 / 0.39-0.46 ms | 0.24-0.26 / 0.49-0.55 ms | |
+| 35 analytic queries, lexdb CPU / PG one core, lexdb wall / PG 4 processes | 0.69 / 1.19 | **0.54 / 1.04** (33 of 35 level or ahead of one core) | |
+| TPC-H SF1, summed (boost off) | 8,910 ms (11-22, PG not re-run) | 8,943 ms | 14,610 one core / 8,818 four processes |
+| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow (not pinned) | - / 1.54 / 6.74 / 3.16 / 5.51 s | 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s | 0.59 / 1.81 / 4.74 / 1.52 / 5.72 s |
+| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 758 / 1,638 / - MB | 764 / 1,680 / 3,256 MB | |
+
+- **The analytic ratios** are each run's median CPU (lexdb against PG one
+  core) and median wall (lexdb against PG four processes), geometric mean
+  over the 35 queries; 2026-11-18's files give 0.69 by this method (0.63
+  was recorded then by another). lexdb's own CPU is 16% lower than on
+  2026-11-18 (geometric mean): the text joins 28-33% (`join_text_rows` 93
+  to 63 ms, `join_text_agg` 90 to 60, `join_text_group` 141 to 101), `minmax_text` 86 to 57, `window`
+  195 to 122. PostgreSQL's figures moved within 2%.
+- **Point selects** +5 to +10% on one process and +5 to +9% with replicas,
+  where they are now above PostgreSQL on the same four cores at 32 clients
+  (434,000-439,000 against 408,400). The compiler work of opt-experiments.md
+  17-19 moved the in-process instructions per select by less than 0.5%; the
+  rest of the change is the lexdb work since 2026-11-18.
+- **Updates** at 32 clients 38,700 to 43,500 over the rounds (median 42,300):
+  1.6 times PostgreSQL. Commit latency is unchanged; p99 is still the
+  1.35-1.40 ms of the owned-string migration (2026-11-18 notes, below).
+- **TPC-H**: lexdb on one core level with PostgreSQL on four processes in
+  total (8,943 against 8,818 ms), geometric mean 0.67 against one core
+  (section 1.6).
+- **Aggregates** (vspg; ms, median of the three rounds): lexdb 2.7 / 25.7 /
+  28.6 / 67.0 / 60.6 against PG one core 19.8 / 58.3 / 47.3 / 86.6 / 60.6
+  and PG four processes 15.5 / 26.5 / 22.5 / 36.5 / 30.0. q4 and q5 overlap
+  the update rounds' checkpoints as before (q5 26.3 ms in round 1, 60.6 and
+  65.5 after).
+- **SQL Server** was not re-run (its container was down): no bcp column.
+
+### 1.00 The 2026-11-18 refresh
 
 **Refresh at `eababf57` (main), pinned (section 2), boost on as before;
 results in `~/Work/lexdb-bench/saved/results/2026-11-18-refresh/`.** The
@@ -158,6 +205,45 @@ parallel aggregates and hash joins are 2.3 to 4.6 × faster.
 1.26 s, PostgreSQL 0.90; t (4 ints, a text) 2.54 s and 1.07.
 
 ### 1.6 TPC-H derived, SF1 (`bench/tpch/run.sh`; ms, warm, median of 3)
+
+**2026-11-23, main `4506a2e8`, lexdb and PostgreSQL both run (boost off, the
+fixed clock; one core each, PostgreSQL also at four processes; all 22 results
+checked against PostgreSQL's):** lexdb summed **8,943 ms** against
+PostgreSQL's **14,610** on one core and **8,818** with four processes: level
+in total with four processes. Geometric mean 0.67 of one core's wall (0.63 of
+its server CPU), 1.08 of four processes'; 17 of 22 level or ahead of one
+core. lexdb's sum is within 0.4% of `647ce4d5`'s run (8,910), each query within
+5% (q18 600 to 626, q1 1,573 to 1,607); PostgreSQL ran 2.3% faster on one core and 5.2% faster on four than in
+the `01b0250c` run. Worst against one core: q20 245 / 124 (1.97), q11 91 /
+61 (1.50), q10 448 / 390 (1.15), q22 101 / 87 (1.17), q15 379 / 332 (1.14).
+Raw: `~/Work/lexdb-bench/saved/results/2026-11-23-refresh/tpch-out`.
+
+| ms | lexdb `4506a2e8` | PG one core | PG four processes |
+|---|---:|---:|---:|
+| q1 | 1,607 | 3,452 | 874 |
+| q2 | 38 | 158 | 134 |
+| q3 | 524 | 545 | 350 |
+| q4 | 141 | 183 | 101 |
+| q5 | 160 | 311 | 172 |
+| q6 | 182 | 273 | 201 |
+| q7 | 408 | 571 | 282 |
+| q8 | 156 | 221 | 139 |
+| q9 | 1,576 | 1,732 | 746 |
+| q10 | 448 | 390 | 167 |
+| q11 | 91 | 61 | 61 |
+| q12 | 443 | 855 | 257 |
+| q13 | 683 | 776 | 777 |
+| q14 | 139 | 141 | 93 |
+| q15 | 379 | 332 | 332 |
+| q16 | 225 | 261 | 109 |
+| q17 | 22 | 538 | 533 |
+| q18 | 626 | 2,743 | 2,997 |
+| q19 | 37 | 40 | 37 |
+| q20 | 245 | 124 | 124 |
+| q21 | 711 | 817 | 285 |
+| q22 | 101 | 87 | 49 |
+| all 22, summed | 8,943 | 14,610 | 8,818 |
+
 
 **Since, lexdb alone (2026-11-22, main `647ce4d5`, after Q8 R8 and the
 descents slice), against the PostgreSQL figures of the `01b0250c` run
@@ -391,6 +477,9 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-23 | 4506a2e8 | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, median of 3 | summed 8,943 ms against PG one core 14,610 and PG four processes 8,818 (level in total); geometric mean 0.67 of one core (wall), 0.63 (CPU), 1.08 of four processes; 17 of 22 level or ahead of one core; worst q20 1.97, q11 1.50 | this page, 1.6 |
+| 2026-11-23 | 4506a2e8 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 92,300 / 164,800 / 160,100/s (+5-10%); 3 replicas 434,000-439,000/s at 32 clients, above PG on four cores (408,400); updates 3,654 / 16,400 / 42,300/s (1.6-2.4 × PG); commit p99 1.35-1.40 ms (unchanged) | this page, 1 |
+| 2026-11-23 | 4506a2e8 | analytic queries (pinned), bulk loads (lexdb and PG; no SQL Server) | 35 queries: lexdb CPU / PG one core 0.54 (0.69 on 11-18 by the same method), wall / PG four processes 1.04; 33 of 35 level or ahead; lexdb CPU -16% since 11-18 (text joins -30%); COPY 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s against PG 0.59 / 1.81 / 4.74 / 1.52 / 5.72 | this page, 1 |
 | 2026-11-22 | 647ce4d5 | TPC-H derived, SF1, lexdb alone against the recorded PG figures of `01b0250c` | summed 8,910 ms (was 9,325 at `7ff69abe`) against PG one core 14,960 and PG four processes 9,300: below four processes for the first time; 17 of 22 level or ahead of one core; q3 528 (PG 564); worst q20 1.85, q11 1.44, q22 1.18 | this page, 1.6; lexdb-tpch-perf.md 4.7 |
 | 2026-11-22 | f1623851 | TPC-H derived, SF1, lexdb alone against the recorded PG figures of `01b0250c` | summed 9,481 ms (was 12,239 at `01b0250c`) against PG one core 14,960 and PG four processes 9,300; q19 41.8 ms (PG 45); worst q20 1.97, q11 1.52, q22 1.30 | this page, 1.6 |
 | 2026-11-21 | 7fec138f (branch, Q8 R7) | windows, 1M rows (row_number per partition, running sum, 10-row moving average, rank; under an aggregate and to the client), lexdb `-O` main 3aabcade vs branch, PG 18 (leader + 3 workers, `work_mem` 256MB), server on CPUs 0-3 | the pipeline's Window operator 0.77-0.91 of main's row engine, 1.03 for the partitioned row_number to the client; lexdb / PG 0.82-1.20 (time; under an aggregate: row_number per partition 0.85, running sum 1.07, moving average 1.20, rank 1.12; to the client 1.02, 1.02, 1.00, 0.82); raw: ~/Work/lexdb-bench/saved/results/2026-11-21-window-r7 | lexdb-layers.md 6.3.Q8 R7 |
