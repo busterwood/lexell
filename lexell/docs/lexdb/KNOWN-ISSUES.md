@@ -6,10 +6,12 @@ smaller differences of its statement.
 
 ## All doors
 
-- **Replicas: temporary objects not built yet.** The pages describe a replica's T-SQL `#temp` tables and table
-  variables, and Oracle DML on global temporary tables, as working, per design/lexdb.md 9.137 phase 5. Until that
-  phase lands, a replica refuses them as it refuses any write (3906, ORA-16000). The replica examples for them in
-  [replicas](replicas.md) show no output for that reason.
+- **Replicas and temporary objects** (main f8e3d6d6, design/lexdb.md 9.137 "As built (phase 5)"):
+  - SQL Server door: `#temp` tables, `SELECT ... INTO #x` and table variables work on a replica.
+  - PostgreSQL door: temporary tables are refused with 25006, as on a hot standby.
+  - Oracle door: `CREATE GLOBAL TEMPORARY TABLE` on a replica is ORA-16000, as on a standby, and DML on a global
+    temporary table is not available there: Active Data Guard allows it for a table the primary defined, but in
+    lexdb no such definition reaches a replica's session (see the Oracle door's entry below).
 
 ## PostgreSQL door
 
@@ -146,6 +148,7 @@ smaller differences of its statement.
   option on in lexdb. bcp and SqlBulkCopy were not affected when checked during development (design/lexdb-tds.md
   section 14). ([bulk loading](bulk-load.md#from-java-sqlserverbulkcopy))
 - **Error line numbers** are always 1 (`Msg 2627, Level 14, State 1, Line 1`), whatever line of the batch failed.
+- **`UPDATE STATISTICS`** is a syntax error (102), on the master and on a replica.
 - **Missing functions:** `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP` and `ATN2` give error 195 ("function ... does
   not exist"). An error 195 ends the batch, as SQL Server's compile errors do.
 - **`INSERT TOP (n)`** is error 102, and a table hint on an `INSERT`'s target (`INSERT INTO t WITH (TABLOCK)`) is
@@ -154,6 +157,10 @@ smaller differences of its statement.
   '...'` (PostgreSQL's form) works in this door.
 
 ## Oracle door
+
+- **A global temporary table's definition is private to the session that made it**, on the master as on a
+  replica. In Oracle the definition is a schema object that every session sees, and only the rows are private to a
+  session.
 
 - **A bare name finds a table of the PostgreSQL door's `public` schema, and blocks `CREATE TABLE` of that name.**
   With a table `city` made in the PostgreSQL door, `CREATE TABLE city (...)` in the Oracle door (user `SA`) fails with

@@ -17,8 +17,8 @@ replica is a process with its own SQL thread, and the master's single SQL thread
   database: the commits applied when it began.
 - **Checkpoints are held.** The master does not reuse pages or log a replica still reads; each replica tells the
   master what it holds.
-- **Writes are refused**, in each door with the product's own error for a read-only secondary. Temporary objects that
-  live only in the session work where the product allows them on a secondary (below).
+- **Writes are refused**, in each door with the product's own error for a read-only secondary. In the SQL Server
+  door, `#temp` tables and table variables work on a replica, as on a readable secondary (below).
 
 ## Starting replicas
 
@@ -180,7 +180,10 @@ A replica's SQL Server door answers as a readable secondary of an availability g
   read-only.`;
 - `DATABASEPROPERTYEX('lexdb', 'Updateability')` is `READ_ONLY`, and `sys.databases.is_read_only` is 1;
 - **`#temp` tables, `SELECT ... INTO #t` and table variables work**, as they do on a secondary, where they live in
-  tempdb. Their rows live in the replica's memory for the session and never reach the master's log.
+  tempdb: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, `ALTER TABLE` and `CREATE
+  INDEX`, when every table they write is a `#name` or a table variable (they may read the replicated tables). Each
+  session's temporary tables are kept in the replica's memory, never reach the master's log, and are dropped when
+  the session ends.
 
 **Routing.** A client that logs in to the master with `ApplicationIntent=ReadOnly` is sent to a replica, as SQL
 Server's read-only routing sends it: the master's login answer carries a routing message (ENVCHANGE 20) naming a
@@ -232,15 +235,37 @@ lexdb 0
 (1 row affected)
 ```
 
-T-SQL's temporary objects on a replica (design/lexdb.md 9.137, phase 5; [not yet in the build](KNOWN-ISSUES.md)
-these pages were checked with, so no output is shown):
+T-SQL's temporary objects on a replica (mssql-jdbc, `applicationIntent=ReadOnly` to the master, so on a replica;
+built from main f8e3d6d6):
 
-```sql
+```
 CREATE TABLE #recent (id int PRIMARY KEY, owner nvarchar(40));
 INSERT INTO #recent SELECT id, owner FROM dbo.acct WHERE balance > 0;
 DECLARE @t TABLE (id int);
 INSERT INTO @t SELECT id FROM #recent;
-SELECT count(*) FROM @t;
+SELECT count(*) AS n FROM @t;
+SELECT id, owner INTO #copy FROM #recent;
+UPDATE #copy SET owner = UPPER(owner);
+SELECT * FROM #copy ORDER BY id;
+
+(2 rows affected)
+
+(2 rows affected)
+
+n
+-
+2
+
+(1 row affected)
+
+(2 rows affected)
+
+id owner
+-- -----
+1  ANN
+2  BOB
+
+(2 rows affected)
 ```
 
 ## Oracle
@@ -251,9 +276,11 @@ A replica's Oracle door answers as an Active Data Guard physical standby:
   pluggable database that is open for read-only access.`;
 - `V$DATABASE` shows `OPEN_MODE` `READ ONLY WITH APPLY` and `DATABASE_ROLE` `PHYSICAL STANDBY` (the master:
   `READ WRITE`, `PRIMARY`);
-- **DML on a global temporary table works**, as on an Active Data Guard standby (temporary undo): its rows live in
-  the replica's memory for the session. The table must have been made on the master; `CREATE GLOBAL TEMPORARY
-  TABLE` on a replica is ORA-16000.
+- `CREATE GLOBAL TEMPORARY TABLE` gives ORA-16000, as on a standby.
+- **DML on a global temporary table is not available on a replica.** An Active Data Guard standby allows it for a
+  table the primary defined. In lexdb a global temporary table's definition belongs to the session that made it, on
+  the master too (it is not shared with other sessions, as Oracle's is), so a replica's session never has one
+  ([known issues](KNOWN-ISSUES.md)).
 
 **Routing.** A client that connects to the master's listener with the read-only service name is redirected to a
 replica, as a listener redirects a client to a service that a standby runs (Data Guard's role-based services). The
@@ -290,14 +317,12 @@ ERROR:
 ORA-16000: Attempting to modify database or pluggable database that is open for read-only access.
 ```
 
-A global temporary table, made on the master and used on a replica (phase 5, as above):
-
-```sql
--- on the master
+```
+$ # ojdbc 23.26.4 to a replica's own port
 CREATE GLOBAL TEMPORARY TABLE work_ids (id NUMBER) ON COMMIT PRESERVE ROWS;
--- on a replica
-INSERT INTO work_ids SELECT id FROM public.acct;
-SELECT count(*) FROM work_ids;
+
+ERROR:
+ORA-16000: Attempting to modify database or pluggable database that is open for read-only access.
 ```
 
 TCPS redirects (`--tcps` with `--replica-tcps`) are built but not yet tested.
