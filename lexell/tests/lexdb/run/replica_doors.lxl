@@ -18,7 +18,13 @@
 // applied (a task commits and polls 100 ms after the wait began), and the
 // commit is then seen; TIMEOUT with and without NO_THROW, the modes, the
 // options' errors, in a block; on the master the standby modes' 55000 and
-// NO_THROW's "not in recovery", primary_flush's wait.
+// NO_THROW's "not in recovery", primary_flush's wait. Routing (the replica's
+// doors registered as its link would, lexdb_repl.setRoutes): a TDS login with
+// ApplicationIntent=ReadOnly to the master is routed (ENVCHANGE 20) to the
+// replica, ReadWrite not, and none up: served by the master; a CONNECT naming
+// the read-only service (lexdb_ro, freepdb1_ro) is redirected (REDIRECT), none
+// up: ORA-12514; a wildcard replica address is answered with the master's host;
+// the replica serves both itself. Lexell's own clients follow both.
 // expect: pg master: in_hot_standby off, default_transaction_read_only off, recovery f
 // expect: pg replica: in_hot_standby on, default_transaction_read_only on, show on, recovery t
 // expect: pg replica rows: 3
@@ -40,6 +46,11 @@
 // expect: wait errors: 55000 22023 22023 22023 22P02 42601 42601 42601 42601 42601
 // expect: wait in a block: 55000
 // expect: wait on the master: 55000 recovery is not in progress / not in recovery / success / timeout
+// expect: route, no replica: tds ReadOnly read_only 0, tns lexdb_ro error 12514
+// expect: route: tds ReadOnly read_only 1, ReadWrite read_only 0; tns lexdb_ro 'PHYSICAL STANDBY', freepdb1_ro 'PHYSICAL STANDBY', lexdb 'PRIMARY'
+// expect: route, wildcard: tds ReadOnly read_only 1, tns lexdb_ro 'PHYSICAL STANDBY'
+// expect: route, at the replica: tds ReadOnly read_only 1, tns lexdb_ro 'PHYSICAL STANDBY'
+// expect: route, gone: tds ReadOnly read_only 0, tns lexdb_ro error 12514
 import "task"
 import "net"
 import "strings"
@@ -52,6 +63,7 @@ import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_wire"
 import "../../../cmd/lexdb_tds"
 import "../../../cmd/lexdb_tns"
+import "../../../cmd/lexdb_repl"
 
 fn port(ln: &net.Listener): str {
     let a = ln.localAddr()
@@ -143,6 +155,42 @@ fn waitChecks(st: &lexdb_store.Store, rep: &lexdb_store.Store, master: &str, rep
     println("wait on the master: " + pgErr(mut &m, "wait for lsn '0/1'") + " / " + pg1(mut &m, "wait for lsn '0/1' with (no_throw)") + " / " +
             pg1(mut &m, &("wait for lsn '" + lsn + "' with (mode 'primary_flush')")) + " / " +
             pg1(mut &m, "wait for lsn 'FFFF/0' with (mode primary_flush, timeout 20, no_throw)"))
+}
+
+// ---- routing read-only clients (phase 4)
+
+fn routedTds(p: &str, intent: &str): str {
+    match sqlserver.connect(&("Server=127.0.0.1," + p + ";UID=sa;PWD=sa;Encrypt=no;ApplicationIntent=" + intent)) {
+        Ok(c) {
+            var cc = c
+            return "read_only " + ms1(mut &cc, "select cast(is_read_only as int) from sys.databases where name = db_name()")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn routedTns(p: &str, svc: &str): str {
+    match oracle.connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + p + "/" + svc)) {
+        Ok(c) {
+            var cc = c
+            return or1(mut &cc, "select database_role from v$database")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn routeChecks(st: &lexdb_store.Store, mtds: &str, rtds: &str, mtns: &str, rtns: &str) {
+    let none: []str = []
+    println("route, no replica: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(mtns, "lexdb_ro"))
+    lexdb_repl.setRoutes(st, 1, &["tds 127.0.0.1:" + rtds, "tns 127.0.0.1:" + rtns])
+    println("route: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", ReadWrite " + routedTds(mtds, "ReadWrite") +
+            "; tns lexdb_ro " + routedTns(mtns, "lexdb_ro") + ", freepdb1_ro " + routedTns(mtns, "FREEPDB1_RO") + ", lexdb " + routedTns(mtns, "lexdb"))
+    // a replica on a wildcard address: the host the client reached the master on
+    lexdb_repl.setRoutes(st, 1, &["tds 0.0.0.0:" + rtds, "tns 0.0.0.0:" + rtns])
+    println("route, wildcard: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(mtns, "lexdb_ro"))
+    println("route, at the replica: tds ReadOnly " + routedTds(rtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(rtns, "lexdb_ro"))
+    lexdb_repl.setRoutes(st, 1, &none)
+    println("route, gone: tds ReadOnly " + routedTds(mtds, "ReadOnly") + ", tns lexdb_ro " + routedTns(mtns, "lexdb_ro"))
 }
 
 // ---- SQL Server
@@ -253,6 +301,8 @@ fn main() {
             let mtns = net.listen("127.0.0.1:0").unwrap()
             let rtns = net.listen("127.0.0.1:0").unwrap()
             let rtds = net.listen("127.0.0.1:0").unwrap()
+            let mtds = net.listen("127.0.0.1:0").unwrap()
+            let dm = port(&mtds)
             let pm = port(&mpg)
             let pr = port(&rpg)
             let tm = port(&mtns)
@@ -267,6 +317,9 @@ fn main() {
             tdsChecks(&dr)
             tnsChecks(&tm, &tr)
             waitChecks(&st, &rep, &pm, &pr)
+            let a6 = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: mtds, st: st.share()})
+            routeChecks(&st, &dm, &dr, &tm, &tr)
+            { let stop = a6 }
             { let stop = a5 }
             { let stop = a4 }
             { let stop = a3 }

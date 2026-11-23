@@ -24,7 +24,9 @@ by many checkpoints. Through psql:
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
 (3906, ORA-16000, v$database's role); libpq with a host list picks the master or a
-replica by target_session_attrs; the master (a worker) killed with SIGKILL is
+replica by target_session_attrs; the master routes ApplicationIntent=ReadOnly logins
+and CONNECTs to the read-only service (lexdb_ro, freepdb1_ro) to a replica; the
+master (a worker) killed with SIGKILL is
 started again by the supervisor, and the replicas with it, the data
 intact; a replica killed is started again on its own; SIGTERM to the
 supervisor stops them all (exit 0).
@@ -249,6 +251,16 @@ def doors_checked(mport, rport, tport, oport, want, fail):
     got = door('tns', oport, 'select open_mode, database_role from v$database')
     if got != "'READ WRITE'|'PRIMARY'":
         fail('supervised: v$database on the master: %s' % got)
+    # routing: the master sends read-only clients to a replica (ENVCHANGE 20, REDIRECT), which announced its doors
+    ro = 'select cast(is_read_only as int) from sys.databases where name = db_name()'
+    for intent, want_ro in (('ReadOnly', '1'), ('ReadWrite', '0')):
+        got = door('tds', tport, ro, 'ApplicationIntent=' + intent)
+        if got != want_ro:
+            fail('supervised: ApplicationIntent=%s on the master reached is_read_only %s' % (intent, got))
+    for svc, role in (('lexdb_ro', "'PHYSICAL STANDBY'"), ('freepdb1_ro', "'PHYSICAL STANDBY'"), ('lexdb', "'PRIMARY'")):
+        got = door('tns', oport, 'select database_role from v$database', svc)
+        if got != role:
+            fail('supervised: service %s on the master reached %s' % (svc, got))
 
 
 def supervised(exe, work, env, fail):
