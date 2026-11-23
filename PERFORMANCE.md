@@ -21,7 +21,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Area | Against | Result |
 |---|---|---|
 | Compile time | Rust | Much faster: about 3 times for hello world, about 23 times for nine programs |
-| Microbenchmarks | Rust, Java | Faster than Rust on seven of ten, level on two; faster than warmed-up Java on four; a twentieth of the JVM's memory or less |
+| Microbenchmarks | Rust, Java | Faster than Rust on seven of ten, level on two; faster than warmed-up Java on four; at most a thirteenth of the JVM's memory |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
 | JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
