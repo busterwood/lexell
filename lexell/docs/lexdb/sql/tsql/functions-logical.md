@@ -224,7 +224,7 @@ int_wins float_wins
 (1 row affected)
 
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "x"
+Conversion failed when converting the varchar value 'x' to data type int.
 ```
 
 ### I. ISNULL and COALESCE differ in lexdb from SQL Server
@@ -256,11 +256,11 @@ SELECT CHOOSE('a', 1, 2) AS a;
 ```
 
 ```text
-Msg 195, Level 16, State 1, Line 1
-function nullif with 3 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'nullif' is not a recognized built-in function name.
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "a"
-Msg 195, Level 16, State 1, Line 1
+Conversion failed when converting the varchar value 'a' to data type int.
+Msg 195, Level 15, State 1, Line 1
 operator does not exist: 1 compared with a
 ```
 
