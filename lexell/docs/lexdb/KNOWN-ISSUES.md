@@ -178,6 +178,17 @@ smaller differences of its statement.
   - Mixed types are not checked in `CASE`, `UNION` and `coalesce` (`coalesce(1, true)` gives 1; PostgreSQL: 42804).
   - `1 = 'a'` is 42883 `operator does not exist` (PostgreSQL: 22P02).
   - Some casts' columns are named differently: `(-2.5)::int` is `?column?`, `42::oid` is `integer`.
+- **Scalar functions** (found writing the function pages):
+  - Regular expressions are RE2's: no back references (`'aa' ~ '(a)\1'` is 2201B) and no lookaround; the error
+    texts are RE2's (`missing closing )`, where PostgreSQL says `parentheses () not balanced`).
+  - `ILIKE` folds ASCII letters only, while `~*` folds every letter: `'É' ILIKE 'é'` is f, `'É' ~* 'é'` is t.
+  - `trunc(numeric, places)` does not exist (42883); `cbrt(27)` gives 3.0000000000000004.
+  - Missing (42883): `character_length`, `bit_length`, `normalize`, `to_ascii`, `sha224` to `sha512`, `factorial`,
+    `setseed`, `random_normal`, `justify_days`, `justify_hours`, `justify_interval`, `make_time`. The `^@` and `~~`
+    operators are not taken.
+  - `concat_ws(',')` alone is 42883 (PostgreSQL: an empty string); `format('%*s', 5, 'a')` has no `*` width.
+  - Messages: `date_trunc('fortnight', ...)` says `for type timestamp` (PostgreSQL: `timestamp without time zone`);
+    `to_date('2026-13-01', ...)` quotes the value re-formatted (`"2026-13-1"`).
 
 
 ## SQL Server door
