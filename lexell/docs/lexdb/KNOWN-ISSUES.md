@@ -22,6 +22,8 @@ smaller differences of its statement.
 - **Cancel requests are ignored.** psql's Ctrl-C, JDBC's `Statement.cancel()` and libpq's `PQcancel` do not stop a
   running statement. `statement_timeout` does.
 - **`inet_server_port()`** and the other `inet_*` functions do not exist (42883).
+- **No PL/pgSQL and no `DO`.** Functions and procedures are `LANGUAGE sql` only; another language is 42704
+  (`language "plpgsql" does not exist`), and `DO` is a syntax error.
 
 ## SQL Server door
 
@@ -35,6 +37,12 @@ smaller differences of its statement.
   option on in lexdb. bcp and SqlBulkCopy were not affected when checked during development (design/lexdb-tds.md
   section 14). ([bulk loading](bulk-load.md#from-java-sqlserverbulkcopy))
 - **Error line numbers** are always 1 (`Msg 2627, Level 14, State 1, Line 1`), whatever line of the batch failed.
+- **Missing functions:** `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP` and `ATN2` give error 195 ("function ... does
+  not exist"). An error 195 ends the batch, as SQL Server's compile errors do.
+- **`INSERT TOP (n)`** is error 102, and a table hint on an `INSERT`'s target (`INSERT INTO t WITH (TABLOCK)`) is
+  error 156. Table hints in `FROM` are read and ignored.
+- **No `CREATE LOGIN`.** `CREATE USER name WITH PASSWORD = '...'` is error 102; `CREATE ROLE name LOGIN PASSWORD
+  '...'` (PostgreSQL's form) works in this door.
 
 ## Oracle door
 
