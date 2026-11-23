@@ -156,9 +156,13 @@ type Gen = record {
     inner: []bool               // ... a local of a function generated in place: live only at its calls
     pts: [][]int                // ... the positions it is named at, in order
     unused: bool                // genAssign: the value of the assignment generated next is not used
+    prevDecl: int               // genAssign: the local the statement before declared (an expression statement's), or -1
     tmpRegs: []int              // the registers of QUIET_REGS no local of the function has
     tmpUsed: int                // ... the number of them holding a temporary (pair)
     defAt: []int                // per local: the position of its declaration with an initializer, or -1
+    coal: []int                 // per double: the local its initializer reads as its first operand alone, or -1
+    coalBy: []int               // ... and the other way: the local whose initializer reads it so, or -1
+    declLoop: []int             // per local: the innermost loop (regions) its declaration is in, or -1
     tailEnd: []int              // per position: in the statements before a return that run straight
                                 // into it, the return's position; else -1
     pos: int                    // the scan's position: its count of statements
@@ -274,7 +278,7 @@ fn newGen(u: ir.Ir): Gen {
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
         caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
-        noInit: [], inner: [], pts: [], defAt: [], tmpRegs: [], tmpUsed: 0, unused: false, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], any89: false, regions: [], openLoops: [],
+        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
@@ -313,6 +317,9 @@ fn newGen(u: ir.Ir): Gen {
         append(mut &g.inner, false)
         append(mut &g.pts, [])
         append(mut &g.defAt, -1)
+        append(mut &g.coal, -1)
+        append(mut &g.coalBy, -1)
+        append(mut &g.declLoop, -1)
         append(mut &g.spillSlot, 0)
     }
     g.countUses()
@@ -1165,6 +1172,14 @@ fn (g: mut &Gen) allocRegs(f: int) {
     for i in 0..len(g.fpLoud) { append(mut &fpBefore, fpBefore[i] + (if g.fpLoud[i] { 1 } else { 0 })) }
     for l in order {
         if !g.isF(g.u.locals[l].ty) || !g.quietLive(l, &fpBefore) { continue }
+        // the register of a local it joins (joins), if free: no copy between them
+        for o in [g.coal[l], g.coalBy[l]] {
+            let x = if o >= 0 { g.freg[o] } else { -1 }
+            if g.freg[l] < 0 && x >= 0 && (g.joins(o, l) || g.joins(l, o)) && g.regFree(&given, 16 + x, l) {
+                g.freg[l] = x
+                append(mut &given[16 + x], l)
+            }
+        }
         for x in FP_REGS {
             if g.freg[l] < 0 && g.regFree(&given, 16 + x, l) {
                 g.freg[l] = x
@@ -1292,6 +1307,7 @@ fn (g: &Gen) regFree(given: &[][]int, r: int, l: int): bool {
 // Whether the live ranges of locals o and l overlap.
 fn (g: &Gen) meets(o: int, l: int): bool {
     if g.first[o] > g.last[l] || g.first[l] > g.last[o] { return false }
+    if (g.coal[l] == o || g.coal[o] == l) && (g.joins(o, l) || g.joins(l, o)) { return false }
     // the ranges around them meet: compare the positions of inner locals
     if !g.inner[o] && !g.inner[l] { return true }
     // an inner local is live at its positions only (spans without making them)
@@ -1303,6 +1319,39 @@ fn (g: &Gen) meets(o: int, l: int): bool {
         }
     }
     return false
+}
+
+// The double local the expression e (the initializer of local l) reads as its first operand
+// (what genFT moves into the target register before it reads anything else: the left operand
+// of + - * /, down the left side, through sqrt) and nowhere else; else -1.
+fn (g: &Gen) firstOpLocal(e: int, l: int): int {
+    var x = e
+    while true {
+        let q = g.sqrtArg(x)
+        if q >= 0 {
+            x = q
+            continue
+        }
+        let n = g.u.nodes[x]
+        if n.k == ir.E_BIN && g.tk(n.c) == ir.TY_F64 && n.v <= ir.OP_DIV && !isCmp(n.v) {
+            x = n.a
+            continue
+        }
+        break
+    }
+    let n = g.u.nodes[x]
+    if n.k != ir.E_LOCAL || n.a == l || !g.isF(g.u.locals[n.a].ty) || x == e { return -1 }
+    return if g.fLaterReads(e, n.a) { -1 } else { n.a }
+}
+
+// Whether local o's range ends where local b's begins, at b's declaration, whose initializer
+// reads o only as its first operand (coal): the initializer reads o's register before it writes
+// b's, so the two may share one (register coalescing: no copy from o's register into b's).
+// Both are declared with initializers in one loop (or in none): o is not live around a loop that
+// b's declaration ends (o's range widened to the loop's end, which b's declaration may be).
+fn (g: &Gen) joins(o: int, b: int): bool {
+    return g.coal[b] == o && o >= 0 && !g.inner[o] && !g.inner[b] && g.defAt[b] >= 0 && g.first[b] == g.defAt[b] &&
+        g.last[o] == g.defAt[b] && g.defAt[o] >= 0 && g.declLoop[o] == g.declLoop[b]
 }
 
 // Whether a position of local l is in [a, b].
@@ -1957,6 +2006,9 @@ fn (g: mut &Gen) touch(l: int) {
         g.inner[l] = !g.counting && g.scanExpr > 0
         g.pts[l] = []
         g.defAt[l] = -1
+        g.coal[l] = -1
+        g.coalBy[l] = -1
+        g.declLoop[l] = -1
     }
 }
 
@@ -2412,7 +2464,15 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         g.step()
         let l = n.a
         g.occur(l)
-        if n.b >= 0 && n.c < 0 && g.first[l] == g.pos { g.defAt[l] = g.pos }
+        g.declLoop[l] = if len(g.openLoops) > 0 { g.openLoops[len(g.openLoops) - 1] } else { -1 }
+        if n.b >= 0 && n.c < 0 && g.first[l] == g.pos {
+            g.defAt[l] = g.pos
+            if g.isF(g.u.locals[l].ty) {
+                let o = g.firstOpLocal(n.b, l)
+                g.coal[l] = o
+                if o >= 0 { g.coalBy[o] = l }
+            }
+        }
         if n.b >= 0 {
             if g.counting { g.uses[l] += 1 }
             g.weigh(l, depth)
@@ -2956,7 +3016,13 @@ fn (g: mut &Gen) stmtsTo(l: int, j0: int, j1: int) {
             j += 2
             continue
         }
+        g.prevDecl = -1
+        if j > 0 && g.u.nk(x) == ir.S_EXPR {
+            let p = g.u.nodes[g.u.listAt(l, j - 1)]
+            if p.k == ir.S_DECL && p.b >= 0 && p.c < 0 { g.prevDecl = p.a }
+        }
         g.stmt(x)
+        g.prevDecl = -1
         g.frame = if g.isDecl(x) { g.declMark } else { before }
         j += 1
     }
@@ -5064,13 +5130,32 @@ fn (g: mut &Gen) genF1(b: int): bool {
 }
 
 // Whether the double b is a load from memory (an element of an array, a member through a
-// pointer) whose address takes integer code only: pure (no call but the inline checks) and
-// nothing of a float type below it. So it can be the memory operand of an SSE op after the
+// pointer) whose address takes integer code only: pure but for assignments of integer locals
+// (addrCode: no call but the inline checks) and nothing of a float type below it. So it can be the memory operand of an SSE op after the
 // other operand is in xmm0: the address computation (place) uses the integer registers alone.
 fn (g: &Gen) fMem(b: int): bool {
     let n = g.u.nodes[b]
     if g.tk(n.ty) != ir.TY_F64 || (n.k != ir.E_MEMBER && n.k != ir.E_DEREF) || g.fregOf(b) >= 0 { return false }
-    return g.pure(b) && g.noFloatIn(n.a)
+    return g.addrCode(b) && g.noFloatIn(n.a)
+}
+
+// Whether x is pure (pure) but for assignments of integer locals (an address cse keeps in a
+// local as it computes it): integer code alone, with no call that could change a float register.
+fn (g: &Gen) addrCode(x: int): bool {
+    if x < 0 { return true }
+    let n = g.u.nodes[x]
+    if n.k == ir.E_ASSIGN {
+        let t = g.u.nodes[n.a]
+        if t.k != ir.E_LOCAL || g.isF(t.ty) || g.isAggr(t.ty) || g.is128(t.ty) { return false }
+        return g.addrCode(n.b)
+    }
+    if n.k == ir.E_POSTINC || n.k == ir.E_CLIT { return false }
+    if n.k == ir.E_CALL { return g.pure(x) }
+    if n.k == ir.E_INT || n.k == ir.E_LOCAL || n.k == ir.E_GLOBAL || n.k == ir.E_STR || n.k == ir.E_FUNC || n.k == ir.E_FLT {
+        return true
+    }
+    if n.k == ir.E_BIN { return g.addrCode(n.a) && g.addrCode(n.b) }
+    return g.addrCode(n.a) && g.addrCode(n.b) && g.addrCode(n.c)
 }
 
 // Whether no node of the tree x has a float type.
@@ -5203,6 +5288,19 @@ fn (g: mut &Gen) fIntoLocal(e: int, r: int, l: int): bool {
     let free: []int = [0, 1]
     g.genFT(e, r, &free)
     return true
+}
+
+// A double e computed in the register of local o, when o is the local the statement before
+// declared (prevDecl), e reads it only as its first operand (firstOpLocal), and nothing else
+// reads it (its declaration and this read are its uses): o's value is not needed after e, so
+// its register holds e's (for a store, without a copy into xmm0). That register, or -1 with
+// nothing generated.
+fn (g: mut &Gen) fIntoTemp(e: int, o: int): int {
+    if o < 0 || g.inner[o] || g.uses[o] != 2 || g.defAt[o] < 0 || g.freg[o] < 8 { return -1 }
+    if g.firstOpLocal(e, -1) != o || !g.fT(e, 2, 8) { return -1 }
+    let free: []int = [0, 1]
+    g.genFT(e, g.freg[o], &free)
+    return g.freg[o]
 }
 
 // op xr, b for a load b (fSrc or fMem).
@@ -5515,6 +5613,7 @@ fn (g: mut &Gen) baseInto(a: int) {
 
 fn (g: mut &Gen) genAssign(e: int) {
     let unused = replace(mut &g.unused, false)
+    let pd = replace(mut &g.prevDecl, -1)
     let n = g.u.nodes[e]
     let lhs = n.a
     let t = n.ty
@@ -5581,6 +5680,14 @@ fn (g: mut &Gen) genAssign(e: int) {
             return
         }
     }
+    if m.base != -9 && g.tk(t) == ir.TY_F64 && g.u.nodes[n.b].ty == t {
+        let r = g.fIntoTemp(n.b, pd)
+        if r >= 0 {
+            g.a.movsdStore(m, r)
+            if !unused { g.a.sse66(MOVAPD, 0, r) }
+            return
+        }
+    }
     if m.base != -9 {
         g.gen(n.b)
         g.storeFrom(g.u.nodes[n.b].ty, t, m)
@@ -5640,9 +5747,15 @@ fn (g: mut &Gen) genAssign(e: int) {
         // the address waits while the value is evaluated
         g.genAddr(lhs)
         let h = g.hold(n.b, g.quietTree(n.b))
-        g.gen(n.b)
+        let fr = if g.tk(t) == ir.TY_F64 && g.u.nodes[n.b].ty == t { g.fIntoTemp(n.b, pd) } else { -1 }
+        if fr < 0 { g.gen(n.b) }
         g.unhold(h)
         g.unholdInto(h, R11)
+        if fr >= 0 {
+            g.a.movsdStore(x64.mem(R11, 0), fr)
+            if !unused { g.a.sse66(MOVAPD, 0, fr) }
+            return
+        }
     }
     g.storeT(t, x64.mem(R11, 0))
     if g.isAggr(t) { g.a.movRR(8, RAX, R11) }

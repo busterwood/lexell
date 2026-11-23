@@ -867,3 +867,44 @@ Only the concat functions changed size (the runtime's other sections are as they
 
 **Next, from this:** a null-pointer `None` for `Option` of a boxed record (the representation:
 check, emit, lower, the drop glue, both backends), measured first on `lists` and `trees`.
+
+## 23. Doubles: temporaries coalesced, stores from a dying temporary, addresses that set a local (as built)
+
+The IR keeps the left operand of an operation in a temporary when the right one has effects
+(a bounds check: `t7 = bs[i].x; dx = t7 - bs[j].x`) and splits sums into temporaries
+(`t18 = dx * dx; t19 = t18 + dy * dy; d2 = t19 + dz * dz`). Each temporary had a register of its
+own, so every step was a `movapd` into the next one's. Rust's `nbody` is level with this one in
+the loop's arithmetic; it leads by unrolling the five bodies and computing two pairs at a time
+(`vsqrtpd`, `vmulpd`): vectorisation, not copies.
+
+- **Coalescing** (x64gen `joins`): a double declared with an initializer that reads local o only
+  as its first operand (what `genFT` moves into the target register before anything else:
+  `firstOpLocal`), where o's range ends, may share o's register. The two ranges meet only at
+  that declaration, which reads o's register before it writes the new local's. Both must be
+  declared with initializers in the same loop: a temporary declared before a loop and read by
+  the body's last declaration is live around the loop, its range widened to the loop's end.
+  The allocator tries the partner's register first.
+- **Stores from a dying temporary** (`fIntoTemp`): `t = p.vx; p.vx = t - dx * mj` computes the
+  value in t's register when the statement before declared t and nothing else reads it (its uses:
+  the declaration and this read), then stores from there; before, it went through xmm0.
+- **Addresses that set a local** (`addrCode`): a load whose address computation assigns an
+  integer local (cse's `rbx = &bs[i]`, kept for the next statements) is a memory operand too,
+  as a pure one is: integer code alone, no call.
+
+| measure (main fc9b8580 against this) | instructions | cycles |
+|---|---:|---:|
+| bench nbody / matmul (5 interleaved rounds) | -17.3 / -6.6% | -2.6 / -6.9% |
+| bench interp / closures | level | +0.8 / +0.1% |
+| perfsuite run suite / compile suite | 0.00 / +0.15% | -0.02 / -0.06% |
+| apps regex / json / jq / cmark / decimal | 0.00% each | -0.1 / 0.0 / -2.2 / +0.2 / -0.1% |
+| TPC-H SF1, server instructions per query (22) | +0.01% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | level (172,346-172,422 against 172,330-172,350) | +1.4 / +2.1% |
+
+`nbody`'s cycles moved less than its instructions: the loop is bound by the latency of
+`sqrtsd` and `divsd`, not by its instruction count. The compile suite's +0.15% is the new
+bookkeeping per local. The point select's cycles: one function of lexdb changed (the planner's
+`grpCost`, 64 bytes smaller), so everything after it moved; its instructions are level.
+
+Test: tests/run/native_float_coalesce (nbody's pair loop, a temporary read again on the right,
+a temporary live around a loop whose body's last declaration reads it, a temporary read by two
+stores, compound assignments of elements).
