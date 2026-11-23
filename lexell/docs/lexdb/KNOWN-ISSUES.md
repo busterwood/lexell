@@ -314,6 +314,25 @@ smaller differences of its statement.
   - Other error numbers: `DROP TABLE`, `VIEW` or `SEQUENCE` of a missing object is 208 (SQL Server: 3701), `DROP
     INDEX` of a missing index 50000 (3701), adding a column that exists 50000 (2705), dropping an unknown column 207
     (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901).
+- **Messages after `SET` or `DECLARE` are lost to JDBC programs.** Through mssql-jdbc 13.6, `SET NOCOUNT ON; PRINT
+  'x'` or `DECLARE @x int = 1; PRINT 'x'` gives the program no message (no `SQLWarning`, whatever `getMoreResults`
+  says); `PRINT 'x'` alone, or a `SELECT` after the `SET`, is seen. lexdb sends a DONE token for the `SET` or
+  `DECLARE`, where SQL Server sends none, and the driver seems to stop there (lexdb_tds.lxl, the EV_DONE arm). The
+  pages avoid a `PRINT` straight after a `SET`.
+- **Transactions and variables** (found writing those T-SQL pages):
+  - A string too long for a variable is error 2628 and leaves it NULL: `DECLARE @s varchar(3) = 'abcdef'` (SQL
+    Server cuts it to 'abc').
+  - `ROLLBACK` undoes changes to a table variable (SQL Server keeps them).
+  - A table variable used after its batch is 208 `Invalid object name '#@t'` (SQL Server: 1087).
+  - `SELECT @n += id FROM t` is 102 (it works in `SET`); in `SELECT @a = 1, @b = @a + 1`, `@b` does not see the new
+    `@a` (SQL Server: 2).
+  - `ROLLBACK TRAN` with a name that is neither the outermost transaction's nor a savepoint's rolls back everything
+    (SQL Server: 6401, the transaction stays open).
+  - `SET TRANSACTION ISOLATION LEVEL` takes any word (`CHAOS`) and keeps nothing:
+    `sys.dm_exec_sessions.transaction_isolation_level` stays 2.
+  - `BEGIN TRANSACTION ... WITH MARK` and `BEGIN DISTRIBUTED TRANSACTION` are 102; cursors (`DECLARE @c CURSOR`,
+    `DECLARE c CURSOR FOR`) are 50000 and 102.
+  - With `XACT_ABORT ON`, a failed `UPDATE` inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
 
 
 ## Oracle door
