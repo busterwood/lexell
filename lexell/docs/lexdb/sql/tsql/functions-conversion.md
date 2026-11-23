@@ -99,8 +99,7 @@ cut to the length of the target type.
   (SQL Server: error 206).
 - A value `CAST` to `char(n)` is not padded with spaces: `'[' + CONVERT(char(8), 12) + ']'` is `[12]`
   (SQL Server: `[12      ]`).
-- An invalid string for a number is error 245 for every number type, with PostgreSQL's wording (`invalid input syntax
-  for type integer: "abc"`), where SQL Server uses 8114 for `decimal`, `float` and `bigint`. In a comparison of a
+- In a comparison of a
   string column with a number (`WHERE s = 12`) lexdb gives error 195 (`operator does not exist`), where SQL Server
   converts the column and fails with 245.
 - A `datetime` column takes PostgreSQL's special strings: `INSERT ... VALUES ('tomorrow')` is accepted.
@@ -217,9 +216,9 @@ iso_date   style_126             style_121                   time_      date_par
 (1 row affected)
 
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "05/03/2026"
+Conversion failed when converting date and/or time from character string.
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "20260305"
+Conversion failed when converting date and/or time from character string.
 ```
 
 ### F. Styles that lexdb ignores: money and binary
@@ -340,7 +339,7 @@ int_wins
 (1 row affected)
 
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "x"
+Conversion failed when converting the varchar value 'x' to data type int.
 ```
 
 ### L. Conversion errors
@@ -372,15 +371,15 @@ SELECT CAST('abc' AS bit) AS a;
 
 ```text
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "abc"
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type numeric: "abc"
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type bigint: "a"
+Conversion failed when converting the varchar value 'abc' to data type int.
+Msg 8114, Level 16, State 1, Line 1
+Error converting data type varchar to numeric.
+Msg 8114, Level 16, State 1, Line 1
+Error converting data type varchar to bigint.
 Msg 517, Level 16, State 1, Line 1
 date/time field value out of range: "2026-13-45"
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type timestamp: "abc"
+Conversion failed when converting date and/or time from character string.
 Msg 8115, Level 16, State 1, Line 1
 integer out of range
 Msg 8115, Level 16, State 1, Line 1
@@ -390,7 +389,7 @@ Arithmetic overflow error converting expression to data type int.
 Msg 8134, Level 16, State 1, Line 1
 Divide by zero error encountered.
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type boolean: "abc"
+Conversion failed when converting the varchar value 'abc' to data type bit.
 ```
 
 ### M. Conversions in a table
@@ -419,7 +418,7 @@ value too long for type character varying(5)
 Msg 8115, Level 16, State 1, Line 1
 numeric field overflow: a field with precision 4, scale 2 must round to an absolute value less than 10^2
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "x"
+Conversion failed when converting the varchar value 'x' to data type int.
 id code_plus_one
 -- -------------
 1  13
@@ -444,9 +443,9 @@ SELECT TRY_PARSE('5' AS int) AS a;
 
 ```text
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'as'.
+Incorrect syntax near the keyword 'AS'.
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'as'.
+Incorrect syntax near the keyword 'AS'.
 ```
 
 ## See also
