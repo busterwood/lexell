@@ -358,12 +358,12 @@ Msg 155, Level 16, State 1, Line 1
 '"tzoffset"' is not a recognized datepart option.
 Msg 155, Level 16, State 1, Line 1
 '"foo"' is not a recognized datename option.
-Msg 195, Level 16, State 1, Line 1
-function isdate with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function switchoffset with 2 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function datetimefromparts with 7 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'isdate' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'switchoffset' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'datetimefromparts' is not a recognized built-in function name.
 ```
 
 ## See also
