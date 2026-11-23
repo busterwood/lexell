@@ -54,7 +54,6 @@ SQLCODE        SQLERRM
 ## Differences from Oracle
 
 - `TO_NUMBER('abc')` raises `VALUE_ERROR` (Oracle: `INVALID_NUMBER`).
-- `ORA-06512` lines give the line of the block only, with no unit name.
 
 ## Examples
 
