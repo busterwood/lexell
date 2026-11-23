@@ -354,7 +354,7 @@ SELECT @@ERROR AS error_after;
 ```text
 num  msg                               sev st ln proc_name xs
 ---- --------------------------------- --- -- -- --------- --
-8134 Divide by zero error encountered. 16  1  1  NULL      0
+8134 Divide by zero error encountered. 16  1  2  NULL      0
 
 (1 row affected)
 
@@ -540,13 +540,13 @@ SELECT @@OPTIONS;
 ```
 
 ```text
-Msg 195, Level 16, State 1, Line 1
-function ident_current with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function newsequentialid with 0 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function host_name with 0 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
+Msg 195, Level 15, State 1, Line 1
+'ident_current' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'newsequentialid' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'host_name' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
 '@@options' is not a recognized built-in function name.
 ```
 
