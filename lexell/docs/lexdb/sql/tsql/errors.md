@@ -53,9 +53,9 @@ feature, the number is **50000**.
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
 | 2628 | A string too long for its column. |
 | 241 | A date or time that cannot be read. |
-| 245 | A string that cannot be converted to a number. |
+| 245 | A string that cannot be converted to an integer. |
 | 517 | A date or time out of range (`2026-02-30`, `25:00`). |
-| 8114 | An error converting a string to a number in a `CAST` to `decimal`. |
+| 8114 | A string that cannot be converted to a `decimal`, `float` or `bigint`. |
 | 8115 | An arithmetic overflow, an integer out of range or a number too large for its decimal. |
 | 8134 | Division by zero. |
 | 512 | A subquery that returns more than one value where one is expected. |
@@ -70,7 +70,7 @@ feature, the number is **50000**.
 | 218, 219 | A type that does not exist (on `DROP TYPE`), or one that exists already (`CREATE TYPE`). |
 | 2714 | An object, role or user that exists already. |
 | 2715 | A data type that does not exist. |
-| 3701 | `DROP PROCEDURE` or `DROP FUNCTION` of an object that does not exist (`DROP TABLE` gives 208). |
+| 3701 | `DROP` of a table, view, procedure or function that does not exist (severity 11). |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
 | 5074 | An object depends on the column you are dropping or changing. |
@@ -103,26 +103,23 @@ feature, the number is **50000**.
 
 - Severity (`Level`) is 16 for most errors, 15 for syntax errors (102, 156, 178 and a few more), and 14 for a key
   violation (2627), a denied permission (229) and a failed login (18456).
-- Line numbers are always 1.
+- The `Line` is the line of the failing statement in the batch.
 - A batch is parsed whole before it runs. A syntax error (102, 156) or a refusal at parse time (error 50000
   `lexdb:` messages, 111, 179) stops the batch before anything in it runs, so put such a statement in a batch of its
   own. Errors 207, 208, 195, 137, 134, 468 and 2812 end the batch at their statement: the statements before it
   have run. Any other error ends only its statement, unless `SET XACT_ABORT ON` is in force.
 - `lexdb:` messages (error 50000) give the feature that is missing: see the *Differences* section of the page for
   the statement.
-- Many messages are PostgreSQL's text under SQL Server's number: a duplicate key says `duplicate key value violates
-  unique constraint "p_pkey"` where SQL Server names the key and the value.
+- Most messages are SQL Server's text. Errors numbered 50000, and a few others (8115 for a decimal that does not fit,
+  2628 for a string too long), carry lexdb's own.
 
 ## Differences from SQL Server
 
-- Messages differ in wording from SQL Server's for most errors (see the examples). The numbers, levels and states
-  are the ones listed.
+- A few messages differ in wording from SQL Server's (see the examples); the numbers and levels are the ones listed.
 - Error 8115 for a decimal that does not fit says `numeric field overflow: ...` and for an integer says
   `integer out of range`; SQL Server's `Arithmetic overflow error converting numeric to data type numeric` appears
   only for some expressions.
 - A unique index violation is 2627 (SQL Server: 2601).
-- Error 245 says `bigint` for a string added to an integer expression.
-- `ERROR_LINE()` and the `Line` of a message are always 1.
 
 ## Examples
 
@@ -160,8 +157,8 @@ Msg 208, Level 16, State 1, Line 1
 Invalid object name 'nothere'.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
-Msg 195, Level 16, State 1, Line 1
-function nofunc with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'nofunc' is not a recognized built-in function name.
 Msg 2812, Level 16, State 62, Line 1
 Could not find stored procedure 'nothere'.
 Msg 911, Level 16, State 1, Line 1
@@ -211,18 +208,18 @@ INSERT INTO dbo.p VALUES (5, 'e');
 
 ```text
 Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "p_pkey"
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "p_code_key"
-Msg 515, Level 16, State 1, Line 1
-null value in column "code" of relation "p" violates not-null constraint
-Msg 547, Level 16, State 1, Line 1
-new row for relation "p" violates check constraint "p_qty_check"
-Msg 547, Level 16, State 1, Line 1
-insert or update on table "c" violates foreign key constraint "c_p_id_fkey"
-Msg 2628, Level 16, State 1, Line 1
+Violation of PRIMARY KEY constraint 'p_pkey'. Cannot insert duplicate key in object 'dbo.p'. The duplicate key value is (1).
+Msg 2627, Level 14, State 1, Line 2
+Violation of UNIQUE KEY constraint 'p_code_key'. Cannot insert duplicate key in object 'dbo.p'. The duplicate key value is (a).
+Msg 515, Level 16, State 1, Line 3
+Cannot insert the value NULL into column 'code', table 'lexdb.dbo.p'; column does not allow nulls. INSERT fails.
+Msg 547, Level 16, State 1, Line 4
+The INSERT statement conflicted with the CHECK constraint "p_qty_check". The conflict occurred in database "lexdb", table "dbo.p", column 'qty'.
+Msg 547, Level 16, State 1, Line 5
+The INSERT statement conflicted with the FOREIGN KEY constraint "c_p_id_fkey". The conflict occurred in database "lexdb", table "dbo.p", column 'id'.
+Msg 2628, Level 16, State 1, Line 6
 value too long for type character varying(5)
-Msg 213, Level 16, State 1, Line 1
+Msg 213, Level 16, State 1, Line 7
 Column name or number of supplied values does not match table definition.
 ```
 
@@ -241,16 +238,16 @@ SELECT 'abc' + 1;
 ```text
 Msg 8134, Level 16, State 1, Line 1
 Divide by zero error encountered.
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "x"
-Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "x"
-Msg 8115, Level 16, State 1, Line 1
+Msg 245, Level 16, State 1, Line 2
+Conversion failed when converting the varchar value 'x' to data type int.
+Msg 241, Level 16, State 1, Line 3
+Conversion failed when converting date and/or time from character string.
+Msg 8115, Level 16, State 1, Line 4
 integer out of range
-Msg 517, Level 16, State 1, Line 1
+Msg 517, Level 16, State 1, Line 5
 date/time field value out of range: "2026-02-30"
-Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type bigint: "abc"
+Msg 8114, Level 16, State 1, Line 6
+Error converting data type varchar to bigint.
 ```
 
 ### E. Objects that exist, or do not
@@ -269,13 +266,13 @@ CREATE USER dup1;
 
 ```text
 Msg 2714, Level 16, State 1, Line 1
-relation "p" already exists
+There is already an object named 'p' in the database.
 Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type nosuchtype.
-Msg 208, Level 16, State 1, Line 1
-table "nothere" does not exist
-Msg 2714, Level 16, State 1, Line 1
-role "dup1" already exists
+Msg 3701, Level 11, State 1, Line 1
+Cannot drop the table 'nothere', because it does not exist or you do not have permission.
+Msg 2714, Level 16, State 1, Line 2
+There is already an object named 'dup1' in the database.
 ```
 
 ### F. Transactions
@@ -290,7 +287,7 @@ SAVE TRANSACTION s1;
 ```text
 Msg 3902, Level 16, State 1, Line 1
 The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION.
-Msg 3903, Level 16, State 1, Line 1
+Msg 3903, Level 16, State 1, Line 2
 The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION.
 Msg 628, Level 16, State 1, Line 1
 Cannot issue SAVE TRANSACTION when there is no active transaction.
