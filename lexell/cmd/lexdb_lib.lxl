@@ -22,6 +22,7 @@ import "./lexdb_rows"
 import "./lexdb_access"
 import "./lexdb_catalog"
 import "./lexdb_newfn"
+import "./lexdb_decfit"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -1338,7 +1339,7 @@ fn intMathOf(name: &str, vs: &[]Val, op: int): Result[Val, DbErr] {
     if (op == IM_MOD || op == IM_DIV) && b.isZero() { return Err(e("22012", "division by zero")) }
     if op == IM_MOD { return Ok(Val.Num(a.rem(b))) }
     if op == IM_DIV {
-        match a.sub(a.rem(b)).div(b, 0, Rounding.HALF_EVEN) {
+        match a.div(b, 0, Rounding.TOWARD_ZERO) {
             Ok(q) { return Ok(Val.Num(q)) }
             Err(_) { return Err(lexdb_ops.decErr()) }
         }
@@ -1466,9 +1467,10 @@ fn widthBucketFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[
     let below = if c < 0 { op.cmp(&b1) < 0 } else { op.cmp(&b1) > 0 }
     let above = if c < 0 { op.cmp(&b2) >= 0 } else { op.cmp(&b2) <= 0 }
     if below { r = 0 } else if above { r = count + 1 } else {
-        let num = if c < 0 { op.sub(b1) } else { b1.sub(op) }
-        let den = if c < 0 { b2.sub(b1) } else { b1.sub(b2) }
-        match num.mulExact(Decimal.fromInt(count)) {
+        // (the differences and the product exact, or rounded to 38 digits where they need more: 1e37 - 0.1 stopped the server)
+        let num = try bucketFit(if c < 0 { lexdb_decfit.subFit(&op, &b1) } else { lexdb_decfit.subFit(&b1, &op) })
+        let den = try bucketFit(if c < 0 { lexdb_decfit.subFit(&b2, &b1) } else { lexdb_decfit.subFit(&b1, &b2) })
+        match lexdb_decfit.mulFit(&num, &Decimal.fromInt(count)) {
             Ok(p) {
                 match p.div(den, 0, Rounding.FLOOR) {
                     Ok(q) { r = q.toInt(Rounding.FLOOR).unwrapOr(0) + 1 }
@@ -1477,9 +1479,17 @@ fn widthBucketFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[
             }
             Err(_) { return Err(lexdb_ops.decErr()) }
         }
+        if r > count { r = count }
     }
     if r > 2147483647 { return Err(e("22003", "integer out of range")) }
     return Ok(Val.Int(r))
+}
+
+fn bucketFit(r: Result[Decimal, DecError]): Result[Decimal, DbErr] {
+    match r {
+        Ok(d) { return Ok(d) }
+        Err(_) { return Err(lexdb_ops.decErr()) }
+    }
 }
 
 // -- formatting (9.8)

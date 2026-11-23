@@ -1,0 +1,119 @@
+// lexdb_decfit: sums and products of numerics rounded to 38 significant digits where the exact result needs more.
+// lib/decimal's operators (+, -, *, and the add, sub and mul methods) stop the program when a result needs more than 38
+// digits, and its exact forms (addExact, mulExact) give DecError.Inexact; neither is what a computation that rounds its
+// result anyway wants: a fraction of a day or a month in microseconds (interval arithmetic, Oracle's date + number,
+// NUMTODSINTERVAL), a percentile's interpolation, a time zone's hours. These give the exact value when it fits, and the
+// exact value rounded half away from zero to 38 digits when it does not; an exponent out of range is still an error.
+// Nothing here is on a hot path: each is called where an exact form would have stopped the server.
+
+import "strings"
+
+const B19: u128 = 10000000000000000000
+const TEN37: u128 = 10000000000000000000000000000000000000
+const TEN38: u128 = 100000000000000000000000000000000000000
+
+// a * b: exact when it fits 38 digits, else the exact product rounded half away from zero to 38 significant digits;
+// DecError.Overflow for an exponent out of range.
+pub fn mulFit(a: &Decimal, b: &Decimal): Result[Decimal, DecError] { return mulRound(a, b, false) }
+
+// a * b as mulFit, but rounded up (toward positive infinity) where it has more than 38 digits: its ceiling is the exact
+// product's (percentile_disc's ceil(f * n))
+pub fn mulCeil(a: &Decimal, b: &Decimal): Result[Decimal, DecError] { return mulRound(a, b, true) }
+
+fn mulRound(a: &Decimal, b: &Decimal, up: bool): Result[Decimal, DecError] {
+    match a.mulExact(b) {
+        Ok(p) { return Ok(p) }
+        Err(e) { if e.code() != 3 { return Err(e) } }
+    }
+    // the coefficients (each below 10^38) as two digits of base 10^19 each; the product's four, least first
+    let x = a.coefficient()
+    let y = b.coefficient()
+    let x1 = x / B19
+    let x0 = x % B19
+    let y1 = y / B19
+    let y0 = y % B19
+    let p0 = x0 * y0
+    let p1 = x0 * y1 + x1 * y0
+    let p2 = x1 * y1
+    var c = p0 / B19
+    let l0 = p0 % B19
+    var t = p1 + c
+    let l1 = t % B19
+    c = t / B19
+    t = p2 + c
+    let l2 = t % B19
+    let l3 = t / B19
+    let all = l3.toStr() + pad19(l2) + pad19(l1) + pad19(l0)
+    var lead = 0
+    while lead < len(all) - 1 && all[lead] == '0' { lead += 1 }
+    return rounded38(&(all[lead..len(all)].toStr()), a.exponent() + b.exponent(), a.isNeg() != b.isNeg(), up)
+}
+
+// a + b: exact when it fits 38 digits, else both rounded half away from zero to the 38th digit of the larger one's
+// magnitude (one more for a carry) and added; DecError.Overflow past 38 integer digits.
+pub fn addFit(a: &Decimal, b: &Decimal): Result[Decimal, DecError] {
+    match a.addExact(b) {
+        Ok(s) { return Ok(s) }
+        Err(e) { if e.code() != 3 { return Err(e) } }
+    }
+    let top = max(topOf(a), topOf(b))
+    let at = top + 1 - 38
+    let ra = try toExp(a, at)
+    let rb = try toExp(b, at)
+    return ra.addExact(&rb)
+}
+
+// a - b, as addFit.
+pub fn subFit(a: &Decimal, b: &Decimal): Result[Decimal, DecError] { return addFit(a, &b.neg()) }
+
+// the position past x's leading digit: its count of integer digits when it is 1 or more
+fn topOf(x: &Decimal): int {
+    if x.isZero() { return -32768 }
+    return digitsOf(x.coefficient()) + x.exponent()
+}
+
+// x rounded half away from zero to a multiple of 10^e (x itself when it is one already)
+fn toExp(x: &Decimal, e: int): Result[Decimal, DecError] {
+    if x.isZero() || x.exponent() >= e { return Ok(x.clone()) }
+    if e < -32767 || e > 32767 { return Err(DecError.Overflow) }
+    let unit = try Decimal.parse(&("1e" + e.toStr()))
+    let q = try x.div(&unit, 0, Rounding.HALF_AWAY)
+    return q.mulExact(&unit)
+}
+
+// the decimal digits ds (no leading zero, more than 38 of them) times 10^e, rounded half away from zero to 38 digits (up:
+// toward positive infinity)
+fn rounded38(ds: &str, e: int, neg: bool, up: bool): Result[Decimal, DecError] {
+    var m: u128 = 0
+    for i in 0..38 { m = m * 10 + u128(ds[i] - '0') }
+    var exp = e + len(ds) - 38
+    var more = ds[38] >= '5'
+    if up {
+        more = false
+        if !neg { for i in 38..len(ds) { if ds[i] != '0' { more = true } } }
+    }
+    if more {
+        m += 1
+        if m == TEN38 {
+            m = TEN37
+            exp += 1
+        }
+    }
+    if exp < -32768 || exp > 32767 { return Err(DecError.Overflow) }
+    return Decimal.parse(&((if neg { "-" } else { "" }) + m.toStr() + "e" + exp.toStr()))
+}
+
+fn pad19(x: u128): str {
+    let s = x.toStr()
+    return strings.repeat("0", 19 - len(s)) + s
+}
+
+fn digitsOf(x: u128): int {
+    var n = 0
+    var v = x
+    while v > 0 {
+        v = v / 10
+        n += 1
+    }
+    return n
+}

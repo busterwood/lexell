@@ -22,6 +22,7 @@ import "tz"
 import "task"
 import "fs"
 import "./lexdb_base"
+import "./lexdb_decfit"
 
 pub const DAY_US = 86400000000
 pub const INF = 9223372036854775807
@@ -345,7 +346,7 @@ pub fn settingZone(v: &str): Result[Zone, lexdb_base.DbErr] {
     }
     match hoursOf(&strings.trim(v)) {
         Some(d) {
-            match d.mul(Decimal.fromInt(3600)).toInt(Rounding.HALF_EVEN) {
+            match lexdb_decfit.mulFit(&d, &Decimal.fromInt(3600)).unwrapOr(Decimal.fromInt(1000000)).toInt(Rounding.HALF_EVEN) {
                 Ok(east) {
                     if east <= -168 * 3600 || east >= 168 * 3600 { return Err(badSetting(v)) }
                     return Ok(fixedZone(east))
@@ -995,26 +996,46 @@ fn unitOf(u: &str): str {
 fn addUnit(months: mut &int, days: mut &int, us: mut &int, n: &Decimal, u: &str, s: &str): Result[Unit, lexdb_base.DbErr] {
     if u == "us" || u == "ms" || u == "s" || u == "min" || u == "h" {
         let per = if u == "us" { 1 } else if u == "ms" { 1000 } else if u == "s" { SEC_US } else if u == "min" { 60 * SEC_US } else { 3600 * SEC_US }
-        us = us + (try roundInt(&n.mul(Decimal.fromInt(per)), s))
+        us = us + (try roundInt(&(try timesFit(n, per, s)), s))
         return Ok(Unit{})
     }
     if u == "d" || u == "w" {
-        let x = if u == "w" { n.mul(Decimal.fromInt(7)) } else { n }
+        let x = if u == "w" { try timesFit(n, 7, s) } else { n.clone() }
         let whole = try truncInt(&x, s)
         days = days + whole
         let rest = x.sub(Decimal.fromInt(whole))
-        us = us + (try roundInt(&rest.mul(Decimal.fromInt(DAY_US)), s))
+        us = us + (try roundInt(&(try timesFit(&rest, DAY_US, s)), s))
         return Ok(Unit{})
     }
     let per = if u == "mon" { 1 } else if u == "y" { 12 } else if u == "dec" { 120 } else if u == "c" { 1200 } else { 12000 }
-    let x = n.mul(Decimal.fromInt(per))
+    let x = try timesFit(n, per, s)
+    // a year's (a decade's ...) fraction is whole months, rounded half to even, nothing spilled (PostgreSQL's rint: '1.01
+    // years' is 1 year, '1.2345 years' 1 year 3 months); a month's fraction spills into days
+    if u != "mon" {
+        match x.toInt(Rounding.HALF_EVEN) {
+            Ok(m) { months = months + m }
+            Err(_) { return Err(range(&"interval", s)) }
+        }
+        return Ok(Unit{})
+    }
     let whole = try truncInt(&x, s)
     months = months + whole
-    let rest = x.sub(Decimal.fromInt(whole)).mul(Decimal.fromInt(30))
+    let rest = try timesFit(&x.sub(Decimal.fromInt(whole)), 30, s)
     let wd = try truncInt(&rest, s)
     days = days + wd
-    us = us + (try roundInt(&rest.sub(Decimal.fromInt(wd)).mul(Decimal.fromInt(DAY_US)), s))
+    us = us + (try roundInt(&(try timesFit(&rest.sub(Decimal.fromInt(wd)), DAY_US, s)), s))
     return Ok(Unit{})
+}
+
+// n times k, exact or rounded to 38 digits where the exact product has more (a fraction of 38 digits times a unit's
+// microseconds: Decimal's operator stopped the server); out of range past 38 integer digits.
+fn timesFit(n: &Decimal, k: int, s: &str): Result[Decimal, lexdb_base.DbErr] { return fitOf(lexdb_decfit.mulFit(n, &Decimal.fromInt(k)), s) }
+
+fn fitOf(r: Result[Decimal, DecError], s: &str): Result[Decimal, lexdb_base.DbErr] {
+    match r {
+        Ok(d) { return Ok(d) }
+        Err(_) { return Err(range(&"interval", s)) }
+    }
 }
 
 fn roundInt(d: &Decimal, s: &str): Result[int, lexdb_base.DbErr] {
@@ -1040,20 +1061,22 @@ pub fn ivalNeg(a: &Ival): Ival { return Ival{months: -a.months, days: -a.days, u
 // spill of a day or more of seconds goes to the days.
 pub fn ivalTimes(a: &Ival, f: &Decimal): Result[Ival, lexdb_base.DbErr] {
     let s: &str = "interval"
-    let mf = Decimal.fromInt(a.months).mul(f)
+    let mf = try fitOf(lexdb_decfit.mulFit(f, &Decimal.fromInt(a.months)), s)
     let months = try truncInt(&mf, s)
-    let mrd = round6(&mf.sub(Decimal.fromInt(months)).mul(Decimal.fromInt(30)))
-    let df = Decimal.fromInt(a.days).mul(f)
+    let mrd = round6(&(try timesFit(&mf.sub(Decimal.fromInt(months)), 30, s)))
+    let df = try fitOf(lexdb_decfit.mulFit(f, &Decimal.fromInt(a.days)), s)
     var days = try truncInt(&df, s)
     let mrdWhole = try truncInt(&mrd, s)
-    var secRem = round6(&df.sub(Decimal.fromInt(days)).add(mrd.sub(Decimal.fromInt(mrdWhole))).mul(Decimal.fromInt(86400)))
+    let dayRem = try fitOf(lexdb_decfit.addFit(&df.sub(Decimal.fromInt(days)), &mrd.sub(Decimal.fromInt(mrdWhole))), s)
+    var secRem = round6(&(try timesFit(&dayRem, 86400, s)))
     let dayCarry = try truncInt(&secRem, s) / 86400
     if dayCarry != 0 {
         days += dayCarry
         secRem = secRem.sub(Decimal.fromInt(dayCarry * 86400))
     }
     days += mrdWhole
-    let us = try roundInt(&Decimal.fromInt(a.us).mul(f).add(secRem.mul(Decimal.fromInt(SEC_US))), s)
+    let usf = try fitOf(lexdb_decfit.mulFit(f, &Decimal.fromInt(a.us)), s)
+    let us = try roundInt(&(try fitOf(lexdb_decfit.addFit(&usf, &(try timesFit(&secRem, SEC_US, s))), s)), s)
     return Ok(Ival{months: months, days: days, us: us})
 }
 

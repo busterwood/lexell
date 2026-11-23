@@ -1359,12 +1359,41 @@ fn randomRangeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[
     let b = lexdb_ops.asNum(&vs[1]).unwrapOr(Decimal.zero())
     if a.cmp(&b) > 0 { return Err(e("22023", "lower bound must be less than or equal to upper bound")) }
     let sc = if a.scale() > b.scale() { a.scale() } else { b.scale() }
-    // (the bounds as whole units of that scale)
+    return randomNum(&a, &b, sc)
+}
+
+// a numeric from a to b, of scale sc: the bounds as whole units of that scale, a draw below their span (up to 10^38 units;
+// it was an integer's, and a span past one was a division by zero that stopped the server); 22003 past 38 digits, as
+// PostgreSQL's "value overflows numeric format" for what its numeric holds and lexdb's does not.
+fn randomNum(a: &Decimal, b: &Decimal, sc: int): Result[Val, DbErr] {
+    let over = e("22003", "value overflows numeric format")
+    if sc > 38 { return Err(over) }
     let unit = Decimal.fromUnits(1, sc)
-    let la = a.div(unit, 0, Rounding.HALF_EVEN).unwrapOr(Decimal.zero()).toInt(Rounding.TOWARD_ZERO).unwrapOr(0)
-    let lb = b.div(unit, 0, Rounding.HALF_EVEN).unwrapOr(Decimal.zero()).toInt(Rounding.TOWARD_ZERO).unwrapOr(0)
-    let pick = la + (try randomBelow(lb - la + 1))
-    return Ok(Val.Num(Decimal.fromUnits(pick, sc)))
+    let la = match a.div(unit, 0, Rounding.HALF_EVEN) { Ok(x) { x } Err(_) { return Err(over) } }
+    let lb = match b.div(unit, 0, Rounding.HALF_EVEN) { Ok(x) { x } Err(_) { return Err(over) } }
+    let span = match lb.subExact(la) { Ok(x) { x.addExact(Decimal.fromInt(1)).unwrapOr(Decimal.zero()) } Err(_) { Decimal.zero() } }
+    if span.isZero() { return Err(over) }
+    var m = span.coefficient()
+    for _ in 0..span.exponent() { m = m * 10 }
+    // 128 random bits below the largest multiple of the span, then their remainder: no bias
+    let top: u128 = 0xffffffffffffffffffffffffffffffff
+    let lim = top - top % m
+    var x = lim
+    while x >= lim {
+        let r = try randomBytes(16)
+        x = 0
+        for i in 0..16 { x = x << 8 | u128(r[i]) }
+    }
+    let pick = match Decimal.fromI128(i128(x % m)) { Ok(p) { p } Err(_) { return Err(over) } }
+    match la.addExact(pick) {
+        Ok(u) {
+            match u.mulExact(unit) {
+                Ok(v) { return Ok(Val.Num(v)) }
+                Err(_) { return Err(over) }
+            }
+        }
+        Err(_) { return Err(over) }
+    }
 }
 
 // int::bytea (18): its bytes big-endian, as many as its type's width (the binder's second argument).
