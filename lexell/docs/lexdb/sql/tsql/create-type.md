@@ -119,14 +119,14 @@ GO
 ```
 
 ```text
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "#tv_ids_pkey"
+Msg 2627, Level 14, State 1, Line 2
+Violation of PRIMARY KEY constraint '#tv_ids_pkey'. Cannot insert duplicate key in object 'pg_temp_4.#tv_ids'. The duplicate key value is (1).
 Msg 219, Level 16, State 1, Line 1
 The type 'dbo.id_list' already exists, or you do not have permission to create it.
-Msg 218, Level 16, State 1, Line 1
+Msg 218, Level 16, State 1, Line 2
 Could not find the type 'dbo.nothere'. Either it does not exist or you do not have the necessary permission.
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'from'.
+Incorrect syntax near the keyword 'FROM'.
 ```
 
 ## See also
