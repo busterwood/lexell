@@ -801,3 +801,30 @@ The compile suite's +0.09% is the new analysis. What remains in `nbody` (4.92G i
 Test: tests/run/native_float_targets (a destination read on the right, nested sqrt and
 quotients, stores to an element then reads through an equal index, an index reassigned between
 uses, a float converted to an index).
+
+## 21. sortBy and str.cmp (library, as built)
+
+`closures` (three stable sorts of 200,000 records with comparator closures) ran 2.2 times
+Rust's time. Its profile: the merge loop 37%, `rt_str_cmp` 20%, the comparators 21%, the
+permutation's swaps 7%.
+
+- **str.cmp compared twice**: `cmpOf(a < b, a > b)`, two calls of `rt_str_cmp` for every
+  unequal pair. `strCmp` is now an intrinsic for the runtime's three-way comparison (added to
+  the compiler first, a commit of its own, so that the seed knows it before std uses it), and
+  `str.cmp` calls it once.
+- **sortBy** (collections.lxl) still sorts indices and permutes the elements at the end (T may
+  be owned), but sorts runs of 16 by insertion first, merges between two index arrays instead
+  of copying each merged run back, takes two runs already in order as they are (one comparison
+  at their boundary: the second sort in `closures` starts from key order), and keeps the current
+  left and right indices in locals.
+
+| measure (main e0c96b21 against this) | instructions | cycles |
+|---|---:|---:|
+| bench closures (5 interleaved rounds) | -28% | -25% |
+| apps regex / json / jq / cmark / decimal | 0.00% each | +0.1 / -0.2 / +1.0 / 0.0 / 0.0% |
+| TPC-H SF1, server instructions per query (22) | -0.33% geomean (q12 -1.8, q22 -1.8, q19 -1.3, q8 -1.1) | |
+| lexdb point select (icount6, 2 alternated rounds) | level (172,309 to 172,315) | +0.3% |
+
+Test: lib/tests/run/collections_sortby_stable (320 cases: sizes around the run and merge widths,
+few and many distinct keys, ascending, descending and equal inputs, owned strings; stable, a
+permutation, sorted, leak-free).
