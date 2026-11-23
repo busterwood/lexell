@@ -132,7 +132,7 @@ id d          t            dt                    dt2
 Msg 517, Level 16, State 1, Line 1
 date/time field value out of range: "2026-02-30"
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "hello"
+Conversion failed when converting date and/or time from character string.
 ```
 
 ### D. datetimeoffset is stored as UTC
@@ -237,7 +237,7 @@ next_day   next_month days_between
 
 (1 row affected)
 
-Msg 195, Level 16, State 1, Line 1
+Msg 195, Level 15, State 1, Line 1
 operator does not exist: timestamp without time zone + bigint
 difference
 --------------
@@ -273,11 +273,11 @@ iso_t                 short_form
 (1 row affected)
 
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "20260315"
+Conversion failed when converting date and/or time from character string.
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "March 15, 2026"
+Conversion failed when converting date and/or time from character string.
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type date: "03/15/2026"
+Conversion failed when converting date and/or time from character string.
 ```
 
 ### J. Other refusals
@@ -293,11 +293,11 @@ SELECT ISDATE('2026-03-15');
 
 ```text
 Msg 241, Level 16, State 1, Line 1
-invalid input syntax for type time without time zone: "2026-03-15 13:45:30"
+Conversion failed when converting date and/or time from character string.
 Msg 1002, Level 16, State 1, Line 1
 Line 1: Specified scale 8 is invalid.
-Msg 195, Level 16, State 1, Line 1
-function isdate with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'isdate' is not a recognized built-in function name.
 ```
 
 ## See also
