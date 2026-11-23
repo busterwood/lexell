@@ -248,4 +248,4 @@ ORA-00900: invalid SQL statement
 ## See also
 
 [UPDATE](update.md) · [DELETE](delete.md) · [MERGE](merge.md) · [SELECT](select.md) · [CREATE SEQUENCE](create-sequence.md) ·
-[PL/SQL blocks](plsql-block.md) · [Array DML](../../bulk-load.md#oracle-array-dml)
+[PL/SQL blocks](plsql-blocks.md) · [Array DML](../../bulk-load.md#oracle-array-dml)
