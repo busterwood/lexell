@@ -23,7 +23,33 @@ pub fn readOnlyErr(door: &str, what: &str): DbErr {
     return lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))
 }
 
-pub const ORA_READ_ONLY = "Attempting to modify database or pluggable database that is open for read-only access."
+// Whether a write statement may run on a replica after all: in the SQL
+// Server door, one on #temporary tables and table variables (#@t, #tv_t),
+// which a readable secondary allows (they live in tempdb; 9.137 phase 5):
+// CREATE TABLE and SELECT INTO, DROP, INSERT, UPDATE, DELETE, MERGE,
+// TRUNCATE, ALTER TABLE and CREATE INDEX whose tables are all such. Their
+// writes go to the replica's temporary storage (lexdb_tmpstore); a write to
+// anything else fails at the commit, as any on a replica. The PostgreSQL
+// door refuses temporary tables (25006), as a standby does; the Oracle
+// door has no temporary table the master defined (CREATE GLOBAL TEMPORARY
+// TABLE makes a session's own, as PostgreSQL's), and refuses making one
+// (ORA-16000).
+pub fn tempWriteOk(door: &str, s: &lexdb_sql.Stmt): bool {
+    if door != "tds" { return false }
+    let k = s.kind
+    if k != lexdb_sql.S_CREATE && k != lexdb_sql.S_DROP && k != lexdb_sql.S_INSERT && k != lexdb_sql.S_UPDATE && k != lexdb_sql.S_DELETE &&
+       k != lexdb_sql.S_MERGE && k != lexdb_sql.S_TRUNCATE && k != lexdb_sql.S_ALTER && k != lexdb_sql.S_CREATE_INDEX {
+        return false
+    }
+    if !isTempName(&s.table) { return false }
+    if k == lexdb_sql.S_DROP || k == lexdb_sql.S_TRUNCATE { for n in s.names { if !isTempName(&n) { return false } } }
+    return true
+}
+
+// A T-SQL #temporary table's (or table variable's) name: # and not ##.
+fn isTempName(n: &str): bool { return len(n) > 1 && n[0] == '#' && n[1] != '#' }
+
+pub const ORA_READ_ONLY ="Attempting to modify database or pluggable database that is open for read-only access."
 
 // SQL Server's 3906 for lexdb's database.
 pub fn tsqlReadOnly(): str { return "Failed to update database \"lexdb\" because the database is read-only." }

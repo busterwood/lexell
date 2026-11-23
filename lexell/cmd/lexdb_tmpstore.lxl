@@ -1,0 +1,306 @@
+// lexdb_tmpstore: a replica's temporary storage (design/lexdb.md 9.137,
+// phase 5). A replica's store takes no writes: its trees are the master's,
+// read through the follower. A session's temporary objects there (the SQL
+// Server door's #temp tables and table variables) live here instead, in
+// memory, never in the log:
+// - local trees, numbered from LOCAL_BASE, a range the master's trees never
+//   reach (its trees count up from 1, one per table, index or TRUNCATE),
+//   below 2^31: the catalog keeps a tree's id in 32 bits;
+// - per temporary schema (pg_temp_N), its catalog rows: the catalog keys
+//   lexdb_base.tempCatKey gives as that schema's.
+// The store's replica view (lexdb_store, View.Repl) reads them over the
+// follower's trees for a transaction whose session has a temporary schema,
+// and a replica's commit of writes that are all to them applies them here.
+// Values are kept whole, as a transaction's own writes are (no chunks).
+import "task"
+import "collections"
+import "./lexdb_base"
+
+// The first local tree id.
+pub const LOCAL_BASE: int = 1 << 30
+
+// Whether tree is a local tree (not one of the master's).
+pub fn isLocal(tree: int): bool { return tree >= LOCAL_BASE && tree < 2 * LOCAL_BASE }
+
+// The temporary schema whose catalog row k is ("" for a key of none): the
+// schema part of a key tempCatKey takes as temporary.
+pub fn schemaOfKey(k: &str): str {
+    if !lexdb_base.tempCatKey(k) { return "" }
+    var at = 0
+    if k[0] == 1 || k[0] == 4 { at = 1 }
+    else if k[0] == 2 && len(k) > 7 && k[0..7] == "\x02acl\x00r:" { at = 7 }
+    else if k[0] == 2 { at = 6 }
+    var i = at
+    while i < len(k) && k[i] != 0x1f { i += 1 }
+    return k[at..i].toStr()
+}
+
+// ---- a sorted map in runs: each run's keys sorted, the runs in order, a
+// run split in two past RUN_MAX keys. A put or a delete costs a binary
+// search over the runs and one in its run, and moves at most RUN_MAX
+// entries.
+
+const RUN_MAX: int = 512
+
+type Run = record { keys: []str; vals: []str }
+
+type Sorted = record { runs: []Run }
+
+fn newSorted(): Sorted { return Sorted{runs: []} }
+
+// The run that would hold k: the last whose first key is not above k (0
+// when k is below every run's), -1 for none.
+fn (s: &Sorted) runOf(k: &str): int {
+    if len(s.runs) == 0 { return -1 }
+    var lo = 0
+    var hi = len(s.runs)
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if s.runs[mid].keys[0] <= k { lo = mid } else { hi = mid }
+    }
+    return lo
+}
+
+fn (s: &Sorted) get(k: &str): Option[str] {
+    let r = s.runOf(k)
+    if r < 0 { return None }
+    let i = collections.lowerBound(&s.runs[r].keys, k)
+    if i < len(s.runs[r].keys) && s.runs[r].keys[i] == k { return Some(s.runs[r].vals[i].clone()) }
+    return None
+}
+
+fn (s: mut &Sorted) put(k: &str, v: &str) {
+    var r = s.runOf(k)
+    if r < 0 {
+        append(mut &s.runs, Run{keys: [k.toStr()], vals: [v.toStr()]})
+        return
+    }
+    let i = collections.lowerBound(&s.runs[r].keys, k)
+    if i < len(s.runs[r].keys) && s.runs[r].keys[i] == k {
+        s.runs[r].vals[i] = v.toStr()
+        return
+    }
+    collections.insert(mut &s.runs[r].keys, i, k.toStr())
+    collections.insert(mut &s.runs[r].vals, i, v.toStr())
+    let n = len(s.runs[r].keys)
+    if n > RUN_MAX {
+        let h = n / 2
+        let nk = collections.copyRange(&s.runs[r].keys, h, n)
+        let nv = collections.copyRange(&s.runs[r].vals, h, n)
+        while len(s.runs[r].keys) > h {
+            let a = pop(mut &s.runs[r].keys)
+            let b = pop(mut &s.runs[r].vals)
+        }
+        collections.insert(mut &s.runs, r + 1, Run{keys: nk, vals: nv})
+    }
+}
+
+fn (s: mut &Sorted) del(k: &str) {
+    let r = s.runOf(k)
+    if r < 0 { return }
+    let i = collections.lowerBound(&s.runs[r].keys, k)
+    if i < len(s.runs[r].keys) && s.runs[r].keys[i] == k {
+        let a = collections.removeAt(mut &s.runs[r].keys, i)
+        let b = collections.removeAt(mut &s.runs[r].vals, i)
+        if len(s.runs[r].keys) == 0 { let c = collections.removeAt(mut &s.runs, r) }
+    }
+}
+
+// Removes the keys of [lo, hi) (hi "": to the end).
+fn (s: mut &Sorted) delRange(lo: &str, hi: &str) {
+    var keep: []Run = []
+    for run in s.runs {
+        var ks: []str = []
+        var vs: []str = []
+        for i in 0..len(run.keys) {
+            if run.keys[i] >= lo && (len(hi) == 0 || run.keys[i] < hi) { continue }
+            append(mut &ks, run.keys[i].clone())
+            append(mut &vs, run.vals[i].clone())
+        }
+        if len(ks) > 0 { append(mut &keep, Run{keys: ks, vals: vs}) }
+    }
+    s.runs = keep
+}
+
+// Up to most entries of [from, to) (to "": to the end), from from up,
+// appended to ks and vs.
+fn (s: &Sorted) range(from: &str, to: &str, most: int, ks: mut &[]str, vs: mut &[]str) {
+    var r = s.runOf(from)
+    if r < 0 { return }
+    var i = collections.lowerBound(&s.runs[r].keys, from)
+    var n = 0
+    while r < len(s.runs) && n < most {
+        if i >= len(s.runs[r].keys) {
+            r += 1
+            i = 0
+            continue
+        }
+        let k = &s.runs[r].keys[i]
+        if len(to) > 0 && k >= to { return }
+        append(ks, k.clone())
+        append(vs, s.runs[r].vals[i].clone())
+        n += 1
+        i += 1
+    }
+}
+
+// Up to most entries of [from, to) (to "": to the end), from the last below
+// to down, appended to ks and vs.
+fn (s: &Sorted) rangeBack(from: &str, to: &str, most: int, ks: mut &[]str, vs: mut &[]str) {
+    if len(s.runs) == 0 { return }
+    var r = len(s.runs) - 1
+    var i = len(s.runs[r].keys) - 1
+    if len(to) > 0 {
+        r = s.runOf(to)
+        i = collections.lowerBound(&s.runs[r].keys, to) - 1
+    }
+    var n = 0
+    while r >= 0 && n < most {
+        if i < 0 {
+            r -= 1
+            if r >= 0 { i = len(s.runs[r].keys) - 1 }
+            continue
+        }
+        let k = &s.runs[r].keys[i]
+        if k < from { return }
+        append(ks, k.clone())
+        append(vs, s.runs[r].vals[i].clone())
+        n += 1
+        i -= 1
+    }
+}
+
+// ---- the replica's temporary storage: every session's, under one lock
+
+type State = record {
+    next: int                   // the next local tree id
+    trees: Map[int, Sorted]     // local trees
+    owner: Map[int, str]        // a local tree's temporary schema
+    cats: Map[str, Sorted]      // per temporary schema, its catalog rows
+}
+
+pub type Tmps = value record { sh: task.Shared[State] }
+
+pub fn newTmps(): Tmps {
+    return Tmps{sh: task.shared(State{next: LOCAL_BASE, trees: newMap(), owner: newMap(), cats: newMap()})}
+}
+
+// Another handle to the same storage (a handle: clone, a copy, does not apply).
+pub fn (m: &Tmps) share(): Tmps { return Tmps{sh: m.sh.share()} }
+
+// A new local tree's id (the tree is made when its transaction commits: create).
+pub fn (m: &Tmps) newId(): int {
+    var id = 0
+    m.sh.with(fn(s: mut &State) {
+        id = s.next
+        s.next += 1
+    })
+    return id
+}
+
+// The value of key in local tree tree, or in schema sc's catalog rows when
+// tree is not local.
+pub fn (m: &Tmps) get(tree: int, sc: &str, key: &str): Option[str] {
+    var out: Option[str] = None
+    m.sh.with(fn(s: mut &State) {
+        if isLocal(tree) {
+            match s.trees.find(&tree) {
+                Some(t) { out = t.get(key) }
+                None {}
+            }
+        } else {
+            match s.cats.find(sc) {
+                Some(t) { out = t.get(key) }
+                None {}
+            }
+        }
+    })
+    return out
+}
+
+// Up to most entries of [from, to) of local tree tree (or of sc's catalog
+// rows), ascending from from, or descending from below to (back).
+pub fn (m: &Tmps) range(tree: int, sc: &str, from: &str, to: &str, back: bool, most: int, ks: mut &[]str, vs: mut &[]str) {
+    m.sh.with(fn(s: mut &State) {
+        if isLocal(tree) {
+            match s.trees.find(&tree) {
+                Some(t) { if back { t.rangeBack(from, to, most, ks, vs) } else { t.range(from, to, most, ks, vs) } }
+                None {}
+            }
+        } else {
+            match s.cats.find(sc) {
+                Some(t) { if back { t.rangeBack(from, to, most, ks, vs) } else { t.range(from, to, most, ks, vs) } }
+                None {}
+            }
+        }
+    })
+}
+
+// A committed write of schema sc's session: a put (del false) or a delete
+// of key in local tree tree, or in sc's catalog rows when tree is not local.
+pub fn (m: &Tmps) write(tree: int, sc: &str, key: &str, val: &str, del: bool) {
+    m.sh.with(fn(s: mut &State) {
+        if isLocal(tree) {
+            if !s.trees.has(&tree) { return }
+            let t = s.trees.atMut(&tree)
+            if del { t.del(key) } else { t.put(key, val) }
+        } else {
+            let t = s.cats.atOrPut(sc.toStr(), newSorted())
+            if del { t.del(key) } else { t.put(key, val) }
+        }
+    })
+}
+
+// A range delete of local tree tree: its keys in [lo, hi) (hi "": to the end).
+pub fn (m: &Tmps) delRange(tree: int, lo: &str, hi: &str) {
+    m.sh.with(fn(s: mut &State) {
+        if s.trees.has(&tree) { s.trees.atMut(&tree).delRange(lo, hi) }
+    })
+}
+
+// Local tree tree made (empty), schema sc's.
+pub fn (m: &Tmps) create(tree: int, sc: &str) {
+    m.sh.with(fn(s: mut &State) {
+        s.trees.put(tree, newSorted())
+        s.owner.put(tree, sc.toStr())
+    })
+}
+
+// Local tree tree dropped.
+pub fn (m: &Tmps) dropTree(tree: int) {
+    m.sh.with(fn(s: mut &State) {
+        let a = s.trees.remove(&tree)
+        let b = s.owner.remove(&tree)
+    })
+}
+
+// Everything of schema sc gone (its session ended): its catalog rows and its trees.
+pub fn (m: &Tmps) dropSchema(sc: &str) {
+    m.sh.with(fn(s: mut &State) {
+        let c = s.cats.remove(sc)
+        var gone: []int = []
+        for i in 0..s.owner.size() {
+            if s.owner.valAt(i) == sc {
+                let id: int = s.owner.keyAt(i)
+                append(mut &gone, id)
+            }
+        }
+        for t in gone {
+            let a = s.trees.remove(&t)
+            let b = s.owner.remove(&t)
+        }
+    })
+}
+
+// The local trees and catalog rows held (for the tests): trees, rows of trees, catalog rows.
+pub fn (m: &Tmps) counts(): []int {
+    var out: []int = []
+    m.sh.with(fn(s: mut &State) {
+        var rows = 0
+        for i in 0..s.trees.size() { for r in s.trees.valAt(i).runs { rows += len(r.keys) } }
+        var cat = 0
+        for i in 0..s.cats.size() { for r in s.cats.valAt(i).runs { cat += len(r.keys) } }
+        out = [s.trees.size(), rows, cat]
+    })
+    return out
+}

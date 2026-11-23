@@ -1,0 +1,279 @@
+// Temporary objects on a read-only replica (design/lexdb.md 9.137, phase 5): a master and a replica store in one
+// process (the simulated files shared, the replica polled by hand), the replica's TDS listener reached with
+// lib/sqlserver. A readable secondary allows #temp tables, SELECT ... INTO #x and table variables (they live in
+// tempdb), and so does lexdb's replica, keeping them in its temporary storage (lexdb_tmpstore), never in the log.
+// Session A's batches (#temp tables with an index, an identity, text keys; joins with the replicated tables; SELECT
+// INTO; table variables; MERGE, TRUNCATE, ALTER, DROP; a transaction rolled back, a savepoint; errors: a duplicate
+// key, a division by zero in a later row, writes to the replicated tables (3906)) run twice, in two sessions at once,
+// one with SET lexdb_batch = off and one with it on: "same" and the answer, or DIFFERENT and both. Run with
+// LEXDB_MSSQL set to a connection string, it runs them against SQL Server 2022 in a database set READ_ONLY (the
+// nearest a container comes to a readable secondary): those are the "same", "b" and "a again" lines. Then (lexdb's
+// own) a session B does not see A's #a and makes its own; the master commits while A holds temporary rows, the
+// replica catches up, and A's join sees the new row with its own rows kept; the temporary storage empties as the
+// sessions end; the master's session of A's number has its own #temporary table, which A never sees.
+// expect: same: ok
+// expect: same: ok
+// expect: same: (4)
+// expect: same: id,v,n: 1|'x'|10;2|NULL|NULL;3|'x'|30;4|'y'|40
+// expect: same: id: 1;3
+// expect: same: (2)
+// expect: same: (1)
+// expect: same: c,s: 3|42
+// expect: same: error 2627
+// expect: same: id,name,v: 1|'a'|'x';2|'b'|NULL;3|'c'|'x'
+// expect: same: id: 
+// expect: same: (2)
+// expect: same: id,name: 2|'b';3|'c'
+// expect: same: (3) / s,c: NULL|1;'p'|2 / name: 'b'
+// expect: same: error 2627
+// expect: same: (1) / k: 2
+// expect: same: ok
+// expect: same: (3) / id,s: 1|'p';2|'q';3|NULL
+// expect: same: ok
+// expect: same: (2)
+// expect: same: error 2627
+// expect: same: k,n: 'x'|1;'y'|NULL
+// expect: same: k,n: 
+// expect: same: (1) / c: 3
+// expect: same: (1) / (1) / id: 1;2;3;6
+// expect: same: error 8134
+// expect: same: c: 4
+// expect: same: error 3906
+// expect: same: error 3906
+// expect: same: c: 1
+// expect: same: (3) / id,v,n: 1|'x'|0;2|NULL|0;3|'x'|0;6|'w'|60;100|'a'|NULL
+// expect: same: c: 0
+// expect: same: ok
+// expect: same: (1) / id,name,extra: 7|'e'|70
+// expect: same: ok
+// expect: same: error 208
+// expect: same: (1) / (1) / id: 100;8;6;3;1 / id: 100;6;3;2;1
+// expect: same: (2) / a: 2;1 / c: 2
+// expect: same: id: 100;6
+// expect: same: (10)
+// expect: same: (1500)
+// expect: same: c,s,lo,hi: 1500|1125750|1|1500
+// expect: same: g,c: 0|214;1|215;2|215;3|214;4|214;5|214;6|214
+// expect: same: i: 1500;1499;1498
+// expect: same: (500)
+// expect: same: ok
+// expect: same: c,s: 142|106287
+// expect: same: (466) / c: 466
+// expect: same: i,name: 695|'c';688|'b';674|'c'
+// expect: same: (133) / c,lo: 867|200
+// expect: same: (67) / c,hi: 800|1399 / c,hi: 867|1499
+// expect: same: (3) / id,n,e: 1|100000|'ab';2|NULL|NULL;3|0|''
+// expect: same: (1) / n,e: 100002|'abcd'
+// expect: same: error 3906
+// expect: same: error 3906
+// expect: b: error 208
+// expect: b: ok
+// expect: b: (1) / id: 99
+// expect: b: c: 1
+// expect: a again: c: 5
+// expect: master's #m: c: 1; replica's session of that number: error 208
+// expect: storage: 3 sessions' trees 21, rows 3531
+// expect: caught up: id,v: 1|'x';2|NULL;3|'x';4|NULL; #a still c: 5
+// expect: after B: trees 20, rows 3530
+// expect: after the A sessions: [0, 0, 0]
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const SETUP = "CREATE TABLE t (id int PRIMARY KEY, name nvarchar(20) NULL)\nINSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')\nCREATE TABLE u (k nvarchar(10) PRIMARY KEY, n int NULL)\nINSERT INTO u VALUES ('x', 1), ('y', NULL)"
+
+// session A's batches, one a line
+const A = "CREATE TABLE #a (id int PRIMARY KEY, v nvarchar(10) NULL, n int NULL)\nCREATE INDEX ix_a ON #a (v)\nINSERT INTO #a VALUES (1, 'x', 10), (2, NULL, NULL), (3, 'x', 30), (4, 'y', 40)\nSELECT id, v, n FROM #a ORDER BY id\nSELECT id FROM #a WHERE v = 'x' ORDER BY id\nUPDATE #a SET n = n + 1 WHERE v = 'x'\nDELETE FROM #a WHERE id = 4\nSELECT COUNT(*) AS c, SUM(n) AS s FROM #a\nINSERT INTO #a VALUES (1, 'dup', 0)\nSELECT t.id, t.name, a.v FROM t JOIN #a a ON a.id = t.id ORDER BY t.id\nSELECT t.id FROM t LEFT JOIN #a a ON a.id = t.id WHERE a.id IS NULL ORDER BY t.id\nSELECT id, name INTO #b FROM t WHERE id > 1\nSELECT id, name FROM #b ORDER BY id\nDECLARE @tv TABLE (k int PRIMARY KEY, s nvarchar(5) NULL); INSERT INTO @tv VALUES (1, 'p'), (2, NULL), (3, 'p'); SELECT s, COUNT(*) AS c FROM @tv GROUP BY s ORDER BY s; SELECT t.name FROM @tv v JOIN t ON t.id = v.k WHERE v.s IS NULL\nDECLARE @tv TABLE (k int PRIMARY KEY); INSERT INTO @tv VALUES (1), (1)\nDECLARE @tv TABLE (k int PRIMARY KEY); INSERT INTO @tv VALUES (2); SELECT k FROM @tv\nCREATE TABLE #c (id int IDENTITY(1, 1) PRIMARY KEY, s nvarchar(5) NULL)\nINSERT INTO #c (s) VALUES ('p'), ('q'), (NULL); SELECT id, s FROM #c ORDER BY id\nCREATE TABLE #d (k nvarchar(10) PRIMARY KEY, n int NULL)\nINSERT INTO #d SELECT k, n FROM u\nINSERT INTO #d VALUES ('X', 5)\nSELECT k, n FROM #d ORDER BY k\nSELECT k, n FROM #d WHERE n > 100\nBEGIN TRANSACTION; INSERT INTO #a VALUES (5, 'z', 50); ROLLBACK; SELECT COUNT(*) AS c FROM #a\nBEGIN TRANSACTION; INSERT INTO #a VALUES (6, 'w', 60); SAVE TRANSACTION s1; INSERT INTO #a VALUES (7, 'w', 70); ROLLBACK TRANSACTION s1; COMMIT; SELECT id FROM #a ORDER BY id\nINSERT INTO #a SELECT id + 10, name, 1 / (id - 3) FROM t\nSELECT COUNT(*) AS c FROM #a\nUPDATE t SET name = 'no' WHERE id = 1\nINSERT INTO #a SELECT 100, name, NULL FROM t WHERE id = 1; INSERT INTO t VALUES (9, 'no')\nSELECT COUNT(*) AS c FROM #a WHERE id = 100\nMERGE #a AS d USING t AS s ON d.id = s.id WHEN MATCHED THEN UPDATE SET n = 0 WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.name, -1); SELECT id, v, n FROM #a ORDER BY id\nTRUNCATE TABLE #b; SELECT COUNT(*) AS c FROM #b\nALTER TABLE #b ADD extra int NULL\nINSERT INTO #b (id, name, extra) VALUES (7, 'e', 70); SELECT id, name, extra FROM #b\nDROP TABLE #b\nSELECT id FROM #b\nBEGIN TRANSACTION; INSERT INTO #a VALUES (8, 'q', 80); DELETE FROM #a WHERE id = 2; SELECT id FROM #a ORDER BY id DESC; ROLLBACK; SELECT id FROM #a ORDER BY id DESC\nBEGIN TRANSACTION; CREATE TABLE #e (a int PRIMARY KEY); INSERT INTO #e VALUES (1), (2); SELECT a FROM #e ORDER BY a DESC; COMMIT; SELECT COUNT(*) AS c FROM #e\nSELECT TOP 2 id FROM #a WHERE id > 1 ORDER BY id DESC\nCREATE TABLE #dg (d int); INSERT INTO #dg VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)\nSELECT i, i % 7 AS g INTO #big FROM (SELECT p.d + q.d * 10 + r.d * 100 + w.d * 1000 + 1 AS i FROM #dg p CROSS JOIN #dg q CROSS JOIN #dg r CROSS JOIN #dg w) n WHERE i <= 1500\nSELECT COUNT(*) AS c, SUM(i) AS s, MIN(i) AS lo, MAX(i) AS hi FROM #big\nSELECT g, COUNT(*) AS c FROM #big GROUP BY g ORDER BY g\nSELECT TOP 3 i FROM #big ORDER BY i DESC\nDELETE FROM #big WHERE i % 3 = 0\nCREATE INDEX ix_big ON #big (g)\nSELECT COUNT(*) AS c, SUM(i) AS s FROM #big WHERE g = 3\nUPDATE #big SET g = g + 10 WHERE i < 700; SELECT COUNT(*) AS c FROM #big WHERE g >= 10\nSELECT TOP 3 b.i, t.name FROM #big b JOIN t ON t.id = b.i % 3 + 1 WHERE b.g = 12 ORDER BY b.i DESC\nDELETE FROM #big WHERE i < 200; SELECT COUNT(*) AS c, MIN(i) AS lo FROM #big\nBEGIN TRANSACTION; DELETE FROM #big WHERE i >= 1400; SELECT COUNT(*) AS c, MAX(i) AS hi FROM #big; ROLLBACK; SELECT COUNT(*) AS c, MAX(i) AS hi FROM #big\nCREATE TABLE #l (id int PRIMARY KEY, s nvarchar(max) NULL); INSERT INTO #l VALUES (1, REPLICATE(CAST(N'ab' AS nvarchar(max)), 50000)), (2, NULL), (3, N''); SELECT id, LEN(s) AS n, SUBSTRING(s, 99999, 2) AS e FROM #l ORDER BY id\nUPDATE #l SET s = s + N'cd' WHERE id = 1; SELECT LEN(s) AS n, RIGHT(s, 4) AS e FROM #l WHERE id = 1\nCREATE TABLE t2 (a int)\nSELECT * INTO t3 FROM t"
+
+// session B's, while A's are there
+const B = "SELECT COUNT(*) AS c FROM #a\nCREATE TABLE #a (id int PRIMARY KEY)\nINSERT INTO #a VALUES (99); SELECT id FROM #a\nSELECT COUNT(*) AS c FROM #a"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and row counts, in order; or its error
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn conn(dsn: &str): sqlserver.Conn { return sqlserver.connect(dsn).unwrap() }
+
+fn runAll(c: mut &sqlserver.Conn, text: &str): []str {
+    var out: []str = []
+    for q in strings.lines(text) { append(mut &out, show(c, &q)) }
+    return out
+}
+
+// SQL Server: the tables in a database of their own, set READ_ONLY; A's and B's batches there
+fn oracle(dsn: &str) {
+    var m = conn(dsn)
+    for q in ["IF DB_ID('lexdb_tmprep') IS NOT NULL BEGIN ALTER DATABASE lexdb_tmprep SET READ_WRITE WITH ROLLBACK IMMEDIATE; DROP DATABASE lexdb_tmprep END",
+              "CREATE DATABASE lexdb_tmprep"] {
+        let r = show(mut &m, &q)
+        if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+    }
+    let db = dsn + ";Database=lexdb_tmprep"
+    var s = conn(&db)
+    let setup: str = SETUP
+    for q in strings.lines(&setup) { let r = show(mut &s, &q) }
+    s.close()
+    let ro = show(mut &m, &"ALTER DATABASE lexdb_tmprep SET READ_ONLY WITH ROLLBACK IMMEDIATE")
+    var a = conn(&db)
+    let a1 = A
+    for r in runAll(mut &a, &a1) { println("same: " + r) }
+    var b = conn(&db)
+    let b1 = B
+    for r in runAll(mut &b, &b1) { println("b: " + r) }
+    b.close()
+    println("a again: " + show(mut &a, &"SELECT COUNT(*) AS c FROM #a"))
+    a.close()
+    let d = show(mut &m, &"ALTER DATABASE lexdb_tmprep SET READ_WRITE WITH ROLLBACK IMMEDIATE; DROP DATABASE lexdb_tmprep")
+    m.close()
+}
+
+fn countsText(xs: &[]int): str {
+    var out: []str = []
+    for n in xs { append(mut &out, n.toStr()) }
+    return "[" + strings.join(&out, ", ") + "]"
+}
+
+// The temporary storage's counts once they differ from was (a closed connection's session ends in the server's
+// task, after the client has gone): at most 5 s.
+fn settled(rep: &lexdb_store.Store, was: &[]int): []int {
+    for i in 0..500 {
+        let c = rep.tmpCounts()
+        if countsText(&c) != countsText(was) { return c }
+        let r = task.sleep(10)
+    }
+    return rep.tmpCounts()
+}
+
+fn spid(c: mut &sqlserver.Conn): str { return show(c, &"SELECT @@SPID AS s") }
+
+fn lexdbRun(st: &lexdb_store.Store, rep: &lexdb_store.Store, mdsn: &str, dsn: &str) {
+    var off = conn(dsn)
+    var on = conn(dsn)
+    // the master's session of off's number holds a #temporary table: replicated, it is another session's
+    var ms = conn(mdsn)
+    var spare: []sqlserver.Conn = []
+    while spid(mut &ms) != spid(mut &off) && len(spare) < 8 {
+        append(mut &spare, ms)
+        ms = conn(mdsn)
+    }
+    let mk = show(mut &ms, &"CREATE TABLE #m (a int); INSERT INTO #m VALUES (1)")
+    let n0 = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+    let x = show(mut &off, &"SET lexdb_batch = off")
+    let y = show(mut &on, &"SET lexdb_batch = on")
+    let a1 = A
+    let ro = runAll(mut &off, &a1)
+    let rb = runAll(mut &on, &a1)
+    let qs = strings.split(&a1, "\n")
+    for i in 0..len(ro) {
+        if ro[i] == rb[i] { println("same: " + rb[i]) } else {
+            println("DIFFERENT: " + qs[i])
+            println("  rows:    " + ro[i])
+            println("  batches: " + rb[i])
+        }
+    }
+    var b = conn(dsn)
+    let b1 = B
+    for r in runAll(mut &b, &b1) { println("b: " + r) }
+    println("a again: " + show(mut &off, &"SELECT COUNT(*) AS c FROM #a"))
+    println("master's #m: " + show(mut &ms, &"SELECT COUNT(*) AS c FROM #m") + "; replica's session of that number: " + show(mut &off, &"SELECT a FROM #m"))
+    let c1 = rep.tmpCounts()
+    println("storage: 3 sessions' trees " + c1[0].toStr() + ", rows " + c1[1].toStr())
+    // the master commits while the sessions hold temporary rows; the replica applies it
+    let w = show(mut &ms, &"INSERT INTO t VALUES (4, NULL)")
+    let n1 = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+    println("caught up: " + show(mut &off, &"SELECT t.id, a.v FROM t LEFT JOIN #a a ON a.id = t.id ORDER BY t.id") + "; #a still " +
+            show(mut &off, &"SELECT COUNT(*) AS c FROM #a"))
+    b.close()
+    let c2 = settled(rep, &c1)
+    println("after B: trees " + c2[0].toStr() + ", rows " + c2[1].toStr())
+    off.close()
+    on.close()
+    ms.close()
+    for c in spare {
+        var cc = c
+        cc.close()
+    }
+    println("after the A sessions: " + countsText(&settled(rep, &c2)))
+}
+
+fn main() {
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { oracle(&dsn) }
+        None {
+            let fs = lexdb_disk.sim(29)
+            let opts = lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+            lexdb_store.run(fs.share(), opts, fn(st: lexdb_store.Store): int {
+                lexdb_exec.bootstrap(&st).unwrap()
+                lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+                task.scope(fn(s: mut &task.Scope) {
+                    let mln = net.listen("127.0.0.1:0").unwrap()
+                    let maddr = mln.localAddr()
+                    let mf = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: mln, st: st.share()})
+                    let mdsn = "Server=127.0.0.1," + maddr[10..len(maddr)] + ";UID=sa;PWD=x;Encrypt=no"
+                    var m = conn(&mdsn)
+                    let setup: str = SETUP
+                    for q in strings.lines(&setup) {
+                        let r = show(mut &m, &q)
+                        if strings.startsWith(&r, "error") { println("setup: " + r + ": " + q) }
+                    }
+                    m.close()
+                    st.checkpoint().unwrap()
+                    let rep = lexdb_store.openReplica(fs.share(), opts, lexdb_store.Link.Local(st.weakRef())).unwrap()
+                    let n = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+                    lexdb_exec.bootstrap(&rep).unwrap()
+                    lexdb_wire.configure(&rep, &lexdb_wire.noAuth()).unwrap()
+                    let ln = net.listen("127.0.0.1:0").unwrap()
+                    let addr = ln.localAddr()
+                    let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: rep.share()})
+                    lexdbRun(&st, &rep, &mdsn, &("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+                    { let stop = f }
+                    { let stop = mf }
+                    rep.close()
+                })
+                return 0
+            }).unwrap()
+        }
+    }
+}
