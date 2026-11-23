@@ -548,35 +548,53 @@ Our tool runs with `LXL_CHECK=1`, so a leak fails a case.
 
 ## lexdb
 
-`lexdb.lxl` is a small SQL database server on disk that speaks the
-PostgreSQL wire protocol, so `psql`, `pgbench` and `lib/postgres` connect to
-it. The design and its state are in
-[../design/lexdb.md](../design/lexdb.md).
+`lexdb.lxl` is a SQL database server on disk. It speaks three wire
+protocols, each with its own SQL dialect and catalog views:
 
-| File | Contents |
-|---|---|
-| `lexdb.lxl` | the server: `lexdb DATADIR [ADDR ...] [--replicas N [--replica-addr ADDR ...]]`; an ADDR is HOST:PORT (default 127.0.0.1:5433), a directory for a Unix socket `.s.PGSQL.PORT`, or a socket path |
-| `lexdb_repl.lxl` | the link between the master and its read-only replicas |
-| `lexdb_wire.lxl` | protocol 3.0: startup, simple and extended queries |
-| `lexdb_sql.lxl` | the SQL lexer and parser |
-| `lexdb_exec.lxl` | the catalog, rows, keys, indexes, the planner's rules, joins, EXPLAIN, statements, sessions |
-| `lexdb_store.lxl` | copy-on-write B+trees, the cache, transactions, the log, checkpoints, recovery, snapshots |
-| `lexdb_page.lxl` | the page formats |
-| `lexdb_disk.lxl` | files with O_DIRECT, and a simulated disk that crashes |
-| `lexdb_base.lxl` | errors, CRC32C, a deterministic generator |
+- PostgreSQL's (protocol 3.0), always on, so `psql`, `pgbench`, the
+  PostgreSQL JDBC driver and `lib/postgres` connect to it;
+- SQL Server's TDS 7.4 with T-SQL, with `--tds HOST:PORT`, for `sqlcmd`,
+  ODBC Driver 18, mssql-jdbc and `lib/sqlserver`;
+- Oracle's TNS with TTC, SQL and PL/SQL, with `--tns HOST:PORT` (or
+  `--tcps HOST:PORT` inside TLS), for ojdbc and `lib/oracle`, service name
+  `lexdb`.
+
+The design and its state are in [../design/lexdb.md](../design/lexdb.md),
+with the current layering in
+[../design/lexdb-layers.md](../design/lexdb-layers.md) and the doors in
+[../design/lexdb-tds.md](../design/lexdb-tds.md) and
+[../design/lexdb-oracle.md](../design/lexdb-oracle.md).
 
     compiler/out/lxlc cmd/lexdb.lxl -O -o lexdb
-    ./lexdb /tmp/lexdb-data &
-    psql "host=127.0.0.1 port=5433 user=me dbname=lexdb"
+    ./lexdb /tmp/lexdb-data 127.0.0.1:5433 /tmp --tds 127.0.0.1:1433 --tns 127.0.0.1:1521 &
+    psql "host=/tmp port=5433 user=me dbname=lexdb"
 
-There is no authentication yet: keep it on loopback. SIGTERM or SIGINT stops
-it after a checkpoint. `python3 lexell/tests/lexdb.py` runs its tests.
+With no address it listens on 127.0.0.1:5433. An address with a `/` is a
+Unix socket: a directory gets `.s.PGSQL.PORT` in it, as PostgreSQL names
+it, and any other path is the socket file itself. One server runs per data
+directory. SIGTERM or SIGINT stops it after a checkpoint.
 
-**Read-only replicas** (design/lexdb.md 9.72, 9.73): `--replicas N` runs
-the master and N replicas, each a process of its own, under one
+**Authentication and TLS** (design/lexdb.md 9.81). `--auth METHOD` sets it
+for TCP connections and `--auth-local METHOD` for Unix sockets: `trust`
+(the default for both) or `scram-sha-256`, checked against a role's
+password. The same roles log in through every door.
+
+    ./lexdb /tmp/lexdb-data 127.0.0.1:5433 /tmp --auth scram-sha-256 &
+    psql "host=/tmp port=5433 user=me dbname=lexdb" -c "CREATE ROLE app LOGIN PASSWORD 'secret'"
+    psql "host=127.0.0.1 port=5433 user=app dbname=lexdb"     # asks for the password
+
+Roles, owners, `GRANT` and `REVOKE` work as in PostgreSQL. `--tls-cert FILE`
+(and `--tls-key FILE`, if the key is not in the certificate's file) turns on
+TLS, and `--require-tls` refuses TCP connections without it. Keep `trust`
+to loopback and private socket directories.
+
+**Read-only replicas** (design/lexdb.md 9.72, 9.73, 9.137): `--replicas N`
+runs the master and N replicas, each a process of its own, under one
 supervisor, which restarts any that crash. The replicas serve read-only
-sessions (writes fail with 25006) on `--replica-addr`, by default each
-ADDR with the port one higher:
+sessions on `--replica-addr`, by default each address with the port one
+higher, and the SQL Server and Oracle doors likewise on `--replica-tds`,
+`--replica-tns` and `--replica-tcps`. Each door answers as its product's
+read-only secondary (PostgreSQL's 25006 for a write).
 
     ./lexdb /tmp/lexdb-data 127.0.0.1:5433 /tmp --replicas 4
     psql "host=127.0.0.1 port=5433 ..."     # read-write: the master
@@ -584,7 +602,33 @@ ADDR with the port one higher:
     psql "host=/tmp port=5434 ..."          # the replicas' Unix socket
 
 The replicas share the TCP port (SO_REUSEPORT) and the Unix socket. A
-replica sees a commit once the master's log holds it, a few microseconds
-later. `lexdb --replica DATADIR ADDR...` runs one replica by hand beside a
-running master. `python3 lexell/tests/lexdb/replica.py` tests both forms.
+replica sees a commit once the master's log holds it. `lexdb --replica
+DATADIR ADDR...` runs one replica by hand beside a running master.
+`--tns-ro-service NAME` names the Oracle service the master redirects to a
+replica (by default `lexdb_ro` and `freepdb1_ro`).
 
+**Storage options.** `--log-dir DIR` keeps the write-ahead log apart from
+the data file (a data directory is then always opened with the same log
+directory). `--cache-mb N` sets the cache, by default a quarter of the
+memory. `--unsafe-no-sync` is for tests only: commits do not wait for the
+disk.
+
+**Source.** The server is `lexdb.lxl` and 71 `lexdb_*.lxl` modules:
+
+| Layer | Modules |
+|---|---|
+| Doors | `lexdb_wire` (PostgreSQL), `lexdb_tds` and `lexdb_tsql*` (SQL Server), `lexdb_tns`, `lexdb_plsql` and `lexdb_ora*` (Oracle), `lexdb_auth` (SCRAM), `lexdb_standby` (what a replica answers) |
+| Catalogs | `lexdb_catalog`, `lexdb_pg`, `lexdb_pgcat`, `lexdb_syscat`, `lexdb_oracat`, `lexdb_priv` (roles and privileges) |
+| SQL | `lexdb_sql` (values, types, expressions), `lexdb_parse`, `lexdb_dialect`, `lexdb_bind` (what a query means), `lexdb_lib`, `lexdb_func` and the other function modules |
+| Planning | `lexdb_plan`, `lexdb_stats` (statistics for the cost-based optimizer) |
+| Execution | `lexdb_exec` (statements, sessions), `lexdb_pipe`, `lexdb_vec` (kernels over typed batches), `lexdb_agg`, `lexdb_sort`, `lexdb_window`, `lexdb_setop`, `lexdb_locks` |
+| Storage | `lexdb_access`, `lexdb_rows` and `lexdb_cols` (row and column leaves), `lexdb_store` (copy-on-write B+trees, the cache, transactions, the log, checkpoints, recovery, snapshots), `lexdb_page`, `lexdb_disk` (O_DIRECT files and a simulated disk that crashes) |
+| Replication | `lexdb_repl` |
+
+The table names the main modules; each module's first comment says what it
+holds.
+
+**Tests.** From this directory's parent, `LXL_NOCACHE=1 python3
+tests/lexdb.py -j N` runs the suite with `compiler/out/lxlc` (`--compiler
+PATH` for another), and `python3 tests/lexdb/replica.py` tests the
+replicas.
