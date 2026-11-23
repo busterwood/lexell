@@ -395,6 +395,52 @@ smaller differences of its statement.
     `xp_msver` shows the real machine's processor count and memory.
 
 
+- **Data types, functions and catalog** (found writing the T-SQL phase 3 pages):
+  - **Hangs:** `REGEXP_REPLACE('abc', 'b')` (two arguments) never answers; give `''` as the third argument.
+  - **Binary:** hexadecimal literals are numbers (`SELECT 0x4142` is 16706; `CAST(0x4142 AS varbinary(10))` is
+    50000); `CAST(varbinary AS varchar)` and `CONVERT(..., 1 | 2)` give `\x4142`; `LEN` of a binary value is 0,
+    `SUBSTRING` and `LEFT` work on that hex text; `binary(n)` is not padded and a longer value into `varbinary(n)`
+    is kept; `HASHBYTES` does not exist.
+  - **Ranges and casts:** `tinyint` is not range-checked (`CAST(256 AS tinyint)`, a column storing 256 or -1);
+    `smallmoney` takes up to 999999.9999; `TRY_CAST(300 AS tinyint)` and `TRY_CAST('12' AS decimal(2,0))` are not
+    NULL; `CAST('yes' AS bit)` is 1; `SUM` of `int` does not overflow; `CAST(0 AS datetime)` is 50000.
+  - **Character:** `char(n)` and `nchar(n)` are not padded; `DECLARE @n varchar = 'abcdef'` and `CAST(x AS varchar)`
+    keep every character; assigning a long string to a `varchar(10)` variable is error 2628 (SQL Server cuts it);
+    `ISNULL` is `COALESCE` (the type of the first argument is not kept); `DATALENGTH` counts two bytes per
+    character of every string type and gives 0 for a `real`.
+  - **Dates:** only ISO layouts are read (`'20260315'`, `'March 15, 2026'` and `'03/15/2026'` are 241, with any
+    style); the seventh fractional digit is lost; a `datetimeoffset` is converted to UTC and shows `+00:00`;
+    `DATEPART(tzoffset | tz | iso_week)` is 155; `datetime + 1` is 195; `datetime - datetime` is an interval
+    (`1 day 10:00:00`); `date + 1` and `date - date` are accepted; `CAST('2026-03-15 13:45:30' AS time)` is 241;
+    `ISDATE`, `SWITCHOFFSET`, `TODATETIMEOFFSET`, `DATETIMEFROMPARTS`, `TIMEFROMPARTS` and `DATETIME2FROMPARTS` are
+    195; conversion styles 9, 13, 14, 22, 109, 113 and 114 are 281.
+  - **Maths:** `LOG(100, 10)` is 0.5 (the arguments are swapped; SQL Server: 2); `ROUND(123.4567, -1)` on a decimal
+    is 8115; `SQRT(-1)` and `LOG(0)` are 50000, `ASIN(2)` and `EXP(710)` 8115 with PostgreSQL's text; `5 / 2.0E0` is
+    a decimal (6 places); `real / int` is computed as a float.
+  - **Functions that are lenient:** `IIF(1, 'a', 'b')` gives `b` (SQL Server: 4145); `GREATEST(1)`, `CONCAT('a')`,
+    `SUBSTRING('abcdef', 2)` and `LEFT('abc', -1)` are taken (SQL Server: 189, 174, 536); `TRANSLATE('abc', 'abc',
+    'xy')` is accepted (9828); `ASCII('')` is 0; `CASE` and `COALESCE` over `1` and `2.5` give `1`, not `1.0`.
+  - **`FORMAT`:** with `de-DE` a date format is still English (`d` gives `3/5/2026`); a custom format with sections
+    stops at the first `;` (`FORMAT(-5, '0;(0)')` is -5); literals between digit placeholders are dropped
+    (`FORMAT(123456789, '###-##-####')`); `FORMAT(CAST('14:07:09' AS time), 'hh\:mm')` is NULL.
+  - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245); 245 is used
+    where SQL Server gives 8114.
+  - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
+    joins strings.
+  - **System functions:** `IDENT_CURRENT`, `NEWSEQUENTIALID`, `ROWCOUNT_BIG`, `TRIGGER_NESTLEVEL`,
+    `SESSION_CONTEXT`, `COL_NAME`, `COL_LENGTH`, `HOST_NAME`, `APP_NAME`, `SUSER_ID`, `USER_ID`, `PARSENAME`,
+    `@@FETCH_STATUS`, `@@CURSOR_ROWS`, `@@DBTS`, `@@OPTIONS` and `SQL_VARIANT_PROPERTY` are 195; `USER_NAME(id)` is
+    195; `@@IDENTITY` takes the value of `NEXT VALUE FOR`; `IS_MEMBER('db_owner')` and
+    `IS_SRVROLEMEMBER('sysadmin')` are 0 for `sa`; `xml` has no methods (`doc.value(...)` is 4121); `NTH_VALUE`
+    works (SQL Server has none).
+  - **Catalog:** `sys.index_columns` omits the `INCLUDE` columns of an index; `sys.server_principals` does not list
+    `sa`; `sys.dm_exec_sessions` is one recorded row; `INFORMATION_SCHEMA.SCHEMATA` has no `dbo`, and `ROUTINES` and
+    `PARAMETERS` have no T-SQL procedures; `INFORMATION_SCHEMA.DOMAINS`, `COLUMN_PRIVILEGES` and
+    `VIEW_COLUMN_USAGE` do not exist; `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
+    not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
+    `sys.columns`.
+  - A `datetime` column takes PostgreSQL's special strings (`INSERT ... VALUES ('tomorrow')`).
+
 ## Oracle door
 
 - **A global temporary table's definition is private to the session that made it**, on the master as on a
