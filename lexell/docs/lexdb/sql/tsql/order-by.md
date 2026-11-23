@@ -210,7 +210,7 @@ SELECT id FROM dbo.sale ORDER BY id OFFSET -1 ROWS;
 ```text
 Msg 50000, Level 16, State 1, Line 1
 for SELECT DISTINCT, ORDER BY expressions must appear in select list
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 2
 OFFSET must not be negative
 ```
 
