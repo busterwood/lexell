@@ -241,12 +241,12 @@ SELECT CHECKSUM_AGG(qty) FROM dbo.sale;
 ```
 
 ```text
-Msg 195, Level 16, State 1, Line 1
-function stdev with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function var with 1 arguments does not exist
-Msg 195, Level 16, State 1, Line 1
-function checksum_agg with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'stdev' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'var' is not a recognized built-in function name.
+Msg 195, Level 15, State 1, Line 1
+'checksum_agg' is not a recognized built-in function name.
 ```
 
 ## See also
