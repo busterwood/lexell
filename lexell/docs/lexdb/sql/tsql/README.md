@@ -58,11 +58,11 @@ This index lists everything the door takes today. Pages not written yet are list
 |---|---|
 | [DECLARE](declare-local-variable.md) | Variables and table variables (`DECLARE @t TABLE (...)`). |
 | [SET @variable](set-local-variable.md), [SELECT @variable =](select-local-variable.md) | Assignment, compound assignment. |
-| IF ... ELSE, WHILE, BREAK, CONTINUE, BEGIN ... END, RETURN | |
-| TRY ... CATCH | With `ERROR_NUMBER()`, `ERROR_MESSAGE()` and the other error functions, `XACT_STATE()`. |
-| THROW, RAISERROR, PRINT | |
-| EXECUTE | Procedures (with named, default and `OUTPUT` arguments) and dynamic SQL strings. |
-| USE | `lexdb` (or `master`). |
+| [IF ... ELSE](if-else.md), [WHILE, BREAK, CONTINUE](while.md), [BEGIN ... END](begin-end.md), [RETURN](return.md) | |
+| [TRY ... CATCH](try-catch.md) | With `ERROR_NUMBER()`, `ERROR_MESSAGE()` and the other error functions, `XACT_STATE()`. |
+| [THROW](throw.md), [RAISERROR](raiserror.md), [PRINT](print.md) | |
+| [EXECUTE](execute.md) | Procedures (with named, default and `OUTPUT` arguments) and dynamic SQL strings. |
+| [USE](use.md) | `lexdb` (or `master`). |
 
 ### Transactions
 
