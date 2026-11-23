@@ -13,7 +13,7 @@ DROP INDEX [ CONCURRENTLY ] [ IF EXISTS ] name
 ## Arguments
 
 `CONCURRENTLY`
-: Accepted; the index is dropped as without it.
+: The index is dropped as without it. As in PostgreSQL, it cannot run inside a transaction block (25001).
 
 `IF EXISTS`
 : If the index does not exist, does nothing and gives a notice.

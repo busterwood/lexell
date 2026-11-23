@@ -20,7 +20,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_nam
   there are checked (23505 for a duplicate).
 
 `CONCURRENTLY`
-: Accepted. The index is built as without it.
+: The index is built as without it. As in PostgreSQL, it cannot run inside a transaction block (25001).
 
 *name*
 : The index's name, in the table's schema. Without one, it is named as PostgreSQL names it: `table_column_idx`
@@ -58,7 +58,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_nam
 
 - Only B-tree indexes: `USING hash`, `gin`, `gist`, `brin` and `spgist` are refused (0A000).
 - `INCLUDE (...)`, `WITH ( storage_parameter )`, `TABLESPACE` and `NULLS NOT DISTINCT` are not supported.
-- `CONCURRENTLY` is accepted and does not change how the index is built.
+- `CONCURRENTLY` does not change how the index is built.
 - `pg_indexes.indexdef` shows an index on `(n + 1)` as `(((n + 1)))`; PostgreSQL shows `((n + 1))`.
 
 ## Examples
@@ -176,6 +176,9 @@ CREATE INDEX customer_h ON customer USING hash (city);
 CREATE INDEX customer_i ON customer (city) INCLUDE (score);
 CREATE INDEX customer_x ON customer (nosuch);
 CREATE UNIQUE INDEX customer_city_u ON customer (city);
+BEGIN;
+CREATE INDEX CONCURRENTLY customer_c ON customer (city);
+ROLLBACK;
 ```
 
 ```text
@@ -185,6 +188,9 @@ ERROR:  syntax error at or near "include"
 ERROR:  column "nosuch" does not exist
 ERROR:  could not create unique index "customer_city_u"
 DETAIL:  Key (city)=(hull) is duplicated.
+BEGIN
+ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+ROLLBACK
 ```
 
 ## See also
