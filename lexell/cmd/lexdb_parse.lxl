@@ -7707,9 +7707,50 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             p.skipToEnd()
             return Ok(st)
         }
+        "wait" {
+            if !p.tsql && !p.ora {
+                if p.isKw("for") { return p.waitLsn() }
+                return Err(near(&p.peek()))
+            }
+        }
         else {}
     }
     return Err(near(&t))
+}
+
+// WAIT FOR LSN 'lsn' [WITH (option [value], ...)] (PostgreSQL 19; lexdb.md
+// 9.137), after WAIT: a SHOW of lexdb_sql.WAIT_LSN (it gives one row and
+// runs outside any transaction, as SHOW does), the LSN's text and each
+// option ("mode=v", "timeout=v", "no_throw=v", lower case) in names. The
+// options are checked when it runs, as PostgreSQL does.
+fn (p: mut &P) waitLsn(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("for")
+    try p.expectKw("lsn")
+    let l = p.next()
+    if l.kind != T_STR { return Err(near(&l)) }
+    var st = lexdb_sql.newStmt(S_SHOW)
+    st.table = lexdb_sql.WAIT_LSN.clone()
+    append(mut &st.names, l.text.clone())
+    if p.acceptKw("with") {
+        try p.expectKw("(")
+        while true {
+            let o = p.next()
+            if o.kind != T_IDENT { return Err(near(&o)) }
+            var v = "\x00"                                  // none: a boolean option's true
+            let x = p.peek().clone()
+            if x.kind == T_STR || x.kind == T_NUM || x.kind == T_IDENT {
+                p.pos += 1
+                v = strings.toLowerAscii(&x.text)
+            } else if x.kind == T_OP && (x.text == "-" || x.text == "+") && p.peekAt(1).kind == T_NUM {
+                p.pos += 2
+                v = x.text + p.toks[p.pos - 1].text
+            }
+            append(mut &st.names, o.text + "=" + v)
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    }
+    return Ok(st)
 }
 
 // SET TIME ZONE's value (9.95): a string, a name, a number (an offset in

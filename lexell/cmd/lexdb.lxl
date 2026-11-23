@@ -69,6 +69,12 @@ fn noCow(dir: &str) {
 // higher), sharing its TCP port (SO_REUSEPORT) and its Unix socket.
 // --replica runs one replica by hand, of a master already serving DATADIR.
 //
+// Replicas in every door (design/lexdb.md 9.137): --replica takes --tds,
+// --tns and --tcps for its own listeners; under --replicas N the replicas
+// serve --replica-tds, --replica-tns and --replica-tcps (by default each of
+// the master's --tds, --tns, --tcps with the port one higher, shared with
+// SO_REUSEPORT). Each door answers as its product's read-only secondary.
+//
 // Authentication (design/lexdb.md 9.81): --auth METHOD for TCP connections,
 // --auth-local METHOD for Unix socket ones: trust (the default for both) or
 // scram-sha-256 (a role's password, CREATE ROLE ... PASSWORD). TLS with
@@ -77,13 +83,13 @@ fn noCow(dir: &str) {
 //
 // --tds HOST:PORT (repeatable): the master also speaks SQL Server's
 // protocol, TDS 7.4, there (design/lexdb-tds.md; SQL Server's port is
-// 1433), with the same roles, authentication and TLS settings. Replicas do
-// not serve it yet.
+// 1433), with the same roles, authentication and TLS settings.
 //
 // --tns HOST:PORT (repeatable): the master also speaks Oracle's protocol,
 // TNS with TTC, there (design/lexdb-oracle.md; Oracle's port is 1521, which
-// is never a default), logins by the roles' Oracle 12c verifiers. Replicas
-// do not serve it.
+// is never a default), logins by the roles' Oracle 12c verifiers.
+// --tns-ro-service NAME: the read-only service the master redirects to a
+// replica (default lexdb_ro and freepdb1_ro).
 //
 // --unsafe-no-sync: TESTS ONLY. Commits and checkpoints never wait for
 // fdatasync/fsync (data is still written, so a clean stop and restart keeps
@@ -132,6 +138,8 @@ fn main() {
     var raddrs: []str = []
     var tdsAddrs: []str = []
     var tnsAddrs: []str = []
+    var rtds: []str = []
+    var rtns: []str = []
     var pos: []str = []
     var noSync = false
     var auth = lexdb_wire.noAuth()
@@ -178,6 +186,22 @@ fn main() {
             if i + 1 >= len(args) || strings.indexOf(&args[i + 1], "/", 0) >= 0 { usage() }
             append(mut &tnsAddrs, "tcps:" + args[i + 1])
             i += 1
+        } else if a == "--replica-tds" || a == "--replica-tns" || a == "--replica-tcps" {
+            // the supervised replicas' own listeners for a door (9.137): TCP only
+            if i + 1 >= len(args) || strings.indexOf(&args[i + 1], "/", 0) >= 0 { usage() }
+            if a == "--replica-tds" {
+                append(mut &rtds, args[i + 1].clone())
+            } else if a == "--replica-tns" {
+                append(mut &rtns, args[i + 1].clone())
+            } else {
+                append(mut &rtns, "tcps:" + args[i + 1])
+            }
+            i += 1
+        } else if a == "--tns-ro-service" {
+            // the Oracle read-only service the master redirects to a replica (9.137)
+            if i + 1 >= len(args) || len(args[i + 1]) == 0 { usage() }
+            lexdb_tns.setReadOnlyService(&args[i + 1])
+            i += 1
         } else if a == "--replicas" || a == "--replica-addr" {
             if i + 1 >= len(args) { usage() }
             if a == "--replicas" {
@@ -194,7 +218,7 @@ fn main() {
         }
         i += 1
     }
-    if len(pos) < 1 || (replica && replicas > 0) { usage() }
+    if len(pos) < 1 || (replica && replicas > 0) || (replicas == 0 && (len(rtds) > 0 || len(rtns) > 0)) { usage() }
     match lexdb_wire.checkAuth(&auth) {
         Ok(_) {}
         Err(msg) {
@@ -218,7 +242,7 @@ fn main() {
     if os.env("LXL_HELPERS").isNone() { os.setEnv("LXL_HELPERS", "32") }   // reads in flight (section 3)
     if replica {
         let none: []net.Listener = []
-        runReplica(dir, &addrs, opts0(), false, none, 10000, &auth)
+        runReplica(dir, &addrs, &tdsAddrs, &tnsAddrs, opts0(), false, none, 10000, &auth)
         return
     }
     match fs.mkdirAll(&dir) {
@@ -233,12 +257,17 @@ fn main() {
         runMaster(dir, &addrs, &tdsAddrs, &tnsAddrs, &auth)
         return
     }
-    supervise(dir, &addrs, &tdsAddrs, &tnsAddrs, replicas, &raddrs, &auth)
+    supervise(dir, &addrs, &tdsAddrs, &tnsAddrs, replicas, &raddrs, &rtds, &rtns, &auth)
 }
 
 fn usage() {
-    eprintln("usage: lexdb DATADIR [ADDR ...] [--tds HOST:PORT ...] [--tns HOST:PORT ...] [--tcps HOST:PORT ...] [--replicas N [--replica-addr ADDR ...]] [--log-dir DIR] [--cache-mb N] [--unsafe-no-sync] [AUTH]")
-    eprintln("       lexdb --replica DATADIR [ADDR ...] [--log-dir DIR] [--cache-mb N] [--unsafe-no-sync] [AUTH]")
+    eprintln("usage: lexdb DATADIR [ADDR ...] [--tds HOST:PORT ...] [--tns HOST:PORT ...] [--tcps HOST:PORT ...] [--tns-ro-service NAME]")
+    eprintln("             [--replicas N [--replica-addr ADDR ...] [--replica-tds HOST:PORT ...] [--replica-tns HOST:PORT ...] [--replica-tcps HOST:PORT ...]]")
+    eprintln("             [--log-dir DIR] [--cache-mb N] [--unsafe-no-sync] [AUTH]")
+    eprintln("       lexdb --replica DATADIR [ADDR ...] [--tds HOST:PORT ...] [--tns HOST:PORT ...] [--tcps HOST:PORT ...] [--tns-ro-service NAME]")
+    eprintln("             [--log-dir DIR] [--cache-mb N] [--unsafe-no-sync] [AUTH]")
+    eprintln("--replica-tds/-tns/-tcps: the supervised replicas' listeners for a door (default: each of the master's, the port one up)")
+    eprintln("--tns-ro-service NAME: the Oracle service the master redirects to a replica (default lexdb_ro and freepdb1_ro)")
     eprintln("--log-dir DIR: the write-ahead log in DIR, not in DATADIR (e.g. another device); fixed when DATADIR is made, and then required, with --replica too")
     eprintln("--cache-mb N: the cache budget in MB (1 to 1048576; default a quarter of the memory)")
     eprintln("--unsafe-no-sync: TESTS ONLY: never fsync; a power cut can lose or corrupt data")
@@ -251,7 +280,8 @@ fn usage() {
 // 0 the master, the others replicas. A worker that ends badly is started
 // again; a replica ends when its master does, and so is started again with
 // it. SIGTERM or SIGINT stops them all.
-fn supervise(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: int, given: &[]str, auth: &lexdb_wire.AuthConf) {
+fn supervise(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: int, given: &[]str, givenTds: &[]str, givenTns: &[]str,
+             auth: &lexdb_wire.AuthConf) {
     // the replicas' addresses: given, or each of the master's one port up
     var raddrs: []str = []
     for a in given { append(mut &raddrs, a.clone()) }
@@ -260,13 +290,22 @@ fn supervise(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: in
             if strings.contains(&a, "/") {
                 append(mut &raddrs, a.clone())
             } else {
-                let c = strings.lastIndexOf(&a, ":")
-                let port = strings.parseIntOpt(a[c + 1..len(a)]).unwrapOr(-1)
-                if c < 0 || port <= 0 {
-                    eprintln("lexdb: --replicas needs the master's TCP port to pick the replicas' (or --replica-addr): " + a)
-                    exit(2)
-                }
-                append(mut &raddrs, a[0..c + 1] + (port + 1).toStr())
+                append(mut &raddrs, portUp(&a, "--replica-addr"))
+            }
+        }
+    }
+    // and for the other doors (9.137): given, or each of the master's for that door one port up
+    var rtds: []str = []
+    for a in givenTds { append(mut &rtds, a.clone()) }
+    if len(rtds) == 0 { for a in tdsAddrs { append(mut &rtds, portUp(&a, "--replica-tds")) } }
+    var rtns: []str = []
+    for a in givenTns { append(mut &rtns, a.clone()) }
+    if len(rtns) == 0 {
+        for a in tnsAddrs {
+            if strings.startsWith(&a, "tcps:") {
+                append(mut &rtns, "tcps:" + portUp(&(a[5..len(a)].toStr()), "--replica-tcps"))
+            } else {
+                append(mut &rtns, portUp(&a, "--replica-tns"))
             }
         }
     }
@@ -320,7 +359,7 @@ fn supervise(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: in
         } else {
             // each replica a copy of the shared sockets (this process's own
             // memory: the supervisor keeps its)
-            runReplica(dir, &tcp, opts0(), true, replace(mut &shared, []), 60000, auth)
+            runReplica(dir, &tcp, &rtds, &rtns, opts0(), true, replace(mut &shared, []), 60000, auth)
         }
     })
     for f in files { let gone = fs.remove(&f) }
@@ -337,6 +376,66 @@ fn supervise(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, n: in
             exit(1)
         }
     }
+}
+
+// HOST:PORT with the port one higher (a replica's default address), else
+// exit 2 naming the flag that gives one.
+fn portUp(a: &str, flag: &str): str {
+    let c = strings.lastIndexOf(a, ":")
+    let port = if c < 0 { -1 } else { strings.parseIntOpt(a[c + 1..len(a)]).unwrapOr(-1) }
+    if port <= 0 {
+        eprintln("lexdb: --replicas needs the master's TCP port to pick the replicas' (or " + flag + "): " + a)
+        exit(2)
+    }
+    return a[0..c + 1] + (port + 1).toStr()
+}
+
+// The SQL Server and Oracle doors' listeners (TCP only): TDS on tdsAddrs,
+// TNS and TCPS on tnsAddrs (TCPS's marked "tcps:"), each printed as it
+// listens (who: "" for the master, "replica " for a replica); with
+// reusePort each with SO_REUSEPORT (the supervised replicas share a port).
+// names: per listener its door and address, "tds 127.0.0.1:1434", which a
+// replica announces to its master (lexdb.md 9.137).
+type Doors = record { tds: []net.Listener; tns: []net.Listener; tcps: []net.Listener; names: []str }
+
+fn listenDoors(tdsAddrs: &[]str, tnsAddrs: &[]str, reusePort: bool, who: &str): Result[Doors, str] {
+    var d = Doors{tds: [], tns: [], tcps: [], names: []}
+    for door in ["tds", "tns", "tcps"] {
+        var want: []str = []
+        if door == "tds" {
+            for a in tdsAddrs { append(mut &want, a.clone()) }
+        } else {
+            for ta in tnsAddrs {
+                if strings.startsWith(&ta, "tcps:") == (door == "tcps") { append(mut &want, if door == "tcps" { ta[5..len(ta)].toStr() } else { ta.clone() }) }
+            }
+        }
+        if len(want) == 0 { continue }
+        var lns: []net.Listener = []
+        if reusePort {
+            for a in want {
+                match net.listenReusePort(&a) {
+                    Ok(ln) { append(mut &lns, ln) }
+                    Err(e) { return Err((if door == "tds" { "tds" } else { "tns" }) + ": listen " + a + ": " + e.toStr()) }
+                }
+            }
+        } else {
+            var files: []str = []
+            match lexdb_wire.listenAll(&want, mut &files) {
+                Ok(x) { lns = x }
+                Err(msg) { return Err((if door == "tds" { "tds" } else { "tns" }) + ": " + msg) }
+            }
+        }
+        var tn: []str = []
+        for ln in lns {
+            append(mut &tn, ln.localAddr())
+            append(mut &d.names, door + " " + ln.localAddr())
+        }
+        let what = if door == "tds" { "TDS (SQL Server)" } else if door == "tns" { "TNS (Oracle)" } else { "TCPS (Oracle over TLS)" }
+        println("lexdb: " + who + what + " on " + strings.join(&tn, ", "))
+        let fl = io.flushStdout()
+        if door == "tds" { d.tds = lns } else if door == "tns" { d.tns = lns } else { d.tcps = lns }
+    }
+    return Ok(d)
 }
 
 // The master: the data directory's lock, the store, its listeners and the
@@ -413,51 +512,19 @@ fn runMaster(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, auth:
                 let fl = io.flushStdout()
                 let ready = task.workerReady()             // (outside task.workers, nothing)
                 let f = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st.share()})
-                // SQL Server's protocol on its own listeners (design/lexdb-tds.md)
-                var tdsFiles: []str = []
-                var tdsLns: []net.Listener = []
-                if len(tdsAddrs) > 0 {
-                    match lexdb_wire.listenAll(tdsAddrs, mut &tdsFiles) {
-                        Ok(x) {
-                            var tn: []str = []
-                            for ln in x { append(mut &tn, ln.localAddr()) }
-                            println("lexdb: TDS (SQL Server) on " + strings.join(&tn, ", "))
-                            let fl2 = io.flushStdout()
-                            tdsLns = x
-                        }
-                        Err(msg) {
-                            eprintln("lexdb: tds: " + msg)
-                            code = START_FAIL
-                        }
+                // SQL Server's protocol on its own listeners (design/lexdb-tds.md), Oracle's likewise
+                // (design/lexdb-oracle.md)
+                var doors = Doors{tds: [], tns: [], tcps: [], names: []}
+                match listenDoors(tdsAddrs, tnsAddrs, false, "") {
+                    Ok(d) { doors = d }
+                    Err(msg) {
+                        eprintln("lexdb: " + msg)
+                        code = START_FAIL
                     }
                 }
-                let g = s.start(lexdb_tds.acceptAll, lexdb_tds.ListenArg{lns: tdsLns, st: st.share()})
-                // Oracle's protocol, likewise (design/lexdb-oracle.md)
-                var tnsFiles: []str = []
-                var tnsLns: []net.Listener = []
-                var tcpsLns: []net.Listener = []
-                for secure in [false, true] {
-                    var want: []str = []
-                    for ta in tnsAddrs {
-                        if strings.startsWith(&ta, "tcps:") == secure { append(mut &want, if secure { ta[5..len(ta)].toStr() } else { ta.clone() }) }
-                    }
-                    if len(want) == 0 { continue }
-                    match lexdb_wire.listenAll(&want, mut &tnsFiles) {
-                        Ok(x) {
-                            var tn: []str = []
-                            for ln in x { append(mut &tn, ln.localAddr()) }
-                            println("lexdb: " + (if secure { "TCPS (Oracle over TLS)" } else { "TNS (Oracle)" }) + " on " + strings.join(&tn, ", "))
-                            let fl3 = io.flushStdout()
-                            if secure { tcpsLns = x } else { tnsLns = x }
-                        }
-                        Err(msg) {
-                            eprintln("lexdb: tns: " + msg)
-                            code = START_FAIL
-                        }
-                    }
-                }
-                let h = s.start(lexdb_tns.acceptAll, lexdb_tns.ListenArg{lns: tnsLns, st: st.share()})
-                let h2 = s.start(lexdb_tns.acceptAllTls, lexdb_tns.ListenArg{lns: tcpsLns, st: st.share()})
+                let g = s.start(lexdb_tds.acceptAll, lexdb_tds.ListenArg{lns: replace(mut &doors.tds, []), st: st.share()})
+                let h = s.start(lexdb_tns.acceptAll, lexdb_tns.ListenArg{lns: replace(mut &doors.tns, []), st: st.share()})
+                let h2 = s.start(lexdb_tns.acceptAllTls, lexdb_tns.ListenArg{lns: replace(mut &doors.tcps, []), st: st.share()})
                 if code == 0 { let sig = task.terminated() }
                 { let stop = h }
                 { let stop = h2 }
@@ -550,8 +617,8 @@ fn opts0(): lexdb_store.Options {
 // A read-only replica (--replica): follows the master of dir over its
 // replication socket and serves addrs with the same SQL, refusing writes
 // (25006). It stops when the master does (exit 1) or on SIGTERM/SIGINT.
-fn runReplica(dir: &str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bool, shared: []net.Listener, waitMs: int,
-              auth: &lexdb_wire.AuthConf) {
+fn runReplica(dir: &str, addrs: &[]str, tdsAddrs: &[]str, tnsAddrs: &[]str, opts: lexdb_store.Options, reusePort: bool, shared: []net.Listener,
+              waitMs: int, auth: &lexdb_wire.AuthConf) {
     task.watchSignals(&[task.SIGTERM, task.SIGINT])
     var sharedLns = shared
     let conn = lexdb_repl.connect(&dir, if LOG_DIR == "" { None } else { Some(logFs(&dir)) }, opts, waitMs)
@@ -561,6 +628,7 @@ fn runReplica(dir: &str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bo
     }
     var rps = [conn.unwrap()]
     let st = rps[0].st.share()
+    let ob = lexdb_repl.outboxOf(&rps[0])          // (the doors it serves are announced through it)
     var code = 0
     task.scope(fn(s: mut &task.Scope) {
         let task.Handoff{promise: p, future: ready} = task.promise[Unit]()
@@ -594,6 +662,19 @@ fn runReplica(dir: &str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bo
                 for ln in lns { append(mut &names, ln.localAddr()) }
                 println("lexdb: replica listening on " + strings.join(&names, ", ") + ", following the master of " + dir)
                 let fl = io.flushStdout()
+                // the other doors (9.137), each the product's read-only secondary
+                var doors = Doors{tds: [], tns: [], tcps: [], names: []}
+                match listenDoors(tdsAddrs, tnsAddrs, reusePort, "replica ") {
+                    Ok(d) { doors = d }
+                    Err(msg) {
+                        eprintln("lexdb: replica: " + msg)
+                        exit(1)                             // (it writes nothing: the master lets its hold go with the link)
+                    }
+                }
+                let g = s.start(lexdb_tds.acceptAll, lexdb_tds.ListenArg{lns: replace(mut &doors.tds, []), st: st.share()})
+                let h = s.start(lexdb_tns.acceptAll, lexdb_tns.ListenArg{lns: replace(mut &doors.tns, []), st: st.share()})
+                let h2 = s.start(lexdb_tns.acceptAllTls, lexdb_tns.ListenArg{lns: replace(mut &doors.tcps, []), st: st.share()})
+                lexdb_repl.announce(&ob, &doors.names)       // the master routes read-only clients of these doors here
                 let marked = task.workerReady()
                 let acc = s.start(lexdb_wire.acceptAll, lexdb_wire.ListenArg{lns: lns, st: st.share()})
                 let sig = s.start(waitStop, 0)
@@ -607,6 +688,9 @@ fn runReplica(dir: &str, addrs: &[]str, opts: lexdb_store.Options, reusePort: bo
                     Err(_) {}
                 }
                 { let stop = acc }
+                { let stop = h2 }
+                { let stop = h }
+                { let stop = g }
                 println("lexdb: replica stopping")
                 let fs0 = st.follower().unwrap().stats()
                 println("lexdb: replica applied batch " + fs0.applied.toStr() + ", checkpoint " + fs0.ckpt.toStr() + " (" +

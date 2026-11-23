@@ -176,19 +176,25 @@ fn serveOne(p: Peer): int {
             var ws = [w]
             task.scope(fn(s: mut &task.Scope) {
                 let sender = s.start(sendChanges, Changes{st: st.share(), w: pop(mut &ws)})
-                // the replica's holds, until it goes
+                // the replica's holds, and the doors it serves (9.137), until it goes
+                var doors: []str = []
                 while true {
                     let l = lineOr(lines.next(&r))
                     if len(l) == 0 { break }
                     if strings.startsWith(&l, "H ") {
                         let v = ints(&l)
                         if len(v) == 2 { st.holdFor(id, v[0], v[1]) }
+                    } else if strings.startsWith(&l, "A ") {
+                        append(mut &doors, l[2..len(l)].toStr())
+                        setRoutes(&st, id, &doors)
                     }
                 }
                 { let stop = sender }
             })
         }
     }
+    let none: []str = []
+    setRoutes(&st, id, &none)
     st.holdFor(id, -1, -1)
     return 0
 }
@@ -372,18 +378,24 @@ pub fn follow(x: Follow): int {
 
 type Holds = record { ob: task.Shared[lexdb_store.Outbox]; w: net.WriteHalf }
 
-// H lines: the follower's hold, each time it moves.
+// H lines: the follower's hold, each time it moves; A lines: the doors the
+// replica serves, once it listens (9.137).
 fn sendHolds(x: Holds): int {
     var lastC = -2
     var lastS = -2
+    var lastD = 0
     while true {
         var ck = -1
         var sg = -1
+        var da = 0
+        var doors: []str = []
         var fut: []task.Future[Unit] = []
         x.ob.with(fn(o: mut &lexdb_store.Outbox) {
             ck = o.ckpt
             sg = o.seg
-            if ck == lastC && sg == lastS {
+            da = o.doorsAt
+            if da != lastD { doors = o.doors.clone() }
+            if ck == lastC && sg == lastS && da == lastD {
                 let task.Handoff{promise: p, future: f} = task.promise[Unit]()
                 append(mut &o.wake, p)
                 append(mut &fut, f)
@@ -393,9 +405,67 @@ fn sendHolds(x: Holds): int {
             if pop(mut &fut).wait().isErr() { return 0 }
             continue
         }
-        if ck >= 0 && x.w.writeStr(&("H " + ck.toStr() + " " + sg.toStr() + "\n")).isErr() { return 1 }
+        if da != lastD {
+            var b = ""
+            for d in doors { b += "A " + d + "\n" }
+            if len(b) > 0 && x.w.writeStr(&b).isErr() { return 1 }
+            lastD = da
+        }
+        if (ck != lastC || sg != lastS) && ck >= 0 && x.w.writeStr(&("H " + ck.toStr() + " " + sg.toStr() + "\n")).isErr() { return 1 }
         lastC = ck
         lastS = sg
     }
     return 0
+}
+
+// ---- routing read-only clients to the replicas (lexdb.md 9.137)
+
+// The link's outbox of a replica, kept before follow takes the replica:
+// announce writes to it.
+pub fn outboxOf(rp: &Replica): task.Shared[lexdb_store.Outbox] { return rp.ob.share() }
+
+// Tells the master the doors this replica serves ("tds HOST:PORT", "tns
+// ...", "tcps ..."), sent as A lines by the link's task.
+pub fn announce(ob: &task.Shared[lexdb_store.Outbox], doors: &[]str) {
+    var wake: []task.Promise[Unit] = []
+    ob.with(fn(o: mut &lexdb_store.Outbox) {
+        o.doors = doors.clone()
+        o.doorsAt += 1
+        while len(o.wake) > 0 { append(mut &wake, pop(mut &o.wake)) }
+    })
+    while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
+}
+
+// The memo key of a door's replicas, on the master: lines "id HOST:PORT",
+// one per replica listener announced, while its link lasts.
+fn routesKey(door: &str): str { return "\x00routes\x00" + door }
+
+// Replica id's announced doors (A lines: "door HOST:PORT" each, all at
+// once) in place of its earlier ones; none when its link ends.
+fn setRoutes(st: &lexdb_store.Store, id: int, doors: &[]str) {
+    let mine = id.toStr() + " "
+    for door in ["tds", "tns", "tcps"] {
+        var keep = ""
+        for l in strings.split(&(st.memo.get(&routesKey(&door)).unwrapOr("")), "\n") {
+            if len(l) > 0 && !strings.startsWith(&l, &mine) { keep += l + "\n" }
+        }
+        for d in doors {
+            let sp = strings.indexOf(&d, " ", 0)
+            if sp > 0 && d[0..sp] == door { keep += mine + d[sp + 1..len(d)] + "\n" }
+        }
+        st.memo.put(&routesKey(&door), &keep)
+    }
+}
+
+// A replica's address for a client of door ("tds", "tns", "tcps") the
+// master routes there (the n-th of those up, round robin by n), None when
+// no replica serves that door now.
+pub fn routeOf(st: &lexdb_store.Store, door: &str, n: int): Option[str] {
+    var addrs: []str = []
+    for l in strings.split(&(st.memo.get(&routesKey(door)).unwrapOr("")), "\n") {
+        let sp = strings.indexOf(&l, " ", 0)
+        if sp > 0 { append(mut &addrs, l[sp + 1..len(l)].toStr()) }
+    }
+    if len(addrs) == 0 { return None }
+    return Some(addrs[(if n < 0 { -n } else { n }) % len(addrs)].clone())
 }

@@ -1,0 +1,227 @@
+// lexdb_standby: what a read-only replica answers in each door, as the
+// product's read-only secondary does (design/lexdb.md 9.137): the error a
+// write gets, and the replica's role in the settings and catalogs.
+import "strings"
+import "task"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+
+type DbErr = lexdb_base.DbErr
+type Val = lexdb_sql.Val
+
+// Whether the store is a replica's (it reads through a follower).
+pub fn isReplica(st: &lexdb_store.Store): bool { return st.follower().isSome() }
+
+// The error a write gets on a replica, by the session's door ("tds",
+// "tns", else PostgreSQL's): PostgreSQL's standby 25006 "cannot execute
+// INSERT in a read-only transaction"; SQL Server's read-only database 3906;
+// Oracle's read-only database ORA-16000 (23.26's text).
+pub fn readOnlyErr(door: &str, what: &str): DbErr {
+    if door == "tds" { return lexdb_base.err("TS3906", &tsqlReadOnly()) }
+    if door == "tns" { return lexdb_base.err("ORA16000", ORA_READ_ONLY) }
+    return lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))
+}
+
+pub const ORA_READ_ONLY = "Attempting to modify database or pluggable database that is open for read-only access."
+
+// SQL Server's 3906 for lexdb's database.
+pub fn tsqlReadOnly(): str { return "Failed to update database \"lexdb\" because the database is read-only." }
+
+// PostgreSQL's settings that tell a standby (in_hot_standby,
+// transaction_read_only, default_transaction_read_only): "on" on a
+// replica, "off" on the master.
+pub fn standbySetting(st: &lexdb_store.Store): str { return if isReplica(st) { "on" } else { "off" } }
+
+// ---- LSNs: lexdb's is the batch number, written as PostgreSQL 19 writes
+// one (%X/%08X)
+
+pub fn lsnText(n: int): str {
+    let hi = strings.toUpperAscii(&(strings.hex((n >> 32) & 0xffffffff)))
+    let lo = strings.toUpperAscii(&(strings.hex(n & 0xffffffff)))
+    return hi + "/" + strings.padLeft(&lo, 8, '0')
+}
+
+// An LSN's text: hex digits, "/", hex digits (each at most 8), else None
+// (PostgreSQL's pg_lsn_in).
+pub fn parseLsn(t: &str): Option[int] {
+    let s = strings.trim(t)
+    let at = strings.indexOf(&s, "/", 0)
+    if at < 1 || at > 8 || len(s) - at - 1 < 1 || len(s) - at - 1 > 8 { return None }
+    let hi = strings.parseIntBase(&(s[0..at].toStr()), 16)
+    let lo = strings.parseIntBase(&(s[at + 1..len(s)].toStr()), 16)
+    if hi.isErr() || lo.isErr() { return None }
+    for i in 0..len(s) { if s[i] == '+' || s[i] == '-' { return None } }
+    return Some((hi.unwrap() << 32) | lo.unwrap())
+}
+
+pub fn isRecoveryFn(n: &str): bool {
+    return n == "pg_is_in_recovery" || n == "pg_current_wal_lsn" || n == "pg_current_wal_insert_lsn" || n == "pg_current_wal_flush_lsn" ||
+           n == "pg_last_wal_replay_lsn" || n == "pg_last_wal_receive_lsn"
+}
+
+// ---- WAIT FOR LSN 'lsn' [WITH (MODE m, TIMEOUT t, NO_THROW)] (PostgreSQL 19)
+
+type WaitOpts = record { lsn: int; mode: str; timeoutMs: int; noThrow: bool }
+
+fn invalid(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// The options of names (the statement's: the LSN's text, then "name=value",
+// value "\x00" for none), checked as PostgreSQL 19 checks them.
+fn waitOpts(names: &[]str): Result[WaitOpts, DbErr] {
+    var o = WaitOpts{lsn: 0, mode: "standby_replay", timeoutMs: 0, noThrow: false}
+    match parseLsn(&names[0]) {
+        Some(n) { o.lsn = n }
+        None { return Err(invalid("22P02", &("invalid input syntax for type pg_lsn: \"" + names[0] + "\""))) }
+    }
+    var seen: []str = []
+    for i in 1..len(names) {
+        let eq = strings.indexOf(&names[i], "=", 0)
+        let k = names[i][0..eq].toStr()
+        let v = names[i][eq + 1..len(names[i])].toStr()
+        if k != "mode" && k != "timeout" && k != "no_throw" { return Err(invalid("42601", &("option \"" + k + "\" not recognized"))) }
+        for s in seen { if s == k { return Err(invalid("42601", "conflicting or redundant options")) } }
+        append(mut &seen, k.clone())
+        if k == "mode" {
+            if v != "standby_replay" && v != "standby_write" && v != "standby_flush" && v != "primary_flush" {
+                return Err(invalid("22023", &("unrecognized value for WAIT option \"mode\": \"" + (if v == "\x00" { "" } else { v.clone() }) + "\"")))
+            }
+            o.mode = v
+        } else if k == "timeout" {
+            o.timeoutMs = try timeoutOf(&v)
+        } else {
+            match boolOf(&v) {
+                Some(b) { o.noThrow = b }
+                None { return Err(invalid("42601", "no_throw requires a Boolean value")) }
+            }
+        }
+    }
+    return Ok(o)
+}
+
+fn boolOf(v: &str): Option[bool] {
+    if v == "\x00" || v == "true" || v == "on" || v == "yes" || v == "1" || v == "t" || v == "y" { return Some(true) }
+    if v == "false" || v == "off" || v == "no" || v == "0" || v == "f" || v == "n" { return Some(false) }
+    return None
+}
+
+// TIMEOUT's milliseconds: a number (ms), or a text of a number and a unit
+// (us, ms, s, min, h, d), rounded; 0 waits for ever.
+fn timeoutOf(v: &str): Result[int, DbErr] {
+    let bad = invalid("22023", &("invalid timeout value: \"" + v + "\""))
+    let t = strings.trim(v)
+    var i = 0
+    if i < len(t) && (t[i] == '-' || t[i] == '+') { i += 1 }
+    let numFrom = i
+    while i < len(t) && ((t[i] >= '0' && t[i] <= '9') || t[i] == '.') { i += 1 }
+    if i == numFrom { return Err(bad) }
+    let unit = strings.trim(t[i..len(t)]).toStr()
+    // the unit in microseconds
+    let mult = match unit {
+        "", "ms" { 1000 }
+        "us" { 1 }
+        "s" { 1000000 }
+        "min" { 60000000 }
+        "h" { 3600000000 }
+        "d" { 86400000000 }
+        else { -1 }
+    }
+    if mult < 0 { return Err(bad) }
+    // the number: whole part and fraction, in microseconds
+    var whole = 0
+    var us = 0
+    var scale = 0
+    var dots = 0
+    for k in numFrom..i {
+        if t[k] == '.' {
+            dots += 1
+            continue
+        }
+        let d = int(t[k] - '0')
+        if dots == 0 {
+            whole = whole * 10 + d
+            if whole > 100000000000 { return Err(lexdb_base.errDetail("22023", &("invalid timeout value: \"" + v + "\""), "", "Value exceeds integer range.")) }
+        } else if scale < 9 {
+            us = us * 10 + d
+            scale += 1
+        }
+    }
+    if dots > 1 || i - numFrom == dots { return Err(bad) }
+    var div = 1
+    for k in 0..scale { div *= 10 }
+    let total = whole * mult + us * mult / div
+    let ms = (total + 500) / 1000
+    if ms > 2147483647 { return Err(lexdb_base.errDetail("22023", &("invalid timeout value: \"" + v + "\""), "", "Value exceeds integer range.")) }
+    if numFrom > 0 && t[0] == '-' && total > 0 { return Err(invalid("22023", "timeout cannot be negative")) }
+    return Ok(ms)
+}
+
+// Runs WAIT FOR LSN: its status, "success", "timeout" or "not in recovery"
+// (the last two only under NO_THROW, else the errors PostgreSQL 19 gives).
+// A replica waits until it has applied the batch (the three standby modes are
+// one: a batch is applied as it arrives, durable); the master, in
+// primary_flush, until the batch is durable.
+pub fn waitLsn(st: &lexdb_store.Store, names: &[]str): Result[str, DbErr] {
+    let o = try waitOpts(names)
+    let fo = st.follower()
+    let primary = o.mode == "primary_flush"
+    if fo.isSome() && primary {
+        return Err(lexdb_base.errDetail("55000", "recovery is in progress", "",
+                                        "Waiting for primary_flush can only be done on a primary server. Use standby_flush mode on a standby server."))
+    }
+    if fo.isNone() && !primary {
+        if o.noThrow { return Ok("not in recovery") }
+        return Err(lexdb_base.errDetail("55000", "recovery is not in progress", "",
+                                        "Waiting for the " + o.mode + " LSN can only be executed during recovery."))
+    }
+    let reached = fn(): bool {
+        match st.follower() {
+            Some(f) { return f.appliedBatch() >= o.lsn }
+            None { return st.durableBatch() >= o.lsn }
+        }
+    }
+    let wait = fn(): bool {
+        match st.follower() {
+            Some(f) { return f.waitApplied(o.lsn).unwrapOr(false) }
+            None {
+                while st.durableBatch() < o.lsn { if !st.waitChange() { return false } }
+                return true
+            }
+        }
+    }
+    if !reached() {
+        let ok = if o.timeoutMs > 0 { task.within(o.timeoutMs, wait) } else { wait() }
+        if !ok && !reached() {
+            if task.cancelled() { return Err(lexdb_base.err("57014", "canceling statement due to user request")) }
+            if o.noThrow { return Ok("timeout") }
+            let cur = match st.follower() {
+                Some(f) { f.appliedBatch() }
+                None { st.durableBatch() }
+            }
+            let verb = if o.mode == "standby_replay" { "replayed" } else if o.mode == "standby_write" { "written" } else { "flushed" }
+            return Err(lexdb_base.err("57014", &("timed out while waiting for target LSN " + lsnText(o.lsn) + " to be " + verb + "; current " + o.mode +
+                                                 " LSN " + lsnText(cur))))
+        }
+    }
+    return Ok("success")
+}
+
+// pg_is_in_recovery(); pg_current_wal_lsn() (and its insert and flush
+// forms) on the master: its durable batch, 55000 on a replica, as on a
+// standby; pg_last_wal_replay_lsn() and pg_last_wal_receive_lsn() on a
+// replica: the batch it has applied (one received is applied), NULL on the
+// master.
+pub fn recoveryFn(st: &lexdb_store.Store, name: &str): Result[Val, DbErr] {
+    let fo = st.follower()
+    if name == "pg_is_in_recovery" { return Ok(Val.Bool(fo.isSome())) }
+    if name == "pg_last_wal_replay_lsn" || name == "pg_last_wal_receive_lsn" {
+        match fo {
+            Some(f) { return Ok(Val.Text(lsnText(f.appliedBatch()))) }
+            None { return Ok(Val.Null) }
+        }
+    }
+    if fo.isSome() {
+        return Err(lexdb_base.errDetail("55000", "recovery is in progress", "", "WAL control functions cannot be executed during recovery."))
+    }
+    return Ok(Val.Text(lsnText(st.durableBatch())))
+}

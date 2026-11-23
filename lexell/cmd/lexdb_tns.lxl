@@ -56,6 +56,7 @@ import "./lexdb_oratext"
 import "./lexdb_plsql"
 import "./lexdb_plcall"
 import "./lexdb_parse"
+import "./lexdb_standby"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -1174,6 +1175,8 @@ fn (c: mut &Conn) endCall(num: int, text: &str, cursor: int, rows: int) {
 
 // oraOf with what the connection knows: a table the user cannot see at all is ORA-00942, one it can read but not change ORA-01031.
 fn (c: mut &Conn) oraErr(e: &DbErr): OraErr {
+    // a write a replica finds at its commit (a sequence's): its database is read-only (9.137)
+    if e.state == lexdb_base.S_READ_ONLY && lexdb_standby.isReplica(&c.st) { return OraErr{num: 16000, text: lexdb_standby.ORA_READ_ONLY} }
     if e.state == "42501" && strings.startsWith(&e.msg, "permission denied for table ") {
         let t = e.msg[28..len(e.msg)].toStr()
         match c.rowsOf("select has_table_privilege(current_user, " + lexdb_oraadm.qlit(&t) + ", 'select')") {
@@ -3294,6 +3297,17 @@ fn (c: mut &Conn) requests(): Result[Unit, str] {
 // ---- CONNECT
 
 type Connect = record { version: int; sdu: int; service: str }
+
+// The read-only service (--tns-ro-service, lexdb.md 9.137), lower case: a CONNECT to the master naming it is redirected
+// to a replica; "" for the default ones, the service names with _ro.
+var RO_SERVICE: str = ""
+
+pub fn setReadOnlyService(name: &str) { RO_SERVICE = strings.toLowerAscii(name) }
+
+fn readOnlyService(svc: &str): bool {
+    if RO_SERVICE != "" { return svc == RO_SERVICE }
+    return svc == SERVICE + "_ro" || svc == SERVICE2 + "_ro"
+}
 
 // The service named in a connect descriptor: SERVICE_NAME= or SID=, lower case; "" none.
 fn serviceOf(desc: &str): str {

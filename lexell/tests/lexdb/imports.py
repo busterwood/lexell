@@ -48,7 +48,7 @@ CORE = {
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun",
     "lexdb_memo", "lexdb_ops", "lexdb_vec",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
-    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_stats",
+    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats",
     "lexdb_store", "lexdb_time", "lexdb_udf", "lexdb_window",
 }
 

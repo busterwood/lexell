@@ -67,6 +67,7 @@ import "./lexdb_priv"
 import "./lexdb_census"
 import "./lexdb_recur"
 import "./lexdb_recrun"
+import "./lexdb_standby"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1006,7 +1007,7 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
         try st.commit(r)
     }
     // temporary objects left by a crash (9.96); a replica's go with the master's
-    if !st.follower().isSome() { try dropLeftTemps(st) }
+    if !st.follower().isSome() { try dropLeftTemps(st) } else { lexdb_dialect.setReplica(true) }
     return Ok(Unit{})
 }
 
@@ -11767,6 +11768,7 @@ fn (s: mut &Session) setPath(names: &[]str) {
 fn showCols(name: &str): []OutCol {
     if name == "all" { return [OutCol{name: "name", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}, OutCol{name: "setting", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}] }
     if name == "timezone" { return [OutCol{name: "TimeZone", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}] }
+    if name == lexdb_sql.WAIT_LSN { return [OutCol{name: "status", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}] }
     return [OutCol{name: name.toStr(), oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}]
 }
 
@@ -11780,7 +11782,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "transaction_isolation", "default_transaction_isolation" { return Some("serializable") }
         // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
         "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
-        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some("off") }
+        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some(lexdb_standby.standbySetting(&s.st)) }   // (on a replica, 9.137)
         "server_version" { return Some("16.0") }
         "server_version_num" { return Some("160000") }
         "server_encoding", "client_encoding" { return Some("UTF8") }
@@ -11957,6 +11959,17 @@ fn (s: &Session) show(name: &str): Result[Res, DbErr] {
         None { return Err(e("42704", &("unrecognized configuration parameter \"" + name + "\""))) }
     }
     return Ok(res)
+}
+
+// WAIT FOR LSN (PostgreSQL 19, lexdb.md 9.137: lexdb_standby): not in a
+// block, which holds a snapshot (every lexdb block is SERIALIZABLE).
+fn (s: &Session) waitLsn(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if len(s.txn) > 0 {
+        return Err(lexdb_base.errDetail("55000", "WAIT cannot be executed while the current transaction holds a snapshot",
+                                        "This transaction runs at an isolation level higher than READ COMMITTED, so it holds a snapshot from its first query until it ends.", ""))
+    }
+    let status = try lexdb_standby.waitLsn(&s.st, &stmt.names)
+    return Ok(Res{cols: showCols(&stmt.table), rows: [[Val.Text(status)]], tag: "WAIT", hasRows: true, copy: COPY_NONE})
 }
 
 // A Session holding a Wire's place while its own is out (a COPY TO's run,
@@ -12308,7 +12321,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     if st.follower().isSome() {
         match writesOn(s) {
-            Some(what) { return Err(lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))) }
+            Some(what) { return Err(lexdb_standby.readOnlyErr(&st.memo.get(&lexdb_priv.doorKey(txn.sql.sess)).unwrapOr(""), &what)) }
             None {}
         }
     }
@@ -12496,7 +12509,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     match stmt.kind {
         lexdb_sql.S_EMPTY { return Ok(tagOnly("")) }
         lexdb_sql.S_CALL { return s.callRoutine(stmt, params, ptypes) }
-        lexdb_sql.S_SHOW { return s.show(&stmt.table) }
+        lexdb_sql.S_SHOW {
+            if stmt.table == lexdb_sql.WAIT_LSN { return s.waitLsn(stmt) }
+            return s.show(&stmt.table)
+        }
         lexdb_sql.S_SET {
             if strings.startsWith(&stmt.table, "discard:") { return s.discard(&stmt.table[8..len(stmt.table)]) }
             if stmt.table == "role" || stmt.table == "session_authorization" { return s.setRole(stmt) }
@@ -17014,7 +17030,7 @@ fn arrayConcat(a: &Expr, b: &Expr, cols: &[]lexdb_sql.ColDef, pt: &[]int): str {
 // The functions that need the session (9.92).
 fn isSessFn(n: &str): bool {
     return n == "current_setting" || n == "set_config" || n == "pg_backend_pid" || n == "txid_current" || n == "pg_current_xact_id" ||
-           n == "pg_my_temp_schema" || n == "pg_is_other_temp_schema"
+           n == "pg_my_temp_schema" || n == "pg_is_other_temp_schema" || lexdb_standby.isRecoveryFn(n)
 }
 
 fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
@@ -17024,6 +17040,7 @@ fn sessCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
     }
     let n = len(vs)
     if name == "pg_backend_pid" && n == 0 { return Ok(Val.Int(se.sess)) }
+    if n == 0 && lexdb_standby.isRecoveryFn(name) { return lexdb_standby.recoveryFn(&se.st, name) }
     // the session's temporary schema's OID, 0 none; whether an OID is
     // another session's (9.96: they are not in lexdb's pg_namespace, so
     // no OID of one is known)
@@ -17312,7 +17329,8 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     }
     var dbopts = ""
     if rel == "sys.databases" { dbopts = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("") }
-    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper, dbopts: dbopts}
+    var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper, dbopts: dbopts,
+                     replica: lexdb_standby.isReplica(st)}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()

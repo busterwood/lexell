@@ -1,0 +1,280 @@
+// A read-only replica in every door (design/lexdb.md 9.137): a master and a
+// replica store in one process (the simulated files shared, the replica
+// polled by hand, as exec_replica), the replica's pgwire, TDS and TNS
+// listeners reached with Lexell's own clients (lib/postgres, lib/sqlserver,
+// lib/oracle). Each door answers as its product's read-only secondary:
+// - PostgreSQL: ParameterStatus in_hot_standby and
+//   default_transaction_read_only on (off on the master), SHOW
+//   transaction_read_only on, pg_is_in_recovery() true, writes and CREATE
+//   TEMP TABLE 25006;
+// - SQL Server: writes and DDL 3906 "Failed to update database ... because
+//   the database is read-only.", DATABASEPROPERTYEX Updateability
+//   READ_ONLY, sys.databases.is_read_only 1;
+// - Oracle: DML, DDL, sequences ORA-16000, v$database READ ONLY WITH APPLY /
+//   PHYSICAL STANDBY (READ WRITE / PRIMARY on the master);
+// and the rows read are the master's. Then WAIT FOR LSN (PostgreSQL 19): the
+// master's pg_current_wal_lsn() is the replica's pg_last_wal_replay_lsn()
+// once applied; a wait for a later LSN ends when a commit on the master is
+// applied (a task commits and polls 100 ms after the wait began), and the
+// commit is then seen; TIMEOUT with and without NO_THROW, the modes, the
+// options' errors, in a block; on the master the standby modes' 55000 and
+// NO_THROW's "not in recovery", primary_flush's wait.
+// expect: pg master: in_hot_standby off, default_transaction_read_only off, recovery f
+// expect: pg replica: in_hot_standby on, default_transaction_read_only on, show on, recovery t
+// expect: pg replica rows: 3
+// expect: pg replica writes: insert 25006, update 25006, create table 25006, temp table 25006, nextval 25006
+// expect: pg replica after errors: 3
+// expect: tds replica rows: 3
+// expect: tds replica writes: insert 3906, update 3906, delete 3906, create table 3906, truncate 3906, create index 3906, select into 3906
+// expect: tds replica message: Failed to update database "lexdb" because the database is read-only.
+// expect: tds replica role: 'READ_ONLY' 1
+// expect: tns master role: 'READ WRITE' 'PRIMARY'
+// expect: tns replica rows: 3
+// expect: tns replica writes: insert error 16000, update error 16000, delete error 16000, create table error 16000, create sequence error 16000, for update error 16000
+// expect: tns replica message: ORA-16000: Attempting to modify database or pluggable database that is open for read-only access.
+// expect: tns replica role: 'READ ONLY WITH APPLY' 'PHYSICAL STANDBY'
+// expect: lsn: master 0/00000005 replica 0/00000005, master's replay NULL, replica's current 55000
+// expect: wait applied: success, then rows 4
+// expect: wait reached: success success
+// expect: wait timeout: 57014 timed out while waiting for target LSN FFFF/00000000 to be replayed; current standby_replay LSN 0/00000006 / timeout / timeout
+// expect: wait errors: 55000 22023 22023 22023 22P02 42601 42601 42601 42601 42601
+// expect: wait in a block: 55000
+// expect: wait on the master: 55000 recovery is not in progress / not in recovery / success / timeout
+import "task"
+import "net"
+import "strings"
+import "postgres"
+import "sqlserver"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+import "../../../cmd/lexdb_tns"
+
+fn port(ln: &net.Listener): str {
+    let a = ln.localAddr()
+    return a[strings.lastIndexOf(&a, ":") + 1..len(a)].toStr()
+}
+
+// ---- PostgreSQL
+
+fn pgConn(p: &str): postgres.Conn {
+    return postgres.connect(&("host=127.0.0.1 port=" + p + " user=test dbname=test sslmode=disable")).unwrap()
+}
+
+fn pg1(c: mut &postgres.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, r.text(i, 0).unwrapOr("NULL")) }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+fn pgChecks(master: &str, replica: &str) {
+    var m = pgConn(master)
+    println("pg master: in_hot_standby " + m.parameter("in_hot_standby").unwrapOr("none") + ", default_transaction_read_only " +
+            m.parameter("default_transaction_read_only").unwrapOr("none") + ", recovery " + pg1(mut &m, "select pg_is_in_recovery()"))
+    var r = pgConn(replica)
+    println("pg replica: in_hot_standby " + r.parameter("in_hot_standby").unwrapOr("none") + ", default_transaction_read_only " +
+            r.parameter("default_transaction_read_only").unwrapOr("none") + ", show " + pg1(mut &r, "show transaction_read_only") +
+            ", recovery " + pg1(mut &r, "select pg_is_in_recovery()"))
+    println("pg replica rows: " + pg1(mut &r, "select count(*) from t"))
+    println("pg replica writes: insert " + pg1(mut &r, "insert into t values (9, 'no')") + ", update " + pg1(mut &r, "update t set name = 'x'") +
+            ", create table " + pg1(mut &r, "create table z (a int)") + ", temp table " + pg1(mut &r, "create temp table tt (a int)") +
+            ", nextval " + pg1(mut &r, "select nextval('q')"))
+    println("pg replica after errors: " + pg1(mut &r, "select count(*) from t"))
+}
+
+fn pgErr(c: mut &postgres.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(r) { return r.text(0, 0).unwrapOr("NULL") }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// ---- WAIT FOR LSN
+
+type Later = record { st: lexdb_store.Store; rep: lexdb_store.Store }
+
+// 100 ms on: a commit on the master, applied on the replica.
+fn later(x: Later): int {
+    let r = task.sleep(100)
+    var m = lexdb_exec.newSession(x.st.share())
+    let q = m.exec("insert into t values (4, 'd')").unwrap()
+    m.close()
+    let n = x.rep.follower().unwrap().poll(x.st.durableBatch()).unwrap()
+    return 0
+}
+
+fn waitChecks(st: &lexdb_store.Store, rep: &lexdb_store.Store, master: &str, replica: &str) {
+    var m = pgConn(master)
+    var r = pgConn(replica)
+    let lsn = pg1(mut &m, "select pg_current_wal_lsn()")
+    println("lsn: master " + lsn + " replica " + pg1(mut &r, "select pg_last_wal_replay_lsn()") + ", master's replay " +
+            pg1(mut &m, "select pg_last_wal_replay_lsn()") + ", replica's current " + pg1(mut &r, "select pg_current_wal_lsn()"))
+    // the next commit's batch
+    let next = "0/0000000" + (strings.parseIntOpt(&lsn[len(lsn) - 1..len(lsn)].toStr()).unwrap() + 1).toStr()
+    var got = ""
+    task.scope(fn(s: mut &task.Scope) {
+        let w = s.start(later, Later{st: st.share(), rep: rep.share()})
+        got = pg1(mut &r, &("wait for lsn '" + next + "' with (timeout '5s')"))
+    })
+    println("wait applied: " + got + ", then rows " + pg1(mut &r, "select count(*) from t"))
+    println("wait reached: " + pg1(mut &r, &("wait for lsn '" + lsn + "'")) + " " + pg1(mut &r, &("wait for lsn '0/1' with (mode 'standby_flush', timeout 10)")))
+    println("wait timeout: " + pgErr(mut &r, "wait for lsn 'FFFF/0' with (timeout '20ms')") + " / " +
+            pg1(mut &r, "wait for lsn 'FFFF/0' with (timeout 20, no_throw)") + " / " +
+            pg1(mut &r, "wait for lsn 'FFFF/0' WITH (MODE standby_write, NO_THROW true, TIMEOUT '0.02 s')"))
+    var errs: []str = []
+    for q in ["wait for lsn '0/1' with (mode 'primary_flush')", "wait for lsn '0/1' with (mode 'bogus')", "wait for lsn '0/1' with (timeout '-1')",
+              "wait for lsn '0/1' with (timeout 'abc')", "wait for lsn 'xyz'", "wait for lsn '0/1' with (timeout 1, timeout 2)",
+              "wait for lsn '0/1' with (foo 1)", "wait for lsn '0/1' with (no_throw maybe)", "wait lsn '0/1'", "wait for lsn '0/1' with ()"] {
+        append(mut &errs, pg1(mut &r, &q))
+    }
+    println("wait errors: " + strings.join(&errs, " "))
+    let b = pg1(mut &r, "begin")
+    let inb = pg1(mut &r, "wait for lsn '0/1'")
+    let rb = pg1(mut &r, "rollback")
+    println("wait in a block: " + inb)
+    println("wait on the master: " + pgErr(mut &m, "wait for lsn '0/1'") + " / " + pg1(mut &m, "wait for lsn '0/1' with (no_throw)") + " / " +
+            pg1(mut &m, &("wait for lsn '" + lsn + "' with (mode 'primary_flush')")) + " / " +
+            pg1(mut &m, "wait for lsn 'FFFF/0' with (mode primary_flush, timeout 20, no_throw)"))
+}
+
+// ---- SQL Server
+
+fn tdsConn(p: &str): sqlserver.Conn {
+    return sqlserver.connect(&("Server=127.0.0.1," + p + ";UID=sa;PWD=sa;Encrypt=no")).unwrap()
+}
+
+fn ms1(c: mut &sqlserver.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() {
+                var cells: []str = []
+                for j in 0..r.columnCount() { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+                append(mut &out, strings.join(&cells, " "))
+            }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return e.code.toStr() }
+    }
+}
+
+fn msMsg(c: mut &sqlserver.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(_) { return "no error" }
+        Err(e) { return e.msg.clone() }
+    }
+}
+
+fn tdsChecks(replica: &str) {
+    var r = tdsConn(replica)
+    println("tds replica rows: " + ms1(mut &r, "select count(*) from t"))
+    println("tds replica writes: insert " + ms1(mut &r, "insert into t values (9, 'no')") + ", update " + ms1(mut &r, "update t set name = 'x'") +
+            ", delete " + ms1(mut &r, "delete from t") + ", create table " + ms1(mut &r, "create table z (a int)") +
+            ", truncate " + ms1(mut &r, "truncate table t") + ", create index " + ms1(mut &r, "create index ix on t (name)") +
+            ", select into " + ms1(mut &r, "select * into t2 from t"))
+    println("tds replica message: " + msMsg(mut &r, "insert into t values (9, 'no')"))
+    println("tds replica role: " + ms1(mut &r, "select cast(databasepropertyex('lexdb', 'Updateability') as nvarchar(20)), " +
+                                        "(select cast(is_read_only as int) from sys.databases where name = db_name())"))
+}
+
+// ---- Oracle
+
+fn tnsConn(p: &str): oracle.Conn {
+    return oracle.connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + p + "/lexdb")).unwrap()
+}
+
+fn or1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() {
+                var cells: []str = []
+                for j in 0..r.columnCount() { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+                append(mut &out, strings.join(&cells, " "))
+            }
+            return strings.join(&out, ",")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn orRun(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(sql, &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn orMsg(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(sql, &[]) {
+        Ok(_) { return "no error" }
+        Err(e) { return strings.trim(&e.msg).toStr() }
+    }
+}
+
+fn tnsChecks(master: &str, replica: &str) {
+    var m = tnsConn(master)
+    println("tns master role: " + or1(mut &m, "select open_mode, database_role from v$database"))
+    var r = tnsConn(replica)
+    println("tns replica rows: " + or1(mut &r, "select count(*) from t"))
+    println("tns replica writes: insert " + orRun(mut &r, "insert into t values (9, 'no')") + ", update " + orRun(mut &r, "update t set name = 'x'") +
+            ", delete " + orRun(mut &r, "delete from t") + ", create table " + orRun(mut &r, "create table z (a number)") +
+            ", create sequence " + orRun(mut &r, "create sequence sq2") + ", for update " + or1(mut &r, "select id from t for update"))
+    println("tns replica message: " + orMsg(mut &r, "insert into t values (9, 'no')"))
+    println("tns replica role: " + or1(mut &r, "select open_mode, database_role from v$database"))
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(23)
+    let opts = lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+    lexdb_store.run(fs.share(), opts, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        var m = lexdb_exec.newSession(st.share())
+        for q in ["create table t (id int primary key, name text)", "insert into t values (1, 'a'), (2, 'b'), (3, 'c')", "create sequence q"] {
+            let r = m.exec(&q).unwrap()
+        }
+        st.checkpoint().unwrap()
+        let rep = lexdb_store.openReplica(fs.share(), opts, lexdb_store.Link.Local(st.weakRef())).unwrap()
+        let n = rep.follower().unwrap().poll(st.durableBatch()).unwrap()
+        lexdb_exec.bootstrap(&rep).unwrap()
+        lexdb_wire.configure(&rep, &lexdb_wire.noAuth()).unwrap()
+        task.scope(fn(s: mut &task.Scope) {
+            let mpg = net.listen("127.0.0.1:0").unwrap()
+            let rpg = net.listen("127.0.0.1:0").unwrap()
+            let mtns = net.listen("127.0.0.1:0").unwrap()
+            let rtns = net.listen("127.0.0.1:0").unwrap()
+            let rtds = net.listen("127.0.0.1:0").unwrap()
+            let pm = port(&mpg)
+            let pr = port(&rpg)
+            let tm = port(&mtns)
+            let tr = port(&rtns)
+            let dr = port(&rtds)
+            let a1 = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: mpg, st: st.share()})
+            let a2 = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: rpg, st: rep.share()})
+            let a3 = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: mtns, st: st.share()})
+            let a4 = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: rtns, st: rep.share()})
+            let a5 = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: rtds, st: rep.share()})
+            pgChecks(&pm, &pr)
+            tdsChecks(&dr)
+            tnsChecks(&tm, &tr)
+            waitChecks(&st, &rep, &pm, &pr)
+            { let stop = a5 }
+            { let stop = a4 }
+            { let stop = a3 }
+            { let stop = a2 }
+            { let stop = a1 }
+        })
+        m.close()
+        rep.close()
+        return 0
+    }).unwrap()
+}

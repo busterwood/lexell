@@ -6752,10 +6752,12 @@ pub type Outbox = record {
     pub ckpt: int               // the hold to send, ckpt -1 none
     pub seg: int
     pub wake: []task.Promise[Unit]
+    pub doors: []str            // the replica's listeners, "tds HOST:PORT", to announce (lexdb_repl.announce, lexdb.md 9.137)
+    pub doorsAt: int            // changed each time they are set
 }
 
 pub fn newOutbox(first: int): task.Shared[Outbox] {
-    return task.shared(Outbox{first: first, ckpt: -1, seg: -1, wake: []})
+    return task.shared(Outbox{first: first, ckpt: -1, seg: -1, wake: [], doors: [], doorsAt: 0})
 }
 
 // Asks the master to keep what the follower reads (Store.hold).
@@ -6871,6 +6873,7 @@ type Fol = record {
     watched: int            // a tree whose applied writes are counted (Store.watch), -1 none
     watchedWrites: int
     metaDue: bool           // a newer checkpoint may be on disk (checkpointed); a local link's always
+    wakes: []task.Promise[Unit]     // woken after batches are applied (waitApplied: WAIT FOR LSN, lexdb.md 9.137)
 }
 
 pub type Follower = value record { sh: task.Shared[Fol] }
@@ -6934,7 +6937,7 @@ fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, cacheByt
     let fol = Fol{link: link, data: data, fs: logFs, bases: [], next: [b], pool: [], pageOf: [], refd: [], at: newMap(),
                   used: 0, budget: cacheBytes, hand: 0, eps: [newEpoch(0)], life: newMap(), applied: m.replayBatch - 1,
                   seg: m.replaySeg, off: m.replayOff, segF: [], segNo: -1, snaps: [], nextSnap: 0,
-                  loads: 0, evictions: 0, batches: 0, pushes: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false}
+                  loads: 0, evictions: 0, batches: 0, pushes: 0, freed: 0, watched: -1, watchedWrites: 0, metaDue: false, wakes: []}
     let fo = Follower{sh: task.shared(fol)}
     fo.adopt()
     return Ok(fo)
@@ -6944,6 +6947,13 @@ fn openFollowerHow(link: Link, fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, cacheByt
 // page.
 pub fn (fo: &Follower) checkpointed() {
     fo.sh.with(fn(f: mut &Fol) { f.metaDue = true })
+}
+
+// The last batch applied (a replica's replayed LSN, lexdb.md 9.137).
+pub fn (fo: &Follower) appliedBatch(): int {
+    var b = 0
+    fo.sh.with(fn(f: mut &Fol) { b = f.applied })
+    return b
 }
 
 pub fn (fo: &Follower) ready(): bool {
@@ -6957,6 +6967,7 @@ pub fn (fo: &Follower) close() {
         f.data.close()
         while len(f.segF) > 0 { pop(mut &f.segF).close() }
         f.link.hold(-1, -1)
+        while len(f.wakes) > 0 { let gone = pop(mut &f.wakes) }       // (abandoned: waitApplied gives false)
     })
 }
 
@@ -7025,6 +7036,7 @@ pub fn (fo: &Follower) poll(upto: int): Result[int, lexdb_base.DbErr] {
         n += 1
     }
     try fo.settle()
+    if n > 0 { fo.wake() }
     return Ok(n)
 }
 
@@ -7062,7 +7074,47 @@ pub fn (fo: &Follower) pushed(batch: int, seg: int, off: int, data: &[]byte): Re
         f.batches += 1
         f.pushes += 1
     })
-    return fo.settle()
+    try fo.settle()
+    fo.wake()
+    return Ok(Unit{})
+}
+
+// Wakes the waits for an applied batch (waitApplied).
+fn (fo: &Follower) wake() {
+    var ws: []task.Promise[Unit] = []
+    fo.sh.with(fn(f: mut &Fol) { while len(f.wakes) > 0 { append(mut &ws, pop(mut &f.wakes)) } })
+    while len(ws) > 0 { pop(mut &ws).complete(Unit{}) }
+}
+
+// Waits until batch b is applied (a replica's WAIT FOR LSN, lexdb.md 9.137):
+// Ok(true) once it is, Ok(false) when the follower closed first; Err when
+// the waiting task is cancelled or an enclosing task.within's deadline
+// passes.
+pub fn (fo: &Follower) waitApplied(b: int): Result[bool, task.Cancelled] {
+    while true {
+        var fut: []task.Future[Unit] = []
+        var done = false
+        fo.sh.with(fn(f: mut &Fol) {
+            if f.applied >= b {
+                done = true
+                return
+            }
+            let task.Handoff{promise: p, future: w} = task.promise[Unit]()
+            append(mut &f.wakes, p)
+            append(mut &fut, w)
+        })
+        if done { return Ok(true) }
+        match pop(mut &fut).wait() {
+            Ok(_) {}
+            Err(e) {
+                match e {
+                    task.Cancelled.Abandoned { return Ok(false) }
+                    else { return Err(e) }
+                }
+            }
+        }
+    }
+    return Ok(false)
 }
 
 // A durable batch the log no longer has where the follower looks: its
