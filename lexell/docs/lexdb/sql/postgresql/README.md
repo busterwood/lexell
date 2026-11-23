@@ -134,6 +134,11 @@ Comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`), `BETWEEN [SYMMETRIC]`, `IN`,
 
 ## System catalog
 
+By group: [schemas and the database](catalog-schemas.md) · [tables and columns](catalog-tables.md) ·
+[constraints and indexes](catalog-constraints.md) · [views and sequences](catalog-views-sequences.md) ·
+[types](catalog-types.md) · [functions and procedures](catalog-routines.md) · [roles and
+privileges](catalog-roles.md) · [statistics and other relations](catalog-other.md).
+
 - **pg_catalog**: `pg_namespace`, `pg_class`, `pg_attribute`, `pg_attrdef`, `pg_type`, `pg_index`,
   `pg_constraint`, `pg_description`, `pg_sequence`, `pg_sequences`, `pg_enum`, `pg_collation`, `pg_am`,
   `pg_opclass`, `pg_database`, `pg_proc`, `pg_roles`, `pg_user`, `pg_auth_members`, `pg_inherits`, `pg_depend`,
@@ -153,6 +158,8 @@ Comparison (`=`, `<>`, `!=`, `<`, `<=`, `>`, `>=`), `BETWEEN [SYMMETRIC]`, `IN`,
 `in_hot_standby` and other fixed values. Other names are accepted and ignored by `SET`.
 
 ## Errors
+
+See [error codes](errors.md) for every code, its cause, and how to see it.
 
 Errors carry PostgreSQL's SQLSTATE codes: 23505 (unique violation), 23503 (foreign key), 23502 (not null), 23514
 (check), 42P01 (undefined table), 42703 (undefined column), 42883 (undefined function), 42601 (syntax error), 22P02
