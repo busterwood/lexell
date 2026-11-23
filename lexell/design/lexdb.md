@@ -12652,3 +12652,109 @@ the unit of the log that a replica applies whole.
 5. temporary objects.
 
 What was built is below.
+
+**As built (phases 2 to 4, branch from main 282d828c).**
+- **Listeners** (`cmd/lexdb.lxl`): `listenDoors` opens the TDS, TNS and TCPS listeners for the master and for a
+  replica (with `SO_REUSEPORT` under `--replicas N`), and prints them as before. `--replica` takes `--tds`, `--tns`
+  and `--tcps`. `supervise` gives the replicas `--replica-tds`, `--replica-tns` and `--replica-tcps`, by default the
+  master's addresses one port up (`portUp`). A replica that cannot open a door's listener exits 1.
+- **The role** (new core module `lexdb_standby`, 227 lines):
+  - `readOnlyErr` gives a replica's refused write by the session's door: 25006, `TS3906`, or `ORA16000`. Exec's one
+    refusal (`execStmt`, under its existing `st.follower()` test) calls it; the door is the session's memo key. A
+    write found only at commit (a sequence's) is 25006 from the store, and the doors map it: `sqlNumber` 25006 to
+    3906 with SQL Server's text, and `oraErr` gives ORA-16000 on a replica.
+  - `standbySetting` gives `in_hot_standby`, `transaction_read_only` and `default_transaction_read_only` (exec's
+    `setting`, and the wire's two new ParameterStatus messages at startup).
+  - `CatView.replica` gives `sys.databases.is_read_only` and v$database's OPEN_MODE and DATABASE_ROLE; DATABASE_ROLE
+    was NULL on the master and is now PRIMARY. DATABASEPROPERTYEX is folded by the parser, which has no store, so
+    `lexdb_dialect.setReplica` (set by `bootstrap` of a replica's store, once per process) decides its
+    Updateability.
+  - `recoveryFn`: `pg_is_in_recovery`, `pg_current_wal_lsn` and its insert and flush forms, `pg_last_wal_replay_lsn`
+    and `pg_last_wal_receive_lsn`, as session functions (`isSessFn`).
+- **WAIT FOR LSN**: the parser makes it an S_SHOW of `lexdb_sql.WAIT_LSN`, with the LSN and the options in `names`,
+  so it runs as SHOW does: outside a transaction, with one row, and with no new arm on a statement path. The
+  statement-start `match` has a `wait` arm, last. `lexdb_standby.waitLsn` checks the options as PostgreSQL 19 does,
+  then waits:
+  - on a replica, on `Follower.waitApplied`: a promise per waiter, woken after `poll` or `pushed` applies batches,
+    abandoned at `close`;
+  - on the master (`primary_flush`), on `Store.waitChange`;
+  - TIMEOUT by `task.within`.
+
+  In a block it is 55000 (exec's `Session.waitLsn`).
+- **Routing**:
+  - The replica's link task sends an `A door addr` line for each of its listeners (`lexdb_repl.announce` through the
+    link's outbox, `Outbox.doors`). The master keeps them in its memo while the link lasts (`setRoutes`, cleared when
+    the link ends); `routeOf` picks one round robin by connection id.
+  - TDS: `parseLogin` reads TypeFlags 0x20; `welcome` adds ENVCHANGE 20 after LOGINACK (`routing`), and the master
+    then ends the session.
+  - TNS: `connect` answers the read-only service with `redirect`: a REDIRECT packet holding the data's length, then
+    a DATA packet holding the data, as python-oracledb reads them. With no replica it answers REFUSE 12514. A
+    replica accepts the read-only names.
+  - A wildcard host is replaced by the connection's local address.
+- **Lexell's clients**:
+  - lib/sqlserver takes `ApplicationIntent=ReadOnly|ReadWrite`, and `MultiSubnetFailover` (ignored);
+  - lib/tds sets the intent (`login7Intent`) and follows one routing answer (`open`, `openOnce`, `routingOf`);
+  - lib/tns follows up to three REDIRECTs (`open`, `redirectOf`), sending the descriptor they give.
+- **Checked with real drivers** (2026-11-23):
+  - .NET SqlClient 6.0.2 (the SDK 9.0 image), `ApplicationIntent=ReadOnly` to the master's TDS port:
+    `DATABASEPROPERTYEX` READ_ONLY and an INSERT 3906 (class 16, SQL Server's text), so it was routed to the replica.
+    `ReadWrite` got READ_WRITE. With the replica stopped, ReadOnly was served by the master.
+  - python-oracledb 26.1 thin: `lexdb_ro`, `freepdb1_ro` and `FREEPDB1_RO` on the master's TNS port reached the
+    replica (READ ONLY WITH APPLY / PHYSICAL STANDBY, an INSERT ORA-16000); `lexdb` reached the master. With no
+    replica, DPY-6001 (ORA-12514).
+  - psql 18 (libpq) with a host list of the master and a replica, in either order: `target_session_attrs=read-write`
+    and `primary` picked the master; `standby`, `read-only` and `prefer-standby` picked the replica.
+  - WAIT FOR LSN through psql against a replica and the master: every status and error of the list above.
+- **Tests**:
+  - `tests/lexdb/run/replica_doors.lxl` (in the suite): a master and a replica store in one process, the replica's
+    pgwire, TDS and TNS listeners and the master's TDS and TNS, through lib/postgres, lib/sqlserver and lib/oracle.
+    Per door it checks the errors, the role and the rows; then WAIT FOR LSN (a wait ended by a commit applied 100 ms
+    later, the timeouts, the options' errors, in a block, on the master); then routing (none up, up, a wildcard
+    address, at the replica, gone).
+  - `tests/lexdb/replica.py`: the hand replica runs with `--tds` and `--tns`, and every round a write through each
+    is refused (3906, ORA-16000) while t's rows match the master's. The supervised form runs with `--tds` and
+    `--tns`: the replicas' doors one port up, libpq host lists by `target_session_attrs`, v$database on both, and
+    the master routing ReadOnly logins and the `_ro` services. These are checked before and after the master is
+    killed and started again. `tests/lexdb/doorsql.lxl` is its SQL Server and Oracle client.
+  - The tests need `LXL_LIB` pointed at this tree's `lib` until the lib changes are on main, since lxlc takes its
+    library from beside the compiler.
+- **Not done:**
+  - TCPS redirect is written (PROTOCOL=tcps, the `tcps` routes) but not tested.
+  - `BEGIN READ WRITE` / `SET TRANSACTION READ WRITE` on a replica is not PostgreSQL's 0A000.
+  - lexdb has no pg_lsn type, so the LSN functions give text.
+  - A replica's sessions see READ_ONLY from DATABASEPROPERTYEX by the process flag; an in-process test with a
+    master and a replica therefore sees READ_ONLY on both, and `replica_doors` checks `sys.databases` for routing.
+
+**Phase 5, not built: temporary objects on a replica.** Temporary tables are catalog rows and trees in the store,
+logged like any (9.96), and a replica's store has no writable tree. So the T-SQL door's `#temp` tables and table
+variables, and Oracle DML on a global temporary table, need storage on the replica that never reaches the log. The
+plan:
+1. **Store** (`lexdb_store`, replica mode): local trees, numbered from a range the master never uses, kept in
+   memory for the session (a sorted map per tree, or a page-less B+tree from the existing node code). A commit
+   whose writes are all to local trees, or to catalog keys in the session's `pg_temp_N` range, applies them there
+   with no log record. Any other write is refused, as now.
+2. **Reads**: `viewOf`'s `View.Repl` consults the overlay for local trees and for the session's temporary catalog
+   keys (get, getMany, scan, scanBack, countRange). Snapshots and savepoints work through the transaction's own
+   writes, as they do on the master.
+3. **Exec**: a replica allows temporary DDL and DML in the T-SQL door (`#t`, `@t`), refuses them in the PostgreSQL
+   door (25006), and in the Oracle door allows DML on a GTT the master defined while refusing `CREATE GLOBAL
+   TEMPORARY TABLE` (ORA-16000). A GTT's per-session rows go to a local tree.
+4. **Tests**: replica_doors' TDS and TNS sections (#temp tables, table variables, SELECT INTO #x, GTT DML, the
+   PostgreSQL refusal), and replica.py's supervised doors.
+
+Size: about two days. It is a storage-layer change, near the store work the user parked (2026-11-15), so it is left
+for the user to schedule.
+
+**Measured** (base 282d828c and the branch, both `-O`, the base built from its own `lib`):
+- **Point statements in process**: `LXL_HASH_SEED=1`, 20,000 prepared statements, instructions per statement, two
+  rounds. Select 33,767 for the base against 33,767 and 33,768 for the branch; INSERT 226,049 for both; UPDATE by key
+  210,238 for both.
+- **Over the wire** (`icount6.sh`, points.sql 3 times, base and branch alternated twice). Without a hash seed:
+  173,096 / 173,035 for the base against 173,125 / 173,231 for the branch. With `LXL_HASH_SEED=1` on the server:
+  173,211 / 173,225 against 173,196 / 173,209, about 15 fewer. Cycles for the branch were 95,466 to 95,958, against
+  95,626 to 96,802 for the base. L1 i-cache misses rose from 329 to 338 to 352 to 357 per statement, which is code
+  placement (the instructions are level).
+- **TPC-H SF1**: base and branch alternated twice, best of each. 8,869 ms for the base, 8,842 for the branch
+  (0.997), and the checksums are equal on all 22. q5, q14, q15 and q20 were 2.2 to 3.2% slower in time, but their
+  server instructions are equal to 0.01% (`iq.sh`: q15 2,632.7M against 2,632.8M), so that is code placement.
+- **lexdb_exec** grew from 20,446 to 20,464 lines.
