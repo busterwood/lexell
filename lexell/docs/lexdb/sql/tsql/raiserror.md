@@ -81,7 +81,7 @@ RAISERROR('[%5d] [%-6s] [%x] 100%%', 16, 2, 42, N'ab', 255);
 ```text
 Msg 50000, Level 16, State 1, Line 1
 Value 42 of balance is wrong
-Msg 50000, Level 16, State 2, Line 1
+Msg 50000, Level 16, State 2, Line 2
 [42] [ab] [ff] 100%
 ```
 
