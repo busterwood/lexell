@@ -280,6 +280,40 @@ smaller differences of its statement.
     (10742), `TOP (-1)` (1014), `TRUNCATE` of a table a foreign key refers to (4712). A `UNION` column-count
     mismatch is 102 (SQL Server: 205); updating an identity column is 544 (SQL Server: 8102).
   - `DATALENGTH` of a `char(7)` value is 14 (SQL Server: 7).
+- **Tables, indexes, views and sequences** (found writing the T-SQL DDL pages):
+  - **`CLUSTERED` and `NONCLUSTERED` are refused everywhere** (102): `PRIMARY KEY CLUSTERED (id)`, `CREATE
+    NONCLUSTERED INDEX`. Most scripts SSMS generates use them.
+  - `DROP INDEX ix ON dbo.t`, SQL Server's usual form, is 156; `DROP INDEX t.ix` is 50000; only `DROP INDEX ix` and
+    `DROP INDEX dbo.ix` work, one at a time.
+  - `ALTER TABLE t ADD CONSTRAINT df DEFAULT 0 FOR col` is 102; a DEFAULT constraint's own name is not kept (it shows
+    as `DF_table_col`), and `DROP CONSTRAINT` finds it by neither name.
+  - `ALTER TABLE` takes one action per statement (`ADD b int, c int` is 50000), and refuses `WITH CHECK ADD`, `WITH
+    NOCHECK ADD`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`, `SET (LOCK_ESCALATION = ...)`, `SWITCH`, `REBUILD` and
+    `DISABLE TRIGGER` (50000).
+  - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
+  - Storage and index options are syntax errors: `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (DATA_COMPRESSION = ...)`,
+    `WITH (FILLFACTOR = ...)`, `WITH (ONLINE = ON)`; so are `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT
+    FOR REPLICATION`, `GENERATED ALWAYS AS ROW START`, `PRIMARY KEY (a DESC)` and an inline `INDEX ix (c)`.
+  - A `rowversion` (`timestamp`) column is never filled in (NULL).
+  - A table with two `IDENTITY` columns is accepted (SQL Server: 2744).
+  - `##g` is a session-private temporary table, as `#g` is.
+  - Alias types (`CREATE TYPE dbo.phone FROM varchar(20)`) are 156.
+  - `ALTER INDEX ... REBUILD`, `REORGANIZE` and `DISABLE` and `CREATE STATISTICS` are 50000; `CREATE COLUMNSTORE
+    INDEX` is 102; `sp_helpindex`, `sp_helptext` and `sp_refreshview` are 2812.
+  - A unique index over rows that clash is 2627 (SQL Server: 1505).
+  - Views: `WITH SCHEMABINDING`, `WITH ENCRYPTION` and `WITH CHECK OPTION` are 50000; `CREATE VIEW` need not be first
+    in its batch (SQL Server: 111); `DROP TABLE` of a table a view reads and `DROP VIEW` of a view another view reads
+    are refused (50000; SQL Server allows both).
+  - `DROP TABLE` of a table a foreign key refers to is 50000 (SQL Server: 3726). A sequence a column `DEFAULT` uses
+    can be dropped, and the next `INSERT` fails with 208 (SQL Server refuses the drop: 3729).
+  - Sequences: `NO CACHE` is 102; `AS decimal(10,0)` is 50000; without `AS` and `START WITH` a sequence starts at 1
+    (SQL Server: a bigint from its minimum); `NEXT VALUE FOR s` twice in one row gives two values (SQL Server: the
+    same); `NEXT VALUE FOR s OVER (...)` is 102; `sp_sequence_get_range` is 2812; past `MAXVALUE` the error is 50000
+    (SQL Server: 11728); `ALTER SEQUENCE s MAXVALUE 100` of a sequence started at 1000 is refused even with
+    `RESTART WITH 50`.
+  - Other error numbers: `DROP TABLE`, `VIEW` or `SEQUENCE` of a missing object is 208 (SQL Server: 3701), `DROP
+    INDEX` of a missing index 50000 (3701), adding a column that exists 50000 (2705), dropping an unknown column 207
+    (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901).
 
 
 ## Oracle door
