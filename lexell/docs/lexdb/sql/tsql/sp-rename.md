@@ -116,11 +116,11 @@ EXEC sp_rename 'dbo.staff';
 ```text
 Msg 15225, Level 16, State 1, Line 1
 No item by the name 'dbo.nothere' could be found in the current database 'lexdb', given that @itemtype was input as '(null)'.
-Msg 15248, Level 16, State 1, Line 1
+Msg 15248, Level 16, State 1, Line 2
 Either the parameter @objname is ambiguous or the claimed @objtype (INDEX) is wrong.
-Msg 15249, Level 16, State 1, Line 1
+Msg 15249, Level 16, State 1, Line 3
 Error: The type of the object 'TABLE' is not valid. It must be COLUMN, DATABASE, INDEX, OBJECT, STATISTICS or USERDATATYPE.
-Msg 201, Level 16, State 4, Line 1
+Msg 201, Level 16, State 4, Line 4
 Procedure or function 'sp_rename' expects parameter '@newname', which was not supplied.
 ```
 
