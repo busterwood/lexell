@@ -1,0 +1,1118 @@
+// lexdb_newfn: the scalar functions the newest releases added (design/lexdb-new-features.md 6.1 item 6), in each door
+// that has them, under its own name, types and errors. One kernel where the products agree (the buckets of a date-time,
+// the edit distances, UNISTR's escapes), each door's spelling around it:
+//
+// - PostgreSQL: date_bin (14), unistr (14), uuidv4 / uuidv7 (18), uuid_extract_version / uuid_extract_timestamp (17), by
+//   their own names;
+// - T-SQL (lexdb_parse.tsqlCall names them #n_t...): DATE_BUCKET and DATETRUNC (2022), BASE64_ENCODE / BASE64_DECODE,
+//   UNISTR, EDIT_DISTANCE, EDIT_DISTANCE_SIMILARITY, JARO_WINKLER_DISTANCE, JARO_WINKLER_SIMILARITY (2025);
+// - Oracle (lexdb_parse.oraCall names them #n_o...): TIME_BUCKET (23ai), UUID, IS_UUID, RAW_TO_UUID, UUID_TO_RAW (26ai),
+//   UNISTR, TO_BOOLEAN (23ai), UTL_MATCH's EDIT_DISTANCE, EDIT_DISTANCE_SIMILARITY, JARO_WINKLER, JARO_WINKLER_SIMILARITY.
+//
+// lexdb_lib.entryOf finds them here after its own (entryOf below), the binder their types (resultOid). A T-SQL call is
+// given its arguments' types after them (the binder's hint, typesHint: each "oid.prec.scale"), for SQL Server's errors
+// by type (8116, 9810) and DATETRUNC's precision.
+
+import "strings"
+import "unicode"
+import "base64"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_ops"
+import "./lexdb_rows"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type Fn = fn(&str, &[]Val, int, &lexdb_time.Zone): Result[Val, DbErr]
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+fn ora(num: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(num.toStr()), 5, '0')), msg) }
+
+// name's function of n arguments here; None: not one of these.
+pub fn entryOf(name: &str, n: int): Option[Fn] {
+    match name {
+        "date_bin" { if n == 3 { return Some(dateBinFn) } }
+        "uuidv4" { if n == 0 { return Some(uuid4Fn) } }
+        "uuidv7" { if n <= 1 { return Some(uuid7Fn) } }
+        "uuid_extract_version" { if n == 1 { return Some(uuidVersionFn) } }
+        "uuid_extract_timestamp" { if n == 1 { return Some(uuidStampFn) } }
+        "unistr" { if n == 1 { return Some(pgUnistrFn) } }
+        "#n_tbucket" { return Some(tBucketFn) }
+        "#n_ttrunc" { return Some(tTruncFn) }
+        "#n_tb64e" { return Some(tB64EncFn) }
+        "#n_tb64d" { return Some(tB64DecFn) }
+        "#n_tunistr" { return Some(tUnistrFn) }
+        "#n_tedit", "#n_teditsim", "#n_tjwd", "#n_tjws" { return Some(tFuzzyFn) }
+        "#n_obucket" { return Some(oBucketFn) }
+        "#n_ouuid" { return Some(oUuidFn) }
+        "#n_oisuuid" { return Some(oIsUuidFn) }
+        "#n_orawuuid" { return Some(oRawToUuidFn) }
+        "#n_ouuidraw" { return Some(oUuidToRawFn) }
+        "#n_ounistr" { return Some(oUnistrFn) }
+        "#n_otobool" { return Some(oToBoolFn) }
+        "#n_oedit", "#n_oeditsim", "#n_ojw", "#n_ojws" { return Some(oFuzzyFn) }
+        else {}
+    }
+    return None
+}
+
+// Whether name is one of these whose value changes from call to call (not folded, not shared).
+pub fn isVolatile(name: &str): bool { return name == "uuidv4" || name == "uuidv7" || name == "#n_ouuid" }
+
+// The type of name's result for arguments of these types; 0: not one of these.
+pub fn resultOid(name: &str, os: &[]int): int {
+    let a = if len(os) > 0 { os[0] } else { 0 }
+    match name {
+        "date_bin" {
+            // (an untyped source is a timestamptz, as PostgreSQL resolves it)
+            let s = if len(os) > 1 { os[1] } else { lexdb_sql.OID_TS }
+            return if s == lexdb_sql.OID_TS || s == lexdb_sql.OID_DATE { lexdb_sql.OID_TS } else { lexdb_sql.OID_TSTZ }
+        }
+        "uuidv4", "uuidv7" { return lexdb_sql.OID_UUID }
+        "uuid_extract_version" { return lexdb_sql.OID_INT2 }
+        "uuid_extract_timestamp" { return lexdb_sql.OID_TSTZ }
+        "unistr", "#n_tunistr", "#n_ounistr", "#n_tb64e", "#n_orawuuid" { return lexdb_sql.OID_TEXT }
+        "#n_tbucket" {
+            let d = if len(os) > 2 { os[2] } else { lexdb_sql.OID_TS }
+            return if d == lexdb_sql.OID_DATE || d == lexdb_sql.OID_TIME || d == lexdb_sql.OID_TSTZ { d } else { lexdb_sql.OID_TS }
+        }
+        "#n_ttrunc" {
+            let d = if len(os) > 1 { os[1] } else { lexdb_sql.OID_TS }
+            return if d == lexdb_sql.OID_DATE || d == lexdb_sql.OID_TIME || d == lexdb_sql.OID_TSTZ { d } else { lexdb_sql.OID_TS }
+        }
+        "#n_obucket" { return if a == lexdb_sql.OID_TSTZ { a } else { lexdb_sql.OID_TS } }
+        "#n_tb64d", "#n_ouuid", "#n_ouuidraw" { return lexdb_sql.OID_BYTEA }
+        "#n_tedit", "#n_teditsim", "#n_tjws" { return lexdb_sql.OID_INT4 }
+        "#n_tjwd", "#n_ojw" { return lexdb_sql.OID_FLOAT8 }
+        "#n_oedit", "#n_oeditsim", "#n_ojws" { return lexdb_sql.OID_NUMERIC }
+        "#n_oisuuid", "#n_otobool" { return lexdb_sql.OID_BOOL }
+        else {}
+    }
+    if !strings.contains(name, "#") && !strings.contains(name, "_") { return 0 }
+    // the newer aggregates (lexdb_agg), their names perhaps marked
+    match lexdb_sql.aggBase(name) {
+        "#product", "any_value" { return a }
+        "#product4" { return lexdb_sql.OID_INT4 }
+        "#product6" { return lexdb_sql.OID_NUMERIC }
+        "bit_and", "bit_or", "bit_xor" { return if strings.contains(name, " dia:o") { lexdb_sql.OID_NUMERIC } else { a } }
+        "#kurtosis_pop", "#kurtosis_samp", "#skewness_pop", "#skewness_samp" { return lexdb_sql.OID_NUMERIC }
+        else { return 0 }
+    }
+}
+
+// ---- the arguments' types (the binder's hint after a T-SQL call's arguments)
+
+pub const HINT: str = "\x00types:"
+
+// The hint of these types.
+pub fn typesHint(ts: &[]lexdb_sql.TypeName): str {
+    var parts: []str = []
+    for t in ts { append(mut &parts, t.oid.toStr() + "." + t.prec.toStr() + "." + t.scale.toStr()) }
+    return HINT + strings.join(&parts, ",")
+}
+
+// A call's arguments without the hint, and the hint's types (oid 0 where none).
+type Args = record {
+    n: int                      // the arguments before the hint
+    oids: []int
+    precs: []int
+    scales: []int
+}
+
+fn argsOf(vs: &[]Val): Args {
+    var a = Args{n: len(vs), oids: [], precs: [], scales: []}
+    if len(vs) > 0 {
+        match vs[len(vs) - 1] {
+            Val.Text(s) {
+                if strings.startsWith(&s, HINT) {
+                    a.n = len(vs) - 1
+                    for p in strings.split(&s[len(HINT)..len(s)], ",") {
+                        let ps = p.toStr()
+                        let f = strings.split(&ps, ".")
+                        append(mut &a.oids, if len(f) > 0 { strings.parseIntOpt(&(f[0].toStr())).unwrapOr(0) } else { 0 })
+                        append(mut &a.precs, if len(f) > 1 { strings.parseIntOpt(&(f[1].toStr())).unwrapOr(0) } else { 0 })
+                        append(mut &a.scales, if len(f) > 2 { strings.parseIntOpt(&(f[2].toStr())).unwrapOr(0) } else { 0 })
+                    }
+                }
+            }
+            else {}
+        }
+    }
+    while len(a.oids) < a.n {
+        append(mut &a.oids, 0)
+        append(mut &a.precs, 0)
+        append(mut &a.scales, 0)
+    }
+    return a
+}
+
+fn isNull(v: &Val): bool { return lexdb_ops.isNull(v) }
+
+// SQL Server's name of a type (an argument's, for 8116 and 9810).
+fn tsName(oid: int, prec: int): str {
+    if oid == lexdb_sql.OID_DATE { return "date" }
+    if oid == lexdb_sql.OID_TIME { return "time" }
+    if oid == lexdb_sql.OID_TSTZ { return "datetimeoffset" }
+    if oid == lexdb_sql.OID_TS { return if prec == 61 { "datetime" } else if prec == 58 { "smalldatetime" } else { "datetime2" } }
+    if oid == lexdb_sql.OID_INT2 { return "smallint" }
+    if oid == lexdb_sql.OID_INT4 { return "int" }
+    if oid == lexdb_sql.OID_INT8 { return "bigint" }
+    if oid == lexdb_sql.OID_NUMERIC { return "numeric" }
+    if oid == lexdb_sql.OID_FLOAT8 || oid == lexdb_sql.OID_FLOAT4 { return "float" }
+    if oid == lexdb_sql.OID_BOOL { return "bit" }
+    if oid == lexdb_sql.OID_BYTEA { return "varbinary" }
+    if oid == lexdb_sql.OID_UUID { return "uniqueidentifier" }
+    return if prec == 167 || prec == 175 { "varchar" } else { "nvarchar" }
+}
+
+// A value's SQL Server type where the hint has none (a variable's).
+fn valName(v: &Val): str {
+    match v {
+        Val.Int(_) { return "int" }
+        Val.Num(_) { return "numeric" }
+        Val.Float(_) { return "float" }
+        Val.Real(_) { return "real" }
+        Val.Bool(_) { return "bit" }
+        Val.Text(_) { return "varchar" }
+        Val.Bytes(_) { return "varbinary" }
+        Val.Date(_) { return "date" }
+        Val.Time(_) { return "time" }
+        Val.Ts(_) { return "datetime2" }
+        Val.Tstz(_) { return "datetimeoffset" }
+        Val.Uuid(_) { return "uniqueidentifier" }
+        else { return "sql_variant" }
+    }
+}
+
+fn argName(a: &Args, vs: &[]Val, k: int): str { return if a.oids[k] != 0 { tsName(a.oids[k], a.precs[k]) } else { valName(&vs[k]) } }
+
+fn badArg(a: &Args, vs: &[]Val, k: int, fname: &str): DbErr {
+    return e("TS8116", &("Argument data type " + argName(a, vs, k) + " is invalid for argument " + (k + 1).toStr() + " of " + fname + " function."))
+}
+
+// ---- dates and times: the buckets (DATE_BUCKET, TIME_BUCKET, date_bin) and DATETRUNC
+
+fn floorDiv(a: int, b: int): int {
+    let q = a / b
+    return if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+
+fn monthsOf(us: int): int {
+    let l = lexdb_time.localOf(us)
+    return l.date.year * 12 + l.date.month - 1
+}
+
+fn addMonths(us: int, m: int): Result[int, DbErr] { return lexdb_time.tsPlus(us, &lexdb_time.Ival{months: m, days: 0, us: 0}) }
+
+// The start of the bucket of local time us: buckets of months months (when above 0) or of width microseconds, from
+// origin; with end, the bucket's end.
+pub fn bucketOf(us: int, months: int, width: int, origin: int, end: bool): Result[int, DbErr] {
+    if months > 0 {
+        // the whole months from the origin to us (the origin's day and time counted), as SQL Server's DATE_BUCKET
+        var m = monthsOf(us) - monthsOf(origin)
+        if (try addMonths(origin, m)) > us { m -= 1 }
+        let k = floorDiv(m, months) * months
+        return addMonths(origin, if end { k + months } else { k })
+    }
+    let k = floorDiv(us - origin, width)
+    let at = origin + k * width
+    return Ok(if end { at + width } else { at })
+}
+
+// 1900-01-01 00:00, SQL Server's origin
+fn origin1900(): int { return lexdb_time.dateToTs(lexdb_time.makeDate(1900, 1, 1).unwrap()) }
+
+// T-SQL DATE_BUCKET(part, number, date [, origin]): the part as lexdb_parse.datePart gives it.
+fn tBucketFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = "Date_Bucket"
+    if a.n < 3 { return Err(e("TS174", "The date_bucket function requires 3 to 4 arguments.")) }
+    let part = lexdb_sql.text(&vs[0])
+    // the date's type and the number's (an integer or a number; a string is not)
+    let doid = if a.oids[2] != 0 { a.oids[2] } else { oidOfVal(&vs[2]) }
+    if !(doid == lexdb_sql.OID_DATE || doid == lexdb_sql.OID_TIME || doid == lexdb_sql.OID_TS || doid == lexdb_sql.OID_TSTZ) {
+        return Err(badArg(&a, vs, 2, &fname))
+    }
+    let noid = if a.oids[1] != 0 { a.oids[1] } else { oidOfVal(&vs[1]) }
+    if !(noid == lexdb_sql.OID_INT2 || noid == lexdb_sql.OID_INT4 || noid == lexdb_sql.OID_INT8 || noid == lexdb_sql.OID_NUMERIC ||
+         noid == lexdb_sql.OID_FLOAT8 || noid == lexdb_sql.OID_FLOAT4 || noid == lexdb_sql.OID_BOOL) {
+        return Err(badArg(&a, vs, 1, &fname))
+    }
+    if a.n > 3 {
+        let ooid = if a.oids[3] != 0 { a.oids[3] } else { oidOfVal(&vs[3]) }
+        if ooid != 0 && (ooid != doid || (doid == lexdb_sql.OID_TS && a.precs[3] != a.precs[2] && a.oids[3] != 0 && a.oids[2] != 0)) {
+            return Err(badArg(&a, vs, 3, &fname))
+        }
+    }
+    let dname = tsName(doid, a.precs[2])
+    var months = 0
+    var width = 0
+    match part.toStr() {
+        "year" { months = 12 }
+        "quarter" { months = 3 }
+        "month" { months = 1 }
+        "week" { width = 7 * lexdb_time.DAY_US }
+        "day" { width = lexdb_time.DAY_US }
+        "hour" { width = 3600000000 }
+        "minute" { width = 60000000 }
+        "second" { width = 1000000 }
+        "millisecond" { width = 1000 }
+        else { return Err(e("TS9810", &("The datepart " + part + " is not supported by date function " + fname + " for data type " + dname + "."))) }
+    }
+    if (doid == lexdb_sql.OID_DATE && width > 0 && width < lexdb_time.DAY_US) || (doid == lexdb_sql.OID_TIME && (months > 0 || width >= lexdb_time.DAY_US)) {
+        return Err(e("TS9810", &("The datepart " + part + " is not supported by date function " + fname + " for data type " + dname + ".")))
+    }
+    if isNull(&vs[1]) || isNull(&vs[2]) { return Ok(Val.Null) }
+    let n = match lexdb_ops.asNum(&vs[1]) {
+        Some(d) { d.toInt(Rounding.TOWARD_ZERO).unwrapOr(0) }
+        None { 0 }
+    }
+    if n <= 0 { return Err(e("TS9834", "Invalid bucket width value passed to date_bucket function. Only positive values are allowed.")) }
+    var org = if doid == lexdb_sql.OID_TIME { 0 } else { origin1900() }
+    if a.n > 3 && !isNull(&vs[3]) { org = try localUs(&vs[3], z) }
+    if doid == lexdb_sql.OID_TIME {
+        let t = match vs[2] { Val.Time(u) { u } else { 0 } }
+        return Ok(Val.Time(floorMod(try bucketOf(t, 0, n * width, org, false), lexdb_time.DAY_US)))
+    }
+    let us = try localUs(&vs[2], z)
+    let r = match bucketOf(us, n * months, n * width, org, false) {
+        Ok(x) { x }
+        Err(_) { return Err(e("TS517", "Adding a value to a 'date' column caused an overflow.")) }
+    }
+    return Ok(sameKind(&vs[2], r, z))
+}
+
+fn oidOfVal(v: &Val): int {
+    match v {
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Int(_) { return lexdb_sql.OID_INT4 }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
+        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Text(_) { return lexdb_sql.OID_TEXT }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
+        else { return 0 }
+    }
+}
+
+// A date-time as local microseconds since 2000 (a timestamptz in the session's zone).
+fn localUs(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
+        Val.Ts(u) { return Ok(u) }
+        Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Time(u) { return Ok(u) }
+        Val.Text(s) {
+            match lexdb_time.parseTs(&strings.trim(s), z) {
+                Ok(u) { return Ok(u) }
+                Err(_) { return Err(e("TS241", "Conversion failed when converting date and/or time from character string.")) }
+            }
+        }
+        else { return Err(e("TS8116", "Argument data type is invalid for a date function.")) }
+    }
+}
+
+// Local time us as a value of v's kind.
+fn sameKind(v: &Val, us: int, z: &lexdb_time.Zone): Val {
+    match v {
+        Val.Date(_) { return Val.Date(lexdb_time.tsToDate(us)) }
+        Val.Tstz(_) { return Val.Tstz(lexdb_time.tsToTstz(us, z)) }
+        Val.Time(_) { return Val.Time(floorMod(us, lexdb_time.DAY_US)) }
+        else { return Val.Ts(us) }
+    }
+}
+
+// T-SQL DATETRUNC(part, date): the part as tsqlCall gives it (iso_week its own); the date's type kept.
+fn tTruncFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = "datetrunc"
+    if a.n != 2 { return Err(e("TS174", "The datetrunc function requires 2 argument(s).")) }
+    let part = lexdb_sql.text(&vs[0])
+    let doid = if a.oids[1] != 0 { a.oids[1] } else { oidOfVal(&vs[1]) }
+    if !(doid == lexdb_sql.OID_DATE || doid == lexdb_sql.OID_TIME || doid == lexdb_sql.OID_TS || doid == lexdb_sql.OID_TSTZ ||
+         doid == lexdb_sql.OID_TEXT || doid == lexdb_sql.OID_VARCHAR || doid == lexdb_sql.OID_UNKNOWN) {
+        return Err(badArg(&a, vs, 1, &fname))
+    }
+    let txt = !(doid == lexdb_sql.OID_DATE || doid == lexdb_sql.OID_TIME || doid == lexdb_sql.OID_TS || doid == lexdb_sql.OID_TSTZ)
+    // the type's fractional digits: datetime 3, smalldatetime 0, datetime2 and time their scale (7 without one)
+    let prec = a.precs[1]
+    let scale = if prec == 61 { 3 } else if prec == 58 { 0 } else if prec == 1 { a.scales[1] } else { 7 }
+    let dname = if txt { "datetime2" } else { tsName(doid, prec) }
+    let rank = match part.toStr() {
+        "year" { 1 }
+        "quarter" { 2 }
+        "month" { 3 }
+        "dayofyear", "day" { 4 }
+        "week", "iso_week" { 5 }
+        "hour" { 6 }
+        "minute" { 7 }
+        "second" { 8 }
+        "millisecond" { 9 }
+        "microsecond" { 10 }
+        else { 0 }
+    }
+    let unsupported = rank == 0 || (doid == lexdb_sql.OID_DATE && rank >= 6) || (doid == lexdb_sql.OID_TIME && rank <= 5) ||
+                      (rank == 9 && scale < 3) || (rank == 10 && scale < 6)
+    if unsupported { return Err(e("TS9810", &("The datepart " + part + " is not supported by date function " + fname + " for data type " + dname + "."))) }
+    if isNull(&vs[1]) { return Ok(Val.Null) }
+    let us = try localUs(&vs[1], z)
+    var r = us
+    if rank <= 5 {
+        let l = lexdb_time.localOf(us)
+        let day = floorDiv(us, lexdb_time.DAY_US)
+        var d = day
+        if rank == 1 { d = lexdb_time.makeDate(l.date.year, 1, 1).unwrap() }
+        else if rank == 2 { d = lexdb_time.makeDate(l.date.year, ((l.date.month - 1) / 3) * 3 + 1, 1).unwrap() }
+        else if rank == 3 { d = lexdb_time.makeDate(l.date.year, l.date.month, 1).unwrap() }
+        else if rank == 5 {
+            // 2000-01-01 was a Saturday: Sunday-based weeks (DATEFIRST 7), iso_week's from Monday
+            let dow = floorMod(day + 6, 7)          // 0 Sunday
+            d = if part == "iso_week" { day - floorMod(dow + 6, 7) } else { day - dow }
+        }
+        r = lexdb_time.dateToTs(d)
+    } else {
+        let w = if rank == 6 { 3600000000 } else if rank == 7 { 60000000 } else if rank == 8 { 1000000 } else if rank == 9 { 1000 } else { 1 }
+        r = floorDiv(us, w) * w
+    }
+    if txt { return Ok(Val.Ts(r)) }
+    return Ok(sameKind(&vs[1], r, z))
+}
+
+// PostgreSQL's date_bin(stride, source, origin): source's bucket of stride (no months), from origin.
+fn dateBinFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) || isNull(&vs[1]) || isNull(&vs[2]) { return Ok(Val.Null) }
+    let iv = match lexdb_ops.coerce(vs[0].clone(), &lexdb_sql.oidType(lexdb_sql.OID_IVAL)) {
+        Ok(x) { match x { Val.Ival(v) { v } else { return Err(e("42883", "function date_bin needs an interval")) } } }
+        Err(x) { return Err(x) }
+    }
+    if iv.months != 0 { return Err(e("0A000", "timestamps cannot be binned into intervals containing months or years")) }
+    let width = iv.days * lexdb_time.DAY_US + iv.us
+    if width <= 0 { return Err(e("22008", "stride must be greater than zero")) }
+    // a timestamptz binned as instants; the rest as timestamps
+    var tz = false
+    match vs[1] {
+        Val.Tstz(_) { tz = true }
+        Val.Text(_) { tz = true }
+        else {}
+    }
+    let tgt = if tz { lexdb_sql.oidType(lexdb_sql.OID_TSTZ) } else { lexdb_sql.oidType(lexdb_sql.OID_TS) }
+    let src = try lexdb_ops.coerce(vs[1].clone(), &tgt)
+    let org = try lexdb_ops.coerce(vs[2].clone(), &tgt)
+    let s = match src { Val.Ts(u) { u } Val.Tstz(u) { u } else { 0 } }
+    let o = match org { Val.Ts(u) { u } Val.Tstz(u) { u } else { 0 } }
+    if s == lexdb_time.INF || s == lexdb_time.NINF { return Ok(src) }
+    if o == lexdb_time.INF || o == lexdb_time.NINF { return Err(e("22008", "origin out of range")) }
+    // (PostgreSQL's: the difference must fit, and the result)
+    match s.checkedSub(o) {
+        Some(_) {}
+        None { return Err(e("22008", "interval out of range")) }
+    }
+    let r = try bucketOf(s, 0, width, o, false)
+    return Ok(if tz { Val.Tstz(r) } else { Val.Ts(r) })
+}
+
+// Oracle's TIME_BUCKET(datetime, stride, origin [, START | END]): the stride an interval or an ISO 8601 duration's text,
+// the origin of the datetime's type; END (the parser's 1 after them) the bucket's end.
+fn oBucketFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let n = len(vs)
+    if n < 3 { return Err(ora(909, "invalid number of arguments")) }
+    let end = n > 3 && lexdb_ops.intOf(&vs[3]).unwrapOr(0) == 1
+    // the origin of the datetime's own type (a DATE and a TIMESTAMP are told apart by the parser's mark: 0 / 1 after END)
+    let dk = if n > 5 { lexdb_ops.intOf(&vs[4]).unwrapOr(-1) } else { -1 }
+    let ok = if n > 5 { lexdb_ops.intOf(&vs[5]).unwrapOr(-1) } else { -1 }
+    if dk >= 0 && ok >= 0 && dk != ok {
+        return Err(ora(3403, "For TIME_BUCKET function, the origin should have the same data type as specified datetime."))
+    }
+    if oidOfVal(&vs[2]) != 0 && oidOfVal(&vs[0]) != 0 && oidOfVal(&vs[2]) != oidOfVal(&vs[0]) && !isNull(&vs[0]) {
+        return Err(ora(3403, "For TIME_BUCKET function, the origin should have the same data type as specified datetime."))
+    }
+    if isNull(&vs[0]) || isNull(&vs[1]) || isNull(&vs[2]) { return Ok(Val.Null) }
+    let iv = match vs[1] {
+        Val.Ival(v) { v }
+        Val.Text(s) {
+            match isoDuration(&s) {
+                Some(v) { v }
+                None { return Err(ora(1867, "the interval is invalid")) }
+            }
+        }
+        else { return Err(ora(932, "inconsistent datatypes: expected INTERVAL got NUMBER")) }
+    }
+    let months = iv.months
+    let width = iv.days * lexdb_time.DAY_US + iv.us
+    if months < 0 || width < 0 || (months == 0 && width == 0) || (months > 0 && width > 0) { return Err(ora(1867, "the interval is invalid")) }
+    if months == 0 && width < 1000000 {
+        return Err(ora(3404, "For TIME_BUCKET function, fractional second is supported only if the specified datetime and the origin are Epoch Time, BINARY_FLOAT or BINARY_DOUBLE."))
+    }
+    let us = try localUs(&vs[0], z)
+    let org = try localUs(&vs[2], z)
+    let r = try bucketOf(us, months, width, org, end)
+    return Ok(sameKind(&vs[0], r, z))
+}
+
+// An ISO 8601 duration (P1Y2M, P3DT4H5M6.5S, PT15M) as an interval; None for another text.
+fn isoDuration(s0: &str): Option[lexdb_time.Ival] {
+    let s = strings.toUpperAscii(&strings.trim(s0))
+    if len(s) < 2 || s[0] != 'P' { return None }
+    var iv = lexdb_time.Ival{months: 0, days: 0, us: 0}
+    var i = 1
+    var inTime = false
+    var any = false
+    while i < len(s) {
+        if s[i] == 'T' {
+            inTime = true
+            i += 1
+            continue
+        }
+        var j = i
+        while j < len(s) && ((s[j] >= '0' && s[j] <= '9') || s[j] == '.') { j += 1 }
+        if j == i || j >= len(s) { return None }
+        let num = match Decimal.parse(&(s[i..j].toStr())) {
+            Ok(d) { d }
+            Err(_) { return None }
+        }
+        let whole = num.toInt(Rounding.TOWARD_ZERO).unwrapOr(0)
+        let u = s[j]
+        if !inTime && u == 'Y' { iv.months += 12 * whole }
+        else if !inTime && u == 'M' { iv.months += whole }
+        else if !inTime && u == 'W' { iv.days += 7 * whole }
+        else if !inTime && u == 'D' { iv.days += whole }
+        else if inTime && u == 'H' { iv.us += whole * 3600000000 }
+        else if inTime && u == 'M' { iv.us += whole * 60000000 }
+        else if inTime && u == 'S' {
+            match num.mulExact(Decimal.fromInt(1000000)) {
+                Ok(x) { iv.us += x.toInt(Rounding.TOWARD_ZERO).unwrapOr(0) }
+                Err(_) { return None }
+            }
+        } else { return None }
+        any = true
+        i = j + 1
+    }
+    return if any { Some(iv) } else { None }
+}
+
+// ---- UUIDs
+
+const UNIX_US = 946684800000000            // microseconds from 1970 to 2000
+
+extern "c" fn getrandom(buf: mut &[byte], n: int, flags: u32): int
+
+fn randomBytes(n: int): Result[[]byte, DbErr] {
+    var b = array(n, byte(0))
+    if getrandom(mut &b, n, u32(0)) != n { return Err(e("58000", "could not generate random values")) }
+    return Ok(b)
+}
+
+fn uuid4Bytes(): Result[[]byte, DbErr] {
+    var b = try randomBytes(16)
+    b[6] = byte((int(b[6]) & 0x0f) | 0x40)
+    b[8] = byte((int(b[8]) & 0x3f) | 0x80)
+    return Ok(b)
+}
+
+fn uuid4Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return Ok(Val.Uuid(lexdb_rows.uuidText(&strFromBytes(&(try uuid4Bytes())))))
+}
+
+// uuidv7([shift]): version 7, the clock's milliseconds (moved by shift) and, as PostgreSQL's, the sub-millisecond part in
+// the next 12 bits (rand_a), the rest random.
+fn uuid7Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var us = lexdb_time.nowTstz()
+    if len(vs) == 1 {
+        if isNull(&vs[0]) { return Ok(Val.Null) }
+        match vs[0] {
+            Val.Ival(iv) { us = try lexdb_time.tstzPlus(us, &iv, z) }
+            else { return Err(e("42883", "function uuidv7 needs an interval")) }
+        }
+    }
+    let unixUs = us + UNIX_US
+    let ms = floorDiv(unixUs, 1000)
+    let sub = (floorMod(unixUs, 1000) * 4096) / 1000
+    var b = try randomBytes(16)
+    for k in 0..6 { b[k] = byte((ms >> (8 * (5 - k))) & 255) }
+    b[6] = byte(0x70 | ((sub >> 8) & 0x0f))
+    b[7] = byte(sub & 255)
+    b[8] = byte((int(b[8]) & 0x3f) | 0x80)
+    return Ok(Val.Uuid(lexdb_rows.uuidText(&strFromBytes(&b))))
+}
+
+fn uuidRaw(v: &Val): Option[str] {
+    match v {
+        Val.Uuid(u) { return Some(lexdb_rows.uuidBytes(&u)) }
+        else {
+            match lexdb_ops.coerce(v.clone(), &lexdb_sql.oidType(lexdb_sql.OID_UUID)) {
+                Ok(x) { match x { Val.Uuid(u) { return Some(lexdb_rows.uuidBytes(&u)) } else { return None } } }
+                Err(_) { return None }
+            }
+        }
+    }
+}
+
+// The version of an RFC 9562 UUID (variant 10), NULL else.
+fn uuidVersionFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let b = try uuidOf(&vs[0])
+    if (int(b[8]) & 0xc0) != 0x80 { return Ok(Val.Null) }
+    return Ok(Val.Int((int(b[6]) >> 4) & 15))
+}
+
+fn uuidOf(v: &Val): Result[str, DbErr] {
+    match uuidRaw(v) {
+        Some(b) { return Ok(b) }
+        None { return Err(e("42883", "function needs a uuid")) }
+    }
+}
+
+// The time of a version 1 or 7 UUID, NULL for another.
+fn uuidStampFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let b = try uuidOf(&vs[0])
+    if (int(b[8]) & 0xc0) != 0x80 { return Ok(Val.Null) }
+    let ver = (int(b[6]) >> 4) & 15
+    if ver == 7 {
+        var ms = 0
+        for k in 0..6 { ms = (ms << 8) | int(b[k]) }
+        return Ok(Val.Tstz(ms * 1000 - UNIX_US))
+    }
+    if ver == 1 {
+        // 100 ns ticks since 1582-10-15: time_low, time_mid, time_hi
+        var lo = 0
+        for k in 0..4 { lo = (lo << 8) | int(b[k]) }
+        let mid = (int(b[4]) << 8) | int(b[5])
+        let hi = ((int(b[6]) & 0x0f) << 8) | int(b[7])
+        let ticks = (hi << 48) | (mid << 32) | lo
+        let unixUs = ticks / 10 - 12219292800000000
+        return Ok(Val.Tstz(unixUs - UNIX_US))
+    }
+    return Ok(Val.Null)
+}
+
+// Oracle's UUID(): a version 4 UUID's 16 bytes (RAW).
+fn oUuidFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) > 0 { return Err(ora(909, "invalid number of arguments")) }
+    return Ok(Val.Bytes(strFromBytes(&(try uuid4Bytes()))))
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+// A UUID's text as Oracle reads one: 32 hex digits, or 36 with the four hyphens; its 16 bytes. Loose (UUID_TO_RAW's):
+// the hyphens anywhere, fewer digits read as the low ones.
+fn oUuidText(s: &str, loose: bool): Option[str] {
+    var hex = ""
+    if loose {
+        for i in 0..len(s) { if s[i] != '-' { hex.addByte(s[i]) } }
+        if len(hex) == 0 || len(hex) > 32 { return None }
+        while len(hex) < 32 { hex = "0" + hex }
+    } else if len(s) == 36 {
+        for i in 0..36 {
+            if i == 8 || i == 13 || i == 18 || i == 23 {
+                if s[i] != '-' { return None }
+            } else { hex.addByte(s[i]) }
+        }
+    } else if len(s) == 32 { hex = s.clone() } else { return None }
+    var out: []byte = []
+    var i = 0
+    while i < 32 {
+        let h = hexVal(hex[i])
+        let l = hexVal(hex[i + 1])
+        if h < 0 || l < 0 { return None }
+        append(mut &out, byte(h * 16 + l))
+        i += 2
+    }
+    return Some(strFromBytes(&out))
+}
+
+fn oIsUuidFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    return Ok(Val.Bool(oUuidText(&lexdb_sql.text(&vs[0]), false).isSome()))
+}
+
+// RAW_TO_UUID(raw): its 36-character text; UUID_TO_RAW(text): its 16 bytes.
+fn oRawToUuidFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    match vs[0] {
+        Val.Bytes(b) {
+            if len(b) != 16 { return Err(ora(62432, " is not a valid UUID value.")) }
+            return Ok(Val.Text(lexdb_rows.uuidText(&b)))
+        }
+        else { return Err(ora(62432, " is not a valid UUID value.")) }
+    }
+}
+
+fn oUuidToRawFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let t = lexdb_sql.text(&vs[0])
+    match oUuidText(&t, true) {
+        Some(b) { return Ok(Val.Bytes(b)) }
+        None { return Err(ora(62432, &(t + " is not a valid UUID value."))) }
+    }
+}
+
+// ---- BASE64 (SQL Server 2025)
+
+const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// Base64 of b, url-safe (- and _, no padding) or standard.
+pub fn b64(b: &str, url: bool): str {
+    let std = base64.encode(b)
+    if !url { return std }
+    var out = ""
+    for i in 0..len(std) {
+        let c = std[i]
+        if c == '=' { break }
+        out.addByte(if c == '+' { '-' } else if c == '/' { '_' } else { c })
+    }
+    return out
+}
+
+fn b64Val(c: byte): int {
+    if c >= 'A' && c <= 'Z' { return int(c - 'A') }
+    if c >= 'a' && c <= 'z' { return int(c - 'a') + 26 }
+    if c >= '0' && c <= '9' { return int(c - '0') + 52 }
+    if c == '+' || c == '-' { return 62 }
+    if c == '/' || c == '_' { return 63 }
+    return -1
+}
+
+// SQL Server's BASE64_DECODE: either alphabet, white space skipped, the padding optional but whole when given; None for
+// text it refuses.
+fn b64Lenient(s: &str): Option[str] {
+    var vals: []int = []
+    var pad = 0
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { continue }
+        if c == '=' {
+            pad += 1
+            continue
+        }
+        if pad > 0 { return None }
+        let v = b64Val(c)
+        if v < 0 { return None }
+        append(mut &vals, v)
+    }
+    let rem = len(vals) % 4
+    if rem == 1 { return None }
+    if pad > 2 || (pad > 0 && rem == 0) { return None }
+    var out: []byte = []
+    var acc = 0
+    var bits = 0
+    for v in vals {
+        acc = ((acc << 6) | v) & 0xffffff
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            append(mut &out, byte((acc >> bits) & 255))
+        }
+    }
+    return Some(strFromBytes(&out))
+}
+
+fn tB64EncFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = "base64_encode"
+    if a.n < 1 || a.n > 2 { return Err(e("TS174", "The base64_encode function requires 1 to 2 arguments.")) }
+    let o = if a.oids[0] != 0 { a.oids[0] } else { oidOfVal(&vs[0]) }
+    if o != lexdb_sql.OID_BYTEA && !(o == 0 || o == lexdb_sql.OID_UNKNOWN) { return Err(badArg(&a, vs, 0, &fname)) }
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    var url = false
+    if a.n > 1 && !isNull(&vs[1]) { url = lexdb_ops.intOf(&vs[1]).unwrapOr(0) != 0 }
+    match vs[0] {
+        Val.Bytes(b) { return Ok(Val.Text(b64(&b, url))) }
+        else { return Err(badArg(&a, vs, 0, &fname)) }
+    }
+}
+
+fn tB64DecFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = "base64_decode"
+    if a.n != 1 { return Err(e("TS174", "The base64_decode function requires 1 argument(s).")) }
+    let o = if a.oids[0] != 0 { a.oids[0] } else { oidOfVal(&vs[0]) }
+    if !(o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_BPCHAR || o == lexdb_sql.OID_UNKNOWN || o == 0) {
+        return Err(badArg(&a, vs, 0, &fname))
+    }
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    match b64Lenient(&lexdb_sql.text(&vs[0])) {
+        Some(b) { return Ok(Val.Bytes(b)) }
+        None { return Err(e("TS9803", "Invalid data for type \"Base64Decode\".")) }
+    }
+}
+
+// PostgreSQL 19's decode(t, 'base64url'): either alphabet, white space skipped, no padding.
+pub fn unb64url(t: &str): Result[str, DbErr] {
+    var out: []byte = []
+    var acc = 0
+    var bits = 0
+    var n = 0
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { continue }
+        if c == '=' { return Err(e("22023", "unexpected \"=\" while decoding base64url sequence")) }
+        let v = b64Val(c)
+        if v < 0 { return Err(e("22023", &("invalid symbol \"" + t[i..i + 1] + "\" found while decoding base64url sequence"))) }
+        acc = ((acc << 6) | v) & 0xffffff
+        bits += 6
+        n += 1
+        if bits >= 8 {
+            bits -= 8
+            append(mut &out, byte((acc >> bits) & 255))
+        }
+    }
+    if n % 4 == 1 { return Err(e("22023", "invalid base64url end sequence")) }
+    return Ok(strFromBytes(&out))
+}
+
+const B32HEX = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+
+// encode(b, 'base32hex'): RFC 4648's extended hex alphabet, padded with "=".
+pub fn b32hex(b: &str): str {
+    var out = ""
+    var acc = 0
+    var bits = 0
+    for i in 0..len(b) {
+        acc = ((acc << 8) | int(b[i])) & 0xffff
+        bits += 8
+        while bits >= 5 {
+            bits -= 5
+            out.addByte(B32HEX[(acc >> bits) & 31])
+        }
+    }
+    if bits > 0 { out.addByte(B32HEX[(acc << (5 - bits)) & 31]) }
+    while len(out) % 8 != 0 { out.addByte('=') }
+    return out
+}
+
+// decode(t, 'base32hex'): either case, the padding optional, the bits left over dropped.
+pub fn unb32hex(t: &str): Result[str, DbErr] {
+    var out: []byte = []
+    var acc = 0
+    var bits = 0
+    var pad = false
+    for i in 0..len(t) {
+        let c = t[i]
+        if c == '=' {
+            pad = true
+            continue
+        }
+        var v = -1
+        if c >= '0' && c <= '9' { v = int(c - '0') }
+        else if c >= 'A' && c <= 'V' { v = int(c - 'A') + 10 }
+        else if c >= 'a' && c <= 'v' { v = int(c - 'a') + 10 }
+        if v < 0 || pad { return Err(e("22023", &("invalid symbol \"" + t[i..i + 1] + "\" found while decoding base32hex sequence"))) }
+        acc = ((acc << 5) | v) & 0xffff
+        bits += 5
+        if bits >= 8 {
+            bits -= 8
+            append(mut &out, byte((acc >> bits) & 255))
+        }
+    }
+    return Ok(strFromBytes(&out))
+}
+
+// ---- UNISTR: a text's Unicode escapes (each door's own rules)
+
+pub const UNI_PG = 0
+pub const UNI_TSQL = 1
+pub const UNI_ORA = 2
+
+fn hexRun(rs: &[]int, at: int, n: int): int {
+    if at + n > len(rs) { return -1 }
+    var v = 0
+    for k in 0..n {
+        let r = rs[at + k]
+        if r > 127 { return -1 }
+        let h = hexVal(byte(r))
+        if h < 0 { return -1 }
+        v = v * 16 + h
+    }
+    return v
+}
+
+// s with its escapes made characters: \XXXX and \\ everywhere; \+XXXXXX in PostgreSQL and T-SQL; \uXXXX and \UXXXXXXXX in
+// PostgreSQL; a surrogate pair one character. None: an escape the door refuses (the caller's error).
+fn unistr(s: &str, esc: int, dia: int): Option[str] {
+    let rs = strings.runes(s)
+    var out: []int = []
+    var i = 0
+    while i < len(rs) {
+        let r = rs[i]
+        if r != esc {
+            append(mut &out, r)
+            i += 1
+            continue
+        }
+        if i + 1 < len(rs) && rs[i + 1] == esc {
+            append(mut &out, esc)
+            i += 2
+            continue
+        }
+        var cp = -1
+        var used = 0
+        if i + 1 < len(rs) && rs[i + 1] == int('+') && dia != UNI_ORA {
+            cp = hexRun(&rs, i + 2, 6)
+            used = 8
+        } else if dia == UNI_PG && i + 1 < len(rs) && rs[i + 1] == int('u') {
+            cp = hexRun(&rs, i + 2, 4)
+            used = 6
+        } else if dia == UNI_PG && i + 1 < len(rs) && rs[i + 1] == int('U') {
+            cp = hexRun(&rs, i + 2, 8)
+            used = 10
+        } else {
+            cp = hexRun(&rs, i + 1, 4)
+            used = 5
+        }
+        if cp < 0 || cp > 0x10ffff { return None }
+        if cp >= 0xd800 && cp <= 0xdbff {
+            // a high surrogate: its low one must follow, escaped
+            let j = i + used
+            if j + 4 < len(rs) + 0 && rs[j] == esc {
+                let lo = hexRun(&rs, j + 1, 4)
+                if lo >= 0xdc00 && lo <= 0xdfff {
+                    append(mut &out, 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00))
+                    i = j + 5
+                    continue
+                }
+            }
+            return None
+        }
+        if cp >= 0xdc00 && cp <= 0xdfff { return None }
+        append(mut &out, cp)
+        i += used
+    }
+    return Some(strings.fromRunes(&out))
+}
+
+// PostgreSQL's unistr: a bad or incomplete escape, or a surrogate alone, 42601; a code point past U+10FFFF 22023.
+fn pgUnistrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let s = lexdb_sql.text(&vs[0])
+    match unistr(&s, int('\\'), UNI_PG) {
+        Some(r) { return Ok(Val.Text(r)) }
+        None {
+            // (past U+10FFFF: a well-formed escape of a code point too big)
+            if tooBig(&s) {
+                return Err(e("22023", "invalid Unicode code point"))
+            }
+            return Err(e("42601", "invalid Unicode escape"))
+        }
+    }
+}
+
+// Whether s has a well-formed \+XXXXXX or \UXXXXXXXX escape of a code point past U+10FFFF.
+fn tooBig(s: &str): bool {
+    let rs = strings.runes(s)
+    for i in 0..len(rs) {
+        if rs[i] == int('\\') && i + 1 < len(rs) {
+            if rs[i + 1] == int('+') && hexRun(&rs, i + 2, 6) > 0x10ffff { return true }
+            if rs[i + 1] == int('U') && hexRun(&rs, i + 2, 8) > 0x10ffff { return true }
+        }
+    }
+    return false
+}
+
+// T-SQL UNISTR(s [, escape]).
+fn tUnistrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = "unistr"
+    if a.n < 1 || a.n > 2 { return Err(e("TS174", "The unistr function requires 1 to 2 arguments.")) }
+    for k in 0..a.n {
+        let o = if a.oids[k] != 0 { a.oids[k] } else { oidOfVal(&vs[k]) }
+        if !(o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_BPCHAR || o == lexdb_sql.OID_UNKNOWN || o == 0) {
+            return Err(badArg(&a, vs, k, &fname))
+        }
+    }
+    var esc = int('\\')
+    if a.n > 1 {
+        if isNull(&vs[1]) { return Ok(Val.Null) }
+        let er = strings.runes(&lexdb_sql.text(&vs[1]))
+        if len(er) != 1 || er[0] < 0x20 || er[0] > 0x7e {
+            return Err(e("TS9843", &("Unicode escape character '" + lexdb_sql.text(&vs[1]) + "' is invalid. Unicode escape character should be of 1 character length and a code point ranging from U+0020 up to U+007E.")))
+        }
+        let c = er[0]
+        if c == int('+') || c == int('\'') || c == int('"') || c == int(' ') || hexVal(byte(c)) >= 0 {
+            return Err(e("TS9842", "Invalid Unicode escape character was provided. The <UESCAPE character> cannot be <plus sign> <single quote> <double quotes> <space> <hexit>."))
+        }
+        esc = c
+    }
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    match unistr(&lexdb_sql.text(&vs[0]), esc, UNI_TSQL) {
+        Some(s) { return Ok(Val.Text(s)) }
+        None { return Err(e("TS9841", "An invalid Unicode escape sequence was specified in the input. Unicode escape sequences should be specified as <UESCAPE character>XXXX or <UESCAPE character>+XXXXXX where X is a <hexit>.")) }
+    }
+}
+
+fn oUnistrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) != 1 { return Err(ora(909, "invalid number of arguments")) }
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    match unistr(&lexdb_sql.text(&vs[0]), int('\\'), UNI_ORA) {
+        Some(s) { return Ok(if len(s) == 0 { Val.Null } else { Val.Text(s) }) }
+        None { return Err(ora(30186, "'\\' must be followed by four hexdecimal characters or another '\\'")) }
+    }
+}
+
+// ---- Oracle's TO_BOOLEAN (23ai)
+
+fn oToBoolFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) != 1 { return Err(ora(909, "invalid number of arguments")) }
+    match vs[0] {
+        Val.Null { return Ok(Val.Null) }
+        Val.Bool(b) { return Ok(Val.Bool(b)) }
+        Val.Int(x) { return Ok(Val.Bool(x != 0)) }
+        Val.Num(d) { return Ok(Val.Bool(!d.isZero())) }
+        Val.Float(f) { return Ok(Val.Bool(f != 0.0f)) }
+        Val.Real(f) { return Ok(Val.Bool(f != 0.0f)) }
+        Val.Text(s) {
+            let w = strings.toLowerAscii(&strings.trim(&s))
+            if w == "true" || w == "yes" || w == "on" || w == "t" || w == "y" || w == "1" { return Ok(Val.Bool(true)) }
+            if w == "false" || w == "no" || w == "off" || w == "f" || w == "n" || w == "0" { return Ok(Val.Bool(false)) }
+            return Err(ora(61800, &("invalid boolean literal: " + s)))
+        }
+        else { return Err(ora(932, "inconsistent datatypes: expected CHAR got DATE")) }
+    }
+}
+
+// ---- edit distance and Jaro-Winkler (SQL Server 2025's fuzzy matching, Oracle's UTL_MATCH)
+
+// The edit distance of a and b (characters): Levenshtein's (Oracle's), or with swap the optimal string alignment distance,
+// two adjacent characters swapped one edit (SQL Server's: martha, marhta 1); max the most it counts to (-1: no limit):
+// max + 1 past it.
+pub fn editDistance(a: &[]int, b: &[]int, max: int, swap: bool): int {
+    let n = len(a)
+    let m = len(b)
+    if n == 0 { return if max >= 0 && m > max { max + 1 } else { m } }
+    if m == 0 { return if max >= 0 && n > max { max + 1 } else { n } }
+    var pp = array(m + 1, 0)
+    var prev = array(m + 1, 0)
+    var cur = array(m + 1, 0)
+    for j in 0..m + 1 { prev[j] = j }
+    for i in 1..n + 1 {
+        cur[0] = i
+        for j in 1..m + 1 {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 }
+            var v = prev[j - 1] + cost
+            if prev[j] + 1 < v { v = prev[j] + 1 }
+            if cur[j - 1] + 1 < v { v = cur[j - 1] + 1 }
+            if swap && i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] && pp[j - 2] + 1 < v { v = pp[j - 2] + 1 }
+            cur[j] = v
+        }
+        for j in 0..m + 1 {
+            pp[j] = prev[j]
+            prev[j] = cur[j]
+        }
+    }
+    let d = prev[m]
+    return if max >= 0 && d > max { max + 1 } else { d }
+}
+
+// The Jaro-Winkler similarity of a and b (0 to 1): Jaro's matches within half the longer length less one, half the
+// transpositions, then the common prefix of up to 4 characters at 0.1.
+pub fn jaroWinkler(a: &[]int, b: &[]int, third: bool): float {
+    let n = len(a)
+    let m = len(b)
+    if n == 0 && m == 0 { return 1.0f }
+    if n == 0 || m == 0 { return 0.0f }
+    var w = (if n > m { n } else { m }) / 2 - 1
+    if w < 0 { w = 0 }
+    var am = array(n, false)
+    var bm = array(m, false)
+    var matches = 0
+    for i in 0..n {
+        let lo = if i - w > 0 { i - w } else { 0 }
+        let hi = if i + w + 1 < m { i + w + 1 } else { m }
+        for j in lo..hi {
+            if !bm[j] && a[i] == b[j] {
+                am[i] = true
+                bm[j] = true
+                matches += 1
+                break
+            }
+        }
+    }
+    if matches == 0 { return 0.0f }
+    var t = 0
+    var k = 0
+    for i in 0..n {
+        if am[i] {
+            while !bm[k] { k += 1 }
+            if a[i] != b[k] { t += 1 }
+            k += 1
+        }
+    }
+    let mf = float(matches)
+    let sum = mf / float(n) + mf / float(m) + (mf - float(t / 2)) / mf
+    // (SQL Server's the sum over 3, Oracle's the sum times a third: their last digits)
+    let jaro = if third { (1.0f / 3.0f) * sum } else { sum / 3.0f }
+    var l = 0
+    while l < 4 && l < n && l < m && a[l] == b[l] { l += 1 }
+    return jaro + float(l) * 0.1f * (1.0f - jaro)
+}
+
+fn maxLen(a: &[]int, b: &[]int): int { return if len(a) > len(b) { len(a) } else { len(b) } }
+
+// T-SQL's four: their arguments strings (a case-insensitive collation's folded by the binder), EDIT_DISTANCE's maximum.
+fn tFuzzyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    let fname = if name == "#n_tedit" { "edit_distance" } else if name == "#n_teditsim" { "edit_distance_similarity" }
+                else if name == "#n_tjwd" { "jaro_winkler_distance" } else { "jaro_winkler_similarity" }
+    for k in 0..2 {
+        if k < a.n {
+            let o = if a.oids[k] != 0 { a.oids[k] } else { oidOfVal(&vs[k]) }
+            if !(o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR || o == lexdb_sql.OID_BPCHAR || o == lexdb_sql.OID_UNKNOWN || o == 0) {
+                return Err(badArg(&a, vs, k, &fname))
+            }
+        }
+    }
+    for k in 0..a.n { if isNull(&vs[k]) { return Ok(Val.Null) } }
+    let x = strings.runes(&lexdb_sql.text(&vs[0]))
+    let y = strings.runes(&lexdb_sql.text(&vs[1]))
+    if name == "#n_tedit" {
+        let max = if a.n > 2 { lexdb_ops.intOf(&vs[2]).unwrapOr(-1) } else { -1 }
+        return Ok(Val.Int(editDistance(&x, &y, max, true)))
+    }
+    if name == "#n_teditsim" {
+        let ml = maxLen(&x, &y)
+        if ml == 0 { return Ok(Val.Int(100)) }
+        let d = editDistance(&x, &y, -1, true)
+        return Ok(Val.Int(roundHalf(100.0f * (1.0f - float(d) / float(ml)))))
+    }
+    let jw = jaroWinkler(&x, &y, false)
+    if name == "#n_tjwd" { return Ok(Val.Float(1.0f - jw)) }
+    return Ok(Val.Int(roundHalf(jw * 100.0f)))
+}
+
+fn roundHalf(f: float): int { return int((f + 0.5f).floor()) }
+
+// Oracle's UTL_MATCH: EDIT_DISTANCE (Levenshtein's; -1 when either is NULL, which '' is), EDIT_DISTANCE_SIMILARITY (100
+// less the distance's share of the longer, cut; 100 for two NULLs), JARO_WINKLER (a BINARY_DOUBLE; 0 with a NULL) and
+// JARO_WINKLER_SIMILARITY (its hundredths, cut); case-sensitive.
+fn oFuzzyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) != 2 { return Err(ora(6553, "PLS-306: wrong number or types of arguments in call")) }
+    let none: []int = []
+    let x = if isNull(&vs[0]) { none.clone() } else { strings.runes(&lexdb_sql.text(&vs[0])) }
+    let y = if isNull(&vs[1]) { none.clone() } else { strings.runes(&lexdb_sql.text(&vs[1])) }
+    if name == "#n_oedit" {
+        if len(x) == 0 || len(y) == 0 { return Ok(Val.Num(Decimal.fromInt(-1))) }
+        return Ok(Val.Num(Decimal.fromInt(editDistance(&x, &y, -1, false))))
+    }
+    if name == "#n_oeditsim" {
+        let ml = maxLen(&x, &y)
+        if ml == 0 { return Ok(Val.Num(Decimal.fromInt(100))) }
+        let d = editDistance(&x, &y, -1, false)
+        return Ok(Val.Num(Decimal.fromInt(100 - (d * 100) / ml)))
+    }
+    let jw = if len(x) == 0 || len(y) == 0 { 0.0f } else { jaroWinkler(&x, &y, true) }
+    if name == "#n_ojw" { return Ok(Val.Float(jw)) }
+    return Ok(Val.Num(Decimal.fromInt(int((jw * 100.0f).floor()))))
+}

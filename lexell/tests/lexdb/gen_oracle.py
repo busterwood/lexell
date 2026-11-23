@@ -194,6 +194,7 @@ CHECKED = {
     'tns_newfix': ('consts', 'QS'),
     'tns_retold': ('consts', 'QS'),
     'tns_stmtforms': ('consts', 'QS'),
+    'tns_newfn': ('consts', 'QS'),
     'tns_winpipe': ('consts', 'QS'),
     'tns_grpview': ('consts', 'QS'),
     'tns_leftovers': ('consts', 'QS'),
