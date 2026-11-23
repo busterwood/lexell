@@ -599,3 +599,80 @@ limit keeps mul out of line. A per-function inline mark would let it in.
 3. Scalar replacement of small records (review 1, 1.2) remains the largest structural
    lever. mid-ir.md's M1 found frame aggregates dominate the spills; it is a project, not
    an experiment.
+
+## 17. Against Java 21: string chains, drop loops (as built)
+
+**The comparison.** Ten ports of the microbenchmarks to Java (OpenJDK 21.0.13, default tiered
+C1/C2, checked arithmetic with `addExact` and `multiplyExact`), checksums equal, on this machine
+(`~/Work/bench-results/2026-11-23-java`: `Bench.java`, `run.sh`, two runs that agree). Lexell is
+native `-O`, best of 5 wall; Java is the best of 5 in-process runs after one warm-up.
+
+| program | Lexell | Java warm | |
+|---|---:|---:|---|
+| fib | 1,063 ms | 793 ms | Java 1.34x |
+| loop | 534 ms | 677 ms | Lexell 1.27x |
+| array | 432 ms | 351 ms | Java 1.23x |
+| alloc | 322 ms | 36 ms | Java 9x: escape analysis removes the allocation |
+| lists | 224 ms | 73 ms | Java 3.1x |
+| strings | 186 ms | 56 ms | Java 3.3x |
+| trees | 156 ms | 51 ms | Java 3.1x |
+| tokens | 135 ms | 206 ms | Lexell 1.5x |
+| sieve | 380 ms | 660 ms | Lexell 1.7x |
+| maps | 406 ms | 305 ms | Java 1.33x |
+
+An outside study on another machine found the same causes, with two corrections from the
+profiles here: `strings` already builds a chain with one allocation (section 10), and its cost
+was elsewhere; and `maps` spends 36% in SipHash here, not 7%.
+
+**What was built** (one commit):
+
+- **Integers written into a chain** (check.lxl `xChain` and `intPart`; section 10's "not
+  built"). A part `x.toStr()` or `intToStr(x)` of an `int` (std's: no program function of that
+  name) is evaluated into an int local where the string was, and passed as
+  `(lxl_str){.p = (char*)x, .len = 2, .cap = 1}`: no string has a cap below its length (an owned
+  one has cap >= len, a static one cap 0). `rt_str_concat3` to `8`, and `rt_str_concat` for a
+  chain joined early to two parts, count its digits and write them straight into the result.
+  The part's string, its allocation and its free are gone.
+- **The concat functions** (native/rt.c) read each part's `p` and `len`, never the part as one
+  16-byte value: a part passed on the stack is two 8-byte stores in the caller, and gcc's 16-byte
+  copy of it could not be forwarded (31M stall events for 5M calls in `strings`). Parts of up to
+  16 bytes are copied inline (two overlapping 8- or 4-byte moves, or up to 3 bytes); int parts and
+  longer parts go to one out-of-line function. `rt_int_to_str` formats 64-bit values without the
+  u128 path.
+- **Drop actions that loop** (emit.lxl `selfLoop`). An action that pushes its own action (a
+  list's next node, a tree's children) holds each such push back and loops on the last one: that
+  action is the next to run when this one returns (the stack is LIFO), so the order of every drop
+  and free is the same. A list's drop is a loop with no pushes; a tree's pushes one child a node
+  instead of two.
+- **Packed literal words** (x64gen `fillEntries`). An 8-byte word of a literal made of two or more
+  small integer constants is one 8-byte store, as a lone narrow field already was: the int part's
+  `len` and `cap` are read as one word.
+- **The consuming `for`'s reverse** (check.lxl `forConsume`) uses two indices, with no `len / 2`
+  per turn.
+
+**A regression found and fixed on the way.** The concat functions became more callers of
+`rt_str_new`, and gcc then stopped inlining it into `rt_str_of` (and inlined `rt_str_of` into
+`rt_str_dup` instead): every `rt_str_dup` paid a call more, +1.0 to 1.2% instructions in json, jq
+and cmark. `rt_str_mk` is now always inline in `rt_str_new` and `rt_str_of`.
+
+| measure (main 6c7d3bf5 against this) | instructions | cycles |
+|---|---:|---:|
+| bench strings / lists / trees (perfsuite, best of 5) | -36.4 / -18.7 / -4.6% | -37.8 / -18.5 / -10.3% |
+| bench maps / the other six | -1.7% / level | -1.4% / level |
+| perfsuite run suite / compile suite (`--frozen 5f30415d`) | -4.54 / -0.41% | -4.94 / -0.14% |
+| apps regex / json / jq / cmark / decimal (5 interleaved rounds) | -0.01 / 0.00 / -0.01 / -0.20 / -0.37% | -0.2 / +0.5 / +0.1 / 0.0 / -0.7% |
+| TPC-H SF1, server instructions per query (22) | -0.03% geomean (-0.30 to +0.09%) | |
+| lexdb point select (icount6, 4 alternated rounds) | -0.48% (173,438 to 172,595) | +1.9% (97,762 to 99,572) |
+| code size: lexdb -O / the compiler built by each | -16 KB / -1.7 KB of program code | runtime +6.5 KB (concat3 to 8) |
+
+The point selects' cycles move against their instructions: L1i misses per statement ranged
+296-521 for this build against 281-385 for main's, and a recording of them by function moves
+by hundreds both ways between unrelated functions (`Wire.fill` 427 to 21, `gl_act` 491 to 675):
+placement, as in sections 3 and 11. Branch misses are +10 a statement (+2.5%), spread the same way,
+with `malloc` the largest (+27%: the sequence of sizes changed with fewer temporary strings).
+
+Tests: tests/run/str_chain_int_parts, str_chain_int_shadow, for_consume_order, drop_chain_loop,
+native_packed_literal, their expectations from main's compiler.
+
+**Next** (being built): one level of recursive inlining (fib, trees, lists; C2's
+MaxRecursiveInlineLevel = 1), and boxed records that never escape kept in a local (alloc).

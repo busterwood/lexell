@@ -1104,15 +1104,19 @@ __attribute__((noreturn)) void exit(int code) { sys_exit(code); }
 #define RT_SP(s) ((const char*)(s).p)
 #define RT_STR_MAX UINT32_MAX
 static char rt_empty[1] = "";
-lxl_str rt_str_new(int64_t len) {
+/* A new string of len bytes (and the NUL); inline in rt_str_of, whatever else calls rt_str_new
+   (gcc stopped inlining it there when the concat functions became its callers: every rt_str_dup
+   paid a call more, +1% instructions in jq, json and cmark). */
+static inline __attribute__((always_inline)) lxl_str rt_str_mk(int64_t len) {
     if (len == 0) return (lxl_str){.p = rt_empty, .cap = 0, .len = 0};
     if (len < 0 || len > (int64_t)RT_STR_MAX) rt_trap(2, "string too long (4 GiB or more)", "runtime");
     char* p = rt_alloc((size_t)len + 1);
     p[len] = 0;
     return (lxl_str){.p = p, .cap = (uint32_t)len, .len = (uint32_t)len};
 }
+lxl_str rt_str_new(int64_t len) { return rt_str_mk(len); }
 lxl_str rt_str_of(const char* p, int64_t len) {
-    lxl_str s = rt_str_new(len);
+    lxl_str s = rt_str_mk(len);
     if (len) memcpy(s.p, p, (size_t)len);
     return s;
 }
