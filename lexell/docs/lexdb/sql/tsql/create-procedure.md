@@ -270,7 +270,7 @@ GO
 ```
 
 ```text
-Msg 111, Level 16, State 1, Line 1
+Msg 111, Level 16, State 1, Line 2
 'CREATE/ALTER PROCEDURE' must be the first statement in a query batch.
 Msg 2714, Level 16, State 1, Line 1
 There is already an object named 'staff' in the database.
