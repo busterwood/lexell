@@ -79,8 +79,8 @@ table_name ::= [ database_name . [ schema_name ] . | schema_name . ] table_name
 ## Differences from SQL Server
 
 - `INSERT TOP (n)` and table hints (`WITH (TABLOCK)`) are not taken: see the examples.
-- The text of many error messages is lexdb's (PostgreSQL's wording), with SQL Server's number and severity.
-- The line number in an error message is that of the batch's first line.
+- Most error messages are SQL Server's; those with number 50000 carry lexdb's text.
+- The line number in an error message is the line of the failing statement in the batch.
 - There are no triggers, so `INSERT` fires none.
 - `VALUES` takes any number of rows (SQL Server stops at 1000, error 10738).
 
@@ -270,12 +270,12 @@ PRINT 'the batch went on';
 
 ```text
 Msg 547, Level 16, State 1, Line 1
-new row for relation "product" violates check constraint "product_price_check"
-Msg 515, Level 16, State 1, Line 1
-null value in column "name" of relation "product" violates not-null constraint
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "cheap_pkey"
-Msg 2628, Level 16, State 1, Line 1
+The INSERT statement conflicted with the CHECK constraint "product_price_check". The conflict occurred in database "lexdb", table "dbo.product", column 'price'.
+Msg 515, Level 16, State 1, Line 2
+Cannot insert the value NULL into column 'name', table 'lexdb.dbo.product'; column does not allow nulls. INSERT fails.
+Msg 2627, Level 14, State 1, Line 3
+Violation of PRIMARY KEY constraint 'cheap_pkey'. Cannot insert duplicate key in object 'dbo.cheap'. The duplicate key value is (1).
+Msg 2628, Level 16, State 1, Line 4
 value too long for type character varying(40)
 the batch went on
 ```
@@ -294,7 +294,7 @@ GO
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near '1'.
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'with'.
+Incorrect syntax near the keyword 'WITH'.
 ```
 
 ## See also
