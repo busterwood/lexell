@@ -63,6 +63,7 @@ Blocks without a marker (shell commands, program output, syntax blocks) are not 
   with `SET FEEDBACK 1` and `SET SERVEROUTPUT ON`: result columns padded, numbers to the right, NULL as nothing;
   `N rows selected.` or `no rows selected`; `1 row created.`, `Table created.`, `PL/SQL procedure successfully
   completed.` and the like; `DBMS_OUTPUT` lines before the feedback; errors as `ERROR:` and the `ORA-` line.
+  The connection is not in autocommit mode, as in SQL\*Plus: a transaction lasts until `COMMIT` or `ROLLBACK`.
   Values are as the JDBC driver's `getString` gives them (a DATE as `2026-11-23 00:00:00`): use `TO_CHAR` where the
   format matters.
 

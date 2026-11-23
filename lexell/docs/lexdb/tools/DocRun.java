@@ -26,6 +26,7 @@ public class DocRun {
         out = new PrintStream(new FileOutputStream(FileDescriptor.out), true, StandardCharsets.UTF_8);
         ora = a[0].equals("oracle");
         c = ora ? DriverManager.getConnection(a[1], a[2], a[3]) : DriverManager.getConnection(a[1]);
+        if (ora) c.setAutoCommit(false);   // as SQL*Plus: a transaction runs until COMMIT or ROLLBACK
         if (ora) try (Statement s = c.createStatement()) { s.execute("BEGIN DBMS_OUTPUT.ENABLE(NULL); END;"); }
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         StringBuilder block = new StringBuilder();
