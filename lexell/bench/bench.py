@@ -11,10 +11,13 @@ lexell/bench/c/NAME.c (no checks), also gets it built with gcc -O2 and timed, as
 the "plain C" column ("-" for the others). The Rust ports in rust/ are built
 once with `cargo build --release` and timed as the "Rust" column ("-" for
 `maps`, which has no reference, and when cargo is missing or --no-rust is
-given). Their output must equal the lxl output.
+given). Their output must equal the lxl output. The Java ports in java/ (Bench.java, compiled
+once with javac) are the "Java" column: one JVM per program, the best of RUNS runs inside it
+after a warm-up run (the JIT has compiled the hot code; JVM startup is not counted). Their
+checksum must equal the lxl output too; --no-java skips them.
 
     python3 lexell/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
-                              [--no-rust] [--hash-seed N | --random-hash]
+                              [--no-rust] [--no-java] [--hash-seed N | --random-hash]
 
 The primary comparison is the same lxl source built both ways (native and
 through C). The hand-written C and Rust references in c/ and rust/ are a
@@ -50,6 +53,8 @@ RUST_DIR = os.path.join(HERE, 'rust')
 RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps'}
 HASH_SEED = None     # set from the command line; see base_env
 RUST_EXE = None      # the one dbench binary, once built
+JAVA_DIR = os.path.join(HERE, 'java')
+JAVA_CP = None       # the compiled Bench classes, once built
 
 
 def args_for(name):
@@ -146,6 +151,29 @@ def build_rust():
     return os.path.join(RUST_DIR, 'target', 'release', 'dbench')
 
 
+def build_java(tmp):
+    """Compile the Java ports once; None when javac or java is unavailable."""
+    if not shutil.which('javac') or not shutil.which('java'):
+        return None
+    out = os.path.join(tmp, 'java')
+    r = subprocess.run(['javac', '-d', out, os.path.join(JAVA_DIR, 'Bench.java')])
+    if r.returncode != 0:
+        print('note: the Java ports did not build; Java column skipped', file=sys.stderr)
+        return None
+    return out
+
+
+def java_run(name, n):
+    """(best warm seconds, checksum line) of the Java port, in one JVM."""
+    p = subprocess.run(['java', f'-Dbench.runs={n}', '-cp', JAVA_CP, 'Bench', name] + args_for(name),
+                       capture_output=True, text=True, env=base_env())
+    if p.returncode != 0:
+        raise SystemExit(f"{name}: the Java port exited {p.returncode}: {p.stderr.strip()[-500:]}")
+    lines = p.stdout.strip().splitlines()
+    warm = [l for l in lines if l.startswith('warm ')]
+    return float(warm[0].split()[1]) / 1000, lines[0].strip()
+
+
 def build_obo(name, tmp):
     exe = os.path.join(tmp, name + '_obo')
     compiler = os.path.join(OBO, 'obo')
@@ -169,12 +197,13 @@ def main():
     ap.add_argument('--perf', action='store_true',
                     help='also report instructions and cycles (perf stat, user mode)')
     ap.add_argument('--no-rust', action='store_true', help='skip the Rust reference column')
+    ap.add_argument('--no-java', action='store_true', help='skip the Java (warm JVM) column')
     ap.add_argument('--hash-seed', type=int, default=42,
                     help='LXL_HASH_SEED for the runs (default 42; makes maps reproducible)')
     ap.add_argument('--random-hash', action='store_true',
                     help='run with the production per-process random hash key')
     a = ap.parse_args()
-    global HASH_SEED, RUST_EXE
+    global HASH_SEED, RUST_EXE, JAVA_CP
     HASH_SEED = None if a.random_hash else str(a.hash_seed)
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='lxlbench')
@@ -183,6 +212,10 @@ def main():
         RUST_EXE = build_rust()
         if RUST_EXE is None and shutil.which('cargo') is None:
             print('note: cargo not found; Rust column skipped', file=sys.stderr)
+    if not a.no_java and not a.obo:
+        JAVA_CP = build_java(tmp)
+        if JAVA_CP is None and not shutil.which('javac'):
+            print('note: javac not found; Java column skipped', file=sys.stderr)
 
     def timed(exe):
         if exe is None:
@@ -221,7 +254,12 @@ def main():
         t_rust, out_rust, i_rust, c_rust = timed(rust)
         if rust and out_rust != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Rust {out_rust!r}")
-        rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust,
+        t_java = None
+        if JAVA_CP:
+            t_java, out_java = java_run(name, a.n)
+            if out_java != out_lxl:
+                raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Java {out_java!r}")
+        rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust, java=t_java,
                          out=out_lxl,
                          ci=i_lxl, ni=i_lxln, oi=i_lxlo, pi=i_plain, ri=i_rust,
                          cc=c_lxl, nc=c_lxln, oc=c_lxlo, pc=c_plain, rc=c_rust))
@@ -237,25 +275,31 @@ def main():
             print(f"| {r['name']} | {fmt(t_obo)} | {fmt(r['c'])} | {fmt(r['n'])} | {cr} | {nr} | {r['out']} |")
         return
     if a.opt:
-        print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | Rust | -O/Rust | output |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        print("| benchmark | via C | native | native -O | -O/C | plain C | -O/plain C | Rust | -O/Rust | "
+              "Java (warm) | -O/Java | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             pc = fmt(r['plain']) if r['plain'] is not None else "-"
             opc = f"{r['o'] / r['plain']:.2f}" if r['plain'] else "-"
             rs = fmt(r['rust']) if r['rust'] is not None else "-"
             ors = f"{r['o'] / r['rust']:.2f}" if r['rust'] else "-"
+            js = fmt(r['java']) if r['java'] is not None else "-"
+            ojs = f"{r['o'] / r['java']:.2f}" if r['java'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {fmt(r['o'])} | "
-                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {rs} | {ors} | {r['out']} |")
+                  f"{r['o'] / r['c']:.2f} | {pc} | {opc} | {rs} | {ors} | {js} | {ojs} | {r['out']} |")
     else:
-        print("| benchmark | via C | native | native/C | plain C | native/plain C | Rust | native/Rust | output |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---|")
+        print("| benchmark | via C | native | native/C | plain C | native/plain C | Rust | native/Rust | "
+              "Java (warm) | native/Java | output |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for r in rows:
             pc = fmt(r['plain']) if r['plain'] is not None else "-"
             npc = f"{r['n'] / r['plain']:.2f}" if r['plain'] else "-"
             rs = fmt(r['rust']) if r['rust'] is not None else "-"
             nrs = f"{r['n'] / r['rust']:.2f}" if r['rust'] else "-"
+            js = fmt(r['java']) if r['java'] is not None else "-"
+            njs = f"{r['n'] / r['java']:.2f}" if r['java'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
-                  f"{pc} | {npc} | {rs} | {nrs} | {r['out']} |")
+                  f"{pc} | {npc} | {rs} | {nrs} | {js} | {njs} | {r['out']} |")
     if a.perf:
         print()
         def m(x):

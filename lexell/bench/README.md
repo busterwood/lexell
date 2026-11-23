@@ -1,10 +1,10 @@
 # Lexell benchmarks
 
 Ten small programs, each built with the default native backend and, with
-`--c`, through C. Nine of them also have a hand-written Rust port:
+`--c`, through C. Each also has a hand-written Rust port and a Java port:
 
     python3 lexell/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
-                              [--no-rust]
+                              [--no-rust] [--no-java]
 
 `--opt` adds a `native -O` build and its columns; `--perf` adds instructions
 and cycles (`perf stat`, user mode) beside the wall times. The compile cost
@@ -42,7 +42,14 @@ There are three different questions, and they must not be mixed:
    `native/Rust` columns are this question. It is not a compiler-backend
    comparison: the Rust code is an independent, idiomatic implementation of
    each program, not the same IR lowered by another backend.
-4. **Another implementation (Rust regex, Go regexp, GNU grep, jq, cmark,
+4. **The same algorithm in Java, on a warmed-up JVM.** `lexell/bench/java/Bench.java` holds the
+   ten ports (OpenJDK 21, default tiered C1/C2), compiled once with `javac`; the table's
+   `Java (warm)` column is one JVM per program, the best of RUNS runs inside it after a warm-up
+   run, so the JIT has compiled the hot code and JVM startup is not counted. Arithmetic that
+   Lexell checks uses `Math.addExact` and `multiplyExact`; the checksum must match. This is the
+   managed-runtime comparison: a JIT with profile-guided inlining, escape analysis and a
+   generational collector against an ahead-of-time compiler with owned memory.
+5. **Another implementation (Rust regex, Go regexp, GNU grep, jq, cmark,
    OpenSSL).** These are usually a different algorithm. They answer "is our
    algorithm competitive", not "is our compiler generating good code". The
    regex and JSON benchmark scripts report them; keep them out of the

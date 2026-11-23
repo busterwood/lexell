@@ -1,7 +1,7 @@
 # Lexell performance
 
 Measured on 22 and 23 November 2026 on `main`: the HTTP server section on 23 November at
-5284326a, the microbenchmarks at commit 2f7f2246, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
+5284326a, the microbenchmarks on 23 November at 600e467e, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
@@ -21,7 +21,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Area | Against | Result |
 |---|---|---|
 | Compile time | Rust | Much faster: about 3 times for hello world, about 23 times for nine programs |
-| Microbenchmarks | Rust | Level or faster on nine of ten |
+| Microbenchmarks | Rust, Java | Faster than Rust on seven of ten, level on two; faster than warmed-up Java on four |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on five of seven |
 | JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
@@ -48,31 +48,41 @@ The compiler's own self-build takes 483 ms (no external reference).
 ## Microbenchmarks
 
 Rust is the reference: the ports in `bench/rust` are built with `opt-level = 3`, thin LTO and one codegen unit, the strongest mainstream native reference for the same work.
+Java is the managed-runtime reference: the ports in `bench/java/Bench.java` run on OpenJDK 21.0.13
+(default tiered C1/C2), one JVM per program, timed inside the JVM as the best of 5 runs after a
+warm-up run, so the JIT has compiled the hot code and JVM startup is not counted. Arithmetic
+that Lexell checks for overflow uses `Math.addExact` and `multiplyExact` in Java.
 
-Ten programs, native `-O`, wall time, best of 5. All ten have a Rust port in
-`bench/rust`. The `maps` port uses std `HashMap`, whose layout differs from Lexell's
-`Map` (insertion-ordered, with u32 index slots), so for `maps` the comparison is of the
-same operations and keys, not the same data structure. Both print the same checksum.
+Ten programs, native `-O`, wall time, best of 5 (`bench/bench.py --opt`). The `maps` ports use
+std `HashMap` (Rust, with its default SipHash) and `java.util.HashMap`, whose layouts differ from
+Lexell's `Map` (insertion-ordered, with u32 index slots), so for `maps` the comparison is of the
+same operations and keys, not the same data structure. All three print the same checksum.
 
-| program | Lexell | Rust | Lexell / Rust |
-|---|---:|---:|---:|
-| fib | 867 ms | 870 ms | 1.00 |
-| loop | 436 ms | 439 ms | 0.99 |
-| array | 360 ms | 367 ms | 0.98 |
-| sieve | 317 ms | 476 ms | 0.67 |
-| alloc | 270 ms | 362 ms | 0.75 |
-| strings | 161 ms | 292 ms | 0.55 |
-| lists | 193 ms | 487 ms | 0.40 |
-| trees | 136 ms | 349 ms | 0.39 |
-| tokens | 108 ms | 96 ms | 1.13 |
-| maps | 368 ms | 671 ms | 0.55 |
+| program | Lexell | Rust | Lexell / Rust | Java (warm) | Lexell / Java |
+|---|---:|---:|---:|---:|---:|
+| fib | 509 ms | 810 ms | 0.63 | 618 ms | 0.82 |
+| loop | 407 ms | 407 ms | 1.00 | 516 ms | 0.79 |
+| array | 330 ms | 337 ms | 0.98 | 272 ms | 1.21 |
+| sieve | 290 ms | 438 ms | 0.66 | 509 ms | 0.57 |
+| alloc | 33 ms | 333 ms | 0.10 | 27 ms | 1.24 |
+| strings | 90 ms | 266 ms | 0.34 | 45 ms | 2.00 |
+| lists | 130 ms | 444 ms | 0.29 | 58 ms | 2.23 |
+| trees | 108 ms | 324 ms | 0.33 | 40 ms | 2.70 |
+| tokens | 102 ms | 92 ms | 1.11 | 168 ms | 0.61 |
+| maps | 333 ms | 628 ms | 0.53 | 282 ms | 1.18 |
 
-A second run of the same build gave every ratio within 0.02 of these, except `tokens`.
-At about 100 ms its best-of-5 ratio is not stable, so its row is the best of 15 rounds,
-alternating with Rust and pinned to one core. Cycles agree: 505M against Rust's 445M, 1.13.
+A second run of the same build gave every ratio within 0.03 of these, except Java's `maps`
+(1.27). `alloc` now runs about 33 ms: its records never escape, so neither Lexell nor the JVM
+allocates them (`lexell/design/opt-experiments.md`, section 18), while Rust's `Box` does.
+
+Where Java leads, the work is per object: `lists`, `trees` and `strings` allocate and free a
+node or string at a time, which a JVM's bump allocation and young-generation collector do in
+bulk; Lexell frees each one when its owner is dropped. `array` uses 4-byte `int` elements in
+Java against Lexell's 8-byte `int`. `fib` is ahead of both because a recursive function is
+inlined into itself one level, as C2 does (section 18).
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
-table holds them), in both languages, with the same output. The gap to Rust is in the
+table holds them), in all three languages, with the same output. The gap to Rust is in the
 native code generator, not the program: the token list's header and the identifier
 slices go through the stack frame where Rust keeps them in registers
 (`lexell/design/opt-experiments.md`, section 14).
