@@ -46,7 +46,7 @@ SELECT COUNT(*) AS left_over FROM sys.schemas WHERE name = 'sales';
 ```
 
 ```text
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 2
 cannot drop schema sales because other objects depend on it
 left_over
 ---------
