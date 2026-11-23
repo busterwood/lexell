@@ -23,7 +23,9 @@ The primary comparison is the same lxl source built both ways (native and
 through C). The hand-written C and Rust references in c/ and rust/ are a
 second, same-algorithm comparison; README.md says what each reference does to
 keep the work equal. --perf adds instructions and cycles (user mode) beside
-the wall times.
+the wall times. A second table gives each implementation's peak resident memory (one more run,
+under peak.c, built static with gcc: a child forked from Python would count Python's memory
+too); the Java figure is the JVM's over its warm-up and timed runs, with its default heap.
 
 Every program runs with LXL_HASH_SEED=42 (--hash-seed changes it), so the
 random per-process hash key of std.Map does not move the maps timings between
@@ -55,6 +57,7 @@ HASH_SEED = None     # set from the command line; see base_env
 RUST_EXE = None      # the one dbench binary, once built
 JAVA_DIR = os.path.join(HERE, 'java')
 JAVA_CP = None       # the compiled Bench classes, once built
+PEAK = None          # peak.c, built static, once
 
 
 def args_for(name):
@@ -163,15 +166,41 @@ def build_java(tmp):
     return out
 
 
+def build_peak(tmp):
+    """peak.c, static; None without gcc."""
+    if not shutil.which('gcc'):
+        return None
+    out = os.path.join(tmp, 'peak')
+    r = subprocess.run(['gcc', '-O2', '-static', '-o', out, os.path.join(HERE, 'peak.c')])
+    return out if r.returncode == 0 else None
+
+
+def peak_of(stderr):
+    """The peak resident memory in MB from peak.c's line, or None."""
+    for l in stderr.splitlines():
+        if l.startswith('peak '):
+            return int(l.split()[1]) / 1024
+    return None
+
+
+def peak_run(exe, name):
+    """Peak resident memory (MB) of one run of exe, or None."""
+    if exe is None or PEAK is None:
+        return None
+    p = subprocess.run([PEAK] + cmd_for(exe, name) + args_for(name), capture_output=True, text=True,
+                       env=base_env())
+    return peak_of(p.stderr)
+
+
 def java_run(name, n):
-    """(best warm seconds, checksum line) of the Java port, in one JVM."""
-    p = subprocess.run(['java', f'-Dbench.runs={n}', '-cp', JAVA_CP, 'Bench', name] + args_for(name),
-                       capture_output=True, text=True, env=base_env())
+    """(best warm seconds, checksum line, peak MB) of the Java port, in one JVM."""
+    cmd = ['java', f'-Dbench.runs={n}', '-cp', JAVA_CP, 'Bench', name] + args_for(name)
+    p = subprocess.run(([PEAK] if PEAK else []) + cmd, capture_output=True, text=True, env=base_env())
     if p.returncode != 0:
         raise SystemExit(f"{name}: the Java port exited {p.returncode}: {p.stderr.strip()[-500:]}")
     lines = p.stdout.strip().splitlines()
     warm = [l for l in lines if l.startswith('warm ')]
-    return float(warm[0].split()[1]) / 1000, lines[0].strip()
+    return float(warm[0].split()[1]) / 1000, lines[0].strip(), peak_of(p.stderr)
 
 
 def build_obo(name, tmp):
@@ -203,7 +232,7 @@ def main():
     ap.add_argument('--random-hash', action='store_true',
                     help='run with the production per-process random hash key')
     a = ap.parse_args()
-    global HASH_SEED, RUST_EXE, JAVA_CP
+    global HASH_SEED, RUST_EXE, JAVA_CP, PEAK
     HASH_SEED = None if a.random_hash else str(a.hash_seed)
     names = a.only or NAMES
     tmp = tempfile.mkdtemp(prefix='lxlbench')
@@ -212,6 +241,7 @@ def main():
         RUST_EXE = build_rust()
         if RUST_EXE is None and shutil.which('cargo') is None:
             print('note: cargo not found; Rust column skipped', file=sys.stderr)
+    PEAK = build_peak(tmp)
     if not a.no_java and not a.obo:
         JAVA_CP = build_java(tmp)
         if JAVA_CP is None and not shutil.which('javac'):
@@ -254,12 +284,13 @@ def main():
         t_rust, out_rust, i_rust, c_rust = timed(rust)
         if rust and out_rust != out_lxl:
             raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Rust {out_rust!r}")
-        t_java = None
+        t_java = m_java = None
         if JAVA_CP:
-            t_java, out_java = java_run(name, a.n)
+            t_java, out_java, m_java = java_run(name, a.n)
             if out_java != out_lxl:
                 raise SystemExit(f"{name}: outputs differ: lxl {out_lxl!r}, Java {out_java!r}")
         rows.append(dict(name=name, obo=t_obo, c=t_lxl, n=t_lxln, o=t_lxlo, plain=t_plain, rust=t_rust, java=t_java,
+                         mn=peak_run(lxlo or lxln, name), mr=peak_run(rust, name), mj=m_java,
                          out=out_lxl,
                          ci=i_lxl, ni=i_lxln, oi=i_lxlo, pi=i_plain, ri=i_rust,
                          cc=c_lxl, nc=c_lxln, oc=c_lxlo, pc=c_plain, rc=c_rust))
@@ -300,6 +331,14 @@ def main():
             njs = f"{r['n'] / r['java']:.2f}" if r['java'] else "-"
             print(f"| {r['name']} | {fmt(r['c'])} | {fmt(r['n'])} | {r['n'] / r['c']:.2f} | "
                   f"{pc} | {npc} | {rs} | {nrs} | {js} | {njs} | {r['out']} |")
+    if any(r['mn'] is not None for r in rows):
+        print()
+        def mb(x):
+            return f"{x:.1f} MB" if x is not None else "-"
+        print(f"| benchmark | {'native -O' if a.opt else 'native'} peak | Rust peak | Java peak |")
+        print("|---|---:|---:|---:|")
+        for r in rows:
+            print(f"| {r['name']} | {mb(r['mn'])} | {mb(r['mr'])} | {mb(r['mj'])} |")
     if a.perf:
         print()
         def m(x):
