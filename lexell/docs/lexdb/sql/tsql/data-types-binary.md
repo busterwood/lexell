@@ -205,7 +205,7 @@ x4  0   \x4142
 
 (1 row affected)
 
-Msg 195, Level 16, State 1, Line 1
+Msg 195, Level 15, State 1, Line 1
 operator does not exist: \x4142 + \x4344
 ```
 
