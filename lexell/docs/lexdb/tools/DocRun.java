@@ -59,7 +59,7 @@ public class DocRun {
         if (sql.isBlank()) return;
         try (Statement s = c.createStatement()) {
             boolean rs;
-            try { rs = s.execute(sql); } catch (SQLException e) { msg(e, o); rs = more(s, o); }
+            try { rs = s.execute(sql); } catch (SQLException e) { quietWarnings(s, o); msg(e, o); rs = more(s, o); }
             while (true) {
                 warnings(s, o);
                 if (rs) {
@@ -82,8 +82,13 @@ public class DocRun {
     static boolean more(Statement s, List<String> o) {
         while (true) {
             try { return s.getMoreResults(); }
-            catch (SQLException e) { msg(e, o); }
+            catch (SQLException e) { quietWarnings(s, o); msg(e, o); }
         }
+    }
+
+    // the messages that came before an error, printed before it (sqlcmd's order)
+    static void quietWarnings(Statement s, List<String> o) {
+        try { warnings(s, o); } catch (SQLException e) { /* none to read */ }
     }
 
     static void warnings(Statement s, List<String> o) throws SQLException {
