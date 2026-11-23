@@ -72,7 +72,7 @@ accounts
 
 (1 row affected)
 
-Msg 51001, Level 16, State 2, Line 1
+Msg 51001, Level 16, State 2, Line 5
 Account 7 is closed.
 ```
 
@@ -96,7 +96,7 @@ logged_number
 
 (1 row affected)
 
-Msg 8134, Level 16, State 1, Line 1
+Msg 8134, Level 16, State 1, Line 6
 Divide by zero error encountered.
 ```
 
