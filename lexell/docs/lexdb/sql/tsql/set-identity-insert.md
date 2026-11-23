@@ -143,8 +143,8 @@ SET IDENTITY_INSERT dbo.ticket OFF;
 ```text
 Msg 544, Level 16, State 1, Line 1
 cannot insert a non-DEFAULT value into column "id"
-Msg 2627, Level 14, State 1, Line 1
-duplicate key value violates unique constraint "ticket_pkey"
+Msg 2627, Level 14, State 1, Line 3
+Violation of PRIMARY KEY constraint 'ticket_pkey'. Cannot insert duplicate key in object 'dbo.ticket'. The duplicate key value is (100).
 ```
 
 ## See also
