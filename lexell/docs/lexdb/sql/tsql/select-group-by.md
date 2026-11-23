@@ -255,8 +255,8 @@ Msg 50000, Level 16, State 1, Line 1
 column "sale.amount" must appear in the GROUP BY clause or be used in an aggregate function
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near ';'.
-Msg 195, Level 16, State 1, Line 1
-function grouping_id with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'grouping_id' is not a recognized built-in function name.
 ```
 
 ## See also
