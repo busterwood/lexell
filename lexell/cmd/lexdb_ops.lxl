@@ -323,8 +323,6 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         }
         return Ok(Val.Text(s))
     }
-    // (a bytea as an integer, PostgreSQL 18's: castMore)
-    if t.kind == lexdb_sql.K_INT && kindOid(&v) == lexdb_sql.OID_BYTEA { return castMore(&v, t) }
     return Err(e("42804", &("column is of type " + kindName(t) + " but the expression is of another type")))
 }
 
@@ -533,21 +531,12 @@ pub fn coerceTime(v: &Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[
     return castMore(&v, t)
 }
 
-// The casts PostgreSQL 18 and 19 added (lexdb-new-features.md P11), else coerce's 42846: a bytea as an integer (its bytes
-// big-endian, as many as the type has at most; 22003 past them), a bytea of 16 bytes as a uuid (22P03 else), a uuid as
-// its bytes. (An integer's bytes, as wide as its type, are lexdb_newfn's #n_intbytes: the binder's.)
+// The casts PostgreSQL 19 added (lexdb-new-features.md P11), else coerce's 42846: a bytea of 16 bytes as a uuid (22P03
+// else), a uuid as its bytes. (An integer's bytes and a bytea as an integer are lexdb_newfn's #n_intbytes and #n_bytes2, 4, 8:
+// the binder's byteaCast, intCast.)
 fn castMore(v: &Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     match v {
         Val.Bytes(b) {
-            if t.kind == lexdb_sql.K_INT {
-                let w = if t.oid == lexdb_sql.OID_INT2 { 2 } else if t.oid == lexdb_sql.OID_INT4 { 4 } else { 8 }
-                if len(b) > w { return Err(e("22003", &(kindName(t) + " out of range"))) }
-                var x = 0
-                for i in 0..len(b) { x = (x << 8) | int(b[i]) }
-                // (a value of the type's whole width keeps its sign)
-                if len(b) == w && w < 8 && (int(b[0]) & 0x80) != 0 { x = x - (1 << (8 * w)) }
-                return Ok(Val.Int(x))
-            }
             if t.kind == lexdb_sql.K_UUID {
                 if len(b) != 16 { return Err(e("22P03", &("invalid input length for type uuid: " + len(b).toStr()))) }
                 let h = lexdb_sql.bytesHex(&b)
