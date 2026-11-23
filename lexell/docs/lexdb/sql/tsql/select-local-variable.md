@@ -139,9 +139,9 @@ GO
 ```
 
 ```text
-Msg 141, Level 16, State 1, Line 1
+Msg 141, Level 16, State 1, Line 2
 A SELECT statement that assigns a value to a variable must not be combined with data-retrieval operations.
-Msg 102, Level 15, State 1, Line 1
+Msg 102, Level 15, State 1, Line 2
 Incorrect syntax near '='.
 ```
 
