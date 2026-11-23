@@ -60,7 +60,6 @@ NEXT VALUE FOR [ schema_name . ] sequence_name
 - `NEXT VALUE FOR` twice for one sequence in one row gives two values; SQL Server gives the same value to both.
 - `NEXT VALUE FOR ... OVER (ORDER BY ...)` is error 102.
 - `sp_sequence_get_range` is not available (2812).
-- A name that is used is error 2714 with lexdb's text.
 
 ## Examples
 
@@ -219,10 +218,10 @@ GO
 
 (1 row affected)
 
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 4
 nextval: reached maximum value of sequence "limited" (2)
 Msg 2714, Level 16, State 1, Line 1
-relation "order_no" already exists
+There is already an object named 'order_no' in the database.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'no'.
 ```
