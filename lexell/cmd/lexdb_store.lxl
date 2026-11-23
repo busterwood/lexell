@@ -3971,7 +3971,6 @@ fn (st: &Store) scanBackIn(t: mut &Txn, tree: int, from: &str, to: &str, f: &fn(
 
 // A new tree, created when the transaction commits.
 pub fn (st: &Store) createTree(t: mut &Txn): int {
-    if st.fo.isSome() { return st.tmpTree(t) }
     var id = 0
     st.sh.with(fn(db: mut &Db) {
         id = db.nextTree
@@ -4081,10 +4080,7 @@ pub fn (st: &Store) liveStale(t: &Txn): bool {
 // writes and waits until the log holds them. A transaction that only read
 // is checked too, and waits until what it saw is durable (4.4).
 pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() {
-        if len(t0.tmp) > 0 { return st.tmpEnd(&t0) }
-        return st.repEnd(&t0)
-    }
+    if st.fo.isSome() { return st.repEnd(&t0) }
     var t = t0
     let id = t.snap
     let lid = t.lockId
@@ -4105,10 +4101,7 @@ pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
 // is (a sequence's block, 9.43: no transaction using its values can be
 // durable before it). A crash before then loses it.
 pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
-    if st.fo.isSome() {
-        if len(t0.tmp) > 0 { return st.tmpEnd(&t0) }
-        return st.repEnd(&t0)
-    }
+    if st.fo.isSome() { return st.repEnd(&t0) }
     var t = t0
     let id = t.snap
     let lid = t.lockId
@@ -8033,8 +8026,10 @@ pub fn openReplicaSplit(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, opts: Options, 
 fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options, link: Link): Result[Store, lexdb_base.DbErr] {
     try checkLog(&fs, &logFs, split, false)
     let fo = try openFollowerHow(link, fs.share(), logFs.share(), opts.cacheBytes)
-    // the Db keeps what the SQL layer keeps (the memo) and the counters
-    let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: 1,
+    // the Db keeps what the SQL layer keeps (the memo) and the counters; its
+    // trees are the replica sessions' temporary ones, numbered from
+    // lexdb_tmpstore.LOCAL_BASE (createTree; 9.137 phase 5)
+    let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: lexdb_tmpstore.LOCAL_BASE,
                             dropped: 0, runs: 0, covers: -1}
     let db = newDb(fs, logFs, lexdb_disk.File.Real(-1, false), opts, &m)
     return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks()})
@@ -8068,10 +8063,11 @@ fn readOnly(what: &str): lexdb_base.DbErr {
     return lexdb_base.err(lexdb_base.S_READ_ONLY, &("cannot execute " + what + " in a read-only transaction"))
 }
 
-// A replica transaction's end: its snapshot ends; one with writes fails.
-// (One whose session has a temporary schema ends in tmpEnd.)
+// A replica transaction's end: its snapshot ends; one with writes fails,
+// unless its session has a temporary schema (tmpFinish).
 fn (st: &Store) repEnd(t: &Txn): Result[Unit, lexdb_base.DbErr] {
     st.endSnapshot(t)
+    if len(t.tmp) > 0 { return st.tmpFinish(t) }
     if len(t.writes) > 0 { return Err(readOnly(&"a write on a replica")) }
     return Ok(Unit{})
 }
@@ -8095,23 +8091,14 @@ const CAT_TREE = 1              // lexdb_catalog.CATALOG
 // Whether catalog key k is a row of temporary schema sc.
 fn tmpKey(sc: &str, k: &str): bool { return lexdb_tmpstore.schemaOfKey(k) == sc }
 
-// A replica's commit of a transaction whose session has a temporary
-// schema: its snapshot ends and its row locks go (a block's UPDATE and
+// repEnd of a transaction whose session has a temporary schema: its row
+// locks go (a block's UPDATE and
 // DELETE of its #temp rows take them); its writes, if any, applied to the
 // temporary storage, or refused (tmpCommit).
-fn (st: &Store) tmpEnd(t: &Txn): Result[Unit, lexdb_base.DbErr] {
-    st.endSnapshot(t)
+fn (st: &Store) tmpFinish(t: &Txn): Result[Unit, lexdb_base.DbErr] {
     st.locks.release(t.lockId, &t.held)
     if len(t.writes) > 0 { return st.tmpCommit(t) }
     return Ok(Unit{})
-}
-
-// A new local tree, made when the transaction commits.
-fn (st: &Store) tmpTree(t: mut &Txn): int {
-    let id = st.follower().unwrap().tmps().newId()
-    append(mut &t.writes, TxWrite{op: OP_CREATE, tree: id, key: "", val: "", head: 0})
-    append(mut &t.created, id)
-    return id
 }
 
 // getBaseIn on a replica, for a transaction with a temporary schema.
