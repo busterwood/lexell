@@ -76,7 +76,7 @@ USE nothere;
 ```text
 Msg 916, Level 14, State 1, Line 1
 The server principal "sa" is not able to access the database "tempdb" under the current security context.
-Msg 911, Level 16, State 1, Line 1
+Msg 911, Level 16, State 1, Line 2
 Database 'nothere' does not exist. Make sure that the name is entered correctly.
 ```
 
