@@ -319,7 +319,7 @@ Table created.
 
 BEFORE_COMMIT
 -------------
-            0
+            1
 
 1 row selected.
 
