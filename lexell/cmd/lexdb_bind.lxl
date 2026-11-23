@@ -439,6 +439,7 @@ pub fn oraStamp(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
                 }
                 "case else" { return if len(args) == 3 { oraStamp(&args[2], cols) } else { -1 } }
                 "#n_obucket" { return if len(args) > 0 { oraStamp(&args[0], cols) } else { -1 } }
+                "#n_oceil", "#n_ofloor", "#n_oround" { return 0 }
                 else { return -1 }
             }
         }
@@ -637,7 +638,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 }
                 "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop", "avg" {
                     let a = if len(args) > 0 { exprOid(&args[0], cols, ptypes, ty) } else { lexdb_sql.OID_INT8 }
-                    if a == lexdb_sql.OID_IVAL && n == "avg" { return a }
+                    if a == lexdb_sql.OID_IVAL && strings.startsWith(&n, "avg") { return a }
                     return if isFloatOid(a) { lexdb_sql.OID_FLOAT8 } else { lexdb_sql.OID_NUMERIC }
                 }
                 "sum" {
@@ -654,6 +655,8 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 }
                 "cbrt", "random", "pi", "sin", "cos", "tan", "cot", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
                 "acosh", "atanh", "sind", "cosd", "tand", "cotd", "asind", "acosd", "atand", "atan2d", "degrees", "radians" {
+                    // (random(min, max), PostgreSQL 17: its bounds' type)
+                    if len(args) == 2 && n == "random" { return widerOid(exprOid(&args[0], cols, ptypes, ty), exprOid(&args[1], cols, ptypes, ty)) }
                     return lexdb_sql.OID_FLOAT8
                 }
                 "sqrt", "exp", "ln", "log10", "log" {
@@ -1738,6 +1741,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             // a char cast to a text: without its blanks (9.94)
             if t.kind == lexdb_sql.K_TEXT && t.oid != lexdb_sql.OID_BPCHAR && isBp(&cx, cols, &ns.ty) { return Ok(Expr.Cast(trimmed(cx), t)) }
             if t.kind == lexdb_sql.K_BOOL && t.len == 0 && pgRules(ns) { return boolCast(cx, cols, ns) }
+            if t.kind == lexdb_sql.K_BYTEA { return Ok(byteaCast(cx, t, cols, ns)) }
             return Ok(Expr.Cast(cx, t))
         }
         Expr.Call(nm, args, star) {
@@ -1896,7 +1900,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 return Ok(Expr.Cast(Expr.Lit(Val.Text(lexdb_sql.typeText(&lexdb_sql.oidType(o)))), named))
             }
             // the newest releases' (lexdb_newfn) and T-SQL's PRODUCT
-            if len(nm) > 3 && nm[0] == '#' && nm[1] == 'n' && nm[2] == '_' { return Ok(Expr.Call(nm.clone(), try newCall(&nm, out, cols, ns), star)) }
+            if len(nm) > 3 && nm[0] == '#' && nm[1] == 'n' && nm[2] == '_' { return newCall(&nm, out, star, cols, ns) }
             if !star && len(out) == 1 && len(ns.coll) > 0 && lexdb_sql.aggBase(&nm) == "#product" { return Ok(Expr.Call(productName(&nm, &out[0], cols, ns), out, false)) }
             if !star && len(out) == 1 && len(nm) > 6 && nm[0] == 'b' && nm[3] == '_' && pgRules(ns) { try bitAggArg(&nm, &out[0], cols, ns) }
             return Ok(bpCall(&nm, out, star, cols, &ns.ty))
@@ -2325,7 +2329,7 @@ pub fn isWinFn(name: &str): bool {
 // The functions whose answer depends on their arguments' types: resolve
 // gives them a hint of those (lexdb_lib.HINT), a last argument of text no
 // SQL text can hold, "\x00types:" and the OIDs.
-const TYPED_FNS: []str = ["to_hex", "array_remove", "array_replace", "array_position", "array_positions", "@>", "<@", "&&"]
+const TYPED_FNS: []str = ["to_hex", "array_remove", "array_replace", "array_position", "array_positions", "@>", "<@", "&&", "to_bin", "to_oct"]
 
 fn isTypedFn(n: &str): bool {
     for f in TYPED_FNS { if f == n { return true } }
@@ -3180,8 +3184,16 @@ fn argType(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): lexdb_sql.TypeName 
 // A call of lexdb_newfn's, resolved: T-SQL's (#n_t...) with their arguments' types after them (lexdb_newfn.typesHint);
 // the fuzzy matching functions under their arguments' collation, which must not be an SQL_ one (9847, as SQL Server 2025),
 // a case-insensitive one's folded.
-fn newCall(nm: &str, args: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[[]Expr, DbErr] {
+fn newCall(nm: &str, args: []Expr, star: bool, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Expr, DbErr] {
     var out = args
+    if (nm == "#n_oceil" || nm == "#n_ofloor" || nm == "#n_oround") && len(out) > 0 {
+        // Oracle's CEIL, FLOOR, ROUND: of a date-time or an interval lexdb_newfn's (23ai), of a number lexdb's
+        let pt = ptypesOf(ns)
+        let o = exprOid(&out[0], cols, &pt, &ns.ty)
+        if (lexdb_sql.timeKind(o) > 0 && o != lexdb_sql.OID_TIME) || o == lexdb_sql.OID_IVAL { return Ok(Expr.Call(nm.clone(), out, star)) }
+        let back = if nm == "#n_oceil" { "ceil" } else if nm == "#n_ofloor" { "floor" } else { "#ora_round" }
+        return Ok(bpCall(&back, out, star, cols, &ns.ty))
+    }
     if nm == "#n_obucket" && (len(out) == 3 || len(out) == 4) {
         // Oracle's TIME_BUCKET: END (1) or START, then whether the datetime and the origin are DATEs or TIMESTAMPs
         if len(out) == 3 { append(mut &out, Expr.Lit(Val.Int(0))) }
@@ -3189,9 +3201,9 @@ fn newCall(nm: &str, args: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Resul
         let o = oraStamp(&out[2], cols)
         append(mut &out, Expr.Lit(Val.Int(d)))
         append(mut &out, Expr.Lit(Val.Int(o)))
-        return Ok(out)
+        return Ok(Expr.Call(nm.clone(), out, star))
     }
-    if len(nm) < 4 || nm[3] != 't' || (len(out) > 0 && isHint(&out[len(out) - 1])) { return Ok(out) }
+    if len(nm) < 4 || nm[3] != 't' || (len(out) > 0 && isHint(&out[len(out) - 1])) { return Ok(Expr.Call(nm.clone(), out, star)) }
     var ts: []lexdb_sql.TypeName = []
     for a in out { append(mut &ts, argType(&a, cols, ns)) }
     if (nm == "#n_tedit" || nm == "#n_teditsim" || nm == "#n_tjwd" || nm == "#n_tjws") && len(out) >= 2 &&
@@ -3206,7 +3218,7 @@ fn newCall(nm: &str, args: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Resul
         }
     }
     append(mut &out, Expr.Lit(Val.Text(lexdb_newfn.typesHint(&ts))))
-    return Ok(out)
+    return Ok(Expr.Call(nm.clone(), out, star))
 }
 
 // PostgreSQL's bit_and, bit_or and bit_xor take integers (the bit strings lexdb has not): another type 42883. Oracle's
@@ -3236,4 +3248,12 @@ fn productName(nm: &str, arg: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): str
         if !(t.prec == 19 && t.scale == 4) { return "#product6" + rest }
     }
     return nm.toStr()
+}
+
+// x::bytea: an integer's bytes as wide as its type, PostgreSQL 18's (lexdb_newfn's #n_intbytes); another as a cast.
+fn byteaCast(x: Expr, t: lexdb_sql.TypeName, cols: &[]lexdb_sql.ColDef, ns: &Names): Expr {
+    let pt = ptypesOf(ns)
+    let o = exprOid(&x, cols, &pt, &ns.ty)
+    if !pgRules(ns) || !isIntOid(o) { return Expr.Cast(x, t) }
+    return Expr.Call("#n_intbytes", [x, Expr.Lit(Val.Int(if o == lexdb_sql.OID_INT2 { 2 } else if o == lexdb_sql.OID_INT4 { 4 } else { 8 }))], false)
 }

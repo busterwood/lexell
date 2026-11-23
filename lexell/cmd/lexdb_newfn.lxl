@@ -39,7 +39,19 @@ pub fn entryOf(name: &str, n: int): Option[Fn] {
         "uuid_extract_version" { if n == 1 { return Some(uuidVersionFn) } }
         "uuid_extract_timestamp" { if n == 1 { return Some(uuidStampFn) } }
         "unistr" { if n == 1 { return Some(pgUnistrFn) } }
+        "error_on_null" { if n == 1 { return Some(errorOnNullFn) } }
+        "to_bin", "to_oct" { return Some(toBaseFn) }               // (typed: a hint after the arguments)
+        "bit_count" { if n == 1 { return Some(bitCountFn) } }
+        "erf", "erfc", "gamma", "lgamma" { if n == 1 { return Some(mathFn) } }
+        "crc32", "crc32c" { if n == 1 { return Some(crcFn) } }
+        "date_add", "date_subtract" { if n == 2 || n == 3 { return Some(dateAddFn) } }
+        "casefold" { if n == 1 { return Some(casefoldFn) } }
+        "trim_array" { if n == 2 { return Some(trimArrayFn) } }
+        "array_reverse", "array_shuffle" { if n == 1 { return Some(arrayOrderFn) } }
+        "array_sample" { if n == 2 { return Some(arraySampleFn) } }
+        "random" { if n == 2 { return Some(randomRangeFn) } }
         "#n_tbucket" { return Some(tBucketFn) }
+        "#n_intbytes" { return Some(intBytesFn) }
         "#n_ttrunc" { return Some(tTruncFn) }
         "#n_tb64e" { return Some(tB64EncFn) }
         "#n_tb64d" { return Some(tB64DecFn) }
@@ -51,6 +63,7 @@ pub fn entryOf(name: &str, n: int): Option[Fn] {
         "#n_orawuuid" { return Some(oRawToUuidFn) }
         "#n_ouuidraw" { return Some(oUuidToRawFn) }
         "#n_ounistr" { return Some(oUnistrFn) }
+        "#n_oceil", "#n_ofloor", "#n_oround" { return Some(oRoundFn) }
         "#n_otobool" { return Some(oToBoolFn) }
         "#n_oedit", "#n_oeditsim", "#n_ojw", "#n_ojws" { return Some(oFuzzyFn) }
         else {}
@@ -59,7 +72,9 @@ pub fn entryOf(name: &str, n: int): Option[Fn] {
 }
 
 // Whether name is one of these whose value changes from call to call (not folded, not shared).
-pub fn isVolatile(name: &str): bool { return name == "uuidv4" || name == "uuidv7" || name == "#n_ouuid" }
+pub fn isVolatile(name: &str): bool {
+    return name == "uuidv4" || name == "uuidv7" || name == "#n_ouuid" || name == "array_shuffle" || name == "array_sample"
+}
 
 // The type of name's result for arguments of these types; 0: not one of these.
 pub fn resultOid(name: &str, os: &[]int): int {
@@ -71,6 +86,11 @@ pub fn resultOid(name: &str, os: &[]int): int {
             return if s == lexdb_sql.OID_TS || s == lexdb_sql.OID_DATE { lexdb_sql.OID_TS } else { lexdb_sql.OID_TSTZ }
         }
         "uuidv4", "uuidv7" { return lexdb_sql.OID_UUID }
+        "error_on_null", "trim_array", "array_reverse", "array_shuffle", "array_sample" { return a }
+        "to_bin", "to_oct", "casefold" { return lexdb_sql.OID_TEXT }
+        "bit_count", "crc32", "crc32c" { return lexdb_sql.OID_INT8 }
+        "erf", "erfc", "gamma", "lgamma" { return lexdb_sql.OID_FLOAT8 }
+        "date_add", "date_subtract" { return lexdb_sql.OID_TSTZ }
         "uuid_extract_version" { return lexdb_sql.OID_INT2 }
         "uuid_extract_timestamp" { return lexdb_sql.OID_TSTZ }
         "unistr", "#n_tunistr", "#n_ounistr", "#n_tb64e", "#n_orawuuid" { return lexdb_sql.OID_TEXT }
@@ -83,7 +103,8 @@ pub fn resultOid(name: &str, os: &[]int): int {
             return if d == lexdb_sql.OID_DATE || d == lexdb_sql.OID_TIME || d == lexdb_sql.OID_TSTZ { d } else { lexdb_sql.OID_TS }
         }
         "#n_obucket" { return if a == lexdb_sql.OID_TSTZ { a } else { lexdb_sql.OID_TS } }
-        "#n_tb64d", "#n_ouuid", "#n_ouuidraw" { return lexdb_sql.OID_BYTEA }
+        "#n_oceil", "#n_ofloor", "#n_oround" { return if a == lexdb_sql.OID_IVAL { a } else { lexdb_sql.OID_TS } }
+        "#n_tb64d", "#n_ouuid", "#n_ouuidraw", "#n_intbytes" { return lexdb_sql.OID_BYTEA }
         "#n_tedit", "#n_teditsim", "#n_tjws" { return lexdb_sql.OID_INT4 }
         "#n_tjwd", "#n_ojw" { return lexdb_sql.OID_FLOAT8 }
         "#n_oedit", "#n_oeditsim", "#n_ojws" { return lexdb_sql.OID_NUMERIC }
@@ -533,8 +554,14 @@ fn uuid7Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, D
         }
     }
     let unixUs = us + UNIX_US
-    let ms = floorDiv(unixUs, 1000)
-    let sub = (floorMod(unixUs, 1000) * 4096) / 1000
+    // its 48 + 12 bits of time above the last one made (several in a microsecond, a clock gone back)
+    var at = floorDiv(unixUs, 1000) * 4096 + (floorMod(unixUs, 1000) * 4096) / 1000
+    if len(vs) == 0 {
+        if at <= LAST_V7 { at = LAST_V7 + 1 }
+        LAST_V7 = at
+    }
+    let ms = at >> 12
+    let sub = at & 4095
     var b = try randomBytes(16)
     for k in 0..6 { b[k] = byte((ms >> (8 * (5 - k))) & 255) }
     b[6] = byte(0x70 | ((sub >> 8) & 0x0f))
@@ -542,6 +569,9 @@ fn uuid7Fn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, D
     b[8] = byte((int(b[8]) & 0x3f) | 0x80)
     return Ok(Val.Uuid(lexdb_rows.uuidText(&strFromBytes(&b))))
 }
+
+// The time bits (48 + 12) of the last uuidv7() made.
+var LAST_V7: int = 0
 
 fn uuidRaw(v: &Val): Option[str] {
     match v {
@@ -1115,4 +1145,350 @@ fn oFuzzyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, 
     let jw = if len(x) == 0 || len(y) == 0 { 0.0f } else { jaroWinkler(&x, &y, true) }
     if name == "#n_ojw" { return Ok(Val.Float(jw)) }
     return Ok(Val.Num(Decimal.fromInt(int((jw * 100.0f).floor()))))
+}
+
+// ---- PostgreSQL's smaller ones (16 to 19: P9, P14, P23)
+
+// error_on_null(x): x, or 22004 for a NULL (19).
+fn errorOnNullFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Err(e("22004", "null value not allowed")) }
+    return Ok(vs[0].clone())
+}
+
+// to_bin(n), to_oct(n) (17): an integer's digits, a negative one's two's complement as wide as its type (the hint).
+fn toBaseFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let a = argsOf(vs)
+    if a.n != 1 { return Err(e("42883", &("function " + name + " with " + a.n.toStr() + " arguments does not exist"))) }
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let x = match lexdb_ops.intOf(&vs[0]) {
+        Some(i) { i }
+        None { return Err(e("42883", &("function " + name + " needs an integer"))) }
+    }
+    let bits = if a.oids[0] == lexdb_sql.OID_INT8 || (a.oids[0] == 0 && (x < -2147483648 || x > 2147483647)) { 64 } else { 32 }
+    let shift = if name == "to_bin" { 1 } else { 3 }
+    // the value's bits as an unsigned number of that width, most significant digit first (a 32-bit one's high bits cut)
+    let v = if bits == 32 { x & 0xffffffff } else { x }
+    var out = ""
+    var k = (bits + shift - 1) / shift - 1
+    var lead = true
+    while k >= 0 {
+        let at = k * shift
+        let take = if bits - at < shift { bits - at } else { shift }
+        let d = (v >> at) & ((1 << take) - 1)
+        if d != 0 || !lead || k == 0 {
+            out.addByte(byte(int('0') + d))
+            lead = false
+        }
+        k -= 1
+    }
+    return Ok(Val.Text(out))
+}
+
+// bit_count(bytea) (14): its bits set.
+fn bitCountFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    match vs[0] {
+        Val.Bytes(b) {
+            var c = 0
+            for i in 0..len(b) {
+                var x = int(b[i])
+                while x > 0 {
+                    c += x & 1
+                    x = x >> 1
+                }
+            }
+            return Ok(Val.Int(c))
+        }
+        else { return Err(e("42883", "function bit_count needs a bytea")) }
+    }
+}
+
+extern "c" fn erf(x: float): float
+extern "c" fn erfc(x: float): float
+extern "c" fn tgamma(x: float): float
+extern "c" fn lgamma(x: float): float
+
+// erf, erfc (16), gamma, lgamma (18): the C library's; an infinite or NaN result of a finite argument 22003.
+fn mathFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let x = match lexdb_ops.asFloat(&vs[0]) {
+        Some(f) { f }
+        None { return Err(e("42883", &("function " + name + " needs a number"))) }
+    }
+    let r = if name == "erf" { erf(x) } else if name == "erfc" { erfc(x) } else if name == "gamma" { tgamma(x) } else { lgamma(x) }
+    let finite = x == x && x - x == 0.0f
+    if finite && (r != r || r - r != 0.0f) { return Err(e("22003", "value out of range: overflow")) }
+    if finite && r == 0.0f && name == "gamma" { return Err(e("22003", "value out of range: underflow")) }
+    return Ok(Val.Float(r))
+}
+
+// crc32(bytea), crc32c(bytea) (18): the CRC-32 (IEEE) and CRC-32C of its bytes.
+fn crcFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let b = match vs[0] {
+        Val.Bytes(x) { x.clone() }
+        Val.Text(t) { try lexdb_ops.parseBytea(&t) }
+        else { return Err(e("42883", &("function " + name + " needs a bytea"))) }
+    }
+    let poly = if name == "crc32" { 0xedb88320 } else { 0x82f63b78 }
+    var c = 0xffffffff
+    for i in 0..len(b) {
+        c = c ^ int(b[i])
+        for k in 0..8 { c = if (c & 1) == 1 { (c >> 1) ^ poly } else { c >> 1 } }
+    }
+    return Ok(Val.Int(c ^ 0xffffffff))
+}
+
+// date_add(t, interval [, zone]), date_subtract (16): the timestamptz moved by the interval in the zone (the session's).
+fn dateAddFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+    let t = match try lexdb_ops.coerce(vs[0].clone(), &lexdb_sql.oidType(lexdb_sql.OID_TSTZ)) { Val.Tstz(u) { u } else { 0 } }
+    var iv = match try lexdb_ops.coerce(vs[1].clone(), &lexdb_sql.oidType(lexdb_sql.OID_IVAL)) {
+        Val.Ival(v) { v }
+        else { return Err(e("42883", &("function " + name + " needs an interval"))) }
+    }
+    if name == "date_subtract" { iv = lexdb_time.ivalNeg(&iv) }
+    if len(vs) == 3 {
+        let zone = try lexdb_time.atZone(&lexdb_sql.text(&vs[2]))
+        return Ok(Val.Tstz(try lexdb_time.tstzPlus(t, &iv, &zone)))
+    }
+    return Ok(Val.Tstz(try lexdb_time.tstzPlus(t, &iv, z)))
+}
+
+// casefold(text) (18): as lower() under the default collation (PostgreSQL's for a libc collation).
+fn casefoldFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    var out = ""
+    for r in strings.runes(&lexdb_sql.text(&vs[0])) { strings.addRune(mut &out, unicode.lower(r)) }
+    return Ok(Val.Text(out))
+}
+
+fn arrayVals(v: &Val): Result[[]Val, DbErr] {
+    var out: []Val = []
+    for p in try lexdb_ops.arrayParts(&lexdb_sql.text(v)) {
+        match p {
+            Some(t) { append(mut &out, Val.Text(t.toStr())) }
+            None { append(mut &out, Val.Null) }
+        }
+    }
+    return Ok(out)
+}
+
+// trim_array(a, n) (14): a without its last n elements (0 to its length; 2202E else).
+fn trimArrayFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Val.Null) }
+    let xs = try arrayVals(&vs[0])
+    let n = lexdb_ops.intOf(&vs[1]).unwrapOr(-1)
+    if n < 0 || n > len(xs) { return Err(e("2202E", &("number of elements to trim must be between 0 and " + len(xs).toStr()))) }
+    var out: []Val = []
+    for i in 0..len(xs) - n { append(mut &out, xs[i].clone()) }
+    return Ok(Val.Text(lexdb_ops.arrayText(&out)))
+}
+
+fn randomBelow(n: int): Result[int, DbErr] {
+    let b = try randomBytes(8)
+    var x = 0
+    for i in 0..7 { x = x * 256 + int(b[i]) }
+    return Ok(x % n)
+}
+
+// array_reverse(a) (18), array_shuffle(a) (16): its elements reversed, shuffled.
+fn arrayOrderFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    var xs = try arrayVals(&vs[0])
+    let n = len(xs)
+    if name == "array_reverse" {
+        var out: []Val = []
+        var i = n - 1
+        while i >= 0 {
+            append(mut &out, xs[i].clone())
+            i -= 1
+        }
+        return Ok(Val.Text(lexdb_ops.arrayText(&out)))
+    }
+    var i = n - 1
+    while i > 0 {
+        let j = try randomBelow(i + 1)
+        let t = xs[i].clone()
+        xs[i] = xs[j].clone()
+        xs[j] = t
+        i -= 1
+    }
+    return Ok(Val.Text(lexdb_ops.arrayText(&xs)))
+}
+
+// array_sample(a, n) (16): n of its elements, chosen at random (0 to its length; 22023 else).
+fn arraySampleFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Val.Null) }
+    var xs = try arrayVals(&vs[0])
+    let k = lexdb_ops.intOf(&vs[1]).unwrapOr(-1)
+    if k < 0 || k > len(xs) { return Err(e("22023", "sample size must be between 0 and " + len(xs).toStr())) }
+    for i in 0..k {
+        let j = i + (try randomBelow(len(xs) - i))
+        let t = xs[i].clone()
+        xs[i] = xs[j].clone()
+        xs[j] = t
+    }
+    var out: []Val = []
+    for i in 0..k { append(mut &out, xs[i].clone()) }
+    return Ok(Val.Text(lexdb_ops.arrayText(&out)))
+}
+
+// random(min, max) (17): an integer or a numeric (the larger scale of the two) from min to max (22023 when min > max).
+fn randomRangeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Val.Null) }
+    match vs[0] {
+        Val.Int(lo) {
+            match vs[1] {
+                Val.Int(hi) {
+                    if lo > hi { return Err(e("22023", "lower bound must be less than or equal to upper bound")) }
+                    let span = hi - lo + 1
+                    if span <= 0 { return Ok(Val.Int(lo + (try randomBelow(0x7fffffffffffffff)))) }
+                    return Ok(Val.Int(lo + (try randomBelow(span))))
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    let a = lexdb_ops.asNum(&vs[0]).unwrapOr(Decimal.zero())
+    let b = lexdb_ops.asNum(&vs[1]).unwrapOr(Decimal.zero())
+    if a.cmp(&b) > 0 { return Err(e("22023", "lower bound must be less than or equal to upper bound")) }
+    let sc = if a.scale() > b.scale() { a.scale() } else { b.scale() }
+    // (the bounds as whole units of that scale)
+    let unit = Decimal.fromUnits(1, sc)
+    let la = a.div(unit, 0, Rounding.HALF_EVEN).unwrapOr(Decimal.zero()).toInt(Rounding.TOWARD_ZERO).unwrapOr(0)
+    let lb = b.div(unit, 0, Rounding.HALF_EVEN).unwrapOr(Decimal.zero()).toInt(Rounding.TOWARD_ZERO).unwrapOr(0)
+    let pick = la + (try randomBelow(lb - la + 1))
+    return Ok(Val.Num(Decimal.fromUnits(pick, sc)))
+}
+
+// int::bytea (18): its bytes big-endian, as many as its type's width (the binder's second argument).
+fn intBytesFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNull(&vs[0]) { return Ok(Val.Null) }
+    let x = lexdb_ops.intOf(&vs[0]).unwrapOr(0)
+    let w = lexdb_ops.intOf(&vs[1]).unwrapOr(8)
+    var out: []byte = []
+    var k = w - 1
+    while k >= 0 {
+        append(mut &out, byte((x >> (8 * k)) & 255))
+        k -= 1
+    }
+    return Ok(Val.Bytes(strFromBytes(&out)))
+}
+
+// ---- Oracle 23ai's CEIL, FLOOR and ROUND of a DATE, a TIMESTAMP (made a DATE first) and an INTERVAL
+
+const OR_CEIL = 0
+const OR_FLOOR = 1
+const OR_ROUND = 2
+
+fn oRoundFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 1 || len(vs) > 2 { return Err(ora(909, "invalid number of arguments")) }
+    for v in vs { if isNull(&v) { return Ok(Val.Null) } }
+    let how = if name == "#n_oceil" { OR_CEIL } else if name == "#n_ofloor" { OR_FLOOR } else { OR_ROUND }
+    match vs[0] {
+        // (a number's, where no binder chose lexdb's own: PL/SQL's expressions)
+        Val.Int(x) { return Ok(Val.Int(x)) }
+        Val.Num(d) {
+            let places = if len(vs) > 1 && how == OR_ROUND { lexdb_ops.intOf(&vs[1]).unwrapOr(0) } else { 0 }
+            let mode = if how == OR_CEIL { Rounding.CEILING } else if how == OR_FLOOR { Rounding.FLOOR } else { Rounding.HALF_AWAY }
+            match d.quantize(places, mode) {
+                Ok(q) { return Ok(Val.Num(q)) }
+                Err(_) { return Err(ora(1426, "numeric overflow")) }
+            }
+        }
+        Val.Float(f) { return Ok(Val.Float(if how == OR_CEIL { f.ceil() } else if how == OR_FLOOR { f.floor() } else { (f + (if f < 0.0f { -0.5f } else { 0.5f })).trunc() })) }
+        Val.Ival(iv) {
+            let fmt = if len(vs) > 1 { strings.toUpperAscii(&strings.trim(&lexdb_sql.text(&vs[1]))) } else if iv.months != 0 { "YEAR" } else { "DD" }
+            return Ok(Val.Ival(try ivalRound(&iv, &fmt, how)))
+        }
+        else {}
+    }
+    // (to the second: a DATE)
+    let us = floorDiv(try localUs(&vs[0], z), 1000000) * 1000000
+    let fmt = if len(vs) > 1 { strings.toUpperAscii(&strings.trim(&lexdb_sql.text(&vs[1]))) } else { "DD" }
+    // (ROUND's error for a format it does not take is ORA-01899, CEIL's and FLOOR's ORA-01821)
+    let lo = match oTrunc(us, &fmt) {
+        Ok(x) { x }
+        Err(x) { return Err(if how == OR_ROUND { ora(1899, "bad precision specifier") } else { x }) }
+    }
+    if how == OR_FLOOR || lo == us { return Ok(Val.Ts(lo)) }
+    let hi = try oNext(lo, &fmt)
+    if how == OR_CEIL { return Ok(Val.Ts(hi)) }
+    let l = lexdb_time.localOf(us)
+    var up = false
+    match fmt.toStr() {
+        "Y", "YY", "YYY", "YYYY", "YEAR", "SYEAR", "SYYYY" { up = l.date.month >= 7 }
+        "Q" {
+            let inq = (l.date.month - 1) % 3
+            up = inq == 2 || (inq == 1 && l.date.day >= 16)
+        }
+        "MM", "MON", "MONTH", "RM" { up = l.date.day >= 16 }
+        else { up = (us - lo) * 2 >= hi - lo }
+    }
+    return Ok(Val.Ts(if up { hi } else { lo }))
+}
+
+// The start of the format's unit of local time us (Oracle's TRUNC); ORA-01821 for another format.
+fn oTrunc(us: int, fmt: &str): Result[int, DbErr] {
+    let l = lexdb_time.localOf(us)
+    let day = floorDiv(us, lexdb_time.DAY_US)
+    let jan1 = lexdb_time.makeDate(l.date.year, 1, 1).unwrap()
+    let dow = floorMod(day + 6, 7)          // 0 Sunday (2000-01-01 was a Saturday)
+    match fmt {
+        "Y", "YY", "YYY", "YYYY", "YEAR", "SYEAR", "SYYYY" { return Ok(lexdb_time.dateToTs(jan1)) }
+        "Q" { return Ok(lexdb_time.dateToTs(lexdb_time.makeDate(l.date.year, ((l.date.month - 1) / 3) * 3 + 1, 1).unwrap())) }
+        "MM", "MON", "MONTH", "RM" { return Ok(lexdb_time.dateToTs(lexdb_time.makeDate(l.date.year, l.date.month, 1).unwrap())) }
+        "IW" { return Ok(lexdb_time.dateToTs(day - floorMod(dow + 6, 7))) }
+        "WW" { return Ok(lexdb_time.dateToTs(day - floorMod(day - jan1, 7))) }
+        "W" { return Ok(lexdb_time.dateToTs(day - (l.date.day - 1) % 7)) }
+        "D", "DAY", "DY" { return Ok(lexdb_time.dateToTs(day - dow)) }
+        "DD", "DDD", "J" { return Ok(lexdb_time.dateToTs(day)) }
+        "HH", "HH12", "HH24" { return Ok(floorDiv(us, 3600000000) * 3600000000) }
+        "MI" { return Ok(floorDiv(us, 60000000) * 60000000) }
+        else { return Err(ora(1821, "date format not recognized")) }
+    }
+}
+
+// The start of the next unit after lo (a unit's start).
+fn oNext(lo: int, fmt: &str): Result[int, DbErr] {
+    match fmt {
+        "Y", "YY", "YYY", "YYYY", "YEAR", "SYEAR", "SYYYY" { return addMonths(lo, 12) }
+        "Q" { return addMonths(lo, 3) }
+        "MM", "MON", "MONTH", "RM" { return addMonths(lo, 1) }
+        "IW", "WW", "W", "D", "DAY", "DY" { return Ok(lo + 7 * lexdb_time.DAY_US) }
+        "DD", "DDD", "J" { return Ok(lo + lexdb_time.DAY_US) }
+        "HH", "HH12", "HH24" { return Ok(lo + 3600000000) }
+        else { return Ok(lo + 60000000) }
+    }
+}
+
+// An interval to whole units of the format: YEAR (a YEAR TO MONTH's), DD, HH, MI (a DAY TO SECOND's); ORA-01899 for
+// another. ROUND's halves away from zero.
+fn ivalRound(iv: &lexdb_time.Ival, fmt: &str, how: int): Result[lexdb_time.Ival, DbErr] {
+    if iv.months != 0 || ((fmt == "YEAR" || fmt == "YYYY" || fmt == "Y" || fmt == "YY" || fmt == "YYY") && iv.days == 0 && iv.us == 0) {
+        if !(fmt == "YEAR" || fmt == "YYYY" || fmt == "Y" || fmt == "YY" || fmt == "YYY") { return Err(ora(1899, "bad precision specifier")) }
+        return Ok(lexdb_time.Ival{months: 12 * roundUnits(iv.months, 12, how), days: 0, us: 0})
+    }
+    let unit = match fmt {
+        "DD", "DDD", "J" { lexdb_time.DAY_US }
+        "HH", "HH12", "HH24" { 3600000000 }
+        "MI" { 60000000 }
+        else { return Err(ora(1899, "bad precision specifier")) }
+    }
+    let total = iv.days * lexdb_time.DAY_US + iv.us
+    let r = roundUnits(total, unit, how) * unit
+    return Ok(lexdb_time.Ival{months: 0, days: r / lexdb_time.DAY_US, us: r % lexdb_time.DAY_US})
+}
+
+// x in whole units of u: up (CEIL), down (FLOOR), or the nearer, a half away from zero (ROUND).
+fn roundUnits(x: int, u: int, how: int): int {
+    let f = floorDiv(x, u)
+    if how == OR_FLOOR || f * u == x { return f }
+    if how == OR_CEIL { return f + 1 }
+    let rem = x - f * u
+    if rem * 2 > u { return f + 1 }
+    if rem * 2 < u { return f }
+    return if x > 0 { f + 1 } else { f }
 }

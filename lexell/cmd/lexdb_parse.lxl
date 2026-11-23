@@ -2247,7 +2247,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 p.udf = true
             }
             if p.ora && fname == "listagg" { fname = "string_agg" }
-            if (p.ora || p.tsql) && len(fname) > 6 { fname = newAggName(fname, p.ora) }
+            if (p.ora || p.tsql) && (len(fname) > 6 || (p.ora && fname == "avg" && p.mr == 0)) { fname = newAggName(fname, p.ora) }
             if p.mr > 0 && fname == "count" && (p.peek().kind == T_IDENT || p.peek().kind == T_QIDENT) && p.peekAt(1).kind == T_OP &&
                p.peekAt(1).text == "." && p.peekAt(2).kind == T_OP && p.peekAt(2).text == "*" {
                 // COUNT(v.*): the rows mapped to v
@@ -8514,7 +8514,7 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
             return Ok(Expr.Call("#ora_tonumber", a, false))
         }
         "trunc" { return Ok(Expr.Call("#ora_trunc", a, false)) }
-        "round" { return Ok(Expr.Call("#ora_round", a, false)) }     // (PostgreSQL's round is typed by its arguments: lexdb_bind.numCall)
+        "round" { return Ok(Expr.Call("#n_oround", a, false)) }      // (a number's #ora_round, a date's or an interval's lexdb_newfn's: lexdb_bind.newCall)
         "add_months" { return Ok(Expr.Call("#ora_addmonths", a, false)) }
         "sys_extract_utc" { return Ok(Expr.Call("#ora_sysutc", a, false)) }
         "numtodsinterval" { return Ok(Expr.Call("#ora_numtods", a, false)) }
@@ -9658,6 +9658,8 @@ fn newAggName(f: str, ora: bool): str {
         "boolean_and_agg" { return "bool_and" }
         "boolean_or_agg" { return "bool_or" }
         "kurtosis_pop", "kurtosis_samp", "skewness_pop", "skewness_samp" { return "#" + f }
+        // (AVG of a YEAR TO MONTH interval: whole months, lexdb_agg.finish)
+        "avg" { return "avg dia:o" }
         else { return f }
     }
 }
@@ -9761,6 +9763,11 @@ fn oraNewCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb_base.DbE
         "utl_match_edit_distance_similarity" { f = "#n_oeditsim" }
         "utl_match_jaro_winkler" { f = "#n_ojw" }
         "utl_match_jaro_winkler_similarity" { f = "#n_ojws" }
+        "ceil", "floor" {
+            f = if name == "ceil" { "#n_oceil" } else { "#n_ofloor" }
+            hi = 2
+        }
+        "dateadd", "datediff", "timestampdiff" { return oraDateAdd(name, args) }
         else { return Ok(Expr.Call(name.toStr(), args, star)) }
     }
     if strings.startsWith(name, "utl_match_") {
@@ -9769,4 +9776,23 @@ fn oraNewCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb_base.DbE
     }
     if n < lo || n > hi { return Err(orArgs(name)) }
     return Ok(Expr.Call(f, args, false))
+}
+
+// Oracle 26ai's DATEADD(part, n, d), DATEDIFF(part, a, b) and TIMESTAMPDIFF: T-SQL's kernels (#dateadd, #datediff) under
+// Oracle's names: a part by its whole name (ORA-00904 for another), n rounded.
+fn oraDateAdd(name: &str, args: []Expr): Result[Expr, lexdb_base.DbErr] {
+    if len(args) != 3 { return Err(orArgs(name)) }
+    var a = args
+    var w = ""
+    match a[0] { Expr.Col(c, _) { w = c.clone() } else {} }
+    match w.toStr() {
+        "year", "quarter", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond" {}
+        else { return Err(oraErr(904, &("\"" + strings.toUpperAscii(&lexdb_sql.exprText(&a[0])) + "\": invalid identifier"))) }
+    }
+    a[0] = Expr.Lit(Val.Text(w))
+    if name == "dateadd" {
+        a[1] = Expr.Call("round", [Expr.Cast(replace(mut &a[1], Expr.Lit(Val.Null)), TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 0, scale: 0, len: 0})], false)
+        return Ok(Expr.Call("#dateadd", a, false))
+    }
+    return Ok(Expr.Call("#datediff", a, false))
 }
